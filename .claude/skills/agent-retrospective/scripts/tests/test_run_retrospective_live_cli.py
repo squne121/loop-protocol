@@ -301,3 +301,77 @@ def test_real_claude_cli_invalid_schema_fail_closed(tmp_path: Path) -> None:
     # invalid-schema validation failure this test exercises.
     assert result.status not in ("timeout", "terminated"), (result.status, result.reason_code, result.exit_code)
     assert result.structured_output is None
+
+
+
+def test_real_claude_cli_custom_prompt_identity_binding() -> None:
+    """Issue #2350 AC4: `bind_observer_prompt()` -- the identity-binding
+    helper the caller-supplied-prompt path in `run_cli()` now threads a
+    non-empty, substantive `--prompts-file` task through (Issue #2350's
+    fix for the previously-unbound caller-supplied-prompt path) -- issued
+    against the REAL `retrospective-runtime-observer` Agent and the
+    committed `observer_result_v1.schema.json`. Unlike
+    `test_real_claude_cli_production_policy_round_trip` (a trivial
+    field-echo prompt), the `task_prompt` here is a genuine investigative
+    instruction with no identity information of its own -- exactly the
+    `--prompts-file` shape Issue #2350's Background section reports
+    deterministically failing with `observer_run_id_mismatch` prior to
+    this fix. Asserts the real CLI response's `run_id` / `base_sha` /
+    `source_set_digest` / `observer_id` all match the values
+    `bind_observer_prompt()` bound into the prompt -- i.e. that
+    `run_observer_wave()`'s identity checks would pass for this response
+    (this test calls the adapter directly, one layer below
+    `run_observer_wave()`, so it asserts the equivalent field-by-field
+    equality that check performs)."""
+    run_id = f"live-cli-{uuid.uuid4()}"
+    nonce = uuid.uuid4().hex
+    base_sha = "e" * 40
+    source_set_digest = "f" * 64
+    observer_id = "retrospective-runtime-observer"
+
+    task_prompt = (
+        "Investigate this real engineering retrospective run (Issue #2350 "
+        f"live-CLI identity-binding regression coverage, nonce {nonce}): "
+        "review this repository's recent commit history and CI "
+        "configuration for concrete, evidence-backed process findings. "
+        "Report only claims you can substantiate; if genuinely nothing "
+        "applicable is found, an empty findings list is acceptable."
+    )
+
+    prompt = rr.bind_observer_prompt(
+        task_prompt,
+        observer_id=observer_id,
+        run_id=run_id,
+        base_sha=base_sha,
+        source_set_digest=source_set_digest,
+    )
+
+    request = rr.AgentInvocationRequest(
+        agent_name=observer_id,
+        prompt=prompt,
+        json_schema_path=str(_OBSERVER_SCHEMA_PATH),
+        cwd=str(_REPO_ROOT),
+        timeout_sec=_LIVE_TIMEOUT_SEC,
+    )
+    policy = rr.DelegatedAgentPermissionPolicy(run_id=run_id)
+
+    result = rr.invoke_agent(request, policy=policy)
+
+    print(
+        f"test_real_claude_cli_custom_prompt_identity_binding: "
+        f"adapter_status={result.status} adapter_reason_code={result.reason_code} "
+        f"child_exit_code={result.exit_code}"
+    )
+
+    assert result.status == "ok", (result.status, result.reason_code, result.raw_stdout_excerpt)
+    assert result.exit_code == 0
+    assert result.reason_code is None
+    assert isinstance(result.structured_output, dict)
+    # the exact identity fields `run_observer_wave()` validates
+    # (`bundle.run_id != ctx.run_id` / `source_set_digest` / `base_sha`) --
+    # asserting field-by-field equality here is the direct equivalent of
+    # that check passing for this real CLI response.
+    assert result.structured_output.get("run_id") == run_id
+    assert result.structured_output.get("base_sha") == base_sha
+    assert result.structured_output.get("source_set_digest") == source_set_digest
+    assert result.structured_output.get("observer_id") == observer_id

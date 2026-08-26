@@ -1861,85 +1861,164 @@ def build_repository_collector(repo_root: Path) -> Callable[[str], Any]:
 #: that design is no longer used (see the OWNER review URL above).
 _DEFAULT_PROMPT_EVIDENCE_REF = "default-prompt-evidence-ref"
 
+#: evidence_ref literal used when binding a caller-supplied (non-empty)
+#: task prompt via ``bind_observer_prompt`` below (Issue #2350) -- distinct
+#: from ``_DEFAULT_PROMPT_EVIDENCE_REF`` purely so the two prompt shapes
+#: remain distinguishable in transcripts; ``run_observer_wave`` never
+#: validates ``evidence_ref`` against either literal (only ``run_id`` /
+#: ``base_sha`` / ``source_set_digest`` / ``observer_id`` are identity
+#: fields checked there).
+_CALLER_SUPPLIED_PROMPT_EVIDENCE_REF = "caller-supplied-prompt-evidence-ref"
 
-def _default_observer_prompt(observer_id: str, *, run_id: str, base_sha: str, source_set_digest: str) -> str:
-    """Issue #2345 fix_delta (OWNER review
-    https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
-    P1 items 1-2): the genuinely non-empty, REAL-identity default prompt
-    used for ``observer_id`` when ``main()``'s ``--prompts-file`` is not
-    supplied. ``run_cli()`` passes this function the SAME ``ctx.run_id`` /
-    ``ctx.base_sha`` / ``plan.source_set_digest`` its internal ``prepare()``
-    step produced for this run (never a fixed placeholder) -- see
-    ``run_cli``'s prompt-building step, executed after ``prepare()``
-    returns.
 
-    Background: prior to Issue #2345, the ``--prompts-file``-omitted
-    default was an empty string per observer (``prompts.get(observer_id,
-    "") -> ""``). Against the real ``claude`` CLI (observed on Claude Code
-    2.1.245), ``claude -p`` rejects an empty prompt argument before any
-    observer output is produced at all -- ``Error: Input must be provided
-    either through stdin or as a prompt argument when using --print``, exit
-    code 1. This is an empty-prompt invocation contract mismatch between
-    this module's (former) default and the real CLI's documented ``-p``
-    contract (a caller-side default that never supplied a prompt at all),
-    not a Claude Code CLI-side regression -- rejecting an explicitly empty
-    prompt is a reasonable caller-contract enforcement on the CLI's part
-    (see Issue #2345, https://github.com/squne121/loop-protocol/issues/2345).
+def bind_observer_prompt(
+    task_prompt: str | None,
+    *,
+    observer_id: str,
+    run_id: str,
+    base_sha: str,
+    source_set_digest: str,
+) -> str:
+    """Issue #2350: the single identity-binding helper BOTH the
+    default-prompt path (``prompts=None``, ``--prompts-file`` omitted) and
+    the caller-supplied-prompt path (``--prompts-file`` present, non-empty
+    per-observer task text) are threaded through in ``run_cli()``, so
+    neither path can construct an observer invocation whose response is
+    structurally unable to satisfy ``run_observer_wave()``'s
+    ``bundle.run_id != ctx.run_id`` / ``source_set_digest`` / ``base_sha``
+    identity checks.
 
-    This default asks ``observer_id`` to emit a schema-conformant
-    ``OBSERVER_RESULT_V1`` (``EvidenceBundle``) JSON envelope that echoes
-    the run's REAL identity fields verbatim, with an empty ``findings``
-    list (no caller-supplied evidence is provided along this
-    ``--prompts-file``-omitted path). A real, successful invocation
-    therefore satisfies ``run_observer_wave()``'s ``bundle.run_id !=
-    ctx.run_id`` / ``source_set_digest`` / ``base_sha`` checks and lets the
-    production call graph continue past the observer wave into the
-    evaluator, delta, and ``finalize`` phases -- the genuine end-to-end
-    completion this default is now designed to reach, rather than a
-    construct-to-fail identity mismatch."""
+    ``run_cli()`` calls this ONLY after its own internal ``prepare()`` step
+    has produced this run's REAL ``ctx.run_id`` / ``ctx.base_sha`` /
+    ``plan.source_set_digest`` -- never a fixed placeholder (mirrors the
+    ``_default_observer_prompt`` design Issue #2345 fix_delta established,
+    OWNER review
+    https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341).
+    Identity remains single-sourced from ``run_cli()``'s own
+    ``uuid.uuid4()``-generated ``run_id`` and ``prepare()``'s ``ctx`` /
+    ``plan`` output -- this function never lets a caller pre-supply or
+    override any of the four identity values (``run_id`` / ``base_sha`` /
+    ``source_set_digest`` / ``observer_id``); doing so would let a caller
+    pre-generate a ``run_id`` and undermine its role-scoped nonce
+    properties (``DelegatedAgentPermissionPolicy`` / the run-scoped temp
+    directory / observer identity all key off it) -- see this Issue's Stop
+    Conditions.
+
+    Background (Issue #2350): prior to this fix, a caller-supplied,
+    substantive investigative prompt passed via ``--prompts-file`` was
+    forwarded to the observer CLI verbatim
+    (``build_observer_requests()``'s ``prompts[spec.observer_id]``) with NO
+    identity-binding instructions at all. An observer receiving such a
+    prompt has no way to know this run's real ``run_id`` / ``base_sha`` /
+    ``source_set_digest`` and therefore cannot legitimately echo them back
+    -- ``run_observer_wave()`` then fail-closed-rejected the mismatched
+    response with ``observer_run_id_mismatch`` (or the
+    ``source_set_digest`` / ``base_sha`` siblings) on every non-empty
+    caller-supplied prompt, a structural gap independently confirmed
+    during Issue #2239 and documented as a "known,
+    independently-confirmed production architecture gap" in
+    ``verify_agent_retrospective_live_smoke.py``'s docstring at the time
+    (``run_retrospective.py`` was outside that Issue's Allowed Paths).
+
+    Fix: this helper always appends the SAME real-identity-binding
+    boilerplate this module's default prompt has used since Issue #2345 --
+    the run's real ``run_id`` / ``base_sha`` / ``source_set_digest`` /
+    ``observer_id`` values, with an explicit instruction to echo them
+    verbatim in the ``OBSERVER_RESULT_V1`` JSON response -- around whatever
+    task text (if any) is supplied. This never asks the caller to
+    pre-generate or discover these identity values itself (structurally
+    impossible for ``source_set_digest`` before ``prepare()`` runs
+    regardless); the SSOT for identity stays exactly where it already was.
+
+    ``task_prompt`` is ``None`` (or empty/whitespace-only) for the
+    default-prompt path -- ``_default_observer_prompt`` is now a thin
+    wrapper around this function passing ``task_prompt=None``. A non-empty
+    ``task_prompt`` is the caller's own investigative instruction text
+    (``--prompts-file``'s per-observer value); this function never itself
+    decides whether an empty caller-supplied prompt is acceptable -- that
+    fail-closed decision remains Issue #2345 P2's ``invalid_observer_prompts``
+    check (``_reject_missing_or_empty_prompts``), applied by
+    ``run_cli()``/``build_observer_requests()`` before this helper ever
+    runs on a caller-supplied prompt."""
+    has_task = task_prompt is not None and task_prompt.strip()
+    if has_task:
+        task_section = (
+            "The following is the caller-supplied investigative task for "
+            "this observer invocation -- use it to decide what to look at "
+            "and what findings (if any) to report:\n\n"
+            f"{task_prompt.strip()}\n\n"
+            "After completing the investigation above, respond"
+        )
+        findings_instruction = (
+            'Populate "findings" with what your investigation above found '
+            "(an empty list if genuinely nothing applicable was found)."
+        )
+        evidence_ref = _CALLER_SUPPLIED_PROMPT_EVIDENCE_REF
+    else:
+        task_section = (
+            "No caller-supplied evidence was provided (this is "
+            "run_retrospective.py's own default prompt, used only when "
+            "--prompts-file is omitted -- Issue #2345). Respond"
+        )
+        findings_instruction = (
+            "Do not invent evidence or findings beyond an empty findings "
+            'list. Set "findings" to [].'
+        )
+        evidence_ref = _DEFAULT_PROMPT_EVIDENCE_REF
     return (
-        f"observer_id={observer_id}. No caller-supplied evidence was "
-        "provided (this is run_retrospective.py's own default prompt, used "
-        "only when --prompts-file is omitted -- Issue #2345). Respond with "
-        "EXACTLY one JSON object (no markdown fence, no prose) conforming "
-        "to OBSERVER_RESULT_V1 (EvidenceBundle):\n"
+        f"observer_id={observer_id}. {task_section} with EXACTLY one JSON "
+        "object (no markdown fence, no prose) conforming to "
+        "OBSERVER_RESULT_V1 (EvidenceBundle):\n"
         "{\n"
         '  "schema_version": "observer_result/v1",\n'
         f'  "run_id": "{run_id}",\n'
         f'  "base_sha": "{base_sha}",\n'
         f'  "source_set_digest": "{source_set_digest}",\n'
         f'  "observer_id": "{observer_id}",\n'
-        f'  "evidence_ref": "{_DEFAULT_PROMPT_EVIDENCE_REF}",\n'
+        f'  "evidence_ref": "{evidence_ref}",\n'
         '  "findings": []\n'
         "}\n"
-        "Echo the run_id/base_sha/source_set_digest/observer_id/"
-        "evidence_ref fields above verbatim; do not invent evidence or "
-        "findings beyond an empty findings list."
+        "The run_id/base_sha/source_set_digest/observer_id fields above "
+        "are this run\'s REAL identity -- never invent or alter these "
+        "four values, copy them into your response verbatim. "
+        f"{findings_instruction}"
     )
 
 
-def build_observer_requests(
-    *, schema_dir: Path, cwd: str, prompts: dict[str, str], timeout_sec: int = 300
-) -> list[AgentInvocationRequest]:
-    """Build the exact 3-observer ``AgentInvocationRequest`` list matching
-    ``EXPECTED_OBSERVER_MANIFEST`` (Issue #2237 P0-2/P0-6). ``prompts`` maps
-    each ``observer_id`` to the prompt text the caller (the root Skill via
-    ``main``'s ``--prompts-file``, or ``run_cli``'s own
-    ``_default_observer_prompt`` fallback -- Issue #2345) has already
-    assembled -- this function never resolves session/evidence content
-    itself (that remains the root Skill's trigger-time responsibility).
-
-    Issue #2345 fix_delta (OWNER review
+def _default_observer_prompt(observer_id: str, *, run_id: str, base_sha: str, source_set_digest: str) -> str:
+    """Issue #2345 fix_delta (OWNER review
     https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
-    P2 item 3): every ``observer_id`` in ``EXPECTED_OBSERVER_MANIFEST``
-    MUST have a non-empty (post-``strip()``) prompt in ``prompts`` -- a
-    missing key or an empty/whitespace-only string is rejected fail-closed
-    with a typed ``WireContractError`` (``reason_code=
-    "invalid_observer_prompts"``) here, locally, before any ``claude`` CLI
-    subprocess is ever invoked. This replaces the previous silent
-    ``prompts.get(spec.observer_id, "")`` fallback, which let an
-    incomplete/partial caller-supplied ``prompts`` dict silently reproduce
-    the original empty-prompt-reaches-the-CLI bug this Issue fixes."""
+    P1 items 1-2): the genuinely non-empty, REAL-identity default prompt
+    used for ``observer_id`` when ``main()``'s ``--prompts-file`` is not
+    supplied. Issue #2350: now a thin wrapper around ``bind_observer_prompt``
+    (``task_prompt=None``) -- the SAME identity-binding helper the
+    caller-supplied-prompt path in ``run_cli()`` also threads through, so
+    both prompt-construction paths can never diverge in how they embed
+    ``run_id`` / ``base_sha`` / ``source_set_digest`` / ``observer_id``."""
+    return bind_observer_prompt(
+        None,
+        observer_id=observer_id,
+        run_id=run_id,
+        base_sha=base_sha,
+        source_set_digest=source_set_digest,
+    )
+
+
+def _reject_missing_or_empty_prompts(prompts: dict[str, str]) -> None:
+    """Issue #2345 fix_delta P2 item 3 (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341):
+    every ``observer_id`` in ``EXPECTED_OBSERVER_MANIFEST`` MUST have a
+    non-empty (post-``strip()``) prompt in ``prompts`` -- a missing key or
+    an empty/whitespace-only string is rejected fail-closed with a typed
+    ``WireContractError`` (``reason_code="invalid_observer_prompts"``)
+    here, locally, before any ``claude`` CLI subprocess is ever invoked or
+    (Issue #2350) any identity is bound onto the prompt text. Shared by
+    ``build_observer_requests`` (direct callers) and ``run_cli``'s
+    caller-supplied-prompt branch (applied to the RAW, pre-
+    ``bind_observer_prompt`` task text -- Issue #2350 never lets
+    identity-binding paper over a genuinely empty caller-supplied prompt,
+    since ``bind_observer_prompt`` always returns non-empty text
+    regardless of its ``task_prompt`` argument)."""
     missing_or_empty = [
         spec.observer_id
         for spec in EXPECTED_OBSERVER_MANIFEST
@@ -1950,6 +2029,26 @@ def build_observer_requests(
             f"invalid_observer_prompts:missing_or_empty={sorted(missing_or_empty)}",
             reason_code="invalid_observer_prompts",
         )
+
+
+def build_observer_requests(
+    *, schema_dir: Path, cwd: str, prompts: dict[str, str], timeout_sec: int = 300
+) -> list[AgentInvocationRequest]:
+    """Build the exact 3-observer ``AgentInvocationRequest`` list matching
+    ``EXPECTED_OBSERVER_MANIFEST`` (Issue #2237 P0-2/P0-6). ``prompts`` maps
+    each ``observer_id`` to the prompt text the caller (the root Skill via
+    ``main``'s ``--prompts-file``, or ``run_cli``'s own
+    ``bind_observer_prompt``-bound prompts -- Issue #2345/#2350) has
+    already assembled -- this function never resolves session/evidence
+    content itself (that remains the root Skill's trigger-time
+    responsibility), and never itself performs identity-binding (that is
+    ``bind_observer_prompt``'s sole responsibility, applied by callers
+    before this function ever sees the prompt text).
+
+    Issue #2345 fix_delta P2 item 3: every ``observer_id`` in
+    ``EXPECTED_OBSERVER_MANIFEST`` MUST have a non-empty (post-``strip()``)
+    prompt in ``prompts`` -- see ``_reject_missing_or_empty_prompts``."""
+    _reject_missing_or_empty_prompts(prompts)
     return [
         AgentInvocationRequest(
             agent_name=spec.observer_id,
@@ -1995,15 +2094,19 @@ def run_cli(
 
     ``prompts`` (Issue #2345 fix_delta, OWNER review
     https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
-    P1 item 1): ``None`` (the default, matching ``main()`` when
-    ``--prompts-file`` is omitted) means "build the default observer
+    P1 item 1; Issue #2350): ``None`` (the default, matching ``main()``
+    when ``--prompts-file`` is omitted) means "build the default observer
     prompts AFTER this call graph's own ``prepare()`` step below has
     produced the REAL ``ctx.run_id``/``ctx.base_sha``/
     ``plan.source_set_digest`` for this run" -- never a fixed placeholder
     identity. A caller-supplied dict (from ``--prompts-file``, or a direct
-    test/Skill caller) is used as-is and validated by
-    ``build_observer_requests`` (every manifest ``observer_id`` must map to
-    a non-empty prompt)."""
+    test/Skill caller) has its per-observer task text validated non-empty
+    (every manifest ``observer_id`` must map to a non-empty prompt --
+    ``_reject_missing_or_empty_prompts``) and then bound to this SAME real
+    identity via ``bind_observer_prompt`` (Issue #2350) -- it is never
+    forwarded to the observer CLI as raw, unbound task text, which
+    previously left every non-empty caller-supplied prompt structurally
+    unable to satisfy ``run_observer_wave()``'s identity checks."""
     manual_trigger_preflight(repo_root=repo_root)
     resolved_run_id = run_id or str(uuid.uuid4())
     policy = DelegatedAgentPermissionPolicy(run_id=resolved_run_id)
@@ -2021,19 +2124,42 @@ def run_cli(
         ctx, plan, results = prepare(
             base_sha_resolver=_base_sha_resolver, collectors=collectors, clock=clock, run_id=resolved_run_id
         )
-        resolved_prompts = (
-            prompts
-            if prompts is not None
-            else {
-                spec.observer_id: _default_observer_prompt(
-                    spec.observer_id,
+        # Issue #2350: BOTH the caller-supplied-prompt path (`prompts`
+        # not None, from `--prompts-file`) and the default-prompt path
+        # (`prompts is None`) are threaded through the SAME identity-
+        # binding helper (`bind_observer_prompt`), using the REAL
+        # `ctx.run_id` / `ctx.base_sha` / `plan.source_set_digest` this
+        # call graph's own `prepare()` step (above) just produced -- never
+        # a fixed placeholder. For the caller-supplied path, the RAW
+        # (pre-binding) prompt text is validated non-empty first via
+        # `_reject_missing_or_empty_prompts` (Issue #2345 P2 item 3);
+        # `bind_observer_prompt` always returns non-empty text regardless
+        # of its `task_prompt` argument, so this raw-text check MUST run
+        # before binding or it would never fire on a genuinely empty
+        # caller-supplied prompt.
+        if prompts is not None:
+            _reject_missing_or_empty_prompts(prompts)
+            resolved_prompts = {
+                spec.observer_id: bind_observer_prompt(
+                    prompts[spec.observer_id],
+                    observer_id=spec.observer_id,
                     run_id=ctx.run_id,
                     base_sha=ctx.base_sha,
                     source_set_digest=plan.source_set_digest,
                 )
                 for spec in EXPECTED_OBSERVER_MANIFEST
             }
-        )
+        else:
+            resolved_prompts = {
+                spec.observer_id: bind_observer_prompt(
+                    None,
+                    observer_id=spec.observer_id,
+                    run_id=ctx.run_id,
+                    base_sha=ctx.base_sha,
+                    source_set_digest=plan.source_set_digest,
+                )
+                for spec in EXPECTED_OBSERVER_MANIFEST
+            }
         observer_requests = build_observer_requests(
             schema_dir=schema_dir, cwd=str(repo_root), prompts=resolved_prompts
         )
