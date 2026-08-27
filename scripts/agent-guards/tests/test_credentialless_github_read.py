@@ -176,34 +176,27 @@ def test_credentialless_public_issue_read_succeeds(issue_number):
     Only `TransportConnectivityFailure` (DNS resolution failure, connection
     refused/reset, no route to host, or a client-side timeout -- i.e. no
     HTTP response was ever received to classify) is treated as an
-    environment SKIP. Every other structured exception the production
-    transport (`github_credentialless_read.py`) can raise for this call --
-    `RateLimitedRejected`, `ForbiddenRejected`,
-    `UnexpectedAuthenticationDependency`, `CanonicalResourceMissing`,
-    `UpstreamEnvironmentFailure` -- and any raw/unmapped
-    `urllib.error.HTTPError` that `_classify_http_error` did not reclassify
-    into one of those, is a real assertion failure, not silently hidden
-    (Issue #2361 AC1/AC2, correcting the previous broad `except
-    urllib.error.URLError` / `except OSError` catches that used to swallow
-    an unmapped HTTPError -- itself a URLError subclass -- as a SKIP)."""
+    environment SKIP. This function does not enumerate the rest of the
+    production transport's exception taxonomy: every other exception --
+    every other `CredentiallessReadError` subclass (`RateLimitedRejected`,
+    `ForbiddenRejected`, `UnexpectedAuthenticationDependency`,
+    `CanonicalResourceMissing`, `UpstreamEnvironmentFailure`,
+    `MalformedResponseBody`, or any future addition), and any raw/unmapped
+    `urllib.error.HTTPError` that `_classify_http_error` did not
+    reclassify -- is left uncaught here and propagates out of this test
+    function, which pytest reports as a FAIL (Issue #2361 AC1/AC2,
+    correcting the previous broad `except urllib.error.URLError` / `except
+    OSError` catches that used to swallow an unmapped HTTPError -- itself a
+    URLError subclass -- as a SKIP). Deliberately not re-enumerating the
+    taxonomy here means a future exception class added to
+    `github_credentialless_read.py` (e.g. `MalformedResponseBody`) FAILs
+    this test by default instead of silently passing through an
+    unconsidered `except` clause (OWNER review, PR #2363 comment
+    5445567396)."""
     try:
         result = gcr.read_public_issue(issue_number)
     except gcr.TransportConnectivityFailure as exc:
         pytest.skip(f"network/DNS unavailable in this environment: {exc}")
-    except (
-        gcr.RateLimitedRejected,
-        gcr.ForbiddenRejected,
-        gcr.UnexpectedAuthenticationDependency,
-        gcr.CanonicalResourceMissing,
-        gcr.UpstreamEnvironmentFailure,
-    ) as exc:
-        pytest.fail(f"AC3 unmet: credentialless public read did not succeed: {exc}")
-    except urllib.error.HTTPError as exc:
-        # An HTTPError that survived `_classify_http_error` unmodified is an
-        # HTTP status the current taxonomy does not map -- it received a
-        # real HTTP response (not a transport failure) and must fail, not
-        # be treated as an environment SKIP (Issue #2361 AC2).
-        pytest.fail(f"AC3 unmet: unclassified HTTP error not covered by taxonomy: {exc}")
 
     assert result["number"] == issue_number
     assert "title" in result

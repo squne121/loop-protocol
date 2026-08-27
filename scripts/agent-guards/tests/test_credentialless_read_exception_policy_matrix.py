@@ -3,25 +3,33 @@ policy inside `test_credentialless_public_issue_read_succeeds`
 (`test_credentialless_github_read.py`, the credentialless GitHub read
 live positive control, Issue #2241 AC3).
 
-The production transport module
-(`scripts/agent-guards/github_credentialless_read.py`) classifies GitHub
-REST failures into a fixed taxonomy: `TransportConnectivityFailure`
-(DNS/egress unavailable -- no HTTP response was ever received),
-`RateLimitedRejected`, `ForbiddenRejected`,
+The live positive-control test's actual design (PR #2363 OWNER review,
+comment 5445567396) does not enumerate the production transport module's
+(`scripts/agent-guards/github_credentialless_read.py`) exception taxonomy
+at all: it catches only `TransportConnectivityFailure` (DNS/egress
+unavailable -- no HTTP response was ever received) and treats that as an
+environment SKIP. Every other exception a `read_public_issue` call can
+raise -- every other `CredentiallessReadError` subclass
+(`RateLimitedRejected`, `ForbiddenRejected`,
 `UnexpectedAuthenticationDependency`, `CanonicalResourceMissing`,
-`UpstreamEnvironmentFailure`, and (for statuses `_classify_http_error`
-does not map) a raw, unmodified `urllib.error.HTTPError`. Per the fixed
-fail-closed contract (Issue #2241 AC3, Issue #2313 investigation), only
-`TransportConnectivityFailure` may be treated as an environment SKIP --
-every other exception in that list must FAIL the test, never be silently
-swallowed.
+`UpstreamEnvironmentFailure`, `MalformedResponseBody`, or any future
+addition to that module) and any raw/unmapped `urllib.error.HTTPError` --
+is left uncaught by the live test and propagates, which pytest reports as
+a FAIL. Because the live test never lists these classes by name, this
+matrix does not need to be updated every time the production taxonomy
+gains a new exception class for the fail-closed contract (Issue #2241
+AC3, Issue #2313 investigation) to keep holding.
 
-This module injects each of those exceptions via `monkeypatch` directly
+This module injects representative exceptions via `monkeypatch` directly
 against the live positive-control test function (loaded from its source
-file, not executed through a nested pytest collection) and asserts it
-reaches the correct pytest outcome (`Skipped` vs `Failed`), so a future
-regression that widens the SKIP net or narrows the FAIL net is caught
-deterministically, without depending on real network access.
+file, not executed through a nested pytest collection) and asserts each
+one reaches the correct pytest outcome: `TransportConnectivityFailure`
+resolves to `pytest.skip.Exception` (SKIP); every other exception
+propagates unmodified out of the test function (which pytest reports as a
+FAIL), verified here by asserting the exact original exception type is
+what escapes -- so a future regression that widens the SKIP net (e.g. an
+added `except` clause that intercepts and skips a non-transport failure)
+is caught deterministically, without depending on real network access.
 """
 
 from __future__ import annotations
@@ -32,7 +40,6 @@ import urllib.error
 from pathlib import Path
 
 import pytest
-from _pytest.outcomes import Failed, Skipped
 
 _GUARDS_DIR = Path(__file__).resolve().parent.parent
 _LIVE_TEST_FILE = _GUARDS_DIR / "tests" / "test_credentialless_github_read.py"
@@ -73,14 +80,15 @@ def test_transport_connectivity_failure_is_skip(monkeypatch):
     """GIVEN `read_public_issue` raises `TransportConnectivityFailure`
     (DNS/egress unavailable -- no HTTP response was ever received)
     WHEN the live positive-control test body runs
-    THEN it resolves to a pytest SKIP, not a FAIL (Issue #2361 AC2)."""
+    THEN it resolves to a pytest SKIP, via the public `pytest.skip.Exception`
+    alias (Issue #2361 AC2)."""
 
     def _raise(issue_number):
         raise gcr.TransportConnectivityFailure("transport_connectivity_failure:test_injected")
 
     monkeypatch.setattr(gcr, "read_public_issue", _raise)
 
-    with pytest.raises(Skipped):
+    with pytest.raises(pytest.skip.Exception):
         _TARGET(1)
 
 
@@ -94,6 +102,7 @@ def test_transport_connectivity_failure_is_skip(monkeypatch):
         ),
         lambda: gcr.CanonicalResourceMissing("canonical_resource_missing:test_injected"),
         lambda: gcr.UpstreamEnvironmentFailure("upstream_environment_failure:test_injected"),
+        lambda: gcr.MalformedResponseBody("malformed_response_body:test_injected"),
     ],
     ids=[
         "RateLimitedRejected",
@@ -101,32 +110,49 @@ def test_transport_connectivity_failure_is_skip(monkeypatch):
         "UnexpectedAuthenticationDependency",
         "CanonicalResourceMissing",
         "UpstreamEnvironmentFailure",
+        "MalformedResponseBody",
     ],
 )
-def test_classified_non_transport_failures_are_fail(monkeypatch, exc_factory):
-    """GIVEN `read_public_issue` raises one of the structured, classified
-    exceptions other than `TransportConnectivityFailure`
+def test_classified_non_transport_failures_propagate_uncaught(monkeypatch, exc_factory):
+    """GIVEN `read_public_issue` raises one of the structured
+    `CredentiallessReadError` subclasses other than
+    `TransportConnectivityFailure` (including `MalformedResponseBody`,
+    which is not derived from an HTTP status via `_classify_http_error`)
     WHEN the live positive-control test body runs
-    THEN it resolves to a pytest FAIL, not a SKIP (Issue #2361 AC2 --
-    matches Issue #2241 AC3's fail-closed contract: a real HTTP response
-    that structurally cannot succeed must never be hidden as an
-    environment SKIP)."""
+    THEN the exact same exception instance propagates uncaught out of the
+    test body -- the live test's only `except` clause matches
+    `TransportConnectivityFailure`, so nothing here is silently downgraded
+    to SKIP -- meaning pytest reports a FAIL when this actually runs under
+    pytest collection (Issue #2361 AC2 -- matches Issue #2241 AC3's
+    fail-closed contract: a real HTTP response that structurally cannot
+    succeed, or a response body that cannot even be parsed, must never be
+    hidden as an environment SKIP). Because the live test does not name
+    this exception's class in an `except` clause, this same assertion
+    holds for any future `CredentiallessReadError` subclass without
+    requiring a change to the live test (PR #2363 OWNER review, comment
+    5445567396)."""
+
+    exc = exc_factory()
 
     def _raise(issue_number):
-        raise exc_factory()
+        raise exc
 
     monkeypatch.setattr(gcr, "read_public_issue", _raise)
 
-    with pytest.raises(Failed):
+    with pytest.raises(type(exc)) as excinfo:
         _TARGET(1)
+    assert excinfo.value is exc
 
 
-def test_unmapped_http_error_is_fail_not_skip(monkeypatch):
+def test_unmapped_http_error_propagates_uncaught(monkeypatch):
     """GIVEN `read_public_issue` raises a raw `urllib.error.HTTPError` for
-    an HTTP status `_classify_http_error` does not map to any of the
-    named taxonomy classes (e.g. HTTP 418)
+    an HTTP status `_classify_http_error` does not map to any named
+    taxonomy class (e.g. HTTP 418)
     WHEN the live positive-control test body runs
-    THEN it resolves to a pytest FAIL, not a SKIP.
+    THEN the `HTTPError` propagates uncaught -- it is not a
+    `TransportConnectivityFailure`, so it is never intercepted -- meaning
+    pytest reports a FAIL when this actually runs under pytest collection,
+    not a SKIP.
 
     This is the exact historical regression Issue #2361 AC2 corrects:
     `urllib.error.HTTPError` is a `urllib.error.URLError` subclass, so the
@@ -145,7 +171,7 @@ def test_unmapped_http_error_is_fail_not_skip(monkeypatch):
 
     monkeypatch.setattr(gcr, "read_public_issue", _raise)
 
-    with pytest.raises(Failed):
+    with pytest.raises(urllib.error.HTTPError):
         _TARGET(1)
 
 
