@@ -162,33 +162,48 @@ def test_list_issue_comments_sends_exact_get_requests_across_pagination(monkeypa
     assert calls[1]["url"] == page_2_url
 
 
+@pytest.mark.github_live
 @pytest.mark.parametrize("issue_number", [1])
 def test_credentialless_public_issue_read_succeeds(issue_number):
     """GIVEN a real, public GitHub Issue in squne121/loop-protocol
     WHEN `read_public_issue` is called with no authentication configured
     THEN the read succeeds and returns the issue's canonical JSON body
-    (Issue #2241 AC3). Only DNS/egress-unavailable failures are treated as
-    an environment SKIP; any HTTP response (including error statuses) is a
-    real assertion, not silently hidden (PR #2247 review P1-4.1)."""
+    (Issue #2241 AC3). This is a live-network positive control, so it is
+    marked `github_live` and deselected from the default (required) pytest
+    run (Issue #2361 AC1) -- shared-runner GitHub API quota / network
+    availability must never gate required CI.
+
+    Only `TransportConnectivityFailure` (DNS resolution failure, connection
+    refused/reset, no route to host, or a client-side timeout -- i.e. no
+    HTTP response was ever received to classify) is treated as an
+    environment SKIP. Every other structured exception the production
+    transport (`github_credentialless_read.py`) can raise for this call --
+    `RateLimitedRejected`, `ForbiddenRejected`,
+    `UnexpectedAuthenticationDependency`, `CanonicalResourceMissing`,
+    `UpstreamEnvironmentFailure` -- and any raw/unmapped
+    `urllib.error.HTTPError` that `_classify_http_error` did not reclassify
+    into one of those, is a real assertion failure, not silently hidden
+    (Issue #2361 AC1/AC2, correcting the previous broad `except
+    urllib.error.URLError` / `except OSError` catches that used to swallow
+    an unmapped HTTPError -- itself a URLError subclass -- as a SKIP)."""
     try:
         result = gcr.read_public_issue(issue_number)
-    except gcr.UpstreamEnvironmentFailure as exc:
-        pytest.skip(f"upstream 5xx, not a boundary/logic failure: {exc}")
-    except (gcr.RateLimitedRejected, gcr.UnexpectedAuthenticationDependency,
-            gcr.CanonicalResourceMissing) as exc:
-        pytest.fail(f"AC3 unmet: credentialless public read did not succeed: {exc}")
-    except urllib.error.URLError as exc:
-        # DNS resolution failure / connection refused / no route to host --
-        # egress is unavailable in this sandbox, not a real assertion
-        # failure. urllib.error.HTTPError is a URLError subclass, but any
-        # HTTPError actually received here was already reclassified by
-        # `_classify_http_error` into one of the exception classes caught
-        # above (or re-raised unmodified for unmapped statuses, which are
-        # deliberately NOT skipped -- see the bare `except OSError` clause
-        # below for genuinely transport-level failures only).
+    except gcr.TransportConnectivityFailure as exc:
         pytest.skip(f"network/DNS unavailable in this environment: {exc}")
-    except OSError as exc:  # pragma: no cover - transport-level only
-        pytest.skip(f"network unavailable in this environment: {exc}")
+    except (
+        gcr.RateLimitedRejected,
+        gcr.ForbiddenRejected,
+        gcr.UnexpectedAuthenticationDependency,
+        gcr.CanonicalResourceMissing,
+        gcr.UpstreamEnvironmentFailure,
+    ) as exc:
+        pytest.fail(f"AC3 unmet: credentialless public read did not succeed: {exc}")
+    except urllib.error.HTTPError as exc:
+        # An HTTPError that survived `_classify_http_error` unmodified is an
+        # HTTP status the current taxonomy does not map -- it received a
+        # real HTTP response (not a transport failure) and must fail, not
+        # be treated as an environment SKIP (Issue #2361 AC2).
+        pytest.fail(f"AC3 unmet: unclassified HTTP error not covered by taxonomy: {exc}")
 
     assert result["number"] == issue_number
     assert "title" in result
