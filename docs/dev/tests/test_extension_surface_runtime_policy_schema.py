@@ -8,10 +8,12 @@ VC preflight の allowlist は `python3 -c` インライン実行を許可しな
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
 import jsonschema
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -93,3 +95,90 @@ def test_auto_mode_assumption_min_version_is_2_1_83_or_higher() -> None:
             f"claim {claim['claim_id']!r} min_claude_code_version {version!r} "
             "is below 2.1.83"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2356 AC1 / AC6: `issue_time_enforcement` field on the project
+# selector object definition accepts `hard` / `advisory` and rejects
+# invalid values (negative case).
+# ---------------------------------------------------------------------------
+
+
+def _find_skill_invocation_rule(policy: dict) -> dict:
+    for rule in policy["rules"]:
+        if rule["id"] == "skill-invocation-procedure-or-contract-change":
+            return rule
+    raise AssertionError(
+        "policy yaml has no 'skill-invocation-procedure-or-contract-change' rule"
+    )
+
+
+def test_issue_time_enforcement_field_present_and_valid_on_split_selectors() -> None:
+    """AC1/AC6 positive case: the live policy YAML's
+    `skill-invocation-procedure-or-contract-change` rule already declares
+    `issue_time_enforcement: hard` / `advisory` on its project selectors,
+    and the whole document validates against the schema (which must
+    therefore accept the field with these enum values).
+    """
+    policy = _load_policy()
+    schema = _load_schema()
+    rule = _find_skill_invocation_rule(policy)
+    project_selectors = [s for s in rule["selectors"] if s["source_scope"] == "project"]
+    declared_values = {s.get("issue_time_enforcement") for s in project_selectors}
+    assert declared_values == {"hard", "advisory"}
+    # A clean return (no exception) means the schema accepts these values.
+    jsonschema.validate(instance=policy, schema=schema)
+
+
+def test_issue_time_enforcement_field_rejects_invalid_value() -> None:
+    """AC1/AC6 negative case: a selector declaring an `issue_time_enforcement`
+    value outside the `hard`/`advisory` enum must fail schema validation.
+    """
+    policy = copy.deepcopy(_load_policy())
+    schema = _load_schema()
+    rule = _find_skill_invocation_rule(policy)
+    project_selector = next(s for s in rule["selectors"] if s["source_scope"] == "project")
+    project_selector["issue_time_enforcement"] = "not-a-real-enforcement-level"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=policy, schema=schema)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2356 AC2: the `skill-invocation-procedure-or-contract-change` rule,
+# after the selector split, has exactly a `.claude/skills/**/SKILL.md`
+# selector with `issue_time_enforcement: hard` and a
+# `.claude/skills/**/scripts/**` selector with `issue_time_enforcement:
+# advisory` -- asserted on the parsed YAML structure, not a loose text match.
+# ---------------------------------------------------------------------------
+
+
+def test_skill_invocation_rule_selectors_split_skill_md_hard_scripts_advisory() -> None:
+    policy = _load_policy()
+    rule = _find_skill_invocation_rule(policy)
+    project_selectors = [s for s in rule["selectors"] if s["source_scope"] == "project"]
+
+    skill_md_selectors = [
+        s for s in project_selectors if s.get("path_globs") == [".claude/skills/**/SKILL.md"]
+    ]
+    scripts_selectors = [
+        s for s in project_selectors if s.get("path_globs") == [".claude/skills/**/scripts/**"]
+    ]
+
+    assert len(skill_md_selectors) == 1, (
+        "expected exactly one project selector with path_globs == "
+        "['.claude/skills/**/SKILL.md']"
+    )
+    assert len(scripts_selectors) == 1, (
+        "expected exactly one project selector with path_globs == "
+        "['.claude/skills/**/scripts/**']"
+    )
+    assert skill_md_selectors[0]["issue_time_enforcement"] == "hard"
+    assert scripts_selectors[0]["issue_time_enforcement"] == "advisory"
+
+    # No single project selector should still carry both globs bundled
+    # together (the pre-#2356 shape this Issue splits apart).
+    for selector in project_selectors:
+        globs = selector.get("path_globs") or []
+        assert not (
+            ".claude/skills/**/SKILL.md" in globs and ".claude/skills/**/scripts/**" in globs
+        ), "SKILL.md and scripts/** must live in separate project selectors"
