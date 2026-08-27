@@ -83,6 +83,24 @@ _RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS = (
     ".claude/worktrees",
     ".claude/artifacts/issue-refinement-loop",
     "artifacts/session-manifest-runtime",
+    # Issue #1526: `.pytest_cache` (repo-root pytest cacheprovider directory,
+    # ignored via `.gitignore:69`). pytest's own `NFPlugin`/`LFPlugin`
+    # (registered together in `_pytest/cacheprovider.py`'s `pytest_configure`
+    # hookimpl) write `cache/nodeids` and `cache/lastfailed` unconditionally
+    # from `pytest_sessionfinish`, and third-party plugins can write arbitrary
+    # additional keys under `.pytest_cache/v/cache/` via the public
+    # `config.cache` API -- none of this is canonical evidence, it is
+    # concurrent peer pytest's ordinary generated/disposable cache state that
+    # this stdlib-only snapshot diff cannot attribute to the executor child
+    # vs. a peer process. `.pytest_cache/CACHEDIR.TAG` and its own
+    # auto-generated `.gitignore: *` already self-declare the directory as
+    # regenerable. Unlike `_LEDGER_*`/`_SHADOW_LOG_EXACT_REL` below, there is
+    # no single stable-identity file here whose symlink/directory/FIFO/
+    # socket/device substitution would need typed exact-file protection --
+    # the whole tree is disposable, so the directory-root exclusion class
+    # used for the peer roots above is the right shape, not the typed
+    # exact-file policy.
+    ".pytest_cache",
 )
 # Issue #1563: `.guard_shadow_log.jsonl` (repo-root peer-append log written by
 # `.claude/hooks/shadow_log.py`, `.claude/hooks/guard-japanese-prose.sh`,
