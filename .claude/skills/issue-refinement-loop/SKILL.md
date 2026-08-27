@@ -205,7 +205,7 @@ isolation agent は `skill_runtime_exec.py`（exact executor）を自ら実行�
 
 ### Step 1: 事前調査 (Investigation)
 
-`REFINEMENT_LOOP_PLAN_V1.decisions.investigation_policy.required == true` の場合のみ `codebase-investigator` を起動する。返却される構造化結果を受け取り、`final_classification` の確定責務は main thread が保持する。SubAgent は mutation してはいけない。起動時は呼び出し入力として `agy_advisory_native_fallback_allowed: true` を明示的に渡す（AGY delegation wrapper が `failure_class`〈代表ケース: `agy_timeout`〉を返した場合に限り `codebase-investigator` 自身が bounded native read-only investigation〈Read/Grep/Glob〉へフォールバックできる。詳細は `.claude/agents/codebase-investigator.md` の「AGY advisory native fallback」節。未指定時は既定どおり fail-close。`root_entry_router.py::capability_preflight_result()` / `workflow_start_entry.py` への新配線は行わない — Issue #2360 Out of Scope）。
+`REFINEMENT_LOOP_PLAN_V1.decisions.investigation_policy.required == true` の場合のみ `codebase-investigator` を起動する。返却される構造化結果を受け取り、`final_classification` の確定責務は main thread が保持する。SubAgent は mutation してはいけない。起動時は呼び出し入力として `agy_advisory_native_fallback_allowed: true` を明示的に渡す（AGY delegation wrapper が `failure_class`〈代表ケース: `agy_timeout`〉を返した場合に限り `codebase-investigator` 自身が bounded native investigation〈non-mutating investigation policy。Read/Grep/Glob + bounded Bash〉へフォールバックできる。詳細は `.claude/agents/codebase-investigator.md` の「AGY advisory native fallback」節。未指定時は既定どおり fail-close。`root_entry_router.py::capability_preflight_result()` / `workflow_start_entry.py` への新配線は行わない — Issue #2360 Out of Scope）。
 
 anchor comment の fact-check 契約、`ANCHOR_COMMENT_CONTEXT_V1`、`ANCHOR_COMMENT_FACT_CHECK_RESULT_V1`、`REPO_EVIDENCE_REF_V1` の扱いは `references/anchor-comment-handling.md` を参照する。
 

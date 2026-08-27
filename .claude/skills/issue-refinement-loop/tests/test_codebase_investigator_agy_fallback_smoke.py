@@ -2,36 +2,65 @@
 fallback (AC3/AC4, `decision: immediate` per `## Runtime Verification
 Applicability`).
 
-Two independent scenarios are covered:
+Two independent, deliberately separate proofs are combined here into a
+**composed proof** (not a single end-to-end AGY producer test, per the OWNER
+PR #2365 review comment https://github.com/squne121/loop-protocol/pull/2365
+#issuecomment-5445622166 -- see "false integration proof" P0 finding):
 
-- ``-k live_smoke`` (AC3): a real, bounded ``claude -p --agent
-  codebase-investigator`` invocation is launched exactly once. A fake AGY
-  delegation wrapper failure (``ok: false``, ``failure_class: agy_timeout`` --
-  the taxonomy's representative non-retryable AGY-side failure, see
+- ``-k live_smoke`` (AC3, "live consumer smoke"): a real, bounded ``claude -p
+  --agent codebase-investigator`` invocation is launched exactly once, using
+  ``--permission-mode dontAsk`` (matching the production frontmatter's
+  ``permissionMode: dontAsk`` -- not ``bypassPermissions``, which bypasses the
+  tool-allow boundary entirely and therefore cannot prove anything about the
+  production permission mode). A fake AGY delegation wrapper failure
+  (``ok: false``, ``failure_class: agy_timeout`` -- the taxonomy's
+  representative non-retryable AGY-side failure, see
   ``.claude/skills/gemini-cli-headless-delegation/references/failure-class-taxonomy.md``)
   is supplied as a pre-completed test double in the task prompt, together
   with an explicit ``agy_advisory_native_fallback_allowed: true`` opt-in.
-  The test asserts that the live SubAgent (a) transitions to bounded native
-  read-only investigation (Read/Grep/Glob only -- no Edit/Write/MultiEdit
-  tool_use is ever observed), (b) successfully retrieves a unique sentinel
-  marker placed inside the worktree, (c) reports ``status: ok`` in its final
-  ``CODEBASE_INVESTIGATION_RESULT_V1``, and (d) leaves the worktree's tracked
-  files byte-for-byte unchanged (``git status --porcelain`` diff before vs.
-  after is empty). Per this Issue's ``skip_conditions``, the test SKIPs
-  (never fabricates PASS) when the real Claude Code SubAgent launch
-  environment is unavailable (``claude`` missing from PATH, or a transport
-  failure whose stdout/stderr matches a known environment-unavailable
-  marker such as ``Please run /login``).
+  This test does **not** exercise the real AGY delegation wrapper /
+  ``run_gemini_headless.py`` invocation itself (that producer-side behavior is
+  independently covered by the existing ``gemini-cli-headless-delegation``
+  wrapper test suite, which is the other half of this composed proof). What
+  this test verifies is the **consumer/fallback behavior**: given a
+  schema-valid fake failure result and the opt-in flag, does the live
+  SubAgent (a) transition to bounded native investigation under the
+  non-mutating investigation policy (Read/Grep/Glob plus bounded, read-only
+  Bash such as ``git rev-parse`` and hash computation -- no Edit/Write/
+  MultiEdit tool_use is ever observed), (b) successfully retrieve a unique
+  sentinel marker placed inside the worktree, (c) report a final
+  ``CODEBASE_INVESTIGATION_RESULT_V1`` that actually YAML-parses and contains
+  all of the schema's fields (``schema_version``, ``status``,
+  ``investigation_route``, ``evidence_refs``, ``discovery_summary``,
+  ``impact_scope``, ``failure_reason``, ``source_evidence_result``), with an
+  ``evidence_refs`` entry carrying non-placeholder verification metadata
+  (``commit_sha`` / ``excerpt_sha256`` / ``verification_status`` /
+  ``verification_method``) and a ``discovery_summary`` that explicitly
+  discloses the fallback route (mentions the observed ``failure_class`` and
+  that native fallback was used), and (d) leaves the worktree's tracked
+  files' ``git status --porcelain`` output unchanged across the invocation
+  (a narrower claim than "byte-for-byte unchanged": this only proves tracked
+  file state as reported by git is unchanged, not that no untracked/ignored
+  side effects occurred anywhere on disk). Per this Issue's
+  ``skip_conditions``, the test SKIPs (never fabricates PASS) when the real
+  Claude Code SubAgent launch environment is unavailable (``claude`` missing
+  from PATH, or a transport failure whose stdout/stderr matches a known
+  environment-unavailable marker such as ``Please run /login``).
 
 - ``-k fail_closed`` (AC4): hermetic (no subprocess, no network) checks that
   (1) a pure mirror of the documented transition-condition predicate in
   ``.claude/agents/codebase-investigator.md`` forbids native fallback
   whenever ``agy_advisory_native_fallback_allowed`` is unset/false --
-  regardless of ``failure_class`` -- and forbids it for
-  permission-boundary-classified failures even when the flag is ``true``;
-  and (2) the agent definition's own prose documents this default
-  fail-closed behavior and the permission-boundary exclusion, so the mirror
-  and the SubAgent-owned prose cannot silently drift apart.
+  regardless of ``failure_class`` -- and forbids it for any
+  ``failure_class`` value that indicates a contract/policy/boundary
+  violation (permission-boundary classifications, plus
+  ``agy_invocation_policy_denied`` / ``request_policy_denied`` /
+  ``request_schema_invalid`` / ``github_research_command_denied``) even when
+  the flag is ``true``; and (2) the agent definition's own prose documents
+  this default fail-closed behavior and each of those excluded
+  classifications, so the mirror and the SubAgent-owned prose cannot
+  silently drift apart. This is a small negative policy (explicitly listed
+  exclusions), not an exhaustive allowlist of every taxonomy value.
 
 SKIP is never converted to PASS (``fallback_success_is_pass: false`` per
 this Issue's Runtime Verification Applicability).
@@ -48,6 +77,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import yaml
 
 _THIS_FILE = Path(__file__).resolve()
 # tests/ -> issue-refinement-loop/ -> skills/ -> .claude/ -> repo (or worktree) root
@@ -79,6 +109,44 @@ _PERMISSION_BOUNDARY_FAILURE_CLASSES = frozenset(
         "agy_permission_boundary_unavailable",
         "agy_permission_boundary_inconclusive",
     }
+)
+
+# Contract/policy validation failures (request-time or invocation-time policy
+# denials) -- distinct from operational (provider outage / timeout / quota)
+# failures. Native-fallback-and-report-success would hide a caller-side bug
+# for these, so they are excluded from the fallback opt-in even when
+# `agy_advisory_native_fallback_allowed: true` (OWNER PR #2365 review,
+# P1 finding: "failure_class の predicate が広すぎる"). This is a small
+# negative list, not an exhaustive allowlist of the whole taxonomy.
+_CONTRACT_POLICY_VIOLATION_FAILURE_CLASSES = frozenset(
+    {
+        "agy_invocation_policy_denied",
+        "request_policy_denied",
+        "request_schema_invalid",
+        "github_research_command_denied",
+    }
+)
+
+_FALLBACK_DENIED_FAILURE_CLASSES = (
+    _PERMISSION_BOUNDARY_FAILURE_CLASSES | _CONTRACT_POLICY_VIOLATION_FAILURE_CLASSES
+)
+
+_REQUIRED_RESULT_FIELDS = (
+    "schema_version",
+    "status",
+    "investigation_route",
+    "evidence_refs",
+    "discovery_summary",
+    "impact_scope",
+    "failure_reason",
+    "source_evidence_result",
+)
+
+_REQUIRED_EVIDENCE_VERIFICATION_FIELDS = (
+    "commit_sha",
+    "excerpt_sha256",
+    "verification_status",
+    "verification_method",
 )
 
 
@@ -125,6 +193,35 @@ def _write_runtime_verification_log(
     return log_path
 
 
+def _extract_investigation_result(text: str) -> dict:
+    """Extracts and YAML-parses the CODEBASE_INVESTIGATION_RESULT_V1 block
+    from a live SubAgent's final message text.
+
+    Tries fenced ```yaml (or ```yml) code blocks first, then falls back to
+    slicing from the first literal ``CODEBASE_INVESTIGATION_RESULT_V1``
+    occurrence to end-of-text. Returns ``{}`` if no candidate YAML-parses
+    into a dict carrying at least a ``status`` field (never fabricates a
+    result out of unparseable text).
+    """
+    candidates: list[str] = list(re.findall(r"```ya?ml\n(.*?)```", text, re.DOTALL))
+    idx = text.find("CODEBASE_INVESTIGATION_RESULT_V1")
+    if idx != -1:
+        candidates.append(text[idx:])
+    for candidate in candidates:
+        try:
+            parsed = yaml.safe_load(candidate)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        inner = parsed.get("CODEBASE_INVESTIGATION_RESULT_V1")
+        if isinstance(inner, dict):
+            return inner
+        if "status" in parsed:
+            return parsed
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Pure mirror of the documented transition-condition predicate (AC4, hermetic)
 # ---------------------------------------------------------------------------
@@ -137,16 +234,16 @@ def _native_fallback_transition_allowed(
     ``.claude/agents/codebase-investigator.md`` -- "AGY advisory native
     fallback" section. This is a hermetic Python re-statement of the
     SubAgent's own documented decision predicate, used only to pin the
-    *default-forbidden* and *permission-boundary-excluded* invariants down
-    with a fast, deterministic, non-live test. It is not consumed by any
-    production code path (the SubAgent itself is prompt-driven, not
-    Python-driven).
+    *default-forbidden* and *contract/policy/boundary-violation-excluded*
+    invariants down with a fast, deterministic, non-live test. It is not
+    consumed by any production code path (the SubAgent itself is
+    prompt-driven, not Python-driven).
     """
     if agy_advisory_native_fallback_allowed is not True:
         return False
     if not failure_class:
         return False
-    if failure_class in _PERMISSION_BOUNDARY_FAILURE_CLASSES:
+    if failure_class in _FALLBACK_DENIED_FAILURE_CLASSES:
         return False
     return True
 
@@ -201,6 +298,25 @@ class TestFailClosedDefault:
                 is False
             ), f"expected fail-closed for {failure_class!r} even with the flag set to true"
 
+    def test_fail_closed_contract_policy_violation_failure_class_forbidden_even_when_allowed(
+        self,
+    ):
+        """GIVEN agy_advisory_native_fallback_allowed: true
+        WHEN the observed failure_class indicates a caller-side contract/policy
+        violation (agy_invocation_policy_denied / request_policy_denied /
+        request_schema_invalid / github_research_command_denied)
+        THEN native fallback must still be forbidden -- native-fallback-and-
+        report-success would otherwise hide a caller-side bug (OWNER PR #2365
+        review P1 finding).
+        """
+        for failure_class in sorted(_CONTRACT_POLICY_VIOLATION_FAILURE_CLASSES):
+            assert (
+                _native_fallback_transition_allowed(
+                    agy_advisory_native_fallback_allowed=True, failure_class=failure_class
+                )
+                is False
+            ), f"expected fail-closed for {failure_class!r} even with the flag set to true"
+
     def test_fail_closed_missing_failure_class_forbidden_even_when_allowed(self):
         """GIVEN agy_advisory_native_fallback_allowed: true
         WHEN the wrapper's ok: false result does not expose an observable
@@ -240,23 +356,70 @@ class TestFailClosedDefault:
                 f"agent definition does not mention the excluded failure_class {failure_class!r}"
             )
 
+    def test_fail_closed_contract_policy_violation_exclusion_documented(self):
+        """The agent definition must document that contract/policy-violation
+        failure_class values (agy_invocation_policy_denied /
+        request_policy_denied / request_schema_invalid /
+        github_research_command_denied) are excluded from the fallback opt-in
+        even when the caller explicitly allows fallback -- so the negative
+        policy in the hermetic mirror and the SubAgent-owned prose cannot
+        silently drift apart."""
+        text = _read(_AGENT_MD_PATH)
+        for failure_class in sorted(_CONTRACT_POLICY_VIOLATION_FAILURE_CLASSES):
+            assert failure_class in text, (
+                f"agent definition does not mention the excluded failure_class {failure_class!r}"
+            )
+
+    def test_fail_closed_rule_3_and_fallback_section_do_not_contradict(self):
+        """OWNER PR #2365 review P0 finding: Evidence Handling Rule 3 (fail-
+        close on wrapper ok: false) and the "AGY advisory native fallback"
+        section must be a single, non-contradictory rule -- not two
+        independent system-prompt instructions that can silently disagree.
+        This is a textual invariant: Rule 3's own prose must reference the
+        opt-in flag and defer to the fallback section for eligible failures,
+        rather than stating an unconditional prohibition."""
+        text = _read(_AGENT_MD_PATH)
+        rule_3_match = re.search(
+            r"#### Rule 3:.*?(?=\n#### |\Z)", text, re.DOTALL
+        )
+        assert rule_3_match, "Evidence Handling Rule 3 section not found"
+        rule_3_text = rule_3_match.group(0)
+        assert "agy_advisory_native_fallback_allowed" in rule_3_text, (
+            "Rule 3 must reference agy_advisory_native_fallback_allowed so it "
+            "does not silently contradict the AGY advisory native fallback section"
+        )
+        assert "AGY advisory native fallback" in rule_3_text, (
+            "Rule 3 must explicitly defer to the AGY advisory native fallback "
+            "section for eligible operational failures"
+        )
+
 
 # ---------------------------------------------------------------------------
-# AC3: live runtime smoke (real, bounded SubAgent launch)
+# AC3: live consumer smoke (real, bounded SubAgent launch; composed proof --
+# see module docstring for what this test does and does not prove)
 # ---------------------------------------------------------------------------
 
 
-def test_live_smoke_agy_timeout_native_fallback_when_allowed():
-    """GIVEN a real, bounded `claude -p --agent codebase-investigator` launch,
-    a fake AGY delegation wrapper failure (ok: false, failure_class:
-    agy_timeout) supplied as an already-completed test double, and an
-    explicit agy_advisory_native_fallback_allowed: true opt-in
+def test_live_smoke_consumer_agy_timeout_native_fallback_when_allowed():
+    """GIVEN a real, bounded `claude -p --agent codebase-investigator` launch
+    (using --permission-mode dontAsk, matching the production frontmatter's
+    permissionMode: dontAsk), a fake AGY delegation wrapper failure
+    (ok: false, failure_class: agy_timeout) supplied as an already-completed
+    test double, and an explicit agy_advisory_native_fallback_allowed: true
+    opt-in
     WHEN the live SubAgent decides how to proceed per its own operating
     instructions (`.claude/agents/codebase-investigator.md`)
-    THEN it transitions to bounded native read-only investigation (no
-    Edit/Write/MultiEdit tool_use observed), retrieves a unique sentinel
-    marker placed inside the worktree, reports status: ok, and leaves the
-    worktree's tracked files byte-for-byte unchanged.
+    THEN it transitions to bounded native investigation under the
+    non-mutating investigation policy (no Edit/Write/MultiEdit tool_use
+    observed), retrieves a unique sentinel marker placed inside the
+    worktree, reports a CODEBASE_INVESTIGATION_RESULT_V1 that YAML-parses
+    with all required fields and non-placeholder evidence verification
+    metadata plus an explicit fallback disclosure, and leaves the worktree's
+    tracked-file git status unchanged.
+
+    This is the "consumer/fallback behavior" half of a composed proof (see
+    module docstring); it does not launch the real AGY delegation wrapper
+    itself.
 
     Per Issue #2360's skip_conditions: SKIPs (never fabricates PASS) when
     the real Claude Code SubAgent launch environment is unavailable.
@@ -319,13 +482,28 @@ JSON result was:
 Per your own operating instructions in codebase-investigator.md (the "AGY
 advisory native fallback" section), given the above wrapper failure
 (ok: false, failure_class: agy_timeout) and the explicit
-agy_advisory_native_fallback_allowed: true input, decide what to do next and
-carry it out. You must not use Edit, Write, MultiEdit, or any Bash command
-that mutates files or git state. Use Read (and Grep/Glob only if needed) to
-read {sentinel_path} and report its exact content.
+agy_advisory_native_fallback_allowed: true input, carry out the native
+fallback under the non-mutating investigation policy:
 
-Report the final CODEBASE_INVESTIGATION_RESULT_V1 (YAML) as your last
-message.
+1. Use Read to read {sentinel_path} and confirm its exact content.
+2. Use Bash to run `git rev-parse HEAD` (read-only, non-mutating) to resolve
+   the current commit_sha.
+3. Use Bash to run `sha256sum {sentinel_path}` (read-only, non-mutating) to
+   compute the excerpt_sha256 of the file you just read.
+4. You must not use Edit, Write, MultiEdit, or any Bash command that mutates
+   files or git state (no writes, no git add/commit/checkout/reset, etc.).
+5. Report the final CODEBASE_INVESTIGATION_RESULT_V1 (YAML) as your last
+   message, inside a ```yaml code fence. It MUST include every one of:
+   schema_version, status, investigation_route, evidence_refs,
+   discovery_summary, impact_scope, failure_reason, source_evidence_result.
+   The evidence_refs entry for {sentinel_path} MUST include commit_sha (the
+   value from step 2), excerpt_sha256 (the value from step 3),
+   verification_status: verified, and verification_method (name the method,
+   e.g. native_fallback_bash_git_rev_parse_sha256sum). discovery_summary
+   MUST explicitly state that the AGY delegation wrapper failed with
+   failure_class: agy_timeout and that you completed this investigation via
+   the native fallback route because agy_advisory_native_fallback_allowed
+   was true.
 """
 
     argv = [
@@ -341,7 +519,7 @@ message.
         "12",
         "--verbose",
         "--permission-mode",
-        "bypassPermissions",
+        "dontAsk",
     ]
 
     before_status = _git_porcelain_status(_REPO_ROOT)
@@ -408,6 +586,26 @@ message.
 
     mutating_tool_uses = [t for t in tool_uses if t["name"] in _MUTATING_TOOL_NAMES]
 
+    result_dict = _extract_investigation_result(final_result_text)
+    missing_fields = [f for f in _REQUIRED_RESULT_FIELDS if f not in result_dict]
+
+    evidence_refs = result_dict.get("evidence_refs") or []
+    evidence_verification_ok = False
+    evidence_missing_fields: list[str] = []
+    if isinstance(evidence_refs, list) and evidence_refs:
+        first_evidence = evidence_refs[0] if isinstance(evidence_refs[0], dict) else {}
+        evidence_missing_fields = [
+            f
+            for f in _REQUIRED_EVIDENCE_VERIFICATION_FIELDS
+            if not first_evidence.get(f)
+        ]
+        evidence_verification_ok = not evidence_missing_fields
+
+    discovery_summary = str(result_dict.get("discovery_summary") or "")
+    fallback_disclosed = (
+        "agy_timeout" in discovery_summary and "fallback" in discovery_summary.lower()
+    )
+
     payload = {
         "argv": argv,
         "returncode": proc.returncode,
@@ -416,9 +614,13 @@ message.
         "tool_uses": tool_uses,
         "mutating_tool_uses": mutating_tool_uses,
         "final_result_excerpt": final_result_text[:4000],
+        "result_dict": result_dict,
+        "missing_fields": missing_fields,
+        "evidence_missing_fields": evidence_missing_fields,
+        "fallback_disclosed": fallback_disclosed,
         "git_status_before": before_status,
         "git_status_after": after_status,
-        "worktree_unchanged": before_status == after_status,
+        "tracked_worktree_status_unchanged": before_status == after_status,
         "parse_errors": parse_errors,
     }
 
@@ -427,15 +629,21 @@ message.
         and not mutating_tool_uses
         and before_status == after_status
         and marker in final_result_text
-        and re.search(r"status:\s*ok", final_result_text) is not None
+        and not missing_fields
+        and result_dict.get("status") == "ok"
+        and evidence_verification_ok
+        and fallback_disclosed
     )
 
     log_path = _write_runtime_verification_log(
         ac="AC3",
         verdict="PASS" if verdict_ok else "FAIL",
         reason=(
-            "native fallback executed, sentinel evidence retrieved, status: ok reported,"
-            " no mutating tool_use observed, worktree unchanged"
+            "native fallback executed, sentinel evidence retrieved, final"
+            " CODEBASE_INVESTIGATION_RESULT_V1 YAML-parsed with all required"
+            " fields and verification metadata, fallback disclosed in"
+            " discovery_summary, no mutating tool_use observed, tracked"
+            " worktree status unchanged"
             if verdict_ok
             else "one or more assertions failed -- see payload"
         ),
@@ -449,12 +657,26 @@ message.
         f"mutating tool_use observed during native fallback: {mutating_tool_uses}; see {log_path}"
     )
     assert before_status == after_status, (
-        "worktree tracked-file state changed across the live SubAgent invocation"
-        f" (mutation detected); see {log_path}"
+        "tracked worktree status (git status --porcelain) changed across the"
+        f" live SubAgent invocation (mutation detected); see {log_path}"
     )
     assert marker in final_result_text, (
         f"sentinel marker {marker!r} not found in final SubAgent result; see {log_path}"
     )
-    assert re.search(r"status:\s*ok", final_result_text) is not None, (
-        f"final SubAgent result did not report status: ok; see {log_path}"
+    assert not missing_fields, (
+        "final CODEBASE_INVESTIGATION_RESULT_V1 did not YAML-parse with all required"
+        f" fields; missing={missing_fields}; parsed={result_dict}; see {log_path}"
+    )
+    assert result_dict.get("status") == "ok", (
+        f"final SubAgent result did not report status: ok (got {result_dict.get('status')!r});"
+        f" see {log_path}"
+    )
+    assert evidence_verification_ok, (
+        "evidence_refs entry is missing non-placeholder verification metadata"
+        f" ({_REQUIRED_EVIDENCE_VERIFICATION_FIELDS}); missing={evidence_missing_fields};"
+        f" evidence_refs={evidence_refs}; see {log_path}"
+    )
+    assert fallback_disclosed, (
+        "discovery_summary did not explicitly disclose the agy_timeout failure_class"
+        f" and native fallback route; discovery_summary={discovery_summary!r}; see {log_path}"
     )
