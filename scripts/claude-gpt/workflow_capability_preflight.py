@@ -54,11 +54,19 @@ import trusted_runtime_capabilities as trusted_uv_mod  # noqa: E402
 
 # Issue #2340 AC2/AC3: the `controlled_github_read` actor-scoped probe below
 # needs the SAME ambient-env sanitize-key set as
-# `controlled_skill_mutation_exec.py::_build_metadata_sanitized_env()`
-# (`controlled_skill_mutation_policy.ENV_SANITIZE_KEYS`), so this preflight's
-# `controlled_github_read` verdict reflects the EXACT credential/host
-# context the downstream issue-editor / contract-update lane executes its
-# GitHub read/write subprocess calls under.
+# `controlled_skill_mutation_exec.py::_build_metadata_sanitized_env()`, so
+# this preflight's `controlled_github_read` verdict reflects the EXACT
+# credential/host context the downstream issue-editor / contract-update
+# lane executes its GitHub read/write subprocess calls under.
+#
+# Issue #2340 fix_delta P0-1 (PR #2357 review, 2026-08-27): this list
+# strips execution/log-hygiene NOISE only, not the GitHub credential
+# carrier. `GH_CONFIG_DIR` / `GH_TOKEN` / `GITHUB_TOKEN` are deliberately
+# left intact -- this probe must observe the SAME credential availability
+# the controlled executor's write helpers do post-fix, otherwise a
+# `controlled_github_read: ready` verdict here would not actually predict
+# whether the downstream write can authenticate (see
+# `controlled_skill_mutation_exec._METADATA_ENV_NOISE_STRIP_KEYS`).
 #
 # This list is intentionally DUPLICATED here (not imported), matching the
 # same pattern `.claude/skills/edit-issue/scripts/edit_issue_txn.py`
@@ -87,11 +95,8 @@ _ENV_SANITIZE_KEYS = (
     "BROWSER",
     "GH_HOST",
     "GH_REPO",
-    "GH_CONFIG_DIR",
     "GH_DEBUG",
     "DEBUG",
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
 )
 
 SCHEMA = "CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1"

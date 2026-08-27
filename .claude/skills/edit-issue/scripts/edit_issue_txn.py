@@ -58,16 +58,23 @@ AGENT_GUARDS_IMPORT_ROOT = SCRIPT_PATH.parents[4] / "scripts" / "agent-guards"
 # controlled-executor transaction as the actual mutation
 # (`controlled_skill_mutation_exec.py`, invoked below via
 # `_invoke_controlled_exec`). That executor's GitHub read/write subprocess
-# calls run under `_build_metadata_sanitized_env()`, which strips
-# `GH_HOST` / `GH_REPO` / `GH_CONFIG_DIR` / `GH_TOKEN` / `GITHUB_TOKEN` (etc.)
-# from the ambient environment before calling `gh`. Before this fix, the `gh`
-# calls made directly from this module (`_fetch_issue`,
+# calls run under `_build_metadata_sanitized_env()`. Before this fix, the
+# `gh` calls made directly from this module (`_fetch_issue`,
 # `_relationship_capability_preflight`, `_fetch_native_relationships`)
 # inherited the fully unsanitized ambient environment, so a pre-read could
 # observe a different GitHub identity/host/config than the write it gates.
 #
+# Issue #2340 fix_delta P0-1 (PR #2357 review, 2026-08-27): this list strips
+# execution/log-hygiene NOISE only (`GH_HOST` / `GH_REPO` / `GH_DEBUG` /
+# `DEBUG` / editor-browser / `PYTHONPATH`), not the GitHub credential
+# carrier. `GH_CONFIG_DIR` / `GH_TOKEN` / `GITHUB_TOKEN` are deliberately
+# left intact so this pre-read authenticates under the SAME credential
+# context as the Claude-GPT launcher (#2299 / PR #2303) and the paired
+# controlled-executor write it gates (see
+# `controlled_skill_mutation_exec._METADATA_ENV_NOISE_STRIP_KEYS`).
+#
 # This list is intentionally duplicated (not imported) from
-# `scripts/agent-guards/controlled_skill_mutation_policy.ENV_SANITIZE_KEYS`:
+# `scripts/agent-guards/controlled_skill_mutation_exec._METADATA_ENV_NOISE_STRIP_KEYS`:
 # title/body-only edit calls in this module must remain importable without
 # the `scripts/agent-guards` module tree present (see the comment on
 # `_load_validate_relationship_graph_invariants` below -- that tree is
@@ -86,11 +93,8 @@ _GH_ENV_SANITIZE_KEYS = (
     "BROWSER",
     "GH_HOST",
     "GH_REPO",
-    "GH_CONFIG_DIR",
     "GH_DEBUG",
     "DEBUG",
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
 )
 
 

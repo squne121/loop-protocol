@@ -192,16 +192,65 @@ def _verify_git_remote_origin(project_root: Path, trusted_repo: str, env: dict[s
 
 # -- Issue #1284 Blocker 5: generic metadata-command env sanitizer -------------
 
+# Issue #2340 fix_delta P0-1 (PR #2357 review, 2026-08-27): sanitize
+# execution/log-hygiene NOISE only, never the GitHub credential carrier
+# itself. The original #2340 P0 fix pointed `_build_metadata_sanitized_env()`
+# at the generic `ENV_SANITIZE_KEYS` list (which strips GH_TOKEN /
+# GITHUB_TOKEN / GH_CONFIG_DIR -- a policy #1667 introduced for the
+# higher-trust PR-review / dependency-graph mutation lanes, see
+# `_build_pr_review_gh_env()` / `_build_issue_dependency_remove_gh_env()`
+# below, which still use `ENV_SANITIZE_KEYS` unchanged). Applying that same
+# strip-the-credential policy to the issue-metadata read/write helpers this
+# function serves reversed the direction #2299 / PR #2303 established for
+# the Claude-GPT launcher: that Issue explicitly changed the launcher to
+# share `GH_TOKEN` / `GITHUB_TOKEN` / `GH_CONFIG_DIR` from the native
+# ambient environment (while `HOME` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME`
+# stay isolated), specifically so downstream `gh` invocations authenticate.
+# Stripping those three keys here made every controlled write in this
+# family credential-starved again -- functionally reintroducing the
+# completion-rate regression #2299 fixed, just one layer further downstream.
+#
+# The correct separation of concerns is "credential availability" vs.
+# "output/log hygiene": this function keeps the credential carrier
+# (`GH_TOKEN` / `GITHUB_TOKEN` / `GH_CONFIG_DIR`) intact and only strips
+# execution-noise / redirection-surface variables that have no legitimate
+# reason to reach a `gh api --hostname github.com ...` call this module
+# already argv-pins to the trusted host. Token VALUES are still never
+# permitted to leak into stdout/stderr/artifacts: `_classify_gh_error()` /
+# `_redact_secret_like_tokens()` redact token-shaped substrings from
+# captured `gh` stderr before it is ever returned or logged.
+_METADATA_ENV_NOISE_STRIP_KEYS = (
+    "PUBLISH_ARTIFACT_DIR",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "GH_EDITOR",
+    "EDITOR",
+    "VISUAL",
+    "BROWSER",
+    # GH_HOST / GH_REPO: every call site below already argv-pins
+    # `--hostname github.com`, so an ambient override cannot silently
+    # redirect these particular calls -- stripped anyway as defense in
+    # depth against any future call site that omits the explicit flag.
+    "GH_HOST",
+    "GH_REPO",
+    "GH_DEBUG",
+    "DEBUG",
+)
+
 
 def _build_metadata_sanitized_env() -> dict[str, str]:
-    """Build a sanitized environment for issue-metadata publisher subprocesses
-    (contract_snapshot.publish).
+    """Build the sanitized environment for issue-metadata read/write
+    subprocesses (issue_body.update / issue_content.update /
+    issue_comment.publish / contract_snapshot.publish /
+    issue_scope_snapshot.materialize). Strips execution/log-hygiene noise
+    only (Issue #2340 fix_delta P0-1) -- the GitHub credential carrier
+    (`GH_TOKEN` / `GITHUB_TOKEN` / `GH_CONFIG_DIR`) is deliberately left
+    intact so these calls authenticate the same way the Claude-GPT launcher
+    itself does (#2299 / PR #2303).
     """
     env = os.environ.copy()
-    for key in ENV_SANITIZE_KEYS:
+    for key in _METADATA_ENV_NOISE_STRIP_KEYS:
         env.pop(key, None)
-    env.pop("PYTHONPATH", None)
-    env.pop("PYTHONHOME", None)
     env["GH_PROMPT_DISABLED"] = "1"
     env["GH_NO_UPDATE_NOTIFIER"] = "1"
     return env
@@ -745,7 +794,9 @@ def _fetch_issue_body_and_updated_at(issue_number: int, repo: str, gh_bin: str) 
     ``contract_snapshot.publish`` uses this helper for both its stale-write
     precondition and its post-publish live-body revalidation.  Those reads are
     part of the authoritative success boundary, so they must not inherit a
-    caller-controlled GH_HOST/GH_REPO/GH_CONFIG_DIR setting.
+    caller-controlled GH_HOST/GH_REPO override (Issue #2340 fix_delta P0-1:
+    GH_CONFIG_DIR / GH_TOKEN / GITHUB_TOKEN are the intentional credential
+    carrier and are not stripped -- see `_build_metadata_sanitized_env()`).
     """
     try:
         out = subprocess.run(

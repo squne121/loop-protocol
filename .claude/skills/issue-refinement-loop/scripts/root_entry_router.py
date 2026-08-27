@@ -382,11 +382,58 @@ class FileBackedFakeGitHubEntryTransport:
         return fixture_comments + posted_bodies
 
 
+def _apply_agy_observed_failure_override(
+    actor_capabilities: dict,
+    *,
+    failure_class: Optional[str],
+    agy_required: bool,
+    fallback_allowed: bool,
+) -> dict:
+    """Issue #2340 fix_delta P0-2 (PR #2357 review, 2026-08-27): production
+    wiring point for ``resolve_agy_advisory_route()``. The producer's own
+    ``delegated_research_agy`` entry is a static ``shutil.which("agy")``
+    presence probe -- it cannot observe a runtime OAuth/subprocess timeout
+    that only manifests once a real delegation attempt runs (the #2332
+    failure mode). A caller that has actually observed such a failure this
+    workflow run (e.g. Step 1's ``codebase-investigator`` reported
+    ``agy_timeout``/``agy_auth_required``/etc.) passes it through
+    ``agy_observed_failure_class`` on ``capability_preflight_result()``,
+    and THIS function is what actually calls ``resolve_agy_advisory_route()``
+    with it and overlays the resolved route onto the returned
+    ``delegated_research_agy`` entry -- the resolver is no longer reachable
+    only from its own unit tests.
+
+    No-op (returns ``actor_capabilities`` unchanged) when ``failure_class``
+    is ``None`` -- the common case where no AGY attempt has happened yet
+    for this call.
+    """
+    if failure_class is None or not isinstance(actor_capabilities, dict):
+        return actor_capabilities
+    route = resolve_agy_advisory_route(
+        failure_class=failure_class,
+        agy_required=agy_required,
+        fallback_allowed=fallback_allowed,
+    )
+    overridden = dict(actor_capabilities)
+    overridden["delegated_research_agy"] = {
+        "status": route["status"],
+        "reason_code": route["reason_code"],
+        "fallback_route": (
+            AGY_ROUTE_NON_AGY_FALLBACK if route["route"] == AGY_ROUTE_NON_AGY_FALLBACK else None
+        ),
+        "probe_execution_class": "agy_advisory_route_resolver",
+    }
+    return overridden
+
+
 def capability_preflight_result(
     repo: str,
     spark_mode: str | None = None,
     spark_fallback: str | None = None,
     planned_operations: "tuple[dict, ...] | list[dict]" = (),
+    agy_observed_failure_class: Optional[str] = None,
+    agy_required: bool = False,
+    agy_fallback_allowed: bool = True,
 ) -> dict:
     """Invoke ``scripts/claude-gpt/workflow_capability_preflight.py`` once and
     return the structured ``CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1`` result
@@ -407,6 +454,15 @@ def capability_preflight_result(
     3-value ``decision`` contract (``ready`` / ``degraded`` / ``blocked``)
     regardless of whether the producer itself declared ``blocked`` or the
     invocation failed outright (Issue #2311 AC3).
+
+    ``agy_observed_failure_class`` (Issue #2340 fix_delta P0-2, default
+    ``None``): when the caller already observed a REAL AGY delegation
+    failure this workflow run, pass its taxonomy ``failure_class`` here to
+    have ``_apply_agy_observed_failure_override()`` resolve it via
+    ``resolve_agy_advisory_route()`` and overlay the result onto
+    ``actor_capabilities["delegated_research_agy"]``, in place of the
+    producer's static binary-presence probe. ``agy_required`` /
+    ``agy_fallback_allowed`` are forwarded to the resolver unchanged.
     """
     repo_root = Path(__file__).resolve().parents[4]
     preflight_script = (
@@ -490,7 +546,15 @@ def capability_preflight_result(
             # Issue #2340 AC2: forward the producer's actor/execution-substrate
             # -scoped capability results verbatim (empty dict default keeps this
             # backward compatible with any caller written before this Issue).
-            "actor_capabilities": result.get("actor_capabilities", {}),
+            # Issue #2340 fix_delta P0-2: overlay a real observed AGY failure
+            # (if any) via resolve_agy_advisory_route() -- no-op when
+            # agy_observed_failure_class is None (the default).
+            "actor_capabilities": _apply_agy_observed_failure_override(
+                result.get("actor_capabilities", {}),
+                failure_class=agy_observed_failure_class,
+                agy_required=agy_required,
+                fallback_allowed=agy_fallback_allowed,
+            ),
             "reasons": result.get("reasons", []),
         }
     finally:
@@ -507,6 +571,15 @@ def capability_preflight_result(
 # names invented (In Scope item 4). Kept as an explicit allowlist so an
 # unrecognized/typo'd failure_class fails closed to escalation instead of
 # silently routing to a fallback for a failure this function cannot classify.
+#
+# Issue #2340 fix_delta P1-1 (PR #2357 review, 2026-08-27): `taxonomy.md`'s
+# "AGY permission-boundary runner failure classes" section explicitly states
+# `agy_permission_boundary_unavailable` / `agy_permission_boundary_inconclusive`
+# are NOT provider-fallback input ("この二つは provider fallback の入力では
+# ない。専用 runner は fallback provider を起動しない"). They must never be
+# members of this allowlist -- doing so would let a permission-boundary
+# runner failure silently degrade to a non-AGY fallback route instead of
+# the fail-closed/non-fallback semantics the dedicated runner requires.
 _AGY_ADVISORY_FALLBACK_FAILURE_CLASSES = frozenset(
     {
         "agy_rate_limited",
@@ -521,8 +594,6 @@ _AGY_ADVISORY_FALLBACK_FAILURE_CLASSES = frozenset(
         "agy_output_missing",
         "agy_unexpected_error",
         "agy_invocation_policy_denied",
-        "agy_permission_boundary_unavailable",
-        "agy_permission_boundary_inconclusive",
     }
 )
 

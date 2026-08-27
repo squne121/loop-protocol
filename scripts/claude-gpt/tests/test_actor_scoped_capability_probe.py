@@ -27,7 +27,6 @@ for _p in (_SCRIPTS_DIR, _GUARDS_DIR):
         sys.path.insert(0, str(_p))
 
 import workflow_capability_preflight as wcp  # noqa: E402
-from controlled_skill_mutation_policy import ENV_SANITIZE_KEYS  # noqa: E402
 
 _DEFAULT_REPO = "squne121/loop-protocol"
 
@@ -84,7 +83,15 @@ def test_root_read_pass_controlled_read_fail_blocks_before_downstream_actor(monk
 
 
 def test_controlled_read_probe_uses_hostname_pinned_sanitized_env(monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "ambient-leaked-token")
+    """Issue #2340 fix_delta P0-1 (PR #2357 review, 2026-08-27): the
+    controlled_github_read probe strips execution/log-hygiene noise
+    (GH_HOST / GH_DEBUG / etc.) but PRESERVES the launcher-shared GitHub
+    credential carrier (GH_TOKEN / GH_CONFIG_DIR) -- this probe must
+    observe the SAME credential availability the downstream controlled
+    executor write helpers do post-fix, or a `ready` verdict here would not
+    actually predict whether the write can authenticate."""
+    monkeypatch.setenv("GH_TOKEN", "ambient-shared-launcher-token")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/fake/native/gh/config")
     monkeypatch.setenv("GH_HOST", "evil.example.com")
     _result, calls = _assess(monkeypatch, controlled_read_rc=0)
 
@@ -94,8 +101,11 @@ def test_controlled_read_probe_uses_hostname_pinned_sanitized_env(monkeypatch):
     assert "github.com" in argv
     env = kwargs.get("env")
     assert env is not None
-    for key in ENV_SANITIZE_KEYS:
+    for key in wcp._ENV_SANITIZE_KEYS:
         assert key not in env
+    assert env.get("GH_HOST") != "evil.example.com"
+    assert env.get("GH_TOKEN") == "ambient-shared-launcher-token"
+    assert env.get("GH_CONFIG_DIR") == "/fake/native/gh/config"
 
 
 def test_both_reads_ready_yields_ready_decision(monkeypatch):
