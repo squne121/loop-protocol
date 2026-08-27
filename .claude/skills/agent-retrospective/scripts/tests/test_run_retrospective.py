@@ -64,6 +64,11 @@ _validate_mod = rr._validate_retrospective_schema_module()
 _FULL_SHA = "a" * 40
 _OTHER_SHA = "b" * 40
 _DIGEST = "d" * 64
+#: Issue #2362 AC1: run_evaluation() now requires repository_id as
+#: Python-side caller context (never part of EvaluatorRequest) -- this is
+#: the single fixture value every direct rr.run_evaluation() call site in
+#: this file passes, matching _identity_key()'s repository_id below.
+_REPOSITORY_ID = "squne121/loop-protocol"
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +472,10 @@ def _run_full_pipeline(call_log: list[str]) -> tuple[rr.RunContext, rr.SourcePla
     finding_sets = rr.build_finding_sets(ctx, plan, bundles)
     evaluator_request = rr.prepare_evaluator_request(ctx, plan, finding_sets)
     evaluation = rr.run_evaluation(
-        ctx, evaluator_request, invoke_evaluator=_make_evaluator_invoke(ctx.run_id, plan.source_set_digest, call_log)
+        ctx,
+        evaluator_request,
+        invoke_evaluator=_make_evaluator_invoke(ctx.run_id, plan.source_set_digest, call_log),
+        repository_id=_REPOSITORY_ID,
     )
     publish_request = rr.finalize(
         ctx,
@@ -520,7 +528,9 @@ def test_evaluator_waits_for_observer_never_invoked_on_observer_failure() -> Non
         )
         finding_sets = rr.build_finding_sets(ctx, plan, bundles)
         evaluator_request = rr.prepare_evaluator_request(ctx, plan, finding_sets)
-        rr.run_evaluation(ctx, evaluator_request, invoke_evaluator=_evaluator_invoke_should_never_run)
+        rr.run_evaluation(
+            ctx, evaluator_request, invoke_evaluator=_evaluator_invoke_should_never_run, repository_id=_REPOSITORY_ID
+        )
 
     assert call_log == ["observer:retrospective-runtime-observer"]
     assert "evaluator" not in call_log
@@ -562,7 +572,7 @@ def test_evaluator_receives_typed_projection_only() -> None:
         )
         return _ok_agent_result(json.loads(evaluation.to_wire()))
 
-    rr.run_evaluation(ctx, evaluator_request, invoke_evaluator=_capturing_invoke)
+    rr.run_evaluation(ctx, evaluator_request, invoke_evaluator=_capturing_invoke, repository_id=_REPOSITORY_ID)
 
     # THEN the evaluator request never has an `evidence_ref` or raw-evidence-shaped field
     payload = json.loads(captured["wire_text"])
@@ -1238,7 +1248,7 @@ def test_schema_repair_retry_bounded_evaluator_never_started_on_exhaustion() -> 
         bundles = rr.run_observer_wave(ctx, plan, invoke=_malformed_invoke, observer_requests=[_observer_request("o1")])
         finding_sets = rr.build_finding_sets(ctx, plan, bundles)
         evaluator_request = rr.prepare_evaluator_request(ctx, plan, finding_sets)
-        rr.run_evaluation(ctx, evaluator_request, invoke_evaluator=_evaluator_invoke)
+        rr.run_evaluation(ctx, evaluator_request, invoke_evaluator=_evaluator_invoke, repository_id=_REPOSITORY_ID)
 
     assert evaluator_called["n"] == 0
 

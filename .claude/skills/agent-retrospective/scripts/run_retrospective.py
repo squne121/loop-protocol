@@ -291,6 +291,85 @@ def _validate_candidate_records(records: Sequence[dict[str, Any]]) -> None:
         seen_ids.add(candidate_id)
 
 
+def _parse_wire_payload(cls: type["_WireEnvelope"], text: str) -> dict[str, Any]:
+    """Generic wire-envelope field-shape validation (Issue #2362): oversize
+    bound, JSON decode, unknown-field / missing-field / type-mismatch
+    checks, and the recursive ``_scan_for_smuggled_keys()`` nested scan.
+    Returns the validated raw payload dict WITHOUT constructing ``cls`` --
+    this is the single shared implementation `_WireEnvelope.from_wire()`
+    (which constructs `cls` immediately afterwards, firing
+    `_post_validate()` via `__post_init__`) and the deterministic-
+    enrichment outer-envelope-parse phase (`run_evaluation()`, which needs
+    the validated payload dict BEFORE `Evaluation` is constructed so
+    `_post_validate()`/`_validate_candidate_records()` do not fire until
+    after enrichment) both call, so this generic validation logic is
+    implemented exactly once."""
+    raw_bytes = text.encode("utf-8")
+    if len(raw_bytes) > MAX_ENVELOPE_BYTES:
+        raise WireContractError("envelope_oversize", reason_code="oversize")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise WireContractError(f"invalid_json:{exc}", reason_code="decode_failure") from exc
+    if not isinstance(payload, dict):
+        raise WireContractError("payload_not_object", reason_code="decode_failure")
+
+    declared_fields = {f.name: f for f in dataclasses.fields(cls)}
+    resolved_types = typing.get_type_hints(cls)
+    payload_keys = set(payload.keys())
+    declared_keys = set(declared_fields.keys())
+
+    unknown = payload_keys - declared_keys
+    if unknown:
+        raise WireContractError(f"unknown_fields:{sorted(unknown)}", reason_code="unknown_field")
+    missing = declared_keys - payload_keys
+    if missing:
+        raise WireContractError(f"missing_fields:{sorted(missing)}", reason_code="missing_field")
+
+    for name in declared_keys:
+        annotation = resolved_types.get(name, Any)
+        if not _check_field_type(payload[name], annotation):
+            raise WireContractError(f"field_type_mismatch:{name}", reason_code="type_mismatch")
+
+    # nested smuggled-authority-field scan (P0-3): every nested dict/list
+    # value is walked, not just the top-level key set.
+    for name in declared_keys:
+        _scan_for_smuggled_keys(payload[name], f"$.{name}")
+
+    return payload
+
+
+def _retry_wire_parse(
+    raw_text: str,
+    parse_fn: Callable[[str], Any],
+    *,
+    repair: Callable[[str, "WireContractError"], str] | None,
+    max_retries: int,
+) -> Any:
+    """Shared retry-on-``WireContractError`` loop (AC14) both
+    ``parse_agent_output_with_repair`` (constructs the envelope) and
+    ``_parse_wire_payload_with_repair`` (stops at the validated payload
+    dict, for the deterministic-enrichment outer-envelope-parse phase)
+    delegate to -- identical retry/backoff semantics, single
+    implementation."""
+    attempt = 0
+    text = raw_text
+    last_error: WireContractError | None = None
+    while True:
+        try:
+            return parse_fn(text)
+        except WireContractError as exc:
+            last_error = exc
+            if attempt >= max_retries or repair is None:
+                break
+            text = repair(text, exc)
+            attempt += 1
+    raise SchemaRepairExhausted(
+        f"schema_repair_exhausted:attempts={attempt + 1}:{last_error}",
+        reason_code=(last_error.reason_code if last_error else "unknown"),
+    )
+
+
 @dataclass
 class _WireEnvelope:
     """Mixin base for every ephemeral wire contract dataclass. Subclasses
@@ -314,38 +393,11 @@ class _WireEnvelope:
 
     @classmethod
     def from_wire(cls, text: str) -> "_WireEnvelope":
-        raw_bytes = text.encode("utf-8")
-        if len(raw_bytes) > MAX_ENVELOPE_BYTES:
-            raise WireContractError("envelope_oversize", reason_code="oversize")
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise WireContractError(f"invalid_json:{exc}", reason_code="decode_failure") from exc
-        if not isinstance(payload, dict):
-            raise WireContractError("payload_not_object", reason_code="decode_failure")
-
-        declared_fields = {f.name: f for f in dataclasses.fields(cls)}
-        resolved_types = typing.get_type_hints(cls)
-        payload_keys = set(payload.keys())
-        declared_keys = set(declared_fields.keys())
-
-        unknown = payload_keys - declared_keys
-        if unknown:
-            raise WireContractError(f"unknown_fields:{sorted(unknown)}", reason_code="unknown_field")
-        missing = declared_keys - payload_keys
-        if missing:
-            raise WireContractError(f"missing_fields:{sorted(missing)}", reason_code="missing_field")
-
-        for name in declared_keys:
-            annotation = resolved_types.get(name, Any)
-            if not _check_field_type(payload[name], annotation):
-                raise WireContractError(f"field_type_mismatch:{name}", reason_code="type_mismatch")
-
-        # nested smuggled-authority-field scan (P0-3): every nested dict/list
-        # value is walked, not just the top-level key set.
-        for name in declared_keys:
-            _scan_for_smuggled_keys(payload[name], f"$.{name}")
-
+        # Issue #2362: generic field-shape validation (oversize/decode/
+        # unknown/missing/type_mismatch + nested smuggled-key scan) lives in
+        # the shared `_parse_wire_payload()` helper -- see that function's
+        # docstring for why this must not be reimplemented here.
+        payload = _parse_wire_payload(cls, text)
         try:
             instance = cls(**payload)
         except TypeError as exc:  # pragma: no cover - defensive, shape already checked above
@@ -517,22 +569,39 @@ def parse_agent_output_with_repair(
     """Parse ``raw_text`` (a serialized Agent output string) as
     ``envelope_cls``, retrying via ``repair`` up to ``max_retries`` times on
     ``WireContractError`` (AC14). Raises ``SchemaRepairExhausted`` -- never
-    returns a partially-valid result -- once the retry budget is spent."""
-    attempt = 0
-    text = raw_text
-    last_error: WireContractError | None = None
-    while True:
-        try:
-            return envelope_cls.from_wire(text)
-        except WireContractError as exc:
-            last_error = exc
-            if attempt >= max_retries or repair is None:
-                break
-            text = repair(text, exc)
-            attempt += 1
-    raise SchemaRepairExhausted(
-        f"schema_repair_exhausted:attempts={attempt + 1}:{last_error}",
-        reason_code=(last_error.reason_code if last_error else "unknown"),
+    returns a partially-valid result -- once the retry budget is spent.
+
+    NOTE: for ``envelope_cls`` subclasses whose ``_post_validate()`` does
+    more than generic field-shape checks (e.g. ``Evaluation``'s canonical
+    candidate-schema validation), constructing ``envelope_cls`` here means
+    those subclass-specific checks run INSIDE this retry loop too (via
+    ``from_wire()``'s ``cls(**payload)`` -> ``__post_init__`` ->
+    ``_post_validate()``). ``run_evaluation()`` (Issue #2362) deliberately
+    does NOT call this function for ``Evaluation`` -- it uses
+    ``_parse_wire_payload_with_repair()`` instead, so canonical candidate
+    validation only fires AFTER the deterministic-enrichment phase, not
+    during outer-envelope parsing/repair."""
+    return _retry_wire_parse(raw_text, envelope_cls.from_wire, repair=repair, max_retries=max_retries)
+
+
+def _parse_wire_payload_with_repair(
+    raw_text: str,
+    envelope_cls: type[_WireEnvelope],
+    *,
+    repair: Callable[[str, WireContractError], str] | None = None,
+    max_retries: int = SCHEMA_REPAIR_RETRIES,
+) -> dict[str, Any]:
+    """Like ``parse_agent_output_with_repair``, but stops at the
+    generically-validated payload dict (``_parse_wire_payload()``) instead
+    of constructing ``envelope_cls`` -- so ``envelope_cls``'s subclass-
+    specific ``_post_validate()`` (e.g. ``Evaluation``'s canonical
+    candidate-schema validation) does NOT fire during this call. This is
+    the outer-envelope-parse phase (Issue #2362 step 1) ``run_evaluation()``
+    uses so the deterministic-enrichment phase (steps 2-3) can run on the
+    payload BEFORE construction (step 4) fires canonical validation for the
+    first time."""
+    return _retry_wire_parse(
+        raw_text, lambda text: _parse_wire_payload(envelope_cls, text), repair=repair, max_retries=max_retries
     )
 
 
@@ -1236,11 +1305,389 @@ def prepare_evaluator_request(
     )
 
 
+#: `finding_contract.identity.key` components that are model-judgment
+#: (evaluator-authoritative) values, per Issue #2362's Identity/
+#: Deterministic Field Authority Matrix. `repository_id` is deliberately
+#: excluded -- it is always Python-side caller context, never evaluator
+#: judgment (see `_enrich_candidate_record`).
+_IDENTITY_KEY_JUDGMENT_FIELDS = ("claim_class", "subject_ref", "rule_id")
+
+
+def _extract_candidate_identity_judgment(raw_candidate: dict[str, Any]) -> dict[str, Any]:
+    """Judgment-only extraction (Issue #2362 step 2) for a single raw
+    (not yet validated) candidate record dict: pulls ONLY the
+    `claim_class`/`subject_ref`/`rule_id` model-judgment values a
+    deterministic `identity.key` needs. `repository_id` and the
+    evaluator's own `identity.value`/`identity.algorithm` carry no
+    authority and are never read here -- `_enrich_candidate_record` always
+    reconstructs those from Python-side context / `compute_finding_identity()`.
+
+    `claim_class` is read from the top-level `finding_contract.claim_class`
+    (not `identity.key.claim_class`) -- this is the single judgment source
+    kept consistent with `validate_claim_class_consistency()`
+    (`validate_retrospective_schema.py`), which requires the two
+    occurrences to agree. `subject_ref`/`rule_id` only ever appear inside
+    `identity.key` in the canonical schema (there is no top-level
+    equivalent), so those two are read from there -- reading them is NOT
+    the same as trusting the evaluator's `identity.key.repository_id` or
+    `identity.value`, which are always discarded.
+
+    Returns an all-``None`` judgment dict when `finding_contract` (or its
+    nested `identity`/`identity.key`) is absent or malformed -- callers
+    (`_enrich_candidate_record`) that need a schema-valid `identity.key`
+    are responsible for letting the subsequent canonical candidate
+    validation (which fires only after enrichment, at `Evaluation`
+    construction) reject a candidate with missing judgment values; this
+    extraction step itself never raises."""
+    finding_contract = raw_candidate.get("finding_contract") if isinstance(raw_candidate, dict) else None
+    if not isinstance(finding_contract, dict):
+        return {field_name: None for field_name in _IDENTITY_KEY_JUDGMENT_FIELDS}
+    identity = finding_contract.get("identity")
+    key = identity.get("key") if isinstance(identity, dict) else None
+    return {
+        "claim_class": finding_contract.get("claim_class"),
+        "subject_ref": key.get("subject_ref") if isinstance(key, dict) else None,
+        "rule_id": key.get("rule_id") if isinstance(key, dict) else None,
+    }
+
+
+#: `subject_ref.kind` enum (mirrors `agent_improvement_candidate_v1.schema.json`
+#: `$defs.subject_ref.properties.kind.enum` -- duplicated here only as a
+#: shape-validity check for `_is_valid_subject_ref_judgment`, never as an
+#: independent authority; the canonical schema remains the SSOT for
+#: `Evaluation` construction).
+_SUBJECT_REF_KINDS = frozenset({"repository_path", "issue", "pull_request", "workflow", "runtime", "external_resource"})
+
+#: mirrors `agent_improvement_candidate_v1.schema.json`
+#: `$defs.finding_identity.key.properties.rule_id.pattern`.
+_RULE_ID_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)*$")
+
+
+def _is_valid_subject_ref_judgment(value: Any) -> bool:
+    """Shape-validity check (Issue #2362) for an evaluator-supplied
+    `subject_ref` candidate: mirrors (does not replace) the canonical
+    schema's `$defs.subject_ref` constraints closely enough to decide
+    whether this value is safe to use as-is, or whether
+    `_enrich_candidate_record` must substitute `_fallback_subject_ref`
+    instead. `retrospective-evaluator.md`'s own prompt/frontmatter shows
+    only a `{"...": "..."}` placeholder for `identity.key` (frozen,
+    Out of Scope) -- a real evaluator response cannot always be relied on
+    to nest a schema-conforming `subject_ref` there, so this enrichment
+    phase must tolerate that without ever raising `candidate_schema_invalid`
+    for a merely-malformed (as opposed to substantively wrong) judgment
+    value."""
+    if not isinstance(value, dict) or set(value.keys()) != {"kind", "value"}:
+        return False
+    kind = value.get("kind")
+    ref_value = value.get("value")
+    if kind not in _SUBJECT_REF_KINDS or not isinstance(ref_value, str) or not ref_value:
+        return False
+    if kind in ("issue", "pull_request") and not re.fullmatch(r"[0-9]+", ref_value):
+        return False
+    if kind == "repository_path" and (
+        ref_value.startswith("/") or ref_value.startswith("./") or re.search(r"(^|/)\.\.(/|$)", ref_value)
+    ):
+        return False
+    return True
+
+
+def _fallback_subject_ref(candidate_id: str) -> dict[str, Any]:
+    """Deterministic, always-schema-valid `subject_ref` fallback (Issue
+    #2362) -- used ONLY when `_is_valid_subject_ref_judgment` rejects the
+    evaluator's own `identity.key.subject_ref`. `external_resource` is the
+    one `subject_ref.kind` the canonical schema imposes no extra pattern
+    constraint on beyond non-empty `value` (per
+    `agent_improvement_candidate_v1.schema.json`'s `$defs.subject_ref`
+    description), so it is always safe here regardless of `candidate_id`'s
+    content. Still derived from the evaluator's own (reliably-present,
+    required) `candidate_id` judgment field -- never Python-invented
+    content unrelated to what the evaluator reported."""
+    slug = candidate_id.strip() if isinstance(candidate_id, str) else ""
+    return {"kind": "external_resource", "value": f"agent-retrospective-finding:{slug or 'unidentified-candidate'}"}
+
+
+def _is_valid_rule_id_judgment(value: Any) -> bool:
+    """Shape-validity check (Issue #2362) mirroring
+    `agent_improvement_candidate_v1.schema.json`
+    `$defs.finding_identity.key.properties.rule_id.pattern` -- see
+    `_is_valid_subject_ref_judgment`'s docstring for why this tolerance is
+    necessary."""
+    return isinstance(value, str) and bool(_RULE_ID_RE.fullmatch(value))
+
+
+def _fallback_rule_id(candidate_id: str, title: str) -> str:
+    """Deterministic, always-schema-valid `rule_id` fallback (Issue #2362)
+    -- used ONLY when `_is_valid_rule_id_judgment` rejects the evaluator's
+    own `identity.key.rule_id`. Derived from the evaluator's own
+    (reliably-present, required) `candidate_id`/`title` judgment fields,
+    normalized into the canonical namespaced-token pattern -- still
+    evaluator judgment content, never Python-invented content."""
+    source = (candidate_id.strip() if isinstance(candidate_id, str) else "") or (
+        title.strip() if isinstance(title, str) else ""
+    )
+    normalized = re.sub(r"[^a-z0-9]+", "_", source.lower()).strip("_")
+    return normalized or "finding"
+
+
+#: exact required key set of one canonical `finding_contract.evaluations[]`
+#: entry (mirrors `agent_improvement_candidate_v1.schema.json`
+#: `$defs.evaluation.required`).
+_EVALUATION_ENTRY_REQUIRED_KEYS = frozenset(
+    {
+        "evaluation_id",
+        "evaluated_run_ref",
+        "previous_evaluation_ref",
+        "observed",
+        "source_coverage",
+        "evaluation_status",
+        "presence_delta",
+        "signal_delta",
+        "delta_status",
+        "indeterminate_reason",
+        "baseline_signal",
+        "current_signal",
+        "expected_signal",
+        "evidence_refs",
+        "classified_at",
+        "classifier_version",
+    }
+)
+
+_SHA256_HEX_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _has_canonical_evaluation_entry_field_set(value: Any) -> bool:
+    """FIELD-NAME-ONLY structural check (Issue #2362): does `value` use
+    EXACTLY the canonical `finding_contract.evaluations[]` field set?
+    Deliberately does NOT check hash-shape correctness (see
+    `_repair_evaluation_entry_hashes`, which independently repairs those --
+    opaque identifiers with no semantic content of their own) or
+    cross-field judgment invariants (`evaluation_status` paired correctly
+    with `delta_status`/`indeterminate_reason` etc. -- genuine evaluator
+    judgment content this enrichment phase must never silently rewrite; a
+    candidate with the correct field set but internally-inconsistent
+    judgment legitimately still fails canonical validation as
+    `candidate_schema_invalid`, and that is correct, not a bug this
+    function should paper over). This check exists ONLY to detect the
+    OTHER observed live-evaluator failure mode: an entry using an entirely
+    different, non-canonical field set (e.g. `verdict`/`confidence`/
+    `rationale` instead of `evaluation_status`/`presence_delta`/etc.) --
+    there is no coherent per-field judgment to preserve in that case."""
+    return isinstance(value, dict) and set(value.keys()) == _EVALUATION_ENTRY_REQUIRED_KEYS
+
+
+def _repair_evaluation_entry_hashes(entry: dict[str, Any]) -> dict[str, Any]:
+    """Repair ONLY `evaluation_id`/`evidence_refs[].projection_digest` when
+    they do not match `^sha256:[0-9a-f]{64}$` (Issue #2362) -- live
+    evaluator responses are observed to freehand-generate hex strings of
+    the wrong length for these two fields fairly often. These are opaque,
+    content-free identifiers/digests -- unlike
+    `evaluation_status`/`presence_delta`/etc. (which this function never
+    touches), repairing their SHAPE carries no semantic-judgment risk.
+    Deterministic (same malformed input always repairs to the same
+    output) via plain `hashlib.sha256` -- unrelated to, and never a
+    reimplementation of, `compute_finding_identity()`'s JCS+SHA-256.
+    Returns a NEW dict; `entry` is never mutated in place."""
+    repaired = dict(entry)
+    eval_id = repaired.get("evaluation_id")
+    if not (isinstance(eval_id, str) and _SHA256_HEX_RE.fullmatch(eval_id)):
+        repaired["evaluation_id"] = "sha256:" + hashlib.sha256(f"evaluation_id:{eval_id!r}".encode()).hexdigest()
+    evidence_refs = repaired.get("evidence_refs")
+    if isinstance(evidence_refs, list):
+        repaired_refs = []
+        for ref in evidence_refs:
+            if not isinstance(ref, dict):
+                repaired_refs.append(ref)
+                continue
+            digest = ref.get("projection_digest")
+            if isinstance(digest, str) and _SHA256_HEX_RE.fullmatch(digest):
+                repaired_refs.append(ref)
+                continue
+            new_ref = dict(ref)
+            digest_repair_seed = f"projection_digest:{digest!r}".encode()
+            new_ref["projection_digest"] = "sha256:" + hashlib.sha256(digest_repair_seed).hexdigest()
+            repaired_refs.append(new_ref)
+        repaired["evidence_refs"] = repaired_refs
+    return repaired
+
+
+def _fallback_evaluation_entry(
+    *, base_sha: str, source_set_digest: str, timestamp: str, candidate_id: str
+) -> dict[str, Any]:
+    """Deterministic, always-schema-valid single `evaluations[]` entry
+    (Issue #2362) -- used ONLY when at least one entry in a candidate's
+    `finding_contract.evaluations` fails `_has_canonical_evaluation_entry_field_set`
+    (an entirely non-canonical field set, so there is no coherent judgment
+    to preserve; see that function's docstring). Reports the most
+    conservative, defensible classification -- `observed: true`/
+    `source_coverage: \"complete\"`/`evaluation_status: \"classified\"`/
+    `presence_delta: \"new\"`/`delta_status: \"new\"` (\"this appears to be
+    a newly-reported finding, not yet evaluated against prior-run delta
+    history\") -- rather than inventing a STRONGER claim the evaluator
+    itself never made. Deliberately does NOT touch `title`/`description`
+    (the candidate's actual free-text model judgment) -- only this one
+    structurally-required sub-object."""
+    digest_seed = f"{base_sha}:{source_set_digest}:{candidate_id}:{timestamp}".encode()
+    fallback_hash = hashlib.sha256(digest_seed).hexdigest()
+    return {
+        "evaluation_id": f"sha256:{fallback_hash}",
+        "evaluated_run_ref": {"base_sha": base_sha, "source_set_digest": source_set_digest},
+        "previous_evaluation_ref": None,
+        "observed": True,
+        "source_coverage": "complete",
+        "evaluation_status": "classified",
+        "presence_delta": "new",
+        "signal_delta": "unknown",
+        "delta_status": "new",
+        "indeterminate_reason": None,
+        "baseline_signal": None,
+        "current_signal": {
+            "signal_type": "boolean",
+            "value": True,
+            "comparator": "eq",
+            "worse_direction": "not_applicable",
+        },
+        "expected_signal": None,
+        "evidence_refs": [
+            {
+                "ref_type": "runtime_receipt",
+                "source_id": "runtime",
+                "resource_identity": f"agent-retrospective-deterministic-enrichment-fallback:{candidate_id}",
+                "projection_digest": f"sha256:{fallback_hash}",
+            }
+        ],
+        "classified_at": timestamp,
+        "classifier_version": "run_retrospective/v1",
+    }
+
+
+def _enrich_candidate_record(
+    raw_candidate: dict[str, Any],
+    *,
+    repository_id: str,
+    base_sha: str,
+    source_set_digest: str,
+    timestamp: str,
+) -> dict[str, Any]:
+    """Deterministic enrichment (Issue #2362 step 3) for a single raw
+    candidate record: unconditionally overwrite `source_run_ref`/
+    `created_at`/`updated_at` with the Python-side run context, and (when
+    `finding_contract` is present) rebuild `finding_contract.identity` from
+    Python-side `repository_id` + the model-judgment `claim_class`/
+    `subject_ref`/`rule_id` extracted by `_extract_candidate_identity_judgment`,
+    calling `compute_finding_identity()` (via the sibling module loader,
+    never reimplementing JCS+SHA-256) for `identity.value`. When the
+    evaluator's own `subject_ref`/`rule_id` judgment values do not conform
+    to the canonical schema's shape (a real, observed evaluator behavior --
+    see `_is_valid_subject_ref_judgment`/`_is_valid_rule_id_judgment`'s
+    docstrings), a deterministic fallback derived from the same candidate's
+    reliably-present `candidate_id`/`title` is substituted instead, so a
+    genuinely non-empty finding never fails with `candidate_schema_invalid`
+    purely because of an identity-key NESTING/SHAPE mismatch. Likewise,
+    `finding_contract.evaluations[]` entries whose OPAQUE hash fields
+    (`evaluation_id`/`evidence_refs[].projection_digest`) are malformed are
+    repaired in place (`_repair_evaluation_entry_hashes` -- no semantic
+    content lost), and entries using an entirely non-canonical field set
+    are replaced wholesale with one conservative `_fallback_evaluation_entry`
+    (`_has_canonical_evaluation_entry_field_set` -- no coherent judgment to
+    preserve in that case). This enrichment phase NEVER rewrites
+    `evaluation_status`/`presence_delta`/`delta_status`/etc. on an entry
+    that DOES use the canonical field set -- an internally-inconsistent
+    judgment on such an entry legitimately still fails canonical
+    validation as `candidate_schema_invalid` (a real evaluator bug, not
+    something this phase should paper over). The evaluator's own
+    `repository_id`/`identity.value`/`source_run_ref`/`created_at`/
+    `updated_at` are never trusted regardless, matching this Issue's
+    Identity/Deterministic Field Authority Matrix. Returns a NEW dict --
+    `raw_candidate` is never mutated in place. Non-dict records and
+    records without `finding_contract` (legacy lifecycle-only candidates,
+    `delta_capability: legacy_unavailable`) pass through with only the
+    top-level `source_run_ref`/`created_at`/`updated_at` overwrite applied."""
+    if not isinstance(raw_candidate, dict):
+        return raw_candidate
+    enriched = dict(raw_candidate)
+    enriched["source_run_ref"] = {"base_sha": base_sha, "source_set_digest": source_set_digest}
+    enriched["created_at"] = timestamp
+    enriched["updated_at"] = timestamp
+
+    finding_contract = raw_candidate.get("finding_contract")
+    if isinstance(finding_contract, dict):
+        judgment = _extract_candidate_identity_judgment(raw_candidate)
+        candidate_id = raw_candidate.get("candidate_id")
+        title = raw_candidate.get("title")
+        subject_ref = judgment["subject_ref"]
+        if not _is_valid_subject_ref_judgment(subject_ref):
+            subject_ref = _fallback_subject_ref(candidate_id)
+        rule_id = judgment["rule_id"]
+        if not _is_valid_rule_id_judgment(rule_id):
+            rule_id = _fallback_rule_id(candidate_id, title)
+        key = {
+            "repository_id": repository_id,
+            "claim_class": judgment["claim_class"],
+            "subject_ref": subject_ref,
+            "rule_id": rule_id,
+        }
+        algorithm = _default_finding_identity_algorithm()
+        value = _validate_retrospective_schema_module().compute_finding_identity(key, algorithm=algorithm)
+        enriched_finding_contract = dict(finding_contract)
+        enriched_finding_contract["identity"] = {"algorithm": algorithm, "key": key, "value": value}
+
+        candidate_id_str = str(raw_candidate.get("candidate_id") or "")
+        evaluations = finding_contract.get("evaluations")
+        if (
+            isinstance(evaluations, list)
+            and evaluations
+            and all(_has_canonical_evaluation_entry_field_set(entry) for entry in evaluations)
+        ):
+            enriched_finding_contract["evaluations"] = [_repair_evaluation_entry_hashes(e) for e in evaluations]
+        else:
+            enriched_finding_contract["evaluations"] = [
+                _fallback_evaluation_entry(
+                    base_sha=base_sha,
+                    source_set_digest=source_set_digest,
+                    timestamp=timestamp,
+                    candidate_id=candidate_id_str,
+                )
+            ]
+
+        enriched["finding_contract"] = enriched_finding_contract
+
+    return enriched
+
+
+def _enrich_evaluation_payload(
+    payload: dict[str, Any],
+    *,
+    repository_id: str,
+    base_sha: str,
+    source_set_digest: str,
+    timestamp: str,
+) -> dict[str, Any]:
+    """Apply `_enrich_candidate_record` to every entry of
+    `payload["candidate_records"]` (Issue #2362 step 3). Returns a NEW
+    payload dict -- the outer-envelope-parsed, not-yet-validated `payload`
+    dict `run_evaluation()` passes in is never mutated in place."""
+    enriched = dict(payload)
+    enriched["candidate_records"] = [
+        _enrich_candidate_record(
+            record,
+            repository_id=repository_id,
+            base_sha=base_sha,
+            source_set_digest=source_set_digest,
+            timestamp=timestamp,
+        )
+        for record in payload.get("candidate_records", [])
+    ]
+    return enriched
+
+
 def run_evaluation(
     ctx: RunContext,
     evaluator_request: EvaluatorRequest,
     *,
     invoke_evaluator: Callable[[EvaluatorRequest], AgentInvocationResult],
+    repository_id: str,
+    clock: Callable[[], datetime] = _utcnow,
     repair: Callable[[str, WireContractError], str] | None = None,
 ) -> Evaluation:
     """Invoke the evaluator exactly once with ``evaluator_request`` (built
@@ -1248,7 +1695,26 @@ def run_evaluation(
     ``build_finding_sets``/``prepare_evaluator_request``) and strictly
     validate its output. The caller (``execute_run``/``run_cli``) is
     responsible for only calling this after ``run_observer_wave`` has
-    succeeded for every observer in the wave (AC9)."""
+    succeeded for every observer in the wave (AC9).
+
+    Issue #2362: `Evaluation` construction (the canonical
+    candidate-validation firing point, via `__post_init__` ->
+    `_post_validate()` -> `_validate_candidate_records()`) is deliberately
+    the LAST step here, preceded by a deterministic enrichment phase:
+    (1) outer envelope parse -- `_parse_wire_payload_with_repair()`
+    validates generic wire shape only (shared with `from_wire()` via
+    `_parse_wire_payload()`), WITHOUT constructing `Evaluation`;
+    (2)-(3) judgment-only extraction + deterministic enrichment --
+    `_enrich_evaluation_payload()` unconditionally overwrites every
+    candidate record's `identity.key`/`identity.value`/`source_run_ref`/
+    `created_at`/`updated_at` from `repository_id` (Python-side caller
+    context -- NOT part of `EvaluatorRequest`), `ctx.base_sha`,
+    `evaluator_request.source_set_digest`, `clock()`, and the evaluator's
+    own model-judgment `claim_class`/`subject_ref`/`rule_id` values (never
+    its `repository_id`/`identity.value`, which carry no authority); (4)
+    construction -- `Evaluation(**enriched_payload)` fires canonical
+    candidate validation for the FIRST time, against the ENRICHED payload,
+    never the raw evaluator output."""
     result = invoke_evaluator(evaluator_request)
     if result.status != "ok":
         # Issue #2341 AC1: thread the underlying adapter-level
@@ -1259,7 +1725,25 @@ def run_evaluation(
             exit_code=result.exit_code,
         )
     raw_text = json.dumps(result.structured_output, sort_keys=True, separators=(",", ":"))
-    evaluation = parse_agent_output_with_repair(raw_text, Evaluation, repair=repair)
+    # Step 1 (outer envelope parse): generic wire-shape validation only --
+    # Evaluation is NOT constructed here, so canonical candidate validation
+    # has not fired yet.
+    payload = _parse_wire_payload_with_repair(raw_text, Evaluation, repair=repair)
+    # Steps 2-3 (judgment-only extraction + deterministic enrichment).
+    enriched_payload = _enrich_evaluation_payload(
+        payload,
+        repository_id=repository_id,
+        base_sha=ctx.base_sha,
+        source_set_digest=evaluator_request.source_set_digest,
+        timestamp=_iso(clock()),
+    )
+    # Step 4 (construction): canonical candidate validation
+    # (_post_validate()/_validate_candidate_records()/validate_candidate())
+    # fires for the FIRST time here, against the enriched payload.
+    try:
+        evaluation = Evaluation(**enriched_payload)
+    except TypeError as exc:  # pragma: no cover - defensive, shape already checked in step 1
+        raise WireContractError(f"construction_failed:{exc}", reason_code="construction_failed") from exc
     if evaluation.run_id != ctx.run_id or evaluation.source_set_digest != evaluator_request.source_set_digest:
         raise EvaluatorInvocationFailed("evaluation_envelope_mismatch")
     return evaluation
@@ -1394,7 +1878,9 @@ def execute_run(
     bundles = run_observer_wave(ctx, plan, invoke=invoke, observer_requests=observer_requests)
     finding_sets = build_finding_sets(ctx, plan, bundles)
     evaluator_request = prepare_evaluator_request(ctx, plan, finding_sets)
-    evaluation = run_evaluation(ctx, evaluator_request, invoke_evaluator=invoke_evaluator)
+    evaluation = run_evaluation(
+        ctx, evaluator_request, invoke_evaluator=invoke_evaluator, repository_id=repository_id, clock=clock
+    )
     resolved_provider = (
         previous_state_provider if previous_state_provider is not None else FixturePreviousStateProvider(fixtures={})
     )
@@ -2262,7 +2748,9 @@ def run_cli(
         def _invoke_evaluator(_request: EvaluatorRequest) -> AgentInvocationResult:
             return invoke_agent(evaluator_agent_request, runner=runner, policy=policy)
 
-        evaluation = run_evaluation(ctx, evaluator_request, invoke_evaluator=_invoke_evaluator)
+        evaluation = run_evaluation(
+            ctx, evaluator_request, invoke_evaluator=_invoke_evaluator, repository_id=repository_id, clock=clock
+        )
         resolved_provider = (
             previous_state_provider
             if previous_state_provider is not None
