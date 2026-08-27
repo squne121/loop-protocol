@@ -334,8 +334,13 @@ rules:
     selectors:
       - source_scope: project
         component: skill_definition
+        issue_time_enforcement: hard
         path_globs:
           - ".claude/skills/**/SKILL.md"
+      - source_scope: project
+        component: skill_definition
+        issue_time_enforcement: advisory
+        path_globs:
           - ".claude/skills/**/scripts/**"
       - source_scope: user
         component: skill_definition

@@ -80,29 +80,6 @@ DECISION_RANK: dict[str, int] = {
     "immediate": 2,
 }
 
-# Path globs whose match is treated as "candidate discovery only" -- it is
-# recorded in ``matched_rules`` (and its ``verification_profile`` is still
-# surfaced) but never forces ``final_decision`` / ``needs_fix`` on its own
-# (PR #2335 OWNER review fix_delta, Issue #2290 P0).
-#
-# Rationale: a file living under ``.claude/skills/**/scripts/**`` being a
-# "skill script" is not the same fact as "skill runtime semantics changed".
-# This evaluator module's own consumers -- ``check_issue_contract.py`` and
-# ``contract_readiness_check.py`` -- are themselves under
-# ``.claude/skills/**/scripts/**``, and forcing ``decision: immediate`` on
-# every Issue whose Allowed Paths merely touch a skill script (static
-# checker edits, docstring fixes, refactors with no runtime-behavior change)
-# would make the gate self-contradicting for Issue #2290 itself. The
-# semantic judgment of whether a given script change actually alters skill
-# runtime behavior remains a PR-time responsibility (Out of Scope for
-# Issue #2290; see the module docstring).
-#
-# ``.claude/skills/**/SKILL.md`` is intentionally NOT included here: it
-# directly encodes skill runtime semantics (Procedure steps / output
-# contract schema) and keeps forcing its rule's ``default_decision`` at
-# Issue-time as before.
-CANDIDATE_ONLY_PATH_GLOBS: frozenset[str] = frozenset({".claude/skills/**/scripts/**"})
-
 
 class PolicyLoadError(RuntimeError):
     """Raised when the policy YAML cannot be loaded, does not parse to a
@@ -200,20 +177,36 @@ def _one_is_prefix_of_other(a: list[str], b: list[str]) -> bool:
     return longer[: len(shorter)] == shorter
 
 
-def _project_path_globs(rule: dict[str, Any]) -> list[str]:
-    """All ``path_globs`` from a rule's ``selectors[].source_scope: project`` entries.
+_DEFAULT_ISSUE_TIME_ENFORCEMENT = "hard"
+
+
+def _project_path_globs(rule: dict[str, Any]) -> list[tuple[str, str]]:
+    """``(path_glob, issue_time_enforcement)`` pairs from a rule's
+    ``selectors[].source_scope: project`` entries.
 
     ``runtime_resolved_only`` selectors (user/managed/plugin/session/cli
     source_scope) carry no ``path_globs`` and are intentionally excluded --
     they cannot be evaluated against repository-relative Allowed Paths
     (Issue #2290 In Scope: ``selectors[].source_scope: project`` only).
+
+    Each project selector may declare its own ``issue_time_enforcement``
+    (``hard`` / ``advisory``, Issue #2356). A selector that omits the field
+    is treated as ``hard`` -- the required runtime fallback for existing
+    rules that predate this field (e.g. ``claude-gpt-lifecycle-invocation-change``).
+    Pairing the enforcement value with each glob (instead of returning a
+    flat ``list[str]``) preserves selector identity so callers can derive
+    advisory/hard per-glob rather than relying on a separate hardcoded
+    constant (Issue #2356; supersedes the removed ``CANDIDATE_ONLY_PATH_GLOBS``
+    frozenset from Issue #2290 / PR #2335).
     """
-    globs: list[str] = []
+    pairs: list[tuple[str, str]] = []
     for selector in rule.get("selectors", []) or []:
         if selector.get("source_scope") != "project":
             continue
-        globs.extend(selector.get("path_globs", []) or [])
-    return globs
+        issue_time_enforcement = selector.get("issue_time_enforcement") or _DEFAULT_ISSUE_TIME_ENFORCEMENT
+        for path_glob in selector.get("path_globs", []) or []:
+            pairs.append((path_glob, issue_time_enforcement))
+    return pairs
 
 
 def _selector_remainder_after_prefix(normalized_selector: str, prefix_len: int) -> list[str]:
@@ -243,26 +236,26 @@ def _is_single_file_at_any_depth_selector(normalized_selector: str, selector_pre
 def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Return a match-info dict if ``entry`` is a candidate for ``rule``, else ``None``.
 
-    A rule may declare more than one ``path_glob`` (e.g.
-    ``skill-invocation-procedure-or-contract-change`` declares both
-    ``.claude/skills/**/SKILL.md`` and ``.claude/skills/**/scripts/**``).
-    For a *wildcard* Allowed Path entry, the conservative static-prefix
-    comparison can match several of the rule's globs at once with equal
-    confidence (e.g. an entry whose prefix is ``.claude/skills/foo`` is an
-    equally valid conservative match against both globs above). Picking
-    only the first glob encountered is an ordering artifact, not a
-    judgment -- if picking the "wrong" glob silently turns a
-    candidate-discovery-only match (``CANDIDATE_ONLY_PATH_GLOBS``) into a
-    hard-block match, the gate self-contradicts on its own declared
-    Allowed Paths (PR #2335 OWNER review fix_delta, Issue #2290 P0
-    re-fix). To stay on the documented "conservative" side (false
+    A rule may declare more than one project selector, each pairing its
+    ``path_globs`` with its own ``issue_time_enforcement`` (e.g.
+    ``skill-invocation-procedure-or-contract-change`` declares a ``hard``
+    selector for ``.claude/skills/**/SKILL.md`` and a separate ``advisory``
+    selector for ``.claude/skills/**/scripts/**``, Issue #2356). For a
+    *wildcard* Allowed Path entry, the conservative static-prefix comparison
+    can match several of the rule's globs at once with equal confidence
+    (e.g. an entry whose prefix is ``.claude/skills/foo`` is an equally
+    valid conservative match against both globs above). Picking only the
+    first glob encountered is an ordering artifact, not a judgment -- if
+    picking the "wrong" glob silently turns an advisory (candidate-discovery-
+    only) match into a hard-block match, the gate self-contradicts on its
+    own declared Allowed Paths (PR #2335 OWNER review fix_delta, Issue
+    #2290 P0 re-fix). To stay on the documented "conservative" side (false
     negatives are acceptable, false positives are not; but a hard block
     triggered purely by glob-iteration order is itself a false positive
-    here), a wildcard entry that ambiguously matches both a
-    candidate-only glob and a non-candidate-only glob within the same
-    rule is resolved to the candidate-only (advisory) match. An entry
-    that matches only candidate-only globs, or only non-candidate-only
-    globs, is unambiguous and keeps its natural classification.
+    here), a wildcard entry that ambiguously matches both an advisory glob
+    and a hard glob within the same rule is resolved to the advisory match.
+    An entry that matches only advisory globs, or only hard globs, is
+    unambiguous and keeps its natural classification.
     """
     normalized_entry_pattern = AllowedPathsMatcher.normalize_allowed_pattern(entry)
     if normalized_entry_pattern is None:
@@ -270,7 +263,7 @@ def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[
     is_wildcard = "*" in normalized_entry_pattern
 
     matches: list[dict[str, Any]] = []
-    for path_glob in _project_path_globs(rule):
+    for path_glob, issue_time_enforcement in _project_path_globs(rule):
         normalized_selector = AllowedPathsMatcher.normalize_allowed_pattern(path_glob)
         if normalized_selector is None:
             continue
@@ -291,6 +284,7 @@ def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[
                     "match_kind": "exact",
                     "allowed_path_entry": entry,
                     "path_glob": path_glob,
+                    "issue_time_enforcement": issue_time_enforcement,
                 }
             continue
 
@@ -330,21 +324,22 @@ def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[
                 "match_kind": "conservative_wildcard_prefix",
                 "allowed_path_entry": entry,
                 "path_glob": path_glob,
+                "issue_time_enforcement": issue_time_enforcement,
             }
         )
 
     if not matches:
         return None
 
-    candidate_only_hits = [m for m in matches if m["path_glob"] in CANDIDATE_ONLY_PATH_GLOBS]
-    non_candidate_only_hits = [m for m in matches if m["path_glob"] not in CANDIDATE_ONLY_PATH_GLOBS]
-    if candidate_only_hits and non_candidate_only_hits:
+    advisory_hits = [m for m in matches if m["issue_time_enforcement"] == "advisory"]
+    hard_hits = [m for m in matches if m["issue_time_enforcement"] == "hard"]
+    if advisory_hits and hard_hits:
         # Ambiguous: the same wildcard entry's conservative prefix matched
-        # both a candidate-only glob and a non-candidate-only glob within
-        # this rule, with no basis to prefer one over the other. Resolve
-        # to the candidate-only (advisory) match rather than the hard
-        # match to avoid a glob-iteration-order-dependent hard block.
-        return candidate_only_hits[0]
+        # both an advisory selector and a hard selector within this rule,
+        # with no basis to prefer one over the other. Resolve to the
+        # advisory match rather than the hard match to avoid a
+        # glob-iteration-order-dependent hard block.
+        return advisory_hits[0]
 
     return matches[0]
 
@@ -377,7 +372,7 @@ def evaluate_allowed_paths(
         if not match_hits:
             continue
 
-        hard_hits = [hit for hit in match_hits if hit["path_glob"] not in CANDIDATE_ONLY_PATH_GLOBS]
+        hard_hits = [hit for hit in match_hits if hit["issue_time_enforcement"] == "hard"]
         enforcement = "hard" if hard_hits else "advisory"
 
         rule_decision = rule.get("default_decision")
@@ -393,10 +388,12 @@ def evaluate_allowed_paths(
         )
         if rule_profile:
             verification_profiles.add(rule_profile)
-        # Advisory-only matches (every hit's path_glob is in
-        # CANDIDATE_ONLY_PATH_GLOBS) are candidate discovery signals, not a
-        # hard block -- they never contribute to final_decision (Issue #2290
-        # P0 fix delta, PR #2335).
+        # Advisory-only matches (every hit's selector declares
+        # issue_time_enforcement: advisory) are candidate discovery
+        # signals, not a hard block -- they never contribute to
+        # final_decision (Issue #2290 P0 fix delta, PR #2335; derivation
+        # migrated from the removed CANDIDATE_ONLY_PATH_GLOBS constant to
+        # selector-declared issue_time_enforcement by Issue #2356).
         if enforcement == "hard" and rule_decision in DECISION_RANK:
             if final_decision is None or DECISION_RANK[rule_decision] > DECISION_RANK[final_decision]:
                 final_decision = rule_decision
