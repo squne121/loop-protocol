@@ -51,6 +51,61 @@ function createRetrospectiveRunComment() {
   }
 }
 
+// Issue #2308: a structurally-invalid agent_retrospective_run_publication/v1
+// envelope (publication_digest omitted) -- normalizeRetrospectiveRunComment()
+// returns kind: 'blocked' for this, and buildRetroIndex() must record it in
+// retrospective_runs_blocked[] instead of silently discarding it.
+function createMalformedRetrospectiveRunComment() {
+  const envelope = {
+    schema_version: 'agent_retrospective_run_publication/v1',
+    repository_id: 'squne121/loop-protocol',
+    target_issue: 2238,
+    request_id: 'req-malformed',
+    scope: 'repository',
+    idempotency_key: `sha256:${'5'.repeat(64)}`,
+    expected_previous_digest: null,
+    parent_record_digest: null,
+    run: {
+      run_identity: {
+        run_id: 'run-malformed',
+        base_sha: 'b'.repeat(40),
+        source_set_digest: 'e'.repeat(64),
+        generated_at: '2026-08-22T00:00:00Z',
+        runtime_version: 'agent-retrospective-persist/v1',
+      },
+      source_observations: [
+        { source_type: 'repository', source_id: 'repository', source_status: 'complete', pagination_completeness: 'complete' },
+      ],
+    },
+    candidate_records: [],
+    delta_results: [],
+    // publication_digest intentionally omitted -- structurally invalid
+  }
+  const marker = `<!-- agent_retrospective_run:v1 repository_id=${envelope.repository_id} idempotency_key=${envelope.idempotency_key} -->`
+  const fenced = `\`\`\`json\n${JSON.stringify(envelope, null, 2)}\n\`\`\``
+  return {
+    html_url: 'https://github.com/squne121/loop-protocol/issues/928#issuecomment-5000000010',
+    body: `${marker}\n\n${fenced}\n`,
+    linkedPrHints: [],
+    linkedIssueHints: [928],
+    branchHint: null,
+  }
+}
+
+// Issue #2308 AC3: the first line carries the agent_retrospective_run:v1
+// marker prefix but omits idempotency_key, so it fails strict
+// RETROSPECTIVE_RUN_MARKER_LINE parsing while still being recognizably a
+// retrospective-run marker (as opposed to an unrelated comment).
+function createMarkerPrefixMalformedComment() {
+  return {
+    html_url: 'https://github.com/squne121/loop-protocol/issues/928#issuecomment-5000000011',
+    body: '<!-- agent_retrospective_run:v1 repository_id=squne121/loop-protocol -->\n\nno idempotency_key on the marker line',
+    linkedPrHints: [],
+    linkedIssueHints: [928],
+    branchHint: null,
+  }
+}
+
 function createSourceComment() {
   const report = createValidReport()
   report.docs_read_refs = [
@@ -467,5 +522,89 @@ describe('update-retro-index', () => {
   it('GIVEN a comment with no retrospective-run marker WHEN normalizeRetrospectiveRunComment runs THEN it is ignored (not routed to retrospective_runs)', () => {
     const ignored = normalizeRetrospectiveRunComment(createSourceComment())
     expect(ignored.kind).toBe('ignored')
+  })
+
+  it('GIVEN a marker prefix present but idempotency_key missing WHEN normalizeRetrospectiveRunComment runs THEN it is blocked as retrospective_run_marker_malformed rather than ignored (Issue #2308 AC3)', () => {
+    const blocked = normalizeRetrospectiveRunComment(createMarkerPrefixMalformedComment())
+    expect(blocked.kind).toBe('blocked')
+    expect(blocked.reason).toBe('retrospective_run_marker_malformed')
+  })
+
+  it('GIVEN a valid entry and a structurally-invalid retrospective-run comment WHEN buildRetroIndex runs THEN entries[] is preserved, retrospective_runs_blocked records the malformed run, and generation_verdict becomes partial (Issue #2308 AC1/AC2/AC5)', () => {
+    const malformedRunComment = createMalformedRetrospectiveRunComment()
+    const built = buildRetroIndex({
+      sourceComments: [createSourceComment(), malformedRunComment],
+      parentIssue: 928,
+      prMetadataByNumber: new Map([
+        [955, {
+          number: 955,
+          body: 'Closes #935',
+          mergeSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          headRefName: 'worktree-issue-935-agent-run-report',
+        }],
+      ]),
+      associatedPrByMergeSha: new Map([
+        ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 955],
+      ]),
+      parentChildIssueNumbers: [935],
+    })
+
+    // entries[] (agent_run_report/v1) is not lost because of the malformed
+    // retrospective-run comment
+    expect(built.index.entries).toHaveLength(1)
+    expect(built.index.generation_verdict).toBe('partial')
+
+    expect(built.index.retrospective_runs_blocked).toEqual([
+      {
+        run_comment_url: malformedRunComment.html_url,
+        reason: 'retrospective_run_publication_digest_missing',
+      },
+    ])
+
+    // existing blockedReasons[]/entries[] agent_run_report/v1 blocked
+    // semantics are unaffected by this additive change
+    expect(built.blockedReasons).toHaveLength(0)
+
+    // the additive key does not trigger the schema-migration guard
+    expect(detectSchemaMigrationRequirement(built.index)).toBeNull()
+  })
+
+  it('GIVEN a retrospective-run comment whose marker prefix fails strict parsing WHEN buildRetroIndex runs THEN it is recorded in retrospective_runs_blocked with reason retrospective_run_marker_malformed and generation_verdict becomes partial (Issue #2308 AC3)', () => {
+    const malformedMarkerComment = createMarkerPrefixMalformedComment()
+    const built = buildRetroIndex({
+      sourceComments: [malformedMarkerComment],
+      parentIssue: 928,
+    })
+
+    expect(built.index.retrospective_runs_blocked).toEqual([
+      {
+        run_comment_url: malformedMarkerComment.html_url,
+        reason: 'retrospective_run_marker_malformed',
+      },
+    ])
+    expect(built.index.generation_verdict).toBe('partial')
+    expect(built.index.entries).toHaveLength(0)
+  })
+
+  it('GIVEN only a valid retrospective-run comment and no malformed runs WHEN buildRetroIndex runs THEN retrospective_runs_blocked stays empty and generation_verdict remains complete (regression: additive field does not degrade the normal-path verdict)', () => {
+    const built = buildRetroIndex({
+      sourceComments: [createSourceComment(), createRetrospectiveRunComment()],
+      parentIssue: 928,
+      prMetadataByNumber: new Map([
+        [955, {
+          number: 955,
+          body: 'Closes #935',
+          mergeSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          headRefName: 'worktree-issue-935-agent-run-report',
+        }],
+      ]),
+      associatedPrByMergeSha: new Map([
+        ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 955],
+      ]),
+      parentChildIssueNumbers: [935],
+    })
+
+    expect(built.index.retrospective_runs_blocked).toEqual([])
+    expect(built.index.generation_verdict).toBe('complete')
   })
 })
