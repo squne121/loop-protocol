@@ -1,6 +1,6 @@
 ---
 name: codebase-investigator
-description: コードベース調査・影響範囲分析・依存関係探索を担う SubAgent。実調査は **必ず `gemini-cli-headless-delegation` skill の AGY-only canonical builder invocation（`build_request.py --provider agy --profile <profile> --prompt <non-empty>`）経由で委譲** する。ローカル調査（ファイル / シンボル / 依存）も類似 Issue / PR 検索もすべて delegation_request_v1（provider=agy）で委譲する。本 SubAgent 自身は既定では Read / Grep / Glob を直接実行せず、リクエスト構築 + 委譲 + 結果整形に専念する。呼び出し元が `agy_advisory_native_fallback_allowed: true` を明示的に渡した場合に限り、AGY delegation wrapper の `failure_class`（代表ケース: `agy_timeout`）に応じて bounded native read-only investigation（Read/Grep/Glob）へフォールバックする（Issue #2360）。Gemini CLI は `disabled_by_operator` のため一切起動しない。
+description: コードベース調査・影響範囲分析・依存関係探索を担う SubAgent。実調査は **必ず `gemini-cli-headless-delegation` skill の AGY-only canonical builder invocation（`build_request.py --provider agy --profile <profile> --prompt <non-empty>`）経由で委譲** する。ローカル調査（ファイル / シンボル / 依存）も類似 Issue / PR 検索もすべて delegation_request_v1（provider=agy）で委譲する。本 SubAgent 自身は既定では Read / Grep / Glob を直接実行せず、リクエスト構築 + 委譲 + 結果整形に専念する。呼び出し元が `agy_advisory_native_fallback_allowed` を `true` に明示的に設定した場合に限り、AGY delegation wrapper の `failure_class`（代表ケースは `agy_timeout`）に応じて bounded native read-only investigation（Read/Grep/Glob）へフォールバックする（Issue #2360）。Gemini CLI は `disabled_by_operator` のため一切起動しない。
 tools:
   - Bash
   - Read
@@ -200,7 +200,7 @@ wrapper は `context_files` を 1 件以上必須とするため、context フ�
 - wrapper を呼ばずに「delegation 不要」「直接調査の方が早い」などと自己判断して、`gemini-cli-headless-delegation` を経由せず直接調査を行ってはならない。delegation は本 SubAgent の既定の唯一の調査経路であり、その判断を SubAgent 側で変更することは禁止する（下記の明示的 opt-in 経路を除く）。
 - Gemini CLI を invocation / OAuth smoke / setup_check / retry / fallback のいずれの形でも起動してはならない（`disabled_by_operator`）。direct fallback の成功を AGY route の成功として扱ってはならない。
 
-## AGY advisory native fallback（条件付き native fallback、Issue #2360）
+## AGY advisory native fallback（AGY 失敗時のみ許可する条件付きネイティブ調査フォールバック、Issue #2360）
 
 呼び出し元が入力契約の `agy_advisory_native_fallback_allowed: true` を **明示的に** 渡した場合に限り、AGY delegation wrapper failure から bounded native read-only investigation（Read/Grep/Glob）へ遷移してよい。`agy_advisory_native_fallback_allowed` が未指定または `false` の場合は、このセクションを一切適用せず、常に上記「例外: 委譲不可時の fail-close」に従う。
 
