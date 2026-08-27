@@ -186,7 +186,6 @@ def render_command(command_id: str, values: dict[str, object]) -> list[str]:
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -204,34 +203,6 @@ def main() -> int:
         outside = Path(".mypy_cache")
         outside.mkdir(parents=True, exist_ok=True)
         (outside / "outside.txt").write_text("self-write")
-    if os.environ.get("SKILL_RUNTIME_TEST_REAL_PYTEST_PEER") == "ignored":
-        # AC7: spawn a genuine independent pytest OS process (not this
-        # fixture's own interpreter) that writes real repo-root
-        # .pytest_cache/** state via pytest's actual cacheprovider plugin,
-        # and wait for it to finish durably before this child returns --
-        # deterministic by construction (no fixed-sleep race against the
-        # after-snapshot). The peer test file and invocation cwd are both
-        # the repo root itself so pytest's rootdir (and therefore its
-        # default .pytest_cache location) resolves to the repo root, not a
-        # nested subdirectory.
-        peer_test_file = Path("test_peer_pytest_cache.py")
-        peer_test_file.write_text("def test_ok():\\n    assert True\\n")
-        peer_python = os.environ["SKILL_RUNTIME_TEST_PEER_PYTHON"]
-        try:
-            subprocess.run(
-                [peer_python, "-m", "pytest", "-q", "test_peer_pytest_cache.py"],
-                cwd=".",
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        finally:
-            # Remove only the throwaway peer test source file (a tracked-
-            # source-tree stand-in that this fixture created solely to give
-            # the real pytest subprocess something to collect); the real
-            # .pytest_cache/** state it produced is left in place -- that is
-            # exactly the state under test.
-            peer_test_file.unlink(missing_ok=True)
     artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number
     artifact_dir.mkdir(parents=True, exist_ok=True)
     payload = {"issue_number": args.issue_number, "repo": args.repo}
@@ -421,26 +392,110 @@ def test_exemption_is_repo_root_specific_not_nested_or_prefix_lookalike(tmp_path
     assert "unauthorized write path=.pytest_cache2" in result2.stderr
 
 
+def _wait_for_file(path: Path, timeout: float) -> bool:
+    """Poll (bounded, not a fixed sleep) for `path` to appear -- a simple
+    file-based barrier/handshake so the caller can deterministically know a
+    sibling process has actually started, instead of guessing a delay."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.02)
+    return path.exists()
+
+
 def test_independent_pytest_process_writes_real_pytest_cache_and_is_permitted(tmp_path: Path) -> None:
-    """AC7: GIVEN a genuinely independent OS process (a real `pytest`
-    subprocess, not a simulated file write) runs inside the fixture repo
-    and writes real `.pytest_cache/**` state via its actual cacheprovider
-    plugin
-    WHEN this command's own child subprocess spawns and waits on that real
-    peer pytest process before returning
-    THEN skill_runtime_exec.py must not fail with unauthorized_write_path."""
+    """AC7 (PR #2364 review P1-2 fix): GIVEN a genuinely independent OS
+    process -- a real `pytest` subprocess launched as a *sibling* of this
+    command's own guarded child, by the test harness itself, not spawned and
+    awaited-to-completion from inside the guarded child -- concurrently
+    writes real repo-root `.pytest_cache/**` state via its actual
+    cacheprovider plugin while the guarded child is still running
+    WHEN both processes overlap in wall-clock time (synchronized by a file
+    barrier: the peer pytest writes a "started" sentinel before it begins its
+    own brief sleep-then-finish, and this test waits on that sentinel before
+    invoking the executor)
+    THEN skill_runtime_exec.py must not fail with unauthorized_write_path,
+    AND the real independent peer pytest process must itself have exited
+    successfully (its exit code is asserted, not ignored)."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    result = _run_executor(
-        repo,
-        {
-            "SKILL_RUNTIME_TEST_REAL_PYTEST_PEER": "ignored",
-            "SKILL_RUNTIME_TEST_PEER_PYTHON": sys.executable,
-        },
+    started_sentinel = repo / "peer_pytest_started.sentinel"
+    (repo / "test_peer_pytest_cache.py").write_text(
+        "from pathlib import Path\n"
+        "import time\n"
+        "def test_ok():\n"
+        f"    Path({str(started_sentinel)!r}).write_text('started')\n"
+        "    time.sleep(0.3)\n"
+        "    assert True\n"
     )
+    peer_proc = subprocess.Popen(
+        [sys.executable, "-m", "pytest", "-q", "test_peer_pytest_cache.py"],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert _wait_for_file(started_sentinel, timeout=10), "peer pytest never started"
+        result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
+    finally:
+        peer_stdout, _ = peer_proc.communicate(timeout=10)
+        (repo / "test_peer_pytest_cache.py").unlink(missing_ok=True)
+    assert peer_proc.returncode == 0, peer_stdout
     assert result.returncode == 0, result.stderr
     real_cache_dir = repo / ".pytest_cache"
     assert real_cache_dir.exists()
     assert (real_cache_dir / "v" / "cache" / "nodeids").exists()
     artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
     assert artifact.exists()
+
+
+def test_pytest_cache_cold_start_temp_dir_race_is_permitted(tmp_path: Path) -> None:
+    """PR #2364 review P1-1: GIVEN a peer pytest process is mid-way through
+    its cold-start cache creation -- pytest's `Cache.
+    _ensure_cache_dir_and_supporting_files()` first materializes a repo-root
+    sibling `tempfile.TemporaryDirectory(prefix="pytest-cache-files-",
+    dir=self._cachedir.parent)` (populated with README.md/.gitignore/
+    CACHEDIR.TAG) and only atomically renames it onto `.pytest_cache`
+    afterwards -- and that transient directory still exists, unrenamed, at
+    repo root
+    WHEN this command's own child subprocess's after-snapshot observes it
+    THEN skill_runtime_exec.py must not fail with unauthorized_write_path
+    (the temp dir is pytest's own disposable cache-creation implementation
+    detail, not canonical evidence)."""
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    temp_dir = repo / "pytest-cache-files-abc123de"
+    cachedir_tag_content = "Signature: 8a477f597d28d172789f06886806bc55\n"
+    thread = _write_after_delay(temp_dir / "CACHEDIR.TAG", cachedir_tag_content, delay_seconds=0.2)
+    try:
+        result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
+    finally:
+        thread.join(timeout=5)
+    assert result.returncode == 0, result.stderr
+    assert temp_dir.exists()
+    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
+    assert artifact.exists()
+
+
+def test_pytest_cache_cold_start_temp_dir_nested_is_rejected(tmp_path: Path) -> None:
+    """PR #2364 review P1-1 scope check: GIVEN a `pytest-cache-files-*`
+    -prefixed path appears nested under a subdirectory rather than directly
+    at repo root
+    WHEN pytest's own `dir=self._cachedir.parent` always resolves to the
+    pytest rootdir (repo root for this repository), so a nested occurrence
+    can never be pytest's genuine cold-start temp dir
+    THEN skill_runtime_exec.py must still fail-close with
+    unauthorized_write_path (the exemption is repo-root-top-level-only)."""
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    nested_temp_dir = repo / "sub" / "pytest-cache-files-abc123de" / "CACHEDIR.TAG"
+    thread = _write_after_delay(nested_temp_dir, "Signature: 8a477f597d28d172789f06886806bc55\n", delay_seconds=0.2)
+    try:
+        result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
+    finally:
+        thread.join(timeout=5)
+    assert result.returncode == 2, result.stderr
+    assert "reason_code=unauthorized_write_path" in result.stderr
+    assert "unauthorized write path=sub/" in result.stderr
