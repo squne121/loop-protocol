@@ -301,3 +301,108 @@ def test_real_claude_cli_invalid_schema_fail_closed(tmp_path: Path) -> None:
     # invalid-schema validation failure this test exercises.
     assert result.status not in ("timeout", "terminated"), (result.status, result.reason_code, result.exit_code)
     assert result.structured_output is None
+
+
+
+def test_real_claude_cli_custom_prompt_identity_binding() -> None:
+    """Issue #2350 AC4: `bind_observer_prompt()` -- the identity-binding
+    helper the caller-supplied-prompt path in `run_cli()` now threads a
+    non-empty, substantive `--prompts-file` task through (Issue #2350's
+    fix for the previously-unbound caller-supplied-prompt path) -- issued
+    against the REAL `retrospective-runtime-observer` Agent and the
+    committed `observer_result_v1.schema.json`. Unlike
+    `test_real_claude_cli_production_policy_round_trip` (a trivial
+    field-echo prompt), the `task_prompt` here is a genuine investigative
+    instruction with no identity information of its own -- exactly the
+    `--prompts-file` shape Issue #2350's Background section reports
+    deterministically failing with `observer_run_id_mismatch` prior to
+    this fix. Asserts the real CLI response's `run_id` / `base_sha` /
+    `source_set_digest` / `observer_id` all match the values
+    `bind_observer_prompt()` bound into the prompt -- i.e. that
+    `run_observer_wave()`'s identity checks would pass for this response
+    (this test calls the adapter directly, one layer below
+    `run_observer_wave()`, so it asserts the equivalent field-by-field
+    equality that check performs).
+
+    PR #2358 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255,
+    "merge前に一度確認" item under the P1 live-AC4-coverage finding): beyond
+    identity equality, this now also supplies a single evidence nonce (a
+    concrete, fabricated-but-verifiable fact -- `NONCE_<hex>` -- embedded
+    directly in the task text as the observer's ONLY evidence source,
+    since `retrospective-runtime-observer` runs with `tools: []` and
+    cannot independently browse this repository) and asserts a `findings`
+    entry's `claim` actually reflects that nonce verbatim. Merely checking
+    identity fields (as the pre-fix_delta version of this test did) cannot
+    distinguish a genuinely substantive response from a degenerate
+    `"findings": []` response that only happens to echo identity
+    correctly -- this nonce-backed assertion closes that gap."""
+    run_id = f"live-cli-{uuid.uuid4()}"
+    nonce = uuid.uuid4().hex
+    nonce_token = f"NONCE_{nonce}"
+    base_sha = "e" * 40
+    source_set_digest = "f" * 64
+    observer_id = "retrospective-runtime-observer"
+
+    task_prompt = (
+        "Investigate this real engineering retrospective run (Issue #2350 "
+        f"live-CLI identity-binding regression coverage, nonce {nonce}). "
+        "You have no tools available, so use ONLY the following supplied "
+        "evidence excerpt as your investigation source -- do not attempt "
+        "to browse the repository or invent additional evidence:\n\n"
+        f'Evidence excerpt: "commit note: a diagnostic log line was added '
+        f'behind a feature flag named {nonce_token}."\n\n'
+        f'Report EXACTLY one finding whose "claim" field explicitly '
+        f'includes the exact token {nonce_token} verbatim (quote it, do '
+        f'not paraphrase or alter it), with "claim_class" set to '
+        '"process". Do not report an empty findings list -- concrete '
+        "evidence was supplied above; findings must reflect it."
+    )
+
+    prompt = rr.bind_observer_prompt(
+        task_prompt,
+        observer_id=observer_id,
+        run_id=run_id,
+        base_sha=base_sha,
+        source_set_digest=source_set_digest,
+    )
+
+    request = rr.AgentInvocationRequest(
+        agent_name=observer_id,
+        prompt=prompt,
+        json_schema_path=str(_OBSERVER_SCHEMA_PATH),
+        cwd=str(_REPO_ROOT),
+        timeout_sec=_LIVE_TIMEOUT_SEC,
+    )
+    policy = rr.DelegatedAgentPermissionPolicy(run_id=run_id)
+
+    result = rr.invoke_agent(request, policy=policy)
+
+    print(
+        f"test_real_claude_cli_custom_prompt_identity_binding: "
+        f"adapter_status={result.status} adapter_reason_code={result.reason_code} "
+        f"child_exit_code={result.exit_code}"
+    )
+
+    assert result.status == "ok", (result.status, result.reason_code, result.raw_stdout_excerpt)
+    assert result.exit_code == 0
+    assert result.reason_code is None
+    assert isinstance(result.structured_output, dict)
+    # the exact identity fields `run_observer_wave()` validates
+    # (`bundle.run_id != ctx.run_id` / `source_set_digest` / `base_sha`) --
+    # asserting field-by-field equality here is the direct equivalent of
+    # that check passing for this real CLI response.
+    assert result.structured_output.get("run_id") == run_id
+    assert result.structured_output.get("base_sha") == base_sha
+    assert result.structured_output.get("source_set_digest") == source_set_digest
+    assert result.structured_output.get("observer_id") == observer_id
+    # THEN (fix_delta addition): identity matching alone is not proof the
+    # response is substantive -- assert `findings` is non-empty AND at
+    # least one finding's `claim` actually reflects the supplied evidence
+    # nonce, ruling out a degenerate identity-only-correct, findings-empty
+    # false-green.
+    findings = result.structured_output.get("findings")
+    assert isinstance(findings, list) and findings, f"expected non-empty findings, got {findings!r}"
+    assert any(nonce_token in str(finding.get("claim", "")) for finding in findings), (
+        f"expected a finding whose claim contains {nonce_token!r}, got {findings!r}"
+    )
