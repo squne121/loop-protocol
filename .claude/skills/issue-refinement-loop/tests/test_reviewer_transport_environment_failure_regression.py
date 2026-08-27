@@ -71,6 +71,7 @@ def test_given_spawn_failure_when_deadlines_are_production_defaults_then_still_e
     assert result["transport_status"] == "environment_failure"
     assert result["semantic_verdict"] is None
     assert {attempt["reason_code"] for attempt in result["attempts"]} == {"spawn_failure"}
+    assert result["attempts"][2]["session_id"] is None
 
 
 def test_given_real_hang_when_per_attempt_deadline_small_then_timeout_still_detected(tmp_path: Path):

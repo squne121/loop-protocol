@@ -1119,7 +1119,7 @@ def run_reviewer_transport(
             )
             if retry is None:
                 break
-            active_session = retry.session_id if retry.session_id is not None else generate_invocation_id()
+            active_session = retry.session_id
             retry_intent_kind = retry.kind
             continue
         common.update(pid=process.pid, process_group=process.pid)
@@ -1349,7 +1349,7 @@ def run_reviewer_transport(
         )
         if retry is None:
             break
-        active_session = retry.session_id if retry.session_id is not None else generate_invocation_id()
+        active_session = retry.session_id
         retry_intent_kind = retry.kind
     return {
         "schema": "REVIEWER_TRANSPORT_RESULT_V1",
