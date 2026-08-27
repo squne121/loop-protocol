@@ -636,3 +636,43 @@ def test_selector_omitting_issue_time_enforcement_defaults_to_hard():
     assert matched_rule["enforcement"] == "hard"
     assert result["final_decision"] == "immediate"
     assert matched_rule["matches"][0]["issue_time_enforcement"] == "hard"
+
+
+# ---------------------------------------------------------------------------
+# PR #2359 OWNER review fix_delta (iteration 1, P1 blocker): an invalid
+# `issue_time_enforcement` value on a project selector (e.g. a typo such as
+# "hrad" instead of "hard") must fail closed -- raising `PolicyLoadError` --
+# rather than silently flowing through as a string that is neither "hard"
+# nor "advisory", failing the `== "hard"` comparison, and thereby degrading
+# the rule to "advisory" (a malformed policy value must never silently
+# WEAKEN the gate; this is the same class of self-application false-negative
+# that caused the P0 regression in PR #2335 / Issue #2290).
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_issue_time_enforcement_fails_closed():
+    bad_policy = {
+        "resolution": {"multiple_matches": "evaluate_all", "final_decision": "most_restrictive"},
+        "rules": [
+            {
+                "id": "synthetic-rule-invalid-issue-time-enforcement",
+                "selectors": [
+                    {
+                        "source_scope": "project",
+                        "path_globs": ["synthetic/invalid-enforcement-field/**"],
+                        "issue_time_enforcement": "hrad",
+                    },
+                ],
+                "default_decision": "immediate",
+                "verification_profile": "profile-synthetic-invalid",
+            },
+        ],
+    }
+    try:
+        evaluate_allowed_paths(
+            allowed_path_entries=["synthetic/invalid-enforcement-field/foo.py"],
+            policy=bad_policy,
+        )
+        assert False, "expected PolicyLoadError for invalid issue_time_enforcement value"
+    except extension_surface_policy_matcher.PolicyLoadError as exc:
+        assert "hrad" in str(exc)

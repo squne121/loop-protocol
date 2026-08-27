@@ -203,7 +203,18 @@ def _project_path_globs(rule: dict[str, Any]) -> list[tuple[str, str]]:
     for selector in rule.get("selectors", []) or []:
         if selector.get("source_scope") != "project":
             continue
-        issue_time_enforcement = selector.get("issue_time_enforcement") or _DEFAULT_ISSUE_TIME_ENFORCEMENT
+        raw_issue_time_enforcement = selector.get("issue_time_enforcement")
+        if raw_issue_time_enforcement is None:
+            issue_time_enforcement = _DEFAULT_ISSUE_TIME_ENFORCEMENT
+        elif raw_issue_time_enforcement in ("hard", "advisory"):
+            issue_time_enforcement = raw_issue_time_enforcement
+        else:
+            raise PolicyLoadError(
+                "project selector declares unsupported issue_time_enforcement "
+                f"{raw_issue_time_enforcement!r} (expected 'hard', 'advisory', or omitted; "
+                "a malformed value must fail closed rather than silently degrade to "
+                "'advisory', PR #2359 OWNER review fix_delta, Issue #2356)"
+            )
         for path_glob in selector.get("path_globs", []) or []:
             pairs.append((path_glob, issue_time_enforcement))
     return pairs
