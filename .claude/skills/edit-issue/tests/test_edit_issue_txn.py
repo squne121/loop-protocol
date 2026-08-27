@@ -2003,7 +2003,7 @@ def test_total_count_mismatch_rejects_exact_set(
     the number of nodes actually returned on a single page."""
     import json as _json
 
-    def _run(_args: list[str]) -> _CP:
+    def _run(_args: list[str], **_kwargs: object) -> _CP:
         payload = {
             "data": {
                 "repository": {

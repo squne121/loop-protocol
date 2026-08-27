@@ -192,16 +192,65 @@ def _verify_git_remote_origin(project_root: Path, trusted_repo: str, env: dict[s
 
 # -- Issue #1284 Blocker 5: generic metadata-command env sanitizer -------------
 
+# Issue #2340 fix_delta P0-1 (PR #2357 review, 2026-08-27): sanitize
+# execution/log-hygiene NOISE only, never the GitHub credential carrier
+# itself. The original #2340 P0 fix pointed `_build_metadata_sanitized_env()`
+# at the generic `ENV_SANITIZE_KEYS` list (which strips GH_TOKEN /
+# GITHUB_TOKEN / GH_CONFIG_DIR -- a policy #1667 introduced for the
+# higher-trust PR-review / dependency-graph mutation lanes, see
+# `_build_pr_review_gh_env()` / `_build_issue_dependency_remove_gh_env()`
+# below, which still use `ENV_SANITIZE_KEYS` unchanged). Applying that same
+# strip-the-credential policy to the issue-metadata read/write helpers this
+# function serves reversed the direction #2299 / PR #2303 established for
+# the Claude-GPT launcher: that Issue explicitly changed the launcher to
+# share `GH_TOKEN` / `GITHUB_TOKEN` / `GH_CONFIG_DIR` from the native
+# ambient environment (while `HOME` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME`
+# stay isolated), specifically so downstream `gh` invocations authenticate.
+# Stripping those three keys here made every controlled write in this
+# family credential-starved again -- functionally reintroducing the
+# completion-rate regression #2299 fixed, just one layer further downstream.
+#
+# The correct separation of concerns is "credential availability" vs.
+# "output/log hygiene": this function keeps the credential carrier
+# (`GH_TOKEN` / `GITHUB_TOKEN` / `GH_CONFIG_DIR`) intact and only strips
+# execution-noise / redirection-surface variables that have no legitimate
+# reason to reach a `gh api --hostname github.com ...` call this module
+# already argv-pins to the trusted host. Token VALUES are still never
+# permitted to leak into stdout/stderr/artifacts: `_classify_gh_error()` /
+# `_redact_secret_like_tokens()` redact token-shaped substrings from
+# captured `gh` stderr before it is ever returned or logged.
+_METADATA_ENV_NOISE_STRIP_KEYS = (
+    "PUBLISH_ARTIFACT_DIR",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "GH_EDITOR",
+    "EDITOR",
+    "VISUAL",
+    "BROWSER",
+    # GH_HOST / GH_REPO: every call site below already argv-pins
+    # `--hostname github.com`, so an ambient override cannot silently
+    # redirect these particular calls -- stripped anyway as defense in
+    # depth against any future call site that omits the explicit flag.
+    "GH_HOST",
+    "GH_REPO",
+    "GH_DEBUG",
+    "DEBUG",
+)
+
 
 def _build_metadata_sanitized_env() -> dict[str, str]:
-    """Build a sanitized environment for issue-metadata publisher subprocesses
-    (contract_snapshot.publish).
+    """Build the sanitized environment for issue-metadata read/write
+    subprocesses (issue_body.update / issue_content.update /
+    issue_comment.publish / contract_snapshot.publish /
+    issue_scope_snapshot.materialize). Strips execution/log-hygiene noise
+    only (Issue #2340 fix_delta P0-1) -- the GitHub credential carrier
+    (`GH_TOKEN` / `GITHUB_TOKEN` / `GH_CONFIG_DIR`) is deliberately left
+    intact so these calls authenticate the same way the Claude-GPT launcher
+    itself does (#2299 / PR #2303).
     """
     env = os.environ.copy()
-    for key in ENV_SANITIZE_KEYS:
+    for key in _METADATA_ENV_NOISE_STRIP_KEYS:
         env.pop(key, None)
-    env.pop("PYTHONPATH", None)
-    env.pop("PYTHONHOME", None)
     env["GH_PROMPT_DISABLED"] = "1"
     env["GH_NO_UPDATE_NOTIFIER"] = "1"
     return env
@@ -651,11 +700,38 @@ def _extract_http_status(stderr: str) -> int | None:
     return None
 
 
+# Issue #2340 AC5: actor capability artifact / worklog sanitization. `gh`
+# does not normally echo credential values into stderr, but this is a
+# defense-in-depth belt for the one branch below (`_classify_gh_error`'s
+# unknown-pattern fallback) that ever includes ANY caller-observed process
+# output in its return value -- every other branch here already returns a
+# fixed, credential-free canonical string. Redaction runs BEFORE bounding, so
+# a token that happens to fall within the truncation window never survives.
+_SECRET_LIKE_PATTERNS = (
+    _re.compile(r"gh[oprsu]_[A-Za-z0-9]{20,}"),
+    _re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    _re.compile(r"(?i)\bauthorization:\s*bearer\s+\S+"),
+    _re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]{16,}"),
+)
+
+
+def _redact_secret_like_tokens(text: str) -> str:
+    """Redact GitHub-token-shaped and Authorization-header-shaped
+    substrings from a diagnostic string before it is ever bounded/returned
+    (Issue #2340 AC5)."""
+    redacted = text
+    for pattern in _SECRET_LIKE_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
 def _classify_gh_error(prefix: str, stderr: str) -> str:
     """Classify a gh api failure into a deterministic error code.
 
     403 -> permission_denied, 404/410 -> ambiguous_no_retry, 422 -> validation_failed,
-    429/503 -> rate_limited, unknown -> the raw truncated stderr.
+    429/503 -> rate_limited, unknown -> the redacted, truncated stderr (Issue
+    #2340 AC5: reason_code / bounded sanitized diagnostic only -- never a raw
+    credential/token value, even in this fallback branch).
     """
     status = _extract_http_status(stderr)
     if status == 403:
@@ -666,7 +742,7 @@ def _classify_gh_error(prefix: str, stderr: str) -> str:
         return f"{prefix}_validation_failed_http_422"
     if status in (429, 503):
         return f"{prefix}_rate_limited_http_{status}"
-    return f"{prefix}: {stderr.strip()[:200]}"
+    return f"{prefix}: {_redact_secret_like_tokens(stderr.strip())[:200]}"
 
 
 # -- Issue #1284: issue body / comment mutation helpers ------------------------
@@ -718,7 +794,9 @@ def _fetch_issue_body_and_updated_at(issue_number: int, repo: str, gh_bin: str) 
     ``contract_snapshot.publish`` uses this helper for both its stale-write
     precondition and its post-publish live-body revalidation.  Those reads are
     part of the authoritative success boundary, so they must not inherit a
-    caller-controlled GH_HOST/GH_REPO/GH_CONFIG_DIR setting.
+    caller-controlled GH_HOST/GH_REPO override (Issue #2340 fix_delta P0-1:
+    GH_CONFIG_DIR / GH_TOKEN / GITHUB_TOKEN are the intentional credential
+    carrier and are not stripped -- see `_build_metadata_sanitized_env()`).
     """
     try:
         out = subprocess.run(
@@ -746,7 +824,16 @@ def _fetch_issue_body_and_updated_at(issue_number: int, repo: str, gh_bin: str) 
 
 
 def _patch_issue_body(issue_number: int, repo: str, new_body: str, gh_bin: str) -> str:
-    """PATCH issue body via gh api argv-list (no gh issue edit CLI). Returns error or ''."""
+    """PATCH issue body via gh api argv-list (no gh issue edit CLI). Returns error or ''.
+
+    Issue #2340 AC1 (P0 credential parity): this write path previously
+    inherited the caller's ambient environment while the sibling read helpers
+    (`_fetch_issue_content` / `_fetch_issue_body_and_updated_at`) explicitly
+    passed `env=_build_metadata_sanitized_env()`. That asymmetry let a read
+    and a write in the same logical transaction execute under different
+    GitHub credential/host contexts. This now pins the trusted host and
+    sanitized env identically to the read helpers.
+    """
     import tempfile
 
     try:
@@ -758,6 +845,8 @@ def _patch_issue_body(issue_number: int, repo: str, new_body: str, gh_bin: str) 
                 [
                     gh_bin,
                     "api",
+                    "--hostname",
+                    _TRUSTED_GITHUB_HOST,
                     "--method",
                     "PATCH",
                     f"repos/{repo}/issues/{issue_number}",
@@ -768,6 +857,7 @@ def _patch_issue_body(issue_number: int, repo: str, new_body: str, gh_bin: str) 
                 text=True,
                 timeout=15,
                 shell=False,
+                env=_build_metadata_sanitized_env(),
             )
         finally:
             try:
@@ -821,7 +911,12 @@ def _patch_issue_content(issue_number: int, repo: str, title: str, body: str, gh
 
 
 def _post_gh_comment(issue_number: int, repo: str, body: str, gh_bin: str) -> tuple[str, str, str]:
-    """POST a comment via gh api argv-list. Returns (comment_url, comment_id, error)."""
+    """POST a comment via gh api argv-list. Returns (comment_url, comment_id, error).
+
+    Issue #2340 AC1: same-transaction issue comment publish route -- pinned to
+    the trusted host and sanitized env for parity with the issue body
+    read/write helpers above (previously inherited ambient env unsanitized).
+    """
     import tempfile
 
     try:
@@ -833,6 +928,8 @@ def _post_gh_comment(issue_number: int, repo: str, body: str, gh_bin: str) -> tu
                 [
                     gh_bin,
                     "api",
+                    "--hostname",
+                    _TRUSTED_GITHUB_HOST,
                     "--method",
                     "POST",
                     f"repos/{repo}/issues/{issue_number}/comments",
@@ -843,6 +940,7 @@ def _post_gh_comment(issue_number: int, repo: str, body: str, gh_bin: str) -> tu
                 text=True,
                 timeout=15,
                 shell=False,
+                env=_build_metadata_sanitized_env(),
             )
         finally:
             try:
