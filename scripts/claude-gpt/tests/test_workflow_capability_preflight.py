@@ -71,7 +71,16 @@ def test_workflow_capability_returns_structured_result():
     assert result["schema"] == "CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1"
     assert result["profile"] == "issue-to-impl"
     assert result["decision"] in ("ready", "degraded", "blocked")
-    assert set(result.keys()) == {"schema", "profile", "decision", "checks", "reasons"}
+    assert set(result.keys()) == {
+        "schema", "profile", "decision", "checks", "reasons", "actor_capabilities",
+    }
+    # Issue #2340 AC2: actor/execution-substrate-scoped capability entries.
+    assert set(result["actor_capabilities"].keys()) == {
+        "root_github_read", "controlled_github_read", "delegated_research_agy", "spark_delegation",
+    }
+    for entry in result["actor_capabilities"].values():
+        assert set(entry.keys()) == {"status", "reason_code", "fallback_route", "probe_execution_class"}
+        assert entry["status"] in ("ready", "degraded", "unavailable")
     assert set(result["checks"].keys()) == {"uv", "spark", "github"}
     assert set(result["checks"]["uv"].keys()) == {"status", "reason", "diagnostic"}
     assert set(result["checks"]["spark"].keys()) == {"status"}
@@ -191,6 +200,25 @@ def test_workflow_capability_degrades_preferred_spark_incompatibility(monkeypatc
     # branch is ever reached.
     monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
     monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: True)
+    # Issue #2340 AC2: `controlled_github_read` is a REQUIRED capability that
+    # fails closed with priority over the Spark route's OPTIONAL `degraded`
+    # signal (see `test_actor_scoped_capability_probe.py::
+    # test_root_read_pass_controlled_read_fail_blocks_before_downstream_actor`,
+    # which asserts `controlled_github_unavailable` blocks regardless of any
+    # other signal). Without pinning this probe to `ready`, a CI runner
+    # without a live, sanitized-env `gh api` route would report
+    # decision=blocked via `controlled_github_unavailable` before the Spark
+    # fallback_only -> degraded branch under test is ever reached.
+    monkeypatch.setattr(
+        wcp,
+        "_controlled_github_read_capability",
+        lambda repo: {
+            "status": wcp.ACTOR_CAPABILITY_READY,
+            "reason_code": None,
+            "fallback_route": None,
+            "probe_execution_class": "controlled_gh_api_repo_read",
+        },
+    )
     result = wcp.assess(
         project_root=str(_REPO_ROOT),
         profile="issue-to-impl",
