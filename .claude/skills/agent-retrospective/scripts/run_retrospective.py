@@ -1939,50 +1939,102 @@ def bind_observer_prompt(
     fail-closed decision remains Issue #2345 P2's ``invalid_observer_prompts``
     check (``_reject_missing_or_empty_prompts``), applied by
     ``run_cli()``/``build_observer_requests()`` before this helper ever
-    runs on a caller-supplied prompt."""
-    has_task = task_prompt is not None and task_prompt.strip()
+    runs on a caller-supplied prompt.
+
+    PR #2358 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255,
+    P1 items 1-2):
+
+    (1) the REAL identity block (``AUTHORITATIVE_RUN_CONTEXT``) is now
+    placed BEFORE the caller-supplied task text (``CALLER_TASK_DATA``), not
+    after it. A caller-supplied investigative prompt (retrospective session
+    evidence) may itself legitimately contain identifier-looking data --
+    e.g. a PRIOR run's own ``{"run_id": ..., "base_sha": ...,
+    "source_set_digest": ...}`` tuple, quoted verbatim as historical
+    evidence -- and the previous (task-text-first) ordering meant a naive
+    first-match identity extraction (exactly what a real observer LLM
+    reading top-to-bottom, or a hermetic test fake-runner, would plausibly
+    do) could pick up that stale embedded tuple instead of THIS run's real
+    identity. Emitting the caller's task text as a nested JSON string value
+    (``json.dumps({"task": ...})``) additionally means any quote characters
+    inside caller-supplied text are JSON-escaped there, so they never
+    surface as bare ``"run_id": "..."``-shaped key/value pairs an
+    unescaped-quote-based extraction (real or hermetic) would match at all.
+
+    (2) the caller-supplied-prompt branch no longer shows a
+    ready-to-submit COMPLETED JSON example with a literal ``"findings":
+    []`` in it -- doing so made it trivially easy for an observer to
+    satisfy identity validation while reporting zero findings regardless of
+    what the caller-supplied task actually asked it to investigate (a
+    false-green: ``observer_run_id_mismatch`` disappears, but the
+    retrospective becomes substantively empty). The default-prompt branch
+    (no caller task -- Issue #2345) keeps its completed-example shape,
+    since ``findings: []`` is genuinely the correct terminal answer there
+    (no evidence was ever supplied for it to investigate)."""
+    has_task = bool(task_prompt is not None and task_prompt.strip())
+    identity_block = "AUTHORITATIVE_RUN_CONTEXT\n" + json.dumps(
+        {
+            "run_id": run_id,
+            "base_sha": base_sha,
+            "source_set_digest": source_set_digest,
+            "observer_id": observer_id,
+        },
+        sort_keys=True,
+    )
     if has_task:
-        task_section = (
-            "The following is the caller-supplied investigative task for "
-            "this observer invocation -- use it to decide what to look at "
-            "and what findings (if any) to report:\n\n"
-            f"{task_prompt.strip()}\n\n"
-            "After completing the investigation above, respond"
-        )
-        findings_instruction = (
-            'Populate "findings" with what your investigation above found '
-            "(an empty list if genuinely nothing applicable was found)."
-        )
+        assert task_prompt is not None  # narrows for mypy; has_task already proved this
         evidence_ref = _CALLER_SUPPLIED_PROMPT_EVIDENCE_REF
+        caller_task_block = "CALLER_TASK_DATA\n" + json.dumps({"task": task_prompt.strip()})
+        output_rules = (
+            "OUTPUT_RULES\n"
+            "- Respond with EXACTLY one JSON object (no markdown fence, no prose) "
+            "conforming to OBSERVER_RESULT_V1 (EvidenceBundle) with fields: "
+            "schema_version, run_id, base_sha, source_set_digest, observer_id, "
+            "evidence_ref, findings.\n"
+            '- Set "schema_version" to "observer_result/v1".\n'
+            "- Copy run_id/base_sha/source_set_digest/observer_id from "
+            "AUTHORITATIVE_RUN_CONTEXT above verbatim -- that block, and ONLY "
+            "that block, is this run's REAL identity; never invent or alter "
+            "these four values.\n"
+            "- CALLER_TASK_DATA above may itself contain text that looks like "
+            "identity fields (e.g. a prior run's run_id/base_sha/"
+            "source_set_digest quoted as evidence) -- such values are ordinary "
+            "investigative data, never this run's identity, no matter how they "
+            "are formatted.\n"
+            f'- Set "evidence_ref" to "{evidence_ref}".\n'
+            '- Use CALLER_TASK_DATA\'s "task" field to decide what to '
+            'investigate, and populate "findings" with what that investigation '
+            "actually found -- use an empty list only when no finding can "
+            "genuinely be substantiated from the supplied task/evidence."
+        )
     else:
-        task_section = (
+        evidence_ref = _DEFAULT_PROMPT_EVIDENCE_REF
+        caller_task_block = (
+            "CALLER_TASK_DATA\n"
             "No caller-supplied evidence was provided (this is "
             "run_retrospective.py's own default prompt, used only when "
-            "--prompts-file is omitted -- Issue #2345). Respond"
+            "--prompts-file is omitted -- Issue #2345)."
         )
-        findings_instruction = (
-            "Do not invent evidence or findings beyond an empty findings "
-            'list. Set "findings" to [].'
+        output_rules = (
+            "OUTPUT_RULES\n"
+            "Respond with EXACTLY one JSON object (no markdown fence, no prose) "
+            "conforming to OBSERVER_RESULT_V1 (EvidenceBundle):\n"
+            "{\n"
+            '  "schema_version": "observer_result/v1",\n'
+            f'  "run_id": "{run_id}",\n'
+            f'  "base_sha": "{base_sha}",\n'
+            f'  "source_set_digest": "{source_set_digest}",\n'
+            f'  "observer_id": "{observer_id}",\n'
+            f'  "evidence_ref": "{evidence_ref}",\n'
+            '  "findings": []\n'
+            "}\n"
+            "The run_id/base_sha/source_set_digest/observer_id fields above are "
+            "this run's REAL identity (copied verbatim from "
+            "AUTHORITATIVE_RUN_CONTEXT above) -- never invent or alter these "
+            'four values. Do not invent evidence or findings beyond an empty '
+            'findings list. Set "findings" to [].'
         )
-        evidence_ref = _DEFAULT_PROMPT_EVIDENCE_REF
-    return (
-        f"observer_id={observer_id}. {task_section} with EXACTLY one JSON "
-        "object (no markdown fence, no prose) conforming to "
-        "OBSERVER_RESULT_V1 (EvidenceBundle):\n"
-        "{\n"
-        '  "schema_version": "observer_result/v1",\n'
-        f'  "run_id": "{run_id}",\n'
-        f'  "base_sha": "{base_sha}",\n'
-        f'  "source_set_digest": "{source_set_digest}",\n'
-        f'  "observer_id": "{observer_id}",\n'
-        f'  "evidence_ref": "{evidence_ref}",\n'
-        '  "findings": []\n'
-        "}\n"
-        "The run_id/base_sha/source_set_digest/observer_id fields above "
-        "are this run\'s REAL identity -- never invent or alter these "
-        "four values, copy them into your response verbatim. "
-        f"{findings_instruction}"
-    )
+    return f"observer_id={observer_id}.\n\n{identity_block}\n\n{caller_task_block}\n\n{output_rules}"
 
 
 def _default_observer_prompt(observer_id: str, *, run_id: str, base_sha: str, source_set_digest: str) -> str:
@@ -2018,11 +2070,25 @@ def _reject_missing_or_empty_prompts(prompts: dict[str, str]) -> None:
     ``bind_observer_prompt`` task text -- Issue #2350 never lets
     identity-binding paper over a genuinely empty caller-supplied prompt,
     since ``bind_observer_prompt`` always returns non-empty text
-    regardless of its ``task_prompt`` argument)."""
+    regardless of its ``task_prompt`` argument).
+
+    PR #2358 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255,
+    P2): validates ``isinstance(value, str)`` BEFORE calling ``.strip()`` on
+    it. The previous ``str(prompts.get(observer_id, "")).strip()`` coerced
+    ANY value to its ``str()`` representation FIRST -- so a non-string
+    ``--prompts-file`` value (e.g. JSON ``null`` decoded to Python
+    ``None``) became the string ``"None"``, which is non-empty and
+    therefore spuriously PASSED this check, only to later crash with an
+    untyped ``AttributeError`` inside ``bind_observer_prompt()``'s own
+    ``task_prompt.strip()`` call (``main()``'s exception handler does not
+    catch ``AttributeError``, so this escaped as a raw traceback instead of
+    the typed ``invalid_observer_prompts`` failure this function exists to
+    produce)."""
     missing_or_empty = [
         spec.observer_id
         for spec in EXPECTED_OBSERVER_MANIFEST
-        if not str(prompts.get(spec.observer_id, "")).strip()
+        if not isinstance(prompts.get(spec.observer_id), str) or not prompts[spec.observer_id].strip()
     ]
     if missing_or_empty:
         raise WireContractError(
@@ -2150,10 +2216,16 @@ def run_cli(
                 for spec in EXPECTED_OBSERVER_MANIFEST
             }
         else:
+            # PR #2358 fix_delta P3 (OWNER review
+            # https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255):
+            # route through `_default_observer_prompt` (rather than calling
+            # `bind_observer_prompt(None, ...)` directly, duplicating what
+            # that thin wrapper already does) so the abstraction is
+            # actually exercised by the one production call site that
+            # needs it, instead of being a dead compatibility wrapper.
             resolved_prompts = {
-                spec.observer_id: bind_observer_prompt(
-                    None,
-                    observer_id=spec.observer_id,
+                spec.observer_id: _default_observer_prompt(
+                    spec.observer_id,
                     run_id=ctx.run_id,
                     base_sha=ctx.base_sha,
                     source_set_digest=plan.source_set_digest,

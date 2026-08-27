@@ -322,20 +322,41 @@ def test_real_claude_cli_custom_prompt_identity_binding() -> None:
     `run_observer_wave()`'s identity checks would pass for this response
     (this test calls the adapter directly, one layer below
     `run_observer_wave()`, so it asserts the equivalent field-by-field
-    equality that check performs)."""
+    equality that check performs).
+
+    PR #2358 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255,
+    "merge前に一度確認" item under the P1 live-AC4-coverage finding): beyond
+    identity equality, this now also supplies a single evidence nonce (a
+    concrete, fabricated-but-verifiable fact -- `NONCE_<hex>` -- embedded
+    directly in the task text as the observer's ONLY evidence source,
+    since `retrospective-runtime-observer` runs with `tools: []` and
+    cannot independently browse this repository) and asserts a `findings`
+    entry's `claim` actually reflects that nonce verbatim. Merely checking
+    identity fields (as the pre-fix_delta version of this test did) cannot
+    distinguish a genuinely substantive response from a degenerate
+    `"findings": []` response that only happens to echo identity
+    correctly -- this nonce-backed assertion closes that gap."""
     run_id = f"live-cli-{uuid.uuid4()}"
     nonce = uuid.uuid4().hex
+    nonce_token = f"NONCE_{nonce}"
     base_sha = "e" * 40
     source_set_digest = "f" * 64
     observer_id = "retrospective-runtime-observer"
 
     task_prompt = (
         "Investigate this real engineering retrospective run (Issue #2350 "
-        f"live-CLI identity-binding regression coverage, nonce {nonce}): "
-        "review this repository's recent commit history and CI "
-        "configuration for concrete, evidence-backed process findings. "
-        "Report only claims you can substantiate; if genuinely nothing "
-        "applicable is found, an empty findings list is acceptable."
+        f"live-CLI identity-binding regression coverage, nonce {nonce}). "
+        "You have no tools available, so use ONLY the following supplied "
+        "evidence excerpt as your investigation source -- do not attempt "
+        "to browse the repository or invent additional evidence:\n\n"
+        f'Evidence excerpt: "commit note: a diagnostic log line was added '
+        f'behind a feature flag named {nonce_token}."\n\n'
+        f'Report EXACTLY one finding whose "claim" field explicitly '
+        f'includes the exact token {nonce_token} verbatim (quote it, do '
+        f'not paraphrase or alter it), with "claim_class" set to '
+        '"process". Do not report an empty findings list -- concrete '
+        "evidence was supplied above; findings must reflect it."
     )
 
     prompt = rr.bind_observer_prompt(
@@ -375,3 +396,13 @@ def test_real_claude_cli_custom_prompt_identity_binding() -> None:
     assert result.structured_output.get("base_sha") == base_sha
     assert result.structured_output.get("source_set_digest") == source_set_digest
     assert result.structured_output.get("observer_id") == observer_id
+    # THEN (fix_delta addition): identity matching alone is not proof the
+    # response is substantive -- assert `findings` is non-empty AND at
+    # least one finding's `claim` actually reflects the supplied evidence
+    # nonce, ruling out a degenerate identity-only-correct, findings-empty
+    # false-green.
+    findings = result.structured_output.get("findings")
+    assert isinstance(findings, list) and findings, f"expected non-empty findings, got {findings!r}"
+    assert any(nonce_token in str(finding.get("claim", "")) for finding in findings), (
+        f"expected a finding whose claim contains {nonce_token!r}, got {findings!r}"
+    )

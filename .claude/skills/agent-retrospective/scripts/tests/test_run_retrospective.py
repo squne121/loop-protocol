@@ -2219,3 +2219,25 @@ def test_build_observer_requests_rejects_missing_or_empty_prompt() -> None:
     with pytest.raises(rr.WireContractError) as empty_value_excinfo:
         rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=".", prompts=empty_value_prompts)
     assert empty_value_excinfo.value.reason_code == "invalid_observer_prompts"
+
+
+def test_build_observer_requests_rejects_non_string_prompt_value() -> None:
+    """PR #2358 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255,
+    P2) regression test: a non-string `--prompts-file` value for a
+    manifest `observer_id` (e.g. JSON `null` decoded to Python `None`) must
+    be rejected the SAME typed, fail-closed way as a missing/empty prompt
+    -- a `WireContractError` with `reason_code="invalid_observer_prompts"`
+    -- never an untyped `AttributeError` from `bind_observer_prompt()`'s
+    `task_prompt.strip()` (the previous `str(value).strip()`-based check
+    coerced `None` to the non-empty string `"None"` FIRST, so it spuriously
+    passed validation)."""
+    non_string_prompts: dict[str, Any] = {
+        spec.observer_id: "real prompt text" for spec in rr.EXPECTED_OBSERVER_MANIFEST
+    }
+    target_id = rr.EXPECTED_OBSERVER_MANIFEST[0].observer_id
+    non_string_prompts[target_id] = None  # e.g. `{"observer_id": null}` in --prompts-file JSON
+
+    with pytest.raises(rr.WireContractError) as excinfo:
+        rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=".", prompts=non_string_prompts)
+    assert excinfo.value.reason_code == "invalid_observer_prompts"

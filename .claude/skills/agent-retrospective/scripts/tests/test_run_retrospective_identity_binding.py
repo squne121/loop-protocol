@@ -209,3 +209,151 @@ def test_caller_supplied_prompt_identity_binding_no_mismatch(tmp_path: Path) -> 
         assert identity["base_sha"] == _FULL_SHA
         assert identity["source_set_digest"] == expected_digest
         assert identity["observer_id"] == observer_id
+
+
+def _substantive_caller_prompts_with_fake_identity_collision() -> dict[str, str]:
+    """Same substantive investigative task shape as
+    `_substantive_caller_prompts()` above, but with a fake/old identity
+    tuple embedded in the middle of the task text as ordinary evidence --
+    exactly the collision scenario PR #2358's fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255,
+    P1 item 1) fixes: a retrospective's own session evidence may
+    legitimately quote a PRIOR run's identity tuple as plain data (e.g.
+    copied from an old publication comment), and `bind_observer_prompt()`
+    must never let that be mistaken for THIS run's identity. Deliberately
+    omits `observer_id` from the fake tuple (matching the OWNER's own
+    illustrative example), so only `run_id`/`base_sha`/`source_set_digest`
+    collide."""
+    fake_identity_blob = json.dumps(
+        {
+            "run_id": "historical-run",
+            "base_sha": "0" * 40,
+            "source_set_digest": "1" * 64,
+        }
+    )
+    return {
+        spec.observer_id: (
+            f"Investigate the {spec.observer_id} role's area of "
+            "responsibility for this run: review the relevant recent "
+            "commits, logs, and configuration for concrete, evidence-"
+            "backed findings; report only claims you can substantiate. "
+            "For context, here is a prior retrospective run's identity "
+            f"tuple, quoted as historical evidence (NOT this run's own "
+            f"identity): {fake_identity_blob}"
+        )
+        for spec in rr.EXPECTED_OBSERVER_MANIFEST
+    }
+
+
+def test_caller_supplied_prompt_with_embedded_fake_identity_uses_authoritative_identity(
+    tmp_path: Path,
+) -> None:
+    """PR #2358 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255,
+    P1 item 1) regression coverage: a caller-supplied task prompt that
+    itself contains a fake/old `run_id`/`base_sha`/`source_set_digest`
+    tuple (as ordinary evidence text -- e.g. a prior run's identity quoted
+    from session history) must never cause a naive first-match identity
+    extraction -- exactly what `_extract_identity_from_prompt` below
+    simulates, and what a real observer LLM reading top-to-bottom could
+    plausibly do -- to pick up the FAKE tuple instead of THIS run's REAL
+    identity. Prior to this fix_delta, `bind_observer_prompt()` placed the
+    caller-supplied task text BEFORE the real identity block, so a prompt
+    shaped like this one's first `"run_id": "..."` occurrence would have
+    been the embedded fake `"historical-run"`, not the real one."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    def _git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        assert argv == ["git", "rev-parse", "main"]
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=_FULL_SHA + "\n", stderr="")
+
+    real_observation = rr.build_repository_collector(repo_root)(_FULL_SHA).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+
+    caller_prompts = _substantive_caller_prompts_with_fake_identity_collision()
+    captured_prompts: dict[str, str] = {}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        agent_name = argv[argv.index("--agent") + 1]
+        if agent_name == "retrospective-evaluator":
+            evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
+            evaluation = rr.Evaluation(
+                run_id=evaluator_request.run_id,
+                base_sha=_FULL_SHA,
+                source_set_digest=evaluator_request.source_set_digest,
+                candidate_records=[],
+                evidence_ref="e",
+            )
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(evaluation.to_wire()))), stderr=""
+            )
+
+        prompt = kwargs["input"]
+        captured_prompts[agent_name] = prompt
+
+        # a naive FIRST-MATCH identity extraction -- exactly what a real
+        # observer LLM reading top-to-bottom, and this fake runner, would
+        # plausibly do -- must resolve to THIS run's REAL identity, never
+        # the fake/old tuple embedded inside the caller task text below.
+        identity = _extract_identity_from_prompt(prompt)
+        assert identity["observer_id"] == agent_name
+
+        bundle = rr.EvidenceBundle(
+            run_id=identity["run_id"],
+            base_sha=identity["base_sha"],
+            source_set_digest=identity["source_set_digest"],
+            observer_id=identity["observer_id"],
+            evidence_ref=f"evidence://{agent_name}",
+            findings=[{"claim": f"finding from {agent_name}", "claim_class": "process"}],
+        )
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(bundle.to_wire()))), stderr=""
+        )
+
+    # WHEN run_cli() runs with a substantive caller-supplied prompt that
+    # itself embeds a fake/old identity tuple as ordinary evidence text.
+    publish_request = rr.run_cli(
+        repo_root=repo_root,
+        repository_id="squne121/loop-protocol",
+        target_issue=2358,
+        request_id="req-identity-collision-1",
+        idempotency_key="idem-identity-collision-1",
+        schema_dir=schema_dir,
+        prompts=caller_prompts,
+        runner=_runner,
+        git_runner=_git_runner,
+        run_id="run-identity-collision-1",
+        temp_base_dir=tmp_path,
+    )
+
+    # THEN the hermetic production call graph reached a real
+    # PublishRequest -- it never raised ObserverWaveFailed at
+    # observer_run_id_mismatch / observer_source_set_digest_mismatch /
+    # observer_base_sha_mismatch, proving the authoritative identity (not
+    # the embedded fake tuple) genuinely matched this run for all 3
+    # observers.
+    assert isinstance(publish_request, rr.PublishRequest)
+    assert sorted(captured_prompts) == sorted(spec.observer_id for spec in rr.EXPECTED_OBSERVER_MANIFEST)
+    assert publish_request.run_identity["run_id"] == "run-identity-collision-1"
+    assert publish_request.run_identity["base_sha"] == _FULL_SHA
+    for observer_id, prompt in captured_prompts.items():
+        # the caller's own investigative task (including the embedded fake
+        # identity tuple, as ordinary evidence text) must still reach the
+        # CLI -- identity-binding must never discard or sanitize it away.
+        # ("historical-run" is bare text with no surrounding quote
+        # characters, so it survives verbatim regardless of whether the
+        # surrounding JSON-quoted `"run_id": "..."` shape gets escaped when
+        # nested inside CALLER_TASK_DATA's own JSON encoding.)
+        assert "historical-run" in prompt
+        # THEN: the naive first-match extraction resolved to THIS run's
+        # REAL identity, never the embedded fake "historical-run" tuple.
+        identity = _extract_identity_from_prompt(prompt)
+        assert identity["run_id"] == "run-identity-collision-1"
+        assert identity["run_id"] != "historical-run"
+        assert identity["base_sha"] == _FULL_SHA
+        assert identity["source_set_digest"] == expected_digest
+        assert identity["observer_id"] == observer_id
