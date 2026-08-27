@@ -123,6 +123,10 @@
                   "type": "array",
                   "items": { "type": "string" }
                 },
+                "issue_time_enforcement": {
+                  "type": "string",
+                  "enum": ["hard", "advisory"]
+                },
                 "runtime_resolved_only": { "type": "boolean" },
                 "evidence_source": { "type": "string" },
                 "notes": { "type": "string" }
