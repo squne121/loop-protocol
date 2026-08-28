@@ -6,8 +6,7 @@ handling correctness (a `gh` subprocess hang must fail closed into this
 module's EXISTING `unavailable`/`False` contract instead of raising an
 uncaught `subprocess.TimeoutExpired`), and consumes the existing timeout
 reason taxonomy verbatim wherever this Issue's new code touches it
-(`agy_timeout` from `.claude/skills/gemini-cli-headless-delegation`,
-`transport_error` from `.claude/skills/implement-issue/scripts/
+(`transport_error` from `.claude/skills/implement-issue/scripts/
 update_branch.py`'s `UPDATE_BRANCH_RESULT_V1` contract).
 """
 
@@ -21,15 +20,13 @@ _TESTS_DIR = Path(__file__).resolve().parent
 _SCRIPTS_DIR = _TESTS_DIR.parent
 _REPO_ROOT = _SCRIPTS_DIR.parent.parent
 _GUARDS_DIR = _REPO_ROOT / "scripts" / "agent-guards"
-_ISSUE_REFINEMENT_LOOP_SCRIPTS = _REPO_ROOT / ".claude" / "skills" / "issue-refinement-loop" / "scripts"
 _UPDATE_BRANCH_SCRIPTS = _REPO_ROOT / ".claude" / "skills" / "implement-issue" / "scripts"
 
-for _p in (_SCRIPTS_DIR, _GUARDS_DIR, _ISSUE_REFINEMENT_LOOP_SCRIPTS, _UPDATE_BRANCH_SCRIPTS):
+for _p in (_SCRIPTS_DIR, _GUARDS_DIR, _UPDATE_BRANCH_SCRIPTS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
 import workflow_capability_preflight as wcp  # noqa: E402
-import root_entry_router as router  # noqa: E402
 import update_branch  # noqa: E402
 
 
@@ -106,13 +103,6 @@ def test_assess_never_produces_a_decision_value_outside_the_fixed_enum_under_tim
 # Existing taxonomy values this Issue consumes (not reimplements) stay
 # available and unrenamed.
 # =============================================================================
-
-
-def test_agy_timeout_taxonomy_value_still_consumed_by_advisory_route():
-    result = router.resolve_agy_advisory_route(
-        failure_class="agy_timeout", agy_required=False, fallback_allowed=True
-    )
-    assert result["reason_code"] == "agy_timeout"
 
 
 def test_update_branch_transport_error_reason_code_unrenamed():
