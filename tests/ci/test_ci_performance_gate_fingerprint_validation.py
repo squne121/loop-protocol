@@ -29,10 +29,18 @@ gate = _load_gate_module()
 
 
 def _good_baseline(job: str, workflow_run_id: int) -> dict:
+    # #2187: `run_attempt: 1` set explicitly -- this fixture feeds
+    # `_comparable_cohort` -> `_dedupe_by_workflow_run_id` ->
+    # `_select_initial_attempt_baselines`, and the gate-side missing-
+    # run_attempt trust rejection unified with the collector in #2187 would
+    # otherwise silently exclude every record here (this file's own scope
+    # is comparability-fingerprint placeholder rejection, not run_attempt
+    # trust semantics).
     baseline = {
         "schema": "ci_runtime_baseline_v1",
         "job": job,
         "workflow_run_id": workflow_run_id,
+        "run_attempt": 1,
         "measurements": [{"phase_id": "test_e2e_ci", "elapsed_ms": 100_000, "status": 0}],
     }
     for field in gate.WITHIN_COHORT_REQUIRED_EQUAL:

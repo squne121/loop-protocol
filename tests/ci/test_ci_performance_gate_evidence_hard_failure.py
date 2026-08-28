@@ -118,6 +118,12 @@ mod._evidence_readiness_hard_check(cohort, ("e2e-core",))
 # sufficient-evidence (future, once #2155-era real data accumulates) cases.
 # --------------------------------------------------------------------------- #
 def _paired_baselines(count: int, job: str, start_id: int = 1, base_ms: int = 60_000) -> list[dict]:
+    # #2187: `run_attempt: 1` set explicitly -- this file's fixtures feed
+    # `run_evidence_gate` -> `_pair_by_workflow_run_id` ->
+    # `_select_initial_attempt_baselines`, and the gate-side missing-
+    # run_attempt trust rejection unified with the collector in #2187 would
+    # otherwise silently exclude every record here (this file's own scope
+    # is the AC11 hard-failure gate, not run_attempt trust semantics).
     baselines = []
     for i in range(count):
         run_id = start_id + i
@@ -125,6 +131,7 @@ def _paired_baselines(count: int, job: str, start_id: int = 1, base_ms: int = 60
             {
                 "workflow_run_id": run_id,
                 "job": job,
+                "run_attempt": 1,
                 "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": base_ms + i}],
             }
         )
@@ -132,11 +139,15 @@ def _paired_baselines(count: int, job: str, start_id: int = 1, base_ms: int = 60
 
 
 def _gate_ready_baselines(count: int, start_id: int = 1) -> list[dict]:
+    # #2187: `run_attempt: 1` set explicitly -- see `_paired_baselines`
+    # comment above; `_gate_ready_post_filter_sample_count` now also
+    # applies `_select_initial_attempt_baselines` dedupe/trust filtering.
     baselines = []
     for i in range(count):
         baselines.append(
             {
                 "workflow_run_id": start_id + i,
+                "run_attempt": 1,
                 "run_started_at": "2026-08-15T00:00:00Z",
                 "check_completed_at": "2026-08-15T00:05:00Z",
             }
