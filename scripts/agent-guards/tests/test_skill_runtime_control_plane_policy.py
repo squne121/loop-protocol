@@ -208,7 +208,10 @@ def test_reject_option_like_positional_allows_ordinary_value():
 # Issue #2378: remote protocol structural policy
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("value", ["-c", "origin", "git@host:repo", "https://host/repo?redirect=evil", "https://user@host/repo"])
+
+@pytest.mark.parametrize(
+    "value", ["-c", "origin", "git@host:repo", "https://host/repo?redirect=evil", "https://user@host/repo"]
+)
 def test_validate_literal_remote_url_rejects_nonliteral_or_indirect_values(value):
     with pytest.raises(ValueError):
         policy.validate_literal_remote_url(value)

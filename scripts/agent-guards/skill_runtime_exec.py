@@ -20,7 +20,6 @@ import time
 import tomllib
 from pathlib import Path
 from dataclasses import dataclass
-from dataclasses import dataclass
 from typing import Iterable, NamedTuple
 
 sys.dont_write_bytecode = True
@@ -48,9 +47,7 @@ from skill_runtime_command_policy import (
     is_exact_skill_runtime_repair_action_apply_executor_command,
     load_registry_entry,
     parse_config_get_regexp_name_only_nul,
-    reject_git_global_options,
     reject_insteadof_rewrite,
-    reject_option_like_positional,
     resolve_active_issue,
     resolve_default_branch,
     resolve_project_root,
@@ -148,6 +145,8 @@ def _is_pytest_cache_cold_start_temp_path(rel_path: str) -> bool:
     normalized = rel_path.replace(os.sep, "/")
     first_segment = normalized.split("/", 1)[0]
     return first_segment.startswith(_PYTEST_CACHE_COLD_START_TEMP_DIR_PREFIX)
+
+
 # Issue #1563: `.guard_shadow_log.jsonl` (repo-root peer-append log written by
 # `.claude/hooks/shadow_log.py`, `.claude/hooks/guard-japanese-prose.sh`,
 # `.claude/hooks/rtk_boundary_shadow_guard.sh`, and `scripts/check-codex-agents.mjs`)
@@ -289,9 +288,7 @@ def _is_allowed_ancestor_transition(before_kind: str, after_kind: str) -> bool:
     return (before_kind, after_kind) in {("absent", "dir"), ("dir", "dir")}
 
 
-def _safe_ledger_ancestor_dir_rels(
-    project_root: str, ancestor_before_kinds: dict[str, str] | None = None
-) -> set[str]:
+def _safe_ledger_ancestor_dir_rels(project_root: str, ancestor_before_kinds: dict[str, str] | None = None) -> set[str]:
     """Return the subset of `_LEDGER_STABLE_ANCESTOR_DIR_RELS` whose
     before -> after kind transition is one of the two authorized ancestor
     transitions (Issue #1502 REQUEST_CHANGES Blocker 5). Postcondition-only
@@ -331,6 +328,7 @@ def _safe_ledger_ancestor_dir_rels(
         else:
             chain_safe = False
     return safe
+
 
 # Bounded quiescence window: how long the executor waits, after the child
 # process exits, for the writer's own `.lock` / `.tmp` protocol entries to be
@@ -454,11 +452,7 @@ def _wait_for_ledger_transient_quiescence(project_root: str) -> list[str]:
     deadline = time.monotonic() + _LEDGER_TRANSIENT_QUIESCENCE_TIMEOUT_SECONDS
 
     def _poll() -> list[str]:
-        return [
-            rel
-            for rel in _LEDGER_TRANSIENT_EXACT_RELS
-            if _path_kind_or_ancestor_absent(root / rel) != "absent"
-        ]
+        return [rel for rel in _LEDGER_TRANSIENT_EXACT_RELS if _path_kind_or_ancestor_absent(root / rel) != "absent"]
 
     last = _poll()
     while True:
@@ -508,9 +502,7 @@ def _allowed_artifact_root(project_root: str, issue_number: str) -> Path:
     return _allowed_artifact_roots(project_root, issue_number)[0]
 
 
-def _is_under_allowed_artifact_root(
-    project_root: str, issue_number: str, rel_path: str, command_id: str = ""
-) -> bool:
+def _is_under_allowed_artifact_root(project_root: str, issue_number: str, rel_path: str, command_id: str = "") -> bool:
     root = Path(project_root)
     target = (root / rel_path).resolve()
     return any(
@@ -665,9 +657,7 @@ def _expand_new_status_paths(
     return expanded
 
 
-def _snapshot_repo_paths(
-    project_root: str, issue_number: str, command_id: str = ""
-) -> dict[str, tuple[str, int, int]]:
+def _snapshot_repo_paths(project_root: str, issue_number: str, command_id: str = "") -> dict[str, tuple[str, int, int]]:
     root = Path(project_root)
     allowed_roots = _allowed_artifact_roots(project_root, issue_number, command_id)
     peer_roots = _race_tolerant_unattributable_roots(project_root)
@@ -710,19 +700,11 @@ def _snapshot_repo_paths(
         if current_path == root / ".git":
             dirnames[:] = []
             continue
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if (current_path / name) != root / ".git"
-        ]
+        dirnames[:] = [name for name in dirnames if (current_path / name) != root / ".git"]
         # Prune volatile peer-session roots entirely so that concurrent
         # local sessions/agents writing under them are never walked into
         # (and therefore never contribute snapshot drift for this command).
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if (current_path / name) not in peer_roots
-        ]
+        dirnames[:] = [name for name in dirnames if (current_path / name) not in peer_roots]
         # PR #2364 review P1-1: also prune a genuine repo-root-only pytest
         # cold-start temp dir (`pytest-cache-files-<random>`, see
         # `_is_pytest_cache_cold_start_temp_path` above) from this full
@@ -731,11 +713,7 @@ def _snapshot_repo_paths(
         # sibling needs its own prefix check, scoped to `current_path ==
         # root` so a nested lookalike is never pruned.
         if current_path == root:
-            dirnames[:] = [
-                name
-                for name in dirnames
-                if not _is_pytest_cache_cold_start_temp_path(name)
-            ]
+            dirnames[:] = [name for name in dirnames if not _is_pytest_cache_cold_start_temp_path(name)]
         for name in ["."] + dirnames + filenames:
             path = current_path if name == "." else current_path / name
             if path == root / ".git":
@@ -1076,11 +1054,13 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     # correctly pinned hostedtoolcache `uv` is preferred over the
     # local-dev convenience lane whenever both are present.
     if name == "uv":
-        safe_entries = _dedupe_path_entries([
-            *_trusted_toolchain_dirs("uv"),
-            *_trusted_account_home_uv_dir(),
-            *_SYSTEM_STANDARD_PATH_DIRS,
-        ])
+        safe_entries = _dedupe_path_entries(
+            [
+                *_trusted_toolchain_dirs("uv"),
+                *_trusted_account_home_uv_dir(),
+                *_SYSTEM_STANDARD_PATH_DIRS,
+            ]
+        )
     else:
         safe_entries = _safe_path_entries()
     safe_path = os.pathsep.join(safe_entries)
@@ -1105,9 +1085,7 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
             # exist -- unlike `candidates_searched`, which only ever
             # contains directories this process actually searched.
             account_home = _os_account_home()
-            recommended_install_dir = (
-                os.path.join(account_home, ".local", "bin") if account_home else None
-            )
+            recommended_install_dir = os.path.join(account_home, ".local", "bin") if account_home else None
             diagnostic_payload = {
                 "error": "uv_not_found",
                 "candidates_searched": list(safe_entries),
@@ -2017,9 +1995,7 @@ def _find_unauthorized_repo_changes(
     # before applying race-tolerant-root exclusion, so cold-start creation of
     # a race-tolerant subtree under an ignored parent is not misreported as
     # an unauthorized write to the collapsed parent itself.
-    expanded_new_status_paths = _expand_new_status_paths(
-        project_root, new_raw_status_paths, issue_number, command_id
-    )
+    expanded_new_status_paths = _expand_new_status_paths(project_root, new_raw_status_paths, issue_number, command_id)
     safe_ledger_ancestor_dir_rels = _safe_ledger_ancestor_dir_rels(project_root, ledger_ancestor_before_kinds)
     new_status_paths = {
         path
@@ -2051,11 +2027,7 @@ def _find_unauthorized_repo_changes(
         after_paths = set(after_snapshot)
         changed = sorted(
             (before_paths ^ after_paths)
-            | {
-                path
-                for path in before_paths & after_paths
-                if before_snapshot[path] != after_snapshot[path]
-            }
+            | {path for path in before_paths & after_paths if before_snapshot[path] != after_snapshot[path]}
         )
         # Issue #1502: the stable-exact ledger path is already authorized
         # above (regular -> regular content changes are expected peer
@@ -2147,14 +2119,10 @@ def _validate_stdout_artifact_projection(
     root_real = os.path.realpath(project_root)
     for raw_path in _parse_artifact_projection(stdout):
         resolved = (
-            os.path.realpath(raw_path)
-            if os.path.isabs(raw_path)
-            else os.path.realpath(Path(project_root) / raw_path)
+            os.path.realpath(raw_path) if os.path.isabs(raw_path) else os.path.realpath(Path(project_root) / raw_path)
         )
         rel_path = (
-            os.path.relpath(resolved, root_real)
-            if os.path.commonpath([root_real, resolved]) == root_real
-            else resolved
+            os.path.relpath(resolved, root_real) if os.path.commonpath([root_real, resolved]) == root_real else resolved
         )
         if not _is_under_allowed_artifact_root(project_root, issue_number, rel_path, command_id):
             failures.append(_repo_relative_path(project_root, resolved))
@@ -2241,10 +2209,7 @@ def _emit_ledger_transient_residue_failure(issue_number: int, stale_paths: list[
 # ---------------------------------------------------------------------------
 
 _POSIX_PROCESS_GROUP_SUPPORTED = (
-    os.name == "posix"
-    and hasattr(os, "killpg")
-    and hasattr(os, "setsid")
-    and hasattr(os, "getpgid")
+    os.name == "posix" and hasattr(os, "killpg") and hasattr(os, "setsid") and hasattr(os, "getpgid")
 )
 
 # Two independently bounded budgets govern outer-child supervision (Issue
@@ -2450,9 +2415,7 @@ def _stage_cleanup(
         if time.monotonic() >= cleanup_deadline:
             cleanup_status = CLEANUP_STATUS_UNCONFIRMED
         else:
-            cleanup_status = (
-                CLEANUP_STATUS_CONFIRMED_ABSENT if group_absent else CLEANUP_STATUS_UNCONFIRMED
-            )
+            cleanup_status = CLEANUP_STATUS_CONFIRMED_ABSENT if group_absent else CLEANUP_STATUS_UNCONFIRMED
     else:
         # AC8: no `killpg`/`setsid` on this platform (or no pgid to
         # supervise) -- best-effort terminate the direct child only, and
@@ -2566,7 +2529,6 @@ def _run_child_with_supervision(
         )
 
 
-
 def _emit_timeout_failure(
     issue_number: int,
     timeout_seconds: object,
@@ -2592,9 +2554,7 @@ def _emit_timeout_failure(
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    parser = argparse.ArgumentParser(
-        description="Privileged exact skill runtime executor", allow_abbrev=False
-    )
+    parser = argparse.ArgumentParser(description="Privileged exact skill runtime executor", allow_abbrev=False)
     parser.add_argument("--command-id", required=True)
     parser.add_argument("--issue-number", required=True, type=int)
     parser.add_argument("--repo", required=True)
@@ -2630,9 +2590,7 @@ def main(argv: list[str] | None = None) -> int:
     # normalized into a valid child command.
     sibling_id = "preflight.run.fixture.with_human_context"
     if sibling_id in raw_argv or f"--command-id={sibling_id}" in raw_argv:
-        raw_command = " ".join(
-            ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL, *raw_argv]
-        )
+        raw_command = " ".join(["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL, *raw_argv])
         if not is_exact_skill_runtime_anchor_fixture_executor_command(
             raw_command, resolve_project_root(), resolve_project_root()
         ):
@@ -2647,9 +2605,7 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_stale_runtime_failure(args.issue_number, stale_entries)
 
     is_fixture_command = args.command_id == "preflight.run.fixture"
-    is_fixture_human_context_command = (
-        args.command_id == "preflight.run.fixture.with_human_context"
-    )
+    is_fixture_human_context_command = args.command_id == "preflight.run.fixture.with_human_context"
     is_anchor_command = args.command_id in {
         "preflight.run.with_anchor",
         "preflight.run.with_human_context",
@@ -2695,8 +2651,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not is_decide_command and (args.authority_transport_path or args.authority_expected):
         print(
-            "skill_runtime_exec: --authority-transport-path/--authority-expected are "
-            "only allowed for decide.run",
+            "skill_runtime_exec: --authority-transport-path/--authority-expected are only allowed for decide.run",
             file=sys.stderr,
         )
         return 2
@@ -2732,22 +2687,30 @@ def main(argv: list[str] | None = None) -> int:
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
         command_tokens = [
-            "uv", "run", "python3", SKILL_RUNTIME_EXEC_REL,
-            "--command-id", args.command_id,
-            "--issue-number", str(args.issue_number),
-            "--repo", args.repo,
-            "--fixture", args.fixture,
-            "--anchor-comment-url", args.anchor_comment_url,
+            "uv",
+            "run",
+            "python3",
+            SKILL_RUNTIME_EXEC_REL,
+            "--command-id",
+            args.command_id,
+            "--issue-number",
+            str(args.issue_number),
+            "--repo",
+            args.repo,
+            "--fixture",
+            args.fixture,
+            "--anchor-comment-url",
+            args.anchor_comment_url,
         ]
         if args.investigation_evidence_transport_path:
-            command_tokens.extend([
-                "--investigation-evidence-transport-path",
-                args.investigation_evidence_transport_path,
-            ])
+            command_tokens.extend(
+                [
+                    "--investigation-evidence-transport-path",
+                    args.investigation_evidence_transport_path,
+                ]
+            )
         command_text = " ".join(command_tokens)
-        if not is_exact_skill_runtime_anchor_fixture_executor_command(
-            command_text, project_root, project_root
-        ):
+        if not is_exact_skill_runtime_anchor_fixture_executor_command(command_text, project_root, project_root):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
     elif is_fixture_command:
@@ -2860,8 +2823,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.loop_state_file or not args.review_result_verdict:
             print(
-                "skill_runtime_exec: --loop-state-file and --review-result-verdict "
-                "are required for decide.run",
+                "skill_runtime_exec: --loop-state-file and --review-result-verdict are required for decide.run",
                 file=sys.stderr,
             )
             return 2
@@ -3053,8 +3015,7 @@ def main(argv: list[str] | None = None) -> int:
             or args.max_iterations
         ):
             print(
-                "skill_runtime_exec: only --apply-repair-action is allowed for "
-                "repair_action.apply",
+                "skill_runtime_exec: only --apply-repair-action is allowed for repair_action.apply",
                 file=sys.stderr,
             )
             return 2
@@ -3074,9 +3035,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.apply_repair_action,
             ]
         )
-        if not is_exact_skill_runtime_repair_action_apply_executor_command(
-            command_text, project_root, project_root
-        ):
+        if not is_exact_skill_runtime_repair_action_apply_executor_command(command_text, project_root, project_root):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
     else:
@@ -3085,8 +3044,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.anchor_comment_url:
             print(
-                "skill_runtime_exec: --anchor-comment-url is only allowed for "
-                "an anchor-bound preflight profile",
+                "skill_runtime_exec: --anchor-comment-url is only allowed for an anchor-bound preflight profile",
                 file=sys.stderr,
             )
             return 2
@@ -3160,11 +3118,7 @@ def main(argv: list[str] | None = None) -> int:
         script_name = "workflow_start_entry.py"
     else:
         script_name = "run_refinement_preflight.py"
-    script_path = (
-        Path(project_root) / ".claude" / "skills" / "issue-refinement-loop"
-        / "scripts"
-        / script_name
-    )
+    script_path = Path(project_root) / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / script_name
     if script_path.is_symlink() or not script_path.is_file():
         raise RuntimeError("preflight_script_invalid")
 
@@ -3244,9 +3198,7 @@ def main(argv: list[str] | None = None) -> int:
         if is_anchor_command or is_contract_update_command or is_fixture_human_context_command:
             render_params["anchor_comment_url"] = args.anchor_comment_url
             if args.investigation_evidence_transport_path:
-                render_params["investigation_evidence_transport_path"] = (
-                    args.investigation_evidence_transport_path
-                )
+                render_params["investigation_evidence_transport_path"] = args.investigation_evidence_transport_path
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
 
@@ -3306,6 +3258,7 @@ def main(argv: list[str] | None = None) -> int:
     if result.stderr:
         sys.stderr.write(result.stderr)
     return result.returncode
+
 
 # ---------------------------------------------------------------------------
 # Issue #2378: closed remote-default-ref Git protocol builders. A consumer can
@@ -3392,6 +3345,7 @@ def git_subprocess_trusted_hooks_dir(scratch_root: str) -> str:
 @dataclass(frozen=True)
 class _ClosedGitInvocation:
     """Private immutable command assembled only by semantic builders."""
+
     arguments: tuple[str, ...]
 
 
@@ -3445,9 +3399,19 @@ def _terminate_git_process_group(proc: subprocess.Popen, pgid: int | None, deadl
     return _verify_process_group_absent(pgid)
 
 
-def _run_closed_git_process(invocation: _ClosedGitInvocation, *, cwd: str, env: dict[str, str], deadline: GitProtocolDeadline, text: bool) -> subprocess.CompletedProcess:
+def _run_closed_git_process(
+    invocation: _ClosedGitInvocation, *, cwd: str, env: dict[str, str], deadline: GitProtocolDeadline, text: bool
+) -> subprocess.CompletedProcess:
     timeout = deadline.execution_seconds()
-    kwargs: dict[str, object] = {"cwd": cwd, "env": env, "shell": False, "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": text}
+    kwargs: dict[str, object] = {
+        "cwd": cwd,
+        "env": env,
+        "shell": False,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": text,
+    }
     posix_supervised = _POSIX_PROCESS_GROUP_SUPPORTED
     if posix_supervised:
         kwargs["start_new_session"] = True
@@ -3468,8 +3432,32 @@ def _run_closed_git_process(invocation: _ClosedGitInvocation, *, cwd: str, env: 
     return subprocess.CompletedProcess(list(invocation.arguments), proc.returncode, stdout, stderr)
 
 
-def _probe_insteadof_rewrite_keys(git_executable: str, *, cwd: str, env: dict[str, str], hooks_dir: str, deadline: GitProtocolDeadline) -> list[str]:
-    probe = _run_closed_git_process(_closed_git_invocation((git_executable, "--no-replace-objects", "-c", "core.hooksPath=" + hooks_dir, "-c", "credential.helper=", "-C", cwd, "config", "--get-regexp", "--name-only", "-z", INSTEADOF_CONFIG_NAME_REGEXP)), cwd=cwd, env=env, deadline=deadline, text=False)
+def _probe_insteadof_rewrite_keys(
+    git_executable: str, *, cwd: str, env: dict[str, str], hooks_dir: str, deadline: GitProtocolDeadline
+) -> list[str]:
+    probe = _run_closed_git_process(
+        _closed_git_invocation(
+            (
+                git_executable,
+                "--no-replace-objects",
+                "-c",
+                "core.hooksPath=" + hooks_dir,
+                "-c",
+                "credential.helper=",
+                "-C",
+                cwd,
+                "config",
+                "--get-regexp",
+                "--name-only",
+                "-z",
+                INSTEADOF_CONFIG_NAME_REGEXP,
+            )
+        ),
+        cwd=cwd,
+        env=env,
+        deadline=deadline,
+        text=False,
+    )
     if probe.returncode == 0:
         return parse_config_get_regexp_name_only_nul(probe.stdout)
     if probe.returncode == 1 and not probe.stderr:
@@ -3478,7 +3466,14 @@ def _probe_insteadof_rewrite_keys(git_executable: str, *, cwd: str, env: dict[st
     raise GitSubprocessConfigProbeFailed(f"probe_nonzero_exit:{probe.returncode}:{stderr.strip()!r}")
 
 
-def _execute_semantic_git(invocation: _ClosedGitInvocation, *, cwd: str, project_root: str, scratch_root: str | None, deadline: GitProtocolDeadline) -> subprocess.CompletedProcess:
+def _execute_semantic_git(
+    invocation: _ClosedGitInvocation,
+    *,
+    cwd: str,
+    project_root: str,
+    scratch_root: str | None,
+    deadline: GitProtocolDeadline,
+) -> subprocess.CompletedProcess:
     if not isinstance(invocation, _ClosedGitInvocation):
         raise TypeError("closed_git_invocation_required")
     if not isinstance(deadline, GitProtocolDeadline):
@@ -3486,8 +3481,26 @@ def _execute_semantic_git(invocation: _ClosedGitInvocation, *, cwd: str, project
     git = resolve_git_subprocess_executable(project_root)
     env = sanitized_git_subprocess_env(project_root)
     hooks_dir = git_subprocess_trusted_hooks_dir(scratch_root or project_root)
-    reject_insteadof_rewrite(_probe_insteadof_rewrite_keys(git, cwd=cwd, env=env, hooks_dir=hooks_dir, deadline=deadline))
-    return _run_closed_git_process(_closed_git_invocation((git, "--no-replace-objects", "-c", "core.hooksPath=" + hooks_dir, "-c", "credential.helper=", *invocation.arguments)), cwd=cwd, env=env, deadline=deadline, text=True)
+    reject_insteadof_rewrite(
+        _probe_insteadof_rewrite_keys(git, cwd=cwd, env=env, hooks_dir=hooks_dir, deadline=deadline)
+    )
+    return _run_closed_git_process(
+        _closed_git_invocation(
+            (
+                git,
+                "--no-replace-objects",
+                "-c",
+                "core.hooksPath=" + hooks_dir,
+                "-c",
+                "credential.helper=",
+                *invocation.arguments,
+            )
+        ),
+        cwd=cwd,
+        env=env,
+        deadline=deadline,
+        text=True,
+    )
 
 
 def _require_success(result: subprocess.CompletedProcess, operation: str) -> subprocess.CompletedProcess:
@@ -3496,67 +3509,238 @@ def _require_success(result: subprocess.CompletedProcess, operation: str) -> sub
     return result
 
 
-def run_control_plane_git_effective_remote_url(expected_remote_url: str, *, cwd: str, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None) -> LiteralRemoteUrl:
+def run_control_plane_git_effective_remote_url(
+    expected_remote_url: str,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> LiteralRemoteUrl:
     literal = validate_literal_remote_url(expected_remote_url)
-    result = _require_success(_execute_semantic_git(_closed_git_invocation(("ls-remote", "--get-url", literal.value)), cwd=cwd, project_root=project_root, scratch_root=scratch_root, deadline=deadline), "effective_remote_url")
+    result = _require_success(
+        _execute_semantic_git(
+            _closed_git_invocation(("ls-remote", "--get-url", literal.value)),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "effective_remote_url",
+    )
     if (result.stdout or "").rstrip("\n") != literal.value:
         raise RuntimeError("effective_remote_url_mismatch")
     return literal
 
 
-def run_control_plane_git_observe_default_ref(remote_url: LiteralRemoteUrl, *, cwd: str, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None) -> subprocess.CompletedProcess:
+def run_control_plane_git_observe_default_ref(
+    remote_url: LiteralRemoteUrl,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> subprocess.CompletedProcess:
     if not isinstance(remote_url, LiteralRemoteUrl):
         raise TypeError("literal_remote_url_required")
-    return _require_success(_execute_semantic_git(_closed_git_invocation(("ls-remote", "--exit-code", "--symref", remote_url.value, "HEAD")), cwd=cwd, project_root=project_root, scratch_root=scratch_root, deadline=deadline), "observe_default_ref")
+    return _require_success(
+        _execute_semantic_git(
+            _closed_git_invocation(("ls-remote", "--exit-code", "--symref", remote_url.value, "HEAD")),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "observe_default_ref",
+    )
 
 
-def run_control_plane_git_repository_object_format(*, cwd: str, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None) -> RepositoryObjectFormat:
-    result = _require_success(_execute_semantic_git(_closed_git_invocation(("rev-parse", "--show-object-format")), cwd=cwd, project_root=project_root, scratch_root=scratch_root, deadline=deadline), "repository_object_format")
+def run_control_plane_git_repository_object_format(
+    *, cwd: str, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None
+) -> RepositoryObjectFormat:
+    result = _require_success(
+        _execute_semantic_git(
+            _closed_git_invocation(("rev-parse", "--show-object-format")),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "repository_object_format",
+    )
     return validate_repository_object_format((result.stdout or "").strip())
 
 
-def run_control_plane_git_fetch_default_ref(remote_url: LiteralRemoteUrl, remote_ref: AllowedRemoteRef, nonce: str, *, cwd: str, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None) -> ControlPlanePrivateRef:
+def run_control_plane_git_fetch_default_ref(
+    remote_url: LiteralRemoteUrl,
+    remote_ref: AllowedRemoteRef,
+    nonce: str,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> ControlPlanePrivateRef:
     if not isinstance(remote_url, LiteralRemoteUrl) or not isinstance(remote_ref, AllowedRemoteRef):
         raise TypeError("literal_remote_url_and_allowed_remote_ref_required")
     private_ref = make_control_plane_private_ref(nonce)
-    _require_success(_execute_semantic_git(_closed_git_invocation(("fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", remote_url.value, f"{remote_ref.value}:{private_ref.value}")), cwd=cwd, project_root=project_root, scratch_root=scratch_root, deadline=deadline), "fetch_default_ref")
+    _require_success(
+        _execute_semantic_git(
+            _closed_git_invocation(
+                (
+                    "fetch",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--no-write-fetch-head",
+                    remote_url.value,
+                    f"{remote_ref.value}:{private_ref.value}",
+                )
+            ),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "fetch_default_ref",
+    )
     return private_ref
 
 
-def run_control_plane_git_read_private_ref_oid(private_ref: ControlPlanePrivateRef, object_format: RepositoryObjectFormat, *, cwd: str, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None) -> RepositoryObjectId:
+def run_control_plane_git_read_private_ref_oid(
+    private_ref: ControlPlanePrivateRef,
+    object_format: RepositoryObjectFormat,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> RepositoryObjectId:
     if not isinstance(private_ref, ControlPlanePrivateRef) or not isinstance(object_format, RepositoryObjectFormat):
         raise TypeError("private_ref_and_object_format_required")
-    result = _require_success(_execute_semantic_git(_closed_git_invocation(("rev-parse", "--verify", "--quiet", private_ref.value)), cwd=cwd, project_root=project_root, scratch_root=scratch_root, deadline=deadline), "read_private_ref_oid")
+    result = _require_success(
+        _execute_semantic_git(
+            _closed_git_invocation(("rev-parse", "--verify", "--quiet", private_ref.value)),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "read_private_ref_oid",
+    )
     return validate_repository_object_id((result.stdout or "").strip(), object_format)
 
 
-def run_control_plane_git_require_commit_object(object_id: RepositoryObjectId, *, cwd: str, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None) -> None:
+def run_control_plane_git_require_commit_object(
+    object_id: RepositoryObjectId,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> None:
     if not isinstance(object_id, RepositoryObjectId):
         raise TypeError("repository_object_id_required")
-    _require_success(_execute_semantic_git(_closed_git_invocation(("cat-file", "-e", object_id.value + "^{commit}")), cwd=cwd, project_root=project_root, scratch_root=scratch_root, deadline=deadline), "commit_object")
+    _require_success(
+        _execute_semantic_git(
+            _closed_git_invocation(("cat-file", "-e", object_id.value + "^{commit}")),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "commit_object",
+    )
 
 
-def run_control_plane_git_read_worktree_head(path: DetachedWorktreePath, object_format: RepositoryObjectFormat, *, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None) -> RepositoryObjectId:
+def run_control_plane_git_read_worktree_head(
+    path: DetachedWorktreePath,
+    object_format: RepositoryObjectFormat,
+    *,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> RepositoryObjectId:
     if not isinstance(path, DetachedWorktreePath) or not isinstance(object_format, RepositoryObjectFormat):
         raise TypeError("detached_worktree_path_and_object_format_required")
-    result = _require_success(_execute_semantic_git(_closed_git_invocation(("rev-parse", "--verify", "HEAD")), cwd=path.value, project_root=project_root, scratch_root=scratch_root, deadline=deadline), "read_worktree_head")
+    result = _require_success(
+        _execute_semantic_git(
+            _closed_git_invocation(("rev-parse", "--verify", "HEAD")),
+            cwd=path.value,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "read_worktree_head",
+    )
     return validate_repository_object_id((result.stdout or "").strip(), object_format)
 
 
-def run_control_plane_git_add_detached_locked_worktree(path: DetachedWorktreePath, commit: RepositoryObjectId, *, cwd: str, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None) -> None:
+def run_control_plane_git_add_detached_locked_worktree(
+    path: DetachedWorktreePath,
+    commit: RepositoryObjectId,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> None:
     if not isinstance(path, DetachedWorktreePath) or not isinstance(commit, RepositoryObjectId):
         raise TypeError("detached_worktree_path_and_repository_object_id_required")
-    run_control_plane_git_require_commit_object(commit, cwd=cwd, project_root=project_root, deadline=deadline, scratch_root=scratch_root)
-    _require_success(_execute_semantic_git(_closed_git_invocation(("worktree", "add", "--detach", "--lock", "--reason", _CONTROL_PLANE_WORKTREE_LOCK_REASON, path.value, commit.value)), cwd=cwd, project_root=project_root, scratch_root=scratch_root, deadline=deadline), "add_detached_locked_worktree")
+    run_control_plane_git_require_commit_object(
+        commit, cwd=cwd, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+    )
+    _require_success(
+        _execute_semantic_git(
+            _closed_git_invocation(
+                (
+                    "worktree",
+                    "add",
+                    "--detach",
+                    "--lock",
+                    "--reason",
+                    _CONTROL_PLANE_WORKTREE_LOCK_REASON,
+                    path.value,
+                    commit.value,
+                )
+            ),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "add_detached_locked_worktree",
+    )
     fmt = RepositoryObjectFormat("sha1") if len(commit.value) == 40 else RepositoryObjectFormat("sha256")
-    if run_control_plane_git_read_worktree_head(path, fmt, project_root=project_root, deadline=deadline, scratch_root=scratch_root) != commit:
+    if (
+        run_control_plane_git_read_worktree_head(
+            path, fmt, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+        )
+        != commit
+    ):
         raise RuntimeError("detached_worktree_head_mismatch")
 
 
-def run_control_plane_git_delete_private_ref_cas(private_ref: ControlPlanePrivateRef, expected_oid: RepositoryObjectId, *, cwd: str, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None) -> None:
+def run_control_plane_git_delete_private_ref_cas(
+    private_ref: ControlPlanePrivateRef,
+    expected_oid: RepositoryObjectId,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> None:
     if not isinstance(private_ref, ControlPlanePrivateRef) or not isinstance(expected_oid, RepositoryObjectId):
         raise TypeError("private_ref_and_expected_oid_required")
-    _require_success(_execute_semantic_git(_closed_git_invocation(("update-ref", "-d", private_ref.value, expected_oid.value)), cwd=cwd, project_root=project_root, scratch_root=scratch_root, deadline=deadline), "delete_private_ref_cas")
+    _require_success(
+        _execute_semantic_git(
+            _closed_git_invocation(("update-ref", "-d", private_ref.value, expected_oid.value)),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "delete_private_ref_cas",
+    )
 
 
 if __name__ == "__main__":

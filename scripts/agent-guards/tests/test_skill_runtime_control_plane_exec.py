@@ -53,7 +53,9 @@ def _init_remote_fixture(tmp_path: Path) -> tuple[Path, str, str]:
     (source / "README.md").write_text("fixture\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=source, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=source, check=True, env=env)
-    oid = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, check=True, text=True, capture_output=True).stdout.strip()
+    oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source, check=True, text=True, capture_output=True
+    ).stdout.strip()
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, env=env)
     subprocess.run(["git", "remote", "add", "origin", origin.as_uri()], cwd=source, check=True, env=env)
     subprocess.run(["git", "push", "-q", "origin", "main"], cwd=source, check=True, env=env)
@@ -108,46 +110,98 @@ def test_exact_remote_commands_and_fixed_fetch_cas_shapes(monkeypatch, tmp_path)
         return subprocess.CompletedProcess(list(args), 0, "", "")
 
     monkeypatch.setattr(exec_mod, "_run_closed_git_process", fake_run)
-    assert exec_mod.run_control_plane_git_effective_remote_url(url, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline) == remote
-    assert exec_mod.run_control_plane_git_observe_default_ref(remote, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline).returncode == 0
-    private = exec_mod.run_control_plane_git_fetch_default_ref(remote, ref, "a" * 16, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline)
-    fmt = exec_mod.run_control_plane_git_repository_object_format(cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline)
+    assert (
+        exec_mod.run_control_plane_git_effective_remote_url(
+            url, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+        )
+        == remote
+    )
+    assert (
+        exec_mod.run_control_plane_git_observe_default_ref(
+            remote, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+        ).returncode
+        == 0
+    )
+    private = exec_mod.run_control_plane_git_fetch_default_ref(
+        remote, ref, "a" * 16, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+    )
+    fmt = exec_mod.run_control_plane_git_repository_object_format(
+        cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+    )
     oid = exec_mod.validate_repository_object_id("a" * 40, fmt)
-    exec_mod.run_control_plane_git_delete_private_ref_cas(private, oid, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline)
+    exec_mod.run_control_plane_git_delete_private_ref_cas(
+        private, oid, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+    )
     semantic_calls = [call for call in calls if "config" not in call]
     assert any(call[-3:] == ("ls-remote", "--get-url", url) for call in semantic_calls)
     assert any(call[-5:] == ("ls-remote", "--exit-code", "--symref", url, "HEAD") for call in semantic_calls)
     fetch = next(call for call in semantic_calls if "fetch" in call)
     assert fetch[-6:-1] == ("fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", url)
     assert fetch[-1] == f"refs/heads/main:{private.value}"
-    assert next(call for call in semantic_calls if "update-ref" in call)[-4:] == ("update-ref", "-d", private.value, oid.value)
+    assert next(call for call in semantic_calls if "update-ref" in call)[-4:] == (
+        "update-ref",
+        "-d",
+        private.value,
+        oid.value,
+    )
 
 
 def test_real_fixture_proves_observe_fetch_commit_worktree_head_and_cas(tmp_path):
     local, url, expected_oid = _init_remote_fixture(tmp_path)
     scratch = tmp_path / "scratch"
     deadline = _deadline()
-    remote = exec_mod.run_control_plane_git_effective_remote_url(url, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline)
-    observed = exec_mod.run_control_plane_git_observe_default_ref(remote, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline)
-    assert f"refs/heads/main" in observed.stdout
-    fmt = exec_mod.run_control_plane_git_repository_object_format(cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline)
-    private = exec_mod.run_control_plane_git_fetch_default_ref(remote, validate_allowed_remote_ref("refs/heads/main"), "b" * 16, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline)
-    fetched = exec_mod.run_control_plane_git_read_private_ref_oid(private, fmt, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline)
+    remote = exec_mod.run_control_plane_git_effective_remote_url(
+        url, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    observed = exec_mod.run_control_plane_git_observe_default_ref(
+        remote, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    assert "refs/heads/main" in observed.stdout
+    fmt = exec_mod.run_control_plane_git_repository_object_format(
+        cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    private = exec_mod.run_control_plane_git_fetch_default_ref(
+        remote,
+        validate_allowed_remote_ref("refs/heads/main"),
+        "b" * 16,
+        cwd=str(local),
+        project_root=str(local),
+        scratch_root=str(scratch),
+        deadline=deadline,
+    )
+    fetched = exec_mod.run_control_plane_git_read_private_ref_oid(
+        private, fmt, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
     assert fetched.value == expected_oid
-    exec_mod.run_control_plane_git_require_commit_object(fetched, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline)
+    exec_mod.run_control_plane_git_require_commit_object(
+        fetched, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
     destination = local / ".claude" / "worktrees" / "dedicated"
     path = validate_detached_worktree_path(str(destination), str(local))
-    exec_mod.run_control_plane_git_add_detached_locked_worktree(path, fetched, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline)
-    assert exec_mod.run_control_plane_git_read_worktree_head(path, fmt, project_root=str(local), scratch_root=str(scratch), deadline=deadline) == fetched
-    exec_mod.run_control_plane_git_delete_private_ref_cas(private, fetched, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline)
-    assert subprocess.run(["git", "rev-parse", "--verify", private.value], cwd=local, capture_output=True).returncode != 0
+    exec_mod.run_control_plane_git_add_detached_locked_worktree(
+        path, fetched, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    assert (
+        exec_mod.run_control_plane_git_read_worktree_head(
+            path, fmt, project_root=str(local), scratch_root=str(scratch), deadline=deadline
+        )
+        == fetched
+    )
+    exec_mod.run_control_plane_git_delete_private_ref_cas(
+        private, fetched, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    assert (
+        subprocess.run(["git", "rev-parse", "--verify", private.value], cwd=local, capture_output=True).returncode != 0
+    )
 
 
 def test_rewrite_rejection_happens_before_remote_operation(tmp_path):
     local, url, _ = _init_remote_fixture(tmp_path)
     subprocess.run(["git", "config", "--local", "url.https://evil.example/.insteadOf", url], cwd=local, check=True)
     with pytest.raises(GitSubprocessRewriteRejected):
-        exec_mod.run_control_plane_git_effective_remote_url(url, cwd=str(local), project_root=str(local), scratch_root=str(tmp_path / "scratch"), deadline=_deadline())
+        exec_mod.run_control_plane_git_effective_remote_url(
+            url, cwd=str(local), project_root=str(local), scratch_root=str(tmp_path / "scratch"), deadline=_deadline()
+        )
 
 
 def test_deadline_reserve_refuses_terminal_spawn(monkeypatch, tmp_path):
@@ -161,23 +215,33 @@ def test_deadline_reserve_refuses_terminal_spawn(monkeypatch, tmp_path):
     monkeypatch.setattr(exec_mod.subprocess, "Popen", unexpected)
     expired = exec_mod.GitProtocolDeadline(time.monotonic() + 0.01, 0.1)
     with pytest.raises(exec_mod.GitProtocolDeadlineExhausted):
-        exec_mod.run_control_plane_git_effective_remote_url("file:///tmp/origin.git", cwd=str(tmp_path), project_root=str(tmp_path), deadline=expired)
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git", cwd=str(tmp_path), project_root=str(tmp_path), deadline=expired
+        )
     assert not spawned
 
 
 def test_timeout_terminates_and_reaps_dedicated_process_group(monkeypatch, tmp_path):
     fake_git = tmp_path / "fake-git"
     child_pid = tmp_path / "child.pid"
-    fake_git.write_text(f'''#!/bin/sh
+    fake_git.write_text(
+        f'''#!/bin/sh
 case "$*" in
   *config*) exit 1 ;;
   *) (sleep 30) & echo $! > "{child_pid}"; sleep 30 ;;
 esac
-''', encoding="utf-8")
+''',
+        encoding="utf-8",
+    )
     fake_git.chmod(0o755)
     monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
     with pytest.raises(exec_mod.GitProtocolTimeout):
-        exec_mod.run_control_plane_git_effective_remote_url("file:///tmp/origin.git", cwd=str(tmp_path), project_root=str(tmp_path), deadline=exec_mod.GitProtocolDeadline.start(0.6, cleanup_reserve_seconds=0.3))
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(0.6, cleanup_reserve_seconds=0.3),
+        )
     pid = int(child_pid.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
@@ -194,13 +258,15 @@ def test_sanitized_git_environment_forces_no_lazy_fetch(tmp_path):
     assert exec_mod.sanitized_git_subprocess_env(str(tmp_path))["GIT_NO_LAZY_FETCH"] == "1"
 
 
-
 def _write_group_leak_git(path: Path, pid_file: Path) -> None:
-    path.write_text(f"""#!/bin/sh
+    path.write_text(
+        f"""#!/bin/sh
 (sleep 30) >/dev/null 2>&1 &
 echo $! > "{pid_file}"
 exit 2
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     path.chmod(0o755)
 
 
@@ -211,7 +277,9 @@ def test_probe_failure_reaps_its_dedicated_process_group(monkeypatch, tmp_path):
     monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
     with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed):
         exec_mod.run_control_plane_git_effective_remote_url(
-            "file:///tmp/origin.git", cwd=str(tmp_path), project_root=str(tmp_path),
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
             deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
         )
     pid = int(child_pid.read_text(encoding="utf-8"))
@@ -244,7 +312,9 @@ def test_exception_after_spawn_reaps_its_dedicated_process_group(monkeypatch, tm
     monkeypatch.setattr(exec_mod.subprocess, "Popen", ExplodingPopen)
     with pytest.raises(RuntimeError, match="injected_post_spawn_failure"):
         exec_mod.run_control_plane_git_effective_remote_url(
-            "file:///tmp/origin.git", cwd=str(tmp_path), project_root=str(tmp_path),
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
             deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
         )
     pid = int(child_pid.read_text(encoding="utf-8"))

@@ -577,7 +577,7 @@ def is_exact_skill_runtime_executor_command(
 # `repo_relative_file`-typed placeholder uniformly (production and
 # test-only), without changing any command's argv shape, flags, or accepted
 # command_ids.
-_SHLEX_ROUND_TRIP_UNSAFE_CHARS = frozenset({" ", "\t", "\"", "'", "\\"})
+_SHLEX_ROUND_TRIP_UNSAFE_CHARS = frozenset({" ", "\t", '"', "'", "\\"})
 
 
 def _is_safe_repo_relative_fixture_path(fixture: str, root: str) -> bool:
@@ -784,9 +784,7 @@ def parse_exact_skill_runtime_anchor_fixture_command(
         return None
     if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
         return None
-    if os.path.realpath(os.path.join(root, tokens[3])) != os.path.realpath(
-        os.path.join(root, SKILL_RUNTIME_EXEC_REL)
-    ):
+    if os.path.realpath(os.path.join(root, tokens[3])) != os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
         return None
     command_id, issue_number, repo = tokens[5], tokens[7], tokens[9]
     fixture, anchor_comment_url = tokens[11], tokens[13]
@@ -1422,8 +1420,6 @@ def is_exact_skill_runtime_authority_transport_consume_executor_command(
     return True
 
 
-
-
 def _parse_exact_skill_runtime_anchor_command(
     command: str, expected_command_ids: frozenset[str], project_root: str | None = None
 ) -> ExactSkillRuntimeCommand | None:
@@ -1632,9 +1628,7 @@ SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"][SCOPE_ROLLUP_RUN_COMMAND
     "network_effect": "github_read_only",
 }
 
-ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS | frozenset(
-    {SCOPE_ROLLUP_RUN_COMMAND_ID}
-)
+ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS | frozenset({SCOPE_ROLLUP_RUN_COMMAND_ID})
 _ROOT_NO_WORKTREE_POLICY_INVARIANTS[SCOPE_ROLLUP_RUN_COMMAND_ID] = {
     "execution_class": SCOPE_ROLLUP_RUN_EXECUTION_CLASS,
     "required_cwd": "canonical_main_root",
@@ -1662,14 +1656,10 @@ class ScopeRollupRunCommand:
 # (safe charset only -- no literal value pinning is possible since both are
 # generated per-invocation).
 _INVOCATION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
-_REQUESTED_AT_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
-)
+_REQUESTED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 
 
-def parse_scope_rollup_run_command(
-    command: str, project_root: str | None = None
-) -> ScopeRollupRunCommand | None:
+def parse_scope_rollup_run_command(command: str, project_root: str | None = None) -> ScopeRollupRunCommand | None:
     """Exact-match parser for `uv run python3
     scripts/agent-guards/run_scope_rollup_preflight.py --issue-number <N>
     --repo <owner/repo> --invocation-id <id> --requested-at <ISO8601>`
@@ -1727,9 +1717,7 @@ def parse_scope_rollup_run_command(
     )
 
 
-def is_scope_rollup_run_command(
-    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
-) -> bool:
+def is_scope_rollup_run_command(command: str, cwd: str, project_root: str, deadline: Deadline | None = None) -> bool:
     """canonical root + default branch + trusted repo binding only. No
     active-issue-worktree requirement -- scope_rollup.run always runs before
     any issue worktree exists (Issue #1547 P0-1)."""
@@ -1803,14 +1791,22 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "{fixture}",
     ],
     "preflight.run.fixture.with_human_context": [
-        "uv", "run", "python3",
+        "uv",
+        "run",
+        "python3",
         ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
-        "--issue-number", "{issue_number}",
-        "--repo", "{repo}",
-        "--fixture", "{fixture}",
-        "--anchor-comment-url", "{anchor_comment_url}",
-        "--human-context-comment-url", "{anchor_comment_url}",
-        "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--fixture",
+        "{fixture}",
+        "--anchor-comment-url",
+        "{anchor_comment_url}",
+        "--human-context-comment-url",
+        "{anchor_comment_url}",
+        "--investigation-evidence-transport-path",
+        "{investigation_evidence_transport_path}",
     ],
     "preflight.run.with_anchor": [
         "uv",
@@ -1982,7 +1978,9 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "fixture": {"type": "repo_relative_file", "required": True},
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         "investigation_evidence_transport_path": {
-            "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
+            "type": "repo_relative_file",
+            "required": False,
+            "optional_flag_pair": True,
         },
     },
     "preflight.run.with_anchor": {
@@ -1996,7 +1994,9 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         # #2086 P0 fix_delta (Blocker 1/2)
         "investigation_evidence_transport_path": {
-            "type": "path", "required": False, "optional_flag_pair": True,
+            "type": "path",
+            "required": False,
+            "optional_flag_pair": True,
         },
     },
     "preflight.run.with_agent_report": {
@@ -2088,11 +2088,7 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
     if expected_placeholders is None or placeholders != expected_placeholders:
         raise ValueError("placeholder_mismatch")
     declared_placeholders = set(placeholders)
-    argv_placeholders = {
-        token[1:-1]
-        for token in argv
-        if isinstance(token, str) and _PLACEHOLDER_RE.match(token)
-    }
+    argv_placeholders = {token[1:-1] for token in argv if isinstance(token, str) and _PLACEHOLDER_RE.match(token)}
     if argv_placeholders != declared_placeholders:
         raise ValueError("argv_placeholder_contract_mismatch")
     if "{active_issue}" not in "".join(expected_write_roots):
