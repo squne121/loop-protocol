@@ -290,9 +290,32 @@ jobs:
         run: |
           set -euo pipefail
           DECISION_FILE="${ARTIFACT_ROOT}/decision/visual_impact_decision_v1.json"
-          EVIDENCE_FILE="${ARTIFACT_ROOT}/evidence/visual_baseline_review_evidence_v2.json"
           [ -f "${DECISION_FILE}" ] || DECISION_FILE=""
-          [ -f "${EVIDENCE_FILE}" ] || EVIDENCE_FILE=""
+
+          # Issue #2284 Phase A/B: migration-window dual-filename
+          # acceptance. The producer (`ci.yml`) may have run at EITHER
+          # the pre-#2284 (V2, legacy filename) or post-#2284 (V3, generic
+          # filename) commit depending on which `main` revision triggered
+          # this `workflow_run` -- never assume only one filename can
+          # exist. If BOTH are present in the acquired artifact, refuse to
+          # silently pick one (fail-closed) rather than risk consuming a
+          # stale/duplicated evidence manifest.
+          LEGACY_EVIDENCE_FILE="${ARTIFACT_ROOT}/evidence/visual_baseline_review_evidence_v2.json"
+          GENERIC_EVIDENCE_FILE="${ARTIFACT_ROOT}/evidence/visual_baseline_review_evidence.json"
+          LEGACY_EVIDENCE_PRESENT=0
+          GENERIC_EVIDENCE_PRESENT=0
+          [ -f "${LEGACY_EVIDENCE_FILE}" ] && LEGACY_EVIDENCE_PRESENT=1
+          [ -f "${GENERIC_EVIDENCE_FILE}" ] && GENERIC_EVIDENCE_PRESENT=1
+          if [ "${LEGACY_EVIDENCE_PRESENT}" -eq 1 ] && [ "${GENERIC_EVIDENCE_PRESENT}" -eq 1 ]; then
+            echo "::error::evidence-manifest artifact contains BOTH the legacy V2 filename (${LEGACY_EVIDENCE_FILE}) and the generic V3 filename (${GENERIC_EVIDENCE_FILE}) -- refusing to silently pick one during the Issue #2284 V2/V3 migration window."
+            exit 1
+          elif [ "${GENERIC_EVIDENCE_PRESENT}" -eq 1 ]; then
+            EVIDENCE_FILE="${GENERIC_EVIDENCE_FILE}"
+          elif [ "${LEGACY_EVIDENCE_PRESENT}" -eq 1 ]; then
+            EVIDENCE_FILE="${LEGACY_EVIDENCE_FILE}"
+          else
+            EVIDENCE_FILE=""
+          fi
 
           EXTRA_ARGS=()
           [ -f artifacts/trusted/base_registry.yml ] && EXTRA_ARGS+=(--trusted-base-registry-file artifacts/trusted/base_registry.yml)
