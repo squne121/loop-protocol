@@ -19,6 +19,7 @@ if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
 import pytest  # noqa: E402
+import skill_runtime_command_policy as policy  # noqa: E402
 
 from skill_runtime_command_policy import (  # noqa: E402
     GIT_GLOBAL_OPTION_TOKENS,
@@ -201,3 +202,39 @@ def test_reject_option_like_positional_rejects_leading_dash():
 def test_reject_option_like_positional_allows_ordinary_value():
     reject_option_like_positional("https://example.com/repo.git")  # must not raise
     reject_option_like_positional("refs/heads/main")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Issue #2378: remote protocol structural policy
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["-c", "origin", "git@host:repo", "https://host/repo?redirect=evil", "https://user@host/repo"])
+def test_validate_literal_remote_url_rejects_nonliteral_or_indirect_values(value):
+    with pytest.raises(ValueError):
+        policy.validate_literal_remote_url(value)
+
+
+def test_remote_ref_and_repository_object_id_are_closed_typed_values(tmp_path):
+    assert policy.validate_allowed_remote_ref("refs/heads/main").value == "refs/heads/main"
+    for bad_ref in ("HEAD", "refs/tags/v1", "refs/heads/../main", "-c"):
+        with pytest.raises(ValueError):
+            policy.validate_allowed_remote_ref(bad_ref)
+    sha1 = policy.validate_repository_object_format("sha1")
+    assert policy.validate_repository_object_id("a" * 40, sha1).value == "a" * 40
+    for bad_oid in ("A" * 40, "a" * 39, "g" * 40):
+        with pytest.raises(ValueError):
+            policy.validate_repository_object_id(bad_oid, sha1)
+    with pytest.raises(ValueError):
+        policy.validate_repository_object_format("sha512")
+
+
+def test_detached_worktree_path_is_fresh_and_project_confined(tmp_path):
+    project = tmp_path / "project"
+    target = project / ".claude" / "worktrees" / "dedicated"
+    assert policy.validate_detached_worktree_path(str(target), str(project)).value == str(target)
+    with pytest.raises(ValueError):
+        policy.validate_detached_worktree_path(str(tmp_path / "outside"), str(project))
+    target.parent.mkdir(parents=True)
+    target.mkdir()
+    with pytest.raises(ValueError):
+        policy.validate_detached_worktree_path(str(target), str(project))

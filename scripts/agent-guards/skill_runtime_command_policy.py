@@ -2262,3 +2262,102 @@ def reject_option_like_positional(value: str) -> None:
     interpreted by Git as a flag instead of data (Issue #2196 P1-3)."""
     if value.startswith("-"):
         raise ValueError(f"positional_argument_looks_like_option:{value}")
+
+
+# ---------------------------------------------------------------------------
+# Issue #2378: closed remote-default-ref protocol value types. These policy
+# constructors are the single authority for data reaching semantic builders.
+# ---------------------------------------------------------------------------
+
+_LITERAL_REMOTE_URL_SCHEMES = frozenset({"file", "https", "ssh"})
+_REMOTE_REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_PRIVATE_REF_NONCE_RE = re.compile(r"^[a-f0-9]{16,64}$")
+_OBJECT_FORMAT_LENGTHS = {"sha1": 40, "sha256": 64}
+
+
+@dataclass(frozen=True)
+class LiteralRemoteUrl:
+    value: str
+
+
+@dataclass(frozen=True)
+class AllowedRemoteRef:
+    value: str
+
+
+@dataclass(frozen=True)
+class RepositoryObjectFormat:
+    value: str
+
+
+@dataclass(frozen=True)
+class RepositoryObjectId:
+    value: str
+
+
+@dataclass(frozen=True)
+class ControlPlanePrivateRef:
+    value: str
+
+
+@dataclass(frozen=True)
+class DetachedWorktreePath:
+    value: str
+
+
+def validate_literal_remote_url(value: str) -> LiteralRemoteUrl:
+    """Accept a literal URL, never an alias, option, or indirection surface."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("literal_remote_url_invalid")
+    if any(char.isspace() for char in value) or "\x00" in value or value.startswith("-"):
+        raise ValueError("literal_remote_url_invalid")
+    parsed = urlparse(value)
+    if parsed.scheme not in _LITERAL_REMOTE_URL_SCHEMES or (not parsed.netloc and parsed.scheme != "file"):
+        raise ValueError("literal_remote_url_invalid")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("literal_remote_url_invalid")
+    if parsed.scheme == "file" and (parsed.netloc not in ("", "localhost") or not parsed.path.startswith("/")):
+        raise ValueError("literal_remote_url_invalid")
+    if parsed.scheme in {"https", "ssh"} and (not parsed.hostname or not parsed.path.startswith("/")):
+        raise ValueError("literal_remote_url_invalid")
+    return LiteralRemoteUrl(value)
+
+
+def validate_allowed_remote_ref(value: str) -> AllowedRemoteRef:
+    if not isinstance(value, str) or not _REMOTE_REF_RE.fullmatch(value) or ".." in value or value.endswith("/"):
+        raise ValueError("remote_ref_not_allowed")
+    return AllowedRemoteRef(value)
+
+
+def make_control_plane_private_ref(nonce: str) -> ControlPlanePrivateRef:
+    if not isinstance(nonce, str) or not _PRIVATE_REF_NONCE_RE.fullmatch(nonce):
+        raise ValueError("private_ref_nonce_invalid")
+    return ControlPlanePrivateRef(f"refs/loop-protocol/control-plane/default-ref/{nonce}")
+
+
+def validate_repository_object_format(value: str) -> RepositoryObjectFormat:
+    if value not in _OBJECT_FORMAT_LENGTHS:
+        raise ValueError("repository_object_format_not_allowed")
+    return RepositoryObjectFormat(value)
+
+
+def validate_repository_object_id(value: str, object_format: RepositoryObjectFormat) -> RepositoryObjectId:
+    if not isinstance(object_format, RepositoryObjectFormat):
+        raise TypeError("repository_object_format_required")
+    expected_length = _OBJECT_FORMAT_LENGTHS[object_format.value]
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]+", value) or len(value) != expected_length:
+        raise ValueError("repository_object_id_invalid")
+    return RepositoryObjectId(value)
+
+
+def validate_detached_worktree_path(value: str, project_root: str) -> DetachedWorktreePath:
+    if not isinstance(value, str) or not os.path.isabs(value):
+        raise ValueError("detached_worktree_path_invalid")
+    root = os.path.realpath(project_root)
+    candidate = os.path.realpath(value)
+    required_prefix = os.path.join(root, ".claude", "worktrees")
+    if candidate == required_prefix or not candidate.startswith(required_prefix + os.sep):
+        raise ValueError("detached_worktree_path_not_confined")
+    if Path(value).exists() or Path(value).is_symlink():
+        raise ValueError("detached_worktree_path_not_fresh")
+    return DetachedWorktreePath(candidate)
