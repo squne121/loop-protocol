@@ -73,6 +73,7 @@ from baseline_vc_preflight import (  # noqa: E402
     # for that SAME body (including the digest passed to the child
     # subprocess below), keeping plan_digest convergent.
     produce_immutable_history_snapshot as _produce_immutable_history_snapshot,
+    resolve_repo_root_for_history as _resolve_repo_root_for_history,
 )
 import vc_runtime_history as _vc_runtime_history  # noqa: E402
 from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
@@ -733,7 +734,10 @@ def map_validate_errors_to_readiness_errors(validate_result: dict) -> list[dict]
 
 
 def compute_invocation_local_baseline_timeout(
-    body: str, *, history_snapshot: "Optional[Dict[str, Any]]" = None
+    body: str,
+    *,
+    history_snapshot: "Optional[Dict[str, Any]]" = None,
+    repo_root: "Optional[str]" = None,
 ) -> int:
     """Issue #2207: derive the `baseline_vc_preflight.py` aggregate wrapper
     timeout for THIS specific pinned `body`, from the canonical VC plan's
@@ -759,7 +763,11 @@ def compute_invocation_local_baseline_timeout(
     # for its OWN `args.cwd or "."` default and `allowed_paths_from_body`,
     # keeping `plan_digest` convergent across the process boundary.
     plan = _compute_canonical_vc_plan(
-        body, cwd=".", allowed_paths=_extract_allowed_paths(body), history_snapshot=history_snapshot
+        body,
+        cwd=".",
+        allowed_paths=_extract_allowed_paths(body),
+        history_snapshot=history_snapshot,
+        repo_root=repo_root,
     )
     # Issue #2207 OWNER P1-3: `command_occurrence_count`, per the Issue
     # #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`.
@@ -779,6 +787,7 @@ def run_baseline_vc_preflight(
     override_timeout_seconds: Optional[float] = None,
     override_grace_seconds: Optional[float] = None,
     _test_extra_env: Optional[Dict[str, str]] = None,
+    history_snapshot: Optional[Dict[str, Any]] = None,
 ) -> tuple[dict, int]:
     """
     Run baseline_vc_preflight.py via a cooperative subprocess supervisor.
@@ -805,6 +814,20 @@ def run_baseline_vc_preflight(
     `_test_extra_env` is test-only free-form environment passthrough to the
     spawned `baseline_vc_preflight.py` child (e.g. a SIGTERM-handler-entry
     marker-file path); production callers never pass this.
+
+    `history_snapshot` (Issue #2254 fix_delta P0 blocker 1, OWNER
+    REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    an IMMUTABLE `history_snapshot/v1` dict a PARENT process (e.g.
+    `run_contract_review_once.py` Step 2, or `run_root_review_pipeline.py`'s
+    `run-checker-attempt`) already produced ONCE for this SAME `body` and
+    passes straight through here, so this function's own plan/digest/child
+    subprocess all reuse that EXACT snapshot instead of this function
+    silently re-reading the store itself (which could observe a DIFFERENT
+    point-in-time result than whatever the parent already used to compute
+    an outer deadline/plan for the SAME invocation). `None` (the default)
+    preserves this function's own pre-fix_delta standalone behavior: it
+    produces its own snapshot exactly as before.
     """
     # Issue #2207: compute the invocation-local aggregate timeout from the
     # SAME canonical VC plan the executor's occurrence count is bound to,
@@ -817,10 +840,26 @@ def run_baseline_vc_preflight(
     # below AND the `_plan_for_digest` computation further down reuse THIS
     # SAME snapshot object, keeping plan_digest convergent across both
     # in-process calls AND the child subprocess boundary).
-    _history_snapshot = _produce_immutable_history_snapshot(body, cwd=".")
+    # Issue #2254 fix_delta P0 blocker 1: when a PARENT process already
+    # produced a snapshot for this SAME body (passed in via
+    # `history_snapshot=`), reuse it verbatim instead of reading the store
+    # again here -- a second independent read could observe a store that a
+    # concurrent writer touched between the parent's read and this one.
+    # Issue #2254 fix_delta P0 blocker 2/3: `_repo_root_for_history` is
+    # resolved ONCE from the SAME `cwd="."` this function always uses for
+    # BOTH producing the snapshot (when not given one) AND the
+    # `_plan_for_digest` computation further down.
+    _repo_root_for_history = _resolve_repo_root_for_history(".")
+    _history_snapshot = (
+        history_snapshot
+        if history_snapshot is not None
+        else _produce_immutable_history_snapshot(
+            body, cwd=".", repo_root=_repo_root_for_history
+        )
+    )
     try:
         aggregate_timeout_seconds: float = compute_invocation_local_baseline_timeout(
-            body, history_snapshot=_history_snapshot
+            body, history_snapshot=_history_snapshot, repo_root=_repo_root_for_history
         )
     except (
         VerificationBudgetExceedsPolicyError,
@@ -931,7 +970,11 @@ def run_baseline_vc_preflight(
         # that exact classification context so `plan_digest` stays
         # convergent across this subprocess boundary.
         _plan_for_digest = _compute_canonical_vc_plan(
-            body, cwd=".", allowed_paths=_extract_allowed_paths(body), history_snapshot=_history_snapshot
+            body,
+            cwd=".",
+            allowed_paths=_extract_allowed_paths(body),
+            history_snapshot=_history_snapshot,
+            repo_root=_repo_root_for_history,
         )
         _vc_command_argv = [
             sys.executable,
@@ -2071,6 +2114,22 @@ def main() -> int:
             "execute: also runs baseline_vc_preflight.py to execute VCs."
         ),
     )
+    parser.add_argument(
+        "--history-snapshot-file",
+        default=None,
+        help=(
+            "Issue #2254 fix_delta P0 blocker 1: path to an immutable "
+            "history_snapshot/v1 JSON file a PARENT process (e.g. "
+            "run_contract_review_once.py Step 2, or "
+            "run_root_review_pipeline.py's run-checker-attempt) already "
+            "produced for this SAME body. When given (and --mode execute), "
+            "this process loads that EXACT snapshot and passes it straight "
+            "through to run_baseline_vc_preflight() instead of reading the "
+            "history store again itself. When omitted, execute mode "
+            "produces its own snapshot (standalone / direct invocation), "
+            "unchanged from pre-fix_delta behavior."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -2140,7 +2199,29 @@ def main() -> int:
         )
         skip_preflight = is_canonical_parent and not parent_has_vc_section
         if not skip_preflight:
-            preflight_result, preflight_exit_code = run_baseline_vc_preflight(body)
+            # Issue #2254 fix_delta P0 blocker 1: reuse a PARENT-produced
+            # snapshot (via --history-snapshot-file) verbatim instead of
+            # always re-reading the store from this subprocess -- see
+            # run_baseline_vc_preflight()'s own docstring above.
+            _cli_history_snapshot: Optional[Dict[str, Any]] = None
+            if args.history_snapshot_file:
+                _cli_history_snapshot = _vc_runtime_history.load_history_snapshot_file(
+                    Path(args.history_snapshot_file)
+                )
+            # Issue #2254 fix_delta P0 blocker 1: only pass the NEW
+            # history_snapshot= kwarg when a caller actually supplied
+            # --history-snapshot-file, so this call site remains
+            # byte-for-byte the SAME run_baseline_vc_preflight(body)
+            # invocation pre-existing test doubles/mocks (which do not
+            # accept this kwarg) already expect, in the (default,
+            # standalone-invocation) case where no parent process passed a
+            # snapshot file.
+            _preflight_kwargs: Dict[str, Any] = {}
+            if _cli_history_snapshot is not None:
+                _preflight_kwargs["history_snapshot"] = _cli_history_snapshot
+            preflight_result, preflight_exit_code = run_baseline_vc_preflight(
+                body, **_preflight_kwargs
+            )
         else:
             # #1878 P2 review: record a machine-readable "not_applicable"
             # source_checks entry so a deliberate skip is distinguishable

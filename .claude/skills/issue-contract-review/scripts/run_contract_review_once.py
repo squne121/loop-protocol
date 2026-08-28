@@ -106,6 +106,9 @@ from baseline_vc_preflight import compute_canonical_vc_plan  # noqa: E402
 # propagated to the baseline_vc_preflight.py subprocess via
 # --history-snapshot-file, keeping plan_digest convergent.
 from baseline_vc_preflight import produce_immutable_history_snapshot  # noqa: E402
+from baseline_vc_preflight import (  # noqa: E402
+    resolve_repo_root_for_history as _resolve_repo_root_for_history,
+)
 import vc_runtime_history as _vc_runtime_history  # noqa: E402
 # Issue #2232 Scope Delta (OWNER REQUEST_CHANGES P0-1
 # https://github.com/squne121/loop-protocol/pull/2255#issuecomment-5340600982):
@@ -642,6 +645,21 @@ def run_once(
     # Step 4 (product spec check), Step 4.5 (delivery-rollup applicability),
     # and Step 5 (VC preflight) via --body-file / direct in-process reuse,
     # so no step can independently observe a different body.
+    # Issue #2254 fix_delta P0 blocker 3 (OWNER REQUEST_CHANGES
+    # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    # resolve the EFFECTIVE cwd for this whole invocation ONCE, up front --
+    # mirrors the child (`baseline_vc_preflight.py` `_main_impl()`) receiving
+    # `--cwd cwd` ONLY when `evidence_mode == "current-head"` (see the
+    # `vc_command.extend([...])` further down), otherwise falling back to
+    # its own `args.cwd or "."` default. Using this SAME value for BOTH the
+    # history-snapshot producer below AND the Step 5 `plan_digest`
+    # computation keeps `command_group_key` (and therefore `plan_digest`)
+    # convergent within this one invocation, instead of the snapshot always
+    # being produced at cwd="." while a current-head-mode plan computation
+    # used a DIFFERENT explicit `cwd`.
+    _effective_cwd_for_digest = cwd if (evidence_mode == "current-head" and cwd) else "."
+    _repo_root_for_history = _resolve_repo_root_for_history(_effective_cwd_for_digest)
+
     body_snapshot, body_snapshot_err = fetch_body_from_github(issue_number, repo)
     if body_snapshot_err:
         result["errors"].append(f"body_snapshot_fetch_error: {body_snapshot_err}")
@@ -663,9 +681,16 @@ def run_once(
             body_snapshot_file.write(body_snapshot)
 
         # Issue #2254 AC1: ONE root-owned read of the local history store
-        # for this whole invocation, reused by Step 5's plan_digest
-        # computation below and serialized to a file for the child.
-        _history_snapshot = produce_immutable_history_snapshot(body_snapshot, cwd=".")
+        # for this whole invocation, reused by Step 2 AND Step 5's
+        # plan_digest computation below and serialized to a file for both
+        # children. Issue #2254 fix_delta P0 blocker 3: produced at the
+        # SAME `_effective_cwd_for_digest` the Step 5 plan computation
+        # below uses (not an unconditional cwd="."), keeping
+        # `command_group_key` convergent for current-head-mode invocations
+        # too.
+        _history_snapshot = produce_immutable_history_snapshot(
+            body_snapshot, cwd=_effective_cwd_for_digest, repo_root=_repo_root_for_history
+        )
         if _history_snapshot is not None:
             _history_snapshot_path = body_snapshot_path + ".history-snapshot.json"
             _vc_runtime_history.write_history_snapshot_file(
@@ -723,6 +748,18 @@ def run_once(
             "--body-file",
             body_snapshot_path,
         ]
+        # Issue #2254 fix_delta P0 blocker 1 (OWNER REQUEST_CHANGES
+        # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+        # in `--mode execute`, contract_readiness_check.py ALSO runs
+        # baseline_vc_preflight.py internally (via run_baseline_vc_preflight()).
+        # Without this, that internal run independently re-read the history
+        # store at a DIFFERENT point in time than the snapshot Step 5 below
+        # uses for the SAME invocation. Passing the SAME
+        # `_history_snapshot_path` here keeps both executions of
+        # baseline_vc_preflight.py within this ONE invocation bound to the
+        # SAME immutable snapshot (Issue #2254 AC1).
+        if _history_snapshot_path is not None:
+            readiness_cmd.extend(["--history-snapshot-file", _history_snapshot_path])
 
         _readiness_started_at = time.monotonic()
         readiness_json, readiness_rc, readiness_err = _run_script(
@@ -949,12 +986,12 @@ def run_once(
         # child will actually use, instead of the function's context-free
         # defaults that previously caused `vc_plan_digest_mismatch` for
         # Allowed-Paths-sensitive directory `rg` commands.
-        _effective_cwd_for_digest = cwd if (evidence_mode == "current-head" and cwd) else "."
         _vc_plan_for_digest = compute_canonical_vc_plan(
             body_snapshot,
             cwd=_effective_cwd_for_digest,
             allowed_paths=extract_allowed_paths(body_snapshot),
             history_snapshot=_history_snapshot,
+            repo_root=_repo_root_for_history,
         )
         vc_command = [
                 sys.executable,

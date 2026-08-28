@@ -121,22 +121,36 @@ CREATE INDEX IF NOT EXISTS idx_samples_group_env_time
 def compute_command_group_key(command: str, cwd: str, *, repo_root: Optional[str] = None) -> str:
     """Grouping key for HISTORY purposes only (Issue #2254 AC2).
 
-    Derived from argv (via `shlex.split`, so option ORDER and shell syntax
-    are preserved byte-for-byte -- never normalized), the repo-relative
-    cwd, and the command "family" (argv[0]). Deliberately does NOT include
+    Derived from the RAW command TEXT (Issue #2254 fix_delta P2 OWNER
+    warning https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756:
+    `shlex.split()` is POSIX-mode QUOTE-STRIPPING, not a byte-for-byte
+    preserving normalization -- see Python's `shlex` docs -- so hashing a
+    split/rejoined argv here would silently CONFLATE two commands that
+    differ only in shell quoting, contradicting this function's own "never
+    normalized" contract; hashing the raw text avoids that entirely), the
+    repo-relative cwd (`repo_root`, when given -- Issue #2254 fix_delta P0
+    blocker 2: this is what lets history samples recorded from one
+    worktree of a repository be shared by every OTHER worktree of the SAME
+    repository, instead of fragmenting into one bucket per worktree's
+    absolute path), and the command "family" (argv[0], still derived via
+    `shlex.split` purely for FAMILY EXTRACTION -- a best-effort
+    classification label, not an identity-preserving transform of the
+    grouping key itself). Deliberately does NOT include
     `applied_timeout_ms` / runner_env_delta / state_epoch -- changing the
     resolved timeout for a command must NOT change which history bucket it
     reads from (that would make the raise-only feedback loop unable to
     ever converge: a bigger timeout would look up a different, empty,
     bucket).
     """
+    stripped_command = command.strip()
     try:
-        argv = shlex.split(command.strip())
+        argv = shlex.split(stripped_command)
+        family = argv[0] if argv else ""
     except ValueError:
-        # Unbalanced quotes etc: fall back to a whitespace split so this
-        # never raises (it is only a GROUPING key, not a security check).
-        argv = command.strip().split()
-    family = argv[0] if argv else ""
+        # Unbalanced quotes etc: family extraction only, never raises (it
+        # is only a GROUPING key, not a security check).
+        parts = stripped_command.split()
+        family = parts[0] if parts else ""
     resolved_cwd = os.path.realpath(cwd or ".")
     if repo_root:
         try:
@@ -146,7 +160,8 @@ def compute_command_group_key(command: str, cwd: str, *, repo_root: Optional[str
     else:
         rel_cwd = resolved_cwd
     payload = json.dumps(
-        {"argv": argv, "cwd": rel_cwd, "family": family}, sort_keys=True
+        {"command_text": stripped_command, "cwd": rel_cwd, "family": family},
+        sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -259,15 +274,33 @@ def _connect(store_path: Path, *, busy_timeout_seconds: float) -> sqlite3.Connec
 
 def _ensure_schema(conn: sqlite3.Connection) -> str:
     """Returns 'ok' or 'unknown_schema'. Never raises for a schema-version
-    mismatch (that is a degrade-to-fallback signal, not a fatal error)."""
+    mismatch (that is a degrade-to-fallback signal, not a fatal error).
+
+    Issue #2254 fix_delta P1 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756
+    blocker 6, AC7): the version row is seeded with `INSERT OR IGNORE`
+    (never a plain `INSERT`), then unconditionally RE-READ. Two independent
+    PROCESSES racing on a genuinely fresh (never-before-written) store can
+    both observe "no version row yet" and both attempt to seed it; a plain
+    `INSERT` would raise `sqlite3.IntegrityError` (a `sqlite3.DatabaseError`
+    subclass) for the loser, which `record_sample()` maps to
+    `store_status: "corrupt"` -- silently dropping that process's sample
+    even though the store itself is perfectly healthy. `INSERT OR IGNORE`
+    makes the loser's seed attempt a no-op instead of an error, and the
+    subsequent `SELECT` always observes SOME winner's row, so both
+    processes agree on `existing_version` and proceed to their own
+    `BEGIN IMMEDIATE` sample insert normally."""
     conn.executescript(_SCHEMA_SQL)
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('version', ?)",
+        (str(HISTORY_STORE_SCHEMA_VERSION),),
+    )
     row = conn.execute("SELECT value FROM schema_meta WHERE key = 'version'").fetchone()
     if row is None:
-        conn.execute(
-            "INSERT INTO schema_meta(key, value) VALUES ('version', ?)",
-            (str(HISTORY_STORE_SCHEMA_VERSION),),
-        )
-        return "ok"
+        # Unreachable in practice (the INSERT OR IGNORE above guarantees a
+        # row exists once this statement returns) -- kept as a defensive,
+        # never-raising fallback rather than an assertion.
+        return "unknown_schema"
     try:
         existing_version = int(row[0])
     except (TypeError, ValueError):
@@ -438,7 +471,18 @@ def compute_history_estimate(
     durations_sorted = sorted(valid_durations)
     rank_index = math.ceil(0.95 * n) - 1
     observed_p95_ms = durations_sorted[rank_index]
-    candidate_seconds = math.ceil(observed_p95_ms * HISTORY_SAFETY_MARGIN_MULTIPLIER / 1000)
+    # Issue #2254 fix_delta P0 blocker 7 (OWNER REQUEST_CHANGES
+    # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    # the Issue's fixed AC3 contract pins INTEGER arithmetic
+    # (`candidate_seconds = ceil(observed_p95_ms * 1.5 / 1000)`, computed
+    # without floating point) -- the prior `math.ceil(p95_ms * 1.5 / 1000)`
+    # used float division, which can round incorrectly for values outside
+    # float64's exact-integer range. `HISTORY_SAFETY_MARGIN_MULTIPLIER`
+    # (1.5) is applied as the exact ratio 3/2000 (`p95_ms * 1.5 / 1000 ==
+    # p95_ms * 3 / 2000`), and `ceil(a / b)` for non-negative integers is
+    # computed via the standard `(a + b - 1) // b` integer-ceiling-division
+    # identity -- never `math.ceil()` on a float.
+    candidate_seconds = (observed_p95_ms * 3 + 1999) // 2000
     return {
         "eligible_sample_count": n,
         "observed_p95_ms": observed_p95_ms,
@@ -550,17 +594,32 @@ def build_history_snapshot(
         if schema_status != "ok":
             return empty_history_snapshot(schema_status, now_utc=now_utc)
 
+        # Issue #2254 fix_delta P2 (OWNER warning
+        # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+        # `isolation_level=None` (autocommit) means each individual SELECT
+        # below would otherwise be its OWN implicit transaction, so a
+        # concurrent writer committing BETWEEN two of these SELECTs could
+        # make different pairs in the SAME "snapshot" observe different
+        # points in time. A short explicit `BEGIN DEFERRED` -> every read
+        # -> `COMMIT` gives the whole loop one single consistent read
+        # transaction (still lock-free to acquire: DEFERRED only takes a
+        # SHARED lock on first read, never blocks a concurrent writer's own
+        # `BEGIN IMMEDIATE` from starting up until this reader is done).
         records: Dict[str, Any] = {}
-        for group_key, fingerprint in pairs:
-            estimate = compute_history_estimate(conn, group_key, fingerprint, now_utc=now_utc)
-            backoff = compute_timeout_backoff_floor(
-                conn, group_key, fingerprint, now_utc=now_utc, max_seconds=max_seconds
-            )
-            records[group_key] = {
-                "environment_fingerprint": fingerprint,
-                **estimate,
-                **backoff,
-            }
+        conn.execute("BEGIN DEFERRED")
+        try:
+            for group_key, fingerprint in pairs:
+                estimate = compute_history_estimate(conn, group_key, fingerprint, now_utc=now_utc)
+                backoff = compute_timeout_backoff_floor(
+                    conn, group_key, fingerprint, now_utc=now_utc, max_seconds=max_seconds
+                )
+                records[group_key] = {
+                    "environment_fingerprint": fingerprint,
+                    **estimate,
+                    **backoff,
+                }
+        finally:
+            conn.execute("COMMIT")
 
         body = {
             "schema": HISTORY_SNAPSHOT_SCHEMA,
@@ -588,7 +647,87 @@ def build_history_snapshot(
 
 
 def write_history_snapshot_file(snapshot: Dict[str, Any], path: Path) -> None:
-    path.write_text(json.dumps(snapshot, sort_keys=True), encoding="utf-8")
+    """Issue #2254 fix_delta P1 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756
+    blocker 5 item 3): atomic temp-file + `os.replace()` write -- a plain
+    `Path.write_text()` can leave a PARTIALLY-written file visible at
+    `path` (e.g. a disk error, or an unlucky concurrent read racing the
+    write) that a child process reading via `load_history_snapshot_file()`
+    could observe mid-write. Writing to a same-directory sibling temp file
+    first and only then atomically renaming it into place (`os.replace()`
+    is atomic on POSIX for same-filesystem renames) guarantees a reader of
+    `path` always sees either the COMPLETE previous file (before this call)
+    or the COMPLETE new one -- never a truncated/partial one."""
+    tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    tmp_path.write_text(json.dumps(snapshot, sort_keys=True), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+_SNAPSHOT_RECORD_OPTIONAL_NONNEGATIVE_INT_FIELDS = (
+    "observed_p95_ms",
+    "history_candidate_seconds",
+    "previous_applied_timeout_seconds",
+    "timeout_backoff_floor_seconds",
+)
+
+
+def _is_valid_snapshot_record(record: Any) -> bool:
+    """Issue #2254 fix_delta P1 blocker 5 item 1: per-record structural
+    validation for a loaded `history_snapshot/v1` -- every field a
+    `compute_command_timeout_budget()` lookup actually reads must have the
+    right TYPE and a sane RANGE before that lookup ever touches it."""
+    if not isinstance(record, dict):
+        return False
+    if not isinstance(record.get("environment_fingerprint"), str):
+        return False
+    eligible = record.get("eligible_sample_count")
+    if not isinstance(eligible, int) or isinstance(eligible, bool) or eligible < 0:
+        return False
+    for field in _SNAPSHOT_RECORD_OPTIONAL_NONNEGATIVE_INT_FIELDS:
+        value = record.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return False
+    return True
+
+
+def _is_valid_snapshot_body(data: Any) -> bool:
+    """Issue #2254 fix_delta P1 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756
+    blocker 5 item 1): full structural validation of a `history_snapshot/v1`
+    body -- not just the top-level dict-ness/schema-name check the
+    pre-fix_delta loader performed. A malformed cross-process transport
+    (truncated write, a non-dict `records`, a `records` VALUE with the
+    wrong nested types/ranges, or a tampered/incorrect `snapshot_digest`)
+    must degrade to `empty_history_snapshot("corrupt")` -- the SAME
+    non-blocking fallback every other store-access failure mode uses
+    (AC8) -- rather than let a malformed dict reach
+    `compute_command_timeout_budget()`'s `.get()`/arithmetic and raise."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("schema") != HISTORY_SNAPSHOT_SCHEMA:
+        return False
+    if not isinstance(data.get("snapshot_as_of_utc"), str):
+        return False
+    if not isinstance(data.get("store_status"), str):
+        return False
+    records = data.get("records")
+    if not isinstance(records, dict):
+        return False
+    for group_key, record in records.items():
+        if not isinstance(group_key, str):
+            return False
+        if not _is_valid_snapshot_record(record):
+            return False
+    digest = data.get("snapshot_digest")
+    if not isinstance(digest, str) or not digest.startswith("sha256:"):
+        return False
+    body_without_digest = {k: v for k, v in data.items() if k != "snapshot_digest"}
+    expected_digest = "sha256:" + hashlib.sha256(
+        _canonicalize_snapshot_body(body_without_digest)
+    ).hexdigest()
+    return digest == expected_digest
 
 
 def load_history_snapshot_file(path: Path) -> Dict[str, Any]:
@@ -596,12 +735,15 @@ def load_history_snapshot_file(path: Path) -> Dict[str, Any]:
     `write_history_snapshot_file()`. NEVER raises for a malformed file --
     degrades to `empty_history_snapshot("corrupt")` instead (Issue #2254
     AC8: a corrupt cross-process handoff must degrade like any other store
-    failure, not crash the child)."""
+    failure, not crash the child). Issue #2254 fix_delta P1 blocker 5 item
+    1: validates the FULL structure (schema, nested record types/ranges,
+    and `snapshot_digest` integrity), not merely the top-level dict-ness/
+    schema-name check the pre-fix_delta loader performed."""
     try:
         raw = path.read_text(encoding="utf-8")
         data = json.loads(raw)
     except (OSError, json.JSONDecodeError):
         return empty_history_snapshot("corrupt")
-    if not isinstance(data, dict) or data.get("schema") != HISTORY_SNAPSHOT_SCHEMA:
+    if not _is_valid_snapshot_body(data):
         return empty_history_snapshot("corrupt")
     return data

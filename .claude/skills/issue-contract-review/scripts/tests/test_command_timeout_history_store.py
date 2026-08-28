@@ -15,9 +15,17 @@ AC6 (select with `-k one_launch_one_sample`): the SAME `execution_id`
     create a second row.
 
 AC7 (select with `-k atomic_concurrent_write`): concurrent writers (2
-    threads, each its own SQLite connection) never lose a sample, and a
-    genuinely lock-contended write degrades to a non-blocking failure
-    (bounded by `busy_timeout_seconds`) rather than hanging.
+    genuinely independent OS PROCESSES -- Issue #2254 fix_delta P1 OWNER
+    REQUEST_CHANGES https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756
+    blocker 6: the Issue's AC7 text explicitly requires "2 プロセス並行
+    INSERT", which two `threading.Thread`s inside the SAME interpreter do
+    NOT exercise -- a genuine process boundary is required to race
+    `_ensure_schema()`'s cold-start version-row seeding, which is where the
+    real defect lived) racing an INSERT against a genuinely FRESH
+    (never-before-written) store never lose a sample and leave a valid
+    schema, and a genuinely lock-contended write (single-process, via a
+    blocking connection) degrades to a non-blocking failure (bounded by
+    `busy_timeout_seconds`) rather than hanging.
 
 AC8 (select with `-k non_blocking_degradation`): every failure mode
     (missing store, locked store, corrupt store, unknown schema version,
@@ -33,9 +41,10 @@ launches a real VC subprocess -- see
 for the AC9 real-subprocess runtime verification).
 """
 
+import multiprocessing
+import os
 import sqlite3
 import sys
-import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -256,40 +265,59 @@ def test_one_launch_one_sample_distinct_execution_ids_each_stored():
 # ---------------------------------------------------------------------------
 
 
-def test_atomic_concurrent_write_two_threads_both_persist(tmp_path):
-    """Two concurrent writers (each its own connection/thread), each
-    inserting a DISTINCT execution_id, both succeed and both rows are
-    present -- SQLite's busy_timeout serializes the two short
-    transactions rather than losing either."""
+def _mp_writer_entry(store_path_str, idx, result_queue):
+    """Module-level (picklable) worker body for
+    `test_atomic_concurrent_write_two_processes_fresh_store_both_persist()`
+    -- `multiprocessing.Process(target=...)` requires a top-level function,
+    not a closure, so the real cross-PROCESS race (not merely a
+    cross-thread one) can be exercised."""
+    result = h.record_sample(
+        Path(store_path_str),
+        execution_id=h.new_execution_id(),
+        command_group_key="gk",
+        environment_fingerprint="fp",
+        status="success",
+        command_hash="abc",
+        duration_ms=1000 + idx,
+        applied_timeout_ms=150000,
+    )
+    result_queue.put((idx, result))
+
+
+def test_atomic_concurrent_write_two_processes_fresh_store_both_persist(tmp_path):
+    """Issue #2254 AC7 (fix_delta P1 OWNER blocker 6): TWO INDEPENDENT OS
+    PROCESSES (not threads) racing an INSERT against a store that has NEVER
+    been written to before -- the exact cold-start scenario where
+    `_ensure_schema()`'s version-row seeding could previously raise a
+    `sqlite3.IntegrityError` (mapped to `store_status: "corrupt"`,
+    silently dropping a sample) if two processes both observed "no version
+    row yet" at the same time. Both processes' samples must persist and the
+    schema must remain valid afterward."""
     store = tmp_path / "store.sqlite3"
-    results = {}
+    assert not store.exists()
+    ctx = multiprocessing.get_context("fork") if hasattr(os, "fork") else multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    procs = [
+        ctx.Process(target=_mp_writer_entry, args=(str(store), i, result_queue))
+        for i in range(2)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=10)
+    for p in procs:
+        assert p.exitcode == 0, f"writer process exited with {p.exitcode}"
 
-    def _writer(idx):
-        results[idx] = h.record_sample(
-            store,
-            execution_id=h.new_execution_id(),
-            command_group_key="gk",
-            environment_fingerprint="fp",
-            status="success",
-            command_hash="abc",
-            duration_ms=1000 + idx,
-            applied_timeout_ms=150000,
-        )
+    collected = dict(result_queue.get(timeout=5) for _ in range(2))
+    assert collected[0]["store_status"] == "ok", collected[0]
+    assert collected[1]["store_status"] == "ok", collected[1]
+    assert collected[0]["recorded"] is True
+    assert collected[1]["recorded"] is True
 
-    threads = [threading.Thread(target=_writer, args=(i,)) for i in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=5)
-
-    assert results[0]["store_status"] == "ok"
-    assert results[1]["store_status"] == "ok"
-    assert results[0]["recorded"] is True
-    assert results[1]["recorded"] is True
     conn = sqlite3.connect(str(store))
     count = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
     assert count == 2
-    # Schema still valid (integrity_check passes) after concurrent writes.
+    # Schema still valid (integrity_check passes) after the 2-process race.
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 

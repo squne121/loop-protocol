@@ -278,6 +278,7 @@ def compute_command_timeout_budget(
     static_policy: Dict[str, int] = STATIC_PER_COMMAND_TIMEOUT_POLICY,
     history_snapshot: Optional[Dict[str, Any]] = None,
     cwd: str = ".",
+    repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute a `command_timeout_budget/v1` entry for a single VC command.
 
@@ -341,7 +342,17 @@ def compute_command_timeout_budget(
     command_group_key: Optional[str] = None
     if history_snapshot is not None:
         history_store_status = history_snapshot.get("store_status", "unknown")
-        command_group_key = _vc_runtime_history.compute_command_group_key(command, cwd)
+        # Issue #2254 fix_delta P0 blocker 2 (OWNER REQUEST_CHANGES
+        # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+        # `repo_root`, when the caller resolved one for THIS SAME `cwd`,
+        # must be threaded into the LOOKUP key exactly the way the
+        # snapshot's own producer (`produce_immutable_history_snapshot()`)
+        # threaded it into the snapshot's `records` KEYS -- otherwise a
+        # lookup against an absolute-cwd key would never match a
+        # repo-relative one (or vice versa).
+        command_group_key = _vc_runtime_history.compute_command_group_key(
+            command, cwd, repo_root=repo_root
+        )
         history_record = (history_snapshot.get("records") or {}).get(command_group_key)
 
     history_sample_count = 0
@@ -1178,6 +1189,7 @@ def compute_canonical_vc_plan(
     cwd: str = ".",
     allowed_paths: Optional[List[str]] = None,
     history_snapshot: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute the canonical, side-effect-free VC plan for `body`.
 
@@ -1227,6 +1239,14 @@ def compute_canonical_vc_plan(
     only hashed a sorted list of small per-distinct-command digests and
     therefore missed changes to occurrence count/order, cleanup tail,
     aggregate, max_workers, body SHA, etc).
+
+    `repo_root` (Issue #2254 fix_delta P0 blocker 2/3): the SAME
+    worktree-root string (see `resolve_repo_root_for_history()` below) the
+    caller resolved for THIS SAME `cwd` and passed to
+    `produce_immutable_history_snapshot()` when building `history_snapshot`
+    -- threaded through to every `compute_command_timeout_budget()` call so
+    the LOOKUP key matches the snapshot's own `records` KEYS. `None`
+    preserves pre-fix_delta (absolute-cwd) behavior.
 
     `history_snapshot` (Issue #2254 AC1): an IMMUTABLE `history_snapshot/v1`
     dict a root-owned caller produced ONCE (see
@@ -1281,6 +1301,7 @@ def compute_canonical_vc_plan(
                     default_seconds=per_command_timeout_seconds,
                     history_snapshot=history_snapshot,
                     cwd=cwd,
+                    repo_root=repo_root,
                 )
             _budget = budgets_by_hash[command_hash]
             aggregate_timeout_seconds += (
@@ -1420,6 +1441,56 @@ def _resolve_git_common_dir(cwd: str) -> Optional[str]:
     return os.path.realpath(raw)
 
 
+def resolve_repo_root_for_history(cwd: str) -> Optional[str]:
+    """Resolve the git WORKTREE ROOT (`git rev-parse --show-toplevel`) for
+    `cwd` (Issue #2254 fix_delta P0 blocker 2/3, OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    `command_group_key` must be keyed off a REPO-RELATIVE cwd, not an
+    absolute one, so history samples recorded from one worktree of a
+    repository are shared by every OTHER worktree of the SAME repository
+    (each worktree has a DIFFERENT absolute path, but its own
+    `show-toplevel` IS its own cwd whenever VCs are run from the worktree
+    root, so both worktrees' `compute_command_group_key()` calls normalize
+    to the SAME relative "." cwd component).
+
+    Deliberately NOT `_resolve_git_common_dir()` (used ONLY to key the
+    SHARED SQLite STORE FILE itself, which for every worktree of a
+    repository points at the ONE original repository's `.git` -- conflating
+    the two would make every worktree's `command_group_key` collapse onto
+    the SAME repo_root REGARDLESS of which worktree cwd was actually used,
+    defeating the point of a repo-RELATIVE cwd).
+
+    A pure function of `cwd` (no caching): calling this twice with the
+    SAME `cwd` string always returns the SAME value, which is what lets a
+    PRODUCER (`produce_immutable_history_snapshot()`) and a CONSUMER
+    (`compute_canonical_vc_plan()`/`compute_command_timeout_budget()`) --
+    even in SEPARATE processes across a subprocess boundary -- converge on
+    the SAME `command_group_key` as long as they are given the SAME `cwd`
+    value, without needing any explicit cross-process handoff of
+    `repo_root` itself.
+
+    Returns `None` (never raises) if `cwd` is not inside a git working tree
+    or `git` itself is unavailable; callers pass `None` straight through to
+    `compute_command_group_key(..., repo_root=None)`, which degrades to its
+    pre-fix_delta absolute-cwd behavior for that one command (a narrower,
+    non-shared -- but still internally self-consistent -- history bucket)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+    return os.path.realpath(raw)
+
+
 def _distinct_command_texts_from_body(body: str) -> List[str]:
     """Every DISTINCT (first-occurrence-ordered) VC command text in
     `body`'s `## Verification Commands` section -- the same population
@@ -1453,6 +1524,7 @@ def produce_immutable_history_snapshot(
     *,
     cwd: str = ".",
     max_seconds: int = MAX_PER_COMMAND_TIMEOUT_SECONDS,
+    repo_root: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Root-owned, SINGLE read of the local per-repository history store
     for every DISTINCT command text in `body` (Issue #2254 AC1). Callers
@@ -1496,7 +1568,15 @@ def produce_immutable_history_snapshot(
         return None
     pairs: List[Tuple[str, str]] = []
     for command in _distinct_command_texts_from_body(body):
-        group_key = _vc_runtime_history.compute_command_group_key(command, cwd)
+        # Issue #2254 fix_delta P0 blocker 2 (OWNER REQUEST_CHANGES
+        # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+        # `repo_root` (when the caller resolved one via
+        # `resolve_repo_root_for_history(cwd)`) must be threaded into the
+        # SAME key computation `compute_command_timeout_budget()`'s LOOKUP
+        # uses, so producer and consumer agree on where evidence lives.
+        group_key = _vc_runtime_history.compute_command_group_key(
+            command, cwd, repo_root=repo_root
+        )
         fingerprint = _vc_runtime_history.compute_environment_fingerprint(
             _command_family(command)
         )
@@ -1517,6 +1597,7 @@ def record_command_execution_sample(
     stderr: str,
     duration_ms: Optional[int],
     applied_timeout_seconds: int,
+    repo_root: Optional[str] = None,
 ) -> None:
     """Best-effort, NEVER-raising history sample recording for ONE REAL
     subprocess launch (Issue #2254 AC6: one launch -> one `record_sample()`
@@ -1542,7 +1623,13 @@ def record_command_execution_sample(
         if git_common_dir is None:
             return
         store_path = _vc_runtime_history.resolve_store_path(git_common_dir)
-        group_key = _vc_runtime_history.compute_command_group_key(command, cwd)
+        # Issue #2254 fix_delta P0 blocker 2: same repo_root-threaded key
+        # as the snapshot producer/lookup above, so a WRITE from this
+        # worktree lands under the SAME bucket a READ from any other
+        # worktree of the SAME repository will look up.
+        group_key = _vc_runtime_history.compute_command_group_key(
+            command, cwd, repo_root=repo_root
+        )
         fingerprint = _vc_runtime_history.compute_environment_fingerprint(
             _command_family(command)
         )
@@ -5527,14 +5614,42 @@ def _main_impl() -> int:
     # --history-snapshot-file when a parent process already produced it --
     # both keep plan_digest convergent with whatever the caller/child
     # agreed on).
+    # Issue #2254 fix_delta P0 blocker 2/3 (OWNER REQUEST_CHANGES
+    # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    # `_repo_root_for_history` is resolved EXACTLY ONCE from `args.cwd` and
+    # reused for BOTH producing/loading the snapshot AND computing the
+    # plan below -- a caller/parent process resolving `repo_root` from the
+    # SAME `--cwd` value independently converges on the SAME string (it is
+    # a pure function of `cwd`), so `command_group_key` stays convergent
+    # across this subprocess boundary without any extra handoff.
     _history_snapshot: Optional[Dict[str, Any]] = None
+    _repo_root_for_history: Optional[str] = None
     if not args.no_history_estimator:
         if args.history_snapshot_file:
+            _repo_root_for_history = resolve_repo_root_for_history(args.cwd)
             _history_snapshot = _vc_runtime_history.load_history_snapshot_file(
                 Path(args.history_snapshot_file)
             )
-        else:
-            _history_snapshot = produce_immutable_history_snapshot(body, cwd=args.cwd)
+        elif not (
+            os.environ.get("PYTEST_CURRENT_TEST")
+            and not os.environ.get("VC_RUNTIME_HISTORY_STORE_PATH")
+        ):
+            # This mirrors produce_immutable_history_snapshot()'s OWN
+            # internal test-safety guard (see its docstring) -- resolving
+            # `repo_root` here shells out to a REAL `git` subprocess, which
+            # must be skipped in the SAME cases that guard already skips,
+            # not merely inside that function, so tests that monkeypatch
+            # this module's OWN `subprocess.Popen` for unrelated
+            # VC-execution assertions never observe an unexpected extra
+            # `git rev-parse --show-toplevel` call.
+            _repo_root_for_history = resolve_repo_root_for_history(args.cwd)
+            _history_snapshot = produce_immutable_history_snapshot(
+                body, cwd=args.cwd, repo_root=_repo_root_for_history
+            )
+        # else: pytest test-safety guard -- `_history_snapshot` /
+        # `_repo_root_for_history` stay None (never read downstream: a
+        # `None` `_history_snapshot` short-circuits every
+        # `repo_root`-dependent lookup in `compute_command_timeout_budget()`).
 
     try:
         _vc_plan = compute_canonical_vc_plan(
@@ -5543,6 +5658,7 @@ def _main_impl() -> int:
             cwd=args.cwd,
             allowed_paths=allowed_paths_from_body,
             history_snapshot=_history_snapshot,
+            repo_root=_repo_root_for_history,
         )
     except CommandTimeoutExceedsPolicyError as _budget_exc:
         return _emit_blocked_policy_error(
@@ -5678,6 +5794,7 @@ def _main_impl() -> int:
                 stderr=_stderr,
                 duration_ms=_duration_ms,
                 applied_timeout_seconds=_effective_timeout_for(job["command"]),
+                repo_root=_repo_root_for_history,
             )
         # P0-2: fail-closed quiet-success -- a pure observation VC that exits
         # 0 but leaves non-empty stderr is not a trustworthy silent pass.
@@ -5720,6 +5837,7 @@ def _main_impl() -> int:
                     stderr=_stderr,
                     duration_ms=_duration_ms,
                     applied_timeout_seconds=_effective_timeout_for(job["command"]),
+                    repo_root=_repo_root_for_history,
                 )
             _outcome = {
                 "exit_code": _exit_code,

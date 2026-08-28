@@ -113,11 +113,27 @@ def _run_baseline_vc_preflight_subprocess(body_file: Path, cwd: Path, store_path
 def test_production_wiring_real_launch_then_next_invocation_budget_changes(tmp_path, monkeypatch):
     """AC9 positive: one REAL subprocess launch (via the actual
     `baseline_vc_preflight.py` production entrypoint) records a genuine
-    sample; after enough real samples accumulate, a SUBSEQUENT production
-    `compute_canonical_vc_plan()` call (fed the store's own snapshot)
-    resolves a per-command budget that has changed because of that
-    history -- not a synthetic snapshot, but the ACTUAL store this test
-    just wrote real launches into."""
+    sample; after enough real samples accumulate, a SECOND REAL subprocess
+    launch of the SAME production CLI entrypoint -- under NORMAL production
+    defaults (no `--timeout-seconds` override, no artificially-lowered
+    `per_command_timeout_seconds`) -- resolves a per-command budget that has
+    genuinely CHANGED (raised, to `source: history_estimate`) because of
+    that recorded history, proving the wiring is real end-to-end production
+    wiring under REALISTIC defaults, not merely a unit-tested pure function
+    exercised with a synthetic low static base.
+
+    Issue #2254 fix_delta P0 blocker 8 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    the pre-fix_delta version of this test seeded `duration_ms=60000`
+    samples and then called `compute_canonical_vc_plan()` DIRECTLY with a
+    deliberately-low `per_command_timeout_seconds=1`, which only proved the
+    helper function COULD select `history_estimate` against an artificial
+    1s static base -- never that the SAME candidate would win against the
+    REAL production static_fallback (150s). This version seeds
+    `duration_ms=120000` samples (candidate
+    `ceil(120000*1.5/1000)=180s`, which STRICTLY exceeds the normal 150s
+    static_fallback base) and observes the SECOND real subprocess launch's
+    OWN JSON output under fully normal defaults."""
     _skip_if_environment_unavailable()
 
     repo_root = _SCRIPTS_DIR.parents[3]  # cwd must be inside a real git repo
@@ -128,11 +144,14 @@ def test_production_wiring_real_launch_then_next_invocation_budget_changes(tmp_p
     monkeypatch.setenv("VC_RUNTIME_HISTORY_STORE_PATH", str(store_path))
 
     # REAL launch #1: this IS "実 command を1回起動し" (AC9) -- the actual
-    # baseline_vc_preflight.py subprocess, not a mock.
+    # baseline_vc_preflight.py subprocess, not a mock. Under normal
+    # production defaults (no history yet), this resolves via
+    # static_fallback (150s).
     result_1 = _run_baseline_vc_preflight_subprocess(body_file, repo_root, store_path)
     assert result_1["results"], result_1
     budget_1 = result_1["results"][0]["timeout_provenance"]
-    assert budget_1["source"] in ("static_fallback", "history_estimate")
+    assert budget_1["source"] == "static_fallback", budget_1
+    assert budget_1["timeout_seconds"] == m.DEFAULT_PER_COMMAND_TIMEOUT_SECONDS, budget_1
 
     # Confirm the write path actually persisted a real sample (production
     # wiring, not a no-op).
@@ -143,12 +162,19 @@ def test_production_wiring_real_launch_then_next_invocation_budget_changes(tmp_p
 
     # Seed 4 MORE samples directly via the SAME production
     # `vc_runtime_history.record_sample()` function (not a reimplementation)
-    # using the SAME identity the real launch above used, so the
-    # `nearest_rank_v1` minimum-sample-count (5) is met without needing 5
-    # separate real subprocess round-trips in this test (the FIRST sample
-    # above is what makes this genuinely "one real launch -> one recorded
-    # sample -> next invocation sees it").
-    group_key = h.compute_command_group_key(_REAL_COMMAND, str(repo_root))
+    # using the SAME repo_root-normalized identity the real launch above
+    # resolves internally (Issue #2254 fix_delta P0 blocker 2/3:
+    # `baseline_vc_preflight.py`'s own executor resolves `repo_root` via
+    # `resolve_repo_root_for_history(args.cwd)` -- mirrored here exactly so
+    # these seeded samples land in the SAME bucket the real launches read
+    # from/write to), so the `nearest_rank_v1` minimum-sample-count (5) is
+    # met without needing 5 separate real subprocess round-trips (the FIRST
+    # sample above is what makes this genuinely "one real launch -> one
+    # recorded sample -> next invocation sees it").
+    resolved_repo_root = m.resolve_repo_root_for_history(str(repo_root))
+    group_key = h.compute_command_group_key(
+        _REAL_COMMAND, str(repo_root), repo_root=resolved_repo_root
+    )
     fingerprint = h.compute_environment_fingerprint(m._command_family(_REAL_COMMAND))
     for i in range(4):
         outcome = h.record_sample(
@@ -157,40 +183,29 @@ def test_production_wiring_real_launch_then_next_invocation_budget_changes(tmp_p
             command_group_key=group_key,
             environment_fingerprint=fingerprint,
             status="success",
+            # 120s -> ceil(120000*1.5/1000) = 180s candidate, which
+            # STRICTLY exceeds the NORMAL production static_fallback base
+            # (DEFAULT_PER_COMMAND_TIMEOUT_SECONDS=150s) -- demonstrating
+            # the budget change under REALISTIC defaults (Issue #2254
+            # fix_delta P0 blocker 8), not an artificially low
+            # per_command_timeout_seconds override.
             command_hash=m.compute_command_hash(_REAL_COMMAND),
-            duration_ms=60000,  # 60s -> *1.5 = 90s candidate, above static_fallback? no: 150 default
+            duration_ms=120000,
             applied_timeout_ms=150000,
         )
         assert outcome["recorded"], outcome
 
-    # REAL production plan computation, low per_command_timeout_seconds so
-    # the history candidate (ceil(60000*1.5/1000) = 90s) demonstrably wins
-    # over a deliberately-low static_base (1s) -- proving the budget
-    # CHANGES between invocations because of recorded history.
-    snapshot = m.produce_immutable_history_snapshot(_BODY, cwd=str(repo_root))
-    assert snapshot["store_status"] == "ok"
-    plan_low_default = m.compute_canonical_vc_plan(
-        _BODY, cwd=str(repo_root), per_command_timeout_seconds=1, history_snapshot=snapshot
-    )
-    budget_low_default = plan_low_default["command_budgets"][0]
-    assert budget_low_default["source"] == "history_estimate"
-    assert budget_low_default["timeout_seconds"] == 90
-    assert budget_low_default["sample_count"] >= 5
-
-    # And WITHOUT history (None snapshot), the SAME low default resolves
-    # to the tiny static_fallback value -- demonstrating the "budget
-    # CHANGES because history snapshot was used" contrast required by AC9.
-    plan_without_history = m.compute_canonical_vc_plan(
-        _BODY, cwd=str(repo_root), per_command_timeout_seconds=1, history_snapshot=None
-    )
-    budget_without_history = plan_without_history["command_budgets"][0]
-    assert budget_without_history["source"] == "static_fallback"
-    # MIN_PER_COMMAND_TIMEOUT_SECONDS (30) floors the deliberately-low
-    # per_command_timeout_seconds=1 default -- still far below the
-    # history-derived 90s, so the contrast this assertion checks for
-    # still holds.
-    assert budget_without_history["timeout_seconds"] == m.MIN_PER_COMMAND_TIMEOUT_SECONDS
-    assert budget_without_history["timeout_seconds"] != budget_low_default["timeout_seconds"]
+    # REAL launch #2: the SAME production baseline_vc_preflight.py CLI
+    # entrypoint, under FULLY NORMAL production defaults (no
+    # --timeout-seconds override at all) -- proving the budget genuinely
+    # CHANGES between invocations because of the recorded history, under
+    # the SAME defaults a real caller uses in production.
+    result_2 = _run_baseline_vc_preflight_subprocess(body_file, repo_root, store_path)
+    assert result_2["results"], result_2
+    budget_2 = result_2["results"][0]["timeout_provenance"]
+    assert budget_2["source"] == "history_estimate", budget_2
+    assert budget_2["timeout_seconds"] == 180, budget_2
+    assert budget_2["timeout_seconds"] != budget_1["timeout_seconds"]
 
 
 def test_production_wiring_cold_start_missing_store_degrades_non_blocking(tmp_path, monkeypatch):

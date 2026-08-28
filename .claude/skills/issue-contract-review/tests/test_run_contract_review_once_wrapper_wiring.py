@@ -508,3 +508,75 @@ class TestCommandTimeoutBudgetWiringIssue2233:
             b["timeout_seconds"] + b["cleanup_tail_seconds"] for b in plan["command_budgets"]
         )
         assert plan["aggregate_timeout_seconds"] == expected_sum
+
+
+# ---------------------------------------------------------------------------
+# Issue #2254 fix_delta P0 blocker 1: Step 2 (contract_readiness_check.py)
+# receives the SAME --history-snapshot-file Step 5 (baseline_vc_preflight.py
+# directly) receives.
+# ---------------------------------------------------------------------------
+
+
+class TestHistorySnapshotPropagationToStep2Blocker1:
+    """Issue #2254 fix_delta P0 blocker 1 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    Step 2 (contract_readiness_check.py, which in --mode execute ALSO runs
+    baseline_vc_preflight.py internally via run_baseline_vc_preflight())
+    must receive the SAME --history-snapshot-file Step 5
+    (baseline_vc_preflight.py invoked directly) receives -- previously
+    only Step 5 got it, so the two internal baseline_vc_preflight.py
+    executions within ONE run_once() invocation could observe DIFFERENT
+    points-in-time of the history store."""
+
+    def test_step2_and_step5_receive_the_same_history_snapshot_file(self, tmp_path, monkeypatch):
+        store_path = tmp_path / "wrapper-wiring-store.sqlite3"
+        # Bypasses produce_immutable_history_snapshot()'s pytest test-safety
+        # guard (PYTEST_CURRENT_TEST set + no explicit override -> None)
+        # so this invocation actually produces a (here: store_status
+        # "missing", since the file does not exist yet) non-None snapshot
+        # dict, exercising the SAME propagation path a real invocation
+        # with an existing store would.
+        monkeypatch.setenv("VC_RUNTIME_HISTORY_STORE_PATH", str(store_path))
+
+        readiness_json = _make_readiness_json("go")
+        product_spec_json = _make_product_spec_json("pass")
+        vc_json = _make_vc_preflight_json("pass")
+
+        run_script_iter = iter(
+            [
+                (readiness_json, 0, None),
+                (product_spec_json, 0, None),
+                (vc_json, 0, None),
+            ]
+        )
+        captured_calls = []
+
+        def _fake_run_script(cmd, *args, **kwargs):
+            captured_calls.append(cmd)
+            return next(run_script_iter)
+
+        with patch.object(_rcr_mod, "_run_script", side_effect=_fake_run_script):
+            with patch.object(_rcr_mod, "_run_shell_script", return_value=(0, "OK", "")):
+                with patch.object(_rcr_mod, "check_existing_go_comment", return_value=(None, None)):
+                    with patch.object(
+                        _rcr_mod, "_run_declared_path_overlap_check", return_value={"disjoint": True}
+                    ):
+                        result = run_once(_ISSUE_NUMBER, _REPO, skip_idempotency_check=True)
+
+        assert result["status"] == "go"
+
+        # readiness (Step 2) is the 1st _run_script call, vc_preflight
+        # (Step 5) is the 3rd (readiness, product_spec, vc_preflight).
+        readiness_cmd = captured_calls[0]
+        vc_preflight_cmd = captured_calls[2]
+
+        assert "--history-snapshot-file" in readiness_cmd, readiness_cmd
+        assert "--history-snapshot-file" in vc_preflight_cmd, vc_preflight_cmd
+
+        readiness_snapshot_path = readiness_cmd[
+            readiness_cmd.index("--history-snapshot-file") + 1
+        ]
+        vc_preflight_snapshot_path = vc_preflight_cmd[
+            vc_preflight_cmd.index("--history-snapshot-file") + 1
+        ]
+        assert readiness_snapshot_path == vc_preflight_snapshot_path

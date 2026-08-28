@@ -440,3 +440,55 @@ def test_timeout_censoring_cancelled_and_failed_never_pollute_percentile():
     assert result["eligible_sample_count"] == 5
     assert result["observed_p95_ms"] < 999999
     assert result["observed_p95_ms"] < 888888
+
+
+# ---------------------------------------------------------------------------
+# Issue #2254 fix_delta P0 blocker 2: repo_root normalizes command_group_key
+# across worktrees of the SAME repository.
+# ---------------------------------------------------------------------------
+
+
+def test_identity_separation_repo_root_normalizes_cwd_across_worktrees():
+    """Issue #2254 fix_delta P0 blocker 2 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    two DIFFERENT absolute worktree paths (simulating two separate
+    `git worktree` checkouts of the SAME repository) produce the SAME
+    `command_group_key` when each is given its OWN cwd as its `repo_root`
+    (the case where a VC is run from a worktree's OWN root) -- proving
+    history recorded from one worktree is shared by another, instead of
+    fragmenting into one bucket per worktree's absolute path (the
+    pre-fix_delta bug: a bare `compute_command_group_key(cmd, cwd)` call
+    with no `repo_root` hashed the ABSOLUTE `realpath(cwd)` into the key,
+    so every worktree started from a permanently-empty history bucket)."""
+    worktree_a = "/tmp/loop-protocol-worktree-issue-a"
+    worktree_b = "/tmp/loop-protocol-worktree-issue-b"
+
+    key_from_worktree_a = h.compute_command_group_key(
+        "pnpm test", worktree_a, repo_root=worktree_a
+    )
+    key_from_worktree_b = h.compute_command_group_key(
+        "pnpm test", worktree_b, repo_root=worktree_b
+    )
+    assert key_from_worktree_a == key_from_worktree_b
+
+    # Without repo_root (pre-fix_delta behavior), the two DIFFERENT
+    # absolute paths produce DIFFERENT keys -- confirming this test
+    # actually exercises the normalization, not an accidental coincidence.
+    key_without_repo_root_a = h.compute_command_group_key("pnpm test", worktree_a)
+    key_without_repo_root_b = h.compute_command_group_key("pnpm test", worktree_b)
+    assert key_without_repo_root_a != key_without_repo_root_b
+
+
+def test_identity_separation_repo_root_normalized_key_still_distinguishes_subdirectory_cwd():
+    """A cwd that is a SUBDIRECTORY of `repo_root` (not the root itself)
+    still normalizes to a repo-RELATIVE (non-".") value distinct from the
+    root cwd's "." -- `repo_root` normalizes the ABSOLUTE PREFIX away, it
+    does not collapse every cwd under a repository into one bucket."""
+    repo_root = "/tmp/loop-protocol-worktree-issue-a"
+    subdirectory_cwd = "/tmp/loop-protocol-worktree-issue-a/.claude/skills"
+
+    key_at_root = h.compute_command_group_key("pnpm test", repo_root, repo_root=repo_root)
+    key_at_subdirectory = h.compute_command_group_key(
+        "pnpm test", subdirectory_cwd, repo_root=repo_root
+    )
+    assert key_at_root != key_at_subdirectory
