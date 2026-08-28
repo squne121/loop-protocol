@@ -202,6 +202,12 @@ _derive_review_budget = _contract_readiness_check.derive_review_budget
 import baseline_vc_preflight as _baseline_vc_preflight  # noqa: E402
 
 _compute_canonical_vc_plan = _baseline_vc_preflight.compute_canonical_vc_plan
+# Issue #2254 AC1: this pipeline is a root-owned producer of the immutable
+# history_snapshot/v1 for its OWN invocation-local `body`, built ONCE
+# (see the `_vc_plan = _compute_canonical_vc_plan(...)` call below) and
+# threaded through -- it never re-derives its own snapshot independently
+# per call within a single pipeline invocation.
+_produce_immutable_history_snapshot = _baseline_vc_preflight.produce_immutable_history_snapshot
 # Issue #2232 Scope Delta P0-1 (OWNER REQUEST_CHANGES
 # https://github.com/squne121/loop-protocol/pull/2255#issuecomment-5340600982):
 # reuse the SAME `extract_allowed_paths()` helper `baseline_vc_preflight.py`'s
@@ -1180,8 +1186,11 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         # `args.cwd or "."` default and `allowed_paths_from_body`), keeping
         # this pipeline's canonical plan (and any digest derived from it
         # downstream) convergent with the other canonical-plan consumers.
+        # Issue #2254 AC1: ONE root-owned read of the local history store
+        # for this invocation-local plan.
+        _history_snapshot = _produce_immutable_history_snapshot(body, cwd=".")
         _vc_plan = _compute_canonical_vc_plan(
-            body, cwd=".", allowed_paths=_extract_allowed_paths(body)
+            body, cwd=".", allowed_paths=_extract_allowed_paths(body), history_snapshot=_history_snapshot
         )
         # Issue #2207 OWNER P1-3 (PR #2221 REQUEST_CHANGES): `command_occurrence_count`,
         # per the Issue #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`

@@ -67,7 +67,14 @@ from baseline_vc_preflight import (  # noqa: E402
     extract_allowed_paths as _extract_allowed_paths,
     extract_verification_commands_section,
     run_subprocess_with_cooperative_supervisor as _run_subprocess_with_cooperative_supervisor,
+    # Issue #2254 AC1: this parent process is a root-owned producer of the
+    # immutable history_snapshot/v1 for its OWN `body`, built ONCE and
+    # reused for every compute_canonical_vc_plan() call this module makes
+    # for that SAME body (including the digest passed to the child
+    # subprocess below), keeping plan_digest convergent.
+    produce_immutable_history_snapshot as _produce_immutable_history_snapshot,
 )
+import vc_runtime_history as _vc_runtime_history  # noqa: E402
 from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
 from prose_boundary_policy import (  # noqa: E402
     BLOCK_KIND_CODE_FENCE,
@@ -725,7 +732,9 @@ def map_validate_errors_to_readiness_errors(validate_result: dict) -> list[dict]
 # ---------------------------------------------------------------------------
 
 
-def compute_invocation_local_baseline_timeout(body: str) -> int:
+def compute_invocation_local_baseline_timeout(
+    body: str, *, history_snapshot: "Optional[Dict[str, Any]]" = None
+) -> int:
     """Issue #2207: derive the `baseline_vc_preflight.py` aggregate wrapper
     timeout for THIS specific pinned `body`, from the canonical VC plan's
     `launch_upper_bound` -- instead of the fixed
@@ -733,6 +742,10 @@ def compute_invocation_local_baseline_timeout(body: str) -> int:
     remains the `N<=2` compatibility value used when this function is not
     invoked, e.g. by any external importer still reading the module
     constant directly).
+
+    `history_snapshot` (Issue #2254 AC1): an immutable snapshot the CALLER
+    already produced ONCE for this SAME body -- passed straight through to
+    `compute_canonical_vc_plan()`. `None` preserves pre-#2254 behavior.
 
     Raises `VerificationBudgetExceedsPolicyError` (non-retryable) if the
     plan's `launch_upper_bound` exceeds the fixed policy ceiling -- BEFORE
@@ -746,7 +759,7 @@ def compute_invocation_local_baseline_timeout(body: str) -> int:
     # for its OWN `args.cwd or "."` default and `allowed_paths_from_body`,
     # keeping `plan_digest` convergent across the process boundary.
     plan = _compute_canonical_vc_plan(
-        body, cwd=".", allowed_paths=_extract_allowed_paths(body)
+        body, cwd=".", allowed_paths=_extract_allowed_paths(body), history_snapshot=history_snapshot
     )
     # Issue #2207 OWNER P1-3: `command_occurrence_count`, per the Issue
     # #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`.
@@ -799,8 +812,16 @@ def run_baseline_vc_preflight(
     # plan exceeds the policy ceiling is rejected here (typed,
     # non-retryable `runtime_error` / `verification_budget_exceeds_policy`)
     # rather than ever spawning `baseline_vc_preflight.py`.
+    # Issue #2254 AC1: ONE root-owned read of the local history store for
+    # this whole invocation (both compute_invocation_local_baseline_timeout()
+    # below AND the `_plan_for_digest` computation further down reuse THIS
+    # SAME snapshot object, keeping plan_digest convergent across both
+    # in-process calls AND the child subprocess boundary).
+    _history_snapshot = _produce_immutable_history_snapshot(body, cwd=".")
     try:
-        aggregate_timeout_seconds: float = compute_invocation_local_baseline_timeout(body)
+        aggregate_timeout_seconds: float = compute_invocation_local_baseline_timeout(
+            body, history_snapshot=_history_snapshot
+        )
     except (
         VerificationBudgetExceedsPolicyError,
         AggregateTimeoutExceedsPolicyError,
@@ -834,6 +855,21 @@ def run_baseline_vc_preflight(
     ) as tf:
         tf.write(body)
         tmp_path = tf.name
+
+    # Issue #2254 AC1: serialize the SAME `_history_snapshot` this function
+    # already produced to a file so the child subprocess below loads the
+    # EXACT same snapshot via `--history-snapshot-file` instead of
+    # re-reading the store itself (which could observe a different result
+    # if a concurrent writer touched the store between this parent's read
+    # and the child's own).
+    # Issue #2254: `_history_snapshot` may be `None` (test-safety guard,
+    # or a caller-disabled history feature) -- only serialize/propagate a
+    # REAL snapshot; a `None` value must behave identically to every
+    # pre-#2254 call site (no --history-snapshot-file argv at all).
+    _history_snapshot_path: Optional[str] = None
+    if _history_snapshot is not None:
+        _history_snapshot_path = tmp_path + ".history-snapshot.json"
+        _vc_runtime_history.write_history_snapshot_file(_history_snapshot, Path(_history_snapshot_path))
 
     try:
         # Issue #2165 P1-1(c) / Issue #2207: the aggregate wrapper timeout is
@@ -895,18 +931,21 @@ def run_baseline_vc_preflight(
         # that exact classification context so `plan_digest` stays
         # convergent across this subprocess boundary.
         _plan_for_digest = _compute_canonical_vc_plan(
-            body, cwd=".", allowed_paths=_extract_allowed_paths(body)
+            body, cwd=".", allowed_paths=_extract_allowed_paths(body), history_snapshot=_history_snapshot
         )
+        _vc_command_argv = [
+            sys.executable,
+            str(_BASELINE_VC_PREFLIGHT_PY),
+            "--strict",
+            "--body-file",
+            tmp_path,
+            "--expected-plan-digest",
+            _plan_for_digest["plan_digest"],
+        ]
+        if _history_snapshot_path is not None:
+            _vc_command_argv.extend(["--history-snapshot-file", _history_snapshot_path])
         supervised = _run_subprocess_with_cooperative_supervisor(
-            [
-                sys.executable,
-                str(_BASELINE_VC_PREFLIGHT_PY),
-                "--strict",
-                "--body-file",
-                tmp_path,
-                "--expected-plan-digest",
-                _plan_for_digest["plan_digest"],
-            ],
+            _vc_command_argv,
             timeout_seconds=aggregate_timeout_seconds,
             env=_child_env,
         )
@@ -966,6 +1005,11 @@ def run_baseline_vc_preflight(
             os.unlink(tmp_path)
         except OSError:
             pass
+        if _history_snapshot_path is not None:
+            try:
+                os.unlink(_history_snapshot_path)
+            except OSError:
+                pass
 
 
 # Status mapping contract:
