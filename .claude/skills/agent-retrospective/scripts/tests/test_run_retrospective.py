@@ -181,6 +181,62 @@ def _new_candidate(candidate_id: str = "cand-new-0001", rule_id: str = "example_
     return _canonical_candidate(candidate_id=candidate_id, rule_id=rule_id, evaluations=[evaluation])
 
 
+#: Issue #2362 Scope Reframe: `run_evaluation()` no longer accepts a
+#: canonical (`finding_contract`-nested) candidate shape as evaluator
+#: output -- the evaluator's wire payload is now judgment-only (flat
+#: `candidate_id`/`title`/`description`/`claim_class`/`subject_ref`/
+#: `rule_id`/`evidence_refs`). Every direct `rr.run_evaluation()` call site
+#: in this file that needs a non-empty `candidate_records` entry now uses
+#: this helper (test callers that don't care about candidate content pass
+#: an empty `candidate_records` list instead).
+def _judgment_from_key(
+    key: dict[str, Any],
+    *,
+    candidate_id: str,
+    title: str = "judgment title",
+    description: str = "judgment description",
+    evidence_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate_id,
+        "title": title,
+        "description": description,
+        "claim_class": key["claim_class"],
+        "subject_ref": key["subject_ref"],
+        "rule_id": key["rule_id"],
+        "evidence_refs": evidence_refs if evidence_refs is not None else [],
+    }
+
+
+#: Issue #2362 Scope Reframe: a judgment-only `evidence_refs[]` entry
+#: matching the single "retrospective-runtime-observer" (`source_type:
+#: "runtime"`) most `execute_run()`-level tests in this file wire as their
+#: only observer -- `_enrich_evidence_ref` recomputes `projection_digest`
+#: from that observer's REAL `findings[]` (nonempty per `_make_observer_invoke`),
+#: so this ref survives enrichment. Needed whenever the resulting
+#: classification is `"classified"` (the canonical schema requires
+#: `evidence_refs` `minItems: 1` in that branch) -- omit for `indeterminate`
+#: expectations, which impose no such requirement.
+_RUNTIME_EVIDENCE_REFS = [
+    {
+        "ref_type": "runtime_receipt",
+        "source_id": "runtime",
+        "resource_identity": "observer:retrospective-runtime-observer",
+    }
+]
+
+
+#: Issue #2362 Scope Reframe: `run_evaluation()` now requires
+#: `previous_state` (a `PreviousStateResult`) -- this is the fixture value
+#: every direct `rr.run_evaluation()` call site in this file that doesn't
+#: specifically exercise `PreviousStateProvider`/`compute_delta()` wiring
+#: passes (matches the pre-existing default `FixturePreviousStateProvider(
+#: fixtures={})` -> `"no_history"` behavior byte-for-byte).
+_EMPTY_PREVIOUS_STATE = rr.PreviousStateResult(
+    status="no_history", previous_run_ref=None, candidates=[], read_version=None
+)
+
+
 # ---------------------------------------------------------------------------
 # AC7: wire contract dataclass round-trip
 # ---------------------------------------------------------------------------
@@ -441,11 +497,16 @@ def _make_observer_invoke(run_id: str, digest: str, call_log: list[str], base_sh
 def _make_evaluator_invoke(run_id: str, digest: str, call_log: list[str]):
     def _invoke(request: rr.EvaluatorRequest) -> rr.AgentInvocationResult:
         call_log.append("evaluator")
+        # Issue #2362 Scope Reframe: an empty candidate_records list is a
+        # judgment-only-wire-shape-compatible fake evaluator response too
+        # (no per-candidate fields to satisfy) -- this fake exists only to
+        # exercise observer-wave-before-evaluator call ordering / no-
+        # mutation-side-effect assertions, not candidate content.
         evaluation = rr.Evaluation(
             run_id=run_id,
             base_sha=_FULL_SHA,
             source_set_digest=digest,
-            candidate_records=[_new_candidate()],
+            candidate_records=[],
             evidence_ref=f"evidence://{run_id}/evaluation",
         )
         return _ok_agent_result(json.loads(evaluation.to_wire()))
@@ -476,6 +537,7 @@ def _run_full_pipeline(call_log: list[str]) -> tuple[rr.RunContext, rr.SourcePla
         evaluator_request,
         invoke_evaluator=_make_evaluator_invoke(ctx.run_id, plan.source_set_digest, call_log),
         repository_id=_REPOSITORY_ID,
+        previous_state=_EMPTY_PREVIOUS_STATE,
     )
     publish_request = rr.finalize(
         ctx,
@@ -529,7 +591,11 @@ def test_evaluator_waits_for_observer_never_invoked_on_observer_failure() -> Non
         finding_sets = rr.build_finding_sets(ctx, plan, bundles)
         evaluator_request = rr.prepare_evaluator_request(ctx, plan, finding_sets)
         rr.run_evaluation(
-            ctx, evaluator_request, invoke_evaluator=_evaluator_invoke_should_never_run, repository_id=_REPOSITORY_ID
+            ctx,
+            evaluator_request,
+            invoke_evaluator=_evaluator_invoke_should_never_run,
+            repository_id=_REPOSITORY_ID,
+            previous_state=_EMPTY_PREVIOUS_STATE,
         )
 
     assert call_log == ["observer:retrospective-runtime-observer"]
@@ -572,7 +638,13 @@ def test_evaluator_receives_typed_projection_only() -> None:
         )
         return _ok_agent_result(json.loads(evaluation.to_wire()))
 
-    rr.run_evaluation(ctx, evaluator_request, invoke_evaluator=_capturing_invoke, repository_id=_REPOSITORY_ID)
+    rr.run_evaluation(
+        ctx,
+        evaluator_request,
+        invoke_evaluator=_capturing_invoke,
+        repository_id=_REPOSITORY_ID,
+        previous_state=_EMPTY_PREVIOUS_STATE,
+    )
 
     # THEN the evaluator request never has an `evidence_ref` or raw-evidence-shaped field
     payload = json.loads(captured["wire_text"])
@@ -987,15 +1059,19 @@ def test_executable_entrypoint_collectors_to_publish_request(tmp_path: Path) -> 
         call_log.append(agent_name)
         if agent_name == "retrospective-evaluator":
             evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
-            evaluation = rr.Evaluation(
-                run_id=evaluator_request.run_id,
-                base_sha=_FULL_SHA,
-                source_set_digest=evaluator_request.source_set_digest,
-                candidate_records=[_new_candidate()],
-                evidence_ref="e",
-            )
+            # Issue #2362 Scope Reframe: candidate content is not asserted
+            # by this test -- an empty candidate_records list is a valid
+            # judgment-only-wire-shape evaluator response too.
+            evaluation_payload = {
+                "schema_version": rr.WIRE_SCHEMA_EVALUATION,
+                "run_id": evaluator_request.run_id,
+                "base_sha": _FULL_SHA,
+                "source_set_digest": evaluator_request.source_set_digest,
+                "candidate_records": [],
+                "evidence_ref": "e",
+            }
             return subprocess.CompletedProcess(
-                argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(evaluation.to_wire()))), stderr=""
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(evaluation_payload)), stderr=""
             )
         bundle = rr.EvidenceBundle(
             run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
@@ -1248,7 +1324,13 @@ def test_schema_repair_retry_bounded_evaluator_never_started_on_exhaustion() -> 
         bundles = rr.run_observer_wave(ctx, plan, invoke=_malformed_invoke, observer_requests=[_observer_request("o1")])
         finding_sets = rr.build_finding_sets(ctx, plan, bundles)
         evaluator_request = rr.prepare_evaluator_request(ctx, plan, finding_sets)
-        rr.run_evaluation(ctx, evaluator_request, invoke_evaluator=_evaluator_invoke, repository_id=_REPOSITORY_ID)
+        rr.run_evaluation(
+            ctx,
+            evaluator_request,
+            invoke_evaluator=_evaluator_invoke,
+            repository_id=_REPOSITORY_ID,
+            previous_state=_EMPTY_PREVIOUS_STATE,
+        )
 
     assert evaluator_called["n"] == 0
 
@@ -1824,15 +1906,25 @@ def test_manual_trigger_preflight_accepts_git_root() -> None:
 
 
 def _make_execute_run_evaluator_invoke(candidate_records: list[dict[str, Any]]):
+    """`candidate_records` MUST already be in the judgment-only wire shape
+    (Issue #2362 Scope Reframe -- see `_judgment_from_key`) -- this builds
+    the raw wire payload dict directly rather than going through
+    `rr.Evaluation(...)`'s constructor, because that constructor's
+    `_post_validate()` fires FULL canonical-candidate-schema validation
+    immediately, which a judgment-only record does not (and must not need
+    to) satisfy; canonical validation only fires downstream, after
+    `run_evaluation()`'s deterministic-enrichment phase has run."""
+
     def _invoke(request: rr.EvaluatorRequest) -> rr.AgentInvocationResult:
-        evaluation = rr.Evaluation(
-            run_id=request.run_id,
-            base_sha=request.base_sha,
-            source_set_digest=request.source_set_digest,
-            candidate_records=candidate_records,
-            evidence_ref="evidence://evaluation",
-        )
-        return _ok_agent_result(json.loads(evaluation.to_wire()))
+        payload = {
+            "schema_version": rr.WIRE_SCHEMA_EVALUATION,
+            "run_id": request.run_id,
+            "base_sha": request.base_sha,
+            "source_set_digest": request.source_set_digest,
+            "candidate_records": candidate_records,
+            "evidence_ref": "evidence://evaluation",
+        }
+        return _ok_agent_result(payload)
 
     return _invoke
 
@@ -1840,7 +1932,17 @@ def _make_execute_run_evaluator_invoke(candidate_records: list[dict[str, Any]]):
 def test_compute_delta_wired_into_production_publish_path_recurrent() -> None:
     # GIVEN a PreviousStateProvider seeded with a previously-resolved finding
     resolved_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.resolved.valid.json")
-    current_recurrence = copy.deepcopy(resolved_fixture)
+    # Issue #2362 Scope Reframe: run_evaluation()'s enrichment phase now
+    # requires a judgment-only evaluator response (not the canonical
+    # finding_contract-nested fixture shape) -- this re-reports the SAME
+    # identity (repository_id/claim_class/subject_ref/rule_id) as
+    # `resolved_fixture` so compute_delta() classifies it as "recurrent"
+    # (its previous last evaluation's presence_delta was "resolved").
+    current_recurrence = _judgment_from_key(
+        resolved_fixture["finding_contract"]["identity"]["key"],
+        candidate_id="cand-recurrence",
+        evidence_refs=_RUNTIME_EVIDENCE_REFS,
+    )
     repository_id = "squne121/loop-protocol"
     provider = rr.FixturePreviousStateProvider(
         fixtures={
@@ -1882,6 +1984,11 @@ def test_compute_delta_wired_into_production_publish_path_recurrent() -> None:
 def test_compute_delta_wired_into_production_publish_path_forces_indeterminate() -> None:
     # GIVEN a PreviousStateProvider reporting incomplete ("partial") coverage
     new_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.new.valid.json")
+    # Issue #2362 Scope Reframe: see test_..._recurrent()'s matching comment
+    # -- re-reports the same identity as new_fixture in judgment-only shape.
+    current_judgment = _judgment_from_key(
+        new_fixture["finding_contract"]["identity"]["key"], candidate_id="cand-indeterminate"
+    )
     repository_id = "squne121/loop-protocol"
     provider = rr.FixturePreviousStateProvider(
         fixtures={
@@ -1900,7 +2007,7 @@ def test_compute_delta_wired_into_production_publish_path_forces_indeterminate()
         collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
         observer_requests=[_observer_request("retrospective-runtime-observer")],
         invoke=_make_observer_invoke("run-delta-2", expected_digest, call_log),
-        invoke_evaluator=_make_execute_run_evaluator_invoke([new_fixture]),
+        invoke_evaluator=_make_execute_run_evaluator_invoke([current_judgment]),
         repository_id=repository_id,
         target_issue=2237,
         request_id="req-delta-2",
@@ -1925,6 +2032,11 @@ def test_compute_delta_wired_into_production_publish_path_default_provider_is_ne
     # GIVEN no previous_state_provider is injected (the common/default case)
     call_log: list[str] = []
     expected_digest = rr.compute_source_set_digest([_fake_collector_result("repository", _FULL_SHA).observation])
+    # Issue #2362 Scope Reframe: judgment-only equivalent of _new_candidate()
+    # -- same identity key (repository_id/claim_class/subject_ref/rule_id).
+    current_judgment = _judgment_from_key(
+        _identity_key("example_rule"), candidate_id="cand-new-0001", evidence_refs=_RUNTIME_EVIDENCE_REFS
+    )
 
     # WHEN execute_run() runs without wiring a PreviousStateProvider
     publish_request = rr.execute_run(
@@ -1932,7 +2044,7 @@ def test_compute_delta_wired_into_production_publish_path_default_provider_is_ne
         collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
         observer_requests=[_observer_request("retrospective-runtime-observer")],
         invoke=_make_observer_invoke("run-delta-3", expected_digest, call_log),
-        invoke_evaluator=_make_execute_run_evaluator_invoke([_new_candidate()]),
+        invoke_evaluator=_make_execute_run_evaluator_invoke([current_judgment]),
         repository_id="squne121/loop-protocol",
         target_issue=2237,
         request_id="req-delta-3",
@@ -1964,7 +2076,17 @@ def test_compute_delta_wired_into_production_publish_path_run_cli(tmp_path: Path
         return subprocess.CompletedProcess(argv, returncode=0, stdout=_FULL_SHA + "\n", stderr="")
 
     resolved_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.resolved.valid.json")
-    current_recurrence = copy.deepcopy(resolved_fixture)
+    # Issue #2362 Scope Reframe: see test_..._recurrent()'s matching comment
+    # -- re-reports the same identity as resolved_fixture in judgment-only
+    # shape (the live-CLI-shaped `_runner` fake below builds the raw wire
+    # payload dict directly rather than via `rr.Evaluation(...)`, whose
+    # constructor would otherwise fire full canonical-candidate validation
+    # against this judgment-only shape prematurely).
+    current_recurrence = _judgment_from_key(
+        resolved_fixture["finding_contract"]["identity"]["key"],
+        candidate_id="cand-recurrence-cli",
+        evidence_refs=_RUNTIME_EVIDENCE_REFS,
+    )
     repository_id = "squne121/loop-protocol"
     provider = rr.FixturePreviousStateProvider(
         fixtures={
@@ -1981,15 +2103,16 @@ def test_compute_delta_wired_into_production_publish_path_run_cli(tmp_path: Path
         agent_name = argv[argv.index("--agent") + 1]
         if agent_name == "retrospective-evaluator":
             evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
-            evaluation = rr.Evaluation(
-                run_id=evaluator_request.run_id,
-                base_sha=_FULL_SHA,
-                source_set_digest=evaluator_request.source_set_digest,
-                candidate_records=[current_recurrence],
-                evidence_ref="e",
-            )
+            evaluation_payload = {
+                "schema_version": rr.WIRE_SCHEMA_EVALUATION,
+                "run_id": evaluator_request.run_id,
+                "base_sha": _FULL_SHA,
+                "source_set_digest": evaluator_request.source_set_digest,
+                "candidate_records": [current_recurrence],
+                "evidence_ref": "e",
+            }
             return subprocess.CompletedProcess(
-                argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(evaluation.to_wire()))), stderr=""
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(evaluation_payload)), stderr=""
             )
         bundle = rr.EvidenceBundle(
             run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
