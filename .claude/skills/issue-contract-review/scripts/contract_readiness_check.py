@@ -1455,6 +1455,74 @@ def check_extension_surface_risk_trigger(body: str) -> list[dict]:
     ]
 
 
+# PR #2370 OWNER review fix_delta (iteration 1, P0): readiness `errors[]`
+# categories that are informational/non-blocking only. Currently just
+# `check_extension_surface_advisory()`'s EXTSURF003 (Issue #2339
+# `unclassified_candidate` advisory). Centralised here so both the
+# `fix_hint`/`minimal_context` selection in `build_result()` and (via the
+# `contract_readiness_check.py --mode merge_readiness`-equivalent
+# `check_issue_contract.py`'s `merge_readiness_into_review_result()`, which
+# filters on the same `category` string independently since it lives in a
+# different dynamically-loaded module) treat this category consistently as
+# never contributing to a blocking verdict.
+_NON_BLOCKING_READINESS_ERROR_CATEGORIES = {"extension_surface_candidate_advisory"}
+
+
+def check_extension_surface_advisory(body: str) -> list[dict]:
+    """Issue #2339: non-blocking `unclassified_candidate` advisory findings.
+
+    Companion to `check_extension_surface_risk_trigger()` above (which
+    remains the unchanged blocking C14/EXTSURF001/EXTSURF002 gate). This
+    function's return value MUST NOT be passed into the
+    `if ext_surface_errors:` escalation in `run_contract_readiness_check()`
+    -- it is included in `all_errors` (the existing output "errors" list)
+    for display only, distinguished by `category:
+    extension_surface_candidate_advisory`, so `overall_status` is never
+    raised by an `unclassified_candidate` match alone (Issue #2339 AC6).
+    """
+    if not _is_canonical_implementation_issue(body):
+        return []
+
+    allowed_path_entries = _extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return []
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+
+    try:
+        policy_evaluation = evaluator.evaluate_allowed_paths(allowed_path_entries)
+    except evaluator.PolicyLoadError:
+        # Policy-unavailable is already surfaced as a blocking EXTSURF002
+        # finding by check_extension_surface_risk_trigger(); do not
+        # double-report it here as a non-blocking advisory.
+        return []
+
+    advisories = policy_evaluation.get("advisories") or []
+    if not advisories:
+        return []
+
+    return [
+        {
+            "rule_id": "EXTSURF003",
+            "severity": "info",
+            "source_check": "contract_readiness_check",
+            "category": "extension_surface_candidate_advisory",
+            "section": "Allowed Paths",
+            "line_start": 0,
+            "line_end": 0,
+            "minimal_context": advisories,
+            "fix_hint": (
+                "Non-blocking: one or more declared Allowed Paths match a project-local "
+                "extension candidate perimeter (unknown_surface_policy.project_candidate_path_globs) "
+                "but no known extension-surface risk-trigger rule. No action required."
+            ),
+            "autofixable": False,
+        }
+    ]
+
+
 def check_rva_immediate_fields(body: str) -> list[dict]:
     """
     AC4: Check that `decision: immediate` RVA section has all required fields.
@@ -1849,6 +1917,10 @@ def build_result(
     rva_errors = check_rva_immediate_fields(body)
     rdr_errors = check_required_design_references(body)
     ext_surface_errors = check_extension_surface_risk_trigger(body)
+    # Issue #2339: non-blocking advisory findings, kept OUT of
+    # `ext_surface_errors` (the escalation-gating variable below) --
+    # included in `all_errors` for display only.
+    ext_surface_advisory_errors = check_extension_surface_advisory(body)
 
     preflight_errors: list[dict] = []
     preflight_aggregate = "go"
@@ -1868,6 +1940,7 @@ def build_result(
         + rva_errors
         + rdr_errors
         + ext_surface_errors
+        + ext_surface_advisory_errors
         + static_vc_errors
         + preflight_errors
     )
@@ -1895,10 +1968,23 @@ def build_result(
         else:
             overall_status = _raise_status(overall_status, "needs_fix")
 
+    # PR #2370 OWNER review fix_delta (iteration 1, P0): `fix_hint` /
+    # `minimal_context` must be selected from the BLOCKING subset of
+    # `all_errors` only. `ext_surface_advisory_errors` (EXTSURF003,
+    # category: extension_surface_candidate_advisory) is a non-blocking
+    # finding kept in `all_errors` for display purposes only -- if it were
+    # allowed to become `first_error` (e.g. when it is the only entry
+    # present, or simply precedes a later blocking error in list order), a
+    # genuinely blocking finding's `fix_hint` would be silently hidden
+    # behind a "no action required" advisory message, self-contradicting
+    # the very blocker it was meant to surface.
+    blocking_errors_for_fix_hint = [
+        e for e in all_errors if e.get("category") not in _NON_BLOCKING_READINESS_ERROR_CATEGORIES
+    ]
     fix_hint: Optional[str] = None
     minimal_context: list = []
-    if all_errors:
-        first_error = all_errors[0]
+    if blocking_errors_for_fix_hint:
+        first_error = blocking_errors_for_fix_hint[0]
         fix_hint = first_error.get("fix_hint")
         minimal_context = first_error.get("minimal_context", [])
 
