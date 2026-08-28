@@ -950,25 +950,24 @@ def build_evidence_from_manifest(
 
 EVIDENCE_MANIFEST_V2_SCHEMA = "VISUAL_BASELINE_REVIEW_EVIDENCE_V2"
 
-# DEFERRED (Issue #2230 fix_delta P2-2, human reviewer, 2026-08-21, best-
-# effort item explicitly NOT implemented in this PR): `run_attempt` is
-# deliberately excluded from `_MANIFEST_V2_RECORD_FIELDS` / `manifest_sha256`
-# below -- cross-attempt forgery of `run_attempt` is instead caught by the
-# separate `evidence_manifest_run_attempt_mismatch` CheckRun-provenance
-# cross-check in `verify_trusted_artifact()`. The reviewer's PERMANENT
-# recommendation is a versioned schema bump (a new
-# `VISUAL_BASELINE_REVIEW_EVIDENCE_V3` schema with `run_attempt` INSIDE the
-# digest fields, plus V2/V3 dual-read during a migration window). This is a
-# genuine schema migration -- new schema constant, V3 record builder/
-# verifier alongside the existing V2 ones, a `find_evidence_manifest_v2_
-# record`-equivalent for V3, a `build_evidence_from_manifest_v2`-equivalent
-# for V3, dual-read call-site logic, AND a `ci.yml` producer-side switch of
-# which builder it calls -- spanning many more call sites than fit within
-# this fix_delta cycle's scope. Deferred to a dedicated follow-up Issue;
-# do not silently treat this as resolved by the `_require_strict_positive_
-# int()` identity-field fix elsewhere in this same fix_delta (that fix
-# only tightens TYPE validation of `run_attempt`, it does not add
-# `run_attempt` to the tamper-evidence digest).
+# RESOLVED by Issue #2284 (was: DEFERRED, Issue #2230 fix_delta P2-2, human
+# reviewer, 2026-08-21). `run_attempt` remains deliberately excluded from
+# `_MANIFEST_V2_RECORD_FIELDS` / `manifest_sha256` below FOR THIS V2 SCHEMA
+# ONLY -- cross-attempt forgery of a V2 record's `run_attempt` is still
+# caught by the separate `evidence_manifest_run_attempt_mismatch`
+# CheckRun-provenance cross-check in `verify_trusted_artifact()`, exactly as
+# before (V2 compatibility behavior is unchanged; see Issue #2284 AC4). The
+# reviewer's PERMANENT recommendation -- a versioned schema bump
+# (`VISUAL_BASELINE_REVIEW_EVIDENCE_V3` with `run_attempt` INSIDE the digest
+# fields, plus V2/V3 dual-read during a migration window) -- is implemented
+# below this V2 section: see `EVIDENCE_MANIFEST_V3_SCHEMA`,
+# `_MANIFEST_V3_RECORD_FIELDS`, `build_evidence_manifest_v3_record()`,
+# `verify_evidence_manifest_v3_record_digest()`,
+# `find_evidence_manifest_v3_record()`,
+# `validate_evidence_manifest_v3_envelope()`, and
+# `build_evidence_from_manifest_v3()`. `evaluate_pr_policy()` and
+# `verify_trusted_artifact()` both dual-read V2/V3 by dispatching on the
+# manifest's own `schema` field.
 #
 # The field set below is the canonical shape of one V2 record (Issue #2019 /
 # PR #2045 OWNER REQUEST_CHANGES). `manifest_sha256` is NEVER included in the
@@ -1035,6 +1034,180 @@ def find_evidence_manifest_v2_record(manifest: dict[str, Any] | None, surface_id
         if isinstance(record, dict) and record.get("surface_id") == surface_id:
             return record
     return None
+
+
+# ---------------------------------------------------------------------------
+# VISUAL_BASELINE_REVIEW_EVIDENCE_V3 -- Issue #2284 Phase A (OWNER
+# REQUEST_CHANGES on PR #2279's P2-2 best-effort deferral above): a
+# versioned schema bump that folds `run_attempt` INSIDE the per-record
+# tamper-evidence digest (`_MANIFEST_V3_RECORD_FIELDS`) and adds a
+# required, strictly-validated top-level envelope (`schema` /
+# `workflow_run_id` / `run_attempt` / `head_sha` / `surfaces`) so even a
+# `surfaces: []` no-impact manifest still carries -- and can be
+# independently cross-checked for -- the exact producing run's identity.
+#
+# V2 is NOT removed: `verify_trusted_artifact()`/`evaluate_pr_policy()`
+# dual-read both schemas (dispatching on the manifest's own `schema`
+# field), and the V2 compatibility behavior documented above
+# (`run_attempt` excluded from the V2 digest; cross-attempt forgery of it
+# caught only by the separate CheckRun-provenance cross-check) is
+# unchanged. V2 reader / legacy-filename removal is explicitly Out of
+# Scope for this Issue (Phase C, a dedicated follow-up once #2287's
+# GitHub-hosted real-rerun validation confirms `run_attempt >= 2` actually
+# occurs in production).
+# ---------------------------------------------------------------------------
+
+EVIDENCE_MANIFEST_V3_SCHEMA = "VISUAL_BASELINE_REVIEW_EVIDENCE_V3"
+
+# `run_attempt` is the ONLY field V3 adds to the digest input relative to
+# V2 -- every other field keeps the identical name/semantics so a V2->V3
+# migration never silently changes an unrelated field's binding.
+_MANIFEST_V3_RECORD_FIELDS: tuple[str, ...] = (*_MANIFEST_V2_RECORD_FIELDS, "run_attempt")
+
+# `head_sha` is always a full, lowercase, 40-hex-character Git commit SHA
+# (never an abbreviated/mixed-case value) -- both at envelope level and at
+# each per-surface record's own `head_sha` field.
+_FULL_LOWERCASE_HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _validate_v3_record_shape(record: Any) -> list[str]:
+    """AC3: V3 uses a CLOSED record shape -- unlike V2's `build_evidence_
+    manifest_v2_record()` (which defaults an omitted kwarg to `None`/
+    `False`), a V3 record read back from an untrusted manifest is rejected
+    outright if it is missing ANY of `_MANIFEST_V3_RECORD_FIELDS` (+
+    `manifest_sha256`), carries any EXTRA key, or if `run_attempt` is
+    anything other than a real JSON integer `>= 1` (string/bool/float/
+    zero/negative/null all rejected -- reusing the same strict,
+    non-coercing `_require_strict_positive_int` validator already applied
+    to `workflow_run_id`/`run_attempt` elsewhere in this module)."""
+    if not isinstance(record, dict):
+        return ["evidence_manifest_v3_record_not_object"]
+    errors: list[str] = []
+    expected_keys = set(_MANIFEST_V3_RECORD_FIELDS) | {"manifest_sha256"}
+    actual_keys = set(record.keys())
+    missing_keys = expected_keys - actual_keys
+    extra_keys = actual_keys - expected_keys
+    if missing_keys:
+        errors.append(f"evidence_manifest_v3_record_missing_keys:{sorted(missing_keys)}")
+    if extra_keys:
+        errors.append(f"evidence_manifest_v3_record_extra_keys:{sorted(extra_keys)}")
+    _, run_attempt_error = _require_strict_positive_int(record.get("run_attempt"), "run_attempt")
+    if run_attempt_error:
+        errors.append(f"evidence_manifest_v3_record_invalid_run_attempt:{run_attempt_error}")
+    return errors
+
+
+def build_evidence_manifest_v3_record(**fields: Any) -> dict[str, Any]:
+    """Build one VISUAL_BASELINE_REVIEW_EVIDENCE_V3 surface record. Unlike
+    `build_evidence_manifest_v2_record()`, EVERY field in
+    `_MANIFEST_V3_RECORD_FIELDS` is mandatory here (closed record shape,
+    AC3) -- a caller omitting a binding field is a real producer bug and
+    must fail loudly (`ValueError`) rather than silently default to
+    `None`/`False`."""
+    unknown = set(fields) - set(_MANIFEST_V3_RECORD_FIELDS)
+    if unknown:
+        raise ValueError(f"build_evidence_manifest_v3_record: unknown field(s) {sorted(unknown)}")
+    missing = set(_MANIFEST_V3_RECORD_FIELDS) - set(fields)
+    if missing:
+        raise ValueError(f"build_evidence_manifest_v3_record: missing field(s) {sorted(missing)}")
+    record = {name: fields[name] for name in _MANIFEST_V3_RECORD_FIELDS}
+    record["manifest_sha256"] = _evidence_record_digest(record)
+    return record
+
+
+def verify_evidence_manifest_v3_record_digest(record: dict[str, Any]) -> bool:
+    """AC2/AC3: fail-closed on any closed-record-shape violation FIRST
+    (missing/extra key, invalid `run_attempt` type/range), then recompute
+    `manifest_sha256` over the record's `_MANIFEST_V3_RECORD_FIELDS`
+    (which, unlike V2, INCLUDES `run_attempt`) and compare -- a record
+    whose `run_attempt` was changed after the digest was computed no
+    longer self-verifies."""
+    if _validate_v3_record_shape(record):
+        return False
+    claimed = record.get("manifest_sha256")
+    if not claimed:
+        return False
+    body = {name: record.get(name) for name in _MANIFEST_V3_RECORD_FIELDS}
+    return _evidence_record_digest(body) == claimed
+
+
+def find_evidence_manifest_v3_record(manifest: dict[str, Any] | None, surface_id: str) -> dict[str, Any] | None:
+    """AC3: unlike `find_evidence_manifest_v2_record()` (first-match-wins),
+    V3 treats more than one record sharing the same `surface_id` anywhere
+    in the manifest as invalid input for THAT surface_id and returns
+    `None` -- a duplicate is never silently resolved by picking either
+    one."""
+    if not manifest or manifest.get("schema") != EVIDENCE_MANIFEST_V3_SCHEMA:
+        return None
+    surfaces = manifest.get("surfaces")
+    if not isinstance(surfaces, list):
+        return None
+    matches = [r for r in surfaces if isinstance(r, dict) and r.get("surface_id") == surface_id]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def validate_evidence_manifest_v3_envelope(manifest: dict[str, Any] | None) -> list[str]:
+    """AC1/AC6: validate the V3 top-level envelope (`schema` /
+    `workflow_run_id` / `run_attempt` / `head_sha` / `surfaces`) -- ALL
+    required, strictly typed (`workflow_run_id`/`run_attempt` real JSON
+    integers `>= 1`; `head_sha` a full 40-character lowercase-hex string),
+    independent of whether `surfaces` is empty (AC6 no-impact identity:
+    the envelope alone must be verifiable even when there is nothing else
+    to check). Also validates every per-surface record's OWN closed shape
+    (AC3) and that its `head_sha`/`workflow_run_id`/`run_attempt` match the
+    envelope's (Issue #2284 In Scope: "各 surface record の ... が envelope
+    と一致することの検証"), and rejects a manifest containing more than one
+    record for the same `surface_id` (AC3 duplicate rejection) -- distinct
+    from `find_evidence_manifest_v3_record()`'s per-lookup duplicate
+    handling, this flags the manifest-wide violation explicitly. Returns an
+    empty list only when the envelope (and every record's shape/identity
+    binding) is fully well-formed."""
+    if not isinstance(manifest, dict):
+        return ["evidence_manifest_v3_not_object"]
+    errors: list[str] = []
+    if manifest.get("schema") != EVIDENCE_MANIFEST_V3_SCHEMA:
+        errors.append("evidence_manifest_v3_schema_invalid")
+    for required_field in ("schema", "workflow_run_id", "run_attempt", "head_sha", "surfaces"):
+        if required_field not in manifest:
+            errors.append(f"evidence_manifest_v3_missing_field:{required_field}")
+    _, run_id_error = _require_strict_positive_int(manifest.get("workflow_run_id"), "workflow_run_id")
+    if run_id_error:
+        errors.append(f"evidence_manifest_v3_invalid_workflow_run_id:{run_id_error}")
+    _, run_attempt_error = _require_strict_positive_int(manifest.get("run_attempt"), "run_attempt")
+    if run_attempt_error:
+        errors.append(f"evidence_manifest_v3_invalid_run_attempt:{run_attempt_error}")
+    head_sha = manifest.get("head_sha")
+    if not isinstance(head_sha, str) or not _FULL_LOWERCASE_HEX_SHA_RE.match(head_sha):
+        errors.append(f"evidence_manifest_v3_invalid_head_sha:{head_sha!r}")
+
+    surfaces = manifest.get("surfaces")
+    if not isinstance(surfaces, list):
+        if "surfaces" in manifest:
+            errors.append("evidence_manifest_v3_surfaces_not_list")
+        return errors
+
+    seen_surface_ids: set[Any] = set()
+    duplicate_surface_ids: set[Any] = set()
+    for entry in surfaces:
+        record_errors = _validate_v3_record_shape(entry)
+        if record_errors:
+            errors.extend(record_errors)
+            continue
+        surface_id = entry.get("surface_id")
+        if surface_id in seen_surface_ids:
+            duplicate_surface_ids.add(surface_id)
+        seen_surface_ids.add(surface_id)
+        if entry.get("head_sha") != manifest.get("head_sha"):
+            errors.append(f"evidence_manifest_v3_record_head_sha_mismatch:{surface_id}")
+        if entry.get("workflow_run_id") != manifest.get("workflow_run_id"):
+            errors.append(f"evidence_manifest_v3_record_workflow_run_id_mismatch:{surface_id}")
+        if entry.get("run_attempt") != manifest.get("run_attempt"):
+            errors.append(f"evidence_manifest_v3_record_run_attempt_mismatch:{surface_id}")
+    for surface_id in sorted(duplicate_surface_ids, key=str):
+        errors.append(f"evidence_manifest_v3_duplicate_surface_id:{surface_id}")
+    return errors
 
 
 def _coerce_mismatched_pixels(mismatched: Any) -> int | None:
@@ -1114,6 +1287,69 @@ def build_evidence_from_manifest_v2(
             evidence_manifest_contract_matches=False,
             evidence_manifest_head_matches=False,
         )
+
+    surface_matches = record.get("surface_id") == surface_id
+    contract_matches = bool(expected_contract_digest) and record.get("contract_digest") == expected_contract_digest
+    head_matches = record.get("head_sha") == head_sha
+
+    checkrun_bound = bool(trusted_check_run_id) and trusted_check_conclusion == "success"
+
+    mismatched_int = _coerce_mismatched_pixels(record.get("mismatched_pixels"))
+    verify_succeeded = bool(record.get("verify_succeeded")) and mismatched_int == 0
+    update_then_verify_succeeded = (
+        bool(record.get("update_executed")) and bool(record.get("update_succeeded")) and verify_succeeded
+    )
+    diff_available = bool(
+        record.get("expected_artifact_id") and record.get("actual_artifact_id") and record.get("diff_artifact_id")
+    )
+
+    return EvidenceObservation(
+        baseline_diff_present=False,  # caller overrides from real changed_paths
+        canonical_verify_success=verify_succeeded and checkrun_bound,
+        evidence_manifest_surface_matches=surface_matches,
+        evidence_manifest_contract_matches=contract_matches,
+        evidence_manifest_head_matches=head_matches,
+        canonical_update_then_verify_success=update_then_verify_succeeded and checkrun_bound,
+        expected_actual_diff_available=diff_available,
+        evidence_manifest_digest=record.get("manifest_sha256"),
+    )
+
+
+def build_evidence_from_manifest_v3(
+    manifest: dict[str, Any] | None,
+    *,
+    surface_id: str,
+    head_sha: str,
+    expected_contract_digest: str,
+    trusted_check_run_id: str | None,
+    trusted_check_suite_id: str | None,
+    trusted_github_app_id: str | None,
+    trusted_github_app_slug: str | None,
+    trusted_check_conclusion: str | None,
+) -> "EvidenceObservation":
+    """V3 counterpart of `build_evidence_from_manifest_v2()`. Fail-closed
+    BEFORE looking up this specific surface's record if the manifest's own
+    top-level envelope (or ANY record's closed shape/identity binding) is
+    invalid (`validate_evidence_manifest_v3_envelope()`) -- a manifest that
+    is broken anywhere is never partially trusted for one surface just
+    because that one record happens to look fine in isolation. CheckRun
+    provenance parameters carry the identical "never trust the producer's
+    own self-report" rationale documented on the V2 function."""
+    fail_closed = EvidenceObservation(
+        baseline_diff_present=False,
+        canonical_verify_success=False,
+        evidence_manifest_surface_matches=False,
+        evidence_manifest_contract_matches=False,
+        evidence_manifest_head_matches=False,
+    )
+    if validate_evidence_manifest_v3_envelope(manifest):
+        return fail_closed
+    assert manifest is not None  # narrowed by the envelope check above
+    record = find_evidence_manifest_v3_record(manifest, surface_id)
+    if record is None:
+        return fail_closed
+    if not verify_evidence_manifest_v3_record_digest(record):
+        return fail_closed
 
     surface_matches = record.get("surface_id") == surface_id
     contract_matches = bool(expected_contract_digest) and record.get("contract_digest") == expected_contract_digest
@@ -1262,7 +1498,19 @@ def evaluate_pr_policy(
             # surface_id string match) and never trust the record's
             # self-reported CheckRun fields -- those come from the caller's
             # independently-fetched CheckRun API lookup instead.
-            evidence = build_evidence_from_manifest_v2(
+            # Issue #2284 (Phase A): V2/V3 dual-read -- dispatch on the
+            # manifest's OWN `schema` field (never a CLI flag or any other
+            # caller-supplied hint), so a caller can pass either schema
+            # version's manifest through the identical `evidence_manifest`
+            # parameter. An unrecognized/missing schema falls through to
+            # the V2 builder, which already fails closed (returns a
+            # non-matching EvidenceObservation) for any manifest that is
+            # not a genuine VISUAL_BASELINE_REVIEW_EVIDENCE_V2 document.
+            manifest_is_v3 = (
+                isinstance(evidence_manifest, dict) and evidence_manifest.get("schema") == EVIDENCE_MANIFEST_V3_SCHEMA
+            )
+            evidence_builder = build_evidence_from_manifest_v3 if manifest_is_v3 else build_evidence_from_manifest_v2
+            evidence = evidence_builder(
                 evidence_manifest,
                 surface_id=surface_id,
                 head_sha=head_sha,
@@ -2956,61 +3204,116 @@ def verify_trusted_artifact(
                 manifest = None
                 reasons.append(f"evidence_manifest_not_json:{exc}")
             if manifest is not None:
-                if not isinstance(manifest, dict) or manifest.get("schema") != EVIDENCE_MANIFEST_V2_SCHEMA:
+                manifest_schema = manifest.get("schema") if isinstance(manifest, dict) else None
+                if manifest_schema not in (EVIDENCE_MANIFEST_V2_SCHEMA, EVIDENCE_MANIFEST_V3_SCHEMA):
                     reasons.append("evidence_manifest_schema_invalid")
-                for surface in decision.get("affected_surfaces", []) or []:
-                    evidence = surface.get("evidence") or {}
-                    digest_claim = evidence.get("evidence_manifest_digest")
-                    if not digest_claim:
-                        continue
-                    record = find_evidence_manifest_v2_record(manifest, surface.get("surface_id"))
-                    if record is None:
-                        reasons.append(f"evidence_manifest_record_missing:{surface.get('surface_id')}")
-                        continue
-                    if not verify_evidence_manifest_v2_record_digest(record):
-                        reasons.append(f"evidence_manifest_digest_tamper:{surface.get('surface_id')}")
-                        continue
-                    if record.get("manifest_sha256") != digest_claim:
-                        reasons.append(f"evidence_manifest_digest_mismatch:{surface.get('surface_id')}")
-                    # Issue #2230 AC2/AC5: the evidence manifest record's
-                    # OWN `(workflow_run_id, run_attempt, head_sha)` tuple
-                    # must also match the trusted consumer's authenticated
-                    # CheckRun provenance -- an old-attempt evidence record
-                    # (same digest scheme, different attempt) must never be
-                    # accepted just because its per-record tamper-evidence
-                    # digest self-verifies.
+                elif manifest_schema == EVIDENCE_MANIFEST_V3_SCHEMA:
+                    # Issue #2284 AC1/AC2/AC5/AC6: V3 dual-read branch. Unlike
+                    # V2 (where `run_attempt` is deliberately excluded from the
+                    # per-record digest and is instead cross-checked here
+                    # against authenticated CheckRun provenance), V3's digest
+                    # ALREADY covers `run_attempt` -- so
+                    # `verify_evidence_manifest_v3_record_digest()` alone
+                    # already detects a post-digest `run_attempt` tamper. This
+                    # branch still ALSO cross-checks the envelope's
+                    # `(workflow_run_id, run_attempt, head_sha)` tuple against
+                    # the trusted consumer's independently-authenticated
+                    # CheckRun provenance (defense in depth: a producer could
+                    # otherwise self-compute a coherent-but-wrong digest for an
+                    # attempt it does not actually own).
+                    envelope_errors = validate_evidence_manifest_v3_envelope(manifest)
+                    reasons.extend(f"evidence_manifest_v3_envelope_invalid:{err}" for err in envelope_errors)
+                    if manifest.get("head_sha") != expected_head_sha:
+                        reasons.append("evidence_manifest_v3_envelope_head_sha_mismatch")
                     if trusted_rederivation is not None and trusted_rederivation.component_vrt_checkrun_provenance:
-                        surf_provenance = trusted_rederivation.component_vrt_checkrun_provenance
-                        if surf_provenance.ok:
-                            # Issue #2230 fix_delta P1-2: these are IDENTITY
-                            # fields, never pixel counts -- reuse the strict
-                            # validator (`_require_strict_positive_int`), not
-                            # `_coerce_mismatched_pixels`'s deliberately
-                            # lenient string-coercion, which would silently
-                            # accept a forged string `"1"` as equal to
-                            # `surf_provenance`'s authenticated int `1`.
-                            record_run_id, _run_id_err = _require_strict_positive_int(
-                                record.get("workflow_run_id"), "workflow_run_id"
+                        envelope_provenance = trusted_rederivation.component_vrt_checkrun_provenance
+                        if envelope_provenance.ok:
+                            envelope_run_id, _envelope_run_id_err = _require_strict_positive_int(
+                                manifest.get("workflow_run_id"), "workflow_run_id"
                             )
-                            run_id_matches = (
-                                surf_provenance.workflow_run_id is not None
-                                and record_run_id == surf_provenance.workflow_run_id
+                            if (
+                                envelope_provenance.workflow_run_id is None
+                                or envelope_run_id != envelope_provenance.workflow_run_id
+                            ):
+                                reasons.append("evidence_manifest_v3_envelope_workflow_run_id_mismatch")
+                            envelope_run_attempt, _envelope_run_attempt_err = _require_strict_positive_int(
+                                manifest.get("run_attempt"), "run_attempt"
                             )
-                            if not run_id_matches:
-                                reasons.append(
-                                    f"evidence_manifest_workflow_run_id_mismatch:{surface.get('surface_id')}"
-                                )
-                            record_run_attempt, _run_attempt_err = _require_strict_positive_int(
-                                record.get("run_attempt"), "run_attempt"
-                            )
-                            run_attempt_matches = (
-                                surf_provenance.run_attempt is not None
-                                and record_run_attempt == surf_provenance.run_attempt
-                            )
-                            if not run_attempt_matches:
-                                reasons.append(f"evidence_manifest_run_attempt_mismatch:{surface.get('surface_id')}")
+                            if (
+                                envelope_provenance.run_attempt is None
+                                or envelope_run_attempt != envelope_provenance.run_attempt
+                            ):
+                                reasons.append("evidence_manifest_v3_envelope_run_attempt_mismatch")
+                    for surface in decision.get("affected_surfaces", []) or []:
+                        evidence = surface.get("evidence") or {}
+                        digest_claim = evidence.get("evidence_manifest_digest")
+                        if not digest_claim:
+                            continue
+                        record = find_evidence_manifest_v3_record(manifest, surface.get("surface_id"))
+                        if record is None:
+                            reasons.append(f"evidence_manifest_record_missing:{surface.get('surface_id')}")
+                            continue
+                        if not verify_evidence_manifest_v3_record_digest(record):
+                            reasons.append(f"evidence_manifest_digest_tamper:{surface.get('surface_id')}")
+                            continue
+                        if record.get("manifest_sha256") != digest_claim:
+                            reasons.append(f"evidence_manifest_digest_mismatch:{surface.get('surface_id')}")
                         if record.get("head_sha") != expected_head_sha:
                             reasons.append(f"evidence_manifest_head_sha_mismatch:{surface.get('surface_id')}")
+                else:
+                    for surface in decision.get("affected_surfaces", []) or []:
+                        evidence = surface.get("evidence") or {}
+                        digest_claim = evidence.get("evidence_manifest_digest")
+                        if not digest_claim:
+                            continue
+                        record = find_evidence_manifest_v2_record(manifest, surface.get("surface_id"))
+                        if record is None:
+                            reasons.append(f"evidence_manifest_record_missing:{surface.get('surface_id')}")
+                            continue
+                        if not verify_evidence_manifest_v2_record_digest(record):
+                            reasons.append(f"evidence_manifest_digest_tamper:{surface.get('surface_id')}")
+                            continue
+                        if record.get("manifest_sha256") != digest_claim:
+                            reasons.append(f"evidence_manifest_digest_mismatch:{surface.get('surface_id')}")
+                        # Issue #2230 AC2/AC5: the evidence manifest record's
+                        # OWN `(workflow_run_id, run_attempt, head_sha)` tuple
+                        # must also match the trusted consumer's authenticated
+                        # CheckRun provenance -- an old-attempt evidence record
+                        # (same digest scheme, different attempt) must never be
+                        # accepted just because its per-record tamper-evidence
+                        # digest self-verifies.
+                        if trusted_rederivation is not None and trusted_rederivation.component_vrt_checkrun_provenance:
+                            surf_provenance = trusted_rederivation.component_vrt_checkrun_provenance
+                            if surf_provenance.ok:
+                                # Issue #2230 fix_delta P1-2: these are IDENTITY
+                                # fields, never pixel counts -- reuse the strict
+                                # validator (`_require_strict_positive_int`), not
+                                # `_coerce_mismatched_pixels`'s deliberately
+                                # lenient string-coercion, which would silently
+                                # accept a forged string `"1"` as equal to
+                                # `surf_provenance`'s authenticated int `1`.
+                                record_run_id, _run_id_err = _require_strict_positive_int(
+                                    record.get("workflow_run_id"), "workflow_run_id"
+                                )
+                                run_id_matches = (
+                                    surf_provenance.workflow_run_id is not None
+                                    and record_run_id == surf_provenance.workflow_run_id
+                                )
+                                if not run_id_matches:
+                                    reasons.append(
+                                        f"evidence_manifest_workflow_run_id_mismatch:{surface.get('surface_id')}"
+                                    )
+                                record_run_attempt, _run_attempt_err = _require_strict_positive_int(
+                                    record.get("run_attempt"), "run_attempt"
+                                )
+                                run_attempt_matches = (
+                                    surf_provenance.run_attempt is not None
+                                    and record_run_attempt == surf_provenance.run_attempt
+                                )
+                                if not run_attempt_matches:
+                                    reasons.append(f"evidence_manifest_run_attempt_mismatch:{surface.get('surface_id')}")
+                            if record.get("head_sha") != expected_head_sha:
+                                reasons.append(f"evidence_manifest_head_sha_mismatch:{surface.get('surface_id')}")
 
     return TrustedArtifactVerdict(ok=not reasons, reason_codes=reasons, decision=decision)
 
@@ -3282,7 +3585,18 @@ def _run_build_evidence_manifest(args: argparse.Namespace) -> int:
     from actual VRT run outputs -- never fabricated). `baseline_sha256` is
     ALWAYS computed here from the on-disk baseline file (never trusted from
     the caller), matching this module's existing "compute, never trust a
-    self-reported hash" pattern."""
+    self-reported hash" pattern.
+
+    Issue #2284 Phase A/B: `--evidence-manifest-schema v3` (default stays
+    `v2`) switches the OUTPUT schema this producer writes -- it never
+    changes how `--surface-inputs-file` itself is read/validated. The V3
+    envelope's `workflow_run_id`/`run_attempt`/`head_sha` are sourced from
+    this CLI invocation's own `--run-id`/`--run-attempt`/`--head-sha`
+    flags (the producer job's real `${{ github.run_id }}`/`${{
+    github.run_attempt }}` context and the real candidate head SHA -- see
+    `ci.yml`'s Phase B producer step), never re-derived from the
+    per-surface records."""
+    manifest_schema = getattr(args, "evidence_manifest_schema", "v2") or "v2"
     registry_doc = load_and_validate_registry(args.registry, args.schema, None, args.repo_root)
     surfaces = registry_doc.get("surfaces", {}) or {}
     inputs = json.loads(Path(args.surface_inputs_file).read_text(encoding="utf-8"))
@@ -3329,48 +3643,108 @@ def _run_build_evidence_manifest(args: argparse.Namespace) -> int:
         if run_attempt_error:
             errors.append(f"{surface_id}: {run_attempt_error}")
 
-        record = build_evidence_manifest_v2_record(
-            surface_id=surface_id,
-            contract_digest=compute_contract_digest(surface_def),
-            head_sha=item.get("head_sha"),
-            workflow_run_id=workflow_run_id_value,
-            # CheckRun binding fields are always populated by the CONSUMER
-            # (visual-impact-policy job's independently-fetched CheckRun API
-            # lookup), never by this producer step -- see
-            # build_evidence_from_manifest_v2()'s docstring.
-            check_run_id=None,
-            check_suite_id=None,
-            github_app_id=None,
-            github_app_slug=None,
-            check_conclusion=None,
-            baseline_path=baseline_path,
-            baseline_sha256=baseline_sha256,
-            actual_sha256=item.get("actual_sha256"),
-            mismatched_pixels=mismatched_pixels,
-            verify_command_id=contracts.get("verify_command_id"),
-            verify_succeeded=bool(item.get("verify_succeeded")),
-            update_command_id=contracts.get("update_command_id"),
-            update_executed=bool(item.get("update_executed")),
-            update_succeeded=bool(item.get("update_succeeded")),
-            expected_artifact_id=item.get("expected_artifact_id"),
-            actual_artifact_id=item.get("actual_artifact_id"),
-            diff_artifact_id=item.get("diff_artifact_id"),
-        )
-        # Issue #2230 AC2: the producer's OWN `${{ github.run_attempt }}`
-        # context, never re-derived elsewhere -- paired with
-        # `workflow_run_id` + `head_sha` this is the exact tuple
-        # `verify_trusted_artifact()` cross-checks against the trusted
-        # consumer's authenticated CheckRun provenance. NOT part of
-        # `_MANIFEST_V2_RECORD_FIELDS` / `manifest_sha256`: attempt-forgery
-        # is caught by the separate `evidence_manifest_run_attempt_mismatch`
-        # cross-check against independently-authenticated CheckRun
-        # provenance, not by the tamper-evidence digest (which must stay
-        # identical to the base-branch-locked consumer's field set so the
-        # digest self-verifies pre-merge).
-        record["run_attempt"] = run_attempt_value
+        if manifest_schema == "v3":
+            # Issue #2284: V3's per-record builder is closed-shape (every
+            # field mandatory, `run_attempt` INSIDE the digest) -- pass
+            # `run_attempt` as a normal keyword field here instead of the
+            # V2 pattern of assigning it onto the dict AFTER digest
+            # computation (which is exactly the behavior V3 replaces).
+            record = build_evidence_manifest_v3_record(
+                surface_id=surface_id,
+                contract_digest=compute_contract_digest(surface_def),
+                head_sha=item.get("head_sha"),
+                workflow_run_id=workflow_run_id_value,
+                run_attempt=run_attempt_value,
+                # CheckRun binding fields are always populated by the
+                # CONSUMER (visual-impact-policy job's independently-
+                # fetched CheckRun API lookup), never by this producer step
+                # -- see build_evidence_from_manifest_v3()'s docstring.
+                check_run_id=None,
+                check_suite_id=None,
+                github_app_id=None,
+                github_app_slug=None,
+                check_conclusion=None,
+                baseline_path=baseline_path,
+                baseline_sha256=baseline_sha256,
+                actual_sha256=item.get("actual_sha256"),
+                mismatched_pixels=mismatched_pixels,
+                verify_command_id=contracts.get("verify_command_id"),
+                verify_succeeded=bool(item.get("verify_succeeded")),
+                update_command_id=contracts.get("update_command_id"),
+                update_executed=bool(item.get("update_executed")),
+                update_succeeded=bool(item.get("update_succeeded")),
+                expected_artifact_id=item.get("expected_artifact_id"),
+                actual_artifact_id=item.get("actual_artifact_id"),
+                diff_artifact_id=item.get("diff_artifact_id"),
+            )
+        else:
+            record = build_evidence_manifest_v2_record(
+                surface_id=surface_id,
+                contract_digest=compute_contract_digest(surface_def),
+                head_sha=item.get("head_sha"),
+                workflow_run_id=workflow_run_id_value,
+                # CheckRun binding fields are always populated by the CONSUMER
+                # (visual-impact-policy job's independently-fetched CheckRun API
+                # lookup), never by this producer step -- see
+                # build_evidence_from_manifest_v2()'s docstring.
+                check_run_id=None,
+                check_suite_id=None,
+                github_app_id=None,
+                github_app_slug=None,
+                check_conclusion=None,
+                baseline_path=baseline_path,
+                baseline_sha256=baseline_sha256,
+                actual_sha256=item.get("actual_sha256"),
+                mismatched_pixels=mismatched_pixels,
+                verify_command_id=contracts.get("verify_command_id"),
+                verify_succeeded=bool(item.get("verify_succeeded")),
+                update_command_id=contracts.get("update_command_id"),
+                update_executed=bool(item.get("update_executed")),
+                update_succeeded=bool(item.get("update_succeeded")),
+                expected_artifact_id=item.get("expected_artifact_id"),
+                actual_artifact_id=item.get("actual_artifact_id"),
+                diff_artifact_id=item.get("diff_artifact_id"),
+            )
+            # Issue #2230 AC2: the producer's OWN `${{ github.run_attempt }}`
+            # context, never re-derived elsewhere -- paired with
+            # `workflow_run_id` + `head_sha` this is the exact tuple
+            # `verify_trusted_artifact()` cross-checks against the trusted
+            # consumer's authenticated CheckRun provenance. NOT part of
+            # `_MANIFEST_V2_RECORD_FIELDS` / `manifest_sha256`: attempt-forgery
+            # is caught by the separate `evidence_manifest_run_attempt_mismatch`
+            # cross-check against independently-authenticated CheckRun
+            # provenance, not by the tamper-evidence digest (which must stay
+            # identical to the base-branch-locked consumer's field set so the
+            # digest self-verifies pre-merge).
+            record["run_attempt"] = run_attempt_value
         records.append(record)
 
-    manifest = {"schema": EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": records}
+    if manifest_schema == "v3":
+        # Issue #2284 AC1: the V3 envelope's identity tuple is sourced from
+        # this invocation's OWN --head-sha/--run-id/--run-attempt (the
+        # producer job's real context), independently strict-validated the
+        # same way every other identity field in this module is (never a
+        # bare `int()`/regex-free string).
+        envelope_run_id, envelope_run_id_error = _require_strict_positive_int(args.run_id, "workflow_run_id")
+        if envelope_run_id_error:
+            errors.append(f"envelope: {envelope_run_id_error}")
+        envelope_run_attempt, envelope_run_attempt_error = _require_strict_positive_int(
+            args.run_attempt, "run_attempt"
+        )
+        if envelope_run_attempt_error:
+            errors.append(f"envelope: {envelope_run_attempt_error}")
+        envelope_head_sha = args.head_sha
+        if not isinstance(envelope_head_sha, str) or not _FULL_LOWERCASE_HEX_SHA_RE.match(envelope_head_sha or ""):
+            errors.append(f"envelope: head_sha must be a 40-character lowercase hex string, got {envelope_head_sha!r}")
+        manifest = {
+            "schema": EVIDENCE_MANIFEST_V3_SCHEMA,
+            "workflow_run_id": envelope_run_id,
+            "run_attempt": envelope_run_attempt,
+            "head_sha": envelope_head_sha,
+            "surfaces": records,
+        }
+    else:
+        manifest = {"schema": EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": records}
     print(json.dumps(manifest, indent=2))
     if args.manifest_output:
         Path(args.manifest_output).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -3560,6 +3934,12 @@ def main(argv: list[str] | None = None) -> int:
     # run inputs (never fabricated in raw shell/bash-embedded Python).
     parser.add_argument("--surface-inputs-file", type=str, default=None)
     parser.add_argument("--manifest-output", type=str, default=None)
+    # Issue #2284 Phase A: selects which evidence-manifest schema
+    # `--mode build-evidence-manifest` WRITES. Consumption
+    # (`evaluate_pr_policy()` / `verify_trusted_artifact()`) always
+    # dual-reads by dispatching on the manifest's own `schema` field, never
+    # on this flag -- this flag only controls the PRODUCER side.
+    parser.add_argument("--evidence-manifest-schema", choices=["v2", "v3"], default="v2")
     # PR #2045 OWNER fix_delta P1-4: `changed-paths` mode -- parses real
     # `git diff --name-status -z --find-renames` output (never re-implemented
     # inline in ci.yml).
