@@ -81,6 +81,31 @@ def make_subtask(
     return subtask
 
 
+def _read_journal_events(run_dir: Path) -> list[dict]:
+    journal = run_dir / "events.ndjson"
+    return [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _wait_for_pid_sentinel(pid_file: Path, *, timeout: float = 10.0, poll_interval: float = 0.02) -> int:
+    """Poll ``pid_file`` until it holds a parseable PID, proving the real
+    fixture child OS process has actually started -- Issue #2371 AC5: the
+    prior version of this test asserted only ``ok is False`` and
+    ``"timeout" in failure_class``, which would false-green even if
+    ``subprocess.Popen()`` was never actually reached. Raises
+    ``AssertionError`` (fail-closed) if the sentinel never becomes ready.
+    """
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if pid_file.exists():
+            try:
+                return int(pid_file.read_text().strip())
+            except ValueError as exc:
+                last_error = exc
+        time.sleep(poll_interval)
+    raise AssertionError(f"pid sentinel {pid_file} did not become ready within {timeout}s (last_error={last_error})")
+
+
 def ok_runner_factory(calls: list):
     """A fake runner recording every invocation and always succeeding."""
 
@@ -274,7 +299,23 @@ def test_provider_auto_rejected_at_preflight(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_overall_timeout_cancels_pending_and_terminates_running(tmp_path):
+def test_overall_timeout_cancels_pending_subtasks(tmp_path):
+    """Issue #2371 AC6: renamed from
+    ``test_overall_timeout_cancels_pending_and_terminates_running`` -- the
+    previous name over-claimed that this test proves the ``slow`` runner's
+    already-started process gets terminated. It does not: the ``runner``
+    fake below just busy-waits on ``ctx.cancel_event`` in-process and never
+    starts a real OS process, so it cannot verify termination (that is the
+    responsibility of ``test_subprocess_runner_terminates_process_group_on_timeout``
+    for the production runner, and
+    ``test_running_process_cancellation_records_sigterm`` /
+    ``test_sigkill_escalation_recorded`` in
+    test_fan_out_process_lifecycle.py for lifecycle-telemetry pairing).
+    This test asserts only what actually belongs to ``run_fanout()``'s own
+    orchestration responsibility: the ``overall_timeout_reached`` deadline-
+    watcher event fires, and pending (not-yet-started) subtasks are
+    cancelled before ever invoking the runner.
+    """
     module = load_module()
     subtasks = [
         make_subtask(tmp_path, subtask_id="slow", objective="Investigate scripts/slow.py hang scenario 1"),
@@ -288,10 +329,11 @@ def test_overall_timeout_cancels_pending_and_terminates_running(tmp_path):
         with invoked_lock:
             invoked.append(job.subtask_id)
         if job.subtask_id == "slow":
-            # Cooperatively "hang" until the orchestrator signals cancellation
-            # (the production subprocess runner polls this same event and
-            # terminates the real child process group -- see
-            # test_subprocess_runner_terminates_process_group_on_timeout).
+            # Cooperatively "hang" until the orchestrator signals cancellation.
+            # This fake runner never spawns a real OS process, so this test
+            # makes no claim about actual child-process termination (see
+            # test_subprocess_runner_terminates_process_group_on_timeout for
+            # that lower-level guarantee against the production runner).
             deadline = time.monotonic() + 5
             while not ctx.cancel_event.is_set() and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -309,6 +351,11 @@ def test_overall_timeout_cancels_pending_and_terminates_running(tmp_path):
     assert result["status"] in ("cancelled", "failed")
     assert result["counts"]["cancelled"] >= 1
 
+    run_dir = Path(result["run_dir"])
+    events = _read_journal_events(run_dir)
+    timeout_events = [e for e in events if e.get("event") == "overall_timeout_reached"]
+    assert len(timeout_events) == 1, "the deadline watcher must record exactly one overall_timeout_reached event"
+
     with invoked_lock:
         invoked_snapshot = list(invoked)
     assert "pending-1" not in invoked_snapshot, "pending subtasks must never start the runner after timeout"
@@ -321,15 +368,30 @@ def test_overall_timeout_cancels_pending_and_terminates_running(tmp_path):
 
 def test_subprocess_runner_terminates_process_group_on_timeout(tmp_path):
     """Lower-level realism check: the production subprocess runner really
-    terminates a hung child's whole process group (SIGTERM, then SIGKILL
-    after the grace period) rather than merely giving up on it in-process.
+    terminates a hung child's whole process group (SIGTERM) rather than
+    merely giving up on it in-process.
+
+    Issue #2371 AC5: the prior version synchronized with a bare
+    ``time.sleep(0.3)`` and asserted only ``ok is False`` /
+    ``"timeout" in failure_class`` on the returned result -- a false-green
+    that would still pass even if ``subprocess.Popen()`` was never actually
+    reached (e.g. if the runner's spawn path silently broke and returned a
+    synthetic "timeout"-labelled failure some other way). This version
+    proves Popen was actually reached via a pid sentinel file the fixture
+    child writes after ``os.getpid()``, and additionally proves the real OS
+    process is gone after cancellation (not just that the in-process flag
+    was observed).
     """
     module = load_module()
+    pid_file = tmp_path / "hang_forever.pid"
     fixture_script = tmp_path / "hang_forever.py"
     fixture_script.write_text(
+        "import os\n"
         "import time\n"
         "import signal\n"
+        "from pathlib import Path\n"
         "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+        f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
         "time.sleep(60)\n",
         encoding="utf-8",
     )
@@ -349,13 +411,30 @@ def test_subprocess_runner_terminates_process_group_on_timeout(tmp_path):
 
     thread = threading.Thread(target=_invoke)
     thread.start()
-    time.sleep(0.3)  # let the child process actually start
-    cancel_event.set()
-    thread.join(timeout=10)
+    try:
+        child_pid = _wait_for_pid_sentinel(pid_file)
+        cancel_event.set()
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "runner must return once cancel_event is set (process group terminated)"
+    finally:
+        # Issue #2371 AC7: clean up the thread and child process on every
+        # exit path (sentinel timeout, assertion failure, thread exception).
+        cancel_event.set()
+        thread.join(timeout=15)
+        assert not thread.is_alive(), "runner thread must be joined and dead in the cleanup path"
 
-    assert not thread.is_alive(), "runner must return once cancel_event is set (process group terminated)"
     assert result_holder["result"]["ok"] is False
     assert "timeout" in result_holder["result"]["failure_class"]
+
+    # The pid sentinel file existing already proves Popen succeeded; also
+    # confirm the real OS process is actually gone post-cancellation (not
+    # just that the runner's in-process cancel_event flag was observed).
+    try:
+        os.kill(child_pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise AssertionError(f"child pid {child_pid} must be terminated after cancel_event, but is still alive")
 
 
 def test_keyboard_interrupt_terminates_running_child_process_group(tmp_path):
