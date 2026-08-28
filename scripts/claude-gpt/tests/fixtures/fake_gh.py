@@ -67,10 +67,31 @@ Originally salvaged from the Issue #2259 bridge test fixture
 claude-gpt/tests/fixtures/fake_gh.py`, never merged to main) and adapted for
 the native (non-bridge) live scenario harness (Issue #2299), then extended
 for Issue #2306.
+
+Issue #2330 additionally teaches this fixture the exact `gh` CLI shapes the
+production consumer `.claude/skills/issue-refinement-loop/scripts/
+root_entry_router.py` actually issues (a compatibility gap PR #2325's
+pr-reviewer flagged as non-blocking, later confirmed authoritative by an
+OWNER adversarial review):
+
+  - `gh repo view <owner>/<repo> --json nameWithOwner --jq .nameWithOwner`
+    -- a POSITIONAL repo argument directly after `view` (not `--repo
+    <repo>`), with a bare-string (`--jq`-filtered, not JSON-quoted) stdout
+    of the repo identity. The prior `--repo <repo>` flag form is still
+    accepted for backward compatibility.
+  - `gh api repos/<owner>/<repo>/git/refs/heads/<base_ref> --jq
+    .object.sha` -- `<base_ref>` is the full suffix after
+    `/git/refs/heads/` (which may itself contain `/`, e.g. `release/next`,
+    not just `main`), and the fixture prints a deterministic 40-hex fake
+    SHA as a bare string (no JSON quoting), derived from the repo path +
+    ref so different refs/repos produce stable-but-distinct fake SHAs.
+    Only this exact `--jq .object.sha` argv shape is understood -- this is
+    not a generic REST router or jq evaluator (Out of Scope, Issue #2330).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -166,12 +187,22 @@ def main() -> int:
     if args[:2] == ["repo", "view"]:
         if os.environ.get("FAKE_GH_REPO_READ_OK", "1") != "1":
             return 1
-        if "--json" in args and "nameWithOwner" in args:
-            repo = None
+        # Issue #2330: the production consumer (root_entry_router.py) issues
+        # `gh repo view <owner>/<repo> --json nameWithOwner --jq
+        # .nameWithOwner` with a POSITIONAL repo argument directly after
+        # `view` -- not `--repo <repo>`. Prefer the positional form; fall
+        # back to `--repo` for backward compatibility with existing callers.
+        repo = args[2] if len(args) > 2 and not args[2].startswith("-") else None
+        if repo is None:
             for i, value in enumerate(args):
                 if value == "--repo" and i + 1 < len(args):
                     repo = args[i + 1]
-            print(json.dumps(repo or "fake/repo"))
+        if "--json" in args and "nameWithOwner" in args:
+            if "--jq" in args and ".nameWithOwner" in args:
+                # Real `gh --jq` output is raw/unquoted text, not JSON.
+                print(repo or "fake/repo")
+            else:
+                print(json.dumps(repo or "fake/repo"))
         return 0
 
     if args[:2] == ["issue", "comment"]:
@@ -307,6 +338,32 @@ def main() -> int:
             print("fake gh: forced controlled-read probe failure", file=sys.stderr)
             return 1
         print(json.dumps({"name": "loop-protocol"}))
+        return 0
+
+    if (
+        len(args) >= 4
+        and args[0] == "api"
+        and args[1].startswith("repos/")
+        and "/git/refs/heads/" in args[1]
+        and args[2] == "--jq"
+        and args[3] == ".object.sha"
+    ):
+        # Issue #2330: the production consumer (root_entry_router.py)
+        # issues `gh api repos/<owner>/<repo>/git/refs/heads/<base_ref>
+        # --jq .object.sha`. `<base_ref>` is NOT limited to a single path
+        # segment (i.e. not just `main`) -- it is everything after the
+        # `/git/refs/heads/` marker, which may itself contain `/` (e.g.
+        # `release/next`). Only this exact `--jq .object.sha` argv shape is
+        # understood; this is not a generic REST router or jq evaluator
+        # (Out of Scope). Prints a deterministic 40-hex fake SHA (bare
+        # string, no JSON quoting) derived from the repo path + ref so
+        # different refs/repos produce stable-but-distinct fake SHAs.
+        marker = "/git/refs/heads/"
+        idx = args[1].index(marker)
+        ref_path = args[1][:idx]
+        base_ref = args[1][idx + len(marker):]
+        digest = hashlib.sha1(f"{ref_path}:{base_ref}".encode("utf-8")).hexdigest()
+        print(digest)
         return 0
 
     if args[:2] == ["api", "graphql"]:
