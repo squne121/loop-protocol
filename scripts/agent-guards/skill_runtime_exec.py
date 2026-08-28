@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import hashlib
 import json
@@ -3274,6 +3275,43 @@ def main(argv: list[str] | None = None) -> int:
 _GIT_SUBPROCESS_EXECUTABLE_CACHE: str | None = None
 _CONTROL_PLANE_WORKTREE_LOCK_REASON = "loop-protocol-control-plane-default-ref"
 
+# Linux makes a process that opts into PR_SET_CHILD_SUBREAPER the reparenting
+# target for orphaned descendants.  This is the containment authority used by
+# the closed Git executor: after its direct Git leader has been reaped, every
+# surviving escaped descendant is still parented below this process rather
+# than disappearing behind an init-parented `/proc` race.
+_PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
+
+
+def _enable_linux_child_subreaper() -> bool:
+    """Enable kernel parentage containment before spawning a Git leader.
+
+    The setting is intentionally retained for this executor process.  Turning
+    it off after an operation would create a reparenting gap for a child that
+    exits immediately after the check.  A platform without this Linux kernel
+    authority has no equivalent race-free containment in this module and is
+    therefore rejected before any Git side effect can be started.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        prctl.restype = ctypes.c_int
+        enabled = ctypes.c_int()
+        if prctl(_PR_GET_CHILD_SUBREAPER, ctypes.addressof(enabled), 0, 0, 0) != 0:
+            return False
+        if enabled.value:
+            return True
+        if prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            return False
+        confirmed = ctypes.c_int()
+        return prctl(_PR_GET_CHILD_SUBREAPER, ctypes.addressof(confirmed), 0, 0, 0) == 0 and confirmed.value == 1
+    except (AttributeError, OSError):
+        return False
+
 
 class GitProtocolDeadlineExhausted(RuntimeError):
     """Raised before a terminal command could consume cleanup reserve."""
@@ -3521,6 +3559,117 @@ def _tracked_descendants_absent(descendants: set[_TrackedGitDescendant]) -> bool
     )
 
 
+def _observe_subreaper_children() -> set[_TrackedGitDescendant] | None:
+    """Return live children directly parented to this Linux subreaper.
+
+    This is deliberately distinct from `_observe_git_descendants`: a readable
+    tree snapshot rooted at the Git leader is only advisory.  Once that leader
+    is reaped, PR_SET_CHILD_SUBREAPER gives an empty direct-child set a kernel
+    parentage meaning: no live orphaned descendant of that leader remains.
+    An unreadable `/proc` result is never interpreted as that proof.
+    """
+    proc_root = Path("/proc")
+    if not sys.platform.startswith("linux") or not proc_root.is_dir():
+        return None
+    parent_pid = os.getpid()
+    children: set[_TrackedGitDescendant] = set()
+    try:
+        proc_entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in proc_entries:
+        if not entry.name.isdecimal():
+            continue
+        identity = _linux_process_identity(int(entry.name))
+        if identity is not None and identity[1] == parent_pid:
+            children.add(_TrackedGitDescendant(identity[0], identity[2]))
+    return children
+
+
+def _observe_descendants_of(parent_pids: set[int]) -> set[_TrackedGitDescendant] | None:
+    """Return the complete current tree below known Linux parent PIDs."""
+    proc_root = Path("/proc")
+    if not sys.platform.startswith("linux") or not proc_root.is_dir():
+        return None
+    records: dict[int, tuple[int, str]] = {}
+    try:
+        proc_entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in proc_entries:
+        if not entry.name.isdecimal():
+            continue
+        identity = _linux_process_identity(int(entry.name))
+        if identity is not None:
+            records[identity[0]] = (identity[1], identity[2])
+    descendants: set[_TrackedGitDescendant] = set()
+    frontier = set(parent_pids)
+    while frontier:
+        parent_pid = frontier.pop()
+        children = {
+            pid: start_time
+            for pid, (record_parent_pid, start_time) in records.items()
+            if record_parent_pid == parent_pid
+        }
+        frontier.update(children)
+        descendants.update(_TrackedGitDescendant(pid, start_time) for pid, start_time in children.items())
+    return descendants
+
+
+def _signal_subreaper_child_trees(children: set[_TrackedGitDescendant], signal_number: int) -> bool:
+    descendants = _observe_descendants_of({child.pid for child in children})
+    if descendants is None:
+        return False
+    return _signal_tracked_descendants(children | descendants, signal_number)
+
+
+def _reap_tracked_children(children: set[_TrackedGitDescendant]) -> bool:
+    """Reap only verified direct subreaper children; never a reused PID."""
+    for child in children:
+        identity = _linux_process_identity(child.pid)
+        if identity is None or identity[2] != child.start_time:
+            continue
+        try:
+            os.waitpid(child.pid, os.WNOHANG)
+        except ChildProcessError:
+            # It was reaped by a concurrent wait; it is no longer a leak.
+            continue
+        except OSError:
+            return False
+    return True
+
+
+def _terminate_subreaper_children(deadline: GitProtocolDeadline) -> bool:
+    """Drain escaped descendants through kernel parentage, then reap them.
+
+    A direct child of the subreaper may itself fork after SIGTERM.  Repeating
+    discovery is not used as a timing heuristic: parentage guarantees that
+    each still-live orphan remains directly reachable until it is terminated
+    and reaped.  The bounded deadline only limits resource cleanup.
+    """
+    term_until = min(deadline.deadline_at, time.monotonic() + max(0.01, deadline.cleanup_reserve_seconds / 2))
+    for signal_number, phase_deadline in ((signal.SIGTERM, term_until), (signal.SIGKILL, deadline.deadline_at)):
+        while time.monotonic() < phase_deadline:
+            children = _observe_subreaper_children()
+            if children is None:
+                return False
+            if not children:
+                return True
+            if not _signal_subreaper_child_trees(children, signal_number):
+                return False
+            if not _reap_tracked_children(children):
+                return False
+            time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+    children = _observe_subreaper_children()
+    if children is None:
+        return False
+    if children and not _signal_subreaper_child_trees(children, signal.SIGKILL):
+        return False
+    if children and not _reap_tracked_children(children):
+        return False
+    return not _observe_subreaper_children()
+
+
 def _signal_tracked_descendants(descendants: set[_TrackedGitDescendant], signal_number: int) -> bool:
     """Signal only descendants whose PID identity still matches observation."""
     for descendant in descendants:
@@ -3578,9 +3727,10 @@ def _terminate_git_process_group(
         proc.poll()
         if _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants):
             proc.wait(timeout=0)
-            # `/proc` and process-group absence prove only this sampled group.
-            # A `setsid()` descendant may have escaped and forked after the
-            # snapshot, so this is deliberately never cleanup success.
+            # Reap any child reparented by the Linux subreaper before the
+            # terminal fail-closed result is surfaced.  An empty leader tree
+            # snapshot remains insufficient to promote this into success.
+            _terminate_subreaper_children(deadline)
             return False
         time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
     try:
@@ -3595,14 +3745,15 @@ def _terminate_git_process_group(
         proc.poll()
         if _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants):
             proc.wait(timeout=0)
-            # `/proc` and process-group absence prove only this sampled group.
-            # A `setsid()` descendant may have escaped and forked after the
-            # snapshot, so this is deliberately never cleanup success.
+            # Reap any child reparented by the Linux subreaper before the
+            # terminal fail-closed result is surfaced.  An empty leader tree
+            # snapshot remains insufficient to promote this into success.
+            _terminate_subreaper_children(deadline)
             return False
         time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
-    # The final `/proc` observation is also only a point-in-time sample.
-    # No cgroup/subreaper containment is established by this executor, so
-    # returning success here would accept a delayed `setsid()` escape.
+    # Ensure adopted children are not left as zombies even though a final
+    # advisory `/proc` snapshot cannot certify successful containment.
+    _terminate_subreaper_children(deadline)
     return False
 
 
@@ -3694,6 +3845,11 @@ def _run_closed_git_process(
     deadline: GitProtocolDeadline,
 ) -> subprocess.CompletedProcess:
     deadline.execution_seconds()
+    if not _enable_linux_child_subreaper():
+        # A process group cannot contain a child which calls setsid().  Do not
+        # run a Git command on a platform where that escape cannot be observed
+        # through kernel parentage and subsequently cleaned up.
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_containment_unavailable")
     argv = _exact_git_argv(operation, git_executable=git_executable, cwd=cwd, hooks_dir=hooks_dir)
     kwargs: dict[str, object] = {
         "cwd": cwd,
@@ -3755,6 +3911,19 @@ def _run_closed_git_process(
         or not _tracked_descendants_absent(descendants)
     ):
         if not _terminate_git_process_group(proc, pgid, deadline, descendants):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_descendant_leak")
+
+    # `communicate()` has reaped the direct Git leader.  A prior empty
+    # leader-rooted `/proc` snapshot cannot prove success: a delayed setsid()
+    # child may have escaped between snapshots.  With the subreaper enabled,
+    # every such live orphan is now directly parented here.  It is terminated
+    # and reaped, but its existence is still a fail-closed protocol failure.
+    adopted_children = _observe_subreaper_children()
+    if adopted_children is None:
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    if adopted_children:
+        if not _terminate_subreaper_children(deadline):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_descendant_leak")
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)

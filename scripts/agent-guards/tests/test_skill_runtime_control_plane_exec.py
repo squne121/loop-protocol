@@ -230,6 +230,24 @@ def test_deadline_reserve_refuses_terminal_spawn(monkeypatch, tmp_path):
     assert not spawned
 
 
+def test_noncontained_platform_fails_closed_before_git_spawn(monkeypatch, tmp_path):
+    monkeypatch.setattr(exec_mod, "_enable_linux_child_subreaper", lambda: False)
+    monkeypatch.setattr(
+        exec_mod.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("uncontained Git command must not spawn"),
+    )
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="containment_unavailable"):
+        exec_mod._run_closed_git_process(
+            exec_mod._GitOperation("repository_object_format"),
+            git_executable="/usr/bin/git",
+            cwd=str(tmp_path),
+            env={},
+            hooks_dir=str(tmp_path),
+            deadline=_deadline(),
+        )
+
+
 def test_timeout_terminates_and_reaps_dedicated_process_group(monkeypatch, tmp_path):
     fake_git = tmp_path / "fake-git"
     child_pid = tmp_path / "child.pid"
@@ -581,20 +599,59 @@ def _assert_delayed_escape_trace_and_reap(pid_file: Path, trace_file: Path) -> N
     assert pid_file.exists(), "delayed setsid descendant did not materialize"
     pid = int(pid_file.read_text(encoding="utf-8"))
     try:
+        # `setsid` makes this fixture PID its own process-group leader.  Kill
+        # the complete fixture group and reap the adopted leader so the test
+        # process's Linux subreaper role cannot retain a zombie.
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
-    finally:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.01)
-    pytest.fail("delayed escape fixture cleanup did not complete")
+
+
+def test_successful_leader_with_readable_empty_snapshot_and_delayed_setsid_child_fails_closed(monkeypatch, tmp_path):
+    # A leader-rooted empty snapshot cannot certify normal-success cleanup.
+    # The fixture deliberately makes the legacy `/proc` observer return a
+    # readable empty set. Its real `setsid` child is started before the leader
+    # exits successfully and remains alive afterward. Linux subreaper
+    # parentage, rather than a sleep or another snapshot count, makes that
+    # child directly observable and permits cleanup before fail-closed return.
+    fake_git = tmp_path / "setsid-success-git"
+    child_pid = tmp_path / "setsid-success-child.pid"
+    trace = tmp_path / "setsid-success.trace"
+    fake_git.write_text(
+        f'''#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+  *)
+    (sleep 0.02; setsid sh -c 'echo $$ > "{child_pid}"; sleep 30') >/dev/null 2>&1 &
+    sleep 0.10
+    echo leader-success > "{trace}"
+    exit 0 ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    # This models the review finding: `/proc` is readable but the old
+    # leader-rooted observation races and sees no descendant.
+    monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: set())
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="descendant_leak"):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+        )
+    assert trace.read_text(encoding="utf-8") == "leader-success\n"
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 def test_timeout_delayed_setsid_escape_fails_closed_not_snapshot_success(monkeypatch, tmp_path):
