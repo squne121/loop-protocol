@@ -472,3 +472,67 @@ def test_registry_loader_rejects_duplicate_nested_surface_id_key(tmp_path: Path)
     )
     with pytest.raises(rvi.RegistryError, match="duplicate key"):
         rvi.load_and_validate_registry(duplicate_key_registry, SCHEMA_PATH, None, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# 5. V2 golden digest fixture (Issue #2284 In Scope: "V2 と V3 それぞれ 1 件の
+#    full-record→expected-SHA256 golden digest fixture を追加する").
+# ---------------------------------------------------------------------------
+
+
+def test_build_evidence_manifest_v2_record_matches_golden_digest_fixture() -> None:
+    """GIVEN a fully-populated, fixed-value V2 record built via the real
+    production `build_evidence_manifest_v2_record()` WHEN its
+    `manifest_sha256` is compared against an INDEPENDENTLY computed
+    (hand-rolled canonical JSON + hashlib, never calling the production
+    digest helper) expected SHA-256 THEN they match -- pinning the exact
+    digest algorithm (canonical JSON key order / separators / excluded
+    `manifest_sha256` field / `run_attempt` EXCLUSION from V2's digest
+    input) against silent regression."""
+    import hashlib
+
+    record = rvi.build_evidence_manifest_v2_record(
+        surface_id="combat-hud-running",
+        contract_digest="c" * 64,
+        head_sha="a" * 40,
+        workflow_run_id=100,
+        check_run_id=None,
+        check_suite_id=None,
+        github_app_id=None,
+        github_app_slug=None,
+        check_conclusion=None,
+        baseline_path="docs/dev/visual-baselines/combat-hud-running.png",
+        baseline_sha256="b" * 64,
+        actual_sha256="b" * 64,
+        mismatched_pixels=0,
+        verify_command_id="vc1",
+        verify_succeeded=True,
+        update_command_id="uc1",
+        update_executed=False,
+        update_succeeded=False,
+        expected_artifact_id="1",
+        actual_artifact_id="2",
+        diff_artifact_id="3",
+    )
+    # V2 compatibility behavior: `run_attempt` is assigned onto the dict
+    # AFTER digest computation and is NEVER part of the digest input (see
+    # `_MANIFEST_V2_RECORD_FIELDS`'s module-level comment) -- assigning it
+    # here (mirroring the real `ci.yml`/`_run_build_evidence_manifest`
+    # call-site pattern) must NOT perturb the already-computed digest.
+    record["run_attempt"] = 1
+
+    expected_digest_input = {name: record.get(name) for name in rvi._MANIFEST_V2_RECORD_FIELDS}
+    canonical = __import__("json").dumps(expected_digest_input, sort_keys=True, separators=(",", ":"))
+    expected_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    assert record["manifest_sha256"] == expected_sha256
+    assert len(record["manifest_sha256"]) == 64
+    assert rvi.verify_evidence_manifest_v2_record_digest(record) is True
+
+    # Changing `run_attempt` post-hoc must NOT invalidate a V2 record's
+    # digest (compatibility behavior, AC4) -- this is the exact V2/V3
+    # behavioral DIFFERENCE Issue #2284 introduces (V3's digest DOES cover
+    # `run_attempt`; see test_visual_impact_v3_manifest_seams.py's digest
+    # tests).
+    record["run_attempt"] = 2
+    assert rvi.verify_evidence_manifest_v2_record_digest(record) is True

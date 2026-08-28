@@ -258,6 +258,43 @@ def test_tuple_binding_both_artifacts_evidence_manifest_head_sha_mismatch_fails_
     assert any(code.startswith("evidence_manifest_head_sha_mismatch") for code in verdict.reason_codes)
 
 
+def test_v2_record_head_sha_mismatch_fails_closed_without_trusted_rederivation():
+    """Issue #2379 OWNER fix_delta P2-1 (regression fix): this head_sha
+    check must fire even when the caller passes NO `trusted_rederivation`
+    at all (`None`, the plain V2 fallback verification path used by any
+    caller that never supplies CheckRun provenance) -- previously the
+    check only ran INSIDE the `trusted_rederivation is not None and
+    trusted_rederivation.component_vrt_checkrun_provenance` guard, so a
+    `trusted_rederivation=None` caller never detected a record whose
+    `head_sha` does not match the expected candidate PR head at all,
+    even though the decision itself and the record's own tamper-evidence
+    digest are both otherwise valid."""
+    decision = _decision(workflow_run_id=RUN_ID, run_attempt=RUN_ATTEMPT)
+    mismatched_record = _manifest_record(workflow_run_id=RUN_ID, run_attempt=RUN_ATTEMPT, head_sha="f" * 40)
+    decision["affected_surfaces"] = [
+        {
+            "surface_id": "combat-hud-running",
+            "contract_id": "combat-hud-running:vitest-browser-mode",
+            "disposition": "verified_unchanged",
+            "evidence": {"evidence_manifest_digest": mismatched_record["manifest_sha256"]},
+        }
+    ]
+    manifest = {"schema": rvi.EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": [mismatched_record]}
+    verdict = rvi.verify_trusted_artifact(
+        decision_raw=json.dumps(decision).encode("utf-8"),
+        evidence_manifest_raw=json.dumps(manifest).encode("utf-8"),
+        visual_impact_schema_path=SCHEMA_PATH,
+        expected_head_sha=HEAD_SHA,
+        expected_repository=REPOSITORY,
+        expected_pr_number=2230,
+        trusted_rederivation=None,
+    )
+    assert verdict.ok is False
+    assert any(code.startswith("evidence_manifest_head_sha_mismatch") for code in verdict.reason_codes), (
+        verdict.reason_codes
+    )
+
+
 def test_tuple_binding_both_artifacts_schema_requires_workflow_run_id_and_run_attempt():
     """AC2's `rg` baseline-check counterpart: the schema itself now REQUIRES
     workflow_run_id/run_attempt on VISUAL_IMPACT_DECISION_V1 (a decision
