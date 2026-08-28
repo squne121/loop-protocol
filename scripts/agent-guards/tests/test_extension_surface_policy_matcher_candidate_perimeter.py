@@ -146,6 +146,139 @@ def test_malformed_candidate_policy_is_policy_unavailable_not_silent_approve():
 
 
 # ---------------------------------------------------------------------------
+# PR #2370 OWNER review fix_delta (iteration 1, P1-1): every distinct shape
+# of a malformed/missing `unknown_surface_policy` must fail closed with
+# `PolicyLoadError` -- never silently degrade to "no candidate perimeter"
+# (which looks identical to a legitimately clean/empty one) and never
+# silently skip an individual invalid glob entry with `continue`.
+# ---------------------------------------------------------------------------
+
+_BASE_UNRELATED_RULE_POLICY: dict = {
+    "resolution": {"multiple_matches": "evaluate_all", "final_decision": "most_restrictive"},
+    "rules": [
+        {
+            "id": "rule-unrelated",
+            "selectors": [
+                {"source_scope": "project", "path_globs": ["fixtures/**"]},
+            ],
+            "default_decision": "immediate",
+            "verification_profile": "profile-unrelated",
+        },
+    ],
+}
+
+
+def _policy_with_unknown_surface_policy(unknown_surface_policy) -> dict:
+    return {**_BASE_UNRELATED_RULE_POLICY, "unknown_surface_policy": unknown_surface_policy}
+
+
+def test_missing_unknown_surface_policy_key_fails_closed():
+    # `unknown_surface_policy` omitted entirely (not even `None`).
+    policy = dict(_BASE_UNRELATED_RULE_POLICY)
+    with pytest.raises(PolicyLoadError):
+        evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+def test_unknown_surface_policy_none_fails_closed():
+    policy = _policy_with_unknown_surface_policy(None)
+    with pytest.raises(PolicyLoadError):
+        evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+def test_unknown_surface_policy_non_dict_fails_closed():
+    policy = _policy_with_unknown_surface_policy(["not", "a", "mapping"])
+    with pytest.raises(PolicyLoadError):
+        evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+def test_unknown_surface_policy_decision_missing_fails_closed():
+    policy = _policy_with_unknown_surface_policy(
+        {"gate": "advisory", "project_candidate_path_globs": [".claude/commands/**"]}
+    )
+    with pytest.raises(PolicyLoadError):
+        evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+def test_unknown_surface_policy_decision_invalid_value_fails_closed():
+    policy = _policy_with_unknown_surface_policy(
+        {
+            "decision": "not_applicable",
+            "gate": "advisory",
+            "project_candidate_path_globs": [".claude/commands/**"],
+        }
+    )
+    with pytest.raises(PolicyLoadError):
+        evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+def test_unknown_surface_policy_gate_missing_fails_closed():
+    policy = _policy_with_unknown_surface_policy(
+        {"decision": "human_judgment", "project_candidate_path_globs": [".claude/commands/**"]}
+    )
+    with pytest.raises(PolicyLoadError):
+        evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+def test_unknown_surface_policy_gate_invalid_value_fails_closed():
+    # `gate: block` was the pre-Issue-#2339 production value -- PR #2370
+    # P1-3 narrows the schema to `const: advisory`, so this must now also
+    # fail closed rather than silently be treated as a valid, unread gate.
+    policy = _policy_with_unknown_surface_policy(
+        {
+            "decision": "human_judgment",
+            "gate": "block",
+            "project_candidate_path_globs": [".claude/commands/**"],
+        }
+    )
+    with pytest.raises(PolicyLoadError):
+        evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+def test_unknown_surface_policy_candidate_globs_key_missing_fails_closed():
+    policy = _policy_with_unknown_surface_policy({"decision": "human_judgment", "gate": "advisory"})
+    with pytest.raises(PolicyLoadError):
+        evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+def test_unknown_surface_policy_candidate_globs_empty_list_fails_closed():
+    policy = _policy_with_unknown_surface_policy(
+        {"decision": "human_judgment", "gate": "advisory", "project_candidate_path_globs": []}
+    )
+    with pytest.raises(PolicyLoadError):
+        evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+def test_unknown_surface_policy_candidate_globs_empty_string_element_fails_closed():
+    policy = _policy_with_unknown_surface_policy(
+        {
+            "decision": "human_judgment",
+            "gate": "advisory",
+            "project_candidate_path_globs": [".claude/commands/**", ""],
+        }
+    )
+    with pytest.raises(PolicyLoadError):
+        evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+def test_unknown_surface_policy_candidate_globs_matcher_v2_invalid_glob_fails_closed():
+    # matcher-v2 rejects partial-segment wildcards (e.g. "*.md"), absolute
+    # paths, ".." segments, and empty segments (AllowedPathsMatcher
+    # .normalize_allowed_pattern()) -- an invalid glob must fail closed
+    # rather than be silently skipped with `continue` (never matching
+    # anything, indistinguishable from an intentionally narrow perimeter).
+    for invalid_glob in ["*.md", "/etc/passwd", "../escape/**", ".claude//double-slash"]:
+        policy = _policy_with_unknown_surface_policy(
+            {
+                "decision": "human_judgment",
+                "gate": "advisory",
+                "project_candidate_path_globs": [invalid_glob],
+            }
+        )
+        with pytest.raises(PolicyLoadError):
+            evaluate_allowed_paths([".claude/commands/some-new-command.md"], policy=policy)
+
+
+# ---------------------------------------------------------------------------
 # AC10: a real, existing repository-relative path (`.claude/rules/
 # project-constitution.md`, not a fictitious fixture) must be detected as
 # `unclassified_candidate` (or a matching formal rule, if one existed) --

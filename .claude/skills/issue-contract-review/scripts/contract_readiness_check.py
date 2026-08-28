@@ -1455,6 +1455,19 @@ def check_extension_surface_risk_trigger(body: str) -> list[dict]:
     ]
 
 
+# PR #2370 OWNER review fix_delta (iteration 1, P0): readiness `errors[]`
+# categories that are informational/non-blocking only. Currently just
+# `check_extension_surface_advisory()`'s EXTSURF003 (Issue #2339
+# `unclassified_candidate` advisory). Centralised here so both the
+# `fix_hint`/`minimal_context` selection in `build_result()` and (via the
+# `contract_readiness_check.py --mode merge_readiness`-equivalent
+# `check_issue_contract.py`'s `merge_readiness_into_review_result()`, which
+# filters on the same `category` string independently since it lives in a
+# different dynamically-loaded module) treat this category consistently as
+# never contributing to a blocking verdict.
+_NON_BLOCKING_READINESS_ERROR_CATEGORIES = {"extension_surface_candidate_advisory"}
+
+
 def check_extension_surface_advisory(body: str) -> list[dict]:
     """Issue #2339: non-blocking `unclassified_candidate` advisory findings.
 
@@ -1955,10 +1968,23 @@ def build_result(
         else:
             overall_status = _raise_status(overall_status, "needs_fix")
 
+    # PR #2370 OWNER review fix_delta (iteration 1, P0): `fix_hint` /
+    # `minimal_context` must be selected from the BLOCKING subset of
+    # `all_errors` only. `ext_surface_advisory_errors` (EXTSURF003,
+    # category: extension_surface_candidate_advisory) is a non-blocking
+    # finding kept in `all_errors` for display purposes only -- if it were
+    # allowed to become `first_error` (e.g. when it is the only entry
+    # present, or simply precedes a later blocking error in list order), a
+    # genuinely blocking finding's `fix_hint` would be silently hidden
+    # behind a "no action required" advisory message, self-contradicting
+    # the very blocker it was meant to surface.
+    blocking_errors_for_fix_hint = [
+        e for e in all_errors if e.get("category") not in _NON_BLOCKING_READINESS_ERROR_CATEGORIES
+    ]
     fix_hint: Optional[str] = None
     minimal_context: list = []
-    if all_errors:
-        first_error = all_errors[0]
+    if blocking_errors_for_fix_hint:
+        first_error = blocking_errors_for_fix_hint[0]
         fix_hint = first_error.get("fix_hint")
         minimal_context = first_error.get("minimal_context", [])
 

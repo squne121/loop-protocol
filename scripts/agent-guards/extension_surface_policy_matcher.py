@@ -142,51 +142,107 @@ def _validate_policy_contract(data: dict[str, Any], path: Path) -> None:
         )
 
 
-def _extract_candidate_path_globs(data: dict[str, Any]) -> list[str]:
-    """Cheap structural validation + extraction of
-    ``unknown_surface_policy.project_candidate_path_globs`` (Issue #2339 AC9).
+# `unknown_surface_policy.decision` / `.gate` values this module's evaluator
+# actually implements. Mirrors `docs/dev/extension-surface-runtime-policy
+# .schema.json`'s `unknown_surface_policy.decision` (`enum: [human_judgment]`)
+# and `.gate` (narrowed to `const: advisory`, Issue #2339 PR #2370 OWNER
+# review fix_delta P1-3 -- `gate: block` is no longer a supported production
+# value; a policy declaring any other value is not safely interpretable and
+# must fail closed rather than silently mis-evaluate or be read as dead
+# metadata).
+_EXPECTED_UNKNOWN_SURFACE_POLICY_DECISION = "human_judgment"
+_EXPECTED_UNKNOWN_SURFACE_POLICY_GATE = "advisory"
+
+
+def _extract_unknown_surface_policy(data: dict[str, Any]) -> dict[str, Any]:
+    """Cheap structural validation + extraction of the full
+    ``unknown_surface_policy`` mapping (``decision`` / ``gate`` /
+    ``project_candidate_path_globs``) (Issue #2339 AC9; PR #2370 OWNER
+    review fix_delta P1-1/P1-3).
 
     Called from ``evaluate_allowed_paths`` for *every* policy source (both
     the default ``load_policy()`` path and a ``policy=`` dict passed
-    directly by a caller/test), so a malformed
-    ``unknown_surface_policy.project_candidate_path_globs`` fails closed
-    with a distinguishable ``PolicyLoadError`` regardless of how the policy
-    mapping was constructed -- it must never silently degrade to "no
-    candidate perimeter" (which would look identical to a legitimately
-    clean/empty candidate perimeter and risk silently approving what should
-    have been an advisory finding, Issue #2339 AC9).
+    directly by a caller/test), so a malformed ``unknown_surface_policy``
+    fails closed with a distinguishable ``PolicyLoadError`` regardless of
+    how the policy mapping was constructed -- it must never silently
+    degrade to "no candidate perimeter" (which would look identical to a
+    legitimately clean/empty candidate perimeter and risk silently
+    approving what should have been an advisory finding, Issue #2339 AC9).
 
-    ``unknown_surface_policy`` itself is OPTIONAL at this (Python-level,
-    cheap) validation layer -- older/minimal fixture policies used by
-    existing tests (e.g. ``_MULTI_RULE_POLICY``) omit the key entirely and
-    must keep working unchanged; they simply have no candidate perimeter
-    (every non-rule-matched entry classifies as ``ordinary``). The real
-    production YAML's ``unknown_surface_policy`` (and its
-    ``project_candidate_path_globs`` field) is additionally required by
-    ``docs/dev/extension-surface-runtime-policy.schema.json`` -- that is a
-    separate, stricter validation layer (Issue #2339 Notes for Reviewer).
+    ``unknown_surface_policy`` is REQUIRED here (PR #2370 OWNER review
+    fix_delta P1-1 -- the previous "optional at this cheap-validation layer"
+    design let a missing/``None`` ``unknown_surface_policy`` or a missing
+    ``project_candidate_path_globs`` key silently fall through to "no
+    candidate perimeter" instead of failing closed, contradicting
+    ``docs/dev/extension-surface-runtime-policy.schema.json`` which already
+    declares all three of ``decision`` / ``gate`` /
+    ``project_candidate_path_globs`` as required). Every fixture policy
+    passed through this function -- including synthetic/minimal test
+    fixtures -- must declare a structurally valid ``unknown_surface_policy``;
+    this is intentionally NOT made optional again to "fix" a failing
+    fixture (fixtures are the ones that must be updated, not this
+    validation).
+
+    ``decision`` and ``gate`` are validated against the single production
+    value each currently supports (see the module-level
+    ``_EXPECTED_UNKNOWN_SURFACE_POLICY_*`` constants above) rather than left
+    unread as dead metadata (P1-3): an unsupported value is exactly as
+    unsafe to silently ignore as a malformed
+    ``project_candidate_path_globs`` list.
     """
     unknown_surface_policy = data.get("unknown_surface_policy")
-    if unknown_surface_policy is None:
-        return []
     if not isinstance(unknown_surface_policy, dict):
         raise PolicyLoadError(
-            f"policy declares 'unknown_surface_policy' as {type(unknown_surface_policy).__name__}, "
-            "expected a mapping"
+            f"policy declares 'unknown_surface_policy' as "
+            f"{type(unknown_surface_policy).__name__ if unknown_surface_policy is not None else 'missing/None'}, "
+            "expected a mapping (Issue #2339 AC9 / PR #2370 P1-1: a missing or non-mapping "
+            "'unknown_surface_policy' must fail closed as policy-unavailable, not silently "
+            "degrade to 'no candidate perimeter')"
         )
-    if "project_candidate_path_globs" not in unknown_surface_policy:
-        return []
+
+    decision = unknown_surface_policy.get("decision")
+    if decision != _EXPECTED_UNKNOWN_SURFACE_POLICY_DECISION:
+        raise PolicyLoadError(
+            f"policy declares 'unknown_surface_policy.decision' as {decision!r}, expected "
+            f"{_EXPECTED_UNKNOWN_SURFACE_POLICY_DECISION!r} (PR #2370 P1-1: an unsupported/missing "
+            "decision value must fail closed rather than be silently unread)"
+        )
+
+    gate = unknown_surface_policy.get("gate")
+    if gate != _EXPECTED_UNKNOWN_SURFACE_POLICY_GATE:
+        raise PolicyLoadError(
+            f"policy declares 'unknown_surface_policy.gate' as {gate!r}, expected "
+            f"{_EXPECTED_UNKNOWN_SURFACE_POLICY_GATE!r} (PR #2370 P1-1/P1-3: an unsupported/missing "
+            "gate value must fail closed rather than be silently unread)"
+        )
+
     raw_globs = unknown_surface_policy.get("project_candidate_path_globs")
-    if not isinstance(raw_globs, list) or not all(
-        isinstance(glob, str) and glob for glob in raw_globs
-    ):
+    if not isinstance(raw_globs, list) or not raw_globs:
         raise PolicyLoadError(
             "policy declares 'unknown_surface_policy.project_candidate_path_globs' as "
-            f"{raw_globs!r}, expected a non-empty list of non-empty strings (Issue #2339 AC9: "
-            "malformed unknown_surface_policy must fail closed as policy-unavailable, not "
-            "silently approve)"
+            f"{raw_globs!r}, expected a non-empty list of non-empty, matcher-v2-valid glob "
+            "strings (Issue #2339 AC9: malformed unknown_surface_policy must fail closed as "
+            "policy-unavailable, not silently approve)"
         )
-    return raw_globs
+    for glob in raw_globs:
+        if not isinstance(glob, str) or not glob:
+            raise PolicyLoadError(
+                "policy declares an entry in 'unknown_surface_policy.project_candidate_path_globs' "
+                f"as {glob!r}, expected a non-empty string (PR #2370 P1-1: fail closed rather than "
+                "silently skip an invalid candidate glob)"
+            )
+        if AllowedPathsMatcher.normalize_allowed_pattern(glob) is None:
+            raise PolicyLoadError(
+                f"policy declares 'unknown_surface_policy.project_candidate_path_globs' entry "
+                f"{glob!r} which is not a valid matcher-v2 glob (PR #2370 P1-1: an invalid glob "
+                "must fail closed rather than be silently read as 'continue'/never match)"
+            )
+
+    return {
+        "decision": decision,
+        "gate": gate,
+        "project_candidate_path_globs": raw_globs,
+    }
 
 
 def load_policy(policy_path: Optional[Path] = None) -> dict[str, Any]:
@@ -463,7 +519,14 @@ def evaluate_allowed_paths(
     """
     policy_data = policy if policy is not None else load_policy()
     rules = policy_data.get("rules", []) or []
-    candidate_path_globs = _extract_candidate_path_globs(policy_data)
+    unknown_surface_policy = _extract_unknown_surface_policy(policy_data)
+    candidate_path_globs = unknown_surface_policy["project_candidate_path_globs"]
+    # PR #2370 P1-3: `decision` / `gate` are read (not dead metadata) and
+    # surfaced verbatim on every `unclassified_candidate` classification
+    # below via `policy_action`, but never merged into `final_decision`
+    # (Issue #2339 AC8) -- `human_judgment` never appears as a
+    # `final_decision` value.
+    policy_action = {"decision": unknown_surface_policy["decision"], "gate": unknown_surface_policy["gate"]}
 
     matched_rules: list[dict[str, Any]] = []
     verification_profiles: set[str] = set()
@@ -525,6 +588,7 @@ def evaluate_allowed_paths(
                     "entry": entry,
                     "classification": "unclassified_candidate",
                     "candidate_path_glob": candidate_glob,
+                    "policy_action": policy_action,
                 }
             )
             advisories.append(
