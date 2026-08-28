@@ -41,16 +41,16 @@ credential を保持できるフィールドは存在しない（`private_eviden
 `schema_version` / `run_id` / `base_sha` / `source_set_digest` /
 `candidate_records: list[dict]` / `evidence_ref: str`。`finalize` phase の入力。
 
-### candidate_records[] の judgment-only wire shape（Issue #2362 Scope Reframe、2026-08-28 owner 承認）
+### candidate_records[] の判定専用（judgment-only）wire shape（Issue #2362 のスコープ再定義、2026-08-28 owner 承認済み）
 
 `--json-schema` として evaluator 呼び出しに渡される
 `schemas/evaluation_result_v1.schema.json`（draft-07）の `candidate_records[].items` は、
 evaluator-authoritative な judgment フィールドのみを要求する flat shape に絞り込まれている:
 
-- `candidate_id` / `title` / `description`（string）
+- `candidate_id` / `title` / `description`（いずれも string 型の判定結果フィールド）
 - `claim_class`（canonical `agent_improvement_candidate_v1.schema.json` の `claim_class` enum と同期）
 - `subject_ref`（`kind`/`value`。canonical schema の discriminated union 制約を draft-07 で自前 author）
-- `rule_id`（namespaced dot-separated token、pattern `^[a-z0-9_]+(\.[a-z0-9_]+)*$`）
+- `rule_id`（namespace 区切りのドット連結トークンで、pattern `^[a-z0-9_]+(\.[a-z0-9_]+)*$` に一致する文字列であること）
 - `evidence_refs[]`（`ref_type`/`source_id`/`resource_identity` のみ。`projection_digest` は含まない）
 
 `identity` / `evaluations` / `repository_id` / `source_run_ref` / `created_at` / `updated_at` /
