@@ -30,6 +30,25 @@ _REPO_ROOT = _GUARDS_DIR.parents[1]
 _REVIEW_ISSUE_SCRIPTS = _REPO_ROOT / ".claude" / "skills" / "review-issue" / "scripts"
 _CONTRACT_READINESS_SCRIPTS = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
 
+# PR #2370 OWNER review fix_delta (P1-1): `unknown_surface_policy` is now a
+# required, strictly-validated mapping on every policy passed to
+# `evaluate_allowed_paths`/`evaluate_issue_risk_trigger` (not just the real
+# production YAML) -- a synthetic fixture policy that previously omitted the
+# key entirely would now fail closed with `PolicyLoadError` instead of
+# quietly having "no candidate perimeter". Every synthetic fixture policy
+# dict below that is exercised through the shared evaluator must therefore
+# declare a minimal, structurally valid `unknown_surface_policy` -- fixtures
+# are fixed to carry a valid one rather than the validation being loosened
+# back to optional (Issue #2339, PR #2370 P1-1 fix_delta explicit
+# instruction). The glob deliberately does not overlap with any Allowed
+# Path entry used by the tests below, so it never changes any existing
+# assertion about `matched_rules` / `final_decision` / `verification_profiles`.
+_MINIMAL_VALID_UNKNOWN_SURFACE_POLICY = {
+    "decision": "human_judgment",
+    "gate": "advisory",
+    "project_candidate_path_globs": ["zzz-unused-synthetic-candidate-perimeter/**"],
+}
+
 
 def _load_module_from_path(module_name: str, path: Path):
     spec = importlib.util.spec_from_file_location(module_name, path)
@@ -105,6 +124,7 @@ def test_docs_only_not_applicable_approve():
 
 _MULTI_RULE_POLICY = {
     "resolution": {"multiple_matches": "evaluate_all", "final_decision": "most_restrictive"},
+    "unknown_surface_policy": _MINIMAL_VALID_UNKNOWN_SURFACE_POLICY,
     "rules": [
         {
             "id": "rule-deferred-scope",
@@ -319,6 +339,7 @@ def test_wildcard_entry_matching_only_skill_md_glob_still_hard():
     # glob) must remain a hard match, same as before the fix.
     single_glob_policy = {
         "resolution": {"multiple_matches": "evaluate_all", "final_decision": "most_restrictive"},
+        "unknown_surface_policy": _MINIMAL_VALID_UNKNOWN_SURFACE_POLICY,
         "rules": [
             {
                 "id": "rule-skill-md-only",
@@ -616,6 +637,7 @@ def test_candidate_only_path_globs_removed():
 def test_selector_omitting_issue_time_enforcement_defaults_to_hard():
     synthetic_policy = {
         "resolution": {"multiple_matches": "evaluate_all", "final_decision": "most_restrictive"},
+        "unknown_surface_policy": _MINIMAL_VALID_UNKNOWN_SURFACE_POLICY,
         "rules": [
             {
                 "id": "synthetic-rule-no-issue-time-enforcement",
@@ -653,6 +675,7 @@ def test_selector_omitting_issue_time_enforcement_defaults_to_hard():
 def test_invalid_issue_time_enforcement_fails_closed():
     bad_policy = {
         "resolution": {"multiple_matches": "evaluate_all", "final_decision": "most_restrictive"},
+        "unknown_surface_policy": _MINIMAL_VALID_UNKNOWN_SURFACE_POLICY,
         "rules": [
             {
                 "id": "synthetic-rule-invalid-issue-time-enforcement",

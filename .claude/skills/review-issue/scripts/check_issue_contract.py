@@ -495,6 +495,20 @@ def readiness_error_to_structured_blocker(
     }
 
 
+# PR #2370 OWNER review fix_delta (iteration 1, P0): readiness `errors[]`
+# categories that are informational/non-blocking only, independently
+# maintained (both this string constant and the identically-named/valued
+# `contract_readiness_check.py::_NON_BLOCKING_READINESS_ERROR_CATEGORIES`
+# constant are dynamically loaded from separate files, so there is no
+# static import boundary to share them across -- Issue #2290 "Notes for
+# Reviewer" no-new-package rule). Currently just `extension_surface_
+# candidate_advisory` (Issue #2339 EXTSURF003 `unclassified_candidate`
+# advisory). `merge_readiness_into_review_result()` routes entries in this
+# category to `non_blocking_improvements` instead of `structured_blockers`/
+# `blocking_issues`/`failure_class` escalation.
+_NON_BLOCKING_READINESS_ERROR_CATEGORIES = {"extension_surface_candidate_advisory"}
+
+
 def readiness_errors_to_structured_blockers(
     readiness_errors: list[dict],
     *,
@@ -571,6 +585,20 @@ def merge_readiness_into_review_result(
     on stale/mismatched evidence (Issue #1791 review remediation, High #5).
     Individual errors whose evidence is otherwise invalid are dropped by
     `readiness_errors_to_structured_blockers()`.
+
+    PR #2370 OWNER review fix_delta (iteration 1, P0): readiness errors whose
+    `category` is in `_NON_BLOCKING_READINESS_ERROR_CATEGORIES` (currently
+    only `extension_surface_candidate_advisory`, Issue #2339's EXTSURF003
+    `unclassified_candidate` advisory) are non-blocking by construction --
+    they must never be converted into a `structured_blockers` entry, never
+    counted in `blocking_issues`, and must never cause `verdict` /
+    `failure_class` escalation. Previously this function blindly converted
+    every entry in `readiness_result.errors` (blocking or not) into a
+    blocking `structured_blocker`, which silently turned an
+    advisory-only-classified Allowed Path (e.g.
+    `.claude/rules/project-constitution.md`) into a `needs-fix` verdict --
+    a direct violation of Issue #2339 AC6. Such advisory entries are instead
+    routed into `non_blocking_improvements`.
     """
     merged = json.loads(json.dumps(review_result))
     review_body_sha256 = merged.get("body_sha256")
@@ -587,43 +615,71 @@ def merge_readiness_into_review_result(
                 f"({readiness_body_sha256!r}); refusing to merge (fail-closed)"
             )
 
-        new_blockers = readiness_errors_to_structured_blockers(
-            readiness_errors,
-            body_sha256=review_body_sha256,
-            iteration_id=iteration_id,
-            readiness_status=readiness_status,
-            artifact_path=readiness_artifact_path,
-        )
-        merged["structured_blockers"] = (
-            list(merged.get("structured_blockers") or []) + new_blockers
-        )
-        merged["blocking_issues"] = list(merged.get("blocking_issues") or []) + [
-            str(
-                error.get("fix_hint")
-                or error.get("message")
-                or error.get("rule_id")
-                or "readiness_error"
-            )
+        blocking_readiness_errors = [
+            error
             for error in readiness_errors
+            if error.get("category") not in _NON_BLOCKING_READINESS_ERROR_CATEGORIES
+        ]
+        advisory_readiness_errors = [
+            error
+            for error in readiness_errors
+            if error.get("category") in _NON_BLOCKING_READINESS_ERROR_CATEGORIES
         ]
 
-        failure_class = readiness_status_to_failure_class(readiness_status)
-        if failure_class:
-            merged["failure_class"] = failure_class
-            # `compact_review_result.py` checks `verdict == "approve"` first
-            # and short-circuits to `NEXT_ACTION: proceed` before it ever
-            # looks at `failure_class` (Issue #1791 review remediation
-            # iteration 3). If the underlying contract check itself
-            # returned `verdict: approve` (readiness errors such as
-            # env_missing_dep/timeout are independent of body content and
-            # can coexist with an approve verdict), force it to
-            # `needs-fix` here so the human_judgment failure_class is not
-            # silently dropped by compact_review_result.py's
-            # verdict-first branching.
-            if merged.get("verdict") == "approve":
+        if advisory_readiness_errors:
+            merged["non_blocking_improvements"] = list(
+                merged.get("non_blocking_improvements") or []
+            ) + [
+                {
+                    "code": str(error.get("rule_id") or "READINESS_ADVISORY"),
+                    "severity": "advisory",
+                    "evidence": error.get("minimal_context", []),
+                    "suggested_action": str(
+                        error.get("fix_hint") or error.get("category") or "readiness advisory"
+                    ),
+                }
+                for error in advisory_readiness_errors
+            ]
+
+        new_blockers: list = []
+        if blocking_readiness_errors:
+            new_blockers = readiness_errors_to_structured_blockers(
+                blocking_readiness_errors,
+                body_sha256=review_body_sha256,
+                iteration_id=iteration_id,
+                readiness_status=readiness_status,
+                artifact_path=readiness_artifact_path,
+            )
+            merged["structured_blockers"] = (
+                list(merged.get("structured_blockers") or []) + new_blockers
+            )
+            merged["blocking_issues"] = list(merged.get("blocking_issues") or []) + [
+                str(
+                    error.get("fix_hint")
+                    or error.get("message")
+                    or error.get("rule_id")
+                    or "readiness_error"
+                )
+                for error in blocking_readiness_errors
+            ]
+
+            failure_class = readiness_status_to_failure_class(readiness_status)
+            if failure_class:
+                merged["failure_class"] = failure_class
+                # `compact_review_result.py` checks `verdict == "approve"` first
+                # and short-circuits to `NEXT_ACTION: proceed` before it ever
+                # looks at `failure_class` (Issue #1791 review remediation
+                # iteration 3). If the underlying contract check itself
+                # returned `verdict: approve` (readiness errors such as
+                # env_missing_dep/timeout are independent of body content and
+                # can coexist with an approve verdict), force it to
+                # `needs-fix` here so the human_judgment failure_class is not
+                # silently dropped by compact_review_result.py's
+                # verdict-first branching.
+                if merged.get("verdict") == "approve":
+                    merged["verdict"] = "needs-fix"
+            elif new_blockers:
                 merged["verdict"] = "needs-fix"
-        elif new_blockers:
-            merged["verdict"] = "needs-fix"
 
     _validate_review_issue_result_payload(merged)
     return merged
@@ -1602,6 +1658,39 @@ def check_c14_extension_surface_risk_trigger(body: str, issue_kind: str) -> tupl
     return CheckResult.PASS, []
 
 
+def get_extension_surface_candidate_advisories(body: str, issue_kind: str) -> list[str]:
+    """Issue #2339: non-blocking `unclassified_candidate` advisory messages.
+
+    Companion to ``check_c14_extension_surface_risk_trigger`` (which remains
+    the unchanged blocking C14 gate) -- this is wired separately as a
+    ``non_blocking_improvements`` entry (via ``_add_warning``) so it can
+    never affect ``CheckResult``/verdict, and so ``review-issue`` and
+    ``issue-contract-review`` expose the same classification + advisory
+    info for the same fixture body (Issue #2339 AC7 parity requirement,
+    same shared-evaluator structural-parity pattern as C14 itself).
+    """
+    if issue_kind != "implementation":
+        return []
+
+    allowed_path_entries = pc_extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return []
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+
+    try:
+        policy_evaluation = evaluator.evaluate_allowed_paths(allowed_path_entries)
+    except evaluator.PolicyLoadError:
+        # A policy-load failure is already surfaced as a blocking C14 WARN
+        # finding by check_c14_extension_surface_risk_trigger(); do not
+        # double-report it here as a non-blocking advisory.
+        return []
+
+    return list(policy_evaluation.get("advisories") or [])
+
+
 def check_c13_vc_preflight_decision_consistency(
     vc_preflight_json_path: Optional[str] = None,
 ) -> tuple[str, list[str]]:
@@ -2490,6 +2579,23 @@ def run_checks(
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C14_extension_surface_risk_trigger == CheckResult.FAIL,
     )
+
+    # C14b: Extension surface candidate perimeter advisory (Issue #2339,
+    # non-blocking -- must never touch checks.* / all_check_values / verdict).
+    extension_surface_candidate_advisories = get_extension_surface_candidate_advisories(body, issue_kind)
+    if extension_surface_candidate_advisories:
+        _add_warning(
+            result,
+            code="extension_surface_candidate_perimeter_advisory",
+            severity="advisory",
+            evidence=extension_surface_candidate_advisories,
+            suggested_action=(
+                "Non-blocking: one or more declared Allowed Paths match a project-local "
+                "extension candidate perimeter (unknown_surface_policy.project_candidate_path_globs) "
+                "but no known extension-surface risk-trigger rule. Confirm whether this is a "
+                "genuine new extension surface; no action required to proceed."
+            ),
+        )
 
     # Non-blocking warnings（structured: code/severity/evidence/suggested_action）
     detect_warning_scope_cvs_in_scope_mismatch(body, result)

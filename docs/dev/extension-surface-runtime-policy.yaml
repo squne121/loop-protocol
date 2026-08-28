@@ -43,16 +43,45 @@ resolution:
 
 # unknown_surface_policy:
 #   上記 surface（agent / hook / skill / claude-gpt / SubAgent lifecycle）の
-#   いずれにも一致しない変更（未知の extension surface）を検知した場合の既定方針。
+#   既知 rule selector のいずれにも一致しない Allowed Paths エントリのうち、
+#   project_candidate_path_globs に一致するもの（project-local な高シグナル
+#   未分類 extension candidate perimeter）を検知した場合の既定方針。
+#   decision / gate は evaluator（scripts/agent-guards/extension_surface_policy_
+#     matcher.py の `_extract_unknown_surface_policy()`）が実際に読み取り、
+#     値を検証したうえで `unclassified_candidate` 分類の `policy_action` に
+#     そのまま転記する（dead metadata ではない、PR #2370 P1-3）。値が
+#     このいずれとも一致しない場合、evaluator は silent approve せず
+#     `PolicyLoadError`（policy-unavailable / fail-close）を送出する。
 #   decision: `not_applicable` へ黙って倒すことを禁止し、human_judgment
-#     （人間判断へのエスカレーション）を既定とする。
-#   gate: block（人間判断が確定するまで進行を止める）とし、advisory（警告のみで
-#     進行を止めない）は採用しない。
-#   override_requires: block を解除できる権限。
+#     （人間判断が必要という分類ラベル）を既定とする。ただしこの値は
+#     evaluator の `final_decision`（not_applicable/deferred/immediate の
+#     既存三値のみ）へは一切混在しない（Issue #2339 AC8）。
+#   gate: advisory 固定（schema 側も `const: advisory` に限定 -- PR #2370
+#     P1-3 で `block` を実運用値から外した。未分類の candidate perimeter
+#     一致だけで進行を止めない。silent approve でもない中間の non-blocking
+#     advisory として可視化する。`override_requires` は `gate: block` 運用
+#     時代の名残として schema 上は任意プロパティのまま残るが、`gate` が
+#     `advisory` 固定である現行運用では設定不要）。
+#   project_candidate_path_globs: 上記の既知 rule いずれにも一致しない
+#     Allowed Paths のうち、project-local な高シグナル候補として advisory
+#     検知の対象にする repository-relative glob 一覧（matcher-v2 grammar）。
+#     ここに一致しない場合は `ordinary`（無警告で approve）として扱う。
+#     `.claude/settings*.json` のような部分セグメントワイルドカードは
+#     matcher-v2 grammar では無効なため候補にしない。`.claude/settings.json`
+#     自体は既存 hard rule で既にカバー済みのため candidate へ重複登録
+#     しない。plugin root 限定の意味を持つ `.lsp.json` /
+#     `monitors/monitors.json` は本 PR では対象に含めない
+#     （PR #2370 OWNER review fix_delta P2）。
 unknown_surface_policy:
   decision: human_judgment
-  gate: block
-  override_requires: owner_approval
+  gate: advisory
+  project_candidate_path_globs:
+    - "CLAUDE.md"
+    - ".claude/CLAUDE.md"
+    - ".claude/commands/**"
+    - ".claude/rules/**"
+    - ".mcp.json"
+    - ".claude-plugin/plugin.json"
 
 # delivery_context:
 #   横断 SSOT として本ポリシーを扱う際の配布形態ごとの留意点。
