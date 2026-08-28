@@ -514,3 +514,115 @@ def test_typed_worktree_builder_suppresses_repository_hook(tmp_path):
         path, commit, cwd=str(local), project_root=str(local), deadline=deadline
     )
     assert not marker.exists(), "repository hook fired despite fixed empty hooksPath"
+
+
+
+def test_internal_worktree_operation_revalidates_forged_paths_before_any_argv(monkeypatch, tmp_path):
+    def unexpected_popen(*args, **kwargs):
+        raise AssertionError("forged worktree path must not reach argv")
+
+    monkeypatch.setattr(exec_mod.subprocess, "Popen", unexpected_popen)
+    deadline = _deadline()
+    commit = exec_mod.RepositoryObjectId("a" * 40)
+    for path in (
+        exec_mod.DetachedWorktreePath("--force"),
+        exec_mod.DetachedWorktreePath(str(tmp_path.parent / "unconfined-worktree")),
+    ):
+        operation = exec_mod._GitOperation(
+            "add_detached_locked_worktree", worktree_path=path, object_id=commit
+        )
+        with pytest.raises((TypeError, ValueError)):
+            exec_mod._execute_semantic_git(
+                operation,
+                cwd=str(tmp_path),
+                project_root=str(tmp_path),
+                scratch_root=str(tmp_path / "scratch"),
+                deadline=deadline,
+            )
+
+
+def _write_setsid_escape_git(path: Path, pid_file: Path, *, probe_fails: bool) -> None:
+    probe_body = "setsid sh -c 'echo $$ > \"%s\"; sleep 30' >/dev/null 2>&1 & sleep 0.2; exit 2" % pid_file
+    semantic_body = "setsid sh -c 'echo $$ > \"%s\"; sleep 30' >/dev/null 2>&1 & sleep 30" % pid_file
+    path.write_text(
+        f'''#!/bin/sh
+case "$*" in
+  *config*) {probe_body if probe_fails else 'exit 1'} ;;
+  *) {semantic_body} ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def test_timeout_reaps_setsid_descendant_outside_the_git_process_group(monkeypatch, tmp_path):
+    fake_git = tmp_path / "setsid-timeout-git"
+    child_pid = tmp_path / "setsid-timeout-child.pid"
+    _write_setsid_escape_git(fake_git, child_pid, probe_fails=False)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    with pytest.raises(exec_mod.GitProtocolTimeout):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(0.8, cleanup_reserve_seconds=0.4),
+        )
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_probe_failure_reaps_setsid_descendant_before_reporting_failure(monkeypatch, tmp_path):
+    fake_git = tmp_path / "setsid-probe-git"
+    child_pid = tmp_path / "setsid-probe-child.pid"
+    _write_setsid_escape_git(fake_git, child_pid, probe_fails=True)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+        )
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_exception_reaps_setsid_descendant_before_reraising(monkeypatch, tmp_path):
+    fake_git = tmp_path / "setsid-exception-git"
+    child_pid = tmp_path / "setsid-exception-child.pid"
+    _write_setsid_escape_git(fake_git, child_pid, probe_fails=False)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    real_popen = exec_mod.subprocess.Popen
+
+    class ExplodingPopen:
+        def __init__(self, *args, **kwargs):
+            self._proc = real_popen(*args, **kwargs)
+            self.pid = self._proc.pid
+            self._is_probe = "config" in args[0]
+
+        def communicate(self, **kwargs):
+            if self._is_probe:
+                return self._proc.communicate(**kwargs)
+            for _ in range(100):
+                if child_pid.exists():
+                    break
+                time.sleep(0.01)
+            raise RuntimeError("injected_setsid_post_spawn_failure")
+
+        def __getattr__(self, name):
+            return getattr(self._proc, name)
+
+    monkeypatch.setattr(exec_mod.subprocess, "Popen", ExplodingPopen)
+    with pytest.raises(RuntimeError, match="injected_setsid_post_spawn_failure"):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+        )
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

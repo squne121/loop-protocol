@@ -3432,9 +3432,117 @@ def _revalidate_worktree_path(
     return validator(value.value, project_root)
 
 
-def _terminate_git_process_group(proc: subprocess.Popen, pgid: int | None, deadline: GitProtocolDeadline) -> bool:
+def _revalidate_semantic_operation(operation: _GitOperation, project_root: str) -> _GitOperation:
+    """Revalidate path-bearing internal operations before even the rewrite probe.
+
+    `_GitOperation` is private, but it remains a trust boundary: a forged
+    `DetachedWorktreePath` must not turn into argv merely because it carries
+    the right runtime type.
+    """
+    if not isinstance(operation, _GitOperation):
+        raise TypeError("git_operation_required")
+    if operation.kind not in _SUPPORTED_GIT_OPERATION_KINDS:
+        raise ValueError("git_operation_not_supported")
+    if operation.kind != "add_detached_locked_worktree":
+        return operation
+    return _GitOperation(
+        operation.kind,
+        object_id=operation.object_id,
+        worktree_path=_revalidate_worktree_path(operation.worktree_path, project_root, require_fresh=True),
+    )
+
+
+@dataclass(frozen=True)
+class _TrackedGitDescendant:
+    """A Linux process identity observed beneath a dedicated Git leader."""
+
+    pid: int
+    start_time: str
+
+
+def _linux_process_identity(pid: int) -> tuple[int, int, str] | None:
+    """Read `(pid, parent_pid, start_time)` without trusting a reused PID."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    _prefix, separator, suffix = stat.rpartition(")")
+    fields = suffix.split()
+    if not separator or len(fields) < 20:
+        return None
+    try:
+        return (pid, int(fields[1]), fields[19])
+    except ValueError:
+        return None
+
+
+def _observe_git_descendants(leader_pid: int) -> set[_TrackedGitDescendant] | None:
+    """Observe the live descendant tree before a child can escape its group.
+
+    A descendant may call `setsid()` and leave the group created by
+    `start_new_session`. Linux `/proc` parent links still identify it while
+    its parent is alive. Failure to inspect that authority is represented by
+    `None` so cleanup can fail closed rather than claiming group-only success.
+    """
+    proc_root = Path("/proc")
+    if not sys.platform.startswith("linux") or not proc_root.is_dir():
+        return None
+    records: dict[int, tuple[int, str]] = {}
+    try:
+        proc_entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in proc_entries:
+        if not entry.name.isdecimal():
+            continue
+        identity = _linux_process_identity(int(entry.name))
+        if identity is not None:
+            pid, parent_pid, start_time = identity
+            records[pid] = (parent_pid, start_time)
+    descendants: set[_TrackedGitDescendant] = set()
+    frontier = {leader_pid}
+    while frontier:
+        parent_pid = frontier.pop()
+        children = {
+            pid: start_time
+            for pid, (record_parent_pid, start_time) in records.items()
+            if record_parent_pid == parent_pid
+        }
+        frontier.update(children)
+        descendants.update(_TrackedGitDescendant(pid, start_time) for pid, start_time in children.items())
+    return descendants
+
+
+def _tracked_descendants_absent(descendants: set[_TrackedGitDescendant]) -> bool:
+    return all(
+        (identity := _linux_process_identity(descendant.pid)) is None or identity[2] != descendant.start_time
+        for descendant in descendants
+    )
+
+
+def _signal_tracked_descendants(descendants: set[_TrackedGitDescendant], signal_number: int) -> bool:
+    """Signal only descendants whose PID identity still matches observation."""
+    for descendant in descendants:
+        identity = _linux_process_identity(descendant.pid)
+        if identity is None or identity[2] != descendant.start_time:
+            continue
+        try:
+            os.kill(descendant.pid, signal_number)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            return False
+    return True
+
+
+def _terminate_git_process_group(
+    proc: subprocess.Popen,
+    pgid: int | None,
+    deadline: GitProtocolDeadline,
+    descendants: set[_TrackedGitDescendant] | None,
+) -> bool:
     """Terminate, verify absence, and reap under the deadline's reserve."""
-    if not _POSIX_PROCESS_GROUP_SUPPORTED or pgid is None:
+    if not _POSIX_PROCESS_GROUP_SUPPORTED or pgid is None or descendants is None:
         try:
             proc.terminate()
         except OSError:
@@ -3454,10 +3562,12 @@ def _terminate_git_process_group(proc: subprocess.Popen, pgid: int | None, deadl
         pass
     except OSError:
         return False
+    if not _signal_tracked_descendants(descendants, signal.SIGTERM):
+        return False
     term_until = min(deadline.deadline_at, time.monotonic() + max(0.01, deadline.cleanup_reserve_seconds / 2))
     while time.monotonic() < term_until:
         proc.poll()
-        if _verify_process_group_absent(pgid):
+        if _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants):
             proc.wait(timeout=0)
             return True
         time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
@@ -3467,13 +3577,15 @@ def _terminate_git_process_group(proc: subprocess.Popen, pgid: int | None, deadl
         pass
     except OSError:
         return False
+    if not _signal_tracked_descendants(descendants, signal.SIGKILL):
+        return False
     while time.monotonic() < deadline.deadline_at:
         proc.poll()
-        if _verify_process_group_absent(pgid):
+        if _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants):
             proc.wait(timeout=0)
             return True
         time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
-    return _verify_process_group_absent(pgid)
+    return _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants)
 
 
 def _operation_arguments(operation: _GitOperation, *, cwd: str) -> list[str]:
@@ -3563,7 +3675,7 @@ def _run_closed_git_process(
     hooks_dir: str,
     deadline: GitProtocolDeadline,
 ) -> subprocess.CompletedProcess:
-    timeout = deadline.execution_seconds()
+    deadline.execution_seconds()
     argv = _exact_git_argv(operation, git_executable=git_executable, cwd=cwd, hooks_dir=hooks_dir)
     kwargs: dict[str, object] = {
         "cwd": cwd,
@@ -3579,19 +3691,45 @@ def _run_closed_git_process(
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
     pgid = proc.pid if posix_supervised else None
+    descendants = _observe_git_descendants(proc.pid) if posix_supervised else set()
     try:
-        timeout = min(timeout, deadline.execution_seconds())
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        if not _terminate_git_process_group(proc, pgid, deadline):
+        while True:
+            observed = _observe_git_descendants(proc.pid) if posix_supervised else set()
+            if descendants is None or observed is None:
+                descendants = None
+            else:
+                descendants.update(observed)
+            try:
+                stdout, stderr = proc.communicate(
+                    timeout=min(_GROUP_POLL_INTERVAL_SECONDS, deadline.execution_seconds())
+                )
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except GitProtocolDeadlineExhausted as exc:
+        observed = _observe_git_descendants(proc.pid) if posix_supervised else set()
+        if descendants is None or observed is None:
+            descendants = None
+        else:
+            descendants.update(observed)
+        if not _terminate_git_process_group(proc, pgid, deadline, descendants):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
         raise GitProtocolTimeout("git_process_timeout") from exc
     except BaseException as exc:
-        if not _terminate_git_process_group(proc, pgid, deadline):
+        observed = _observe_git_descendants(proc.pid) if posix_supervised else set()
+        if descendants is None or observed is None:
+            descendants = None
+        else:
+            descendants.update(observed)
+        if not _terminate_git_process_group(proc, pgid, deadline, descendants):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
         raise
-    if posix_supervised and not _verify_process_group_absent(proc.pid):
-        if not _terminate_git_process_group(proc, pgid, deadline):
+    if posix_supervised and (
+        descendants is None
+        or not _verify_process_group_absent(proc.pid)
+        or not _tracked_descendants_absent(descendants)
+    ):
+        if not _terminate_git_process_group(proc, pgid, deadline, descendants):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_descendant_leak")
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
@@ -3624,8 +3762,7 @@ def _execute_semantic_git(
     scratch_root: str | None,
     deadline: GitProtocolDeadline,
 ) -> subprocess.CompletedProcess:
-    if not isinstance(operation, _GitOperation):
-        raise TypeError("git_operation_required")
+    operation = _revalidate_semantic_operation(operation, project_root)
     deadline.execution_seconds()
     git = resolve_git_subprocess_executable(project_root)
     env = sanitized_git_subprocess_env(project_root)
