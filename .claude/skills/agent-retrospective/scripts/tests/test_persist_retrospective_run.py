@@ -394,15 +394,22 @@ def _make_observer_invoke(run_id: str, digest: str):
 
 
 def _make_evaluator_invoke(candidate_records: list[dict[str, Any]]):
+    """`candidate_records` MUST already be in the judgment-only wire shape
+    (Issue #2362 Scope Reframe) -- builds the raw wire payload dict
+    directly rather than via `rr.Evaluation(...)`, whose constructor fires
+    full canonical-candidate validation immediately (before
+    `run_evaluation()`'s deterministic-enrichment phase has run)."""
+
     def _invoke(request: rr.EvaluatorRequest) -> rr.AgentInvocationResult:
-        evaluation = rr.Evaluation(
-            run_id=request.run_id,
-            base_sha=request.base_sha,
-            source_set_digest=request.source_set_digest,
-            candidate_records=candidate_records,
-            evidence_ref="evidence://evaluation",
-        )
-        return _ok_agent_result(json.loads(evaluation.to_wire()))
+        payload = {
+            "schema_version": rr.WIRE_SCHEMA_EVALUATION,
+            "run_id": request.run_id,
+            "base_sha": request.base_sha,
+            "source_set_digest": request.source_set_digest,
+            "candidate_records": candidate_records,
+            "evidence_ref": "evidence://evaluation",
+        }
+        return _ok_agent_result(payload)
 
     return _invoke
 
@@ -423,7 +430,10 @@ def test_read_version_propagates_to_expected_previous_digest() -> None:
         collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
         observer_requests=[_observer_request("retrospective-runtime-observer")],
         invoke=_make_observer_invoke("run-2", expected_digest),
-        invoke_evaluator=_make_evaluator_invoke([_new_candidate()]),
+        # Issue #2362 Scope Reframe: candidate content is not asserted by
+        # either of this helper's two callers -- an empty candidate_records
+        # list is a valid judgment-only-wire-shape evaluator response too.
+        invoke_evaluator=_make_evaluator_invoke([]),
         repository_id=_REPO_ID,
         target_issue=_TARGET_ISSUE,
         request_id="req-ac2",
@@ -450,7 +460,10 @@ def test_read_version_propagates_to_expected_previous_digest_none_when_no_histor
         collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
         observer_requests=[_observer_request("retrospective-runtime-observer")],
         invoke=_make_observer_invoke("run-3", expected_digest),
-        invoke_evaluator=_make_evaluator_invoke([_new_candidate()]),
+        # Issue #2362 Scope Reframe: candidate content is not asserted by
+        # either of this helper's two callers -- an empty candidate_records
+        # list is a valid judgment-only-wire-shape evaluator response too.
+        invoke_evaluator=_make_evaluator_invoke([]),
         repository_id=_REPO_ID,
         target_issue=_TARGET_ISSUE,
         request_id="req-ac2-none",
