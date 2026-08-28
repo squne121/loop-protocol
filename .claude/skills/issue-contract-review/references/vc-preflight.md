@@ -147,7 +147,7 @@ Issue #2233 の元々の障害（`uv run --locked pytest .claude/skills/issue-re
 
 `baseline_vc_preflight.py` の各 VC result item は `timeout_provenance`（`timeout_seconds` / `cleanup_tail_seconds` / `source` / `estimator_version` / `estimator_input_digest`）を持ち、その VC 自身の `command_timeout_budget/v1` エントリから導出される（他コマンドの budget のコピーではない）。
 
-### History-based estimator（Issue #2254）
+### 履歴ベース estimator（History-based estimator、Issue #2254 で追加）
 
 `history_estimate` source は `.claude/skills/issue-contract-review/scripts/vc_runtime_history.py`（新規モジュール、`baseline_vc_preflight.py` に詰め込まない）が所有する、**ローカル per-repository** SQLite store（`$XDG_STATE_HOME/loop-protocol/vc-runtime-history/<sha256(realpath(git-common-dir))>.sqlite3`、`XDG_STATE_HOME` 未設定時は `~/.local/state`）に永続化された過去実測 execution time evidence から算出する。repo にコミットされる state ではなく、Allowed Paths guard の対象外の runtime state として扱う（worktree に関わらず同一 repository の全 worktree が同一 store を共有する — `git rev-parse --git-common-dir` で解決）。
 
@@ -172,7 +172,7 @@ Issue #2233 の元々の障害（`uv run --locked pytest .claude/skills/issue-re
 
 **Test 環境での安全装置**: `produce_immutable_history_snapshot()` / `record_command_execution_sample()` は、`PYTEST_CURRENT_TEST` が設定されておりかつ `VC_RUNTIME_HISTORY_STORE_PATH`（store path のテスト用 override 環境変数）が未設定の場合、実際の store には一切触れず no-op で degrade する。これは、`baseline_vc_preflight.py` を呼び出す既存の 30 以上のテストファイルが、開発者/CI マシンの実際の `$XDG_STATE_HOME` 配下へ意図せず書き込むことを防ぐための test-safety guard であり、`VC_RUNTIME_HISTORY_STORE_PATH` を明示的に設定するテスト（Issue #2254 自身の新規テストを含む）では通常どおり実 store の read/write path を検証できる。
 
-### `ci_runtime_baseline_v1` との scope boundary（AC10）
+### `ci_runtime_baseline_v1` との scope boundary（対象範囲の切り分け、AC10）
 
 `docs/dev/ci-performance.md` が正本の `ci_runtime_baseline_v1` は GitHub Actions の **job/step 粒度**で elapsed_ms を記録する CI cross-run baseline スキーマであり、bootstrap-3-runs / decision-baseline-20-runs という別のポリシーで運用される。本 Issue の `history_estimate` は **ローカル per-command 粒度**で、CI run をまたがない、単一開発者マシン上の実行履歴のみを扱う。両者は以下の理由で意図的に schema・store を共有しない独立実装とした:
 
