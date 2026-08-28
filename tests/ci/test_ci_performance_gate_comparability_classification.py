@@ -72,10 +72,16 @@ def test_within_cohort_fingerprint_still_excludes_mismatched_runs():
     still functions after the three-way redesign)."""
 
     def baseline(workflow_run_id: int, host_runner_image: str) -> dict:
+        # #2187: `run_attempt: 1` set explicitly -- this fixture feeds
+        # `_comparable_cohort` -> `_dedupe_by_workflow_run_id` ->
+        # `_select_initial_attempt_baselines`, and the gate-side missing-
+        # run_attempt trust rejection unified with the collector in #2187
+        # would otherwise silently exclude every record here.
         b = {
             "schema": "ci_runtime_baseline_v1",
             "job": "e2e-core",
             "workflow_run_id": workflow_run_id,
+            "run_attempt": 1,
             "measurements": [{"phase_id": "test_e2e_ci", "elapsed_ms": 100_000, "status": 0}],
         }
         for field in gate.WITHIN_COHORT_REQUIRED_EQUAL:
