@@ -7,13 +7,13 @@
   "codebase-investigator.md": {
     "disallowedTools": [
       "Edit",
-      "Glob",
-      "Grep",
       "MultiEdit",
       "Write"
     ],
     "tools": [
       "Bash",
+      "Glob",
+      "Grep",
       "Read"
     ]
   },
