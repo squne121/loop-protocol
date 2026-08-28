@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import signal
 import sys
 import threading
 import time
@@ -122,6 +124,27 @@ def make_fake_provider_script(
     ]
     script.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return script
+
+
+def wait_for_pid_sentinel(pid_file: Path, *, timeout: float = 10.0, poll_interval: float = 0.02) -> int:
+    """Poll ``pid_file`` until it holds a parseable PID, proving the real
+    fixture child OS process has actually started (Issue #2371 AC2):
+    readiness is confirmed by the sentinel file the child itself writes
+    after ``os.getpid()``, never by an unconditional ``time.sleep()`` guess
+    that races the child's own startup / preflight overhead under CI load.
+    Raises ``AssertionError`` (fail-closed, not a silent pass) if the
+    sentinel never becomes ready within ``timeout`` seconds.
+    """
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if pid_file.exists():
+            try:
+                return int(pid_file.read_text().strip())
+            except ValueError as exc:
+                last_error = exc
+        time.sleep(poll_interval)
+    raise AssertionError(f"pid sentinel {pid_file} did not become ready within {timeout}s (last_error={last_error})")
 
 
 def read_journal_events(run_dir: Path) -> list[dict]:
@@ -518,25 +541,127 @@ def test_all_spawn_failure_no_provider_overlap(tmp_path):
     assert module.actual_provider_process_overlap(pairs) is False
 
 
-def test_timeout_termination_recorded(tmp_path):
-    script = make_fake_provider_script(tmp_path, "hang.py", sleep_sec=60)
-    subtasks = [make_subtask(tmp_path, subtask_id="hang1")]
-    module, result = _run_fanout_with_fake_provider(
-        tmp_path, subtasks, script=script, max_workers=1, overall_timeout_sec=0.3
-    )
+def test_running_process_cancellation_records_sigterm(tmp_path):
+    """Issue #2371 AC1-AC3: replaces the previous ``overall_timeout_sec=0.3``
+    fixed-deadline-watcher race (``test_timeout_termination_recorded``) --
+    which could legitimately fire before ``subprocess.Popen()`` under CI
+    load, recording zero process events and failing the assertion for
+    reasons unrelated to the runner's actual SIGTERM behavior -- with a
+    readiness-sentinel-gated manual ``cancel_event.set()``. This test does
+    NOT claim to exercise the ``overall_timeout_sec`` deadline watcher path
+    (``_watch_deadline()``); it verifies only the runner's own SIGTERM
+    termination + lifecycle-telemetry pairing once the real child process
+    has actually started.
 
-    assert result["counts"]["cancelled"] >= 1 or result["counts"]["failed"] >= 1
-    events = read_journal_events(Path(result["run_dir"]))
-    exits = process_events(events, "process_exit")
-    assert len(exits) == 1
+    OWNER review (PR #2373, 2026-08-28) P1: the previous ``finally`` cleanup
+    only ever re-armed ``cancel_event`` and joined the thread -- i.e. it
+    depended on the very cancel-coordination path this test exercises. If a
+    future regression makes the runner ignore ``cancel_event`` (hung
+    thread) or raises before its own unregister-then-terminate logic runs
+    (thread dies, but the child it never unregistered from ``ctx`` -- or,
+    if it already unregistered, one that ``ctx`` can no longer reach -- is
+    left running), the old cleanup could leak a non-daemon thread and/or an
+    orphaned child process across test runs instead of surfacing the
+    regression. The cleanup below no longer relies on that path: it always
+    calls ``ctx.terminate_all()`` (independent of whether cancel_event
+    coordination actually worked), and additionally force-kills
+    ``child_pid`` directly via its own process group when the thread is
+    still alive or raised -- covering the case where the thread's own
+    ``finally`` already unregistered the process from ``ctx`` without
+    killing it.
+    """
+    module = load_module()
+    pid_file = tmp_path / "sigterm_child.pid"
+    script = make_fake_provider_script(tmp_path, "sigterm_target.py", sleep_sec=60, pid_file=pid_file)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    events: list[dict] = []
+    lock = threading.Lock()
+
+    def journal(event):
+        with lock:
+            events.append(event)
+
+    cancel_event = threading.Event()
+    ctx = module.RunnerContext(run_dir=run_dir, audit_log_path=None, cancel_event=cancel_event, journal=journal)
+    runner = module.make_subprocess_runner(script)
+    job = module.ChildJob(subtask_id="sigterm-1", artifact_stem="0000-sigterm", request={"provider": "agy"})
+
+    result_holder: dict = {}
+    thread_exceptions: list[BaseException] = []
+
+    def _invoke():
+        try:
+            result_holder["result"] = runner(job, ctx)
+        except BaseException as exc:  # noqa: BLE001 - re-raised after cleanup below
+            thread_exceptions.append(exc)
+
+    thread = threading.Thread(target=_invoke)
+    thread.start()
+    child_pid: int | None = None
+    try:
+        child_pid = wait_for_pid_sentinel(pid_file)
+        cancel_event.set()
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "runner must return once cancel_event is set (process group terminated)"
+    finally:
+        # AC7: every exit path (sentinel timeout, assertion failure, or a
+        # thread-internal exception) must still clean up the spawned thread
+        # and child process rather than leak them across test runs -- and
+        # must not rely solely on the cooperative cancel_event path under
+        # test (see the OWNER-review rationale in the docstring above).
+        cancel_event.set()
+        ctx.terminate_all(grace_period=0.1)
+        if (thread.is_alive() or thread_exceptions) and child_pid is not None:
+            # Test-only fallback: ctx.terminate_all() only reaches
+            # processes still registered in ctx; a runner thread that
+            # raised mid-wait already unregistered (and thus orphaned) its
+            # child in its own finally, so force-kill child_pid directly.
+            try:
+                pgid = os.getpgid(child_pid)
+                if pgid == child_pid:
+                    os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        thread.join(timeout=2)
+        assert not thread.is_alive(), "runner thread must be joined and dead in the cleanup path"
+        if thread_exceptions:
+            raise thread_exceptions[0]
+
+    assert result_holder["result"]["ok"] is False
+
+    with lock:
+        events_snapshot = list(events)
+    starts = [e for e in events_snapshot if e.get("event") == "process_start"]
+    exits = [e for e in events_snapshot if e.get("event") == "process_exit"]
+    assert len(starts) == 1, "exactly one process_start event expected"
+    assert len(exits) == 1, "exactly one process_exit event expected"
+    assert starts[0]["pid"] == child_pid, "process_start pid must match the sentinel-observed child pid"
+    assert exits[0]["pid"] == child_pid, "process_exit pid must match the sentinel-observed child pid"
     assert exits[0]["termination_reason"] == "sigterm"
 
 
 def test_sigkill_escalation_recorded(tmp_path, monkeypatch):
+    """Issue #2371 AC4: the previous ``time.sleep(0.3)`` synchronization
+    before ``cancel_event.set()`` raced the fake child's own startup +
+    SIGTERM-ignore signal-handler installation under CI load. Replaced with
+    the same pid-sentinel readiness helper used by
+    ``test_running_process_cancellation_records_sigterm`` -- the sentinel
+    file is written by the fixture script only *after* it installs its
+    ``SIG_IGN`` handler, so observing it also proves the handler is armed.
+
+    OWNER review (PR #2373, 2026-08-28) P1/P2: cleanup uses the same
+    independent-of-cancel_event ``ctx.terminate_all()`` + child_pid
+    fallback as ``test_running_process_cancellation_records_sigterm`` (see
+    that test's docstring for the full rationale). Also asserts
+    ``process_start`` count/pid alongside ``process_exit``, matching the
+    SIGTERM test, per the Issue #2371 lifecycle-pairing contract.
+    """
     module = load_module()
     monkeypatch.setattr(module, "_CHILD_TERMINATE_GRACE_SEC", 0.3)
 
-    script = make_fake_provider_script(tmp_path, "stubborn.py", sleep_sec=60, ignore_sigterm=True)
+    pid_file = tmp_path / "stubborn_child.pid"
+    script = make_fake_provider_script(tmp_path, "stubborn.py", sleep_sec=60, ignore_sigterm=True, pid_file=pid_file)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     events: list[dict] = []
@@ -552,20 +677,49 @@ def test_sigkill_escalation_recorded(tmp_path, monkeypatch):
     job = module.ChildJob(subtask_id="stubborn", artifact_stem="0000-stubborn", request={"provider": "agy"})
 
     result_holder: dict = {}
+    thread_exceptions: list[BaseException] = []
 
     def _invoke():
-        result_holder["result"] = runner(job, ctx)
+        try:
+            result_holder["result"] = runner(job, ctx)
+        except BaseException as exc:  # noqa: BLE001 - re-raised after cleanup below
+            thread_exceptions.append(exc)
 
     thread = threading.Thread(target=_invoke)
     thread.start()
-    time.sleep(0.3)
-    cancel_event.set()
-    thread.join(timeout=10)
+    child_pid: int | None = None
+    try:
+        child_pid = wait_for_pid_sentinel(pid_file)
+        cancel_event.set()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    finally:
+        # AC7: cleanup must not depend on the cooperative cancel_event path
+        # under test -- see test_running_process_cancellation_records_sigterm
+        # above for the full rationale.
+        cancel_event.set()
+        ctx.terminate_all(grace_period=0.1)
+        if (thread.is_alive() or thread_exceptions) and child_pid is not None:
+            try:
+                pgid = os.getpgid(child_pid)
+                if pgid == child_pid:
+                    os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        thread.join(timeout=2)
+        assert not thread.is_alive(), "runner thread must be joined and dead in the cleanup path"
+        if thread_exceptions:
+            raise thread_exceptions[0]
 
-    assert not thread.is_alive()
     assert result_holder["result"]["ok"] is False
-    exits = [e for e in events if e.get("event") == "process_exit"]
+    with lock:
+        events_snapshot = list(events)
+    starts = [e for e in events_snapshot if e.get("event") == "process_start"]
+    exits = [e for e in events_snapshot if e.get("event") == "process_exit"]
+    assert len(starts) == 1, "exactly one process_start event expected"
+    assert starts[0]["pid"] == child_pid, "process_start pid must match the sentinel-observed child pid"
     assert len(exits) == 1
+    assert exits[0]["pid"] == child_pid
     assert exits[0]["termination_reason"] == "sigkill"
 
 
