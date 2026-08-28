@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -46,111 +45,24 @@ def _load_module():
 MOD = _load_module()
 
 
-def _resolve_pre_migration_commit(repo_root: Path) -> str | None:
-    """Best-effort resolution of a commit that predates Issue #2160's
-    migration commits, for a direct git-history diff-proof (AC1, human PR
-    reviewer 2026-08-25 P1 blocker, PR #2334 comment 5401806450).
-
-    Returns None when the checkout does not have enough history to resolve
-    a merge-base (e.g. a CI shallow clone with fetch-depth 1 and no
-    `origin/main` ref locally). Callers must not silently pass in that
-    case; they fall back to the checked-in snapshot guard instead.
-    """
-    for ref in ("origin/main", "main"):
-        proc = subprocess.run(
-            ["git", "-C", str(repo_root), "merge-base", "HEAD", ref],
-            capture_output=True, text=True,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout.strip()
-    return None
-
-
 # ---------------------------------------------------------------------------
 # AC1 (sub-requirement): permission-affecting frontmatter fields baseline
 # ---------------------------------------------------------------------------
 
 class TestPermissionBaselineUnchanged:
-    def test_all_agents_tools_and_disallowed_tools_match_pre_migration_git_history(self):
-        """AC1 (re-scoped 2026-08-25 per human PR reviewer P1 blocker, PR
-        #2334 comment 5401806450): compares base-commit (merge-base with
-        origin/main) frontmatter directly against HEAD frontmatter via
-        `git show <merge-base>:<path>`, instead of trusting a same-PR JSON
-        snapshot. A same-PR snapshot cannot prove no-unintended-change
-        during *this* migration -- it would pass even if this PR's own
-        migration changed `tools:`/`disallowedTools:` and the snapshot had
-        simply been copied from the already-changed value. This test
-        re-derives the pre-migration ground truth directly from git
-        history at test time.
-
-        Skips (does not silently pass, and does not report AC1 as
-        satisfied on its own) when the checkout lacks the git history to
-        resolve a merge-base (e.g. a CI shallow clone) -- the
-        checked-in-snapshot test below still runs unconditionally as a
-        CI-safe fallback guard in that case.
-        """
-        commit = _resolve_pre_migration_commit(REPO_ROOT)
-        if commit is None:
-            pytest.skip(
-                "no git history available to resolve a pre-migration merge-base "
-                "(e.g. CI shallow clone with fetch-depth=1); see "
-                "test_all_agents_tools_and_disallowed_tools_match_checked_in_baseline "
-                "for the CI-safe fallback guard"
-            )
-        claude_dir = REPO_ROOT / ".claude" / "agents"
-        mismatches = []
-        checked = 0
-        for md_path in sorted(claude_dir.glob("*.md")):
-            rel = f".claude/agents/{md_path.name}"
-            proc = subprocess.run(
-                ["git", "-C", str(REPO_ROOT), "show", f"{commit}:{rel}"],
-                capture_output=True, text=True,
-            )
-            if proc.returncode != 0:
-                continue  # agent file did not exist at the pre-migration commit
-            try:
-                pre_fm = MOD.extract_frontmatter(proc.stdout, source_path=f"{commit}:{rel}")
-            except MOD.FrontmatterParseError:
-                # A pre-migration file that the (now-stricter, real-YAML)
-                # parser cannot parse cannot be diffed against; this is not
-                # itself evidence of an unintended tools:/disallowedTools:
-                # change, so it is skipped rather than failing the test.
-                continue
-            checked += 1
-            head_text = md_path.read_text(encoding="utf-8")
-            head_fm = MOD.extract_frontmatter(head_text, source_path=str(md_path))
-
-            def _norm(fm, key):
-                v = fm.get(key, [])
-                return sorted(v) if isinstance(v, list) else []
-
-            pre_tools, head_tools = _norm(pre_fm, "tools"), _norm(head_fm, "tools")
-            pre_disallowed = _norm(pre_fm, "disallowedTools")
-            head_disallowed = _norm(head_fm, "disallowedTools")
-            if pre_tools != head_tools or pre_disallowed != head_disallowed:
-                mismatches.append(
-                    {
-                        "agent": md_path.name,
-                        "pre_migration_tools": pre_tools,
-                        "head_tools": head_tools,
-                        "pre_migration_disallowedTools": pre_disallowed,
-                        "head_disallowedTools": head_disallowed,
-                    }
-                )
-        assert checked > 0, f"no pre-migration .claude/agents/*.md files resolved at {commit}"
-        assert mismatches == [], (
-            f"permission-affecting frontmatter fields changed during this migration "
-            f"(base commit {commit}): {mismatches}"
-        )
-
     def test_all_agents_tools_and_disallowed_tools_match_checked_in_baseline(self):
         """AC1: normalized tools:/disallowedTools: for every .claude/agents/*.md
         must equal the checked-in baseline. CI-safe fallback guard (does
         not require git history): the checked-in baseline was itself
         generated from the pre-migration commit recorded in its
-        `_provenance` block (see
-        test_all_agents_tools_and_disallowed_tools_match_pre_migration_git_history
-        above for the primary, non-snapshot-trusting proof)."""
+        `_provenance` block. (The #2334-era one-off
+        "pre_migration_git_history" git-history diff-proof was removed per
+        OWNER PR #2365 review 2026-08-28: it permanently forbade any future
+        intentional tools:/disallowedTools: change, which is harness scope
+        leakage beyond Issue #2160's one-time migration proof. This
+        checked-in baseline is now the sole AC1 guard; an intentional
+        permission change updates this baseline in the same PR, and the
+        diff itself is the human-reviewable record of the change.)"""
         raw = json.loads(
             (FIXTURE_DIR / "agent_permission_baseline.json").read_text(encoding="utf-8")
         )
