@@ -41,6 +41,29 @@ credential を保持できるフィールドは存在しない（`private_eviden
 `schema_version` / `run_id` / `base_sha` / `source_set_digest` /
 `candidate_records: list[dict]` / `evidence_ref: str`。`finalize` phase の入力。
 
+### candidate_records[] の判定専用（judgment-only）wire shape（Issue #2362 のスコープ再定義、2026-08-28 owner 承認済み）
+
+`--json-schema` として evaluator 呼び出しに渡される
+`schemas/evaluation_result_v1.schema.json`（draft-07）の `candidate_records[].items` は、
+evaluator-authoritative な judgment フィールドのみを要求する flat shape に絞り込まれている:
+
+- `candidate_id` / `title` / `description`（いずれも string 型の判定結果フィールド）
+- `claim_class`（canonical `agent_improvement_candidate_v1.schema.json` の `claim_class` enum と同期）
+- `subject_ref`（`kind`/`value`。canonical schema の discriminated union 制約を draft-07 で自前 author）
+- `rule_id`（namespace 区切りのドット連結トークンで、pattern `^[a-z0-9_]+(\.[a-z0-9_]+)*$` に一致する文字列であること）
+- `evidence_refs[]`（`ref_type`/`source_id`/`resource_identity` のみ。`projection_digest` は含まない）
+
+`identity` / `evaluations` / `repository_id` / `source_run_ref` / `created_at` / `updated_at` /
+`candidate_status` は wire schema に存在せず、evaluator から一切要求・許容されない
+（`additionalProperties: false`）。`run_retrospective.py`'s `_enrich_candidate_record()`
+（deterministic-enrichment phase）が、この judgment-only 出力 + Python 側の
+`repository_id`/`compute_finding_identity()`/`compute_delta()`/`PreviousStateProvider`/
+実 `finding_sets` データから、canonical `agent_improvement_candidate/v1` の完全な shape
+（`identity`/`evaluations[]`/`evidence_refs[].projection_digest` を含む）を 100% 決定論的に
+構築する。evaluator の wire payload から `evaluations[]` を一切パースしない
+（旧 PR #2367 fix_delta items 1-6 の「evaluator が出す `finding_contract` をそのまま overwrite/
+passthrough する」design を上書きする、この Issue の Scope Reframe が正本）。
+
 ## PublishRequest（proposal-only・公開提案）
 
 `schema_version` / `request_id` / `repository_id` / `target_issue: int` /

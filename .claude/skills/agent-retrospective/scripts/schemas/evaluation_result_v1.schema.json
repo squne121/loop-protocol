@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://loop-protocol.internal/schemas/agent-retrospective/evaluation_result_v1.schema.json",
   "title": "evaluation_result/v1",
-  "description": "Canonical wire-contract schema for the claude CLI --json-schema flag when invoking the agent-retrospective evaluator Agent. Mirrors run_retrospective.py's Evaluation dataclass (WIRE_SCHEMA_EVALUATION = \"evaluation_result/v1\", Issue #2301). candidate_records[] entries must each independently satisfy the canonical agent_improvement_candidate/v1 schema (#2288/#2289) -- this schema intentionally does not re-embed that full contract inline and only requires candidate_records to be an array of objects at the wire-contract layer; the stricter per-record validation is enforced by run_retrospective.py's _validate_candidate_records() after structured_output parsing.",
+  "description": "Canonical wire-contract schema for the claude CLI --json-schema flag when invoking the agent-retrospective evaluator Agent. Mirrors run_retrospective.py's Evaluation dataclass (WIRE_SCHEMA_EVALUATION = \"evaluation_result/v1\", Issue #2301). Issue #2362 (Scope Reframe, 2026-08-28 owner-approved): candidate_records[] entries are now a JUDGMENT-ONLY shape (candidate_id/title/description/claim_class/subject_ref/rule_id/evidence_refs) covering ONLY evaluator-authoritative fields -- identity/evaluations (history)/repository_id/source_run_ref/created_at/updated_at are deliberately NOT accepted here; run_retrospective.py's deterministic-enrichment phase (_enrich_candidate_record()) constructs those 100% from Python-side context (compute_finding_identity()/compute_delta()/PreviousStateProvider), never from this wire payload. This is a hand-authored draft-07 subset of the canonical agent_improvement_candidate/v1 schema (2020-12) -- deliberately not $ref'd across drafts, since the Agent SDK's --json-schema flag only accepts draft-07. The full per-record canonical validation (after Python-side enrichment has run) is enforced separately by run_retrospective.py's _validate_candidate_records().",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -32,11 +32,187 @@
     "candidate_records": {
       "type": "array",
       "items": {
-        "type": "object"
+        "$ref": "#/definitions/candidate_judgment"
       }
     },
     "evidence_ref": {
       "type": "string"
+    }
+  },
+  "definitions": {
+    "claim_class": {
+      "type": "string",
+      "description": "ADR 0007 Decision 2 claim-class taxonomy (exact 9-value closed enum) -- mirrors agent_improvement_candidate_v1.schema.json's $defs.claim_class. Kept in sync manually (draft-07 cannot $ref across the 2020-12 canonical schema).",
+      "enum": [
+        "code_content",
+        "code_authorship_timing",
+        "internal_loop_review_verdict",
+        "github_native_review_state",
+        "review_comment",
+        "mergeability",
+        "issue_intent",
+        "external_fact",
+        "runtime_behavior"
+      ]
+    },
+    "subject_ref": {
+      "type": "object",
+      "description": "Mirrors agent_improvement_candidate_v1.schema.json's $defs.subject_ref (discriminated union + pattern constraints), hand-authored here in draft-07 for the same reason as claim_class above.",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["repository_path", "issue", "pull_request", "workflow", "runtime", "external_resource"]
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "kind": { "enum": ["issue", "pull_request"] } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "value": { "type": "string", "pattern": "^[0-9]+$" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "repository_path" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "value": { "type": "string", "pattern": "^(?!/)(?!\\./)(?!.*(^|/)\\.\\.(/|$)).+$" }
+            }
+          }
+        }
+      ]
+    },
+    "evidence_ref_judgment": {
+      "type": "object",
+      "description": "Judgment-only subset of agent_improvement_candidate_v1.schema.json's $defs.evidence_ref -- evaluator supplies ref_type/source_id/resource_identity for evidence it actually saw in observer output; projection_digest is deliberately NOT accepted here (run_retrospective.py's deterministic-enrichment phase recomputes it from the real observer finding_sets data it holds, never trusting an evaluator-supplied value).",
+      "additionalProperties": false,
+      "required": ["ref_type", "source_id", "resource_identity"],
+      "properties": {
+        "ref_type": {
+          "type": "string",
+          "enum": ["public_github_resource", "repository_blob", "runtime_receipt", "external_primary_source"]
+        },
+        "source_id": {
+          "type": "string",
+          "enum": ["github", "repository", "runtime", "web"]
+        },
+        "resource_identity": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "ref_type": { "const": "public_github_resource" } },
+            "required": ["ref_type"]
+          },
+          "then": {
+            "properties": {
+              "source_id": { "const": "github" },
+              "resource_identity": {
+                "type": "string",
+                "pattern": "^(https://github\\.com/[^\\s]+|[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+)$"
+              }
+            },
+            "required": ["source_id"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "ref_type": { "const": "repository_blob" } },
+            "required": ["ref_type"]
+          },
+          "then": {
+            "properties": {
+              "source_id": { "const": "repository" },
+              "resource_identity": {
+                "type": "string",
+                "pattern": "^[^\\s#]+\\.[A-Za-z0-9_-]+(#[^\\s]+)?$"
+              }
+            },
+            "required": ["source_id"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "ref_type": { "const": "runtime_receipt" } },
+            "required": ["ref_type"]
+          },
+          "then": {
+            "properties": {
+              "source_id": { "const": "runtime" }
+            },
+            "required": ["source_id"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "ref_type": { "const": "external_primary_source" } },
+            "required": ["ref_type"]
+          },
+          "then": {
+            "properties": {
+              "source_id": { "const": "web" },
+              "resource_identity": {
+                "type": "string",
+                "pattern": "^https?://[^\\s]+$"
+              }
+            },
+            "required": ["source_id"]
+          }
+        }
+      ]
+    },
+    "candidate_judgment": {
+      "type": "object",
+      "description": "Issue #2362: judgment-only wire shape for one candidate record. Deliberately does NOT accept identity/evaluations/repository_id/source_run_ref/created_at/updated_at/candidate_status -- those are 100% Python-side deterministic (see run_retrospective.py's _enrich_candidate_record()).",
+      "additionalProperties": false,
+      "required": ["candidate_id", "title", "description", "claim_class", "subject_ref", "rule_id", "evidence_refs"],
+      "properties": {
+        "candidate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "claim_class": {
+          "$ref": "#/definitions/claim_class"
+        },
+        "subject_ref": {
+          "$ref": "#/definitions/subject_ref"
+        },
+        "rule_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)*$",
+          "minLength": 1
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/evidence_ref_judgment"
+          }
+        }
+      }
     }
   }
 }
