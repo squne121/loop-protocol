@@ -164,9 +164,21 @@ def _cli_run_details_from_pairs(pairs: list[tuple], commit_sha: str) -> list[dic
     actual attempt SELECTED for this pair by `_pair_by_workflow_run_id`'s
     `initial_attempt_only_v1` policy (always 1 under that policy, but
     propagated from the record rather than hardcoded, so a future policy
-    change does not require touching this call site)."""
+    change does not require touching this call site).
+
+    #2187: uses `_normalize_run_attempt_trusted` (never `_normalize_run_attempt
+    (core) or 1`) -- a `core` baseline whose `run_attempt` is missing or
+    invalid is EXCLUDED from `run_details` entirely rather than having a
+    synthesized `run_attempt: 1` fabricated for it. In the normal production
+    call path every `core` reaching this function was already selected by
+    `_select_initial_attempt_baselines` (via `_pair_by_workflow_run_id`), so
+    this exclusion never fires there; it exists as a fail-closed guard for
+    direct/unit-test callers of this function."""
     run_details = []
     for workflow_run_id, core, responsive in pairs:
+        trusted_attempt = _normalize_run_attempt_trusted(core)
+        if trusted_attempt is None:
+            continue
         core_duration = _single_baseline_duration_seconds(core)
         responsive_duration = _single_baseline_duration_seconds(responsive)
         if core_duration is None or responsive_duration is None:
@@ -175,7 +187,7 @@ def _cli_run_details_from_pairs(pairs: list[tuple], commit_sha: str) -> list[dic
             {
                 "run_id": str(workflow_run_id),
                 "workflow_run_id": workflow_run_id,
-                "run_attempt": _normalize_run_attempt(core) or 1,
+                "run_attempt": trusted_attempt,
                 "commit_sha": commit_sha,
                 "conclusion": "success",
                 "duration_seconds": max(core_duration, responsive_duration),
@@ -212,8 +224,12 @@ def run_evidence_gate(fixture: dict) -> dict:
 
     before_provider_count, _ = _provider_post_filter_sample_count(before_core, before_responsive)
     after_provider_count, _ = _provider_post_filter_sample_count(after_core, after_responsive)
-    before_gate_ready_count = _gate_ready_post_filter_sample_count(before_gate_ready)
-    after_gate_ready_count = _gate_ready_post_filter_sample_count(after_gate_ready)
+    before_gate_ready_count, _before_gate_ready_evidence_errors = _gate_ready_post_filter_sample_count(
+        before_gate_ready
+    )
+    after_gate_ready_count, _after_gate_ready_evidence_errors = _gate_ready_post_filter_sample_count(
+        after_gate_ready
+    )
 
     try:
         _evidence_readiness_hard_check_post_filter(
@@ -378,28 +394,23 @@ RERUN_ATTEMPT_SELECTION_POLICY = "initial_attempt_only_v1"
 
 
 def _normalize_run_attempt(baseline: dict) -> int | None:
-    """#2179: normalizes `baseline["run_attempt"]` to the
-    `initial_attempt_only_v1` policy's `integer >= 1` contract. A missing
-    key defaults to 1 and is treated as a TRUSTED attempt-1 candidate --
-    this is NOT backward compatibility with pre-`run_attempt` baselines
-    (`ci_runtime_baseline_v1` has included `run_attempt` since its
-    introduction in commit `9574ee5c`; every baseline has always carried
-    this field). It is a KNOWN, TRACKED limitation: this gate module's own
-    Allowed Paths boundary (#2179 fix_delta, OWNER adversarial review of
-    PR #2182, issuecomment-5302595322) excludes satellite fixture files
-    such as `tests/ci/test_ci_performance_gate_paired_critical_path.py`,
-    which construct baseline records without `run_attempt`. Defaulting a
-    missing key to untrusted (`None`) here would silently exclude every
-    baseline from those satellite fixtures from the trusted cohort,
-    breaking their existing tests. Fully unifying this with the
-    collector's stricter (`scripts/ci/collect_e2e_performance_
-    benchmark.py`) missing-excludes-from-cohort policy is tracked in
-    follow-up Issue #2187 (https://github.com/squne121/loop-protocol/
-    issues/2187), which widens the Allowed Paths to the satellite fixture
-    files. A numeric STRING (e.g. `"1"`) is accepted and coerced to int --
-    this is the REAL producer shape (`GITHUB_RUN_ATTEMPT` is a bash env
-    var, always a string, see `.github/workflows/ci.yml`'s
-    `Collect ci_runtime_baseline_v1 artifact` step and
+    """#2179 (docstring corrected by #2187): normalizes
+    `baseline["run_attempt"]` to the `initial_attempt_only_v1` policy's
+    `integer >= 1` contract. A missing key defaults to 1 -- but (#2187) that
+    default is used ONLY by `_detect_run_attempt_identity_collisions` for
+    COLLISION-GROUPING purposes (grouping a missing-key record into the
+    same identity slot as an explicit `run_attempt: 1` record so a genuine
+    content disagreement between them is still detected as a collision). It
+    is NOT a statement that a missing key is a TRUSTED attempt-1 candidate
+    for cohort membership -- trust judgment is `_normalize_run_attempt_
+    trusted()` below, which returns `None` (untrusted / excluded) for a
+    missing key, mirroring `scripts/ci/collect_e2e_performance_
+    benchmark.py`'s `_classify_run_attempt` policy (unified by #2187,
+    follow-up to PR #2182's OWNER adversarial review issuecomment-5302595322).
+    A numeric STRING (e.g. `"1"`) is accepted and coerced to int -- this is
+    the REAL producer shape (`GITHUB_RUN_ATTEMPT` is a bash env var, always
+    a string, see `.github/workflows/ci.yml`'s `Collect ci_runtime_
+    baseline_v1 artifact` step and
     `test_v2_producer_shaped_baseline_from_ci_yml_is_admitted_to_cohort`).
     An explicit `None`, a non-numeric string, a bool, `0`, or a negative
     value is invalid -- returns `None` (fail-closed exclusion, never
@@ -420,6 +431,27 @@ def _normalize_run_attempt(baseline: dict) -> int | None:
     if value < 1:
         return None
     return value
+
+
+LEGACY_UNVERIFIED_RUN_ATTEMPT_REASON = "legacy_unverified_run_attempt"
+
+
+def _normalize_run_attempt_trusted(baseline: dict) -> int | None:
+    """#2187: TRUST-judgment counterpart to `_normalize_run_attempt` above.
+    Unlike that function (whose missing-key default of 1 exists ONLY for
+    `_detect_run_attempt_identity_collisions`'s collision-grouping use
+    case), this function returns `None` (untrusted / excluded from the
+    trusted cohort) when `run_attempt` is missing entirely -- unifying this
+    gate module's trusted-cohort eligibility policy with the collector's
+    (`scripts/ci/collect_e2e_performance_benchmark.py::_classify_run_
+    attempt`) missing-excludes-from-cohort policy. All other type-coercion
+    rules (explicit int `1` / producer-shaped numeric string `"1"` accepted;
+    bool/`None`/non-numeric string/`0`/negative rejected) are IDENTICAL to
+    `_normalize_run_attempt` and are delegated to it (never duplicated) once
+    the missing-key case has been handled here."""
+    if "run_attempt" not in baseline:
+        return None
+    return _normalize_run_attempt(baseline)
 
 
 def _identity_normalized_json(baseline: dict) -> str:
@@ -466,32 +498,41 @@ def _detect_run_attempt_identity_collisions(baselines: list[dict]) -> dict[objec
     return collisions
 
 
-def _select_initial_attempt_baselines(baselines: list[dict]) -> dict[object, dict]:
+def _select_initial_attempt_baselines(
+    baselines: list[dict],
+) -> tuple[dict[object, dict], list[dict]]:
     """#2179 P0-2/P1-1 (supersedes the #2159 first-seen-wins version):
     sample identity is `workflow_run_id`; among baselines sharing one id,
-    only the run_attempt == 1 candidate (default when absent) is kept.
-    Order-independent -- groups by id first via a dict-of-lists, never
-    relies on insertion order. Baselines missing `workflow_run_id` are
-    excluded (cannot be deduped/paired safely).
+    only the TRUSTED run_attempt == 1 candidate is kept. Order-independent
+    -- groups by id first via a dict-of-lists, never relies on insertion
+    order. Baselines missing `workflow_run_id` are excluded (cannot be
+    deduped/paired safely).
 
-    NOTE (#2182 fix_delta scope boundary, OWNER adversarial review
-    issuecomment-5302446086 P0-3): unlike the COLLECTOR's
-    `_normalize_run_attempt` (`scripts/ci/collect_e2e_performance_
-    benchmark.py`), THIS gate module intentionally still defaults a
-    MISSING `run_attempt` key to 1 for trusted-cohort eligibility. Fully
-    unifying this with the collector's stricter (missing-excludes-from-
-    cohort) policy would require also changing `_baseline()` fixtures in
-    `tests/ci/test_ci_performance_gate_paired_critical_path.py` (and
-    other satellite files), which are OUTSIDE Issue #2179's Allowed
-    Paths -- an explicit Stop Condition ("performance gate related
-    files ... requiring a change is discovered"). This asymmetry is a
-    KNOWN, documented limitation of this fix_delta; a follow-up Issue
-    widening the Allowed Paths to the satellite files would be needed to
-    fully unify it. The #2182 P1 identity-collision fix
-    (`_detect_run_attempt_identity_collisions` above) IS fully applied
-    here, since it does not change any existing fixture's selected
-    result (collisions only trigger on genuine, previously-`min()`-
-    silenced content disagreement)."""
+    #2187 (supersedes the #2182 fix_delta scope-boundary asymmetry): trust
+    judgment now uses `_normalize_run_attempt_trusted`, which -- UNLIKE
+    `_normalize_run_attempt` -- returns `None` (untrusted) for a MISSING
+    `run_attempt` key. This unifies this gate module's trusted-cohort
+    eligibility policy with the collector's (`scripts/ci/collect_e2e_
+    performance_benchmark.py::_classify_run_attempt`) missing-excludes-
+    from-cohort policy; the two modules' policies are no longer
+    asymmetric. The #2182 P1 identity-collision fix
+    (`_detect_run_attempt_identity_collisions` above, which intentionally
+    keeps grouping a missing key into the attempt-1 slot for collision
+    detection ONLY) is unaffected by this change and continues to apply
+    here first, before trust filtering.
+
+    Returns `(selected, evidence_errors)`. `selected` maps `workflow_run_id`
+    -> the chosen trusted attempt-1 baseline. `evidence_errors` records one
+    entry per `workflow_run_id` group that has NO trusted attempt-1
+    candidate AND contains at least one baseline missing the `run_attempt`
+    key entirely -- reason `legacy_unverified_run_attempt` (#2187 AC2/AC9),
+    the SAME identifiable reason the collector emits for this case. A group
+    excluded purely because its only candidates are attempt 2+ (with
+    `run_attempt` present, just not 1), or because it is flagged as an
+    identity collision, is still excluded from `selected` but does NOT get
+    a `legacy_unverified_run_attempt` evidence_errors entry here (that is
+    the existing, unchanged `missing_pair_*` / collision reporting handled
+    by this function's callers, e.g. `_pair_by_workflow_run_id`)."""
     by_id: dict[object, list[dict]] = {}
     for baseline in baselines:
         workflow_run_id = baseline.get("workflow_run_id")
@@ -502,14 +543,22 @@ def _select_initial_attempt_baselines(baselines: list[dict]) -> dict[object, dic
     collisions = _detect_run_attempt_identity_collisions(baselines)
 
     selected: dict[object, dict] = {}
+    evidence_errors: list[dict] = []
     for workflow_run_id, group in by_id.items():
         if workflow_run_id in collisions:
             continue
-        candidates = [b for b in group if _normalize_run_attempt(b) == 1]
+        candidates = [b for b in group if _normalize_run_attempt_trusted(b) == 1]
         if not candidates:
+            if any("run_attempt" not in b for b in group):
+                evidence_errors.append(
+                    {
+                        "workflow_run_id": workflow_run_id,
+                        "reason": LEGACY_UNVERIFIED_RUN_ATTEMPT_REASON,
+                    }
+                )
             continue
         selected[workflow_run_id] = min(candidates, key=lambda b: json.dumps(b, sort_keys=True, default=str))
-    return selected
+    return selected, evidence_errors
 
 
 def _dedupe_by_workflow_run_id(baselines: list[dict]) -> list[dict]:
@@ -520,8 +569,11 @@ def _dedupe_by_workflow_run_id(baselines: list[dict]) -> list[dict]:
     means the whole `workflow_run_id` is excluded (never substituted with
     a later attempt). Returns baselines sorted by `workflow_run_id`
     (canonical order, #2179 AC7) -- order-independent regardless of input
-    order."""
-    selected = _select_initial_attempt_baselines(baselines)
+    order. #2187: `_select_initial_attempt_baselines` now returns
+    `(selected, evidence_errors)`; this helper only needs `selected` (its
+    callers -- `_comparable_cohort` -- do not currently surface a
+    per-baseline evidence_errors channel)."""
+    selected, _evidence_errors = _select_initial_attempt_baselines(baselines)
     return [selected[workflow_run_id] for workflow_run_id in sorted(selected, key=str)]
 
 
@@ -589,10 +641,37 @@ def _pair_by_workflow_run_id(
     NOT a `{b["workflow_run_id"]: b for b in ...}` dict comprehension --
     that shape is an implicit "last baseline in the input list wins" for a
     duplicate key, an insertion-order artifact this policy explicitly
-    forbids."""
-    core_by_id = _select_initial_attempt_baselines(core_baselines)
-    responsive_by_id = _select_initial_attempt_baselines(responsive_baselines)
-    all_ids = sorted(set(core_by_id) | set(responsive_by_id), key=str)
+    forbids.
+
+    #2187 AC4/AC9: `all_ids` is built from the RAW `workflow_run_id` set
+    present in `core_baselines` / `responsive_baselines` -- NOT from the
+    selected maps' keys -- so a `workflow_run_id` excluded on BOTH sides by
+    `_select_initial_attempt_baselines` (e.g. every same-id baseline is
+    missing `run_attempt` on both `e2e-core` and `e2e-responsive-matrix`)
+    still surfaces in `evidence_errors` instead of silently disappearing.
+    When the underlying cause is a `_select_initial_attempt_baselines`
+    exclusion (`legacy_unverified_run_attempt`), that reason is merged into
+    this function's own `evidence_errors` entry rather than being reported
+    only as the fixed `missing_pair_e2e-core` / `missing_pair_e2e-
+    responsive-matrix` string."""
+    core_by_id, core_selection_errors = _select_initial_attempt_baselines(core_baselines)
+    responsive_by_id, responsive_selection_errors = _select_initial_attempt_baselines(responsive_baselines)
+
+    core_selection_reason_by_id = {err["workflow_run_id"]: err["reason"] for err in core_selection_errors}
+    responsive_selection_reason_by_id = {
+        err["workflow_run_id"]: err["reason"] for err in responsive_selection_errors
+    }
+
+    raw_ids: set[object] = set()
+    for baseline in core_baselines:
+        workflow_run_id = baseline.get("workflow_run_id")
+        if workflow_run_id is not None:
+            raw_ids.add(workflow_run_id)
+    for baseline in responsive_baselines:
+        workflow_run_id = baseline.get("workflow_run_id")
+        if workflow_run_id is not None:
+            raw_ids.add(workflow_run_id)
+    all_ids = sorted(raw_ids, key=str)
 
     pairs: list[tuple[object, dict, dict]] = []
     evidence_errors: list[dict] = []
@@ -600,10 +679,17 @@ def _pair_by_workflow_run_id(
         core = core_by_id.get(workflow_run_id)
         responsive = responsive_by_id.get(workflow_run_id)
         if core is None or responsive is None:
+            reasons: list[str] = []
+            if core is None:
+                reasons.append(core_selection_reason_by_id.get(workflow_run_id, "missing_pair_e2e-core"))
+            if responsive is None:
+                reasons.append(
+                    responsive_selection_reason_by_id.get(workflow_run_id, "missing_pair_e2e-responsive-matrix")
+                )
             evidence_errors.append(
                 {
                     "workflow_run_id": workflow_run_id,
-                    "reason": "missing_pair_e2e-core" if core is None else "missing_pair_e2e-responsive-matrix",
+                    "reason": ",".join(reasons),
                 }
             )
             continue
@@ -828,14 +914,23 @@ def _provider_post_filter_sample_count(
     return post_filter_count, evidence_errors
 
 
-def _gate_ready_post_filter_sample_count(baselines: list[dict]) -> int:
-    """Returns the number of baselines with a REAL (both-timestamps-present)
-    same-clock gate-ready latency AFTER timestamp filtering (#2159 P0-6).
-    `_gate_ready_latency_seconds` already silently drops timestamp-missing
-    baselines; this helper makes the resulting count an explicit,
-    independently checkable value rather than an implicit array length the
-    caller may forget to re-validate."""
-    return len(_gate_ready_latency_seconds(baselines))
+def _gate_ready_post_filter_sample_count(baselines: list[dict]) -> tuple[int, list[dict]]:
+    """Returns `(post_filter_sample_count, evidence_errors)`: the number of
+    baselines with a REAL (both-timestamps-present) same-clock gate-ready
+    latency AFTER timestamp filtering (#2159 P0-6). `_gate_ready_latency_
+    seconds` already silently drops timestamp-missing baselines; this
+    helper makes the resulting count an explicit, independently checkable
+    value rather than an implicit array length the caller may forget to
+    re-validate.
+
+    #2187 AC6: applies the SAME `_select_initial_attempt_baselines`
+    attempt-selection / `workflow_run_id` dedupe the provider lane uses
+    (`_pair_by_workflow_run_id`) to this gate-ready lane, so a missing
+    `run_attempt`, a duplicate `workflow_run_id`, or an attempt-2-and-later
+    -only record cannot inflate the sample floor."""
+    selected, evidence_errors = _select_initial_attempt_baselines(baselines)
+    deduped = list(selected.values())
+    return len(_gate_ready_latency_seconds(deduped)), evidence_errors
 
 
 def _evidence_readiness_hard_check_post_filter(

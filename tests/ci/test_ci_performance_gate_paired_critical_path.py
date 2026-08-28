@@ -36,10 +36,19 @@ gate = _load_gate_module()
 
 
 def _baseline(job: str, workflow_run_id: int, elapsed_ms: int) -> dict:
+    # #2187: `run_attempt` is set explicitly to the trusted attempt-1 value.
+    # Under the gate-side missing-run_attempt trust rejection unified with
+    # the collector in #2187, a fixture omitting this key would be silently
+    # excluded from `_select_initial_attempt_baselines` / `_pair_by_
+    # workflow_run_id`, breaking every existing assertion in this file that
+    # this helper feeds (this file's own scope is paired-critical-path
+    # statistics, not run_attempt trust semantics -- those are covered by
+    # tests/ci/test_ci_performance_gate_rerun_attempt_trust_boundary.py).
     return {
         "schema": "ci_runtime_baseline_v1",
         "job": job,
         "workflow_run_id": workflow_run_id,
+        "run_attempt": 1,
         "measurements": [{"phase_id": "test_e2e_ci", "elapsed_ms": elapsed_ms, "status": 0}],
     }
 

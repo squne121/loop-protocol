@@ -202,7 +202,7 @@ def test_identity_collision_on_any_disagreeing_field_excludes_whole_sample(extra
     assert 990 in collisions
     assert len(collisions[990]) == 2
 
-    selected = gate._select_initial_attempt_baselines([baseline_a, baseline_b])
+    selected, _evidence_errors = gate._select_initial_attempt_baselines([baseline_a, baseline_b])
     assert 990 not in selected
 
 
@@ -218,7 +218,7 @@ def test_byte_identical_duplicate_is_unchanged_not_a_collision():
     collisions = gate._detect_run_attempt_identity_collisions([baseline_a, baseline_b])
     assert 991 not in collisions
 
-    selected = gate._select_initial_attempt_baselines([baseline_a, baseline_b])
+    selected, _evidence_errors = gate._select_initial_attempt_baselines([baseline_a, baseline_b])
     assert selected[991]["measurements"][0]["elapsed_ms"] == 150_000
 
 
@@ -243,5 +243,5 @@ def test_missing_attempt_baseline_colliding_with_explicit_attempt_1_baseline_is_
     collisions = gate._detect_run_attempt_identity_collisions([explicit_attempt_1, missing_attempt])
     assert 992 in collisions
 
-    selected = gate._select_initial_attempt_baselines([explicit_attempt_1, missing_attempt])
+    selected, _evidence_errors = gate._select_initial_attempt_baselines([explicit_attempt_1, missing_attempt])
     assert 992 not in selected
