@@ -142,6 +142,53 @@ def _validate_policy_contract(data: dict[str, Any], path: Path) -> None:
         )
 
 
+def _extract_candidate_path_globs(data: dict[str, Any]) -> list[str]:
+    """Cheap structural validation + extraction of
+    ``unknown_surface_policy.project_candidate_path_globs`` (Issue #2339 AC9).
+
+    Called from ``evaluate_allowed_paths`` for *every* policy source (both
+    the default ``load_policy()`` path and a ``policy=`` dict passed
+    directly by a caller/test), so a malformed
+    ``unknown_surface_policy.project_candidate_path_globs`` fails closed
+    with a distinguishable ``PolicyLoadError`` regardless of how the policy
+    mapping was constructed -- it must never silently degrade to "no
+    candidate perimeter" (which would look identical to a legitimately
+    clean/empty candidate perimeter and risk silently approving what should
+    have been an advisory finding, Issue #2339 AC9).
+
+    ``unknown_surface_policy`` itself is OPTIONAL at this (Python-level,
+    cheap) validation layer -- older/minimal fixture policies used by
+    existing tests (e.g. ``_MULTI_RULE_POLICY``) omit the key entirely and
+    must keep working unchanged; they simply have no candidate perimeter
+    (every non-rule-matched entry classifies as ``ordinary``). The real
+    production YAML's ``unknown_surface_policy`` (and its
+    ``project_candidate_path_globs`` field) is additionally required by
+    ``docs/dev/extension-surface-runtime-policy.schema.json`` -- that is a
+    separate, stricter validation layer (Issue #2339 Notes for Reviewer).
+    """
+    unknown_surface_policy = data.get("unknown_surface_policy")
+    if unknown_surface_policy is None:
+        return []
+    if not isinstance(unknown_surface_policy, dict):
+        raise PolicyLoadError(
+            f"policy declares 'unknown_surface_policy' as {type(unknown_surface_policy).__name__}, "
+            "expected a mapping"
+        )
+    if "project_candidate_path_globs" not in unknown_surface_policy:
+        return []
+    raw_globs = unknown_surface_policy.get("project_candidate_path_globs")
+    if not isinstance(raw_globs, list) or not all(
+        isinstance(glob, str) and glob for glob in raw_globs
+    ):
+        raise PolicyLoadError(
+            "policy declares 'unknown_surface_policy.project_candidate_path_globs' as "
+            f"{raw_globs!r}, expected a non-empty list of non-empty strings (Issue #2339 AC9: "
+            "malformed unknown_surface_policy must fail closed as policy-unavailable, not "
+            "silently approve)"
+        )
+    return raw_globs
+
+
 def load_policy(policy_path: Optional[Path] = None) -> dict[str, Any]:
     """Load, parse, and cheaply validate the extension-surface risk-trigger
     policy YAML. Raises ``PolicyLoadError`` (never returns a partially
@@ -355,6 +402,44 @@ def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[
     return matches[0]
 
 
+def _matches_candidate_perimeter(entry: str, candidate_path_globs: list[str]) -> Optional[str]:
+    """Return the first ``unknown_surface_policy.project_candidate_path_globs``
+    entry that ``entry`` is a conservative candidate for, else ``None``.
+
+    Mirrors ``match_allowed_path_entry``'s exact-match / conservative
+    static-prefix-overlap comparison against a rule's ``path_globs``, but
+    against the flat candidate-perimeter glob list instead of a rule's
+    selectors (the candidate perimeter has no ``source_scope`` /
+    ``issue_time_enforcement`` concept -- Issue #2339 AC11: it is a
+    project-local-only, repository-relative glob list, never resolved
+    against user/managed/plugin/session/cli source_scope surfaces).
+    """
+    normalized_entry_pattern = AllowedPathsMatcher.normalize_allowed_pattern(entry)
+    if normalized_entry_pattern is None:
+        return None
+    is_wildcard = "*" in normalized_entry_pattern
+
+    for glob in candidate_path_globs:
+        normalized_glob = AllowedPathsMatcher.normalize_allowed_pattern(glob)
+        if normalized_glob is None:
+            continue
+
+        if not is_wildcard:
+            normalized_file = AllowedPathsMatcher.normalize_path(entry)
+            if normalized_file is None:
+                continue
+            if AllowedPathsMatcher.matches_pattern(normalized_file, normalized_glob):
+                return glob
+            continue
+
+        entry_prefix = _static_prefix_segments(normalized_entry_pattern)
+        glob_prefix = _static_prefix_segments(normalized_glob)
+        if _one_is_prefix_of_other(entry_prefix, glob_prefix):
+            return glob
+
+    return None
+
+
 def evaluate_allowed_paths(
     allowed_path_entries: list[str],
     policy: Optional[dict[str, Any]] = None,
@@ -366,13 +451,24 @@ def evaluate_allowed_paths(
     In Scope, bullet 2) and derives the union of required
     ``verification_profiles`` from the matched rules (Issue #2290 In Scope,
     bullet 3).
+
+    Issue #2339: each declared Allowed Path entry is additionally
+    classified into exactly one of ``matched_rule`` / ``unclassified_candidate``
+    / ``ordinary`` (``path_classifications``), and any ``unclassified_candidate``
+    entry (a ``unknown_surface_policy.project_candidate_path_globs`` match
+    with no known rule selector match) contributes a non-blocking
+    ``advisories`` message. ``unclassified_candidate`` entries never
+    contribute to ``final_decision`` -- only ``matched_rule`` entries with
+    ``enforcement: hard`` do (unchanged from Issue #2290/#2356 semantics).
     """
     policy_data = policy if policy is not None else load_policy()
     rules = policy_data.get("rules", []) or []
+    candidate_path_globs = _extract_candidate_path_globs(policy_data)
 
     matched_rules: list[dict[str, Any]] = []
     verification_profiles: set[str] = set()
     final_decision: Optional[str] = None
+    entries_with_rule_hit: set[str] = set()
 
     for rule in rules:
         match_hits: list[dict[str, Any]] = []
@@ -380,6 +476,7 @@ def evaluate_allowed_paths(
             hit = match_allowed_path_entry(entry, rule)
             if hit is not None:
                 match_hits.append(hit)
+                entries_with_rule_hit.add(entry)
         if not match_hits:
             continue
 
@@ -409,6 +506,37 @@ def evaluate_allowed_paths(
             if final_decision is None or DECISION_RANK[rule_decision] > DECISION_RANK[final_decision]:
                 final_decision = rule_decision
 
+    # Issue #2339: classify every declared entry that matched no rule as
+    # either `unclassified_candidate` (a project_candidate_path_globs hit)
+    # or `ordinary` (no candidate glob hit either). `matched_rule` entries
+    # keep their existing `matched_rules` representation above; this pass
+    # only adds the three-way per-entry classification view, it does not
+    # change any existing matched-rule semantics.
+    path_classifications: list[dict[str, Any]] = []
+    advisories: list[str] = []
+    for entry in allowed_path_entries:
+        if entry in entries_with_rule_hit:
+            path_classifications.append({"entry": entry, "classification": "matched_rule"})
+            continue
+        candidate_glob = _matches_candidate_perimeter(entry, candidate_path_globs)
+        if candidate_glob is not None:
+            path_classifications.append(
+                {
+                    "entry": entry,
+                    "classification": "unclassified_candidate",
+                    "candidate_path_glob": candidate_glob,
+                }
+            )
+            advisories.append(
+                f"Allowed Path entry '{entry}' matches the project-local extension candidate "
+                f"perimeter glob '{candidate_glob}' (unknown_surface_policy.project_candidate_path_globs) "
+                "but no known extension-surface risk-trigger rule selector. This is a non-blocking "
+                "advisory -- verdict: approve, final_decision unaffected -- surfaced so a human can "
+                "confirm whether this is a genuine new extension surface (Issue #2339)."
+            )
+        else:
+            path_classifications.append({"entry": entry, "classification": "ordinary"})
+
     return {
         "schema": SCHEMA_POLICY_EVALUATION,
         "matched_rules": matched_rules,
@@ -419,6 +547,8 @@ def evaluate_allowed_paths(
             "multiple_matches": (policy_data.get("resolution") or {}).get("multiple_matches"),
             "final_decision_strategy": (policy_data.get("resolution") or {}).get("final_decision"),
         },
+        "path_classifications": path_classifications,
+        "advisories": advisories,
     }
 
 
@@ -494,4 +624,8 @@ def evaluate_issue_risk_trigger(
         "reasons": reasons,
         "policy_evaluation": policy_evaluation,
         "missing_rva_immediate_fields": missing_fields,
+        # Issue #2339: `unclassified_candidate` advisories (non-blocking --
+        # never contribute to `reasons`/`verdict`; verdict stays `approve`
+        # when reasons is empty even if advisories is non-empty, AC6).
+        "advisories": policy_evaluation.get("advisories", []),
     }

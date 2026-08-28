@@ -43,16 +43,27 @@ resolution:
 
 # unknown_surface_policy:
 #   上記 surface（agent / hook / skill / claude-gpt / SubAgent lifecycle）の
-#   いずれにも一致しない変更（未知の extension surface）を検知した場合の既定方針。
+#   既知 rule selector のいずれにも一致しない Allowed Paths エントリのうち、
+#   project_candidate_path_globs に一致するもの（project-local な高シグナル
+#   未分類 extension candidate perimeter）を検知した場合の既定方針。
 #   decision: `not_applicable` へ黙って倒すことを禁止し、human_judgment
-#     （人間判断へのエスカレーション）を既定とする。
-#   gate: block（人間判断が確定するまで進行を止める）とし、advisory（警告のみで
-#     進行を止めない）は採用しない。
-#   override_requires: block を解除できる権限。
+#     （人間判断が必要という分類ラベル）を既定とする。ただしこの値は
+#     evaluator の `final_decision`（not_applicable/deferred/immediate の
+#     既存三値のみ）へは一切混在しない（Issue #2339 AC8）。
+#   gate: advisory（Issue #2339 で block から変更 -- 未分類の candidate
+#     perimeter 一致だけで進行を止めない。silent approve でもない中間の
+#     non-blocking advisory として可視化する）。gate: block のときのみ
+#     override_requires を必須とする（schema 側の条件付き validation）。
+#   project_candidate_path_globs: 上記の既知 rule いずれにも一致しない
+#     Allowed Paths のうち、project-local な高シグナル候補として advisory
+#     検知の対象にする repository-relative glob 一覧（matcher-v2 grammar）。
+#     ここに一致しない場合は `ordinary`（無警告で approve）として扱う。
 unknown_surface_policy:
   decision: human_judgment
-  gate: block
-  override_requires: owner_approval
+  gate: advisory
+  project_candidate_path_globs:
+    - ".claude/commands/**"
+    - ".claude/rules/**"
 
 # delivery_context:
 #   横断 SSOT として本ポリシーを扱う際の配布形態ごとの留意点。

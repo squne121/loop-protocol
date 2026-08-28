@@ -1602,6 +1602,39 @@ def check_c14_extension_surface_risk_trigger(body: str, issue_kind: str) -> tupl
     return CheckResult.PASS, []
 
 
+def get_extension_surface_candidate_advisories(body: str, issue_kind: str) -> list[str]:
+    """Issue #2339: non-blocking `unclassified_candidate` advisory messages.
+
+    Companion to ``check_c14_extension_surface_risk_trigger`` (which remains
+    the unchanged blocking C14 gate) -- this is wired separately as a
+    ``non_blocking_improvements`` entry (via ``_add_warning``) so it can
+    never affect ``CheckResult``/verdict, and so ``review-issue`` and
+    ``issue-contract-review`` expose the same classification + advisory
+    info for the same fixture body (Issue #2339 AC7 parity requirement,
+    same shared-evaluator structural-parity pattern as C14 itself).
+    """
+    if issue_kind != "implementation":
+        return []
+
+    allowed_path_entries = pc_extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return []
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+
+    try:
+        policy_evaluation = evaluator.evaluate_allowed_paths(allowed_path_entries)
+    except evaluator.PolicyLoadError:
+        # A policy-load failure is already surfaced as a blocking C14 WARN
+        # finding by check_c14_extension_surface_risk_trigger(); do not
+        # double-report it here as a non-blocking advisory.
+        return []
+
+    return list(policy_evaluation.get("advisories") or [])
+
+
 def check_c13_vc_preflight_decision_consistency(
     vc_preflight_json_path: Optional[str] = None,
 ) -> tuple[str, list[str]]:
@@ -2490,6 +2523,23 @@ def run_checks(
         finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
         blocking=checks.C14_extension_surface_risk_trigger == CheckResult.FAIL,
     )
+
+    # C14b: Extension surface candidate perimeter advisory (Issue #2339,
+    # non-blocking -- must never touch checks.* / all_check_values / verdict).
+    extension_surface_candidate_advisories = get_extension_surface_candidate_advisories(body, issue_kind)
+    if extension_surface_candidate_advisories:
+        _add_warning(
+            result,
+            code="extension_surface_candidate_perimeter_advisory",
+            severity="advisory",
+            evidence=extension_surface_candidate_advisories,
+            suggested_action=(
+                "Non-blocking: one or more declared Allowed Paths match a project-local "
+                "extension candidate perimeter (unknown_surface_policy.project_candidate_path_globs) "
+                "but no known extension-surface risk-trigger rule. Confirm whether this is a "
+                "genuine new extension surface; no action required to proceed."
+            ),
+        )
 
     # Non-blocking warnings（structured: code/severity/evidence/suggested_action）
     detect_warning_scope_cvs_in_scope_mismatch(body, result)

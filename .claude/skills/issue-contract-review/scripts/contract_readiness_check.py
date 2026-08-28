@@ -1455,6 +1455,61 @@ def check_extension_surface_risk_trigger(body: str) -> list[dict]:
     ]
 
 
+def check_extension_surface_advisory(body: str) -> list[dict]:
+    """Issue #2339: non-blocking `unclassified_candidate` advisory findings.
+
+    Companion to `check_extension_surface_risk_trigger()` above (which
+    remains the unchanged blocking C14/EXTSURF001/EXTSURF002 gate). This
+    function's return value MUST NOT be passed into the
+    `if ext_surface_errors:` escalation in `run_contract_readiness_check()`
+    -- it is included in `all_errors` (the existing output "errors" list)
+    for display only, distinguished by `category:
+    extension_surface_candidate_advisory`, so `overall_status` is never
+    raised by an `unclassified_candidate` match alone (Issue #2339 AC6).
+    """
+    if not _is_canonical_implementation_issue(body):
+        return []
+
+    allowed_path_entries = _extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return []
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+
+    try:
+        policy_evaluation = evaluator.evaluate_allowed_paths(allowed_path_entries)
+    except evaluator.PolicyLoadError:
+        # Policy-unavailable is already surfaced as a blocking EXTSURF002
+        # finding by check_extension_surface_risk_trigger(); do not
+        # double-report it here as a non-blocking advisory.
+        return []
+
+    advisories = policy_evaluation.get("advisories") or []
+    if not advisories:
+        return []
+
+    return [
+        {
+            "rule_id": "EXTSURF003",
+            "severity": "info",
+            "source_check": "contract_readiness_check",
+            "category": "extension_surface_candidate_advisory",
+            "section": "Allowed Paths",
+            "line_start": 0,
+            "line_end": 0,
+            "minimal_context": advisories,
+            "fix_hint": (
+                "Non-blocking: one or more declared Allowed Paths match a project-local "
+                "extension candidate perimeter (unknown_surface_policy.project_candidate_path_globs) "
+                "but no known extension-surface risk-trigger rule. No action required."
+            ),
+            "autofixable": False,
+        }
+    ]
+
+
 def check_rva_immediate_fields(body: str) -> list[dict]:
     """
     AC4: Check that `decision: immediate` RVA section has all required fields.
@@ -1849,6 +1904,10 @@ def build_result(
     rva_errors = check_rva_immediate_fields(body)
     rdr_errors = check_required_design_references(body)
     ext_surface_errors = check_extension_surface_risk_trigger(body)
+    # Issue #2339: non-blocking advisory findings, kept OUT of
+    # `ext_surface_errors` (the escalation-gating variable below) --
+    # included in `all_errors` for display only.
+    ext_surface_advisory_errors = check_extension_surface_advisory(body)
 
     preflight_errors: list[dict] = []
     preflight_aggregate = "go"
@@ -1868,6 +1927,7 @@ def build_result(
         + rva_errors
         + rdr_errors
         + ext_surface_errors
+        + ext_surface_advisory_errors
         + static_vc_errors
         + preflight_errors
     )

@@ -27,13 +27,27 @@
     },
     "unknown_surface_policy": {
       "type": "object",
-      "required": ["decision", "gate", "override_requires"],
+      "required": ["decision", "gate", "project_candidate_path_globs"],
       "additionalProperties": false,
       "properties": {
         "decision": { "type": "string", "enum": ["human_judgment"] },
         "gate": { "type": "string", "enum": ["block", "advisory"] },
-        "override_requires": { "type": "string" }
-      }
+        "override_requires": { "type": "string" },
+        "project_candidate_path_globs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "gate": { "const": "block" } },
+            "required": ["gate"]
+          },
+          "then": { "required": ["override_requires"] }
+        }
+      ]
     },
     "delivery_context": {
       "type": "object",
