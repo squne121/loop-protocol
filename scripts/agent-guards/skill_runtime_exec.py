@@ -83,7 +83,59 @@ _RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS = (
     ".claude/worktrees",
     ".claude/artifacts/issue-refinement-loop",
     "artifacts/session-manifest-runtime",
+    # Issue #1526: `.pytest_cache` (repo-root pytest cacheprovider directory,
+    # ignored via `.gitignore:69`). pytest's own `NFPlugin`/`LFPlugin`
+    # (registered together in `_pytest/cacheprovider.py`'s `pytest_configure`
+    # hookimpl) both write into it from `pytest_sessionfinish`: `NFPlugin`
+    # saves `cache/nodeids` on every ordinary session finish, and `LFPlugin`
+    # saves `cache/lastfailed` whenever the failed-node-id set changed since
+    # the last run (PR #2364 review P2: not unconditionally -- pytest 9.0.3's
+    # `LFPlugin.pytest_sessionfinish` compares against the previously saved
+    # value first). Third-party plugins can additionally write arbitrary keys
+    # under `.pytest_cache/v/cache/` via the public `config.cache` API. None
+    # of this is canonical evidence, it is concurrent peer pytest's ordinary
+    # generated/disposable cache state that this stdlib-only snapshot diff
+    # cannot attribute to the executor child vs. a peer process.
+    # `.pytest_cache/CACHEDIR.TAG` and its own auto-generated `.gitignore: *`
+    # already self-declare the directory as regenerable. Unlike
+    # `_LEDGER_*`/`_SHADOW_LOG_EXACT_REL` below, there is no single
+    # stable-identity file here whose symlink/directory/FIFO/socket/device
+    # substitution would need typed exact-file protection -- the whole tree
+    # is disposable, so the directory-root exclusion class used for the peer
+    # roots above is the right shape, not the typed exact-file policy.
+    ".pytest_cache",
 )
+
+# Issue #1526 PR #2364 review P1-1: pytest's cacheprovider does not create
+# `.pytest_cache` directly on a cold start. `Cache._ensure_cache_dir_and_
+# supporting_files()` first materializes a `tempfile.TemporaryDirectory(
+# prefix="pytest-cache-files-", dir=self._cachedir.parent)` -- i.e. a
+# repo-root sibling of `.pytest_cache`, not a path under it -- populates it
+# with README.md/.gitignore/CACHEDIR.TAG, and only then renames it onto
+# `.pytest_cache`. A genuinely concurrent peer pytest process racing this
+# executor's before/after snapshot can therefore leave a real, transient
+# `pytest-cache-files-<random>/` directory sitting directly at repo root,
+# which the `.pytest_cache` root-exclusion above does not cover. This is the
+# same disposable/generated-state class as `.pytest_cache` itself (pytest's
+# own atomic-rename implementation detail, never canonical evidence), so it
+# gets a narrow, repo-root-only, prefix-matched exemption alongside it rather
+# than widening `_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS` (which only does
+# exact-string/exact-subtree matching, not prefix globs).
+_PYTEST_CACHE_COLD_START_TEMP_DIR_PREFIX = "pytest-cache-files-"
+
+
+def _is_pytest_cache_cold_start_temp_path(rel_path: str) -> bool:
+    """True for a repo-root-only `pytest-cache-files-<random>` transient
+    directory (or any path inside it) that pytest's cacheprovider creates
+    while atomically materializing `.pytest_cache` on a cold start (PR #2364
+    review P1-1). Deliberately top-level-only: a nested
+    `sub/pytest-cache-files-x` is never pytest's own cache_dir sibling (its
+    `dir=self._cachedir.parent` is always the pytest rootdir, which this
+    executor treats as repo root) and must remain fully audited.
+    """
+    normalized = rel_path.replace(os.sep, "/")
+    first_segment = normalized.split("/", 1)[0]
+    return first_segment.startswith(_PYTEST_CACHE_COLD_START_TEMP_DIR_PREFIX)
 # Issue #1563: `.guard_shadow_log.jsonl` (repo-root peer-append log written by
 # `.claude/hooks/shadow_log.py`, `.claude/hooks/guard-japanese-prose.sh`,
 # `.claude/hooks/rtk_boundary_shadow_guard.sh`, and `scripts/check-codex-agents.mjs`)
@@ -659,6 +711,19 @@ def _snapshot_repo_paths(
             for name in dirnames
             if (current_path / name) not in peer_roots
         ]
+        # PR #2364 review P1-1: also prune a genuine repo-root-only pytest
+        # cold-start temp dir (`pytest-cache-files-<random>`, see
+        # `_is_pytest_cache_cold_start_temp_path` above) from this full
+        # filesystem walk. `peer_roots` above only prunes exact, statically
+        # known paths (like `.pytest_cache` itself); this dynamic-suffix
+        # sibling needs its own prefix check, scoped to `current_path ==
+        # root` so a nested lookalike is never pruned.
+        if current_path == root:
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not _is_pytest_cache_cold_start_temp_path(name)
+            ]
         for name in ["."] + dirnames + filenames:
             path = current_path if name == "." else current_path / name
             if path == root / ".git":
@@ -1949,6 +2014,7 @@ def _find_unauthorized_repo_changes(
         for path in expanded_new_status_paths
         if not _is_under_allowed_artifact_root(project_root, issue_number, path, command_id)
         and not _is_race_tolerant_unattributable_path(path)
+        and not _is_pytest_cache_cold_start_temp_path(path)
         and path not in _LEDGER_TYPED_EXACT_RELS
         and path != _SHADOW_LOG_EXACT_REL
         and path.rstrip("/") not in safe_ledger_ancestor_dir_rels
