@@ -284,6 +284,47 @@ def test_gh_cli_transport_default_planned_operations_declares_issue_comment():
 
 
 
+# --- Generic result-field passthrough (PR #2372 REQUEST_CHANGES follow-up) ---
+
+
+def test_capability_preflight_result_forwards_generic_result_fields(monkeypatch):
+    """GIVEN the producer (workflow_capability_preflight.py) returns an
+    arbitrary/generic result payload
+    WHEN capability_preflight_result() is called
+    THEN it forwards the producer's `decision` / `checks` /
+    `actor_capabilities` / `reasons` fields through unchanged -- verified
+    with generic sentinel names, not AGY-specific ones (PR #2372
+    REQUEST_CHANGES P2: a positive contract test for the transparent
+    passthrough behavior of `capability_preflight_result()`)."""
+
+    payload = {
+        "decision": "ready",
+        "checks": {"sentinel_check": {"status": "ok"}},
+        "actor_capabilities": {
+            "sentinel_actor": {
+                "status": "ready",
+                "reason_code": None,
+            }
+        },
+        "reasons": ["sentinel_reason"],
+    }
+
+    monkeypatch.setattr(
+        rer.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        ),
+    )
+
+    result = rer.capability_preflight_result(repo=_REPO)
+
+    assert result == payload
+
+
 # --- P1-4: real producer/consumer integration via a fake `gh` on PATH -----
 
 
