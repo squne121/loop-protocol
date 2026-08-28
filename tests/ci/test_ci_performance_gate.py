@@ -209,7 +209,20 @@ def run_evidence_gate(fixture: dict) -> dict:
     the insufficient-evidence case (the CLI wrapper below converts that into
     a non-zero process exit -- this function itself stays a pure, directly
     unit-testable building block, mirroring `build_assessment_from_percentile_
-    cohorts`'s own existing testability design)."""
+    cohorts`'s own existing testability design).
+
+    #2187 fix_delta (OWNER REQUEST_CHANGES issuecomment-5458167419 P1-1):
+    `_gate_ready_post_filter_sample_count`'s `evidence_errors` return value
+    is no longer discarded (`_before_gate_ready_evidence_errors` /
+    `_after_gate_ready_evidence_errors` were previously bound with a `_`
+    prefix and never used) -- it is threaded into
+    `_evidence_readiness_hard_check_post_filter` (which now also
+    fail-closes on a non-empty gate-ready `evidence_errors` list, not only
+    on the raw post-filter sample count) AND surfaced verbatim in the
+    result dict's `gate_ready_evidence_errors` field (`{"before": [...],
+    "after": [...]}`) for BOTH the `insufficient_evidence` and `complete`
+    outcomes, so a missing/invalid/colliding gate-ready record's id and
+    reason are never silently dropped from the production result."""
     validator = _load_validator_module()
 
     before_core = fixture["before"]["core_baselines"]
@@ -224,19 +237,29 @@ def run_evidence_gate(fixture: dict) -> dict:
 
     before_provider_count, _ = _provider_post_filter_sample_count(before_core, before_responsive)
     after_provider_count, _ = _provider_post_filter_sample_count(after_core, after_responsive)
-    before_gate_ready_count, _before_gate_ready_evidence_errors = _gate_ready_post_filter_sample_count(
+    before_gate_ready_count, before_gate_ready_evidence_errors = _gate_ready_post_filter_sample_count(
         before_gate_ready
     )
-    after_gate_ready_count, _after_gate_ready_evidence_errors = _gate_ready_post_filter_sample_count(
+    after_gate_ready_count, after_gate_ready_evidence_errors = _gate_ready_post_filter_sample_count(
         after_gate_ready
     )
+    gate_ready_evidence_errors = {
+        "before": before_gate_ready_evidence_errors,
+        "after": after_gate_ready_evidence_errors,
+    }
 
     try:
         _evidence_readiness_hard_check_post_filter(
-            before_provider_count, before_evidence_errors, {"before": before_gate_ready_count}
+            before_provider_count,
+            before_evidence_errors,
+            {"before": before_gate_ready_count},
+            gate_ready_evidence_errors={"before": before_gate_ready_evidence_errors},
         )
         _evidence_readiness_hard_check_post_filter(
-            after_provider_count, after_evidence_errors, {"after": after_gate_ready_count}
+            after_provider_count,
+            after_evidence_errors,
+            {"after": after_gate_ready_count},
+            gate_ready_evidence_errors={"after": after_gate_ready_evidence_errors},
         )
     except EvidenceInsufficientError as exc:
         return {
@@ -245,6 +268,7 @@ def run_evidence_gate(fixture: dict) -> dict:
             "reason": str(exc),
             "before_provider_post_filter_count": before_provider_count,
             "after_provider_post_filter_count": after_provider_count,
+            "gate_ready_evidence_errors": gate_ready_evidence_errors,
             "assessment": None,
             "validation_result": None,
         }
@@ -280,6 +304,7 @@ def run_evidence_gate(fixture: dict) -> dict:
         "reason": None,
         "before_provider_post_filter_count": before_provider_count,
         "after_provider_post_filter_count": after_provider_count,
+        "gate_ready_evidence_errors": gate_ready_evidence_errors,
         "assessment": assessment,
         "validation_result": decision,
         "validation_exit_code": exit_code,
@@ -454,6 +479,35 @@ def _normalize_run_attempt_trusted(baseline: dict) -> int | None:
     return _normalize_run_attempt(baseline)
 
 
+RUN_ATTEMPT_IDENTITY_COLLISION_REASON = "run_attempt_identity_collision"
+MISSING_OR_INVALID_INITIAL_ATTEMPT_EXCLUDED_REASON = "missing_or_invalid_initial_attempt_excluded_from_sample"
+
+
+def _classify_run_attempt_trusted(baseline: dict) -> tuple[int | None, str]:
+    """#2187 fix_delta (OWNER REQUEST_CHANGES issuecomment-5458167419 P1-2):
+    small classifier mirroring the collector's
+    (`scripts/ci/collect_e2e_performance_benchmark.py::_classify_run_
+    attempt`) three-way shape, so every `_select_initial_attempt_baselines`
+    exclusion carries an identifiable reason instead of silently
+    disappearing for input shapes other than a fully-missing key. Returns
+    `(value, status)` where `status` is one of `"missing"` (key absent
+    entirely), `"invalid"` (key present but fails `_normalize_run_attempt`'s
+    type/range contract), or `"ok"` (a valid `run_attempt` integer -- NOT
+    necessarily `1`; attempt 2+ is still `"ok"`, just not selected as the
+    initial attempt). #2187 note: unlike the collector's version, this gate
+    module's producer-shaped numeric-string `"1"` acceptance is delegated
+    to `_normalize_run_attempt` unchanged (never re-implemented/narrowed
+    here) -- unifying the trust *eligibility* boundary (missing-key
+    handling) does not mean copying the collector's int-only literal
+    implementation."""
+    if "run_attempt" not in baseline:
+        return None, "missing"
+    value = _normalize_run_attempt(baseline)
+    if value is None:
+        return None, "invalid"
+    return value, "ok"
+
+
 def _identity_normalized_json(baseline: dict) -> str:
     """#2182 P1 (fix_delta after OWNER adversarial review of PR #2182,
     issuecomment-5302446086): canonical (sorted-keys) JSON view of
@@ -522,17 +576,31 @@ def _select_initial_attempt_baselines(
     here first, before trust filtering.
 
     Returns `(selected, evidence_errors)`. `selected` maps `workflow_run_id`
-    -> the chosen trusted attempt-1 baseline. `evidence_errors` records one
-    entry per `workflow_run_id` group that has NO trusted attempt-1
-    candidate AND contains at least one baseline missing the `run_attempt`
-    key entirely -- reason `legacy_unverified_run_attempt` (#2187 AC2/AC9),
-    the SAME identifiable reason the collector emits for this case. A group
-    excluded purely because its only candidates are attempt 2+ (with
-    `run_attempt` present, just not 1), or because it is flagged as an
-    identity collision, is still excluded from `selected` but does NOT get
-    a `legacy_unverified_run_attempt` evidence_errors entry here (that is
-    the existing, unchanged `missing_pair_*` / collision reporting handled
-    by this function's callers, e.g. `_pair_by_workflow_run_id`)."""
+    -> the chosen trusted attempt-1 baseline. `evidence_errors` records
+    EXACTLY ONE entry per `workflow_run_id` group that has NO trusted
+    attempt-1 candidate -- #2187 fix_delta (OWNER REQUEST_CHANGES
+    issuecomment-5458167419 P1-2): every such group now gets an
+    identifiable reason, never a silent exclusion, classified via
+    `_classify_run_attempt_trusted`:
+
+    - `run_attempt_identity_collision` (`RUN_ATTEMPT_IDENTITY_COLLISION_
+      REASON`) when the group is flagged by
+      `_detect_run_attempt_identity_collisions` (checked FIRST, before
+      trust filtering, so a collision group never also gets a
+      missing/invalid reason).
+    - `legacy_unverified_run_attempt` (`LEGACY_UNVERIFIED_RUN_ATTEMPT_
+      REASON`) when EVERY baseline in the group is missing the
+      `run_attempt` key entirely (#2187 AC2/AC9) -- the SAME identifiable
+      reason the collector emits for this case.
+    - `missing_or_invalid_initial_attempt_excluded_from_sample`
+      (`MISSING_OR_INVALID_INITIAL_ATTEMPT_EXCLUDED_REASON`) for every
+      other no-trusted-candidate shape: an explicit invalid value (`None`
+      / bool / `0` / negative / non-numeric string), an attempt-2-and-
+      later-only group, or a group mixing missing/invalid records without
+      a single fully-missing consensus. Pre-fix_delta, this bucket was a
+      silently empty `evidence_errors` list -- the exact defect flagged by
+      OWNER review (a new test-fixture shape, not merely the fully-missing
+      case, could still lose evidence with no identifiable reason)."""
     by_id: dict[object, list[dict]] = {}
     for baseline in baselines:
         workflow_run_id = baseline.get("workflow_run_id")
@@ -546,16 +614,22 @@ def _select_initial_attempt_baselines(
     evidence_errors: list[dict] = []
     for workflow_run_id, group in by_id.items():
         if workflow_run_id in collisions:
+            evidence_errors.append(
+                {
+                    "workflow_run_id": workflow_run_id,
+                    "reason": RUN_ATTEMPT_IDENTITY_COLLISION_REASON,
+                }
+            )
             continue
         candidates = [b for b in group if _normalize_run_attempt_trusted(b) == 1]
         if not candidates:
-            if any("run_attempt" not in b for b in group):
-                evidence_errors.append(
-                    {
-                        "workflow_run_id": workflow_run_id,
-                        "reason": LEGACY_UNVERIFIED_RUN_ATTEMPT_REASON,
-                    }
-                )
+            statuses = {_classify_run_attempt_trusted(b)[1] for b in group}
+            reason = (
+                LEGACY_UNVERIFIED_RUN_ATTEMPT_REASON
+                if statuses == {"missing"}
+                else MISSING_OR_INVALID_INITIAL_ATTEMPT_EXCLUDED_REASON
+            )
+            evidence_errors.append({"workflow_run_id": workflow_run_id, "reason": reason})
             continue
         selected[workflow_run_id] = min(candidates, key=lambda b: json.dumps(b, sort_keys=True, default=str))
     return selected, evidence_errors
@@ -571,8 +645,20 @@ def _dedupe_by_workflow_run_id(baselines: list[dict]) -> list[dict]:
     (canonical order, #2179 AC7) -- order-independent regardless of input
     order. #2187: `_select_initial_attempt_baselines` now returns
     `(selected, evidence_errors)`; this helper only needs `selected` (its
-    callers -- `_comparable_cohort` -- do not currently surface a
-    per-baseline evidence_errors channel)."""
+    caller -- `_comparable_cohort` -- feeds the exploratory,
+    count/duration-only integration tests at the bottom of this module,
+    NOT the AC11 close-verification hard-check path; that path goes
+    through `_gate_ready_post_filter_sample_count` /
+    `_provider_post_filter_sample_count` /
+    `_evidence_readiness_hard_check_post_filter` instead, which DO
+    propagate `evidence_errors` end-to-end into `run_evidence_gate`'s
+    result -- #2187 fix_delta P2-2, OWNER REQUEST_CHANGES
+    issuecomment-5458167419: discarding `evidence_errors` here is scoped
+    to this count-only exploratory path and is not itself a production
+    evidence-loss defect; a future caller that needs `_comparable_cohort`
+    diagnostics for a close-verification use case should thread
+    `evidence_errors` through rather than assume this helper already does
+    so)."""
     selected, _evidence_errors = _select_initial_attempt_baselines(baselines)
     return [selected[workflow_run_id] for workflow_run_id in sorted(selected, key=str)]
 
@@ -937,6 +1023,7 @@ def _evidence_readiness_hard_check_post_filter(
     provider_post_filter_count: int,
     provider_evidence_errors: list[dict],
     gate_ready_post_filter_counts: dict[str, int],
+    gate_ready_evidence_errors: dict[str, list[dict]] | None = None,
     min_count: int = MIN_COHORT_RUN_COUNT,
 ) -> None:
     """#2159 P0-6 AC11 extension: the close-verification hard-check must
@@ -947,7 +1034,17 @@ def _evidence_readiness_hard_check_post_filter(
     `EvidenceInsufficientError` -- never a silent skip -- when the
     post-filter evidence is insufficient, exactly mirroring
     `_evidence_readiness_hard_check`'s fail-closed contract but operating on
-    the correct (post-filter) sample counts."""
+    the correct (post-filter) sample counts.
+
+    #2187 fix_delta (OWNER REQUEST_CHANGES issuecomment-5458167419 P1-1):
+    `gate_ready_evidence_errors` (`{role: [{"workflow_run_id": ..., "reason":
+    ...}, ...]}`, one entry per role such as `"before"` / `"after"`) mirrors
+    `provider_evidence_errors`'s existing fail-closed contract for the
+    gate-ready lane -- a role whose gate-ready sample count clears
+    `min_count` but still has a non-empty exclusion list (a missing/invalid
+    `run_attempt`, a duplicate `workflow_run_id`, or an identity collision)
+    is STILL rejected here, never silently treated as sufficient just
+    because the raw count happened to clear the floor."""
     problems: dict[str, object] = {}
     if provider_post_filter_count < min_count:
         problems["provider_post_filter_sample_count"] = provider_post_filter_count
@@ -956,6 +1053,9 @@ def _evidence_readiness_hard_check_post_filter(
     for role, count in gate_ready_post_filter_counts.items():
         if count < min_count:
             problems[f"gate_ready_post_filter_sample_count[{role}]"] = count
+    for role, errors in (gate_ready_evidence_errors or {}).items():
+        if errors:
+            problems[f"gate_ready_evidence_errors[{role}]"] = errors
     if problems:
         raise EvidenceInsufficientError(
             f"insufficient POST-FILTER comparable-cohort evidence (need >= {min_count} "

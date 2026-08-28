@@ -226,17 +226,29 @@ def test_gate_ready_attempt_2_never_substitutes_for_missing_attempt_1():
     carrying ONLY an attempt-2 record (attempt 1 never uploaded/missing)
     WHEN the post-filter sample count is computed THEN it is 0 -- attempt 2
     is never silently promoted to stand in for a missing attempt 1
-    (#2187 AC6, scenario 3/4)."""
+    (#2187 AC6, scenario 3/4).
+
+    #2187 fix_delta (OWNER REQUEST_CHANGES issuecomment-5458167419 P1-2,
+    test name preserved from the pre-fix_delta version but the assertion
+    REVERSED): these records are NOT missing `run_attempt` (they have
+    `run_attempt=2`), so they do NOT get the `legacy_unverified_run_attempt`
+    reason (that reason is reserved for the genuinely-missing-key case,
+    #2187 AC2/AC9) -- but pre-fix_delta this test asserted
+    `evidence_errors == []`, i.e. this exact input shape silently lost
+    evidence with NO identifiable reason at all, exactly the defect the
+    OWNER review flagged. Each excluded `workflow_run_id` must now carry
+    the identifiable `missing_or_invalid_initial_attempt_excluded_from_
+    sample` reason instead."""
     baselines = [_gate_ready_baseline(6200 + i, run_attempt=2) for i in range(20)]
 
     count, evidence_errors = gate._gate_ready_post_filter_sample_count(baselines)
 
     assert count == 0
-    # These records are NOT missing run_attempt (they have run_attempt=2),
-    # so they are excluded from `selected` without a legacy_unverified_
-    # run_attempt evidence_errors entry (that reason is reserved for the
-    # genuinely-missing-key case, #2187 AC2/AC9).
-    assert evidence_errors == []
+    assert len(evidence_errors) == 20
+    assert all(
+        e["reason"] == gate.MISSING_OR_INVALID_INITIAL_ATTEMPT_EXCLUDED_REASON for e in evidence_errors
+    )
+    assert {e["workflow_run_id"] for e in evidence_errors} == {6200 + i for i in range(20)}
 
 
 def test_gate_ready_unique_explicit_attempt_1_records_meet_sample_floor():
@@ -336,6 +348,82 @@ def test_builtin_insufficient_evidence_fixture_remains_insufficient_evidence():
 
 
 # --------------------------------------------------------------------------- #
+# #2187 fix_delta P2-1 (OWNER REQUEST_CHANGES issuecomment-5458167419): the
+# real `.github/workflows/ci.yml` built-in fixture reproduced immediately
+# above genuinely has NO `run_attempt` key (confirmed via `git show
+# HEAD:.github/workflows/ci.yml` -- the `arm()` helper embedded there
+# builds `core_baselines` / `responsive_baselines` / `gate_ready_baselines`
+# dicts without a `run_attempt` field at all), so
+# `test_builtin_insufficient_evidence_fixture_remains_insufficient_evidence`
+# above necessarily exercises BOTH the sample-floor check AND the
+# run_attempt-trust exclusion simultaneously and must not be changed to add
+# a key the real CI workflow does not emit (`.github/workflows/*.yml` is
+# Out of Scope for this Issue). This variant fixture -- NOT a claim about
+# ci.yml's actual shape -- isolates the sample-floor check alone by adding
+# a trusted producer-shaped `run_attempt: "1"` to every record, so a
+# reviewer can see the two failure causes exercised independently rather
+# than conflated into a single always-`legacy_unverified_run_attempt`
+# reason.
+# --------------------------------------------------------------------------- #
+def _builtin_insufficient_evidence_arm_with_trusted_run_attempt(commit_sha: str, count: int, start_id: int) -> dict:
+    arm = _builtin_insufficient_evidence_arm(commit_sha, count, start_id)
+    for baseline in arm["core_baselines"] + arm["responsive_baselines"] + arm["gate_ready_baselines"]:
+        baseline["run_attempt"] = "1"
+    return arm
+
+
+def test_builtin_fixture_exercises_post_filter_sample_floor():
+    """GIVEN the same 3-samples-per-arm shape as
+    `test_builtin_insufficient_evidence_fixture_remains_insufficient_
+    evidence` above but with a TRUSTED producer-shaped `run_attempt: "1"`
+    added to every record WHEN `run_evidence_gate` runs THEN `gate_status`
+    is still `insufficient_evidence`, but the failure is PURELY the
+    sample-count floor -- NEITHER `legacy_unverified_run_attempt` NOR
+    `missing_or_invalid_initial_attempt_excluded_from_sample` appears
+    anywhere in the reason, and `gate_ready_evidence_errors` is empty for
+    both arms -- proving the sample-floor re-validation itself is
+    exercised in isolation from the run_attempt-trust exclusion path
+    (#2187 fix_delta P2-1)."""
+    fixture = {
+        "issue_number": 2159,
+        "pr_number": 2172,
+        "measured_at": "2026-08-15T00:00:00Z",
+        "functional_evidence": {"proof_level": "check_run_only", "coverage_bound": False},
+        "declared_impact": (
+            "sample-floor-only variant of the built-in insufficient-evidence smoke "
+            "fixture, decoupled from the run_attempt-trust exclusion path (#2187 "
+            "fix_delta P2-1)."
+        ),
+        "risk_acknowledgement": {
+            "reference": {"source_kind": "issue_comment", "source_id": "issuecomment-5458167419"},
+            "verification_status": "unverified",
+        },
+        "cohort_provenance": {
+            "runner_image": "ubuntu-24.04",
+            "workers": 1,
+            "scheduler": "loadscope",
+            "command_manifest_digest": "sha256:" + "0" * 64,
+            "test_selection_digest": "sha256:" + "0" * 64,
+        },
+        "before": _builtin_insufficient_evidence_arm_with_trusted_run_attempt("0" * 40, 3, 9000),
+        "after": _builtin_insufficient_evidence_arm_with_trusted_run_attempt("1" * 40, 3, 19000),
+    }
+
+    result = gate.run_evidence_gate(fixture)
+
+    assert result["gate_status"] == "insufficient_evidence"
+    assert result["assessment"] is None
+    assert gate.LEGACY_UNVERIFIED_RUN_ATTEMPT_REASON not in result["reason"]
+    assert gate.MISSING_OR_INVALID_INITIAL_ATTEMPT_EXCLUDED_REASON not in result["reason"]
+    assert (
+        "provider_post_filter_sample_count" in result["reason"]
+        or "gate_ready_post_filter_sample_count" in result["reason"]
+    )
+    assert result["gate_ready_evidence_errors"]["before"] == []
+    assert result["gate_ready_evidence_errors"]["after"] == []
+
+
+# --------------------------------------------------------------------------- #
 # AC9: _select_initial_attempt_baselines's legacy_unverified_run_attempt
 # exclusion reason propagates into _pair_by_workflow_run_id's
 # evidence_errors (rather than the reason staying a fixed
@@ -376,3 +464,176 @@ def test_evidence_errors_fixed_missing_pair_reason_preserved_when_not_attempt_ca
     assert len(evidence_errors) == 1
     assert evidence_errors[0]["workflow_run_id"] == 5007
     assert evidence_errors[0]["reason"] == "missing_pair_e2e-core"
+
+
+# --------------------------------------------------------------------------- #
+# #2187 fix_delta (OWNER REQUEST_CHANGES on PR #2383,
+# issuecomment-5458167419): P1-1 (gate-ready `evidence_errors` silently
+# discarded in `run_evidence_gate`'s production path) and P1-2 (the
+# missing/invalid/later-attempt/collision classification was incomplete,
+# and `test_gate_ready_attempt_2_never_substitutes_for_missing_attempt_1`
+# above pinned a silent-exclusion shape as the "expected" outcome) fix
+# verification. Reproduces the exact scenarios named in the OWNER comment.
+# --------------------------------------------------------------------------- #
+def test_gate_ready_attempt_2_only_reports_exclusion_reason():
+    """GIVEN 3 gate-ready baselines with UNIQUE `workflow_run_id`s, each
+    carrying ONLY an attempt-2 record, WHEN the post-filter sample count is
+    computed THEN each excluded `workflow_run_id` carries the identifiable
+    `missing_or_invalid_initial_attempt_excluded_from_sample` reason
+    (dedicated small-scale counterpart to
+    `test_gate_ready_attempt_2_never_substitutes_for_missing_attempt_1`
+    above, named per the OWNER review's explicit regression-test list)."""
+    baselines = [_gate_ready_baseline(6400 + i, run_attempt=2) for i in range(3)]
+
+    count, evidence_errors = gate._gate_ready_post_filter_sample_count(baselines)
+
+    assert count == 0
+    assert len(evidence_errors) == 3
+    assert all(
+        e["reason"] == gate.MISSING_OR_INVALID_INITIAL_ATTEMPT_EXCLUDED_REASON for e in evidence_errors
+    )
+
+
+def test_gate_ready_invalid_attempt_reports_exclusion_reason():
+    """GIVEN gate-ready baselines with EXPLICIT invalid `run_attempt`
+    values (`None`, a bool, `0`, a negative int, a non-numeric string --
+    all values `_normalize_run_attempt` rejects) on distinct
+    `workflow_run_id`s WHEN the post-filter sample count is computed THEN
+    every one is excluded with the identifiable
+    `missing_or_invalid_initial_attempt_excluded_from_sample` reason -- an
+    EXPLICIT invalid value must never be conflated with the
+    `legacy_unverified_run_attempt` fully-missing-key case, but it must
+    also never be silently dropped from `evidence_errors` (#2187 P1-2)."""
+    invalid_values = [None, True, False, 0, -1, "not-a-number"]
+    baselines = []
+    for i, value in enumerate(invalid_values):
+        baseline = _gate_ready_baseline(6500 + i, run_attempt=1)
+        baseline["run_attempt"] = value
+        assert "run_attempt" in baseline
+        baselines.append(baseline)
+
+    count, evidence_errors = gate._gate_ready_post_filter_sample_count(baselines)
+
+    assert count == 0
+    assert len(evidence_errors) == len(invalid_values)
+    assert all(
+        e["reason"] == gate.MISSING_OR_INVALID_INITIAL_ATTEMPT_EXCLUDED_REASON for e in evidence_errors
+    )
+    assert {e["workflow_run_id"] for e in evidence_errors} == {6500 + i for i in range(len(invalid_values))}
+
+
+def test_gate_ready_collision_reports_collision_reason():
+    """GIVEN two gate-ready baselines sharing the SAME `workflow_run_id`/
+    trusted attempt-1 identity slot but disagreeing on content (a genuine
+    identity collision, `_detect_run_attempt_identity_collisions`) WHEN
+    the post-filter sample count is computed THEN the `workflow_run_id` is
+    excluded with the identifiable `run_attempt_identity_collision` reason
+    -- pre-fix_delta, a collision group was excluded from `selected` with
+    NO `evidence_errors` entry at all (#2187 P1-2)."""
+    baseline_a = _gate_ready_baseline(6600, run_attempt=1)
+    baseline_b = dict(baseline_a, check_completed_at="2026-08-15T00:09:00Z")
+    assert baseline_a != baseline_b
+
+    count, evidence_errors = gate._gate_ready_post_filter_sample_count([baseline_a, baseline_b])
+
+    assert count == 0
+    assert len(evidence_errors) == 1
+    assert evidence_errors[0]["workflow_run_id"] == 6600
+    assert evidence_errors[0]["reason"] == gate.RUN_ATTEMPT_IDENTITY_COLLISION_REASON
+
+
+# --------------------------------------------------------------------------- #
+# #2187 fix_delta P1-1: `run_evidence_gate`'s PRODUCTION result must not
+# silently drop a gate-ready `evidence_errors` entry, regardless of
+# whether the overall sample floor is otherwise met.
+# --------------------------------------------------------------------------- #
+_FIX_DELTA_COHORT_FIXTURE_COMMON = {
+    "issue_number": 2187,
+    "pr_number": 2383,
+    "measured_at": "2026-08-15T00:00:00Z",
+    "functional_evidence": {"proof_level": "check_run_only", "coverage_bound": False},
+    "declared_impact": "#2187 fix_delta P1-1 regression fixture (issuecomment-5458167419).",
+    "risk_acknowledgement": {
+        "reference": {"source_kind": "issue_comment", "source_id": "issuecomment-5458167419"},
+        "verification_status": "unverified",
+    },
+    "cohort_provenance": {
+        "runner_image": "ubuntu-24.04",
+        "workers": 1,
+        "scheduler": "loadscope",
+        "command_manifest_digest": "sha256:" + "0" * 64,
+        "test_selection_digest": "sha256:" + "0" * 64,
+    },
+}
+
+
+def _fix_delta_arm_fixture(commit_sha: str, start_id: int, gate_ready_extra: list[dict] | None = None) -> dict:
+    """20 trusted, uniquely-identified core/responsive/gate-ready samples
+    (sufficient evidence on their own) -- callers add `gate_ready_extra`
+    records to reproduce a specific surplus/poison scenario on the
+    gate-ready lane without disturbing the (already-sufficient) provider
+    lane."""
+    core = [_baseline("e2e-core", start_id + i, 100_000 + i, run_attempt=1) for i in range(20)]
+    responsive = [
+        _baseline("e2e-responsive-matrix", start_id + i, 100_000 + i, run_attempt=1) for i in range(20)
+    ]
+    gate_ready = [_gate_ready_baseline(start_id + i, run_attempt=1) for i in range(20)]
+    if gate_ready_extra:
+        gate_ready = gate_ready + gate_ready_extra
+    return {
+        "commit_sha": commit_sha,
+        "core_baselines": core,
+        "responsive_baselines": responsive,
+        "gate_ready_baselines": gate_ready,
+    }
+
+
+def test_run_evidence_gate_surfaces_gate_ready_missing_attempt_evidence_error_in_production_result():
+    """GIVEN a `before` arm with 20 trusted gate-ready samples PLUS 1
+    surplus sample missing `run_attempt` entirely WHEN `run_evidence_gate`
+    (the production gate function) runs THEN the missing sample's
+    `workflow_run_id` and `legacy_unverified_run_attempt` reason are
+    PRESENT in `result["gate_ready_evidence_errors"]["before"]` -- proving
+    the fix_delta's `before_gate_ready_evidence_errors` /
+    `after_gate_ready_evidence_errors` are no longer discarded (pre-fix_delta
+    these were bound to `_before_gate_ready_evidence_errors` /
+    `_after_gate_ready_evidence_errors` with a leading underscore and never
+    read again, #2187 fix_delta P1-1)."""
+    fixture = dict(_FIX_DELTA_COHORT_FIXTURE_COMMON)
+    poison = _gate_ready_baseline(7999, run_attempt=None)
+    assert "run_attempt" not in poison
+    fixture["before"] = _fix_delta_arm_fixture("a" * 40, start_id=8000, gate_ready_extra=[poison])
+    fixture["after"] = _fix_delta_arm_fixture("b" * 40, start_id=9000)
+
+    result = gate.run_evidence_gate(fixture)
+
+    assert "gate_ready_evidence_errors" in result
+    before_errors = result["gate_ready_evidence_errors"]["before"]
+    assert any(
+        e["workflow_run_id"] == 7999 and e["reason"] == gate.LEGACY_UNVERIFIED_RUN_ATTEMPT_REASON
+        for e in before_errors
+    ), f"the surplus missing-run_attempt evidence error must survive into the production result: {before_errors!r}"
+
+
+def test_run_evidence_gate_surfaces_gate_ready_collision_evidence_error_in_production_result():
+    """GIVEN a `before` arm with 20 trusted gate-ready samples PLUS a
+    duplicate `workflow_run_id` disagreeing on content (identity collision)
+    WHEN `run_evidence_gate` runs THEN the `run_attempt_identity_collision`
+    reason for that `workflow_run_id` is PRESENT in
+    `result["gate_ready_evidence_errors"]["before"]` -- proving a
+    production-path collision is never silently dropped either (#2187
+    fix_delta P1-1/P1-2)."""
+    fixture = dict(_FIX_DELTA_COHORT_FIXTURE_COMMON)
+    colliding_original = _gate_ready_baseline(8000, run_attempt=1)
+    colliding_conflict = dict(colliding_original, check_completed_at="2026-08-15T00:09:00Z")
+    fixture["before"] = _fix_delta_arm_fixture("a" * 40, start_id=8000, gate_ready_extra=[colliding_conflict])
+    fixture["after"] = _fix_delta_arm_fixture("b" * 40, start_id=9000)
+
+    result = gate.run_evidence_gate(fixture)
+
+    assert "gate_ready_evidence_errors" in result
+    before_errors = result["gate_ready_evidence_errors"]["before"]
+    assert any(
+        e["workflow_run_id"] == 8000 and e["reason"] == gate.RUN_ATTEMPT_IDENTITY_COLLISION_REASON
+        for e in before_errors
+    ), f"the colliding sample's evidence error must survive into the production result: {before_errors!r}"

@@ -91,7 +91,20 @@ def test_pair_excludes_run_when_attempt_1_missing_never_substitutes_attempt_2():
     missing) for a workflow_run_id that DOES have an attempt-1 responsive
     baseline, WHEN paired THEN the pair is excluded (core side has no
     eligible attempt-1 candidate) -- attempt 2 is never silently promoted
-    to stand in for a missing attempt 1 (#2179 P0-4)."""
+    to stand in for a missing attempt 1 (#2179 P0-4).
+
+    #2187 fix_delta (OWNER REQUEST_CHANGES issuecomment-5458167419 P1-2):
+    the reason is now the identifiable
+    `missing_or_invalid_initial_attempt_excluded_from_sample`
+    (`_select_initial_attempt_baselines`'s own classification of an
+    attempt-2-and-later-only group), NOT the generic fallback
+    `missing_pair_e2e-core` string this test asserted pre-fix_delta --
+    that fallback is reserved for a `workflow_run_id` with NO baseline at
+    all on a given lane (see
+    `test_evidence_errors_fixed_missing_pair_reason_preserved_when_not_
+    attempt_caused` in test_ci_performance_gate_rerun_attempt_trust_
+    boundary.py), not for one whose only baseline was excluded by
+    attempt-trust filtering."""
     core_attempt_2_only = _baseline("e2e-core", 601, elapsed_ms=100_000, run_attempt=2)
     responsive_attempt_1 = _baseline("e2e-responsive-matrix", 601, elapsed_ms=200_000, run_attempt=1)
 
@@ -99,7 +112,7 @@ def test_pair_excludes_run_when_attempt_1_missing_never_substitutes_attempt_2():
     assert pairs == []
     assert len(evidence_errors) == 1
     assert evidence_errors[0]["workflow_run_id"] == 601
-    assert evidence_errors[0]["reason"] == "missing_pair_e2e-core"
+    assert evidence_errors[0]["reason"] == gate.MISSING_OR_INVALID_INITIAL_ATTEMPT_EXCLUDED_REASON
 
 
 def test_cli_run_details_propagates_selected_run_attempt_not_hardcoded():
