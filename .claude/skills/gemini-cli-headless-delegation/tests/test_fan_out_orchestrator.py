@@ -381,6 +381,12 @@ def test_subprocess_runner_terminates_process_group_on_timeout(tmp_path):
     child writes after ``os.getpid()``, and additionally proves the real OS
     process is gone after cancellation (not just that the in-process flag
     was observed).
+
+    OWNER review (PR #2373, 2026-08-28) P1: cleanup uses the same
+    independent-of-cancel_event ``ctx.terminate_all()`` + child_pid
+    fallback as ``test_running_process_cancellation_records_sigterm`` in
+    ``test_fan_out_process_lifecycle.py`` (see that test's docstring for
+    the full rationale).
     """
     module = load_module()
     pid_file = tmp_path / "hang_forever.pid"
@@ -405,12 +411,17 @@ def test_subprocess_runner_terminates_process_group_on_timeout(tmp_path):
     )
 
     result_holder: dict = {}
+    thread_exceptions: list[BaseException] = []
 
     def _invoke():
-        result_holder["result"] = runner(job, ctx)
+        try:
+            result_holder["result"] = runner(job, ctx)
+        except BaseException as exc:  # noqa: BLE001 - re-raised after cleanup below
+            thread_exceptions.append(exc)
 
     thread = threading.Thread(target=_invoke)
     thread.start()
+    child_pid: int | None = None
     try:
         child_pid = _wait_for_pid_sentinel(pid_file)
         cancel_event.set()
@@ -418,10 +429,23 @@ def test_subprocess_runner_terminates_process_group_on_timeout(tmp_path):
         assert not thread.is_alive(), "runner must return once cancel_event is set (process group terminated)"
     finally:
         # Issue #2371 AC7: clean up the thread and child process on every
-        # exit path (sentinel timeout, assertion failure, thread exception).
+        # exit path (sentinel timeout, assertion failure, thread exception)
+        # without depending on the cooperative cancel_event path under
+        # test -- see test_running_process_cancellation_records_sigterm in
+        # test_fan_out_process_lifecycle.py for the full rationale.
         cancel_event.set()
-        thread.join(timeout=15)
+        ctx.terminate_all(grace_period=0.1)
+        if (thread.is_alive() or thread_exceptions) and child_pid is not None:
+            try:
+                pgid = os.getpgid(child_pid)
+                if pgid == child_pid:
+                    os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        thread.join(timeout=2)
         assert not thread.is_alive(), "runner thread must be joined and dead in the cleanup path"
+        if thread_exceptions:
+            raise thread_exceptions[0]
 
     assert result_holder["result"]["ok"] is False
     assert "timeout" in result_holder["result"]["failure_class"]
