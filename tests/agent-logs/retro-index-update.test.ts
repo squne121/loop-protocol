@@ -530,6 +530,41 @@ describe('update-retro-index', () => {
     expect(blocked.reason).toBe('retrospective_run_marker_malformed')
   })
 
+  it('GIVEN a v1 marker with no delimiter after the version (e.g. v1repository_id=...) WHEN normalizeRetrospectiveRunComment runs THEN it is blocked as retrospective_run_marker_malformed rather than ignored (Issue #2366 fix_delta: \\b does not fire between two word characters)', () => {
+    const blocked = normalizeRetrospectiveRunComment({
+      html_url: 'https://github.com/squne121/loop-protocol/issues/928#issuecomment-5000000012',
+      body: '<!-- agent_retrospective_run:v1repository_id=squne121/loop-protocol idempotency_key=sha256:abc -->\n\nno space after v1',
+      linkedPrHints: [],
+      linkedIssueHints: [928],
+      branchHint: null,
+    })
+    expect(blocked.kind).toBe('blocked')
+    expect(blocked.reason).toBe('retrospective_run_marker_malformed')
+  })
+
+  it('GIVEN a v1 marker followed by an underscore (e.g. v1_repository_id=...) WHEN normalizeRetrospectiveRunComment runs THEN it is blocked as retrospective_run_marker_malformed rather than ignored (Issue #2366 fix_delta: \\b does not fire between "1" and "_")', () => {
+    const blocked = normalizeRetrospectiveRunComment({
+      html_url: 'https://github.com/squne121/loop-protocol/issues/928#issuecomment-5000000013',
+      body: '<!-- agent_retrospective_run:v1_repository_id=squne121/loop-protocol idempotency_key=sha256:abc -->\n\nunderscore after v1',
+      linkedPrHints: [],
+      linkedIssueHints: [928],
+      branchHint: null,
+    })
+    expect(blocked.kind).toBe('blocked')
+    expect(blocked.reason).toBe('retrospective_run_marker_malformed')
+  })
+
+  it('GIVEN a v10 marker (a different/future marker version, not v1) WHEN normalizeRetrospectiveRunComment runs THEN it stays ignored rather than being misclassified as a malformed v1 marker (Issue #2366 fix_delta negative control)', () => {
+    const ignored = normalizeRetrospectiveRunComment({
+      html_url: 'https://github.com/squne121/loop-protocol/issues/928#issuecomment-5000000014',
+      body: '<!-- agent_retrospective_run:v10 repository_id=squne121/loop-protocol idempotency_key=sha256:abc -->\n\nfuture marker version',
+      linkedPrHints: [],
+      linkedIssueHints: [928],
+      branchHint: null,
+    })
+    expect(ignored.kind).toBe('ignored')
+  })
+
   it('GIVEN a valid entry and a structurally-invalid retrospective-run comment WHEN buildRetroIndex runs THEN entries[] is preserved, retrospective_runs_blocked records the malformed run, and generation_verdict becomes partial (Issue #2308 AC1/AC2/AC5)', () => {
     const malformedRunComment = createMalformedRetrospectiveRunComment()
     const built = buildRetroIndex({

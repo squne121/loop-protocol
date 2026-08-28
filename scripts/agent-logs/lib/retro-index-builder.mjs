@@ -337,7 +337,7 @@ function checkPublicObservationSources(payload, markerDigest) {
 // ---------------------------------------------------------------------------
 
 const RETROSPECTIVE_RUN_MARKER_LINE = /^<!--\s*agent_retrospective_run:v1\s+repository_id=\S+\s+idempotency_key=\S+\s*-->$/u
-const RETROSPECTIVE_RUN_MARKER_PREFIX = /^<!--\s*agent_retrospective_run:v1\b/u
+const RETROSPECTIVE_RUN_MARKER_PREFIX = /^<!--\s*agent_retrospective_run:v1(?![0-9])/u
 const FENCED_JSON_BLOCK = /```json\r?\n([\s\S]*?)\r?\n```/u
 
 function extractRetrospectiveRunPayload(body) {
