@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -243,7 +244,7 @@ esac
     )
     fake_git.chmod(0o755)
     monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
-    with pytest.raises(exec_mod.GitProtocolTimeout):
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed):
         exec_mod.run_control_plane_git_effective_remote_url(
             "file:///tmp/origin.git",
             cwd=str(tmp_path),
@@ -318,7 +319,7 @@ def test_exception_after_spawn_reaps_its_dedicated_process_group(monkeypatch, tm
             return getattr(self._proc, name)
 
     monkeypatch.setattr(exec_mod.subprocess, "Popen", ExplodingPopen)
-    with pytest.raises(RuntimeError, match="injected_post_spawn_failure"):
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
         exec_mod.run_control_plane_git_effective_remote_url(
             "file:///tmp/origin.git",
             cwd=str(tmp_path),
@@ -541,14 +542,29 @@ def test_internal_worktree_operation_revalidates_forged_paths_before_any_argv(mo
             )
 
 
-def _write_setsid_escape_git(path: Path, pid_file: Path, *, probe_fails: bool) -> None:
-    probe_body = "setsid sh -c 'echo $$ > \"%s\"; sleep 30' >/dev/null 2>&1 & sleep 0.2; exit 2" % pid_file
-    semantic_body = "setsid sh -c 'echo $$ > \"%s\"; sleep 30' >/dev/null 2>&1 & sleep 30" % pid_file
+def _write_delayed_setsid_escape_git(path: Path, pid_file: Path, trace_file: Path, *, probe_fails: bool) -> None:
+    """Create a fixture that defeats a point-in-time `/proc` tree snapshot.
+
+    The `setsid` helper runs independently of the Git process group and does
+    not publish its PID until after a delay. An unreadable `/proc` snapshot
+    therefore leaves the executor unable to distinguish this live escape from
+    absence, which must fail closed.
+    """
+    escape_script = path.parent / f"{path.name}.delayed-escape"
+    escape_script.write_text(
+        f"#!/bin/sh\nsleep 0.35\necho $$ > \"{pid_file}\"\nsleep 30\n",
+        encoding="utf-8",
+    )
+    escape_script.chmod(0o755)
+    delayed_escape = (
+        f"printf 'setsid-parent-started\\n' > \"{trace_file}\"; "
+        f"setsid \"{escape_script}\" >/dev/null 2>&1 & sleep 0.08"
+    )
     path.write_text(
         f'''#!/bin/sh
 case "$*" in
-  *config*) {probe_body if probe_fails else 'exit 1'} ;;
-  *) {semantic_body} ;;
+  *config*) {delayed_escape}; {'exit 2' if probe_fails else 'exit 1'} ;;
+  *) {delayed_escape}; sleep 30 ;;
 esac
 ''',
         encoding="utf-8",
@@ -556,45 +572,77 @@ esac
     path.chmod(0o755)
 
 
-def test_timeout_reaps_setsid_descendant_outside_the_git_process_group(monkeypatch, tmp_path):
+def _assert_delayed_escape_trace_and_reap(pid_file: Path, trace_file: Path) -> None:
+    """Prove the delayed escape occurred, then keep the test fixture clean."""
+    deadline = time.monotonic() + 2
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert trace_file.read_text(encoding="utf-8") == "setsid-parent-started\n"
+    assert pid_file.exists(), "delayed setsid descendant did not materialize"
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    try:
+        os.kill(pid, 0)
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.01)
+    pytest.fail("delayed escape fixture cleanup did not complete")
+
+
+def test_timeout_delayed_setsid_escape_fails_closed_not_snapshot_success(monkeypatch, tmp_path):
     fake_git = tmp_path / "setsid-timeout-git"
     child_pid = tmp_path / "setsid-timeout-child.pid"
-    _write_setsid_escape_git(fake_git, child_pid, probe_fails=False)
+    trace = tmp_path / "setsid-timeout.trace"
+    _write_delayed_setsid_escape_git(fake_git, child_pid, trace, probe_fails=False)
     monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
-    with pytest.raises(exec_mod.GitProtocolTimeout):
+    # Model an unreadable `/proc` snapshot. The real fixture still makes a
+    # delayed `setsid` escape, so no cleanup verdict may be successful.
+    monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: None)
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
         exec_mod.run_control_plane_git_effective_remote_url(
             "file:///tmp/origin.git",
             cwd=str(tmp_path),
             project_root=str(tmp_path),
             deadline=exec_mod.GitProtocolDeadline.start(0.8, cleanup_reserve_seconds=0.4),
         )
-    pid = int(child_pid.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    _assert_delayed_escape_trace_and_reap(child_pid, trace)
 
 
-def test_probe_failure_reaps_setsid_descendant_before_reporting_failure(monkeypatch, tmp_path):
+def test_probe_failure_delayed_setsid_escape_fails_closed_not_snapshot_success(monkeypatch, tmp_path):
     fake_git = tmp_path / "setsid-probe-git"
     child_pid = tmp_path / "setsid-probe-child.pid"
-    _write_setsid_escape_git(fake_git, child_pid, probe_fails=True)
+    trace = tmp_path / "setsid-probe.trace"
+    _write_delayed_setsid_escape_git(fake_git, child_pid, trace, probe_fails=True)
     monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
-    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed):
+    # Model an unreadable `/proc` snapshot. The real fixture still makes a
+    # delayed `setsid` escape, so no cleanup verdict may be successful.
+    monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: None)
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
         exec_mod.run_control_plane_git_effective_remote_url(
             "file:///tmp/origin.git",
             cwd=str(tmp_path),
             project_root=str(tmp_path),
             deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
         )
-    pid = int(child_pid.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    _assert_delayed_escape_trace_and_reap(child_pid, trace)
 
 
-def test_exception_reaps_setsid_descendant_before_reraising(monkeypatch, tmp_path):
+def test_exception_delayed_setsid_escape_fails_closed_not_snapshot_success(monkeypatch, tmp_path):
     fake_git = tmp_path / "setsid-exception-git"
     child_pid = tmp_path / "setsid-exception-child.pid"
-    _write_setsid_escape_git(fake_git, child_pid, probe_fails=False)
+    trace = tmp_path / "setsid-exception.trace"
+    _write_delayed_setsid_escape_git(fake_git, child_pid, trace, probe_fails=False)
     monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    # An observation gap is indistinguishable from an unreadable snapshot.
+    monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: None)
     real_popen = exec_mod.subprocess.Popen
 
     class ExplodingPopen:
@@ -606,23 +654,18 @@ def test_exception_reaps_setsid_descendant_before_reraising(monkeypatch, tmp_pat
         def communicate(self, **kwargs):
             if self._is_probe:
                 return self._proc.communicate(**kwargs)
-            for _ in range(100):
-                if child_pid.exists():
-                    break
-                time.sleep(0.01)
-            raise RuntimeError("injected_setsid_post_spawn_failure")
+            time.sleep(0.1)
+            raise RuntimeError("injected_delayed_setsid_post_spawn_failure")
 
         def __getattr__(self, name):
             return getattr(self._proc, name)
 
     monkeypatch.setattr(exec_mod.subprocess, "Popen", ExplodingPopen)
-    with pytest.raises(RuntimeError, match="injected_setsid_post_spawn_failure"):
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
         exec_mod.run_control_plane_git_effective_remote_url(
             "file:///tmp/origin.git",
             cwd=str(tmp_path),
             project_root=str(tmp_path),
             deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
         )
-    pid = int(child_pid.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    _assert_delayed_escape_trace_and_reap(child_pid, trace)

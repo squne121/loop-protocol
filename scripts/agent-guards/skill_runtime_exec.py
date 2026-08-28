@@ -3280,7 +3280,7 @@ class GitProtocolDeadlineExhausted(RuntimeError):
 
 
 class GitProtocolTimeout(RuntimeError):
-    """Raised only after the process group was terminated and reaped."""
+    """Raised only after a containment backend confirms terminal cleanup."""
 
 
 class GitProtocolProcessGroupCleanupFailed(RuntimeError):
@@ -3480,9 +3480,10 @@ def _observe_git_descendants(leader_pid: int) -> set[_TrackedGitDescendant] | No
     """Observe the live descendant tree before a child can escape its group.
 
     A descendant may call `setsid()` and leave the group created by
-    `start_new_session`. Linux `/proc` parent links still identify it while
-    its parent is alive. Failure to inspect that authority is represented by
-    `None` so cleanup can fail closed rather than claiming group-only success.
+    `start_new_session`. Linux `/proc` parent links are an advisory snapshot
+    only: an escaped child can fork a delayed descendant and exit between two
+    observations. Callers must therefore never use a snapshot as proof that
+    all descendants are absent; terminal cleanup remains fail-closed.
     """
     proc_root = Path("/proc")
     if not sys.platform.startswith("linux") or not proc_root.is_dir():
@@ -3541,7 +3542,15 @@ def _terminate_git_process_group(
     deadline: GitProtocolDeadline,
     descendants: set[_TrackedGitDescendant] | None,
 ) -> bool:
-    """Terminate, verify absence, and reap under the deadline's reserve."""
+    """Attempt bounded cleanup, but confirm success only with containment.
+
+    A dedicated process group is not race-free descendant containment: a
+    child can call `setsid()`, create a delayed child, and disappear before a
+    `/proc` snapshot is read. This executor has no cgroup/subreaper backend,
+    so it reaps what it can but returns False on every terminal path. The
+    caller must surface `GitProtocolProcessGroupCleanupFailed` rather than
+    present best-effort cleanup as success.
+    """
     if not _POSIX_PROCESS_GROUP_SUPPORTED or pgid is None or descendants is None:
         try:
             proc.terminate()
@@ -3569,7 +3578,10 @@ def _terminate_git_process_group(
         proc.poll()
         if _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants):
             proc.wait(timeout=0)
-            return True
+            # `/proc` and process-group absence prove only this sampled group.
+            # A `setsid()` descendant may have escaped and forked after the
+            # snapshot, so this is deliberately never cleanup success.
+            return False
         time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
     try:
         os.killpg(pgid, signal.SIGKILL)
@@ -3583,9 +3595,15 @@ def _terminate_git_process_group(
         proc.poll()
         if _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants):
             proc.wait(timeout=0)
-            return True
+            # `/proc` and process-group absence prove only this sampled group.
+            # A `setsid()` descendant may have escaped and forked after the
+            # snapshot, so this is deliberately never cleanup success.
+            return False
         time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
-    return _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants)
+    # The final `/proc` observation is also only a point-in-time sample.
+    # No cgroup/subreaper containment is established by this executor, so
+    # returning success here would accept a delayed `setsid()` escape.
+    return False
 
 
 def _operation_arguments(operation: _GitOperation, *, cwd: str) -> list[str]:
@@ -3724,6 +3742,13 @@ def _run_closed_git_process(
         if not _terminate_git_process_group(proc, pgid, deadline, descendants):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
         raise
+    # A non-success result is a terminal path. A rewrite probe's exit 1 is
+    # its documented "no matching key" result; every other nonzero outcome
+    # must attempt cleanup and may not use an advisory descendant snapshot as
+    # a successful cleanup verdict.
+    if proc.returncode != 0 and not (operation.kind == "probe_rewrite" and proc.returncode == 1):
+        if not _terminate_git_process_group(proc, pgid, deadline, descendants):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
     if posix_supervised and (
         descendants is None
         or not _verify_process_group_absent(proc.pid)
