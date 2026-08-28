@@ -98,8 +98,16 @@ def test_exact_remote_commands_and_fixed_fetch_cas_shapes(monkeypatch, tmp_path)
     deadline = _deadline()
     calls: list[tuple[str, ...]] = []
 
-    def fake_run(invocation, *, text, **kwargs):
-        args = invocation.arguments
+    def fake_run(operation, **kwargs):
+        text = operation.kind != "probe_rewrite"
+        args = tuple(
+            exec_mod._exact_git_argv(
+                operation,
+                git_executable=kwargs["git_executable"],
+                cwd=kwargs["cwd"],
+                hooks_dir=kwargs["hooks_dir"],
+            )
+        )
         calls.append(args)
         if "config" in args:
             return subprocess.CompletedProcess(list(args), 1, b"" if not text else "", b"" if not text else "")
@@ -320,3 +328,189 @@ def test_exception_after_spawn_reaps_its_dedicated_process_group(monkeypatch, tm
     pid = int(child_pid.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+def test_operation_runner_accepts_no_raw_tuple_or_list_argv_authority():
+    for name in ("_run_closed_git_process", "_execute_semantic_git"):
+        signature = inspect.signature(getattr(exec_mod, name))
+        assert "argv" not in signature.parameters
+        assert "arguments" not in signature.parameters
+    source = inspect.getsource(exec_mod)
+    assert "class _ClosedGitInvocation" not in source
+    assert "def _closed_git_invocation" not in source
+
+
+def test_forged_typed_payloads_and_global_option_injection_fail_before_spawn(monkeypatch, tmp_path):
+    def unexpected_popen(*args, **kwargs):
+        raise AssertionError("forged payload must fail before spawn")
+
+    monkeypatch.setattr(exec_mod.subprocess, "Popen", unexpected_popen)
+    deadline = _deadline()
+    invalid_calls = (
+        lambda: exec_mod.run_control_plane_git_observe_default_ref(
+            exec_mod.LiteralRemoteUrl("--config-env=core.hooksPath=/tmp/evil"),
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=deadline,
+        ),
+        lambda: exec_mod.run_control_plane_git_fetch_default_ref(
+            validate_literal_remote_url("file:///tmp/origin.git"),
+            exec_mod.AllowedRemoteRef("refs/tags/v1"),
+            "a" * 16,
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=deadline,
+        ),
+        lambda: exec_mod.run_control_plane_git_read_private_ref_oid(
+            exec_mod.ControlPlanePrivateRef("refs/heads/main"),
+            exec_mod.RepositoryObjectFormat("sha1"),
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=deadline,
+        ),
+        lambda: exec_mod.run_control_plane_git_require_commit_object(
+            exec_mod.RepositoryObjectId("g" * 40),
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=deadline,
+        ),
+        lambda: exec_mod.run_control_plane_git_read_worktree_head(
+            exec_mod.DetachedWorktreePath(str(tmp_path / "outside")),
+            exec_mod.RepositoryObjectFormat("sha1"),
+            project_root=str(tmp_path),
+            deadline=deadline,
+        ),
+    )
+    for call in invalid_calls:
+        with pytest.raises((TypeError, ValueError)):
+            call()
+
+
+@pytest.mark.parametrize(
+    "deadline",
+    (
+        exec_mod.GitProtocolDeadline(float("nan"), 1),
+        exec_mod.GitProtocolDeadline(float("inf"), 1),
+        exec_mod.GitProtocolDeadline(1, float("nan")),
+        exec_mod.GitProtocolDeadline(1, float("inf")),
+        exec_mod.GitProtocolDeadline(1, 0),
+    ),
+)
+def test_forged_nonfinite_or_nonpositive_deadline_fails_before_spawn(monkeypatch, tmp_path, deadline):
+    monkeypatch.setattr(
+        exec_mod.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("invalid deadline must fail before spawn"),
+    )
+    with pytest.raises(ValueError):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git", cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+        )
+
+
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), 0, -1))
+def test_deadline_start_rejects_nonfinite_or_nonpositive_values(value):
+    with pytest.raises(ValueError):
+        exec_mod.GitProtocolDeadline.start(value)
+    with pytest.raises(ValueError):
+        exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=value)
+
+
+def test_base_exception_with_unconfirmed_cleanup_fails_closed(monkeypatch, tmp_path):
+    class ExplodingPopen:
+        pid = 12345
+
+        def communicate(self, **kwargs):
+            raise RuntimeError("injected_post_spawn_failure")
+
+    monkeypatch.setattr(exec_mod.subprocess, "Popen", lambda *args, **kwargs: ExplodingPopen())
+    monkeypatch.setattr(exec_mod, "_terminate_git_process_group", lambda *args, **kwargs: False)
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed) as excinfo:
+        exec_mod._run_closed_git_process(
+            exec_mod._GitOperation("repository_object_format"),
+            git_executable="/usr/bin/git",
+            cwd=str(tmp_path),
+            env={},
+            hooks_dir=str(tmp_path),
+            deadline=_deadline(),
+        )
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_pushinsteadof_rejection_is_preserved_by_typed_runner(tmp_path):
+    local, url, _ = _init_remote_fixture(tmp_path)
+    subprocess.run(
+        ["git", "config", "--local", "url.https://evil.example/.pushInsteadOf", url],
+        cwd=local,
+        check=True,
+    )
+    with pytest.raises(GitSubprocessRewriteRejected):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            url,
+            cwd=str(local),
+            project_root=str(local),
+            scratch_root=str(tmp_path / "scratch"),
+            deadline=_deadline(),
+        )
+
+
+def test_typed_runner_preserves_sanitized_hooks_credentials_askpass_and_path(monkeypatch, tmp_path):
+    fake_git = tmp_path / "fake-git"
+    capture = tmp_path / "capture"
+    arguments_capture = tmp_path / "arguments"
+    url = "file:///tmp/origin.git"
+    fake_git.write_text(
+        f"""#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+esac
+printf '%s\n' "$*" > "{arguments_capture}"
+printf '%s\n' "$GIT_TERMINAL_PROMPT" > "{capture}"
+printf '%s\n' "$GIT_ASKPASS" >> "{capture}"
+printf '%s\n' "$SSH_ASKPASS" >> "{capture}"
+printf '%s\n' "$GIT_NO_LAZY_FETCH" >> "{capture}"
+printf '%s\n' "${{GIT_EXEC_PATH-unset}}" >> "{capture}"
+printf '%s\n' "$PATH" >> "{capture}"
+printf '%s\n' "{url}"
+""",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    malicious = tmp_path / "malicious"
+    malicious.mkdir()
+    monkeypatch.setenv("PATH", f"{malicious}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("GIT_EXEC_PATH", str(malicious))
+    monkeypatch.setenv("GIT_ASKPASS", str(malicious / "askpass"))
+    monkeypatch.setenv("SSH_ASKPASS", str(malicious / "askpass"))
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    assert (
+        exec_mod.run_control_plane_git_effective_remote_url(
+            url, cwd=str(tmp_path), project_root=str(tmp_path), deadline=_deadline()
+        ).value
+        == url
+    )
+    prompt, askpass, ssh_askpass, no_lazy, git_exec_path, child_path = capture.read_text(encoding="utf-8").splitlines()
+    assert (prompt, askpass, ssh_askpass, no_lazy, git_exec_path) == ("0", "", "", "1", "unset")
+    assert str(malicious) not in child_path
+    command_text = arguments_capture.read_text(encoding="utf-8")
+    assert "core.hooksPath=" in command_text
+    assert "credential.helper=" in command_text
+    assert "--no-replace-objects" in command_text
+
+
+def test_typed_worktree_builder_suppresses_repository_hook(tmp_path):
+    local, _, expected_oid = _init_remote_fixture(tmp_path)
+    marker = tmp_path / "post-checkout.marker"
+    hook = local / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f'#!/bin/sh\ntouch "{marker}"\n', encoding="utf-8")
+    hook.chmod(0o755)
+    deadline = _deadline()
+    object_format = exec_mod.run_control_plane_git_repository_object_format(
+        cwd=str(local), project_root=str(local), deadline=deadline
+    )
+    commit = exec_mod.validate_repository_object_id(expected_oid, object_format)
+    path = validate_detached_worktree_path(str(local / ".claude" / "worktrees" / "hook-check"), str(local))
+    exec_mod.run_control_plane_git_add_detached_locked_worktree(
+        path, commit, cwd=str(local), project_root=str(local), deadline=deadline
+    )
+    assert not marker.exists(), "repository hook fired despite fixed empty hooksPath"

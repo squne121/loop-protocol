@@ -7,6 +7,7 @@ import argparse
 import errno
 import hashlib
 import json
+import math
 import os
 import pwd
 import re
@@ -60,6 +61,10 @@ from skill_runtime_command_policy import (
     RepositoryObjectFormat,
     RepositoryObjectId,
     make_control_plane_private_ref,
+    validate_allowed_remote_ref,
+    validate_control_plane_private_ref,
+    validate_detached_worktree_path,
+    validate_existing_detached_worktree_path,
     validate_literal_remote_url,
     validate_repository_object_format,
     validate_repository_object_id,
@@ -3291,15 +3296,19 @@ class GitProtocolDeadline:
 
     @classmethod
     def start(cls, timeout_seconds: float, cleanup_reserve_seconds: float = 1.0) -> "GitProtocolDeadline":
-        if timeout_seconds <= 0 or cleanup_reserve_seconds <= 0 or timeout_seconds <= cleanup_reserve_seconds:
+        timeout = _validate_deadline_value(timeout_seconds, "timeout")
+        cleanup_reserve = _validate_deadline_value(cleanup_reserve_seconds, "cleanup_reserve")
+        if timeout <= cleanup_reserve:
             raise ValueError("git_protocol_deadline_invalid")
-        return cls(time.monotonic() + timeout_seconds, cleanup_reserve_seconds)
+        return cls(time.monotonic() + timeout, cleanup_reserve)
 
     def execution_seconds(self) -> float:
-        remaining = self.deadline_at - time.monotonic()
-        if remaining <= self.cleanup_reserve_seconds:
+        deadline_at = _validate_deadline_value(self.deadline_at, "deadline_at")
+        cleanup_reserve = _validate_deadline_value(self.cleanup_reserve_seconds, "cleanup_reserve")
+        remaining = deadline_at - time.monotonic()
+        if remaining <= cleanup_reserve:
             raise GitProtocolDeadlineExhausted("git_protocol_cleanup_reserve_required")
-        return remaining - self.cleanup_reserve_seconds
+        return remaining - cleanup_reserve
 
 
 def resolve_git_subprocess_executable(project_root: str) -> str:
@@ -3343,16 +3352,84 @@ def git_subprocess_trusted_hooks_dir(scratch_root: str) -> str:
 
 
 @dataclass(frozen=True)
-class _ClosedGitInvocation:
-    """Private immutable command assembled only by semantic builders."""
+class _GitOperation:
+    """Private supported operation plus typed payload, never caller argv."""
 
-    arguments: tuple[str, ...]
+    kind: str
+    remote_url: LiteralRemoteUrl | None = None
+    remote_ref: AllowedRemoteRef | None = None
+    private_ref: ControlPlanePrivateRef | None = None
+    object_id: RepositoryObjectId | None = None
+    worktree_path: DetachedWorktreePath | None = None
 
 
-def _closed_git_invocation(arguments: tuple[str, ...]) -> _ClosedGitInvocation:
-    if not arguments or any(not isinstance(argument, str) or "\x00" in argument for argument in arguments):
-        raise RuntimeError("closed_git_invocation_invalid")
-    return _ClosedGitInvocation(arguments)
+_SUPPORTED_GIT_OPERATION_KINDS = frozenset(
+    {
+        "probe_rewrite",
+        "effective_remote_url",
+        "observe_default_ref",
+        "repository_object_format",
+        "fetch_default_ref",
+        "read_private_ref_oid",
+        "require_commit_object",
+        "read_worktree_head",
+        "add_detached_locked_worktree",
+        "delete_private_ref_cas",
+    }
+)
+
+
+def _validate_deadline_value(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"git_protocol_deadline_{field}_invalid")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise ValueError(f"git_protocol_deadline_{field}_invalid")
+    return normalized
+
+
+def _revalidate_literal_remote_url(value: LiteralRemoteUrl) -> LiteralRemoteUrl:
+    if not isinstance(value, LiteralRemoteUrl):
+        raise TypeError("literal_remote_url_required")
+    return validate_literal_remote_url(value.value)
+
+
+def _revalidate_allowed_remote_ref(value: AllowedRemoteRef) -> AllowedRemoteRef:
+    if not isinstance(value, AllowedRemoteRef):
+        raise TypeError("allowed_remote_ref_required")
+    return validate_allowed_remote_ref(value.value)
+
+
+def _revalidate_private_ref(value: ControlPlanePrivateRef) -> ControlPlanePrivateRef:
+    if not isinstance(value, ControlPlanePrivateRef):
+        raise TypeError("control_plane_private_ref_required")
+    return validate_control_plane_private_ref(value.value)
+
+
+def _revalidate_object_format(value: RepositoryObjectFormat) -> RepositoryObjectFormat:
+    if not isinstance(value, RepositoryObjectFormat):
+        raise TypeError("repository_object_format_required")
+    return validate_repository_object_format(value.value)
+
+
+def _revalidate_object_id(
+    value: RepositoryObjectId, object_format: RepositoryObjectFormat | None = None
+) -> RepositoryObjectId:
+    if not isinstance(value, RepositoryObjectId):
+        raise TypeError("repository_object_id_required")
+    format_value = object_format
+    if format_value is None:
+        format_value = validate_repository_object_format("sha1" if len(value.value) == 40 else "sha256")
+    return validate_repository_object_id(value.value, _revalidate_object_format(format_value))
+
+
+def _revalidate_worktree_path(
+    value: DetachedWorktreePath, project_root: str, *, require_fresh: bool
+) -> DetachedWorktreePath:
+    if not isinstance(value, DetachedWorktreePath):
+        raise TypeError("detached_worktree_path_required")
+    validator = validate_detached_worktree_path if require_fresh else validate_existing_detached_worktree_path
+    return validator(value.value, project_root)
 
 
 def _terminate_git_process_group(proc: subprocess.Popen, pgid: int | None, deadline: GitProtocolDeadline) -> bool:
@@ -3399,10 +3476,95 @@ def _terminate_git_process_group(proc: subprocess.Popen, pgid: int | None, deadl
     return _verify_process_group_absent(pgid)
 
 
+def _operation_arguments(operation: _GitOperation, *, cwd: str) -> list[str]:
+    """Construct exact argv only from a supported operation and typed payload."""
+    if not isinstance(operation, _GitOperation) or operation.kind not in _SUPPORTED_GIT_OPERATION_KINDS:
+        raise ValueError("git_operation_not_supported")
+    if operation.kind == "probe_rewrite":
+        return ["-C", cwd, "config", "--get-regexp", "--name-only", "-z", INSTEADOF_CONFIG_NAME_REGEXP]
+    if operation.kind == "effective_remote_url":
+        remote_url = _revalidate_literal_remote_url(operation.remote_url)
+        return ["ls-remote", "--get-url", remote_url.value]
+    if operation.kind == "observe_default_ref":
+        remote_url = _revalidate_literal_remote_url(operation.remote_url)
+        return ["ls-remote", "--exit-code", "--symref", remote_url.value, "HEAD"]
+    if operation.kind == "repository_object_format":
+        return ["rev-parse", "--show-object-format"]
+    if operation.kind == "fetch_default_ref":
+        remote_url = _revalidate_literal_remote_url(operation.remote_url)
+        remote_ref = _revalidate_allowed_remote_ref(operation.remote_ref)
+        private_ref = _revalidate_private_ref(operation.private_ref)
+        return [
+            "fetch",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--no-write-fetch-head",
+            remote_url.value,
+            f"{remote_ref.value}:{private_ref.value}",
+        ]
+    if operation.kind == "read_private_ref_oid":
+        private_ref = _revalidate_private_ref(operation.private_ref)
+        return ["rev-parse", "--verify", "--quiet", private_ref.value]
+    if operation.kind == "require_commit_object":
+        object_id = _revalidate_object_id(operation.object_id)
+        return ["cat-file", "-e", object_id.value + "^{commit}"]
+    if operation.kind == "read_worktree_head":
+        return ["rev-parse", "--verify", "HEAD"]
+    if operation.kind == "add_detached_locked_worktree":
+        path = operation.worktree_path
+        object_id = _revalidate_object_id(operation.object_id)
+        if not isinstance(path, DetachedWorktreePath):
+            raise TypeError("detached_worktree_path_required")
+        return [
+            "worktree",
+            "add",
+            "--detach",
+            "--lock",
+            "--reason",
+            _CONTROL_PLANE_WORKTREE_LOCK_REASON,
+            path.value,
+            object_id.value,
+        ]
+    if operation.kind == "delete_private_ref_cas":
+        private_ref = _revalidate_private_ref(operation.private_ref)
+        object_id = _revalidate_object_id(operation.object_id)
+        return ["update-ref", "-d", private_ref.value, object_id.value]
+    raise AssertionError("unreachable_supported_operation")
+
+
+def _exact_git_argv(operation: _GitOperation, *, git_executable: str, cwd: str, hooks_dir: str) -> list[str]:
+    if operation.kind == "probe_rewrite":
+        return [
+            git_executable,
+            "--no-replace-objects",
+            "-c",
+            "core.hooksPath=" + hooks_dir,
+            "-c",
+            "credential.helper=",
+            *_operation_arguments(operation, cwd=cwd),
+        ]
+    return [
+        git_executable,
+        "--no-replace-objects",
+        "-c",
+        "core.hooksPath=" + hooks_dir,
+        "-c",
+        "credential.helper=",
+        *_operation_arguments(operation, cwd=cwd),
+    ]
+
+
 def _run_closed_git_process(
-    invocation: _ClosedGitInvocation, *, cwd: str, env: dict[str, str], deadline: GitProtocolDeadline, text: bool
+    operation: _GitOperation,
+    *,
+    git_executable: str,
+    cwd: str,
+    env: dict[str, str],
+    hooks_dir: str,
+    deadline: GitProtocolDeadline,
 ) -> subprocess.CompletedProcess:
     timeout = deadline.execution_seconds()
+    argv = _exact_git_argv(operation, git_executable=git_executable, cwd=cwd, hooks_dir=hooks_dir)
     kwargs: dict[str, object] = {
         "cwd": cwd,
         "env": env,
@@ -3410,53 +3572,41 @@ def _run_closed_git_process(
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": text,
+        "text": operation.kind != "probe_rewrite",
     }
     posix_supervised = _POSIX_PROCESS_GROUP_SUPPORTED
     if posix_supervised:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(list(invocation.arguments), **kwargs)  # type: ignore[arg-type]
+    proc = subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
     pgid = proc.pid if posix_supervised else None
     try:
+        timeout = min(timeout, deadline.execution_seconds())
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         if not _terminate_git_process_group(proc, pgid, deadline):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
         raise GitProtocolTimeout("git_process_timeout") from exc
-    except BaseException:
-        _terminate_git_process_group(proc, pgid, deadline)
+    except BaseException as exc:
+        if not _terminate_git_process_group(proc, pgid, deadline):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
         raise
     if posix_supervised and not _verify_process_group_absent(proc.pid):
-        _terminate_git_process_group(proc, pgid, deadline)
+        if not _terminate_git_process_group(proc, pgid, deadline):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_descendant_leak")
-    return subprocess.CompletedProcess(list(invocation.arguments), proc.returncode, stdout, stderr)
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
 def _probe_insteadof_rewrite_keys(
     git_executable: str, *, cwd: str, env: dict[str, str], hooks_dir: str, deadline: GitProtocolDeadline
 ) -> list[str]:
     probe = _run_closed_git_process(
-        _closed_git_invocation(
-            (
-                git_executable,
-                "--no-replace-objects",
-                "-c",
-                "core.hooksPath=" + hooks_dir,
-                "-c",
-                "credential.helper=",
-                "-C",
-                cwd,
-                "config",
-                "--get-regexp",
-                "--name-only",
-                "-z",
-                INSTEADOF_CONFIG_NAME_REGEXP,
-            )
-        ),
+        _GitOperation("probe_rewrite"),
+        git_executable=git_executable,
         cwd=cwd,
         env=env,
+        hooks_dir=hooks_dir,
         deadline=deadline,
-        text=False,
     )
     if probe.returncode == 0:
         return parse_config_get_regexp_name_only_nul(probe.stdout)
@@ -3467,17 +3617,16 @@ def _probe_insteadof_rewrite_keys(
 
 
 def _execute_semantic_git(
-    invocation: _ClosedGitInvocation,
+    operation: _GitOperation,
     *,
     cwd: str,
     project_root: str,
     scratch_root: str | None,
     deadline: GitProtocolDeadline,
 ) -> subprocess.CompletedProcess:
-    if not isinstance(invocation, _ClosedGitInvocation):
-        raise TypeError("closed_git_invocation_required")
-    if not isinstance(deadline, GitProtocolDeadline):
-        raise TypeError("git_protocol_deadline_required")
+    if not isinstance(operation, _GitOperation):
+        raise TypeError("git_operation_required")
+    deadline.execution_seconds()
     git = resolve_git_subprocess_executable(project_root)
     env = sanitized_git_subprocess_env(project_root)
     hooks_dir = git_subprocess_trusted_hooks_dir(scratch_root or project_root)
@@ -3485,21 +3634,12 @@ def _execute_semantic_git(
         _probe_insteadof_rewrite_keys(git, cwd=cwd, env=env, hooks_dir=hooks_dir, deadline=deadline)
     )
     return _run_closed_git_process(
-        _closed_git_invocation(
-            (
-                git,
-                "--no-replace-objects",
-                "-c",
-                "core.hooksPath=" + hooks_dir,
-                "-c",
-                "credential.helper=",
-                *invocation.arguments,
-            )
-        ),
+        operation,
+        git_executable=git,
         cwd=cwd,
         env=env,
+        hooks_dir=hooks_dir,
         deadline=deadline,
-        text=True,
     )
 
 
@@ -3520,7 +3660,7 @@ def run_control_plane_git_effective_remote_url(
     literal = validate_literal_remote_url(expected_remote_url)
     result = _require_success(
         _execute_semantic_git(
-            _closed_git_invocation(("ls-remote", "--get-url", literal.value)),
+            _GitOperation("effective_remote_url", remote_url=literal),
             cwd=cwd,
             project_root=project_root,
             scratch_root=scratch_root,
@@ -3541,11 +3681,10 @@ def run_control_plane_git_observe_default_ref(
     deadline: GitProtocolDeadline,
     scratch_root: str | None = None,
 ) -> subprocess.CompletedProcess:
-    if not isinstance(remote_url, LiteralRemoteUrl):
-        raise TypeError("literal_remote_url_required")
+    remote_url = _revalidate_literal_remote_url(remote_url)
     return _require_success(
         _execute_semantic_git(
-            _closed_git_invocation(("ls-remote", "--exit-code", "--symref", remote_url.value, "HEAD")),
+            _GitOperation("observe_default_ref", remote_url=remote_url),
             cwd=cwd,
             project_root=project_root,
             scratch_root=scratch_root,
@@ -3560,7 +3699,7 @@ def run_control_plane_git_repository_object_format(
 ) -> RepositoryObjectFormat:
     result = _require_success(
         _execute_semantic_git(
-            _closed_git_invocation(("rev-parse", "--show-object-format")),
+            _GitOperation("repository_object_format"),
             cwd=cwd,
             project_root=project_root,
             scratch_root=scratch_root,
@@ -3581,21 +3720,12 @@ def run_control_plane_git_fetch_default_ref(
     deadline: GitProtocolDeadline,
     scratch_root: str | None = None,
 ) -> ControlPlanePrivateRef:
-    if not isinstance(remote_url, LiteralRemoteUrl) or not isinstance(remote_ref, AllowedRemoteRef):
-        raise TypeError("literal_remote_url_and_allowed_remote_ref_required")
+    remote_url = _revalidate_literal_remote_url(remote_url)
+    remote_ref = _revalidate_allowed_remote_ref(remote_ref)
     private_ref = make_control_plane_private_ref(nonce)
     _require_success(
         _execute_semantic_git(
-            _closed_git_invocation(
-                (
-                    "fetch",
-                    "--no-tags",
-                    "--no-recurse-submodules",
-                    "--no-write-fetch-head",
-                    remote_url.value,
-                    f"{remote_ref.value}:{private_ref.value}",
-                )
-            ),
+            _GitOperation("fetch_default_ref", remote_url=remote_url, remote_ref=remote_ref, private_ref=private_ref),
             cwd=cwd,
             project_root=project_root,
             scratch_root=scratch_root,
@@ -3615,11 +3745,11 @@ def run_control_plane_git_read_private_ref_oid(
     deadline: GitProtocolDeadline,
     scratch_root: str | None = None,
 ) -> RepositoryObjectId:
-    if not isinstance(private_ref, ControlPlanePrivateRef) or not isinstance(object_format, RepositoryObjectFormat):
-        raise TypeError("private_ref_and_object_format_required")
+    private_ref = _revalidate_private_ref(private_ref)
+    object_format = _revalidate_object_format(object_format)
     result = _require_success(
         _execute_semantic_git(
-            _closed_git_invocation(("rev-parse", "--verify", "--quiet", private_ref.value)),
+            _GitOperation("read_private_ref_oid", private_ref=private_ref),
             cwd=cwd,
             project_root=project_root,
             scratch_root=scratch_root,
@@ -3638,11 +3768,10 @@ def run_control_plane_git_require_commit_object(
     deadline: GitProtocolDeadline,
     scratch_root: str | None = None,
 ) -> None:
-    if not isinstance(object_id, RepositoryObjectId):
-        raise TypeError("repository_object_id_required")
+    object_id = _revalidate_object_id(object_id)
     _require_success(
         _execute_semantic_git(
-            _closed_git_invocation(("cat-file", "-e", object_id.value + "^{commit}")),
+            _GitOperation("require_commit_object", object_id=object_id),
             cwd=cwd,
             project_root=project_root,
             scratch_root=scratch_root,
@@ -3660,11 +3789,11 @@ def run_control_plane_git_read_worktree_head(
     deadline: GitProtocolDeadline,
     scratch_root: str | None = None,
 ) -> RepositoryObjectId:
-    if not isinstance(path, DetachedWorktreePath) or not isinstance(object_format, RepositoryObjectFormat):
-        raise TypeError("detached_worktree_path_and_object_format_required")
+    path = _revalidate_worktree_path(path, project_root, require_fresh=False)
+    object_format = _revalidate_object_format(object_format)
     result = _require_success(
         _execute_semantic_git(
-            _closed_git_invocation(("rev-parse", "--verify", "HEAD")),
+            _GitOperation("read_worktree_head", worktree_path=path),
             cwd=path.value,
             project_root=project_root,
             scratch_root=scratch_root,
@@ -3684,25 +3813,14 @@ def run_control_plane_git_add_detached_locked_worktree(
     deadline: GitProtocolDeadline,
     scratch_root: str | None = None,
 ) -> None:
-    if not isinstance(path, DetachedWorktreePath) or not isinstance(commit, RepositoryObjectId):
-        raise TypeError("detached_worktree_path_and_repository_object_id_required")
+    path = _revalidate_worktree_path(path, project_root, require_fresh=True)
+    commit = _revalidate_object_id(commit)
     run_control_plane_git_require_commit_object(
         commit, cwd=cwd, project_root=project_root, deadline=deadline, scratch_root=scratch_root
     )
     _require_success(
         _execute_semantic_git(
-            _closed_git_invocation(
-                (
-                    "worktree",
-                    "add",
-                    "--detach",
-                    "--lock",
-                    "--reason",
-                    _CONTROL_PLANE_WORKTREE_LOCK_REASON,
-                    path.value,
-                    commit.value,
-                )
-            ),
+            _GitOperation("add_detached_locked_worktree", object_id=commit, worktree_path=path),
             cwd=cwd,
             project_root=project_root,
             scratch_root=scratch_root,
@@ -3710,10 +3828,14 @@ def run_control_plane_git_add_detached_locked_worktree(
         ),
         "add_detached_locked_worktree",
     )
-    fmt = RepositoryObjectFormat("sha1") if len(commit.value) == 40 else RepositoryObjectFormat("sha256")
+    object_format = validate_repository_object_format("sha1" if len(commit.value) == 40 else "sha256")
     if (
         run_control_plane_git_read_worktree_head(
-            path, fmt, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+            path,
+            object_format,
+            project_root=project_root,
+            deadline=deadline,
+            scratch_root=scratch_root,
         )
         != commit
     ):
@@ -3729,11 +3851,11 @@ def run_control_plane_git_delete_private_ref_cas(
     deadline: GitProtocolDeadline,
     scratch_root: str | None = None,
 ) -> None:
-    if not isinstance(private_ref, ControlPlanePrivateRef) or not isinstance(expected_oid, RepositoryObjectId):
-        raise TypeError("private_ref_and_expected_oid_required")
+    private_ref = _revalidate_private_ref(private_ref)
+    expected_oid = _revalidate_object_id(expected_oid)
     _require_success(
         _execute_semantic_git(
-            _closed_git_invocation(("update-ref", "-d", private_ref.value, expected_oid.value)),
+            _GitOperation("delete_private_ref_cas", private_ref=private_ref, object_id=expected_oid),
             cwd=cwd,
             project_root=project_root,
             scratch_root=scratch_root,

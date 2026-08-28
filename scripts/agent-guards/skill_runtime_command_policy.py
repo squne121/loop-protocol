@@ -2331,6 +2331,13 @@ def make_control_plane_private_ref(nonce: str) -> ControlPlanePrivateRef:
     return ControlPlanePrivateRef(f"refs/loop-protocol/control-plane/default-ref/{nonce}")
 
 
+def validate_control_plane_private_ref(value: str) -> ControlPlanePrivateRef:
+    prefix = "refs/loop-protocol/control-plane/default-ref/"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise ValueError("private_ref_not_allowed")
+    return make_control_plane_private_ref(value.removeprefix(prefix))
+
+
 def validate_repository_object_format(value: str) -> RepositoryObjectFormat:
     if value not in _OBJECT_FORMAT_LENGTHS:
         raise ValueError("repository_object_format_not_allowed")
@@ -2352,8 +2359,22 @@ def validate_detached_worktree_path(value: str, project_root: str) -> DetachedWo
     root = os.path.realpath(project_root)
     candidate = os.path.realpath(value)
     required_prefix = os.path.join(root, ".claude", "worktrees")
-    if candidate == required_prefix or not candidate.startswith(required_prefix + os.sep):
+    if value != candidate or candidate == required_prefix or not candidate.startswith(required_prefix + os.sep):
         raise ValueError("detached_worktree_path_not_confined")
     if Path(value).exists() or Path(value).is_symlink():
         raise ValueError("detached_worktree_path_not_fresh")
+    return DetachedWorktreePath(candidate)
+
+
+def validate_existing_detached_worktree_path(value: str, project_root: str) -> DetachedWorktreePath:
+    if not isinstance(value, str) or not os.path.isabs(value):
+        raise ValueError("detached_worktree_path_invalid")
+    root = os.path.realpath(project_root)
+    candidate = os.path.realpath(value)
+    required_prefix = os.path.join(root, ".claude", "worktrees")
+    path = Path(value)
+    if value != candidate or candidate == required_prefix or not candidate.startswith(required_prefix + os.sep):
+        raise ValueError("detached_worktree_path_not_confined")
+    if not path.is_dir() or path.is_symlink():
+        raise ValueError("detached_worktree_path_not_existing_directory")
     return DetachedWorktreePath(candidate)
