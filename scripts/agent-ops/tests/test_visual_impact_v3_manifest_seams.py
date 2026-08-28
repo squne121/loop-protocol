@@ -236,6 +236,21 @@ def test_v3_closed_shape_rejects_invalid_run_attempt_values() -> None:
         assert rvi.verify_evidence_manifest_v3_record_digest(record) is False, bad_run_attempt
 
 
+def test_v3_closed_shape_rejects_invalid_workflow_run_id_values() -> None:
+    """Issue #2379 OWNER fix_delta P3: `workflow_run_id` was previously
+    only compared with `!=` against the envelope (which would silently
+    accept e.g. `100.0 == 100`) -- it is now strict-type-validated inside
+    `_validate_v3_record_shape()` exactly like `run_attempt`, so
+    string/bool/float/zero/negative/null are all rejected by the read-side
+    closed-shape+digest verifier."""
+    for bad_workflow_run_id in ("100", True, 100.0, 0, -1, None):
+        record = rvi.build_evidence_manifest_v3_record(**_v3_record_fields())
+        record["workflow_run_id"] = bad_workflow_run_id
+        assert rvi.verify_evidence_manifest_v3_record_digest(record) is False, bad_workflow_run_id
+        errors = rvi._validate_v3_record_shape(record)
+        assert any("invalid_workflow_run_id" in e for e in errors), errors
+
+
 def test_v3_closed_shape_rejects_duplicate_surface_id() -> None:
     """AC3: V3 does NOT inherit V2's "first match wins" lookup semantics --
     a manifest with more than one record sharing the same `surface_id` is
@@ -621,3 +636,63 @@ def test_v3_no_impact_manifest_fails_when_manifest_missing_entirely() -> None:
     )
     assert verdict.ok is False
     assert any("evidence_manifest_missing" in r for r in verdict.reason_codes), verdict.reason_codes
+
+
+
+def test_v3_no_impact_manifest_fails_when_decision_and_envelope_workflow_run_id_mismatch_no_provenance() -> None:
+    """Issue #2379 OWNER fix_delta P2-2 (AC6): a no-impact decision's
+    `workflow_run_id` and the V3 envelope's own `workflow_run_id` must be
+    directly cross-checked EVEN WITHOUT any authenticated CheckRun
+    provenance (`trusted_rederivation=None`) -- previously the only
+    workflow_run_id comparison happened inside the `trusted_rederivation
+    is not None and trusted_rederivation.component_vrt_checkrun_provenance`
+    guard, so a no-provenance caller passing a decision/envelope pair with
+    mismatched run identities was never caught by this direct comparison."""
+    head_sha = "a" * 40
+    decision = _no_impact_decision(
+        head_sha=head_sha, repository="squne121/loop-protocol", pr_number=1, run_id=500, run_attempt=1
+    )
+    # Envelope claims workflow_run_id=999, disagreeing with the decision's
+    # own claimed workflow_run_id=500 -- no provenance is supplied, so this
+    # can ONLY be caught by the unconditional decision<->envelope check.
+    manifest = _v3_manifest(workflow_run_id=999, run_attempt=1, head_sha=head_sha, surfaces=[])
+
+    verdict = rvi.verify_trusted_artifact(
+        decision_raw=json.dumps(decision).encode("utf-8"),
+        evidence_manifest_raw=json.dumps(manifest).encode("utf-8"),
+        visual_impact_schema_path=VISUAL_IMPACT_SCHEMA_PATH,
+        expected_head_sha=head_sha,
+        expected_repository="squne121/loop-protocol",
+        expected_pr_number=1,
+    )
+    assert verdict.ok is False
+    assert any(
+        "evidence_manifest_v3_envelope_decision_workflow_run_id_mismatch" in r for r in verdict.reason_codes
+    ), verdict.reason_codes
+
+
+def test_v3_no_impact_manifest_fails_when_decision_and_envelope_run_attempt_mismatch_no_provenance() -> None:
+    """Issue #2379 OWNER fix_delta P2-2 (AC6): same as the workflow_run_id
+    variant above, but for `run_attempt` -- a no-impact decision's
+    `run_attempt` and the V3 envelope's own `run_attempt` must be directly
+    cross-checked even without any authenticated CheckRun provenance."""
+    head_sha = "a" * 40
+    decision = _no_impact_decision(
+        head_sha=head_sha, repository="squne121/loop-protocol", pr_number=1, run_id=500, run_attempt=1
+    )
+    # Envelope claims run_attempt=7, disagreeing with the decision's own
+    # claimed run_attempt=1 -- no provenance is supplied.
+    manifest = _v3_manifest(workflow_run_id=500, run_attempt=7, head_sha=head_sha, surfaces=[])
+
+    verdict = rvi.verify_trusted_artifact(
+        decision_raw=json.dumps(decision).encode("utf-8"),
+        evidence_manifest_raw=json.dumps(manifest).encode("utf-8"),
+        visual_impact_schema_path=VISUAL_IMPACT_SCHEMA_PATH,
+        expected_head_sha=head_sha,
+        expected_repository="squne121/loop-protocol",
+        expected_pr_number=1,
+    )
+    assert verdict.ok is False
+    assert any(
+        "evidence_manifest_v3_envelope_decision_run_attempt_mismatch" in r for r in verdict.reason_codes
+    ), verdict.reason_codes

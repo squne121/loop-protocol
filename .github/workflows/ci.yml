@@ -2015,23 +2015,15 @@ jobs:
           set -e
           cp /tmp/combat-hud-running.vrt.test.ts.orig tests/component/combat-hud-running.vrt.test.ts
           exit "${probe_status}"
-      - name: Build VISUAL_BASELINE_REVIEW_EVIDENCE_V3 manifest
+      - name: Build VISUAL_BASELINE_REVIEW_EVIDENCE_V2 manifest
         # PR #2045 OWNER fix_delta P0-5 second-round REQUEST_CHANGES:
-        # per-surface manifest (one record per registered surface,
+        # per-surface V2 manifest (one record per registered surface,
         # self-binding to its own contract digest + tamper-evidence digest)
         # replaces the single flat V1 record for the whole job. Record
         # construction (including baseline_sha256, which is ALWAYS computed
         # from the on-disk baseline -- never trusted from this shell step) is
         # delegated to `resolve_visual_impact.py --mode
         # build-evidence-manifest`, never re-implemented ad hoc here.
-        #
-        # Issue #2284 Phase B: schema cut over to V3
-        # (`--evidence-manifest-schema v3` below) -- `run_attempt` is now
-        # bound INSIDE the per-record tamper-evidence digest, and the
-        # manifest carries a required top-level envelope
-        # (`workflow_run_id`/`run_attempt`/`head_sha`) so even a
-        # `surfaces: []` no-impact manifest is independently identity-
-        # verifiable.
         id: build-evidence-manifest
         if: ${{ always() }}
         env:
@@ -2158,32 +2150,18 @@ jobs:
           ]
           json.dump(records, sys.stdout, indent=2)
           PY
-          # Issue #2284 Phase B: producer cutover -- write the V3 schema
-          # (`--evidence-manifest-schema v3`) to the version-neutral
-          # generic filename (`visual_baseline_review_evidence.json`,
-          # never the old `_v2` suffix) so this producer job's OWN
-          # `run_attempt` is bound INSIDE the evidence manifest's
-          # tamper-evidence digest (Issue #2284 AC2), not merely carried
-          # alongside it as V2's compatibility-excluded field. The V3
-          # envelope's identity tuple comes from THIS job's own
-          # `$GH_HEAD_SHA`/`$GITHUB_RUN_ID`/`$GH_RUN_ATTEMPT` context --
-          # never re-derived by any other party.
           uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
             --mode build-evidence-manifest \
-            --evidence-manifest-schema v3 \
             --surface-inputs-file surface_inputs.json \
-            --head-sha "$GH_HEAD_SHA" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GH_RUN_ATTEMPT" \
-            --manifest-output /tmp/visual_baseline_review_evidence.json
+            --manifest-output /tmp/visual_baseline_review_evidence_v2.json
           {
             echo ""
-            echo "### VISUAL_BASELINE_REVIEW_EVIDENCE_V3 (Issue #2284 Phase B production cutover)"
+            echo "### VISUAL_BASELINE_REVIEW_EVIDENCE_V2 (Issue #2019 P0-5)"
             echo '```json'
-            cat /tmp/visual_baseline_review_evidence.json
+            cat /tmp/visual_baseline_review_evidence_v2.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload VISUAL_BASELINE_REVIEW_EVIDENCE_V3 manifest
+      - name: Upload VISUAL_BASELINE_REVIEW_EVIDENCE_V2 manifest
         id: upload-evidence-manifest
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
@@ -2194,11 +2172,8 @@ jobs:
           # exact-name resolution) and the base-locked
           # `visual-impact-trusted-consumer.yml` `name=` filter can never
           # silently adopt an OLDER attempt's stale evidence manifest.
-          # Issue #2284 Phase B: artifact NAME is unchanged (still
-          # attempt-scoped) -- only the file INSIDE it is the new
-          # version-neutral generic filename.
           name: component-vrt-evidence-manifest-${{ github.run_attempt }}
-          path: /tmp/visual_baseline_review_evidence.json
+          path: /tmp/visual_baseline_review_evidence_v2.json
           if-no-files-found: error
           retention-days: 30
       # --- end runtime evidence ---------------------------------------------
@@ -2457,9 +2432,7 @@ jobs:
           # Issue #2230: same-run, same-attempt exact-name match (this job
           # and `component-vrt-report` always share the same
           # `github.run_attempt` since both run within the same workflow
-          # attempt). Issue #2284 Phase B: the artifact name itself is
-          # unchanged -- only the FILE inside it (see the policy-check
-          # step below) moved to the generic V3 filename.
+          # attempt).
           name: component-vrt-evidence-manifest-${{ github.run_attempt }}
           path: evidence-manifest-download
       # PR #2045 OWNER fix_delta P0-5 second-round REQUEST_CHANGES: the
@@ -2585,7 +2558,7 @@ jobs:
             --changed-paths-typed-file changed_paths_typed.json \
             --changed-paths-file changed_paths.txt \
             --pr-body-file pr_body.md \
-            --evidence-manifest-file evidence-manifest-download/visual_baseline_review_evidence.json \
+            --evidence-manifest-file evidence-manifest-download/visual_baseline_review_evidence_v2.json \
             --codeowners-file base_codeowners.txt \
             --actor "${PR_ACTOR}" \
             --repository "${GITHUB_REPOSITORY}" \

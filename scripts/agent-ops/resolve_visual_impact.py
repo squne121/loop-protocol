@@ -1075,11 +1075,14 @@ def _validate_v3_record_shape(record: Any) -> list[str]:
     manifest_v2_record()` (which defaults an omitted kwarg to `None`/
     `False`), a V3 record read back from an untrusted manifest is rejected
     outright if it is missing ANY of `_MANIFEST_V3_RECORD_FIELDS` (+
-    `manifest_sha256`), carries any EXTRA key, or if `run_attempt` is
-    anything other than a real JSON integer `>= 1` (string/bool/float/
-    zero/negative/null all rejected -- reusing the same strict,
-    non-coercing `_require_strict_positive_int` validator already applied
-    to `workflow_run_id`/`run_attempt` elsewhere in this module)."""
+    `manifest_sha256`), carries any EXTRA key, or if `workflow_run_id`/
+    `run_attempt` is anything other than a real JSON integer `>= 1`
+    (string/bool/float/zero/negative/null all rejected -- reusing the same
+    strict, non-coercing `_require_strict_positive_int` validator already
+    applied to `workflow_run_id`/`run_attempt` elsewhere in this module).
+    Issue #2379 OWNER fix_delta P3: `workflow_run_id` was previously only
+    compared with `!=` against the envelope (accepting e.g. `100.0 == 100`)
+    -- it is now strict-type-validated here exactly like `run_attempt`."""
     if not isinstance(record, dict):
         return ["evidence_manifest_v3_record_not_object"]
     errors: list[str] = []
@@ -1091,6 +1094,12 @@ def _validate_v3_record_shape(record: Any) -> list[str]:
         errors.append(f"evidence_manifest_v3_record_missing_keys:{sorted(missing_keys)}")
     if extra_keys:
         errors.append(f"evidence_manifest_v3_record_extra_keys:{sorted(extra_keys)}")
+    _, workflow_run_id_error = _require_strict_positive_int(
+        record.get("workflow_run_id"),
+        "workflow_run_id",
+    )
+    if workflow_run_id_error:
+        errors.append(f"evidence_manifest_v3_record_invalid_workflow_run_id:{workflow_run_id_error}")
     _, run_attempt_error = _require_strict_positive_int(record.get("run_attempt"), "run_attempt")
     if run_attempt_error:
         errors.append(f"evidence_manifest_v3_record_invalid_run_attempt:{run_attempt_error}")
@@ -3225,6 +3234,21 @@ def verify_trusted_artifact(
                     reasons.extend(f"evidence_manifest_v3_envelope_invalid:{err}" for err in envelope_errors)
                     if manifest.get("head_sha") != expected_head_sha:
                         reasons.append("evidence_manifest_v3_envelope_head_sha_mismatch")
+                    # Issue #2379 OWNER fix_delta P2-2 (AC6): this decision<->
+                    # envelope identity-binding check must be unconditional.
+                    # Previously the ONLY comparison of workflow_run_id/
+                    # run_attempt was against AUTHENTICATED provenance inside
+                    # the `trusted_rederivation is not None and ...` guard
+                    # below -- there was never a direct comparison between the
+                    # V3 envelope's own values and the DECISION artifact's own
+                    # claimed values, so a no-provenance caller (or a
+                    # provenance-present-but-not-ok caller) could pass a
+                    # decision/envelope pair with mismatched run identities
+                    # undetected.
+                    if manifest.get("workflow_run_id") != decision.get("workflow_run_id"):
+                        reasons.append("evidence_manifest_v3_envelope_decision_workflow_run_id_mismatch")
+                    if manifest.get("run_attempt") != decision.get("run_attempt"):
+                        reasons.append("evidence_manifest_v3_envelope_decision_run_attempt_mismatch")
                     if trusted_rederivation is not None and trusted_rederivation.component_vrt_checkrun_provenance:
                         envelope_provenance = trusted_rederivation.component_vrt_checkrun_provenance
                         if envelope_provenance.ok:
@@ -3275,6 +3299,17 @@ def verify_trusted_artifact(
                             continue
                         if record.get("manifest_sha256") != digest_claim:
                             reasons.append(f"evidence_manifest_digest_mismatch:{surface.get('surface_id')}")
+                        # Issue #2379 OWNER fix_delta P2-1 (regression fix):
+                        # this head_sha check must be unconditional -- it had
+                        # been living INSIDE the `trusted_rederivation is not
+                        # None and trusted_rederivation.component_vrt_checkrun_
+                        # provenance` guard below, so a caller invoking this
+                        # function without provenance (trusted_rederivation is
+                        # `None`, as in a plain V2 fallback verification) never
+                        # detected an old-attempt/forged record's head_sha
+                        # mismatch at all.
+                        if record.get("head_sha") != expected_head_sha:
+                            reasons.append(f"evidence_manifest_head_sha_mismatch:{surface.get('surface_id')}")
                         # Issue #2230 AC2/AC5: the evidence manifest record's
                         # OWN `(workflow_run_id, run_attempt, head_sha)` tuple
                         # must also match the trusted consumer's authenticated
@@ -3312,8 +3347,6 @@ def verify_trusted_artifact(
                                 )
                                 if not run_attempt_matches:
                                     reasons.append(f"evidence_manifest_run_attempt_mismatch:{surface.get('surface_id')}")
-                            if record.get("head_sha") != expected_head_sha:
-                                reasons.append(f"evidence_manifest_head_sha_mismatch:{surface.get('surface_id')}")
 
     return TrustedArtifactVerdict(ok=not reasons, reason_codes=reasons, decision=decision)
 
