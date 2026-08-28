@@ -87,6 +87,14 @@ OWNER adversarial review):
     ref so different refs/repos produce stable-but-distinct fake SHAs.
     Only this exact `--jq .object.sha` argv shape is understood -- this is
     not a generic REST router or jq evaluator (Out of Scope, Issue #2330).
+
+PR #2377 OWNER REQUEST_CHANGES fix_delta (P1-1): both shapes above are now
+EXACT-argv contracts, not containment/substring checks -- an argv with an
+extra trailing token (e.g. a stray `--method DELETE`), an empty `base_ref`,
+a missing `owner/repo` structure, an unexpected path segment before the
+`/git/refs/heads/` marker, or a wrong/extra `--jq` selector on the `repo
+view` shape now fails closed (non-zero exit) instead of being silently
+accepted as a near-miss success.
 """
 
 from __future__ import annotations
@@ -94,7 +102,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
+
+# Issue #2330 fix_delta (P1-1): exact-argv contract for the
+# `gh api repos/<owner>/<repo>/git/refs/heads/<base_ref> --jq .object.sha`
+# endpoint shape -- requires a non-empty `owner/repo` pair and a non-empty
+# `base_ref` suffix (which may itself contain further `/`).
+_REF_SHA_ENDPOINT_RE = re.compile(r"^(repos/[^/]+/[^/]+)/git/refs/heads/(.+)$")
 
 
 def _load(state_path: str) -> dict:
@@ -187,22 +202,40 @@ def main() -> int:
     if args[:2] == ["repo", "view"]:
         if os.environ.get("FAKE_GH_REPO_READ_OK", "1") != "1":
             return 1
-        # Issue #2330: the production consumer (root_entry_router.py) issues
-        # `gh repo view <owner>/<repo> --json nameWithOwner --jq
-        # .nameWithOwner` with a POSITIONAL repo argument directly after
-        # `view` -- not `--repo <repo>`. Prefer the positional form; fall
-        # back to `--repo` for backward compatibility with existing callers.
-        repo = args[2] if len(args) > 2 and not args[2].startswith("-") else None
-        if repo is None:
-            for i, value in enumerate(args):
-                if value == "--repo" and i + 1 < len(args):
-                    repo = args[i + 1]
+        # Issue #2330 fix_delta (P1-1, PR #2377 OWNER REQUEST_CHANGES): the
+        # bare/`--jq`-filtered output the production consumer
+        # (`root_entry_router.py`) depends on is only emitted for this EXACT
+        # positional-repo argv shape -- `["repo", "view", <owner>/<repo>,
+        # "--json", "nameWithOwner", "--jq", ".nameWithOwner"]` (7 tokens,
+        # nothing more, nothing less). A previous substring/containment-only
+        # check (`"--jq" in args and ".nameWithOwner" in args`) let near-miss
+        # argv (wrong `--jq` selector, extra trailing tokens) through as a
+        # false success; any near-miss now fails closed instead.
+        exact_positional_identity_read = (
+            len(args) == 7
+            and not args[2].startswith("-")
+            and args[3:] == ["--json", "nameWithOwner", "--jq", ".nameWithOwner"]
+        )
+        if exact_positional_identity_read:
+            # Real `gh --jq` output is raw/unquoted text, not JSON.
+            print(args[2])
+            return 0
+        if "--jq" in args:
+            # A near-miss of the exact positional+jq shape above (wrong
+            # selector, extra tokens, `--repo` flag combined with `--jq`,
+            # etc.) -- fail closed rather than silently falling back to the
+            # legacy JSON-quoted output below.
+            return 1
+
+        # Legacy `--repo <repo>` flag form (Issue #2273/#2306-era callers),
+        # JSON-quoted output, no `--jq` involved. Still accepted for
+        # backward compatibility with existing callers.
+        repo = None
+        for i, value in enumerate(args):
+            if value == "--repo" and i + 1 < len(args):
+                repo = args[i + 1]
         if "--json" in args and "nameWithOwner" in args:
-            if "--jq" in args and ".nameWithOwner" in args:
-                # Real `gh --jq` output is raw/unquoted text, not JSON.
-                print(repo or "fake/repo")
-            else:
-                print(json.dumps(repo or "fake/repo"))
+            print(json.dumps(repo or "fake/repo"))
         return 0
 
     if args[:2] == ["issue", "comment"]:
@@ -341,30 +374,34 @@ def main() -> int:
         return 0
 
     if (
-        len(args) >= 4
+        len(args) == 4
         and args[0] == "api"
-        and args[1].startswith("repos/")
-        and "/git/refs/heads/" in args[1]
-        and args[2] == "--jq"
-        and args[3] == ".object.sha"
+        and args[2:] == ["--jq", ".object.sha"]
     ):
-        # Issue #2330: the production consumer (root_entry_router.py)
-        # issues `gh api repos/<owner>/<repo>/git/refs/heads/<base_ref>
-        # --jq .object.sha`. `<base_ref>` is NOT limited to a single path
-        # segment (i.e. not just `main`) -- it is everything after the
-        # `/git/refs/heads/` marker, which may itself contain `/` (e.g.
-        # `release/next`). Only this exact `--jq .object.sha` argv shape is
-        # understood; this is not a generic REST router or jq evaluator
-        # (Out of Scope). Prints a deterministic 40-hex fake SHA (bare
-        # string, no JSON quoting) derived from the repo path + ref so
-        # different refs/repos produce stable-but-distinct fake SHAs.
-        marker = "/git/refs/heads/"
-        idx = args[1].index(marker)
-        ref_path = args[1][:idx]
-        base_ref = args[1][idx + len(marker):]
-        digest = hashlib.sha1(f"{ref_path}:{base_ref}".encode("utf-8")).hexdigest()
-        print(digest)
-        return 0
+        # Issue #2330 fix_delta (P1-1, PR #2377 OWNER REQUEST_CHANGES): the
+        # production consumer (root_entry_router.py) issues `gh api
+        # repos/<owner>/<repo>/git/refs/heads/<base_ref> --jq .object.sha`.
+        # `<base_ref>` is NOT limited to a single path segment (i.e. not
+        # just `main`) -- it is everything after the `/git/refs/heads/`
+        # marker, which may itself contain `/` (e.g. `release/next`). This
+        # is now an EXACT argv contract: `len(args) == 4` (no extra trailing
+        # tokens such as a stray `--method DELETE`) and `args[1]` must
+        # `re.fullmatch` `repos/<owner>/<repo>/git/refs/heads/<non-empty
+        # base_ref>` -- a prior containment-only check (`startswith("repos/")`
+        # + `"/git/refs/heads/" in args[1]`) let near-miss endpoints (empty
+        # base_ref, missing `owner/repo` structure, an unexpected segment
+        # before the marker) through as a false success. Only this exact
+        # `--jq .object.sha` argv shape is understood; this is not a
+        # generic REST router or jq evaluator (Out of Scope). Prints a
+        # deterministic 40-hex fake SHA (bare string, no JSON quoting)
+        # derived from the repo path + ref so different refs/repos produce
+        # stable-but-distinct fake SHAs.
+        match = _REF_SHA_ENDPOINT_RE.fullmatch(args[1])
+        if match:
+            ref_path, base_ref = match.groups()
+            digest = hashlib.sha1(f"{ref_path}:{base_ref}".encode("utf-8")).hexdigest()
+            print(digest)
+            return 0
 
     if args[:2] == ["api", "graphql"]:
         number = None

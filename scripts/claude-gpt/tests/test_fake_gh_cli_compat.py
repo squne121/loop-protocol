@@ -70,7 +70,17 @@ def _run_fake_gh(tmp_path: Path, args: list[str]) -> subprocess.CompletedProcess
             timeout=30,
             env=env,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except subprocess.TimeoutExpired as exc:
+        # PR #2377 OWNER REQUEST_CHANGES fix_delta (P1-2):
+        # `subprocess.TimeoutExpired` is a `subprocess.SubprocessError`
+        # subclass, so a bare `except (OSError, subprocess.SubprocessError)`
+        # previously mis-classified a genuinely hung `fake_gh.py` invocation
+        # as an "environment unavailable" SKIP (exit 77). Per Issue #2330's
+        # contract, SKIP is reserved for the local Python subprocess
+        # execution environment itself being unavailable -- a real hang is a
+        # FAIL, not a SKIP.
+        pytest.fail(f"fake_gh.py subprocess timed out: {exc}")
+    except OSError as exc:
         # Issue #2330 Stop Condition: SKIP (exit 77), never a silent pass
         # or an in-process fallback, when the local Python subprocess
         # execution environment itself is unavailable.
@@ -156,3 +166,80 @@ def test_repo_view_legacy_flag_form_still_exits_zero(tmp_path):
         ["repo", "view", "--repo", _REPO, "--json", "nameWithOwner"],
     )
     assert proc.returncode == 0, proc.stderr
+
+
+# =============================================================================
+# PR #2377 OWNER REQUEST_CHANGES fix_delta (P1-1) / GIVEN near-miss argv that
+# only superficially resembles the two exact-argv shapes above, WHEN
+# `fake_gh.py` is invoked with that near-miss argv, THEN it fails closed
+# (non-zero exit) instead of being silently accepted as a success.
+# =============================================================================
+
+
+def test_api_refs_heads_extra_trailing_token_is_rejected(tmp_path):
+    proc = _run_fake_gh(
+        tmp_path,
+        [
+            "api",
+            f"repos/{_REPO}/git/refs/heads/main",
+            "--jq",
+            ".object.sha",
+            "--method",
+            "DELETE",
+        ],
+    )
+    assert proc.returncode != 0
+
+
+def test_api_refs_heads_empty_base_ref_is_rejected(tmp_path):
+    proc = _run_fake_gh(
+        tmp_path,
+        ["api", f"repos/{_REPO}/git/refs/heads/", "--jq", ".object.sha"],
+    )
+    assert proc.returncode != 0
+
+
+def test_api_refs_heads_missing_owner_repo_structure_is_rejected(tmp_path):
+    proc = _run_fake_gh(
+        tmp_path,
+        ["api", "repos/owner/git/refs/heads/main", "--jq", ".object.sha"],
+    )
+    assert proc.returncode != 0
+
+
+def test_api_refs_heads_unexpected_endpoint_before_marker_is_rejected(tmp_path):
+    proc = _run_fake_gh(
+        tmp_path,
+        [
+            "api",
+            f"repos/{_REPO}/other/git/refs/heads/main",
+            "--jq",
+            ".object.sha",
+        ],
+    )
+    assert proc.returncode != 0
+
+
+def test_repo_view_wrong_jq_selector_is_rejected(tmp_path):
+    proc = _run_fake_gh(
+        tmp_path,
+        ["repo", "view", _REPO, "--json", "nameWithOwner", "--jq", ".wrongSelector"],
+    )
+    assert proc.returncode != 0
+
+
+def test_repo_view_extra_trailing_token_is_rejected(tmp_path):
+    proc = _run_fake_gh(
+        tmp_path,
+        [
+            "repo",
+            "view",
+            _REPO,
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+            "extra",
+        ],
+    )
+    assert proc.returncode != 0
