@@ -43,17 +43,33 @@ gate = _load_gate_module()
 
 
 def _baseline_with_duration(job: str, workflow_run_id: int, elapsed_ms: int | None) -> dict:
+    # #2187: `run_attempt: 1` set explicitly -- this fixture feeds
+    # `_provider_post_filter_sample_count` -> `_pair_by_workflow_run_id` ->
+    # `_select_initial_attempt_baselines`, and the gate-side missing-
+    # run_attempt trust rejection unified with the collector in #2187 would
+    # otherwise silently exclude every record here (this file's own scope
+    # is post-filter sample-floor re-validation, not run_attempt trust
+    # semantics).
     measurements = [] if elapsed_ms is None else [{"phase_id": "test_e2e_ci", "elapsed_ms": elapsed_ms, "status": 0}]
     return {
         "schema": "ci_runtime_baseline_v1",
         "job": job,
         "workflow_run_id": workflow_run_id,
+        "run_attempt": 1,
         "measurements": measurements,
     }
 
 
 def _baseline_with_clock(role_id: int, run_started_at: str | None, check_completed_at: str | None) -> dict:
-    baseline: dict = {"schema": "ci_runtime_baseline_v1", "job": "e2e", "workflow_run_id": role_id}
+    # #2187: `run_attempt: 1` set explicitly -- see `_baseline_with_duration`
+    # comment above; `_gate_ready_post_filter_sample_count` now also applies
+    # `_select_initial_attempt_baselines` dedupe/trust filtering.
+    baseline: dict = {
+        "schema": "ci_runtime_baseline_v1",
+        "job": "e2e",
+        "workflow_run_id": role_id,
+        "run_attempt": 1,
+    }
     if run_started_at is not None:
         baseline["run_started_at"] = run_started_at
     if check_completed_at is not None:
@@ -102,8 +118,9 @@ def test_20_baselines_but_1_valid_timestamp_fails_post_filter_floor():
         for i in range(20)
     ]
 
-    post_filter_count = gate._gate_ready_post_filter_sample_count(baselines)
+    post_filter_count, evidence_errors = gate._gate_ready_post_filter_sample_count(baselines)
     assert post_filter_count == 1
+    assert evidence_errors == [], "all 20 baselines carry a trusted run_attempt; there must be no trust exclusions"
 
     with pytest.raises(gate.EvidenceInsufficientError) as exc_info:
         gate._evidence_readiness_hard_check_post_filter(

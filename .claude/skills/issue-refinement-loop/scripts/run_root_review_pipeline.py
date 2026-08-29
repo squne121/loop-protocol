@@ -202,6 +202,19 @@ _derive_review_budget = _contract_readiness_check.derive_review_budget
 import baseline_vc_preflight as _baseline_vc_preflight  # noqa: E402
 
 _compute_canonical_vc_plan = _baseline_vc_preflight.compute_canonical_vc_plan
+# Issue #2254 AC1: this pipeline is a root-owned producer of the immutable
+# history_snapshot/v1 for its OWN invocation-local `body`, built ONCE
+# (see the `_vc_plan = _compute_canonical_vc_plan(...)` call below) and
+# threaded through -- it never re-derives its own snapshot independently
+# per call within a single pipeline invocation.
+_produce_immutable_history_snapshot = _baseline_vc_preflight.produce_immutable_history_snapshot
+# Issue #2254 fix_delta P0 blocker 2/3 (OWNER REQUEST_CHANGES
+# https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+# resolve the SAME worktree-root string `produce_immutable_history_snapshot()`
+# and `compute_canonical_vc_plan()` both need for `command_group_key`
+# normalization, from the SAME `cwd` this pipeline always uses.
+_resolve_repo_root_for_history = _baseline_vc_preflight.resolve_repo_root_for_history
+import vc_runtime_history as _vc_runtime_history  # noqa: E402
 # Issue #2232 Scope Delta P0-1 (OWNER REQUEST_CHANGES
 # https://github.com/squne121/loop-protocol/pull/2255#issuecomment-5340600982):
 # reuse the SAME `extract_allowed_paths()` helper `baseline_vc_preflight.py`'s
@@ -335,7 +348,11 @@ def run_check_issue_contract(
 
 
 def run_contract_readiness_check(
-    body_file: str, *, mode: str = "execute", timeout_seconds: float = CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS
+    body_file: str,
+    *,
+    mode: str = "execute",
+    timeout_seconds: float = CONTRACT_READINESS_CHECK_TIMEOUT_SECONDS,
+    history_snapshot_file: str | None = None,
 ) -> tuple[dict | None, int, str | None]:
     """Run `contract_readiness_check.py --body-file <body_file> --mode <mode>`.
 
@@ -360,6 +377,14 @@ def run_contract_readiness_check(
     """
     script_path = _ISSUE_CONTRACT_REVIEW_SCRIPTS / "contract_readiness_check.py"
     cmd = [sys.executable, str(script_path), "--body-file", body_file, "--mode", mode]
+    # Issue #2254 fix_delta P0 blocker 1: propagate the SAME immutable
+    # history snapshot `_cmd_produce()` already built for this invocation's
+    # pinned body, so `contract_readiness_check.py`'s own internal
+    # `run_baseline_vc_preflight()` call (in --mode execute) reuses it
+    # instead of independently re-reading the store at a different point
+    # in time.
+    if history_snapshot_file is not None:
+        cmd.extend(["--history-snapshot-file", history_snapshot_file])
     supervised = _baseline_vc_preflight.run_subprocess_with_cooperative_supervisor(
         cmd, timeout_seconds=timeout_seconds
     )
@@ -1039,6 +1064,7 @@ def run_checker_pipeline_once(
     issue_number: int,
     body_sha256: str,
     readiness_timeout_seconds: int | None = None,
+    history_snapshot_file: str | None = None,
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
     """Run check_issue_contract -> contract_readiness_check -> merge_readiness
     exactly once against an already-fetched, already-pinned body file.
@@ -1072,10 +1098,14 @@ def run_checker_pipeline_once(
         # `run_contract_readiness_check()`'s static `N<=2`-compatible default.
         if readiness_timeout_seconds is not None:
             readiness_result, _readiness_rc, readiness_err = run_contract_readiness_check(
-                body_file, timeout_seconds=readiness_timeout_seconds
+                body_file,
+                timeout_seconds=readiness_timeout_seconds,
+                history_snapshot_file=history_snapshot_file,
             )
         else:
-            readiness_result, _readiness_rc, readiness_err = run_contract_readiness_check(body_file)
+            readiness_result, _readiness_rc, readiness_err = run_contract_readiness_check(
+                body_file, history_snapshot_file=history_snapshot_file
+            )
         if readiness_result is None:
             return None, readiness_err, ("contract_readiness_check_wrapper" if readiness_err == "timeout" else None)
 
@@ -1137,6 +1167,7 @@ def _cmd_run_checker_attempt(args: argparse.Namespace) -> int:
         issue_number=args.issue_number,
         body_sha256=args.body_sha256,
         readiness_timeout_seconds=args.readiness_timeout_seconds,
+        history_snapshot_file=args.history_snapshot_file,
     )
     if merged is None:
         # Issue #2165 P1-4: `timeout_phase` is included ONLY when set (kept
@@ -1180,8 +1211,23 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         # `args.cwd or "."` default and `allowed_paths_from_body`), keeping
         # this pipeline's canonical plan (and any digest derived from it
         # downstream) convergent with the other canonical-plan consumers.
+        # Issue #2254 AC1: ONE root-owned read of the local history store
+        # for this invocation-local plan.
+        # Issue #2254 fix_delta P0 blocker 2/3 (OWNER REQUEST_CHANGES
+        # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+        # `_repo_root_for_history` is resolved ONCE from the SAME cwd="."
+        # this whole function uses, and threaded into BOTH the snapshot
+        # producer AND the plan computation below.
+        _repo_root_for_history = _resolve_repo_root_for_history(".")
+        _history_snapshot = _produce_immutable_history_snapshot(
+            body, cwd=".", repo_root=_repo_root_for_history
+        )
         _vc_plan = _compute_canonical_vc_plan(
-            body, cwd=".", allowed_paths=_extract_allowed_paths(body)
+            body,
+            cwd=".",
+            allowed_paths=_extract_allowed_paths(body),
+            history_snapshot=_history_snapshot,
+            repo_root=_repo_root_for_history,
         )
         # Issue #2207 OWNER P1-3 (PR #2221 REQUEST_CHANGES): `command_occurrence_count`,
         # per the Issue #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`
@@ -1222,6 +1268,21 @@ def _cmd_produce(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(dir=str(tmp_root), prefix="root_review_pipeline_") as scratch_dir:
         body_file = write_pinned_body_tempfile(body, dir=scratch_dir)
 
+        # Issue #2254 fix_delta P0 blocker 1: serialize the SAME
+        # `_history_snapshot` this function already produced ABOVE (before
+        # any checker subprocess was spawned) to a file inside this
+        # `scratch_dir` (removed automatically when this `with` block
+        # exits, i.e. after every retry attempt has completed), so every
+        # `run-checker-attempt` child spawned below -- including retries,
+        # which reuse this SAME `base_argv` -- loads the EXACT same
+        # snapshot instead of each independently re-reading the store.
+        _history_snapshot_path: str | None = None
+        if _history_snapshot is not None:
+            _history_snapshot_path = str(Path(scratch_dir) / "history-snapshot.json")
+            _vc_runtime_history.write_history_snapshot_file(
+                _history_snapshot, Path(_history_snapshot_path)
+            )
+
         # Issue #2054 PR #2142 owner REQUEST_CHANGES P0-1: production wiring
         # through `reviewer_transport.run_reviewer_transport()` -- real
         # attempt manifests, the closed retry matrix, process-group
@@ -1245,6 +1306,8 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             "--readiness-timeout-seconds",
             str(_review_budget.readiness_wrapper_seconds),
         ]
+        if _history_snapshot_path is not None:
+            base_argv.extend(["--history-snapshot-file", _history_snapshot_path])
         artifact_root = _REPO_ROOT / _CANONICAL_ARTIFACT_DIR
 
         # Issue #2165 P1-1 / Issue #2207 AC8: derive and pass EXPLICIT
@@ -1480,6 +1543,13 @@ def main(argv: list[str] | None = None) -> int:
     # formula). Optional so direct/test invocations without it fall back to
     # `run_contract_readiness_check()`'s static default.
     p_attempt.add_argument("--readiness-timeout-seconds", type=int, default=None)
+    # Issue #2254 fix_delta P0 blocker 1: path to the immutable
+    # history_snapshot/v1 JSON file `_cmd_produce()` already serialized for
+    # this SAME pinned body, forwarded unchanged to
+    # run_checker_pipeline_once() -> run_contract_readiness_check().
+    # Optional so a direct/test invocation without it falls back to
+    # `run_contract_readiness_check()`'s own standalone snapshot production.
+    p_attempt.add_argument("--history-snapshot-file", default=None)
     p_attempt.set_defaults(func=_cmd_run_checker_attempt)
 
     p_classify = sub.add_parser("classify-child-stdout", help="Classify child agent raw stdout")
