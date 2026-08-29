@@ -1198,7 +1198,17 @@ STEP_4_5 = "step_4_5"
 STEP_2_5 = "step_2_5"
 STEP_4 = "step_4"
 STEP_5_HUMAN_JUDGMENT_REQUIRED = "step_5_human_judgment_required"
+STEP_5_OPERATOR_INTERVENTION_REQUIRED = "step_5_operator_intervention_required"
 FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE = "fail_closed_environment_or_integrity_failure"
+
+# Issue #2397: the ONLY `failure_class` value that redirects a
+# `needs-fix` + `request_changes` triple away from Step 4 and into
+# `STEP_5_OPERATOR_INTERVENTION_REQUIRED`. This is the exact string
+# `check_issue_contract.readiness_status_to_failure_class()` /
+# `merge_readiness_into_review_result()` already write into
+# `merged_review_result["failure_class"]` on main (no wire change
+# required to observe it here -- see Issue #2397 P0-2).
+FAILURE_CLASS_CONTRACT_READINESS_HUMAN_JUDGMENT = "contract_readiness_human_judgment"
 
 
 def route_canonical_step2_result(result: Any) -> str:
@@ -1239,7 +1249,17 @@ def route_canonical_step2_result(result: Any) -> str:
                closes: the routing table itself, not just prose telling the
                orchestrator to remember to check applicability separately.)
         status == ok + verdict == needs-fix + next_action == request_changes
-            -> Step 4 (`STEP_4`)
+            -> Step 4 (`STEP_4`) by default, UNLESS the SAME payload's
+               verified `merged_review_result.failure_class` is exactly
+               `"contract_readiness_human_judgment"` (Issue #2397), in
+               which case it routes to
+               `STEP_5_OPERATOR_INTERVENTION_REQUIRED` instead (see below).
+               This does NOT touch the compact V2 wire (`next_action`
+               stays the two-valued `proceed | request_changes` contract
+               from Issue #2054) -- `merged_review_result` is the full,
+               already-merged `REVIEW_ISSUE_RESULT_V1` payload this SAME
+               producer call places alongside `compact_result` in its own
+               stdout JSON, not a wire field.
         status == ok + verdict == needs-fix + next_action ==
             human_judgment_required (EXACT triple match only -- Issue #2389
             PR #2391 OWNER review P1-1: a loose match on `next_action` alone
@@ -1247,6 +1267,23 @@ def route_canonical_step2_result(result: Any) -> str:
             `verdict: approve` + `next_action: human_judgment_required`,
             which must fail closed instead, see below)
             -> Step 5 (`STEP_5_HUMAN_JUDGMENT_REQUIRED`)
+        status == ok + verdict == needs-fix + next_action == request_changes
+            + merged_review_result.failure_class ==
+            "contract_readiness_human_judgment" (Issue #2397 P0-1/P0-2):
+            `contract_readiness_human_judgment` marks an environment/tool/
+            timeout/unknown-classification readiness state that a Step 4
+            Issue-body rewrite cannot fix -- it is an operator-intervention
+            condition, not a genuine semantic/owner-ambiguity judgment call
+            (that is what `STEP_5_HUMAN_JUDGMENT_REQUIRED` above is for).
+            When `merged_review_result` is missing, `None`, or its
+            `failure_class` is missing/`None`, this branch falls through to
+            the ordinary `STEP_4` result unchanged (Issue #2397 AC2). When
+            `merged_review_result` is present but not a `Mapping`, or
+            `failure_class` is a non-empty string other than
+            `"contract_readiness_human_judgment"`, this fails closed instead
+            (Issue #2397 AC3) -- an unrecognized/malformed `failure_class`
+            must never be silently treated as an ordinary Step 4 rewrite.
+            -> Step 5 (`STEP_5_OPERATOR_INTERVENTION_REQUIRED`)
         status == input_or_runtime_error (Issue #2389 PR #2391 OWNER review
             P0-2: EVERY `input_or_runtime_error`, known `error_code` or not,
             is routed here -- NOT to `STEP_5_HUMAN_JUDGMENT_REQUIRED` --
@@ -1282,7 +1319,23 @@ def route_canonical_step2_result(result: Any) -> str:
     if status == "ok" and verdict == "approve" and next_action == "proceed":
         return STEP_2_5
     if status == "ok" and verdict == "needs-fix" and next_action == "request_changes":
-        return STEP_4
+        # Issue #2397: within this SAME triple, additionally consult the
+        # verified `merged_review_result.failure_class` this producer
+        # already places alongside `compact_result` in its own output.
+        # This does not touch the compact V2 wire (`next_action` stays
+        # `proceed | request_changes`); it only inspects the full merged
+        # checker result that is already part of `result`.
+        merged_review_result = result.get("merged_review_result")
+        if merged_review_result is None:
+            return STEP_4
+        if not isinstance(merged_review_result, Mapping):
+            return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+        failure_class = merged_review_result.get("failure_class")
+        if failure_class is None:
+            return STEP_4
+        if failure_class == FAILURE_CLASS_CONTRACT_READINESS_HUMAN_JUDGMENT:
+            return STEP_5_OPERATOR_INTERVENTION_REQUIRED
+        return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
     if status == "ok" and verdict == "needs-fix" and next_action == "human_judgment_required":
         return STEP_5_HUMAN_JUDGMENT_REQUIRED
     return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE

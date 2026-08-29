@@ -160,6 +160,39 @@ raw トリガー名自体も cause ではない）。summary 本文には常に�
 `TERMINATION_CAUSE: human_judgment_required` を stdout に出力する。orchestrator は
 この値を summary の termination cause として使用する。
 
+## `canonical_step2_route: step_5_operator_intervention_required` の termination payload（#2397）
+
+`run_root_review_pipeline.route_canonical_step2_result()` が
+`canonical_step2_route: step_5_operator_intervention_required` を返した場合
+（`status: ok` + `compact_result.verdict: needs-fix` +
+`compact_result.next_action: request_changes` かつ verified
+`merged_review_result.failure_class == "contract_readiness_human_judgment"`。
+上記「canonical Step 2 routing table」節参照）、orchestrator は既存の
+`step_5_human_judgment_required` handler をそのまま再利用して停止処理を行う
+（新設の別 handler は追加しない）が、以下の点で `step_5_human_judgment_required`
+と区別する:
+
+| フィールド | `step_5_human_judgment_required`（genuine semantic / owner ambiguity） | `step_5_operator_intervention_required`（#2397） |
+|---|---|---|
+| `termination_reason` | `human_escalation` | `human_escalation`（同一） |
+| `termination_cause`（summary 本文） | `human_judgment_required` | `operator_intervention_required` |
+| 意味 | Issue 本文の書き換えでは解消しない意味論的・owner 判断が必要な状態 | `env_missing_dep` / `timeout` / unknown 分類 / regression gate failure / `package_manager_no_tty_prompt` / validator timeout・internal error・JSON decode error / body retrieval failure など、Issue 本文の書き換えでは解消しない環境・tool・runtime 起因の readiness 状態（`contract_readiness_check.py` の `human_judgment` 分類、exit code 2） |
+
+`termination_cause: operator_intervention_required` は、`termination_reason:
+human_escalation` の summary 本文における cause 記述としてのみ現れる
+（`termination_reason` 自体を新設の値に変えるものではない）。
+
+**scope_signal_guard の termination_cause 正規化ルールとの独立性**: 上記
+「scope_signal_guard 停止時の termination payload 正規化」節は、
+`scope_signal_guard.triggered=true` かつ `excluded_by_anchor_reframe=false`
+というトリガー経路に対して、summary 本文の termination cause を常に
+`human_judgment_required` へ正規化するルールである。`canonical_step2_route:
+step_5_operator_intervention_required` は `route_canonical_step2_result()`
+起因の別トリガー経路であり、`scope_signal_guard` の正規化ルールの対象外
+（scope_signal_guard 側のルールを流用・適用しない）。本 route の
+termination_cause は常に `operator_intervention_required` を使用し、
+`human_judgment_required` へ正規化してはならない。
+
 ## Additional stop rules（追加の停止規則）
 
 - anchor comment fact-check が未完了のまま stale approval を使おうとした場合
