@@ -4,21 +4,27 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import ctypes
 import errno
 import hashlib
 import json
+import math
 import os
 import pwd
 import re
+import select
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Iterable, NamedTuple
 
 sys.dont_write_bytecode = True
@@ -30,7 +36,6 @@ from skill_runtime_command_policy import (
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
     ExactSkillRuntimeCommand,
-    GitSubprocessConfigProbeFailed,
     _is_safe_issue_artifact_path,
     command_allows_root_no_worktree,
     current_branch,
@@ -45,15 +50,25 @@ from skill_runtime_command_policy import (
     is_exact_skill_runtime_fixture_executor_command,
     is_exact_skill_runtime_repair_action_apply_executor_command,
     load_registry_entry,
-    parse_config_get_regexp_name_only_nul,
-    reject_git_global_options,
-    reject_insteadof_rewrite,
-    reject_option_like_positional,
     resolve_active_issue,
     resolve_default_branch,
     resolve_project_root,
     resolve_repo_slug,
     validate_registry_entry,
+    AllowedRemoteRef,
+    ControlPlanePrivateRef,
+    DetachedWorktreePath,
+    LiteralRemoteUrl,
+    RepositoryObjectFormat,
+    RepositoryObjectId,
+    make_control_plane_private_ref,
+    validate_allowed_remote_ref,
+    validate_control_plane_private_ref,
+    validate_detached_worktree_path,
+    validate_existing_detached_worktree_path,
+    validate_literal_remote_url,
+    validate_repository_object_format,
+    validate_repository_object_id,
 )
 
 
@@ -136,6 +151,8 @@ def _is_pytest_cache_cold_start_temp_path(rel_path: str) -> bool:
     normalized = rel_path.replace(os.sep, "/")
     first_segment = normalized.split("/", 1)[0]
     return first_segment.startswith(_PYTEST_CACHE_COLD_START_TEMP_DIR_PREFIX)
+
+
 # Issue #1563: `.guard_shadow_log.jsonl` (repo-root peer-append log written by
 # `.claude/hooks/shadow_log.py`, `.claude/hooks/guard-japanese-prose.sh`,
 # `.claude/hooks/rtk_boundary_shadow_guard.sh`, and `scripts/check-codex-agents.mjs`)
@@ -277,9 +294,7 @@ def _is_allowed_ancestor_transition(before_kind: str, after_kind: str) -> bool:
     return (before_kind, after_kind) in {("absent", "dir"), ("dir", "dir")}
 
 
-def _safe_ledger_ancestor_dir_rels(
-    project_root: str, ancestor_before_kinds: dict[str, str] | None = None
-) -> set[str]:
+def _safe_ledger_ancestor_dir_rels(project_root: str, ancestor_before_kinds: dict[str, str] | None = None) -> set[str]:
     """Return the subset of `_LEDGER_STABLE_ANCESTOR_DIR_RELS` whose
     before -> after kind transition is one of the two authorized ancestor
     transitions (Issue #1502 REQUEST_CHANGES Blocker 5). Postcondition-only
@@ -319,6 +334,7 @@ def _safe_ledger_ancestor_dir_rels(
         else:
             chain_safe = False
     return safe
+
 
 # Bounded quiescence window: how long the executor waits, after the child
 # process exits, for the writer's own `.lock` / `.tmp` protocol entries to be
@@ -442,11 +458,7 @@ def _wait_for_ledger_transient_quiescence(project_root: str) -> list[str]:
     deadline = time.monotonic() + _LEDGER_TRANSIENT_QUIESCENCE_TIMEOUT_SECONDS
 
     def _poll() -> list[str]:
-        return [
-            rel
-            for rel in _LEDGER_TRANSIENT_EXACT_RELS
-            if _path_kind_or_ancestor_absent(root / rel) != "absent"
-        ]
+        return [rel for rel in _LEDGER_TRANSIENT_EXACT_RELS if _path_kind_or_ancestor_absent(root / rel) != "absent"]
 
     last = _poll()
     while True:
@@ -496,9 +508,7 @@ def _allowed_artifact_root(project_root: str, issue_number: str) -> Path:
     return _allowed_artifact_roots(project_root, issue_number)[0]
 
 
-def _is_under_allowed_artifact_root(
-    project_root: str, issue_number: str, rel_path: str, command_id: str = ""
-) -> bool:
+def _is_under_allowed_artifact_root(project_root: str, issue_number: str, rel_path: str, command_id: str = "") -> bool:
     root = Path(project_root)
     target = (root / rel_path).resolve()
     return any(
@@ -653,9 +663,7 @@ def _expand_new_status_paths(
     return expanded
 
 
-def _snapshot_repo_paths(
-    project_root: str, issue_number: str, command_id: str = ""
-) -> dict[str, tuple[str, int, int]]:
+def _snapshot_repo_paths(project_root: str, issue_number: str, command_id: str = "") -> dict[str, tuple[str, int, int]]:
     root = Path(project_root)
     allowed_roots = _allowed_artifact_roots(project_root, issue_number, command_id)
     peer_roots = _race_tolerant_unattributable_roots(project_root)
@@ -698,19 +706,11 @@ def _snapshot_repo_paths(
         if current_path == root / ".git":
             dirnames[:] = []
             continue
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if (current_path / name) != root / ".git"
-        ]
+        dirnames[:] = [name for name in dirnames if (current_path / name) != root / ".git"]
         # Prune volatile peer-session roots entirely so that concurrent
         # local sessions/agents writing under them are never walked into
         # (and therefore never contribute snapshot drift for this command).
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if (current_path / name) not in peer_roots
-        ]
+        dirnames[:] = [name for name in dirnames if (current_path / name) not in peer_roots]
         # PR #2364 review P1-1: also prune a genuine repo-root-only pytest
         # cold-start temp dir (`pytest-cache-files-<random>`, see
         # `_is_pytest_cache_cold_start_temp_path` above) from this full
@@ -719,11 +719,7 @@ def _snapshot_repo_paths(
         # sibling needs its own prefix check, scoped to `current_path ==
         # root` so a nested lookalike is never pruned.
         if current_path == root:
-            dirnames[:] = [
-                name
-                for name in dirnames
-                if not _is_pytest_cache_cold_start_temp_path(name)
-            ]
+            dirnames[:] = [name for name in dirnames if not _is_pytest_cache_cold_start_temp_path(name)]
         for name in ["."] + dirnames + filenames:
             path = current_path if name == "." else current_path / name
             if path == root / ".git":
@@ -1064,11 +1060,13 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     # correctly pinned hostedtoolcache `uv` is preferred over the
     # local-dev convenience lane whenever both are present.
     if name == "uv":
-        safe_entries = _dedupe_path_entries([
-            *_trusted_toolchain_dirs("uv"),
-            *_trusted_account_home_uv_dir(),
-            *_SYSTEM_STANDARD_PATH_DIRS,
-        ])
+        safe_entries = _dedupe_path_entries(
+            [
+                *_trusted_toolchain_dirs("uv"),
+                *_trusted_account_home_uv_dir(),
+                *_SYSTEM_STANDARD_PATH_DIRS,
+            ]
+        )
     else:
         safe_entries = _safe_path_entries()
     safe_path = os.pathsep.join(safe_entries)
@@ -1093,9 +1091,7 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
             # exist -- unlike `candidates_searched`, which only ever
             # contains directories this process actually searched.
             account_home = _os_account_home()
-            recommended_install_dir = (
-                os.path.join(account_home, ".local", "bin") if account_home else None
-            )
+            recommended_install_dir = os.path.join(account_home, ".local", "bin") if account_home else None
             diagnostic_payload = {
                 "error": "uv_not_found",
                 "candidates_searched": list(safe_entries),
@@ -2005,9 +2001,7 @@ def _find_unauthorized_repo_changes(
     # before applying race-tolerant-root exclusion, so cold-start creation of
     # a race-tolerant subtree under an ignored parent is not misreported as
     # an unauthorized write to the collapsed parent itself.
-    expanded_new_status_paths = _expand_new_status_paths(
-        project_root, new_raw_status_paths, issue_number, command_id
-    )
+    expanded_new_status_paths = _expand_new_status_paths(project_root, new_raw_status_paths, issue_number, command_id)
     safe_ledger_ancestor_dir_rels = _safe_ledger_ancestor_dir_rels(project_root, ledger_ancestor_before_kinds)
     new_status_paths = {
         path
@@ -2039,11 +2033,7 @@ def _find_unauthorized_repo_changes(
         after_paths = set(after_snapshot)
         changed = sorted(
             (before_paths ^ after_paths)
-            | {
-                path
-                for path in before_paths & after_paths
-                if before_snapshot[path] != after_snapshot[path]
-            }
+            | {path for path in before_paths & after_paths if before_snapshot[path] != after_snapshot[path]}
         )
         # Issue #1502: the stable-exact ledger path is already authorized
         # above (regular -> regular content changes are expected peer
@@ -2135,14 +2125,10 @@ def _validate_stdout_artifact_projection(
     root_real = os.path.realpath(project_root)
     for raw_path in _parse_artifact_projection(stdout):
         resolved = (
-            os.path.realpath(raw_path)
-            if os.path.isabs(raw_path)
-            else os.path.realpath(Path(project_root) / raw_path)
+            os.path.realpath(raw_path) if os.path.isabs(raw_path) else os.path.realpath(Path(project_root) / raw_path)
         )
         rel_path = (
-            os.path.relpath(resolved, root_real)
-            if os.path.commonpath([root_real, resolved]) == root_real
-            else resolved
+            os.path.relpath(resolved, root_real) if os.path.commonpath([root_real, resolved]) == root_real else resolved
         )
         if not _is_under_allowed_artifact_root(project_root, issue_number, rel_path, command_id):
             failures.append(_repo_relative_path(project_root, resolved))
@@ -2229,10 +2215,7 @@ def _emit_ledger_transient_residue_failure(issue_number: int, stale_paths: list[
 # ---------------------------------------------------------------------------
 
 _POSIX_PROCESS_GROUP_SUPPORTED = (
-    os.name == "posix"
-    and hasattr(os, "killpg")
-    and hasattr(os, "setsid")
-    and hasattr(os, "getpgid")
+    os.name == "posix" and hasattr(os, "killpg") and hasattr(os, "setsid") and hasattr(os, "getpgid")
 )
 
 # Two independently bounded budgets govern outer-child supervision (Issue
@@ -2438,9 +2421,7 @@ def _stage_cleanup(
         if time.monotonic() >= cleanup_deadline:
             cleanup_status = CLEANUP_STATUS_UNCONFIRMED
         else:
-            cleanup_status = (
-                CLEANUP_STATUS_CONFIRMED_ABSENT if group_absent else CLEANUP_STATUS_UNCONFIRMED
-            )
+            cleanup_status = CLEANUP_STATUS_CONFIRMED_ABSENT if group_absent else CLEANUP_STATUS_UNCONFIRMED
     else:
         # AC8: no `killpg`/`setsid` on this platform (or no pgid to
         # supervise) -- best-effort terminate the direct child only, and
@@ -2554,7 +2535,6 @@ def _run_child_with_supervision(
         )
 
 
-
 def _emit_timeout_failure(
     issue_number: int,
     timeout_seconds: object,
@@ -2580,9 +2560,7 @@ def _emit_timeout_failure(
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    parser = argparse.ArgumentParser(
-        description="Privileged exact skill runtime executor", allow_abbrev=False
-    )
+    parser = argparse.ArgumentParser(description="Privileged exact skill runtime executor", allow_abbrev=False)
     parser.add_argument("--command-id", required=True)
     parser.add_argument("--issue-number", required=True, type=int)
     parser.add_argument("--repo", required=True)
@@ -2618,9 +2596,7 @@ def main(argv: list[str] | None = None) -> int:
     # normalized into a valid child command.
     sibling_id = "preflight.run.fixture.with_human_context"
     if sibling_id in raw_argv or f"--command-id={sibling_id}" in raw_argv:
-        raw_command = " ".join(
-            ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL, *raw_argv]
-        )
+        raw_command = " ".join(["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL, *raw_argv])
         if not is_exact_skill_runtime_anchor_fixture_executor_command(
             raw_command, resolve_project_root(), resolve_project_root()
         ):
@@ -2635,9 +2611,7 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_stale_runtime_failure(args.issue_number, stale_entries)
 
     is_fixture_command = args.command_id == "preflight.run.fixture"
-    is_fixture_human_context_command = (
-        args.command_id == "preflight.run.fixture.with_human_context"
-    )
+    is_fixture_human_context_command = args.command_id == "preflight.run.fixture.with_human_context"
     is_anchor_command = args.command_id in {
         "preflight.run.with_anchor",
         "preflight.run.with_human_context",
@@ -2683,8 +2657,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not is_decide_command and (args.authority_transport_path or args.authority_expected):
         print(
-            "skill_runtime_exec: --authority-transport-path/--authority-expected are "
-            "only allowed for decide.run",
+            "skill_runtime_exec: --authority-transport-path/--authority-expected are only allowed for decide.run",
             file=sys.stderr,
         )
         return 2
@@ -2720,22 +2693,30 @@ def main(argv: list[str] | None = None) -> int:
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
         command_tokens = [
-            "uv", "run", "python3", SKILL_RUNTIME_EXEC_REL,
-            "--command-id", args.command_id,
-            "--issue-number", str(args.issue_number),
-            "--repo", args.repo,
-            "--fixture", args.fixture,
-            "--anchor-comment-url", args.anchor_comment_url,
+            "uv",
+            "run",
+            "python3",
+            SKILL_RUNTIME_EXEC_REL,
+            "--command-id",
+            args.command_id,
+            "--issue-number",
+            str(args.issue_number),
+            "--repo",
+            args.repo,
+            "--fixture",
+            args.fixture,
+            "--anchor-comment-url",
+            args.anchor_comment_url,
         ]
         if args.investigation_evidence_transport_path:
-            command_tokens.extend([
-                "--investigation-evidence-transport-path",
-                args.investigation_evidence_transport_path,
-            ])
+            command_tokens.extend(
+                [
+                    "--investigation-evidence-transport-path",
+                    args.investigation_evidence_transport_path,
+                ]
+            )
         command_text = " ".join(command_tokens)
-        if not is_exact_skill_runtime_anchor_fixture_executor_command(
-            command_text, project_root, project_root
-        ):
+        if not is_exact_skill_runtime_anchor_fixture_executor_command(command_text, project_root, project_root):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
     elif is_fixture_command:
@@ -2848,8 +2829,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.loop_state_file or not args.review_result_verdict:
             print(
-                "skill_runtime_exec: --loop-state-file and --review-result-verdict "
-                "are required for decide.run",
+                "skill_runtime_exec: --loop-state-file and --review-result-verdict are required for decide.run",
                 file=sys.stderr,
             )
             return 2
@@ -3041,8 +3021,7 @@ def main(argv: list[str] | None = None) -> int:
             or args.max_iterations
         ):
             print(
-                "skill_runtime_exec: only --apply-repair-action is allowed for "
-                "repair_action.apply",
+                "skill_runtime_exec: only --apply-repair-action is allowed for repair_action.apply",
                 file=sys.stderr,
             )
             return 2
@@ -3062,9 +3041,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.apply_repair_action,
             ]
         )
-        if not is_exact_skill_runtime_repair_action_apply_executor_command(
-            command_text, project_root, project_root
-        ):
+        if not is_exact_skill_runtime_repair_action_apply_executor_command(command_text, project_root, project_root):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
     else:
@@ -3073,8 +3050,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.anchor_comment_url:
             print(
-                "skill_runtime_exec: --anchor-comment-url is only allowed for "
-                "an anchor-bound preflight profile",
+                "skill_runtime_exec: --anchor-comment-url is only allowed for an anchor-bound preflight profile",
                 file=sys.stderr,
             )
             return 2
@@ -3148,11 +3124,7 @@ def main(argv: list[str] | None = None) -> int:
         script_name = "workflow_start_entry.py"
     else:
         script_name = "run_refinement_preflight.py"
-    script_path = (
-        Path(project_root) / ".claude" / "skills" / "issue-refinement-loop"
-        / "scripts"
-        / script_name
-    )
+    script_path = Path(project_root) / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / script_name
     if script_path.is_symlink() or not script_path.is_file():
         raise RuntimeError("preflight_script_invalid")
 
@@ -3232,9 +3204,7 @@ def main(argv: list[str] | None = None) -> int:
         if is_anchor_command or is_contract_update_command or is_fixture_human_context_command:
             render_params["anchor_comment_url"] = args.anchor_comment_url
             if args.investigation_evidence_transport_path:
-                render_params["investigation_evidence_transport_path"] = (
-                    args.investigation_evidence_transport_path
-                )
+                render_params["investigation_evidence_transport_path"] = args.investigation_evidence_transport_path
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
 
@@ -3295,33 +3265,97 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(result.stderr)
     return result.returncode
 
+
 # ---------------------------------------------------------------------------
-# Issue #2196 (Child 1 of #2190): dedicated sanitized Git subprocess
-# execution utility. Not yet wired into any production command dispatch
-# path -- later children (#2197/#2198/#2199/#2200) are the ones that will
-# call the closed `run_control_plane_git_*` builders below for their own
-# dedicated Git subprocesses. This Issue only establishes and self-tests
-# the utility. Per PR #2201's owner adversarial review (P1-3), there is no
-# production-callsite API that accepts a raw `list[str]` argv: the only
-# entry points are the closed, typed builders at the bottom of this
-# section, each of which only accepts a fixed, validated subcommand shape.
+# Issue #2378: closed remote-default-ref Git protocol builders. A consumer can
+# express only protocol data flow; it cannot provide argv, flags, a refspec,
+# a worktree action, or a lock reason.
 # ---------------------------------------------------------------------------
 
 _GIT_SUBPROCESS_EXECUTABLE_CACHE: str | None = None
+_GIT_NO_LAZY_FETCH_CAPABILITY_CACHE: dict[str, bool] = {}
+_CONTROL_PLANE_WORKTREE_LOCK_REASON = "loop-protocol-control-plane-default-ref"
+
+# The short-lived per-invocation supervisor, never the long-lived executor
+# host, opts into PR_SET_CHILD_SUBREAPER. Consequently an orphaned Git
+# descendant is reparented only to the supervisor that spawned its Git leader;
+# the host's unrelated children cannot enter this attribution domain.
+_PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
+
+
+def _enable_linux_child_subreaper() -> bool:
+    """Enable containment in an invocation supervisor before it spawns Git.
+
+    This function is called exclusively after `_run_closed_git_process` has
+    forked its short-lived supervisor. It must never run in the long-lived
+    executor host: PR_SET_CHILD_SUBREAPER changes orphan reparenting semantics
+    for the entire calling process and would otherwise make unrelated host
+    children eligible for classification, signalling, or reaping.
+
+    The supervisor remains alive until its one Git invocation reaches a
+    confirmed terminal state, so an escaped descendant is attributable to the
+    known Git leader rather than to the host. This containment implementation
+    is deliberately Linux/WSL-only and fail-closed on other platforms; it runs
+    only in the short-lived single-threaded supervisor after `fork()`.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        prctl.restype = ctypes.c_int
+        enabled = ctypes.c_int()
+        if prctl(_PR_GET_CHILD_SUBREAPER, ctypes.addressof(enabled), 0, 0, 0) != 0:
+            return False
+        if enabled.value:
+            return True
+        if prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            return False
+        confirmed = ctypes.c_int()
+        return prctl(_PR_GET_CHILD_SUBREAPER, ctypes.addressof(confirmed), 0, 0, 0) == 0 and confirmed.value == 1
+    except (AttributeError, OSError):
+        return False
+
+
+class GitProtocolDeadlineExhausted(RuntimeError):
+    """Raised before a terminal command could consume cleanup reserve."""
+
+
+class GitProtocolTimeout(RuntimeError):
+    """Raised only after a containment backend confirms terminal cleanup."""
+
+
+class GitProtocolProcessGroupCleanupFailed(RuntimeError):
+    """Fail closed when dedicated process-group absence is not confirmed."""
+
+
+@dataclass(frozen=True)
+class GitProtocolDeadline:
+    """One monotonic deadline shared by every step in one remote protocol."""
+
+    deadline_at: float
+    cleanup_reserve_seconds: float
+
+    @classmethod
+    def start(cls, timeout_seconds: float, cleanup_reserve_seconds: float = 1.0) -> "GitProtocolDeadline":
+        timeout = _validate_deadline_value(timeout_seconds, "timeout")
+        cleanup_reserve = _validate_deadline_value(cleanup_reserve_seconds, "cleanup_reserve")
+        if timeout <= cleanup_reserve:
+            raise ValueError("git_protocol_deadline_invalid")
+        return cls(time.monotonic() + timeout, cleanup_reserve)
+
+    def execution_seconds(self) -> float:
+        deadline_at = _validate_deadline_value(self.deadline_at, "deadline_at")
+        cleanup_reserve = _validate_deadline_value(self.cleanup_reserve_seconds, "cleanup_reserve")
+        remaining = deadline_at - time.monotonic()
+        if remaining <= cleanup_reserve:
+            raise GitProtocolDeadlineExhausted("git_protocol_cleanup_reserve_required")
+        return remaining - cleanup_reserve
 
 
 def resolve_git_subprocess_executable(project_root: str) -> str:
-    """Resolve the absolute path to the trusted `git` executable exactly
-    once per process and reuse the cached value for every subsequent
-    dedicated Git subprocess invocation (Issue #2196 AC2). Resolving only
-    once (instead of re-resolving on every call, the way
-    `_resolve_child_argv`/`_resolve_trusted_executable` deliberately do for
-    `uv`/`python3` to defend against a TOCTOU venv-symlink rewrite) means a
-    PATH or symlink change made mid-session cannot silently swap which
-    `git` binary later dedicated-subprocess invocations run -- every
-    invocation within this process keeps using the exact same absolute
-    path string that was validated at first resolution.
-    """
     global _GIT_SUBPROCESS_EXECUTABLE_CACHE
     if _GIT_SUBPROCESS_EXECUTABLE_CACHE is None:
         _GIT_SUBPROCESS_EXECUTABLE_CACHE = _resolve_trusted_executable("git", project_root)
@@ -3329,57 +3363,22 @@ def resolve_git_subprocess_executable(project_root: str) -> str:
 
 
 def _reset_git_subprocess_executable_cache_for_tests() -> None:
-    """Test-only reset hook. Production code never needs to call this --
-    the whole point of AC2 is that the cache is never invalidated within a
-    process lifetime."""
     global _GIT_SUBPROCESS_EXECUTABLE_CACHE
     _GIT_SUBPROCESS_EXECUTABLE_CACHE = None
+    _GIT_NO_LAZY_FETCH_CAPABILITY_CACHE.clear()
 
 
 def _resolve_trusted_ssh_command() -> str:
-    """Resolve `GIT_SSH_COMMAND` to an absolute, trusted `ssh` executable
-    resolved only from the same trusted `PATH` allowlist used for the rest
-    of the dedicated Git subprocess environment (Issue #2196 AC7 / P1-2).
-    Never falls back to an unqualified `"ssh"` token, which would resolve
-    via whatever `PATH` the child process happened to inherit -- if no
-    trusted `ssh` executable can be found, `GIT_SSH_COMMAND` is pointed at
-    `false` (a command that always fails) instead, so an `ssh://` remote
-    can never silently succeed through an unvetted `ssh`."""
-    safe_path = os.pathsep.join(_safe_path_entries())
-    ssh_path = shutil.which("ssh", path=safe_path)
-    if ssh_path:
-        return f"{ssh_path} -oBatchMode=yes -oStrictHostKeyChecking=yes"
-    return "false"
+    ssh_path = shutil.which("ssh", path=os.pathsep.join(_safe_path_entries()))
+    return f"{ssh_path} -oBatchMode=yes -oStrictHostKeyChecking=yes" if ssh_path else "false"
 
 
 def sanitized_git_subprocess_env(project_root: str) -> dict[str, str]:
-    """Build the environment for a dedicated Git subprocess (Issue #2196
-    AC1/AC5/AC7).
-
-    Every key in `GIT_SUBPROCESS_UNSET_ENV_KEYS` is guaranteed absent from
-    the returned mapping -- built by copying `os.environ` and excluding
-    those keys, never by overwriting them with an empty string, so no
-    caller-controlled value for any of them can survive into the child
-    process. `PATH` is replaced entirely with the same trusted allowlist
-    used to resolve the `git` executable itself (never the inherited
-    `PATH`), so a poisoned `PATH` entry cannot substitute a fake Git
-    helper (e.g. `git-remote-https`) or a fake `ssh` (Issue #2196 P1-2:
-    `GIT_EXEC_PATH` alone unset is not sufficient, since Git also searches
-    `PATH` for `git-<command>` helpers). Interactive prompting, an ambient
-    credential helper, and interactive SSH are all disabled (terminal
-    prompt disabled, the two askpass-style hooks cleared, SSH forced to
-    batch mode against a trusted absolute `ssh` path) so the subprocess can
-    never block waiting on stdin or silently invoke an ambient credential
-    helper or an untrusted `ssh`.
-    """
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in GIT_SUBPROCESS_UNSET_ENV_KEYS
-    }
+    env = {key: value for key, value in os.environ.items() if key not in GIT_SUBPROCESS_UNSET_ENV_KEYS}
     env["CLAUDE_PROJECT_DIR"] = project_root
     env["PATH"] = os.pathsep.join(_safe_path_entries())
     env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_NO_LAZY_FETCH"] = "1"
     env["GIT_ASKPASS"] = ""
     env["SSH_ASKPASS"] = ""
     env["GIT_SSH_COMMAND"] = _resolve_trusted_ssh_command()
@@ -3387,332 +3386,1512 @@ def sanitized_git_subprocess_env(project_root: str) -> dict[str, str]:
 
 
 def git_subprocess_trusted_hooks_dir(scratch_root: str) -> str:
-    """Return the absolute realpath of a fresh, verified-empty,
-    per-invocation directory to pin `core.hooksPath` at for a dedicated
-    Git subprocess invocation (Issue #2196 AC3).
-
-    `scratch_root` (and every existing ancestor of it) must not be a
-    symlink -- rejected fail-closed via `_is_symlink_path`'s component-wise,
-    no-follow walk -- and must be an absolute path, so a caller cannot
-    redirect this trusted directory outside the location it appears to be
-    in. A brand-new directory is created under `scratch_root` for every
-    call (never a fixed, reused name), so no two invocations -- even
-    concurrent ones -- ever share the same trusted-empty-hooks directory,
-    and its resolved realpath is checked to equal itself (i.e. it is not
-    itself reached through a symlink) before being handed back. Git only
-    looks for hooks inside the configured `core.hooksPath`, and this
-    directory can never contain any (verified empty immediately after
-    creation), so no hook script (attacker- or accident-placed, e.g. a
-    repo-local `.git/hooks/post-checkout`) can ever fire for a dedicated
-    Git subprocess.
-    """
     scratch_path = Path(scratch_root)
-    if not scratch_path.is_absolute():
-        raise RuntimeError("git_subprocess_scratch_root_not_absolute")
-    if _is_symlink_path(scratch_path):
-        raise RuntimeError("git_subprocess_scratch_root_symlinked")
+    if not scratch_path.is_absolute() or _is_symlink_path(scratch_path):
+        raise RuntimeError("git_subprocess_scratch_root_invalid")
     scratch_path.mkdir(parents=True, exist_ok=True)
-    hooks_dir = Path(
-        tempfile.mkdtemp(prefix=".skill-runtime-git-hooks-", dir=str(scratch_path))
-    )
-    real_hooks_dir = Path(os.path.realpath(hooks_dir))
-    if real_hooks_dir != hooks_dir:
-        raise RuntimeError("git_subprocess_trusted_hooks_dir_not_realpath")
-    if any(hooks_dir.iterdir()):
-        raise RuntimeError("git_subprocess_trusted_hooks_dir_not_empty")
+    hooks_dir = Path(tempfile.mkdtemp(prefix=".skill-runtime-git-hooks-", dir=str(scratch_path)))
+    if Path(os.path.realpath(hooks_dir)) != hooks_dir or any(hooks_dir.iterdir()):
+        raise RuntimeError("git_subprocess_trusted_hooks_dir_invalid")
     return str(hooks_dir)
 
 
-def _probe_insteadof_rewrite_keys(
-    git_executable: str,
+@dataclass(frozen=True)
+class _GitOperation:
+    """Private supported operation plus typed payload, never caller argv."""
+
+    kind: str
+    remote_url: LiteralRemoteUrl | None = None
+    remote_ref: AllowedRemoteRef | None = None
+    private_ref: ControlPlanePrivateRef | None = None
+    object_id: RepositoryObjectId | None = None
+    worktree_path: DetachedWorktreePath | None = None
+
+
+_SUPPORTED_GIT_OPERATION_KINDS = frozenset(
+    {
+        "probe_rewrite",
+        "probe_no_lazy_fetch_support",
+        "probe_promisor_remote",
+        "effective_remote_url",
+        "observe_default_ref",
+        "repository_object_format",
+        "fetch_default_ref",
+        "fetch_default_ref_no_lazy",
+        "read_private_ref_oid",
+        "require_commit_object",
+        "read_worktree_head",
+        "add_detached_locked_worktree",
+        "remove_detached_locked_worktree",
+        "list_worktrees_porcelain",
+        "delete_private_ref_cas",
+    }
+)
+
+
+def _validate_deadline_value(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"git_protocol_deadline_{field}_invalid")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise ValueError(f"git_protocol_deadline_{field}_invalid")
+    return normalized
+
+
+def _revalidate_literal_remote_url(value: LiteralRemoteUrl) -> LiteralRemoteUrl:
+    if not isinstance(value, LiteralRemoteUrl):
+        raise TypeError("literal_remote_url_required")
+    return validate_literal_remote_url(value.value)
+
+
+def _revalidate_allowed_remote_ref(value: AllowedRemoteRef) -> AllowedRemoteRef:
+    if not isinstance(value, AllowedRemoteRef):
+        raise TypeError("allowed_remote_ref_required")
+    return validate_allowed_remote_ref(value.value)
+
+
+def _revalidate_private_ref(value: ControlPlanePrivateRef) -> ControlPlanePrivateRef:
+    if not isinstance(value, ControlPlanePrivateRef):
+        raise TypeError("control_plane_private_ref_required")
+    return validate_control_plane_private_ref(value.value)
+
+
+def _revalidate_object_format(value: RepositoryObjectFormat) -> RepositoryObjectFormat:
+    if not isinstance(value, RepositoryObjectFormat):
+        raise TypeError("repository_object_format_required")
+    return validate_repository_object_format(value.value)
+
+
+def _revalidate_object_id(
+    value: RepositoryObjectId, object_format: RepositoryObjectFormat | None = None
+) -> RepositoryObjectId:
+    if not isinstance(value, RepositoryObjectId):
+        raise TypeError("repository_object_id_required")
+    format_value = object_format
+    if format_value is None:
+        format_value = validate_repository_object_format("sha1" if len(value.value) == 40 else "sha256")
+    return validate_repository_object_id(value.value, _revalidate_object_format(format_value))
+
+
+def _revalidate_worktree_path(
+    value: DetachedWorktreePath, project_root: str, *, require_fresh: bool
+) -> DetachedWorktreePath:
+    if not isinstance(value, DetachedWorktreePath):
+        raise TypeError("detached_worktree_path_required")
+    validator = validate_detached_worktree_path if require_fresh else validate_existing_detached_worktree_path
+    return validator(value.value, project_root)
+
+
+def _revalidate_semantic_operation(operation: _GitOperation, project_root: str) -> _GitOperation:
+    """Revalidate path-bearing internal operations before even the rewrite probe.
+
+    `_GitOperation` is private, but it remains a trust boundary: a forged
+    `DetachedWorktreePath` must not turn into argv merely because it carries
+    the right runtime type.
+    """
+    if not isinstance(operation, _GitOperation):
+        raise TypeError("git_operation_required")
+    if operation.kind not in _SUPPORTED_GIT_OPERATION_KINDS:
+        raise ValueError("git_operation_not_supported")
+    if operation.kind == "add_detached_locked_worktree":
+        return _GitOperation(
+            operation.kind,
+            object_id=operation.object_id,
+            worktree_path=_revalidate_worktree_path(operation.worktree_path, project_root, require_fresh=True),
+        )
+    if operation.kind == "remove_detached_locked_worktree":
+        return _GitOperation(
+            operation.kind,
+            worktree_path=_revalidate_worktree_path(operation.worktree_path, project_root, require_fresh=False),
+        )
+    # `fetch_default_ref_no_lazy` is internally synthesized only after the
+    # trusted executable passed the fixed capability probe. Rebuild every
+    # payload-bearing operation so a forged dataclass cannot smuggle state.
+    if operation.kind in {"fetch_default_ref", "fetch_default_ref_no_lazy"}:
+        return _GitOperation(
+            "fetch_default_ref",
+            remote_url=operation.remote_url,
+            remote_ref=operation.remote_ref,
+            private_ref=operation.private_ref,
+        )
+    return operation
+
+
+@dataclass(frozen=True)
+class _TrackedGitDescendant:
+    """A Linux process identity observed beneath a dedicated Git leader."""
+
+    pid: int
+    start_time: str
+
+
+def _linux_process_identity(pid: int) -> tuple[int, int, str] | None:
+    """Read `(pid, parent_pid, start_time)` without trusting a reused PID."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    _prefix, separator, suffix = stat.rpartition(")")
+    fields = suffix.split()
+    if not separator or len(fields) < 20:
+        return None
+    try:
+        return (pid, int(fields[1]), fields[19])
+    except ValueError:
+        return None
+
+
+def _observe_git_descendants(leader_pid: int) -> set[_TrackedGitDescendant] | None:
+    """Observe the live descendant tree before a child can escape its group.
+
+    A descendant may call `setsid()` and leave the group created by
+    `start_new_session`. Linux `/proc` parent links are an advisory snapshot
+    only: an escaped child can fork a delayed descendant and exit between two
+    observations. Callers must therefore never use a snapshot as proof that
+    all descendants are absent; terminal cleanup remains fail-closed.
+    """
+    proc_root = Path("/proc")
+    if not sys.platform.startswith("linux") or not proc_root.is_dir():
+        return None
+    records: dict[int, tuple[int, str]] = {}
+    try:
+        proc_entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in proc_entries:
+        if not entry.name.isdecimal():
+            continue
+        identity = _linux_process_identity(int(entry.name))
+        if identity is not None:
+            pid, parent_pid, start_time = identity
+            records[pid] = (parent_pid, start_time)
+    descendants: set[_TrackedGitDescendant] = set()
+    frontier = {leader_pid}
+    while frontier:
+        parent_pid = frontier.pop()
+        children = {
+            pid: start_time
+            for pid, (record_parent_pid, start_time) in records.items()
+            if record_parent_pid == parent_pid
+        }
+        frontier.update(children)
+        descendants.update(_TrackedGitDescendant(pid, start_time) for pid, start_time in children.items())
+    return descendants
+
+
+def _tracked_descendants_absent(descendants: set[_TrackedGitDescendant]) -> bool:
+    return all(
+        (identity := _linux_process_identity(descendant.pid)) is None or identity[2] != descendant.start_time
+        for descendant in descendants
+    )
+
+
+def _observe_invocation_supervisor_children() -> set[_TrackedGitDescendant] | None:
+    """Return live children adopted by this one-invocation supervisor.
+
+    This is deliberately distinct from `_observe_git_descendants`: a readable
+    tree snapshot rooted at the Git leader is only advisory. Once that leader
+    is reaped, the supervisor's PR_SET_CHILD_SUBREAPER gives an empty
+    direct-child set a kernel-parentage meaning: no live orphaned descendant
+    of that Git leader remains. The supervisor spawned no other child, and an
+    unreadable `/proc` result is never interpreted as that proof.
+    """
+    proc_root = Path("/proc")
+    if not sys.platform.startswith("linux") or not proc_root.is_dir():
+        return None
+    parent_pid = os.getpid()
+    children: set[_TrackedGitDescendant] = set()
+    try:
+        proc_entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in proc_entries:
+        if not entry.name.isdecimal():
+            continue
+        identity = _linux_process_identity(int(entry.name))
+        if identity is not None and identity[1] == parent_pid:
+            children.add(_TrackedGitDescendant(identity[0], identity[2]))
+    return children
+
+
+def _observe_descendants_of(parent_pids: set[int]) -> set[_TrackedGitDescendant] | None:
+    """Return the complete current tree below known Linux parent PIDs."""
+    proc_root = Path("/proc")
+    if not sys.platform.startswith("linux") or not proc_root.is_dir():
+        return None
+    records: dict[int, tuple[int, str]] = {}
+    try:
+        proc_entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in proc_entries:
+        if not entry.name.isdecimal():
+            continue
+        identity = _linux_process_identity(int(entry.name))
+        if identity is not None:
+            records[identity[0]] = (identity[1], identity[2])
+    descendants: set[_TrackedGitDescendant] = set()
+    frontier = set(parent_pids)
+    while frontier:
+        parent_pid = frontier.pop()
+        children = {
+            pid: start_time
+            for pid, (record_parent_pid, start_time) in records.items()
+            if record_parent_pid == parent_pid
+        }
+        frontier.update(children)
+        descendants.update(_TrackedGitDescendant(pid, start_time) for pid, start_time in children.items())
+    return descendants
+
+
+def _signal_invocation_child_trees(children: set[_TrackedGitDescendant], signal_number: int) -> bool:
+    descendants = _observe_descendants_of({child.pid for child in children})
+    if descendants is None:
+        return False
+    return _signal_tracked_descendants(children | descendants, signal_number)
+
+
+def _reap_tracked_children(children: set[_TrackedGitDescendant]) -> bool:
+    """Reap only verified direct subreaper children; never a reused PID."""
+    for child in children:
+        identity = _linux_process_identity(child.pid)
+        if identity is None or identity[2] != child.start_time:
+            continue
+        try:
+            os.waitpid(child.pid, os.WNOHANG)
+        except ChildProcessError:
+            # It was reaped by a concurrent wait; it is no longer a leak.
+            continue
+        except OSError:
+            return False
+    return True
+
+
+def _terminate_invocation_supervisor_children(deadline: GitProtocolDeadline) -> bool:
+    """Drain Git descendants adopted by this invocation supervisor only.
+
+    A direct child of the supervisor may itself fork after SIGTERM. Repeating
+    discovery is not used as a timing heuristic: its parentage is still within
+    the known Git invocation. No host child can be seen by this process.
+    """
+    term_until = min(deadline.deadline_at, time.monotonic() + max(0.01, deadline.cleanup_reserve_seconds / 2))
+    for signal_number, phase_deadline in ((signal.SIGTERM, term_until), (signal.SIGKILL, deadline.deadline_at)):
+        while time.monotonic() < phase_deadline:
+            children = _observe_invocation_supervisor_children()
+            if children is None:
+                return False
+            if not children:
+                return True
+            if not _signal_invocation_child_trees(children, signal_number):
+                return False
+            if not _reap_tracked_children(children):
+                return False
+            time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+    children = _observe_invocation_supervisor_children()
+    if children is None:
+        return False
+    if children and not _signal_invocation_child_trees(children, signal.SIGKILL):
+        return False
+    if children and not _reap_tracked_children(children):
+        return False
+    final_children = _observe_invocation_supervisor_children()
+    return final_children is not None and not final_children
+
+
+def _signal_tracked_descendants(descendants: set[_TrackedGitDescendant], signal_number: int) -> bool:
+    """Signal only descendants whose PID identity still matches observation."""
+    for descendant in descendants:
+        identity = _linux_process_identity(descendant.pid)
+        if identity is None or identity[2] != descendant.start_time:
+            continue
+        try:
+            os.kill(descendant.pid, signal_number)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            return False
+    return True
+
+
+def _terminate_git_process_group(
+    proc: subprocess.Popen,
+    pgid: int | None,
+    deadline: GitProtocolDeadline,
+    descendants: set[_TrackedGitDescendant] | None,
+) -> bool:
+    """Bounded cleanup with supervisor-scoped containment confirmation.
+
+    The caller is the invocation supervisor. Its subreaper domain contains
+    only the Git leader it spawned and descendants subsequently orphaned from
+    that leader, never a child of the long-lived executor host.
+    """
+    if not _POSIX_PROCESS_GROUP_SUPPORTED or pgid is None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=max(0.0, deadline.deadline_at - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=max(0.0, deadline.deadline_at - time.monotonic()))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return False
+
+    if descendants is None:
+        # Observation itself failed after Popen. We cannot confirm containment,
+        # but the known dedicated group must still receive bounded TERM/KILL.
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return False
+        term_until = min(deadline.deadline_at, time.monotonic() + max(0.01, deadline.cleanup_reserve_seconds / 2))
+        while time.monotonic() < term_until:
+            if _verify_process_group_absent(pgid):
+                try:
+                    proc.wait(timeout=0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                _terminate_invocation_supervisor_children(deadline)
+                return False
+            time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return False
+        while time.monotonic() < deadline.deadline_at:
+            if _verify_process_group_absent(pgid):
+                try:
+                    proc.wait(timeout=0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                _terminate_invocation_supervisor_children(deadline)
+                return False
+            time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+        _terminate_invocation_supervisor_children(deadline)
+        return False
+
+    def confirmed_absence() -> bool:
+        children = _observe_invocation_supervisor_children()
+        if children is None:
+            return False
+        if children:
+            # An escaped descendant was observed in the isolated supervisor.
+            # Reap it, but do not promote an escape into successful cleanup.
+            _terminate_invocation_supervisor_children(deadline)
+            return False
+        return True
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return False
+    if not _signal_tracked_descendants(descendants, signal.SIGTERM):
+        return False
+    term_until = min(deadline.deadline_at, time.monotonic() + max(0.01, deadline.cleanup_reserve_seconds / 2))
+    while time.monotonic() < term_until:
+        proc.poll()
+        if _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants):
+            try:
+                proc.wait(timeout=0)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            return confirmed_absence()
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return False
+    if not _signal_tracked_descendants(descendants, signal.SIGKILL):
+        return False
+    while time.monotonic() < deadline.deadline_at:
+        proc.poll()
+        if _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants):
+            try:
+                proc.wait(timeout=0)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            return confirmed_absence()
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+    # Ensure only invocation-attributable adopted children are not left as
+    # zombies, even though final confirmation has failed.
+    _terminate_invocation_supervisor_children(deadline)
+    return False
+
+
+def _operation_arguments(operation: _GitOperation, *, cwd: str) -> list[str]:
+    """Construct exact argv only from a supported operation and typed payload."""
+    if not isinstance(operation, _GitOperation) or operation.kind not in _SUPPORTED_GIT_OPERATION_KINDS:
+        raise ValueError("git_operation_not_supported")
+    if operation.kind == "probe_rewrite":
+        return ["-C", cwd, "config", "--get-regexp", "--name-only", "-z", INSTEADOF_CONFIG_NAME_REGEXP]
+    if operation.kind == "probe_no_lazy_fetch_support":
+        return ["--version"]
+    if operation.kind == "probe_promisor_remote":
+        return ["config", "--local", "--get-regexp", r"^remote\..*\.promisor$"]
+    if operation.kind == "effective_remote_url":
+        remote_url = _revalidate_literal_remote_url(operation.remote_url)
+        return ["ls-remote", "--get-url", remote_url.value]
+    if operation.kind == "observe_default_ref":
+        remote_url = _revalidate_literal_remote_url(operation.remote_url)
+        return ["ls-remote", "--exit-code", "--symref", remote_url.value, "HEAD"]
+    if operation.kind == "repository_object_format":
+        return ["rev-parse", "--show-object-format"]
+    if operation.kind in {"fetch_default_ref", "fetch_default_ref_no_lazy"}:
+        remote_url = _revalidate_literal_remote_url(operation.remote_url)
+        remote_ref = _revalidate_allowed_remote_ref(operation.remote_ref)
+        private_ref = _revalidate_private_ref(operation.private_ref)
+        return [
+            "fetch",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--no-write-fetch-head",
+            remote_url.value,
+            f"{remote_ref.value}:{private_ref.value}",
+        ]
+    if operation.kind == "read_private_ref_oid":
+        private_ref = _revalidate_private_ref(operation.private_ref)
+        return ["rev-parse", "--verify", "--quiet", private_ref.value]
+    if operation.kind == "require_commit_object":
+        object_id = _revalidate_object_id(operation.object_id)
+        return ["cat-file", "-e", object_id.value + "^{commit}"]
+    if operation.kind == "read_worktree_head":
+        return ["rev-parse", "--verify", "HEAD"]
+    if operation.kind == "add_detached_locked_worktree":
+        path = operation.worktree_path
+        object_id = _revalidate_object_id(operation.object_id)
+        if not isinstance(path, DetachedWorktreePath):
+            raise TypeError("detached_worktree_path_required")
+        return [
+            "worktree",
+            "add",
+            "--detach",
+            "--lock",
+            "--reason",
+            _CONTROL_PLANE_WORKTREE_LOCK_REASON,
+            path.value,
+            object_id.value,
+        ]
+    if operation.kind == "remove_detached_locked_worktree":
+        path = operation.worktree_path
+        if not isinstance(path, DetachedWorktreePath):
+            raise TypeError("detached_worktree_path_required")
+        return ["worktree", "remove", "--force", "--force", path.value]
+    if operation.kind == "list_worktrees_porcelain":
+        return ["worktree", "list", "--porcelain"]
+    if operation.kind == "delete_private_ref_cas":
+        private_ref = _revalidate_private_ref(operation.private_ref)
+        object_id = _revalidate_object_id(operation.object_id)
+        return ["update-ref", "-d", private_ref.value, object_id.value]
+    raise AssertionError("unreachable_supported_operation")
+
+
+def _exact_git_argv(operation: _GitOperation, *, git_executable: str, cwd: str, hooks_dir: str) -> list[str]:
+    no_lazy_fetch = ("--no-lazy-fetch",) if operation.kind in {
+        "probe_no_lazy_fetch_support",
+        "fetch_default_ref_no_lazy",
+    } else ()
+    return [
+        git_executable,
+        "--no-replace-objects",
+        "-c",
+        "core.hooksPath=" + hooks_dir,
+        "-c",
+        "credential.helper=",
+        *no_lazy_fetch,
+        *_operation_arguments(operation, cwd=cwd),
+    ]
+
+
+_INVOCATION_SUPERVISOR_MAX_RESULT_BYTES = 32 * 1024 * 1024
+_INVOCATION_SUPERVISOR_READY = b"R"
+_INVOCATION_SUPERVISOR_CLEANUP_ABSENT = b"A"
+_INVOCATION_SUPERVISOR_CLEANUP_UNCONFIRMED = b"U"
+
+
+class _InvocationSupervisorCleanupRequested(BaseException):
+    """Ask the isolated supervisor to clean its Git-only child tree."""
+
+
+def _request_invocation_supervisor_cleanup(_signum: int, _frame: object) -> None:
+    raise _InvocationSupervisorCleanupRequested()
+
+
+def _record_git_descendant_observation(
+    proc: subprocess.Popen, descendants: set[_TrackedGitDescendant] | None
+) -> set[_TrackedGitDescendant] | None:
+    """Merge an advisory observation without letting its failure skip cleanup."""
+    try:
+        observed = _observe_git_descendants(proc.pid)
+    except BaseException:
+        return None
+    if descendants is None or observed is None:
+        return None
+    descendants.update(observed)
+    return descendants
+
+
+def _drain_invocation_children_after_leader_exit(pgid: int, deadline: GitProtocolDeadline) -> str:
+    """Classify only supervisor-adopted Git children after leader exit.
+
+    A helper in the original dedicated Git session is an ordinary Git
+    descendant completing shutdown, even when a non-interactive shell gives it
+    another process group. An adopted child in another session escaped that
+    containment and remains a fail-closed leak. Both cases are observed solely
+    inside the short-lived invocation supervisor.
+    """
+    # start_new_session=True makes the leader PID both session and process
+    # group ID; retain that numeric session identity after the leader is reaped.
+    leader_session_id = pgid
+    drain_until = min(deadline.deadline_at, time.monotonic() + max(0.01, deadline.cleanup_reserve_seconds / 2))
+    while time.monotonic() < drain_until:
+        children = _observe_invocation_supervisor_children()
+        if children is None:
+            return "unconfirmed"
+        if not children:
+            return "absent"
+        for child in children:
+            identity = _linux_process_identity(child.pid)
+            if identity is None or identity[2] != child.start_time:
+                continue
+            try:
+                if os.getsid(child.pid) != leader_session_id:
+                    if not _terminate_invocation_supervisor_children(deadline):
+                        return "unconfirmed"
+                    # It is still a Git-derived child in this isolated
+                    # supervisor. Confirmed cleanup is sufficient; do not
+                    # reclassify it as a host child or leave it running.
+                    return "absent"
+            except OSError:
+                return "unconfirmed"
+        if not _reap_tracked_children(children):
+            return "unconfirmed"
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+    children = _observe_invocation_supervisor_children()
+    if children is None:
+        return "unconfirmed"
+    if not children:
+        return "absent"
+    if not _terminate_invocation_supervisor_children(deadline):
+        return "unconfirmed"
+    return "absent"
+
+
+def _run_closed_git_process_in_invocation_supervisor(
+    operation: _GitOperation,
     *,
+    git_executable: str,
     cwd: str,
     env: dict[str, str],
     hooks_dir: str,
-    timeout: float,
-) -> list[str]:
-    """Run the structured, name-only, NUL-delimited, regexp-limited
-    `insteadOf`/`pushInsteadOf` config probe (Issue #2196 AC4/AC6/AC9 /
-    P1-1/P1-4/P1-5), using the exact same `git_executable`, `env`, and
-    `-c core.hooksPath=`/`-c credential.helper=`/`--no-replace-objects`
-    global options as the real command that follows it, so the probe and
-    the real command are provably bound to identical config authority
-    (P1-1: this is what makes a `GIT_CONFIG`-style split-execution attack
-    structurally impossible here -- `GIT_CONFIG` itself is already unset
-    for both, and both read config through the same argv/env/cwd shape).
-
-    Returns the list of matched `url.<base>.(insteadOf|pushInsteadOf)`
-    config key names (empty if none). Raises
-    `GitSubprocessConfigProbeFailed` for any outcome other than "the probe
-    positively established zero matches" -- a timeout, an OS-level
-    transport error, a decode failure, or a nonzero exit accompanied by
-    stderr output are all treated as "could not be evaluated", never as
-    "no rewrite exists" (P1-5).
-    """
-    argv = [
-        git_executable,
-        "--no-replace-objects",
-        "-c",
-        "core.hooksPath=" + hooks_dir,
-        "-c",
-        "credential.helper=",
-        "-C",
-        cwd,
-        "config",
-        "--get-regexp",
-        "--name-only",
-        "-z",
-        INSTEADOF_CONFIG_NAME_REGEXP,
-    ]
-    try:
-        probe = subprocess.run(
-            argv,
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GitSubprocessConfigProbeFailed("probe_timeout") from exc
-    except OSError as exc:
-        raise GitSubprocessConfigProbeFailed(f"probe_os_error:{exc}") from exc
-
-    if probe.returncode == 0:
-        return parse_config_get_regexp_name_only_nul(probe.stdout)
-    if probe.returncode == 1:
-        # `git config --get-regexp` exits 1 when no key matches the given
-        # regexp -- but only when that is genuinely the reason: a nonzero
-        # exit accompanied by stderr output means something else went
-        # wrong (a config syntax error, a bad `include`, a permission
-        # error, ...), which must not be silently treated as "no match".
-        stderr_text = probe.stderr.decode("utf-8", errors="replace") if probe.stderr else ""
-        if stderr_text.strip() == "":
-            return []
-        raise GitSubprocessConfigProbeFailed(
-            f"probe_nonzero_exit_with_stderr:{stderr_text.strip()!r}"
-        )
-    raise GitSubprocessConfigProbeFailed(f"probe_nonzero_exit:{probe.returncode}")
-
-
-def _run_sanitized_git_subprocess(
-    argv: list[str],
-    *,
-    cwd: str,
-    project_root: str,
-    scratch_root: str | None = None,
-    timeout: float,
+    deadline: GitProtocolDeadline,
 ) -> subprocess.CompletedProcess:
-    """Internal engine for a dedicated, sanitized Git subprocess (Issue
-    #2196). Private (leading underscore): the only production callers are
-    the closed `run_control_plane_git_*` builders below, each of which
-    constructs `argv` itself from validated, structured parameters -- this
-    function is never exposed as a raw-argv production API (P1-3).
+    """Run one Git command inside its short-lived subreaper supervisor."""
+    if not _enable_linux_child_subreaper():
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_containment_unavailable")
+    argv = _exact_git_argv(operation, git_executable=git_executable, cwd=cwd, hooks_dir=hooks_dir)
+    kwargs: dict[str, object] = {
+        "cwd": cwd,
+        "env": env,
+        "shell": False,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": operation.kind != "probe_rewrite",
+    }
+    posix_supervised = _POSIX_PROCESS_GROUP_SUPPORTED
+    if posix_supervised:
+        kwargs["start_new_session"] = True
+    proc: subprocess.Popen | None = None
+    pgid: int | None = None
+    descendants: set[_TrackedGitDescendant] | None = set() if posix_supervised else None
+    try:
+        proc = subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
+        pgid = proc.pid if posix_supervised else None
+        # This initial observation is deliberately inside the guarded region:
+        # observer failures occur after Popen and therefore require bounded
+        # cleanup just like communicate(), poll(), and timeout failures.
+        if posix_supervised:
+            descendants = _record_git_descendant_observation(proc, descendants)
+        while True:
+            if posix_supervised:
+                descendants = _record_git_descendant_observation(proc, descendants)
+            try:
+                stdout, stderr = proc.communicate(
+                    timeout=min(_GROUP_POLL_INTERVAL_SECONDS, deadline.execution_seconds())
+                )
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except GitProtocolDeadlineExhausted as exc:
+        if proc is None or not _terminate_git_process_group(proc, pgid, deadline, descendants):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
+        raise GitProtocolTimeout("git_process_timeout") from exc
+    except BaseException as exc:
+        if proc is None or not _terminate_git_process_group(proc, pgid, deadline, descendants):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
+        raise
 
-    `argv` is the Git subcommand and its arguments, WITHOUT the leading
-    `git` executable name (e.g. `["status", "--short"]`) and WITHOUT any
-    Git global option (rejected via `reject_git_global_options`, P1-3).
-    This function:
+    # A non-success result is terminal, except the documented no-match result
+    # of the rewrite probe. Cleanup remains mandatory before its result leaves
+    # this supervisor.
+    if proc.returncode != 0 and not (operation.kind == "probe_rewrite" and proc.returncode == 1):
+        if not _terminate_git_process_group(proc, pgid, deadline, descendants):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    if posix_supervised and descendants is None:
+        _terminate_git_process_group(proc, pgid, deadline, descendants)
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
 
-    1. Resolves (once, cached -- AC2) the absolute trusted `git`
-       executable.
-    2. Builds the sanitized environment (AC1/AC5/AC7): GIT_* variables in
-       `GIT_SUBPROCESS_UNSET_ENV_KEYS` are unset, `PATH` is a trusted
-       allowlist, interactive prompting/credential helper/SSH prompting
-       are disabled.
-    3. Fixes `core.hooksPath` at a fresh, verified-empty, per-invocation
-       trusted directory (AC3) via a config override applied identically
-       to both the probe and the real command invocation, and
-       additionally disables any ambient credential helper the same way.
-    4. Fail-closed rejects the invocation before the real command runs if
-       `cwd`'s effective Git configuration declares any
-       `url.<base>.insteadOf`/`pushInsteadOf` rewrite (AC4/AC6), using a
-       structured, name-only, NUL-delimited probe bound to identical
-       config authority as the real command (P1-1/P1-4), and fails closed
-       (rather than proceeding) if that probe itself could not be
-       positively evaluated (AC9/P1-5).
-    5. Applies `--no-replace-objects` as a fixed global option on every
-       invocation (AC11), defaults `stdin=subprocess.DEVNULL` and requires
-       a bounded `timeout` (AC10/P2-2).
+    # communicate() has reaped the direct Git leader. The invocation
+    # supervisor may still have adopted a normal helper in that leader's
+    # process group; drain it without widening attribution to any host child.
+    if not posix_supervised or pgid is None:
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    drain_result = _drain_invocation_children_after_leader_exit(pgid, deadline)
+    if drain_result == "unconfirmed":
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    if drain_result != "absent":
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_descendant_leak")
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
-    Raises `GitSubprocessRewriteRejected` for step 4's rewrite rejection,
-    `GitSubprocessConfigProbeFailed` for step 4's probe-failure rejection.
-    Any other precondition failure (e.g. an unexpected leading `git` token
-    or embedded global option in `argv`, a non-bounded `timeout`, or a
-    non-empty trusted hooks directory) raises `ValueError` / `RuntimeError`
-    before any subprocess is spawned.
+
+def _encode_invocation_supervisor_stream(value: str | bytes | None) -> dict[str, object]:
+    if isinstance(value, str):
+        raw = value.encode("utf-8")
+        text = True
+    elif isinstance(value, bytes):
+        raw = value
+        text = False
+    else:
+        raw = b""
+        text = True
+    return {"text": text, "data": base64.b64encode(raw).decode("ascii")}
+
+
+def _decode_invocation_supervisor_stream(value: object) -> str | bytes | None:
+    if not isinstance(value, dict) or not isinstance(value.get("text"), bool) or not isinstance(value.get("data"), str):
+        raise ValueError("invalid_invocation_supervisor_stream")
+    raw = base64.b64decode(value["data"], validate=True)
+    return raw.decode("utf-8") if value["text"] else raw
+
+
+def _write_invocation_supervisor_result(write_fd: int, outcome: dict[str, object]) -> None:
+    """Send one bounded JSON frame over a private parent/supervisor pipe."""
+    try:
+        payload = json.dumps(outcome, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if len(payload) > _INVOCATION_SUPERVISOR_MAX_RESULT_BYTES:
+            return
+        frame = struct.pack("!Q", len(payload)) + payload
+        sent = 0
+        while sent < len(frame):
+            sent += os.write(write_fd, frame[sent:])
+    except (OSError, TypeError, ValueError):
+        return
+
+
+def _supervisor_cleanup_deadline(deadline: GitProtocolDeadline) -> GitProtocolDeadline:
+    """Reserve a bounded post-interruption window for the Git-only handshake."""
+    return GitProtocolDeadline(
+        deadline_at=max(
+            deadline.deadline_at,
+            time.monotonic() + max(0.1, deadline.cleanup_reserve_seconds),
+        ),
+        cleanup_reserve_seconds=deadline.cleanup_reserve_seconds,
+    )
+
+
+def _write_invocation_supervisor_cleanup_status(write_fd: int, status: bytes) -> None:
+    try:
+        os.write(write_fd, status)
+    except OSError:
+        pass
+
+
+def _invocation_supervisor_main(
+    write_fd: int,
+    ready_write_fd: int,
+    cleanup_write_fd: int,
+    operation: _GitOperation,
+    *,
+    git_executable: str,
+    cwd: str,
+    env: dict[str, str],
+    hooks_dir: str,
+    deadline: GitProtocolDeadline,
+) -> None:
+    """Execute one Git operation and certify Git-only cleanup before exit."""
+    handler_installed = False
+    try:
+        # The parent waits for this byte before it can interrupt result reading.
+        # Therefore a parent-requested SIGTERM cannot arrive before this handler
+        # converts it into the normal, bounded Git cleanup path.
+        signal.signal(signal.SIGTERM, _request_invocation_supervisor_cleanup)
+        handler_installed = True
+        _write_invocation_supervisor_cleanup_status(ready_write_fd, _INVOCATION_SUPERVISOR_READY)
+        try:
+            completed = _run_closed_git_process_in_invocation_supervisor(
+                operation,
+                git_executable=git_executable,
+                cwd=cwd,
+                env=env,
+                hooks_dir=hooks_dir,
+                deadline=deadline,
+            )
+            outcome: dict[str, object] = {
+                "kind": "completed",
+                "argv": completed.args,
+                "returncode": completed.returncode,
+                "stdout": _encode_invocation_supervisor_stream(completed.stdout),
+                "stderr": _encode_invocation_supervisor_stream(completed.stderr),
+            }
+        except BaseException as exc:
+            outcome = {"kind": "raised", "type": type(exc).__name__, "message": str(exc)}
+        _write_invocation_supervisor_result(write_fd, outcome)
+    except BaseException as exc:
+        # A signal during result serialization still reaches the final cleanup
+        # handshake. Its result is deliberately not trusted by the parent.
+        _write_invocation_supervisor_result(
+            write_fd, {"kind": "raised", "type": type(exc).__name__, "message": str(exc)}
+        )
+    finally:
+        if handler_installed:
+            try:
+                # Once cancellation has been accepted, do not permit a second
+                # SIGTERM to interrupt the cleanup proof.
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            except (OSError, ValueError):
+                pass
+        cleanup_confirmed = _terminate_invocation_supervisor_children(_supervisor_cleanup_deadline(deadline))
+        _write_invocation_supervisor_cleanup_status(
+            cleanup_write_fd,
+            _INVOCATION_SUPERVISOR_CLEANUP_ABSENT
+            if cleanup_confirmed
+            else _INVOCATION_SUPERVISOR_CLEANUP_UNCONFIRMED,
+        )
+        for fd in (write_fd, ready_write_fd, cleanup_write_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        os._exit(0 if cleanup_confirmed else 1)
+
+
+def _read_invocation_supervisor_cleanup_status(
+    read_fd: int, deadline_at: float, *, expected: bytes
+) -> bool:
+    """Read one bounded supervisor-only handshake byte and close its pipe."""
+    try:
+        while time.monotonic() < deadline_at:
+            readable, _writable, _exceptional = select.select(
+                [read_fd], [], [], min(_GROUP_POLL_INTERVAL_SECONDS, deadline_at - time.monotonic())
+            )
+            if not readable:
+                continue
+            return os.read(read_fd, 1) == expected
+        return False
+    except (OSError, ValueError):
+        return False
+    finally:
+        try:
+            os.close(read_fd)
+        except OSError:
+            pass
+
+
+def _wait_for_invocation_supervisor_reap(supervisor_pid: int, deadline_at: float) -> bool:
+    """Reap only the known direct supervisor, never a host process."""
+    while time.monotonic() < deadline_at:
+        try:
+            waited_pid, _status = os.waitpid(supervisor_pid, os.WNOHANG)
+        except ChildProcessError:
+            # SIGCHLD may be configured for automatic reaping. The cleanup
+            # pipe is still bound to the original supervisor, so it remains a
+            # valid absence certificate without any PID-directed action.
+            return True
+        except OSError:
+            return False
+        if waited_pid == supervisor_pid:
+            return True
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+    return False
+
+
+def _stop_invocation_supervisor(supervisor_pid: int) -> None:
+    """Last-resort SIGKILL of a still-known direct supervisor only."""
+    try:
+        waited_pid, _status = os.waitpid(supervisor_pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return
+    if waited_pid == supervisor_pid:
+        return
+    try:
+        os.kill(supervisor_pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        os.waitpid(supervisor_pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def _cleanup_interrupted_invocation_supervisor(
+    supervisor_pid: int, cleanup_read_fd: int, deadline: GitProtocolDeadline
+) -> bool:
+    """Request and verify bounded Git-only cleanup before propagating failure.
+
+    The parent can signal and reap exactly its known one-invocation supervisor.
+    It never scans, signals, or reaps a host child. The supervisor's subreaper
+    acknowledgement is accepted only after its direct-child set proves the Git
+    leader and every escaped descendant absent.
     """
-    if not argv or argv[0] == "git":
-        raise ValueError("argv_must_not_include_executable_name")
-    if timeout is None or timeout <= 0:
-        raise ValueError("timeout_required_bounded")
-    reject_git_global_options(argv)
+    # The supervisor may first spend its ordinary reserved cleanup phase
+    # terminating the leader and then run the final subreaper absence proof.
+    # Keep the parent handshake bounded while allowing both Git-only phases.
+    cleanup_deadline_at = max(
+        deadline.deadline_at,
+        time.monotonic() + max(0.1, deadline.cleanup_reserve_seconds) * 3,
+    )
+    try:
+        waited_pid, _status = os.waitpid(supervisor_pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        try:
+            os.close(cleanup_read_fd)
+        except OSError:
+            pass
+        return False
+    supervisor_reaped = waited_pid == supervisor_pid
+    if not supervisor_reaped:
+        try:
+            os.kill(supervisor_pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            try:
+                os.close(cleanup_read_fd)
+            except OSError:
+                pass
+            return False
+    cleanup_absent = _read_invocation_supervisor_cleanup_status(
+        cleanup_read_fd, cleanup_deadline_at, expected=_INVOCATION_SUPERVISOR_CLEANUP_ABSENT
+    )
+    if cleanup_absent and (
+        supervisor_reaped or _wait_for_invocation_supervisor_reap(supervisor_pid, cleanup_deadline_at)
+    ):
+        return True
+    _stop_invocation_supervisor(supervisor_pid)
+    return False
 
-    git_executable = resolve_git_subprocess_executable(project_root)
-    env = sanitized_git_subprocess_env(project_root)
-    hooks_dir = git_subprocess_trusted_hooks_dir(scratch_root or project_root)
 
-    matched_keys = _probe_insteadof_rewrite_keys(
-        git_executable,
+def _read_invocation_supervisor_result(
+    read_fd: int, supervisor_pid: int, deadline: GitProtocolDeadline
+) -> dict[str, object] | None:
+    """Read a bounded result while retaining a deadline for supervisor cleanup."""
+    data = bytearray()
+    result_deadline_at = deadline.deadline_at + max(0.1, _GROUP_POLL_INTERVAL_SECONDS * 2)
+    try:
+        while time.monotonic() < result_deadline_at:
+            readable, _writable, _exceptional = select.select(
+                [read_fd], [], [], min(_GROUP_POLL_INTERVAL_SECONDS, result_deadline_at - time.monotonic())
+            )
+            if not readable:
+                continue
+            chunk = os.read(read_fd, 65536)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > _INVOCATION_SUPERVISOR_MAX_RESULT_BYTES + 8:
+                return None
+    except (OSError, ValueError):
+        return None
+    finally:
+        try:
+            os.close(read_fd)
+        except OSError:
+            pass
+    if len(data) < 8:
+        return None
+    size = struct.unpack("!Q", data[:8])[0]
+    if size > _INVOCATION_SUPERVISOR_MAX_RESULT_BYTES or len(data) != size + 8:
+        return None
+    try:
+        outcome = json.loads(data[8:].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(outcome, dict) or outcome.get("kind") not in {"completed", "raised"}:
+        return None
+    while time.monotonic() < result_deadline_at:
+        try:
+            waited_pid, _status = os.waitpid(supervisor_pid, os.WNOHANG)
+        except OSError:
+            return None
+        if waited_pid == supervisor_pid:
+            return outcome
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+    return None
+
+
+def _raise_invocation_supervisor_error(outcome: dict[str, object]) -> None:
+    error_type = outcome.get("type")
+    message = outcome.get("message")
+    if not isinstance(error_type, str) or not isinstance(message, str):
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    error_classes: dict[str, type[BaseException]] = {
+        "GitProtocolDeadlineExhausted": GitProtocolDeadlineExhausted,
+        "GitProtocolTimeout": GitProtocolTimeout,
+        "GitProtocolProcessGroupCleanupFailed": GitProtocolProcessGroupCleanupFailed,
+        "RuntimeError": RuntimeError,
+        "ValueError": ValueError,
+        "TypeError": TypeError,
+    }
+    error_class = error_classes.get(error_type)
+    if error_class is None:
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    raise error_class(message)
+
+
+def _run_closed_git_process(
+    operation: _GitOperation,
+    *,
+    git_executable: str,
+    cwd: str,
+    env: dict[str, str],
+    hooks_dir: str,
+    deadline: GitProtocolDeadline,
+) -> subprocess.CompletedProcess:
+    """Delegate one Git process to a one-invocation subreaper supervisor.
+
+    The host creates and waits for only the known supervisor PID. It never
+    enables subreaping, scans `/proc` for host children, signals them, or reaps
+    them. A failed or interrupted result read first performs a bounded,
+    supervisor-certified Git-only cleanup handshake before it propagates.
+    """
+    deadline.execution_seconds()
+    try:
+        result_read_fd, result_write_fd = os.pipe()
+        ready_read_fd, ready_write_fd = os.pipe()
+        cleanup_read_fd, cleanup_write_fd = os.pipe()
+        supervisor_pid = os.fork()
+    except (AttributeError, OSError) as exc:
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_containment_unavailable") from exc
+    if supervisor_pid == 0:
+        try:
+            for fd in (result_read_fd, ready_read_fd, cleanup_read_fd):
+                os.close(fd)
+            _invocation_supervisor_main(
+                result_write_fd,
+                ready_write_fd,
+                cleanup_write_fd,
+                operation,
+                git_executable=git_executable,
+                cwd=cwd,
+                env=env,
+                hooks_dir=hooks_dir,
+                deadline=deadline,
+            )
+        finally:
+            os._exit(1)
+    for fd in (result_write_fd, ready_write_fd, cleanup_write_fd):
+        os.close(fd)
+
+    startup_deadline_at = min(
+        deadline.deadline_at,
+        time.monotonic() + max(0.1, deadline.cleanup_reserve_seconds),
+    )
+    try:
+        supervisor_ready = _read_invocation_supervisor_cleanup_status(
+            ready_read_fd, startup_deadline_at, expected=_INVOCATION_SUPERVISOR_READY
+        )
+    except BaseException as exc:
+        try:
+            os.close(result_read_fd)
+        except OSError:
+            pass
+        if not _cleanup_interrupted_invocation_supervisor(supervisor_pid, cleanup_read_fd, deadline):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
+        raise
+    if not supervisor_ready:
+        try:
+            os.close(result_read_fd)
+        except OSError:
+            pass
+        if not _cleanup_interrupted_invocation_supervisor(supervisor_pid, cleanup_read_fd, deadline):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+
+    try:
+        outcome = _read_invocation_supervisor_result(result_read_fd, supervisor_pid, deadline)
+    except BaseException as exc:
+        try:
+            # The normal reader closes this descriptor in its finally block;
+            # repeat it defensively so an interrupted/custom reader cannot
+            # block the supervisor while it reports cancellation.
+            os.close(result_read_fd)
+        except OSError:
+            pass
+        if not _cleanup_interrupted_invocation_supervisor(supervisor_pid, cleanup_read_fd, deadline):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
+        raise
+    if outcome is None:
+        if not _cleanup_interrupted_invocation_supervisor(supervisor_pid, cleanup_read_fd, deadline):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+
+    # Result success is not a cleanup proof. The isolated supervisor writes
+    # this acknowledgement only after its subreaper observes no Git leader or
+    # escaped descendants and exits; `_read_invocation_supervisor_result` has
+    # already reaped that exact known supervisor PID.
+    normal_cleanup_deadline_at = _supervisor_cleanup_deadline(deadline).deadline_at
+    if not _read_invocation_supervisor_cleanup_status(
+        cleanup_read_fd, normal_cleanup_deadline_at, expected=_INVOCATION_SUPERVISOR_CLEANUP_ABSENT
+    ):
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    if outcome["kind"] == "completed":
+        try:
+            argv = outcome["argv"]
+            returncode = outcome["returncode"]
+            if (
+                not isinstance(argv, list)
+                or not all(isinstance(arg, str) for arg in argv)
+                or not isinstance(returncode, int)
+            ):
+                raise ValueError("invalid_invocation_supervisor_result")
+            return subprocess.CompletedProcess(
+                argv,
+                returncode,
+                _decode_invocation_supervisor_stream(outcome.get("stdout")),
+                _decode_invocation_supervisor_stream(outcome.get("stderr")),
+            )
+        except (TypeError, ValueError, KeyError):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from None
+    _raise_invocation_supervisor_error(outcome)
+    raise AssertionError("unreachable_invocation_supervisor_error")
+
+
+def _git_supports_no_lazy_fetch(
+    git_executable: str, *, cwd: str, env: dict[str, str], hooks_dir: str, deadline: GitProtocolDeadline
+) -> bool:
+    """Probe the trusted executable once; never infer capability from an env var."""
+    cached = _GIT_NO_LAZY_FETCH_CAPABILITY_CACHE.get(git_executable)
+    if cached is not None:
+        return cached
+    probe = _run_closed_git_process(
+        _GitOperation("probe_no_lazy_fetch_support"),
+        git_executable=git_executable,
         cwd=cwd,
         env=env,
         hooks_dir=hooks_dir,
-        timeout=timeout,
+        deadline=deadline,
     )
-    reject_insteadof_rewrite(matched_keys)
+    supported = probe.returncode == 0
+    _GIT_NO_LAZY_FETCH_CAPABILITY_CACHE[git_executable] = supported
+    return supported
 
-    full_argv = [
-        git_executable,
-        "--no-replace-objects",
-        "-c",
-        "core.hooksPath=" + hooks_dir,
-        "-c",
-        "credential.helper=",
-        *argv,
-    ]
-    return subprocess.run(
-        full_argv,
+
+def _repository_has_promisor_remote(
+    git_executable: str, *, cwd: str, env: dict[str, str], hooks_dir: str, deadline: GitProtocolDeadline
+) -> bool:
+    """Detect a local partial-clone promisor without consulting ambient config."""
+    probe = _run_closed_git_process(
+        _GitOperation("probe_promisor_remote"),
+        git_executable=git_executable,
         cwd=cwd,
         env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        stdin=subprocess.DEVNULL,
+        hooks_dir=hooks_dir,
+        deadline=deadline,
+    )
+    if probe.returncode == 1:
+        return False
+    if probe.returncode != 0:
+        raise RuntimeError(f"promisor_remote_probe_failed:{probe.returncode}")
+    return any(
+        line.rsplit(maxsplit=1)[-1].lower() in {"true", "yes", "on", "1"}
+        for line in (probe.stdout or "").splitlines()
+        if line.split()
     )
 
 
-# ---------------------------------------------------------------------------
-# Closed command builder API (Issue #2196 AC8 / P1-3).
-#
-# Each builder below accepts only a fixed, validated subcommand shape --
-# structured keyword/positional parameters describing *data* (a repo URL, a
-# ref name, an object id, ...), never a caller-supplied argv list. None of
-# them accept a Git global option in any form: `reject_git_global_options`
-# defends the constructed argv itself (defense in depth), and every
-# caller-supplied positional value is separately checked by
-# `reject_option_like_positional` so it cannot be interpreted by Git as a
-# flag. This is the only sanctioned way for production code (later
-# children #2197-#2200) to run a dedicated sanitized Git subprocess; no
-# raw-argv equivalent is exposed at production callsites.
-# ---------------------------------------------------------------------------
-
-
-def run_control_plane_git_ls_remote(
-    repo: str,
+def _require_literal_effective_remote_url(
+    remote_url: LiteralRemoteUrl,
     *,
+    git_executable: str,
     cwd: str,
-    project_root: str,
-    scratch_root: str | None = None,
-    timeout: float,
-) -> subprocess.CompletedProcess:
-    """Closed builder for `git ls-remote -- <repo>`."""
-    reject_option_like_positional(repo)
-    return _run_sanitized_git_subprocess(
-        ["ls-remote", "--", repo],
-        cwd=cwd,
-        project_root=project_root,
-        scratch_root=scratch_root,
-        timeout=timeout,
-    )
+    env: dict[str, str],
+    hooks_dir: str,
+    deadline: GitProtocolDeadline,
+) -> None:
+    """Fail closed only when Git rewrites the transport actually in use.
 
-
-def run_control_plane_git_fetch(
-    repo: str,
-    refspec: str,
-    *,
-    cwd: str,
-    project_root: str,
-    scratch_root: str | None = None,
-    timeout: float,
-) -> subprocess.CompletedProcess:
-    """Closed builder for `git fetch -- <repo> <refspec>`."""
-    reject_option_like_positional(repo)
-    reject_option_like_positional(refspec)
-    return _run_sanitized_git_subprocess(
-        ["fetch", "--", repo, refspec],
-        cwd=cwd,
-        project_root=project_root,
-        scratch_root=scratch_root,
-        timeout=timeout,
-    )
-
-
-_CAT_FILE_ALLOWED_MODES = frozenset({"-p", "-t", "-s"})
-
-
-def run_control_plane_git_cat_file(
-    object_id: str,
-    *,
-    mode: str = "-p",
-    cwd: str,
-    project_root: str,
-    scratch_root: str | None = None,
-    timeout: float,
-) -> subprocess.CompletedProcess:
-    """Closed builder for `git cat-file <mode> <object_id>`. `mode` must be
-    one of `-p`/`-t`/`-s` (the fixed, validated subcommand shape for this
-    builder); any other value is rejected before a subprocess is spawned.
+    An unrelated `insteadOf` or any `pushInsteadOf` key is not authority for a
+    read/fetch protocol. `ls-remote --get-url` is local/no-network and returns
+    the exact URL Git would use for this literal remote.
     """
-    if mode not in _CAT_FILE_ALLOWED_MODES:
-        raise ValueError(f"cat_file_mode_not_allowed:{mode}")
-    reject_option_like_positional(object_id)
-    return _run_sanitized_git_subprocess(
-        ["cat-file", mode, object_id],
-        cwd=cwd,
-        project_root=project_root,
-        scratch_root=scratch_root,
-        timeout=timeout,
+    effective = _require_success(
+        _run_closed_git_process(
+            _GitOperation("effective_remote_url", remote_url=remote_url),
+            git_executable=git_executable,
+            cwd=cwd,
+            env=env,
+            hooks_dir=hooks_dir,
+            deadline=deadline,
+        ),
+        "effective_remote_url",
     )
+    if (effective.stdout or "").rstrip("\n") != remote_url.value:
+        raise RuntimeError("effective_remote_url_mismatch")
 
 
-def run_control_plane_git_update_ref(
-    ref: str,
-    new_oid: str,
+def _execute_semantic_git(
+    operation: _GitOperation,
     *,
     cwd: str,
     project_root: str,
-    scratch_root: str | None = None,
-    timeout: float,
+    scratch_root: str | None,
+    deadline: GitProtocolDeadline,
 ) -> subprocess.CompletedProcess:
-    """Closed builder for `git update-ref -- <ref> <new_oid>`."""
-    reject_option_like_positional(ref)
-    reject_option_like_positional(new_oid)
-    return _run_sanitized_git_subprocess(
-        ["update-ref", "--", ref, new_oid],
-        cwd=cwd,
-        project_root=project_root,
-        scratch_root=scratch_root,
-        timeout=timeout,
+    operation = _revalidate_semantic_operation(operation, project_root)
+    deadline.execution_seconds()
+    git = resolve_git_subprocess_executable(project_root)
+    env = sanitized_git_subprocess_env(project_root)
+    hooks_dir = git_subprocess_trusted_hooks_dir(scratch_root or project_root)
+    try:
+        if operation.kind in {"observe_default_ref", "fetch_default_ref"}:
+            remote_url = _revalidate_literal_remote_url(operation.remote_url)
+            _require_literal_effective_remote_url(
+                remote_url,
+                git_executable=git,
+                cwd=cwd,
+                env=env,
+                hooks_dir=hooks_dir,
+                deadline=deadline,
+            )
+        if operation.kind == "fetch_default_ref":
+            if _git_supports_no_lazy_fetch(
+                git, cwd=cwd, env=env, hooks_dir=hooks_dir, deadline=deadline
+            ):
+                operation = _GitOperation(
+                    "fetch_default_ref_no_lazy",
+                    remote_url=operation.remote_url,
+                    remote_ref=operation.remote_ref,
+                    private_ref=operation.private_ref,
+                )
+            elif _repository_has_promisor_remote(
+                git, cwd=cwd, env=env, hooks_dir=hooks_dir, deadline=deadline
+            ):
+                raise RuntimeError("git_no_lazy_fetch_not_supported_for_promisor_repository")
+        return _run_closed_git_process(
+            operation,
+            git_executable=git,
+            cwd=cwd,
+            env=env,
+            hooks_dir=hooks_dir,
+            deadline=deadline,
+        )
+    finally:
+        try:
+            shutil.rmtree(hooks_dir)
+        except OSError as exc:
+            raise GitProtocolProcessGroupCleanupFailed("git_subprocess_hooks_cleanup_failed") from exc
+
+
+def _require_success(result: subprocess.CompletedProcess, operation: str) -> subprocess.CompletedProcess:
+    if result.returncode != 0:
+        raise RuntimeError(f"{operation}_failed:{result.returncode}:{(result.stderr or '').strip()}")
+    return result
+
+
+def run_control_plane_git_effective_remote_url(
+    expected_remote_url: str,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> LiteralRemoteUrl:
+    literal = validate_literal_remote_url(expected_remote_url)
+    result = _require_success(
+        _execute_semantic_git(
+            _GitOperation("effective_remote_url", remote_url=literal),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "effective_remote_url",
+    )
+    if (result.stdout or "").rstrip("\n") != literal.value:
+        raise RuntimeError("effective_remote_url_mismatch")
+    return literal
+
+
+def run_control_plane_git_observe_default_ref(
+    remote_url: LiteralRemoteUrl,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> subprocess.CompletedProcess:
+    remote_url = _revalidate_literal_remote_url(remote_url)
+    return _require_success(
+        _execute_semantic_git(
+            _GitOperation("observe_default_ref", remote_url=remote_url),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "observe_default_ref",
     )
 
 
-_WORKTREE_ALLOWED_ACTIONS = frozenset({"list", "add", "remove", "prune"})
+def run_control_plane_git_repository_object_format(
+    *, cwd: str, project_root: str, deadline: GitProtocolDeadline, scratch_root: str | None = None
+) -> RepositoryObjectFormat:
+    result = _require_success(
+        _execute_semantic_git(
+            _GitOperation("repository_object_format"),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "repository_object_format",
+    )
+    return validate_repository_object_format((result.stdout or "").strip())
 
 
-def run_control_plane_git_worktree(
-    action: str,
-    *args: str,
+def run_control_plane_git_fetch_default_ref(
+    remote_url: LiteralRemoteUrl,
+    remote_ref: AllowedRemoteRef,
+    *,
     cwd: str,
     project_root: str,
+    deadline: GitProtocolDeadline,
     scratch_root: str | None = None,
-    timeout: float,
-) -> subprocess.CompletedProcess:
-    """Closed builder for `git worktree <action> [args...]`. `action` must
-    be one of `list`/`add`/`remove`/`prune` (the fixed, validated
-    subcommand shape for this builder); any other value is rejected before
-    a subprocess is spawned. Every element of `args` is separately checked
-    by `reject_option_like_positional`.
+) -> ControlPlanePrivateRef:
+    remote_url = _revalidate_literal_remote_url(remote_url)
+    remote_ref = _revalidate_allowed_remote_ref(remote_ref)
+    private_ref = make_control_plane_private_ref()
+    _require_success(
+        _execute_semantic_git(
+            _GitOperation("fetch_default_ref", remote_url=remote_url, remote_ref=remote_ref, private_ref=private_ref),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "fetch_default_ref",
+    )
+    return private_ref
+
+
+def run_control_plane_git_read_private_ref_oid(
+    private_ref: ControlPlanePrivateRef,
+    object_format: RepositoryObjectFormat,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> RepositoryObjectId:
+    private_ref = _revalidate_private_ref(private_ref)
+    object_format = _revalidate_object_format(object_format)
+    result = _require_success(
+        _execute_semantic_git(
+            _GitOperation("read_private_ref_oid", private_ref=private_ref),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "read_private_ref_oid",
+    )
+    return validate_repository_object_id((result.stdout or "").strip(), object_format)
+
+
+def run_control_plane_git_require_commit_object(
+    object_id: RepositoryObjectId,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> None:
+    object_id = _revalidate_object_id(object_id)
+    _require_success(
+        _execute_semantic_git(
+            _GitOperation("require_commit_object", object_id=object_id),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "commit_object",
+    )
+
+
+def run_control_plane_git_read_worktree_head(
+    path: DetachedWorktreePath,
+    object_format: RepositoryObjectFormat,
+    *,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> RepositoryObjectId:
+    path = _revalidate_worktree_path(path, project_root, require_fresh=False)
+    object_format = _revalidate_object_format(object_format)
+    result = _require_success(
+        _execute_semantic_git(
+            _GitOperation("read_worktree_head", worktree_path=path),
+            cwd=path.value,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "read_worktree_head",
+    )
+    return validate_repository_object_id((result.stdout or "").strip(), object_format)
+
+
+def _rollback_deadline(deadline: GitProtocolDeadline) -> GitProtocolDeadline:
+    """Bound compensation after a terminal add has consumed protocol time.
+
+    This is not a new normal-protocol deadline. It is a bounded recovery window
+    reserved solely to remove a worktree that this builder just created and to
+    prove both its path and its catalog entry are absent.
     """
-    if action not in _WORKTREE_ALLOWED_ACTIONS:
-        raise ValueError(f"worktree_action_not_allowed:{action}")
-    for value in args:
-        reject_option_like_positional(value)
-    return _run_sanitized_git_subprocess(
-        ["worktree", action, *args],
-        cwd=cwd,
-        project_root=project_root,
-        scratch_root=scratch_root,
-        timeout=timeout,
+    reserve = _validate_deadline_value(deadline.cleanup_reserve_seconds, "cleanup_reserve")
+    return GitProtocolDeadline(
+        deadline_at=max(deadline.deadline_at, time.monotonic() + reserve * 6),
+        cleanup_reserve_seconds=reserve,
+    )
+
+
+def _worktree_catalog_contains_path(porcelain: str, path: DetachedWorktreePath) -> bool:
+    target = os.path.realpath(path.value)
+    return any(
+        line.startswith("worktree ") and os.path.realpath(line.removeprefix("worktree ")) == target
+        for line in porcelain.splitlines()
+    )
+
+
+def _rollback_detached_locked_worktree(
+    path: DetachedWorktreePath,
+    *,
+    cwd: str,
+    project_root: str,
+    scratch_root: str | None,
+    deadline: GitProtocolDeadline,
+) -> None:
+    recovery_deadline = _rollback_deadline(deadline)
+    if Path(path.value).exists():
+        _require_success(
+            _execute_semantic_git(
+                _GitOperation("remove_detached_locked_worktree", worktree_path=path),
+                cwd=cwd,
+                project_root=project_root,
+                scratch_root=scratch_root,
+                deadline=recovery_deadline,
+            ),
+            "remove_detached_locked_worktree",
+        )
+    if Path(path.value).exists():
+        raise RuntimeError("detached_worktree_rollback_path_present")
+    catalog = _require_success(
+        _execute_semantic_git(
+            _GitOperation("list_worktrees_porcelain"),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=recovery_deadline,
+        ),
+        "list_worktrees_porcelain",
+    )
+    if _worktree_catalog_contains_path(catalog.stdout or "", path):
+        raise RuntimeError("detached_worktree_rollback_catalog_present")
+
+
+def run_control_plane_git_add_detached_locked_worktree(
+    path: DetachedWorktreePath,
+    commit: RepositoryObjectId,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> None:
+    path = _revalidate_worktree_path(path, project_root, require_fresh=True)
+    commit = _revalidate_object_id(commit)
+    run_control_plane_git_require_commit_object(
+        commit, cwd=cwd, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+    )
+    add_attempted = False
+    try:
+        add_attempted = True
+        _require_success(
+            _execute_semantic_git(
+                _GitOperation("add_detached_locked_worktree", object_id=commit, worktree_path=path),
+                cwd=cwd,
+                project_root=project_root,
+                scratch_root=scratch_root,
+                deadline=deadline,
+            ),
+            "add_detached_locked_worktree",
+        )
+        object_format = validate_repository_object_format("sha1" if len(commit.value) == 40 else "sha256")
+        if (
+            run_control_plane_git_read_worktree_head(
+                path,
+                object_format,
+                project_root=project_root,
+                deadline=deadline,
+                scratch_root=scratch_root,
+            )
+            != commit
+        ):
+            raise RuntimeError("detached_worktree_head_mismatch")
+    except BaseException:
+        # A result-read interruption may happen after `git worktree add`
+        # succeeded, so the fresh path is also checked, not only a local flag.
+        if add_attempted and Path(path.value).exists():
+            _rollback_detached_locked_worktree(
+                path,
+                cwd=cwd,
+                project_root=project_root,
+                scratch_root=scratch_root,
+                deadline=deadline,
+            )
+        raise
+
+
+def run_control_plane_git_delete_private_ref_cas(
+    private_ref: ControlPlanePrivateRef,
+    expected_oid: RepositoryObjectId,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> None:
+    private_ref = _revalidate_private_ref(private_ref)
+    expected_oid = _revalidate_object_id(expected_oid)
+    _require_success(
+        _execute_semantic_git(
+            _GitOperation("delete_private_ref_cas", private_ref=private_ref, object_id=expected_oid),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "delete_private_ref_cas",
     )
 
 
