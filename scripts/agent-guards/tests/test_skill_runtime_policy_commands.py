@@ -24,8 +24,10 @@ from skill_runtime_command_policy import (  # noqa: E402
     TRUSTED_REPO_SLUG,
     ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS,
     is_exact_skill_runtime_repair_action_apply_executor_command,
+    is_exact_skill_runtime_structural_repair_action_apply_executor_command,
     parse_exact_skill_runtime_command,
     parse_exact_skill_runtime_repair_action_apply_command,
+    parse_exact_skill_runtime_structural_repair_action_apply_command,
     validate_registry_entry,
 )
 
@@ -272,3 +274,108 @@ class TestIsExactSkillRuntimeRepairActionApplyExecutorCommand:
         assert not is_exact_skill_runtime_repair_action_apply_executor_command(
             _cmd() + " --extra x", str(tmp_git_repo), str(tmp_git_repo)
         )
+
+
+_STRUCTURAL_ISSUE = "2402"
+_STRUCTURAL_PATH = ".claude/artifacts/issue-refinement-loop/2402/refinement_preflight_result_v1.json"
+
+
+def _structural_cmd(
+    issue_number: str = _STRUCTURAL_ISSUE,
+    repo: str = TRUSTED_REPO_SLUG,
+    path: str = _STRUCTURAL_PATH,
+) -> str:
+    return (
+        f"uv run python3 {SKILL_RUNTIME_EXEC_REL} "
+        "--command-id structural_repair_action.apply "
+        f"--issue-number {issue_number} --repo {repo} "
+        f"--apply-structural-repair-action {path}"
+    )
+
+
+class TestStructuralRepairActionApplyRegistryEntry:
+    def test_registry_entry_exists_and_matches_policy(self) -> None:
+        entry = command_registry.REGISTRY["structural_repair_action.apply"]
+        assert entry["id"] == "structural_repair_action.apply"
+        assert entry["execution_class"] == "exact_structural_repair_action_apply"
+        assert entry["stdout_contract"] == "structural_repair_apply_result/v1"
+        validate_registry_entry("structural_repair_action.apply", entry, _STRUCTURAL_ISSUE)
+
+    def test_registry_argv_remains_the_existing_structural_contract(self) -> None:
+        rendered = command_registry.render_command(
+            "structural_repair_action.apply",
+            {
+                "issue_number": int(_STRUCTURAL_ISSUE),
+                "repo": TRUSTED_REPO_SLUG,
+                "preflight_result_path": _STRUCTURAL_PATH,
+            },
+        )
+        assert rendered[-1] == _STRUCTURAL_PATH
+        assert "--apply-structural-repair-action" in rendered
+        assert "--apply-repair-action" not in rendered
+
+
+class TestParseExactSkillRuntimeStructuralRepairActionApplyCommand:
+    def test_valid_command_parses(self, tmp_git_repo: Path) -> None:
+        parsed = parse_exact_skill_runtime_structural_repair_action_apply_command(_structural_cmd(), str(tmp_git_repo))
+        assert parsed is not None
+        assert parsed.command_id == "structural_repair_action.apply"
+        assert parsed.issue_number == _STRUCTURAL_ISSUE
+        assert parsed.preflight_result_path == _STRUCTURAL_PATH
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            _structural_cmd() + " --extra x",
+            _structural_cmd().replace("--apply-structural-repair-action", "--apply-repair-action"),
+            _structural_cmd(path="/etc/hosts"),
+            _structural_cmd(path=".claude/artifacts/issue-refinement-loop/2401/refinement_preflight_result_v1.json"),
+            _structural_cmd(path=".claude/artifacts/issue-refinement-loop/2402/../2401/result.json"),
+            _structural_cmd() + " --apply-repair-action " + _STRUCTURAL_PATH,
+        ],
+    )
+    def test_cross_route_and_unsafe_shapes_are_rejected(self, tmp_git_repo: Path, command: str) -> None:
+        assert parse_exact_skill_runtime_structural_repair_action_apply_command(command, str(tmp_git_repo)) is None
+
+    def test_symlink_path_is_rejected(self, tmp_git_repo: Path) -> None:
+        artifact_dir = tmp_git_repo / ".claude/artifacts/issue-refinement-loop/2402"
+        artifact_dir.mkdir(parents=True)
+        (artifact_dir / "linked.json").symlink_to(tmp_git_repo / "outside.json")
+        assert parse_exact_skill_runtime_structural_repair_action_apply_command(
+            _structural_cmd(path=".claude/artifacts/issue-refinement-loop/2402/linked.json"), str(tmp_git_repo)
+        ) is None
+
+
+class TestIsExactSkillRuntimeStructuralRepairActionApplyExecutorCommand:
+    def test_denies_without_active_issue_worktree(self, tmp_git_repo: Path) -> None:
+        assert not is_exact_skill_runtime_structural_repair_action_apply_executor_command(
+            _structural_cmd(), str(tmp_git_repo), str(tmp_git_repo)
+        )
+
+    def test_denies_wrong_cwd_branch_or_repo(self, tmp_git_repo: Path) -> None:
+        subdir = tmp_git_repo / "subdir"
+        subdir.mkdir()
+        assert not is_exact_skill_runtime_structural_repair_action_apply_executor_command(
+            _structural_cmd(), str(subdir), str(tmp_git_repo)
+        )
+        import subprocess
+
+        subprocess.run(["git", "-C", str(tmp_git_repo), "checkout", "-q", "-b", "feature"], check=True)
+        assert not is_exact_skill_runtime_structural_repair_action_apply_executor_command(
+            _structural_cmd(), str(tmp_git_repo), str(tmp_git_repo)
+        )
+
+
+def test_structural_repair_route_documents_resume_gate() -> None:
+    skill = (REPO_ROOT / ".claude/skills/issue-refinement-loop/SKILL.md").read_text(encoding="utf-8")
+    route_marker = "NEXT_ACTION: apply_deterministic_structural_repair"
+    start = skill.index(route_marker)
+    route = skill[start : start + 5000]
+    assert "structural_repair_action.apply" in route
+    assert "--apply-structural-repair-action" in route
+    assert "exit 0" in route
+    assert "phase: complete" in route
+    assert "failure_code: null" in route
+    assert "mutation_outcome" in route and "applied" in route and "no_change" in route
+    assert "fresh preflight" in route and "Step 2" in route
+    assert "unknown" in route and "not_attempted" in route and "盲目的に再試行しない" in route

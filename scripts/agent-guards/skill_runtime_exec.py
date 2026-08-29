@@ -47,6 +47,7 @@ from skill_runtime_command_policy import (
     is_exact_skill_runtime_executor_command,
     is_exact_skill_runtime_fixture_executor_command,
     is_exact_skill_runtime_repair_action_apply_executor_command,
+    is_exact_skill_runtime_structural_repair_action_apply_executor_command,
     load_registry_entry,
     resolve_active_issue,
     resolve_default_branch,
@@ -1886,8 +1887,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--router-receipt-path", required=False, default=None)
     parser.add_argument("--contract-patch-plan-file", required=False, default=None)
     parser.add_argument("--anchor-context-file", required=False, default=None)
-    # Issue #2039 AC8/AC11: repair_action.apply.
-    parser.add_argument("--apply-repair-action", required=False, default=None)
+    # Generic and structural mutation consumers have distinct command IDs and
+    # exact outer flags. Argparse rejects a mixed invocation before dispatch;
+    # each command branch below also enforces its exact pairing.
+    apply_action_flags = parser.add_mutually_exclusive_group()
+    apply_action_flags.add_argument("--apply-repair-action", required=False, default=None)
+    apply_action_flags.add_argument("--apply-structural-repair-action", required=False, default=None)
     # #2086 P0 fix_delta (Blocker 1/2): only ever meaningful for
     # preflight.run.with_human_context (the operator-selected human-context
     # lane) -- see skill_runtime_command_policy._parse_exact_skill_runtime_anchor_command.
@@ -1908,6 +1913,16 @@ def main(argv: list[str] | None = None) -> int:
     if sibling_id in raw_argv or f"--command-id={sibling_id}" in raw_argv:
         raw_command = " ".join(["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL, *raw_argv])
         if not is_exact_skill_runtime_anchor_fixture_executor_command(
+            raw_command, resolve_project_root(), resolve_project_root()
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    structural_id = "structural_repair_action.apply"
+    if structural_id in raw_argv or f"--command-id={structural_id}" in raw_argv:
+        # Validate raw argv before argparse can normalize a duplicate option.
+        # This is an outer transport check only; the child owns payload parsing.
+        raw_command = " ".join(["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL, *raw_argv])
+        if not is_exact_skill_runtime_structural_repair_action_apply_executor_command(
             raw_command, resolve_project_root(), resolve_project_root()
         ):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
@@ -1935,6 +1950,7 @@ def main(argv: list[str] | None = None) -> int:
     is_produce_command = args.command_id == "authority_transport.produce"
     is_consume_command = args.command_id == "authority_transport.consume"
     is_repair_action_apply_command = args.command_id == "repair_action.apply"
+    is_structural_repair_action_apply_command = args.command_id == "structural_repair_action.apply"
     # #2086 P0 fix_delta (Blocker 3): decide.run may ALSO carry
     # --invocation-id/--git-head-sha (bound into its Mode B authority-check
     # sub-fields), in addition to authority_transport.produce/consume.
@@ -1962,6 +1978,18 @@ def main(argv: list[str] | None = None) -> int:
     if is_repair_action_apply_command and not args.apply_repair_action:
         print(
             "skill_runtime_exec: --apply-repair-action is required for repair_action.apply",
+            file=sys.stderr,
+        )
+        return 2
+    if not is_structural_repair_action_apply_command and args.apply_structural_repair_action:
+        print(
+            "skill_runtime_exec: --apply-structural-repair-action is only allowed for structural_repair_action.apply",
+            file=sys.stderr,
+        )
+        return 2
+    if is_structural_repair_action_apply_command and not args.apply_structural_repair_action:
+        print(
+            "skill_runtime_exec: --apply-structural-repair-action is required for structural_repair_action.apply",
             file=sys.stderr,
         )
         return 2
@@ -2354,6 +2382,36 @@ def main(argv: list[str] | None = None) -> int:
         if not is_exact_skill_runtime_repair_action_apply_executor_command(command_text, project_root, project_root):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
+    elif is_structural_repair_action_apply_command:
+        # Preserve strict outer-transport isolation. The safe path predicate is
+        # applied to the original argparse value, then the exact parser checks
+        # the fixed command shape. No structural payload is opened at root.
+        if not _is_safe_issue_artifact_path(
+            args.apply_structural_repair_action, project_root, str(args.issue_number)
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--apply-structural-repair-action",
+                args.apply_structural_repair_action,
+            ]
+        )
+        if not is_exact_skill_runtime_structural_repair_action_apply_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
     else:
         if args.fixture:
             print("skill_runtime_exec: --fixture is only allowed for preflight.run.fixture", file=sys.stderr)
@@ -2500,6 +2558,12 @@ def main(argv: list[str] | None = None) -> int:
             "issue_number": args.issue_number,
             "repo": args.repo,
             "preflight_result_path": args.apply_repair_action,
+        }
+    elif is_structural_repair_action_apply_command:
+        render_params = {
+            "issue_number": args.issue_number,
+            "repo": args.repo,
+            "preflight_result_path": args.apply_structural_repair_action,
         }
     else:
         render_params = {"issue_number": args.issue_number, "repo": args.repo}

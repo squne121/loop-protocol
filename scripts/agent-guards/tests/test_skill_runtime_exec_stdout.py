@@ -401,6 +401,15 @@ def select_issue_worktree(catalog, issue_number, root_realpath):
     )
     gh_script.chmod(0o755)
 
+    uv = shutil.which("uv")
+    assert uv is not None
+    uv_version = subprocess.run([uv, "--version"], check=True, capture_output=True, text=True).stdout.split()[1]
+    _write_text(repo_root / "pyproject.toml", f"[tool.uv]\nrequired-version = \"=={uv_version}\"\n")
+    (repo_root / ".gitignore").write_text((repo_root / ".gitignore").read_text() + ".venv/\n")
+    subprocess.run([uv, "venv", ".venv"], cwd=repo_root, check=True, capture_output=True, text=True)
+    subprocess.run([uv, "lock"], cwd=repo_root, check=True, capture_output=True, text=True)
+    (repo_root / ".venv/.lock").write_text("", encoding="utf-8")
+
     worktree_dir = repo_root / ".claude" / "worktrees" / "issue-2039-repair-action-apply-fixture"
     worktree_dir.mkdir(parents=True, exist_ok=True)
 
@@ -561,3 +570,185 @@ def test_repair_action_apply_rejects_alternate_cwd(tmp_path: Path) -> None:
     )
     assert result.returncode != 0
     assert not gh_marker.exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #2402 AC4/AC5: production root executor -> production policy ->
+# production registry -> fixture leaf child. Only run_refinement_preflight.py
+# is substituted; the outer chain is copied verbatim and exercised by a real
+# subprocess.
+# ---------------------------------------------------------------------------
+
+
+_STRUCTURAL_ISSUE = "2402"
+_STRUCTURAL_ARTIFACT = ".claude/artifacts/issue-refinement-loop/2402/refinement_preflight_result_v1.json"
+_STRUCTURAL_CHILD_ARGV = [
+    "--issue-number",
+    _STRUCTURAL_ISSUE,
+    "--repo",
+    "squne121/loop-protocol",
+    "--apply-structural-repair-action",
+    _STRUCTURAL_ARTIFACT,
+]
+_STRUCTURAL_STDOUT = (json.dumps({"argv": _STRUCTURAL_CHILD_ARGV}, separators=(",", ":")) + "\n").encode()
+_STRUCTURAL_STDERR = b"STRUCTURAL-FIXTURE-STDERR\n"
+
+
+def _install_structural_repair_action_apply_fixture(repo_root: Path) -> Path:
+    for rel in (
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "scripts/agent-guards/skill_runtime_command_policy.py",
+        ".claude/skills/issue-refinement-loop/scripts/command_registry.py",
+    ):
+        _write_text(repo_root / rel, (REPO_ROOT / rel).read_text())
+
+    _write_text(
+        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
+        """from __future__ import annotations
+
+class Deadline:
+    def subprocess_timeout(self, seconds: float) -> float:
+        return seconds
+
+
+def list_worktrees(project_root: str, deadline=None):
+    return []
+
+
+def select_issue_worktree(catalog, issue_number, root_realpath):
+    return {"issue_number": issue_number, "path": root_realpath}
+""",
+    )
+    leaf = repo_root / ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py"
+    _write_text(
+        leaf,
+        """from __future__ import annotations
+import json
+import sys
+from pathlib import Path
+
+issue = sys.argv[sys.argv.index("--issue-number") + 1]
+marker = Path(f".claude/artifacts/issue-refinement-loop/{issue}/fixture-child.marker")
+marker.parent.mkdir(parents=True, exist_ok=True)
+marker.write_text("spawned\\n", encoding="utf-8")
+sys.stdout.buffer.write((json.dumps({"argv": sys.argv[1:]}, separators=(",", ":")) + "\\n").encode())
+sys.stderr.buffer.write(b"STRUCTURAL-FIXTURE-STDERR\\n")
+raise SystemExit(17)
+""",
+    )
+    artifact = repo_root / _STRUCTURAL_ARTIFACT
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("{}", encoding="utf-8")
+    uv = shutil.which("uv")
+    assert uv is not None
+    uv_version = subprocess.run([uv, "--version"], check=True, capture_output=True, text=True).stdout.split()[1]
+    _write_text(repo_root / "pyproject.toml", f"[tool.uv]\nrequired-version = \"=={uv_version}\"\n")
+    (repo_root / ".gitignore").write_text((repo_root / ".gitignore").read_text() + ".venv/\n")
+    subprocess.run([uv, "venv", ".venv"], cwd=repo_root, check=True, capture_output=True, text=True)
+    (repo_root / ".venv/.lock").write_text("", encoding="utf-8")
+    subprocess.run([uv, "lock"], cwd=repo_root, check=True, capture_output=True, text=True)
+    worktree_dir = repo_root / ".claude/worktrees/issue-2402-structural-route-fixture"
+    worktree_dir.mkdir(parents=True, exist_ok=True)
+    _git("add", "-A", cwd=repo_root)
+    _git("commit", "-q", "-m", "install structural runtime fixture", cwd=repo_root)
+    return artifact.parent / "fixture-child.marker"
+
+
+def _run_structural_repair_action_apply_executor(
+    repo: Path,
+    *,
+    command_id: str = "structural_repair_action.apply",
+    issue_number: str = _STRUCTURAL_ISSUE,
+    repo_slug: str = "squne121/loop-protocol",
+    artifact_path: str = _STRUCTURAL_ARTIFACT,
+    apply_flag: str | None = "--apply-structural-repair-action",
+    extra: list[str] | None = None,
+    cwd: Path | None = None,
+    active_issue: str = _STRUCTURAL_ISSUE,
+) -> subprocess.CompletedProcess[bytes]:
+    argv = [
+        sys.executable,
+        str(repo / "scripts/agent-guards/skill_runtime_exec.py"),
+        "--command-id",
+        command_id,
+        "--issue-number",
+        issue_number,
+        "--repo",
+        repo_slug,
+    ]
+    if apply_flag is not None:
+        argv.extend([apply_flag, artifact_path])
+    if extra:
+        argv.extend(extra)
+    return subprocess.run(
+        argv,
+        cwd=str(cwd or repo),
+        capture_output=True,
+        text=False,
+        env={
+            **os.environ,
+            "CLAUDE_PROJECT_DIR": str(repo),
+            "LOOP_ISSUE_NUMBER": active_issue,
+        },
+        check=False,
+    )
+
+
+def test_structural_repair_action_apply_relays_exact_child_argv_stdout_stderr_and_exit(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    marker = _install_structural_repair_action_apply_fixture(repo)
+    result = _run_structural_repair_action_apply_executor(repo)
+
+    assert result.returncode == 17
+    assert result.stdout == _STRUCTURAL_STDOUT
+    assert json.loads(result.stdout) == {"argv": _STRUCTURAL_CHILD_ARGV}
+    assert _STRUCTURAL_STDERR in result.stderr
+    assert marker.exists()
+
+
+def test_structural_repair_action_apply_rejects_invalid_outer_transport_before_child_spawn(tmp_path: Path) -> None:
+    cases = (
+        {"apply_flag": None},
+        {"extra": ["--extra", "x"]},
+        {"apply_flag": "--apply-repair-action"},
+        {"extra": ["--apply-repair-action", _STRUCTURAL_ARTIFACT]},
+        {"repo_slug": "other/repo"},
+        {"artifact_path": "/etc/hosts"},
+        {"artifact_path": ".claude/artifacts/issue-refinement-loop/2402/../2401/result.json"},
+        {"artifact_path": ".claude/artifacts/issue-refinement-loop/2401/result.json"},
+        {"command_id": "repair_action.apply"},
+        {"command_id": "repair_action.apply", "apply_flag": "--apply-structural-repair-action"},
+        {"issue_number": "2403", "artifact_path": ".claude/artifacts/issue-refinement-loop/2403/result.json"},
+        {"active_issue": "9999"},
+    )
+    for index, case in enumerate(cases):
+        case_root = tmp_path / f"case-{index}"
+        case_root.mkdir()
+        repo = _make_repo(case_root)
+        marker = _install_structural_repair_action_apply_fixture(repo)
+        result = _run_structural_repair_action_apply_executor(repo, **case)
+        assert result.returncode != 0, case
+        assert not marker.exists(), case
+
+
+def test_structural_repair_action_apply_rejects_symlink_wrong_cwd_and_branch_before_child_spawn(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    marker = _install_structural_repair_action_apply_fixture(repo)
+    artifact_dir = repo / ".claude/artifacts/issue-refinement-loop/2402"
+    (artifact_dir / "linked.json").symlink_to(repo / "outside.json")
+    symlink_result = _run_structural_repair_action_apply_executor(
+        repo, artifact_path=".claude/artifacts/issue-refinement-loop/2402/linked.json"
+    )
+    assert symlink_result.returncode != 0
+    assert not marker.exists()
+
+    subdir = repo / "subdir"
+    subdir.mkdir()
+    cwd_result = _run_structural_repair_action_apply_executor(repo, cwd=subdir)
+    assert cwd_result.returncode != 0
+    assert not marker.exists()
+
+    _git("checkout", "-q", "-b", "feature", cwd=repo)
+    branch_result = _run_structural_repair_action_apply_executor(repo)
+    assert branch_result.returncode != 0
+    assert not marker.exists()
