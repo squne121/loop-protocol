@@ -293,7 +293,7 @@ def _structural_cmd(
     )
 
 
-class TestStructuralRepairActionApplyRegistryEntry:
+class TestStructural_repair_action_apply_registry_entry:
     def test_registry_entry_exists_and_matches_policy(self) -> None:
         entry = command_registry.REGISTRY["structural_repair_action.apply"]
         assert entry["id"] == "structural_repair_action.apply"
@@ -315,7 +315,7 @@ class TestStructuralRepairActionApplyRegistryEntry:
         assert "--apply-repair-action" not in rendered
 
 
-class TestParseExactSkillRuntimeStructuralRepairActionApplyCommand:
+class TestParse_exact_skill_runtime_structural_repair_action_apply_command:
     def test_valid_command_parses(self, tmp_git_repo: Path) -> None:
         parsed = parse_exact_skill_runtime_structural_repair_action_apply_command(_structural_cmd(), str(tmp_git_repo))
         assert parsed is not None
@@ -346,7 +346,7 @@ class TestParseExactSkillRuntimeStructuralRepairActionApplyCommand:
         ) is None
 
 
-class TestIsExactSkillRuntimeStructuralRepairActionApplyExecutorCommand:
+class TestIs_exact_skill_runtime_structural_repair_action_apply_executor_command:
     def test_denies_without_active_issue_worktree(self, tmp_git_repo: Path) -> None:
         assert not is_exact_skill_runtime_structural_repair_action_apply_executor_command(
             _structural_cmd(), str(tmp_git_repo), str(tmp_git_repo)
