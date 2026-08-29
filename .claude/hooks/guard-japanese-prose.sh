@@ -54,7 +54,8 @@ MATRIX="${PROJECT_DIR}/.claude/skills/create-issue/scripts/mutation_route_matrix
 #   exit 1 は tool call を block しない（block するのは exit 2 のみ）。
 #   計算（hash/route_id/clock 等）は一切行わない。
 # off/shadow(legacy alias) mode: 計算を一切行わず即座に exit 0（HIGH1: dead code 削減）。
-# persistent file（.guard_shadow_log.jsonl）へは一切 write しない（#2265）。
+# persistent shadow telemetry ファイルへの write は行わない（#2265 で除去済み、
+# 当該サブシステム自体は #2252 で全 producer 撤去のうえ廃止）。
 # ============================================================
 _GUARD_MODE_RAW="${GUARD_JAPANESE_PROSE_MODE:-}"
 
