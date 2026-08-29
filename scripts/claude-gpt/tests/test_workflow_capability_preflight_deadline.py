@@ -144,7 +144,10 @@ def test_root_transports_one_deadline_and_keeps_watchdog_grace(monkeypatch):
 
 
 def test_watchdog_and_nonzero_stderr_taxonomy_are_distinct_and_redacted(monkeypatch):
-    monkeypatch.setattr(rer.subprocess, "run", lambda *_a, **_k: (_ for _ in ()).throw(subprocess.TimeoutExpired("x", 1)))
+    def timeout_expired(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("x", 1)
+
+    monkeypatch.setattr(rer.subprocess, "run", timeout_expired)
     watchdog = rer.capability_preflight_result(repo=_REPO)
     assert watchdog["reasons"] == ["producer_watchdog_timeout"]
 

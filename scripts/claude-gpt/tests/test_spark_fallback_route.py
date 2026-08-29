@@ -11,7 +11,6 @@ judgment; Issue #2340 In Scope item 5 keeps the lazy-attempt design).
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from pathlib import Path
 
