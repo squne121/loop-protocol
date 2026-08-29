@@ -3886,6 +3886,17 @@ def _exact_git_argv(operation: _GitOperation, *, git_executable: str, cwd: str, 
 
 
 _INVOCATION_SUPERVISOR_MAX_RESULT_BYTES = 32 * 1024 * 1024
+_INVOCATION_SUPERVISOR_READY = b"R"
+_INVOCATION_SUPERVISOR_CLEANUP_ABSENT = b"A"
+_INVOCATION_SUPERVISOR_CLEANUP_UNCONFIRMED = b"U"
+
+
+class _InvocationSupervisorCleanupRequested(BaseException):
+    """Ask the isolated supervisor to clean its Git-only child tree."""
+
+
+def _request_invocation_supervisor_cleanup(_signum: int, _frame: object) -> None:
+    raise _InvocationSupervisorCleanupRequested()
 
 
 def _record_git_descendant_observation(
@@ -4060,8 +4071,28 @@ def _write_invocation_supervisor_result(write_fd: int, outcome: dict[str, object
         return
 
 
+def _supervisor_cleanup_deadline(deadline: GitProtocolDeadline) -> GitProtocolDeadline:
+    """Reserve a bounded post-interruption window for the Git-only handshake."""
+    return GitProtocolDeadline(
+        deadline_at=max(
+            deadline.deadline_at,
+            time.monotonic() + max(0.1, deadline.cleanup_reserve_seconds),
+        ),
+        cleanup_reserve_seconds=deadline.cleanup_reserve_seconds,
+    )
+
+
+def _write_invocation_supervisor_cleanup_status(write_fd: int, status: bytes) -> None:
+    try:
+        os.write(write_fd, status)
+    except OSError:
+        pass
+
+
 def _invocation_supervisor_main(
     write_fd: int,
+    ready_write_fd: int,
+    cleanup_write_fd: int,
     operation: _GitOperation,
     *,
     git_executable: str,
@@ -4070,46 +4101,165 @@ def _invocation_supervisor_main(
     hooks_dir: str,
     deadline: GitProtocolDeadline,
 ) -> None:
-    """Execute exactly one Git operation, then exit without touching host state."""
+    """Execute one Git operation and certify Git-only cleanup before exit."""
+    handler_installed = False
     try:
-        completed = _run_closed_git_process_in_invocation_supervisor(
-            operation,
-            git_executable=git_executable,
-            cwd=cwd,
-            env=env,
-            hooks_dir=hooks_dir,
-            deadline=deadline,
-        )
-        outcome: dict[str, object] = {
-            "kind": "completed",
-            "argv": completed.args,
-            "returncode": completed.returncode,
-            "stdout": _encode_invocation_supervisor_stream(completed.stdout),
-            "stderr": _encode_invocation_supervisor_stream(completed.stderr),
-        }
-    except BaseException as exc:
-        outcome = {"kind": "raised", "type": type(exc).__name__, "message": str(exc)}
-    try:
+        # The parent waits for this byte before it can interrupt result reading.
+        # Therefore a parent-requested SIGTERM cannot arrive before this handler
+        # converts it into the normal, bounded Git cleanup path.
+        signal.signal(signal.SIGTERM, _request_invocation_supervisor_cleanup)
+        handler_installed = True
+        _write_invocation_supervisor_cleanup_status(ready_write_fd, _INVOCATION_SUPERVISOR_READY)
+        try:
+            completed = _run_closed_git_process_in_invocation_supervisor(
+                operation,
+                git_executable=git_executable,
+                cwd=cwd,
+                env=env,
+                hooks_dir=hooks_dir,
+                deadline=deadline,
+            )
+            outcome: dict[str, object] = {
+                "kind": "completed",
+                "argv": completed.args,
+                "returncode": completed.returncode,
+                "stdout": _encode_invocation_supervisor_stream(completed.stdout),
+                "stderr": _encode_invocation_supervisor_stream(completed.stderr),
+            }
+        except BaseException as exc:
+            outcome = {"kind": "raised", "type": type(exc).__name__, "message": str(exc)}
         _write_invocation_supervisor_result(write_fd, outcome)
+    except BaseException as exc:
+        # A signal during result serialization still reaches the final cleanup
+        # handshake. Its result is deliberately not trusted by the parent.
+        _write_invocation_supervisor_result(
+            write_fd, {"kind": "raised", "type": type(exc).__name__, "message": str(exc)}
+        )
+    finally:
+        if handler_installed:
+            try:
+                # Once cancellation has been accepted, do not permit a second
+                # SIGTERM to interrupt the cleanup proof.
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            except (OSError, ValueError):
+                pass
+        cleanup_confirmed = _terminate_invocation_supervisor_children(_supervisor_cleanup_deadline(deadline))
+        _write_invocation_supervisor_cleanup_status(
+            cleanup_write_fd,
+            _INVOCATION_SUPERVISOR_CLEANUP_ABSENT
+            if cleanup_confirmed
+            else _INVOCATION_SUPERVISOR_CLEANUP_UNCONFIRMED,
+        )
+        for fd in (write_fd, ready_write_fd, cleanup_write_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        os._exit(0 if cleanup_confirmed else 1)
+
+
+def _read_invocation_supervisor_cleanup_status(
+    read_fd: int, deadline_at: float, *, expected: bytes
+) -> bool:
+    """Read one bounded supervisor-only handshake byte and close its pipe."""
+    try:
+        while time.monotonic() < deadline_at:
+            readable, _writable, _exceptional = select.select(
+                [read_fd], [], [], min(_GROUP_POLL_INTERVAL_SECONDS, deadline_at - time.monotonic())
+            )
+            if not readable:
+                continue
+            return os.read(read_fd, 1) == expected
+        return False
+    except (OSError, ValueError):
+        return False
     finally:
         try:
-            os.close(write_fd)
-        finally:
-            os._exit(0)
+            os.close(read_fd)
+        except OSError:
+            pass
+
+
+def _wait_for_invocation_supervisor_reap(supervisor_pid: int, deadline_at: float) -> bool:
+    """Reap only the known direct supervisor, never a host process."""
+    while time.monotonic() < deadline_at:
+        try:
+            waited_pid, _status = os.waitpid(supervisor_pid, os.WNOHANG)
+        except ChildProcessError:
+            # SIGCHLD may be configured for automatic reaping. The cleanup
+            # pipe is still bound to the original supervisor, so it remains a
+            # valid absence certificate without any PID-directed action.
+            return True
+        except OSError:
+            return False
+        if waited_pid == supervisor_pid:
+            return True
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+    return False
 
 
 def _stop_invocation_supervisor(supervisor_pid: int) -> None:
-    """Bound the known supervisor itself; never signal an arbitrary host PID."""
+    """Last-resort SIGKILL of a still-known direct supervisor only."""
+    try:
+        waited_pid, _status = os.waitpid(supervisor_pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return
+    if waited_pid == supervisor_pid:
+        return
     try:
         os.kill(supervisor_pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        pass
+    except (ProcessLookupError, OSError):
+        return
     try:
         os.waitpid(supervisor_pid, 0)
     except ChildProcessError:
         pass
+
+
+def _cleanup_interrupted_invocation_supervisor(
+    supervisor_pid: int, cleanup_read_fd: int, deadline: GitProtocolDeadline
+) -> bool:
+    """Request and verify bounded Git-only cleanup before propagating failure.
+
+    The parent can signal and reap exactly its known one-invocation supervisor.
+    It never scans, signals, or reaps a host child. The supervisor's subreaper
+    acknowledgement is accepted only after its direct-child set proves the Git
+    leader and every escaped descendant absent.
+    """
+    # The supervisor may first spend its ordinary reserved cleanup phase
+    # terminating the leader and then run the final subreaper absence proof.
+    # Keep the parent handshake bounded while allowing both Git-only phases.
+    cleanup_deadline_at = max(
+        deadline.deadline_at,
+        time.monotonic() + max(0.1, deadline.cleanup_reserve_seconds) * 3,
+    )
+    try:
+        waited_pid, _status = os.waitpid(supervisor_pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        try:
+            os.close(cleanup_read_fd)
+        except OSError:
+            pass
+        return False
+    supervisor_reaped = waited_pid == supervisor_pid
+    if not supervisor_reaped:
+        try:
+            os.kill(supervisor_pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            try:
+                os.close(cleanup_read_fd)
+            except OSError:
+                pass
+            return False
+    cleanup_absent = _read_invocation_supervisor_cleanup_status(
+        cleanup_read_fd, cleanup_deadline_at, expected=_INVOCATION_SUPERVISOR_CLEANUP_ABSENT
+    )
+    if cleanup_absent and (
+        supervisor_reaped or _wait_for_invocation_supervisor_reap(supervisor_pid, cleanup_deadline_at)
+    ):
+        return True
+    _stop_invocation_supervisor(supervisor_pid)
+    return False
 
 
 def _read_invocation_supervisor_result(
@@ -4192,19 +4342,25 @@ def _run_closed_git_process(
 
     The host creates and waits for only the known supervisor PID. It never
     enables subreaping, scans `/proc` for host children, signals them, or reaps
-    them. Containment or result-confirmation failure remains fail-closed.
+    them. A failed or interrupted result read first performs a bounded,
+    supervisor-certified Git-only cleanup handshake before it propagates.
     """
     deadline.execution_seconds()
     try:
-        read_fd, write_fd = os.pipe()
+        result_read_fd, result_write_fd = os.pipe()
+        ready_read_fd, ready_write_fd = os.pipe()
+        cleanup_read_fd, cleanup_write_fd = os.pipe()
         supervisor_pid = os.fork()
     except (AttributeError, OSError) as exc:
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_containment_unavailable") from exc
     if supervisor_pid == 0:
         try:
-            os.close(read_fd)
+            for fd in (result_read_fd, ready_read_fd, cleanup_read_fd):
+                os.close(fd)
             _invocation_supervisor_main(
-                write_fd,
+                result_write_fd,
+                ready_write_fd,
+                cleanup_write_fd,
                 operation,
                 git_executable=git_executable,
                 cwd=cwd,
@@ -4214,10 +4370,60 @@ def _run_closed_git_process(
             )
         finally:
             os._exit(1)
-    os.close(write_fd)
-    outcome = _read_invocation_supervisor_result(read_fd, supervisor_pid, deadline)
+    for fd in (result_write_fd, ready_write_fd, cleanup_write_fd):
+        os.close(fd)
+
+    startup_deadline_at = min(
+        deadline.deadline_at,
+        time.monotonic() + max(0.1, deadline.cleanup_reserve_seconds),
+    )
+    try:
+        supervisor_ready = _read_invocation_supervisor_cleanup_status(
+            ready_read_fd, startup_deadline_at, expected=_INVOCATION_SUPERVISOR_READY
+        )
+    except BaseException as exc:
+        try:
+            os.close(result_read_fd)
+        except OSError:
+            pass
+        if not _cleanup_interrupted_invocation_supervisor(supervisor_pid, cleanup_read_fd, deadline):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
+        raise
+    if not supervisor_ready:
+        try:
+            os.close(result_read_fd)
+        except OSError:
+            pass
+        if not _cleanup_interrupted_invocation_supervisor(supervisor_pid, cleanup_read_fd, deadline):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+
+    try:
+        outcome = _read_invocation_supervisor_result(result_read_fd, supervisor_pid, deadline)
+    except BaseException as exc:
+        try:
+            # The normal reader closes this descriptor in its finally block;
+            # repeat it defensively so an interrupted/custom reader cannot
+            # block the supervisor while it reports cancellation.
+            os.close(result_read_fd)
+        except OSError:
+            pass
+        if not _cleanup_interrupted_invocation_supervisor(supervisor_pid, cleanup_read_fd, deadline):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
+        raise
     if outcome is None:
-        _stop_invocation_supervisor(supervisor_pid)
+        if not _cleanup_interrupted_invocation_supervisor(supervisor_pid, cleanup_read_fd, deadline):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+
+    # Result success is not a cleanup proof. The isolated supervisor writes
+    # this acknowledgement only after its subreaper observes no Git leader or
+    # escaped descendants and exits; `_read_invocation_supervisor_result` has
+    # already reaped that exact known supervisor PID.
+    normal_cleanup_deadline_at = _supervisor_cleanup_deadline(deadline).deadline_at
+    if not _read_invocation_supervisor_cleanup_status(
+        cleanup_read_fd, normal_cleanup_deadline_at, expected=_INVOCATION_SUPERVISOR_CLEANUP_ABSENT
+    ):
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
     if outcome["kind"] == "completed":
         try:

@@ -816,6 +816,116 @@ esac
 
 
 
+def _write_parent_result_read_escape_git(path: Path, pid_file: Path) -> None:
+    path.write_text(
+        f'''#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+  *)
+    (setsid sh -c 'echo $$ > "{pid_file}"; sleep 30') >/dev/null 2>&1 &
+    while [ ! -s "{pid_file}" ]; do sleep 0.01; done
+    sleep 30
+    ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _assert_parent_result_read_cleanup_preserves_host_child(
+    host_child: subprocess.Popen, escaped_pid_file: Path
+) -> None:
+    escaped_pid = int(escaped_pid_file.read_text(encoding="utf-8"))
+    assert _wait_until_pid_gone(escaped_pid), "parent-side result failure leaked an escaped Git descendant"
+    assert os.waitpid(host_child.pid, os.WNOHANG) == (0, 0)
+    os.kill(host_child.pid, 0)
+
+
+def test_parent_result_read_failure_performs_git_only_cleanup_before_fail_closed(monkeypatch, tmp_path):
+    """A malformed/failed parent result read cannot strand the supervisor's Git tree."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux invocation-supervisor regression")
+    fake_git = tmp_path / "parent-result-failure-git"
+    escaped_pid_file = tmp_path / "parent-result-failure-escaped.pid"
+    _write_parent_result_read_escape_git(fake_git, escaped_pid_file)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+
+    real_result_read = exec_mod._read_invocation_supervisor_result
+    reads = 0
+
+    def fail_result_read(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return real_result_read(*args, **kwargs)
+        until = time.monotonic() + 1
+        while not escaped_pid_file.exists() and time.monotonic() < until:
+            time.sleep(0.01)
+        assert escaped_pid_file.exists(), "fixture did not start its escaped Git descendant"
+        return None
+
+    monkeypatch.setattr(exec_mod, "_read_invocation_supervisor_result", fail_result_read)
+    host_child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
+            exec_mod.run_control_plane_git_effective_remote_url(
+                "file:///tmp/origin.git",
+                cwd=str(tmp_path),
+                project_root=str(tmp_path),
+                deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+            )
+        _assert_parent_result_read_cleanup_preserves_host_child(host_child, escaped_pid_file)
+    finally:
+        try:
+            os.killpg(host_child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        host_child.wait(timeout=2)
+
+
+def test_parent_keyboard_interrupt_waits_for_git_only_cleanup_before_propagating(monkeypatch, tmp_path):
+    """KeyboardInterrupt propagates only after the supervisor proves no Git leak."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux invocation-supervisor regression")
+    fake_git = tmp_path / "parent-keyboard-interrupt-git"
+    escaped_pid_file = tmp_path / "parent-keyboard-interrupt-escaped.pid"
+    _write_parent_result_read_escape_git(fake_git, escaped_pid_file)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+
+    real_result_read = exec_mod._read_invocation_supervisor_result
+    reads = 0
+
+    def interrupt_result_read(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return real_result_read(*args, **kwargs)
+        until = time.monotonic() + 1
+        while not escaped_pid_file.exists() and time.monotonic() < until:
+            time.sleep(0.01)
+        assert escaped_pid_file.exists(), "fixture did not start its escaped Git descendant"
+        raise KeyboardInterrupt("injected_parent_result_read_interrupt")
+
+    monkeypatch.setattr(exec_mod, "_read_invocation_supervisor_result", interrupt_result_read)
+    host_child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="injected_parent_result_read_interrupt"):
+            exec_mod.run_control_plane_git_effective_remote_url(
+                "file:///tmp/origin.git",
+                cwd=str(tmp_path),
+                project_root=str(tmp_path),
+                deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+            )
+        _assert_parent_result_read_cleanup_preserves_host_child(host_child, escaped_pid_file)
+    finally:
+        try:
+            os.killpg(host_child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        host_child.wait(timeout=2)
+
+
 def test_invocation_supervisor_allows_contained_git_helper_to_finish(monkeypatch, tmp_path):
     """A normal helper in the dedicated Git group is drained, not misclassified."""
     fake_git = tmp_path / "contained-helper-git"
