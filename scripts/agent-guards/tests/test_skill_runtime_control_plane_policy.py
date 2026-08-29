@@ -210,7 +210,7 @@ def test_reject_option_like_positional_allows_ordinary_value():
 
 
 @pytest.mark.parametrize(
-    "value", ["-c", "origin", "git@host:repo", "https://host/repo?redirect=evil", "https://user@host/repo"]
+    "value", ["-c", "origin", "https://host/repo?redirect=evil", "https://user@host/repo"]
 )
 def test_validate_literal_remote_url_rejects_nonliteral_or_indirect_values(value):
     with pytest.raises(ValueError):
@@ -241,3 +241,45 @@ def test_detached_worktree_path_is_fresh_and_project_confined(tmp_path):
     target.mkdir()
     with pytest.raises(ValueError):
         policy.validate_detached_worktree_path(str(target), str(project))
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "https://github.com/squne121/loop-protocol.git",
+        "ssh://git@github.com/squne121/loop-protocol.git",
+        "git@github.com:squne121/loop-protocol.git",
+        "file:///tmp/loop-protocol.git",
+    ),
+)
+def test_validate_literal_remote_url_accepts_git_transport_matrix(value):
+    assert policy.validate_literal_remote_url(value).value == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "ssh://git:secret@github.com/squne121/loop-protocol.git",
+        "ssh://git@github.com/squne121/loop-protocol.git?option=bad",
+        "git@github.com:",
+        "git@github.com:repo?option=bad",
+    ),
+)
+def test_validate_literal_remote_url_rejects_ssh_indirection_or_secret(value):
+    with pytest.raises(ValueError):
+        policy.validate_literal_remote_url(value)
+
+
+def test_remote_ref_validation_matches_git_ref_component_rules():
+    for allowed in ("refs/heads/release+candidate", "refs/heads/日本語/branch"):
+        assert policy.validate_allowed_remote_ref(allowed).value == allowed
+    for rejected in (
+        "refs/heads/.hidden",
+        "refs/heads/topic.lock",
+        "refs/heads/a//b",
+        "refs/heads/trailing.",
+        "refs/heads/a..b",
+        "refs/heads/a@{b",
+    ):
+        with pytest.raises(ValueError):
+            policy.validate_allowed_remote_ref(rejected)

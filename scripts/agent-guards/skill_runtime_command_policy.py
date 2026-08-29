@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -2266,7 +2267,7 @@ def reject_option_like_positional(value: str) -> None:
 # ---------------------------------------------------------------------------
 
 _LITERAL_REMOTE_URL_SCHEMES = frozenset({"file", "https", "ssh"})
-_REMOTE_REF_RE = re.compile(r"^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_SCP_LIKE_SSH_RE = re.compile(r"^(?:(?P<user>[^@:/\s]+)@)?(?P<host>[A-Za-z0-9][A-Za-z0-9.-]*):(?P<path>[^\s\x00]+)$")
 _PRIVATE_REF_NONCE_RE = re.compile(r"^[a-f0-9]{16,64}$")
 _OBJECT_FORMAT_LENGTHS = {"sha1": 40, "sha256": 64}
 
@@ -2302,15 +2303,32 @@ class DetachedWorktreePath:
 
 
 def validate_literal_remote_url(value: str) -> LiteralRemoteUrl:
-    """Accept a literal URL, never an alias, option, or indirection surface."""
+    """Accept only a concrete network/file URL accepted by Git.
+
+    SSH remotes deliberately include both URI and scp-like grammar.  An SSH
+    username selects an account at the authority and is data, not a rewrite or
+    credential secret; passwords, queries, fragments, aliases, and options are
+    still rejected before any Git command is constructed.
+    """
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError("literal_remote_url_invalid")
     if any(char.isspace() for char in value) or "\x00" in value or value.startswith("-"):
         raise ValueError("literal_remote_url_invalid")
+    # URI parsing must take precedence: otherwise `ssh://host/path` could
+    # be misread as an scp-like `ssh:...` value.
+    scp_like = _SCP_LIKE_SSH_RE.fullmatch(value) if "://" not in value else None
+    if scp_like is not None:
+        # `host:path` is Git's SSH shorthand. A colon remains required, so a
+        # remote alias cannot enter this closed semantic surface.
+        if not scp_like.group("path").lstrip("/") or "?" in value or "#" in value:
+            raise ValueError("literal_remote_url_invalid")
+        return LiteralRemoteUrl(value)
     parsed = urlparse(value)
     if parsed.scheme not in _LITERAL_REMOTE_URL_SCHEMES or (not parsed.netloc and parsed.scheme != "file"):
         raise ValueError("literal_remote_url_invalid")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+    if parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("literal_remote_url_invalid")
+    if parsed.scheme != "ssh" and parsed.username:
         raise ValueError("literal_remote_url_invalid")
     if parsed.scheme == "file" and (parsed.netloc not in ("", "localhost") or not parsed.path.startswith("/")):
         raise ValueError("literal_remote_url_invalid")
@@ -2320,22 +2338,44 @@ def validate_literal_remote_url(value: str) -> LiteralRemoteUrl:
 
 
 def validate_allowed_remote_ref(value: str) -> AllowedRemoteRef:
-    if not isinstance(value, str) or not _REMOTE_REF_RE.fullmatch(value) or ".." in value or value.endswith("/"):
+    """Validate the `refs/heads/` subset of Git's refname grammar.
+
+    The closed builder does not accept an arbitrary ref namespace. Within the
+    allowed namespace this preserves Git's meaningful grammar, including `+`
+    and Unicode, while rejecting every special/ref-format-invalid component.
+    """
+    prefix = "refs/heads/"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise ValueError("remote_ref_not_allowed")
+    suffix = value.removeprefix(prefix)
+    forbidden = set(" ~^:?*[")
+    if (
+        not suffix
+        or value.endswith("/")
+        or value.endswith(".")
+        or "//" in value
+        or ".." in value
+        or "@{" in value
+        or "\\" in value
+        or any(char in forbidden or ord(char) < 32 or ord(char) == 127 for char in value)
+        or any(component.startswith(".") or component.endswith(".lock") for component in value.split("/"))
+    ):
         raise ValueError("remote_ref_not_allowed")
     return AllowedRemoteRef(value)
 
 
-def make_control_plane_private_ref(nonce: str) -> ControlPlanePrivateRef:
-    if not isinstance(nonce, str) or not _PRIVATE_REF_NONCE_RE.fullmatch(nonce):
-        raise ValueError("private_ref_nonce_invalid")
+def make_control_plane_private_ref() -> ControlPlanePrivateRef:
+    """Allocate a private ref name; callers never select its nonce."""
+    nonce = secrets.token_hex(16)
     return ControlPlanePrivateRef(f"refs/loop-protocol/control-plane/default-ref/{nonce}")
 
 
 def validate_control_plane_private_ref(value: str) -> ControlPlanePrivateRef:
     prefix = "refs/loop-protocol/control-plane/default-ref/"
-    if not isinstance(value, str) or not value.startswith(prefix):
+    nonce = value.removeprefix(prefix) if isinstance(value, str) else ""
+    if not isinstance(value, str) or not value.startswith(prefix) or not _PRIVATE_REF_NONCE_RE.fullmatch(nonce):
         raise ValueError("private_ref_not_allowed")
-    return make_control_plane_private_ref(value.removeprefix(prefix))
+    return ControlPlanePrivateRef(value)
 
 
 def validate_repository_object_format(value: str) -> RepositoryObjectFormat:

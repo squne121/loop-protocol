@@ -36,7 +36,6 @@ from skill_runtime_command_policy import (
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
     ExactSkillRuntimeCommand,
-    GitSubprocessConfigProbeFailed,
     _is_safe_issue_artifact_path,
     command_allows_root_no_worktree,
     current_branch,
@@ -51,8 +50,6 @@ from skill_runtime_command_policy import (
     is_exact_skill_runtime_fixture_executor_command,
     is_exact_skill_runtime_repair_action_apply_executor_command,
     load_registry_entry,
-    parse_config_get_regexp_name_only_nul,
-    reject_insteadof_rewrite,
     resolve_active_issue,
     resolve_default_branch,
     resolve_project_root,
@@ -3276,6 +3273,7 @@ def main(argv: list[str] | None = None) -> int:
 # ---------------------------------------------------------------------------
 
 _GIT_SUBPROCESS_EXECUTABLE_CACHE: str | None = None
+_GIT_NO_LAZY_FETCH_CAPABILITY_CACHE: dict[str, bool] = {}
 _CONTROL_PLANE_WORKTREE_LOCK_REASON = "loop-protocol-control-plane-default-ref"
 
 # The short-lived per-invocation supervisor, never the long-lived executor
@@ -3297,7 +3295,9 @@ def _enable_linux_child_subreaper() -> bool:
 
     The supervisor remains alive until its one Git invocation reaches a
     confirmed terminal state, so an escaped descendant is attributable to the
-    known Git leader rather than to the host.
+    known Git leader rather than to the host. This containment implementation
+    is deliberately Linux/WSL-only and fail-closed on other platforms; it runs
+    only in the short-lived single-threaded supervisor after `fork()`.
     """
     if not sys.platform.startswith("linux"):
         return False
@@ -3365,6 +3365,7 @@ def resolve_git_subprocess_executable(project_root: str) -> str:
 def _reset_git_subprocess_executable_cache_for_tests() -> None:
     global _GIT_SUBPROCESS_EXECUTABLE_CACHE
     _GIT_SUBPROCESS_EXECUTABLE_CACHE = None
+    _GIT_NO_LAZY_FETCH_CAPABILITY_CACHE.clear()
 
 
 def _resolve_trusted_ssh_command() -> str:
@@ -3410,14 +3411,19 @@ class _GitOperation:
 _SUPPORTED_GIT_OPERATION_KINDS = frozenset(
     {
         "probe_rewrite",
+        "probe_no_lazy_fetch_support",
+        "probe_promisor_remote",
         "effective_remote_url",
         "observe_default_ref",
         "repository_object_format",
         "fetch_default_ref",
+        "fetch_default_ref_no_lazy",
         "read_private_ref_oid",
         "require_commit_object",
         "read_worktree_head",
         "add_detached_locked_worktree",
+        "remove_detached_locked_worktree",
+        "list_worktrees_porcelain",
         "delete_private_ref_cas",
     }
 )
@@ -3487,13 +3493,28 @@ def _revalidate_semantic_operation(operation: _GitOperation, project_root: str) 
         raise TypeError("git_operation_required")
     if operation.kind not in _SUPPORTED_GIT_OPERATION_KINDS:
         raise ValueError("git_operation_not_supported")
-    if operation.kind != "add_detached_locked_worktree":
-        return operation
-    return _GitOperation(
-        operation.kind,
-        object_id=operation.object_id,
-        worktree_path=_revalidate_worktree_path(operation.worktree_path, project_root, require_fresh=True),
-    )
+    if operation.kind == "add_detached_locked_worktree":
+        return _GitOperation(
+            operation.kind,
+            object_id=operation.object_id,
+            worktree_path=_revalidate_worktree_path(operation.worktree_path, project_root, require_fresh=True),
+        )
+    if operation.kind == "remove_detached_locked_worktree":
+        return _GitOperation(
+            operation.kind,
+            worktree_path=_revalidate_worktree_path(operation.worktree_path, project_root, require_fresh=False),
+        )
+    # `fetch_default_ref_no_lazy` is internally synthesized only after the
+    # trusted executable passed the fixed capability probe. Rebuild every
+    # payload-bearing operation so a forged dataclass cannot smuggle state.
+    if operation.kind in {"fetch_default_ref", "fetch_default_ref_no_lazy"}:
+        return _GitOperation(
+            "fetch_default_ref",
+            remote_url=operation.remote_url,
+            remote_ref=operation.remote_ref,
+            private_ref=operation.private_ref,
+        )
+    return operation
 
 
 @dataclass(frozen=True)
@@ -3673,7 +3694,8 @@ def _terminate_invocation_supervisor_children(deadline: GitProtocolDeadline) -> 
         return False
     if children and not _reap_tracked_children(children):
         return False
-    return not _observe_invocation_supervisor_children()
+    final_children = _observe_invocation_supervisor_children()
+    return final_children is not None and not final_children
 
 
 def _signal_tracked_descendants(descendants: set[_TrackedGitDescendant], signal_number: int) -> bool:
@@ -3813,6 +3835,10 @@ def _operation_arguments(operation: _GitOperation, *, cwd: str) -> list[str]:
         raise ValueError("git_operation_not_supported")
     if operation.kind == "probe_rewrite":
         return ["-C", cwd, "config", "--get-regexp", "--name-only", "-z", INSTEADOF_CONFIG_NAME_REGEXP]
+    if operation.kind == "probe_no_lazy_fetch_support":
+        return ["--version"]
+    if operation.kind == "probe_promisor_remote":
+        return ["config", "--local", "--get-regexp", r"^remote\..*\.promisor$"]
     if operation.kind == "effective_remote_url":
         remote_url = _revalidate_literal_remote_url(operation.remote_url)
         return ["ls-remote", "--get-url", remote_url.value]
@@ -3821,7 +3847,7 @@ def _operation_arguments(operation: _GitOperation, *, cwd: str) -> list[str]:
         return ["ls-remote", "--exit-code", "--symref", remote_url.value, "HEAD"]
     if operation.kind == "repository_object_format":
         return ["rev-parse", "--show-object-format"]
-    if operation.kind == "fetch_default_ref":
+    if operation.kind in {"fetch_default_ref", "fetch_default_ref_no_lazy"}:
         remote_url = _revalidate_literal_remote_url(operation.remote_url)
         remote_ref = _revalidate_allowed_remote_ref(operation.remote_ref)
         private_ref = _revalidate_private_ref(operation.private_ref)
@@ -3856,6 +3882,13 @@ def _operation_arguments(operation: _GitOperation, *, cwd: str) -> list[str]:
             path.value,
             object_id.value,
         ]
+    if operation.kind == "remove_detached_locked_worktree":
+        path = operation.worktree_path
+        if not isinstance(path, DetachedWorktreePath):
+            raise TypeError("detached_worktree_path_required")
+        return ["worktree", "remove", "--force", "--force", path.value]
+    if operation.kind == "list_worktrees_porcelain":
+        return ["worktree", "list", "--porcelain"]
     if operation.kind == "delete_private_ref_cas":
         private_ref = _revalidate_private_ref(operation.private_ref)
         object_id = _revalidate_object_id(operation.object_id)
@@ -3864,16 +3897,10 @@ def _operation_arguments(operation: _GitOperation, *, cwd: str) -> list[str]:
 
 
 def _exact_git_argv(operation: _GitOperation, *, git_executable: str, cwd: str, hooks_dir: str) -> list[str]:
-    if operation.kind == "probe_rewrite":
-        return [
-            git_executable,
-            "--no-replace-objects",
-            "-c",
-            "core.hooksPath=" + hooks_dir,
-            "-c",
-            "credential.helper=",
-            *_operation_arguments(operation, cwd=cwd),
-        ]
+    no_lazy_fetch = ("--no-lazy-fetch",) if operation.kind in {
+        "probe_no_lazy_fetch_support",
+        "fetch_default_ref_no_lazy",
+    } else ()
     return [
         git_executable,
         "--no-replace-objects",
@@ -3881,6 +3908,7 @@ def _exact_git_argv(operation: _GitOperation, *, git_executable: str, cwd: str, 
         "core.hooksPath=" + hooks_dir,
         "-c",
         "credential.helper=",
+        *no_lazy_fetch,
         *_operation_arguments(operation, cwd=cwd),
     ]
 
@@ -4447,23 +4475,77 @@ def _run_closed_git_process(
     raise AssertionError("unreachable_invocation_supervisor_error")
 
 
-def _probe_insteadof_rewrite_keys(
+def _git_supports_no_lazy_fetch(
     git_executable: str, *, cwd: str, env: dict[str, str], hooks_dir: str, deadline: GitProtocolDeadline
-) -> list[str]:
+) -> bool:
+    """Probe the trusted executable once; never infer capability from an env var."""
+    cached = _GIT_NO_LAZY_FETCH_CAPABILITY_CACHE.get(git_executable)
+    if cached is not None:
+        return cached
     probe = _run_closed_git_process(
-        _GitOperation("probe_rewrite"),
+        _GitOperation("probe_no_lazy_fetch_support"),
         git_executable=git_executable,
         cwd=cwd,
         env=env,
         hooks_dir=hooks_dir,
         deadline=deadline,
     )
-    if probe.returncode == 0:
-        return parse_config_get_regexp_name_only_nul(probe.stdout)
-    if probe.returncode == 1 and not probe.stderr:
-        return []
-    stderr = probe.stderr.decode("utf-8", errors="replace") if probe.stderr else ""
-    raise GitSubprocessConfigProbeFailed(f"probe_nonzero_exit:{probe.returncode}:{stderr.strip()!r}")
+    supported = probe.returncode == 0
+    _GIT_NO_LAZY_FETCH_CAPABILITY_CACHE[git_executable] = supported
+    return supported
+
+
+def _repository_has_promisor_remote(
+    git_executable: str, *, cwd: str, env: dict[str, str], hooks_dir: str, deadline: GitProtocolDeadline
+) -> bool:
+    """Detect a local partial-clone promisor without consulting ambient config."""
+    probe = _run_closed_git_process(
+        _GitOperation("probe_promisor_remote"),
+        git_executable=git_executable,
+        cwd=cwd,
+        env=env,
+        hooks_dir=hooks_dir,
+        deadline=deadline,
+    )
+    if probe.returncode == 1:
+        return False
+    if probe.returncode != 0:
+        raise RuntimeError(f"promisor_remote_probe_failed:{probe.returncode}")
+    return any(
+        line.rsplit(maxsplit=1)[-1].lower() in {"true", "yes", "on", "1"}
+        for line in (probe.stdout or "").splitlines()
+        if line.split()
+    )
+
+
+def _require_literal_effective_remote_url(
+    remote_url: LiteralRemoteUrl,
+    *,
+    git_executable: str,
+    cwd: str,
+    env: dict[str, str],
+    hooks_dir: str,
+    deadline: GitProtocolDeadline,
+) -> None:
+    """Fail closed only when Git rewrites the transport actually in use.
+
+    An unrelated `insteadOf` or any `pushInsteadOf` key is not authority for a
+    read/fetch protocol. `ls-remote --get-url` is local/no-network and returns
+    the exact URL Git would use for this literal remote.
+    """
+    effective = _require_success(
+        _run_closed_git_process(
+            _GitOperation("effective_remote_url", remote_url=remote_url),
+            git_executable=git_executable,
+            cwd=cwd,
+            env=env,
+            hooks_dir=hooks_dir,
+            deadline=deadline,
+        ),
+        "effective_remote_url",
+    )
+    if (effective.stdout or "").rstrip("\n") != remote_url.value:
+        raise RuntimeError("effective_remote_url_mismatch")
 
 
 def _execute_semantic_git(
@@ -4479,17 +4561,44 @@ def _execute_semantic_git(
     git = resolve_git_subprocess_executable(project_root)
     env = sanitized_git_subprocess_env(project_root)
     hooks_dir = git_subprocess_trusted_hooks_dir(scratch_root or project_root)
-    reject_insteadof_rewrite(
-        _probe_insteadof_rewrite_keys(git, cwd=cwd, env=env, hooks_dir=hooks_dir, deadline=deadline)
-    )
-    return _run_closed_git_process(
-        operation,
-        git_executable=git,
-        cwd=cwd,
-        env=env,
-        hooks_dir=hooks_dir,
-        deadline=deadline,
-    )
+    try:
+        if operation.kind in {"observe_default_ref", "fetch_default_ref"}:
+            remote_url = _revalidate_literal_remote_url(operation.remote_url)
+            _require_literal_effective_remote_url(
+                remote_url,
+                git_executable=git,
+                cwd=cwd,
+                env=env,
+                hooks_dir=hooks_dir,
+                deadline=deadline,
+            )
+        if operation.kind == "fetch_default_ref":
+            if _git_supports_no_lazy_fetch(
+                git, cwd=cwd, env=env, hooks_dir=hooks_dir, deadline=deadline
+            ):
+                operation = _GitOperation(
+                    "fetch_default_ref_no_lazy",
+                    remote_url=operation.remote_url,
+                    remote_ref=operation.remote_ref,
+                    private_ref=operation.private_ref,
+                )
+            elif _repository_has_promisor_remote(
+                git, cwd=cwd, env=env, hooks_dir=hooks_dir, deadline=deadline
+            ):
+                raise RuntimeError("git_no_lazy_fetch_not_supported_for_promisor_repository")
+        return _run_closed_git_process(
+            operation,
+            git_executable=git,
+            cwd=cwd,
+            env=env,
+            hooks_dir=hooks_dir,
+            deadline=deadline,
+        )
+    finally:
+        try:
+            shutil.rmtree(hooks_dir)
+        except OSError as exc:
+            raise GitProtocolProcessGroupCleanupFailed("git_subprocess_hooks_cleanup_failed") from exc
 
 
 def _require_success(result: subprocess.CompletedProcess, operation: str) -> subprocess.CompletedProcess:
@@ -4562,7 +4671,6 @@ def run_control_plane_git_repository_object_format(
 def run_control_plane_git_fetch_default_ref(
     remote_url: LiteralRemoteUrl,
     remote_ref: AllowedRemoteRef,
-    nonce: str,
     *,
     cwd: str,
     project_root: str,
@@ -4571,7 +4679,7 @@ def run_control_plane_git_fetch_default_ref(
 ) -> ControlPlanePrivateRef:
     remote_url = _revalidate_literal_remote_url(remote_url)
     remote_ref = _revalidate_allowed_remote_ref(remote_ref)
-    private_ref = make_control_plane_private_ref(nonce)
+    private_ref = make_control_plane_private_ref()
     _require_success(
         _execute_semantic_git(
             _GitOperation("fetch_default_ref", remote_url=remote_url, remote_ref=remote_ref, private_ref=private_ref),
@@ -4653,6 +4761,64 @@ def run_control_plane_git_read_worktree_head(
     return validate_repository_object_id((result.stdout or "").strip(), object_format)
 
 
+def _rollback_deadline(deadline: GitProtocolDeadline) -> GitProtocolDeadline:
+    """Bound compensation after a terminal add has consumed protocol time.
+
+    This is not a new normal-protocol deadline. It is a bounded recovery window
+    reserved solely to remove a worktree that this builder just created and to
+    prove both its path and its catalog entry are absent.
+    """
+    reserve = _validate_deadline_value(deadline.cleanup_reserve_seconds, "cleanup_reserve")
+    return GitProtocolDeadline(
+        deadline_at=max(deadline.deadline_at, time.monotonic() + reserve * 6),
+        cleanup_reserve_seconds=reserve,
+    )
+
+
+def _worktree_catalog_contains_path(porcelain: str, path: DetachedWorktreePath) -> bool:
+    target = os.path.realpath(path.value)
+    return any(
+        line.startswith("worktree ") and os.path.realpath(line.removeprefix("worktree ")) == target
+        for line in porcelain.splitlines()
+    )
+
+
+def _rollback_detached_locked_worktree(
+    path: DetachedWorktreePath,
+    *,
+    cwd: str,
+    project_root: str,
+    scratch_root: str | None,
+    deadline: GitProtocolDeadline,
+) -> None:
+    recovery_deadline = _rollback_deadline(deadline)
+    if Path(path.value).exists():
+        _require_success(
+            _execute_semantic_git(
+                _GitOperation("remove_detached_locked_worktree", worktree_path=path),
+                cwd=cwd,
+                project_root=project_root,
+                scratch_root=scratch_root,
+                deadline=recovery_deadline,
+            ),
+            "remove_detached_locked_worktree",
+        )
+    if Path(path.value).exists():
+        raise RuntimeError("detached_worktree_rollback_path_present")
+    catalog = _require_success(
+        _execute_semantic_git(
+            _GitOperation("list_worktrees_porcelain"),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=recovery_deadline,
+        ),
+        "list_worktrees_porcelain",
+    )
+    if _worktree_catalog_contains_path(catalog.stdout or "", path):
+        raise RuntimeError("detached_worktree_rollback_catalog_present")
+
+
 def run_control_plane_git_add_detached_locked_worktree(
     path: DetachedWorktreePath,
     commit: RepositoryObjectId,
@@ -4667,28 +4833,43 @@ def run_control_plane_git_add_detached_locked_worktree(
     run_control_plane_git_require_commit_object(
         commit, cwd=cwd, project_root=project_root, deadline=deadline, scratch_root=scratch_root
     )
-    _require_success(
-        _execute_semantic_git(
-            _GitOperation("add_detached_locked_worktree", object_id=commit, worktree_path=path),
-            cwd=cwd,
-            project_root=project_root,
-            scratch_root=scratch_root,
-            deadline=deadline,
-        ),
-        "add_detached_locked_worktree",
-    )
-    object_format = validate_repository_object_format("sha1" if len(commit.value) == 40 else "sha256")
-    if (
-        run_control_plane_git_read_worktree_head(
-            path,
-            object_format,
-            project_root=project_root,
-            deadline=deadline,
-            scratch_root=scratch_root,
+    add_attempted = False
+    try:
+        add_attempted = True
+        _require_success(
+            _execute_semantic_git(
+                _GitOperation("add_detached_locked_worktree", object_id=commit, worktree_path=path),
+                cwd=cwd,
+                project_root=project_root,
+                scratch_root=scratch_root,
+                deadline=deadline,
+            ),
+            "add_detached_locked_worktree",
         )
-        != commit
-    ):
-        raise RuntimeError("detached_worktree_head_mismatch")
+        object_format = validate_repository_object_format("sha1" if len(commit.value) == 40 else "sha256")
+        if (
+            run_control_plane_git_read_worktree_head(
+                path,
+                object_format,
+                project_root=project_root,
+                deadline=deadline,
+                scratch_root=scratch_root,
+            )
+            != commit
+        ):
+            raise RuntimeError("detached_worktree_head_mismatch")
+    except BaseException:
+        # A result-read interruption may happen after `git worktree add`
+        # succeeded, so the fresh path is also checked, not only a local flag.
+        if add_attempted and Path(path.value).exists():
+            _rollback_detached_locked_worktree(
+                path,
+                cwd=cwd,
+                project_root=project_root,
+                scratch_root=scratch_root,
+                deadline=deadline,
+            )
+        raise
 
 
 def run_control_plane_git_delete_private_ref_cas(
