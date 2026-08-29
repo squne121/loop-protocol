@@ -777,7 +777,7 @@ OWNER の敵対的レビュー（PR #1634 iteration 2）により、初回実装
 
 Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。
 
-## 13. pr_reviewer_guard.py — agent-scoped hook（Issue #1881）
+## 13. pr_reviewer_guard.py — agent-scoped hook（エージェント限定 hook、Issue #1881）
 
 `pr_reviewer_guard.py` は project-level `.claude/settings.json` の
 `hook_boundaries_manifest_v1`（本ドキュメント第2節）には **登録されない**。

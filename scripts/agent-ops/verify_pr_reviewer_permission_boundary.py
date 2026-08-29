@@ -59,7 +59,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -323,11 +322,11 @@ def run_runtime_case(
         )
         process_error: str | None = None
         returncode = proc.returncode
-        stdout, stderr = proc.stdout, proc.stderr
+        stdout = proc.stdout
     except (OSError, subprocess.TimeoutExpired) as exc:
         process_error = str(exc)
         returncode = None
-        stdout, stderr = "", ""
+        stdout = ""
 
     evidence: dict[str, Any] | None = None
     if evidence_json.exists():
@@ -378,7 +377,16 @@ def classify_positive_case(result: dict[str, Any]) -> str:
 # ─── Artifact log (runtime-verification-policy.md format, allowlisted fields) ──
 
 
-def write_artifact_log(*, artifacts_dir: Path, ac: str, result: str, exit_code: int, reason: str, input_summary: str, output_summary: str) -> Path:
+def write_artifact_log(
+    *,
+    artifacts_dir: Path,
+    ac: str,
+    result: str,
+    exit_code: int,
+    reason: str,
+    input_summary: str,
+    output_summary: str,
+) -> Path:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     log_path = artifacts_dir / f"runtime-verification-{ac}-{timestamp}.log"
