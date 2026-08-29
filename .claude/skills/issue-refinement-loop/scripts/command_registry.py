@@ -635,6 +635,52 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "preflight_result_path": {"type": "path", "required": True},
         },
     },
+    # Issue #2396: `structural_repair_action.apply` controlled consumer --
+    # bridges a repair_issue_contract.py build_structural_repair_bundle()
+    # auto_apply_safe candidate (template-derived structural_repair_action/v1,
+    # Issue #995) to the SAME controlled edit_issue_txn.py transaction core
+    # `repair_action.apply` already uses (single mutation, stale guard,
+    # authoritative readback -- never a raw `gh issue edit` call). Distinct
+    # `execution_class` from `repair_action.apply` (AC1) -- the two lanes
+    # read different producer fields (`structural_repair_action` vs
+    # `repair_action`) and must never be routed interchangeably.
+    "structural_repair_action.apply": {
+        "id": "structural_repair_action.apply",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}",
+            "--repo", "{repo}",
+            "--apply-structural-repair-action", "{preflight_result_path}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_structural_repair_action_apply",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        "network_effect": "github_mutation",
+        "stdin_contract": "none",
+        "stdout_contract": "structural_repair_apply_result/v1",
+        # Same worst-case critical-path reasoning as `repair_action.apply`
+        # above: inner subprocess budgets
+        # (REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS (30s) +
+        # REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS (60s) = 90s
+        # worst-case critical path, reused as-is by the structural consumer
+        # via the SAME shared dispatch core) + a readback reserve (one
+        # GH_API_TIMEOUT-bounded `_fetch_issue()` read = 30s) + a margin
+        # (30s) for interpreter startup / argv parsing / non-subprocess
+        # local work (the multi-item body synthesis itself is pure
+        # in-process string processing, no extra subprocess).
+        # 90 + 30 + 30 = 150.
+        "timeout_seconds": 150,
+        "mutation": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "preflight_result_path": {"type": "path", "required": True},
+        },
+    },
     "gh.issue.view": {
         "id": "gh.issue.view",
         "argv": [
