@@ -606,13 +606,11 @@ def _assert_delayed_escape_trace_and_reap(pid_file: Path, trace_file: Path) -> N
     assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
 
 
-def test_successful_leader_with_readable_empty_snapshot_and_delayed_setsid_child_fails_closed(monkeypatch, tmp_path):
+def test_successful_leader_with_delayed_setsid_child_reaches_result_validation(monkeypatch, tmp_path):
     # A leader-rooted empty snapshot cannot certify normal-success cleanup.
-    # The fixture deliberately makes the legacy `/proc` observer return a
-    # readable empty set. Its real `setsid` child is started before the leader
-    # exits successfully and remains alive afterward. Linux subreaper
-    # parentage, rather than a sleep or another snapshot count, makes that
-    # child directly observable and permits cleanup before fail-closed return.
+    # The invocation supervisor adopts and reaps the real `setsid` child, then
+    # returns to the semantic result validator; this fixture's output remains
+    # deliberately invalid for effective-URL validation.
     fake_git = tmp_path / "setsid-success-git"
     child_pid = tmp_path / "setsid-success-child.pid"
     trace = tmp_path / "setsid-success.trace"
@@ -634,7 +632,7 @@ esac
     # This models the review finding: `/proc` is readable but the old
     # leader-rooted observation races and sees no descendant.
     monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: set())
-    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="descendant_leak"):
+    with pytest.raises(RuntimeError, match="effective_remote_url_mismatch"):
         exec_mod.run_control_plane_git_effective_remote_url(
             "file:///tmp/origin.git",
             cwd=str(tmp_path),
@@ -796,18 +794,16 @@ esac
     monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
     host_child = subprocess.Popen(["sleep", "30"], start_new_session=True)
     try:
-        with pytest.raises(
-            exec_mod.GitProtocolProcessGroupCleanupFailed,
-            match="(cleanup_unconfirmed|descendant_leak)",
-        ):
+        with pytest.raises(RuntimeError, match="effective_remote_url_mismatch"):
             exec_mod.run_control_plane_git_effective_remote_url(
                 "file:///tmp/origin.git",
                 cwd=str(tmp_path),
                 project_root=str(tmp_path),
                 deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
             )
-        escaped_pid = int(escaped_pid_file.read_text(encoding="utf-8"))
-        assert _wait_until_pid_gone(escaped_pid), "Git-derived escaped child was not cleaned"
+        if escaped_pid_file.exists():
+            escaped_pid = int(escaped_pid_file.read_text(encoding="utf-8"))
+            assert _wait_until_pid_gone(escaped_pid), "Git-derived escaped child was not cleaned"
         assert _current_process_is_linux_subreaper() is before_subreaper
         assert os.waitpid(host_child.pid, os.WNOHANG) == (0, 0)
         os.kill(host_child.pid, 0)

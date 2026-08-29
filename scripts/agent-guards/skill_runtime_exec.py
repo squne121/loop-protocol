@@ -3929,7 +3929,10 @@ def _drain_invocation_children_after_leader_exit(pgid: int, deadline: GitProtoco
                 if os.getsid(child.pid) != leader_session_id:
                     if not _terminate_invocation_supervisor_children(deadline):
                         return "unconfirmed"
-                    return "escaped"
+                    # It is still a Git-derived child in this isolated
+                    # supervisor. Confirmed cleanup is sufficient; do not
+                    # reclassify it as a host child or leave it running.
+                    return "absent"
             except OSError:
                 return "unconfirmed"
         if not _reap_tracked_children(children):
@@ -3942,7 +3945,7 @@ def _drain_invocation_children_after_leader_exit(pgid: int, deadline: GitProtoco
         return "absent"
     if not _terminate_invocation_supervisor_children(deadline):
         return "unconfirmed"
-    return "escaped"
+    return "absent"
 
 
 def _run_closed_git_process_in_invocation_supervisor(
