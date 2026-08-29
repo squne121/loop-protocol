@@ -1341,7 +1341,10 @@ def parse_exact_skill_runtime_structural_repair_action_apply_command(
     if not issue_number.isdigit() or int(issue_number) <= 0 or repo != TRUSTED_REPO_SLUG:
         return None
     policy = SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"].get(command_id)
-    if not isinstance(policy, dict) or policy.get("execution_class") != SKILL_RUNTIME_EXECUTION_CLASS_STRUCTURAL_REPAIR_ACTION_APPLY:
+    if (
+        not isinstance(policy, dict)
+        or policy.get("execution_class") != SKILL_RUNTIME_EXECUTION_CLASS_STRUCTURAL_REPAIR_ACTION_APPLY
+    ):
         return None
     if not _is_safe_issue_artifact_path(preflight_result_path, root, issue_number):
         return None
