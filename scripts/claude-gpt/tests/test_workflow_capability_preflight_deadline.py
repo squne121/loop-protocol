@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _TESTS_DIR = Path(__file__).resolve().parent
 _SCRIPTS_DIR = _TESTS_DIR.parent
 _REPO_ROOT = _SCRIPTS_DIR.parent.parent
@@ -111,6 +113,44 @@ def test_spark_none_skips_env_probe_and_timeout_semantics_are_preserved(monkeypa
     )
     assert required["checks"]["spark"]["status"] == wcp.SPARK_UNAVAILABLE
     assert required["decision"] == wcp.DECISION_BLOCKED
+
+
+@pytest.mark.parametrize("stdout", ("not-json", "[]"))
+def test_successful_malformed_spark_output_returns_structured_reason(monkeypatch, stdout):
+    monkeypatch.setattr(wcp.trusted_uv_mod, "check_trusted_uv", _ready_uv)
+    monkeypatch.setattr(
+        wcp,
+        "_run_env_only_preflight",
+        lambda _deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED, stdout=stdout),
+    )
+    monkeypatch.setattr(
+        wcp,
+        "_github_auth_probe",
+        lambda _deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED),
+    )
+    monkeypatch.setattr(
+        wcp,
+        "_github_repo_read_probe",
+        lambda _repo, _deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED),
+    )
+    monkeypatch.setattr(
+        wcp,
+        "_controlled_github_read_probe",
+        lambda _repo, _deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED),
+    )
+
+    result = wcp.assess(
+        project_root=str(_REPO_ROOT),
+        profile="issue-to-impl",
+        repo=_REPO,
+        spark_mode="preferred",
+        spark_fallback="allowed",
+        planned_operations=[],
+    )
+
+    assert "preflight_probe_malformed_output:spark_env_only" in result["reasons"]
+    assert result["checks"]["spark"]["status"] == wcp.SPARK_FALLBACK_ONLY
+    assert result["decision"] == wcp.DECISION_DEGRADED
 
 
 def test_producer_cli_without_deadline_creates_local_deadline(monkeypatch):

@@ -507,11 +507,19 @@ def assess(
         spark_status = SPARK_NOT_REQUIRED
     else:
         spark_outcome = _run_env_only_preflight(deadline_ns)
-        _append_probe_reason(reasons, "spark_env_only", spark_outcome)
         if spark_outcome.kind == PROBE_COMPLETED:
-            env_only_result = json.loads(spark_outcome.stdout)
+            try:
+                env_only_result = json.loads(spark_outcome.stdout)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                spark_outcome = ProbeOutcome(PROBE_MALFORMED_OUTPUT)
+                env_only_result = {}
+            else:
+                if not isinstance(env_only_result, dict):
+                    spark_outcome = ProbeOutcome(PROBE_MALFORMED_OUTPUT)
+                    env_only_result = {}
         else:
             env_only_result = {}
+        _append_probe_reason(reasons, "spark_env_only", spark_outcome)
         spark_status = _spark_capability(spark_mode, spark_fallback, env_only_result)
     if spark_status == SPARK_UNAVAILABLE:
         reasons.append(
