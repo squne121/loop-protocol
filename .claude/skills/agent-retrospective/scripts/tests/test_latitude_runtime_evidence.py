@@ -152,6 +152,17 @@ def test_available_requires_null_reason_code():
         vrs.validate_latitude_runtime_evidence(instance)
 
 
+@pytest.mark.parametrize("metric_key", ["trace_count", "span_count", "duration_ms"])
+def test_available_requires_non_null_metric(metric_key: str):
+    """PR #2392 review blocker: `availability: "available"` must require ALL 3 allowlisted
+    metrics (not just `evidence_identity`/`evidence_ref`) to be non-null, matching the Issue's
+    `## latitude_runtime_evidence/v1` contract text."""
+    instance = _make_available_instance()
+    instance["metrics"][metric_key] = None
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        vrs.validate_latitude_runtime_evidence(instance)
+
+
 def test_unavailable_requires_null_evidence_identity():
     instance = _make_unavailable_instance()
     instance["evidence_identity"] = "sha256:" + "0" * 64
@@ -404,34 +415,52 @@ def test_collector_success_projects_only_allowlisted_metrics():
     vrs.validate_latitude_runtime_evidence(result)
 
 
-def test_collector_negative_metric_values_coerced_to_null():
+def test_collector_negative_metric_value_becomes_malformed_output_error():
+    """A single out-of-range metric (coerced to null by `_coerce_latitude_metric`) must not
+    surface as `availability: "available"` with a null metric -- Issue #2375's
+    `latitude_runtime_evidence/v1` contract requires all 3 allowlisted metrics to be non-null
+    integers whenever `availability == "available"`; the whole result normalizes to a closed
+    `error`/`malformed_output` instead (see PR #2392 review blocker)."""
     payload = '{"trace_count": -1, "span_count": 2, "duration_ms": 3}'
 
     def negative_runner(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
 
     result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=negative_runner)
-    assert result["metrics"]["trace_count"] is None
+    assert result["availability"] == "error"
+    assert result["reason_code"] == "malformed_output"
+    assert result["metrics"] == {"trace_count": None, "span_count": None, "duration_ms": None}
     vrs.validate_latitude_runtime_evidence(result)
 
 
-def test_collector_boolean_metric_values_coerced_to_null():
+def test_collector_boolean_metric_value_becomes_malformed_output_error():
+    """Same as above for a boolean (not `int`) metric value coerced to null."""
     payload = '{"trace_count": true, "span_count": 2, "duration_ms": 3}'
 
     def bool_runner(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
 
     result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=bool_runner)
-    assert result["metrics"]["trace_count"] is None
+    assert result["availability"] == "error"
+    assert result["reason_code"] == "malformed_output"
+    assert result["metrics"] == {"trace_count": None, "span_count": None, "duration_ms": None}
     vrs.validate_latitude_runtime_evidence(result)
 
 
-def test_collector_missing_metric_keys_become_null():
+def test_collector_missing_metric_keys_become_malformed_output_error():
+    """A parseable-but-key-missing CLI response (only 1 of 3 allowlisted metric keys present)
+    must not surface as `availability: "available"` with the missing metrics null -- it
+    normalizes to a closed `error`/`malformed_output` result instead (Issue #2375 PR #2392 review
+    blocker: `latitude_runtime_evidence/v1` requires all 3 allowlisted metrics to be non-null
+    integers whenever `availability == "available"`)."""
+
     def partial_runner(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 0, stdout='{"trace_count": 7}', stderr="")
 
     result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=partial_runner)
-    assert result["metrics"] == {"trace_count": 7, "span_count": None, "duration_ms": None}
+    assert result["availability"] == "error"
+    assert result["reason_code"] == "malformed_output"
+    assert result["metrics"] == {"trace_count": None, "span_count": None, "duration_ms": None}
     vrs.validate_latitude_runtime_evidence(result)
 
 

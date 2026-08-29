@@ -91,9 +91,17 @@
         "properties": {
           "evidence_identity": { "type": "string" },
           "evidence_ref": { "type": "string" },
-          "reason_code": { "const": null }
+          "reason_code": { "const": null },
+          "metrics": {
+            "properties": {
+              "trace_count": { "type": "integer" },
+              "span_count": { "type": "integer" },
+              "duration_ms": { "type": "integer" }
+            },
+            "required": ["trace_count", "span_count", "duration_ms"]
+          }
         },
-        "required": ["evidence_identity", "evidence_ref", "reason_code"]
+        "required": ["evidence_identity", "evidence_ref", "reason_code", "metrics"]
       }
     },
     {

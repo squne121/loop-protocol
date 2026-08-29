@@ -744,6 +744,9 @@ def validate_latitude_runtime_evidence(instance: dict[str, Any]) -> None:
 
     - `instance["schema_version"]` is not exactly `"latitude_runtime_evidence/v1"` (unknown schema
       version);
+    - `availability == "available"` and any of `metrics.trace_count`/`span_count`/`duration_ms` is
+      not a non-null integer (redundant with the schema's own availability=="available" branch --
+      see the schema file -- in case JSON Schema validation is not exercised at every call site);
     - `availability == "available"` and the declared `evidence_ref` does not equal
       `compute_latitude_evidence_ref(collector_version, metrics, collected_at)`, or the declared
       `evidence_identity` does not equal
@@ -760,6 +763,17 @@ def validate_latitude_runtime_evidence(instance: dict[str, Any]) -> None:
 
     if instance["availability"] != "available":
         return
+
+    metrics = instance["metrics"]
+    for metric_key in ("trace_count", "span_count", "duration_ms"):
+        metric_value = metrics.get(metric_key)
+        if not isinstance(metric_value, int) or isinstance(metric_value, bool):
+            raise RetrospectiveSchemaError(
+                f"latitude_runtime_evidence metrics.{metric_key} must be a non-null integer when "
+                f"availability == 'available'; got {metric_value!r}. This check is redundant with "
+                "the schema's allOf/if/then availability=='available' branch and exists in case "
+                "JSON Schema validation is not exercised at every call site."
+            )
 
     expected_ref = compute_latitude_evidence_ref(
         instance["collector_version"], instance["metrics"], instance["collected_at"]

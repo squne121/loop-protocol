@@ -1521,9 +1521,11 @@ def collect_latitude_runtime_evidence(
     for testability -- production default is a real `subprocess.run` with a 10s timeout and
     `stdin=subprocess.DEVNULL`, matching Collection Budget/CLI Boundary). Every failure mode --
     executable not found, timeout, non-zero exit (auth/network/other), oversized output, malformed
-    output -- normalizes to a `latitude_runtime_evidence/v1`-shaped dict with `availability`
-    `unavailable`/`error` and a closed `reason_code`; raw stdout/stderr are never stored on the
-    returned dict (only read long enough to classify/parse, then discarded).
+    output, or a parseable-but-incomplete/invalid metrics payload (missing key or wrong-type/
+    out-of-range value for any of the 3 allowlisted metrics) -- normalizes to a
+    `latitude_runtime_evidence/v1`-shaped dict with `availability` `unavailable`/`error` and a
+    closed `reason_code`; raw stdout/stderr are never stored on the returned dict (only read long
+    enough to classify/parse, then discarded).
 
     `identity_computer` defaults to `validate_retrospective_schema.compute_latitude_evidence_ref`/
     `compute_latitude_evidence_identity` (injected via closure by the module-level default to
@@ -1573,6 +1575,15 @@ def collect_latitude_runtime_evidence(
 
     metrics = {key: _coerce_latitude_metric(parsed.get(key)) for key in _LATITUDE_METRIC_KEYS}
     del parsed, stdout, stderr  # raw parsed payload discarded; only the 3 allowlisted metrics survive
+
+    if any(value is None for value in metrics.values()):
+        # A parseable JSON response that is missing one or more of the 3 allowlisted metric keys,
+        # or that carries a wrong-type/out-of-range value coerced to null by
+        # `_coerce_latitude_metric`, never becomes `availability: "available"` with a null metric.
+        # `latitude_runtime_evidence/v1` requires all 3 allowlisted metrics to be non-null integers
+        # whenever `availability == "available"` (Issue #2375) -- normalize to a closed `error`
+        # result instead, discarding the incomplete/invalid projected metrics.
+        return _latitude_result(availability="error", reason_code="malformed_output", clock=clock)
 
     collected_at = _iso(clock())
     evidence_ref, evidence_identity = identity_computer(LATITUDE_COLLECTOR_VERSION, metrics, collected_at)
