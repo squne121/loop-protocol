@@ -41,6 +41,7 @@ Covers AC3 (Issue #2350's fake-runner regression test):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -53,7 +54,63 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import run_retrospective as rr  # noqa: E402
 
-_FULL_SHA = "a" * 40
+def _git_head_sha() -> str:
+    """Real ``git rev-parse HEAD`` against this actual repo checkout, used
+    as this file's shared ``_FULL_SHA`` identity value (Issue #2374, PR
+    #2387 fix_delta): the codebase-investigator role adapter's
+    ``REPO_EVIDENCE_REF_V1`` byte re-verification always shells out to a
+    real ``git show <commit_sha>:<path>`` (no ``blob_bytes_getter``
+    injection seam at any production call site --
+    ``apply_codebase_investigator_role_adapter`` never passes one), so this
+    shared identity can no longer be an arbitrary placeholder like the
+    pre-#2374 ``"a" * 40``. Mirrors
+    ``test_codebase_investigator_observer_contract.py``'s own
+    ``_git_head_sha()`` helper (duplicated here rather than imported, per
+    this file's module docstring on hermetic fixture self-containment)."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    proc = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True, timeout=30, check=False
+    )
+    assert proc.returncode == 0, f"git rev-parse HEAD failed: {proc.stderr}"
+    return proc.stdout.strip()
+
+
+_FULL_SHA = _git_head_sha()
+
+
+def _identity_binding_repo_evidence_ref(*, commit_sha: str, path: str = "pyproject.toml") -> dict[str, Any]:
+    """Build a REPO_EVIDENCE_REF_V1 whose ``excerpt_sha256`` is computed via
+    a REAL ``git show <commit_sha>:<path>`` against this actual repo
+    checkout (Issue #2374 OWNER review P0-4) -- mirrors
+    ``test_codebase_investigator_observer_contract.py``'s own
+    ``_real_repo_evidence_ref`` helper (duplicated per this file's own
+    self-contained-fixture convention -- see module docstring), narrowed to
+    a fixed single-line excerpt (``pyproject.toml``'s first line) since
+    this file's tests only need ONE real, byte-verifiable evidence entry
+    per observer invocation, not the broader line-range coverage the other
+    test file's own P0-4 negative-case tests exercise."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    blob_bytes = subprocess.run(
+        ["git", "show", f"{commit_sha}:{path}"], cwd=repo_root, capture_output=True, timeout=30, check=True
+    ).stdout
+    lines = blob_bytes.split(b"\n")
+    reconstructed = lines[0]
+    if len(lines) > 1:
+        reconstructed += b"\n"
+    excerpt_sha256 = hashlib.sha256(reconstructed).hexdigest()
+    return {
+        "type": "REPO_EVIDENCE_REF_V1",
+        "object_format": "sha1",
+        "commit_sha": commit_sha,
+        "path": path,
+        "start_line": 1,
+        "end_line": 1,
+        "permalink": f"https://github.com/squne121/loop-protocol/blob/{commit_sha}/{path}#L1-L1",
+        "excerpt_sha256": excerpt_sha256,
+        "verification_status": "verified",
+        "verification_method": "sha256_hash_match",
+        "verified_at": "2026-08-29T00:00:00Z",
+    }
 
 
 def _wrapper_payload(structured_output: dict[str, Any], *, is_error: bool = False) -> dict[str, Any]:
@@ -117,6 +174,24 @@ def test_caller_supplied_prompt_identity_binding_no_mismatch(tmp_path: Path) -> 
     schema_dir.mkdir()
     (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
     (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    # Issue #2374 (PR #2387 fix_delta, OWNER review
+    # #2387#issuecomment-5459502795 P0-1): build_observer_requests()'s
+    # caller-supplied-task path (exercised by this test's rr.run_cli(...,
+    # prompts=caller_prompts, ...) call, since `prompts is not None`)
+    # selects `codebase_investigation_result_v1.schema.json` -- not the
+    # generic `observer_result_v1.schema.json` placeholder above -- as the
+    # `codebase-investigator` observer's own `json_schema_path`
+    # (`build_agent_invocation_argv` reads this file's bytes to build the
+    # real `claude` CLI's `--json-schema` argv content). Unlike the two
+    # permissive `"{}"` placeholders above, this copies the REAL schema
+    # content (mirrors `test_codebase_investigator_observer_contract.py`'s
+    # own `_compat_schema_path` pattern) rather than a placeholder, since
+    # it is the accurate, always-correct value regardless of which code
+    # path ever reads it.
+    (schema_dir / rr._CODEBASE_INVESTIGATION_RESULT_SCHEMA_FILENAME).write_text(
+        (_SCRIPTS_DIR / "schemas" / rr._CODEBASE_INVESTIGATION_RESULT_SCHEMA_FILENAME).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 
     def _git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         assert argv == ["git", "rev-parse", "main"]
@@ -164,6 +239,33 @@ def test_caller_supplied_prompt_identity_binding_no_mismatch(tmp_path: Path) -> 
         # prompt()` itself embedded the identity in the prompt).
         identity = _extract_identity_from_prompt(prompt)
         assert identity["observer_id"] == agent_name
+
+        # Issue #2374 (PR #2387 fix_delta, OWNER review
+        # #2387#issuecomment-5459502795 P0-1): `run_cli()`'s
+        # `caller_supplied_task_path=True` (both tests in this file pass
+        # `prompts=caller_prompts`, i.e. `prompts is not None`) wires
+        # `role_adapter` onto ONLY the `codebase-investigator` request, so
+        # that request's real `claude` CLI `--json-schema` is the NATIVE
+        # `codebase_investigation_result_v1.schema.json` contract, not
+        # `observer_result_v1.schema.json` -- this fake runner must
+        # therefore return a real, schema/AC4/AC5/P0-4-conformant
+        # `CODEBASE_INVESTIGATION_RESULT_V1` for `codebase-investigator`
+        # specifically (never the generic `EvidenceBundle` wire shape the
+        # other 2 observers use below).
+        if agent_name == "codebase-investigator":
+            native_result = {
+                "schema_version": 1,
+                "status": "ok",
+                "investigation_route": "local_asset_research",
+                "evidence_refs": [_identity_binding_repo_evidence_ref(commit_sha=identity["base_sha"])],
+                "discovery_summary": f"finding from {agent_name}",
+                "impact_scope": ["pyproject.toml"],
+                "failure_reason": None,
+                "source_evidence_result": None,
+            }
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(native_result)), stderr=""
+            )
 
         bundle = rr.EvidenceBundle(
             run_id=identity["run_id"],
@@ -266,6 +368,24 @@ def test_caller_supplied_prompt_with_embedded_fake_identity_uses_authoritative_i
     schema_dir.mkdir()
     (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
     (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    # Issue #2374 (PR #2387 fix_delta, OWNER review
+    # #2387#issuecomment-5459502795 P0-1): build_observer_requests()'s
+    # caller-supplied-task path (exercised by this test's rr.run_cli(...,
+    # prompts=caller_prompts, ...) call, since `prompts is not None`)
+    # selects `codebase_investigation_result_v1.schema.json` -- not the
+    # generic `observer_result_v1.schema.json` placeholder above -- as the
+    # `codebase-investigator` observer's own `json_schema_path`
+    # (`build_agent_invocation_argv` reads this file's bytes to build the
+    # real `claude` CLI's `--json-schema` argv content). Unlike the two
+    # permissive `"{}"` placeholders above, this copies the REAL schema
+    # content (mirrors `test_codebase_investigator_observer_contract.py`'s
+    # own `_compat_schema_path` pattern) rather than a placeholder, since
+    # it is the accurate, always-correct value regardless of which code
+    # path ever reads it.
+    (schema_dir / rr._CODEBASE_INVESTIGATION_RESULT_SCHEMA_FILENAME).write_text(
+        (_SCRIPTS_DIR / "schemas" / rr._CODEBASE_INVESTIGATION_RESULT_SCHEMA_FILENAME).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 
     def _git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         assert argv == ["git", "rev-parse", "main"]
@@ -301,6 +421,33 @@ def test_caller_supplied_prompt_with_embedded_fake_identity_uses_authoritative_i
         # the fake/old tuple embedded inside the caller task text below.
         identity = _extract_identity_from_prompt(prompt)
         assert identity["observer_id"] == agent_name
+
+        # Issue #2374 (PR #2387 fix_delta, OWNER review
+        # #2387#issuecomment-5459502795 P0-1): `run_cli()`'s
+        # `caller_supplied_task_path=True` (both tests in this file pass
+        # `prompts=caller_prompts`, i.e. `prompts is not None`) wires
+        # `role_adapter` onto ONLY the `codebase-investigator` request, so
+        # that request's real `claude` CLI `--json-schema` is the NATIVE
+        # `codebase_investigation_result_v1.schema.json` contract, not
+        # `observer_result_v1.schema.json` -- this fake runner must
+        # therefore return a real, schema/AC4/AC5/P0-4-conformant
+        # `CODEBASE_INVESTIGATION_RESULT_V1` for `codebase-investigator`
+        # specifically (never the generic `EvidenceBundle` wire shape the
+        # other 2 observers use below).
+        if agent_name == "codebase-investigator":
+            native_result = {
+                "schema_version": 1,
+                "status": "ok",
+                "investigation_route": "local_asset_research",
+                "evidence_refs": [_identity_binding_repo_evidence_ref(commit_sha=identity["base_sha"])],
+                "discovery_summary": f"finding from {agent_name}",
+                "impact_scope": ["pyproject.toml"],
+                "failure_reason": None,
+                "source_evidence_result": None,
+            }
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(native_result)), stderr=""
+            )
 
         bundle = rr.EvidenceBundle(
             run_id=identity["run_id"],
