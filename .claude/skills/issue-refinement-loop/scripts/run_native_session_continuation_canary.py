@@ -171,6 +171,14 @@ def build_launch_argv(
     argv += ["-p", "--output-format", "stream-json", "--verbose"]
     if phase == "resume":
         argv += ["--resume", str(resume_session_id)]
+    if phase in ("initial", "resume"):
+        # Issue #2153 OWNER review P2: the initial and resume launches are
+        # the marker-only semantic-continuity probe (establish / recall a
+        # reference token, "Do not use any tools"). Disabling built-in
+        # tools reduces flakiness/latency/accidental worktree mutation for
+        # these two launches. The fresh launch (AC4: distinct-id check, not
+        # part of the marker probe) is intentionally left unchanged.
+        argv += ["--tools", ""]
     argv += ["--max-turns", str(max_turns)]
     return argv
 
@@ -253,6 +261,49 @@ def is_terminal_success(stdout: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def judge_phase(
+    exit_code: int, timed_out: bool, stdout: str, stderr: str
+) -> tuple[str, str | None]:
+    """Consolidated phase judgment (Issue #2153 OWNER review P0 fix-delta).
+
+    Single source of truth for OK/SKIP/FAIL, applied uniformly to all three
+    launch phases (initial/resume/fresh), in this fixed order:
+
+    1. ``timed_out`` -> FAIL. The shared ``_run()`` helper kills the process
+       group on timeout but still returns whatever partial stdout was
+       captured up to that point, which can (misleadingly) already contain
+       a terminal-success-looking ``type: "result"`` event -- a timeout
+       must never be promoted to OK on that basis (AC5).
+    2. ``classify_claude_structured_outcome()`` -> ``"capability_skip"`` ->
+       SKIP (never promoted to OK/FAIL; genuinely unavailable capability).
+    3. ``exit_code != 0`` -> FAIL. This includes ``"turn_limit_reached"``
+       (the ``--max-turns`` bound was reached -- a runtime failure, not a
+       capability gap) and any other non-zero exit: a non-zero exit is
+       never overridden by a terminal-success-looking event elsewhere in
+       partial stdout (AC5).
+    4. ``is_terminal_success(stdout)`` -> not ok -> FAIL, else OK.
+
+    Returns ``(verdict, reason)`` where ``verdict`` is one of ``"ok"``,
+    ``"skip"``, ``"fail"``; ``reason`` is ``None`` only when
+    ``verdict == "ok"``.
+    """
+    if timed_out:
+        return (
+            "fail",
+            "launch process timed out (partial stdout observed before "
+            "termination is not treated as terminal-success evidence)",
+        )
+    decision, reason = classify_claude_structured_outcome(exit_code, stdout, stderr, timed_out)
+    if decision == "capability_skip":
+        return "skip", reason
+    if exit_code != 0:
+        return "fail", reason or f"non-zero exit code: {exit_code}"
+    ok, term_reason = is_terminal_success(stdout)
+    if not ok:
+        return "fail", term_reason
+    return "ok", None
+
+
 def extract_assistant_texts(stdout: str) -> list[str]:
     """Local extraction of ``type: "assistant"`` message text blocks from
     native stream-json stdout, used only for the semantic continuity marker
@@ -319,28 +370,72 @@ def _parse_claude_gpt_receipt(text: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
-def preflight_claude_gpt(claude_bin: str, timeout_seconds: float) -> tuple[bool, str | None, dict | None]:
-    """Run ``<launch.sh> --check-only`` and classify availability from its
-    own ``CLAUDE_GPT_LAUNCH_RESULT_V1`` receipt (the receipt lands on
-    stdout in --check-only mode; see ``_parse_claude_gpt_receipt``)."""
+# Issue #2153 OWNER review P1 fix-delta: exit codes documented in
+# scripts/claude-gpt/launch.sh's own header comment as genuinely
+# environment-unavailable (not a caller/launcher integration bug):
+#   3 = claude-code-proxy / claude binary unavailable
+#   4 = ChatGPT subscription auth unavailable
+#   7 = proxy bind/readiness/model-alias resolution failure (proxy or
+#       model endpoint unavailable)
+# Everything else (including a missing/malformed/unknown-schema receipt,
+# exit 2 caller argv error, exit 5 canonical-path violation, exit 6
+# invalid generated settings, and any other/unknown exit code such as 9)
+# is a caller/launcher integration bug and FAILs -- never SKIPs.
+_LAUNCHER_SKIP_EXIT_CODES = frozenset({3, 4, 7})
+
+
+def classify_launcher_receipt(rc: int, receipt: dict | None) -> tuple[str, str]:
+    """Classify a claude-gpt launcher (``scripts/claude-gpt/launch.sh``)
+    non-``ok`` outcome as SKIP (environment-unavailable) or FAIL
+    (caller/launcher integration bug) (Issue #2153 OWNER review P1
+    fix-delta). Narrow parser rejection of a genuinely unsupported Claude
+    Code flag remains a separate, already-handled SKIP source via
+    ``classify_claude_structured_outcome()`` during a real (non-check-only)
+    launch -- it is not part of this launcher-receipt classification.
+
+    Returns ``(verdict, reason)`` where ``verdict`` is ``"skip"`` or
+    ``"fail"``. Never returns ``"ok"`` -- callers only invoke this once an
+    ``ok`` receipt has already been ruled out.
+    """
+    status = receipt.get("status") if receipt is not None else None
+    reason = receipt.get("reason") if receipt is not None else None
+    if receipt is None:
+        return "fail", f"claude-gpt launcher produced no parsable receipt (exit {rc})"
+    if rc in _LAUNCHER_SKIP_EXIT_CODES:
+        return (
+            "skip",
+            f"claude-gpt launcher reported environment-unavailable "
+            f"(exit {rc}, status={status!r}, reason={reason!r})",
+        )
+    return (
+        "fail",
+        f"claude-gpt launcher reported a caller/launcher integration failure "
+        f"(exit {rc}, status={status!r}, reason={reason!r})",
+    )
+
+
+def preflight_claude_gpt(claude_bin: str, timeout_seconds: float) -> tuple[str, str | None, dict | None]:
+    """Run ``<launch.sh> --check-only`` and classify availability via
+    ``classify_launcher_receipt()`` from its own ``CLAUDE_GPT_LAUNCH_RESULT_V1``
+    receipt (the receipt lands on stdout in --check-only mode; see
+    ``_parse_claude_gpt_receipt``).
+
+    Returns ``(verdict, reason, receipt)`` where ``verdict`` is one of
+    ``"ok"``, ``"skip"``, ``"fail"``.
+    """
     rc, out, err, timed_out = _run([claude_bin, "--check-only"], timeout=timeout_seconds)
     if timed_out:
-        return False, "claude-gpt launcher --check-only timed out", None
+        return "skip", "claude-gpt launcher --check-only timed out", None
     receipt = (
         _parse_claude_gpt_receipt(out)
         or _parse_claude_gpt_receipt(err)
         or extract_claude_gpt_launcher_receipt(out)
         or extract_claude_gpt_launcher_receipt(err)
     )
-    if receipt is None:
-        return False, f"claude-gpt launcher --check-only produced no receipt (exit {rc})", None
-    if receipt.get("status") != "ok":
-        return False, f"claude-gpt launcher unavailable: {receipt.get('reason') or receipt.get('status')}", receipt
-    return True, None, receipt
-
-
-def _launcher_failure_reason(receipt: dict) -> str | None:
-    return receipt.get("reason") or receipt.get("status")
+    if receipt is not None and receipt.get("status") == "ok":
+        return "ok", None, receipt
+    verdict, reason = classify_launcher_receipt(rc, receipt)
+    return verdict, reason, receipt
 
 
 def detect_claude_gpt_launch_failure_receipt(stdout: str, stderr: str) -> dict | None:
@@ -415,6 +510,47 @@ def write_evidence(output_dir: Path, evidence: dict[str, Any]) -> None:
     )
 
 
+def apply_postcondition_check(
+    evidence: dict[str, Any],
+    *,
+    before_fingerprint: Any,
+    worktree_real: str | None,
+    require_clean_postcondition: bool,
+    verdict: str,
+    code: int,
+) -> tuple[str, int]:
+    """Actually run the after-fingerprint/diff postcondition check on every
+    finishing return path (Issue #2153 OWNER review P1 fix-delta), instead
+    of merely echoing whether the check was *requested*.
+    ``evidence["cleanup"]["postcondition_checked"]`` must reflect whether the
+    check actually EXECUTED, not whether ``--require-clean-postcondition``
+    was passed on the command line.
+
+    If ``before_fingerprint`` is ``None`` (a failure occurred before the
+    pre-launch fingerprint could be captured, e.g. worktree identity
+    rejected, runtime unavailable at preflight), ``postcondition_checked``
+    is set to ``False`` truthfully -- the check literally never ran.
+
+    If the check does run and finds non-empty diffs, the incoming
+    ``verdict``/``code`` are downgraded to ``("FAIL", 1)`` regardless of
+    what was passed in (a real repository-state mutation must never be
+    hidden behind a PASS or SKIP verdict).
+
+    Returns the (possibly downgraded) ``(verdict, code)``.
+    """
+    if require_clean_postcondition and before_fingerprint is not None:
+        after_fingerprint = repo_fingerprint(worktree_real, None)
+        diffs = diff_fingerprints(before_fingerprint, after_fingerprint)
+        evidence["cleanup"]["postcondition_checked"] = True
+        evidence["cleanup"]["postcondition_diffs"] = diffs
+        if diffs:
+            evidence["errors"].append(f"postcondition violated: {diffs}")
+            return "FAIL", 1
+        return verdict, code
+    evidence["cleanup"]["postcondition_checked"] = False
+    return verdict, code
+
+
 # ---------------------------------------------------------------------------
 # Main canary sequence.
 # ---------------------------------------------------------------------------
@@ -448,9 +584,40 @@ def main(argv: list[str] | None = None) -> int:
         "command_class": "claude_structured_print_mode",
         "verdict": "FAIL",
         "exit_code": 1,
-        "cleanup": {"postcondition_checked": bool(args.require_clean_postcondition)},
+        "cleanup": {"postcondition_checked": False},
         "errors": [],
     }
+
+    # Issue #2153 OWNER review P1 fix-delta: ``worktree_real`` /
+    # ``before_fingerprint`` are declared here (before any return path) so
+    # every finishing return -- including the earliest failures below --
+    # can be routed through the single ``finish()`` helper, which actually
+    # RUNS the after-fingerprint/diff postcondition check (rather than
+    # merely echoing whether it was requested). ``before_fingerprint``
+    # stays ``None`` for every failure that occurs before it is captured
+    # (a few lines below), so ``postcondition_checked`` truthfully reports
+    # ``False`` for those paths -- the check literally never ran.
+    worktree_real: str | None = None
+    before_fingerprint: Any = None
+
+    def finish(code: int, verdict: str, *, skip_reason: str | None = None) -> int:
+        if skip_reason is not None:
+            evidence["skip_reason"] = skip_reason
+        verdict, code = apply_postcondition_check(
+            evidence,
+            before_fingerprint=before_fingerprint,
+            worktree_real=worktree_real,
+            require_clean_postcondition=bool(args.require_clean_postcondition),
+            verdict=verdict,
+            code=code,
+        )
+        if verdict == "PASS":
+            evidence.setdefault("provider_fallback", False)
+            evidence.setdefault("runtime_fallback", False)
+        evidence["verdict"] = verdict
+        evidence["exit_code"] = code
+        write_evidence(args.output_dir, evidence)
+        return code
 
     try:
         repo_root = _default_repo_root()
@@ -469,36 +636,28 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.claude_adapter == "claude-gpt" and not args.claude_bin:
         evidence["errors"].append("--claude-bin is required for --claude-adapter claude-gpt")
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
     resolved_bin, skip_reason = preflight_claude_available(args.claude_bin)
     if resolved_bin is None:
-        evidence["verdict"] = "SKIP"
-        evidence["exit_code"] = 77
-        evidence["skip_reason"] = skip_reason
-        write_evidence(args.output_dir, evidence)
-        return 77
+        return finish(77, "SKIP", skip_reason=skip_reason)
     evidence["resolved_executable_sha256"] = extract_claude_resolved_executable_sha256(resolved_bin)
 
     launcher_receipt: dict | None = None
     if args.claude_adapter == "claude-gpt":
-        available, skip_reason, launcher_receipt = preflight_claude_gpt(resolved_bin, args.timeout_seconds)
-        if not available:
-            evidence["verdict"] = "SKIP"
-            evidence["exit_code"] = 77
-            evidence["skip_reason"] = skip_reason
-            evidence["claude_gpt_launcher_receipt"] = launcher_receipt
-            write_evidence(args.output_dir, evidence)
-            return 77
+        preflight_verdict, preflight_reason, launcher_receipt = preflight_claude_gpt(
+            resolved_bin, args.timeout_seconds
+        )
         evidence["claude_gpt_launcher_receipt"] = launcher_receipt
+        if preflight_verdict == "skip":
+            return finish(77, "SKIP", skip_reason=preflight_reason)
+        if preflight_verdict == "fail":
+            evidence["errors"].append(preflight_reason)
+            return finish(1, "FAIL")
         if detect_provider_fallback(launcher_receipt):
-            evidence["verdict"] = "FAIL"
-            evidence["exit_code"] = 1
             evidence["provider_fallback"] = True
             evidence["errors"].append("claude-gpt launcher receipt reports model_alias_ok=false (provider fallback)")
-            write_evidence(args.output_dir, evidence)
-            return 1
+            return finish(1, "FAIL")
 
     before_fingerprint = repo_fingerprint(worktree_real, None) if args.require_clean_postcondition else None
 
@@ -546,6 +705,13 @@ def main(argv: list[str] | None = None) -> int:
         }
         return record, out, err, timed_out
 
+    # Issue #2153 OWNER review P0 fix-delta: every phase below is judged
+    # through the single ``judge_phase()`` function (timed_out -> capability
+    # skip -> non-zero exit -> terminal-success, in that fixed order) so a
+    # terminal-success-looking event elsewhere in partial stdout can never
+    # be promoted to OK when the process actually timed out or exited
+    # non-zero (AC5).
+
     # ---- Phase 1: initial launch -----------------------------------------
     initial_record, initial_out, initial_err, initial_timed_out = launch(
         "initial",
@@ -557,35 +723,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.claude_adapter == "claude-gpt":
         failure_receipt = detect_claude_gpt_launch_failure_receipt(initial_out, initial_err)
         if failure_receipt is not None:
-            evidence["verdict"] = "SKIP"
-            evidence["exit_code"] = 77
-            evidence["skip_reason"] = (
-                f"claude-gpt launcher unavailable at initial launch: {_launcher_failure_reason(failure_receipt)}"
+            launcher_verdict, launcher_reason = classify_launcher_receipt(
+                initial_record["exit_code"], failure_receipt
             )
             evidence["claude_gpt_launcher_receipt"] = failure_receipt
-            write_evidence(args.output_dir, evidence)
-            return 77
-
-    decision, reason = classify_claude_structured_outcome(
-        initial_record["exit_code"], initial_out, initial_err, initial_timed_out
-    )
-    if decision == "capability_skip":
-        evidence["verdict"] = "SKIP"
-        evidence["exit_code"] = 77
-        evidence["skip_reason"] = reason
-        write_evidence(args.output_dir, evidence)
-        return 77
+            if launcher_verdict == "skip":
+                return finish(77, "SKIP", skip_reason=f"initial launch: {launcher_reason}")
+            evidence["errors"].append(f"initial launch: {launcher_reason}")
+            return finish(1, "FAIL")
 
     if not initial_record["argv_contract_ok"]:
         evidence["errors"].append(f"initial launch argv contract violation: {initial_record['argv_contract_detail']}")
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
-    ok, reason = is_terminal_success(initial_out)
-    if not ok:
+    verdict, reason = judge_phase(
+        initial_record["exit_code"], initial_timed_out, initial_out, initial_err
+    )
+    if verdict == "skip":
+        return finish(77, "SKIP", skip_reason=reason)
+    if verdict == "fail":
         evidence["errors"].append(f"initial launch: {reason}")
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
     observed_id_1 = extract_claude_parent_session_id(initial_out)
     evidence["initial_launch"]["observed_session_id_hash"] = _hash_id(observed_id_1)
@@ -594,8 +752,7 @@ def main(argv: list[str] | None = None) -> int:
             "initial launch: no claude_code_session_id observed in native structured output "
             "(synthetic_parent_generated_id is forbidden -- refusing to substitute one)"
         )
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
     # ---- Phase 2: same-continuation (resume) launch ------------------------
     resume_record, resume_out, resume_err, resume_timed_out = launch(
@@ -609,35 +766,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.claude_adapter == "claude-gpt":
         failure_receipt = detect_claude_gpt_launch_failure_receipt(resume_out, resume_err)
         if failure_receipt is not None:
-            evidence["verdict"] = "SKIP"
-            evidence["exit_code"] = 77
-            evidence["skip_reason"] = (
-                f"claude-gpt launcher unavailable at resume launch: {_launcher_failure_reason(failure_receipt)}"
+            launcher_verdict, launcher_reason = classify_launcher_receipt(
+                resume_record["exit_code"], failure_receipt
             )
             evidence["claude_gpt_launcher_receipt"] = failure_receipt
-            write_evidence(args.output_dir, evidence)
-            return 77
-
-    decision, reason = classify_claude_structured_outcome(
-        resume_record["exit_code"], resume_out, resume_err, resume_timed_out
-    )
-    if decision == "capability_skip":
-        evidence["verdict"] = "SKIP"
-        evidence["exit_code"] = 77
-        evidence["skip_reason"] = reason
-        write_evidence(args.output_dir, evidence)
-        return 77
+            if launcher_verdict == "skip":
+                return finish(77, "SKIP", skip_reason=f"resume launch: {launcher_reason}")
+            evidence["errors"].append(f"resume launch: {launcher_reason}")
+            return finish(1, "FAIL")
 
     if not resume_record["argv_contract_ok"]:
         evidence["errors"].append(f"resume launch argv contract violation: {resume_record['argv_contract_detail']}")
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
-    ok, reason = is_terminal_success(resume_out)
-    if not ok:
+    verdict, reason = judge_phase(
+        resume_record["exit_code"], resume_timed_out, resume_out, resume_err
+    )
+    if verdict == "skip":
+        return finish(77, "SKIP", skip_reason=reason)
+    if verdict == "fail":
         evidence["errors"].append(f"resume launch: {reason}")
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
     observed_id_2 = extract_claude_parent_session_id(resume_out)
     evidence["same_continuation_launch"]["observed_session_id_hash"] = _hash_id(observed_id_2)
@@ -645,23 +794,19 @@ def main(argv: list[str] | None = None) -> int:
     evidence["same_continuation_launch"]["id_equality"] = id_equal
     if not id_equal:
         evidence["errors"].append("resume launch: observed session id does not equal the initial observed session id")
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
     marker_ok = marker_recalled(resume_out, marker)
     evidence["same_continuation_launch"]["semantic_continuity_marker_recalled"] = marker_ok
 
     if detect_runtime_fallback(id_equal, marker_ok):
-        evidence["verdict"] = "FAIL"
-        evidence["exit_code"] = 1
         evidence["runtime_fallback"] = True
         evidence["errors"].append(
             "runtime_fallback: session id equality held but the semantic continuity marker was not "
             "recalled -- this is a fallback-looking success, not genuine continuation, and is not "
             "treated as PASS evidence"
         )
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
     # ---- Phase 3: fresh launch ---------------------------------------------
     fresh_record, fresh_out, fresh_err, fresh_timed_out = launch(
@@ -673,35 +818,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.claude_adapter == "claude-gpt":
         failure_receipt = detect_claude_gpt_launch_failure_receipt(fresh_out, fresh_err)
         if failure_receipt is not None:
-            evidence["verdict"] = "SKIP"
-            evidence["exit_code"] = 77
-            evidence["skip_reason"] = (
-                f"claude-gpt launcher unavailable at fresh launch: {_launcher_failure_reason(failure_receipt)}"
+            launcher_verdict, launcher_reason = classify_launcher_receipt(
+                fresh_record["exit_code"], failure_receipt
             )
             evidence["claude_gpt_launcher_receipt"] = failure_receipt
-            write_evidence(args.output_dir, evidence)
-            return 77
-
-    decision, reason = classify_claude_structured_outcome(
-        fresh_record["exit_code"], fresh_out, fresh_err, fresh_timed_out
-    )
-    if decision == "capability_skip":
-        evidence["verdict"] = "SKIP"
-        evidence["exit_code"] = 77
-        evidence["skip_reason"] = reason
-        write_evidence(args.output_dir, evidence)
-        return 77
+            if launcher_verdict == "skip":
+                return finish(77, "SKIP", skip_reason=f"fresh launch: {launcher_reason}")
+            evidence["errors"].append(f"fresh launch: {launcher_reason}")
+            return finish(1, "FAIL")
 
     if not fresh_record["argv_contract_ok"]:
         evidence["errors"].append(f"fresh launch argv contract violation: {fresh_record['argv_contract_detail']}")
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
-    ok, reason = is_terminal_success(fresh_out)
-    if not ok:
+    verdict, reason = judge_phase(
+        fresh_record["exit_code"], fresh_timed_out, fresh_out, fresh_err
+    )
+    if verdict == "skip":
+        return finish(77, "SKIP", skip_reason=reason)
+    if verdict == "fail":
         evidence["errors"].append(f"fresh launch: {reason}")
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
     observed_id_3 = extract_claude_parent_session_id(fresh_out)
     evidence["fresh_launch"]["observed_session_id_hash"] = _hash_id(observed_id_3)
@@ -712,25 +849,16 @@ def main(argv: list[str] | None = None) -> int:
             "fresh launch: observed session id was missing or equal to the initial observed session id "
             "(fresh launch must produce a distinct id, and never a synthetic substitute)"
         )
-        write_evidence(args.output_dir, evidence)
-        return 1
+        return finish(1, "FAIL")
 
-    # ---- Cleanup / postcondition verdict -----------------------------------
-    if args.require_clean_postcondition:
-        after_fingerprint = repo_fingerprint(worktree_real, None)
-        diffs = diff_fingerprints(before_fingerprint, after_fingerprint)
-        evidence["cleanup"]["postcondition_diffs"] = diffs
-        if diffs:
-            evidence["errors"].append(f"postcondition violated: {diffs}")
-            write_evidence(args.output_dir, evidence)
-            return 1
-
-    evidence["verdict"] = "PASS"
-    evidence["exit_code"] = 0
+    # ---- Cleanup / postcondition verdict + final verdict --------------------
+    # Issue #2153 OWNER review P1 fix-delta: the after-fingerprint/diff check
+    # is now run inside ``finish()`` itself (whenever ``before_fingerprint``
+    # was actually captured), so this final success path shares the exact
+    # same postcondition logic as every FAIL/SKIP return above.
     evidence["provider_fallback"] = False
     evidence["runtime_fallback"] = False
-    write_evidence(args.output_dir, evidence)
-    return 0
+    return finish(0, "PASS")
 
 
 if __name__ == "__main__":

@@ -35,12 +35,22 @@ RUNNER = (
 CLAUDE_GPT_LAUNCH_SH = REPO_ROOT / "scripts" / "claude-gpt" / "launch.sh"
 EVIDENCE_ROOT = REPO_ROOT / "artifacts" / "native-session-continuation-canary"
 
-# Three real launches per lane; each is individually bounded by
-# --timeout-seconds. The outer subprocess timeout is a generous multiple so
-# a genuine per-launch bound (not this outer one) is what fires first.
+# Real launches per lane; each is individually bounded by --timeout-seconds.
+# The outer subprocess timeout must be a generous multiple of the actual
+# number of timed operations the runner performs for the given adapter, so a
+# genuine per-launch bound (not this outer one) is what fires first (Issue
+# #2153 OWNER review P1 fix-delta). The native lane performs 3 timed
+# launches (initial/resume/fresh); the claude-gpt lane performs 4 (an extra
+# ``--check-only`` preflight probe before the same 3 launches) -- an outer
+# timeout computed only for 3 launches on the claude-gpt lane could fire
+# BEFORE the runner's own process-group cleanup/evidence-write completes.
 _PER_LAUNCH_TIMEOUT_SECONDS = 180.0
 _MAX_TURNS = 3
-_RUNNER_PROCESS_TIMEOUT_SECONDS = int(_PER_LAUNCH_TIMEOUT_SECONDS * 3 + 120)
+
+
+def _outer_runner_timeout_seconds(adapter: str) -> int:
+    launch_count = 4 if adapter == "claude-gpt" else 3
+    return int(_PER_LAUNCH_TIMEOUT_SECONDS * launch_count + 120)
 
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -113,14 +123,31 @@ def _run_canary(adapter: str, claude_bin: str | None) -> tuple[int, dict | None,
     ]
     if claude_bin:
         command += ["--claude-bin", claude_bin]
-    result = subprocess.run(
-        command,
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=_RUNNER_PROCESS_TIMEOUT_SECONDS,
-        check=False,
-    )
+    outer_timeout = _outer_runner_timeout_seconds(adapter)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=outer_timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Issue #2153 OWNER review P1 fix-delta: distinguish an emergency
+        # OUTER timeout (this pytest process's own subprocess.run bound
+        # firing) from an ordinary runner-reported FAIL. If this fires, the
+        # runner itself never got a chance to run its own process-group
+        # cleanup / write its evidence.json receipt -- that is a
+        # timeout-budget bug in this test harness, not a canary FAIL.
+        pytest.fail(
+            f"native session continuation canary emergency OUTER timeout fired "
+            f"({outer_timeout}s) BEFORE the runner's own process-group cleanup/"
+            f"evidence-write completed (adapter={adapter!r}); this is an outer "
+            f"timeout-budget bug, not an ordinary canary FAIL. "
+            f"partial stdout(tail)={(exc.stdout or '')[-1200:]!r}; "
+            f"partial stderr(tail)={(exc.stderr or '')[-1200:]!r}"
+        )
     evidence_path = output_dir / "evidence.json"
     evidence = (
         json.loads(evidence_path.read_text(encoding="utf-8")) if evidence_path.is_file() else None
@@ -375,3 +402,221 @@ def test_detect_claude_gpt_launch_failure_receipt_none_for_ok_status():
     module = _load_canary_module()
     stdout = json.dumps({"schema": "CLAUDE_GPT_LAUNCH_RESULT_V1", "status": "ok"})
     assert module.detect_claude_gpt_launch_failure_receipt(stdout, "") is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2153 OWNER review P0 fix-delta: judge_phase() consolidated
+# timed_out -> capability_skip -> non-zero exit -> terminal-success ordering.
+# A terminal-success-looking event present in (partial) stdout must never be
+# promoted to OK when the process actually timed out or exited non-zero.
+# ---------------------------------------------------------------------------
+
+_TERMINAL_SUCCESS_STDOUT = json.dumps({"type": "result", "is_error": False, "subtype": "success"}) + "\n"
+
+
+def test_judge_phase_terminal_success_event_but_nonzero_exit_is_fail():
+    """Regression: a terminal-success (type=result) event present in stdout
+    must not be promoted to OK when the process exited non-zero."""
+    module = _load_canary_module()
+    verdict, reason = module.judge_phase(1, False, _TERMINAL_SUCCESS_STDOUT, "")
+    assert verdict == "fail"
+    assert reason is not None
+
+
+def test_judge_phase_terminal_success_event_but_timed_out_is_fail():
+    """Regression: the shared ``_run()`` helper kills the process group on
+    timeout but still returns whatever partial stdout was captured, which
+    can misleadingly already contain a terminal-success event; a timeout
+    must always FAIL regardless."""
+    module = _load_canary_module()
+    verdict, reason = module.judge_phase(0, True, _TERMINAL_SUCCESS_STDOUT, "")
+    assert verdict == "fail"
+    assert reason is not None
+
+
+def test_judge_phase_turn_limit_reached_is_fail():
+    """Regression: reaching the --max-turns bound (flag accepted; a runtime
+    failure, not a capability gap) must FAIL, not be promoted to OK/SKIP."""
+    module = _load_canary_module()
+    verdict, reason = module.judge_phase(1, False, "", "Claude reached max turns limit\n")
+    assert verdict == "fail"
+    assert reason is not None
+
+
+def test_judge_phase_ok_when_clean_terminal_success():
+    module = _load_canary_module()
+    verdict, reason = module.judge_phase(0, False, _TERMINAL_SUCCESS_STDOUT, "")
+    assert verdict == "ok"
+    assert reason is None
+
+
+def test_judge_phase_skip_on_capability_skip_classification():
+    """A narrowly-matched parser-level unknown/unrecognized-option
+    rejection of one of this runner's own fixed argv flags (and no valid
+    JSON event observed) is a genuine capability SKIP, not FAIL."""
+    module = _load_canary_module()
+    verdict, reason = module.judge_phase(
+        1, False, "", "error: unknown option '--max-turns'\n"
+    )
+    assert verdict == "skip"
+    assert reason is not None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2153 OWNER review P1 fix-delta: classify_launcher_receipt() SKIP
+# allowlist (exit 3/4/7 only) vs. everything-else FAIL (caller/launcher
+# integration bugs must never be silently absorbed into SKIP).
+# ---------------------------------------------------------------------------
+
+
+def _receipt(status: str, reason: str) -> dict:
+    return {"schema": "CLAUDE_GPT_LAUNCH_RESULT_V1", "status": status, "reason": reason}
+
+
+@pytest.mark.parametrize(
+    "rc,receipt,expected_verdict",
+    [
+        (3, _receipt("blocked", "claude_binary_not_found"), "skip"),
+        (4, _receipt("blocked", "chatgpt_auth_unavailable"), "skip"),
+        (7, _receipt("failed", "proxy_not_ready_or_bind_not_confirmed"), "skip"),
+        (7, _receipt("failed", "model_alias_not_resolved"), "skip"),
+        (2, _receipt("blocked", "missing_value"), "fail"),
+        (2, _receipt("blocked", "unknown_launcher_option"), "fail"),
+        (2, _receipt("blocked", "unexpected_positional_argument_before_double_dash"), "fail"),
+        (2, _receipt("blocked", "policy_weakening_flag_rejected"), "fail"),
+        (5, _receipt("blocked", "canonical_path_under_repo_or_worktree"), "fail"),
+        (6, _receipt("blocked", "invalid_generated_settings"), "fail"),
+        (9, _receipt("blocked", "spark_launch_nonce_unsafe_chars"), "fail"),
+        (1, {"status": "unknown-schema-junk"}, "fail"),
+        (1, None, "fail"),
+    ],
+)
+def test_classify_launcher_receipt(rc, receipt, expected_verdict):
+    module = _load_canary_module()
+    verdict, reason = module.classify_launcher_receipt(rc, receipt)
+    assert verdict == expected_verdict
+    assert isinstance(reason, str) and reason
+
+
+# ---------------------------------------------------------------------------
+# Issue #2153 OWNER review P1 fix-delta: apply_postcondition_check() must
+# actually EXECUTE the after-fingerprint/diff check on every finishing
+# return path, and must truthfully report ``postcondition_checked: False``
+# when ``before_fingerprint`` was never captured (a failure occurred before
+# preflight completed).
+# ---------------------------------------------------------------------------
+
+
+def test_apply_postcondition_check_not_executed_when_before_fingerprint_missing():
+    module = _load_canary_module()
+    evidence = {"cleanup": {}, "errors": []}
+    verdict, code = module.apply_postcondition_check(
+        evidence,
+        before_fingerprint=None,
+        worktree_real="/does/not/matter",
+        require_clean_postcondition=True,
+        verdict="PASS",
+        code=0,
+    )
+    assert (verdict, code) == ("PASS", 0)
+    assert evidence["cleanup"]["postcondition_checked"] is False
+    assert "postcondition_diffs" not in evidence["cleanup"]
+
+
+def test_apply_postcondition_check_not_executed_when_not_required(tmp_path):
+    module = _load_canary_module()
+    evidence = {"cleanup": {}, "errors": []}
+    verdict, code = module.apply_postcondition_check(
+        evidence,
+        before_fingerprint={"anything": True},
+        worktree_real=str(tmp_path),
+        require_clean_postcondition=False,
+        verdict="PASS",
+        code=0,
+    )
+    assert (verdict, code) == ("PASS", 0)
+    assert evidence["cleanup"]["postcondition_checked"] is False
+
+
+def test_apply_postcondition_check_downgrades_pass_to_fail_on_diff(monkeypatch):
+    module = _load_canary_module()
+    monkeypatch.setattr(module, "repo_fingerprint", lambda worktree, ignore: {"after": True})
+    monkeypatch.setattr(module, "diff_fingerprints", lambda before, after: ["untracked file appeared"])
+    evidence = {"cleanup": {}, "errors": []}
+    verdict, code = module.apply_postcondition_check(
+        evidence,
+        before_fingerprint={"before": True},
+        worktree_real="/x",
+        require_clean_postcondition=True,
+        verdict="PASS",
+        code=0,
+    )
+    assert (verdict, code) == ("FAIL", 1)
+    assert evidence["cleanup"]["postcondition_checked"] is True
+    assert evidence["cleanup"]["postcondition_diffs"] == ["untracked file appeared"]
+    assert any("postcondition violated" in e for e in evidence["errors"])
+
+
+def test_apply_postcondition_check_downgrades_skip_to_fail_on_diff(monkeypatch):
+    """A real repository-state mutation must never be hidden behind a SKIP
+    verdict either."""
+    module = _load_canary_module()
+    monkeypatch.setattr(module, "repo_fingerprint", lambda worktree, ignore: {"after": True})
+    monkeypatch.setattr(module, "diff_fingerprints", lambda before, after: ["untracked file appeared"])
+    evidence = {"cleanup": {}, "errors": []}
+    verdict, code = module.apply_postcondition_check(
+        evidence,
+        before_fingerprint={"before": True},
+        worktree_real="/x",
+        require_clean_postcondition=True,
+        verdict="SKIP",
+        code=77,
+    )
+    assert (verdict, code) == ("FAIL", 1)
+
+
+def test_apply_postcondition_check_keeps_pass_when_no_diff(monkeypatch):
+    module = _load_canary_module()
+    monkeypatch.setattr(module, "repo_fingerprint", lambda worktree, ignore: {"after": True})
+    monkeypatch.setattr(module, "diff_fingerprints", lambda before, after: [])
+    evidence = {"cleanup": {}, "errors": []}
+    verdict, code = module.apply_postcondition_check(
+        evidence,
+        before_fingerprint={"before": True},
+        worktree_real="/x",
+        require_clean_postcondition=True,
+        verdict="PASS",
+        code=0,
+    )
+    assert (verdict, code) == ("PASS", 0)
+    assert evidence["cleanup"]["postcondition_checked"] is True
+    assert evidence["cleanup"]["postcondition_diffs"] == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #2153 OWNER review P2 (low-risk, applied): the marker-only
+# semantic-continuity probe launches (initial/resume) disable built-in tools
+# via ``--tools ""`` to reduce flakiness/latency/accidental worktree
+# mutation. The fresh launch (AC4 distinct-id check, not part of the marker
+# probe) is intentionally left unchanged.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("adapter,bin_path", [
+    ("native", "claude"),
+    ("claude-gpt", "/abs/path/to/launch.sh"),
+])
+def test_argv_marker_probe_launches_disable_builtin_tools(adapter, bin_path):
+    module = _load_canary_module()
+    for phase in ("initial", "resume"):
+        argv = module.build_launch_argv(
+            bin_path, adapter, phase, max_turns=3, resume_session_id="fake-id"
+        )
+        assert "--tools" in argv, f"{phase} launch argv must disable built-in tools: {argv}"
+        idx = argv.index("--tools")
+        assert argv[idx + 1] == "", f"{phase} launch --tools value must be empty string: {argv}"
+
+    fresh_argv = module.build_launch_argv(bin_path, adapter, "fresh", max_turns=3)
+    assert "--tools" not in fresh_argv, (
+        f"fresh launch is not part of the marker probe and must be left unchanged: {fresh_argv}"
+    )
