@@ -159,12 +159,20 @@ try:
         route_structural_repair_disposition,
         STRUCTURAL_REPAIR_ROUTE_STATUS_PASS,
         STRUCTURAL_REPAIR_ROUTE_STATUS_NEEDS_FIX,
+        # Issue #2396: the structural_repair_action.apply consumer and the
+        # severity-arbitration override both need the SAME closed-enum
+        # disposition literal the producer itself uses (never an
+        # independently-declared string that could silently diverge).
+        STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
+        detect_missing_template_sections,
     )
 except ImportError:  # pragma: no cover - defensive fallback
     build_structural_repair_bundle = None
     route_structural_repair_disposition = None
     STRUCTURAL_REPAIR_ROUTE_STATUS_PASS = "pass"
     STRUCTURAL_REPAIR_ROUTE_STATUS_NEEDS_FIX = "needs_fix"
+    STRUCT_DISPOSITION_AUTO_APPLY_SAFE = "auto_apply_safe"
+    detect_missing_template_sections = None
 
 
 
@@ -1311,6 +1319,237 @@ def _run_repair_apply_fresh_validation(
     }
 
 
+def _dispatch_candidate_body_via_edit_txn(
+    *,
+    current_issue_: dict,
+    candidate_body: str,
+    candidate_path: Path,
+    input_path: Path,
+    scratch_dir_fd: int,
+    root: Path,
+    issue_number: int,
+    repo: str,
+) -> dict:
+    """Issue #2039 AC8/AC11 (extracted for Issue #2396 AC5 sharing): the ONE
+    mutation-dispatch core BOTH `repair_action.apply` (generic
+    `run_repair_action_apply()`) and `structural_repair_action.apply`
+    (`run_structural_repair_action_apply()`) invoke -- never a second,
+    independent GitHub-mutation implementation for the structural lane.
+
+    Builds the `edit_issue_txn.py` transaction input via
+    `build_issue_edit_txn_input()`, dispatches it through the ONE
+    GitHub-mutation subprocess this core ever invokes
+    (`edit_issue_txn.py --input-file`, never a raw `gh issue edit` call --
+    AC11), and losslessly surfaces a genuinely-unconfirmed
+    (TimeoutExpired/OSError/non-JSON-stdout) outcome as
+    `mutation_outcome_unknown` rather than a degraded `failed_no_mutation`
+    (PR #2202 review fix-delta P0-6) -- fail-closed the SAME way for
+    either caller lane.
+    """
+    from scope_signal_delta import build_issue_edit_txn_input
+
+    readiness_script = _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
+    try:
+        completed_readiness = subprocess.run(
+            [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        readiness_stdout = completed_readiness.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        # PR #2202 review fix-delta (P0-6, item 2): the readiness check
+        # never touches GitHub -- it runs strictly BEFORE
+        # edit_issue_txn.py is ever invoked below, so a
+        # TimeoutExpired/OSError here proves no mutation could possibly
+        # have been dispatched yet. It is therefore always safe to fall
+        # through to the SAME degraded-readiness fallback already used
+        # for non-JSON readiness stdout below (never a fabricated
+        # "verified"/"unresolved" readiness signal, and never routed
+        # into the mutation-side `unknown` handling this is not).
+        readiness_stdout = ""
+    try:
+        readiness = json.loads(readiness_stdout)
+    except json.JSONDecodeError:
+        readiness = {}
+    if not isinstance(readiness, dict):
+        readiness = {}
+    readiness.setdefault("status", "input_or_runtime_error")
+    readiness.setdefault("body_sha256", f"sha256:{_sha256(candidate_body)}")
+    readiness.setdefault("source_checks", [])
+    readiness.setdefault("errors", [])
+    readiness["readiness_result_ref"] = "transaction-local"
+    readiness_forwarding = {
+        key: readiness[key]
+        for key in (
+            "status",
+            "body_sha256",
+            "source_checks",
+            "errors",
+            "readiness_result_ref",
+            "resolution_evidence",
+        )
+        if key in readiness
+    }
+
+    transaction_input = build_issue_edit_txn_input(
+        issue_number=issue_number,
+        repo=repo,
+        previous_body_sha256=f"sha256:{_sha256(current_issue_.get('body', ''))}",
+        previous_updated_at=current_issue_["updatedAt"],
+        new_body_file=str(candidate_path.relative_to(root)),
+        readiness_result=readiness_forwarding,
+    )
+    # PR #2202 review fix (P1-1): dir-FD-relative O_CREAT|O_EXCL create
+    # (see `_dispatch_candidate_body_default_transaction()`'s docstring
+    # comment for the full rationale) instead of a plain
+    # `Path.write_text()` at a fixed, guessable pathname.
+    _repair_apply_scratch_create(
+        scratch_dir_fd, input_path.name, json.dumps(transaction_input, ensure_ascii=False).encode("utf-8")
+    )
+
+    def _unknown_dispatch_txn_result(error_code: str, message: str) -> dict:
+        # PR #2202 review fix-delta (P0-6): a genuinely-unconfirmed
+        # outcome detected HERE (never through a raw-executor receipt)
+        # still followed an actual edit_issue_txn.py subprocess
+        # invocation attempt, so `content_update.patch_attempted=True`
+        # is set (mirroring the canonical ISSUE_EDIT_TXN_RESULT_V1
+        # `mutation_outcome_unknown` shape) so AC9 fresh validation
+        # still runs after this outcome, exactly as it would for a
+        # genuine executor-reported unknown receipt.
+        return {
+            "status": "mutation_outcome_unknown",
+            "content_update": {"patch_attempted": True, "mutation_outcome": "unknown"},
+            "errors": [{"code": error_code, "message": message[:200]}],
+        }
+
+    # AC11: the ONLY GitHub-mutation subprocess this consumer ever
+    # invokes is edit_issue_txn.py --input-file. No `gh issue edit`
+    # call exists anywhere in this function.
+    transaction_script = _SCRIPTS_DIR.parent.parent / EDIT_ISSUE_TXN_SCRIPT_REL
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(transaction_script), "--input-file", str(input_path.relative_to(root))],
+            capture_output=True,
+            text=True,
+            shell=False,
+            cwd=str(root),
+            timeout=REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # PR #2202 review fix-delta (P0-6, items 2+3): this is the ONLY
+        # subprocess this consumer ever invokes to dispatch a real
+        # GitHub PATCH (AC11). `subprocess.run(timeout=...)` kills the
+        # child only AFTER the timeout has already elapsed, so a
+        # TimeoutExpired here does NOT prove the PATCH never reached
+        # GitHub -- the child (or GitHub itself) may already have
+        # applied it. Reporting this as "no mutation" would be an
+        # unsafe mis-report of a non-retriable PATCH (review P0-6 item
+        # 3), so this is always routed to the SAME
+        # `mutation_outcome_unknown` status the executor itself uses to
+        # signal an unconfirmed outcome -- never a degraded
+        # `failed_no_mutation` shortcut. `_repair_receipt_from_txn_result`
+        # maps this to `mutation_outcome=unknown` and triggers the
+        # existing AC5 single authoritative-readback path.
+        return _unknown_dispatch_txn_result("txn_subprocess_timeout", str(exc))
+    except OSError as exc:
+        # Same reasoning as the TimeoutExpired branch above: an OSError
+        # raised by subprocess.run() itself (e.g. a transient OS-level
+        # wait/communicate failure) after the call has already been
+        # made does not prove the PATCH was never dispatched.
+        return _unknown_dispatch_txn_result("txn_subprocess_oserror", str(exc))
+    try:
+        txn_result = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        # PR #2202 review fix-delta (P0-6, item 3): stdout being empty,
+        # truncated, or non-JSON AFTER the subprocess call above has
+        # already completed does NOT prove no mutation happened -- the
+        # child may have dispatched the PATCH and then failed to
+        # flush/emit its own confirmation. Degrading this to
+        # `failed_no_mutation` (the prior behavior) risked silently
+        # reporting "no mutation" after a real, non-retriable PATCH.
+        # This must resolve to `unknown` and route into the SAME AC5
+        # authoritative-readback path used for a genuine executor-
+        # reported `mutation_outcome_unknown` receipt.
+        txn_result = _unknown_dispatch_txn_result("txn_stdout_not_json", completed.stderr or "")
+    # Same reasoning: a parsed-but-non-dict stdout shape still followed
+    # a completed subprocess call, so it must not be reported as
+    # `failed_no_mutation` either.
+    return txn_result if isinstance(txn_result, dict) else _unknown_dispatch_txn_result(
+        "txn_stdout_not_dict", "parsed stdout JSON was not a dict"
+    )
+
+
+def _dispatch_candidate_body_default_transaction(
+    current_issue_: dict,
+    candidate_body: str,
+    *,
+    root: Path,
+    issue_number: int,
+    repo: str,
+    scratch_subdir: str = "repair-action-apply",
+) -> dict:
+    """Issue #2039 AC8 (extracted for Issue #2396 AC5 sharing): unlike the
+    sibling contract_update.run.with_anchor lane (which uses the shared,
+    non-Issue-scoped `tmp/` workspace), this lane's transaction-local
+    scratch files live under this command_id's own declared
+    `allowed_write_roots` entry
+    (`.claude/artifacts/issue-refinement-loop/{issue_number}/{scratch_subdir}/`),
+    so they are never reported as an unauthorized write by
+    skill_runtime_exec.py's git-status-diff postcondition check (which has
+    no `tmp/`-specific exemption of its own for a bare ignored directory's
+    mere existence). `scratch_subdir` keeps the generic `repair_action.apply`
+    lane's scratch files and the structural `structural_repair_action.apply`
+    lane's scratch files in separate subdirectories so two concurrent
+    invocations for the SAME Issue across the two lanes can never collide
+    on each other's filenames.
+
+    PR #2202 review fix (P1-1): a FIXED issue-number-keyed scratch path
+    here (e.g. `issue_<N>_repair_action_candidate.md`) lets two concurrent
+    invocations for the same Issue clobber each other's candidate/input
+    files, and -- worse -- lets another process with the same permissions
+    pre-place a symlink at that exact, guessable path BEFORE this code
+    ever runs, redirecting the write below to silently overwrite an
+    arbitrary writable file elsewhere. This happens strictly upstream of
+    `edit_issue_txn.py`'s own symlink checks, which only ever see the
+    file we already (unsafely) wrote. Use a per-invocation random
+    subdirectory (`tempfile.mkdtemp`, mode 0700, unguessable name) under
+    the same allowed-write-roots base, then create each scratch file
+    inside it via dir-FD-relative `O_CREAT|O_EXCL|O_NOFOLLOW` so we fail
+    closed instead of following/overwriting anything unexpectedly already
+    there.
+    """
+    _txn_base_dir = root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number) / scratch_subdir
+    _txn_base_dir.mkdir(parents=True, exist_ok=True)
+    _scratch_dir = Path(tempfile.mkdtemp(dir=str(_txn_base_dir)))
+    candidate_path = _scratch_dir / "candidate_body.md"
+    input_path = _scratch_dir / "edit_issue_txn_input.json"
+
+    _scratch_dir_fd = os.open(str(_scratch_dir), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _repair_apply_scratch_create(_scratch_dir_fd, candidate_path.name, candidate_body.encode("utf-8"))
+        try:
+            return _dispatch_candidate_body_via_edit_txn(
+                current_issue_=current_issue_,
+                candidate_body=candidate_body,
+                candidate_path=candidate_path,
+                input_path=input_path,
+                scratch_dir_fd=_scratch_dir_fd,
+                root=root,
+                issue_number=issue_number,
+                repo=repo,
+            )
+        finally:
+            for _tmp_path in (candidate_path, input_path):
+                _repair_apply_scratch_unlink(_scratch_dir_fd, _tmp_path.name)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(_scratch_dir_fd)
+        with contextlib.suppress(OSError):
+            os.rmdir(_scratch_dir)
+
+
 def run_repair_action_apply(
     *,
     repo: str,
@@ -1741,196 +1980,15 @@ def run_repair_action_apply(
         }
 
     def _default_apply_transaction(current_issue_: dict, candidate_body: str) -> dict:
-        # Issue #2039 AC8: unlike the sibling contract_update.run.with_anchor
-        # lane (which uses the shared, non-Issue-scoped `tmp/` workspace),
-        # repair_action.apply's transaction-local scratch files live under
-        # this command_id's own declared `allowed_write_roots` entry
-        # (`.claude/artifacts/issue-refinement-loop/{issue_number}/`), so
-        # they are never reported as an unauthorized write by
-        # skill_runtime_exec.py's git-status-diff postcondition check (which
-        # has no `tmp/`-specific exemption of its own for a bare ignored
-        # directory's mere existence).
-        #
-        # PR #2202 review fix (P1-1): a FIXED issue-number-keyed scratch
-        # path here (e.g. `issue_<N>_repair_action_candidate.md`) lets two
-        # concurrent invocations for the same Issue clobber each other's
-        # candidate/input files, and -- worse -- lets another process with
-        # the same permissions pre-place a symlink at that exact,
-        # guessable path BEFORE this code ever runs, redirecting the write
-        # below to silently overwrite an arbitrary writable file
-        # elsewhere. This happens strictly upstream of
-        # `edit_issue_txn.py`'s own symlink checks, which only ever see
-        # the file we already (unsafely) wrote. Use a per-invocation
-        # random subdirectory (`tempfile.mkdtemp`, mode 0700, unguessable
-        # name) under the same allowed-write-roots base, then create each
-        # scratch file inside it via dir-FD-relative
-        # `O_CREAT|O_EXCL|O_NOFOLLOW` so we fail closed instead of
-        # following/overwriting anything unexpectedly already there.
-        _txn_base_dir = (
-            root / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number) / "repair-action-apply"
-        )
-        _txn_base_dir.mkdir(parents=True, exist_ok=True)
-        _scratch_dir = Path(tempfile.mkdtemp(dir=str(_txn_base_dir)))
-        candidate_path = _scratch_dir / "repair_action_candidate.md"
-        input_path = _scratch_dir / "repair_action_txn.json"
-
-        _scratch_dir_fd = os.open(str(_scratch_dir), os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            _repair_apply_scratch_create(_scratch_dir_fd, candidate_path.name, candidate_body.encode("utf-8"))
-            try:
-                return _default_apply_transaction_inner(
-                    current_issue_, candidate_body, candidate_path, input_path, _scratch_dir_fd
-                )
-            finally:
-                for _tmp_path in (candidate_path, input_path):
-                    _repair_apply_scratch_unlink(_scratch_dir_fd, _tmp_path.name)
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(_scratch_dir_fd)
-            with contextlib.suppress(OSError):
-                os.rmdir(_scratch_dir)
-
-    def _default_apply_transaction_inner(
-        current_issue_: dict,
-        candidate_body: str,
-        candidate_path: Path,
-        input_path: Path,
-        _scratch_dir_fd: int,
-    ) -> dict:
-        from scope_signal_delta import build_issue_edit_txn_input
-
-        readiness_script = (
-            _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
-        )
-        try:
-            completed_readiness = subprocess.run(
-                [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
-                capture_output=True,
-                text=True,
-                shell=False,
-                timeout=REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS,
-            )
-            readiness_stdout = completed_readiness.stdout
-        except (subprocess.TimeoutExpired, OSError):
-            # PR #2202 review fix-delta (P0-6, item 2): the readiness check
-            # never touches GitHub -- it runs strictly BEFORE
-            # edit_issue_txn.py is ever invoked below, so a
-            # TimeoutExpired/OSError here proves no mutation could possibly
-            # have been dispatched yet. It is therefore always safe to fall
-            # through to the SAME degraded-readiness fallback already used
-            # for non-JSON readiness stdout below (never a fabricated
-            # "verified"/"unresolved" readiness signal, and never routed
-            # into the mutation-side `unknown` handling this is not).
-            readiness_stdout = ""
-        try:
-            readiness = json.loads(readiness_stdout)
-        except json.JSONDecodeError:
-            readiness = {}
-        if not isinstance(readiness, dict):
-            readiness = {}
-        readiness.setdefault("status", "input_or_runtime_error")
-        readiness.setdefault("body_sha256", f"sha256:{_sha256(candidate_body)}")
-        readiness.setdefault("source_checks", [])
-        readiness.setdefault("errors", [])
-        readiness["readiness_result_ref"] = "transaction-local"
-        readiness_forwarding = {
-            key: readiness[key]
-            for key in (
-                "status",
-                "body_sha256",
-                "source_checks",
-                "errors",
-                "readiness_result_ref",
-                "resolution_evidence",
-            )
-            if key in readiness
-        }
-
-        transaction_input = build_issue_edit_txn_input(
-            issue_number=issue_number,
-            repo=repo,
-            previous_body_sha256=f"sha256:{_sha256(current_issue_.get('body', ''))}",
-            previous_updated_at=current_issue_["updatedAt"],
-            new_body_file=str(candidate_path.relative_to(root)),
-            readiness_result=readiness_forwarding,
-        )
-        # PR #2202 review fix (P1-1): dir-FD-relative O_CREAT|O_EXCL create
-        # (see `_default_apply_transaction`'s docstring comment above for
-        # the full rationale) instead of a plain `Path.write_text()` at a
-        # fixed, guessable pathname.
-        _repair_apply_scratch_create(
-            _scratch_dir_fd, input_path.name, json.dumps(transaction_input, ensure_ascii=False).encode("utf-8")
-        )
-
-        def _unknown_dispatch_txn_result(error_code: str, message: str) -> dict:
-            # PR #2202 review fix-delta (P0-6): a genuinely-unconfirmed
-            # outcome detected HERE (never through a raw-executor receipt)
-            # still followed an actual edit_issue_txn.py subprocess
-            # invocation attempt, so `content_update.patch_attempted=True`
-            # is set (mirroring the canonical ISSUE_EDIT_TXN_RESULT_V1
-            # `mutation_outcome_unknown` shape) so AC9 fresh validation
-            # still runs after this outcome, exactly as it would for a
-            # genuine executor-reported unknown receipt.
-            return {
-                "status": "mutation_outcome_unknown",
-                "content_update": {"patch_attempted": True, "mutation_outcome": "unknown"},
-                "errors": [{"code": error_code, "message": message[:200]}],
-            }
-
-        # AC11: the ONLY GitHub-mutation subprocess this consumer ever
-        # invokes is edit_issue_txn.py --input-file. No `gh issue edit`
-        # call exists anywhere in this function.
-        transaction_script = _SCRIPTS_DIR.parent.parent / EDIT_ISSUE_TXN_SCRIPT_REL
-        try:
-            completed = subprocess.run(
-                [sys.executable, str(transaction_script), "--input-file", str(input_path.relative_to(root))],
-                capture_output=True,
-                text=True,
-                shell=False,
-                cwd=str(root),
-                timeout=REPAIR_APPLY_EDIT_ISSUE_TXN_SUBPROCESS_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as exc:
-            # PR #2202 review fix-delta (P0-6, items 2+3): this is the ONLY
-            # subprocess this consumer ever invokes to dispatch a real
-            # GitHub PATCH (AC11). `subprocess.run(timeout=...)` kills the
-            # child only AFTER the timeout has already elapsed, so a
-            # TimeoutExpired here does NOT prove the PATCH never reached
-            # GitHub -- the child (or GitHub itself) may already have
-            # applied it. Reporting this as "no mutation" would be an
-            # unsafe mis-report of a non-retriable PATCH (review P0-6 item
-            # 3), so this is always routed to the SAME
-            # `mutation_outcome_unknown` status the executor itself uses to
-            # signal an unconfirmed outcome -- never a degraded
-            # `failed_no_mutation` shortcut. `_repair_receipt_from_txn_result`
-            # maps this to `mutation_outcome=unknown` and triggers the
-            # existing AC5 single authoritative-readback path.
-            return _unknown_dispatch_txn_result("txn_subprocess_timeout", str(exc))
-        except OSError as exc:
-            # Same reasoning as the TimeoutExpired branch above: an OSError
-            # raised by subprocess.run() itself (e.g. a transient OS-level
-            # wait/communicate failure) after the call has already been
-            # made does not prove the PATCH was never dispatched.
-            return _unknown_dispatch_txn_result("txn_subprocess_oserror", str(exc))
-        try:
-            txn_result = json.loads(completed.stdout)
-        except json.JSONDecodeError:
-            # PR #2202 review fix-delta (P0-6, item 3): stdout being empty,
-            # truncated, or non-JSON AFTER the subprocess call above has
-            # already completed does NOT prove no mutation happened -- the
-            # child may have dispatched the PATCH and then failed to
-            # flush/emit its own confirmation. Degrading this to
-            # `failed_no_mutation` (the prior behavior) risked silently
-            # reporting "no mutation" after a real, non-retriable PATCH.
-            # This must resolve to `unknown` and route into the SAME AC5
-            # authoritative-readback path used for a genuine executor-
-            # reported `mutation_outcome_unknown` receipt.
-            txn_result = _unknown_dispatch_txn_result("txn_stdout_not_json", completed.stderr or "")
-        # Same reasoning: a parsed-but-non-dict stdout shape still followed
-        # a completed subprocess call, so it must not be reported as
-        # `failed_no_mutation` either.
-        return txn_result if isinstance(txn_result, dict) else _unknown_dispatch_txn_result(
-            "txn_stdout_not_dict", "parsed stdout JSON was not a dict"
+        # Issue #2396: this default now delegates to the top-level, shared
+        # `_dispatch_candidate_body_default_transaction()` helper (AC5 of
+        # Issue #2396 -- the structural_repair_action.apply consumer reuses
+        # the EXACT SAME mutation-dispatch core via this same helper, never
+        # a second independent implementation). See that function's own
+        # docstring for the full scratch-directory / symlink-safety
+        # rationale (unchanged from before this extraction).
+        return _dispatch_candidate_body_default_transaction(
+            current_issue_, candidate_body, root=root, issue_number=issue_number, repo=repo
         )
 
     apply_fn = apply_transaction or _default_apply_transaction
@@ -2015,6 +2073,551 @@ def run_repair_action_apply(
             "physically_deleted": False,
             "latest_action_reference_invalidated": mutation_outcome == "applied",
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Issue #2396: `structural_repair_action.apply` controlled consumer.
+#
+# Bridges `repair_issue_contract.py`'s `build_structural_repair_bundle()`
+# (Issue #995 -- a pure, mutation-free producer of per-field insertion
+# proposals) to the SAME `edit_issue_txn.py` controlled-transaction core
+# `run_repair_action_apply()` already uses. Unlike the generic
+# `repair_action/v1` lane, `structural_repair_action/v1` never carries a
+# pre-materialized whole-body `candidate_body_artifact` -- its `items[]`
+# are per-field insertion metadata (`anchor_start_line` / `relation` /
+# `candidate_value` / digests) that this consumer must independently
+# re-verify against the LIVE Issue body and synthesize into a single
+# repaired body BEFORE it can even be handed to the shared dispatch core.
+# ---------------------------------------------------------------------------
+
+STRUCTURAL_REPAIR_APPLY_STDOUT_SCHEMA_VERSION = "structural_repair_apply_result/v1"
+
+STRUCTURAL_REPAIR_APPLY_FAILURE_INVALID_DISPOSITION = "invalid_disposition"
+STRUCTURAL_REPAIR_APPLY_FAILURE_AMBIGUOUS_ITEM = "ambiguous_insertion_present"
+STRUCTURAL_REPAIR_APPLY_FAILURE_DIGEST_MISMATCH = "structural_item_digest_mismatch"
+STRUCTURAL_REPAIR_APPLY_FAILURE_CONFLICTING_TARGETS = "structural_conflicting_insertion_targets"
+STRUCTURAL_REPAIR_APPLY_FAILURE_BODY_DRIFT = "structural_body_drift"
+STRUCTURAL_REPAIR_APPLY_FAILURE_CROSS_ISSUE = "cross_issue_provenance_mismatch"
+STRUCTURAL_REPAIR_APPLY_FAILURE_READBACK_UNRESOLVABLE = "final_readback_unresolvable"
+
+
+def _structural_apply_not_attempted_result(
+    *, repo: str, issue_number: int, phase: str, failure_code: "str | None"
+) -> dict:
+    """Shared not_attempted stdout-contract shape for every early-exit
+    branch of `run_structural_repair_action_apply()`. Never emits a GitHub
+    mutation (mirrors `_repair_apply_not_attempted_result()`'s role for the
+    sibling generic lane)."""
+    return {
+        "schema_version": STRUCTURAL_REPAIR_APPLY_STDOUT_SCHEMA_VERSION,
+        "phase": phase,
+        "mutation_outcome": "not_attempted",
+        "failure_code": failure_code,
+        "repo": repo,
+        "issue_number": issue_number,
+        "items_applied": 0,
+        "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
+        "receipt": {
+            "patch_attempted": False,
+            "executor_status": None,
+            "mutation_outcome": "not_attempted",
+            "failure_code": failure_code,
+            "final_readback": {"status": "not_applicable", "digest": None, "digest_class": "not_applicable"},
+        },
+        "fresh_validation": {
+            "status": "not_run",
+            "actionable_repair_remaining": None,
+            "final_body_digest_match": None,
+        },
+    }
+
+
+def _structural_item_rendered_block(item: dict) -> str:
+    """Reproduce the EXACT same candidate-section text the producer hashed
+    into `insertion.candidate_section_digest`
+    (`repair_issue_contract._apply_insertion_decision`'s own formula) so
+    this consumer's digest re-verification is a genuine byte-for-byte
+    check, not an independently-invented format."""
+    insertion = item["insertion"]
+    rendered_heading = insertion["rendered_heading"]
+    candidate_value = item.get("candidate_value")
+    if candidate_value:
+        return f"{rendered_heading}\n\n{candidate_value}\n"
+    return f"{rendered_heading}\n"
+
+
+def _structural_item_block_lines(item: dict) -> list[str]:
+    """The rendered block as a list of body lines (no trailing empty
+    component from the block's own trailing newline) suitable for splicing
+    directly into a `body.split(\"\\n\")` line list."""
+    text = _structural_item_rendered_block(item)
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _verify_structural_items_against_live_body(items: list[dict], live_body: str) -> "str | None":
+    """Issue #2396 AC5: re-verify EVERY item's own
+    `insertion.candidate_section_digest` / `insertion.anchor_digest`
+    against the freshly-fetched LIVE Issue body BEFORE any synthesis --
+    never trusting the artifact's own recorded digests alone (defense in
+    depth, mirroring this codebase's existing stance of never trusting a
+    producer's summary field without independently re-checking its own
+    items -- see `route_structural_repair_disposition()`).
+
+    Returns None on success, or a failure_code string on the first
+    mismatch / ambiguous item encountered.
+    """
+    from repair_issue_contract import _parse_h2_sections, _section_line_bounds
+
+    live_lines = live_body.split("\n")
+    sections = _parse_h2_sections(live_body)
+    heading_index: dict[str, list[dict]] = {}
+    for sec in sections:
+        heading_index.setdefault(sec["heading"].strip().casefold(), []).append(sec)
+
+    for item in items:
+        insertion = item.get("insertion")
+        if not isinstance(insertion, dict) or insertion.get("disposition") == "ambiguous":
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_AMBIGUOUS_ITEM
+
+        # NOTE: `repair_issue_contract._sha256()` (which produced every
+        # digest recorded on this item) returns a `sha256:`-prefixed
+        # string, unlike THIS module's own bare-hex `_sha256()` -- prefix
+        # explicitly here so the comparison is genuinely apples-to-apples,
+        # not a same-named-but-differently-formatted function.
+        recomputed_section_digest = f"sha256:{_sha256(_structural_item_rendered_block(item))}"
+        if recomputed_section_digest != insertion.get("candidate_section_digest"):
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+
+        anchor_heading = insertion.get("anchor_heading")
+        anchor_start_line = insertion.get("anchor_start_line")
+        anchor_digest = insertion.get("anchor_digest")
+        relation = insertion.get("relation")
+        if relation not in ("before", "after", "insert_contract_key", "replace_section_content"):
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_CONFLICTING_TARGETS
+
+        matches = heading_index.get((anchor_heading or "").strip().casefold(), [])
+        if len(matches) != 1:
+            # The anchor heading this item recorded is no longer present
+            # exactly once in the live body (renamed, removed, or now
+            # duplicated) -- the environment this item's insertion decision
+            # was made against no longer holds.
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+        sec = matches[0]
+        recomputed_anchor_digest = "sha256:" + _sha256(f"## {sec['heading']}")
+        if recomputed_anchor_digest != anchor_digest:
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+
+        start, end = _section_line_bounds(sections, len(live_lines))[id(sec)]
+        if relation == "before":
+            expected_anchor_line = start
+        elif relation == "replace_section_content":
+            expected_anchor_line = start
+        else:  # "after" / "insert_contract_key"
+            expected_anchor_line = end
+        if expected_anchor_line != anchor_start_line:
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+
+    return None
+
+
+def _synthesize_structural_repaired_body(items: list[dict], live_body: str) -> "tuple[str | None, str | None]":
+    """Issue #2396: deterministically synthesize a SINGLE repaired body from
+    every item's `insertion` metadata, applied against the live body from
+    the bottom of the document upward (by descending anchor line) so an
+    earlier (higher-line) splice never invalidates a not-yet-processed
+    lower-line anchor. Items resolving to the exact same insertion point
+    are concatenated in ascending `template_field_order` (the template's
+    own top-to-bottom field order) rather than left in an arbitrary/input
+    order.
+
+    Callers MUST have already run `_verify_structural_items_against_live_body()`
+    successfully against the SAME `live_body` -- this function re-derives
+    section boundaries again (a second, independent parse) rather than
+    trusting any state from that earlier call, so it never silently
+    applies an insertion whose anchor turned out to be ambiguous/duplicate.
+
+    Returns (new_body, None) on success, or (None, failure_code) if two
+    items resolve to conflicting/overlapping targets that cannot be
+    uniquely applied.
+    """
+    from repair_issue_contract import _parse_h2_sections, _section_line_bounds
+
+    live_lines = live_body.split("\n")
+    sections = _parse_h2_sections(live_body)
+    bounds = _section_line_bounds(sections, len(live_lines))
+    heading_index: dict[str, list[dict]] = {}
+    for sec in sections:
+        heading_index.setdefault(sec["heading"].strip().casefold(), []).append(sec)
+
+    replace_plans: list[dict] = []
+    insert_groups: dict[int, list[dict]] = {}
+
+    for item in items:
+        insertion = item["insertion"]
+        relation = insertion["relation"]
+        anchor_heading = insertion.get("anchor_heading")
+        matches = heading_index.get((anchor_heading or "").strip().casefold(), [])
+        if len(matches) != 1:
+            return None, STRUCTURAL_REPAIR_APPLY_FAILURE_CONFLICTING_TARGETS
+        sec = matches[0]
+        start, end = bounds[id(sec)]
+
+        if relation == "replace_section_content":
+            replace_plans.append(
+                {"start": start, "end": end, "item": item, "order": item["template_field_order"]}
+            )
+        elif relation == "before":
+            insert_groups.setdefault(start - 1, []).append(item)
+        else:  # "after" / "insert_contract_key"
+            insert_groups.setdefault(end, []).append(item)
+
+    # Reject overlapping replace ranges (fail closed rather than guess a
+    # resolution order). In practice `replace_section_content` is only ever
+    # reached by the producer for human_review_required items (Issue #2396
+    # investigation), so this branch is unreachable on an
+    # all-auto_apply_safe bundle -- kept as defense in depth.
+    for i in range(len(replace_plans)):
+        for j in range(i + 1, len(replace_plans)):
+            a, b = replace_plans[i], replace_plans[j]
+            if a["start"] <= b["end"] and b["start"] <= a["end"]:
+                return None, STRUCTURAL_REPAIR_APPLY_FAILURE_CONFLICTING_TARGETS
+
+    operations: list[tuple[int, int, list[str]]] = []
+    for plan in replace_plans:
+        operations.append((plan["start"] - 1, plan["end"], _structural_item_block_lines(plan["item"])))
+    for pos, group in insert_groups.items():
+        group.sort(key=lambda i: i["template_field_order"])
+        combined_lines: list[str] = []
+        for grouped_item in group:
+            combined_lines.extend(_structural_item_block_lines(grouped_item))
+            combined_lines.append("")
+        operations.append((pos, pos, combined_lines))
+
+    # Apply from the bottom of the body upward (descending start index) so
+    # earlier splices never invalidate not-yet-processed lower indices.
+    operations.sort(key=lambda op: op[0], reverse=True)
+    for start_idx, end_idx, new_lines in operations:
+        live_lines[start_idx:end_idx] = new_lines
+
+    return "\n".join(live_lines), None
+
+
+def _structural_items_already_applied(items: list[dict], live_body: str) -> bool:
+    """Issue #2396 (AC10-analogue idempotent-replay short circuit): True
+    when EVERY item's own target already reflects its candidate content in
+    the live body -- i.e. this exact structural candidate was already
+    applied by a prior invocation (or externally), so a replay must resolve
+    to `no_change` without spending any dispatch."""
+    from repair_issue_contract import _parse_h2_sections
+
+    sections = _parse_h2_sections(live_body)
+    heading_index: dict[str, list[dict]] = {}
+    for sec in sections:
+        heading_index.setdefault(sec["heading"].strip().casefold(), []).append(sec)
+
+    for item in items:
+        candidate_value = (item.get("candidate_value") or "").strip()
+        field_id = item.get("field_id", "")
+        if isinstance(field_id, str) and field_id.startswith("machine-readable-contract."):
+            key_name = field_id.split(".", 1)[1]
+            if (
+                f"{key_name}: {candidate_value}" not in live_body
+                and f'{key_name}: "{candidate_value}"' not in live_body
+            ):
+                return False
+            continue
+        label = item.get("label", "")
+        matches = heading_index.get(label.strip().casefold(), [])
+        if len(matches) != 1 or matches[0]["content"].strip() != candidate_value:
+            return False
+    return True
+
+
+def _default_structural_fresh_validate_producer(body: str, covered_field_ids: "set[str]") -> dict:
+    """Issue #2396 AC6 default fresh-validation producer: reruns the
+    (narrow, mutation-free) structural section/contract-key detector
+    against the fresh live body -- never the full `run_preflight()`
+    pipeline, mirroring the generic lane's own `_default_fresh_validate_producer()`
+    narrow-rerun scope -- and reports whether any of the ORIGINALLY covered
+    `field_id`s still appear as a detected missing/invalid item."""
+    if detect_missing_template_sections is None:
+        return {"error": "structural_detector_unavailable", "actionable_repair": None}
+    try:
+        kind, template_text, template_path = _resolve_structural_repair_template(body, _find_repo_root())
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"error": str(exc), "actionable_repair": None}
+    if kind is None:
+        return {"error": "structural_template_unresolvable", "actionable_repair": None}
+    try:
+        fresh_items = detect_missing_template_sections(
+            body, issue_kind=kind, template_text=template_text, template_path=template_path
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"error": str(exc), "actionable_repair": None}
+    remaining = {i.get("field_id") for i in fresh_items if isinstance(i, dict)}
+    return {"error": None, "actionable_repair": bool(remaining & covered_field_ids)}
+
+
+def _run_structural_apply_fresh_validation(*, fetch, producer, expected_digest: "str | None") -> dict:
+    """Issue #2396 AC6/AC9-analogue: post-mutation fresh validation. Re-reads
+    the live Issue body (a read, never a mutation retry) and reruns
+    `producer` against it. Succeeds ONLY when no actionable structural
+    repair remains for the originally-covered fields AND the live body
+    digest matches `expected_digest`."""
+    if expected_digest is None:
+        return {"status": "failed", "actionable_repair_remaining": None, "final_body_digest_match": None}
+    try:
+        fresh_issue = fetch()
+    except Exception:
+        return {"status": "failed", "actionable_repair_remaining": None, "final_body_digest_match": None}
+
+    fresh_body = fresh_issue.get("body", "") or ""
+    fresh_digest = _sha256(fresh_body)
+    digest_match = _repair_apply_strip_sha_prefix(fresh_digest) == _repair_apply_strip_sha_prefix(expected_digest)
+
+    produced = producer(fresh_body)
+    if produced.get("error") is not None:
+        return {"status": "failed", "actionable_repair_remaining": None, "final_body_digest_match": digest_match}
+
+    actionable_remaining = produced.get("actionable_repair")
+    status = "success" if (actionable_remaining is False and digest_match) else "failed"
+    return {
+        "status": status,
+        "actionable_repair_remaining": actionable_remaining,
+        "final_body_digest_match": digest_match,
+    }
+
+
+def run_structural_repair_action_apply(
+    *,
+    repo: str,
+    issue_number: int,
+    preflight_result_path: str,
+    repo_root: "Path | None" = None,
+    fetch_current=None,
+    apply_transaction=None,
+    fresh_validate=None,
+) -> dict:
+    """Issue #2396: `structural_repair_action.apply` controlled consumer.
+
+    Reads a previously-produced preflight-result artifact via the SAME
+    FD-based secure reader `run_repair_action_apply()` uses (AC7 of Issue
+    #2039's own reader), requires `structural_repair_action.disposition_summary
+    == auto_apply_safe` with every item ITSELF `auto_apply_safe` and no
+    `insertion.disposition == "ambiguous"` item present (AC3), re-verifies
+    every item's own recorded digests against the freshly-fetched LIVE
+    Issue body (AC5), synthesizes a single whole-body candidate from the
+    per-item insertion metadata (never a pre-materialized
+    `candidate_body_artifact` -- no such artifact exists for this schema),
+    and dispatches it through the EXACT SAME shared
+    `_dispatch_candidate_body_default_transaction()` /
+    `_dispatch_candidate_body_via_edit_txn()` core `run_repair_action_apply()`
+    itself uses (AC5 -- never a second, independent GitHub-mutation
+    implementation).
+
+    A replay against a live body that already reflects every item's own
+    candidate content resolves deterministically to `mutation_outcome:
+    no_change` with no GitHub mutation dispatched, even when the whole body
+    has otherwise drifted from `original_body_sha256` (AC10-analogue).
+    """
+    root = repo_root or _find_repo_root()
+    _pf_path = Path(preflight_result_path)
+    if not _pf_path.is_absolute():
+        _pf_path = root / _pf_path
+    try:
+        result_text, _ = secure_read_repair_apply_artifact(_pf_path, root=root)
+    except RepairApplySecureOpenError:
+        return _structural_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+    try:
+        parsed = json.loads(result_text)
+    except json.JSONDecodeError:
+        return _structural_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+    if not isinstance(parsed, dict):
+        return _structural_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="candidate_load", failure_code="secure_open_rejected"
+        )
+
+    structural_repair_action = parsed.get("structural_repair_action")
+    if not isinstance(structural_repair_action, dict) or (
+        structural_repair_action.get("disposition_summary") != STRUCT_DISPOSITION_AUTO_APPLY_SAFE
+    ):
+        return _structural_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="provenance_validation",
+            failure_code=STRUCTURAL_REPAIR_APPLY_FAILURE_INVALID_DISPOSITION,
+        )
+    if structural_repair_action.get("repo") != repo or structural_repair_action.get("issue_number") != issue_number:
+        return _structural_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="provenance_validation",
+            failure_code=STRUCTURAL_REPAIR_APPLY_FAILURE_CROSS_ISSUE,
+        )
+
+    items = structural_repair_action.get("items")
+    if (
+        not isinstance(items, list)
+        or not items
+        or any(not isinstance(i, dict) or i.get("disposition") != STRUCT_DISPOSITION_AUTO_APPLY_SAFE for i in items)
+    ):
+        return _structural_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="provenance_validation",
+            failure_code=STRUCTURAL_REPAIR_APPLY_FAILURE_INVALID_DISPOSITION,
+        )
+
+    original_body_sha256 = structural_repair_action.get("original_body_sha256")
+
+    def _default_fetch_current():
+        current_issue, issue_error = _fetch_issue(repo, issue_number)
+        if current_issue is None:
+            raise RuntimeError(f"issue_readback_failed:{issue_error}")
+        return current_issue
+
+    fetch = fetch_current or _default_fetch_current
+    try:
+        current_issue = fetch()
+    except Exception:
+        return _structural_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="precondition_read",
+            failure_code=STRUCTURAL_REPAIR_APPLY_FAILURE_READBACK_UNRESOLVABLE,
+        )
+
+    live_body = current_issue.get("body", "") or ""
+    live_body_digest = f"sha256:{hashlib.sha256(live_body.encode('utf-8')).hexdigest()}"
+
+    if _repair_apply_strip_sha_prefix(live_body_digest) != _repair_apply_strip_sha_prefix(original_body_sha256):
+        # Issue #2396 (stale guard, mirrors the generic lane's own
+        # original_body_sha256 comparison): the whole body has drifted
+        # since this bundle was produced. Before failing closed, check the
+        # AC10-analogue idempotent-replay short circuit -- if every item's
+        # own target already reflects its candidate content, this is a
+        # replay of an already-applied change, not a fresh drift.
+        if _structural_items_already_applied(items, live_body):
+            return {
+                "schema_version": STRUCTURAL_REPAIR_APPLY_STDOUT_SCHEMA_VERSION,
+                "phase": "complete",
+                "mutation_outcome": "no_change",
+                "failure_code": None,
+                "repo": repo,
+                "issue_number": issue_number,
+                "items_applied": 0,
+                "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
+                "receipt": {
+                    "patch_attempted": False,
+                    "executor_status": None,
+                    "mutation_outcome": "no_change",
+                    "failure_code": None,
+                    "final_readback": {
+                        "status": "verified",
+                        "digest": live_body_digest,
+                        "digest_class": "candidate",
+                    },
+                },
+                "fresh_validation": {
+                    "status": "not_run",
+                    "actionable_repair_remaining": None,
+                    "final_body_digest_match": None,
+                },
+            }
+        return _structural_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="precondition_read",
+            failure_code=STRUCTURAL_REPAIR_APPLY_FAILURE_BODY_DRIFT,
+        )
+
+    # AC5: per-item digest re-verification against the LIVE body, always --
+    # even though the whole-body stale guard above already passed.
+    _verify_failure = _verify_structural_items_against_live_body(items, live_body)
+    if _verify_failure is not None:
+        return _structural_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="provenance_validation", failure_code=_verify_failure
+        )
+
+    new_body, synth_failure = _synthesize_structural_repaired_body(items, live_body)
+    if synth_failure is not None or new_body is None:
+        return _structural_apply_not_attempted_result(
+            repo=repo, issue_number=issue_number, phase="provenance_validation", failure_code=synth_failure
+        )
+
+    candidate_digest = f"sha256:{hashlib.sha256(new_body.encode('utf-8')).hexdigest()}"
+
+    def _default_apply_transaction(current_issue_: dict, candidate_body: str) -> dict:
+        # AC5: the EXACT SAME shared dispatch core the generic
+        # repair_action.apply lane's own default uses -- never a second,
+        # independent GitHub-mutation implementation. `scratch_subdir`
+        # keeps this lane's scratch files in their own subdirectory.
+        return _dispatch_candidate_body_default_transaction(
+            current_issue_,
+            candidate_body,
+            root=root,
+            issue_number=issue_number,
+            repo=repo,
+            scratch_subdir="structural-repair-action-apply",
+        )
+
+    apply_fn = apply_transaction or _default_apply_transaction
+    txn_result = apply_fn(current_issue, new_body)
+
+    def _resolve_readback() -> "str | None":
+        fresh_issue = fetch()
+        return f"sha256:{hashlib.sha256((fresh_issue.get('body', '') or '').encode('utf-8')).hexdigest()}"
+
+    receipt = _repair_receipt_from_txn_result(
+        txn_result,
+        candidate_digest=candidate_digest,
+        old_digest=live_body_digest,
+        resolve_readback=_resolve_readback,
+    )
+    mutation_outcome = receipt["mutation_outcome"]
+    phase = "complete" if mutation_outcome in {"applied", "no_change", "not_attempted"} else "final_readback"
+    failure_code = receipt["failure_code"]
+
+    if receipt.get("patch_attempted"):
+        expected_digest = _repair_apply_expected_post_mutation_digest(
+            mutation_outcome=mutation_outcome,
+            receipt=receipt,
+            candidate_digest=candidate_digest,
+            old_digest=live_body_digest,
+        )
+        covered_field_ids = {i.get("field_id") for i in items}
+        fresh_validate_fn = fresh_validate or (
+            lambda body: _default_structural_fresh_validate_producer(body, covered_field_ids)
+        )
+        fresh_validation = _run_structural_apply_fresh_validation(
+            fetch=fetch, producer=fresh_validate_fn, expected_digest=expected_digest
+        )
+    else:
+        fresh_validation = {"status": "not_run", "actionable_repair_remaining": None, "final_body_digest_match": None}
+
+    if fresh_validation["status"] == "failed" and phase == "complete":
+        phase = "fresh_validation"
+        failure_code = "fresh_validation_failed"
+
+    return {
+        "schema_version": STRUCTURAL_REPAIR_APPLY_STDOUT_SCHEMA_VERSION,
+        "phase": phase,
+        "mutation_outcome": mutation_outcome,
+        "failure_code": failure_code,
+        "repo": repo,
+        "issue_number": issue_number,
+        "items_applied": len(items) if mutation_outcome == "applied" else 0,
+        "retry": {"post_dispatch_retry_budget": 0, "retries_used": 0},
+        "receipt": receipt,
+        "fresh_validation": fresh_validation,
     }
 
 
@@ -6141,6 +6744,85 @@ _STRUCTURAL_ISSUE_KIND_RE = re.compile(r"(?m)^[ \t]*issue_kind:[ \t]*([A-Za-z0-9
 _KNOWN_STRUCTURAL_ISSUE_KINDS = frozenset({"parent", "implementation", "research"})
 
 
+def _structural_deadlock_override_eligible(
+    structural_repair_action: "dict | None",
+    blockers: list[str],
+    required_sections: list[str],
+    required_contract_keys: list[str],
+) -> bool:
+    """Issue #2396: eligibility check for overriding the severity-arbitration
+    `structural_repair_action_deferred` suppression when the incoming
+    structural candidate would itself resolve the SAME
+    `missing_required_section` blocker(s) that made the pre-existing status
+    more severe than the structural target (the #2180 blocked-precedence
+    deadlock). Independently re-validates every condition against the
+    bundle's own items -- never trusts `disposition_summary` alone --
+    mirroring `route_structural_repair_disposition()`'s own defense-in-depth
+    stance (a summary claiming auto_apply_safe must be backed by items that
+    are themselves auto_apply_safe).
+
+    All of the following must hold, or this returns False (existing defer
+    behavior is preserved):
+      1. every item's own `disposition` is `auto_apply_safe`
+      2. no item's `insertion.disposition` is `"ambiguous"` (a producer bug
+         or a hand-crafted/adversarial artifact could otherwise smuggle an
+         unanchorable item through under a false auto_apply_safe summary)
+      3. the bundle's own covered targets (whole-section `label`s plus
+         Machine-Readable-Contract key names) are EXACTLY the union of
+         `required_sections`/`required_contract_keys` (neither more nor
+         less) -- when that union is empty, coverage can never be
+         established from the anonymous `missing_required_section` planner
+         blocker alone, so the override never fires
+      4. `blockers` contains ONLY `missing_required_section`[`:*`] and/or
+         `structural_repair_action_deferred:*` namespaced entries -- any
+         other blocker (allowed_paths, secret, environment, etc.) keeps the
+         existing blocked status untouched
+    """
+    if not isinstance(structural_repair_action, dict):
+        return False
+    items = structural_repair_action.get("items")
+    if not isinstance(items, list) or not items:
+        return False
+
+    covered_sections: set[str] = set()
+    covered_contract_keys: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict) or item.get("disposition") != STRUCT_DISPOSITION_AUTO_APPLY_SAFE:
+            return False
+        insertion = item.get("insertion")
+        if not isinstance(insertion, dict) or insertion.get("disposition") == "ambiguous":
+            return False
+        field_id = item.get("field_id")
+        if isinstance(field_id, str) and field_id.startswith("machine-readable-contract."):
+            covered_contract_keys.add(field_id.split(".", 1)[1])
+        else:
+            label = item.get("label")
+            if isinstance(label, str):
+                covered_sections.add(label)
+
+    required_targets = set(required_sections or []) | set(required_contract_keys or [])
+    covered_targets = covered_sections | covered_contract_keys
+    if not required_targets or required_targets != covered_targets:
+        return False
+
+    for _b in blockers:
+        if (
+            _b == "missing_required_section"
+            or _b.startswith("missing_required_section:")
+            or _b.startswith("structural_repair_action_deferred:")
+            # BLOCKER_FAIL_CLOSED ("PLANNER_FAIL_CLOSED") is the generic
+            # companion marker `_apply_exit_code_mapping()` always appends
+            # alongside the planner's own `missing_required_section` reason
+            # code (Issue #2180's own incident report shows exactly these
+            # THREE blockers together) -- it is not an unrelated blocker
+            # namespace and must not, by itself, prevent the override.
+            or _b == BLOCKER_FAIL_CLOSED
+        ):
+            continue
+        return False
+    return True
+
+
 def _resolve_structural_repair_template(
     body: str, repo_root: Path
 ) -> "tuple[Optional[str], Optional[str], Optional[str]]":
@@ -7321,7 +8003,38 @@ def run_preflight(
             }
             _current_rank = _status_severity.get(status, 0)
             _target_rank = _status_severity[_structural_target_status]
-            if _current_rank > _target_rank:
+            if _current_rank > _target_rank and (
+                _structural_target_status == STRUCTURAL_REPAIR_ROUTE_STATUS_NEEDS_FIX
+                and _structural_deadlock_override_eligible(
+                    structural_repair_action, blockers, required_sections, required_contract_keys
+                )
+            ):
+                # Issue #2396: the incoming structural candidate would
+                # itself RESOLVE the same missing_required_section blocker
+                # that made the pre-existing status more severe than the
+                # structural target -- adopting the (weaker-ranked)
+                # structural verdict here does not silently downgrade an
+                # UNRELATED, more severe finding; it is a fix for the exact
+                # blocker(s) present. Deferring in this specific case would
+                # permanently deadlock a fixable Issue (the #2180 incident).
+                # Every covered missing_required_section /
+                # structural_repair_action_deferred blocker is cleared
+                # (resolved by the adopted action), never left stale
+                # alongside a needs_fix status.
+                status = _structural_target_status
+                next_action = "apply_deterministic_structural_repair"
+                exit_code = EXIT_NEEDS_FIX
+                blockers[:] = [
+                    _b
+                    for _b in blockers
+                    if not (
+                        _b == "missing_required_section"
+                        or _b.startswith("missing_required_section:")
+                        or _b.startswith("structural_repair_action_deferred:")
+                        or _b == BLOCKER_FAIL_CLOSED
+                    )
+                ]
+            elif _current_rank > _target_rank:
                 for _struct_rc in structural_repair_route["reason_codes"]:
                     _struct_entry = f"structural_repair_action_deferred:{_struct_rc}"
                     if _struct_entry not in blockers:
@@ -8210,6 +8923,21 @@ def main(argv: list[str] | None = None) -> None:
         "(never a raw `gh issue edit` call). Requires --issue-number, --repo.",
     )
 
+    parser.add_argument(
+        "--apply-structural-repair-action",
+        type=Path,
+        default=None,
+        metavar="PREFLIGHT_RESULT_JSON_PATH",
+        help="Issue #2396: read a previously-produced preflight result JSON "
+        "artifact (FD-based secure open), and -- only when "
+        "structural_repair_action.disposition_summary == auto_apply_safe with "
+        "every item itself auto_apply_safe and no ambiguous insertion present -- "
+        "re-verify each item's digests against the live Issue body, synthesize a "
+        "single repaired body, and dispatch it through edit_issue_txn.py "
+        "--input-file (the SAME shared core --apply-repair-action uses; never a "
+        "raw `gh issue edit` call). Requires --issue-number, --repo.",
+    )
+
     args = parser.parse_args(argv)
 
     # #2053: producer / consumer dedicated CLI modes -- bypass the full
@@ -8283,6 +9011,22 @@ def main(argv: list[str] | None = None) -> None:
         # (phase == "fresh_validation" with a non-null failure_code) must
         # exit non-zero even when the mutation itself genuinely applied --
         # mutation_outcome alone previously hid this failure behind exit 0.
+        if result.get("phase") == "fresh_validation" and result.get("failure_code"):
+            sys.exit(EXIT_ENVIRONMENT_FAILURE)
+        if outcome in {"applied", "no_change"}:
+            sys.exit(0)
+        if outcome == "not_attempted":
+            sys.exit(EXIT_BLOCKED)
+        sys.exit(EXIT_ENVIRONMENT_FAILURE)
+
+    if args.apply_structural_repair_action is not None:
+        result = run_structural_repair_action_apply(
+            repo=args.repo,
+            issue_number=args.issue_number,
+            preflight_result_path=str(args.apply_structural_repair_action),
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        outcome = result.get("mutation_outcome")
         if result.get("phase") == "fresh_validation" and result.get("failure_code"):
             sys.exit(EXIT_ENVIRONMENT_FAILURE)
         if outcome in {"applied", "no_change"}:
