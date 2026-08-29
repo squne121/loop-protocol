@@ -136,7 +136,7 @@ def _open_fds_for(path: Path) -> set[str]:
     return {entry.name for entry in Path("/proc/self/fd").iterdir() if os.path.realpath(entry) == target}
 
 
-def test_given_primary_or_linked_worktree_when_acquired_then_canonical_common_dir_and_fixed_key(
+def test_given_primary_or_linked_worktree_when_acquired_then_canonical_common_dir_and_fixed_key_lock_ordering(
     repo_pair: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     primary, linked, _ = repo_pair
@@ -219,7 +219,7 @@ def test_given_busy_lock_when_owner_releases_before_deadline_then_bounded_timeou
     assert timed_out_payload == {"status": "control_plane_unavailable", "reason_code": "lifecycle_lock_busy"}
 
 
-def test_given_guard_when_foreign_released_or_key_tampered_then_owner_token_foreign_released_or_key_mismatch(
+def test_given_guard_when_foreign_released_or_key_tampered_then_owner_token_foreign_released_or_key_mismatch_invalid_or_stale_lease(
     repo_pair: tuple[Path, Path, Path],
 ) -> None:
     primary, _, other = repo_pair
@@ -260,7 +260,7 @@ def test_given_guard_when_foreign_released_or_key_tampered_then_owner_token_fore
         guard.release()
 
 
-def test_given_holder_is_sigkilled_when_next_process_acquires_then_holder_death_reacquire_and_primary_invariant(
+def test_given_holder_is_sigkilled_when_next_process_acquires_then_holder_death_reacquire_and_primary_invariant_two_concurrent_processes(
     repo_pair: tuple[Path, Path, Path],
 ) -> None:
     primary, linked, _ = repo_pair
