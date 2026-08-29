@@ -42,10 +42,26 @@ def _make_repo(tmp_path: Path) -> Path:
     repo.mkdir()
     _git("init", "-q", "-b", "main", cwd=repo)
     _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
-    (repo / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\n")
+    (repo / ".gitignore").write_text(
+        ".cache/\n__pycache__/\ntmp/\n.guard_shadow_log.jsonl\n"
+    )
     (repo / "README.md").write_text("seed\n")
     _git("add", "README.md", ".gitignore", cwd=repo)
     _git("commit", "-q", "-m", "seed", cwd=repo)
+    # Issue #2252 PR #2390 review [BLOCKER 2]: the production repo-root
+    # `.gitignore` keeps `.guard_shadow_log.jsonl` as a legacy tombstone (so a
+    # stale local file left over from a removed producer never surfaces as an
+    # ordinary untracked `??` path). Assert once, at fixture construction
+    # time, that this fixture's `.gitignore` reproduces that real
+    # ignored-path condition -- otherwise the create/update regression tests
+    # below would only ever exercise a plain untracked file, not the actual
+    # `!!` ignored-path status the executor's snapshot diff has to handle in
+    # production.
+    subprocess.run(
+        ["git", "check-ignore", "-q", ".guard_shadow_log.jsonl"],
+        cwd=str(repo),
+        check=True,
+    )
     return repo
 
 
@@ -218,7 +234,8 @@ def main() -> int:
         )
         self_other_artifact_path.parent.mkdir(parents=True, exist_ok=True)
         self_other_artifact_path.write_text('{"self_write": true}')
-    if os.environ.get("SKILL_RUNTIME_TEST_SHADOW_LOG_WRITE") == "create":
+    shadow_log_write_mode = os.environ.get("SKILL_RUNTIME_TEST_SHADOW_LOG_WRITE")
+    if shadow_log_write_mode == "create":
         # Issue #2252 AC4: `.guard_shadow_log.jsonl` no longer has a typed
         # exact-file special case in skill_runtime_exec.py -- a child
         # command creating it must now fail closed as a generic
@@ -226,6 +243,19 @@ def main() -> int:
         # repo-root file.
         shadow_log_path = Path(".guard_shadow_log.jsonl")
         shadow_log_path.write_text('{"schema_version":"1","timestamp":"t"}\\n')
+    elif shadow_log_write_mode == "update":
+        # Issue #2252 AC4 (PR #2390 review [BLOCKER 2]): the same generic
+        # fail-close must also hold when `.guard_shadow_log.jsonl` already
+        # exists (pre-created by the test harness before this child runs)
+        # and the child only appends/updates it -- this is a different
+        # detection path from create (no new path in the before/after
+        # status-set diff; it is caught by the existing-path
+        # mtime_ns/size/kind snapshot comparison instead), so it must be
+        # exercised separately from the create case.
+        shadow_log_path = Path(".guard_shadow_log.jsonl")
+        shadow_log_path.write_text(
+            shadow_log_path.read_text() + '{"schema_version":"1","event":"update"}\\n'
+        )
     artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number
     artifact_dir.mkdir(parents=True, exist_ok=True)
     payload = {"issue_number": args.issue_number, "repo": args.repo}
@@ -430,17 +460,34 @@ def test_self_write_to_other_issue_artifacts_is_known_unsupported_in_stdlib_mode
     assert artifact.exists()
 
 
-def test_shadow_log_create_fails_as_generic_unauthorized_write_path(tmp_path: Path) -> None:
-    """GIVEN the executed child command creates `.guard_shadow_log.jsonl`
+@pytest.mark.parametrize("mode", ["create", "update"])
+def test_shadow_log_create_or_update_fails_as_generic_unauthorized_write_path(
+    tmp_path: Path, mode: str
+) -> None:
+    """GIVEN the executed child command creates OR updates an already
+    pre-existing `.guard_shadow_log.jsonl`
     WHEN no producer-specific typed exact-file special case exists any more
-    (Issue #2252)
+    (Issue #2252 AC4) and the fixture repo's `.gitignore` reproduces the
+    production ignored-path condition for this file (PR #2390 review
+    [BLOCKER 2])
     THEN skill_runtime_exec.py must fail-close with the generic
-    unauthorized_write_path reason code, reporting the shadow-log path
-    exactly like any other untracked repo-root file -- not silently
-    authorize it via a shadow-log-specific kind/content transition policy."""
+    unauthorized_write_path reason code in both cases, reporting the
+    shadow-log path exactly like any other repo-root file -- not silently
+    authorize it via a shadow-log-specific kind/content transition policy.
+    `create` is detected via the before/after status-set diff (a brand new
+    path appears); `update` is detected via the existing-path
+    mtime_ns/size/kind snapshot comparison instead, since the ignored path's
+    status entry itself does not change -- so both detection paths must be
+    exercised separately rather than assuming create coverage implies update
+    coverage."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SHADOW_LOG_WRITE": "create"})
+    if mode == "update":
+        stale_shadow_log = repo / ".guard_shadow_log.jsonl"
+        stale_shadow_log.write_text(
+            '{"schema_version":"1","timestamp":"2026-01-01T00:00:00Z","event":"stale"}\n'
+        )
+    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SHADOW_LOG_WRITE": mode})
     assert result.returncode == 2
     assert "reason_code=unauthorized_write_path" in result.stderr
     assert "unauthorized write path=.guard_shadow_log.jsonl" in result.stderr
