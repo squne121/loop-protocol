@@ -80,7 +80,7 @@ unclassified reference は 0 を維持する
 
 native Codex CLI 撤去に伴い、`legacy_codex_projection` / `legacy_codex_only` 分類値と `phase_2_compatibility` ブロック（`codex_assets_authoritative` 等）は不要になり削除した（Issue #2161）。
 
-## Manual Spark Agents の撤去（Issue #2161）
+## Manual Spark Agents の撤去（手動 Spark エージェントの撤去、Issue #2161 で削除済み）
 
 `spark-skim` / `spark-worker` / `spark-deep`（旧 `.codex/agents/spark-*.toml`）は native Codex CLI 専用の custom subagent であり、Codex CLI 撤去に伴い削除した。将来の Spark 設計は `claude-gpt-session` 上のカスタム SubAgent `spark-codex` として #2186 が別途所有し、Codex CLI `.toml` を継続保持する設計ではない（2026-08-25 人間レビュー反映）。
 
