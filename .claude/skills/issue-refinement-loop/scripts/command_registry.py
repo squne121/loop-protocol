@@ -797,6 +797,16 @@ REGISTRY: dict[str, dict[str, Any]] = {
     # narrow exception to #1875's minimal-harness direction (see
     # run_root_review_pipeline.py's module docstring "Architecture delta
     # relative to #1875" for the full rationale/consumer inventory).
+    # Issue #2389: this command's stdout JSON ALSO carries a top-level
+    # `canonical_step2_route` field (the verbatim return value of
+    # `run_root_review_pipeline.route_canonical_step2_result()`, computed by
+    # this SAME command before it prints -- see `_emit_produce_result()` in
+    # run_root_review_pipeline.py) on EVERY output path (success / body-fetch
+    # failure / VC-budget error / transport failure / artifact-readback
+    # failure). Canonical Step 2 reads `canonical_step2_route` DIRECTLY as
+    # its SOLE routing authority; it does not independently recompute
+    # routing from `status` / `compact_result.verdict` /
+    # `compact_result.next_action`.
     "root_review_pipeline.produce": {
         "id": "root_review_pipeline.produce",
         "argv": [
