@@ -36,12 +36,25 @@ def _fake_completed(returncode: int = 0, stdout: str = "", stderr: str = ""):
 
 
 def _assess(monkeypatch, *, controlled_read_rc: int, github_auth: bool = True, github_repo_read: bool = True):
-    monkeypatch.setattr(wcp, "_github_auth_ok", lambda: github_auth)
-    monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: github_repo_read)
+    monkeypatch.setattr(
+        wcp,
+        "_github_auth_probe",
+        lambda deadline_ns: wcp.ProbeOutcome(
+            wcp.PROBE_COMPLETED if github_auth else wcp.PROBE_NONZERO_EXIT,
+            returncode=0 if github_auth else 1,
+        ),
+    )
+    monkeypatch.setattr(
+        wcp,
+        "_github_repo_read_probe",
+        lambda repo, deadline_ns: wcp.ProbeOutcome(
+            wcp.PROBE_COMPLETED if github_repo_read else wcp.PROBE_NONZERO_EXIT,
+            returncode=0 if github_repo_read else 1,
+        ),
+    )
     monkeypatch.setattr(wcp.trusted_uv_mod, "check_trusted_uv", lambda project_root: {
         "status": wcp.trusted_uv_mod.STATUS_OK, "reason": "resolved", "resolved_path": "/fake/uv"
     })
-    monkeypatch.setattr(wcp, "_run_env_only_preflight", lambda: {})
 
     captured_calls = []
 
@@ -187,12 +200,11 @@ def test_actor_capabilities_never_carry_secret_like_values(monkeypatch):
 
 
 def test_controlled_github_read_probe_exception_reports_unavailable(monkeypatch):
-    monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
-    monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: True)
+    monkeypatch.setattr(wcp, "_github_auth_probe", lambda deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED))
+    monkeypatch.setattr(wcp, "_github_repo_read_probe", lambda repo, deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED))
     monkeypatch.setattr(wcp.trusted_uv_mod, "check_trusted_uv", lambda project_root: {
         "status": wcp.trusted_uv_mod.STATUS_OK, "reason": "resolved", "resolved_path": "/fake/uv"
     })
-    monkeypatch.setattr(wcp, "_run_env_only_preflight", lambda: {})
 
     def _raise(*_a, **_k):
         raise OSError("gh binary not found")

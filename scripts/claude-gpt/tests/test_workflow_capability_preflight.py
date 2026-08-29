@@ -32,6 +32,10 @@ PREFLIGHT_SH = _SCRIPTS_DIR / "preflight.sh"
 _DEFAULT_REPO = "squne121/loop-protocol"
 
 
+def _completed_probe(stdout: str = "") -> wcp.ProbeOutcome:
+    return wcp.ProbeOutcome(wcp.PROBE_COMPLETED, stdout=stdout, returncode=0)
+
+
 def _run_preflight_cli(*extra_args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["sh", str(PREFLIGHT_SH), "--workflow-profile", *extra_args],
@@ -172,7 +176,9 @@ def _no_spark_env(monkeypatch):
     monkeypatch.setattr(
         wcp,
         "_run_env_only_preflight",
-        lambda: {"binary_available": False, "chatgpt_auth": {"available": False}},
+        lambda deadline_ns: _completed_probe(
+            json.dumps({"binary_available": False, "chatgpt_auth": {"available": False}})
+        ),
     )
 
 
@@ -198,8 +204,8 @@ def test_workflow_capability_degrades_preferred_spark_incompatibility(monkeypatc
     # configured would report decision=blocked via the (unrelated)
     # `not github_auth` branch before the Spark fallback_only -> degraded
     # branch is ever reached.
-    monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
-    monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: True)
+    monkeypatch.setattr(wcp, "_github_auth_probe", lambda deadline_ns: _completed_probe())
+    monkeypatch.setattr(wcp, "_github_repo_read_probe", lambda repo, deadline_ns: _completed_probe())
     # Issue #2340 AC2: `controlled_github_read` is a REQUIRED capability that
     # fails closed with priority over the Spark route's OPTIONAL `degraded`
     # signal (see `test_actor_scoped_capability_probe.py::
@@ -211,13 +217,8 @@ def test_workflow_capability_degrades_preferred_spark_incompatibility(monkeypatc
     # fallback_only -> degraded branch under test is ever reached.
     monkeypatch.setattr(
         wcp,
-        "_controlled_github_read_capability",
-        lambda repo: {
-            "status": wcp.ACTOR_CAPABILITY_READY,
-            "reason_code": None,
-            "fallback_route": None,
-            "probe_execution_class": "controlled_gh_api_repo_read",
-        },
+        "_controlled_github_read_probe",
+        lambda repo, deadline_ns: _completed_probe(),
     )
     result = wcp.assess(
         project_root=str(_REPO_ROOT),
@@ -235,8 +236,8 @@ def test_workflow_capability_degrades_preferred_spark_incompatibility(monkeypatc
 
 
 def test_workflow_capability_separates_read_and_write_github_capability(monkeypatch):
-    monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
-    monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: True)
+    monkeypatch.setattr(wcp, "_github_auth_probe", lambda deadline_ns: _completed_probe())
+    monkeypatch.setattr(wcp, "_github_repo_read_probe", lambda repo, deadline_ns: _completed_probe())
     result = wcp.assess(
         project_root=str(_REPO_ROOT),
         profile="issue-to-impl",
@@ -260,8 +261,8 @@ def test_workflow_capability_separates_read_and_write_github_capability(monkeypa
 
 
 def test_workflow_capability_read_only_route_does_not_pass_write(monkeypatch):
-    monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
-    monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: True)
+    monkeypatch.setattr(wcp, "_github_auth_probe", lambda deadline_ns: _completed_probe())
+    monkeypatch.setattr(wcp, "_github_repo_read_probe", lambda repo, deadline_ns: _completed_probe())
     result = wcp.assess(
         project_root=str(_REPO_ROOT),
         profile="issue-to-impl",
@@ -288,8 +289,8 @@ def test_workflow_capability_read_only_route_does_not_pass_write(monkeypatch):
 
 
 def test_workflow_capability_blocks_missing_root_owned_mutation_route(monkeypatch):
-    monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
-    monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: True)
+    monkeypatch.setattr(wcp, "_github_auth_probe", lambda deadline_ns: _completed_probe())
+    monkeypatch.setattr(wcp, "_github_repo_read_probe", lambda repo, deadline_ns: _completed_probe())
     result = wcp.assess(
         project_root=str(_REPO_ROOT),
         profile="issue-to-impl",
@@ -445,8 +446,12 @@ def test_workflow_capability_repo_read_false_blocks(monkeypatch):
     read the very issue/PR state it needs to operate on, so this is not a
     merely-degraded capability state (P1-1 fix)."""
 
-    monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
-    monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: False)
+    monkeypatch.setattr(wcp, "_github_auth_probe", lambda deadline_ns: _completed_probe())
+    monkeypatch.setattr(
+        wcp,
+        "_github_repo_read_probe",
+        lambda repo, deadline_ns: wcp.ProbeOutcome(wcp.PROBE_NONZERO_EXIT, returncode=1),
+    )
     result = wcp.assess(
         project_root=str(_REPO_ROOT),
         profile="issue-to-impl",
