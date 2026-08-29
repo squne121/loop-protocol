@@ -1,4 +1,13 @@
-"""V2 compact wire contract: parent-owned and exact (Issue #2054)."""
+"""V2 compact wire contract: parent-owned and exact (Issue #2054).
+
+Issue #2397: `build_compact_v2()` gained an optional `failure_class`
+parameter. This module's existing tests call `build_compact_v2()` /
+`validate_compact_v2()` without that parameter and must keep passing
+unmodified (AC2 -- default/omitted `failure_class` leaves the existing
+`proceed` / `request_changes` two-way behavior unchanged). The
+`human_judgment_required` `NEXT_ACTION` coverage itself lives in the
+sibling module `test_review_compact_v2_human_judgment.py`.
+"""
 
 from __future__ import annotations
 
