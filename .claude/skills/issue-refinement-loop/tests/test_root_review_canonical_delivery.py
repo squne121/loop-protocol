@@ -291,9 +291,12 @@ def test_skill_md_step2_states_issue_reviewer_not_invoked_for_canonical_routing(
 # ---------------------------------------------------------------------------
 
 
-def test_route_canonical_step2_result_approve_proceed_routes_step_4_5(tmp_path: Path, monkeypatch):
+def test_route_canonical_step2_result_approve_proceed_routes_step_2_5(tmp_path: Path, monkeypatch):
+    """Issue #2389: a deterministic approve routes to Step 2.5 (semantic
+    design review applicability), not directly to Step 4.5 -- this proves
+    the routing table itself no longer bypasses that applicability gate."""
     out = _run_real_produce(tmp_path, monkeypatch, body=_APPROVE_BODY, issue_number=2380010)
-    assert _PIPELINE.route_canonical_step2_result(out) == _PIPELINE.STEP_4_5
+    assert _PIPELINE.route_canonical_step2_result(out) == _PIPELINE.STEP_2_5
 
 
 def test_route_canonical_step2_result_needs_fix_request_changes_routes_step_4(tmp_path: Path, monkeypatch):
@@ -390,7 +393,7 @@ def test_given_real_produce_output_when_routed_through_pure_router_end_to_end_th
     `issue-reviewer` handoff in between."""
     approve_out = _run_real_produce(tmp_path, monkeypatch, body=_APPROVE_BODY, issue_number=2380012)
     needs_fix_out = _run_real_produce(tmp_path, monkeypatch, body=_NEEDS_FIX_BODY, issue_number=2380013)
-    assert _PIPELINE.route_canonical_step2_result(approve_out) == _PIPELINE.STEP_4_5
+    assert _PIPELINE.route_canonical_step2_result(approve_out) == _PIPELINE.STEP_2_5
     assert _PIPELINE.route_canonical_step2_result(needs_fix_out) == _PIPELINE.STEP_4
 
 

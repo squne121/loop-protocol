@@ -1195,9 +1195,27 @@ def run_checker_pipeline_once(
 # ---------------------------------------------------------------------------
 
 STEP_4_5 = "step_4_5"
+STEP_2_5 = "step_2_5"
 STEP_4 = "step_4"
 STEP_5_HUMAN_JUDGMENT_REQUIRED = "step_5_human_judgment_required"
 FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE = "fail_closed_environment_or_integrity_failure"
+
+# Issue #2389: the ONLY `status: input_or_runtime_error` producer error
+# codes `route_canonical_step2_result()` treats as a recognized, terminal
+# human-escalation state (Step 5) rather than an unrecognized/inconsistent
+# fail-closed stop. Both are emitted by `_cmd_produce()` only after the
+# inner `reviewer_transport.run_reviewer_transport()` bounded retry /
+# artifact-verification machinery has already been exhausted -- see the
+# call sites in `_cmd_produce()` below. Body-fetch failure and VC-budget
+# policy-ceiling errors are intentionally NOT included here (Issue #2389
+# Out of Scope): those remain `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`,
+# unchanged from before this Issue.
+_KNOWN_PRODUCER_HUMAN_JUDGMENT_ERROR_CODES = frozenset(
+    {
+        "reviewer_transport_environment_failure",
+        "artifact_readback_failed",
+    }
+)
 
 
 def route_canonical_step2_result(result: dict[str, Any]) -> str:
@@ -1224,17 +1242,31 @@ def route_canonical_step2_result(result: dict[str, Any]) -> str:
     it independently unit-testable):
 
         status == ok + verdict == approve   + next_action == proceed
-            -> Step 4.5 (`STEP_4_5`)
+            -> Step 2.5 (`STEP_2_5`; Issue #2389 -- a deterministic approve
+               must still pass through the Step 2.5 semantic design review
+               applicability gate. Routing straight to `STEP_4_5` here would
+               bypass that gate, which is exactly the defect Issue #2389
+               closes: the routing table itself, not just prose telling the
+               orchestrator to remember to check applicability separately.)
         status == ok + verdict == needs-fix + next_action == request_changes
             -> Step 4 (`STEP_4`)
         status == ok + next_action == human_judgment_required (verdict-agnostic,
             per the schema note above)
             -> Step 5 (`STEP_5_HUMAN_JUDGMENT_REQUIRED`)
-        anything else (including `status != ok`, i.e. `produce` itself
-        returned `input_or_runtime_error`) -> a fail-closed stop, distinct
-        from the ordinary human-judgment escalation above, because it
-        indicates an inconsistent/unrecognized `(status, verdict,
-        next_action)` combination rather than a documented terminal state
+        status == input_or_runtime_error + error_code in
+            `_KNOWN_PRODUCER_HUMAN_JUDGMENT_ERROR_CODES` (Issue #2389: the
+            inner `reviewer_transport.run_reviewer_transport()` bounded retry
+            / artifact-verification machinery has already been exhausted by
+            the time `_cmd_produce()` emits either of these two codes, so
+            this is a recognized terminal producer-error state, not an
+            unrecognized one)
+            -> Step 5 (`STEP_5_HUMAN_JUDGMENT_REQUIRED`)
+        anything else (including any OTHER `status != ok` / unrecognized or
+        missing `error_code`, and any other inconsistent `(status, verdict,
+        next_action)` combination) -> a fail-closed stop, distinct from the
+        ordinary human-judgment escalation above, because it indicates an
+        inconsistent/unrecognized combination rather than a documented
+        terminal state
             -> `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`
 
     This function does not call `classify_child_stdout()`,
@@ -1247,10 +1279,12 @@ def route_canonical_step2_result(result: dict[str, Any]) -> str:
     next_action = compact_result.get("next_action")
 
     if status == "ok" and verdict == "approve" and next_action == "proceed":
-        return STEP_4_5
+        return STEP_2_5
     if status == "ok" and verdict == "needs-fix" and next_action == "request_changes":
         return STEP_4
     if status == "ok" and next_action == "human_judgment_required":
+        return STEP_5_HUMAN_JUDGMENT_REQUIRED
+    if status == "input_or_runtime_error" and result.get("error_code") in _KNOWN_PRODUCER_HUMAN_JUDGMENT_ERROR_CODES:
         return STEP_5_HUMAN_JUDGMENT_REQUIRED
     return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
 
@@ -1293,18 +1327,41 @@ def _cmd_run_checker_attempt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _emit_produce_result(payload: dict[str, Any]) -> None:
+    """Single stdout-JSON exit point for `_cmd_produce()` (Issue #2389).
+
+    EVERY `_cmd_produce()` stdout JSON output path -- success, body-fetch
+    failure, VC-budget policy-ceiling error, reviewer-transport failure,
+    artifact-readback failure -- MUST print through this one helper instead
+    of calling `print(json.dumps(...))` directly, so a top-level
+    `canonical_step2_route` field (the verbatim return value of
+    `route_canonical_step2_result()`, this SAME producer's own routing
+    determination for its OWN output) is always present, on every path,
+    with no call site able to silently forget it. Canonical Step 2
+    (`issue-refinement-loop` SKILL.md) reads `canonical_step2_route`
+    directly as its SOLE routing authority; it does not independently
+    recompute routing from `status` / `compact_result.verdict` /
+    `compact_result.next_action`.
+
+    `payload` is the schema/status/etc. dict a call site would otherwise
+    have passed straight to `json.dumps()`; this function does not mutate
+    the caller's copy of it in place.
+    """
+    payload = dict(payload)
+    payload["canonical_step2_route"] = route_canonical_step2_result(payload)
+    print(json.dumps(payload))
+
+
 def _cmd_produce(args: argparse.Namespace) -> int:
     body, body_sha256, error_code = fetch_and_pin_live_body(args.issue_number, args.repo)
     if body is None:
-        print(
-            json.dumps(
-                {
-                    "schema": SCHEMA,
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "input_or_runtime_error",
-                    "error_code": error_code,
-                }
-            )
+        _emit_produce_result(
+            {
+                "schema": SCHEMA,
+                "schema_version": SCHEMA_VERSION,
+                "status": "input_or_runtime_error",
+                "error_code": error_code,
+            }
         )
         return 2
 
@@ -1360,15 +1417,13 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         _baseline_vc_preflight.CommandTimeoutExceedsPolicyError,
         _baseline_vc_preflight.CommandTimeoutNonPositiveError,
     ) as exc:
-        print(
-            json.dumps(
-                {
-                    "schema": SCHEMA,
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "input_or_runtime_error",
-                    "error_code": exc.error_code,
-                }
-            )
+        _emit_produce_result(
+            {
+                "schema": SCHEMA,
+                "schema_version": SCHEMA_VERSION,
+                "status": "input_or_runtime_error",
+                "error_code": exc.error_code,
+            }
         )
         return 2
 
@@ -1447,16 +1502,14 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             total_deadline=_review_budget.total_seconds,
         )
         if transport_result["transport_status"] != "ok":
-            print(
-                json.dumps(
-                    {
-                        "schema": SCHEMA,
-                        "schema_version": SCHEMA_VERSION,
-                        "status": "input_or_runtime_error",
-                        "error_code": "reviewer_transport_environment_failure",
-                        "transport_invocation_id": transport_result["invocation_id"],
-                    }
-                )
+            _emit_produce_result(
+                {
+                    "schema": SCHEMA,
+                    "schema_version": SCHEMA_VERSION,
+                    "status": "input_or_runtime_error",
+                    "error_code": "reviewer_transport_environment_failure",
+                    "transport_invocation_id": transport_result["invocation_id"],
+                }
             )
             return 2
 
@@ -1480,15 +1533,13 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             expected_sha256=compact_fields["ARTIFACT_SHA256"],
         )
         if verified["status"] != "valid":
-            print(
-                json.dumps(
-                    {
-                        "schema": SCHEMA,
-                        "schema_version": SCHEMA_VERSION,
-                        "status": "input_or_runtime_error",
-                        "error_code": "artifact_readback_failed",
-                    }
-                )
+            _emit_produce_result(
+                {
+                    "schema": SCHEMA,
+                    "schema_version": SCHEMA_VERSION,
+                    "status": "input_or_runtime_error",
+                    "error_code": "artifact_readback_failed",
+                }
             )
             return 2
 
@@ -1555,21 +1606,19 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             "attempt": last_attempt["attempt"],
         }
 
-        print(
-            json.dumps(
-                {
-                    "schema": SCHEMA,
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "ok",
-                    "issue_number": args.issue_number,
-                    "body_sha256": body_sha256,
-                    "merged_review_result": merged,
-                    "artifact_path": str(artifact_path),
-                    "compact_result": compact_result,
-                    "full_review_artifact": full_review_artifact,
-                    "verified_transport_artifact": verified_transport_artifact,
-                }
-            )
+        _emit_produce_result(
+            {
+                "schema": SCHEMA,
+                "schema_version": SCHEMA_VERSION,
+                "status": "ok",
+                "issue_number": args.issue_number,
+                "body_sha256": body_sha256,
+                "merged_review_result": merged,
+                "artifact_path": str(artifact_path),
+                "compact_result": compact_result,
+                "full_review_artifact": full_review_artifact,
+                "verified_transport_artifact": verified_transport_artifact,
+            }
         )
         return 0
 
