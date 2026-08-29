@@ -218,6 +218,14 @@ def main() -> int:
         )
         self_other_artifact_path.parent.mkdir(parents=True, exist_ok=True)
         self_other_artifact_path.write_text('{"self_write": true}')
+    if os.environ.get("SKILL_RUNTIME_TEST_SHADOW_LOG_WRITE") == "create":
+        # Issue #2252 AC4: `.guard_shadow_log.jsonl` no longer has a typed
+        # exact-file special case in skill_runtime_exec.py -- a child
+        # command creating it must now fail closed as a generic
+        # unauthorized_write_path, exactly like any other untracked
+        # repo-root file.
+        shadow_log_path = Path(".guard_shadow_log.jsonl")
+        shadow_log_path.write_text('{"schema_version":"1","timestamp":"t"}\\n')
     artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number
     artifact_dir.mkdir(parents=True, exist_ok=True)
     payload = {"issue_number": args.issue_number, "repo": args.repo}
@@ -420,3 +428,20 @@ def test_self_write_to_other_issue_artifacts_is_known_unsupported_in_stdlib_mode
     assert self_write_path.exists()
     artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
     assert artifact.exists()
+
+
+def test_shadow_log_create_fails_as_generic_unauthorized_write_path(tmp_path: Path) -> None:
+    """GIVEN the executed child command creates `.guard_shadow_log.jsonl`
+    WHEN no producer-specific typed exact-file special case exists any more
+    (Issue #2252)
+    THEN skill_runtime_exec.py must fail-close with the generic
+    unauthorized_write_path reason code, reporting the shadow-log path
+    exactly like any other untracked repo-root file -- not silently
+    authorize it via a shadow-log-specific kind/content transition policy."""
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SHADOW_LOG_WRITE": "create"})
+    assert result.returncode == 2
+    assert "reason_code=unauthorized_write_path" in result.stderr
+    assert "unauthorized write path=.guard_shadow_log.jsonl" in result.stderr
+    assert "target_issue=1228" in result.stderr

@@ -2468,14 +2468,15 @@ executor / hook がこれらの root 配下の変化を検知した場合、`all
 background hook worker」（session-manifest debounce/generate hook）由来のケースも含むためであり、
 シンボル名はその共通性質（executor から見て provenance を区別できない = unattributable）を表す。
 
-**`.guard_shadow_log.jsonl` は本節の directory-root 除外クラス（`_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS`）
-のメンバーではない（Issue #1563）**。`.guard_shadow_log.jsonl`（`.claude/hooks/shadow_log.py` /
-`.claude/hooks/guard-japanese-prose.sh` / `.claude/hooks/rtk_boundary_shadow_guard.sh` /
-`scripts/check-codex-agents.mjs` が並行 append する repo-root peer ログファイル）を directory-root
-除外クラスにそのまま追加すると、`_snapshot_repo_paths()` が transition kind を検査せずに配下を丸ごと
-prune するため、symlink / directory / FIFO / socket / device への置換が監査対象外になってしまう
-（AC2 と自己矛盾する fail-open）。このため `.guard_shadow_log.jsonl` は後述の「型付き shadow-log 遷移
-ポリシー」で個別に扱う。
+（歴史的経緯）`.guard_shadow_log.jsonl` はかつて本節の directory-root 除外クラス
+（`_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS`）のメンバーではなく、個別の exact-path・型付き遷移ポリシー
+（Issue #1563）で扱われていた。Issue #2252 により repo-local shadow telemetry サブシステム自体が
+全 producer（`.claude/hooks/shadow_log.py` / `.claude/hooks/guard-japanese-prose.sh` の persistent
+shadow logging / `.claude/hooks/rtk_boundary_shadow_guard.sh`）ごと廃止され、`skill_runtime_exec.py`
+から当該 typed exact-file special case も削除された。現在は `.guard_shadow_log.jsonl` を含め、
+このファイルへの production 書き込みは存在せず、万一書き込まれた場合は generic な
+`unauthorized_write_path` で fail-close する（`.gitignore` の entry は legacy tombstone として
+維持されている）。
 
 ### 検出保証の二段階区分（Strict attribution mode / Race-tolerant stdlib mode）
 
@@ -2499,42 +2500,22 @@ race-tolerant stdlib 実装の既知の制限（Known Limitation）と矛盾す�
     による書き込みを、traced child の self-write に誤帰属してはならない（strict mode 導入後も hook 自身の
     正当な非同期書き込みを誤って fail-close させないことが要求される）。
 
-### 型付き shadow-log 遷移ポリシー（Issue #1563）
+### 型付き shadow-log 遷移ポリシー（歴史的経緯・Issue #1563、Issue #2252 で廃止済み）
 
-`.guard_shadow_log.jsonl`（repo root。owner は `.claude/hooks/shadow_log.py` /
-`.claude/hooks/guard-japanese-prose.sh` / `.claude/hooks/rtk_boundary_shadow_guard.sh` /
-`scripts/check-codex-agents.mjs` の 4 producer）は、前述の `_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS`
-（directory-root exclusion class）のメンバーではなく、`skill_runtime_exec.py` の
-`_SHADOW_LOG_EXACT_REL` として個別の exact-path・型付き遷移ポリシーで扱う（ledger の
+かつて `.guard_shadow_log.jsonl`（repo root。旧 producer は `.claude/hooks/shadow_log.py` /
+`.claude/hooks/guard-japanese-prose.sh` / `.claude/hooks/rtk_boundary_shadow_guard.sh`）は、
+前述の `_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS`（directory-root exclusion class）のメンバーではなく、
+`skill_runtime_exec.py` の `_SHADOW_LOG_EXACT_REL` として個別の exact-path・型付き遷移ポリシー
+（kind 遷移の allow-tuple 判定・append-only な content 遷移の検証）で扱われていた（ledger の
 `_LEDGER_STABLE_EXACT_REL` と同じ Issue #1502 / PR #1552 パターン）。
 
-- **kind 遷移**（`_is_allowed_shadow_log_kind_transition`）: `absent -> absent` /
-  `absent -> regular` / `regular -> regular` の 3 遷移のみが許可される。delete
-  （`regular -> absent`）、および symlink / directory / FIFO / socket / device への
-  置換（どの before-kind からでも）は before-kind を問わずすべて fail-close する
-  （AC2。厳密な allow-tuple 一致で判定し、`after_kind == "regular"` だけで許可する実装は禁止）。
-- **content 遷移**（`_is_authorized_shadow_log_content_transition`）: `regular -> regular`
-  の内容変化は、以下をすべて満たす場合のみ許可される append-only 遷移として扱う。
-  1. after の先頭バイト列が before と完全一致する（`after.startswith(before)`）。
-  2. before / after の双方が well-formed JSONL（各行が有効な JSON object で、末尾に改行がある）
-     としてパース可能である。
-  3. before に存在した各 record が、順序も内容も変えずに after にもそのまま存在する。
-  truncate・全内容の overwrite・malformed JSONL への置換・既存 record の削除や並べ替えは、
-  型としては `regular -> regular` で authorized であっても content 検証で fail-close する（AC3）。
-- ledger の stable-exact-peer-file ポリシーと異なり、ancestor directory exemption は不要である:
-  `.guard_shadow_log.jsonl` は project root 直下に存在するため、その遷移自体が新たな ancestor
-  directory-node snapshot entry を作らない。
-
-**stdlib snapshot mode の provenance 区別不能性（AC7）**: `.guard_shadow_log.jsonl` の provenance（正規 append が自プロセス由来か peer プロセス由来かの厳密な区別）は stdlib snapshot mode では判定できない。
-本ポリシーは他の型付き遷移ポリシーと同じく race-tolerant stdlib mode（mtime/size の snapshot 比較 +
-before/after 1回の content 読み取り）上で動作するため、`.guard_shadow_log.jsonl` への正規 append が
-「この executor 自身の子コマンドが呼び出す非同期 peer hook（自プロセス由来）」によるものか、「完全に
-独立した並行セッション/エージェント（他プロセス由来）」によるものかを区別できない。append-only である
-限り両者は同一に authorize される。AC2 の保証は「実行終了時点で非-regular kind が観測されれば fail-close する」という
-事後検査（postcondition）ベースの保証であり、書き込み開始前に symlink へ差し替えてから書き込み終了後に
-元へ戻すような TOCTOU（time-of-check-to-time-of-use）攻撃を完全に防止するものではない。厳密な
-process-level provenance attestation（`strace` 等）は本ポリシーの対象外であり、`#1363`
-（Linux-only optional strict trace attribution mode、OPEN）が対象領域を広げた場合の handoff 先である。
+Issue #2252（2026-08-20 OWNER decision）により、`.guard_shadow_log.jsonl` は security authority /
+canonical audit ledger ではなく shadow rollout 観測用の local telemetry に過ぎないことが確認され、
+全 production producer が撤去された上で、この typed exact-file special case は
+`skill_runtime_exec.py` から完全に削除された。現在 `.guard_shadow_log.jsonl` は generic repository
+path として扱われ、将来 production process が誤って作成・更新すれば通常の `unauthorized_write_path`
+で fail-close する。retention / rotation / segmentation / repository 外 runtime state 移行は
+実装されていない（Issue #2252 Out of Scope）。
 
 #### Race-tolerant stdlib mode（現行実装。PR #1349 Option B）
 
