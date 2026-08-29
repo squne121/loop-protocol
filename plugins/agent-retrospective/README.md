@@ -1,4 +1,4 @@
-# agent-retrospective (plugin distribution)
+# agent-retrospective（plugin 配布版）
 
 継続的 retrospective の proposal-only orchestrator を、`.claude/` を持たない任意の repository でも
 `claude --plugin-dir` 経由で実行可能にする、self-contained な Claude Code plugin distribution。
@@ -100,7 +100,7 @@ frontmatter パーサはこれらを認識しない（`claude plugin validate --
 この plugin に追加していない -- mutation protection は上記 3 機構と、公式 frontmatter フィールド
 だけで完結している。
 
-## Python dependency closure
+## Python dependency closure（Python 依存関係クロージャ）
 
 `pyproject.toml`/`uv.lock` は `jsonschema` のみを依存として固定する。`uv run --project
 "${CLAUDE_PLUGIN_ROOT}" --locked` で解決されるこの closure は、host repository（`.claude/` を持つ
@@ -116,7 +116,7 @@ clean_install_smoke.sh`（Issue #2240 AC5）は default branch 名が `main` で
 （`git init -b portability-smoke`）でこの smoke を実施し、この portability defect を隠さないことを
 確認する。
 
-## Marketplace / semver / rollback（Out of Scope）
+## Marketplace / semver / rollback（Out of Scope、対象範囲外）
 
 Marketplace への公開申請・審査対応、明示的な semver version フィールドの必須化・version bump 運用
 手順の docs 化、update/rollback 専用 machinery、`clean_install_smoke_receipt.json` 等の証跡ファイル
