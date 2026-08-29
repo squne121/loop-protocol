@@ -41,6 +41,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -139,25 +141,95 @@ _KNOWN_OPERATION_ROUTES = frozenset(
 )
 
 _DEFAULT_REPO = "squne121/loop-protocol"
+DEFAULT_BUDGET_SECONDS = 30.0
+_ENV_ONLY_PROBE_CAP_SECONDS = 30.0
+_GITHUB_AUTH_PROBE_CAP_SECONDS = 30.0
+_GITHUB_REPO_READ_PROBE_CAP_SECONDS = 30.0
+_CONTROLLED_GITHUB_READ_PROBE_CAP_SECONDS = 15.0
+
+PROBE_COMPLETED = "completed"
+PROBE_NONZERO_EXIT = "nonzero_exit"
+PROBE_TIMEOUT = "probe_timeout"
+PROBE_DEADLINE_EXHAUSTED = "deadline_exhausted_before_spawn"
+PROBE_SPAWN_ERROR = "spawn_error"
+PROBE_MALFORMED_OUTPUT = "malformed_output"
 
 
-def _run_env_only_preflight() -> dict:
-    """Reuse the existing `preflight.sh --env-only` lane (binary_available +
-    chatgpt_auth.available) as the observable input for the Spark route
-    judgment, instead of re-implementing proxy binary/auth discovery here
-    (single source of truth for those two checks stays in `lib.sh`)."""
-    preflight_sh = _SCRIPT_DIR / "preflight.sh"
+@dataclass(frozen=True)
+class ProbeOutcome:
+    """Internal, typed result of one deadline-bound subprocess probe."""
+
+    kind: str
+    stdout: str = ""
+    returncode: int | None = None
+    error_name: str | None = None
+
+
+def _local_deadline_ns() -> int:
+    return time.monotonic_ns() + int(DEFAULT_BUDGET_SECONDS * 1_000_000_000)
+
+
+def _run_probe_with_deadline(
+    probe_name: str,
+    argv: list[str],
+    *,
+    deadline_ns: int,
+    cap_seconds: float,
+    env: dict[str, str] | None = None,
+) -> ProbeOutcome:
+    """Run one probe within its share of the common absolute deadline.
+
+    A deadline that has already passed is an operational result, not an
+    invocation failure: no subprocess is started and the caller can preserve
+    the probe name in its structured reason.
+    """
+    del probe_name  # retained in this small boundary's explicit call contract
+    remaining_seconds = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
+    if remaining_seconds <= 0:
+        return ProbeOutcome(PROBE_DEADLINE_EXHAUSTED)
     try:
         proc = subprocess.run(
-            ["sh", str(preflight_sh), "--env-only"],
+            argv,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=min(cap_seconds, remaining_seconds),
             check=False,
+            env=env,
         )
-        return json.loads(proc.stdout)
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        return {}
+    except subprocess.TimeoutExpired:
+        return ProbeOutcome(PROBE_TIMEOUT)
+    except OSError as exc:
+        return ProbeOutcome(PROBE_SPAWN_ERROR, error_name=exc.__class__.__name__)
+    if proc.returncode != 0:
+        return ProbeOutcome(PROBE_NONZERO_EXIT, stdout=proc.stdout, returncode=proc.returncode)
+    return ProbeOutcome(PROBE_COMPLETED, stdout=proc.stdout, returncode=proc.returncode)
+
+
+def _run_env_only_preflight(deadline_ns: int | None = None) -> ProbeOutcome | dict:
+    """Run the Spark environment probe under the common deadline.
+
+    The no-argument dictionary return is retained only for existing direct
+    diagnostic callers; assessment always supplies its shared deadline and
+    receives the typed outcome.
+    """
+    compatibility_mode = deadline_ns is None
+    deadline_ns = _local_deadline_ns() if deadline_ns is None else deadline_ns
+    preflight_sh = _SCRIPT_DIR / "preflight.sh"
+    outcome = _run_probe_with_deadline(
+        "spark_env_only",
+        ["sh", str(preflight_sh), "--env-only"],
+        deadline_ns=deadline_ns,
+        cap_seconds=_ENV_ONLY_PROBE_CAP_SECONDS,
+    )
+    if outcome.kind != PROBE_COMPLETED:
+        return {} if compatibility_mode else outcome
+    try:
+        parsed = json.loads(outcome.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return {} if compatibility_mode else ProbeOutcome(PROBE_MALFORMED_OUTPUT)
+    if not isinstance(parsed, dict):
+        return {} if compatibility_mode else ProbeOutcome(PROBE_MALFORMED_OUTPUT)
+    return parsed if compatibility_mode else outcome
 
 
 def _spark_capability(
@@ -185,42 +257,33 @@ def _spark_capability(
     return SPARK_UNAVAILABLE
 
 
-# Issue #2340 AC8: this module does not own timeout/deadline management
-# (Issue #2322 owns nested-timeout / shared-deadline unification -- this
-# Issue does not reimplement it, per Out of Scope). The constant below is
-# scoped narrowly to exception-handling correctness: `subprocess.
-# TimeoutExpired` is NOT a subclass of `OSError`, so the pre-existing
-# `except OSError:` guards on the two functions below (and the new
-# `_controlled_github_read_capability` further down) silently let a `gh`
-# subprocess hang propagate as an UNCAUGHT exception instead of failing
-# closed into this module's existing `unavailable`/`False` return contract.
-# No new timeout reason-code taxonomy is introduced by this fix -- a future
-# shared-deadline abstraction (#2322) can still wrap these calls unchanged.
-_SUBPROCESS_TIMEOUT_EXCEPTIONS = (OSError, subprocess.TimeoutExpired)
+def _github_auth_probe(deadline_ns: int) -> ProbeOutcome:
+    return _run_probe_with_deadline(
+        "github_auth",
+        ["gh", "auth", "status"],
+        deadline_ns=deadline_ns,
+        cap_seconds=_GITHUB_AUTH_PROBE_CAP_SECONDS,
+    )
 
 
+def _github_repo_read_probe(repo: str, deadline_ns: int) -> ProbeOutcome:
+    return _run_probe_with_deadline(
+        "github_repo_read",
+        ["gh", "repo", "view", repo, "--json", "name"],
+        deadline_ns=deadline_ns,
+        cap_seconds=_GITHUB_REPO_READ_PROBE_CAP_SECONDS,
+    )
+
+
+# Compatibility adapters retained for direct diagnostic callers. Production
+# assessment uses the typed probe functions above so every probe shares its
+# caller-provided deadline.
 def _github_auth_ok() -> bool:
-    try:
-        proc = subprocess.run(
-            ["gh", "auth", "status"], capture_output=True, text=True, timeout=30, check=False
-        )
-        return proc.returncode == 0
-    except _SUBPROCESS_TIMEOUT_EXCEPTIONS:
-        return False
+    return _github_auth_probe(_local_deadline_ns()).kind == PROBE_COMPLETED
 
 
 def _github_repo_read_ok(repo: str) -> bool:
-    try:
-        proc = subprocess.run(
-            ["gh", "repo", "view", repo, "--json", "name"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        return proc.returncode == 0
-    except _SUBPROCESS_TIMEOUT_EXCEPTIONS:
-        return False
+    return _github_repo_read_probe(repo, _local_deadline_ns()).kind == PROBE_COMPLETED
 
 
 def _sanitized_controlled_env() -> dict[str, str]:
@@ -260,31 +323,18 @@ def _root_github_read_capability(github_auth: bool, github_repo_read: bool) -> d
     }
 
 
-def _controlled_github_read_capability(repo: str) -> dict:
-    """Actor-scoped entry (Issue #2340 AC2/AC3): a read-only,
-    consumer-equivalent probe that uses the SAME sanitized env + trusted-host
-    pin the controlled executor's GitHub read/write helpers use (after the
-    AC1 parity fix), instead of substituting the root shell's ambient
-    `gh auth status`. This lets a credential/host context that would only
-    surface downstream as `gh_issue_fetch_failed_rc_4` (inside
-    `issue_body.update`) be classified BEFORE that actor is ever launched."""
-    try:
-        proc = subprocess.run(
-            ["gh", "api", "--hostname", "github.com", f"repos/{repo}", "--jq", "{name}"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-            env=_sanitized_controlled_env(),
-        )
-    except _SUBPROCESS_TIMEOUT_EXCEPTIONS:
-        return {
-            "status": ACTOR_CAPABILITY_UNAVAILABLE,
-            "reason_code": "controlled_github_unavailable",
-            "fallback_route": None,
-            "probe_execution_class": "controlled_gh_api_repo_read",
-        }
-    if proc.returncode == 0:
+def _controlled_github_read_probe(repo: str, deadline_ns: int) -> ProbeOutcome:
+    return _run_probe_with_deadline(
+        "controlled_github_read",
+        ["gh", "api", "--hostname", "github.com", f"repos/{repo}", "--jq", "{name}"],
+        deadline_ns=deadline_ns,
+        cap_seconds=_CONTROLLED_GITHUB_READ_PROBE_CAP_SECONDS,
+        env=_sanitized_controlled_env(),
+    )
+
+
+def _controlled_github_read_from_outcome(outcome: ProbeOutcome) -> dict:
+    if outcome.kind == PROBE_COMPLETED:
         return {
             "status": ACTOR_CAPABILITY_READY,
             "reason_code": None,
@@ -297,6 +347,13 @@ def _controlled_github_read_capability(repo: str) -> dict:
         "fallback_route": None,
         "probe_execution_class": "controlled_gh_api_repo_read",
     }
+
+
+def _controlled_github_read_capability(repo: str) -> dict:
+    """Compatibility adapter for callers outside the shared-deadline path."""
+    return _controlled_github_read_from_outcome(
+        _controlled_github_read_probe(repo, _local_deadline_ns())
+    )
 
 
 def _delegated_research_agy_capability() -> dict:
@@ -405,6 +462,19 @@ def _load_planned_operations(path: str | None) -> list[dict]:
     return normalized
 
 
+def _append_probe_reason(reasons: list[str], probe_name: str, outcome: ProbeOutcome) -> None:
+    if outcome.kind == PROBE_TIMEOUT:
+        reasons.append(f"preflight_probe_timeout:{probe_name}")
+    elif outcome.kind == PROBE_DEADLINE_EXHAUSTED:
+        reasons.append(f"preflight_deadline_exhausted:{probe_name}")
+    elif outcome.kind == PROBE_SPAWN_ERROR:
+        reasons.append(f"preflight_probe_spawn_error:{probe_name}:{outcome.error_name}")
+    elif outcome.kind == PROBE_NONZERO_EXIT:
+        reasons.append(f"preflight_probe_nonzero_exit:{probe_name}:exit_{outcome.returncode}")
+    elif outcome.kind == PROBE_MALFORMED_OUTPUT:
+        reasons.append(f"preflight_probe_malformed_output:{probe_name}")
+
+
 def assess(
     *,
     project_root: str,
@@ -413,7 +483,15 @@ def assess(
     spark_mode: str | None,
     spark_fallback: str | None,
     planned_operations: list[dict],
+    deadline_ns: int | None = None,
 ) -> dict:
+    """Assess all capabilities using one absolute monotonic deadline.
+
+    Direct callers retain compatibility: when no deadline is supplied this
+    producer owns a local deadline with the same default budget as the root
+    consumer's transport path.
+    """
+    deadline_ns = _local_deadline_ns() if deadline_ns is None else deadline_ns
     reasons: list[str] = []
 
     uv_result = trusted_uv_mod.check_trusted_uv(project_root)
@@ -425,8 +503,16 @@ def assess(
             "provisioned uv; see docs/dev/claude-gpt-runtime-prerequisites.md"
         )
 
-    env_only_result = _run_env_only_preflight()
-    spark_status = _spark_capability(spark_mode, spark_fallback, env_only_result)
+    if spark_mode is None:
+        spark_status = SPARK_NOT_REQUIRED
+    else:
+        spark_outcome = _run_env_only_preflight(deadline_ns)
+        _append_probe_reason(reasons, "spark_env_only", spark_outcome)
+        if spark_outcome.kind == PROBE_COMPLETED:
+            env_only_result = json.loads(spark_outcome.stdout)
+        else:
+            env_only_result = {}
+        spark_status = _spark_capability(spark_mode, spark_fallback, env_only_result)
     if spark_status == SPARK_UNAVAILABLE:
         reasons.append(
             "spark:unavailable: required Spark delegation route has no known-available "
@@ -440,8 +526,14 @@ def assess(
             "permits fallback so the workflow may proceed in degraded mode"
         )
 
-    github_auth = _github_auth_ok()
-    github_repo_read = github_auth and _github_repo_read_ok(repo)
+    github_auth_outcome = _github_auth_probe(deadline_ns)
+    _append_probe_reason(reasons, "github_auth", github_auth_outcome)
+    github_auth = github_auth_outcome.kind == PROBE_COMPLETED
+    github_repo_read = False
+    if github_auth:
+        github_repo_read_outcome = _github_repo_read_probe(repo, deadline_ns)
+        _append_probe_reason(reasons, "github_repo_read", github_repo_read_outcome)
+        github_repo_read = github_repo_read_outcome.kind == PROBE_COMPLETED
     if not github_auth:
         reasons.append(
             "github:auth_unavailable: run `gh auth login` (or ensure GH_TOKEN/GH_CONFIG_DIR "
@@ -466,14 +558,9 @@ def assess(
                 f"{entry.get('actor_role', 'unknown')}; do not start this mutation-requiring phase"
             )
 
-    # Issue #2340 AC2/AC3: actor/execution-substrate-scoped capability
-    # results, alongside (not replacing) the overall `decision` verdict
-    # above. `controlled_github_read` is the consumer-equivalent probe (#2/#3
-    # In Scope): if it is unavailable while root's own `gh auth status` still
-    # passed, that divergence is exactly the failure mode this Issue exists
-    # to catch BEFORE issue-editor / contract-update actors start (rather
-    # than surfacing only as their own `gh_issue_fetch_failed_rc_4`).
-    controlled_github_read = _controlled_github_read_capability(repo)
+    controlled_outcome = _controlled_github_read_probe(repo, deadline_ns)
+    _append_probe_reason(reasons, "controlled_github_read", controlled_outcome)
+    controlled_github_read = _controlled_github_read_from_outcome(controlled_outcome)
     actor_capabilities = {
         "root_github_read": _root_github_read_capability(github_auth, github_repo_read),
         "controlled_github_read": controlled_github_read,
@@ -527,6 +614,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spark-mode", default=None, choices=["required", "preferred", None])
     parser.add_argument("--spark-fallback", default=None, choices=["forbidden", "allowed", None])
     parser.add_argument("--planned-operations-json", default=None)
+    parser.add_argument("--deadline-monotonic-ns", type=int, default=None)
     return parser
 
 
@@ -552,6 +640,7 @@ def main(argv: list[str] | None = None) -> int:
         spark_mode=args.spark_mode,
         spark_fallback=args.spark_fallback,
         planned_operations=planned_operations,
+        deadline_ns=args.deadline_monotonic_ns,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0
