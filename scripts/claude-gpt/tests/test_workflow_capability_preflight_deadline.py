@@ -58,7 +58,12 @@ def test_all_four_probes_share_decreasing_remaining_timeout(monkeypatch):
 
     assert result["decision"] == wcp.DECISION_READY
     assert [round(timeout, 3) for _, timeout in calls] == [10.0, 9.0, 8.0, 7.0]
-    assert [call[0][0] for call in calls] == ["sh", "gh", "gh", "gh"]
+    # Issue #2401 AC1: required GitHub probes (`github_auth` ->
+    # `github_repo_read` -> `controlled_github_read`) now run BEFORE the
+    # optional Spark probe, so the shared deadline's decreasing remaining
+    # timeout is observed by `gh`, `gh`, `gh`, `sh` in that order (not the
+    # prior `sh`-first order).
+    assert [call[0][0] for call in calls] == ["gh", "gh", "gh", "sh"]
 
 
 def test_expired_deadline_spawns_no_new_process(monkeypatch):
