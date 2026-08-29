@@ -49,6 +49,136 @@ def _write_fixture(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+# ─── PR #2385 fix_delta: translate_agent_definition_to_agents_json ──────────
+# Issue #25816 (https://github.com/anthropics/claude-code/issues/25816)
+# workaround: mechanical frontmatter+body -> --agents JSON translation.
+# Uses a small synthetic fixture -- never the real pr-reviewer.md content
+# (that is exercised only by the live runtime probe path).
+
+
+_SYNTHETIC_AGENT_MD = """---
+name: synthetic-agent
+description: A synthetic test agent.
+tools:
+  - Bash
+  - Read
+disallowedTools:
+  - Edit
+model: sonnet
+effort: high
+permissionMode: dontAsk
+skills:
+  - some-skill
+hooks: {PreToolUse: [{matcher: "Bash", hooks: [
+  {type: command, if: "Bash(git commit *)", command: "${CLAUDE_PROJECT_DIR}/fake_guard.py",
+   args: ["deny"], timeout: 5}
+]}]}
+---
+
+You are a synthetic test agent.
+
+## Section
+
+Body text here.
+"""
+
+_SYNTHETIC_AGENT_MD_MINIMAL = """---
+name: minimal-agent
+description: Minimal synthetic agent with no optional fields.
+---
+
+Minimal body.
+"""
+
+
+class TestTranslateAgentDefinitionToAgentsJson:
+    def test_expected_json_shape_and_passthrough_fields(self, tmp_path: Path) -> None:
+        agent_md = tmp_path / "synthetic-agent.md"
+        agent_md.write_text(_SYNTHETIC_AGENT_MD, encoding="utf-8")
+
+        result = verifier.translate_agent_definition_to_agents_json(agent_md, "synthetic-agent")
+
+        assert set(result.keys()) == {"synthetic-agent"}
+        payload = result["synthetic-agent"]
+        assert payload["description"] == "A synthetic test agent."
+        assert payload["prompt"] == (
+            "You are a synthetic test agent.\n\n## Section\n\nBody text here."
+        )
+        assert payload["tools"] == ["Bash", "Read"]
+        assert payload["disallowedTools"] == ["Edit"]
+        assert payload["model"] == "sonnet"
+        assert payload["permissionMode"] == "dontAsk"
+
+    def test_hooks_passed_through_verbatim(self, tmp_path: Path) -> None:
+        agent_md = tmp_path / "synthetic-agent.md"
+        agent_md.write_text(_SYNTHETIC_AGENT_MD, encoding="utf-8")
+
+        result = verifier.translate_agent_definition_to_agents_json(agent_md, "synthetic-agent")
+        payload = result["synthetic-agent"]
+
+        assert payload["hooks"] == {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "if": "Bash(git commit *)",
+                            "command": "${CLAUDE_PROJECT_DIR}/fake_guard.py",
+                            "args": ["deny"],
+                            "timeout": 5,
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def test_absent_fields_are_excluded_not_null(self, tmp_path: Path) -> None:
+        agent_md = tmp_path / "minimal-agent.md"
+        agent_md.write_text(_SYNTHETIC_AGENT_MD_MINIMAL, encoding="utf-8")
+
+        result = verifier.translate_agent_definition_to_agents_json(agent_md, "minimal-agent")
+        payload = result["minimal-agent"]
+
+        assert payload == {
+            "description": "Minimal synthetic agent with no optional fields.",
+            "prompt": "Minimal body.",
+        }
+        for absent_field in ("tools", "disallowedTools", "model", "permissionMode", "hooks"):
+            assert absent_field not in payload
+
+    def test_no_invented_fields_like_name_or_skills(self, tmp_path: Path) -> None:
+        agent_md = tmp_path / "synthetic-agent.md"
+        agent_md.write_text(_SYNTHETIC_AGENT_MD, encoding="utf-8")
+
+        result = verifier.translate_agent_definition_to_agents_json(agent_md, "synthetic-agent")
+        payload = result["synthetic-agent"]
+
+        assert set(payload.keys()) == {
+            "description",
+            "prompt",
+            "tools",
+            "disallowedTools",
+            "model",
+            "permissionMode",
+            "hooks",
+        }
+
+    def test_missing_frontmatter_delimiters_raises_value_error(self, tmp_path: Path) -> None:
+        agent_md = tmp_path / "broken-agent.md"
+        agent_md.write_text("no frontmatter here at all\n", encoding="utf-8")
+
+        with pytest.raises(ValueError):
+            verifier.translate_agent_definition_to_agents_json(agent_md, "broken-agent")
+
+    def test_missing_description_raises_value_error(self, tmp_path: Path) -> None:
+        agent_md = tmp_path / "no-description-agent.md"
+        agent_md.write_text("---\nname: no-description-agent\n---\n\nBody.\n", encoding="utf-8")
+
+        with pytest.raises(ValueError):
+            verifier.translate_agent_definition_to_agents_json(agent_md, "no-description-agent")
+
+
 # ─── AC7: bounded_claim_scope_declared ──────────────────────────────────────
 
 

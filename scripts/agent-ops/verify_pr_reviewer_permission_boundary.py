@@ -8,6 +8,35 @@ direct subprocess, ``--claude-agent-name pr-reviewer``). This script does
 event parsing -- all of that remains owned by the runner it calls out to
 (Issue #1881 Stop Conditions forbid changing that runner).
 
+Agent discovery route (PR #2385 fix_delta -- confirmed upstream bug workaround)
+--------------------------------------------------------------------------------
+The runner's file-based ``--agent pr-reviewer`` project-discovery lookup
+(``.claude/agents/pr-reviewer.md``, scanned by Claude Code itself) hits a
+confirmed OPEN upstream Claude Code bug when cwd is a git worktree linked via
+a ``.git`` file pointing at ``commondir``: custom agents under
+``.claude/agents/`` are not discovered at all
+(https://github.com/anthropics/claude-code/issues/25816). This is NOT a
+workspace-trust issue and NOT something fixable in this repo. To route
+around it without touching the runner (Issue #1881 Stop Conditions forbid
+changing ``run_worktree_agent_runtime_smoke.py``), this script mechanically
+translates the *live* candidate ``.claude/agents/pr-reviewer.md`` frontmatter
++ body (read fresh from the worktree under test on every case invocation --
+never a cached/hardcoded copy) into the officially-documented, session-local
+``--agents <json>`` CLI format (see ``translate_agent_definition_to_agents_json``)
+and injects it via the runner's own existing, documented ``--claude-bin``
+extension point (an "absolute path to a claude-compatible executable ...
+or a transparent wrapper", per that flag's own help text) rather than
+``--hermetic-agent-definition`` (Issue #2046), which is explicitly out of
+scope here because it hardcodes ``tools: ["Read"]`` and replaces
+``.claude/settings.json`` with a fixed deny-all-mutation session-local
+``--settings`` file -- neither of which would exercise the actual
+``hooks``/``tools``/``permissionMode`` frontmatter fields this Issue's P0/P1
+fixes are being verified against, and both of which would suppress the
+production settings/permission surface AC4/AC5 need to observe.
+See ``build_agents_json_passthrough_argv`` below. This never uses
+``--add-dir`` (confirmed to break ``CLAUDE_PROJECT_DIR`` resolution needed
+by the hooks' ``${CLAUDE_PROJECT_DIR}`` interpolation).
+
 What this script adds on top of the runner
 --------------------------------------------
 1. A capability preflight (`claude` binary present, `gh` authenticated, and
@@ -56,12 +85,15 @@ import argparse
 import glob
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -77,6 +109,29 @@ CANONICAL_REFERENCE_RELATIVE_PATH = (
 
 DENY_MARKER = "reviewer-deny"
 REFERENCE_READ_MARKER = "reviewer-reference-read-ok"
+
+# Issue #25816 (https://github.com/anthropics/claude-code/issues/25816):
+# confirmed OPEN upstream Claude Code bug -- custom agents under
+# ``.claude/agents/`` are not discovered when cwd is a git worktree. This
+# script routes around it via a session-local ``--agents`` JSON passthrough
+# (see ``translate_agent_definition_to_agents_json`` /
+# ``build_agents_json_passthrough_argv``) instead of relying on the
+# ``--agent <name>`` file-based project-discovery lookup alone.
+UPSTREAM_WORKTREE_AGENT_DISCOVERY_BUG_REF = (
+    "https://github.com/anthropics/claude-code/issues/25816"
+)
+
+# --agents JSON frontmatter fields passed through verbatim when present
+# (Issue #1881 PR #2385 fix_delta). Deliberately excludes fields with no
+# meaning in the --agents JSON schema (e.g. ``name``, ``skills``, ``effort``)
+# -- this script never invents new fields.
+_AGENTS_JSON_PASSTHROUGH_FRONTMATTER_FIELDS = (
+    "tools",
+    "disallowedTools",
+    "model",
+    "permissionMode",
+    "hooks",
+)
 
 # Issue #1881 canonical mutation command families (AC5). `git_worktree` is
 # the mandatory canary -- a local, non-GitHub-mutating operation -- and is
@@ -256,6 +311,116 @@ def preflight_capability(
     return True, "", detail
 
 
+# ─── Agent discovery: --agents JSON passthrough (Issue #25816 workaround) ──
+
+
+def translate_agent_definition_to_agents_json(agent_md_path: Path, agent_name: str) -> dict[str, Any]:
+    """Mechanically translate a candidate Agent ``.md`` file's frontmatter +
+    body into the officially-documented ``--agents <json>`` CLI format
+    (Issue #1881 PR #2385 fix_delta).
+
+    Reads ``agent_md_path`` fresh on every call (the caller must pass the
+    live worktree's own file at the current head -- never a cached copy).
+    Parses the ``---``-delimited YAML frontmatter and the Markdown body,
+    then builds ``{agent_name: {"description": ..., "prompt": <body,
+    stripped>, ...}}`` where ``tools``/``disallowedTools``/``model``/
+    ``permissionMode``/``hooks`` are passed through byte-for-byte from the
+    frontmatter when present (skipped entirely when absent or ``None`` --
+    never injected as empty/null). Does not invent new fields and does not
+    reshape ``hooks`` in any way: this is the exact content whose P0/P1
+    fixes Issue #1881's AC4/AC5 verify.
+
+    Raises ``ValueError`` if the file is not a well-formed
+    ``---``-delimited frontmatter document, if the frontmatter does not
+    parse to a YAML mapping, or if the frontmatter has no ``description``
+    (a required top-level field in the ``--agents`` JSON schema).
+    """
+    text = agent_md_path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        raise ValueError(f"{agent_md_path}: missing leading '---' frontmatter delimiter")
+    _, _, remainder = text.partition("---\n")
+    frontmatter_text, sep, body = remainder.partition("\n---\n")
+    if not sep:
+        raise ValueError(f"{agent_md_path}: missing closing '---' frontmatter delimiter")
+    frontmatter = yaml.safe_load(frontmatter_text)
+    if not isinstance(frontmatter, dict):
+        raise ValueError(f"{agent_md_path}: frontmatter did not parse to a YAML mapping")
+    description = frontmatter.get("description")
+    if not isinstance(description, str) or not description:
+        raise ValueError(f"{agent_md_path}: frontmatter is missing a non-empty 'description'")
+
+    agent_payload: dict[str, Any] = {
+        "description": description,
+        "prompt": body.strip(),
+    }
+    for field in _AGENTS_JSON_PASSTHROUGH_FRONTMATTER_FIELDS:
+        if field not in frontmatter:
+            continue
+        value = frontmatter[field]
+        if value is None:
+            continue
+        agent_payload[field] = value
+
+    return {agent_name: agent_payload}
+
+
+def build_agents_json_passthrough_argv(
+    *, worktree: Path, agent_name: str, real_claude_bin: str, case_dir: Path
+) -> list[str]:
+    """Build the extra runner CLI args that route agent discovery through a
+    session-local ``--agents <json>`` payload instead of the file-based
+    ``--agent <name>`` project-discovery lookup alone (Issue #25816
+    workaround, see module docstring).
+
+    Does NOT modify ``run_worktree_agent_runtime_smoke.py``: this uses that
+    runner's existing, documented ``--claude-bin`` extension point (an
+    "absolute path to a claude-compatible executable ... or a transparent
+    wrapper"). With the default ``--claude-adapter native`` (never set here
+    -- native is the default), the runner's own fixed argv is passed
+    through byte-for-byte to whatever ``--claude-bin`` points at. This
+    writes a small wrapper shell script that: (1) execs the real ``claude``
+    binary unchanged for any non-print-mode invocation (e.g. the runner's
+    own ``<bin> --version`` capability probe), so nothing about the
+    runner's other behavior is perturbed; and (2) for the actual
+    structured-lane print-mode invocation (identified by the runner's own
+    fixed ``-p`` flag, always present in that shape), appends exactly one
+    extra ``--agents <json>`` flag before delegating to the real binary.
+    Never uses ``--add-dir`` (see module docstring).
+
+    Returns ``["--claude-bin", <wrapper_path>]`` to be appended to the
+    runner's own CLI invocation.
+    """
+    agent_md_path = worktree / ".claude" / "agents" / f"{agent_name}.md"
+    agents_payload = translate_agent_definition_to_agents_json(agent_md_path, agent_name)
+
+    case_dir.mkdir(parents=True, exist_ok=True)
+    agents_json_path = case_dir / "agents-passthrough.json"
+    agents_json_path.write_text(json.dumps(agents_payload), encoding="utf-8")
+
+    wrapper_path = case_dir / "claude-agents-passthrough-wrapper.sh"
+    wrapper_script = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "has_print_mode=0\n"
+        'for _arg in "$@"; do\n'
+        '  if [ "$_arg" = "-p" ]; then\n'
+        "    has_print_mode=1\n"
+        "    break\n"
+        "  fi\n"
+        "done\n"
+        'if [ "$has_print_mode" = "1" ]; then\n'
+        f"  _agents_json=\"$(cat {shlex.quote(str(agents_json_path))})\"\n"
+        f'  exec {shlex.quote(real_claude_bin)} "$@" --agents "$_agents_json"\n'
+        "else\n"
+        f'  exec {shlex.quote(real_claude_bin)} "$@"\n'
+        "fi\n"
+    )
+    wrapper_path.write_text(wrapper_script, encoding="utf-8")
+    wrapper_path.chmod(0o700)
+
+    return ["--claude-bin", str(wrapper_path)]
+
+
 # ─── Case execution (delegates the actual runtime to the smoke runner) ─────
 
 
@@ -316,20 +481,41 @@ def run_runtime_case(
     if require_clean_postcondition:
         cmd.append("--require-clean-postcondition")
 
-    env = dict(os.environ)
-    env["LOOP_PR_REVIEWER_RUNTIME_PROBE"] = "1"
+    # Issue #25816 workaround (see module docstring): route agent discovery
+    # through a session-local --agents JSON passthrough instead of relying
+    # on the runner's file-based --agent <name> project-discovery lookup
+    # alone, which is confirmed broken from a git-worktree cwd upstream.
+    process_error: str | None = None
+    real_claude_bin = shutil.which("claude")
+    if real_claude_bin is None:
+        process_error = "agents_json_passthrough_build_failed: claude_binary_not_found"
+    else:
+        try:
+            cmd += build_agents_json_passthrough_argv(
+                worktree=worktree,
+                agent_name="pr-reviewer",
+                real_claude_bin=real_claude_bin,
+                case_dir=case_dir,
+            )
+        except (OSError, ValueError) as exc:
+            process_error = f"agents_json_passthrough_build_failed: {exc}"
 
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, env=env, timeout=timeout_seconds + 30
-        )
-        process_error: str | None = None
-        returncode = proc.returncode
-        stdout = proc.stdout
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        process_error = str(exc)
-        returncode = None
-        stdout = ""
+    returncode: int | None = None
+    stdout = ""
+    if process_error is None:
+        env = dict(os.environ)
+        env["LOOP_PR_REVIEWER_RUNTIME_PROBE"] = "1"
+
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, env=env, timeout=timeout_seconds + 30
+            )
+            returncode = proc.returncode
+            stdout = proc.stdout
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            process_error = str(exc)
+            returncode = None
+            stdout = ""
 
     evidence: dict[str, Any] | None = None
     if evidence_json.exists():
@@ -348,7 +534,18 @@ def run_runtime_case(
 
 
 def classify_deny_case(result: dict[str, Any], expect_marker: str) -> str:
-    """Returns 'confirmed_deny' | 'confirmed_breach' | 'inconclusive'."""
+    """Returns 'confirmed_deny' | 'confirmed_breach' | 'inconclusive'.
+
+    AC5 (PR #2385 fix_delta): ``result`` comes from a ``run_runtime_case``
+    invocation whose agent discovery went through the ``--agents`` JSON
+    passthrough (see module docstring / ``build_agents_json_passthrough_argv``)
+    rather than the runner's file-based ``--agent <name>`` project-discovery
+    lookup alone. This routes around confirmed upstream Claude Code bug
+    #25816 (git-worktree custom-agent discovery), not any local repo bug --
+    the candidate ``pr-reviewer`` frontmatter's own ``hooks``/``tools``/
+    ``permissionMode`` fields, and this repo's production
+    ``.claude/settings.json``, are unchanged by that routing.
+    """
     if result.get("process_error") is not None:
         return "inconclusive"
     if result["exit_code"] == EXIT_SKIP:
@@ -378,6 +575,11 @@ def classify_positive_case(result: dict[str, Any]) -> str:
     stdout, not the raw hook output). A missing or malformed
     ``expected_markers_missing`` field is treated as inconclusive, never a
     silent PASS.
+
+    AC4 (PR #2385 fix_delta): same ``--agents`` JSON passthrough discovery
+    route as ``classify_deny_case`` above, applied here to the positive
+    reference-read case. Also purely a workaround for upstream bug #25816,
+    not a change to what is being verified.
     """
     if result.get("process_error") is not None:
         return "inconclusive"
