@@ -594,7 +594,12 @@ _STRUCTURAL_STDOUT = (json.dumps({"argv": _STRUCTURAL_CHILD_ARGV}, separators=("
 _STRUCTURAL_STDERR = b"STRUCTURAL-FIXTURE-STDERR\n"
 
 
-def _install_structural_repair_action_apply_fixture(repo_root: Path) -> Path:
+def _install_structural_repair_action_apply_fixture(
+    repo_root: Path,
+    *,
+    child_stdout: bytes = _STRUCTURAL_STDOUT,
+    child_stderr: bytes = _STRUCTURAL_STDERR,
+) -> Path:
     for rel in (
         "scripts/agent-guards/skill_runtime_exec.py",
         "scripts/agent-guards/skill_runtime_command_policy.py",
@@ -622,17 +627,16 @@ def select_issue_worktree(catalog, issue_number, root_realpath):
     leaf = repo_root / ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py"
     _write_text(
         leaf,
-        """from __future__ import annotations
-import json
+        f"""from __future__ import annotations
 import sys
 from pathlib import Path
 
 issue = sys.argv[sys.argv.index("--issue-number") + 1]
-marker = Path(f".claude/artifacts/issue-refinement-loop/{issue}/fixture-child.marker")
+marker = Path(f".claude/artifacts/issue-refinement-loop/{{issue}}/fixture-child.marker")
 marker.parent.mkdir(parents=True, exist_ok=True)
 marker.write_text("spawned\\n", encoding="utf-8")
-sys.stdout.buffer.write((json.dumps({"argv": sys.argv[1:]}, separators=(",", ":")) + "\\n").encode())
-sys.stderr.buffer.write(b"STRUCTURAL-FIXTURE-STDERR\\n")
+sys.stdout.buffer.write({child_stdout!r})
+sys.stderr.buffer.write({child_stderr!r})
 raise SystemExit(17)
 """,
     )
@@ -703,6 +707,23 @@ def test_structural_repair_action_apply_relays_exact_child_argv_stdout_stderr_an
     assert result.stdout == _STRUCTURAL_STDOUT
     assert json.loads(result.stdout) == {"argv": _STRUCTURAL_CHILD_ARGV}
     assert _STRUCTURAL_STDERR in result.stderr
+    assert marker.exists()
+
+
+def test_structural_repair_action_apply_relays_raw_child_bytes_without_text_normalization(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    child_stdout = b"STRUCTURAL-STDOUT\xff\r\nsecond-line\r\n"
+    child_stderr = b"STRUCTURAL-STDERR\xfe\r\nsecond-error\r\n"
+    marker = _install_structural_repair_action_apply_fixture(
+        repo,
+        child_stdout=child_stdout,
+        child_stderr=child_stderr,
+    )
+    result = _run_structural_repair_action_apply_executor(repo)
+
+    assert result.returncode == 17
+    assert result.stdout == child_stdout
+    assert result.stderr.endswith(child_stderr)
     assert marker.exists()
 
 

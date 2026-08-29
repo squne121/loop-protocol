@@ -1581,8 +1581,8 @@ class _ChildSupervisionResult:
         *,
         timed_out: bool,
         returncode: int | None,
-        stdout: str,
-        stderr: str,
+        stdout: str | bytes,
+        stderr: str | bytes,
         cleanup_scope: str,
         cleanup_status: str,
         termination: str,
@@ -1764,19 +1764,16 @@ def _run_child_with_supervision(
     cwd: str,
     env: dict[str, str],
     timeout_seconds: float | int | None,
+    binary_output: bool = False,
 ) -> _ChildSupervisionResult:
     """Launch `child_argv` under direct caller supervision.
 
-    Normal-success semantics (stdout/stderr/returncode) are unchanged from
-    the previous `subprocess.run(capture_output=True, text=True)` behavior
-    (AC4): the execution wait itself is delegated to
-    `proc.communicate(timeout=timeout_seconds)`, which preserves
-    `subprocess.run()`'s own timeout/pipe-EOF/decode-error semantics
-    exactly (Issue #2075 P1-2) -- including that a leader which exits while
-    a descendant still holds the stdout/stderr pipe open keeps this call
-    blocked (and, on timeout, still times out) rather than being mistaken
-    for success, and that a `UnicodeDecodeError` from malformed child output
-    propagates to the caller instead of being swallowed.
+    Generic commands retain the previous text-mode normal-success semantics.
+    The structural transport opts into binary capture so its stdout/stderr
+    relay preserves CRLF and invalid UTF-8 byte-for-byte (Issue #2402 AC4).
+    The execution wait is delegated to `proc.communicate(timeout=...)`;
+    a leader that exits while a descendant still holds stdout/stderr open
+    remains blocked (and can time out) rather than being mistaken for success.
 
     On timeout (or any other exception unwinding past a successful
     `Popen()`, including `KeyboardInterrupt`), the process group is driven
@@ -1785,6 +1782,7 @@ def _run_child_with_supervision(
     ever surfaced (AC7) -- only cleanup telemetry is returned.
     """
     posix_supervised = _POSIX_PROCESS_GROUP_SUPPORTED
+    empty_output: str | bytes = b"" if binary_output else ""
 
     popen_kwargs: dict[str, object] = dict(
         cwd=cwd,
@@ -1792,7 +1790,7 @@ def _run_child_with_supervision(
         shell=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        text=not binary_output,
     )
     if posix_supervised:
         popen_kwargs["start_new_session"] = True
@@ -1816,8 +1814,8 @@ def _run_child_with_supervision(
         return _ChildSupervisionResult(
             timed_out=True,
             returncode=None,
-            stdout="",
-            stderr="",
+            stdout=empty_output,
+            stderr=empty_output,
             cleanup_scope=cleanup_scope,
             cleanup_status=cleanup_status,
             termination=termination,
@@ -1836,8 +1834,8 @@ def _run_child_with_supervision(
         return _ChildSupervisionResult(
             timed_out=False,
             returncode=proc.returncode,
-            stdout=stdout or "",
-            stderr=stderr or "",
+            stdout=stdout if stdout is not None else empty_output,
+            stderr=stderr if stderr is not None else empty_output,
             cleanup_scope=CLEANUP_SCOPE_PROCESS_GROUP,
             cleanup_status=CLEANUP_STATUS_NOT_STARTED,
             termination=TERMINATION_NOT_NEEDED,
@@ -2582,6 +2580,7 @@ def main(argv: list[str] | None = None) -> int:
         cwd=project_root,
         env=_sanitize_env(project_root, args.command_id),
         timeout_seconds=timeout_seconds,
+        binary_output=is_structural_repair_action_apply_command,
     )
     if supervision.timed_out:
         return _emit_timeout_failure(
@@ -2615,18 +2614,27 @@ def main(argv: list[str] | None = None) -> int:
     if unauthorized_path is not None:
         return _emit_unauthorized_write_failure(args.issue_number, unauthorized_path)
 
+    stdout_for_artifact_projection = (
+        result.stdout.decode("utf-8", errors="surrogateescape")
+        if isinstance(result.stdout, bytes)
+        else result.stdout
+    )
     artifact_projection_failures = _validate_stdout_artifact_projection(
         project_root,
         str(args.issue_number),
-        result.stdout,
+        stdout_for_artifact_projection,
         args.command_id,
     )
     if artifact_projection_failures:
         return _emit_artifact_projection_failure(args.issue_number, artifact_projection_failures)
 
-    if result.stdout:
+    if isinstance(result.stdout, bytes):
+        sys.stdout.buffer.write(result.stdout)
+    elif result.stdout:
         sys.stdout.write(result.stdout)
-    if result.stderr:
+    if isinstance(result.stderr, bytes):
+        sys.stderr.buffer.write(result.stderr)
+    elif result.stderr:
         sys.stderr.write(result.stderr)
     return result.returncode
 
