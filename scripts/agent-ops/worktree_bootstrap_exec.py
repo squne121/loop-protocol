@@ -90,6 +90,34 @@ _ACQUIRING_CONTROL_PLANE_KEYS: set[str] = set()
 _CONTROL_PLANE_GUARD_REGISTRY_LOCK = threading.Lock()
 
 
+def _after_control_plane_mutex_fork_child() -> None:
+    """Discard inherited mutex state in an explicit fork child.
+
+    ``flock`` ownership belongs to the shared open file description copied by
+    ``fork``.  The child must therefore plain-close only its copy; ``LOCK_UN``
+    here would also release the parent's lock.  The copied guards and lock are
+    invalid in the new process and must not be retained as registry authority.
+    """
+    global _HELD_CONTROL_PLANE_GUARDS
+    global _ACQUIRING_CONTROL_PLANE_KEYS
+    global _CONTROL_PLANE_GUARD_REGISTRY_LOCK
+
+    for _, guard in tuple(_HELD_CONTROL_PLANE_GUARDS.values()):
+        fd = guard._fd
+        guard._fd = -1
+        guard._released = True
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _HELD_CONTROL_PLANE_GUARDS = {}
+    _ACQUIRING_CONTROL_PLANE_KEYS = set()
+    _CONTROL_PLANE_GUARD_REGISTRY_LOCK = threading.Lock()
+
+
+os.register_at_fork(after_in_child=_after_control_plane_mutex_fork_child)
+
+
 def _validate_deadline_at(deadline_at: float) -> float:
     try:
         value = float(deadline_at)
@@ -107,7 +135,9 @@ def _raise_if_deadline_expired(deadline_at: float) -> float:
     return remaining
 
 
-def _canonical_existing_git_common_dir(project_root: str | os.PathLike[str]) -> Path:
+def _canonical_existing_git_common_dir(
+    project_root: str | os.PathLike[str], *, deadline_at: float
+) -> Path:
     """Derive the only permitted mutex scope with a fixed trusted Git command.
 
     The command has no caller-provided argv and inherits neither repository
@@ -116,7 +146,7 @@ def _canonical_existing_git_common_dir(project_root: str | os.PathLike[str]) -> 
     filesystem resolution below establishes the required existing realpath.
     """
     root = os.path.realpath(os.fspath(project_root))
-    deadline_at = time.monotonic() + 10.0
+    _raise_if_deadline_expired(deadline_at)
     try:
         result = subprocess.run(
             [
@@ -223,7 +253,7 @@ def acquire_control_plane_preflight_lifecycle_mutex(
     TTL, heartbeat, stale scanning, takeover, or lock-file unlinking.
     """
     deadline = _validate_deadline_at(deadline_at)
-    canonical_common_dir = _canonical_existing_git_common_dir(project_root)
+    canonical_common_dir = _canonical_existing_git_common_dir(project_root, deadline_at=deadline)
     lock_path = _fixed_control_plane_lock_path(canonical_common_dir)
     key = str(canonical_common_dir)
     with _CONTROL_PLANE_GUARD_REGISTRY_LOCK:
