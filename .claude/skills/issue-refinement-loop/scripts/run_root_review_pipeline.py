@@ -159,6 +159,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1188,19 +1189,19 @@ def run_checker_pipeline_once(
         shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
-
 # ---------------------------------------------------------------------------
 # Canonical Step 2 routing (Issue #2380 P0-2, OWNER PR #2386 review):
 # `(status, verdict, next_action)` triple routing, NOT `verdict` alone.
 # ---------------------------------------------------------------------------
 
 STEP_4_5 = "step_4_5"
+STEP_2_5 = "step_2_5"
 STEP_4 = "step_4"
 STEP_5_HUMAN_JUDGMENT_REQUIRED = "step_5_human_judgment_required"
 FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE = "fail_closed_environment_or_integrity_failure"
 
 
-def route_canonical_step2_result(result: dict[str, Any]) -> str:
+def route_canonical_step2_result(result: Any) -> str:
     """Canonical Step 2's SOLE routing decision function (Issue #2380 P0-2).
 
     A prior implementation iteration keyed routing off `compact_result.verdict`
@@ -1217,40 +1218,72 @@ def route_canonical_step2_result(result: dict[str, Any]) -> str:
     fixable contract defect.
 
     This function evaluates the FULL `(status, verdict, next_action)` triple
-    -- exactly the four outcomes the Issue #2380 fix_delta specifies -- and is
-    intentionally pure (no I/O, no SubAgent/CLI invocation of any kind): it
-    only inspects the dict `result` (typically `_cmd_produce()`'s own parsed
-    JSON output, but any dict with the same shape works, which is what makes
-    it independently unit-testable):
+    -- exactly the outcomes the Issue #2380 / #2389 fix_delta specify -- and
+    is intentionally pure (no I/O, no SubAgent/CLI invocation of any kind):
+    it only inspects `result` (typically `_cmd_produce()`'s own parsed JSON
+    output, but any object with the same shape works, which is what makes it
+    independently unit-testable). It is a TOTAL function: `result` and its
+    `compact_result` entry are validated to be `Mapping` instances before any
+    attribute access, so malformed/non-dict input (`list`, `str`, `int`,
+    `None`, etc.) never raises `AttributeError` -- it falls through to the
+    fail-closed return below instead (Issue #2389 P1-1 / AC4).
 
+        result is not a Mapping, OR `compact_result` is present and is not
+        a Mapping
+            -> `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE` (never raises)
         status == ok + verdict == approve   + next_action == proceed
-            -> Step 4.5 (`STEP_4_5`)
+            -> Step 2.5 (`STEP_2_5`; Issue #2389 -- a deterministic approve
+               must still pass through the Step 2.5 semantic design review
+               applicability gate. Routing straight to `STEP_4_5` here would
+               bypass that gate, which is exactly the defect Issue #2389
+               closes: the routing table itself, not just prose telling the
+               orchestrator to remember to check applicability separately.)
         status == ok + verdict == needs-fix + next_action == request_changes
             -> Step 4 (`STEP_4`)
-        status == ok + next_action == human_judgment_required (verdict-agnostic,
-            per the schema note above)
+        status == ok + verdict == needs-fix + next_action ==
+            human_judgment_required (EXACT triple match only -- Issue #2389
+            PR #2391 OWNER review P1-1: a loose match on `next_action` alone
+            would also match inconsistent combinations such as
+            `verdict: approve` + `next_action: human_judgment_required`,
+            which must fail closed instead, see below)
             -> Step 5 (`STEP_5_HUMAN_JUDGMENT_REQUIRED`)
-        anything else (including `status != ok`, i.e. `produce` itself
-        returned `input_or_runtime_error`) -> a fail-closed stop, distinct
-        from the ordinary human-judgment escalation above, because it
-        indicates an inconsistent/unrecognized `(status, verdict,
-        next_action)` combination rather than a documented terminal state
+        status == input_or_runtime_error (Issue #2389 PR #2391 OWNER review
+            P0-2: EVERY `input_or_runtime_error`, known `error_code` or not,
+            is routed here -- NOT to `STEP_5_HUMAN_JUDGMENT_REQUIRED` --
+            to preserve Issue #2054's `transport_status: environment_failure`
+            / `semantic_verdict: null` separation contract: transport and
+            artifact-integrity failures are an operational/environment
+            condition, not a semantic human-judgment decision, and Issue
+            #2389 does not supersede that separation)
+        anything else (including any other inconsistent `(status, verdict,
+        next_action)` combination, e.g. `verdict: approve` +
+        `next_action: human_judgment_required`) -> a fail-closed stop,
+        because it indicates an inconsistent/unrecognized combination rather
+        than a documented terminal state
             -> `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`
 
     This function does not call `classify_child_stdout()`,
     `retry_once_on_transport_failure()`, or invoke the `issue-reviewer` agent
     -- it has no side effects at all.
     """
+    if not isinstance(result, Mapping):
+        return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+
+    compact_result = result.get("compact_result")
+    if compact_result is None:
+        compact_result = {}
+    if not isinstance(compact_result, Mapping):
+        return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+
     status = result.get("status")
-    compact_result = result.get("compact_result") or {}
     verdict = compact_result.get("verdict")
     next_action = compact_result.get("next_action")
 
     if status == "ok" and verdict == "approve" and next_action == "proceed":
-        return STEP_4_5
+        return STEP_2_5
     if status == "ok" and verdict == "needs-fix" and next_action == "request_changes":
         return STEP_4
-    if status == "ok" and next_action == "human_judgment_required":
+    if status == "ok" and verdict == "needs-fix" and next_action == "human_judgment_required":
         return STEP_5_HUMAN_JUDGMENT_REQUIRED
     return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
 
@@ -1293,18 +1326,41 @@ def _cmd_run_checker_attempt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _emit_produce_result(payload: dict[str, Any]) -> None:
+    """Single stdout-JSON exit point for `_cmd_produce()` (Issue #2389).
+
+    EVERY `_cmd_produce()` stdout JSON output path -- success, body-fetch
+    failure, VC-budget policy-ceiling error, reviewer-transport failure,
+    artifact-readback failure -- MUST print through this one helper instead
+    of calling `print(json.dumps(...))` directly, so a top-level
+    `canonical_step2_route` field (the verbatim return value of
+    `route_canonical_step2_result()`, this SAME producer's own routing
+    determination for its OWN output) is always present, on every path,
+    with no call site able to silently forget it. Canonical Step 2
+    (`issue-refinement-loop` SKILL.md) reads `canonical_step2_route`
+    directly as its SOLE routing authority; it does not independently
+    recompute routing from `status` / `compact_result.verdict` /
+    `compact_result.next_action`.
+
+    `payload` is the schema/status/etc. dict a call site would otherwise
+    have passed straight to `json.dumps()`; this function does not mutate
+    the caller's copy of it in place.
+    """
+    payload = dict(payload)
+    payload["canonical_step2_route"] = route_canonical_step2_result(payload)
+    print(json.dumps(payload))
+
+
 def _cmd_produce(args: argparse.Namespace) -> int:
     body, body_sha256, error_code = fetch_and_pin_live_body(args.issue_number, args.repo)
     if body is None:
-        print(
-            json.dumps(
-                {
-                    "schema": SCHEMA,
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "input_or_runtime_error",
-                    "error_code": error_code,
-                }
-            )
+        _emit_produce_result(
+            {
+                "schema": SCHEMA,
+                "schema_version": SCHEMA_VERSION,
+                "status": "input_or_runtime_error",
+                "error_code": error_code,
+            }
         )
         return 2
 
@@ -1360,15 +1416,13 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         _baseline_vc_preflight.CommandTimeoutExceedsPolicyError,
         _baseline_vc_preflight.CommandTimeoutNonPositiveError,
     ) as exc:
-        print(
-            json.dumps(
-                {
-                    "schema": SCHEMA,
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "input_or_runtime_error",
-                    "error_code": exc.error_code,
-                }
-            )
+        _emit_produce_result(
+            {
+                "schema": SCHEMA,
+                "schema_version": SCHEMA_VERSION,
+                "status": "input_or_runtime_error",
+                "error_code": exc.error_code,
+            }
         )
         return 2
 
@@ -1447,16 +1501,14 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             total_deadline=_review_budget.total_seconds,
         )
         if transport_result["transport_status"] != "ok":
-            print(
-                json.dumps(
-                    {
-                        "schema": SCHEMA,
-                        "schema_version": SCHEMA_VERSION,
-                        "status": "input_or_runtime_error",
-                        "error_code": "reviewer_transport_environment_failure",
-                        "transport_invocation_id": transport_result["invocation_id"],
-                    }
-                )
+            _emit_produce_result(
+                {
+                    "schema": SCHEMA,
+                    "schema_version": SCHEMA_VERSION,
+                    "status": "input_or_runtime_error",
+                    "error_code": "reviewer_transport_environment_failure",
+                    "transport_invocation_id": transport_result["invocation_id"],
+                }
             )
             return 2
 
@@ -1480,15 +1532,13 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             expected_sha256=compact_fields["ARTIFACT_SHA256"],
         )
         if verified["status"] != "valid":
-            print(
-                json.dumps(
-                    {
-                        "schema": SCHEMA,
-                        "schema_version": SCHEMA_VERSION,
-                        "status": "input_or_runtime_error",
-                        "error_code": "artifact_readback_failed",
-                    }
-                )
+            _emit_produce_result(
+                {
+                    "schema": SCHEMA,
+                    "schema_version": SCHEMA_VERSION,
+                    "status": "input_or_runtime_error",
+                    "error_code": "artifact_readback_failed",
+                }
             )
             return 2
 
@@ -1555,21 +1605,19 @@ def _cmd_produce(args: argparse.Namespace) -> int:
             "attempt": last_attempt["attempt"],
         }
 
-        print(
-            json.dumps(
-                {
-                    "schema": SCHEMA,
-                    "schema_version": SCHEMA_VERSION,
-                    "status": "ok",
-                    "issue_number": args.issue_number,
-                    "body_sha256": body_sha256,
-                    "merged_review_result": merged,
-                    "artifact_path": str(artifact_path),
-                    "compact_result": compact_result,
-                    "full_review_artifact": full_review_artifact,
-                    "verified_transport_artifact": verified_transport_artifact,
-                }
-            )
+        _emit_produce_result(
+            {
+                "schema": SCHEMA,
+                "schema_version": SCHEMA_VERSION,
+                "status": "ok",
+                "issue_number": args.issue_number,
+                "body_sha256": body_sha256,
+                "merged_review_result": merged,
+                "artifact_path": str(artifact_path),
+                "compact_result": compact_result,
+                "full_review_artifact": full_review_artifact,
+                "verified_transport_artifact": verified_transport_artifact,
+            }
         )
         return 0
 
