@@ -817,3 +817,29 @@ esac
         except ProcessLookupError:
             pass
         host_child.wait(timeout=2)
+
+
+
+def test_invocation_supervisor_allows_contained_git_helper_to_finish(monkeypatch, tmp_path):
+    """A normal helper in the dedicated Git group is drained, not misclassified."""
+    fake_git = tmp_path / "contained-helper-git"
+    fake_git.write_text(
+        """#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+  *)
+    (sleep 0.05) >/dev/null 2>&1 &
+    printf '%s\n' 'file:///tmp/origin.git'
+    exit 0 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    assert exec_mod.run_control_plane_git_effective_remote_url(
+        "file:///tmp/origin.git",
+        cwd=str(tmp_path),
+        project_root=str(tmp_path),
+        deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+    ).value == "file:///tmp/origin.git"

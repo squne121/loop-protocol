@@ -3902,6 +3902,49 @@ def _record_git_descendant_observation(
     return descendants
 
 
+def _drain_invocation_children_after_leader_exit(pgid: int, deadline: GitProtocolDeadline) -> str:
+    """Classify only supervisor-adopted Git children after leader exit.
+
+    A helper in the original dedicated Git session is an ordinary Git
+    descendant completing shutdown, even when a non-interactive shell gives it
+    another process group. An adopted child in another session escaped that
+    containment and remains a fail-closed leak. Both cases are observed solely
+    inside the short-lived invocation supervisor.
+    """
+    # start_new_session=True makes the leader PID both session and process
+    # group ID; retain that numeric session identity after the leader is reaped.
+    leader_session_id = pgid
+    drain_until = min(deadline.deadline_at, time.monotonic() + max(0.01, deadline.cleanup_reserve_seconds / 2))
+    while time.monotonic() < drain_until:
+        children = _observe_invocation_supervisor_children()
+        if children is None:
+            return "unconfirmed"
+        if not children:
+            return "absent"
+        for child in children:
+            identity = _linux_process_identity(child.pid)
+            if identity is None or identity[2] != child.start_time:
+                continue
+            try:
+                if os.getsid(child.pid) != leader_session_id:
+                    if not _terminate_invocation_supervisor_children(deadline):
+                        return "unconfirmed"
+                    return "escaped"
+            except OSError:
+                return "unconfirmed"
+        if not _reap_tracked_children(children):
+            return "unconfirmed"
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+    children = _observe_invocation_supervisor_children()
+    if children is None:
+        return "unconfirmed"
+    if not children:
+        return "absent"
+    if not _terminate_invocation_supervisor_children(deadline):
+        return "unconfirmed"
+    return "escaped"
+
+
 def _run_closed_git_process_in_invocation_supervisor(
     operation: _GitOperation,
     *,
@@ -3963,23 +4006,19 @@ def _run_closed_git_process_in_invocation_supervisor(
     if proc.returncode != 0 and not (operation.kind == "probe_rewrite" and proc.returncode == 1):
         if not _terminate_git_process_group(proc, pgid, deadline, descendants):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
-    if posix_supervised and (
-        descendants is None
-        or not _verify_process_group_absent(proc.pid)
-        or not _tracked_descendants_absent(descendants)
-    ):
+    if posix_supervised and descendants is None:
         _terminate_git_process_group(proc, pgid, deadline, descendants)
-        raise GitProtocolProcessGroupCleanupFailed("git_process_group_descendant_leak")
-
-    # communicate() has reaped the direct Git leader. In this isolated
-    # supervisor, an empty adopted-child set has kernel parentage meaning and
-    # is a confirmation limited to this Git invocation.
-    adopted_children = _observe_invocation_supervisor_children()
-    if adopted_children is None:
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
-    if adopted_children:
-        if not _terminate_invocation_supervisor_children(deadline):
-            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+
+    # communicate() has reaped the direct Git leader. The invocation
+    # supervisor may still have adopted a normal helper in that leader's
+    # process group; drain it without widening attribution to any host child.
+    if not posix_supervised or pgid is None:
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    drain_result = _drain_invocation_children_after_leader_exit(pgid, deadline)
+    if drain_result == "unconfirmed":
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    if drain_result != "absent":
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_descendant_leak")
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
