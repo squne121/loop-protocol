@@ -172,6 +172,21 @@ argv/env 変換が適用されてしまう欠陥だった。
   `extract_claude_gpt_launcher_receipt()` で stderr の `CLAUDE_GPT_LAUNCH_RESULT_V1`
   JSON 行から抽出され、evidence の `claude_gpt_launcher_receipt` に記録される。
 
+## `--check-only` receipt の multi-line 埋め込み（Issue #2153 実装時の live 発見）
+
+`scripts/claude-gpt/launch.sh --check-only` が成功時に出力する
+`CLAUDE_GPT_LAUNCH_RESULT_V1` receipt は、ネストされた `preflight` object を
+pretty-print（複数行）で埋め込む。`extract_claude_gpt_launcher_receipt()` の
+単一行 regex（`[^\n]*`）はこの receipt を抽出できないことを live 実行で確認
+済み（拒否系の単一行 receipt は引き続き正しく抽出できる）。この
+`--check-only` receipt のような multi-line embedded JSON を消費する呼び出し元
+は、単一行 regex ではなく `json.JSONDecoder.raw_decode()`（bracket-aware）で
+receipt marker 位置から parse する必要がある。`.claude/skills/
+issue-refinement-loop/scripts/run_native_session_continuation_canary.py` の
+`_parse_claude_gpt_receipt()` がこの local workaround の実装例（Issue #2153
+AC6 の reuse 境界により、この workaround 自体は本 SKILL の汎用 harness へは
+追加していない）。
+
 ## Herdr 全体 snapshot 保全検証（Issue #2174 AC7）
 
 `--mode interactive` は常に（オプトインではなく）、isolated interactive lane 実行の
