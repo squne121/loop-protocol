@@ -158,7 +158,12 @@ def test_successful_malformed_spark_output_returns_structured_reason(monkeypatch
     assert result["decision"] == wcp.DECISION_DEGRADED
 
 
-def test_producer_cli_without_deadline_creates_local_deadline(monkeypatch):
+def test_producer_cli_without_deadline_passes_none_to_assess(monkeypatch):
+    # Issue #2401 P2-2 fix_delta: renamed (no behavior change) -- this test
+    # still fully replaces `assess()` and only confirms the CLI passes
+    # `None` through; the sibling `test_capability_preflight_review_fixes.
+    # test_assess_without_deadline_creates_one_shared_local_deadline` (AC4)
+    # is the one that proves the REAL local-deadline creation behavior.
     captured = {}
 
     def fake_assess(**kwargs):
