@@ -10,6 +10,7 @@ judgment; Issue #2340 In Scope item 5 keeps the lazy-attempt design).
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -28,18 +29,23 @@ _DEFAULT_REPO = "squne121/loop-protocol"
 
 
 def _assess_with_spark(monkeypatch, *, spark_mode, spark_fallback, binary_available, auth_available):
-    monkeypatch.setattr(wcp, "_github_auth_ok", lambda: True)
-    monkeypatch.setattr(wcp, "_github_repo_read_ok", lambda repo: True)
+    monkeypatch.setattr(wcp, "_github_auth_probe", lambda deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED))
+    monkeypatch.setattr(wcp, "_github_repo_read_probe", lambda repo, deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED))
     monkeypatch.setattr(wcp.trusted_uv_mod, "check_trusted_uv", lambda project_root: {
         "status": wcp.trusted_uv_mod.STATUS_OK, "reason": "resolved", "resolved_path": "/fake/uv"
     })
     monkeypatch.setattr(
         wcp,
         "_run_env_only_preflight",
-        lambda: {
-            "binary_available": binary_available,
-            "chatgpt_auth": {"available": auth_available},
-        },
+        lambda deadline_ns: wcp.ProbeOutcome(
+            wcp.PROBE_COMPLETED,
+            stdout=json.dumps(
+                {
+                    "binary_available": binary_available,
+                    "chatgpt_auth": {"available": auth_available},
+                }
+            ),
+        ),
     )
     monkeypatch.setattr(wcp.subprocess, "run", lambda *a, **k: __import__("subprocess").CompletedProcess([], 0))
     monkeypatch.setattr(wcp.shutil, "which", lambda name: None)
