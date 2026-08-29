@@ -2015,7 +2015,7 @@ jobs:
           set -e
           cp /tmp/combat-hud-running.vrt.test.ts.orig tests/component/combat-hud-running.vrt.test.ts
           exit "${probe_status}"
-      - name: Build VISUAL_BASELINE_REVIEW_EVIDENCE_V2 manifest
+      - name: Build VISUAL_BASELINE_REVIEW_EVIDENCE_V3 manifest
         # PR #2045 OWNER fix_delta P0-5 second-round REQUEST_CHANGES:
         # per-surface V2 manifest (one record per registered surface,
         # self-binding to its own contract digest + tamper-evidence digest)
@@ -2153,15 +2153,19 @@ jobs:
           uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
             --mode build-evidence-manifest \
             --surface-inputs-file surface_inputs.json \
-            --manifest-output /tmp/visual_baseline_review_evidence_v2.json
+            --manifest-output /tmp/visual_baseline_review_evidence.json \
+            --evidence-manifest-schema v3 \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GH_RUN_ATTEMPT" \
+            --head-sha "$GH_HEAD_SHA"
           {
             echo ""
-            echo "### VISUAL_BASELINE_REVIEW_EVIDENCE_V2 (Issue #2019 P0-5)"
+            echo "### VISUAL_BASELINE_REVIEW_EVIDENCE_V3 (Issue #2019 P0-5, Issue #2284 Phase B)"
             echo '```json'
-            cat /tmp/visual_baseline_review_evidence_v2.json
+            cat /tmp/visual_baseline_review_evidence.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload VISUAL_BASELINE_REVIEW_EVIDENCE_V2 manifest
+      - name: Upload VISUAL_BASELINE_REVIEW_EVIDENCE_V3 manifest
         id: upload-evidence-manifest
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
@@ -2173,7 +2177,7 @@ jobs:
           # `visual-impact-trusted-consumer.yml` `name=` filter can never
           # silently adopt an OLDER attempt's stale evidence manifest.
           name: component-vrt-evidence-manifest-${{ github.run_attempt }}
-          path: /tmp/visual_baseline_review_evidence_v2.json
+          path: /tmp/visual_baseline_review_evidence.json
           if-no-files-found: error
           retention-days: 30
       # --- end runtime evidence ---------------------------------------------
@@ -2558,7 +2562,7 @@ jobs:
             --changed-paths-typed-file changed_paths_typed.json \
             --changed-paths-file changed_paths.txt \
             --pr-body-file pr_body.md \
-            --evidence-manifest-file evidence-manifest-download/visual_baseline_review_evidence_v2.json \
+            --evidence-manifest-file evidence-manifest-download/visual_baseline_review_evidence.json \
             --codeowners-file base_codeowners.txt \
             --actor "${PR_ACTOR}" \
             --repository "${GITHUB_REPOSITORY}" \
