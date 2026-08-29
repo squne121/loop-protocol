@@ -259,13 +259,7 @@ transport/grounding 成功と扱う（詳細は `references/web-research-routing
 anchor comment により stale approval を無効化する場合も、raw snapshot は Step 4 に渡さず、正規化済み `anchor_comment_feedback` だけを渡す。
 
 **重要**: `review` phase（rewrite 前）では `decide_next_loop_action.py` を呼んではならない。
-`review` phase での routing は `produce` の stdout JSON トップレベル `canonical_step2_route`
-にそのまま従う（承認なら Step 2.5、要修正なら Step 4、`contract_readiness_human_judgment`
-な operator-only readiness（Issue #2397）なら Step 5 (operator intervention required)、
-genuine semantic / owner ambiguity の human_judgment_required なら Step 5 (human judgment
-required)、不整合なら fail-closed で停止）。`step_5_operator_intervention_required` は
-`step_5_human_judgment_required` とは独立した5番目の分岐であり、両者を同一の Step 5 停止と
-して丸めない（詳細は上記 routing table および `references/termination-policy.md` 参照）。
+`review` phase での routing は `produce` の stdout JSON トップレベル `canonical_step2_route` にそのまま従う（承認なら Step 2.5、要修正なら Step 4、operator-only readiness（`contract_readiness_human_judgment`, Issue #2397）なら Step 5 operator intervention、genuine semantic / owner ambiguity の human_judgment_required なら Step 5 human judgment、不整合なら fail-closed で停止）。`step_5_operator_intervention_required` は `step_5_human_judgment_required` とは独立した5番目の分岐であり、両者を同一の Step 5 停止として丸めない（詳細は上記 routing table および `references/termination-policy.md` 参照）。
 
 `decide_next_loop_action.py` は rewrite 後 / next-action 決定時にのみ呼ぶ:
 
