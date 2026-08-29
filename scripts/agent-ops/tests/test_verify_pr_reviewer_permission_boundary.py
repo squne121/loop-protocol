@@ -7,6 +7,15 @@ AC6: runtime evidence stays allowlist-only (no raw transcript/prompt/HOME/
 AC7: the script declares a bounded claim scope (repo_local distribution,
      no new schema/digest/receipt/publisher/state store, no gh api/GraphQL/
      HTTP client/plugin/server-side-authorization claims).
+
+PR #2385 review fix_delta:
+- P1-2: the `git_worktree` canary command is a real member of the guard's
+  deny-scoped worktree subcommand family but does not mutate real state
+  (`--dry-run`), and is deliberately not `git worktree list` (read-only,
+  never denied post-P1-2).
+- P1-3: `classify_positive_case()` requires the runner's own structured
+  `expected_markers_missing == []` evidence field, not a marker-substring
+  search against captured stdout.
 """
 
 from __future__ import annotations
@@ -15,6 +24,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -49,6 +59,66 @@ class TestBoundedClaimScopeDeclared:
             "plugin_distribution",
         ):
             assert scope[flag] is False, f"{flag} must be declared False"
+
+
+# ─── PR #2385 review fix_delta P1-2: git_worktree canary command ───────────
+
+
+class TestGitWorktreeCanaryCommand:
+    def test_canary_is_a_mutation_family_subcommand_not_list(self) -> None:
+        command = verifier.CASE_COMMANDS["git_worktree"]
+        assert command != "git worktree list", (
+            "git worktree list is read-only and never denied post-P1-2; it "
+            "is no longer a valid confirmed-deny canary signal"
+        )
+        assert command.split()[:2] == ["git", "worktree"]
+        subcommand = command.split()[2]
+        assert subcommand in {"add", "remove", "move", "prune", "repair", "lock", "unlock"}
+
+    def test_canary_command_is_dry_run_safe(self) -> None:
+        assert "--dry-run" in verifier.CASE_COMMANDS["git_worktree"]
+
+
+# ─── PR #2385 review fix_delta P1-3: classify_positive_case structured match ──
+
+
+class TestClassifyPositiveCaseStructuredMatch:
+    def _base_result(self, **overrides: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "process_error": None,
+            "exit_code": verifier.EXIT_OK,
+            "marker_observed": True,
+            "evidence": {"expected_markers_missing": []},
+        }
+        result.update(overrides)
+        return result
+
+    def test_pass_requires_empty_expected_markers_missing(self) -> None:
+        result = self._base_result()
+        assert verifier.classify_positive_case(result) == "pass"
+
+    def test_marker_observed_true_alone_is_not_sufficient(self) -> None:
+        """P1-3: a truthy `marker_observed` (stdout substring match) without
+        the runner's own structured `expected_markers_missing == []`
+        evidence must NOT be classified as pass."""
+        result = self._base_result(evidence={"expected_markers_missing": ["reviewer-reference-read-ok"]})
+        assert verifier.classify_positive_case(result) != "pass"
+
+    def test_missing_evidence_field_is_inconclusive_not_pass(self) -> None:
+        result = self._base_result(evidence={})
+        assert verifier.classify_positive_case(result) == "inconclusive"
+
+    def test_non_list_expected_markers_missing_is_inconclusive_not_pass(self) -> None:
+        result = self._base_result(evidence={"expected_markers_missing": None})
+        assert verifier.classify_positive_case(result) == "inconclusive"
+
+    def test_exit_fail_is_fail_regardless_of_evidence(self) -> None:
+        result = self._base_result(exit_code=verifier.EXIT_FAIL)
+        assert verifier.classify_positive_case(result) == "fail"
+
+    def test_exit_skip_is_inconclusive(self) -> None:
+        result = self._base_result(exit_code=verifier.EXIT_SKIP)
+        assert verifier.classify_positive_case(result) == "inconclusive"
 
 
 # ─── AC6: no_authority_artifacts_or_sensitive_output ────────────────────────

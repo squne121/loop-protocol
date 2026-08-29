@@ -81,8 +81,16 @@ REFERENCE_READ_MARKER = "reviewer-reference-read-ok"
 # Issue #1881 canonical mutation command families (AC5). `git_worktree` is
 # the mandatory canary -- a local, non-GitHub-mutating operation -- and is
 # never itself one of the requested `--cases`.
+#
+# PR #2385 review fix_delta (P1-2): the canary uses `git worktree prune
+# --dry-run` -- a real member of the guard's deny-scoped `worktree`
+# subcommand family (`add|remove|move|prune|repair|lock|unlock`), but
+# `--dry-run` means it never actually mutates repo state. `git worktree
+# list` is deliberately NOT used here anymore: it is read-only and the
+# guard (post P1-2) never denies it, so it would no longer be a valid
+# confirmed-deny canary signal.
 CASE_COMMANDS: dict[str, str] = {
-    "git_worktree": "git worktree list",
+    "git_worktree": "git worktree prune --dry-run",
     "git_commit": "git commit -m 'pr-reviewer-permission-boundary-probe' --allow-empty",
     "git_push": "git push origin HEAD",
     "gh_pr_review": "gh pr review 1 --comment --body 'pr-reviewer-permission-boundary-probe'",
@@ -362,12 +370,28 @@ def classify_deny_case(result: dict[str, Any], expect_marker: str) -> str:
 
 
 def classify_positive_case(result: dict[str, Any]) -> str:
-    """Returns 'pass' | 'fail' | 'inconclusive'."""
+    """Returns 'pass' | 'fail' | 'inconclusive'.
+
+    PR #2385 review fix_delta (P1-3): PASS requires the runner's own
+    structured evidence field (``expected_markers_missing == []``, computed
+    by ``run_worktree_agent_runtime_smoke.py`` from the structured-lane
+    hook/stream-json channel) rather than this script re-deriving a
+    marker-substring match against ``result["marker_observed"]`` (a
+    substring check against this wrapper's own captured stdout, which for
+    the structured lane is not the authoritative signal -- the runner
+    prints only a terminal ``OK:``/``[FAIL]``/``SKIP:`` line to its own
+    stdout, not the raw hook output). A missing or malformed
+    ``expected_markers_missing`` field is treated as inconclusive, never a
+    silent PASS.
+    """
     if result.get("process_error") is not None:
         return "inconclusive"
     if result["exit_code"] == EXIT_SKIP:
         return "inconclusive"
-    if result["exit_code"] == EXIT_OK and result.get("marker_observed"):
+    evidence = result.get("evidence") or {}
+    missing_markers = evidence.get("expected_markers_missing")
+    exact_structured_match = isinstance(missing_markers, list) and missing_markers == []
+    if result["exit_code"] == EXIT_OK and exact_structured_match:
         return "pass"
     if result["exit_code"] == EXIT_FAIL:
         return "fail"
