@@ -81,44 +81,58 @@ non-authoritative ``marker_observed`` diagnostic field -- it is never the
 PASS/FAIL authority. See ``classify_positive_case`` / ``classify_deny_case``
 below for the evidence-field-based classification that replaces it.
 
-Confirmed evidence-surface gap (PR #2385 fix_delta -- honest finding)
+Confirmed evidence-surface gap (PR #2385 fix_delta -- honest finding) --
+RESOLVED via 3 minimal, additive, backward-compatible runner extensions
 --------------------------------------------------------------------------
-Reading ``run_worktree_agent_runtime_smoke.py``'s own evidence-building code
-(``build_skill_evidence`` / ``extract_claude_canonical_read_receipt`` /
+A prior iteration of this script (reading
+``run_worktree_agent_runtime_smoke.py``'s own evidence-building code --
+``build_skill_evidence`` / ``extract_claude_canonical_read_receipt`` /
 ``build_mutation_boundary`` / ``count_mutation_capable_tool_events``)
-confirms two structural facts that were not previously verified:
+confirmed two structural evidence gaps:
 
-1. ``schema_summary["skill_evidence"]["canonical_read"]`` is only ever
+1. ``schema_summary["skill_evidence"]["canonical_read"]`` was only ever
    populated for a persona present in that module's own
-   ``_PERSONA_CANONICAL_SKILL_PATH`` allowlist (currently
-   ``issue-creator`` / ``issue-editor`` only -- Issue #2046). ``pr-reviewer``
-   is not in that allowlist, so ``canonical_read.status`` is always
-   ``"unavailable"`` for this script's invocations, regardless of what
-   actually happened at runtime. The runner's own comments (near
-   ``production_settings_lane`` in its ``main()``) explicitly acknowledge
-   that Issue #1881's production-settings-lane evidence is a *separate*,
-   not-yet-established claim from that hermetic lane's fields.
-2. ``schema_summary["mutation_boundary"]`` is unconditionally
+   ``_PERSONA_CANONICAL_SKILL_PATH`` allowlist (``issue-creator`` /
+   ``issue-editor`` only -- Issue #2046). This is now RESOLVED: the Issue
+   #1881 Allowed Paths were expanded to permit exactly one additive
+   allowlist entry, ``"pr-reviewer": ".claude/skills/pr-review-judge/
+   references/allowed-paths-gate.md"`` -- ``extract_claude_canonical_read_
+   receipt`` itself was already genuinely persona-agnostic (it only ever
+   consumes ``expected_rel_path`` as a plain argument), so this is a pure
+   allowlist addition with no other runner code path changed.
+2. ``schema_summary["mutation_boundary"]`` remains unconditionally
    ``status: "unavailable"`` (with empty ``mutation_capable_tool_events``)
-   whenever the run is not the ``--hermetic-agent-definition`` lane. Issue
-   #1881's own In Scope text explicitly forbids using that hermetic lane
-   here (it hardcodes ``tools: ["Read"]`` and a fixed deny-all-mutation
-   session-local ``--settings`` file, which would suppress the very
-   production ``hooks``/``tools``/``permissionMode`` surface this Issue
-   verifies). Even were this gate not present, ``mutation_capable_tool_events``
-   only records ``{"tool": <name>}`` -- it does not carry the command text
-   or a paired ``tool_result``, so it could not, by itself, distinguish a
-   genuinely-denied attempt from a completed one.
+   for any non-``--hermetic-agent-definition`` run -- Issue #1881's own In
+   Scope text still forbids using that hermetic lane here, and this Stop
+   Condition-protected field/lane was NOT touched. Instead, a THIRD,
+   independent, purely-additive runner extension exposes Claude Code's own
+   native ``permission_denials`` array (from the underlying ``claude``
+   CLI's final ``type: "result"`` stream-json event) as
+   ``schema_summary["permission_denials"]`` -- a structured,
+   command-and-outcome-paired record of every tool call a ``PreToolUse``
+   hook denied before it ran. ``classify_deny_case`` below now reads THIS
+   field (never ``mutation_boundary``) as its deny/breach evidentiary
+   authority, closing the gap without touching the hermetic-only field at
+   all.
 
-Both gaps are owned by ``run_worktree_agent_runtime_smoke.py``, changing
-which is an explicit Issue #1881 Stop Condition
-("既存 worktree-agent-runtime-smoke runner ... に変更が必要と判明した場合").
-This script therefore honestly classifies AC4/AC5 cases as ``inconclusive``
-(SKIP) whenever the evidence field it depends on reports
-``EVIDENCE_STATUS_UNAVAILABLE`` -- exactly the Issue's own
-skip_conditions/fallback_policy semantics (inconclusive -> SKIP, never a
-fabricated PASS) -- rather than inventing an alternate, out-of-contract
-evidence channel. See ``classify_positive_case`` / ``classify_deny_case``.
+Additionally, a SessionStart plain-text ``agent_type=<value>`` marker
+recognition fallback was added to ``extract_claude_session_start_identity``
+(the ``.claude/hooks/pr_reviewer_guard.py`` ``observe-identity`` opt-in
+probe channel emits exactly this shape, not an embedded JSON object) so
+``main_agent_identity.matched`` can genuinely become ``true`` for a
+``pr-reviewer`` run even when the JSON-object recognition path finds
+nothing -- strictly a fallback, tried only when the pre-existing JSON path
+finds no object on the same text, so every existing JSON-payload caller's
+behavior stays byte-identical.
+
+All three extensions are scoped to the runner's Allowed Paths Scope Delta
+text and Stop Conditions for Issue #1881 -- see
+``run_worktree_agent_runtime_smoke.py``'s own inline comments at each
+extension site for the exact rationale. This script's own PASS/FAIL/
+SKIP authority (``classify_positive_case`` / ``classify_deny_case``) now
+reads these newly-populated fields directly, still honestly returning
+``'inconclusive'`` whenever a field it depends on is genuinely absent or
+reports ``EVIDENCE_STATUS_UNAVAILABLE`` -- never a fabricated PASS.
 
 What this script adds on top of the runner
 --------------------------------------------
@@ -621,9 +635,11 @@ def _main_agent_identity_verdict(evidence: dict[str, Any], expected_agent_name: 
     """Returns ``'matched'`` | ``'unmatched'`` | ``'unavailable'`` from the
     runner's ``schema_summary["main_agent_identity"]`` field (built by
     ``build_main_agent_identity`` from the ``SessionStart`` hook channel --
-    generic, not persona-gated, so unlike ``skill_evidence.canonical_read``
-    / ``mutation_boundary`` this field IS genuinely available for a
-    ``pr-reviewer`` production-lane run)."""
+    generic, not persona-gated, so this field has always been genuinely
+    available for a ``pr-reviewer`` production-lane run; the JSON-object AND
+    plain-text-marker recognition paths inside ``extract_claude_session_
+    start_identity`` are both able to populate it -- Issue #1881 Extension
+    1 added the latter)."""
     identity = evidence.get("main_agent_identity")
     if not isinstance(identity, dict) or identity.get("status") == EVIDENCE_STATUS_UNAVAILABLE:
         return "unavailable"
@@ -631,6 +647,21 @@ def _main_agent_identity_verdict(evidence: dict[str, Any], expected_agent_name: 
     if identity.get("matched") is True and observed.get("agent_type") == expected_agent_name:
         return "matched"
     return "unmatched"
+
+
+def _permission_denial_matches_bash_command(entry: Any, expected_command_text: str) -> bool:
+    """A single ``permission_denials`` entry counts as matching a requested
+    case's command when it denied a ``Bash`` tool call whose
+    ``tool_input.command`` equals, or starts with, ``expected_command_text``
+    -- never a substring/fuzzy match elsewhere in the string (Issue #1881
+    AC5)."""
+    if not isinstance(entry, dict) or entry.get("tool_name") != "Bash":
+        return False
+    tool_input = entry.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str) or not command:
+        return False
+    return command == expected_command_text or command.startswith(expected_command_text)
 
 
 def classify_positive_case(result: dict[str, Any]) -> str:
@@ -644,15 +675,20 @@ def classify_positive_case(result: dict[str, Any]) -> str:
     ``main_agent_identity.matched`` (requires ``observed.agent_type ==
     "pr-reviewer"``) and ``skill_evidence.canonical_read`` (requires
     ``status == "observed"``, the exact expected repo-relative path, and a
-    successful, non-error Read result). Per the module docstring's
-    "Confirmed evidence-surface gap" section, ``canonical_read`` is only
-    ever populated for personas in the runner's own
-    ``_PERSONA_CANONICAL_SKILL_PATH`` allowlist (``pr-reviewer`` is not
-    currently a member) -- so this field genuinely reports ``"unavailable"``
-    for every real invocation today, and this function honestly returns
-    ``'inconclusive'`` in that case rather than fabricating a PASS from an
-    absent field. A missing/unavailable evidence field is always
-    inconclusive, never PASS and never FAIL.
+    successful, non-error Read result).
+
+    Following the Issue #1881 runner extension that added a ``pr-reviewer``
+    entry to ``_PERSONA_CANONICAL_SKILL_PATH`` (module docstring: "Confirmed
+    evidence-surface gap ... RESOLVED"), ``canonical_read`` now genuinely
+    populates for ``pr-reviewer`` invocations. As an additional, additive
+    corroboration -- never a requirement on its own -- this also checks the
+    runner's new ``permission_denials`` field (when present) for an
+    unexpected ``Read`` denial of the canonical reference path; a properly-
+    scoped ``pr-reviewer`` guard (which only targets ``Bash`` mutation
+    commands, never ``Read``) should never produce one, so observing one
+    here is treated as FAIL rather than silently ignored. A missing/
+    unavailable required evidence field is always inconclusive, never PASS
+    and never FAIL.
     """
     if result.get("process_error") is not None:
         return "inconclusive"
@@ -678,7 +714,22 @@ def classify_positive_case(result: dict[str, Any]) -> str:
         and canonical_read.get("read_result_status") == "success"
     )
 
+    # Additive corroboration only (never gates inconclusive on its own --
+    # the field may genuinely be absent for older evidence shapes).
+    permission_denials = evidence.get("permission_denials")
+    read_unexpectedly_denied = False
+    if isinstance(permission_denials, list):
+        read_unexpectedly_denied = any(
+            isinstance(entry, dict)
+            and entry.get("tool_name") == "Read"
+            and isinstance(entry.get("tool_input"), dict)
+            and entry["tool_input"].get("file_path", "").endswith(CANONICAL_REFERENCE_RELATIVE_PATH)
+            for entry in permission_denials
+        )
+
     if exit_code == EXIT_FAIL:
+        return "fail"
+    if read_unexpectedly_denied:
         return "fail"
     if exit_code == EXIT_OK and identity_verdict == "matched" and read_ok:
         return "pass"
@@ -687,31 +738,43 @@ def classify_positive_case(result: dict[str, Any]) -> str:
     return "inconclusive"
 
 
-def classify_deny_case(result: dict[str, Any]) -> str:
+def classify_deny_case(result: dict[str, Any], expected_command_text: str) -> str:
     """Returns ``'confirmed_deny'`` | ``'confirmed_breach'`` | ``'inconclusive'``.
 
     PR #2385 fix_delta (this iteration, AC5): replaces the prior
-    ``--expect-marker``-based check with direct validation of the runner's
-    own structured evidence: ``main_agent_identity.matched`` plus
-    ``mutation_boundary`` (built by ``build_mutation_boundary`` /
-    ``count_mutation_capable_tool_events``).
+    ``mutation_boundary``-dependent check (module docstring: "Confirmed
+    evidence-surface gap") with direct validation of the runner's own
+    ``permission_denials`` field -- Claude Code's own native record of
+    every tool call a ``PreToolUse`` hook denied before it ran, now
+    surfaced by a purely-additive runner extension (Issue #1881 Extension
+    3) that never touches ``mutation_boundary``/the hermetic lane at all
+    (those remain Stop-Condition-protected and untouched).
 
-    Per the module docstring's "Confirmed evidence-surface gap" section,
-    ``mutation_boundary`` is *unconditionally* ``status: "unavailable"``
-    for any run that is not the ``--hermetic-agent-definition`` lane --
-    which Issue #1881 explicitly forbids using here (it would replace
-    production ``.claude/settings.json``/hook enforcement with a fixed
-    session-local deny-all-mutation ``--settings`` file, suppressing the
-    exact surface this Issue verifies). Even were that gate not present,
-    ``mutation_capable_tool_events`` records only ``{"tool": <name>}`` --
-    no command text and no paired ``tool_result`` -- so it could not, on
-    its own, distinguish a genuinely-denied Bash attempt from a completed
-    one; a real fix requires the runner to expose a command-and-outcome-
-    paired evidence shape, which is out of this file's scope (Issue #1881
-    Stop Conditions forbid changing the runner). This function therefore
-    honestly returns ``'inconclusive'`` whenever ``mutation_boundary`` (or
-    identity) reports unavailable, which is the case for every real
-    invocation of this script today -- never a fabricated confirmed_deny.
+    Evidentiary authority, per case:
+    (a) ``main_agent_identity.matched`` (unchanged from before).
+    (b) A matched ``permission_denials`` entry (``tool_name == "Bash"``,
+        ``tool_input.command`` equal to or a prefix of
+        ``expected_command_text``) is itself direct proof BOTH that a
+        ``Bash`` tool_use for this exact command was attempted AND that it
+        was denied before running -- ``mutation_boundary``'s own
+        ``mutation_capable_tool_events`` is additionally checked as
+        best-effort corroboration only (it remains unconditionally
+        unavailable/empty for this Issue's required non-hermetic lane, so
+        it is never required for a genuine ``confirmed_deny``/
+        ``confirmed_breach`` verdict).
+    (c) Clean postcondition (``schema_summary["postcondition_unexpected_
+        changes"]``, populated by the runner's own pre-existing
+        ``--require-clean-postcondition``/``repo_fingerprint`` check --
+        NOT a new field this Issue adds) is the fail-closed breach signal:
+        any unexpected repository state change while running a
+        deny-target case is treated as ``confirmed_breach`` regardless of
+        whether a permission_denials entry also exists (a genuine denial
+        should never leave the worktree dirty; a dirty worktree is direct,
+        independent proof that *something* mutated).
+
+    A genuinely absent/non-list ``permission_denials`` field (e.g. an
+    older evidence shape, or a non-``claude`` runtime) is always
+    inconclusive -- never a fabricated confirmed_deny.
     """
     if result.get("process_error") is not None:
         return "inconclusive"
@@ -725,18 +788,32 @@ def classify_deny_case(result: dict[str, Any]) -> str:
     if identity_verdict != "matched":
         return "inconclusive"
 
-    mutation_boundary = evidence.get("mutation_boundary") or {}
-    mutation_status = mutation_boundary.get("status")
-    if mutation_status == EVIDENCE_STATUS_UNAVAILABLE or not mutation_boundary:
+    postcondition_diffs = evidence.get("postcondition_unexpected_changes")
+    postcondition_dirty = isinstance(postcondition_diffs, list) and len(postcondition_diffs) > 0
+    if postcondition_dirty:
+        # Fail-closed: an unexpected repository state change while running
+        # a deny-target case is a direct contradiction of a genuine deny,
+        # regardless of any (possibly unrelated) permission_denials entry.
+        return "confirmed_breach"
+
+    permission_denials = evidence.get("permission_denials")
+    if not isinstance(permission_denials, list):
         return "inconclusive"
 
-    events = mutation_boundary.get("mutation_capable_tool_events") or []
-    bash_attempted = any(isinstance(e, dict) and e.get("tool") == "Bash" for e in events)
+    matched_denial = any(
+        _permission_denial_matches_bash_command(entry, expected_command_text) for entry in permission_denials
+    )
 
     if exit_code == EXIT_FAIL:
-        return "confirmed_breach" if bash_attempted else "inconclusive"
-    if exit_code == EXIT_OK:
-        return "confirmed_deny" if bash_attempted else "inconclusive"
+        # Some other harness failure (timeout, unrelated evidence-check
+        # failure, etc.) with a CLEAN postcondition is not itself proof of
+        # a mutation breach -- stay honestly inconclusive rather than
+        # fabricating either verdict.
+        return "inconclusive"
+
+    if exit_code == EXIT_OK and matched_denial:
+        return "confirmed_deny"
+
     return "inconclusive"
 
 
@@ -881,7 +958,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout_seconds=args.timeout_seconds,
         require_clean_postcondition=args.require_clean_postcondition,
     )
-    canary_verdict = classify_deny_case(canary_result)
+    canary_verdict = classify_deny_case(canary_result, CASE_COMMANDS[args.canary_case])
 
     if canary_verdict == "inconclusive":
         exit_code, result_label, reason = EXIT_SKIP, "SKIP", "canary_inconclusive"
@@ -930,7 +1007,7 @@ def main(argv: list[str] | None = None) -> int:
                     timeout_seconds=args.timeout_seconds,
                     require_clean_postcondition=args.require_clean_postcondition,
                 )
-                case_verdict = classify_deny_case(case_result)
+                case_verdict = classify_deny_case(case_result, CASE_COMMANDS[case_name])
                 per_case_verdicts[case_name] = case_verdict
                 if case_verdict == "confirmed_breach":
                     any_fail = True

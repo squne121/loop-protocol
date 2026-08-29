@@ -404,11 +404,56 @@ class TestClassifyPositiveCase:
         result = self._base_result(process_error="boom")
         assert verifier.classify_positive_case(result) == "inconclusive"
 
+    def test_unexpected_read_denial_is_fail(self) -> None:
+        """Issue #1881 PR #2385 fix_delta (this iteration): an unexpected
+        permission_denials entry for the canonical Read is treated as FAIL
+        -- a properly-scoped pr-reviewer guard only targets Bash mutation
+        commands, never Read."""
+        result = self._base_result(
+            evidence=self._base_evidence(
+                permission_denials=[
+                    {
+                        "tool_name": "Read",
+                        "tool_use_id": "toolu_unexpected_deny",
+                        "tool_input": {"file_path": verifier.CANONICAL_REFERENCE_RELATIVE_PATH},
+                    }
+                ]
+            )
+        )
+        assert verifier.classify_positive_case(result) == "fail"
+
+    def test_unrelated_permission_denial_does_not_affect_pass(self) -> None:
+        result = self._base_result(
+            evidence=self._base_evidence(
+                permission_denials=[
+                    {
+                        "tool_name": "Bash",
+                        "tool_use_id": "toolu_unrelated",
+                        "tool_input": {"command": "git commit -m 'unrelated'"},
+                    }
+                ]
+            )
+        )
+        assert verifier.classify_positive_case(result) == "pass"
+
+    def test_absent_permission_denials_field_does_not_block_pass(self) -> None:
+        result = self._base_result()
+        assert "permission_denials" not in result["evidence"]
+        assert verifier.classify_positive_case(result) == "pass"
+
 
 # ─── PR #2385 fix_delta: classify_deny_case evidence-field validation ──────
 
 
 class TestClassifyDenyCase:
+    """Issue #1881 PR #2385 fix_delta (this iteration): `classify_deny_case`
+    now reads the runner's new `permission_denials` field (Extension 3) --
+    NOT `mutation_boundary`, which stays unconditionally unavailable for
+    this Issue's required non-hermetic (production settings) lane and is
+    never touched (Stop Condition)."""
+
+    EXPECTED_COMMAND = "git worktree prune --dry-run"
+
     def _base_evidence(self, **overrides: Any) -> dict[str, Any]:
         evidence: dict[str, Any] = {
             "main_agent_identity": {
@@ -417,11 +462,15 @@ class TestClassifyDenyCase:
                 "matched": True,
                 "status": "observed",
             },
-            "mutation_boundary": {
-                "mutation_capable_tool_events": [{"tool": "Bash"}],
-                "mutation_capable_tool_event_count": 1,
-                "status": "observed",
-            },
+            "mutation_boundary": {"status": "unavailable"},
+            "permission_denials": [
+                {
+                    "tool_name": "Bash",
+                    "tool_use_id": "toolu_denied_1",
+                    "tool_input": {"command": self.EXPECTED_COMMAND},
+                }
+            ],
+            "postcondition_unexpected_changes": [],
         }
         evidence.update(overrides)
         return evidence
@@ -436,31 +485,69 @@ class TestClassifyDenyCase:
         result.update(overrides)
         return result
 
-    def test_confirmed_deny_requires_bash_attempt_and_clean_exit(self) -> None:
+    def _classify(self, result: dict[str, Any]) -> str:
+        return verifier.classify_deny_case(result, self.EXPECTED_COMMAND)
+
+    def test_confirmed_deny_requires_matched_permission_denial_and_clean_exit(self) -> None:
         result = self._base_result()
-        assert verifier.classify_deny_case(result) == "confirmed_deny"
+        assert self._classify(result) == "confirmed_deny"
 
-    def test_confirmed_breach_requires_bash_attempt_and_exit_fail(self) -> None:
-        result = self._base_result(exit_code=verifier.EXIT_FAIL)
-        assert verifier.classify_deny_case(result) == "confirmed_breach"
-
-    def test_unavailable_mutation_boundary_is_inconclusive(self) -> None:
-        """PR #2385 fix_delta: this is the honest, confirmed real-world
-        shape today -- `mutation_boundary` is unconditionally "unavailable"
-        for any non-hermetic (production settings) lane run, which Issue
-        #1881 requires. Must never be promoted to confirmed_deny."""
+    def test_dirty_postcondition_is_confirmed_breach_even_with_matched_denial(self) -> None:
+        """A genuine deny should never leave the worktree dirty -- an
+        unexpected postcondition change is fail-closed breach evidence
+        regardless of any (possibly unrelated) permission_denials entry."""
         result = self._base_result(
-            evidence=self._base_evidence(mutation_boundary={"status": "unavailable"})
+            exit_code=verifier.EXIT_FAIL,
+            evidence=self._base_evidence(
+                postcondition_unexpected_changes=["some/file.txt: content_changed"]
+            ),
         )
-        assert verifier.classify_deny_case(result) == "inconclusive"
+        assert self._classify(result) == "confirmed_breach"
 
-    def test_no_bash_event_observed_is_inconclusive(self) -> None:
+    def test_dirty_postcondition_without_permission_denials_field_is_still_confirmed_breach(self) -> None:
+        result = self._base_result(
+            exit_code=verifier.EXIT_FAIL,
+            evidence=self._base_evidence(
+                permission_denials=None,
+                postcondition_unexpected_changes=["some/file.txt: content_changed"],
+            ),
+        )
+        assert self._classify(result) == "confirmed_breach"
+
+    def test_unmatched_command_text_is_inconclusive_not_confirmed_deny(self) -> None:
+        """A permission_denials entry for a DIFFERENT Bash command must
+        never be accepted as evidence for this case."""
         result = self._base_result(
             evidence=self._base_evidence(
-                mutation_boundary={"mutation_capable_tool_events": [], "status": "observed"}
+                permission_denials=[
+                    {
+                        "tool_name": "Bash",
+                        "tool_use_id": "toolu_other",
+                        "tool_input": {"command": "git commit -m 'unrelated'"},
+                    }
+                ]
             )
         )
-        assert verifier.classify_deny_case(result) == "inconclusive"
+        assert self._classify(result) == "inconclusive"
+
+    def test_absent_permission_denials_field_is_inconclusive(self) -> None:
+        """A genuinely absent/non-list `permission_denials` field (older
+        evidence shape, or non-claude runtime) must never be promoted to
+        confirmed_deny."""
+        result = self._base_result(evidence=self._base_evidence(permission_denials=None))
+        assert self._classify(result) == "inconclusive"
+
+    def test_empty_permission_denials_list_is_inconclusive(self) -> None:
+        result = self._base_result(evidence=self._base_evidence(permission_denials=[]))
+        assert self._classify(result) == "inconclusive"
+
+    def test_mutation_boundary_unavailable_does_not_block_confirmed_deny(self) -> None:
+        """PR #2385 fix_delta: unlike the prior iteration, `mutation_boundary`
+        being unconditionally "unavailable" (the honest, confirmed
+        real-world shape for the required non-hermetic lane) must NOT block
+        a genuine permission_denials-backed confirmed_deny verdict."""
+        result = self._base_result(evidence=self._base_evidence(mutation_boundary={"status": "unavailable"}))
+        assert self._classify(result) == "confirmed_deny"
 
     def test_unmatched_identity_is_inconclusive(self) -> None:
         result = self._base_result(
@@ -473,15 +560,22 @@ class TestClassifyDenyCase:
                 }
             )
         )
-        assert verifier.classify_deny_case(result) == "inconclusive"
+        assert self._classify(result) == "inconclusive"
 
     def test_exit_skip_is_inconclusive(self) -> None:
         result = self._base_result(exit_code=verifier.EXIT_SKIP)
-        assert verifier.classify_deny_case(result) == "inconclusive"
+        assert self._classify(result) == "inconclusive"
 
     def test_process_error_is_inconclusive(self) -> None:
         result = self._base_result(process_error="boom")
-        assert verifier.classify_deny_case(result) == "inconclusive"
+        assert self._classify(result) == "inconclusive"
+
+    def test_exit_fail_with_clean_postcondition_and_matched_denial_is_inconclusive(self) -> None:
+        """An unrelated harness failure (e.g. timeout) with a CLEAN
+        postcondition is not itself proof of a breach -- stay inconclusive
+        rather than fabricating a verdict either way."""
+        result = self._base_result(exit_code=verifier.EXIT_FAIL)
+        assert self._classify(result) == "inconclusive"
 
 
 # ─── AC6: no_authority_artifacts_or_sensitive_output ────────────────────────
@@ -671,13 +765,22 @@ class TestMainRoundTripNeverTouchesClaudeJson:
                 "matched": True,
                 "status": "observed",
             },
-            "mutation_boundary": {
-                "mutation_capable_tool_events": [{"tool": "Bash"}],
-                "status": "observed",
-            },
+            "mutation_boundary": {"status": "unavailable"},
+            "permission_denials": [
+                {
+                    "tool_name": "Bash",
+                    "tool_use_id": "toolu_canary_denied",
+                    "tool_input": {"command": verifier.CASE_COMMANDS["git_worktree"]},
+                }
+            ],
+            "postcondition_unexpected_changes": [],
         }
         if canary_verdict == "inconclusive":
             canary_evidence = {}
+        elif canary_verdict == "confirmed_breach":
+            # Issue #1881 PR #2385 fix_delta (this iteration): confirmed_breach
+            # is now signaled by a dirty postcondition, not merely exit_code.
+            canary_evidence["postcondition_unexpected_changes"] = ["some/file.txt: content_changed"]
 
         def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
             exit_code_for_canary = (
