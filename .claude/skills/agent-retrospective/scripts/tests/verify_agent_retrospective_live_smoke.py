@@ -13,42 +13,74 @@ instead of hand-assembling ``SourcePlan``/``Evaluation`` and calling
 ``rr.finalize()`` directly in this process (the prior design, which never
 executed the root Skill or the real observer wave at all).
 
-Known, independently-confirmed production architecture gap (out of this
-fix_delta's Allowed Paths to change -- `run_retrospective.py` is not
-editable here): `run_cli()`/`main()` generate `run_id` as a *fresh*
-`uuid.uuid4()` inside the call, with no CLI flag to pre-seed it. Any real
-caller of the documented CLI entrypoint (including the root Skill session
-launched below) therefore cannot know `ctx.run_id` ahead of time when
-composing `--prompts-file` observer prompts -- so this verifier does not
-try to guess it (previous versions of the observer-wave-bypassing test
-data are not reused here). No `--prompts-file` is passed at all, so
-`run_retrospective.py` runs with the documented empty-prompts default
-(`prompts.get(observer_id, "")` -> `""`).
+No `--prompts-file` is passed at all, so `run_retrospective.py` runs with
+its `--prompts-file`-omitted default prompt generation (see the
+Correction/Fix paragraphs below). `run_cli()`/`main()` generate `run_id`
+as a *fresh* `uuid.uuid4()` inside the call, with no CLI flag to pre-seed
+it, so this verifier cannot pre-compute it either -- but as of Issue #2345
+fix_delta (below), that no longer matters: `run_retrospective.py` itself
+threads the REAL `ctx.run_id`/`ctx.base_sha`/`plan.source_set_digest` into
+its own default prompt, generated AFTER its internal `prepare()` step, so
+this verifier does not need to guess or pre-seed any identity value.
 
 Correction (PR #2342 fix_delta, OWNER review
 https://github.com/squne121/loop-protocol/pull/2342#issuecomment-5411607690,
 P2 item 3): this module previously documented that the empty-prompts
 default deterministically resolves to `ObserverWaveFailed`'s
-`bundle.run_id != ctx.run_id` bundle-validation check. That claim does NOT
+`bundle.run_id != ctx.run_id` bundle-validation check. That claim did NOT
 hold against the real `claude` CLI as actually observed (Claude Code
-2.1.245): `claude -p` rejects an empty prompt argument *before* any
-observer output is produced at all --
+2.1.245): `claude -p` rejected an empty prompt argument *before* any
+observer output was produced at all --
 ``Error: Input must be provided either through stdin or as a prompt
 argument when using --print``, exit code 1 -- which
-`run_retrospective.py`'s `invoke_agent()` surfaces as
+`run_retrospective.py`'s `invoke_agent()` surfaced as
 `status="api_error"` / `reason_code="nonzero_exit"` on the
 `observer_failed:<agent>:<status>` `ObserverWaveFailed` raise site (never
-reaching the `bundle.run_id != ctx.run_id` check). `nonzero_exit` is
+reaching the `bundle.run_id != ctx.run_id` check). This was an
+empty-prompt invocation contract mismatch between this module's (former)
+default and the real CLI's documented `-p` contract -- a caller-side
+default that never supplied a prompt at all -- not a Claude Code CLI-side
+regression; rejecting an explicitly empty prompt is reasonable
+caller-contract enforcement on the CLI's part. `nonzero_exit` is
 intentionally NOT allowlisted below (see
-`_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES`), so this verifier
-currently FAILs (exit 1) on this path rather than reaching the exit-0
-typed-failure branch this docstring previously (incorrectly) documented as
-the deterministic outcome. This is a separately-tracked follow-up, not
-`run_retrospective.py`'s `ObserverWaveFailed` reason_code diagnosability
-work Issue #2341 / PR #2342 itself addresses -- see Issue #2345
-(https://github.com/squne121/loop-protocol/issues/2345). Issue #2239
-AC6/AC7 still accept either a `PUBLISH_REQUEST_V1` or a typed failure
-envelope, as long as it is parseable, so this verifier treats a
+`_ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES`) -- this verifier used to
+unintentionally FAIL (exit 1) on this path rather than reach the intended
+outcome this docstring previously (incorrectly) documented as
+deterministic. This verifier-side gap, and its fix, are tracked separately
+from `run_retrospective.py`'s `ObserverWaveFailed` reason_code
+diagnosability work Issue #2341 / PR #2342 itself addresses -- see Issue
+#2345 (https://github.com/squne121/loop-protocol/issues/2345).
+
+Fix (Issue #2345 fix_delta, OWNER review
+https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+P1 items 1-2): `run_retrospective.py`'s `main()` no longer defaults an
+omitted `--prompts-file` to an empty-string prompt per observer_id, and
+its default-prompt path is no longer a construct-to-fail fixed-placeholder
+identity either (an earlier fix_delta iteration of this Issue used a fixed
+placeholder `run_id` that could never equal the real one, deliberately
+making every default-prompt invocation fail at
+`run_observer_wave()`'s `bundle.run_id != ctx.run_id` check -- see the
+OWNER review URL above). `run_cli()` now builds the default prompt for
+every manifest entry AFTER its own internal `prepare()` step, threading
+that run's REAL `ctx.run_id`/`ctx.base_sha`/`plan.source_set_digest` in --
+see `_default_observer_prompt()`'s docstring. A real, successful
+invocation of this default prompt therefore neither trips the CLI's own
+empty-prompt rejection NOR the identity-mismatch check, and the real
+production call graph can now genuinely continue past the observer wave
+into the evaluator, delta, and `finalize` phases -- i.e. the PRIMARY
+expected outcome of this verifier's `--prompts-file`-omitted invocation is
+now a full `PublishRequest` (`status: "pass"` below), not the
+`observer_run_id_mismatch` typed-failure envelope. `observer_run_id_mismatch`
+remains allowlisted below only defensively (e.g. if a future
+`_default_observer_prompt()` change reintroduces a real-but-momentarily-
+stale identity race) -- it is no longer the expected steady-state outcome
+of a successful default-prompt observer wave. `nonzero_exit` remains
+correctly NOT allowlisted regardless (a `nonzero_exit` from any cause --
+e.g. a genuine CLI/auth/runtime fault -- must still FAIL this verifier,
+not be silently accepted).
+
+Issue #2239 AC6/AC7 still accept either a `PUBLISH_REQUEST_V1` or a typed
+failure envelope, as long as it is parseable, so this verifier treats a
 well-formed typed failure as `status: "fail"` (not `"skip"`) and asserts
 the invariants that are meaningful regardless of which branch production
 took: schema-parseable output, `tested_head` match, repository fingerprint
@@ -99,12 +131,17 @@ _FORBIDDEN_MUTATION_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEd
 
 #: Issue #2341 AC2 -- regression coverage gap fix. This verifier does not
 #: pass `--prompts-file` to `run_retrospective.py` (see the module
-#: docstring above), so an observer wave that actually reaches bundle
+#: docstring above), so IF an observer wave were to reach bundle
 #: validation against the real `retrospective-runtime-observer` leaf
-#: SubAgent can resolve to `ObserverWaveFailed` at `bundle.run_id !=
-#: ctx.run_id` (see `run_observer_wave()`) -- a KNOWN, expected, benign
-#: failure this verifier's docstring (and Issue #2239 AC6/AC7) explicitly
-#: accept as a well-formed typed-failure terminal outcome.
+#: SubAgent with a stale/mismatched identity, it could resolve to
+#: `ObserverWaveFailed` at `bundle.run_id != ctx.run_id` (see
+#: `run_observer_wave()`) -- a well-formed typed-failure terminal outcome
+#: this verifier's docstring (and Issue #2239 AC6/AC7) explicitly accept.
+#: As of Issue #2345 fix_delta (see the module docstring's Fix paragraph),
+#: `run_retrospective.py`'s own default-prompt path threads the REAL
+#: run identity in, so `observer_run_id_mismatch` is no longer the
+#: expected steady-state outcome of a successful default-prompt invocation
+#: -- it remains allowlisted below only defensively.
 #:
 #: PR #2342 fix_delta (OWNER review
 #: https://github.com/squne121/loop-protocol/pull/2342#issuecomment-5411607690,
@@ -131,10 +168,16 @@ _FORBIDDEN_MUTATION_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEd
 #: (deny-by-default), not open-world.
 _ALLOWLISTED_OBSERVER_WAVE_FAILED_REASON_CODES = frozenset(
     {
-        # the known, accepted run_id-binding gap this verifier's own
-        # docstring documents (no `--prompts-file` -> `ctx.run_id` cannot be
-        # pre-seeded into observer prompts). See `run_observer_wave()`'s
-        # `bundle.run_id != ctx.run_id` raise site.
+        # Kept allowlisted defensively only (Issue #2345 fix_delta): since
+        # `run_retrospective.py`'s default-prompt path now threads the REAL
+        # run identity into every observer prompt (see the module
+        # docstring's Fix paragraph and `_default_observer_prompt()`), a
+        # successful default-prompt observer wave is no longer expected to
+        # hit `run_observer_wave()`'s `bundle.run_id != ctx.run_id` raise
+        # site in steady state -- the PRIMARY expected outcome is now a
+        # full `PublishRequest` (`status: "pass"`). This code remains
+        # allowlisted only so a genuine, still-benign run_id-binding edge
+        # case is not misclassified as an unallowlisted production failure.
         "observer_run_id_mismatch",
     }
 )

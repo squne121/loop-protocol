@@ -454,12 +454,14 @@ def capability_preflight_result(
             return {
                 "decision": "blocked",
                 "checks": {},
+                "actor_capabilities": {},
                 "reasons": [f"producer_invocation_failed:{exc.__class__.__name__}"],
             }
         if proc.returncode != 0:
             return {
                 "decision": "blocked",
                 "checks": {},
+                "actor_capabilities": {},
                 "reasons": [f"producer_invocation_failed:exit_{proc.returncode}"],
             }
         try:
@@ -468,6 +470,7 @@ def capability_preflight_result(
             return {
                 "decision": "blocked",
                 "checks": {},
+                "actor_capabilities": {},
                 "reasons": ["producer_result_malformed:non_json_stdout"],
             }
         if not isinstance(result, dict) or result.get("decision") not in (
@@ -478,11 +481,16 @@ def capability_preflight_result(
             return {
                 "decision": "blocked",
                 "checks": {},
+                "actor_capabilities": {},
                 "reasons": ["producer_result_malformed:invalid_decision"],
             }
         return {
             "decision": result.get("decision"),
             "checks": result.get("checks", {}),
+            # Issue #2340 AC2: forward the producer's actor/execution-substrate
+            # -scoped capability results verbatim (empty dict default keeps this
+            # backward compatible with any caller written before this Issue).
+            "actor_capabilities": result.get("actor_capabilities", {}),
             "reasons": result.get("reasons", []),
         }
     finally:

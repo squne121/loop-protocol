@@ -1384,7 +1384,12 @@ class TestReadbackContractSnapshotLiveBodyRevalidation:
                 "--jq",
                 "{body, updatedAt: .updated_at}",
             ]
-            for key in ("GH_HOST", "GH_REPO", "GH_CONFIG_DIR"):
+            # Issue #2340 fix_delta P0-1: GH_CONFIG_DIR is the intentional
+            # credential-carrier (kept so the launcher-shared gh credential
+            # store is reachable) -- only GH_HOST / GH_REPO (redirection
+            # surface, always explicitly --hostname pinned above) are
+            # stripped now.
+            for key in ("GH_HOST", "GH_REPO"):
                 assert key not in kwargs["env"]
 
 
@@ -1657,11 +1662,19 @@ class TestSingleCommentCanonicalReadback:
         ) is False
 
     def test_single_comment_readback_binds_hostname_and_sanitized_env(self):
-        hostile_env = {
+        # Issue #2340 fix_delta P0-1: GH_HOST / GH_REPO are redirection-
+        # surface noise (always explicitly --hostname pinned above) and are
+        # still stripped. GH_CONFIG_DIR is the intentional credential
+        # carrier (kept so the launcher-shared gh credential store is
+        # reachable) and is asserted PRESERVED below, not stripped.
+        noise_env = {
             "GH_HOST": "attacker.example",
             "GH_REPO": "other/repo",
-            "GH_CONFIG_DIR": "/tmp/evil",
         }
+        preserved_env = {
+            "GH_CONFIG_DIR": "/fake/native/gh/config",
+        }
+        hostile_env = {**noise_env, **preserved_env}
         calls = []
 
         def _fake_run(cmd, **kwargs):
@@ -1693,8 +1706,10 @@ class TestSingleCommentCanonicalReadback:
             "{body, updatedAt: .updated_at}",
         ]
         child_env = calls[0][1]["env"]
-        for key in hostile_env:
+        for key in noise_env:
             assert key not in child_env
+        for key, value in preserved_env.items():
+            assert child_env[key] == value
         assert child_env["GH_PROMPT_DISABLED"] == "1"
         assert child_env["GH_NO_UPDATE_NOTIFIER"] == "1"
 

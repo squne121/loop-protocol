@@ -23,6 +23,13 @@
         "$ref": "#/$defs/retrospectiveRunEntry"
       }
     },
+    "retrospective_runs_blocked": {
+      "type": "array",
+      "description": "Optional, additive-only derived section (Issue #2308) recording agent-retrospective run publication comments that normalizeRetrospectiveRunComment() could not accept -- either malformed/structurally-invalid payloads (kind: 'blocked') or comments carrying the agent_retrospective_run:v1 marker prefix that fail strict marker parsing (reason: 'retrospective_run_marker_malformed'). Distinct from the existing agent_run_report/v1-derived `blockedReasons`/entries[] blocked semantics, which this field does not change. Omitting this key entirely is valid (older index artifacts remain schema-valid).",
+      "items": {
+        "$ref": "#/$defs/retrospectiveRunBlockedEntry"
+      }
+    },
     "generation_verdict": {
       "type": "string",
       "enum": [
@@ -132,6 +139,27 @@
             "type": "integer",
             "minimum": 1
           }
+        }
+      }
+    },
+    "retrospectiveRunBlockedEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_comment_url",
+        "reason"
+      ],
+      "properties": {
+        "run_comment_url": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 240,
+          "pattern": "^https://github\\.com/squne121/loop-protocol/(issues|pull)/[0-9]+#issuecomment-[0-9]+$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
         }
       }
     },

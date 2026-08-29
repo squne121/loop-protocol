@@ -582,7 +582,7 @@ _EXPECTED_DENIED_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"
 
 _ROLE_STATIC_TOOLS = {
     "retrospective-runtime-observer": frozenset(),
-    "codebase-investigator": frozenset({"Bash", "Read"}),
+    "codebase-investigator": frozenset({"Bash", "Read", "Grep", "Glob"}),
     "web-researcher": frozenset({"Bash", "Read", "WebSearch", "WebFetch"}),
     "retrospective-evaluator": frozenset(),
 }

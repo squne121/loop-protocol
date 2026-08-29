@@ -53,7 +53,7 @@ def test_given_retry_matrix_when_retried_then_same_then_fresh_session_intent_is_
     assert len(result["attempts"]) == 3
     assert result["attempts"][0]["session_id"] == "same-session"
     assert result["attempts"][1]["session_id"] == "same-session"
-    assert result["attempts"][2]["session_id"] not in {None, "same-session"}
+    assert result["attempts"][2]["session_id"] is None
     manifests = [
         json.loads(
             (tmp_path / "2054" / "transport-e2e" / f"attempt-{number:03d}" / "attempt_manifest.json").read_text()

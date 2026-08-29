@@ -18,6 +18,7 @@ _GUARDS_DIR = Path(__file__).resolve().parent.parent
 if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
+import extension_surface_policy_matcher  # noqa: E402
 from extension_surface_policy_matcher import (  # noqa: E402
     DECISION_RANK,
     evaluate_allowed_paths,
@@ -28,6 +29,25 @@ from extension_surface_policy_matcher import (  # noqa: E402
 _REPO_ROOT = _GUARDS_DIR.parents[1]
 _REVIEW_ISSUE_SCRIPTS = _REPO_ROOT / ".claude" / "skills" / "review-issue" / "scripts"
 _CONTRACT_READINESS_SCRIPTS = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
+
+# PR #2370 OWNER review fix_delta (P1-1): `unknown_surface_policy` is now a
+# required, strictly-validated mapping on every policy passed to
+# `evaluate_allowed_paths`/`evaluate_issue_risk_trigger` (not just the real
+# production YAML) -- a synthetic fixture policy that previously omitted the
+# key entirely would now fail closed with `PolicyLoadError` instead of
+# quietly having "no candidate perimeter". Every synthetic fixture policy
+# dict below that is exercised through the shared evaluator must therefore
+# declare a minimal, structurally valid `unknown_surface_policy` -- fixtures
+# are fixed to carry a valid one rather than the validation being loosened
+# back to optional (Issue #2339, PR #2370 P1-1 fix_delta explicit
+# instruction). The glob deliberately does not overlap with any Allowed
+# Path entry used by the tests below, so it never changes any existing
+# assertion about `matched_rules` / `final_decision` / `verification_profiles`.
+_MINIMAL_VALID_UNKNOWN_SURFACE_POLICY = {
+    "decision": "human_judgment",
+    "gate": "advisory",
+    "project_candidate_path_globs": ["zzz-unused-synthetic-candidate-perimeter/**"],
+}
 
 
 def _load_module_from_path(module_name: str, path: Path):
@@ -104,6 +124,7 @@ def test_docs_only_not_applicable_approve():
 
 _MULTI_RULE_POLICY = {
     "resolution": {"multiple_matches": "evaluate_all", "final_decision": "most_restrictive"},
+    "unknown_surface_policy": _MINIMAL_VALID_UNKNOWN_SURFACE_POLICY,
     "rules": [
         {
             "id": "rule-deferred-scope",
@@ -318,6 +339,7 @@ def test_wildcard_entry_matching_only_skill_md_glob_still_hard():
     # glob) must remain a hard match, same as before the fix.
     single_glob_policy = {
         "resolution": {"multiple_matches": "evaluate_all", "final_decision": "most_restrictive"},
+        "unknown_surface_policy": _MINIMAL_VALID_UNKNOWN_SURFACE_POLICY,
         "rules": [
             {
                 "id": "rule-skill-md-only",
@@ -589,3 +611,91 @@ def test_load_policy_accepts_minimal_valid_policy(tmp_path):
     )
     policy = load_policy(good_policy_path)
     assert policy["schema_version"] == "v2"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2356 AC3: `CANDIDATE_ONLY_PATH_GLOBS` hardcoded frozenset is removed
+# in favour of the YAML/schema-driven `issue_time_enforcement` field.
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_only_path_globs_removed():
+    assert not hasattr(extension_surface_policy_matcher, "CANDIDATE_ONLY_PATH_GLOBS")
+
+
+# ---------------------------------------------------------------------------
+# Issue #2356 AC5: a project selector that intentionally OMITS
+# `issue_time_enforcement` must be treated as `hard` -- this is the required
+# runtime fallback for existing/future rules that never declare the field
+# (e.g. `claude-gpt-lifecycle-invocation-change`). This is a *synthetic*
+# selector constructed directly in this test, independent of any existing
+# rule's current unlabeled state, so the backward-compat meaning stays fixed
+# even if an existing rule later gains an explicit `issue_time_enforcement`.
+# ---------------------------------------------------------------------------
+
+
+def test_selector_omitting_issue_time_enforcement_defaults_to_hard():
+    synthetic_policy = {
+        "resolution": {"multiple_matches": "evaluate_all", "final_decision": "most_restrictive"},
+        "unknown_surface_policy": _MINIMAL_VALID_UNKNOWN_SURFACE_POLICY,
+        "rules": [
+            {
+                "id": "synthetic-rule-no-issue-time-enforcement",
+                "selectors": [
+                    # Deliberately omits `issue_time_enforcement` entirely.
+                    {"source_scope": "project", "path_globs": ["synthetic/no-enforcement-field/**"]},
+                ],
+                "default_decision": "immediate",
+                "verification_profile": "profile-synthetic",
+            },
+        ],
+    }
+    result = evaluate_allowed_paths(
+        allowed_path_entries=["synthetic/no-enforcement-field/foo.py"],
+        policy=synthetic_policy,
+    )
+    matched_rule = result["matched_rules"][0]
+    assert matched_rule["enforcement"] == "hard"
+    assert result["final_decision"] == "immediate"
+    assert matched_rule["matches"][0]["issue_time_enforcement"] == "hard"
+
+
+# ---------------------------------------------------------------------------
+# PR #2359 OWNER review fix_delta (iteration 1, P1 blocker): an invalid
+# `issue_time_enforcement` value on a project selector (e.g. a typo such as
+# "hrad" instead of "hard") must fail closed -- raising `PolicyLoadError` --
+# rather than silently flowing through as a string that is neither "hard"
+# nor "advisory", failing the `== "hard"` comparison, and thereby degrading
+# the rule to "advisory" (a malformed policy value must never silently
+# WEAKEN the gate; this is the same class of self-application false-negative
+# that caused the P0 regression in PR #2335 / Issue #2290).
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_issue_time_enforcement_fails_closed():
+    bad_policy = {
+        "resolution": {"multiple_matches": "evaluate_all", "final_decision": "most_restrictive"},
+        "unknown_surface_policy": _MINIMAL_VALID_UNKNOWN_SURFACE_POLICY,
+        "rules": [
+            {
+                "id": "synthetic-rule-invalid-issue-time-enforcement",
+                "selectors": [
+                    {
+                        "source_scope": "project",
+                        "path_globs": ["synthetic/invalid-enforcement-field/**"],
+                        "issue_time_enforcement": "hrad",
+                    },
+                ],
+                "default_decision": "immediate",
+                "verification_profile": "profile-synthetic-invalid",
+            },
+        ],
+    }
+    try:
+        evaluate_allowed_paths(
+            allowed_path_entries=["synthetic/invalid-enforcement-field/foo.py"],
+            policy=bad_policy,
+        )
+        assert False, "expected PolicyLoadError for invalid issue_time_enforcement value"
+    except extension_surface_policy_matcher.PolicyLoadError as exc:
+        assert "hrad" in str(exc)

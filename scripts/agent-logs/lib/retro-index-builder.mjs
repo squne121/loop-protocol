@@ -337,6 +337,7 @@ function checkPublicObservationSources(payload, markerDigest) {
 // ---------------------------------------------------------------------------
 
 const RETROSPECTIVE_RUN_MARKER_LINE = /^<!--\s*agent_retrospective_run:v1\s+repository_id=\S+\s+idempotency_key=\S+\s*-->$/u
+const RETROSPECTIVE_RUN_MARKER_PREFIX = /^<!--\s*agent_retrospective_run:v1(?![0-9])/u
 const FENCED_JSON_BLOCK = /```json\r?\n([\s\S]*?)\r?\n```/u
 
 function extractRetrospectiveRunPayload(body) {
@@ -345,6 +346,14 @@ function extractRetrospectiveRunPayload(body) {
   }
   const firstLine = body.split('\n')[0]?.trim() ?? ''
   if (!RETROSPECTIVE_RUN_MARKER_LINE.test(firstLine)) {
+    // Issue #2308 AC3: a first line that carries the agent_retrospective_run:v1
+    // marker prefix but fails strict marker parsing (e.g. missing
+    // idempotency_key) is a malformed marker, not an unrelated comment --
+    // surface it as blocked rather than silently ignoring it. A first line
+    // without the marker prefix at all remains an ordinary ignored comment.
+    if (RETROSPECTIVE_RUN_MARKER_PREFIX.test(firstLine)) {
+      return { kind: 'blocked', reason: 'retrospective_run_marker_malformed' }
+    }
     return null
   }
   const match = body.match(FENCED_JSON_BLOCK)
@@ -623,22 +632,30 @@ export function buildRetroIndex({
   const blockedReasons = []
   const sourceCommentRefs = []
   const retrospectiveRuns = []
+  const retrospectiveRunsBlocked = []
   const parentChildSet = new Set(parentChildIssueNumbers)
 
   for (const rawComment of sourceComments) {
     // Issue #2238 Child 5 (additive-only): agent_retrospective_run_publication/v1
     // comments are recognized by a distinct marker/schema and routed to
     // retrospective_runs[] instead of entries[] -- never mixed into the
-    // agent_run_report/v1 resolution path below. A malformed retrospective-run
-    // comment is skipped here (not added to blockedReasons/generation_verdict)
-    // so this additive feature cannot regress the existing entries[]
-    // generation_verdict semantics.
+    // agent_run_report/v1 resolution path below. Issue #2308: a malformed
+    // retrospective-run comment (normalizeRetrospectiveRunComment() returning
+    // kind: 'blocked') is no longer silently discarded -- it is recorded in
+    // retrospective_runs_blocked[] and reflected into generation_verdict as at
+    // least 'partial'. This remains independent from the existing
+    // blockedReasons[]/entries[] agent_run_report/v1 blocked semantics, which
+    // this additive feature does not regress.
     const retrospectiveRun = normalizeRetrospectiveRunComment(rawComment)
     if (retrospectiveRun.kind === 'run') {
       retrospectiveRuns.push(retrospectiveRun.entry)
       continue
     }
     if (retrospectiveRun.kind === 'blocked') {
+      retrospectiveRunsBlocked.push({
+        run_comment_url: rawComment.html_url,
+        reason: retrospectiveRun.reason,
+      })
       continue
     }
 
@@ -706,11 +723,12 @@ export function buildRetroIndex({
     schema: 'agent_retro_index/v1',
     generation_verdict: blockedReasons.length > 0
       ? 'blocked'
-      : (entries.length === 0 || orphanReports.length > 0 || ambiguousLinks.length > 0 ? 'partial' : 'complete'),
+      : (entries.length === 0 || orphanReports.length > 0 || ambiguousLinks.length > 0 || retrospectiveRunsBlocked.length > 0 ? 'partial' : 'complete'),
     entries,
     orphan_reports: orphanReports,
     ambiguous_links: ambiguousLinks,
     retrospective_runs: retrospectiveRuns,
+    retrospective_runs_blocked: retrospectiveRunsBlocked,
   }
 
   const canonicalIndexJson = JSON.stringify(retroPayload, null, 2)
@@ -730,7 +748,7 @@ export function buildRetroIndex({
 }
 
 export function detectSchemaMigrationRequirement(indexCandidate) {
-  const allowedKeys = new Set(['schema', 'generation_verdict', 'entries', 'orphan_reports', 'ambiguous_links', 'retrospective_runs'])
+  const allowedKeys = new Set(['schema', 'generation_verdict', 'entries', 'orphan_reports', 'ambiguous_links', 'retrospective_runs', 'retrospective_runs_blocked'])
   const extraKeys = Object.keys(indexCandidate).filter((key) => !allowedKeys.has(key))
   if (extraKeys.length === 0) {
     return null

@@ -64,6 +64,11 @@ _validate_mod = rr._validate_retrospective_schema_module()
 _FULL_SHA = "a" * 40
 _OTHER_SHA = "b" * 40
 _DIGEST = "d" * 64
+#: Issue #2362 AC1: run_evaluation() now requires repository_id as
+#: Python-side caller context (never part of EvaluatorRequest) -- this is
+#: the single fixture value every direct rr.run_evaluation() call site in
+#: this file passes, matching _identity_key()'s repository_id below.
+_REPOSITORY_ID = "squne121/loop-protocol"
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +179,62 @@ def _canonical_candidate(
 def _new_candidate(candidate_id: str = "cand-new-0001", rule_id: str = "example_rule") -> dict[str, Any]:
     evaluation = _evaluation_entry(rule_id=rule_id, presence_delta="new", observed=True, delta_status="new")
     return _canonical_candidate(candidate_id=candidate_id, rule_id=rule_id, evaluations=[evaluation])
+
+
+#: Issue #2362 Scope Reframe: `run_evaluation()` no longer accepts a
+#: canonical (`finding_contract`-nested) candidate shape as evaluator
+#: output -- the evaluator's wire payload is now judgment-only (flat
+#: `candidate_id`/`title`/`description`/`claim_class`/`subject_ref`/
+#: `rule_id`/`evidence_refs`). Every direct `rr.run_evaluation()` call site
+#: in this file that needs a non-empty `candidate_records` entry now uses
+#: this helper (test callers that don't care about candidate content pass
+#: an empty `candidate_records` list instead).
+def _judgment_from_key(
+    key: dict[str, Any],
+    *,
+    candidate_id: str,
+    title: str = "judgment title",
+    description: str = "judgment description",
+    evidence_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate_id,
+        "title": title,
+        "description": description,
+        "claim_class": key["claim_class"],
+        "subject_ref": key["subject_ref"],
+        "rule_id": key["rule_id"],
+        "evidence_refs": evidence_refs if evidence_refs is not None else [],
+    }
+
+
+#: Issue #2362 Scope Reframe: a judgment-only `evidence_refs[]` entry
+#: matching the single "retrospective-runtime-observer" (`source_type:
+#: "runtime"`) most `execute_run()`-level tests in this file wire as their
+#: only observer -- `_enrich_evidence_ref` recomputes `projection_digest`
+#: from that observer's REAL `findings[]` (nonempty per `_make_observer_invoke`),
+#: so this ref survives enrichment. Needed whenever the resulting
+#: classification is `"classified"` (the canonical schema requires
+#: `evidence_refs` `minItems: 1` in that branch) -- omit for `indeterminate`
+#: expectations, which impose no such requirement.
+_RUNTIME_EVIDENCE_REFS = [
+    {
+        "ref_type": "runtime_receipt",
+        "source_id": "runtime",
+        "resource_identity": "observer:retrospective-runtime-observer",
+    }
+]
+
+
+#: Issue #2362 Scope Reframe: `run_evaluation()` now requires
+#: `previous_state` (a `PreviousStateResult`) -- this is the fixture value
+#: every direct `rr.run_evaluation()` call site in this file that doesn't
+#: specifically exercise `PreviousStateProvider`/`compute_delta()` wiring
+#: passes (matches the pre-existing default `FixturePreviousStateProvider(
+#: fixtures={})` -> `"no_history"` behavior byte-for-byte).
+_EMPTY_PREVIOUS_STATE = rr.PreviousStateResult(
+    status="no_history", previous_run_ref=None, candidates=[], read_version=None
+)
 
 
 # ---------------------------------------------------------------------------
@@ -436,11 +497,16 @@ def _make_observer_invoke(run_id: str, digest: str, call_log: list[str], base_sh
 def _make_evaluator_invoke(run_id: str, digest: str, call_log: list[str]):
     def _invoke(request: rr.EvaluatorRequest) -> rr.AgentInvocationResult:
         call_log.append("evaluator")
+        # Issue #2362 Scope Reframe: an empty candidate_records list is a
+        # judgment-only-wire-shape-compatible fake evaluator response too
+        # (no per-candidate fields to satisfy) -- this fake exists only to
+        # exercise observer-wave-before-evaluator call ordering / no-
+        # mutation-side-effect assertions, not candidate content.
         evaluation = rr.Evaluation(
             run_id=run_id,
             base_sha=_FULL_SHA,
             source_set_digest=digest,
-            candidate_records=[_new_candidate()],
+            candidate_records=[],
             evidence_ref=f"evidence://{run_id}/evaluation",
         )
         return _ok_agent_result(json.loads(evaluation.to_wire()))
@@ -467,7 +533,11 @@ def _run_full_pipeline(call_log: list[str]) -> tuple[rr.RunContext, rr.SourcePla
     finding_sets = rr.build_finding_sets(ctx, plan, bundles)
     evaluator_request = rr.prepare_evaluator_request(ctx, plan, finding_sets)
     evaluation = rr.run_evaluation(
-        ctx, evaluator_request, invoke_evaluator=_make_evaluator_invoke(ctx.run_id, plan.source_set_digest, call_log)
+        ctx,
+        evaluator_request,
+        invoke_evaluator=_make_evaluator_invoke(ctx.run_id, plan.source_set_digest, call_log),
+        repository_id=_REPOSITORY_ID,
+        previous_state=_EMPTY_PREVIOUS_STATE,
     )
     publish_request = rr.finalize(
         ctx,
@@ -520,7 +590,13 @@ def test_evaluator_waits_for_observer_never_invoked_on_observer_failure() -> Non
         )
         finding_sets = rr.build_finding_sets(ctx, plan, bundles)
         evaluator_request = rr.prepare_evaluator_request(ctx, plan, finding_sets)
-        rr.run_evaluation(ctx, evaluator_request, invoke_evaluator=_evaluator_invoke_should_never_run)
+        rr.run_evaluation(
+            ctx,
+            evaluator_request,
+            invoke_evaluator=_evaluator_invoke_should_never_run,
+            repository_id=_REPOSITORY_ID,
+            previous_state=_EMPTY_PREVIOUS_STATE,
+        )
 
     assert call_log == ["observer:retrospective-runtime-observer"]
     assert "evaluator" not in call_log
@@ -562,7 +638,13 @@ def test_evaluator_receives_typed_projection_only() -> None:
         )
         return _ok_agent_result(json.loads(evaluation.to_wire()))
 
-    rr.run_evaluation(ctx, evaluator_request, invoke_evaluator=_capturing_invoke)
+    rr.run_evaluation(
+        ctx,
+        evaluator_request,
+        invoke_evaluator=_capturing_invoke,
+        repository_id=_REPOSITORY_ID,
+        previous_state=_EMPTY_PREVIOUS_STATE,
+    )
 
     # THEN the evaluator request never has an `evidence_ref` or raw-evidence-shaped field
     payload = json.loads(captured["wire_text"])
@@ -977,15 +1059,19 @@ def test_executable_entrypoint_collectors_to_publish_request(tmp_path: Path) -> 
         call_log.append(agent_name)
         if agent_name == "retrospective-evaluator":
             evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
-            evaluation = rr.Evaluation(
-                run_id=evaluator_request.run_id,
-                base_sha=_FULL_SHA,
-                source_set_digest=evaluator_request.source_set_digest,
-                candidate_records=[_new_candidate()],
-                evidence_ref="e",
-            )
+            # Issue #2362 Scope Reframe: candidate content is not asserted
+            # by this test -- an empty candidate_records list is a valid
+            # judgment-only-wire-shape evaluator response too.
+            evaluation_payload = {
+                "schema_version": rr.WIRE_SCHEMA_EVALUATION,
+                "run_id": evaluator_request.run_id,
+                "base_sha": _FULL_SHA,
+                "source_set_digest": evaluator_request.source_set_digest,
+                "candidate_records": [],
+                "evidence_ref": "e",
+            }
             return subprocess.CompletedProcess(
-                argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(evaluation.to_wire()))), stderr=""
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(evaluation_payload)), stderr=""
             )
         bundle = rr.EvidenceBundle(
             run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
@@ -1006,7 +1092,14 @@ def test_executable_entrypoint_collectors_to_publish_request(tmp_path: Path) -> 
         request_id="req-cli-1",
         idempotency_key="idem-cli-1",
         schema_dir=schema_dir,
-        prompts={},
+        # Issue #2345 fix_delta P1/P2: `prompts=None` exercises the
+        # production `--prompts-file`-omitted default-prompt path
+        # (`run_cli()` builds real-identity default prompts itself); the
+        # fake `_runner` above derives observer identity from `kwargs["env"]`
+        # (the same run-scoped env `run_cli()` always injects) rather than
+        # prompt content, so this default-prompt path is exercised without
+        # changing this test's own assertions.
+        prompts=None,
         runner=_runner,
         git_runner=_git_runner,
         run_id="run-cli-1",
@@ -1231,7 +1324,13 @@ def test_schema_repair_retry_bounded_evaluator_never_started_on_exhaustion() -> 
         bundles = rr.run_observer_wave(ctx, plan, invoke=_malformed_invoke, observer_requests=[_observer_request("o1")])
         finding_sets = rr.build_finding_sets(ctx, plan, bundles)
         evaluator_request = rr.prepare_evaluator_request(ctx, plan, finding_sets)
-        rr.run_evaluation(ctx, evaluator_request, invoke_evaluator=_evaluator_invoke)
+        rr.run_evaluation(
+            ctx,
+            evaluator_request,
+            invoke_evaluator=_evaluator_invoke,
+            repository_id=_REPOSITORY_ID,
+            previous_state=_EMPTY_PREVIOUS_STATE,
+        )
 
     assert evaluator_called["n"] == 0
 
@@ -1760,7 +1859,11 @@ def test_temp_scope_is_on_production_path_and_cleanup_failure_surfaces(tmp_path:
             request_id="req",
             idempotency_key="idem",
             schema_dir=schema_dir,
-            prompts={},
+            # Issue #2345 fix_delta P1/P2: `prompts=None` exercises the
+            # production default-prompt path (built from real ctx/plan
+            # identity); `_runner` below forces `api_error` regardless of
+            # prompt content, so `ObserverWaveFailed` is still reached.
+            prompts=None,
             runner=_runner,
             git_runner=_git_runner,
             run_id="run-temp-1",
@@ -1803,15 +1906,25 @@ def test_manual_trigger_preflight_accepts_git_root() -> None:
 
 
 def _make_execute_run_evaluator_invoke(candidate_records: list[dict[str, Any]]):
+    """`candidate_records` MUST already be in the judgment-only wire shape
+    (Issue #2362 Scope Reframe -- see `_judgment_from_key`) -- this builds
+    the raw wire payload dict directly rather than going through
+    `rr.Evaluation(...)`'s constructor, because that constructor's
+    `_post_validate()` fires FULL canonical-candidate-schema validation
+    immediately, which a judgment-only record does not (and must not need
+    to) satisfy; canonical validation only fires downstream, after
+    `run_evaluation()`'s deterministic-enrichment phase has run."""
+
     def _invoke(request: rr.EvaluatorRequest) -> rr.AgentInvocationResult:
-        evaluation = rr.Evaluation(
-            run_id=request.run_id,
-            base_sha=request.base_sha,
-            source_set_digest=request.source_set_digest,
-            candidate_records=candidate_records,
-            evidence_ref="evidence://evaluation",
-        )
-        return _ok_agent_result(json.loads(evaluation.to_wire()))
+        payload = {
+            "schema_version": rr.WIRE_SCHEMA_EVALUATION,
+            "run_id": request.run_id,
+            "base_sha": request.base_sha,
+            "source_set_digest": request.source_set_digest,
+            "candidate_records": candidate_records,
+            "evidence_ref": "evidence://evaluation",
+        }
+        return _ok_agent_result(payload)
 
     return _invoke
 
@@ -1819,7 +1932,17 @@ def _make_execute_run_evaluator_invoke(candidate_records: list[dict[str, Any]]):
 def test_compute_delta_wired_into_production_publish_path_recurrent() -> None:
     # GIVEN a PreviousStateProvider seeded with a previously-resolved finding
     resolved_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.resolved.valid.json")
-    current_recurrence = copy.deepcopy(resolved_fixture)
+    # Issue #2362 Scope Reframe: run_evaluation()'s enrichment phase now
+    # requires a judgment-only evaluator response (not the canonical
+    # finding_contract-nested fixture shape) -- this re-reports the SAME
+    # identity (repository_id/claim_class/subject_ref/rule_id) as
+    # `resolved_fixture` so compute_delta() classifies it as "recurrent"
+    # (its previous last evaluation's presence_delta was "resolved").
+    current_recurrence = _judgment_from_key(
+        resolved_fixture["finding_contract"]["identity"]["key"],
+        candidate_id="cand-recurrence",
+        evidence_refs=_RUNTIME_EVIDENCE_REFS,
+    )
     repository_id = "squne121/loop-protocol"
     provider = rr.FixturePreviousStateProvider(
         fixtures={
@@ -1861,6 +1984,11 @@ def test_compute_delta_wired_into_production_publish_path_recurrent() -> None:
 def test_compute_delta_wired_into_production_publish_path_forces_indeterminate() -> None:
     # GIVEN a PreviousStateProvider reporting incomplete ("partial") coverage
     new_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.new.valid.json")
+    # Issue #2362 Scope Reframe: see test_..._recurrent()'s matching comment
+    # -- re-reports the same identity as new_fixture in judgment-only shape.
+    current_judgment = _judgment_from_key(
+        new_fixture["finding_contract"]["identity"]["key"], candidate_id="cand-indeterminate"
+    )
     repository_id = "squne121/loop-protocol"
     provider = rr.FixturePreviousStateProvider(
         fixtures={
@@ -1879,7 +2007,7 @@ def test_compute_delta_wired_into_production_publish_path_forces_indeterminate()
         collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
         observer_requests=[_observer_request("retrospective-runtime-observer")],
         invoke=_make_observer_invoke("run-delta-2", expected_digest, call_log),
-        invoke_evaluator=_make_execute_run_evaluator_invoke([new_fixture]),
+        invoke_evaluator=_make_execute_run_evaluator_invoke([current_judgment]),
         repository_id=repository_id,
         target_issue=2237,
         request_id="req-delta-2",
@@ -1904,6 +2032,11 @@ def test_compute_delta_wired_into_production_publish_path_default_provider_is_ne
     # GIVEN no previous_state_provider is injected (the common/default case)
     call_log: list[str] = []
     expected_digest = rr.compute_source_set_digest([_fake_collector_result("repository", _FULL_SHA).observation])
+    # Issue #2362 Scope Reframe: judgment-only equivalent of _new_candidate()
+    # -- same identity key (repository_id/claim_class/subject_ref/rule_id).
+    current_judgment = _judgment_from_key(
+        _identity_key("example_rule"), candidate_id="cand-new-0001", evidence_refs=_RUNTIME_EVIDENCE_REFS
+    )
 
     # WHEN execute_run() runs without wiring a PreviousStateProvider
     publish_request = rr.execute_run(
@@ -1911,7 +2044,7 @@ def test_compute_delta_wired_into_production_publish_path_default_provider_is_ne
         collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
         observer_requests=[_observer_request("retrospective-runtime-observer")],
         invoke=_make_observer_invoke("run-delta-3", expected_digest, call_log),
-        invoke_evaluator=_make_execute_run_evaluator_invoke([_new_candidate()]),
+        invoke_evaluator=_make_execute_run_evaluator_invoke([current_judgment]),
         repository_id="squne121/loop-protocol",
         target_issue=2237,
         request_id="req-delta-3",
@@ -1943,7 +2076,17 @@ def test_compute_delta_wired_into_production_publish_path_run_cli(tmp_path: Path
         return subprocess.CompletedProcess(argv, returncode=0, stdout=_FULL_SHA + "\n", stderr="")
 
     resolved_fixture = _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.resolved.valid.json")
-    current_recurrence = copy.deepcopy(resolved_fixture)
+    # Issue #2362 Scope Reframe: see test_..._recurrent()'s matching comment
+    # -- re-reports the same identity as resolved_fixture in judgment-only
+    # shape (the live-CLI-shaped `_runner` fake below builds the raw wire
+    # payload dict directly rather than via `rr.Evaluation(...)`, whose
+    # constructor would otherwise fire full canonical-candidate validation
+    # against this judgment-only shape prematurely).
+    current_recurrence = _judgment_from_key(
+        resolved_fixture["finding_contract"]["identity"]["key"],
+        candidate_id="cand-recurrence-cli",
+        evidence_refs=_RUNTIME_EVIDENCE_REFS,
+    )
     repository_id = "squne121/loop-protocol"
     provider = rr.FixturePreviousStateProvider(
         fixtures={
@@ -1960,15 +2103,16 @@ def test_compute_delta_wired_into_production_publish_path_run_cli(tmp_path: Path
         agent_name = argv[argv.index("--agent") + 1]
         if agent_name == "retrospective-evaluator":
             evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
-            evaluation = rr.Evaluation(
-                run_id=evaluator_request.run_id,
-                base_sha=_FULL_SHA,
-                source_set_digest=evaluator_request.source_set_digest,
-                candidate_records=[current_recurrence],
-                evidence_ref="e",
-            )
+            evaluation_payload = {
+                "schema_version": rr.WIRE_SCHEMA_EVALUATION,
+                "run_id": evaluator_request.run_id,
+                "base_sha": _FULL_SHA,
+                "source_set_digest": evaluator_request.source_set_digest,
+                "candidate_records": [current_recurrence],
+                "evidence_ref": "e",
+            }
             return subprocess.CompletedProcess(
-                argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(evaluation.to_wire()))), stderr=""
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(evaluation_payload)), stderr=""
             )
         bundle = rr.EvidenceBundle(
             run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
@@ -1991,7 +2135,10 @@ def test_compute_delta_wired_into_production_publish_path_run_cli(tmp_path: Path
         request_id="req-cli-delta-1",
         idempotency_key="idem-cli-delta-1",
         schema_dir=schema_dir,
-        prompts={},
+        # Issue #2345 fix_delta P1/P2: `prompts=None` exercises the
+        # production default-prompt path; `_runner` above derives observer
+        # identity from `kwargs["env"]`, not prompt content.
+        prompts=None,
         runner=_runner,
         git_runner=_git_runner,
         run_id="run-cli-delta-1",
@@ -2083,8 +2230,147 @@ def test_build_observer_requests_default_schema_dir_points_at_committed_schemas(
     `run_cli()`/`main()` use in production must resolve to the exact
     directory containing the two schema assets this Issue adds -- not a
     stale/placeholder path."""
-    requests = rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=str(tmp_path), prompts={})
+    # Issue #2345 fix_delta P2: build_observer_requests() now rejects an
+    # empty/missing prompt per manifest entry -- supply a valid non-empty
+    # prompt for every observer_id so this test only exercises what it
+    # actually asserts (schema_dir resolution).
+    valid_prompts = {spec.observer_id: f"prompt for {spec.observer_id}" for spec in rr.EXPECTED_OBSERVER_MANIFEST}
+    requests = rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=str(tmp_path), prompts=valid_prompts)
     assert requests
     for request in requests:
         assert Path(request.json_schema_path) == _SCHEMA_DIR / "observer_result_v1.schema.json"
         assert Path(request.json_schema_path).is_file()
+
+
+# ---------------------------------------------------------------------------
+# Issue #2345 fix_delta (OWNER review
+# https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+# P2 item 4): hermetic (non-live, fake-runner-based) regression coverage
+# for the `--prompts-file`-omitted default-prompt path.
+# ---------------------------------------------------------------------------
+
+
+def test_default_observer_prompts_use_real_run_identity_not_placeholder(tmp_path: Path) -> None:
+    """(a) every default observer prompt `run_cli()` generates when
+    `prompts=None` (the `--prompts-file`-omitted case) is non-empty, and
+    (b) reflects the REAL run identity (`ctx.run_id`/`ctx.base_sha`/
+    `plan.source_set_digest`) rather than a fixed placeholder that could
+    never legitimately match -- the construct-to-fail design this
+    fix_delta replaces (see `_default_observer_prompt`'s docstring). The
+    production `run_cli()` call graph completing end-to-end into a real
+    `PublishRequest` (never raising `ObserverWaveFailed` at
+    `observer_run_id_mismatch`) is itself proof the threaded identity
+    matched."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    def _git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=_FULL_SHA + "\n", stderr="")
+
+    real_observation = rr.build_repository_collector(repo_root)(_FULL_SHA).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+
+    captured_prompts: dict[str, str] = {}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        agent_name = argv[argv.index("--agent") + 1]
+        if agent_name == "retrospective-evaluator":
+            evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
+            evaluation = rr.Evaluation(
+                run_id=evaluator_request.run_id,
+                base_sha=_FULL_SHA,
+                source_set_digest=evaluator_request.source_set_digest,
+                candidate_records=[],
+                evidence_ref="e",
+            )
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(evaluation.to_wire()))), stderr=""
+            )
+        captured_prompts[agent_name] = kwargs["input"]
+        bundle = rr.EvidenceBundle(
+            run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
+            base_sha=kwargs["env"].get("AGENT_RETROSPECTIVE_BASE_SHA", ""),
+            source_set_digest=expected_digest,
+            observer_id=agent_name,
+            evidence_ref="evidence://default",
+            findings=[],
+        )
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(bundle.to_wire()))), stderr=""
+        )
+
+    publish_request = rr.run_cli(
+        repo_root=repo_root,
+        repository_id="squne121/loop-protocol",
+        target_issue=2237,
+        request_id="req-default-prompt-1",
+        idempotency_key="idem-default-prompt-1",
+        schema_dir=schema_dir,
+        prompts=None,
+        runner=_runner,
+        git_runner=_git_runner,
+        run_id="run-default-prompt-1",
+        temp_base_dir=tmp_path,
+    )
+
+    # THEN the real production call graph completed end-to-end into a
+    # PublishRequest -- it never raised ObserverWaveFailed at
+    # observer_run_id_mismatch, proving the default-prompt path's
+    # run_id/base_sha/source_set_digest genuinely matched this run.
+    assert isinstance(publish_request, rr.PublishRequest)
+    assert sorted(captured_prompts) == sorted(spec.observer_id for spec in rr.EXPECTED_OBSERVER_MANIFEST)
+    for observer_id, prompt in captured_prompts.items():
+        # (a) never empty
+        assert prompt.strip(), f"default prompt for {observer_id} must be non-empty"
+        # (b) reflects the REAL run identity, never a fixed placeholder
+        assert "run-default-prompt-1" in prompt
+        assert _FULL_SHA in prompt
+        assert expected_digest in prompt
+        assert "unset-default-prompt-run-id" not in prompt
+
+
+def test_build_observer_requests_rejects_missing_or_empty_prompt() -> None:
+    """(c) Issue #2345 fix_delta P2 item 3: a partial/incomplete
+    caller-supplied `prompts` dict -- a missing manifest key, or an
+    empty/whitespace-only string value -- is rejected locally with a typed
+    `invalid_observer_prompts` `WireContractError`, never silently
+    defaulted to `""` and passed through toward the `claude` CLI (the
+    original empty-prompt bug this Issue exists to fix)."""
+    complete_prompts = {spec.observer_id: "real prompt text" for spec in rr.EXPECTED_OBSERVER_MANIFEST}
+    missing_key_id = rr.EXPECTED_OBSERVER_MANIFEST[0].observer_id
+
+    partial_prompts = {k: v for k, v in complete_prompts.items() if k != missing_key_id}
+    with pytest.raises(rr.WireContractError) as missing_key_excinfo:
+        rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=".", prompts=partial_prompts)
+    assert missing_key_excinfo.value.reason_code == "invalid_observer_prompts"
+
+    empty_value_prompts = dict(complete_prompts)
+    empty_value_prompts[missing_key_id] = "   "  # whitespace-only -- empty after strip()
+    with pytest.raises(rr.WireContractError) as empty_value_excinfo:
+        rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=".", prompts=empty_value_prompts)
+    assert empty_value_excinfo.value.reason_code == "invalid_observer_prompts"
+
+
+def test_build_observer_requests_rejects_non_string_prompt_value() -> None:
+    """PR #2358 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255,
+    P2) regression test: a non-string `--prompts-file` value for a
+    manifest `observer_id` (e.g. JSON `null` decoded to Python `None`) must
+    be rejected the SAME typed, fail-closed way as a missing/empty prompt
+    -- a `WireContractError` with `reason_code="invalid_observer_prompts"`
+    -- never an untyped `AttributeError` from `bind_observer_prompt()`'s
+    `task_prompt.strip()` (the previous `str(value).strip()`-based check
+    coerced `None` to the non-empty string `"None"` FIRST, so it spuriously
+    passed validation)."""
+    non_string_prompts: dict[str, Any] = {
+        spec.observer_id: "real prompt text" for spec in rr.EXPECTED_OBSERVER_MANIFEST
+    }
+    target_id = rr.EXPECTED_OBSERVER_MANIFEST[0].observer_id
+    non_string_prompts[target_id] = None  # e.g. `{"observer_id": null}` in --prompts-file JSON
+
+    with pytest.raises(rr.WireContractError) as excinfo:
+        rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=".", prompts=non_string_prompts)
+    assert excinfo.value.reason_code == "invalid_observer_prompts"

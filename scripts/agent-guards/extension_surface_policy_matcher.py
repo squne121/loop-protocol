@@ -80,29 +80,6 @@ DECISION_RANK: dict[str, int] = {
     "immediate": 2,
 }
 
-# Path globs whose match is treated as "candidate discovery only" -- it is
-# recorded in ``matched_rules`` (and its ``verification_profile`` is still
-# surfaced) but never forces ``final_decision`` / ``needs_fix`` on its own
-# (PR #2335 OWNER review fix_delta, Issue #2290 P0).
-#
-# Rationale: a file living under ``.claude/skills/**/scripts/**`` being a
-# "skill script" is not the same fact as "skill runtime semantics changed".
-# This evaluator module's own consumers -- ``check_issue_contract.py`` and
-# ``contract_readiness_check.py`` -- are themselves under
-# ``.claude/skills/**/scripts/**``, and forcing ``decision: immediate`` on
-# every Issue whose Allowed Paths merely touch a skill script (static
-# checker edits, docstring fixes, refactors with no runtime-behavior change)
-# would make the gate self-contradicting for Issue #2290 itself. The
-# semantic judgment of whether a given script change actually alters skill
-# runtime behavior remains a PR-time responsibility (Out of Scope for
-# Issue #2290; see the module docstring).
-#
-# ``.claude/skills/**/SKILL.md`` is intentionally NOT included here: it
-# directly encodes skill runtime semantics (Procedure steps / output
-# contract schema) and keeps forcing its rule's ``default_decision`` at
-# Issue-time as before.
-CANDIDATE_ONLY_PATH_GLOBS: frozenset[str] = frozenset({".claude/skills/**/scripts/**"})
-
 
 class PolicyLoadError(RuntimeError):
     """Raised when the policy YAML cannot be loaded, does not parse to a
@@ -165,6 +142,109 @@ def _validate_policy_contract(data: dict[str, Any], path: Path) -> None:
         )
 
 
+# `unknown_surface_policy.decision` / `.gate` values this module's evaluator
+# actually implements. Mirrors `docs/dev/extension-surface-runtime-policy
+# .schema.json`'s `unknown_surface_policy.decision` (`enum: [human_judgment]`)
+# and `.gate` (narrowed to `const: advisory`, Issue #2339 PR #2370 OWNER
+# review fix_delta P1-3 -- `gate: block` is no longer a supported production
+# value; a policy declaring any other value is not safely interpretable and
+# must fail closed rather than silently mis-evaluate or be read as dead
+# metadata).
+_EXPECTED_UNKNOWN_SURFACE_POLICY_DECISION = "human_judgment"
+_EXPECTED_UNKNOWN_SURFACE_POLICY_GATE = "advisory"
+
+
+def _extract_unknown_surface_policy(data: dict[str, Any]) -> dict[str, Any]:
+    """Cheap structural validation + extraction of the full
+    ``unknown_surface_policy`` mapping (``decision`` / ``gate`` /
+    ``project_candidate_path_globs``) (Issue #2339 AC9; PR #2370 OWNER
+    review fix_delta P1-1/P1-3).
+
+    Called from ``evaluate_allowed_paths`` for *every* policy source (both
+    the default ``load_policy()`` path and a ``policy=`` dict passed
+    directly by a caller/test), so a malformed ``unknown_surface_policy``
+    fails closed with a distinguishable ``PolicyLoadError`` regardless of
+    how the policy mapping was constructed -- it must never silently
+    degrade to "no candidate perimeter" (which would look identical to a
+    legitimately clean/empty candidate perimeter and risk silently
+    approving what should have been an advisory finding, Issue #2339 AC9).
+
+    ``unknown_surface_policy`` is REQUIRED here (PR #2370 OWNER review
+    fix_delta P1-1 -- the previous "optional at this cheap-validation layer"
+    design let a missing/``None`` ``unknown_surface_policy`` or a missing
+    ``project_candidate_path_globs`` key silently fall through to "no
+    candidate perimeter" instead of failing closed, contradicting
+    ``docs/dev/extension-surface-runtime-policy.schema.json`` which already
+    declares all three of ``decision`` / ``gate`` /
+    ``project_candidate_path_globs`` as required). Every fixture policy
+    passed through this function -- including synthetic/minimal test
+    fixtures -- must declare a structurally valid ``unknown_surface_policy``;
+    this is intentionally NOT made optional again to "fix" a failing
+    fixture (fixtures are the ones that must be updated, not this
+    validation).
+
+    ``decision`` and ``gate`` are validated against the single production
+    value each currently supports (see the module-level
+    ``_EXPECTED_UNKNOWN_SURFACE_POLICY_*`` constants above) rather than left
+    unread as dead metadata (P1-3): an unsupported value is exactly as
+    unsafe to silently ignore as a malformed
+    ``project_candidate_path_globs`` list.
+    """
+    unknown_surface_policy = data.get("unknown_surface_policy")
+    if not isinstance(unknown_surface_policy, dict):
+        raise PolicyLoadError(
+            f"policy declares 'unknown_surface_policy' as "
+            f"{type(unknown_surface_policy).__name__ if unknown_surface_policy is not None else 'missing/None'}, "
+            "expected a mapping (Issue #2339 AC9 / PR #2370 P1-1: a missing or non-mapping "
+            "'unknown_surface_policy' must fail closed as policy-unavailable, not silently "
+            "degrade to 'no candidate perimeter')"
+        )
+
+    decision = unknown_surface_policy.get("decision")
+    if decision != _EXPECTED_UNKNOWN_SURFACE_POLICY_DECISION:
+        raise PolicyLoadError(
+            f"policy declares 'unknown_surface_policy.decision' as {decision!r}, expected "
+            f"{_EXPECTED_UNKNOWN_SURFACE_POLICY_DECISION!r} (PR #2370 P1-1: an unsupported/missing "
+            "decision value must fail closed rather than be silently unread)"
+        )
+
+    gate = unknown_surface_policy.get("gate")
+    if gate != _EXPECTED_UNKNOWN_SURFACE_POLICY_GATE:
+        raise PolicyLoadError(
+            f"policy declares 'unknown_surface_policy.gate' as {gate!r}, expected "
+            f"{_EXPECTED_UNKNOWN_SURFACE_POLICY_GATE!r} (PR #2370 P1-1/P1-3: an unsupported/missing "
+            "gate value must fail closed rather than be silently unread)"
+        )
+
+    raw_globs = unknown_surface_policy.get("project_candidate_path_globs")
+    if not isinstance(raw_globs, list) or not raw_globs:
+        raise PolicyLoadError(
+            "policy declares 'unknown_surface_policy.project_candidate_path_globs' as "
+            f"{raw_globs!r}, expected a non-empty list of non-empty, matcher-v2-valid glob "
+            "strings (Issue #2339 AC9: malformed unknown_surface_policy must fail closed as "
+            "policy-unavailable, not silently approve)"
+        )
+    for glob in raw_globs:
+        if not isinstance(glob, str) or not glob:
+            raise PolicyLoadError(
+                "policy declares an entry in 'unknown_surface_policy.project_candidate_path_globs' "
+                f"as {glob!r}, expected a non-empty string (PR #2370 P1-1: fail closed rather than "
+                "silently skip an invalid candidate glob)"
+            )
+        if AllowedPathsMatcher.normalize_allowed_pattern(glob) is None:
+            raise PolicyLoadError(
+                f"policy declares 'unknown_surface_policy.project_candidate_path_globs' entry "
+                f"{glob!r} which is not a valid matcher-v2 glob (PR #2370 P1-1: an invalid glob "
+                "must fail closed rather than be silently read as 'continue'/never match)"
+            )
+
+    return {
+        "decision": decision,
+        "gate": gate,
+        "project_candidate_path_globs": raw_globs,
+    }
+
+
 def load_policy(policy_path: Optional[Path] = None) -> dict[str, Any]:
     """Load, parse, and cheaply validate the extension-surface risk-trigger
     policy YAML. Raises ``PolicyLoadError`` (never returns a partially
@@ -200,20 +280,47 @@ def _one_is_prefix_of_other(a: list[str], b: list[str]) -> bool:
     return longer[: len(shorter)] == shorter
 
 
-def _project_path_globs(rule: dict[str, Any]) -> list[str]:
-    """All ``path_globs`` from a rule's ``selectors[].source_scope: project`` entries.
+_DEFAULT_ISSUE_TIME_ENFORCEMENT = "hard"
+
+
+def _project_path_globs(rule: dict[str, Any]) -> list[tuple[str, str]]:
+    """``(path_glob, issue_time_enforcement)`` pairs from a rule's
+    ``selectors[].source_scope: project`` entries.
 
     ``runtime_resolved_only`` selectors (user/managed/plugin/session/cli
     source_scope) carry no ``path_globs`` and are intentionally excluded --
     they cannot be evaluated against repository-relative Allowed Paths
     (Issue #2290 In Scope: ``selectors[].source_scope: project`` only).
+
+    Each project selector may declare its own ``issue_time_enforcement``
+    (``hard`` / ``advisory``, Issue #2356). A selector that omits the field
+    is treated as ``hard`` -- the required runtime fallback for existing
+    rules that predate this field (e.g. ``claude-gpt-lifecycle-invocation-change``).
+    Pairing the enforcement value with each glob (instead of returning a
+    flat ``list[str]``) preserves selector identity so callers can derive
+    advisory/hard per-glob rather than relying on a separate hardcoded
+    constant (Issue #2356; supersedes the removed ``CANDIDATE_ONLY_PATH_GLOBS``
+    frozenset from Issue #2290 / PR #2335).
     """
-    globs: list[str] = []
+    pairs: list[tuple[str, str]] = []
     for selector in rule.get("selectors", []) or []:
         if selector.get("source_scope") != "project":
             continue
-        globs.extend(selector.get("path_globs", []) or [])
-    return globs
+        raw_issue_time_enforcement = selector.get("issue_time_enforcement")
+        if raw_issue_time_enforcement is None:
+            issue_time_enforcement = _DEFAULT_ISSUE_TIME_ENFORCEMENT
+        elif raw_issue_time_enforcement in ("hard", "advisory"):
+            issue_time_enforcement = raw_issue_time_enforcement
+        else:
+            raise PolicyLoadError(
+                "project selector declares unsupported issue_time_enforcement "
+                f"{raw_issue_time_enforcement!r} (expected 'hard', 'advisory', or omitted; "
+                "a malformed value must fail closed rather than silently degrade to "
+                "'advisory', PR #2359 OWNER review fix_delta, Issue #2356)"
+            )
+        for path_glob in selector.get("path_globs", []) or []:
+            pairs.append((path_glob, issue_time_enforcement))
+    return pairs
 
 
 def _selector_remainder_after_prefix(normalized_selector: str, prefix_len: int) -> list[str]:
@@ -243,26 +350,26 @@ def _is_single_file_at_any_depth_selector(normalized_selector: str, selector_pre
 def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Return a match-info dict if ``entry`` is a candidate for ``rule``, else ``None``.
 
-    A rule may declare more than one ``path_glob`` (e.g.
-    ``skill-invocation-procedure-or-contract-change`` declares both
-    ``.claude/skills/**/SKILL.md`` and ``.claude/skills/**/scripts/**``).
-    For a *wildcard* Allowed Path entry, the conservative static-prefix
-    comparison can match several of the rule's globs at once with equal
-    confidence (e.g. an entry whose prefix is ``.claude/skills/foo`` is an
-    equally valid conservative match against both globs above). Picking
-    only the first glob encountered is an ordering artifact, not a
-    judgment -- if picking the "wrong" glob silently turns a
-    candidate-discovery-only match (``CANDIDATE_ONLY_PATH_GLOBS``) into a
-    hard-block match, the gate self-contradicts on its own declared
-    Allowed Paths (PR #2335 OWNER review fix_delta, Issue #2290 P0
-    re-fix). To stay on the documented "conservative" side (false
+    A rule may declare more than one project selector, each pairing its
+    ``path_globs`` with its own ``issue_time_enforcement`` (e.g.
+    ``skill-invocation-procedure-or-contract-change`` declares a ``hard``
+    selector for ``.claude/skills/**/SKILL.md`` and a separate ``advisory``
+    selector for ``.claude/skills/**/scripts/**``, Issue #2356). For a
+    *wildcard* Allowed Path entry, the conservative static-prefix comparison
+    can match several of the rule's globs at once with equal confidence
+    (e.g. an entry whose prefix is ``.claude/skills/foo`` is an equally
+    valid conservative match against both globs above). Picking only the
+    first glob encountered is an ordering artifact, not a judgment -- if
+    picking the "wrong" glob silently turns an advisory (candidate-discovery-
+    only) match into a hard-block match, the gate self-contradicts on its
+    own declared Allowed Paths (PR #2335 OWNER review fix_delta, Issue
+    #2290 P0 re-fix). To stay on the documented "conservative" side (false
     negatives are acceptable, false positives are not; but a hard block
     triggered purely by glob-iteration order is itself a false positive
-    here), a wildcard entry that ambiguously matches both a
-    candidate-only glob and a non-candidate-only glob within the same
-    rule is resolved to the candidate-only (advisory) match. An entry
-    that matches only candidate-only globs, or only non-candidate-only
-    globs, is unambiguous and keeps its natural classification.
+    here), a wildcard entry that ambiguously matches both an advisory glob
+    and a hard glob within the same rule is resolved to the advisory match.
+    An entry that matches only advisory globs, or only hard globs, is
+    unambiguous and keeps its natural classification.
     """
     normalized_entry_pattern = AllowedPathsMatcher.normalize_allowed_pattern(entry)
     if normalized_entry_pattern is None:
@@ -270,7 +377,7 @@ def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[
     is_wildcard = "*" in normalized_entry_pattern
 
     matches: list[dict[str, Any]] = []
-    for path_glob in _project_path_globs(rule):
+    for path_glob, issue_time_enforcement in _project_path_globs(rule):
         normalized_selector = AllowedPathsMatcher.normalize_allowed_pattern(path_glob)
         if normalized_selector is None:
             continue
@@ -291,6 +398,7 @@ def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[
                     "match_kind": "exact",
                     "allowed_path_entry": entry,
                     "path_glob": path_glob,
+                    "issue_time_enforcement": issue_time_enforcement,
                 }
             continue
 
@@ -330,23 +438,62 @@ def match_allowed_path_entry(entry: str, rule: dict[str, Any]) -> Optional[dict[
                 "match_kind": "conservative_wildcard_prefix",
                 "allowed_path_entry": entry,
                 "path_glob": path_glob,
+                "issue_time_enforcement": issue_time_enforcement,
             }
         )
 
     if not matches:
         return None
 
-    candidate_only_hits = [m for m in matches if m["path_glob"] in CANDIDATE_ONLY_PATH_GLOBS]
-    non_candidate_only_hits = [m for m in matches if m["path_glob"] not in CANDIDATE_ONLY_PATH_GLOBS]
-    if candidate_only_hits and non_candidate_only_hits:
+    advisory_hits = [m for m in matches if m["issue_time_enforcement"] == "advisory"]
+    hard_hits = [m for m in matches if m["issue_time_enforcement"] == "hard"]
+    if advisory_hits and hard_hits:
         # Ambiguous: the same wildcard entry's conservative prefix matched
-        # both a candidate-only glob and a non-candidate-only glob within
-        # this rule, with no basis to prefer one over the other. Resolve
-        # to the candidate-only (advisory) match rather than the hard
-        # match to avoid a glob-iteration-order-dependent hard block.
-        return candidate_only_hits[0]
+        # both an advisory selector and a hard selector within this rule,
+        # with no basis to prefer one over the other. Resolve to the
+        # advisory match rather than the hard match to avoid a
+        # glob-iteration-order-dependent hard block.
+        return advisory_hits[0]
 
     return matches[0]
+
+
+def _matches_candidate_perimeter(entry: str, candidate_path_globs: list[str]) -> Optional[str]:
+    """Return the first ``unknown_surface_policy.project_candidate_path_globs``
+    entry that ``entry`` is a conservative candidate for, else ``None``.
+
+    Mirrors ``match_allowed_path_entry``'s exact-match / conservative
+    static-prefix-overlap comparison against a rule's ``path_globs``, but
+    against the flat candidate-perimeter glob list instead of a rule's
+    selectors (the candidate perimeter has no ``source_scope`` /
+    ``issue_time_enforcement`` concept -- Issue #2339 AC11: it is a
+    project-local-only, repository-relative glob list, never resolved
+    against user/managed/plugin/session/cli source_scope surfaces).
+    """
+    normalized_entry_pattern = AllowedPathsMatcher.normalize_allowed_pattern(entry)
+    if normalized_entry_pattern is None:
+        return None
+    is_wildcard = "*" in normalized_entry_pattern
+
+    for glob in candidate_path_globs:
+        normalized_glob = AllowedPathsMatcher.normalize_allowed_pattern(glob)
+        if normalized_glob is None:
+            continue
+
+        if not is_wildcard:
+            normalized_file = AllowedPathsMatcher.normalize_path(entry)
+            if normalized_file is None:
+                continue
+            if AllowedPathsMatcher.matches_pattern(normalized_file, normalized_glob):
+                return glob
+            continue
+
+        entry_prefix = _static_prefix_segments(normalized_entry_pattern)
+        glob_prefix = _static_prefix_segments(normalized_glob)
+        if _one_is_prefix_of_other(entry_prefix, glob_prefix):
+            return glob
+
+    return None
 
 
 def evaluate_allowed_paths(
@@ -360,13 +507,31 @@ def evaluate_allowed_paths(
     In Scope, bullet 2) and derives the union of required
     ``verification_profiles`` from the matched rules (Issue #2290 In Scope,
     bullet 3).
+
+    Issue #2339: each declared Allowed Path entry is additionally
+    classified into exactly one of ``matched_rule`` / ``unclassified_candidate``
+    / ``ordinary`` (``path_classifications``), and any ``unclassified_candidate``
+    entry (a ``unknown_surface_policy.project_candidate_path_globs`` match
+    with no known rule selector match) contributes a non-blocking
+    ``advisories`` message. ``unclassified_candidate`` entries never
+    contribute to ``final_decision`` -- only ``matched_rule`` entries with
+    ``enforcement: hard`` do (unchanged from Issue #2290/#2356 semantics).
     """
     policy_data = policy if policy is not None else load_policy()
     rules = policy_data.get("rules", []) or []
+    unknown_surface_policy = _extract_unknown_surface_policy(policy_data)
+    candidate_path_globs = unknown_surface_policy["project_candidate_path_globs"]
+    # PR #2370 P1-3: `decision` / `gate` are read (not dead metadata) and
+    # surfaced verbatim on every `unclassified_candidate` classification
+    # below via `policy_action`, but never merged into `final_decision`
+    # (Issue #2339 AC8) -- `human_judgment` never appears as a
+    # `final_decision` value.
+    policy_action = {"decision": unknown_surface_policy["decision"], "gate": unknown_surface_policy["gate"]}
 
     matched_rules: list[dict[str, Any]] = []
     verification_profiles: set[str] = set()
     final_decision: Optional[str] = None
+    entries_with_rule_hit: set[str] = set()
 
     for rule in rules:
         match_hits: list[dict[str, Any]] = []
@@ -374,10 +539,11 @@ def evaluate_allowed_paths(
             hit = match_allowed_path_entry(entry, rule)
             if hit is not None:
                 match_hits.append(hit)
+                entries_with_rule_hit.add(entry)
         if not match_hits:
             continue
 
-        hard_hits = [hit for hit in match_hits if hit["path_glob"] not in CANDIDATE_ONLY_PATH_GLOBS]
+        hard_hits = [hit for hit in match_hits if hit["issue_time_enforcement"] == "hard"]
         enforcement = "hard" if hard_hits else "advisory"
 
         rule_decision = rule.get("default_decision")
@@ -393,13 +559,47 @@ def evaluate_allowed_paths(
         )
         if rule_profile:
             verification_profiles.add(rule_profile)
-        # Advisory-only matches (every hit's path_glob is in
-        # CANDIDATE_ONLY_PATH_GLOBS) are candidate discovery signals, not a
-        # hard block -- they never contribute to final_decision (Issue #2290
-        # P0 fix delta, PR #2335).
+        # Advisory-only matches (every hit's selector declares
+        # issue_time_enforcement: advisory) are candidate discovery
+        # signals, not a hard block -- they never contribute to
+        # final_decision (Issue #2290 P0 fix delta, PR #2335; derivation
+        # migrated from the removed CANDIDATE_ONLY_PATH_GLOBS constant to
+        # selector-declared issue_time_enforcement by Issue #2356).
         if enforcement == "hard" and rule_decision in DECISION_RANK:
             if final_decision is None or DECISION_RANK[rule_decision] > DECISION_RANK[final_decision]:
                 final_decision = rule_decision
+
+    # Issue #2339: classify every declared entry that matched no rule as
+    # either `unclassified_candidate` (a project_candidate_path_globs hit)
+    # or `ordinary` (no candidate glob hit either). `matched_rule` entries
+    # keep their existing `matched_rules` representation above; this pass
+    # only adds the three-way per-entry classification view, it does not
+    # change any existing matched-rule semantics.
+    path_classifications: list[dict[str, Any]] = []
+    advisories: list[str] = []
+    for entry in allowed_path_entries:
+        if entry in entries_with_rule_hit:
+            path_classifications.append({"entry": entry, "classification": "matched_rule"})
+            continue
+        candidate_glob = _matches_candidate_perimeter(entry, candidate_path_globs)
+        if candidate_glob is not None:
+            path_classifications.append(
+                {
+                    "entry": entry,
+                    "classification": "unclassified_candidate",
+                    "candidate_path_glob": candidate_glob,
+                    "policy_action": policy_action,
+                }
+            )
+            advisories.append(
+                f"Allowed Path entry '{entry}' matches the project-local extension candidate "
+                f"perimeter glob '{candidate_glob}' (unknown_surface_policy.project_candidate_path_globs) "
+                "but no known extension-surface risk-trigger rule selector. This is a non-blocking "
+                "advisory -- verdict: approve, final_decision unaffected -- surfaced so a human can "
+                "confirm whether this is a genuine new extension surface (Issue #2339)."
+            )
+        else:
+            path_classifications.append({"entry": entry, "classification": "ordinary"})
 
     return {
         "schema": SCHEMA_POLICY_EVALUATION,
@@ -411,6 +611,8 @@ def evaluate_allowed_paths(
             "multiple_matches": (policy_data.get("resolution") or {}).get("multiple_matches"),
             "final_decision_strategy": (policy_data.get("resolution") or {}).get("final_decision"),
         },
+        "path_classifications": path_classifications,
+        "advisories": advisories,
     }
 
 
@@ -486,4 +688,8 @@ def evaluate_issue_risk_trigger(
         "reasons": reasons,
         "policy_evaluation": policy_evaluation,
         "missing_rva_immediate_fields": missing_fields,
+        # Issue #2339: `unclassified_candidate` advisories (non-blocking --
+        # never contribute to `reasons`/`verdict`; verdict stays `approve`
+        # when reasons is empty even if advisories is non-empty, AC6).
+        "advisories": policy_evaluation.get("advisories", []),
     }

@@ -291,6 +291,86 @@ def _validate_candidate_records(records: Sequence[dict[str, Any]]) -> None:
         seen_ids.add(candidate_id)
 
 
+def _parse_wire_payload(cls: type["_WireEnvelope"], text: str) -> dict[str, Any]:
+    """Generic wire-envelope field-shape validation (Issue #2362): oversize
+    bound, JSON decode, unknown-field / missing-field / type-mismatch
+    checks, and the recursive ``_scan_for_smuggled_keys()`` nested scan.
+    Returns the validated raw payload dict WITHOUT constructing ``cls`` --
+    this is the single shared implementation `_WireEnvelope.from_wire()`
+    (which constructs `cls` immediately afterwards, firing
+    `_post_validate()` via `__post_init__`) and the deterministic-
+    enrichment outer-envelope-parse phase (`run_evaluation()`, which needs
+    the validated payload dict BEFORE `Evaluation` is constructed so
+    `_post_validate()`/`_validate_candidate_records()` do not fire until
+    after enrichment) both call, so this generic validation logic is
+    implemented exactly once."""
+    raw_bytes = text.encode("utf-8")
+    if len(raw_bytes) > MAX_ENVELOPE_BYTES:
+        raise WireContractError("envelope_oversize", reason_code="oversize")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise WireContractError(f"invalid_json:{exc}", reason_code="decode_failure") from exc
+    if not isinstance(payload, dict):
+        raise WireContractError("payload_not_object", reason_code="decode_failure")
+
+    declared_fields = {f.name: f for f in dataclasses.fields(cls)}
+    resolved_types = typing.get_type_hints(cls)
+    payload_keys = set(payload.keys())
+    declared_keys = set(declared_fields.keys())
+
+    unknown = payload_keys - declared_keys
+    if unknown:
+        raise WireContractError(f"unknown_fields:{sorted(unknown)}", reason_code="unknown_field")
+    missing = declared_keys - payload_keys
+    if missing:
+        raise WireContractError(f"missing_fields:{sorted(missing)}", reason_code="missing_field")
+
+    for name in declared_keys:
+        annotation = resolved_types.get(name, Any)
+        if not _check_field_type(payload[name], annotation):
+            raise WireContractError(f"field_type_mismatch:{name}", reason_code="type_mismatch")
+
+    # nested smuggled-authority-field scan (P0-3): every nested dict/list
+    # value is walked, not just the top-level key set.
+    for name in declared_keys:
+        _scan_for_smuggled_keys(payload[name], f"$.{name}")
+
+    return payload
+
+
+def _retry_wire_parse(
+    raw_text: str,
+    parse_fn: Callable[[str], Any],
+    *,
+    repair: Callable[[str, "WireContractError"], str] | None,
+    max_retries: int,
+) -> Any:
+    """Shared retry-on-``WireContractError`` loop (AC14): both
+    ``parse_agent_output_with_repair`` (constructs the envelope) and
+    ``run_evaluation()``'s parse -> deterministic-enrichment -> canonical-
+    construction pipeline (Issue #2367 fix_delta item 6 -- the ``repair``
+    boundary covers all three steps, not only the outer-envelope parse)
+    delegate to this single implementation for identical retry/backoff
+    semantics."""
+    attempt = 0
+    text = raw_text
+    last_error: WireContractError | None = None
+    while True:
+        try:
+            return parse_fn(text)
+        except WireContractError as exc:
+            last_error = exc
+            if attempt >= max_retries or repair is None:
+                break
+            text = repair(text, exc)
+            attempt += 1
+    raise SchemaRepairExhausted(
+        f"schema_repair_exhausted:attempts={attempt + 1}:{last_error}",
+        reason_code=(last_error.reason_code if last_error else "unknown"),
+    )
+
+
 @dataclass
 class _WireEnvelope:
     """Mixin base for every ephemeral wire contract dataclass. Subclasses
@@ -314,38 +394,11 @@ class _WireEnvelope:
 
     @classmethod
     def from_wire(cls, text: str) -> "_WireEnvelope":
-        raw_bytes = text.encode("utf-8")
-        if len(raw_bytes) > MAX_ENVELOPE_BYTES:
-            raise WireContractError("envelope_oversize", reason_code="oversize")
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise WireContractError(f"invalid_json:{exc}", reason_code="decode_failure") from exc
-        if not isinstance(payload, dict):
-            raise WireContractError("payload_not_object", reason_code="decode_failure")
-
-        declared_fields = {f.name: f for f in dataclasses.fields(cls)}
-        resolved_types = typing.get_type_hints(cls)
-        payload_keys = set(payload.keys())
-        declared_keys = set(declared_fields.keys())
-
-        unknown = payload_keys - declared_keys
-        if unknown:
-            raise WireContractError(f"unknown_fields:{sorted(unknown)}", reason_code="unknown_field")
-        missing = declared_keys - payload_keys
-        if missing:
-            raise WireContractError(f"missing_fields:{sorted(missing)}", reason_code="missing_field")
-
-        for name in declared_keys:
-            annotation = resolved_types.get(name, Any)
-            if not _check_field_type(payload[name], annotation):
-                raise WireContractError(f"field_type_mismatch:{name}", reason_code="type_mismatch")
-
-        # nested smuggled-authority-field scan (P0-3): every nested dict/list
-        # value is walked, not just the top-level key set.
-        for name in declared_keys:
-            _scan_for_smuggled_keys(payload[name], f"$.{name}")
-
+        # Issue #2362: generic field-shape validation (oversize/decode/
+        # unknown/missing/type_mismatch + nested smuggled-key scan) lives in
+        # the shared `_parse_wire_payload()` helper -- see that function's
+        # docstring for why this must not be reimplemented here.
+        payload = _parse_wire_payload(cls, text)
         try:
             instance = cls(**payload)
         except TypeError as exc:  # pragma: no cover - defensive, shape already checked above
@@ -517,23 +570,22 @@ def parse_agent_output_with_repair(
     """Parse ``raw_text`` (a serialized Agent output string) as
     ``envelope_cls``, retrying via ``repair`` up to ``max_retries`` times on
     ``WireContractError`` (AC14). Raises ``SchemaRepairExhausted`` -- never
-    returns a partially-valid result -- once the retry budget is spent."""
-    attempt = 0
-    text = raw_text
-    last_error: WireContractError | None = None
-    while True:
-        try:
-            return envelope_cls.from_wire(text)
-        except WireContractError as exc:
-            last_error = exc
-            if attempt >= max_retries or repair is None:
-                break
-            text = repair(text, exc)
-            attempt += 1
-    raise SchemaRepairExhausted(
-        f"schema_repair_exhausted:attempts={attempt + 1}:{last_error}",
-        reason_code=(last_error.reason_code if last_error else "unknown"),
-    )
+    returns a partially-valid result -- once the retry budget is spent.
+
+    NOTE: for ``envelope_cls`` subclasses whose ``_post_validate()`` does
+    more than generic field-shape checks (e.g. ``Evaluation``'s canonical
+    candidate-schema validation), constructing ``envelope_cls`` here means
+    those subclass-specific checks run INSIDE this retry loop too (via
+    ``from_wire()``'s ``cls(**payload)`` -> ``__post_init__`` ->
+    ``_post_validate()``). ``run_evaluation()`` (Issue #2362/#2367)
+    deliberately does NOT call this function for ``Evaluation`` -- a
+    deterministic-enrichment phase must run BETWEEN outer-envelope parsing
+    and canonical construction (Issue #2362 steps 2-3), so it builds its
+    own parse -> enrich -> construct pipeline function and drives it
+    through ``_retry_wire_parse`` directly (Issue #2367 fix_delta item 6),
+    so one ``repair`` attempt covers the full pipeline, not only the
+    outer-envelope parse."""
+    return _retry_wire_parse(raw_text, envelope_cls.from_wire, repair=repair, max_retries=max_retries)
 
 
 # ---------------------------------------------------------------------------
@@ -690,21 +742,52 @@ def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if k in _DEFAULT_ENV_PASSTHROUGH_ALLOWLIST}
 
 
-#: matches a single leading/trailing markdown code fence around a JSON blob
-#: (```json ... ``` or bare ``` ... ```), used only by
-#: `_structured_output_from_result_compat` below.
-_MARKDOWN_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*)\n```\s*$", re.DOTALL)
+#: Matches every markdown fence *delimiter* line (an opening line such as
+#: ```json / ```text / ```python / bare ``` , OR a closing bare ``` line),
+#: allowing up to 3 leading spaces of indent per GFM. `_iter_fenced_json_candidates`
+#: below pairs up consecutive fence-delimiter matches (1st+2nd, 3rd+4th, ...)
+#: as (opener, closer) regardless of the opener's info string, then filters
+#: pairs down to those whose opener info string is "" or "json"
+#: (case-insensitive). This fixes Issue #2348's regression where a
+#: foreign-language fenced block (e.g. ```text ... ```) appearing before the
+#: real ```json ... ``` block had its own *closing* fence misread as a new
+#: bare *opening* fence by the prior opener-only regex, silently swallowing
+#: the real JSON block's closing fence and making the real candidate vanish
+#: from `finditer()` results entirely.
+_FENCE_DELIMITER_RE = re.compile(r"^[ \t]{0,3}```([^\n`]*)$", re.MULTILINE)
 
 
-def _extract_fenced_json_text(text: str) -> str:
-    """Strip a single leading/trailing markdown code fence from `text` if
-    present (returns `text` stripped of surrounding whitespace unchanged
-    otherwise). Pure string transform -- callers still parse/validate the
-    result themselves (Issue #2301 live verification compat recovery, see
-    `_structured_output_from_result_compat`)."""
-    stripped = text.strip()
-    match = _MARKDOWN_JSON_FENCE_RE.match(stripped)
-    return match.group(1).strip() if match else stripped
+def _iter_fenced_json_candidates(text: str) -> list[str]:
+    """Enumerate the body text of every JSON-eligible markdown fenced code
+    block found anywhere within `text`, in encounter order (Issue #2348).
+
+    Unlike the pre-#2348 implementation, which matched only ```json / bare
+    ``` *opener* fences directly via a single regex (and thus silently
+    misread a foreign-language fence's *closing* delimiter as a new bare
+    opener, corrupting subsequent fence pairing -- see
+    `_FENCE_DELIMITER_RE` docstring), this scans every backtick fence
+    delimiter line first, regardless of its info string, and pairs them up
+    sequentially (1st opener + 2nd closer, 3rd opener + 4th closer, ...).
+    Only pairs whose opener info string is "" or "json" (case-insensitive)
+    are returned as JSON candidates; foreign-language fences (```text,
+    ```python, ...) are paired and skipped, not misread as delimiters of an
+    unrelated block. An unpaired trailing fence (odd total delimiter count)
+    is ignored. Pure string transform -- callers still parse/validate each
+    candidate themselves (`_structured_output_from_result_compat`)."""
+    fence_matches = list(_FENCE_DELIMITER_RE.finditer(text))
+    candidates: list[str] = []
+    for opener, closer in zip(fence_matches[0::2], fence_matches[1::2]):
+        info = opener.group(1).strip().lower()
+        if info not in ("", "json"):
+            continue
+        content_start = opener.end()
+        if content_start < len(text) and text[content_start] == "\n":
+            content_start += 1
+        content = text[content_start:closer.start()]
+        if content.endswith("\n"):
+            content = content[:-1]
+        candidates.append(content.strip())
+    return candidates
 
 
 def _structured_output_from_result_compat(
@@ -723,30 +806,60 @@ def _structured_output_from_result_compat(
     --json-schema ...` invocations, which populate `structured_output`
     directly, these custom-subagent invocations were observed to omit
     `structured_output` and instead carry the schema-conformant JSON in
-    `result` (frequently wrapped in a markdown ```json code fence). This is
-    an observation about invocations actually exercised, not an absolute
-    claim covering every possible custom-subagent invocation. The recovered
-    payload is accepted only if it independently, strictly validates against
+    `result` (frequently wrapped in a markdown ```json code fence, with the
+    fence itself sometimes preceded and/or followed by explanatory prose --
+    Issue #2348 root cause: the prior whole-string anchor regex required the
+    fence to be the *entire* `result` text and silently failed on this
+    common shape). This is an observation about invocations actually
+    exercised, not an absolute claim covering every possible custom-subagent
+    invocation.
+
+    Recovery strategy (Issue #2348): every markdown fenced code block found
+    anywhere in `result` (see `_iter_fenced_json_candidates`) is treated as
+    an independent JSON candidate; if `result` contains no fence at all, the
+    whole (stripped) `result` text is treated as the sole candidate
+    (preserves the pre-#2348 behavior for unfenced `result` text). Each
+    candidate is independently parsed with `json.loads` and, only if that
+    succeeds and yields a dict, independently, strictly validated against
     the exact schema file this invocation was given (`request.
     json_schema_path`) -- mirrors the Issue #2237 P0-1 rationale against
-    re-parsing the *wrapper* itself as the business schema: a
-    malformed/absent `result`, or one that fails schema validation, is never
-    silently accepted as `ok`."""
+    re-parsing the *wrapper* itself as the business schema. The recovered
+    payload is returned only when EXACTLY ONE candidate both parses as JSON
+    and passes schema validation: zero schema-valid candidates is the
+    pre-existing `missing_structured_output` fail-closed outcome, and MORE
+    THAN ONE schema-valid candidate is treated as ambiguous and also
+    rejected (fail-closed) rather than guessing which fence is the intended
+    business payload. A malformed/absent `result`, or one where no
+    candidate passes schema validation, is never silently accepted as
+    `ok`."""
     result_text = payload.get("result")
     if not isinstance(result_text, str) or not result_text.strip():
         return None
     try:
-        candidate = json.loads(_extract_fenced_json_text(result_text))
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(candidate, dict):
-        return None
-    try:
         schema = json.loads(Path(json_schema_path).read_text(encoding="utf-8"))
-        jsonschema.validate(candidate, schema)
-    except (OSError, json.JSONDecodeError, jsonschema.exceptions.ValidationError, jsonschema.exceptions.SchemaError):
+    except (OSError, json.JSONDecodeError):
         return None
-    return candidate
+
+    fenced_candidates = _iter_fenced_json_candidates(result_text)
+    candidate_texts = fenced_candidates if fenced_candidates else [result_text.strip()]
+
+    schema_valid_candidates: list[dict[str, Any]] = []
+    for candidate_text in candidate_texts:
+        try:
+            candidate = json.loads(candidate_text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            jsonschema.validate(candidate, schema)
+        except (jsonschema.exceptions.ValidationError, jsonschema.exceptions.SchemaError):
+            continue
+        schema_valid_candidates.append(candidate)
+
+    if len(schema_valid_candidates) != 1:
+        return None
+    return schema_valid_candidates[0]
 
 
 def build_agent_invocation_argv(
@@ -1175,11 +1288,488 @@ def prepare_evaluator_request(
     )
 
 
+#: `finding_contract.identity.key` components that are model-judgment
+#: (evaluator-authoritative) values, per Issue #2362's Identity/
+#: Deterministic Field Authority Matrix. `repository_id` is deliberately
+#: excluded -- it is always Python-side caller context, never evaluator
+#: judgment (see `_enrich_candidate_record`).
+_IDENTITY_KEY_JUDGMENT_FIELDS = ("claim_class", "subject_ref", "rule_id")
+
+
+def _extract_candidate_identity_judgment(raw_candidate: dict[str, Any]) -> dict[str, Any]:
+    """Judgment-only extraction (Issue #2362, Scope Reframe 2026-08-28) for
+    a single raw (not yet validated) candidate record dict: pulls ONLY the
+    `claim_class`/`subject_ref`/`rule_id` model-judgment values a
+    deterministic `identity.key` needs. `repository_id` and any
+    evaluator-supplied `identity`/`finding_contract`/`evaluations` are never
+    read here -- the judgment-only wire schema
+    (`schemas/evaluation_result_v1.schema.json`) no longer even accepts
+    those fields from the evaluator, and `_enrich_candidate_record` always
+    (re)constructs `identity`/`evaluations` from Python-side context /
+    `compute_finding_identity()` / `compute_delta()`.
+
+    `claim_class`/`subject_ref`/`rule_id` are now TOP-LEVEL fields on
+    `raw_candidate` (the judgment-only wire shape has no `finding_contract`
+    nesting at all -- unlike the superseded Issue #2362 design this Scope
+    Reframe replaces, where the evaluator still nested a fully-shaped
+    `finding_contract.identity.key`).
+
+    Returns an all-``None`` judgment dict when `raw_candidate` is not a
+    dict -- callers (`_enrich_candidate_record`) that need a schema-valid
+    `identity.key` are responsible for letting the subsequent canonical
+    candidate validation (which fires only after enrichment, at
+    `Evaluation` construction) reject a candidate with missing judgment
+    values; this extraction step itself never raises."""
+    if not isinstance(raw_candidate, dict):
+        return {field_name: None for field_name in _IDENTITY_KEY_JUDGMENT_FIELDS}
+    return {
+        "claim_class": raw_candidate.get("claim_class"),
+        "subject_ref": raw_candidate.get("subject_ref"),
+        "rule_id": raw_candidate.get("rule_id"),
+    }
+
+
+#: `subject_ref.kind` enum (mirrors `agent_improvement_candidate_v1.schema.json`
+#: `$defs.subject_ref.properties.kind.enum` -- duplicated here only as a
+#: shape-validity check for `_is_valid_subject_ref_judgment`, never as an
+#: independent authority; the canonical schema remains the SSOT for
+#: `Evaluation` construction).
+_SUBJECT_REF_KINDS = frozenset({"repository_path", "issue", "pull_request", "workflow", "runtime", "external_resource"})
+
+#: mirrors `agent_improvement_candidate_v1.schema.json`
+#: `$defs.finding_identity.key.properties.rule_id.pattern`.
+_RULE_ID_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)*$")
+
+
+def _is_valid_subject_ref_judgment(value: Any) -> bool:
+    """Shape-validity check (Issue #2362) for an evaluator-supplied
+    `subject_ref` candidate: mirrors (does not replace) the canonical
+    schema's `$defs.subject_ref` constraints closely enough to decide
+    whether this value is safe to use as-is. `retrospective-evaluator.md`'s
+    own prompt/frontmatter shows only a `{"...": "..."}` placeholder for
+    `identity.key` (frozen, Out of Scope) -- a real evaluator response
+    cannot always be relied on to nest a schema-conforming `subject_ref`
+    there. Issue #2367 fix_delta item 3 (superseding the earlier Issue
+    #2362 design): when this check fails, `_enrich_candidate_record` no
+    longer substitutes a Python-synthesized `_fallback_subject_ref` --
+    `subject_ref`/`rule_id` are evaluator judgment per Issue #2362's
+    Identity/Deterministic Field Authority Matrix, and synthesizing them
+    from `candidate_id` degrades cross-run finding identity correlation to
+    the candidate lifecycle ID. A failing check now raises a typed
+    `WireContractError(reason_code="candidate_schema_invalid")` instead."""
+    if not isinstance(value, dict) or set(value.keys()) != {"kind", "value"}:
+        return False
+    kind = value.get("kind")
+    ref_value = value.get("value")
+    if kind not in _SUBJECT_REF_KINDS or not isinstance(ref_value, str) or not ref_value:
+        return False
+    if kind in ("issue", "pull_request") and not re.fullmatch(r"[0-9]+", ref_value):
+        return False
+    if kind == "repository_path" and (
+        ref_value.startswith("/") or ref_value.startswith("./") or re.search(r"(^|/)\.\.(/|$)", ref_value)
+    ):
+        return False
+    return True
+
+
+def _is_valid_rule_id_judgment(value: Any) -> bool:
+    """Shape-validity check (Issue #2362) mirroring
+    `agent_improvement_candidate_v1.schema.json`
+    `$defs.finding_identity.key.properties.rule_id.pattern` -- see
+    `_is_valid_subject_ref_judgment`'s docstring for why a failing check
+    (Issue #2367 fix_delta item 3) raises `candidate_schema_invalid`
+    instead of substituting a Python-synthesized fallback."""
+    return isinstance(value, str) and bool(_RULE_ID_RE.fullmatch(value))
+
+
+def _observer_source_type_index(
+    finding_sets: Sequence[dict[str, Any]], manifest: Sequence[ObserverRoleSpec] = EXPECTED_OBSERVER_MANIFEST
+) -> dict[str, list[dict[str, Any]]]:
+    """Build a ``source_type -> real observer findings`` index from
+    ``evaluator_request.finding_sets`` (Issue #2362 Scope Reframe): the
+    ACTUAL, already public-safe/redacted evidence data the evaluator had
+    available this run, grouped by the observer's ``source_type`` (per
+    ``EXPECTED_OBSERVER_MANIFEST``: ``runtime``/``repository``/``web``).
+    Used only to recompute ``evidence_refs[].projection_digest`` from real
+    data (`_enrich_evidence_ref`) -- never to fabricate evidence. A
+    ``source_id`` with no corresponding observer in ``manifest`` (e.g.
+    ``github`` -- no observer in the current 3-observer manifest produces
+    GitHub-sourced findings) or whose observer reported zero findings has
+    no entry here, which is the correct "no real evidence available"
+    signal `_enrich_evidence_ref` uses to fail closed rather than
+    fabricate a digest."""
+    source_type_by_id = {spec.observer_id: spec.source_type for spec in manifest}
+    index: dict[str, list[dict[str, Any]]] = {}
+    for finding_set in finding_sets:
+        if not isinstance(finding_set, dict):
+            continue
+        source_type = source_type_by_id.get(finding_set.get("observer_id"))
+        if source_type is None:
+            continue
+        findings = finding_set.get("findings")
+        if isinstance(findings, list) and findings:
+            index.setdefault(source_type, []).extend(f for f in findings if isinstance(f, dict))
+    return index
+
+
+def _enrich_evidence_ref(
+    raw_ref: Any, *, real_evidence_index: dict[str, list[dict[str, Any]]]
+) -> dict[str, Any] | None:
+    """Recompute ``projection_digest`` for one evaluator-supplied
+    (judgment-only) ``evidence_ref`` from REAL evidence data (Issue #2362
+    Scope Reframe) -- the evaluator's own `ref_type`/`source_id`/
+    `resource_identity` judgment is trusted (it is genuine model judgment
+    about which evidence it examined), but the digest is always computed
+    here from the actual, real ``finding_sets`` content the evaluator was
+    given for that ``source_id`` (a JCS-canonicalized hash of the real,
+    already-redacted observer findings) -- NEVER from an evaluator-supplied
+    value (the wire schema does not even accept one) and NEVER from a
+    fabricated/placeholder string. Returns ``None`` (never a fabricated
+    digest) when `raw_ref` is malformed, or when `real_evidence_index` has
+    no real evidence for the claimed ``source_id`` (evaluator referenced a
+    source with no backing evidence this run -- honest failure, not
+    something to paper over); the caller (`_enrich_evidence_refs`) drops
+    such refs rather than keep an unverifiable claim."""
+    if not isinstance(raw_ref, dict):
+        return None
+    ref_type = raw_ref.get("ref_type")
+    source_id = raw_ref.get("source_id")
+    resource_identity = raw_ref.get("resource_identity")
+    if not (isinstance(ref_type, str) and ref_type):
+        return None
+    if not (isinstance(source_id, str) and source_id):
+        return None
+    if not (isinstance(resource_identity, str) and resource_identity):
+        return None
+    real_findings = real_evidence_index.get(source_id)
+    if not real_findings:
+        return None
+    projection = json.dumps(real_findings, sort_keys=True, separators=(",", ":"))
+    digest = "sha256:" + hashlib.sha256(projection.encode("utf-8")).hexdigest()
+    return {
+        "ref_type": ref_type,
+        "source_id": source_id,
+        "resource_identity": resource_identity,
+        "projection_digest": digest,
+    }
+
+
+def _enrich_evidence_refs(
+    raw_evidence_refs: Any, *, real_evidence_index: dict[str, list[dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """Apply `_enrich_evidence_ref` to every entry of the evaluator's
+    (judgment-only) ``evidence_refs`` list, dropping any entry that cannot
+    be backed by real evidence data (Issue #2362 Scope Reframe -- never
+    fabricate a digest to keep an unverifiable ref)."""
+    if not isinstance(raw_evidence_refs, list):
+        return []
+    enriched_refs = []
+    for raw_ref in raw_evidence_refs:
+        enriched_ref = _enrich_evidence_ref(raw_ref, real_evidence_index=real_evidence_index)
+        if enriched_ref is not None:
+            enriched_refs.append(enriched_ref)
+    return enriched_refs
+
+
+def _find_previous_candidate(previous_state: "PreviousStateResult", identity_value: str) -> dict[str, Any] | None:
+    """Look up the previous run's candidate record (if any) sharing the
+    same ``finding_contract.identity.value`` (Issue #2362 Scope Reframe) --
+    used to carry over the prior ``evaluations[]`` history so the new
+    entry this run produces is APPENDED to it, never replacing it."""
+    for candidate in previous_state.candidates:
+        if _finding_identity_value(candidate) == identity_value:
+            return candidate
+    return None
+
+
+def _classify_current_candidate_delta(previous_state: "PreviousStateResult", identity_value: str) -> dict[str, Any]:
+    """Classify ONE currently-reported candidate's presence/absence delta
+    against ``previous_state`` (Issue #2362 Scope Reframe -- AC3) by
+    delegating to `compute_delta()` (the exact same algorithm the
+    `PublishRequest.delta_results` sidecar uses -- no separate/duplicated
+    classification logic that could drift from it) with a single-item
+    current-candidates batch. `compute_delta()`'s "resolved" synthesis loop
+    (for previous identities absent from the batch) may append spurious
+    entries for OTHER previous candidates when given a singleton batch --
+    those are irrelevant here and discarded; only the entry whose
+    ``finding_identity`` matches `identity_value` is returned, since a
+    currently-reported candidate's own identity is always present in the
+    single-item ``current_identities`` set `compute_delta()` builds, so its
+    own classification entry is always produced."""
+    synthetic_candidate = {"finding_contract": {"identity": {"value": identity_value}}}
+    for result in compute_delta(previous_state, [synthetic_candidate]):
+        if result.get("finding_identity") == identity_value:
+            return result
+    # Defensive: compute_delta() always classifies a present current
+    # candidate with a resolvable identity value; reaching this branch
+    # signals an internal precondition violation, not a legitimate
+    # business classification -- fail closed rather than guess.
+    raise WireContractError(
+        f"delta_classification_unresolved:{identity_value}", reason_code="candidate_schema_invalid"
+    )
+
+
+#: maps `compute_delta()`'s coarse `delta_status` (for a CURRENTLY-reported
+#: candidate -- never `"resolved"`-for-absent, which `compute_delta()` only
+#: emits for previous-only identities, never through
+#: `_classify_current_candidate_delta`'s single-item-batch call) to a
+#: `presence_delta` value that keeps `agent_improvement_candidate_v1.schema.json`
+#: `$defs.evaluation`'s `allOf` presence/delta invariants internally
+#: consistent (Issue #2362 Scope Reframe): `presence_delta` `"new"`/
+#: `"resolved"`/`"recurrent"` each FORCE `delta_status` to the identical
+#: value, so those three map 1:1; `"unchanged"` maps to `"active"` +
+#: `signal_delta: "unknown"`, which together also force `delta_status`
+#: `"unchanged"` (the only remaining `allOf` branch), so the pairing stays
+#: consistent either way.
+_PRESENCE_DELTA_BY_DELTA_STATUS = {
+    "new": "new",
+    "resolved": "resolved",
+    "recurrent": "recurrent",
+    "unchanged": "active",
+}
+
+#: maps `PreviousStateResult.status` (when it forces `evaluation_status:
+#: "indeterminate"`) to a canonical `source_coverage` enum value for the
+#: entry `_build_evaluation_entry` constructs. `"stale"` has no identically-
+#: named `source_coverage` enum member -- `"unavailable"` is the closest
+#: honest characterization (previous data too old to treat as a reliable
+#: comparison baseline).
+_SOURCE_COVERAGE_BY_PREVIOUS_STATUS = {"partial": "partial", "stale": "unavailable"}
+
+
+def _build_evaluation_entry(
+    *,
+    classification: dict[str, Any],
+    prev_evaluations: list[dict[str, Any]],
+    evidence_refs: list[dict[str, Any]],
+    base_sha: str,
+    source_set_digest: str,
+    timestamp: str,
+    identity_value: str,
+    previous_status: str,
+) -> dict[str, Any]:
+    """Construct ONE full canonical `finding_contract.evaluations[]` entry
+    (Issue #2362 Scope Reframe -- AC3) entirely from Python-side
+    deterministic sources: `classification` (`_classify_current_candidate_delta`,
+    itself sourced from `compute_delta()`/`PreviousStateResult`),
+    `prev_evaluations` (the prior run's own history for this finding
+    identity, from `PreviousStateProvider`), and `evidence_refs` (already
+    digest-recomputed from real evidence data by `_enrich_evidence_refs`
+    -- never the evaluator's raw claim). Never parses or reads any
+    `evaluations[]` value from the evaluator's wire payload -- the
+    judgment-only wire schema does not even accept one.
+
+    Presence is the only continuous signal this module tracks (there is no
+    real numeric/metric pipeline behind `baseline_signal`/`current_signal`
+    -- inventing one would be exactly the kind of fabrication this Issue
+    exists to remove), so `current_signal`/`baseline_signal` (when set) are
+    always the same honest boolean "was this finding's identity present"
+    signal, `worse_direction: "not_applicable"`, matching this module's
+    superseded `_fallback_evaluation_entry`'s approach to the same
+    constraint (Issue #2367 fix_delta) -- never a fabricated numeric
+    severity/confidence score."""
+    previous_evaluation_ref = prev_evaluations[-1]["evaluation_id"] if prev_evaluations else None
+    evaluation_id_seed = f"evaluation_id:{identity_value}:{base_sha}:{source_set_digest}:{timestamp}".encode()
+    evaluation_id = "sha256:" + hashlib.sha256(evaluation_id_seed).hexdigest()
+    entry: dict[str, Any] = {
+        "evaluation_id": evaluation_id,
+        "evaluated_run_ref": {"base_sha": base_sha, "source_set_digest": source_set_digest},
+        "previous_evaluation_ref": previous_evaluation_ref,
+        "observed": True,
+        "classified_at": timestamp,
+        "classifier_version": "run_retrospective/v1",
+        "evidence_refs": evidence_refs,
+    }
+    if classification["evaluation_status"] == "indeterminate":
+        entry["source_coverage"] = _SOURCE_COVERAGE_BY_PREVIOUS_STATUS.get(previous_status, "unavailable")
+        entry["evaluation_status"] = "indeterminate"
+        entry["presence_delta"] = "active"
+        entry["signal_delta"] = "unknown"
+        entry["indeterminate_reason"] = classification.get("indeterminate_reason") or "source_partial"
+        entry["baseline_signal"] = None
+        entry["current_signal"] = None
+        entry["expected_signal"] = None
+        # `delta_status` intentionally OMITTED -- the canonical schema
+        # forbids the key entirely when `evaluation_status ==
+        # "indeterminate"` (Issue #2367 fix_delta item 1's fix, preserved).
+    else:
+        delta_status = classification["delta_status"]
+        presence_delta = _PRESENCE_DELTA_BY_DELTA_STATUS.get(delta_status, "active")
+        signal = {"signal_type": "boolean", "value": True, "comparator": "eq", "worse_direction": "not_applicable"}
+        entry["source_coverage"] = "complete"
+        entry["evaluation_status"] = "classified"
+        entry["presence_delta"] = presence_delta
+        entry["signal_delta"] = "unknown"
+        entry["delta_status"] = delta_status
+        entry["indeterminate_reason"] = None
+        entry["baseline_signal"] = None if presence_delta == "new" else signal
+        entry["current_signal"] = signal
+        entry["expected_signal"] = None
+    return entry
+
+
+def _enrich_candidate_record(
+    raw_candidate: dict[str, Any],
+    *,
+    repository_id: str,
+    base_sha: str,
+    source_set_digest: str,
+    timestamp: str,
+    previous_state: "PreviousStateResult",
+    real_evidence_index: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Deterministic enrichment (Issue #2362 Scope Reframe, 2026-08-28
+    owner-approved) for a single raw JUDGMENT-ONLY candidate record: builds
+    the ENTIRE canonical `agent_improvement_candidate/v1` record from the
+    evaluator's judgment-only fields (`candidate_id`/`title`/`description`/
+    `claim_class`/`subject_ref`/`rule_id`/`evidence_refs`) plus 100%
+    Python-side deterministic sources -- `repository_id`/`base_sha`/
+    `source_set_digest`/`timestamp` (Python-side run context),
+    `compute_finding_identity()` (identity.value SSOT, via the sibling
+    module loader, never reimplemented), and `compute_delta()`/
+    `previous_state` (evaluations[] history -- Issue #2362 AC3). The
+    evaluator is NEVER asked for, and this function never reads,
+    `identity`/`finding_contract`/`evaluations`/`repository_id`/
+    `source_run_ref`/`created_at`/`updated_at`/`candidate_status` from
+    `raw_candidate` -- the judgment-only wire schema
+    (`schemas/evaluation_result_v1.schema.json`) does not even accept
+    those fields, closing the architectural gap the superseded (Issue
+    #2362 original / PR #2367 items 1-6) design could not: this function
+    no longer merely OVERWRITES an evaluator-supplied `evaluations[]`/
+    `identity` (which the frozen evaluator prompt could still emit in an
+    incompatible vocabulary, causing `candidate_schema_invalid`) -- it
+    never parses one from the wire payload in the first place.
+
+    `subject_ref`/`rule_id` remain evaluator judgment (Issue #2362
+    Identity/Deterministic Field Authority Matrix, unchanged by this Scope
+    Reframe): when the evaluator's own values fail
+    `_is_valid_subject_ref_judgment`/`_is_valid_rule_id_judgment`, this
+    function raises `WireContractError(reason_code=
+    "candidate_schema_invalid")` -- never a Python-synthesized fallback
+    (PR #2367 fix_delta item 3's fail-closed contract, preserved).
+
+    `evidence_refs[].projection_digest` is always Python-recomputed from
+    real `finding_sets` data (`_enrich_evidence_refs`/`real_evidence_index`)
+    -- an evaluator-claimed ref with no real backing evidence is dropped,
+    never kept with a fabricated digest (`evidence_refs[].projection_digest`
+    Authority Matrix row).
+
+    Raises `WireContractError(reason_code="candidate_schema_invalid")` for
+    a non-dict `raw_candidate` (defensive -- the outer envelope's
+    `candidate_records` field is only type-checked as `list[dict[str,
+    Any]]` by `_parse_wire_payload`, which does not itself validate each
+    list ELEMENT's type) rather than silently passing it through, since
+    every candidate produced by this function must be a genuinely
+    schema-eligible dict for the canonical validator (step 4) to assess."""
+    if not isinstance(raw_candidate, dict):
+        raise WireContractError("candidate_record_not_object", reason_code="candidate_schema_invalid")
+
+    candidate_id = raw_candidate.get("candidate_id")
+    judgment = _extract_candidate_identity_judgment(raw_candidate)
+    subject_ref = judgment["subject_ref"]
+    if not _is_valid_subject_ref_judgment(subject_ref):
+        raise WireContractError(
+            f"candidate_schema_invalid[subject_ref]:candidate_id={candidate_id!r}:{subject_ref!r}",
+            reason_code="candidate_schema_invalid",
+        )
+    rule_id = judgment["rule_id"]
+    if not _is_valid_rule_id_judgment(rule_id):
+        raise WireContractError(
+            f"candidate_schema_invalid[rule_id]:candidate_id={candidate_id!r}:{rule_id!r}",
+            reason_code="candidate_schema_invalid",
+        )
+    key = {
+        "repository_id": repository_id,
+        "claim_class": judgment["claim_class"],
+        "subject_ref": subject_ref,
+        "rule_id": rule_id,
+    }
+    algorithm = _default_finding_identity_algorithm()
+    identity_value = _validate_retrospective_schema_module().compute_finding_identity(key, algorithm=algorithm)
+
+    prev_candidate = _find_previous_candidate(previous_state, identity_value)
+    prev_evaluations: list[dict[str, Any]] = []
+    if prev_candidate is not None:
+        prev_finding_contract = prev_candidate.get("finding_contract")
+        if isinstance(prev_finding_contract, dict):
+            prev_evaluations = list(prev_finding_contract.get("evaluations") or [])
+
+    classification = _classify_current_candidate_delta(previous_state, identity_value)
+    enriched_evidence_refs = _enrich_evidence_refs(
+        raw_candidate.get("evidence_refs"), real_evidence_index=real_evidence_index
+    )
+    new_entry = _build_evaluation_entry(
+        classification=classification,
+        prev_evaluations=prev_evaluations,
+        evidence_refs=enriched_evidence_refs,
+        base_sha=base_sha,
+        source_set_digest=source_set_digest,
+        timestamp=timestamp,
+        identity_value=identity_value,
+        previous_status=previous_state.status,
+    )
+
+    return {
+        "candidate_id": candidate_id,
+        "candidate_status": "proposed",
+        "title": raw_candidate.get("title"),
+        "description": raw_candidate.get("description"),
+        "source_run_ref": {"base_sha": base_sha, "source_set_digest": source_set_digest},
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "finding_contract": {
+            "schema_version": "v1",
+            "identity": {"algorithm": algorithm, "key": key, "value": identity_value},
+            "claim_class": judgment["claim_class"],
+            "evaluations": prev_evaluations + [new_entry],
+        },
+    }
+
+
+def _enrich_evaluation_payload(
+    payload: dict[str, Any],
+    *,
+    repository_id: str,
+    base_sha: str,
+    source_set_digest: str,
+    timestamp: str,
+    previous_state: "PreviousStateResult",
+    finding_sets: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply `_enrich_candidate_record` to every entry of
+    `payload["candidate_records"]` (Issue #2362 Scope Reframe). Returns a
+    NEW payload dict -- the outer-envelope-parsed, not-yet-validated
+    `payload` dict `run_evaluation()` passes in is never mutated in place.
+
+    `real_evidence_index` (`_observer_source_type_index`) is built ONCE
+    from `finding_sets` (the evaluator's actual input evidence, i.e.
+    `evaluator_request.finding_sets`) and shared across every candidate
+    record's `evidence_refs[]` digest recomputation."""
+    real_evidence_index = _observer_source_type_index(finding_sets)
+    enriched = dict(payload)
+    enriched["candidate_records"] = [
+        _enrich_candidate_record(
+            record,
+            repository_id=repository_id,
+            base_sha=base_sha,
+            source_set_digest=source_set_digest,
+            timestamp=timestamp,
+            previous_state=previous_state,
+            real_evidence_index=real_evidence_index,
+        )
+        for record in payload.get("candidate_records", [])
+    ]
+    return enriched
+
+
 def run_evaluation(
     ctx: RunContext,
     evaluator_request: EvaluatorRequest,
     *,
     invoke_evaluator: Callable[[EvaluatorRequest], AgentInvocationResult],
+    repository_id: str,
+    previous_state: "PreviousStateResult",
+    clock: Callable[[], datetime] = _utcnow,
     repair: Callable[[str, WireContractError], str] | None = None,
 ) -> Evaluation:
     """Invoke the evaluator exactly once with ``evaluator_request`` (built
@@ -1187,7 +1777,57 @@ def run_evaluation(
     ``build_finding_sets``/``prepare_evaluator_request``) and strictly
     validate its output. The caller (``execute_run``/``run_cli``) is
     responsible for only calling this after ``run_observer_wave`` has
-    succeeded for every observer in the wave (AC9)."""
+    succeeded for every observer in the wave (AC9).
+
+    Issue #2362 (Scope Reframe, 2026-08-28 owner-approved): `Evaluation`
+    construction (the canonical candidate-validation firing point, via
+    `__post_init__` -> `_post_validate()` -> `_validate_candidate_records()`)
+    is deliberately the LAST step here, preceded by a deterministic
+    enrichment phase: (1) outer envelope parse -- generic wire shape only
+    (shared with `from_wire()` via `_parse_wire_payload()`), WITHOUT
+    constructing `Evaluation`; (2)-(3) judgment-only extraction +
+    deterministic enrichment -- `_enrich_evaluation_payload()` builds every
+    candidate record's ENTIRE canonical shape (`candidate_status`/
+    `source_run_ref`/`created_at`/`updated_at`/`finding_contract.identity`/
+    `finding_contract.evaluations[]`) from `repository_id` (Python-side
+    caller context -- NOT part of `EvaluatorRequest`), `ctx.base_sha`,
+    `evaluator_request.source_set_digest`, `clock()`, `previous_state`
+    (`compute_delta()`/`PreviousStateProvider`, AC3), and the evaluator's
+    own judgment-only `candidate_id`/`title`/`description`/`claim_class`/
+    `subject_ref`/`rule_id`/`evidence_refs` values -- the evaluator's wire
+    payload is never asked for, and this phase never reads, `identity`/
+    `finding_contract`/`evaluations`/`repository_id`/`source_run_ref`/
+    `created_at`/`updated_at`; (4) construction --
+    `Evaluation(**enriched_payload)` fires canonical candidate validation
+    for the FIRST time, against the ENRICHED payload, never the raw
+    evaluator output.
+
+    `previous_state` (Issue #2362 Scope Reframe -- AC3) MUST be obtained
+    by the caller (`execute_run()`/`run_cli()`) from a
+    `PreviousStateProviderProtocol.get()` call BEFORE invoking this
+    function (a re-sequencing relative to the pre-Scope-Reframe call graph,
+    where `PreviousStateProvider.get()`/`compute_delta()` only ran AFTER
+    `run_evaluation()` returned, purely to populate the separate
+    `PublishRequest.delta_results` sidecar) -- `finding_contract.evaluations[]`
+    construction now needs it too, to append this run's new evaluation
+    entry to the correct prior history chain and to classify presence/
+    absence deltas via `compute_delta()`.
+
+    Issue #2367 fix_delta item 6: steps (1)-(4) above are now driven as a
+    SINGLE unit through `_retry_wire_parse()` (the same shared retry
+    helper `parse_agent_output_with_repair()` uses), instead of only
+    wrapping step (1) in a `repair` retry loop. A `candidate_schema_invalid`
+    raised by step (4) -- which only fires AFTER enrichment, so it could
+    never have been observed by a step-(1)-only retry loop -- is now
+    retried via `repair` against the ORIGINAL raw evaluator text exactly
+    like a step-(1) parse failure would be, and the full parse -> enrich ->
+    construct sequence re-runs from scratch on the repaired text. The
+    current production call site passes `repair=None`, so this is a
+    structural fix to the existing API contract (an unused repair
+    opportunity is now available to future callers) rather than an
+    immediate behavior change for `repair=None` callers, who still fail
+    closed on the first attempt (as `SchemaRepairExhausted`, a
+    `WireContractError` subclass, wrapping the same `reason_code`)."""
     result = invoke_evaluator(evaluator_request)
     if result.status != "ok":
         # Issue #2341 AC1: thread the underlying adapter-level
@@ -1198,7 +1838,33 @@ def run_evaluation(
             exit_code=result.exit_code,
         )
     raw_text = json.dumps(result.structured_output, sort_keys=True, separators=(",", ":"))
-    evaluation = parse_agent_output_with_repair(raw_text, Evaluation, repair=repair)
+
+    def _parse_enrich_construct(text: str) -> Evaluation:
+        # Step 1 (outer envelope parse): generic wire-shape validation only
+        # -- Evaluation is NOT constructed here, so canonical candidate
+        # validation has not fired yet.
+        payload = _parse_wire_payload(Evaluation, text)
+        # Steps 2-3 (judgment-only extraction + deterministic enrichment).
+        enriched_payload = _enrich_evaluation_payload(
+            payload,
+            repository_id=repository_id,
+            base_sha=ctx.base_sha,
+            source_set_digest=evaluator_request.source_set_digest,
+            timestamp=_iso(clock()),
+            previous_state=previous_state,
+            finding_sets=evaluator_request.finding_sets,
+        )
+        # Step 4 (construction): canonical candidate validation
+        # (_post_validate()/_validate_candidate_records()/validate_candidate())
+        # fires for the FIRST time here, against the enriched payload.
+        try:
+            return Evaluation(**enriched_payload)
+        except TypeError as exc:  # pragma: no cover - defensive, shape already checked in step 1
+            raise WireContractError(f"construction_failed:{exc}", reason_code="construction_failed") from exc
+
+    evaluation = _retry_wire_parse(
+        raw_text, _parse_enrich_construct, repair=repair, max_retries=SCHEMA_REPAIR_RETRIES
+    )
     if evaluation.run_id != ctx.run_id or evaluation.source_set_digest != evaluator_request.source_set_digest:
         raise EvaluatorInvocationFailed("evaluation_envelope_mismatch")
     return evaluation
@@ -1333,14 +1999,26 @@ def execute_run(
     bundles = run_observer_wave(ctx, plan, invoke=invoke, observer_requests=observer_requests)
     finding_sets = build_finding_sets(ctx, plan, bundles)
     evaluator_request = prepare_evaluator_request(ctx, plan, finding_sets)
-    evaluation = run_evaluation(ctx, evaluator_request, invoke_evaluator=invoke_evaluator)
     resolved_provider = (
         previous_state_provider if previous_state_provider is not None else FixturePreviousStateProvider(fixtures={})
     )
+    # Issue #2362 Scope Reframe: fetched BEFORE run_evaluation() now (moved
+    # up from immediately after it) -- run_evaluation()'s deterministic
+    # enrichment phase needs `previous_state` to construct
+    # `finding_contract.evaluations[]` (AC3), not only this function's own
+    # `delta_results` sidecar below.
     previous_state = resolved_provider.get(
         repository_id=repository_id,
         scope=previous_state_scope,
         finding_identity_algorithm=_default_finding_identity_algorithm(),
+    )
+    evaluation = run_evaluation(
+        ctx,
+        evaluator_request,
+        invoke_evaluator=invoke_evaluator,
+        repository_id=repository_id,
+        previous_state=previous_state,
+        clock=clock,
     )
     delta_results = compute_delta(previous_state, evaluation.candidate_records)
     return finalize(
@@ -1784,19 +2462,280 @@ def build_repository_collector(repo_root: Path) -> Callable[[str], Any]:
     return _collect
 
 
+#: fixed, non-identity fields used by ``_default_observer_prompt`` below
+#: (Issue #2345 fix_delta, OWNER review
+#: https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+#: P1 item 1). The *identity* fields (``run_id``/``base_sha``/
+#: ``source_set_digest``) are never fixed placeholders -- ``run_cli()``
+#: calls ``_default_observer_prompt`` only AFTER its own internal
+#: ``prepare()`` step has produced the real ``ctx``/``plan`` for this run,
+#: and threads those real values in (see ``run_cli``'s prompt-building
+#: step below). An earlier version of this function embedded a fixed
+#: placeholder ``run_id`` that could never equal the real one, which made
+#: every invocation using it construct-to-fail at
+#: ``run_observer_wave()``'s ``bundle.run_id != ctx.run_id`` check instead
+#: of exercising the real, functional production call graph end-to-end --
+#: that design is no longer used (see the OWNER review URL above).
+_DEFAULT_PROMPT_EVIDENCE_REF = "default-prompt-evidence-ref"
+
+#: evidence_ref literal used when binding a caller-supplied (non-empty)
+#: task prompt via ``bind_observer_prompt`` below (Issue #2350) -- distinct
+#: from ``_DEFAULT_PROMPT_EVIDENCE_REF`` purely so the two prompt shapes
+#: remain distinguishable in transcripts; ``run_observer_wave`` never
+#: validates ``evidence_ref`` against either literal (only ``run_id`` /
+#: ``base_sha`` / ``source_set_digest`` / ``observer_id`` are identity
+#: fields checked there).
+_CALLER_SUPPLIED_PROMPT_EVIDENCE_REF = "caller-supplied-prompt-evidence-ref"
+
+
+def bind_observer_prompt(
+    task_prompt: str | None,
+    *,
+    observer_id: str,
+    run_id: str,
+    base_sha: str,
+    source_set_digest: str,
+) -> str:
+    """Issue #2350: the single identity-binding helper BOTH the
+    default-prompt path (``prompts=None``, ``--prompts-file`` omitted) and
+    the caller-supplied-prompt path (``--prompts-file`` present, non-empty
+    per-observer task text) are threaded through in ``run_cli()``, so
+    neither path can construct an observer invocation whose response is
+    structurally unable to satisfy ``run_observer_wave()``'s
+    ``bundle.run_id != ctx.run_id`` / ``source_set_digest`` / ``base_sha``
+    identity checks.
+
+    ``run_cli()`` calls this ONLY after its own internal ``prepare()`` step
+    has produced this run's REAL ``ctx.run_id`` / ``ctx.base_sha`` /
+    ``plan.source_set_digest`` -- never a fixed placeholder (mirrors the
+    ``_default_observer_prompt`` design Issue #2345 fix_delta established,
+    OWNER review
+    https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341).
+    Identity remains single-sourced from ``run_cli()``'s own
+    ``uuid.uuid4()``-generated ``run_id`` and ``prepare()``'s ``ctx`` /
+    ``plan`` output -- this function never lets a caller pre-supply or
+    override any of the four identity values (``run_id`` / ``base_sha`` /
+    ``source_set_digest`` / ``observer_id``); doing so would let a caller
+    pre-generate a ``run_id`` and undermine its role-scoped nonce
+    properties (``DelegatedAgentPermissionPolicy`` / the run-scoped temp
+    directory / observer identity all key off it) -- see this Issue's Stop
+    Conditions.
+
+    Background (Issue #2350): prior to this fix, a caller-supplied,
+    substantive investigative prompt passed via ``--prompts-file`` was
+    forwarded to the observer CLI verbatim
+    (``build_observer_requests()``'s ``prompts[spec.observer_id]``) with NO
+    identity-binding instructions at all. An observer receiving such a
+    prompt has no way to know this run's real ``run_id`` / ``base_sha`` /
+    ``source_set_digest`` and therefore cannot legitimately echo them back
+    -- ``run_observer_wave()`` then fail-closed-rejected the mismatched
+    response with ``observer_run_id_mismatch`` (or the
+    ``source_set_digest`` / ``base_sha`` siblings) on every non-empty
+    caller-supplied prompt, a structural gap independently confirmed
+    during Issue #2239 and documented as a "known,
+    independently-confirmed production architecture gap" in
+    ``verify_agent_retrospective_live_smoke.py``'s docstring at the time
+    (``run_retrospective.py`` was outside that Issue's Allowed Paths).
+
+    Fix: this helper always appends the SAME real-identity-binding
+    boilerplate this module's default prompt has used since Issue #2345 --
+    the run's real ``run_id`` / ``base_sha`` / ``source_set_digest`` /
+    ``observer_id`` values, with an explicit instruction to echo them
+    verbatim in the ``OBSERVER_RESULT_V1`` JSON response -- around whatever
+    task text (if any) is supplied. This never asks the caller to
+    pre-generate or discover these identity values itself (structurally
+    impossible for ``source_set_digest`` before ``prepare()`` runs
+    regardless); the SSOT for identity stays exactly where it already was.
+
+    ``task_prompt`` is ``None`` (or empty/whitespace-only) for the
+    default-prompt path -- ``_default_observer_prompt`` is now a thin
+    wrapper around this function passing ``task_prompt=None``. A non-empty
+    ``task_prompt`` is the caller's own investigative instruction text
+    (``--prompts-file``'s per-observer value); this function never itself
+    decides whether an empty caller-supplied prompt is acceptable -- that
+    fail-closed decision remains Issue #2345 P2's ``invalid_observer_prompts``
+    check (``_reject_missing_or_empty_prompts``), applied by
+    ``run_cli()``/``build_observer_requests()`` before this helper ever
+    runs on a caller-supplied prompt.
+
+    PR #2358 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255,
+    P1 items 1-2):
+
+    (1) the REAL identity block (``AUTHORITATIVE_RUN_CONTEXT``) is now
+    placed BEFORE the caller-supplied task text (``CALLER_TASK_DATA``), not
+    after it. A caller-supplied investigative prompt (retrospective session
+    evidence) may itself legitimately contain identifier-looking data --
+    e.g. a PRIOR run's own ``{"run_id": ..., "base_sha": ...,
+    "source_set_digest": ...}`` tuple, quoted verbatim as historical
+    evidence -- and the previous (task-text-first) ordering meant a naive
+    first-match identity extraction (exactly what a real observer LLM
+    reading top-to-bottom, or a hermetic test fake-runner, would plausibly
+    do) could pick up that stale embedded tuple instead of THIS run's real
+    identity. Emitting the caller's task text as a nested JSON string value
+    (``json.dumps({"task": ...})``) additionally means any quote characters
+    inside caller-supplied text are JSON-escaped there, so they never
+    surface as bare ``"run_id": "..."``-shaped key/value pairs an
+    unescaped-quote-based extraction (real or hermetic) would match at all.
+
+    (2) the caller-supplied-prompt branch no longer shows a
+    ready-to-submit COMPLETED JSON example with a literal ``"findings":
+    []`` in it -- doing so made it trivially easy for an observer to
+    satisfy identity validation while reporting zero findings regardless of
+    what the caller-supplied task actually asked it to investigate (a
+    false-green: ``observer_run_id_mismatch`` disappears, but the
+    retrospective becomes substantively empty). The default-prompt branch
+    (no caller task -- Issue #2345) keeps its completed-example shape,
+    since ``findings: []`` is genuinely the correct terminal answer there
+    (no evidence was ever supplied for it to investigate)."""
+    has_task = bool(task_prompt is not None and task_prompt.strip())
+    identity_block = "AUTHORITATIVE_RUN_CONTEXT\n" + json.dumps(
+        {
+            "run_id": run_id,
+            "base_sha": base_sha,
+            "source_set_digest": source_set_digest,
+            "observer_id": observer_id,
+        },
+        sort_keys=True,
+    )
+    if has_task:
+        assert task_prompt is not None  # narrows for mypy; has_task already proved this
+        evidence_ref = _CALLER_SUPPLIED_PROMPT_EVIDENCE_REF
+        caller_task_block = "CALLER_TASK_DATA\n" + json.dumps({"task": task_prompt.strip()})
+        output_rules = (
+            "OUTPUT_RULES\n"
+            "- Respond with EXACTLY one JSON object (no markdown fence, no prose) "
+            "conforming to OBSERVER_RESULT_V1 (EvidenceBundle) with fields: "
+            "schema_version, run_id, base_sha, source_set_digest, observer_id, "
+            "evidence_ref, findings.\n"
+            '- Set "schema_version" to "observer_result/v1".\n'
+            "- Copy run_id/base_sha/source_set_digest/observer_id from "
+            "AUTHORITATIVE_RUN_CONTEXT above verbatim -- that block, and ONLY "
+            "that block, is this run's REAL identity; never invent or alter "
+            "these four values.\n"
+            "- CALLER_TASK_DATA above may itself contain text that looks like "
+            "identity fields (e.g. a prior run's run_id/base_sha/"
+            "source_set_digest quoted as evidence) -- such values are ordinary "
+            "investigative data, never this run's identity, no matter how they "
+            "are formatted.\n"
+            f'- Set "evidence_ref" to "{evidence_ref}".\n'
+            '- Use CALLER_TASK_DATA\'s "task" field to decide what to '
+            'investigate, and populate "findings" with what that investigation '
+            "actually found -- use an empty list only when no finding can "
+            "genuinely be substantiated from the supplied task/evidence."
+        )
+    else:
+        evidence_ref = _DEFAULT_PROMPT_EVIDENCE_REF
+        caller_task_block = (
+            "CALLER_TASK_DATA\n"
+            "No caller-supplied evidence was provided (this is "
+            "run_retrospective.py's own default prompt, used only when "
+            "--prompts-file is omitted -- Issue #2345)."
+        )
+        output_rules = (
+            "OUTPUT_RULES\n"
+            "Respond with EXACTLY one JSON object (no markdown fence, no prose) "
+            "conforming to OBSERVER_RESULT_V1 (EvidenceBundle):\n"
+            "{\n"
+            '  "schema_version": "observer_result/v1",\n'
+            f'  "run_id": "{run_id}",\n'
+            f'  "base_sha": "{base_sha}",\n'
+            f'  "source_set_digest": "{source_set_digest}",\n'
+            f'  "observer_id": "{observer_id}",\n'
+            f'  "evidence_ref": "{evidence_ref}",\n'
+            '  "findings": []\n'
+            "}\n"
+            "The run_id/base_sha/source_set_digest/observer_id fields above are "
+            "this run's REAL identity (copied verbatim from "
+            "AUTHORITATIVE_RUN_CONTEXT above) -- never invent or alter these "
+            'four values. Do not invent evidence or findings beyond an empty '
+            'findings list. Set "findings" to [].'
+        )
+    return f"observer_id={observer_id}.\n\n{identity_block}\n\n{caller_task_block}\n\n{output_rules}"
+
+
+def _default_observer_prompt(observer_id: str, *, run_id: str, base_sha: str, source_set_digest: str) -> str:
+    """Issue #2345 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+    P1 items 1-2): the genuinely non-empty, REAL-identity default prompt
+    used for ``observer_id`` when ``main()``'s ``--prompts-file`` is not
+    supplied. Issue #2350: now a thin wrapper around ``bind_observer_prompt``
+    (``task_prompt=None``) -- the SAME identity-binding helper the
+    caller-supplied-prompt path in ``run_cli()`` also threads through, so
+    both prompt-construction paths can never diverge in how they embed
+    ``run_id`` / ``base_sha`` / ``source_set_digest`` / ``observer_id``."""
+    return bind_observer_prompt(
+        None,
+        observer_id=observer_id,
+        run_id=run_id,
+        base_sha=base_sha,
+        source_set_digest=source_set_digest,
+    )
+
+
+def _reject_missing_or_empty_prompts(prompts: dict[str, str]) -> None:
+    """Issue #2345 fix_delta P2 item 3 (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341):
+    every ``observer_id`` in ``EXPECTED_OBSERVER_MANIFEST`` MUST have a
+    non-empty (post-``strip()``) prompt in ``prompts`` -- a missing key or
+    an empty/whitespace-only string is rejected fail-closed with a typed
+    ``WireContractError`` (``reason_code="invalid_observer_prompts"``)
+    here, locally, before any ``claude`` CLI subprocess is ever invoked or
+    (Issue #2350) any identity is bound onto the prompt text. Shared by
+    ``build_observer_requests`` (direct callers) and ``run_cli``'s
+    caller-supplied-prompt branch (applied to the RAW, pre-
+    ``bind_observer_prompt`` task text -- Issue #2350 never lets
+    identity-binding paper over a genuinely empty caller-supplied prompt,
+    since ``bind_observer_prompt`` always returns non-empty text
+    regardless of its ``task_prompt`` argument).
+
+    PR #2358 fix_delta (OWNER review
+    https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255,
+    P2): validates ``isinstance(value, str)`` BEFORE calling ``.strip()`` on
+    it. The previous ``str(prompts.get(observer_id, "")).strip()`` coerced
+    ANY value to its ``str()`` representation FIRST -- so a non-string
+    ``--prompts-file`` value (e.g. JSON ``null`` decoded to Python
+    ``None``) became the string ``"None"``, which is non-empty and
+    therefore spuriously PASSED this check, only to later crash with an
+    untyped ``AttributeError`` inside ``bind_observer_prompt()``'s own
+    ``task_prompt.strip()`` call (``main()``'s exception handler does not
+    catch ``AttributeError``, so this escaped as a raw traceback instead of
+    the typed ``invalid_observer_prompts`` failure this function exists to
+    produce)."""
+    missing_or_empty = [
+        spec.observer_id
+        for spec in EXPECTED_OBSERVER_MANIFEST
+        if not isinstance(prompts.get(spec.observer_id), str) or not prompts[spec.observer_id].strip()
+    ]
+    if missing_or_empty:
+        raise WireContractError(
+            f"invalid_observer_prompts:missing_or_empty={sorted(missing_or_empty)}",
+            reason_code="invalid_observer_prompts",
+        )
+
+
 def build_observer_requests(
     *, schema_dir: Path, cwd: str, prompts: dict[str, str], timeout_sec: int = 300
 ) -> list[AgentInvocationRequest]:
     """Build the exact 3-observer ``AgentInvocationRequest`` list matching
     ``EXPECTED_OBSERVER_MANIFEST`` (Issue #2237 P0-2/P0-6). ``prompts`` maps
-    each ``observer_id`` to the prompt text the root Skill (or ``main``'s
-    ``--prompts-file``) has already assembled -- this function never
-    resolves session/evidence content itself (that remains the root Skill's
-    trigger-time responsibility)."""
+    each ``observer_id`` to the prompt text the caller (the root Skill via
+    ``main``'s ``--prompts-file``, or ``run_cli``'s own
+    ``bind_observer_prompt``-bound prompts -- Issue #2345/#2350) has
+    already assembled -- this function never resolves session/evidence
+    content itself (that remains the root Skill's trigger-time
+    responsibility), and never itself performs identity-binding (that is
+    ``bind_observer_prompt``'s sole responsibility, applied by callers
+    before this function ever sees the prompt text).
+
+    Issue #2345 fix_delta P2 item 3: every ``observer_id`` in
+    ``EXPECTED_OBSERVER_MANIFEST`` MUST have a non-empty (post-``strip()``)
+    prompt in ``prompts`` -- see ``_reject_missing_or_empty_prompts``."""
+    _reject_missing_or_empty_prompts(prompts)
     return [
         AgentInvocationRequest(
             agent_name=spec.observer_id,
-            prompt=prompts.get(spec.observer_id, ""),
+            prompt=prompts[spec.observer_id],
             json_schema_path=str(schema_dir / "observer_result_v1.schema.json"),
             cwd=cwd,
             timeout_sec=timeout_sec,
@@ -1813,7 +2752,7 @@ def run_cli(
     request_id: str,
     idempotency_key: str,
     schema_dir: Path,
-    prompts: dict[str, str],
+    prompts: dict[str, str] | None = None,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     git_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     clock: Callable[[], datetime] = _utcnow,
@@ -1834,7 +2773,23 @@ def run_cli(
     non-zero exit code). ``previous_state_provider`` defaults to an empty
     ``FixturePreviousStateProvider`` -- a real, persistence-backed provider
     (#2238) can be injected here without any other change to this call
-    graph."""
+    graph.
+
+    ``prompts`` (Issue #2345 fix_delta, OWNER review
+    https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+    P1 item 1; Issue #2350): ``None`` (the default, matching ``main()``
+    when ``--prompts-file`` is omitted) means "build the default observer
+    prompts AFTER this call graph's own ``prepare()`` step below has
+    produced the REAL ``ctx.run_id``/``ctx.base_sha``/
+    ``plan.source_set_digest`` for this run" -- never a fixed placeholder
+    identity. A caller-supplied dict (from ``--prompts-file``, or a direct
+    test/Skill caller) has its per-observer task text validated non-empty
+    (every manifest ``observer_id`` must map to a non-empty prompt --
+    ``_reject_missing_or_empty_prompts``) and then bound to this SAME real
+    identity via ``bind_observer_prompt`` (Issue #2350) -- it is never
+    forwarded to the observer CLI as raw, unbound task text, which
+    previously left every non-empty caller-supplied prompt structurally
+    unable to satisfy ``run_observer_wave()``'s identity checks."""
     manual_trigger_preflight(repo_root=repo_root)
     resolved_run_id = run_id or str(uuid.uuid4())
     policy = DelegatedAgentPermissionPolicy(run_id=resolved_run_id)
@@ -1852,7 +2807,51 @@ def run_cli(
         ctx, plan, results = prepare(
             base_sha_resolver=_base_sha_resolver, collectors=collectors, clock=clock, run_id=resolved_run_id
         )
-        observer_requests = build_observer_requests(schema_dir=schema_dir, cwd=str(repo_root), prompts=prompts)
+        # Issue #2350: BOTH the caller-supplied-prompt path (`prompts`
+        # not None, from `--prompts-file`) and the default-prompt path
+        # (`prompts is None`) are threaded through the SAME identity-
+        # binding helper (`bind_observer_prompt`), using the REAL
+        # `ctx.run_id` / `ctx.base_sha` / `plan.source_set_digest` this
+        # call graph's own `prepare()` step (above) just produced -- never
+        # a fixed placeholder. For the caller-supplied path, the RAW
+        # (pre-binding) prompt text is validated non-empty first via
+        # `_reject_missing_or_empty_prompts` (Issue #2345 P2 item 3);
+        # `bind_observer_prompt` always returns non-empty text regardless
+        # of its `task_prompt` argument, so this raw-text check MUST run
+        # before binding or it would never fire on a genuinely empty
+        # caller-supplied prompt.
+        if prompts is not None:
+            _reject_missing_or_empty_prompts(prompts)
+            resolved_prompts = {
+                spec.observer_id: bind_observer_prompt(
+                    prompts[spec.observer_id],
+                    observer_id=spec.observer_id,
+                    run_id=ctx.run_id,
+                    base_sha=ctx.base_sha,
+                    source_set_digest=plan.source_set_digest,
+                )
+                for spec in EXPECTED_OBSERVER_MANIFEST
+            }
+        else:
+            # PR #2358 fix_delta P3 (OWNER review
+            # https://github.com/squne121/loop-protocol/pull/2358#issuecomment-5437414255):
+            # route through `_default_observer_prompt` (rather than calling
+            # `bind_observer_prompt(None, ...)` directly, duplicating what
+            # that thin wrapper already does) so the abstraction is
+            # actually exercised by the one production call site that
+            # needs it, instead of being a dead compatibility wrapper.
+            resolved_prompts = {
+                spec.observer_id: _default_observer_prompt(
+                    spec.observer_id,
+                    run_id=ctx.run_id,
+                    base_sha=ctx.base_sha,
+                    source_set_digest=plan.source_set_digest,
+                )
+                for spec in EXPECTED_OBSERVER_MANIFEST
+            }
+        observer_requests = build_observer_requests(
+            schema_dir=schema_dir, cwd=str(repo_root), prompts=resolved_prompts
+        )
 
         def _invoke(request: AgentInvocationRequest) -> AgentInvocationResult:
             run_scoped_env = {
@@ -1880,16 +2879,25 @@ def run_cli(
         def _invoke_evaluator(_request: EvaluatorRequest) -> AgentInvocationResult:
             return invoke_agent(evaluator_agent_request, runner=runner, policy=policy)
 
-        evaluation = run_evaluation(ctx, evaluator_request, invoke_evaluator=_invoke_evaluator)
         resolved_provider = (
             previous_state_provider
             if previous_state_provider is not None
             else FixturePreviousStateProvider(fixtures={})
         )
+        # Issue #2362 Scope Reframe: fetched BEFORE run_evaluation() now --
+        # see execute_run()'s matching comment for why.
         previous_state = resolved_provider.get(
             repository_id=repository_id,
             scope=previous_state_scope,
             finding_identity_algorithm=_default_finding_identity_algorithm(),
+        )
+        evaluation = run_evaluation(
+            ctx,
+            evaluator_request,
+            invoke_evaluator=_invoke_evaluator,
+            repository_id=repository_id,
+            previous_state=previous_state,
+            clock=clock,
         )
         delta_results = compute_delta(previous_state, evaluation.candidate_records)
         publish_request = finalize(
@@ -1945,7 +2953,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    prompts: dict[str, str] = {}
+    # Issue #2345 fix_delta (OWNER review
+    # https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
+    # P1 item 1): when `--prompts-file` is omitted, `prompts` is left as
+    # `None` -- `run_cli()` builds the default prompts itself, AFTER its
+    # own internal `prepare()` step has produced this run's REAL
+    # `ctx.run_id`/`ctx.base_sha`/`plan.source_set_digest` (see
+    # `_default_observer_prompt`'s docstring). `main()` cannot build those
+    # defaults here because `run_id`/`base_sha` do not exist yet at this
+    # point in the call graph.
+    prompts: dict[str, str] | None = None
     if args.prompts_file:
         prompts = json.loads(Path(args.prompts_file).read_text(encoding="utf-8"))
 

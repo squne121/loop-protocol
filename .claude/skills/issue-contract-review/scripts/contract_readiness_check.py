@@ -67,7 +67,15 @@ from baseline_vc_preflight import (  # noqa: E402
     extract_allowed_paths as _extract_allowed_paths,
     extract_verification_commands_section,
     run_subprocess_with_cooperative_supervisor as _run_subprocess_with_cooperative_supervisor,
+    # Issue #2254 AC1: this parent process is a root-owned producer of the
+    # immutable history_snapshot/v1 for its OWN `body`, built ONCE and
+    # reused for every compute_canonical_vc_plan() call this module makes
+    # for that SAME body (including the digest passed to the child
+    # subprocess below), keeping plan_digest convergent.
+    produce_immutable_history_snapshot as _produce_immutable_history_snapshot,
+    resolve_repo_root_for_history as _resolve_repo_root_for_history,
 )
+import vc_runtime_history as _vc_runtime_history  # noqa: E402
 from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
 from prose_boundary_policy import (  # noqa: E402
     BLOCK_KIND_CODE_FENCE,
@@ -725,7 +733,12 @@ def map_validate_errors_to_readiness_errors(validate_result: dict) -> list[dict]
 # ---------------------------------------------------------------------------
 
 
-def compute_invocation_local_baseline_timeout(body: str) -> int:
+def compute_invocation_local_baseline_timeout(
+    body: str,
+    *,
+    history_snapshot: "Optional[Dict[str, Any]]" = None,
+    repo_root: "Optional[str]" = None,
+) -> int:
     """Issue #2207: derive the `baseline_vc_preflight.py` aggregate wrapper
     timeout for THIS specific pinned `body`, from the canonical VC plan's
     `launch_upper_bound` -- instead of the fixed
@@ -733,6 +746,10 @@ def compute_invocation_local_baseline_timeout(body: str) -> int:
     remains the `N<=2` compatibility value used when this function is not
     invoked, e.g. by any external importer still reading the module
     constant directly).
+
+    `history_snapshot` (Issue #2254 AC1): an immutable snapshot the CALLER
+    already produced ONCE for this SAME body -- passed straight through to
+    `compute_canonical_vc_plan()`. `None` preserves pre-#2254 behavior.
 
     Raises `VerificationBudgetExceedsPolicyError` (non-retryable) if the
     plan's `launch_upper_bound` exceeds the fixed policy ceiling -- BEFORE
@@ -746,7 +763,11 @@ def compute_invocation_local_baseline_timeout(body: str) -> int:
     # for its OWN `args.cwd or "."` default and `allowed_paths_from_body`,
     # keeping `plan_digest` convergent across the process boundary.
     plan = _compute_canonical_vc_plan(
-        body, cwd=".", allowed_paths=_extract_allowed_paths(body)
+        body,
+        cwd=".",
+        allowed_paths=_extract_allowed_paths(body),
+        history_snapshot=history_snapshot,
+        repo_root=repo_root,
     )
     # Issue #2207 OWNER P1-3: `command_occurrence_count`, per the Issue
     # #2207 Outcome/AC5 contract -- NOT `launch_upper_bound`.
@@ -766,6 +787,7 @@ def run_baseline_vc_preflight(
     override_timeout_seconds: Optional[float] = None,
     override_grace_seconds: Optional[float] = None,
     _test_extra_env: Optional[Dict[str, str]] = None,
+    history_snapshot: Optional[Dict[str, Any]] = None,
 ) -> tuple[dict, int]:
     """
     Run baseline_vc_preflight.py via a cooperative subprocess supervisor.
@@ -792,6 +814,20 @@ def run_baseline_vc_preflight(
     `_test_extra_env` is test-only free-form environment passthrough to the
     spawned `baseline_vc_preflight.py` child (e.g. a SIGTERM-handler-entry
     marker-file path); production callers never pass this.
+
+    `history_snapshot` (Issue #2254 fix_delta P0 blocker 1, OWNER
+    REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    an IMMUTABLE `history_snapshot/v1` dict a PARENT process (e.g.
+    `run_contract_review_once.py` Step 2, or `run_root_review_pipeline.py`'s
+    `run-checker-attempt`) already produced ONCE for this SAME `body` and
+    passes straight through here, so this function's own plan/digest/child
+    subprocess all reuse that EXACT snapshot instead of this function
+    silently re-reading the store itself (which could observe a DIFFERENT
+    point-in-time result than whatever the parent already used to compute
+    an outer deadline/plan for the SAME invocation). `None` (the default)
+    preserves this function's own pre-fix_delta standalone behavior: it
+    produces its own snapshot exactly as before.
     """
     # Issue #2207: compute the invocation-local aggregate timeout from the
     # SAME canonical VC plan the executor's occurrence count is bound to,
@@ -799,8 +835,32 @@ def run_baseline_vc_preflight(
     # plan exceeds the policy ceiling is rejected here (typed,
     # non-retryable `runtime_error` / `verification_budget_exceeds_policy`)
     # rather than ever spawning `baseline_vc_preflight.py`.
+    # Issue #2254 AC1: ONE root-owned read of the local history store for
+    # this whole invocation (both compute_invocation_local_baseline_timeout()
+    # below AND the `_plan_for_digest` computation further down reuse THIS
+    # SAME snapshot object, keeping plan_digest convergent across both
+    # in-process calls AND the child subprocess boundary).
+    # Issue #2254 fix_delta P0 blocker 1: when a PARENT process already
+    # produced a snapshot for this SAME body (passed in via
+    # `history_snapshot=`), reuse it verbatim instead of reading the store
+    # again here -- a second independent read could observe a store that a
+    # concurrent writer touched between the parent's read and this one.
+    # Issue #2254 fix_delta P0 blocker 2/3: `_repo_root_for_history` is
+    # resolved ONCE from the SAME `cwd="."` this function always uses for
+    # BOTH producing the snapshot (when not given one) AND the
+    # `_plan_for_digest` computation further down.
+    _repo_root_for_history = _resolve_repo_root_for_history(".")
+    _history_snapshot = (
+        history_snapshot
+        if history_snapshot is not None
+        else _produce_immutable_history_snapshot(
+            body, cwd=".", repo_root=_repo_root_for_history
+        )
+    )
     try:
-        aggregate_timeout_seconds: float = compute_invocation_local_baseline_timeout(body)
+        aggregate_timeout_seconds: float = compute_invocation_local_baseline_timeout(
+            body, history_snapshot=_history_snapshot, repo_root=_repo_root_for_history
+        )
     except (
         VerificationBudgetExceedsPolicyError,
         AggregateTimeoutExceedsPolicyError,
@@ -834,6 +894,21 @@ def run_baseline_vc_preflight(
     ) as tf:
         tf.write(body)
         tmp_path = tf.name
+
+    # Issue #2254 AC1: serialize the SAME `_history_snapshot` this function
+    # already produced to a file so the child subprocess below loads the
+    # EXACT same snapshot via `--history-snapshot-file` instead of
+    # re-reading the store itself (which could observe a different result
+    # if a concurrent writer touched the store between this parent's read
+    # and the child's own).
+    # Issue #2254: `_history_snapshot` may be `None` (test-safety guard,
+    # or a caller-disabled history feature) -- only serialize/propagate a
+    # REAL snapshot; a `None` value must behave identically to every
+    # pre-#2254 call site (no --history-snapshot-file argv at all).
+    _history_snapshot_path: Optional[str] = None
+    if _history_snapshot is not None:
+        _history_snapshot_path = tmp_path + ".history-snapshot.json"
+        _vc_runtime_history.write_history_snapshot_file(_history_snapshot, Path(_history_snapshot_path))
 
     try:
         # Issue #2165 P1-1(c) / Issue #2207: the aggregate wrapper timeout is
@@ -895,18 +970,25 @@ def run_baseline_vc_preflight(
         # that exact classification context so `plan_digest` stays
         # convergent across this subprocess boundary.
         _plan_for_digest = _compute_canonical_vc_plan(
-            body, cwd=".", allowed_paths=_extract_allowed_paths(body)
+            body,
+            cwd=".",
+            allowed_paths=_extract_allowed_paths(body),
+            history_snapshot=_history_snapshot,
+            repo_root=_repo_root_for_history,
         )
+        _vc_command_argv = [
+            sys.executable,
+            str(_BASELINE_VC_PREFLIGHT_PY),
+            "--strict",
+            "--body-file",
+            tmp_path,
+            "--expected-plan-digest",
+            _plan_for_digest["plan_digest"],
+        ]
+        if _history_snapshot_path is not None:
+            _vc_command_argv.extend(["--history-snapshot-file", _history_snapshot_path])
         supervised = _run_subprocess_with_cooperative_supervisor(
-            [
-                sys.executable,
-                str(_BASELINE_VC_PREFLIGHT_PY),
-                "--strict",
-                "--body-file",
-                tmp_path,
-                "--expected-plan-digest",
-                _plan_for_digest["plan_digest"],
-            ],
+            _vc_command_argv,
             timeout_seconds=aggregate_timeout_seconds,
             env=_child_env,
         )
@@ -966,6 +1048,11 @@ def run_baseline_vc_preflight(
             os.unlink(tmp_path)
         except OSError:
             pass
+        if _history_snapshot_path is not None:
+            try:
+                os.unlink(_history_snapshot_path)
+            except OSError:
+                pass
 
 
 # Status mapping contract:
@@ -1455,6 +1542,74 @@ def check_extension_surface_risk_trigger(body: str) -> list[dict]:
     ]
 
 
+# PR #2370 OWNER review fix_delta (iteration 1, P0): readiness `errors[]`
+# categories that are informational/non-blocking only. Currently just
+# `check_extension_surface_advisory()`'s EXTSURF003 (Issue #2339
+# `unclassified_candidate` advisory). Centralised here so both the
+# `fix_hint`/`minimal_context` selection in `build_result()` and (via the
+# `contract_readiness_check.py --mode merge_readiness`-equivalent
+# `check_issue_contract.py`'s `merge_readiness_into_review_result()`, which
+# filters on the same `category` string independently since it lives in a
+# different dynamically-loaded module) treat this category consistently as
+# never contributing to a blocking verdict.
+_NON_BLOCKING_READINESS_ERROR_CATEGORIES = {"extension_surface_candidate_advisory"}
+
+
+def check_extension_surface_advisory(body: str) -> list[dict]:
+    """Issue #2339: non-blocking `unclassified_candidate` advisory findings.
+
+    Companion to `check_extension_surface_risk_trigger()` above (which
+    remains the unchanged blocking C14/EXTSURF001/EXTSURF002 gate). This
+    function's return value MUST NOT be passed into the
+    `if ext_surface_errors:` escalation in `run_contract_readiness_check()`
+    -- it is included in `all_errors` (the existing output "errors" list)
+    for display only, distinguished by `category:
+    extension_surface_candidate_advisory`, so `overall_status` is never
+    raised by an `unclassified_candidate` match alone (Issue #2339 AC6).
+    """
+    if not _is_canonical_implementation_issue(body):
+        return []
+
+    allowed_path_entries = _extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return []
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+
+    try:
+        policy_evaluation = evaluator.evaluate_allowed_paths(allowed_path_entries)
+    except evaluator.PolicyLoadError:
+        # Policy-unavailable is already surfaced as a blocking EXTSURF002
+        # finding by check_extension_surface_risk_trigger(); do not
+        # double-report it here as a non-blocking advisory.
+        return []
+
+    advisories = policy_evaluation.get("advisories") or []
+    if not advisories:
+        return []
+
+    return [
+        {
+            "rule_id": "EXTSURF003",
+            "severity": "info",
+            "source_check": "contract_readiness_check",
+            "category": "extension_surface_candidate_advisory",
+            "section": "Allowed Paths",
+            "line_start": 0,
+            "line_end": 0,
+            "minimal_context": advisories,
+            "fix_hint": (
+                "Non-blocking: one or more declared Allowed Paths match a project-local "
+                "extension candidate perimeter (unknown_surface_policy.project_candidate_path_globs) "
+                "but no known extension-surface risk-trigger rule. No action required."
+            ),
+            "autofixable": False,
+        }
+    ]
+
+
 def check_rva_immediate_fields(body: str) -> list[dict]:
     """
     AC4: Check that `decision: immediate` RVA section has all required fields.
@@ -1849,6 +2004,10 @@ def build_result(
     rva_errors = check_rva_immediate_fields(body)
     rdr_errors = check_required_design_references(body)
     ext_surface_errors = check_extension_surface_risk_trigger(body)
+    # Issue #2339: non-blocking advisory findings, kept OUT of
+    # `ext_surface_errors` (the escalation-gating variable below) --
+    # included in `all_errors` for display only.
+    ext_surface_advisory_errors = check_extension_surface_advisory(body)
 
     preflight_errors: list[dict] = []
     preflight_aggregate = "go"
@@ -1868,6 +2027,7 @@ def build_result(
         + rva_errors
         + rdr_errors
         + ext_surface_errors
+        + ext_surface_advisory_errors
         + static_vc_errors
         + preflight_errors
     )
@@ -1895,10 +2055,23 @@ def build_result(
         else:
             overall_status = _raise_status(overall_status, "needs_fix")
 
+    # PR #2370 OWNER review fix_delta (iteration 1, P0): `fix_hint` /
+    # `minimal_context` must be selected from the BLOCKING subset of
+    # `all_errors` only. `ext_surface_advisory_errors` (EXTSURF003,
+    # category: extension_surface_candidate_advisory) is a non-blocking
+    # finding kept in `all_errors` for display purposes only -- if it were
+    # allowed to become `first_error` (e.g. when it is the only entry
+    # present, or simply precedes a later blocking error in list order), a
+    # genuinely blocking finding's `fix_hint` would be silently hidden
+    # behind a "no action required" advisory message, self-contradicting
+    # the very blocker it was meant to surface.
+    blocking_errors_for_fix_hint = [
+        e for e in all_errors if e.get("category") not in _NON_BLOCKING_READINESS_ERROR_CATEGORIES
+    ]
     fix_hint: Optional[str] = None
     minimal_context: list = []
-    if all_errors:
-        first_error = all_errors[0]
+    if blocking_errors_for_fix_hint:
+        first_error = blocking_errors_for_fix_hint[0]
         fix_hint = first_error.get("fix_hint")
         minimal_context = first_error.get("minimal_context", [])
 
@@ -1939,6 +2112,22 @@ def main() -> int:
             "  Detects compound_command_disallowed statically. "
             "  unexpected_pass detection requires --mode execute (execution-only signal). "
             "execute: also runs baseline_vc_preflight.py to execute VCs."
+        ),
+    )
+    parser.add_argument(
+        "--history-snapshot-file",
+        default=None,
+        help=(
+            "Issue #2254 fix_delta P0 blocker 1: path to an immutable "
+            "history_snapshot/v1 JSON file a PARENT process (e.g. "
+            "run_contract_review_once.py Step 2, or "
+            "run_root_review_pipeline.py's run-checker-attempt) already "
+            "produced for this SAME body. When given (and --mode execute), "
+            "this process loads that EXACT snapshot and passes it straight "
+            "through to run_baseline_vc_preflight() instead of reading the "
+            "history store again itself. When omitted, execute mode "
+            "produces its own snapshot (standalone / direct invocation), "
+            "unchanged from pre-fix_delta behavior."
         ),
     )
 
@@ -2010,7 +2199,29 @@ def main() -> int:
         )
         skip_preflight = is_canonical_parent and not parent_has_vc_section
         if not skip_preflight:
-            preflight_result, preflight_exit_code = run_baseline_vc_preflight(body)
+            # Issue #2254 fix_delta P0 blocker 1: reuse a PARENT-produced
+            # snapshot (via --history-snapshot-file) verbatim instead of
+            # always re-reading the store from this subprocess -- see
+            # run_baseline_vc_preflight()'s own docstring above.
+            _cli_history_snapshot: Optional[Dict[str, Any]] = None
+            if args.history_snapshot_file:
+                _cli_history_snapshot = _vc_runtime_history.load_history_snapshot_file(
+                    Path(args.history_snapshot_file)
+                )
+            # Issue #2254 fix_delta P0 blocker 1: only pass the NEW
+            # history_snapshot= kwarg when a caller actually supplied
+            # --history-snapshot-file, so this call site remains
+            # byte-for-byte the SAME run_baseline_vc_preflight(body)
+            # invocation pre-existing test doubles/mocks (which do not
+            # accept this kwarg) already expect, in the (default,
+            # standalone-invocation) case where no parent process passed a
+            # snapshot file.
+            _preflight_kwargs: Dict[str, Any] = {}
+            if _cli_history_snapshot is not None:
+                _preflight_kwargs["history_snapshot"] = _cli_history_snapshot
+            preflight_result, preflight_exit_code = run_baseline_vc_preflight(
+                body, **_preflight_kwargs
+            )
         else:
             # #1878 P2 review: record a machine-readable "not_applicable"
             # source_checks entry so a deliberate skip is distinguishable
