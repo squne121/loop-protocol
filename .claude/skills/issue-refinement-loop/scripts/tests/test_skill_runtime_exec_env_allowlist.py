@@ -44,6 +44,34 @@ _CAPABILITY_ENV_NAMES = (
 )
 
 
+def test_sanitize_env_carries_gh_config_dir_only_for_exact_bare_preflight_run(monkeypatch):
+    """GH_CONFIG_DIR follows the same exact-command boundary as the bare
+    workflow-start carrier; it is not a profile-prefix allowlist."""
+    configured_path = "/non-secret/launcher-gh-config"
+    monkeypatch.setenv("GH_CONFIG_DIR", configured_path)
+
+    bare_env = sre._sanitize_env("/fake/project/root", command_id="preflight.run")
+
+    assert bare_env["GH_CONFIG_DIR"] == configured_path
+    for command_id in (
+        "",
+        "preflight.run.with_anchor",
+        "preflight.run.with_human_context",
+        "preflight.run.with_agent_report",
+        "preflight.run.fixture",
+        "preflight.run.fixture.with_human_context",
+    ):
+        assert "GH_CONFIG_DIR" not in sre._sanitize_env("/fake/project/root", command_id=command_id)
+
+
+def test_sanitize_env_never_synthesizes_gh_config_dir_for_bare_preflight_run(monkeypatch):
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    assert "GH_CONFIG_DIR" not in sre._sanitize_env("/fake/project/root", command_id="preflight.run")
+
+    monkeypatch.setenv("GH_CONFIG_DIR", "")
+    assert "GH_CONFIG_DIR" not in sre._sanitize_env("/fake/project/root", command_id="preflight.run")
+
+
 def test_sanitize_env_carries_capability_request_for_bare_preflight_run(monkeypatch):
     monkeypatch.setenv("LOOP_SPARK_MODE", "required")
     monkeypatch.setenv("LOOP_SPARK_FALLBACK", "forbidden")

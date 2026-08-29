@@ -510,6 +510,52 @@ def test_required_uv_version_reads_repo_pyproject_toml_ssot():
 # ---------------------------------------------------------------------------
 
 
+def test_sanitize_env_preserves_nonempty_gh_config_dir_for_exact_bare_preflight_run(monkeypatch, tmp_path):
+    """GIVEN an isolated-HOME launcher supplies a non-empty GH_CONFIG_DIR path
+    WHEN the canonical executor sanitizes the exact bare preflight.run command
+    THEN only that caller-provided path identity survives without inspecting its contents."""
+    gh_config_dir = tmp_path / "launcher-gh-config"
+    gh_config_dir.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(gh_config_dir))
+
+    env = exec_mod._sanitize_env(str(REPO_ROOT), command_id="preflight.run")
+
+    assert env["GH_CONFIG_DIR"] == str(gh_config_dir)
+
+
+def test_sanitize_env_omits_unset_or_empty_gh_config_dir_for_bare_preflight_run(monkeypatch):
+    """A bare preflight.run never synthesizes GH_CONFIG_DIR: absent and empty
+    caller values remain absent from its child environment."""
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    assert "GH_CONFIG_DIR" not in exec_mod._sanitize_env(str(REPO_ROOT), command_id="preflight.run")
+
+    monkeypatch.setenv("GH_CONFIG_DIR", "")
+    assert "GH_CONFIG_DIR" not in exec_mod._sanitize_env(str(REPO_ROOT), command_id="preflight.run")
+
+
+@pytest.mark.parametrize(
+    "command_id",
+    (
+        "",
+        "preflight.run.with_anchor",
+        "preflight.run.with_human_context",
+        "preflight.run.with_agent_report",
+        "preflight.run.fixture",
+        "preflight.run.fixture.with_human_context",
+    ),
+)
+def test_sanitize_env_strips_gh_config_dir_for_every_non_bare_preflight_profile(monkeypatch, tmp_path, command_id):
+    """Every default and sibling profile remains denied GH_CONFIG_DIR,
+    including the former fixture-only exception."""
+    gh_config_dir = tmp_path / "launcher-gh-config"
+    gh_config_dir.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", str(gh_config_dir))
+
+    env = exec_mod._sanitize_env(str(REPO_ROOT), command_id=command_id)
+
+    assert "GH_CONFIG_DIR" not in env
+
+
 def test_sanitize_env_secret_canary_never_reaches_real_child_process(monkeypatch, tmp_path):
     """GIVEN a secret canary embedded only in a fake host `GH_CONFIG_DIR`
     (its env var value AND its on-disk `hosts.yml` content -- the thing an

@@ -1137,11 +1137,21 @@ def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",
     }
-    # Only the closed offline fixture sibling may receive its isolated gh
-    # configuration directory.  Production command environments retain their
-    # existing allowlist and PATH/trusted-executable behavior.
-    if command_id == "preflight.run.fixture.with_human_context":
-        allowed_keys.add("GH_CONFIG_DIR")
+    # GH_CONFIG_DIR is an invocation-scoped GitHub CLI configuration path for
+    # the one bare workflow-start carrier.  Do not infer a value when absent,
+    # inspect configuration contents, or widen this to any similarly named
+    # profile: only the exact command id below receives it.
+    #
+    # The fixture-only human-context exception was removed with this exact
+    # command boundary; all fixture, anchor, and human-context profiles retain
+    # the default strip behavior.
+    if command_id == "preflight.run":
+        allowed_keys |= {
+            "GH_CONFIG_DIR",
+            "LOOP_SPARK_MODE",
+            "LOOP_SPARK_FALLBACK",
+            "LOOP_PLANNED_OPERATIONS_JSON",
+        }
     # Issue #2311 fix_delta (PR #2320 review P0-1): only the bare
     # `preflight.run` command's first hop (`workflow_start_entry.py`) reads
     # an invocation-scoped capability request off these three env vars as
@@ -1160,12 +1170,6 @@ def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
     # `.with_agent_report` / `.fixture` / `.fixture.with_human_context`)
     # first-hop into `run_refinement_preflight.py` directly and do not
     # consume this env-based capability request at all.
-    if command_id == "preflight.run":
-        allowed_keys |= {
-            "LOOP_SPARK_MODE",
-            "LOOP_SPARK_FALLBACK",
-            "LOOP_PLANNED_OPERATIONS_JSON",
-        }
     env = {
         key: value
         for key, value in os.environ.items()
