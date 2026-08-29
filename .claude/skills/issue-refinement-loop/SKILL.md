@@ -61,20 +61,23 @@ needs-fix を受け取ったとき:
 [Step 1: Investigation]      → codebase-investigator
 [Step 1b: Web research]      → web-researcher (conditional)
         ↓
-[Step 2: Review]             → issue-reviewer → root_review_pipeline(V2 delegate) → ISSUE_REVIEW_RESULT_COMPACT_V2
+[Step 2: Review]             → run_root_review_pipeline.py produce（root-owned、直接 consume, #2380）
         ↓
- VERDICT を decide_next_loop_action.py にそのまま渡す（bounded decision, #1873）
-   ├─ approve:
-   │    → Step 4.5 → Step 5
-   ├─ needs-fix かつ iteration < max_iterations:
-   │    iteration += 1 → Step 4（rewrite）
-   └─ needs-fix かつ iteration >= max_iterations（または blocked）:
-        → Step 5 (human_review_required)
+ (status, verdict, next_action) の組で routing する（bounded decision, #1873/#2380。詳細・
+ routing table は下記 Step 2 参照）
+   ├─ ok / approve / proceed                     → Step 4.5 → Step 5
+   ├─ ok / needs-fix / request_changes            → iteration += 1 → Step 4（rewrite。
+   │                                                 max_iterations 到達時は Step 5）
+   ├─ ok / human_judgment_required（verdict 不問） → Step 5 (human_review_required)
+   └─ 上記以外の不整合な組（status != ok を含む）  → fail-closed で停止
 ```
 
-Step 2a（旧 Replay Arbitration、#1532 V2 契約）は #1873 で撤去された。orchestrator は
-`issue-reviewer` の VERDICT を独立に再計算せず直接信頼する。Step 3（adversarial review）
-と Step 1.5（spec document review）は採用しない。Step 番号は履歴互換のため維持する。
+canonical Step 2 は `issue-reviewer` SubAgent を起動せず、11 行 wire（`compact_result.stdout_lines`）
+を relay しない（Issue #2380）。`issue-reviewer` SubAgent・`classify_child_stdout()`・
+`retry_once_on_transport_failure()` は legacy CLI・診断・回帰テスト専用であり、canonical
+routing の必須処理ではない。Step 2a（旧 Replay Arbitration、#1532 V2 契約）は #1873 で
+撤去された。Step 3（adversarial review）と Step 1.5（spec document review）は採用しない。
+Step 番号は履歴互換のため維持する。
 
 ## LOOP_STATE
 
@@ -239,27 +242,25 @@ transport/grounding 成功と扱う（詳細は `references/web-research-routing
 
 **producer I/O は root-owned、compact envelope 生成も含め単一 producer（Issue #2049 / merged PR #2135、AC8 SSOT を #2054 が拡張）**: live body fetch・body SHA 固定・`check_issue_contract` / `contract_readiness_check` / merge_readiness の実行・`ISSUE_REVIEW_RESULT_COMPACT_V2` compact envelope の生成・full artifact / compact artifact の canonical artifact directory への保存は、すべて orchestrator（main thread）が
 `.claude/skills/issue-refinement-loop/scripts/run_root_review_pipeline.py produce --issue-number <N> --repo <owner/repo>`
-（`root_review_pipeline.produce`, command_registry.py 登録済み、外部 CLI 契約は #2054 でも変更しない）を実行して行う。`produce` の内部実装は #2054 で `.claude/skills/issue-refinement-loop/scripts/reviewer_transport.py`（V2 契約 SSOT）へ委譲し、`ISSUE_REVIEW_RESULT_COMPACT_V1`（9行、`EVIDENCE` あり）ではなく `ISSUE_REVIEW_RESULT_COMPACT_V2`（`ATTEMPT_ID`/`ARTIFACT_SHA256` を含む exact 11行 grammar）を生成・永続化する。V1 producer（`compact_review_result.py` の compact 生成関数）は retired であり、同一 commit での atomic cutover に downgrade fallback はない。`produce` の JSON 出力には `compact_result.stdout_lines`（既に render・永続化済みの `ISSUE_REVIEW_RESULT_COMPACT_V2` 11 行）が含まれる。`issue-reviewer` SubAgent（`.codex/agents/issue-reviewer.toml`, `default_permissions: loop-protocol-readonly`）は orchestrator からこの `compact_result.stdout_lines` を明示的な read-only input として受け取り、そのまま自身の最終出力として relay するだけで、producer I/O を一切行わない。
+（`root_review_pipeline.produce`, command_registry.py 登録済み、外部 CLI 契約は #2054 でも変更しない）を実行して行う。`produce` の内部実装は #2054 で `.claude/skills/issue-refinement-loop/scripts/reviewer_transport.py`（V2 契約 SSOT）へ委譲し、`ISSUE_REVIEW_RESULT_COMPACT_V1`（9行、`EVIDENCE` あり）ではなく `ISSUE_REVIEW_RESULT_COMPACT_V2`（`ATTEMPT_ID`/`ARTIFACT_SHA256` を含む exact 11行 grammar）を生成・永続化する。V1 producer（`compact_review_result.py` の compact 生成関数）は retired であり、同一 commit での atomic cutover に downgrade fallback はない。
 
-これは Issue #2049 の root-owned pipeline アーキテクチャ（child agent は producer I/O を一切行わない）を維持したまま、#2054 が compact envelope の wire format を V1 から V2 へ atomic cutover した変更である。`run_root_review_pipeline.py` は #2054 が新設する第二の producer pipeline ではなく、既存の `classify_child_stdout()` / `retry_once_on_transport_failure()` / `readback_persisted_artifact()` の内部実装を `reviewer_transport.py` へ委譲する形で単一の V2 契約実装へ統合されている（AC8）。ステップ単位の所有権表は `.claude/skills/review-issue/SKILL.md` の「Producer I/O ownership」節を参照する。
+**canonical Step 2 routing は `produce` の JSON 出力を直接 consume する（Issue #2380）**: `produce` の JSON 出力には root-verified な `compact_result.verdict` / `compact_result.next_action`（`reviewer_transport.run_reviewer_transport()` が内側で行う deterministic checker transport の bounded retry、および `_cmd_produce()` 自身が行う `verify_artifact()` / `verify_wire_matches_artifact()` による artifact 整合性検証を経て確定した値）と `verified_transport_artifact`（`REVIEWER_COMPACT_ARTIFACT_V2`）が含まれる。canonical Step 2 は、この `compact_result.verdict` / `compact_result.next_action` を routing の唯一の入力として直接使用する。`issue-reviewer` SubAgent（`.codex/agents/issue-reviewer.toml`, `default_permissions: loop-protocol-readonly`）は canonical Step 2 では起動されない（routing authority を持たない）。`compact_result.stdout_lines`（11行 wire）を issue-reviewer に relay することも行わない。これは Issue #2049 の root-owned pipeline アーキテクチャ（producer I/O は root-owned pipeline のみが行う）を維持したまま、#2054 が compact envelope の wire format を V1 から V2 へ atomic cutover した変更を引き継ぐ。`run_root_review_pipeline.py` は #2054 が新設する第二の producer pipeline ではなく、既存の `classify_child_stdout()` / `retry_once_on_transport_failure()` / `readback_persisted_artifact()` の内部実装を `reviewer_transport.py` へ委譲する形で単一の V2 契約実装へ統合されている（AC8）。**#2380 以降、`classify_child_stdout()` / `retry_once_on_transport_failure()` / `run_root_review_pipeline.py classify-child-stdout` CLI と issue-reviewer SubAgent の起動は canonical Step 2 routing の必須処理から外れた。これらは legacy CLI・診断・回帰テスト専用として引き続き利用可能であり、exact 11-line grammar を強制する strict compatibility boundary としての `validate_review_compact_output.py` / `reviewer_transport.verify_wire_matches_artifact()` 自体は変更しない（AC3）。** ステップ単位の所有権表は `.claude/skills/review-issue/SKILL.md` の「Producer I/O ownership」節を参照する。
+**`produce` 自体が transport failure を返した場合の扱い（AC2/AC5）**: `reviewer_transport.run_reviewer_transport()` が内側で行う deterministic checker transport の bounded retry（spawn / timeout / signal / empty output / malformed output を含む）、artifact verification（repo/issue/body SHA/invocation/attempt/raw-byte SHA binding）、final review readback gate は変更しない。この内側の retry / 検証を尽くしても `produce` が `status: input_or_runtime_error`（`error_code: reviewer_transport_environment_failure` または `artifact_readback_failed`）を返した場合、canonical Step 2 は追加の子 invocation 再試行（旧 issue-reviewer 呼び出しの一度だけ再試行）を行わず、そのまま `NEXT_ACTION: human_judgment_required` として Step 5 (human_escalation) へ倒す。`status: ok` の場合のみ `compact_result.verdict` / `compact_result.next_action` を routing に使う。symlink／root escape／attempt mismatch／hash mismatch を含む artifact 整合性検証は `produce` 内部で完結しており、この整合性検証ロジック自体は変更しない。消費側契約 (consumer contract): `ISSUE_REVIEW_RESULT_COMPACT_V2`（正本 (SSOT): `.claude/skills/issue-refinement-loop/scripts/reviewer_transport.py`）。V1（`ISSUE_REVIEW_RESULT_COMPACT_V1`、`compact_review_result.py`）は retired であり、partial deployment・downgrade fallback は禁止する。
 
-**child stdout が 0 byte または malformed（非空だが不正）のときの扱い（AC4/AC5/AC6）**: orchestrator は `issue-reviewer` の raw stdout が 0 byte のまま返った場合でも、必ず `validate_review_compact_output.py`（内部実装は V2 契約 SSOT の `reviewer_transport.validate_compact_v2()` へ委譲、V2 grammar 専用）を呼ぶ（呼ばずに再試行やスキップをしない）。バリデータは `empty_input` violation に `classification: reviewer_transport_failure` を付与する。この classification を受けた場合、orchestrator は root producer（`issue-reviewer` SubAgent 呼び出し）を一度だけ再実行する。再実行後も `empty_input` / `reviewer_transport_failure` のままであれば、それ以上再試行せず `NEXT_ACTION: human_judgment_required` として Step 5 (human_escalation) へ倒す（`run_root_review_pipeline.retry_once_on_transport_failure()` が同じ一度だけ再試行のセマンティクスを実装する。この関数の `classify_child_stdout()` は V2 契約 SSOT の `reviewer_transport.validate_compact_v2()` を直接呼ぶ単一の実行経路であり、非空だが malformed な stdout も同じ `reviewer_transport_failure` として一度だけ再試行される — 別の簡易 classifier を持たない）。transport failure（spawn / timeout / signal / empty output / malformed output / artifact 書き込み・整合性失敗を含む）は常に `STATUS: environment_failure` / `semantic_verdict: null` に収束し、`human_judgment_required` として記録しない。symlink／root escape／attempt mismatch／hash mismatch は `integrity_failure` として区別する。
+**canonical Step 2 routing table（AC1/AC2、追加の classify / relay ステップなしに直接評価する。Issue #2380 P0-2: `(status, verdict, next_action)` の組で判定し、`verdict` 単独では判定しない）**: canonical Step 2 は `produce` の JSON 出力に含まれる `status` / `compact_result.verdict` / `compact_result.next_action` の組を、issue-reviewer 起動・`run_root_review_pipeline.py classify-child-stdout`・`classify_child_stdout()`・`retry_once_on_transport_failure()` のいずれも呼ばずに、`run_root_review_pipeline.route_canonical_step2_result()`（純粋関数、副作用なし）へそのまま渡して判定する:
 
-消費側契約 (consumer contract): `ISSUE_REVIEW_RESULT_COMPACT_V2`（正本 (SSOT): `.claude/skills/issue-refinement-loop/scripts/reviewer_transport.py`）。V1（`ISSUE_REVIEW_RESULT_COMPACT_V1`、`compact_review_result.py`）は retired であり、partial deployment・downgrade fallback は禁止する。
-
-**validator-first 順序（AC4/AC6、routing table より前に評価する）**: orchestrator は approve / needs-fix いずれの経路でも、SubAgent（child）stdout の raw bytes を consume する前に、必ず `run_root_review_pipeline.py classify-child-stdout`（`--issue-number` / `--artifact-root` / `--repo` / `--expected-body-sha256` を渡す）へ child の raw stdout bytes をそのまま（re-transcribe せず）渡す。この単一エントリポイントが内部で `validate_review_compact_output.py`（V2 grammar 判定）→ `reviewer_transport.verify_artifact()`（trusted artifact root FD を起点に `O_DIRECTORY|O_NOFOLLOW` で component-wise open、同一 accepted leaf FD から一度だけ bounded raw bytes を読み、その同じ raw bytes で SHA-256・strict JSON・schema/repository/issue/reviewed body SHA/invocation/attempt を検証する。`Path.resolve()` → `stat()` → 別 `open()` という resolve/stat と open を分離した security fallback は行わない）→ `reviewer_transport.verify_wire_matches_artifact()`（検証済み artifact の `semantic_result` から wire を再導出し、child が relay した wire と byte 単位で一致することを確認する。ARTIFACT/ARTIFACT_SHA256 を変えずに VERDICT/BLOCKERS/NEXT_ACTION だけを自己整合的に書き換えた wire はここで `integrity_failure` として reject される）の順に評価する。**この一連の検証が完了する前に `VERDICT` / `NEXT_ACTION` / `ARTIFACT` を読んではならない。** `classification` が `ok` 以外（`reviewer_transport_failure` または `integrity_failure`）の場合は routing を `human_judgment_required` に固定する（fail-closed。`integrity_failure` は再試行しない）。`classification: ok` の場合のみ、`normalized_payload` を根拠に以下の routing table を評価する:
-
-- `VERDICT: approve` → Step 4.5 へ
-- `VERDICT: needs-fix` → `decide_next_loop_action.py`（rewrite 後 / next-action 決定時に呼ぶ、下記「LOOP_STATE」参照）へ VERDICT をそのまま渡す（**#1873: 旧 Step 2a Replay Arbitration は撤去された** — orchestrator は VERDICT を独立に再計算せず直接信頼する）
-- full structured data は parent-verified V2 artifact（`ARTIFACT: compact_review_result_v2=<path>`）から取得する（main context には返らない、validator と artifact binding 通過後のみ参照可）
+- `status: ok` + `compact_result.verdict: approve` + `compact_result.next_action: proceed` → Step 4.5 へ
+- `status: ok` + `compact_result.verdict: needs-fix` + `compact_result.next_action: request_changes` → `decide_next_loop_action.py`（rewrite 後 / next-action 決定時に呼ぶ、下記「LOOP_STATE」参照）へ VERDICT をそのまま渡す（**#1873: 旧 Step 2a Replay Arbitration は撤去された** — orchestrator は VERDICT を独立に再計算せず直接信頼する）
+- `status: ok` + `compact_result.next_action: human_judgment_required`（`verdict` の値は問わない。既存の compact schema — `review-issue/SKILL.md` の「Producer I/O ownership」節 — で `verdict: needs-fix` かつ `next_action: human_judgment_required` の組が有効であるため）→ Step 5 (human_review_required) へ
+- 上記いずれにも一致しない組（`status != ok` を含む）→ environment/integrity failure として fail-closed で停止する（`decide_next_loop_action.py` を呼ばず、通常の rewrite loop へも進めない）
+- full structured data は `produce` が返す `verified_transport_artifact`（`REVIEWER_COMPACT_ARTIFACT_V2`、`compact_result.artifact_path` と同一パス）または `merged_review_result` から取得する。`merged_review_result` は `_cmd_produce()` の成功 JSON のトップレベルに含まれ、通常の tool result 経由で main context に実際に返る（Issue #2380 P2: 過去の記述「main context には返らない」は実際の stdout 出力と矛盾していたため訂正）。issue-reviewer 経由の relay は経由しない
 
 anchor comment により stale approval を無効化する場合も、raw snapshot は Step 4 に渡さず、正規化済み `anchor_comment_feedback` だけを渡す。
 
 **重要**: `review` phase（rewrite 前）では `decide_next_loop_action.py` を呼んではならない。
-`review` phase での routing は VERDICT に基づいて直接行う（承認なら次段階へ、要修正なら書き直しへ）:
-
-- `VERDICT: approve` → Step 4.5 へ（承認）
-- `VERDICT: needs-fix` → Step 4（rewrite、書き直し）へ
+`review` phase での routing は `route_canonical_step2_result()` が返す上記の
+`(status, verdict, next_action)` 判定にそのまま従う（承認なら Step 4.5、要修正なら Step 4、
+human_judgment_required なら Step 5、不整合なら fail-closed で停止）。
 
 `decide_next_loop_action.py` は rewrite 後 / next-action 決定時にのみ呼ぶ:
 
