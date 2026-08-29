@@ -537,6 +537,23 @@ def run_runtime_case(
     require_clean_postcondition: bool,
 ) -> dict[str, Any]:
     case_dir = output_dir / case_name
+    # Issue #1881 fix_delta (PR #2385): a stale `case_dir` left over from a
+    # PRIOR invocation of this same case (e.g. a previous CI run, a previous
+    # reviewer/human invocation in the same worktree, or a prior attempt in
+    # this same session) causes the delegated runner's own `--output-dir`
+    # exclusive-create check (`prepare_output_dir()` in
+    # `run_worktree_agent_runtime_smoke.py`, which this script deliberately
+    # does not modify per this Issue's Stop Conditions) to fail before it
+    # ever writes a fresh `evidence.json`. `classify_deny_case()` /
+    # `classify_positive_case()` then correctly, honestly report
+    # `inconclusive` from that absence -- fail-closed, not a fabricated
+    # PASS -- but this makes the script confusingly non-idempotent across
+    # repeated invocations unless the caller manually pre-cleans this
+    # directory (undocumented, and the root cause of a real false blocker).
+    # Unconditionally discard any stale state and start each case run from a
+    # guaranteed-fresh directory so the case's own evidence is always used,
+    # never leftover state from an earlier run.
+    shutil.rmtree(case_dir, ignore_errors=True)
     case_dir.mkdir(parents=True, exist_ok=True)
     prompt_file = case_dir / "prompt.txt"
     prompt_file.write_text(prompt_text, encoding="utf-8")

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -920,3 +921,131 @@ class TestOtherLiveClaudeProcesses:
         assert isinstance(result, list)
         for pid in result:
             assert isinstance(pid, int)
+
+
+# ─── Stale output-directory idempotency (PR #2385 final review fix_delta) ──
+
+
+class TestRunRuntimeCaseStaleDirectoryIdempotency:
+    """Issue #1881 fix_delta (PR #2385, final review round): a stale
+    ``artifacts/runtime-probe/<case_name>/`` directory left over from a
+    PRIOR invocation of the same case (a previous CI run, a previous
+    reviewer/human invocation in the same worktree, or an earlier attempt
+    in this same session) must not cause a spurious ``process_error`` /
+    inconclusive result on a SUBSEQUENT invocation of ``run_runtime_case``
+    -- the later run's own fresh evidence must be used every time, never
+    leftover state from an earlier run, and without requiring the caller
+    to manually pre-clean the directory."""
+
+    def _install_fake_runner(self, monkeypatch: pytest.MonkeyPatch, calls: list[int]) -> None:
+        """Fakes the delegated runner's own well-known behavior: it fails
+        (non-zero exit, no ``evidence.json`` written) if its own
+        ``--output-dir`` already exists on disk (mirrors
+        ``run_worktree_agent_runtime_smoke.py``'s real
+        ``prepare_output_dir()`` exclusive-create check -- this test does
+        not modify or import that runner, per this Issue's Stop
+        Conditions, it only reproduces its documented exclusive-create
+        contract), and otherwise creates it fresh and writes a
+        run-specific ``evidence.json``."""
+
+        def _fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            calls.append(1)
+            run_index = len(calls)
+            output_dir = Path(cmd[cmd.index("--output-dir") + 1])
+            evidence_json_path = Path(cmd[cmd.index("--evidence-json") + 1])
+            if output_dir.exists():
+                return subprocess.CompletedProcess(
+                    cmd,
+                    returncode=1,
+                    stdout="FAIL: output directory already exists (exclusive create required)\n",
+                    stderr="",
+                )
+            output_dir.mkdir(parents=True)
+            evidence_json_path.write_text(json.dumps({"run_index": run_index}), encoding="utf-8")
+            return subprocess.CompletedProcess(
+                cmd, returncode=0, stdout=f"OK: run-{run_index}\n", stderr=""
+            )
+
+        monkeypatch.setattr(verifier.subprocess, "run", _fake_run)
+
+    def _make_worktree(self, tmp_path: Path) -> Path:
+        worktree = tmp_path / "worktree"
+        agent_md = worktree / ".claude" / "agents" / "pr-reviewer.md"
+        agent_md.parent.mkdir(parents=True)
+        agent_md.write_text("---\ndescription: test agent\n---\nBody text\n", encoding="utf-8")
+        return worktree
+
+    def test_second_run_without_manual_cleanup_uses_fresh_evidence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
+        worktree = self._make_worktree(tmp_path)
+        output_dir = tmp_path / "artifacts" / "runtime-probe"
+        calls: list[int] = []
+        self._install_fake_runner(monkeypatch, calls)
+
+        first = verifier.run_runtime_case(
+            worktree=worktree,
+            case_name="positive_reference_read",
+            prompt_text="prompt",
+            marker_hint="marker",
+            output_dir=output_dir,
+            timeout_seconds=5,
+            require_clean_postcondition=False,
+        )
+        assert first["process_error"] is None
+        assert first["evidence"] == {"run_index": 1}
+
+        # Second invocation, deliberately WITHOUT any manual cleanup of the
+        # first run's leftover `case_dir` (smoke-output/, evidence.json,
+        # prompt.txt, agents-passthrough.json, wrapper script all still on
+        # disk from the first run) -- mirrors a stale directory left over
+        # from a prior invocation by a different caller/session.
+        second = verifier.run_runtime_case(
+            worktree=worktree,
+            case_name="positive_reference_read",
+            prompt_text="prompt",
+            marker_hint="marker",
+            output_dir=output_dir,
+            timeout_seconds=5,
+            require_clean_postcondition=False,
+        )
+        assert second["process_error"] is None
+        assert second["evidence"] == {"run_index": 2}
+        assert second["exit_code"] == 0
+
+    def test_stale_case_dir_from_unrelated_prior_run_is_discarded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Directly reproduces the reported false-SKIP scenario: a stale
+        `case_dir` (with its own `smoke-output/` and `evidence.json`)
+        already exists on disk BEFORE `run_runtime_case` is ever called in
+        this test (e.g. left over from a prior CI run/session), yet the
+        call still succeeds and uses fresh evidence -- without the fix,
+        the fake runner would observe the pre-existing `--output-dir` and
+        return the same failure the real runner does."""
+        monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
+        worktree = self._make_worktree(tmp_path)
+        output_dir = tmp_path / "artifacts" / "runtime-probe"
+        case_dir = output_dir / "positive_reference_read"
+
+        stale_smoke_output = case_dir / "smoke-output"
+        stale_smoke_output.mkdir(parents=True)
+        (case_dir / "evidence.json").write_text(json.dumps({"stale": True}), encoding="utf-8")
+
+        calls: list[int] = []
+        self._install_fake_runner(monkeypatch, calls)
+
+        result = verifier.run_runtime_case(
+            worktree=worktree,
+            case_name="positive_reference_read",
+            prompt_text="prompt",
+            marker_hint="marker",
+            output_dir=output_dir,
+            timeout_seconds=5,
+            require_clean_postcondition=False,
+        )
+
+        assert result["process_error"] is None
+        assert result["evidence"] == {"run_index": 1}
+        assert result["exit_code"] == 0
