@@ -418,6 +418,7 @@ payload が構造的に現れないため、`causal_evidence_source` は今の�
 
 ## Related（関連情報）
 
+- `.claude/skills/issue-refinement-loop/scripts/run_native_session_continuation_canary.py` — Issue #2153。claude-native / claude-gpt の Claude Code session continuation（initial/same-continuation/fresh の 3 段階 lifecycle）を検証する専用 canary。本 Skill の executable/launcher 解決・`--claude-adapter` 選択・timeout/process termination・stdout/stderr capture・worktree identity・runtime-unavailable classification の primitive を reuse するが、3 段階 lifecycle state machine 自体は本 Skill には追加されていない（reuse 境界は Issue #2153 AC6 参照）
 - `.claude/skills/implement-issue/SKILL.md` — 動作検証 AC を含む Issue の実装手順（本 Skill を呼び出す側）
 - `docs/dev/runtime-verification-policy.md` — Runtime Verification Applicability の全体方針
 - `docs/dev/agent-runtime-ops.md` — structured lane 既定・interactive herdr lane 限定利用の運用境界
