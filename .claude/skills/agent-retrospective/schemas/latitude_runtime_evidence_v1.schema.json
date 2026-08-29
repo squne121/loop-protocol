@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.dev/schemas/latitude_runtime_evidence_v1.schema.json",
+  "title": "latitude_runtime_evidence/v1",
+  "description": "Public-safe, bounded runtime evidence produced by agent-retrospective's Latitude CLI collector (Issue #2375). This is the ONLY output contract the collector may emit -- collector-internal results are never accepted as arbitrary JSON. additionalProperties: false (top-level and metrics) closes the key set: unknown/forbidden fields (raw trace, prompt, message, tool I/O, full stdout/stderr, authorization, token, secret, absolute local path) fail schema validation rather than being silently dropped. When availability: available, evidence_identity/evidence_ref/metrics.* are required non-null and reason_code is required null. When availability is unavailable or error, evidence_identity/evidence_ref/metrics.* are required null and reason_code is required non-null (from the closed enum below) -- a Latitude-unavailable result never carries an evidence claim. evidence_identity and evidence_ref are both derived (via validate_retrospective_schema.compute_latitude_evidence_ref/compute_latitude_evidence_identity) exclusively from allowlisted metrics/collector_version/collected_at -- never from raw trace ID, raw payload, or a local absolute path (Binding Rules).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "availability",
+    "collected_at",
+    "collector_version",
+    "evidence_identity",
+    "evidence_ref",
+    "metrics",
+    "reason_code"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "latitude_runtime_evidence/v1"
+    },
+    "availability": {
+      "type": "string",
+      "enum": ["available", "unavailable", "error"]
+    },
+    "collected_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "collector_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_identity": {
+      "description": "sha256 digest of a canonical, public-safe projection (collector_version + evidence_ref + metrics) -- never a hash of raw trace/payload content.",
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "evidence_ref": {
+      "description": "Opaque, non-secret reference derived solely from collector_version + metrics + collected_at. Never raw trace content, a raw trace ID, or a local absolute path.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trace_count", "span_count", "duration_ms"],
+      "properties": {
+        "trace_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "span_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "duration_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        }
+      }
+    },
+    "reason_code": {
+      "type": ["string", "null"],
+      "enum": [
+        null,
+        "cli_not_found",
+        "auth_failed",
+        "network_unavailable",
+        "non_zero_exit",
+        "timeout",
+        "malformed_output",
+        "budget_exceeded",
+        "schema_violation",
+        "forbidden_field",
+        "duplicate_evidence",
+        "unknown_schema_version",
+        "identity_mismatch",
+        "unknown_error"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "availability": { "const": "available" } },
+        "required": ["availability"]
+      },
+      "then": {
+        "properties": {
+          "evidence_identity": { "type": "string" },
+          "evidence_ref": { "type": "string" },
+          "reason_code": { "const": null }
+        },
+        "required": ["evidence_identity", "evidence_ref", "reason_code"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "availability": { "enum": ["unavailable", "error"] } },
+        "required": ["availability"]
+      },
+      "then": {
+        "properties": {
+          "evidence_identity": { "const": null },
+          "evidence_ref": { "const": null },
+          "reason_code": { "type": "string" },
+          "metrics": {
+            "properties": {
+              "trace_count": { "const": null },
+              "span_count": { "const": null },
+              "duration_ms": { "const": null }
+            }
+          }
+        },
+        "required": ["evidence_identity", "evidence_ref", "reason_code", "metrics"]
+      }
+    }
+  ]
+}

@@ -37,3 +37,24 @@ frontmatter に固定された具体値:
 | `retrospective-evaluator` | 8 | `[]`（no tool） | sonnet |
 
 両者とも `mcpServers`/`hooks`/`memory` は不使用（frontmatter に宣言しない）。
+
+## Latitude CLI Collection Budget（Issue #2375）
+
+```yaml
+latitude_max_launches_per_run: 1
+latitude_timeout_seconds: 10
+latitude_max_output_bytes: 65536   # 64 KiB, stdout/stderr 個別に適用
+latitude_max_allowlisted_metrics: 3   # trace_count / span_count / duration_ms
+latitude_pagination: prohibited
+latitude_retry_loop: prohibited
+latitude_background_polling: prohibited
+```
+
+- `collect_snapshot.collect_latitude_runtime_evidence()` は 1 回の呼び出しにつき `latitude` CLI
+  を最大 1 回だけ起動する（内部に retry loop を持たない -- 予算超過は呼び出し側の責務）。
+- timeout（10秒）・output size（64 KiB、stdout/stderr 個別）を超過した場合は raw output を
+  保持せず `availability: error` / `reason_code: budget_exceeded` に正規化する。
+- allowlisted metric は `trace_count`/`span_count`/`duration_ms` の 3 個で固定。CLI の応答に
+  他のフィールドが含まれていても、この 3 個以外は読み取り直後に破棄する。
+- CLI Boundary（read-only・argv-only・no shell/stdin prompt）は
+  `references/wire-contract.md`（`latitude_runtime_evidence/v1` セクション）を参照。
