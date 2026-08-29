@@ -2291,3 +2291,244 @@ def test_given_candidate_worktree_fixture_when_non_hermetic_run_then_new_evidenc
     # Non-hermetic project-discovery binding: status stays unavailable, but
     # the field itself is never omitted from the schema.
     assert "'binding_mode': 'project_discovery'" in summary
+
+
+# ---------------------------------------------------------------------------
+# Issue #1881 PR #2385 fix_delta -- Allowed Paths Scope Delta: 3 minimal,
+# additive, backward-compatible extensions used by
+# ``verify_pr_reviewer_permission_boundary.py`` (AC4/AC5 evidentiary
+# mechanism). Function-level tests against synthetic stream-json event text,
+# per the established pattern (see the "Unit-level coverage for the
+# classification / derivation helpers themselves" section above).
+# ---------------------------------------------------------------------------
+
+
+def _system_init_line() -> str:
+    return json.dumps({"type": "system", "subtype": "init", "session_id": "fixture-session"})
+
+
+def _session_start_hook_json_payload_line(agent_type: str) -> str:
+    """The pre-existing, byte-identical JSON-object recognition path."""
+    official_payload = json.dumps(
+        {"session_id": "fixture-session", "hook_event_name": "SessionStart", "agent_type": agent_type}
+    )
+    return json.dumps(
+        {
+            "type": "system",
+            "subtype": "hook_response",
+            "hook_event": "SessionStart",
+            "hook_name": "SessionStart",
+            "session_id": "fixture-session",
+            "stdout": official_payload,
+            "output": official_payload,
+        }
+    )
+
+
+def _session_start_hook_plain_marker_line(marker_text: str) -> str:
+    """Extension 1: a plain-text SessionStart hook stdout/output marker
+    (mirrors ``.claude/hooks/pr_reviewer_guard.py``'s ``observe-identity``
+    opt-in probe channel output, e.g.
+    ``reviewer-identity-observed agent_type=pr-reviewer``) -- NOT an
+    embedded JSON object."""
+    return json.dumps(
+        {
+            "type": "system",
+            "subtype": "hook_response",
+            "hook_event": "SessionStart",
+            "hook_name": "SessionStart",
+            "session_id": "fixture-session",
+            "stdout": marker_text,
+            "output": marker_text,
+        }
+    )
+
+
+def _read_tool_use_line(tool_use_id: str, file_path: str) -> str:
+    return json.dumps(
+        {
+            "type": "assistant",
+            "session_id": "fixture-session",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": tool_use_id, "name": "Read", "input": {"file_path": file_path}}
+                ]
+            },
+        }
+    )
+
+
+def _read_tool_result_line(tool_use_id: str, *, is_error: bool = False) -> str:
+    return json.dumps(
+        {
+            "type": "user",
+            "session_id": "fixture-session",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": tool_use_id, "is_error": is_error, "content": "ok"}
+                ]
+            },
+        }
+    )
+
+
+def _result_event_line(permission_denials: list | None = None) -> str:
+    payload: dict = {"type": "result", "subtype": "success", "session_id": "fixture-session"}
+    if permission_denials is not None:
+        payload["permission_denials"] = permission_denials
+    return json.dumps(payload)
+
+
+class TestExtension1PlainTextMarkerRecognition:
+    """Issue #1881 Extension 1: ``extract_claude_session_start_identity``
+    gains an additional, strictly-fallback plain-text ``agent_type=<value>``
+    marker recognition path, tried only when the pre-existing JSON-object
+    path finds nothing on the same text."""
+
+    def test_plain_marker_is_recognized_as_fallback(self) -> None:
+        module = _load_module()
+        stdout = "\n".join(
+            [
+                _system_init_line(),
+                _session_start_hook_plain_marker_line("reviewer-identity-observed agent_type=pr-reviewer"),
+                _result_event_line(),
+            ]
+        )
+        identity = module.extract_claude_session_start_identity(stdout)
+        assert identity["agent_type"] == "pr-reviewer"
+        assert identity["source"] == module.AGENT_TYPE_SOURCE_PLAIN_MARKER
+
+    def test_json_payload_path_stays_byte_identical_and_takes_precedence(self) -> None:
+        """The pre-existing JSON-object recognition path must remain
+        untouched: when JSON parses successfully, the plain-text fallback
+        must never run at all."""
+        module = _load_module()
+        stdout = "\n".join(
+            [
+                _system_init_line(),
+                _session_start_hook_json_payload_line("issue-creator"),
+                _result_event_line(),
+            ]
+        )
+        identity = module.extract_claude_session_start_identity(stdout)
+        assert identity["agent_type"] == "issue-creator"
+        assert identity["source"] == module.AGENT_TYPE_SOURCE_HOOK_PAYLOAD
+
+    def test_non_matching_plain_text_stays_unavailable(self) -> None:
+        """Fail-closed: text with no JSON object and no ``agent_type=``
+        marker never fabricates an agent_type."""
+        module = _load_module()
+        stdout = "\n".join(
+            [
+                _system_init_line(),
+                _session_start_hook_plain_marker_line("some unrelated hook output"),
+                _result_event_line(),
+            ]
+        )
+        identity = module.extract_claude_session_start_identity(stdout)
+        assert identity["agent_type"] is None
+        assert identity["source"] is None
+
+    def test_build_main_agent_identity_matches_via_plain_marker(self) -> None:
+        """End-to-end through the consumer function: a plain-marker-only
+        SessionStart hook is sufficient for ``main_agent_identity.matched``
+        to become True for the requested persona."""
+        module = _load_module()
+        stdout = "\n".join(
+            [
+                _system_init_line(),
+                _session_start_hook_plain_marker_line("reviewer-identity-observed agent_type=pr-reviewer"),
+                _result_event_line(),
+            ]
+        )
+        identity = module.build_main_agent_identity("pr-reviewer", stdout)
+        assert identity["matched"] is True
+        assert identity["observed"]["agent_type"] == "pr-reviewer"
+        assert identity["observed"]["source"] == module.AGENT_TYPE_SOURCE_PLAIN_MARKER
+        assert identity["status"] == module.EVIDENCE_STATUS_OBSERVED
+
+
+class TestExtension2PrReviewerCanonicalPathAllowlist:
+    """Issue #1881 Extension 2: a single ``pr-reviewer`` entry added to
+    ``_PERSONA_CANONICAL_SKILL_PATH``; ``extract_claude_canonical_read_receipt``
+    itself is genuinely persona-agnostic and untouched."""
+
+    def test_pr_reviewer_entry_present_and_unchanged_others(self) -> None:
+        module = _load_module()
+        assert module._PERSONA_CANONICAL_SKILL_PATH["pr-reviewer"] == (
+            ".claude/skills/pr-review-judge/references/allowed-paths-gate.md"
+        )
+        # Pre-existing entries are untouched.
+        assert module._PERSONA_CANONICAL_SKILL_PATH["issue-creator"] == ".claude/skills/create-issue/SKILL.md"
+        assert module._PERSONA_CANONICAL_SKILL_PATH["issue-editor"] == ".claude/skills/edit-issue/SKILL.md"
+
+    def test_pr_reviewer_canonical_read_becomes_observed_on_successful_read(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = tmp_path / "worktree"
+        rel_path = Path(".claude/skills/pr-review-judge/references/allowed-paths-gate.md")
+        (worktree / rel_path.parent).mkdir(parents=True, exist_ok=True)
+        (worktree / rel_path).write_text("# Allowed Paths Gate\n", encoding="utf-8")
+
+        tool_use_id = "toolu_pr_reviewer_read_1"
+        stdout = "\n".join(
+            [
+                _system_init_line(),
+                _read_tool_use_line(tool_use_id, str(rel_path)),
+                _read_tool_result_line(tool_use_id),
+                _result_event_line(),
+            ]
+        )
+        skill_evidence = module.build_skill_evidence("pr-reviewer", str(worktree), stdout)
+        canonical_read = skill_evidence["canonical_read"]
+        assert canonical_read["status"] == module.EVIDENCE_STATUS_OBSERVED
+        assert canonical_read["observed_repo_relative_path"] == str(rel_path)
+        assert canonical_read["read_result_status"] == "success"
+
+    def test_other_persona_names_unaffected(self, tmp_path: Path) -> None:
+        module = _load_module()
+        assert module._PERSONA_CANONICAL_SKILL_PATH.get("general-purpose") is None
+
+
+class TestExtension3PermissionDenialsExposure:
+    """Issue #1881 Extension 3: ``extract_claude_permission_denials`` surfaces
+    Claude Code's own native ``permission_denials`` array from the final
+    ``type: "result"`` stream-json event -- purely additive, never gated
+    behind ``--hermetic-agent-definition``, never touching
+    ``mutation_boundary``."""
+
+    def test_present_permission_denials_array_is_extracted_verbatim(self) -> None:
+        module = _load_module()
+        denials = [
+            {
+                "tool_name": "Bash",
+                "tool_use_id": "toolu_denied_1",
+                "tool_input": {"command": "git worktree prune --dry-run"},
+            }
+        ]
+        stdout = "\n".join([_system_init_line(), _result_event_line(permission_denials=denials)])
+        assert module.extract_claude_permission_denials(stdout) == denials
+
+    def test_absent_permission_denials_field_defaults_to_empty_list(self) -> None:
+        module = _load_module()
+        stdout = "\n".join([_system_init_line(), _result_event_line()])
+        assert module.extract_claude_permission_denials(stdout) == []
+
+    def test_no_result_event_at_all_defaults_to_empty_list(self) -> None:
+        module = _load_module()
+        stdout = _system_init_line()
+        assert module.extract_claude_permission_denials(stdout) == []
+
+    def test_none_stdout_defaults_to_empty_list_never_raises(self) -> None:
+        module = _load_module()
+        assert module.extract_claude_permission_denials(None) == []
+
+    def test_permission_denials_never_gated_by_hermetic_or_mutation_boundary(self) -> None:
+        """Purely additive: the function signature takes only ``stdout`` --
+        it has no hermetic/mutation_boundary parameter to gate behind at
+        all, so this is a structural (signature-level), not merely
+        behavioral, guarantee."""
+        module = _load_module()
+        import inspect
+
+        params = list(inspect.signature(module.extract_claude_permission_denials).parameters)
+        assert params == ["stdout"]
