@@ -11,23 +11,22 @@ event parsing -- all of that remains owned by the runner it calls out to
 What this script adds on top of the runner
 --------------------------------------------
 1. A capability preflight (`claude` binary present, `gh` authenticated, and
-   -- because workspace-trust registration mutates the single shared,
-   global ``~/.claude.json`` "projects" map that every concurrently running
-   Claude Code process on this machine also reads/writes -- a live scan of
-   ``/proc`` for other running `claude` processes). If any of these are
-   unavailable, the run is a genuine capability SKIP (exit 77), never a
+   a *read-only* check that the target worktree is already registered as
+   trusted in the single shared, global ``~/.claude.json`` "projects" map).
+   Claude Code workspace trust is folder-exact; an untrusted folder never
+   fires ``pr-reviewer`` frontmatter hooks at all. This script never writes
+   to ``~/.claude.json`` -- registering trust for the first time is a
+   separate, one-time human operational step (the official interactive
+   workspace-trust dialog, run in an isolated named herdr session) that is
+   out of this script's responsibility. If any preflight condition is
+   unmet, the run is a genuine capability SKIP (exit 77), never a
    fabricated PASS.
-2. Workspace-trust registration/cleanup for the target worktree in
-   ``~/.claude.json`` (required because Claude Code workspace trust is
-   folder-exact; an untrusted folder never fires ``pr-reviewer`` frontmatter
-   hooks at all). Registration always records the pre-existing entry (or its
-   absence) so cleanup can restore the exact prior state.
-3. A mandatory canary case (default: ``git_worktree`` -- a local,
+2. A mandatory canary case (default: ``git_worktree`` -- a local,
    non-GitHub-mutating operation) run *before* any requested case. Canary
    outcomes are classified as ``confirmed_deny`` (proceed),
    ``confirmed_breach`` (FAIL immediately, run nothing else), or
    ``inconclusive`` (SKIP immediately, run nothing else).
-4. Two invocation shapes:
+3. Two invocation shapes:
    - ``--case <name>`` (AC4): a single positive case (e.g.
      ``positive_reference_read``) run after a successful canary.
    - ``--canary-case <name> --cases <c1,c2,...>`` (AC5): a canary followed by
@@ -47,7 +46,8 @@ Exit codes
 ----------
 0   PASS
 1   FAIL (confirmed breach, or a requested case's expectation was not met)
-77  SKIP (capability unavailable / inconclusive canary / no attempt observed)
+77  SKIP (capability unavailable / worktree not yet trusted / inconclusive
+    canary / no attempt observed)
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ ALLOWLISTED_ARTIFACT_FIELDS = {
 }
 
 
-# ─── /proc-based concurrent-process safety check ───────────────────────────
+# ─── /proc-based concurrent-process diagnostic (optional, non-gating) ──────
 
 
 def _self_and_ancestor_pids() -> set[int]:
@@ -154,12 +154,11 @@ def _self_and_ancestor_pids() -> set[int]:
 def other_live_claude_processes(exclude_pids: set[int] | None = None) -> list[int]:
     """Real, non-fabricated /proc scan for other running `claude` processes.
 
-    Workspace-trust registration mutates the single shared, global
-    ``~/.claude.json``. If any *other* `claude` process is currently
-    running against the same HOME, that process may concurrently
-    read/write the same file; this script treats that as making trust
-    registration unavailable rather than risk racing/corrupting shared
-    state belonging to unrelated projects/sessions.
+    Retained as an optional diagnostic only. This script no longer writes to
+    ``~/.claude.json`` (workspace-trust registration is a read-only
+    prerequisite check now), so there is nothing left to protect from
+    concurrent-process races: this function's return value MUST NOT gate
+    ``EXIT_SKIP`` on its own.
     """
     exclude = exclude_pids if exclude_pids is not None else _self_and_ancestor_pids()
     found: list[int] = []
@@ -185,10 +184,52 @@ def other_live_claude_processes(exclude_pids: set[int] | None = None) -> list[in
     return found
 
 
+# ─── Workspace-trust prerequisite check (~/.claude.json, read-only) ────────
+
+
+def _claude_json_path() -> Path:
+    return Path.home() / ".claude.json"
+
+
+def is_worktree_trusted(claude_json_path: Path, worktree_abs: str) -> bool:
+    """Read-only check: is `worktree_abs` already trusted in ~/.claude.json?
+
+    Returns True only when ``projects[worktree_abs]["hasTrustDialogAccepted"]``
+    is present and is exactly the bool ``True``. Any missing/malformed shape
+    (file missing/unreadable/corrupt JSON, missing ``projects`` key, a
+    non-dict project entry, a non-bool ``hasTrustDialogAccepted`` value, or
+    an unrelated worktree's entry) fails closed to ``False``.
+
+    This function only reads ``claude_json_path``. It never opens the file
+    in write mode, never calls ``write_text``, and never mutates the parsed
+    ``data``/``projects``/entry structures.
+    """
+    try:
+        raw_text = claude_json_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        return False
+    entry = projects.get(worktree_abs)
+    if not isinstance(entry, dict):
+        return False
+    flag = entry.get("hasTrustDialogAccepted")
+    return flag is True
+
+
 # ─── Capability preflight ───────────────────────────────────────────────────
 
 
-def preflight_capability() -> tuple[bool, str, dict[str, Any]]:
+def preflight_capability(
+    worktree_abs: str, claude_json_path: Path | None = None
+) -> tuple[bool, str, dict[str, Any]]:
     detail: dict[str, Any] = {}
 
     if shutil.which("claude") is None:
@@ -206,59 +247,13 @@ def preflight_capability() -> tuple[bool, str, dict[str, Any]]:
     if gh_check.returncode != 0:
         return False, "gh_auth_unavailable", detail
 
-    others = other_live_claude_processes()
-    detail["other_live_claude_pid_count"] = len(others)
-    if others:
-        return False, "concurrent_claude_processes_detected", detail
+    resolved_claude_json_path = claude_json_path if claude_json_path is not None else _claude_json_path()
+    trusted = is_worktree_trusted(resolved_claude_json_path, worktree_abs)
+    detail["worktree_trusted"] = trusted
+    if not trusted:
+        return False, "worktree_trust_prerequisite_missing", detail
 
     return True, "", detail
-
-
-# ─── Workspace-trust registration/cleanup (~/.claude.json) ──────────────────
-
-
-def _claude_json_path() -> Path:
-    return Path.home() / ".claude.json"
-
-
-def register_worktree_trust(claude_json_path: Path, worktree_abs: str) -> tuple[bool, dict[str, Any] | None]:
-    """Register `worktree_abs` as trusted. Returns (existed_before, original_entry)."""
-    data = json.loads(claude_json_path.read_text(encoding="utf-8"))
-    projects = data.setdefault("projects", {})
-    existed_before = worktree_abs in projects
-    original_entry = json.loads(json.dumps(projects[worktree_abs])) if existed_before else None
-
-    if existed_before:
-        projects[worktree_abs]["hasTrustDialogAccepted"] = True
-    else:
-        projects[worktree_abs] = {
-            "allowedTools": [],
-            "mcpContextUris": [],
-            "mcpServers": {},
-            "enabledMcpjsonServers": [],
-            "disabledMcpjsonServers": [],
-            "hasTrustDialogAccepted": True,
-            "hasClaudeMdExternalIncludesApproved": False,
-            "hasClaudeMdExternalIncludesWarningShown": False,
-        }
-
-    claude_json_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    return existed_before, original_entry
-
-
-def revoke_worktree_trust(
-    claude_json_path: Path,
-    worktree_abs: str,
-    existed_before: bool,
-    original_entry: dict[str, Any] | None,
-) -> None:
-    data = json.loads(claude_json_path.read_text(encoding="utf-8"))
-    projects = data.setdefault("projects", {})
-    if existed_before:
-        projects[worktree_abs] = original_entry
-    else:
-        projects.pop(worktree_abs, None)
-    claude_json_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 # ─── Case execution (delegates the actual runtime to the smoke runner) ─────
@@ -460,7 +455,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expect-marker", required=True)
     parser.add_argument("--require-clean-postcondition", action="store_true")
     parser.add_argument("--abort-on-canary-failure", action="store_true")
-    parser.add_argument("--revoke-worktree-trust-after", action="store_true")
+    parser.add_argument(
+        "--revoke-worktree-trust-after",
+        action="store_true",
+        help=(
+            "No-op, kept for CLI/back-compat with the Issue's Verification "
+            "Commands. Workspace trust is a read-only prerequisite checked "
+            "against ~/.claude.json; this script never registers or revokes "
+            "it, so there is nothing for this flag to clean up."
+        ),
+    )
     parser.add_argument("--worktree", default=None)
     parser.add_argument("--timeout-seconds", type=int, default=180)
     return parser
@@ -484,7 +488,12 @@ def main(argv: list[str] | None = None) -> int:
     artifacts_dir = worktree / "artifacts"
     ac_label = "AC4" if args.case else "AC5"
 
-    available, reason, detail = preflight_capability()
+    # --revoke-worktree-trust-after is a documented no-op (see build_parser
+    # help text above): trust persists after the one-time official bootstrap
+    # and this script never mutates ~/.claude.json, so there is no per-run
+    # trust entry to revoke here.
+
+    available, reason, detail = preflight_capability(str(worktree))
     if not available:
         write_artifact_log(
             artifacts_dir=artifacts_dir,
@@ -498,113 +507,87 @@ def main(argv: list[str] | None = None) -> int:
         print(f"SKIP: runtime capability unavailable ({reason}): {detail}")
         return EXIT_SKIP
 
-    claude_json_path = _claude_json_path()
-    try:
-        existed_before, original_entry = register_worktree_trust(claude_json_path, str(worktree))
-    except (OSError, json.JSONDecodeError, KeyError) as exc:
-        write_artifact_log(
-            artifacts_dir=artifacts_dir,
-            ac=ac_label,
-            result="SKIP",
-            exit_code=EXIT_SKIP,
-            reason="worktree_trust_registration_failed",
-            input_summary=str(worktree),
-            output_summary=str(exc),
-        )
-        print(f"SKIP: worktree trust registration failed: {exc}")
-        return EXIT_SKIP
-
     exit_code = EXIT_SKIP
     result_label = "SKIP"
     reason = "unset"
     output_summary = ""
 
-    try:
-        canary_prompt = _mutation_case_prompt(CASE_COMMANDS[args.canary_case])
-        canary_result = run_runtime_case(
-            worktree=worktree,
-            case_name=args.canary_case,
-            prompt_text=canary_prompt,
-            expect_marker=DENY_MARKER,
-            output_dir=artifacts_dir / "runtime-probe",
-            timeout_seconds=args.timeout_seconds,
-            require_clean_postcondition=args.require_clean_postcondition,
-        )
-        canary_verdict = classify_deny_case(canary_result, DENY_MARKER)
+    canary_prompt = _mutation_case_prompt(CASE_COMMANDS[args.canary_case])
+    canary_result = run_runtime_case(
+        worktree=worktree,
+        case_name=args.canary_case,
+        prompt_text=canary_prompt,
+        expect_marker=DENY_MARKER,
+        output_dir=artifacts_dir / "runtime-probe",
+        timeout_seconds=args.timeout_seconds,
+        require_clean_postcondition=args.require_clean_postcondition,
+    )
+    canary_verdict = classify_deny_case(canary_result, DENY_MARKER)
 
-        if canary_verdict == "inconclusive":
-            exit_code, result_label, reason = EXIT_SKIP, "SKIP", "canary_inconclusive"
-            output_summary = json.dumps(canary_result.get("evidence") or {})
-        elif canary_verdict == "confirmed_breach":
-            exit_code, result_label, reason = EXIT_FAIL, "FAIL", "canary_confirmed_breach"
-            output_summary = json.dumps(canary_result.get("evidence") or {})
-        else:
-            if args.case:
-                if args.case not in POSITIVE_CASE_NAMES:
-                    exit_code, result_label, reason = EXIT_FAIL, "FAIL", f"unknown_case:{args.case}"
-                else:
-                    positive_result = run_runtime_case(
-                        worktree=worktree,
-                        case_name=args.case,
-                        prompt_text=POSITIVE_CASE_PROMPT,
-                        expect_marker=args.expect_marker,
-                        output_dir=artifacts_dir / "runtime-probe",
-                        timeout_seconds=args.timeout_seconds,
-                        require_clean_postcondition=args.require_clean_postcondition,
-                    )
-                    verdict = classify_positive_case(positive_result)
-                    if verdict == "pass":
-                        exit_code, result_label, reason = EXIT_OK, "PASS", "positive_reference_read_observed"
-                    elif verdict == "fail":
-                        exit_code, result_label, reason = EXIT_FAIL, "FAIL", "positive_reference_read_not_observed"
-                    else:
-                        exit_code, result_label, reason = EXIT_SKIP, "SKIP", "positive_reference_read_inconclusive"
-                    output_summary = json.dumps(positive_result.get("evidence") or {})
+    if canary_verdict == "inconclusive":
+        exit_code, result_label, reason = EXIT_SKIP, "SKIP", "canary_inconclusive"
+        output_summary = json.dumps(canary_result.get("evidence") or {})
+    elif canary_verdict == "confirmed_breach":
+        exit_code, result_label, reason = EXIT_FAIL, "FAIL", "canary_confirmed_breach"
+        output_summary = json.dumps(canary_result.get("evidence") or {})
+    else:
+        if args.case:
+            if args.case not in POSITIVE_CASE_NAMES:
+                exit_code, result_label, reason = EXIT_FAIL, "FAIL", f"unknown_case:{args.case}"
             else:
-                requested_cases = [c.strip() for c in args.cases.split(",") if c.strip()]
-                any_fail = False
-                any_skip = False
-                per_case_verdicts: dict[str, str] = {}
-                for case_name in requested_cases:
-                    if case_name not in CASE_COMMANDS:
-                        per_case_verdicts[case_name] = "unknown_case"
-                        any_fail = True
-                        break
-                    case_result = run_runtime_case(
-                        worktree=worktree,
-                        case_name=case_name,
-                        prompt_text=_mutation_case_prompt(CASE_COMMANDS[case_name]),
-                        expect_marker=args.expect_marker,
-                        output_dir=artifacts_dir / "runtime-probe",
-                        timeout_seconds=args.timeout_seconds,
-                        require_clean_postcondition=args.require_clean_postcondition,
-                    )
-                    case_verdict = classify_deny_case(case_result, args.expect_marker)
-                    per_case_verdicts[case_name] = case_verdict
-                    if case_verdict == "confirmed_breach":
-                        any_fail = True
-                        break
-                    if case_verdict == "inconclusive":
-                        any_skip = True
-                        if args.abort_on_canary_failure:
-                            break
-
-                output_summary = json.dumps(per_case_verdicts)
-                if any_fail:
-                    exit_code, result_label, reason = EXIT_FAIL, "FAIL", "mutation_case_confirmed_breach"
-                elif any_skip:
-                    exit_code, result_label, reason = EXIT_SKIP, "SKIP", "mutation_case_inconclusive"
+                positive_result = run_runtime_case(
+                    worktree=worktree,
+                    case_name=args.case,
+                    prompt_text=POSITIVE_CASE_PROMPT,
+                    expect_marker=args.expect_marker,
+                    output_dir=artifacts_dir / "runtime-probe",
+                    timeout_seconds=args.timeout_seconds,
+                    require_clean_postcondition=args.require_clean_postcondition,
+                )
+                verdict = classify_positive_case(positive_result)
+                if verdict == "pass":
+                    exit_code, result_label, reason = EXIT_OK, "PASS", "positive_reference_read_observed"
+                elif verdict == "fail":
+                    exit_code, result_label, reason = EXIT_FAIL, "FAIL", "positive_reference_read_not_observed"
                 else:
-                    exit_code, result_label, reason = EXIT_OK, "PASS", "all_mutation_cases_confirmed_deny"
-    finally:
-        if args.revoke_worktree_trust_after:
-            try:
-                revoke_worktree_trust(claude_json_path, str(worktree), existed_before, original_entry)
-            except (OSError, json.JSONDecodeError, KeyError) as exc:
-                print(f"FAIL: trust revocation cleanup failed: {exc}", file=sys.stderr)
-                exit_code = EXIT_FAIL
-                result_label = "FAIL"
-                reason = "trust_revocation_cleanup_failed"
+                    exit_code, result_label, reason = EXIT_SKIP, "SKIP", "positive_reference_read_inconclusive"
+                output_summary = json.dumps(positive_result.get("evidence") or {})
+        else:
+            requested_cases = [c.strip() for c in args.cases.split(",") if c.strip()]
+            any_fail = False
+            any_skip = False
+            per_case_verdicts: dict[str, str] = {}
+            for case_name in requested_cases:
+                if case_name not in CASE_COMMANDS:
+                    per_case_verdicts[case_name] = "unknown_case"
+                    any_fail = True
+                    break
+                case_result = run_runtime_case(
+                    worktree=worktree,
+                    case_name=case_name,
+                    prompt_text=_mutation_case_prompt(CASE_COMMANDS[case_name]),
+                    expect_marker=args.expect_marker,
+                    output_dir=artifacts_dir / "runtime-probe",
+                    timeout_seconds=args.timeout_seconds,
+                    require_clean_postcondition=args.require_clean_postcondition,
+                )
+                case_verdict = classify_deny_case(case_result, args.expect_marker)
+                per_case_verdicts[case_name] = case_verdict
+                if case_verdict == "confirmed_breach":
+                    any_fail = True
+                    break
+                if case_verdict == "inconclusive":
+                    any_skip = True
+                    if args.abort_on_canary_failure:
+                        break
+
+            output_summary = json.dumps(per_case_verdicts)
+            if any_fail:
+                exit_code, result_label, reason = EXIT_FAIL, "FAIL", "mutation_case_confirmed_breach"
+            elif any_skip:
+                exit_code, result_label, reason = EXIT_SKIP, "SKIP", "mutation_case_inconclusive"
+            else:
+                exit_code, result_label, reason = EXIT_OK, "PASS", "all_mutation_cases_confirmed_deny"
 
     write_artifact_log(
         artifacts_dir=artifacts_dir,

@@ -16,6 +16,13 @@ PR #2385 review fix_delta:
 - P1-3: `classify_positive_case()` requires the runner's own structured
   `expected_markers_missing == []` evidence field, not a marker-substring
   search against captured stdout.
+
+Issue #1881 contract refinement (this iteration): workspace-trust
+registration/revocation (`register_worktree_trust` / `revoke_worktree_trust`)
+was removed entirely and replaced with a read-only prerequisite check
+(`is_worktree_trusted`). This script must never write to `~/.claude.json`
+(or any fixture standing in for it), regardless of trust state. All tests
+below use temp fixture files -- never the real ambient `~/.claude.json`.
 """
 
 from __future__ import annotations
@@ -36,6 +43,10 @@ assert spec is not None and spec.loader is not None
 verifier = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = verifier
 spec.loader.exec_module(verifier)  # type: ignore[attr-defined]
+
+
+def _write_fixture(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 # ─── AC7: bounded_claim_scope_declared ──────────────────────────────────────
@@ -132,7 +143,7 @@ class TestNoAuthorityArtifactsOrSensitiveOutput:
             ac="AC4",
             result="SKIP",
             exit_code=77,
-            reason="concurrent_claude_processes_detected",
+            reason="worktree_trust_prerequisite_missing",
             input_summary="case=positive_reference_read",
             output_summary="{}",
         )
@@ -171,7 +182,7 @@ class TestNoAuthorityArtifactsOrSensitiveOutput:
         monkeypatch.setattr(
             verifier,
             "preflight_capability",
-            lambda: (False, "concurrent_claude_processes_detected", {"other_live_claude_pid_count": 3}),
+            lambda *a, **kw: (False, "worktree_trust_prerequisite_missing", {"worktree_trusted": False}),
         )
         worktree = tmp_path / "worktree"
         worktree.mkdir()
@@ -201,25 +212,395 @@ class TestNoAuthorityArtifactsOrSensitiveOutput:
         assert len(artifact_files) == 1
         assert "Result: SKIP" in artifact_files[0].read_text(encoding="utf-8")
 
-    def test_unavailable_never_registers_trust(
+
+# ─── register/revoke removal (this iteration's fix_delta) ──────────────────
+
+
+class TestTrustMutationLogicFullyRemoved:
+    def test_register_worktree_trust_no_longer_exists(self) -> None:
+        assert not hasattr(verifier, "register_worktree_trust")
+
+    def test_revoke_worktree_trust_no_longer_exists(self) -> None:
+        assert not hasattr(verifier, "revoke_worktree_trust")
+
+
+# ─── is_worktree_trusted(): read-only prerequisite check ───────────────────
+
+
+class TestIsWorktreeTrusted:
+    def test_trusted_exact_match_returns_true(self, tmp_path: Path) -> None:
+        claude_json = tmp_path / "claude.json"
+        worktree_abs = "/some/worktree/path"
+        _write_fixture(
+            claude_json,
+            {"projects": {worktree_abs: {"hasTrustDialogAccepted": True}}},
+        )
+        assert verifier.is_worktree_trusted(claude_json, worktree_abs) is True
+
+    def test_untrusted_flag_false_returns_false(self, tmp_path: Path) -> None:
+        claude_json = tmp_path / "claude.json"
+        worktree_abs = "/some/worktree/path"
+        _write_fixture(
+            claude_json,
+            {"projects": {worktree_abs: {"hasTrustDialogAccepted": False}}},
+        )
+        assert verifier.is_worktree_trusted(claude_json, worktree_abs) is False
+
+    def test_missing_entry_returns_false(self, tmp_path: Path) -> None:
+        claude_json = tmp_path / "claude.json"
+        _write_fixture(claude_json, {"projects": {}})
+        assert verifier.is_worktree_trusted(claude_json, "/some/worktree/path") is False
+
+    def test_missing_projects_key_fails_closed(self, tmp_path: Path) -> None:
+        claude_json = tmp_path / "claude.json"
+        _write_fixture(claude_json, {})
+        assert verifier.is_worktree_trusted(claude_json, "/some/worktree/path") is False
+
+    def test_non_bool_trust_flag_fails_closed(self, tmp_path: Path) -> None:
+        claude_json = tmp_path / "claude.json"
+        worktree_abs = "/some/worktree/path"
+        for bogus_value in ("true", 1, ["yes"], None):
+            _write_fixture(
+                claude_json,
+                {"projects": {worktree_abs: {"hasTrustDialogAccepted": bogus_value}}},
+            )
+            assert verifier.is_worktree_trusted(claude_json, worktree_abs) is False, bogus_value
+
+    def test_non_dict_project_entry_fails_closed(self, tmp_path: Path) -> None:
+        claude_json = tmp_path / "claude.json"
+        worktree_abs = "/some/worktree/path"
+        _write_fixture(claude_json, {"projects": {worktree_abs: "not-a-dict"}})
+        assert verifier.is_worktree_trusted(claude_json, worktree_abs) is False
+
+    def test_malformed_json_fails_closed_not_crash(self, tmp_path: Path) -> None:
+        claude_json = tmp_path / "claude.json"
+        claude_json.write_text("{not valid json", encoding="utf-8")
+        assert verifier.is_worktree_trusted(claude_json, "/some/worktree/path") is False
+
+    def test_missing_file_fails_closed_not_crash(self, tmp_path: Path) -> None:
+        claude_json = tmp_path / "does-not-exist.json"
+        assert verifier.is_worktree_trusted(claude_json, "/some/worktree/path") is False
+
+    def test_unrelated_project_entry_is_not_authority(self, tmp_path: Path) -> None:
+        claude_json = tmp_path / "claude.json"
+        our_worktree = "/some/worktree/path"
+        other_worktree = "/some/other/worktree/path"
+        _write_fixture(
+            claude_json,
+            {
+                "projects": {
+                    other_worktree: {"hasTrustDialogAccepted": True},
+                }
+            },
+        )
+        assert verifier.is_worktree_trusted(claude_json, our_worktree) is False
+
+    def test_never_writes_fixture_file(self, tmp_path: Path) -> None:
+        claude_json = tmp_path / "claude.json"
+        worktree_abs = "/some/worktree/path"
+        _write_fixture(
+            claude_json,
+            {"projects": {worktree_abs: {"hasTrustDialogAccepted": True}}},
+        )
+        before_mtime = claude_json.stat().st_mtime_ns
+        before_content = claude_json.read_bytes()
+
+        for _ in range(3):
+            verifier.is_worktree_trusted(claude_json, worktree_abs)
+
+        assert claude_json.stat().st_mtime_ns == before_mtime
+        assert claude_json.read_bytes() == before_content
+
+
+# ─── preflight_capability(): trust becomes the gate, not process count ─────
+
+
+class TestPreflightCapability:
+    def _stub_claude_and_gh_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
+
+        class _FakeCompleted:
+            returncode = 0
+
+        monkeypatch.setattr(verifier.subprocess, "run", lambda *a, **kw: _FakeCompleted())
+
+    def test_trusted_worktree_with_concurrent_claude_processes_still_passes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """SKIP-before-registration means ~/.claude.json is never touched."""
-        register_calls: list[tuple] = []
-        monkeypatch.setattr(
-            verifier,
-            "preflight_capability",
-            lambda: (False, "claude_binary_not_found", {}),
+        self._stub_claude_and_gh_ok(monkeypatch)
+        # Simulate concurrent `claude` processes: this must NOT gate SKIP
+        # anymore now that no write to ~/.claude.json ever happens.
+        monkeypatch.setattr(verifier, "other_live_claude_processes", lambda *a, **kw: [111, 222, 333])
+
+        claude_json = tmp_path / "claude.json"
+        worktree_abs = "/some/worktree/path"
+        _write_fixture(
+            claude_json,
+            {"projects": {worktree_abs: {"hasTrustDialogAccepted": True}}},
         )
-        monkeypatch.setattr(
-            verifier,
-            "register_worktree_trust",
-            lambda *a, **kw: register_calls.append((a, kw)) or (False, None),
+
+        available, reason, detail = verifier.preflight_capability(
+            worktree_abs, claude_json_path=claude_json
         )
+        assert available is True
+        assert reason == ""
+        assert detail["worktree_trusted"] is True
+
+    def test_untrusted_worktree_returns_worktree_trust_prerequisite_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stub_claude_and_gh_ok(monkeypatch)
+        claude_json = tmp_path / "claude.json"
+        _write_fixture(claude_json, {"projects": {}})
+
+        available, reason, detail = verifier.preflight_capability(
+            "/some/worktree/path", claude_json_path=claude_json
+        )
+        assert available is False
+        assert reason == "worktree_trust_prerequisite_missing"
+        assert detail["worktree_trusted"] is False
+
+    def test_malformed_trust_state_returns_prerequisite_missing_not_crash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stub_claude_and_gh_ok(monkeypatch)
+        claude_json = tmp_path / "claude.json"
+        claude_json.write_text("{not valid json", encoding="utf-8")
+
+        available, reason, detail = verifier.preflight_capability(
+            "/some/worktree/path", claude_json_path=claude_json
+        )
+        assert available is False
+        assert reason == "worktree_trust_prerequisite_missing"
+
+    def test_missing_claude_binary_short_circuits_before_trust_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(verifier.shutil, "which", lambda _name: None)
+        claude_json = tmp_path / "claude.json"
+        _write_fixture(claude_json, {"projects": {}})
+
+        available, reason, _detail = verifier.preflight_capability(
+            "/some/worktree/path", claude_json_path=claude_json
+        )
+        assert available is False
+        assert reason == "claude_binary_not_found"
+
+
+# ─── Full main() round-trip: never writes ~/.claude.json fixture ───────────
+
+
+class TestMainNeverWritesClaudeJsonFixture:
+    def _run_main_with_trusted_fixture(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        trusted: bool,
+        extra_args: list[str] | None = None,
+    ) -> tuple[int, Path]:
         worktree = tmp_path / "worktree"
         worktree.mkdir()
+        claude_json = tmp_path / "claude.json"
+        if trusted:
+            _write_fixture(
+                claude_json,
+                {"projects": {str(worktree): {"hasTrustDialogAccepted": True}}},
+            )
+        else:
+            _write_fixture(claude_json, {"projects": {}})
 
-        exit_code = verifier.main(
+        monkeypatch.setattr(verifier, "_claude_json_path", lambda: claude_json)
+        monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
+
+        class _FakeCompleted:
+            returncode = 0
+
+        monkeypatch.setattr(verifier.subprocess, "run", lambda *a, **kw: _FakeCompleted())
+
+        # Avoid spawning the real smoke runner: simulate a confirmed-deny
+        # canary result directly.
+        def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
+            return {
+                "case": kwargs["case_name"],
+                "exit_code": verifier.EXIT_OK,
+                "process_error": None,
+                "marker_observed": True,
+                "evidence": {"expected_markers_missing": []},
+            }
+
+        monkeypatch.setattr(verifier, "run_runtime_case", _fake_run_runtime_case)
+
+        args = [
+            "--runtime",
+            "claude",
+            "--mode",
+            "structured",
+            "--claude-agent-name",
+            "pr-reviewer",
+            "--case",
+            "positive_reference_read",
+            "--expect-marker",
+            "reviewer-reference-read-ok",
+            "--worktree",
+            str(worktree),
+        ]
+        if extra_args:
+            args.extend(extra_args)
+
+        before_mtime = claude_json.stat().st_mtime_ns
+        before_content = claude_json.read_bytes()
+        exit_code = verifier.main(args)
+        assert claude_json.stat().st_mtime_ns == before_mtime
+        assert claude_json.read_bytes() == before_content
+        return exit_code, claude_json
+
+    def test_trusted_path_proceeds_and_never_writes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        exit_code, _claude_json = self._run_main_with_trusted_fixture(
+            tmp_path, monkeypatch, trusted=True
+        )
+        assert exit_code == verifier.EXIT_OK
+
+    def test_untrusted_path_skips_and_never_writes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        exit_code, _claude_json = self._run_main_with_trusted_fixture(
+            tmp_path, monkeypatch, trusted=False
+        )
+        assert exit_code == verifier.EXIT_SKIP
+
+    def test_revoke_flag_causes_no_mutation_attempt_and_no_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        exit_code, _claude_json = self._run_main_with_trusted_fixture(
+            tmp_path,
+            monkeypatch,
+            trusted=True,
+            extra_args=["--revoke-worktree-trust-after"],
+        )
+        assert exit_code == verifier.EXIT_OK
+
+    def test_revoke_flag_with_untrusted_worktree_still_skips_cleanly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        exit_code, _claude_json = self._run_main_with_trusted_fixture(
+            tmp_path,
+            monkeypatch,
+            trusted=False,
+            extra_args=["--revoke-worktree-trust-after"],
+        )
+        assert exit_code == verifier.EXIT_SKIP
+
+    def test_no_write_text_call_targets_claude_json_fixture(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Assert no code path opens the claude.json fixture in write mode,
+        by wrapping Path.write_text and recording any target path equal to
+        the fixture."""
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        claude_json = tmp_path / "claude.json"
+        _write_fixture(
+            claude_json,
+            {"projects": {str(worktree): {"hasTrustDialogAccepted": True}}},
+        )
+        monkeypatch.setattr(verifier, "_claude_json_path", lambda: claude_json)
+        monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
+
+        class _FakeCompleted:
+            returncode = 0
+
+        monkeypatch.setattr(verifier.subprocess, "run", lambda *a, **kw: _FakeCompleted())
+
+        def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
+            return {
+                "case": kwargs["case_name"],
+                "exit_code": verifier.EXIT_OK,
+                "process_error": None,
+                "marker_observed": True,
+                "evidence": {"expected_markers_missing": []},
+            }
+
+        monkeypatch.setattr(verifier, "run_runtime_case", _fake_run_runtime_case)
+
+        original_write_text = Path.write_text
+        write_targets: list[Path] = []
+
+        def _tracking_write_text(self: Path, *args: Any, **kwargs: Any) -> int:
+            write_targets.append(self)
+            return original_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", _tracking_write_text)
+
+        verifier.main(
+            [
+                "--runtime",
+                "claude",
+                "--mode",
+                "structured",
+                "--claude-agent-name",
+                "pr-reviewer",
+                "--case",
+                "positive_reference_read",
+                "--expect-marker",
+                "reviewer-reference-read-ok",
+                "--worktree",
+                str(worktree),
+                "--revoke-worktree-trust-after",
+            ]
+        )
+
+        assert claude_json.resolve() not in {p.resolve() for p in write_targets}
+
+
+# ─── Sensitive fixture content must never leak into stdout/artifact log ───
+
+
+class TestClaudeJsonContentNeverLeaks:
+    def test_claude_json_shaped_content_not_in_stdout_or_artifact_log(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        claude_json = tmp_path / "claude.json"
+        sentinel = "SUPER_SECRET_MCP_TOKEN_VALUE_DO_NOT_LEAK"
+        _write_fixture(
+            claude_json,
+            {
+                "projects": {
+                    str(worktree): {
+                        "hasTrustDialogAccepted": True,
+                        "mcpServers": {"token": sentinel},
+                    }
+                },
+                "oauthAccount": {"secret": sentinel},
+            },
+        )
+        monkeypatch.setattr(verifier, "_claude_json_path", lambda: claude_json)
+        monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
+
+        class _FakeCompleted:
+            returncode = 0
+
+        monkeypatch.setattr(verifier.subprocess, "run", lambda *a, **kw: _FakeCompleted())
+
+        def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
+            return {
+                "case": kwargs["case_name"],
+                "exit_code": verifier.EXIT_OK,
+                "process_error": None,
+                "marker_observed": True,
+                "evidence": {"expected_markers_missing": []},
+            }
+
+        monkeypatch.setattr(verifier, "run_runtime_case", _fake_run_runtime_case)
+
+        verifier.main(
             [
                 "--runtime",
                 "claude",
@@ -235,58 +616,17 @@ class TestNoAuthorityArtifactsOrSensitiveOutput:
                 str(worktree),
             ]
         )
-        assert exit_code == verifier.EXIT_SKIP
-        assert register_calls == []
+
+        captured = capsys.readouterr()
+        assert sentinel not in captured.out
+        assert sentinel not in captured.err
+
+        artifact_files = list((worktree / "artifacts").glob("runtime-verification-*.log"))
+        assert len(artifact_files) == 1
+        assert sentinel not in artifact_files[0].read_text(encoding="utf-8")
 
 
-# ─── Functional round-trip: trust registration/cleanup (fixture, not real HOME) ──
-
-
-class TestWorktreeTrustRoundTrip:
-    def test_register_new_entry_then_revoke_removes_it(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "claude.json"
-        claude_json.write_text(json.dumps({"projects": {}}), encoding="utf-8")
-
-        worktree_abs = "/some/worktree/path"
-        existed_before, original_entry = verifier.register_worktree_trust(claude_json, worktree_abs)
-        assert existed_before is False
-        assert original_entry is None
-
-        data = json.loads(claude_json.read_text(encoding="utf-8"))
-        assert data["projects"][worktree_abs]["hasTrustDialogAccepted"] is True
-
-        verifier.revoke_worktree_trust(claude_json, worktree_abs, existed_before, original_entry)
-        data_after = json.loads(claude_json.read_text(encoding="utf-8"))
-        assert worktree_abs not in data_after["projects"]
-
-    def test_register_existing_entry_then_revoke_restores_exact_prior_state(
-        self, tmp_path: Path
-    ) -> None:
-        claude_json = tmp_path / "claude.json"
-        worktree_abs = "/some/worktree/path"
-        prior_entry = {
-            "allowedTools": [],
-            "hasTrustDialogAccepted": False,
-            "lastCost": 4.2,
-        }
-        claude_json.write_text(
-            json.dumps({"projects": {worktree_abs: prior_entry}}), encoding="utf-8"
-        )
-
-        existed_before, original_entry = verifier.register_worktree_trust(claude_json, worktree_abs)
-        assert existed_before is True
-        assert original_entry == prior_entry
-
-        data = json.loads(claude_json.read_text(encoding="utf-8"))
-        assert data["projects"][worktree_abs]["hasTrustDialogAccepted"] is True
-        assert data["projects"][worktree_abs]["lastCost"] == 4.2
-
-        verifier.revoke_worktree_trust(claude_json, worktree_abs, existed_before, original_entry)
-        data_after = json.loads(claude_json.read_text(encoding="utf-8"))
-        assert data_after["projects"][worktree_abs] == prior_entry
-
-
-# ─── Concurrent-process safety check ────────────────────────────────────────
+# ─── Concurrent-process diagnostic (retained, non-gating) ──────────────────
 
 
 class TestOtherLiveClaudeProcesses:
