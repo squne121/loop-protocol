@@ -1078,29 +1078,35 @@ def test_worktree_deadline_exhaustion_after_add_rolls_back_locked_worktree(monke
 
 
 def test_git_243_partial_clone_does_not_claim_no_lazy_support(monkeypatch, tmp_path):
-    url = "file:///tmp/origin.git"
-    remote = validate_literal_remote_url(url)
-    ref = validate_allowed_remote_ref("refs/heads/main")
-    calls: list[str] = []
+    """A no-capability promisor repository stops before real `git fetch`.
 
-    def fake_run(operation, **kwargs):
-        calls.append(operation.kind)
-        if operation.kind == "effective_remote_url":
-            return subprocess.CompletedProcess([], 0, url + "\n", "")
-        if operation.kind == "probe_no_lazy_fetch_support":
-            return subprocess.CompletedProcess([], 129, "", "unknown option")
-        if operation.kind == "probe_promisor_remote":
-            return subprocess.CompletedProcess([], 0, "remote.origin.promisor true\n", "")
-        if operation.kind.startswith("fetch_default_ref"):
-            pytest.fail("unsupported partial clone must not issue fetch")
-        raise AssertionError(operation.kind)
-
-    monkeypatch.setattr(exec_mod, "_run_closed_git_process", fake_run)
+    The fixture uses real Git for `--get-url` and local promisor discovery;
+    capability is forced to the Git 2.43 result. A fetch would create a private
+    ref in this local bare-origin fixture, so its absence is behavioral proof
+    that the remote operation never started.
+    """
+    local, url, _ = _init_remote_fixture(tmp_path)
+    subprocess.run(
+        ["git", "config", "--local", "remote.origin.promisor", "true"], cwd=local, check=True
+    )
+    monkeypatch.setattr(exec_mod, "_git_supports_no_lazy_fetch", lambda *args, **kwargs: False)
     with pytest.raises(RuntimeError, match="no_lazy_fetch_not_supported"):
         exec_mod.run_control_plane_git_fetch_default_ref(
-            remote, ref, cwd=str(tmp_path), project_root=str(tmp_path), deadline=_deadline()
+            validate_literal_remote_url(url),
+            validate_allowed_remote_ref("refs/heads/main"),
+            cwd=str(local),
+            project_root=str(local),
+            scratch_root=str(tmp_path / "scratch"),
+            deadline=_deadline(),
         )
-    assert calls == ["effective_remote_url", "probe_no_lazy_fetch_support", "probe_promisor_remote"]
+    refs = subprocess.run(
+        ["git", "for-each-ref", "refs/loop-protocol/control-plane/default-ref"],
+        cwd=local,
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+    assert not refs.stdout
 
 
 def test_supported_fetch_uses_fixed_no_lazy_fetch_global_option(monkeypatch, tmp_path):
