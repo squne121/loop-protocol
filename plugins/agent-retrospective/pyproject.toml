@@ -1,0 +1,21 @@
+[project]
+name = "agent-retrospective-plugin"
+version = "0.1.0"
+description = "Self-contained Python dependency closure for the agent-retrospective Claude Code plugin (Issue #2240)."
+requires-python = ">=3.12"
+dependencies = [
+  "jsonschema>=4.0",
+]
+
+[tool.uv]
+# uv version canonical source parity with the host repository's own
+# pyproject.toml (Issue #1598 / #1598 fix_delta 2026-08-29). This plugin is
+# distributed standalone (a repository without .claude/ has no other uv
+# version pin to inherit), so it fixes its own version explicitly rather
+# than relying on an ambient/inherited pin.
+required-version = "==0.11.29"
+# This directory is a script bundle, not an installable Python package (no
+# setup.py/wheel target) -- `uv run --project plugins/agent-retrospective`
+# only needs to resolve/sync the dependency closure below, never build a
+# distributable artifact.
+package = false
