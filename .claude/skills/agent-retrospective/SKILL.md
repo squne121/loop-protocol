@@ -228,14 +228,26 @@ human_authorization_receipt/v1:
 `mutation_capability`）は維持されたまま。承認は本 receipt ファイル、または TTY 明示確認という
 別チャネルでのみ確認する。
 
-## Latitude Runtime Evidence（latitude_runtime_evidence/v1、Issue #2375）
+## Latitude ランタイム証跡（latitude_runtime_evidence/v1、Issue #2375）
 
 `agent-retrospective` は Latitude CLI から bounded・read-only な runtime evidence を任意で
 収集し、`runtime_behavior` claim_class の finding へ deterministic に enrichment できる（Latitude
 不在・不許可・利用不能は retrospective 自体を止めない）。
 
-- 収集: `scripts/collect_snapshot.py`'s `collect_latitude_runtime_evidence()`（argv-only、最大
-  1 回起動、timeout 10秒、output 64 KiB 上限、allowlisted metric 3 個）
+- 収集: `scripts/collect_snapshot.py`'s `collect_latitude_runtime_evidence()`（実 CLI
+  `latitude traces list --project-slug <slug> --filters <JSON> --limit <n> --format json` の
+  argv-only、最大 1 回起動、timeout 10秒、output 64 KiB 上限、allowlisted metric 3 個。
+  `project_slug` は `LATITUDE_PROJECT` 環境変数からのみ解決する）
+- Session Correlation: `scripts/run_retrospective.py`'s
+  `_resolve_latitude_target_session_id()` が既存の hook-sink 収集経路（Claude-GPT adapter の
+  `complete_sessions`）から対象 Claude Code `session_id` を解決し、`--filters` の
+  `sessionId eq` 条件として渡す。「直近 trace を無条件取得」するフォールバックは行わない。
+  `session_id` 未解決または相関 0 件は `unavailable`（`session_id_unresolved`/
+  `no_matching_trace`）に縮退する。
+- 実行経路への配線: `scripts/run_retrospective.py`'s `execute_run()` が
+  `collect_latitude_runtime_evidence_once()`/`bind_latitude_evidence_to_candidates()` を
+  `compute_delta()` 直後・`finalize()` 直前に呼び出す（Collection Budget: 1 run あたり
+  `latitude` CLI 起動は最大 1 回。失敗・利用不能は retrospective 全体を止めない）。
 - 検証: `scripts/validate_retrospective_schema.py`'s `validate_latitude_runtime_evidence()`
   （`schemas/latitude_runtime_evidence_v1.schema.json`。closed key set、availability 別
   nullability、closed reason_code、identity 再計算による mismatch fail-closed）

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Tests for `latitude_runtime_evidence/v1` (schema/validator) and the bounded
-Latitude CLI collector `collect_snapshot.collect_latitude_runtime_evidence` (Issue #2375).
+Latitude CLI collector `collect_snapshot.collect_latitude_runtime_evidence` (Issue #2375; PR #2392
+fix_delta -- corrected against the REAL, locally-verified `latitude` CLI v7.10.0: `latitude traces
+list --project-slug <slug> --filters <JSON> --limit <n> --format json`, response shape
+`{items: [...], nextCursor, hasMore}`, NOT the fictitious `latitude runs list` command/flat
+`{trace_count, span_count, duration_ms}` response this Issue's code originally guessed).
 
 Covers:
   AC1 `latitude_runtime_evidence/v1` validator: closed key set, availability-conditioned
@@ -8,6 +12,8 @@ Covers:
       (identity/evidence_ref mismatch, unknown schema_version -- both fail closed).
   AC2 collector: at most one allowlisted-argv Latitude CLI launch, Collection Budget
       (10s timeout / 64 KiB output / 3 allowlisted metrics) enforcement without raw output.
+      Session correlation (`session_id`/`project_slug` resolution, `no_matching_trace`/
+      `session_id_unresolved`/`project_slug_unresolved`) is exercised here too.
   AC5 no public `source_kind` field / `latitude_otlp` literal introduced by this Issue's
       new code (existing #1223 public `source_kind` enum boundary left untouched).
 
@@ -17,6 +23,7 @@ Fixture/mock-based only; the real `latitude` executable is never invoked here (t
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -35,6 +42,38 @@ import validate_retrospective_schema as vrs  # noqa: E402
 _COLLECTOR_VERSION = "latitude-collector/v1"
 _COLLECTED_AT = "2026-08-29T00:00:00Z"
 _METRICS = {"trace_count": 5, "span_count": 12, "duration_ms": 340}
+
+#: fixed test-only session_id/project_slug -- every AC2 collector test below supplies these
+#: explicitly (never relying on `LATITUDE_PROJECT` env var / process env), so tests are hermetic
+#: regardless of the real environment's Latitude configuration.
+_TEST_SESSION_ID = "test-session-id-0001"
+_TEST_PROJECT_SLUG = "test-project-slug"
+
+
+def _traces_response(
+    *, span_count: Any = 12, duration_ns: Any = 340_000_000, session_id: str = _TEST_SESSION_ID
+) -> str:
+    """Builds a real-CLI-shaped `latitude traces list --format json` response body
+    (`{items: [...], nextCursor, hasMore}`) with exactly one item -- the shape this collector's
+    `runner` fake stands in for."""
+    return json.dumps(
+        {
+            "items": [
+                {
+                    "traceId": "0" * 31 + "1",
+                    "sessionId": session_id,
+                    "spanCount": span_count,
+                    "durationNs": duration_ns,
+                }
+            ],
+            "nextCursor": None,
+            "hasMore": False,
+        }
+    )
+
+
+def _empty_traces_response() -> str:
+    return json.dumps({"items": [], "nextCursor": None, "hasMore": False})
 
 
 def _make_available_instance(
@@ -260,8 +299,75 @@ def test_identity_changes_when_metrics_differ():
 # ---------------------------------------------------------------------------
 
 
+def _collect(**kwargs: Any) -> dict[str, Any]:
+    """Convenience wrapper defaulting `session_id`/`project_slug` to the fixed test constants --
+    every test below that wants to exercise past-the-gate behavior (CLI launch, response parsing)
+    calls this instead of `cs.collect_latitude_runtime_evidence` directly."""
+    kwargs.setdefault("session_id", _TEST_SESSION_ID)
+    kwargs.setdefault("project_slug", _TEST_PROJECT_SLUG)
+    return cs.collect_latitude_runtime_evidence(**kwargs)
+
+
+def test_collector_returns_session_id_unresolved_when_session_id_missing():
+    """PR #2392 fix_delta Session Correlation: no target session_id resolvable -> the collector
+    never launches the CLI (no "latest trace" fallback)."""
+    calls: list[list[str]] = []
+
+    def unexpected_runner(argv: list[str]) -> subprocess.CompletedProcess:
+        calls.append(list(argv))
+        raise AssertionError("collector must not launch the CLI when session_id is unresolved")
+
+    result = cs.collect_latitude_runtime_evidence(
+        which=lambda n: "/usr/bin/latitude", runner=unexpected_runner, project_slug=_TEST_PROJECT_SLUG, session_id=None
+    )
+    assert calls == []
+    assert result["availability"] == "unavailable"
+    assert result["reason_code"] == "session_id_unresolved"
+    vrs.validate_latitude_runtime_evidence(result)
+
+
+def test_collector_returns_project_slug_unresolved_when_project_slug_missing():
+    calls: list[list[str]] = []
+
+    def unexpected_runner(argv: list[str]) -> subprocess.CompletedProcess:
+        calls.append(list(argv))
+        raise AssertionError("collector must not launch the CLI when project_slug is unresolved")
+
+    result = cs.collect_latitude_runtime_evidence(
+        which=lambda n: "/usr/bin/latitude",
+        runner=unexpected_runner,
+        session_id=_TEST_SESSION_ID,
+        project_slug=None,
+        project_slug_resolver=lambda: None,
+    )
+    assert calls == []
+    assert result["availability"] == "unavailable"
+    assert result["reason_code"] == "project_slug_unresolved"
+    vrs.validate_latitude_runtime_evidence(result)
+
+
+def test_collector_project_slug_defaults_to_resolver():
+    """When `project_slug` is omitted, the collector calls `project_slug_resolver` (defaulting to
+    reading `LATITUDE_PROJECT`) -- injecting a fake resolver here keeps the test hermetic."""
+    captured: list[list[str]] = []
+
+    def fake_runner(argv: list[str]) -> subprocess.CompletedProcess:
+        captured.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout=_traces_response(), stderr="")
+
+    result = cs.collect_latitude_runtime_evidence(
+        which=lambda n: "/usr/bin/latitude",
+        runner=fake_runner,
+        session_id=_TEST_SESSION_ID,
+        project_slug_resolver=lambda: "resolved-project-slug",
+    )
+    assert result["availability"] == "available"
+    assert "--project-slug" in captured[0]
+    assert captured[0][captured[0].index("--project-slug") + 1] == "resolved-project-slug"
+
+
 def test_collector_returns_cli_not_found_when_executable_missing():
-    result = cs.collect_latitude_runtime_evidence(which=lambda name: None)
+    result = _collect(which=lambda name: None)
     assert result["availability"] == "unavailable"
     assert result["reason_code"] == "cli_not_found"
     vrs.validate_latitude_runtime_evidence(result)
@@ -269,13 +375,12 @@ def test_collector_returns_cli_not_found_when_executable_missing():
 
 def test_collector_launches_cli_at_most_once_on_success():
     calls: list[list[str]] = []
-    payload = '{"trace_count": 1, "span_count": 2, "duration_ms": 3}'
 
     def fake_runner(argv: list[str]) -> subprocess.CompletedProcess:
         calls.append(list(argv))
-        return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=_traces_response(), stderr="")
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=fake_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=fake_runner)
     assert len(calls) == 1
     assert result["availability"] == "available"
     vrs.validate_latitude_runtime_evidence(result)
@@ -286,12 +391,47 @@ def test_collector_uses_only_the_allowlisted_argv_shape():
 
     def fake_runner(argv: list[str]) -> subprocess.CompletedProcess:
         captured.append(list(argv))
-        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=_traces_response(), stderr="")
 
-    cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=fake_runner)
-    assert captured == [list(cs.LATITUDE_ALLOWED_ARGV)]
+    _collect(which=lambda n: "/usr/bin/latitude", runner=fake_runner)
+    expected = cs.build_latitude_allowed_argv(
+        project_slug=_TEST_PROJECT_SLUG, session_id=_TEST_SESSION_ID, limit=cs.LATITUDE_DEFAULT_LIMIT
+    )
+    assert captured == [expected]
     # argv-only: no shell metacharacters/strings, always a list of plain tokens.
     assert all(isinstance(token, str) and ";" not in token and "|" not in token for token in captured[0])
+
+
+def test_build_latitude_allowed_argv_shape_is_fixed_with_3_dynamic_slots():
+    """The argv shape has exactly 11 fixed-position tokens; only the values at the
+    `--project-slug`/`--filters`/`--limit` positions vary with the caller-supplied inputs -- every
+    flag token is a fixed literal, and the `--filters` value is always `json.dumps` output (never a
+    hand-built/concatenated string), so a session_id containing quotes/braces cannot inject an
+    additional flag or filter condition."""
+    argv = cs.build_latitude_allowed_argv(project_slug="proj-a", session_id="sess-a", limit=1)
+    assert argv == [
+        "latitude",
+        "traces",
+        "list",
+        "--project-slug",
+        "proj-a",
+        "--filters",
+        json.dumps({"sessionId": [{"op": "eq", "value": "sess-a"}]}, sort_keys=True),
+        "--limit",
+        "1",
+        "--format",
+        "json",
+    ]
+    assert json.loads(argv[6]) == {"sessionId": [{"op": "eq", "value": "sess-a"}]}
+
+
+def test_build_latitude_allowed_argv_session_id_cannot_inject_extra_argv_tokens():
+    hostile_session_id = '"} malicious {"sessionId": [{"op": "eq", "value": "other'
+    argv = cs.build_latitude_allowed_argv(project_slug="proj-a", session_id=hostile_session_id, limit=1)
+    # still exactly 11 tokens -- the hostile value is confined to a single JSON string value, not
+    # split into additional argv entries.
+    assert len(argv) == 11
+    assert json.loads(argv[6]) == {"sessionId": [{"op": "eq", "value": hostile_session_id}]}
 
 
 def test_default_runner_never_uses_a_shell_and_disables_stdin_prompts(monkeypatch):
@@ -303,7 +443,8 @@ def test_default_runner_never_uses_a_shell_and_disables_stdin_prompts(monkeypatc
         return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
 
     monkeypatch.setattr(cs.subprocess, "run", fake_subprocess_run)
-    cs._default_latitude_runner(list(cs.LATITUDE_ALLOWED_ARGV))
+    argv = cs.build_latitude_allowed_argv(project_slug=_TEST_PROJECT_SLUG, session_id=_TEST_SESSION_ID)
+    cs._default_latitude_runner(argv)
     assert isinstance(captured_kwargs["argv"], list)
     assert captured_kwargs.get("shell", False) is False
     assert captured_kwargs["stdin"] == cs.subprocess.DEVNULL
@@ -314,7 +455,7 @@ def test_collector_returns_timeout_on_subprocess_timeout():
     def timeout_runner(argv: list[str]) -> subprocess.CompletedProcess:
         raise subprocess.TimeoutExpired(cmd=argv, timeout=cs.LATITUDE_TIMEOUT_SECONDS)
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=timeout_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=timeout_runner)
     assert result == {
         "schema_version": "latitude_runtime_evidence/v1",
         "availability": "unavailable",
@@ -340,7 +481,7 @@ def test_collector_classifies_non_zero_exit_by_reason(stderr_text: str, expected
     def fail_runner(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr_text)
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=fail_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=fail_runner)
     assert result["availability"] == "unavailable"
     assert result["reason_code"] == expected_reason
     vrs.validate_latitude_runtime_evidence(result)
@@ -352,7 +493,7 @@ def test_collector_never_retains_stderr_text_on_non_zero_exit():
     def fail_runner(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr=f"unauthorized: {secret_marker}")
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=fail_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=fail_runner)
     assert secret_marker not in repr(result)
 
 
@@ -360,7 +501,7 @@ def test_collector_budget_exceeded_on_oversized_stdout():
     def big_runner(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 0, stdout="x" * (cs.LATITUDE_MAX_OUTPUT_BYTES + 1), stderr="")
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=big_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=big_runner)
     assert result["availability"] == "error"
     assert result["reason_code"] == "budget_exceeded"
     assert "x" * 100 not in repr(result)
@@ -371,7 +512,7 @@ def test_collector_budget_exceeded_on_oversized_stderr():
     def big_stderr_runner(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr="y" * (cs.LATITUDE_MAX_OUTPUT_BYTES + 1))
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=big_stderr_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=big_stderr_runner)
     assert result["availability"] == "error"
     assert result["reason_code"] == "budget_exceeded"
 
@@ -380,7 +521,7 @@ def test_collector_malformed_output_not_json():
     def bad_json_runner(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 0, stdout="not-json{{{", stderr="")
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=bad_json_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=bad_json_runner)
     assert result["availability"] == "error"
     assert result["reason_code"] == "malformed_output"
     vrs.validate_latitude_runtime_evidence(result)
@@ -390,95 +531,199 @@ def test_collector_malformed_output_json_array_not_object():
     def array_runner(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 0, stdout="[1, 2, 3]", stderr="")
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=array_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=array_runner)
     assert result["availability"] == "error"
     assert result["reason_code"] == "malformed_output"
 
 
+def test_collector_malformed_output_missing_items_key():
+    """Real-CLI-shape parser: a JSON object without an `items` key/array is malformed_output, not
+    silently treated as `{"items": []}`."""
+
+    def no_items_runner(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, 0, stdout='{"hasMore": false}', stderr="")
+
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=no_items_runner)
+    assert result["availability"] == "error"
+    assert result["reason_code"] == "malformed_output"
+
+
+def test_collector_malformed_output_items_not_a_list():
+    def bad_items_runner(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, 0, stdout='{"items": "not-a-list"}', stderr="")
+
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=bad_items_runner)
+    assert result["availability"] == "error"
+    assert result["reason_code"] == "malformed_output"
+
+
+def test_collector_zero_matching_traces_is_unavailable_no_matching_trace_not_error():
+    """PR #2392 fix_delta: a well-formed, zero-item response is a legitimate `unavailable`
+    outcome (the session genuinely has no attributed trace yet), never `error`/`malformed_output`,
+    and never silently substituted with an unrelated trace."""
+
+    def empty_runner(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, 0, stdout=_empty_traces_response(), stderr="")
+
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=empty_runner)
+    assert result["availability"] == "unavailable"
+    assert result["reason_code"] == "no_matching_trace"
+    assert result["metrics"] == {"trace_count": None, "span_count": None, "duration_ms": None}
+    vrs.validate_latitude_runtime_evidence(result)
+
+
 def test_collector_success_projects_only_allowlisted_metrics():
-    payload = (
-        '{"trace_count": 5, "span_count": 12, "duration_ms": 340, '
-        '"raw_trace": "SECRET_SHOULD_NOT_LEAK", "credential": "tok_abcdef", '
-        '"prompt": "system prompt text", "absolute_path": "/home/user/.latitude/config"}'
+    payload = json.dumps(
+        {
+            "items": [
+                {
+                    "traceId": "SECRET_SHOULD_NOT_LEAK",
+                    "sessionId": _TEST_SESSION_ID,
+                    "spanCount": 12,
+                    "durationNs": 340_000_000,
+                    "credential": "tok_abcdef",
+                    "prompt": "system prompt text",
+                    "absolute_path": "/home/user/.latitude/config",
+                }
+            ],
+            "nextCursor": None,
+            "hasMore": False,
+        }
     )
 
     def success_runner(argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=success_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=success_runner)
     assert result["availability"] == "available"
     assert set(result["metrics"].keys()) == {"trace_count", "span_count", "duration_ms"}
-    assert result["metrics"] == {"trace_count": 5, "span_count": 12, "duration_ms": 340}
+    assert result["metrics"] == {"trace_count": 1, "span_count": 12, "duration_ms": 340}
     serialized = repr(result)
     for forbidden in ("SECRET_SHOULD_NOT_LEAK", "tok_abcdef", "system prompt text", "/home/user/.latitude/config"):
         assert forbidden not in serialized
     vrs.validate_latitude_runtime_evidence(result)
 
 
-def test_collector_negative_metric_value_becomes_malformed_output_error():
+@pytest.mark.parametrize(
+    "duration_ns,expected_duration_ms",
+    [
+        (0, 0),
+        (1_000_000, 1),
+        (1_999_999, 1),  # floor division, not rounding
+        (21_903_000_000, 21_903),
+        (21_903_000_000.0, 21_903),  # the real CLI's `durationNs` is JSON `number` (may be float)
+    ],
+)
+def test_duration_ns_to_ms_floor_conversion(duration_ns: Any, expected_duration_ms: int):
+    def runner(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, 0, stdout=_traces_response(duration_ns=duration_ns), stderr="")
+
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=runner)
+    assert result["availability"] == "available"
+    assert result["metrics"]["duration_ms"] == expected_duration_ms
+
+
+def test_collector_negative_span_count_becomes_malformed_output_error():
     """A single out-of-range metric (coerced to null by `_coerce_latitude_metric`) must not
     surface as `availability: "available"` with a null metric -- Issue #2375's
     `latitude_runtime_evidence/v1` contract requires all 3 allowlisted metrics to be non-null
     integers whenever `availability == "available"`; the whole result normalizes to a closed
     `error`/`malformed_output` instead (see PR #2392 review blocker)."""
-    payload = '{"trace_count": -1, "span_count": 2, "duration_ms": 3}'
 
     def negative_runner(argv: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=_traces_response(span_count=-1), stderr="")
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=negative_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=negative_runner)
     assert result["availability"] == "error"
     assert result["reason_code"] == "malformed_output"
     assert result["metrics"] == {"trace_count": None, "span_count": None, "duration_ms": None}
     vrs.validate_latitude_runtime_evidence(result)
 
 
-def test_collector_boolean_metric_value_becomes_malformed_output_error():
+def test_collector_boolean_span_count_becomes_malformed_output_error():
     """Same as above for a boolean (not `int`) metric value coerced to null."""
-    payload = '{"trace_count": true, "span_count": 2, "duration_ms": 3}'
 
     def bool_runner(argv: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=_traces_response(span_count=True), stderr="")
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=bool_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=bool_runner)
     assert result["availability"] == "error"
     assert result["reason_code"] == "malformed_output"
     assert result["metrics"] == {"trace_count": None, "span_count": None, "duration_ms": None}
     vrs.validate_latitude_runtime_evidence(result)
 
 
-def test_collector_missing_metric_keys_become_malformed_output_error():
-    """A parseable-but-key-missing CLI response (only 1 of 3 allowlisted metric keys present)
-    must not surface as `availability: "available"` with the missing metrics null -- it
-    normalizes to a closed `error`/`malformed_output` result instead (Issue #2375 PR #2392 review
-    blocker: `latitude_runtime_evidence/v1` requires all 3 allowlisted metrics to be non-null
-    integers whenever `availability == "available"`)."""
+def test_collector_missing_span_count_key_becomes_malformed_output_error():
+    """A parseable-but-key-missing CLI response item (missing `spanCount`) must not surface as
+    `availability: "available"` with the missing metric null -- it normalizes to a closed
+    `error`/`malformed_output` result instead (Issue #2375 PR #2392 review blocker:
+    `latitude_runtime_evidence/v1` requires all 3 allowlisted metrics to be non-null integers
+    whenever `availability == "available"`)."""
 
     def partial_runner(argv: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(argv, 0, stdout='{"trace_count": 7}', stderr="")
+        payload = json.dumps(
+            {"items": [{"sessionId": _TEST_SESSION_ID, "durationNs": 1_000_000}], "nextCursor": None, "hasMore": False}
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
 
-    result = cs.collect_latitude_runtime_evidence(which=lambda n: "/usr/bin/latitude", runner=partial_runner)
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=partial_runner)
     assert result["availability"] == "error"
     assert result["reason_code"] == "malformed_output"
     assert result["metrics"] == {"trace_count": None, "span_count": None, "duration_ms": None}
+    vrs.validate_latitude_runtime_evidence(result)
+
+
+_FIXTURES_DIR = _SCRIPTS_DIR.parent / "schemas" / "fixtures"
+
+
+def _load_fixture_json(name: str) -> dict[str, Any]:
+    with (_FIXTURES_DIR / name).open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_collector_parses_the_real_cli_derived_with_match_golden_fixture():
+    """PR #2392 fix_delta golden fixture: an ANONYMIZED, real-CLI-derived (latitude v7.10.0)
+    `latitude traces list` response (real field names/value types/magnitudes, fake IDs) --
+    anchors the parser to the REAL response shape instead of an invented one."""
+    fixture = _load_fixture_json("latitude_traces_list_response.v1.with_match.example.json")
+    fixture.pop("_comment", None)
+
+    def fixture_runner(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(fixture), stderr="")
+
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=fixture_runner)
+    assert result["availability"] == "available"
+    item = fixture["items"][0]
+    assert result["metrics"] == {
+        "trace_count": 1,
+        "span_count": item["spanCount"],
+        "duration_ms": item["durationNs"] // 1_000_000,
+    }
+    vrs.validate_latitude_runtime_evidence(result)
+
+
+def test_collector_parses_the_real_cli_derived_no_match_golden_fixture():
+    fixture = _load_fixture_json("latitude_traces_list_response.v1.no_match.example.json")
+    fixture.pop("_comment", None)
+
+    def fixture_runner(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(fixture), stderr="")
+
+    result = _collect(which=lambda n: "/usr/bin/latitude", runner=fixture_runner)
+    assert result["availability"] == "unavailable"
+    assert result["reason_code"] == "no_matching_trace"
     vrs.validate_latitude_runtime_evidence(result)
 
 
 def test_collector_result_is_deterministic_given_same_inputs():
-    payload = '{"trace_count": 1, "span_count": 2, "duration_ms": 3}'
-
     def success_runner(argv: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=_traces_response(), stderr="")
 
     def fixed_clock():
         return datetime(2026, 8, 29, tzinfo=timezone.utc)
 
-    result_a = cs.collect_latitude_runtime_evidence(
-        which=lambda n: "/usr/bin/latitude", runner=success_runner, clock=fixed_clock
-    )
-    result_b = cs.collect_latitude_runtime_evidence(
-        which=lambda n: "/usr/bin/latitude", runner=success_runner, clock=fixed_clock
-    )
+    result_a = _collect(which=lambda n: "/usr/bin/latitude", runner=success_runner, clock=fixed_clock)
+    result_b = _collect(which=lambda n: "/usr/bin/latitude", runner=success_runner, clock=fixed_clock)
     assert result_a == result_b
 
 

@@ -77,7 +77,10 @@
         "duplicate_evidence",
         "unknown_schema_version",
         "identity_mismatch",
-        "unknown_error"
+        "unknown_error",
+        "no_matching_trace",
+        "session_id_unresolved",
+        "project_slug_unresolved"
       ]
     }
   },

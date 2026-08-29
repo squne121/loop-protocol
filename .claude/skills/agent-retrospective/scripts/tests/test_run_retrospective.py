@@ -2582,23 +2582,132 @@ def test_collect_latitude_runtime_evidence_once_forwards_injected_collector_kwar
     """``collect_latitude_runtime_evidence_once`` forwards its kwargs verbatim to Child 3's
     ``collect_latitude_runtime_evidence`` -- injecting a fake ``which``/``runner`` here (rather
     than monkeypatching the `_collect_snapshot_module()`-loaded module object, which is re-exec'd
-    fresh on every call and therefore not a stable monkeypatch target) proves the delegation."""
-    result = rr.collect_latitude_runtime_evidence_once(which=lambda name: None)
+    fresh on every call and therefore not a stable monkeypatch target) proves the delegation.
+    ``session_id``/``project_slug`` are supplied explicitly (PR #2392 fix_delta: the collector
+    never launches the CLI without a resolvable session_id) so this test still exercises the
+    ``which`` forwarding path (``cli_not_found``)."""
+    result = rr.collect_latitude_runtime_evidence_once(
+        which=lambda name: None, session_id="sess-forward-0001", project_slug="proj-forward"
+    )
     assert result["schema_version"] == "latitude_runtime_evidence/v1"
     assert result["availability"] == "unavailable"
     assert result["reason_code"] == "cli_not_found"
     _validate_mod.validate_latitude_runtime_evidence(result)
 
 
+def test_collect_latitude_runtime_evidence_once_session_id_unresolved_never_launches_cli():
+    calls: list[list[str]] = []
+
+    def unexpected_runner(argv):
+        calls.append(list(argv))
+        raise AssertionError("must not launch CLI without a resolvable session_id")
+
+    result = rr.collect_latitude_runtime_evidence_once(
+        which=lambda name: "/usr/bin/latitude", runner=unexpected_runner, project_slug="proj-forward"
+    )
+    assert calls == []
+    assert result["availability"] == "unavailable"
+    assert result["reason_code"] == "session_id_unresolved"
+
+
 def test_collect_latitude_runtime_evidence_once_launches_cli_exactly_once():
     calls: list[list[str]] = []
-    payload = '{"trace_count": 1, "span_count": 1, "duration_ms": 1}'
+    payload = json.dumps(
+        {
+            "items": [{"sessionId": "sess-launch-0001", "spanCount": 1, "durationNs": 1_000_000}],
+            "nextCursor": None,
+            "hasMore": False,
+        }
+    )
 
     def fake_runner(argv):
         calls.append(list(argv))
         return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
 
-    result = rr.collect_latitude_runtime_evidence_once(which=lambda name: "/usr/bin/latitude", runner=fake_runner)
+    result = rr.collect_latitude_runtime_evidence_once(
+        which=lambda name: "/usr/bin/latitude",
+        runner=fake_runner,
+        session_id="sess-launch-0001",
+        project_slug="proj-launch",
+    )
     assert len(calls) == 1
     assert result["availability"] == "available"
     _validate_mod.validate_latitude_runtime_evidence(result)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2375 PR #2392 fix_delta: `_resolve_latitude_target_session_id` (Session Correlation)
+# and the actual `execute_run()` wiring of
+# `collect_latitude_runtime_evidence_once()`/`bind_latitude_evidence_to_candidates()` (previously
+# defined but never called from any production path -- human review blocker).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_latitude_target_session_id_reads_claude_gpt_complete_sessions():
+    claude_gpt_result = _FakeCollectorResult(
+        {"source_id": "claude_gpt", "source_type": "runtime", "source_status": "complete"},
+        {"provenance": {"complete_sessions": ["sess-aaa", "sess-bbb"]}},
+    )
+    other_result = _FakeCollectorResult({"source_id": "repository"}, {})
+
+    assert rr._resolve_latitude_target_session_id([other_result, claude_gpt_result]) == "sess-aaa"
+
+
+def test_resolve_latitude_target_session_id_none_when_no_complete_sessions():
+    claude_gpt_result = _FakeCollectorResult(
+        {"source_id": "claude_gpt"}, {"provenance": {"complete_sessions": []}}
+    )
+    assert rr._resolve_latitude_target_session_id([claude_gpt_result]) is None
+
+
+def test_resolve_latitude_target_session_id_none_when_no_claude_gpt_result():
+    other_result = _FakeCollectorResult({"source_id": "repository"}, {})
+    assert rr._resolve_latitude_target_session_id([other_result]) is None
+
+
+def test_execute_run_wires_latitude_binding_into_production_call_graph():
+    """PR #2392 fix_delta: `execute_run()` must actually call
+    `collect_latitude_runtime_evidence_once()`/`bind_latitude_evidence_to_candidates()` -- this
+    monkeypatches the module-level `collect_latitude_runtime_evidence_once` to prove it is invoked
+    from the real `execute_run()` call graph (not just unit-testable in isolation), and that
+    available evidence is actually bound onto the resulting `PublishRequest.candidate_records`."""
+    latitude_evidence = _latitude_available_evidence()
+    call_log: list[str] = []
+    expected_digest = rr.compute_source_set_digest([_fake_collector_result("repository", _FULL_SHA).observation])
+    # `_identity_key`'s default `claim_class` is already `"runtime_behavior"` (the eligible
+    # claim_class for latitude evidence binding -- see `bind_latitude_evidence_to_candidates`).
+    current_judgment = _judgment_from_key(
+        _identity_key("example_rule"), candidate_id="cand-latitude-wired", evidence_refs=_RUNTIME_EVIDENCE_REFS
+    )
+
+    def fake_collect_once(**kwargs):
+        call_log.append("collect_latitude_runtime_evidence_once")
+        return latitude_evidence
+
+    original = rr.collect_latitude_runtime_evidence_once
+    rr.collect_latitude_runtime_evidence_once = fake_collect_once
+    try:
+        publish_request = rr.execute_run(
+            base_sha_resolver=lambda: _FULL_SHA,
+            collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
+            observer_requests=[_observer_request("retrospective-runtime-observer")],
+            invoke=_make_observer_invoke("run-latitude-1", expected_digest, call_log),
+            invoke_evaluator=_make_execute_run_evaluator_invoke([current_judgment]),
+            repository_id="squne121/loop-protocol",
+            target_issue=2375,
+            request_id="req-latitude-1",
+            idempotency_key="idem-latitude-1",
+            run_id="run-latitude-1",
+        )
+    finally:
+        rr.collect_latitude_runtime_evidence_once = original
+
+    assert "collect_latitude_runtime_evidence_once" in call_log
+    bound_candidate = publish_request.candidate_records[0]
+    evidence_refs = bound_candidate["finding_contract"]["evaluations"][-1]["evidence_refs"]
+    assert evidence_refs[-1] == {
+        "ref_type": "runtime_receipt",
+        "source_id": "runtime",
+        "resource_identity": latitude_evidence["evidence_ref"],
+        "projection_digest": latitude_evidence["evidence_identity"],
+    }

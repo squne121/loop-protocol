@@ -2506,6 +2506,26 @@ def execute_run(
         clock=clock,
     )
     delta_results = compute_delta(previous_state, evaluation.candidate_records)
+
+    # Issue #2375 PR #2392 fix_delta: wires `collect_latitude_runtime_evidence_once()`/
+    # `bind_latitude_evidence_to_candidates()` into the actual `execute_run()` call graph --
+    # previously both were defined but had zero call sites outside their own definitions/tests
+    # (PR #2392 human review blocker). Placed after `compute_delta()` (mirroring how delta
+    # computation itself is wired in immediately before `finalize()`) so binding sees the final
+    # `evaluation.candidate_records` the same way `finalize()` will persist them. Collection
+    # Budget: exactly one `collect_latitude_runtime_evidence_once()` call per run, unconditionally
+    # (the child collector itself declines to launch the CLI -- `session_id_unresolved`/
+    # `project_slug_unresolved` -- when no target session_id/project slug is resolvable, so this
+    # is never a second CLI launch). Failure/unavailability never blocks or fails the
+    # retrospective (fail-open): `bind_latitude_evidence_to_candidates()` leaves every candidate
+    # byte-for-byte unchanged whenever `latitude_evidence["availability"] != "available"`.
+    latitude_session_id = _resolve_latitude_target_session_id(results)
+    latitude_evidence = collect_latitude_runtime_evidence_once(session_id=latitude_session_id)
+    bound_candidate_records = bind_latitude_evidence_to_candidates(
+        evaluation.candidate_records, latitude_evidence
+    )
+    evaluation = dataclasses.replace(evaluation, candidate_records=bound_candidate_records)
+
     return finalize(
         ctx,
         plan,
@@ -3656,13 +3676,54 @@ def collect_latitude_runtime_evidence_once(**collector_kwargs: Any) -> dict[str,
     run -- this wrapper has no internal retry/loop, so a caller that (incorrectly) calls it more
     than once per run would itself violate the Collection Budget, not this function.
 
-    ``**collector_kwargs`` (``which``/``runner``/``clock``/``identity_computer``) are forwarded
-    verbatim to ``collect_latitude_runtime_evidence`` -- this lets tests inject a fake CLI runner
-    through THIS wrapper directly, rather than needing to monkeypatch the
-    ``_collect_snapshot_module()``-loaded module object (which, like every ``_load_module_from_path``
-    sibling load in this file, is re-exec'd fresh on every call and therefore not a stable
-    monkeypatch target across two separate calls)."""
+    ``**collector_kwargs`` (``which``/``runner``/``clock``/``identity_computer``/``session_id``/
+    ``project_slug``/``project_slug_resolver``/``limit``) are forwarded verbatim to
+    ``collect_latitude_runtime_evidence`` -- this lets tests inject a fake CLI runner through THIS
+    wrapper directly, rather than needing to monkeypatch the ``_collect_snapshot_module()``-loaded
+    module object (which, like every ``_load_module_from_path`` sibling load in this file, is
+    re-exec'd fresh on every call and therefore not a stable monkeypatch target across two separate
+    calls). PR #2392 fix_delta: ``session_id`` is the caller-resolved target Claude Code
+    ``session_id`` (see ``_resolve_latitude_target_session_id``) -- when omitted/``None``, the
+    child collector itself returns ``unavailable``/``session_id_unresolved`` without launching the
+    CLI (never a query without a session filter)."""
     return _collect_snapshot_module().collect_latitude_runtime_evidence(**collector_kwargs)
+
+
+def _resolve_latitude_target_session_id(
+    results: Sequence[Any], *, source_id: str = "claude_gpt"
+) -> str | None:
+    """Resolves the target Claude Code ``session_id`` for Latitude trace correlation from the
+    EXISTING hook-sink-derived ``complete_sessions`` provenance the ``claude_gpt`` collector
+    (``collect_snapshot.collect_claude_gpt_source``) already produces (Issue #2375 PR #2392
+    fix_delta -- Session Correlation, not "latest trace"). This function does NOT invent a new
+    session-recording mechanism; it reuses
+    ``CollectorResult.private_evidence["provenance"]["complete_sessions"]`` -- a sorted list of
+    ``session_id`` strings this run's nonce observed as both ``UserPromptSubmit`` and ``Stop``
+    (see ``collect_snapshot.collect_claude_gpt_source``'s ``complete_sessions`` computation).
+
+    ``results`` is the list ``prepare()`` returns (each a Child 3 ``CollectorResult``) -- the SAME
+    list ``execute_run()`` already threads through to ``build_source_digest_registry``/
+    ``finalize(source_observations=...)``, so this reuses data already computed for this run
+    rather than re-collecting anything.
+
+    Deterministic tie-break when more than one session completed within the same retrospective
+    run: the (already sorted) first entry is used, so ``collect_latitude_runtime_evidence_once()``
+    is still called with exactly one session_id candidate and the Collection Budget's "at most 1
+    CLI launch per run" is honored.
+
+    Returns ``None`` (session unresolved) when no ``claude_gpt`` collector result is present in
+    ``results`` or it reports no complete sessions -- callers MUST treat this as "skip Latitude
+    collection entirely for this run", never as "query without a session filter"."""
+    for result in results:
+        observation = getattr(result, "observation", {}) or {}
+        if observation.get("source_id") != source_id:
+            continue
+        private_evidence = getattr(result, "private_evidence", {}) or {}
+        provenance = private_evidence.get("provenance", {}) or {}
+        complete_sessions = provenance.get("complete_sessions") or []
+        if complete_sessions:
+            return complete_sessions[0]
+    return None
 
 
 def bind_latitude_evidence_to_candidates(
