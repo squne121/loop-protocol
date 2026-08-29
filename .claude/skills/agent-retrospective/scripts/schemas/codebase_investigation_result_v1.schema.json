@@ -1,0 +1,262 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://loop-protocol.internal/schemas/agent-retrospective/codebase_investigation_result_v1.schema.json",
+  "title": "CODEBASE_INVESTIGATION_RESULT_V1",
+  "description": "Canonical wire-contract schema for the claude CLI --json-schema flag when invoking codebase-investigator on the AGY advisory native fallback path (role_adapter, Issue #2374). Mirrors .claude/agents/codebase-investigator.md's own native output contract (8 fields, schema_version const 1) -- distinct from, and never confusable with, observer_result_v1.schema.json's schema_version const \"observer_result/v1\". Used ONLY when run_retrospective.py's AgentInvocationRequest.role_adapter == _ROLE_ADAPTER_CODEBASE_INVESTIGATOR_OBSERVER_V1 (OWNER review #2387#issuecomment-5459502795 P0-1/P0-3: deterministic schema selection at the --json-schema CLI boundary, plus real jsonschema-level validation of the native result and its nested REPO_EVIDENCE_REF_V1 evidence -- replacing the prior structural 8-key recognizer).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "investigation_route",
+    "evidence_refs",
+    "discovery_summary",
+    "impact_scope",
+    "failure_reason",
+    "source_evidence_result"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "failed", "inconclusive"]
+    },
+    "investigation_route": {
+      "type": "string",
+      "enum": ["local_asset_research", "github_research", "none"]
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/repo_evidence_ref_v1"
+      }
+    },
+    "discovery_summary": {
+      "type": "string"
+    },
+    "impact_scope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "failure_reason": {
+      "type": ["string", "null"]
+    },
+    "source_evidence_result": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/source_evidence_acquisition_result_v1"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "description": "status == ok implies failure_reason == null (OWNER review P0-3).",
+      "if": {
+        "properties": {
+          "status": {
+            "const": "ok"
+          }
+        },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "failure_reason": {
+            "const": null
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "repo_evidence_ref_v1": {
+      "description": "REPO_EVIDENCE_REF_V1 -- SSOT: .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "type",
+        "commit_sha",
+        "object_format",
+        "path",
+        "start_line",
+        "end_line",
+        "permalink",
+        "excerpt_sha256",
+        "verification_status",
+        "verification_method",
+        "verified_at"
+      ],
+      "properties": {
+        "type": {
+          "const": "REPO_EVIDENCE_REF_V1"
+        },
+        "object_format": {
+          "type": "string",
+          "enum": ["sha1", "sha256"]
+        },
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$|^[a-f0-9]{64}$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "permalink": {
+          "type": "string",
+          "pattern": "^https://github\\.com/[^/]+/[^/]+/blob/([a-f0-9]{40}|[a-f0-9]{64})/"
+        },
+        "excerpt_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "anchor_text": {
+          "type": ["string", "null"]
+        },
+        "verification_status": {
+          "type": "string",
+          "enum": ["verified", "inconclusive"]
+        },
+        "verification_method": {
+          "type": "string",
+          "enum": ["sha256_hash_match", "sha256_hash_mismatch", "line_range_unverified", "fetch_error"]
+        },
+        "verified_at": {
+          "type": "string"
+        }
+      }
+    },
+    "source_evidence_acquisition_result_v1": {
+      "description": "SOURCE_EVIDENCE_ACQUISITION_RESULT_V1 -- SSOT: .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md and .claude/skills/issue-refinement-loop/schemas/source_evidence_acquisition_result_v1.schema.json (top-level shape mirrored here; terminal_artifact is left loosely typed since its own deep schema is outside this Issue's scope).",
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "schema",
+        "claim",
+        "baseline",
+        "route_plan",
+        "attempts",
+        "evidence_refs",
+        "semantic_verdict",
+        "disposition",
+        "terminal_artifact"
+      ],
+      "properties": {
+        "schema": {
+          "const": "source_evidence_acquisition_result/v1"
+        },
+        "claim": {
+          "type": "object",
+          "required": ["claim_id", "claim_kind", "evidence_kind"],
+          "properties": {
+            "claim_id": {
+              "type": "string"
+            },
+            "claim_kind": {
+              "type": "string",
+              "enum": ["dispositive", "supporting"]
+            },
+            "evidence_kind": {
+              "type": "string"
+            },
+            "dependency_group": {
+              "type": ["string", "null"]
+            }
+          }
+        },
+        "baseline": {
+          "type": "object"
+        },
+        "route_plan": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["route_id", "lane", "evidence_kind", "eligible"],
+            "properties": {
+              "route_id": {
+                "type": "string"
+              },
+              "lane": {
+                "type": "string"
+              },
+              "evidence_kind": {
+                "type": "string"
+              },
+              "eligible": {
+                "type": "boolean"
+              },
+              "reason": {
+                "type": ["string", "null"]
+              }
+            }
+          }
+        },
+        "attempts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["route_id", "lane", "dispatch_state", "acquisition_outcome"],
+            "properties": {
+              "route_id": {
+                "type": "string"
+              },
+              "lane": {
+                "type": "string"
+              },
+              "dispatch_state": {
+                "type": "string",
+                "enum": ["dispatched", "outcome_unknown"]
+              },
+              "acquisition_outcome": {
+                "type": "string",
+                "enum": ["succeeded", "failed", "unknown_outcome"]
+              },
+              "failure_domain": {
+                "type": ["string", "null"]
+              },
+              "provider_failure_code": {
+                "type": ["string", "null"]
+              },
+              "cross_lane_recovery": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/repo_evidence_ref_v1"
+          }
+        },
+        "semantic_verdict": {
+          "type": "string",
+          "enum": ["supported", "contradicted", "insufficient", "not_evaluated"]
+        },
+        "disposition": {
+          "type": "string",
+          "enum": ["proceed", "recover", "human_review", "environment_degraded"]
+        },
+        "terminal_artifact": {
+          "type": ["object", "null"]
+        }
+      }
+    }
+  }
+}
