@@ -6,8 +6,6 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
-import errno
-import hashlib
 import json
 import math
 import os
@@ -25,7 +23,7 @@ import time
 import tomllib
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Iterable, NamedTuple
+from typing import Iterable
 
 sys.dont_write_bytecode = True
 
@@ -113,7 +111,7 @@ _RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS = (
     # cannot attribute to the executor child vs. a peer process.
     # `.pytest_cache/CACHEDIR.TAG` and its own auto-generated `.gitignore: *`
     # already self-declare the directory as regenerable. Unlike
-    # `_LEDGER_*`/`_SHADOW_LOG_EXACT_REL` below, there is no single
+    # `_LEDGER_*` below, there is no single
     # stable-identity file here whose symlink/directory/FIFO/socket/device
     # substitution would need typed exact-file protection -- the whole tree
     # is disposable, so the directory-root exclusion class used for the peer
@@ -151,19 +149,6 @@ def _is_pytest_cache_cold_start_temp_path(rel_path: str) -> bool:
     normalized = rel_path.replace(os.sep, "/")
     first_segment = normalized.split("/", 1)[0]
     return first_segment.startswith(_PYTEST_CACHE_COLD_START_TEMP_DIR_PREFIX)
-
-
-# Issue #1563: `.guard_shadow_log.jsonl` (repo-root peer-append log written by
-# `.claude/hooks/shadow_log.py`, `.claude/hooks/guard-japanese-prose.sh`,
-# `.claude/hooks/rtk_boundary_shadow_guard.sh`, and `scripts/check-codex-agents.mjs`)
-# is deliberately NOT added to this tuple. This tuple is a *directory-root*
-# exclusion class: `_snapshot_repo_paths()` prunes everything under these
-# roots before even inspecting the transition kind, so adding an exact file
-# here would make a symlink/directory/FIFO/socket/device replacement of that
-# file invisible to this executor -- the exact opposite of the fail-close
-# guarantee this executor exists to provide. `.guard_shadow_log.jsonl` instead
-# gets its own narrow, exact-path, transition-typed policy (see
-# `_SHADOW_LOG_EXACT_REL` below), mirroring the `_LEDGER_*` typed policy.
 
 
 def _race_tolerant_unattributable_roots(project_root: str) -> list[Path]:
@@ -1304,621 +1289,6 @@ def _is_authorized_ledger_content_transition(before: dict, after: dict) -> bool:
     return True
 
 
-# =============================================================================
-# Typed shadow-log peer-append transition policy (Issue #1563).
-#
-# `.guard_shadow_log.jsonl` (repo root) is a peer file written by multiple
-# independent hook producers (`.claude/hooks/shadow_log.py`,
-# `.claude/hooks/guard-japanese-prose.sh`,
-# `.claude/hooks/rtk_boundary_shadow_guard.sh`) and by
-# `scripts/check-codex-agents.mjs`. It must NOT be added to
-# `_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS` above -- that symbol is a
-# *directory-root* exclusion class that prunes the entire subtree before even
-# inspecting the transition kind, so adding an exact file to it would make a
-# symlink/directory/FIFO/socket/device replacement of that file invisible to
-# this executor -- the exact opposite of Issue #1563 AC2. Instead this file
-# gets its own narrow, exact-path, transition-typed policy, mirroring the
-# `_LEDGER_*` typed policy above (Issue #1502 / PR #1552 pattern):
-#
-# - kind transition (`_is_allowed_shadow_log_kind_transition`): only
-#   `absent -> absent`, `absent -> regular`, and `regular -> regular` are
-#   authorized. Delete (`regular -> absent`) and any substitution into or out
-#   of a non-regular kind (symlink / directory / FIFO / socket / device) fail
-#   closed, regardless of before-kind (AC2).
-# - content transition (`_is_authorized_shadow_log_content_transition`): a
-#   `regular -> regular` byte change is authorized only when the new content
-#   is a strict byte-level extension of the old content
-#   (`after.startswith(before)`) AND both the before and after content parse
-#   as well-formed JSONL (each complete line is a JSON object) AND every
-#   parsed before-record is still present, unchanged, and in the same order
-#   in the after-record list. Truncation, overwrite, malformed-JSONL
-#   replacement, and record deletion or reordering all fail closed (AC3).
-#
-# Unlike the ledger's stable-exact-peer-file policy, no ancestor directory
-# exemption is required here: `.guard_shadow_log.jsonl` lives directly at the
-# project root, so its own transition never creates a new ancestor
-# directory-node snapshot entry.
-#
-# stdlib snapshot mode provenance limitation (AC7): this policy runs on the
-# stdlib-only race-tolerant snapshot model (a single fd-fstat-consistent
-# before/after content read), so it cannot distinguish a regular
-# guard_shadow_log.jsonl append performed by this executor's own child
-# command's asynchronous peer hooks from an append made by a fully
-# independent concurrent session/agent -- both are authorized identically as
-# long as the transition is append-only; self-write and peer-write
-# provenance are indistinguishable in this mode. The AC2 guarantee is
-# strictly postcondition-based ("if a non-regular kind is observed at the
-# end of the run, fail closed"), not a guarantee that the file was never
-# replaced and replaced back before the final observation.
-#
-# PR #1572 REQUEST_CHANGES (Blocker 1: TOCTOU between the exact-path check
-# and the generic repo-wide diff): the original implementation read the
-# shadow-log "after" content and classified its "after" kind *before* the
-# generic repo-wide snapshot/status ("after_snapshot" / "after_status") was
-# captured, and unconditionally excluded `.guard_shadow_log.jsonl` from that
-# later generic diff regardless of what happened to the path in the
-# intervening gap. A path replaced (symlink, delete, truncate, overwrite)
-# strictly between the exact-path content read and the generic snapshot
-# capture would therefore have its later, unvalidated state silently
-# excluded. `_find_unauthorized_repo_changes` now performs the exact-path
-# shadow-log check *after* capturing `after_snapshot` / `after_status`, and
-# `_shadow_log_stable_observation` below additionally guarantees that the
-# kind/content it returns reflects a single, self-consistent filesystem
-# generation (fd-fstat identity re-confirmed via a fresh `lstat()` after the
-# read, with bounded retry on inconsistency) -- not two racing observations
-# stitched together.
-# =============================================================================
-
-_SHADOW_LOG_EXACT_REL = ".guard_shadow_log.jsonl"
-
-# Bounded retry budget for `_shadow_log_stable_observation` to absorb a
-# legitimate in-flight peer write landing exactly inside the fd-fstat /
-# final-lstat consistency window. Kept short: a real race here is on the
-# order of a single syscall pair, not seconds.
-#
-# Issue #2243 AC7 (fixed-cutoff snapshot semantics, "B案"): each attempt
-# below now reads only `[0, observed_end)` where `observed_end` is the size
-# observed by `fstat()` at the top of that attempt -- it never waits for the
-# stream to reach EOF, so a continuously-appending producer cannot indefinitely
-# extend a single attempt's read. Retries here exist only to absorb kind
-# replacement / truncation-below-`observed_end` races, not ongoing legitimate
-# growth past the cutoff (growth past the cutoff is simply left for the next
-# audit epoch to observe). Because a large file could still in principle be
-# re-scanned once per retry attempt (e.g. under a truncate/replace/truncate
-# adversarial loop), `_SHADOW_LOG_STABLE_OBSERVATION_DEADLINE_SECONDS` bounds
-# the *wall-clock* cost of the whole retry loop as a second, independent
-# guard -- so "25 attempts x one full cutoff-bound scan each" cannot become an
-# unbounded-latency operation on an implausibly large file even in the
-# adversarial-replace case.
-_SHADOW_LOG_STABLE_OBSERVATION_ATTEMPTS = 25
-_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS = 0.01
-_SHADOW_LOG_STABLE_OBSERVATION_DEADLINE_SECONDS = 2.0
-
-# Sentinel kind returned by `_shadow_log_stable_observation` when a
-# self-consistent observation could not be made within the retry budget.
-# This value is never a member of any authorized transition tuple in
-# `_is_allowed_shadow_log_kind_transition`, so it always fails closed.
-_SHADOW_LOG_KIND_UNSTABLE = "unstable"
-
-# Issue #2243: the shadow log is an append-only file with many concurrent
-# producers, so any *total-file-size* ceiling is guaranteed to eventually be
-# reached in production and permanently fail-close the privileged executor
-# (#2231). `_shadow_log_stable_observation` therefore no longer buffers file
-# content into memory at all (no `chunks.append()` / `b"".join()` pattern):
-# it streams the file in bounded chunks through a cryptographic digest
-# (SHA-256, the repository's existing convention) and an incremental JSONL
-# validity scanner, and never holds more than O(chunk size + per-record
-# bound) bytes at any point, regardless of total file size.
-#
-# `_SHADOW_LOG_STREAM_CHUNK_BYTES` is the bounded read-chunk size used by the
-# streaming scan.
-_SHADOW_LOG_STREAM_CHUNK_BYTES = 1 << 20
-
-# `_SHADOW_LOG_MAX_RECORD_BYTES` bounds the amount of buffered data held for
-# a single not-yet-terminated JSONL line/record, so one pathologically large
-# record cannot make working memory unbounded even though the overall file
-# scan is streamed. This is a per-record memory bound, not a producer/consumer
-# wire-format contract change: real shadow-log producer records observed in
-# repository log evidence are ~400-610 bytes (max observed ~609 bytes as of
-# Issue #2243), so a `regular -> regular` append composed entirely of records
-# at or below this bound is always accepted regardless of where this constant
-# is set within that range. 4MiB is chosen (raised from a prior 64KiB) purely
-# as a generous compatibility safety margin above the ~609-byte observed
-# maximum -- not because any existing or anticipated producer emits records
-# anywhere near that size -- so this change strictly widens the accepted set
-# (no previously-accepted record becomes rejected) and never narrows it.
-_SHADOW_LOG_MAX_RECORD_BYTES = 4 * 1024 * 1024
-
-# `_SHADOW_LOG_SAFETY_VALVE_MAX_BYTES` is a pure DoS safety valve, not the
-# primary bounded-memory defense (that defense is the streaming scan itself,
-# which never buffers content proportional to total file size). A file at or
-# growing past this size still fails closed (sentinel
-# `_SHADOW_LOG_KIND_UNSTABLE`, surfaced by the caller as the
-# `unauthorized_write_path` reason code), but this is a deliberately new,
-# much larger constant -- not a raised `_SHADOW_LOG_MAX_BYTES` -- because
-# "just raise the cap" alone would not fix the underlying
-# unbounded-heap-allocation defect (Issue #2243 Prohibited fixes). This valve
-# only guards against an implausibly large file; it is not a retention,
-# segmentation, or migration policy for the shadow log approaching this size
-# in legitimate long-running operation -- that follow-up concern (rotation /
-# segmentation / moving persistent runtime state outside the repository
-# checkout once a file approaches this order of magnitude) is tracked
-# separately in Issue #2252, not solved here.
-_SHADOW_LOG_SAFETY_VALVE_MAX_BYTES = 512 * 1024 * 1024
-
-
-class ShadowLogStreamCapture(NamedTuple):
-    """Bounded-memory streaming observation of a shadow-log byte stream
-    (Issue #2243). `sha256_hex` / `valid_jsonl` describe the *entire*
-    observed stream. When the stream was observed with a `prefix_size`
-    (i.e. as an "after" observation being compared against a known "before"
-    length), `prefix_sha256_hex` is the digest of exactly the first
-    `prefix_size` bytes (computed incrementally, without ever buffering
-    that prefix as bytes) and `suffix_valid_jsonl` is the JSONL validity of
-    exactly the bytes at or after that offset -- both are `None` when no
-    `prefix_size` was requested, or when the stream turned out to be
-    shorter than `prefix_size`."""
-
-    total: int
-    sha256_hex: str
-    valid_jsonl: bool
-    prefix_sha256_hex: str | None
-    suffix_valid_jsonl: bool | None
-
-
-class _JsonlLineScanner:
-    """Incrementally validates a byte stream as well-formed JSON Lines,
-    mirroring the exact well-formedness rules of `_parse_shadow_log_jsonl`
-    (trailing newline required for non-empty content, no blank lines,
-    UTF-8-decodable lines, `json.loads` with `_reject_shadow_log_json_constant`
-    to reject the non-standard `NaN` / `Infinity` / `-Infinity` tokens, and
-    every line must parse to a JSON object) -- but processes the stream
-    line-by-line with a bounded per-line buffer (capped at
-    `_SHADOW_LOG_MAX_RECORD_BYTES`) instead of holding the whole stream in
-    memory. Splitting on the raw byte `b"\\n"` before UTF-8-decoding each
-    completed line is safe: `0x0A` never appears inside a multi-byte UTF-8
-    continuation sequence, so line boundaries found this way never split a
-    multi-byte character."""
-
-    def __init__(self) -> None:
-        self._buf = bytearray()
-        self._valid = True
-        self._saw_any_byte = False
-        self._pending_partial_line = False
-
-    def feed(self, chunk: bytes) -> None:
-        if not chunk:
-            return
-        self._saw_any_byte = True
-        start = 0
-        chunk_len = len(chunk)
-        while True:
-            idx = chunk.find(b"\n", start)
-            if idx == -1:
-                remainder = chunk[start:]
-                if remainder:
-                    if len(self._buf) + len(remainder) > _SHADOW_LOG_MAX_RECORD_BYTES:
-                        # One record growing past the explicit per-record
-                        # bound: fail closed, but never let the discarded
-                        # remainder keep accumulating -- drop it so memory
-                        # use stays bounded regardless of how large the
-                        # offending record actually is on disk.
-                        self._valid = False
-                        self._buf.clear()
-                    else:
-                        self._buf.extend(remainder)
-                self._pending_partial_line = True
-                return
-            line = bytes(self._buf) + chunk[start:idx]
-            self._buf.clear()
-            self._pending_partial_line = False
-            if len(line) > _SHADOW_LOG_MAX_RECORD_BYTES:
-                self._valid = False
-            else:
-                self._validate_line(line)
-            start = idx + 1
-            if start >= chunk_len:
-                return
-
-    def _validate_line(self, line: bytes) -> None:
-        if not line:
-            # A blank line is not a valid JSON value under the JSON Lines
-            # specification.
-            self._valid = False
-            return
-        try:
-            text = line.decode("utf-8")
-        except UnicodeDecodeError:
-            self._valid = False
-            return
-        try:
-            obj = json.loads(text, parse_constant=_reject_shadow_log_json_constant)
-        except (ValueError, RecursionError):
-            # `RecursionError` (pathologically deeply nested JSON, e.g.
-            # `[[[[...]]]]`) is caught alongside `ValueError` so a
-            # stack-exhausting adversarial record fails closed as an
-            # invalid record rather than propagating out of the scanner and
-            # aborting the whole observation.
-            self._valid = False
-            return
-        if not isinstance(obj, dict):
-            self._valid = False
-
-    def finalize(self) -> bool:
-        if not self._valid:
-            return False
-        if not self._saw_any_byte:
-            # Empty content is well-formed (zero records), matching
-            # `_parse_shadow_log_jsonl(b"") == []`.
-            return True
-        # Non-empty content must end exactly on a line boundary (trailing
-        # newline present, no dangling partial final line).
-        return not self._pending_partial_line and len(self._buf) == 0
-
-
-def _shadow_log_stream_capture(
-    fd: int,
-    prefix_size: int | None = None,
-    read_upto: int | None = None,
-) -> ShadowLogStreamCapture | None:
-    """Stream-read `fd` in bounded `_SHADOW_LOG_STREAM_CHUNK_BYTES` chunks,
-    computing a full-content SHA-256 digest and JSONL validity without ever
-    buffering content proportional to total file size (Issue #2243). When
-    `prefix_size` is given, also incrementally computes a digest over just
-    the first `prefix_size` bytes and JSONL validity over just the bytes at
-    or after that offset. Returns `None` if the stream exceeds
-    `_SHADOW_LOG_SAFETY_VALVE_MAX_BYTES` (pure DoS safety valve, not the
-    primary defense).
-
-    Issue #2243 AC7 (fixed-cutoff snapshot semantics): when `read_upto` is
-    given, this function reads *exactly* that many bytes (a fixed
-    `fstat()`-observed cutoff) rather than reading until EOF -- it never
-    blocks on / waits for a concurrently-appending writer to stop growing
-    the file, so an append-only producer that keeps writing past the cutoff
-    cannot prevent this read from completing. When `read_upto` is omitted
-    (`None`), the stream is read to EOF (used by callers, and by direct unit
-    tests, that want the whole current file content in a single call)."""
-    full_hasher = hashlib.sha256()
-    full_scanner = _JsonlLineScanner()
-    prefix_hasher = hashlib.sha256() if prefix_size is not None else None
-    suffix_scanner = _JsonlLineScanner() if prefix_size is not None else None
-    total = 0
-    while read_upto is None or total < read_upto:
-        want = _SHADOW_LOG_STREAM_CHUNK_BYTES
-        if read_upto is not None:
-            want = min(want, read_upto - total)
-        chunk = os.read(fd, want)
-        if not chunk:
-            # EOF (or, when `read_upto` is set, a short/absent read before
-            # reaching the cutoff -- e.g. a concurrent truncation). Either
-            # way there is nothing more to consume; the caller compares
-            # `total` against the requested cutoff to decide whether this
-            # was a clean, complete cutoff-bound read.
-            break
-        chunk_len = len(chunk)
-        full_hasher.update(chunk)
-        full_scanner.feed(chunk)
-        chunk_start_offset = total
-        total += chunk_len
-        if total > _SHADOW_LOG_SAFETY_VALVE_MAX_BYTES:
-            return None
-        if prefix_size is not None:
-            if chunk_start_offset < prefix_size:
-                split = min(chunk_len, prefix_size - chunk_start_offset)
-                prefix_hasher.update(chunk[:split])
-                suffix_part = chunk[split:]
-            else:
-                suffix_part = chunk
-            if suffix_part:
-                suffix_scanner.feed(suffix_part)
-
-    prefix_sha256_hex = None
-    suffix_valid_jsonl = None
-    if prefix_size is not None and total >= prefix_size:
-        prefix_sha256_hex = prefix_hasher.hexdigest()  # type: ignore[union-attr]
-        suffix_valid_jsonl = suffix_scanner.finalize()  # type: ignore[union-attr]
-
-    return ShadowLogStreamCapture(
-        total=total,
-        sha256_hex=full_hasher.hexdigest(),
-        valid_jsonl=full_scanner.finalize(),
-        prefix_sha256_hex=prefix_sha256_hex,
-        suffix_valid_jsonl=suffix_valid_jsonl,
-    )
-
-
-def _mode_kind(mode: int) -> str:
-    """Classify a raw `st_mode` value into the same kind vocabulary as
-    `_path_kind`, without re-`lstat()`-ing the path (used on an already
-    captured `os.stat_result`, e.g. from `os.fstat()`)."""
-    if stat.S_ISLNK(mode):
-        return "symlink"
-    if stat.S_ISDIR(mode):
-        return "dir"
-    if stat.S_ISREG(mode):
-        return "regular"
-    if stat.S_ISFIFO(mode):
-        return "fifo"
-    if stat.S_ISSOCK(mode):
-        return "socket"
-    if stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
-        return "device"
-    return "other"
-
-
-def _shadow_log_stable_observation(
-    path: Path,
-    prefix_size: int | None = None,
-) -> tuple[str, tuple[int, int, int, int] | None, ShadowLogStreamCapture | None]:
-    """Return `(kind, identity, capture)` for the shadow-log path as a
-    single, self-consistent filesystem-generation observation.
-
-    - `kind`: `absent` / `symlink` / `dir` / `regular` / `fifo` / `socket` /
-      `device` / `other` / `unstable` (see `_SHADOW_LOG_KIND_UNSTABLE`).
-    - `identity`: `(st_dev, st_ino, st_size, st_mtime_ns)` for a non-absent
-      path, else `None`.
-    - `capture`: a `ShadowLogStreamCapture` bounded-memory streaming
-      observation (digest + JSONL validity) of the file's content in
-      `[0, observed_end)` when `kind == "regular"`, else `None`. Issue #2243:
-      this REPLACES the file's raw buffered bytes that this function
-      previously returned as its third element -- callers must not expect
-      raw `bytes` here anymore.
-    - `prefix_size`: when given and the observed content is at least this
-      many bytes long, `capture.prefix_sha256_hex` / `capture.suffix_valid_jsonl`
-      are additionally computed against this prefix offset (used by the
-      "after" observation to validate a pure append against a known
-      "before" length without re-buffering the "before" content).
-
-    PR #1572 REQUEST_CHANGES Blocker 1: a plain `lstat()`-then-`open()`
-    -then-`read()` sequence has a TOCTOU gap between classifying the kind
-    and reading the content -- the path could be replaced (symlink, delete,
-    truncate, overwrite) in that gap, and the caller would then authorize a
-    transition based on content that no longer corresponds to the kind it
-    classified (or vice versa). This helper closes that gap by opening with
-    `O_NOFOLLOW | O_NONBLOCK` (never silently follows a symlink final
-    component; never blocks indefinitely opening a FIFO with no writer),
-    `fstat()`-ing the open descriptor to capture the identity of exactly the
-    generation being read, streaming the content from that same descriptor
-    (Issue #2243: bounded-memory, never buffered in full), and then
-    re-`lstat()`-ing the path afterward to confirm its identity still
-    matches what was `fstat()`'d.
-
-    Issue #2243 AC7 (fixed-cutoff snapshot semantics, "B案", adopted via
-    OWNER adversarial review of PR #2248): `fstat()` on the freshly opened
-    descriptor fixes `observed_end` as this attempt's audit-epoch cutoff, and
-    only `[0, observed_end)` is ever read here -- this function does NOT wait
-    for the stream to reach EOF. A continuously-appending producer can extend
-    the file arbitrarily far past `observed_end` while this attempt is
-    running without ever causing this attempt to fail or retry: content
-    appended at or after `observed_end` is simply left unobserved by this
-    call and will be picked up as part of the *next* audit epoch (the next
-    `_shadow_log_stable_observation` call, e.g. the caller's next "before"/
-    "after" pair). This function guarantees only that `[0, observed_end)` was
-    read from a single, self-consistent filesystem generation -- it does NOT
-    guarantee "every byte present in the file at return time was validated".
-    A bounded number of retries (both an attempt-count budget and, as a
-    second independent bound, a wall-clock deadline -- see
-    `_SHADOW_LOG_STABLE_OBSERVATION_DEADLINE_SECONDS`) absorbs a legitimate
-    kind replacement / truncation-below-cutoff race landing exactly inside
-    this narrow window; if the observation still cannot be made
-    self-consistent within that budget, `_SHADOW_LOG_KIND_UNSTABLE` is
-    returned, which always fails closed."""
-    deadline_at = time.monotonic() + _SHADOW_LOG_STABLE_OBSERVATION_DEADLINE_SECONDS
-    for _ in range(_SHADOW_LOG_STABLE_OBSERVATION_ATTEMPTS):
-        if time.monotonic() >= deadline_at:
-            # Issue #2243: an independent wall-clock bound on top of the
-            # attempt-count budget, so a persistent adversarial
-            # replace/truncate loop on an implausibly large file cannot cost
-            # up to `_SHADOW_LOG_STABLE_OBSERVATION_ATTEMPTS` full
-            # cutoff-bound scans' worth of latency -- it fails closed as soon
-            # as either bound is exhausted, whichever comes first.
-            break
-        try:
-            lst = path.lstat()
-        except FileNotFoundError:
-            return "absent", None, None
-
-        if not stat.S_ISREG(lst.st_mode):
-            try:
-                confirm = path.lstat()
-            except FileNotFoundError:
-                time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
-                continue
-            if (confirm.st_dev, confirm.st_ino, confirm.st_mode) == (
-                lst.st_dev,
-                lst.st_ino,
-                lst.st_mode,
-            ):
-                identity = (confirm.st_dev, confirm.st_ino, confirm.st_size, confirm.st_mtime_ns)
-                return _mode_kind(confirm.st_mode), identity, None
-            time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
-            continue
-
-        try:
-            fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except FileNotFoundError:
-            time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
-            continue
-        except OSError as exc:
-            if exc.errno in (errno.ELOOP, errno.ENXIO):
-                # ELOOP: a symlink was installed at the final path component
-                # between the lstat() above and this open(). ENXIO: the path
-                # was replaced by a socket (opening a UNIX-domain socket
-                # special file with open(2) is not permitted on Linux) or by
-                # a FIFO with O_NONBLOCK and no reader-compatible peer state.
-                # Either way, re-observe from scratch.
-                time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
-                continue
-            raise
-
-        try:
-            fstat_result = os.fstat(fd)
-            if not stat.S_ISREG(fstat_result.st_mode):
-                time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
-                continue
-            if fstat_result.st_size > _SHADOW_LOG_SAFETY_VALVE_MAX_BYTES:
-                # Issue #2243: pure DoS safety valve, not the primary
-                # bounded-memory defense (that is the streaming scan below,
-                # which never buffers content proportional to file size).
-                # An implausibly large file is still rejected outright
-                # (fail closed, sentinel kind) without even attempting the
-                # streaming scan. Follow-up: retention/segmentation/
-                # repository-external migration once a file approaches this
-                # order of magnitude is tracked separately in Issue #2252.
-                return _SHADOW_LOG_KIND_UNSTABLE, None, None
-            # Issue #2243 AC7: `observed_end` fixes this attempt's
-            # audit-epoch cutoff at the size `fstat()` just observed. The
-            # streaming capture below reads exactly `[0, observed_end)` and
-            # never waits for EOF, so ongoing legitimate append past this
-            # cutoff cannot block or fail this attempt.
-            observed_end = fstat_result.st_size
-            capture = _shadow_log_stream_capture(fd, prefix_size=prefix_size, read_upto=observed_end)
-            if capture is None:
-                # Exceeded the safety-valve bound while streaming (should not
-                # happen given the `observed_end` cutoff and the check just
-                # above, but fail closed defensively if it ever does).
-                return _SHADOW_LOG_KIND_UNSTABLE, None, None
-            if capture.total != observed_end:
-                # A short read before reaching the cutoff (e.g. a concurrent
-                # truncation racing the read) -- this attempt's content is
-                # not a self-consistent `[0, observed_end)` snapshot. Do not
-                # return it; re-observe from scratch (the `finally` below
-                # still closes `fd` before this `continue` takes effect).
-                time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
-                continue
-        finally:
-            os.close(fd)
-
-        try:
-            final_lst = path.lstat()
-        except FileNotFoundError:
-            time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
-            continue
-
-        # Issue #2243 AC7: identity consistency no longer requires the
-        # final `mtime` to be byte-identical to the `fstat()`-time `mtime`
-        # (that would re-introduce the old "any concurrent write at all
-        # fails this attempt" defect this redesign removes) -- it requires
-        # only that (a) the path is still the same regular-file generation
-        # (same `(st_dev, st_ino)`, ruling out a symlink/dir/FIFO/socket/
-        # device substitution or an `os.replace()` onto a distinct inode),
-        # and (b) the file was never observed to shrink below the cutoff
-        # (`final_lst.st_size >= observed_end`, ruling out a truncation that
-        # raced the read). Growth past `observed_end` between the `fstat()`
-        # above and this `lstat()` is expected and authorized -- it is
-        # simply outside this audit epoch's cutoff and will be covered by
-        # the next one.
-        identity_matches = (
-            stat.S_ISREG(final_lst.st_mode)
-            and (final_lst.st_dev, final_lst.st_ino) == (fstat_result.st_dev, fstat_result.st_ino)
-            and final_lst.st_size >= observed_end
-        )
-        if identity_matches:
-            identity = (fstat_result.st_dev, fstat_result.st_ino, observed_end, fstat_result.st_mtime_ns)
-            return "regular", identity, capture
-        time.sleep(_SHADOW_LOG_STABLE_OBSERVATION_RETRY_SECONDS)
-
-    return _SHADOW_LOG_KIND_UNSTABLE, None, None
-
-
-def _is_allowed_shadow_log_kind_transition(before_kind: str, after_kind: str) -> bool:
-    """`absent -> absent`, `absent -> regular`, and `regular -> regular` are
-    the only authorized shadow-log kind transitions (AC2). Delete
-    (`regular -> absent`) and substitution into/out of any non-regular kind
-    (symlink / directory / FIFO / socket / device), from any before-kind, are
-    rejected -- this is an explicit allow-tuple match, not a
-    postcondition-only `after_kind == "regular"` check. `_SHADOW_LOG_KIND_UNSTABLE`
-    (either side) is never a member of the allow-tuple set and therefore
-    always fails closed."""
-    if before_kind == "absent" and after_kind == "absent":
-        return True
-    return (before_kind, after_kind) in {("absent", "regular"), ("regular", "regular")}
-
-
-def _reject_shadow_log_json_constant(constant: str) -> None:
-    """`parse_constant` callback for `json.loads`: PR #1572 REQUEST_CHANGES
-    Blocker 4. Python's `json` module accepts the non-standard tokens `NaN`,
-    `Infinity`, and `-Infinity` by default (RFC 8259 / the JSON Lines
-    specification do not permit them as JSON values). Raising here makes
-    `json.loads` propagate a `ValueError` for any line containing one of
-    these tokens instead of silently accepting it as a valid record."""
-    raise ValueError(f"non_standard_json_constant:{constant}")
-
-
-def _parse_shadow_log_jsonl(data: bytes) -> list[dict] | None:
-    """Parse JSONL content into a list of record objects. Returns None if the
-    content is not well-formed append-only JSONL: an incomplete final line
-    (no trailing newline for non-empty content), a non-UTF-8 byte sequence, a
-    blank line (JSON Lines requires every line to be a valid JSON value; an
-    empty string is not one), a line that fails to parse as JSON, a line
-    containing a non-standard `NaN` / `Infinity` / `-Infinity` constant
-    (PR #1572 REQUEST_CHANGES Blocker 4), or a line whose parsed value is not
-    a JSON object."""
-    if not data:
-        return []
-    if not data.endswith(b"\n"):
-        return None
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-    records: list[dict] = []
-    for line in text.split("\n")[:-1]:
-        if not line:
-            # PR #1572 REQUEST_CHANGES Blocker 4: a blank line is not a valid
-            # JSON value under the JSON Lines specification, so it must be
-            # rejected as malformed content, not silently skipped.
-            return None
-        try:
-            obj = json.loads(line, parse_constant=_reject_shadow_log_json_constant)
-        except (ValueError, RecursionError):
-            # RecursionError (pathologically deeply nested JSON) fails
-            # closed the same way a ValueError-raising malformed line does.
-            return None
-        if not isinstance(obj, dict):
-            return None
-        records.append(obj)
-    return records
-
-
-def _is_authorized_shadow_log_content_transition_capture(
-    before: ShadowLogStreamCapture, after: ShadowLogStreamCapture
-) -> bool:
-    """A `regular -> regular` shadow-log content change is authorized only
-    when it is a strict append (AC3), evaluated over bounded-memory
-    streaming digests/validity (Issue #2243) instead of raw buffered bytes:
-    `after`'s first `before.total` bytes must digest-match `before`'s full
-    content (byte-for-byte prefix identity -- the same guarantee the prior
-    `after.startswith(before)` byte-level check relied on, so this is not a
-    weakening), and the appended tail must itself be complete, well-formed
-    JSONL. Truncation, overwrite, malformed-JSONL replacement, and
-    existing-record deletion/reordering are all rejected, whether or not
-    the byte length changed. Inode identity (same-path-different-inode
-    replacement, PR #1572 REQUEST_CHANGES Blocker 3) is validated
-    separately by the caller before this function is reached."""
-    if before.total == after.total and before.sha256_hex == after.sha256_hex:
-        return True
-    if after.total < before.total:
-        return False
-    if not before.valid_jsonl:
-        return False
-    if after.prefix_sha256_hex is None or after.prefix_sha256_hex != before.sha256_hex:
-        return False
-    return bool(after.suffix_valid_jsonl)
-
-
-def _is_authorized_shadow_log_cold_start_content_capture(after: ShadowLogStreamCapture) -> bool:
-    """PR #1572 REQUEST_CHANGES Blocker 2: an `absent -> regular` shadow-log
-    creation must still be validated as well-formed JSONL content, not
-    merely accepted because *some* regular file appeared. Returns True only
-    when the full `after` content is well-formed JSONL (Issue #2243:
-    `after.valid_jsonl` was computed by the bounded-memory streaming scan;
-    see `_JsonlLineScanner` for the exact well-formedness contract,
-    including the Blocker 4 blank-line / non-standard-constant
-    rejections)."""
-    return after.valid_jsonl
-
-
 def _find_unauthorized_repo_changes(
     project_root: str,
     issue_number: str,
@@ -1927,9 +1297,6 @@ def _find_unauthorized_repo_changes(
     ledger_before_kinds: dict[str, str] | None = None,
     ledger_before_bytes: bytes | None = None,
     ledger_ancestor_before_kinds: dict[str, str] | None = None,
-    shadow_log_before_kind: str | None = None,
-    shadow_log_before_capture: ShadowLogStreamCapture | None = None,
-    shadow_log_before_identity: tuple[int, int, int, int] | None = None,
     command_id: str = "",
 ) -> str | None:
     # Issue #1830: launch-ledger state is advisory telemetry. Keep its exact
@@ -1939,61 +1306,6 @@ def _find_unauthorized_repo_changes(
 
     after_snapshot = _snapshot_repo_paths(project_root, issue_number, command_id)
     after_status = _git_status_paths(project_root)
-
-    # Issue #1563 / PR #1572 REQUEST_CHANGES (Blocker 1): the shadow-log
-    # exact-path typed transition is checked *after* the generic
-    # `after_snapshot` / `after_status` capture above, not before it. The
-    # earlier ordering read the shadow-log "after" kind/content, then
-    # captured the generic repo-wide "after" state afterward while
-    # unconditionally excluding the shadow-log path from that later diff --
-    # a replacement (symlink, delete, truncate, overwrite) strictly between
-    # the exact-path read and the generic capture would have its later,
-    # unvalidated state silently excluded. Performing the exact-path
-    # observation last means there is no unvalidated window left after it
-    # for the excluded path to still change out from under this decision.
-    resolved_shadow_log_before_kind = shadow_log_before_kind or "absent"
-    shadow_log_path = Path(project_root) / _SHADOW_LOG_EXACT_REL
-    # Issue #2243: when a "before" regular-file capture is available, pass
-    # its length as the "after" observation's prefix_size so the streaming
-    # scan can validate the append against it without ever re-buffering the
-    # "before" content.
-    shadow_log_prefix_size = (
-        shadow_log_before_capture.total
-        if resolved_shadow_log_before_kind == "regular" and shadow_log_before_capture is not None
-        else None
-    )
-    shadow_log_after_kind, shadow_log_after_identity, shadow_log_after_capture = _shadow_log_stable_observation(
-        shadow_log_path, prefix_size=shadow_log_prefix_size
-    )
-    if not _is_allowed_shadow_log_kind_transition(resolved_shadow_log_before_kind, shadow_log_after_kind):
-        return _SHADOW_LOG_EXACT_REL
-    if shadow_log_after_kind == "regular":
-        if resolved_shadow_log_before_kind == "absent":
-            # PR #1572 REQUEST_CHANGES Blocker 2: cold-start creation must
-            # still be validated as well-formed JSONL content.
-            if shadow_log_after_capture is None or not _is_authorized_shadow_log_cold_start_content_capture(
-                shadow_log_after_capture
-            ):
-                return _SHADOW_LOG_EXACT_REL
-        elif resolved_shadow_log_before_kind == "regular":
-            # PR #1572 REQUEST_CHANGES Blocker 3: a `regular -> regular`
-            # transition is only a genuine in-place append when the after
-            # state is still the *same inode* as the before state -- an
-            # `os.replace(tmp, shadow_log)` swap onto a distinct inode must
-            # fail closed even if the replacement's bytes happen to be a
-            # valid JSONL extension of the original content.
-            if (
-                shadow_log_before_identity is None
-                or shadow_log_after_identity is None
-                or shadow_log_before_identity[:2] != shadow_log_after_identity[:2]
-            ):
-                return _SHADOW_LOG_EXACT_REL
-            if shadow_log_after_capture is None or shadow_log_before_capture is None:
-                return _SHADOW_LOG_EXACT_REL
-            if not _is_authorized_shadow_log_content_transition_capture(
-                shadow_log_before_capture, shadow_log_after_capture
-            ):
-                return _SHADOW_LOG_EXACT_REL
 
     new_raw_status_paths = after_status - before_status
     # Issue #1409 REQUEST_CHANGES (P1): expand any collapsed ignored-ancestor
@@ -2010,7 +1322,6 @@ def _find_unauthorized_repo_changes(
         and not _is_race_tolerant_unattributable_path(path)
         and not _is_pytest_cache_cold_start_temp_path(path)
         and path not in _LEDGER_TYPED_EXACT_RELS
-        and path != _SHADOW_LOG_EXACT_REL
         and path.rstrip("/") not in safe_ledger_ancestor_dir_rels
     }
     if new_status_paths:
@@ -2049,7 +1360,6 @@ def _find_unauthorized_repo_changes(
             item
             for item in changed
             if item not in _LEDGER_TYPED_EXACT_RELS
-            and item != _SHADOW_LOG_EXACT_REL
             and item not in safe_ledger_ancestor_dir_rels
         ]
         if filtered_changed:
@@ -3089,12 +2399,6 @@ def main(argv: list[str] | None = None) -> int:
         if ledger_before_kinds.get(_LEDGER_STABLE_EXACT_REL) == "regular"
         else None
     )
-    (
-        shadow_log_before_kind,
-        shadow_log_before_identity,
-        shadow_log_before_capture,
-    ) = _shadow_log_stable_observation(Path(project_root) / _SHADOW_LOG_EXACT_REL)
-
     entry = load_registry_entry(args.command_id, project_root)
     validate_registry_entry(args.command_id, entry, str(args.issue_number))
 
@@ -3242,9 +2546,6 @@ def main(argv: list[str] | None = None) -> int:
         ledger_before_kinds,
         ledger_before_bytes,
         ledger_ancestor_before_kinds,
-        shadow_log_before_kind,
-        shadow_log_before_capture,
-        shadow_log_before_identity,
         args.command_id,
     )
     if unauthorized_path is not None:
