@@ -9,15 +9,25 @@ Verifies:
 * AC2: `status: ok` + `verdict: approve` + `next_action: proceed` routes to
   `STEP_2_5` (NOT directly to `STEP_4_5`), so the Step 2.5 semantic design
   review applicability gate is never bypassed.
-* AC3: `needs-fix` + `request_changes` routes to `STEP_4`;
-  `next_action: human_judgment_required` routes to
-  `STEP_5_HUMAN_JUDGMENT_REQUIRED` regardless of `verdict`.
-* AC4: `status: input_or_runtime_error` with a KNOWN structured `error_code`
-  (`reviewer_transport_environment_failure` / `artifact_readback_failed`)
-  routes to `STEP_5_HUMAN_JUDGMENT_REQUIRED`; any other/unknown/missing
-  `error_code` (including body-fetch and VC-budget errors, which remain
-  Out of Scope per Issue #2389) routes to
-  `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`.
+* AC3: `needs-fix` + `request_changes` routes to `STEP_4`; the EXACT triple
+  `verdict: needs-fix` + `next_action: human_judgment_required` routes to
+  `STEP_5_HUMAN_JUDGMENT_REQUIRED`. A loose match on `next_action` alone
+  (e.g. `verdict: approve` + `next_action: human_judgment_required`) is an
+  inconsistent combination and routes to
+  `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE` instead (OWNER PR #2391
+  review P1-1).
+* AC4: `status: input_or_runtime_error` routes to
+  `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE` regardless of whether
+  `error_code` is known (`reviewer_transport_environment_failure` /
+  `artifact_readback_failed`) or unknown/missing -- Issue #2054's
+  `transport_status: environment_failure` / `semantic_verdict: null`
+  separation contract is preserved, NOT superseded, so transport/artifact
+  failures are never routed to `STEP_5_HUMAN_JUDGMENT_REQUIRED` (OWNER PR
+  #2391 review P0-2). `route_canonical_step2_result()` is also a TOTAL
+  function: non-`Mapping` `result` / `compact_result` input (`list` / `str`
+  / `int` / `None`) never raises `AttributeError` and instead routes to
+  `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE` (OWNER PR #2391 review
+  P1-1).
 """
 
 from __future__ import annotations
@@ -207,7 +217,10 @@ def test_produce_transport_failure_stdout_top_level_field_present(tmp_path: Path
     assert out["status"] == "input_or_runtime_error", out
     assert out["error_code"] == "reviewer_transport_environment_failure", out
     assert "canonical_step2_route" in out, "transport-failure path must carry top-level canonical_step2_route"
-    assert out["canonical_step2_route"] == _PIPELINE.STEP_5_HUMAN_JUDGMENT_REQUIRED
+    # OWNER PR #2391 review P0-2: transport failure is an environment_failure
+    # (Issue #2054), NOT a semantic human-judgment decision -- it must stay
+    # fail-closed, not be routed to STEP_5_HUMAN_JUDGMENT_REQUIRED.
+    assert out["canonical_step2_route"] == _PIPELINE.FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
 
 
 def test_produce_artifact_readback_failure_stdout_top_level_field_present(tmp_path: Path, monkeypatch):
@@ -250,7 +263,11 @@ def test_produce_artifact_readback_failure_stdout_top_level_field_present(tmp_pa
     assert out["status"] == "input_or_runtime_error", out
     assert out["error_code"] == "artifact_readback_failed", out
     assert "canonical_step2_route" in out, "artifact-readback-failure path must carry top-level canonical_step2_route"
-    assert out["canonical_step2_route"] == _PIPELINE.STEP_5_HUMAN_JUDGMENT_REQUIRED
+    # OWNER PR #2391 review P0-2: artifact-integrity failure is an
+    # environment_failure (Issue #2054), NOT a semantic human-judgment
+    # decision -- it must stay fail-closed, not be routed to
+    # STEP_5_HUMAN_JUDGMENT_REQUIRED.
+    assert out["canonical_step2_route"] == _PIPELINE.FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
 
 
 # ---------------------------------------------------------------------------
@@ -270,9 +287,12 @@ def test_route_canonical_step2_result_approve_routes_to_step_2_5():
 
 
 # ---------------------------------------------------------------------------
-# AC3: `needs-fix` + `request_changes` -> STEP_4;
-# `next_action: human_judgment_required` -> STEP_5_HUMAN_JUDGMENT_REQUIRED,
-# independent of `verdict`.
+# AC3: `needs-fix` + `request_changes` -> STEP_4; the EXACT triple
+# `verdict: needs-fix` + `next_action: human_judgment_required` ->
+# STEP_5_HUMAN_JUDGMENT_REQUIRED. A loose match on `next_action` alone
+# (e.g. `verdict: approve` + `next_action: human_judgment_required`) is an
+# inconsistent combination and must fail closed instead (OWNER PR #2391
+# review P1-1).
 # ---------------------------------------------------------------------------
 
 
@@ -280,33 +300,49 @@ def test_route_canonical_step2_result_needs_fix_and_human_judgment_routes_correc
     needs_fix_result = {"status": "ok", "compact_result": {"verdict": "needs-fix", "next_action": "request_changes"}}
     assert _PIPELINE.route_canonical_step2_result(needs_fix_result) == _PIPELINE.STEP_4
 
-    for verdict in ("needs-fix", "approve"):
-        human_judgment_result = {
-            "status": "ok",
-            "compact_result": {"verdict": verdict, "next_action": "human_judgment_required"},
-        }
-        assert (
-            _PIPELINE.route_canonical_step2_result(human_judgment_result)
-            == _PIPELINE.STEP_5_HUMAN_JUDGMENT_REQUIRED
-        )
+    exact_human_judgment_result = {
+        "status": "ok",
+        "compact_result": {"verdict": "needs-fix", "next_action": "human_judgment_required"},
+    }
+    assert (
+        _PIPELINE.route_canonical_step2_result(exact_human_judgment_result)
+        == _PIPELINE.STEP_5_HUMAN_JUDGMENT_REQUIRED
+    )
+
+    # OWNER PR #2391 review P1-1: `verdict: approve` + `next_action:
+    # human_judgment_required` is an inconsistent/unreachable combination
+    # (the exact triple match requires `verdict: needs-fix`), so it must
+    # fail closed, NOT silently resolve to STEP_5_HUMAN_JUDGMENT_REQUIRED
+    # via a loose `next_action`-only match.
+    loose_match_result = {
+        "status": "ok",
+        "compact_result": {"verdict": "approve", "next_action": "human_judgment_required"},
+    }
+    assert (
+        _PIPELINE.route_canonical_step2_result(loose_match_result)
+        == _PIPELINE.FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+    )
 
 
 # ---------------------------------------------------------------------------
-# AC4: known producer `error_code`s (`reviewer_transport_environment_failure`
-# / `artifact_readback_failed`) route to STEP_5_HUMAN_JUDGMENT_REQUIRED;
-# every other/unknown/missing `error_code` routes to
-# FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE.
+# AC4: `status: input_or_runtime_error` routes to
+# FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE regardless of whether
+# `error_code` is known or unknown/missing (Issue #2054's environment_failure
+# separation contract is preserved, not superseded, per OWNER PR #2391 review
+# P0-2). Non-`Mapping` `result` / `compact_result` input must never raise
+# `AttributeError`; it routes to FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+# instead (OWNER PR #2391 review P1-1).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "error_code,expected_attr",
+    "error_code",
     [
-        ("reviewer_transport_environment_failure", "STEP_5_HUMAN_JUDGMENT_REQUIRED"),
-        ("artifact_readback_failed", "STEP_5_HUMAN_JUDGMENT_REQUIRED"),
-        ("some_unrecognized_error_code", "FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE"),
-        ("verification_budget_exceeds_policy", "FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE"),
-        (None, "FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE"),
+        "reviewer_transport_environment_failure",
+        "artifact_readback_failed",
+        "some_unrecognized_error_code",
+        "verification_budget_exceeds_policy",
+        None,
     ],
     ids=[
         "known_reviewer_transport_environment_failure",
@@ -316,8 +352,46 @@ def test_route_canonical_step2_result_needs_fix_and_human_judgment_routes_correc
         "missing_error_code",
     ],
 )
-def test_route_canonical_step2_result_producer_error_route_distinction(error_code, expected_attr):
+def test_route_canonical_step2_result_producer_error_route_distinction_or_non_mapping_input(error_code):
     result: dict = {"status": "input_or_runtime_error"}
     if error_code is not None:
         result["error_code"] = error_code
-    assert _PIPELINE.route_canonical_step2_result(result) == getattr(_PIPELINE, expected_attr)
+    # Every input_or_runtime_error, known error_code or not, must fail closed
+    # -- NEVER route to STEP_5_HUMAN_JUDGMENT_REQUIRED (Issue #2054
+    # environment_failure separation contract).
+    assert _PIPELINE.route_canonical_step2_result(result) == _PIPELINE.FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+
+
+@pytest.mark.parametrize(
+    "malformed_result",
+    [
+        ["unexpected", "list"],
+        "unexpected string",
+        1,
+        None,
+        {"status": "ok", "compact_result": ["unexpected"]},
+        {"status": "ok", "compact_result": "unexpected"},
+        {"status": "ok", "compact_result": 1},
+    ],
+    ids=[
+        "top_level_list",
+        "top_level_string",
+        "top_level_int",
+        "top_level_none",
+        "compact_result_list",
+        "compact_result_string",
+        "compact_result_int",
+    ],
+)
+def test_route_canonical_step2_result_producer_error_route_distinction_or_non_mapping_input_never_raises(
+    malformed_result,
+):
+    # Issue #2389 P1-1 / AC4: `route_canonical_step2_result()` is a TOTAL
+    # function -- non-Mapping `result` / `compact_result` input must never
+    # raise `AttributeError` (a prior implementation iteration's
+    # `result.get("compact_result") or {}` pattern raised on truthy
+    # non-Mapping `compact_result` values such as `["unexpected"]`).
+    assert (
+        _PIPELINE.route_canonical_step2_result(malformed_result)
+        == _PIPELINE.FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+    )

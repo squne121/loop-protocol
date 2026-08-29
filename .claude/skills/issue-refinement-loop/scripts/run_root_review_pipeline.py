@@ -159,6 +159,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1188,7 +1189,6 @@ def run_checker_pipeline_once(
         shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
-
 # ---------------------------------------------------------------------------
 # Canonical Step 2 routing (Issue #2380 P0-2, OWNER PR #2386 review):
 # `(status, verdict, next_action)` triple routing, NOT `verdict` alone.
@@ -1200,25 +1200,8 @@ STEP_4 = "step_4"
 STEP_5_HUMAN_JUDGMENT_REQUIRED = "step_5_human_judgment_required"
 FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE = "fail_closed_environment_or_integrity_failure"
 
-# Issue #2389: the ONLY `status: input_or_runtime_error` producer error
-# codes `route_canonical_step2_result()` treats as a recognized, terminal
-# human-escalation state (Step 5) rather than an unrecognized/inconsistent
-# fail-closed stop. Both are emitted by `_cmd_produce()` only after the
-# inner `reviewer_transport.run_reviewer_transport()` bounded retry /
-# artifact-verification machinery has already been exhausted -- see the
-# call sites in `_cmd_produce()` below. Body-fetch failure and VC-budget
-# policy-ceiling errors are intentionally NOT included here (Issue #2389
-# Out of Scope): those remain `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`,
-# unchanged from before this Issue.
-_KNOWN_PRODUCER_HUMAN_JUDGMENT_ERROR_CODES = frozenset(
-    {
-        "reviewer_transport_environment_failure",
-        "artifact_readback_failed",
-    }
-)
 
-
-def route_canonical_step2_result(result: dict[str, Any]) -> str:
+def route_canonical_step2_result(result: Any) -> str:
     """Canonical Step 2's SOLE routing decision function (Issue #2380 P0-2).
 
     A prior implementation iteration keyed routing off `compact_result.verdict`
@@ -1235,12 +1218,19 @@ def route_canonical_step2_result(result: dict[str, Any]) -> str:
     fixable contract defect.
 
     This function evaluates the FULL `(status, verdict, next_action)` triple
-    -- exactly the four outcomes the Issue #2380 fix_delta specifies -- and is
-    intentionally pure (no I/O, no SubAgent/CLI invocation of any kind): it
-    only inspects the dict `result` (typically `_cmd_produce()`'s own parsed
-    JSON output, but any dict with the same shape works, which is what makes
-    it independently unit-testable):
+    -- exactly the outcomes the Issue #2380 / #2389 fix_delta specify -- and
+    is intentionally pure (no I/O, no SubAgent/CLI invocation of any kind):
+    it only inspects `result` (typically `_cmd_produce()`'s own parsed JSON
+    output, but any object with the same shape works, which is what makes it
+    independently unit-testable). It is a TOTAL function: `result` and its
+    `compact_result` entry are validated to be `Mapping` instances before any
+    attribute access, so malformed/non-dict input (`list`, `str`, `int`,
+    `None`, etc.) never raises `AttributeError` -- it falls through to the
+    fail-closed return below instead (Issue #2389 P1-1 / AC4).
 
+        result is not a Mapping, OR `compact_result` is present and is not
+        a Mapping
+            -> `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE` (never raises)
         status == ok + verdict == approve   + next_action == proceed
             -> Step 2.5 (`STEP_2_5`; Issue #2389 -- a deterministic approve
                must still pass through the Step 2.5 semantic design review
@@ -1250,31 +1240,42 @@ def route_canonical_step2_result(result: dict[str, Any]) -> str:
                orchestrator to remember to check applicability separately.)
         status == ok + verdict == needs-fix + next_action == request_changes
             -> Step 4 (`STEP_4`)
-        status == ok + next_action == human_judgment_required (verdict-agnostic,
-            per the schema note above)
+        status == ok + verdict == needs-fix + next_action ==
+            human_judgment_required (EXACT triple match only -- Issue #2389
+            PR #2391 OWNER review P1-1: a loose match on `next_action` alone
+            would also match inconsistent combinations such as
+            `verdict: approve` + `next_action: human_judgment_required`,
+            which must fail closed instead, see below)
             -> Step 5 (`STEP_5_HUMAN_JUDGMENT_REQUIRED`)
-        status == input_or_runtime_error + error_code in
-            `_KNOWN_PRODUCER_HUMAN_JUDGMENT_ERROR_CODES` (Issue #2389: the
-            inner `reviewer_transport.run_reviewer_transport()` bounded retry
-            / artifact-verification machinery has already been exhausted by
-            the time `_cmd_produce()` emits either of these two codes, so
-            this is a recognized terminal producer-error state, not an
-            unrecognized one)
-            -> Step 5 (`STEP_5_HUMAN_JUDGMENT_REQUIRED`)
-        anything else (including any OTHER `status != ok` / unrecognized or
-        missing `error_code`, and any other inconsistent `(status, verdict,
-        next_action)` combination) -> a fail-closed stop, distinct from the
-        ordinary human-judgment escalation above, because it indicates an
-        inconsistent/unrecognized combination rather than a documented
-        terminal state
+        status == input_or_runtime_error (Issue #2389 PR #2391 OWNER review
+            P0-2: EVERY `input_or_runtime_error`, known `error_code` or not,
+            is routed here -- NOT to `STEP_5_HUMAN_JUDGMENT_REQUIRED` --
+            to preserve Issue #2054's `transport_status: environment_failure`
+            / `semantic_verdict: null` separation contract: transport and
+            artifact-integrity failures are an operational/environment
+            condition, not a semantic human-judgment decision, and Issue
+            #2389 does not supersede that separation)
+        anything else (including any other inconsistent `(status, verdict,
+        next_action)` combination, e.g. `verdict: approve` +
+        `next_action: human_judgment_required`) -> a fail-closed stop,
+        because it indicates an inconsistent/unrecognized combination rather
+        than a documented terminal state
             -> `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`
 
     This function does not call `classify_child_stdout()`,
     `retry_once_on_transport_failure()`, or invoke the `issue-reviewer` agent
     -- it has no side effects at all.
     """
+    if not isinstance(result, Mapping):
+        return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+
+    compact_result = result.get("compact_result")
+    if compact_result is None:
+        compact_result = {}
+    if not isinstance(compact_result, Mapping):
+        return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+
     status = result.get("status")
-    compact_result = result.get("compact_result") or {}
     verdict = compact_result.get("verdict")
     next_action = compact_result.get("next_action")
 
@@ -1282,9 +1283,7 @@ def route_canonical_step2_result(result: dict[str, Any]) -> str:
         return STEP_2_5
     if status == "ok" and verdict == "needs-fix" and next_action == "request_changes":
         return STEP_4
-    if status == "ok" and next_action == "human_judgment_required":
-        return STEP_5_HUMAN_JUDGMENT_REQUIRED
-    if status == "input_or_runtime_error" and result.get("error_code") in _KNOWN_PRODUCER_HUMAN_JUDGMENT_ERROR_CODES:
+    if status == "ok" and verdict == "needs-fix" and next_action == "human_judgment_required":
         return STEP_5_HUMAN_JUDGMENT_REQUIRED
     return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
 

@@ -304,17 +304,23 @@ def test_route_canonical_step2_result_needs_fix_request_changes_routes_step_4(tm
     assert _PIPELINE.route_canonical_step2_result(out) == _PIPELINE.STEP_4
 
 
-def test_route_canonical_step2_result_human_judgment_required_routes_step5_regardless_of_verdict():
+def test_route_canonical_step2_result_human_judgment_required_routes_step5_for_exact_triple_only():
     """The existing compact schema (`review-issue/SKILL.md` "Producer I/O
     ownership" section) allows `verdict: needs-fix` + `next_action:
     human_judgment_required` -- an unresolvable environment/timeout
     condition, NOT a body-rewrite-fixable contract defect. The prior
     `verdict`-only routing table would have sent this into the ordinary
-    rewrite loop (Step 4); the fix routes ANY `next_action:
-    human_judgment_required` to Step 5, independent of `verdict`."""
-    for verdict in ("needs-fix", "approve"):
-        result = {"status": "ok", "compact_result": {"verdict": verdict, "next_action": "human_judgment_required"}}
-        assert _PIPELINE.route_canonical_step2_result(result) == _PIPELINE.STEP_5_HUMAN_JUDGMENT_REQUIRED
+    rewrite loop (Step 4); the fix routes the EXACT `verdict: needs-fix` +
+    `next_action: human_judgment_required` triple to Step 5.
+
+    OWNER PR #2391 review P1-1: a loose match on `next_action` alone (i.e.
+    ignoring `verdict`) would ALSO match the inconsistent combination
+    `verdict: approve` + `next_action: human_judgment_required`, which must
+    fail closed instead -- see
+    `test_route_canonical_step2_result_inconsistent_combos_fail_closed`
+    below, which now covers that case."""
+    result = {"status": "ok", "compact_result": {"verdict": "needs-fix", "next_action": "human_judgment_required"}}
+    assert _PIPELINE.route_canonical_step2_result(result) == _PIPELINE.STEP_5_HUMAN_JUDGMENT_REQUIRED
 
 
 @pytest.mark.parametrize(
@@ -325,6 +331,17 @@ def test_route_canonical_step2_result_human_judgment_required_routes_step5_regar
         {"status": "ok", "compact_result": {}},
         {"status": "input_or_runtime_error", "compact_result": {}},
         {"status": "input_or_runtime_error", "compact_result": {"verdict": "approve", "next_action": "proceed"}},
+        # OWNER PR #2391 review P1-1: a loose match on `next_action` alone
+        # (ignoring `verdict`) would incorrectly route this inconsistent
+        # combination to STEP_5_HUMAN_JUDGMENT_REQUIRED; the exact-triple
+        # match must fail closed instead.
+        {"status": "ok", "compact_result": {"verdict": "approve", "next_action": "human_judgment_required"}},
+        # OWNER PR #2391 review P0-2: `input_or_runtime_error` with a KNOWN
+        # producer error_code must NOT be routed to
+        # STEP_5_HUMAN_JUDGMENT_REQUIRED -- Issue #2054's environment_failure
+        # separation contract is preserved, not superseded.
+        {"status": "input_or_runtime_error", "error_code": "reviewer_transport_environment_failure"},
+        {"status": "input_or_runtime_error", "error_code": "artifact_readback_failed"},
     ],
     ids=[
         "approve_plus_request_changes",
@@ -332,6 +349,9 @@ def test_route_canonical_step2_result_human_judgment_required_routes_step5_regar
         "ok_status_empty_compact_result",
         "non_ok_status_empty_compact_result",
         "non_ok_status_otherwise_valid_pair",
+        "approve_plus_human_judgment_required_loose_match",
+        "known_reviewer_transport_environment_failure_stays_fail_closed",
+        "known_artifact_readback_failed_stays_fail_closed",
     ],
 )
 def test_route_canonical_step2_result_inconsistent_combos_fail_closed(result: dict):
