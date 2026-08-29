@@ -243,7 +243,9 @@ def test_cmd_produce_result_is_self_sufficient_for_canonical_step2_routing(tmp_p
     for key in ("verdict", "next_action", "artifact_path", "reviewed_body_sha256", "attempt_id"):
         assert key in compact_result, f"canonical Step 2 routing needs compact_result.{key}"
     for key in ("root", "relative_path", "sha256", "schema", "invocation_id", "attempt"):
-        assert key in out["verified_transport_artifact"], f"canonical Step 2 routing needs verified_transport_artifact.{key}"
+        assert key in out["verified_transport_artifact"], (
+            f"canonical Step 2 routing needs verified_transport_artifact.{key}"
+        )
 
 
 # ---------------------------------------------------------------------------
