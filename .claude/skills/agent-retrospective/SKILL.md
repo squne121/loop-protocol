@@ -70,7 +70,13 @@ nonce）と `base_sha`（一度だけ解決、以降再解決しない）を固�
 
 - `retrospective-runtime-observer`（interpreter role。Claude Code/Claude-GPT session evidence の解釈専用）
 - `codebase-investigator`（既存 SubAgent の再利用。advisory role、base_sha 非束縛の調査は finding
-  authority にしない -- `finding_authority: advisory` タグが付与される）
+  authority にしない -- `finding_authority: advisory` タグが付与される）。substantive な
+  caller-supplied task（`--prompts-file` 経由）を持つ場合にのみ `agy_advisory_native_fallback_allowed:
+  true` と `authoritative_base_sha=ctx.base_sha` を明示的に配線する（default/no-task path には配線し
+  ない -- Issue #2374）。role adapter（`apply_codebase_investigator_role_adapter`）が AGY operational
+  failure 後の native fallback 結果（`CODEBASE_INVESTIGATION_RESULT_V1`）を検証（native `status:
+  failed`/`inconclusive`、または `evidence_refs` の `commit_sha != ctx.base_sha` は typed failure とし
+  空 findings の成功へ変換しない）した上で `EvidenceBundle`/`OBSERVER_RESULT_V1` へ正規化する。
 - `web-researcher`（既存 SubAgent の再利用。discovery role。`evidence_digest` が Web collector の
   再取得済み digest と一致しない場合は `UnboundEvidenceAuthority` で reject される）
 

@@ -5,7 +5,7 @@
 | Role | Authority | 必須入力 | 本番制約 |
 |---|---|---|---|
 | runtime observer | interpreter | private runtime evidence + digest | no Agent/Skill/write、raw 出力禁止 |
-| codebase investigator | advisory（current worktree を authority にしない） | `git show <base_sha>:<path>` 等で materialize した入力 | base_sha 非束縛の調査結果は finding authority にしない |
+| codebase investigator | advisory（current worktree を authority にしない） | `git show <base_sha>:<path>` 等でmaterialize した入力 | base_sha 非束縛の調査結果は finding authority にしない。substantive なcaller-supplied task にのみ `agy_advisory_native_fallback_allowed: true` + `authoritative_base_sha`を配線し、AGY operational failure 後の native fallback 結果を role adapter で`EvidenceBundle`/`OBSERVER_RESULT_V1` へ正規化する（native `failed`/`inconclusive`・`base_sha` 不一致はtyped failure、Issue #2374） |
 | web researcher | URL discovery / claim interpretation | bounded query | 最終 evidence は Web collector（`collect_web_source`）で再取得・digest 化してから finding authority にする |
 | evaluator | privileged synthesis | validated projection のみ | Web/Bash/Agent/Skill/write 全禁止 |
 

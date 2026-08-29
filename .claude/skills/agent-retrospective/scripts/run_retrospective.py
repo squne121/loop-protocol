@@ -703,6 +703,25 @@ class AgentInvocationRequest:
     cwd: str
     env: dict[str, str] = field(default_factory=dict)
     timeout_sec: int = 300
+    #: Issue #2374: opt-in role-adapter identifier. ``None`` (the default)
+    #: for every existing caller/agent (``retrospective-runtime-observer``,
+    #: ``web-researcher``, ``retrospective-evaluator``, and
+    #: codebase-investigator's own default/no-task invocation) -- with this
+    #: unset, ``invoke_agent``'s result-text recovery path
+    #: (``_structured_output_from_result_compat``) behaves EXACTLY as
+    #: before (no behavior change to any pre-existing caller). Only
+    #: ``build_observer_requests()``'s substantive-caller-supplied-task
+    #: codebase-investigator branch sets this to
+    #: ``_ROLE_ADAPTER_CODEBASE_INVESTIGATOR_OBSERVER_V1``, which
+    #: additionally recognizes the SubAgent's own native
+    #: ``CODEBASE_INVESTIGATION_RESULT_V1`` output contract
+    #: (``.claude/agents/codebase-investigator.md``) among the candidates
+    #: recovered from the wrapper's ``result`` text, so a role adapter
+    #: (``apply_codebase_investigator_role_adapter``) can convert it into
+    #: this module's ``EvidenceBundle``/``OBSERVER_RESULT_V1`` wire
+    #: contract instead of unconditionally failing closed with
+    #: ``missing_structured_output``.
+    role_adapter: str | None = None
 
 
 @dataclass
@@ -716,6 +735,17 @@ class AgentInvocationResult:
     raw_stdout_excerpt: str | None
     exit_code: int | None
     reason_code: str | None
+    #: Issue #2374: ``True`` only when ``request.role_adapter ==
+    #: _ROLE_ADAPTER_CODEBASE_INVESTIGATOR_OBSERVER_V1`` AND the result-text
+    #: recovery path matched exactly one candidate against the native
+    #: ``CODEBASE_INVESTIGATION_RESULT_V1`` shape (never the
+    #: ``observer_result_v1`` shape) -- a marker consumed only by
+    #: ``apply_codebase_investigator_role_adapter``/
+    #: ``invoke_agent_with_role_adapter``. ``status`` is still ``"ok"`` and
+    #: ``structured_output`` still carries the (not-yet-converted) native
+    #: dict in this case; every other caller/status combination leaves this
+    #: ``False``, matching pre-#2374 behavior exactly.
+    native_role_adapter_candidate: bool = False
 
 
 _AGENT_INVOCATION_STATUSES = frozenset(
@@ -730,6 +760,65 @@ _MAX_STDOUT_EXCERPT = 200
 #: ``DelegatedAgentPermissionPolicy`` is supplied (defensive fallback only --
 #: production callers always supply a policy; see ``run_cli``).
 _DEFAULT_ENV_PASSTHROUGH_ALLOWLIST = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ"})
+
+# ---------------------------------------------------------------------------
+# codebase-investigator role adapter (Issue #2374)
+# ---------------------------------------------------------------------------
+
+#: ``AgentInvocationRequest.role_adapter`` value that opts a codebase-
+#: investigator invocation into native ``CODEBASE_INVESTIGATION_RESULT_V1``
+#: candidate recognition (see ``_looks_like_native_codebase_investigation_result``)
+#: and role-adapted conversion into ``EvidenceBundle``/``OBSERVER_RESULT_V1``
+#: (see ``apply_codebase_investigator_role_adapter``). Only
+#: ``build_observer_requests()``'s substantive-caller-supplied-task
+#: codebase-investigator branch ever sets this.
+_ROLE_ADAPTER_CODEBASE_INVESTIGATOR_OBSERVER_V1 = "codebase_investigator_observer_v1"
+
+#: Required top-level keys of ``.claude/agents/codebase-investigator.md``'s
+#: own native ``CODEBASE_INVESTIGATION_RESULT_V1`` output contract
+#: (``schema_version``/``status``/``investigation_route``/``evidence_refs``/
+#: ``discovery_summary``/``impact_scope``/``failure_reason``/
+#: ``source_evidence_result`` -- 8 fields, matching the SubAgent's own
+#: "Result: CODEBASE_INVESTIGATION_RESULT_V1" section, corrected from the
+#: pre-Issue-#2374 Issue body's mistaken "7 fields"). This module never adds
+#: a second on-disk JSON Schema file for this shape (Issue #2374 Allowed
+#: Paths note: a schema file is needed only if the *native --json-schema*
+#: mode is chosen -- this module instead recognizes the shape structurally,
+#: in Python, keeping the fix additive within the Allowed Paths already
+#: granted).
+_NATIVE_CODEBASE_INVESTIGATION_RESULT_KEYS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "investigation_route",
+        "evidence_refs",
+        "discovery_summary",
+        "impact_scope",
+        "failure_reason",
+        "source_evidence_result",
+    }
+)
+
+#: ``CODEBASE_INVESTIGATION_RESULT_V1.schema_version`` is the integer ``1``
+#: (distinct from ``observer_result_v1.schema.json``'s ``schema_version``
+#: const string ``"observer_result/v1"`` -- the two shapes' ``schema_version``
+#: values are never confusable with one another).
+_NATIVE_CODEBASE_INVESTIGATION_SCHEMA_VERSION = 1
+
+
+def _looks_like_native_codebase_investigation_result(candidate: dict[str, Any]) -> bool:
+    """Structural (non-jsonschema) recognizer for
+    ``.claude/agents/codebase-investigator.md``'s own native
+    ``CODEBASE_INVESTIGATION_RESULT_V1`` output contract -- distinct from,
+    and never validated against, this module's ``observer_result_v1.schema.json``
+    wire contract. Only used when ``role_adapter ==
+    _ROLE_ADAPTER_CODEBASE_INVESTIGATOR_OBSERVER_V1`` (see
+    ``_structured_output_from_result_compat``)."""
+    if not isinstance(candidate, dict):
+        return False
+    if not _NATIVE_CODEBASE_INVESTIGATION_RESULT_KEYS.issubset(candidate.keys()):
+        return False
+    return candidate.get("schema_version") == _NATIVE_CODEBASE_INVESTIGATION_SCHEMA_VERSION
 
 
 def _stdout_excerpt(text: str | None) -> str | None:
@@ -790,9 +879,31 @@ def _iter_fenced_json_candidates(text: str) -> list[str]:
     return candidates
 
 
+@dataclass
+class _RecoveredStructuredOutput:
+    """Return type of ``_structured_output_from_result_compat`` (Issue
+    #2374, replacing its prior bare ``dict[str, Any] | None`` return --
+    an internal, ``_``-prefixed helper's return shape, never a wire
+    contract). ``matched_kind`` is ``"observer"`` (the pre-#2374, still
+    default behavior), ``"native"`` (Issue #2374's codebase-investigator
+    role-adapter recognition -- ``payload`` is the NOT-YET-CONVERTED native
+    ``CODEBASE_INVESTIGATION_RESULT_V1`` dict), or ``None`` (no unambiguous
+    candidate -- ``payload`` is also ``None``). The remaining fields are
+    diagnostics (Issue #2374 In Scope "診断精緻化") describing every
+    fenced/unfenced JSON candidate considered, regardless of outcome."""
+
+    payload: dict[str, Any] | None
+    matched_kind: str | None
+    result_fence_count: int = 0
+    json_candidate_count: int = 0
+    observer_schema_valid_candidate_count: int = 0
+    native_schema_valid_candidate_count: int = 0
+    observed_top_level_keys: list[list[str]] = field(default_factory=list)
+
+
 def _structured_output_from_result_compat(
-    payload: dict[str, Any], *, json_schema_path: str
-) -> dict[str, Any] | None:
+    payload: dict[str, Any], *, json_schema_path: str, role_adapter: str | None = None
+) -> "_RecoveredStructuredOutput":
     """Best-effort recovery of the schema-conformant business payload from
     the wrapper's `result` text field, attempted only when the
     `structured_output` wrapper field is absent or explicitly `None`
@@ -831,19 +942,37 @@ def _structured_output_from_result_compat(
     rejected (fail-closed) rather than guessing which fence is the intended
     business payload. A malformed/absent `result`, or one where no
     candidate passes schema validation, is never silently accepted as
-    `ok`."""
+    `ok`.
+
+    Issue #2374: when ``role_adapter ==
+    _ROLE_ADAPTER_CODEBASE_INVESTIGATOR_OBSERVER_V1``, every candidate that
+    FAILS observer-schema validation is additionally probed against
+    ``_looks_like_native_codebase_investigation_result`` (the
+    codebase-investigator SubAgent's own native output contract). An
+    observer-schema-valid candidate is never also probed as native (the two
+    shapes are mutually exclusive by construction -- see that recognizer's
+    docstring). Exactly one native match (and zero observer matches) is
+    returned as ``matched_kind="native"`` -- still the RAW, NOT-YET-CONVERTED
+    native dict; conversion into ``EvidenceBundle``/``OBSERVER_RESULT_V1`` is
+    ``apply_codebase_investigator_role_adapter``'s responsibility, not this
+    function's. When ``role_adapter`` is ``None`` (every other caller),
+    this function's behavior is byte-for-byte identical to its pre-#2374
+    form: only observer-schema-valid candidates are ever considered."""
     result_text = payload.get("result")
     if not isinstance(result_text, str) or not result_text.strip():
-        return None
+        return _RecoveredStructuredOutput(None, None)
     try:
         schema = json.loads(Path(json_schema_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        return _RecoveredStructuredOutput(None, None)
 
     fenced_candidates = _iter_fenced_json_candidates(result_text)
     candidate_texts = fenced_candidates if fenced_candidates else [result_text.strip()]
 
-    schema_valid_candidates: list[dict[str, Any]] = []
+    observer_valid: list[dict[str, Any]] = []
+    native_valid: list[dict[str, Any]] = []
+    json_candidate_count = 0
+    observed_top_level_keys: list[list[str]] = []
     for candidate_text in candidate_texts:
         try:
             candidate = json.loads(candidate_text)
@@ -851,15 +980,32 @@ def _structured_output_from_result_compat(
             continue
         if not isinstance(candidate, dict):
             continue
+        json_candidate_count += 1
+        observed_top_level_keys.append(sorted(candidate.keys()))
         try:
             jsonschema.validate(candidate, schema)
-        except (jsonschema.exceptions.ValidationError, jsonschema.exceptions.SchemaError):
+            observer_valid.append(candidate)
             continue
-        schema_valid_candidates.append(candidate)
+        except (jsonschema.exceptions.ValidationError, jsonschema.exceptions.SchemaError):
+            pass
+        if role_adapter == _ROLE_ADAPTER_CODEBASE_INVESTIGATOR_OBSERVER_V1 and (
+            _looks_like_native_codebase_investigation_result(candidate)
+        ):
+            native_valid.append(candidate)
 
-    if len(schema_valid_candidates) != 1:
-        return None
-    return schema_valid_candidates[0]
+    diagnostics_kwargs = {
+        "result_fence_count": len(fenced_candidates),
+        "json_candidate_count": json_candidate_count,
+        "observer_schema_valid_candidate_count": len(observer_valid),
+        "native_schema_valid_candidate_count": len(native_valid),
+        "observed_top_level_keys": observed_top_level_keys,
+    }
+
+    if len(observer_valid) == 1 and not native_valid:
+        return _RecoveredStructuredOutput(observer_valid[0], "observer", **diagnostics_kwargs)
+    if len(native_valid) == 1 and not observer_valid:
+        return _RecoveredStructuredOutput(native_valid[0], "native", **diagnostics_kwargs)
+    return _RecoveredStructuredOutput(None, None, **diagnostics_kwargs)
 
 
 def build_agent_invocation_argv(
@@ -1030,21 +1176,74 @@ def invoke_agent(
     # rationale.
     _MISSING = object()
     raw_structured_output = payload.get("structured_output", _MISSING)
+    structured_output_presence = (
+        "present" if isinstance(raw_structured_output, dict)
+        else "null" if raw_structured_output is None
+        else "absent" if raw_structured_output is _MISSING
+        else "present_wrong_type"
+    )
+    matched_kind: str | None = None
+    recovery_diagnostics: "_RecoveredStructuredOutput | None" = None
     if isinstance(raw_structured_output, dict):
         structured_output = raw_structured_output
     elif raw_structured_output is _MISSING or raw_structured_output is None:
-        structured_output = _structured_output_from_result_compat(
-            payload, json_schema_path=request.json_schema_path
+        recovery_diagnostics = _structured_output_from_result_compat(
+            payload, json_schema_path=request.json_schema_path, role_adapter=request.role_adapter
         )
+        structured_output = recovery_diagnostics.payload
+        matched_kind = recovery_diagnostics.matched_kind
     else:
         structured_output = None
+
+    # Issue #2374: a native (codebase-investigator's own
+    # CODEBASE_INVESTIGATION_RESULT_V1) recovery match is surfaced as `ok`
+    # with the raw, NOT-YET-CONVERTED native dict plus the
+    # `native_role_adapter_candidate` marker -- conversion into
+    # `EvidenceBundle`/`OBSERVER_RESULT_V1` is
+    # `apply_codebase_investigator_role_adapter`'s responsibility (it needs
+    # this run's `ctx.base_sha`/`ctx.run_id`/`plan.source_set_digest`, none
+    # of which this context-free adapter function has access to).
+    if matched_kind == "native" and isinstance(structured_output, dict):
+        return AgentInvocationResult(
+            status="ok",
+            structured_output=structured_output,
+            raw_stdout_excerpt=None,
+            exit_code=completed.returncode,
+            reason_code=None,
+            native_role_adapter_candidate=True,
+        )
+
     if not isinstance(structured_output, dict):
+        reason_code = "missing_structured_output"
+        # Issue #2374 In Scope "診断精緻化": only role_adapter-enabled
+        # requests get the enriched reason_code -- every other caller keeps
+        # the exact pre-#2374 literal `"missing_structured_output"` (no
+        # observable behavior change for the other 2 observers / the
+        # default/no-task codebase-investigator path -- AC6/AC7/AC8).
+        if request.role_adapter is not None:
+            diagnostics = {
+                "wrapper_subtype": payload.get("subtype"),
+                "structured_output_presence": structured_output_presence,
+                "structured_output_type": (
+                    type(raw_structured_output).__name__ if raw_structured_output is not _MISSING else None
+                ),
+                "result_fence_count": recovery_diagnostics.result_fence_count if recovery_diagnostics else 0,
+                "json_candidate_count": recovery_diagnostics.json_candidate_count if recovery_diagnostics else 0,
+                "observer_schema_valid_candidate_count": (
+                    recovery_diagnostics.observer_schema_valid_candidate_count if recovery_diagnostics else 0
+                ),
+                "native_schema_valid_candidate_count": (
+                    recovery_diagnostics.native_schema_valid_candidate_count if recovery_diagnostics else 0
+                ),
+                "observed_top_level_keys": recovery_diagnostics.observed_top_level_keys if recovery_diagnostics else [],
+            }
+            reason_code = "missing_structured_output:" + json.dumps(diagnostics, sort_keys=True)
         return AgentInvocationResult(
             status="malformed_output",
             structured_output=None,
             raw_stdout_excerpt=_stdout_excerpt(completed.stdout),
             exit_code=completed.returncode,
-            reason_code="missing_structured_output",
+            reason_code=reason_code,
         )
 
     return AgentInvocationResult(
@@ -1054,6 +1253,152 @@ def invoke_agent(
         exit_code=completed.returncode,
         reason_code=None,
     )
+
+
+class NativeResultAdaptationFailed(Exception):
+    """Raised by ``apply_codebase_investigator_role_adapter`` when the
+    codebase-investigator SubAgent's native ``CODEBASE_INVESTIGATION_RESULT_V1``
+    cannot be role-adapted into a valid ``EvidenceBundle``/
+    ``OBSERVER_RESULT_V1`` (Issue #2374 AC4/AC5). Callers MUST NOT convert
+    this into an empty-``findings`` success -- see
+    ``apply_codebase_investigator_role_adapter``'s caller
+    (``invoke_agent_with_role_adapter``), which surfaces this as a typed
+    ``AgentInvocationResult(status="malformed_output", ...)`` instead."""
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+def adapt_native_codebase_investigation_result(
+    native_result: dict[str, Any],
+    *,
+    run_id: str,
+    base_sha: str,
+    source_set_digest: str,
+    observer_id: str,
+) -> dict[str, Any]:
+    """Role adapter (Issue #2374): converts a recognized native
+    ``CODEBASE_INVESTIGATION_RESULT_V1`` dict (produced during an AGY
+    advisory native fallback -- ``.claude/agents/codebase-investigator.md``)
+    into an ``EvidenceBundle``-conformant (``observer_result/v1``) dict.
+    Raises ``NativeResultAdaptationFailed`` -- never silently downgrades to
+    an empty-``findings`` success -- when:
+
+    - ``status`` is not ``"ok"`` (``"failed"``/``"inconclusive"`` -- AC4)
+    - ``evidence_refs`` is missing/empty, is not a list of objects, or any
+      entry's ``commit_sha`` does not equal this run's authoritative
+      ``base_sha`` (AC5 -- ``REPO_EVIDENCE_REF_V1.commit_sha != ctx.base_sha``)
+    - ``discovery_summary`` is missing/empty (nothing to report as a finding)
+
+    The returned dict's key set is EXACTLY ``EvidenceBundle``'s 7 declared
+    fields (``_parse_wire_payload`` rejects unknown/missing fields) -- no
+    extra/renamed keys, and no ``SMUGGLED_AUTHORITY_KEYS`` collision (the
+    nested ``evidence_refs`` carries only ``REPO_EVIDENCE_REF_V1`` public
+    fields, never raw stdout/credentials/absolute paths)."""
+    status = native_result.get("status")
+    if status != "ok":
+        raise NativeResultAdaptationFailed("native_result_status_not_ok")
+
+    evidence_refs = native_result.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not evidence_refs:
+        raise NativeResultAdaptationFailed("native_result_missing_evidence_refs")
+    for ref in evidence_refs:
+        if not isinstance(ref, dict):
+            raise NativeResultAdaptationFailed("native_result_evidence_ref_not_object")
+        if ref.get("commit_sha") != base_sha:
+            raise NativeResultAdaptationFailed("native_result_evidence_base_sha_mismatch")
+
+    discovery_summary = native_result.get("discovery_summary")
+    if not isinstance(discovery_summary, str) or not discovery_summary.strip():
+        raise NativeResultAdaptationFailed("native_result_missing_discovery_summary")
+
+    impact_scope = native_result.get("impact_scope")
+    finding = {
+        "claim": discovery_summary.strip(),
+        "claim_class": "codebase_investigation",
+        "investigation_route": native_result.get("investigation_route"),
+        "impact_scope": impact_scope if isinstance(impact_scope, list) else [],
+        "evidence_refs": evidence_refs,
+    }
+
+    return {
+        "schema_version": WIRE_SCHEMA_EVIDENCE_BUNDLE,
+        "run_id": run_id,
+        "base_sha": base_sha,
+        "source_set_digest": source_set_digest,
+        "observer_id": observer_id,
+        "evidence_ref": "codebase-investigator-native-fallback-evidence-ref",
+        "findings": [finding],
+    }
+
+
+def apply_codebase_investigator_role_adapter(
+    result: AgentInvocationResult,
+    *,
+    ctx: "RunContext",
+    plan: "SourcePlan",
+    observer_id: str,
+) -> AgentInvocationResult:
+    """Issue #2374 role adapter entry point: a pure, additive wrapper around
+    an already-produced ``AgentInvocationResult``. When
+    ``result.native_role_adapter_candidate`` is ``False`` (every request
+    except a substantive-task codebase-investigator invocation that actually
+    hit the native-recognition path), ``result`` is returned COMPLETELY
+    UNCHANGED. Only when the marker is set does this function attempt
+    ``adapt_native_codebase_investigation_result`` -- success replaces
+    ``structured_output`` with the converted ``EvidenceBundle`` dict
+    (``status="ok"``); failure (AC4/AC5 typed rejection) is surfaced as
+    ``status="malformed_output"`` with a ``native_fallback_adaptation_failed:``
+    -prefixed ``reason_code`` (never silently promoted to an empty-findings
+    success)."""
+    if not result.native_role_adapter_candidate:
+        return result
+    if not isinstance(result.structured_output, dict):  # pragma: no cover - defensive, invariant of the marker
+        return result
+    try:
+        converted = adapt_native_codebase_investigation_result(
+            result.structured_output,
+            run_id=ctx.run_id,
+            base_sha=ctx.base_sha,
+            source_set_digest=plan.source_set_digest,
+            observer_id=observer_id,
+        )
+    except NativeResultAdaptationFailed as exc:
+        return AgentInvocationResult(
+            status="malformed_output",
+            structured_output=None,
+            raw_stdout_excerpt=result.raw_stdout_excerpt,
+            exit_code=result.exit_code,
+            reason_code=f"native_fallback_adaptation_failed:{exc.reason_code}",
+        )
+    return AgentInvocationResult(
+        status="ok",
+        structured_output=converted,
+        raw_stdout_excerpt=None,
+        exit_code=result.exit_code,
+        reason_code=None,
+    )
+
+
+def invoke_agent_with_role_adapter(
+    request: AgentInvocationRequest,
+    *,
+    ctx: "RunContext",
+    plan: "SourcePlan",
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    policy: "DelegatedAgentPermissionPolicy | None" = None,
+) -> AgentInvocationResult:
+    """Issue #2374: thin wrapper around ``invoke_agent`` that applies
+    ``apply_codebase_investigator_role_adapter`` afterwards. Every request
+    with ``role_adapter is None`` (every existing caller) passes through
+    ``invoke_agent``'s own result completely unchanged -- this wrapper never
+    alters ``invoke_agent``'s own behavior, it only adds a post-processing
+    step for the codebase-investigator role-adapter path."""
+    result = invoke_agent(request, runner=runner, policy=policy)
+    if request.role_adapter != _ROLE_ADAPTER_CODEBASE_INVESTIGATOR_OBSERVER_V1:
+        return result
+    return apply_codebase_investigator_role_adapter(result, ctx=ctx, plan=plan, observer_id=request.agent_name)
 
 
 # ---------------------------------------------------------------------------
@@ -2651,7 +2996,31 @@ def bind_observer_prompt(
             'four values. Do not invent evidence or findings beyond an empty '
             'findings list. Set "findings" to [].'
         )
-    return f"observer_id={observer_id}.\n\n{identity_block}\n\n{caller_task_block}\n\n{output_rules}"
+    # Issue #2374: fallback opt-in (`agy_advisory_native_fallback_allowed`)
+    # and `authoritative_base_sha` are wired ONLY into the substantive
+    # caller-supplied-task path (`has_task`) for `codebase-investigator`
+    # specifically (AC1) -- never into `retrospective-runtime-observer`'s or
+    # `web-researcher`'s prompts, and never into the default/no-task path
+    # (AC7). `.claude/agents/codebase-investigator.md`'s own input contract
+    # already documents `agy_advisory_native_fallback_allowed`; the caller
+    # (this module) is the one that must actually pass it -- prior to this
+    # Issue, no wiring path existed at all (see this Issue's "Current
+    # Validated Scope"). This does NOT ask the model to override its own
+    # native output contract via task-prompt instructions (Issue #2374
+    # Outcome: "task prompt への追記だけでは...決定論的に解消できない") --
+    # `apply_codebase_investigator_role_adapter` (Python-side) is what
+    # deterministically resolves the native/observer contract selection,
+    # not this prompt text.
+    fallback_policy_block = ""
+    if has_task and observer_id == "codebase-investigator":
+        fallback_policy_block = "\n\nAGY_ADVISORY_NATIVE_FALLBACK_POLICY\n" + json.dumps(
+            {"agy_advisory_native_fallback_allowed": True, "authoritative_base_sha": base_sha},
+            sort_keys=True,
+        )
+    return (
+        f"observer_id={observer_id}.\n\n{identity_block}\n\n{caller_task_block}\n\n"
+        f"{output_rules}{fallback_policy_block}"
+    )
 
 
 def _default_observer_prompt(observer_id: str, *, run_id: str, base_sha: str, source_set_digest: str) -> str:
@@ -2715,7 +3084,12 @@ def _reject_missing_or_empty_prompts(prompts: dict[str, str]) -> None:
 
 
 def build_observer_requests(
-    *, schema_dir: Path, cwd: str, prompts: dict[str, str], timeout_sec: int = 300
+    *,
+    schema_dir: Path,
+    cwd: str,
+    prompts: dict[str, str],
+    timeout_sec: int = 300,
+    caller_supplied_task_path: bool = False,
 ) -> list[AgentInvocationRequest]:
     """Build the exact 3-observer ``AgentInvocationRequest`` list matching
     ``EXPECTED_OBSERVER_MANIFEST`` (Issue #2237 P0-2/P0-6). ``prompts`` maps
@@ -2730,7 +3104,18 @@ def build_observer_requests(
 
     Issue #2345 fix_delta P2 item 3: every ``observer_id`` in
     ``EXPECTED_OBSERVER_MANIFEST`` MUST have a non-empty (post-``strip()``)
-    prompt in ``prompts`` -- see ``_reject_missing_or_empty_prompts``."""
+    prompt in ``prompts`` -- see ``_reject_missing_or_empty_prompts``.
+
+    ``caller_supplied_task_path`` (Issue #2374, default ``False``): ``True``
+    only when ``run_cli()``'s caller supplied a ``--prompts-file`` (the
+    substantive caller-supplied-task path, as opposed to the default/no-task
+    path). When ``True``, ONLY the ``codebase-investigator`` request gets
+    ``role_adapter=_ROLE_ADAPTER_CODEBASE_INVESTIGATOR_OBSERVER_V1`` (AC1) --
+    ``retrospective-runtime-observer`` and ``web-researcher`` never get a
+    ``role_adapter`` regardless of this flag. The default ``False`` keeps
+    every pre-#2374 direct caller of this function (which never passes this
+    new keyword-only argument) producing the exact same 3 requests as
+    before -- ``role_adapter=None`` on all of them."""
     _reject_missing_or_empty_prompts(prompts)
     return [
         AgentInvocationRequest(
@@ -2739,6 +3124,11 @@ def build_observer_requests(
             json_schema_path=str(schema_dir / "observer_result_v1.schema.json"),
             cwd=cwd,
             timeout_sec=timeout_sec,
+            role_adapter=(
+                _ROLE_ADAPTER_CODEBASE_INVESTIGATOR_OBSERVER_V1
+                if caller_supplied_task_path and spec.observer_id == "codebase-investigator"
+                else None
+            ),
         )
         for spec in EXPECTED_OBSERVER_MANIFEST
     ]
@@ -2849,8 +3239,17 @@ def run_cli(
                 )
                 for spec in EXPECTED_OBSERVER_MANIFEST
             }
+        # Issue #2374 AC1: `caller_supplied_task_path=(prompts is not None)`
+        # -- the substantive caller-supplied-task path (`--prompts-file`)
+        # is the ONLY path that gets `role_adapter` wired onto the
+        # `codebase-investigator` request; `prompts is None` (default/
+        # no-task path) always produces `role_adapter=None` on every
+        # request (AC7).
         observer_requests = build_observer_requests(
-            schema_dir=schema_dir, cwd=str(repo_root), prompts=resolved_prompts
+            schema_dir=schema_dir,
+            cwd=str(repo_root),
+            prompts=resolved_prompts,
+            caller_supplied_task_path=(prompts is not None),
         )
 
         def _invoke(request: AgentInvocationRequest) -> AgentInvocationResult:
@@ -2859,7 +3258,9 @@ def run_cli(
                 f"{_RUN_SCOPED_ENV_PREFIX}RUN_ID": ctx.run_id,
                 f"{_RUN_SCOPED_ENV_PREFIX}BASE_SHA": ctx.base_sha,
             }
-            return invoke_agent(dataclasses.replace(request, env=run_scoped_env), runner=runner, policy=policy)
+            return invoke_agent_with_role_adapter(
+                dataclasses.replace(request, env=run_scoped_env), ctx=ctx, plan=plan, runner=runner, policy=policy
+            )
 
         bundles = run_observer_wave(
             ctx, plan, invoke=_invoke, observer_requests=observer_requests, expected_manifest=EXPECTED_OBSERVER_MANIFEST
