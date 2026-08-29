@@ -17,10 +17,25 @@ readback/verdict-identity gating of the "final review" step) into a single
 root-owned script that the orchestrator (main thread / `issue-refinement-loop`
 SKILL.md Step 2), not the read-only agent, invokes directly.
 
-The `issue-reviewer` agent's role after this change is strictly advisory: it
-reads the already-pinned merged review result this script produces and
-returns an `ISSUE_REVIEW_RESULT_COMPACT_V1` verdict on stdout. It performs no
-I/O of its own.
+Historical note, superseded by the Issue #2380 paragraph immediately below:
+prior to Issue #2380, the `issue-reviewer` agent's role after the above
+change was advisory-relay -- it read the already-pinned merged review
+result this script produces and returned an `ISSUE_REVIEW_RESULT_COMPACT_V1`
+verdict on stdout, performing no I/O of its own. That relay is no longer
+part of the canonical routing path.
+
+Issue #2380: canonical Step 2 routing (`issue-refinement-loop` SKILL.md) does
+NOT invoke the `issue-reviewer` agent, does not relay `compact_result.stdout_lines`
+to it, and does not call `classify_child_stdout()` /
+`retry_once_on_transport_failure()` (both defined below). Canonical Step 2
+consumes `produce`'s own root-verified `compact_result.verdict` /
+`compact_result.next_action` (and `verified_transport_artifact`) directly.
+The `issue-reviewer` agent, `classify-child-stdout` CLI subcommand,
+`classify_child_stdout()`, and `retry_once_on_transport_failure()` remain
+available for legacy CLI / diagnostic / regression-test use (they still
+enforce the exact 11-line V2 wire grammar as a strict compatibility
+boundary -- see `validate_review_compact_output.py`), but they are no
+longer part of the canonical routing path.
 
 CLI subcommands:
 
@@ -34,22 +49,29 @@ CLI subcommands:
                          "read-only" child that could not legitimately write
                          it). The compact envelope's rendered stdout lines are
                          returned to the caller as `compact_result.stdout_lines`
-                         so the orchestrator can hand them to the read-only
-                         `issue-reviewer` child as an explicit, already-produced,
-                         read-only input (the child relays them verbatim; it
-                         never invokes `compact_review_result.py` itself).
+                         (legacy CLI / diagnostic / regression-test use only),
+                         alongside `compact_result.verdict` /
+                         `compact_result.next_action` -- canonical Step 2's OWN
+                         direct-consume routing input (Issue #2380). Canonical
+                         Step 2 does not hand `compact_result.stdout_lines` to the
+                         read-only `issue-reviewer` child; that agent is not
+                         invoked as part of canonical Step 2 routing at all.
     classify-child-stdout
-                         Classify the issue-reviewer child agent's raw stdout
-                         text via the SAME canonical validator
+                         LEGACY / diagnostic-only (Issue #2380: canonical Step
+                         2 routing does not call this subcommand). Classify the
+                         issue-reviewer child agent's raw stdout text via the
+                         SAME canonical validator
                          (`validate_review_compact_output.validate_review_compact_output()`)
-                         the orchestrator's Step 2 routing table uses -- not a
-                         separately reimplemented simplified classifier (PR
-                         #2135 iteration-3 P0-2). 0-byte stdout classifies as
+                         used by this classifier -- not a separately
+                         reimplemented simplified classifier (PR #2135
+                         iteration-3 P0-2). 0-byte stdout classifies as
                          `reviewer_transport_failure` / `empty_input` (Issue
                          #2049 AC4/AC5); non-empty-but-malformed stdout now
                          also classifies as `reviewer_transport_failure` /
                          `malformed_output` instead of being silently accepted
-                         as "ok".
+                         as "ok". Retained for legacy CLI / diagnostic /
+                         regression-test use as the strict 11-line V2 wire
+                         grammar compatibility boundary.
     readback            Verify the persisted `REVIEWER_COMPACT_ARTIFACT_V2`
                          artifact -- i.e. `produce`'s
                          `verified_transport_artifact` /
@@ -112,12 +134,15 @@ gate keyed on a *freshly regenerated-this-call* artifact, not a stale
 long-lived receipt): every artifact this module persists is produced and
 consumed within the SAME `produce` invocation's live-body fetch, never
 carried over from a prior run, and `gate_final_review()` only ever reads back
-the artifact this same call just wrote. Consumers: `issue-refinement-loop`
-SKILL.md Step 2 (orchestrator) and the `issue-reviewer` read-only child
-(input only, never a writer). No other skill/orchestrator step depends on
-this schema. If Issue #2049's AC7/AC10 wording itself needs to change to fold
-this back into #1875's stale-tolerant minimal-harness model, that is a
-separate Issue-contract decision, not one this PR makes unilaterally.
+the artifact this same call just wrote. Consumer: `issue-refinement-loop`
+SKILL.md Step 2 (orchestrator), which consumes `compact_result.verdict` /
+`compact_result.next_action` / `verified_transport_artifact` directly (Issue
+#2380) -- the `issue-reviewer` agent is NOT a canonical Step 2 consumer of
+this schema; it remains a legacy CLI / diagnostic / regression-test-only
+reader of `compact_result.stdout_lines` when invoked outside canonical
+routing. No other skill/orchestrator step depends on this schema. If Issue #2049's AC7/AC10 wording itself needs to
+change to fold this back into #1875's stale-tolerant minimal-harness model, that is a separate Issue-contract
+decision, not one this PR makes unilaterally.
 
 Exit codes: 0 = ok, 1 = producer/validation error, 2 = input/environment
 error, 3 = human_judgment_required.
@@ -515,9 +540,17 @@ def classify_child_stdout(
     repo: str | None = None,
     expected_body_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Classify the child `issue-reviewer` agent's raw stdout text via the
+    """LEGACY / diagnostic-only (Issue #2380): canonical Step 2 routing does
+    NOT call this function -- it consumes `produce`'s own root-verified
+    `compact_result.verdict` / `compact_result.next_action` directly and
+    never invokes the `issue-reviewer` child agent at all. This function
+    remains for legacy CLI (`classify-child-stdout`), diagnostic, and
+    regression-test use as the strict 11-line V2 wire grammar compatibility
+    boundary (AC3).
+
+    Classify the child `issue-reviewer` agent's raw stdout text via the
     SAME canonical validator (`validate_review_compact_output.validate_review_compact_output()`)
-    the orchestrator's Step 2 routing table uses -- NOT a separately
+    this legacy classifier uses -- NOT a separately
     reimplemented simplified classifier (PR #2135 human REQUEST_CHANGES
     iteration-3 P0-2 closes the prior bug: any non-empty stdout, even
     malformed JSON, was unconditionally treated as "ok").
@@ -617,7 +650,16 @@ def retry_once_on_transport_failure(
     total_deadline_seconds: float | None = None,
     per_attempt_deadline_seconds: float | None = None,
 ):
-    """Call `invoke_child()` (returns raw stdout text); if the FIRST call is
+    """LEGACY / diagnostic-only (Issue #2380): canonical Step 2 routing does
+    NOT call this function. The orchestrator-level "retry the child agent
+    invocation once" semantics this function implements applied only to the
+    now-removed issue-reviewer relay path; the deterministic checker
+    transport `reviewer_transport.run_reviewer_transport()` spawns from
+    `produce` already performs its OWN bounded retry (unchanged, AC5) before
+    `produce` ever returns. Retained for legacy CLI / diagnostic /
+    regression-test use.
+
+    Call `invoke_child()` (returns raw stdout text); if the FIRST call is
     classified `reviewer_transport_failure` (empty OR malformed, via the
     canonical validator -- see `classify_child_stdout`), retry
     `invoke_child()` exactly once. If the retry is ALSO
@@ -1144,6 +1186,73 @@ def run_checker_pipeline_once(
         return merged, None, None
     finally:
         shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+
+# ---------------------------------------------------------------------------
+# Canonical Step 2 routing (Issue #2380 P0-2, OWNER PR #2386 review):
+# `(status, verdict, next_action)` triple routing, NOT `verdict` alone.
+# ---------------------------------------------------------------------------
+
+STEP_4_5 = "step_4_5"
+STEP_4 = "step_4"
+STEP_5_HUMAN_JUDGMENT_REQUIRED = "step_5_human_judgment_required"
+FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE = "fail_closed_environment_or_integrity_failure"
+
+
+def route_canonical_step2_result(result: dict[str, Any]) -> str:
+    """Canonical Step 2's SOLE routing decision function (Issue #2380 P0-2).
+
+    A prior implementation iteration keyed routing off `compact_result.verdict`
+    alone (`approve` -> Step 4.5, `needs-fix` -> Step 4), silently ignoring
+    `compact_result.next_action`. That is a functional bug: the existing
+    compact schema (see `review-issue/SKILL.md` "Producer I/O ownership" /
+    Step 2.5 doc) allows a valid `verdict: needs-fix` +
+    `next_action: human_judgment_required` combination (e.g. when the
+    readiness checker's own `failure_class` is
+    `contract_readiness_human_judgment` -- environment/timeout/unknown
+    classification, NOT a body-rewrite-fixable contract defect). Routing that
+    combination into the ordinary rewrite loop (Step 4) as if it were a plain
+    `needs-fix` misclassifies an unresolvable environment condition as a
+    fixable contract defect.
+
+    This function evaluates the FULL `(status, verdict, next_action)` triple
+    -- exactly the four outcomes the Issue #2380 fix_delta specifies -- and is
+    intentionally pure (no I/O, no SubAgent/CLI invocation of any kind): it
+    only inspects the dict `result` (typically `_cmd_produce()`'s own parsed
+    JSON output, but any dict with the same shape works, which is what makes
+    it independently unit-testable):
+
+        status == ok + verdict == approve   + next_action == proceed
+            -> Step 4.5 (`STEP_4_5`)
+        status == ok + verdict == needs-fix + next_action == request_changes
+            -> Step 4 (`STEP_4`)
+        status == ok + next_action == human_judgment_required (verdict-agnostic,
+            per the schema note above)
+            -> Step 5 (`STEP_5_HUMAN_JUDGMENT_REQUIRED`)
+        anything else (including `status != ok`, i.e. `produce` itself
+        returned `input_or_runtime_error`) -> a fail-closed stop, distinct
+        from the ordinary human-judgment escalation above, because it
+        indicates an inconsistent/unrecognized `(status, verdict,
+        next_action)` combination rather than a documented terminal state
+            -> `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`
+
+    This function does not call `classify_child_stdout()`,
+    `retry_once_on_transport_failure()`, or invoke the `issue-reviewer` agent
+    -- it has no side effects at all.
+    """
+    status = result.get("status")
+    compact_result = result.get("compact_result") or {}
+    verdict = compact_result.get("verdict")
+    next_action = compact_result.get("next_action")
+
+    if status == "ok" and verdict == "approve" and next_action == "proceed":
+        return STEP_4_5
+    if status == "ok" and verdict == "needs-fix" and next_action == "request_changes":
+        return STEP_4
+    if status == "ok" and next_action == "human_judgment_required":
+        return STEP_5_HUMAN_JUDGMENT_REQUIRED
+    return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
 
 
 def _cmd_run_checker_attempt(args: argparse.Namespace) -> int:
