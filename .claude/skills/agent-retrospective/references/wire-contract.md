@@ -161,3 +161,60 @@ digest 再計算 → `publication_digest` と比較（Markdown 生 bytes 比較�
   （初回のみではない）。
 - **P1-4**: `IssueCommentPreviousStateProvider`'s age-based staleness はデフォルト無効
   （`stale_after_seconds=None`）。opt-in で `STALE_AFTER_SECONDS_LEGACY_DEFAULT`（7日）を指定可能。
+
+## latitude_runtime_evidence/v1（Latitude CLI ランタイム証跡、Issue #2375）
+
+`agent-retrospective` の Latitude CLI 収集専用の、独立した公開可能出力契約。上記の
+`SOURCE_PLAN_V1`/`OBSERVER_RESULT_V1` 等の ephemeral wire contract とは別物であり、
+`agent_retrospective_run/v1`（`schemas/agent_retrospective_run_v1.schema.json`、この Issue の
+Allowed Paths 外・未変更）の `source_observations[]` にも追加されない。
+
+```yaml
+schema_version: latitude_runtime_evidence/v1
+availability: available | unavailable | error
+collected_at: RFC3339 UTC timestamp
+collector_version: non-empty string
+evidence_identity: sha256:<64 hex> | null   # available のときのみ非 null
+evidence_ref: opaque non-secret string | null  # available のときのみ非 null
+metrics:
+  trace_count: integer | null
+  span_count: integer | null
+  duration_ms: integer | null
+reason_code: closed enum string | null      # unavailable/error のときのみ非 null
+```
+
+- 検証は `validate_retrospective_schema.validate_latitude_runtime_evidence()`（JSON Schema による
+  closed key set/availability 別 nullability/closed reason_code enum、および
+  `evidence_ref`/`evidence_identity` の再計算による mismatch fail-closed）。
+- 収集は `collect_snapshot.collect_latitude_runtime_evidence()`（`build_latitude_allowed_argv()`
+  が組み立てる `latitude traces list --project-slug <slug> --filters <JSON> --limit <n> --format
+  json` の argv-only 起動、`LATITUDE_TIMEOUT_SECONDS`＝10秒、`LATITUDE_MAX_OUTPUT_BYTES`＝64 KiB、
+  allowlisted metric は `trace_count`/`span_count`/`duration_ms` の 3 個のみ）。実 CLI（v7.10.0）
+  の応答は `{items: [...], nextCursor, hasMore}` 形状であり、`items[0].spanCount`/
+  `items[0].durationNs`（ナノ秒、`duration_ms` へは floor 除算で変換）から allowlisted metric を
+  射影する。`project_slug` は `LATITUDE_PROJECT` 環境変数からのみ解決し、ハードコードしない。詳細な
+  CLI Boundary/Collection Budget は `execution-budget.md` を参照。
+- **Session Correlation（PR #2392 fix_delta）**: 収集は「直近の trace を無条件に取得する」ヒューリ
+  スティックを使わない。`run_retrospective._resolve_latitude_target_session_id()` が既存の
+  hook-sink 収集経路（`collect_snapshot.collect_claude_gpt_source()` が生成する
+  `private_evidence.provenance.complete_sessions`）から対象 Claude Code `session_id` を解決し、
+  `--filters '{"sessionId":[{"op":"eq","value":"<session_id>"}]}'`（実 API で live 検証済みの
+  correct な operator 形状。`{"eq": ...}` は 400 で reject される）で相関する。`session_id` が
+  解決できない場合は CLI を起動せず `availability: unavailable` / `reason_code:
+  session_id_unresolved` に縮退する。相関クエリが 0 件を返した場合も `unavailable` /
+  `reason_code: no_matching_trace`（`error` ではない）に縮退し、他の run の trace を誤って
+  bind することはない。
+- `evidence_ref`/`evidence_identity` はいずれも `collector_version`/`metrics`/`collected_at` のみ
+  から決定論的に導出される（raw trace ID、raw payload、local absolute path を digest input に
+  含めない）。
+- deterministic enrichment（`run_retrospective.bind_latitude_evidence_to_candidates()`）は
+  `availability == "available"` の evidence だけを、`finding_contract.claim_class ==
+  "runtime_behavior"` の candidate の直近 evaluation へ、`agent_improvement_candidate_v1.schema.json`
+  （この Issue の Allowed Paths 外・未変更）が既に持つ `evidence_ref` の `runtime_receipt`/
+  `runtime` ref_type/source_id ペアを使って `evidence_refs[]` に追加するだけであり、
+  `observed`/`presence_delta`/`evaluation_status`/`source_coverage`/`claim_class`/signal を一切
+  変更しない。unavailable/error/invalid/duplicate evidence は候補を変更しない（duplicate・
+  identity mismatch・unknown schema_version は fail closed）。
+- Latitude を public `source_kind` にはしない（既存 `scripts/agent-logs/lib/
+  observation-source-adapter.mjs` の `latitude_otlp` 入力/出力境界、#1223 を変更しない。この
+  Issue の新規コードは `latitude_otlp` 文字列も `source_kind` フィールドも一切含まない）。

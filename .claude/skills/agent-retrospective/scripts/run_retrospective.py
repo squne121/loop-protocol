@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import dataclasses
 import hashlib
 import json
@@ -2505,6 +2506,26 @@ def execute_run(
         clock=clock,
     )
     delta_results = compute_delta(previous_state, evaluation.candidate_records)
+
+    # Issue #2375 PR #2392 fix_delta: wires `collect_latitude_runtime_evidence_once()`/
+    # `bind_latitude_evidence_to_candidates()` into the actual `execute_run()` call graph --
+    # previously both were defined but had zero call sites outside their own definitions/tests
+    # (PR #2392 human review blocker). Placed after `compute_delta()` (mirroring how delta
+    # computation itself is wired in immediately before `finalize()`) so binding sees the final
+    # `evaluation.candidate_records` the same way `finalize()` will persist them. Collection
+    # Budget: exactly one `collect_latitude_runtime_evidence_once()` call per run, unconditionally
+    # (the child collector itself declines to launch the CLI -- `session_id_unresolved`/
+    # `project_slug_unresolved` -- when no target session_id/project slug is resolvable, so this
+    # is never a second CLI launch). Failure/unavailability never blocks or fails the
+    # retrospective (fail-open): `bind_latitude_evidence_to_candidates()` leaves every candidate
+    # byte-for-byte unchanged whenever `latitude_evidence["availability"] != "available"`.
+    latitude_session_id = _resolve_latitude_target_session_id(results)
+    latitude_evidence = collect_latitude_runtime_evidence_once(session_id=latitude_session_id)
+    bound_candidate_records = bind_latitude_evidence_to_candidates(
+        evaluation.candidate_records, latitude_evidence
+    )
+    evaluation = dataclasses.replace(evaluation, candidate_records=bound_candidate_records)
+
     return finalize(
         ctx,
         plan,
@@ -3607,6 +3628,188 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(publish_request.to_wire())
     return 0
+
+
+
+# ---------------------------------------------------------------------------
+# Latitude runtime evidence deterministic enrichment (Issue #2375)
+# ---------------------------------------------------------------------------
+#
+# Binds a single validated `latitude_runtime_evidence/v1` instance (Child collector:
+# `collect_snapshot.collect_latitude_runtime_evidence`) onto `agent_improvement_candidate/v1`
+# candidates' `finding_contract.evaluations[].evidence_refs[]` -- WITHOUT touching
+# `agent_improvement_candidate_v1.schema.json` (outside this Issue's Allowed Paths): the existing
+# schema's `runtime_receipt`/`runtime` `ref_type`/`source_id` pair already accepts exactly this
+# shape (`resource_identity` has no extra pattern constraint for `runtime_receipt`, and
+# `projection_digest` only requires the `sha256:<64 hex>` shape that
+# `compute_latitude_evidence_identity` already produces), so no schema change is required.
+#
+# Binding Rules (Issue #2375) enforced here:
+#   - only `availability == "available"` evidence is ever bound (`None`/`unavailable`/`error`
+#     evidence leaves every candidate unchanged -- Latitude being absent/unavailable never halts
+#     or alters the retrospective by itself);
+#   - only `finding_contract.claim_class == "runtime_behavior"` candidates are eligible (Latitude
+#     runtime evidence substantiates runtime-behavior claims, not code-content/review/mergeability
+#     claims);
+#   - binding NEVER changes `observed`/`presence_delta`/`evaluation_status`/`source_coverage`/
+#     `claim_class`/any signal field -- it only appends one `evidence_refs[]` entry to the current
+#     (last) evaluation, so evidence presence/absence can never by itself upgrade a finding to a
+#     positive claim/status/confidence (AC3);
+#   - an unknown `schema_version`, a schema/format violation, or an identity mismatch on the
+#     supplied evidence all fail closed (`RetrospectiveSchemaError`, propagated from
+#     `validate_retrospective_schema.validate_latitude_runtime_evidence`) rather than being
+#     silently treated as absent evidence;
+#   - the same `evidence_identity` is never bound twice onto the same evaluation within one call
+#     (Collection Budget: at most 1 evidence per retrospective run) -- fail closed
+#     (`RetrospectiveSchemaError`) rather than silently de-duplicating.
+
+LATITUDE_RUNTIME_EVIDENCE_REF_TYPE = "runtime_receipt"
+LATITUDE_RUNTIME_EVIDENCE_SOURCE_ID = "runtime"
+LATITUDE_ELIGIBLE_CLAIM_CLASS = "runtime_behavior"
+
+
+def collect_latitude_runtime_evidence_once(**collector_kwargs: Any) -> dict[str, Any]:
+    """Thin delegating wrapper around Child 3's
+    ``collect_snapshot.collect_latitude_runtime_evidence`` (Issue #2375 AC2: at most one Latitude
+    CLI launch per retrospective run). Callers MUST call this at most once per run and reuse the
+    single returned evidence dict for every ``bind_latitude_evidence_to_candidates`` call in that
+    run -- this wrapper has no internal retry/loop, so a caller that (incorrectly) calls it more
+    than once per run would itself violate the Collection Budget, not this function.
+
+    ``**collector_kwargs`` (``which``/``runner``/``clock``/``identity_computer``/``session_id``/
+    ``project_slug``/``project_slug_resolver``/``limit``) are forwarded verbatim to
+    ``collect_latitude_runtime_evidence`` -- this lets tests inject a fake CLI runner through THIS
+    wrapper directly, rather than needing to monkeypatch the ``_collect_snapshot_module()``-loaded
+    module object (which, like every ``_load_module_from_path`` sibling load in this file, is
+    re-exec'd fresh on every call and therefore not a stable monkeypatch target across two separate
+    calls). PR #2392 fix_delta: ``session_id`` is the caller-resolved target Claude Code
+    ``session_id`` (see ``_resolve_latitude_target_session_id``) -- when omitted/``None``, the
+    child collector itself returns ``unavailable``/``session_id_unresolved`` without launching the
+    CLI (never a query without a session filter)."""
+    return _collect_snapshot_module().collect_latitude_runtime_evidence(**collector_kwargs)
+
+
+def _resolve_latitude_target_session_id(
+    results: Sequence[Any], *, source_id: str = "claude_gpt"
+) -> str | None:
+    """Resolves the target Claude Code ``session_id`` for Latitude trace correlation from the
+    EXISTING hook-sink-derived ``complete_sessions`` provenance the ``claude_gpt`` collector
+    (``collect_snapshot.collect_claude_gpt_source``) already produces (Issue #2375 PR #2392
+    fix_delta -- Session Correlation, not "latest trace"). This function does NOT invent a new
+    session-recording mechanism; it reuses
+    ``CollectorResult.private_evidence["provenance"]["complete_sessions"]`` -- a sorted list of
+    ``session_id`` strings this run's nonce observed as both ``UserPromptSubmit`` and ``Stop``
+    (see ``collect_snapshot.collect_claude_gpt_source``'s ``complete_sessions`` computation).
+
+    ``results`` is the list ``prepare()`` returns (each a Child 3 ``CollectorResult``) -- the SAME
+    list ``execute_run()`` already threads through to ``build_source_digest_registry``/
+    ``finalize(source_observations=...)``, so this reuses data already computed for this run
+    rather than re-collecting anything.
+
+    Deterministic tie-break when more than one session completed within the same retrospective
+    run: the (already sorted) first entry is used, so ``collect_latitude_runtime_evidence_once()``
+    is still called with exactly one session_id candidate and the Collection Budget's "at most 1
+    CLI launch per run" is honored.
+
+    Returns ``None`` (session unresolved) when no ``claude_gpt`` collector result is present in
+    ``results`` or it reports no complete sessions -- callers MUST treat this as "skip Latitude
+    collection entirely for this run", never as "query without a session filter"."""
+    for result in results:
+        observation = getattr(result, "observation", {}) or {}
+        if observation.get("source_id") != source_id:
+            continue
+        private_evidence = getattr(result, "private_evidence", {}) or {}
+        provenance = private_evidence.get("provenance", {}) or {}
+        complete_sessions = provenance.get("complete_sessions") or []
+        if complete_sessions:
+            return complete_sessions[0]
+    return None
+
+
+def bind_latitude_evidence_to_candidates(
+    candidates: Sequence[dict[str, Any]],
+    latitude_evidence: dict[str, Any] | None,
+    *,
+    validator_module: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Deterministically bind ``latitude_evidence``'s allowlisted metrics + opaque
+    ``evidence_ref``/``evidence_identity`` onto every ``runtime_behavior``-claim-class candidate's
+    current (last) ``finding_contract`` evaluation, per the Binding Rules in the module docstring
+    above.
+
+    Pure / non-mutating: returns a deep copy of ``candidates`` in every case; neither ``candidates``
+    nor ``latitude_evidence`` (nor any of their nested dicts) is ever mutated in place. When
+    ``latitude_evidence`` is ``None`` or its ``availability`` is not ``"available"``, the deep copy
+    is returned completely unchanged (Latitude absence/unavailability never alters or blocks the
+    retrospective).
+
+    Raises ``RetrospectiveSchemaError`` (imported from ``validate_retrospective_schema.py``, fail
+    closed, never silently swallowed) when:
+
+    - ``latitude_evidence["schema_version"]`` is not exactly ``"latitude_runtime_evidence/v1"``
+      (unknown schema version);
+    - ``latitude_evidence`` fails schema validation or its declared ``evidence_ref``/
+      ``evidence_identity`` do not match the values recomputed from its own
+      ``collector_version``/``metrics``/``collected_at`` (identity mismatch) -- see
+      ``validate_retrospective_schema.validate_latitude_runtime_evidence``;
+    - the same ``evidence_identity`` would be bound twice onto the same evaluation's
+      ``evidence_refs[]`` (duplicate evidence within a single retrospective run).
+    """
+    result = copy.deepcopy(list(candidates))
+    if latitude_evidence is None:
+        return result
+
+    # ``validator_module`` is injectable (defaults to a fresh
+    # ``_validate_retrospective_schema_module()`` load) SOLELY because
+    # ``_load_module_from_path`` (see module docstring's sibling-loading section) re-execs the
+    # target file on every call, producing a structurally-identical but IDENTITY-DISTINCT
+    # ``RetrospectiveSchemaError`` class each time -- a caller (e.g. a test) that wants
+    # ``pytest.raises(validator_mod.RetrospectiveSchemaError)`` to actually match must supply the
+    # exact module instance it will assert against, rather than relying on two independent fresh
+    # loads coincidentally producing "the same" exception type (they never do; see
+    # ``test_latitude_evidence_binding_duplicate_within_run_fails_closed`` and neighbors in
+    # ``test_run_retrospective.py`` for the concrete failure mode this avoids).
+    validator_mod = validator_module if validator_module is not None else _validate_retrospective_schema_module()
+    schema_version = latitude_evidence.get("schema_version")
+    if schema_version != "latitude_runtime_evidence/v1":
+        raise validator_mod.RetrospectiveSchemaError(
+            "bind_latitude_evidence_to_candidates: unknown latitude_evidence schema_version="
+            f"{schema_version!r}; expected 'latitude_runtime_evidence/v1'."
+        )
+    validator_mod.validate_latitude_runtime_evidence(latitude_evidence)
+
+    if latitude_evidence["availability"] != "available":
+        return result
+
+    evidence_ref_entry = {
+        "ref_type": LATITUDE_RUNTIME_EVIDENCE_REF_TYPE,
+        "source_id": LATITUDE_RUNTIME_EVIDENCE_SOURCE_ID,
+        "resource_identity": latitude_evidence["evidence_ref"],
+        "projection_digest": latitude_evidence["evidence_identity"],
+    }
+
+    for candidate in result:
+        finding_contract = candidate.get("finding_contract")
+        if not finding_contract or finding_contract.get("claim_class") != LATITUDE_ELIGIBLE_CLAIM_CLASS:
+            continue
+        evaluations = finding_contract.get("evaluations") or []
+        if not evaluations:
+            continue
+        current_evaluation = evaluations[-1]
+        existing_digests = {
+            ref.get("projection_digest")
+            for ref in current_evaluation.get("evidence_refs", [])
+            if ref.get("ref_type") == LATITUDE_RUNTIME_EVIDENCE_REF_TYPE
+        }
+        if evidence_ref_entry["projection_digest"] in existing_digests:
+            raise validator_mod.RetrospectiveSchemaError(
+                "bind_latitude_evidence_to_candidates: duplicate latitude evidence_identity="
+                f"{evidence_ref_entry['projection_digest']!r} already bound to this evaluation "
+                "within the same retrospective run (Collection Budget: at most 1 evidence per run)."
+            )
+        current_evaluation.setdefault("evidence_refs", []).append(evidence_ref_entry)
+
+    return result
 
 
 if __name__ == "__main__":
