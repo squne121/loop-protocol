@@ -140,9 +140,9 @@ SKILL.md Step 2 (orchestrator), which consumes `compact_result.verdict` /
 #2380) -- the `issue-reviewer` agent is NOT a canonical Step 2 consumer of
 this schema; it remains a legacy CLI / diagnostic / regression-test-only
 reader of `compact_result.stdout_lines` when invoked outside canonical
-routing. No other skill/orchestrator step depends on this schema. If Issue #2049's AC7/AC10 wording itself needs to change to fold
-this back into #1875's stale-tolerant minimal-harness model, that is a
-separate Issue-contract decision, not one this PR makes unilaterally.
+routing. No other skill/orchestrator step depends on this schema. If Issue #2049's AC7/AC10 wording itself needs to
+change to fold this back into #1875's stale-tolerant minimal-harness model, that is a separate Issue-contract
+decision, not one this PR makes unilaterally.
 
 Exit codes: 0 = ok, 1 = producer/validation error, 2 = input/environment
 error, 3 = human_judgment_required.
