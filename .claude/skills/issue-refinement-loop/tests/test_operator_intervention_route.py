@@ -157,7 +157,7 @@ def _run_real_produce(tmp_path: Path, monkeypatch, *, body: str, issue_number: i
 # ---------------------------------------------------------------------------
 
 
-def test_route_canonical_step2_result_needs_fix_request_changes_with_contract_readiness_human_judgment_routes_to_operator_intervention():
+def test_route_canonical_step2_result_needs_fix_request_changes_with_contract_readiness_human_judgment_routes_to_operator_intervention():  # noqa: E501
     result = {
         "status": "ok",
         "compact_result": {"verdict": "needs-fix", "next_action": "request_changes"},
@@ -171,7 +171,7 @@ def test_route_canonical_step2_result_needs_fix_request_changes_with_contract_re
     assert _PIPELINE.STEP_5_OPERATOR_INTERVENTION_REQUIRED != _PIPELINE.STEP_4
 
 
-def test_given_real_produce_needs_fix_body_with_contract_readiness_human_judgment_when_run_then_routes_to_operator_intervention(
+def test_given_real_produce_needs_fix_body_with_contract_readiness_human_judgment_when_run_then_routes_to_operator_intervention(  # noqa: E501
     tmp_path: Path, monkeypatch
 ):
     out = _run_real_produce(
