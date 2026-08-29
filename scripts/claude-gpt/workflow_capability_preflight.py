@@ -227,9 +227,30 @@ def _run_env_only_preflight(deadline_ns: int | None = None) -> ProbeOutcome | di
         parsed = json.loads(outcome.stdout)
     except (json.JSONDecodeError, ValueError):
         return {} if compatibility_mode else ProbeOutcome(PROBE_MALFORMED_OUTPUT)
-    if not isinstance(parsed, dict):
+    if not _validate_spark_env_payload(parsed):
         return {} if compatibility_mode else ProbeOutcome(PROBE_MALFORMED_OUTPUT)
     return parsed if compatibility_mode else outcome
+
+
+def _validate_spark_env_payload(parsed: object) -> bool:
+    """Validate only the Spark JSON fields `_spark_capability()` consumes
+    (Issue #2401 AC3): `binary_available: bool`, `chatgpt_auth: object`,
+    `chatgpt_auth.available: bool`. Any other malformed/invalid shape
+    (non-dict top level, non-bool `binary_available`, missing/non-dict
+    `chatgpt_auth`, non-bool `chatgpt_auth.available`) is rejected here so
+    the caller can normalize it into the existing structured
+    malformed-output reason instead of risking an uncaught exception later
+    (e.g. `.get()` on a non-dict `chatgpt_auth` value)."""
+    if not isinstance(parsed, dict):
+        return False
+    if not isinstance(parsed.get("binary_available"), bool):
+        return False
+    chatgpt_auth = parsed.get("chatgpt_auth")
+    if not isinstance(chatgpt_auth, dict):
+        return False
+    if not isinstance(chatgpt_auth.get("available"), bool):
+        return False
+    return True
 
 
 def _spark_capability(
@@ -503,37 +524,12 @@ def assess(
             "provisioned uv; see docs/dev/claude-gpt-runtime-prerequisites.md"
         )
 
-    if spark_mode is None:
-        spark_status = SPARK_NOT_REQUIRED
-    else:
-        spark_outcome = _run_env_only_preflight(deadline_ns)
-        if spark_outcome.kind == PROBE_COMPLETED:
-            try:
-                env_only_result = json.loads(spark_outcome.stdout)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                spark_outcome = ProbeOutcome(PROBE_MALFORMED_OUTPUT)
-                env_only_result = {}
-            else:
-                if not isinstance(env_only_result, dict):
-                    spark_outcome = ProbeOutcome(PROBE_MALFORMED_OUTPUT)
-                    env_only_result = {}
-        else:
-            env_only_result = {}
-        _append_probe_reason(reasons, "spark_env_only", spark_outcome)
-        spark_status = _spark_capability(spark_mode, spark_fallback, env_only_result)
-    if spark_status == SPARK_UNAVAILABLE:
-        reasons.append(
-            "spark:unavailable: required Spark delegation route has no known-available "
-            "binary/auth and fallback is forbidden by the directive; do not launch the "
-            "SubAgent until the Spark route (claude-code-proxy binary + ChatGPT "
-            "subscription auth) is available, or relax the directive to preferred/allowed"
-        )
-    elif spark_status == SPARK_FALLBACK_ONLY:
-        reasons.append(
-            "spark:fallback_only: Spark route is not currently available; the directive "
-            "permits fallback so the workflow may proceed in degraded mode"
-        )
-
+    # Issue #2401 AC1: the required GitHub probes (`github_auth`, then
+    # `github_repo_read` only when `github_auth` completed) and the
+    # `controlled_github_read` probe (run independently of the root
+    # `github_auth`/`github_repo_read` outcome) all run BEFORE the optional
+    # `spark_env_only` probe below, so a slow/starved optional probe can
+    # never consume the shared deadline budget a required probe needs.
     github_auth_outcome = _github_auth_probe(deadline_ns)
     _append_probe_reason(reasons, "github_auth", github_auth_outcome)
     github_auth = github_auth_outcome.kind == PROBE_COMPLETED
@@ -553,6 +549,17 @@ def assess(
             "access for the authenticated account"
         )
 
+    controlled_outcome = _controlled_github_read_probe(repo, deadline_ns)
+    _append_probe_reason(reasons, "controlled_github_read", controlled_outcome)
+    controlled_github_read = _controlled_github_read_from_outcome(controlled_outcome)
+    controlled_github_unavailable = controlled_github_read["status"] == ACTOR_CAPABILITY_UNAVAILABLE
+    if controlled_github_unavailable:
+        reasons.append(
+            "controlled_github_unavailable: the consumer-equivalent read-only GitHub probe "
+            "(same sanitized env / trusted host the issue-editor / contract-update lane uses) "
+            "failed; do not start those actors until this is resolved"
+        )
+
     operations: dict[str, dict] = {}
     missing_mutation_route = False
     for entry in planned_operations:
@@ -566,22 +573,50 @@ def assess(
                 f"{entry.get('actor_role', 'unknown')}; do not start this mutation-requiring phase"
             )
 
-    controlled_outcome = _controlled_github_read_probe(repo, deadline_ns)
-    _append_probe_reason(reasons, "controlled_github_read", controlled_outcome)
-    controlled_github_read = _controlled_github_read_from_outcome(controlled_outcome)
+    # Optional Spark probe LAST (Issue #2401 AC1/AC2): it must never starve
+    # a required probe's share of the shared deadline. When the required
+    # probes above already consumed the deadline, this probe legitimately
+    # degrades (no spawn once exhausted -- see `_run_probe_with_deadline`)
+    # rather than blocking the required GitHub capability it did not affect.
+    if spark_mode is None:
+        spark_status = SPARK_NOT_REQUIRED
+    else:
+        spark_outcome = _run_env_only_preflight(deadline_ns)
+        if spark_outcome.kind == PROBE_COMPLETED:
+            try:
+                parsed_spark_payload = json.loads(spark_outcome.stdout)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                spark_outcome = ProbeOutcome(PROBE_MALFORMED_OUTPUT)
+                env_only_result = {}
+            else:
+                if _validate_spark_env_payload(parsed_spark_payload):
+                    env_only_result = parsed_spark_payload
+                else:
+                    spark_outcome = ProbeOutcome(PROBE_MALFORMED_OUTPUT)
+                    env_only_result = {}
+        else:
+            env_only_result = {}
+        _append_probe_reason(reasons, "spark_env_only", spark_outcome)
+        spark_status = _spark_capability(spark_mode, spark_fallback, env_only_result)
+    if spark_status == SPARK_UNAVAILABLE:
+        reasons.append(
+            "spark:unavailable: required Spark delegation route has no known-available "
+            "binary/auth and fallback is forbidden by the directive; do not launch the "
+            "SubAgent until the Spark route (claude-code-proxy binary + ChatGPT "
+            "subscription auth) is available, or relax the directive to preferred/allowed"
+        )
+    elif spark_status == SPARK_FALLBACK_ONLY:
+        reasons.append(
+            "spark:fallback_only: Spark route is not currently available; the directive "
+            "permits fallback so the workflow may proceed in degraded mode"
+        )
+
     actor_capabilities = {
         "root_github_read": _root_github_read_capability(github_auth, github_repo_read),
         "controlled_github_read": controlled_github_read,
         "delegated_research_agy": _delegated_research_agy_capability(),
         "spark_delegation": _spark_delegation_capability(spark_status),
     }
-    controlled_github_unavailable = controlled_github_read["status"] == ACTOR_CAPABILITY_UNAVAILABLE
-    if controlled_github_unavailable:
-        reasons.append(
-            "controlled_github_unavailable: the consumer-equivalent read-only GitHub probe "
-            "(same sanitized env / trusted host the issue-editor / contract-update lane uses) "
-            "failed; do not start those actors until this is resolved"
-        )
 
     if missing_mutation_route or not github_auth or not github_repo_read or controlled_github_unavailable:
         decision = DECISION_BLOCKED
