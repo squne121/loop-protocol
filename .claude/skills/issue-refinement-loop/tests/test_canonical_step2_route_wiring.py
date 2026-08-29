@@ -28,14 +28,6 @@ Verifies:
   / `int` / `None`) never raises `AttributeError` and instead routes to
   `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE` (OWNER PR #2391 review
   P1-1).
-
-Issue #2397 note: this module exercises `route_canonical_step2_result()`
-directly against hand-built `compact_result` dicts, so it is unaffected by
-`reviewer_transport.build_compact_v2()` gaining an optional `failure_class`
-parameter (that producer-reachability fix lives in
-`test_review_compact_v2_human_judgment.py`); it is re-run here only to
-confirm the `STEP_5_HUMAN_JUDGMENT_REQUIRED` routing decision itself still
-holds unchanged now that a real producer can reach it.
 """
 
 from __future__ import annotations

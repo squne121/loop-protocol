@@ -186,17 +186,6 @@ REAP_CONFIRM_INTERVAL_SECONDS = 0.2
 _SHA = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ATTEMPT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
-# Issue #2397 (follow-up to PR #2391 owner P0-1
-# https://github.com/squne121/loop-protocol/pull/2391#issuecomment-5461056774):
-# the sole `failure_class` value that switches `build_compact_v2()`'s
-# `next_action` derivation away from the plain approve/needs-fix two-way
-# choice. This mirrors `review-issue/SKILL.md`'s
-# `REVIEW_ISSUE_RESULT_V1.failure_class` contract (set only when the
-# readiness checker itself reports `status: human_judgment` -- an
-# environment/timeout/unknown classification, not a body-rewrite-fixable
-# contract defect).
-FAILURE_CLASS_CONTRACT_READINESS_HUMAN_JUDGMENT = "contract_readiness_human_judgment"
-
 V2_FIELDS = (
     "SCHEMA",
     "STATUS",
@@ -576,27 +565,7 @@ def build_compact_v2(
     artifact_relative: str,
     artifact_sha256: str,
     must_read: str = "",
-    failure_class: str | None = None,
 ) -> bytes:
-    """Build the V2 compact wire.
-
-    Issue #2397 (follow-up to PR #2391 owner P0-1): ``failure_class`` is an
-    OPTIONAL, additive parameter that lets a caller thread
-    ``merged_review_result.failure_class`` (see
-    ``review-issue/SKILL.md``'s Producer I/O ownership section) through to
-    the ``NEXT_ACTION`` field. When ``failure_class ==
-    FAILURE_CLASS_CONTRACT_READINESS_HUMAN_JUDGMENT`` AND ``verdict ==
-    "needs-fix"``, ``NEXT_ACTION`` is set to ``human_judgment_required``
-    instead of ``request_changes`` -- the readiness checker's own
-    `status: human_judgment` classification (environment/timeout/unknown)
-    is not a body-rewrite-fixable contract defect, so it must not be routed
-    into the ordinary rewrite loop. Any other ``failure_class`` value
-    (including the default ``None``), or a ``failure_class`` combined with
-    ``verdict == "approve"`` (a combination that never legitimately occurs
-    -- an approved contract has no readiness `human_judgment` failure to
-    report), leaves the existing ``proceed`` / ``request_changes`` two-way
-    derivation completely unchanged (AC2).
-    """
     if (
         verdict not in {"approve", "needs-fix"}
         or blockers < 0
@@ -605,12 +574,9 @@ def build_compact_v2(
         or not _SHA.match(artifact_sha256)
     ):
         raise ValueError("invalid_compact_v2_values")
+    action = "proceed" if verdict == "approve" else "request_changes"
     if (verdict == "approve" and blockers != 0) or (verdict == "needs-fix" and blockers == 0):
         raise ValueError("compact_v2_cross_field_invalid")
-    if verdict == "needs-fix" and failure_class == FAILURE_CLASS_CONTRACT_READINESS_HUMAN_JUDGMENT:
-        action = "human_judgment_required"
-    else:
-        action = "proceed" if verdict == "approve" else "request_changes"
     values = {
         "SCHEMA": SCHEMA_V2,
         "STATUS": "ok",
@@ -662,21 +628,12 @@ def validate_compact_v2(
             return result
         values[expected] = value
     artifact_prefix = "compact_review_result_v2="
-    if values["SCHEMA"] != SCHEMA_V2 or values["STATUS"] != "ok" or values["VERDICT"] not in {"approve", "needs-fix"}:
-        result["violations"].append({"code": "value_invalid"})
-        return result
-    # Issue #2397: `needs-fix` accepts either `request_changes` (the
-    # ordinary rewrite-loop routing) or `human_judgment_required` (the
-    # readiness checker's own `status: human_judgment` classification,
-    # threaded through by `build_compact_v2()`'s `failure_class` param).
-    # `approve` still accepts ONLY `proceed` -- a loose `next_action`-only
-    # match that also allowed `approve` + `human_judgment_required` would
-    # reintroduce the exact inconsistent-triple defect
-    # `route_canonical_step2_result()` (Issue #2389) fails closed against.
-    allowed_next_actions = (
-        {"proceed"} if values["VERDICT"] == "approve" else {"request_changes", "human_judgment_required"}
-    )
-    if values["NEXT_ACTION"] not in allowed_next_actions:
+    if (
+        values["SCHEMA"] != SCHEMA_V2
+        or values["STATUS"] != "ok"
+        or values["VERDICT"] not in {"approve", "needs-fix"}
+        or values["NEXT_ACTION"] != ("proceed" if values["VERDICT"] == "approve" else "request_changes")
+    ):
         result["violations"].append({"code": "value_invalid"})
         return result
     if (
