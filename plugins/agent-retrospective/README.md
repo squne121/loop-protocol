@@ -12,7 +12,7 @@ investigator`/`web-researcher` は Read/Grep/Glob・native WebSearch/WebFetch �
 
 ## 構成
 
-```
+```text
 plugins/agent-retrospective/
 ├── .claude-plugin/
 │   └── plugin.json          # plugin manifest（`.claude-plugin/` 配下にはこの manifest のみを置く）
