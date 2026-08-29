@@ -160,7 +160,7 @@ raw トリガー名自体も cause ではない）。summary 本文には常に�
 `TERMINATION_CAUSE: human_judgment_required` を stdout に出力する。orchestrator は
 この値を summary の termination cause として使用する。
 
-## `canonical_step2_route: step_5_operator_intervention_required` の termination payload（#2397）
+## `canonical_step2_route: step_5_operator_intervention_required` 発生時の termination payload 正規化（#2397）
 
 `run_root_review_pipeline.route_canonical_step2_result()` が
 `canonical_step2_route: step_5_operator_intervention_required` を返した場合
