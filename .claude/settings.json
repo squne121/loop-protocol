@@ -59,6 +59,7 @@
       "Read(**/.pypirc)",
       "Read(**/credentials)",
       "Read(**/settings.local.json)",
+      "Read(**/.claude/settings.local.json)",
       "Read(**/.ssh/**)",
       "Read(**/.config/gh/**)",
       "Edit(**/.ssh/**)",
