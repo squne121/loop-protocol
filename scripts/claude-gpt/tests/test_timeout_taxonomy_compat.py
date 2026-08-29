@@ -68,8 +68,9 @@ def test_update_branch_transport_error_reason_code_unrenamed():
     assert update_branch.REASON_TRANSPORT_ERROR == "transport_error"
 
 
-def test_no_new_competing_timeout_ownership_module_introduced():
-    forbidden_names = ("shared_deadline", "nested_timeout_manager", "timeout_ownership")
-    for name in forbidden_names:
-        assert not (_SCRIPTS_DIR / f"{name}.py").exists()
-        assert not (_GUARDS_DIR / f"{name}.py").exists()
+# Issue #2401 AC6: the filename-based blacklist test that used to live here
+# (asserting `shared_deadline.py` / `nested_timeout_manager.py` /
+# `timeout_ownership.py` do not exist under this package or the guards
+# package) is intentionally removed. Absence of a competing
+# timeout-ownership module is confirmed once during PR review instead of
+# enforced by a permanent filename blacklist test.
