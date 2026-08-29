@@ -47,6 +47,7 @@ Gemini CLI は operator により `disabled_by_operator` 状態にある。本 S
 
 **共通・任意フィールド**:
 - `agy_advisory_native_fallback_allowed`（任意、boolean。既定値: `false`〈未指定時は forbidden〉）: 呼び出し元が明示的に `true` を渡した場合に限り、AGY delegation wrapper failure 時の bounded native investigation（non-mutating investigation policy）フォールバックを許可する。詳細は「AGY advisory native fallback」節を参照。未指定または `false` の場合は既存どおり fail-close のみ（本節末尾「例外: 委譲不可時の fail-close」を参照）。
+- `authoritative_base_sha`（任意、string。40 文字 sha1 または 64 文字 sha256 の commit SHA。Issue #2374）: `agy_advisory_native_fallback_allowed: true` と同時に呼び出し元が渡す、呼び出し元の run が固定した権威ある `base_sha`。この値が渡されている場合、「AGY advisory native fallback」節の native investigation で収集する `evidence_refs`（`REPO_EVIDENCE_REF_V1`）の `commit_sha` は、この値と一致しなければならない（`git rev-parse HEAD` 等で解決した実際の commit と `authoritative_base_sha` を必ず突き合わせる）。一致しない場合は `status: ok` に昇格させず `status: inconclusive` とし、`failure_reason` に base_sha 不一致である旨を明記する（呼び出し元の `run_retrospective.py` 側でも独立に同じ不一致を fail-close するが、本 SubAgent 自身もこの検証を行う）。`authoritative_base_sha` が渡されていない場合、この節の base_sha 突き合わせ要求は適用されない（既存の他フィールドの検証・報告要件は変わらない）。
 
 ## 振る舞い
 
@@ -223,9 +224,9 @@ wrapper は `context_files` を 1 件以上必須とするため、context フ�
   - `status: ok`
   - `investigation_route`: 元々要求されていたモードに対応する値（`local_asset_research` または `github_research`）。fallback 経由であることは `discovery_summary` の prose で明記する。
   - `discovery_summary`: AGY delegation が `failure_class`（例: `agy_timeout`）で失敗したこと、`agy_advisory_native_fallback_allowed: true` の明示的許可により non-mutating investigation policy による native fallback（Read/Grep/Glob + bounded Bash）で調査を完了したことを明記した上で、発見事項を要約する。
-  - `evidence_refs`: `REPO_EVIDENCE_REF_V1` 形式のまま、native tool 呼び出しで直接確認したファイル・行範囲を記録する。`commit_sha`（`git rev-parse HEAD` 等の bounded Bash で解決）・`excerpt_sha256`（hash 計算コマンドで算出）・`verification_status` / `verification_method` を含む verification metadata を省略しない（Rule 2 参照）。
+  - `evidence_refs`: `REPO_EVIDENCE_REF_V1` 形式のまま、native tool 呼び出しで直接確認したファイル・行範囲を記録する。`commit_sha`（`git rev-parse HEAD` 等の bounded Bash で解決）・`excerpt_sha256`（hash 計算コマンドで算出）・`verification_status` / `verification_method` を含む verification metadata を省略しない（Rule 2 参照）。呼び出し元が `authoritative_base_sha`（Issue #2374）を渡している場合、この `commit_sha` は必ず `authoritative_base_sha`と一致しなければならない（一致しない evidence は `status: ok` の根拠に使えない -- 直下の inconclusive 分岐を参照）。
   - `failure_reason: null`（`status: ok` のため）
-- 十分な evidence が得られない場合は `status: inconclusive` とし、`failure_reason` に native fallback でも解決できなかった理由を記す。未検証事実を捏造して `status: ok` に昇格させてはならない（Evidence Handling Rule 参照）。
+- 十分な evidence が得られない場合、または `authoritative_base_sha` が渡されているのに `evidence_refs` の `commit_sha` がそれと一致しない場合（base_sha 束縛の破れ、Issue #2374）は `status: inconclusive` とし、`failure_reason` に native fallback でも解決できなかった理由（base_sha 不一致の場合はその旨）を記す。未検証事実を捏造して `status: ok` に昇格させてはならない（Evidence Handling Rule 参照）。
 
 ### MUST NOT（native fallback 使用時も変わらず禁止）
 

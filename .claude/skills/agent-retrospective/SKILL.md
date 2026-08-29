@@ -70,7 +70,19 @@ nonce）と `base_sha`（一度だけ解決、以降再解決しない）を固�
 
 - `retrospective-runtime-observer`（interpreter role。Claude Code/Claude-GPT session evidence の解釈専用）
 - `codebase-investigator`（既存 SubAgent の再利用。advisory role、base_sha 非束縛の調査は finding
-  authority にしない -- `finding_authority: advisory` タグが付与される）
+  authority にしない -- `finding_authority: advisory` タグが付与される）。substantive な
+  caller-supplied task（`--prompts-file` 経由）を持つ場合にのみ `agy_advisory_native_fallback_allowed:
+  true` と `authoritative_base_sha=ctx.base_sha` を明示的に配線し、この場合に限り `--json-schema` へ渡す
+  schema も `codebase_investigation_result_v1.schema.json`（native 契約自身の schema）へ切り替える
+  （default/no-task path、他の2 observer には配線せず、常に `observer_result_v1.schema.json` のまま --
+  Issue #2374、PR #2387 review fix_delta P0-1: 二方式を混在させず role_adapter の有無で決定論的に分岐）。
+  role adapter（`apply_codebase_investigator_role_adapter`）が AGY operational failure 後の native
+  fallback 結果（`CODEBASE_INVESTIGATION_RESULT_V1`）を実 `jsonschema.validate` で検証（native `status:
+  failed`/`inconclusive`、または `evidence_refs` の `commit_sha != ctx.base_sha` は typed failure とし
+  空 findings の成功へ変換しない）し、さらに各 `evidence_refs` エントリのバイト内容を
+  `git show <base_sha>:<path>` による独立再検証（`gemini-cli-headless-delegation` skill の
+  `validate_repo_evidence_ref` を再利用、read-only git コマンドのみ）で確認した上で
+  `EvidenceBundle`/`OBSERVER_RESULT_V1` へ正規化する。
 - `web-researcher`（既存 SubAgent の再利用。discovery role。`evidence_digest` が Web collector の
   再取得済み digest と一致しない場合は `UnboundEvidenceAuthority` で reject される）
 
