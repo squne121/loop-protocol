@@ -123,3 +123,90 @@ def test_evidence_ref_resource_identity_structure_by_ref_type():
 
     evidence_ref["resource_identity"] = "https://example.com/some/primary/source"
     vrs.validate_candidate(candidate)  # no error
+
+
+# ---------------------------------------------------------------------------
+# Issue #2375 AC4: latitude_runtime_evidence/v1 + its runtime_receipt/runtime evidence_ref
+# binding must never carry raw trace/prompt/message/tool I/O/stdout/stderr/authorization/
+# token/secret/absolute-path content.
+# ---------------------------------------------------------------------------
+
+_LATITUDE_COLLECTOR_VERSION = "latitude-collector/v1"
+_LATITUDE_COLLECTED_AT = "2026-08-29T00:00:00Z"
+_LATITUDE_METRICS = {"trace_count": 2, "span_count": 6, "duration_ms": 120}
+
+
+def _latitude_available_instance():
+    ref = vrs.compute_latitude_evidence_ref(
+        _LATITUDE_COLLECTOR_VERSION, dict(_LATITUDE_METRICS), _LATITUDE_COLLECTED_AT
+    )
+    identity = vrs.compute_latitude_evidence_identity(_LATITUDE_COLLECTOR_VERSION, ref, dict(_LATITUDE_METRICS))
+    return {
+        "schema_version": "latitude_runtime_evidence/v1",
+        "availability": "available",
+        "collected_at": _LATITUDE_COLLECTED_AT,
+        "collector_version": _LATITUDE_COLLECTOR_VERSION,
+        "evidence_identity": identity,
+        "evidence_ref": ref,
+        "metrics": dict(_LATITUDE_METRICS),
+        "reason_code": None,
+    }
+
+
+@pytest.mark.parametrize("raw_field", RAW_EVIDENCE_FIELD_NAMES)
+def test_latitude_runtime_evidence_rejects_raw_evidence_field(raw_field):
+    instance = _latitude_available_instance()
+    instance[raw_field] = "untrusted raw content that must never be schema-allowed"
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        vrs.validate_latitude_runtime_evidence(instance)
+
+
+def test_latitude_runtime_evidence_schema_has_no_raw_evidence_property():
+    schema = vrs.load_latitude_runtime_evidence_schema()
+    top_level_properties = set(schema["properties"].keys())
+    for raw_field in RAW_EVIDENCE_FIELD_NAMES:
+        assert raw_field not in top_level_properties
+
+
+def test_latitude_bound_evidence_ref_uses_existing_runtime_receipt_shape_and_validates():
+    """The latitude evidence_ref binding (Issue #2375 AC3) reuses the EXISTING
+    `runtime_receipt`/`runtime` ref_type/source_id pair -- no new evidence_ref shape/schema
+    change was required, and the result passes the SAME public-safety schema gate as every
+    other evidence_ref (`additionalProperties: false` field allowlist)."""
+    candidate = _base_candidate()
+    latitude_evidence = _latitude_available_instance()
+    candidate["finding_contract"]["evaluations"][0]["evidence_refs"].append(
+        {
+            "ref_type": "runtime_receipt",
+            "source_id": "runtime",
+            "resource_identity": latitude_evidence["evidence_ref"],
+            "projection_digest": latitude_evidence["evidence_identity"],
+        }
+    )
+    vrs.validate_candidate(candidate)  # no error
+
+
+@pytest.mark.parametrize("raw_field", RAW_EVIDENCE_FIELD_NAMES)
+def test_latitude_bound_evidence_ref_rejects_raw_evidence_field(raw_field):
+    candidate = _base_candidate()
+    latitude_evidence = _latitude_available_instance()
+    runtime_evidence_ref = {
+        "ref_type": "runtime_receipt",
+        "source_id": "runtime",
+        "resource_identity": latitude_evidence["evidence_ref"],
+        "projection_digest": latitude_evidence["evidence_identity"],
+        raw_field: "untrusted raw content that must never be schema-allowed",
+    }
+    candidate["finding_contract"]["evaluations"][0]["evidence_refs"].append(runtime_evidence_ref)
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        vrs.validate_candidate(candidate)
+
+
+def test_latitude_evidence_ref_and_identity_never_contain_absolute_path_shape():
+    """evidence_ref/evidence_identity are sha256 digests derived from allowlisted metrics only
+    (Binding Rules) -- they structurally cannot resemble a local absolute filesystem path."""
+    instance = _latitude_available_instance()
+    for value in (instance["evidence_ref"], instance["evidence_identity"]):
+        assert not value.startswith("/")
+        assert "/home/" not in value
+        assert "/Users/" not in value

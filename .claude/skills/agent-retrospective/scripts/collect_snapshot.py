@@ -80,7 +80,9 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import re
+import shutil
 import socket
 import ssl
 import subprocess
@@ -1379,3 +1381,384 @@ def collect_all_sources(collectors: Sequence[Callable[[], CollectorResult]]) -> 
     swallowed here.
     """
     return [collector() for collector in collectors]
+
+
+# ---------------------------------------------------------------------------
+# Latitude CLI runtime evidence collector (Issue #2375; PR #2392 fix_delta --
+# corrected against the REAL, locally-verified `latitude` CLI v7.10.0)
+# ---------------------------------------------------------------------------
+#
+# Bounded, read-only, argv-only collector for the external `latitude` CLI. Unlike the five
+# `collect_*_source` adapters above (which each build a `source_observation` matching
+# `agent_retrospective_run/v1`), this collector's sole output contract is
+# `latitude_runtime_evidence/v1` (`schemas/latitude_runtime_evidence_v1.schema.json`) -- see
+# `validate_retrospective_schema.validate_latitude_runtime_evidence`.
+#
+# PR #2392 fix_delta ground truth (live-verified against `latitude` v7.10.0, `latitude traces
+# list --help`/`--schema`, and a live authenticated call -- see PR body for the full transcript):
+#   - There is NO `latitude runs` command group. The real, only command shape this collector may
+#     ever use is `latitude traces list --project-slug <slug> --filters <JSON> --limit <n>
+#     --format json` (`build_latitude_allowed_argv`, replacing the old fixed
+#     `LATITUDE_ALLOWED_ARGV` tuple -- the argv now has 3 dynamic value slots, so it is built by a
+#     pure function instead of being a module-level constant, but the flag/token SHAPE remains
+#     fixed and allowlisted: no other subcommand, flag, or path is ever passed).
+#   - The response is `{"items": [...], "nextCursor": ..., "hasMore": ...}` -- NOT a flat
+#     `{trace_count, span_count, duration_ms}` object. Each `items[]` entry has (among many other
+#     out-of-scope fields) `spanCount` (integer) and `durationNs` (integer nanoseconds).
+#   - `--filters '{"sessionId": [{"op": "eq", "value": "<session_id>"}]}'` is the verified,
+#     correct filter-condition shape -- `{"sessionId": [{"eq": "<value>"}]}` (guessed by the
+#     original human reviewer, going only off the CLI's own `--help` text) is REJECTED by the
+#     live API with a 400 `error[api]: Unknown error`. The correct `{"op": ..., "value": ...}`
+#     shape comes from `latitude traces list --spec`'s embedded OpenAPI `FilterCondition` schema,
+#     confirmed by a live round-trip: a real session's `sessionId` returns its trace with `op:
+#     "eq"`, and a non-matching UUID-shaped `sessionId` returns `{"items": [], "hasMore": false}`
+#     (exit 0, not an error) -- see `no_matching_trace` below.
+#
+# CLI Boundary (Issue #2375):
+#   - `build_latitude_allowed_argv()` is the single allowlisted, read-only command-shape builder.
+#     It is invoked as a literal argv list (`subprocess.run([...])`) -- never through a shell,
+#     `eval`, or a dynamically-assembled command string -- and `stdin=subprocess.DEVNULL`
+#     guarantees no interactive prompt can block the collector. The only dynamic values are
+#     `project_slug` (from the `LATITUDE_PROJECT` env var), the `--filters` JSON body (built via
+#     `json.dumps` of a dict -- a session_id is never string-concatenated into a shell/JSON
+#     string by hand), and `limit` -- every other argv token is a fixed literal.
+#   - executable-not-found, auth failure, network unavailable, non-zero exit, and timeout all
+#     normalize to `availability: unavailable` (or `error` for budget/parse failures) with a closed
+#     `reason_code`; raw stdout/stderr are read only long enough to classify/parse them and are
+#     never stored on the returned dict or logged.
+#   - no target Claude Code `session_id` resolvable, or a resolvable session_id with zero matching
+#     traces, are both legitimate `availability: "unavailable"` outcomes (`session_id_unresolved`/
+#     `no_matching_trace`) -- never `error`, and the collector never falls back to querying without
+#     a session filter (that would attach one run's evidence to an unrelated run's candidates).
+#
+# Collection Budget (Issue #2375):
+#   - at most one `latitude` CLI launch per call (a single `runner(argv)` invocation; no retry
+#     loop, no pagination, no polling);
+#   - `LATITUDE_TIMEOUT_SECONDS` (10s) caller-supplied `timeout=` on the subprocess call;
+#   - `LATITUDE_MAX_OUTPUT_BYTES` (64 KiB) ceiling on stdout/stderr size -- exceeding it is
+#     `availability: error` / `reason_code: budget_exceeded` with the raw (oversized) output
+#     discarded, never partially retained;
+#   - exactly 3 allowlisted metrics (`trace_count`/`span_count`/`duration_ms`) are ever projected
+#     out of the parsed JSON payload; every other key in each `items[]` entry (and every other
+#     top-level response key besides `items`) is discarded immediately after the 3 allowlisted
+#     values are read (`_coerce_latitude_metric`/`_coerce_latitude_duration_ms`).
+#
+# Metrics semantics (PR #2392 fix_delta, since a session-correlated query can match 0 or more
+# traces): the collector always requests `limit=1` (the most recent trace for the session, per the
+# CLI's `--sort-by startTime --sort-direction desc` default), so `items` holds at most one trace.
+# `trace_count` is `len(items)` (0 or 1 given `limit=1`); when `items` is non-empty,
+# `span_count`/`duration_ms` are read from that single `items[0]` entry (never summed/aggregated --
+# there is at most one candidate given `limit=1`). `duration_ms` is `durationNs // 1_000_000`
+# (floor/truncating integer division -- documented, deterministic, unit-tested rounding rule).
+#
+# `evidence_ref`/`evidence_identity` are computed from the allowlisted metrics/collector_version/
+# collected_at alone (`validate_retrospective_schema.compute_latitude_evidence_ref`/
+# `compute_latitude_evidence_identity`) -- the raw parsed payload and raw stdout/stderr text are
+# never used as digest input and are dropped (`del`) as soon as the allowlisted metrics have been
+# read out of them, so no raw evidence can leak into the returned dict even by accident.
+
+LATITUDE_RUNTIME_EVIDENCE_SCHEMA_VERSION = "latitude_runtime_evidence/v1"
+LATITUDE_COLLECTOR_VERSION = "latitude-collector/v1"
+LATITUDE_TIMEOUT_SECONDS = 10
+LATITUDE_MAX_OUTPUT_BYTES = 64 * 1024
+LATITUDE_MAX_LAUNCHES_PER_RUN = 1
+LATITUDE_DEFAULT_LIMIT = 1
+
+#: name of the single env var this collector reads (Issue #2375 PR #2392 fix_delta: the real CLI
+#: requires `--project-slug`; the collector does not read/touch `LATITUDE_API_KEY`/
+#: `LATITUDE_BASE_URL`/any other Latitude env var -- credential/config resolution is entirely the
+#: `latitude` binary's own responsibility).
+LATITUDE_PROJECT_SLUG_ENV_VAR = "LATITUDE_PROJECT"
+
+_LATITUDE_METRIC_KEYS: tuple[str, ...] = ("trace_count", "span_count", "duration_ms")
+
+
+def _default_latitude_project_slug() -> str | None:
+    """Reads the real Latitude project slug from `LATITUDE_PROJECT` (Issue #2375 PR #2392
+    fix_delta) -- the collector never hardcodes a project slug. Returns `None` (never an empty
+    string) when the env var is absent/blank so callers can distinguish "unset" from "set"."""
+    value = os.environ.get(LATITUDE_PROJECT_SLUG_ENV_VAR)
+    return value if value else None
+
+
+def build_latitude_allowed_argv(
+    *, project_slug: str, session_id: str, limit: int = LATITUDE_DEFAULT_LIMIT
+) -> list[str]:
+    """Builds the single allowlisted, read-only Latitude CLI command shape (Issue #2375 CLI
+    Boundary, PR #2392 fix_delta): `latitude traces list --project-slug <slug> --filters <JSON>
+    --limit <n> --format json`. A pure function (not a fixed module-level constant) because the
+    real CLI's session-correlation filter must carry a dynamic `session_id` value -- but every
+    flag token and the overall shape are fixed; only the VALUES at 3 known positions
+    (`project_slug`, the `--filters` JSON body, `limit`) ever vary. The `--filters` JSON body is
+    built via `json.dumps` of a plain dict (never hand-built/concatenated string interpolation),
+    so a `session_id` containing quotes/braces can never inject an additional filter condition or
+    flag.
+    """
+    filters = json.dumps({"sessionId": [{"op": "eq", "value": session_id}]}, sort_keys=True)
+    return [
+        "latitude",
+        "traces",
+        "list",
+        "--project-slug",
+        project_slug,
+        "--filters",
+        filters,
+        "--limit",
+        str(limit),
+        "--format",
+        "json",
+    ]
+
+#: keyword scan used ONLY to classify a non-zero exit's already-bounded stderr text into a closed
+#: reason_code -- the matched stderr string itself is never retained or returned (see
+#: `_classify_latitude_stderr`). Mirrors the existing GitHub adapter's status+header-based (never
+#: full-body) classification approach above.
+_LATITUDE_AUTH_MARKERS: tuple[str, ...] = (
+    "unauthorized",
+    "unauthenticated",
+    "not logged in",
+    "auth",
+    "login required",
+    "forbidden",
+)
+_LATITUDE_NETWORK_MARKERS: tuple[str, ...] = (
+    "network",
+    "connection refused",
+    "could not resolve",
+    "dns",
+    "econnrefused",
+    "unreachable",
+    "no route to host",
+)
+
+
+def _default_latitude_which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def _default_latitude_runner(argv: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(  # noqa: S603
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=LATITUDE_TIMEOUT_SECONDS,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def _latitude_result(
+    *,
+    availability: str,
+    clock: Callable[[], datetime],
+    reason_code: str | None = None,
+    evidence_identity: str | None = None,
+    evidence_ref: str | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": LATITUDE_RUNTIME_EVIDENCE_SCHEMA_VERSION,
+        "availability": availability,
+        "collected_at": _iso(clock()),
+        "collector_version": LATITUDE_COLLECTOR_VERSION,
+        "evidence_identity": evidence_identity,
+        "evidence_ref": evidence_ref,
+        "metrics": metrics
+        if metrics is not None
+        else {key: None for key in _LATITUDE_METRIC_KEYS},
+        "reason_code": reason_code,
+    }
+
+
+def _classify_latitude_stderr(stderr: str) -> str:
+    lowered = (stderr or "").lower()
+    if any(marker in lowered for marker in _LATITUDE_AUTH_MARKERS):
+        return "auth_failed"
+    if any(marker in lowered for marker in _LATITUDE_NETWORK_MARKERS):
+        return "network_unavailable"
+    return "non_zero_exit"
+
+
+def _coerce_latitude_metric(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
+def _coerce_latitude_duration_ms(duration_ns: Any) -> int | None:
+    """Converts the real CLI's `durationNs` (nanoseconds, `int` or `float` per the live-verified
+    OpenAPI schema) to `duration_ms` via floor/truncating integer division
+    (`int(duration_ns) // 1_000_000`) -- documented, deterministic rounding rule (PR #2392
+    fix_delta). Rejects `bool` (like `_coerce_latitude_metric`) and negative values."""
+    if isinstance(duration_ns, bool):
+        return None
+    if isinstance(duration_ns, (int, float)) and duration_ns >= 0:
+        return int(duration_ns) // 1_000_000
+    return None
+
+
+def collect_latitude_runtime_evidence(
+    *,
+    which: Callable[[str], str | None] = _default_latitude_which,
+    runner: Callable[[list[str]], subprocess.CompletedProcess] = _default_latitude_runner,
+    clock: Callable[[], datetime] = _utcnow,
+    identity_computer: Callable[[str, dict[str, Any], str], tuple[str, str]] | None = None,
+    session_id: str | None = None,
+    project_slug: str | None = None,
+    project_slug_resolver: Callable[[], str | None] = _default_latitude_project_slug,
+    limit: int = LATITUDE_DEFAULT_LIMIT,
+) -> dict[str, Any]:
+    """Bounded, read-only, argv-only collector for Latitude CLI runtime evidence (Issue #2375;
+    PR #2392 fix_delta -- corrected against the real `latitude traces list` command).
+
+    Session correlation (Issue #2375 PR #2392 fix_delta): `session_id` is the target Claude Code
+    `session_id` to correlate against (resolved by the caller from the existing hook-sink
+    collection path -- see `run_retrospective._resolve_latitude_target_session_id`; this module
+    has no session-recording logic of its own). When `session_id` is `None`/empty, the collector
+    NEVER launches the CLI without a session filter (that would silently attach an unrelated
+    run's most-recent trace as if it were this run's evidence) -- it returns `unavailable` /
+    `session_id_unresolved` immediately.
+
+    `project_slug` defaults to `project_slug_resolver()` (in turn defaulting to reading the
+    `LATITUDE_PROJECT` env var) when not supplied explicitly. When no project slug is resolvable
+    the collector returns `unavailable` / `project_slug_unresolved` (also without launching the
+    CLI) -- `--project-slug` is a required flag of the real CLI.
+
+    Launches the `latitude` executable at most once (`build_latitude_allowed_argv(...)`, `runner`
+    injected for testability -- production default is a real `subprocess.run` with a 10s timeout
+    and `stdin=subprocess.DEVNULL`, matching Collection Budget/CLI Boundary). Every failure mode --
+    executable not found, timeout, non-zero exit (auth/network/other), oversized output, malformed
+    output (missing/wrong-typed `items`), zero matching traces (`no_matching_trace`), or a
+    parseable-but-incomplete/invalid metrics payload -- normalizes to a
+    `latitude_runtime_evidence/v1`-shaped dict with `availability` `unavailable`/`error` and a
+    closed `reason_code`; raw stdout/stderr are never stored on the returned dict (only read long
+    enough to classify/parse, then discarded).
+
+    `identity_computer` defaults to `validate_retrospective_schema.compute_latitude_evidence_ref`/
+    `compute_latitude_evidence_identity` (injected via closure by the module-level default to
+    avoid a hard import cycle; tests may substitute a fake to keep this module's own test suite
+    independent of `validate_retrospective_schema.py`'s internals). Returns a
+    `latitude_runtime_evidence/v1`-shaped dict in every case (never raises for a typed operational
+    failure) -- callers are expected to additionally run
+    `validate_retrospective_schema.validate_latitude_runtime_evidence()` on the result before
+    trusting/binding it (this function does not self-validate against the JSON Schema).
+    """
+    if identity_computer is None:
+        identity_computer = _default_latitude_identity_computer
+
+    if not session_id:
+        return _latitude_result(availability="unavailable", reason_code="session_id_unresolved", clock=clock)
+
+    resolved_project_slug = project_slug if project_slug else project_slug_resolver()
+    if not resolved_project_slug:
+        return _latitude_result(availability="unavailable", reason_code="project_slug_unresolved", clock=clock)
+
+    if which("latitude") is None:
+        return _latitude_result(availability="unavailable", reason_code="cli_not_found", clock=clock)
+
+    argv = build_latitude_allowed_argv(project_slug=resolved_project_slug, session_id=session_id, limit=limit)
+    try:
+        completed = runner(argv)
+    except subprocess.TimeoutExpired:
+        return _latitude_result(availability="unavailable", reason_code="timeout", clock=clock)
+    except (OSError, subprocess.SubprocessError):
+        return _latitude_result(availability="unavailable", reason_code="cli_not_found", clock=clock)
+
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    stdout_bytes = len(stdout.encode("utf-8"))
+    stderr_bytes = len(stderr.encode("utf-8"))
+    if stdout_bytes > LATITUDE_MAX_OUTPUT_BYTES or stderr_bytes > LATITUDE_MAX_OUTPUT_BYTES:
+        del stdout, stderr  # oversized raw output discarded, not partially retained
+        return _latitude_result(availability="error", reason_code="budget_exceeded", clock=clock)
+
+    if completed.returncode != 0:
+        reason = _classify_latitude_stderr(stderr)
+        del stdout, stderr
+        return _latitude_result(availability="unavailable", reason_code=reason, clock=clock)
+
+    try:
+        parsed = json.loads(stdout)
+    except (ValueError, TypeError):
+        del stdout, stderr
+        return _latitude_result(availability="error", reason_code="malformed_output", clock=clock)
+
+    if not isinstance(parsed, dict):
+        del parsed, stdout, stderr
+        return _latitude_result(availability="error", reason_code="malformed_output", clock=clock)
+
+    items = parsed.get("items")
+    if not isinstance(items, list):
+        del parsed, stdout, stderr
+        return _latitude_result(availability="error", reason_code="malformed_output", clock=clock)
+
+    if len(items) == 0:
+        # A well-formed response with zero matching traces for this session is a legitimate
+        # outcome, NOT a parse/malformed-output error (Issue #2375 PR #2392 fix_delta) -- the
+        # session genuinely has no Latitude trace yet (e.g. telemetry lag, or the session
+        # produced no LLM spans).
+        del parsed, stdout, stderr
+        return _latitude_result(availability="unavailable", reason_code="no_matching_trace", clock=clock)
+
+    item = items[0]
+    del parsed, stdout, stderr  # raw parsed payload discarded; only allowlisted values are read below
+    if not isinstance(item, dict):
+        return _latitude_result(availability="error", reason_code="malformed_output", clock=clock)
+
+    # `limit` bounds the request to at most 1 trace, so `trace_count` (the number of items
+    # actually returned) is well-defined here as `len(items)` -- always 1 at this point (the
+    # `len(items) == 0` case already returned above). `span_count`/`duration_ms` are read from
+    # this single trace (never summed -- there is at most one candidate given `limit=1`).
+    metrics = {
+        "trace_count": _coerce_latitude_metric(len(items)),
+        "span_count": _coerce_latitude_metric(item.get("spanCount")),
+        "duration_ms": _coerce_latitude_duration_ms(item.get("durationNs")),
+    }
+
+    if any(value is None for value in metrics.values()):
+        # A parseable JSON response whose single trace item is missing/carries a wrong-type/
+        # out-of-range value for `spanCount`/`durationNs` never becomes `availability: "available"`
+        # with a null metric. `latitude_runtime_evidence/v1` requires all 3 allowlisted metrics to
+        # be non-null integers whenever `availability == "available"` (Issue #2375) -- normalize to
+        # a closed `error` result instead, discarding the incomplete/invalid projected metrics.
+        return _latitude_result(availability="error", reason_code="malformed_output", clock=clock)
+
+    collected_at = _iso(clock())
+    evidence_ref, evidence_identity = identity_computer(LATITUDE_COLLECTOR_VERSION, metrics, collected_at)
+
+    return {
+        "schema_version": LATITUDE_RUNTIME_EVIDENCE_SCHEMA_VERSION,
+        "availability": "available",
+        "collected_at": collected_at,
+        "collector_version": LATITUDE_COLLECTOR_VERSION,
+        "evidence_identity": evidence_identity,
+        "evidence_ref": evidence_ref,
+        "metrics": metrics,
+        "reason_code": None,
+    }
+
+
+def _default_latitude_identity_computer(
+    collector_version: str, metrics: dict[str, Any], collected_at: str
+) -> tuple[str, str]:
+    """Lazily import `validate_retrospective_schema.py` (sibling module, same directory) so this
+    module has no import-time dependency on it -- only `collect_latitude_runtime_evidence`'s
+    success path (the only path that needs an identity) triggers the import."""
+    from pathlib import Path as _Path
+
+    module_name = "agent_retrospective_validate_schema_for_collect_snapshot"
+    if module_name not in sys.modules:
+        import importlib.util
+
+        module_path = _Path(__file__).resolve().parent / "validate_retrospective_schema.py"
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:  # pragma: no cover - defensive
+            raise RuntimeError(f"cannot load module {module_name} from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    vrs = sys.modules[module_name]
+    evidence_ref = vrs.compute_latitude_evidence_ref(collector_version, metrics, collected_at)
+    evidence_identity = vrs.compute_latitude_evidence_identity(collector_version, evidence_ref, metrics)
+    return evidence_ref, evidence_identity

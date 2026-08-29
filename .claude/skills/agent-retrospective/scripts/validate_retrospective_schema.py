@@ -662,3 +662,145 @@ def load_fixture(name: str) -> dict[str, Any]:
     fixtures_dir = _SCHEMAS_DIR / "fixtures"
     with (fixtures_dir / name).open("r", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+# ---------------------------------------------------------------------------
+# latitude_runtime_evidence/v1 (Issue #2375)
+# ---------------------------------------------------------------------------
+#
+# Public-safe, bounded runtime evidence contract for agent-retrospective's
+# Latitude CLI collector (`collect_snapshot.collect_latitude_runtime_evidence`).
+# `validate_latitude_runtime_evidence()` does two things `latitude_runtime_evidence_v1.schema.json`
+# alone cannot express:
+#
+# - recomputes `evidence_ref` from `collector_version`/`metrics`/`collected_at` and
+#   `evidence_identity` from `collector_version`/`evidence_ref`/`metrics`, rejecting (fail closed,
+#   `RetrospectiveSchemaError`) any instance whose declared value does not match -- a caller cannot
+#   supply an arbitrary, stale, or fabricated identity/ref and have it pass (mirrors
+#   `validate_finding_identity` above);
+# - rejects (fail closed) an instance whose `schema_version` is not exactly
+#   `"latitude_runtime_evidence/v1"` -- an unrecognized/future schema version is never silently
+#   accepted as this version.
+#
+# Both `evidence_ref` and `evidence_identity` are derived exclusively from allowlisted, already
+# public-safe inputs (collector_version/metrics/collected_at) -- never from a raw trace ID, raw
+# payload, or a local absolute path (Issue #2375 Binding Rules) -- so recomputation here never
+# needs (and never receives) raw CLI output.
+
+LATITUDE_RUNTIME_EVIDENCE_SCHEMA_VERSION = "latitude_runtime_evidence/v1"
+LATITUDE_RUNTIME_EVIDENCE_SCHEMA_PATH = _SCHEMAS_DIR / "latitude_runtime_evidence_v1.schema.json"
+
+
+def load_latitude_runtime_evidence_schema() -> dict[str, Any]:
+    return _load_schema(LATITUDE_RUNTIME_EVIDENCE_SCHEMA_PATH)
+
+
+def compute_latitude_evidence_ref(
+    collector_version: str, metrics: dict[str, Any], collected_at: str
+) -> str:
+    """Deterministically derive the opaque `evidence_ref` from allowlisted,
+    already public-safe inputs only (never raw trace ID/payload/absolute path).
+
+    Calling this twice with structurally-equal inputs always returns the same value.
+    """
+    canonical = _jcs_canonicalize(
+        {"collector_version": collector_version, "collected_at": collected_at, "metrics": metrics}
+    )
+    preimage = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
+    return "sha256:" + hashlib.sha256(preimage.encode("utf-8")).hexdigest()
+
+
+def compute_latitude_evidence_identity(
+    collector_version: str, evidence_ref: str, metrics: dict[str, Any]
+) -> str:
+    """Deterministically derive `evidence_identity` -- the canonical public-projection identity
+    -- from allowlisted, already public-safe inputs only (never raw trace ID/payload/absolute
+    path). Distinct preimage from `compute_latitude_evidence_ref` (includes `schema_version` and
+    the already-computed `evidence_ref`, not `collected_at`), so the two derived values are not
+    trivially interchangeable.
+    """
+    canonical = _jcs_canonicalize(
+        {
+            "schema_version": LATITUDE_RUNTIME_EVIDENCE_SCHEMA_VERSION,
+            "collector_version": collector_version,
+            "evidence_ref": evidence_ref,
+            "metrics": metrics,
+        }
+    )
+    preimage = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
+    return "sha256:" + hashlib.sha256(preimage.encode("utf-8")).hexdigest()
+
+
+def validate_latitude_runtime_evidence(instance: dict[str, Any]) -> None:
+    """Validate a `latitude_runtime_evidence/v1` instance.
+
+    Raises `jsonschema.exceptions.ValidationError` on schema/format failure (closed key set,
+    availability-conditioned nullability, closed `reason_code` enum -- see the schema file).
+    Raises `RetrospectiveSchemaError` (fail closed) when:
+
+    - `instance["schema_version"]` is not exactly `"latitude_runtime_evidence/v1"` (unknown schema
+      version);
+    - `availability == "available"` and any of `metrics.trace_count`/`span_count`/`duration_ms` is
+      not a non-null integer (redundant with the schema's own availability=="available" branch --
+      see the schema file -- in case JSON Schema validation is not exercised at every call site);
+    - `availability == "available"` and the declared `evidence_ref` does not equal
+      `compute_latitude_evidence_ref(collector_version, metrics, collected_at)`, or the declared
+      `evidence_identity` does not equal
+      `compute_latitude_evidence_identity(collector_version, evidence_ref, metrics)` (identity
+      mismatch).
+    """
+    schema_version = instance.get("schema_version")
+    if schema_version != LATITUDE_RUNTIME_EVIDENCE_SCHEMA_VERSION:
+        raise RetrospectiveSchemaError(
+            f"unknown latitude_runtime_evidence schema_version: {schema_version!r}; expected "
+            f"{LATITUDE_RUNTIME_EVIDENCE_SCHEMA_VERSION!r}."
+        )
+    _validate_with_format_checking(instance, load_latitude_runtime_evidence_schema())
+
+    if instance["availability"] != "available":
+        return
+
+    metrics = instance["metrics"]
+    for metric_key in ("trace_count", "span_count", "duration_ms"):
+        metric_value = metrics.get(metric_key)
+        if not isinstance(metric_value, int) or isinstance(metric_value, bool):
+            raise RetrospectiveSchemaError(
+                f"latitude_runtime_evidence metrics.{metric_key} must be a non-null integer when "
+                f"availability == 'available'; got {metric_value!r}. This check is redundant with "
+                "the schema's allOf/if/then availability=='available' branch and exists in case "
+                "JSON Schema validation is not exercised at every call site."
+            )
+
+    expected_ref = compute_latitude_evidence_ref(
+        instance["collector_version"], instance["metrics"], instance["collected_at"]
+    )
+    actual_ref = instance["evidence_ref"]
+    if expected_ref != actual_ref:
+        raise RetrospectiveSchemaError(
+            f"latitude_runtime_evidence evidence_ref mismatch: stored evidence_ref={actual_ref!r} "
+            f"but compute_latitude_evidence_ref(...)={expected_ref!r}. evidence_ref is derived and "
+            "cannot be supplied, copied, or reused independently."
+        )
+
+    expected_identity = compute_latitude_evidence_identity(
+        instance["collector_version"], actual_ref, instance["metrics"]
+    )
+    actual_identity = instance["evidence_identity"]
+    if expected_identity != actual_identity:
+        raise RetrospectiveSchemaError(
+            "latitude_runtime_evidence evidence_identity mismatch: stored evidence_identity="
+            f"{actual_identity!r} but compute_latitude_evidence_identity(...)={expected_identity!r}. "
+            "evidence_identity is derived and cannot be supplied, copied, or reused independently."
+        )
+
+
+def is_valid_latitude_runtime_evidence(instance: dict[str, Any]) -> bool:
+    try:
+        validate_latitude_runtime_evidence(instance)
+    except (jsonschema.exceptions.ValidationError, RetrospectiveSchemaError):
+        return False
+    return True
