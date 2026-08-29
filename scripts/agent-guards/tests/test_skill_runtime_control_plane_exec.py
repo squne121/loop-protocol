@@ -1,26 +1,13 @@
-"""Issue #2196 (Child 1 of #2190): sanitized Git subprocess exec tests.
-
-Covers `sanitized_git_subprocess_env`, `resolve_git_subprocess_executable`,
-`git_subprocess_trusted_hooks_dir`, the private `_run_sanitized_git_subprocess`
-engine, and the closed `run_control_plane_git_*` command builders in
-`skill_runtime_exec.py` (AC1-AC11). Reflects the PR #2201 owner adversarial
-review fix delta (P1-1 through P1-5, P2-1 through P2-5): raw-argv access is
-private/internal only, `PATH`/`GIT_SSH_COMMAND` are trusted-allowlist-only,
-`core.hooksPath` is a fresh per-invocation trusted directory, the
-`insteadOf`/`pushInsteadOf` probe uses a structured NUL-delimited query
-bound to identical config authority as the real command, probe failure is
-fail-closed, and credential helper/askpass/ssh marker executables are
-proven never invoked (not merely "does not hang").
-"""
+"""Behavioral regression coverage for Issue #2378 closed Git builders."""
 
 from __future__ import annotations
 
-import http.server
+import inspect
 import os
-import stat
+import signal
 import subprocess
 import sys
-import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -31,787 +18,1145 @@ if str(_GUARDS_DIR) not in sys.path:
 
 import skill_runtime_exec as exec_mod  # noqa: E402
 from skill_runtime_command_policy import (  # noqa: E402
-    GitSubprocessConfigProbeFailed,
-    GitSubprocessRewriteRejected,
+    make_control_plane_private_ref,
+    validate_allowed_remote_ref,
+    validate_detached_worktree_path,
+    validate_literal_remote_url,
 )
 
 
 @pytest.fixture(autouse=True)
-def _reset_git_subprocess_cache():
+def _reset_git_cache():
     exec_mod._reset_git_subprocess_executable_cache_for_tests()
     yield
     exec_mod._reset_git_subprocess_executable_cache_for_tests()
 
 
-def _init_fixture_repo(repo_dir: Path, home_dir: Path) -> dict[str, str]:
-    """Create a minimal git repo with one commit, using a clean HOME so the
-    real developer's global gitconfig never leaks into the test."""
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    home_dir.mkdir(parents=True, exist_ok=True)
-    base_env = dict(os.environ)
-    base_env["HOME"] = str(home_dir)
-    base_env["XDG_CONFIG_HOME"] = str(home_dir / ".config")
-    base_env["GIT_AUTHOR_NAME"] = "Test"
-    base_env["GIT_AUTHOR_EMAIL"] = "test@example.com"
-    base_env["GIT_COMMITTER_NAME"] = "Test"
-    base_env["GIT_COMMITTER_EMAIL"] = "test@example.com"
-    base_env["GIT_TERMINAL_PROMPT"] = "0"
-    subprocess.run(["git", "init", "-q", "-b", "main", str(repo_dir)], check=True, env=base_env)
-    (repo_dir / "README.md").write_text("fixture\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True, env=base_env)
-    subprocess.run(
-        ["git", "commit", "-q", "-m", "initial"], cwd=repo_dir, check=True, env=base_env
+def _git_env(tmp_path: Path) -> dict[str, str]:
+    home = tmp_path / "fixture-home"
+    xdg = home / "xdg"
+    xdg.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env.update(
+        HOME=str(home),
+        XDG_CONFIG_HOME=str(xdg),
+        GIT_AUTHOR_NAME="Test",
+        GIT_AUTHOR_EMAIL="test@example.com",
+        GIT_COMMITTER_NAME="Test",
+        GIT_COMMITTER_EMAIL="test@example.com",
+        GIT_TERMINAL_PROMPT="0",
     )
-    return base_env
-
-
-def _write_marker_script(path: Path, marker_file: Path) -> None:
-    path.write_text(f'#!/bin/sh\ntouch "{marker_file}"\nexit 1\n', encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-
-# ---------------------------------------------------------------------------
-# AC1 / AC5 / AC7: sanitized_git_subprocess_env
-# ---------------------------------------------------------------------------
-
-
-def test_sanitized_git_subprocess_env_unsets_all_ac1_keys(monkeypatch, tmp_path):
-    """GIVEN every AC1 GIT_* variable (post owner-review 14-variable set)
-    is present in the ambient environment
-    WHEN sanitized_git_subprocess_env is called
-    THEN none of them appear in the returned mapping."""
-    ac1_keys = [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_SYSTEM",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_EXEC_PATH",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_SSL_NO_VERIFY",
-    ]
-    for key in ac1_keys:
-        monkeypatch.setenv(key, "/tmp/attacker-controlled")
-
-    env = exec_mod.sanitized_git_subprocess_env(str(tmp_path))
-
-    for key in ac1_keys:
-        assert key not in env, f"{key} leaked into sanitized env"
-
-
-def test_sanitized_git_subprocess_env_disables_prompts_and_credential_surfaces(tmp_path):
-    """GIVEN no special setup
-    WHEN sanitized_git_subprocess_env is called
-    THEN interactive terminal prompting, askpass, and interactive SSH are
-    all disabled (AC5)."""
-    env = exec_mod.sanitized_git_subprocess_env(str(tmp_path))
-    assert env["GIT_TERMINAL_PROMPT"] == "0"
-    assert env["GIT_ASKPASS"] == ""
-    assert env["SSH_ASKPASS"] == ""
-    assert "BatchMode=yes" in env["GIT_SSH_COMMAND"]
-
-
-def test_sanitized_git_subprocess_env_preserves_unrelated_keys(monkeypatch, tmp_path):
-    """GIVEN an unrelated environment variable
-    WHEN sanitized_git_subprocess_env is called
-    THEN it is preserved (only the AC1 named set is stripped)."""
-    monkeypatch.setenv("SKILL_RUNTIME_TEST_MARKER", "keep-me")
-    env = exec_mod.sanitized_git_subprocess_env(str(tmp_path))
-    assert env.get("SKILL_RUNTIME_TEST_MARKER") == "keep-me"
-
-
-def test_sanitized_git_subprocess_env_path_is_trusted_allowlist_not_inherited(monkeypatch, tmp_path):
-    """GIVEN an ambient PATH with a malicious directory prepended
-    WHEN sanitized_git_subprocess_env is called
-    THEN the returned PATH is exactly the trusted allowlist -- the
-    malicious directory never survives (AC7 / P1-2)."""
-    malicious_dir = tmp_path / "malicious-bin"
-    malicious_dir.mkdir()
-    monkeypatch.setenv("PATH", f"{malicious_dir}{os.pathsep}{os.environ.get('PATH', '')}")
-
-    env = exec_mod.sanitized_git_subprocess_env(str(tmp_path))
-
-    assert str(malicious_dir) not in env["PATH"].split(os.pathsep)
-    assert env["PATH"] == os.pathsep.join(exec_mod._safe_path_entries())
-
-
-def test_sanitized_git_subprocess_env_ssh_command_is_absolute_trusted_path(tmp_path):
-    """GIVEN no special setup
-    WHEN sanitized_git_subprocess_env is called
-    THEN GIT_SSH_COMMAND's ssh binary is either an absolute path resolved
-    from the trusted allowlist, or the "always fail" fallback -- never an
-    unqualified `ssh` token that would resolve via inherited PATH
-    (AC7 / P1-2)."""
-    env = exec_mod.sanitized_git_subprocess_env(str(tmp_path))
-    ssh_bin = env["GIT_SSH_COMMAND"].split()[0]
-    if ssh_bin == "false":
-        return
-    assert os.path.isabs(ssh_bin)
-    assert os.path.dirname(ssh_bin) in {
-        os.path.realpath(entry) for entry in exec_mod._safe_path_entries()
-    } | set(exec_mod._safe_path_entries())
-
-
-def test_sanitized_git_subprocess_env_ssh_command_ignores_poisoned_path(monkeypatch, tmp_path):
-    """GIVEN a poisoned PATH containing a fake `ssh` executable
-    WHEN sanitized_git_subprocess_env is called
-    THEN GIT_SSH_COMMAND never resolves to the poisoned executable
-    (AC7 / P1-2)."""
-    malicious_dir = tmp_path / "malicious-bin"
-    malicious_dir.mkdir()
-    fake_ssh = malicious_dir / "ssh"
-    fake_ssh.write_text("#!/bin/sh\necho fake\nexit 0\n", encoding="utf-8")
-    fake_ssh.chmod(fake_ssh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    monkeypatch.setenv("PATH", f"{malicious_dir}{os.pathsep}{os.environ.get('PATH', '')}")
-
-    env = exec_mod.sanitized_git_subprocess_env(str(tmp_path))
-    ssh_bin = env["GIT_SSH_COMMAND"].split()[0]
-    assert ssh_bin != str(fake_ssh)
-
-
-# ---------------------------------------------------------------------------
-# AC2: resolve_git_subprocess_executable caching
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_git_subprocess_executable_returns_absolute_git_path(tmp_path):
-    resolved = exec_mod.resolve_git_subprocess_executable(str(tmp_path))
-    assert os.path.isabs(resolved)
-    assert os.path.basename(resolved) == "git"
-    assert os.access(resolved, os.X_OK)
-
-
-def test_resolve_git_subprocess_executable_is_cached_and_reused(monkeypatch, tmp_path):
-    first = exec_mod.resolve_git_subprocess_executable(str(tmp_path))
-
-    call_count = {"n": 0}
-    real_resolve = exec_mod._resolve_trusted_executable
-
-    def _spy(name, project_root):
-        call_count["n"] += 1
-        return real_resolve(name, project_root)
-
-    monkeypatch.setattr(exec_mod, "_resolve_trusted_executable", _spy)
-
-    second = exec_mod.resolve_git_subprocess_executable(str(tmp_path))
-    third = exec_mod.resolve_git_subprocess_executable(str(tmp_path))
-
-    assert second == first
-    assert third == first
-    assert call_count["n"] == 0
-
-
-# ---------------------------------------------------------------------------
-# AC3: git_subprocess_trusted_hooks_dir
-# ---------------------------------------------------------------------------
-
-
-def test_git_subprocess_trusted_hooks_dir_creates_empty_dir(tmp_path):
-    hooks_dir = exec_mod.git_subprocess_trusted_hooks_dir(str(tmp_path))
-    assert Path(hooks_dir).is_dir()
-    assert list(Path(hooks_dir).iterdir()) == []
-
-
-def test_git_subprocess_trusted_hooks_dir_is_per_invocation(tmp_path):
-    """GIVEN repeated calls with the same scratch_root
-    WHEN git_subprocess_trusted_hooks_dir is called each time
-    THEN a distinct directory is created every time (never a fixed,
-    reused default -- P2-1)."""
-    first = exec_mod.git_subprocess_trusted_hooks_dir(str(tmp_path))
-    second = exec_mod.git_subprocess_trusted_hooks_dir(str(tmp_path))
-    assert first != second
-    assert Path(first).is_dir()
-    assert Path(second).is_dir()
-
-
-def test_git_subprocess_trusted_hooks_dir_rejects_relative_scratch_root():
-    with pytest.raises(RuntimeError):
-        exec_mod.git_subprocess_trusted_hooks_dir("relative/scratch")
-
-
-def test_git_subprocess_trusted_hooks_dir_rejects_symlinked_scratch_root(tmp_path):
-    real_root = tmp_path / "real-scratch"
-    real_root.mkdir()
-    symlink_root = tmp_path / "symlinked-scratch"
-    symlink_root.symlink_to(real_root)
-
-    with pytest.raises(RuntimeError):
-        exec_mod.git_subprocess_trusted_hooks_dir(str(symlink_root))
-
-
-def test_git_subprocess_trusted_hooks_dir_fails_closed_if_not_empty(monkeypatch, tmp_path):
-    """GIVEN the freshly-minted trusted hooks directory unexpectedly
-    contains a file (simulated by faking tempfile.mkdtemp to hand back a
-    pre-populated directory)
-    WHEN git_subprocess_trusted_hooks_dir is called
-    THEN it raises RuntimeError instead of silently proceeding."""
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
-    poisoned = scratch / "poisoned-hooks-dir"
-    poisoned.mkdir()
-    (poisoned / "post-checkout").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-
-    def _fake_mkdtemp(prefix=None, dir=None):
-        return str(poisoned)
-
-    monkeypatch.setattr(exec_mod.tempfile, "mkdtemp", _fake_mkdtemp)
-
-    with pytest.raises(RuntimeError):
-        exec_mod.git_subprocess_trusted_hooks_dir(str(scratch))
-
-
-def test_git_subprocess_trusted_hooks_dir_fails_closed_if_realpath_differs(monkeypatch, tmp_path):
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
-
-    real_realpath = exec_mod.os.path.realpath
-
-    def _tampered_realpath(path):
-        result = real_realpath(path)
-        if str(scratch) in str(path) and ".skill-runtime-git-hooks-" in str(path):
-            return result + "-tampered"
-        return result
-
-    monkeypatch.setattr(exec_mod.os.path, "realpath", _tampered_realpath)
-
-    with pytest.raises(RuntimeError):
-        exec_mod.git_subprocess_trusted_hooks_dir(str(scratch))
-
-
-# ---------------------------------------------------------------------------
-# AC3 (behavioral): _run_sanitized_git_subprocess prevents post-checkout firing
-# ---------------------------------------------------------------------------
-
-
-def test_run_sanitized_git_subprocess_prevents_post_checkout_hook_firing(tmp_path):
-    """GIVEN a fixture repo whose default .git/hooks/post-checkout writes a
-    marker file
-    WHEN a checkout-equivalent operation is run through
-    _run_sanitized_git_subprocess
-    THEN the marker file is NOT created (core.hooksPath pinned to a
-    verified-empty trusted directory suppresses hook firing) -- and a
-    baseline direct `git checkout` (without sanitization) DOES create the
-    marker, proving the hook is real and would otherwise fire."""
-    repo_dir = tmp_path / "repo"
-    home_dir = tmp_path / "home"
-    scratch_dir = tmp_path / "scratch"
-    base_env = _init_fixture_repo(repo_dir, home_dir)
-
-    marker = repo_dir / "post-checkout-fired.marker"
-    hooks_dir = repo_dir / ".git" / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-    hook_path = hooks_dir / "post-checkout"
-    hook_path.write_text(
-        f'#!/bin/sh\ntouch "{marker}"\n',
-        encoding="utf-8",
-    )
-    hook_path.chmod(hook_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-    baseline = subprocess.run(
-        ["git", "checkout", "-q", "-b", "baseline-branch"],
-        cwd=repo_dir,
-        env=base_env,
-    )
-    assert baseline.returncode == 0
-    assert marker.exists(), "baseline hook did not fire; fixture is broken"
-    marker.unlink()
-
-    result = exec_mod._run_sanitized_git_subprocess(
-        ["checkout", "-q", "-b", "sanitized-branch"],
-        cwd=str(repo_dir),
-        project_root=str(repo_dir),
-        scratch_root=str(scratch_dir),
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
-    assert not marker.exists(), "post-checkout hook fired despite core.hooksPath sanitization"
-
-
-# ---------------------------------------------------------------------------
-# AC4 / AC6 (behavioral): insteadOf/pushInsteadOf rejection + GIT_CONFIG split
-# ---------------------------------------------------------------------------
-
-
-def test_run_sanitized_git_subprocess_rejects_insteadof_rewrite(tmp_path):
-    repo_dir = tmp_path / "repo"
-    home_dir = tmp_path / "home"
-    scratch_dir = tmp_path / "scratch"
-    base_env = _init_fixture_repo(repo_dir, home_dir)
-    subprocess.run(
-        [
-            "git",
-            "config",
-            "--local",
-            "url.https://rewritten.example/.insteadOf",
-            "https://example.com/",
-        ],
-        cwd=repo_dir,
-        check=True,
-        env=base_env,
-    )
-
-    with pytest.raises(GitSubprocessRewriteRejected):
-        exec_mod._run_sanitized_git_subprocess(
-            ["status", "--short"],
-            cwd=str(repo_dir),
-            project_root=str(repo_dir),
-            scratch_root=str(scratch_dir),
-            timeout=30,
-        )
-
-
-def test_run_sanitized_git_subprocess_rejects_pushinsteadof_rewrite(tmp_path):
-    """AC4: the pre-owner-review code only checked `insteadOf`, never
-    `pushInsteadOf` -- P1-4 requires both."""
-    repo_dir = tmp_path / "repo"
-    home_dir = tmp_path / "home"
-    scratch_dir = tmp_path / "scratch"
-    base_env = _init_fixture_repo(repo_dir, home_dir)
-    subprocess.run(
-        [
-            "git",
-            "config",
-            "--local",
-            "url.https://rewritten.example/.pushInsteadOf",
-            "https://example.com/",
-        ],
-        cwd=repo_dir,
-        check=True,
-        env=base_env,
-    )
-
-    with pytest.raises(GitSubprocessRewriteRejected):
-        exec_mod._run_sanitized_git_subprocess(
-            ["status", "--short"],
-            cwd=str(repo_dir),
-            project_root=str(repo_dir),
-            scratch_root=str(scratch_dir),
-            timeout=30,
-        )
-
-
-def test_run_sanitized_git_subprocess_rejects_insteadof_with_equals_in_subsection(tmp_path):
-    """AC4 / P1-4: a legal subsection name containing '=' must still be
-    detected -- this is only possible because detection is now structured
-    (name-only query), never a hand split of `key=value` line text."""
-    repo_dir = tmp_path / "repo"
-    home_dir = tmp_path / "home"
-    scratch_dir = tmp_path / "scratch"
-    base_env = _init_fixture_repo(repo_dir, home_dir)
-    subprocess.run(
-        [
-            "git",
-            "config",
-            "--local",
-            "url.https://evil.example/?x=y.insteadOf",
-            "https://good.example/",
-        ],
-        cwd=repo_dir,
-        check=True,
-        env=base_env,
-    )
-
-    with pytest.raises(GitSubprocessRewriteRejected):
-        exec_mod._run_sanitized_git_subprocess(
-            ["status", "--short"],
-            cwd=str(repo_dir),
-            project_root=str(repo_dir),
-            scratch_root=str(scratch_dir),
-            timeout=30,
-        )
-
-
-def test_run_sanitized_git_subprocess_allows_repo_without_insteadof(tmp_path):
-    repo_dir = tmp_path / "repo"
-    home_dir = tmp_path / "home"
-    scratch_dir = tmp_path / "scratch"
-    _init_fixture_repo(repo_dir, home_dir)
-
-    result = exec_mod._run_sanitized_git_subprocess(
-        ["status", "--short"],
-        cwd=str(repo_dir),
-        project_root=str(repo_dir),
-        scratch_root=str(scratch_dir),
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
-
-
-def test_run_sanitized_git_subprocess_rejects_insteadof_despite_ambient_git_config_split(
-    tmp_path, monkeypatch
-):
-    """AC6 / P1-1: even if the caller's ambient environment sets GIT_CONFIG
-    to point at an empty config file, the probe must not be split from the
-    real command's config authority -- GIT_CONFIG is unset for both, so a
-    repo-local insteadOf rule is still detected and rejected."""
-    repo_dir = tmp_path / "repo"
-    home_dir = tmp_path / "home"
-    scratch_dir = tmp_path / "scratch"
-    base_env = _init_fixture_repo(repo_dir, home_dir)
-    subprocess.run(
-        [
-            "git",
-            "config",
-            "--local",
-            "url.https://rewritten.example/.insteadOf",
-            "https://example.com/",
-        ],
-        cwd=repo_dir,
-        check=True,
-        env=base_env,
-    )
-
-    empty_config = tmp_path / "empty.gitconfig"
-    empty_config.write_text("", encoding="utf-8")
-    monkeypatch.setenv("GIT_CONFIG", str(empty_config))
-
-    with pytest.raises(GitSubprocessRewriteRejected):
-        exec_mod._run_sanitized_git_subprocess(
-            ["status", "--short"],
-            cwd=str(repo_dir),
-            project_root=str(repo_dir),
-            scratch_root=str(scratch_dir),
-            timeout=30,
-        )
-
-
-def test_run_sanitized_git_subprocess_rejects_leading_git_token():
-    with pytest.raises(ValueError):
-        exec_mod._run_sanitized_git_subprocess(
-            ["git", "status"],
-            cwd=".",
-            project_root=".",
-            timeout=10,
-        )
-
-
-# ---------------------------------------------------------------------------
-# AC9 (behavioral): config probe failure is fail-closed, never "no rewrite"
-# ---------------------------------------------------------------------------
-
-
-def test_run_sanitized_git_subprocess_fails_closed_when_probe_cannot_be_evaluated(tmp_path):
-    """AC9 / P1-5: a corrupted repo-local config makes the insteadOf probe
-    itself fail (nonzero exit with stderr) -- this must raise
-    GitSubprocessConfigProbeFailed and stop before the real command runs,
-    never be silently treated as "no rewrite exists"."""
-    repo_dir = tmp_path / "repo"
-    home_dir = tmp_path / "home"
-    scratch_dir = tmp_path / "scratch"
-    _init_fixture_repo(repo_dir, home_dir)
-    config_path = repo_dir / ".git" / "config"
-    with config_path.open("a", encoding="utf-8") as fh:
-        fh.write("this is not valid git config syntax [[[\n")
-
-    with pytest.raises(GitSubprocessConfigProbeFailed):
-        exec_mod._run_sanitized_git_subprocess(
-            ["status", "--short"],
-            cwd=str(repo_dir),
-            project_root=str(repo_dir),
-            scratch_root=str(scratch_dir),
-            timeout=30,
-        )
-
-
-def test_probe_insteadof_rewrite_keys_fails_closed_on_timeout(tmp_path, monkeypatch):
-    def _raise_timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=["git"], timeout=1)
-
-    monkeypatch.setattr(exec_mod.subprocess, "run", _raise_timeout)
-
-    with pytest.raises(GitSubprocessConfigProbeFailed):
-        exec_mod._probe_insteadof_rewrite_keys(
-            "/usr/bin/git",
-            cwd=str(tmp_path),
-            env={},
-            hooks_dir=str(tmp_path),
-            timeout=1,
-        )
-
-
-# ---------------------------------------------------------------------------
-# AC5 (behavioral): disabled prompts/credential surfaces never invoked
-# ---------------------------------------------------------------------------
-
-
-class _AuthRequiredHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802 (stdlib API name)
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="fixture"')
-        self.end_headers()
-
-    def log_message(self, *_args):  # silence default request logging
-        return
-
-
-def test_run_sanitized_git_subprocess_does_not_hang_on_credential_prompt(tmp_path):
-    server = http.server.HTTPServer(("127.0.0.1", 0), _AuthRequiredHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        repo_dir = tmp_path / "repo"
-        home_dir = tmp_path / "home"
-        scratch_dir = tmp_path / "scratch"
-        _init_fixture_repo(repo_dir, home_dir)
-        port = server.server_address[1]
-        url = f"http://127.0.0.1:{port}/fixture-repo.git"
-
-        result = exec_mod._run_sanitized_git_subprocess(
-            ["ls-remote", url],
-            cwd=str(repo_dir),
-            project_root=str(repo_dir),
-            scratch_root=str(scratch_dir),
-            timeout=10,
-        )
-        assert result.returncode != 0
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
-
-
-def test_run_sanitized_git_subprocess_never_invokes_credential_or_askpass_markers(
-    tmp_path, monkeypatch
-):
-    """P2-3: directly prove credential helper and askpass are never
-    invoked, using marker executables, instead of only proving "does not
-    hang" against a 401 endpoint."""
-    server = http.server.HTTPServer(("127.0.0.1", 0), _AuthRequiredHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        repo_dir = tmp_path / "repo"
-        home_dir = tmp_path / "home"
-        scratch_dir = tmp_path / "scratch"
-        base_env = _init_fixture_repo(repo_dir, home_dir)
-
-        cred_marker = tmp_path / "credential-helper.marker"
-        askpass_marker = tmp_path / "askpass.marker"
-        cred_script = tmp_path / "marker-credential-helper.sh"
-        askpass_script = tmp_path / "marker-askpass.sh"
-        _write_marker_script(cred_script, cred_marker)
-        _write_marker_script(askpass_script, askpass_marker)
-
-        subprocess.run(
-            ["git", "config", "--global", "credential.helper", str(cred_script)],
-            cwd=repo_dir,
-            check=True,
-            env=base_env,
-        )
-
-        port = server.server_address[1]
-        url = f"http://127.0.0.1:{port}/fixture-repo.git"
-
-        monkeypatch.setenv("HOME", str(home_dir))
-        monkeypatch.setenv("GIT_ASKPASS", str(askpass_script))
-        monkeypatch.setenv("SSH_ASKPASS", str(askpass_script))
-
-        result = exec_mod._run_sanitized_git_subprocess(
-            ["ls-remote", url],
-            cwd=str(repo_dir),
-            project_root=str(repo_dir),
-            scratch_root=str(scratch_dir),
-            timeout=10,
-        )
-
-        assert result.returncode != 0
-        assert not cred_marker.exists(), "credential helper marker fired"
-        assert not askpass_marker.exists(), "askpass marker fired"
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
-
-
-# ---------------------------------------------------------------------------
-# AC7 (behavioral): poisoned PATH/GIT_EXEC_PATH cannot substitute helpers
-# ---------------------------------------------------------------------------
-
-
-def test_run_control_plane_git_ls_remote_ignores_poisoned_path_and_git_exec_path(
-    monkeypatch, tmp_path
-):
-    """AC7 / P1-2: a poisoned PATH + GIT_EXEC_PATH containing a fake
-    `git-remote-https` marker executable must never be invoked -- the
-    trusted PATH allowlist and GIT_EXEC_PATH removal together close this
-    substitution."""
-    repo_dir = tmp_path / "repo"
-    home_dir = tmp_path / "home"
-    scratch_dir = tmp_path / "scratch"
-    _init_fixture_repo(repo_dir, home_dir)
-
-    malicious_dir = tmp_path / "malicious-bin"
-    malicious_dir.mkdir()
-    marker = tmp_path / "fake-git-remote-https.marker"
-    fake_helper = malicious_dir / "git-remote-https"
-    fake_helper.write_text(
-        f'#!/bin/sh\ntouch "{marker}"\necho "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef refs/heads/main"\nexit 0\n',
-        encoding="utf-8",
-    )
-    fake_helper.chmod(fake_helper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-    monkeypatch.setenv("PATH", f"{malicious_dir}{os.pathsep}{os.environ.get('PATH', '')}")
-    monkeypatch.setenv("GIT_EXEC_PATH", str(malicious_dir))
-
-    result = exec_mod.run_control_plane_git_ls_remote(
-        "https://also-unresolvable.invalid.example/repo.git",
-        cwd=str(repo_dir),
-        project_root=str(repo_dir),
-        scratch_root=str(scratch_dir),
-        timeout=10,
-    )
-
-    assert not marker.exists(), "poisoned PATH/GIT_EXEC_PATH git-remote-https helper was invoked"
-    assert result.returncode != 0
-
-
-# ---------------------------------------------------------------------------
-# AC8 / P1-3: closed command builder API rejects global options; no raw API
-# ---------------------------------------------------------------------------
-
-
-def test_no_public_raw_argv_production_api_exists():
-    assert not hasattr(exec_mod, "run_sanitized_git_subprocess")
-    assert hasattr(exec_mod, "_run_sanitized_git_subprocess")
-    for builder_name in (
+    return env
+
+
+def _init_remote_fixture(tmp_path: Path) -> tuple[Path, str, str]:
+    source = tmp_path / "source"
+    origin = tmp_path / "origin.git"
+    local = tmp_path / "local"
+    env = _git_env(tmp_path)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True, env=env)
+    (source / "README.md").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=source, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=source, check=True, env=env)
+    oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source, check=True, text=True, capture_output=True
+    ).stdout.strip()
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, env=env)
+    subprocess.run(["git", "remote", "add", "origin", origin.as_uri()], cwd=source, check=True, env=env)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=source, check=True, env=env)
+    subprocess.run(["git", "--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"], check=True, env=env)
+    subprocess.run(["git", "clone", "-q", origin.as_uri(), str(local)], check=True, env=env)
+    return local, origin.as_uri(), oid
+
+
+def _deadline() -> exec_mod.GitProtocolDeadline:
+    return exec_mod.GitProtocolDeadline.start(20, cleanup_reserve_seconds=1)
+
+
+def test_closed_surface_has_no_generic_or_raw_argv_authority():
+    forbidden = (
         "run_control_plane_git_ls_remote",
         "run_control_plane_git_fetch",
         "run_control_plane_git_cat_file",
         "run_control_plane_git_update_ref",
         "run_control_plane_git_worktree",
+        "_run_sanitized_git_subprocess",
+    )
+    for name in forbidden:
+        assert not hasattr(exec_mod, name), name
+    for name in (
+        "run_control_plane_git_effective_remote_url",
+        "run_control_plane_git_observe_default_ref",
+        "run_control_plane_git_fetch_default_ref",
+        "run_control_plane_git_read_private_ref_oid",
+        "run_control_plane_git_add_detached_locked_worktree",
+        "run_control_plane_git_delete_private_ref_cas",
     ):
-        assert hasattr(exec_mod, builder_name)
+        assert "argv" not in inspect.signature(getattr(exec_mod, name)).parameters
+    assert "*args" not in inspect.getsource(exec_mod.run_control_plane_git_add_detached_locked_worktree)
+
+
+def test_exact_remote_commands_and_fixed_fetch_cas_shapes(monkeypatch, tmp_path):
+    url = "file:///tmp/origin.git"
+    remote = validate_literal_remote_url(url)
+    ref = validate_allowed_remote_ref("refs/heads/main")
+    deadline = _deadline()
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(operation, **kwargs):
+        text = operation.kind != "probe_rewrite"
+        args = tuple(
+            exec_mod._exact_git_argv(
+                operation,
+                git_executable=kwargs["git_executable"],
+                cwd=kwargs["cwd"],
+                hooks_dir=kwargs["hooks_dir"],
+            )
+        )
+        calls.append(args)
+        if "config" in args:
+            return subprocess.CompletedProcess(list(args), 1, b"" if not text else "", b"" if not text else "")
+        if "--get-url" in args:
+            return subprocess.CompletedProcess(list(args), 0, url + "\n", "")
+        if "--show-object-format" in args:
+            return subprocess.CompletedProcess(list(args), 0, "sha1\n", "")
+        return subprocess.CompletedProcess(list(args), 0, "", "")
+
+    monkeypatch.setattr(exec_mod, "_run_closed_git_process", fake_run)
+    assert (
+        exec_mod.run_control_plane_git_effective_remote_url(
+            url, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+        )
+        == remote
+    )
+    assert (
+        exec_mod.run_control_plane_git_observe_default_ref(
+            remote, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+        ).returncode
+        == 0
+    )
+    private = exec_mod.run_control_plane_git_fetch_default_ref(
+        remote, ref, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+    )
+    fmt = exec_mod.run_control_plane_git_repository_object_format(
+        cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+    )
+    oid = exec_mod.validate_repository_object_id("a" * 40, fmt)
+    exec_mod.run_control_plane_git_delete_private_ref_cas(
+        private, oid, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+    )
+    semantic_calls = [call for call in calls if "config" not in call]
+    assert any(call[-3:] == ("ls-remote", "--get-url", url) for call in semantic_calls)
+    assert any(call[-5:] == ("ls-remote", "--exit-code", "--symref", url, "HEAD") for call in semantic_calls)
+    fetch = next(call for call in semantic_calls if "fetch" in call)
+    assert fetch[-6:-1] == ("fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", url)
+    assert fetch[-1] == f"refs/heads/main:{private.value}"
+    assert next(call for call in semantic_calls if "update-ref" in call)[-4:] == (
+        "update-ref",
+        "-d",
+        private.value,
+        oid.value,
+    )
+
+
+def test_real_fixture_proves_observe_fetch_commit_worktree_head_and_cas(tmp_path):
+    local, url, expected_oid = _init_remote_fixture(tmp_path)
+    scratch = tmp_path / "scratch"
+    deadline = _deadline()
+    remote = exec_mod.run_control_plane_git_effective_remote_url(
+        url, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    observed = exec_mod.run_control_plane_git_observe_default_ref(
+        remote, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    assert "refs/heads/main" in observed.stdout
+    fmt = exec_mod.run_control_plane_git_repository_object_format(
+        cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    private = exec_mod.run_control_plane_git_fetch_default_ref(
+        remote,
+        validate_allowed_remote_ref("refs/heads/main"),
+        cwd=str(local),
+        project_root=str(local),
+        scratch_root=str(scratch),
+        deadline=deadline,
+    )
+    fetched = exec_mod.run_control_plane_git_read_private_ref_oid(
+        private, fmt, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    assert fetched.value == expected_oid
+    exec_mod.run_control_plane_git_require_commit_object(
+        fetched, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    destination = local / ".claude" / "worktrees" / "dedicated"
+    path = validate_detached_worktree_path(str(destination), str(local))
+    exec_mod.run_control_plane_git_add_detached_locked_worktree(
+        path, fetched, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    assert (
+        exec_mod.run_control_plane_git_read_worktree_head(
+            path, fmt, project_root=str(local), scratch_root=str(scratch), deadline=deadline
+        )
+        == fetched
+    )
+    exec_mod.run_control_plane_git_delete_private_ref_cas(
+        private, fetched, cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=deadline
+    )
+    assert (
+        subprocess.run(["git", "rev-parse", "--verify", private.value], cwd=local, capture_output=True).returncode != 0
+    )
+
+
+def test_effective_remote_rewrite_mismatch_fails_closed_before_remote_operation(tmp_path):
+    local, url, _ = _init_remote_fixture(tmp_path)
+    subprocess.run(["git", "config", "--local", "url.https://evil.example/.insteadOf", url], cwd=local, check=True)
+    with pytest.raises(RuntimeError, match="effective_remote_url_mismatch"):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            url, cwd=str(local), project_root=str(local), scratch_root=str(tmp_path / "scratch"), deadline=_deadline()
+        )
+
+
+def test_deadline_reserve_refuses_terminal_spawn(monkeypatch, tmp_path):
+    spawned = False
+
+    def unexpected(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("terminal process must not spawn")
+
+    monkeypatch.setattr(exec_mod.subprocess, "Popen", unexpected)
+    expired = exec_mod.GitProtocolDeadline(time.monotonic() + 0.01, 0.1)
+    with pytest.raises(exec_mod.GitProtocolDeadlineExhausted):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git", cwd=str(tmp_path), project_root=str(tmp_path), deadline=expired
+        )
+    assert not spawned
+
+
+def test_noncontained_platform_fails_closed_before_git_spawn(monkeypatch, tmp_path):
+    monkeypatch.setattr(exec_mod, "_enable_linux_child_subreaper", lambda: False)
+    monkeypatch.setattr(
+        exec_mod.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("uncontained Git command must not spawn"),
+    )
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="containment_unavailable"):
+        exec_mod._run_closed_git_process(
+            exec_mod._GitOperation("repository_object_format"),
+            git_executable="/usr/bin/git",
+            cwd=str(tmp_path),
+            env={},
+            hooks_dir=str(tmp_path),
+            deadline=_deadline(),
+        )
+
+
+def test_timeout_terminates_and_reaps_dedicated_process_group(monkeypatch, tmp_path):
+    fake_git = tmp_path / "fake-git"
+    child_pid = tmp_path / "child.pid"
+    fake_git.write_text(
+        f'''#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+  *) (sleep 30) & echo $! > "{child_pid}"; sleep 30 ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(0.6, cleanup_reserve_seconds=0.3),
+        )
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
+
+
+def test_private_ref_nonce_is_generated_inside_builder():
+    signature = inspect.signature(exec_mod.run_control_plane_git_fetch_default_ref)
+    assert "nonce" not in signature.parameters
+    first = make_control_plane_private_ref()
+    second = make_control_plane_private_ref()
+    prefix = "refs/loop-protocol/control-plane/default-ref/"
+    assert first.value.startswith(prefix)
+    assert second.value.startswith(prefix)
+    assert first != second
+    assert len(first.value.removeprefix(prefix)) == 32
+
+
+def test_sanitized_git_environment_forces_no_lazy_fetch(tmp_path):
+    assert exec_mod.sanitized_git_subprocess_env(str(tmp_path))["GIT_NO_LAZY_FETCH"] == "1"
+
+
+def _write_group_leak_git(path: Path, pid_file: Path) -> None:
+    path.write_text(
+        f"""#!/bin/sh
+(sleep 30) >/dev/null 2>&1 &
+echo $! > "{pid_file}"
+exit 2
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def test_probe_failure_reaps_its_dedicated_process_group(monkeypatch, tmp_path):
+    fake_git = tmp_path / "probe-failure-git"
+    child_pid = tmp_path / "probe-child.pid"
+    _write_group_leak_git(fake_git, child_pid)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+        )
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
+
+
+def test_exception_after_spawn_reaps_its_dedicated_process_group(monkeypatch, tmp_path):
+    fake_git = tmp_path / "exception-git"
+    child_pid = tmp_path / "exception-child.pid"
+    _write_group_leak_git(fake_git, child_pid)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    real_popen = exec_mod.subprocess.Popen
+
+    class ExplodingPopen:
+        def __init__(self, *args, **kwargs):
+            self._proc = real_popen(*args, **kwargs)
+            self.pid = self._proc.pid
+
+        def communicate(self, **kwargs):
+            for _ in range(100):
+                if child_pid.exists():
+                    break
+                time.sleep(0.01)
+            raise RuntimeError("injected_post_spawn_failure")
+
+        def __getattr__(self, name):
+            return getattr(self._proc, name)
+
+    monkeypatch.setattr(exec_mod.subprocess, "Popen", ExplodingPopen)
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="(cleanup_unconfirmed|descendant_leak)"):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+        )
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
+
+
+def test_operation_runner_accepts_no_raw_tuple_or_list_argv_authority():
+    for name in ("_run_closed_git_process", "_execute_semantic_git"):
+        signature = inspect.signature(getattr(exec_mod, name))
+        assert "argv" not in signature.parameters
+        assert "arguments" not in signature.parameters
+    source = inspect.getsource(exec_mod)
+    assert "class _ClosedGitInvocation" not in source
+    assert "def _closed_git_invocation" not in source
+
+
+def test_forged_typed_payloads_and_global_option_injection_fail_before_spawn(monkeypatch, tmp_path):
+    def unexpected_popen(*args, **kwargs):
+        raise AssertionError("forged payload must fail before spawn")
+
+    monkeypatch.setattr(exec_mod.subprocess, "Popen", unexpected_popen)
+    deadline = _deadline()
+    invalid_calls = (
+        lambda: exec_mod.run_control_plane_git_observe_default_ref(
+            exec_mod.LiteralRemoteUrl("--config-env=core.hooksPath=/tmp/evil"),
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=deadline,
+        ),
+        lambda: exec_mod.run_control_plane_git_fetch_default_ref(
+            validate_literal_remote_url("file:///tmp/origin.git"),
+            exec_mod.AllowedRemoteRef("refs/tags/v1"),
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=deadline,
+        ),
+        lambda: exec_mod.run_control_plane_git_read_private_ref_oid(
+            exec_mod.ControlPlanePrivateRef("refs/heads/main"),
+            exec_mod.RepositoryObjectFormat("sha1"),
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=deadline,
+        ),
+        lambda: exec_mod.run_control_plane_git_require_commit_object(
+            exec_mod.RepositoryObjectId("g" * 40),
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=deadline,
+        ),
+        lambda: exec_mod.run_control_plane_git_read_worktree_head(
+            exec_mod.DetachedWorktreePath(str(tmp_path / "outside")),
+            exec_mod.RepositoryObjectFormat("sha1"),
+            project_root=str(tmp_path),
+            deadline=deadline,
+        ),
+    )
+    for call in invalid_calls:
+        with pytest.raises((TypeError, ValueError)):
+            call()
 
 
 @pytest.mark.parametrize(
-    "bad_value",
-    [
-        "-c",
-        "--config-env=core.hooksPath=/tmp/evil",
-        "-C",
-        "--git-dir=/etc",
-        "--work-tree=/",
-        "--exec-path=/tmp/evil-helpers",
-        "--namespace=evil",
-    ],
+    "deadline",
+    (
+        exec_mod.GitProtocolDeadline(float("nan"), 1),
+        exec_mod.GitProtocolDeadline(float("inf"), 1),
+        exec_mod.GitProtocolDeadline(1, float("nan")),
+        exec_mod.GitProtocolDeadline(1, float("inf")),
+        exec_mod.GitProtocolDeadline(1, 0),
+    ),
 )
-def test_run_control_plane_git_ls_remote_rejects_global_option_like_repo_value(bad_value, tmp_path):
-    with pytest.raises(ValueError):
-        exec_mod.run_control_plane_git_ls_remote(
-            bad_value,
-            cwd=str(tmp_path),
-            project_root=str(tmp_path),
-            timeout=10,
-        )
-
-
-def test_internal_engine_rejects_global_option_argv_defense_in_depth():
-    with pytest.raises(ValueError):
-        exec_mod._run_sanitized_git_subprocess(
-            ["-c", "core.hooksPath=/tmp/evil", "status"],
-            cwd=".",
-            project_root=".",
-            timeout=10,
-        )
-
-
-def test_run_control_plane_git_cat_file_rejects_disallowed_mode(tmp_path):
-    with pytest.raises(ValueError):
-        exec_mod.run_control_plane_git_cat_file(
-            "deadbeef",
-            mode="--batch",
-            cwd=str(tmp_path),
-            project_root=str(tmp_path),
-            timeout=10,
-        )
-
-
-def test_run_control_plane_git_worktree_rejects_disallowed_action(tmp_path):
-    with pytest.raises(ValueError):
-        exec_mod.run_control_plane_git_worktree(
-            "lock",
-            cwd=str(tmp_path),
-            project_root=str(tmp_path),
-            timeout=10,
-        )
-
-
-def test_run_control_plane_git_worktree_list_succeeds(tmp_path):
-    repo_dir = tmp_path / "repo"
-    home_dir = tmp_path / "home"
-    scratch_dir = tmp_path / "scratch"
-    _init_fixture_repo(repo_dir, home_dir)
-    result = exec_mod.run_control_plane_git_worktree(
-        "list",
-        cwd=str(repo_dir),
-        project_root=str(repo_dir),
-        scratch_root=str(scratch_dir),
-        timeout=10,
+def test_forged_nonfinite_or_nonpositive_deadline_fails_before_spawn(monkeypatch, tmp_path, deadline):
+    monkeypatch.setattr(
+        exec_mod.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("invalid deadline must fail before spawn"),
     )
-    assert result.returncode == 0, result.stderr
-
-
-# ---------------------------------------------------------------------------
-# AC10 / AC11: bounded timeout required, stdin=DEVNULL, --no-replace-objects
-# ---------------------------------------------------------------------------
-
-
-def test_run_control_plane_git_worktree_requires_timeout_kwarg(tmp_path):
-    with pytest.raises(TypeError):
-        exec_mod.run_control_plane_git_worktree(
-            "list", cwd=str(tmp_path), project_root=str(tmp_path)
-        )  # missing required timeout
-
-
-def test_internal_engine_rejects_none_timeout():
     with pytest.raises(ValueError):
-        exec_mod._run_sanitized_git_subprocess(
-            ["status"], cwd=".", project_root=".", timeout=None
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git", cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
         )
 
 
-def test_internal_engine_rejects_non_positive_timeout():
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), 0, -1))
+def test_deadline_start_rejects_nonfinite_or_nonpositive_values(value):
     with pytest.raises(ValueError):
-        exec_mod._run_sanitized_git_subprocess(
-            ["status"], cwd=".", project_root=".", timeout=0
+        exec_mod.GitProtocolDeadline.start(value)
+    with pytest.raises(ValueError):
+        exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=value)
+
+
+def test_base_exception_with_unconfirmed_cleanup_fails_closed(monkeypatch, tmp_path):
+    class ExplodingPopen:
+        pid = 12345
+
+        def communicate(self, **kwargs):
+            raise RuntimeError("injected_post_spawn_failure")
+
+    monkeypatch.setattr(exec_mod.subprocess, "Popen", lambda *args, **kwargs: ExplodingPopen())
+    monkeypatch.setattr(exec_mod, "_terminate_git_process_group", lambda *args, **kwargs: False)
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed):
+        exec_mod._run_closed_git_process(
+            exec_mod._GitOperation("repository_object_format"),
+            git_executable="/usr/bin/git",
+            cwd=str(tmp_path),
+            env={},
+            hooks_dir=str(tmp_path),
+            deadline=_deadline(),
         )
 
 
-def test_run_control_plane_git_worktree_applies_no_replace_objects_and_devnull_stdin(
-    monkeypatch, tmp_path
-):
-    """AC10 / AC11: every subprocess.run call the engine makes (both the
-    insteadOf probe and the real command) fixes `--no-replace-objects` and
-    defaults `stdin=subprocess.DEVNULL`, with the caller-supplied bounded
-    timeout forwarded unchanged."""
-    repo_dir = tmp_path / "repo"
-    home_dir = tmp_path / "home"
-    scratch_dir = tmp_path / "scratch"
-    _init_fixture_repo(repo_dir, home_dir)
-
-    calls = []
-    real_run = subprocess.run
-
-    def _spy(argv, **kwargs):
-        calls.append((list(argv), kwargs))
-        return real_run(argv, **kwargs)
-
-    monkeypatch.setattr(exec_mod.subprocess, "run", _spy)
-
-    result = exec_mod.run_control_plane_git_worktree(
-        "list",
-        cwd=str(repo_dir),
-        project_root=str(repo_dir),
-        scratch_root=str(scratch_dir),
-        timeout=12,
+def test_unrelated_insteadof_does_not_block_literal_remote(tmp_path):
+    local, url, _ = _init_remote_fixture(tmp_path)
+    subprocess.run(
+        ["git", "config", "--local", "url.https://company-mirror.example/.insteadOf", "https://unrelated.example/"],
+        cwd=local,
+        check=True,
     )
-    assert result.returncode == 0, result.stderr
-    assert len(calls) == 2, "expected exactly the probe call and the real command call"
-    for argv, kwargs in calls:
-        assert "--no-replace-objects" in argv
-        assert kwargs.get("stdin") == subprocess.DEVNULL
-        assert kwargs.get("timeout") == 12
+    observed = exec_mod.run_control_plane_git_observe_default_ref(
+        validate_literal_remote_url(url),
+        cwd=str(local),
+        project_root=str(local),
+        scratch_root=str(tmp_path / "scratch"),
+        deadline=_deadline(),
+    )
+    assert "refs/heads/main" in observed.stdout
+
+
+def test_pushinsteadof_does_not_block_fetch_protocol(tmp_path):
+    local, url, _ = _init_remote_fixture(tmp_path)
+    subprocess.run(
+        ["git", "config", "--local", "url.https://push-only.example/.pushInsteadOf", url],
+        cwd=local,
+        check=True,
+    )
+    observed = exec_mod.run_control_plane_git_observe_default_ref(
+        validate_literal_remote_url(url),
+        cwd=str(local),
+        project_root=str(local),
+        scratch_root=str(tmp_path / "scratch"),
+        deadline=_deadline(),
+    )
+    assert "refs/heads/main" in observed.stdout
+
+
+def test_typed_runner_preserves_sanitized_hooks_credentials_askpass_and_path(monkeypatch, tmp_path):
+    fake_git = tmp_path / "fake-git"
+    capture = tmp_path / "capture"
+    arguments_capture = tmp_path / "arguments"
+    url = "file:///tmp/origin.git"
+    fake_git.write_text(
+        f"""#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+esac
+printf '%s\n' "$*" > "{arguments_capture}"
+printf '%s\n' "$GIT_TERMINAL_PROMPT" > "{capture}"
+printf '%s\n' "$GIT_ASKPASS" >> "{capture}"
+printf '%s\n' "$SSH_ASKPASS" >> "{capture}"
+printf '%s\n' "$GIT_NO_LAZY_FETCH" >> "{capture}"
+printf '%s\n' "${{GIT_EXEC_PATH-unset}}" >> "{capture}"
+printf '%s\n' "$PATH" >> "{capture}"
+printf '%s\n' "{url}"
+""",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    malicious = tmp_path / "malicious"
+    malicious.mkdir()
+    monkeypatch.setenv("PATH", f"{malicious}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("GIT_EXEC_PATH", str(malicious))
+    monkeypatch.setenv("GIT_ASKPASS", str(malicious / "askpass"))
+    monkeypatch.setenv("SSH_ASKPASS", str(malicious / "askpass"))
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    assert (
+        exec_mod.run_control_plane_git_effective_remote_url(
+            url, cwd=str(tmp_path), project_root=str(tmp_path), deadline=_deadline()
+        ).value
+        == url
+    )
+    prompt, askpass, ssh_askpass, no_lazy, git_exec_path, child_path = capture.read_text(encoding="utf-8").splitlines()
+    assert (prompt, askpass, ssh_askpass, no_lazy, git_exec_path) == ("0", "", "", "1", "unset")
+    assert str(malicious) not in child_path
+    command_text = arguments_capture.read_text(encoding="utf-8")
+    assert "core.hooksPath=" in command_text
+    assert "credential.helper=" in command_text
+    assert "--no-replace-objects" in command_text
+
+
+def test_typed_worktree_builder_suppresses_repository_hook(tmp_path):
+    local, _, expected_oid = _init_remote_fixture(tmp_path)
+    marker = tmp_path / "post-checkout.marker"
+    hook = local / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f'#!/bin/sh\ntouch "{marker}"\n', encoding="utf-8")
+    hook.chmod(0o755)
+    deadline = _deadline()
+    object_format = exec_mod.run_control_plane_git_repository_object_format(
+        cwd=str(local), project_root=str(local), deadline=deadline
+    )
+    commit = exec_mod.validate_repository_object_id(expected_oid, object_format)
+    path = validate_detached_worktree_path(str(local / ".claude" / "worktrees" / "hook-check"), str(local))
+    exec_mod.run_control_plane_git_add_detached_locked_worktree(
+        path, commit, cwd=str(local), project_root=str(local), deadline=deadline
+    )
+    assert not marker.exists(), "repository hook fired despite fixed empty hooksPath"
+
+
+
+def test_internal_worktree_operation_revalidates_forged_paths_before_any_argv(monkeypatch, tmp_path):
+    def unexpected_popen(*args, **kwargs):
+        raise AssertionError("forged worktree path must not reach argv")
+
+    monkeypatch.setattr(exec_mod.subprocess, "Popen", unexpected_popen)
+    deadline = _deadline()
+    commit = exec_mod.RepositoryObjectId("a" * 40)
+    for path in (
+        exec_mod.DetachedWorktreePath("--force"),
+        exec_mod.DetachedWorktreePath(str(tmp_path.parent / "unconfined-worktree")),
+    ):
+        operation = exec_mod._GitOperation(
+            "add_detached_locked_worktree", worktree_path=path, object_id=commit
+        )
+        with pytest.raises((TypeError, ValueError)):
+            exec_mod._execute_semantic_git(
+                operation,
+                cwd=str(tmp_path),
+                project_root=str(tmp_path),
+                scratch_root=str(tmp_path / "scratch"),
+                deadline=deadline,
+            )
+
+
+def _write_delayed_setsid_escape_git(path: Path, pid_file: Path, trace_file: Path, *, probe_fails: bool) -> None:
+    """Create a fixture that defeats a point-in-time `/proc` tree snapshot.
+
+    The `setsid` helper runs independently of the Git process group and does
+    not publish its PID until after a delay. An unreadable `/proc` snapshot
+    therefore leaves the executor unable to distinguish this live escape from
+    absence, which must fail closed.
+    """
+    escape_script = path.parent / f"{path.name}.delayed-escape"
+    escape_script.write_text(
+        f"#!/bin/sh\nsleep 0.35\necho $$ > \"{pid_file}\"\nsleep 30\n",
+        encoding="utf-8",
+    )
+    escape_script.chmod(0o755)
+    delayed_escape = (
+        f"printf 'setsid-parent-started\\n' > \"{trace_file}\"; "
+        f"setsid \"{escape_script}\" >/dev/null 2>&1 & sleep 0.08"
+    )
+    path.write_text(
+        f'''#!/bin/sh
+case "$*" in
+  *config*) {delayed_escape}; {'exit 2' if probe_fails else 'exit 1'} ;;
+  *) {delayed_escape}; sleep 30 ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _assert_delayed_escape_trace_and_reap(pid_file: Path, trace_file: Path) -> None:
+    """Prove the delayed escape occurred, then keep the test fixture clean."""
+    deadline = time.monotonic() + 2
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert trace_file.read_text(encoding="utf-8") == "setsid-parent-started\n"
+    # The invocation supervisor may terminate the delayed helper before it
+    # materializes its setsid child. If it did materialize, clean the fixture
+    # defensively and require eventual absence rather than reaping via the
+    # long-lived test host.
+    if not pid_file.exists():
+        return
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
+
+
+def test_successful_leader_with_delayed_setsid_child_reaches_result_validation(monkeypatch, tmp_path):
+    # A leader-rooted empty snapshot cannot certify normal-success cleanup.
+    # The invocation supervisor adopts and reaps the real `setsid` child, then
+    # returns to the semantic result validator; this fixture's output remains
+    # deliberately invalid for effective-URL validation.
+    fake_git = tmp_path / "setsid-success-git"
+    child_pid = tmp_path / "setsid-success-child.pid"
+    trace = tmp_path / "setsid-success.trace"
+    fake_git.write_text(
+        f'''#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+  *)
+    (sleep 0.02; setsid sh -c 'echo $$ > "{child_pid}"; sleep 30') >/dev/null 2>&1 &
+    sleep 0.10
+    echo leader-success > "{trace}"
+    exit 0 ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    # This models the review finding: `/proc` is readable but the old
+    # leader-rooted observation races and sees no descendant.
+    monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: set())
+    with pytest.raises(RuntimeError, match="effective_remote_url_mismatch"):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+        )
+    assert trace.read_text(encoding="utf-8") == "leader-success\n"
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
+
+
+def test_timeout_delayed_setsid_escape_fails_closed_not_snapshot_success(monkeypatch, tmp_path):
+    fake_git = tmp_path / "setsid-timeout-git"
+    child_pid = tmp_path / "setsid-timeout-child.pid"
+    trace = tmp_path / "setsid-timeout.trace"
+    _write_delayed_setsid_escape_git(fake_git, child_pid, trace, probe_fails=False)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    # Model an unreadable `/proc` snapshot. The real fixture still makes a
+    # delayed `setsid` escape, so no cleanup verdict may be successful.
+    monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: None)
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="(cleanup_unconfirmed|descendant_leak)"):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(0.8, cleanup_reserve_seconds=0.4),
+        )
+    _assert_delayed_escape_trace_and_reap(child_pid, trace)
+
+
+def test_probe_failure_delayed_setsid_escape_fails_closed_not_snapshot_success(monkeypatch, tmp_path):
+    fake_git = tmp_path / "setsid-probe-git"
+    child_pid = tmp_path / "setsid-probe-child.pid"
+    trace = tmp_path / "setsid-probe.trace"
+    _write_delayed_setsid_escape_git(fake_git, child_pid, trace, probe_fails=True)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    # Model an unreadable `/proc` snapshot. The real fixture still makes a
+    # delayed `setsid` escape, so no cleanup verdict may be successful.
+    monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: None)
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="(cleanup_unconfirmed|descendant_leak)"):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+        )
+    _assert_delayed_escape_trace_and_reap(child_pid, trace)
+
+
+def test_exception_delayed_setsid_escape_fails_closed_not_snapshot_success(monkeypatch, tmp_path):
+    fake_git = tmp_path / "setsid-exception-git"
+    child_pid = tmp_path / "setsid-exception-child.pid"
+    trace = tmp_path / "setsid-exception.trace"
+    _write_delayed_setsid_escape_git(fake_git, child_pid, trace, probe_fails=False)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    # An observation gap is indistinguishable from an unreadable snapshot.
+    monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: None)
+    real_popen = exec_mod.subprocess.Popen
+
+    class ExplodingPopen:
+        def __init__(self, *args, **kwargs):
+            self._proc = real_popen(*args, **kwargs)
+            self.pid = self._proc.pid
+            self._is_probe = "config" in args[0]
+
+        def communicate(self, **kwargs):
+            if self._is_probe:
+                return self._proc.communicate(**kwargs)
+            time.sleep(0.1)
+            raise RuntimeError("injected_delayed_setsid_post_spawn_failure")
+
+        def __getattr__(self, name):
+            return getattr(self._proc, name)
+
+    monkeypatch.setattr(exec_mod.subprocess, "Popen", ExplodingPopen)
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="(cleanup_unconfirmed|descendant_leak)"):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+        )
+    _assert_delayed_escape_trace_and_reap(child_pid, trace)
+
+
+
+def _current_process_is_linux_subreaper() -> bool:
+    """Read, but never alter, the current test host's subreaper state."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux subreaper regression")
+    libc = exec_mod.ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [
+        exec_mod.ctypes.c_int,
+        exec_mod.ctypes.c_ulong,
+        exec_mod.ctypes.c_ulong,
+        exec_mod.ctypes.c_ulong,
+        exec_mod.ctypes.c_ulong,
+    ]
+    prctl.restype = exec_mod.ctypes.c_int
+    enabled = exec_mod.ctypes.c_int()
+    assert prctl(exec_mod._PR_GET_CHILD_SUBREAPER, exec_mod.ctypes.addressof(enabled), 0, 0, 0) == 0
+    return bool(enabled.value)
+
+
+def _wait_until_pid_gone(pid: int, timeout: float = 2.0) -> bool:
+    until = time.monotonic() + timeout
+    while time.monotonic() < until:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_first_descendant_observation_exception_still_performs_bounded_cleanup(monkeypatch, tmp_path):
+    fake_git = tmp_path / "first-observation-exception-git"
+    child_pid = tmp_path / "first-observation-child.pid"
+    _write_group_leak_git(fake_git, child_pid)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+
+    def fail_first_observation(_leader_pid):
+        until = time.monotonic() + 1
+        while not child_pid.exists() and time.monotonic() < until:
+            time.sleep(0.01)
+        raise RuntimeError("injected_first_descendant_observation_failure")
+
+    monkeypatch.setattr(exec_mod, "_observe_git_descendants", fail_first_observation)
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+        )
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    assert _wait_until_pid_gone(pid), "first-observation exception leaked a Git child"
+
+
+def test_invocation_supervisor_does_not_classify_or_reap_unrelated_host_child(monkeypatch, tmp_path):
+    """A Git escape is cleaned without adopting an unrelated executor child."""
+    before_subreaper = _current_process_is_linux_subreaper()
+    fake_git = tmp_path / "escaped-git"
+    escaped_pid_file = tmp_path / "escaped-git.pid"
+    fake_git.write_text(
+        f'''#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+  *)
+    (setsid sh -c 'echo $$ > "{escaped_pid_file}"; sleep 30') >/dev/null 2>&1 &
+    sleep 0.05
+    exit 0 ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    host_child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        with pytest.raises(RuntimeError, match="effective_remote_url_mismatch"):
+            exec_mod.run_control_plane_git_effective_remote_url(
+                "file:///tmp/origin.git",
+                cwd=str(tmp_path),
+                project_root=str(tmp_path),
+                deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+            )
+        if escaped_pid_file.exists():
+            escaped_pid = int(escaped_pid_file.read_text(encoding="utf-8"))
+            assert _wait_until_pid_gone(escaped_pid), "Git-derived escaped child was not cleaned"
+        assert _current_process_is_linux_subreaper() is before_subreaper
+        assert os.waitpid(host_child.pid, os.WNOHANG) == (0, 0)
+        os.kill(host_child.pid, 0)
+    finally:
+        try:
+            os.killpg(host_child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        host_child.wait(timeout=2)
+
+
+
+def _write_parent_result_read_escape_git(path: Path, pid_file: Path) -> None:
+    path.write_text(
+        f'''#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+  *)
+    (setsid sh -c 'echo $$ > "{pid_file}"; sleep 30') >/dev/null 2>&1 &
+    while [ ! -s "{pid_file}" ]; do sleep 0.01; done
+    sleep 30
+    ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _assert_parent_result_read_cleanup_preserves_host_child(
+    host_child: subprocess.Popen, escaped_pid_file: Path
+) -> None:
+    escaped_pid = int(escaped_pid_file.read_text(encoding="utf-8"))
+    assert _wait_until_pid_gone(escaped_pid), "parent-side result failure leaked an escaped Git descendant"
+    assert os.waitpid(host_child.pid, os.WNOHANG) == (0, 0)
+    os.kill(host_child.pid, 0)
+
+
+def test_parent_result_read_failure_performs_git_only_cleanup_before_fail_closed(monkeypatch, tmp_path):
+    """A malformed/failed parent result read cannot strand the supervisor's Git tree."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux invocation-supervisor regression")
+    fake_git = tmp_path / "parent-result-failure-git"
+    escaped_pid_file = tmp_path / "parent-result-failure-escaped.pid"
+    _write_parent_result_read_escape_git(fake_git, escaped_pid_file)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+
+    real_result_read = exec_mod._read_invocation_supervisor_result
+    reads = 0
+
+    def fail_result_read(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return real_result_read(*args, **kwargs)
+        until = time.monotonic() + 1
+        while not escaped_pid_file.exists() and time.monotonic() < until:
+            time.sleep(0.01)
+        assert escaped_pid_file.exists(), "fixture did not start its escaped Git descendant"
+        return None
+
+    monkeypatch.setattr(exec_mod, "_read_invocation_supervisor_result", fail_result_read)
+    host_child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
+            exec_mod.run_control_plane_git_effective_remote_url(
+                "file:///tmp/origin.git",
+                cwd=str(tmp_path),
+                project_root=str(tmp_path),
+                deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+            )
+        _assert_parent_result_read_cleanup_preserves_host_child(host_child, escaped_pid_file)
+    finally:
+        try:
+            os.killpg(host_child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        host_child.wait(timeout=2)
+
+
+def test_parent_keyboard_interrupt_waits_for_git_only_cleanup_before_propagating(monkeypatch, tmp_path):
+    """KeyboardInterrupt propagates only after the supervisor proves no Git leak."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux invocation-supervisor regression")
+    fake_git = tmp_path / "parent-keyboard-interrupt-git"
+    escaped_pid_file = tmp_path / "parent-keyboard-interrupt-escaped.pid"
+    _write_parent_result_read_escape_git(fake_git, escaped_pid_file)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+
+    real_result_read = exec_mod._read_invocation_supervisor_result
+    reads = 0
+
+    def interrupt_result_read(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return real_result_read(*args, **kwargs)
+        until = time.monotonic() + 1
+        while not escaped_pid_file.exists() and time.monotonic() < until:
+            time.sleep(0.01)
+        assert escaped_pid_file.exists(), "fixture did not start its escaped Git descendant"
+        raise KeyboardInterrupt("injected_parent_result_read_interrupt")
+
+    monkeypatch.setattr(exec_mod, "_read_invocation_supervisor_result", interrupt_result_read)
+    host_child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
+            exec_mod.run_control_plane_git_effective_remote_url(
+                "file:///tmp/origin.git",
+                cwd=str(tmp_path),
+                project_root=str(tmp_path),
+                deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+            )
+        _assert_parent_result_read_cleanup_preserves_host_child(host_child, escaped_pid_file)
+    finally:
+        try:
+            os.killpg(host_child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        host_child.wait(timeout=2)
+
+
+def test_invocation_supervisor_allows_contained_git_helper_to_finish(monkeypatch, tmp_path):
+    """A normal helper in the dedicated Git group is drained, not misclassified."""
+    fake_git = tmp_path / "contained-helper-git"
+    fake_git.write_text(
+        """#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+  *)
+    (sleep 0.05) >/dev/null 2>&1 &
+    printf '%s\n' 'file:///tmp/origin.git'
+    exit 0 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    assert exec_mod.run_control_plane_git_effective_remote_url(
+        "file:///tmp/origin.git",
+        cwd=str(tmp_path),
+        project_root=str(tmp_path),
+        deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+    ).value == "file:///tmp/origin.git"
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://github.com/squne121/loop-protocol.git",
+        "ssh://git@github.com/squne121/loop-protocol.git",
+        "git@github.com:squne121/loop-protocol.git",
+        "file:///tmp/loop-protocol.git",
+    ),
+)
+def test_accepts_ssh_uri_and_scp_like_github_origin_without_network(tmp_path, url):
+    local, _, _ = _init_remote_fixture(tmp_path)
+    assert (
+        exec_mod.run_control_plane_git_effective_remote_url(
+            url,
+            cwd=str(local),
+            project_root=str(local),
+            scratch_root=str(tmp_path / "scratch"),
+            deadline=_deadline(),
+        ).value
+        == url
+    )
+
+
+def _assert_worktree_absent(local: Path, destination: Path) -> None:
+    assert not destination.exists()
+    listed = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=local, text=True, check=True, capture_output=True
+    ).stdout
+    assert f"worktree {destination}" not in listed
+
+
+def _worktree_rollback_fixture(tmp_path: Path) -> tuple[Path, object, object, Path]:
+    local, _, expected_oid = _init_remote_fixture(tmp_path)
+    deadline = _deadline()
+    object_format = exec_mod.run_control_plane_git_repository_object_format(
+        cwd=str(local), project_root=str(local), scratch_root=str(tmp_path / "scratch"), deadline=deadline
+    )
+    commit = exec_mod.validate_repository_object_id(expected_oid, object_format)
+    destination = local / ".claude" / "worktrees" / "rollback"
+    return local, commit, deadline, destination
+
+
+def test_worktree_readback_failure_rolls_back_locked_worktree(monkeypatch, tmp_path):
+    local, commit, deadline, destination = _worktree_rollback_fixture(tmp_path)
+    path = validate_detached_worktree_path(str(destination), str(local))
+    monkeypatch.setattr(
+        exec_mod,
+        "run_control_plane_git_read_worktree_head",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected_readback_failure")),
+    )
+    with pytest.raises(RuntimeError, match="injected_readback_failure"):
+        exec_mod.run_control_plane_git_add_detached_locked_worktree(
+            path,
+            commit,
+            cwd=str(local),
+            project_root=str(local),
+            scratch_root=str(tmp_path / "scratch"),
+            deadline=deadline,
+        )
+    _assert_worktree_absent(local, destination)
+
+
+def test_worktree_head_mismatch_rolls_back_locked_worktree(monkeypatch, tmp_path):
+    local, commit, deadline, destination = _worktree_rollback_fixture(tmp_path)
+    path = validate_detached_worktree_path(str(destination), str(local))
+    monkeypatch.setattr(
+        exec_mod,
+        "run_control_plane_git_read_worktree_head",
+        lambda *args, **kwargs: exec_mod.RepositoryObjectId("b" * len(commit.value)),
+    )
+    with pytest.raises(RuntimeError, match="detached_worktree_head_mismatch"):
+        exec_mod.run_control_plane_git_add_detached_locked_worktree(
+            path,
+            commit,
+            cwd=str(local),
+            project_root=str(local),
+            scratch_root=str(tmp_path / "scratch"),
+            deadline=deadline,
+        )
+    _assert_worktree_absent(local, destination)
+
+
+def test_worktree_deadline_exhaustion_after_add_rolls_back_locked_worktree(monkeypatch, tmp_path):
+    local, commit, deadline, destination = _worktree_rollback_fixture(tmp_path)
+    path = validate_detached_worktree_path(str(destination), str(local))
+    monkeypatch.setattr(
+        exec_mod,
+        "run_control_plane_git_read_worktree_head",
+        lambda *args, **kwargs: (_ for _ in ()).throw(exec_mod.GitProtocolDeadlineExhausted("injected_deadline")),
+    )
+    with pytest.raises(exec_mod.GitProtocolDeadlineExhausted, match="injected_deadline"):
+        exec_mod.run_control_plane_git_add_detached_locked_worktree(
+            path,
+            commit,
+            cwd=str(local),
+            project_root=str(local),
+            scratch_root=str(tmp_path / "scratch"),
+            deadline=deadline,
+        )
+    _assert_worktree_absent(local, destination)
+
+
+def test_git_243_partial_clone_does_not_claim_no_lazy_support(monkeypatch, tmp_path):
+    """A no-capability promisor repository stops before real `git fetch`.
+
+    The fixture uses real Git for `--get-url` and local promisor discovery;
+    capability is forced to the Git 2.43 result. A fetch would create a private
+    ref in this local bare-origin fixture, so its absence is behavioral proof
+    that the remote operation never started.
+    """
+    local, url, _ = _init_remote_fixture(tmp_path)
+    subprocess.run(
+        ["git", "config", "--local", "remote.origin.promisor", "true"], cwd=local, check=True
+    )
+    monkeypatch.setattr(exec_mod, "_git_supports_no_lazy_fetch", lambda *args, **kwargs: False)
+    with pytest.raises(RuntimeError, match="no_lazy_fetch_not_supported"):
+        exec_mod.run_control_plane_git_fetch_default_ref(
+            validate_literal_remote_url(url),
+            validate_allowed_remote_ref("refs/heads/main"),
+            cwd=str(local),
+            project_root=str(local),
+            scratch_root=str(tmp_path / "scratch"),
+            deadline=_deadline(),
+        )
+    refs = subprocess.run(
+        ["git", "for-each-ref", "refs/loop-protocol/control-plane/default-ref"],
+        cwd=local,
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+    assert not refs.stdout
+
+
+def test_supported_fetch_uses_fixed_no_lazy_fetch_global_option(monkeypatch, tmp_path):
+    url = "file:///tmp/origin.git"
+    remote = validate_literal_remote_url(url)
+    ref = validate_allowed_remote_ref("refs/heads/main")
+    argv: list[tuple[str, ...]] = []
+
+    def fake_run(operation, **kwargs):
+        args = tuple(
+            exec_mod._exact_git_argv(
+                operation,
+                git_executable=kwargs["git_executable"],
+                cwd=kwargs["cwd"],
+                hooks_dir=kwargs["hooks_dir"],
+            )
+        )
+        argv.append(args)
+        if operation.kind == "effective_remote_url":
+            return subprocess.CompletedProcess(list(args), 0, url + "\n", "")
+        return subprocess.CompletedProcess(list(args), 0, "", "")
+
+    monkeypatch.setattr(exec_mod, "_run_closed_git_process", fake_run)
+    exec_mod.run_control_plane_git_fetch_default_ref(
+        remote, ref, cwd=str(tmp_path), project_root=str(tmp_path), deadline=_deadline()
+    )
+    fetch = next(args for args in argv if "fetch" in args)
+    assert "--no-lazy-fetch" in fetch
+    assert fetch[-6:-1] == ("fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", url)
+
+
+def test_final_child_observation_none_is_cleanup_unconfirmed(monkeypatch):
+    child = exec_mod._TrackedGitDescendant(123, "start")
+    observations = iter(({child}, None))
+    monotonic = iter((0.0, 0.0, 1.0, 1.0))
+    monkeypatch.setattr(exec_mod, "_observe_invocation_supervisor_children", lambda: next(observations))
+    monkeypatch.setattr(exec_mod, "_signal_invocation_child_trees", lambda *args: True)
+    monkeypatch.setattr(exec_mod, "_reap_tracked_children", lambda *args: True)
+    monkeypatch.setattr(exec_mod.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(exec_mod.time, "sleep", lambda *_: None)
+    assert not exec_mod._terminate_invocation_supervisor_children(exec_mod.GitProtocolDeadline(1.0, 0.5))
+
+
+def test_hooks_directory_is_removed_and_git_status_remains_clean(tmp_path):
+    local, _, _ = _init_remote_fixture(tmp_path)
+    exec_mod.run_control_plane_git_repository_object_format(
+        cwd=str(local), project_root=str(local), deadline=_deadline()
+    )
+    assert not list(local.glob(".skill-runtime-git-hooks-*"))
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=local, text=True, check=True, capture_output=True
+    )
+    assert not status.stdout
