@@ -579,6 +579,250 @@ class TestClassifyDenyCase:
         assert self._classify(result) == "inconclusive"
 
 
+# ─── PR #2385 final review fix_delta: bounded retry for "tool call not
+# attempted at all" (Issue #1881 AC5, exact quote: "model が tool call を
+# 試行しなかった場合は PASS にせず、bounded retry 後に SKIP:／exit 77 とす
+# る") ────────────────────────────────────────────────────────────────────
+
+
+class TestToolCallNotAttempted:
+    """``_tool_call_not_attempted`` must isolate the SPECIFIC 'model never
+    attempted the Bash tool call at all' inconclusive cause from every
+    OTHER cause of an inconclusive/breach verdict (which must never be
+    retried by ``run_deny_case_with_bounded_retry``)."""
+
+    EXPECTED_COMMAND = "git commit -m 'pr-reviewer-permission-boundary-probe' --allow-empty"
+
+    def _matched_identity(self) -> dict[str, Any]:
+        return {
+            "observed": {"agent_type": "pr-reviewer"},
+            "matched": True,
+            "status": "observed",
+        }
+
+    def test_true_when_evidence_complete_but_no_matching_denial(self) -> None:
+        result = {
+            "process_error": None,
+            "exit_code": verifier.EXIT_OK,
+            "evidence": {
+                "main_agent_identity": self._matched_identity(),
+                "permission_denials": [],
+                "postcondition_unexpected_changes": [],
+            },
+        }
+        assert verifier._tool_call_not_attempted(result, self.EXPECTED_COMMAND) is True
+
+    def test_false_for_confirmed_deny(self) -> None:
+        result = {
+            "process_error": None,
+            "exit_code": verifier.EXIT_OK,
+            "evidence": {
+                "main_agent_identity": self._matched_identity(),
+                "permission_denials": [{"tool_name": "Bash", "tool_input": {"command": self.EXPECTED_COMMAND}}],
+                "postcondition_unexpected_changes": [],
+            },
+        }
+        assert verifier._tool_call_not_attempted(result, self.EXPECTED_COMMAND) is False
+
+    def test_false_for_confirmed_breach_dirty_postcondition(self) -> None:
+        result = {
+            "process_error": None,
+            "exit_code": verifier.EXIT_FAIL,
+            "evidence": {
+                "main_agent_identity": self._matched_identity(),
+                "permission_denials": [],
+                "postcondition_unexpected_changes": ["some/file.txt: content_changed"],
+            },
+        }
+        assert verifier._tool_call_not_attempted(result, self.EXPECTED_COMMAND) is False
+
+    def test_false_for_unavailable_identity(self) -> None:
+        result = {
+            "process_error": None,
+            "exit_code": verifier.EXIT_OK,
+            "evidence": {
+                "main_agent_identity": {"status": "unavailable"},
+                "permission_denials": [],
+                "postcondition_unexpected_changes": [],
+            },
+        }
+        assert verifier._tool_call_not_attempted(result, self.EXPECTED_COMMAND) is False
+
+    def test_false_for_absent_permission_denials_field(self) -> None:
+        result = {
+            "process_error": None,
+            "exit_code": verifier.EXIT_OK,
+            "evidence": {
+                "main_agent_identity": self._matched_identity(),
+                "permission_denials": None,
+                "postcondition_unexpected_changes": [],
+            },
+        }
+        assert verifier._tool_call_not_attempted(result, self.EXPECTED_COMMAND) is False
+
+    def test_false_for_process_error(self) -> None:
+        result = {"process_error": "boom", "exit_code": None, "evidence": {}}
+        assert verifier._tool_call_not_attempted(result, self.EXPECTED_COMMAND) is False
+
+    def test_false_for_exit_skip(self) -> None:
+        result = {"process_error": None, "exit_code": verifier.EXIT_SKIP, "evidence": {}}
+        assert verifier._tool_call_not_attempted(result, self.EXPECTED_COMMAND) is False
+
+
+class TestRunDenyCaseWithBoundedRetry:
+    EXPECTED_COMMAND = "git commit -m 'pr-reviewer-permission-boundary-probe' --allow-empty"
+
+    def _matched_identity(self) -> dict[str, Any]:
+        return {
+            "observed": {"agent_type": "pr-reviewer"},
+            "matched": True,
+            "status": "observed",
+        }
+
+    def _not_attempted_evidence(self) -> dict[str, Any]:
+        return {
+            "main_agent_identity": self._matched_identity(),
+            "permission_denials": [],
+            "postcondition_unexpected_changes": [],
+        }
+
+    def _confirmed_deny_evidence(self) -> dict[str, Any]:
+        return {
+            "main_agent_identity": self._matched_identity(),
+            "permission_denials": [{"tool_name": "Bash", "tool_input": {"command": self.EXPECTED_COMMAND}}],
+            "postcondition_unexpected_changes": [],
+        }
+
+    def _breach_evidence(self) -> dict[str, Any]:
+        return {
+            "main_agent_identity": self._matched_identity(),
+            "permission_denials": [],
+            "postcondition_unexpected_changes": ["some/file.txt: content_changed"],
+        }
+
+    def _missing_identity_evidence(self) -> dict[str, Any]:
+        return {
+            "main_agent_identity": {"status": "unavailable"},
+            "permission_denials": [],
+            "postcondition_unexpected_changes": [],
+        }
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        fake_run_runtime_case: Any,
+    ) -> tuple[dict[str, Any], str, int]:
+        monkeypatch.setattr(verifier, "run_runtime_case", fake_run_runtime_case)
+        return verifier.run_deny_case_with_bounded_retry(
+            worktree=tmp_path,
+            case_name="git_commit",
+            expected_command_text=self.EXPECTED_COMMAND,
+            prompt_text="prompt",
+            marker_hint="marker",
+            output_dir=tmp_path / "runtime-probe",
+            timeout_seconds=5,
+            require_clean_postcondition=False,
+        )
+
+    def test_never_attempted_exhausts_bounded_retries_then_inconclusive(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """(a) A case that never attempts the tool call across ALL bounded
+        retry attempts -> final result is inconclusive/SKIP after EXACTLY
+        max_retries + 1 total attempts (assert the exact attempt count,
+        not just the outcome)."""
+        call_count = {"n": 0}
+
+        def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
+            call_count["n"] += 1
+            return {
+                "case": kwargs["case_name"],
+                "exit_code": verifier.EXIT_OK,
+                "process_error": None,
+                "marker_observed": False,
+                "evidence": self._not_attempted_evidence(),
+            }
+
+        _result, verdict, attempts = self._run(monkeypatch, tmp_path, _fake_run_runtime_case)
+
+        assert verdict == "inconclusive"
+        assert attempts == verifier.MAX_TOOL_CALL_NOT_ATTEMPTED_RETRIES + 1
+        assert call_count["n"] == verifier.MAX_TOOL_CALL_NOT_ATTEMPTED_RETRIES + 1
+
+    def test_retry_eventually_attempts_and_gets_confirmed_deny(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """(b) A case that fails to attempt on the first try but DOES
+        attempt (and gets denied) on a retry -> final result is
+        confirmed_deny, and the retry actually happened (more than 1
+        attempt was made) rather than accepting the first failure."""
+        call_count = {"n": 0}
+
+        def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
+            call_count["n"] += 1
+            evidence = self._not_attempted_evidence() if call_count["n"] == 1 else self._confirmed_deny_evidence()
+            return {
+                "case": kwargs["case_name"],
+                "exit_code": verifier.EXIT_OK,
+                "process_error": None,
+                "marker_observed": call_count["n"] > 1,
+                "evidence": evidence,
+            }
+
+        _result, verdict, attempts = self._run(monkeypatch, tmp_path, _fake_run_runtime_case)
+
+        assert verdict == "confirmed_deny"
+        assert attempts > 1
+        assert call_count["n"] == attempts
+
+    def test_confirmed_breach_is_never_retried(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """(c) confirmed_breach must NOT be retried -- exactly 1 attempt (a
+        real breach observation stays terminal exactly as before)."""
+        call_count = {"n": 0}
+
+        def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
+            call_count["n"] += 1
+            return {
+                "case": kwargs["case_name"],
+                "exit_code": verifier.EXIT_FAIL,
+                "process_error": None,
+                "marker_observed": False,
+                "evidence": self._breach_evidence(),
+            }
+
+        _result, verdict, attempts = self._run(monkeypatch, tmp_path, _fake_run_runtime_case)
+
+        assert verdict == "confirmed_breach"
+        assert attempts == 1
+        assert call_count["n"] == 1
+
+    def test_structural_inconclusive_for_other_reasons_is_never_retried(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """(c) A structural-inconclusive verdict for a reason OTHER than
+        "tool call not attempted" (here: missing main_agent_identity) must
+        NOT be retried -- exactly 1 attempt, since retrying cannot fix a
+        structural evidence-availability problem."""
+        call_count = {"n": 0}
+
+        def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
+            call_count["n"] += 1
+            return {
+                "case": kwargs["case_name"],
+                "exit_code": verifier.EXIT_OK,
+                "process_error": None,
+                "marker_observed": False,
+                "evidence": self._missing_identity_evidence(),
+            }
+
+        _result, verdict, attempts = self._run(monkeypatch, tmp_path, _fake_run_runtime_case)
+
+        assert verdict == "inconclusive"
+        assert attempts == 1
+        assert call_count["n"] == 1
+
+
 # ─── AC6: no_authority_artifacts_or_sensitive_output ────────────────────────
 
 
