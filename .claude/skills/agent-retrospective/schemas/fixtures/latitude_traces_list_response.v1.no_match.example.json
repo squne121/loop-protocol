@@ -1,0 +1,6 @@
+{
+  "_comment": "Issue #2375 PR #2392 fix_delta -- real-CLI-derived (latitude v7.10.0) `latitude traces list --project-slug <slug> --filters '{\"sessionId\":[{\"op\":\"eq\",\"value\":\"<session_id>\"}]}' --limit 1 --format json` response for a session_id with zero matching traces (live-verified: exit 0, not an error). `collect_snapshot.collect_latitude_runtime_evidence` maps this shape to `availability: \"unavailable\"` / `reason_code: \"no_matching_trace\"` -- a legitimate outcome, never `error`/`malformed_output`, and the collector never falls back to an unfiltered/most-recent-trace query.",
+  "hasMore": false,
+  "items": [],
+  "nextCursor": null
+}

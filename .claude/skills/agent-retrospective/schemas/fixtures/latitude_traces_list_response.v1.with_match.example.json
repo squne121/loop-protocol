@@ -1,0 +1,38 @@
+{
+  "_comment": "Issue #2375 PR #2392 fix_delta -- ANONYMIZED, real-CLI-derived (latitude v7.10.0) `latitude traces list --project-slug <slug> --filters '{\"sessionId\":[{\"op\":\"eq\",\"value\":\"<session_id>\"}]}' --limit 1 --format json` response shape. Real traceId/sessionId/userId/organizationId/projectId are replaced with clearly-fake placeholder values; field NAMES and realistic value TYPES/magnitudes are preserved. This is the golden fixture `collect_snapshot.collect_latitude_runtime_evidence`'s parser is anchored against (a live-verified shape, not an invented one) -- see the collector's `items[0].spanCount`/`items[0].durationNs` projection.",
+  "hasMore": false,
+  "items": [
+    {
+      "costInputMicrocents": 24440700,
+      "costOutputMicrocents": 1615000,
+      "costTotalMicrocents": 26055700,
+      "durationNs": 21903000000,
+      "endTime": "2026-01-01T00:00:23.406Z",
+      "errorCount": 0,
+      "models": ["fake-model-identifier"],
+      "negativeAnnotationCount": 0,
+      "organizationId": "fakeorg00000000000000000",
+      "positiveAnnotationCount": 0,
+      "projectId": "fakeproj0000000000000000",
+      "providers": ["fake-provider"],
+      "rootSpanId": "0000000000000001",
+      "rootSpanName": "interaction",
+      "serviceNames": ["fake-service"],
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "simulationId": null,
+      "spanCount": 8,
+      "startTime": "2026-01-01T00:00:01.503Z",
+      "tags": ["FAKE_TAG"],
+      "timeToFirstTokenNs": 0,
+      "tokensCacheCreate": 1902,
+      "tokensCacheRead": 1198180,
+      "tokensInput": 8,
+      "tokensOutput": 1615,
+      "tokensReasoning": 0,
+      "tokensTotal": 1201705,
+      "traceId": "00000000000000000000000000000001",
+      "userId": null
+    }
+  ],
+  "nextCursor": "fake-opaque-cursor-value-0001"
+}

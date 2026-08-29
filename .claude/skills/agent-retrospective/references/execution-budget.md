@@ -37,3 +37,30 @@ frontmatter に固定された具体値:
 | `retrospective-evaluator` | 8 | `[]`（no tool） | sonnet |
 
 両者とも `mcpServers`/`hooks`/`memory` は不使用（frontmatter に宣言しない）。
+
+## Latitude CLI の収集予算（Collection Budget、Issue #2375 の課題）
+
+```yaml
+latitude_max_launches_per_run: 1
+latitude_timeout_seconds: 10
+latitude_max_output_bytes: 65536   # 64 KiB, stdout/stderr 個別に適用
+latitude_max_allowlisted_metrics: 3   # trace_count / span_count / duration_ms
+latitude_pagination: prohibited
+latitude_retry_loop: prohibited
+latitude_background_polling: prohibited
+```
+
+- `collect_snapshot.collect_latitude_runtime_evidence()` は 1 回の呼び出しにつき `latitude` CLI
+  を最大 1 回だけ起動する（内部に retry loop を持たない -- 予算超過は呼び出し側の責務）。
+  `run_retrospective.execute_run()` は `session_id` を解決できない場合も CLI を起動しない
+  （collector 自身が起動前に `session_id_unresolved`/`project_slug_unresolved` を返すため、
+  無条件の 1 回起動ではなく「起動する場合のみ最大 1 回」）。
+- timeout（10秒）・output size（64 KiB、stdout/stderr 個別）を超過した場合は raw output を
+  保持せず `availability: error` / `reason_code: budget_exceeded` に正規化する。
+- allowlisted metric は `trace_count`/`span_count`/`duration_ms` の 3 個で固定。CLI の応答
+  （`{items: [...], nextCursor, hasMore}`）に他のフィールドが含まれていても、この 3 個以外は
+  読み取り直後に破棄する。`--limit 1` で常に 1 trace 以下に絞るため、`span_count`/
+  `duration_ms` は複数 trace を集約しない（該当 trace が 0 件なら
+  `reason_code: no_matching_trace` で `unavailable`）。
+- CLI Boundary（read-only・argv-only・no shell/stdin prompt）は
+  `references/wire-contract.md`（`latitude_runtime_evidence/v1` セクション）を参照。

@@ -228,6 +228,41 @@ human_authorization_receipt/v1:
 `mutation_capability`）は維持されたまま。承認は本 receipt ファイル、または TTY 明示確認という
 別チャネルでのみ確認する。
 
+## Latitude ランタイム証跡（latitude_runtime_evidence/v1、Issue #2375）
+
+`agent-retrospective` は Latitude CLI から bounded・read-only な runtime evidence を任意で
+収集し、`runtime_behavior` claim_class の finding へ deterministic に enrichment できる（Latitude
+不在・不許可・利用不能は retrospective 自体を止めない）。
+
+- 収集: `scripts/collect_snapshot.py`'s `collect_latitude_runtime_evidence()`（実 CLI
+  `latitude traces list --project-slug <slug> --filters <JSON> --limit <n> --format json` の
+  argv-only、最大 1 回起動、timeout 10秒、output 64 KiB 上限、allowlisted metric 3 個。
+  `project_slug` は `LATITUDE_PROJECT` 環境変数からのみ解決する）
+- Session Correlation: `scripts/run_retrospective.py`'s
+  `_resolve_latitude_target_session_id()` が既存の hook-sink 収集経路（Claude-GPT adapter の
+  `complete_sessions`）から対象 Claude Code `session_id` を解決し、`--filters` の
+  `sessionId eq` 条件として渡す。「直近 trace を無条件取得」するフォールバックは行わない。
+  `session_id` 未解決または相関 0 件は `unavailable`（`session_id_unresolved`/
+  `no_matching_trace`）に縮退する。
+- 実行経路への配線: `scripts/run_retrospective.py`'s `execute_run()` が
+  `collect_latitude_runtime_evidence_once()`/`bind_latitude_evidence_to_candidates()` を
+  `compute_delta()` 直後・`finalize()` 直前に呼び出す（Collection Budget: 1 run あたり
+  `latitude` CLI 起動は最大 1 回。失敗・利用不能は retrospective 全体を止めない）。
+- 検証: `scripts/validate_retrospective_schema.py`'s `validate_latitude_runtime_evidence()`
+  （`schemas/latitude_runtime_evidence_v1.schema.json`。closed key set、availability 別
+  nullability、closed reason_code、identity 再計算による mismatch fail-closed）
+- 結合: `scripts/run_retrospective.py`'s `bind_latitude_evidence_to_candidates()`（available
+  evidence のみ、`claim_class == "runtime_behavior"` の候補のみ、既存 `evidence_ref` の
+  `runtime_receipt`/`runtime` shape で `evidence_refs[]` に追記するだけ -- claim/status/confidence
+  は一切変更しない）
+- CLI Boundary・Collection Budget の詳細は `references/wire-contract.md` /
+  `references/execution-budget.md` を参照。
+- 動作検証（opt-in）: `scripts/tests/verify_latitude_runtime_evidence_live_cli.py`
+  （`pytest.skip()`、stdout `SKIP:` prefix。CLI/認証/network unavailable は SKIP、予期しない
+  失敗は FAIL、成功時は public-safe artifact を生成して PASS）
+- Latitude は public `source_kind` にしない（`latitude_otlp` は既存 #1223 の private provenance
+  のまま。`agent_run_report/v1` の public `source_kind` enum は変更しない）。
+
 ## Guardrails（ガードレール）
 
 - **Allowed Paths 外を編集しない**
@@ -241,6 +276,7 @@ human_authorization_receipt/v1:
 - `.claude/skills/agent-retrospective/scripts/collect_snapshot.py`（Child 3、#2236）
 - `.claude/skills/agent-retrospective/scripts/validate_retrospective_schema.py`（Child 2、#2235/#2288）
 - `.claude/skills/agent-retrospective/scripts/persist_retrospective_run.py`（Child 5、#2238）
+- `.claude/skills/agent-retrospective/scripts/tests/verify_latitude_runtime_evidence_live_cli.py`（Issue #2375 AC6 opt-in 動作検証）
 - `.claude/skills/agent-retrospective/references/wire-contract.md`（永続化 envelope の詳細）
 - `.claude/agents/codebase-investigator.md` / `.claude/agents/web-researcher.md`（既存再利用）
 - `docs/adr/0007-agent-retrospective-boundaries.md`
