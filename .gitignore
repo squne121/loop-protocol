@@ -60,7 +60,10 @@ dist-ssr
 # repo root の project-local pnpm store（root 限定）
 /.pnpm-store/
 
-# Guard shadow log (write-guard observability, local only)
+# Legacy tombstone for retired repo-local shadow telemetry (Issue #2252)。
+# 現在は active な observability mechanism ではない。producer 撤去後に
+# ローカルへ残存し得る旧ログファイルが git status に突然 untracked として
+# 出現するのを防ぐためだけに ignore entry を維持する。
 .guard_shadow_log.jsonl
 
 # Python runtime artifacts
