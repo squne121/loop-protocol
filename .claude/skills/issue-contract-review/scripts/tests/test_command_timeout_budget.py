@@ -324,3 +324,57 @@ def test_main_impl_result_item_provenance_reflects_explicit_override(tmp_path, c
 
     assert provenance["source"] == "explicit_override"
     assert provenance["timeout_seconds"] == 45
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #2254 regression: `history_snapshot=None` (the pre-#2254 default,
+# and every pre-#2254 call site) preserves byte-for-byte pre-#2254
+# behavior -- the `history_estimate` source is purely additive.
+# ---------------------------------------------------------------------------
+
+
+def test_history_snapshot_none_default_preserves_pre_2254_static_fallback():
+    """`compute_command_timeout_budget()` called with no `history_snapshot`
+    argument at all (the exact call shape every pre-#2254 site used)
+    resolves identically to before #2254: `static_fallback`, no
+    `history_estimate` ever considered."""
+    budget = m.compute_command_timeout_budget("pnpm typecheck")
+    assert budget["source"] == "static_fallback"
+    assert budget["timeout_seconds"] == m.DEFAULT_PER_COMMAND_TIMEOUT_SECONDS
+    assert budget["sample_count"] == 0
+    assert budget["observed_p95_ms"] is None
+
+
+def test_history_snapshot_none_default_preserves_pre_2254_static_policy():
+    """A `static_policy`-curated command with `history_snapshot=None`
+    still resolves via `static_policy`, unaffected by Issue #2254's
+    additive fields."""
+    slow_command = "uv run --locked pytest .claude/skills/issue-refinement-loop/tests -v"
+    budget = m.compute_command_timeout_budget(slow_command)
+    assert budget["source"] == "static_policy"
+    assert budget["timeout_seconds"] == m.STATIC_PER_COMMAND_TIMEOUT_POLICY[slow_command]
+
+
+def test_compute_canonical_vc_plan_history_snapshot_none_default_matches_pre_2254_digest():
+    """`compute_canonical_vc_plan()` called without `history_snapshot`
+    (positional-compatible with every pre-#2254 call site) produces a
+    `command_budgets[]` list whose entries are IDENTICAL (aside from the
+    new additive keys) to explicitly passing `history_snapshot=None`."""
+    body = "## Verification Commands\n\n```bash\n$ pnpm lint\n```\n"
+    plan_implicit = m.compute_canonical_vc_plan(body)
+    plan_explicit_none = m.compute_canonical_vc_plan(body, history_snapshot=None)
+    assert plan_implicit["plan_digest"] == plan_explicit_none["plan_digest"]
+    assert plan_implicit["command_budgets"][0]["source"] == "static_fallback"
+
+
+def test_command_timeout_budget_additive_history_fields_present_and_null_by_default():
+    """The Issue #2254 additive fields exist on EVERY budget entry
+    (subset-check compatible with the pre-existing AC1 field-set test
+    above) and are null/false/`snapshot_absent` when no history_snapshot
+    was supplied -- never fabricated."""
+    budget = m.compute_command_timeout_budget("pnpm build")
+    assert budget["command_group_key"] is None
+    assert budget["history_store_status"] == "snapshot_absent"
+    assert budget["history_backoff_applied"] is False
+    assert budget["timeout_backoff_floor_seconds"] is None

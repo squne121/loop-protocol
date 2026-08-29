@@ -40,6 +40,7 @@ from vc_contract_syntax import (  # noqa: E402
     parse_verification_commands_section,
 )
 import pnpm_gate_registry as pnpm_gate_registry  # noqa: E402
+import vc_runtime_history as _vc_runtime_history  # noqa: E402
 
 
 # Issue #1333 AC1: per-command timeout の named constant。
@@ -80,14 +81,23 @@ DEFAULT_TIMEOUT_SECONDS = 150
 # canonical-serialization hash over the full versioned plan envelope)
 # instead of independently re-deriving per-command scalars.
 #
-# Scope note (Issue #2233 Out of Scope): full history-based (P50/P95)
-# calibration is intentionally NOT implemented here. A `history_estimate`
-# source therefore does NOT exist in the production schema below (OWNER
-# fix_delta P2: fabricating `sample_count=1` / `observed_p95_ms` from a bare
-# `estimated_seconds` int, with no real evidence object, is worse than not
-# having the source at all) -- it is deferred to the follow-up history-based
-# estimator Issue, which must introduce a real trusted evidence object
-# before resurrecting this source.
+# Scope note (Issue #2233 Out of Scope, superseded by Issue #2254): full
+# history-based (P50/P95) calibration was intentionally NOT implemented
+# when this section was introduced (OWNER fix_delta P2 rejected a
+# fabricated `sample_count=1` / `observed_p95_ms` derived from a bare
+# `estimated_seconds` int, with no real evidence object -- worse than not
+# having the source at all).
+#
+# Issue #2254 reintroduces `history_estimate` as a NEW, additive
+# `command_timeout_budget/v1` source backed by GENUINE evidence: a local
+# per-repository SQLite store of real subprocess durations
+# (`vc_runtime_history.py`), a fixed `nearest_rank_v1` percentile contract
+# (>= 5 eligible success samples, 30-day TTL, newest 50 samples), a
+# right-censored timeout backoff floor, and a strictly RAISE-ONLY
+# precedence (`history_estimate` can only ever WIN over `static_policy` /
+# `static_fallback`, never lower the resolved timeout below them). See
+# `compute_command_timeout_budget()`'s `history_snapshot` parameter below
+# and `.claude/skills/issue-contract-review/references/vc-preflight.md`.
 
 # Alias making the per-command role of `DEFAULT_TIMEOUT_SECONDS` explicit at
 # call sites that reason about command-level budgets specifically.
@@ -266,26 +276,57 @@ def compute_command_timeout_budget(
     min_seconds: int = MIN_PER_COMMAND_TIMEOUT_SECONDS,
     max_seconds: int = MAX_PER_COMMAND_TIMEOUT_SECONDS,
     static_policy: Dict[str, int] = STATIC_PER_COMMAND_TIMEOUT_POLICY,
+    history_snapshot: Optional[Dict[str, Any]] = None,
+    cwd: str = ".",
+    repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute a `command_timeout_budget/v1` entry for a single VC command.
 
-    Precedence (Issue #2233 AC4): `override_seconds` (an explicit
-    `--timeout-seconds` CLI value) is a HARD GLOBAL override and always wins
-    over `static_policy` / `default_seconds`.
+    Precedence (Issue #2233 AC4, extended by Issue #2254 AC4
+    raise-only precedence): `override_seconds` (an explicit
+    `--timeout-seconds` CLI value) is a HARD GLOBAL override and always
+    wins over every other source. Otherwise:
+
+        resolved = min(max_seconds, max(static_base, history_candidate, timeout_backoff_floor))
+
+    where `static_base` is the `static_policy` entry (if the command text
+    matches) or `default_seconds` (`static_fallback`), and
+    `history_candidate` / `timeout_backoff_floor` come from `history_snapshot`
+    (Issue #2254 AC3/AC5). `history_estimate` is named as the resolved
+    `source` ONLY when a history-derived value STRICTLY exceeds
+    `static_base` -- if history is absent, degraded, or <= `static_base`,
+    `source` stays `static_policy` / `static_fallback` (Issue #2254 In
+    Scope: "history が static_base 以下の場合は provenance の source を
+    static_policy または static_fallback のまま維持し、history_estimate を
+    name-only で名乗らない").
 
     `static_policy` (Issue #2233 fix_delta P0-2): a trusted, hand-curated,
     repo-owned mapping of EXACT command text to a legitimately-larger
     per-command timeout (`source: static_policy`). This is the authority
     that lets a genuinely slow-but-legitimate VC (e.g. the 271.31s
     `issue-refinement-loop` test suite, Issue #2233 Background) resolve to
-    a budget above `DEFAULT_PER_COMMAND_TIMEOUT_SECONDS` without a
-    history-based estimator (Out of Scope for this Issue).
+    a budget above `DEFAULT_PER_COMMAND_TIMEOUT_SECONDS` without relying on
+    history alone.
+
+    `history_snapshot` (Issue #2254 AC1): an IMMUTABLE `history_snapshot/v1`
+    dict (see `vc_runtime_history.build_history_snapshot()`), produced ONCE
+    by a root-owned caller and passed in unchanged -- this function NEVER
+    touches SQLite itself. `None` (the default; also every pre-#2254 call
+    site until wired) behaves EXACTLY as before #2254 (`static_policy` /
+    `static_fallback` only). `cwd` is used ONLY to derive the same
+    `command_group_key` the snapshot's producer used to key its `records`
+    dict (Issue #2254 AC2 identity separation) -- it does not affect
+    `static_policy` / `static_fallback` resolution.
 
     Raises `CommandTimeoutExceedsPolicyError` (Issue #2233 AC5) BEFORE
     returning if the resolved value would exceed `max_seconds` -- this
-    applies to EVERY source (override, static_policy, or fallback) so the
-    #2207 aggregate formula's per-command worst-case assumption can never be
-    silently violated.
+    applies to EVERY source (override, static_policy, static_fallback, OR
+    history_estimate) so the #2207 aggregate formula's per-command
+    worst-case assumption can never be silently violated. This is also how
+    Issue #2254 AC4's "history is capped at MAX_PER_COMMAND_TIMEOUT_SECONDS"
+    requirement is enforced -- the `min(max_seconds, ...)` clamp above
+    already guarantees the resolved value never exceeds `max_seconds`
+    before this check runs.
 
     Raises `CommandTimeoutNonPositiveError` (Issue #2233 fix_delta P2)
     BEFORE returning if the resolved value is <= 0, regardless of `source`.
@@ -293,21 +334,68 @@ def compute_command_timeout_budget(
     command_hash = compute_command_hash(command)
     policy_clamped = False
 
+    # Issue #2254 AC1/AC2: look up this command's history record (if any)
+    # from the caller-supplied immutable snapshot. This function NEVER
+    # queries the store itself -- `history_snapshot` is a plain dict.
+    history_record: Optional[Dict[str, Any]] = None
+    history_store_status = "snapshot_absent"
+    command_group_key: Optional[str] = None
+    if history_snapshot is not None:
+        history_store_status = history_snapshot.get("store_status", "unknown")
+        # Issue #2254 fix_delta P0 blocker 2 (OWNER REQUEST_CHANGES
+        # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+        # `repo_root`, when the caller resolved one for THIS SAME `cwd`,
+        # must be threaded into the LOOKUP key exactly the way the
+        # snapshot's own producer (`produce_immutable_history_snapshot()`)
+        # threaded it into the snapshot's `records` KEYS -- otherwise a
+        # lookup against an absolute-cwd key would never match a
+        # repo-relative one (or vice versa).
+        command_group_key = _vc_runtime_history.compute_command_group_key(
+            command, cwd, repo_root=repo_root
+        )
+        history_record = (history_snapshot.get("records") or {}).get(command_group_key)
+
+    history_sample_count = 0
+    history_observed_p95_ms: Optional[int] = None
+    history_candidate_seconds: Optional[int] = None
+    timeout_backoff_floor_seconds: Optional[int] = None
+    if history_record is not None:
+        history_sample_count = int(history_record.get("eligible_sample_count") or 0)
+        history_observed_p95_ms = history_record.get("observed_p95_ms")
+        history_candidate_seconds = history_record.get("history_candidate_seconds")
+        timeout_backoff_floor_seconds = history_record.get("timeout_backoff_floor_seconds")
+
     if override_seconds is not None:
         source = "explicit_override"
         resolved_seconds = int(override_seconds)
         sample_count = 0
         observed_p95_ms: Optional[int] = None
-    elif command.strip() in static_policy:
-        source = "static_policy"
-        resolved_seconds = int(static_policy[command.strip()])
-        sample_count = 0
-        observed_p95_ms = None
+        history_backoff_applied = False
     else:
-        source = "static_fallback"
-        resolved_seconds = int(default_seconds)
-        sample_count = 0
-        observed_p95_ms = None
+        static_source = "static_policy" if command.strip() in static_policy else "static_fallback"
+        static_base = int(
+            static_policy[command.strip()] if command.strip() in static_policy else default_seconds
+        )
+        history_candidates = [
+            v for v in (history_candidate_seconds, timeout_backoff_floor_seconds) if v is not None
+        ]
+        history_best = max(history_candidates) if history_candidates else None
+
+        # Issue #2254 AC4 raise-only precedence: history NEVER wins a tie
+        # or a loss against `static_base` -- it must STRICTLY exceed it.
+        if history_best is not None and history_best > static_base:
+            source = "history_estimate"
+            resolved_seconds = min(max_seconds, history_best)
+            history_backoff_applied = (
+                timeout_backoff_floor_seconds is not None
+                and timeout_backoff_floor_seconds == history_best
+            )
+        else:
+            source = static_source
+            resolved_seconds = static_base
+            history_backoff_applied = False
+        sample_count = history_sample_count if source == "history_estimate" else 0
+        observed_p95_ms = history_observed_p95_ms if source == "history_estimate" else None
 
     if resolved_seconds <= 0:
         raise CommandTimeoutNonPositiveError(command_hash, resolved_seconds, source)
@@ -315,11 +403,11 @@ def compute_command_timeout_budget(
     if resolved_seconds > max_seconds:
         raise CommandTimeoutExceedsPolicyError(command_hash, resolved_seconds, max_seconds)
     # Issue #2233: `min_seconds` is a documented floor for the
-    # `static_fallback` / `static_policy` sources ONLY. An
-    # `explicit_override` (Issue #2233 AC4 hard global override, e.g. a
-    # fault-injection test's deliberately narrow `--timeout-seconds`) is
-    # honored byte-for-byte and never silently raised to `min_seconds` --
-    # doing so would defeat the caller's explicit intent.
+    # `static_fallback` / `static_policy` / `history_estimate` sources
+    # ONLY. An `explicit_override` (Issue #2233 AC4 hard global override,
+    # e.g. a fault-injection test's deliberately narrow `--timeout-seconds`)
+    # is honored byte-for-byte and never silently raised to `min_seconds`
+    # -- doing so would defeat the caller's explicit intent.
     if source != "explicit_override" and resolved_seconds < min_seconds:
         resolved_seconds = min_seconds
         policy_clamped = True
@@ -333,6 +421,11 @@ def compute_command_timeout_budget(
                 "cleanup_tail_seconds": cleanup_tail_seconds,
                 "estimator_version": COMMAND_TIMEOUT_BUDGET_ESTIMATOR_VERSION,
                 "policy_clamped": policy_clamped,
+                # Issue #2254: bind history evidence into the digest so two
+                # budgets that resolve to the SAME timeout_seconds via
+                # DIFFERENT evidence are still distinguishable.
+                "sample_count": sample_count,
+                "observed_p95_ms": observed_p95_ms,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -358,6 +451,12 @@ def compute_command_timeout_budget(
         "sample_count": sample_count,
         "observed_p95_ms": observed_p95_ms,
         "policy_clamped": policy_clamped,
+        # Issue #2254 additive fields (never read by pre-#2254 consumers;
+        # additive-only per Issue #2254 Out of Scope schema constraint).
+        "command_group_key": command_group_key,
+        "history_store_status": history_store_status,
+        "history_backoff_applied": history_backoff_applied,
+        "timeout_backoff_floor_seconds": timeout_backoff_floor_seconds,
     }
 
 
@@ -1089,6 +1188,8 @@ def compute_canonical_vc_plan(
     global_override_seconds: Optional[int] = None,
     cwd: str = ".",
     allowed_paths: Optional[List[str]] = None,
+    history_snapshot: Optional[Dict[str, Any]] = None,
+    repo_root: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute the canonical, side-effect-free VC plan for `body`.
 
@@ -1139,6 +1240,30 @@ def compute_canonical_vc_plan(
     therefore missed changes to occurrence count/order, cleanup tail,
     aggregate, max_workers, body SHA, etc).
 
+    `repo_root` (Issue #2254 fix_delta P0 blocker 2/3): the SAME
+    worktree-root string (see `resolve_repo_root_for_history()` below) the
+    caller resolved for THIS SAME `cwd` and passed to
+    `produce_immutable_history_snapshot()` when building `history_snapshot`
+    -- threaded through to every `compute_command_timeout_budget()` call so
+    the LOOKUP key matches the snapshot's own `records` KEYS. `None`
+    preserves pre-fix_delta (absolute-cwd) behavior.
+
+    `history_snapshot` (Issue #2254 AC1): an IMMUTABLE `history_snapshot/v1`
+    dict a root-owned caller produced ONCE (see
+    `produce_immutable_history_snapshot()` below /
+    `vc_runtime_history.build_history_snapshot()`) and threads through to
+    every `compute_command_timeout_budget()` call this function makes.
+    Because this function itself NEVER queries the history store (it only
+    reads the given dict), two calls with the SAME `body` + SAME
+    `history_snapshot` object (or an equal dict, e.g. round-tripped through
+    `vc_runtime_history.write_history_snapshot_file()` /
+    `load_history_snapshot_file()` across a subprocess boundary) always
+    produce the SAME `plan_digest` -- even if the underlying SQLite store
+    has since been written to or a TTL boundary has since passed (Issue
+    #2254 AC1 snapshot determinism). `None` (the default) preserves
+    pre-#2254 behavior exactly (`static_policy` / `static_fallback` only,
+    no `history_estimate` source ever resolved).
+
     Raises `CommandTimeoutExceedsPolicyError` / `CommandTimeoutNonPositiveError`
     (Issue #2233 AC5 / fix_delta P2) BEFORE returning if any resolved
     command budget would exceed the per-command hard maximum or resolve to
@@ -1174,6 +1299,9 @@ def compute_canonical_vc_plan(
                     command,
                     override_seconds=global_override_seconds,
                     default_seconds=per_command_timeout_seconds,
+                    history_snapshot=history_snapshot,
+                    cwd=cwd,
+                    repo_root=repo_root,
                 )
             _budget = budgets_by_hash[command_hash]
             aggregate_timeout_seconds += (
@@ -1207,6 +1335,16 @@ def compute_canonical_vc_plan(
 
     command_budgets = list(budgets_by_hash.values())
 
+    # Issue #2254 AC1: bind the snapshot's own digest (or `None` when no
+    # snapshot was supplied) into the plan digest too -- this is additive
+    # belt-and-braces on top of `command_budgets` already differing when
+    # history evidence differs; it also makes an ABSENT vs PRESENT (but
+    # empty/`store_status != "ok"`) snapshot distinguishable even in the
+    # (degenerate) case where no command in this body has ANY history
+    # record either way.
+    _history_snapshot_digest = (
+        history_snapshot.get("snapshot_digest") if history_snapshot is not None else None
+    )
     envelope_for_digest = {
         "schema": CANONICAL_VC_PLAN_SCHEMA,
         "policy_version": CANONICAL_VC_PLAN_POLICY_VERSION,
@@ -1223,6 +1361,7 @@ def compute_canonical_vc_plan(
         "override_provenance": (
             "explicit_override" if global_override_seconds is not None else None
         ),
+        "history_snapshot_digest": _history_snapshot_digest,
     }
     plan_digest = hashlib.sha256(_canonicalize_for_digest(envelope_for_digest)).hexdigest()
 
@@ -1246,6 +1385,10 @@ def compute_canonical_vc_plan(
         # hashed a sorted list of small per-distinct-command digests).
         "estimator_evidence_digest": f"sha256:{plan_digest}",
         "plan_digest": f"sha256:{plan_digest}",
+        # Issue #2254 additive field: the history snapshot's own digest (or
+        # `None`), surfaced so a caller can independently verify which
+        # snapshot a given plan_digest was derived from.
+        "history_snapshot_digest": _history_snapshot_digest,
     }
 
 
@@ -1261,6 +1404,259 @@ def verify_canonical_vc_plan_digest(plan: Dict[str, Any], expected_digest: Optio
     actual_digest = plan["plan_digest"]
     if actual_digest != expected_digest:
         raise VcPlanDigestMismatchError(expected_digest, actual_digest)
+
+
+# ---------------------------------------------------------------------------
+# History-based estimator wiring (Issue #2254)
+# ---------------------------------------------------------------------------
+#
+# This section is the ONLY place `baseline_vc_preflight.py` talks to
+# `vc_runtime_history.py`. `compute_command_timeout_budget()` /
+# `compute_canonical_vc_plan()` above only ever consume an already-built
+# `history_snapshot` dict -- they never call anything below directly.
+
+
+def _resolve_git_common_dir(cwd: str) -> Optional[str]:
+    """Resolve the REAL, shared `.git` common directory for `cwd` (Issue
+    #2254: the history store is keyed by this, not by the worktree path,
+    so every worktree of the SAME repository shares ONE history store).
+    Returns `None` (never raises) if `cwd` is not inside a git working
+    tree or `git` itself is unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+    if not os.path.isabs(raw):
+        raw = os.path.join(cwd, raw)
+    return os.path.realpath(raw)
+
+
+def resolve_repo_root_for_history(cwd: str) -> Optional[str]:
+    """Resolve the git WORKTREE ROOT (`git rev-parse --show-toplevel`) for
+    `cwd` (Issue #2254 fix_delta P0 blocker 2/3, OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    `command_group_key` must be keyed off a REPO-RELATIVE cwd, not an
+    absolute one, so history samples recorded from one worktree of a
+    repository are shared by every OTHER worktree of the SAME repository
+    (each worktree has a DIFFERENT absolute path, but its own
+    `show-toplevel` IS its own cwd whenever VCs are run from the worktree
+    root, so both worktrees' `compute_command_group_key()` calls normalize
+    to the SAME relative "." cwd component).
+
+    Deliberately NOT `_resolve_git_common_dir()` (used ONLY to key the
+    SHARED SQLite STORE FILE itself, which for every worktree of a
+    repository points at the ONE original repository's `.git` -- conflating
+    the two would make every worktree's `command_group_key` collapse onto
+    the SAME repo_root REGARDLESS of which worktree cwd was actually used,
+    defeating the point of a repo-RELATIVE cwd).
+
+    A pure function of `cwd` (no caching): calling this twice with the
+    SAME `cwd` string always returns the SAME value, which is what lets a
+    PRODUCER (`produce_immutable_history_snapshot()`) and a CONSUMER
+    (`compute_canonical_vc_plan()`/`compute_command_timeout_budget()`) --
+    even in SEPARATE processes across a subprocess boundary -- converge on
+    the SAME `command_group_key` as long as they are given the SAME `cwd`
+    value, without needing any explicit cross-process handoff of
+    `repo_root` itself.
+
+    Returns `None` (never raises) if `cwd` is not inside a git working tree
+    or `git` itself is unavailable; callers pass `None` straight through to
+    `compute_command_group_key(..., repo_root=None)`, which degrades to its
+    pre-fix_delta absolute-cwd behavior for that one command (a narrower,
+    non-shared -- but still internally self-consistent -- history bucket)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+    return os.path.realpath(raw)
+
+
+def _distinct_command_texts_from_body(body: str) -> List[str]:
+    """Every DISTINCT (first-occurrence-ordered) VC command text in
+    `body`'s `## Verification Commands` section -- the same population
+    `compute_canonical_vc_plan()` computes one `command_timeout_budget/v1`
+    entry for."""
+    section = extract_verification_commands_section(body) or ""
+    blocks = extract_fenced_bash_blocks(section)
+    seen: set = set()
+    ordered: List[str] = []
+    for block in blocks:
+        for entry in parse_commands_from_block(block):
+            command = entry[1]
+            key = command.strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(command)
+    return ordered
+
+
+def _command_family(command: str) -> str:
+    try:
+        argv = shlex.split(command.strip())
+    except ValueError:
+        argv = command.strip().split()
+    return argv[0] if argv else ""
+
+
+def produce_immutable_history_snapshot(
+    body: str,
+    *,
+    cwd: str = ".",
+    max_seconds: int = MAX_PER_COMMAND_TIMEOUT_SECONDS,
+    repo_root: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Root-owned, SINGLE read of the local per-repository history store
+    for every DISTINCT command text in `body` (Issue #2254 AC1). Callers
+    (this module's own `_main_impl()`, and additive wiring in
+    `contract_readiness_check.py` / `run_contract_review_once.py` /
+    `run_root_review_pipeline.py`) call this EXACTLY ONCE per
+    canonical-VC-plan computation and pass the resulting dict, unchanged,
+    into every `compute_canonical_vc_plan(..., history_snapshot=...)` call
+    for that SAME plan (including across a subprocess boundary, via
+    `vc_runtime_history.write_history_snapshot_file()` /
+    `--history-snapshot-file`).
+
+    NEVER raises. Degrades to `vc_runtime_history.empty_history_snapshot(...)`
+    (Issue #2254 AC8) if the git common dir cannot be resolved (e.g. `cwd`
+    is outside any git working tree) or the store itself is
+    missing/locked/corrupt/unknown-schema.
+
+    Test-safety guard: when running under pytest (`PYTEST_CURRENT_TEST`
+    set) WITHOUT an explicit `VC_RUNTIME_HISTORY_STORE_PATH` override, this
+    returns `None` (the SAME value pre-#2254 callers implicitly used, and
+    the SAME value `compute_canonical_vc_plan(history_snapshot=None)`
+    already treats as "no history evidence at all") rather than touching
+    the real developer/CI machine's default `$XDG_STATE_HOME` store -- the
+    30+ existing test files across this repo that invoke
+    `baseline_vc_preflight.py` were never designed to expect a real
+    out-of-repo filesystem write. Returning `None` here (rather than a
+    real-but-empty `store_status` snapshot dict) is deliberate: a non-null
+    snapshot object carries its own `snapshot_digest`, which would get
+    baked into `plan_digest` via `history_snapshot_digest` and diverge
+    from every comparison plan a PRE-#2254 test computes by calling
+    `compute_canonical_vc_plan()` with no `history_snapshot` argument at
+    all (which defaults to `None`) -- breaking `plan_digest` convergence
+    between this executor and its callers under test, even though no
+    Issue #2254 behavior was otherwise exercised. Issue #2254's own tests
+    all set `VC_RUNTIME_HISTORY_STORE_PATH` explicitly to exercise the
+    real read/write path hermetically instead of relying on this guard.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(
+        "VC_RUNTIME_HISTORY_STORE_PATH"
+    ):
+        return None
+    pairs: List[Tuple[str, str]] = []
+    for command in _distinct_command_texts_from_body(body):
+        # Issue #2254 fix_delta P0 blocker 2 (OWNER REQUEST_CHANGES
+        # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+        # `repo_root` (when the caller resolved one via
+        # `resolve_repo_root_for_history(cwd)`) must be threaded into the
+        # SAME key computation `compute_command_timeout_budget()`'s LOOKUP
+        # uses, so producer and consumer agree on where evidence lives.
+        group_key = _vc_runtime_history.compute_command_group_key(
+            command, cwd, repo_root=repo_root
+        )
+        fingerprint = _vc_runtime_history.compute_environment_fingerprint(
+            _command_family(command)
+        )
+        pairs.append((group_key, fingerprint))
+
+    git_common_dir = _resolve_git_common_dir(cwd)
+    if git_common_dir is None:
+        return _vc_runtime_history.empty_history_snapshot("missing")
+    store_path = _vc_runtime_history.resolve_store_path(git_common_dir)
+    return _vc_runtime_history.build_history_snapshot(store_path, pairs, max_seconds=max_seconds)
+
+
+def record_command_execution_sample(
+    command: str,
+    cwd: str,
+    *,
+    exit_code: Optional[int],
+    stderr: str,
+    duration_ms: Optional[int],
+    applied_timeout_seconds: int,
+    repo_root: Optional[str] = None,
+) -> None:
+    """Best-effort, NEVER-raising history sample recording for ONE REAL
+    subprocess launch (Issue #2254 AC6: one launch -> one `record_sample()`
+    call -> at most one stored row; AC7: non-blocking; AC8: a recording
+    failure must NEVER affect VC classification/exit code -- this function
+    swallows every exception).
+
+    Maps `run_command()`'s return shape to a `status`: exit_code == 0 ->
+    `success`; exit_code == -1 with `stderr == "timeout"` -> `timed_out`
+    (Issue #2254 In Scope: right-censored, NOT excluded); anything else ->
+    `failed` (diagnostic-only, excluded from the duration percentile).
+
+    Test-safety guard: same as `produce_immutable_history_snapshot()`
+    above -- a no-op under pytest without an explicit
+    `VC_RUNTIME_HISTORY_STORE_PATH` override.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(
+        "VC_RUNTIME_HISTORY_STORE_PATH"
+    ):
+        return
+    try:
+        git_common_dir = _resolve_git_common_dir(cwd)
+        if git_common_dir is None:
+            return
+        store_path = _vc_runtime_history.resolve_store_path(git_common_dir)
+        # Issue #2254 fix_delta P0 blocker 2: same repo_root-threaded key
+        # as the snapshot producer/lookup above, so a WRITE from this
+        # worktree lands under the SAME bucket a READ from any other
+        # worktree of the SAME repository will look up.
+        group_key = _vc_runtime_history.compute_command_group_key(
+            command, cwd, repo_root=repo_root
+        )
+        fingerprint = _vc_runtime_history.compute_environment_fingerprint(
+            _command_family(command)
+        )
+        if exit_code == 0:
+            status = "success"
+        elif exit_code == -1 and stderr == "timeout":
+            status = "timed_out"
+        else:
+            status = "failed"
+        _vc_runtime_history.record_sample(
+            store_path,
+            execution_id=_vc_runtime_history.new_execution_id(),
+            command_group_key=group_key,
+            environment_fingerprint=fingerprint,
+            status=status,
+            command_hash=compute_command_hash(command),
+            duration_ms=(
+                max(0, int(duration_ms)) if isinstance(duration_ms, int) else None
+            ),
+            applied_timeout_ms=int(applied_timeout_seconds) * 1000,
+        )
+    except Exception:
+        # Issue #2254 AC8: the WRITE path degrades exactly like the READ
+        # path -- never allowed to affect the VC's own classification or
+        # this process's exit code.
+        return
+
 
 
 # ---------------------------------------------------------------------------
@@ -4836,6 +5232,30 @@ def _main_impl() -> int:
         ),
     )
     parser.add_argument(
+        "--history-snapshot-file",
+        default=None,
+        help=(
+            "Issue #2254 AC1: path to an immutable history_snapshot/v1 JSON "
+            "file a parent process already produced (vc_runtime_history."
+            "write_history_snapshot_file()). When given, this process loads "
+            "that EXACT snapshot instead of producing its own, keeping "
+            "plan_digest convergent across the subprocess boundary. When "
+            "omitted, this process produces its own snapshot (standalone / "
+            "direct invocation)."
+        ),
+    )
+    parser.add_argument(
+        "--no-history-estimator",
+        action="store_true",
+        default=False,
+        help=(
+            "Issue #2254: disable the history-based estimator entirely for "
+            "this invocation (no snapshot production, no sample recording). "
+            "Behavior is then byte-for-byte identical to pre-#2254 "
+            "(static_policy/static_fallback only)."
+        ),
+    )
+    parser.add_argument(
         "--max-workers",
         type=bounded_worker_count,
         default=1,
@@ -5188,12 +5608,57 @@ def _main_impl() -> int:
         emit_json(_policy_result, args.evidence_mode, current_evidence)
         return exit_code_for_status("blocked")
 
+    # Issue #2254 AC1: this is the ONE root-owned read of the local
+    # history store for this invocation's plan (skipped entirely under
+    # --no-history-estimator, and loaded verbatim from
+    # --history-snapshot-file when a parent process already produced it --
+    # both keep plan_digest convergent with whatever the caller/child
+    # agreed on).
+    # Issue #2254 fix_delta P0 blocker 2/3 (OWNER REQUEST_CHANGES
+    # https://github.com/squne121/loop-protocol/pull/2382#issuecomment-5458281756):
+    # `_repo_root_for_history` is resolved EXACTLY ONCE from `args.cwd` and
+    # reused for BOTH producing/loading the snapshot AND computing the
+    # plan below -- a caller/parent process resolving `repo_root` from the
+    # SAME `--cwd` value independently converges on the SAME string (it is
+    # a pure function of `cwd`), so `command_group_key` stays convergent
+    # across this subprocess boundary without any extra handoff.
+    _history_snapshot: Optional[Dict[str, Any]] = None
+    _repo_root_for_history: Optional[str] = None
+    if not args.no_history_estimator:
+        if args.history_snapshot_file:
+            _repo_root_for_history = resolve_repo_root_for_history(args.cwd)
+            _history_snapshot = _vc_runtime_history.load_history_snapshot_file(
+                Path(args.history_snapshot_file)
+            )
+        elif not (
+            os.environ.get("PYTEST_CURRENT_TEST")
+            and not os.environ.get("VC_RUNTIME_HISTORY_STORE_PATH")
+        ):
+            # This mirrors produce_immutable_history_snapshot()'s OWN
+            # internal test-safety guard (see its docstring) -- resolving
+            # `repo_root` here shells out to a REAL `git` subprocess, which
+            # must be skipped in the SAME cases that guard already skips,
+            # not merely inside that function, so tests that monkeypatch
+            # this module's OWN `subprocess.Popen` for unrelated
+            # VC-execution assertions never observe an unexpected extra
+            # `git rev-parse --show-toplevel` call.
+            _repo_root_for_history = resolve_repo_root_for_history(args.cwd)
+            _history_snapshot = produce_immutable_history_snapshot(
+                body, cwd=args.cwd, repo_root=_repo_root_for_history
+            )
+        # else: pytest test-safety guard -- `_history_snapshot` /
+        # `_repo_root_for_history` stay None (never read downstream: a
+        # `None` `_history_snapshot` short-circuits every
+        # `repo_root`-dependent lookup in `compute_command_timeout_budget()`).
+
     try:
         _vc_plan = compute_canonical_vc_plan(
             body,
             global_override_seconds=_global_override_seconds,
             cwd=args.cwd,
             allowed_paths=allowed_paths_from_body,
+            history_snapshot=_history_snapshot,
+            repo_root=_repo_root_for_history,
         )
     except CommandTimeoutExceedsPolicyError as _budget_exc:
         return _emit_blocked_policy_error(
@@ -5317,6 +5782,20 @@ def _main_impl() -> int:
         _exit_code, _stdout, _stderr, _duration_ms, _runner_env_delta = run_command(
             job["command"], _effective_timeout_for(job["command"]), args.cwd
         )
+        # Issue #2254 AC6/AC7: this run_command() call IS the one real
+        # subprocess launch for this (dedup-cacheable) key -- record it
+        # BEFORE the P0-2 quiet-success mutation below, which is a VC
+        # CLASSIFICATION concern, not a process-completion concern.
+        if not args.no_history_estimator:
+            record_command_execution_sample(
+                job["command"],
+                args.cwd,
+                exit_code=_exit_code,
+                stderr=_stderr,
+                duration_ms=_duration_ms,
+                applied_timeout_seconds=_effective_timeout_for(job["command"]),
+                repo_root=_repo_root_for_history,
+            )
         # P0-2: fail-closed quiet-success -- a pure observation VC that exits
         # 0 but leaves non-empty stderr is not a trustworthy silent pass.
         if _exit_code == 0 and _stderr.strip():
@@ -5348,6 +5827,18 @@ def _main_impl() -> int:
             _exit_code, _stdout, _stderr, _duration_ms, _runner_env_delta = run_command(
                 job["command"], _effective_timeout_for(job["command"]), args.cwd
             )
+            # Issue #2254 AC6/AC7: a non-pure job is NEVER dedup-replayed --
+            # every call here is its own real subprocess launch.
+            if not args.no_history_estimator:
+                record_command_execution_sample(
+                    job["command"],
+                    args.cwd,
+                    exit_code=_exit_code,
+                    stderr=_stderr,
+                    duration_ms=_duration_ms,
+                    applied_timeout_seconds=_effective_timeout_for(job["command"]),
+                    repo_root=_repo_root_for_history,
+                )
             _outcome = {
                 "exit_code": _exit_code,
                 "stdout": _stdout,
