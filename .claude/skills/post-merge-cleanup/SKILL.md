@@ -107,11 +107,13 @@ worker が実行する mechanical executor procedure（8 ステップの determi
 git/gh 結果分類、worktree/branch binding 検証、cleanup failure taxonomy、
 `POST_MERGE_CLEANUP_REPORT_V1` の生成）は本 orchestrator Skill の本文に保持しない。
 
-worker（`post-merge-cleanup-worker`）は Claude Code では `.claude/agents/post-merge-cleanup-worker.md`
-の `skills: [post-merge-cleanup-executor]` frontmatter 経由、Codex CLI では
-`.codex/agents/post-merge-cleanup-worker.toml` の `repo_local_skill_surface` 経由で
+worker（`post-merge-cleanup-worker`）は `.claude/agents/post-merge-cleanup-worker.md`
+の `skills: [post-merge-cleanup-executor]` frontmatter 経由で
 `post-merge-cleanup-executor` Skill（canonical body: `.claude/skills/post-merge-cleanup-executor/SKILL.md`、
-Codex thin wrapper: `.agents/skills/post-merge-cleanup-executor/SKILL.md`）を参照し、
+repo-local discovery surface: `.agents/skills/post-merge-cleanup-executor/SKILL.md`。Issue #2161 の
+native Codex CLI retirement 以前は Codex CLI が `.codex/agents/post-merge-cleanup-worker.toml` の
+`repo_local_skill_surface` 経由で本 symlink 越しに同じ canonical body を参照していたが、当該 agent 定義は
+撤去済みである）を参照し、
 本 orchestrator の main-thread 向け routing instruction（worker 起動、follow-up 起票実行、
 parent close 実行、superseded PR close 実行）を読み込まない。
 

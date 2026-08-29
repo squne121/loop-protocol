@@ -399,6 +399,8 @@ GitHub 操作における信頼境界の定義。
 
 ```bash
 rtk gh --help
-codex execpolicy check --pretty --rules .codex/rules/default.rules -- rtk gh issue view 1
-codex execpolicy check --pretty --rules .codex/rules/default.rules -- gh issue view 1
 ```
+
+Issue #2161（native Codex CLI retirement）以前は上記に加えて `codex execpolicy check --pretty --rules
+.codex/rules/default.rules -- rtk gh issue view 1` 等の execpolicy smoke check も行っていたが、
+`.codex/**` の撤去に伴い当該チェックは廃止された。

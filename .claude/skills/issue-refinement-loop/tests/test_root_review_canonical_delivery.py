@@ -42,7 +42,6 @@ PIPELINE_SCRIPT = SCRIPTS_DIR / "run_root_review_pipeline.py"
 SKILL_MD = ROOT / ".claude" / "skills" / "issue-refinement-loop" / "SKILL.md"
 REVIEW_ISSUE_SKILL_MD = ROOT / ".claude" / "skills" / "review-issue" / "SKILL.md"
 ISSUE_REVIEWER_AGENT_MD = ROOT / ".claude" / "agents" / "issue-reviewer.md"
-ISSUE_REVIEWER_AGENT_TOML = ROOT / ".codex" / "agents" / "issue-reviewer.toml"
 COMMAND_REGISTRY_PY = SCRIPTS_DIR / "command_registry.py"
 
 if str(SCRIPTS_DIR) not in sys.path:
@@ -444,11 +443,6 @@ _LEGACY_RELAY_REGRESSION_PHRASES: dict[Path, list[str]] = {
         "orchestratorから呼ばれ、結果を返して終了する",
         "orchestratorは判定を再評価せず、機械的にroutingする",
         "orchestratorは本SubAgentの`VERDICT`を独立に再計算せず直接信頼する",
-    ],
-    ISSUE_REVIEWER_AGENT_TOML: [
-        "issue-refinement-loop向けのread-onlyadvisoryreviewerとして、root-ownedpipelineが",
-        "呼び出し元（orchestrator）から明示的なread-only",
-        "orchestratorは本AgentのVERDICTを独立に再計算せず直接信頼する",
     ],
     REVIEW_ISSUE_SKILL_MD: [
         "`invoked_as_loop:true`（`issue-reviewer`経由）",

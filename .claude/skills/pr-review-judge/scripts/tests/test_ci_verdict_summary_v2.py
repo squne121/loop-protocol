@@ -200,7 +200,6 @@ class TestAC10EnumExhaustiveness:
             make_check("e2e-core", conclusion="success"),
             make_check("e2e-responsive-matrix", conclusion="success"),
             make_check("python-test-core", conclusion="success"),
-            make_check("codex-execpolicy", conclusion="success"),
             make_check("python-test", conclusion="success"),
             make_check("node-backed-hook-tests", conclusion="success"),
             make_check("actionlint", conclusion="success"),
@@ -444,7 +443,8 @@ class TestB3NoRequiredEvidence:
     def test_required_checks_contains_all_ci_jobs(self, v2):
         """REQUIRED_CHECKS must include all ci.yml upstream evidence jobs
         (Issue #1788 added agy-causal-claim-drift-gate; Issue #1760/#1824 added
-        python-test-core and codex-execpolicy)."""
+        python-test-core and the former codex-execpolicy job, retired by
+        Issue #2161's native Codex CLI retirement)."""
         expected = {
             ("ci", "typecheck"),
             ("ci", "lint"),
@@ -454,7 +454,6 @@ class TestB3NoRequiredEvidence:
             ("ci", "e2e-core"),
             ("ci", "e2e-responsive-matrix"),
             ("ci", "python-test-core"),
-            ("ci", "codex-execpolicy"),
             ("ci", "python-test"),
             ("ci", "node-backed-hook-tests"),
             ("ci", "actionlint"),
@@ -473,7 +472,6 @@ class TestB3NoRequiredEvidence:
             make_check("e2e-core", conclusion="success"),
             make_check("e2e-responsive-matrix", conclusion="success"),
             make_check("python-test-core", conclusion="success"),
-            make_check("codex-execpolicy", conclusion="success"),
             make_check("python-test", conclusion="success"),
             make_check("node-backed-hook-tests", conclusion="success"),
             make_check("actionlint", conclusion="success"),
@@ -631,7 +629,7 @@ class TestP0RealCheckRunApiEvidence:
         names = [
             "typecheck", "lint", "test", "build", "e2e",
             "e2e-core", "e2e-responsive-matrix",
-            "python-test-core", "codex-execpolicy", "python-test",
+            "python-test-core", "python-test",
             "node-backed-hook-tests", "actionlint", "agy-causal-claim-drift-gate",
             "visual-impact-policy",
         ]
@@ -802,9 +800,11 @@ class TestAC10AC11UploadedArtifactBinding:
 # ---------------------------------------------------------------------------
 
 class TestP0_1AllRealCiJobsClassified:
-    """Regression guard for PR #1824 review: python-test-core / codex-execpolicy
-    were added as new ci.yml jobs but never registered in CLASSIFICATION_MAP,
-    so a fully-green real run still produced overall_status=gh_error."""
+    """Regression guard for PR #1824 review: python-test-core (and, at the
+    time, codex-execpolicy -- retired by Issue #2161's native Codex CLI
+    retirement) were added as new ci.yml jobs but never registered in
+    CLASSIFICATION_MAP, so a fully-green real run still produced
+    overall_status=gh_error."""
 
     def _ci_verdict_summary_needs(self) -> list[str]:
         import yaml
@@ -824,9 +824,8 @@ class TestP0_1AllRealCiJobsClassified:
             f"entry (would be treated as blocking/gh_error): {unclassified}"
         )
 
-    def test_python_test_core_and_codex_execpolicy_are_classified(self, v2):
+    def test_python_test_core_is_classified(self, v2):
         assert v2.get_classification("ci", "python-test-core") != "unknown"
-        assert v2.get_classification("ci", "codex-execpolicy") != "unknown"
 
     def test_real_ci_jobs_all_green_yields_merge_ready_not_gh_error(self, v2):
         """End-to-end reproduction of the reported bug (run 30271027218):

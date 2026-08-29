@@ -165,8 +165,8 @@ def _is_race_tolerant_unattributable_path(rel_path: str) -> bool:
 
 # Issue #2161 (native Codex CLI retirement): the typed SubAgent-launch-
 # ledger transition policy (Issue #1502) that lived here was removed as
-# part of the DELETE_CHAIN -- its sole live producer,
-# scripts/check-codex-agents.mjs, no longer exists.
+# part of the DELETE_CHAIN -- its sole live producer (the former native
+# Codex-agents parity checker script under scripts/) no longer exists.
 
 def _is_symlink_path(path: Path) -> bool:
     current = Path(path.anchor) if path.is_absolute() else Path()
@@ -932,7 +932,8 @@ def _find_unauthorized_repo_changes(
     # Issue #2161 (native Codex CLI retirement): the launch-ledger typed
     # exact-path exclusion (Issue #1502/#1830) was removed from this
     # function's diff filtering as part of the DELETE_CHAIN -- its sole live
-    # producer, scripts/check-codex-agents.mjs, no longer exists.
+    # producer (the former native Codex-agents parity checker script under
+    # scripts/) no longer exists.
     after_snapshot = _snapshot_repo_paths(project_root, issue_number, command_id)
     after_status = _git_status_paths(project_root)
 

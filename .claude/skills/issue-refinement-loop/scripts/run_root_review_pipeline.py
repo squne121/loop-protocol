@@ -5,8 +5,8 @@ run_root_review_pipeline.py - ROOT_REVIEW_PIPELINE_RESULT_V1
 Root-owned producer I/O for the issue-refinement-loop review step (Issue #2049).
 
 Problem this closes: the `issue-reviewer` custom agent
-(`.codex/agents/issue-reviewer.toml`) declares `default_permissions =
-"loop-protocol-readonly"` (read-only) while its historical
+(`.claude/agents/issue-reviewer.md`) is declared read-only (no Issue mutation
+tools; see its frontmatter `description`) while its historical
 `developer_instructions` also required it to fetch the live Issue body,
 write temp files, and persist a full artifact under
 `.claude/artifacts/issue-refinement-loop/<N>/` -- a producer I/O
@@ -941,72 +941,15 @@ def gate_final_review(*, remote_update_ok: bool, readback: dict[str, Any]) -> di
     return {"final_review_allowed": allowed, "reasons": reasons}
 
 
-# ---------------------------------------------------------------------------
-# Static agent-contract check (Issue #2049 AC9)
-# ---------------------------------------------------------------------------
-
-_WORKSPACE_WRITE_MARKERS = (
-    "artifact として保存",
-    "temp file",
-    "一時ファイル",
-    "を保存し",
-    "書き込む",
-    "書き込み",
-    "Persist",
-)
-
-# Negation cues that, when present in the SAME sentence as an action marker,
-# mean the sentence is describing what the agent does NOT do (e.g. "producer
-# I/O を一切行わない" / "何も書き込まない") rather than asserting a workspace
-# write requirement. Without this, a read-only agent's own disclaimer text
-# (which necessarily mentions "artifact" / "temp file" / "書き込み" while
-# denying it performs them) would be flagged as self-contradictory.
-_NEGATION_CUES = (
-    "行わない",
-    "行いません",
-    "書き込まない",
-    "しない",
-    "せず",
-    "一切",
-    "ではない",
-)
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split on full-width period, first folding newlines to spaces so a
-    sentence that wraps across multiple TOML lines is still evaluated as one
-    unit (negation cues near the end of a wrapped sentence must still count)."""
-    flat = text.replace("\n", " ")
-    return [s for s in flat.split("。") if s.strip()]
-
-
-def check_agent_is_read_only_advisory(toml_text: str) -> list[str]:
-    """Reject a read-only agent config whose instructions still carry a
-    workspace write requirement (Issue #2049 AC9).
-
-    A config is only flagged when it BOTH declares itself read-only
-    (`default_permissions` containing `readonly`) AND its
-    `developer_instructions` contains a sentence with a workspace-write
-    marker that is NOT negated in the same sentence (i.e. it asserts,
-    rather than disclaims, a write requirement). A non-read-only agent is
-    never flagged.
-    """
-    violations: list[str] = []
-    is_read_only = bool(re.search(r'default_permissions\s*=\s*"[^"]*readonly[^"]*"', toml_text))
-    if not is_read_only:
-        return violations
-
-    instructions_match = re.search(r'developer_instructions\s*=\s*"""(.*?)"""', toml_text, re.DOTALL)
-    instructions = instructions_match.group(1) if instructions_match else toml_text
-
-    for sentence in _split_sentences(instructions):
-        if any(cue in sentence for cue in _NEGATION_CUES):
-            continue
-        for marker in _WORKSPACE_WRITE_MARKERS:
-            if marker in sentence:
-                violations.append(f"workspace_write_marker_present:{marker}")
-
-    return violations
+# Issue #2161 (native Codex CLI retirement): the Issue #2049 AC9 static
+# agent-contract check (`check_agent_is_read_only_advisory()` and its
+# `_split_sentences()` / `_WORKSPACE_WRITE_MARKERS` / `_NEGATION_CUES`
+# helpers) was removed as an orphan DELETE_CHAIN -- it parsed the TOML
+# `default_permissions = "..."` / `developer_instructions = """..."""`
+# grammar of the now-deleted `.codex/agents/issue-reviewer.toml`, had no
+# other production caller, and the provider-neutral
+# `.claude/agents/issue-reviewer.md` counterpart uses a different (Markdown
+# frontmatter + prose) format this checker cannot parse.
 
 
 # ---------------------------------------------------------------------------
