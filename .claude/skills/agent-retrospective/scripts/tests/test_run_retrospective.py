@@ -2374,3 +2374,340 @@ def test_build_observer_requests_rejects_non_string_prompt_value() -> None:
     with pytest.raises(rr.WireContractError) as excinfo:
         rr.build_observer_requests(schema_dir=_SCHEMA_DIR, cwd=".", prompts=non_string_prompts)
     assert excinfo.value.reason_code == "invalid_observer_prompts"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2375 AC3: latitude_runtime_evidence deterministic enrichment binding
+# ---------------------------------------------------------------------------
+#
+# `bind_latitude_evidence_to_candidates` is a pure function: only `available` evidence is ever
+# bound, only onto `runtime_behavior`-claim-class candidates, and only as an additional
+# `evidence_refs[]` entry -- it never changes `observed`/`presence_delta`/`evaluation_status`/
+# `source_coverage`/`claim_class`/any signal field, so evidence presence/absence alone can never
+# upgrade a finding to a positive claim/status/confidence.
+
+_LATITUDE_COLLECTOR_VERSION = "latitude-collector/v1"
+_LATITUDE_COLLECTED_AT = "2026-08-29T00:00:00Z"
+_LATITUDE_METRICS = {"trace_count": 2, "span_count": 6, "duration_ms": 120}
+
+
+def _latitude_finding_fixture() -> dict[str, Any]:
+    return copy.deepcopy(
+        _validate_mod.load_fixture("agent_improvement_candidate_v1.finding_contract.new.valid.json")
+    )
+
+
+def _latitude_available_evidence(metrics: dict[str, Any] | None = None) -> dict[str, Any]:
+    metrics = metrics if metrics is not None else dict(_LATITUDE_METRICS)
+    ref = _validate_mod.compute_latitude_evidence_ref(_LATITUDE_COLLECTOR_VERSION, metrics, _LATITUDE_COLLECTED_AT)
+    identity = _validate_mod.compute_latitude_evidence_identity(_LATITUDE_COLLECTOR_VERSION, ref, metrics)
+    return {
+        "schema_version": "latitude_runtime_evidence/v1",
+        "availability": "available",
+        "collected_at": _LATITUDE_COLLECTED_AT,
+        "collector_version": _LATITUDE_COLLECTOR_VERSION,
+        "evidence_identity": identity,
+        "evidence_ref": ref,
+        "metrics": metrics,
+        "reason_code": None,
+    }
+
+
+def _latitude_unavailable_evidence(reason_code: str = "cli_not_found") -> dict[str, Any]:
+    return {
+        "schema_version": "latitude_runtime_evidence/v1",
+        "availability": "unavailable",
+        "collected_at": _LATITUDE_COLLECTED_AT,
+        "collector_version": _LATITUDE_COLLECTOR_VERSION,
+        "evidence_identity": None,
+        "evidence_ref": None,
+        "metrics": {"trace_count": None, "span_count": None, "duration_ms": None},
+        "reason_code": reason_code,
+    }
+
+
+def test_latitude_evidence_binds_onto_runtime_behavior_candidate():
+    candidate = _latitude_finding_fixture()
+    assert candidate["finding_contract"]["claim_class"] == "runtime_behavior"
+    evidence = _latitude_available_evidence()
+
+    bound = rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+    evidence_refs = bound[0]["finding_contract"]["evaluations"][-1]["evidence_refs"]
+    assert evidence_refs[-1] == {
+        "ref_type": "runtime_receipt",
+        "source_id": "runtime",
+        "resource_identity": evidence["evidence_ref"],
+        "projection_digest": evidence["evidence_identity"],
+    }
+    # schema still validates after binding (no schema change was required).
+    _validate_mod.validate_candidate(bound[0])
+
+
+def test_latitude_evidence_binding_does_not_mutate_input_candidates():
+    candidate = _latitude_finding_fixture()
+    original = copy.deepcopy(candidate)
+    evidence = _latitude_available_evidence()
+
+    rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+    assert candidate == original
+
+
+def test_latitude_evidence_binding_does_not_mutate_evidence_dict():
+    candidate = _latitude_finding_fixture()
+    evidence = _latitude_available_evidence()
+    original_evidence = copy.deepcopy(evidence)
+
+    rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+    assert evidence == original_evidence
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["observed", "presence_delta", "evaluation_status", "source_coverage"],
+)
+def test_latitude_evidence_binding_never_changes_evaluation_fields(field: str):
+    candidate = _latitude_finding_fixture()
+    before_value = candidate["finding_contract"]["evaluations"][-1][field]
+    evidence = _latitude_available_evidence()
+
+    bound = rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+    assert bound[0]["finding_contract"]["evaluations"][-1][field] == before_value
+
+
+def test_latitude_evidence_binding_never_changes_claim_class():
+    candidate = _latitude_finding_fixture()
+    before_claim_class = candidate["finding_contract"]["claim_class"]
+    evidence = _latitude_available_evidence()
+
+    bound = rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+    assert bound[0]["finding_contract"]["claim_class"] == before_claim_class
+
+
+@pytest.mark.parametrize("availability", ["unavailable", "error"])
+def test_latitude_evidence_not_available_leaves_candidate_unchanged(availability: str):
+    candidate = _latitude_finding_fixture()
+    evidence = _latitude_unavailable_evidence()
+    evidence["availability"] = availability
+    evidence["reason_code"] = "budget_exceeded" if availability == "error" else "cli_not_found"
+
+    bound = rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+    assert bound[0] == candidate
+
+
+def test_latitude_evidence_none_leaves_candidate_unchanged():
+    candidate = _latitude_finding_fixture()
+
+    bound = rr.bind_latitude_evidence_to_candidates([candidate], None, validator_module=_validate_mod)
+
+    assert bound[0] == candidate
+
+
+def test_latitude_evidence_does_not_bind_onto_non_runtime_behavior_candidate():
+    candidate = _latitude_finding_fixture()
+    candidate["finding_contract"]["claim_class"] = "code_content"
+    candidate["finding_contract"]["identity"]["key"]["claim_class"] = "code_content"
+    evidence = _latitude_available_evidence()
+
+    bound = rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+    assert bound[0] == candidate
+
+
+def test_latitude_evidence_binding_duplicate_within_run_fails_closed():
+    candidate = _latitude_finding_fixture()
+    evidence = _latitude_available_evidence()
+
+    bound_once = rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+    with pytest.raises(_validate_mod.RetrospectiveSchemaError, match="duplicate latitude evidence_identity"):
+        rr.bind_latitude_evidence_to_candidates(bound_once, evidence, validator_module=_validate_mod)
+
+
+def test_latitude_evidence_identity_mismatch_fails_closed_without_binding():
+    candidate = _latitude_finding_fixture()
+    evidence = _latitude_available_evidence()
+    evidence["evidence_identity"] = "sha256:" + "7" * 64
+
+    with pytest.raises(_validate_mod.RetrospectiveSchemaError, match="evidence_identity mismatch"):
+        rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+
+def test_latitude_evidence_unknown_schema_version_fails_closed_without_binding():
+    candidate = _latitude_finding_fixture()
+    evidence = _latitude_available_evidence()
+    evidence["schema_version"] = "latitude_runtime_evidence/v99"
+
+    with pytest.raises(_validate_mod.RetrospectiveSchemaError, match="unknown latitude_evidence schema_version"):
+        rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+
+def test_latitude_evidence_malformed_evidence_fails_closed_without_binding():
+    candidate = _latitude_finding_fixture()
+    evidence = _latitude_available_evidence()
+    del evidence["evidence_ref"]  # required field missing -> jsonschema ValidationError
+
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        rr.bind_latitude_evidence_to_candidates([candidate], evidence, validator_module=_validate_mod)
+
+
+def test_latitude_evidence_binding_is_a_no_op_for_empty_candidate_list():
+    evidence = _latitude_available_evidence()
+    assert rr.bind_latitude_evidence_to_candidates([], evidence, validator_module=_validate_mod) == []
+
+
+def test_latitude_evidence_binding_skips_candidate_without_finding_contract():
+    legacy_candidate = {
+        "candidate_id": "cand-legacy-0001",
+        "candidate_status": "proposed",
+        "title": "legacy candidate with no finding_contract",
+        "description": "legacy lifecycle-only record.",
+        "source_run_ref": {"base_sha": "a" * 40, "source_set_digest": "b" * 64},
+        "created_at": _LATITUDE_COLLECTED_AT,
+        "updated_at": _LATITUDE_COLLECTED_AT,
+    }
+    evidence = _latitude_available_evidence()
+
+    bound = rr.bind_latitude_evidence_to_candidates([legacy_candidate], evidence, validator_module=_validate_mod)
+
+    assert bound[0] == legacy_candidate
+
+
+def test_collect_latitude_runtime_evidence_once_forwards_injected_collector_kwargs():
+    """``collect_latitude_runtime_evidence_once`` forwards its kwargs verbatim to Child 3's
+    ``collect_latitude_runtime_evidence`` -- injecting a fake ``which``/``runner`` here (rather
+    than monkeypatching the `_collect_snapshot_module()`-loaded module object, which is re-exec'd
+    fresh on every call and therefore not a stable monkeypatch target) proves the delegation.
+    ``session_id``/``project_slug`` are supplied explicitly (PR #2392 fix_delta: the collector
+    never launches the CLI without a resolvable session_id) so this test still exercises the
+    ``which`` forwarding path (``cli_not_found``)."""
+    result = rr.collect_latitude_runtime_evidence_once(
+        which=lambda name: None, session_id="sess-forward-0001", project_slug="proj-forward"
+    )
+    assert result["schema_version"] == "latitude_runtime_evidence/v1"
+    assert result["availability"] == "unavailable"
+    assert result["reason_code"] == "cli_not_found"
+    _validate_mod.validate_latitude_runtime_evidence(result)
+
+
+def test_collect_latitude_runtime_evidence_once_session_id_unresolved_never_launches_cli():
+    calls: list[list[str]] = []
+
+    def unexpected_runner(argv):
+        calls.append(list(argv))
+        raise AssertionError("must not launch CLI without a resolvable session_id")
+
+    result = rr.collect_latitude_runtime_evidence_once(
+        which=lambda name: "/usr/bin/latitude", runner=unexpected_runner, project_slug="proj-forward"
+    )
+    assert calls == []
+    assert result["availability"] == "unavailable"
+    assert result["reason_code"] == "session_id_unresolved"
+
+
+def test_collect_latitude_runtime_evidence_once_launches_cli_exactly_once():
+    calls: list[list[str]] = []
+    payload = json.dumps(
+        {
+            "items": [{"sessionId": "sess-launch-0001", "spanCount": 1, "durationNs": 1_000_000}],
+            "nextCursor": None,
+            "hasMore": False,
+        }
+    )
+
+    def fake_runner(argv):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
+
+    result = rr.collect_latitude_runtime_evidence_once(
+        which=lambda name: "/usr/bin/latitude",
+        runner=fake_runner,
+        session_id="sess-launch-0001",
+        project_slug="proj-launch",
+    )
+    assert len(calls) == 1
+    assert result["availability"] == "available"
+    _validate_mod.validate_latitude_runtime_evidence(result)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2375 PR #2392 fix_delta: `_resolve_latitude_target_session_id` (Session Correlation)
+# and the actual `execute_run()` wiring of
+# `collect_latitude_runtime_evidence_once()`/`bind_latitude_evidence_to_candidates()` (previously
+# defined but never called from any production path -- human review blocker).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_latitude_target_session_id_reads_claude_gpt_complete_sessions():
+    claude_gpt_result = _FakeCollectorResult(
+        {"source_id": "claude_gpt", "source_type": "runtime", "source_status": "complete"},
+        {"provenance": {"complete_sessions": ["sess-aaa", "sess-bbb"]}},
+    )
+    other_result = _FakeCollectorResult({"source_id": "repository"}, {})
+
+    assert rr._resolve_latitude_target_session_id([other_result, claude_gpt_result]) == "sess-aaa"
+
+
+def test_resolve_latitude_target_session_id_none_when_no_complete_sessions():
+    claude_gpt_result = _FakeCollectorResult(
+        {"source_id": "claude_gpt"}, {"provenance": {"complete_sessions": []}}
+    )
+    assert rr._resolve_latitude_target_session_id([claude_gpt_result]) is None
+
+
+def test_resolve_latitude_target_session_id_none_when_no_claude_gpt_result():
+    other_result = _FakeCollectorResult({"source_id": "repository"}, {})
+    assert rr._resolve_latitude_target_session_id([other_result]) is None
+
+
+def test_execute_run_wires_latitude_binding_into_production_call_graph():
+    """PR #2392 fix_delta: `execute_run()` must actually call
+    `collect_latitude_runtime_evidence_once()`/`bind_latitude_evidence_to_candidates()` -- this
+    monkeypatches the module-level `collect_latitude_runtime_evidence_once` to prove it is invoked
+    from the real `execute_run()` call graph (not just unit-testable in isolation), and that
+    available evidence is actually bound onto the resulting `PublishRequest.candidate_records`."""
+    latitude_evidence = _latitude_available_evidence()
+    call_log: list[str] = []
+    expected_digest = rr.compute_source_set_digest([_fake_collector_result("repository", _FULL_SHA).observation])
+    # `_identity_key`'s default `claim_class` is already `"runtime_behavior"` (the eligible
+    # claim_class for latitude evidence binding -- see `bind_latitude_evidence_to_candidates`).
+    current_judgment = _judgment_from_key(
+        _identity_key("example_rule"), candidate_id="cand-latitude-wired", evidence_refs=_RUNTIME_EVIDENCE_REFS
+    )
+
+    def fake_collect_once(**kwargs):
+        call_log.append("collect_latitude_runtime_evidence_once")
+        return latitude_evidence
+
+    original = rr.collect_latitude_runtime_evidence_once
+    rr.collect_latitude_runtime_evidence_once = fake_collect_once
+    try:
+        publish_request = rr.execute_run(
+            base_sha_resolver=lambda: _FULL_SHA,
+            collectors=[lambda base_sha: _fake_collector_result("repository", base_sha)],
+            observer_requests=[_observer_request("retrospective-runtime-observer")],
+            invoke=_make_observer_invoke("run-latitude-1", expected_digest, call_log),
+            invoke_evaluator=_make_execute_run_evaluator_invoke([current_judgment]),
+            repository_id="squne121/loop-protocol",
+            target_issue=2375,
+            request_id="req-latitude-1",
+            idempotency_key="idem-latitude-1",
+            run_id="run-latitude-1",
+        )
+    finally:
+        rr.collect_latitude_runtime_evidence_once = original
+
+    assert "collect_latitude_runtime_evidence_once" in call_log
+    bound_candidate = publish_request.candidate_records[0]
+    evidence_refs = bound_candidate["finding_contract"]["evaluations"][-1]["evidence_refs"]
+    assert evidence_refs[-1] == {
+        "ref_type": "runtime_receipt",
+        "source_id": "runtime",
+        "resource_identity": latitude_evidence["evidence_ref"],
+        "projection_digest": latitude_evidence["evidence_identity"],
+    }
