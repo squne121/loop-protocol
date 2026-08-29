@@ -666,7 +666,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"{claude_path}: model_alias expected"
                 f" {expected['model_alias']!r} got {claude_frontmatter.get('model')!r}"
             )
-        if "claude_permission_mode" in expected and claude_frontmatter.get("permissionMode") != expected["claude_permission_mode"]:
+        if (
+            "claude_permission_mode" in expected
+            and claude_frontmatter.get("permissionMode") != expected["claude_permission_mode"]
+        ):
             failures.append(
                 f"{claude_path}: permissionMode expected"
                 f" {expected['claude_permission_mode']!r}"

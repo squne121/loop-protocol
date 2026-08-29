@@ -99,12 +99,6 @@ CLI subcommands:
                          Blocker 2: every expected binding value is
                          caller-supplied, never re-derived from the artifact
                          itself).
-    check-agent-contract
-                         Static check that a read-only agent's
-                         developer_instructions does not carry a workspace
-                         write requirement (reused by
-                         test_issue_reviewer_contract_static.py, Issue #2049
-                         AC9).
 
 Persistence (Issue #2049 AC3, PR #2135 iteration-3 P1-3): both
 `persist_to_canonical_artifact_directory()` and the compact-envelope artifact
@@ -1615,13 +1609,6 @@ def _cmd_gate_final_review(args: argparse.Namespace) -> int:
     return 0 if result["final_review_allowed"] else 1
 
 
-def _cmd_check_agent_contract(args: argparse.Namespace) -> int:
-    text = Path(args.toml_file).read_text(encoding="utf-8")
-    violations = check_agent_is_read_only_advisory(text)
-    print(json.dumps({"violations": violations}))
-    return 0 if not violations else 1
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Root-owned issue-refinement-loop review pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1695,10 +1682,6 @@ def main(argv: list[str] | None = None) -> int:
     p_gate.add_argument("--expected-verdict", required=True)
     p_gate.add_argument("--remote-update-ok", action="store_true")
     p_gate.set_defaults(func=_cmd_gate_final_review)
-
-    p_contract = sub.add_parser("check-agent-contract", help="Static read-only/workspace-write contract check")
-    p_contract.add_argument("--toml-file", required=True)
-    p_contract.set_defaults(func=_cmd_check_agent_contract)
 
     args = parser.parse_args(argv)
     return args.func(args)
