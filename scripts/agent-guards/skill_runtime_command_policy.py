@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -577,7 +578,7 @@ def is_exact_skill_runtime_executor_command(
 # `repo_relative_file`-typed placeholder uniformly (production and
 # test-only), without changing any command's argv shape, flags, or accepted
 # command_ids.
-_SHLEX_ROUND_TRIP_UNSAFE_CHARS = frozenset({" ", "\t", "\"", "'", "\\"})
+_SHLEX_ROUND_TRIP_UNSAFE_CHARS = frozenset({" ", "\t", '"', "'", "\\"})
 
 
 def _is_safe_repo_relative_fixture_path(fixture: str, root: str) -> bool:
@@ -784,9 +785,7 @@ def parse_exact_skill_runtime_anchor_fixture_command(
         return None
     if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
         return None
-    if os.path.realpath(os.path.join(root, tokens[3])) != os.path.realpath(
-        os.path.join(root, SKILL_RUNTIME_EXEC_REL)
-    ):
+    if os.path.realpath(os.path.join(root, tokens[3])) != os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
         return None
     command_id, issue_number, repo = tokens[5], tokens[7], tokens[9]
     fixture, anchor_comment_url = tokens[11], tokens[13]
@@ -1422,8 +1421,6 @@ def is_exact_skill_runtime_authority_transport_consume_executor_command(
     return True
 
 
-
-
 def _parse_exact_skill_runtime_anchor_command(
     command: str, expected_command_ids: frozenset[str], project_root: str | None = None
 ) -> ExactSkillRuntimeCommand | None:
@@ -1632,9 +1629,7 @@ SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"][SCOPE_ROLLUP_RUN_COMMAND
     "network_effect": "github_read_only",
 }
 
-ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS | frozenset(
-    {SCOPE_ROLLUP_RUN_COMMAND_ID}
-)
+ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS | frozenset({SCOPE_ROLLUP_RUN_COMMAND_ID})
 _ROOT_NO_WORKTREE_POLICY_INVARIANTS[SCOPE_ROLLUP_RUN_COMMAND_ID] = {
     "execution_class": SCOPE_ROLLUP_RUN_EXECUTION_CLASS,
     "required_cwd": "canonical_main_root",
@@ -1662,14 +1657,10 @@ class ScopeRollupRunCommand:
 # (safe charset only -- no literal value pinning is possible since both are
 # generated per-invocation).
 _INVOCATION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
-_REQUESTED_AT_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
-)
+_REQUESTED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 
 
-def parse_scope_rollup_run_command(
-    command: str, project_root: str | None = None
-) -> ScopeRollupRunCommand | None:
+def parse_scope_rollup_run_command(command: str, project_root: str | None = None) -> ScopeRollupRunCommand | None:
     """Exact-match parser for `uv run python3
     scripts/agent-guards/run_scope_rollup_preflight.py --issue-number <N>
     --repo <owner/repo> --invocation-id <id> --requested-at <ISO8601>`
@@ -1727,9 +1718,7 @@ def parse_scope_rollup_run_command(
     )
 
 
-def is_scope_rollup_run_command(
-    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
-) -> bool:
+def is_scope_rollup_run_command(command: str, cwd: str, project_root: str, deadline: Deadline | None = None) -> bool:
     """canonical root + default branch + trusted repo binding only. No
     active-issue-worktree requirement -- scope_rollup.run always runs before
     any issue worktree exists (Issue #1547 P0-1)."""
@@ -1803,14 +1792,22 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "{fixture}",
     ],
     "preflight.run.fixture.with_human_context": [
-        "uv", "run", "python3",
+        "uv",
+        "run",
+        "python3",
         ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
-        "--issue-number", "{issue_number}",
-        "--repo", "{repo}",
-        "--fixture", "{fixture}",
-        "--anchor-comment-url", "{anchor_comment_url}",
-        "--human-context-comment-url", "{anchor_comment_url}",
-        "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--fixture",
+        "{fixture}",
+        "--anchor-comment-url",
+        "{anchor_comment_url}",
+        "--human-context-comment-url",
+        "{anchor_comment_url}",
+        "--investigation-evidence-transport-path",
+        "{investigation_evidence_transport_path}",
     ],
     "preflight.run.with_anchor": [
         "uv",
@@ -1982,7 +1979,9 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "fixture": {"type": "repo_relative_file", "required": True},
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         "investigation_evidence_transport_path": {
-            "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
+            "type": "repo_relative_file",
+            "required": False,
+            "optional_flag_pair": True,
         },
     },
     "preflight.run.with_anchor": {
@@ -1996,7 +1995,9 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         # #2086 P0 fix_delta (Blocker 1/2)
         "investigation_evidence_transport_path": {
-            "type": "path", "required": False, "optional_flag_pair": True,
+            "type": "path",
+            "required": False,
+            "optional_flag_pair": True,
         },
     },
     "preflight.run.with_agent_report": {
@@ -2088,11 +2089,7 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
     if expected_placeholders is None or placeholders != expected_placeholders:
         raise ValueError("placeholder_mismatch")
     declared_placeholders = set(placeholders)
-    argv_placeholders = {
-        token[1:-1]
-        for token in argv
-        if isinstance(token, str) and _PLACEHOLDER_RE.match(token)
-    }
+    argv_placeholders = {token[1:-1] for token in argv if isinstance(token, str) and _PLACEHOLDER_RE.match(token)}
     if argv_placeholders != declared_placeholders:
         raise ValueError("argv_placeholder_contract_mismatch")
     if "{active_issue}" not in "".join(expected_write_roots):
@@ -2262,3 +2259,162 @@ def reject_option_like_positional(value: str) -> None:
     interpreted by Git as a flag instead of data (Issue #2196 P1-3)."""
     if value.startswith("-"):
         raise ValueError(f"positional_argument_looks_like_option:{value}")
+
+
+# ---------------------------------------------------------------------------
+# Issue #2378: closed remote-default-ref protocol value types. These policy
+# constructors are the single authority for data reaching semantic builders.
+# ---------------------------------------------------------------------------
+
+_LITERAL_REMOTE_URL_SCHEMES = frozenset({"file", "https", "ssh"})
+_SCP_LIKE_SSH_RE = re.compile(r"^(?:(?P<user>[^@:/\s]+)@)?(?P<host>[A-Za-z0-9][A-Za-z0-9.-]*):(?P<path>[^\s\x00]+)$")
+_PRIVATE_REF_NONCE_RE = re.compile(r"^[a-f0-9]{16,64}$")
+_OBJECT_FORMAT_LENGTHS = {"sha1": 40, "sha256": 64}
+
+
+@dataclass(frozen=True)
+class LiteralRemoteUrl:
+    value: str
+
+
+@dataclass(frozen=True)
+class AllowedRemoteRef:
+    value: str
+
+
+@dataclass(frozen=True)
+class RepositoryObjectFormat:
+    value: str
+
+
+@dataclass(frozen=True)
+class RepositoryObjectId:
+    value: str
+
+
+@dataclass(frozen=True)
+class ControlPlanePrivateRef:
+    value: str
+
+
+@dataclass(frozen=True)
+class DetachedWorktreePath:
+    value: str
+
+
+def validate_literal_remote_url(value: str) -> LiteralRemoteUrl:
+    """Accept only a concrete network/file URL accepted by Git.
+
+    SSH remotes deliberately include both URI and scp-like grammar.  An SSH
+    username selects an account at the authority and is data, not a rewrite or
+    credential secret; passwords, queries, fragments, aliases, and options are
+    still rejected before any Git command is constructed.
+    """
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("literal_remote_url_invalid")
+    if any(char.isspace() for char in value) or "\x00" in value or value.startswith("-"):
+        raise ValueError("literal_remote_url_invalid")
+    # URI parsing must take precedence: otherwise `ssh://host/path` could
+    # be misread as an scp-like `ssh:...` value.
+    scp_like = _SCP_LIKE_SSH_RE.fullmatch(value) if "://" not in value else None
+    if scp_like is not None:
+        # `host:path` is Git's SSH shorthand. A colon remains required, so a
+        # remote alias cannot enter this closed semantic surface.
+        if not scp_like.group("path").lstrip("/") or "?" in value or "#" in value:
+            raise ValueError("literal_remote_url_invalid")
+        return LiteralRemoteUrl(value)
+    parsed = urlparse(value)
+    if parsed.scheme not in _LITERAL_REMOTE_URL_SCHEMES or (not parsed.netloc and parsed.scheme != "file"):
+        raise ValueError("literal_remote_url_invalid")
+    if parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("literal_remote_url_invalid")
+    if parsed.scheme != "ssh" and parsed.username:
+        raise ValueError("literal_remote_url_invalid")
+    if parsed.scheme == "file" and (parsed.netloc not in ("", "localhost") or not parsed.path.startswith("/")):
+        raise ValueError("literal_remote_url_invalid")
+    if parsed.scheme in {"https", "ssh"} and (not parsed.hostname or not parsed.path.startswith("/")):
+        raise ValueError("literal_remote_url_invalid")
+    return LiteralRemoteUrl(value)
+
+
+def validate_allowed_remote_ref(value: str) -> AllowedRemoteRef:
+    """Validate the `refs/heads/` subset of Git's refname grammar.
+
+    The closed builder does not accept an arbitrary ref namespace. Within the
+    allowed namespace this preserves Git's meaningful grammar, including `+`
+    and Unicode, while rejecting every special/ref-format-invalid component.
+    """
+    prefix = "refs/heads/"
+    if not isinstance(value, str) or not value.startswith(prefix):
+        raise ValueError("remote_ref_not_allowed")
+    suffix = value.removeprefix(prefix)
+    forbidden = set(" ~^:?*[")
+    if (
+        not suffix
+        or value.endswith("/")
+        or value.endswith(".")
+        or "//" in value
+        or ".." in value
+        or "@{" in value
+        or "\\" in value
+        or any(char in forbidden or ord(char) < 32 or ord(char) == 127 for char in value)
+        or any(component.startswith(".") or component.endswith(".lock") for component in value.split("/"))
+    ):
+        raise ValueError("remote_ref_not_allowed")
+    return AllowedRemoteRef(value)
+
+
+def make_control_plane_private_ref() -> ControlPlanePrivateRef:
+    """Allocate a private ref name; callers never select its nonce."""
+    nonce = secrets.token_hex(16)
+    return ControlPlanePrivateRef(f"refs/loop-protocol/control-plane/default-ref/{nonce}")
+
+
+def validate_control_plane_private_ref(value: str) -> ControlPlanePrivateRef:
+    prefix = "refs/loop-protocol/control-plane/default-ref/"
+    nonce = value.removeprefix(prefix) if isinstance(value, str) else ""
+    if not isinstance(value, str) or not value.startswith(prefix) or not _PRIVATE_REF_NONCE_RE.fullmatch(nonce):
+        raise ValueError("private_ref_not_allowed")
+    return ControlPlanePrivateRef(value)
+
+
+def validate_repository_object_format(value: str) -> RepositoryObjectFormat:
+    if value not in _OBJECT_FORMAT_LENGTHS:
+        raise ValueError("repository_object_format_not_allowed")
+    return RepositoryObjectFormat(value)
+
+
+def validate_repository_object_id(value: str, object_format: RepositoryObjectFormat) -> RepositoryObjectId:
+    if not isinstance(object_format, RepositoryObjectFormat):
+        raise TypeError("repository_object_format_required")
+    expected_length = _OBJECT_FORMAT_LENGTHS[object_format.value]
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]+", value) or len(value) != expected_length:
+        raise ValueError("repository_object_id_invalid")
+    return RepositoryObjectId(value)
+
+
+def validate_detached_worktree_path(value: str, project_root: str) -> DetachedWorktreePath:
+    if not isinstance(value, str) or not os.path.isabs(value):
+        raise ValueError("detached_worktree_path_invalid")
+    root = os.path.realpath(project_root)
+    candidate = os.path.realpath(value)
+    required_prefix = os.path.join(root, ".claude", "worktrees")
+    if value != candidate or candidate == required_prefix or not candidate.startswith(required_prefix + os.sep):
+        raise ValueError("detached_worktree_path_not_confined")
+    if Path(value).exists() or Path(value).is_symlink():
+        raise ValueError("detached_worktree_path_not_fresh")
+    return DetachedWorktreePath(candidate)
+
+
+def validate_existing_detached_worktree_path(value: str, project_root: str) -> DetachedWorktreePath:
+    if not isinstance(value, str) or not os.path.isabs(value):
+        raise ValueError("detached_worktree_path_invalid")
+    root = os.path.realpath(project_root)
+    candidate = os.path.realpath(value)
+    required_prefix = os.path.join(root, ".claude", "worktrees")
+    path = Path(value)
+    if value != candidate or candidate == required_prefix or not candidate.startswith(required_prefix + os.sep):
+        raise ValueError("detached_worktree_path_not_confined")
+    if not path.is_dir() or path.is_symlink():
+        raise ValueError("detached_worktree_path_not_existing_directory")
+    return DetachedWorktreePath(candidate)
