@@ -22,6 +22,19 @@ reads the already-pinned merged review result this script produces and
 returns an `ISSUE_REVIEW_RESULT_COMPACT_V1` verdict on stdout. It performs no
 I/O of its own.
 
+Issue #2380: canonical Step 2 routing (`issue-refinement-loop` SKILL.md) does
+NOT invoke the `issue-reviewer` agent, does not relay `compact_result.stdout_lines`
+to it, and does not call `classify_child_stdout()` /
+`retry_once_on_transport_failure()` (both defined below). Canonical Step 2
+consumes `produce`'s own root-verified `compact_result.verdict` /
+`compact_result.next_action` (and `verified_transport_artifact`) directly.
+The `issue-reviewer` agent, `classify-child-stdout` CLI subcommand,
+`classify_child_stdout()`, and `retry_once_on_transport_failure()` remain
+available for legacy CLI / diagnostic / regression-test use (they still
+enforce the exact 11-line V2 wire grammar as a strict compatibility
+boundary -- see `validate_review_compact_output.py`), but they are no
+longer part of the canonical routing path.
+
 CLI subcommands:
 
     produce             Fetch + pin live body, run checkers, and act as the
@@ -39,17 +52,21 @@ CLI subcommands:
                          read-only input (the child relays them verbatim; it
                          never invokes `compact_review_result.py` itself).
     classify-child-stdout
-                         Classify the issue-reviewer child agent's raw stdout
-                         text via the SAME canonical validator
+                         LEGACY / diagnostic-only (Issue #2380: canonical Step
+                         2 routing does not call this subcommand). Classify the
+                         issue-reviewer child agent's raw stdout text via the
+                         SAME canonical validator
                          (`validate_review_compact_output.validate_review_compact_output()`)
-                         the orchestrator's Step 2 routing table uses -- not a
-                         separately reimplemented simplified classifier (PR
-                         #2135 iteration-3 P0-2). 0-byte stdout classifies as
+                         used by this classifier -- not a separately
+                         reimplemented simplified classifier (PR #2135
+                         iteration-3 P0-2). 0-byte stdout classifies as
                          `reviewer_transport_failure` / `empty_input` (Issue
                          #2049 AC4/AC5); non-empty-but-malformed stdout now
                          also classifies as `reviewer_transport_failure` /
                          `malformed_output` instead of being silently accepted
-                         as "ok".
+                         as "ok". Retained for legacy CLI / diagnostic /
+                         regression-test use as the strict 11-line V2 wire
+                         grammar compatibility boundary.
     readback            Verify the persisted `REVIEWER_COMPACT_ARTIFACT_V2`
                          artifact -- i.e. `produce`'s
                          `verified_transport_artifact` /
@@ -515,9 +532,17 @@ def classify_child_stdout(
     repo: str | None = None,
     expected_body_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Classify the child `issue-reviewer` agent's raw stdout text via the
+    """LEGACY / diagnostic-only (Issue #2380): canonical Step 2 routing does
+    NOT call this function -- it consumes `produce`'s own root-verified
+    `compact_result.verdict` / `compact_result.next_action` directly and
+    never invokes the `issue-reviewer` child agent at all. This function
+    remains for legacy CLI (`classify-child-stdout`), diagnostic, and
+    regression-test use as the strict 11-line V2 wire grammar compatibility
+    boundary (AC3).
+
+    Classify the child `issue-reviewer` agent's raw stdout text via the
     SAME canonical validator (`validate_review_compact_output.validate_review_compact_output()`)
-    the orchestrator's Step 2 routing table uses -- NOT a separately
+    this legacy classifier uses -- NOT a separately
     reimplemented simplified classifier (PR #2135 human REQUEST_CHANGES
     iteration-3 P0-2 closes the prior bug: any non-empty stdout, even
     malformed JSON, was unconditionally treated as "ok").
@@ -617,7 +642,16 @@ def retry_once_on_transport_failure(
     total_deadline_seconds: float | None = None,
     per_attempt_deadline_seconds: float | None = None,
 ):
-    """Call `invoke_child()` (returns raw stdout text); if the FIRST call is
+    """LEGACY / diagnostic-only (Issue #2380): canonical Step 2 routing does
+    NOT call this function. The orchestrator-level "retry the child agent
+    invocation once" semantics this function implements applied only to the
+    now-removed issue-reviewer relay path; the deterministic checker
+    transport `reviewer_transport.run_reviewer_transport()` spawns from
+    `produce` already performs its OWN bounded retry (unchanged, AC5) before
+    `produce` ever returns. Retained for legacy CLI / diagnostic /
+    regression-test use.
+
+    Call `invoke_child()` (returns raw stdout text); if the FIRST call is
     classified `reviewer_transport_failure` (empty OR malformed, via the
     canonical validator -- see `classify_child_stdout`), retry
     `invoke_child()` exactly once. If the retry is ALSO
