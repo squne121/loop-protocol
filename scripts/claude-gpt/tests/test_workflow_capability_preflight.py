@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _TESTS_DIR = Path(__file__).resolve().parent
 _SCRIPTS_DIR = _TESTS_DIR.parent
 _REPO_ROOT = _SCRIPTS_DIR.parent.parent
@@ -68,6 +70,12 @@ def _write_fake_uv(bin_dir: Path, version: str) -> Path:
 # --- AC1 ---------------------------------------------------------------
 
 
+# Issue #2401: this is a real-subprocess integration test (spawns
+# `preflight.sh --workflow-profile issue-to-impl`, which in turn shells out
+# to real `gh auth status` / `gh repo view`). It remains optional live
+# coverage, not part of this Issue's hermetic close evidence (deselected by
+# default `addopts = "-m 'not github_live and not claude_live'"`).
+@pytest.mark.github_live
 def test_workflow_capability_returns_structured_result():
     proc = _run_preflight_cli("issue-to-impl")
     assert proc.returncode == 0, proc.stderr
