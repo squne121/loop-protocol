@@ -258,7 +258,7 @@ Allowed Paths 違反、実テスト・CI・PR review failure に基づく。
 - `SUBAGENT_LAUNCH_LEDGER_V1` および対応する native writer chain は Issue #2161（native Codex CLI retirement）で DELETE_CHAIN として撤去した。advisory telemetry の位置づけ（missing/invalid を routing stop にせず、PASS・承認・CI・review・merge readiness の証拠にしない）自体は今後も踏襲する。
 - parallel-safe な起動記録の再設計が必要になった場合は別 Issue で行う。
 
-### Multi-Agent V2 の V1 rollback（historical、Issue #2161 で撤去）
+### Multi-Agent V2 の V1 rollback（historical、Issue #2161 で native Codex CLI 撤去に伴い削除）
 
 Multi-Agent V2 の repository-pinned declaration を V1 に戻す手順は native Codex CLI
 （`.codex/config.toml` の `[features.multi_agent_v2]`）専用の rollback 手順であり、
