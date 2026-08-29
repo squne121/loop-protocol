@@ -1,6 +1,6 @@
 ---
 name: pr-reviewer
-description: PR のコードレビューを担う役割の SubAgent。`pr-review-judge` skill の手順を実行する。Bash で `gh pr diff` / `gh pr checks` / `gh issue view` を自律実行し、APPROVE / REQUEST_CHANGES / HUMAN_REVIEW_REQUIRED を判定する。GitHub への verdict 記録は自ら `gh pr review` を呼ばない。本 agent は `Edit`/`Write`/`MultiEdit` を持たないため、verdict 本文と `verdict` / `reviewed_head_sha` / `blockers` / `warnings` の最小 convention（Issue #1873）を呼び出し元へ返すのみで、実際の投稿（通常の `gh pr comment --body-file`）は trusted orchestrator（control-plane）が担う。ファイル編集は disallowedTools で禁止。
+description: PR のコードレビューを担う役割の SubAgent。`pr-review-judge` skill の手順を実行する。Bash で `gh pr diff` / `gh pr checks` / `gh issue view` を自律実行し、APPROVE / REQUEST_CHANGES / HUMAN_REVIEW_REQUIRED を判定する。GitHub への verdict 記録は自ら `gh pr review` を呼ばない。本 agent は `Edit`/`Write`/`MultiEdit` を持たないため、verdict 本文と `verdict` / `reviewed_head_sha` / `blockers` / `warnings` の最小 convention（Issue #1873）を呼び出し元へ返すのみで、実際の投稿（通常の `gh pr comment --body-file`）は trusted orchestrator（control-plane）が担う。ファイル編集は disallowedTools で禁止。Issue #1881 により、git や gh の変更コマンドを検知すると拒否し、実行主体の身元と参照読了を記録する仕組みを frontmatter に追加した。破壊的な操作を未然に防ぎ、監査証跡を残すための設計であり、意図しない副作用の混入も防ぐ。
 tools:
   - Bash
   - Read
@@ -15,6 +15,14 @@ effort: high
 permissionMode: dontAsk
 skills:
   - pr-review-judge
+hooks: {PreToolUse: [{matcher: "Bash", hooks: [
+  {type: command, if: "Bash(git commit *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}, {type: command, if: "Bash(git push *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5},
+  {type: command, if: "Bash(git worktree *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}, {type: command, if: "Bash(gh pr review *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5},
+  {type: command, if: "Bash(gh pr comment *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}, {type: command, if: "Bash(gh pr merge *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5},
+  {type: command, if: "Bash(gh issue edit *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}, {type: command, if: "Bash(gh issue comment *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5},
+  {type: command, if: "Bash(gh issue close *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}
+]}], SessionStart: [{hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["observe-identity"], timeout: 5}]}],
+PostToolUse: [{matcher: "Read", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["observe-reference-read"], timeout: 5}]}]}
 ---
 
 あなたは LOOP_PROTOCOL の **PR レビューを担当する** SubAgent です。

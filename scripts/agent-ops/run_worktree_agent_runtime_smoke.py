@@ -1047,6 +1047,30 @@ def has_terminal_event(runtime: str, stdout: str) -> bool:
     return False
 
 
+def extract_claude_permission_denials(stdout: str | None) -> list:
+    """Issue #1881 PR #2385 fix_delta (Extension 3): the underlying
+    ``claude`` CLI's own final ``type: "result"`` stream-json event already
+    carries a top-level ``permission_denials`` array -- populated by Claude
+    Code itself whenever a ``PreToolUse`` hook denies a tool call before it
+    runs -- that this runner has never surfaced in its own evidence output.
+    Purely additive: this surfaces Claude Code's own existing structured
+    field verbatim (already redaction-safe -- ``tool_name``/``tool_use_id``/
+    ``tool_input``, the same shape Claude Code itself returns; never a new
+    mechanism). Returns ``[]`` (never ``None``, matching this module's other
+    list-typed evidence fields, e.g. ``spawn_events``) when the final result
+    event carries no such array, or is absent altogether -- never
+    fabricated."""
+    if not stdout:
+        return []
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "result":
+            continue
+        denials = payload.get("permission_denials")
+        if isinstance(denials, list):
+            return denials
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Structured telemetry fields (Issue #1733 Scope Delta, 2026-08-02
 # owner-approved harness extension) — tested_head / runtime_version /
@@ -1451,6 +1475,22 @@ _CLAUDE_HOOK_LIFECYCLE_EVENTS = ("SubagentStart", "SubagentStop")
 AGENT_TYPE_SOURCE_TOOL_RESULT = "tool_use_result"
 AGENT_TYPE_SOURCE_HOOK_PAYLOAD = "hook_payload"
 AGENT_TYPE_SOURCE_HOOK_NAME = "hook_name"
+
+# Issue #1881 PR #2385 fix_delta (Extension 1): provenance label for a
+# ``SessionStart`` hook stdout/output text that carries a plain-text
+# ``agent_type=<value>`` marker (e.g. ``.claude/hooks/pr_reviewer_guard.py``'s
+# opt-in ``observe-identity`` probe channel, which emits
+# ``reviewer-identity-observed agent_type=<value>``) rather than an embedded
+# JSON object. Kept distinct from ``AGENT_TYPE_SOURCE_HOOK_PAYLOAD`` so a
+# consumer can tell the two recognition paths apart if it ever needs to.
+AGENT_TYPE_SOURCE_PLAIN_MARKER = "plain_marker"
+
+# Matches a plain-text ``agent_type=<value>`` marker embedded anywhere in a
+# SessionStart hook's stdout/output text (Issue #1881 Extension 1). Only
+# tried as a FALLBACK after ``_parse_embedded_json_object`` finds no JSON
+# object on that same text -- the pre-existing JSON-object recognition path
+# is untouched and stays byte-identical for any caller relying on it.
+_PLAIN_AGENT_TYPE_MARKER_RE = re.compile(r"agent_type=([a-zA-Z0-9_-]+)")
 
 # ``child_spawn_launch_mode`` values (Issue #2021 AC7).
 SPAWN_LAUNCH_MODE_ASYNC = "async_launched"
@@ -3457,6 +3497,13 @@ _CLAUDE_SESSION_START_HOOK_EVENT = "SessionStart"
 _PERSONA_CANONICAL_SKILL_PATH = {
     "issue-creator": ".claude/skills/create-issue/SKILL.md",
     "issue-editor": ".claude/skills/edit-issue/SKILL.md",
+    # Issue #1881 PR #2385 fix_delta (Extension 2): the sole tracked
+    # reference `pr-reviewer` is expected to Read (allowed-paths-gate
+    # canonical reference). `extract_claude_canonical_read_receipt` below
+    # is genuinely persona-agnostic (it only ever consumes
+    # `expected_rel_path` as a plain argument), so this is a pure allowlist
+    # addition -- no other code path changes.
+    "pr-reviewer": ".claude/skills/pr-review-judge/references/allowed-paths-gate.md",
 }
 
 # Tool names capable of mutating repository/filesystem state or spawning a
@@ -3502,6 +3549,19 @@ def extract_claude_session_start_identity(stdout: str) -> dict:
                 continue
             parsed = _parse_embedded_json_object(text)
             if parsed is None:
+                # Issue #1881 PR #2385 fix_delta (Extension 1): fall back to
+                # a plain-text ``agent_type=<value>`` marker (see
+                # ``.claude/hooks/pr_reviewer_guard.py``'s ``observe-identity``
+                # opt-in probe channel) ONLY when the JSON-object recognition
+                # path above found nothing on this same text. This is a new,
+                # additional recognition path; it never runs when a JSON
+                # object was already found, so every existing JSON-payload
+                # caller's behavior stays byte-identical.
+                if result["agent_type"] is None:
+                    match = _PLAIN_AGENT_TYPE_MARKER_RE.search(text)
+                    if match:
+                        result["agent_type"] = match.group(1)
+                        result["source"] = AGENT_TYPE_SOURCE_PLAIN_MARKER
                 continue
             agent_type = parsed.get("agent_type")
             if isinstance(agent_type, str) and agent_type and result["agent_type"] is None:
@@ -5592,12 +5652,17 @@ def main(argv: list[str] | None = None) -> int:
         "loaded_skills_source": "static_frontmatter" if loaded_skills is not None else None,
         "prompt_sha256": prompt_sha256,
         "agent_definition": agent_definition,
-        # main_agent_identity / skill_evidence / mutation_boundary are
-        # placeholders here (no stdout captured yet); overwritten below with
-        # real evidence once the structured claude invocation completes.
+        # main_agent_identity / skill_evidence / mutation_boundary /
+        # permission_denials are placeholders here (no stdout captured
+        # yet); overwritten below with real evidence once the structured
+        # claude invocation completes.
         "main_agent_identity": build_main_agent_identity(args.claude_agent_name, None),
         "skill_evidence": build_skill_evidence(args.claude_agent_name, worktree, None),
         "mutation_boundary": build_mutation_boundary(hermetic_active, hermetic_settings_digest, None, None),
+        # Issue #1881 PR #2385 fix_delta (Extension 3): purely additive --
+        # never gated behind --hermetic-agent-definition, never touches
+        # mutation_boundary.
+        "permission_denials": extract_claude_permission_denials(None),
         "settings_provenance": build_settings_provenance(worktree, hermetic_active, hermetic_settings_digest),
         # Issue #2046 AC10: #1881 (production settings lane, pr-reviewer
         # persona safe Read/mutation-deny boundary) remains separately OPEN.
@@ -5746,6 +5811,10 @@ def main(argv: list[str] | None = None) -> int:
                 schema_summary["mutation_boundary"] = build_mutation_boundary(
                     hermetic_active, hermetic_settings_digest, claude_invocation_argv_for_evidence, out
                 )
+                # Issue #1881 PR #2385 fix_delta (Extension 3): purely
+                # additive field, independent of mutation_boundary/hermetic
+                # gating above.
+                schema_summary["permission_denials"] = extract_claude_permission_denials(out)
             else:
                 rc, out, err, timed_out = run_structured_codex(
                     worktree, prompt, float(args.timeout_seconds), codex_bin=resolved_runtime_bin

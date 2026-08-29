@@ -58,8 +58,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,6 +78,51 @@ VALID_ROUTES = frozenset(
 )
 
 MAX_BASE_PREFLIGHT_RETRIES = 3
+DEFAULT_BUDGET_SECONDS = 30.0
+WATCHDOG_GRACE_SECONDS = 2.0
+MAX_STDERR_EXCERPT_CHARS = 500
+
+# This local sanitizer deliberately mirrors the relevant behavior of
+# `preflight_agy._redact_output_sample()` without importing a skill-local
+# module across its fixture-copy boundary.
+_KNOWN_CREDENTIAL_ENV_KEYS = (
+    "AGY_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "HF_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
+_OAUTH_URL_RE = re.compile(
+    r"https?://[^\s\"'<>]*(?:accounts\.google\.com|oauth2?|/o/oauth)[^\s\"'<>]*",
+    re.IGNORECASE,
+)
+_OAUTH_QUERY_PARAM_RE = re.compile(
+    r"(?i)\b(code|state|token|access_token|refresh_token|id_token|authuser)=[^&\s\"'<>]+"
+)
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~])")
+
+
+def _sanitize_stderr_excerpt(value: str | bytes | None) -> str:
+    """Return a redacted, display-safe stderr excerpt bounded by characters."""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = value or ""
+    for key in _KNOWN_CREDENTIAL_ENV_KEYS:
+        secret = os.environ.get(key)
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})\b", "<redacted>", text)
+    text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer <redacted>", text)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted>", text)
+    text = _OAUTH_URL_RE.sub("<redacted-oauth-url>", text)
+    text = _OAUTH_QUERY_PARAM_RE.sub(lambda match: f"{match.group(1)}=<redacted>", text)
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    return re.sub(r"\s+", " ", text).strip()[:MAX_STDERR_EXCERPT_CHARS]
 
 _ROUTE_V1_KEYS = (
     "route",
@@ -412,6 +460,7 @@ def capability_preflight_result(
     preflight_script = (
         repo_root / "scripts" / "claude-gpt" / "workflow_capability_preflight.py"
     )
+    deadline_ns = time.monotonic_ns() + int(DEFAULT_BUDGET_SECONDS * 1_000_000_000)
     argv = [
         sys.executable,
         str(preflight_script),
@@ -419,6 +468,8 @@ def capability_preflight_result(
         "issue-to-impl",
         "--repo",
         repo,
+        "--deadline-monotonic-ns",
+        str(deadline_ns),
     ]
     if spark_mode is not None:
         argv.extend(["--spark-mode", spark_mode])
@@ -443,13 +494,25 @@ def capability_preflight_result(
             planned_ops_path = tmp.name
             argv.extend(["--planned-operations-json", planned_ops_path])
 
+        remaining_seconds = max(
+            0.001,
+            (deadline_ns - time.monotonic_ns()) / 1_000_000_000,
+        )
+        parent_timeout = remaining_seconds + WATCHDOG_GRACE_SECONDS
         try:
             proc = subprocess.run(
                 argv,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=parent_timeout,
             )
+        except subprocess.TimeoutExpired:
+            return {
+                "decision": "blocked",
+                "checks": {},
+                "actor_capabilities": {},
+                "reasons": ["producer_watchdog_timeout"],
+            }
         except Exception as exc:  # noqa: BLE001 -- fail-closed transport boundary
             return {
                 "decision": "blocked",
@@ -458,11 +521,14 @@ def capability_preflight_result(
                 "reasons": [f"producer_invocation_failed:{exc.__class__.__name__}"],
             }
         if proc.returncode != 0:
+            stderr_excerpt = _sanitize_stderr_excerpt(getattr(proc, "stderr", None))
             return {
                 "decision": "blocked",
                 "checks": {},
                 "actor_capabilities": {},
-                "reasons": [f"producer_invocation_failed:exit_{proc.returncode}"],
+                "reasons": [
+                    f"producer_invocation_failed:exit_{proc.returncode}:{stderr_excerpt}"
+                ],
             }
         try:
             result = json.loads(proc.stdout)

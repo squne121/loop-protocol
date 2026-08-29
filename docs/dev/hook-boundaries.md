@@ -776,3 +776,62 @@ OWNER の敵対的レビュー（PR #1634 iteration 2）により、初回実装
 ## 12. publish lane authorization trust root（歴史的経緯・historical note）
 
 Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。
+
+## 13. pr_reviewer_guard.py — agent-scoped hook（エージェント限定 hook、Issue #1881）
+
+`pr_reviewer_guard.py` は project-level `.claude/settings.json` の
+`hook_boundaries_manifest_v1`（本ドキュメント第2節）には **登録されない**。
+`.claude/agents/pr-reviewer.md` の frontmatter `hooks.PreToolUse` にのみ
+配線される agent-scoped hook であり、`agent_type == pr-reviewer` のセッション
+でのみ有効化される。第2節の `TestSettingsManifestAlignment` drift 検査の対象外
+（settings.json の project PreToolUse を走査しないため）。
+
+- **配線元**: `.claude/agents/pr-reviewer.md` frontmatter（正本は同ファイル）。
+  `PreToolUse` は単一の `matcher: "Bash"` group の下に、canonical mutation
+  command family（9 種）ごとの hook handler オブジェクトを配置し、`if` は
+  各 handler 自身が個別に保持する（公式 Claude Code hooks schema に
+  `if` は matcher-group 直下ではなく個々の handler に置く、と明記されて
+  いることの反映。PR #2385 review P0）
+- **command 分類**: 一次フィルタは Claude Code の native permission-rule
+  構文（`if: "Bash(git commit *)"` 等）に委ねるが、公式ドキュメントの
+  とおり `if` は曖昧な Bash 入力（`$()` やバッククォート等）に対して
+  保守的に発火する（＝ hook を実行してしまう）ため単独では信頼できない
+  best-effort フィルタである。`pr_reviewer_guard.py` の `deny` サブ
+  コマンドは、この一次フィルタを通過した後に実際の `tool_input.command`
+  を anchored regex（`_command_is_canonical_mutation`）で再確認し、
+  一致しない場合（曖昧なコマンド・`tool_input.command` 欠落・
+  `git worktree list` のような読み取り専用サブコマンドを含む）は
+  fail-open（exit 0、許可）する（PR #2385 review P1-1）。この regex は
+  汎用 shell parser ではなく、引用符・パイプ・リダイレクト・サブ
+  シェルを解釈しない固定コマンドファミリの anchored allowlist に限定
+  される
+- **git worktree のスコープ**: guard 側の anchored regex は
+  `add`／`remove`／`move`／`prune`／`repair`／`lock`／`unlock`
+  サブコマンドのみを deny 対象とし、`git worktree list`
+  （読み取り専用の identity-check 操作）は deny しない（PR #2385
+  review P1-2）
+- **fail policy**: `deny` サブコマンドは `hook_event_name == PreToolUse`
+  かつ `agent_type == pr-reviewer` かつ実コマンドが上記 anchored regex
+  に一致する場合のみ stderr に固定理由を出して exit 2（blocker）。
+  それ以外は無出力で exit 0（fail-open）
+- **観測系**: `observe-identity` / `observe-reference-read` は
+  `LOOP_PR_REVIEWER_RUNTIME_PROBE=1` のときのみ sanitized marker
+  （`agent_type` のみ）を出力し、通常のレビュー session では無出力。
+  `observe-reference-read` は `agent_type` が厳密に `pr-reviewer` と
+  一致し、かつ解決済みファイルパスが正規参照パスと完全一致する場合
+  にのみマーカーを出す（接尾一致では出さない。PR #2385 review P1-3）
+- **対象外**: global `secret_boundary_guard.sh` への `agent_type` 追加は行わない
+  （Out of Scope、Issue #1881）
+- **production frontmatter への SessionStart/PostToolUse(Read) 観測 hook
+  の常設**: PR #2385 review P2 は、これらの観測系 hook を runtime probe
+  専用の session-local `--settings` override へ切り出し、production の
+  `pr-reviewer.md` frontmatter からは撤去することを提案したが、
+  `scripts/agent-ops/run_worktree_agent_runtime_smoke.py`
+  （本 Issue の Allowed Paths 外、かつ変更自体が Issue #1881 の
+  Stop Conditions に該当する既存 runner）が任意の `--settings` override
+  ファイルを受け取る汎用フラグを公開していない（`--hermetic-agent-definition`
+  は tool surface を制限する別レーンであり、本番の mutation guard を
+  証明する目的には使えないため Issue #1881 が明示的に対象外としている）
+  ため、本 fix_delta では見送り、production frontmatter の観測 hook は
+  現状維持とする（best-effort item、hard blocker ではない）。
+
