@@ -13,16 +13,29 @@ PR #2385 review fix_delta:
   deny-scoped worktree subcommand family but does not mutate real state
   (`--dry-run`), and is deliberately not `git worktree list` (read-only,
   never denied post-P1-2).
-- P1-3: `classify_positive_case()` requires the runner's own structured
-  `expected_markers_missing == []` evidence field, not a marker-substring
-  search against captured stdout.
 
-Issue #1881 contract refinement (this iteration): workspace-trust
-registration/revocation (`register_worktree_trust` / `revoke_worktree_trust`)
-was removed entirely and replaced with a read-only prerequisite check
-(`is_worktree_trusted`). This script must never write to `~/.claude.json`
-(or any fixture standing in for it), regardless of trust state. All tests
-below use temp fixture files -- never the real ambient `~/.claude.json`.
+PR #2385 fix_delta (this iteration -- contract refinement, body_sha256
+sha256:105def95ae4294b2cbdbb24dd0a75128d5443ec5b22ef858b469dd70acb1b3c8):
+- The workspace-trust prerequisite (`is_worktree_trusted`,
+  `_claude_json_path`, and the `~/.claude.json`-reading branch of
+  `preflight_capability`) has been removed entirely -- this script never
+  reads or writes `~/.claude.json` (or any fixture standing in for it) in
+  any code path anymore.
+- `gh auth status` is no longer part of `preflight_capability` either --
+  the only remaining genuine capability prerequisite is the `claude`
+  binary itself.
+- `translate_agent_definition_to_agents_json` now passes through the FULL
+  officially-documented `--agents` JSON field set (including `skills` and
+  `effort`, which a prior iteration silently dropped), still excluding
+  only `name` (the JSON object's own key) and `description`/`prompt`
+  (handled as their own explicit top-level fields).
+- `classify_positive_case` / `classify_deny_case` no longer depend on
+  `--expect-marker`/`expected_markers_missing` (which required the
+  now-removed, structurally-unsatisfiable-for-a-main-session-persona
+  SubagentStart/SubagentStop causal-evidence gate). They now read
+  `main_agent_identity` / `skill_evidence.canonical_read` /
+  `mutation_boundary` directly, honestly returning `'inconclusive'`
+  whenever a field they depend on reports `status: "unavailable"`.
 """
 
 from __future__ import annotations
@@ -90,6 +103,29 @@ description: Minimal synthetic agent with no optional fields.
 Minimal body.
 """
 
+# Exercises the remaining officially-documented fields not covered by
+# _SYNTHETIC_AGENT_MD above (maxTurns, mcpServers, memory, background,
+# isolation, color, initialPrompt, experimental) -- Issue #1881 PR #2385
+# fix_delta: a prior iteration silently dropped every field below.
+_SYNTHETIC_AGENT_MD_EXTENDED_FIELDS = """---
+name: extended-agent
+description: A synthetic agent exercising the remaining official fields.
+maxTurns: 12
+mcpServers:
+  some-server:
+    command: some-command
+memory: project
+background: true
+isolation: worktree
+color: blue
+initialPrompt: Say hello.
+experimental:
+  someFlag: true
+---
+
+Extended body.
+"""
+
 
 class TestTranslateAgentDefinitionToAgentsJson:
     def test_expected_json_shape_and_passthrough_fields(self, tmp_path: Path) -> None:
@@ -108,6 +144,19 @@ class TestTranslateAgentDefinitionToAgentsJson:
         assert payload["disallowedTools"] == ["Edit"]
         assert payload["model"] == "sonnet"
         assert payload["permissionMode"] == "dontAsk"
+
+    def test_skills_and_effort_passed_through(self, tmp_path: Path) -> None:
+        """PR #2385 fix_delta: `skills`/`effort` were silently dropped by a
+        prior iteration's hardcoded 5-field passthrough list, even though
+        the candidate `.claude/agents/pr-reviewer.md` uses both."""
+        agent_md = tmp_path / "synthetic-agent.md"
+        agent_md.write_text(_SYNTHETIC_AGENT_MD, encoding="utf-8")
+
+        result = verifier.translate_agent_definition_to_agents_json(agent_md, "synthetic-agent")
+        payload = result["synthetic-agent"]
+
+        assert payload["skills"] == ["some-skill"]
+        assert payload["effort"] == "high"
 
     def test_hooks_passed_through_verbatim(self, tmp_path: Path) -> None:
         agent_md = tmp_path / "synthetic-agent.md"
@@ -133,6 +182,22 @@ class TestTranslateAgentDefinitionToAgentsJson:
             ]
         }
 
+    def test_extended_official_fields_passed_through_verbatim(self, tmp_path: Path) -> None:
+        agent_md = tmp_path / "extended-agent.md"
+        agent_md.write_text(_SYNTHETIC_AGENT_MD_EXTENDED_FIELDS, encoding="utf-8")
+
+        result = verifier.translate_agent_definition_to_agents_json(agent_md, "extended-agent")
+        payload = result["extended-agent"]
+
+        assert payload["maxTurns"] == 12
+        assert payload["mcpServers"] == {"some-server": {"command": "some-command"}}
+        assert payload["memory"] == "project"
+        assert payload["background"] is True
+        assert payload["isolation"] == "worktree"
+        assert payload["color"] == "blue"
+        assert payload["initialPrompt"] == "Say hello."
+        assert payload["experimental"] == {"someFlag": True}
+
     def test_absent_fields_are_excluded_not_null(self, tmp_path: Path) -> None:
         agent_md = tmp_path / "minimal-agent.md"
         agent_md.write_text(_SYNTHETIC_AGENT_MD_MINIMAL, encoding="utf-8")
@@ -144,16 +209,21 @@ class TestTranslateAgentDefinitionToAgentsJson:
             "description": "Minimal synthetic agent with no optional fields.",
             "prompt": "Minimal body.",
         }
-        for absent_field in ("tools", "disallowedTools", "model", "permissionMode", "hooks"):
+        for absent_field in verifier._AGENTS_JSON_PASSTHROUGH_FRONTMATTER_FIELDS:
             assert absent_field not in payload
 
-    def test_no_invented_fields_like_name_or_skills(self, tmp_path: Path) -> None:
+    def test_name_field_excluded_but_skills_and_effort_included(self, tmp_path: Path) -> None:
+        """PR #2385 fix_delta: `name` must never appear in the payload (it
+        becomes the JSON object's own key), while `skills`/`effort` --
+        previously invented-as-excluded by a prior iteration's incorrect
+        comment -- ARE officially-supported fields and must be included."""
         agent_md = tmp_path / "synthetic-agent.md"
         agent_md.write_text(_SYNTHETIC_AGENT_MD, encoding="utf-8")
 
         result = verifier.translate_agent_definition_to_agents_json(agent_md, "synthetic-agent")
         payload = result["synthetic-agent"]
 
+        assert "name" not in payload
         assert set(payload.keys()) == {
             "description",
             "prompt",
@@ -162,6 +232,8 @@ class TestTranslateAgentDefinitionToAgentsJson:
             "model",
             "permissionMode",
             "hooks",
+            "skills",
+            "effort",
         }
 
     def test_missing_frontmatter_delimiters_raises_value_error(self, tmp_path: Path) -> None:
@@ -220,38 +292,105 @@ class TestGitWorktreeCanaryCommand:
         assert "--dry-run" in verifier.CASE_COMMANDS["git_worktree"]
 
 
-# ─── PR #2385 review fix_delta P1-3: classify_positive_case structured match ──
+# ─── PR #2385 fix_delta: classify_positive_case evidence-field validation ──
 
 
-class TestClassifyPositiveCaseStructuredMatch:
+class TestClassifyPositiveCase:
+    def _base_evidence(self, **overrides: Any) -> dict[str, Any]:
+        evidence: dict[str, Any] = {
+            "main_agent_identity": {
+                "requested": {"agent_name": "pr-reviewer", "source": "runner_argv"},
+                "observed": {"agent_type": "pr-reviewer", "source": "hook_payload", "status": "observed"},
+                "matched": True,
+                "status": "observed",
+            },
+            "skill_evidence": {
+                "canonical_read": {
+                    "expected_repo_relative_path": verifier.CANONICAL_REFERENCE_RELATIVE_PATH,
+                    "observed_repo_relative_path": verifier.CANONICAL_REFERENCE_RELATIVE_PATH,
+                    "tool_name": "Read",
+                    "read_result_status": "success",
+                    "status": "observed",
+                }
+            },
+        }
+        evidence.update(overrides)
+        return evidence
+
     def _base_result(self, **overrides: Any) -> dict[str, Any]:
         result: dict[str, Any] = {
             "process_error": None,
             "exit_code": verifier.EXIT_OK,
             "marker_observed": True,
-            "evidence": {"expected_markers_missing": []},
+            "evidence": self._base_evidence(),
         }
         result.update(overrides)
         return result
 
-    def test_pass_requires_empty_expected_markers_missing(self) -> None:
+    def test_pass_requires_matched_identity_and_observed_canonical_read(self) -> None:
         result = self._base_result()
         assert verifier.classify_positive_case(result) == "pass"
 
-    def test_marker_observed_true_alone_is_not_sufficient(self) -> None:
-        """P1-3: a truthy `marker_observed` (stdout substring match) without
-        the runner's own structured `expected_markers_missing == []`
-        evidence must NOT be classified as pass."""
-        result = self._base_result(evidence={"expected_markers_missing": ["reviewer-reference-read-ok"]})
-        assert verifier.classify_positive_case(result) != "pass"
-
-    def test_missing_evidence_field_is_inconclusive_not_pass(self) -> None:
-        result = self._base_result(evidence={})
+    def test_unavailable_canonical_read_is_inconclusive_not_pass(self) -> None:
+        """PR #2385 fix_delta: this is the honest, confirmed real-world
+        shape for a `pr-reviewer` invocation today -- `pr-reviewer` is not
+        in the runner's own `_PERSONA_CANONICAL_SKILL_PATH` allowlist, so
+        `canonical_read.status` is always "unavailable" regardless of what
+        actually happened at runtime. Must never be silently promoted to
+        pass or fail."""
+        result = self._base_result(
+            evidence=self._base_evidence(
+                skill_evidence={"canonical_read": {"status": "unavailable"}}
+            )
+        )
         assert verifier.classify_positive_case(result) == "inconclusive"
 
-    def test_non_list_expected_markers_missing_is_inconclusive_not_pass(self) -> None:
-        result = self._base_result(evidence={"expected_markers_missing": None})
+    def test_unavailable_identity_is_inconclusive_not_pass(self) -> None:
+        result = self._base_result(
+            evidence=self._base_evidence(main_agent_identity={"status": "unavailable"})
+        )
         assert verifier.classify_positive_case(result) == "inconclusive"
+
+    def test_wrong_observed_path_is_fail(self) -> None:
+        result = self._base_result(
+            evidence=self._base_evidence(
+                skill_evidence={
+                    "canonical_read": {
+                        "observed_repo_relative_path": "some/other/path.md",
+                        "read_result_status": "success",
+                        "status": "observed",
+                    }
+                }
+            )
+        )
+        assert verifier.classify_positive_case(result) == "fail"
+
+    def test_error_read_result_is_fail(self) -> None:
+        result = self._base_result(
+            evidence=self._base_evidence(
+                skill_evidence={
+                    "canonical_read": {
+                        "observed_repo_relative_path": verifier.CANONICAL_REFERENCE_RELATIVE_PATH,
+                        "read_result_status": "error",
+                        "status": "observed",
+                    }
+                }
+            )
+        )
+        assert verifier.classify_positive_case(result) == "fail"
+
+    def test_mismatched_identity_is_fail(self) -> None:
+        result = self._base_result(
+            evidence=self._base_evidence(
+                main_agent_identity={
+                    "requested": {"agent_name": "pr-reviewer", "source": "runner_argv"},
+                    "observed": {"agent_type": "general-purpose", "source": "hook_payload", "status": "observed"},
+                    "matched": False,
+                    "status": "observed",
+                }
+            )
+        )
+        assert verifier.classify_positive_case(result) == "fail"
 
     def test_exit_fail_is_fail_regardless_of_evidence(self) -> None:
         result = self._base_result(exit_code=verifier.EXIT_FAIL)
@@ -260,6 +399,89 @@ class TestClassifyPositiveCaseStructuredMatch:
     def test_exit_skip_is_inconclusive(self) -> None:
         result = self._base_result(exit_code=verifier.EXIT_SKIP)
         assert verifier.classify_positive_case(result) == "inconclusive"
+
+    def test_process_error_is_inconclusive(self) -> None:
+        result = self._base_result(process_error="boom")
+        assert verifier.classify_positive_case(result) == "inconclusive"
+
+
+# ─── PR #2385 fix_delta: classify_deny_case evidence-field validation ──────
+
+
+class TestClassifyDenyCase:
+    def _base_evidence(self, **overrides: Any) -> dict[str, Any]:
+        evidence: dict[str, Any] = {
+            "main_agent_identity": {
+                "requested": {"agent_name": "pr-reviewer", "source": "runner_argv"},
+                "observed": {"agent_type": "pr-reviewer", "source": "hook_payload", "status": "observed"},
+                "matched": True,
+                "status": "observed",
+            },
+            "mutation_boundary": {
+                "mutation_capable_tool_events": [{"tool": "Bash"}],
+                "mutation_capable_tool_event_count": 1,
+                "status": "observed",
+            },
+        }
+        evidence.update(overrides)
+        return evidence
+
+    def _base_result(self, **overrides: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "process_error": None,
+            "exit_code": verifier.EXIT_OK,
+            "marker_observed": True,
+            "evidence": self._base_evidence(),
+        }
+        result.update(overrides)
+        return result
+
+    def test_confirmed_deny_requires_bash_attempt_and_clean_exit(self) -> None:
+        result = self._base_result()
+        assert verifier.classify_deny_case(result) == "confirmed_deny"
+
+    def test_confirmed_breach_requires_bash_attempt_and_exit_fail(self) -> None:
+        result = self._base_result(exit_code=verifier.EXIT_FAIL)
+        assert verifier.classify_deny_case(result) == "confirmed_breach"
+
+    def test_unavailable_mutation_boundary_is_inconclusive(self) -> None:
+        """PR #2385 fix_delta: this is the honest, confirmed real-world
+        shape today -- `mutation_boundary` is unconditionally "unavailable"
+        for any non-hermetic (production settings) lane run, which Issue
+        #1881 requires. Must never be promoted to confirmed_deny."""
+        result = self._base_result(
+            evidence=self._base_evidence(mutation_boundary={"status": "unavailable"})
+        )
+        assert verifier.classify_deny_case(result) == "inconclusive"
+
+    def test_no_bash_event_observed_is_inconclusive(self) -> None:
+        result = self._base_result(
+            evidence=self._base_evidence(
+                mutation_boundary={"mutation_capable_tool_events": [], "status": "observed"}
+            )
+        )
+        assert verifier.classify_deny_case(result) == "inconclusive"
+
+    def test_unmatched_identity_is_inconclusive(self) -> None:
+        result = self._base_result(
+            evidence=self._base_evidence(
+                main_agent_identity={
+                    "requested": {"agent_name": "pr-reviewer", "source": "runner_argv"},
+                    "observed": {"agent_type": "general-purpose", "source": "hook_payload", "status": "observed"},
+                    "matched": False,
+                    "status": "observed",
+                }
+            )
+        )
+        assert verifier.classify_deny_case(result) == "inconclusive"
+
+    def test_exit_skip_is_inconclusive(self) -> None:
+        result = self._base_result(exit_code=verifier.EXIT_SKIP)
+        assert verifier.classify_deny_case(result) == "inconclusive"
+
+    def test_process_error_is_inconclusive(self) -> None:
+        result = self._base_result(process_error="boom")
+        assert verifier.classify_deny_case(result) == "inconclusive"
 
 
 # ─── AC6: no_authority_artifacts_or_sensitive_output ────────────────────────
@@ -273,7 +495,7 @@ class TestNoAuthorityArtifactsOrSensitiveOutput:
             ac="AC4",
             result="SKIP",
             exit_code=77,
-            reason="worktree_trust_prerequisite_missing",
+            reason="canonical_read_unavailable",
             input_summary="case=positive_reference_read",
             output_summary="{}",
         )
@@ -312,7 +534,7 @@ class TestNoAuthorityArtifactsOrSensitiveOutput:
         monkeypatch.setattr(
             verifier,
             "preflight_capability",
-            lambda *a, **kw: (False, "worktree_trust_prerequisite_missing", {"worktree_trusted": False}),
+            lambda *a, **kw: (False, "claude_binary_not_found", {}),
         )
         worktree = tmp_path / "worktree"
         worktree.mkdir()
@@ -343,220 +565,130 @@ class TestNoAuthorityArtifactsOrSensitiveOutput:
         assert "Result: SKIP" in artifact_files[0].read_text(encoding="utf-8")
 
 
-# ─── register/revoke removal (this iteration's fix_delta) ──────────────────
+# ─── Workspace-trust prerequisite: fully removed (this iteration) ─────────
 
 
-class TestTrustMutationLogicFullyRemoved:
+class TestWorkspaceTrustPrerequisiteFullyRemoved:
     def test_register_worktree_trust_no_longer_exists(self) -> None:
         assert not hasattr(verifier, "register_worktree_trust")
 
     def test_revoke_worktree_trust_no_longer_exists(self) -> None:
         assert not hasattr(verifier, "revoke_worktree_trust")
 
+    def test_is_worktree_trusted_no_longer_exists(self) -> None:
+        assert not hasattr(verifier, "is_worktree_trusted")
 
-# ─── is_worktree_trusted(): read-only prerequisite check ───────────────────
+    def test_claude_json_path_helper_no_longer_exists(self) -> None:
+        assert not hasattr(verifier, "_claude_json_path")
 
-
-class TestIsWorktreeTrusted:
-    def test_trusted_exact_match_returns_true(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "claude.json"
-        worktree_abs = "/some/worktree/path"
-        _write_fixture(
-            claude_json,
-            {"projects": {worktree_abs: {"hasTrustDialogAccepted": True}}},
-        )
-        assert verifier.is_worktree_trusted(claude_json, worktree_abs) is True
-
-    def test_untrusted_flag_false_returns_false(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "claude.json"
-        worktree_abs = "/some/worktree/path"
-        _write_fixture(
-            claude_json,
-            {"projects": {worktree_abs: {"hasTrustDialogAccepted": False}}},
-        )
-        assert verifier.is_worktree_trusted(claude_json, worktree_abs) is False
-
-    def test_missing_entry_returns_false(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "claude.json"
-        _write_fixture(claude_json, {"projects": {}})
-        assert verifier.is_worktree_trusted(claude_json, "/some/worktree/path") is False
-
-    def test_missing_projects_key_fails_closed(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "claude.json"
-        _write_fixture(claude_json, {})
-        assert verifier.is_worktree_trusted(claude_json, "/some/worktree/path") is False
-
-    def test_non_bool_trust_flag_fails_closed(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "claude.json"
-        worktree_abs = "/some/worktree/path"
-        for bogus_value in ("true", 1, ["yes"], None):
-            _write_fixture(
-                claude_json,
-                {"projects": {worktree_abs: {"hasTrustDialogAccepted": bogus_value}}},
-            )
-            assert verifier.is_worktree_trusted(claude_json, worktree_abs) is False, bogus_value
-
-    def test_non_dict_project_entry_fails_closed(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "claude.json"
-        worktree_abs = "/some/worktree/path"
-        _write_fixture(claude_json, {"projects": {worktree_abs: "not-a-dict"}})
-        assert verifier.is_worktree_trusted(claude_json, worktree_abs) is False
-
-    def test_malformed_json_fails_closed_not_crash(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "claude.json"
-        claude_json.write_text("{not valid json", encoding="utf-8")
-        assert verifier.is_worktree_trusted(claude_json, "/some/worktree/path") is False
-
-    def test_missing_file_fails_closed_not_crash(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "does-not-exist.json"
-        assert verifier.is_worktree_trusted(claude_json, "/some/worktree/path") is False
-
-    def test_unrelated_project_entry_is_not_authority(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "claude.json"
-        our_worktree = "/some/worktree/path"
-        other_worktree = "/some/other/worktree/path"
-        _write_fixture(
-            claude_json,
-            {
-                "projects": {
-                    other_worktree: {"hasTrustDialogAccepted": True},
-                }
-            },
-        )
-        assert verifier.is_worktree_trusted(claude_json, our_worktree) is False
-
-    def test_never_writes_fixture_file(self, tmp_path: Path) -> None:
-        claude_json = tmp_path / "claude.json"
-        worktree_abs = "/some/worktree/path"
-        _write_fixture(
-            claude_json,
-            {"projects": {worktree_abs: {"hasTrustDialogAccepted": True}}},
-        )
-        before_mtime = claude_json.stat().st_mtime_ns
-        before_content = claude_json.read_bytes()
-
-        for _ in range(3):
-            verifier.is_worktree_trusted(claude_json, worktree_abs)
-
-        assert claude_json.stat().st_mtime_ns == before_mtime
-        assert claude_json.read_bytes() == before_content
+    def test_module_source_never_opens_claude_json(self) -> None:
+        """The module docstring discusses the removed `~/.claude.json`
+        prerequisite for historical/rationale purposes (prose only). What
+        must genuinely be absent is any CODE construct that would open,
+        read, or write it -- i.e. no `Path.home()` call, no
+        `".claude.json"` *string literal* (as opposed to the prose
+        occurrences inside the docstring, which use double-backtick
+        Markdown code-span syntax, never a Python string literal)."""
+        source = verifier.__file__ and Path(verifier.__file__).read_text(encoding="utf-8")
+        assert source is not None
+        assert "Path.home()" not in source
+        assert '"claude.json"' not in source and "'claude.json'" not in source
+        assert '".claude.json"' not in source and "'.claude.json'" not in source
 
 
-# ─── preflight_capability(): trust becomes the gate, not process count ─────
+# ─── preflight_capability(): claude binary only, no trust/gh-auth gate ─────
 
 
 class TestPreflightCapability:
-    def _stub_claude_and_gh_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_claude_binary_present_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
 
-        class _FakeCompleted:
-            returncode = 0
-
-        monkeypatch.setattr(verifier.subprocess, "run", lambda *a, **kw: _FakeCompleted())
-
-    def test_trusted_worktree_with_concurrent_claude_processes_still_passes(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._stub_claude_and_gh_ok(monkeypatch)
-        # Simulate concurrent `claude` processes: this must NOT gate SKIP
-        # anymore now that no write to ~/.claude.json ever happens.
-        monkeypatch.setattr(verifier, "other_live_claude_processes", lambda *a, **kw: [111, 222, 333])
-
-        claude_json = tmp_path / "claude.json"
-        worktree_abs = "/some/worktree/path"
-        _write_fixture(
-            claude_json,
-            {"projects": {worktree_abs: {"hasTrustDialogAccepted": True}}},
-        )
-
-        available, reason, detail = verifier.preflight_capability(
-            worktree_abs, claude_json_path=claude_json
-        )
+        available, reason, detail = verifier.preflight_capability("/some/worktree/path")
         assert available is True
         assert reason == ""
-        assert detail["worktree_trusted"] is True
+        assert detail == {}
 
-    def test_untrusted_worktree_returns_worktree_trust_prerequisite_missing(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._stub_claude_and_gh_ok(monkeypatch)
-        claude_json = tmp_path / "claude.json"
-        _write_fixture(claude_json, {"projects": {}})
-
-        available, reason, detail = verifier.preflight_capability(
-            "/some/worktree/path", claude_json_path=claude_json
-        )
-        assert available is False
-        assert reason == "worktree_trust_prerequisite_missing"
-        assert detail["worktree_trusted"] is False
-
-    def test_malformed_trust_state_returns_prerequisite_missing_not_crash(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._stub_claude_and_gh_ok(monkeypatch)
-        claude_json = tmp_path / "claude.json"
-        claude_json.write_text("{not valid json", encoding="utf-8")
-
-        available, reason, detail = verifier.preflight_capability(
-            "/some/worktree/path", claude_json_path=claude_json
-        )
-        assert available is False
-        assert reason == "worktree_trust_prerequisite_missing"
-
-    def test_missing_claude_binary_short_circuits_before_trust_check(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_missing_claude_binary_returns_claude_binary_not_found(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(verifier.shutil, "which", lambda _name: None)
-        claude_json = tmp_path / "claude.json"
-        _write_fixture(claude_json, {"projects": {}})
 
-        available, reason, _detail = verifier.preflight_capability(
-            "/some/worktree/path", claude_json_path=claude_json
-        )
+        available, reason, _detail = verifier.preflight_capability("/some/worktree/path")
         assert available is False
         assert reason == "claude_binary_not_found"
 
+    def test_never_calls_gh_auth_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """PR #2385 fix_delta: `gh auth status` is no longer part of the
+        capability preflight at all -- calling `subprocess.run` here would
+        indicate a regression back to requiring live GitHub credentials."""
+        monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
 
-# ─── Full main() round-trip: never writes ~/.claude.json fixture ───────────
+        def _fail_if_called(*_a: Any, **_kw: Any) -> Any:
+            raise AssertionError("subprocess.run must not be called by preflight_capability")
+
+        monkeypatch.setattr(verifier.subprocess, "run", _fail_if_called)
+
+        available, reason, _detail = verifier.preflight_capability("/some/worktree/path")
+        assert available is True
+        assert reason == ""
+
+    def test_never_touches_claude_json(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
+        original_read_text = Path.read_text
+        read_targets: list[Path] = []
+
+        def _tracking_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            read_targets.append(self)
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _tracking_read_text)
+
+        verifier.preflight_capability(str(tmp_path))
+
+        assert not any(p.name == ".claude.json" for p in read_targets)
 
 
-class TestMainNeverWritesClaudeJsonFixture:
-    def _run_main_with_trusted_fixture(
+# ─── Full main() round-trip: PASS/SKIP without any ~/.claude.json access ───
+
+
+class TestMainRoundTripNeverTouchesClaudeJson:
+    def _run_main(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         *,
-        trusted: bool,
+        canary_verdict: str,
         extra_args: list[str] | None = None,
-    ) -> tuple[int, Path]:
+    ) -> int:
         worktree = tmp_path / "worktree"
         worktree.mkdir()
-        claude_json = tmp_path / "claude.json"
-        if trusted:
-            _write_fixture(
-                claude_json,
-                {"projects": {str(worktree): {"hasTrustDialogAccepted": True}}},
-            )
-        else:
-            _write_fixture(claude_json, {"projects": {}})
 
-        monkeypatch.setattr(verifier, "_claude_json_path", lambda: claude_json)
         monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
 
-        class _FakeCompleted:
-            returncode = 0
+        canary_evidence = {
+            "main_agent_identity": {
+                "observed": {"agent_type": "pr-reviewer"},
+                "matched": True,
+                "status": "observed",
+            },
+            "mutation_boundary": {
+                "mutation_capable_tool_events": [{"tool": "Bash"}],
+                "status": "observed",
+            },
+        }
+        if canary_verdict == "inconclusive":
+            canary_evidence = {}
 
-        monkeypatch.setattr(verifier.subprocess, "run", lambda *a, **kw: _FakeCompleted())
-
-        # Avoid spawning the real smoke runner: simulate a confirmed-deny
-        # canary result directly.
         def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
+            exit_code_for_canary = (
+                verifier.EXIT_FAIL if canary_verdict == "confirmed_breach" else verifier.EXIT_OK
+            )
             return {
                 "case": kwargs["case_name"],
-                "exit_code": verifier.EXIT_OK,
+                "exit_code": exit_code_for_canary,
                 "process_error": None,
                 "marker_observed": True,
-                "evidence": {"expected_markers_missing": []},
+                "evidence": canary_evidence,
             }
 
         monkeypatch.setattr(verifier, "run_runtime_case", _fake_run_runtime_case)
@@ -577,84 +709,33 @@ class TestMainNeverWritesClaudeJsonFixture:
         ]
         if extra_args:
             args.extend(extra_args)
+        return verifier.main(args)
 
-        before_mtime = claude_json.stat().st_mtime_ns
-        before_content = claude_json.read_bytes()
-        exit_code = verifier.main(args)
-        assert claude_json.stat().st_mtime_ns == before_mtime
-        assert claude_json.read_bytes() == before_content
-        return exit_code, claude_json
-
-    def test_trusted_path_proceeds_and_never_writes(
+    def test_confirmed_deny_canary_then_inconclusive_positive_case_skips(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        exit_code, _claude_json = self._run_main_with_trusted_fixture(
-            tmp_path, monkeypatch, trusted=True
-        )
-        assert exit_code == verifier.EXIT_OK
-
-    def test_untrusted_path_skips_and_never_writes(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        exit_code, _claude_json = self._run_main_with_trusted_fixture(
-            tmp_path, monkeypatch, trusted=False
-        )
+        # Canary confirmed-deny proceeds; the positive case's own evidence
+        # (also faked to the honest "unavailable" canonical_read shape via
+        # the same _fake_run_runtime_case) yields SKIP, not a fabricated
+        # PASS -- see TestClassifyPositiveCase.test_unavailable_canonical_read_is_inconclusive_not_pass.
+        exit_code = self._run_main(tmp_path, monkeypatch, canary_verdict="confirmed_deny")
         assert exit_code == verifier.EXIT_SKIP
 
-    def test_revoke_flag_causes_no_mutation_attempt_and_no_error(
+    def test_confirmed_breach_canary_fails_immediately(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        exit_code, _claude_json = self._run_main_with_trusted_fixture(
-            tmp_path,
-            monkeypatch,
-            trusted=True,
-            extra_args=["--revoke-worktree-trust-after"],
-        )
-        assert exit_code == verifier.EXIT_OK
+        exit_code = self._run_main(tmp_path, monkeypatch, canary_verdict="confirmed_breach")
+        assert exit_code == verifier.EXIT_FAIL
 
-    def test_revoke_flag_with_untrusted_worktree_still_skips_cleanly(
+    def test_inconclusive_canary_skips_immediately(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        exit_code, _claude_json = self._run_main_with_trusted_fixture(
-            tmp_path,
-            monkeypatch,
-            trusted=False,
-            extra_args=["--revoke-worktree-trust-after"],
-        )
+        exit_code = self._run_main(tmp_path, monkeypatch, canary_verdict="inconclusive")
         assert exit_code == verifier.EXIT_SKIP
 
-    def test_no_write_text_call_targets_claude_json_fixture(
+    def test_revoke_flag_is_inert_and_never_touches_claude_json(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Assert no code path opens the claude.json fixture in write mode,
-        by wrapping Path.write_text and recording any target path equal to
-        the fixture."""
-        worktree = tmp_path / "worktree"
-        worktree.mkdir()
-        claude_json = tmp_path / "claude.json"
-        _write_fixture(
-            claude_json,
-            {"projects": {str(worktree): {"hasTrustDialogAccepted": True}}},
-        )
-        monkeypatch.setattr(verifier, "_claude_json_path", lambda: claude_json)
-        monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
-
-        class _FakeCompleted:
-            returncode = 0
-
-        monkeypatch.setattr(verifier.subprocess, "run", lambda *a, **kw: _FakeCompleted())
-
-        def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
-            return {
-                "case": kwargs["case_name"],
-                "exit_code": verifier.EXIT_OK,
-                "process_error": None,
-                "marker_observed": True,
-                "evidence": {"expected_markers_missing": []},
-            }
-
-        monkeypatch.setattr(verifier, "run_runtime_case", _fake_run_runtime_case)
-
         original_write_text = Path.write_text
         write_targets: list[Path] = []
 
@@ -664,68 +745,35 @@ class TestMainNeverWritesClaudeJsonFixture:
 
         monkeypatch.setattr(Path, "write_text", _tracking_write_text)
 
-        verifier.main(
-            [
-                "--runtime",
-                "claude",
-                "--mode",
-                "structured",
-                "--claude-agent-name",
-                "pr-reviewer",
-                "--case",
-                "positive_reference_read",
-                "--expect-marker",
-                "reviewer-reference-read-ok",
-                "--worktree",
-                str(worktree),
-                "--revoke-worktree-trust-after",
-            ]
+        exit_code = self._run_main(
+            tmp_path,
+            monkeypatch,
+            canary_verdict="confirmed_deny",
+            extra_args=["--revoke-worktree-trust-after"],
         )
+        assert exit_code == verifier.EXIT_SKIP
+        assert not any(p.name == ".claude.json" for p in write_targets)
 
-        assert claude_json.resolve() not in {p.resolve() for p in write_targets}
-
-
-# ─── Sensitive fixture content must never leak into stdout/artifact log ───
-
-
-class TestClaudeJsonContentNeverLeaks:
-    def test_claude_json_shaped_content_not_in_stdout_or_artifact_log(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
+    def test_expect_marker_not_forwarded_to_runner_argv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """PR #2385 fix_delta: --expect-marker must never reach the runner
+        subprocess argv (it would trigger the unsatisfiable causal-evidence
+        gate for a main-session persona binding)."""
         worktree = tmp_path / "worktree"
         worktree.mkdir()
-        claude_json = tmp_path / "claude.json"
-        sentinel = "SUPER_SECRET_MCP_TOKEN_VALUE_DO_NOT_LEAK"
-        _write_fixture(
-            claude_json,
-            {
-                "projects": {
-                    str(worktree): {
-                        "hasTrustDialogAccepted": True,
-                        "mcpServers": {"token": sentinel},
-                    }
-                },
-                "oauthAccount": {"secret": sentinel},
-            },
-        )
-        monkeypatch.setattr(verifier, "_claude_json_path", lambda: claude_json)
         monkeypatch.setattr(verifier.shutil, "which", lambda _name: "/usr/bin/claude")
 
-        class _FakeCompleted:
-            returncode = 0
-
-        monkeypatch.setattr(verifier.subprocess, "run", lambda *a, **kw: _FakeCompleted())
+        captured_kwargs: list[dict[str, Any]] = []
 
         def _fake_run_runtime_case(**kwargs: Any) -> dict[str, Any]:
+            captured_kwargs.append(kwargs)
             return {
                 "case": kwargs["case_name"],
                 "exit_code": verifier.EXIT_OK,
                 "process_error": None,
                 "marker_observed": True,
-                "evidence": {"expected_markers_missing": []},
+                "evidence": {},
             }
 
         monkeypatch.setattr(verifier, "run_runtime_case", _fake_run_runtime_case)
@@ -747,13 +795,12 @@ class TestClaudeJsonContentNeverLeaks:
             ]
         )
 
-        captured = capsys.readouterr()
-        assert sentinel not in captured.out
-        assert sentinel not in captured.err
-
-        artifact_files = list((worktree / "artifacts").glob("runtime-verification-*.log"))
-        assert len(artifact_files) == 1
-        assert sentinel not in artifact_files[0].read_text(encoding="utf-8")
+        # run_runtime_case() is invoked with a marker_hint kwarg (used only
+        # for prompt embedding / non-authoritative diagnostics), not an
+        # `expect_marker` kwarg that gets forwarded to the runner argv.
+        for kwargs in captured_kwargs:
+            assert "expect_marker" not in kwargs
+            assert "marker_hint" in kwargs
 
 
 # ─── Concurrent-process diagnostic (retained, non-gating) ──────────────────
