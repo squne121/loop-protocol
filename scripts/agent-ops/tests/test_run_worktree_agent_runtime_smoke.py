@@ -582,33 +582,11 @@ def test_given_no_claude_binary_when_preflight_runs_then_skip77(repo_with_worktr
     assert "required command not found: claude" in summary
 
 
-def test_given_codex_help_introspection_fails_when_preflight_runs_then_skip77_with_summary(
-    repo_with_worktree, tmp_path
-):
-    """Issue #1960 P1-1 fix-delta: a controlled SKIP 77 caused by the codex
-    capability preflight (``codex exec --help`` introspection failing or
-    missing required flags) must still emit summary.md evidence (AC7)."""
-    repo, worktree = repo_with_worktree
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    # Missing --json/--ephemeral/-C in --help output triggers the
-    # capability-missing skip branch of preflight_codex_flags().
-    _write_fake_exe(fake_bin / "codex", 'echo "nothing useful"\nexit 0\n')
-    prompt = _prompt_file(tmp_path)
-    out_dir = tmp_path / "out"
-    result = _run(
-        repo, worktree,
-        "--runtime", "codex", "--mode", "structured",
-        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
-        fake_bin_dir=fake_bin,
-    )
-    assert result.returncode == 77
-    summary_path = out_dir / "summary.md"
-    assert summary_path.exists(), "codex capability preflight SKIP must still write summary.md (AC7)"
-    summary = summary_path.read_text(encoding="utf-8")
-    assert "exit_code: 77" in summary
-    assert "codex CLI missing required structured-lane flags" in summary
-    assert "resolved_executable:" in summary
+# Issue #2161 (native Codex CLI retirement):
+# test_given_codex_help_introspection_fails_when_preflight_runs_then_skip77_with_summary
+# was removed -- it exercised preflight_codex_flags(), which was removed
+# along with the ``codex`` runtime lane (and argparse now rejects
+# --runtime codex before any preflight runs).
 
 
 def test_given_herdr_preflight_fails_when_interactive_mode_runs_then_skip77_with_summary(
@@ -785,91 +763,14 @@ exit 0
 
 
 # ---------------------------------------------------------------------------
-# AC4: structured Codex lane — argv (-C worktree --json --ephemeral -), prompt
-# via stdin (Issue #1921 P1 fix-delta: prompt must never appear in argv).
-# ---------------------------------------------------------------------------
-
-
-def test_given_fake_codex_when_structured_lane_runs_then_prompt_delivered_via_stdin_not_argv(
-    repo_with_worktree, tmp_path
-):
-    repo, worktree = repo_with_worktree
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    argv_log = tmp_path / "codex_argv.txt"
-    stdin_log = tmp_path / "codex_stdin.txt"
-    _write_fake_exe(fake_bin / "codex", f"""
-if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
-  echo "--json --ephemeral -C"
-  exit 0
-fi
-echo "$@" > "{argv_log}"
-cat > "{stdin_log}"
-echo '{{"type":"item.completed"}}'
-exit 0
-""")
-    prompt = _prompt_file(tmp_path, "codex prompt text\n")
-    out_dir = tmp_path / "out"
-    result = _run(
-        repo, worktree,
-        "--runtime", "codex", "--mode", "structured",
-        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
-        fake_bin_dir=fake_bin,
-    )
-    assert result.returncode == 0, result.stderr
-    argv_text = argv_log.read_text(encoding="utf-8")
-    assert "-C" in argv_text
-    assert str(worktree) in argv_text
-    assert "--json" in argv_text
-    assert "--ephemeral" in argv_text
-    assert "codex prompt text" not in argv_text
-    stdin_text = stdin_log.read_text(encoding="utf-8")
-    assert "codex prompt text" in stdin_text
-
-
-def test_given_fake_codex_success_with_expected_marker_when_structured_lane_runs_then_exit0_and_causal_evidence_null(
-    repo_with_worktree, tmp_path
-):
-    """Issue #2183 PR #2220 OWNER REQUEST_CHANGES P0-1
-    (https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514):
-    the structured lane's --expect-marker default causal-evidence gate
-    (``causal_evidence_required``) must be scoped to ``args.runtime ==
-    "claude"`` -- ``subagent_causal_evidence_verdict()`` is only ever
-    computed for the Claude structured lane (the Codex lane has no
-    SubagentStart/SubagentStop stream-json channel this harness can parse,
-    so ``causal_evidence`` is unconditionally ``None`` there). Before this
-    fix-delta, a Codex run that exited 0, reached a terminal event, AND
-    printed the expected marker text was still forced to FAIL purely
-    because ``causal_evidence is None`` -- a bug, not a genuine causal-
-    evidence gap, since Codex was never expected to have that channel in
-    the first place."""
-    repo, worktree = repo_with_worktree
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    _write_fake_exe(fake_bin / "codex", """
-if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
-  echo "--json --ephemeral -C"
-  exit 0
-fi
-cat > /dev/null
-echo '{"type":"item.completed","text":"MARKER_TOKEN_CODEX_P0_1"}'
-exit 0
-""")
-    prompt = _prompt_file(tmp_path, "codex prompt text\n")
-    out_dir = tmp_path / "out"
-    result = _run(
-        repo, worktree,
-        "--runtime", "codex", "--mode", "structured",
-        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
-        "--expect-marker", "MARKER_TOKEN_CODEX_P0_1",
-        fake_bin_dir=fake_bin,
-    )
-    assert result.returncode == 0, result.stderr
-    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
-    assert "subagent_causal_evidence: None" in summary
-    assert "subagent causal evidence insufficient" not in result.stderr
-
-
+# Issue #2161 (native Codex CLI retirement):
+# test_given_fake_codex_when_structured_lane_runs_then_prompt_delivered_via_stdin_not_argv
+# and
+# test_given_fake_codex_success_with_expected_marker_when_structured_lane_runs_then_exit0_and_causal_evidence_null
+# were removed -- both exercised the structured ``codex`` runtime lane
+# (run_structured_codex / preflight_codex_flags), which was retired along
+# with the native Codex CLI ``codex`` runtime; argparse now rejects
+# --runtime codex before any preflight runs.
 # ---------------------------------------------------------------------------
 # AC9 / postcondition (Issue #1921 P0-5: full repository fingerprint)
 # ---------------------------------------------------------------------------
@@ -2154,38 +2055,11 @@ exit 0
     assert "orchestration_action_count: 1" in summary
 
 
-def test_given_codex_collab_tool_call_item_when_structured_run_then_child_spawn_event_count_recorded(
-    repo_with_worktree, tmp_path
-):
-    repo, worktree = repo_with_worktree
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    _write_fake_exe(fake_bin / "codex", """
-if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
-  echo "--json --ephemeral -C"
-  exit 0
-fi
-if [ "$1" = "--version" ]; then
-  echo "codex-cli 0.146.0"
-  exit 0
-fi
-cat > /dev/null
-echo '{"type":"item.completed","item":{"id":"item_1","type":"collab_tool_call","tool":"wait"}}'
-echo '{"type":"item.completed"}'
-exit 0
-""")
-    prompt = _prompt_file(tmp_path)
-    out_dir = tmp_path / "out"
-    result = _run(
-        repo, worktree,
-        "--runtime", "codex", "--mode", "structured",
-        "--prompt-file", str(prompt), "--output-dir", str(out_dir),
-        fake_bin_dir=fake_bin,
-    )
-    assert result.returncode == 0, result.stderr
-    summary = (out_dir / "summary.md").read_text(encoding="utf-8")
-    assert "child_spawn_event_count: 1" in summary
-    assert "runtime_version: codex-cli 0.146.0" in summary
+# Issue #2161 (native Codex CLI retirement):
+# test_given_codex_collab_tool_call_item_when_structured_run_then_child_spawn_event_count_recorded
+# was removed -- it exercised classify_codex_events()'s
+# ``collab_tool_call`` detection, which was retired along with the
+# ``codex`` runtime lane.
 
 
 # ---------------------------------------------------------------------------
