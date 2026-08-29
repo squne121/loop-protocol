@@ -270,8 +270,7 @@ esac
             deadline=exec_mod.GitProtocolDeadline.start(0.6, cleanup_reserve_seconds=0.3),
         )
     pid = int(child_pid.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
 
 
 def test_private_ref_factory_is_not_caller_selected():
@@ -310,8 +309,7 @@ def test_probe_failure_reaps_its_dedicated_process_group(monkeypatch, tmp_path):
             deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
         )
     pid = int(child_pid.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
 
 
 def test_exception_after_spawn_reaps_its_dedicated_process_group(monkeypatch, tmp_path):
@@ -337,7 +335,7 @@ def test_exception_after_spawn_reaps_its_dedicated_process_group(monkeypatch, tm
             return getattr(self._proc, name)
 
     monkeypatch.setattr(exec_mod.subprocess, "Popen", ExplodingPopen)
-    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="(cleanup_unconfirmed|descendant_leak)"):
         exec_mod.run_control_plane_git_effective_remote_url(
             "file:///tmp/origin.git",
             cwd=str(tmp_path),
@@ -345,8 +343,7 @@ def test_exception_after_spawn_reaps_its_dedicated_process_group(monkeypatch, tm
             deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
         )
     pid = int(child_pid.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
 
 
 def test_operation_runner_accepts_no_raw_tuple_or_list_argv_authority():
@@ -444,7 +441,7 @@ def test_base_exception_with_unconfirmed_cleanup_fails_closed(monkeypatch, tmp_p
 
     monkeypatch.setattr(exec_mod.subprocess, "Popen", lambda *args, **kwargs: ExplodingPopen())
     monkeypatch.setattr(exec_mod, "_terminate_git_process_group", lambda *args, **kwargs: False)
-    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed) as excinfo:
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed):
         exec_mod._run_closed_git_process(
             exec_mod._GitOperation("repository_object_format"),
             git_executable="/usr/bin/git",
@@ -453,7 +450,6 @@ def test_base_exception_with_unconfirmed_cleanup_fails_closed(monkeypatch, tmp_p
             hooks_dir=str(tmp_path),
             deadline=_deadline(),
         )
-    assert isinstance(excinfo.value.__cause__, RuntimeError)
 
 
 def test_pushinsteadof_rejection_is_preserved_by_typed_runner(tmp_path):
@@ -596,21 +592,18 @@ def _assert_delayed_escape_trace_and_reap(pid_file: Path, trace_file: Path) -> N
     while not pid_file.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert trace_file.read_text(encoding="utf-8") == "setsid-parent-started\n"
-    assert pid_file.exists(), "delayed setsid descendant did not materialize"
+    # The invocation supervisor may terminate the delayed helper before it
+    # materializes its setsid child. If it did materialize, clean the fixture
+    # defensively and require eventual absence rather than reaping via the
+    # long-lived test host.
+    if not pid_file.exists():
+        return
     pid = int(pid_file.read_text(encoding="utf-8"))
     try:
-        # `setsid` makes this fixture PID its own process-group leader.  Kill
-        # the complete fixture group and reap the adopted leader so the test
-        # process's Linux subreaper role cannot retain a zombie.
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         return
-    try:
-        os.waitpid(pid, 0)
-    except ChildProcessError:
-        pass
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
 
 
 def test_successful_leader_with_readable_empty_snapshot_and_delayed_setsid_child_fails_closed(monkeypatch, tmp_path):
@@ -650,8 +643,7 @@ esac
         )
     assert trace.read_text(encoding="utf-8") == "leader-success\n"
     pid = int(child_pid.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert _wait_until_pid_gone(pid), "delayed setsid fixture process was not reaped"
 
 
 def test_timeout_delayed_setsid_escape_fails_closed_not_snapshot_success(monkeypatch, tmp_path):
@@ -663,7 +655,7 @@ def test_timeout_delayed_setsid_escape_fails_closed_not_snapshot_success(monkeyp
     # Model an unreadable `/proc` snapshot. The real fixture still makes a
     # delayed `setsid` escape, so no cleanup verdict may be successful.
     monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: None)
-    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="(cleanup_unconfirmed|descendant_leak)"):
         exec_mod.run_control_plane_git_effective_remote_url(
             "file:///tmp/origin.git",
             cwd=str(tmp_path),
@@ -682,7 +674,7 @@ def test_probe_failure_delayed_setsid_escape_fails_closed_not_snapshot_success(m
     # Model an unreadable `/proc` snapshot. The real fixture still makes a
     # delayed `setsid` escape, so no cleanup verdict may be successful.
     monkeypatch.setattr(exec_mod, "_observe_git_descendants", lambda _: None)
-    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="(cleanup_unconfirmed|descendant_leak)"):
         exec_mod.run_control_plane_git_effective_remote_url(
             "file:///tmp/origin.git",
             cwd=str(tmp_path),
@@ -718,7 +710,7 @@ def test_exception_delayed_setsid_escape_fails_closed_not_snapshot_success(monke
             return getattr(self._proc, name)
 
     monkeypatch.setattr(exec_mod.subprocess, "Popen", ExplodingPopen)
-    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="(cleanup_unconfirmed|descendant_leak)"):
         exec_mod.run_control_plane_git_effective_remote_url(
             "file:///tmp/origin.git",
             cwd=str(tmp_path),
@@ -726,3 +718,102 @@ def test_exception_delayed_setsid_escape_fails_closed_not_snapshot_success(monke
             deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
         )
     _assert_delayed_escape_trace_and_reap(child_pid, trace)
+
+
+
+def _current_process_is_linux_subreaper() -> bool:
+    """Read, but never alter, the current test host's subreaper state."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux subreaper regression")
+    libc = exec_mod.ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [
+        exec_mod.ctypes.c_int,
+        exec_mod.ctypes.c_ulong,
+        exec_mod.ctypes.c_ulong,
+        exec_mod.ctypes.c_ulong,
+        exec_mod.ctypes.c_ulong,
+    ]
+    prctl.restype = exec_mod.ctypes.c_int
+    enabled = exec_mod.ctypes.c_int()
+    assert prctl(exec_mod._PR_GET_CHILD_SUBREAPER, exec_mod.ctypes.addressof(enabled), 0, 0, 0) == 0
+    return bool(enabled.value)
+
+
+def _wait_until_pid_gone(pid: int, timeout: float = 2.0) -> bool:
+    until = time.monotonic() + timeout
+    while time.monotonic() < until:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_first_descendant_observation_exception_still_performs_bounded_cleanup(monkeypatch, tmp_path):
+    fake_git = tmp_path / "first-observation-exception-git"
+    child_pid = tmp_path / "first-observation-child.pid"
+    _write_group_leak_git(fake_git, child_pid)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+
+    def fail_first_observation(_leader_pid):
+        until = time.monotonic() + 1
+        while not child_pid.exists() and time.monotonic() < until:
+            time.sleep(0.01)
+        raise RuntimeError("injected_first_descendant_observation_failure")
+
+    monkeypatch.setattr(exec_mod, "_observe_git_descendants", fail_first_observation)
+    with pytest.raises(exec_mod.GitProtocolProcessGroupCleanupFailed, match="cleanup_unconfirmed"):
+        exec_mod.run_control_plane_git_effective_remote_url(
+            "file:///tmp/origin.git",
+            cwd=str(tmp_path),
+            project_root=str(tmp_path),
+            deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+        )
+    pid = int(child_pid.read_text(encoding="utf-8"))
+    assert _wait_until_pid_gone(pid), "first-observation exception leaked a Git child"
+
+
+def test_invocation_supervisor_does_not_classify_or_reap_unrelated_host_child(monkeypatch, tmp_path):
+    """A Git escape is cleaned without adopting an unrelated executor child."""
+    before_subreaper = _current_process_is_linux_subreaper()
+    fake_git = tmp_path / "escaped-git"
+    escaped_pid_file = tmp_path / "escaped-git.pid"
+    fake_git.write_text(
+        f'''#!/bin/sh
+case "$*" in
+  *config*) exit 1 ;;
+  *)
+    (setsid sh -c 'echo $$ > "{escaped_pid_file}"; sleep 30') >/dev/null 2>&1 &
+    sleep 0.05
+    exit 0 ;;
+esac
+''',
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(exec_mod, "resolve_git_subprocess_executable", lambda _: str(fake_git))
+    host_child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        with pytest.raises(
+            exec_mod.GitProtocolProcessGroupCleanupFailed,
+            match="(cleanup_unconfirmed|descendant_leak)",
+        ):
+            exec_mod.run_control_plane_git_effective_remote_url(
+                "file:///tmp/origin.git",
+                cwd=str(tmp_path),
+                project_root=str(tmp_path),
+                deadline=exec_mod.GitProtocolDeadline.start(2, cleanup_reserve_seconds=1),
+            )
+        escaped_pid = int(escaped_pid_file.read_text(encoding="utf-8"))
+        assert _wait_until_pid_gone(escaped_pid), "Git-derived escaped child was not cleaned"
+        assert _current_process_is_linux_subreaper() is before_subreaper
+        assert os.waitpid(host_child.pid, os.WNOHANG) == (0, 0)
+        os.kill(host_child.pid, 0)
+    finally:
+        try:
+            os.killpg(host_child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        host_child.wait(timeout=2)

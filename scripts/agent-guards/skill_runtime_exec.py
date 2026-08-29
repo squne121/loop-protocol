@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ctypes
 import errno
 import hashlib
@@ -12,9 +13,11 @@ import math
 import os
 import pwd
 import re
+import select
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -3275,23 +3278,26 @@ def main(argv: list[str] | None = None) -> int:
 _GIT_SUBPROCESS_EXECUTABLE_CACHE: str | None = None
 _CONTROL_PLANE_WORKTREE_LOCK_REASON = "loop-protocol-control-plane-default-ref"
 
-# Linux makes a process that opts into PR_SET_CHILD_SUBREAPER the reparenting
-# target for orphaned descendants.  This is the containment authority used by
-# the closed Git executor: after its direct Git leader has been reaped, every
-# surviving escaped descendant is still parented below this process rather
-# than disappearing behind an init-parented `/proc` race.
+# The short-lived per-invocation supervisor, never the long-lived executor
+# host, opts into PR_SET_CHILD_SUBREAPER. Consequently an orphaned Git
+# descendant is reparented only to the supervisor that spawned its Git leader;
+# the host's unrelated children cannot enter this attribution domain.
 _PR_SET_CHILD_SUBREAPER = 36
 _PR_GET_CHILD_SUBREAPER = 37
 
 
 def _enable_linux_child_subreaper() -> bool:
-    """Enable kernel parentage containment before spawning a Git leader.
+    """Enable containment in an invocation supervisor before it spawns Git.
 
-    The setting is intentionally retained for this executor process.  Turning
-    it off after an operation would create a reparenting gap for a child that
-    exits immediately after the check.  A platform without this Linux kernel
-    authority has no equivalent race-free containment in this module and is
-    therefore rejected before any Git side effect can be started.
+    This function is called exclusively after `_run_closed_git_process` has
+    forked its short-lived supervisor. It must never run in the long-lived
+    executor host: PR_SET_CHILD_SUBREAPER changes orphan reparenting semantics
+    for the entire calling process and would otherwise make unrelated host
+    children eligible for classification, signalling, or reaping.
+
+    The supervisor remains alive until its one Git invocation reaches a
+    confirmed terminal state, so an escaped descendant is attributable to the
+    known Git leader rather than to the host.
     """
     if not sys.platform.startswith("linux"):
         return False
@@ -3559,14 +3565,15 @@ def _tracked_descendants_absent(descendants: set[_TrackedGitDescendant]) -> bool
     )
 
 
-def _observe_subreaper_children() -> set[_TrackedGitDescendant] | None:
-    """Return live children directly parented to this Linux subreaper.
+def _observe_invocation_supervisor_children() -> set[_TrackedGitDescendant] | None:
+    """Return live children adopted by this one-invocation supervisor.
 
     This is deliberately distinct from `_observe_git_descendants`: a readable
-    tree snapshot rooted at the Git leader is only advisory.  Once that leader
-    is reaped, PR_SET_CHILD_SUBREAPER gives an empty direct-child set a kernel
-    parentage meaning: no live orphaned descendant of that leader remains.
-    An unreadable `/proc` result is never interpreted as that proof.
+    tree snapshot rooted at the Git leader is only advisory. Once that leader
+    is reaped, the supervisor's PR_SET_CHILD_SUBREAPER gives an empty
+    direct-child set a kernel-parentage meaning: no live orphaned descendant
+    of that Git leader remains. The supervisor spawned no other child, and an
+    unreadable `/proc` result is never interpreted as that proof.
     """
     proc_root = Path("/proc")
     if not sys.platform.startswith("linux") or not proc_root.is_dir():
@@ -3616,7 +3623,7 @@ def _observe_descendants_of(parent_pids: set[int]) -> set[_TrackedGitDescendant]
     return descendants
 
 
-def _signal_subreaper_child_trees(children: set[_TrackedGitDescendant], signal_number: int) -> bool:
+def _signal_invocation_child_trees(children: set[_TrackedGitDescendant], signal_number: int) -> bool:
     descendants = _observe_descendants_of({child.pid for child in children})
     if descendants is None:
         return False
@@ -3639,35 +3646,34 @@ def _reap_tracked_children(children: set[_TrackedGitDescendant]) -> bool:
     return True
 
 
-def _terminate_subreaper_children(deadline: GitProtocolDeadline) -> bool:
-    """Drain escaped descendants through kernel parentage, then reap them.
+def _terminate_invocation_supervisor_children(deadline: GitProtocolDeadline) -> bool:
+    """Drain Git descendants adopted by this invocation supervisor only.
 
-    A direct child of the subreaper may itself fork after SIGTERM.  Repeating
-    discovery is not used as a timing heuristic: parentage guarantees that
-    each still-live orphan remains directly reachable until it is terminated
-    and reaped.  The bounded deadline only limits resource cleanup.
+    A direct child of the supervisor may itself fork after SIGTERM. Repeating
+    discovery is not used as a timing heuristic: its parentage is still within
+    the known Git invocation. No host child can be seen by this process.
     """
     term_until = min(deadline.deadline_at, time.monotonic() + max(0.01, deadline.cleanup_reserve_seconds / 2))
     for signal_number, phase_deadline in ((signal.SIGTERM, term_until), (signal.SIGKILL, deadline.deadline_at)):
         while time.monotonic() < phase_deadline:
-            children = _observe_subreaper_children()
+            children = _observe_invocation_supervisor_children()
             if children is None:
                 return False
             if not children:
                 return True
-            if not _signal_subreaper_child_trees(children, signal_number):
+            if not _signal_invocation_child_trees(children, signal_number):
                 return False
             if not _reap_tracked_children(children):
                 return False
             time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
-    children = _observe_subreaper_children()
+    children = _observe_invocation_supervisor_children()
     if children is None:
         return False
-    if children and not _signal_subreaper_child_trees(children, signal.SIGKILL):
+    if children and not _signal_invocation_child_trees(children, signal.SIGKILL):
         return False
     if children and not _reap_tracked_children(children):
         return False
-    return not _observe_subreaper_children()
+    return not _observe_invocation_supervisor_children()
 
 
 def _signal_tracked_descendants(descendants: set[_TrackedGitDescendant], signal_number: int) -> bool:
@@ -3691,16 +3697,13 @@ def _terminate_git_process_group(
     deadline: GitProtocolDeadline,
     descendants: set[_TrackedGitDescendant] | None,
 ) -> bool:
-    """Attempt bounded cleanup, but confirm success only with containment.
+    """Bounded cleanup with supervisor-scoped containment confirmation.
 
-    A dedicated process group is not race-free descendant containment: a
-    child can call `setsid()`, create a delayed child, and disappear before a
-    `/proc` snapshot is read. This executor has no cgroup/subreaper backend,
-    so it reaps what it can but returns False on every terminal path. The
-    caller must surface `GitProtocolProcessGroupCleanupFailed` rather than
-    present best-effort cleanup as success.
+    The caller is the invocation supervisor. Its subreaper domain contains
+    only the Git leader it spawned and descendants subsequently orphaned from
+    that leader, never a child of the long-lived executor host.
     """
-    if not _POSIX_PROCESS_GROUP_SUPPORTED or pgid is None or descendants is None:
+    if not _POSIX_PROCESS_GROUP_SUPPORTED or pgid is None:
         try:
             proc.terminate()
         except OSError:
@@ -3714,6 +3717,55 @@ def _terminate_git_process_group(
             except (OSError, subprocess.TimeoutExpired):
                 pass
         return False
+
+    if descendants is None:
+        # Observation itself failed after Popen. We cannot confirm containment,
+        # but the known dedicated group must still receive bounded TERM/KILL.
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return False
+        term_until = min(deadline.deadline_at, time.monotonic() + max(0.01, deadline.cleanup_reserve_seconds / 2))
+        while time.monotonic() < term_until:
+            if _verify_process_group_absent(pgid):
+                try:
+                    proc.wait(timeout=0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                _terminate_invocation_supervisor_children(deadline)
+                return False
+            time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return False
+        while time.monotonic() < deadline.deadline_at:
+            if _verify_process_group_absent(pgid):
+                try:
+                    proc.wait(timeout=0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                _terminate_invocation_supervisor_children(deadline)
+                return False
+            time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+        _terminate_invocation_supervisor_children(deadline)
+        return False
+
+    def confirmed_absence() -> bool:
+        children = _observe_invocation_supervisor_children()
+        if children is None:
+            return False
+        if children:
+            # An escaped descendant was observed in the isolated supervisor.
+            # Reap it, but do not promote an escape into successful cleanup.
+            _terminate_invocation_supervisor_children(deadline)
+            return False
+        return True
+
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
@@ -3726,12 +3778,11 @@ def _terminate_git_process_group(
     while time.monotonic() < term_until:
         proc.poll()
         if _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants):
-            proc.wait(timeout=0)
-            # Reap any child reparented by the Linux subreaper before the
-            # terminal fail-closed result is surfaced.  An empty leader tree
-            # snapshot remains insufficient to promote this into success.
-            _terminate_subreaper_children(deadline)
-            return False
+            try:
+                proc.wait(timeout=0)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            return confirmed_absence()
         time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
     try:
         os.killpg(pgid, signal.SIGKILL)
@@ -3744,16 +3795,15 @@ def _terminate_git_process_group(
     while time.monotonic() < deadline.deadline_at:
         proc.poll()
         if _verify_process_group_absent(pgid) and _tracked_descendants_absent(descendants):
-            proc.wait(timeout=0)
-            # Reap any child reparented by the Linux subreaper before the
-            # terminal fail-closed result is surfaced.  An empty leader tree
-            # snapshot remains insufficient to promote this into success.
-            _terminate_subreaper_children(deadline)
-            return False
+            try:
+                proc.wait(timeout=0)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            return confirmed_absence()
         time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
-    # Ensure adopted children are not left as zombies even though a final
-    # advisory `/proc` snapshot cannot certify successful containment.
-    _terminate_subreaper_children(deadline)
+    # Ensure only invocation-attributable adopted children are not left as
+    # zombies, even though final confirmation has failed.
+    _terminate_invocation_supervisor_children(deadline)
     return False
 
 
@@ -3835,7 +3885,24 @@ def _exact_git_argv(operation: _GitOperation, *, git_executable: str, cwd: str, 
     ]
 
 
-def _run_closed_git_process(
+_INVOCATION_SUPERVISOR_MAX_RESULT_BYTES = 32 * 1024 * 1024
+
+
+def _record_git_descendant_observation(
+    proc: subprocess.Popen, descendants: set[_TrackedGitDescendant] | None
+) -> set[_TrackedGitDescendant] | None:
+    """Merge an advisory observation without letting its failure skip cleanup."""
+    try:
+        observed = _observe_git_descendants(proc.pid)
+    except BaseException:
+        return None
+    if descendants is None or observed is None:
+        return None
+    descendants.update(observed)
+    return descendants
+
+
+def _run_closed_git_process_in_invocation_supervisor(
     operation: _GitOperation,
     *,
     git_executable: str,
@@ -3844,11 +3911,8 @@ def _run_closed_git_process(
     hooks_dir: str,
     deadline: GitProtocolDeadline,
 ) -> subprocess.CompletedProcess:
-    deadline.execution_seconds()
+    """Run one Git command inside its short-lived subreaper supervisor."""
     if not _enable_linux_child_subreaper():
-        # A process group cannot contain a child which calls setsid().  Do not
-        # run a Git command on a platform where that escape cannot be observed
-        # through kernel parentage and subsequently cleaned up.
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_containment_unavailable")
     argv = _exact_git_argv(operation, git_executable=git_executable, cwd=cwd, hooks_dir=hooks_dir)
     kwargs: dict[str, object] = {
@@ -3863,16 +3927,20 @@ def _run_closed_git_process(
     posix_supervised = _POSIX_PROCESS_GROUP_SUPPORTED
     if posix_supervised:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
-    pgid = proc.pid if posix_supervised else None
-    descendants = _observe_git_descendants(proc.pid) if posix_supervised else set()
+    proc: subprocess.Popen | None = None
+    pgid: int | None = None
+    descendants: set[_TrackedGitDescendant] | None = set() if posix_supervised else None
     try:
+        proc = subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
+        pgid = proc.pid if posix_supervised else None
+        # This initial observation is deliberately inside the guarded region:
+        # observer failures occur after Popen and therefore require bounded
+        # cleanup just like communicate(), poll(), and timeout failures.
+        if posix_supervised:
+            descendants = _record_git_descendant_observation(proc, descendants)
         while True:
-            observed = _observe_git_descendants(proc.pid) if posix_supervised else set()
-            if descendants is None or observed is None:
-                descendants = None
-            else:
-                descendants.update(observed)
+            if posix_supervised:
+                descendants = _record_git_descendant_observation(proc, descendants)
             try:
                 stdout, stderr = proc.communicate(
                     timeout=min(_GROUP_POLL_INTERVAL_SECONDS, deadline.execution_seconds())
@@ -3881,27 +3949,17 @@ def _run_closed_git_process(
             except subprocess.TimeoutExpired:
                 continue
     except GitProtocolDeadlineExhausted as exc:
-        observed = _observe_git_descendants(proc.pid) if posix_supervised else set()
-        if descendants is None or observed is None:
-            descendants = None
-        else:
-            descendants.update(observed)
-        if not _terminate_git_process_group(proc, pgid, deadline, descendants):
+        if proc is None or not _terminate_git_process_group(proc, pgid, deadline, descendants):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
         raise GitProtocolTimeout("git_process_timeout") from exc
     except BaseException as exc:
-        observed = _observe_git_descendants(proc.pid) if posix_supervised else set()
-        if descendants is None or observed is None:
-            descendants = None
-        else:
-            descendants.update(observed)
-        if not _terminate_git_process_group(proc, pgid, deadline, descendants):
+        if proc is None or not _terminate_git_process_group(proc, pgid, deadline, descendants):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from exc
         raise
-    # A non-success result is a terminal path. A rewrite probe's exit 1 is
-    # its documented "no matching key" result; every other nonzero outcome
-    # must attempt cleanup and may not use an advisory descendant snapshot as
-    # a successful cleanup verdict.
+
+    # A non-success result is terminal, except the documented no-match result
+    # of the rewrite probe. Cleanup remains mandatory before its result leaves
+    # this supervisor.
     if proc.returncode != 0 and not (operation.kind == "probe_rewrite" and proc.returncode == 1):
         if not _terminate_git_process_group(proc, pgid, deadline, descendants):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
@@ -3910,23 +3968,235 @@ def _run_closed_git_process(
         or not _verify_process_group_absent(proc.pid)
         or not _tracked_descendants_absent(descendants)
     ):
-        if not _terminate_git_process_group(proc, pgid, deadline, descendants):
-            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+        _terminate_git_process_group(proc, pgid, deadline, descendants)
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_descendant_leak")
 
-    # `communicate()` has reaped the direct Git leader.  A prior empty
-    # leader-rooted `/proc` snapshot cannot prove success: a delayed setsid()
-    # child may have escaped between snapshots.  With the subreaper enabled,
-    # every such live orphan is now directly parented here.  It is terminated
-    # and reaped, but its existence is still a fail-closed protocol failure.
-    adopted_children = _observe_subreaper_children()
+    # communicate() has reaped the direct Git leader. In this isolated
+    # supervisor, an empty adopted-child set has kernel parentage meaning and
+    # is a confirmation limited to this Git invocation.
+    adopted_children = _observe_invocation_supervisor_children()
     if adopted_children is None:
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
     if adopted_children:
-        if not _terminate_subreaper_children(deadline):
+        if not _terminate_invocation_supervisor_children(deadline):
             raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
         raise GitProtocolProcessGroupCleanupFailed("git_process_group_descendant_leak")
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def _encode_invocation_supervisor_stream(value: str | bytes | None) -> dict[str, object]:
+    if isinstance(value, str):
+        raw = value.encode("utf-8")
+        text = True
+    elif isinstance(value, bytes):
+        raw = value
+        text = False
+    else:
+        raw = b""
+        text = True
+    return {"text": text, "data": base64.b64encode(raw).decode("ascii")}
+
+
+def _decode_invocation_supervisor_stream(value: object) -> str | bytes | None:
+    if not isinstance(value, dict) or not isinstance(value.get("text"), bool) or not isinstance(value.get("data"), str):
+        raise ValueError("invalid_invocation_supervisor_stream")
+    raw = base64.b64decode(value["data"], validate=True)
+    return raw.decode("utf-8") if value["text"] else raw
+
+
+def _write_invocation_supervisor_result(write_fd: int, outcome: dict[str, object]) -> None:
+    """Send one bounded JSON frame over a private parent/supervisor pipe."""
+    try:
+        payload = json.dumps(outcome, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if len(payload) > _INVOCATION_SUPERVISOR_MAX_RESULT_BYTES:
+            return
+        frame = struct.pack("!Q", len(payload)) + payload
+        sent = 0
+        while sent < len(frame):
+            sent += os.write(write_fd, frame[sent:])
+    except (OSError, TypeError, ValueError):
+        return
+
+
+def _invocation_supervisor_main(
+    write_fd: int,
+    operation: _GitOperation,
+    *,
+    git_executable: str,
+    cwd: str,
+    env: dict[str, str],
+    hooks_dir: str,
+    deadline: GitProtocolDeadline,
+) -> None:
+    """Execute exactly one Git operation, then exit without touching host state."""
+    try:
+        completed = _run_closed_git_process_in_invocation_supervisor(
+            operation,
+            git_executable=git_executable,
+            cwd=cwd,
+            env=env,
+            hooks_dir=hooks_dir,
+            deadline=deadline,
+        )
+        outcome: dict[str, object] = {
+            "kind": "completed",
+            "argv": completed.args,
+            "returncode": completed.returncode,
+            "stdout": _encode_invocation_supervisor_stream(completed.stdout),
+            "stderr": _encode_invocation_supervisor_stream(completed.stderr),
+        }
+    except BaseException as exc:
+        outcome = {"kind": "raised", "type": type(exc).__name__, "message": str(exc)}
+    try:
+        _write_invocation_supervisor_result(write_fd, outcome)
+    finally:
+        try:
+            os.close(write_fd)
+        finally:
+            os._exit(0)
+
+
+def _stop_invocation_supervisor(supervisor_pid: int) -> None:
+    """Bound the known supervisor itself; never signal an arbitrary host PID."""
+    try:
+        os.kill(supervisor_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        pass
+    try:
+        os.waitpid(supervisor_pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def _read_invocation_supervisor_result(
+    read_fd: int, supervisor_pid: int, deadline: GitProtocolDeadline
+) -> dict[str, object] | None:
+    """Read a bounded result while retaining a deadline for supervisor cleanup."""
+    data = bytearray()
+    result_deadline_at = deadline.deadline_at + max(0.1, _GROUP_POLL_INTERVAL_SECONDS * 2)
+    try:
+        while time.monotonic() < result_deadline_at:
+            readable, _writable, _exceptional = select.select(
+                [read_fd], [], [], min(_GROUP_POLL_INTERVAL_SECONDS, result_deadline_at - time.monotonic())
+            )
+            if not readable:
+                continue
+            chunk = os.read(read_fd, 65536)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > _INVOCATION_SUPERVISOR_MAX_RESULT_BYTES + 8:
+                return None
+    except (OSError, ValueError):
+        return None
+    finally:
+        try:
+            os.close(read_fd)
+        except OSError:
+            pass
+    if len(data) < 8:
+        return None
+    size = struct.unpack("!Q", data[:8])[0]
+    if size > _INVOCATION_SUPERVISOR_MAX_RESULT_BYTES or len(data) != size + 8:
+        return None
+    try:
+        outcome = json.loads(data[8:].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(outcome, dict) or outcome.get("kind") not in {"completed", "raised"}:
+        return None
+    while time.monotonic() < result_deadline_at:
+        try:
+            waited_pid, _status = os.waitpid(supervisor_pid, os.WNOHANG)
+        except OSError:
+            return None
+        if waited_pid == supervisor_pid:
+            return outcome
+        time.sleep(_GROUP_POLL_INTERVAL_SECONDS)
+    return None
+
+
+def _raise_invocation_supervisor_error(outcome: dict[str, object]) -> None:
+    error_type = outcome.get("type")
+    message = outcome.get("message")
+    if not isinstance(error_type, str) or not isinstance(message, str):
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    error_classes: dict[str, type[BaseException]] = {
+        "GitProtocolDeadlineExhausted": GitProtocolDeadlineExhausted,
+        "GitProtocolTimeout": GitProtocolTimeout,
+        "GitProtocolProcessGroupCleanupFailed": GitProtocolProcessGroupCleanupFailed,
+        "RuntimeError": RuntimeError,
+        "ValueError": ValueError,
+        "TypeError": TypeError,
+    }
+    error_class = error_classes.get(error_type)
+    if error_class is None:
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    raise error_class(message)
+
+
+def _run_closed_git_process(
+    operation: _GitOperation,
+    *,
+    git_executable: str,
+    cwd: str,
+    env: dict[str, str],
+    hooks_dir: str,
+    deadline: GitProtocolDeadline,
+) -> subprocess.CompletedProcess:
+    """Delegate one Git process to a one-invocation subreaper supervisor.
+
+    The host creates and waits for only the known supervisor PID. It never
+    enables subreaping, scans `/proc` for host children, signals them, or reaps
+    them. Containment or result-confirmation failure remains fail-closed.
+    """
+    deadline.execution_seconds()
+    try:
+        read_fd, write_fd = os.pipe()
+        supervisor_pid = os.fork()
+    except (AttributeError, OSError) as exc:
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_containment_unavailable") from exc
+    if supervisor_pid == 0:
+        try:
+            os.close(read_fd)
+            _invocation_supervisor_main(
+                write_fd,
+                operation,
+                git_executable=git_executable,
+                cwd=cwd,
+                env=env,
+                hooks_dir=hooks_dir,
+                deadline=deadline,
+            )
+        finally:
+            os._exit(1)
+    os.close(write_fd)
+    outcome = _read_invocation_supervisor_result(read_fd, supervisor_pid, deadline)
+    if outcome is None:
+        _stop_invocation_supervisor(supervisor_pid)
+        raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed")
+    if outcome["kind"] == "completed":
+        try:
+            argv = outcome["argv"]
+            returncode = outcome["returncode"]
+            if (
+                not isinstance(argv, list)
+                or not all(isinstance(arg, str) for arg in argv)
+                or not isinstance(returncode, int)
+            ):
+                raise ValueError("invalid_invocation_supervisor_result")
+            return subprocess.CompletedProcess(
+                argv,
+                returncode,
+                _decode_invocation_supervisor_stream(outcome.get("stdout")),
+                _decode_invocation_supervisor_stream(outcome.get("stderr")),
+            )
+        except (TypeError, ValueError, KeyError):
+            raise GitProtocolProcessGroupCleanupFailed("git_process_group_cleanup_unconfirmed") from None
+    _raise_invocation_supervisor_error(outcome)
+    raise AssertionError("unreachable_invocation_supervisor_error")
 
 
 def _probe_insteadof_rewrite_keys(
