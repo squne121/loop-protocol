@@ -24,12 +24,14 @@ an `issue-reviewer` subprocess invocation).
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import importlib.util
 import inspect
 import io
 import json
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -38,6 +40,10 @@ ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 SCRIPTS_DIR = ROOT / ".claude" / "skills" / "issue-refinement-loop" / "scripts"
 PIPELINE_SCRIPT = SCRIPTS_DIR / "run_root_review_pipeline.py"
 SKILL_MD = ROOT / ".claude" / "skills" / "issue-refinement-loop" / "SKILL.md"
+REVIEW_ISSUE_SKILL_MD = ROOT / ".claude" / "skills" / "review-issue" / "SKILL.md"
+ISSUE_REVIEWER_AGENT_MD = ROOT / ".claude" / "agents" / "issue-reviewer.md"
+ISSUE_REVIEWER_AGENT_TOML = ROOT / ".codex" / "agents" / "issue-reviewer.toml"
+COMMAND_REGISTRY_PY = SCRIPTS_DIR / "command_registry.py"
 
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -274,3 +280,194 @@ def test_skill_md_step2_states_issue_reviewer_not_invoked_for_canonical_routing(
     assert "canonical Step 2 では起動されない" in step2_text
     assert "classify_child_stdout()" in step2_text
     assert "retry_once_on_transport_failure()" in step2_text
+
+
+# ---------------------------------------------------------------------------
+# P0-2 (Issue #2380 / OWNER PR #2386 review): canonical Step 2's routing pure
+# function must key off the FULL `(status, verdict, next_action)` triple, not
+# `verdict` alone -- a prior iteration silently ignored `next_action` and
+# would have misrouted the valid `needs-fix` + `human_judgment_required`
+# combination into the ordinary rewrite loop.
+# ---------------------------------------------------------------------------
+
+
+def test_route_canonical_step2_result_approve_proceed_routes_step_4_5(tmp_path: Path, monkeypatch):
+    out = _run_real_produce(tmp_path, monkeypatch, body=_APPROVE_BODY, issue_number=2380010)
+    assert _PIPELINE.route_canonical_step2_result(out) == _PIPELINE.STEP_4_5
+
+
+def test_route_canonical_step2_result_needs_fix_request_changes_routes_step_4(tmp_path: Path, monkeypatch):
+    out = _run_real_produce(tmp_path, monkeypatch, body=_NEEDS_FIX_BODY, issue_number=2380011)
+    assert _PIPELINE.route_canonical_step2_result(out) == _PIPELINE.STEP_4
+
+
+def test_route_canonical_step2_result_human_judgment_required_routes_step5_regardless_of_verdict():
+    """The existing compact schema (`review-issue/SKILL.md` "Producer I/O
+    ownership" section) allows `verdict: needs-fix` + `next_action:
+    human_judgment_required` -- an unresolvable environment/timeout
+    condition, NOT a body-rewrite-fixable contract defect. The prior
+    `verdict`-only routing table would have sent this into the ordinary
+    rewrite loop (Step 4); the fix routes ANY `next_action:
+    human_judgment_required` to Step 5, independent of `verdict`."""
+    for verdict in ("needs-fix", "approve"):
+        result = {"status": "ok", "compact_result": {"verdict": verdict, "next_action": "human_judgment_required"}}
+        assert _PIPELINE.route_canonical_step2_result(result) == _PIPELINE.STEP_5_HUMAN_JUDGMENT_REQUIRED
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"status": "ok", "compact_result": {"verdict": "approve", "next_action": "request_changes"}},
+        {"status": "ok", "compact_result": {"verdict": "needs-fix", "next_action": "proceed"}},
+        {"status": "ok", "compact_result": {}},
+        {"status": "input_or_runtime_error", "compact_result": {}},
+        {"status": "input_or_runtime_error", "compact_result": {"verdict": "approve", "next_action": "proceed"}},
+    ],
+    ids=[
+        "approve_plus_request_changes",
+        "needs_fix_plus_proceed",
+        "ok_status_empty_compact_result",
+        "non_ok_status_empty_compact_result",
+        "non_ok_status_otherwise_valid_pair",
+    ],
+)
+def test_route_canonical_step2_result_inconsistent_combos_fail_closed(result: dict):
+    assert (
+        _PIPELINE.route_canonical_step2_result(result)
+        == _PIPELINE.FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+    )
+
+
+def _function_body_source_without_docstring(func) -> str:
+    """Returns just the CODE of a function (no docstring, no signature/name),
+    so a forbidden-substring check does not false-positive on legitimate
+    prose in the function's own explanatory docstring."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    func_def = tree.body[0]
+    assert isinstance(func_def, (ast.FunctionDef, ast.AsyncFunctionDef))
+    body = func_def.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    return "\n".join(ast.unparse(stmt) for stmt in body)
+
+
+def test_route_canonical_step2_result_is_pure_and_never_invokes_issue_reviewer():
+    """P0-3: the canonical CONSUMER route itself (not just `_cmd_produce()`)
+    must be a pure `(status, verdict, next_action) -> target` mapping with NO
+    invocation of the `issue-reviewer` agent, subprocess, or any callback --
+    this static check on `route_canonical_step2_result()`'s own CODE (its
+    docstring is deliberately excluded -- it legitimately discusses
+    `issue-reviewer` in prose) is what actually proves the "producer ->
+    issue-reviewer handoff" the prior test suite failed to exercise cannot
+    occur through this consumer path."""
+    body_source = _function_body_source_without_docstring(_PIPELINE.route_canonical_step2_result)
+    for forbidden in (
+        "issue-reviewer",
+        "issue_reviewer",
+        "subprocess",
+        "Agent(",
+        "classify_child_stdout",
+        "retry_once_on_transport_failure",
+    ):
+        assert forbidden not in body_source, f"unexpected {forbidden!r} in route_canonical_step2_result() body"
+
+
+def test_given_real_produce_output_when_routed_through_pure_router_end_to_end_then_no_agent_handoff_occurs(
+    tmp_path: Path, monkeypatch
+):
+    """P0-3 canonical consumer path: feed a REAL `_cmd_produce()` roundtrip's
+    OWN output into `route_canonical_step2_result()` -- the actual canonical
+    Step 2 consumer, not a hand-rolled fixture dict -- for BOTH verdict
+    branches. This is the missing link the prior AC1/AC2 tests never
+    exercised: they proved `_cmd_produce()` itself never calls the legacy
+    relay/classify functions, but never proved the CONSUMER of its output
+    (this routing function) reaches the correct canonical target without any
+    `issue-reviewer` handoff in between."""
+    approve_out = _run_real_produce(tmp_path, monkeypatch, body=_APPROVE_BODY, issue_number=2380012)
+    needs_fix_out = _run_real_produce(tmp_path, monkeypatch, body=_NEEDS_FIX_BODY, issue_number=2380013)
+    assert _PIPELINE.route_canonical_step2_result(approve_out) == _PIPELINE.STEP_4_5
+    assert _PIPELINE.route_canonical_step2_result(needs_fix_out) == _PIPELINE.STEP_4
+
+
+# ---------------------------------------------------------------------------
+# P0-1/P0-3 (Issue #2380 / OWNER PR #2386 review): whole-file / cross-file
+# instruction-surface consistency. The pre-fix_delta static tests above only
+# ever sliced "### Step 2" .. "### Step 2.5" out of SKILL.md, so they could
+# never detect the SAME SKILL.md's own top-of-file "Loop Structure" diagram
+# (or the sibling agent/registry/pipeline files) contradicting it. This
+# regression guard checks the FULL text of every flagged active instruction
+# surface, not just one narrow section of one file.
+# ---------------------------------------------------------------------------
+
+import re  # noqa: E402
+
+_LEGACY_RELAY_REGRESSION_PHRASES: dict[Path, list[str]] = {
+    SKILL_MD: [
+        # pre-fix_delta top-of-file Loop Structure diagram routed through the
+        # issue-reviewer agent instead of directly consuming `produce`.
+        "issue-reviewer→root_review_pipeline(V2delegate)→ISSUE_REVIEW_RESULT_COMPACT_V2",
+        # pre-fix_delta claim that the orchestrator trusts the issue-reviewer
+        # AGENT's own self-reported VERDICT directly (as opposed to the
+        # root-verified `compact_result.verdict` `produce` itself returns).
+        "orchestratorは`issue-reviewer`のVERDICTを独立に再計算せず直接信頼する",
+    ],
+    ISSUE_REVIEWER_AGENT_MD: [
+        "issue-refinement-loop`のStep2loopworkerです",
+        "orchestratorから呼ばれ、結果を返して終了する",
+        "orchestratorは判定を再評価せず、機械的にroutingする",
+        "orchestratorは本SubAgentの`VERDICT`を独立に再計算せず直接信頼する",
+    ],
+    ISSUE_REVIEWER_AGENT_TOML: [
+        "issue-refinement-loop向けのread-onlyadvisoryreviewerとして、root-ownedpipelineが",
+        "呼び出し元（orchestrator）から明示的なread-only",
+        "orchestratorは本AgentのVERDICTを独立に再計算せず直接信頼する",
+    ],
+    REVIEW_ISSUE_SKILL_MD: [
+        "`invoked_as_loop:true`（`issue-reviewer`経由）",
+    ],
+    COMMAND_REGISTRY_PY: [
+        "itonlyrelays`compact_result.stdout_lines`verbatim.Thisisa",
+    ],
+}
+
+
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+@pytest.mark.parametrize(
+    "surface_path",
+    list(_LEGACY_RELAY_REGRESSION_PHRASES.keys()),
+    ids=[p.name for p in _LEGACY_RELAY_REGRESSION_PHRASES],
+)
+def test_instruction_surfaces_no_longer_contain_legacy_relay_regression_phrases(surface_path: Path):
+    """Cross-file consistency guard (Issue #2380 P0-1/P0-3): none of the
+    specific legacy issue-reviewer-relay imperative sentences OWNER PR #2386
+    review flagged may reappear, on ANY of the flagged active instruction
+    surfaces -- not just the narrow "### Step 2" slice of one file the
+    pre-existing static tests checked."""
+    normalized = _normalize_whitespace(surface_path.read_text(encoding="utf-8"))
+    for phrase in _LEGACY_RELAY_REGRESSION_PHRASES[surface_path]:
+        assert phrase not in normalized, f"{surface_path}: found regression phrase {phrase!r}"
+
+
+def test_pipeline_docstring_no_longer_claims_issue_reviewer_is_a_stdout_lines_consumer():
+    """P0-1: `run_root_review_pipeline.py`'s own module docstring previously
+    described `compact_result.stdout_lines` as being handed to the read-only
+    `issue-reviewer` child as part of the CANONICAL `produce` contract, and
+    separately listed the `issue-reviewer` agent as a "Consumer" of the
+    persisted artifact schema alongside the orchestrator. Both claims
+    contradicted the Issue #2380 canonical direct-consume routing."""
+    source = PIPELINE_SCRIPT.read_text(encoding="utf-8")
+    normalized = _normalize_whitespace(source)
+    for phrase in (
+        "sotheorchestratorcanhandthemtotheread-only`issue-reviewer`childasanexplicit,already-produced,",
+        "read-onlyinput(thechildrelaysthemverbatim;itneverinvokes`compact_review_result.py`itself).",
+        "andthe`issue-reviewer`read-onlychild(inputonly,neverawriter).",
+    ):
+        assert phrase not in normalized, f"run_root_review_pipeline.py: found regression phrase {phrase!r}"

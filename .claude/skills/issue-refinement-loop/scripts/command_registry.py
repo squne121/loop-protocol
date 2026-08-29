@@ -782,15 +782,21 @@ REGISTRY: dict[str, dict[str, Any]] = {
     # check_issue_contract.py / contract_readiness_check.py / merge_readiness,
     # and persists the merged review result to the canonical artifact
     # directory. PR #2135 human REQUEST_CHANGES iteration-3 P0-1: this
-    # command is now ALSO the sole producer of the ISSUE_REVIEW_RESULT_COMPACT_V1
-    # compact envelope (see `produce_compact_result()` /
-    # `compact_result.stdout_lines` in the stdout JSON) -- the read-only
-    # `issue-reviewer` custom agent (.codex/agents/issue-reviewer.toml) never
-    # invokes compact_review_result.py or performs any producer I/O itself;
-    # it only relays `compact_result.stdout_lines` verbatim. This is a
-    # deliberate, narrow exception to #1875's minimal-harness direction
-    # (see run_root_review_pipeline.py's module docstring "Architecture
-    # delta relative to #1875" for the full rationale/consumer inventory).
+    # command is now ALSO the sole producer of the ISSUE_REVIEW_RESULT_COMPACT_V2
+    # compact envelope (see `produce_compact_result()` / `compact_result` in
+    # the stdout JSON). Issue #2380: canonical Step 2 (issue-refinement-loop
+    # SKILL.md) consumes this command's `compact_result.verdict` /
+    # `compact_result.next_action` / `verified_transport_artifact` DIRECTLY --
+    # it does NOT invoke the read-only `issue-reviewer` custom agent
+    # (.codex/agents/issue-reviewer.toml) and does NOT relay
+    # `compact_result.stdout_lines` to it. That agent remains available for
+    # legacy CLI / diagnostic / regression-test use only (it never invokes
+    # compact_review_result.py or performs any producer I/O itself; when
+    # invoked via that legacy path it only relays `compact_result.stdout_lines`
+    # verbatim). This command's own producer-I/O ownership is a deliberate,
+    # narrow exception to #1875's minimal-harness direction (see
+    # run_root_review_pipeline.py's module docstring "Architecture delta
+    # relative to #1875" for the full rationale/consumer inventory).
     "root_review_pipeline.produce": {
         "id": "root_review_pipeline.produce",
         "argv": [
