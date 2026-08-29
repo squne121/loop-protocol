@@ -776,3 +776,26 @@ OWNER の敵対的レビュー（PR #1634 iteration 2）により、初回実装
 ## 12. publish lane authorization trust root（歴史的経緯・historical note）
 
 Issue #1454（Phase A, PR #1457 MERGED）で `scripts/trust-root` 一式（`trusted_hook_launcher.py` / `manifest_schema.py` / `install_trust_root.sh`）が external trust root として導入されたが、これを `.codex/hooks.json` へ実際に配線する Issue #1450（Phase B）と、追加ハードニングを扱う Issue #1468 がいずれも個人開発の脅威モデルに対して過剰と判断され not planned でクローズされた。配線先を失った `scripts/trust-root` は不使用コードとなったため、Issue #1469 でコード一式・CI 登録・本節の bootstrap/rotation/managed hook registration 手順を削除した。現行の publish lane 保護は Issue #1408（PR #1442 MERGED、Issue branch 限定 push 許可・force/tag/delete/mirror 拒否）と main branch protection（Issue #360）のみで構成される。
+
+## 13. pr_reviewer_guard.py — agent-scoped hook（Issue #1881）
+
+`pr_reviewer_guard.py` は project-level `.claude/settings.json` の
+`hook_boundaries_manifest_v1`（本ドキュメント第2節）には **登録されない**。
+`.claude/agents/pr-reviewer.md` の frontmatter `hooks.PreToolUse` にのみ
+配線される agent-scoped hook であり、`agent_type == pr-reviewer` のセッション
+でのみ有効化される。第2節の `TestSettingsManifestAlignment` drift 検査の対象外
+（settings.json の project PreToolUse を走査しないため）。
+
+- **配線元**: `.claude/agents/pr-reviewer.md` frontmatter（正本は同ファイル）
+- **command 分類**: Claude Code の native permission-rule 構文
+  （`if: "Bash(git commit *)"` 等、9 種の canonical mutation command family）
+  に委ね、hook script 自身は shell parser を実装しない
+- **fail policy**: `deny` サブコマンドは `hook_event_name == PreToolUse` かつ
+  `agent_type == pr-reviewer` の場合のみ stderr に固定理由を出して exit 2
+  （blocker）。それ以外は無出力で exit 0
+- **観測系**: `observe-identity` / `observe-reference-read` は
+  `LOOP_PR_REVIEWER_RUNTIME_PROBE=1` のときのみ sanitized marker
+  （`agent_type` のみ）を出力し、通常のレビュー session では無出力
+- **対象外**: global `secret_boundary_guard.sh` への `agent_type` 追加は行わない
+  （Out of Scope、Issue #1881）
+

@@ -15,6 +15,14 @@ effort: high
 permissionMode: dontAsk
 skills:
   - pr-review-judge
+hooks: {PreToolUse: [
+  {matcher: "Bash", if: "Bash(git commit *)", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}]}, {matcher: "Bash", if: "Bash(git push *)", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}]},
+  {matcher: "Bash", if: "Bash(git worktree *)", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}]}, {matcher: "Bash", if: "Bash(gh pr review *)", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}]},
+  {matcher: "Bash", if: "Bash(gh pr comment *)", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}]}, {matcher: "Bash", if: "Bash(gh pr merge *)", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}]},
+  {matcher: "Bash", if: "Bash(gh issue edit *)", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}]}, {matcher: "Bash", if: "Bash(gh issue comment *)", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}]},
+  {matcher: "Bash", if: "Bash(gh issue close *)", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}]},
+], SessionStart: [{hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["observe-identity"], timeout: 5}]}],
+PostToolUse: [{matcher: "Read", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["observe-reference-read"], timeout: 5}]}]}
 ---
 
 あなたは LOOP_PROTOCOL の **PR レビューを担当する** SubAgent です。
