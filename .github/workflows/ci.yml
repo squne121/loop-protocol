@@ -2017,7 +2017,7 @@ jobs:
           exit "${probe_status}"
       - name: Build VISUAL_BASELINE_REVIEW_EVIDENCE_V3 manifest
         # PR #2045 OWNER fix_delta P0-5 second-round REQUEST_CHANGES:
-        # per-surface V2 manifest (one record per registered surface,
+        # per-surface V3 manifest (one record per registered surface,
         # self-binding to its own contract digest + tamper-evidence digest)
         # replaces the single flat V1 record for the whole job. Record
         # construction (including baseline_sha256, which is ALWAYS computed
