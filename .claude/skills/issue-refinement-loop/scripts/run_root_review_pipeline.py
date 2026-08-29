@@ -1216,16 +1216,34 @@ def route_canonical_step2_result(result: Any) -> str:
 
     A prior implementation iteration keyed routing off `compact_result.verdict`
     alone (`approve` -> Step 4.5, `needs-fix` -> Step 4), silently ignoring
-    `compact_result.next_action`. That is a functional bug: the existing
-    compact schema (see `review-issue/SKILL.md` "Producer I/O ownership" /
-    Step 2.5 doc) allows a valid `verdict: needs-fix` +
-    `next_action: human_judgment_required` combination (e.g. when the
-    readiness checker's own `failure_class` is
-    `contract_readiness_human_judgment` -- environment/timeout/unknown
-    classification, NOT a body-rewrite-fixable contract defect). Routing that
-    combination into the ordinary rewrite loop (Step 4) as if it were a plain
-    `needs-fix` misclassifies an unresolvable environment condition as a
-    fixable contract defect.
+    `compact_result.next_action`. That is a functional bug: `compact_result`
+    can in principle carry a `verdict: needs-fix` + `next_action:
+    human_judgment_required` shape (the `STEP_5_HUMAN_JUDGMENT_REQUIRED`
+    branch below exists to route that exact triple, kept from Issue #2389
+    for exhaustiveness), so ignoring `next_action` entirely would route it
+    into the ordinary rewrite loop (Step 4) as if it were a plain
+    `needs-fix`.
+
+    IMPORTANT (Issue #2397 P2-1 -- retired design corrected here): an
+    earlier iteration of this docstring, and of `check_issue_contract.py`'s
+    own docstrings, described `compact_review_result.py` / `build_compact_v2()`
+    as DERIVING that `next_action: human_judgment_required` wire value FROM
+    the readiness checker's `failure_class`. That design was proposed,
+    reviewed, and explicitly REJECTED by the OWNER (Issue #2397 anchor
+    comment P0-3): the Compact V2 wire's `NEXT_ACTION` stays the two-valued
+    `proceed | request_changes` contract from Issue #2054, unchanged, and
+    `build_compact_v2()` / `validate_compact_v2()` never read or emit
+    `failure_class` at all. The readiness checker's `contract_readiness_
+    human_judgment` `failure_class` (environment/tool/timeout/unknown-
+    classification, NOT a body-rewrite-fixable contract defect) is instead
+    surfaced to THIS root-owned function directly, by reading
+    `merged_review_result.failure_class` from the SAME producer payload --
+    see the `STEP_5_OPERATOR_INTERVENTION_REQUIRED` branch below (Issue
+    #2397 P0-1/P0-2). The `next_action == "human_judgment_required"` branch
+    immediately below is unrelated to `failure_class` and is never actually
+    populated by the real two-valued wire; it remains only as a defensive,
+    independently-tested terminal case for a `compact_result` shape this
+    function does not otherwise assume is impossible.
 
     This function evaluates the FULL `(status, verdict, next_action)` triple
     -- exactly the outcomes the Issue #2380 / #2389 fix_delta specify -- and
@@ -1341,6 +1359,41 @@ def route_canonical_step2_result(result: Any) -> str:
     return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
 
 
+def build_canonical_step2_disposition(route: str) -> dict[str, Any]:
+    """Pure helper (Issue #2397 Scope Delta AC12): derive the
+    `canonical_step2_disposition` field from an ALREADY-COMPUTED
+    `route_canonical_step2_result()` return value.
+
+    This is intentionally a second, separate pure function rather than
+    folding the extra fields into `route_canonical_step2_result()` itself:
+    `route_canonical_step2_result()`'s contract is "return exactly one of
+    the known route string constants" (unit-tested directly against those
+    constants across AC1-AC4), and callers other than `_emit_produce_result()`
+    (e.g. `test_canonical_step2_route_wiring.py`) rely on that narrow
+    contract unchanged. `build_canonical_step2_disposition()` takes that
+    SAME route string as its only input and has no I/O of its own.
+
+    Only the `STEP_5_OPERATOR_INTERVENTION_REQUIRED` route is terminal from
+    this disposition's point of view: it carries `terminal: true` plus the
+    fixed `termination_reason` / `termination_cause` pair the orchestrator
+    (`issue-refinement-loop/references/termination-policy.md`) uses to
+    distinguish an operator-intervention stop from an ordinary in-loop route
+    (Step 2.5 / Step 4 / Step 5 human-judgment) or a fail-closed integrity
+    stop. Every other route (including `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`
+    and `STEP_5_HUMAN_JUDGMENT_REQUIRED`, which have their own distinct
+    termination handling elsewhere and are unchanged by this Issue) gets
+    back the route alone, with no additional keys.
+    """
+    if route == STEP_5_OPERATOR_INTERVENTION_REQUIRED:
+        return {
+            "route": route,
+            "terminal": True,
+            "termination_reason": "human_escalation",
+            "termination_cause": "operator_intervention_required",
+        }
+    return {"route": route}
+
+
 def _cmd_run_checker_attempt(args: argparse.Namespace) -> int:
     """[internal] Single reviewer-transport "attempt" child: run the
     deterministic checker pipeline once against an already-pinned body file
@@ -1398,9 +1451,19 @@ def _emit_produce_result(payload: dict[str, Any]) -> None:
     `payload` is the schema/status/etc. dict a call site would otherwise
     have passed straight to `json.dumps()`; this function does not mutate
     the caller's copy of it in place.
+
+    Issue #2397 Scope Delta AC12: this SAME helper also attaches
+    `canonical_step2_disposition` -- the pure, additive
+    `build_canonical_step2_disposition()` derivation of the
+    `canonical_step2_route` value it just computed above. Deriving it here
+    (rather than only on the success path) keeps both fields governed by
+    the exact same single-exit-point guarantee: no call site can attach one
+    without the other, or forget either.
     """
     payload = dict(payload)
-    payload["canonical_step2_route"] = route_canonical_step2_result(payload)
+    route = route_canonical_step2_result(payload)
+    payload["canonical_step2_route"] = route
+    payload["canonical_step2_disposition"] = build_canonical_step2_disposition(route)
     print(json.dumps(payload))
 
 

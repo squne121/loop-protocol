@@ -4,12 +4,23 @@ route.
 `merged_review_result.failure_class == "contract_readiness_human_judgment"`
 marks an environment/tool/timeout/unknown-classification readiness state
 (`contract_readiness_check.py` -- e.g. `env_missing_dep`, `timeout`,
-`unknown` classification, `command_not_allowed`, `package_manager_no_tty_prompt`,
-regression-gate failure, validator internal/timeout errors, body-retrieval
-failure) that a Step 4 Issue-body rewrite cannot fix. This is an
-operator-intervention condition, not a genuine semantic/owner-ambiguity
-judgment call (that remains `STEP_5_HUMAN_JUDGMENT_REQUIRED`, unchanged by
-this Issue).
+`unknown` classification, `package_manager_no_tty_prompt`, regression-gate
+failure, validator internal/timeout errors, body-retrieval failure) that a
+Step 4 Issue-body rewrite cannot fix. This is an operator-intervention
+condition, not a genuine semantic/owner-ambiguity judgment call (that
+remains `STEP_5_HUMAN_JUDGMENT_REQUIRED`, unchanged by this Issue).
+
+NOTE (Issue #2397 Scope Delta, OWNER PR #2398 review P0-1): `command_not_allowed`
+(a VC using a command shape that is not on the static preflight allowlist)
+is deliberately EXCLUDED from the example list above -- it is now mapped to
+`readiness_status: needs_fix` (see `contract_readiness_check.py`'s
+`_PREFLIGHT_CATEGORY_TO_READINESS`), not `human_judgment`, because it is
+body-author-fixable (rewrite the VC to an allowlisted command). The
+`command_not_allowed` -> `STEP_4` regression coverage for that is in
+`test_operator_intervention_route_scope_delta.py::
+test_command_not_allowed_readiness_routes_to_step_4_not_operator_intervention`
+(AC10), and the genuinely-operator-only fixture below uses an `unknown`
+classification (`jq` against a nonexistent path) instead.
 
 Verifies:
 
@@ -74,21 +85,41 @@ def _load_pipeline_module():
 _PIPELINE = _load_pipeline_module()
 _REPO = "squne121/loop-protocol"
 
-# `zzz-not-a-real-preflight-allowlisted-tool-2397` is not on
-# `baseline_vc_preflight.py`'s closed allowlist (`_ALLOWED_COMMANDS`), so the
-# REAL checker chain classifies it `category: command_not_allowed` /
-# `decision: blocked` BEFORE any attempt to execute it (the allowlist check
-# is purely static, no exec, no missing-binary lookup, no network) --
-# `command_not_allowed` is not a key in
-# `contract_readiness_check._PREFLIGHT_CATEGORY_TO_READINESS`, so
-# `map_preflight_result_to_errors()` falls through to its `else` branch and
-# reports `readiness_status: "human_judgment"`. `merge_readiness_into_review_result()`
+# Issue #2397 Scope Delta (OWNER PR #2398 review P0-1): this fixture MUST NOT
+# use a `command_not_allowed` VC shape (a command not on
+# `baseline_vc_preflight.py`'s static allowlist, e.g. an unknown binary) --
+# that category is now `needs_fix` (body-author-fixable: rewrite the VC to an
+# allowlisted command form), not a genuine operator-only condition, and using
+# it here would make this "genuinely operator-only" fixture silently stop
+# proving anything the moment the P0-1 fix above landed (that is exactly the
+# regression the OWNER flagged: this fixture used to be `command_not_allowed`
+# and would have kept "passing" against the OLD, pre-fix mapping while no
+# longer reaching the operator-intervention route for real).
+#
+# `jq` IS on the closed allowlist (`_ALLOWED_COMMANDS`; no
+# `_is_allowed_jq_invocation`-style sub-validation restricts it further), so
+# the real checker chain actually EXECUTES it against a path that does not
+# exist. `jq`'s own exit code (2) and stderr ("Could not open file ...: No
+# such file or directory") do not match ANY of `classify_result()`'s
+# `rg` / `pytest` / `python3` / `node` / `./`-script specific patterns (those
+# all require a DIFFERENT `cmd_basename` or a `./`/`../` path substring), so
+# classification falls all the way through to the terminal "Unknown: cannot
+# classify" branch, which returns `decision: "human_judgment"` directly
+# (`category: "unknown"`) -- `map_preflight_result_to_errors()` takes the
+# `decision == "human_judgment"` branch UNCONDITIONALLY, never consulting
+# `_PREFLIGHT_CATEGORY_TO_READINESS` at all for this result, so this fixture
+# stays a genuine operator-only signal regardless of any future
+# `_PREFLIGHT_CATEGORY_TO_READINESS` entry changes (Issue #2397 Out of
+# Scope: `env_missing_dep` / `timeout` / `package_manager_no_tty_prompt` /
+# `unknown` remain operator-only). `merge_readiness_into_review_result()`
 # then sets `merged["failure_class"] = "contract_readiness_human_judgment"`
 # (`readiness_status_to_failure_class()`) and force-upgrades a would-be
 # `verdict: approve` to `verdict: needs-fix` so the failure_class is never
 # silently dropped -- producing a genuine, deterministic, hermetic
 # `needs-fix` + `request_changes` + `contract_readiness_human_judgment`
-# payload with no live GitHub / network / missing-binary dependency.
+# payload with no live GitHub / network / missing-binary dependency (`jq`
+# itself is a real, locally-installed binary; only the JSON file path it is
+# given does not exist).
 _CONTRACT_READINESS_HUMAN_JUDGMENT_BODY = """## Machine-Readable Contract
 
 ```yaml
@@ -108,22 +139,24 @@ result to `STEP_5_OPERATOR_INTERVENTION_REQUIRED` (Issue #2397).
 
 ## Acceptance Criteria
 
-- [ ] AC1: fixture body's Verification Command uses a binary that is not on
-      the VC preflight allowlist, so the real checker chain's readiness
-      check classifies it `category: command_not_allowed` -> readiness
-      `human_judgment`, producing a genuine
+- [ ] AC1: fixture body's Verification Command uses an allowlisted binary
+      (`jq`) against a path that does not exist, so the real checker chain
+      actually executes it and its readiness check classifies the result
+      `category: unknown` / `decision: human_judgment` (genuinely
+      operator-only, NOT the body-fixable `command_not_allowed` category),
+      producing a genuine
       `merged_review_result.failure_class: contract_readiness_human_judgment`.
 
 ## Verification Commands
 
 ```bash
 # AC1
-$ zzz-not-a-real-preflight-allowlisted-tool-2397 --version
+$ jq '.' fixture/e2e_produce_operator_intervention_unknown_classification.json
 ```
 
 ## Allowed Paths
 
-- fixture/e2e_produce_operator_intervention_contract_readiness_human_judgment.md
+- fixture/e2e_produce_operator_intervention_unknown_classification.json
 """
 
 
