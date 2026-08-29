@@ -5,9 +5,9 @@
 language-independent source of truth for repository paths that must always
 be denied for AI-driven staging/commit, regardless of what an Issue's
 declared Allowed Paths say. This module is a thin Python loader over that
-JSON -- it does NOT hardcode the rule list. Other consumers (Node
-`scripts/check-codex-agents.mjs`, `.codex/config.toml`) are expected to
-either read the same JSON file directly, or keep a validated mirror in sync
+JSON -- it does NOT hardcode the rule list. A retired native Codex CLI
+consumer (the now-deleted Node agent-config validator, native Codex CLI
+config) used to keep a validated mirror in sync
 with it (see `docs/dev/agent-runtime-ops.md` for the mirror verification
 procedure).
 

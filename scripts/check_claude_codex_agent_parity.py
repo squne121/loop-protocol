@@ -34,7 +34,7 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTATION_PATH = REPO_ROOT / "tests/fixtures/codex-agent-config/expected-runtime-contract.json"
+EXPECTATION_PATH = REPO_ROOT / "tests/fixtures/agent-config/expected-runtime-contract.json"
 
 # Permission profiles -> mutation boundary mapping (fallback only; the
 # declared ground truth is `required_agents.<agent>.mutation_class`, see

@@ -114,7 +114,7 @@ def _write_minimal_contract(
     mutation_class: str = "readonly",
     runtime_followup_route: str = "review-issue",
 ) -> Path:
-    fixture_dir = tmp_path / "tests" / "fixtures" / "codex-agent-config"
+    fixture_dir = tmp_path / "tests" / "fixtures" / "agent-config"
     fixture_dir.mkdir(parents=True, exist_ok=True)
     minimal_contract = {
         "required_agents": {

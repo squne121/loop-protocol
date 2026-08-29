@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Verify real CI check-run conclusions + AC6 sentinel artifact content (Issue #1760).
+"""Verify real CI check-run conclusions (Issue #1760).
 
-AC9 requires runtime evidence for the same head SHA -- not a string search over
-``ci.yml`` -- that ``actionlint`` / ``python-test-core`` / ``codex-execpolicy`` /
-``python-test`` (required aggregate) / ``node-backed-hook-tests`` all completed with
-an acceptable conclusion, AND that the AC6 sentinel artifact
-(``codex_execpolicy_matrix_status_v1.json``) reports a real terminal status (not
-merely "started"/absent).
+Issue #2161 (native Codex CLI retirement): the former codex-execpolicy job,
+its AC6 sentinel artifact (``codex_execpolicy_matrix_status_v1.json``), and
+the ``--codex-sentinel-json`` verification this script performed against it
+were removed with the job. The remaining AC9 contract still requires runtime
+evidence for the same head SHA -- not a string search over ``ci.yml`` -- that
+``actionlint`` / ``python-test-core`` / ``python-test`` (required aggregate) /
+``node-backed-hook-tests`` all completed with an acceptable conclusion.
 
 Issue #1824 P1-3 review: a check-run candidate set that is only grouped by
 (name, head_sha) can accept a MIXED-PROVENANCE result set when the same commit
@@ -15,25 +16,20 @@ name does not guarantee every accepted row belongs to the SAME workflow run.
 ``--workflow-run-id`` / ``--workflow-run-attempt`` are now REQUIRED, and every
 accepted check-run row's ``details_url`` must reference that exact run id (the
 same binding rule ``ci_verdict_summary_v2.filter_check_runs_by_workflow_run``
-already applies -- reused here, not reimplemented, to avoid drift). The AC6
-sentinel's own ``run_id`` / ``run_attempt`` / ``schema`` / ``exit_code`` are
-also cross-checked against the same run so a stale sentinel from a different
-run cannot be substituted in.
+already applies -- reused here, not reimplemented, to avoid drift).
 
-Inputs are two already-fetched JSON documents (no live network calls from this
-script -- the CI job that invokes it is responsible for the ``gh api`` call and the
-artifact download, matching the existing ``ci_verdict_summary_v2.py`` pattern):
+Input is one already-fetched JSON document (no live network calls from this
+script -- the CI job that invokes it is responsible for the ``gh api`` call,
+matching the existing ``ci_verdict_summary_v2.py`` pattern):
 
   --check-runs-api-json   raw ``GET /repos/{owner}/{repo}/commits/{sha}/check-runs``
                            response body (the same file the ci-verdict-summary job
                            already produces as ``ci_verdict_summary_v2_check_runs.json``)
-  --codex-sentinel-json    the downloaded ``codex_execpolicy_matrix_status_v1.json``
-                           artifact content produced by the codex-execpolicy job
 
 Exit 0 = every required check name has a matching, current-head, SAME-RUN,
-successful check run AND the sentinel reports a terminal status bound to the
-same run. Exit 2 = any invariant violated (fail-closed). Exit 3 = operational
-failure (missing/unparseable input file, missing required CLI argument).
+successful check run. Exit 2 = any invariant violated (fail-closed). Exit 3 =
+operational failure (missing/unparseable input file, missing required CLI
+argument).
 """
 
 from __future__ import annotations
@@ -58,20 +54,17 @@ _CI_VERDICT_SUMMARY_V2_PATH = (
 REQUIRED_CHECK_NAMES = {
     "actionlint",
     "python-test-core",
-    "codex-execpolicy",
     "python-test",
     "node-backed-hook-tests",
 }
 
 ACCEPTABLE_CONCLUSIONS = {"success"}
 
-# codex-execpolicy is skipped (by its own `if:` condition) during a python_test_bench
-# workflow_dispatch run; a "skipped" conclusion for that ONE check name is acceptable
-# only when the caller explicitly declares bench mode (see --bench-mode).
-BENCH_MODE_SKIPPABLE = {"codex-execpolicy"}
-
-SENTINEL_TERMINAL_STATUSES = {"completed"}
-SENTINEL_SCHEMA = "codex_execpolicy_matrix_status_v1"
+# Issue #2161: codex-execpolicy (the sole BENCH_MODE_SKIPPABLE check name) was
+# removed with native Codex CLI retirement, so no required check name is
+# currently bench-mode-skippable. --bench-mode is retained as an accepted CLI
+# flag for call-site compatibility; it no longer changes verification outcome.
+BENCH_MODE_SKIPPABLE: set[str] = set()
 
 
 class OperationalError(RuntimeError):
@@ -106,7 +99,6 @@ def _load_ci_verdict_summary_v2_module() -> ModuleType:
 def verify(
     *,
     check_runs_payload: Any,
-    sentinel_payload: Any,
     expected_head_sha: str,
     workflow_run_id: int,
     workflow_run_attempt: int | None,
@@ -176,52 +168,6 @@ def verify(
             + ")"
         )
 
-    sentinel_status = None
-    sentinel_schema = None
-    sentinel_run_id = None
-    sentinel_run_attempt = None
-    sentinel_exit_code = None
-    if isinstance(sentinel_payload, dict):
-        sentinel_status = sentinel_payload.get("status")
-        sentinel_schema = sentinel_payload.get("schema")
-        sentinel_run_id = sentinel_payload.get("run_id")
-        sentinel_run_attempt = sentinel_payload.get("run_attempt")
-        sentinel_exit_code = sentinel_payload.get("exit_code")
-
-    if not bench_mode:
-        # In bench mode codex-execpolicy never ran, so no sentinel is expected.
-        if sentinel_schema != SENTINEL_SCHEMA:
-            violations.append(
-                f"AC9/AC6: sentinel schema={sentinel_schema!r} (expected {SENTINEL_SCHEMA!r})"
-            )
-        if sentinel_status not in SENTINEL_TERMINAL_STATUSES:
-            violations.append(
-                f"AC9/AC6: codex_execpolicy_matrix_status_v1.json status={sentinel_status!r} "
-                f"(expected one of {sorted(SENTINEL_TERMINAL_STATUSES)})"
-            )
-        # run_id / run_attempt binding: the sentinel is produced by the SAME
-        # codex-execpolicy job invocation as the check-run evidence above, so its
-        # own declared run_id/run_attempt must match this verification's run.
-        if sentinel_run_id is not None and str(sentinel_run_id) != str(workflow_run_id):
-            violations.append(
-                f"AC9/AC6: sentinel run_id={sentinel_run_id!r} does not match "
-                f"workflow_run_id={workflow_run_id!r}"
-            )
-        if (
-            workflow_run_attempt is not None
-            and sentinel_run_attempt is not None
-            and str(sentinel_run_attempt) != str(workflow_run_attempt)
-        ):
-            violations.append(
-                f"AC9/AC6: sentinel run_attempt={sentinel_run_attempt!r} does not match "
-                f"workflow_run_attempt={workflow_run_attempt!r}"
-            )
-        if sentinel_status == "completed" and sentinel_exit_code != 0:
-            violations.append(
-                f"AC9/AC6: sentinel status=='completed' but exit_code={sentinel_exit_code!r} "
-                "(expected 0)"
-            )
-
     ok = not violations
     return {
         "schema": SCHEMA,
@@ -231,10 +177,6 @@ def verify(
         "workflow_run_attempt": workflow_run_attempt,
         "bench_mode": bench_mode,
         "checks": checks_report,
-        "sentinel_status": sentinel_status,
-        "sentinel_run_id": sentinel_run_id,
-        "sentinel_run_attempt": sentinel_run_attempt,
-        "sentinel_exit_code": sentinel_exit_code,
         "violations": violations,
     }
 
@@ -242,13 +184,6 @@ def verify(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-runs-api-json", required=True, help="path to the fetched check-runs API JSON")
-    parser.add_argument(
-        "--codex-sentinel-json",
-        required=False,
-        default=None,
-        help="path to the downloaded codex_execpolicy_matrix_status_v1.json artifact "
-        "(omit only with --bench-mode)",
-    )
     parser.add_argument("--expected-head-sha", required=True, help="trusted head SHA to match check runs against")
     parser.add_argument(
         "--workflow-run-id",
@@ -270,18 +205,14 @@ def main(argv: list[str] | None = None) -> int:
         "--bench-mode",
         action="store_true",
         help="treat this as a python_test_bench workflow_dispatch run "
-        "(codex-execpolicy 'skipped' is acceptable; sentinel is not required)",
+        "(retained for call-site compatibility; no required check name is "
+        "currently bench-mode-skippable, see BENCH_MODE_SKIPPABLE)",
     )
     parser.add_argument("--output", default=None, help="optional path to also write the JSON report")
     args = parser.parse_args(argv)
 
     try:
         check_runs_payload = _load_json(Path(args.check_runs_api_json), label="check-runs-api-json")
-        sentinel_payload: Any = None
-        if args.codex_sentinel_json is not None:
-            sentinel_payload = _load_json(Path(args.codex_sentinel_json), label="codex-sentinel-json")
-        elif not args.bench_mode:
-            raise OperationalError("--codex-sentinel-json is required unless --bench-mode is set")
     except OperationalError as exc:
         print(json.dumps({"schema": SCHEMA, "ok": False, "operational_error": str(exc)}, indent=2))
         return 3
@@ -289,7 +220,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         report = verify(
             check_runs_payload=check_runs_payload,
-            sentinel_payload=sentinel_payload,
             expected_head_sha=args.expected_head_sha,
             workflow_run_id=args.workflow_run_id,
             workflow_run_attempt=args.workflow_run_attempt,

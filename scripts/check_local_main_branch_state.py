@@ -26,10 +26,9 @@ Output (--json):
     }
   }
 
-Codex startup preflight requirement:
-  This script MUST be run before beginning implementation work in a Codex session.
+Startup preflight requirement:
+  This script MUST be run before beginning implementation work.
   If it exits non-zero, the agent MUST NOT proceed with implementation.
-  Documented in .codex/rules/default.rules.
 """
 
 from __future__ import annotations

@@ -11,6 +11,10 @@ Issue #1824 P1-2 review adds negative fixtures for each documented bypass:
   3. python-test-plan.json never loaded/cross-checked
   4. a local composite action hiding a Node bootstrap
   5. verifier invocation (job/argv/single-occurrence/if/continue-on-error) fixed
+
+Issue #2161 (native Codex CLI retirement): the former codex-execpolicy job and
+its AC4/AC6 invariants (sentinel-before-matrix ordering, dedicated Node/Codex
+CLI lane) were removed along with the job; this suite was updated accordingly.
 """
 
 from __future__ import annotations
@@ -38,25 +42,6 @@ def mod():
     return _load_module()
 
 
-_SENTINEL_STEP = (
-    "      - name: Create codex-execpolicy sentinel artifact (AC6)\n"
-    "        run: |\n"
-    "          python3 - <<'PY'\n"
-    "          import pathlib\n"
-    "          pathlib.Path(\n"
-    '              "codex_execpolicy_artifacts/codex_execpolicy_matrix_status_v1.json"\n'
-    "          ).write_text(\n"
-    "              '{\"status\": \"started\"}'\n"
-    "          )\n"
-    "          PY\n"
-)
-_MATRIX_STEP = (
-    "      - name: codex execpolicy + cleanup-route matrix (timed)\n"
-    "        run: |\n"
-    "          python3 scripts/ci/codex_execpolicy_matrix.py \\\n"
-    "            --artifact codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json\n"
-    "          uv run --locked pytest tests/codex/test_local_main_branch_guard.py\n"
-)
 _VERIFIER_STEP_NAME = "      - name: Verify python-test lane topology invariants (#1760)\n"
 _VERIFIER_STEP_RUN = (
     "        run: uv run --locked python scripts/ci/verify_python_test_lane.py "
@@ -75,7 +60,6 @@ _AGGREGATE_STEP = (
     "        run: |\n"
     "          uv run --locked python3 scripts/ci/evaluate_python_test_aggregate.py "
     '--core-result "${{ needs.python-test-core.result }}" '
-    '--codex-result "${{ needs.codex-execpolicy.result }}" '
     '--bench-mode "${{ github.event.inputs.python_test_bench }}"\n'
 )
 
@@ -90,24 +74,9 @@ _BASELINE = (
     "      - uses: actions/checkout@v6\n"
     + _PYTEST_STEP
     + _VERIFIER_STEP
-    + "  codex-execpolicy:\n"
+    + "  python-test:\n"
     "    runs-on: ubuntu-latest\n"
-    "    steps:\n"
-    "      - uses: actions/checkout@v6\n"
-    "      - uses: actions/setup-node@v6\n"
-    "        with:\n"
-    '          node-version: "22"\n'
-    + _SENTINEL_STEP
-    + _MATRIX_STEP
-    + "      - name: Upload codex execpolicy artifacts\n"
-    "        if: ${{ always() }}\n"
-    "        uses: actions/upload-artifact@v7\n"
-    "        with:\n"
-    "          name: codex-execpolicy-${{ github.run_attempt }}\n"
-    "          path: codex_execpolicy_artifacts/\n"
-    "  python-test:\n"
-    "    runs-on: ubuntu-latest\n"
-    "    needs: [python-test-core, codex-execpolicy]\n"
+    "    needs: [python-test-core]\n"
     "    if: always()\n"
     "    steps:\n"
     + _AGGREGATE_STEP
@@ -251,7 +220,7 @@ class TestAC3PlanExternalPytestInjection:
         assert any("hard-coded target/path token" in v for v in report["violations"])
 
 
-class TestAC1AC4AC5JobRemovalOrRelocation:
+class TestAC1AC5JobRemovalOrRelocation:
     def test_missing_python_test_core_job_is_rejected(self, mod, tmp_path):
         core_block = (
             "  python-test-core:\n"
@@ -267,18 +236,9 @@ class TestAC1AC4AC5JobRemovalOrRelocation:
         assert report["ok"] is False
         assert any("python-test-core is missing" in v for v in report["violations"])
 
-    def test_missing_codex_execpolicy_job_is_rejected(self, mod, tmp_path):
-        lines = _BASELINE.splitlines(keepends=True)
-        start = next(i for i, ln in enumerate(lines) if ln.startswith("  codex-execpolicy:"))
-        end = next(i for i, ln in enumerate(lines) if i > start and ln.startswith("  python-test:"))
-        mutated = "".join(lines[:start] + lines[end:])
-        report = mod.verify(_write(tmp_path, mutated))
-        assert report["ok"] is False
-        assert any("codex-execpolicy is missing" in v for v in report["violations"])
-
     def test_aggregate_needs_relocated_is_rejected(self, mod, tmp_path):
         mutated = _BASELINE.replace(
-            "needs: [python-test-core, codex-execpolicy]", "needs: [python-test-core]", 1
+            "needs: [python-test-core]", "needs: [python-test-core, some-other-job]", 1
         )
         report = mod.verify(_write(tmp_path, mutated))
         assert report["ok"] is False
@@ -286,34 +246,13 @@ class TestAC1AC4AC5JobRemovalOrRelocation:
 
     def test_aggregate_if_always_removed_is_rejected(self, mod, tmp_path):
         mutated = _BASELINE.replace(
-            "    needs: [python-test-core, codex-execpolicy]\n    if: always()\n",
-            "    needs: [python-test-core, codex-execpolicy]\n",
+            "    needs: [python-test-core]\n    if: always()\n",
+            "    needs: [python-test-core]\n",
             1,
         )
         report = mod.verify(_write(tmp_path, mutated))
         assert report["ok"] is False
         assert any("jobs.python-test.if" in v for v in report["violations"])
-
-
-class TestAC6SentinelOrdering:
-    def test_sentinel_after_matrix_is_rejected(self, mod, tmp_path):
-        assert _SENTINEL_STEP in _BASELINE and _MATRIX_STEP in _BASELINE
-        mutated = _BASELINE.replace(_SENTINEL_STEP, "", 1).replace(
-            _MATRIX_STEP, _MATRIX_STEP + _SENTINEL_STEP, 1
-        )
-        report = mod.verify(_write(tmp_path, mutated))
-        assert report["ok"] is False
-        assert any("BEFORE the matrix orchestrator" in v for v in report["violations"])
-
-    def test_upload_without_always_is_rejected(self, mod, tmp_path):
-        mutated = _BASELINE.replace(
-            "        if: ${{ always() }}\n        uses: actions/upload-artifact@v7\n",
-            "        if: ${{ success() }}\n        uses: actions/upload-artifact@v7\n",
-            1,
-        )
-        report = mod.verify(_write(tmp_path, mutated))
-        assert report["ok"] is False
-        assert any("if: ${{ always() }}" in v for v in report["violations"])
 
 
 class TestAC7VerifierDisablement:
@@ -349,8 +288,8 @@ class TestAC7VerifierDisablement:
         """P1-2 review point 5: the verifier must be wired in python-test-core,
         not merely somewhere in the workflow."""
         mutated = _BASELINE.replace(_VERIFIER_STEP, "", 1).replace(
-            "      - name: Upload codex execpolicy artifacts\n",
-            _VERIFIER_STEP + "      - name: Upload codex execpolicy artifacts\n",
+            _AGGREGATE_STEP,
+            _VERIFIER_STEP + _AGGREGATE_STEP,
             1,
         )
         report = mod.verify(_write(tmp_path, mutated))
@@ -414,7 +353,6 @@ class TestAC10AggregatePolicyInvocation:
             "        run: |\n"
             "          uv run --locked python3 scripts/ci/evaluate_python_test_aggregate.py "
             '--core-result "${{ needs.python-test-core.result }}" '
-            '--codex-result "${{ needs.codex-execpolicy.result }}" '
             '--bench-mode "${{ github.event.inputs.python_test_bench }}"\n',
             1,
         )
@@ -493,6 +431,5 @@ class TestPositiveContractRealCiYml:
     def test_real_ci_yml_has_expected_job_topology(self, mod):
         jobs = mod.load_workflow(_REAL_CI_YML)["jobs"]
         assert "python-test-core" in jobs
-        assert "codex-execpolicy" in jobs
         assert "python-test" in jobs
-        assert jobs["python-test"]["needs"] == ["python-test-core", "codex-execpolicy"]
+        assert jobs["python-test"]["needs"] == ["python-test-core"]

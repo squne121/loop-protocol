@@ -3,7 +3,7 @@
 Covers:
 - AC1 (sub-requirement): permission-affecting frontmatter fields
   (tools:/disallowedTools:) must not silently drift from the checked-in
-  baseline captured in tests/fixtures/codex-agent-config/
+  baseline captured in tests/fixtures/agent-config/
   agent_permission_baseline.json.
 - AC2: every .claude/agents/*.md asset is uniquely classified
   (shared_claude_runtime / claude_only / experimental), zero unclassified
@@ -28,7 +28,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "scripts" / "check_claude_codex_agent_parity.py"
-FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "codex-agent-config"
+FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "agent-config"
 
 
 def _load_module():

@@ -492,48 +492,11 @@ def test_local_main_and_codex_flavors_keep_root_and_destructive_denies(tmp_path,
     assert force_push_result["status"] == "block"
 
 
-_REPO_ROOT = _GUARDS_DIR.parent.parent
-_DEFAULT_RULES = _REPO_ROOT / ".codex" / "rules" / "default.rules"
-_CODEX_BIN = None
-for _candidate_dir in os.environ.get("PATH", "").split(os.pathsep):
-    _candidate = os.path.join(_candidate_dir, "codex")
-    if os.path.isfile(_candidate) and os.access(_candidate, os.X_OK):
-        _CODEX_BIN = _candidate
-        break
-
-
-def _execpolicy_decision(argv_tail):
-    result = subprocess.run(
-        [_CODEX_BIN, "execpolicy", "check", "--rules", str(_DEFAULT_RULES), "--"] + argv_tail,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=True,
-    )
-    import json as _json
-    return _json.loads(result.stdout).get("decision", "no_match")
-
-
-# P1 Blocker regression: the dedicated executor invocation shape must
-# resolve to allow, and every rtk git merge shape (with or without --ff-only,
-# with malformed suffixes, or wrapped in a shell) must stay at prompt --
-# never allow, since only the dedicated executor performs its own
-# authorization before the trusted transaction.
-@pytest.mark.skipif(_CODEX_BIN is None, reason="codex CLI not available in this environment")
-def test_codex_execpolicy_allows_only_the_dedicated_executor_shape():
-    valid_sha = "8" * 40
-    allow_argv = [
-        "uv", "run", "--locked", "--no-sync", "python3",
-        "scripts/agent-ops/verified_ff_merge_exec.py", "--target-sha", valid_sha,
-    ]
-    assert _execpolicy_decision(allow_argv) == "allow"
-
-    prompt_cases = [
-        ["rtk", "git", "merge", "--ff-only", valid_sha],
-        ["rtk", "git", "merge", "--ff-only", valid_sha.upper()],
-        ["rtk", "git", "merge", "--ff-only", valid_sha, "--no-edit"],
-        ["rtk", "git", "merge", "feature-branch"],
-        ["bash", "-c", "rtk git merge --ff-only " + valid_sha],
-    ]
-    for argv_tail in prompt_cases:
-        assert _execpolicy_decision(argv_tail) != "allow", argv_tail
+# Issue #2161 (native Codex CLI retirement): removed the real-`codex`-binary
+# execpolicy smoke test that lived here
+# (test_codex_execpolicy_allows_only_the_dedicated_executor_shape), which
+# shelled out to the native Codex CLI's `execpolicy check` against the
+# repository's default.rules file (both now deleted). The dedicated-executor
+# authorization behavior itself
+# is a pure, provider-neutral Python function and remains covered by the
+# other tests in this file.

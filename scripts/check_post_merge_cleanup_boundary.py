@@ -582,7 +582,7 @@ def check_agent_parity_strict(repo_root: Path = REPO_ROOT) -> ValidationResult:
     check_claude_codex_agent_parity.py), under which
     post-merge-cleanup-worker is now intentionally classified
     shared_claude_runtime in
-    tests/fixtures/codex-agent-config/expected-runtime-contract.json and is
+    tests/fixtures/agent-config/expected-runtime-contract.json and is
     therefore validated like any other shared Claude-runtime agent -- this
     is a deliberate, documented design change, not a regression.
 

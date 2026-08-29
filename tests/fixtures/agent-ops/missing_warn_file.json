@@ -2,5 +2,5 @@
   "description": "Fixture for testing missing expected file (warn level) detection",
   "scenario": "missing_warn",
   "expected_status": "warn",
-  "expected_warn_path": "tests/fixtures/codex-agent-config/expected-runtime-contract.json"
+  "expected_warn_path": "tests/fixtures/agent-config/expected-runtime-contract.json"
 }

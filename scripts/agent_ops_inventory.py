@@ -29,7 +29,7 @@ from typing import NamedTuple, Optional
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTATION_PATH = REPO_ROOT / "tests/fixtures/codex-agent-config/expected-runtime-contract.json"
+EXPECTATION_PATH = REPO_ROOT / "tests/fixtures/agent-config/expected-runtime-contract.json"
 
 # stdout budget for compact plan / EVIDENCE lines (AC1).
 STDOUT_BUDGET_BYTES = 2048
@@ -97,7 +97,7 @@ OPS_REVIEW_INVENTORY_PROFILE = InventoryProfile(
         ".claude/skills/",
         ".claude/hooks/",
         ".claude/rules/",
-        "tests/fixtures/codex-agent-config/",
+        "tests/fixtures/agent-config/",
     ),
     coverage_targets=(
         CoverageTarget(".claude/agents/", "dir", empty_ok=False),
@@ -106,13 +106,13 @@ OPS_REVIEW_INVENTORY_PROFILE = InventoryProfile(
         CoverageTarget(".claude/skills/", "dir", empty_ok=False),
         CoverageTarget(".agents/skills/", "dir", empty_ok=False),
         CoverageTarget(
-            "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+            "tests/fixtures/agent-config/expected-runtime-contract.json",
             "file",
             empty_ok=False,
         ),
     ),
     expected_paths=(
-        "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+        "tests/fixtures/agent-config/expected-runtime-contract.json",
         ".claude/settings.json",
     ),
     critical_surface_source="codex_runtime_contract",
@@ -198,7 +198,7 @@ PLAN_REGISTRY: dict[str, PlanSpec] = {
     "agent-ops-review": PlanSpec(
         task_kind="agent-ops-review",
         must_read=[
-            "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+            "tests/fixtures/agent-config/expected-runtime-contract.json",
             "scripts/check_claude_codex_agent_parity.py",
         ],
         do_not_read_initial_only=[
@@ -415,7 +415,7 @@ def classify_path_kind(path: str) -> str:
         return "claude_settings"
     if path.startswith(".claude/agents/"):
         return "claude_agent_definition"
-    if path.startswith("tests/fixtures/codex-agent-config/"):
+    if path.startswith("tests/fixtures/agent-config/"):
         return "codex_agent_fixture"
     if path.endswith(".toml"):
         return "agent_definition"
@@ -428,7 +428,7 @@ def _coverage_target_matches(target: CoverageTarget, path: str) -> bool:
     """File targets match by exact equality; directory targets by prefix.
 
     This prevents a file target like
-    tests/fixtures/codex-agent-config/expected-runtime-contract.json from being
+    tests/fixtures/agent-config/expected-runtime-contract.json from being
     falsely satisfied by a sibling such as ...expected-runtime-contract.json.bak
     (BLOCKER 5).
     """
