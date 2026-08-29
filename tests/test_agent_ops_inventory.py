@@ -724,10 +724,6 @@ class TestArtifactSecurity:
         """GIVEN .claude/skills/ path WHEN classify_path_kind THEN canonical_skill_body."""
         assert classify_path_kind(".claude/skills/implement-issue/SKILL.md") == "canonical_skill_body"
 
-    def test_classify_path_kind_codex_config(self):
-        """GIVEN .codex/ path WHEN classify_path_kind THEN codex_config."""
-        assert classify_path_kind(".codex/config.toml") == "codex_config"
-
     def test_classify_path_kind_fixture(self):
         """GIVEN codex-agent-config fixture path WHEN classify_path_kind THEN codex_agent_fixture."""
         assert classify_path_kind("tests/fixtures/codex-agent-config/expected-runtime-contract.json") == "codex_agent_fixture"

@@ -253,18 +253,6 @@ class TestIssueRefinementOpsReviewCoverage:
         ]
         assert len(skill_items) > 0, "Expected .claude/skills/ items in inventory"
 
-    def test_inventory_for_issue_refinement_ops_review_has_codex_agents(self):
-        """GIVEN issue-refinement-ops-review inventory WHEN items inspected THEN .codex/ included."""
-        tracked = get_tracked_paths_decoded(REPO_ROOT)
-        inventory = build_agent_ops_inventory(REPO_ROOT, tracked, task_kind="issue-refinement-ops-review")
-        codex_items = [
-            it for it in inventory["items"]
-            if it["path"].startswith(".codex/")
-        ]
-        # Codex config is optional but if present should be in inventory
-        if codex_items:
-            assert len(codex_items) > 0
-
     def test_inventory_for_issue_refinement_ops_review_has_fixture(self):
         """GIVEN issue-refinement-ops-review inventory WHEN items inspected THEN expected-runtime-contract.json included."""
         tracked = get_tracked_paths_decoded(REPO_ROOT)
@@ -291,7 +279,6 @@ class TestIssueRefinementOpsReviewCoverage:
             ".claude/hooks/",
             ".claude/skills/",
             ".agents/skills/",
-            ".codex/agents/",
             "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
         }
         coverage_prefixes = {entry["prefix"] for entry in artifact["coverage"]}
@@ -540,14 +527,13 @@ class TestIssueRefinementOpsReviewSecurity:
             f"file target must match exactly, .bak must not inflate count: {entry}"
         )
 
-    def test_security_codex_agents_toml_classified_as_codex_agent_definition(self):
-        """GIVEN a .codex/agents/*.toml path WHEN classified THEN codex_agent_definition,
-        not generic codex_config (MAJOR 1)."""
-        assert classify_path_kind(".codex/agents/issue-creator.toml") == "codex_agent_definition"
-        assert classify_path_kind(".codex/agents/issue-editor.toml") == "codex_agent_definition"
+    def test_security_claude_agents_md_classified_as_claude_agent_definition(self):
+        """GIVEN a .claude/agents/*.md path WHEN classified THEN claude_agent_definition
+        (Issue #2161: native Codex CLI retired; the former codex_agent_definition /
+        codex_config classification branches were removed along with the retired
+        native Codex CLI config directory)."""
         assert classify_path_kind(".claude/agents/issue-reviewer.md") == "claude_agent_definition"
-        # Non-agent codex config still classifies as codex_config.
-        assert classify_path_kind(".codex/config.toml") == "codex_config"
+        assert classify_path_kind(".claude/agents/issue-creator.md") == "claude_agent_definition"
 
     def test_security_invalid_contract_json_is_blocked_not_traceback(self, tmp_path):
         """GIVEN a corrupt expected-runtime-contract.json WHEN surfaces loaded THEN a
