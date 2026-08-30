@@ -2837,15 +2837,20 @@ _DENIED_GH_MUTATING_ACTION_TOKENS = frozenset(
     }
 )
 #: standalone head commands (outside `git`/`gh`) allowed under the
-#: read-only investigation profile -- hashing/inspection coreutils needed to
-#: independently verify `REPO_EVIDENCE_REF_V1` byte content, plus the
-#: interpreter/launcher used for the AGY canonical builder (its own
-#: filesystem writes remain denied via the pre-existing `Write` tool
-#: denial -- this allowlist only governs whether the Bash *invocation
-#: attempt* itself is permitted).
-_READ_ONLY_INVESTIGATION_HEAD_COMMANDS = frozenset(
-    {"sha256sum", "sha1sum", "wc", "head", "tail", "cat", "ls", "find", "python3", "uv"}
-)
+#: read-only investigation profile -- ONLY hashing/inspection coreutils that
+#: cannot themselves execute arbitrary further commands. `find` (its `-exec`
+#: /`-execdir`/`-ok`/`-okdir` actions run an arbitrary command, unrelated to
+#: its head token) and `python3`/`uv` (a heredoc, stdin script, or script
+#: FILE argument can execute arbitrary code -- including a nested `git
+#: merge` via `subprocess`/`os.system` -- with no `-c` flag for
+#: `_DENIED_INLINE_EXEC_FLAGS` to catch) are deliberately EXCLUDED: PR #2425
+#: review found both allow the Issue #2419 incident's exact `git merge`
+#: class to execute completely undetected once the guard treats their head
+#: token as unconditionally trusted. No standalone interpreter/launcher is
+#: allowed in this profile for that reason -- a genuinely required AGY
+#: canonical builder invocation is denied here (fail-closed) rather than
+#: risk it.
+_READ_ONLY_INVESTIGATION_HEAD_COMMANDS = frozenset({"sha256sum", "sha1sum", "wc", "head", "tail", "cat", "ls"})
 
 _DENIED_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Agent", "Skill"})
 

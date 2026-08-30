@@ -76,6 +76,19 @@ def _run_hook(command: str) -> dict:
         # what the substituted command itself would resolve to.
         "echo $(git merge stale-feature)",
         "echo `git merge stale-feature`",
+        # PR #2425 review fix_delta (P0 bypass found in this Issue's own
+        # fix): `find -exec` runs an arbitrary command that a head-token
+        # allowlist never inspects.
+        "find . -maxdepth 1 -exec git merge stale-feature ;",
+        "find . -maxdepth 1 -execdir git commit -m x \\;",
+        # PR #2425 review fix_delta: a bare interpreter/launcher head token
+        # (no `-c` flag) executing a heredoc, stdin script, or script FILE
+        # can shell out to a nested git mutation with nothing in the outer
+        # command line for a static token scan to catch.
+        "python3 script_that_merges.py",
+        "python3 - <<'EOF'\nimport os\nos.system('git merge stale-feature')\nEOF",
+        "uv run python3 script_that_merges.py",
+        "uv run --locked python3 script_that_merges.py",
     ],
 )
 def test_bash_guard_hook_denies_mutation(command: str) -> None:
