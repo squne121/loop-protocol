@@ -335,7 +335,9 @@ def _run_fixed_proposal_only_actual_wrapper_smoke(*, root: Path, fake_agy_bin: s
             }
         ),
         root=root,
-        test_wrapper_env_overlay={"AGY_BIN": fake_agy_bin},
+        test_wrapper_env_overlay={
+            "PATH": f"{Path(fake_agy_bin).parent}{os.pathsep}{os.environ.get('PATH', '')}",
+        },
         _test_profile="proposal_only",
     )
 

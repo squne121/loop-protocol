@@ -44,7 +44,7 @@ _SENTINEL = "AGY_ADVISORY_INVOCATION_REQUEST_V1"
 
 def _tracked_status() -> str:
     completed = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no"],
+        ["git", "status", "--porcelain"],
         cwd=_REPO_ROOT,
         capture_output=True,
         text=True,
@@ -85,7 +85,9 @@ def _exit_runtime_skip(*, reason: str, before: str) -> NoReturn:
 
 
 def _write_fake_agy(tmp_path: Path) -> Path:
-    fake = tmp_path / "fake-agy.py"
+    fake_directory = tmp_path / "fake-bin"
+    fake_directory.mkdir()
+    fake = fake_directory / "agy"
     fake.write_text(
         """#!/usr/bin/env python3
 import json
@@ -161,6 +163,7 @@ def test_actual_wrapper_fallback_reaches_real_native_sentinel(tmp_path: Path, mo
     controller_command = f"{driver} > {decision_path} 2> {sidecar_path}"
     monkeypatch.setenv("AGY_BIN", "/ambient/must-not-be-used")
     before = _tracked_status()
+    assert before == "", "AC8 runtime smoke requires a clean worktree"
 
     claude_bin = shutil.which("claude")
     if claude_bin is None:
@@ -176,10 +179,10 @@ controller decision only on stdout. Capture stdout and stderr separately exactly
 Use the Read tool separately on both resulting files. Do not accept a caller-supplied decision, raw wrapper result,
 or provenance. Only if the directly captured decision is exact `degraded` /
 `native_non_mutating_fallback`, the sidecar is empty, and the process exit is 0, perform
-bounded native read-only investigation of `.claude/agents/codebase-investigator.md`, find
-the literal sentinel `{_SENTINEL}`, and return concise CODEBASE_INVESTIGATION_RESULT_V1
-YAML whose `discovery_summary` contains that literal sentinel exactly. Do not invoke AGY
-separately, and do not use a mutation tool.
+bounded native read-only investigation of `.claude/agents/codebase-investigator.md`, find the literal
+controller request schema identifier there, and return concise CODEBASE_INVESTIGATION_RESULT_V1 YAML
+whose `discovery_summary` contains that identifier exactly. Do not invoke AGY separately, and do not
+use a mutation tool.
 """
     completed = subprocess.run(
         [
@@ -216,6 +219,9 @@ separately, and do not use a mutation tool.
         for tool in tools
         if tool["name"] == "Bash" and isinstance(tool["input"], dict)
     ]
+    assert bash_commands == [controller_command], (
+        "real codebase-investigator issued a Bash command outside the bounded controller invocation"
+    )
     assert completed.returncode == 0, completed.stderr[-2000:]
     assert decision_path.is_file()
     assert sidecar_path.is_file()
@@ -233,18 +239,28 @@ separately, and do not use a mutation tool.
     assert fake_evidence.is_file()
     fake_invocation = json.loads(fake_evidence.read_text(encoding="utf-8"))
     assert "-p" in fake_invocation["argv"]
-    assert fake_invocation["agy_bin"] == str(fake)
+    assert fake_invocation["agy_bin"] is None
     assert any(str(driver) in command for command in bash_commands), (
         "real codebase-investigator did not invoke the test-only controller driver"
     )
-    read_paths = {
-        str(tool["input"].get("file_path", ""))
-        for tool in tools
+    read_indices = {
+        str(tool["input"].get("file_path", "")): index
+        for index, tool in enumerate(tools)
         if tool["name"] == "Read" and isinstance(tool["input"], dict)
     }
-    assert {str(decision_path), str(sidecar_path)} <= read_paths, (
-        "real codebase-investigator did not separately consume controller stdout/stderr captures"
+    source_path = _REPO_ROOT / ".claude/agents/codebase-investigator.md"
+    assert {str(decision_path), str(sidecar_path), str(source_path)} <= read_indices.keys(), (
+        "real codebase-investigator did not consume controller captures then perform native source reading"
     )
+    driver_index = next(
+        index
+        for index, tool in enumerate(tools)
+        if tool["name"] == "Bash"
+        and isinstance(tool["input"], dict)
+        and tool["input"].get("command") == controller_command
+    )
+    assert driver_index < read_indices[str(decision_path)] < read_indices[str(source_path)]
+    assert driver_index < read_indices[str(sidecar_path)] < read_indices[str(source_path)]
     assert not [tool for tool in tools if tool["name"] in _MUTATING_TOOLS]
     assert before == _tracked_status(), "tracked worktree status changed during smoke"
     assert _SENTINEL in result, "real codebase-investigator did not reach native sentinel"
