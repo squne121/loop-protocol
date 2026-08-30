@@ -71,6 +71,11 @@ for _arg in "$@"; do
   _prev_arg="$_arg"
 done
 
+# --- Issue #2433: `--scenario issue_edit` mode ---
+# production launcher Auto → issue-editor → edit_issue_txn.py → controlled
+# Issue REST GET/PATCH/readback を fake provider だけで実プロセス検証する。
+ISSUE_EDIT_SCENARIO=false
+
 # --- Issue #2278 AC2-AC11: `--scenario issue_to_impl` mode + generalized
 # --scenario validation. AC11: an unknown --scenario value is rejected with
 # exit 2 immediately (before any evidence directory/file is created) and
@@ -141,9 +146,10 @@ done
 if [ -n "$SCENARIO_VALUE" ]; then
   case "$SCENARIO_VALUE" in
     issue_create) : ;;
+    issue_edit) ISSUE_EDIT_SCENARIO=true ;;
     issue_to_impl) ISSUE_TO_IMPL_SCENARIO=true ;;
     *)
-      echo "FAIL: unknown --scenario value '${SCENARIO_VALUE}' (known values: issue_create, issue_to_impl). Refusing to fall back to the default smoke scenario (Issue #2278 AC11)." >&2
+      echo "FAIL: unknown --scenario value '${SCENARIO_VALUE}' (known values: issue_create, issue_edit, issue_to_impl). Refusing to fall back to the default smoke scenario (Issue #2278 AC11)." >&2
       exit 2
       ;;
   esac
@@ -354,6 +360,326 @@ ISSUE_CREATE_READBACK_PY_EOF
     exit 0
   fi
   echo "FAIL: issue_create scenario が完走しませんでした（launch_exit_code=${ISSUE_CREATE_LAUNCH_RC}, readback=${ISSUE_CREATE_READBACK_JSON}）。証跡: ${ISSUE_CREATE_EVIDENCE_FILE}"
+  exit 1
+fi
+
+# --- Issue #2433: fake-provider-backed canonical issue edit transaction ---
+# This scenario intentionally uses the real launcher, Auto mode, issue-editor,
+# edit_issue_txn.py, and controlled executor. `sitecustomize` changes only the
+# test process's trusted-gh lookup; production code, PATH trust policy, and
+# credential carrier behavior remain unchanged.
+if [ "$ISSUE_EDIT_SCENARIO" = "true" ]; then
+  ISSUE_EDIT_EVIDENCE_FILE="${EVIDENCE_DIR}/issue-edit-scenario-${TIMESTAMP}.json"
+  ISSUE_EDIT_TXN_SHA256=$(claude_gpt_sha256_file "$SUT_REPO_ROOT/.claude/skills/edit-issue/scripts/edit_issue_txn.py")
+  ISSUE_EDIT_SESSION_ID="issue-edit-scenario-${TIMESTAMP}-$$"
+
+  ISSUE_EDIT_PREFLIGHT_JSON=$("$SCRIPT_DIR/preflight.sh" --env-only)
+  ISSUE_EDIT_PREFLIGHT_RC=$?
+  if [ "$ISSUE_EDIT_PREFLIGHT_RC" -eq 3 ] || [ "$ISSUE_EDIT_PREFLIGHT_RC" -eq 4 ]; then
+    ISSUE_EDIT_SKIP_REASON="binary_unavailable"
+    if [ "$ISSUE_EDIT_PREFLIGHT_RC" -eq 4 ]; then
+      ISSUE_EDIT_SKIP_REASON="chatgpt_subscription_auth_unavailable"
+    fi
+    printf '{"schema":"CLAUDE_GPT_ISSUE_EDIT_SCENARIO_RESULT_V1","status":"skip","reason":"%s","session_id":"%s","generated_at":"%s","sut":{"git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","edit_issue_txn_sha256":"%s"},"preflight_env_only":%s}\n' \
+      "$ISSUE_EDIT_SKIP_REASON" "$ISSUE_EDIT_SESSION_ID" "$TIMESTAMP" "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$ISSUE_EDIT_TXN_SHA256" "$ISSUE_EDIT_PREFLIGHT_JSON" > "$ISSUE_EDIT_EVIDENCE_FILE"
+    echo "SKIP: issue_edit scenario の実行環境が利用不能です（reason=${ISSUE_EDIT_SKIP_REASON}）。証跡: ${ISSUE_EDIT_EVIDENCE_FILE}"
+    exit 77
+  fi
+
+  FAKE_GH_FIXTURE="$SCRIPT_DIR/tests/fixtures/fake_gh.py"
+  if [ ! -f "$FAKE_GH_FIXTURE" ]; then
+    printf '{"schema":"CLAUDE_GPT_ISSUE_EDIT_SCENARIO_RESULT_V1","status":"fail","reason":"fake_gh_fixture_missing","session_id":"%s","generated_at":"%s"}\n' \
+      "$ISSUE_EDIT_SESSION_ID" "$TIMESTAMP" > "$ISSUE_EDIT_EVIDENCE_FILE"
+    echo "FAIL: fake gh fixture が見つかりません（${FAKE_GH_FIXTURE}）。証跡: ${ISSUE_EDIT_EVIDENCE_FILE}"
+    exit 1
+  fi
+
+  ISSUE_EDIT_WORKDIR=$(mktemp -d)
+  ISSUE_EDIT_FAKE_STATE="${ISSUE_EDIT_WORKDIR}/fake_gh_state.json"
+  ISSUE_EDIT_FAKE_SEED="${ISSUE_EDIT_WORKDIR}/fake_gh_seed.json"
+  ISSUE_EDIT_FAKE_BIN_DIR="${ISSUE_EDIT_WORKDIR}/fake-bin"
+  ISSUE_EDIT_SITE_DIR="${ISSUE_EDIT_WORKDIR}/site"
+  mkdir -p "$ISSUE_EDIT_FAKE_BIN_DIR" "$ISSUE_EDIT_SITE_DIR"
+  ISSUE_EDIT_FAKE_GH_BIN="${ISSUE_EDIT_FAKE_BIN_DIR}/gh"
+  cat > "$ISSUE_EDIT_FAKE_GH_BIN" <<FAKE_GH_WRAPPER_EOF
+#!/bin/sh
+exec python3 "$FAKE_GH_FIXTURE" "\$@"
+FAKE_GH_WRAPPER_EOF
+  chmod +x "$ISSUE_EDIT_FAKE_GH_BIN"
+
+  # The controlled executor deliberately searches trusted system paths. This
+  # test-only import hook intercepts exactly that lookup in its Python process;
+  # it is activated only by the scenario's explicit environment marker.
+  cat > "${ISSUE_EDIT_SITE_DIR}/sitecustomize.py" <<'ISSUE_EDIT_SITECUSTOMIZE_EOF'
+import os
+import shutil
+
+if os.environ.get("CLAUDE_GPT_ISSUE_EDIT_TEST_MODE") == "1":
+    _fake_gh = os.environ.get("CLAUDE_GPT_ISSUE_EDIT_TEST_GH_BIN", "")
+    _original_which = shutil.which
+
+    def _issue_edit_test_which(command, mode=os.F_OK | os.X_OK, path=None):
+        if (
+            command == "gh"
+            and path == "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+            and _fake_gh
+            and os.path.isfile(_fake_gh)
+            and os.access(_fake_gh, os.X_OK)
+        ):
+            return _fake_gh
+        return _original_which(command, mode=mode, path=path)
+
+    shutil.which = _issue_edit_test_which
+ISSUE_EDIT_SITECUSTOMIZE_EOF
+
+  ISSUE_EDIT_EXPECTED_REPO="squne121/loop-protocol"
+  ISSUE_EDIT_NUMBER="$(date +%s)$$"
+  ISSUE_EDIT_INITIAL_TITLE="claude-gpt issue-edit scenario initial title"
+  ISSUE_EDIT_INITIAL_BODY="## Outcome
+
+Initial fake-provider body."
+  ISSUE_EDIT_EXPECTED_BODY="## Machine-Readable Contract
+
+\`\`\`yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: \"none\"
+goal_ref: \"Prove the launcher-owned Auto permission permits only the canonical issue-editor transaction.\"
+change_kind: tooling
+\`\`\`
+
+## Parent Issue
+
+none
+
+## Parent Goal Ref
+
+- Goal: Ensure the fake provider is changed only through the canonical controlled transaction.
+
+## Current Validated Scope
+
+- This is an isolated fake-provider smoke contract.
+
+## Remaining Parent Gaps
+
+- No parent implementation dependency is modeled by this hermetic smoke.
+
+## Outcome
+
+The fake Issue body was updated only through the canonical controlled transaction.
+
+## Runtime Verification Applicability
+
+\`\`\`yaml
+decision: immediate
+reason: \"The launcher, Auto mode, and SubAgent execution must be observed as a real process.\"
+execution_environment: \"Claude-GPT launcher with a hermetic fake GitHub provider\"
+applicable_acs: [AC1]
+skip_conditions:
+  - \"Claude Code or the Claude-GPT proxy subscription is unavailable\"
+fallback_policy:
+  fallback_success_is_pass: false
+  notes: \"A skipped live smoke is not PASS.\"
+artifact_requirements:
+  - \"fake provider authoritative readback\"
+  - \"Subagent lifecycle event pair\"
+\`\`\`
+
+## In Scope
+
+- Canonical issue-editor transaction smoke only.
+
+## Out of Scope
+
+- Any real GitHub mutation.
+
+## Acceptance Criteria
+
+- [ ] AC1: The fake provider receives the requested body.
+
+## Verification Commands
+
+\`\`\`bash
+$ true  # AC1
+\`\`\`
+
+## Allowed Paths
+
+- scripts/claude-gpt/**
+
+## Stop Conditions
+
+- Allowed Paths 外の変更が必要と判明した場合
+- In Scope の固定契約（キー集合・スキーマ・型定義）の変更が必要になった場合
+- 新規 Issue の起票が必要と判断した場合（スコープ分割が発生する場合）
+- 後続 Phase / 別スコープへの波及が判明した場合
+- nested SubAgent delegation が必要になった場合
+- 外部サービス利用・権限昇格・既存テスト大規模改変が必要になった場合
+- Any real GitHub operation is attempted.
+
+## Required Skills
+
+- edit-issue
+
+## Required Design References
+
+- .claude/skills/edit-issue/SKILL.md
+
+## Delivery Rule
+
+- This fake-provider smoke does not create a pull request."
+  ISSUE_EDIT_EXPECTED_TITLE="$ISSUE_EDIT_INITIAL_TITLE"
+  ISSUE_EDIT_HOOK_NONCE="issue-edit-${TIMESTAMP}-$$"
+  ISSUE_EDIT_CLAUDE_GPT_HOME="${ISSUE_EDIT_WORKDIR}/claude-gpt-home"
+  ISSUE_EDIT_HOOK_SINK="${ISSUE_EDIT_CLAUDE_GPT_HOME}/state/hook-sink-${ISSUE_EDIT_HOOK_NONCE}.jsonl"
+
+  ISSUE_EDIT_SEED_STATE="$ISSUE_EDIT_FAKE_SEED" ISSUE_EDIT_NUMBER="$ISSUE_EDIT_NUMBER" \
+    ISSUE_EDIT_EXPECTED_REPO="$ISSUE_EDIT_EXPECTED_REPO" ISSUE_EDIT_INITIAL_TITLE="$ISSUE_EDIT_INITIAL_TITLE" \
+    ISSUE_EDIT_INITIAL_BODY="$ISSUE_EDIT_INITIAL_BODY" python3 <<'ISSUE_EDIT_SEED_PY_EOF'
+import json
+import os
+
+path = os.environ["ISSUE_EDIT_SEED_STATE"]
+number = os.environ["ISSUE_EDIT_NUMBER"]
+repo = os.environ["ISSUE_EDIT_EXPECTED_REPO"]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(
+        {
+            "next_number": int(number) + 1,
+            "issues": {
+                number: {
+                    "repo": repo,
+                    "title": os.environ["ISSUE_EDIT_INITIAL_TITLE"],
+                    "body": os.environ["ISSUE_EDIT_INITIAL_BODY"],
+                    "state": "open",
+                    "updatedAt": "2026-08-30T00:00:00Z",
+                    "url": f"https://github.com/{repo}/issues/{number}",
+                }
+            },
+            "calls": [],
+        },
+        fh,
+    )
+ISSUE_EDIT_SEED_PY_EOF
+
+  ISSUE_EDIT_PROMPT="Use the Task tool to invoke the issue-editor SubAgent (subagent_type: \"issue-editor\"). Update only the body of existing Issue #${ISSUE_EDIT_NUMBER} in repo \"${ISSUE_EDIT_EXPECTED_REPO}\" to exactly the following text. Follow the edit-issue controlled transaction procedure, do not create a comment, and do not perform any other GitHub operation. After the SubAgent finishes, report only: DONE
+
+${ISSUE_EDIT_EXPECTED_BODY}"
+  ISSUE_EDIT_STDERR_LOG="${ISSUE_EDIT_WORKDIR}/launch.stderr.log"
+  ISSUE_EDIT_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  ISSUE_EDIT_CLAUDE_OUTPUT=$(FAKE_GH_STATE="$ISSUE_EDIT_FAKE_STATE" FAKE_GH_SEED_ISSUES_PATH="$ISSUE_EDIT_FAKE_SEED" \
+    CLAUDE_GPT_HOME="$ISSUE_EDIT_CLAUDE_GPT_HOME" CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=hook-sink-multi-turn \
+    CLAUDE_GPT_HOOK_SINK_NONCE="$ISSUE_EDIT_HOOK_NONCE" \
+    CLAUDE_GPT_ISSUE_EDIT_TEST_MODE=1 CLAUDE_GPT_ISSUE_EDIT_TEST_GH_BIN="$ISSUE_EDIT_FAKE_GH_BIN" \
+    PYTHONPATH="${ISSUE_EDIT_SITE_DIR}${PYTHONPATH:+:$PYTHONPATH}" PATH="${ISSUE_EDIT_FAKE_BIN_DIR}:${PATH}" \
+    "$SCRIPT_DIR/launch.sh" -- -p "$ISSUE_EDIT_PROMPT" --output-format text --no-session-persistence \
+    2>"$ISSUE_EDIT_STDERR_LOG")
+  ISSUE_EDIT_LAUNCH_RC=$?
+  ISSUE_EDIT_END_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  ISSUE_EDIT_READBACK_JSON=$(FAKE_GH_STATE="$ISSUE_EDIT_FAKE_STATE" ISSUE_EDIT_HOOK_SINK="$ISSUE_EDIT_HOOK_SINK" \
+    ISSUE_EDIT_HOOK_NONCE="$ISSUE_EDIT_HOOK_NONCE" ISSUE_EDIT_NUMBER="$ISSUE_EDIT_NUMBER" \
+    ISSUE_EDIT_EXPECTED_REPO="$ISSUE_EDIT_EXPECTED_REPO" ISSUE_EDIT_EXPECTED_TITLE="$ISSUE_EDIT_EXPECTED_TITLE" \
+    ISSUE_EDIT_EXPECTED_BODY="$ISSUE_EDIT_EXPECTED_BODY" SUT_REPO_ROOT="$SUT_REPO_ROOT" python3 <<'ISSUE_EDIT_READBACK_PY_EOF'
+import glob
+import json
+import os
+
+result = {
+    "state_present": False,
+    "repo_match": False,
+    "title_match": False,
+    "body_match": False,
+    "patch_count": 0,
+    "content_get_count": 0,
+    "metadata_input_count": 0,
+    "subagent_lifecycle_ok": False,
+    "canonical_issue_editor_txn_count": 0,
+}
+state_path = os.environ["FAKE_GH_STATE"]
+number = os.environ["ISSUE_EDIT_NUMBER"]
+if os.path.exists(state_path):
+    result["state_present"] = True
+    with open(state_path, encoding="utf-8") as fh:
+        state = json.load(fh)
+    info = state.get("issues", {}).get(number, {})
+    result["repo_match"] = info.get("repo") == os.environ["ISSUE_EDIT_EXPECTED_REPO"]
+    result["title_match"] = info.get("title") == os.environ["ISSUE_EDIT_EXPECTED_TITLE"]
+    result["body_match"] = info.get("body") == os.environ["ISSUE_EDIT_EXPECTED_BODY"]
+    result["patch_count"] = state.get("issue_content_patch_count", 0)
+    result["content_get_count"] = sum(
+        1 for call in state.get("calls", []) if call.get("operation") == "issue_content_get"
+    )
+metadata_glob = os.path.join(
+    os.environ["SUT_REPO_ROOT"], "artifacts", number, "issue-metadata", "issue_content.update", "*.input.json"
+)
+result["metadata_input_count"] = len(glob.glob(metadata_glob))
+try:
+    with open(os.environ["ISSUE_EDIT_HOOK_SINK"], encoding="utf-8") as fh:
+        hook_records = [json.loads(line) for line in fh if line.strip()]
+except (OSError, json.JSONDecodeError):
+    hook_records = []
+starts = [
+    record for record in hook_records
+    if record.get("event") == "SubagentStart"
+    and record.get("run_nonce") == os.environ["ISSUE_EDIT_HOOK_NONCE"]
+    and record.get("agent_type") == "issue-editor"
+    and isinstance(record.get("agent_id"), str)
+    and record["agent_id"]
+]
+stops = [
+    record for record in hook_records
+    if record.get("event") == "SubagentStop"
+    and record.get("run_nonce") == os.environ["ISSUE_EDIT_HOOK_NONCE"]
+    and record.get("agent_type") == "issue-editor"
+    and isinstance(record.get("agent_id"), str)
+    and record["agent_id"]
+]
+result["subagent_lifecycle_ok"] = (
+    len(starts) == 1
+    and len(stops) == 1
+    and starts[0]["agent_id"] == stops[0]["agent_id"]
+)
+if result["subagent_lifecycle_ok"]:
+    result["canonical_issue_editor_txn_count"] = sum(
+        1
+        for record in hook_records
+        if record.get("event") == "PreToolUse"
+        and record.get("run_nonce") == os.environ["ISSUE_EDIT_HOOK_NONCE"]
+        and record.get("agent_id") == starts[0]["agent_id"]
+        and record.get("canonical_issue_editor_txn") is True
+    )
+result["matched"] = (
+    result["state_present"]
+    and result["repo_match"]
+    and result["title_match"]
+    and result["body_match"]
+    and result["patch_count"] == 1
+    and result["content_get_count"] >= 2
+    and result["metadata_input_count"] >= 1
+    and result["subagent_lifecycle_ok"]
+    and result["canonical_issue_editor_txn_count"] == 1
+)
+print(json.dumps(result))
+ISSUE_EDIT_READBACK_PY_EOF
+)
+  ISSUE_EDIT_MATCHED=$(printf '%s' "$ISSUE_EDIT_READBACK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["matched"])')
+  ISSUE_EDIT_STATUS="fail"
+  if [ "$ISSUE_EDIT_LAUNCH_RC" -eq 0 ] && [ "$ISSUE_EDIT_MATCHED" = "True" ]; then
+    ISSUE_EDIT_STATUS="pass"
+  fi
+
+  printf '{"schema":"CLAUDE_GPT_ISSUE_EDIT_SCENARIO_RESULT_V1","status":"%s","session_id":"%s","generated_at":"%s","started_at":"%s","completed_at":"%s","launch_exit_code":%s,"fake_provider":{"repository_id":"squne121/loop-protocol","issue_number":%s,"readback":%s},"sut":{"git_head":"%s","git_dirty":"%s","launch_sh_sha256":"%s","edit_issue_txn_sha256":"%s"}}\n' \
+    "$ISSUE_EDIT_STATUS" "$ISSUE_EDIT_SESSION_ID" "$TIMESTAMP" "$ISSUE_EDIT_START_TS" "$ISSUE_EDIT_END_TS" \
+    "$ISSUE_EDIT_LAUNCH_RC" "$ISSUE_EDIT_NUMBER" "$ISSUE_EDIT_READBACK_JSON" \
+    "$SUT_GIT_HEAD" "$SUT_GIT_DIRTY" "$SUT_LAUNCH_SH_SHA256" "$ISSUE_EDIT_TXN_SHA256" > "$ISSUE_EDIT_EVIDENCE_FILE"
+
+  rm -rf "$ISSUE_EDIT_WORKDIR"
+  if [ "$ISSUE_EDIT_STATUS" = "pass" ]; then
+    echo "PASS: issue_edit scenario -- Auto mode の issue-editor transaction が fake provider 経由で authoritative readback まで完走しました（issue_number=${ISSUE_EDIT_NUMBER}）。証跡: ${ISSUE_EDIT_EVIDENCE_FILE}"
+    exit 0
+  fi
+  echo "FAIL: issue_edit scenario が完走しませんでした（launch_exit_code=${ISSUE_EDIT_LAUNCH_RC}, readback=${ISSUE_EDIT_READBACK_JSON}）。証跡: ${ISSUE_EDIT_EVIDENCE_FILE}"
   exit 1
 fi
 

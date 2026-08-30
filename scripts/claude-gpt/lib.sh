@@ -215,6 +215,14 @@ CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL="claude-gpt launcher narrow enviro
 
 CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL="claude-gpt launcher narrow allow（second-gate 判断補助。authority ではない）: ${CLAUDE_GPT_TRUSTED_REPO} に repository 固定した GitHub mutation transaction broker（canonical builder/wrapper 経由、raw gh api を使わない）による Issue の read/create/edit/comment/close と、同一 repository の PR の read/create/edit/comment/review、および同一 repository への non-force task-branch push（force push・branch/tag/release 削除・repository settings/IAM/secret 変更は含まない）。加えて repository-owned canonical codebase-investigator -> gemini-cli-headless-delegation -> provider=agy の read-only isolated delegation（direct arbitrary agy 起動・provider!=agy・canonical builder/wrapper bypass・AGY からの GitHub mutation は対象外）。決定論的な authority は permissions.deny / PreToolUse hook / transaction broker が持ち、この allow rule はその second-gate 判断補助に過ぎない。"
 
+# Issue #2433: Auto mode では parent session の permission rules が SubAgent action
+# にも適用されるため、issue-editor の canonical outer transaction だけを launcher-
+# owned settings で事前許可する。末尾 wildcard は transaction input file だけを可変にし、
+# raw gh・controlled executor・他 skill script・任意の uv/python invocation は含めない。
+# downstream controlled transaction は repo / schema / pre-read / stale check / single PATCH /
+# readback を引き続き独立に検証する。
+CLAUDE_GPT_ISSUE_EDITOR_TXN_ALLOW_RULE="Bash(uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file *)"
+
 # hard_deny への追加分（P0-2, PR #2214 OWNER adversarial review 反映）。$defaults の
 # hard_deny を置換・削除せず、default branch push・force push・remote ref
 # deletion を明示的に追加する。これは defense-in-depth の second-gate 補強であり、
@@ -325,7 +333,8 @@ claude_gpt_auto_mode_readback() {
   python3 - "$version_tmp" "$version_rc" "$defaults_tmp" "$defaults_rc" "$config_tmp" "$config_rc" "$settings_path" \
     "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL" "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL" \
     "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL" "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL" \
-    "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL" "$CLAUDE_GPT_MIN_SUPPORTED_CLAUDE_VERSION" <<'PYEOF'
+    "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL" "$CLAUDE_GPT_MIN_SUPPORTED_CLAUDE_VERSION" \
+    "$CLAUDE_GPT_ISSUE_EDITOR_TXN_ALLOW_RULE" <<'PYEOF'
 import hashlib
 import json
 import re
@@ -345,7 +354,8 @@ import sys
     hard_deny_force_push_label,
     hard_deny_ref_deletion_label,
     min_supported_version,
-) = sys.argv[1:14]
+    issue_editor_txn_allow_rule,
+) = sys.argv[1:15]
 version_rc = int(version_rc)
 defaults_rc = int(defaults_rc)
 config_rc = int(config_rc)
@@ -388,6 +398,13 @@ else:
 
 defaults = None
 config = None
+settings = None
+
+try:
+    with open(settings_path, encoding="utf-8") as fh:
+        settings = json.load(fh)
+except (OSError, ValueError):
+    reasons.append("launcher_settings_unparsable")
 
 if defaults_rc != 0:
     reasons.append("auto_mode_defaults_command_failed")
@@ -407,6 +424,7 @@ else:
 
 env_label_present = False
 allow_label_present = False
+issue_editor_txn_allow_rule_present = False
 hard_deny_superset_ok = None
 soft_deny_unmodified = None
 classify_all_shell_ok = False
@@ -423,6 +441,12 @@ if defaults is not None and config is not None:
         reasons.append("environment_narrow_label_not_reflected")
     if not allow_label_present:
         reasons.append("allow_narrow_label_not_reflected")
+
+    permissions = settings.get("permissions") if isinstance(settings, dict) else None
+    configured_allow = permissions.get("allow") if isinstance(permissions, dict) else None
+    issue_editor_txn_allow_rule_present = configured_allow == [issue_editor_txn_allow_rule]
+    if not issue_editor_txn_allow_rule_present:
+        reasons.append("issue_editor_txn_allow_rule_missing_or_broadened")
 
     # hard_deny は $defaults を置換・削除せず、narrow な追加分（default branch
     # push / force push / ref deletion）だけを加える契約（P0-2）。defaults の
@@ -499,6 +523,7 @@ result = {
     "checks": {
         "environment_narrow_label_present": env_label_present,
         "allow_narrow_label_present": allow_label_present,
+        "issue_editor_txn_allow_rule_present": issue_editor_txn_allow_rule_present,
         "hard_deny_defaults_and_additions_present": bool(hard_deny_superset_ok),
         "soft_deny_unmodified": bool(soft_deny_unmodified),
         "classify_all_shell_enabled": classify_all_shell_ok,

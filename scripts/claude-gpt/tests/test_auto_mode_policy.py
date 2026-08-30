@@ -34,6 +34,10 @@ LIB_SH = SCRIPT_DIR / "lib.sh"
 LAUNCH_SH = SCRIPT_DIR / "launch.sh"
 PREFLIGHT_SH = SCRIPT_DIR / "preflight.sh"
 CANARY_PY = SCRIPT_DIR / "auto_mode_canary.py"
+ISSUE_EDITOR_TXN_ALLOW_RULE = (
+    "Bash(uv run --locked python3 "
+    ".claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file *)"
+)
 
 REAL_CLAUDE_BIN = shutil.which("claude")
 REAL_GH_BIN = shutil.which("gh")
@@ -58,6 +62,19 @@ def _run_sh_function(function_name: str, *args: str) -> subprocess.CompletedProc
     quoted_args = " ".join(f'"{arg}"' for arg in args)
     script = f'. "{LIB_SH}"; {function_name} {quoted_args}'
     return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=20)
+
+
+def _write_launcher_settings(settings_path: Path) -> None:
+    auto_mode = json.loads(_run_sh_function("claude_gpt_auto_mode_standalone_json").stdout)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "permissions": {"allow": [ISSUE_EDITOR_TXN_ALLOW_RULE]},
+                **auto_mode,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 # --- AC1: generated_settings_defaults ---------------------------------------
@@ -105,8 +122,7 @@ def test_generated_settings_defaults_readback_via_real_claude_cli(tmp_path):
     claude_config_dir = tmp_path / "claude-gpt-home" / "claude"
     claude_config_dir.mkdir(parents=True)
     settings_path = claude_config_dir / "settings.local.json"
-    fragment = _run_sh_function("claude_gpt_auto_mode_json_fragment").stdout.strip()
-    settings_path.write_text("{\n  " + fragment + "\n}\n", encoding="utf-8")
+    _write_launcher_settings(settings_path)
 
     result = subprocess.run(
         [str(PREFLIGHT_SH), "--auto-mode-check", str(settings_path)],
@@ -119,6 +135,7 @@ def test_generated_settings_defaults_readback_via_real_claude_cli(tmp_path):
     assert payload["ok"] is True, payload
     assert payload["checks"]["environment_narrow_label_present"] is True
     assert payload["checks"]["allow_narrow_label_present"] is True
+    assert payload["checks"]["issue_editor_txn_allow_rule_present"] is True
     assert payload["checks"]["hard_deny_defaults_and_additions_present"] is True
     assert payload["checks"]["soft_deny_unmodified"] is True
     assert payload["checks"]["classify_all_shell_enabled"] is True
@@ -171,8 +188,7 @@ sys.exit(1)
     claude_config_dir = tmp_path / "claude-gpt-home" / "claude"
     claude_config_dir.mkdir(parents=True)
     settings_path = claude_config_dir / "settings.local.json"
-    fragment = _run_sh_function("claude_gpt_auto_mode_json_fragment").stdout.strip()
-    settings_path.write_text("{\n  " + fragment + "\n}\n", encoding="utf-8")
+    _write_launcher_settings(settings_path)
 
     env = dict(os.environ)
     env["CLAUDE_GPT_CLAUDE_BIN"] = str(fake_claude)
@@ -188,6 +204,30 @@ sys.exit(1)
     assert payload["ok"] is False
     assert "claude_version_below_minimum_supported" in payload["fail_closed_reasons"]
     assert payload["claude_version"]["ok"] is False
+
+
+def test_auto_mode_readback_rejects_missing_or_broadened_transaction_allow_rule(tmp_path):
+    fake_claude = _write_executable(tmp_path / "fake-claude", FAKE_CLAUDE_SOURCE)
+    settings_path = tmp_path / "settings.local.json"
+    _write_launcher_settings(settings_path)
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    payload["permissions"]["allow"].append("Bash(uv run *)")
+    settings_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    env = dict(os.environ)
+    env["CLAUDE_GPT_CLAUDE_BIN"] = str(fake_claude)
+    result = subprocess.run(
+        [str(PREFLIGHT_SH), "--auto-mode-check", str(settings_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+
+    assert result.returncode == 8, result.stdout + result.stderr
+    result_payload = json.loads(result.stdout)
+    assert result_payload["checks"]["issue_editor_txn_allow_rule_present"] is False
+    assert "issue_editor_txn_allow_rule_missing_or_broadened" in result_payload["fail_closed_reasons"]
 
 
 # --- AC2: narrow_policy_scope -------------------------------------------------
@@ -436,6 +476,74 @@ def test_isolation_and_auto_mode_enforcement_settings_has_classify_all_shell_and
     assert payload["enabledPlugins"] == {}
     deny_rules = payload["permissions"]["deny"]
     assert any("proxy-config" in rule for rule in deny_rules)
+
+
+def test_launcher_settings_allow_only_canonical_issue_editor_transaction(tmp_path):
+    """Auto-mode allow は実際の issue-editor outer transaction 一件に限定する。"""
+    result = _run_launch(tmp_path, ["-p", "hello"])
+    assert result.returncode == 0, result.stderr
+    settings_path = tmp_path / "claude-gpt-home" / "claude" / "settings.local.json"
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    assert payload["permissions"]["allow"] == [
+        "Bash(uv run --locked python3 "
+        ".claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file *)"
+    ]
+    rendered = "\n".join(payload["permissions"]["allow"])
+    for forbidden in (
+        "Bash(*)",
+        "Bash(uv run *)",
+        "Bash(python",
+        "controlled_skill_mutation_exec.py",
+        "Bash(gh ",
+    ):
+        assert forbidden not in rendered
+
+
+def test_hook_sink_binds_only_canonical_transaction_without_command_leak(tmp_path):
+    source = LAUNCH_SH.read_text(encoding="utf-8")
+    start_marker = "HOOK_SINK_WRITER_EOF'\n"
+    start = source.index(start_marker) + len(start_marker)
+    end = source.index("HOOK_SINK_WRITER_EOF", start)
+    writer = tmp_path / "hook-sink-writer.py"
+    writer.write_text(source[start:end], encoding="utf-8")
+    sink_path = tmp_path / "sink.jsonl"
+
+    def invoke(command: str) -> dict:
+        env = dict(os.environ)
+        env["CLAUDE_GPT_HOOK_SINK_NONCE"] = "test-nonce"
+        env["CLAUDE_GPT_HOOK_SINK_PATH"] = str(sink_path)
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "agent_id": "agent-issue-editor",
+            "agent_type": "issue-editor",
+            "tool_input": {"command": command},
+        }
+        result = subprocess.run(
+            [sys.executable, str(writer)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        return json.loads(sink_path.read_text(encoding="utf-8").splitlines()[-1])
+
+    canonical = invoke(
+        "uv run --locked python3 "
+        ".claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file artifacts/1/input.json"
+    )
+    near_miss = invoke(
+        "uv run --locked python3 "
+        ".claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file artifacts/1/input.json --extra"
+    )
+
+    assert canonical["canonical_issue_editor_txn"] is True
+    assert near_miss["canonical_issue_editor_txn"] is False
+    assert "command" not in canonical
+    assert canonical["agent_id"] == "agent-issue-editor"
+    assert canonical["agent_type"] == "issue-editor"
 
 
 def test_forbidden_extra_flags_list_includes_permission_mode():
