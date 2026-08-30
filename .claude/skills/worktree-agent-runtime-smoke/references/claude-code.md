@@ -52,11 +52,11 @@ claude -p \
   **silent fallback せず exit 77（SKIP）** を返す
 - bounded timeout（`--timeout-seconds`）で fresh process を強制終了する
 
-## Invocation-local peer messaging policy（Issue #2437）
+## 呼び出しローカルのピアメッセージング方針（Issue #2437）
 
-The native harness supplies one fixed `--settings` JSON overlay for every
-structured invocation, retaining the `SubagentStart` / `SubagentStop`
-observability hooks and adding exactly:
+native harness は、すべての structured invocation に対して固定の `--settings` JSON
+overlay を 1 つ渡す。`SubagentStart` / `SubagentStop` の観測用 hook を維持したまま、
+次の設定だけを追加する:
 
 ```json
 {
@@ -65,17 +65,16 @@ observability hooks and adding exactly:
 }
 ```
 
-This is harness-owned process-local input, not a rewrite of global settings.
-`crossSessionInbound: "refuse"` is configuration evidence, not an inbound
-behavioral proof. Bare deny removes the outbound/listing tools, including
-post-spawn subagent/agent-team messaging; the supported lifecycle remains
-`Agent(...)` spawn through terminal completion. Tests use a controlled process
-that validates only its own settings/tool surface and never starts, lists,
-messages, or observes an independent peer.
+これは harness が所有するプロセスローカルの入力であり、global settings の書き換えではない。
+`crossSessionInbound: "refuse"` は設定上の証跡であって、inbound の振る舞いを証明するものではない。
+bare deny は、起動後の subagent/agent-team messaging を含む outbound/listing tools を除去する。
+サポート対象の lifecycle は、terminal completion までの `Agent(...)` spawn のままである。
+test は、独立した peer を start、list、message、observe せず、自身の settings/tool surface
+だけを検証する controlled process を使用する。
 
-The interactive lane uses Herdr's documented `agent start ... -- [AGENT_ARG]...`
-pass-through to forward this same fixed `--settings` overlay. It remains an
-isolated named Herdr session; structured execution remains a direct subprocess.
+interactive lane は、同じ固定 `--settings` overlay を forward するために Herdr の文書化された
+`agent start ... -- [AGENT_ARG]...` pass-through を使用する。これは isolated named Herdr session
+のままであり、structured execution は引き続き direct subprocess である。
 
 ## Interactive herdr lane（必要時のみ）
 
