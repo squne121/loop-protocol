@@ -220,7 +220,8 @@ use a mutation tool.
         if tool["name"] == "Bash" and isinstance(tool["input"], dict)
     ]
     assert bash_commands == [controller_command], (
-        "real codebase-investigator issued a Bash command outside the bounded controller invocation"
+        "real codebase-investigator issued a Bash command outside the bounded controller invocation: "
+        f"{bash_commands!r}"
     )
     assert completed.returncode == 0, completed.stderr[-2000:]
     assert decision_path.is_file()
