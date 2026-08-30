@@ -26,6 +26,7 @@
     ".claude/skills/issue-refinement-loop/scripts/tests/",
     ".claude/skills/issue-refinement-loop/tests/",
     ".claude/skills/agent-retrospective/scripts/tests/",
+    "plugins/agent-retrospective/skills/run/scripts/tests/",
     "docs/dev/tests/",
     "schemas/tests/",
     "tests/ci/",
