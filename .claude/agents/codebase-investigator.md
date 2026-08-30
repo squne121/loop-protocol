@@ -38,12 +38,12 @@ local asset 調査の caller は、nonempty repository-relative regular file の
 
 ### Legacy compatibility ingress（この SubAgent と issue-refinement-loop 呼び出し境界だけ）
 
-旧 `agy_advisory_native_fallback_allowed` は controller へ渡さない。requirement がある場合は legacy field がなければそのまま渡す。requirement がなく legacy が `true` なら `advisory`、`false` なら `explicitly_required`、両方がなければ `explicitly_required` にする。両方がある場合、legacy が boolean 以外の場合、または requirement が enum 以外の場合は fail-close する。legacy を受けた named pre-controller ingress は、変換後に old field を削除して exact request を作り、固定 `--precontroller-legacy-ingress` mode で controller へ渡す。この mode は adapter 専用であり、通常 controller stdin は legacy field を拒否する。
+旧 `agy_advisory_native_fallback_allowed` は controller へ渡さない。requirement がある場合は legacy field がなければそのまま渡す。requirement がなく legacy が `true` なら `advisory`、`false` なら `explicitly_required`、両方がなければ `explicitly_required` にする。両方がある場合、legacy が boolean 以外の場合、または requirement が enum 以外の場合は fail-close する。named `agent/issue-refinement-loop` pre-controller ingress は変換後に old field を削除して exact request を作る。controller の public stdin / CLI は legacy mode・flag・old key を受理しない。
 
 ## 振る舞い
 
 1. exact `AGY_ADVISORY_INVOCATION_REQUEST_V1` を組み立てる。public request は `schema`、`schema_version: 1`、`mode: codebase_local_asset`、`purpose`、`target_paths`、任意 `context_paths`、`agy_investigation_requirement` だけである。
-2. 通常の exact V1 request は `run_codebase_investigator_agy_advisory.py` を stdin request、stdout decision、stderr sidecar として起動する。legacy ingress だけは固定 `--precontroller-legacy-ingress` mode を使う。SubAgent は builder、wrapper、temporary output file を直接起動・読取りしない。
+2. named `agent/issue-refinement-loop` pre-controller ingress が exact V1 request を作った後、`run_codebase_investigator_agy_advisory.py` を stdin request、stdout decision、stderr sidecar として起動する。SubAgent は builder、wrapper、temporary output file を直接起動・読取りしない。
 3. stdout/stderr を別々に strict duplicate-key rejecting JSON として読む。exit 0 は exact `ok/continue_agy_result` + exact success sidecar、または exact `degraded/native_non_mutating_fallback` だけを受け入れる。exit 1 は exact `failed/fail_closed` だけ、exit 2・stream 欠落・余計な bytes・pairing 不整合は fail-close である。
 4. `ok` では sidecar の `response_text` を untrusted research content として結果整形にのみ使う。`degraded/native_non_mutating_fallback` のときだけ下記 native policy に進む。その他は failed として停止する。
 

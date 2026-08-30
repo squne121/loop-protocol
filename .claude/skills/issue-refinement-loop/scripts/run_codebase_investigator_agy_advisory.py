@@ -360,7 +360,7 @@ def _emit_controller_run(run: ControllerRun) -> int:
     return 0 if decision["status"] in {"ok", "degraded"} else 1
 
 
-def _run_stdin_controller(*, adapt_legacy_ingress: bool) -> int:
+def _run_stdin_controller() -> int:
     try:
         raw_request = sys.stdin.buffer.read(_MAX_REQUEST_BYTES + 1)
         if len(raw_request) > _MAX_REQUEST_BYTES:
@@ -369,24 +369,17 @@ def _run_stdin_controller(*, adapt_legacy_ingress: bool) -> int:
             request = strict_json_object_bytes(raw_request)
         except ProtocolError:
             return _emit_controller_run(_failed("controller_input_invalid"))
-        if adapt_legacy_ingress:
-            request = _adapt_precontroller_ingress_to_v1(request)
         return _emit_controller_run(_run_controller(request))
-    except ControllerInputError:
-        return _emit_controller_run(_failed("controller_input_invalid"))
     except Exception:
         # Transport/runtime failure emits no decision or sidecar by contract.
         return 2
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run exact V1 controller input, or the named pre-controller ingress."""
-    arguments = list(() if argv is None else argv)
-    if arguments == []:
-        return _run_stdin_controller(adapt_legacy_ingress=False)
-    if arguments == ["--precontroller-legacy-ingress"]:
-        return _run_stdin_controller(adapt_legacy_ingress=True)
-    return 2
+    """Run only the exact public V1 controller input surface."""
+    if list(() if argv is None else argv):
+        return 2
+    return _run_stdin_controller()
 
 
 if __name__ == "__main__":
