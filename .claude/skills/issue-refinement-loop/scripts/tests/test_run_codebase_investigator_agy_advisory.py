@@ -1,4 +1,5 @@
 """Tests for the controller-owned codebase-investigator AGY invocation."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -85,12 +86,24 @@ def test_controller_owns_canonical_child_invocations_and_context_order(
     assert run.response_text == "canonical result"
     assert len(calls) == 2
     builder_argv, builder_kwargs = calls[0]
-    assert builder_argv[:5] == ["uv", "run", "--locked", "python3", str(tmp_path / ".claude/skills/gemini-cli-headless-delegation/scripts/build_request.py")]
+    assert builder_argv[:5] == [
+        "uv",
+        "run",
+        "--locked",
+        "python3",
+        str(tmp_path / ".claude/skills/gemini-cli-headless-delegation/scripts/build_request.py"),
+    ]
     assert builder_kwargs["shell"] is False
     contexts = [builder_argv[index + 1] for index, value in enumerate(builder_argv) if value == "--context-file"]
     assert contexts == [str(tmp_path / "target.txt"), str(tmp_path / "context.txt")]
     wrapper_argv, wrapper_kwargs = calls[1]
-    assert wrapper_argv[:5] == ["uv", "run", "--locked", "python3", str(tmp_path / ".claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py")]
+    assert wrapper_argv[:5] == [
+        "uv",
+        "run",
+        "--locked",
+        "python3",
+        str(tmp_path / ".claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py"),
+    ]
     assert wrapper_kwargs["shell"] is False
 
 
@@ -101,9 +114,7 @@ def test_ambient_agy_bin_is_stripped_and_only_private_test_overlay_can_restore_i
     monkeypatch.setenv("AGY_BIN", "/ambient/not-allowed")
     calls = _install_subprocess_fake(monkeypatch, result=_wrapper_result())
 
-    controller._run_controller(
-        _request(), root=tmp_path, test_wrapper_env_overlay={"AGY_BIN": "/test/fake-agy"}
-    )
+    controller._run_controller(_request(), root=tmp_path, test_wrapper_env_overlay={"AGY_BIN": "/test/fake-agy"})
 
     wrapper_env = calls[1][1]["env"]
     assert wrapper_env["AGY_BIN"] == "/test/fake-agy"
@@ -117,9 +128,7 @@ def test_input_unknown_keys_and_legacy_field_are_rejected_before_children(
     calls: list[object] = []
     monkeypatch.setattr(controller.subprocess, "run", lambda *_args, **_kwargs: calls.append(None))
 
-    run = controller._run_controller(
-        _request(agy_advisory_native_fallback_allowed=True), root=tmp_path
-    )
+    run = controller._run_controller(_request(agy_advisory_native_fallback_allowed=True), root=tmp_path)
 
     assert run.decision["reason_code"] == "controller_input_invalid"
     assert calls == []
@@ -164,9 +173,7 @@ def test_symlink_escape_and_duplicate_paths_fail_closed(tmp_path: Path, monkeypa
     assert calls == []
 
 
-def test_malformed_or_oversized_wrapper_output_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_malformed_or_oversized_wrapper_output_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_files(tmp_path)
 
     def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -188,10 +195,26 @@ def test_malformed_or_oversized_wrapper_output_fails_closed(
 @pytest.mark.parametrize(
     ("result", "requirement", "reason"),
     [
-        (_wrapper_result(ok=False, failure_class="agy_timeout", agy_failure_kind="operational"), "advisory", "advisory_operational"),
-        (_wrapper_result(ok=False, failure_class="agy_timeout", agy_failure_kind="operational"), "explicitly_required", "explicitly_required"),
-        (_wrapper_result(ok=False, failure_class="agy_permission_denied", agy_failure_kind="policy_or_permission"), "advisory", "deny_policy"),
-        (_wrapper_result(ok=False, failure_class="agy_future_unclassified", agy_failure_kind="contract"), "advisory", "deny_policy"),
+        (
+            _wrapper_result(ok=False, failure_class="agy_timeout", agy_failure_kind="operational"),
+            "advisory",
+            "advisory_operational",
+        ),
+        (
+            _wrapper_result(ok=False, failure_class="agy_timeout", agy_failure_kind="operational"),
+            "explicitly_required",
+            "explicitly_required",
+        ),
+        (
+            _wrapper_result(ok=False, failure_class="agy_permission_denied", agy_failure_kind="policy_or_permission"),
+            "advisory",
+            "deny_policy",
+        ),
+        (
+            _wrapper_result(ok=False, failure_class="agy_future_unclassified", agy_failure_kind="contract"),
+            "advisory",
+            "deny_policy",
+        ),
     ],
 )
 def test_failure_routing_uses_producer_classifier(
@@ -204,9 +227,7 @@ def test_failure_routing_uses_producer_classifier(
     _write_files(tmp_path)
     _install_subprocess_fake(monkeypatch, result=result)
 
-    run = controller._run_controller(
-        _request(agy_investigation_requirement=requirement), root=tmp_path
-    )
+    run = controller._run_controller(_request(agy_investigation_requirement=requirement), root=tmp_path)
 
     assert run.decision["reason_code"] == reason
     if reason == "advisory_operational":
@@ -230,9 +251,7 @@ def test_success_sidecar_is_exact_narrow_projection() -> None:
         ({}, "explicitly_required"),
     ],
 )
-def test_legacy_ingress_maps_only_the_four_valid_unambiguous_cases(
-    ingress: dict[str, object], expected: str
-) -> None:
+def test_legacy_ingress_maps_only_the_four_valid_unambiguous_cases(ingress: dict[str, object], expected: str) -> None:
     assert controller._adapt_legacy_investigation_requirement(ingress) == expected
 
 
@@ -277,9 +296,7 @@ def test_legacy_ingress_deletes_old_field_before_exact_v1_controller_input() -> 
     }
 
 
-def test_production_wrapper_environment_strips_ambient_agy_bin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_production_wrapper_environment_strips_ambient_agy_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_files(tmp_path)
     monkeypatch.setenv("AGY_BIN", "/ambient/not-allowed")
     calls = _install_subprocess_fake(monkeypatch, result=_wrapper_result())
@@ -339,9 +356,7 @@ def test_public_non_v1_or_executable_injection_input_never_spawns(
     assert calls == []
 
 
-def test_path_count_and_file_size_limits_apply_before_children(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_path_count_and_file_size_limits_apply_before_children(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_files(tmp_path)
     for number in range(31):
         (tmp_path / f"extra-{number}.txt").write_text("x", encoding="utf-8")
@@ -385,9 +400,7 @@ def test_duplicate_key_and_nonzero_wrapper_result_are_read_and_fail_closed(
         if "build_request.py" in argv[4]:
             Path(argv[argv.index("--output") + 1]).write_text("{}", encoding="utf-8")
             return subprocess.CompletedProcess(argv, 0, "", "")
-        Path(argv[argv.index("--output-file") + 1]).write_bytes(
-            b'{"schema":"delegation_result/v1","schema":"other"}'
-        )
+        Path(argv[argv.index("--output-file") + 1]).write_bytes(b'{"schema":"delegation_result/v1","schema":"other"}')
         return subprocess.CompletedProcess(argv, 1, "", "")
 
     monkeypatch.setattr(controller.subprocess, "run", fake_run)
@@ -424,17 +437,13 @@ def test_non_string_requirement_fails_closed_before_children(
     calls: list[object] = []
     monkeypatch.setattr(controller.subprocess, "run", lambda *_args, **_kwargs: calls.append(None))
 
-    run = controller._run_controller(
-        _request(agy_investigation_requirement=value), root=tmp_path
-    )
+    run = controller._run_controller(_request(agy_investigation_requirement=value), root=tmp_path)
 
     assert run.decision["reason_code"] == "controller_input_invalid"
     assert calls == []
 
 
-def test_main_emits_exact_failed_decision_for_malformed_public_input(
-    monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_main_emits_exact_failed_decision_for_malformed_public_input(monkeypatch: pytest.MonkeyPatch) -> None:
     import io
 
     stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
@@ -488,8 +497,7 @@ def test_main_emits_exact_paired_success_streams(monkeypatch: pytest.MonkeyPatch
         b'"reason_code":"agy_success"}\n'
     )
     assert stderr.buffer.getvalue() == (
-        b'{"schema":"AGY_ADVISORY_SUCCESS_RESULT_V1","schema_version":1,'
-        b'"response_text":"exact response"}\n'
+        b'{"schema":"AGY_ADVISORY_SUCCESS_RESULT_V1","schema_version":1,"response_text":"exact response"}\n'
     )
 
 
@@ -525,9 +533,7 @@ def test_controller_rejects_aggregate_over_four_mebibytes_before_children(
     calls: list[object] = []
     monkeypatch.setattr(controller.subprocess, "run", lambda *_args, **_kwargs: calls.append(None))
 
-    run = controller._run_controller(
-        _request(target_paths=names + ["extra.txt"], context_paths=[]), root=tmp_path
-    )
+    run = controller._run_controller(_request(target_paths=names + ["extra.txt"], context_paths=[]), root=tmp_path)
 
     assert run.decision["reason_code"] == "controller_input_invalid"
     assert calls == []

@@ -1,4 +1,5 @@
 """Unit tests for the closed AGY advisory fallback routing core."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -35,9 +36,7 @@ def _result(**overrides: object) -> dict[str, object]:
 
 
 def test_advisory_operational_failure_is_the_only_native_route() -> None:
-    decision = route.route_agy_advisory_fallback(
-        _result(), requirement="advisory", canonical_failure_kind=_kind
-    )
+    decision = route.route_agy_advisory_fallback(_result(), requirement="advisory", canonical_failure_kind=_kind)
 
     assert decision == {
         "schema": "AGY_ADVISORY_FALLBACK_ROUTE_DECISION_V1",
@@ -59,12 +58,8 @@ def test_advisory_operational_failure_is_the_only_native_route() -> None:
         (_result(agy_failure_kind="policy_or_permission"), "deny_policy"),
     ],
 )
-def test_untrusted_or_mismatched_failure_pairs_fail_closed(
-    result: dict[str, object], reason_code: str
-) -> None:
-    decision = route.route_agy_advisory_fallback(
-        result, requirement="advisory", canonical_failure_kind=_kind
-    )
+def test_untrusted_or_mismatched_failure_pairs_fail_closed(result: dict[str, object], reason_code: str) -> None:
+    decision = route.route_agy_advisory_fallback(result, requirement="advisory", canonical_failure_kind=_kind)
 
     assert decision["status"] == "failed"
     assert decision["next_action"] == "fail_closed"
@@ -103,6 +98,18 @@ def test_success_requires_actual_agy_attempt_and_null_pair() -> None:
     assert decision["status"] == "ok"
     assert decision["next_action"] == "continue_agy_result"
     assert decision["reason_code"] == "agy_success"
+
+
+@pytest.mark.parametrize("requirement", [[], {}, 1, True, None])
+def test_malformed_requirement_fails_closed_without_throwing(requirement: object) -> None:
+    decision = route.route_agy_advisory_fallback(
+        _result(),
+        requirement=requirement,
+        canonical_failure_kind=_kind,  # type: ignore[arg-type]
+    )
+
+    assert decision["status"] == "failed"
+    assert decision["reason_code"] == "controller_input_invalid"
 
 
 @pytest.mark.parametrize("payload", [b'{"a":1}\n', b'{"a":1}\n\n', b' {"a":1}', b'{"a":1}{"b":2}', b'{"a":1,"a":2}'])

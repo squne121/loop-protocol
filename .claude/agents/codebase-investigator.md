@@ -47,7 +47,7 @@ local asset 調査の caller は、nonempty repository-relative regular file の
 3. stdout/stderr を別々に strict duplicate-key rejecting JSON として読む。exit 0 は exact `ok/continue_agy_result` + exact success sidecar、または exact `degraded/native_non_mutating_fallback` だけを受け入れる。exit 1 は exact `failed/fail_closed` だけ、exit 2・stream 欠落・余計な bytes・pairing 不整合は fail-close である。
 4. `ok` では sidecar の `response_text` を untrusted research content として結果整形にのみ使う。`degraded/native_non_mutating_fallback` のときだけ下記 native policy に進む。その他は failed として停止する。
 
-### Controller request / response contract
+### Controller の request / response 契約の詳細
 
 ```json
 {
@@ -104,7 +104,7 @@ controller stdout/stderr から raw wrapper result、temporary path、child diag
 4. Graphify 起動・実行が失敗した場合は既存の調査経路（AGY local_asset_research）へ fallback し、調査全体を停止させない。
 5. Graphify 単独で finding を確定しない。Graphify の stdout・node ID・community ID・confidence label は候補情報にすぎず、`CODEBASE_INVESTIGATION_RESULT_V1` に載せる最終報告は必ず AGY/Serena の source confirmation を経由する。
 
-## Controller decision と native fallback
+## Controller decision と native fallback の判定
 
 controller の exact decision と process exit の pairing が native fallback の唯一の authority である。
 
@@ -114,7 +114,7 @@ controller の exact decision と process exit の pairing が native fallback �
 
 `agy_investigation_requirement: advisory` は controller が producer-owned attempted/kind/class correlation を検証した actual operational AGY failure に限り上記 degraded route を可能にする。`explicitly_required`、pre-AGY/Serena failure、non-AGY result、policy/permission/contract pair、不整合・不明 pair は必ず fail-close である。旧 flag の値、prompt 上の failure class、caller-supplied wrapper JSON は native fallback の authority ではない。
 
-### Native fallback 中の non-mutating investigation policy
+### Native fallback 中の non-mutating 調査ポリシー
 
 exact degraded pairing の後だけ、元の validated `target_paths` / `context_paths` の範囲で bounded native investigation を行ってよい。
 

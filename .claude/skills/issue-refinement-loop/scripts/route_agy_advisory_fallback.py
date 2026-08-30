@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Pure routing core for controller-owned AGY advisory invocations."""
+
 from __future__ import annotations
 
 import json
@@ -13,16 +14,18 @@ _DECISION_STATUS_ACTIONS = {
     ("degraded", "native_non_mutating_fallback"),
     ("failed", "fail_closed"),
 }
-_DECISION_REASON_CODES = frozenset({
-    "controller_input_invalid",
-    "builder_failed",
-    "wrapper_result_invalid",
-    "deny_policy",
-    "explicitly_required",
-    "non_agy_or_pre_agy",
-    "agy_success",
-    "advisory_operational",
-})
+_DECISION_REASON_CODES = frozenset(
+    {
+        "controller_input_invalid",
+        "builder_failed",
+        "wrapper_result_invalid",
+        "deny_policy",
+        "explicitly_required",
+        "non_agy_or_pre_agy",
+        "agy_success",
+        "advisory_operational",
+    }
+)
 _FAILURE_KINDS = frozenset({"operational", "policy_or_permission", "contract"})
 
 
@@ -49,9 +52,7 @@ def strict_json_object_bytes(data: bytes) -> dict[str, Any]:
         value = json.loads(
             data.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                ProtocolError(f"invalid JSON constant: {value}")
-            ),
+            parse_constant=lambda value: (_ for _ in ()).throw(ProtocolError(f"invalid JSON constant: {value}")),
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProtocolError("invalid JSON stream") from exc
@@ -62,10 +63,7 @@ def strict_json_object_bytes(data: bytes) -> dict[str, Any]:
 
 def encode_closed_json(value: Mapping[str, Any]) -> bytes:
     """Encode one closed JSON object with the sole permitted trailing LF."""
-    return (
-        json.dumps(dict(value), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
-        + b"\n"
-    )
+    return json.dumps(dict(value), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
 
 
 def _decision(status: str, next_action: str, failure_class: str | None, reason_code: str) -> dict[str, Any]:
@@ -83,7 +81,11 @@ def validate_decision(value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the controller's intentionally narrow delivery protocol."""
     if set(value) != _DECISION_KEYS:
         raise ProtocolError("decision keys are not exact")
-    if value.get("schema") != _DECISION_SCHEMA or type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
+    if (
+        value.get("schema") != _DECISION_SCHEMA
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+    ):
         raise ProtocolError("decision schema mismatch")
     status = value.get("status")
     next_action = value.get("next_action")
@@ -111,9 +113,7 @@ def validate_decision(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ProtocolError("invalid decision failure_class")
     if status == "ok" and failure_class is not None:
         raise ProtocolError("ok decision requires null failure_class")
-    if status == "degraded" and (
-        not isinstance(failure_class, str) or not failure_class.startswith("agy_")
-    ):
+    if status == "degraded" and (not isinstance(failure_class, str) or not failure_class.startswith("agy_")):
         raise ProtocolError("degraded decision requires agy failure_class")
     return dict(value)
 
@@ -129,7 +129,7 @@ def route_agy_advisory_fallback(
     ``canonical_failure_kind`` is owned by the canonical producer. This core
     validates only the routing projection and never mirrors producer taxonomy.
     """
-    if requirement not in {"advisory", "explicitly_required"}:
+    if not isinstance(requirement, str) or requirement not in {"advisory", "explicitly_required"}:
         return _decision("failed", "fail_closed", None, "controller_input_invalid")
     if result.get("schema") != "delegation_result/v1":
         return _decision("failed", "fail_closed", None, "wrapper_result_invalid")

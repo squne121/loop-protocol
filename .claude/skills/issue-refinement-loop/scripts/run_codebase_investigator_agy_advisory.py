@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Controller-owned AGY advisory invocation for codebase-investigator."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -21,9 +22,16 @@ _MAX_SUCCESS_RESPONSE_BYTES = 256 * 1024
 _MAX_PATHS = 32
 _MAX_FILE_BYTES = 1024 * 1024
 _MAX_TOTAL_BYTES = 4 * 1024 * 1024
-_REQUIRED_REQUEST_KEYS = frozenset({
-    "schema", "schema_version", "mode", "purpose", "target_paths", "agy_investigation_requirement",
-})
+_REQUIRED_REQUEST_KEYS = frozenset(
+    {
+        "schema",
+        "schema_version",
+        "mode",
+        "purpose",
+        "target_paths",
+        "agy_investigation_requirement",
+    }
+)
 _OPTIONAL_REQUEST_KEYS = frozenset({"context_paths"})
 
 sys.path.insert(0, str(_SCRIPT_DIR))
@@ -94,11 +102,7 @@ def _adapt_precontroller_ingress_to_v1(ingress: Mapping[str, Any]) -> dict[str, 
     boundary executable without widening the public protocol.
     """
     requirement = _adapt_legacy_investigation_requirement(ingress)
-    adapted = {
-        key: value
-        for key, value in ingress.items()
-        if key != "agy_advisory_native_fallback_allowed"
-    }
+    adapted = {key: value for key, value in ingress.items() if key != "agy_advisory_native_fallback_allowed"}
     adapted["agy_investigation_requirement"] = requirement
     return adapted
 
@@ -137,7 +141,11 @@ def _validate_relative_file(raw: Any, *, root: Path) -> Path:
 def _validate_request(request: Mapping[str, Any], *, root: Path) -> tuple[str, list[Path], list[Path], str]:
     if not _REQUIRED_REQUEST_KEYS.issubset(request) or set(request) - (_REQUIRED_REQUEST_KEYS | _OPTIONAL_REQUEST_KEYS):
         raise ControllerInputError("request keys are not exact")
-    if request.get("schema") != "AGY_ADVISORY_INVOCATION_REQUEST_V1" or type(request.get("schema_version")) is not int or request.get("schema_version") != 1:
+    if (
+        request.get("schema") != "AGY_ADVISORY_INVOCATION_REQUEST_V1"
+        or type(request.get("schema_version")) is not int
+        or request.get("schema_version") != 1
+    ):
         raise ControllerInputError("request schema mismatch")
     if request.get("mode") != "codebase_local_asset":
         raise ControllerInputError("unsupported mode")
@@ -229,10 +237,19 @@ def _run_controller(
         builder = root / ".claude/skills/gemini-cli-headless-delegation/scripts/build_request.py"
         wrapper = root / ".claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py"
         builder_argv = [
-            "uv", "run", "--locked", "python3", str(builder), "--provider", "agy",
-            "--profile", profile, "--prompt",
+            "uv",
+            "run",
+            "--locked",
+            "python3",
+            str(builder),
+            "--provider",
+            "agy",
+            "--profile",
+            profile,
+            "--prompt",
             _prompt(purpose=purpose, root=root, targets=targets, contexts=contexts),
-            "--output", str(request_file),
+            "--output",
+            str(request_file),
         ]
         for path in targets + contexts:
             builder_argv.extend(["--context-file", str(path)])
@@ -257,10 +274,23 @@ def _run_controller(
         try:
             subprocess.run(
                 [
-                    "uv", "run", "--locked", "python3", str(wrapper), "--request-file", str(request_file),
-                    "--output-file", str(result_file),
+                    "uv",
+                    "run",
+                    "--locked",
+                    "python3",
+                    str(wrapper),
+                    "--request-file",
+                    str(request_file),
+                    "--output-file",
+                    str(result_file),
                 ],
-                cwd=root, env=wrapper_env, capture_output=True, text=True, timeout=360, shell=False, check=False,
+                cwd=root,
+                env=wrapper_env,
+                capture_output=True,
+                text=True,
+                timeout=360,
+                shell=False,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             raise RuntimeError("wrapper transport unavailable")
@@ -286,9 +316,7 @@ def _run_controller(
     return ControllerRun(decision, response_text)
 
 
-def _run_fixed_proposal_only_actual_wrapper_smoke(
-    *, root: Path, fake_agy_bin: str
-) -> ControllerRun:
+def _run_fixed_proposal_only_actual_wrapper_smoke(*, root: Path, fake_agy_bin: str) -> ControllerRun:
     """Test-only fixed driver for the sole actual-wrapper smoke.
 
     It cannot be selected through controller stdin and deliberately uses the
@@ -296,14 +324,16 @@ def _run_fixed_proposal_only_actual_wrapper_smoke(
     actual wrapper, exact readback, and decision core as production.
     """
     return _run_controller(
-        _adapt_precontroller_ingress_to_v1({
-            "schema": "AGY_ADVISORY_INVOCATION_REQUEST_V1",
-            "schema_version": 1,
-            "mode": "codebase_local_asset",
-            "purpose": "Verify the fixed non-mutating advisory fallback smoke.",
-            "target_paths": [".claude/agents/codebase-investigator.md"],
-            "agy_investigation_requirement": "advisory",
-        }),
+        _adapt_precontroller_ingress_to_v1(
+            {
+                "schema": "AGY_ADVISORY_INVOCATION_REQUEST_V1",
+                "schema_version": 1,
+                "mode": "codebase_local_asset",
+                "purpose": "Verify the fixed non-mutating advisory fallback smoke.",
+                "target_paths": [".claude/agents/codebase-investigator.md"],
+                "agy_investigation_requirement": "advisory",
+            }
+        ),
         root=root,
         test_wrapper_env_overlay={"AGY_BIN": fake_agy_bin},
         _test_profile="proposal_only",
@@ -311,11 +341,13 @@ def _run_fixed_proposal_only_actual_wrapper_smoke(
 
 
 def _success_sidecar(response_text: str) -> bytes:
-    return encode_closed_json({
-        "schema": "AGY_ADVISORY_SUCCESS_RESULT_V1",
-        "schema_version": 1,
-        "response_text": response_text,
-    })
+    return encode_closed_json(
+        {
+            "schema": "AGY_ADVISORY_SUCCESS_RESULT_V1",
+            "schema_version": 1,
+            "response_text": response_text,
+        }
+    )
 
 
 def main() -> int:

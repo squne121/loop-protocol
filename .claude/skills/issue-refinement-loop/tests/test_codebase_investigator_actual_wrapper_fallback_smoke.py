@@ -5,6 +5,7 @@ uses a test-owned AGY fake through the canonical builder and actual wrapper
 before a real codebase-investigator invocation reaches a native read-only
 sentinel. The worker does not execute this test.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -13,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,17 +37,43 @@ _UNAVAILABLE_MARKERS = (
     "Not authenticated",
     "invalid_grant",
     "command not found",
+    "unrecognized_model",
 )
 _SENTINEL = "AGY_ADVISORY_INVOCATION_REQUEST_V1"
 
 
 def _tracked_status() -> str:
     completed = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=_REPO_ROOT, capture_output=True,
-        text=True, timeout=30, check=False,
+        ["git", "status", "--porcelain"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
     )
     assert completed.returncode == 0
     return completed.stdout
+
+
+def _write_runtime_skip_evidence(reason: str) -> Path:
+    """Persist the contract-required, credential-free runtime SKIP reason."""
+    directory = _REPO_ROOT / ".claude/artifacts/issue-refinement-loop/2434"
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = directory / f"actual-wrapper-smoke-skip-{stamp}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "ISSUE_2434_RUNTIME_SMOKE_SKIP_V1",
+                "status": "skip",
+                "reason": reason,
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _write_fake_agy(tmp_path: Path) -> Path:
@@ -62,6 +90,33 @@ raise SystemExit(1)
     )
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
     return fake
+
+
+def _write_private_controller_driver(tmp_path: Path, fake_agy: Path) -> Path:
+    """Create the smoke-only caller process around the module-private seam."""
+    driver = tmp_path / "private-controller-driver.py"
+    driver.write_text(
+        f"""#!/usr/bin/env python3
+import importlib.util
+import sys
+from pathlib import Path
+
+controller_path = Path({str(_CONTROLLER_PATH)!r})
+spec = importlib.util.spec_from_file_location("issue_2434_private_smoke", controller_path)
+assert spec is not None and spec.loader is not None
+controller = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = controller
+spec.loader.exec_module(controller)
+run = controller._run_fixed_proposal_only_actual_wrapper_smoke(
+    root=Path({str(_REPO_ROOT)!r}), fake_agy_bin={str(fake_agy)!r}
+)
+sys.stdout.buffer.write(controller.encode_closed_json(run.decision))
+raise SystemExit(0 if run.decision["status"] in {{"ok", "degraded"}} else 1)
+""",
+        encoding="utf-8",
+    )
+    driver.chmod(driver.stat().st_mode | stat.S_IXUSR)
+    return driver
 
 
 def _stream_result(stdout: str) -> tuple[list[dict[str, Any]], str]:
@@ -81,21 +136,73 @@ def _stream_result(stdout: str) -> tuple[list[dict[str, Any]], str]:
     return tools, result
 
 
-def test_actual_wrapper_fallback_reaches_real_native_sentinel(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_actual_wrapper_fallback_reaches_real_native_sentinel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The test-runner-only smoke preserves exact controller ownership."""
     fake = _write_fake_agy(tmp_path)
+    driver = _write_private_controller_driver(tmp_path, fake)
+    decision_path = tmp_path / "controller-decision.json"
+    sidecar_path = tmp_path / "controller-sidecar.json"
+    controller_command = f"{driver} > {decision_path} 2> {sidecar_path}"
     monkeypatch.setenv("AGY_BIN", "/ambient/must-not-be-used")
     before = _tracked_status()
-    run = controller._run_fixed_proposal_only_actual_wrapper_smoke(
-        root=_REPO_ROOT, fake_agy_bin=str(fake)
-    )
 
-    fake_evidence = fake.with_suffix(".invoked")
-    assert fake_evidence.is_file()
-    assert "-p" in fake_evidence.read_text(encoding="utf-8")
-    assert run.decision == {
+    claude_bin = shutil.which("claude")
+    if claude_bin is None:
+        evidence = _write_runtime_skip_evidence("claude CLI not found on PATH")
+        pytest.skip(f"SKIP: claude CLI not found; evidence: {evidence}")
+    prompt = f"""Run the following exact **test-only private controller driver** once. It owns
+canonical builder → actual AGY wrapper → exact result readback and emits its closed
+controller decision only on stdout. Capture stdout and stderr separately exactly as shown:
+
+```bash
+{controller_command}
+```
+
+Read both resulting files. Do not accept a caller-supplied decision, raw wrapper result,
+or provenance. Only if the directly captured decision is exact `degraded` /
+`native_non_mutating_fallback`, the sidecar is empty, and the process exit is 0, perform
+bounded native read-only investigation of `.claude/agents/codebase-investigator.md`, find
+the literal sentinel `{_SENTINEL}`, and return concise CODEBASE_INVESTIGATION_RESULT_V1
+YAML. Do not invoke AGY separately, and do not use a mutation tool.
+"""
+    completed = subprocess.run(
+        [
+            claude_bin,
+            "-p",
+            "--agent",
+            "codebase-investigator",
+            "--output-format",
+            "stream-json",
+            "--include-hook-events",
+            "--no-session-persistence",
+            "--max-turns",
+            "8",
+            "--verbose",
+        ],
+        cwd=_REPO_ROOT,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    combined = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    unavailable = next((item for item in _UNAVAILABLE_MARKERS if item in combined), None)
+    if completed.returncode != 0 and unavailable is not None:
+        evidence = _write_runtime_skip_evidence(f"actual SubAgent runtime unavailable ({unavailable})")
+        pytest.skip(f"SKIP: actual SubAgent runtime unavailable ({unavailable}); evidence: {evidence}")
+
+    tools, result = _stream_result(completed.stdout or "")
+    bash_commands = [
+        str(tool["input"].get("command", ""))
+        for tool in tools
+        if tool["name"] == "Bash" and isinstance(tool["input"], dict)
+    ]
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    assert decision_path.is_file()
+    assert sidecar_path.is_file()
+    decision = controller.strict_json_object_bytes(decision_path.read_bytes())
+    assert controller.validate_decision(decision) == {
         "schema": "AGY_ADVISORY_FALLBACK_ROUTE_DECISION_V1",
         "schema_version": 1,
         "status": "degraded",
@@ -103,32 +210,13 @@ def test_actual_wrapper_fallback_reaches_real_native_sentinel(
         "failure_class": "agy_exit_nonzero",
         "reason_code": "advisory_operational",
     }
-    assert run.response_text is None
-
-    claude_bin = shutil.which("claude")
-    if claude_bin is None:
-        pytest.skip("SKIP: claude CLI not found; actual SubAgent runtime unavailable")
-    prompt = f"""Issue #2434's test-owned controller driver already emitted this exact decision:
-```json
-{json.dumps(run.decision, separators=(',', ':'))}
-```
-Consume only it. It is the exact degraded/native_non_mutating_fallback pairing.
-Perform bounded native read-only investigation of `.claude/agents/codebase-investigator.md`,
-find the literal sentinel `{_SENTINEL}`, and return concise CODEBASE_INVESTIGATION_RESULT_V1
-YAML. Do not invoke AGY, Bash, or any mutation tool.
-"""
-    completed = subprocess.run(
-        [claude_bin, "-p", "--agent", "codebase-investigator", "--output-format", "stream-json",
-         "--include-hook-events", "--no-session-persistence", "--max-turns", "8", "--verbose"],
-        cwd=_REPO_ROOT, input=prompt, capture_output=True, text=True, timeout=300, check=False,
+    assert sidecar_path.read_bytes() == b""
+    fake_evidence = fake.with_suffix(".invoked")
+    assert fake_evidence.is_file()
+    assert "-p" in fake_evidence.read_text(encoding="utf-8")
+    assert any(str(driver) in command for command in bash_commands), (
+        "real codebase-investigator did not invoke the test-only controller driver"
     )
-    combined = (completed.stdout or "") + "\n" + (completed.stderr or "")
-    unavailable = next((item for item in _UNAVAILABLE_MARKERS if item in combined), None)
-    if completed.returncode != 0 and unavailable is not None:
-        pytest.skip(f"SKIP: actual SubAgent runtime unavailable ({unavailable})")
-
-    tools, result = _stream_result(completed.stdout or "")
-    assert completed.returncode == 0, completed.stderr[-2000:]
     assert not [tool for tool in tools if tool["name"] in _MUTATING_TOOLS]
     assert before == _tracked_status(), "tracked worktree status changed during smoke"
     assert _SENTINEL in result, "real codebase-investigator did not reach native sentinel"
