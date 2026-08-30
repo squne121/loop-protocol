@@ -304,7 +304,8 @@ def _write_controlled_gh(trusted_bin: Path) -> None:
 
     It reads only GH_CONFIG_DIR presence plus equality with a test-owned
     expected path, then records an opaque match status and command order.  It
-    never opens configuration files or observes token/HOME values.
+    never opens configuration files or observes token/HOME values; non-empty
+    credential environment is rejected without recording its value.
     """
     trusted_bin.mkdir(parents=True)
     gh_path = trusted_bin / "gh"
@@ -316,15 +317,39 @@ if [ -n "${GH_CONFIG_DIR:-}" ] && [ "${GH_CONFIG_DIR}" = "${SKILL_RUNTIME_TEST_E
 else
     gh_config_state=missing_or_wrong_path
 fi
-case "$*" in
-    "auth status --active --hostname github.com") probe=gh-auth ;;
-    "repo view github.com/squne121/loop-protocol --json name") probe=gh-repo-view ;;
-    "api --hostname github.com repos/squne121/loop-protocol --jq {name}") probe=controlled-gh-api ;;
-    *)
-        printf '%s\n' "unexpected-gh-argv" >> "${SKILL_RUNTIME_TEST_GH_PROBE_LOG}"
-        exit 64
-        ;;
-esac
+if [ -n "${GH_TOKEN:-}" ] || \
+   [ -n "${GITHUB_TOKEN:-}" ] || \
+   [ -n "${GH_ENTERPRISE_TOKEN:-}" ] || \
+   [ -n "${GITHUB_ENTERPRISE_TOKEN:-}" ]; then
+    printf '%s\n' "unexpected-credential-environment" >> "${SKILL_RUNTIME_TEST_GH_PROBE_LOG}"
+    exit 65
+fi
+if [ "$#" -eq 5 ] && \
+   [ "$1" = "auth" ] && \
+   [ "$2" = "status" ] && \
+   [ "$3" = "--active" ] && \
+   [ "$4" = "--hostname" ] && \
+   [ "$5" = "github.com" ]; then
+    probe=gh-auth
+elif [ "$#" -eq 5 ] && \
+     [ "$1" = "repo" ] && \
+     [ "$2" = "view" ] && \
+     [ "$3" = "github.com/squne121/loop-protocol" ] && \
+     [ "$4" = "--json" ] && \
+     [ "$5" = "name" ]; then
+    probe=gh-repo-view
+elif [ "$#" -eq 6 ] && \
+     [ "$1" = "api" ] && \
+     [ "$2" = "--hostname" ] && \
+     [ "$3" = "github.com" ] && \
+     [ "$4" = "repos/squne121/loop-protocol" ] && \
+     [ "$5" = "--jq" ] && \
+     [ "$6" = "{name}" ]; then
+    probe=controlled-gh-api
+else
+    printf '%s\n' "unexpected-gh-argv" >> "${SKILL_RUNTIME_TEST_GH_PROBE_LOG}"
+    exit 64
+fi
 printf '%s\\n' "${probe}:gh_config=${gh_config_state}" >> "${SKILL_RUNTIME_TEST_GH_PROBE_LOG}"
 [ "${gh_config_state}" = "expected_path" ]
 """,
@@ -359,6 +384,10 @@ def test_canonical_executor_preserves_gh_config_dir_to_root_github_probes_before
             "GH_CONFIG_DIR": str(gh_config_dir),
             "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
             "SKILL_RUNTIME_TEST_GH_PROBE_LOG": str(probe_log),
+            "GH_TOKEN": "",
+            "GITHUB_TOKEN": "",
+            "GH_ENTERPRISE_TOKEN": "",
+            "GITHUB_ENTERPRISE_TOKEN": "",
             "LOOP_PLANNED_OPERATIONS_JSON": json.dumps(
                 [
                     {
