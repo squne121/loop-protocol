@@ -11,15 +11,29 @@ follow-up implementation Issue を作成しリンクする。
 ### 結果サマリ
 
 ```yaml
-result_status: parity_failed
+result_status: verified
 parity_verified: false
 tested_head: aade97858e348985081156afab134c317faac67f
 availability_probe: available
 deterministic_guard_matrix_passed: true
 claude_gpt_live_deny_passed: false
 claude_gpt_live_allow_passed: false
-nested_claude_proxy_transport_proven: false
+nested_claude_proxy_transport_proven: true
 ```
+
+> **Issue #2445 post-fix update**: `result_status` は `parity_failed` から
+> `verified` へ更新した（下記「Issue #2445 post-fix re-verification」参照）。
+> これは本セクションが特定した **`transport_routing_gap` capability gap
+> （nested claude invocation に Claude-GPT proxy routing 手段が存在しない
+> こと）が Issue #2445 の修正により解消し、live 動作検証で証明された**
+> ことを意味する。`claude_gpt_live_deny_passed` / `claude_gpt_live_allow_passed`
+> は本 Issue のスコープ外（transport routing gap とは別の、guard の
+> deny/allow 挙動そのものについての未検証の claim）であり、`false` のまま
+> 据え置く。これらを再検証する場合は、Issue #2436 の元の live deny/allow
+> canary（`test_run_retrospective_live_cli.py`）を、今回修正済みの
+> transport 経路上で改めて実行する必要がある（本 Issue #2445 のスコープ外、
+> 別途 follow-up として扱う）。したがって `parity_verified`（Claude-GPT /
+> Native Claude 間の完全な capability parity）も `false` のまま据え置く。
 
 - 検証日時（`timestamp`）: 2026-08-30（日本時間、セッション実施日）
 - 対象リポジトリ（`tested_repository`）: squne121/loop-protocol
@@ -169,6 +183,95 @@ credential）で行われていた可能性が高く、Claude-GPT lane の証拠
 ガード自体（AC1）にリグレッションは一切ない。これは guard/security の
 回帰ではなく、**production の nested-invocation adapter に Claude-GPT
 routing の実装が存在しない**という capability gap である。
+
+### Issue #2445 post-fix re-verification
+
+Issue #2445 は上記 `transport_routing_gap` の是正を実装した follow-up
+implementation Issue。修正内容（Allowed Paths: `run_retrospective.py` /
+新設 unit test / 新設 live verification script /
+本ファイルの `parity_failed` エントリ更新のみ）:
+
+- **AC1**: `DelegatedAgentPermissionPolicy.sanitize_subprocess_env()` /
+  `_default_sanitized_env()`（旧 `_ENV_PASSTHROUGH_ALLOWLIST`
+  allowlist-based semantics）を、`plugins/agent-retrospective/skills/run/scripts/run_retrospective.py`
+  の同名関数と同じ **denylist-based semantics**（`_MUTATION_CREDENTIAL_ENV_VARS`
+  のみ除外し、それ以外は親環境をそのまま継承）へ置き換えた。新しい
+  claude-gpt 専用 opt-in フラグは追加していない。
+- **AC2**: `.claude/skills/agent-retrospective/scripts/tests/test_sanitize_subprocess_env_regression.py`
+  を新設し、`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` /
+  `CLAUDE_CONFIG_DIR` / `CLAUDE_CODE_AUTO_COMPACT_WINDOW` /
+  `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK` /
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` 等の non-mutation env が
+  `invoke_agent()` の実 runner env まで到達すること、既存の
+  `_MUTATION_CREDENTIAL_ENV_VARS` は引き続き除外されることを、
+  `sanitize_subprocess_env()` と `_default_sanitized_env()` の両方について
+  回帰確認する（18 tests、うち `-k "default_sanitized_env"` で 13 tests）。
+- **AC3**: `.claude/skills/agent-retrospective/scripts/tests/verify_claude_gpt_transport_passthrough.sh`
+  を新設し、修正後の実装で PR 時の一回限りの live verification を実施した
+  （下記「AC3 live 実施結果」参照）。
+
+#### AC3 live 実施結果
+
+`scripts/claude-gpt/launch.sh` 経由で起動した outer live Claude-GPT
+セッション（実 ChatGPT subscription 認証）から、`run_retrospective.py` の
+production `invoke_agent()` 経由で `retrospective-runtime-observer`
+（frontmatter `model: haiku`）を呼び出す nested invocation を発火させた。
+Issue #2436 の反省（同一 Unix user 単位で共有される単一 proxy log による
+誤帰属）を踏まえ、**この検証専用の、この検証だけが排他的に所有する
+`claude-code-proxy` インスタンス**（`mktemp -d` の scratch `CLAUDE_GPT_HOME`。
+実プロファイルの ChatGPT credential のみをコピーして使う。transport log
+は実行前に存在しない = 空/新規作成であることを事前確認）を使い、既存の
+`scripts/claude-gpt/transport_log.py`（無変更、読み取り専用利用）でその
+scoped log を判定した。
+
+3 回の live trial すべてで PASS（exit 0）:
+
+```
+started_count: 5 (trial 1) / 5 (trial 2, retest) / 8 (trial 1 回目に発生した
+  model の bash 再実行込みの trial)
+haiku_alias_match_count (gpt-5.6-luna, 期待される haiku エイリアス): >= 1（毎回確認）
+observed_model_aliases: ["gpt-5.6-luna", "gpt-5.6-terra"] のみ
+  （gpt-5.6-terra は outer セッション自身の main エイリアス。他の未知
+  エイリアスは一度も観測されなかった）
+transport_log.py の transport_verdict.ok: true（毎回。malformed 行 0、
+  websocket/auto 0、reqId 相関済みの http /v1/messages 200 のみ）
+fallback_suspected: 該当なし（毎回 haiku エイリアス側の request が観測された）
+```
+
+`ANTHROPIC_BASE_URL` 等が nested claude subprocess まで実際に伝播し、実際に
+Claude-GPT proxy 経由で `/v1/messages` を叩いたことを、この nested
+invocation に排他的に帰属できるログ scope で証明した。よって
+`nested_claude_proxy_transport_proven: false` → **`true`** に更新する。
+
+#### AC4: 再実行手順（re-run procedure）
+
+本エントリの `verified` 判定を独立に再現する場合の手順:
+
+```bash
+# AC1
+uv run --locked pytest .claude/skills/agent-retrospective/scripts/tests/test_sanitize_subprocess_env_regression.py -q
+
+# AC2
+uv run --locked pytest .claude/skills/agent-retrospective/scripts/tests/test_sanitize_subprocess_env_regression.py -q -k "default_sanitized_env"
+
+# AC3 (実 ChatGPT subscription 認証が必要。利用不能な環境では exit 77 で SKIP)
+bash .claude/skills/agent-retrospective/scripts/tests/verify_claude_gpt_transport_passthrough.sh
+
+# AC4 (このエントリ自体の所在確認)
+rg -n "parity_failed|nested_claude_proxy_transport_proven" docs/dev/agent-capability-gaps.md
+```
+
+#### 未解決のまま残る事項（Out of Scope, follow-up 検討）
+
+`claude_gpt_live_deny_passed` / `claude_gpt_live_allow_passed`
+（guard 自体の deny/allow 挙動が Claude-GPT lane 経由でも成立することの
+独立証明）は、`transport_routing_gap` とは別個の未検証 claim であり、
+本 Issue #2445 のスコープ外（Issue 本文の Out of Scope: 「新しい security
+harness や claude-gpt-mode classifier の追加」「常設の CI required gate や
+permanent runtime-verification harness としての AC3 の恒久化」を除外して
+いるため、この2つの再検証は行っていない）。再検証する場合は Issue #2436 の
+元の live deny/allow canary（`test_run_retrospective_live_cli.py`）を、
+今回修正済みの transport 経路上で改めて実行する。
 
 ### Follow-up
 
