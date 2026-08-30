@@ -219,7 +219,11 @@ use a mutation tool.
         for tool in tools
         if tool["name"] == "Bash" and isinstance(tool["input"], dict)
     ]
-    assert bash_commands == [controller_command], (
+    controller_bash_commands = {
+        controller_command,
+        f"{controller_command}; status=$?; printf 'exit=%s\\n' \"$status\"",
+    }
+    assert len(bash_commands) == 1 and bash_commands[0] in controller_bash_commands, (
         "real codebase-investigator issued a Bash command outside the bounded controller invocation: "
         f"{bash_commands!r}"
     )
@@ -258,7 +262,7 @@ use a mutation tool.
         for index, tool in enumerate(tools)
         if tool["name"] == "Bash"
         and isinstance(tool["input"], dict)
-        and tool["input"].get("command") == controller_command
+        and tool["input"].get("command") in controller_bash_commands
     )
     assert driver_index < read_indices[str(decision_path)] < read_indices[str(source_path)]
     assert driver_index < read_indices[str(sidecar_path)] < read_indices[str(source_path)]
