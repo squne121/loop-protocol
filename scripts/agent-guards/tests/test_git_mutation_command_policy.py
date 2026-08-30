@@ -27,9 +27,6 @@ from git_mutation_command_policy import (
 )
 
 _GIT_MUTATION_POLICY_SCRIPT = _GUARDS_DIR / "git_mutation_command_policy.py"
-_CODEX_HOOK_ADAPTER_MJS = (
-    _GUARDS_DIR.parent.parent / "scripts" / "session-recording" / "codex-hook-adapter.mjs"
-)
 
 
 def _init_repo(repo: Path) -> None:
@@ -646,8 +643,8 @@ def _run_policy_cli(*args: str, cwd: Path, env: dict) -> subprocess.CompletedPro
 # ---------------------------------------------------------------------------
 
 def test_direct_cli_invalid_boundary_layer_does_not_execute(tmp_path: Path):
-    """A `--boundary-layer` value other than the two known trusted
-    PreToolUse-equivalent callers must never reach the real existing-branch
+    """A `--boundary-layer` value other than the one known trusted
+    PreToolUse-equivalent caller must never reach the real existing-branch
     push -- verified via the pre-receive push-counter fixture staying
     empty."""
     repo = tmp_path / "repo"
@@ -665,6 +662,39 @@ def test_direct_cli_invalid_boundary_layer_does_not_execute(tmp_path: Path):
         "--command", f"rtk git push origin HEAD:refs/heads/{branch}",
         "--cwd", str(repo),
         "--boundary-layer", "direct_terminal_no_hook",
+        "--execute-existing-branch-update",
+        "--publish-context-json", json.dumps(context),
+        cwd=repo, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "deny"
+    assert payload["reason_code"] == "execution_not_authorized_for_boundary_layer"
+    assert not counter.exists()
+
+
+def test_retired_codex_hook_adapter_boundary_layer_is_no_longer_authorized(tmp_path: Path):
+    """Issue #2412: the native Codex CLI hook adapter that used to pass
+    `--boundary-layer codex_hook_adapter_pretooluse` was retired along with
+    native Codex CLI runtime support (Issue #2161). That value must now be
+    rejected exactly like any other unknown/unauthorized boundary_layer --
+    it must never reach the real existing-branch push (verified via the
+    pre-receive push-counter fixture staying empty)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    branch = "worktree-issue-2412-retired-codex-boundary"
+    remote_head, local_head, remote, counter = _init_existing_branch_repo(repo, branch)
+    context = _valid_controlled_publish_context(head=local_head, remote_head=remote_head)
+    context["active_branch"] = branch
+
+    env = os.environ.copy()
+    env["CODEX_ALLOWED_PATHS"] = "tracked.txt\n"
+    env["LOOP_CANONICAL_REPO_URL_PATTERN"] = "^" + re.escape(str(remote)) + "$"
+
+    result = _run_policy_cli(
+        "--command", f"rtk git push origin HEAD:refs/heads/{branch}",
+        "--cwd", str(repo),
+        "--boundary-layer", "codex_hook_adapter_pretooluse",
         "--execute-existing-branch-update",
         "--publish-context-json", json.dumps(context),
         cwd=repo, env=env,
@@ -718,15 +748,6 @@ def test_direct_policy_cli_is_blocked_by_real_hook_chain(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # Issue #1688 fix delta P0 nested_timeout_mismatch
 # ---------------------------------------------------------------------------
-
-def test_passive_adapter_has_no_publish_transaction_deadline():
-    """Quarantined passive hooks must not retain a transaction timeout or
-    invoke the existing-branch publish transaction at all."""
-    source = _CODEX_HOOK_ADAPTER_MJS.read_text()
-    assert "EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS" not in source
-    assert "--execute-existing-branch-update" not in source
-    assert "git_mutation_command_policy.py" not in source
-
 
 def test_timeout_returns_structured_indeterminate_result(tmp_path: Path):
     """GIVEN the transaction's own deadline is already exhausted before the
