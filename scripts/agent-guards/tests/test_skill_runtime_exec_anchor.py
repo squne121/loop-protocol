@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import sys
@@ -333,6 +334,31 @@ def select_issue_worktree(catalog, issue_number, root_realpath):
     return None
 """,
     )
+    # Fixture-only isolated-home read boundary. The production wrapper selects
+    # this credentialless adapter before its authenticated transaction phase;
+    # it reads only local fake state and never opens GH_CONFIG_DIR.
+    _write_text(
+        repo_root / "scripts" / "agent-guards" / "github_credentialless_read.py",
+        """from __future__ import annotations
+
+import json
+from pathlib import Path
+
+
+class CredentiallessGitHubReadTransport:
+    def _artifact(self) -> Path:
+        return Path.cwd() / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+
+    def read_issue(self, repo: str, issue_number: int) -> dict:
+        return json.loads((self._artifact() / "fake_remote_issue.json").read_text(encoding="utf-8"))
+
+    def list_issue_comments(self, repo: str, issue_number: int) -> list[dict]:
+        return [json.loads((self._artifact() / "fake_anchor.json").read_text(encoding="utf-8"))]
+
+    def read_issue_comment(self, repo: str, comment_id: int) -> dict:
+        return json.loads((self._artifact() / "fake_anchor.json").read_text(encoding="utf-8"))
+""",
+    )
 
     # The transaction helper remains production code.  This fake is its
     # external controlled-executor boundary and mutates only the fixture's
@@ -402,10 +428,24 @@ def _fake_gh(args, *positional, **kwargs):
     state = artifact / "fake_remote_issue.json"
     anchor = artifact / "fake_anchor.json"
     calls = artifact / "fake_gh_calls.jsonl"
+    config_states = artifact / "fake_gh_config_states.jsonl"
     argv = [str(value) for value in args[1:]]
+    expected_config_dir = os.environ.get("SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR")
+    config_state = (
+        "expected_path"
+        if expected_config_dir and os.environ.get("GH_CONFIG_DIR") == expected_config_dir
+        else "missing_or_wrong_path"
+    )
+    if expected_config_dir and any(
+        os.environ.get(name)
+        for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+    ):
+        return subprocess.CompletedProcess(args, 2, "", "unexpected credential environment")
     calls.parent.mkdir(parents=True, exist_ok=True)
     with calls.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(argv) + "\\n")
+    with config_states.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(config_state) + "\\n")
     if argv[:2] == ["issue", "view"]:
         payload = json.loads(state.read_text(encoding="utf-8"))
     elif argv[:1] == ["api"] and argv[1].startswith(
@@ -634,7 +674,13 @@ def _run_executor(
     extra_env: "dict[str, str] | None" = None,
     use_fixture_runtime: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo)}
+    # Default fixture invocations model an ordinary account HOME. Individual
+    # isolated-HOME tests override this with their own temporary directory.
+    env = {
+        **os.environ,
+        "HOME": pwd.getpwuid(os.getuid()).pw_dir,
+        "CLAUDE_PROJECT_DIR": str(repo),
+    }
     if extra_env:
         env.update(extra_env)
     runtime = ["uv", "run", "--locked", "python3"] if use_fixture_runtime else [sys.executable]
@@ -762,9 +808,12 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
 
     This runs the real registry, policy, privileged executor,
     ``run_refinement_preflight.py``, planner, candidate readiness, review,
-    and ``edit_issue_txn.py`` in a temporary git repository. Only GitHub
-    and the controlled mutation executable are faked; no fixture replaces
-    the phase wrapper or changes the executor's production PATH trust.
+    and ``edit_issue_txn.py`` in a temporary git repository. It uses an
+    isolated HOME and test-owned config-only `GH_CONFIG_DIR`; the fake GitHub
+    boundary records only exact argv plus an opaque path-identity match.
+    Only GitHub and the controlled mutation executable are faked; no fixture
+    replaces the phase wrapper or changes the executor's production PATH
+    trust.
     """
     repo = _make_repo(tmp_path)
     _install_real_contract_update_fixture(repo)
@@ -774,6 +823,19 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     (repo / "tmp").mkdir()
     artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    gh_config_dir = tmp_path / "test-owned-gh-config"
+    gh_config_dir.mkdir()
+    config_only_env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": str(gh_config_dir),
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+    }
     immutable = json.loads(
         (
             REPO_ROOT
@@ -812,6 +874,7 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
         repo,
         command_id="contract_update.run.with_human_context",
         use_fixture_runtime=True,
+        extra_env=config_only_env,
     )
     # The controlled write reached final readback, but the post-update
     # contract review detects the deliberately incomplete new AC.  That is a
@@ -824,8 +887,14 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
         (artifact_dir / "fake_remote_issue.json").read_text()
     )["body"]
     calls = [json.loads(line) for line in (artifact_dir / "fake_gh_calls.jsonl").read_text().splitlines()]
-    assert calls.count(["api", "repos/squne121/loop-protocol/issues/comments/1"]) >= 2
-    assert sum(call[:2] == ["issue", "view"] for call in calls) >= 4
+    config_states = [
+        json.loads(line)
+        for line in (artifact_dir / "fake_gh_config_states.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert config_states
+    assert set(config_states) == {"expected_path"}
+    assert any(call[:2] == ["issue", "view"] for call in calls)
+    assert sum(call[:2] == ["issue", "view"] for call in calls) >= 2
     result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     assert result["contract_update"] == {
         "status": "failed",

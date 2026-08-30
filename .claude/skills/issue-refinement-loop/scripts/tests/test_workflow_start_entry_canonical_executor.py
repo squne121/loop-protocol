@@ -316,11 +316,14 @@ if [ -n "${GH_CONFIG_DIR:-}" ] && [ "${GH_CONFIG_DIR}" = "${SKILL_RUNTIME_TEST_E
 else
     gh_config_state=missing_or_wrong_path
 fi
-case "${1:-}" in
-    auth) probe=gh-auth ;;
-    repo) probe=gh-repo-view ;;
-    api) probe=controlled-gh-api ;;
-    *) probe=unexpected-gh-command ;;
+case "$*" in
+    "auth status --active --hostname github.com") probe=gh-auth ;;
+    "repo view github.com/squne121/loop-protocol --json name") probe=gh-repo-view ;;
+    "api --hostname github.com repos/squne121/loop-protocol --jq {name}") probe=controlled-gh-api ;;
+    *)
+        printf '%s\n' "unexpected-gh-argv" >> "${SKILL_RUNTIME_TEST_GH_PROBE_LOG}"
+        exit 64
+        ;;
 esac
 printf '%s\\n' "${probe}:gh_config=${gh_config_state}" >> "${SKILL_RUNTIME_TEST_GH_PROBE_LOG}"
 [ "${gh_config_state}" = "expected_path" ]
