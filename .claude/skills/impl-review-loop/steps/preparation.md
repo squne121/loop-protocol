@@ -393,9 +393,10 @@ REQUESTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ```
 
 **2. `scope-rollup-runner` を起動する**（`.claude/agents/scope-rollup-runner.md` 定義に従う。
-manual invocation 時は Codex は `.codex/agents/scope-rollup-runner.toml` を dispatch source とし、
-Claude source と混在させない。runner は nested delegation を行わず、exact executor 以外の
-mutation を行わない）:
+runner は nested delegation を行わず、exact executor 以外の mutation を行わない。
+Issue #2161（native Codex CLI retirement）以前は manual invocation 時に Codex 側 dispatch source
+（`.codex/agents/scope-rollup-runner.toml`）も存在したが、native Codex CLI 撤去に伴い削除され、
+現在は `.claude/agents/scope-rollup-runner.md` が唯一の dispatch source である）:
 
 以下の入力を渡して起動する:
 

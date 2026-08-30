@@ -430,16 +430,18 @@ raw `gh issue edit` / `gh issue comment` は `gh_mutation_denied` で block さ�
 
 ---
 
-## 4. agent 判断表（Codex CLI / Codex CLI 向け）
+## 4. agent 判断表（historical: native Codex CLI 向け）
 
-この manifest は Claude Code の `.claude/settings.json` hook topology を対象とする。Codex CLI については、この manifest から Claude Code と同等の event / output / exit-code parity を主張しない。Codex 側の制御は sandbox、approval、network policy、telemetry、および Codex 固有 hook 実装の検証で別途扱う。
+この manifest は Claude Code の `.claude/settings.json` hook topology を対象とする。native Codex CLI は
+Issue #2161 で repository から撤去済みであり、以下の表は native Codex CLI が存在していた当時
+（`.codex/hooks.json`、`Codex セッション`）の hook 判断を記録する historical/reference record として残す。
 
-| hook | Codex CLI での扱い |
+| hook | 旧 native Codex CLI での扱い（historical） |
 |---|---|
-| `secret_boundary_guard.sh` | この manifest の対象外。同等の制御は Codex 固有の policy / allowed-tools 設定で別途実装する必要がある |
-| `local_main_branch_guard.sh` | repo-controlled `.codex/hooks.json` は現在 `SessionEnd` / `SubagentStop` の passive advisory recorder のみを宣言している（Issue #1830 quarantine）。この guard を呼び出す PreToolUse / PermissionRequest 宣言は存在しない。branch-safety policy の authority は Agent/Skill-side behavioral contract にあり、startup preflight `check_local_main_branch_state.py` は Codex セッション開始前に必須実行する |
-| `guard-japanese-prose.sh` | この manifest の対象外（Claude Code のみ） |
-| その他 telemetry hooks | この manifest の対象外。Codex セッションでの telemetry 収集は Codex 固有実装に依存する |
+| `secret_boundary_guard.sh` | この manifest の対象外だった。同等の制御は Codex 固有の policy / allowed-tools 設定で別途実装する必要があった |
+| `local_main_branch_guard.sh` | repo-controlled `.codex/hooks.json` は撤去前、`SessionEnd` / `SubagentStop` の passive advisory recorder のみを宣言していた（Issue #1830 quarantine）。この guard を呼び出す PreToolUse / PermissionRequest 宣言は存在しなかった。branch-safety policy の authority は Agent/Skill-side behavioral contract にあり、startup preflight `check_local_main_branch_state.py` は Codex セッション開始前に必須実行する運用だった |
+| `guard-japanese-prose.sh` | この manifest の対象外だった（Claude Code のみ） |
+| その他 telemetry hooks | この manifest の対象外だった。Codex セッションでの telemetry 収集は Codex 固有実装に依存していた |
 
 ---
 

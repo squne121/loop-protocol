@@ -744,7 +744,6 @@ class TestSecuritySensitiveGate:
             ".github/dependabot.yml",
             ".github/CODEOWNERS",
             "docs/dev/secret-policy.md",
-            ".codex/agents/reviewer.md",
             ".claude/agents/implementation-worker.md",
         ],
     )

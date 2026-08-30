@@ -12,18 +12,13 @@ raw file) and asserts the topology contract introduced by Issue #1760:
     scans it: a Node bootstrap hiding behind a composite action (e.g.
     ``./.github/actions/setup-node-pnpm``) is rejected the same as a direct
     ``actions/setup-node`` usage (Issue #1824 P1-2 review point 4).
-  * ``jobs.codex-execpolicy`` exists and owns the Node/Codex CLI bootstrap and the
-    execpolicy matrix + ``tests/codex/test_local_main_branch_guard.py`` pytest
-    invocation -- AC4.
   * ``jobs.python-test`` (the required aggregate) is defined with
-    ``needs: [python-test-core, codex-execpolicy]`` and ``if: always()`` -- AC5, AND
+    ``needs: [python-test-core]`` and ``if: always()`` -- AC5, AND
     its policy step invokes ``scripts/ci/evaluate_python_test_aggregate.py`` with an
     EXACT, fixed argv (not merely a substring match on a literal string) -- Issue
     #1824 P1-1 review: a ``run:`` heredoc that merely CONTAINS the string
     ``python_test_bench_aggregate_policy`` (e.g. replaced with
     ``echo python_test_bench_aggregate_policy ok``) must be rejected.
-  * ``jobs.codex-execpolicy`` creates a sentinel status artifact step before the
-    matrix orchestrator step -- AC6.
   * No step in ``python-test-core`` invokes a pytest target/nodeid string that is
     not part of the plan-driven steps (i.e. no new hard-coded pytest execution was
     smuggled into python-test-core outside the python-test-plan.json SSOT) -- AC3.
@@ -37,6 +32,10 @@ raw file) and asserts the topology contract introduced by Issue #1760:
     EXACT command (full argv match, not a substring), appearing EXACTLY ONCE, with
     no ``if:`` condition and no ``continue-on-error: true`` -- AC7 (Issue #1824
     P1-2 review point 5).
+
+Issue #2161 (native Codex CLI retirement): the former ``jobs.codex-execpolicy``
+(AC4/AC6, the dedicated Node/Codex CLI lane and its sentinel-before-matrix
+invariant) was removed along with the job.
 
 This script never mutates ci.yml. Exit 0 = all invariants hold. Exit 2 = one or more
 invariants violated (fail-closed); the JSON report on stdout lists every violation.
@@ -107,8 +106,6 @@ EXPECTED_AGGREGATE_ARGV = [
     AGGREGATE_EVALUATOR_SCRIPT,
     "--core-result",
     "${{ needs.python-test-core.result }}",
-    "--codex-result",
-    "${{ needs.codex-execpolicy.result }}",
     "--bench-mode",
     "${{ github.event.inputs.python_test_bench }}",
 ]
@@ -387,75 +384,6 @@ def check_plan_is_loadable_and_referenced(
         )
 
 
-def check_codex_execpolicy_job(jobs: dict[str, Any], violations: list[str]) -> dict[str, Any] | None:
-    job = jobs.get("codex-execpolicy")
-    if not isinstance(job, dict):
-        violations.append("AC4: jobs.codex-execpolicy is missing")
-        return None
-    steps = _job_steps(job)
-    has_setup_node = any(
-        isinstance(step.get("uses"), str) and re.match(r"^actions/setup-node(@|$)", step["uses"])
-        for step in steps
-    )
-    if not has_setup_node:
-        violations.append("AC4: jobs.codex-execpolicy does not set up Node (actions/setup-node)")
-    matrix_steps = [step for step in steps if "codex_execpolicy_matrix.py" in _step_run_text(step)]
-    if not matrix_steps:
-        violations.append("AC4: jobs.codex-execpolicy does not invoke scripts/ci/codex_execpolicy_matrix.py")
-    guard_test_steps = [
-        step for step in steps if "tests/codex/test_local_main_branch_guard.py" in _step_run_text(step)
-    ]
-    if not guard_test_steps:
-        violations.append(
-            "AC4: jobs.codex-execpolicy does not run tests/codex/test_local_main_branch_guard.py"
-        )
-    return job
-
-
-def check_sentinel_before_matrix(job: dict[str, Any], violations: list[str]) -> None:
-    steps = _job_steps(job)
-    sentinel_idx = None
-    matrix_idx = None
-    for idx, step in enumerate(steps):
-        run_text = _step_run_text(step)
-        if sentinel_idx is None and "codex_execpolicy_matrix_status_v1.json" in run_text and (
-            '"status": "started"' in run_text or "'status': 'started'" in run_text
-        ):
-            sentinel_idx = idx
-        if matrix_idx is None and "codex_execpolicy_matrix.py" in run_text and "--artifact" in run_text:
-            matrix_idx = idx
-    if sentinel_idx is None:
-        violations.append("AC6: jobs.codex-execpolicy has no sentinel-artifact-creation step")
-        return
-    if matrix_idx is None:
-        violations.append(
-            "AC6: jobs.codex-execpolicy has no matrix orchestrator step to compare sentinel ordering against"
-        )
-        return
-    if sentinel_idx >= matrix_idx:
-        violations.append("AC6: sentinel artifact step must run BEFORE the matrix orchestrator step")
-
-    # Bootstrap/matrix failure must still leave a status artifact: require the
-    # upload step for codex_execpolicy_artifacts/ to run with `if: always()`.
-    upload_steps = [
-        step
-        for step in steps
-        if isinstance(step.get("uses"), str)
-        and step["uses"].startswith("actions/upload-artifact")
-        and "codex_execpolicy_artifacts" in str((step.get("with") or {}).get("path", ""))
-    ]
-    if not upload_steps:
-        violations.append("AC6: jobs.codex-execpolicy has no artifact upload step for codex_execpolicy_artifacts/")
-        return
-    for step in upload_steps:
-        cond = step.get("if")
-        if cond not in ("${{ always() }}", "always()"):
-            violations.append(
-                "AC6: codex_execpolicy_artifacts upload step must run with `if: ${{ always() }}` "
-                "so bootstrap/matrix failure artifacts are still uploaded"
-            )
-
-
 def _run_text_exact_argv(run_text: str, expected_argv: list[str]) -> bool:
     """True iff ``run_text`` is (once split into shell lines and re-tokenized as a
     single logical command via backslash-continuation joining) EXACTLY the given
@@ -476,9 +404,9 @@ def check_aggregate_job(jobs: dict[str, Any], violations: list[str]) -> None:
         violations.append("AC5: jobs.python-test (required aggregate) is missing")
         return
     needs = job.get("needs")
-    if needs != ["python-test-core", "codex-execpolicy"]:
+    if needs != ["python-test-core"]:
         violations.append(
-            f"AC5: jobs.python-test.needs must equal ['python-test-core', 'codex-execpolicy'], got {needs!r}"
+            f"AC5: jobs.python-test.needs must equal ['python-test-core'], got {needs!r}"
         )
     cond = job.get("if")
     if cond not in ("always()", "${{ always() }}"):
@@ -581,10 +509,6 @@ def verify(ci_yml_path: Path) -> dict[str, Any]:
         check_no_hardcoded_pytest_target(core_job, violations)
 
     check_plan_is_loadable_and_referenced(jobs, violations, ci_yml_path=ci_yml_path)
-
-    codex_job = check_codex_execpolicy_job(jobs, violations)
-    if codex_job is not None:
-        check_sentinel_before_matrix(codex_job, violations)
 
     check_aggregate_job(jobs, violations)
     check_verifier_not_disabled(jobs, violations)

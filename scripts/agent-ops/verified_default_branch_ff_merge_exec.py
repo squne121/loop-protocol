@@ -8,7 +8,8 @@
 # identity via `git ls-remote --symref`, fetches it by object, and only then
 # fast-forward merges -- exact `rtk git merge --ff-only origin/<candidate>`.
 #
-# .codex/rules/default.rules allowlists ONLY the exact invocation shape:
+# The native Codex CLI execpolicy rules file that historically allowlisted
+# ONLY the exact invocation shape below was retired in Issue #2161:
 #   uv run --locked --no-sync python3 scripts/agent-ops/verified_default_branch_ff_merge_exec.py --candidate-branch NAME
 #
 # Issue #1603 iteration-2 OWNER adversarial review (P1-1 / P2-7): this
@@ -17,12 +18,11 @@
 # repository's SSOT worktree catalog (`scripts/agent-ops/worktree_catalog.py`
 # `select_issue_worktrees`), not a tautological `cwd == cwd` check. It ALSO
 # validates its own argv is the EXACT `["--candidate-branch", <value>]` shape
-# before argparse ever runs -- because `.codex/rules/default.rules` is a
-# PREFIX rule (Codex execpolicy has no exact-shape / no-trailing-token
-# primitive), a duplicate `--candidate-branch` flag, a `--flag=value` form,
-# extra positionals, or a trailing token would otherwise still match the
-# rule's `allow` prefix. The real enforcement for those shapes is here, not
-# in the static rule.
+# before argparse ever runs -- the retired execpolicy rules file was a
+# PREFIX rule (no exact-shape / no-trailing-token primitive), so a duplicate
+# `--candidate-branch` flag, a `--flag=value` form, extra positionals, or a
+# trailing token would otherwise still have matched the rule's `allow`
+# prefix. The real enforcement for those shapes is here, not in a static rule.
 
 from __future__ import annotations
 
@@ -162,8 +162,8 @@ def _validate_exact_invocation_argv(raw_argv):
     """Issue #1603 iteration-2 P2-7: require the argv to be EXACTLY
     `["--candidate-branch", <value>]` -- two tokens, no duplicate flag, no
     `--flag=value` form, no positionals, no trailing tokens. This is the
-    real enforcement the `.codex/rules/default.rules` PREFIX rule cannot
-    provide by itself."""
+    real enforcement the retired native Codex CLI execpolicy PREFIX rule
+    (Issue #2161) could not provide by itself."""
     if len(raw_argv) not in (2, 4):
         return False
     if raw_argv[0] != '--candidate-branch':

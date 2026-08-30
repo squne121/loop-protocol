@@ -606,49 +606,12 @@ def test_claude_codex_and_local_main_routing_parity(tmp_path, monkeypatch, hook_
     assert force_push_result["status"] == "block"
 
 
-_REPO_ROOT = _GUARDS_DIR.parent.parent
-_DEFAULT_RULES = _REPO_ROOT / ".codex" / "rules" / "default.rules"
-_CODEX_BIN = None
-for _candidate_dir in os.environ.get("PATH", "").split(os.pathsep):
-    _candidate = os.path.join(_candidate_dir, "codex")
-    if os.path.isfile(_candidate) and os.access(_candidate, os.X_OK):
-        _CODEX_BIN = _candidate
-        break
-
-
-def _execpolicy_decision(argv_tail):
-    result = subprocess.run(
-        [_CODEX_BIN, "execpolicy", "check", "--rules", str(_DEFAULT_RULES), "--"] + argv_tail,
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=True,
-    )
-    return json.loads(result.stdout).get("decision", "no_match")
-
-
-@pytest.mark.skipif(_CODEX_BIN is None, reason="codex CLI not available in this environment")
-def test_codex_execpolicy_allows_only_the_dedicated_executor_shape():
-    allow_argv = [
-        "uv", "run", "--locked", "--no-sync", "python3",
-        "scripts/agent-ops/verified_default_branch_ff_merge_exec.py", "--candidate-branch", "main",
-    ]
-    assert _execpolicy_decision(allow_argv) == "allow"
-
-    prompt_cases = [
-        ["rtk", "git", "merge", "--ff-only", "origin/main"],
-        ["rtk", "git", "merge", "origin/main"],
-        ["rtk", "git", "merge", "--ff-only", "origin/main", "--no-edit"],
-        ["rtk", "git", "merge", "feature-branch"],
-        ["bash", "-c", "rtk git merge --ff-only origin/main"],
-    ]
-    for argv_tail in prompt_cases:
-        assert _execpolicy_decision(argv_tail) != "allow", argv_tail
-
-
 # ---------------------------------------------------------------------------
-# Codex executor (verified_default_branch_ff_merge_exec.py) authorization
-# tests -- Issue #1603 iteration-2 P1-1 / P2-7.
+# verified_default_branch_ff_merge_exec.py authorization tests -- Issue
+# #1603 iteration-2 P1-1 / P2-7. (The "codex_executor" test names below are
+# a historical naming convention: `run()` is a pure, provider-neutral Python
+# function with no native Codex CLI dependency. Issue #2161 removed the
+# adjacent real-`codex`-binary execpolicy smoke test that lived here.)
 # ---------------------------------------------------------------------------
 
 

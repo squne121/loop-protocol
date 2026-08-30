@@ -1,0 +1,9 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "agent-retrospective",
+  "version": "0.1.0",
+  "description": "Portable, self-contained agent-retrospective distribution. Generates proposal-only agent_improvement_candidate/v1 records from repository/runtime evidence via an observer wave + evaluator, without requiring a .claude/ project checkout.",
+  "author": {
+    "name": "LOOP_PROTOCOL"
+  }
+}

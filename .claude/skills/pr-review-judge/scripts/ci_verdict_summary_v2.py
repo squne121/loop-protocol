@@ -49,19 +49,20 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     # both fall through to "unknown" (get_classification default), which
     # determine_check_verdict() treats as ALWAYS blocking with
     # failure_reason=gh_error even when both providers actually succeeded
-    # (the same class of regression Issue #1760 fixed for python-test-core /
-    # codex-execpolicy above).
+    # (the same class of regression Issue #1760 fixed for python-test-core
+    # below).
     ("ci", "e2e-core"): "evidence",
     ("ci", "e2e-responsive-matrix"): "evidence",
-    # Issue #1760: python-test-core / codex-execpolicy are the two dedicated lane
-    # jobs that python-test (the required aggregate, still classified below) depends
-    # on. Without an explicit classification entry both fall through to "unknown"
-    # (get_classification default), which determine_check_verdict() treats as
-    # ALWAYS blocking with failure_reason=gh_error -- even when both jobs actually
-    # succeeded. Registering them here as "evidence" restores the intended
-    # merge_ready computation.
+    # Issue #1760: python-test-core is the dedicated lane job that
+    # python-test (the required aggregate, still classified below) depends
+    # on. Without an explicit classification entry it falls through to
+    # "unknown" (get_classification default), which determine_check_verdict()
+    # treats as ALWAYS blocking with failure_reason=gh_error -- even when
+    # the job actually succeeded. Registering it here as "evidence" restores
+    # the intended merge_ready computation. Issue #2161 (native Codex CLI
+    # retirement): the former sibling ("ci", "codex-execpolicy") lane job
+    # entry was removed along with the job.
     ("ci", "python-test-core"): "evidence",
-    ("ci", "codex-execpolicy"): "evidence",
     ("ci", "python-test"): "evidence",
     ("ci", "node-backed-hook-tests"): "evidence",
     ("ci", "actionlint"): "required",
@@ -98,14 +99,16 @@ REQUIRED_CHECKS: set[tuple[str, str]] = {
     # Issue #2119: the two dedicated provider jobs that feed the "e2e"
     # required aggregate must themselves be present with conclusion=success
     # for the aggregate's own success to count as real merge-ready evidence
-    # (same pattern as python-test-core/codex-execpolicy below, Issue #1760).
+    # (same pattern as python-test-core below, Issue #1760).
     ("ci", "e2e-core"),
     ("ci", "e2e-responsive-matrix"),
-    # Issue #1760: the two dedicated lane jobs that feed the "python-test"
-    # required aggregate must themselves be present with conclusion=success
-    # for the aggregate's own success to count as real merge-ready evidence.
+    # Issue #1760: the dedicated lane job that feeds the "python-test"
+    # required aggregate must itself be present with conclusion=success for
+    # the aggregate's own success to count as real merge-ready evidence.
+    # Issue #2161 (native Codex CLI retirement): the former sibling
+    # ("ci", "codex-execpolicy") lane job entry was removed along with the
+    # job itself.
     ("ci", "python-test-core"),
-    ("ci", "codex-execpolicy"),
     ("ci", "python-test"),
     ("ci", "node-backed-hook-tests"),
     ("ci", "actionlint"),

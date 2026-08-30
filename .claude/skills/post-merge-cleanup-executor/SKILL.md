@@ -118,9 +118,10 @@ agent は bare `git -C <worktree>` で clean 判定や `git worktree remove` / `
 clean 判定・PR merged / head branch / linked issue / catalog / branch / root=default の検証・削除は、
 単一の認可境界 `scripts/agent-ops/cleanup_exec.py` が実行のたびに内部で行う。agent が bare git cleanup を
 発行しない運用上の理由は「単一の認可境界を `cleanup_exec` に一本化する」こと自体にある。`worktree_scope_guard`
-は behavioral/defense-in-depth contract として repo に残存するが、現行 project config（`.claude/settings.json`
-/ `.codex/hooks.json`）の project PreToolUse としては wiring されておらず、bare git cleanup を実行時に
-deny する active enforcement 経路ではない。
+は behavioral/defense-in-depth contract として repo に残存するが、現行 project config（`.claude/settings.json`。
+Issue #2161 の native Codex CLI retirement 以前は `.codex/hooks.json` も存在したが撤去済み）の
+project PreToolUse としては wiring されておらず、bare git cleanup を実行時に deny する active
+enforcement 経路ではない。
 
 1. guard arbitration を機械判定する（mutation を行わない・`AGENT_GUARD_PREFLIGHT_V1` を返す）:
 ```bash

@@ -2,8 +2,9 @@
 """run_agent_provider_route_smoke.py — live route smoke producer for the
 ``agent_provider_route_smoke/v1`` envelope (Issue #1886).
 
-For each required ``(runtime, agent, profile)`` route (Claude Code / Codex
-CLI x codebase-investigator / web-researcher), this script:
+For each required ``(runtime, agent, profile)`` route (Claude Code x
+codebase-investigator / web-researcher -- the native Codex CLI ``codex_cli``
+route was retired in Issue #2161), this script:
 
 1. Spawns the target custom agent via the existing, independently-tested
    worktree runtime smoke harness (``run_worktree_agent_runtime_smoke.py``),
@@ -75,16 +76,15 @@ SCHEMA = "agent_provider_route_smoke/v1"
 # reaching outside the authorized Allowed Paths.
 DIAGNOSTICS_SCHEMA = "agent_provider_route_smoke_diagnostics/v1"
 
+# Issue #2161: the native Codex CLI (``codex_cli``) routes were retired
+# along with native Codex CLI; the ``claude_code`` routes are unaffected.
 REQUIRED_ROUTES: list[dict[str, str]] = [
     {"runtime": "claude_code", "agent": "codebase-investigator", "profile": "local_asset_research"},
     {"runtime": "claude_code", "agent": "codebase-investigator", "profile": "github_research"},
     {"runtime": "claude_code", "agent": "web-researcher", "profile": "grounded_research"},
-    {"runtime": "codex_cli", "agent": "codebase-investigator", "profile": "local_asset_research"},
-    {"runtime": "codex_cli", "agent": "codebase-investigator", "profile": "github_research"},
-    {"runtime": "codex_cli", "agent": "web-researcher", "profile": "grounded_research"},
 ]
 
-_RUNTIME_TO_HARNESS = {"claude_code": "claude", "codex_cli": "codex"}
+_RUNTIME_TO_HARNESS = {"claude_code": "claude"}
 
 _GEMINI_SENTINEL_TEMPLATE = """#!/usr/bin/env python3
 import json
@@ -145,7 +145,7 @@ def _runtime_version(bin_name: str) -> str:
     The schema (``agent_provider_route_smoke_v1.schema.json``) requires
     ``subject.runtime_version`` to be a non-empty string in every artifact,
     including ``--dry-run`` ones (Issue #1886 fix_delta iteration 3): CI
-    runners do not have ``claude`` / ``codex`` on ``PATH`` the way a local
+    runners do not have ``claude`` on ``PATH`` the way a local
     interactive dev environment does, so a bare ``None`` here previously
     failed schema validation in CI while passing locally. Rather than
     fabricating a fake version string, an absent/unusable binary is recorded
@@ -165,15 +165,14 @@ def _runtime_version(bin_name: str) -> str:
 
 
 def _agent_definition_path(agent: str, runtime: str, repo_root: Path) -> Path:
-    if runtime == "claude_code":
-        return repo_root / ".claude" / "agents" / f"{agent}.md"
-    return repo_root / ".codex" / "agents" / f"{agent}.toml"
+    assert runtime == "claude_code", f"unsupported runtime {runtime!r} (Issue #2161: codex_cli retired)"
+    return repo_root / ".claude" / "agents" / f"{agent}.md"
 
 
 def compute_subject(route: dict[str, str], repo_root: Path) -> dict:
     runtime = route["runtime"]
     agent = route["agent"]
-    bin_name = "claude" if runtime == "claude_code" else "codex"
+    bin_name = "claude"
     agent_path = _agent_definition_path(agent, runtime, repo_root)
     agent_sha = _sha256_file(agent_path)
     head_sha = _git_head_sha(repo_root)
@@ -531,8 +530,8 @@ def _is_transient_infrastructure_candidate(
     failure_class: str | None,
     diagnostics: Mapping[str, Any] | None = None,
 ) -> bool:
-    if route["runtime"] == "codex_cli" and failure_class == "spawn_not_observed":
-        return True
+    # Issue #2161: the native Codex CLI (codex_cli) spawn_not_observed
+    # bounded-retry branch was removed along with the codex_cli route.
     if failure_class == "validation_failed" and diagnostics is not None:
         secondary_failures = diagnostics.get("secondary_failures") or []
         if any(
@@ -1059,8 +1058,8 @@ def run_route_live(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--all-routes", action="store_true", help="run all 6 required routes")
-    parser.add_argument("--runtime", choices=["claude_code", "codex_cli"])
+    parser.add_argument("--all-routes", action="store_true", help="run all 3 required routes")
+    parser.add_argument("--runtime", choices=["claude_code"])
     parser.add_argument("--agent", choices=["codebase-investigator", "web-researcher"])
     parser.add_argument("--profile", choices=["local_asset_research", "github_research", "grounded_research"])
     parser.add_argument("--worktree", default=str(REPO_ROOT))

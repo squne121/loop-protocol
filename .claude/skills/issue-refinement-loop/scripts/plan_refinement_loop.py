@@ -316,7 +316,6 @@ TRUSTED_AUTHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 SECURITY_SENSITIVE_PATH_PREFIXES = (
     ".claude/hooks/",
     ".claude/agents/",
-    ".codex/agents/",
     ".github/workflows/",
     ".github/actions/",
     ".github/dependabot.yml",

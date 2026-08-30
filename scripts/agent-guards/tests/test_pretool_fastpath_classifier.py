@@ -8,8 +8,6 @@ Commands (each test below is invoked individually via `pytest -k <name>`).
 
 from __future__ import annotations
 
-import importlib.util
-import json
 import subprocess
 import sys
 import textwrap
@@ -157,8 +155,10 @@ class TestAC3ExactExecutorHash:
 
 
 # =============================================================================
-# AC4: hook boundary manifest (including .codex/hooks.json) documents the
-# fast-path classification / fail policy / stdout-stderr contract.
+# AC4: hook boundary manifest documents the fast-path classification / fail
+# policy / stdout-stderr contract. Issue #2161 (native Codex CLI retirement):
+# the parallel native Codex CLI hook config assertions in this class were
+# removed along with the config file.
 # =============================================================================
 
 
@@ -170,31 +170,6 @@ class TestAC4HookBoundaryManifest:
         assert "readonly_display" in docs_text
         assert "exact_controlled_executor_authorized" in docs_text
         assert "mutation_or_unknown" in docs_text
-
-        codex_hooks_path = REPO_ROOT / ".codex" / "hooks.json"
-        codex_hooks = json.loads(codex_hooks_path.read_text(encoding="utf-8"))
-        assert sorted(codex_hooks.keys()) == ["hooks"]
-
-        hook_commands = [
-            hook.get("command", "")
-            for entries in codex_hooks["hooks"].values()
-            for entry in entries
-            for hook in entry.get("hooks", [])
-        ]
-        assert not any("pretool_fastpath_classifier" in command for command in hook_commands)
-
-    def test_fastpath_contract_root_metadata_is_rejected_by_validators(self, tmp_path):
-        codex_hooks_path = REPO_ROOT / ".codex" / "hooks.json"
-        codex_hooks = json.loads(codex_hooks_path.read_text(encoding="utf-8"))
-        codex_hooks["fastpathContract"] = {}
-
-        fixture_hooks = tmp_path / "hooks.json"
-        fixture_hooks.write_text(json.dumps(codex_hooks), encoding="utf-8")
-
-        checker = _load_check_hook_boundaries()
-        errors = checker.check_codex_hooks_root_keys(path=fixture_hooks)
-        assert errors
-        assert any("root keys must be exactly" in error for error in errors)
 
 
 # =============================================================================
@@ -224,7 +199,9 @@ class TestAC5Budget:
 
 # =============================================================================
 # AC6: classifier is not registered as an independent PreToolUse hook; hook
-# topology (settings.json / .codex/hooks.json) is unchanged.
+# topology (settings.json) is unchanged. Issue #2161 (native Codex CLI
+# retirement): the parallel native Codex CLI hook config assertion was
+# removed along with the config file.
 # =============================================================================
 
 
@@ -241,14 +218,6 @@ class TestAC6NoNewHookTopology:
                 assert "pretool_fastpath_classifier" not in command, (
                     "classifier must not be registered as its own PreToolUse hook entry"
                 )
-
-        codex_hooks_path = REPO_ROOT / ".codex" / "hooks.json"
-        codex = json.loads(codex_hooks_path.read_text(encoding="utf-8"))
-        codex_pretool_entries = codex.get("hooks", {}).get("PreToolUse", [])
-        for entry in codex_pretool_entries:
-            for hook in entry.get("hooks", []):
-                command = hook.get("command", "")
-                assert "pretool_fastpath_classifier" not in command
 
         # The module itself must not define a __main__ hook entry point that
         # reads stdin PreToolUse payloads (i.e. it has no `main()` CLI hook
@@ -474,48 +443,8 @@ class TestBlocker3SummaryNoSecretLeak:
             assert "some/secret/path.txt" not in serialized
 
 
-# =============================================================================
-# Major (PR #1299 / #1367 review fix_delta): .codex/hooks.json PreToolUse
-# topology must be verified against a fixed expected handler matrix, not just
-# absence of the classifier module name.
-# =============================================================================
-
-
-def _load_check_hook_boundaries():
-    checker_path = REPO_ROOT / "scripts" / "check_hook_boundaries.py"
-    spec = importlib.util.spec_from_file_location(
-        "check_hook_boundaries_for_fastpath_test", checker_path
-    )
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)  # type: ignore[attr-defined]
-    return module
-
-
-class TestMajorCodexHooksTopologyCheck:
-    def test_current_topology_matches_frozen_expectation(self):
-        checker = _load_check_hook_boundaries()
-        errors = checker.check_codex_hooks_pretool_topology()
-        assert errors == []
-
-    def test_topology_drift_is_detected_and_fails_closed(self):
-        checker = _load_check_hook_boundaries()
-        actual = checker.load_codex_hooks_topology()
-        assert actual == {}, "quarantined Codex surface must have no active PreToolUse matcher"
-
-        # Compare the active empty topology with a synthetic enforcing topology.
-        drifted_expected = {
-            "^Bash$": [
-            {
-                "type": "command",
-                "command": "echo unexpected",
-                "timeout": 1,
-                "statusMessage": "Unexpected hook",
-            }
-            ]
-        }
-
-        errors = checker.check_codex_hooks_pretool_topology(expected=drifted_expected)
-        assert errors, "topology drift must be reported, not silently accepted"
-        assert any("pretool_topology" in err for err in errors)
+# Issue #2161 (native Codex CLI retirement): TestMajorCodexHooksTopologyCheck
+# and its _load_check_hook_boundaries() helper were removed -- they exercised
+# check_hook_boundaries.check_codex_hooks_pretool_topology() /
+# load_codex_hooks_topology(), which were removed from check_hook_boundaries.py
+# along with the native Codex CLI hook config file they verified.
