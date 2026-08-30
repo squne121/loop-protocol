@@ -47,6 +47,7 @@ from skill_runtime_command_policy import (
     is_exact_skill_runtime_executor_command,
     is_exact_skill_runtime_fixture_executor_command,
     is_exact_skill_runtime_repair_action_apply_executor_command,
+    is_exact_skill_runtime_structural_repair_action_apply_executor_command,
     load_registry_entry,
     resolve_active_issue,
     resolve_default_branch,
@@ -1185,8 +1186,8 @@ class _ChildSupervisionResult:
         *,
         timed_out: bool,
         returncode: int | None,
-        stdout: str,
-        stderr: str,
+        stdout: str | bytes,
+        stderr: str | bytes,
         cleanup_scope: str,
         cleanup_status: str,
         termination: str,
@@ -1368,19 +1369,16 @@ def _run_child_with_supervision(
     cwd: str,
     env: dict[str, str],
     timeout_seconds: float | int | None,
+    binary_output: bool = False,
 ) -> _ChildSupervisionResult:
     """Launch `child_argv` under direct caller supervision.
 
-    Normal-success semantics (stdout/stderr/returncode) are unchanged from
-    the previous `subprocess.run(capture_output=True, text=True)` behavior
-    (AC4): the execution wait itself is delegated to
-    `proc.communicate(timeout=timeout_seconds)`, which preserves
-    `subprocess.run()`'s own timeout/pipe-EOF/decode-error semantics
-    exactly (Issue #2075 P1-2) -- including that a leader which exits while
-    a descendant still holds the stdout/stderr pipe open keeps this call
-    blocked (and, on timeout, still times out) rather than being mistaken
-    for success, and that a `UnicodeDecodeError` from malformed child output
-    propagates to the caller instead of being swallowed.
+    Generic commands retain the previous text-mode normal-success semantics.
+    The structural transport opts into binary capture so its stdout/stderr
+    relay preserves CRLF and invalid UTF-8 byte-for-byte (Issue #2402 AC4).
+    The execution wait is delegated to `proc.communicate(timeout=...)`;
+    a leader that exits while a descendant still holds stdout/stderr open
+    remains blocked (and can time out) rather than being mistaken for success.
 
     On timeout (or any other exception unwinding past a successful
     `Popen()`, including `KeyboardInterrupt`), the process group is driven
@@ -1389,6 +1387,7 @@ def _run_child_with_supervision(
     ever surfaced (AC7) -- only cleanup telemetry is returned.
     """
     posix_supervised = _POSIX_PROCESS_GROUP_SUPPORTED
+    empty_output: str | bytes = b"" if binary_output else ""
 
     popen_kwargs: dict[str, object] = dict(
         cwd=cwd,
@@ -1396,7 +1395,7 @@ def _run_child_with_supervision(
         shell=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        text=not binary_output,
     )
     if posix_supervised:
         popen_kwargs["start_new_session"] = True
@@ -1420,8 +1419,8 @@ def _run_child_with_supervision(
         return _ChildSupervisionResult(
             timed_out=True,
             returncode=None,
-            stdout="",
-            stderr="",
+            stdout=empty_output,
+            stderr=empty_output,
             cleanup_scope=cleanup_scope,
             cleanup_status=cleanup_status,
             termination=termination,
@@ -1440,8 +1439,8 @@ def _run_child_with_supervision(
         return _ChildSupervisionResult(
             timed_out=False,
             returncode=proc.returncode,
-            stdout=stdout or "",
-            stderr=stderr or "",
+            stdout=stdout if stdout is not None else empty_output,
+            stderr=stderr if stderr is not None else empty_output,
             cleanup_scope=CLEANUP_SCOPE_PROCESS_GROUP,
             cleanup_status=CLEANUP_STATUS_NOT_STARTED,
             termination=TERMINATION_NOT_NEEDED,
@@ -1491,8 +1490,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--router-receipt-path", required=False, default=None)
     parser.add_argument("--contract-patch-plan-file", required=False, default=None)
     parser.add_argument("--anchor-context-file", required=False, default=None)
-    # Issue #2039 AC8/AC11: repair_action.apply.
-    parser.add_argument("--apply-repair-action", required=False, default=None)
+    # Generic and structural mutation consumers have distinct command IDs and
+    # exact outer flags. Argparse rejects a mixed invocation before dispatch;
+    # each command branch below also enforces its exact pairing.
+    apply_action_flags = parser.add_mutually_exclusive_group()
+    apply_action_flags.add_argument("--apply-repair-action", required=False, default=None)
+    apply_action_flags.add_argument("--apply-structural-repair-action", required=False, default=None)
     # #2086 P0 fix_delta (Blocker 1/2): only ever meaningful for
     # preflight.run.with_human_context (the operator-selected human-context
     # lane) -- see skill_runtime_command_policy._parse_exact_skill_runtime_anchor_command.
@@ -1513,6 +1516,16 @@ def main(argv: list[str] | None = None) -> int:
     if sibling_id in raw_argv or f"--command-id={sibling_id}" in raw_argv:
         raw_command = " ".join(["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL, *raw_argv])
         if not is_exact_skill_runtime_anchor_fixture_executor_command(
+            raw_command, resolve_project_root(), resolve_project_root()
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    structural_id = "structural_repair_action.apply"
+    if structural_id in raw_argv or f"--command-id={structural_id}" in raw_argv:
+        # Validate raw argv before argparse can normalize a duplicate option.
+        # This is an outer transport check only; the child owns payload parsing.
+        raw_command = " ".join(["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL, *raw_argv])
+        if not is_exact_skill_runtime_structural_repair_action_apply_executor_command(
             raw_command, resolve_project_root(), resolve_project_root()
         ):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
@@ -1540,6 +1553,7 @@ def main(argv: list[str] | None = None) -> int:
     is_produce_command = args.command_id == "authority_transport.produce"
     is_consume_command = args.command_id == "authority_transport.consume"
     is_repair_action_apply_command = args.command_id == "repair_action.apply"
+    is_structural_repair_action_apply_command = args.command_id == "structural_repair_action.apply"
     # #2086 P0 fix_delta (Blocker 3): decide.run may ALSO carry
     # --invocation-id/--git-head-sha (bound into its Mode B authority-check
     # sub-fields), in addition to authority_transport.produce/consume.
@@ -1567,6 +1581,18 @@ def main(argv: list[str] | None = None) -> int:
     if is_repair_action_apply_command and not args.apply_repair_action:
         print(
             "skill_runtime_exec: --apply-repair-action is required for repair_action.apply",
+            file=sys.stderr,
+        )
+        return 2
+    if not is_structural_repair_action_apply_command and args.apply_structural_repair_action:
+        print(
+            "skill_runtime_exec: --apply-structural-repair-action is only allowed for structural_repair_action.apply",
+            file=sys.stderr,
+        )
+        return 2
+    if is_structural_repair_action_apply_command and not args.apply_structural_repair_action:
+        print(
+            "skill_runtime_exec: --apply-structural-repair-action is required for structural_repair_action.apply",
             file=sys.stderr,
         )
         return 2
@@ -1959,6 +1985,36 @@ def main(argv: list[str] | None = None) -> int:
         if not is_exact_skill_runtime_repair_action_apply_executor_command(command_text, project_root, project_root):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
+    elif is_structural_repair_action_apply_command:
+        # Preserve strict outer-transport isolation. The safe path predicate is
+        # applied to the original argparse value, then the exact parser checks
+        # the fixed command shape. No structural payload is opened at root.
+        if not _is_safe_issue_artifact_path(
+            args.apply_structural_repair_action, project_root, str(args.issue_number)
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--apply-structural-repair-action",
+                args.apply_structural_repair_action,
+            ]
+        )
+        if not is_exact_skill_runtime_structural_repair_action_apply_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
     else:
         if args.fixture:
             print("skill_runtime_exec: --fixture is only allowed for preflight.run.fixture", file=sys.stderr)
@@ -2099,6 +2155,12 @@ def main(argv: list[str] | None = None) -> int:
             "repo": args.repo,
             "preflight_result_path": args.apply_repair_action,
         }
+    elif is_structural_repair_action_apply_command:
+        render_params = {
+            "issue_number": args.issue_number,
+            "repo": args.repo,
+            "preflight_result_path": args.apply_structural_repair_action,
+        }
     else:
         render_params = {"issue_number": args.issue_number, "repo": args.repo}
         if is_fixture_command or is_fixture_human_context_command:
@@ -2116,6 +2178,7 @@ def main(argv: list[str] | None = None) -> int:
         cwd=project_root,
         env=_sanitize_env(project_root, args.command_id),
         timeout_seconds=timeout_seconds,
+        binary_output=is_structural_repair_action_apply_command,
     )
     if supervision.timed_out:
         return _emit_timeout_failure(
@@ -2138,18 +2201,27 @@ def main(argv: list[str] | None = None) -> int:
     if unauthorized_path is not None:
         return _emit_unauthorized_write_failure(args.issue_number, unauthorized_path)
 
+    stdout_for_artifact_projection = (
+        result.stdout.decode("utf-8", errors="surrogateescape")
+        if isinstance(result.stdout, bytes)
+        else result.stdout
+    )
     artifact_projection_failures = _validate_stdout_artifact_projection(
         project_root,
         str(args.issue_number),
-        result.stdout,
+        stdout_for_artifact_projection,
         args.command_id,
     )
     if artifact_projection_failures:
         return _emit_artifact_projection_failure(args.issue_number, artifact_projection_failures)
 
-    if result.stdout:
+    if isinstance(result.stdout, bytes):
+        sys.stdout.buffer.write(result.stdout)
+    elif result.stdout:
         sys.stdout.write(result.stdout)
-    if result.stderr:
+    if isinstance(result.stderr, bytes):
+        sys.stderr.buffer.write(result.stderr)
+    elif result.stderr:
         sys.stderr.write(result.stderr)
     return result.returncode
 

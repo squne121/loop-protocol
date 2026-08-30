@@ -71,6 +71,9 @@ SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_PRODUCER = "exact_authority_tr
 SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_CONSUMER = "exact_authority_transport_consumer"
 # Issue #2039 AC8/AC11: repair_action.apply controlled consumer command class.
 SKILL_RUNTIME_EXECUTION_CLASS_REPAIR_ACTION_APPLY = "exact_repair_action_apply"
+# Issue #2402: a distinct exact transport profile for the structural consumer.
+# Its command ID, outer flag, and parser remain separate from the generic lane.
+SKILL_RUNTIME_EXECUTION_CLASS_STRUCTURAL_REPAIR_ACTION_APPLY = "exact_structural_repair_action_apply"
 _DECIDE_VERDICT_VALUES = frozenset({"approve", "request_changes", "needs-fix"})
 
 
@@ -234,6 +237,18 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
         # boundary as authority_transport.consume.
         "repair_action.apply": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_REPAIR_ACTION_APPLY,
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [
+                ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            ],
+            "network_effect": "github_mutation",
+        },
+        # Issue #2402: sibling policy for PR #2400's existing structural
+        # consumer. This only validates outer transport; nested structural
+        # bundle semantics remain the consumer's responsibility.
+        "structural_repair_action.apply": {
+            "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_STRUCTURAL_REPAIR_ACTION_APPLY,
             "required_cwd": "canonical_main_root",
             "required_branch": "default_branch",
             "allowed_write_roots": [
@@ -1290,6 +1305,75 @@ def is_exact_skill_runtime_repair_action_apply_executor_command(
     return True
 
 
+def parse_exact_skill_runtime_structural_repair_action_apply_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact parser for the distinct `structural_repair_action.apply` lane.
+
+    This is deliberately a sibling of `repair_action.apply`: it accepts only
+    the structural command ID and its dedicated outer flag. It validates the
+    same Issue-bound safe artifact path, without reading or re-parsing the
+    structural payload delegated to the existing consumer.
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if len(tokens) != 12 or tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    expected_flags = ["--command-id", "--issue-number", "--repo", "--apply-structural-repair-action"]
+    expected_positions = [4, 6, 8, 10]
+    if any(tokens[pos] != flag for flag, pos in zip(expected_flags, expected_positions)):
+        return None
+    if any(token.startswith(f"{flag}=") for token in tokens for flag in expected_flags):
+        return None
+    command_id, issue_number, repo, preflight_result_path = tokens[5], tokens[7], tokens[9], tokens[11]
+    if command_id != "structural_repair_action.apply":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0 or repo != TRUSTED_REPO_SLUG:
+        return None
+    policy = SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"].get(command_id)
+    if (
+        not isinstance(policy, dict)
+        or policy.get("execution_class") != SKILL_RUNTIME_EXECUTION_CLASS_STRUCTURAL_REPAIR_ACTION_APPLY
+    ):
+        return None
+    if not _is_safe_issue_artifact_path(preflight_result_path, root, issue_number):
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        preflight_result_path=preflight_result_path,
+    )
+
+
+def is_exact_skill_runtime_structural_repair_action_apply_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """Apply the canonical root/default-branch/active-Issue boundary to the
+    structural sibling. It is never root-no-worktree eligible."""
+    parsed = parse_exact_skill_runtime_structural_repair_action_apply_command(command, project_root)
+    if parsed is None or os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    if not branch or branch != resolve_default_branch(project_root, deadline):
+        return False
+    if resolve_repo_slug(project_root, deadline) != parsed.repo:
+        return False
+    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
+    return active_issue == parsed.issue_number and entry is not None
+
+
 def _parse_exact_skill_runtime_authority_transport_consume_tail(
     tokens: list[str], root: str
 ) -> ExactSkillRuntimeCommand | None:
@@ -1962,6 +2046,19 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "--apply-repair-action",
         "{preflight_result_path}",
     ],
+    # Issue #2402: preserve PR #2400's structural registry argv exactly.
+    "structural_repair_action.apply": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        "--issue-number",
+        "{issue_number}",
+        "--repo",
+        "{repo}",
+        "--apply-structural-repair-action",
+        "{preflight_result_path}",
+    ],
 }
 _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
     "preflight.run": {
@@ -2047,6 +2144,12 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
     },
     # Issue #2039 AC8/AC11
     "repair_action.apply": {
+        "issue_number": {"type": "positive_int", "required": True},
+        "repo": {"type": "owner_repo", "required": True},
+        "preflight_result_path": {"type": "path", "required": True},
+    },
+    # Issue #2402: same placeholder contract, distinct command profile.
+    "structural_repair_action.apply": {
         "issue_number": {"type": "positive_int", "required": True},
         "repo": {"type": "owner_repo", "required": True},
         "preflight_result_path": {"type": "path", "required": True},
