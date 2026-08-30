@@ -58,7 +58,7 @@ SubAgent lifecycle・forbidden marker 不在を検証できる）
 呼び出し元は transport を選択できない。検証 session は常に cleanup 対象であり、残す
 オプションは提供しない。
 
-## Invocation-local Claude peer policy（Issue #2437）
+## Invocation-local Claude peer policy（呼び出し単位の peer 方針、Issue #2437）
 
 native Claude の structured / interactive lane は、harness が所有する invocation-local
 settings に常に次を固定する。global `.claude/settings*`、`~/.claude`、既存 Herdr
