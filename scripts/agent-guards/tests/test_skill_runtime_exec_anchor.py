@@ -446,13 +446,28 @@ def _fake_gh(args, *positional, **kwargs):
         handle.write(json.dumps(argv) + "\\n")
     with config_states.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(config_state) + "\\n")
-    if argv[:2] == ["issue", "view"]:
+    issue_read_argvs = {
+        (
+            "issue", "view", "1498", "--repo", "squne121/loop-protocol",
+            "--json", "title,body,updatedAt",
+        ),
+        (
+            "issue", "view", "1498", "--repo", "squne121/loop-protocol",
+            "--json", "number,title,body,labels,url,updatedAt",
+        ),
+    }
+    comments_read_argv = (
+        "api", "repos/squne121/loop-protocol/issues/1498/comments?per_page=100",
+        "--paginate", "--slurp",
+    )
+    anchor_read_argv = (
+        "api", "repos/squne121/loop-protocol/issues/comments/1",
+    )
+    if tuple(argv) in issue_read_argvs:
         payload = json.loads(state.read_text(encoding="utf-8"))
-    elif argv[:1] == ["api"] and argv[1].startswith(
-        "repos/squne121/loop-protocol/issues/1498/comments?"
-    ):
+    elif tuple(argv) == comments_read_argv:
         payload = [[json.loads(anchor.read_text(encoding="utf-8"))]]
-    elif argv[:2] == ["api", "repos/squne121/loop-protocol/issues/comments/1"]:
+    elif tuple(argv) == anchor_read_argv:
         payload = json.loads(anchor.read_text(encoding="utf-8"))
     else:
         return subprocess.CompletedProcess(args, 2, "", "unexpected fake gh argv")
@@ -893,8 +908,10 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     ]
     assert config_states
     assert set(config_states) == {"expected_path"}
-    assert any(call[:2] == ["issue", "view"] for call in calls)
-    assert sum(call[:2] == ["issue", "view"] for call in calls) >= 2
+    assert calls == [
+        ["issue", "view", "1498", "--repo", "squne121/loop-protocol", "--json", "title,body,updatedAt"],
+        ["issue", "view", "1498", "--repo", "squne121/loop-protocol", "--json", "title,body,updatedAt"],
+    ]
     result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     assert result["contract_update"] == {
         "status": "failed",
