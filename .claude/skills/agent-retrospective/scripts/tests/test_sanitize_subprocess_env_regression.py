@@ -220,3 +220,89 @@ def test_invoke_agent_forwards_non_mutation_env_to_real_runner_env_without_polic
     for key, value in _AC2_NON_MUTATION_ENV_VARS.items():
         assert captured["env"].get(key) == value, f"{key} did not reach invoke_agent()'s real runner env (no policy)"
     assert rr._MUTATION_CREDENTIAL_ENV_VARS.isdisjoint(captured["env"].keys())
+
+
+# ---------------------------------------------------------------------------
+# AC2 (root-cause regression): the ORIGINAL bug (Issue #2436 Background) was
+# that the OUTER PROCESS's own `os.environ` (e.g. a caller shell, or the
+# outer Claude-GPT session, exporting `ANTHROPIC_BASE_URL` etc. before ever
+# invoking `run_retrospective.py`) did not survive into the nested `claude`
+# subprocess's env -- NOT that a value supplied via `AgentInvocationRequest
+# .env` got stripped. The two tests above supply target vars only via
+# `request.env`, which `invoke_agent()` merges via
+# `merged_env = {**os.environ, **request.env}` (`run_retrospective.py`)
+# BEFORE sanitization -- so they never actually exercise the `os.environ`
+# half of that merge. These two tests do: `request.env` is intentionally
+# left empty, and the target var is injected ONLY into the outer test
+# process's `os.environ` via `monkeypatch.setenv`, directly regression
+# testing OWNER review P1
+# (https://github.com/squne121/loop-protocol/pull/2453#issuecomment-5469097778).
+# ---------------------------------------------------------------------------
+
+
+def test_invoke_agent_forwards_parent_os_environ_to_real_runner_env_with_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Root-cause regression (policy path): a value present ONLY in the
+    outer/parent process's `os.environ` (never passed via `request.env`)
+    must still reach the real runner env through
+    `merged_env = {**os.environ, **request.env}` +
+    `policy.sanitize_subprocess_env()`."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:41888")
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    policy = rr.DelegatedAgentPermissionPolicy(run_id="issue-2445-run-6")
+    captured: dict[str, Any] = {}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload({"ok": True})), stderr=""
+        )
+
+    request = rr.AgentInvocationRequest(
+        agent_name="retrospective-runtime-observer",
+        prompt="observe",
+        json_schema_path=str(schema_path),
+        cwd="/repo",
+        env={},  # deliberately empty: the var must come from os.environ alone
+    )
+    rr.invoke_agent(request, runner=_runner, policy=policy)
+
+    assert captured["env"].get("ANTHROPIC_BASE_URL") == "http://127.0.0.1:41888", (
+        "a value set ONLY on the outer process's os.environ (never via request.env) "
+        "did not reach invoke_agent()'s real runner env -- this is the original "
+        "Issue #2436 transport_routing_gap regression"
+    )
+
+
+def test_invoke_agent_forwards_parent_os_environ_to_real_runner_env_without_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same root-cause regression, through the `policy=None` fallback branch
+    (`_default_sanitized_env()`)."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:41888")
+    schema_path = tmp_path / "s.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    captured: dict[str, Any] = {}
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload({"ok": True})), stderr=""
+        )
+
+    request = rr.AgentInvocationRequest(
+        agent_name="retrospective-runtime-observer",
+        prompt="observe",
+        json_schema_path=str(schema_path),
+        cwd="/repo",
+        env={},  # deliberately empty: the var must come from os.environ alone
+    )
+    rr.invoke_agent(request, runner=_runner, policy=None)
+
+    assert captured["env"].get("ANTHROPIC_BASE_URL") == "http://127.0.0.1:41888", (
+        "a value set ONLY on the outer process's os.environ (never via request.env) "
+        "did not reach invoke_agent()'s real runner env (no policy) -- this is the "
+        "original Issue #2436 transport_routing_gap regression"
+    )

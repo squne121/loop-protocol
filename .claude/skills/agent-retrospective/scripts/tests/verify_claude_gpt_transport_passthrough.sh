@@ -7,12 +7,20 @@
 # / `DelegatedAgentPermissionPolicy.sanitize_subprocess_env()`) actually
 # forwards Claude-GPT proxy transport env (`ANTHROPIC_BASE_URL` /
 # `ANTHROPIC_AUTH_TOKEN` / model-alias env) to a REAL nested `claude`
-# subprocess it spawns, and that this nested subprocess's own `/v1/messages`
-# request is attributable to a run-scoped, exclusively-owned
-# `claude-code-proxy` instance -- never to a shared, long-lived, possibly
-# multi-session log (Issue #2436 Background: the pre-#2445 investigation's
-# false "verified" conclusion came from reusing the single shared,
-# system-wide `$CLAUDE_GPT_HOME/state/claude-code-proxy/proxy.log`).
+# subprocess it spawns.
+#
+# Claim: `transport_observed` (OWNER review
+# https://github.com/squne121/loop-protocol/pull/2453#issuecomment-5469097778
+# P0-2), NOT exclusive attribution. Within a dedicated fresh/exclusive
+# run-scoped `claude-code-proxy` instance, both the outer session's own
+# traffic and the nested observer's expected Haiku-tier `/v1/messages`
+# traffic are observed, and every observed request succeeded via the
+# expected transport (proxy), never a fallback. Which single reqId belongs
+# to the nested invocation is NOT determined here -- model-alias names
+# (below) are observational evidence, not a causal/exclusive-ownership ID
+# (Claude Code's own docs note the Haiku-tier alias is also used for
+# background functionality, so "alias == this specific nested call" cannot
+# be asserted as a proof of exclusive ownership).
 #
 # Design (why a dedicated ephemeral CLAUDE_GPT_HOME, not the caller's real
 # one):
@@ -33,22 +41,21 @@
 #      repository-tracked file -- written to the same scratch directory)
 #      that calls `run_retrospective.py`'s real `invoke_agent()` with a
 #      trivial `retrospective-runtime-observer` (Haiku-tier) request.
-#   4. Attribution of "the nested invocation's own request" among the
-#      (necessarily also present) outer session's own turns uses the
-#      upstream model alias recorded in `codex_upstream_request_started`
-#      (`lib.sh`'s documented mapping: opus -> gpt-5.6-sol, sonnet/main ->
-#      gpt-5.6-terra, haiku -> gpt-5.6-luna). The outer session's own model
-#      is the `main` alias (`gpt-5.6-terra`); the nested leaf agent's
-#      frontmatter pins `model: haiku` (`gpt-5.6-luna`) -- a value the outer
-#      session's own turns never produce. Exactly one `gpt-5.6-luna` request
-#      is required; zero is `fallback_suspected` (Stop Condition: FAIL, not
-#      SKIP -- the nested call succeeded WITHOUT the proxy, i.e. it fell
-#      back to some other transport); more than one is ambiguous
-#      attribution (FAIL).
+#   4. `transport_observed` requires seeing at least one Haiku-tier
+#      (`gpt-5.6-luna`, `retrospective-runtime-observer`'s pinned
+#      `model: haiku`) upstream request in the scoped log -- its absence
+#      is `fallback_suspected` (Stop Condition: FAIL, not SKIP -- the
+#      nested call succeeded WITHOUT the proxy, i.e. it fell back to some
+#      other transport). Multiple Haiku-tier requests, and/or the outer
+#      session's own `main`-alias (`gpt-5.6-terra`) requests mixed into the
+#      same scoped log, are expected and allowed -- this script does not
+#      attempt to reduce them to a single exclusively-attributed reqId.
 #   5. `transport_log.py` (read-only use of the existing canonical
 #      transport-policy validator -- never duplicated here) independently
-#      confirms the matched reqId's request/response pair is a confirmed
-#      `http` / `/v1/messages` / `200` round trip.
+#      confirms that every single request in the whole scoped log (both
+#      outer and nested-observer traffic) is a confirmed `http` /
+#      `/v1/messages` / `200` round trip -- i.e. all observed traffic used
+#      the expected transport, none fell back.
 #
 # Exit code / SKIP contract (docs/dev/runtime-verification-policy.md):
 #   0   PASS
@@ -80,7 +87,7 @@ _log() {
 _write_header() {
   {
     echo "=== Runtime Verification Log ==="
-    echo "AC: AC3 (Issue #2445) -- nested claude subprocess proves Claude-GPT proxy transport routing"
+    echo "AC: AC3 (Issue #2445) -- transport_observed: nested claude subprocess Claude-GPT proxy transport routing"
     echo "Timestamp: $TIMESTAMP"
     echo "Environment: tested_head=$TESTED_HEAD"
     echo ""
@@ -256,11 +263,14 @@ PRESERVED_LOG_PATH="$ARTIFACT_DIR/ac3-scoped-proxy-${TIMESTAMP}.log"
 cp "$SCRATCH_LOG_PATH" "$PRESERVED_LOG_PATH"
 _log "preserved scoped proxy log evidence: $PRESERVED_LOG_PATH"
 
-# --- attribution: exactly one codex_upstream_request_started event whose
-# model alias is the Haiku-tier one (gpt-5.6-luna), confirmed by
-# transport_log.py's own reqId correlation for that specific request -------
-ATTRIBUTION_JSON="$ARTIFACT_DIR/ac3-attribution-${TIMESTAMP}.json"
-ATTRIBUTION_RESULT="$(uv run --locked python3 - "$PRESERVED_LOG_PATH" "$TRANSPORT_LOG_PY" "$ATTRIBUTION_JSON" <<'PYEOF2'
+# --- transport_observed: at least one codex_upstream_request_started event
+# whose model alias is the Haiku-tier one (gpt-5.6-luna), plus
+# transport_log.py's own whole-log verdict (every observed request --
+# Haiku-tier and outer alike -- used the expected http transport). This does
+# NOT attempt to attribute a single reqId exclusively to the nested
+# invocation (OWNER review P0-2: model-alias names are not a causal ID) ----
+OBSERVATION_JSON="$ARTIFACT_DIR/ac3-transport-observed-${TIMESTAMP}.json"
+OBSERVATION_RESULT="$(uv run --locked python3 - "$PRESERVED_LOG_PATH" "$TRANSPORT_LOG_PY" "$OBSERVATION_JSON" <<'PYEOF2'
 import importlib.util
 import json
 import sys
@@ -295,21 +305,25 @@ def _model_alias(event: dict) -> str:
     return str((event.get("fields") or {}).get("model", "")).split("[", 1)[0]
 
 
-# Attribution rests on this log's EXCLUSIVITY (a fresh, single-run scratch
-# `CLAUDE_GPT_HOME` this script alone seeds and this script alone points
-# `launch.sh` at -- no other process, session, or concurrent invocation can
-# reach this exact instance), not on reqId-counting heuristics. Empirically
-# (live runs, Issue #2445 AC3), the outer session's own single Bash-tool
-# decision does not always translate into exactly one nested-invocation
-# subprocess launch (the model sometimes re-runs the requested command), and
-# even a single nested subprocess's own internal machinery can itself issue
-# more than one haiku-tier upstream request -- so "exactly one reqId" and
-# "exactly one contiguous run" are both too brittle. What actually matters:
+# `transport_observed` rests on this log's EXCLUSIVITY (a fresh, single-run
+# scratch `CLAUDE_GPT_HOME` this script alone seeds and this script alone
+# points `launch.sh` at -- no other process, session, or concurrent
+# invocation can reach this exact instance), not on reqId-counting
+# heuristics or model-alias causal attribution. Empirically (live runs,
+# Issue #2445 AC3), the outer session's own single Bash-tool decision does
+# not always translate into exactly one nested-invocation subprocess launch
+# (the model sometimes re-runs the requested command), and even a single
+# nested subprocess's own internal machinery can itself issue more than one
+# haiku-tier upstream request -- so "exactly one reqId" would be brittle,
+# and is not required. What actually matters for `transport_observed`:
 #   1. At least one haiku-tier (gpt-5.6-luna -- `retrospective-runtime-observer`'s
 #      pinned `model: haiku`, distinct from the outer session's own `main`
-#      alias `gpt-5.6-terra`) upstream request was observed at all (proves
-#      the nested subprocess reached the proxy, rather than falling back to
-#      some other transport with no proxy interaction whatsoever).
+#      alias `gpt-5.6-terra`) upstream request was observed at all (the
+#      nested subprocess's expected traffic reached the proxy, rather than
+#      falling back to some other transport with no proxy interaction
+#      whatsoever). This is an observation, not an exclusive-ownership
+#      proof -- the alias is also used by Claude Code for other background
+#      functionality per its own docs.
 #   2. `transport_log.py`'s OWN canonical, already-validated verdict for the
 #      WHOLE scoped log is `ok: true` -- every single reqId in this
 #      exclusively-owned log (both the outer session's own turns AND every
@@ -317,9 +331,11 @@ def _model_alias(event: dict) -> str:
 #      round trip; this is already the strict global constraint (no
 #      websocket/auto transport, no malformed lines, no reqId/path/status
 #      mismatch, ANYWHERE in the log), so it independently also covers every
-#      individual haiku-tier request's own confirmation.
+#      individual haiku-tier request's own confirmation, and confirms the
+#      outer session's own ("Terra") traffic succeeded via the same
+#      expected transport too.
 haiku_matches = [e for e in started if _model_alias(e) == HAIKU_ALIAS]
-non_haiku_matches = [e for e in started if _model_alias(e) != HAIKU_ALIAS]
+outer_alias_matches = [e for e in started if _model_alias(e) != HAIKU_ALIAS]
 
 verdict = transport_log.evaluate_transport_log(log_path)
 
@@ -327,7 +343,7 @@ result = {
     "malformed_line_count": malformed,
     "started_count": len(started),
     "haiku_alias_match_count": len(haiku_matches),
-    "non_haiku_alias_match_count": len(non_haiku_matches),
+    "outer_alias_match_count": len(outer_alias_matches),
     "observed_model_aliases": sorted({_model_alias(e) for e in started}),
     "transport_verdict_ok": verdict.ok,
     "transport_verdict_reason": "; ".join(verdict.reasons) if verdict.reasons else "ok",
@@ -342,15 +358,15 @@ with open(out_path, "w", encoding="utf-8") as fh:
 print(json.dumps(result))
 PYEOF2
 )"
-ATTRIBUTION_PY_EXIT=$?
-_log "attribution result: $ATTRIBUTION_RESULT"
+OBSERVATION_PY_EXIT=$?
+_log "transport_observed result: $OBSERVATION_RESULT"
 
-if [ "$ATTRIBUTION_PY_EXIT" -ne 0 ]; then
-  _finish FAIL "attribution script itself failed (exit $ATTRIBUTION_PY_EXIT) -- see log" 1
+if [ "$OBSERVATION_PY_EXIT" -ne 0 ]; then
+  _finish FAIL "transport_observed check script itself failed (exit $OBSERVATION_PY_EXIT) -- see log" 1
 fi
 
-HAIKU_MATCH_COUNT="$(uv run --locked python3 -c "import json,sys; print(json.loads(sys.argv[1])['haiku_alias_match_count'])" "$ATTRIBUTION_RESULT" 2>>"$LOG_FILE")"
-ATTRIBUTION_OK="$(uv run --locked python3 -c "import json,sys; print(json.loads(sys.argv[1])['ok'])" "$ATTRIBUTION_RESULT" 2>>"$LOG_FILE")"
+HAIKU_MATCH_COUNT="$(uv run --locked python3 -c "import json,sys; print(json.loads(sys.argv[1])['haiku_alias_match_count'])" "$OBSERVATION_RESULT" 2>>"$LOG_FILE")"
+TRANSPORT_OBSERVED_OK="$(uv run --locked python3 -c "import json,sys; print(json.loads(sys.argv[1])['ok'])" "$OBSERVATION_RESULT" 2>>"$LOG_FILE")"
 
 if [ "$HAIKU_MATCH_COUNT" = "0" ]; then
   if [ "$DRIVER_STATUS" = "ok" ]; then
@@ -358,11 +374,11 @@ if [ "$HAIKU_MATCH_COUNT" = "0" ]; then
   fi
   _finish FAIL "no Haiku-tier (gpt-5.6-luna) request observed in the scratch proxy log, and the nested invocation itself did not report success either" 1
 fi
-if [ "$ATTRIBUTION_OK" != "True" ]; then
-  _finish FAIL "transport_log.py's own verdict for this exclusively-owned, run-scoped log was not ok (see $ATTRIBUTION_JSON and $PRESERVED_LOG_PATH for the full reasons -- e.g. non-http transport, malformed lines, or an unconfirmed reqId anywhere in the log, not necessarily limited to the haiku-tier requests)" 1
+if [ "$TRANSPORT_OBSERVED_OK" != "True" ]; then
+  _finish FAIL "transport_log.py's own verdict for this exclusively-owned, run-scoped log was not ok (see $OBSERVATION_JSON and $PRESERVED_LOG_PATH for the full reasons -- e.g. non-http transport, malformed lines, or an unconfirmed reqId anywhere in the log, not necessarily limited to the haiku-tier requests)" 1
 fi
 if [ "$DRIVER_STATUS" != "ok" ]; then
   _finish FAIL "nested invocation's own reported status was '$DRIVER_STATUS' (expected ok), even though a matching proxy request was observed -- see $DRIVER_RESULT_JSON provenance in the log" 1
 fi
 
-_finish PASS "nested claude subprocess's Haiku-tier (gpt-5.6-luna) request(s) [$HAIKU_MATCH_COUNT observed] were confirmed via a run-scoped, exclusively-owned claude-code-proxy transport log (transport_log.py verdict ok: every reqId in the log, http /v1/messages 200); attribution evidence: $ATTRIBUTION_JSON" 0
+_finish PASS "transport_observed: within this run-scoped, exclusively-owned claude-code-proxy transport log, both the outer session's own traffic and the nested observer's expected Haiku-tier (gpt-5.6-luna) /v1/messages traffic [$HAIKU_MATCH_COUNT haiku-tier request(s) observed] were observed, and transport_log.py's verdict for every request in the log is ok (http /v1/messages 200, no fallback). Exclusive attribution of a single reqId to the nested invocation is NOT claimed. Evidence: $OBSERVATION_JSON" 0

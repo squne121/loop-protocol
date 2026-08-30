@@ -11,29 +11,28 @@ follow-up implementation Issue を作成しリンクする。
 ### 結果サマリ
 
 ```yaml
-result_status: verified
+result_status: parity_failed
 parity_verified: false
 tested_head: aade97858e348985081156afab134c317faac67f
 availability_probe: available
 deterministic_guard_matrix_passed: true
 claude_gpt_live_deny_passed: false
 claude_gpt_live_allow_passed: false
-nested_claude_proxy_transport_proven: true
+nested_claude_proxy_transport_proven: false
 ```
 
-> **Issue #2445 post-fix update**: `result_status` は `parity_failed` から
-> `verified` へ更新した（下記「Issue #2445 post-fix re-verification」参照）。
-> これは本セクションが特定した **`transport_routing_gap` capability gap
-> （nested claude invocation に Claude-GPT proxy routing 手段が存在しない
-> こと）が Issue #2445 の修正により解消し、live 動作検証で証明された**
-> ことを意味する。`claude_gpt_live_deny_passed` / `claude_gpt_live_allow_passed`
-> は本 Issue のスコープ外（transport routing gap とは別の、guard の
-> deny/allow 挙動そのものについての未検証の claim）であり、`false` のまま
-> 据え置く。これらを再検証する場合は、Issue #2436 の元の live deny/allow
-> canary（`test_run_retrospective_live_cli.py`）を、今回修正済みの
-> transport 経路上で改めて実行する必要がある（本 Issue #2445 のスコープ外、
-> 別途 follow-up として扱う）。したがって `parity_verified`（Claude-GPT /
-> Native Claude 間の完全な capability parity）も `false` のまま据え置く。
+> **本セクションは Issue #2436 の元の測定結果のみを記述する（`tested_head`
+> 固定、変更なし）**: 上記4フィールドはいずれも Issue #2436 で `verified` と
+> 判定するために必要な必要条件（全件成立が条件）であり、
+> `claude_gpt_live_deny_passed` / `claude_gpt_live_allow_passed` /
+> `nested_claude_proxy_transport_proven` が `false` のままである限り、
+> `result_status` は `parity_failed` のまま据え置く（OWNER 敵対的レビュー
+> https://github.com/squne121/loop-protocol/pull/2453#issuecomment-5469097778
+> P0-1 指摘に基づく訂正）。Issue #2445 が修正・観測した内容は、この4フィールド
+> のうちどれか単体を `true` に書き換えることでは表現せず、下記
+> 「Issue #2445 post-fix re-verification」セクションに、本セクションとは
+> 独立した、狭いスコープの別レコード（`transport_routing_gap_status`）として
+> 追記する。
 
 - 検証日時（`timestamp`）: 2026-08-30（日本時間、セッション実施日）
 - 対象リポジトリ（`tested_repository`）: squne121/loop-protocol
@@ -210,7 +209,7 @@ implementation Issue。修正内容（Allowed Paths: `run_retrospective.py` /
   を新設し、修正後の実装で PR 時の一回限りの live verification を実施した
   （下記「AC3 live 実施結果」参照）。
 
-#### AC3 live 実施結果
+#### AC3 live 実施結果（`transport_observed`、排他的帰属は主張しない）
 
 `scripts/claude-gpt/launch.sh` 経由で起動した outer live Claude-GPT
 セッション（実 ChatGPT subscription 認証）から、`run_retrospective.py` の
@@ -224,6 +223,16 @@ Issue #2436 の反省（同一 Unix user 単位で共有される単一 proxy lo
 `scripts/claude-gpt/transport_log.py`（無変更、読み取り専用利用）でその
 scoped log を判定した。
 
+証明対象は **`transport_observed`** であり、OWNER 敵対的レビュー
+（https://github.com/squne121/loop-protocol/pull/2453#issuecomment-5469097778
+P0-2）を踏まえた次の理由により、対象 nested invocation への
+**排他的帰属（exclusive attribution）は主張しない**: model alias
+（Haiku-tier の `gpt-5.6-luna`）は Claude Code 公式ドキュメントが
+background functionality にも用いると明記しており、一意な causal ID として
+使えない。実際に live trial では 5/5/8 件の request が観測され、Haiku-tier
+（"Luna"）と outer（"Terra"）双方の model-alias traffic が同一 scoped log に
+混在した。
+
 3 回の live trial すべてで PASS（exit 0）:
 
 ```
@@ -234,18 +243,45 @@ observed_model_aliases: ["gpt-5.6-luna", "gpt-5.6-terra"] のみ
   （gpt-5.6-terra は outer セッション自身の main エイリアス。他の未知
   エイリアスは一度も観測されなかった）
 transport_log.py の transport_verdict.ok: true（毎回。malformed 行 0、
-  websocket/auto 0、reqId 相関済みの http /v1/messages 200 のみ）
+  websocket/auto 0、全 reqId が http /v1/messages 200 で確認済み）
 fallback_suspected: 該当なし（毎回 haiku エイリアス側の request が観測された）
 ```
 
-`ANTHROPIC_BASE_URL` 等が nested claude subprocess まで実際に伝播し、実際に
-Claude-GPT proxy 経由で `/v1/messages` を叩いたことを、この nested
-invocation に排他的に帰属できるログ scope で証明した。よって
-`nested_claude_proxy_transport_proven: false` → **`true`** に更新する。
+この run-scoped transport log 内で、outer session 自身のトラフィックと
+nested invocation が期待する Haiku-tier `/v1/messages` トラフィックの両方が
+観測され、観測された全リクエストが期待される transport（proxy）経由で
+成功したこと（`transport_observed`）を確認した。対象 nested invocation に
+どの単一 reqId が帰属するかを排他的に特定すること（exclusive attribution）
+は主張しない。
+
+この結果は、Issue #2436 の `verified` 判定に必要な4フィールド
+（本ドキュメント冒頭「結果サマリ」参照）のいずれも `true` に書き換えない。
+`nested_claude_proxy_transport_proven` は Issue #2436 の元の（より強い、
+排他的帰属を要求する）claim であり、本 Issue #2445 は別の狭いスコープの
+claim（`transport_routing_gap_status`）だけを検証・記録する:
+
+```yaml
+transport_routing_gap_status: verified
+post_fix_tested_head: 60e189af50ed7ba6d2548414139a10e8d71799a0
+nested_claude_proxy_transport_observed: true
+```
+
+- `transport_routing_gap_status: verified` は、本 Issue #2445 が特定・修正
+  した `transport_routing_gap` capability gap（nested claude invocation に
+  Claude-GPT proxy routing 手段が存在しないこと）が解消し、上記の live
+  verification で `transport_observed` を確認したことのみを意味する。
+- `nested_claude_proxy_transport_observed: true` は「排他的に帰属できる
+  ログ scope で証明した」ではなく「観測した」という弱い claim である。
+- `claude_gpt_live_deny_passed` / `claude_gpt_live_allow_passed` /
+  `parity_verified` / `nested_claude_proxy_transport_proven`（Issue #2436
+  の元の4フィールド）はいずれも本レコードでは変更しない（`false` のまま、
+  スコープ外）。
 
 #### AC4: 再実行手順（re-run procedure）
 
-本エントリの `verified` 判定を独立に再現する場合の手順:
+本エントリの `transport_routing_gap_status: verified` 判定を独立に再現する
+場合の手順（Issue #2436 の元の `result_status: parity_failed` 判定はこの
+手順では変更しない）:
 
 ```bash
 # AC1
@@ -257,8 +293,9 @@ uv run --locked pytest .claude/skills/agent-retrospective/scripts/tests/test_san
 # AC3 (実 ChatGPT subscription 認証が必要。利用不能な環境では exit 77 で SKIP)
 bash .claude/skills/agent-retrospective/scripts/tests/verify_claude_gpt_transport_passthrough.sh
 
-# AC4 (このエントリ自体の所在確認)
-rg -n "parity_failed|nested_claude_proxy_transport_proven" docs/dev/agent-capability-gaps.md
+# AC4 (このエントリ自体の所在確認。Issue #2436 の元の parity_failed 判定が
+# 変更されていないことも同時に確認できる)
+rg -n "parity_failed|transport_routing_gap_status" docs/dev/agent-capability-gaps.md
 ```
 
 #### 未解決のまま残る事項（Out of Scope, follow-up 検討）
