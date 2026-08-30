@@ -508,3 +508,276 @@ def test_dependency_materialization_resolves_native_predecessor_keys_from_edit_i
     assert add_key == "add_blocked_by"
     assert remove_key == "remove_blocked_by"
     assert {add_key, remove_key}.issubset(edit_txn.NATIVE_RELATIONSHIPS_KEYS)
+
+
+# ---------------------------------------------------------------------------
+# P1 (OWNER review on PR #2447): this module must never re-invoke
+# contract_readiness_check.py itself -- it only forwards a caller-supplied
+# readiness_result, or falls back to a no-op "go" default computed without
+# any subprocess call.
+# ---------------------------------------------------------------------------
+
+
+def test_dependency_materialization_never_shells_out_for_readiness():
+    """The old `_run_readiness_check` subprocess helper no longer exists at
+    all -- there is no internal seam left that could re-invoke
+    contract_readiness_check.py."""
+    assert not hasattr(dm, "_run_readiness_check")
+    assert not hasattr(dm, "READINESS_SCRIPT")
+
+
+def test_dependency_materialization_forwards_caller_supplied_readiness_result():
+    """A caller-supplied readiness_result is forwarded verbatim into the
+    edit_issue_txn.py payload rather than recomputed."""
+    captured: dict[str, Any] = {}
+
+    def fake_live(issue_number: int, repo: str) -> tuple[dict[str, Any], str]:
+        return {"parent": None, "blocked_by": [], "blocking": []}, ""
+
+    def capture_invoke(payload: dict[str, Any], *, issue_number: int) -> dict[str, Any]:
+        captured["readiness_result"] = payload["readiness_forwarding_payload"]["readiness_result"]
+        return _fake_edit_txn_invoke_ok(payload, issue_number=issue_number)
+
+    caller_readiness = {
+        "status": "needs_fix",
+        "body_sha256": "sha256:deadbeef",
+        "source_checks": ["caller_provided"],
+        "errors": [],
+        "readiness_result_ref": "artifacts/caller_provided.json",
+    }
+
+    dm.materialize_dependencies(
+        target_issue_number=1,
+        repo="squne121/loop-protocol",
+        desired_predecessors=[2422],
+        readiness_result=caller_readiness,
+        capability_preflight=lambda: (True, ""),
+        fetch_live_snapshot=fake_live,
+        fetch_issue_content=_fake_issue_content,
+        invoke_edit_issue_txn=capture_invoke,
+    )
+    assert captured["readiness_result"] == caller_readiness
+
+
+def test_dependency_materialization_default_readiness_result_does_not_invoke_subprocess(monkeypatch):
+    """When the caller omits readiness_result, no subprocess of any kind is
+    started by this module to compute one."""
+
+    def fail_if_called(*args: Any, **kwargs: Any):
+        raise AssertionError("dependency_materializer.py must never shell out for its own readiness check")
+
+    monkeypatch.setattr(dm.subprocess, "run", fail_if_called)
+
+    def fake_live(issue_number: int, repo: str) -> tuple[dict[str, Any], str]:
+        return {"parent": None, "blocked_by": [], "blocking": []}, ""
+
+    result = dm.materialize_dependencies(
+        target_issue_number=1,
+        repo="squne121/loop-protocol",
+        desired_predecessors=[2422],
+        capability_preflight=lambda: (True, ""),
+        fetch_live_snapshot=fake_live,
+        fetch_issue_content=_fake_issue_content,
+        invoke_edit_issue_txn=_fake_edit_txn_invoke_ok,
+    )
+    assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# P0 (OWNER review on PR #2447): evaluate_termination_dependency_gate() --
+# the mandatory Step 5 termination choke point. These tests exercise the
+# gate end-to-end (not just the standalone detect_body_only_false_green
+# unit tests above), per the owner's guidance to favor a small number of
+# high-value integration-shaped tests.
+# ---------------------------------------------------------------------------
+
+
+def test_termination_gate_no_hard_dependency_confirmed_is_a_noop():
+    """A cycle that confirmed no hard dependency at all must not be forced
+    to have one -- the gate is a no-op and never calls materialize()."""
+
+    def fail_if_called(**kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("materialize must not be called when no hard dependency was confirmed")
+
+    result = dm.evaluate_termination_dependency_gate(
+        target_issue_number=2424,
+        repo="squne121/loop-protocol",
+        current_execution_decision=None,
+        materialize=fail_if_called,
+    )
+    assert result["decision"] == "proceed"
+    assert result["materialization_result"] is None
+    assert result["body_only_false_green"] is False
+
+
+def test_termination_gate_2424_regression_fixture_proceeds():
+    """AC6-shaped fixture through the gate: desired={2422,2423,2432},
+    materialization succeeds, and the gate allows the approved termination
+    to proceed."""
+    decision = {
+        "relations": [
+            {"source_issue_number": 2424, "target_issue_number": 2422, "relation_type": "depends_on"},
+            {"source_issue_number": 2424, "target_issue_number": 2423, "relation_type": "depends_on"},
+            {"source_issue_number": 2424, "target_issue_number": 2432, "relation_type": "depends_on"},
+        ]
+    }
+
+    def fake_materialize(**kwargs: Any) -> dict[str, Any]:
+        assert sorted(kwargs["desired_predecessors"]) == [2422, 2423, 2432]
+        return {
+            "schema": dm.RESULT_SCHEMA,
+            "status": "ok",
+            "native_relationship_materialized": True,
+            "failure_class": None,
+            "edit_txn_status": "ok",
+            "observed_predecessors_after": [2422, 2423, 2432],
+        }
+
+    result = dm.evaluate_termination_dependency_gate(
+        target_issue_number=2424,
+        repo="squne121/loop-protocol",
+        current_execution_decision=decision,
+        current_body="## Outcome\n\nSome outcome text.\n",
+        materialize=fake_materialize,
+    )
+    assert result["decision"] == "proceed"
+    assert result["materialization_result"]["observed_predecessors_after"] == [2422, 2423, 2432]
+
+
+def test_termination_gate_explicit_remove_with_unrelated_blocker_preservation_proceeds():
+    """AC7(a)+(b) through the gate: reframing from {2422,2423,2432} to
+    {2422,2432} explicitly removes #2423 via the previous/current decision
+    delta, while an unrelated pre-existing blocker (#99) is preserved by the
+    underlying materializer -- the gate still proceeds."""
+    previous_decision = {
+        "relations": [
+            {"source_issue_number": 2424, "target_issue_number": 2422, "relation_type": "depends_on"},
+            {"source_issue_number": 2424, "target_issue_number": 2423, "relation_type": "depends_on"},
+            {"source_issue_number": 2424, "target_issue_number": 2432, "relation_type": "depends_on"},
+        ]
+    }
+    current_decision = {
+        "relations": [
+            {"source_issue_number": 2424, "target_issue_number": 2422, "relation_type": "depends_on"},
+            {"source_issue_number": 2424, "target_issue_number": 2432, "relation_type": "depends_on"},
+        ]
+    }
+
+    def fake_materialize(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["stale_predecessors_to_remove"] == [2423]
+        return {
+            "schema": dm.RESULT_SCHEMA,
+            "status": "ok",
+            "native_relationship_materialized": True,
+            "failure_class": None,
+            "edit_txn_status": "ok",
+            "observed_predecessors_after": [99, 2422, 2432],
+        }
+
+    result = dm.evaluate_termination_dependency_gate(
+        target_issue_number=2424,
+        repo="squne121/loop-protocol",
+        current_execution_decision=current_decision,
+        previous_execution_decision=previous_decision,
+        current_body="## Outcome\n\nSome outcome text.\n",
+        materialize=fake_materialize,
+    )
+    assert result["decision"] == "proceed"
+    assert 99 in result["materialization_result"]["observed_predecessors_after"]
+    assert 2423 not in result["materialization_result"]["observed_predecessors_after"]
+
+
+def test_termination_gate_body_only_false_green_blocks_approved_termination_end_to_end():
+    """The #2424 incident shape wired end-to-end: the body already declares
+    predecessors under '## Blocked By', native capability was available,
+    but native materialization was never attempted (e.g. a transient live
+    readback failure before any write was attempted) -- the gate must
+    block the approved termination, not just flag it in a standalone
+    detector unit test."""
+    decision = {
+        "relations": [
+            {"source_issue_number": 2424, "target_issue_number": 2422, "relation_type": "depends_on"},
+        ]
+    }
+
+    def fake_materialize(**kwargs: Any) -> dict[str, Any]:
+        # capability preflight succeeded (not native-capability-unavailable)
+        # but the live readback failed before any write was attempted.
+        return {
+            "schema": dm.RESULT_SCHEMA,
+            "status": "blocked",
+            "native_relationship_materialized": False,
+            "failure_class": "auth-or-environment-failure",
+            "edit_txn_status": None,
+        }
+
+    body = "## Blocked By\n\n- #2422\n\n## Outcome\n\nSome outcome text.\n"
+    result = dm.evaluate_termination_dependency_gate(
+        target_issue_number=2424,
+        repo="squne121/loop-protocol",
+        current_execution_decision=decision,
+        current_body=body,
+        materialize=fake_materialize,
+    )
+    assert result["decision"] == "block_persistent"
+    assert result["body_only_false_green"] is True
+    assert result["reason"] == "body_only_false_green_detected"
+
+
+def test_termination_gate_retryable_failure_without_body_only_blocks_retryable():
+    """A transient environment failure with no body-only shortcut in play
+    (the body does not declare any predecessors yet) must be retryable, not
+    escalated to a human."""
+    decision = {
+        "relations": [{"source_issue_number": 2424, "target_issue_number": 2422, "relation_type": "depends_on"}]
+    }
+
+    def fake_materialize(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema": dm.RESULT_SCHEMA,
+            "status": "blocked",
+            "native_relationship_materialized": False,
+            "failure_class": "auth-or-environment-failure",
+            "edit_txn_status": None,
+        }
+
+    result = dm.evaluate_termination_dependency_gate(
+        target_issue_number=2424,
+        repo="squne121/loop-protocol",
+        current_execution_decision=decision,
+        current_body="## Outcome\n\nNo blocked-by section here.\n",
+        materialize=fake_materialize,
+    )
+    assert result["decision"] == "block_retryable"
+
+
+@pytest.mark.parametrize(
+    ("failure_class", "edit_txn_status"),
+    [
+        ("readback-mismatch", "ok"),
+        ("semantic-human-judgment-required", "human_judgment"),
+        ("native-capability-unavailable", None),
+    ],
+)
+def test_termination_gate_persistent_failure_classes_block_persistent(failure_class: str, edit_txn_status: str | None):
+    decision = {
+        "relations": [{"source_issue_number": 2424, "target_issue_number": 2422, "relation_type": "depends_on"}]
+    }
+
+    def fake_materialize(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema": dm.RESULT_SCHEMA,
+            "status": "failed",
+            "native_relationship_materialized": False,
+            "failure_class": failure_class,
+            "edit_txn_status": edit_txn_status,
+        }
+
+    result = dm.evaluate_termination_dependency_gate(
+        target_issue_number=2424,
+        repo="squne121/loop-protocol",
+        current_execution_decision=decision,
+        current_body="## Outcome\n\nNo blocked-by section here.\n",
+        materialize=fake_materialize,
+    )
+    assert result["decision"] == "block_persistent"

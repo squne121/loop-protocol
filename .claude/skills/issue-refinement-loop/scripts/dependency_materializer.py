@@ -64,6 +64,41 @@ I/O) callable with an explicit, injectable collaborator boundary
 any future lane) can import and call ``materialize_dependencies`` directly
 without needing its own copy of the delta/postcondition logic, and without
 colliding with this module's own callers.
+
+## Readiness consumption, not re-computation (P1, OWNER review on PR #2447)
+
+``materialize_dependencies`` never invokes ``contract_readiness_check.py``
+itself. It only forwards whatever ``readiness_result`` the caller already
+computed earlier in the same refinement cycle (e.g. the existing Step 4
+pre-edit static readiness check, or the Final Gate's confirmed
+``CONTRACT_REVIEW_RESULT_V1.status == "go"``) to
+``edit_issue_txn.py``'s existing ``readiness_forwarding_payload`` contract.
+This module previously ran its own ``contract_readiness_check.py``
+subprocess and mapped that subprocess's own non-JSON/crash output to
+``status: input_or_runtime_error``, which ``edit_issue_txn.py`` then folds
+into an overall ``status: human_judgment`` -- turning a routine, retryable
+failure inside *this module's own* readiness re-check into an unnecessary
+human-judgment escalation. Removing the internal re-check removes that
+failure mode entirely: a caller-supplied ``readiness_result`` whose own
+``status`` is genuinely ``human_judgment`` / ``input_or_runtime_error`` (a
+real signal from the workflow's own readiness pipeline, not a crash inside
+this module) is still correctly classified as
+``semantic-human-judgment-required`` via
+``_FAILURE_CLASS_BY_ERROR_CODE["readiness_forwarding_requires_human_judgment"]``.
+
+## Step 5 termination gate (P0, OWNER review on PR #2447)
+
+``evaluate_termination_dependency_gate`` is the single production choke
+point the ``issue-refinement-loop`` Step 5 termination path calls before
+posting an ``approved`` / ``LOOP_HANDOFF_RESULT_V1`` termination for a
+cycle where a hard dependency was confirmed via any production lane
+(trusted human context, trusted anchor, controlled reframe, or the #2406
+confirmed-hard-predecessor route). Without this wiring, adding the
+producer/materializer alone left the #2424 defect this Issue exists to fix
+fully reproducible after merge (the choke point existed but nothing in the
+real termination path ever called it). See
+``references/termination-policy.md`` (Dependency Materialization Gate) for
+the mandatory Step 5 invocation contract.
 """
 
 from __future__ import annotations
@@ -81,11 +116,18 @@ from typing import Any, Callable
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[4]
 EDIT_ISSUE_SCRIPTS_DIR = REPO_ROOT / ".claude" / "skills" / "edit-issue" / "scripts"
-READINESS_SCRIPT = (
-    REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
-)
 
 RESULT_SCHEMA = "DEPENDENCY_MATERIALIZATION_RESULT_V1"
+GATE_RESULT_SCHEMA = "TERMINATION_DEPENDENCY_GATE_RESULT_V1"
+
+GATE_DECISIONS = frozenset({"proceed", "block_retryable", "block_persistent"})
+
+# AC8 failure classes that a Step 5 termination gate caller should treat as
+# transient/environment noise (bounded-retry, never escalate to a human) as
+# opposed to a genuine persistent block (readback drift, capability that is
+# fundamentally unavailable, a real semantic-human-judgment signal, or a
+# detected body-only false-green).
+_RETRYABLE_FAILURE_CLASSES = frozenset({"auth-or-environment-failure", "controlled-executor-failure"})
 
 FAILURE_CLASSES = frozenset(
     {
@@ -329,34 +371,27 @@ def _write_repo_relative_tmp(relative_dir: str, suffix: str, text: str) -> str:
     return str(path.relative_to(REPO_ROOT)).replace("\\", "/")
 
 
-def _run_readiness_check(body_text: str, issue_number: int) -> dict[str, Any]:
-    body_ref = _write_repo_relative_tmp("tmp", ".md", body_text)
-    cp = subprocess.run(
-        [sys.executable, str(READINESS_SCRIPT), "--body-file", str(REPO_ROOT / body_ref), "--mode", "static"],
-        capture_output=True,
-        text=True,
-        cwd=str(REPO_ROOT),
-        timeout=60,
-    )
-    try:
-        parsed = json.loads(cp.stdout)
-    except json.JSONDecodeError:
-        parsed = {
-            "status": "input_or_runtime_error",
-            "body_sha256": "sha256:" + hashlib.sha256(body_text.encode("utf-8")).hexdigest(),
-            "source_checks": [],
-            "errors": [{"code": "readiness_check_non_json_output", "message": cp.stderr.strip()[:400]}],
-        }
+def _default_readiness_result(body_text: str, issue_number: int) -> dict[str, Any]:
+    """Fallback ``readiness_result`` used only when the caller does not pass
+    one already computed by the existing workflow (P1 fix, OWNER review on
+    PR #2447). This module never itself shells out to
+    ``contract_readiness_check.py`` -- doing so previously converted a
+    routine subprocess crash/non-JSON-output failure into a fabricated
+    ``status: input_or_runtime_error`` signal that ``edit_issue_txn.py``
+    then folded into an unnecessary ``human_judgment`` escalation. The
+    production caller (the Step 5 termination gate) always has an
+    already-confirmed ``status: go`` readiness available -- the Final Gate
+    (``references/termination-policy.md``) requires
+    ``CONTRACT_REVIEW_RESULT_V1.status == "go"`` before an ``approved``
+    termination is even reachable -- so this default exists only to keep
+    this module usable by isolated callers/tests that have no separate
+    readiness pipeline of their own; it performs no check of its own."""
+    body_sha256 = "sha256:" + hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+    parsed = {"status": "go", "body_sha256": body_sha256, "source_checks": [], "errors": []}
     readiness_ref = _write_repo_relative_tmp(
         f"artifacts/{issue_number}/dependency-materialization", ".readiness.json", json.dumps(parsed)
     )
-    return {
-        "status": parsed.get("status"),
-        "body_sha256": parsed.get("body_sha256"),
-        "source_checks": parsed.get("source_checks", []),
-        "errors": parsed.get("errors", []),
-        "readiness_result_ref": readiness_ref,
-    }
+    return {**parsed, "readiness_result_ref": readiness_ref}
 
 
 def _default_invoke_edit_issue_txn(input_payload: dict[str, Any], *, issue_number: int) -> dict[str, Any]:
@@ -427,6 +462,7 @@ def materialize_dependencies(
     repo: str,
     desired_predecessors: list[int],
     stale_predecessors_to_remove: list[int] | None = None,
+    readiness_result: dict[str, Any] | None = None,
     capability_preflight: Callable[[], tuple[bool, str]] = _default_capability_preflight,
     fetch_live_snapshot: Callable[[int, str], tuple[dict[str, Any] | None, str]] = _default_fetch_live_snapshot,
     fetch_issue_content: Callable[[int, str], tuple[dict[str, Any] | None, str]] = _default_fetch_issue_content,
@@ -437,6 +473,14 @@ def materialize_dependencies(
     deterministically (tests monkeypatch the seams) without ever making a
     live GitHub call -- and so any other lane (#2406's confirmed-hard-
     predecessor route included) can reuse this exact function unmodified.
+
+    ``readiness_result`` (P1 fix, OWNER review on PR #2447): the
+    already-computed ``readiness_forwarding_payload.readiness_result`` the
+    calling workflow produced earlier in the same cycle. This module never
+    invokes ``contract_readiness_check.py`` itself -- if the caller omits
+    this, a no-op ``status: go`` default is used (see
+    ``_default_readiness_result``); it is never derived from an internal
+    subprocess call.
     """
     desired = sorted(set(desired_predecessors))
     stale = sorted(set(stale_predecessors_to_remove or []))
@@ -522,7 +566,10 @@ def materialize_dependencies(
 
     current_body = issue_content.get("body", "")
     current_updated_at = issue_content.get("updatedAt", "")
-    readiness_result = _run_readiness_check(current_body, target_issue_number)
+    if readiness_result is not None:
+        effective_readiness_result = readiness_result
+    else:
+        effective_readiness_result = _default_readiness_result(current_body, target_issue_number)
 
     edit_txn = _load_edit_issue_txn()
     add_key, remove_key = _resolve_native_predecessor_delta_keys(edit_txn)
@@ -545,7 +592,7 @@ def materialize_dependencies(
         "issue_number": target_issue_number,
         "repo": repo,
         "new_body_file": new_body_ref,
-        "readiness_forwarding_payload": {"readiness_result": readiness_result},
+        "readiness_forwarding_payload": {"readiness_result": effective_readiness_result},
         "comment_mode": {"mode": "skip"},
         "expected_previous_body_sha256": "sha256:" + hashlib.sha256(current_body.encode("utf-8")).hexdigest(),
         "expected_previous_updated_at": current_updated_at,
@@ -612,6 +659,143 @@ def materialize_dependencies(
 
 
 # ---------------------------------------------------------------------------
+# Step 5 termination gate (P0, OWNER review on PR #2447)
+# ---------------------------------------------------------------------------
+
+
+def _render_gate_result(
+    *,
+    decision: str,
+    reason: str,
+    materialization_result: dict[str, Any] | None,
+    body_only_false_green: bool,
+    body_only_reason: str | None,
+) -> dict[str, Any]:
+    return {
+        "schema": GATE_RESULT_SCHEMA,
+        "decision": decision,
+        "reason": reason,
+        "materialization_result": materialization_result,
+        "body_only_false_green": body_only_false_green,
+        "body_only_reason": body_only_reason,
+    }
+
+
+def evaluate_termination_dependency_gate(
+    *,
+    target_issue_number: int,
+    repo: str,
+    current_execution_decision: dict[str, Any] | None,
+    previous_execution_decision: dict[str, Any] | None = None,
+    current_body: str = "",
+    materialize: Callable[..., dict[str, Any]] = materialize_dependencies,
+) -> dict[str, Any]:
+    """The mandatory Step 5 termination gate (Issue #2435 P0, OWNER review on
+    PR #2447): ``issue-refinement-loop`` MUST call this before posting an
+    ``approved`` / ``LOOP_HANDOFF_RESULT_V1`` termination for a cycle where a
+    hard dependency was confirmed via any production lane (trusted human
+    context, trusted anchor, controlled reframe, or the #2406
+    confirmed-hard-predecessor route). See
+    ``references/termination-policy.md`` (Dependency Materialization Gate)
+    for the full Step 5 invocation contract.
+
+    Projects ``current_execution_decision`` (this cycle's confirmed
+    ``ISSUE_EXECUTION_DECISION_V1``) via ``derive_desired_predecessors``,
+    calls ``materialize_dependencies``, and folds the body-only
+    false-green detector (AC5) into the same decision so a caller cannot
+    reach ``proceed`` by posting a body-only ``## Blocked By`` mutation
+    while native materialization was never even attempted.
+
+    Returns ``TERMINATION_DEPENDENCY_GATE_RESULT_V1``:
+
+    - ``decision: proceed`` -- either no hard dependency was confirmed this
+      cycle (no-op; a cycle with no confirmed dependency is never required
+      to have one), or materialization succeeded and no body-only
+      false-green was detected. The orchestrator may continue with the
+      ``approved`` termination.
+    - ``decision: block_retryable`` -- a transient auth/environment or
+      controlled-executor failure (``_RETRYABLE_FAILURE_CLASSES``). The
+      orchestrator should bounded-retry, never escalate to a human on this
+      alone.
+    - ``decision: block_persistent`` -- a readback mismatch, a genuine
+      ``semantic-human-judgment-required`` signal, native capability being
+      fundamentally unavailable, or a detected body-only false-green
+      (AC5). The orchestrator MUST NOT post the ``approved`` termination
+      until this is resolved.
+    """
+    desired = derive_desired_predecessors(current_execution_decision, target_issue_number)
+    stale = derive_stale_predecessors(previous_execution_decision, current_execution_decision, target_issue_number)
+
+    if not desired and not stale:
+        return _render_gate_result(
+            decision="proceed",
+            reason="no_hard_dependencies_confirmed_this_cycle",
+            materialization_result=None,
+            body_only_false_green=False,
+            body_only_reason=None,
+        )
+
+    materialization_result = materialize(
+        target_issue_number=target_issue_number,
+        repo=repo,
+        desired_predecessors=desired,
+        stale_predecessors_to_remove=stale,
+    )
+
+    failure_class = materialization_result.get("failure_class")
+    capability_available = failure_class != "native-capability-unavailable"
+    native_relationship_attempted = materialization_result.get("edit_txn_status") not in (
+        None,
+        "no_op_not_attempted",
+    )
+    body_only, body_only_reason = detect_body_only_false_green(
+        current_body,
+        native_relationship_attempted=native_relationship_attempted,
+        capability_available=capability_available,
+    )
+
+    if body_only:
+        # AC5, wired end-to-end: a body-only false-green always blocks the
+        # approved termination, independent of the underlying failure_class
+        # shape (this is the exact #2424 incident silhouette -- body
+        # declares predecessors, native materialization was never even
+        # attempted, capability was available).
+        return _render_gate_result(
+            decision="block_persistent",
+            reason="body_only_false_green_detected",
+            materialization_result=materialization_result,
+            body_only_false_green=True,
+            body_only_reason=body_only_reason,
+        )
+
+    if materialization_result.get("status") == "ok":
+        return _render_gate_result(
+            decision="proceed",
+            reason="native_relationship_materialized",
+            materialization_result=materialization_result,
+            body_only_false_green=False,
+            body_only_reason=None,
+        )
+
+    if failure_class in _RETRYABLE_FAILURE_CLASSES:
+        return _render_gate_result(
+            decision="block_retryable",
+            reason=f"materialization_failure:{failure_class}",
+            materialization_result=materialization_result,
+            body_only_false_green=False,
+            body_only_reason=None,
+        )
+
+    return _render_gate_result(
+        decision="block_persistent",
+        reason=f"materialization_failure:{failure_class or 'unknown'}",
+        materialization_result=materialization_result,
+        body_only_false_green=False,
+        body_only_reason=None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -622,12 +806,26 @@ def _parse_int_list(raw: str | None) -> list[int]:
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+def _read_json_file(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _cmd_materialize(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Materialize an explicit add/remove native predecessor delta.")
     parser.add_argument("--target-issue", type=int, required=True)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--desired-predecessors", default="", help="comma-separated issue numbers")
     parser.add_argument("--stale-predecessors", default="", help="comma-separated issue numbers to explicitly remove")
+    parser.add_argument(
+        "--readiness-result-file",
+        default=None,
+        help=(
+            "path to an already-computed readiness_result JSON produced earlier in this cycle "
+            "(P1 fix: this module never re-runs contract_readiness_check.py itself)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     result = materialize_dependencies(
@@ -635,10 +833,66 @@ def main(argv: list[str] | None = None) -> int:
         repo=args.repo,
         desired_predecessors=_parse_int_list(args.desired_predecessors),
         stale_predecessors_to_remove=_parse_int_list(args.stale_predecessors),
+        readiness_result=_read_json_file(args.readiness_result_file),
     )
     sys.stdout.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     sys.stdout.write("\n")
     return 0 if result["status"] == "ok" else 1
+
+
+def _cmd_gate(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Step 5 termination gate (Issue #2435 P0): evaluate whether an approved "
+            "termination may proceed for this cycle's confirmed hard dependency."
+        )
+    )
+    parser.add_argument("--target-issue", type=int, required=True)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument(
+        "--current-decision-file",
+        required=True,
+        help="path to this cycle's confirmed ISSUE_EXECUTION_DECISION_V1 JSON",
+    )
+    parser.add_argument(
+        "--previous-decision-file",
+        default=None,
+        help="path to the prior cycle's confirmed ISSUE_EXECUTION_DECISION_V1 JSON, if any",
+    )
+    parser.add_argument("--body-file", default=None, help="path to the current Issue body text")
+    args = parser.parse_args(argv)
+
+    current_decision = _read_json_file(args.current_decision_file)
+    previous_decision = _read_json_file(args.previous_decision_file)
+    body_text = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else ""
+
+    result = evaluate_termination_dependency_gate(
+        target_issue_number=args.target_issue,
+        repo=args.repo,
+        current_execution_decision=current_decision,
+        previous_execution_decision=previous_decision,
+        current_body=body_text,
+    )
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    sys.stdout.write("\n")
+    if result["decision"] == "proceed":
+        return 0
+    if result["decision"] == "block_retryable":
+        return 2
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Dispatches to the ``gate`` (Step 5 termination gate) or
+    ``materialize`` (standalone delta materialization) subcommand. No
+    subcommand token is treated as ``materialize`` for backward
+    compatibility with the original Issue #2435 CLI contract."""
+    raw_argv = sys.argv[1:] if argv is None else argv
+    if raw_argv and raw_argv[0] == "gate":
+        return _cmd_gate(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "materialize":
+        return _cmd_materialize(raw_argv[1:])
+    return _cmd_materialize(raw_argv)
 
 
 if __name__ == "__main__":
