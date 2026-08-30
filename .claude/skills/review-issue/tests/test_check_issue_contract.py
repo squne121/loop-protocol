@@ -846,13 +846,36 @@ class TestMachineReadableContractPriority:
 # ---------------------------------------------------------------------------
 
 # Inline fixture for human_judgment detection tests.
-# This issue has a VC that calls a nonexistent tool, which produces exit 127
-# (env_missing_dep → human_judgment status in contract_readiness_check.py).
-# The key property: overall status == "human_judgment", NOT "needs_fix".
+#
+# Issue #2397 Scope Delta iteration 2: this fixture previously used a VC
+# calling `loop-protocol-nonexistent-tool-xyz-abc`, a binary not present on
+# baseline_vc_preflight.py's closed command allowlist (`_ALLOWED_COMMANDS`).
+# Per Issue #514's allowlist-closed policy, such a call is rejected *before*
+# execution (`category: command_not_allowed`, exit_code=None), never actually
+# reaching the point of executing and getting a real exit 127. Issue #2397
+# Scope Delta AC9 intentionally maps `command_not_allowed -> needs_fix` in
+# `_PREFLIGHT_CATEGORY_TO_READINESS` (it is a body-fixable state: the VC can
+# be rewritten to use an allowlisted command), so this fixture's prior VC no
+# longer exercises a genuinely operator-only (human_judgment) state.
+#
+# The fixture below is replaced with the same genuinely operator-only
+# pattern established by Issue #2397's own new tests
+# (`test_operator_intervention_route.py` /
+# `test_operator_intervention_route_scope_delta.py`): `jq` IS on the closed
+# allowlist, so the real checker chain actually executes it, against a path
+# that does not exist. `jq`'s exit code (2) and stderr do not match any of
+# `classify_result()`'s specific patterns, so classification falls through
+# to the terminal "Unknown: cannot classify" branch
+# (`decision: "human_judgment"`, `category: "unknown"`), which
+# `map_preflight_result_to_errors()` treats as `human_judgment`
+# unconditionally -- a genuine operator-only signal, unaffected by the
+# `command_not_allowed -> needs_fix` fix.
+# The key property (unchanged): overall status == "human_judgment"
+# (or "blocked"), NOT "needs_fix".
 _HUMAN_JUDGMENT_ISSUE_CONTENT = """\
 ---
 LABELS: phase/implementation,kind/implementation
-TITLE: 実装: human_judgment テスト用フィクスチャ（VC が env_missing_dep で human_judgment になる Issue）
+TITLE: 実装: human_judgment テスト用フィクスチャ（VC が unknown 分類で human_judgment になる Issue）
 ---
 ## Machine-Readable Contract
 
@@ -875,8 +898,13 @@ none
 ## Background
 
 このフィクスチャは `--mode execute` の human_judgment 検出テスト用。
-VC の `$ loop-protocol-nonexistent-tool-xyz-abc` は常に exit 127 (command not found) を返すため、
-env_missing_dep → human_judgment となる。
+VC の `$ jq '.' fixture/e2e_check_issue_contract_human_judgment_unknown.json` は、
+`jq` 自体は preflight の許可コマンド一覧（`_ALLOWED_COMMANDS`）に含まれるため実際に実行されるが、
+参照先パスが存在しないため exit code 2 で失敗し、`classify_result()` の既知パターン
+（env_missing_dep / timeout 等）のいずれにも一致せず `category: unknown` に分類される。
+`unknown` は `_PREFLIGHT_CATEGORY_TO_READINESS` で human_judgment のまま維持される、
+本文修正では解消しない genuine operator-only な状態である
+（Issue #2397 Scope Delta: `command_not_allowed` を human_judgment fixture に使わない）。
 
 ## Parent Goal Ref
 
@@ -905,13 +933,14 @@ env_missing_dep → human_judgment となる。
 
 ## Acceptance Criteria
 
-- [ ] AC1: `loop-protocol-nonexistent-tool-xyz-abc` が exit 127 を返すこと（human_judgment テスト用）
+- [ ] AC1: `jq '.' fixture/e2e_check_issue_contract_human_judgment_unknown.json` が
+      存在しないパスに対する `unknown` 分類で human_judgment となること（human_judgment テスト用）
 
 ## Verification Commands
 
 ```bash
 # AC1
-$ loop-protocol-nonexistent-tool-xyz-abc
+$ jq '.' fixture/e2e_check_issue_contract_human_judgment_unknown.json
 ```
 
 ## Stop Conditions
@@ -1139,18 +1168,33 @@ class TestContractReadinessExecuteIntegration:
             assert "command_hash" in payload, f"source_payload missing 'command_hash': {payload}"
 
     def test_human_judgment_not_collapsed_to_needs_fix(self):
-        """GIVEN a fixture with a nonexistent-tool VC WHEN --mode execute runs
+        """GIVEN a fixture with a genuinely operator-only VC WHEN --mode execute runs
         THEN status == human_judgment (AC5: must NOT be collapsed to needs_fix).
 
-        Uses _HUMAN_JUDGMENT_ISSUE_CONTENT which has VC: $ loop-protocol-nonexistent-tool-xyz-abc.
-        That command exits with 127 (command not found) → env_missing_dep → human_judgment.
+        Uses _HUMAN_JUDGMENT_ISSUE_CONTENT which has VC:
+        $ jq '.' fixture/e2e_check_issue_contract_human_judgment_unknown.json
+        `jq` is on the preflight allowlist and is actually executed, but the referenced
+        path does not exist, so its exit code (2) matches none of classify_result()'s
+        known patterns and falls through to `category: unknown` -> human_judgment.
+
+        Issue #2397 Scope Delta iteration 2: this fixture previously used
+        `$ loop-protocol-nonexistent-tool-xyz-abc`, an unallowlisted binary that
+        `classify_result()` rejects *before* execution as `command_not_allowed`
+        (a body-fixable state intentionally mapped to `needs_fix` by Issue #2397
+        Scope Delta AC9, not human_judgment). The fixture was replaced with a
+        genuinely operator-only (`unknown` classification) state so this test keeps
+        verifying that human_judgment is not collapsed to needs_fix, without relying
+        on the now-reclassified `command_not_allowed` category.
         The contract_readiness_check.py must NOT collapse this to needs_fix."""
         result, _exit_code = run_contract_readiness_from_content(_HUMAN_JUDGMENT_ISSUE_CONTENT, mode="execute")
 
         # The fixture must produce at least one error.
-        # With the allowlist policy introduced in #514, unknown commands are classified as
-        # command_not_allowed / blocked (exit_code=None, not executed) rather than
-        # env_missing_dep / human_judgment (exit_code=127). Both must NOT be collapsed to needs_fix.
+        # NOTE: `command_not_allowed` is kept in this tolerance list only for defensive
+        # breadth; since Issue #2397 Scope Delta AC9, `command_not_allowed` itself maps
+        # to `needs_fix` (not human_judgment), so it would not actually satisfy this
+        # assertion on its own. This fixture exercises `unknown` instead (jq against a
+        # nonexistent path, exit_code=2, decision=human_judgment), which remains
+        # genuinely operator-only and unaffected by the AC9 change.
         errors = result.get("errors", [])
         non_needs_fix_errors = [
             e for e in errors
@@ -1163,7 +1207,8 @@ class TestContractReadinessExecuteIntegration:
         )
 
         # Overall status must be human_judgment or blocked (not needs_fix) (AC5)
-        # command_not_allowed blocked VCs map to status=human_judgment at the contract level.
+        # unknown-classification blocked VCs (e.g. jq against a nonexistent path) map to
+        # status=human_judgment at the contract level.
         assert result.get("status") in ("human_judgment", "blocked"), (
             f"non-needs_fix errors must NOT collapse overall status to needs_fix. "
             f"status={result.get('status')}, non_needs_fix_errors={non_needs_fix_errors}"
