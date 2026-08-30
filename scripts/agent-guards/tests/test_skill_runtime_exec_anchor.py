@@ -278,7 +278,124 @@ def _copy_tree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
 
 
-def _install_real_contract_update_fixture(repo_root: Path) -> Path:
+def _write_controlled_gh(trusted_bin: Path) -> None:
+    """Install an actual no-network ``gh`` executable for the fixture.
+
+    It records only safe operation labels and opaque config-path identity. The
+    copied production controlled executor reaches it as an OS child process.
+    """
+    trusted_bin.mkdir(parents=True)
+    gh_path = trusted_bin / "gh"
+    gh_path.write_text(
+        """#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+ARTIFACT = Path.cwd() / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+STATE_PATH = ARTIFACT / "fake_remote_issue.json"
+EXPECTED_CONFIG_DIR = os.environ.get("SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR")
+if not EXPECTED_CONFIG_DIR or os.environ.get("GH_CONFIG_DIR") != EXPECTED_CONFIG_DIR:
+    print("missing_or_wrong_config_path", file=sys.stderr)
+    raise SystemExit(66)
+if any(
+    os.environ.get(name)
+    for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+):
+    print("unexpected_credential_environment", file=sys.stderr)
+    raise SystemExit(65)
+
+argv = sys.argv[1:]
+read_argv = [
+    "api",
+    "--hostname",
+    "github.com",
+    "repos/squne121/loop-protocol/issues/1498",
+    "--jq",
+    '{title, body, updatedAt: .updated_at, isPullRequest: has("pull_request")}',
+]
+patch_prefix = [
+    "api",
+    "--hostname",
+    "github.com",
+    "--method",
+    "PATCH",
+    "repos/squne121/loop-protocol/issues/1498",
+    "--input",
+]
+if argv == read_argv:
+    operation = "issue_content_read"
+    state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    response = {
+        "title": state["title"],
+        "body": state["body"],
+        "updatedAt": state["updatedAt"],
+        "isPullRequest": False,
+    }
+elif tuple(argv) in {
+    (
+        "issue",
+        "view",
+        "1498",
+        "--repo",
+        "squne121/loop-protocol",
+        "--json",
+        "title,body,updatedAt",
+    ),
+    (
+        "issue",
+        "view",
+        "1498",
+        "--repo",
+        "squne121/loop-protocol",
+        "--json",
+        "number,title,body,labels,url,updatedAt",
+    ),
+}:
+    operation = "issue_view"
+    response = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+elif argv == [
+    "api",
+    "repos/squne121/loop-protocol/issues/1498/comments?per_page=100",
+    "--paginate",
+    "--slurp",
+]:
+    operation = "issue_comments_read"
+    response = [[json.loads((ARTIFACT / "fake_anchor.json").read_text(encoding="utf-8"))]]
+elif argv == ["api", "repos/squne121/loop-protocol/issues/comments/1"]:
+    operation = "issue_comment_read"
+    response = json.loads((ARTIFACT / "fake_anchor.json").read_text(encoding="utf-8"))
+elif len(argv) == len(patch_prefix) + 1 and argv[:-1] == patch_prefix:
+    operation = "issue_content_patch"
+    patch = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+    if set(patch) != {"title", "body"} or not all(isinstance(patch[key], str) for key in patch):
+        print("invalid_issue_content_patch", file=sys.stderr)
+        raise SystemExit(64)
+    state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    state["title"] = patch["title"]
+    state["body"] = patch["body"]
+    state["updatedAt"] = "2026-08-01T00:00:01Z"
+    STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
+    response = {"ok": True}
+else:
+    print("unexpected_fake_gh_argv", file=sys.stderr)
+    raise SystemExit(64)
+
+with (ARTIFACT / "fake_gh_operations.jsonl").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(operation) + "\\n")
+with (ARTIFACT / "fake_gh_config_states.jsonl").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps("expected_path") + "\\n")
+print(json.dumps(response))
+""",
+        encoding="utf-8",
+    )
+    gh_path.chmod(0o755)
+
+
+def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path) -> Path:
     """Install the production wrapper and its direct consumers.
 
     Only GitHub and the controlled mutation executor are replaced.  The
@@ -306,9 +423,37 @@ def _install_real_contract_update_fixture(repo_root: Path) -> Path:
     for rel in (
         "scripts/agent-guards/skill_runtime_exec.py",
         "scripts/agent-guards/skill_runtime_command_policy.py",
+        "scripts/agent-guards/controlled_skill_mutation_exec.py",
+        "scripts/agent-guards/controlled_skill_mutation_policy.py",
     ):
         src = source_root / rel
         _write_text(repo_root / rel, src.read_text())
+
+    executor_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_exec.py"
+    executor_source = executor_path.read_text(encoding="utf-8")
+    default_safe_path_return = (
+        "    return _dedupe_path_entries([*_trusted_toolchain_dirs(\"uv\"), *_SYSTEM_STANDARD_PATH_DIRS])\n"
+    )
+    fixture_safe_path_return = (
+        f"    return _dedupe_path_entries([{str(trusted_gh_bin)!r}, *_trusted_toolchain_dirs(\"uv\"), "
+        "*_SYSTEM_STANDARD_PATH_DIRS])\n"
+    )
+    assert default_safe_path_return in executor_source
+    _write_text(executor_path, executor_source.replace(default_safe_path_return, fixture_safe_path_return))
+
+    controlled_executor_path = repo_root / "scripts" / "agent-guards" / "controlled_skill_mutation_exec.py"
+    controlled_executor_source = controlled_executor_path.read_text(encoding="utf-8")
+    default_gh_trusted_paths = '_GH_TRUSTED_PATHS = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"'
+    fixture_gh_trusted_paths = (
+        f'_GH_TRUSTED_PATHS = {str(trusted_gh_bin)!r} + '
+        '":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"'
+    )
+    assert default_gh_trusted_paths in controlled_executor_source
+    _write_text(
+        controlled_executor_path,
+        controlled_executor_source.replace(default_gh_trusted_paths, fixture_gh_trusted_paths),
+    )
+    _write_controlled_gh(trusted_gh_bin)
 
     for rel in ("pyproject.toml", "uv.lock"):
         _write_text(repo_root / rel, (source_root / rel).read_text())
@@ -364,7 +509,7 @@ class CredentiallessGitHubReadTransport:
     # external controlled-executor boundary and mutates only the fixture's
     # artifact-root backed fake remote state.
     _write_text(
-        repo_root / "scripts" / "agent-guards" / "controlled_skill_mutation_exec.py",
+        repo_root / "scripts" / "agent-guards" / "fixture_unused_controlled_skill_mutation_exec.py",
         """from __future__ import annotations
 
 import argparse
@@ -401,7 +546,7 @@ if __name__ == "__main__":
     )
 
     _write_text(
-        next((repo_root / ".venv").glob("lib/python*/site-packages")) / "sitecustomize.py",
+        next((repo_root / ".venv").glob("lib/python*/site-packages")) / "fixture_unused_subprocess_helpers.py",
         """# Fixture-only external GitHub boundary for subprocess tests.
 import json
 import os
@@ -819,19 +964,21 @@ def test_executor_preflight_run_unaffected_without_anchor(tmp_path: Path) -> Non
 
 
 def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_path: Path) -> None:
-    """#1877 AC3/AC6/AC10: production process path and fake external boundary.
+    """#1877 AC3/AC6/AC10: production process path and fake GitHub boundary.
 
     This runs the real registry, policy, privileged executor,
     ``run_refinement_preflight.py``, planner, candidate readiness, review,
     and ``edit_issue_txn.py`` in a temporary git repository. It uses an
     isolated HOME and test-owned config-only `GH_CONFIG_DIR`; the fake GitHub
     boundary records only exact argv plus an opaque path-identity match.
-    Only GitHub and the controlled mutation executable are faked; no fixture
-    replaces the phase wrapper or changes the executor's production PATH
-    trust.
+    Only GitHub CLI I/O is faked by a fixture-owned executable. The real
+    controlled mutation executor runs unchanged apart from a fixture-local
+    trusted-path extension; no fixture replaces the phase wrapper or changes
+    the production executor's trust policy.
     """
     repo = _make_repo(tmp_path)
-    _install_real_contract_update_fixture(repo)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    _install_real_contract_update_fixture(repo, trusted_gh_bin)
     # Canonical repositories provision this approved transaction-local
     # workspace.  Create it before the executor's before-snapshot; the real
     # consumer removes its candidate/input files before the child returns.
@@ -895,23 +1042,28 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     # contract review detects the deliberately incomplete new AC.  That is a
     # terminal fail-closed result, never a successful implementation route.
     assert first.returncode == 2, first.stderr
-    request = json.loads((artifact_dir / "controlled_transaction_request.json").read_text())
-    assert request["command_id"] == "issue_content.update"
-    assert request["payload"]["schema"] == "ISSUE_CONTENT_UPDATE_INPUT_V1"
+    # The production controlled executor's authenticated effect is verified
+    # below through the fixture-local remote state and ordered fake-gh child
+    # operations, rather than through a fixture-specific executor receipt.
     assert "AC2: trusted fixture directive" in json.loads(
         (artifact_dir / "fake_remote_issue.json").read_text()
     )["body"]
-    calls = [json.loads(line) for line in (artifact_dir / "fake_gh_calls.jsonl").read_text().splitlines()]
+    operations = [
+        json.loads(line)
+        for line in (artifact_dir / "fake_gh_operations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
     config_states = [
         json.loads(line)
         for line in (artifact_dir / "fake_gh_config_states.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert config_states
-    assert set(config_states) == {"expected_path"}
-    assert calls == [
-        ["issue", "view", "1498", "--repo", "squne121/loop-protocol", "--json", "title,body,updatedAt"],
-        ["issue", "view", "1498", "--repo", "squne121/loop-protocol", "--json", "title,body,updatedAt"],
+    assert operations == [
+        "issue_view",
+        "issue_content_read",
+        "issue_content_patch",
+        "issue_content_read",
+        "issue_view",
     ]
+    assert config_states == ["expected_path"] * len(operations)
     result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     assert result["contract_update"] == {
         "status": "failed",
@@ -933,6 +1085,7 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
         repo,
         command_id="contract_update.run.with_human_context",
         use_fixture_runtime=True,
+        extra_env=config_only_env,
     )
     assert replay.returncode == 2, replay.stderr
     replay_result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
@@ -942,6 +1095,7 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
         repo,
         command_id="contract_update.run.with_anchor",
         use_fixture_runtime=True,
+        extra_env=config_only_env,
     )
     assert generic_replay.returncode == 2, generic_replay.stderr
     generic_replay_result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
@@ -1025,10 +1179,24 @@ def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_rea
     classifier chain, with ZERO writes and ZERO mutation-executor
     invocations (full-rewrite handoff, not a mutation attempt)."""
     repo = _make_repo(tmp_path)
-    _install_real_contract_update_fixture(repo)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    _install_real_contract_update_fixture(repo, trusted_gh_bin)
     (repo / "tmp").mkdir()
     artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    gh_config_dir = tmp_path / "test-owned-gh-config"
+    gh_config_dir.mkdir()
+    config_only_env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": str(gh_config_dir),
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+    }
 
     anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
     anchor_body = (
@@ -1084,6 +1252,7 @@ def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_rea
         command_id="contract_update.run.with_anchor",
         anchor_comment_url=anchor_url,
         use_fixture_runtime=True,
+        extra_env=config_only_env,
     )
 
     assert "NEXT_ACTION: issue_editor_required" in result.stdout, result.stdout + result.stderr
@@ -1093,11 +1262,25 @@ def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_rea
     assert payload["contract_update"]["disposition"] == "full_rewrite_required"
     assert payload["contract_update"]["writes"] == 0
     assert payload["contract_update"]["final_readback"] == "not_applicable"
-    # No mutation executor invocation of any kind: the write-path helper
-    # (controlled_skill_mutation_exec.py, this fixture's fake external
-    # controlled-executor boundary) is never reached for a disposition that
-    # attempted zero writes.
-    assert not (artifact_dir / "controlled_transaction_request.json").exists()
+    # `full_rewrite_required` resolves before the production controlled
+    # mutation executor. Its real marker must therefore be absent, and the
+    # fixture-owned gh child may not receive a PATCH argv.
+    production_marker_path = (
+        repo
+        / "artifacts"
+        / "1498"
+        / "issue-metadata"
+        / "issue_content.update"
+        / "issue_content_update.marker.json"
+    )
+    operations_path = artifact_dir / "fake_gh_operations.jsonl"
+    operations = (
+        [json.loads(line) for line in operations_path.read_text(encoding="utf-8").splitlines()]
+        if operations_path.exists()
+        else []
+    )
+    assert not production_marker_path.exists()
+    assert "issue_content_patch" not in operations
 
     # Replaying the identical transition through a second real subprocess
     # invocation is still side-effect free and deterministic (regression #2
@@ -1107,9 +1290,16 @@ def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_rea
         command_id="contract_update.run.with_anchor",
         anchor_comment_url=anchor_url,
         use_fixture_runtime=True,
+        extra_env=config_only_env,
     )
     assert "NEXT_ACTION: issue_editor_required" in replay.stdout, replay.stdout + replay.stderr
     replay_payload = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     assert replay_payload["contract_update"]["status"] == "handoff_required"
     assert replay_payload["contract_update"]["writes"] == 0
-    assert not (artifact_dir / "controlled_transaction_request.json").exists()
+    assert not production_marker_path.exists()
+    replay_operations = (
+        [json.loads(line) for line in operations_path.read_text(encoding="utf-8").splitlines()]
+        if operations_path.exists()
+        else []
+    )
+    assert "issue_content_patch" not in replay_operations
