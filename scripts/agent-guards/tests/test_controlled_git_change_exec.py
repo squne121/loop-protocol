@@ -13,7 +13,6 @@ if str(_GUARDS_DIR) not in sys.path:
 
 _REPO_ROOT = _GUARDS_DIR.parent.parent
 _PR_REVIEW_JUDGE_SCRIPTS_DIR = _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts"
-_CI_DIR = _REPO_ROOT / "scripts" / "ci"
 
 import protected_paths_policy  # noqa: E402
 from controlled_git_change_exec import (  # noqa: E402
@@ -1221,61 +1220,14 @@ def test_new_modules_compile():
 
 
 # ─── AC14 ─────────────────────────────────────────────────────────────────
-
-
-def test_codex_execpolicy_matrix_includes_git_mutation_cases():
-    """AC14: `execpolicy_case_definitions()` includes static cases for the
-    controlled-executor-only git add/commit narrowing (Issue #1611 contract
-    revision). This asserts the case DEFINITIONS exist with the expected
-    decision/guard-pair shape -- it does not invoke a real Codex binary."""
-    import sys as _sys
-    from dataclasses import dataclass
-    from pathlib import Path as _Path
-
-    if str(_CI_DIR) not in _sys.path:
-        _sys.path.insert(0, str(_CI_DIR))
-    import codex_execpolicy_matrix as matrix_module
-
-    @dataclass(frozen=True)
-    class _FakeFixture:
-        root: _Path
-        worktree: _Path
-        branch: str
-        issue_number: str
-
-    fixture = _FakeFixture(
-        root=_Path("/tmp/fake-repo"),
-        worktree=_Path("/tmp/fake-repo/.claude/worktrees/issue-1611-x"),
-        branch="worktree-issue-1611-x",
-        issue_number="1611",
-    )
-    cases = matrix_module.execpolicy_case_definitions(fixture)
-    labels = {case["label"]: case for case in cases}
-
-    for expected_deny_label in (
-        "git_add_denied_outside_controlled_executor",
-        "git_commit_denied_outside_controlled_executor",
-        "rtk_git_add_denied_outside_controlled_executor",
-        "rtk_git_commit_denied_outside_controlled_executor",
-    ):
-        assert expected_deny_label in labels, expected_deny_label
-        case = labels[expected_deny_label]
-        assert case["expected_guard_pair"] == "deny"
-        assert "forbidden" in case["expected_execpolicy"] or "prompt" in case["expected_execpolicy"]
-
-    exact_case = labels["controlled_executor_exact_invocation_allowed"]
-    assert exact_case["expected_guard_pair"] == "allow"
-    assert exact_case["expected_execpolicy"] == ["allow"]
-    assert "controlled_git_change_exec.py" in " ".join(exact_case["argv"])
-
-    for deny_label in (
-        "controlled_executor_extra_argv_denied",
-        "controlled_executor_via_bash_lc_denied",
-        "controlled_executor_from_main_root_denied",
-        "controlled_executor_wrong_issue_worktree_denied",
-    ):
-        assert deny_label in labels, deny_label
-        assert labels[deny_label]["expected_guard_pair"] == "deny"
+# Issue #2161 (native Codex CLI retirement): the former
+# test_codex_execpolicy_matrix_includes_git_mutation_cases test asserted
+# static case DEFINITIONS in the now-deleted scripts/ci/codex_execpolicy_matrix.py
+# (input data feeding the real Codex CLI execpolicy engine only), not the
+# actual controlled_git_change_exec.py / worktree_scope_guard.py deny/allow
+# behavior -- that behavior is exercised directly by the many other tests in
+# this file (e.g. test_snapshot_json_flag_always_denied below), so removing
+# it does not reduce real security-relevant coverage.
 
 
 # ─── Issue #1629 fix_delta P0 (provenance_self_attestation) ────────────────

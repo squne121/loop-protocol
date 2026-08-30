@@ -1,0 +1,143 @@
+{
+  "required_agents": {
+    "implementation-worker": {
+      "claude_agent_path": ".claude/agents/implementation-worker.md",
+      "claude_permission_mode": "acceptEdits",
+      "mutation_class": "issue-mutation",
+      "runtime_followup_route": "implement-issue",
+      "repo_local_skill_surfaces": [
+        ".agents/skills/implement-issue/SKILL.md"
+      ],
+      "model_alias": "sonnet"
+    },
+    "issue-creator": {
+      "claude_agent_path": ".claude/agents/issue-creator.md",
+      "claude_permission_mode": "acceptEdits",
+      "mutation_class": "issue-mutation",
+      "runtime_followup_route": "create-issue",
+      "repo_local_skill_surfaces": [
+        ".agents/skills/create-issue/SKILL.md"
+      ],
+      "model_alias": "sonnet"
+    },
+    "issue-editor": {
+      "claude_agent_path": ".claude/agents/issue-editor.md",
+      "claude_permission_mode": "acceptEdits",
+      "mutation_class": "issue-mutation",
+      "runtime_followup_route": "edit-issue",
+      "repo_local_skill_surfaces": [
+        ".agents/skills/edit-issue/SKILL.md"
+      ],
+      "model_alias": "sonnet"
+    },
+    "issue-reviewer": {
+      "claude_agent_path": ".claude/agents/issue-reviewer.md",
+      "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
+      "runtime_followup_route": "review-issue",
+      "repo_local_skill_surfaces": [
+        ".agents/skills/review-issue/SKILL.md"
+      ],
+      "model_alias": "haiku"
+    },
+    "review-issue": {
+      "claude_agent_path": ".claude/agents/review-issue.md",
+      "claude_permission_mode": "acceptEdits",
+      "mutation_class": "issue-mutation",
+      "runtime_followup_route": "review-issue",
+      "repo_local_skill_surfaces": [
+        ".agents/skills/review-issue/SKILL.md"
+      ],
+      "model_alias": "sonnet"
+    },
+    "scope-rollup-runner": {
+      "claude_agent_path": ".claude/agents/scope-rollup-runner.md",
+      "claude_permission_mode": "auto",
+      "mutation_class": "readonly",
+      "runtime_followup_route": "none",
+      "semantic_mutation_boundary": "repo_remote_readonly_with_ephemeral_local_write",
+      "required_effective_permission_profile": "loop-protocol-scope-rollup",
+      "model_alias": "haiku"
+    },
+    "test-runner": {
+      "claude_agent_path": ".claude/agents/test-runner.md",
+      "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
+      "runtime_followup_route": "none",
+      "model_alias": "haiku"
+    },
+    "pr-reviewer": {
+      "claude_agent_path": ".claude/agents/pr-reviewer.md",
+      "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
+      "runtime_followup_route": "pr-review-judge",
+      "repo_local_skill_surfaces": [
+        ".agents/skills/pr-review-judge/SKILL.md"
+      ],
+      "model_alias": "sonnet"
+    },
+    "pr-reviewer-lite": {
+      "claude_agent_path": ".claude/agents/pr-reviewer-lite.md",
+      "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
+      "runtime_followup_route": "pr-review-judge",
+      "repo_local_skill_surfaces": [
+        ".agents/skills/pr-review-judge/SKILL.md"
+      ],
+      "model_alias": "haiku"
+    },
+    "post-merge-cleanup-worker": {
+      "claude_agent_path": ".claude/agents/post-merge-cleanup-worker.md",
+      "claude_permission_mode": "default",
+      "mutation_class": "repo-write",
+      "runtime_followup_route": "post-merge-cleanup-executor",
+      "repo_local_skill_surfaces": [
+        ".agents/skills/post-merge-cleanup-executor/SKILL.md"
+      ],
+      "model_alias": "haiku"
+    },
+    "codebase-investigator": {
+      "claude_agent_path": ".claude/agents/codebase-investigator.md",
+      "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
+      "runtime_followup_route": "gemini-cli-headless-delegation",
+      "repo_local_skill_surfaces": [
+        ".agents/skills/gemini-cli-headless-delegation/SKILL.md"
+      ],
+      "agy_builder_profiles": [
+        "local_asset_research",
+        "github_research"
+      ],
+      "agy_builder_provider": "agy",
+      "model_alias": "haiku"
+    },
+    "web-researcher": {
+      "claude_agent_path": ".claude/agents/web-researcher.md",
+      "claude_permission_mode": "dontAsk",
+      "mutation_class": "readonly",
+      "runtime_followup_route": "agy_grounded_research_with_native_web_fallback",
+      "agy_builder_profiles": [
+        "grounded_research"
+      ],
+      "agy_builder_provider": "agy",
+      "model_alias": "haiku"
+    }
+  },
+  "asset_classification": {
+    ".claude/agents/codebase-investigator.md": "shared_claude_runtime",
+    ".claude/agents/implementation-worker.md": "shared_claude_runtime",
+    ".claude/agents/issue-creator.md": "shared_claude_runtime",
+    ".claude/agents/issue-editor.md": "shared_claude_runtime",
+    ".claude/agents/issue-reviewer.md": "shared_claude_runtime",
+    ".claude/agents/post-merge-cleanup-worker.md": "shared_claude_runtime",
+    ".claude/agents/pr-reviewer-lite.md": "shared_claude_runtime",
+    ".claude/agents/pr-reviewer.md": "shared_claude_runtime",
+    ".claude/agents/review-issue.md": "shared_claude_runtime",
+    ".claude/agents/scope-rollup-runner.md": "shared_claude_runtime",
+    ".claude/agents/test-runner.md": "shared_claude_runtime",
+    ".claude/agents/web-researcher.md": "shared_claude_runtime",
+    ".claude/agents/issue-design-reviewer.md": "claude_only",
+    ".claude/agents/retrospective-evaluator.md": "claude_only",
+    ".claude/agents/retrospective-runtime-observer.md": "claude_only"
+  }
+}

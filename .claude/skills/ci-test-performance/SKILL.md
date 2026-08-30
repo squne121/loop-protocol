@@ -8,7 +8,6 @@ paths:
   - "docs/dev/ci-performance.md"
   - "docs/dev/test-lane-policy.md"
   - ".claude/skills/ci-test-performance/**"
-  - ".codex/agents/**"
   - ".claude/agents/**"
   - ".agents/skills/ci-test-performance/**"
   - "schemas/**"
@@ -25,7 +24,7 @@ runtime delta テンプレートは `templates/runtime-delta.md` を参照する
 
 この Skill が定義する Target Policy と現行 CI 実装の差分:
 
-- Issue #1760: `python-test` job は `python-test-core`（Python-only、`setup-python-uv` / `uv python install` / `uv sync --locked --group dev` のみ）と `codex-execpolicy`（Node/npm/codex CLI + execpolicy matrix + `tests/codex/test_local_main_branch_guard.py` 専用）に分割され、`python-test` は required status check 名を維持したまま `needs: [python-test-core, codex-execpolicy]` + `if: always()` の集約 job になった
+- Issue #1760: `python-test` job は `python-test-core`（Python-only、`setup-python-uv` / `uv python install` / `uv sync --locked --group dev` のみ）を dedicated lane job として分離し、`python-test` は required status check 名を維持したまま `needs: [python-test-core]` + `if: always()` の集約 job になった。当初 `python-test-core` と並ぶもう一つの dedicated lane job だった `codex-execpolicy`（Node/npm/codex CLI + execpolicy matrix + `tests/codex/test_local_main_branch_guard.py` 専用の pinned-CLI-only test isolation）は Issue #2161（native Codex CLI retirement）で削除され、`tests/codex/test_local_main_branch_guard.py` は dedicated lane を持たない通常の `python-test-core` target（`.github/ci/python-test-plan.json` の `targets[]`）として実行されるようになった
 - `python-test-core` job は現在 `setup-python-uv` / `uv python install` / `uv sync --locked --group dev` を実行し、`setup-node-pnpm` / `pnpm install --frozen-lockfile` は実行しない
 - `scripts/ci/verify_python_test_lane.py` が `python-test-core` の Python-only invariant と `python-test` 集約 job の `needs`/`if` 契約を、`scripts/ci/verify_ci_check_conclusions.py` が実 CI check conclusion + AC6 sentinel artifact を検証する
 - `python-test` の hook pytest は Python-only hook tests を継続実行し、Node-backed 2 nodeid は `--deselect=<exact nodeid>` で除外している
@@ -226,7 +225,7 @@ uv run --locked python3 .claude/skills/ci-test-performance/scripts/validate_ci_p
 
 ### 実際に配線された production gate（#2159 OWNER による scope-authority 判断 issuecomment-5299412215 の項目 2/P0-8・3/P1-3/AC11 に対応）
 
-毎回の CI 実行で走る `claim.kind: none` の schema smoke producer（`codex-execpolicy` job 内）とは別に、`.github/workflows/ci.yml` の `e2e-performance-benchmark-assessment-gate` steps (inside the existing `codex-execpolicy` job)（`workflow_dispatch` opt-in、通常 PR には配線しない）が `tests/ci/test_ci_performance_gate.py --cohort-fixture <path> --output <path>` を実 CLI として呼び出し、AC11 の `_evidence_readiness_hard_check_post_filter`（証拠不足時に非 zero exit）と P0-8 の `build_assessment_from_percentile_cohorts`（実 claim 計算）を 1 つの実行可能パスへ配線する。詳細は `docs/dev/e2e-performance-benchmark.md` の「実 production gate の配線」を参照する。
+毎回の CI 実行で走る `claim.kind: none` の schema smoke producer（`python-test-core` job 内。Issue #2161 の native Codex CLI retirement で `codex-execpolicy` job が削除された際、当該 step 群は `python-test-core` job へ移設された）とは別に、`.github/workflows/ci.yml` の `e2e-performance-benchmark-assessment-gate` steps (inside the `python-test-core` job)（`workflow_dispatch` opt-in、通常 PR には配線しない）が `tests/ci/test_ci_performance_gate.py --cohort-fixture <path> --output <path>` を実 CLI として呼び出し、AC11 の `_evidence_readiness_hard_check_post_filter`（証拠不足時に非 zero exit）と P0-8 の `build_assessment_from_percentile_cohorts`（実 claim 計算）を 1 つの実行可能パスへ配線する。詳細は `docs/dev/e2e-performance-benchmark.md` の「実 production gate の配線」を参照する。
 
 ## 関連ドキュメント
 

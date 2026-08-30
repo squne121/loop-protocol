@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """run_worktree_agent_runtime_smoke.py — cross-runtime worktree agent smoke runner (Issue #1887).
 
-Launches Claude Code or Codex CLI inside an identity-verified, linked worktree
-and observes either:
+Launches Claude Code inside an identity-verified, linked worktree and
+observes either (Issue #2161: the native Codex CLI ``codex`` runtime lane
+was retired; only the ``claude`` lane remains):
 
-- ``structured`` lane: a non-interactive process (``claude -p`` /
-  ``codex exec``) whose exit code and native structured stdout are the
-  evidence, always run as a direct subprocess (never via herdr), or
+- ``structured`` lane: a non-interactive process (``claude -p``) whose exit
+  code and native structured stdout are the evidence, always run as a
+  direct subprocess (never via herdr), or
 - ``interactive`` lane: a herdr agent lifecycle inside a freshly created,
   isolated named herdr session (never the caller's own attached session)
   whose bounded, allowlist-only summary is the evidence.
@@ -69,19 +70,14 @@ SCHEMA = "WORKTREE_AGENT_RUNTIME_SMOKE_RESULT_V1"
 # invocation always passes a real ``--agent-type`` value.
 _UNSPECIFIED_AGENT_TYPE = "unspecified"
 
-# A mutation route is deliberately checked by this runner before it starts a
-# runtime.  This is a deterministic control-plane receipt, not an assertion
-# about what a model might choose to say in its final response.  The optional
-# flag keeps the generic smoke runner backward compatible for callers which do
-# not exercise a role-specific mutation route.
-_RUNTIME_FOLLOWUP_ROUTE_RE = re.compile(
-    r"(?m)^\s*-\s*runtime_followup_route:\s*([^\s]+)\s*$"
-)
-
-_TRANSACTION_ENTRYPOINTS = {
-    "create-issue": ".claude/skills/create-issue/scripts/create_issue_txn.py",
-    "edit-issue": ".claude/skills/edit-issue/scripts/edit_issue_txn.py",
-}
+# Issue #2161: the requested-mutation-route preflight mechanism (formerly
+# backed by these constants) has been deleted -- it was a broken,
+# zero-live-caller mechanism after this PR's migration from the deleted
+# native Codex CLI agent TOML directory (which declared
+# `runtime_followup_route:`) to `.claude/agents/*.md` (which mostly lacks
+# that declaration), which made it always return `declared_route_unavailable`
+# for any agent other than `web-researcher`. See PR #2409 OWNER
+# adversarial review comment.
 _REQUIRED_RUNTIME_OBSERVATION_FIELDS = frozenset(
     {"effective_permission_profile", "loaded_skill", "executor", "mutation"}
 )
@@ -94,7 +90,6 @@ _MAX_PANE_LINES = 400
 _MAX_LINE_CHARS = 2000
 _MAX_SESSION_LOG_LINES = 200
 _DEFAULT_MAX_TURNS = 30
-_CODEX_CHILD_META_SCAN_SECONDS = 1.0
 
 # Absolute path / long-base64-token redaction (mirrors git_worktree_probe.py).
 _SECRET_LIKE_RE = re.compile(
@@ -491,25 +486,6 @@ def preflight_claude_available(
     return os.path.realpath(exe), None
 
 
-def preflight_codex_flags() -> tuple[str | None, str | None]:
-    """Resolve the ``codex`` executable exactly once and return
-    ``(resolved_executable, skip_reason)`` (Issue #1960 Design Decision 5,
-    P1-2 fix-delta -- see ``preflight_claude_available`` docstring)."""
-    exe = shutil.which("codex")
-    if exe is None:
-        return None, "required command not found: codex"
-    resolved = os.path.realpath(exe)
-    rc, out, err, timed_out = _run([resolved, "exec", "--help"], timeout=20.0)
-    if timed_out or rc != 0:
-        return resolved, "unable to introspect codex exec --help capability"
-    text = out + err
-    required = ["--json", "--ephemeral", "-C"]
-    missing = [flag for flag in required if flag not in text]
-    if missing:
-        return resolved, f"codex CLI missing required structured-lane flags: {missing}"
-    return resolved, None
-
-
 def preflight_herdr() -> str | None:
     if os.environ.get("HERDR_ENV") != "1":
         return "HERDR_ENV=1 not set"
@@ -865,21 +841,6 @@ def verify_evidence_not_stale(
     return {"stale": False, "reason": None}
 
 
-def run_structured_codex(worktree: str, prompt: str, timeout_seconds: float,
-                          codex_bin: str = "codex") -> tuple[int | None, str, str, bool]:
-    # ``-`` reads the prompt from stdin instead of argv, so the prompt text
-    # never appears in the process list (Issue #1921 P1 fix-delta).
-    argv = [
-        codex_bin,
-        "exec",
-        "-C", worktree,
-        "--json",
-        "--ephemeral",
-        "-",
-    ]
-    return _run(argv, cwd=worktree, timeout=timeout_seconds, input_text=prompt)
-
-
 def parse_native_event_count(stdout: str) -> int:
     count = 0
     for line in stdout.splitlines():
@@ -1092,26 +1053,9 @@ def extract_claude_permission_denials(stdout: str | None) -> list:
 # [Agent]``). It is not named ``Task``.
 _CLAUDE_SPAWN_TOOL_NAME = "Agent"
 
-# Codex CLI's native sub-agent dispatch (`spawn_agent`, `namespace:
-# collaboration`) was empirically observed (Issue #1859/#1864 evidence,
-# artifacts/codex-permission-profile-smoke/pr-1864/*-exec-events.jsonl,
-# codex-cli 0.146.0) to NOT surface the ``spawn_agent`` function_call itself
-# as a top-level ``item.completed``/``item.started`` event in ``codex exec
-# --json`` stdout -- only the full session *rollout* log (not captured by
-# this harness, which only reads stdout) shows
-# ``payload.type=="function_call"`` with ``payload.name=="spawn_agent"``. The
-# only visible signal in the ``--json`` stdout stream is
-# ``item.type=="collab_tool_call"`` (observed with ``tool":"wait"`` in that
-# evidence, corresponding to the parent's ``wait_agent`` call after a spawn).
-# Because a ``spawn_agent`` call is virtually always followed by a
-# corresponding ``wait``/``interrupt``/``send_message`` collaboration item
-# that IS visible here, any ``collab_tool_call`` item is treated as spawn
-# evidence (best-effort, documented over/under-count risk: a lone
-# ``collab_tool_call`` cannot positively distinguish "this session spawned an
-# agent" from "some other collaboration-tool activity occurred", but for a
-# fresh no-child-policy smoke run any such item at all is itself worth
-# surfacing rather than silently discarding).
-_CODEX_COLLAB_ITEM_TYPE = "collab_tool_call"
+# Issue #2161 (native Codex CLI retirement): the ``_CODEX_COLLAB_ITEM_TYPE``
+# constant and its native Codex CLI sub-agent dispatch detection notes were
+# removed along with the ``codex`` runtime lane.
 
 # Bash/shell command patterns that indicate the worker re-invoked its own
 # agent runtime (self-restart) -- mirrors
@@ -1200,7 +1144,6 @@ def load_static_declared_skills(checkout_root: str, agent_type: str) -> list[str
 
 
 _CLAUDE_DIRECT_WEB_TOOL_NAMES = {"WebSearch", "WebFetch"}
-_CODEX_DIRECT_WEB_TOKEN_RE = re.compile(r"\b(web_search|browser|fetch_url|http_get|curl)\b", re.IGNORECASE)
 
 
 def count_direct_web_tool_events(runtime: str, stdout: str) -> int:
@@ -1210,53 +1153,30 @@ def count_direct_web_tool_events(runtime: str, stdout: str) -> int:
     Claude Code's native ``stream-json`` events unambiguously name direct
     web tools (``WebSearch`` / ``WebFetch``) as ``tool_use`` blocks, exactly
     like the existing ``Agent``/``Bash`` classification above -- counted
-    precisely. Codex CLI's ``--json`` event stream does not expose an
-    equally explicit tool-name field for a direct-web equivalent in this
-    repository's own observed runtime state (documented gap, same caveat as
-    ``_CODEX_COLLAB_ITEM_TYPE`` above): a best-effort, deliberately narrow
-    token scan over each event's own text/command fields is used instead,
-    which may under-detect but is never fabricated as a fixed 0."""
+    precisely.
+
+    Issue #2161 (native Codex CLI retirement): the Codex-only best-effort
+    token-scan branch (``_CODEX_DIRECT_WEB_TOKEN_RE``) was removed along
+    with the ``codex`` runtime; ``runtime`` is always ``"claude"`` now."""
     count = 0
-    if runtime == "claude":
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "assistant":
+            continue
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
-            try:
-                payload = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if not isinstance(payload, dict) or payload.get("type") != "assistant":
-                continue
-            message = payload.get("message")
-            content = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                if block.get("name") in _CLAUDE_DIRECT_WEB_TOOL_NAMES:
-                    count += 1
-    else:
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            item = payload.get("item") if isinstance(payload.get("item"), dict) else None
-            if item is None:
-                continue
-            candidate_text = " ".join(
-                str(item.get(field, ""))
-                for field in ("tool", "command", "name")
-                if item.get(field) is not None
-            )
-            if _CODEX_DIRECT_WEB_TOKEN_RE.search(candidate_text):
+            if block.get("name") in _CLAUDE_DIRECT_WEB_TOOL_NAMES:
                 count += 1
     return count
 
@@ -1326,14 +1246,12 @@ def classify_claude_events(stdout: str) -> tuple[list[dict], int, int]:
 #   ``native_spawn_event_observed`` permanently ``False``). The parent
 #   session id is the top-level ``session_id`` field already present on
 #   every native ``stream-json`` event.
-# - Codex CLI: ``spawn_agent`` (namespace ``multi_agent_v1``)
-#   ``function_call_output`` payloads embed ``{"agent_id": "<uuid>", ...}``.
-#   This is only visible in the on-disk rollout log
-#   (``~/.codex/sessions/**/rollout-*.jsonl``), not in ``codex exec --json``
-#   stdout (see ``_CODEX_COLLAB_ITEM_TYPE`` note above). The parent session
-#   id is the ``thread_id`` from the ``thread.started`` stdout event.
 #
-# Both extractors are best-effort and fail closed to ``None`` on any error
+# Issue #2161 (native Codex CLI retirement): the parallel Codex CLI
+# ``spawn_agent`` rollout-log extraction note was removed along with the
+# ``codex`` runtime lane.
+#
+# The Claude extractor is best-effort and fails closed to ``None`` on any error
 # (missing file, unexpected shape, permission denied) -- a value that cannot
 # be honestly derived is never guessed.
 # ---------------------------------------------------------------------------
@@ -3227,248 +3145,12 @@ def _find_claude_interactive_subagent_only_session_dirs(
         return []
 
 
-def extract_codex_parent_session_id(stdout: str) -> str | None:
-    """``thread_id`` from the ``thread.started`` native ``--json`` event."""
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        if payload.get("type") == "thread.started":
-            value = payload.get("thread_id")
-            if isinstance(value, str) and value:
-                return value
-    return None
-
-
-def _codex_agent_id_from_spawn_agent_calls(candidate: Path) -> str | None:
-    """Parse ``spawn_agent`` ``function_call``/``function_call_output`` pairs
-    out of a single Codex rollout log file and return the resulting
-    ``agent_id``, if any. Extracted as a helper so both the primary
-    (filename-substring) and fallback (content-linked) lookup strategies in
-    ``extract_codex_child_session_id`` can reuse the same parsing logic."""
-    try:
-        pending_call_ids: set[str] = set()
-        for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            payload = record.get("payload") if isinstance(record, dict) else None
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("type") == "function_call" and payload.get("name") == "spawn_agent":
-                call_id = payload.get("call_id")
-                if isinstance(call_id, str):
-                    pending_call_ids.add(call_id)
-                continue
-            if payload.get("type") == "function_call_output" and payload.get("call_id") in pending_call_ids:
-                output = payload.get("output")
-                if isinstance(output, str):
-                    try:
-                        parsed_output = json.loads(output)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    agent_id = parsed_output.get("agent_id") if isinstance(parsed_output, dict) else None
-                    if isinstance(agent_id, str) and agent_id:
-                        return agent_id
-        return None
-    except OSError:
-        return None
-
-
-def _find_codex_child_session_meta(parent_session_id: str) -> dict | None:
-    """Locate the on-disk Codex rollout log for a spawned child sub-agent
-    thread whose first record (``type: session_meta``) content-links back
-    to ``parent_session_id`` via ``payload.parent_thread_id`` (also
-    duplicated as ``payload.session_id``), and return that ``session_meta``
-    ``payload`` dict.
-
-    Extracted as a shared helper (Issue #1886 P0-2 iteration-N fix_delta,
-    live rollout-log investigation) so both
-    ``extract_codex_child_session_id`` (child session id) and
-    ``extract_codex_child_agent_role`` (identity evidence) read the exact
-    same on-disk ``session_meta`` record instead of independently
-    re-scanning ``~/.codex/sessions`` and risking disagreement if the
-    directory changes between the two reads.
-
-    Returns ``None`` on any lookup failure or when no linked record is
-    found -- read-only, best-effort evidence collection, never a guess."""
-    try:
-        sessions_dir = Path.home() / ".codex" / "sessions"
-        if not sessions_dir.is_dir():
-            return None
-        deadline = time.monotonic() + _CODEX_CHILD_META_SCAN_SECONDS
-        for candidate in sessions_dir.glob("**/*.jsonl"):
-            if time.monotonic() >= deadline:
-                return None
-            try:
-                with candidate.open(encoding="utf-8", errors="replace") as handle:
-                    first_line = handle.readline()
-            except OSError:
-                continue
-            if not first_line:
-                continue
-            try:
-                record = json.loads(first_line.strip())
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if not isinstance(record, dict) or record.get("type") != "session_meta":
-                continue
-            payload = record.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            linked_parent_id = payload.get("parent_thread_id") or payload.get("session_id")
-            if linked_parent_id != parent_session_id:
-                continue
-            return payload
-        return None
-    except OSError:
-        return None
-
-
-def extract_codex_child_session_id(parent_session_id: str | None) -> str | None:
-    """``agent_id``/child thread id extraction for the Codex CLI child
-    sub-agent spawned by this run.
-
-    Primary source (unchanged): the on-disk Codex rollout log whose
-    *filename* contains ``parent_session_id``, parsed for
-    ``spawn_agent`` ``function_call``/``function_call_output`` pairs. This
-    only ever matches when the parent thread's own rollout log is itself
-    persisted to disk under that id.
-
-    Fallback source (Issue #1886 AC7 fix-delta, iteration 7): this runner
-    invokes ``codex exec --ephemeral`` (see ``run_structured_codex``), which
-    -- analogous to Claude Code's ``--no-session-persistence`` -- suppresses
-    persistence of the *parent* thread's own rollout log. No file's
-    filename will ever contain ``parent_session_id`` in that case. However,
-    a spawned child sub-agent thread's *own* rollout log is still written
-    to disk, and its first record (``type: session_meta``) carries a
-    ``payload.parent_thread_id`` (also duplicated as ``payload.session_id``)
-    equal to the spawning parent's own ``thread_id`` -- this is genuine,
-    content-level linkage recorded by the Codex CLI itself, not an
-    inference. Once such a file is found (via ``_find_codex_child_session_
-    meta``), its own ``payload.id`` (also embedded in the filename) is
-    returned as the child thread's session id -- direct evidence of a
-    distinct, non-empty child session that differs from
-    ``parent_session_id`` (see ``native_spawn_event_observed``).
-
-    Returns ``None`` on any lookup failure -- this is read-only,
-    best-effort evidence collection, never a guess."""
-    if not parent_session_id:
-        return None
-    try:
-        sessions_dir = Path.home() / ".codex" / "sessions"
-        if not sessions_dir.is_dir():
-            return None
-        matches = list(sessions_dir.glob(f"**/*{parent_session_id}*.jsonl"))
-        for candidate in matches:
-            agent_id = _codex_agent_id_from_spawn_agent_calls(candidate)
-            if agent_id:
-                return agent_id
-    except OSError:
-        return None
-    meta = _find_codex_child_session_meta(parent_session_id)
-    if not meta:
-        return None
-    own_id = meta.get("id")
-    if isinstance(own_id, str) and own_id:
-        return own_id
-    return None
-
-
-def extract_codex_child_agent_role(parent_session_id: str | None) -> str | None:
-    """Runtime-returned custom-agent identity evidence for the Codex CLI
-    child sub-agent spawned by this run (Issue #1886 P0-2 iteration-N
-    fix_delta).
-
-    The PR #2005 adversarial review's P0-2 finding was correct that a bare
-    ``agent_id`` alone never proves *which* custom agent was spawned -- a
-    generic child satisfies the same evidence as a named custom agent. The
-    prior fix_delta (commit 8915af25) therefore fail-closed
-    ``agent_type_identity_verified`` to always ``False`` for Codex,
-    documenting that no stable runtime-returned identity field was found
-    in this repository's own local runtime state.
-
-    Direct investigation of real, live-produced Codex rollout logs under
-    this runner's own structured lane (multiple ``codebase-investigator``
-    and ``web-researcher`` routes, local ``~/.codex/sessions``, Codex CLI
-    0.146.0, 2026-08-06/07) shows this field DOES exist: the spawned
-    child's own rollout log's first record (``type: session_meta``) is
-    written by the Codex CLI itself (not by this runner, not by the
-    spawning parent's prompt text) with an ``agent_role`` field --
-    duplicated under ``source.subagent.thread_spawn.agent_role`` -- that
-    holds exactly the custom agent role/persona name passed to the
-    multi-agent ``spawn_agent`` collaboration tool (e.g.
-    ``"codebase-investigator"``, ``"web-researcher"``). This is genuine,
-    content-level identity evidence independently written to disk by the
-    runtime, not a caller self-report re-echoing ``requested_agent_type``.
-
-    Reuses ``_find_codex_child_session_meta`` -- the exact same on-disk
-    ``session_meta`` record that ``extract_codex_child_session_id``'s
-    content-linked fallback path locates -- so the child session id and
-    its identity evidence are always read from the same record.
-
-    Returns ``None`` -- never a guess -- when no linked child
-    ``session_meta`` record (or no ``agent_role`` field within it) is
-    found; this preserves the fail-closed posture for any Codex CLI
-    version/config where this field is genuinely absent."""
-    if not parent_session_id:
-        return None
-    meta = _find_codex_child_session_meta(parent_session_id)
-    if not meta:
-        return None
-    agent_role = meta.get("agent_role")
-    if isinstance(agent_role, str) and agent_role:
-        return agent_role
-    return None
-
-
-def classify_codex_events(stdout: str) -> tuple[list[dict], int, int]:
-    """Classify the already-captured native ``--json`` JSONL event stream for
-    Codex CLI. Returns ``(spawn_events, self_restart_event_count,
-    orchestration_action_count)``. See ``_CODEX_COLLAB_ITEM_TYPE`` docstring
-    above for the empirical basis and documented limitation of the
-    ``collab_tool_call`` best-effort signal."""
-    spawn_events: list[dict] = []
-    self_restart_count = 0
-    orchestration_count = 0
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        item = payload.get("item") if isinstance(payload.get("item"), dict) else None
-        if item is not None and item.get("type") == _CODEX_COLLAB_ITEM_TYPE:
-            spawn_events.append(
-                {"runtime": "codex", "item_type": _CODEX_COLLAB_ITEM_TYPE, "tool": item.get("tool")}
-            )
-        # Codex's structured lane invokes the model's own shell/exec tool
-        # (not a "Bash" tool_use block) -- best-effort scan any string value
-        # under an item.completed/item.started payload for the same
-        # self-restart / orchestration command patterns observed for the
-        # Claude lane, without persisting the raw payload.
-        if item is not None:
-            command = item.get("command")
-            command = command if isinstance(command, str) else ""
-            if _SELF_RESTART_COMMAND_RE.search(command):
-                self_restart_count += 1
-            if _ORCHESTRATION_ACTION_COMMAND_RE.search(command):
-                orchestration_count += 1
-    return spawn_events, self_restart_count, orchestration_count
+# Issue #2161 (native Codex CLI retirement): extract_codex_parent_session_id(),
+# _codex_agent_id_from_spawn_agent_calls(), _find_codex_child_session_meta(),
+# extract_codex_child_session_id(), extract_codex_child_agent_role(), and
+# classify_codex_events() were removed along with the native Codex CLI
+# ``codex`` runtime lane (rollout-log scanning under the native Codex
+# CLI's home-directory session state).
 
 
 # ---------------------------------------------------------------------------
@@ -5063,7 +4745,9 @@ def _absolute_path(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="worktree-agent-runtime-smoke runner")
-    parser.add_argument("--runtime", choices=["claude", "codex"], required=True)
+    # Issue #2161 (native Codex CLI retirement): "codex" was removed from
+    # the choices; only the "claude" (native) lane remains.
+    parser.add_argument("--runtime", choices=["claude"], required=True)
     parser.add_argument("--mode", choices=["structured", "interactive"], required=True)
     parser.add_argument("--worktree", required=True)
     parser.add_argument("--prompt-file", required=True)
@@ -5205,25 +4889,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--requested-mutation-route",
-        default=None,
-        help=(
-            "optional role-bound mutation route to preflight before launching "
-            "the runtime; a mismatched route is refused before any runtime "
-            "subprocess is invoked"
-        ),
-    )
-    parser.add_argument(
-        "--require-transaction-entrypoint-preflight",
-        action="store_true",
-        help=(
-            "for a role-bound route request, safely invoke the actual "
-            "transaction entrypoint with deliberately incomplete input and "
-            "require its pre-executor parser refusal before recording a "
-            "route mismatch refusal"
-        ),
-    )
-    parser.add_argument(
         "--claude-agent-name",
         default=None,
         help=(
@@ -5318,87 +4983,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
-
-
-def preflight_requested_mutation_route(
-    worktree: str, agent_type: str, requested_route: str | None, *,
-    require_transaction_entrypoint_preflight: bool = False,
-) -> dict[str, object]:
-    """Return a deterministic receipt for an optional mutation-route request.
-
-    The canonical route is read from the active agent TOML rather than a test
-    fixture or a hard-coded role table.  A refusal is a successful preflight
-    outcome: it intentionally prevents the runtime from starting, so no
-    prompt-only model refusal can be mistaken for an authorization boundary.
-    """
-    receipt: dict[str, object] = {
-        "requested_mutation_route": requested_route,
-        "declared_mutation_route": None,
-        "route_preflight_decision": "not_requested",
-        "route_preflight_source": None,
-        "controlled_route_preflight_status": "not_requested",
-        "canonical_transaction_entrypoint": None,
-        "requested_transaction_entrypoint": None,
-        "pre_executor_refusal_observed": False,
-        "executor_invocation_observed": False,
-        "mutation_attempted": None,
-        "mutation_observed_channels": [],
-    }
-    if requested_route is None:
-        return receipt
-    if agent_type == _UNSPECIFIED_AGENT_TYPE:
-        receipt["route_preflight_decision"] = "invalid_agent_type"
-        receipt["route_preflight_source"] = "runner_agent_route_guard"
-        return receipt
-
-    agent_path = Path(worktree) / ".codex" / "agents" / f"{agent_type}.toml"
-    try:
-        text = agent_path.read_text(encoding="utf-8")
-    except OSError:
-        receipt["route_preflight_decision"] = "agent_config_unavailable"
-        receipt["route_preflight_source"] = "runner_agent_route_guard"
-        return receipt
-
-    match = _RUNTIME_FOLLOWUP_ROUTE_RE.search(text)
-    if match is None:
-        receipt["route_preflight_decision"] = "declared_route_unavailable"
-        receipt["route_preflight_source"] = "runner_agent_route_guard"
-        return receipt
-
-    declared_route = match.group(1)
-    receipt["declared_mutation_route"] = declared_route
-    receipt["route_preflight_source"] = "runner_agent_route_guard"
-    receipt["route_preflight_decision"] = (
-        "allow" if requested_route == declared_route else "refused_before_runtime"
-    )
-    if not require_transaction_entrypoint_preflight:
-        return receipt
-
-    declared_entrypoint = _TRANSACTION_ENTRYPOINTS.get(declared_route)
-    requested_entrypoint = _TRANSACTION_ENTRYPOINTS.get(requested_route)
-    receipt["declared_transaction_entrypoint"] = declared_entrypoint
-    receipt["requested_transaction_entrypoint"] = requested_entrypoint
-    if declared_entrypoint is None:
-        receipt["controlled_route_preflight_status"] = "canonical_entrypoint_unavailable"
-        return receipt
-    entrypoint_path = Path(worktree) / declared_entrypoint
-    receipt["canonical_transaction_entrypoint"] = declared_entrypoint
-    if not entrypoint_path.is_file():
-        receipt["controlled_route_preflight_status"] = "canonical_entrypoint_missing"
-        return receipt
-    # Invoke the actual selected transaction entrypoint with deliberately
-    # incomplete input. Both create and edit parsers reject before their
-    # executor/mutation transport can begin (exit 2), giving AC6 a concrete
-    # non-mutating parser receipt rather than treating --help as a decision.
-    rc, _out, _err, timed_out = _run(
-        [sys.executable, str(entrypoint_path)], cwd=worktree, timeout=10.0
-    )
-    if rc != 2 or timed_out:
-        receipt["controlled_route_preflight_status"] = "invalid_transaction_input_not_rejected"
-        return receipt
-    receipt["controlled_route_preflight_status"] = "invalid_transaction_input_rejected_pre_executor"
-    receipt["pre_executor_refusal_observed"] = requested_route != declared_route
-    return receipt
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5519,17 +5103,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[FAIL] {dir_error}", file=sys.stderr)
         return EXIT_FAIL
 
-    route_preflight = preflight_requested_mutation_route(
-        worktree,
-        args.agent_type,
-        args.requested_mutation_route,
-        require_transaction_entrypoint_preflight=args.require_transaction_entrypoint_preflight,
-    )
-    route_refused = (
-        args.requested_mutation_route is not None
-        and route_preflight["route_preflight_decision"] != "allow"
-    )
-
     # From this point on, worktree/prompt/output_dir are all confirmed
     # usable, so EVERY controlled exit below -- including the
     # capability/herdr preflight SKIPs -- must emit allowlist-only
@@ -5543,39 +5116,26 @@ def main(argv: list[str] | None = None) -> int:
     # bottom of this function.
     exit_code = EXIT_OK
     resolved_runtime_bin: str | None = None
-    entrypoint_preflight_failed = (
-        args.require_transaction_entrypoint_preflight
-        and args.requested_mutation_route is not None
-        and route_preflight["controlled_route_preflight_status"]
-        != "invalid_transaction_input_rejected_pre_executor"
-    )
-    if entrypoint_preflight_failed:
-        errors.append(
-            "controlled route preflight unavailable: "
-            f"{route_preflight['controlled_route_preflight_status']}"
-        )
-        exit_code = EXIT_FAIL
 
-    if args.mode == "interactive" and not route_refused:
+    if args.mode == "interactive":
         skip_reason = preflight_herdr()
         if skip_reason:
             errors.append(skip_reason)
             exit_code = EXIT_SKIP
 
-    if exit_code == EXIT_OK and not route_refused:
+    if exit_code == EXIT_OK:
         # Issue #1960 Design Decision 5 (P1-2 fix-delta): resolve the
         # runtime executable exactly ONCE here via ``shutil.which()``
-        # (inside ``preflight_claude_available`` / ``preflight_codex_flags``)
-        # and thread that same absolute path through version capture and
-        # structured-lane execution below, instead of independently
-        # re-resolving "claude"/"codex" by name in each place. Structured
-        # -lane flag capability itself is still decided from the actual
-        # fixed-argv invocation result (classify_claude_structured_outcome),
-        # never from ``claude --help`` text (AC1/AC5).
-        if args.runtime == "claude":
-            resolved_runtime_bin, skip_reason = preflight_claude_available(args.claude_bin)
-        else:
-            resolved_runtime_bin, skip_reason = preflight_codex_flags()
+        # (inside ``preflight_claude_available``) and thread that same
+        # absolute path through version capture and structured-lane
+        # execution below, instead of independently re-resolving "claude"
+        # by name in each place. Structured-lane flag capability itself is
+        # still decided from the actual fixed-argv invocation result
+        # (classify_claude_structured_outcome), never from ``claude --help``
+        # text (AC1/AC5). Issue #2161: the native Codex CLI
+        # ``preflight_codex_flags`` branch was removed along with the
+        # ``codex`` runtime lane.
+        resolved_runtime_bin, skip_reason = preflight_claude_available(args.claude_bin)
         if skip_reason:
             errors.append(skip_reason)
             exit_code = EXIT_SKIP
@@ -5677,7 +5237,6 @@ def main(argv: list[str] | None = None) -> int:
             "until #1881 (pr-reviewer persona safe Read/mutation-deny boundary) "
             "merges"
         ),
-        **route_preflight,
     }
     if args.mode == "interactive":
         # Issue #1960 Design Decision 5 (P1-2 fix-delta): the interactive
@@ -5717,27 +5276,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        if route_refused:
-            # The controlled guard declined the route before launching a
-            # runtime.  Record that limited fact only; do not synthesize a
-            # terminal event, loaded Skill, executor invocation, or mutation
-            # observation from static configuration.
-            schema_summary["runtime_invocation"] = "not_started_route_preflight_blocked"
-            schema_summary["terminal_event_observed"] = None
-            schema_summary["child_agent_type_observed"] = None
-            schema_summary["child_agent_type_source"] = None
-            schema_summary["agent_type_identity_verified"] = False
-            schema_summary["native_spawn_event_observed"] = False
-            schema_summary["child_spawn_observed"] = False
-            schema_summary["child_spawn_source"] = None
-            schema_summary["child_launch_mode"] = None
-            schema_summary["child_completion_observed"] = False
-            schema_summary["child_completion_source"] = None
-            schema_summary["child_terminal_status"] = None
-            schema_summary["child_agent_id"] = None
-            schema_summary["spawn_elapsed_sec"] = None
-            schema_summary["completion_elapsed_sec"] = None
-        elif exit_code != EXIT_OK:
+        if exit_code != EXIT_OK:
             # A capability/herdr preflight above already decided this run is
             # a controlled SKIP -- do not attempt to launch either lane.
             # Evidence (schema_summary as built so far, including
@@ -5815,14 +5354,9 @@ def main(argv: list[str] | None = None) -> int:
                 # additive field, independent of mutation_boundary/hermetic
                 # gating above.
                 schema_summary["permission_denials"] = extract_claude_permission_denials(out)
-            else:
-                rc, out, err, timed_out = run_structured_codex(
-                    worktree, prompt, float(args.timeout_seconds), codex_bin=resolved_runtime_bin
-                )
-                # Codex CLI capability preflight (help-based) is out of scope
-                # for Issue #1960 -- see Out of Scope: "Codex CLI lane の
-                # capability preflight 見直しは本 Issue の対象外".
-                capability_decision, capability_reason = "runtime_outcome", None
+            # Issue #2161 (native Codex CLI retirement): the
+            # run_structured_codex()-based else branch was removed along
+            # with the ``codex`` runtime lane.
 
             event_count = parse_native_event_count(out)
             schema_summary["process_exit_code"] = rc
@@ -5833,10 +5367,9 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["capability_decision"] = capability_decision
             schema_summary["capability_error_classification"] = capability_reason
 
-            if args.runtime == "claude":
-                spawn_events, self_restart_count, orchestration_count = classify_claude_events(out)
-            else:
-                spawn_events, self_restart_count, orchestration_count = classify_codex_events(out)
+            # Issue #2161: the classify_codex_events() else branch was
+            # removed along with the ``codex`` runtime lane.
+            spawn_events, self_restart_count, orchestration_count = classify_claude_events(out)
             schema_summary["spawn_events"] = spawn_events
             schema_summary["child_spawn_event_count"] = len(spawn_events)
             schema_summary["self_restart_event_count"] = self_restart_count
@@ -5899,20 +5432,9 @@ def main(argv: list[str] | None = None) -> int:
             #   `agentId` also carries `agentType` (see
             #   `extract_claude_child_agent_type`); identity is verified iff
             #   that observed value equals `requested_agent_type`.
-            # - Codex (Issue #1886 P0-2 iteration-N fix_delta): live
-            #   investigation of real, local `~/.codex/sessions` rollout
-            #   logs (multiple `codebase-investigator` / `web-researcher`
-            #   routes, Codex CLI 0.146.0) found that a spawned child's own
-            #   rollout log DOES carry runtime-returned identity evidence
-            #   after all -- its `session_meta` record's `agent_role` field
-            #   (see `extract_codex_child_agent_role`), written by the Codex
-            #   CLI itself, holds the custom agent role/persona name. This
-            #   supersedes the prior fail-closed-to-always-False posture
-            #   (commit 8915af25): identity is verified iff that observed
-            #   value equals `requested_agent_type`, exactly mirroring the
-            #   Claude lane. If a future Codex CLI version ever stops
-            #   emitting this field, `extract_codex_child_agent_role`
-            #   returns `None` and this still fails closed.
+            # Issue #2161: the native Codex CLI identity-evidence branch
+            # (rollout-log `session_meta.agent_role`) was removed along with
+            # the ``codex`` runtime lane.
             if args.runtime == "claude":
                 parent_session_id = extract_claude_parent_session_id(out)
                 child_session_id = extract_claude_child_session_id(parent_session_id, worktree, out)
@@ -5924,21 +5446,9 @@ def main(argv: list[str] | None = None) -> int:
                     extract_claude_child_agent_type_with_source(out)
                 )
                 child_spawn_launch_mode = classify_claude_spawn_launch_mode(out)
-            else:
-                parent_session_id = extract_codex_parent_session_id(out)
-                # A timed-out child cannot supply complete identity evidence.
-                # Do not spend the caller's bounded capability window scanning
-                # the global rollout inventory after that terminal condition.
-                child_session_id = (
-                    None if timed_out else extract_codex_child_session_id(parent_session_id)
-                )
-                child_agent_type_observed = (
-                    None if timed_out else extract_codex_child_agent_role(parent_session_id)
-                )
-                child_agent_type_source = (
-                    "codex_session_meta_agent_role" if child_agent_type_observed else None
-                )
-                child_spawn_launch_mode = SPAWN_LAUNCH_MODE_UNKNOWN
+            # Issue #2161: the native Codex CLI else branch (rollout-log
+            # based parent/child session id and agent-role extraction) was
+            # removed along with the ``codex`` runtime lane.
             agent_type_identity_verified = (
                 child_agent_type_observed is not None
                 and requested_agent_type is not None
@@ -5988,42 +5498,9 @@ def main(argv: list[str] | None = None) -> int:
                 # elapsed time, which would misrepresent per-child timing.
                 spawn_elapsed_sec = None
                 completion_elapsed_sec = None
-            else:
-                # Issue #2015 AC11 documented limitation: Codex CLI's
-                # ``codex exec --json`` stdout (this harness only reads
-                # stdout, never the on-disk rollout log for live timing) has
-                # no per-child terminal-event equivalent to Claude's
-                # ``SubagentStop`` hook currently identified in this
-                # repository's own runtime research. ``child_session_id``
-                # (recovered from the child's own rollout log, see
-                # ``extract_codex_child_session_id``) is the best available
-                # spawn evidence; completion is approximated as "the overall
-                # session reached ITS OWN terminal event AND a child rollout
-                # was recovered" -- this is a parent-level, not a genuine
-                # child-level, terminal signal, and is intentionally NOT
-                # promoted to the same confidence as the Claude hook-based
-                # signal. A dedicated Codex-specific child terminal marker is
-                # a known follow-up research gap (see PR #2044 root-cause
-                # report), not silently faked here.
-                child_agent_id = child_session_id
-                child_spawn_source = (
-                    "codex_rollout_log_spawn_agent_call" if child_session_id else None
-                )
-                child_spawn_observed = child_session_id is not None
-                child_completion_observed = bool(child_session_id and terminal_event_observed)
-                child_completion_source = (
-                    "approximate_parent_terminal_event_plus_rollout_spawn"
-                    if child_completion_observed
-                    else None
-                )
-                if child_completion_observed:
-                    child_terminal_status = CHILD_TERMINAL_STATUS_COMPLETED
-                elif child_spawn_observed:
-                    child_terminal_status = CHILD_TERMINAL_STATUS_ASYNC_NO_STOP
-                else:
-                    child_terminal_status = CHILD_TERMINAL_STATUS_UNKNOWN
-                spawn_elapsed_sec = None
-                completion_elapsed_sec = None
+            # Issue #2161: the native Codex CLI else branch (rollout-log
+            # spawn/completion approximation) was removed along with the
+            # ``codex`` runtime lane.
             schema_summary["child_spawn_observed"] = child_spawn_observed
             schema_summary["child_spawn_source"] = child_spawn_source
             schema_summary["child_launch_mode"] = child_spawn_launch_mode
@@ -6082,15 +5559,11 @@ def main(argv: list[str] | None = None) -> int:
             # Issue #2183: structural, hook-ID-correlated causal evidence,
             # recorded unconditionally (never gated on any flag) so a
             # future reader can always see WHY a marker-only PASS was or
-            # was not trusted. Only Claude's structured lane has the
+            # was not trusted. Claude's structured lane has the
             # SubagentStart/SubagentStop stream-json channel this function
-            # parses (`out` above); the Codex lane has no equivalent
-            # channel in this harness, so the verdict is left `None` there
-            # rather than fabricated from an unrelated shape.
-            if args.runtime == "claude":
-                causal_evidence = subagent_causal_evidence_verdict(out, args.expect_marker)
-            else:
-                causal_evidence = None
+            # parses (`out` above). Issue #2161: the native Codex CLI else
+            # branch was removed along with the ``codex`` runtime lane.
+            causal_evidence = subagent_causal_evidence_verdict(out, args.expect_marker)
             schema_summary["subagent_causal_evidence"] = causal_evidence
             # PR #2220 review fix-delta: the structured lane already has the
             # SubagentStart/SubagentStop stream-json channel available on
@@ -6385,10 +5858,9 @@ def main(argv: list[str] | None = None) -> int:
                 # Wiring an interactive-lane hook-output channel equivalent
                 # to the structured lane's is future work, not this Issue's
                 # scope (no new hook settings/matcher configuration here).
-                if args.runtime == "claude":
-                    causal_evidence = subagent_causal_evidence_verdict(combined_pane_text, args.expect_marker)
-                else:
-                    causal_evidence = None
+                # Issue #2161: the native Codex CLI else branch was removed
+                # along with the ``codex`` runtime lane.
+                causal_evidence = subagent_causal_evidence_verdict(combined_pane_text, args.expect_marker)
                 schema_summary["subagent_causal_evidence"] = causal_evidence
                 if (
                     args.require_subagent_causal_evidence

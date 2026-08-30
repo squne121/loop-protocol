@@ -1,17 +1,17 @@
 # Agent Runtime Ops
 
-Codex local runtime 運用の主文書。
-この文書は Codex CLI の起動・sandbox・permission profile・rules・instruction surface を扱い、GitHub 操作ルールそのものは [github-ops.md](github-ops.md) を参照する。
+旧 Codex local runtime 運用の主文書（native Codex CLI は Issue #2161 で repository から撤去済み）。
+本文書の大半は native Codex CLI（起動・sandbox・permission profile・rules・instruction surface）に関する historical/reference record として残す。GitHub 操作ルールそのものは [github-ops.md](github-ops.md) を参照する。provider-neutral な guard 実装（`scripts/agent-guards/protected_paths_policy.py`・`scripts/agent-guards/controlled_git_change_exec.py` 等）が本文書の一部セクションを引き続き参照する場合がある。
 
-## Runtime Positioning（実行時の位置付け）
+## Runtime Positioning（実行時の位置付け、historical）
 
-- Codex CLI は **optional runtime** であり、`Claude Code`、既存 `SSOT`、既存 `workflow` を置き換えない
+- native Codex CLI は撤去前は **optional runtime** であり、`Claude Code`、既存 `SSOT`、既存 `workflow` を置き換えなかった
 - repo の正本は引き続き `CLAUDE.md`、`docs/dev/workflow.md`、`docs/product/requirements.md` などの SSOT 群にある
-- Codex 向けの project-local guidance は `AGENTS.md` に集約し、この文書はその runtime 前提と復旧手順を補足する
+- native Codex CLI 向けの project-local guidance を集約していた `AGENTS.md` の該当箇所は Issue #2161 で整理済み
 
-## Agent model allocation declaration proof（エージェントモデル割当の宣言証明）
+## Agent model allocation declaration proof（エージェントモデル割当の宣言証明。Issue #2161 で provider-neutral 化）
 
-`tests/fixtures/codex-agent-config/expected-runtime-contract.json` が custom agent のモデル、reasoning effort、permission 宣言の唯一の declaration proof である。TOML と静的 validator はこの契約への一致を検査するが、宣言値を provider-side dispatch の観測値として扱わない。
+`tests/fixtures/agent-config/expected-runtime-contract.json` が custom agent のモデル、reasoning effort、permission 宣言の唯一の declaration proof である。静的 validator はこの契約への一致を検査するが、宣言値を provider-side dispatch の観測値として扱わない。
 
 証明は三層に分ける。declaration proof は contract/TOML の静的一致、dispatch proof はイベントが存在する場合に trusted hook が記録する observed model と session/turn/agent/run の相関、availability proof は同一 evidence run の全distinct Terra/Luna model/effort direct smokeである。Issue #1451 のruntime完了条件はavailability proofに限定し、custom-agent dispatchやfresh ledger生成を要求しない。ledger境界はstatic validator/fixtureで維持する。ledger は secret を保存せず、hook trust、freshness、repo headを検証できない場合は PASS にせず `HUMAN_ACTION_REQUIRED` または `BLOCKED` とする。
 

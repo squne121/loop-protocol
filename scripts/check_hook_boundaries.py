@@ -29,16 +29,13 @@ import yaml
 REPO_ROOT = Path(__file__).parent.parent
 DOCS_PATH = REPO_ROOT / "docs" / "dev" / "hook-boundaries.md"
 SETTINGS_PATH = REPO_ROOT / ".claude" / "settings.json"
-CODEX_HOOKS_PATH = REPO_ROOT / ".codex" / "hooks.json"
 
 # Issue #1289: name of the shared fast-path classifier library. It must NEVER
-# appear as its own PreToolUse hook command in either .claude/settings.json or
-# .codex/hooks.json (it is imported by existing guards, not registered as an
-# independent hook).
+# appear as its own PreToolUse hook command in .claude/settings.json (it is
+# imported by existing guards, not registered as an independent hook). Issue
+# #2161 (native Codex CLI retirement): the parallel native Codex CLI hook
+# config topology checks were removed along with the config file.
 _FASTPATH_CLASSIFIER_MODULE_NAME = "pretool_fastpath_classifier"
-# Issue #1830: enforcing PreToolUse handlers are quarantined. Keep the existing
-# helper API for callers, but its exact expected topology is now empty.
-EXPECTED_CODEX_PRETOOL_TOPOLOGY: dict[str, list[dict[str, Any]]] = {}
 
 # ─── manifest 抽出 ────────────────────────────────────────────────────────────
 
@@ -433,82 +430,6 @@ def check_drift(
     return errors
 
 
-def load_codex_hooks_topology(path: Path = CODEX_HOOKS_PATH) -> dict[str, list[dict[str, Any]]]:
-    """Return the exact .codex/hooks.json PreToolUse topology per matcher."""
-    data = json.loads(path.read_text(encoding="utf-8"))
-    pretool = data.get("hooks", {}).get("PreToolUse", [])
-    topology: dict[str, list[dict[str, Any]]] = {}
-    for entry in pretool:
-        matcher = entry.get("matcher", "<none>")
-        topology[matcher] = entry.get("hooks", [])
-    return topology
-
-
-def check_codex_hooks_pretool_topology(
-    path: Path = CODEX_HOOKS_PATH,
-    expected: dict[str, list[dict[str, Any]]] | None = None,
-) -> list[str]:
-    """Verify that the quarantined Codex surface has no active PreToolUse hook."""
-    if expected is None:
-        expected = EXPECTED_CODEX_PRETOOL_TOPOLOGY
-    errors: list[str] = []
-    if not path.exists():
-        errors.append(f"[error] .codex/hooks.json が見つかりません: {path}")
-        return errors
-    actual = load_codex_hooks_topology(path)
-    if actual != expected:
-        errors.append(
-            "[codex:pretool_topology] .codex/hooks.json の PreToolUse hook "
-            f"topology が期待値と一致しません: expected={expected!r} actual={actual!r} "
-            "（意図した hook 追加/削除であれば EXPECTED_CODEX_PRETOOL_TOPOLOGY を更新しレビューを受けること）"
-        )
-    return errors
-
-
-def check_codex_hooks_no_fastpath_classifier(path: Path = CODEX_HOOKS_PATH) -> list[str]:
-    """Issue #1289 AC6: pretool_fastpath_classifier must never be registered as
-    its own PreToolUse hook command in .codex/hooks.json."""
-    errors: list[str] = []
-    if not path.exists():
-        errors.append(f"[error] .codex/hooks.json が見つかりません: {path}")
-        return errors
-    data = json.loads(path.read_text(encoding="utf-8"))
-    for event, event_entries in data.get("hooks", {}).items():
-        if not isinstance(event_entries, list):
-            continue
-        for entry in event_entries:
-            for hook in entry.get("hooks", []):
-                command = hook.get("command", "")
-                if _FASTPATH_CLASSIFIER_MODULE_NAME in command:
-                    errors.append(
-                        f"[codex:fastpath_topology] {_FASTPATH_CLASSIFIER_MODULE_NAME} は "
-                        f".codex/hooks.json の独立 PreToolUse hook として登録されてはいけません "
-                        f"(event={event!r} command={command!r})"
-                    )
-    return errors
-
-
-def check_codex_hooks_root_keys(path: Path = CODEX_HOOKS_PATH) -> list[str]:
-    errors: list[str] = []
-    if not path.exists():
-        return [f"[codex:root_keys] .codex/hooks.json が見つかりません: {path}"]
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        return [f"[codex:root_keys] .codex/hooks.json の JSON parse に失敗: {exc}"]
-
-    if not isinstance(data, dict):
-        return ["[codex:root_keys] .codex/hooks.json root は object である必要があります"]
-
-    root_keys = sorted(data.keys())
-    if root_keys != ["hooks"]:
-        errors.append(
-            "[codex:root_keys] .codex/hooks.json root keys must be exactly "
-            f"['hooks'], got {root_keys}"
-        )
-    return errors
-
-
 def check_settings_no_fastpath_classifier(path: Path = SETTINGS_PATH) -> list[str]:
     """Issue #1289 AC6: same check for .claude/settings.json."""
     errors: list[str] = []
@@ -593,13 +514,11 @@ def main() -> int:
     errors.extend(drift_errors)
     errors.extend(validate_narrative_consistency(docs_text))
 
-    # Issue #1289 (AC4/AC6): .codex/hooks.json is also in scope now — verify
-    # the shared fast-path classifier was never registered as an independent
-    # PreToolUse hook in either manifest.
-    errors.extend(check_codex_hooks_root_keys())
-    errors.extend(check_codex_hooks_no_fastpath_classifier())
+    # Issue #1289 (AC4/AC6): verify the shared fast-path classifier was never
+    # registered as an independent PreToolUse hook. Issue #2161 (native Codex
+    # CLI retirement): the parallel native Codex CLI hook config topology
+    # checks were removed along with the config file.
     errors.extend(check_settings_no_fastpath_classifier())
-    errors.extend(check_codex_hooks_pretool_topology())
 
     # 結果出力
     if errors:

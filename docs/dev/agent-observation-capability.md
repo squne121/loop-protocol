@@ -90,19 +90,13 @@ gate_model:
   pass_requires: hook_coexistence_pass_requires
 ```
 
-### Codex CLI（コーデックスの surface）
+### Codex CLI（コーデックスの surface。native Codex CLI は Issue #2161 で撤去済み）
 
-Codex CLI では canonical な feature key を `[features].hooks` とし、`codex_hooks` は legacy alias としてのみ扱う。`.codex/hooks.json` と `validate-codex-hooks.mjs` が drift している間、非 canonical key の間、project 層が untrusted の間は、Codex を `supported` にしない。
+native Codex CLI 自体は Issue #2161 で repository から撤去し、旧 `.codex/hooks.json` と旧 `validate-codex-hooks.mjs` validator（いずれも削除済み）は存在しない。この capability matrix は `surface` の閉じた 3 値集合（`claude_code` / `codex_cli` / `google_antigravity`、`scripts/check_session_recording_runtime_safety.py` の `CAPABILITY_SURFACE_ENUM`）を機械検証する契約であり、`codex_cli` エントリ自体は固定契約として維持し、`claimed_verdict: unsupported`（closed `verdict_enum` の一値）のまま据え置く。
 
 ```yaml
 surface: codex_cli
 claimed_verdict: unsupported
-canonical_feature_key: "[features].hooks"
-legacy_alias: codex_hooks
-supported_blocked_while:
-  - codex_hooks_json_validator_drift
-  - non_canonical_hook_key
-  - project_layer_untrusted
 ```
 
 ### Google Antigravity（グーグル アンチグラビティの surface）

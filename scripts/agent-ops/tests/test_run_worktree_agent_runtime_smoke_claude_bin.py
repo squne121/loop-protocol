@@ -590,6 +590,13 @@ def test_interactive_lane_native_adapter_never_sets_claude_gpt_claude_bin_env(mo
 # Finding 6 (PR #2176 OWNER REQUEST_CHANGES): invalid runtime/flag
 # combinations must be rejected at argparse time (exit 2), never silently
 # accepted and ignored while a different runtime actually runs.
+#
+# Issue #2161 (native Codex CLI retirement): --runtime codex is no longer a
+# valid argparse choice at all (the ``codex`` runtime lane was removed), so
+# these tests now assert the argparse-level "invalid choice" rejection
+# instead of the (now-unreachable) --runtime-specific parser.error() checks
+# below it. The parser.error() checks themselves are retained in
+# run_worktree_agent_runtime_smoke.py as defensive dead code.
 # ---------------------------------------------------------------------------
 
 
@@ -604,7 +611,7 @@ def test_codex_runtime_with_claude_bin_is_rejected(repo_with_worktree, tmp_path)
         "--claude-bin", "/tmp/does-not-matter/launch.sh",
     )
     assert result.returncode == 2, result.stderr
-    assert "--claude-bin requires --runtime claude" in result.stderr
+    assert "invalid choice: 'codex'" in result.stderr
 
 
 def test_codex_runtime_with_claude_adapter_is_rejected(repo_with_worktree, tmp_path):
@@ -632,7 +639,7 @@ def test_codex_runtime_with_claude_agent_name_is_rejected(repo_with_worktree, tm
         "--claude-agent-name", "some-agent",
     )
     assert result.returncode == 2, result.stderr
-    assert "--claude-agent-name requires --runtime claude" in result.stderr
+    assert "invalid choice: 'codex'" in result.stderr
 
 
 def test_codex_runtime_with_hermetic_agent_definition_is_rejected(repo_with_worktree, tmp_path):
@@ -646,7 +653,7 @@ def test_codex_runtime_with_hermetic_agent_definition_is_rejected(repo_with_work
         "--hermetic-agent-definition",
     )
     assert result.returncode == 2, result.stderr
-    assert "--hermetic-agent-definition requires --runtime claude" in result.stderr
+    assert "invalid choice: 'codex'" in result.stderr
 
 
 def test_hermetic_agent_definition_outside_structured_mode_is_rejected(repo_with_worktree, tmp_path):

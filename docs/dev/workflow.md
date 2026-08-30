@@ -252,25 +252,18 @@ Codex のコマンド強制はリポジトリ内フックを権限根拠とせ�
 安全停止は root checkout、detached HEAD、dirty worktree、Issue/branch mismatch、
 Allowed Paths 違反、実テスト・CI・PR review failure に基づく。
 
-### Codex custom-agent dispatch guardrail（Codex custom-agent 委譲ガードレール）
+### custom-agent dispatch guardrail（custom-agent 委譲ガードレール）
 
-- Codex CLI では `impl-review-loop` / `post-merge-cleanup` の root thread は control-plane のみを担当し、data-plane 操作は明示 spawn した custom agent に委譲する
-- `.codex/agents/*.toml` と dispatch validator は設定整合性の検査に使える。
-  `SUBAGENT_LAUNCH_LEDGER_V1` は advisory telemetry のみで、missing/invalid を
-  routing stop にせず、PASS・承認・CI・review・merge readiness の証拠にしない。
-- parallel-safe ledger V2 は別 Issue で再設計し、未実装を通常 workflow の停止理由にしない。
+- `impl-review-loop` / `post-merge-cleanup` の root thread は control-plane のみを担当し、data-plane 操作は明示 spawn した custom agent（SubAgent）に委譲する
+- `SUBAGENT_LAUNCH_LEDGER_V1` および対応する native writer chain は Issue #2161（native Codex CLI retirement）で DELETE_CHAIN として撤去した。advisory telemetry の位置づけ（missing/invalid を routing stop にせず、PASS・承認・CI・review・merge readiness の証拠にしない）自体は今後も踏襲する。
+- parallel-safe な起動記録の再設計が必要になった場合は別 Issue で行う。
 
-### Multi-Agent V2 の V1 rollback（V1 への復帰手順）
+### Multi-Agent V2 の V1 rollback（historical、Issue #2161 で native Codex CLI 撤去に伴い削除）
 
-Multi-Agent V2 の repository-pinned declaration を V1 に戻す必要がある場合は、
-`.codex/config.toml` の `[features.multi_agent_v2]` で `enabled = false` に戻し、
-`[agents]` table に `max_depth = 1` を復元する。その後、fresh session で次を再実行し、
-rollback 後の config を checker が意図どおり判定することを確認する。
-
-```bash
-uv run --locked python3 scripts/check_impl_review_loop_codex_dispatch.py \
-  --assert-project-multi-agent-v1-config
-```
+Multi-Agent V2 の repository-pinned declaration を V1 に戻す手順は native Codex CLI
+（`.codex/config.toml` の `[features.multi_agent_v2]`）専用の rollback 手順であり、
+`scripts/check_impl_review_loop_codex_dispatch.py` とともに Issue #2161（native Codex CLI
+retirement）で撤去した。
 
 V1 rollback 状態では `--assert-project-multi-agent-v1-config` が、strict boolean
 `enabled = false` と strict integer `max_depth = 1` の両方を正として PASS する。

@@ -883,8 +883,9 @@ def execute_initial_branch_create_transaction(
 # probe -> push -> readback transaction. The hook adapter's own subprocess
 # timeout (`EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS` in
 # scripts/session-recording/codex-hook-adapter.mjs) is deliberately set
-# larger than this, with margin, and stays under the `.codex/hooks.json`
-# 30s hook-wide budget -- so this function should always be able to return a
+# larger than this, with margin, and stayed under the retired native Codex
+# CLI hook config's 30s hook-wide budget (Issue #2161) -- so this function
+# should always be able to return a
 # structured result of its own before any external SIGTERM ever arrives.
 _EXISTING_BRANCH_UPDATE_DEADLINE_SECONDS = 20.0
 # Floor timeout for the one readback attempt performed when the deadline has

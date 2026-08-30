@@ -210,7 +210,7 @@ class TestMaterializationRaceIsRetriedRegardlessOfWhichFailureClassItProduces:
         clock = _FakeClock(step=1.0)
         monkeypatch.setattr(producer.time, "monotonic", clock.monotonic)
         monkeypatch.setattr(producer.time, "sleep", clock.sleep)
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         monkeypatch.setattr(
             producer.subprocess,
             "run",
@@ -263,7 +263,7 @@ class TestMaterializedButFailedResultIsNeverTreatedAsARace:
         clock = _FakeClock(step=1.0)
         monkeypatch.setattr(producer.time, "monotonic", clock.monotonic)
         monkeypatch.setattr(producer.time, "sleep", clock.sleep)
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         monkeypatch.setattr(
             producer.subprocess,
             "run",
@@ -328,14 +328,25 @@ class TestRouteLevelSharedDeadline:
         clock = _FakeClock(step=25.0)
         monkeypatch.setattr(producer.time, "monotonic", clock.monotonic)
         monkeypatch.setattr(producer.time, "sleep", clock.sleep)
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         seen_timeouts: list[str] = []
+        # Issue #2161 (native Codex CLI retirement): the former
+        # codex_cli-only spawn_not_observed retry trigger was removed along
+        # with the codex_cli route. Use the still-retry-eligible
+        # child_completed_but_artifact_not_materialized trigger instead
+        # (Issue #2015 P1 fix) -- a genuine completion signal with the
+        # request evidence present but the result evidence never
+        # materializing.
         real_fake = _fake_harness_run(
             harness_summary={
-                "native_spawn_event_observed": False,
+                "native_spawn_event_observed": True,
                 "parent_session_id": "parent-1",
-                "child_session_id": "",
+                "child_session_id": "child-1",
+                "child_spawn_observed": True,
+                "child_completion_observed": True,
+                "child_completion_source": "hook_subagent_stop",
             },
+            evidence_files={"delegation_request.json": _PASS_REQUEST_JSON},
         )
 
         def _run(argv, **kwargs):  # noqa: ANN001
@@ -403,16 +414,25 @@ class TestRouteLevelSharedDeadline:
         clock = _FakeClock(step=1.0)
         monkeypatch.setattr(producer.time, "monotonic", clock.monotonic)
         monkeypatch.setattr(producer.time, "sleep", clock.sleep)
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
+        # Issue #2161 (native Codex CLI retirement): the former
+        # codex_cli-only spawn_not_observed retry trigger was removed along
+        # with the codex_cli route. Use the still-retry-eligible
+        # child_completed_but_artifact_not_materialized trigger instead
+        # (Issue #2015 P1 fix).
         monkeypatch.setattr(
             producer.subprocess,
             "run",
             _fake_harness_run(
                 harness_summary={
-                    "native_spawn_event_observed": False,
+                    "native_spawn_event_observed": True,
                     "parent_session_id": "parent-1",
-                    "child_session_id": "",
+                    "child_session_id": "child-1",
+                    "child_spawn_observed": True,
+                    "child_completion_observed": True,
+                    "child_completion_source": "hook_subagent_stop",
                 },
+                evidence_files={"delegation_request.json": _PASS_REQUEST_JSON},
             ),
         )
         _artifact, diagnostics = producer.run_route_live(
@@ -488,7 +508,7 @@ class TestRequireRoutePassFlag:
         self, producer, tmp_path
     ):
         rc = producer.main([
-            "--runtime", "codex_cli", "--agent", "web-researcher", "--profile", "grounded_research",
+            "--runtime", "claude_code", "--agent", "web-researcher", "--profile", "grounded_research",
             "--dry-run", "--output-dir", str(tmp_path), "--repo-root", str(REPO_ROOT),
             "--require-route-pass",
         ])
@@ -496,7 +516,7 @@ class TestRequireRoutePassFlag:
 
     def test_without_require_route_pass_dry_run_still_exits_zero(self, producer, tmp_path):
         rc = producer.main([
-            "--runtime", "codex_cli", "--agent", "web-researcher", "--profile", "grounded_research",
+            "--runtime", "claude_code", "--agent", "web-researcher", "--profile", "grounded_research",
             "--dry-run", "--output-dir", str(tmp_path), "--repo-root", str(REPO_ROOT),
         ])
         assert rc == 0

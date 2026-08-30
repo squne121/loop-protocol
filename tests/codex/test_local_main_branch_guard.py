@@ -1,13 +1,16 @@
 """
 tests/codex/test_local_main_branch_guard.py
 
-Tests for Codex CLI parity of local_main_branch_guard.py.
+Tests for the shared local_main_branch_guard.py decision core (Issue #2161:
+the native Codex CLI hook-flavor parity assertions this module historically
+also covered were removed with Codex CLI retirement; the "codex" hook_flavor
+label remains a valid, provider-neutral parameter value on evaluate()).
 Covers AC8, AC17.
 
-AC8: Codex hook input fixture — git switch issue-* denied, git switch main allowed,
-     PermissionRequest also handled.
-AC17: check_codex_agent_config.py fails on startup preflight absent / handler form wrong /
-      hooks.json double-definition.
+AC8: PreToolUse/PermissionRequest fixture — git switch issue-* denied, git
+     switch main allowed.
+AC17: scripts/check_local_main_branch_state.py provides the startup
+      preflight presence.
 """
 
 from __future__ import annotations
@@ -329,26 +332,6 @@ class TestIssue1543OwnerRequestChangesLauncherGrammarArityCodex:
         )
         assert result["status"] == "allow"
 
-    def test_codex_hooks_json_has_local_main_branch_guard(self):
-        """Codex hook は quarantine 後の passive allowlist に限定する。"""
-        hooks_path = REPO_ROOT / ".codex" / "hooks.json"
-        assert hooks_path.exists()
-        hooks = json.loads(hooks_path.read_text())
-        hooks_root = hooks.get("hooks", {})
-        assert set(hooks_root) == {"SessionEnd", "SubagentStop"}
-        commands = [
-            hook.get("command", "")
-            for entries in hooks_root.values()
-            for entry in entries
-            for hook in entry.get("hooks", [])
-        ]
-        assert not any("local_main_branch_guard" in command for command in commands)
-
-    def test_codex_hook_script_exists(self):
-        """Codex hook script .codex/hooks/local_main_branch_guard.sh must exist."""
-        script_path = REPO_ROOT / ".codex" / "hooks" / "local_main_branch_guard.sh"
-        assert script_path.exists(), f"Codex hook script not found: {script_path}"
-
     def test_guard_script_exists(self):
         """Shared guard script scripts/agent-guards/local_main_branch_guard.py must exist."""
         guard_path = REPO_ROOT / "scripts" / "agent-guards" / "local_main_branch_guard.py"
@@ -507,45 +490,21 @@ class TestReadonlyPipelineClassifier:
         assert result["reason_code"] == REASON_UNPARSEABLE
 
 
-# ─── AC17: Codex startup preflight mandatory ─────────────────────────────────
+# ─── AC17: startup preflight mandatory ────────────────────────────────────
+# Issue #2161: the former check_codex_agent_config.py-based preflight and
+# hooks.json double-definition assertions were removed with native Codex
+# CLI retirement; the shared scripts/check_local_main_branch_state.py
+# preflight producer itself is provider-neutral and still verified below.
 
 
-class TestAC17CodexStartupPreflightMandatory:
-    """AC17: check_codex_agent_config.py validates startup preflight presence."""
+class TestAC17StartupPreflightMandatory:
+    """AC17: scripts/check_local_main_branch_state.py provides the startup
+    preflight presence."""
 
     def test_startup_preflight_script_exists(self):
         """scripts/check_local_main_branch_state.py must exist."""
         script_path = REPO_ROOT / "scripts" / "check_local_main_branch_state.py"
         assert script_path.exists(), f"Startup preflight script not found: {script_path}"
-
-    def test_check_codex_agent_config_validates_preflight(self):
-        """check_codex_agent_config.py --assert-local-main-branch-guard must pass."""
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(REPO_ROOT / "scripts" / "check_codex_agent_config.py"),
-                "--assert-local-main-branch-guard",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=str(REPO_ROOT),
-        )
-        assert result.returncode == 0, (
-            f"check_codex_agent_config.py --assert-local-main-branch-guard failed:\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
-        )
-
-    def test_hooks_json_no_duplicate_local_main_guard_definition(self):
-        """
-        AC17: .codex/hooks.json must not double-define local_main_branch_guard
-        (i.e., it should be defined only once per event/matcher combination).
-        """
-        hooks_path = REPO_ROOT / ".codex" / "hooks.json"
-        assert hooks_path.exists()
-        hooks = json.loads(hooks_path.read_text())
-        hooks_root = hooks.get("hooks", {})
-        assert "PreToolUse" not in hooks_root
-        assert "PermissionRequest" not in hooks_root
 
     def test_startup_preflight_runs_successfully_on_main(self, tmp_path):
         """
@@ -1417,15 +1376,10 @@ class TestGithub5ClassVocabularyConstants:
         ]:
             assert term in content, f"agent-skill-boundaries.md must contain 5-class term: {term!r}"
 
-    def test_ac15_codex_default_rules_has_trusted_repo_mention(self):
-        """AC15: .codex/rules/default.rules mentions managed skill context for gh issue create/edit."""
-        rules_path = REPO_ROOT / ".codex" / "rules" / "default.rules"
-        assert rules_path.exists(), f"default.rules not found: {rules_path}"
-        content = rules_path.read_text()
-        # The rules file should mention that managed skill context allows gh issue create/edit
-        assert "github_issue_mutation" in content or "managed skill" in content or "body-file" in content, (
-            ".codex/rules/default.rules must reference managed skill / body-file context for gh issue mutations"
-        )
+    # Issue #2161: the former AC15 native Codex CLI default.rules mention
+    # test was removed with native Codex CLI retirement (the rules file no
+    # longer exists); the shared 5-class vocabulary is still verified above
+    # against hook-boundaries.md / agent-skill-boundaries.md.
 
 
 # ─── B1-B4 Review Blocker Fixes (Codex flavor) ────────────────────────────────
@@ -1626,12 +1580,14 @@ class TestIssue1291IssueMetadataMutationCodex:
         assert result.stderr == ""
 
 
-# ─── Issue #1137: cleanup arbitration + Claude/Codex reason_code parity ────────
-# The cleanup decision core is worktree_scope_guard.build_decision, wired into
-# BOTH .claude/settings.json (Claude) and .codex/hooks.json (Codex). The two
-# runtimes therefore share one decision core and one reason-code vocabulary
-# (SHARED_CLEANUP_REASON_CODES). local_main_branch_guard defers the exact cleanup
-# commands to that core instead of double-deciding them.
+# ─── Issue #1137: cleanup arbitration + reason_code parity ────────────────
+# The cleanup decision core is worktree_scope_guard.build_decision, wired
+# into .claude/settings.json. It historically was also wired into the
+# native Codex CLI hook config before Codex CLI retirement (Issue #2161);
+# the shared decision core and reason-code vocabulary
+# (SHARED_CLEANUP_REASON_CODES) is retained as the single source of truth.
+# local_main_branch_guard defers the exact cleanup commands to that core
+# instead of double-deciding them.
 
 import importlib.util as _ilu  # noqa: E402
 import json as _json  # noqa: E402
