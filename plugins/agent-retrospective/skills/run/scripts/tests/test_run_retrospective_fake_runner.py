@@ -30,6 +30,7 @@ Run with:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -39,9 +40,25 @@ import pytest
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 _SCHEMAS_DIR = _SCRIPTS_DIR.parent / "schemas"
+# NOTE: This plugin's run_retrospective.py shares its bare module basename
+# with the unrelated host-repo project Skill at
+# .claude/skills/agent-retrospective/scripts/run_retrospective.py, whose own
+# test suite also imports it as a bare ``run_retrospective`` module. Python's
+# ``sys.modules`` cache is process-global and keyed by bare module name, so
+# when both test suites are collected in the SAME pytest process (as CI's
+# unified python-test-core job does), whichever ``import run_retrospective``
+# executes first wins the cache entry and the other silently gets the wrong
+# module back. Load this plugin's copy via an explicit file-location spec
+# under a collision-proof module name instead of a bare top-level import, so
+# it never touches (or is shadowed by) the ``run_retrospective`` cache key
+# (Issue #2240 fix_delta iteration 5).
 sys.path.insert(0, str(_SCRIPTS_DIR))
-
-import run_retrospective as rr  # noqa: E402  (sys.path manipulated above)
+_RR_MODULE_NAME = "agent_retrospective_plugin_run_retrospective_under_test"
+_rr_spec = importlib.util.spec_from_file_location(_RR_MODULE_NAME, _SCRIPTS_DIR / "run_retrospective.py")
+assert _rr_spec is not None and _rr_spec.loader is not None
+rr = importlib.util.module_from_spec(_rr_spec)
+sys.modules[_RR_MODULE_NAME] = rr
+_rr_spec.loader.exec_module(rr)
 
 
 def _extract_scoped_agent_name(argv: list[str]) -> str:
