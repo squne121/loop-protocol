@@ -52,6 +52,31 @@ claude -p \
   **silent fallback せず exit 77（SKIP）** を返す
 - bounded timeout（`--timeout-seconds`）で fresh process を強制終了する
 
+## Invocation-local peer messaging policy（Issue #2437）
+
+The native harness supplies one fixed `--settings` JSON overlay for every
+structured invocation, retaining the `SubagentStart` / `SubagentStop`
+observability hooks and adding exactly:
+
+```json
+{
+  "crossSessionInbound": "refuse",
+  "permissions": {"deny": ["SendMessage", "ListAgents"]}
+}
+```
+
+This is harness-owned process-local input, not a rewrite of global settings.
+`crossSessionInbound: "refuse"` is configuration evidence, not an inbound
+behavioral proof. Bare deny removes the outbound/listing tools, including
+post-spawn subagent/agent-team messaging; the supported lifecycle remains
+`Agent(...)` spawn through terminal completion. Tests use a controlled process
+that validates only its own settings/tool surface and never starts, lists,
+messages, or observes an independent peer.
+
+The interactive lane uses Herdr's documented `agent start ... -- [AGENT_ARG]...`
+pass-through to forward this same fixed `--settings` overlay. It remains an
+isolated named Herdr session; structured execution remains a direct subprocess.
+
 ## Interactive herdr lane（必要時のみ）
 
 呼び出し元の Herdr session ではなく、実行のたびに新規生成する isolated named session の

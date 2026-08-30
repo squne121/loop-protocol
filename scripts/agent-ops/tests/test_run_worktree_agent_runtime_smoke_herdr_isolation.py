@@ -630,7 +630,12 @@ def test_given_real_herdr_and_poisoned_ambient_identity_when_helpers_run_then_co
         # must not disturb that pre-existing inventory.
         session_name = module.new_isolated_session_name("herdr", env=isolated_env)
         assert session_name not in {entry["name"] for entry in before}
-        proc = module.create_isolated_session("herdr", session_name, isolated_env, timeout_seconds=20.0)
+        try:
+            proc = module.create_isolated_session("herdr", session_name, isolated_env, timeout_seconds=20.0)
+        except module.HerdrLaneError as exc:
+            if exc.skip:
+                pytest.skip(f"SKIP: isolated Herdr launch unavailable: {exc}")
+            raise
         try:
             mid = module.snapshot_herdr_sessions("herdr", isolated_env)
             assert mid is not None

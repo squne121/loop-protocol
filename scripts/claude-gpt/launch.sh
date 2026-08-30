@@ -1454,6 +1454,8 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
 {
   "permissions": {
     "deny": [
+      "SendMessage",
+      "ListAgents",
       "Read(/${PROXY_CONFIG_DIR_TARGET}/**)",
       "Read(/${PROXY_STATE_DIR_TARGET}/**)",
       "Read(/${PROXY_HOME_TARGET}/**)",
@@ -1462,6 +1464,7 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
       "Edit(/${SPARK_AUTH_DIR_TARGET}/**)"
     ]
   },
+  "crossSessionInbound": "refuse",
   "enabledPlugins": {}${HOOKS_JSON_FRAGMENT}${ENV_JSON_FRAGMENT},
   ${AUTO_MODE_JSON_FRAGMENT}
 }

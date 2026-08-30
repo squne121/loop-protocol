@@ -144,6 +144,76 @@ FAKE_CLAUDE_SUCCESS_BODY = (
 )
 
 
+def test_given_native_policy_payload_when_generated_then_exact_peer_policy_and_observability_hooks_are_present():
+    """The harness-owned native overlay contains the exact peer policy and
+    retains the existing lifecycle observability hooks; it is not a global
+    settings mutation or caller-provided policy input."""
+    module = _load_module()
+    settings = json.loads(module._CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON)
+
+    assert settings["crossSessionInbound"] == "refuse"
+    assert settings["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+    assert set(settings["hooks"]) == {"SubagentStart", "SubagentStop"}
+
+
+def test_given_native_structured_spawn_when_fake_child_receives_settings_then_peer_tools_are_fixed_and_no_peer_is_started(
+    repo_with_worktree, tmp_path
+):
+    """A controlled child process validates only its own generated settings.
+    It never starts, lists, sends to, or observes an independent peer."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    observed = tmp_path / "peer-policy-observed"
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + f"""
+settings=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--settings" ]; then
+    settings="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+python3 - "$settings" <<'PY'
+import json
+import sys
+settings = json.loads(sys.argv[1])
+assert settings["crossSessionInbound"] == "refuse"
+assert settings["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+PY
+printf '%s' absent_or_denied > {shlex.quote(str(observed))}
+cat > /dev/null
+printf '%s\\n' '{{"type":"system","subtype":"init"}}'
+printf '%s\\n' '{{"type":"result","subtype":"success","permission_denials":[{{"tool_name":"SendMessage"}},{{"tool_name":"ListAgents"}}]}}'
+""")
+    prompt = _prompt_file(tmp_path)
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        "--evidence-json", str(tmp_path / "evidence.json"),
+        fake_bin_dir=fake_bin,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert observed.read_text(encoding="utf-8") == "absent_or_denied"
+    evidence = json.loads((tmp_path / "evidence.json").read_text(encoding="utf-8"))
+    assert evidence["peer_policy_configured"] is True
+    assert evidence["cross_session_inbound_configured_refuse"] is True
+    assert evidence["outbound_peer_tools_absent"] is True
+
+
+def test_given_native_interactive_agent_start_when_constructed_then_settings_are_passed_after_herdr_separator():
+    """Installed Herdr documents `agent start ... -- [AGENT_ARG]...`; the
+    interactive lane uses that existing pass-through rather than changing its
+    direct-vs-Herdr transport boundary."""
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert 'if claude_adapter == "native":' in source
+    assert '"--", "--settings", _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON' in source
+    assert "Claude-GPT keeps its launcher-owned" in source
+
+
 def _subagent_hook_lines(
     agent_id: str = "child-fixture-1",
     transcript_path: str | None = None,
@@ -951,7 +1021,12 @@ case "$1" in
     ;;
   agent)
     case "$2" in
-      start) exit 0 ;;
+      start)
+        if [ -n "${FAKE_HERDR_AGENT_START_LOG:-}" ]; then
+          printf '%s\\n' "$@" > "$FAKE_HERDR_AGENT_START_LOG"
+        fi
+        exit 0
+        ;;
       prompt) exit 0 ;;
       get) echo '{"state":"idle"}'; exit 0 ;;
       explain) echo '{"agent":"claude","confidence":"high"}'; exit 0 ;;
@@ -982,6 +1057,38 @@ case "$1" in
 esac
 exit 0
 """
+
+
+def test_given_native_interactive_lane_when_herdr_starts_agent_then_fixed_policy_uses_documented_passthrough(
+    repo_with_worktree, tmp_path
+):
+    """The controlled isolated session records only the agent-start argv.
+    No human or independent peer is created or observed."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\\n")
+    start_log = tmp_path / "agent-start.argv"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(_prompt_file(tmp_path)), "--output-dir", str(tmp_path / "out"),
+        fake_bin_dir=fake_bin,
+        extra_env={
+            "HERDR_ENV": "1",
+            "FAKE_HERDR_STATE_DIR": str(tmp_path / "herdr-state"),
+            "FAKE_HERDR_AGENT_START_LOG": str(start_log),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    argv = start_log.read_text(encoding="utf-8").splitlines()
+    separator = argv.index("--")
+    assert argv[separator + 1] == "--settings"
+    settings = json.loads(argv[separator + 2])
+    assert settings["crossSessionInbound"] == "refuse"
+    assert settings["permissions"]["deny"] == ["SendMessage", "ListAgents"]
 
 
 def test_given_isolated_herdr_lane_when_interactive_runs_then_session_created_and_cleaned_up(

@@ -473,6 +473,14 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
   確認できない場合は fail-closed で exit 1 とする（PR #1921 human OWNER fix-delta）。
 - Runner（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は runtime 起動・観測・証跡収集だけを所有し、
   hook reason の意味分類・mutation deny の妥当性・review verdict 等の semantic 判定は caller が引き続き所有する。
+- Claude peer messaging を対象にする immediate verification は、harness-owned invocation-local
+  `crossSessionInbound: "refuse"` と bare `SendMessage` / `ListAgents` deny の exact generated-settings
+  test、および peer を開始・観測・送信先にしない controlled spawned-process canary を含める。
+  configured evidence (`peer_policy_configured`, `cross_session_inbound_configured_refuse`) と observed
+  evidence (`outbound_peer_tools_absent`, `agent_spawn_completion_observed`, `herdr_namespace_isolated`,
+  `preexisting_herdr_preserved`) を混同しない。inbound behavior は configured value から推論せず、
+  runtime unavailable / nested isolated-Herdr constraint は bounded reason-code SKIP exit 77 として
+  artifact を残し、PASS に読み替えない。
 - **SubAgent 実行の causal evidence は hook ID 相関を要求し、marker 文字列出力のみでは不十分とする**（Issue #2183、
   Issue #2174 OWNER REQUEST_CHANGES https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173、
   PR #2214 OWNER レビュー https://github.com/squne121/loop-protocol/pull/2214#issuecomment-5307009937、

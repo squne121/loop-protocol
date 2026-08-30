@@ -230,6 +230,30 @@ def test_build_proxy_env_helper_references_same_transport_policy_constant():
     assert "CCP_CODEX_TRANSPORT=" in body
 
 
+def test_claude_gpt_runtime_smoke_settings_contain_exact_fixed_peer_policy(tmp_path):
+    """The launcher, rather than a caller setting, owns the exact policy."""
+    result = _run_check_only(tmp_path)
+    assert result.returncode == 0, result.stderr
+
+    settings_path = tmp_path / "claude-gpt-home" / "claude" / "settings.local.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert settings["crossSessionInbound"] == "refuse"
+    assert settings["permissions"]["deny"][:2] == ["SendMessage", "ListAgents"]
+
+
+def test_claude_gpt_public_settings_flag_remains_rejected():
+    """A public caller cannot replace the launcher-owned policy overlay."""
+    result = subprocess.run(
+        [str(LAUNCH_SH), "--", "--settings", '{"crossSessionInbound":"accept"}'],
+        cwd=str(SCRIPT_DIR),
+        capture_output=True,
+        text=True,
+        env=dict(os.environ),
+    )
+    assert result.returncode == 2
+    assert '"reason":"policy_weakening_flag_rejected"' in result.stderr
+
+
 # --- child env の repository-owned transport 固定（AC3） -------------------------
 
 

@@ -544,11 +544,16 @@ def read_prompt(prompt_file: str) -> str:
 # process-local, this-invocation-only settings overlay -- it never
 # modifies the committed ``.claude/settings.json`` (out of Allowed Paths)
 # and never disables any hook already configured there.
+# This is harness-owned invocation-local input.  Keep the peer policy in the
+# same overlay as the existing observability hooks so every native lane has one
+# exact, auditable policy payload and no global Claude settings are changed.
 _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON = json.dumps({
+    "crossSessionInbound": "refuse",
+    "permissions": {"deny": ["SendMessage", "ListAgents"]},
     "hooks": {
         "SubagentStart": [{"hooks": [{"type": "command", "command": "cat"}]}],
         "SubagentStop": [{"hooks": [{"type": "command", "command": "cat"}]}],
-    }
+    },
 })
 
 
@@ -4537,7 +4542,17 @@ def run_interactive_herdr_isolated(
         # in Issue #1960) -- not from a structured-lane print-mode flag
         # that has not been separately confirmed to be honored by an
         # interactive Claude Code launch.
+        # ``herdr agent start`` explicitly supports ``-- [AGENT_ARG]...``.
+        # Native Claude receives the same fixed, invocation-local policy used
+        # by the structured subprocess. Claude-GPT keeps its launcher-owned
+        # policy channel instead: forwarding --settings to that launcher is a
+        # rejected policy-bypass input. Neither branch alters the isolated
+        # Herdr lifecycle or routes structured execution through Herdr.
         agent_extra_args: list[str] = []
+        if claude_adapter == "native":
+            agent_extra_args = [
+                "--", "--settings", _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON,
+            ]
 
         # A freshly created workspace's shell may not be an "available shell"
         # yet (still initializing). Retry ``agent start`` with a bounded,
@@ -5237,6 +5252,16 @@ def main(argv: list[str] | None = None) -> int:
             "until #1881 (pr-reviewer persona safe Read/mutation-deny boundary) "
             "merges"
         ),
+        # Issue #2437: these names deliberately distinguish the two settings
+        # facts from runtime observations. None means the lane did not expose
+        # a trustworthy observation channel; it is never promoted from a
+        # model self-report or an absence of unrelated output.
+        "peer_policy_configured": args.runtime == "claude",
+        "cross_session_inbound_configured_refuse": args.runtime == "claude",
+        "outbound_peer_tools_absent": None,
+        "agent_spawn_completion_observed": None,
+        "herdr_namespace_isolated": None,
+        "preexisting_herdr_preserved": None,
     }
     if args.mode == "interactive":
         # Issue #1960 Design Decision 5 (P1-2 fix-delta): the interactive
@@ -5354,6 +5379,13 @@ def main(argv: list[str] | None = None) -> int:
                 # additive field, independent of mutation_boundary/hermetic
                 # gating above.
                 schema_summary["permission_denials"] = extract_claude_permission_denials(out)
+                denied_peer_tools = {
+                    str(denial.get("tool_name"))
+                    for denial in schema_summary["permission_denials"]
+                    if isinstance(denial, dict)
+                }
+                if {"SendMessage", "ListAgents"}.issubset(denied_peer_tools):
+                    schema_summary["outbound_peer_tools_absent"] = True
             # Issue #2161 (native Codex CLI retirement): the
             # run_structured_codex()-based else branch was removed along
             # with the ``codex`` runtime lane.
@@ -5510,6 +5542,9 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["child_agent_id"] = child_agent_id
             schema_summary["spawn_elapsed_sec"] = spawn_elapsed_sec
             schema_summary["completion_elapsed_sec"] = completion_elapsed_sec
+            schema_summary["agent_spawn_completion_observed"] = bool(
+                child_spawn_observed and child_completion_observed
+            )
 
             if capability_decision == "capability_skip":
                 # AC2: a known unknown/unrecognized-option parser diagnostic
@@ -5961,6 +5996,12 @@ def main(argv: list[str] | None = None) -> int:
             cleanup = evidence.get("cleanup") or {}
             schema_summary["cleanup_attempted"] = cleanup.get("attempted", False)
             schema_summary["cleanup_confirmed_removed"] = cleanup.get("confirmed_removed", False)
+            schema_summary["herdr_namespace_isolated"] = bool(
+                evidence.get("session_name") and cleanup.get("confirmed_removed")
+            )
+            schema_summary["preexisting_herdr_preserved"] = schema_summary.get(
+                "herdr_workspace_snapshot_preserved"
+            )
             if cleanup.get("attempted") and not cleanup.get("confirmed_removed"):
                 errors.append("herdr isolated session cleanup could not be confirmed removed")
                 exit_code = EXIT_FAIL

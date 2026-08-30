@@ -58,6 +58,34 @@ SubAgent lifecycle・forbidden marker 不在を検証できる）
 呼び出し元は transport を選択できない。検証 session は常に cleanup 対象であり、残す
 オプションは提供しない。
 
+## Invocation-local Claude peer policy（Issue #2437）
+
+native Claude の structured / interactive lane は、harness が所有する invocation-local
+settings に常に次を固定する。global `.claude/settings*`、`~/.claude`、既存 Herdr
+namespace は変更しない。
+
+```json
+{
+  "crossSessionInbound": "refuse",
+  "permissions": {"deny": ["SendMessage", "ListAgents"]}
+}
+```
+
+- structured lane は既存 direct subprocess の `--settings` overlay に hook observability
+  とともに追加する。interactive lane は Herdr が公式に提供する
+  `agent start ... -- [AGENT_ARG]...` pass-through で同じ overlay を渡す。
+- `SendMessage` deny により spawn 後の peer / subagent messaging や resume coordination
+  は要求しない。維持対象は同一 main session の `Agent(...)` spawn と terminal completion
+  lifecycle evidence のみである。
+- evidence は `peer_policy_configured` と
+  `cross_session_inbound_configured_refuse` を configured、
+  `outbound_peer_tools_absent`、`agent_spawn_completion_observed`、
+  `herdr_namespace_isolated`、`preexisting_herdr_preserved` を observed として扱う。
+  inbound peer message の behavioral proof は主張せず、人間または独立 peer を開始・観測・
+  送信先にしない。
+- Claude-GPT adapter は caller `--settings` を受け取らず、launcher-owned fixed
+  runtime-smoke settings channel の同じ policy を使う。SKIP exit 77 は runtime PASS ではない。
+
 ## Lane 選択
 
 ### capability 判定の方針(help への非掲載は capability 不足を意味しない)

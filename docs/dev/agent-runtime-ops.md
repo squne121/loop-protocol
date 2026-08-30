@@ -549,6 +549,29 @@ Claude Code／Codex CLI の runtime smoke（linked worktree 内での fresh sess
 経由しない。runner は起動・観測・証跡収集だけを所有し、Codex CLI 側の
 sandbox／permission profile（本文書の Root Default Permission Profile）は変更しない。
 
+### Claude peer messaging policy（Issue #2437）
+
+runtime-smoke が起動する Claude process は process-local settings で
+`crossSessionInbound: "refuse"` と bare `permissions.deny` の `SendMessage` /
+`ListAgents` を固定する。structured lane は直接 subprocess のまま、interactive
+lane は fresh isolated Herdr namespace の `agent start ... -- [AGENT_ARG]...`
+pass-through を使う。いずれも global Claude/Herdr config や pre-existing human
+namespace を変更しない。
+
+この policy は harness-started process の initial/effective policy を public runner
+input から弱めさせないためのものであり、hostile relaunch、OS/user/account isolation
+を証明する security boundary ではない。Claude-GPT は既存 launcher-owned fixed
+runtime-smoke settings channel だけで同じ値を生成し、caller `--settings` は拒否する。
+
+runtime evidence は configured (`peer_policy_configured`,
+`cross_session_inbound_configured_refuse`) と observed
+(`outbound_peer_tools_absent`, `agent_spawn_completion_observed`,
+`herdr_namespace_isolated`, `preexisting_herdr_preserved`) を区別する。human / independent
+peer を start、list、message、observe して inbound behavior を証明しない。`SendMessage`
+deny 後も維持する lifecycle は `Agent(...)` spawn → terminal completion のみであり、
+post-spawn SendMessage/resume/agent-team coordination は要求しない。feature/runtime が
+利用不能な場合は bounded reason-code SKIP (exit 77) であり PASS へ昇格しない。
+
 ## main drift 選択的再束縛の証跡契約（Issue #2102）
 
 main が並行に前進した場合、issue-refinement-loop / impl-review-loop は base-bound evidence
