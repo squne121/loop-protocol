@@ -1145,6 +1145,15 @@ FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE = "fail_closed_environment_or_integ
 # `merge_readiness_into_review_result()` already write into
 # `merged_review_result["failure_class"]` on main (no wire change
 # required to observe it here -- see Issue #2397 P0-2).
+#
+# Issue #2397 Scope Delta iteration 3 (OWNER PR #2398 review, 3rd round,
+# P1-3): this constant is the single source of truth for the route-critical
+# known `failure_class` value set `route_canonical_step2_result()` below
+# recognizes. Any OTHER non-empty `failure_class` string (including a
+# future new value not added HERE first) is treated as unrecognized and
+# fails closed (`FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`) rather than
+# silently routing anywhere -- do not duplicate or hardcode this literal
+# string elsewhere; reference this constant instead.
 FAILURE_CLASS_CONTRACT_READINESS_HUMAN_JUDGMENT = "contract_readiness_human_judgment"
 
 

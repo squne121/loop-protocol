@@ -37,6 +37,16 @@ Verifies:
   (`terminal: true` / `termination_reason: "human_escalation"` /
   `termination_cause: "operator_intervention_required"`) only for the
   operator-intervention route, and `{"route": route}` only otherwise.
+* AC14 (Scope Delta iteration 3, OWNER PR #2398 review, 3rd round, P0-1):
+  AC11's "genuinely operator-only" fixture no longer relies on the
+  `unknown` catch-all classification (`jq` against a hardcoded nonexistent
+  path). `unknown` is a classifier-gap catch-all that also absorbs
+  body-fixable conditions (typo / stale VC / classifier gap), so it does
+  not actually PROVE the readiness state is operator-only. AC11's fixture
+  now forces a KNOWN, named operator-only category (`env_missing_dep`) by
+  shimming an allowlisted command's real subprocess execution boundary
+  (see `_write_forced_env_missing_dep_command()` below) instead of relying
+  on ambient host/classifier behavior.
 """
 
 from __future__ import annotations
@@ -46,6 +56,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -97,6 +108,47 @@ def _run_real_produce(tmp_path: Path, monkeypatch, *, body: str, issue_number: i
     return out
 
 
+def _write_forced_env_missing_dep_command(
+    tmp_path: Path, monkeypatch, *, binary_name: str = "jq"
+) -> None:
+    """Issue #2397 Scope Delta iteration 3 (OWNER PR #2398 review, 3rd
+    round, P0-1): deterministically force a KNOWN operator-only preflight
+    classification (`category: "env_missing_dep"`) at the REAL preflight
+    subprocess execution boundary, instead of relying on the `unknown`
+    catch-all (which also absorbs body-fixable typo/stale-VC/classifier-gap
+    conditions and therefore does not prove genuine operator-only-ness).
+
+    Mechanism: `binary_name` (`jq` by default) IS on
+    `baseline_vc_preflight.py`'s closed `_ALLOWED_COMMANDS` allowlist, so a
+    VC invoking it passes the static `command_not_allowed` check and
+    reaches REAL execution. This shims that binary: a directory containing
+    an executable named `binary_name` that unconditionally `exit`s 127 is
+    prepended to `PATH`. Every layer of the real checker subprocess chain
+    `_run_real_produce()` exercises (`reviewer_transport.
+    run_reviewer_transport()` -> `run_root_review_pipeline.py
+    run-checker-attempt` -> `check_issue_contract.py` ->
+    `contract_readiness_check.run_baseline_vc_preflight()` ->
+    `baseline_vc_preflight.py`'s own VC-command `subprocess.Popen()`)
+    launches its child with `env=None` (inherit current environment), so
+    this shimmed `PATH` propagates all the way down to the actual
+    VC-command exec -- deterministically, regardless of whether the host
+    machine happens to have a real `jq` installed or what its real
+    behavior against any particular input would be.
+    `classify_result()`'s `exit_code in (126, 127)` branch classifies this
+    `category: "env_missing_dep"` unconditionally (independent of stderr
+    wording), which `_PREFLIGHT_CATEGORY_TO_READINESS` maps to
+    `human_judgment` -- one of the Issue #2397 Out of Scope's confirmed
+    operator-only categories (`env_missing_dep` / `timeout` /
+    `package_manager_no_tty_prompt` / `unknown` remain operator-only).
+    """
+    fake_bin_dir = tmp_path / "fake-bin-env-missing-dep"
+    fake_bin_dir.mkdir(parents=True, exist_ok=True)
+    shim_path = fake_bin_dir / binary_name
+    shim_path.write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
+    shim_path.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
 # `zzz-not-a-real-preflight-allowlisted-tool-2397` is not on
 # `baseline_vc_preflight.py`'s closed allowlist (`_ALLOWED_COMMANDS`), so the
 # real checker chain classifies it `category: command_not_allowed` /
@@ -138,21 +190,29 @@ $ zzz-not-a-real-preflight-allowlisted-tool-2397-scope-delta --version
 """
 
 
-# `jq` IS on the closed allowlist, so the real checker chain actually
-# executes it against a path that does not exist. Its exit code (2) and
-# stderr do not match any of `classify_result()`'s specific patterns, so
-# classification falls through to the terminal "Unknown: cannot classify"
-# branch (`decision: "human_judgment"`, `category: "unknown"`), which
-# `map_preflight_result_to_errors()` treats as `human_judgment`
-# unconditionally -- a genuine operator-only signal, unaffected by the
-# `command_not_allowed` -> `needs_fix` fix (Issue #2397 Scope Delta AC11).
+# Issue #2397 Scope Delta iteration 3 (OWNER PR #2398 review, 3rd round,
+# P0-1): this fixture used to point `jq` at a hardcoded nonexistent path,
+# relying on the resulting `category: "unknown"` catch-all classification
+# as its stand-in for "genuinely operator-only". That was wrong: `unknown`
+# is a classifier-gap catch-all that ALSO absorbs body-fixable conditions
+# (typo / stale VC / classifier gap), so it never actually proved the
+# readiness state was operator-only -- it only proved the classifier could
+# not recognize the failure. The fixture below instead uses a plain,
+# innocuous `jq --version` invocation; determinism comes from
+# `_write_forced_env_missing_dep_command()` (called by each test using this
+# fixture) shimming `jq`'s real subprocess execution boundary via `PATH` so
+# the real checker chain deterministically observes exit code 127 ->
+# `category: "env_missing_dep"` (a KNOWN, named operator-only category --
+# see Issue #2397 Out of Scope), regardless of host/environment state. The
+# unreliable `fixture/e2e_produce_operator_intervention_scope_delta_unknown.json`
+# reference has been removed entirely.
 _GENUINELY_OPERATOR_ONLY_BODY = """## Machine-Readable Contract
 
 ```yaml
 contract_schema_version: v1
 issue_kind: research
 parent_issue: none
-goal_ref: "Issue #2397 Scope Delta AC11 fixture (genuinely operator-only, not command_not_allowed)"
+goal_ref: "Issue #2397 Scope Delta AC11/AC14 fixture (genuinely operator-only, not command_not_allowed)"
 change_kind: research
 ```
 
@@ -161,25 +221,29 @@ change_kind: research
 Fixture body for a genuine end-to-end `produce` CLI regression test proving
 a genuinely operator-only readiness state (NOT `command_not_allowed`) still
 routes to `STEP_5_OPERATOR_INTERVENTION_REQUIRED` after the Issue #2397
-Scope Delta P0-1 fix (Issue #2397 Scope Delta AC11).
+Scope Delta P0-1 fix (Issue #2397 Scope Delta AC11/AC14).
 
 ## Acceptance Criteria
 
 - [ ] AC1: fixture body's Verification Command uses an allowlisted binary
-      (`jq`) against a path that does not exist, so the real checker chain
-      actually executes it and its readiness check classifies the result
-      `category: unknown` / `decision: human_judgment`.
+      (`jq`) whose real subprocess execution boundary the test process has
+      shimmed (via `PATH`) to deterministically exit 127, so the real
+      checker chain's readiness check classifies the result
+      `category: env_missing_dep` / `decision: blocked` -> `human_judgment`
+      (genuinely operator-only, a KNOWN category, NOT the classifier-gap
+      `unknown` catch-all and NOT the body-fixable `command_not_allowed`
+      category).
 
 ## Verification Commands
 
 ```bash
 # AC1
-$ jq '.' fixture/e2e_produce_operator_intervention_scope_delta_unknown.json
+$ jq --version
 ```
 
 ## Allowed Paths
 
-- fixture/e2e_produce_operator_intervention_scope_delta_unknown.json
+- fixture/e2e_produce_operator_intervention_scope_delta_env_missing_dep.md
 """
 
 
@@ -290,6 +354,7 @@ def test_command_not_allowed_readiness_routes_to_step_4_not_operator_interventio
 def test_genuinely_operator_only_fixture_routes_to_operator_intervention(
     tmp_path: Path, monkeypatch
 ):
+    _write_forced_env_missing_dep_command(tmp_path, monkeypatch)
     out = _run_real_produce(
         tmp_path,
         monkeypatch,
@@ -312,6 +377,7 @@ def test_genuinely_operator_only_fixture_routes_to_operator_intervention(
 def test_cmd_produce_includes_canonical_step2_disposition_for_operator_route(
     tmp_path: Path, monkeypatch
 ):
+    _write_forced_env_missing_dep_command(tmp_path, monkeypatch)
     out = _run_real_produce(
         tmp_path,
         monkeypatch,
