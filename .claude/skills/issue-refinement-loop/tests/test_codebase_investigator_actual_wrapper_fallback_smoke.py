@@ -40,6 +40,11 @@ _UNAVAILABLE_MARKERS = (
     "unrecognized_model",
 )
 _SENTINEL = "AGY_ADVISORY_INVOCATION_REQUEST_V1"
+_AC8_LIVE_VERIFICATION_COMMAND = (
+    "uv run --locked pytest "
+    ".claude/skills/issue-refinement-loop/tests/"
+    "test_codebase_investigator_actual_wrapper_fallback_smoke.py -q -m claude_live"
+)
 
 
 def _tracked_status() -> str:
@@ -73,6 +78,35 @@ def _write_runtime_skip_evidence(reason: str) -> Path:
         + "\n",
         encoding="utf-8",
     )
+    return path
+
+
+def _write_runtime_pass_evidence() -> Path:
+    """Persist bounded PASS evidence without recording runtime output or credentials."""
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0
+    tested_head = completed.stdout.strip()
+    assert len(tested_head) == 40
+    content = (
+        f"tested_head={tested_head}\n"
+        "result=PASS\n"
+        f"verification_command={_AC8_LIVE_VERIFICATION_COMMAND}\n"
+        "agy_invocation=fake-only/no-provider\n"
+        "tracked_status=unchanged\n"
+    )
+    assert len(content.encode("utf-8")) <= 1024
+    directory = _REPO_ROOT / ".claude/artifacts/issue-refinement-loop/2434"
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = directory / f"actual-wrapper-smoke-pass-{stamp}.log"
+    path.write_text(content, encoding="utf-8")
     return path
 
 
@@ -271,3 +305,7 @@ use a mutation tool.
     assert not [tool for tool in tools if tool["name"] in _MUTATING_TOOLS]
     assert before == _tracked_status(), "tracked worktree status changed during smoke"
     assert _SENTINEL in result, "real codebase-investigator did not reach native sentinel"
+    evidence = _write_runtime_pass_evidence()
+    assert evidence.is_file()
+    assert before == _tracked_status(), "tracked worktree status changed while writing PASS evidence"
+    print(f"PASS evidence: {evidence.relative_to(_REPO_ROOT)}")
