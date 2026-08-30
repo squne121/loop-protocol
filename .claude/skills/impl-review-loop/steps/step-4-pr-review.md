@@ -90,20 +90,72 @@ agent 定義の変更は数秒以内に自動検出され次の delegation か�
 ### Stage B（candidate-head fresh direct invocation、通常の第一候補 recovery）
 
 Stage A で解決しない場合、candidate worktree を cwd とした fresh Claude
-runtime で、対象 agent を `--agent <name>` として直接起動する（既存の
+runtime で、対象 agent を `--agent <name>` として直接起動する。この
+「fresh Claude runtime」は、呼び出し元 session が使っている
+runtime/adapter をそのまま継承する（例: 呼び出し元 session が
+`scripts/claude-gpt/launch.sh` 経由の `claude-gpt` adapter で
+`--claude-bin` / `--claude-adapter claude-gpt` を指定して動作している
+場合、Stage B もその同じ adapter 指定を保ったまま実行し、ambient な
+plain `claude` バイナリへ黙って fallback しない）。そうしないと、実運用で
+使われているものと異なる runtime 下で recovery が見かけ上成功してしまい、
+production 固有の real failure を覆い隠しうる。
+
+Stage B の成功条件は、達成したい保証の強さに応じて次の二段（tier）に
+分かれる。
+
+#### Tier 1: canonical review recovery（既定、通常はこれで十分）
+
+plain `--agent <name>` による project-discovery route（既存の
 `worktree-agent-runtime-smoke` の structured lane・`--claude-agent-name
-<name>` route、または `verify_pr_reviewer_permission_boundary.py` と同様の
-`--agents <json>` passthrough route を再利用してよい）。成功条件は
-少なくとも: (i) process/runtime が正常終了する、(ii) candidate-head の
-agent 定義が実際に使用されていることを十分確認できる、(iii) parse 可能な
-canonical verdict／出力契約が返る、(iv) `reviewed_head_sha` 等が
-candidate HEADと一致する、(v) blockers/warnings が canonical contract に
-従う、の5点とする。**ここでは spawned child 用の
+<name>` route を再利用してよい）で fresh runtime を起動し、以下を満たせば
+canonical review を実行する能力そのものは回復したとみなす: (i)
+process/runtime が正常終了する、(ii) parse 可能な canonical
+verdict／出力契約が返る、(iii) `reviewed_head_sha` 等が candidate
+HEADと一致する、(iv) blockers/warnings が canonical contract に従う。
+**この Tier 1 の成功だけでは、candidate-head の agent 定義が実際に
+使用されたことの証明にはならない**（`worktree-agent-runtime-smoke` の
+project-discovery lane 自身の canonical documentation が
+`agent_definition` 結果を独立検証不能として `status: unavailable` と
+定義しており、Claude Code の agent 解決は managed settings → `--agents`
+→ project → user → plugin の priority order で行われ、cwd に近い
+`.claude/agents/` が優先されるため、共有ディレクトリツリー内に同名の
+agent 定義が複数存在する場合は filesystem read order が実際に使用された
+定義を隠しうる）。**ここでは spawned child 用の
 `SubagentStart`/`SubagentStop` / `causal_evidence_source ==
 hook_id_correlated` を成功条件にしない**（`--agent <name>` による
 main-session persona binding では child SubAgent が spawn されないため、
 これを要求すると正常な canonical review を harness の都合で FAIL させて
 しまう）。
+
+#### Tier 2: candidate-definition binding（実際に証明が必要な場合のみ）
+
+candidate-head の agent 定義が実際に使用されていることを厳密に証明する
+必要がある場合に限り、`verify_pr_reviewer_permission_boundary.py` が既に
+使っている passthrough の仕組み（candidate branch の `.md` agent 定義
+ファイルをディスクから fresh に読み、session-local `--agents <json>`
+引数として fresh な Claude Code invocation に渡す）を再利用する。これは
+その passthrough の仕組み／パターンのみを再利用するものであり、同スクリプト
+の permission-canary test suite 一式の実行を要求するものではない。Tier 2
+まで実施した場合、Tier 1 の (i)〜(iv) に加えて、candidate HEADと一致する
+agent 定義ファイルが実際に fresh invocation へ渡されたことを確認できた
+場合にのみ、candidate-definition binding が成功したとみなす。
+
+#### Stage B のハンドオフ（通常の loop への合流）
+
+Stage B で fresh runtime に渡すプロンプトは、通常の `spawn_agent` 呼び出し
+が渡すのと同じ materialize 済みレビュー入力を持たせる（実際の
+`pr_number` と現在の candidate `reviewed_head_sha` を値として渡し、
+placeholder を渡さない）。fresh process の最終出力は canonical
+`LOOP_VERDICT`（`verdict` / `reviewed_head_sha` / `blockers` /
+`warnings`）として parse する。Stage B がこの形で有効な verdict を得た
+場合、その verdict はその Step 4 iteration の `pr-reviewer` 結果を
+**代替する**。orchestrator は同一 iteration に対して `spawn_agent` や
+child 用 Common Completion Protocol を再実行してはならない（`--agent
+<name>` による main-session persona binding は child task を spawn
+せず、待機する対象が存在しないため）。`worktree-agent-runtime-smoke` の
+runtime `exit_code == 0` だけでは APPROVE authority にならず、単独では
+有効な parsed verdict を構成しない（実際に消費されるのは parse された
+LOOP_VERDICT の中身である）。
 
 ### Stage C（delegation/discovery diagnostic、必要な場合のみ）
 
@@ -124,6 +176,18 @@ candidate head が変わった場合、既存の runtime evidence／review は
 Stage A〜C の全てで genuinely recovery 不可能な場合（fresh direct
 invocation でも runtime/parse 失敗が続く等）にのみ、human/operator
 blocker として停止する。
+
+#### 「not found」の二つの意味の区別
+
+本節が扱う discovery failure は、あくまで (a) `Agent(subagent_type:
+...)` による pre-dispatch / dispatch 時点での agent-type discovery 失敗
+（recoverable、本節の Stage A〜C の対象）である。これに対し、(b) 既に
+生成された canonical child task 自身が後になって `list_agents` で
+`not_found` を報告するケースは lifecycle-integrity failure であり、
+本節の recovery routing の対象ではなく、既存の Common Completion
+Protocol（本ファイル「Common Completion Protocol」節）の
+`errored`/`interrupted`/`shutdown`/`not_found` の扱いに従い fail-closed
+のままとする。
 
 #### `--add-dir` に関する補足
 
