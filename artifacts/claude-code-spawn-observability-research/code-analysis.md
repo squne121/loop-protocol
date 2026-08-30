@@ -134,21 +134,22 @@ hook の未発火を報告する community bug report（"Closed as not planned"�
 
 ## (b) `_run_route_once()` の失敗判定の実際の評価順序
 
-`scripts/agent-ops/run_agent_provider_route_smoke.py:911-940`（tested SHA `f1adbdc9`）を
+`scripts/agent-ops/run_agent_provider_route_smoke.py:910-939`（tested SHA `f1adbdc9`。
+native Codex CLI `codex_cli` route 撤去（Issue #2161）に伴い元のソース行から 1 行分ずれた）を
 current code から再構成した評価順序は次のとおり。
 
 | 順 | 条件 | ソース行 | `status` | `failure_class` |
 | --- | --- | --- | --- | --- |
-| 1 | `gemini_hits > 0` | `run_agent_provider_route_smoke.py:911` | `fail` | `gemini_invoked` |
-| 2 | `fallback_hits > 0` | `run_agent_provider_route_smoke.py:914` | `fail` | `direct_fallback_invoked` |
-| 3 | `harness_exit == 77` | `run_agent_provider_route_smoke.py:917` | `skip` | `agy_unavailable` |
-| 4 | `harness_exit != 0` | `run_agent_provider_route_smoke.py:920` | `fail` | `validation_failed` |
-| 5 | `not native_spawn_event_observed` | `run_agent_provider_route_smoke.py:923` | `fail` | `spawn_not_observed` |
-| 6 | `request_validation != "pass"` | `run_agent_provider_route_smoke.py:926` | `fail` | `validation_failed` |
-| 7 | `selected_provider != "agy"` | `run_agent_provider_route_smoke.py:929` | `fail` | `provider_mismatch` |
-| 8 | `profile == "github_research" and route_evidence_sha256 is None` | `run_agent_provider_route_smoke.py:932` | `fail` | `route_evidence_schema_mismatch` |
-| 9 | `not wrapper_ok` | `run_agent_provider_route_smoke.py:935` | `fail` | `validation_failed` |
-| 10 | 上記いずれにも該当しない | `run_agent_provider_route_smoke.py:938` | `pass` | `None` |
+| 1 | `gemini_hits > 0` | `run_agent_provider_route_smoke.py:910` | `fail` | `gemini_invoked` |
+| 2 | `fallback_hits > 0` | `run_agent_provider_route_smoke.py:913` | `fail` | `direct_fallback_invoked` |
+| 3 | `harness_exit == 77` | `run_agent_provider_route_smoke.py:916` | `skip` | `agy_unavailable` |
+| 4 | `harness_exit != 0` | `run_agent_provider_route_smoke.py:919` | `fail` | `validation_failed` |
+| 5 | `not native_spawn_event_observed` | `run_agent_provider_route_smoke.py:922` | `fail` | `spawn_not_observed` |
+| 6 | `request_validation != "pass"` | `run_agent_provider_route_smoke.py:925` | `fail` | `validation_failed` |
+| 7 | `selected_provider != "agy"` | `run_agent_provider_route_smoke.py:928` | `fail` | `provider_mismatch` |
+| 8 | `profile == "github_research" and route_evidence_sha256 is None` | `run_agent_provider_route_smoke.py:931` | `fail` | `route_evidence_schema_mismatch` |
+| 9 | `not wrapper_ok` | `run_agent_provider_route_smoke.py:934` | `fail` | `validation_failed` |
+| 10 | 上記いずれにも該当しない | `run_agent_provider_route_smoke.py:937` | `pass` | `None` |
 
 ### Issue 本文の記載との drift（current code を正とする）
 

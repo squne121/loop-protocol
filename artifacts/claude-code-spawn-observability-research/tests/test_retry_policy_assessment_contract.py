@@ -68,9 +68,24 @@ def test_names_the_real_production_predicate(assessment_text: str) -> None:
     assert "def _is_transient_infrastructure_candidate(" in source, (
         "the predicate no longer exists in production; the assessment is stale"
     )
-    assert 'route["runtime"] == "codex_cli"' in source and '"spawn_not_observed"' in source, (
-        "the production predicate's current shape differs from the one assessed"
+    marker = source.index("def _is_transient_infrastructure_candidate(")
+    next_def = source.index("\ndef ", marker + 1)
+    body = source[marker:next_def]
+    # Issue #2161: the codex_cli-specific spawn_not_observed bounded-retry
+    # branch this assessment originally evaluated was retired along with the
+    # native codex_cli runtime route. The predicate's current shape is
+    # runtime-independent -- it never special-cases spawn_not_observed and
+    # only gates on the agy_transient_quota_failure /
+    # child_completed_but_artifact_not_materialized secondary-failure kinds
+    # (see retry-policy-assessment.md's Issue #2161 update note).
+    assert 'route["runtime"] == "codex_cli"' not in body, (
+        "a codex_cli-specific branch reappeared in production despite its "
+        "Issue #2161 retirement; the assessment's premise no longer holds"
     )
+    assert (
+        '"agy_transient_quota_failure"' in body
+        and '"child_completed_but_artifact_not_materialized"' in body
+    ), "the production predicate's current shape differs from the one assessed"
 
 
 def test_cross_validates_the_existing_repo_test_contract(assessment_text: str) -> None:

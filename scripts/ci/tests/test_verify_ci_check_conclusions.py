@@ -1,10 +1,14 @@
 """Tests for scripts/ci/verify_ci_check_conclusions.py (Issue #1760 AC9 / #1824 P1-3).
 
 Runtime evidence check: real check-run conclusions for the SAME head SHA AND
-the SAME workflow run (actionlint / python-test-core / codex-execpolicy /
-python-test / node-backed-hook-tests) plus the AC6 sentinel artifact content
--- never a plain string search, and never a (name, head_sha)-only grouping
-that can mix evidence from an unrelated rerun of the same commit.
+the SAME workflow run (actionlint / python-test-core / python-test /
+node-backed-hook-tests) -- never a plain string search, and never a
+(name, head_sha)-only grouping that can mix evidence from an unrelated rerun
+of the same commit.
+
+Issue #2161 (native Codex CLI retirement): the former codex-execpolicy check
+name and its AC6 sentinel artifact verification were removed with the job;
+this suite was rewritten accordingly.
 """
 
 from __future__ import annotations
@@ -80,14 +84,7 @@ def _make_check_runs(
     }
 
 
-ALL_REQUIRED = ["actionlint", "python-test-core", "codex-execpolicy", "python-test", "node-backed-hook-tests"]
-TERMINAL_SENTINEL = {
-    "schema": "codex_execpolicy_matrix_status_v1",
-    "status": "completed",
-    "exit_code": 0,
-    "run_id": str(RUN_ID),
-    "run_attempt": str(RUN_ATTEMPT),
-}
+ALL_REQUIRED = ["actionlint", "python-test-core", "python-test", "node-backed-hook-tests"]
 
 
 def _verify(mod, **kwargs):
@@ -102,47 +99,36 @@ class TestPositive:
         report = _verify(
             mod,
             check_runs_payload=_make_check_runs(ALL_REQUIRED),
-            sentinel_payload=TERMINAL_SENTINEL,
             expected_head_sha=EXPECTED_SHA,
             bench_mode=False,
         )
         assert report["ok"] is True, report["violations"]
 
-    def test_bench_mode_skips_codex_and_sentinel(self, mod):
-        names_minus_codex = [n for n in ALL_REQUIRED if n != "codex-execpolicy"]
-        payload = _make_check_runs(names_minus_codex)
-        payload["check_runs"].append(
-            {
-                "name": "codex-execpolicy",
-                "head_sha": EXPECTED_SHA,
-                "status": "completed",
-                "conclusion": "skipped",
-                "id": 99,
-                "details_url": f"https://github.com/owner/repo/actions/runs/{RUN_ID}/job/99",
-            }
-        )
+    def test_bench_mode_no_check_name_is_currently_skippable(self, mod):
+        """Issue #2161: codex-execpolicy (the sole BENCH_MODE_SKIPPABLE check
+        name) was removed, so bench_mode=True no longer changes the outcome
+        -- every required check must still be present and successful."""
         report = _verify(
             mod,
-            check_runs_payload=payload,
-            sentinel_payload=None,
+            check_runs_payload=_make_check_runs(ALL_REQUIRED),
             expected_head_sha=EXPECTED_SHA,
             bench_mode=True,
         )
         assert report["ok"] is True, report["violations"]
+        assert mod.BENCH_MODE_SKIPPABLE == set()
 
 
 class TestMissingCheck:
     def test_missing_required_check_is_rejected(self, mod):
-        names = [n for n in ALL_REQUIRED if n != "codex-execpolicy"]
+        names = [n for n in ALL_REQUIRED if n != "node-backed-hook-tests"]
         report = _verify(
             mod,
             check_runs_payload=_make_check_runs(names),
-            sentinel_payload=TERMINAL_SENTINEL,
             expected_head_sha=EXPECTED_SHA,
             bench_mode=False,
         )
         assert report["ok"] is False
-        assert any("no check run named 'codex-execpolicy'" in v for v in report["violations"])
+        assert any("no check run named 'node-backed-hook-tests'" in v for v in report["violations"])
 
 
 class TestStaleHeadSha:
@@ -150,7 +136,6 @@ class TestStaleHeadSha:
         report = _verify(
             mod,
             check_runs_payload=_make_check_runs(ALL_REQUIRED, head_sha=OTHER_SHA),
-            sentinel_payload=TERMINAL_SENTINEL,
             expected_head_sha=EXPECTED_SHA,
             bench_mode=False,
         )
@@ -166,7 +151,6 @@ class TestMixedProvenanceDifferentRun:
         report = _verify(
             mod,
             check_runs_payload=_make_check_runs(ALL_REQUIRED, run_id=OTHER_RUN_ID),
-            sentinel_payload=TERMINAL_SENTINEL,
             expected_head_sha=EXPECTED_SHA,
             bench_mode=False,
         )
@@ -183,7 +167,6 @@ class TestMixedProvenanceDifferentRun:
         report = _verify(
             mod,
             check_runs_payload=payload,
-            sentinel_payload=TERMINAL_SENTINEL,
             expected_head_sha=EXPECTED_SHA,
             bench_mode=False,
         )
@@ -199,121 +182,35 @@ class TestFailedConclusion:
         report = _verify(
             mod,
             check_runs_payload=payload,
-            sentinel_payload=TERMINAL_SENTINEL,
             expected_head_sha=EXPECTED_SHA,
             bench_mode=False,
         )
         assert report["ok"] is False
         assert any("python-test-core" in v and "failure" in v for v in report["violations"])
 
-    def test_non_bench_skipped_conclusion_is_rejected(self, mod):
+    def test_skipped_conclusion_is_rejected(self, mod):
         payload = _make_check_runs(ALL_REQUIRED)
         for run in payload["check_runs"]:
-            if run["name"] == "codex-execpolicy":
+            if run["name"] == "node-backed-hook-tests":
                 run["conclusion"] = "skipped"
         report = _verify(
             mod,
             check_runs_payload=payload,
-            sentinel_payload=TERMINAL_SENTINEL,
             expected_head_sha=EXPECTED_SHA,
             bench_mode=False,
         )
         assert report["ok"] is False
-        assert any("codex-execpolicy" in v and "skipped" in v for v in report["violations"])
+        assert any("node-backed-hook-tests" in v and "skipped" in v for v in report["violations"])
 
     def test_pending_status_is_rejected(self, mod):
         payload = _make_check_runs(ALL_REQUIRED, status="in_progress", conclusion=None)
         report = _verify(
             mod,
             check_runs_payload=payload,
-            sentinel_payload=TERMINAL_SENTINEL,
             expected_head_sha=EXPECTED_SHA,
             bench_mode=False,
         )
         assert report["ok"] is False
-
-
-class TestSentinelContent:
-    def test_sentinel_started_only_is_rejected(self, mod):
-        report = _verify(
-            mod,
-            check_runs_payload=_make_check_runs(ALL_REQUIRED),
-            sentinel_payload={"schema": "codex_execpolicy_matrix_status_v1", "status": "started"},
-            expected_head_sha=EXPECTED_SHA,
-            bench_mode=False,
-        )
-        assert report["ok"] is False
-        assert any("codex_execpolicy_matrix_status_v1.json status" in v for v in report["violations"])
-
-    def test_sentinel_bootstrap_failed_is_rejected(self, mod):
-        report = _verify(
-            mod,
-            check_runs_payload=_make_check_runs(ALL_REQUIRED),
-            sentinel_payload={"schema": "codex_execpolicy_matrix_status_v1", "status": "bootstrap_failed"},
-            expected_head_sha=EXPECTED_SHA,
-            bench_mode=False,
-        )
-        assert report["ok"] is False
-
-    def test_sentinel_missing_is_rejected(self, mod):
-        report = _verify(
-            mod,
-            check_runs_payload=_make_check_runs(ALL_REQUIRED),
-            sentinel_payload=None,
-            expected_head_sha=EXPECTED_SHA,
-            bench_mode=False,
-        )
-        assert report["ok"] is False
-
-    def test_sentinel_wrong_schema_is_rejected(self, mod):
-        report = _verify(
-            mod,
-            check_runs_payload=_make_check_runs(ALL_REQUIRED),
-            sentinel_payload={"schema": "something_else", "status": "completed", "exit_code": 0},
-            expected_head_sha=EXPECTED_SHA,
-            bench_mode=False,
-        )
-        assert report["ok"] is False
-        assert any("sentinel schema" in v for v in report["violations"])
-
-    def test_sentinel_run_id_mismatch_is_rejected(self, mod):
-        sentinel = dict(TERMINAL_SENTINEL)
-        sentinel["run_id"] = str(OTHER_RUN_ID)
-        report = _verify(
-            mod,
-            check_runs_payload=_make_check_runs(ALL_REQUIRED),
-            sentinel_payload=sentinel,
-            expected_head_sha=EXPECTED_SHA,
-            bench_mode=False,
-        )
-        assert report["ok"] is False
-        assert any("sentinel run_id" in v for v in report["violations"])
-
-    def test_sentinel_run_attempt_mismatch_is_rejected(self, mod):
-        sentinel = dict(TERMINAL_SENTINEL)
-        sentinel["run_attempt"] = "9"
-        report = _verify(
-            mod,
-            check_runs_payload=_make_check_runs(ALL_REQUIRED),
-            sentinel_payload=sentinel,
-            expected_head_sha=EXPECTED_SHA,
-            bench_mode=False,
-        )
-        assert report["ok"] is False
-        assert any("sentinel run_attempt" in v for v in report["violations"])
-
-    def test_sentinel_completed_with_nonzero_exit_code_is_rejected(self, mod):
-        sentinel = dict(TERMINAL_SENTINEL)
-        sentinel["exit_code"] = 1
-        report = _verify(
-            mod,
-            check_runs_payload=_make_check_runs(ALL_REQUIRED),
-            sentinel_payload=sentinel,
-            expected_head_sha=EXPECTED_SHA,
-            bench_mode=False,
-        )
-        assert report["ok"] is False
-        assert any("exit_code" in v for v in report["violations"])
 
 
 class TestCli:
@@ -364,17 +261,13 @@ class TestCli:
         import subprocess
 
         runs_path = tmp_path / "runs.json"
-        sentinel_path = tmp_path / "sentinel.json"
         runs_path.write_text(json.dumps(_make_check_runs(ALL_REQUIRED)))
-        sentinel_path.write_text(json.dumps(TERMINAL_SENTINEL))
         proc = subprocess.run(
             [
                 "python3",
                 str(_MODULE_PATH),
                 "--check-runs-api-json",
                 str(runs_path),
-                "--codex-sentinel-json",
-                str(sentinel_path),
                 "--expected-head-sha",
                 EXPECTED_SHA,
                 "--workflow-run-id",

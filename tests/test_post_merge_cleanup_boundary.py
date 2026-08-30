@@ -8,7 +8,6 @@ selectable via ``pytest -k <marker>`` per the Issue's Verification Commands.
 
 from __future__ import annotations
 
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,7 +20,6 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import check_post_merge_cleanup_boundary as boundary  # noqa: E402
 
 WORKER_MD = REPO_ROOT / ".claude" / "agents" / "post-merge-cleanup-worker.md"
-WORKER_TOML = REPO_ROOT / ".codex" / "agents" / "post-merge-cleanup-worker.toml"
 ORCHESTRATOR_SKILL = REPO_ROOT / ".claude" / "skills" / "post-merge-cleanup" / "SKILL.md"
 EXECUTOR_SKILL = REPO_ROOT / ".claude" / "skills" / "post-merge-cleanup-executor" / "SKILL.md"
 EXECUTOR_WRAPPER = REPO_ROOT / ".agents" / "skills" / "post-merge-cleanup-executor" / "SKILL.md"
@@ -37,7 +35,7 @@ CLEANUP_EXEC_TESTS = REPO_ROOT / "tests" / "codex" / "test_cleanup_exec_branch_o
 
 def test_ac1_executor_skill_files_exist():
     assert EXECUTOR_SKILL.is_file(), f"missing canonical executor skill: {EXECUTOR_SKILL}"
-    assert EXECUTOR_WRAPPER.is_file(), f"missing codex thin wrapper: {EXECUTOR_WRAPPER}"
+    assert EXECUTOR_WRAPPER.is_file(), f"missing repo-local skill discovery surface: {EXECUTOR_WRAPPER}"
 
 
 # ---------------------------------------------------------------------------
@@ -61,33 +59,11 @@ def test_worker_skills_frontmatter_rejects_extra_entries():
 
 
 # ---------------------------------------------------------------------------
-# AC3: codex_skill_surface
+# AC3: codex_skill_surface (Issue #2161 native Codex CLI retirement: the
+# TOML-parsing checks this parametrized against the now-deleted worker's
+# Codex agent TOML config were removed as an orphan DELETE_CHAIN; see
+# `check_post_merge_cleanup_boundary.py`)
 # ---------------------------------------------------------------------------
-
-
-def test_codex_skill_surface():
-    result = boundary.check_codex_skill_surface(WORKER_TOML)
-    assert result.valid, result.errors
-
-
-def test_codex_worker_no_stale_canonical():
-    result = boundary.check_codex_no_stale_canonical(WORKER_TOML)
-    assert result.valid, result.errors
-
-
-def test_codex_worker_no_stale_canonical_detects_reintroduced_marker():
-    import tomllib
-
-    with WORKER_TOML.open("rb") as fh:
-        data = tomllib.load(fh)
-    poisoned_instructions = data["developer_instructions"] + "\n- `post-merge-cleanup` skill を正本とする。\n"
-    tmp_path = REPO_ROOT / "tests" / "_tmp_poisoned_worker_toml_for_test.toml"
-    tmp_path.write_text(f'name = "x"\ndeveloper_instructions = """\n{poisoned_instructions}\n"""\n', encoding="utf-8")
-    try:
-        result = boundary.check_codex_no_stale_canonical(tmp_path)
-        assert not result.valid
-    finally:
-        tmp_path.unlink()
 
 
 def test_claude_worker_description_no_stale_procedure():
@@ -107,17 +83,6 @@ def test_claude_worker_description_detects_reintroduced_orchestrator_reference()
         assert not result.valid
     finally:
         tmp_path.unlink()
-
-
-def test_codex_skill_surface_value_is_exact():
-    import tomllib
-
-    with WORKER_TOML.open("rb") as fh:
-        data = tomllib.load(fh)
-    instructions = data["developer_instructions"]
-    match = re.search(r"repo_local_skill_surface:\s*(\S+)", instructions)
-    assert match is not None
-    assert match.group(1).strip() == ".agents/skills/post-merge-cleanup-executor/SKILL.md"
 
 
 # ---------------------------------------------------------------------------

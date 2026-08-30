@@ -300,7 +300,7 @@ legacy projection と v2 は同一の delta 計算結果を共有し、二重計
 `_is_security_sensitive_scope_delta()` は以下を deterministic に判定する（#558 の security gate 本体とは別の、狭い fail-closed チェック。検出語彙・path は #558 の real-security-risk 例と整合させる）。
 
 - 追加パスが以下の security-sensitive path prefix から始まる:
-  `.claude/hooks/` / `.claude/agents/` / `.codex/agents/` / `.github/workflows/` /
+  `.claude/hooks/` / `.claude/agents/` / `.github/workflows/` /
   `.github/actions/` / `.github/dependabot.yml` / `.github/CODEOWNERS` /
   `docs/dev/secret-policy.md`
 - 追加パス文字列、または承認 evidence の `rationale` に以下の security term が
