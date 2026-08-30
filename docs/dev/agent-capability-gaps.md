@@ -184,7 +184,7 @@ credential）で行われていた可能性が高く、Claude-GPT lane の証拠
 回帰ではなく、**production の nested-invocation adapter に Claude-GPT
 routing の実装が存在しない**という capability gap である。
 
-### Issue #2445 post-fix re-verification
+### Issue #2445 修正後の再検証（post-fix re-verification）
 
 Issue #2445 は上記 `transport_routing_gap` の是正を実装した follow-up
 implementation Issue。修正内容（Allowed Paths: `run_retrospective.py` /
