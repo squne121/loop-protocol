@@ -63,6 +63,11 @@ def test_live_claude_gpt_trace_arrives_with_gpt_model_attribute():
     WHEN non-sensitive canary prompt で Claude-GPT session を1回起動する
     THEN 実 session_id で Latitude trace を取得でき、trace の model attribute が
          launcher-owned GPT model set のいずれかに一致する（AC6）
+
+    P1-4 fix-delta (PR #2439 OWNER REQUEST_CHANGES): SKIP は environment
+    preflight にのみ予約する。canary launch を実際に試みた後の非0 exit /
+    session_id 未解決は本物の regression でありうるため FAIL する（trace 未着信
+    は既存の `assert trace is not None` が既に FAIL 済み）。
     """
     available, reason = helpers.is_environment_available()
     if not available:
@@ -76,8 +81,17 @@ def test_live_claude_gpt_trace_arrives_with_gpt_model_attribute():
     session_id, proc = helpers.run_claude_gpt_canary(
         "Reply with exactly the single word: PONG", nonce=nonce
     )
-    if proc.returncode != 0 or not session_id:
-        pytest.skip("SKIP: claude-gpt canary launch did not complete (session_id unresolved)")
+    if proc.returncode != 0:
+        pytest.fail(
+            f"claude-gpt canary launch failed with returncode={proc.returncode}: "
+            f"stderr={proc.stderr[-2000:]}"
+        )
+    if not session_id:
+        pytest.fail(
+            "claude-gpt canary launch completed (returncode 0) but no session_id "
+            "was resolved from the Stop hook-sink -- broken hook-sink wiring "
+            "or session correlation, not a SKIP-worthy prerequisite absence"
+        )
 
     trace = helpers.query_latitude_trace_by_session_id(session_id, project_slug)
     summary = {

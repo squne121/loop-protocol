@@ -79,9 +79,16 @@ def test_claude_model_classifies_as_claude_code_native():
 
 @pytest.mark.claude_live
 def test_live_native_trace_classifies_as_claude_code_native():
-    """GIVEN 実行環境が利用可能で、直近の ambient Native Claude Code trace が存在する
-    WHEN その trace の models を classify_runtime() へ渡す
-    THEN claude_code_native と判定される（AC7: 実 Native trace での確認）
+    """GIVEN 実行環境が利用可能で、直近の LOCAL Native Claude Code transcript
+         file（`~/.claude/projects/**/*.jsonl`）が存在する
+    WHEN その transcript のファイル名（= 実 session_id、classify_runtime() を
+         一切経由しない独立 provenance。P1-2 fix-delta, PR #2439 OWNER
+         REQUEST_CHANGES）で Latitude trace を取得し、その trace の models を
+         classify_runtime() へ渡す
+    THEN claude_code_native と判定される（AC7: 実 Native trace での確認。
+         選別ロジックと検証ロジックが独立しているため、
+         `classifier(x) == native implies classifier(x) == native` という
+         循環にならない）
     """
     available, reason = helpers.is_environment_available()
     if not available:
@@ -90,9 +97,16 @@ def test_live_native_trace_classifies_as_claude_code_native():
     if not project_slug:
         pytest.skip("SKIP: LATITUDE_PROJECT not configured in Native settings")
 
-    trace = helpers.find_recent_native_trace(project_slug)
+    session_id = helpers.find_recent_native_session_id_from_transcripts()
+    if not session_id:
+        pytest.skip("SKIP: no local Native Claude Code transcript file found")
+
+    trace = helpers.query_latitude_trace_by_session_id(session_id, project_slug)
     if trace is None:
-        pytest.skip("SKIP: no recent Native Claude Code trace available to classify")
+        pytest.skip(
+            "SKIP: no matching Latitude trace found for the most recent local "
+            "Native transcript session"
+        )
 
     classification = helpers.classify_runtime(trace.get("models", []))
     _write_bounded_summary(
@@ -114,6 +128,13 @@ def test_live_claude_gpt_trace_classifies_as_claude_gpt():
          exact session ID の trace を取得する
     THEN classify_runtime() が claude_gpt と判定する（AC7: 実 Claude-GPT trace
          での確認。#2375 production collector とは独立した本 Issue 専用 helper）
+
+    P1-4 fix-delta (PR #2439 OWNER REQUEST_CHANGES): SKIP は environment
+    preflight（`is_environment_available()` / `LATITUDE_PROJECT` 未設定）にのみ
+    予約する。canary launch を実際に試みた後は、非0 exit / session_id 未解決 /
+    trace 未着信のいずれも本物の regression でありうるため FAIL する
+    （`docs/dev/runtime-verification-policy.md` の SKIP 規約: fixture-only PASS
+    と同様、実行済みの失敗を SKIP へ吸収しない）。
     """
     available, reason = helpers.is_environment_available()
     if not available:
@@ -126,12 +147,25 @@ def test_live_claude_gpt_trace_classifies_as_claude_gpt():
     session_id, proc = helpers.run_claude_gpt_canary(
         "Reply with exactly the single word: PONG", nonce=nonce
     )
-    if proc.returncode != 0 or not session_id:
-        pytest.skip("SKIP: claude-gpt canary launch did not complete (session_id unresolved)")
+    if proc.returncode != 0:
+        pytest.fail(
+            f"claude-gpt canary launch failed with returncode={proc.returncode}: "
+            f"stderr={proc.stderr[-2000:]}"
+        )
+    if not session_id:
+        pytest.fail(
+            "claude-gpt canary launch completed (returncode 0) but no session_id "
+            "was resolved from the Stop hook-sink -- broken hook-sink wiring "
+            "or session correlation, not a SKIP-worthy prerequisite absence"
+        )
 
     trace = helpers.query_latitude_trace_by_session_id(session_id, project_slug)
     if trace is None:
-        pytest.skip("SKIP: no matching Latitude trace found for the live canary session")
+        pytest.fail(
+            f"no matching Latitude trace found for the live canary session "
+            f"(session_id={session_id!r}) within the bounded wait window -- "
+            f"telemetry did not arrive, not a SKIP-worthy prerequisite absence"
+        )
 
     classification = helpers.classify_runtime(trace.get("models", []))
     _write_bounded_summary(

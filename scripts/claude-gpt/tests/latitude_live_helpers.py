@@ -127,51 +127,45 @@ def _read_stop_session_id(sink_path: Path) -> str:
     return session_id
 
 
-def find_recent_native_trace(project_slug: str, *, limit: int = 20) -> dict | None:
-    """直近 `limit` 件の trace のうち、`models` attribute が Native Claude Code
-    （`classify_runtime() == "claude_code_native"`）と分類される最初の trace を
-    返す（AC7: Native 側の比較サンプルとして、新規セッションを起動せず既存の
-    ambient native telemetry から拾う）。
+def find_recent_native_session_id_from_transcripts(claude_projects_dir: Path | None = None) -> str | None:
+    """AC7 P1-2 fix-delta (PR #2439 OWNER REQUEST_CHANGES, corrective iteration):
+    independent provenance for the "Native sample" trace used by the live
+    classifier test.
 
-    `serviceNames` は Native / Claude-GPT のどちらも固定で `claude-code` を
-    報告する（Design 7節: 現行 Latitude telemetry は `service.name=claude-code`
-    を固定生成し、model attribute だけが実際の判別要素であるため、
-    `serviceNames` では両者を区別できない -- これはまさに本 classifier が
-    model attribute を使う理由そのものである）。そのため選別自体も
-    `classify_runtime()` を使う。見つからなければ None。
+    The prior approach (`find_recent_native_trace()`, removed) selected a
+    "Native sample" by calling `classify_runtime(item.get("models") or [])`
+    on Latitude's own trace listing and returning the first item the
+    classifier itself already labeled `claude_code_native` -- the live test
+    then re-applied the SAME `classify_runtime()` to that same trace and
+    asserted the (tautological) result, proving only `classifier(x) ==
+    native implies classifier(x) == native`, never that the classifier
+    correctly identifies a genuine Native trace.
+
+    This function instead resolves the `session_id` of the most recently
+    modified LOCAL Claude Code transcript file under
+    `~/.claude/projects/**/*.jsonl`. Per Claude Code's own transcript file
+    naming convention, the filename stem IS the `session_id` a genuine Stop
+    hook payload would carry for that session -- the exact same identity a
+    Stop hook's `session_id` field reports, obtained here without ever
+    inspecting a Latitude trace or any model attribute. The caller then
+    queries Latitude for that exact `session_id` (`query_latitude_trace_by_session_id`)
+    and feeds the resulting trace into `classify_runtime()` for the
+    assertion, so selection and verification are fully independent.
+
+    Bounded to a single most-recently-modified file (never a full
+    enumeration/export of transcript content -- only the filename
+    component contributes the returned `session_id`). Returns `None` if no
+    local transcript file exists (genuine local prerequisite absence, not a
+    classifier/trace-arrival failure).
     """
-    try:
-        proc = subprocess.run(
-            [
-                "latitude",
-                "traces",
-                "list",
-                "--project-slug",
-                project_slug,
-                "--limit",
-                str(limit),
-                "--format",
-                "json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            stdin=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    root = claude_projects_dir or (Path.home() / ".claude" / "projects")
+    if not root.is_dir():
         return None
-    if proc.returncode != 0:
+    candidates = list(root.glob("*/*.jsonl"))
+    if not candidates:
         return None
-    try:
-        payload = json.loads(proc.stdout)
-    except ValueError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    for item in payload.get("items", []):
-        if classify_runtime(item.get("models") or []) == "claude_code_native":
-            return item
-    return None
+    most_recent = max(candidates, key=lambda p: p.stat().st_mtime)
+    return most_recent.stem
 
 
 def query_latitude_trace_by_session_id(
