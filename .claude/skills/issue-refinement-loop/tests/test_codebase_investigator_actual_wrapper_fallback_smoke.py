@@ -295,7 +295,7 @@ use a mutation tool.
     )
     decision_index = next(index for index in read_indices[str(decision_path)] if index > driver_index)
     sidecar_index = next(index for index in read_indices[str(sidecar_path)] if index > driver_index)
-    assert any(index > max(decision_index, sidecar_index) for index in read_indices[str(source_path)])
+    assert min(read_indices[str(source_path)]) > max(decision_index, sidecar_index)
     assert not [tool for tool in tools if tool["name"] in _MUTATING_TOOLS]
     assert before == _tracked_status(), "tracked worktree status changed during smoke"
     assert _SENTINEL in result, "real codebase-investigator did not reach native sentinel"
