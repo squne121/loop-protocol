@@ -99,18 +99,36 @@ Python 側が呼び出し後に 100% 決定論的に構築するため、あな�
     {
       "candidate_id": "finding-missing-error-handling-001",
       "title": "run_retrospective.py の subprocess 呼び出しが例外を握りつぶす",
-      "description": "observer 出力（schema-controlled projection）に基づく、secrets/絶対パス/生transcriptを含まない説明文",
-      "claim_class": "runtime_behavior",
+      "description": "codebase-investigator の finding（schema-controlled projection）に基づく、secrets/絶対パス/生transcriptを含まない説明文",
+      "claim_class": "code_content",
       "subject_ref": {
         "kind": "repository_path",
         "value": "skills/run/scripts/run_retrospective.py"
       },
-      "rule_id": "runtime_behavior.missing_error_handling",
+      "rule_id": "code_content.missing_error_handling",
       "evidence_refs": [
         {
-          "ref_type": "runtime_receipt",
-          "source_id": "runtime",
-          "resource_identity": "observer:retrospective-runtime-observer"
+          "ref_type": "repository_blob",
+          "source_id": "repository",
+          "resource_identity": "skills/run/scripts/run_retrospective.py"
+        }
+      ]
+    },
+    {
+      "candidate_id": "finding-external-fact-example-001",
+      "title": "web-researcher が確認した外部一次資料の要約",
+      "description": "web-researcher の finding（schema-controlled projection）に基づく、secrets/絶対パス/生transcriptを含まない説明文",
+      "claim_class": "external_fact",
+      "subject_ref": {
+        "kind": "external_resource",
+        "value": "https://example.com/some-primary-source"
+      },
+      "rule_id": "external_fact.example_rule",
+      "evidence_refs": [
+        {
+          "ref_type": "external_primary_source",
+          "source_id": "web",
+          "resource_identity": "https://example.com/some-primary-source"
         }
       ]
     }
@@ -118,6 +136,11 @@ Python 側が呼び出し後に 100% 決定論的に構築するため、あな�
   "evidence_ref": "<呼び出し元が付与する opaque 参照文字列>"
 }
 ```
+
+（上記 2 件目は `web-researcher` finding の `citation_url` を `resource_identity` にそのまま
+コピーした例。`retrospective-runtime-observer` 起動時〈`--runtime-evidence-file` 明示指定時のみ〉
+は `ref_type: "runtime_receipt"` / `source_id: "runtime"` / `resource_identity:
+"observer:retrospective-runtime-observer"` を使う -- 上記「評価対象フィールドの意味」の表を参照）
 
 各フィールドの意味:
 
@@ -134,17 +157,32 @@ Python 側が呼び出し後に 100% 決定論的に構築するため、あな�
 - `rule_id`: namespaced dot-separated token（小文字英数字とアンダースコアのみ、ドット区切り）。
   例: `runtime_behavior.missing_error_handling` / `runtime_behavior.missing_evidence`
 - `evidence_refs[]`: あなたが実際に `finding_sets` の中で見た real な evidence への参照のみを返す
-  （実在しない evidence をでっち上げない）。**あなたは observer の schema-controlled projection
-  （`finding_sets[].findings[]`）のみを見ており、repository blob や GitHub resource や web page を
-  直接見ていない** ので、`ref_type` は原則として常に `"runtime_receipt"` / `source_id` は常に
-  `"runtime"` を使うこと（`public_github_resource`/`repository_blob`/`external_primary_source` は、
-  あなたが直接その種類のリソースを閲覧した場合のみ使う、通常は使わない選択肢）。
-  `resource_identity` は証拠を提供した観測者を指す `"observer:<observer_id>"` 形式の文字列にする
-  （例: `"observer:retrospective-runtime-observer"`）。これ以外の自由記述（パスの説明文や
-  `"observer:X via path/to/file"` のような prose）は使わない -- `resource_identity` は正規化された
-  短い識別子であり、説明文ではない。`projection_digest` は**あなたは返さない**（Python が実データから
-  再計算する）。裏付けとなる real evidence が `finding_sets` の中に無い場合は `evidence_refs` を
-  空配列 `[]` にする（存在しない証拠を捏造しない）
+  （実在しない evidence をでっち上げない）。**`ref_type`/`source_id` は、その finding が実際に
+  由来した observer（`finding_sets[].observer_id`）に応じて必ず正しく使い分けること** -- 以下の
+  3 パターンのみが有効であり、observer の種類に関わらず常に同じ値を使い回すことは禁止（Issue #2240
+  fix_delta P0-2。旧版の本ファイルは「常に `runtime_receipt`/`runtime` を使う」という誤った指示を
+  していたため、repository/web finding の evidence_ref が実データに一切束縛されず、Python 側の
+  `run_retrospective.py` による独立クロスチェックで drop されるか、無関係な runtime evidence に
+  誤って束縛されるバグを引き起こしていた）:
+
+  | finding の由来（`finding_sets[].observer_id`） | `ref_type` | `source_id` | `resource_identity` |
+  |---|---|---|---|
+  | `codebase-investigator` | `"repository_blob"` | `"repository"` | その finding が実際に持つ `repository_path` の値を **そのまま** 使う（改変・要約しない） |
+  | `web-researcher` | `"external_primary_source"` | `"web"` | その finding が実際に持つ `citation_url` の値を **そのまま** 使う（改変・要約しない） |
+  | `retrospective-runtime-observer` | `"runtime_receipt"` | `"runtime"` | `"observer:retrospective-runtime-observer"`（固定文字列） |
+
+  `run_retrospective.py` は `ref_type`/`source_id`/`resource_identity` の 3 つすべてを、上記の
+  表と実際の `finding_sets[].findings[]` データに対して独立に再検証する -- あなたの申告した
+  `ref_type`/`source_id` の組み合わせが上記表と一致しない場合、または `resource_identity` が実際の
+  finding の `repository_path`/`citation_url` と一致しない場合、その evidence_ref は黙って drop
+  される（存在しない証拠として扱われる）。したがって `repository_path`/`citation_url` は
+  **観測された値を一字一句そのまま** `resource_identity` にコピーすること（要約・正規化・パス短縮
+  をしない）。`public_github_resource`（`source_id: "github"`）は、あなたが直接 GitHub resource を
+  見た場合のみ使う稀な選択肢であり、この plugin の 3 observer のいずれもこの source を提供しない
+  ため通常は使わない。`projection_digest` は**あなたは返さない**（Python が、あなたが参照した
+  「その特定の finding」1 件分の projection から再計算する -- source 全体からではない）。裏付けと
+  なる real evidence が `finding_sets` の中に無い場合は `evidence_refs` を空配列 `[]` にする
+  （存在しない証拠を捏造しない）
 
 未知フィールドの追加は禁止（`--json-schema` が構造的に拒否する）。
 本 SubAgent は `PUBLISH_REQUEST_V1` を生成しない（proposal-only envelope の生成は決定論的な

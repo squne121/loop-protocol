@@ -42,6 +42,7 @@ deliberately narrower than the project Skill's:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import dataclasses
 import hashlib
@@ -594,6 +595,14 @@ class AgentInvocationRequest:
     #: ``--plugin-dir`` is session-duration-scoped and not automatically
     #: inherited by a spawned subprocess).
     plugin_root: str | None = None
+    #: explicit tool allowlist (``--allowedTools``) for this specific
+    #: invocation (Issue #2240 fix_delta P1-1): additive defense-in-depth on
+    #: top of the shared ``DelegatedAgentPermissionPolicy`` denylist
+    #: (``--disallowedTools``) -- e.g. ``codebase-investigator`` only ever
+    #: receives ``{"Read", "Grep", "Glob"}``. Empty (the default) means no
+    #: ``--allowedTools`` flag is added (denylist-only, unchanged prior
+    #: behavior).
+    allowed_tools: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass
@@ -611,7 +620,37 @@ _AGENT_INVOCATION_STATUSES = frozenset(
 
 _MAX_STDOUT_EXCERPT = 200
 
-_DEFAULT_ENV_PASSTHROUGH_ALLOWLIST = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ"})
+#: mutation-risk-only credentials stripped from every delegated Agent
+#: subprocess's environment (Issue #2240 fix_delta P1-2). Everything else --
+#: including official Claude Code / Anthropic auth & provider-routing env
+#: vars (``ANTHROPIC_API_KEY``/``CLAUDE_CODE_OAUTH_TOKEN``/
+#: ``ANTHROPIC_AUTH_TOKEN``/``ANTHROPIC_BASE_URL``/``HTTP_PROXY``/
+#: ``HTTPS_PROXY``/``CLAUDE_CONFIG_DIR``/Bedrock/Vertex/Foundry routing vars)
+#: -- is inherited from the parent environment by default. The pre-fix
+#: allowlist-only design (``PATH``/``HOME``/``LANG``/``LC_ALL``/``TZ`` only)
+#: stripped these auth/gateway vars too, so the plugin only ever worked for
+#: HOME-based subscription login, not the "portable to any environment"
+#: claim. None of these Agents perform git/GitHub/npm mutation or use a
+#: cloud SDK (leaf `tools`/`disallowedTools` frontmatter + this
+#: ``DelegatedAgentPermissionPolicy`` both technically block mutation
+#: commands already), so none of them have any legitimate use for these
+#: credentials.
+_MUTATION_CREDENTIAL_ENV_VARS = frozenset(
+    {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "NPM_TOKEN",
+        "NPM_AUTH_TOKEN",
+        "GIT_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    }
+)
 
 
 def _stdout_excerpt(text: str | None) -> str | None:
@@ -621,7 +660,7 @@ def _stdout_excerpt(text: str | None) -> str | None:
 
 
 def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
-    return {k: v for k, v in env.items() if k in _DEFAULT_ENV_PASSTHROUGH_ALLOWLIST}
+    return {k: v for k, v in env.items() if k not in _MUTATION_CREDENTIAL_ENV_VARS}
 
 
 #: Matches every markdown fence *delimiter* line (an opening line such as
@@ -725,6 +764,12 @@ def build_agent_invocation_argv(request: AgentInvocationRequest, *, policy: "Del
     ]
     if policy is not None:
         argv += ["--disallowedTools", *sorted(policy.denied_tools)]
+    # Issue #2240 fix_delta P1-1: additive per-Agent tool allowlist, on top of
+    # the shared denylist above -- e.g. codebase-investigator only ever gets
+    # `--allowedTools Glob Grep Read`. Never sent when empty (no behavior
+    # change for a request that doesn't set `allowed_tools`).
+    if request.allowed_tools:
+        argv += ["--allowedTools", *sorted(request.allowed_tools)]
     return argv
 
 
@@ -823,6 +868,28 @@ class ObserverWaveFailed(Exception):
         self.exit_code = exit_code
 
 
+def _invoke_observer_wave_concurrently(
+    invoke: Callable[[AgentInvocationRequest], AgentInvocationResult],
+    observer_requests: Sequence[AgentInvocationRequest],
+) -> list[AgentInvocationResult]:
+    """Issue #2240 fix_delta P0-1(e): invoke every (already-manifest-trimmed)
+    observer request in parallel rather than a sequential for-loop -- these
+    are independent headless CLI subprocess calls (I/O-bound), and a
+    sequential loop means an idle/empty lane (e.g. a slow-to-timeout runtime
+    observer) needlessly blocks the others. Results are collected back into
+    ``observer_requests`` order so downstream fail-closed validation below
+    stays deterministic regardless of which subprocess happened to finish
+    first."""
+    if not observer_requests:
+        return []
+    results: list[AgentInvocationResult | None] = [None] * len(observer_requests)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(observer_requests)) as executor:
+        future_to_index = {executor.submit(invoke, request): index for index, request in enumerate(observer_requests)}
+        for future in concurrent.futures.as_completed(future_to_index):
+            results[future_to_index[future]] = future.result()
+    return typing.cast("list[AgentInvocationResult]", results)
+
+
 def run_observer_wave(
     ctx: RunContext,
     plan: SourcePlan,
@@ -832,15 +899,21 @@ def run_observer_wave(
     repair: Callable[[str, WireContractError], str] | None = None,
     expected_manifest: Sequence[ObserverRoleSpec] | None = None,
 ) -> list[EvidenceBundle]:
-    """``validate-observers`` phase (fan-out half): invoke every observer,
-    strictly validate its serialized output into an ``EvidenceBundle``. All
-    observers must succeed -- the first failure aborts the wave
-    (fail-closed)."""
+    """``validate-observers`` phase (fan-out half): invoke every observer
+    concurrently (Issue #2240 fix_delta P0-1(e)), strictly validate its
+    serialized output into an ``EvidenceBundle``. All observers must succeed
+    -- the first failure (checked in stable ``observer_requests`` order,
+    independent of actual completion order) aborts the wave (fail-closed).
+    ``observer_requests``/``expected_manifest`` are the caller's active
+    manifest -- Issue #2240 fix_delta P0-1(d): a caller may trim
+    ``retrospective-runtime-observer`` out of both when no runtime evidence
+    was explicitly supplied, so this function itself does not assume a fixed
+    3-observer manifest."""
     expected_ids = {spec.observer_id for spec in expected_manifest} if expected_manifest is not None else None
+    results = _invoke_observer_wave_concurrently(invoke, observer_requests)
     seen_ids: set[str] = set()
     bundles: list[EvidenceBundle] = []
-    for request in observer_requests:
-        result = invoke(request)
+    for request, result in zip(observer_requests, results):
         if result.status != "ok":
             raise ObserverWaveFailed(f"observer_failed:{request.agent_name}:{result.status}", reason_code=result.reason_code, exit_code=result.exit_code)
         raw_text = json.dumps(result.structured_output, sort_keys=True, separators=(",", ":"))
@@ -975,7 +1048,92 @@ def _observer_source_type_index(finding_sets: Sequence[dict[str, Any]], manifest
     return index
 
 
-def _enrich_evidence_ref(raw_ref: Any, *, real_evidence_index: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+#: Issue #2240 fix_delta P0-2(b): the ONE valid ``ref_type`` for each
+#: ``source_id`` (mirrors ``evidence_ref``/``evidence_ref_judgment``'s
+#: schema-level ``allOf``/``if``/``then`` pairing in
+#: ``agent_improvement_candidate_v1.schema.json`` /
+#: ``evaluation_result_v1.schema.json``). The pre-fix evaluator prompt
+#: instructed the model to return ``runtime_receipt``/``runtime`` for
+#: essentially every finding regardless of its actual observer source; this
+#: table is used to independently re-derive/verify the pairing from the
+#: REAL observer source of the referenced evidence, never trusting the
+#: evaluator's free-form ``ref_type`` claim on its own.
+_REF_TYPE_BY_SOURCE_ID = {
+    "repository": "repository_blob",
+    "web": "external_primary_source",
+    "runtime": "runtime_receipt",
+    "github": "public_github_resource",
+}
+
+#: the observer output field that carries a per-finding addressable
+#: identity for each non-runtime source type (Issue #2240 fix_delta
+#: P0-2(c)): ``codebase-investigator`` findings carry ``repository_path``;
+#: ``web-researcher`` findings carry ``citation_url`` (both per
+#: ``agents/codebase-investigator.md`` / ``agents/web-researcher.md``'s
+#: OBSERVER_RESULT_V1 output format). ``runtime`` has no such field --
+#: individual runtime findings are not independently addressable, so its
+#: cross-check (see ``_matched_finding_projection``) is by observer identity
+#: alone, matching the entire runtime evidence set for this run.
+_RESOURCE_IDENTITY_FIELD_BY_SOURCE_ID = {"repository": "repository_path", "web": "citation_url"}
+
+
+def _source_type_observer_ids(manifest: Sequence[ObserverRoleSpec] = EXPECTED_OBSERVER_MANIFEST) -> dict[str, str]:
+    """``{source_type: observer_id}`` reverse index of the (static,
+    run-independent) observer manifest -- used to validate a ``runtime``
+    evidence ref's ``resource_identity`` (``observer:<observer_id>``)
+    against the ACTUAL observer identity that owns the ``runtime`` source
+    type, regardless of whether that observer was actually invoked this run
+    (Issue #2240 fix_delta P0-1(d)/P0-2(c))."""
+    return {spec.source_type: spec.observer_id for spec in manifest}
+
+
+def _matched_finding_projection(
+    source_id: str,
+    resource_identity: str,
+    findings: list[dict[str, Any]],
+    *,
+    observer_id: str | None,
+) -> Any | None:
+    """Issue #2240 fix_delta P0-2(c)/(d): cross-check ``resource_identity``
+    against the ACTUAL finding it claims to reference -- never trust the
+    evaluator's free-form ``resource_identity`` blindly. Returns the single
+    matched finding (``repository``/``web`` -- ``repository_path``/
+    ``citation_url`` equality, tolerating a repository_blob ``#anchor``
+    suffix) so the caller's digest is computed from a projection of that ONE
+    finding rather than the entire source collection (P0-2(d)); for
+    ``runtime`` there is no per-finding addressable field, so the entire
+    runtime findings list for this run is the narrowest available
+    projection once the ``observer:<observer_id>`` identity itself is
+    verified. Returns ``None`` (never a guessed/partial match) when nothing
+    matches -- the caller drops the ref rather than binding it to unrelated
+    evidence."""
+    if source_id == "runtime":
+        if observer_id is not None and resource_identity == f"observer:{observer_id}":
+            return findings
+        return None
+    field_name = _RESOURCE_IDENTITY_FIELD_BY_SOURCE_ID.get(source_id)
+    if field_name is None:
+        return None
+    base_identity = resource_identity.split("#", 1)[0]
+    for finding in findings:
+        value = finding.get(field_name)
+        if isinstance(value, str) and value and value in (resource_identity, base_identity):
+            return finding
+    return None
+
+
+def _enrich_evidence_ref(
+    raw_ref: Any,
+    *,
+    real_evidence_index: dict[str, list[dict[str, Any]]],
+    source_type_observer_ids: dict[str, str],
+) -> dict[str, Any] | None:
+    """Issue #2240 fix_delta P0-2: bind one evaluator-claimed evidence ref to
+    its REAL observer-produced evidence, independently re-verified on the
+    Python side rather than trusted as the model asserted it (the pre-fix
+    version trusted ``source_id`` alone -- any claimed ``ref_type`` passed
+    through unchecked, and the digest was computed over the ENTIRE source
+    collection rather than the specific referenced finding)."""
     if not isinstance(raw_ref, dict):
         return None
     ref_type = raw_ref.get("ref_type")
@@ -987,20 +1145,41 @@ def _enrich_evidence_ref(raw_ref: Any, *, real_evidence_index: dict[str, list[di
         return None
     if not (isinstance(resource_identity, str) and resource_identity):
         return None
+    # (b) ref_type must agree with the ACTUAL observer source of source_id --
+    # a mismatched claim (e.g. a repository finding claimed as
+    # runtime_receipt/runtime) is dropped, never silently propagated.
+    if _REF_TYPE_BY_SOURCE_ID.get(source_id) != ref_type:
+        return None
     real_findings = real_evidence_index.get(source_id)
     if not real_findings:
         return None
-    projection = json.dumps(real_findings, sort_keys=True, separators=(",", ":"))
+    matched = _matched_finding_projection(
+        source_id, resource_identity, real_findings, observer_id=source_type_observer_ids.get(source_id)
+    )
+    if matched is None:
+        return None
+    # (d) digest is computed from a projection of the specific matched
+    # finding (or, for `runtime`, the full runtime findings list -- the
+    # narrowest available projection since individual runtime findings carry
+    # no addressable identity field), never the entire source collection.
+    projection = json.dumps(matched, sort_keys=True, separators=(",", ":"))
     digest = "sha256:" + hashlib.sha256(projection.encode("utf-8")).hexdigest()
     return {"ref_type": ref_type, "source_id": source_id, "resource_identity": resource_identity, "projection_digest": digest}
 
 
-def _enrich_evidence_refs(raw_evidence_refs: Any, *, real_evidence_index: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+def _enrich_evidence_refs(
+    raw_evidence_refs: Any,
+    *,
+    real_evidence_index: dict[str, list[dict[str, Any]]],
+    source_type_observer_ids: dict[str, str],
+) -> list[dict[str, Any]]:
     if not isinstance(raw_evidence_refs, list):
         return []
     enriched_refs = []
     for raw_ref in raw_evidence_refs:
-        enriched_ref = _enrich_evidence_ref(raw_ref, real_evidence_index=real_evidence_index)
+        enriched_ref = _enrich_evidence_ref(
+            raw_ref, real_evidence_index=real_evidence_index, source_type_observer_ids=source_type_observer_ids
+        )
         if enriched_ref is not None:
             enriched_refs.append(enriched_ref)
     return enriched_refs
@@ -1110,7 +1289,11 @@ def _enrich_candidate_record(
             prev_evaluations = list(prev_finding_contract.get("evaluations") or [])
 
     classification = _classify_current_candidate_delta(previous_state, identity_value)
-    enriched_evidence_refs = _enrich_evidence_refs(raw_candidate.get("evidence_refs"), real_evidence_index=real_evidence_index)
+    enriched_evidence_refs = _enrich_evidence_refs(
+        raw_candidate.get("evidence_refs"),
+        real_evidence_index=real_evidence_index,
+        source_type_observer_ids=_source_type_observer_ids(),
+    )
     new_entry = _build_evaluation_entry(
         classification=classification,
         prev_evaluations=prev_evaluations,
@@ -1403,23 +1586,9 @@ _DENIED_INLINE_EXEC_FLAGS = frozenset({"-c"})
 
 _DENIED_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Agent", "Skill"})
 
-_MUTATION_CREDENTIAL_ENV_VARS = frozenset(
-    {
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_ENTERPRISE_TOKEN",
-        "GIT_ASKPASS",
-        "SSH_AUTH_SOCK",
-        "SSH_AGENT_PID",
-        "NPM_TOKEN",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "NPM_AUTH_TOKEN",
-    }
-)
-_ENV_PASSTHROUGH_ALLOWLIST = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ"})
+#: Issue #2240 fix_delta P1-2: the credential denylist is defined once,
+#: earlier in this module (``_MUTATION_CREDENTIAL_ENV_VARS``, shared with
+#: ``_default_sanitized_env()``) -- no separate allowlist is kept here.
 _RUN_SCOPED_ENV_PREFIX = "AGENT_RETROSPECTIVE_"
 
 
@@ -1482,13 +1651,13 @@ class DelegatedAgentPermissionPolicy:
         return _DENIED_TOOLS
 
     def sanitize_subprocess_env(self, env: dict[str, str]) -> dict[str, str]:
-        sanitized: dict[str, str] = {}
-        for key, value in env.items():
-            if key in _MUTATION_CREDENTIAL_ENV_VARS:
-                continue
-            if key in _ENV_PASSTHROUGH_ALLOWLIST or key.startswith(_RUN_SCOPED_ENV_PREFIX):
-                sanitized[key] = value
-        return sanitized
+        """Issue #2240 fix_delta P1-2: inherit the parent environment by
+        default, stripping only ``_MUTATION_CREDENTIAL_ENV_VARS`` (see that
+        constant's docstring). ``AGENT_RETROSPECTIVE_*`` (run-scoped
+        identity vars added by the caller) pass through unchanged, same as
+        every other non-denylisted var -- no separate prefix check is needed
+        now that this is deny-list-based rather than allowlist-based."""
+        return _default_sanitized_env(env)
 
 
 # ---------------------------------------------------------------------------
@@ -1546,6 +1715,17 @@ def build_repository_collector(repo_root: Path) -> Callable[[str], Any]:
 
 _DEFAULT_PROMPT_EVIDENCE_REF = "default-prompt-evidence-ref"
 _CALLER_SUPPLIED_PROMPT_EVIDENCE_REF = "caller-supplied-prompt-evidence-ref"
+
+#: Issue #2240 fix_delta P0-1(c): the standard invocation path (no explicit
+#: ``--task``/``$ARGUMENTS``) uses this non-empty default task rather than
+#: silently falling back to the pre-fix "findings: []" hardcoded prompt --
+#: every real task (default or caller-supplied) always instructs the
+#: codebase/web observers to actually investigate and report genuine
+#: findings; only ``retrospective-runtime-observer`` (excluded from the
+#: active manifest whenever no runtime evidence is explicitly supplied, see
+#: ``active_observer_manifest()``) keeps the "no evidence -> findings: []"
+#: contract, since it has no other way to investigate anything.
+DEFAULT_TASK = "find implementation improvement candidates in the current working tree"
 
 
 def bind_observer_prompt(task_prompt: str | None, *, observer_id: str, run_id: str, base_sha: str, source_set_digest: str) -> str:
@@ -1616,24 +1796,69 @@ def _default_observer_prompt(observer_id: str, *, run_id: str, base_sha: str, so
     return bind_observer_prompt(None, observer_id=observer_id, run_id=run_id, base_sha=base_sha, source_set_digest=source_set_digest)
 
 
-def _reject_missing_or_empty_prompts(prompts: dict[str, str]) -> None:
+#: Issue #2240 fix_delta P1-1: the additive ``--allowedTools`` allowlist for
+#: each observer, matching that observer's own frontmatter `tools` list
+#: (``agents/codebase-investigator.md``/``agents/web-researcher.md``/
+#: ``agents/retrospective-runtime-observer.md``). Empty for
+#: ``retrospective-runtime-observer`` -- it takes ``tools: []`` in its own
+#: frontmatter (interprets caller-supplied evidence only, never calls a
+#: tool).
+_OBSERVER_ALLOWED_TOOLS: dict[str, frozenset[str]] = {
+    "codebase-investigator": frozenset({"Read", "Grep", "Glob"}),
+    "web-researcher": frozenset({"WebSearch", "WebFetch"}),
+    "retrospective-runtime-observer": frozenset(),
+}
+
+
+def active_observer_manifest(
+    *, include_runtime: bool, manifest: Sequence[ObserverRoleSpec] = EXPECTED_OBSERVER_MANIFEST
+) -> tuple[ObserverRoleSpec, ...]:
+    """Issue #2240 fix_delta P0-1(d): ``retrospective-runtime-observer``
+    requires the caller to embed real runtime evidence directly into its
+    prompt (it has no way to discover runtime evidence on its own -- ``tools:
+    []``); the standard invocation path never supplies this, so launching it
+    unconditionally is a guaranteed no-op that still burns a full model call.
+    Returns the full manifest when ``include_runtime`` is true (runtime
+    evidence was explicitly supplied), otherwise the manifest with
+    ``retrospective-runtime-observer`` excluded."""
+    if include_runtime:
+        return tuple(manifest)
+    return tuple(spec for spec in manifest if spec.source_type != "runtime")
+
+
+def _reject_missing_or_empty_prompts(
+    prompts: dict[str, str], *, manifest: Sequence[ObserverRoleSpec] = EXPECTED_OBSERVER_MANIFEST
+) -> None:
     missing_or_empty = [
         spec.observer_id
-        for spec in EXPECTED_OBSERVER_MANIFEST
+        for spec in manifest
         if not isinstance(prompts.get(spec.observer_id), str) or not prompts[spec.observer_id].strip()
     ]
     if missing_or_empty:
-        raise WireContractError(f"invalid_observer_prompts:missing_or_empty={sorted(missing_or_empty)}", reason_code="invalid_observer_prompts")
+        raise WireContractError(
+            f"invalid_observer_prompts:missing_or_empty={sorted(missing_or_empty)}", reason_code="invalid_observer_prompts"
+        )
 
 
-def build_observer_requests(*, schema_dir: Path, cwd: str, prompts: dict[str, str], timeout_sec: int = 300, plugin_root: str | None = None) -> list[AgentInvocationRequest]:
-    """Build the exact 3-observer ``AgentInvocationRequest`` list matching
-    ``EXPECTED_OBSERVER_MANIFEST``. Every request always targets
-    ``observer_result_v1.schema.json`` -- this plugin's ``codebase-
-    investigator``/``web-researcher`` Agents are lightweight
+def build_observer_requests(
+    *,
+    schema_dir: Path,
+    cwd: str,
+    prompts: dict[str, str],
+    timeout_sec: int = 300,
+    plugin_root: str | None = None,
+    manifest: Sequence[ObserverRoleSpec] = EXPECTED_OBSERVER_MANIFEST,
+) -> list[AgentInvocationRequest]:
+    """Build the ``AgentInvocationRequest`` list for ``manifest`` (Issue
+    #2240 fix_delta P0-1(d): the caller's ACTIVE manifest, which may exclude
+    ``retrospective-runtime-observer`` -- defaults to the full 3-observer
+    ``EXPECTED_OBSERVER_MANIFEST`` for backward compatibility). Every request
+    always targets ``observer_result_v1.schema.json`` -- this plugin's
+    ``codebase-investigator``/``web-researcher`` Agents are lightweight
     reimplementations that always speak ``observer_result/v1`` directly (no
-    AGY role-adapter / native-fallback schema switching)."""
-    _reject_missing_or_empty_prompts(prompts)
+    AGY role-adapter / native-fallback schema switching). Each request also
+    carries its own ``--allowedTools`` (Issue #2240 fix_delta P1-1)."""
+    _reject_missing_or_empty_prompts(prompts, manifest=manifest)
     return [
         AgentInvocationRequest(
             agent_name=spec.observer_id,
@@ -1642,8 +1867,9 @@ def build_observer_requests(*, schema_dir: Path, cwd: str, prompts: dict[str, st
             cwd=cwd,
             timeout_sec=timeout_sec,
             plugin_root=plugin_root,
+            allowed_tools=_OBSERVER_ALLOWED_TOOLS.get(spec.observer_id, frozenset()),
         )
-        for spec in EXPECTED_OBSERVER_MANIFEST
+        for spec in manifest
     ]
 
 
@@ -1657,6 +1883,8 @@ def run_cli(
     schema_dir: Path,
     plugin_root: str | None = None,
     base_ref: str = "HEAD",
+    task: str | None = None,
+    runtime_evidence: str | None = None,
     prompts: dict[str, str] | None = None,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     git_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
@@ -1667,7 +1895,7 @@ def run_cli(
     previous_state_scope: str = DEFAULT_PREVIOUS_STATE_SCOPE,
 ) -> PublishRequest:
     """The single production call graph: manual-trigger preflight ->
-    run-scoped temp dir -> collector closures -> ``prepare`` -> exact-manifest
+    run-scoped temp dir -> collector closures -> ``prepare`` -> active-manifest
     observer wave (real headless CLI subprocess adapter, permission-policy-
     wrapped, every nested ``claude -p --agent`` invocation scoped to
     ``agent-retrospective:<agent-name>`` and given ``--plugin-dir
@@ -1677,7 +1905,19 @@ def run_cli(
     ``base_ref`` (Issue #2240 AC5) resolves the snapshot anchor via ``git
     rev-parse <base_ref>`` -- never a hardcoded ``main``. Defaults to
     ``HEAD`` (this checkout's current commit) so the resolver works
-    regardless of the analyzed repository's default branch name."""
+    regardless of the analyzed repository's default branch name.
+
+    ``task``/``runtime_evidence`` (Issue #2240 fix_delta P0-1) are the
+    standard-path inputs: ``task`` (or ``DEFAULT_TASK`` when omitted) is fed
+    to ``codebase-investigator``/``web-researcher``; ``retrospective-runtime-
+    observer`` is only added to the active manifest when ``runtime_evidence``
+    is explicitly supplied (P0-1(d)) -- it is fed ``runtime_evidence``
+    itself, never ``task`` (a generic task description is not runtime
+    evidence). ``prompts`` remains a lower-level ADVANCED override (e.g. for
+    tests): when supplied, it takes precedence over ``task``/
+    ``runtime_evidence`` and always addresses the FULL 3-observer manifest
+    (unchanged legacy behavior), one raw per-observer task/evidence string
+    keyed by ``observer_id``."""
     manual_trigger_preflight(repo_root=repo_root)
     resolved_run_id = run_id or str(uuid.uuid4())
     policy = DelegatedAgentPermissionPolicy(run_id=resolved_run_id)
@@ -1688,28 +1928,40 @@ def run_cli(
             raise ValueError(f"base_sha_resolution_failed:{completed.stderr}")
         return completed.stdout.strip()
 
+    has_runtime_evidence = bool(runtime_evidence and runtime_evidence.strip())
+    active_manifest = (
+        EXPECTED_OBSERVER_MANIFEST if prompts is not None else active_observer_manifest(include_runtime=has_runtime_evidence)
+    )
+
     with run_scoped_temp_dir(resolved_run_id, base_dir=temp_base_dir):
         collectors = [build_repository_collector(repo_root)]
         ctx, plan, results = prepare(base_sha_resolver=_base_sha_resolver, collectors=collectors, clock=clock, run_id=resolved_run_id)
 
         if prompts is not None:
-            _reject_missing_or_empty_prompts(prompts)
+            _reject_missing_or_empty_prompts(prompts, manifest=active_manifest)
             resolved_prompts = {
                 spec.observer_id: bind_observer_prompt(prompts[spec.observer_id], observer_id=spec.observer_id, run_id=ctx.run_id, base_sha=ctx.base_sha, source_set_digest=plan.source_set_digest)
-                for spec in EXPECTED_OBSERVER_MANIFEST
+                for spec in active_manifest
             }
         else:
-            resolved_prompts = {
-                spec.observer_id: _default_observer_prompt(spec.observer_id, run_id=ctx.run_id, base_sha=ctx.base_sha, source_set_digest=plan.source_set_digest)
-                for spec in EXPECTED_OBSERVER_MANIFEST
-            }
-        observer_requests = build_observer_requests(schema_dir=schema_dir, cwd=str(repo_root), prompts=resolved_prompts, plugin_root=plugin_root)
+            effective_task = task if (task is not None and task.strip()) else DEFAULT_TASK
+            resolved_prompts = {}
+            for spec in active_manifest:
+                task_prompt = runtime_evidence if spec.source_type == "runtime" else effective_task
+                resolved_prompts[spec.observer_id] = bind_observer_prompt(
+                    task_prompt, observer_id=spec.observer_id, run_id=ctx.run_id, base_sha=ctx.base_sha, source_set_digest=plan.source_set_digest
+                )
+        observer_requests = build_observer_requests(
+            schema_dir=schema_dir, cwd=str(repo_root), prompts=resolved_prompts, plugin_root=plugin_root, manifest=active_manifest
+        )
 
         def _invoke(request: AgentInvocationRequest) -> AgentInvocationResult:
             run_scoped_env = {**request.env, f"{_RUN_SCOPED_ENV_PREFIX}RUN_ID": ctx.run_id, f"{_RUN_SCOPED_ENV_PREFIX}BASE_SHA": ctx.base_sha}
             return invoke_agent(dataclasses.replace(request, env=run_scoped_env), runner=runner, policy=policy)
 
-        bundles = run_observer_wave(ctx, plan, invoke=_invoke, observer_requests=observer_requests, expected_manifest=EXPECTED_OBSERVER_MANIFEST)
+        bundles = run_observer_wave(
+            ctx, plan, invoke=_invoke, observer_requests=observer_requests, expected_manifest=active_manifest
+        )
         source_digest_registry = build_source_digest_registry(results)
         finding_sets = build_finding_sets(ctx, plan, bundles, source_digest_registry=source_digest_registry)
         evaluator_request = prepare_evaluator_request(ctx, plan, finding_sets)
@@ -1721,6 +1973,7 @@ def run_cli(
             cwd=str(repo_root),
             env={f"{_RUN_SCOPED_ENV_PREFIX}RUN_ID": ctx.run_id, f"{_RUN_SCOPED_ENV_PREFIX}BASE_SHA": ctx.base_sha},
             plugin_root=plugin_root,
+            allowed_tools=frozenset(),
         )
 
         def _invoke_evaluator(_request: EvaluatorRequest) -> AgentInvocationResult:
@@ -1782,7 +2035,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--idempotency-key", default=None, help="Defaults to a fresh UUID.")
     parser.add_argument("--base-ref", default="HEAD", help="git rev-parse target for the snapshot base_sha; never hardcoded to 'main'.")
     parser.add_argument("--schema-dir", default=str(_SCHEMAS_DIR))
-    parser.add_argument("--prompts-file", default=None, help="JSON file: {observer_id: prompt_text}")
+    parser.add_argument(
+        "--task",
+        default=None,
+        help=(
+            "Investigation task fed to codebase-investigator/web-researcher (Issue #2240 fix_delta "
+            "P0-1). Wired mechanically from the invoking Skill's $ARGUMENTS. Omitted or blank falls "
+            "back to DEFAULT_TASK -- never the pre-fix hardcoded empty-findings default prompt."
+        ),
+    )
+    parser.add_argument(
+        "--runtime-evidence-file",
+        default=None,
+        help=(
+            "Path to a text file with scrubbed Claude Code/Claude-GPT runtime evidence. Only when "
+            "supplied is retrospective-runtime-observer added to the active observer manifest and "
+            "invoked (Issue #2240 fix_delta P0-1(d)) -- omitted by default, matching the standard "
+            "path never having runtime evidence to embed."
+        ),
+    )
+    parser.add_argument(
+        "--prompts-file",
+        default=None,
+        help="JSON file: {observer_id: prompt_text}. Advanced/test override; always addresses the full 3-observer manifest.",
+    )
     parser.add_argument("--state-backend", choices=STATE_BACKEND_CHOICES, default="fixture", help="PreviousStateProvider backend. This plugin ships only 'fixture'.")
     args = parser.parse_args(argv)
 
@@ -1809,6 +2085,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.prompts_file:
         prompts = json.loads(Path(args.prompts_file).read_text(encoding="utf-8"))
 
+    runtime_evidence: str | None = None
+    if args.runtime_evidence_file:
+        runtime_evidence = Path(args.runtime_evidence_file).read_text(encoding="utf-8")
+
     try:
         previous_state_provider = resolve_previous_state_provider(state_backend=args.state_backend, repository_id=repository_id, target_issue=args.target_issue)
         publish_request = run_cli(
@@ -1820,6 +2100,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             schema_dir=Path(args.schema_dir),
             plugin_root=args.plugin_root,
             base_ref=args.base_ref,
+            task=args.task,
+            runtime_evidence=runtime_evidence,
             prompts=prompts,
             previous_state_provider=previous_state_provider,
         )

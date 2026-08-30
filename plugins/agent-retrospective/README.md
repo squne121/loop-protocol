@@ -43,21 +43,32 @@ claude --plugin-dir /path/to/plugins/agent-retrospective
 `skills/run/scripts/run_retrospective.py` を起動する（詳細は `skills/run/SKILL.md` を参照）。
 
 ```bash
+UV_PROJECT_ENVIRONMENT="${CLAUDE_PLUGIN_DATA}/venv" \
 uv run --project "${CLAUDE_PLUGIN_ROOT}" --locked python3 \
   "${CLAUDE_PLUGIN_ROOT}/skills/run/scripts/run_retrospective.py" \
   --repo-root "${CLAUDE_PROJECT_DIR}" \
   --plugin-root "${CLAUDE_PLUGIN_ROOT}" \
-  --state-backend fixture
+  --state-backend fixture \
+  --task "$ARGUMENTS"
 ```
 
 - `${CLAUDE_PLUGIN_ROOT}`: この plugin 自身のインストール先（bundled asset -- スクリプト・schema・
   Agent 定義 -- の解決に使う）
 - `${CLAUDE_PROJECT_DIR}`: 解析対象 repository（呼び出し元セッションが現在アタッチしている project）
-- `${CLAUDE_PLUGIN_DATA}`: 本 plugin は永続データを書き込まない（proposal-only、artifact は
-  run-scoped temp dir へのみ書き込み、run 終了時に必ず削除する）ため使用しない
+- `${CLAUDE_PLUGIN_DATA}`: `uv run --project` の依存解決 venv（`${CLAUDE_PLUGIN_DATA}/venv`）の
+  設置先として使う（Issue #2240 fix_delta P1-3）。plugin root は Claude Code のアップデートで
+  置き換え可能な transient 領域であり、`uv run --project` が既定で作成する `.venv` を plugin root
+  直下に置くと「永続データの置き場」という `${CLAUDE_PLUGIN_DATA}` の公式仕様と矛盾するため、
+  `UV_PROJECT_ENVIRONMENT` で明示的に退避する。retrospective run 自体の中間 artifact は
+  run-scoped temp dir へのみ書き込み、run 終了時に必ず削除する（proposal-only、永続 retrospective
+  artifact はここには書き込まない）
 
-`--repository-id`（省略時は `git remote get-url origin` から自動導出）・`--target-issue`（省略時は
-issue-less run）・`--request-id`/`--idempotency-key`（省略時は UUID 自動生成）はすべて任意である。
+`uv` が必須（Python 3.12+ は `uv` 自身が解決する）。初回実行時に依存解決（`jsonschema` の sync）が
+走る。`--repository-id`（省略時は `git remote get-url origin` から自動導出）・`--target-issue`
+（省略時は issue-less run）・`--request-id`/`--idempotency-key`（省略時は UUID 自動生成）は
+すべて任意である。`--task`（省略時は非空の既定 task へフォールバックする。Issue #2240 fix_delta
+P0-1）・`--runtime-evidence-file`（明示指定した場合のみ `retrospective-runtime-observer` を
+起動する。Issue #2240 fix_delta P0-1(d)）も参照。詳細は `skills/run/SKILL.md` の手順書を正本とする。
 
 ## Plugin Agent frontmatter の未対応フィールド
 
@@ -102,10 +113,16 @@ frontmatter パーサはこれらを認識しない（`claude plugin validate --
 
 ## Python dependency closure（Python 依存関係クロージャ）
 
-`pyproject.toml`/`uv.lock` は `jsonschema` のみを依存として固定する。`uv run --project
-"${CLAUDE_PLUGIN_ROOT}" --locked` で解決されるこの closure は、host repository（`.claude/` を持つ
-project）側の `pyproject.toml`/`uv.lock` から独立している -- `.claude/` を持たない repository へ
-インストールしても、この plugin 自身の依存解決だけで動作する。
+`pyproject.toml`/`uv.lock` の runtime dependency は `jsonschema` のみを固定する（`[dependency-
+groups].test` の `pytest` は `skills/run/scripts/tests/` の offline regression test 専用の
+test-only 依存であり、`uv run --project "${CLAUDE_PLUGIN_ROOT}" --locked`〈`--group test` を渡さない
+既定の実行〉では sync されない -- グループ名をあえて uv が既定で自動 sync する特別扱いの `dev` に
+せず `test` にしているのはこのため）。`uv run --project "${CLAUDE_PLUGIN_ROOT}" --locked` で解決される
+この closure は、host repository（`.claude/` を持つ project）側の `pyproject.toml`/`uv.lock` から
+独立している -- `.claude/` を持たない repository へインストールしても、この plugin 自身の依存解決
+だけで動作する。`[tool.uv].required-version` は `>=0.11.29,<0.13`（Issue #2240 fix_delta P1-3。
+plugin は任意の repository の任意の ambient uv install の上で動くため、exact-match pin はインストール
+済み uv がわずかに新しいだけで起動不能になる kill-switch になってしまう）。
 
 ## base_sha resolution（default branch 名を決め打ちしない）
 
