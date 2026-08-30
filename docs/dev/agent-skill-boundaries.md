@@ -53,109 +53,36 @@ Step 1 起動の authority ではない。正本は
 | `implementation-worker` | write | `acceptEdits` | Read, Grep, Glob, Bash, Edit, Write, MultiEdit | — |
 | `post-merge-cleanup-worker` | cleanup | `default` | Bash, Read | Agent, Edit, Write, MultiEdit |
 
-## Claude/Codex Agent Runtime Authority（実行権限の正本、#2160 Phase 2: agent/runtime parity 契約移行）
+## Claude Agent Runtime Authority（実行権限の正本）
 
-`.claude/agents/*.md` を `claude-native` / `claude-gpt` 共通の実行 authority とし、`.codex/agents/*.toml` を Phase 3（#2161）までの legacy compatibility（read-only）projection とする Authority 分離を、本節を正本として明記する（Parent #2154 アーキテクチャ決定 D の再定義、2026-08-24 OWNER 敵対的レビュー `recommended_disposition: reframe_in_place` 反映）。
+`.claude/agents/*.md` を `claude-native` / `claude-gpt` 共通の実行 authority とする（Issue #2161 で native Codex CLI を撤去し、旧 `.codex/agents/*.toml` legacy compatibility projection を廃止した。Parent #2154 の Desired Destination 達成）。
 
 | 次元 | Authority | 備考 |
 |---|---|---|
 | Claude Code が読む実行宣言 | `.claude/agents/*.md` | claude-native / claude-gpt 共通の Claude Code 実行 authority |
-| repository 固有の分類・mutation/delegation/output policy | `tests/fixtures/codex-agent-config/expected-runtime-contract.json` | `asset_classification` ブロックが SSOT |
+| repository 固有の分類・mutation/delegation/output policy | `tests/fixtures/agent-config/expected-runtime-contract.json` | `asset_classification` ブロックが SSOT |
 | alias から runtime model への mapping | `claude-gpt` launcher（`scripts/claude-gpt/**`） | model_alias（sonnet/haiku/opus）→ 具体 model ID の変換はここに一本化する |
 | 実際に起動された runtime/model/SubAgent | 既存 runtime-smoke evidence（PR #2176 / #2220） | `run_worktree_agent_runtime_smoke.py` |
-| Codex CLI 互換 | `.codex/agents/*.toml` | legacy read-only projection。Phase 3（#2161）まで削除しない |
 | 人間向け説明 | 本節 | Authority 分離の正本 |
 
-### Asset inventory classification（資産の分類一覧, AC2, #2160）
+### Asset inventory classification（資産の分類一覧, AC2, #2160。Issue #2161 で provider-neutral 化）
 
-`.claude/agents/**` と `.codex/agents/**` の全 asset は
-`tests/fixtures/codex-agent-config/expected-runtime-contract.json` の
-`asset_classification` ブロックで次の 5 値のいずれかへ一意分類する:
+`.claude/agents/**` の全 asset は
+`tests/fixtures/agent-config/expected-runtime-contract.json` の
+`asset_classification` ブロックで次の 3 値のいずれかへ一意分類する:
 
 - `shared_claude_runtime` — `.claude/agents/*.md`。claude-native / claude-gpt 共通の実行 authority
-- `claude_only` — Codex 側に対応 TOML を持たない Claude 専用 SubAgent（例: `issue-design-reviewer` / `retrospective-evaluator` / `retrospective-runtime-observer`）
-- `legacy_codex_projection` — `.claude/agents/*.md` とペアの `.codex/agents/*.toml`。Phase 3（#2161）まで legacy compatibility projection として維持
-- `legacy_codex_only` — Codex CLI ネイティブ専用（対応する Claude 側 asset なし。例: `spark-skim` / `spark-worker` / `spark-deep`）
+- `claude_only` — Claude 専用 SubAgent（例: `issue-design-reviewer` / `retrospective-evaluator` / `retrospective-runtime-observer`）
 - `experimental` — 現時点で未使用（将来の実験的 asset 用に予約）
 
 unclassified reference は 0 を維持する
 （`tests/test_agent_portability_contract.py::test_all_agent_assets_classified_no_unclassified` で機械検証）。
 
-### phase_2_compatibility ブロック（AC9, Phase 3 / #2161 への引き継ぎ）
+native Codex CLI 撤去に伴い、`legacy_codex_projection` / `legacy_codex_only` 分類値と `phase_2_compatibility` ブロック（`codex_assets_authoritative` 等）は不要になり削除した（Issue #2161）。
 
-```yaml
-phase_2_compatibility:
-  codex_assets_authoritative: false
-  legacy_validator_mode: compatibility_only
-  codex_asset_deletion: forbidden
-  removal_owner: "#2161"
-```
+## Manual Spark Agents の撤去（手動 Spark エージェントの撤去、Issue #2161 で削除済み）
 
-Phase 2（本 #2160）では `.codex/**` を削除しない。削除対象・consumer・compatibility shim の inventory は
-`tests/fixtures/codex-agent-config/codex_removal_inventory.json`（`CODEX_ASSET_REMOVAL_INVENTORY_V1`）に checked-in artifact として保存し、
-Phase 3（#2161, removal_owner）が読み取る。
-
-Spark 系 3 asset（`spark-skim` / `spark-worker` / `spark-deep`）は `legacy_codex_only` のまま維持しつつ、`codex_removal_inventory.json` 上は removal_target: true（follow-up: #2186）として明記する。将来の Spark 設計は #2186 が所有する claude-gpt-session 上のカスタム SubAgent `spark-codex` であり、Codex CLI `.toml` を継続保持する設計ではない（2026-08-25 人間レビュー反映）。
-
-## Codex Dispatch Guardrail（Codex ディスパッチ境界）
-
-Codex の変更操作制御は標準の隔離環境と承認機構による
-`managed configuration` を権限根拠とする。隔離済みリポジトリフックの
-`enforcement 再導入` は暗黙に行わず、公式実行環境で有効な到達性を証明する
-独立した変更として扱う。
-
-- Codex CLI の root thread は control-plane 専用とし、`implementation-worker` / `test-runner` / `pr-reviewer` / `post-merge-cleanup-worker` を明示 spawn して data-plane を委譲する
-- `SUBAGENT_LAUNCH_LEDGER_V1` は advisory telemetry とし、missing / stale /
-  mixed / invalid / malformed / hook-skipped は warning のみとする。有効な ledger
-  も PASS・承認・CI・review・merge readiness の canonical evidence にしない
-- `SUBAGENT_LAUNCH_LEDGER_V1.coverage_scope` は support 済みの `SubagentStart` / `PreToolUse(Bash|apply_patch|Edit|Write)` 観測範囲を明示する。未対応 path の absence を「完全防止」の証拠として主張しない
-- project-local `.codex/config.toml` は profile routing の証拠として扱わず、actual runtime contract と launch-ledger evidence を validator 対象にする
-- live spawn の runtime verification は `#601` に deferred し、この文書で扱うのは evidence 不足時に fail-closed する repo-side 監査境界のみ
-
-## Manual Codex Spark Agents（手動 Codex Spark エージェント）
-
-`spark-skim` / `spark-worker` / `spark-deep` は manual invocation only の Codex custom subagent として扱う。human が agent 名を明示 spawn した場合だけ使い、workflow root の auto dispatch 先にしない。
-
-### Reasoning routing policy（推論ルーティング方針）
-
-| Agent | Permissions | 想定用途 | 補足 |
-|---|---|---|---|
-| `spark-skim` | `loop-protocol-readonly` | 軽量な read-only triage / 要点抽出 | low reasoning |
-| `spark-worker` | `loop-protocol-rtk` | Allowed Paths 内の manual bounded edit helper | medium reasoning。`implementation-worker` / `issue-creator` / `issue-editor` / `pr-reviewer` の代替ではない |
-| `spark-deep` | `loop-protocol-readonly` | 複雑な read-only analysis / risk surfacing | high reasoning |
-
-- `xhigh` reasoning は今回採用しない。account plan / rollout 差分や運用実績を踏まえた follow-up 判断対象とする。
-- heavy agent 非置換を原則とし、既存 `implementation-worker` / `issue-creator` / `issue-editor` / `pr-reviewer` / `test-runner` の routing は維持する。
-- `spark-worker` は manual bounded edit helper であり、Issue authoring、PR review judgment、loop orchestration、publish 操作を担当しない。
-- `HOOK_COMMAND_REPAIR_HINT_V1` は agent steering 用の bounded diagnostics であり、rules / hooks の authorization を上書きしない。
-- `HOOK_COMMAND_REPAIR_HINT_V1` が `suggested_command` を返しても、それは `direct rtk git ...` の exact / bounded repair 候補に限る。wrapper 展開や bypass shell を agent が自動採用してはならない。
-- `allowed_paths_missing_for_git_mutation` や `issue_context_required` は runtime contract 未解決の停止信号として扱い、agent は publish を続行せず binding/source-of-truth を確認する。
-- publish retry は branch 名一致だけで green 扱いせず、`PUBLISH_LANE_DECISION_V1` の `expected_remote_head` / `current_remote_head` / `local_head` / `verified_head` / `declared_publish_head` / `allowed_paths_gate_status` / `remote_readback_source` / `decision_inputs_complete` を read-only preflight で揃えてから判断する。
-- `PUBLISH_SAFETY_STOP_REPORT_V1` の `reason_code` は少なくとも `branch_mismatch` / `stale_remote_head` / `local_head_mismatch` / `remote_fast_forward_by_same_scope` / `remote_head_scope_contamination` / `allowed_paths_gate_not_ok` / `publish_guard_context_missing` / `publish_guard_context_invalid` を使い、manual remote update への暗黙フォールバックを禁止する。
-
-### Prompt examples（プロンプト例）
-
-- `spark-skim`: `Spawn spark-skim and read only docs/dev/agent-skill-boundaries.md plus .codex/agents. Return SPARK_AGENT_RESULT_V1 with evidence refs only.`。軽量調査だけを依頼する例。
-- `spark-worker`: `Spawn spark-worker for a bounded edit inside the listed Allowed Paths only. Do not review the PR or publish anything.`。編集範囲を厳密に縛る例。
-- `spark-deep`: `Spawn spark-deep for read-only analysis of validator / fixture drift and return risk flags without editing files.`。深い read-only 分析を依頼する例。
-
-### Positive smoke and negative smoke policy（ポジティブ/ネガティブ smoke 方針）
-
-- positive smoke: human が `spark-skim` / `spark-worker` / `spark-deep` をそれぞれ明示 spawn し、`SUBAGENT_LAUNCH_LEDGER_V1.launches[]` に対象 agent 名、runtime model、reasoning effort、default permissions が記録されることを確認する。
-- negative smoke: `issue-refinement-loop` / `impl-review-loop` の通常ルート実行後に ledger を確認し、`spark-*` が auto dispatch されていないことを確認する。routing 変更は別 Issue とする。
-- auto dispatch を有効化する変更は本スコープ外であり、planner / loop routing / workflow root の変更を伴う別 implementation issue で扱う。
-
-### Manual smoke evidence minimum（手動 smoke の最小証跡）
-
-- `Codex CLI version`。Codex CLI の版情報。
-- `install route`。導入経路の記録。
-- `auth mode category`。認証モード区分。
-- `agent prompt`。実際に使った agent 指示。
-- `ledger path`。ledger artifact の保存先。
-- `Known limitation`。既知制約の明記。
-
-- manual smoke evidence には secret、raw transcript、raw logs を残さない。必要なら構造化 summary と ledger path のみを残す。
-- Spark 3 agent は Codex-only parity exception として扱い、fixture では `parity_mode: codex_only`、`parity_exception_reason`、`claude_agent_path: null` を保持する。
+`spark-skim` / `spark-worker` / `spark-deep`（旧 `.codex/agents/spark-*.toml`）は native Codex CLI 専用の custom subagent であり、Codex CLI 撤去に伴い削除した。将来の Spark 設計は `claude-gpt-session` 上のカスタム SubAgent `spark-codex` として #2186 が別途所有し、Codex CLI `.toml` を継続保持する設計ではない（2026-08-25 人間レビュー反映）。
 
 ### `review-issue` / `issue-reviewer` の使い分け
 
@@ -379,9 +306,9 @@ SKILL_RUNTIME_COMMAND_POLICY_V2:
 | Consumer | 役割 | 読むタイミング | 実更新状況 |
 |---|---|---|---|
 | `issue-contract-review` | CI 関連 Issue で `ci-test-performance` が Required Skills に欠落、または CI runtime evidence plan が存在しない場合に `blocked` を返すことができる | CI 関連 Issue の contract review 時 | 実更新は follow-up Issue に分離（docs-only 定義） |
-| `implementation-worker` | `.github/workflows/**`・`pyproject.toml`・`uv.lock`・pytest/Ruff/xdist/CI artifact 関連を触る前に `ci-test-performance` を読む。PR 本文または artifact に `CI_TEST_PERFORMANCE_DECISION_V1` を残す | CI 関連 path 編集前 | Codex CLI 側は `.codex/agents/implementation-worker.toml` に routing 追加済み。Claude Code 側実更新は follow-up Issue に分離 |
-| `test-runner` | VC 実行・runtime artifact 確認の担当。lane 設計の意思決定者ではなく、PASS/FAIL/SKIP 分類と artifact 整合性チェックを行う | VC 実行時 | Codex CLI 側は `.codex/agents/test-runner.toml` に routing 追加済み。Claude Code 側実更新は follow-up Issue に分離 |
-| `pr-reviewer` | CI 関連 PR で `CI_TEST_PERFORMANCE_DECISION_V1`・lane 判断・`ci_runtime_baseline` 比較・self-report 以外の証跡が存在しない場合は `REQUEST_CHANGES` を返すことができる | CI 関連 PR review 時 | Codex CLI 側は `.codex/agents/pr-reviewer.toml` に routing 追加済み。Claude Code 側実更新は follow-up Issue に分離 |
+| `implementation-worker` | `.github/workflows/**`・`pyproject.toml`・`uv.lock`・pytest/Ruff/xdist/CI artifact 関連を触る前に `ci-test-performance` を読む。PR 本文または artifact に `CI_TEST_PERFORMANCE_DECISION_V1` を残す | CI 関連 path 編集前 | Claude Code 側実更新は follow-up Issue に分離（Issue #2161 で native Codex CLI 側の routing 記述は撤去済み） |
+| `test-runner` | VC 実行・runtime artifact 確認の担当。lane 設計の意思決定者ではなく、PASS/FAIL/SKIP 分類と artifact 整合性チェックを行う | VC 実行時 | Claude Code 側実更新は follow-up Issue に分離（Issue #2161 で native Codex CLI 側の routing 記述は撤去済み） |
+| `pr-reviewer` | CI 関連 PR で `CI_TEST_PERFORMANCE_DECISION_V1`・lane 判断・`ci_runtime_baseline` 比較・self-report 以外の証跡が存在しない場合は `REQUEST_CHANGES` を返すことができる | CI 関連 PR review 時 | Claude Code 側実更新は follow-up Issue に分離（Issue #2161 で native Codex CLI 側の routing 記述は撤去済み） |
 
 ### Claude Code 側 consumer 更新の扱い
 
@@ -1470,8 +1397,8 @@ issue dependency 削除など、GitHub へのリモートミューテーショ�
 これらの command id を直接呼び出す raw `gh issue edit` / `gh issue comment` 等は、
 `worktree_scope_guard` / `local_main_branch_guard` の behavioral/defense-in-depth contract として
 deny 対象と定義されている。ただし現行 project config（`.claude/settings.json` の project
-PreToolUse、`.codex/hooks.json`）には両スクリプトとも PreToolUse handler として wiring されて
-おらず（#1691）、実行時の technical enforcement は `controlled_skill_mutation_exec.py` を
+PreToolUse。Issue #2161 で native Codex CLI hook config も撤去済み）には両スクリプトとも
+PreToolUse handler として wiring されておらず（#1691）、実行時の technical enforcement は `controlled_skill_mutation_exec.py` を
 唯一の executor とする単一 executor 制約そのものが担う。
 
 ### ポリシーレジストリ（例: `issue_comment.publish`）
@@ -1556,8 +1483,9 @@ Claude Code permission syntax の制約上 `*` を使用しているが、settin
 - settings は「このコマンドクラスを allow する UI 層」
 - argv 制限ロジック（`_validate_executor_argv` 相当）は `worktree_scope_guard.py` / `local_main_branch_guard.py`
   にコードとして実装されており、`test_worktree_scope_guard.py` / `test_local_main_branch_guard.py` の unit test
-  で検証される。ただし現行 project config（`.claude/settings.json` の project PreToolUse、`.codex/hooks.json`）
-  には両スクリプトとも PreToolUse handler として wiring されていない（#1691）ため、この argv 制限は
+  で検証される。ただし現行 project config（`.claude/settings.json` の project PreToolUse。
+  Issue #2161 で native Codex CLI hook config も撤去済み）には両スクリプトとも PreToolUse
+  handler として wiring されていない（#1691）ため、この argv 制限は
   実行時の PreToolUse hook 層として動作する enforcement ではない
 - wildcard を悪用した不正 argv（例: `--unknown-flag`）を deny する実効的な境界は、executor script
   （`controlled_skill_mutation_exec.py`）自身の内部検証、および Agent/Skill 側の運用規律である
@@ -1651,8 +1579,8 @@ exact command class allow は executor script identity + argv 形状のみを検
 なしで同じ allow 経路に乗る。raw `gh issue edit` / `gh issue comment` は `worktree_scope_guard.py`
 内の `_classify_gh` ロジック上は `mutating` に分類され、active issue + no-matching-worktree
 状態では behavioral/defense-in-depth contract として block 対象と定義される。ただし現行 project config
-（`.claude/settings.json` の project PreToolUse、`.codex/hooks.json`）には `worktree_scope_guard`
-が PreToolUse handler として wiring されていない（#1691）ため、この分類が実行時に自動的な block を
+（`.claude/settings.json` の project PreToolUse。Issue #2161 で native Codex CLI hook config も
+撤去済み）には `worktree_scope_guard` が PreToolUse handler として wiring されていない（#1691）ため、この分類が実行時に自動的な block を
 引き起こす経路は現在存在しない。
 
 ## isolation worktree agent の Issue コメント投稿ブリッジ機構（Issue #1633）
@@ -1787,13 +1715,13 @@ raw `gh issue comment` は `publish_termination_report.py` からもう呼ばれ
 （AC4/AC14、marker precheck、postcondition）は Issue #1284 で確定済みのものを
 そのまま再利用し、本 Issue では新設していない。
 
-### Codex 側 allow エントリ（AC5）
+### 旧 Codex 側 allow エントリ（AC5、Issue #2161 で撤去）
 
-`.codex/rules/default.rules` に `uv run python3
-scripts/agent-guards/controlled_skill_mutation_exec.py` の exact prefix allow
-エントリを追加した。Claude 側 `.claude/settings.json` の同等 wildcard allow
-エントリと同じ共有 authorization lane に Codex 側も乗る
-（詳細は `docs/dev/hook-boundaries.md` の該当セクション参照）。
+`.codex/rules/default.rules`（native Codex CLI 撤去に伴い削除済み）に
+`uv run python3 scripts/agent-guards/controlled_skill_mutation_exec.py` の
+exact prefix allow エントリを追加していたが、Issue #2161 の native Codex CLI
+retirement でこのファイル自体を撤去した。Claude 側 `.claude/settings.json` の
+wildcard allow エントリが引き続き authorization lane を担う。
 
 ### no-live-mutation 統合テスト（AC4）
 
@@ -2536,112 +2464,16 @@ path として扱われ、将来 production process が誤って作成・更新�
 - non-volatile outside path に対する negative test を伴わない「並列実行対応」の主張は、self-write bypass
   （自分の逸脱を volatile root 除外ロジックで隠蔽する抜け穴）を作りうるため、レビューで reject する。
 
-### SubAgent 起動記録 writer の Linux 安全性の境界（Issue #1503）
+### SubAgent 起動記録 ledger の撤去（Issue #1503/#1502 は Issue #2161 で retired）
 
-`scripts/subagent-launch-ledger-writer.c` は、trusted local Codex hook process が
-`artifacts/codex/subagent-launch-ledger.json` を更新する唯一の writer である。Node.js 側は
-source を build して entry を渡すだけであり、ledger の read-modify-write、lock、temporary file、
-replacement を直接実行してはならない。
-
-- build artifact の配置（Issue #1502）: `ensureLedgerWriter()` は source を repo-local
-  `tmp/subagent-launch-ledger-writer*` へ build しない。OS temp directory 配下の
-  content-addressed cache（source の sha256 をキーにした再利用可能な build artifact。
-  `os.tmpdir()/loop-protocol-subagent-ledger-writer-cache/<sha256>-ledger-writer`）へ build し、
-  同一 source content の再ビルドを回避する。repo snapshot 外に置くことで、cold/warm な
-  hook 呼び出しが `skill_runtime_exec.py` の anchor-bound preflight から self-write と誤認され
-  ないようにする。repo-local `tmp/subagent-launch-ledger-writer*` を race-tolerant exception に
-  追加することは行わない（directory-wide exclusion 禁止の原則と同様、Out of Scope）。
-
-- helper は ledger parent directory fd を開き、Linux の `openat2`（利用できない kernel では
-  `openat` + `O_NOFOLLOW`）と `renameat` を使用する。exclusive lock を取得した後に ledger を
-  再読込し、valid `SUBAGENT_LAUNCH_LEDGER_V1` だけへ entry を追加する。
-- ledger parent、ledger、lock、fixed temporary file に起動前から symlink、FIFO、socket、device、
-  または期待外の entry がある場合、malformed JSON、schema invalid、lock timeout、build/write/rename
-  failure を含めて fail-close とする。empty ledger への reset、partial JSON の公開、stale lock の
-  自動削除は行わない。
-- atomic replacement は reader が旧 ledger または完全な新 ledger のみを観測することを対象とする。
-  power loss 後の durability、network filesystem、macOS/Windows の locking は保証しない。
-- この境界は cooperating trusted local hook process を対象とする。hostile process が check/open/rename
-  の間に path component を差し替える攻撃は security boundary として主張しない。strict_strace による
-  process attribution は #1363 の handoff であり、本 writer の scope 外である。
-- canonical evidence を最終利用する consumer は、少なくとも一つの launch と、選択された launch の
-  `observed_dispatch` および `correlation` がすべて揃わない場合に fail-close する。
-
-### 型付き ledger 遷移ポリシー（Issue #1502）
-
-`skill_runtime_exec.py` が repo-wide snapshot/status diff を anchor-bound preflight の
-postcondition 判定に使う際、SubAgent 起動 ledger まわりの書き込みは volatile root の
-directory-wide 除外（前述の `_RACE_TOLERANT_UNATTRIBUTABLE_ROOT_RELS`）を使わない。
-`artifacts/`、`artifacts/codex/`、`tmp/` の directory-wide exclusion は禁止のままであり、
-ledger 関連パスは以下の 4 分類のうち後半 2 分類として、exact path 単位・型付き遷移で扱う。
-
-1. **directory roots**（前述の volatile root 分類。ledger とは別カテゴリ、変更なし）。
-2. **stable exact peer file**: `artifacts/codex/subagent-launch-ledger.json`
-   （`skill_runtime_exec.py` の `_LEDGER_STABLE_EXACT_REL`）。owner は
-   `scripts/subagent-launch-ledger-writer.c`。canonical であり、consumer（他 skill /
-   validator）が読む唯一の正本。許可される状態遷移は `absent -> regular` と
-   `regular -> regular` のみ（`_is_allowed_stable_ledger_transition`。厳密な allow-tuple
-   一致で判定し、`before_kind` を問わず `after_kind == "regular"` なら常に許可するような
-   実装は禁止 -- symlink/directory/FIFO/socket/device からの `-> regular` 置換は明示的に
-   拒否する）。delete（`regular -> absent`）、symlink、directory、FIFO、socket、device への
-   置換は、before-kind に関わらずすべて fail-close する。`regular -> regular` はさらに型
-   だけでなく内容も検証する（`_is_authorized_ledger_content_transition`）:
-   before/after 双方が有効な `SUBAGENT_LAUNCH_LEDGER_V1` ドキュメントであること、
-   `ledger_schema` / `generated_by` / `coverage_scope` が不変であること、`launches` /
-   `root_thread_actions` が既存エントリを一切削除・変更しない append-only であることを
-   要求する。malformed content への置換や既存エントリの削除・改変は、型としては
-   `regular -> regular` で authorized でも content 検証で fail-close する。
-3. **transient protocol entries**: `artifacts/codex/subagent-launch-ledger.json.lock` /
-   `.tmp`（`_LEDGER_TRANSIENT_EXACT_RELS`）。owner は同じ native writer。writer 自身の
-   単一呼び出しの間だけ存在する非 canonical な一時プロトコルエントリであり、consumer は
-   これらを直接読まない。executor は子プロセス終了後、bounded quiescence window
-   （既定 2 秒、50ms ポーリング。`_wait_for_ledger_transient_quiescence`）の間だけこれらの
-   消滅を待つ。単発の空 poll だけでは quiescence とみなさず、短い confirm interval
-   （既定 0.1 秒）を空けて再度空であることを確認できた場合のみ成功とする
-   （TOCTOU: 単発 poll と呼び出し元の後続 snapshot 取得の間に late-arriving な
-   lock/tmp が現れるケースを取りこぼさないため）。window 内に確認できずに消えれば無視し、
-   window 経過後もなお残っていれば stale residue として fail-close する
-   （`reason_code=ledger_transient_residue_timeout`）。stale lock/temp を executor が
-   自動削除することはない。
-4. **build/runtime executable artifact**: `check-codex-agents.mjs` の
-   `ensureLedgerWriter()` が invocation ごとに `fs.mkdtempSync` で作る private work
-   directory 配下のコンパイル済みバイナリ。共有・content-addressed な warm cache は
-   廃止した（Issue #1502 REQUEST_CHANGES）: 予測可能なキャッシュパスに他プロセスが
-   先回りで実行ファイルを配置できる TOCTOU / cache poisoning を防ぐため、毎回
-   `os.tmpdir()` が repo 外の絶対パスであることを検証したうえで一意なディレクトリを
-   作成し、読み取り済みの `sourceBytes` をそのディレクトリ内の private source file へ
-   書き出してコンパイルし（`ledgerWriterSource` を pathname で再オープンしない）、
-   子プロセス終了後に private directory ごと削除する。repo snapshot 外にあるため、
-   この分類は `skill_runtime_exec.py` の snapshot/status diff に一切現れない
-   （除外ロジックを必要としない）。
-
-上記 3・4 に属さない `artifacts/codex/` 配下の他ファイル（sibling）は、この型付きポリシーの
-対象外であり、通常の repo-wide snapshot/status diff がそのまま適用される。したがって
-sibling の新規作成・更新・削除・rename は、既存の metadata/status model で観測可能な限り
-引き続き fail-close する（Out of Scope: `artifacts/codex/` の directory-wide exclusion は
-行わない）。symmetric-difference（create/delete）の delta 集合と、既存 path の
-metadata-changed 集合は union で合成する。片方が非空でももう片方の計算をスキップしない
-（mixed delta: ledger の新規作成と既存 sibling の更新が同一 invocation で同時に起きても、
-sibling 側の更新差分を取りこぼさない）。
-
-ledger の ancestor directory node（`artifacts`、`artifacts/codex`）の exemption も
-postcondition だけでなく before-kind を snapshot して判定する。許可される ancestor 遷移は
-`absent -> dir` と `dir -> dir` のみで、shallow から順に判定し、chain 内のどこかで
-不許可な遷移が見つかった時点で、それより深い rel も safe set から除外する（parent が
-symlink や plain file から real directory へ置換された場合、その parent 配下の deeper rel
-単体の before/after だけを見ると `absent -> dir` に見えてしまうため、chain 全体の
-安全性が伝播しないと見逃す）。
-
-**stdlib snapshot mode の保証限界**: 本節の型付き遷移判定は「race-tolerant stdlib mode」
-（前述）の一部であり、mtime/size ベースの metadata 比較を用いる。cooperating/trusted な
-child process 自身による exact-ledger self-write（例えば正規 writer 以外のプロセスが
-同じ内容で ledger を書き戻す byte-preserving update）を完全には attribution できない
-（誰が書いたかを厳密に特定できない）。したがって、内容が変わらない `regular -> regular`
-の byte-preserving update を検出しないことは既知の制限として受容する（本文書の
-content-transition 検証はあくまで「内容が変化した場合」に適用され、無変更の
-byte-preserving update 自体を新たに検出可能にするものではない）。strict な
-process-level attribution（`strace` 等による OS-level trace）は本節の対象外であり、
-`#1363`（Linux-only optional strict trace attribution mode、OPEN）が handoff 先である。
+`scripts/subagent-launch-ledger-writer.c`（trusted local native Codex hook process 用の
+`SUBAGENT_LAUNCH_LEDGER_V1` writer）と、それに付随する `skill_runtime_exec.py` 側の
+typed exact-path 遷移ポリシー（`_LEDGER_STABLE_EXACT_REL` / `_LEDGER_TRANSIENT_EXACT_RELS`
+等）は、唯一の live producer だった `check-codex-agents.mjs` の削除に伴い Issue #2161 で
+DELETE_CHAIN として撤去した（native Codex CLI retirement、parent #2154）。ledger は
+advisory telemetry のみで PASS・承認・merge readiness の証拠として使用禁止という運用方針
+（`.claude/agents/test-runner.md` 等）自体は変更しない。並列実行対応の再設計は必要になった
+時点で別 Issue とする。
 
 ### Codex session manifest の canonical 出力先の外部化（Issue #1546）
 

@@ -150,16 +150,19 @@ class TestSchemaShape:
 
 
 class TestProducer:
-    def test_required_routes_has_six_entries(self, producer):
-        assert len(producer.REQUIRED_ROUTES) == 6
+    def test_required_routes_has_three_entries(self, producer):
+        """Issue #2161: the 3 native Codex CLI (codex_cli) routes were
+        retired along with native Codex CLI; only the 3 claude_code routes
+        remain."""
+        assert len(producer.REQUIRED_ROUTES) == 3
 
     def test_required_routes_are_unique(self, producer):
         keys = {producer._route_key(r) for r in producer.REQUIRED_ROUTES}
-        assert len(keys) == 6
+        assert len(keys) == 3
 
-    def test_required_routes_cover_both_runtimes(self, producer):
+    def test_required_routes_cover_claude_code_runtime(self, producer):
         runtimes = {r["runtime"] for r in producer.REQUIRED_ROUTES}
-        assert runtimes == {"claude_code", "codex_cli"}
+        assert runtimes == {"claude_code"}
 
     def test_required_routes_cover_expected_profiles(self, producer):
         profiles_by_agent: dict[str, set[str]] = {}
@@ -246,7 +249,7 @@ class TestProducer:
             p for p in artifact_paths
             if p.name != "index.json" and not p.name.endswith("-diagnostics.json")
         ]
-        assert len(artifact_paths) == 6
+        assert len(artifact_paths) == 3
         for path in artifact_paths:
             data = json.loads(path.read_text(encoding="utf-8"))
             jsonschema.validate(data, schema)
@@ -256,7 +259,7 @@ class TestProducer:
 
     def test_dry_run_single_route_writes_one_artifact(self, producer, tmp_path):
         rc = producer.main([
-            "--runtime", "codex_cli", "--agent", "web-researcher", "--profile", "grounded_research",
+            "--runtime", "claude_code", "--agent", "web-researcher", "--profile", "grounded_research",
             "--dry-run", "--output-dir", str(tmp_path), "--repo-root", str(REPO_ROOT),
         ])
         assert rc == 0
@@ -268,7 +271,7 @@ class TestProducer:
 
     def test_unknown_route_returns_nonzero(self, producer, tmp_path, capsys):
         rc = producer.main([
-            "--runtime", "codex_cli", "--agent", "codebase-investigator", "--profile", "grounded_research",
+            "--runtime", "claude_code", "--agent", "codebase-investigator", "--profile", "grounded_research",
             "--dry-run", "--output-dir", str(tmp_path), "--repo-root", str(REPO_ROOT),
         ])
         assert rc == 1
@@ -316,13 +319,11 @@ class TestDirectWebToolEventDetection:
         stdout = "\n".join(json.dumps(line) for line in _synthetic_claude_stream_lines())
         assert runtime_smoke.count_direct_web_tool_events("claude", stdout) == 0
 
-    def test_codex_web_search_token_is_counted(self, runtime_smoke):
-        stdout = json.dumps({"item": {"type": "collab_tool_call", "tool": "web_search"}})
-        assert runtime_smoke.count_direct_web_tool_events("codex", stdout) == 1
-
-    def test_codex_unrelated_command_is_not_counted(self, runtime_smoke):
-        stdout = json.dumps({"item": {"type": "collab_tool_call", "command": "ls -la"}})
-        assert runtime_smoke.count_direct_web_tool_events("codex", stdout) == 0
+    # Issue #2161 (native Codex CLI retirement): test_codex_web_search_token_is_counted
+    # and test_codex_unrelated_command_is_not_counted were removed -- they
+    # exercised the Codex-only best-effort token-scan branch
+    # (_CODEX_DIRECT_WEB_TOKEN_RE), which was removed along with the
+    # ``codex`` runtime lane.
 
 
 class TestProducerRouteEvidenceValidation:
@@ -469,28 +470,26 @@ class TestProducerRouteEvidenceValidation:
 
 
 class TestProducerRetryPolicy:
-    """Issue #1886 P0-4 fix_delta: only Codex spawn_not_observed is eligible
-    for a single bounded retry; identity mismatch, validation failure,
-    provider mismatch, and fallback detection are never retried."""
-
-    def test_codex_spawn_not_observed_is_transient_candidate(self, producer):
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
-        assert producer._is_transient_infrastructure_candidate(route, "spawn_not_observed") is True
+    """Issue #1886 P0-4 fix_delta: identity mismatch, validation failure,
+    provider mismatch, and fallback detection are never retried. Issue #2161
+    (native Codex CLI retirement): the former Codex-only spawn_not_observed
+    bounded-retry branch was removed along with the codex_cli route, so
+    spawn_not_observed is now never a transient candidate for any route."""
 
     def test_claude_spawn_not_observed_is_not_transient_candidate(self, producer):
         route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         assert producer._is_transient_infrastructure_candidate(route, "spawn_not_observed") is False
 
     def test_provider_mismatch_is_never_transient_candidate(self, producer):
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         assert producer._is_transient_infrastructure_candidate(route, "provider_mismatch") is False
 
     def test_validation_failed_is_never_transient_candidate(self, producer):
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         assert producer._is_transient_infrastructure_candidate(route, "validation_failed") is False
 
     def test_direct_fallback_invoked_is_never_transient_candidate(self, producer):
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         assert producer._is_transient_infrastructure_candidate(route, "direct_fallback_invoked") is False
 
     def test_validation_failed_without_materialization_diagnostics_is_not_transient(self, producer):
@@ -498,7 +497,7 @@ class TestProducerRetryPolicy:
         that never recorded the artifact-materialization race) must remain
         non-transient -- only adding the new Issue #2015 AC14 diagnostic
         signature below is allowed to change that."""
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         assert producer._is_transient_infrastructure_candidate(route, "validation_failed", None) is False
         assert (
             producer._is_transient_infrastructure_candidate(
@@ -520,23 +519,12 @@ class TestProducerRetryPolicy:
         505d3528): a genuinely-completed child (SubagentStop hook fired)
         whose delegation artifact never materializes even after the bounded
         poll is a genuine async-Task-dispatch infrastructure-timing race,
-        not a validation defect -- eligible for the same bounded single
-        retry as the codex_cli spawn-evidence disk-timing race, on EITHER
-        runtime (reproduced live on claude_code; the underlying async
-        dispatch race is not runtime-specific)."""
+        not a validation defect -- eligible for a bounded single retry
+        (reproduced live on claude_code). Issue #2161: the former
+        codex_cli-only duplicate of this test was removed along with the
+        codex_cli route (the underlying retry-eligibility check is not
+        route-specific)."""
         route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
-        diagnostics = {
-            "secondary_failures": [
-                {"kind": "child_completed_but_artifact_not_materialized"},
-            ],
-        }
-        assert (
-            producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
-            is True
-        )
-
-    def test_codex_child_completed_artifact_not_materialized_is_transient_candidate(self, producer):
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
         diagnostics = {
             "secondary_failures": [
                 {"kind": "child_completed_but_artifact_not_materialized"},
@@ -549,32 +537,33 @@ class TestProducerRetryPolicy:
 
     def test_agy_rate_limited_is_transient_candidate(self, producer):
         """Issue #2015 root-cause finding (live re-run, 2026-08-09, head
-        948759e8): a genuinely-completed, genuinely-spawned codex_cli
-        trial can still fail ``validation_failed`` because the
-        materialized ``delegation_result.json`` itself reports
-        ``ok: false`` with ``failure_class: agy_rate_limited`` -- a
-        real AGY-side ``RESOURCE_EXHAUSTED`` (HTTP 429) quota/rate-limit
-        error observed under concurrent multi-session host load, AFTER a
-        genuinely successful Serena MCP retrieval
+        948759e8): a genuinely-completed, genuinely-spawned trial can still
+        fail ``validation_failed`` because the materialized
+        ``delegation_result.json`` itself reports ``ok: false`` with
+        ``failure_class: agy_rate_limited`` -- a real AGY-side
+        ``RESOURCE_EXHAUSTED`` (HTTP 429) quota/rate-limit error observed
+        under concurrent multi-session host load, AFTER a genuinely
+        successful Serena MCP retrieval
         (``local_asset_retrieval_metadata.retrieval_status: "succeeded"``).
         ``references/failure-class-taxonomy.md``'s AGY provider failure
         class table already documents ``agy_rate_limited`` as
         retryable="yes"; this is retry-eligible at this route-smoke layer
-        too, for either runtime."""
-        for runtime in ("codex_cli", "claude_code"):
-            route = producer._find_route(runtime, "codebase-investigator", "local_asset_research")
-            diagnostics = {
-                "secondary_failures": [
-                    {"kind": "agy_transient_quota_failure", "agy_failure_class": "agy_rate_limited"},
-                ],
-            }
-            assert (
-                producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
-                is True
-            )
+        too. Issue #2161: the former codex_cli/claude_code dual-runtime
+        loop was simplified to the one remaining runtime (the underlying
+        retry-eligibility check is not route-specific)."""
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
+        diagnostics = {
+            "secondary_failures": [
+                {"kind": "agy_transient_quota_failure", "agy_failure_class": "agy_rate_limited"},
+            ],
+        }
+        assert (
+            producer._is_transient_infrastructure_candidate(route, "validation_failed", diagnostics)
+            is True
+        )
 
     def test_agy_capacity_exhausted_is_transient_candidate(self, producer):
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         diagnostics = {
             "secondary_failures": [
                 {"kind": "agy_transient_quota_failure", "agy_failure_class": "agy_capacity_exhausted"},
@@ -594,7 +583,7 @@ class TestProducerRetryPolicy:
         never an unrelated deterministic signal such as ``gemini_invoked``
         (checked, and always wins, ahead of ``delegation_result.json``
         state in ``_run_route_once``)."""
-        route = producer._find_route("codex_cli", "codebase-investigator", "local_asset_research")
+        route = producer._find_route("claude_code", "codebase-investigator", "local_asset_research")
         diagnostics = {
             "secondary_failures": [
                 {"kind": "agy_transient_quota_failure", "agy_failure_class": "agy_rate_limited"},
@@ -968,51 +957,16 @@ class TestClaudeChildAgentTypeIdentityBinding:
         )
         assert identity_verified is True
 
-    def test_codex_identity_verified_when_observed_agent_role_matches(self):
-        """Issue #1886 P0-2 iteration-N fix_delta: live investigation of
-        real Codex rollout logs found the spawned child's own
-        `session_meta.agent_role` field genuinely carries the requested
-        custom agent's role name (see
-        `extract_codex_child_agent_role`) -- this supersedes the prior
-        always-False fail-closed posture (commit 8915af25). Mirrors the
-        Codex `else` branch wiring in
-        run_worktree_agent_runtime_smoke.main()."""
-        observed_agent_type = "codebase-investigator"
-        requested_agent_type = "codebase-investigator"
-        identity_verified = (
-            observed_agent_type is not None
-            and requested_agent_type is not None
-            and observed_agent_type == requested_agent_type
-        )
-        assert identity_verified is True
-
-    def test_codex_identity_not_verified_when_observed_agent_role_mismatches(self):
-        """Adversarial case mirroring the Claude
-        `general-purpose`-vs-`codebase-investigator` test above: an
-        observed `agent_role` that does not match the requested agent
-        type must not be treated as identity verified."""
-        observed_agent_type = "general-purpose"
-        requested_agent_type = "codebase-investigator"
-        identity_verified = (
-            observed_agent_type is not None
-            and requested_agent_type is not None
-            and observed_agent_type == requested_agent_type
-        )
-        assert identity_verified is False
-
-    def test_codex_identity_fails_closed_when_agent_role_absent(self):
-        """If a future Codex CLI version/config ever omits `agent_role`
-        from the child's `session_meta`, `extract_codex_child_agent_role`
-        returns `None` and identity must still fail closed to
-        unverified -- never promoted to True on child-id presence alone."""
-        observed_agent_type = None
-        requested_agent_type = "codebase-investigator"
-        identity_verified = (
-            observed_agent_type is not None
-            and requested_agent_type is not None
-            and observed_agent_type == requested_agent_type
-        )
-        assert identity_verified is False
+    # Issue #2161 (native Codex CLI retirement):
+    # test_codex_identity_verified_when_observed_agent_role_matches and
+    # test_codex_identity_not_verified_when_observed_agent_role_mismatches
+    # were removed as exact duplicates of
+    # test_matching_agent_type_satisfies_identity /
+    # test_general_purpose_child_does_not_satisfy_codebase_investigator_identity
+    # above (same inline identity-verified formula).
+    # test_codex_identity_fails_closed_when_agent_role_absent exercised
+    # extract_codex_child_agent_role(), removed along with the ``codex``
+    # runtime lane.
 
 
 class TestClaudeChildSessionIdFromStdoutStream:
@@ -1075,229 +1029,11 @@ class TestClaudeChildSessionIdFromStdoutStream:
             is None
         )
 
-
-# ---------------------------------------------------------------------------
-# Codex CLI child session id: derivable from a rollout log's own content
-# linkage under --ephemeral, not solely a filename-substring match (Issue
-# #1886 AC7 fix-delta, iteration 7). Merged from
-# test_run_worktree_agent_runtime_smoke_codex_child_session_id.py per
-# fix-delta iteration 8 (Allowed Paths compliance).
-# ---------------------------------------------------------------------------
-
-
-def _write_codex_child_rollout_log(sessions_dir: Path, *, own_id: str, parent_thread_id: str) -> Path:
-    """Shaped after a real, live-observed rollout log written for a spawned
-    Codex CLI sub-agent thread: the file's own id is embedded both in its
-    filename and in the first ``session_meta`` record's ``payload.id``; the
-    spawning parent's own ``thread_id`` is recorded as
-    ``payload.parent_thread_id`` (and duplicated as ``payload.session_id``)
-    -- never in the filename."""
-    day_dir = sessions_dir / "2026" / "08" / "06"
-    day_dir.mkdir(parents=True, exist_ok=True)
-    path = day_dir / f"rollout-2026-08-06T21-51-04-{own_id}.jsonl"
-    lines = [
-        {
-            "timestamp": "2026-08-06T12:51:04.552Z",
-            "type": "session_meta",
-            "payload": {
-                "session_id": parent_thread_id,
-                "id": own_id,
-                "parent_thread_id": parent_thread_id,
-                "cwd": "/home/example/worktree",
-                "thread_source": "subagent",
-                "agent_role": "codebase-investigator",
-            },
-        },
-        {"timestamp": "2026-08-06T12:51:05.000Z", "type": "turn_context", "payload": {}},
-    ]
-    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
-    return path
-
-
-class TestCodexChildSessionIdViaContentLinkedRolloutLog:
-    @pytest.fixture()
-    def fake_home(self, tmp_path: Path) -> Path:
-        home = tmp_path / "home"
-        home.mkdir()
-        return home
-
-    def test_extract_codex_child_session_id_via_content_linked_rollout_log_under_ephemeral(
-        self, runtime_smoke, fake_home: Path, monkeypatch
-    ):
-        """Fallback path (iteration 7 fix): under ``--ephemeral``, no
-        rollout log's *filename* ever contains the parent's own
-        ``thread_id`` -- the child's own rollout log must instead be
-        located by its content-level ``parent_thread_id`` linkage, and the
-        child's own thread id (its ``payload.id``) returned as evidence of
-        a distinct native spawn."""
-        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
-
-        parent_thread_id = "019fd720-2814-7362-b530-cb659cec97f8"
-        child_own_id = "019fd720-9458-7703-b3f0-07aac6e6b350"
-        _write_codex_child_rollout_log(
-            fake_home / ".codex" / "sessions", own_id=child_own_id, parent_thread_id=parent_thread_id
-        )
-
-        child_session_id = runtime_smoke.extract_codex_child_session_id(parent_thread_id)
-        assert child_session_id == child_own_id
-        assert child_session_id != parent_thread_id
-
-    def test_extract_codex_child_session_id_prefers_filename_match_when_present(
-        self, runtime_smoke, fake_home: Path, monkeypatch
-    ):
-        """Primary path (unchanged): if a rollout log's filename directly
-        contains the parent's ``thread_id`` (the parent's own transcript
-        was persisted, e.g. a future non-``--ephemeral`` caller), the
-        existing ``spawn_agent`` function_call/function_call_output parsing
-        must still take precedence over the content-linked fallback."""
-        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
-
-        parent_thread_id = "parent-thread-zzzz"
-        sessions_dir = fake_home / ".codex" / "sessions" / "2026" / "08" / "06"
-        sessions_dir.mkdir(parents=True)
-        parent_log = sessions_dir / f"rollout-2026-08-06T00-00-00-{parent_thread_id}.jsonl"
-        lines = [
-            {
-                "type": "response_item",
-                "payload": {"type": "function_call", "name": "spawn_agent", "call_id": "call_1"},
-            },
-            {
-                "type": "response_item",
-                "payload": {
-                    "type": "function_call_output",
-                    "call_id": "call_1",
-                    "output": json.dumps({"agent_id": "spawned-agent-id-from-tool-output"}),
-                },
-            },
-        ]
-        parent_log.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
-
-        child_session_id = runtime_smoke.extract_codex_child_session_id(parent_thread_id)
-        assert child_session_id == "spawned-agent-id-from-tool-output"
-
-    def test_extract_codex_child_session_id_returns_none_without_any_linkage(
-        self, runtime_smoke, fake_home: Path, monkeypatch
-    ):
-        """Fail-closed: no filename match and no rollout log content links
-        back to the given parent id -> ``None``, never a guess."""
-        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
-
-        _write_codex_child_rollout_log(
-            fake_home / ".codex" / "sessions",
-            own_id="unrelated-child-id",
-            parent_thread_id="some-other-parent-thread-id",
-        )
-
-        assert runtime_smoke.extract_codex_child_session_id("this-parent-id-has-no-match") is None
-
-    def test_extract_codex_child_session_id_returns_none_for_empty_parent_id(
-        self, runtime_smoke, fake_home: Path, monkeypatch
-    ):
-        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
-        assert runtime_smoke.extract_codex_child_session_id(None) is None
-        assert runtime_smoke.extract_codex_child_session_id("") is None
-
-
-class TestCodexChildAgentRoleIdentityEvidence:
-    """Issue #1886 P0-2 iteration-N fix_delta (PR #2005 REQUEST_CHANGES):
-    live investigation of real, local Codex rollout logs (Codex CLI
-    0.146.0, multiple `codebase-investigator`/`web-researcher` routes,
-    2026-08-06/07) found that the spawned child's own rollout log
-    `session_meta` record genuinely carries an `agent_role` field written
-    by the Codex CLI itself -- see `_write_codex_child_rollout_log`, which
-    is shaped after those real logs and already includes this field.
-    These tests cover the new `extract_codex_child_agent_role` extractor
-    that supersedes the prior always-``None``/always-``False`` fail-closed
-    posture (commit 8915af25)."""
-
-    @pytest.fixture()
-    def fake_home(self, tmp_path: Path) -> Path:
-        home = tmp_path / "home"
-        home.mkdir()
-        return home
-
-    def test_extract_codex_child_agent_role_from_content_linked_session_meta(
-        self, runtime_smoke, fake_home: Path, monkeypatch
-    ):
-        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
-
-        parent_thread_id = "019fd720-2814-7362-b530-cb659cec97f8"
-        child_own_id = "019fd720-9458-7703-b3f0-07aac6e6b350"
-        _write_codex_child_rollout_log(
-            fake_home / ".codex" / "sessions", own_id=child_own_id, parent_thread_id=parent_thread_id
-        )
-
-        agent_role = runtime_smoke.extract_codex_child_agent_role(parent_thread_id)
-        assert agent_role == "codebase-investigator"
-
-    def test_extract_codex_child_agent_role_returns_none_without_any_linkage(
-        self, runtime_smoke, fake_home: Path, monkeypatch
-    ):
-        """Fail-closed: no rollout log content links back to the given
-        parent id -> ``None``, never a guess."""
-        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
-
-        _write_codex_child_rollout_log(
-            fake_home / ".codex" / "sessions",
-            own_id="unrelated-child-id",
-            parent_thread_id="some-other-parent-thread-id",
-        )
-
-        assert runtime_smoke.extract_codex_child_agent_role("this-parent-id-has-no-match") is None
-
-    def test_extract_codex_child_agent_role_returns_none_when_field_absent(
-        self, runtime_smoke, fake_home: Path, monkeypatch
-    ):
-        """Fail-closed: a linked child session_meta record that lacks the
-        agent_role field entirely -> ``None``, never a guess (preserves
-        fail-closed posture for a hypothetical Codex CLI version/config
-        that omits this field)."""
-        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
-
-        sessions_dir = fake_home / ".codex" / "sessions" / "2026" / "08" / "06"
-        sessions_dir.mkdir(parents=True)
-        parent_thread_id = "parent-no-agent-role"
-        child_own_id = "child-no-agent-role"
-        path = sessions_dir / f"rollout-2026-08-06T21-51-04-{child_own_id}.jsonl"
-        lines = [
-            {
-                "timestamp": "2026-08-06T12:51:04.552Z",
-                "type": "session_meta",
-                "payload": {
-                    "session_id": parent_thread_id,
-                    "id": child_own_id,
-                    "parent_thread_id": parent_thread_id,
-                    "cwd": "/home/example/worktree",
-                    "thread_source": "subagent",
-                },
-            },
-        ]
-        path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
-
-        assert runtime_smoke.extract_codex_child_agent_role(parent_thread_id) is None
-
-    def test_extract_codex_child_agent_role_returns_none_for_empty_parent_id(
-        self, runtime_smoke, fake_home: Path, monkeypatch
-    ):
-        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
-        assert runtime_smoke.extract_codex_child_agent_role(None) is None
-        assert runtime_smoke.extract_codex_child_agent_role("") is None
-
-    def test_child_session_id_and_agent_role_read_the_same_record(
-        self, runtime_smoke, fake_home: Path, monkeypatch
-    ):
-        """Both extractors must agree on identity for the same spawn --
-        they share `_find_codex_child_session_meta` precisely so the child
-        session id and its identity evidence can never disagree."""
-        monkeypatch.setattr(runtime_smoke.Path, "home", classmethod(lambda cls: fake_home))
-
-        parent_thread_id = "019fd723-shared-parent"
-        child_own_id = "019fd723-shared-child"
-        _write_codex_child_rollout_log(
-            fake_home / ".codex" / "sessions", own_id=child_own_id, parent_thread_id=parent_thread_id
-        )
-
-        assert runtime_smoke.extract_codex_child_session_id(parent_thread_id) == child_own_id
-        assert (
-            runtime_smoke.extract_codex_child_agent_role(parent_thread_id) == "codebase-investigator"
-        )
+# Issue #2161 (native Codex CLI retirement): the Codex CLI child
+# session id / agent role identity evidence tests
+# (TestCodexChildSessionIdViaContentLinkedRolloutLog,
+# TestCodexChildAgentRoleIdentityEvidence) and their
+# _write_codex_child_rollout_log() helper were removed -- they
+# exercised extract_codex_child_session_id() /
+# extract_codex_child_agent_role() / _find_codex_child_session_meta(),
+# all removed along with the ``codex`` runtime lane.

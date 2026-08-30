@@ -144,11 +144,14 @@ def test_given_claude_backend_when_session_present_then_resume_flag_is_materiali
     assert fresh == ["claude", "review"]
 
 
-def test_given_codex_backend_when_session_present_then_resume_subcommand_is_materialized():
-    resumed = transport.build_backend_command(backend="codex", base_argv=["codex", "exec"], session_id="thread-9")
-    assert resumed == ["codex", "exec", "resume", "thread-9"]
-    fresh = transport.build_backend_command(backend="codex", base_argv=["codex", "exec"], session_id=None)
-    assert fresh == ["codex", "exec"]
+def test_given_codex_backend_when_command_built_then_rejected_as_retired():
+    # Issue #2161: the native Codex CLI executable backend ("codex") was
+    # retired -- `codex` is no longer a member of `_KNOWN_BACKENDS`, so
+    # `build_backend_command()` must reject it exactly like any other
+    # unknown backend name, not build a `codex exec resume <id>` argv.
+    assert "codex" not in transport._KNOWN_BACKENDS
+    with pytest.raises(ValueError):
+        transport.build_backend_command(backend="codex", base_argv=["codex", "exec"], session_id="thread-9")
 
 
 def test_given_unknown_backend_when_command_built_then_rejected():

@@ -492,7 +492,11 @@ def test_given_non_claude_runtime_with_require_subagent_causal_evidence_when_par
         extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
     )
     assert result.returncode == 2
-    assert "--require-subagent-causal-evidence requires --runtime claude" in result.stderr
+    # Issue #2161 (native Codex CLI retirement): --runtime codex is no
+    # longer a valid argparse choice at all, so this now surfaces the
+    # argparse-level "invalid choice" rejection instead of the (now
+    # unreachable) --runtime-specific parser.error() check.
+    assert "invalid choice: 'codex'" in result.stderr
     assert not out_dir.exists()
 
 

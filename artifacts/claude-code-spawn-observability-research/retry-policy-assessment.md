@@ -1,9 +1,29 @@
 # retry policy 評価（Issue #2013 AC4）
 
 `scripts/agent-ops/run_agent_provider_route_smoke.py` の
-`_is_transient_infrastructure_candidate()` は現在、`codex_cli` + `spawn_not_observed`
-のみを bounded single retry の対象とし、`claude_code` + `spawn_not_observed` を
-明示的に対象外としている。本文書はこの設計が AC2 の観測データと整合するかを評価する。
+`_is_transient_infrastructure_candidate()` は、`claude_code` + `spawn_not_observed` を
+bounded single retry の対象外としている。本文書はこの設計が AC2 の観測データと整合するかを評価する。
+
+## 更新履歴（Issue #2161: native Codex CLI 撤去に伴う本評価の改訂）
+
+本評価は元々、`_is_transient_infrastructure_candidate()` が `codex_cli` runtime に
+限り `spawn_not_observed` を bounded single retry の対象とし、`claude_code` を
+明示的に除外するという runtime 条件付き設計（当時 native Codex CLI がまだ
+サポートされていた頃の実装形状、具体的には `route["runtime"] == "codex_cli"` を
+条件とする分岐）を評価対象として書かれた。
+
+Issue #2161 で native Codex CLI runtime route が撤去され、それに付随して
+`codex_cli` 固有の `spawn_not_observed` bounded-retry 分岐も
+`_is_transient_infrastructure_candidate()` から削除された。現行の実装は
+runtime に依存せず、`spawn_not_observed` を常に bounded retry の対象外として
+扱う（対象とするのは `agy_transient_quota_failure` /
+`child_completed_but_artifact_not_materialized` という別の secondary-failure
+種別のみであり、いずれも `spawn_not_observed` とは無関係）。
+
+この runtime-independent 化は本評価が下した結論（`keep_excluded` を維持すべき）
+を変更しない。評価対象だった `claude_code` + `spawn_not_observed` の扱いは
+撤去前後で同一（対象外のまま）であり、以下の「観測データ」「評価」「結論」の
+各節は改訂不要である。
 
 ## 機械可読な判定
 

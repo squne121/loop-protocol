@@ -29,7 +29,7 @@ from typing import NamedTuple, Optional
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTATION_PATH = REPO_ROOT / "tests/fixtures/codex-agent-config/expected-runtime-contract.json"
+EXPECTATION_PATH = REPO_ROOT / "tests/fixtures/agent-config/expected-runtime-contract.json"
 
 # stdout budget for compact plan / EVIDENCE lines (AC1).
 STDOUT_BUDGET_BYTES = 2048
@@ -55,7 +55,7 @@ class CoverageTarget(NamedTuple):
     """A coverage target the inventory must account for.
 
     target_type:
-      - "dir":  matched by path prefix (e.g. ".codex/agents/")
+      - "dir":  matched by path prefix (e.g. ".claude/agents/")
       - "file": matched by exact path equality (e.g. a single contract fixture)
     empty_ok: whether it is acceptable for this target to have zero tracked matches.
     """
@@ -97,8 +97,7 @@ OPS_REVIEW_INVENTORY_PROFILE = InventoryProfile(
         ".claude/skills/",
         ".claude/hooks/",
         ".claude/rules/",
-        ".codex/",
-        "tests/fixtures/codex-agent-config/",
+        "tests/fixtures/agent-config/",
     ),
     coverage_targets=(
         CoverageTarget(".claude/agents/", "dir", empty_ok=False),
@@ -106,15 +105,14 @@ OPS_REVIEW_INVENTORY_PROFILE = InventoryProfile(
         CoverageTarget(".claude/hooks/", "dir", empty_ok=False),
         CoverageTarget(".claude/skills/", "dir", empty_ok=False),
         CoverageTarget(".agents/skills/", "dir", empty_ok=False),
-        CoverageTarget(".codex/agents/", "dir", empty_ok=False),
         CoverageTarget(
-            "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+            "tests/fixtures/agent-config/expected-runtime-contract.json",
             "file",
             empty_ok=False,
         ),
     ),
     expected_paths=(
-        "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+        "tests/fixtures/agent-config/expected-runtime-contract.json",
         ".claude/settings.json",
     ),
     critical_surface_source="codex_runtime_contract",
@@ -200,8 +198,8 @@ PLAN_REGISTRY: dict[str, PlanSpec] = {
     "agent-ops-review": PlanSpec(
         task_kind="agent-ops-review",
         must_read=[
-            "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
-            "scripts/check_codex_agent_config.py",
+            "tests/fixtures/agent-config/expected-runtime-contract.json",
+            "scripts/check_claude_codex_agent_parity.py",
         ],
         do_not_read_initial_only=[
             "src/",
@@ -406,12 +404,7 @@ def load_critical_surfaces_from_contract(repo_root: Path) -> list[str]:
 
 
 def classify_path_kind(path: str) -> str:
-    """Classify a tracked path into a metadata kind.
-
-    Order matters: agent definitions under .codex/agents/ and .claude/agents/
-    are classified before the broader .codex/ config bucket so that custom
-    agent definitions are not mis-labelled as generic config (MAJOR 1).
-    """
+    """Classify a tracked path into a metadata kind."""
     if path.startswith(".agents/skills/"):
         return "agent_skill_surface"
     if path.startswith(".claude/skills/"):
@@ -420,13 +413,9 @@ def classify_path_kind(path: str) -> str:
         return "claude_hook"
     if path == ".claude/settings.json":
         return "claude_settings"
-    if path.startswith(".codex/agents/") and path.endswith(".toml"):
-        return "codex_agent_definition"
     if path.startswith(".claude/agents/"):
         return "claude_agent_definition"
-    if path.startswith(".codex/"):
-        return "codex_config"
-    if path.startswith("tests/fixtures/codex-agent-config/"):
+    if path.startswith("tests/fixtures/agent-config/"):
         return "codex_agent_fixture"
     if path.endswith(".toml"):
         return "agent_definition"
@@ -439,7 +428,7 @@ def _coverage_target_matches(target: CoverageTarget, path: str) -> bool:
     """File targets match by exact equality; directory targets by prefix.
 
     This prevents a file target like
-    tests/fixtures/codex-agent-config/expected-runtime-contract.json from being
+    tests/fixtures/agent-config/expected-runtime-contract.json from being
     falsely satisfied by a sibling such as ...expected-runtime-contract.json.bak
     (BLOCKER 5).
     """

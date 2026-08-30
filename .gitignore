@@ -45,8 +45,9 @@ dist-ssr
 .serena/
 # .agents/ 配下: 流用 skill が前提とする rules / shared-agent-skills-governance はリポジトリで管理する
 .agents/skills/nlm-skill/
-# Codex repo-shared skill surface lives under .agents/skills/ and is tracked unless explicitly ignored above.
-# `.codex/skills` は local-only compatibility / symlink 用であり、repo-shared surface としては使わない。
+# repo-shared skill surface lives under .agents/skills/ and is tracked unless explicitly ignored above.
+# Issue #2161（native Codex CLI retirement）以前は `.codex/skills` が local-only compatibility /
+# symlink 用として存在したが、native Codex CLI 撤去に伴い当該ディレクトリごと撤去済み。
 # .claude/ 配下: nlm-skill / worktree / plans 等の一時領域のみ除外
 .claude/skills/nlm-skill/
 # .system/ は ESLint では eslint.config.mjs 側で ignore 済みだが、git status / dirty tree に残り続けるため除外

@@ -65,12 +65,12 @@ def test_real_plan_scope_argv_carries_ignore_and_deselect_flags():
     assert "--ignore=.claude/hooks/tests/test_secret_boundary_contract.py" in argv
 
 
-def test_real_plan_keeps_only_runtime_guard_in_dedicated_codex_lane():
-    """The dedicated codex lane keeps only the runtime guard test isolated."""
-    plan = mod.load_plan(_PLAN_PATH)
-    argv = mod.scope_argv(plan)
-    assert "tests/codex/test_execpolicy_matrix.py" in argv
-    assert "tests/codex/test_local_main_branch_guard.py" not in argv
+# Issue #2161 (native Codex CLI retirement): test_real_plan_keeps_only_runtime_guard_in_dedicated_codex_lane
+# asserted the dedicated codex-execpolicy lane's target isolation
+# (tests/codex/test_execpolicy_matrix.py present / tests/codex/test_local_main_branch_guard.py
+# excluded from the shared scope). The dedicated lane, the matrix test file, and
+# the exclusion were all removed together with native Codex CLI; this test was
+# removed accordingly.
 
 
 # --- run_argv modes ---
@@ -167,8 +167,6 @@ def test_real_plan_serial_lane_has_debounce():
     scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py to
     parallel_exclude to remove a real xdist race: its repo-tree snapshot window can
     be polluted by a concurrent worker running test_summarize_agent_transcript.py.
-    tests/codex/test_scope_rollup_runner_agent_config.py is also serial because
-    its raw adapter-to-capture E2E is parallel-unsafe on the GitHub runner.
     .claude/skills/issue-contract-review/scripts/tests/test_baseline_vc_preflight.py
     was added to parallel_exclude (Issue #1788 PR #1790 CI fixup) because
     test_issue_393_snapshot_fixture_processed's real subprocess call hit its 90s
@@ -250,7 +248,6 @@ def test_real_plan_serial_lane_has_debounce():
         "-n",
         "0",
         "scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py",
-        "tests/codex/test_scope_rollup_runner_agent_config.py",
         ".claude/skills/issue-contract-review/scripts/tests/test_baseline_vc_preflight.py",
         # Issue #2073: scripts/agent-guards/tests/test_skill_runtime_preflight_bytecode_cache.py
         # was formerly in parallel_exclude as a historical mitigation for a
@@ -285,7 +282,6 @@ def test_real_plan_serial_lane_has_debounce():
     par = mod.run_argv(plan, mode="parallel")
     assert not any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
     assert "--ignore=scripts/agent-guards/tests/test_skill_runtime_exec_session_manifest.py" in par
-    assert "--ignore=tests/codex/test_scope_rollup_runner_agent_config.py" in par
 
 
 def test_real_plan_uses_fixed_worker_count():

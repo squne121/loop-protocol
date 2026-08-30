@@ -17,7 +17,10 @@ created: "2026-05-24"
 導入作業のうち権限・secret・外部契約が必要な部分を明確に分離し、
 AI が実行できる準備作業と人間が判断しなければならない操作を区別する。
 
-## Codex CLI Hook Trust（信頼設定）補足
+## Codex CLI Hook Trust（信頼設定）補足（historical: native Codex CLI は Issue #2161 で撤去済み）
+
+native Codex CLI は Issue #2161 で repository から撤去済みであり、以下は撤去前の pilot 手順を
+historical/reference record として残す。
 
 - Codex repo-local hook の canonical config key は `[features].hooks`。旧 `codex_hooks` alias が残っていても、それを唯一の正本として説明しない。
 - `.codex/hooks.json` を validator が pass しても、runtime active hook state と trust state は別途 `/hooks` 等で確認する必要がある。
