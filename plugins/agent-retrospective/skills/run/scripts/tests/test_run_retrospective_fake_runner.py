@@ -41,9 +41,10 @@ import pytest
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 _SCHEMAS_DIR = _SCRIPTS_DIR.parent / "schemas"
 # NOTE: This plugin's run_retrospective.py shares its bare module basename
-# with the unrelated host-repo project Skill at
-# .claude/skills/agent-retrospective/scripts/run_retrospective.py, whose own
-# test suite also imports it as a bare ``run_retrospective`` module. Python's
+# with the unrelated host-repo project Skill's own separate module of the
+# same name (a different file under the main dot-claude-based skill tree,
+# not this plugin), whose own test suite also imports it as a bare
+# ``run_retrospective`` module. Python's
 # ``sys.modules`` cache is process-global and keyed by bare module name, so
 # when both test suites are collected in the SAME pytest process (as CI's
 # unified python-test-core job does), whichever ``import run_retrospective``
