@@ -10,3 +10,4 @@
 | follow-up materialization | `follow-up-materialization.md` | delivery-rollup child materialization や follow-up 起票候補を処理するとき | orchestrator + issue-creator | Step 4.5 / 派生改善候補 sections | title 検索だけで dedupe しない |
 | web research routing | `web-research-routing.md` | external_spec claim があり `WEB_RESEARCH_RESULT_V1` を扱うとき | web-researcher (SubAgent-owned) | Step 1b | retry_count / fallback_query / raw_grounding_state を保持しない |
 | termination policy | `termination-policy.md` | ループ終了条件、needs_second_pass、human escalation を判断するとき | orchestrator | Step 5 / loop end sections | approve 以外を黙って success 扱いしない |
+| native dependency materialization | `dependency-materialization.md` | 確定済み hard dependency を GitHub native `blockedBy` へ materialize/readback するとき | orchestrator + `dependency_materializer.py` | Issue #2435 | body 更新だけを dependency 完了条件にしない |
