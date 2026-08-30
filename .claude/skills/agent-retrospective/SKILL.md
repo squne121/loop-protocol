@@ -270,6 +270,15 @@ human_authorization_receipt/v1:
 - observer/evaluator は leaf SubAgent（`tools` に `Agent`/`Skill` を含まない、nested delegation 禁止）
 - evaluator は observer wave 完了・validated projection 受領前には起動しない
 - raw evidence（stdout/stderr/絶対パス/credential）は `evidence_ref` 以外の形で wire envelope を通過しない
+- Bash を保持する observer（`codebase-investigator`）の git/gh mutation は、`--disallowedTools`（Write/Edit/
+  MultiEdit/NotebookEdit/Agent/Skill の tool 名denyのみで、Bash 自体は対象外）だけでは防げない。
+  `run_cli()` が run-scoped `--settings` ファイル（`write_bash_guard_settings_file`）経由で real
+  `PreToolUse` hook（`retrospective_bash_guard_hook.py`）を注入し、`DelegatedAgentPermissionPolicy
+  .check_bash`（`read_only_investigation_enabled=True`）が実際の tool call 実行前に git/gh の
+  mutating subcommand を拒否する（Issue #2419 -- 修正前は `check_bash` が本番呼び出し経路のどこからも
+  呼ばれない dead code で、observer が Bash 経由の `git merge` を実行し canonical local `main` を
+  破損させる実害が発生した）。agent frontmatter 自身の `hooks:` フィールドは headless `-p` session
+  では発火しない（workspace trust dialog が `-p` では成立しないため）ので、この用途には使わない。
 
 ## Related（関連情報）
 
