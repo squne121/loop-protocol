@@ -85,6 +85,24 @@ def _adapt_legacy_investigation_requirement(ingress: Mapping[str, Any]) -> str:
     return "explicitly_required"
 
 
+def _adapt_precontroller_ingress_to_v1(ingress: Mapping[str, Any]) -> dict[str, Any]:
+    """Create exact V1 input after the named legacy compatibility ingress.
+
+    This remains outside ``main`` deliberately: the public controller accepts
+    exact V1 only. The agent/loop caller invokes this pre-controller mapping
+    before it sends stdin, and the test-only smoke uses it to keep that
+    boundary executable without widening the public protocol.
+    """
+    requirement = _adapt_legacy_investigation_requirement(ingress)
+    adapted = {
+        key: value
+        for key, value in ingress.items()
+        if key != "agy_advisory_native_fallback_allowed"
+    }
+    adapted["agy_investigation_requirement"] = requirement
+    return adapted
+
+
 def _load_producer_module() -> Any:
     path = _REPO_ROOT / ".claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py"
     spec = importlib.util.spec_from_file_location("_agy_canonical_producer", path)
@@ -278,14 +296,14 @@ def _run_fixed_proposal_only_actual_wrapper_smoke(
     actual wrapper, exact readback, and decision core as production.
     """
     return _run_controller(
-        {
+        _adapt_precontroller_ingress_to_v1({
             "schema": "AGY_ADVISORY_INVOCATION_REQUEST_V1",
             "schema_version": 1,
             "mode": "codebase_local_asset",
             "purpose": "Verify the fixed non-mutating advisory fallback smoke.",
             "target_paths": [".claude/agents/codebase-investigator.md"],
             "agy_investigation_requirement": "advisory",
-        },
+        }),
         root=root,
         test_wrapper_env_overlay={"AGY_BIN": fake_agy_bin},
         _test_profile="proposal_only",

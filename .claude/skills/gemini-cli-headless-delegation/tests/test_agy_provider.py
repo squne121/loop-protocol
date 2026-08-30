@@ -1065,6 +1065,20 @@ def test_agy_invocation_attempted_is_false_before_subprocess() -> None:
     assert result["agy_invocation_attempted"] is False
 
 
+def test_agy_invocation_attempted_failure_is_true_after_subprocess_boundary() -> None:
+    def fake_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess:
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True
+        return _make_completed(1, stderr="simulated process failure")
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = rgh.run_delegation(_agy_request())
+
+    assert result["ok"] is False
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] == "operational"
+    assert rgh.canonical_agy_failure_kind(result["failure_class"]) == "operational"
+
+
 def test_agy_invocation_attempted_becomes_true_at_subprocess_boundary() -> None:
     def fake_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess:
         assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True

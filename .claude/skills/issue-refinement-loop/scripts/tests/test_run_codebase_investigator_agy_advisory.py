@@ -255,6 +255,28 @@ def test_legacy_ingress_fails_closed_for_dual_or_type_invalid_inputs(
         controller._adapt_legacy_investigation_requirement(ingress)
 
 
+def test_legacy_ingress_deletes_old_field_before_exact_v1_controller_input() -> None:
+    adapted = controller._adapt_precontroller_ingress_to_v1(
+        {
+            "schema": "AGY_ADVISORY_INVOCATION_REQUEST_V1",
+            "schema_version": 1,
+            "mode": "codebase_local_asset",
+            "purpose": "Inspect target evidence.",
+            "target_paths": ["target.txt"],
+            "agy_advisory_native_fallback_allowed": True,
+        }
+    )
+
+    assert adapted == {
+        "schema": "AGY_ADVISORY_INVOCATION_REQUEST_V1",
+        "schema_version": 1,
+        "mode": "codebase_local_asset",
+        "purpose": "Inspect target evidence.",
+        "target_paths": ["target.txt"],
+        "agy_investigation_requirement": "advisory",
+    }
+
+
 def test_production_wrapper_environment_strips_ambient_agy_bin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -469,3 +491,43 @@ def test_main_emits_exact_paired_success_streams(monkeypatch: pytest.MonkeyPatch
         b'{"schema":"AGY_ADVISORY_SUCCESS_RESULT_V1","schema_version":1,'
         b'"response_text":"exact response"}\n'
     )
+
+
+def test_controller_and_producer_accept_shared_four_mebibyte_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    names: list[str] = []
+    for number in range(4):
+        name = f"maximum-{number}.txt"
+        (tmp_path / name).write_bytes(b"x" * controller._MAX_FILE_BYTES)
+        names.append(name)
+    calls = _install_subprocess_fake(monkeypatch, result=_wrapper_result())
+
+    run = controller._run_controller(_request(target_paths=names, context_paths=[]), root=tmp_path)
+    producer = controller._load_producer_module()
+
+    assert run.decision["status"] == "ok"
+    assert len(calls) == 2
+    assert producer.LOCAL_ASSET_MAX_CONTEXT_BYTES == controller._MAX_FILE_BYTES
+    assert producer.LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES == controller._MAX_TOTAL_BYTES
+    assert producer._validate_agy_local_asset_payload_bounds([tmp_path / name for name in names]) == []
+
+
+def test_controller_rejects_aggregate_over_four_mebibytes_before_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    names: list[str] = []
+    for number in range(4):
+        name = f"maximum-{number}.txt"
+        (tmp_path / name).write_bytes(b"x" * controller._MAX_FILE_BYTES)
+        names.append(name)
+    (tmp_path / "extra.txt").write_bytes(b"x")
+    calls: list[object] = []
+    monkeypatch.setattr(controller.subprocess, "run", lambda *_args, **_kwargs: calls.append(None))
+
+    run = controller._run_controller(
+        _request(target_paths=names + ["extra.txt"], context_paths=[]), root=tmp_path
+    )
+
+    assert run.decision["reason_code"] == "controller_input_invalid"
+    assert calls == []
