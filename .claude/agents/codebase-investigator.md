@@ -100,9 +100,8 @@ controller stdout/stderr から raw wrapper result、temporary path、child diag
 
 1. Graphify prefilter は **任意** 実行であり、必須経路ではない。
 2. **clean worktree の場合のみ** 実行する（dirty worktree では利用しない）。
-3. Graphify で候補を絞り込んだ後も、controller-owned AGY `local_asset_research` と Serena source confirmation を必ず実行する（最終確認経路として省略しない）。
-4. Graphify 起動・実行が失敗した場合は既存の調査経路（AGY local_asset_research）へ fallback し、調査全体を停止させない。
-5. Graphify 単独で finding を確定しない。Graphify の stdout・node ID・community ID・confidence label は候補情報にすぎず、`CODEBASE_INVESTIGATION_RESULT_V1` に載せる最終報告は必ず AGY/Serena の source confirmation を経由する。
+3. Graphify で候補を絞り込んだ後も、既存の AGY local_asset_research（controller-owned route）と Serena source confirmation を必ず実行する（最終確認経路として省略しない）。
+4. Graphify 単独で finding を確定しない。Graphify の stdout・node ID・community ID・confidence label は候補情報にすぎず、`CODEBASE_INVESTIGATION_RESULT_V1` に載せる最終報告は必ず AGY/Serena の source confirmation を経由する。
 
 ## Controller decision と native fallback の判定
 
