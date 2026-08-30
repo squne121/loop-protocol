@@ -528,9 +528,20 @@ def readiness_errors_to_structured_blockers(
     Callers that need to route `human_judgment` distinctly must set the
     top-level `REVIEW_ISSUE_RESULT_V1.failure_class` field instead (see
     `readiness_status_to_failure_class()` and
-    `merge_readiness_into_review_result()`), because
-    `compact_review_result.py` derives `NEXT_ACTION: human_judgment_required`
-    from the top-level `failure_class`, not from any per-blocker field.
+    `merge_readiness_into_review_result()`). This `failure_class` field is
+    NOT read by `compact_review_result.py` / `build_compact_v2()` and does
+    not influence the Compact V2 wire's two-valued `NEXT_ACTION` (`proceed
+    | request_changes`, unchanged since Issue #2054). Instead, the
+    root-owned canonical route (`route_canonical_step2_result()` in
+    `issue-refinement-loop/scripts/run_root_review_pipeline.py`) reads this
+    SAME `merged_review_result.failure_class` directly from the producer's
+    own stdout JSON to decide between the ordinary Step 4 rewrite loop and
+    the `step_5_operator_intervention_required` route (Issue #2397
+    P0-1/P0-2). A prior design iteration had this function's docstring
+    describe `compact_review_result.py` as deriving a
+    `NEXT_ACTION: human_judgment_required` wire value from `failure_class`;
+    that design was proposed and explicitly rejected by the OWNER (Issue
+    #2397 anchor comment P0-3) and is not what this codebase implements.
 
     Entries whose provenance fails `_is_valid_deterministic_evidence()` (e.g.
     `body_sha256` mismatch) are silently dropped rather than emitted as
@@ -553,10 +564,24 @@ def readiness_errors_to_structured_blockers(
 
 def readiness_status_to_failure_class(readiness_status: Optional[str]) -> Optional[str]:
     """Map `ISSUE_CONTRACT_READINESS_RESULT_V1.status` to the top-level
-    `REVIEW_ISSUE_RESULT_V1.failure_class` value that
-    `compact_review_result.py` reads to derive
-    `NEXT_ACTION: human_judgment_required` (Issue #1791 review remediation,
-    Critical #3). Returns `None` for `needs_fix` / `go` / other statuses.
+    `REVIEW_ISSUE_RESULT_V1.failure_class` value (Issue #1791 review
+    remediation, Critical #3). Returns `None` for `needs_fix` / `go` /
+    other statuses.
+
+    This `failure_class` field is NOT read by `compact_review_result.py` /
+    `build_compact_v2()` -- the Compact V2 wire's `NEXT_ACTION` stays the
+    two-valued `proceed | request_changes` contract from Issue #2054,
+    unmodified. Instead, the root-owned canonical route
+    (`route_canonical_step2_result()` in `issue-refinement-loop/scripts/
+    run_root_review_pipeline.py`) reads this SAME `merged_review_result.
+    failure_class` directly from the producer's own stdout JSON to decide
+    between the ordinary Step 4 rewrite loop and the
+    `step_5_operator_intervention_required` route (Issue #2397 P0-1/P0-2).
+    A prior design iteration described this function as feeding a
+    `NEXT_ACTION: human_judgment_required` wire value derived from
+    `failure_class`; that design was proposed and explicitly rejected by
+    the OWNER (Issue #2397 anchor comment P0-3) and is not what this
+    codebase implements.
     """
     if readiness_status == "human_judgment":
         return "contract_readiness_human_judgment"
