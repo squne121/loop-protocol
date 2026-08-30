@@ -417,7 +417,7 @@ def test_root_to_producer_transports_deadline_with_fake_external_clis(tmp_path, 
     # the fixture's separate, explicitly non-exact `calls[]` trace.
     gh_calls = [json.loads(line) for line in call_log_path.read_text(encoding="utf-8").splitlines()]
     assert gh_calls == [
-        ["auth", "status"],
+        ["auth", "status", "--active", "--hostname", "github.com"],
         ["repo", "view", _REPO, "--json", "name"],
         ["api", "--hostname", "github.com", f"repos/{_REPO}", "--jq", "{name}"],
     ]
