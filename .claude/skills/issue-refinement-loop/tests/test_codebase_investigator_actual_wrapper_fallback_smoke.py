@@ -152,6 +152,7 @@ def _stream_result(stdout: str) -> tuple[list[dict[str, Any]], str]:
     return tools, result
 
 
+@pytest.mark.claude_live
 def test_actual_wrapper_fallback_reaches_real_native_sentinel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The test-runner-only smoke preserves exact controller ownership."""
     fake = _write_fake_agy(tmp_path)
