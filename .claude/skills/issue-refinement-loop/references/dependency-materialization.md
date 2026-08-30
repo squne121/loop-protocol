@@ -140,7 +140,7 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/dependency_
   --body-file <path/to/current_issue_body.md>
 ```
 
-exit code: `0` = `proceed`、`2` = `block_retryable`、`1` = `block_persistent`。
+終了コード（exit code）の対応は次のとおりである: `0` は `proceed` を、`2` は `block_retryable` を、`1` は `block_persistent` を、それぞれ意味する。
 
 ## DEPENDENCY_MATERIALIZATION_RESULT_V1
 
