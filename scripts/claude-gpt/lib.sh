@@ -69,6 +69,28 @@ claude_gpt_evidence_dir() {
   printf '%s/.evidence\n' "$script_dir"
 }
 
+# --- Latitude telemetry package identity（Issue #2426）。
+# launcher-owned Latitude Stop hook adapter（scripts/claude-gpt/latitude_hook.py）が
+# 起動する telemetry package の exact pinned identity を一箇所の SSOT で固定する
+# （Design 4節「再現可能な exact identity を一箇所の SSOT で pin する」）。
+# versionless / floating `npx -y @latitude-data/claude-code-telemetry` を新しい
+# canonical production command にしない（docs/dev/secret-policy.md の
+# `activation_denied_if: unpinned_npx` と同じ禁止事項）。
+# docs/dev/secret-policy.md の LATITUDE_DISTRIBUTION_GATE_V1.package_spec /
+# tarball_sha256 プレースホルダはこの値と同期させる（このファイルが正本、
+# secret-policy.md 側は mirror）。
+claude_gpt_latitude_package_name() {
+  printf '@latitude-data/claude-code-telemetry\n'
+}
+
+claude_gpt_latitude_package_version() {
+  printf '0.0.14\n'
+}
+
+claude_gpt_latitude_package_spec() {
+  printf '%s@%s\n' "$(claude_gpt_latitude_package_name)" "$(claude_gpt_latitude_package_version)"
+}
+
 # --- Model alias mapping（Parent #2154 アーキテクチャ決定 E 準拠） ---
 # opus -> gpt-5.6-sol / sonnet -> gpt-5.6-terra（main 推奨） / haiku -> gpt-5.6-luna
 #

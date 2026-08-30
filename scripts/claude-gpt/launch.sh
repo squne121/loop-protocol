@@ -243,6 +243,12 @@ SPARK_AUTH_DIR_TARGET=$(claude_gpt_spark_auth_dir)
 #     する）。 ---
 CLAUDE_ISOLATED_HOME_TARGET=$(claude_gpt_claude_isolated_home_dir)
 CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET="${GH_CONFIG_DIR:-${HOME}/.config/gh}"
+# --- Issue #2426: launcher-owned Latitude Stop hook adapter が読む Native user
+#     settings のパス。isolated HOME 差し替え *前* の ambient 実 HOME を使って
+#     ここで固定する（CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET と同じ理由）。この値
+#     自体は settings.local.json の env フラグメントへ path 文字列としてのみ
+#     baked され、中身（API key 等）は adapter 実行時にのみ読まれる。 ---
+CLAUDE_NATIVE_LATITUDE_SETTINGS_PATH_TARGET="${HOME}/.claude/settings.json"
 CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_config_dir)
 CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_cache_dir)
 
@@ -1174,10 +1180,25 @@ UPS_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GAT
 PTU_HOOK_GROUPS='{"matcher": "Agent", "hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" pre-tool-use-agent"}]}'
 SAS_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" subagent-start"}]}'
 SAP_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" subagent-stop"}]}'
-STOP_HOOK_GROUPS=""
+
+# --- Issue #2426 AC1: launcher-owned Latitude Stop hook group (additive to
+#     whatever else is registered on Stop below -- never a replacement of an
+#     existing Stop hook group). CLAUDE_GPT_LATITUDE_HOOK / _NATIVE_SETTINGS_PATH
+#     / _HOME_ROOT / _PACKAGE_SPEC are baked into ENV_JSON_FRAGMENT below so the
+#     hook command (which runs via a shell) can resolve them. ---
+CLAUDE_GPT_LATITUDE_HOOK="${SCRIPT_DIR}/latitude_hook.py"
+CLAUDE_GPT_LATITUDE_PACKAGE_SPEC=$(claude_gpt_latitude_package_spec)
+LATITUDE_HOOK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_LATITUDE_HOOK\"", "async": true}]}'
+STOP_HOOK_GROUPS="$LATITUDE_HOOK_GROUP"
 STOPFAILURE_HOOK_GROUPS=""
 ENV_JSON_FRAGMENT=",
-  \"env\": {\"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\"}"
+  \"env\": {
+    \"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\",
+    \"CLAUDE_GPT_LATITUDE_HOOK\": \"${CLAUDE_GPT_LATITUDE_HOOK}\",
+    \"CLAUDE_GPT_NATIVE_SETTINGS_PATH\": \"${CLAUDE_NATIVE_LATITUDE_SETTINGS_PATH_TARGET}\",
+    \"CLAUDE_GPT_HOME_ROOT\": \"${CLAUDE_GPT_HOME}\",
+    \"CLAUDE_GPT_LATITUDE_PACKAGE_SPEC\": \"${CLAUDE_GPT_LATITUDE_PACKAGE_SPEC}\"
+  }"
 if [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-start-stop" ]; then
   # Issue #2274 AC17 corrective iteration (hook-time byte-offset causal
   # correlation): this sink used to be a bare `cat` that only echoed the
@@ -1267,7 +1288,11 @@ SPARK_LIFECYCLE_OFFSET_WRITER_EOF
   \"env\": {
     \"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\",
     \"SPARK_LIFECYCLE_OFFSET_LOG_PATH\": \"${SPARK_LIFECYCLE_OFFSET_LOG_PATH}\",
-    \"SPARK_LIFECYCLE_OFFSET_WRITER\": \"${SPARK_LIFECYCLE_OFFSET_WRITER}\"
+    \"SPARK_LIFECYCLE_OFFSET_WRITER\": \"${SPARK_LIFECYCLE_OFFSET_WRITER}\",
+    \"CLAUDE_GPT_LATITUDE_HOOK\": \"${CLAUDE_GPT_LATITUDE_HOOK}\",
+    \"CLAUDE_GPT_NATIVE_SETTINGS_PATH\": \"${CLAUDE_NATIVE_LATITUDE_SETTINGS_PATH_TARGET}\",
+    \"CLAUDE_GPT_HOME_ROOT\": \"${CLAUDE_GPT_HOME}\",
+    \"CLAUDE_GPT_LATITUDE_PACKAGE_SPEC\": \"${CLAUDE_GPT_LATITUDE_PACKAGE_SPEC}\"
   }"
   export SPARK_LIFECYCLE_OFFSET_LOG_PATH SPARK_LIFECYCLE_OFFSET_WRITER
 elif [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "hook-sink-multi-turn" ]; then
@@ -1340,7 +1365,10 @@ HOOK_SINK_WRITER_EOF
   # Stop/StopFailure have no gate equivalent, so they get sink-only groups.
   SINK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}'
   UPS_HOOK_GROUPS="${UPS_HOOK_GROUPS}, ${SINK_GROUP}"
-  STOP_HOOK_GROUPS="${SINK_GROUP}"
+  # Issue #2426 AC1: append (never replace) so the launcher-owned Latitude
+  # Stop hook group set as the default above stays wired even when this
+  # runtime-smoke observation sink is also requested.
+  STOP_HOOK_GROUPS="${STOP_HOOK_GROUPS}, ${SINK_GROUP}"
   STOPFAILURE_HOOK_GROUPS="${SINK_GROUP}"
   SAS_HOOK_GROUPS="${SAS_HOOK_GROUPS}, ${SINK_GROUP}"
   SAP_HOOK_GROUPS="${SAP_HOOK_GROUPS}, ${SINK_GROUP}"
@@ -1355,19 +1383,28 @@ HOOK_SINK_WRITER_EOF
     \"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\",
     \"CLAUDE_GPT_HOOK_SINK_NONCE\": \"${CLAUDE_GPT_HOOK_SINK_NONCE}\",
     \"CLAUDE_GPT_HOOK_SINK_PATH\": \"${CLAUDE_GPT_HOOK_SINK_PATH}\",
-    \"CLAUDE_GPT_HOOK_SINK_WRITER\": \"${CLAUDE_GPT_HOOK_SINK_WRITER}\"
+    \"CLAUDE_GPT_HOOK_SINK_WRITER\": \"${CLAUDE_GPT_HOOK_SINK_WRITER}\",
+    \"CLAUDE_GPT_LATITUDE_HOOK\": \"${CLAUDE_GPT_LATITUDE_HOOK}\",
+    \"CLAUDE_GPT_NATIVE_SETTINGS_PATH\": \"${CLAUDE_NATIVE_LATITUDE_SETTINGS_PATH_TARGET}\",
+    \"CLAUDE_GPT_HOME_ROOT\": \"${CLAUDE_GPT_HOME}\",
+    \"CLAUDE_GPT_LATITUDE_PACKAGE_SPEC\": \"${CLAUDE_GPT_LATITUDE_PACKAGE_SPEC}\"
   }"
   export CLAUDE_GPT_HOOK_SINK_NONCE CLAUDE_GPT_HOOK_SINK_PATH CLAUDE_GPT_HOOK_SINK_WRITER
 fi
 
+# Issue #2426 AC1: "Stop" is now unconditionally present (STOP_HOOK_GROUPS
+# always contains at least the launcher-owned Latitude hook group set as the
+# default above); only "StopFailure" remains conditional on the runtime-smoke
+# hook-sink-multi-turn mode, which has no gate equivalent to always emit.
 HOOKS_JSON_FRAGMENT=',
   "hooks": {
     "UserPromptSubmit": ['"${UPS_HOOK_GROUPS}"'],
     "PreToolUse": ['"${PTU_HOOK_GROUPS}"'],
     "SubagentStart": ['"${SAS_HOOK_GROUPS}"'],
-    "SubagentStop": ['"${SAP_HOOK_GROUPS}"']'"$(
-  if [ -n "$STOP_HOOK_GROUPS" ]; then
-    printf ',\n    "Stop": [%s],\n    "StopFailure": [%s]' "$STOP_HOOK_GROUPS" "$STOPFAILURE_HOOK_GROUPS"
+    "SubagentStop": ['"${SAP_HOOK_GROUPS}"'],
+    "Stop": ['"${STOP_HOOK_GROUPS}"']'"$(
+  if [ -n "$STOPFAILURE_HOOK_GROUPS" ]; then
+    printf ',\n    "StopFailure": [%s]' "$STOPFAILURE_HOOK_GROUPS"
   fi
 )"'
   }'
@@ -1643,6 +1680,12 @@ export XDG_CONFIG_HOME="$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET"
 export XDG_CACHE_HOME="$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"
 unset SSH_AUTH_SOCK
 unset GIT_ASKPASS SSH_ASKPASS GIT_CREDENTIAL_HELPER
+# Issue #2426 Design 5節 / AC5: 明示的に unset する（親シェルの ambient
+# BUN_OPTIONS を Claude-GPT 子プロセスへ継承させない production invariant）。
+# 有効な Latitude preload が ambient に既に存在する場合の enrichment 自体は
+# 許容するが、この unset を production invariant として扱い、preload の有無を
+# AC5 の PASS 根拠にはしない。
+unset BUN_OPTIONS
 
 export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1
 # `auto` は `[1m]` suffix なし model 名の場合に未知 model として context window を

@@ -284,6 +284,47 @@ LATITUDE_PILOT_EXCEPTION_V1:
 > `remote_cleanup_state: machine_verified`、`distribution.*` の各 digest を確定させること。
 > 1 つでも欠落・unknown・不正があれば host verifier は activation を `blocked_until_activation` に固定する。
 
+#### owner-controlled policy supersession（#2426）
+
+`#2426` は、Native Claude Code が既に利用している local Latitude observation
+profile を、同一 project 宛に限り Claude-GPT にも適用する owner-approved local
+operation を対象とする。これは上記 `LATITUDE_PILOT_EXCEPTION_V1.decision:
+approve_synthetic_only` の一般的な意味（synthetic fixture / policy validation
+のみ許可、real trace export 禁止）とは異なる owner 意図に基づくため、
+`approve_synthetic_only` という closed enum の値自体は変更せず、以下の
+owner-controlled policy supersession として明示的に materialize する
+（`approve_timeboxed_real_pilot` への遷移や、旧 real pilot の
+provenance/registry-signature/remote-cleanup harness の復活を意味しない）。
+
+```yaml
+# owner_local_observation_supersession_v1（#2426 由来）
+# LATITUDE_PILOT_EXCEPTION_V1.decision は approve_synthetic_only のまま変更しない。
+owner_local_observation_supersession_v1:
+  supersedes: none
+  scope: claude_gpt_native_latitude_local_observation_only
+  authorized_by: "#2426 owner decision (2026-08-30)"
+  authorizes:
+    - native_claude_code_local_latitude_profile_reuse_by_claude_gpt_launcher
+    - same_project_telemetry_export_to_existing_latitude_project
+  does_not_authorize:
+    - unrestricted_real_pilot
+    - approve_timeboxed_real_pilot_transition
+    - cloud_pilot_activation
+    - legacy_provenance_registry_signature_remote_cleanup_harness_revival
+  retained_constraints:
+    - latitude_api_key_not_in_tracked_file_github_argv_fixture_persisted_evidence
+    - raw_trace_raw_prompt_tool_io_not_published_to_github
+    - latitude_failure_not_a_claude_gpt_workflow_completion_gate
+    - native_claude_settings_not_full_config_authority_for_claude_gpt
+    - claude_gpt_home_config_mcp_plugin_isolation_not_relaxed
+    - issue_2375_pr_2392_schema_and_collection_budget_unchanged
+```
+
+`docs/dev/agent-observation-capability.md` が持つ synthetic-only 契約・
+capability matrix・#1220 A1 gate 既定は本 supersession の対象外であり、変更
+されない（同文書側にも本 Issue のスコープが独立であることを示す参照コメントを
+追加している）。
+
 ### Session recording command surface contract（記録コマンド面の契約）
 
 ```yaml
