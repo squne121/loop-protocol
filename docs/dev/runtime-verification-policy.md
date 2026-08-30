@@ -480,7 +480,9 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
   evidence (`outbound_peer_tools_absent`, `agent_spawn_completion_observed`, `herdr_namespace_isolated`,
   `preexisting_herdr_preserved`) を混同しない。inbound behavior は configured value から推論せず、
   runtime unavailable / nested isolated-Herdr constraint は bounded reason-code SKIP exit 77 として
-  artifact を残し、PASS に読み替えない。
+  artifact を残し、PASS に読み替えない。nested-session policy により fresh isolated launch が
+  拒否された場合は `herdr_isolated_session_unavailable` を記録し、同時に snapshot が
+  利用不能でも SKIP を FAIL へ昇格させない。
 - **SubAgent 実行の causal evidence は hook ID 相関を要求し、marker 文字列出力のみでは不十分とする**（Issue #2183、
   Issue #2174 OWNER REQUEST_CHANGES https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173、
   PR #2214 OWNER レビュー https://github.com/squne121/loop-protocol/pull/2214#issuecomment-5307009937、

@@ -1059,6 +1059,37 @@ exit 0
 """
 
 
+def test_given_nested_herdr_refusal_when_interactive_lane_runs_then_exit77_has_bounded_reason_code(
+    repo_with_worktree, tmp_path
+):
+    """An unavailable isolated session is a SKIP, not a snapshot-preservation
+    failure and never a fallback to an ambient human namespace."""
+    repo, worktree = repo_with_worktree
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    nested_refusal_body = _FAKE_ISOLATED_HERDR_BODY.replace(
+        '  touch "$STATE_DIR/$2.session"\n  sleep 300\n  exit 0',
+        '  printf "%s\\n" "nested herdr is disabled by default" 1>&2\n  exit 1',
+    )
+    _write_fake_exe(fake_bin / "herdr", nested_refusal_body)
+    _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\\n")
+    evidence_json = tmp_path / "interactive-evidence.json"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "interactive",
+        "--prompt-file", str(_prompt_file(tmp_path)), "--output-dir", str(tmp_path / "out"),
+        "--evidence-json", str(evidence_json),
+        fake_bin_dir=fake_bin,
+        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(tmp_path / "herdr-state")},
+    )
+
+    assert result.returncode == 77
+    evidence = json.loads(evidence_json.read_text(encoding="utf-8"))
+    assert evidence["runtime_skip_reason_code"] == "herdr_isolated_session_unavailable"
+    assert evidence["herdr_namespace_isolated"] is None
+    assert evidence["preexisting_herdr_preserved"] is None
+
+
 def test_given_native_interactive_lane_when_herdr_starts_agent_then_fixed_policy_uses_documented_passthrough(
     repo_with_worktree, tmp_path
 ):

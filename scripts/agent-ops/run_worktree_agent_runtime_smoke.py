@@ -5920,6 +5920,12 @@ def main(argv: list[str] | None = None) -> int:
             except HerdrLaneError as exc:
                 errors.append(exc.message)
                 exit_code = EXIT_SKIP if exc.skip else EXIT_FAIL
+                if exc.skip:
+                    # A nested-session refusal is an explicit environment
+                    # constraint, not evidence that an existing namespace was
+                    # mutated. Keep its bounded classification through the
+                    # mandatory snapshot cleanup path below.
+                    schema_summary["runtime_skip_reason_code"] = "herdr_isolated_session_unavailable"
             finally:
                 # Issue #2176 (P0-3): re-snapshot AFTER the isolated lane
                 # (including its own ``finally``-block cleanup above) has
@@ -5962,8 +5968,10 @@ def main(argv: list[str] | None = None) -> int:
                     workspace_snapshot_before, workspace_snapshot_after
                 )
                 schema_summary["herdr_workspace_snapshot_diffs"] = workspace_snapshot_diffs
-                schema_summary["herdr_workspace_snapshot_preserved"] = not workspace_snapshot_diffs
-                if workspace_snapshot_diffs:
+                schema_summary["herdr_workspace_snapshot_preserved"] = (
+                    None if exit_code == EXIT_SKIP else not workspace_snapshot_diffs
+                )
+                if workspace_snapshot_diffs and exit_code != EXIT_SKIP:
                     errors.append(
                         "herdr workspace/agent/focus snapshot not preserved across isolated "
                         f"interactive lane run: {workspace_snapshot_diffs}"
@@ -5996,8 +6004,10 @@ def main(argv: list[str] | None = None) -> int:
             cleanup = evidence.get("cleanup") or {}
             schema_summary["cleanup_attempted"] = cleanup.get("attempted", False)
             schema_summary["cleanup_confirmed_removed"] = cleanup.get("confirmed_removed", False)
-            schema_summary["herdr_namespace_isolated"] = bool(
-                evidence.get("session_name") and cleanup.get("confirmed_removed")
+            schema_summary["herdr_namespace_isolated"] = (
+                None if exit_code == EXIT_SKIP else bool(
+                    evidence.get("session_name") and cleanup.get("confirmed_removed")
+                )
             )
             schema_summary["preexisting_herdr_preserved"] = schema_summary.get(
                 "herdr_workspace_snapshot_preserved"

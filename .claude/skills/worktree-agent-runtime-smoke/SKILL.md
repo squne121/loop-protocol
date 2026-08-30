@@ -85,6 +85,9 @@ namespace は変更しない。
   送信先にしない。
 - Claude-GPT adapter は caller `--settings` を受け取らず、launcher-owned fixed
   runtime-smoke settings channel の同じ policy を使う。SKIP exit 77 は runtime PASS ではない。
+  fresh isolated Herdr launch が nested-session policy で拒否された場合の bounded
+  reason code は `herdr_isolated_session_unavailable` であり、snapshot が利用不能でも
+  SKIP を FAIL に昇格させない。
 
 ## Lane 選択
 
