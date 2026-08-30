@@ -1135,7 +1135,26 @@ STEP_4_5 = "step_4_5"
 STEP_2_5 = "step_2_5"
 STEP_4 = "step_4"
 STEP_5_HUMAN_JUDGMENT_REQUIRED = "step_5_human_judgment_required"
+STEP_5_OPERATOR_INTERVENTION_REQUIRED = "step_5_operator_intervention_required"
 FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE = "fail_closed_environment_or_integrity_failure"
+
+# Issue #2397: the ONLY `failure_class` value that redirects a
+# `needs-fix` + `request_changes` triple away from Step 4 and into
+# `STEP_5_OPERATOR_INTERVENTION_REQUIRED`. This is the exact string
+# `check_issue_contract.readiness_status_to_failure_class()` /
+# `merge_readiness_into_review_result()` already write into
+# `merged_review_result["failure_class"]` on main (no wire change
+# required to observe it here -- see Issue #2397 P0-2).
+#
+# Issue #2397 Scope Delta iteration 3 (OWNER PR #2398 review, 3rd round,
+# P1-3): this constant is the single source of truth for the route-critical
+# known `failure_class` value set `route_canonical_step2_result()` below
+# recognizes. Any OTHER non-empty `failure_class` string (including a
+# future new value not added HERE first) is treated as unrecognized and
+# fails closed (`FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`) rather than
+# silently routing anywhere -- do not duplicate or hardcode this literal
+# string elsewhere; reference this constant instead.
+FAILURE_CLASS_CONTRACT_READINESS_HUMAN_JUDGMENT = "contract_readiness_human_judgment"
 
 
 def route_canonical_step2_result(result: Any) -> str:
@@ -1143,16 +1162,34 @@ def route_canonical_step2_result(result: Any) -> str:
 
     A prior implementation iteration keyed routing off `compact_result.verdict`
     alone (`approve` -> Step 4.5, `needs-fix` -> Step 4), silently ignoring
-    `compact_result.next_action`. That is a functional bug: the existing
-    compact schema (see `review-issue/SKILL.md` "Producer I/O ownership" /
-    Step 2.5 doc) allows a valid `verdict: needs-fix` +
-    `next_action: human_judgment_required` combination (e.g. when the
-    readiness checker's own `failure_class` is
-    `contract_readiness_human_judgment` -- environment/timeout/unknown
-    classification, NOT a body-rewrite-fixable contract defect). Routing that
-    combination into the ordinary rewrite loop (Step 4) as if it were a plain
-    `needs-fix` misclassifies an unresolvable environment condition as a
-    fixable contract defect.
+    `compact_result.next_action`. That is a functional bug: `compact_result`
+    can in principle carry a `verdict: needs-fix` + `next_action:
+    human_judgment_required` shape (the `STEP_5_HUMAN_JUDGMENT_REQUIRED`
+    branch below exists to route that exact triple, kept from Issue #2389
+    for exhaustiveness), so ignoring `next_action` entirely would route it
+    into the ordinary rewrite loop (Step 4) as if it were a plain
+    `needs-fix`.
+
+    IMPORTANT (Issue #2397 P2-1 -- retired design corrected here): an
+    earlier iteration of this docstring, and of `check_issue_contract.py`'s
+    own docstrings, described `compact_review_result.py` / `build_compact_v2()`
+    as DERIVING that `next_action: human_judgment_required` wire value FROM
+    the readiness checker's `failure_class`. That design was proposed,
+    reviewed, and explicitly REJECTED by the OWNER (Issue #2397 anchor
+    comment P0-3): the Compact V2 wire's `NEXT_ACTION` stays the two-valued
+    `proceed | request_changes` contract from Issue #2054, unchanged, and
+    `build_compact_v2()` / `validate_compact_v2()` never read or emit
+    `failure_class` at all. The readiness checker's `contract_readiness_
+    human_judgment` `failure_class` (environment/tool/timeout/unknown-
+    classification, NOT a body-rewrite-fixable contract defect) is instead
+    surfaced to THIS root-owned function directly, by reading
+    `merged_review_result.failure_class` from the SAME producer payload --
+    see the `STEP_5_OPERATOR_INTERVENTION_REQUIRED` branch below (Issue
+    #2397 P0-1/P0-2). The `next_action == "human_judgment_required"` branch
+    immediately below is unrelated to `failure_class` and is never actually
+    populated by the real two-valued wire; it remains only as a defensive,
+    independently-tested terminal case for a `compact_result` shape this
+    function does not otherwise assume is impossible.
 
     This function evaluates the FULL `(status, verdict, next_action)` triple
     -- exactly the outcomes the Issue #2380 / #2389 fix_delta specify -- and
@@ -1176,7 +1213,17 @@ def route_canonical_step2_result(result: Any) -> str:
                closes: the routing table itself, not just prose telling the
                orchestrator to remember to check applicability separately.)
         status == ok + verdict == needs-fix + next_action == request_changes
-            -> Step 4 (`STEP_4`)
+            -> Step 4 (`STEP_4`) by default, UNLESS the SAME payload's
+               verified `merged_review_result.failure_class` is exactly
+               `"contract_readiness_human_judgment"` (Issue #2397), in
+               which case it routes to
+               `STEP_5_OPERATOR_INTERVENTION_REQUIRED` instead (see below).
+               This does NOT touch the compact V2 wire (`next_action`
+               stays the two-valued `proceed | request_changes` contract
+               from Issue #2054) -- `merged_review_result` is the full,
+               already-merged `REVIEW_ISSUE_RESULT_V1` payload this SAME
+               producer call places alongside `compact_result` in its own
+               stdout JSON, not a wire field.
         status == ok + verdict == needs-fix + next_action ==
             human_judgment_required (EXACT triple match only -- Issue #2389
             PR #2391 OWNER review P1-1: a loose match on `next_action` alone
@@ -1184,6 +1231,23 @@ def route_canonical_step2_result(result: Any) -> str:
             `verdict: approve` + `next_action: human_judgment_required`,
             which must fail closed instead, see below)
             -> Step 5 (`STEP_5_HUMAN_JUDGMENT_REQUIRED`)
+        status == ok + verdict == needs-fix + next_action == request_changes
+            + merged_review_result.failure_class ==
+            "contract_readiness_human_judgment" (Issue #2397 P0-1/P0-2):
+            `contract_readiness_human_judgment` marks an environment/tool/
+            timeout/unknown-classification readiness state that a Step 4
+            Issue-body rewrite cannot fix -- it is an operator-intervention
+            condition, not a genuine semantic/owner-ambiguity judgment call
+            (that is what `STEP_5_HUMAN_JUDGMENT_REQUIRED` above is for).
+            When `merged_review_result` is missing, `None`, or its
+            `failure_class` is missing/`None`, this branch falls through to
+            the ordinary `STEP_4` result unchanged (Issue #2397 AC2). When
+            `merged_review_result` is present but not a `Mapping`, or
+            `failure_class` is a non-empty string other than
+            `"contract_readiness_human_judgment"`, this fails closed instead
+            (Issue #2397 AC3) -- an unrecognized/malformed `failure_class`
+            must never be silently treated as an ordinary Step 4 rewrite.
+            -> Step 5 (`STEP_5_OPERATOR_INTERVENTION_REQUIRED`)
         status == input_or_runtime_error (Issue #2389 PR #2391 OWNER review
             P0-2: EVERY `input_or_runtime_error`, known `error_code` or not,
             is routed here -- NOT to `STEP_5_HUMAN_JUDGMENT_REQUIRED` --
@@ -1219,10 +1283,61 @@ def route_canonical_step2_result(result: Any) -> str:
     if status == "ok" and verdict == "approve" and next_action == "proceed":
         return STEP_2_5
     if status == "ok" and verdict == "needs-fix" and next_action == "request_changes":
-        return STEP_4
+        # Issue #2397: within this SAME triple, additionally consult the
+        # verified `merged_review_result.failure_class` this producer
+        # already places alongside `compact_result` in its own output.
+        # This does not touch the compact V2 wire (`next_action` stays
+        # `proceed | request_changes`); it only inspects the full merged
+        # checker result that is already part of `result`.
+        merged_review_result = result.get("merged_review_result")
+        if merged_review_result is None:
+            return STEP_4
+        if not isinstance(merged_review_result, Mapping):
+            return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+        failure_class = merged_review_result.get("failure_class")
+        if failure_class is None:
+            return STEP_4
+        if failure_class == FAILURE_CLASS_CONTRACT_READINESS_HUMAN_JUDGMENT:
+            return STEP_5_OPERATOR_INTERVENTION_REQUIRED
+        return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
     if status == "ok" and verdict == "needs-fix" and next_action == "human_judgment_required":
         return STEP_5_HUMAN_JUDGMENT_REQUIRED
     return FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE
+
+
+def build_canonical_step2_disposition(route: str) -> dict[str, Any]:
+    """Pure helper (Issue #2397 Scope Delta AC12): derive the
+    `canonical_step2_disposition` field from an ALREADY-COMPUTED
+    `route_canonical_step2_result()` return value.
+
+    This is intentionally a second, separate pure function rather than
+    folding the extra fields into `route_canonical_step2_result()` itself:
+    `route_canonical_step2_result()`'s contract is "return exactly one of
+    the known route string constants" (unit-tested directly against those
+    constants across AC1-AC4), and callers other than `_emit_produce_result()`
+    (e.g. `test_canonical_step2_route_wiring.py`) rely on that narrow
+    contract unchanged. `build_canonical_step2_disposition()` takes that
+    SAME route string as its only input and has no I/O of its own.
+
+    Only the `STEP_5_OPERATOR_INTERVENTION_REQUIRED` route is terminal from
+    this disposition's point of view: it carries `terminal: true` plus the
+    fixed `termination_reason` / `termination_cause` pair the orchestrator
+    (`issue-refinement-loop/references/termination-policy.md`) uses to
+    distinguish an operator-intervention stop from an ordinary in-loop route
+    (Step 2.5 / Step 4 / Step 5 human-judgment) or a fail-closed integrity
+    stop. Every other route (including `FAIL_CLOSED_ENVIRONMENT_OR_INTEGRITY_FAILURE`
+    and `STEP_5_HUMAN_JUDGMENT_REQUIRED`, which have their own distinct
+    termination handling elsewhere and are unchanged by this Issue) gets
+    back the route alone, with no additional keys.
+    """
+    if route == STEP_5_OPERATOR_INTERVENTION_REQUIRED:
+        return {
+            "route": route,
+            "terminal": True,
+            "termination_reason": "human_escalation",
+            "termination_cause": "operator_intervention_required",
+        }
+    return {"route": route}
 
 
 def _cmd_run_checker_attempt(args: argparse.Namespace) -> int:
@@ -1282,9 +1397,19 @@ def _emit_produce_result(payload: dict[str, Any]) -> None:
     `payload` is the schema/status/etc. dict a call site would otherwise
     have passed straight to `json.dumps()`; this function does not mutate
     the caller's copy of it in place.
+
+    Issue #2397 Scope Delta AC12: this SAME helper also attaches
+    `canonical_step2_disposition` -- the pure, additive
+    `build_canonical_step2_disposition()` derivation of the
+    `canonical_step2_route` value it just computed above. Deriving it here
+    (rather than only on the success path) keeps both fields governed by
+    the exact same single-exit-point guarantee: no call site can attach one
+    without the other, or forget either.
     """
     payload = dict(payload)
-    payload["canonical_step2_route"] = route_canonical_step2_result(payload)
+    route = route_canonical_step2_result(payload)
+    payload["canonical_step2_route"] = route
+    payload["canonical_step2_disposition"] = build_canonical_step2_disposition(route)
     print(json.dumps(payload))
 
 

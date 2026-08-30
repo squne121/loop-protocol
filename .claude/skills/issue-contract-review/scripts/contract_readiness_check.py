@@ -1093,6 +1093,18 @@ _PREFLIGHT_CATEGORY_TO_READINESS: dict[str, str] = {
     # over the whole repo) is a body-author-fixable VC-scope problem, not an
     # environment/tooling issue -> needs_fix (not human_judgment).
     "broad_search_path_unbounded": "needs_fix",
+    # Issue #2397 Scope Delta (OWNER PR #2398 review P0-1): `command_not_allowed`
+    # (the VC uses a command shape that is not on `baseline_vc_preflight.py`'s
+    # closed static allowlist -- a purely static, pre-execution check, see
+    # `classify_result()`'s early `command_not_allowed` returns) is a
+    # body-author-fixable VC-scope problem, not an environment/tooling issue:
+    # rewriting the VC to use an allowlisted command form resolves it. Before
+    # this entry, `command_not_allowed` was NOT a key here and fell through to
+    # the `human_judgment` default below, which incorrectly routed
+    # `route_canonical_step2_result()` (via `failure_class:
+    # contract_readiness_human_judgment`) to the operator-intervention route
+    # instead of the ordinary Step 4 rewrite loop.
+    "command_not_allowed": "needs_fix",
 }
 
 
