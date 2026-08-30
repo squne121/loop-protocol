@@ -411,10 +411,29 @@ downstream skill（impl-review-loop・implement-issue・issue-contract-review・
 
 **Canonical schema の digest provenance / legacy compatibility metadata**（AC10）: `schemas/issue_execution_decision_v1.schema.json` に additive/optional な `provenance`（`policy_version`・producer/collector provenance・`canonicalization_id`・`digests.{source_manifest_sha256,semantic_decision_sha256,artifact_sha256}`・`legacy_compatibility.{legacy_schema_identifiers,supported_consumer_versions}`）と `migration`（`phase: dual_write | equivalence | dual_read | new_authoritative | legacy_removed`・`legacy_digest`・`new_digest`・`equivalence_result`・`producer_version`・`consumer_capability`）ブロックを追加した。`equivalence` phase の digest 不一致は `validate_issue_execution_decision.validate_migration()` が fail-closed で拒否する（AC13）。legacy `graph.nodes/graph.edges` + `execution.target_state/predecessor_issue_numbers/reason_codes` からの adapter は `validate_issue_execution_decision.adapt_legacy_graph_to_v1()` が実装し、canonical output は常に V1 へ正規化する。詳細は `references/refinement-loop-plan-output.md` の `issue_execution_decision` 節を参照する。
 
+## Native Dependency Materialization（Issue #2435）
+
+hard dependency の SSOT は GitHub native `blockedBy`; body prose は mirror/fallback である。
+trusted human context / trusted anchor / controlled reframe / #2406 confirmed-hard-predecessor の
+いずれの経路で hard dependency が確定した場合でも、native materialization + live readback が
+refinement completion gate である。本文 `## Blocked By` / `Depends On` の更新だけを dependency
+完了条件として扱ってはならない（Issue #2424 の retrospective: 本文には blocker が記載されたが
+native `blocked_by` の live readback は空集合のままだった）。
+
+全ての production lane は、`.claude/skills/issue-refinement-loop/scripts/dependency_materializer.py`
+の `materialize_dependencies()` という単一の共通 dependency-materialization choke point を経由する。
+lane ごとの個別 native relationship writer は作らない。desired predecessor 集合の投影
+（`ISSUE_EXECUTION_DECISION_V1.relations[].relation_type == "depends_on"` /
+`execution.predecessors[]`）、explicit add/remove delta の計算、
+`.claude/skills/edit-issue/scripts/edit_issue_txn.py` の `native_relationships` /
+`issue_relationship.update` controlled executor への委譲、mutation 後の独立した postcondition
+readback 再検証までを扱う。詳細は `references/dependency-materialization.md` を参照する。
+
 ## 参照マップ (Reference Map)
 
 | topic | primary reference |
 |---|---|
+| native dependency materialization | `references/dependency-materialization.md` — `scripts/dependency_materializer.py` |
 | anchor comment schema | `schemas/anchor_comment.schema.json`（Issue #1873: `loop_state.schema.json` から抽出） |
 | loop state field definitions（historical） | `references/loop-state.md` |
 | anchor comment handling | `references/anchor-comment-handling.md` |
