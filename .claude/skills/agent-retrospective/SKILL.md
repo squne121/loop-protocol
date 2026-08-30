@@ -281,7 +281,8 @@ human_authorization_receipt/v1:
   では発火しない（workspace trust dialog が `-p` では成立しないため）ので、この用途には使わない。
   この read-only investigation profile は PR #2425 review fix_delta（#2425#issuecomment-5466916997）で
   3 つの明示 capability の allowlist に再構成されている: (1) canonical AGY builder/wrapper invocation
-  （`build_request.py`/`run_gemini_headless.py` の正規パスへの exact suffix match のみ。それ以外の
+  （`build_request.py`/`run_gemini_headless.py --request-file <path> --output-file <path>` の正規パス
+  への `Path.resolve()` 完全一致（repo-root anchored、PR #2425 review fix_delta round 4）のみ。それ以外の
   `python3`/`uv` 呼び出しはすべて拒否）、(2) native Git read-only subcommand allowlist（`show/log/diff/
   blame/rev-parse/status/cat-file/ls-tree/grep/merge-base` の argv POSITION ベース判定。未列挙 mutation
   はすべて拒否される denylist 逆転設計）、(3) native GitHub `(group, action)` exact pair allowlist +

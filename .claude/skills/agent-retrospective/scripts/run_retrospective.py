@@ -2875,15 +2875,35 @@ _GH_API_METHOD_FLAGS = frozenset({"--method", "-x"})
 #: present.
 _GH_API_DATA_FLAGS = frozenset({"-f", "-F", "--raw-field", "--input"})
 #: canonical AGY delegation scripts (Issue #2419 PR #2425 review fix_delta
-#: P0-1) -- the ONLY `python3`/`uv` invocations this profile allows. Matched
-#: by trailing-path membership (any token in the segment ending with one of
-#: these relative paths), so the profile stays agnostic to the caller's cwd
-#: / absolute-path prefix while still being anchored to the real, in-repo
-#: script identity (never a heredoc, `-c` inline script, or arbitrary
-#: script FILE argument -- those still fail closed below).
+#: P0-1), relative to ``_REPO_ROOT``, that this profile's `python3`/`uv`
+#: capability allows invoking.
+#:
+#: PR #2425 review fix_delta round 4 (P0, decoy-script bypass): a prior
+#: design matched these by raw ``str.endswith()`` trailing-path membership
+#: against the UNRESOLVED token text -- that check is trivially spoofed by
+#: ANY path merely ending with the same trailing directory structure
+#: (verified end-to-end: ``python3
+#: /tmp/evilcopy/.claude/skills/gemini-cli-headless-delegation/scripts/
+#: build_request.py`` was `allow`ed), and never even checked that the
+#: script existed on disk (a NONEXISTENT path with the same trailing
+#: structure was also `allow`ed). ``_AGY_CANONICAL_SCRIPT_ABSOLUTE_PATHS``
+#: below instead holds the real, ``Path.resolve()``d (symlink- and
+#: ``..``-collapsing) absolute path of each canonical script anchored to
+#: this repo's OWN root (``_REPO_ROOT``, derived from this very module's
+#: ``__file__`` the same way the hook script resolves its own location --
+#: see ``retrospective_bash_guard_hook.py``'s
+#: ``sys.path.insert(0, str(Path(__file__).resolve().parent))``), and
+#: ``_is_agy_canonical_script_token`` requires an EXACT membership match
+#: against a token's OWN resolved absolute path -- never a substring/suffix
+#: match against unresolved text.
 _AGY_CANONICAL_SCRIPT_SUFFIXES = (
     ".claude/skills/gemini-cli-headless-delegation/scripts/build_request.py",
     ".claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py",
+)
+#: real, resolved, repo-root-anchored absolute paths backing
+#: ``_is_agy_canonical_script_token``'s exact-match containment check.
+_AGY_CANONICAL_SCRIPT_ABSOLUTE_PATHS = frozenset(
+    (_REPO_ROOT / suffix).resolve() for suffix in _AGY_CANONICAL_SCRIPT_SUFFIXES
 )
 #: head commands that MAY be a canonical AGY delegation invocation -- gated
 #: further by `_AGY_CANONICAL_SCRIPT_SUFFIXES` membership, never trusted
@@ -3048,6 +3068,34 @@ def _find_gh_group_action(tokens: list[str]) -> tuple[str | None, str | None]:
     if idx >= n:
         return group, None
     return group, tokens[idx]
+
+
+def _is_agy_canonical_script_token(tok: str) -> bool:
+    """PR #2425 review fix_delta round 4 (P0, decoy-script bypass): returns
+    ``True`` only when ``tok`` is a real filesystem path that
+    ``Path.resolve()``s (following any symlink and collapsing any ``..``
+    segment -- this covers the "symlink-based impersonation" concern too,
+    since a symlink at/under a decoy path resolving to a canonical script
+    is not itself the canonical script's OWN absolute path, and a symlink
+    planted AT the canonical path pointing elsewhere resolves away from
+    ``_AGY_CANONICAL_SCRIPT_ABSOLUTE_PATHS``) to EXACTLY one of the two
+    canonical AGY delegation scripts' real, ``_REPO_ROOT``-anchored absolute
+    paths.
+
+    ``Path.resolve()`` never requires the path to exist (Python's default
+    ``strict=False``) -- a decoy path is denied not because a stat() call
+    fails, but because its resolved value can never equal a DIFFERENT,
+    real script's own resolved absolute path. This is what makes the
+    check fail closed for BOTH a decoy copy at an attacker-chosen prefix
+    (e.g. ``/tmp/evilcopy/.claude/skills/gemini-cli-headless-delegation/
+    scripts/build_request.py``) and a wholly nonexistent path with the
+    same trailing directory structure -- the prior ``str.endswith()``
+    design allowed both."""
+    try:
+        resolved = Path(tok).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return resolved in _AGY_CANONICAL_SCRIPT_ABSOLUTE_PATHS
 
 
 class DelegatedAgentPermissionPolicy:
@@ -3241,11 +3289,14 @@ class DelegatedAgentPermissionPolicy:
                     )
                 continue
             if head in _AGY_CANONICAL_INVOCATION_HEAD_COMMANDS:
-                # PR #2425 review fix_delta P0-1: the ONLY allowed
-                # `python3`/`uv` use is an exact canonical AGY builder/
-                # wrapper invocation -- everything else (heredoc, `-c`,
-                # arbitrary script FILE argument) stays denied.
-                if any(tok.endswith(_AGY_CANONICAL_SCRIPT_SUFFIXES) for tok in original_tokens):
+                # PR #2425 review fix_delta P0-1 / round 4 (P0,
+                # decoy-script bypass): the ONLY allowed `python3`/`uv` use
+                # is an exact canonical AGY builder/wrapper invocation --
+                # everything else (heredoc, `-c`, arbitrary script FILE
+                # argument, or a decoy/nonexistent path merely ending with
+                # the same trailing directory structure -- see
+                # `_is_agy_canonical_script_token`) stays denied.
+                if any(_is_agy_canonical_script_token(tok) for tok in original_tokens):
                     continue
                 raise PermissionDenied(f"denied_unlisted_command:{head}", command=command)
             if head in _READ_ONLY_INVESTIGATION_HEAD_COMMANDS:

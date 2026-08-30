@@ -216,3 +216,63 @@ def test_bash_guard_hook_allows_canonical_agy_builder_invocation() -> None:
     hook_output = decision["hookSpecificOutput"]
     assert hook_output["hookEventName"] == "PreToolUse"
     assert hook_output["permissionDecision"] == "allow", decision
+
+
+#: real repo root, resolved the exact same way `run_retrospective._REPO_ROOT`
+#: resolves its own (this test file lives 5 directories below repo root:
+#: tests/ -> scripts/ -> agent-retrospective/ -> skills/ -> .claude/).
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+_CANONICAL_BUILD_REQUEST_SUFFIX = ".claude/skills/gemini-cli-headless-delegation/scripts/build_request.py"
+
+
+def test_bash_guard_hook_denies_decoy_agy_script_outside_repo(tmp_path: Path) -> None:
+    """PR #2425 review fix_delta round 4 (P0, decoy-script bypass): a
+    `python3`/`uv` invocation of a script that merely ENDS WITH one of the
+    canonical AGY delegation scripts' relative paths, but is planted
+    OUTSIDE this repository (e.g. an attacker-controlled `/tmp` decoy
+    copy), must be denied -- the prior `str.endswith()`-only design had no
+    filesystem/repo-root anchoring and `allow`ed this exact bypass
+    end-to-end. The decoy file here is a REAL, readable file on disk (an
+    arbitrary `subprocess` call, in a genuine attack) with the identical
+    trailing directory structure as the real canonical script, proving the
+    denial is not merely "the file doesn't exist" -- it is "this is not
+    THIS repo's own canonical script"."""
+    decoy_script = tmp_path / "evilcopy" / _CANONICAL_BUILD_REQUEST_SUFFIX
+    decoy_script.parent.mkdir(parents=True)
+    decoy_script.write_text("import subprocess, sys\nsubprocess.run(['git', 'push', 'origin', 'main'])\n")
+    decision = _run_hook(f"python3 {decoy_script}")
+    hook_output = decision["hookSpecificOutput"]
+    assert hook_output["permissionDecision"] == "deny", decision
+    assert "denied_unlisted_command:python3" in hook_output["permissionDecisionReason"]
+
+
+def test_bash_guard_hook_denies_nonexistent_agy_script_path(tmp_path: Path) -> None:
+    """PR #2425 review fix_delta round 4 (P0, decoy-script bypass): a
+    `python3`/`uv` invocation of a path with the canonical AGY delegation
+    scripts' trailing directory structure that does not exist ANYWHERE on
+    disk must ALSO be denied -- the prior `str.endswith()`-only design
+    never even checked filesystem existence, so a nonexistent path was
+    `allow`ed identically to a real canonical invocation."""
+    nonexistent_script = tmp_path / "does-not-exist" / _CANONICAL_BUILD_REQUEST_SUFFIX
+    assert not nonexistent_script.exists()
+    decision = _run_hook(f"python3 {nonexistent_script}")
+    hook_output = decision["hookSpecificOutput"]
+    assert hook_output["permissionDecision"] == "deny", decision
+    assert "denied_unlisted_command:python3" in hook_output["permissionDecisionReason"]
+
+
+def test_bash_guard_hook_allows_canonical_agy_builder_invocation_absolute_path() -> None:
+    """Regression confirmation for PR #2425 review fix_delta round 4: the
+    REAL, in-repo canonical AGY delegation script, referenced by its own
+    real repo-root-anchored ABSOLUTE path (not merely the relative-path
+    form ``test_bash_guard_hook_allows_canonical_agy_builder_invocation``
+    already covers), must still be allowed after anchoring this capability
+    to `Path.resolve()`d containment instead of `str.endswith()`."""
+    canonical_script = _REPO_ROOT / _CANONICAL_BUILD_REQUEST_SUFFIX
+    assert canonical_script.is_file(), "canonical AGY builder script must exist in this repo"
+    decision = _run_hook(
+        f"python3 {canonical_script} --provider agy --profile local_asset_research "
+        "--objective x --prompt y --output /tmp/out.json"
+    )
+    hook_output = decision["hookSpecificOutput"]
+    assert hook_output["permissionDecision"] == "allow", decision
