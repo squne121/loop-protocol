@@ -591,6 +591,46 @@ parser 本体（`.claude/skills/issue-contract-review/**`）は変更対象に�
 （`publish_audit_comment_best_effort()`）。restart 時は audit comment を authority
 として扱わず、常に fresh review からやり直す。
 
+## Dependency Materialization Gate（終了前必須ゲート、Issue #2435 P0 — OWNER レビュー PR #2447 反映）
+
+`issue-refinement-loop` の Step 5 が `approved` 終了（`LOOP_HANDOFF_RESULT_V1` marker の投稿
+および `publish_termination_report.py` の呼び出し）を行う **前に**、当該サイクルで hard
+dependency が確定していた場合（trusted human context / trusted anchor / controlled reframe /
+#2406 confirmed-hard-predecessor のいずれか）は、以下の gate を必ず実行する。
+
+Issue #2435 は `dependency_materializer.py` の producer/materializer choke point を追加した
+が、当初の実装はこの Step 5 経路のどこからも呼ばれていなかった（OWNER REQUEST_CHANGES,
+https://github.com/squne121/loop-protocol/pull/2447#issuecomment-5468370232 ）。choke point
+自体が存在しても実際の終了経路が一度も呼ばなければ、#2424 型の body-only false-green は merge
+後も再発可能なままだった。本節はその欠落配線を Step 5 手順として確定する。
+
+```bash
+uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/dependency_materializer.py gate \
+  --target-issue <ISSUE_NUMBER> --repo <owner/repo> \
+  --current-decision-file <path/to/current_ISSUE_EXECUTION_DECISION_V1.json> \
+  [--previous-decision-file <path/to/previous_ISSUE_EXECUTION_DECISION_V1.json>] \
+  --body-file <path/to/current_issue_body.md>
+```
+
+`--current-decision-file` は当該サイクルで確定した `ISSUE_EXECUTION_DECISION_V1`（本ファイル
+上部「ISSUE_EXECUTION_DECISION_V1 ハンドオフ契約」節、SKILL.md 参照）をそのまま渡す。
+`--previous-decision-file` はこの loop の前回 iteration で確定した decision snapshot があれば
+渡す（初回確定時は省略してよい）。`TERMINATION_DEPENDENCY_GATE_RESULT_V1` の schema・decision
+定義・body-only false-green との統合は `references/dependency-materialization.md` の
+「Step 5 termination gate」節を SSOT とする。
+
+### Routing（gate の decision に応じた Step 5 分岐）
+
+| `decision` | Step 5 の扱い |
+|---|---|
+| `proceed` | 確定済み hard dependency が存在しない、または native materialization が独立検証済み。通常どおり `approved` 終了（`LOOP_HANDOFF_RESULT_V1` 投稿 + `publish_termination_report.py`）を継続する |
+| `block_retryable` | `auth-or-environment-failure` / `controlled-executor-failure` の一時的障害。bounded retry（gate を再実行）する。この decision 単独を理由に `human_escalation` へは倒さない |
+| `block_persistent` | `readback-mismatch` / `semantic-human-judgment-required` / `native-capability-unavailable`、または body-only false-green の検出。`approved` 終了を投稿してはならない。`termination_reason: human_escalation` / `termination_cause: dependency_materialization_blocked` として停止し、gate の `reason` / `materialization_result.failure_class` / `body_only_reason` を blockers 要約に含める |
+
+`termination_cause: dependency_materialization_blocked` は、上記「scope_signal_guard 停止時の
+termination payload 正規化」節・「`canonical_step2_route: step_5_operator_intervention_required`」
+節のいずれの正規化ルールの対象にもならない、独立した trigger 経路である（本節が単独の SSOT）。
+
 ## Termination Summary Publish Flow（終了サマリー投稿フロー, #1873）
 
 #1873（bounded review loops）で `render_termination_report.py`（`TERMINATION_REPORT_INPUT_V1` ->
