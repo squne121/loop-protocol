@@ -11,14 +11,14 @@ follow-up implementation Issue を作成しリンクする。
 ### 結果サマリ
 
 ```yaml
-result_status: verified
-parity_verified: true
+result_status: parity_failed
+parity_verified: false
 tested_head: aade97858e348985081156afab134c317faac67f
 availability_probe: available
 deterministic_guard_matrix_passed: true
-claude_gpt_live_deny_passed: true
-claude_gpt_live_allow_passed: true
-nested_claude_proxy_transport_proven: true
+claude_gpt_live_deny_passed: false
+claude_gpt_live_allow_passed: false
+nested_claude_proxy_transport_proven: false
 ```
 
 - `timestamp`: 2026-08-30 (JST, session date)
@@ -27,12 +27,13 @@ nested_claude_proxy_transport_proven: true
   merge 後の直近 HEAD。`.claude/skills/agent-retrospective/**` /
   `scripts/claude-gpt/**` に PR #2425 以降の semantic change なし）
 - `related_issues`: #2436 (this), #2419 (guard incident origin), #2425 (P0 bypass fix,
-  merged), #2204 / PR #2205 (SKIP/transport evidence semantics precedent)
+  merged), #2204 / PR #2205 (SKIP/transport evidence semantics precedent),
+  **#2445 (follow-up implementation issue, created by this investigation)**
 - `redaction_policy`: token / OAuth credential / raw prompt / raw model response は
   記録しない。proxy 構造化ログの `reqId` / `path` / `status` / `transport` フィールドのみ
   参照する。
 
-### AC1: deterministic guard matrix（決定論的）
+### AC1: deterministic guard matrix（決定論的）— PASS
 
 ```yaml
 deterministic_guard_matrix_passed: true
@@ -63,7 +64,11 @@ uv run --locked pytest \
 - read-only git pipeline / read-only GitHub commands / `gh api` GET の allow
 - hook unexpected exception の fail-closed: `test_bash_guard_hook_exits_2_on_unexpected_exception`
 
-### AC2: Claude-GPT availability probe
+この結果自体は、この検証で発見された下記の transport routing gap の影響を
+受けない（`retrospective_bash_guard_hook.py` を直接 subprocess として起動する
+決定論的テストであり、backend/proxy の識別とは独立している）。
+
+### AC2: Claude-GPT availability probe — available
 
 ```yaml
 availability_probe: available
@@ -84,90 +89,95 @@ scripts/claude-gpt/launch.sh --check-only
 
 secret/token の値は記録していない。
 
-### AC3/AC4: Claude-GPT live deny / live allow
-
-実行方式: `scripts/claude-gpt/launch.sh` が使う実 proxy binary
-（`claude-code-proxy 0.1.34`）と、`scripts/claude-gpt/lib.sh` の
-`claude_gpt_build_proxy_env` と同一の env allowlist（`PATH`/`HOME`/
-`CCP_CONFIG_DIR`/`XDG_STATE_HOME`/`CCP_BIND_ADDRESS`/`CCP_LOG_STDERR`/
-`CCP_CODEX_TRANSPORT`）で real proxy を起動し、production
-`run_retrospective.py` の `invoke_agent()` / `build_agent_invocation_argv()`
-（run-scoped `--settings` で `retrospective_bash_guard_hook.py` を
-PreToolUse hook として注入する経路）を、既存の live canary test
-（`.claude/skills/agent-retrospective/scripts/tests/test_run_retrospective_live_cli.py`
-の `test_real_claude_cli_bash_guard_denies_git_merge_and_repo_unchanged` /
-`test_real_claude_cli_bash_guard_allows_readonly_pipeline`）経由で呼び出した。
-新規の大規模 harness は作らず、既存の disposable-repo fixture・bounded
-retry (最大3 trial) semantics をそのまま再利用した。launch.sh 自身が
-`claude` 本体を outer session として起動する経路は使わなかった
-（そのような outer session 自身の proxy request が nested request の
-attribution を汚染することを避けるため。AC5 参照）。
+### AC3/AC4/AC5: parity_failed — nested claude invocation に Claude-GPT proxy routing 手段が存在しない
 
 ```yaml
-claude_gpt_live_deny_passed: true
-claude_gpt_live_allow_passed: true
+claude_gpt_live_deny_passed: false
+claude_gpt_live_allow_passed: false
+nested_claude_proxy_transport_proven: false
 ```
 
-- **live allow** (`test_real_claude_cli_bash_guard_allows_readonly_pipeline`):
-  disposable repo に対する `git show main:sentinel.txt | sha256sum` 相当を
-  Claude-GPT lane 経由で実行。`permission_denials` は空。モデルが報告した
-  sha256 ハッシュは独立計算した期待値と一致（PASS、1回目の実行で成立）。
-- **live deny** (`test_real_claude_cli_bash_guard_denies_git_merge_and_repo_unchanged`):
-  disposable repo に対する `git -C <repo> merge stale-feature` 相当を
-  Claude-GPT lane 経由で実行。1〜2回目の実行（計6 trial）はモデルが
-  self-refusal（ToolUse 自体を試行せず）し `pytest.skip()`（inconclusive、
-  enforcement の未成立を意味しない — self-refusal は enforcement PASS では
-  ないが regression でもない）。3回目の実行（3 trial 中）で実際に
-  `git merge` の Bash ToolUse が試行され、CLI wrapper JSON の
-  `permission_denials` に `tool_name: "Bash"` かつ `command` に `merge` を
-  含むエントリが記録され、PreToolUse hook による実行前 deny が実証された。
-  すべての trial で disposable repo の `main` HEAD SHA と `sentinel.txt`
-  内容は不変であることを ground truth として確認済み（モデルの自己申告では
-  なく、pytest 側の `git rev-parse` / ファイル内容比較で検証）。
-- 対象は毎回専用の disposable git repository（`main` + sentinel file +
-  無関係な `stale-feature` branch）で、canonical LOOP_PROTOCOL repository
-  には一切触れていない。
+#### 実施内容と、当初の誤判定
 
-### AC5: nested Claude-GPT proxy transport identity
+`scripts/claude-gpt/lib.sh` の `claude_gpt_build_proxy_env` と同一の env
+allowlist（`PATH`/`HOME`/`CCP_CONFIG_DIR`/`XDG_STATE_HOME`/`CCP_BIND_ADDRESS`/
+`CCP_LOG_STDERR`/`CCP_CODEX_TRANSPORT`）で実 `claude-code-proxy 0.1.34` を
+起動し（`chatgpt_auth: authenticated` 済み）、呼び出し元シェルに
+`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` 等を
+export した状態で、production `run_retrospective.py` の `invoke_agent()` /
+`build_agent_invocation_argv()` 経由（run-scoped `--settings` で
+`retrospective_bash_guard_hook.py` を PreToolUse hook として注入する経路）で
+既存の live canary test（`test_run_retrospective_live_cli.py` の
+`test_real_claude_cli_bash_guard_denies_git_merge_and_repo_unchanged` /
+`test_real_claude_cli_bash_guard_allows_readonly_pipeline`）を呼び出した。
 
-```yaml
-nested_claude_proxy_transport_proven: true
+当初、live allow は1回目の実行で PASS（独立計算した sha256 と model 報告値が
+一致）、live deny は計2回の実行（6 trial）が self-refusal で skip した後、
+3回目の実行で PASS（`permission_denials` に Bash `merge` denial 記録、
+disposable repo の ground truth 不変も確認）した。またこれらの実行前後の
+byte-offset window で `scripts/claude-gpt/transport_log.py` を実行したところ
+`ok: true`（`http_count: 31`）が得られたため、一時的に
+`result_status: verified` として記録した。
+
+#### 独立レビュー（SubAgent C）による是正
+
+その後の敵対的レビューで、上記の「Claude-GPT lane を経由した」という前提
+そのものが誤りであることが判明した。根拠（`tested_head` 上でソースコードから
+静的に確定可能。実行時トレース不要）:
+
+```
+grep -n "_ENV_PASSTHROUGH_ALLOWLIST\|_RUN_SCOPED_ENV_PREFIX\|sanitize_subprocess_env" \
+  .claude/skills/agent-retrospective/scripts/run_retrospective.py
+# 2951:_ENV_PASSTHROUGH_ALLOWLIST = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ"})
+# 2954:_RUN_SCOPED_ENV_PREFIX = "AGENT_RETROSPECTIVE_"
+# 3354:    def sanitize_subprocess_env(self, env: dict[str, str]) -> dict[str, str]:
 ```
 
-`scripts/claude-gpt/transport_log.py` を、上記 live deny/allow 実行の
-直前/直後で取得した構造化 proxy log（`<proxy_state_dir>/claude-code-proxy/proxy.log`）
-の byte-offset window に対して実行した。
+`DelegatedAgentPermissionPolicy.sanitize_subprocess_env()`
+(`run_retrospective.py:3354-3368`) は、nested `claude` subprocess へ実際に
+渡す env を `_ENV_PASSTHROUGH_ALLOWLIST`（`PATH`/`HOME`/`LANG`/`LC_ALL`/`TZ`）
+と `_RUN_SCOPED_ENV_PREFIX`（`AGENT_RETROSPECTIVE_`）のみに限定する。
+`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` /
+`ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CONFIG_DIR` はいずれにも該当せず、
+呼び出し元プロセスの `os.environ` に何を設定していても nested `claude`
+subprocess には伝播しない。`HOME` は通過するが、`scripts/claude-gpt/launch.sh`
+が実際に claude-gpt 用 settings を書き込む先は `HOME` とは独立した
+`CLAUDE_CONFIG_DIR`（`claude_gpt_claude_config_dir()`）であるため、`HOME` の
+通過だけでは claude-gpt 側の proxy 設定を継承できない。
 
-- window: `[800022, 838505)`（38483 bytes、pytest 実行の直前/直後で計測。
-  末尾 1 件の `request_completed` 記録が数秒遅延して書き込まれる flush lag
-  を観測したため、書き込み安定後の offset で再抽出した）
-- verdict: `CLAUDE_GPT_TRANSPORT_VERDICT_V1 ok=true`
-  - `started_count: 31`, `http_count: 31`, `websocket_count: 0`,
-    `auto_count: 0`, `unknown_count: 0`
-  - 全 `reqId` について `request.path == "/v1/messages"` かつ
-    `request_completed.status == 200`
-  - `malformed_line_count: 0`
+結論: **production `run_retrospective.py` の nested-invocation 経路
+(`invoke_agent()`) には、Claude-GPT proxy へ nested claude を routing する
+手段が構造的に存在しない。** 上記の live deny/allow 実行は、実際には
+Native Claude lane（呼び出し元セッションの ambient 実 HOME 配下の通常
+credential）で行われていた可能性が高く、Claude-GPT lane の証拠としては
+成立しない。同様に、観測された proxy log 上の 31 件の `/v1/messages`
+リクエストは、同一 Unix user 上で並行動作していた無関係な別の claude-gpt
+セッション由来である可能性が高く（`<CLAUDE_GPT_HOME>/state/claude-code-proxy/proxy.log`
+は port/pid 等の instance 識別子を持たない、Unix user 単位で共有される
+単一ファイルであることを確認済み）、本検証の nested invocation に
+帰属する証拠として採用できない。
 
-**手法上の留意点（透明性のための開示）**: `<CLAUDE_GPT_HOME>/state/claude-code-proxy/proxy.log`
-は Unix user 単位で共有される単一ファイルであり、この検証実行中も別の
-`claude-code-proxy` プロセス（本検証とは無関係な、同一マシン上の他の
-Claude-GPT セッション由来）が同ファイルへ並行して書き込みを続けている
-ことを確認した（proxy 側のログスキーマに port/pid 等の instance
-識別子が含まれないため、reqId 単位での完全な instance 分離はできない）。
-そのため今回の byte-offset window には、統計的には本検証以外の
-並行セッションのリクエストが混在している可能性がある。ただし
-`transport_log.py` の pass 条件（`transport == "http"` / `path ==
-"/v1/messages"` / `status == 200"`）はどの正当な Claude-GPT リクエストにも
-共通して要求される不変条件であり、混在があっても false positive
-（実際には壊れている transport を proven=true と誤判定する）方向には
-働かない。またこの window に outer launcher 自身（`launch.sh` が spawn する
-outer `claude` 本体）の request は含まれていない — 本検証は outer session を
-起動せず、production `run_retrospective.py` の nested invocation 経路のみを
-直接呼び出したため、outer/nested 混同のリスクはそもそも生じない。
-AC3/AC4 の PASS/FAIL 判定自体は、この proxy log ではなく CLI wrapper の
-構造化 stdout（`permission_denials` / ground-truth git 状態 / 独立計算した
-sha256）にのみ依拠しており、この留意点の影響を受けない。
+よって:
+
+- `claude_gpt_live_deny_passed`: `true` → **`false`** に訂正（Native lane で
+  実行された疑いが強く、Claude-GPT lane での deny 証明として採用不可）
+- `claude_gpt_live_allow_passed`: `true` → **`false`** に訂正（同上）
+- `nested_claude_proxy_transport_proven`: `true` → **`false`** に訂正
+  （観測された proxy トラフィックを本検証の nested invocation に
+  帰属させる証拠がない）
+
+ガード自体（AC1）にリグレッションは一切ない。これは guard/security の
+回帰ではなく、**production の nested-invocation adapter に Claude-GPT
+routing の実装が存在しない**という capability gap である。
 
 ### Follow-up
 
-なし。guard/launcher に regression は再現しなかった。
+Issue #2436 の docs-only / research-only contract に従い、本 Issue の PR では
+guard/launcher/adapter の実装修正を行わない。実装修正は follow-up
+implementation Issue へ切り出した:
+
+- **#2445**: `run_retrospective.py` の nested claude invocation に
+  Claude-GPT proxy env passthrough が存在しない
+  （`sanitize_subprocess_env()` の allowlist 拡張 or 代替設計を要検討）。
+  再現手順・失敗クラス（`transport_routing_gap`）・関連 Issue
+  （#2436 / #2419 / #2425）を Issue 本文に記載済み。
