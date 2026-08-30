@@ -302,7 +302,7 @@ if not EXPECTED_CONFIG_DIR or os.environ.get("GH_CONFIG_DIR") != EXPECTED_CONFIG
     print("missing_or_wrong_config_path", file=sys.stderr)
     raise SystemExit(66)
 if any(
-    os.environ.get(name)
+    name in os.environ
     for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 ):
     print("unexpected_credential_environment", file=sys.stderr)
