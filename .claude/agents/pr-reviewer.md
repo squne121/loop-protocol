@@ -15,14 +15,68 @@ effort: high
 permissionMode: dontAsk
 skills:
   - pr-review-judge
-hooks: {PreToolUse: [{matcher: "Bash", hooks: [
-  {type: command, if: "Bash(git commit *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}, {type: command, if: "Bash(git push *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5},
-  {type: command, if: "Bash(git worktree *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}, {type: command, if: "Bash(gh pr review *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5},
-  {type: command, if: "Bash(gh pr comment *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}, {type: command, if: "Bash(gh pr merge *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5},
-  {type: command, if: "Bash(gh issue edit *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}, {type: command, if: "Bash(gh issue comment *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5},
-  {type: command, if: "Bash(gh issue close *)", command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["deny"], timeout: 5}
-]}], SessionStart: [{hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["observe-identity"], timeout: 5}]}],
-PostToolUse: [{matcher: "Read", hooks: [{type: command, command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py", args: ["observe-reference-read"], timeout: 5}]}]}
+hooks:
+  PreToolUse:
+    - matcher: "Bash"
+      hooks:
+        - type: command
+          if: "Bash(git commit *)"
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["deny"]
+          timeout: 5
+        - type: command
+          if: "Bash(git push *)"
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["deny"]
+          timeout: 5
+        - type: command
+          if: "Bash(git worktree *)"
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["deny"]
+          timeout: 5
+        - type: command
+          if: "Bash(gh pr review *)"
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["deny"]
+          timeout: 5
+        - type: command
+          if: "Bash(gh pr comment *)"
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["deny"]
+          timeout: 5
+        - type: command
+          if: "Bash(gh pr merge *)"
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["deny"]
+          timeout: 5
+        - type: command
+          if: "Bash(gh issue edit *)"
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["deny"]
+          timeout: 5
+        - type: command
+          if: "Bash(gh issue comment *)"
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["deny"]
+          timeout: 5
+        - type: command
+          if: "Bash(gh issue close *)"
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["deny"]
+          timeout: 5
+  SessionStart:
+    - hooks:
+        - type: command
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["observe-identity"]
+          timeout: 5
+  PostToolUse:
+    - matcher: "Read"
+      hooks:
+        - type: command
+          command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/pr_reviewer_guard.py"
+          args: ["observe-reference-read"]
+          timeout: 5
 ---
 
 あなたは LOOP_PROTOCOL の **PR レビューを担当する** SubAgent です。
