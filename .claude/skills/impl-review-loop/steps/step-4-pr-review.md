@@ -71,6 +71,71 @@ uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py s
 
 Codex CLI では `pr-reviewer` custom agent を起動し、root thread は file edit / test 実行 / commit / push / review judgment を直接行わない。
 
+## Discovery-Failure Recovery Routing（agent 定義変更後の delegation 失敗時の回復手順）
+
+SubAgent 定義（`.claude/agents/*.md`）変更後に、その agent への delegation が
+`Agent(subagent_type: "<変更対象>")` の `not found` 等で失敗しても、それを
+即座に停止条件とせず、回復可能な runtime discovery failure（YAML parse
+error、一時的な watch 遅延等の個別具体的原因を含みうる）の可能性を疑う。
+
+### Stage A（bounded live-reload retry、短時間の再試行）
+
+対象の `.claude/agents/` directory が既に session 開始時から存在し、
+`--add-dir` 経由でも `--disable-slash-commands` でもない通常ケースでは、
+agent 定義の変更は数秒以内に自動検出され次の delegation から使われるのが
+公式の正常系である。`not found` が発生した場合、新しい retry framework を
+作らず、短い bounded grace（例: 数秒程度）の後に現在 session で1回だけ
+再 dispatch を試みる。
+
+### Stage B（candidate-head fresh direct invocation、通常の第一候補 recovery）
+
+Stage A で解決しない場合、candidate worktree を cwd とした fresh Claude
+runtime で、対象 agent を `--agent <name>` として直接起動する（既存の
+`worktree-agent-runtime-smoke` の structured lane・`--claude-agent-name
+<name>` route、または `verify_pr_reviewer_permission_boundary.py` と同様の
+`--agents <json>` passthrough route を再利用してよい）。成功条件は
+少なくとも: (i) process/runtime が正常終了する、(ii) candidate-head の
+agent 定義が実際に使用されていることを十分確認できる、(iii) parse 可能な
+canonical verdict／出力契約が返る、(iv) `reviewed_head_sha` 等が
+candidate HEADと一致する、(v) blockers/warnings が canonical contract に
+従う、の5点とする。**ここでは spawned child 用の
+`SubagentStart`/`SubagentStop` / `causal_evidence_source ==
+hook_id_correlated` を成功条件にしない**（`--agent <name>` による
+main-session persona binding では child SubAgent が spawn されないため、
+これを要求すると正常な canonical review を harness の都合で FAIL させて
+しまう）。
+
+### Stage C（delegation/discovery diagnostic、必要な場合のみ）
+
+「Agent tool による child delegation 自体」または「candidate 定義が child
+として discover/spawn できること」を検証する必要がある場合に限り、
+`worktree-agent-runtime-smoke` の structured lane・`--require-min-subagents
+1`・**child 自身が出力する語**を `--expect-marker` に指定し、
+`subagent_causal_evidence.causal_evidence_source == hook_id_correlated`
+かつ `exit_code == 0` を成功条件とする。canonical review 完遂の必須 gate
+にはしない。
+
+Stage B が成功すれば通常の `impl-review-loop` を継続する。Stage C まで
+必要な場合でも自動的に実行可能なら人間を呼ばない。
+
+candidate head が変わった場合、既存の runtime evidence／review は
+**staleとして扱い再取得**する。
+
+Stage A〜C の全てで genuinely recovery 不可能な場合（fresh direct
+invocation でも runtime/parse 失敗が続く等）にのみ、human/operator
+blocker として停止する。
+
+#### `--add-dir` に関する補足
+
+`--add-dir` で追加したディレクトリ内の `.claude/agents/` は discovery
+対象としてロードされるが、**watch されない**ため、追加・編集後は session
+restart が必要である（Stage A の「通常ケース」から除外される具体的理由）。
+本 repository が `--add-dir` を recovery route の第一候補にしない理由は、
+discovery が不可能だからではなく、`${CLAUDE_PROJECT_DIR}` resolution が
+hooks の `${CLAUDE_PROJECT_DIR}` interpolation を壊すためである
+（`scripts/agent-ops/verify_pr_reviewer_permission_boundary.py` 11-38行
+参照）。
+
 ## 委譲呼び出し
 
 ```yaml
