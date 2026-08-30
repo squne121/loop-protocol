@@ -46,6 +46,10 @@ def _run_hook(command: str) -> dict:
         # verify REPO_EVIDENCE_REF_V1 byte content.
         "git show 60926cc926dac80ef72d279005d7daf7eafe5425:README.md | sha256sum",
         "git show 60926cc926dac80ef72d279005d7daf7eafe5425:README.md | head -5 | sha256sum",
+        # uppercase `-C <path>` ("run git in this directory") must remain
+        # distinct from lowercase `-c` (inline config override, denied --
+        # PR #2425 review fix_delta round 2's alias-indirection bypass).
+        "git -C /tmp/some-disposable-repo show HEAD:sentinel.txt",
         "git log --oneline -5",
         "git diff HEAD~1 HEAD",
         "git blame README.md",

@@ -89,6 +89,11 @@ def _run_hook(command: str) -> dict:
         "python3 - <<'EOF'\nimport os\nos.system('git merge stale-feature')\nEOF",
         "uv run python3 script_that_merges.py",
         "uv run --locked python3 script_that_merges.py",
+        # PR #2425 review fix_delta round 2 (2 more real bypasses found in
+        # end-to-end subprocess re-testing).
+        "ls\ngit merge stale-feature",
+        "git -c alias.merge-x=merge merge-x stale-feature",
+        "git --config alias.mx=merge mx stale-feature",
     ],
 )
 def test_bash_guard_hook_denies_mutation(command: str) -> None:

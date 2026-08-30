@@ -2989,29 +2989,55 @@ class DelegatedAgentPermissionPolicy:
 
     def _check_read_only_investigation_command(self, command: str) -> None:
         """Issue #2419: pipeline-aware read-only investigation gate. Splits
-        ``command`` on ``|``/``;``/``&&``/``||`` (never on ``` ` ``` or
-        ``$(`` -- those are denied unconditionally, since a segment-aware
-        parser cannot safely predict what command substitution conjures at
-        runtime) and validates each segment independently. A segment is
-        allowed only if its head command is ``git``/``gh`` with a
-        non-mutating subcommand(+action), or is in
+        ``command`` on ``|``/``;``/``&&``/``||``/newline (never on
+        ``` ` ``` or ``$(`` -- those are denied unconditionally, since a
+        segment-aware parser cannot safely predict what command
+        substitution conjures at runtime) and validates each segment
+        independently. A segment is allowed only if its head command is
+        ``git``/``gh`` with a non-mutating subcommand(+action), or is in
         ``_READ_ONLY_INVESTIGATION_HEAD_COMMANDS`` -- and only if it also
         contains no denied metacharacter, is not a denied standalone
-        command, and is not an inline-exec-flag invocation."""
+        command, and is not an inline-exec-flag invocation.
+
+        PR #2425 review fix_delta (2 more real bypasses found in
+        end-to-end subprocess re-testing, same severity class as Issue
+        #2419's original incident):
+
+        - newline as a command separator: a multi-line Bash tool_use
+          command (real bash treats ``\\n`` exactly like ``;``) was
+          previously NOT split on, so ``shlex.split`` merged an unguarded
+          second line's tokens into the FIRST line's segment -- e.g.
+          ``"ls\\ngit merge x"`` tokenized as one segment headed by
+          ``ls``, hiding the ``git merge`` entirely from inspection.
+        - git config-alias indirection: ``git -c alias.x=merge x
+          <branch>`` renames the ``merge`` subcommand to an arbitrary
+          token that never appears in
+          ``_DENIED_GIT_MUTATING_SUBCOMMANDS``, verified end-to-end to
+          perform a real fast-forward merge while the token-set denylist
+          saw only the alias name. Any inline git config override
+          (``-c``/``--config``) is now denied outright for `git`
+          segments -- it is never needed for read-only investigation, and
+          is a documented indirection vector (aliases, ``core.pager``,
+          hook-adjacent config) no fixed-string subcommand denylist can
+          fully close. (Deliberately checked against the ORIGINAL,
+          not-lowercased tokens: lowercasing would make this
+          indistinguishable from the legitimate uppercase ``-C
+          <path>`` "run git in this directory" flag this profile's own
+          test suite relies on.)"""
         if "`" in command or "$(" in command:
             raise PermissionDenied("denied_bash_metacharacter:command_substitution", command=command)
-        segments = [seg.strip() for seg in re.split(r"\|\||&&|[|;]", command)]
+        segments = [seg.strip() for seg in re.split(r"\|\||&&|[|;\r\n]", command)]
         segments = [seg for seg in segments if seg]
         if not segments:
             raise PermissionDenied("bash_empty", command=command)
         for segment in segments:
             try:
-                tokens = shlex.split(segment)
+                original_tokens = shlex.split(segment)
             except ValueError as exc:
                 raise PermissionDenied(f"bash_unparsable:{exc}", command=command) from exc
-            if not tokens:
+            if not original_tokens:
                 raise PermissionDenied("bash_empty_segment", command=command)
-            lowered = [tok.lower() for tok in tokens]
+            lowered = [tok.lower() for tok in original_tokens]
             token_set = set(lowered)
             if token_set & _DENIED_BASH_METACHAR_TOKENS:
                 raise PermissionDenied("denied_bash_metacharacter", command=command)
@@ -3021,6 +3047,8 @@ class DelegatedAgentPermissionPolicy:
             if (token_set & _DENIED_INLINE_EXEC_INTERPRETERS) and (token_set & _DENIED_INLINE_EXEC_FLAGS):
                 raise PermissionDenied("denied_bash_pattern:inline_exec", command=command)
             if head == "git":
+                if "-c" in original_tokens or "--config" in lowered:
+                    raise PermissionDenied("denied_git_inline_config_override", command=command)
                 # Issue #2419 fix_delta: token-SET membership (not a fixed
                 # `lowered[1]` position) -- a flag inserted before the
                 # subcommand (`git -C . commit -m x`) must not bypass this
