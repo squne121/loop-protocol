@@ -9,7 +9,10 @@ hermetic runtime smoke。
 - AC4: legacy `Write(<spark-auth>/**) is not matched by file permission checks`
   相当の warning が発生しないこと
 - AC5: canonical `Edit(<spark-auth>/**)` deny が spark-auth 配下への実 file
-  edit を実 tool boundary（Edit tool 呼び出し）で拒否すること
+  作成を実 tool boundary（Write tool による新規ファイル作成）で拒否すること
+  （既存ファイルへの Edit tool 呼び出しは Read(path) deny によっても
+  ブロックされるため Edit(...) deny 自体の効果を証明できない -- PR #2458
+  review, P0 参照）
 
 を確認する。static fixture / string grep のみを PASS 根拠にしない
 （`docs/dev/runtime-verification-policy.md` Runtime Verification
@@ -61,6 +64,19 @@ pytestmark = pytest.mark.skipif(
     reason="SKIP: claude CLI not available in test environment (AC4/AC5 runtime smoke prerequisite)",
 )
 
+# P2 follow-up (PR #2458 review): include `claude --version` in failure
+# evidence so a future upstream permission-matcher regression can be
+# triaged against a known binary version. Guarded by `REAL_CLAUDE_BIN is
+# None` since module-level code still executes even when pytestmark skips
+# the individual test functions.
+CLAUDE_VERSION = (
+    subprocess.run(
+        [REAL_CLAUDE_BIN, "--version"], capture_output=True, text=True, timeout=10
+    ).stdout.strip()
+    if REAL_CLAUDE_BIN is not None
+    else "unknown (claude CLI not available)"
+)
+
 
 def _run_claude_print(
     settings_path: Path,
@@ -69,19 +85,30 @@ def _run_claude_print(
     permission_mode: str = "default",
     timeout: float = 60.0,
     cwd: Path | None = None,
+    tools: str | None = None,
 ) -> subprocess.CompletedProcess:
+    # `--setting-sources ""` makes the invocation hermetic: only `--settings
+    # <generated-settings>` is honored and ambient user/project/local
+    # settings files are never consulted, even if they happen to exist on
+    # the host running this test (P1 follow-up, PR #2458 review).
+    cmd = [
+        REAL_CLAUDE_BIN,
+        "--settings",
+        str(settings_path),
+        "--setting-sources",
+        "",
+        "--permission-mode",
+        permission_mode,
+    ]
+    if tools is not None:
+        # AC5 restricts the built-in tool set to `Write` only, so the
+        # smoke test proves the canonical `Edit(...)` deny blocks the
+        # `Write` tool specifically (not merely that some other tool
+        # failed to run).
+        cmd += ["--tools", tools]
+    cmd += ["-p", prompt, "--output-format", "text"]
     return subprocess.run(
-        [
-            REAL_CLAUDE_BIN,
-            "--settings",
-            str(settings_path),
-            "--permission-mode",
-            permission_mode,
-            "-p",
-            prompt,
-            "--output-format",
-            "text",
-        ],
+        cmd,
         cwd=str(cwd) if cwd is not None else None,
         capture_output=True,
         text=True,
@@ -101,7 +128,7 @@ def test_no_legacy_write_deny_warning_with_generated_canonical_settings(tmp_path
 
     proc = _run_claude_print(settings_path, "Reply with exactly one word: OK")
     combined = proc.stdout + proc.stderr
-    assert LEGACY_WARNING_SNIPPET not in combined, combined
+    assert LEGACY_WARNING_SNIPPET not in combined, f"claude --version: {CLAUDE_VERSION}\n{combined}"
 
 
 def test_synthetic_legacy_write_only_rule_reproduces_warning_negative_control(tmp_path):
@@ -130,19 +157,31 @@ def test_synthetic_legacy_write_only_rule_reproduces_warning_negative_control(tm
 
     proc = _run_claude_print(settings_path, "Reply with exactly one word: OK")
     combined = proc.stdout + proc.stderr
-    assert LEGACY_WARNING_SNIPPET in combined, combined
+    assert LEGACY_WARNING_SNIPPET in combined, f"claude --version: {CLAUDE_VERSION}\n{combined}"
 
 
-def test_canonical_edit_deny_blocks_spark_auth_file_edit_at_tool_boundary(tmp_path):
+def test_canonical_edit_deny_blocks_spark_auth_new_file_write_at_tool_boundary(tmp_path):
     """GIVEN launch.sh --check-only が生成した canonical Edit(...) deny を含む
-    settings と、test-owned spark-auth dir 配下の canary file、対照用の control
-    file
-    WHEN --permission-mode acceptEdits（明示 deny 以外の Edit tool 呼び出しは
-    自動承認される）で、両ファイルへの Edit を実 claude CLI に指示する
-    THEN spark-auth 配下の canary file は実際には変更されない（canonical
-    Edit(...) deny が実 tool boundary で拒否する）一方、control file は変更
-    される（acceptEdits 自体は機能しており、本テストが false-negative でない
-    ことの positive control）(AC5: config の文字列検査だけを PASS としない)
+    settings と、spark-auth 配下にまだ存在しない新規ファイルパス、対照用の
+    spark-auth 外の新規ファイルパス
+    WHEN --permission-mode acceptEdits（明示 deny 以外の file-editing tool
+    呼び出しは自動承認される）・--tools "Write"（built-in tool を Write のみに
+    絞る）で、両パスへの新規ファイル作成を Write tool で実 claude CLI に指示する
+    THEN spark-auth 配下の新規ファイルは実際には作成されない一方、spark-auth 外
+    の control file は Write tool で新規作成される（acceptEdits + Write tool
+    自体は機能しており、本テストが false-negative でないことの positive
+    control）(AC5: config の文字列検査だけを PASS としない)
+
+    既存ファイルの Edit ではなく未作成ファイルへの Write を使う理由（PR #2458
+    review, P0）: Claude Code の公式仕様では Read(path) deny も同じパスへの
+    Edit tool 呼び出しをブロックするが、Write/NotebookEdit はブロックしない。
+    今回生成される settings は spark-auth に対して Read(...) と Edit(...) の
+    両方の deny を持つため、既存ファイルへの Edit tool 呼び出しを検証対象に
+    すると、たとえ Edit(...) deny 自体を意図的に外しても Read(...) deny だけで
+    ブロックされてしまい、証明すべき Edit(...) deny の効果を証明できない
+    （false PASS しうる）。Write tool による新規ファイル作成は Read(path) deny
+    ではブロックされず、Edit(path) deny によってのみブロックされるため、
+    Edit(...) deny 自体の効果を直接証明できる。
     """
     result, settings_path = run_check_only(tmp_path)
     assert settings_path.exists(), result.stderr
@@ -154,29 +193,35 @@ def test_canonical_edit_deny_blocks_spark_auth_file_edit_at_tool_boundary(tmp_pa
     spark_auth_dir = claude_gpt_home / "spark-auth"
     assert spark_auth_dir.is_dir(), "launch.sh must have created SPARK_AUTH_DIR_TARGET"
 
-    canary_path = spark_auth_dir / f"canary-{uuid.uuid4().hex}.txt"
-    canary_path.write_text("ORIGINAL_CANARY\n", encoding="utf-8")
+    blocked_path = spark_auth_dir / f"blocked-{uuid.uuid4().hex}.txt"
+    assert not blocked_path.exists(), "blocked_path must not pre-exist (Write = new-file creation)"
 
-    control_path = tmp_path / f"control-{uuid.uuid4().hex}.txt"
-    control_path.write_text("ORIGINAL_CONTROL\n", encoding="utf-8")
+    control_path = tmp_path / f"allowed-{uuid.uuid4().hex}.txt"
+    assert not control_path.exists(), "control_path must not pre-exist (Write = new-file creation)"
 
     prompt = (
-        f"Use the Edit tool to replace the text ORIGINAL_CANARY with MODIFIED_CANARY "
-        f"in the file {canary_path}. Then use the Edit tool to replace the text "
-        f"ORIGINAL_CONTROL with MODIFIED_CONTROL in the file {control_path}. "
-        "Attempt both edits even if one fails; do not ask for confirmation; "
-        "report the outcome of each attempt."
+        f"Use the Write tool to create a new file at {blocked_path} with the exact "
+        f"content BLOCKED_CONTENT. Then use the Write tool to create a new file at "
+        f"{control_path} with the exact content ALLOWED_CONTENT. Attempt both writes "
+        "even if one fails; do not ask for confirmation; report the outcome of each "
+        "attempt."
     )
     proc = _run_claude_print(
-        settings_path, prompt, permission_mode="acceptEdits", timeout=90.0, cwd=tmp_path
+        settings_path,
+        prompt,
+        permission_mode="acceptEdits",
+        timeout=90.0,
+        cwd=tmp_path,
+        tools="Write",
     )
-    transcript = f"claude stdout:\n{proc.stdout}\nclaude stderr:\n{proc.stderr}"
+    transcript = f"claude --version: {CLAUDE_VERSION}\nclaude stdout:\n{proc.stdout}\nclaude stderr:\n{proc.stderr}"
 
-    assert canary_path.read_text(encoding="utf-8") == "ORIGINAL_CANARY\n", (
-        "spark-auth canary file must remain unmodified -- canonical Edit(...) deny "
-        f"must block the edit at the real tool boundary.\n{transcript}"
+    assert not blocked_path.exists(), (
+        "spark-auth new file must not be created -- canonical Edit(...) deny must "
+        f"block the Write tool at the real tool boundary.\n{transcript}"
     )
-    assert control_path.read_text(encoding="utf-8") == "MODIFIED_CONTROL\n", (
-        "control file must be modified by acceptEdits -- otherwise this is not a "
-        f"valid positive control proving the Edit tool boundary was actually exercised.\n{transcript}"
+    assert control_path.exists() and "ALLOWED_CONTENT" in control_path.read_text(encoding="utf-8"), (
+        "control file outside spark-auth must be created by the Write tool under "
+        f"acceptEdits -- otherwise this is not a valid positive control proving the "
+        f"Write tool boundary was actually exercised.\n{transcript}"
     )

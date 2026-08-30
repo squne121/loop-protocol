@@ -38,21 +38,43 @@ def _spark_auth_write_or_edit_entries(settings: dict) -> list[str]:
     ]
 
 
+def _expected_canonical_edit_entry(settings_path: Path) -> str:
+    """Exact expected canonical deny entry for the test-owned spark-auth dir.
+
+    `settings_path == <CLAUDE_GPT_HOME>/claude/settings.local.json`
+    (`_latitude_check_only_helper.run_check_only`), so
+    `settings_path.parent.parent == <CLAUDE_GPT_HOME>` and
+    `<CLAUDE_GPT_HOME>/spark-auth == SPARK_AUTH_DIR_TARGET`
+    (`scripts/claude-gpt/lib.sh::claude_gpt_spark_auth_dir`).
+
+    The value is built from a test-owned absolute path rather than hard-coded
+    so that assertions can compare the *entire* array with `==` (PR #2458
+    review, P1): a bare `startswith("Edit(")` or `str(tmp_path) in deny_path`
+    check does not pin the canonical absolute-path grammar
+    (`Edit(//absolute/**)` -- a leading `/` before the already-absolute
+    `${SPARK_AUTH_DIR_TARGET}` yields a double slash; a single `/` would not
+    be filesystem-absolute) and would silently pass even if the generated
+    value regressed to a single-slash form.
+    """
+    spark_auth_dir = settings_path.parent.parent / "spark-auth"
+    return f"Edit(/{spark_auth_dir}/**)"
+
+
 def test_canonical_edit_deny_present_and_legacy_write_deny_absent(tmp_path):
     """GIVEN 通常の launch.sh --check-only 実行（test-owned isolated CLAUDE_GPT_HOME）
     WHEN 生成された settings.local.json の permissions.deny を読む
     THEN spark-auth 向け deny は canonical Edit(<CLAUDE_GPT_HOME>/spark-auth/**) の
     1件のみであり、legacy Write(<CLAUDE_GPT_HOME>/spark-auth/**) は一切含まれない
-    (AC1, AC2)
+    (AC1, AC2)。canonical absolute-path grammar を固定するため配列全体を
+    exact match で検証する（PR #2458 review, P1）。
     """
     result, settings_path = run_check_only(tmp_path)
     assert settings_path.exists(), result.stderr
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
 
+    expected_entry = _expected_canonical_edit_entry(settings_path)
     entries = _spark_auth_write_or_edit_entries(settings)
-    assert len(entries) == 1, entries
-    assert entries[0].startswith("Edit("), entries
-    assert not any(entry.startswith("Write(") for entry in entries)
+    assert entries == [expected_entry], entries
 
 
 def test_unrelated_deny_entries_are_preserved(tmp_path):
@@ -78,7 +100,7 @@ def test_repeated_launch_does_not_duplicate_or_reintroduce_legacy_write_deny(tmp
     WHEN 2回目実行後の settings.local.json を読む
     THEN spark-auth deny エントリは常に canonical Edit(...) 1件のみであり、
     legacy Write(...) との重複・再出現は発生しない (AC3: 毎回の完全再生成による
-    回帰確認)
+    回帰確認)。配列全体を exact match で検証する（PR #2458 review, P1）。
     """
     result1, settings_path = run_check_only(tmp_path)
     assert settings_path.exists(), result1.stderr
@@ -89,9 +111,9 @@ def test_repeated_launch_does_not_duplicate_or_reintroduce_legacy_write_deny(tmp
     assert settings_path.exists(), result2.stderr
 
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    expected_entry = _expected_canonical_edit_entry(settings_path)
     entries = _spark_auth_write_or_edit_entries(settings)
-    assert len(entries) == 1, entries
-    assert entries[0].startswith("Edit("), entries
+    assert entries == [expected_entry], entries
 
 
 def test_spark_auth_deny_path_is_test_owned_isolated_home_not_ambient_home(tmp_path):
@@ -99,17 +121,21 @@ def test_spark_auth_deny_path_is_test_owned_isolated_home_not_ambient_home(tmp_p
     生成する）での launch.sh --check-only 実行
     WHEN canonical Edit(...) deny のパスを読む
     THEN パスは tmp_path 配下（test-owned）であり、実運用の ambient HOME や
-    production spark-auth content を参照しない (AC6)
+    production spark-auth content を参照しない (AC6)。entry 全体を
+    settings_path から構築した expected 値との exact match で検証し
+    (PR #2458 review, P1)、tmp_path 由来の部分を除いたパス残余に
+    production/real-user HOME を示唆する "/home/" が含まれないことも確認する。
     """
     result, settings_path = run_check_only(tmp_path)
     assert settings_path.exists(), result.stderr
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
 
-    entries = _spark_auth_write_or_edit_entries(settings)
-    assert len(entries) == 1, entries
     # entry の形は "Edit(/<abs path>/**)"（launch.sh が絶対パス target を
-    # 文字列展開した結果、"//" 始まりになる）。tmp_path が含まれることだけを
-    # 確認し、production/real-user のような固定パスに一致しないことを保証する。
-    deny_path = entries[0].split("(", 1)[1].rstrip(")")
+    # 文字列展開した結果、"//" 始まりになる）。
+    expected_entry = _expected_canonical_edit_entry(settings_path)
+    entries = _spark_auth_write_or_edit_entries(settings)
+    assert entries == [expected_entry], entries
+
+    deny_path = expected_entry.split("(", 1)[1].rstrip(")")
     assert str(tmp_path) in deny_path, deny_path
     assert "/home/" not in deny_path.replace(str(tmp_path), ""), deny_path
