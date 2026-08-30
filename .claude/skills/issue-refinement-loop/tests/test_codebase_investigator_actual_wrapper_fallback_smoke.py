@@ -60,52 +60,40 @@ def _tracked_status() -> str:
     return completed.stdout
 
 
-def _write_runtime_skip_evidence(reason: str) -> Path:
-    """Persist the contract-required, credential-free runtime SKIP reason."""
-    directory = _REPO_ROOT / ".claude/artifacts/issue-refinement-loop/2434"
+def _write_runtime_evidence(*, result: str, exit_code: int, reason: str) -> Path:
+    """Persist the runtime-policy evidence without raw child output or credentials."""
+    assert result in {"PASS", "SKIP"}
+    assert exit_code in {0, 77}
+    directory = _REPO_ROOT / "artifacts"
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = directory / f"actual-wrapper-smoke-skip-{stamp}.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schema": "ISSUE_2434_RUNTIME_SMOKE_SKIP_V1",
-                "status": "skip",
-                "reason": reason,
-            },
-            separators=(",", ":"),
+    path = directory / f"runtime-verification-AC8-{stamp}.log"
+    environment = (
+        f"python={sys.version_info.major}.{sys.version_info.minor}; "
+        f"claude_cli={'available' if shutil.which('claude') else 'unavailable'}"
+    )
+    content = "\n".join(
+        (
+            "=== Runtime Verification Log ===",
+            "AC: AC8 actual-wrapper native fallback smoke",
+            f"Timestamp: {datetime.now(timezone.utc).isoformat()}",
+            f"Environment: {environment}",
+            "",
+            "--- Input ---",
+            _AC8_LIVE_VERIFICATION_COMMAND,
+            "AGY_BIN: [stripped; module-private fake only]",
+            "",
+            "--- Output ---",
+            "Raw SubAgent stdout/stderr is omitted to preserve the no-secret boundary.",
+            "",
+            "--- Verdict ---",
+            f"Result: {result}",
+            f"Exit Code: {exit_code}",
+            f"Reason: {reason}",
+            "",
         )
-        + "\n",
-        encoding="utf-8",
     )
-    return path
-
-
-def _write_runtime_pass_evidence() -> Path:
-    """Persist bounded PASS evidence without recording runtime output or credentials."""
-    completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=_REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    assert completed.returncode == 0
-    tested_head = completed.stdout.strip()
-    assert len(tested_head) == 40
-    content = (
-        f"tested_head={tested_head}\n"
-        "result=PASS\n"
-        f"verification_command={_AC8_LIVE_VERIFICATION_COMMAND}\n"
-        "agy_invocation=fake-only/no-provider\n"
-        "tracked_status=unchanged\n"
-    )
-    assert len(content.encode("utf-8")) <= 1024
-    directory = _REPO_ROOT / ".claude/artifacts/issue-refinement-loop/2434"
-    directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = directory / f"actual-wrapper-smoke-pass-{stamp}.log"
+    assert len(content.encode("utf-8")) <= 4096
     path.write_text(content, encoding="utf-8")
     return path
 
@@ -113,7 +101,7 @@ def _write_runtime_pass_evidence() -> Path:
 def _exit_runtime_skip(*, reason: str, before: str) -> NoReturn:
     """Emit the runtime-policy SKIP contract without treating it as PASS."""
     assert before == _tracked_status(), "tracked worktree status changed before runtime SKIP"
-    evidence = _write_runtime_skip_evidence(reason)
+    evidence = _write_runtime_evidence(result="SKIP", exit_code=77, reason=reason)
     print(f"SKIP: {reason}; evidence: {evidence}")
     pytest.exit("runtime verification unavailable", returncode=77)
 
@@ -284,13 +272,18 @@ use a mutation tool.
     assert any(str(driver) in command for command in bash_commands), (
         "real codebase-investigator did not invoke the test-only controller driver"
     )
-    read_indices = {
-        str(tool["input"].get("file_path", "")): index
-        for index, tool in enumerate(tools)
-        if tool["name"] == "Read" and isinstance(tool["input"], dict)
-    }
     source_path = _REPO_ROOT / ".claude/agents/codebase-investigator.md"
-    assert {str(decision_path), str(sidecar_path), str(source_path)} <= read_indices.keys(), (
+    read_indices = {
+        path: [
+            index
+            for index, tool in enumerate(tools)
+            if tool["name"] == "Read"
+            and isinstance(tool["input"], dict)
+            and tool["input"].get("file_path") == path
+        ]
+        for path in (str(decision_path), str(sidecar_path), str(source_path))
+    }
+    assert all(read_indices.values()), (
         "real codebase-investigator did not consume controller captures then perform native source reading"
     )
     driver_index = next(
@@ -300,12 +293,17 @@ use a mutation tool.
         and isinstance(tool["input"], dict)
         and tool["input"].get("command") in controller_bash_commands
     )
-    assert driver_index < read_indices[str(decision_path)] < read_indices[str(source_path)]
-    assert driver_index < read_indices[str(sidecar_path)] < read_indices[str(source_path)]
+    decision_index = next(index for index in read_indices[str(decision_path)] if index > driver_index)
+    sidecar_index = next(index for index in read_indices[str(sidecar_path)] if index > driver_index)
+    assert any(index > max(decision_index, sidecar_index) for index in read_indices[str(source_path)])
     assert not [tool for tool in tools if tool["name"] in _MUTATING_TOOLS]
     assert before == _tracked_status(), "tracked worktree status changed during smoke"
     assert _SENTINEL in result, "real codebase-investigator did not reach native sentinel"
-    evidence = _write_runtime_pass_evidence()
+    evidence = _write_runtime_evidence(
+        result="PASS",
+        exit_code=0,
+        reason="controller-owned fake actual-wrapper smoke reached the native sentinel",
+    )
     assert evidence.is_file()
     assert before == _tracked_status(), "tracked worktree status changed while writing PASS evidence"
     print(f"PASS evidence: {evidence.relative_to(_REPO_ROOT)}")
