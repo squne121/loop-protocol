@@ -1,0 +1,37 @@
+[project]
+name = "agent-retrospective-plugin"
+version = "0.1.0"
+description = "Self-contained Python dependency closure for the agent-retrospective Claude Code plugin (Issue #2240)."
+requires-python = ">=3.12"
+dependencies = [
+  "jsonschema>=4.0",
+]
+
+[tool.uv]
+# uv version compatible-range pin (Issue #2240 fix_delta P1-3, superseding
+# the prior exact-match "==0.11.29" pin from Issue #1598 parity). An
+# exact-match pin is a kill-switch: this plugin is distributed standalone
+# into arbitrary repositories with their own (newer) ambient uv install, and
+# uv itself refuses to run at all when the installed uv doesn't match
+# exactly. This lower bound matches the uv.lock this pyproject.toml ships;
+# the upper bound is a conservative "same major.minor series" guess, not a
+# verified compatibility boundary -- widen it if a real incompatibility with
+# a specific newer uv release surfaces.
+required-version = ">=0.11.29,<0.13"
+# This directory is a script bundle, not an installable Python package (no
+# setup.py/wheel target) -- `uv run --project plugins/agent-retrospective`
+# only needs to resolve/sync the dependency closure below, never build a
+# distributable artifact.
+package = false
+
+[dependency-groups]
+# "test" (not the special "dev" group) so the standard `uv run --project
+# ... --locked ...` invocation (SKILL.md/README.md/clean_install_smoke.sh,
+# none of which pass --group) does NOT sync pytest -- uv syncs the "dev"
+# group by default even without --group dev, which would silently widen
+# every production run's dependency closure beyond `jsonschema` (Issue
+# #2240 fix_delta P1-4(b)). Run the offline regression test with:
+#   uv run --project . --locked --group test pytest skills/run/scripts/tests/
+test = [
+    "pytest>=9.1.1",
+]
