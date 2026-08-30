@@ -9,7 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -350,23 +350,9 @@ def _success_sidecar(response_text: str) -> bytes:
     )
 
 
-def main() -> int:
-    try:
-        raw_request = sys.stdin.buffer.read(_MAX_REQUEST_BYTES + 1)
-        if len(raw_request) > _MAX_REQUEST_BYTES:
-            run = _failed("controller_input_invalid")
-        else:
-            try:
-                request = strict_json_object_bytes(raw_request)
-            except ProtocolError:
-                run = _failed("controller_input_invalid")
-            else:
-                run = _run_controller(request)
-        decision = validate_decision(run.decision)
-        if decision["status"] == "ok" and run.response_text is None:
-            return 2
-    except Exception:
-        # Transport/runtime failure emits no decision or sidecar by contract.
+def _emit_controller_run(run: ControllerRun) -> int:
+    decision = validate_decision(run.decision)
+    if decision["status"] == "ok" and run.response_text is None:
         return 2
     sys.stdout.buffer.write(encode_closed_json(decision))
     if decision["status"] == "ok":
@@ -374,5 +360,34 @@ def main() -> int:
     return 0 if decision["status"] in {"ok", "degraded"} else 1
 
 
+def _run_stdin_controller(*, adapt_legacy_ingress: bool) -> int:
+    try:
+        raw_request = sys.stdin.buffer.read(_MAX_REQUEST_BYTES + 1)
+        if len(raw_request) > _MAX_REQUEST_BYTES:
+            return _emit_controller_run(_failed("controller_input_invalid"))
+        try:
+            request = strict_json_object_bytes(raw_request)
+        except ProtocolError:
+            return _emit_controller_run(_failed("controller_input_invalid"))
+        if adapt_legacy_ingress:
+            request = _adapt_precontroller_ingress_to_v1(request)
+        return _emit_controller_run(_run_controller(request))
+    except ControllerInputError:
+        return _emit_controller_run(_failed("controller_input_invalid"))
+    except Exception:
+        # Transport/runtime failure emits no decision or sidecar by contract.
+        return 2
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run exact V1 controller input, or the named pre-controller ingress."""
+    arguments = list(() if argv is None else argv)
+    if arguments == []:
+        return _run_stdin_controller(adapt_legacy_ingress=False)
+    if arguments == ["--precontroller-legacy-ingress"]:
+        return _run_stdin_controller(adapt_legacy_ingress=True)
+    return 2
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

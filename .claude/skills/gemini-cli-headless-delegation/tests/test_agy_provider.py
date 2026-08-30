@@ -3,6 +3,7 @@
 Covers AC1-AC14 for provider=agy path. Uses mock subprocess to avoid
 requiring the agy CLI to be installed in the test environment.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -130,8 +131,8 @@ def _write_serena_manifest(root: Path, pinned_ref: str = "0123456789abcdef") -> 
             "--from",
             f"git+https://github.com/oraios/serena@{pinned_ref}",
             "serena",
-        "start-mcp-server",
-        "--project-from-cwd",
+            "start-mcp-server",
+            "--project-from-cwd",
         ],
         "read_only_allowlist": sorted(rgh.SERENA_READ_ONLY_TOOLS),
         "dangerous_denylist": sorted(rgh.SERENA_DANGEROUS_TOOLS),
@@ -191,29 +192,33 @@ def test_ac6_unknown_provider_fails_closed() -> None:
 
 def test_ac6_gemini_provider_accepted() -> None:
     """AC6: provider=gemini is valid (default path)."""
-    errors = rgh.validate_request({
-        "schema": "delegation_request_v1",
-        "tool_profile": "no_tools",
-        "provider": "gemini",
-        "objective": "Test gemini provider validation with enough detail",
-        "instructions": ["Step one", "Step two"],
-        "output_sections": ["response"],
-        "context_files": [],
-    })
+    errors = rgh.validate_request(
+        {
+            "schema": "delegation_request_v1",
+            "tool_profile": "no_tools",
+            "provider": "gemini",
+            "objective": "Test gemini provider validation with enough detail",
+            "instructions": ["Step one", "Step two"],
+            "output_sections": ["response"],
+            "context_files": [],
+        }
+    )
     # No unknown_provider error should be present
     assert not any("unknown_provider" in e for e in errors)
 
 
 def test_ac6_missing_provider_defaults_to_gemini() -> None:
     """AC6: provider not specified -> gemini default, no unknown_provider error."""
-    errors = rgh.validate_request({
-        "schema": "delegation_request_v1",
-        "tool_profile": "no_tools",
-        "objective": "Test default provider with enough detail here",
-        "instructions": ["Step one", "Step two"],
-        "output_sections": ["response"],
-        "context_files": [],
-    })
+    errors = rgh.validate_request(
+        {
+            "schema": "delegation_request_v1",
+            "tool_profile": "no_tools",
+            "objective": "Test default provider with enough detail here",
+            "instructions": ["Step one", "Step two"],
+            "output_sections": ["response"],
+            "context_files": [],
+        }
+    )
     assert not any("unknown_provider" in e for e in errors)
 
 
@@ -290,11 +295,12 @@ def test_agy_grounded_research_forbids_gemini_google_search() -> None:
     completed = _make_completed(0, stdout=grounded_output)
     completed.agy_provenance_hook_events = [_valid_hook_event()]  # type: ignore[attr-defined]
     completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
-    with patch.object(rgh, "_run_agy", return_value=completed) as mock_agy, patch.object(
-        rgh,
-        "_run_gemini",
-        side_effect=AssertionError(
-            "_run_gemini (Gemini CLI/API path) must not be called for provider=agy"
+    with (
+        patch.object(rgh, "_run_agy", return_value=completed) as mock_agy,
+        patch.object(
+            rgh,
+            "_run_gemini",
+            side_effect=AssertionError("_run_gemini (Gemini CLI/API path) must not be called for provider=agy"),
         ),
     ):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=300))
@@ -568,10 +574,13 @@ def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, 
         context_files=["context.md"],
         prompt="Summarize local repository evidence.",
     )
-    with patch.object(rgh, "_run_agy", side_effect=_run_agy), patch.object(
-        rgh,
-        "_collect_live_serena_read_only_evidence",
-        side_effect=_fake_live_evidence,
+    with (
+        patch.object(rgh, "_run_agy", side_effect=_run_agy),
+        patch.object(
+            rgh,
+            "_collect_live_serena_read_only_evidence",
+            side_effect=_fake_live_evidence,
+        ),
     ):
         result = rgh.run_delegation(req, request_path=repo_root / "request.json")
 
@@ -824,9 +833,7 @@ def test_ac13_run_agy_uses_shell_false_and_minimal_env() -> None:
 
     # shell=False (default when not specified, but must not be True)
     assert (
-        captured_kwargs.get("shell") is False
-        or "shell" not in captured_kwargs
-        or captured_kwargs.get("shell") is False
+        captured_kwargs.get("shell") is False or "shell" not in captured_kwargs or captured_kwargs.get("shell") is False
     )
     # env must be present and minimal
     env = captured_kwargs.get("env")
@@ -1416,9 +1423,7 @@ def test_issue_1777_ac6_grounded_research_evidence_gate_applies_regardless_of_mo
     assert with_model_result["ok"] is False
     assert with_model_result["failure_class"] == "agy_web_grounding_tool_call_missing"
 
-    with patch.dict(
-        os.environ, {rgh.AGY_MODEL_AVAILABILITY_OVERRIDE_ENV: '{"claude-sonnet-4-6": false}'}
-    ):
+    with patch.dict(os.environ, {rgh.AGY_MODEL_AVAILABILITY_OVERRIDE_ENV: '{"claude-sonnet-4-6": false}'}):
         assert rgh.resolve_agy_grounded_research_model() is None
         with patch("subprocess.run", side_effect=mock_run):
             no_model_result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
@@ -1433,7 +1438,7 @@ def test_issue_1777_ac6_grounded_research_evidence_gate_applies_regardless_of_mo
 # corrupted by merged stderr.
 # ---------------------------------------------------------------------------
 
-_FAKE_SERENA_STDERR_BACKPRESSURE_SERVER_SOURCE = '''
+_FAKE_SERENA_STDERR_BACKPRESSURE_SERVER_SOURCE = """
 import json
 import sys
 
@@ -1482,7 +1487,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
+"""
 
 
 def test_ac2_serena_collector_survives_stderr_backpressure_fake_mcp_server(tmp_path) -> None:
@@ -1506,10 +1511,11 @@ def test_ac2_serena_collector_survives_stderr_backpressure_fake_mcp_server(tmp_p
         "known_tools": ["find_file", "search_for_pattern", "get_symbols_overview"],
     }
 
-    with patch.object(rgh, "_load_serena_from_mcp_config", _fake_load_serena_from_mcp_config), patch.object(
-        rgh, "SERENA_COLLECTOR_SESSION_DEADLINE_SEC", 20.0
-    ), patch.object(rgh, "SERENA_CLIENT_REQUEST_TIMEOUT_SEC", 10.0), patch.object(
-        rgh, "SERENA_SERVER_TOOL_TIMEOUT_SEC", 8.0
+    with (
+        patch.object(rgh, "_load_serena_from_mcp_config", _fake_load_serena_from_mcp_config),
+        patch.object(rgh, "SERENA_COLLECTOR_SESSION_DEADLINE_SEC", 20.0),
+        patch.object(rgh, "SERENA_CLIENT_REQUEST_TIMEOUT_SEC", 10.0),
+        patch.object(rgh, "SERENA_SERVER_TOOL_TIMEOUT_SEC", 8.0),
     ):
         documents, metadata = rgh._collect_live_serena_read_only_evidence([context_file], repo_root, manifest)
 

@@ -537,3 +537,45 @@ def test_controller_rejects_aggregate_over_four_mebibytes_before_children(
 
     assert run.decision["reason_code"] == "controller_input_invalid"
     assert calls == []
+
+
+def test_named_precontroller_ingress_maps_legacy_before_controller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+
+    ingress = _request()
+    ingress.pop("agy_investigation_requirement")
+    ingress["agy_advisory_native_fallback_allowed"] = True
+    captured: list[dict[str, object]] = []
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    monkeypatch.setattr(
+        controller.sys,
+        "stdin",
+        io.TextIOWrapper(
+            io.BytesIO(json.dumps(ingress, separators=(",", ":")).encode("utf-8")),
+            encoding="utf-8",
+        ),
+    )
+    monkeypatch.setattr(controller.sys, "stdout", stdout)
+    monkeypatch.setattr(controller.sys, "stderr", stderr)
+
+    def fake_controller(request: dict[str, object]) -> object:
+        captured.append(request)
+        return controller._failed("builder_failed")
+
+    monkeypatch.setattr(controller, "_run_controller", fake_controller)
+
+    assert controller.main(["--precontroller-legacy-ingress"]) == 1
+    assert captured == [
+        {
+            "schema": "AGY_ADVISORY_INVOCATION_REQUEST_V1",
+            "schema_version": 1,
+            "mode": "codebase_local_asset",
+            "purpose": "Inspect the supplied source evidence.",
+            "target_paths": ["target.txt"],
+            "context_paths": ["context.txt"],
+            "agy_investigation_requirement": "advisory",
+        }
+    ]
