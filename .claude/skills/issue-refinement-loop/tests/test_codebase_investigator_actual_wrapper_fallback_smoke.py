@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import stat
 import subprocess
@@ -60,10 +61,27 @@ def _tracked_status() -> str:
     return completed.stdout
 
 
+def _resolve_tested_head() -> str:
+    """Return only a validated current worktree HEAD for runtime evidence."""
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, "runtime evidence requires resolving the current git HEAD"
+    tested_head = completed.stdout.strip()
+    assert re.fullmatch(r"[0-9a-f]{40}", tested_head), "runtime evidence requires a lowercase full git HEAD"
+    return tested_head
+
+
 def _write_runtime_evidence(*, result: str, exit_code: int, reason: str) -> Path:
     """Persist the runtime-policy evidence without raw child output or credentials."""
     assert result in {"PASS", "SKIP"}
     assert exit_code in {0, 77}
+    tested_head = _resolve_tested_head()
     directory = _REPO_ROOT / "artifacts"
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -72,11 +90,17 @@ def _write_runtime_evidence(*, result: str, exit_code: int, reason: str) -> Path
         f"python={sys.version_info.major}.{sys.version_info.minor}; "
         f"claude_cli={'available' if shutil.which('claude') else 'unavailable'}"
     )
+    completion = (
+        ("Selected Test: completed", "SKIP: not used")
+        if result == "PASS"
+        else ("Selected Test: unavailable", "SKIP: exit 77")
+    )
     content = "\n".join(
         (
             "=== Runtime Verification Log ===",
             "AC: AC8 actual-wrapper native fallback smoke",
             f"Timestamp: {datetime.now(timezone.utc).isoformat()}",
+            f"Tested Head: {tested_head}",
             f"Environment: {environment}",
             "",
             "--- Input ---",
@@ -88,6 +112,7 @@ def _write_runtime_evidence(*, result: str, exit_code: int, reason: str) -> Path
             "",
             "--- Verdict ---",
             f"Result: {result}",
+            *completion,
             f"Exit Code: {exit_code}",
             f"Reason: {reason}",
             "",
@@ -96,6 +121,34 @@ def _write_runtime_evidence(*, result: str, exit_code: int, reason: str) -> Path
     assert len(content.encode("utf-8")) <= 4096
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def test_runtime_evidence_binds_the_actual_current_head() -> None:
+    """PASS evidence records the worktree SHA and explicit completed/no-SKIP state."""
+    expected_head = _resolve_tested_head()
+    evidence = _write_runtime_evidence(result="PASS", exit_code=0, reason="focused unit")
+    try:
+        content = evidence.read_text(encoding="utf-8")
+        assert f"Tested Head: {expected_head}" in content
+        assert "Selected Test: completed" in content
+        assert "SKIP: not used" in content
+    finally:
+        evidence.unlink(missing_ok=True)
+
+
+def test_runtime_evidence_fails_closed_without_a_resolved_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed HEAD lookup must not create a runtime-evidence file."""
+    directory = _REPO_ROOT / "artifacts"
+    before = set(directory.glob("runtime-verification-AC8-*.log")) if directory.is_dir() else set()
+
+    def fail_head_lookup(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=["git", "rev-parse", "HEAD"], returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fail_head_lookup)
+    with pytest.raises(AssertionError, match="requires resolving the current git HEAD"):
+        _write_runtime_evidence(result="PASS", exit_code=0, reason="focused unit")
+    after = set(directory.glob("runtime-verification-AC8-*.log")) if directory.is_dir() else set()
+    assert after == before
 
 
 def _exit_runtime_skip(*, reason: str, before: str) -> NoReturn:
