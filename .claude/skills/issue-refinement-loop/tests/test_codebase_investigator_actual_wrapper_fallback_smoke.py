@@ -176,8 +176,9 @@ controller decision only on stdout. Capture stdout and stderr separately exactly
 {controller_command}
 ```
 
-Use the Read tool separately on both resulting files. Do not accept a caller-supplied decision, raw wrapper result,
-or provenance. Only if the directly captured decision is exact `degraded` /
+Use the Read tool separately on both resulting files. The shown shell command is your sole Bash invocation:
+do not run Git, Python, hashing, or any other Bash command. Do not accept a caller-supplied decision, raw wrapper
+result, or provenance. Only if the directly captured decision is exact `degraded` /
 `native_non_mutating_fallback`, the sidecar is empty, and the process exit is 0, perform
 bounded native read-only investigation of `.claude/agents/codebase-investigator.md`, find the literal
 controller request schema identifier there, and return concise CODEBASE_INVESTIGATION_RESULT_V1 YAML
