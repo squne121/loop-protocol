@@ -2796,61 +2796,113 @@ _DENIED_INLINE_EXEC_FLAGS = frozenset({"-c"})
 # wired -- its single-command, no-pipeline-splitting scan treats every `|`
 # as an unconditional deny. The constants below back a NEW, explicitly
 # opt-in ("read_only_investigation_enabled") gate that is pipeline-aware
-# (each `|`/`;`/`&&`/`||`-delimited segment is validated independently) and
-# denies by git/gh SUBCOMMAND+ACTION rather than by exact full-command
-# match, so a real, unbounded set of read-only `git show`/`gh pr view`
-# invocations can be allowed while every mutating verb stays denied. This is
-# ADDITIVE: the default (`read_only_investigation_enabled=False`) keeps
-# `check_bash`'s pre-existing deny-all-by-default / exact-allowlist-plus-
-# tokenized-denylist behavior byte-for-byte (Issue #2237 P0-5's fail-open
-# fix is not touched).
+# (each `|`-delimited segment is validated independently; `;`/`&`/`&&`/`||`
+# and a literal newline are unconditional denies, never segment delimiters
+# -- see `_tokenize_read_only_investigation_pipeline`) and denies by git/gh
+# SUBCOMMAND+ACTION *position* (not token-SET membership) rather than by
+# exact full-command match, so a real, unbounded set of read-only `git
+# show`/`gh pr view` invocations can be allowed while every mutating verb
+# stays denied. This is ADDITIVE: the default
+# (`read_only_investigation_enabled=False`) keeps `check_bash`'s
+# pre-existing deny-all-by-default / exact-allowlist-plus-tokenized-denylist
+# behavior byte-for-byte (Issue #2237 P0-5's fail-open fix is not touched).
+#
+# PR #2425 review fix_delta round 3 (OWNER REQUEST_CHANGES,
+# #2425#issuecomment-5466916997) rebuilt this profile around 3 explicit
+# capabilities instead of an ever-growing set of individually-patched
+# bypasses:
+#   1. canonical AGY capability (`_AGY_CANONICAL_SCRIPT_SUFFIXES`) --
+#      `codebase-investigator`'s real `build_request.py` /
+#      `run_gemini_headless.py` invocation is now the ONLY allowed
+#      `python3`/`uv` use, restoring the workflow the round-2 fix had
+#      self-blocked (a bare `python3`/`uv` head was excluded entirely).
+#   2. native Git read-only capability (`_ALLOWED_GIT_READ_ONLY_SUBCOMMANDS`)
+#      -- an ALLOWLIST of read-only subcommands (position-based: the first
+#      non-global-flag token after `git`), replacing the previous denylist
+#      of *known* mutating subcommands, which silently allowed every
+#      unlisted mutation (`git add`, `git hash-object -w`, `git bisect
+#      start`, ...).
+#   3. native GitHub capability (`_ALLOWED_GH_GROUP_ACTION_PAIRS` +
+#      `_check_gh_api_segment`) -- exact (group, action) PAIRS at their real
+#      argv POSITIONS (not token-SET membership, which let `gh pr checkout 1
+#      --branch view` and `gh workflow run x.yml --ref view` through because
+#      `view`/`pr`/`workflow` were merely *present* somewhere in the
+#      command), plus a `gh api` GET-only rule (Issue #2419 contract
+#      requires `gh api GET` for `github_research`).
 # ---------------------------------------------------------------------------
 
-#: git subcommands that mutate repository/ref/working-tree state -- denied
-#: outright under the read-only investigation profile regardless of flags.
-_DENIED_GIT_MUTATING_SUBCOMMANDS = frozenset(
+#: git GLOBAL flags that take a following value token (consumed as a pair)
+#: when locating the actual subcommand position -- e.g. `git -C <path>
+#: show ...` must resolve to subcommand `show`, not treat `<path>` as the
+#: subcommand. `-c`/`--config` are deliberately absent: those are denied
+#: unconditionally (git config/alias indirection) before subcommand lookup
+#: ever runs, regardless of position.
+_GIT_GLOBAL_FLAGS_WITH_VALUE = frozenset({"-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix"})
+#: git GLOBAL flags that take no value.
+_GIT_GLOBAL_FLAGS_NO_VALUE = frozenset(
+    {"--no-pager", "--paginate", "-p", "--bare", "--literal-pathspecs", "--no-replace-objects", "--no-optional-locks"}
+)
+#: git subcommands with a genuine read-only investigation surface -- an
+#: ALLOWLIST (PR #2425 review fix_delta P0-3): every unlisted subcommand
+#: (`add`, `hash-object -w`, `bisect`, `commit`, `push`, `merge`, ...) is
+#: denied by construction, instead of relying on an ever-incomplete
+#: denylist of *known* mutating subcommands.
+_ALLOWED_GIT_READ_ONLY_SUBCOMMANDS = frozenset(
+    {"show", "log", "diff", "blame", "rev-parse", "status", "cat-file", "ls-tree", "grep", "merge-base"}
+)
+#: `gh` GLOBAL flags that take a following value token.
+_GH_GLOBAL_FLAGS_WITH_VALUE = frozenset({"--repo", "-R", "--hostname"})
+#: exact (group, action) pairs allowed under the read-only investigation
+#: profile, matched at their real argv POSITION (PR #2425 review fix_delta
+#: P0-4) -- a flag value or branch/ref name that happens to equal an action
+#: token (`gh pr checkout 1 --branch view`, `gh workflow run x.yml --ref
+#: view`) can no longer be mistaken for the actual action the way a
+#: token-SET-membership check could.
+_ALLOWED_GH_GROUP_ACTION_PAIRS = frozenset(
     {
-        "commit", "push", "merge", "rebase", "reset", "checkout", "switch",
-        "branch", "clean", "stash", "tag", "cherry-pick", "revert", "am",
-        "apply", "notes", "worktree", "submodule", "fetch", "pull", "remote",
-        "config", "gc", "prune", "filter-branch", "filter-repo",
-        "update-ref", "symbolic-ref", "restore", "init", "clone",
+        ("pr", "view"), ("pr", "diff"), ("pr", "checks"), ("pr", "status"),
+        ("issue", "view"), ("issue", "list"),
+        ("repo", "view"),
+        ("run", "view"), ("run", "list"),
+        ("workflow", "view"), ("workflow", "list"),
     }
 )
-#: `gh` second-token subcommands that have a genuine read-only investigation
-#: surface. Every other `gh` subcommand (e.g. `release`, `auth`, `secret`,
-#: `gist`, `workflow` with a mutating action) is denied outright.
-_ALLOWED_GH_READ_ONLY_SUBCOMMANDS = frozenset({"pr", "issue", "repo", "run", "workflow"})
-#: `gh` third-token actions allowed under the subcommands above. Anything
-#: else (`merge`/`close`/`edit`/`comment`/`create`/`reopen`/`delete`/
-#: `review`/`ready`/`lock`/`transfer`/`pin`/... ) is denied.
-_ALLOWED_GH_READ_ONLY_ACTIONS = frozenset({"view", "diff", "list", "status", "checks"})
-#: `gh` action tokens that mutate GitHub state -- denied outright by
-#: token-SET membership (not position), matching how a flag inserted before
-#: the actual action (`gh --repo x/y issue comment 1 --body hi`) must not
-#: bypass this check.
-_DENIED_GH_MUTATING_ACTION_TOKENS = frozenset(
-    {
-        "merge", "close", "edit", "comment", "create", "reopen", "delete",
-        "lock", "unlock", "pin", "unpin", "transfer", "review", "ready",
-        "rerun", "cancel", "dispatch", "enable", "disable",
-    }
+#: `gh api` method-override flags (an explicit non-GET method is always
+#: denied; PR #2425 review fix_delta P1-c).
+_GH_API_METHOD_FLAGS = frozenset({"--method", "-x"})
+#: `gh api` flags that implicitly switch the request to `POST` per GitHub
+#: CLI's own documented behavior, UNLESS an explicit `--method GET` is also
+#: present.
+_GH_API_DATA_FLAGS = frozenset({"-f", "-F", "--raw-field", "--input"})
+#: canonical AGY delegation scripts (Issue #2419 PR #2425 review fix_delta
+#: P0-1) -- the ONLY `python3`/`uv` invocations this profile allows. Matched
+#: by trailing-path membership (any token in the segment ending with one of
+#: these relative paths), so the profile stays agnostic to the caller's cwd
+#: / absolute-path prefix while still being anchored to the real, in-repo
+#: script identity (never a heredoc, `-c` inline script, or arbitrary
+#: script FILE argument -- those still fail closed below).
+_AGY_CANONICAL_SCRIPT_SUFFIXES = (
+    ".claude/skills/gemini-cli-headless-delegation/scripts/build_request.py",
+    ".claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py",
 )
-#: standalone head commands (outside `git`/`gh`) allowed under the
-#: read-only investigation profile -- ONLY hashing/inspection coreutils that
-#: cannot themselves execute arbitrary further commands. `find` (its `-exec`
-#: /`-execdir`/`-ok`/`-okdir` actions run an arbitrary command, unrelated to
-#: its head token) and `python3`/`uv` (a heredoc, stdin script, or script
-#: FILE argument can execute arbitrary code -- including a nested `git
-#: merge` via `subprocess`/`os.system` -- with no `-c` flag for
-#: `_DENIED_INLINE_EXEC_FLAGS` to catch) are deliberately EXCLUDED: PR #2425
-#: review found both allow the Issue #2419 incident's exact `git merge`
-#: class to execute completely undetected once the guard treats their head
-#: token as unconditionally trusted. No standalone interpreter/launcher is
-#: allowed in this profile for that reason -- a genuinely required AGY
-#: canonical builder invocation is denied here (fail-closed) rather than
-#: risk it.
+#: head commands that MAY be a canonical AGY delegation invocation -- gated
+#: further by `_AGY_CANONICAL_SCRIPT_SUFFIXES` membership, never trusted
+#: unconditionally (a bare `python3`/`uv` invocation of anything else is
+#: still an unconditional deny -- see `_check_read_only_investigation_command`).
+_AGY_CANONICAL_INVOCATION_HEAD_COMMANDS = frozenset({"python3", "uv"})
+#: standalone head commands (outside `git`/`gh`/the canonical AGY
+#: invocation above) allowed under the read-only investigation profile --
+#: ONLY hashing/inspection coreutils that cannot themselves execute
+#: arbitrary further commands. `find` (its `-exec`/`-execdir`/`-ok`/`-okdir`
+#: actions run an arbitrary command, unrelated to its head token) is
+#: deliberately EXCLUDED for that reason.
 _READ_ONLY_INVESTIGATION_HEAD_COMMANDS = frozenset({"sha256sum", "sha1sum", "wc", "head", "tail", "cat", "ls"})
+#: pipeline operator tokens this profile ever tokenizes as significant
+#: (see `_tokenize_read_only_investigation_pipeline`). Only `|` composes a
+#: pipeline; every other operator token that appears is an unconditional
+#: deny of the WHOLE command (never a segment delimiter).
+_PIPELINE_TOKENIZER_PUNCTUATION_CHARS = "|;&\n\r"
+_DENIED_PIPELINE_OPERATOR_TOKENS = frozenset({";", "&", "&&", "||", "\n", "\r"})
 
 _DENIED_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Agent", "Skill"})
 
@@ -2886,6 +2938,116 @@ class PermissionDenied(Exception):
     def __init__(self, message: str, *, command: str) -> None:
         super().__init__(message)
         self.command = command
+
+
+def _tokenize_read_only_investigation_pipeline(command: str) -> list[list[str]]:
+    """Quote-aware tokenizer for the read-only investigation Bash profile
+    (Issue #2419 PR #2425 review fix_delta P1-b). Uses ``shlex``'s
+    ``punctuation_chars`` mode so a ``|``/``;``/``&``/newline INSIDE a
+    quoted string (``git grep 'foo|bar'``, ``gh pr view 1 --jq '.title |
+    length'``) is never mistaken for a command separator -- unlike the
+    previous ``re.split(r"\\|\\||&&|[|;\\r\\n]", command)``, which split on
+    any raw occurrence of those characters regardless of quoting.
+
+    Returns one token list PER simple command in a single-pipe (``|``-only)
+    pipeline. Any OTHER operator token (``;``, a bare ``&``, ``&&``,
+    ``||``, a literal newline/carriage-return) appearing ANYWHERE in the
+    command -- even what otherwise looks like a single simple command -- is
+    an unconditional deny of the WHOLE command: this profile only ever
+    composes read-only pipelines with ``|``, and treating those operators as
+    segment delimiters (the previous ``re.split`` behavior) is what let a
+    mutating segment ride along next to a read-only-looking one."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=_PIPELINE_TOKENIZER_PUNCTUATION_CHARS)
+    lexer.whitespace = " \t"
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError as exc:
+        raise PermissionDenied(f"bash_unparsable:{exc}", command=command) from exc
+    if not tokens:
+        raise PermissionDenied("bash_empty", command=command)
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token == "|":
+            if not current:
+                raise PermissionDenied("bash_empty_segment", command=command)
+            segments.append(current)
+            current = []
+            continue
+        if token in _DENIED_PIPELINE_OPERATOR_TOKENS:
+            raise PermissionDenied(f"denied_bash_operator:{token!r}", command=command)
+        current.append(token)
+    if not current:
+        raise PermissionDenied("bash_empty_segment", command=command)
+    segments.append(current)
+    return segments
+
+
+def _find_git_subcommand(tokens: list[str]) -> str | None:
+    """PR #2425 review fix_delta P0-3: locate the real git subcommand
+    POSITION by walking past recognized GLOBAL flags following git's own
+    argv grammar (a value-taking flag like ``-C <path>`` consumes its
+    value as a separate token; a ``--flag=value`` long option consumes only
+    itself). An unrecognized leading ``-``-prefixed flag fails CLOSED
+    (returns ``None``, which the caller then denies) rather than guessing
+    whether it takes a value -- consistent with this profile's fail-closed
+    philosophy everywhere else."""
+    idx = 1
+    n = len(tokens)
+    while idx < n:
+        tok = tokens[idx]
+        if tok in _GIT_GLOBAL_FLAGS_WITH_VALUE:
+            idx += 2
+            continue
+        if tok in _GIT_GLOBAL_FLAGS_NO_VALUE:
+            idx += 1
+            continue
+        if tok.startswith("--") and "=" in tok:
+            idx += 1
+            continue
+        if tok.startswith("-"):
+            return None
+        return tok
+    return None
+
+
+def _find_gh_group_action(tokens: list[str]) -> tuple[str | None, str | None]:
+    """PR #2425 review fix_delta P0-4: locate the real ``gh`` (group,
+    action) POSITIONS by walking past recognized GLOBAL flags
+    (``--repo``/``-R``/``--hostname``), the same fail-closed-on-unrecognized
+    -flag approach as ``_find_git_subcommand``."""
+    idx = 1
+    n = len(tokens)
+    while idx < n:
+        tok = tokens[idx]
+        if tok in _GH_GLOBAL_FLAGS_WITH_VALUE:
+            idx += 2
+            continue
+        if tok.startswith("--") and "=" in tok:
+            idx += 1
+            continue
+        if tok.startswith("-"):
+            return None, None
+        break
+    if idx >= n:
+        return None, None
+    group = tokens[idx]
+    idx += 1
+    while idx < n:
+        tok = tokens[idx]
+        if tok in _GH_GLOBAL_FLAGS_WITH_VALUE:
+            idx += 2
+            continue
+        if tok.startswith("--") and "=" in tok:
+            idx += 1
+            continue
+        if tok.startswith("-"):
+            return group, None
+        break
+    if idx >= n:
+        return group, None
+    return group, tokens[idx]
 
 
 class DelegatedAgentPermissionPolicy:
@@ -2988,55 +3150,60 @@ class DelegatedAgentPermissionPolicy:
             raise PermissionDenied("denied_bash_pattern:inline_exec", command=command)
 
     def _check_read_only_investigation_command(self, command: str) -> None:
-        """Issue #2419: pipeline-aware read-only investigation gate. Splits
-        ``command`` on ``|``/``;``/``&&``/``||``/newline (never on
-        ``` ` ``` or ``$(`` -- those are denied unconditionally, since a
-        segment-aware parser cannot safely predict what command
-        substitution conjures at runtime) and validates each segment
-        independently. A segment is allowed only if its head command is
-        ``git``/``gh`` with a non-mutating subcommand(+action), or is in
-        ``_READ_ONLY_INVESTIGATION_HEAD_COMMANDS`` -- and only if it also
-        contains no denied metacharacter, is not a denied standalone
-        command, and is not an inline-exec-flag invocation.
+        """Issue #2419 / PR #2425 review fix_delta round 3
+        (#2425#issuecomment-5466916997): pipeline-aware read-only
+        investigation gate built around 3 explicit capabilities (canonical
+        AGY invocation, native Git read-only subcommands, native GitHub
+        group+action pairs) instead of an ever-growing set of individually
+        patched bypasses -- see the module-level comment above
+        ``_ALLOWED_GIT_READ_ONLY_SUBCOMMANDS`` for the full rationale.
 
-        PR #2425 review fix_delta (2 more real bypasses found in
-        end-to-end subprocess re-testing, same severity class as Issue
-        #2419's original incident):
+        Process substitution (``<(...)``/``>(...)``) and command
+        substitution (`` ` `` / ``$(``) are denied unconditionally on the
+        RAW command string, before any tokenization: bash actually executes
+        the substituted/substitution-fed command as its own process (P0-2 --
+        OWNER-verified end-to-end that ``cat <(git merge stale-feature)``
+        fast-forwards ``main`` exactly like Issue #2419's original
+        incident), and no segment-aware parser can safely predict what
+        either one conjures at runtime.
 
-        - newline as a command separator: a multi-line Bash tool_use
-          command (real bash treats ``\\n`` exactly like ``;``) was
-          previously NOT split on, so ``shlex.split`` merged an unguarded
-          second line's tokens into the FIRST line's segment -- e.g.
-          ``"ls\\ngit merge x"`` tokenized as one segment headed by
-          ``ls``, hiding the ``git merge`` entirely from inspection.
-        - git config-alias indirection: ``git -c alias.x=merge x
-          <branch>`` renames the ``merge`` subcommand to an arbitrary
-          token that never appears in
-          ``_DENIED_GIT_MUTATING_SUBCOMMANDS``, verified end-to-end to
-          perform a real fast-forward merge while the token-set denylist
-          saw only the alias name. Any inline git config override
-          (``-c``/``--config``) is now denied outright for `git`
-          segments -- it is never needed for read-only investigation, and
-          is a documented indirection vector (aliases, ``core.pager``,
-          hook-adjacent config) no fixed-string subcommand denylist can
-          fully close. (Deliberately checked against the ORIGINAL,
-          not-lowercased tokens: lowercasing would make this
-          indistinguishable from the legitimate uppercase ``-C
-          <path>`` "run git in this directory" flag this profile's own
-          test suite relies on.)"""
-        if "`" in command or "$(" in command:
-            raise PermissionDenied("denied_bash_metacharacter:command_substitution", command=command)
-        segments = [seg.strip() for seg in re.split(r"\|\||&&|[|;\r\n]", command)]
-        segments = [seg for seg in segments if seg]
-        if not segments:
-            raise PermissionDenied("bash_empty", command=command)
-        for segment in segments:
-            try:
-                original_tokens = shlex.split(segment)
-            except ValueError as exc:
-                raise PermissionDenied(f"bash_unparsable:{exc}", command=command) from exc
-            if not original_tokens:
-                raise PermissionDenied("bash_empty_segment", command=command)
+        The remaining command is tokenized quote-aware
+        (``_tokenize_read_only_investigation_pipeline``) into one or more
+        ``|``-joined segments; every other operator (``;``/``&``/``&&``/
+        ``||``/a literal newline) is an unconditional deny of the WHOLE
+        command, never a segment delimiter (P1-b -- a raw-string
+        ``re.split`` previously split on those same characters even INSIDE
+        a quoted argument, e.g. ``git grep 'foo|bar'`` or ``gh pr view 2425
+        --jq '.title | length'``, denying legitimate read-only
+        investigation).
+
+        Each segment is allowed only if its head command is:
+
+        - ``git`` with an ALLOWLISTED read-only subcommand at its real argv
+          POSITION (P0-3 -- replaces a denylist of known mutating
+          subcommands, which silently allowed every unlisted mutation like
+          ``git add``/``git hash-object -w``/``git bisect``);
+        - ``gh`` with an ALLOWLISTED (group, action) PAIR at its real argv
+          POSITION, or ``gh api`` with an effective GET method (P0-4/P1-c --
+          replaces token-SET membership, which let a flag VALUE or branch
+          name equal to an action token bypass the check, e.g. ``gh pr
+          checkout 1 --branch view``);
+        - the canonical AGY delegation builder/wrapper invocation (P0-1 --
+          the ONLY ``python3``/``uv`` use this profile allows; restores the
+          workflow a prior round's blanket `python3`/`uv` exclusion had
+          self-blocked); or
+        - one of the standalone read-only coreutils in
+          ``_READ_ONLY_INVESTIGATION_HEAD_COMMANDS``.
+
+        Any inline git config override (``-c``/``--config``) is denied
+        outright for ``git`` segments regardless of position -- it is never
+        needed for read-only investigation and is a documented alias/
+        indirection vector (verified end-to-end: ``git -c
+        alias.x=merge x <branch>`` performs a real fast-forward merge)."""
+        if any(marker in command for marker in ("`", "$(", "<(", ">(")):
+            raise PermissionDenied("denied_bash_metacharacter:command_or_process_substitution", command=command)
+        segments = _tokenize_read_only_investigation_pipeline(command)
+        for original_tokens in segments:
             lowered = [tok.lower() for tok in original_tokens]
             token_set = set(lowered)
             if token_set & _DENIED_BASH_METACHAR_TOKENS:
@@ -3049,35 +3216,74 @@ class DelegatedAgentPermissionPolicy:
             if head == "git":
                 if "-c" in original_tokens or "--config" in lowered:
                     raise PermissionDenied("denied_git_inline_config_override", command=command)
-                # Issue #2419 fix_delta: token-SET membership (not a fixed
-                # `lowered[1]` position) -- a flag inserted before the
-                # subcommand (`git -C . commit -m x`) must not bypass this
-                # check, matching the substring-blacklist-bypass philosophy
-                # `_check_single_command_tokenized_denylist` already uses.
-                denied_present = token_set & _DENIED_GIT_MUTATING_SUBCOMMANDS
-                if denied_present:
-                    reason = f"denied_git_mutating_subcommand:{sorted(denied_present)[0]}"
-                    raise PermissionDenied(reason, command=command)
+                # PR #2425 review fix_delta P0-3: POSITION-based subcommand
+                # lookup against an ALLOWLIST (not a token-SET denylist
+                # intersection) -- `_find_git_subcommand` walks past global
+                # flags following real git argv grammar (`-C <path>` etc.
+                # consume their value; an unrecognized leading flag fails
+                # closed to `None` rather than guessing its arity).
+                subcommand = _find_git_subcommand(original_tokens)
+                if subcommand is None or subcommand.lower() not in _ALLOWED_GIT_READ_ONLY_SUBCOMMANDS:
+                    raise PermissionDenied(f"denied_git_subcommand_not_allowlisted:{subcommand}", command=command)
                 continue
             if head == "gh":
-                # Issue #2419 fix_delta: same token-SET rationale as `git`
-                # above (`gh --repo owner/repo issue comment ...` must not
-                # bypass via flag position). A `gh` segment is allowed only
-                # if it names an allowed read-only subcommand+action AND
-                # names no denied mutating action token anywhere.
-                denied_actions_present = token_set & _DENIED_GH_MUTATING_ACTION_TOKENS
-                if denied_actions_present:
+                # PR #2425 review fix_delta P0-4/P1-c: POSITION-based
+                # (group, action) lookup against an exact-pair ALLOWLIST,
+                # with `gh api` handled by its own GET-only rule.
+                group, action = _find_gh_group_action(original_tokens)
+                if group is not None and group.lower() == "api":
+                    self._check_gh_api_segment(original_tokens, lowered, command)
+                    continue
+                pair = (group.lower(), action.lower()) if group and action else None
+                if pair is None or pair not in _ALLOWED_GH_GROUP_ACTION_PAIRS:
                     raise PermissionDenied(
-                        f"denied_gh_action:{sorted(denied_actions_present)[0]}", command=command
+                        f"denied_gh_group_action_not_allowlisted:{group}:{action}", command=command
                     )
-                if not (token_set & _ALLOWED_GH_READ_ONLY_SUBCOMMANDS):
-                    raise PermissionDenied("denied_gh_missing_subcommand", command=command)
-                if not (token_set & _ALLOWED_GH_READ_ONLY_ACTIONS):
-                    raise PermissionDenied("denied_gh_missing_action", command=command)
                 continue
+            if head in _AGY_CANONICAL_INVOCATION_HEAD_COMMANDS:
+                # PR #2425 review fix_delta P0-1: the ONLY allowed
+                # `python3`/`uv` use is an exact canonical AGY builder/
+                # wrapper invocation -- everything else (heredoc, `-c`,
+                # arbitrary script FILE argument) stays denied.
+                if any(tok.endswith(_AGY_CANONICAL_SCRIPT_SUFFIXES) for tok in original_tokens):
+                    continue
+                raise PermissionDenied(f"denied_unlisted_command:{head}", command=command)
             if head in _READ_ONLY_INVESTIGATION_HEAD_COMMANDS:
                 continue
             raise PermissionDenied(f"denied_unlisted_command:{head}", command=command)
+
+    def _check_gh_api_segment(self, original_tokens: list[str], lowered: list[str], command: str) -> None:
+        """PR #2425 review fix_delta P1-c: ``gh api`` is allowed only for an
+        effective ``GET`` request -- GitHub CLI's own documented behavior is
+        that the default method is ``GET`` but ``-f``/``-F``/``--raw-field``/
+        ``--input`` implicitly switch it to ``POST``. Denies any explicit
+        non-``GET`` ``--method``/``-X``, and denies any data-carrying flag
+        UNLESS an explicit ``--method GET`` is also present."""
+        explicit_method: str | None = None
+        has_data_flag = False
+        idx = 0
+        n = len(original_tokens)
+        while idx < n:
+            tok = original_tokens[idx]
+            low = lowered[idx]
+            if low in _GH_API_METHOD_FLAGS:
+                explicit_method = original_tokens[idx + 1] if idx + 1 < n else ""
+                idx += 2
+                continue
+            if low.startswith("--method="):
+                explicit_method = tok.split("=", 1)[1]
+                idx += 1
+                continue
+            if low in _GH_API_DATA_FLAGS:
+                has_data_flag = True
+                idx += 1
+                continue
+            idx += 1
+        explicit_method_upper = explicit_method.upper() if explicit_method is not None else None
+        if explicit_method_upper is not None and explicit_method_upper != "GET":
+            raise PermissionDenied(f"denied_gh_api_method:{explicit_method_upper}", command=command)
+        if has_data_flag and explicit_method_upper != "GET":
+            raise PermissionDenied("denied_gh_api_data_flag_without_explicit_get", command=command)
 
     def check_filesystem_write(self, path: str) -> None:
         raise PermissionDenied(f"filesystem_write_denied:{path}", command=f"write:{path}")

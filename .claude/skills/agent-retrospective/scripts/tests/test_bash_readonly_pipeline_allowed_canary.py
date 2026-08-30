@@ -66,6 +66,17 @@ def _run_hook(command: str) -> dict:
         # multi-segment pipelines where every segment is independently safe.
         "git log --oneline | head -5",
         "git show HEAD:README.md | wc -l",
+        # PR #2425 review fix_delta round 3 (OWNER REQUEST_CHANGES,
+        # #2425#issuecomment-5466916997) P1-b: a quote-aware tokenizer must
+        # not mistake a `|` INSIDE a quoted argument for a pipeline
+        # separator -- the previous raw-string `re.split` did, breaking
+        # both of these legitimate investigation commands.
+        "git grep 'foo|bar'",
+        "gh pr view 2425 --jq '.title | length'",
+        # P1-c: `gh api` GET (default method, and an explicit `--method
+        # GET`) is part of Issue #2419's `github_research` contract.
+        "gh api repos/squne121/loop-protocol/issues/2419",
+        "gh api repos/squne121/loop-protocol/issues/2419 --method GET",
     ],
 )
 def test_bash_guard_hook_allows_read_only_investigation(command: str) -> None:

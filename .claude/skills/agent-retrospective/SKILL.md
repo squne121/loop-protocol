@@ -279,6 +279,19 @@ human_authorization_receipt/v1:
   呼ばれない dead code で、observer が Bash 経由の `git merge` を実行し canonical local `main` を
   破損させる実害が発生した）。agent frontmatter 自身の `hooks:` フィールドは headless `-p` session
   では発火しない（workspace trust dialog が `-p` では成立しないため）ので、この用途には使わない。
+  この read-only investigation profile は PR #2425 review fix_delta（#2425#issuecomment-5466916997）で
+  3 つの明示 capability の allowlist に再構成されている: (1) canonical AGY builder/wrapper invocation
+  （`build_request.py`/`run_gemini_headless.py` の正規パスへの exact suffix match のみ。それ以外の
+  `python3`/`uv` 呼び出しはすべて拒否）、(2) native Git read-only subcommand allowlist（`show/log/diff/
+  blame/rev-parse/status/cat-file/ls-tree/grep/merge-base` の argv POSITION ベース判定。未列挙 mutation
+  はすべて拒否される denylist 逆転設計）、(3) native GitHub `(group, action)` exact pair allowlist +
+  `gh api` GET-only 判定（argv POSITION ベース。flag 値や branch 名が action token と一致しても bypass
+  しない）。shell 側は quote-aware tokenizer（`shlex.shlex(punctuation_chars=...)`）で `|` のみをパイプ
+  演算子として許可し、`;`/`&`/`&&`/`||`/改行はトークンとして出現した時点で無条件拒否する（クォート内の
+  `|` を誤って区切り文字として扱わない）。`` ` ``/`$(`/`<(`/`>(`（command/process substitution）は生文字列
+  レベルで無条件拒否する。hook 自身の内部例外（import error 等）は `main()` 全体の try/except で捕捉し
+  `stderr` に診断出力した上で `sys.exit(2)` する（Claude Code の PreToolUse hook 契約では exit 2 のみが
+  block、他の非0終了は non-blocking error として tool 実行が続行されるため）。
 
 ## Related（関連情報）
 
