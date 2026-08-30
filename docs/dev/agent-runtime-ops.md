@@ -65,7 +65,7 @@ network_access = true
 ```
 
 - `network_access = true` は legacy runtime のみの表現で、modern `default_permissions` と混在させない
-- GitHub の issue / PR の更新とコメントは、引き続き [github-ops.md](github-ops.md) と `rtk gh` を使う
+- GitHub issue / PR updates and comments still use [github-ops.md](github-ops.md) and `rtk gh`
 
 ## Root Default Permission Profile（root default 権限プロファイル、Issue #1859）
 
@@ -549,7 +549,7 @@ Claude Code／Codex CLI の runtime smoke（linked worktree 内での fresh sess
 経由しない。runner は起動・観測・証跡収集だけを所有し、Codex CLI 側の
 sandbox／permission profile（本文書の Root Default Permission Profile）は変更しない。
 
-### Claude のピアメッセージング方針（Claude peer messaging policy、Issue #2437）
+### Claude のピアメッセージング方針（Issue #2437）
 
 runtime-smoke が起動する Claude process は process-local settings で
 `crossSessionInbound: "refuse"` と bare `permissions.deny` の `SendMessage` /
