@@ -34,6 +34,8 @@ agent_observation_capability/v1:
 
 `supported` は `runtime_event_observed == true` かつ `capture_artifact_observed == true` かつ `raw_values_emitted == false` のときに限り成立する。`evidence_mode: synthetic_only` では信頼できる provenance は `synthetic_fixture` のみであり、`real_pilot_verified` は #1220 の `LATITUDE_PILOT_EXCEPTION_V1` gate が `approve_timeboxed_real_pilot` へ遷移し activation fields が machine-verified になるまで blocked のままとする。本書は #1220 の A1 decision gate 既定（`approve_synthetic_only` / `blocked_until_activation`）を変更しない。`docs/dev/secret-policy.md` も変更しない。
 
+> **#2426 との関係（参照コメントのみ）**: `#2426`（Claude-GPT を既存 Native Claude Code 用 Latitude local profile 経由で同一 project へ接続する Issue）は、Native Claude Code が既に利用している local observation profile を同一 project 宛に限り Claude-GPT にも適用する owner-approved local operation であり、本書の capability matrix・`verdict_enum`・#1220 A1 decision gate 既定（上記）を変更しない別レイヤーのスコープである。`#2426` の owner-controlled policy supersession は `docs/dev/secret-policy.md` の `owner_local_observation_supersession_v1` に記録されており、本書の `evidence_mode: synthetic_only` / `real_runtime_evidence` 契約値はそのまま維持される。
+
 ## hook 共存の PASS 契約
 
 hook 共存（Latitude の async Stop hook と既存 coordinator hook の併存）に依存する surface は、以下の closed contract を満たすときに限り `supported` へ到達できる。async hook は gate ではなく、canonical gate は post-run verifier であり、hook の exit 0 は authoritative ではない。
