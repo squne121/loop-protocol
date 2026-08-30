@@ -281,7 +281,7 @@ def _spark_capability(
 def _github_auth_probe(deadline_ns: int) -> ProbeOutcome:
     return _run_probe_with_deadline(
         "github_auth",
-        ["gh", "auth", "status"],
+        ["gh", "auth", "status", "--active", "--hostname", "github.com"],
         deadline_ns=deadline_ns,
         cap_seconds=_GITHUB_AUTH_PROBE_CAP_SECONDS,
     )
@@ -290,7 +290,7 @@ def _github_auth_probe(deadline_ns: int) -> ProbeOutcome:
 def _github_repo_read_probe(repo: str, deadline_ns: int) -> ProbeOutcome:
     return _run_probe_with_deadline(
         "github_repo_read",
-        ["gh", "repo", "view", repo, "--json", "name"],
+        ["gh", "repo", "view", f"github.com/{repo}", "--json", "name"],
         deadline_ns=deadline_ns,
         cap_seconds=_GITHUB_REPO_READ_PROBE_CAP_SECONDS,
     )
