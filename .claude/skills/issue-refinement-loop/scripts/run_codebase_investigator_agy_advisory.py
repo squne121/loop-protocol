@@ -33,6 +33,7 @@ _REQUIRED_REQUEST_KEYS = frozenset(
     }
 )
 _OPTIONAL_REQUEST_KEYS = frozenset({"context_paths"})
+_PRIVATE_SMOKE_SAFE_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "TERM")
 
 sys.path.insert(0, str(_SCRIPT_DIR))
 from route_agy_advisory_fallback import (  # noqa: E402
@@ -52,6 +53,49 @@ class ControllerRun:
 
 class ControllerInputError(ValueError):
     """A caller-controlled request violates the exact public contract."""
+
+
+def _private_smoke_wrapper_env(
+    private_dir: Path,
+    test_wrapper_env_overlay: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Build the private fake's credential-sterile wrapper environment.
+
+    The sole actual-wrapper smoke must exercise the canonical wrapper without
+    letting its ``proposal_only`` workspace discover host OAuth, keyring, or
+    configuration paths. Only the test-owned fake's PATH is admitted; HOME
+    and every XDG config/cache/state root are fresh directories below the
+    controller-owned temporary directory.
+    """
+    if test_wrapper_env_overlay is None or set(test_wrapper_env_overlay) != {"PATH"}:
+        raise ValueError("private smoke requires exactly the test-owned PATH overlay")
+    fake_path = test_wrapper_env_overlay["PATH"]
+    if not isinstance(fake_path, str) or not fake_path:
+        raise ValueError("private smoke PATH overlay must be non-empty")
+
+    private_home = private_dir / "private-smoke-home"
+    xdg_config = private_dir / "private-smoke-xdg-config"
+    xdg_cache = private_dir / "private-smoke-xdg-cache"
+    xdg_state = private_dir / "private-smoke-xdg-state"
+    for directory in (private_home, xdg_config, xdg_cache, xdg_state):
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+
+    env = {
+        key: value
+        for key in _PRIVATE_SMOKE_SAFE_ENV_KEYS
+        if (value := os.environ.get(key)) is not None
+    }
+    env.update(
+        {
+            "PATH": fake_path,
+            "HOME": str(private_home),
+            "XDG_CONFIG_HOME": str(xdg_config),
+            "XDG_CACHE_HOME": str(xdg_cache),
+            "XDG_STATE_HOME": str(xdg_state),
+        }
+    )
+    return env
 
 
 def _failed(reason_code: str, failure_class: str | None = None) -> ControllerRun:
@@ -266,11 +310,14 @@ def _run_controller(
         except ProtocolError:
             return _failed("builder_failed")
 
-        wrapper_env = dict(os.environ)
-        wrapper_env.pop("AGY_BIN", None)
-        if test_wrapper_env_overlay is not None:
-            # A caller cannot reach this argument through the public CLI/API.
-            wrapper_env.update(test_wrapper_env_overlay)
+        if _test_profile == "proposal_only":
+            wrapper_env = _private_smoke_wrapper_env(private_dir, test_wrapper_env_overlay)
+        else:
+            wrapper_env = dict(os.environ)
+            wrapper_env.pop("AGY_BIN", None)
+            if test_wrapper_env_overlay is not None:
+                # A caller cannot reach this argument through the public CLI/API.
+                wrapper_env.update(test_wrapper_env_overlay)
         try:
             subprocess.run(
                 [

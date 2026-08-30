@@ -121,6 +121,60 @@ def test_ambient_agy_bin_is_stripped_and_only_private_test_overlay_can_restore_i
     assert "/ambient/not-allowed" not in wrapper_env.values()
 
 
+def test_private_proposal_only_smoke_uses_sterile_wrapper_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_files(tmp_path)
+    host_environment = {
+        "AGY_BIN": "/sanitized/host-agy",
+        "HOME": "/sanitized/host-home",
+        "XDG_CONFIG_HOME": "/sanitized/host-xdg-config",
+        "XDG_CACHE_HOME": "/sanitized/host-xdg-cache",
+        "XDG_STATE_HOME": "/sanitized/host-xdg-state",
+        "XDG_RUNTIME_DIR": "/sanitized/host-runtime",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/sanitized/host-bus",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/sanitized/host-application-credentials",
+        "KEYRING_SESSION_KEYRING": "sanitized-host-keyring",
+    }
+    for key, value in host_environment.items():
+        monkeypatch.setenv(key, value)
+    calls = _install_subprocess_fake(monkeypatch, result=_wrapper_result())
+
+    run = controller._run_controller(
+        _request(),
+        root=tmp_path,
+        test_wrapper_env_overlay={"PATH": "/test-owned-fake-bin:/usr/bin"},
+        _test_profile="proposal_only",
+    )
+
+    assert run.decision["status"] == "ok"
+    wrapper_env = calls[1][1]["env"]
+    assert wrapper_env["PATH"] == "/test-owned-fake-bin:/usr/bin"
+    assert Path(wrapper_env["HOME"]).name == "private-smoke-home"
+    assert Path(wrapper_env["XDG_CONFIG_HOME"]).name == "private-smoke-xdg-config"
+    assert Path(wrapper_env["XDG_CACHE_HOME"]).name == "private-smoke-xdg-cache"
+    assert Path(wrapper_env["XDG_STATE_HOME"]).name == "private-smoke-xdg-state"
+    for key in {
+        "AGY_BIN",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "KEYRING_SESSION_KEYRING",
+    }:
+        assert key not in wrapper_env
+    assert not set(host_environment.values()).intersection(wrapper_env.values())
+    assert set(wrapper_env) <= {
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+    }
+
+
 def test_input_unknown_keys_and_legacy_field_are_rejected_before_children(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
