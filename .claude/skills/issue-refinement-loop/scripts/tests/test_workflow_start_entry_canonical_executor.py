@@ -304,8 +304,8 @@ def _write_controlled_gh(trusted_bin: Path) -> None:
 
     It reads only GH_CONFIG_DIR presence plus equality with a test-owned
     expected path, then records an opaque match status and command order.  It
-    never opens configuration files or observes token/HOME values; non-empty
-    credential environment is rejected without recording its value.
+    never opens configuration files or observes token/HOME values; forwarded
+    credential keys are rejected without expanding or recording their values.
     """
     trusted_bin.mkdir(parents=True)
     gh_path = trusted_bin / "gh"
@@ -317,10 +317,10 @@ if [ -n "${GH_CONFIG_DIR:-}" ] && [ "${GH_CONFIG_DIR}" = "${SKILL_RUNTIME_TEST_E
 else
     gh_config_state=missing_or_wrong_path
 fi
-if [ -n "${GH_TOKEN:-}" ] || \
-   [ -n "${GITHUB_TOKEN:-}" ] || \
-   [ -n "${GH_ENTERPRISE_TOKEN:-}" ] || \
-   [ -n "${GITHUB_ENTERPRISE_TOKEN:-}" ]; then
+if [ "${GH_TOKEN+x}" = x ] || \
+   [ "${GITHUB_TOKEN+x}" = x ] || \
+   [ "${GH_ENTERPRISE_TOKEN+x}" = x ] || \
+   [ "${GITHUB_ENTERPRISE_TOKEN+x}" = x ]; then
     printf '%s\n' "unexpected-credential-environment" >> "${SKILL_RUNTIME_TEST_GH_PROBE_LOG}"
     exit 65
 fi

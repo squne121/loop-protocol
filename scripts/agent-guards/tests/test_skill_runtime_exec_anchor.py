@@ -582,7 +582,7 @@ def _fake_gh(args, *positional, **kwargs):
         else "missing_or_wrong_path"
     )
     if expected_config_dir and any(
-        os.environ.get(name)
+        name in os.environ
         for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
     ):
         return subprocess.CompletedProcess(args, 2, "", "unexpected credential environment")
