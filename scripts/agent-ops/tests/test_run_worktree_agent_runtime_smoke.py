@@ -156,8 +156,9 @@ def test_given_native_policy_payload_when_generated_then_exact_peer_policy_and_o
     assert set(settings["hooks"]) == {"SubagentStart", "SubagentStop"}
 
 
-def test_given_native_structured_spawn_when_fake_child_receives_settings_then_peer_tools_are_fixed_and_no_peer_is_started(
-    repo_with_worktree, tmp_path
+def test_given_native_structured_spawn_when_fake_child_gets_settings_then_peer_tools_are_fixed_and_no_peer_is_started(
+    repo_with_worktree,
+    tmp_path,
 ):
     """A controlled child process validates only its own generated settings.
     It never starts, lists, sends to, or observes an independent peer."""
@@ -185,7 +186,10 @@ PY
 printf '%s' absent_or_denied > {shlex.quote(str(observed))}
 cat > /dev/null
 printf '%s\\n' '{{"type":"system","subtype":"init"}}'
-printf '%s\\n' '{{"type":"result","subtype":"success","permission_denials":[{{"tool_name":"SendMessage"}},{{"tool_name":"ListAgents"}}]}}'
+result='{{"type":"result","subtype":"success",'
+result+='"permission_denials":[{{"tool_name":"SendMessage"}},'
+result+='{{"tool_name":"ListAgents"}}]}}'
+printf '%s\\n' "$result"
 """)
     prompt = _prompt_file(tmp_path)
     result = _run(
