@@ -13,7 +13,7 @@ refinement completion の gate である。本文更新だけを完了条件と�
 retrospective: 本文には `#2422`/`#2423`/`#2432` が `## Blocked By` として記載されたが、GitHub native
 `blocked_by` の live readback は空集合のままだった）。
 
-## dependency-materialization choke point（AC2）
+## dependency-materialization choke point の設計（AC2）
 
 `.claude/skills/issue-refinement-loop/scripts/dependency_materializer.py` が、確定済み hard
 dependency をどの経路が確定したかに関わらず経由させる、単一の共通 dependency-materialization
