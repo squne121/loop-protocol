@@ -6,7 +6,7 @@ capability parity の検証結果を記録する。研究専用（research-only�
 guard / launcher の実装修正はここでは行わない。実装修正が必要な場合は
 follow-up implementation Issue を作成しリンクする。
 
-## Issue #2436: Claude-GPT / Native Claude parity — agent-retrospective bash guard
+## Issue #2436 の検証記録: Claude-GPT / Native Claude parity（agent-retrospective bash guard）
 
 ### 結果サマリ
 
@@ -21,19 +21,19 @@ claude_gpt_live_allow_passed: false
 nested_claude_proxy_transport_proven: false
 ```
 
-- `timestamp`: 2026-08-30 (JST, session date)
-- `tested_repository`: squne121/loop-protocol
-- `tested_head`: `aade97858e348985081156afab134c317faac67f`（`origin/main`、PR #2425
-  merge 後の直近 HEAD。`.claude/skills/agent-retrospective/**` /
+- 検証日時（`timestamp`）: 2026-08-30（日本時間、セッション実施日）
+- 対象リポジトリ（`tested_repository`）: squne121/loop-protocol
+- 検証対象コミット（`tested_head`）: `aade97858e348985081156afab134c317faac67f`
+  （`origin/main`、PR #2425 merge 後の直近 HEAD。`.claude/skills/agent-retrospective/**` /
   `scripts/claude-gpt/**` に PR #2425 以降の semantic change なし）
-- `related_issues`: #2436 (this), #2419 (guard incident origin), #2425 (P0 bypass fix,
-  merged), #2204 / PR #2205 (SKIP/transport evidence semantics precedent),
-  **#2445 (follow-up implementation issue, created by this investigation)**
-- `redaction_policy`: token / OAuth credential / raw prompt / raw model response は
-  記録しない。proxy 構造化ログの `reqId` / `path` / `status` / `transport` フィールドのみ
-  参照する。
+- 関連 Issue（`related_issues`）: #2436（本件）, #2419（guard incident の起源）,
+  #2425（P0 bypass fix, merged）, #2204 / PR #2205（SKIP/transport evidence
+  semantics の先例）, **#2445（本調査で作成した follow-up implementation issue）**
+- 秘匿情報の取り扱い方針（`redaction_policy`）: token / OAuth credential /
+  raw prompt / raw model response は記録しない。proxy 構造化ログの `reqId` /
+  `path` / `status` / `transport` フィールドのみ参照する。
 
-### AC1: deterministic guard matrix（決定論的）— PASS
+### AC1: 決定論的ガード検証（deterministic guard matrix）— PASS
 
 ```yaml
 deterministic_guard_matrix_passed: true
@@ -50,25 +50,25 @@ uv run --locked pytest \
 
 再現規約カバレッジ（PR #2425 の P0 bypass class を含む）を確認済み:
 
-- process substitution: `cat <(git merge stale-feature)`
-- `find -exec` / `-execdir`: `find . -maxdepth 1 -exec git merge stale-feature ;`
-- Python/uv 間接実行: `python3 -c "os.system(...)"`, `uv run python3 script_that_merges.py`
-- newline separator: `ls\ngit merge stale-feature`
-- git inline alias/config bypass: `git -c alias.merge-x=merge merge-x stale-feature`,
+- プロセス置換（process substitution）の迂回拒否: `cat <(git merge stale-feature)`
+- `find -exec` / `-execdir` 経由の迂回拒否: `find . -maxdepth 1 -exec git merge stale-feature ;`
+- Python/uv 間接実行の迂回拒否: `python3 -c "os.system(...)"`, `uv run python3 script_that_merges.py`
+- 改行区切り（newline separator）の迂回拒否: `ls\ngit merge stale-feature`
+- git inline alias/config を使った迂回拒否: `git -c alias.merge-x=merge merge-x stale-feature`,
   `git --config alias.mx=merge mx stale-feature`
-- git 未列挙 mutation（denylist 漏れ対策）: `git add`, `git hash-object -w`,
+- git 未列挙 mutation（denylist 漏れ対策）の拒否: `git add`, `git hash-object -w`,
   `git bisect start`
-- `gh` action-position spoof: `gh pr checkout 1 --branch view`,
+- `gh` action-position spoof（位置引数偽装）の拒否: `gh pr checkout 1 --branch view`,
   `gh workflow run triage.yml --ref view`
-- canonical AGY capability の allow: `test_bash_guard_hook_allows_canonical_agy_builder_invocation*`
-- read-only git pipeline / read-only GitHub commands / `gh api` GET の allow
-- hook unexpected exception の fail-closed: `test_bash_guard_hook_exits_2_on_unexpected_exception`
+- canonical AGY capability の許可確認: `test_bash_guard_hook_allows_canonical_agy_builder_invocation*`
+- read-only な git pipeline / GitHub コマンド / `gh api` GET の許可確認
+- hook 内の想定外例外に対する fail-closed 挙動の確認: `test_bash_guard_hook_exits_2_on_unexpected_exception`
 
 この結果自体は、この検証で発見された下記の transport routing gap の影響を
 受けない（`retrospective_bash_guard_hook.py` を直接 subprocess として起動する
 決定論的テストであり、backend/proxy の識別とは独立している）。
 
-### AC2: Claude-GPT availability probe — available
+### AC2: Claude-GPT 可用性確認（availability probe）— available（利用可能）
 
 ```yaml
 availability_probe: available
@@ -78,14 +78,14 @@ availability_probe: available
 scripts/claude-gpt/launch.sh --check-only
 ```
 
-- exit code: `0`
-- `chatgpt_auth.available`: `true`（`detail: "authenticated"`）
-- `proxy.absolute_path`: `/home/squne/.local/bin/claude-code-proxy`
-- `proxy.version`: `claude-code-proxy 0.1.34`
-- `canonical_paths.ok`: `true`, `read_restriction.ok`: `true`
-- launcher identity: `scripts/claude-gpt/launch.sh`
-  sha256=`e006608d9999741adfcf7b3be230f0be8043128689c042413132fb22c905fa44`
-- Claude CLI identity: `2.1.251 (Claude Code)` (`/home/squne/.local/bin/claude`)
+- 終了コード（exit code）: `0`
+- ChatGPT 認証状態（`chatgpt_auth.available`）: `true`（`detail: "authenticated"`）
+- proxy の絶対パス（`proxy.absolute_path`）: `/home/squne/.local/bin/claude-code-proxy`
+- proxy のバージョン（`proxy.version`）: `claude-code-proxy 0.1.34`
+- パス検証結果（`canonical_paths.ok` / `read_restriction.ok`）: いずれも `true`
+- launcher の識別情報: `scripts/claude-gpt/launch.sh`
+  の sha256 は `e006608d9999741adfcf7b3be230f0be8043128689c042413132fb22c905fa44`
+- Claude CLI の識別情報: `2.1.251 (Claude Code)` (`/home/squne/.local/bin/claude`)
 
 secret/token の値は記録していない。
 
