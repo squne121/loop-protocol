@@ -466,6 +466,32 @@ class TestAssetClassification:
         failures = MOD.check_duplicate_agent_names(agent_dir)
         assert any("duplicate Claude agent name" in f for f in failures)
 
+    def test_nested_subdirectory_agent_is_discovered(self, tmp_path: Path):
+        # Claude Code recursively scans `.claude/agents/**` (subdirectories
+        # included, see https://code.claude.com/docs/en/sub-agents), so a
+        # nested `.claude/agents/<subdir>/foo.md` must be discovered by both
+        # asset-classification completeness and duplicate-name detection,
+        # not silently skipped by a non-recursive `glob("*.md")`.
+        agent_dir = tmp_path / ".claude" / "agents"
+        subdir = agent_dir / "subdir"
+        subdir.mkdir(parents=True, exist_ok=True)
+        (subdir / "foo.md").write_text("---\nname: nested-foo\n---\nbody\n", encoding="utf-8")
+
+        failures = MOD.check_asset_classification_complete({}, agent_dir)
+        assert any(
+            f == "asset_classification: .claude/agents/subdir/foo.md is unclassified"
+            for f in failures
+        )
+
+        # A same-named duplicate in a different subdirectory must still be
+        # caught (duplicate-name uniqueness is repo-subtree-wide, not
+        # per-directory).
+        other_subdir = agent_dir / "other"
+        other_subdir.mkdir(parents=True, exist_ok=True)
+        (other_subdir / "foo.md").write_text("---\nname: nested-foo\n---\nbody\n", encoding="utf-8")
+        dup_failures = MOD.check_duplicate_agent_names(agent_dir)
+        assert any("duplicate Claude agent name 'nested-foo'" in f for f in dup_failures)
+
 
 # ---------------------------------------------------------------------------
 # Real repo integration (parity with the historical B4 test)

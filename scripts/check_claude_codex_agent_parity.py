@@ -532,8 +532,17 @@ def check_asset_classification_complete(
     failures: list[str] = []
     discovered: list[str] = []
     if claude_agent_dir.is_dir():
+        # Claude Code recursively discovers `.claude/agents/**` (subdirectories
+        # included, names must be unique across the whole subtree -- see
+        # https://code.claude.com/docs/en/sub-agents), so this must use
+        # `rglob()` (not a non-recursive `glob("*.md")`) and preserve the
+        # path relative to `claude_agent_dir` (not just the filename) so a
+        # nested `.claude/agents/<subdir>/foo.md` is discovered and reported
+        # under its own subdirectory, not collapsed onto (or collided with) a
+        # top-level `foo.md`.
         discovered.extend(
-            f".claude/agents/{p.name}" for p in sorted(claude_agent_dir.glob("*.md"))
+            f".claude/agents/{p.relative_to(claude_agent_dir).as_posix()}"
+            for p in sorted(claude_agent_dir.rglob("*.md"))
         )
     for rel_path in discovered:
         cls = classification.get(rel_path)
@@ -597,21 +606,31 @@ def check_asset_classification_pairing(
 
 
 def check_duplicate_agent_names(claude_agent_dir: Path) -> list[str]:
-    """Duplicate agent `name:` values within `.claude/agents/` are errors."""
+    """Duplicate agent `name:` values within `.claude/agents/` are errors.
+
+    Claude Code recursively discovers `.claude/agents/**` and requires
+    `name:` to be unique across the *whole subtree* (not just per
+    directory) -- see https://code.claude.com/docs/en/sub-agents -- so this
+    uses `rglob()` (not a non-recursive `glob("*.md")`) and reports each
+    duplicate by its path relative to `claude_agent_dir` (not just the bare
+    filename), so two same-named nested agents in different subdirectories
+    are still caught and clearly identified.
+    """
     failures: list[str] = []
     if claude_agent_dir.is_dir():
         seen: dict[str, Path] = {}
-        for md_path in sorted(claude_agent_dir.glob("*.md")):
+        for md_path in sorted(claude_agent_dir.rglob("*.md")):
             fm = extract_frontmatter(md_path.read_text(encoding="utf-8"), source_path=str(md_path))
             name = fm.get("name")
             if not isinstance(name, str) or not name:
                 continue
+            rel_path = md_path.relative_to(claude_agent_dir).as_posix()
             if name in seen:
                 failures.append(
-                    f"duplicate Claude agent name {name!r}: {seen[name]} and {md_path}"
+                    f"duplicate Claude agent name {name!r}: {seen[name]} and {rel_path}"
                 )
             else:
-                seen[name] = md_path
+                seen[name] = rel_path
     return failures
 
 
