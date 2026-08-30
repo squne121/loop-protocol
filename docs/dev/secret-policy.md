@@ -284,7 +284,7 @@ LATITUDE_PILOT_EXCEPTION_V1:
 > `remote_cleanup_state: machine_verified`、`distribution.*` の各 digest を確定させること。
 > 1 つでも欠落・unknown・不正があれば host verifier は activation を `blocked_until_activation` に固定する。
 
-#### owner-controlled policy supersession（#2426）
+#### owner-controlled policy supersession（オーナー主導のポリシー上書き、#2426）
 
 `#2426` は、Native Claude Code が既に利用している local Latitude observation
 profile を、同一 project 宛に限り Claude-GPT にも適用する owner-approved local
