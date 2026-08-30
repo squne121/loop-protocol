@@ -18,6 +18,20 @@ hermetic runtime smoke。
 （`docs/dev/runtime-verification-policy.md` Runtime Verification
 Applicability: `decision: immediate`, `applicable_acs: [AC4, AC5]`）。
 
+iteration 2（impl-review-loop control-plane による実 `claude` CLI 手動再現で
+発見）: 生成される canonical settings は spark-auth に対して常に `Read(...)`
+と `Edit(...)` の両方の deny を持つ。この環境の実 `claude` CLI では
+`Read(...)` deny だけでも Write tool による新規ファイル作成がブロックされる
+ことが実機確認されているため（後述 `test_canonical_edit_deny_blocks_...`
+docstring 参照）、両方が揃った production settings に対する Write tool
+new-file-creation の block 確認だけでは、"Edit(...) deny が実際にブロックの
+原因になっている" ことを "Read(...) deny 単体でも同一の PASS 結果になる
+（Edit(...) deny 側の文法/エントリが将来 silently 壊れても検知できない）"
+から区別できない。そのため、生成済み settings から spark-auth 向け
+`Read(...)` deny エントリのみを機械的に除去した Edit(...)-only variant を
+追加で用いる sub-check を設け、Edit(...) deny 自体の効果を独立に証明する
+（PR #2458 review, P0 iteration 2）。
+
 実 `claude` binary が test environment で利用不能な場合は `pytest.skip` する
 （SKIP。既存 `test_auto_mode_policy.py` の
 `@pytest.mark.skipif(REAL_CLAUDE_BIN is None, ...)` および
@@ -38,6 +52,7 @@ subscription / spark-auth credential とは無関係）。
 from __future__ import annotations
 
 import importlib.util
+import json
 import shutil
 import subprocess
 import uuid
@@ -160,6 +175,42 @@ def test_synthetic_legacy_write_only_rule_reproduces_warning_negative_control(tm
     assert LEGACY_WARNING_SNIPPET in combined, f"claude --version: {CLAUDE_VERSION}\n{combined}"
 
 
+def _spark_auth_read_deny_entries(deny: list[str]) -> list[str]:
+    return [rule for rule in deny if rule.startswith("Read(") and "spark-auth" in rule]
+
+
+def _write_edit_only_settings(settings_path: Path) -> Path:
+    """Derive an `Edit(...)`-only variant of the real generated settings by
+    programmatically removing the pre-existing spark-auth `Read(...)` deny
+    entry from the real generated `permissions.deny` list (PR #2458 review,
+    iteration 2, P0 follow-up).
+
+    Deliberately *not* hand-authored from scratch: the returned settings
+    stay coupled to whatever `launch.sh --check-only` actually emitted
+    (same unrelated `Read(...)` entries for `proxy-config/`, `state/`,
+    `proxy-home/`, same canonical `Edit(<spark-auth>/**)` entry), with only
+    the spark-auth `Read(...)` entry surgically removed. This isolates
+    `Edit(...)` deny's own effect from `Read(...)` deny's effect, which the
+    full-production-settings check (both present) cannot do by itself --
+    this repo's own runtime smoke independently found that `Read(...)` deny
+    ALONE also blocks Write-tool new-file-creation in this environment (see
+    the module-level iteration-2 docstring note above), so a PASS against
+    full settings does not, on its own, prove `Edit(...)` deny is doing
+    anything.
+    """
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    deny = settings["permissions"]["deny"]
+    spark_auth_read_entries = _spark_auth_read_deny_entries(deny)
+    assert spark_auth_read_entries, (
+        "expected launch.sh --check-only to generate a pre-existing spark-auth "
+        f"Read(...) deny entry to remove for the isolation variant; deny={deny}"
+    )
+    settings["permissions"]["deny"] = [r for r in deny if r not in spark_auth_read_entries]
+    edit_only_settings_path = settings_path.parent / "settings.local.edit-only-isolation.json"
+    edit_only_settings_path.write_text(json.dumps(settings), encoding="utf-8")
+    return edit_only_settings_path
+
+
 def test_canonical_edit_deny_blocks_spark_auth_new_file_write_at_tool_boundary(tmp_path):
     """GIVEN launch.sh --check-only が生成した canonical Edit(...) deny を含む
     settings と、spark-auth 配下にまだ存在しない新規ファイルパス、対照用の
@@ -173,15 +224,31 @@ def test_canonical_edit_deny_blocks_spark_auth_new_file_write_at_tool_boundary(t
     control）(AC5: config の文字列検査だけを PASS としない)
 
     既存ファイルの Edit ではなく未作成ファイルへの Write を使う理由（PR #2458
-    review, P0）: Claude Code の公式仕様では Read(path) deny も同じパスへの
-    Edit tool 呼び出しをブロックするが、Write/NotebookEdit はブロックしない。
-    今回生成される settings は spark-auth に対して Read(...) と Edit(...) の
-    両方の deny を持つため、既存ファイルへの Edit tool 呼び出しを検証対象に
-    すると、たとえ Edit(...) deny 自体を意図的に外しても Read(...) deny だけで
-    ブロックされてしまい、証明すべき Edit(...) deny の効果を証明できない
-    （false PASS しうる）。Write tool による新規ファイル作成は Read(path) deny
-    ではブロックされず、Edit(path) deny によってのみブロックされるため、
-    Edit(...) deny 自体の効果を直接証明できる。
+    review, P0 iteration 1）: 既存ファイルへの Edit tool 呼び出しは、同じパスへの
+    Read(path) deny によってもブロックされる。今回生成される settings は
+    spark-auth に対して Read(...) と Edit(...) の両方の deny を持つため、既存
+    ファイルへの Edit tool 呼び出しを検証対象にすると、たとえ Edit(...) deny
+    自体を意図的に外しても Read(...) deny だけでブロックされてしまい、証明すべき
+    Edit(...) deny の効果を証明できない（false PASS しうる）。
+
+    このテスト本体のチェック（full production settings = Read(...) + Edit(...)
+    両方が揃った状態）は、spark-auth 全体が実 tool boundary で実際にブロックされる
+    ことの end-to-end 確認であり、これ自体は有効な evidence である。ただし
+    iteration 2（PR #2458 review, P0 iteration 2, impl-review-loop control-plane
+    による実 claude CLI 手動再現）で、この環境の実 claude CLI では Write tool に
+    よる新規ファイル作成は Read(...) deny 単体でもブロックされることが実機確認
+    された（Read(path) deny が Write tool による新規ファイル作成を一般にブロック
+    しない、という一般則を本リポジトリ独自に検証・保証することはできない）。その
+    ため full production settings（Read(...) + Edit(...) 両方）に対する block 確認
+    だけでは、"Edit(...) deny が実際にブロックの原因になっている" ことと
+    "Read(...) deny 単体でも同一の PASS 結果になる（Edit(...) deny 側が将来
+    silently 壊れても検知できない）" ことを区別できない。そのため下段で
+    `_write_edit_only_settings` により spark-auth の Read(...) deny エントリだけを
+    機械的に除去した Edit(...)-only settings variant を追加し、Edit(...) deny
+    自体の効果を独立に証明する sub-check を行う。これが AC5 の causal claim
+    （Edit(...) deny 自体の効果）を実際に証明する evidence であり、full
+    production settings の check は end-to-end 確認としての補助的 evidence
+    という位置づけになる。
     """
     result, settings_path = run_check_only(tmp_path)
     assert settings_path.exists(), result.stderr
@@ -217,11 +284,60 @@ def test_canonical_edit_deny_blocks_spark_auth_new_file_write_at_tool_boundary(t
     transcript = f"claude --version: {CLAUDE_VERSION}\nclaude stdout:\n{proc.stdout}\nclaude stderr:\n{proc.stderr}"
 
     assert not blocked_path.exists(), (
-        "spark-auth new file must not be created -- canonical Edit(...) deny must "
-        f"block the Write tool at the real tool boundary.\n{transcript}"
+        "spark-auth new file must not be created -- full production settings "
+        f"(Read+Edit both present) must block the Write tool at the real tool "
+        f"boundary end-to-end.\n{transcript}"
     )
     assert control_path.exists() and "ALLOWED_CONTENT" in control_path.read_text(encoding="utf-8"), (
         "control file outside spark-auth must be created by the Write tool under "
         f"acceptEdits -- otherwise this is not a valid positive control proving the "
         f"Write tool boundary was actually exercised.\n{transcript}"
+    )
+
+    # --- iteration 2 (PR #2458 review, P0 iteration 2) ---
+    # Isolate Edit(...) deny's own effect from Read(...) deny's effect using
+    # an Edit(...)-only settings variant derived from the real generated
+    # settings (spark-auth Read(...) deny entry removed; see
+    # `_write_edit_only_settings` docstring for why this is necessary).
+    edit_only_settings_path = _write_edit_only_settings(settings_path)
+
+    edit_only_blocked_path = spark_auth_dir / f"blocked-edit-only-{uuid.uuid4().hex}.txt"
+    assert not edit_only_blocked_path.exists(), "edit_only_blocked_path must not pre-exist"
+
+    edit_only_control_path = tmp_path / f"allowed-edit-only-{uuid.uuid4().hex}.txt"
+    assert not edit_only_control_path.exists(), "edit_only_control_path must not pre-exist"
+
+    edit_only_prompt = (
+        f"Use the Write tool to create a new file at {edit_only_blocked_path} with the "
+        f"exact content BLOCKED_CONTENT. Then use the Write tool to create a new file at "
+        f"{edit_only_control_path} with the exact content ALLOWED_CONTENT. Attempt both "
+        "writes even if one fails; do not ask for confirmation; report the outcome of "
+        "each attempt."
+    )
+    edit_only_proc = _run_claude_print(
+        edit_only_settings_path,
+        edit_only_prompt,
+        permission_mode="acceptEdits",
+        timeout=90.0,
+        cwd=tmp_path,
+        tools="Write",
+    )
+    edit_only_transcript = (
+        f"claude --version: {CLAUDE_VERSION}\n"
+        f"claude stdout:\n{edit_only_proc.stdout}\nclaude stderr:\n{edit_only_proc.stderr}"
+    )
+
+    assert not edit_only_blocked_path.exists(), (
+        "spark-auth new file must not be created even with the spark-auth Read(...) "
+        "deny entry removed -- this directly and unambiguously proves Edit(...) "
+        "deny's own effect at the real tool boundary, independent of Read(...) deny "
+        f"(PR #2458 review, P0 iteration 2).\n{edit_only_transcript}"
+    )
+    assert edit_only_control_path.exists() and "ALLOWED_CONTENT" in edit_only_control_path.read_text(
+        encoding="utf-8"
+    ), (
+        "control file outside spark-auth must be created by the Write tool under "
+        "acceptEdits with the Edit(...)-only settings too -- otherwise this is not a "
+        "valid positive control proving the Write tool boundary was actually exercised "
+        f"for the isolated variant.\n{edit_only_transcript}"
     )
