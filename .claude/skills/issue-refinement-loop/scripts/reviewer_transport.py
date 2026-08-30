@@ -108,10 +108,9 @@ MAX_ATTEMPTS = 3
 # allowlist of transport-layer-only reason codes -- `spawn_failure`,
 # `signal`, `capture_failure` -- not "every reason_code except timeout").
 # This means the deterministic backend effectively gets ONE full-length
-# attempt for a VC-execution-budget failure. Other backends
-# (`claude`/`codex`) keep retrying on timeout, since an LLM session hang is
-# plausibly transient in a way a deterministic subprocess budget overrun is
-# not.
+# attempt for a VC-execution-budget failure. Other backends (`claude`) keep
+# retrying on timeout, since an LLM session hang is plausibly transient in a
+# way a deterministic subprocess budget overrun is not.
 #
 # TOTAL_DEADLINE_SECONDS stays >= PER_ATTEMPT_DEADLINE_SECONDS (+40s margin)
 # so a single full-length attempt is never starved of its own per-attempt
@@ -142,7 +141,7 @@ STDOUT_CAP = 65_536
 # Issue #2165 merge condition #8 (PR #2177 OWNER 2026-08-15 REQUEST_CHANGES,
 # fix_delta iteration 2): `has_sufficient_retry_attempt_budget()` is the
 # SINGLE, backend-agnostic budget check that gates spawning ANY new attempt
-# (2nd/3rd, of ANY backend -- deterministic, claude, codex, fixture) after
+# (2nd/3rd, of ANY backend -- deterministic, claude, fixture) after
 # the first. `run_reviewer_transport()`'s own attempt loop already applies
 # this uniformly regardless of `backend` (there is no `if backend ==
 # "deterministic"` branch around the check itself -- only `retry_matrix()`'s
@@ -169,9 +168,9 @@ def has_sufficient_retry_attempt_budget(
     smaller than ``min_fraction * per_attempt_deadline_seconds`` -- too
     small for a new attempt to realistically spawn, do minimal useful work,
     and clean up. Callers MUST NOT spawn a new attempt when this returns
-    ``False``, regardless of backend: a non-deterministic (claude/codex)
-    backend attempt has no better chance of completing useful work in a
-    near-zero remaining budget than a deterministic one does.
+    ``False``, regardless of backend: a non-deterministic (claude) backend
+    attempt has no better chance of completing useful work in a near-zero
+    remaining budget than a deterministic one does.
     """
     remaining_seconds = total_deadline_seconds - elapsed_seconds
     return remaining_seconds >= per_attempt_deadline_seconds * min_fraction
@@ -520,7 +519,11 @@ def retry_matrix(*, backend: str, initial_session_id: str | None, attempt: int, 
 # Backend command adapter (PR #2142 owner REQUEST_CHANGES P0-1)
 # ---------------------------------------------------------------------------
 
-_KNOWN_BACKENDS = frozenset({"claude", "codex", "deterministic", "fixture"})
+# Issue #2161: the native Codex CLI executable backend ("codex") was
+# retired from this transport (`native_codex_cli.disposition: retire`,
+# `compatibility_preservation: not_required`) -- no replacement Codex
+# adapter or compatibility shim was added.
+_KNOWN_BACKENDS = frozenset({"claude", "deterministic", "fixture"})
 
 
 def build_backend_command(*, backend: str, base_argv: list[str], session_id: str | None) -> list[str]:
@@ -537,12 +540,12 @@ def build_backend_command(*, backend: str, base_argv: list[str], session_id: str
     - ``claude``: same-session resume passes ``--resume <session_id>``;
       fresh-session replacement omits it (a new agent ID is assigned by the
       launched process, not synthesized here).
-    - ``codex``: same-session resume passes ``resume <session_id>``
-      (matching ``codex exec resume <id>`` CLI convention); fresh-session
-      replacement omits it.
     - ``deterministic``: no session concept (idempotent checker pipeline);
       argv is returned unchanged regardless of ``session_id``.
     - ``fixture``: test-only passthrough, unchanged.
+
+    Issue #2161: the native Codex CLI executable backend (``codex``) has
+    been removed from ``_KNOWN_BACKENDS`` and no longer has a branch here.
     """
     if backend not in _KNOWN_BACKENDS:
         raise ValueError(f"unknown_backend:{backend}")
@@ -550,8 +553,6 @@ def build_backend_command(*, backend: str, base_argv: list[str], session_id: str
         raise ValueError("empty_base_argv")
     if backend == "claude":
         return [*base_argv, "--resume", session_id] if session_id else list(base_argv)
-    if backend == "codex":
-        return [*base_argv, "resume", session_id] if session_id else list(base_argv)
     return list(base_argv)
 
 

@@ -5,7 +5,8 @@ Issue #2119 AC12: e2e-core / e2e-responsive-matrix must have explicit
 CLASSIFICATION_MAP entries so determine_check_verdict() does not fall back
 to `unknown` -> `blocking=True, failure_reason="gh_error"` when both
 providers actually succeeded (the same class of regression Issue #1760
-fixed for python-test-core/codex-execpolicy).
+fixed for python-test-core/the former codex-execpolicy job, retired by
+Issue #2161's native Codex CLI retirement).
 """
 from __future__ import annotations
 

@@ -17,7 +17,6 @@
 | `docs/dev/agent-skill-boundaries.md` | 不要 | 不要 | 必須 | 不要 |
 | `docs/dev/**`（その他） | 不要 | 不要 | 条件付き（CI/skill/schema/artifact contract 変更の場合のみ） | 不要 |
 | `.claude/skills/**/SKILL.md` | 不要 | 不要 | 必須 | 不要 |
-| `.codex/agents/*.toml` | 不要 | 不要 | 必須 | 不要 |
 | `.agents/skills/**/SKILL.md` | 不要 | 不要 | 必須 | 不要 |
 
 ## CI_TEST_PERFORMANCE_DECISION_V1 完全スキーマ定義

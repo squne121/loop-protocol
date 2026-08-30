@@ -3,8 +3,8 @@
 local_main_branch_guard.py
 
 Shared core logic for the local root checkout branch drift guard.
-Used by both Claude Code (.claude/hooks/local_main_branch_guard.sh)
-and Codex CLI (.codex/hooks/local_main_branch_guard.sh) wrappers.
+Used by Claude Code (.claude/hooks/local_main_branch_guard.sh). Native
+Codex CLI historically had a parallel wrapper; it was retired in Issue #2161.
 
 Guard judgment: When running in local root context (cwd is under primary worktree
 and NOT inside a linked issue worktree), block any Bash command that would change

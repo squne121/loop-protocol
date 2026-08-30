@@ -9,9 +9,10 @@ This module provides:
   key rejection, malformed YAML detection). This is a real structural
   validator, not an identifier grep.
 - boundary check functions consumed by ``tests/test_post_merge_cleanup_boundary.py``
-  to verify the Claude/Codex worker frontmatter, the orchestrator/executor
+  to verify the Claude worker frontmatter, the orchestrator/executor
   instruction separation, the no-child policy, and the follow-up routing
-  ownership split described in Issue #1733.
+  ownership split described in Issue #1733. Issue #2161 (native Codex CLI
+  retirement) removed the parallel Codex worker TOML boundary checks.
 - a CLI entrypoint (``--check runtime_smoke_evidence``) that inspects
   ``worktree-agent-runtime-smoke`` evidence written under
   ``artifacts/runtime-smoke/`` for AC12 and exits 0/1/77 per
@@ -30,7 +31,6 @@ import ast
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -344,58 +344,23 @@ def check_worker_skills_frontmatter(worker_md_path: Path) -> ValidationResult:
     return ValidationResult(True)
 
 
-def check_codex_skill_surface(toml_path: Path) -> ValidationResult:
-    """AC3: post-merge-cleanup-worker.toml repo_local_skill_surface points at
-    the executor thin wrapper."""
-    with toml_path.open("rb") as fh:
-        data = tomllib.load(fh)
-    instructions = data.get("developer_instructions", "")
-    match = re.search(r"repo_local_skill_surface:\s*(\S+)", instructions)
-    if not match:
-        return ValidationResult(False, ["repo_local_skill_surface not found in developer_instructions"])
-    surface = match.group(1).strip()
-    expected = ".agents/skills/post-merge-cleanup-executor/SKILL.md"
-    if surface != expected:
-        return ValidationResult(False, [f"repo_local_skill_surface expected {expected!r}, got {surface!r}"])
-    return ValidationResult(True)
-
-
 # ---------------------------------------------------------------------------
 # Blocker 2 (Issue #1733 PR #1947 fix_delta): worker canonical-procedure
-# instruction hygiene — the Codex worker's ``developer_instructions`` and the
-# Claude worker's frontmatter ``description`` must both name
-# ``post-merge-cleanup-executor`` as the sole canonical procedure, not the
-# orchestrator Skill (``post-merge-cleanup``).
+# instruction hygiene — the Claude worker's frontmatter ``description`` must
+# name ``post-merge-cleanup-executor`` as the sole canonical procedure, not
+# the orchestrator Skill (``post-merge-cleanup``).
+#
+# Issue #2161 (native Codex CLI retirement): the Codex worker counterparts of
+# this check (``check_codex_skill_surface()`` / ``check_codex_no_stale_canonical()``,
+# and the ``_STALE_CODEX_CANONICAL_MARKER`` / ``_CODEX_CANONICAL_REQUIRED_MARKER`` /
+# ``_CODEX_ORCHESTRATOR_FORBID_MARKER`` markers they checked) were removed --
+# they parsed the now-deleted Codex agent TOML config for this worker
+# (formerly under the repository's deleted native-Codex-CLI asset tree) and
+# had no CLI/CI dispatch caller (only their own dedicated tests).
 # ---------------------------------------------------------------------------
-
-_STALE_CODEX_CANONICAL_MARKER = "skill を正本とする"
-_CODEX_CANONICAL_REQUIRED_MARKER = "唯一の canonical procedure とする"
-_CODEX_ORCHESTRATOR_FORBID_MARKER = "orchestrator Skill（`post-merge-cleanup`）の読込み・実行は禁止する"
 
 _STALE_CLAUDE_DESC_PROCEDURE_MARKER = "post-merge-cleanup` skill の Procedure を実行し"
 _CLAUDE_DESC_EXECUTOR_REQUIRED_MARKER = "post-merge-cleanup-executor` skill の Procedure を実行し"
-
-
-def check_codex_no_stale_canonical(toml_path: Path) -> ValidationResult:
-    """Blocker 2: Codex worker developer_instructions must name
-    post-merge-cleanup-executor as the sole canonical procedure and must not
-    retain the stale ``post-merge-cleanup`` skill を正本とする instruction."""
-    with toml_path.open("rb") as fh:
-        data = tomllib.load(fh)
-    instructions = data.get("developer_instructions", "")
-    errors: list[str] = []
-    if _STALE_CODEX_CANONICAL_MARKER in instructions:
-        errors.append(f"developer_instructions retains stale canonical marker: {_STALE_CODEX_CANONICAL_MARKER!r}")
-    if _CODEX_CANONICAL_REQUIRED_MARKER not in instructions:
-        errors.append(
-            f"developer_instructions missing explicit canonical marker: {_CODEX_CANONICAL_REQUIRED_MARKER!r}"
-        )
-    if _CODEX_ORCHESTRATOR_FORBID_MARKER not in instructions:
-        errors.append(
-            "developer_instructions missing explicit orchestrator-load prohibition: "
-            f"{_CODEX_ORCHESTRATOR_FORBID_MARKER!r}"
-        )
-    return ValidationResult(len(errors) == 0, errors)
 
 
 def check_claude_worker_description_no_stale_procedure(worker_md_path: Path) -> ValidationResult:
@@ -582,7 +547,7 @@ def check_agent_parity_strict(repo_root: Path = REPO_ROOT) -> ValidationResult:
     check_claude_codex_agent_parity.py), under which
     post-merge-cleanup-worker is now intentionally classified
     shared_claude_runtime in
-    tests/fixtures/codex-agent-config/expected-runtime-contract.json and is
+    tests/fixtures/agent-config/expected-runtime-contract.json and is
     therefore validated like any other shared Claude-runtime agent -- this
     is a deliberate, documented design change, not a regression.
 
@@ -686,8 +651,12 @@ def check_agent_parity_strict(repo_root: Path = REPO_ROOT) -> ValidationResult:
 # This is intentionally a single well-known path -- not a glob across
 # multiple ``artifacts/runtime-smoke/*/`` candidates -- so there is never
 # "which of several candidates" ambiguity (the exact false-positive source
-# Blocker 1 objected to).
-_DEFAULT_ARTIFACT_PATH = Path("artifacts/runtime-smoke/codex-structured/summary.md")
+# Blocker 1 objected to). Issue #2161 (native Codex CLI retirement): the
+# `--runtime codex` lane (and its `codex-structured` output-dir naming
+# convention) was removed from `run_worktree_agent_runtime_smoke.py`;
+# `claude-structured` is now the sole documented convention (see
+# `.claude/skills/worktree-agent-runtime-smoke/SKILL.md`).
+_DEFAULT_ARTIFACT_PATH = Path("artifacts/runtime-smoke/claude-structured/summary.md")
 
 _REQUIRED_STRUCTURED_SMOKE_FIELDS = (
     "tested_head",

@@ -2,11 +2,12 @@
 # verified_ff_merge_exec.py -- sole Codex-allowlisted executor for the
 # verified fast-forward merge lane (Issue 1589 / 1609 fix_delta P1 Blocker).
 #
-# .codex/rules/default.rules allowlists ONLY the exact invocation shape:
+# The native Codex CLI execpolicy rules file that historically allowlisted
+# ONLY the exact invocation shape below was retired in Issue #2161:
 #   uv run --locked --no-sync python3 scripts/agent-ops/verified_ff_merge_exec.py --target-sha SHA
 #
 # A bare rtk git merge --ff-only SHA command, with or without this shape,
-# stays in the generic prompt bucket in Codex execpolicy (a prefix_rule
+# stayed in the generic prompt bucket in the retired Codex execpolicy (a prefix_rule
 # allowlisting that shape directly would also match the broader rtk git
 # merge prompt rule, and execpolicy takes the most severe decision across
 # every matching rule, forbidden over prompt over allow, not first-rule-wins,

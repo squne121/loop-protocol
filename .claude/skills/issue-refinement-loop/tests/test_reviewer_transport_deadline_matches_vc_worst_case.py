@@ -174,7 +174,10 @@ def test_deterministic_backend_does_not_retry_deterministic_output_failures():
 
 
 def test_other_backends_still_retry_timeout_and_deterministic_output_failures_unchanged():
-    for backend in ("claude", "codex", "fixture"):
+    # Issue #2161: the native Codex CLI executable backend ("codex") has
+    # been retired from `reviewer_transport.py`, so this list no longer
+    # includes it.
+    for backend in ("claude", "fixture"):
         for reason_code in ("timeout", "nonzero_exit", "malformed_output"):
             assert (
                 transport.retry_matrix(backend=backend, initial_session_id=None, attempt=1, reason_code=reason_code)
@@ -256,7 +259,7 @@ def test_retry_attempt_is_spawned_when_remaining_budget_is_above_minimum(tmp_pat
 def test_has_sufficient_retry_attempt_budget_is_backend_agnostic_by_construction():
     # The helper takes no `backend` argument at all -- it cannot special-case
     # any backend, so it necessarily applies uniformly to deterministic,
-    # claude, codex, and fixture callers alike.
+    # claude, and fixture callers alike.
     assert "backend" not in transport.has_sufficient_retry_attempt_budget.__code__.co_varnames[
         : transport.has_sufficient_retry_attempt_budget.__code__.co_argcount
     ]
@@ -275,7 +278,7 @@ def test_has_sufficient_retry_attempt_budget_is_backend_agnostic_by_construction
 
 
 def test_retry_once_on_transport_failure_skips_retry_when_budget_insufficient_for_non_deterministic_backend():
-    # `invoke_child` here stands in for a non-deterministic (claude/codex)
+    # `invoke_child` here stands in for a non-deterministic (claude)
     # backend caller of `retry_once_on_transport_failure()`. Even though the
     # first call is a retryable transport failure (empty stdout), supplying
     # deadline state that leaves less than `MIN_RETRY_ATTEMPT_BUDGET_FRACTION

@@ -36,7 +36,6 @@ _THIS_FILE = Path(__file__).resolve()
 REPO_ROOT = _THIS_FILE.parent.parent.parent
 GUARD_SH = REPO_ROOT / ".claude" / "hooks" / "worktree_scope_guard.sh"
 GUARD_PY = REPO_ROOT / "scripts" / "agent-guards" / "worktree_scope_guard.py"
-CODEX_APPLY_PATCH_ADAPTER_PY = REPO_ROOT / "scripts" / "agent-guards" / "codex_apply_patch_adapter.py"
 SETTINGS_JSON = REPO_ROOT / ".claude" / "settings.json"
 
 
@@ -115,10 +114,10 @@ def _run_guard(payload: dict, project_root: Path, issue: str | None = None, extr
     return _run_guard_script(["bash", str(GUARD_SH)], payload, project_root, issue, extra_env)
 
 
-def _run_codex_apply_patch_adapter(payload: dict, project_root: Path, issue: str | None = None, extra_env: dict | None = None):
-    """Run codex_apply_patch_adapter.py — mirrors `.codex/hooks.json`'s
-    `apply_patch|Edit|Write` matcher invocation (`python3 codex_apply_patch_adapter.py`)."""
-    return _run_guard_script(["python3", str(CODEX_APPLY_PATCH_ADAPTER_PY)], payload, project_root, issue, extra_env)
+# Issue #2161: _run_codex_apply_patch_adapter() was removed along with
+# scripts/agent-guards/codex_apply_patch_adapter.py (native Codex CLI
+# retirement; its sole wiring point, the retired native Codex CLI hook
+# config's PreToolUse apply_patch|Edit|Write matcher, no longer exists).
 
 
 def _bash_payload(command: str, cwd: str) -> dict:

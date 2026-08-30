@@ -24,7 +24,6 @@ CI_PATTERNS=(
   "docs/dev/ci-performance.md"
   ".claude/skills/ci-test-performance/"
   ".agents/skills/ci-test-performance/"
-  ".codex/agents/"
   "schemas/"
 )
 

@@ -15,13 +15,16 @@ created: "2026-05-24"
 本文書は `session_recording_policy/v1` YAML と Kill Switch 手順の唯一の正本（SSOT）である。
 `secrets_mode` が `none` 以外に遷移した場合の session 記録制御と、Kill Switch の実行手順を定める。
 
-## Codex CLI Hook Boundary（Codex CLI フック境界）
+## Codex CLI Hook Boundary（Codex CLI フック境界、historical）
+
+native Codex CLI は Issue #2161 で repository から撤去済み。以下は撤去前の hook boundary を
+historical/reference record として残す。
 
 - Issue #1830 以後、project-local Codex active hook は `SessionEnd` と
-  `SubagentStop` の passive advisory recorder だけとする。以下に残る
+  `SubagentStop` の passive advisory recorder だけとした。以下に残る
   PreToolUse、PermissionRequest、Stop、scope-rollup、manifest producer、
   controlled publish の記述は履歴・再導入時の設計資料であり、active wiring
-  ではない。再導入には別 Issue が必要である。
+  ではなかった。再導入には別 Issue が必要である。
 - recorder は transcript 本文を解析せず、network/GitHub/git mutation、
   subprocess、permission/continuation/additional-context decision、post-run
   verifier、required gate を行わない。全エラーは fail-open、SessionEnd は

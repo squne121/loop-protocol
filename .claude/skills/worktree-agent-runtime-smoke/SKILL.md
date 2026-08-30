@@ -1,11 +1,11 @@
 ---
 name: worktree-agent-runtime-smoke
-description: linked worktree 内で Claude Code / Codex CLI の fresh runtime を起動し、structured output（既定・常に direct subprocess）または herdr interactive lane（TUI 固有挙動が必要な場合のみ・常に人間の Herdr session とは分離した isolated named session）で観測し、allowlist-only summary evidence を worktree-local に保存する共有 Skill。「runtime smoke」「動作検証を実行」「Claude/Codex を worktree で起動して確認」のトリガーで使う。
+description: linked worktree 内で Claude Code の fresh runtime を起動し、structured output（既定・常に direct subprocess）または herdr interactive lane（TUI 固有挙動が必要な場合のみ・常に人間の Herdr session とは分離した isolated named session）で観測し、allowlist-only summary evidence を worktree-local に保存する共有 Skill（native Codex CLI lane は Issue #2161 で撤去済み）。「runtime smoke」「動作検証を実行」「Claude を worktree で起動して確認」のトリガーで使う。
 ---
 
 # Worktree Agent Runtime Smoke
 
-Claude Code と Codex CLI について、linked worktree 内で fresh session を起動し、
+Claude Code について、linked worktree 内で fresh session を起動し、
 structured event（既定・常に direct subprocess）または herdr pane observation
 （TUI 固有挙動が必要な場合・常に呼び出し元とは分離した isolated named herdr session）で
 runtime evidence を収集する。semantic verdict（hook reason 分類、mutation deny 妥当性、
@@ -14,7 +14,7 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 ## Trigger（使用条件）
 
 - Issue の `## Runtime Verification Applicability` が `decision: immediate` で、
-  Claude Code または Codex CLI の実 process / TUI 起動証跡が必要な場合
+  Claude Code の実 process / TUI 起動証跡が必要な場合
 - pr-review-judge や実装 worker が runtime postcondition（hook lifecycle、session 非永続化、
   worktree cwd binding）を証明する必要がある場合
 
@@ -27,7 +27,7 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 
 ## Input（入力）
 
-- `--runtime claude|codex`
+- `--runtime claude`（native Codex CLI lane は Issue #2161 で撤去済み）
 - `--mode structured|interactive`
 - `--worktree <linked worktree の絶対パス>`
 - `--prompt-file <検証用 prompt ファイル>`（raw prompt を argument interpolation しない）
@@ -41,7 +41,7 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 - `--claude-agent-name <persona 名>`（任意。claude runtime + structured mode 限定。実際に `--agent <name>` として CLI へ forward し、main-session identity（`main_agent_identity`）・candidate Agent definition binding（`agent_definition`）・Skill evidence（`skill_evidence`）の evidence source になる。Issue #2046）
 - `--hermetic-agent-definition`（任意。`--claude-agent-name` 併用必須。project-discovery の `--agent <name>` lookup ではなく、candidate Agent 定義から決定論的に生成した session-local `--agents` JSON payload（tools は Read のみ固定）と session-local `--settings`（mutation-capable tool を deny）で起動する hermetic no-mutation lane。Issue #2046）
 - `--claude-bin <absolute path>`（任意。`--runtime claude` 限定。claude 互換の実行ファイル（例: `scripts/claude-gpt/launch.sh` launcher）の絶対パスを明示指定する。指定時は `shutil.which("claude")` による PATH 解決を bypass し、structured lane はその絶対パスを固定 argv の実行ファイルとして直接使用する。interactive herdr lane では、herdr 自身が `--kind claude` の実行ファイルを常に自分の PATH lookup で再解決するため、isolated session 専用の一時ディレクトリに `claude` という名前の forwarder script（symlink ではない。`exec '<絶対パス>' "$@"` で実際の launcher を exec するシェルスクリプト。symlink だと `$0` が symlink 自身のパスになり、sibling `lib.sh` を `dirname -- "$0"` で source する launcher が壊れるため。PR #2176 OWNER REQUEST_CHANGES Finding 2）を生成し、`herdr workspace create --env PATH=<shim-dir>:<既存PATH>` で Herdr 自身のサーバ／root shell プロセスへ明示的に渡す（Python クライアント側の `PATH` を更新するだけでは Herdr サーバの PTY プロセスへ届かないため。Finding 1）。forwarder は起動直前に run-scoped nonce を 0600 の receipt ファイルへ書き込み、runner はその nonce を run 終了後に readback して指定 launcher が実際に実行されたことを検証する（ambient PATH 上の別 `claude` が実行された場合は receipt が観測できず FAIL する）。未指定時（既定）は既存の `shutil.which("claude")` PATH 解決が変更なく維持される（Issue #2174）。
-- `--claude-adapter native|claude-gpt`（任意。既定値 `native`。Issue #2174 AC1 fix_delta、OWNER REQUEST_CHANGES https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173 で追加。`--claude-bin` とは独立した明示入力であり、`bool(--claude-bin)` から launcher 固有挙動を暗黙適用しない。`native`（既定）: `--claude-bin`（指定時）は純粋な binary path override として扱われ、PATH 解決時と同一の固定 argv（`--settings <hook-observability-json>` を含む）で起動する。`claude-gpt`: `--claude-bin` の指定が必須（未指定なら起動前に blocked）。`scripts/claude-gpt/launch.sh` 自身の CLI 契約（自身のオプションの後に literal `--` separator、以降は claude 本体へ素通し）に従い、structured lane の固定 argv 先頭に `--` を挿入し、`--settings <JSON>` の代わりに `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop` 環境変数を設定する（launcher が `--settings` を含む policy-weakening flag を拒否するため）。launcher 自身の `CLAUDE_GPT_LAUNCH_RESULT_V1` 受理/拒否 receipt は evidence の `claude_gpt_launcher_receipt` としてそのまま記録される（Issue #2174 AC8）。`--runtime codex` と組み合わせると argparse 時点で拒否される（PR #2176 OWNER REQUEST_CHANGES Finding 6）。
+- `--claude-adapter native|claude-gpt`（任意。既定値 `native`。Issue #2174 AC1 fix_delta、OWNER REQUEST_CHANGES https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173 で追加。`--claude-bin` とは独立した明示入力であり、`bool(--claude-bin)` から launcher 固有挙動を暗黙適用しない。`native`（既定）: `--claude-bin`（指定時）は純粋な binary path override として扱われ、PATH 解決時と同一の固定 argv（`--settings <hook-observability-json>` を含む）で起動する。`claude-gpt`: `--claude-bin` の指定が必須（未指定なら起動前に blocked）。`scripts/claude-gpt/launch.sh` 自身の CLI 契約（自身のオプションの後に literal `--` separator、以降は claude 本体へ素通し）に従い、structured lane の固定 argv 先頭に `--` を挿入し、`--settings <JSON>` の代わりに `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop` 環境変数を設定する（launcher が `--settings` を含む policy-weakening flag を拒否するため）。launcher 自身の `CLAUDE_GPT_LAUNCH_RESULT_V1` 受理/拒否 receipt は evidence の `claude_gpt_launcher_receipt` としてそのまま記録される（Issue #2174 AC8）。claude 以外の `--runtime` 値は argparse 時点で拒否される（PR #2176 OWNER REQUEST_CHANGES Finding 6。native Codex CLI lane は Issue #2161 で撤去済み）。
 - `--require-min-subagents <int>`（任意。既定 0 = 未要求。`--runtime claude` 限定。structured lane と interactive lane の両方に適用される。0 より大きい値を指定すると、最低この個数の DISTINCT SubAgent が spawn かつ completion まで agent_id exact pairing で確認されるまで run が FAIL する。structured lane は stdout を、interactive lane は永続化された session transcript を evidence source として同じ `classify_claude_multi_child_lifecycle()` で判定する。Issue #2219 AC3）
 - `--require-min-turns <int>`（任意。既定 0 = 未要求。`--runtime claude` 限定。structured lane と interactive lane の両方に適用される。0 より大きい値を指定すると、SAME main session_id が最低このturn 数持続することを要求する。structured lane では単一 invocation 内で `--max-turns` がこの値未満だと `parser.error`（起動前拒否）になる。interactive lane では 1（初回 turn）+ `--additional-prompt` の指定数がこの値未満だと `parser.error` になる。Issue #2219 AC2/AC11、fix_delta iteration 1）
 - `--scan-forbidden-markers`（任意。既定 off。`--runtime claude` 限定。structured lane と interactive lane の両方に適用される。`403 WebSocket upgrade` / `WebSocket upgrade was rejected` / `Please run /login` / `early termination` / `context limit` / `auto-compaction failure` の固定 literal allowlist を、structured lane は stdout/stderr から、interactive lane は永続化された session transcript と bounded pane 抜粋から scan し、1 件でも観測されれば FAIL する。Issue #2219 AC6、fix_delta iteration 1）
@@ -85,9 +85,8 @@ session の stop／delete／removal 確認で bounded execution を担保する)
 TUI screen scraping を使わない。herdr を経由しない（常に direct subprocess）。
 
 - Claude Code の起動コマンド例: `claude -p --output-format stream-json --include-hook-events --no-session-persistence --max-turns <n>`
-- Codex CLI の起動コマンド例: `codex exec -C <worktree> --json --ephemeral -`（prompt は stdin 経由。argv には出さない）
 
-詳細は `references/claude-code.md` / `references/codex-cli.md` を参照。
+詳細は `references/claude-code.md` を参照。
 
 ### Lane B: interactive herdr smoke（必要時のみ）
 
@@ -357,13 +356,8 @@ stream-json チャンネルが常に利用可能なため、呼び出し側が `
 `--expect-marker` を指定しない `--runtime claude --mode structured` 実行にもこの
 要件を課したい場合にのみ使う。
 
-**`--runtime codex`（structured lane）** には `SubagentStart`/`SubagentStop` 相当の
-stream-json hook channel が存在せず、`causal_evidence` は常に `None` になる。PR #2220
-OWNER REQUEST_CHANGES P0-1（https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514）
-より、structured lane の既定強制は `args.runtime == "claude"` に明示的にスコープされて
-おり、Codex の `--expect-marker` marker-only PASS はこの gate の対象外になる（修正前は
-runtime を判別しなかったため、正常終了し marker も出力した Codex 実行が
-`causal_evidence is None` を理由に誤って FAIL していた）。
+native Codex CLI lane（`--runtime codex`）は Issue #2161 で撤去済みであり、structured lane の既定強制は現在 `args.runtime == "claude"` の唯一の値に対して
+常に成立する（PR #2220 OWNER REQUEST_CHANGES P0-1、https://github.com/squne121/loop-protocol/pull/2220#issuecomment-5309790514）。
 
 **interactive lane** は herdr pane のテキストレンダリングにはこの stream-json hook
 payload が構造的に現れないため、`causal_evidence_source` は今のところ
@@ -412,7 +406,6 @@ payload が構造的に現れないため、`causal_evidence_source` は今の�
 ## Reference Map（参照資料の一覧）
 
 - `references/claude-code.md` — Claude Code の structured／interactive invocation 手順を説明する
-- `references/codex-cli.md` — Codex CLI の structured／interactive invocation 手順を説明する
 - `references/herdr.md` — herdr pane／agent API の使い分けを説明する
 - `references/evidence-hygiene.md` — evidence hygiene と session-log metadata boundary の扱いを説明する
 

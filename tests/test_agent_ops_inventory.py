@@ -152,7 +152,7 @@ class TestAgentOpsReviewInventory:
         inventory = build_agent_ops_inventory(REPO_ROOT, tracked)
         contract_items = [
             it for it in inventory["items"]
-            if it["path"] == "tests/fixtures/codex-agent-config/expected-runtime-contract.json"
+            if it["path"] == "tests/fixtures/agent-config/expected-runtime-contract.json"
         ]
         assert len(contract_items) == 1, "expected-runtime-contract.json must appear in inventory"
 
@@ -171,7 +171,7 @@ class TestAgentOpsReviewInventory:
     def test_agent_ops_review_task_kind_in_registry(self):
         """GIVEN PLAN_REGISTRY WHEN agent-ops-review inspected THEN contract fixture in MUST_READ."""
         spec = PLAN_REGISTRY["agent-ops-review"]
-        assert "tests/fixtures/codex-agent-config/expected-runtime-contract.json" in spec.must_read
+        assert "tests/fixtures/agent-config/expected-runtime-contract.json" in spec.must_read
 
     def test_agents_skills_surface_synced_with_contract(self):
         """GIVEN inventory WHEN critical_surfaces compared with contract THEN inventory includes all."""
@@ -223,7 +223,7 @@ class TestStatusLevels:
 
     def _make_fake_contract(self, repo_root: Path, surfaces: list[str]) -> None:
         """Write a fake expected-runtime-contract.json with given surfaces."""
-        contract_dir = repo_root / "tests" / "fixtures" / "codex-agent-config"
+        contract_dir = repo_root / "tests" / "fixtures" / "agent-config"
         contract_dir.mkdir(parents=True, exist_ok=True)
         contract_path = contract_dir / "expected-runtime-contract.json"
         contract_data = {
@@ -384,7 +384,7 @@ class TestStatusLevels:
         subprocess.run(
             [
                 "git", "add", ".agents/skills",
-                "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+                "tests/fixtures/agent-config/expected-runtime-contract.json",
                 ".claude/settings.json", ".claude/skills/test-agent/SKILL.md",
             ],
             cwd=str(repo_root), check=True, capture_output=True,
@@ -426,7 +426,7 @@ class TestStatusLevels:
         subprocess.run(
             [
                 "git", "add", ".agents/skills",
-                "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+                "tests/fixtures/agent-config/expected-runtime-contract.json",
                 ".claude/settings.json",
             ],
             cwd=str(repo_root), check=True, capture_output=True,
@@ -461,7 +461,7 @@ class TestStatusLevels:
         subprocess.run(
             [
                 "git", "add", ".agents/skills",
-                "tests/fixtures/codex-agent-config/expected-runtime-contract.json",
+                "tests/fixtures/agent-config/expected-runtime-contract.json",
                 ".claude/settings.json", ".claude/alternate-skills/test-agent/SKILL.md",
             ],
             cwd=str(repo_root), check=True, capture_output=True,
@@ -686,7 +686,7 @@ class TestArtifactSecurity:
         subprocess.run(["git", "add", "."], cwd=str(repo_root), check=True, capture_output=True)
 
         # Make a fake contract pointing to this surface
-        contract_dir = repo_root / "tests" / "fixtures" / "codex-agent-config"
+        contract_dir = repo_root / "tests" / "fixtures" / "agent-config"
         contract_dir.mkdir(parents=True, exist_ok=True)
         contract_path = contract_dir / "expected-runtime-contract.json"
         contract_data = {
@@ -724,13 +724,9 @@ class TestArtifactSecurity:
         """GIVEN .claude/skills/ path WHEN classify_path_kind THEN canonical_skill_body."""
         assert classify_path_kind(".claude/skills/implement-issue/SKILL.md") == "canonical_skill_body"
 
-    def test_classify_path_kind_codex_config(self):
-        """GIVEN .codex/ path WHEN classify_path_kind THEN codex_config."""
-        assert classify_path_kind(".codex/config.toml") == "codex_config"
-
     def test_classify_path_kind_fixture(self):
-        """GIVEN codex-agent-config fixture path WHEN classify_path_kind THEN codex_agent_fixture."""
-        assert classify_path_kind("tests/fixtures/codex-agent-config/expected-runtime-contract.json") == "codex_agent_fixture"
+        """GIVEN agent-config fixture path WHEN classify_path_kind THEN codex_agent_fixture."""
+        assert classify_path_kind("tests/fixtures/agent-config/expected-runtime-contract.json") == "codex_agent_fixture"
 
     def test_classify_path_kind_claude_hook(self):
         """GIVEN .claude/hooks/ path WHEN classify_path_kind THEN claude_hook."""
@@ -784,7 +780,7 @@ class TestAgentSkilllContractSync:
         surfaces_from_code = load_critical_surfaces_from_contract(REPO_ROOT)
         expected_from_contract = []
         contract_data = json.loads(
-            (REPO_ROOT / "tests/fixtures/codex-agent-config/expected-runtime-contract.json")
+            (REPO_ROOT / "tests/fixtures/agent-config/expected-runtime-contract.json")
             .read_text(encoding="utf-8")
         )
         for agent_data in contract_data.get("required_agents", {}).values():

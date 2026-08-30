@@ -22,7 +22,6 @@ CI_PATHS = [
     "docs/dev/ci-performance.md",
     ".claude/skills/ci-test-performance/SKILL.md",
     ".agents/skills/ci-test-performance/runner.py",
-    ".codex/agents/my-agent.md",
     "schemas/some_schema.json",
 ]
 

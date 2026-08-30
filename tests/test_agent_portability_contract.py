@@ -3,12 +3,12 @@
 Covers:
 - AC1 (sub-requirement): permission-affecting frontmatter fields
   (tools:/disallowedTools:) must not silently drift from the checked-in
-  baseline captured in tests/fixtures/codex-agent-config/
+  baseline captured in tests/fixtures/agent-config/
   agent_permission_baseline.json.
-- AC2: every .claude/agents/*.md and .codex/agents/*.toml asset is
-  uniquely classified (shared_claude_runtime / claude_only /
-  legacy_codex_projection / legacy_codex_only / experimental), zero
-  unclassified.
+- AC2: every .claude/agents/*.md asset is uniquely classified
+  (shared_claude_runtime / claude_only / experimental), zero unclassified
+  (Issue #2161: native Codex CLI retired, the retired native Codex CLI
+  `agents/*.toml` classification removed along with it).
 - AC4: mutation_class is not derived from permissionMode alone -- at
   least 3 negative (contradiction) cases are exercised.
 - AC7: the frontmatter parser fails loudly (raises, does not silently
@@ -28,7 +28,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "scripts" / "check_claude_codex_agent_parity.py"
-FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "codex-agent-config"
+FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "agent-config"
 
 
 def _load_module():
@@ -115,15 +115,14 @@ class TestPermissionBaselineUnchanged:
 
 class TestAssetInventoryClassification:
     def test_all_agent_assets_classified_no_unclassified(self):
-        """AC2: every .claude/agents/*.md and .codex/agents/*.toml file has a
-        unique classification in ALLOWED_CLASSIFICATIONS; zero unclassified."""
+        """AC2: every .claude/agents/*.md file has a unique classification
+        in ALLOWED_CLASSIFICATIONS; zero unclassified."""
         expectations = json.loads(
             (FIXTURE_DIR / "expected-runtime-contract.json").read_text(encoding="utf-8")
         )
         classification = expectations["asset_classification"]
         claude_dir = REPO_ROOT / ".claude" / "agents"
-        codex_dir = REPO_ROOT / ".codex" / "agents"
-        failures = MOD.check_asset_classification_complete(classification, claude_dir, codex_dir)
+        failures = MOD.check_asset_classification_complete(classification, claude_dir)
         assert failures == [], f"unclassified or invalid assets found: {failures}"
 
         # Positive assertion: the enum values actually used are within the
@@ -135,7 +134,7 @@ class TestAssetInventoryClassification:
         )
 
     def test_asset_classification_covers_every_discovered_file(self):
-        """AC2: no discovered .md/.toml agent file is missing from the
+        """AC2: no discovered .md agent file is missing from the
         classification map (defends against the fixture going stale when a
         new agent file is added without updating the inventory)."""
         expectations = json.loads(
@@ -143,9 +142,7 @@ class TestAssetInventoryClassification:
         )
         classification = expectations["asset_classification"]
         claude_dir = REPO_ROOT / ".claude" / "agents"
-        codex_dir = REPO_ROOT / ".codex" / "agents"
         discovered = {f".claude/agents/{p.name}" for p in claude_dir.glob("*.md")}
-        discovered |= {f".codex/agents/{p.name}" for p in codex_dir.glob("*.toml")}
         missing = discovered - classification.keys()
         assert missing == set(), f"discovered assets missing from asset_classification: {missing}"
 
@@ -161,19 +158,14 @@ class TestAssetInventoryClassification:
         )
         assert failures == [], f"asset_classification pairing failures: {failures}"
 
-    def test_pairing_detects_shared_claude_runtime_without_codex_projection(self):
-        """AC2/AC9 negative case: a shared_claude_runtime entry whose Codex
-        counterpart is missing/mis-classified is detected."""
+    def test_pairing_detects_shared_claude_runtime_without_required_agents_entry(self):
+        """AC2/AC9 negative case (Issue #2161: native Codex CLI retired, the
+        retired native Codex CLI `agents/*.toml` pairing check was removed along with it): a
+        shared_claude_runtime entry with no matching required_agents entry
+        is detected."""
         classification = {".claude/agents/orphan.md": "shared_claude_runtime"}
         failures = MOD.check_asset_classification_pairing(classification, {})
-        assert any("orphan" in f and "legacy_codex_projection" in f for f in failures)
-
-    def test_pairing_detects_legacy_codex_projection_without_shared_claude(self):
-        """AC2/AC9 negative case: a legacy_codex_projection entry whose
-        Claude counterpart is missing/mis-classified is detected."""
-        classification = {".codex/agents/orphan.toml": "legacy_codex_projection"}
-        failures = MOD.check_asset_classification_pairing(classification, {})
-        assert any("orphan" in f and "shared_claude_runtime" in f for f in failures)
+        assert any("orphan" in f and "no matching required_agents entry" in f for f in failures)
 
     def test_pairing_detects_classified_path_that_does_not_exist(self):
         """AC2/AC9 negative case: a classification entry pointing at a
@@ -460,8 +452,6 @@ class TestDuplicateAgentNameDetection:
     def test_check_duplicate_agent_names_detects_duplicate_claude_names(self, tmp_path):
         claude_dir = tmp_path / ".claude" / "agents"
         claude_dir.mkdir(parents=True)
-        codex_dir = tmp_path / ".codex" / "agents"
-        codex_dir.mkdir(parents=True)
         (claude_dir / "a.md").write_text(
             "---\nname: dup-agent\nmodel: haiku\npermissionMode: dontAsk\n---\n\nbody\n",
             encoding="utf-8",
@@ -470,13 +460,12 @@ class TestDuplicateAgentNameDetection:
             "---\nname: dup-agent\nmodel: haiku\npermissionMode: dontAsk\n---\n\nbody\n",
             encoding="utf-8",
         )
-        failures = MOD.check_duplicate_agent_names(claude_dir, codex_dir)
+        failures = MOD.check_duplicate_agent_names(claude_dir)
         assert any("dup-agent" in f for f in failures)
 
     def test_check_duplicate_agent_names_no_false_positive_on_real_repo(self):
         """Regression guard: the real repository has zero duplicate agent
         names today."""
         claude_dir = REPO_ROOT / ".claude" / "agents"
-        codex_dir = REPO_ROOT / ".codex" / "agents"
-        failures = MOD.check_duplicate_agent_names(claude_dir, codex_dir)
+        failures = MOD.check_duplicate_agent_names(claude_dir)
         assert failures == []

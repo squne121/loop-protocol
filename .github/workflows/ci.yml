@@ -63,8 +63,10 @@ on:
       # #2159 OWNER scope-authority ruling (issuecomment-5299412215, items
       # 2/P0-8 and 3/P1-3/AC11): opt-in trigger for the
       # `e2e-performance-benchmark-assessment-gate` steps below (added to
-      # the existing `codex-execpolicy` job -- deliberately not a new job,
-      # see the comment above those steps). Never runs on
+      # the python-test-core job -- deliberately not a new job, see the
+      # comment above those steps. Issue #2161: these steps were relocated
+      # here from the retired native-Codex-CLI-lane job (Issue #2161), which
+      # retirement removed). Never runs on
       # a normal push/pull_request event -- the 20-run comparable-cohort
       # wait is explicitly Out of Scope as a merge/close condition for
       # #2159/#2172 (deferred to #2155); this input lets an operator
@@ -73,7 +75,7 @@ on:
       # blocking a regular PR's required `ci` check.
       run_performance_assessment_gate:
         description: >-
-          When true, the `codex-execpolicy` job additionally runs the
+          When true, the python-test-core job additionally runs the
           `e2e-performance-benchmark-assessment-gate` steps: read
           `cohort_fixture_path` (a JSON file already present in the
           checked-out worktree -- e.g. downloaded from a prior
@@ -2717,9 +2719,10 @@ jobs:
         run: uv run --locked python scripts/ci/check_claude_settings_permissions.py --settings .claude/settings.json
       - name: Verify python-test lane topology invariants (#1760)
         # Fail-closed YAML-AST scan: python-test-core stays Python-only (no
-        # Node/npm/npx/pnpm/corepack/codex commands), codex-execpolicy owns the
-        # Node/Codex CLI bootstrap + matrix + tests/codex/test_local_main_branch_guard.py,
-        # the python-test required aggregate is needs:[python-test-core,codex-execpolicy]
+        # Node/npm/npx/pnpm/corepack/codex commands -- Issue #2161: the former
+        # native-Codex-CLI-lane job that owned the Node/Codex CLI bootstrap + matrix
+        # + tests/codex/test_local_main_branch_guard.py was retired), the
+        # python-test required aggregate is needs:[python-test-core]
         # + if:always(), and this verifier itself stays wired (not disabled).
         run: uv run --locked python scripts/ci/verify_python_test_lane.py --ci-yml .github/workflows/ci.yml
       - name: pytest python suite (parallel) (timed)
@@ -3001,228 +3004,6 @@ jobs:
           PY
           } >> "$GITHUB_STEP_SUMMARY"
 
-  codex-execpolicy:
-    # Issue #1760: dedicated Node/Codex CLI lane. python-test-core (above) is
-    # Python-only (AC1/AC2); this job owns Node/npm/npx/codex commands, the
-    # real @openai/codex execpolicy matrix, and the codex-only runtime guard
-    # test tests/codex/test_local_main_branch_guard.py (secondary_coverage
-    # .dedicated_lanes[].provider_job in .github/ci/python-test-plan.json,
-    # AC4). scripts/ci/tests/test_codex_execpolicy_matrix.py and
-    # tests/codex/test_execpolicy_matrix.py stay plan targets in
-    # python-test-core (AC3) AND are re-run here against the real pinned
-    # codex binary (unchanged behavior, just relocated with the matrix step).
-    if: ${{ github.event.inputs.python_test_bench != 'true' }}
-    runs-on: ubuntu-latest
-    outputs:
-      # Issue #1824 P1-4: ci-verdict-summary only needs the small status sentinel
-      # (a few KB), never the full evidence artifact -- see the split upload steps
-      # below. Downloading the status-only artifact avoids fetching the (formerly
-      # ~110MB) npm install tree that used to be nested inside
-      # codex_execpolicy_artifacts/.
-      artifact_id: ${{ steps.upload-codex-execpolicy-status.outputs.artifact-id }}
-      artifact_name: codex-execpolicy-status-${{ github.run_attempt }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-python-uv
-      - name: uv python install
-        run: uv python install
-      - name: uv sync (locked, dev group)
-        run: uv sync --locked --group dev
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "22"
-      - name: Create codex-execpolicy sentinel artifact (AC6)
-        # Written BEFORE the matrix orchestrator starts so a hard bootstrap
-        # failure inside the next step (process killed, OOM, etc.) still
-        # leaves a status artifact behind for scripts/ci/verify_ci_check_conclusions.py.
-        run: |
-          mkdir -p codex_execpolicy_artifacts
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-
-          pathlib.Path("codex_execpolicy_artifacts/codex_execpolicy_matrix_status_v1.json").write_text(
-              json.dumps(
-                  {
-                      "schema": "codex_execpolicy_matrix_status_v1",
-                      "status": "started",
-                      "run_id": os.environ.get("GITHUB_RUN_ID"),
-                      "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
-                  },
-                  indent=2,
-              )
-          )
-          PY
-      - name: codex execpolicy + cleanup-route matrix (timed)
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          mkdir -p codex_execpolicy_artifacts
-          # The required gate is fail-closed only if install, version, and
-          # `codex execpolicy check --help` all succeed inside the same
-          # artifact-writing orchestrator.
-          # Issue #1824 P1-4: --npm-prefix installs the FULL @openai/codex npm
-          # package tree (node_modules, native binaries, etc) -- several orders of
-          # magnitude larger than the JSON evidence this job actually needs to
-          # keep. Installing it OUTSIDE codex_execpolicy_artifacts/ (the directory
-          # actually uploaded as an artifact below) is the fix for the reported
-          # ~110MB codex-execpolicy-1 artifact; only the small JSON files under
-          # codex_execpolicy_artifacts/ are ever uploaded.
-          python3 scripts/ci/codex_execpolicy_matrix.py \
-            --npm-prefix "${RUNNER_TEMP}/codex-cli-npm-prefix" \
-            --package-spec "@openai/codex@0.142.0" \
-            --expected-version "codex-cli 0.142.0" \
-            --rules .codex/rules/default.rules \
-            --artifact codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json
-          _matrix=$?
-          uv run --locked pytest \
-            scripts/ci/tests/test_codex_execpolicy_matrix.py \
-            tests/codex/test_execpolicy_matrix.py \
-            tests/codex/test_local_main_branch_guard.py \
-            -q
-          _pytest=$?
-          _s=$(( _matrix != 0 ? _matrix : _pytest ))
-          set -e
-          printf '{"step_id":"codex_execpolicy_matrix","phase_id":"codex_execpolicy","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          python3 - "$_s" <<'PY'
-          import json
-          import pathlib
-          import sys
-
-          exit_code = int(sys.argv[1])
-          p = pathlib.Path("codex_execpolicy_artifacts/codex_execpolicy_matrix_status_v1.json")
-          data = json.loads(p.read_text()) if p.exists() else {"schema": "codex_execpolicy_matrix_status_v1"}
-          data["status"] = "completed" if exit_code == 0 else "matrix_failed"
-          data["exit_code"] = exit_code
-          p.write_text(json.dumps(data, indent=2))
-          PY
-          exit $_s
-      - name: Ensure codex-execpolicy sentinel reflects bootstrap failure (AC6)
-        # If the matrix step above never ran to completion (setup-node /
-        # uv sync / install failed before python3 could update the sentinel),
-        # this always-run step still leaves a fail-closed status artifact.
-        if: ${{ !cancelled() }}
-        run: |
-          mkdir -p codex_execpolicy_artifacts
-          python3 - <<'PY'
-          import json
-          import pathlib
-
-          p = pathlib.Path("codex_execpolicy_artifacts/codex_execpolicy_matrix_status_v1.json")
-          if p.exists():
-              data = json.loads(p.read_text())
-              if data.get("status") == "started":
-                  data["status"] = "bootstrap_failed"
-          else:
-              data = {"schema": "codex_execpolicy_matrix_status_v1", "status": "bootstrap_failed"}
-          p.write_text(json.dumps(data, indent=2))
-          PY
-      - name: Upload codex-execpolicy STATUS artifact (small, always)
-        # Issue #1824 P1-4: the status sentinel is the ONLY thing ci-verdict-summary
-        # downloads (a few KB). Split from the fuller evidence artifact below so a
-        # merge-ready check never has to fetch a large ZIP just to read one small
-        # JSON file.
-        id: upload-codex-execpolicy-status
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: codex-execpolicy-status-${{ github.run_attempt }}
-          path: codex_execpolicy_artifacts/codex_execpolicy_matrix_status_v1.json
-          if-no-files-found: error
-          retention-days: 30
-      - name: Upload codex-execpolicy EVIDENCE artifact (npm ls / native binary sha / probes)
-        # Issue #1824 P1-4: kept SEPARATE from the status artifact and with a SHORT
-        # retention -- this is diagnostic detail (npm ls output, native binary
-        # realpath/sha256, version/help probe stdout+stderr), not merge-ready
-        # evidence. The npm install tree itself (~110MB) is never inside this path
-        # because --npm-prefix now installs to $RUNNER_TEMP, outside
-        # codex_execpolicy_artifacts/.
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: codex-execpolicy-evidence-${{ github.run_attempt }}
-          path: codex_execpolicy_artifacts/codex_execpolicy_matrix_v1.json
-          if-no-files-found: warn
-          retention-days: 3
-      - name: Collect ci_runtime_baseline_v1 artifact
-        # Issue #1824 P1-5: docs/dev/ci-performance.md documents codex-execpolicy
-        # as a ci_runtime_baseline_v1 job, but this job previously only appended to
-        # measurements.jsonl without ever generating/uploading the baseline
-        # artifact -- connect the same collector used by every other timed job.
-        if: ${{ !cancelled() }}
-        env:
-          GH_JOB: ${{ github.job }}
-          GH_RUN_ID: ${{ github.run_id }}
-          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
-          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          GH_SHA: ${{ github.sha }}
-        run: |
-          mkdir -p ci_runtime_baseline_artifacts
-          python3 - <<'PY'
-          import json, os, pathlib
-          measurements = []
-          p = pathlib.Path("measurements.jsonl")
-          if p.exists():
-              for line in p.read_text().splitlines():
-                  line = line.strip()
-                  if line:
-                      r = json.loads(line)
-                      r.update({
-                          "run_id": os.environ["GH_RUN_ID"],
-                          "run_attempt": os.environ["GH_RUN_ATTEMPT"],
-                          "head_sha": os.environ["GH_HEAD_SHA"],
-                          "merge_sha": os.environ["GH_SHA"],
-                          "job": os.environ["GH_JOB"],
-                          "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
-                          "measurement_method": "date_plus3N_ms"
-                      })
-                      measurements.append(r)
-          artifact = {
-              "schema": "ci_runtime_baseline_v1",
-              "run_id": os.environ["GH_RUN_ID"],
-              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
-              "head_sha": os.environ["GH_HEAD_SHA"],
-              "merge_sha": os.environ["GH_SHA"],
-              "job": os.environ["GH_JOB"],
-              "runner_image": os.environ.get("ImageOS","unknown") + "/" + os.environ.get("ImageVersion","unknown"),
-              "measurement_method": "date_plus3N_ms",
-              "measurements": measurements,
-          }
-          out = pathlib.Path("ci_runtime_baseline_artifacts/ci_runtime_baseline_v1.json")
-          out.write_text(json.dumps(artifact, indent=2))
-          print(f"Written: {out}")
-          PY
-      - name: Upload ci-runtime-baseline artifact
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
-          path: ci_runtime_baseline_artifacts/
-          if-no-files-found: error
-          retention-days: 30
-      - name: Output CI runtime summary
-        if: ${{ !cancelled() }}
-        run: |
-          {
-            echo "## CI Runtime Baseline: ${{ github.job }}"
-            echo ""
-            echo "| step_id | elapsed_ms | status |"
-            echo "|---|---|---|"
-            python3 - <<'PY'
-          import json, pathlib
-          p = pathlib.Path("measurements.jsonl")
-          if p.exists():
-              for line in p.read_text().splitlines():
-                  line = line.strip()
-                  if line:
-                      m = json.loads(line)
-                      print(f"| {m['step_id']} | {m['elapsed_ms']} | {m['status']} |")
-          PY
-          } >> "$GITHUB_STEP_SUMMARY"
       - name: Generate CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact
         if: ${{ !cancelled() }}
         env:
@@ -3417,16 +3198,14 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-
   python-test:
     # Issue #1760 AC5: required aggregate status check (name unchanged --
     # docs/ops/branch-protection.md keeps referencing "python-test"). Fails
-    # or is skipped whenever either dependency job fails/skips, EXCEPT during
-    # a python_test_bench workflow_dispatch run (AC10), where codex-execpolicy
-    # is intentionally skipped by design (the dispatch input's documented
-    # contract is "run ONLY the python-test-core job").
+    # or is skipped whenever the dependency job fails/skips. Issue #2161
+    # (native Codex CLI retirement): this job previously also depended on
+    # the native-Codex-CLI-lane job, which was removed (Issue #2161).
     runs-on: ubuntu-latest
-    needs: [python-test-core, codex-execpolicy]
+    needs: [python-test-core]
     if: always()
     steps:
       - uses: actions/checkout@v6
@@ -3445,7 +3224,6 @@ jobs:
         run: |
           uv run --locked python3 scripts/ci/evaluate_python_test_aggregate.py \
             --core-result "${{ needs.python-test-core.result }}" \
-            --codex-result "${{ needs.codex-execpolicy.result }}" \
             --bench-mode "${{ github.event.inputs.python_test_bench }}"
 
   node-backed-hook-tests:
@@ -4007,7 +3785,7 @@ jobs:
   ci-verdict-summary:
     runs-on: ubuntu-latest
     if: ${{ !cancelled() && github.event.inputs.python_test_bench != 'true' }}
-    needs: [typecheck, lint, test, build, e2e, python-test-core, codex-execpolicy, python-test, node-backed-hook-tests, actionlint, agy-causal-claim-drift-gate, visual-impact-policy]
+    needs: [typecheck, lint, test, build, e2e, python-test-core, python-test, node-backed-hook-tests, actionlint, agy-causal-claim-drift-gate, visual-impact-policy]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -4166,16 +3944,10 @@ jobs:
           path: ci_runtime_baseline_artifacts/ci_runtime_baseline_v1_e2e.json
           if-no-files-found: error
           retention-days: 30
-      - name: Download codex-execpolicy sentinel artifact (AC9)
-        if: ${{ !cancelled() && github.event.inputs.python_test_bench != 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p codex_execpolicy_artifacts_downloaded
-          gh api             "repos/${GITHUB_REPOSITORY}/actions/artifacts/${{ needs.codex-execpolicy.outputs.artifact_id }}/zip"             > codex-execpolicy-artifact.zip
-          unzip -o codex-execpolicy-artifact.zip -d codex_execpolicy_artifacts_downloaded
-          test -s codex_execpolicy_artifacts_downloaded/codex_execpolicy_matrix_status_v1.json
-      - name: Verify real CI check conclusions + AC6 sentinel (AC9)
+      - name: Verify real CI check conclusions (AC9)
+        # Issue #2161 (native Codex CLI retirement): the former
+        # native-Codex-CLI-lane sentinel download + AC6 sentinel verification
+        # branch were removed along with the job.
         if: ${{ !cancelled() }}
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -4191,7 +3963,6 @@ jobs:
           else
             uv run --locked python3 scripts/ci/verify_ci_check_conclusions.py \
               --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
-              --codex-sentinel-json codex_execpolicy_artifacts_downloaded/codex_execpolicy_matrix_status_v1.json \
               --expected-head-sha "$PR_HEAD_SHA" \
               --workflow-run-id "${{ github.run_id }}" \
               --workflow-run-attempt "${{ github.run_attempt }}"

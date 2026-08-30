@@ -834,7 +834,7 @@ REGISTRY: dict[str, dict[str, Any]] = {
     # SKILL.md) consumes this command's `compact_result.verdict` /
     # `compact_result.next_action` / `verified_transport_artifact` DIRECTLY --
     # it does NOT invoke the read-only `issue-reviewer` custom agent
-    # (.codex/agents/issue-reviewer.toml) and does NOT relay
+    # (.claude/agents/issue-reviewer.md) and does NOT relay
     # `compact_result.stdout_lines` to it. That agent remains available for
     # legacy CLI / diagnostic / regression-test use only (it never invokes
     # compact_review_result.py or performs any producer I/O itself; when
