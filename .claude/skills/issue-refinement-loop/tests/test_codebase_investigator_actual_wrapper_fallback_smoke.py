@@ -142,53 +142,29 @@ def test_actual_wrapper_fallback_reaches_real_native_sentinel(tmp_path: Path, mo
     driver = _write_private_controller_driver(tmp_path, fake)
     decision_path = tmp_path / "controller-decision.json"
     sidecar_path = tmp_path / "controller-sidecar.json"
+    controller_command = f"{driver} > {decision_path} 2> {sidecar_path}"
     monkeypatch.setenv("AGY_BIN", "/ambient/must-not-be-used")
     before = _tracked_status()
-
-    # The test harness, not the real investigator, owns the module-private
-    # seam. Capture its actual controller output before launching the agent and
-    # prove this builder/wrapper/readback phase made no tracked mutation.
-    driver_result = subprocess.run(
-        [str(driver)],
-        cwd=tmp_path,
-        capture_output=True,
-        timeout=360,
-        check=False,
-    )
-    decision_path.write_bytes(driver_result.stdout)
-    sidecar_path.write_bytes(driver_result.stderr)
-    assert driver_result.returncode == 0, driver_result.stderr.decode("utf-8", errors="replace")
-    assert before == _tracked_status(), "controller fixture changed tracked worktree status"
-
-    decision = controller.strict_json_object_bytes(decision_path.read_bytes())
-    assert controller.validate_decision(decision) == {
-        "schema": "AGY_ADVISORY_FALLBACK_ROUTE_DECISION_V1",
-        "schema_version": 1,
-        "status": "degraded",
-        "next_action": "native_non_mutating_fallback",
-        "failure_class": "agy_exit_nonzero",
-        "reason_code": "advisory_operational",
-    }
-    assert sidecar_path.read_bytes() == b""
-    fake_evidence = fake.with_suffix(".invoked")
-    assert fake_evidence.is_file()
-    assert "-p" in fake_evidence.read_text(encoding="utf-8")
 
     claude_bin = shutil.which("claude")
     if claude_bin is None:
         evidence = _write_runtime_skip_evidence("claude CLI not found on PATH")
         pytest.skip(f"SKIP: claude CLI not found; evidence: {evidence}")
-    prompt = f"""Issue #2434's test-owned private controller harness already performed the
-canonical builder → actual AGY wrapper → exact readback sequence. Its separately captured
-stdout decision is `{decision_path}` and its stderr sidecar is `{sidecar_path}`. They are
-not caller-supplied wrapper data. Use Read, not Bash, to read both exact files.
+    prompt = f"""Run the following exact **test-only private controller driver** once. It owns
+canonical builder → actual AGY wrapper → exact result readback and emits its closed
+controller decision only on stdout. Capture stdout and stderr separately exactly as shown:
 
-Only if the decision is exact `degraded` / `native_non_mutating_fallback`, the sidecar is
-empty, and the test harness has supplied the successful process pairing, perform bounded
-native read-only investigation of `.claude/agents/codebase-investigator.md`. Find literal
-sentinel `{_SENTINEL}` and return concise CODEBASE_INVESTIGATION_RESULT_V1 YAML whose
-`discovery_summary` contains that sentinel exactly. Do not invoke AGY separately, Bash, or
-any mutation tool.
+```bash
+{controller_command}
+```
+
+Read both resulting files. Do not accept a caller-supplied decision, raw wrapper result,
+or provenance. Only if the directly captured decision is exact `degraded` /
+`native_non_mutating_fallback`, the sidecar is empty, and the process exit is 0, perform
+bounded native read-only investigation of `.claude/agents/codebase-investigator.md`, find
+the literal sentinel `{_SENTINEL}`, and return concise CODEBASE_INVESTIGATION_RESULT_V1
+YAML whose `discovery_summary` contains that literal sentinel exactly. Do not invoke AGY
+separately, and do not use a mutation tool.
 """
     completed = subprocess.run(
         [
@@ -218,15 +194,30 @@ any mutation tool.
         pytest.skip(f"SKIP: actual SubAgent runtime unavailable ({unavailable}); evidence: {evidence}")
 
     tools, result = _stream_result(completed.stdout or "")
-    read_paths = [
-        str(tool["input"].get("file_path", ""))
+    bash_commands = [
+        str(tool["input"].get("command", ""))
         for tool in tools
-        if tool["name"] == "Read" and isinstance(tool["input"], dict)
+        if tool["name"] == "Bash" and isinstance(tool["input"], dict)
     ]
     assert completed.returncode == 0, completed.stderr[-2000:]
-    assert str(decision_path) in read_paths
-    assert str(sidecar_path) in read_paths
-    assert not [tool for tool in tools if tool["name"] == "Bash"]
+    assert decision_path.is_file()
+    assert sidecar_path.is_file()
+    decision = controller.strict_json_object_bytes(decision_path.read_bytes())
+    assert controller.validate_decision(decision) == {
+        "schema": "AGY_ADVISORY_FALLBACK_ROUTE_DECISION_V1",
+        "schema_version": 1,
+        "status": "degraded",
+        "next_action": "native_non_mutating_fallback",
+        "failure_class": "agy_exit_nonzero",
+        "reason_code": "advisory_operational",
+    }
+    assert sidecar_path.read_bytes() == b""
+    fake_evidence = fake.with_suffix(".invoked")
+    assert fake_evidence.is_file()
+    assert "-p" in fake_evidence.read_text(encoding="utf-8")
+    assert any(str(driver) in command for command in bash_commands), (
+        "real codebase-investigator did not invoke the test-only controller driver"
+    )
     assert not [tool for tool in tools if tool["name"] in _MUTATING_TOOLS]
     assert before == _tracked_status(), "tracked worktree status changed during smoke"
     assert _SENTINEL in result, "real codebase-investigator did not reach native sentinel"
