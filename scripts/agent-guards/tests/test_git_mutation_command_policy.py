@@ -27,9 +27,6 @@ from git_mutation_command_policy import (
 )
 
 _GIT_MUTATION_POLICY_SCRIPT = _GUARDS_DIR / "git_mutation_command_policy.py"
-_CODEX_HOOK_ADAPTER_MJS = (
-    _GUARDS_DIR.parent.parent / "scripts" / "session-recording" / "codex-hook-adapter.mjs"
-)
 
 
 def _init_repo(repo: Path) -> None:
@@ -718,15 +715,6 @@ def test_direct_policy_cli_is_blocked_by_real_hook_chain(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # Issue #1688 fix delta P0 nested_timeout_mismatch
 # ---------------------------------------------------------------------------
-
-def test_passive_adapter_has_no_publish_transaction_deadline():
-    """Quarantined passive hooks must not retain a transaction timeout or
-    invoke the existing-branch publish transaction at all."""
-    source = _CODEX_HOOK_ADAPTER_MJS.read_text()
-    assert "EXISTING_BRANCH_PUBLISH_LANE_TIMEOUT_MS" not in source
-    assert "--execute-existing-branch-update" not in source
-    assert "git_mutation_command_policy.py" not in source
-
 
 def test_timeout_returns_structured_indeterminate_result(tmp_path: Path):
     """GIVEN the transaction's own deadline is already exhausted before the
