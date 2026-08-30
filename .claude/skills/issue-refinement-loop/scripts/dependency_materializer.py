@@ -443,7 +443,11 @@ def materialize_dependencies(
 
     cap_ok, cap_err = capability_preflight()
     if not cap_ok:
-        failure_class = "native-capability-unavailable" if cap_err == "gh_binary_not_found" else "auth-or-environment-failure"
+        failure_class = (
+            "native-capability-unavailable"
+            if cap_err == "gh_binary_not_found"
+            else "auth-or-environment-failure"
+        )
         return _render_materialization_result(
             status="blocked",
             target_issue_number=target_issue_number,
