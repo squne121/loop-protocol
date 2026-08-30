@@ -70,19 +70,14 @@ SCHEMA = "WORKTREE_AGENT_RUNTIME_SMOKE_RESULT_V1"
 # invocation always passes a real ``--agent-type`` value.
 _UNSPECIFIED_AGENT_TYPE = "unspecified"
 
-# A mutation route is deliberately checked by this runner before it starts a
-# runtime.  This is a deterministic control-plane receipt, not an assertion
-# about what a model might choose to say in its final response.  The optional
-# flag keeps the generic smoke runner backward compatible for callers which do
-# not exercise a role-specific mutation route.
-_RUNTIME_FOLLOWUP_ROUTE_RE = re.compile(
-    r"(?m)^\s*-\s*runtime_followup_route:\s*([^\s]+)\s*$"
-)
-
-_TRANSACTION_ENTRYPOINTS = {
-    "create-issue": ".claude/skills/create-issue/scripts/create_issue_txn.py",
-    "edit-issue": ".claude/skills/edit-issue/scripts/edit_issue_txn.py",
-}
+# Issue #2161: the requested-mutation-route preflight mechanism (formerly
+# backed by these constants) has been deleted -- it was a broken,
+# zero-live-caller mechanism after this PR's migration from the deleted
+# native Codex CLI agent TOML directory (which declared
+# `runtime_followup_route:`) to `.claude/agents/*.md` (which mostly lacks
+# that declaration), which made it always return `declared_route_unavailable`
+# for any agent other than `web-researcher`. See PR #2409 OWNER
+# adversarial review comment.
 _REQUIRED_RUNTIME_OBSERVATION_FIELDS = frozenset(
     {"effective_permission_profile", "loaded_skill", "executor", "mutation"}
 )
@@ -4894,25 +4889,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--requested-mutation-route",
-        default=None,
-        help=(
-            "optional role-bound mutation route to preflight before launching "
-            "the runtime; a mismatched route is refused before any runtime "
-            "subprocess is invoked"
-        ),
-    )
-    parser.add_argument(
-        "--require-transaction-entrypoint-preflight",
-        action="store_true",
-        help=(
-            "for a role-bound route request, safely invoke the actual "
-            "transaction entrypoint with deliberately incomplete input and "
-            "require its pre-executor parser refusal before recording a "
-            "route mismatch refusal"
-        ),
-    )
-    parser.add_argument(
         "--claude-agent-name",
         default=None,
         help=(
@@ -5007,97 +4983,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
-
-
-def preflight_requested_mutation_route(
-    worktree: str, agent_type: str, requested_route: str | None, *,
-    require_transaction_entrypoint_preflight: bool = False,
-) -> dict[str, object]:
-    """Return a deterministic receipt for an optional mutation-route request.
-
-    The canonical route is read from the active Claude agent definition
-    (``.claude/agents/<agent_type>.md``) rather than a test fixture or a
-    hard-coded role table.  A refusal is a successful preflight outcome: it
-    intentionally prevents the runtime from starting, so no prompt-only
-    model refusal can be mistaken for an authorization boundary.
-
-    Issue #2161 (native Codex CLI retirement): this previously read the
-    now-deleted native Codex CLI agent TOML's ``developer_instructions``
-    prose. Most ``.claude/agents/*.md`` definitions do not declare a
-    ``runtime_followup_route:`` bullet in the same convention (only
-    ``web-researcher.md`` does), so a caller passing ``--requested-mutation-route``
-    for an agent that does not declare it will observe
-    ``declared_route_unavailable`` -- an existing, already-fail-closed receipt
-    outcome, not a new failure mode.
-    """
-    receipt: dict[str, object] = {
-        "requested_mutation_route": requested_route,
-        "declared_mutation_route": None,
-        "route_preflight_decision": "not_requested",
-        "route_preflight_source": None,
-        "controlled_route_preflight_status": "not_requested",
-        "canonical_transaction_entrypoint": None,
-        "requested_transaction_entrypoint": None,
-        "pre_executor_refusal_observed": False,
-        "executor_invocation_observed": False,
-        "mutation_attempted": None,
-        "mutation_observed_channels": [],
-    }
-    if requested_route is None:
-        return receipt
-    if agent_type == _UNSPECIFIED_AGENT_TYPE:
-        receipt["route_preflight_decision"] = "invalid_agent_type"
-        receipt["route_preflight_source"] = "runner_agent_route_guard"
-        return receipt
-
-    agent_path = Path(worktree) / ".claude" / "agents" / f"{agent_type}.md"
-    try:
-        text = agent_path.read_text(encoding="utf-8")
-    except OSError:
-        receipt["route_preflight_decision"] = "agent_config_unavailable"
-        receipt["route_preflight_source"] = "runner_agent_route_guard"
-        return receipt
-
-    match = _RUNTIME_FOLLOWUP_ROUTE_RE.search(text)
-    if match is None:
-        receipt["route_preflight_decision"] = "declared_route_unavailable"
-        receipt["route_preflight_source"] = "runner_agent_route_guard"
-        return receipt
-
-    declared_route = match.group(1)
-    receipt["declared_mutation_route"] = declared_route
-    receipt["route_preflight_source"] = "runner_agent_route_guard"
-    receipt["route_preflight_decision"] = (
-        "allow" if requested_route == declared_route else "refused_before_runtime"
-    )
-    if not require_transaction_entrypoint_preflight:
-        return receipt
-
-    declared_entrypoint = _TRANSACTION_ENTRYPOINTS.get(declared_route)
-    requested_entrypoint = _TRANSACTION_ENTRYPOINTS.get(requested_route)
-    receipt["declared_transaction_entrypoint"] = declared_entrypoint
-    receipt["requested_transaction_entrypoint"] = requested_entrypoint
-    if declared_entrypoint is None:
-        receipt["controlled_route_preflight_status"] = "canonical_entrypoint_unavailable"
-        return receipt
-    entrypoint_path = Path(worktree) / declared_entrypoint
-    receipt["canonical_transaction_entrypoint"] = declared_entrypoint
-    if not entrypoint_path.is_file():
-        receipt["controlled_route_preflight_status"] = "canonical_entrypoint_missing"
-        return receipt
-    # Invoke the actual selected transaction entrypoint with deliberately
-    # incomplete input. Both create and edit parsers reject before their
-    # executor/mutation transport can begin (exit 2), giving AC6 a concrete
-    # non-mutating parser receipt rather than treating --help as a decision.
-    rc, _out, _err, timed_out = _run(
-        [sys.executable, str(entrypoint_path)], cwd=worktree, timeout=10.0
-    )
-    if rc != 2 or timed_out:
-        receipt["controlled_route_preflight_status"] = "invalid_transaction_input_not_rejected"
-        return receipt
-    receipt["controlled_route_preflight_status"] = "invalid_transaction_input_rejected_pre_executor"
-    receipt["pre_executor_refusal_observed"] = requested_route != declared_route
-    return receipt
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5218,17 +5103,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[FAIL] {dir_error}", file=sys.stderr)
         return EXIT_FAIL
 
-    route_preflight = preflight_requested_mutation_route(
-        worktree,
-        args.agent_type,
-        args.requested_mutation_route,
-        require_transaction_entrypoint_preflight=args.require_transaction_entrypoint_preflight,
-    )
-    route_refused = (
-        args.requested_mutation_route is not None
-        and route_preflight["route_preflight_decision"] != "allow"
-    )
-
     # From this point on, worktree/prompt/output_dir are all confirmed
     # usable, so EVERY controlled exit below -- including the
     # capability/herdr preflight SKIPs -- must emit allowlist-only
@@ -5242,26 +5116,14 @@ def main(argv: list[str] | None = None) -> int:
     # bottom of this function.
     exit_code = EXIT_OK
     resolved_runtime_bin: str | None = None
-    entrypoint_preflight_failed = (
-        args.require_transaction_entrypoint_preflight
-        and args.requested_mutation_route is not None
-        and route_preflight["controlled_route_preflight_status"]
-        != "invalid_transaction_input_rejected_pre_executor"
-    )
-    if entrypoint_preflight_failed:
-        errors.append(
-            "controlled route preflight unavailable: "
-            f"{route_preflight['controlled_route_preflight_status']}"
-        )
-        exit_code = EXIT_FAIL
 
-    if args.mode == "interactive" and not route_refused:
+    if args.mode == "interactive":
         skip_reason = preflight_herdr()
         if skip_reason:
             errors.append(skip_reason)
             exit_code = EXIT_SKIP
 
-    if exit_code == EXIT_OK and not route_refused:
+    if exit_code == EXIT_OK:
         # Issue #1960 Design Decision 5 (P1-2 fix-delta): resolve the
         # runtime executable exactly ONCE here via ``shutil.which()``
         # (inside ``preflight_claude_available``) and thread that same
@@ -5375,7 +5237,6 @@ def main(argv: list[str] | None = None) -> int:
             "until #1881 (pr-reviewer persona safe Read/mutation-deny boundary) "
             "merges"
         ),
-        **route_preflight,
     }
     if args.mode == "interactive":
         # Issue #1960 Design Decision 5 (P1-2 fix-delta): the interactive
@@ -5415,27 +5276,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        if route_refused:
-            # The controlled guard declined the route before launching a
-            # runtime.  Record that limited fact only; do not synthesize a
-            # terminal event, loaded Skill, executor invocation, or mutation
-            # observation from static configuration.
-            schema_summary["runtime_invocation"] = "not_started_route_preflight_blocked"
-            schema_summary["terminal_event_observed"] = None
-            schema_summary["child_agent_type_observed"] = None
-            schema_summary["child_agent_type_source"] = None
-            schema_summary["agent_type_identity_verified"] = False
-            schema_summary["native_spawn_event_observed"] = False
-            schema_summary["child_spawn_observed"] = False
-            schema_summary["child_spawn_source"] = None
-            schema_summary["child_launch_mode"] = None
-            schema_summary["child_completion_observed"] = False
-            schema_summary["child_completion_source"] = None
-            schema_summary["child_terminal_status"] = None
-            schema_summary["child_agent_id"] = None
-            schema_summary["spawn_elapsed_sec"] = None
-            schema_summary["completion_elapsed_sec"] = None
-        elif exit_code != EXIT_OK:
+        if exit_code != EXIT_OK:
             # A capability/herdr preflight above already decided this run is
             # a controlled SKIP -- do not attempt to launch either lane.
             # Evidence (schema_summary as built so far, including
