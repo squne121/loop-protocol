@@ -69,6 +69,69 @@ claude_gpt_evidence_dir() {
   printf '%s/.evidence\n' "$script_dir"
 }
 
+# --- Latitude telemetry package identity（Issue #2426）。
+# launcher-owned Latitude Stop hook adapter（scripts/claude-gpt/latitude_hook.py）が
+# 起動する telemetry package の exact pinned identity を一箇所の SSOT で固定する
+# （Design 4節「再現可能な exact identity を一箇所の SSOT で pin する」）。
+# versionless / floating `npx -y @latitude-data/claude-code-telemetry` を新しい
+# canonical production command にしない（docs/dev/secret-policy.md の
+# `activation_denied_if: unpinned_npx` と同じ禁止事項）。
+# docs/dev/secret-policy.md の LATITUDE_DISTRIBUTION_GATE_V1.package_spec /
+# tarball_sha256 プレースホルダはこの値と同期させる（このファイルが正本、
+# secret-policy.md 側は mirror）。
+claude_gpt_latitude_package_name() {
+  printf '@latitude-data/claude-code-telemetry\n'
+}
+
+claude_gpt_latitude_package_version() {
+  printf '0.0.14\n'
+}
+
+claude_gpt_latitude_package_spec() {
+  printf '%s@%s\n' "$(claude_gpt_latitude_package_name)" "$(claude_gpt_latitude_package_version)"
+}
+
+# claude_gpt_native_latitude_project: Native user settings（引数1）の `env` から
+# `LATITUDE_PROJECT` の値だけを返す（Issue #2426 PR #2439 P0 fix-delta,
+# OWNER REQUEST_CHANGES）。
+#
+# Design 3節: 「`LATITUDE_PROJECT` は secret ではないため、既存 #2375（PR #2392）
+# collector が同一 project を解決できるよう runtime から解決可能にしてよい」-- した
+# がってこの値は（`LATITUDE_API_KEY` とは異なり）生成済み Claude-GPT settings の
+# `env` へそのまま焼き込んでよい。実際の値読み取りは、closed allowlist の実装が
+# 存在する唯一の SSOT である `latitude_hook.py` の `read_native_latitude_allowlist()`
+# を再利用する（同じ allowlist ロジックを shell 側に複製しない）。
+#
+# 引数1: Native user settings の絶対パス（`~/.claude/settings.json` 相当）
+# 引数2: `latitude_hook.py` の絶対パス（`read_native_latitude_allowlist()` を
+#        import するために使う。呼び出し元がすでに解決済みの
+#        `CLAUDE_GPT_LATITUDE_HOOK` をそのまま渡すこと）
+# 戻り値: LATITUDE_PROJECT の値（非空文字列）。未設定・読み取り失敗時は空文字列
+#         （fail-open。既存 `read_native_latitude_allowlist()` の fail-open 契約と
+#         同じ）。`LATITUDE_API_KEY` はこの関数が扱う値に一切含まれない
+#         （`allowlist.get("LATITUDE_PROJECT")` のみを取り出す）。
+claude_gpt_native_latitude_project() {
+  native_settings_path="$1"
+  hook_path="$2"
+  if [ -z "$native_settings_path" ] || [ -z "$hook_path" ] || ! command -v python3 >/dev/null 2>&1; then
+    printf ''
+    return 0
+  fi
+  python3 -c '
+import importlib.util
+import sys
+
+hook_path, settings_path = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location(
+    "claude_gpt_latitude_hook_lib_native_project", hook_path
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+allowlist = module.read_native_latitude_allowlist(settings_path)
+sys.stdout.write(allowlist.get("LATITUDE_PROJECT") or "")
+' "$hook_path" "$native_settings_path" 2>/dev/null
+}
+
 # --- Model alias mapping（Parent #2154 アーキテクチャ決定 E 準拠） ---
 # opus -> gpt-5.6-sol / sonnet -> gpt-5.6-terra（main 推奨） / haiku -> gpt-5.6-luna
 #
