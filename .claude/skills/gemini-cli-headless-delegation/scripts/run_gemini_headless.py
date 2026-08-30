@@ -638,6 +638,60 @@ def _classify_agy_failure(returncode: int, stdout: str, stderr: str) -> str:
     if _AGY_RATE_LIMITED_RE.search(combined):
         return "agy_rate_limited"
     return "agy_exit_nonzero" if returncode != 0 else "agy_output_missing"
+
+
+_AGY_FAILURE_KIND_OPERATIONAL = "operational"
+_AGY_FAILURE_KIND_POLICY_OR_PERMISSION = "policy_or_permission"
+_AGY_FAILURE_KIND_CONTRACT = "contract"
+_AGY_FAILURE_KINDS = frozenset({
+    _AGY_FAILURE_KIND_OPERATIONAL,
+    _AGY_FAILURE_KIND_POLICY_OR_PERMISSION,
+    _AGY_FAILURE_KIND_CONTRACT,
+})
+
+
+def canonical_agy_failure_kind(failure_class: str | None) -> str | None:
+    """Return the producer-owned kind for a known actual AGY failure class.
+
+    Consumers use this narrow classifier to verify the pair emitted by this
+    canonical producer.  Returning ``None`` for unknown values is deliberate:
+    a future class must be added here with its domain before it can authorize
+    an advisory fallback.
+    """
+    if failure_class in {
+        "agy_permission_denied",
+        "agy_invocation_policy_denied",
+        "agy_permission_boundary_unavailable",
+        "agy_permission_boundary_inconclusive",
+    }:
+        return _AGY_FAILURE_KIND_POLICY_OR_PERMISSION
+    if failure_class in {
+        "agy_rate_limited",
+        "agy_capacity_exhausted",
+        "agy_web_grounding_quota_exhausted",
+        "agy_auth_required",
+        "agy_not_found",
+        "agy_timeout",
+        "agy_exit_nonzero",
+        "agy_empty_stdout",
+        "agy_output_missing",
+        "agy_unexpected_error",
+    }:
+        return _AGY_FAILURE_KIND_OPERATIONAL
+    if failure_class in {"agy_empty_prompt"}:
+        return _AGY_FAILURE_KIND_CONTRACT
+    return None
+
+
+def _agy_failure_kind(failure_class: str | None) -> str:
+    """Return the closed emitted domain for an AGY failure class.
+
+    Unknown values remain representable as ``contract`` in the producer
+    result, but the exported classifier above returns ``None`` for them.  A
+    controller therefore rejects an unknown class/kind pair rather than
+    treating the conservative emitted fallback as a valid operational class.
+    """
+    return canonical_agy_failure_kind(failure_class) or _AGY_FAILURE_KIND_CONTRACT
 AGY_SUPPORTED_PROFILES: frozenset[str] = frozenset(
     {
         "no_tools",
@@ -727,8 +781,8 @@ _AGY_GROUNDED_RESEARCH_RETRYABLE_FAILURE_CLASSES = frozenset({
 })
 SERENA_TOOL_CONTRACT_UNKNOWN_POLICY = "exact_match"
 LOCAL_ASSET_MAX_CONTEXT_FILES = 32
-LOCAL_ASSET_MAX_CONTEXT_BYTES = 200_000
-LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES = 600_000
+LOCAL_ASSET_MAX_CONTEXT_BYTES = 1024 * 1024
+LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES = 4 * 1024 * 1024
 
 # Issue #1638: AGY local_asset_research targeted source-evidence contract bounds.
 TARGETED_EVIDENCE_MAX_TARGETS = 8
@@ -3571,6 +3625,13 @@ _AGY_LAST_RAW_COMMAND_CTX: "contextvars.ContextVar[list[str] | None]" = contextv
     "_agy_last_raw_command_ctx", default=None
 )
 
+# Set immediately before the canonical subprocess execution boundary. The
+# result surface attaches this producer-owned fact instead of asking route
+# consumers to infer whether a validation or preflight failure reached AGY.
+_AGY_INVOCATION_ATTEMPTED_CTX: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "_agy_invocation_attempted_ctx", default=False
+)
+
 
 def _get_agy_audit_raw_command() -> list[str]:
     """Return the `raw_command` value for the current agy invocation
@@ -3751,6 +3812,7 @@ def _run_agy(
             run_command = command
             if workspace.agy_oauth_token_bwrap_prefix:
                 run_command = list(workspace.agy_oauth_token_bwrap_prefix) + command
+            _AGY_INVOCATION_ATTEMPTED_CTX.set(True)
             completed = subprocess.run(
                 run_command,
                 cwd=str(workspace.workspace_dir),
@@ -3815,6 +3877,7 @@ def _run_agy(
                 # calls happened" without also checking this field (Issue #1708 AC9).
                 hook_load_error = f"workspace_hook_generation_failed: {exc}"
 
+        _AGY_INVOCATION_ATTEMPTED_CTX.set(True)
         completed = subprocess.run(
             command,
             cwd=tmp,
@@ -4719,6 +4782,7 @@ def _normalize_agy_result(
             "warnings": warnings,
             "failure_reason": warning,
             "failure_class": failure_class,
+            "agy_failure_kind": _agy_failure_kind(failure_class),
             "raw_command": _get_agy_audit_raw_command(),
             "model_chain": [],
             "model_downgrades": [],
@@ -4755,6 +4819,7 @@ def _normalize_agy_result(
             "warnings": [warning] + warnings,
             "failure_reason": failure_class,
             "failure_class": failure_class,
+            "agy_failure_kind": _agy_failure_kind(failure_class),
             "raw_command": _get_agy_audit_raw_command(),
             "model_chain": [],
             "model_downgrades": [],
@@ -4833,6 +4898,9 @@ def _normalize_agy_result(
         "warnings": warnings,
         "failure_reason": top_level_failure_reason,
         "failure_class": top_level_failure_class,
+        "agy_failure_kind": (
+            _agy_failure_kind(top_level_failure_class) if not top_level_ok else None
+        ),
         "raw_command": _get_agy_audit_raw_command(),
         "grounded_research_evidence": grounded_research_evidence,
         "model_chain": [],
@@ -7170,6 +7238,33 @@ _AUDIT_REENTRANCY_DEPTH_VAR: contextvars.ContextVar[int] = contextvars.ContextVa
 )
 
 
+def _attach_agy_failure_kind(
+    request: Mapping[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
+    """Add the canonical producer-owned AGY failure discriminator.
+
+    ``_run_delegation_core`` has several early error returns before the AGY
+    subprocess normalizer is reached.  Keeping this at the public producer
+    boundary makes every direct ``provider: agy`` result carry the same
+    closed discriminator without asking a downstream consumer to infer it.
+    Non-AGY requests retain their existing result contract unchanged.
+    """
+    if request.get("provider") != "agy":
+        return result
+
+    normalized = dict(result)
+    normalized["agy_invocation_attempted"] = _AGY_INVOCATION_ATTEMPTED_CTX.get()
+    if normalized.get("ok") is True:
+        normalized["agy_failure_kind"] = None
+        return normalized
+
+    failure_class = normalized.get("failure_class")
+    normalized["agy_failure_kind"] = _agy_failure_kind(
+        failure_class if isinstance(failure_class, str) else None
+    )
+    return normalized
+
+
 def run_delegation(
     request: Mapping[str, Any],
     request_path: Path | None = None,
@@ -7188,9 +7283,17 @@ def run_delegation(
     _AUDIT_REENTRANCY_DEPTH_VAR.set(depth)
     is_top_level_call = depth == 1
     audit_state: dict[str, Any] | None = None
+    agy_attempt_token = (
+        _AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+        if request.get("provider") == "agy"
+        else None
+    )
     try:
         audit_state = _audit_begin(request) if is_top_level_call else None
-        result = _run_delegation_core(request, request_path=request_path, _routing=_routing)
+        result = _attach_agy_failure_kind(
+            request,
+            _run_delegation_core(request, request_path=request_path, _routing=_routing),
+        )
         if is_top_level_call:
             _audit_end(audit_state, request, result)
         return result
@@ -7206,6 +7309,8 @@ def run_delegation(
             _audit_end(audit_state, request, unexpected_result)
         raise
     finally:
+        if agy_attempt_token is not None:
+            _AGY_INVOCATION_ATTEMPTED_CTX.reset(agy_attempt_token)
         _AUDIT_REENTRANCY_DEPTH_VAR.set(depth - 1)
 
 

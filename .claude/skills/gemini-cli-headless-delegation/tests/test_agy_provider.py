@@ -1004,7 +1004,77 @@ def test_agy_file_not_found_returns_failure_class() -> None:
         result = rgh.run_delegation(_agy_request())
     assert result["ok"] is False
     assert result.get("failure_class") == "agy_not_found"
+    assert result.get("agy_failure_kind") == "operational"
     assert "agy_not_found" in (result.get("failure_reason") or "")
+
+
+# ---------------------------------------------------------------------------
+# Issue #2434: producer-owned AGY failure discriminator
+# ---------------------------------------------------------------------------
+
+
+def test_agy_success_has_null_producer_failure_kind() -> None:
+    completed = _make_completed(0, stdout="LOOP_AGY_SMOKE_OK")
+    with patch.object(rgh, "_run_agy", return_value=completed):
+        result = rgh.run_delegation(_agy_request())
+
+    assert result["ok"] is True
+    assert result["agy_failure_kind"] is None
+
+
+def test_agy_operational_failure_has_producer_failure_kind() -> None:
+    with patch.object(rgh, "_run_agy", side_effect=subprocess.TimeoutExpired(cmd="agy", timeout=30)):
+        result = rgh.run_delegation(_agy_request())
+
+    assert result["failure_class"] == "agy_timeout"
+    assert result["agy_failure_kind"] == "operational"
+
+
+def test_agy_policy_or_permission_failure_has_producer_failure_kind() -> None:
+    completed = _make_completed(1, stderr="permission denied")
+    with patch.object(rgh, "_run_agy", return_value=completed):
+        result = rgh.run_delegation(_agy_request())
+
+    assert result["failure_class"] == "agy_permission_denied"
+    assert result["agy_failure_kind"] == "policy_or_permission"
+
+
+def test_agy_contract_failure_has_producer_failure_kind() -> None:
+    result = rgh.run_delegation(_agy_request(prompt=""))
+
+    assert result["failure_class"] == "agy_empty_prompt"
+    assert result["agy_failure_kind"] == "contract"
+
+
+def test_unknown_agy_failure_class_is_conservatively_contract() -> None:
+    assert rgh._agy_failure_kind("agy_future_unclassified") == "contract"
+
+
+def test_canonical_agy_failure_kind_rejects_unknown_pair_class() -> None:
+    assert rgh.canonical_agy_failure_kind("agy_timeout") == "operational"
+    assert rgh.canonical_agy_failure_kind("agy_permission_denied") == "policy_or_permission"
+    assert rgh.canonical_agy_failure_kind("agy_empty_prompt") == "contract"
+    assert rgh.canonical_agy_failure_kind("agy_future_unclassified") is None
+    assert rgh.canonical_agy_failure_kind("request_policy_denied") is None
+
+
+def test_agy_invocation_attempted_is_false_before_subprocess() -> None:
+    result = rgh.run_delegation(_agy_request(prompt=""))
+
+    assert result["ok"] is False
+    assert result["agy_invocation_attempted"] is False
+
+
+def test_agy_invocation_attempted_becomes_true_at_subprocess_boundary() -> None:
+    def fake_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess:
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True
+        return _make_completed(0, stdout="LOOP_AGY_SMOKE_OK")
+
+    with patch("subprocess.run", side_effect=fake_run):
+        result = rgh.run_delegation(_agy_request())
+
+    assert result["ok"] is True
+    assert result["agy_invocation_attempted"] is True
 
 
 # ---------------------------------------------------------------------------
