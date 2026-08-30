@@ -16,7 +16,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -76,13 +76,29 @@ def _write_runtime_skip_evidence(reason: str) -> Path:
     return path
 
 
+def _exit_runtime_skip(*, reason: str, before: str) -> NoReturn:
+    """Emit the runtime-policy SKIP contract without treating it as PASS."""
+    assert before == _tracked_status(), "tracked worktree status changed before runtime SKIP"
+    evidence = _write_runtime_skip_evidence(reason)
+    print(f"SKIP: {reason}; evidence: {evidence}")
+    pytest.exit("runtime verification unavailable", returncode=77)
+
+
 def _write_fake_agy(tmp_path: Path) -> Path:
     fake = tmp_path / "fake-agy.py"
     fake.write_text(
         """#!/usr/bin/env python3
+import json
+import os
 from pathlib import Path
 import sys
-Path(__file__).with_suffix('.invoked').write_text(' '.join(sys.argv[1:]), encoding='utf-8')
+Path(__file__).with_suffix('.invoked').write_text(
+    json.dumps(
+        {"argv": sys.argv[1:], "agy_bin": os.environ.get("AGY_BIN")},
+        separators=(",", ":"),
+    ),
+    encoding="utf-8",
+)
 print('simulated AGY operational failure', file=sys.stderr)
 raise SystemExit(1)
 """,
@@ -145,11 +161,11 @@ def test_actual_wrapper_fallback_reaches_real_native_sentinel(tmp_path: Path, mo
     controller_command = f"{driver} > {decision_path} 2> {sidecar_path}"
     monkeypatch.setenv("AGY_BIN", "/ambient/must-not-be-used")
     before = _tracked_status()
+    assert before == "", "AC8 runtime smoke requires a clean tracked worktree"
 
     claude_bin = shutil.which("claude")
     if claude_bin is None:
-        evidence = _write_runtime_skip_evidence("claude CLI not found on PATH")
-        pytest.skip(f"SKIP: claude CLI not found; evidence: {evidence}")
+        _exit_runtime_skip(reason="claude CLI not found on PATH", before=before)
     prompt = f"""Run the following exact **test-only private controller driver** once. It owns
 canonical builder → actual AGY wrapper → exact result readback and emits its closed
 controller decision only on stdout. Capture stdout and stderr separately exactly as shown:
@@ -158,7 +174,7 @@ controller decision only on stdout. Capture stdout and stderr separately exactly
 {controller_command}
 ```
 
-Read both resulting files. Do not accept a caller-supplied decision, raw wrapper result,
+Use the Read tool separately on both resulting files. Do not accept a caller-supplied decision, raw wrapper result,
 or provenance. Only if the directly captured decision is exact `degraded` /
 `native_non_mutating_fallback`, the sidecar is empty, and the process exit is 0, perform
 bounded native read-only investigation of `.claude/agents/codebase-investigator.md`, find
@@ -190,8 +206,10 @@ separately, and do not use a mutation tool.
     combined = (completed.stdout or "") + "\n" + (completed.stderr or "")
     unavailable = next((item for item in _UNAVAILABLE_MARKERS if item in combined), None)
     if completed.returncode != 0 and unavailable is not None:
-        evidence = _write_runtime_skip_evidence(f"actual SubAgent runtime unavailable ({unavailable})")
-        pytest.skip(f"SKIP: actual SubAgent runtime unavailable ({unavailable}); evidence: {evidence}")
+        _exit_runtime_skip(
+            reason=f"actual SubAgent runtime unavailable ({unavailable})",
+            before=before,
+        )
 
     tools, result = _stream_result(completed.stdout or "")
     bash_commands = [
@@ -214,9 +232,19 @@ separately, and do not use a mutation tool.
     assert sidecar_path.read_bytes() == b""
     fake_evidence = fake.with_suffix(".invoked")
     assert fake_evidence.is_file()
-    assert "-p" in fake_evidence.read_text(encoding="utf-8")
+    fake_invocation = json.loads(fake_evidence.read_text(encoding="utf-8"))
+    assert "-p" in fake_invocation["argv"]
+    assert fake_invocation["agy_bin"] == str(fake)
     assert any(str(driver) in command for command in bash_commands), (
         "real codebase-investigator did not invoke the test-only controller driver"
+    )
+    read_paths = {
+        str(tool["input"].get("file_path", ""))
+        for tool in tools
+        if tool["name"] == "Read" and isinstance(tool["input"], dict)
+    }
+    assert {str(decision_path), str(sidecar_path)} <= read_paths, (
+        "real codebase-investigator did not separately consume controller stdout/stderr captures"
     )
     assert not [tool for tool in tools if tool["name"] in _MUTATING_TOOLS]
     assert before == _tracked_status(), "tracked worktree status changed during smoke"
