@@ -114,23 +114,23 @@ INITIAL_BRANCH_CREATE_STATUS_DENIED = "denied"
 # `--execute-existing-branch-update` flag) and initial_branch_create
 # (`execute_initial_branch_create_transaction`, always attempted once the
 # `--force-with-lease=` argv shape and every precondition above it match) --
-# MUST NOT execute unless `boundary_layer` identifies one of the two known
-# trusted PreToolUse-equivalent callers below. This is a second, independent
-# layer of defense behind the hook adapter's own `eventName === 'PreToolUse'`
-# gate (scripts/session-recording/codex-hook-adapter.mjs) -- it is not a
-# cryptographic caller-authentication scheme (a `--boundary-layer
-# codex_hook_adapter_pretooluse` string is not a secret), but it does close
-# the concrete PermissionRequest-mutates-remote hole and gives a fail-closed
-# default for any other/unknown boundary_layer value (including a bare
-# terminal invocation of this CLI).
+# MUST NOT execute unless `boundary_layer` identifies the one known trusted
+# PreToolUse-equivalent caller below. This is not a cryptographic
+# caller-authentication scheme (a `--boundary-layer` string is not a
+# secret), but it does close the concrete PermissionRequest-mutates-remote
+# hole and gives a fail-closed default for any other/unknown boundary_layer
+# value (including a bare terminal invocation of this CLI).
 #   - "worktree_scope_guard_denied": the default used by
 #     scripts/agent-guards/worktree_scope_guard.py, the Claude Code
 #     PreToolUse-equivalent trusted in-process caller (Issue #1449).
-#   - "codex_hook_adapter_pretooluse": the Codex `PreToolUse` hook adapter
-#     (Issue #1408 / #1688). The adapter never passes this value for a
-#     `PermissionRequest` event.
+# Issue #2412: the native Codex CLI hook adapter (formerly
+# scripts/session-recording/codex-hook-adapter.mjs) that used to have its
+# own dedicated entry in the authorized set below was retired along with
+# native Codex CLI runtime support (Issue #2161); that boundary_layer value
+# is removed and now falls through to the fail-closed default like any
+# other unknown caller.
 _AUTHORIZED_EXECUTION_BOUNDARY_LAYERS = frozenset(
-    {"worktree_scope_guard_denied", "codex_hook_adapter_pretooluse"}
+    {"worktree_scope_guard_denied"}
 )
 EXECUTION_NOT_AUTHORIZED_FOR_BOUNDARY_LAYER = "execution_not_authorized_for_boundary_layer"
 
@@ -3043,8 +3043,8 @@ def _classify_initial_branch_create_push(
 
     # Issue #1688 fix delta (P0 EVENT-BOUNDARY-01 / no_caller_authentication_
     # on_mutation_executing_cli): second-layer defense -- never reach the real
-    # remote write below unless `boundary_layer` identifies one of the two
-    # known trusted PreToolUse-equivalent callers (see
+    # remote write below unless `boundary_layer` identifies the one known
+    # trusted PreToolUse-equivalent caller (see
     # `_AUTHORIZED_EXECUTION_BOUNDARY_LAYERS`). A `PermissionRequest`-origin
     # or unauthenticated direct-CLI invocation never has an authorized value
     # here and is denied before the transaction (and therefore before any
@@ -3805,10 +3805,8 @@ def _classify_rtk_git_mutation_with_context(
         # Issue #1688 fix delta (P0 EVENT-BOUNDARY-01 / no_caller_
         # authentication_on_mutation_executing_cli): second-layer defense --
         # never perform the real remote write below unless `boundary_layer`
-        # identifies one of the two known trusted PreToolUse-equivalent
-        # callers (see `_AUTHORIZED_EXECUTION_BOUNDARY_LAYERS`). This is
-        # independent of, and in addition to, the hook adapter's own
-        # `eventName === 'PreToolUse'` gate.
+        # identifies the one known trusted PreToolUse-equivalent caller (see
+        # `_AUTHORIZED_EXECUTION_BOUNDARY_LAYERS`).
         if boundary_layer not in _AUTHORIZED_EXECUTION_BOUNDARY_LAYERS:
             return GitMutationPolicyResult(
                 status="deny",
