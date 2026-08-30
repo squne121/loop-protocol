@@ -3307,52 +3307,6 @@ jobs:
           printf '{"step_id":"pytest_node_backed_hook_tests","phase_id":"pytest_node_backed_hooks","status":%d,"elapsed_ms":%d}\n' \
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
-      - name: pytest_session_recording_codex_hook_adapter (timed)
-        # Issue #1420 fix_delta 2: dedicated node-backed-hook-tests lane for
-        # tests/session_recording/codex/test_hook_adapter.py. This job already
-        # runs pnpm install, so the Node child-process dependency
-        # (codex-hook-adapter.mjs / ajv / ajv-formats) is available here.
-        # Independent of the fixed 2-nodeid disjointness/exact-match invariant
-        # check below (do not touch that block).
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest -q tests/session_recording/codex/test_hook_adapter.py -p no:xdist
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_session_recording_codex_hook_adapter","phase_id":"pytest_session_recording_codex_hook_adapter","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest_session_recording_codex_initial_branch_create_lane (timed)
-        # Issue #1449 fix_delta (PR #1479 review): dedicated node-backed-hook-tests
-        # lane for tests/session_recording/codex/test_initial_branch_create_lane.py,
-        # which exercises the real codex-hook-adapter.mjs node subprocess (same
-        # harness pattern as test_hook_adapter.py above) and was previously an
-        # uncovered changed test file (neither python-test targets nor this job's
-        # dedicated_lanes referenced it).
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest -q tests/session_recording/codex/test_initial_branch_create_lane.py -p no:xdist
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_session_recording_codex_initial_branch_create_lane","phase_id":"pytest_session_recording_codex_initial_branch_create_lane","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
-      - name: pytest_session_recording_codex_hook_adapter_xdist (timed)
-        # Issue #1420 fix_delta 3 AC11: run the same suite under pytest-xdist
-        # parallel execution (-n 4 --dist load) to regression-test the manifest
-        # write-path race fix under real worker parallelism. The `-p no:xdist`
-        # step above is left untouched (both lanes execute).
-        run: |
-          _t0=$(date +%s%3N)
-          set +e
-          uv run --locked pytest -q tests/session_recording/codex/test_hook_adapter.py -n 4 --dist load
-          _s=$?
-          set -e
-          printf '{"step_id":"pytest_session_recording_codex_hook_adapter_xdist","phase_id":"pytest_session_recording_codex_hook_adapter_xdist","status":%d,"elapsed_ms":%d}\n' \
-            $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
-          exit $_s
       - name: node --test session_manifest_debounce (AC4/AC6, Node 22) (timed)
         # Issue #1141 AC6: virtual-clock unit tests for flushLoop DI core.
         # Node 22 is guaranteed by the setup-node-pnpm composite action (default
@@ -3374,8 +3328,7 @@ jobs:
         # directly or via its `--repo-root` / `--print-resolved-override`
         # test seams) and were previously running inside python-test-core
         # (a Node-free-by-contract job, Issue #1760), which violates that
-        # job's Python-only invariant. Moved here alongside the sibling
-        # tests/session_recording/codex/ node-backed lanes. The remaining
+        # job's Python-only invariant. The remaining
         # pure-Python nodeids in the same file stay in python-test-core (see
         # .github/ci/python-test-plan.json deselect +
         # secondary_coverage.dedicated_lanes).
@@ -3403,8 +3356,6 @@ jobs:
           uv run --locked pytest --collect-only -q \
             .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable \
             .claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths \
-            tests/session_recording/codex/test_hook_adapter.py \
-            tests/session_recording/codex/test_initial_branch_create_lane.py \
             tests/session-recording/test_fixed_location_cutover.py::test_default_fixed_location_producer_paths \
             tests/session-recording/test_fixed_location_cutover.py::test_new_private_directory_and_artifact_mode \
             tests/session-recording/test_fixed_location_cutover.py::test_env_override_repo_root_normalized \
@@ -3442,8 +3393,6 @@ jobs:
               pytest_args=[
                   ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stdout_is_silent_and_artifact_path_is_overridable",
                   ".claude/hooks/tests/test_generate_session_manifest_from_hook.py::test_wrapper_stderr_redacts_posix_windows_and_wsl_paths",
-                  "tests/session_recording/codex/test_hook_adapter.py",
-                  "tests/session_recording/codex/test_initial_branch_create_lane.py",
                   "tests/session-recording/test_fixed_location_cutover.py::test_default_fixed_location_producer_paths",
                   "tests/session-recording/test_fixed_location_cutover.py::test_new_private_directory_and_artifact_mode",
                   "tests/session-recording/test_fixed_location_cutover.py::test_env_override_repo_root_normalized",
@@ -3477,23 +3426,18 @@ jobs:
           # #1420 fix_delta AC8: the session_recording sublane is now ALSO
           # collected in this same collect-only pass so the G1
           # uncovered_changed_test_files gate observes real execution evidence
-          # for tests/session_recording/codex/test_hook_adapter.py instead of
-          # relying solely on the python-test-plan.json declared
+          # instead of relying solely on the python-test-plan.json declared
           # secondary_coverage entry.
-          # #1449 fix_delta (PR #1479 review): tests/session_recording/codex/
-          # test_initial_branch_create_lane.py joins the same sublane (same
-          # directory, same real codex-hook-adapter.mjs node subprocess
-          # harness) so it is also treated as session_recording, not as a
-          # "fixed hook wrapper" nodeid.
           # Issue #2004 P1-2 (PR #2008 review): the 8 node-backed nodeids in
           # tests/session-recording/test_fixed_location_cutover.py (a
-          # DIFFERENT directory -- tests/session-recording/, hyphenated --
-          # from the tests/session_recording/codex/ lane above) join the
-          # same "not a fixed hook wrapper nodeid" classification for the
-          # same reason: they spawn a real node child process.
+          # hyphenated directory) join this "not a fixed hook wrapper nodeid"
+          # classification because they spawn a real node child process.
+          # Issue #2412: the sibling tests/session_recording/codex/ (Codex
+          # passive-recorder adapter) node-backed lane was retired -- the
+          # producer chain (.codex/hooks.json -> composite hook -> the
+          # session-recording adapter script) was removed by PR #2409, and
+          # the last remaining production inbound reference was removed here.
           session_recording_prefixes = (
-              "tests/session_recording/codex/test_hook_adapter.py",
-              "tests/session_recording/codex/test_initial_branch_create_lane.py",
               "tests/session-recording/test_fixed_location_cutover.py",
           )
           artifact_dir = pathlib.Path("ci_test_selection_artifacts")
@@ -3550,7 +3494,7 @@ jobs:
           if not summary["node_backed_hook_tests"]["matches_expected_nodeids"]:
               raise SystemExit("node-backed-hook-tests collect-only output did not match expected fixed nodeids")
           if not summary["node_backed_hook_tests"]["session_recording_nodeids_present"]:
-              raise SystemExit("node-backed-hook-tests collect-only output did not include tests/session_recording/codex/test_hook_adapter.py nodeids")
+              raise SystemExit("node-backed-hook-tests collect-only output did not include tests/session-recording/test_fixed_location_cutover.py nodeids")
           if not summary["union_disjointness"]["disjoint"]:
               raise SystemExit("python-test and node-backed-hook-tests collect-only outputs overlapped")
           PY
