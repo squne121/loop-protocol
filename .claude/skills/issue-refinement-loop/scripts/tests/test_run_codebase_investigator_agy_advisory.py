@@ -312,7 +312,9 @@ def test_legacy_ingress_maps_only_the_five_valid_unambiguous_cases(ingress: dict
     assert controller._adapt_legacy_investigation_requirement(ingress) == expected
 
 
-def test_private_smoke_environment_uses_only_the_module_private_fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_private_smoke_environment_uses_only_the_module_private_fake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     fake = tmp_path / "fake-agy"
     fake.write_text("#!/bin/sh\n", encoding="utf-8")
     monkeypatch.setenv("AGY_BIN", "/ambient/must-not-be-used")
