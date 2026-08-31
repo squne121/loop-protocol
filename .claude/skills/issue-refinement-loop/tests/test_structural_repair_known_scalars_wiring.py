@@ -366,6 +366,137 @@ def test_current_issue_source_span_digest_binds_to_original_body_sha256():
 
 
 # ---------------------------------------------------------------------------
+# PR #2469 fix_delta iteration 3 (P1-1, human adversarial review):
+# `line_start`/`line_end` must byte-exactly reconstruct
+# `source_spans[...]["text"]` via `body.splitlines()[line_start-1:line_end]`
+# -- NOT merely "the line right after the heading", which silently
+# disagreed with the actual raw content start whenever a blank separator
+# line sits between the `## Heading` and its content (the ordinary
+# heading -> blank line -> bullets shape this repo's own issue templates
+# use, and the SAME shape `_build_body()` already produces above).
+# ---------------------------------------------------------------------------
+
+
+def test_current_issue_source_span_line_range_reconstructs_text_single_line():
+    """(a) Normal heading -> blank line -> single-line bullet content
+    shape."""
+    body = _build_body(include_allowed_paths_heading=False, include_proposed_allowed_paths_heading=True)
+    spans = wrapper._resolve_current_issue_heading_alias_source_spans(body, repo=REPO, issue_number=1)
+    span = spans["allowed-paths"]
+    line_start, line_end = span["line_start"], span["line_end"]
+    actual = "\n".join(body.splitlines()[line_start - 1:line_end])
+    assert actual == span["text"]
+
+
+def test_current_issue_source_span_line_range_reconstructs_text_multi_line():
+    """(b) Multi-line content case: the alias section's content spans
+    several bullet lines, so `line_end` must advance past `line_start` by
+    exactly the right number of lines."""
+    multi_line_value = "- src/example.ts\n- src/other.ts\n- src/third.ts"
+    body = _build_body(
+        include_allowed_paths_heading=False,
+        include_proposed_allowed_paths_heading=True,
+        proposed_allowed_paths_value=multi_line_value,
+    )
+    spans = wrapper._resolve_current_issue_heading_alias_source_spans(body, repo=REPO, issue_number=1)
+    span = spans["allowed-paths"]
+    assert span["text"] == multi_line_value
+    line_start, line_end = span["line_start"], span["line_end"]
+    assert line_end == line_start + 2
+    actual = "\n".join(body.splitlines()[line_start - 1:line_end])
+    assert actual == span["text"]
+
+
+# ---------------------------------------------------------------------------
+# PR #2469 fix_delta iteration 3 (P1-2, human adversarial review): a forged
+# `current_issue` source span (claiming a `source_object_kind`/`source_repo`/
+# `source_object_id`/`source_revision` the ONE trusted assembler in
+# `run_refinement_preflight.py` never actually emits) must be rejected at
+# `repair_issue_contract.py`'s OWN generic producer boundary
+# (`build_structural_repair_bundle()`), never only by that one assembler --
+# a forged span could, in principle, reach this module via a different
+# caller entirely.
+# ---------------------------------------------------------------------------
+
+
+def test_forged_current_issue_source_span_rejected_at_generic_producer_boundary():
+    issue_number = 900
+    body = _build_body(
+        parent_issue_mrc=None,
+        include_parent_issue_heading=False,
+        include_allowed_paths_heading=False,
+        include_proposed_allowed_paths_heading=False,
+    )
+    forged_span = {
+        "text": "- src/forged.ts",
+        "source_url": f"https://github.com/{REPO}/issues/{issue_number}",
+        "line_start": 1,
+        "line_end": 1,
+        "authority_kind": "current_issue",
+        # Forged: the real assembler only ever emits "issue_body" for
+        # `current_issue` -- this claims a comment backed it instead.
+        "source_object_kind": "issue_comment",
+        "source_repo": REPO,
+        "source_object_id": str(issue_number),
+        # `ric._sha256()` is already `sha256:`-prefixed.
+        "source_revision": ric._sha256(body),
+    }
+    bundle = ric.build_structural_repair_bundle(
+        body,
+        issue_kind="implementation",
+        template_text=_TEMPLATE_TEXT,
+        template_path=str(_TEMPLATE_PATH),
+        repo=REPO,
+        issue_number=issue_number,
+        source_spans={"allowed-paths": forged_span},
+    )
+    items_by_field = {i["field_id"]: i for i in bundle["items"]}
+    item = items_by_field["allowed-paths"]
+    assert item["disposition"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
+    assert item["derivation"] is None
+    assert bundle["disposition_summary"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
+
+
+def test_current_issue_source_span_authority_validator_rejects_each_forgeable_field():
+    """Direct unit coverage of `_validate_current_issue_source_span_authority()`
+    itself, isolating each individual forgeable field one at a time."""
+    issue_number = 901
+    body = "## Allowed Paths placeholder body"
+    # `ric._sha256()` is already `sha256:`-prefixed -- the SAME format
+    # `build_structural_repair_bundle()`'s own `original_body_sha256`
+    # variable holds, so no additional prefixing is applied here.
+    original_body_sha256 = ric._sha256(body)
+    valid_span = {
+        "authority_kind": "current_issue",
+        "source_object_kind": "issue_body",
+        "source_repo": REPO,
+        "source_object_id": str(issue_number),
+        "source_revision": original_body_sha256,
+    }
+    assert ric._validate_current_issue_source_span_authority(
+        valid_span, repo=REPO, issue_number=issue_number, original_body_sha256=original_body_sha256,
+    )
+
+    for mutated_field, bad_value in (
+        ("source_object_kind", "issue_comment"),
+        ("source_repo", "someone-else/other-repo"),
+        ("source_object_id", str(issue_number + 1)),
+        ("source_revision", "sha256:deadbeef"),
+    ):
+        forged = {**valid_span, mutated_field: bad_value}
+        assert not ric._validate_current_issue_source_span_authority(
+            forged, repo=REPO, issue_number=issue_number, original_body_sha256=original_body_sha256,
+        ), mutated_field
+
+    # A non-`current_issue` authority_kind is never narrowed by this
+    # validator (additive extension only, other 3 kinds unaffected).
+    other_kind_span = {**valid_span, "authority_kind": "owner_anchor", "source_repo": "anything"}
+    assert ric._validate_current_issue_source_span_authority(
+        other_kind_span, repo=REPO, issue_number=issue_number, original_body_sha256=original_body_sha256,
+    )
+
+
+# ---------------------------------------------------------------------------
 # AC5: closed, one-way, exact heading alias table -- no fuzzy/substring
 # matching, no other heading pairs.
 # ---------------------------------------------------------------------------

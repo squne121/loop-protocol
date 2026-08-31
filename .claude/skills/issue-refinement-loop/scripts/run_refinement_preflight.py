@@ -172,6 +172,15 @@ try:
         _mrc_parse,
         MRC_PARSE_STATUS_OK,
         _parse_h2_sections,
+        # PR #2469 fix_delta iteration 3 (P1): the SAME line-bound helper
+        # `_apply_insertion_decision()` uses (repair_issue_contract.py) to
+        # compute a section's raw (start_line, end_line) span -- never a
+        # re-derived offset arithmetic -- so the assembler's `line_start`/
+        # `line_end` always point at the section's ACTUAL raw line range
+        # instead of assuming content starts on the line immediately after
+        # the heading (false for the common heading -> blank line -> bullets
+        # shape).
+        _section_line_bounds,
         _DERIVED_SCALAR_FIELD_VALIDATORS,
     )
 except ImportError:  # pragma: no cover - defensive fallback
@@ -184,6 +193,7 @@ except ImportError:  # pragma: no cover - defensive fallback
     _mrc_parse = None
     MRC_PARSE_STATUS_OK = "ok"
     _parse_h2_sections = None
+    _section_line_bounds = None
     _DERIVED_SCALAR_FIELD_VALIDATORS = {}
 
 
@@ -6976,14 +6986,31 @@ def _resolve_current_issue_heading_alias_source_spans(
     consumer can independently confirm `source_revision ==
     "sha256:" + item["original_body_sha256"]` never crossed a stale/
     different body snapshot (AC4's same-body / digest-match precondition).
+
+    PR #2469 fix_delta iteration 3 (P1): `line_start`/`line_end` are NOT
+    simply "the line right after the heading" -- ordinary Markdown puts a
+    blank separator line between a `## Heading` and its content (heading ->
+    blank line -> bullets), and `_parse_h2_sections()`'s `content` field is
+    `.strip()`-ed, so the FIRST line of `content` is offset from the raw
+    section start by however many leading blank lines precede it (and the
+    LAST line is likewise offset by trailing blank lines the strip()
+    removed). This function locates the actual raw line range the
+    `.strip()`-ed `content` occupies -- using the SAME
+    `_section_line_bounds()` helper `_apply_insertion_decision()` uses for
+    the identical raw-line-range problem, never a re-derived offset -- so
+    `body.splitlines()[line_start - 1:line_end]` always reconstructs
+    exactly `content`.
     """
-    if _parse_h2_sections is None:  # pragma: no cover - defensive
+    if _parse_h2_sections is None or _section_line_bounds is None:  # pragma: no cover - defensive
         return {}
 
     sections = _parse_h2_sections(body)
     heading_index: dict[str, list[dict]] = {}
     for section in sections:
         heading_index.setdefault(section["heading"].strip().casefold(), []).append(section)
+
+    body_lines = body.split("\n")
+    bounds = _section_line_bounds(sections, len(body_lines))
 
     body_digest = "sha256:" + _sha256(body)
     source_url = f"https://github.com/{repo}/issues/{issue_number}"
@@ -6996,11 +7023,30 @@ def _resolve_current_issue_heading_alias_source_spans(
         canonical_matches = heading_index.get(canonical_heading.strip().casefold(), [])
         if len(alias_matches) != 1 or len(canonical_matches) != 0:
             continue
-        alias_content = alias_matches[0]["content"].strip()
+        alias_section = alias_matches[0]
+        alias_content = alias_section["content"].strip()
         if not alias_content:
             continue
-        line_start = alias_matches[0]["start_line"] + 1
+        # Raw (pre-strip) line range of this section's content: the line
+        # right after the heading through the line just before the next
+        # section (or end of body) -- the SAME range `_parse_h2_sections()`
+        # itself joined (pre-strip) to produce `content`.
+        _heading_start, section_end_line = bounds[id(alias_section)]
+        raw_content_start_line = alias_section["start_line"] + 1
+        if raw_content_start_line > section_end_line:  # pragma: no cover - defensive, empty section
+            continue
+        raw_content_lines = body_lines[raw_content_start_line - 1 : section_end_line]
+        raw_content_joined = "\n".join(raw_content_lines)
+        leading_ws_len = len(raw_content_joined) - len(raw_content_joined.lstrip())
+        leading_blank_lines = raw_content_joined[:leading_ws_len].count("\n")
+        line_start = raw_content_start_line + leading_blank_lines
         line_end = line_start + max(0, alias_content.count("\n"))
+        # Regression guard (PR #2469 fix_delta iteration 3, P1): fail-closed
+        # rather than emit a `source_span_exact` candidate whose line range
+        # does not byte-exactly reconstruct `text` -- a downstream consumer
+        # trusts `line_start`/`line_end` without re-deriving them.
+        if "\n".join(body_lines[line_start - 1 : line_end]) != alias_content:  # pragma: no cover - defensive
+            continue
         spans[field_id] = {
             "text": alias_content,
             "source_url": source_url,

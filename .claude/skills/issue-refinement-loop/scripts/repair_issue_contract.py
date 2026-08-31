@@ -1249,6 +1249,97 @@ def _validate_source_span_provenance(span: dict) -> tuple[bool, list[str]]:
     return (len(reasons) == 0), reasons
 
 
+def _validate_current_issue_source_span_authority(
+    span: dict,
+    *,
+    repo: Optional[str],
+    issue_number: Optional[int],
+    original_body_sha256: str,
+) -> bool:
+    """`original_body_sha256` is the ALREADY `sha256:`-prefixed digest this
+    module's own `_sha256()` produces (the SAME convention
+    `build_structural_repair_bundle()`'s `original_body_sha256 = _sha256(body)`
+    and the bundle's own top-level `original_body_sha256` field already use)
+    -- compared directly against `span["source_revision"]`, never
+    re-prefixed a second time.
+
+    PR #2469 fix_delta iteration 3 (P1-2, human adversarial review):
+    `_validate_source_span_provenance()` above only enforces the GENERIC
+    required-field/enum/line-range shape shared by all 4
+    `_SOURCE_SPAN_AUTHORITY_KINDS` -- it has no way to know this run's own
+    `repo`/`issue_number`/`original_body_sha256`, so it cannot tell a
+    genuine same-body `current_issue` span from a FORGED one (e.g. a
+    `source_object_kind: issue_comment` or a different `source_repo`/
+    `source_object_id`/stale `source_revision`) claiming the
+    `current_issue` authority_kind. `current_issue`'s own narrower
+    precondition -- same repo, same issue, body digest matches THIS run's
+    `original_body_sha256` -- can only be checked at a boundary that
+    actually has those 3 values, so it lives HERE at this module's own
+    generic producer boundary (`build_structural_repair_bundle()`, the
+    caller of this function), never in
+    `run_refinement_preflight.py`'s `_STRUCTURAL_HEADING_ALIAS_TABLE`
+    assembler -- so ANY caller of `build_structural_repair_bundle()`
+    (not just that one trusted assembler) gets this check, never only the
+    single production caller. Any span whose `authority_kind` is NOT
+    `current_issue` is untouched (returns True unconditionally) -- this is
+    an ADDITIVE narrowing for `current_issue` only, never a change to the
+    other 3 authority kinds' existing behavior."""
+    if span.get("authority_kind") != "current_issue":
+        return True
+    return (
+        span.get("source_object_kind") == "issue_body"
+        and repo is not None
+        and span.get("source_repo") == repo
+        and issue_number is not None
+        and span.get("source_object_id") == str(issue_number)
+        and span.get("source_revision") == original_body_sha256
+    )
+
+
+def _reject_forged_current_issue_source_spans(
+    source_spans: Optional[dict],
+    *,
+    repo: Optional[str],
+    issue_number: Optional[int],
+    original_body_sha256: str,
+) -> Optional[dict]:
+    """PR #2469 fix_delta iteration 3 (P1-2): drop any `source_spans` entry
+    (or, for a multi-candidate list entry, any individual candidate) whose
+    `authority_kind` is `current_issue` but fails
+    `_validate_current_issue_source_span_authority()` -- BEFORE
+    `detect_missing_template_sections()` ever sees it, so a rejected span
+    can never reach `_classify_missing_field()`'s `text`-based
+    `source_span_exact`/`auto_apply_safe` branch. A field with its only
+    candidate dropped this way falls through to
+    `_classify_missing_field()`'s existing `missing_required_field_
+    without_exact_source` -> `human_review_required` path -- fail-closed,
+    the SAME disposition an absent source span already produces (never a
+    NEW disposition/derivation mode)."""
+    if not source_spans:
+        return source_spans
+    filtered: dict = {}
+    for field_id, entry in source_spans.items():
+        if isinstance(entry, list):
+            kept = [
+                candidate
+                for candidate in entry
+                if not isinstance(candidate, dict)
+                or _validate_current_issue_source_span_authority(
+                    candidate, repo=repo, issue_number=issue_number,
+                    original_body_sha256=original_body_sha256,
+                )
+            ]
+            if kept:
+                filtered[field_id] = kept
+            continue
+        if isinstance(entry, dict) and not _validate_current_issue_source_span_authority(
+            entry, repo=repo, issue_number=issue_number, original_body_sha256=original_body_sha256,
+        ):
+            continue
+        filtered[field_id] = entry
+    return filtered
+
+
 def parse_issue_template_fields(template_text: str, template_path: str) -> list[dict]:
     """Parse a GitHub issue-form YAML template (`.github/ISSUE_TEMPLATE/*.yml`)
     into ordered field metadata.
@@ -1950,6 +2041,14 @@ def build_structural_repair_bundle(
     to bind to).
     """
     original_body_sha256 = _sha256(body)
+    # PR #2469 fix_delta iteration 3 (P1-2): reject any forged `current_issue`
+    # source span BEFORE the classifier ever sees it -- see
+    # `_reject_forged_current_issue_source_spans()`'s docstring for why this
+    # generic producer boundary (not the assembler) is where this belongs.
+    source_spans = _reject_forged_current_issue_source_spans(
+        source_spans, repo=repo, issue_number=issue_number,
+        original_body_sha256=original_body_sha256,
+    )
     items = detect_missing_template_sections(
         body,
         issue_kind=issue_kind,
