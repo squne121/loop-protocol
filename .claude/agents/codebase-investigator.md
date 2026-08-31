@@ -51,7 +51,11 @@ Gemini CLI は operator により `disabled_by_operator` 状態にある。本 S
 
 ### Issue #2434 controller-owned local-asset advisory route（named caller 限定）
 
-`agent/issue-refinement-loop` が新規 local-asset advisory route を選択する場合だけ、既存 global input を V1 専用に狭めず、caller が exact closed `AGY_ADVISORY_INVOCATION_REQUEST_V1` を controller に渡す。この route の public request は `schema`、`schema_version: 1`、`mode: "codebase_local_asset"`、nonempty `purpose`、nonempty repository-relative `target_paths`、optional repository-relative `context_paths`、`agy_investigation_requirement: advisory|explicitly_required` だけである。named caller は `run_codebase_investigator_agy_advisory.py` を stdin request、stdout decision、stderr success sidecar として起動し、controller-owned builder / wrapper / exact readback / failure routing を消費する。既存 global caller と agent-retrospective はこの V1-only route へ移行せず、上記の既存 interface と compatibility ingress を維持する。
+これは global input の別名・既定値ではない。**outer delegation に `CALLER_ROUTE: agent/issue-refinement-loop.local-advisory` が明示され、その caller が次の exact V1 を渡した場合だけ** controller route を選ぶ。この route marker は outer delegation の routing instruction であり、controller stdin の public request field ではない。`target_path`、`target_symbol`、`keywords`、`issue_body`、`agy_advisory_native_fallback_allowed`、`authoritative_base_sha`、`CALLER_TASK_DATA.task`、又は task prose に `issue-refinement-loop` という語があるだけでは marker にならない。marker がない invocation は必ず既存 global route へ戻る。
+
+named caller が作る controller stdin は、`schema`、`schema_version: 1`、`mode: "codebase_local_asset"`、nonempty `purpose`、nonempty repository-relative `target_paths`、optional repository-relative `context_paths`、`agy_investigation_requirement: advisory|explicitly_required` **だけ**の `AGY_ADVISORY_INVOCATION_REQUEST_V1` である。legacy flag は named caller の pre-controller ingress で requirement に one-way map して削除し、`authoritative_base_sha`、route marker、raw prompt、wrapper path/result、failure class、provenance を stdin に混ぜない。
+
+この named route だけが `run_codebase_investigator_agy_advisory.py` を stdin request、stdout decision、stderr success sidecar として起動する。stdout/stderr は別々に capture し、exact exit-0 `ok/continue_agy_result` と strict sidecar、又は exact exit-0 `degraded/native_non_mutating_fallback` だけを受理する。後者だけが既存の bounded non-mutating native investigation を許可する。exit 1 の exact `failed/fail_closed`、exit 2、stream 欠落・余計な bytes・duplicate key・不正 pairing は fail-close である。**global caller は controller を起動せず、global wrapper result を controller decision として解釈しない。**
 
 ## 振る舞い
 
@@ -59,11 +63,12 @@ Gemini CLI は operator により `disabled_by_operator` 状態にある。本 S
 
 ### 手順
 
-1. 入力モードを判定:
-   - named `agent/issue-refinement-loop` の exact V1 advisory request → controller-owned `run_codebase_investigator_agy_advisory.py` route
-   - `target_path` / `target_symbol` あり → existing `local_asset_research` プロファイル（`route_evidence.schema` は wrapper 内部の Serena MCP evidence）
-   - `keywords` / `issue_body` あり → existing `github_research` プロファイル（`route_evidence.schema: agy_github_research_evidence/v1`。#1920 実装済みの evidence wrapper を参照し、再実装しない）
-2. existing global route では **canonical builder** で `delegation_request_v1`（provider-aware, `provider: agy`）を構築する:
+1. **route dispatch を先に固定する**:
+   - outer delegation の exact `CALLER_ROUTE: agent/issue-refinement-loop.local-advisory` と exact V1 が両方ある → 前節の controller-owned route。V1 は stdin へ byte-for-byte 渡し、global builder / wrapper は起動しない。
+   - それ以外で `target_path` / `target_symbol` あり → existing global `local_asset_research` プロファイル（`route_evidence.schema` は wrapper 内部の Serena MCP evidence）。
+   - それ以外で `keywords` / `issue_body` あり → existing global `github_research` プロファイル（`route_evidence.schema: agy_github_research_evidence/v1`。#1920 実装済みの evidence wrapper を参照し、再実装しない）。
+   - どれにも該当しない → `INSUFFICIENT_CONTEXT`。global input を V1 に変換して controller へ送らない。
+2. global route では **canonical builder** で `delegation_request_v1`（provider-aware, `provider: agy`）を構築する:
    ```bash
    uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
      --provider agy \
@@ -71,16 +76,16 @@ Gemini CLI は operator により `disabled_by_operator` 状態にある。本 S
      --objective "<purpose を 1 文で>" \
      --prompt "<non-empty prompt。model は指定しない（provider=agy は --model を禁止）>" \
      --context-file <context-file-path> \
-     --output /tmp/codebase-investigator-<timestamp>.json
+     --output <caller-supplied-request-path>
    ```
-   `--provider agy` は non-empty `--prompt` を必須とし `--model` を禁止する（builder-level fail-closed: `agy_prompt_required` / `agy_model_not_supported`）。手書きの provider 別 JSON をこの SubAgent 自身が組み立てることはしない（builder のみが `delegation_request_v1` を生成する）。
-3. existing global route では Bash で wrapper を起動:
+   global caller が canonical builder/wrapper command と `--output` / `--output-file` destination を渡した場合は、その argv と destination を**そのまま**使用する。`/tmp` は caller が destination を渡さない通常 global invocation の一時既定値に限り、supplied evidence destination の代替には絶対にしない。`--provider agy` は non-empty `--prompt` を必須とし `--model` を禁止する（builder-level fail-closed: `agy_prompt_required` / `agy_model_not_supported`）。手書きの provider 別 JSON をこの SubAgent 自身が組み立てることはしない（builder のみが `delegation_request_v1` を生成する）。
+3. global route では Bash で wrapper を起動する:
    ```bash
    uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
-     --request-file /tmp/codebase-investigator-<timestamp>.json \
-     --output-file /tmp/codebase-investigator-result-<timestamp>.json
+     --request-file <caller-supplied-request-path> \
+     --output-file <caller-supplied-result-path>
    ```
-4. `--output-file` の JSON を Read で読み、`result_surface` を本 SubAgent の報告形式に整形
+4. global `local_asset_research` は supplied result destination の actual wrapper JSON を Read して `result_surface` を整形する。global `github_research` は actual wrapper result に加え、caller-supplied evidence destination へ受け取った exact `agy_github_research_evidence/v1` JSON を byte-for-byte materialize し、その file の actual hash を確認する。必要な result/evidence file、schema、又は hash が欠落・不正なら route success を報告しない。
 
 ### リクエスト雛形（builder が生成する delegation_request_v1 の骨子）
 
@@ -174,7 +179,7 @@ wrapper は `context_files` を 1 件以上必須とするため、context フ�
 ### 委譲メタ
 - wrapper exit: <ok / failed>
 - provider: agy
-- delegation request: /tmp/codebase-investigator-<timestamp>.json
+- delegation request: <actual caller-supplied request path, or the global invocation's generated temporary path>
 ```
 
 調査対象が見つからない場合は推測せず「見つからない」と明記する。
