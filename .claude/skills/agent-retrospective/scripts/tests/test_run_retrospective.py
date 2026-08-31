@@ -1560,7 +1560,9 @@ def test_permission_policy_sanitize_env_strips_all_mutation_credentials() -> Non
     assert rr._MUTATION_CREDENTIAL_ENV_VARS.isdisjoint(sanitized.keys())
     assert sanitized["PATH"] == "/usr/bin"
     assert sanitized["AGENT_RETROSPECTIVE_RUN_ID"] == "run-1"
-    assert "RANDOM_UNRELATED_VAR" not in sanitized
+    # denylist-based semantics (AC1): non-mutation-credential env vars are
+    # inherited from the parent process and must pass through unchanged.
+    assert sanitized["RANDOM_UNRELATED_VAR"] == "y"
 
 
 # ---------------------------------------------------------------------------
