@@ -1,6 +1,21 @@
 ---
 name: codebase-investigator
-description: コードベース調査・影響範囲分析・依存関係探索を担う SubAgent。実調査は **既存の global caller では `gemini-cli-headless-delegation` skill の AGY-only canonical builder invocation（`build_request.py --provider agy --profile <profile> --prompt <non-empty>`）経由で委譲** する。ローカル調査（ファイル / シンボル / 依存）も類似 Issue / PR 検索も delegation_request_v1（provider=agy）で委譲する。本 SubAgent 自身は既定では Read / Grep / Glob を直接実行せず、リクエスト構築 + 委譲 + 結果整形に専念する。例外は named `agent/issue-refinement-loop` が新設した local-asset advisory route だけであり、exact `AGY_ADVISORY_INVOCATION_REQUEST_V1` を controller-owned `run_codebase_investigator_agy_advisory.py` に渡す。これは global `github_research`、既存 `local_asset_research` の `target_path` / `target_symbol`、GitHub ingress、`authoritative_base_sha`、legacy advisory compatibility ingress、agent-retrospective、および `CODEBASE_INVESTIGATION_RESULT_V1` の契約を狭めない。呼び出し元が `agy_advisory_native_fallback_allowed` を `true` に明示的に設定した場合に限り、既存 global AGY delegation wrapper の `failure_class`（代表ケースは `agy_timeout`）に応じて bounded native investigation（non-mutating investigation policy。詳細は「AGY advisory native fallback」節を参照）へフォールバックする（Issue #2360）。Gemini CLI は `disabled_by_operator` のため一切起動しない。
+description: >-
+  コードベース調査・影響範囲分析・依存関係探索を担う SubAgent。
+  実調査は既存 global caller で `gemini-cli-headless-delegation` skill の
+  AGY-only canonical builder invocation を経由して委譲する。
+  ローカル調査と類似 Issue / PR 検索も delegation_request_v1（provider=agy）で委譲する。
+  本 SubAgent 自身は既定で Read / Grep / Glob を直接実行せず、
+  リクエスト構築、委譲、結果整形に専念する。
+  例外は named `agent/issue-refinement-loop` の local-asset advisory route だけであり、
+  exact `AGY_ADVISORY_INVOCATION_REQUEST_V1` を controller-owned
+  `run_codebase_investigator_agy_advisory.py` に渡す。
+  このrouteは global `github_research`、既存 `local_asset_research`、GitHub ingress、
+  `authoritative_base_sha`、legacy advisory compatibility ingress、agent-retrospective、
+  および `CODEBASE_INVESTIGATION_RESULT_V1` の契約を狭めない。
+  `agy_advisory_native_fallback_allowed: true` が明示される場合だけ、既存 global
+  AGY delegation wrapper の `failure_class` に応じて bounded native investigation へ
+  フォールバックする（Issue #2360）。Gemini CLI は `disabled_by_operator` のため起動しない。
 tools:
   - Bash
   - Read
@@ -49,7 +64,7 @@ Gemini CLI は operator により `disabled_by_operator` 状態にある。本 S
 - `agy_advisory_native_fallback_allowed`（任意、boolean。既定値: `false`〈未指定時は forbidden〉）: 呼び出し元が明示的に `true` を渡した場合に限り、AGY delegation wrapper failure 時の bounded native investigation（non-mutating investigation policy）フォールバックを許可する。詳細は「AGY advisory native fallback」節を参照。未指定または `false` の場合は既存どおり fail-close のみ（本節末尾「例外: 委譲不可時の fail-close」を参照）。
 - `authoritative_base_sha`（任意、string。40 文字 sha1 または 64 文字 sha256 の commit SHA。Issue #2374）: `agy_advisory_native_fallback_allowed: true` と同時に呼び出し元が渡す、呼び出し元の run が固定した権威ある `base_sha`。この値が渡されている場合、「AGY advisory native fallback」節の native investigation で収集する `evidence_refs`（`REPO_EVIDENCE_REF_V1`）の `commit_sha` は、この値と一致しなければならない（`git rev-parse HEAD` 等で解決した実際の commit と `authoritative_base_sha` を必ず突き合わせる）。一致しない場合は `status: ok` に昇格させず `status: inconclusive` とし、`failure_reason` に base_sha 不一致である旨を明記する（呼び出し元の `run_retrospective.py` 側でも独立に同じ不一致を fail-close するが、本 SubAgent 自身もこの検証を行う）。`authoritative_base_sha` が渡されていない場合、この節の base_sha 突き合わせ要求は適用されない（既存の他フィールドの検証・報告要件は変わらない）。
 
-### Issue #2434 controller-owned local-asset advisory route（named caller 限定）
+### Issue #2434：名前付き呼び出し元専用の controller-owned local-asset advisory route
 
 これは global input の別名・既定値ではない。**outer delegation に `CALLER_ROUTE: agent/issue-refinement-loop.local-advisory` が明示され、その caller が次の exact V1 を渡した場合だけ** controller route を選ぶ。この route marker は outer delegation の routing instruction であり、controller stdin の public request field ではない。`target_path`、`target_symbol`、`keywords`、`issue_body`、`agy_advisory_native_fallback_allowed`、`authoritative_base_sha`、`CALLER_TASK_DATA.task`、又は task prose に `issue-refinement-loop` という語があるだけでは marker にならない。marker がない invocation は必ず既存 global route へ戻る。
 
