@@ -160,6 +160,39 @@ raw トリガー名自体も cause ではない）。summary 本文には常に�
 `TERMINATION_CAUSE: human_judgment_required` を stdout に出力する。orchestrator は
 この値を summary の termination cause として使用する。
 
+## `canonical_step2_route: step_5_operator_intervention_required` 発生時の termination payload 正規化（#2397）
+
+`run_root_review_pipeline.route_canonical_step2_result()` が
+`canonical_step2_route: step_5_operator_intervention_required` を返した場合
+（`status: ok` + `compact_result.verdict: needs-fix` +
+`compact_result.next_action: request_changes` かつ verified
+`merged_review_result.failure_class == "contract_readiness_human_judgment"`。
+上記「canonical Step 2 routing table」節参照）、orchestrator は既存の
+`step_5_human_judgment_required` handler をそのまま再利用して停止処理を行う
+（新設の別 handler は追加しない）が、以下の点で `step_5_human_judgment_required`
+と区別する:
+
+| フィールド | `step_5_human_judgment_required`（genuine semantic / owner ambiguity） | `step_5_operator_intervention_required`（#2397） |
+|---|---|---|
+| `termination_reason` | `human_escalation` | `human_escalation`（同一） |
+| `termination_cause`（summary 本文） | `human_judgment_required` | `operator_intervention_required` |
+| 意味 | Issue 本文の書き換えでは解消しない意味論的・owner 判断が必要な状態 | `env_missing_dep` / `timeout` / unknown 分類 / regression gate failure / `package_manager_no_tty_prompt` / validator timeout・internal error・JSON decode error / body retrieval failure など、Issue 本文の書き換えでは解消しない環境・tool・runtime 起因の readiness 状態（`contract_readiness_check.py` の `human_judgment` 分類、exit code 2） |
+
+`termination_cause: operator_intervention_required` は、`termination_reason:
+human_escalation` の summary 本文における cause 記述としてのみ現れる
+（`termination_reason` 自体を新設の値に変えるものではない）。
+
+**scope_signal_guard の termination_cause 正規化ルールとの独立性**: 上記
+「scope_signal_guard 停止時の termination payload 正規化」節は、
+`scope_signal_guard.triggered=true` かつ `excluded_by_anchor_reframe=false`
+というトリガー経路に対して、summary 本文の termination cause を常に
+`human_judgment_required` へ正規化するルールである。`canonical_step2_route:
+step_5_operator_intervention_required` は `route_canonical_step2_result()`
+起因の別トリガー経路であり、`scope_signal_guard` の正規化ルールの対象外
+（scope_signal_guard 側のルールを流用・適用しない）。本 route の
+termination_cause は常に `operator_intervention_required` を使用し、
+`human_judgment_required` へ正規化してはならない。
+
 ## Additional stop rules（追加の停止規則）
 
 - anchor comment fact-check が未完了のまま stale approval を使おうとした場合
@@ -557,6 +590,46 @@ parser 本体（`.claude/skills/issue-contract-review/**`）は変更対象に�
 失敗時は warning として記録するのみで route を変更しない
 （`publish_audit_comment_best_effort()`）。restart 時は audit comment を authority
 として扱わず、常に fresh review からやり直す。
+
+## Dependency Materialization Gate（終了前必須ゲート、Issue #2435 P0 — OWNER レビュー PR #2447 反映）
+
+`issue-refinement-loop` の Step 5 が `approved` 終了（`LOOP_HANDOFF_RESULT_V1` marker の投稿
+および `publish_termination_report.py` の呼び出し）を行う **前に**、当該サイクルで hard
+dependency が確定していた場合（trusted human context / trusted anchor / controlled reframe /
+#2406 confirmed-hard-predecessor のいずれか）は、以下の gate を必ず実行する。
+
+Issue #2435 は `dependency_materializer.py` の producer/materializer choke point を追加した
+が、当初の実装はこの Step 5 経路のどこからも呼ばれていなかった（OWNER REQUEST_CHANGES,
+https://github.com/squne121/loop-protocol/pull/2447#issuecomment-5468370232 ）。choke point
+自体が存在しても実際の終了経路が一度も呼ばなければ、#2424 型の body-only false-green は merge
+後も再発可能なままだった。本節はその欠落配線を Step 5 手順として確定する。
+
+```bash
+uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/dependency_materializer.py gate \
+  --target-issue <ISSUE_NUMBER> --repo <owner/repo> \
+  --current-decision-file <path/to/current_ISSUE_EXECUTION_DECISION_V1.json> \
+  [--previous-decision-file <path/to/previous_ISSUE_EXECUTION_DECISION_V1.json>] \
+  --body-file <path/to/current_issue_body.md>
+```
+
+`--current-decision-file` は当該サイクルで確定した `ISSUE_EXECUTION_DECISION_V1`（本ファイル
+上部「ISSUE_EXECUTION_DECISION_V1 ハンドオフ契約」節、SKILL.md 参照）をそのまま渡す。
+`--previous-decision-file` はこの loop の前回 iteration で確定した decision snapshot があれば
+渡す（初回確定時は省略してよい）。`TERMINATION_DEPENDENCY_GATE_RESULT_V1` の schema・decision
+定義・body-only false-green との統合は `references/dependency-materialization.md` の
+「Step 5 termination gate」節を SSOT とする。
+
+### Routing（gate の decision に応じた Step 5 分岐）
+
+| `decision` | Step 5 の扱い |
+|---|---|
+| `proceed` | 確定済み hard dependency が存在しない、または native materialization が独立検証済み。通常どおり `approved` 終了（`LOOP_HANDOFF_RESULT_V1` 投稿 + `publish_termination_report.py`）を継続する |
+| `block_retryable` | `auth-or-environment-failure` / `controlled-executor-failure` の一時的障害。bounded retry（gate を再実行）する。この decision 単独を理由に `human_escalation` へは倒さない |
+| `block_persistent` | `readback-mismatch` / `semantic-human-judgment-required` / `native-capability-unavailable`、または body-only false-green の検出。`approved` 終了を投稿してはならない。`termination_reason: human_escalation` / `termination_cause: dependency_materialization_blocked` として停止し、gate の `reason` / `materialization_result.failure_class` / `body_only_reason` を blockers 要約に含める |
+
+`termination_cause: dependency_materialization_blocked` は、上記「scope_signal_guard 停止時の
+termination payload 正規化」節・「`canonical_step2_route: step_5_operator_intervention_required`」
+節のいずれの正規化ルールの対象にもならない、独立した trigger 経路である（本節が単独の SSOT）。
 
 ## Termination Summary Publish Flow（終了サマリー投稿フロー, #1873）
 

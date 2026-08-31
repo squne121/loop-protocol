@@ -783,10 +783,33 @@ _AGENT_INVOCATION_STATUSES = frozenset(
 #: raw stdout blob (mirrors collect_snapshot.py's `_safe_diagnostic_text`).
 _MAX_STDOUT_EXCERPT = 200
 
-#: subprocess environment passthrough allowlist used when no
-#: ``DelegatedAgentPermissionPolicy`` is supplied (defensive fallback only --
-#: production callers always supply a policy; see ``run_cli``).
-_DEFAULT_ENV_PASSTHROUGH_ALLOWLIST = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ"})
+#: environment variable names never forwarded to a delegated Agent's
+#: subprocess, regardless of what else is present (Issue #2445 AC1:
+#: replaces the prior allowlist-only design). These carry mutation
+#: authority (git/gh credentials, cloud credentials, SSH agent socket) that
+#: has no legitimate use inside a read-only observer/evaluator invocation
+#: (Issue #2237 P0-5). Everything else -- including provider transport env
+#: vars such as ``ANTHROPIC_BASE_URL``/``ANTHROPIC_AUTH_TOKEN``/
+#: ``ANTHROPIC_MODEL``/``CLAUDE_CONFIG_DIR`` -- is inherited from the parent
+#: environment by default (Issue #2445; mirrors the sibling
+#: ``plugins/agent-retrospective/skills/run/scripts/run_retrospective.py``
+#: implementation's denylist semantics, which motivated this replacement).
+_MUTATION_CREDENTIAL_ENV_VARS = frozenset(
+    {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GIT_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "NPM_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "NPM_AUTH_TOKEN",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # codebase-investigator role adapter (Issue #2374; schema-selection/
@@ -842,7 +865,12 @@ def _stdout_excerpt(text: str | None) -> str | None:
 
 
 def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
-    return {k: v for k, v in env.items() if k in _DEFAULT_ENV_PASSTHROUGH_ALLOWLIST}
+    """Issue #2445 AC1: inherit the parent environment by default, stripping
+    only ``_MUTATION_CREDENTIAL_ENV_VARS`` (see that constant's docstring).
+    Used as the fallback when no ``DelegatedAgentPermissionPolicy`` is
+    supplied (defensive fallback only -- production callers always supply a
+    policy; see ``run_cli``)."""
+    return {k: v for k, v in env.items() if k not in _MUTATION_CREDENTIAL_ENV_VARS}
 
 
 #: Matches every markdown fence *delimiter* line (an opening line such as
@@ -1049,6 +1077,12 @@ def build_agent_invocation_argv(
     ]
     if policy is not None:
         argv += ["--disallowedTools", *sorted(policy.denied_tools)]
+        # Issue #2419: registers `retrospective_bash_guard_hook.py` as a
+        # real `PreToolUse` hook for this subprocess (`--disallowedTools`
+        # alone never covered Bash -- it only ever named
+        # Write/Edit/MultiEdit/NotebookEdit/Agent/Skill).
+        if policy.settings_path:
+            argv += ["--settings", policy.settings_path]
     return argv
 
 
@@ -2778,33 +2812,154 @@ _DENIED_BASH_METACHAR_TOKENS = frozenset({">", ">>", "|", "&&", "||", ";", "`", 
 _DENIED_INLINE_EXEC_INTERPRETERS = frozenset({"python", "python3"})
 _DENIED_INLINE_EXEC_FLAGS = frozenset({"-c"})
 
-_DENIED_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Agent", "Skill"})
+# ---------------------------------------------------------------------------
+# Issue #2419 P0 incident fix: a delegated `codebase-investigator` observer
+# ran `git fetch` + `git merge` via Bash and fast-forwarded the canonical
+# local `main` ref to an unrelated stale branch. Root cause (see PR #2419):
+# `DelegatedAgentPermissionPolicy.check_bash` was never called from any real
+# invocation path (dead code), AND its exact-allowlist-only design could not
+# have distinguished a legitimate read-only investigation pipeline (`git
+# show <sha>:<path> | sha256sum`, needed to independently verify
+# `REPO_EVIDENCE_REF_V1.excerpt_sha256`) from a mutation even if it HAD been
+# wired -- its single-command, no-pipeline-splitting scan treats every `|`
+# as an unconditional deny. The constants below back a NEW, explicitly
+# opt-in ("read_only_investigation_enabled") gate that is pipeline-aware
+# (each `|`-delimited segment is validated independently; `;`/`&`/`&&`/`||`
+# and a literal newline are unconditional denies, never segment delimiters
+# -- see `_tokenize_read_only_investigation_pipeline`) and denies by git/gh
+# SUBCOMMAND+ACTION *position* (not token-SET membership) rather than by
+# exact full-command match, so a real, unbounded set of read-only `git
+# show`/`gh pr view` invocations can be allowed while every mutating verb
+# stays denied. This is ADDITIVE: the default
+# (`read_only_investigation_enabled=False`) keeps `check_bash`'s
+# pre-existing deny-all-by-default / exact-allowlist-plus-tokenized-denylist
+# behavior byte-for-byte (Issue #2237 P0-5's fail-open fix is not touched).
+#
+# PR #2425 review fix_delta round 3 (OWNER REQUEST_CHANGES,
+# #2425#issuecomment-5466916997) rebuilt this profile around 3 explicit
+# capabilities instead of an ever-growing set of individually-patched
+# bypasses:
+#   1. canonical AGY capability (`_AGY_CANONICAL_SCRIPT_SUFFIXES`) --
+#      `codebase-investigator`'s real `build_request.py` /
+#      `run_gemini_headless.py` invocation is now the ONLY allowed
+#      `python3`/`uv` use, restoring the workflow the round-2 fix had
+#      self-blocked (a bare `python3`/`uv` head was excluded entirely).
+#   2. native Git read-only capability (`_ALLOWED_GIT_READ_ONLY_SUBCOMMANDS`)
+#      -- an ALLOWLIST of read-only subcommands (position-based: the first
+#      non-global-flag token after `git`), replacing the previous denylist
+#      of *known* mutating subcommands, which silently allowed every
+#      unlisted mutation (`git add`, `git hash-object -w`, `git bisect
+#      start`, ...).
+#   3. native GitHub capability (`_ALLOWED_GH_GROUP_ACTION_PAIRS` +
+#      `_check_gh_api_segment`) -- exact (group, action) PAIRS at their real
+#      argv POSITIONS (not token-SET membership, which let `gh pr checkout 1
+#      --branch view` and `gh workflow run x.yml --ref view` through because
+#      `view`/`pr`/`workflow` were merely *present* somewhere in the
+#      command), plus a `gh api` GET-only rule (Issue #2419 contract
+#      requires `gh api GET` for `github_research`).
+# ---------------------------------------------------------------------------
 
-#: environment variable names never forwarded to a delegated Agent's
-#: subprocess, regardless of allowlist configuration -- these carry mutation
-#: authority (git/gh credentials, cloud credentials, SSH agent socket) that
-#: has no legitimate use inside a read-only observer/evaluator invocation
-#: (Issue #2237 P0-5).
-_MUTATION_CREDENTIAL_ENV_VARS = frozenset(
+#: git GLOBAL flags that take a following value token (consumed as a pair)
+#: when locating the actual subcommand position -- e.g. `git -C <path>
+#: show ...` must resolve to subcommand `show`, not treat `<path>` as the
+#: subcommand. `-c`/`--config` are deliberately absent: those are denied
+#: unconditionally (git config/alias indirection) before subcommand lookup
+#: ever runs, regardless of position.
+_GIT_GLOBAL_FLAGS_WITH_VALUE = frozenset({"-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix"})
+#: git GLOBAL flags that take no value.
+_GIT_GLOBAL_FLAGS_NO_VALUE = frozenset(
+    {"--no-pager", "--paginate", "-p", "--bare", "--literal-pathspecs", "--no-replace-objects", "--no-optional-locks"}
+)
+#: git subcommands with a genuine read-only investigation surface -- an
+#: ALLOWLIST (PR #2425 review fix_delta P0-3): every unlisted subcommand
+#: (`add`, `hash-object -w`, `bisect`, `commit`, `push`, `merge`, ...) is
+#: denied by construction, instead of relying on an ever-incomplete
+#: denylist of *known* mutating subcommands.
+_ALLOWED_GIT_READ_ONLY_SUBCOMMANDS = frozenset(
+    {"show", "log", "diff", "blame", "rev-parse", "status", "cat-file", "ls-tree", "grep", "merge-base"}
+)
+#: `gh` GLOBAL flags that take a following value token.
+_GH_GLOBAL_FLAGS_WITH_VALUE = frozenset({"--repo", "-R", "--hostname"})
+#: exact (group, action) pairs allowed under the read-only investigation
+#: profile, matched at their real argv POSITION (PR #2425 review fix_delta
+#: P0-4) -- a flag value or branch/ref name that happens to equal an action
+#: token (`gh pr checkout 1 --branch view`, `gh workflow run x.yml --ref
+#: view`) can no longer be mistaken for the actual action the way a
+#: token-SET-membership check could.
+_ALLOWED_GH_GROUP_ACTION_PAIRS = frozenset(
     {
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_ENTERPRISE_TOKEN",
-        "GIT_ASKPASS",
-        "SSH_AUTH_SOCK",
-        "SSH_AGENT_PID",
-        "NPM_TOKEN",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "NPM_AUTH_TOKEN",
+        ("pr", "view"), ("pr", "diff"), ("pr", "checks"), ("pr", "status"),
+        ("issue", "view"), ("issue", "list"),
+        ("repo", "view"),
+        ("run", "view"), ("run", "list"),
+        ("workflow", "view"), ("workflow", "list"),
     }
 )
-#: environment variables always safe to pass through unchanged.
-_ENV_PASSTHROUGH_ALLOWLIST = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ"})
-#: caller-supplied run-scoped variables (never credentials) are passed
-#: through when prefixed like this -- e.g. ``AGENT_RETROSPECTIVE_RUN_ID``.
+#: `gh api` method-override flags (an explicit non-GET method is always
+#: denied; PR #2425 review fix_delta P1-c).
+_GH_API_METHOD_FLAGS = frozenset({"--method", "-x"})
+#: `gh api` flags that implicitly switch the request to `POST` per GitHub
+#: CLI's own documented behavior, UNLESS an explicit `--method GET` is also
+#: present.
+_GH_API_DATA_FLAGS = frozenset({"-f", "-F", "--raw-field", "--input"})
+#: canonical AGY delegation scripts (Issue #2419 PR #2425 review fix_delta
+#: P0-1), relative to ``_REPO_ROOT``, that this profile's `python3`/`uv`
+#: capability allows invoking.
+#:
+#: PR #2425 review fix_delta round 4 (P0, decoy-script bypass): a prior
+#: design matched these by raw ``str.endswith()`` trailing-path membership
+#: against the UNRESOLVED token text -- that check is trivially spoofed by
+#: ANY path merely ending with the same trailing directory structure
+#: (verified end-to-end: ``python3
+#: /tmp/evilcopy/.claude/skills/gemini-cli-headless-delegation/scripts/
+#: build_request.py`` was `allow`ed), and never even checked that the
+#: script existed on disk (a NONEXISTENT path with the same trailing
+#: structure was also `allow`ed). ``_AGY_CANONICAL_SCRIPT_ABSOLUTE_PATHS``
+#: below instead holds the real, ``Path.resolve()``d (symlink- and
+#: ``..``-collapsing) absolute path of each canonical script anchored to
+#: this repo's OWN root (``_REPO_ROOT``, derived from this very module's
+#: ``__file__`` the same way the hook script resolves its own location --
+#: see ``retrospective_bash_guard_hook.py``'s
+#: ``sys.path.insert(0, str(Path(__file__).resolve().parent))``), and
+#: ``_is_agy_canonical_script_token`` requires an EXACT membership match
+#: against a token's OWN resolved absolute path -- never a substring/suffix
+#: match against unresolved text.
+_AGY_CANONICAL_SCRIPT_SUFFIXES = (
+    ".claude/skills/gemini-cli-headless-delegation/scripts/build_request.py",
+    ".claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py",
+)
+#: real, resolved, repo-root-anchored absolute paths backing
+#: ``_is_agy_canonical_script_token``'s exact-match containment check.
+_AGY_CANONICAL_SCRIPT_ABSOLUTE_PATHS = frozenset(
+    (_REPO_ROOT / suffix).resolve() for suffix in _AGY_CANONICAL_SCRIPT_SUFFIXES
+)
+#: head commands that MAY be a canonical AGY delegation invocation -- gated
+#: further by `_AGY_CANONICAL_SCRIPT_SUFFIXES` membership, never trusted
+#: unconditionally (a bare `python3`/`uv` invocation of anything else is
+#: still an unconditional deny -- see `_check_read_only_investigation_command`).
+_AGY_CANONICAL_INVOCATION_HEAD_COMMANDS = frozenset({"python3", "uv"})
+#: standalone head commands (outside `git`/`gh`/the canonical AGY
+#: invocation above) allowed under the read-only investigation profile --
+#: ONLY hashing/inspection coreutils that cannot themselves execute
+#: arbitrary further commands. `find` (its `-exec`/`-execdir`/`-ok`/`-okdir`
+#: actions run an arbitrary command, unrelated to its head token) is
+#: deliberately EXCLUDED for that reason.
+_READ_ONLY_INVESTIGATION_HEAD_COMMANDS = frozenset({"sha256sum", "sha1sum", "wc", "head", "tail", "cat", "ls"})
+#: pipeline operator tokens this profile ever tokenizes as significant
+#: (see `_tokenize_read_only_investigation_pipeline`). Only `|` composes a
+#: pipeline; every other operator token that appears is an unconditional
+#: deny of the WHOLE command (never a segment delimiter).
+_PIPELINE_TOKENIZER_PUNCTUATION_CHARS = "|;&\n\r"
+_DENIED_PIPELINE_OPERATOR_TOKENS = frozenset({";", "&", "&&", "||", "\n", "\r"})
+
+_DENIED_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Agent", "Skill"})
+
+#: caller-supplied run-scoped variables (never credentials) built by this
+#: module elsewhere (e.g. ``AGENT_RETROSPECTIVE_RUN_ID``). Issue #2445 AC1:
+#: no longer consulted by ``sanitize_subprocess_env``/``_default_sanitized_env``
+#: (those are denylist-based now, see ``_MUTATION_CREDENTIAL_ENV_VARS``) --
+#: retained only for the ``env=`` dict-building call sites below that still
+#: reference this prefix constant.
 _RUN_SCOPED_ENV_PREFIX = "AGENT_RETROSPECTIVE_"
 
 
@@ -2812,6 +2967,144 @@ class PermissionDenied(Exception):
     def __init__(self, message: str, *, command: str) -> None:
         super().__init__(message)
         self.command = command
+
+
+def _tokenize_read_only_investigation_pipeline(command: str) -> list[list[str]]:
+    """Quote-aware tokenizer for the read-only investigation Bash profile
+    (Issue #2419 PR #2425 review fix_delta P1-b). Uses ``shlex``'s
+    ``punctuation_chars`` mode so a ``|``/``;``/``&``/newline INSIDE a
+    quoted string (``git grep 'foo|bar'``, ``gh pr view 1 --jq '.title |
+    length'``) is never mistaken for a command separator -- unlike the
+    previous ``re.split(r"\\|\\||&&|[|;\\r\\n]", command)``, which split on
+    any raw occurrence of those characters regardless of quoting.
+
+    Returns one token list PER simple command in a single-pipe (``|``-only)
+    pipeline. Any OTHER operator token (``;``, a bare ``&``, ``&&``,
+    ``||``, a literal newline/carriage-return) appearing ANYWHERE in the
+    command -- even what otherwise looks like a single simple command -- is
+    an unconditional deny of the WHOLE command: this profile only ever
+    composes read-only pipelines with ``|``, and treating those operators as
+    segment delimiters (the previous ``re.split`` behavior) is what let a
+    mutating segment ride along next to a read-only-looking one."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=_PIPELINE_TOKENIZER_PUNCTUATION_CHARS)
+    lexer.whitespace = " \t"
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError as exc:
+        raise PermissionDenied(f"bash_unparsable:{exc}", command=command) from exc
+    if not tokens:
+        raise PermissionDenied("bash_empty", command=command)
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token == "|":
+            if not current:
+                raise PermissionDenied("bash_empty_segment", command=command)
+            segments.append(current)
+            current = []
+            continue
+        if token in _DENIED_PIPELINE_OPERATOR_TOKENS:
+            raise PermissionDenied(f"denied_bash_operator:{token!r}", command=command)
+        current.append(token)
+    if not current:
+        raise PermissionDenied("bash_empty_segment", command=command)
+    segments.append(current)
+    return segments
+
+
+def _find_git_subcommand(tokens: list[str]) -> str | None:
+    """PR #2425 review fix_delta P0-3: locate the real git subcommand
+    POSITION by walking past recognized GLOBAL flags following git's own
+    argv grammar (a value-taking flag like ``-C <path>`` consumes its
+    value as a separate token; a ``--flag=value`` long option consumes only
+    itself). An unrecognized leading ``-``-prefixed flag fails CLOSED
+    (returns ``None``, which the caller then denies) rather than guessing
+    whether it takes a value -- consistent with this profile's fail-closed
+    philosophy everywhere else."""
+    idx = 1
+    n = len(tokens)
+    while idx < n:
+        tok = tokens[idx]
+        if tok in _GIT_GLOBAL_FLAGS_WITH_VALUE:
+            idx += 2
+            continue
+        if tok in _GIT_GLOBAL_FLAGS_NO_VALUE:
+            idx += 1
+            continue
+        if tok.startswith("--") and "=" in tok:
+            idx += 1
+            continue
+        if tok.startswith("-"):
+            return None
+        return tok
+    return None
+
+
+def _find_gh_group_action(tokens: list[str]) -> tuple[str | None, str | None]:
+    """PR #2425 review fix_delta P0-4: locate the real ``gh`` (group,
+    action) POSITIONS by walking past recognized GLOBAL flags
+    (``--repo``/``-R``/``--hostname``), the same fail-closed-on-unrecognized
+    -flag approach as ``_find_git_subcommand``."""
+    idx = 1
+    n = len(tokens)
+    while idx < n:
+        tok = tokens[idx]
+        if tok in _GH_GLOBAL_FLAGS_WITH_VALUE:
+            idx += 2
+            continue
+        if tok.startswith("--") and "=" in tok:
+            idx += 1
+            continue
+        if tok.startswith("-"):
+            return None, None
+        break
+    if idx >= n:
+        return None, None
+    group = tokens[idx]
+    idx += 1
+    while idx < n:
+        tok = tokens[idx]
+        if tok in _GH_GLOBAL_FLAGS_WITH_VALUE:
+            idx += 2
+            continue
+        if tok.startswith("--") and "=" in tok:
+            idx += 1
+            continue
+        if tok.startswith("-"):
+            return group, None
+        break
+    if idx >= n:
+        return group, None
+    return group, tokens[idx]
+
+
+def _is_agy_canonical_script_token(tok: str) -> bool:
+    """PR #2425 review fix_delta round 4 (P0, decoy-script bypass): returns
+    ``True`` only when ``tok`` is a real filesystem path that
+    ``Path.resolve()``s (following any symlink and collapsing any ``..``
+    segment -- this covers the "symlink-based impersonation" concern too,
+    since a symlink at/under a decoy path resolving to a canonical script
+    is not itself the canonical script's OWN absolute path, and a symlink
+    planted AT the canonical path pointing elsewhere resolves away from
+    ``_AGY_CANONICAL_SCRIPT_ABSOLUTE_PATHS``) to EXACTLY one of the two
+    canonical AGY delegation scripts' real, ``_REPO_ROOT``-anchored absolute
+    paths.
+
+    ``Path.resolve()`` never requires the path to exist (Python's default
+    ``strict=False``) -- a decoy path is denied not because a stat() call
+    fails, but because its resolved value can never equal a DIFFERENT,
+    real script's own resolved absolute path. This is what makes the
+    check fail closed for BOTH a decoy copy at an attacker-chosen prefix
+    (e.g. ``/tmp/evilcopy/.claude/skills/gemini-cli-headless-delegation/
+    scripts/build_request.py``) and a wholly nonexistent path with the
+    same trailing directory structure -- the prior ``str.endswith()``
+    design allowed both."""
+    try:
+        resolved = Path(tok).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return resolved in _AGY_CANONICAL_SCRIPT_ABSOLUTE_PATHS
 
 
 class DelegatedAgentPermissionPolicy:
@@ -2835,14 +3128,65 @@ class DelegatedAgentPermissionPolicy:
     ``gh --repo owner/repo issue comment 1 --body x``, ``python -c '...'``,
     ``curl -X POST ...``, ``printf data > repository-file``)."""
 
-    def __init__(self, *, run_id: str, allowed_bash_commands: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        allowed_bash_commands: frozenset[str] = frozenset(),
+        read_only_investigation_enabled: bool = False,
+        settings_path: str | None = None,
+    ) -> None:
         self.run_id = run_id
         self.allowed_bash_commands = allowed_bash_commands
+        #: Issue #2419: explicit opt-in only. Default ``False`` preserves
+        #: `check_bash`'s pre-existing deny-all-by-default behavior
+        #: byte-for-byte for every caller that does not pass this.
+        self.read_only_investigation_enabled = read_only_investigation_enabled
+        #: Issue #2419: path to a run-scoped ``--settings`` JSON file (see
+        #: ``write_bash_guard_settings_file``) registering
+        #: ``retrospective_bash_guard_hook.py`` as a ``PreToolUse`` hook for
+        #: the real ``claude`` CLI subprocess. ``None`` (the default) adds no
+        #: ``--settings`` argv element -- existing callers that never set
+        #: this are unaffected.
+        self.settings_path = settings_path
 
     def check_bash(self, command: str) -> None:
+        """Fail-closed Bash gate. Two modes, selected by
+        ``self.read_only_investigation_enabled``:
+
+        - ``False`` (the default): pre-existing Issue #2237 P0-5 semantics,
+          unchanged. A command must be present verbatim in
+          ``self.allowed_bash_commands`` AND pass
+          ``_check_single_command_tokenized_denylist`` -- an empty allowlist
+          denies all Bash.
+        - ``True`` (Issue #2419, opt-in): an exact ``allowed_bash_commands``
+          match still short-circuits (via the same tokenized denylist scan,
+          for backward compatibility with literal fixture allowlisting).
+          Otherwise, falls through to
+          ``_check_read_only_investigation_command``, which is
+          pipeline-aware and denies by git/gh subcommand+action rather than
+          by exact string match -- this is what actually allows the
+          `codebase-investigator` observer's legitimate `git show <sha>:
+          <path> | sha256sum` evidence-verification pipeline while still
+          denying `git merge`/`git commit`/`git push`/... (the Issue #2419
+          incident's root command class) inside that same pipeline."""
         normalized = " ".join(command.split())
-        if normalized not in self.allowed_bash_commands:
+        if normalized in self.allowed_bash_commands:
+            self._check_single_command_tokenized_denylist(command)
+            return
+        if not self.read_only_investigation_enabled:
             raise PermissionDenied("bash_not_allowlisted", command=command)
+        self._check_read_only_investigation_command(command)
+
+    def _check_single_command_tokenized_denylist(self, command: str) -> None:
+        """Pre-existing (Issue #2237 P0-5) single-command tokenized denylist
+        scan -- unchanged. Only reached for a command that already matched
+        ``self.allowed_bash_commands`` verbatim; closes the substring-
+        blacklist bypasses identified in OWNER review
+        #2237#issuecomment-5378291560 (``git -C . commit -m x``,
+        ``gh --repo owner/repo issue comment 1 --body x``,
+        ``python -c '...'``, ``curl -X POST ...``,
+        ``printf data > repository-file``)."""
         try:
             tokens = shlex.split(command)
         except ValueError as exc:
@@ -2862,6 +3206,145 @@ class DelegatedAgentPermissionPolicy:
         if (token_set & _DENIED_INLINE_EXEC_INTERPRETERS) and (token_set & _DENIED_INLINE_EXEC_FLAGS):
             raise PermissionDenied("denied_bash_pattern:inline_exec", command=command)
 
+    def _check_read_only_investigation_command(self, command: str) -> None:
+        """Issue #2419 / PR #2425 review fix_delta round 3
+        (#2425#issuecomment-5466916997): pipeline-aware read-only
+        investigation gate built around 3 explicit capabilities (canonical
+        AGY invocation, native Git read-only subcommands, native GitHub
+        group+action pairs) instead of an ever-growing set of individually
+        patched bypasses -- see the module-level comment above
+        ``_ALLOWED_GIT_READ_ONLY_SUBCOMMANDS`` for the full rationale.
+
+        Process substitution (``<(...)``/``>(...)``) and command
+        substitution (`` ` `` / ``$(``) are denied unconditionally on the
+        RAW command string, before any tokenization: bash actually executes
+        the substituted/substitution-fed command as its own process (P0-2 --
+        OWNER-verified end-to-end that ``cat <(git merge stale-feature)``
+        fast-forwards ``main`` exactly like Issue #2419's original
+        incident), and no segment-aware parser can safely predict what
+        either one conjures at runtime.
+
+        The remaining command is tokenized quote-aware
+        (``_tokenize_read_only_investigation_pipeline``) into one or more
+        ``|``-joined segments; every other operator (``;``/``&``/``&&``/
+        ``||``/a literal newline) is an unconditional deny of the WHOLE
+        command, never a segment delimiter (P1-b -- a raw-string
+        ``re.split`` previously split on those same characters even INSIDE
+        a quoted argument, e.g. ``git grep 'foo|bar'`` or ``gh pr view 2425
+        --jq '.title | length'``, denying legitimate read-only
+        investigation).
+
+        Each segment is allowed only if its head command is:
+
+        - ``git`` with an ALLOWLISTED read-only subcommand at its real argv
+          POSITION (P0-3 -- replaces a denylist of known mutating
+          subcommands, which silently allowed every unlisted mutation like
+          ``git add``/``git hash-object -w``/``git bisect``);
+        - ``gh`` with an ALLOWLISTED (group, action) PAIR at its real argv
+          POSITION, or ``gh api`` with an effective GET method (P0-4/P1-c --
+          replaces token-SET membership, which let a flag VALUE or branch
+          name equal to an action token bypass the check, e.g. ``gh pr
+          checkout 1 --branch view``);
+        - the canonical AGY delegation builder/wrapper invocation (P0-1 --
+          the ONLY ``python3``/``uv`` use this profile allows; restores the
+          workflow a prior round's blanket `python3`/`uv` exclusion had
+          self-blocked); or
+        - one of the standalone read-only coreutils in
+          ``_READ_ONLY_INVESTIGATION_HEAD_COMMANDS``.
+
+        Any inline git config override (``-c``/``--config``) is denied
+        outright for ``git`` segments regardless of position -- it is never
+        needed for read-only investigation and is a documented alias/
+        indirection vector (verified end-to-end: ``git -c
+        alias.x=merge x <branch>`` performs a real fast-forward merge)."""
+        if any(marker in command for marker in ("`", "$(", "<(", ">(")):
+            raise PermissionDenied("denied_bash_metacharacter:command_or_process_substitution", command=command)
+        segments = _tokenize_read_only_investigation_pipeline(command)
+        for original_tokens in segments:
+            lowered = [tok.lower() for tok in original_tokens]
+            token_set = set(lowered)
+            if token_set & _DENIED_BASH_METACHAR_TOKENS:
+                raise PermissionDenied("denied_bash_metacharacter", command=command)
+            head = Path(lowered[0]).name
+            if head in _DENIED_BASH_STANDALONE_COMMANDS:
+                raise PermissionDenied(f"denied_bash_standalone:{head}", command=command)
+            if (token_set & _DENIED_INLINE_EXEC_INTERPRETERS) and (token_set & _DENIED_INLINE_EXEC_FLAGS):
+                raise PermissionDenied("denied_bash_pattern:inline_exec", command=command)
+            if head == "git":
+                if "-c" in original_tokens or "--config" in lowered:
+                    raise PermissionDenied("denied_git_inline_config_override", command=command)
+                # PR #2425 review fix_delta P0-3: POSITION-based subcommand
+                # lookup against an ALLOWLIST (not a token-SET denylist
+                # intersection) -- `_find_git_subcommand` walks past global
+                # flags following real git argv grammar (`-C <path>` etc.
+                # consume their value; an unrecognized leading flag fails
+                # closed to `None` rather than guessing its arity).
+                subcommand = _find_git_subcommand(original_tokens)
+                if subcommand is None or subcommand.lower() not in _ALLOWED_GIT_READ_ONLY_SUBCOMMANDS:
+                    raise PermissionDenied(f"denied_git_subcommand_not_allowlisted:{subcommand}", command=command)
+                continue
+            if head == "gh":
+                # PR #2425 review fix_delta P0-4/P1-c: POSITION-based
+                # (group, action) lookup against an exact-pair ALLOWLIST,
+                # with `gh api` handled by its own GET-only rule.
+                group, action = _find_gh_group_action(original_tokens)
+                if group is not None and group.lower() == "api":
+                    self._check_gh_api_segment(original_tokens, lowered, command)
+                    continue
+                pair = (group.lower(), action.lower()) if group and action else None
+                if pair is None or pair not in _ALLOWED_GH_GROUP_ACTION_PAIRS:
+                    raise PermissionDenied(
+                        f"denied_gh_group_action_not_allowlisted:{group}:{action}", command=command
+                    )
+                continue
+            if head in _AGY_CANONICAL_INVOCATION_HEAD_COMMANDS:
+                # PR #2425 review fix_delta P0-1 / round 4 (P0,
+                # decoy-script bypass): the ONLY allowed `python3`/`uv` use
+                # is an exact canonical AGY builder/wrapper invocation --
+                # everything else (heredoc, `-c`, arbitrary script FILE
+                # argument, or a decoy/nonexistent path merely ending with
+                # the same trailing directory structure -- see
+                # `_is_agy_canonical_script_token`) stays denied.
+                if any(_is_agy_canonical_script_token(tok) for tok in original_tokens):
+                    continue
+                raise PermissionDenied(f"denied_unlisted_command:{head}", command=command)
+            if head in _READ_ONLY_INVESTIGATION_HEAD_COMMANDS:
+                continue
+            raise PermissionDenied(f"denied_unlisted_command:{head}", command=command)
+
+    def _check_gh_api_segment(self, original_tokens: list[str], lowered: list[str], command: str) -> None:
+        """PR #2425 review fix_delta P1-c: ``gh api`` is allowed only for an
+        effective ``GET`` request -- GitHub CLI's own documented behavior is
+        that the default method is ``GET`` but ``-f``/``-F``/``--raw-field``/
+        ``--input`` implicitly switch it to ``POST``. Denies any explicit
+        non-``GET`` ``--method``/``-X``, and denies any data-carrying flag
+        UNLESS an explicit ``--method GET`` is also present."""
+        explicit_method: str | None = None
+        has_data_flag = False
+        idx = 0
+        n = len(original_tokens)
+        while idx < n:
+            tok = original_tokens[idx]
+            low = lowered[idx]
+            if low in _GH_API_METHOD_FLAGS:
+                explicit_method = original_tokens[idx + 1] if idx + 1 < n else ""
+                idx += 2
+                continue
+            if low.startswith("--method="):
+                explicit_method = tok.split("=", 1)[1]
+                idx += 1
+                continue
+            if low in _GH_API_DATA_FLAGS:
+                has_data_flag = True
+                idx += 1
+                continue
+            idx += 1
+        explicit_method_upper = explicit_method.upper() if explicit_method is not None else None
+        if explicit_method_upper is not None and explicit_method_upper != "GET":
+            raise PermissionDenied(f"denied_gh_api_method:{explicit_method_upper}", command=command)
+        if has_data_flag and explicit_method_upper != "GET":
+            raise PermissionDenied("denied_gh_api_data_flag_without_explicit_get", command=command)
+
     def check_filesystem_write(self, path: str) -> None:
         raise PermissionDenied(f"filesystem_write_denied:{path}", command=f"write:{path}")
 
@@ -2879,19 +3362,84 @@ class DelegatedAgentPermissionPolicy:
 
     def sanitize_subprocess_env(self, env: dict[str, str]) -> dict[str, str]:
         """Build the environment actually forwarded to a delegated Agent's
-        subprocess (Issue #2237 P0-5): unconditionally excludes
-        ``_MUTATION_CREDENTIAL_ENV_VARS`` regardless of what else is
-        allowlisted, passes ``_ENV_PASSTHROUGH_ALLOWLIST`` unchanged, and
-        passes through caller-supplied run-scoped variables (prefixed
-        ``AGENT_RETROSPECTIVE_``, e.g. the run's ``run_id``/``base_sha``) --
-        never the full ambient ``os.environ``."""
-        sanitized: dict[str, str] = {}
-        for key, value in env.items():
-            if key in _MUTATION_CREDENTIAL_ENV_VARS:
-                continue
-            if key in _ENV_PASSTHROUGH_ALLOWLIST or key.startswith(_RUN_SCOPED_ENV_PREFIX):
-                sanitized[key] = value
-        return sanitized
+        subprocess (Issue #2237 P0-5, replaced by Issue #2445 AC1 with
+        denylist-based semantics): inherits ``env`` (built by ``invoke_agent``
+        as ``{**os.environ, **request.env}``) unconditionally excluding only
+        ``_MUTATION_CREDENTIAL_ENV_VARS``. This restores continuity for
+        provider transport / model-selection / other non-mutation Claude
+        runtime env vars (``ANTHROPIC_BASE_URL``, ``ANTHROPIC_AUTH_TOKEN``,
+        ``ANTHROPIC_MODEL``, ``ANTHROPIC_DEFAULT_*_MODEL``,
+        ``CLAUDE_CONFIG_DIR``, ``CLAUDE_CODE_AUTO_COMPACT_WINDOW``, etc.) that
+        the prior allowlist-only design silently dropped (Issue #2436
+        Background) -- no new claude-gpt-specific opt-in flag is introduced;
+        this mirrors the sibling
+        ``plugins/agent-retrospective/skills/run/scripts/run_retrospective.py``
+        implementation's ``sanitize_subprocess_env``/``_default_sanitized_env``
+        pair exactly."""
+        return _default_sanitized_env(env)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2419: real PreToolUse hook wiring for `DelegatedAgentPermissionPolicy
+# .check_bash`. `check_bash` was previously defined but never called from any
+# production invocation path -- the actual production call site is
+# `retrospective_bash_guard_hook.py` (a standalone script the real `claude`
+# CLI subprocess launches per-Bash-tool-use, per Claude Code's own
+# `PreToolUse` hook contract), which imports this module and calls
+# `build_bash_guard_hook_decision`. Agent frontmatter's own `hooks:` field
+# does NOT fire in a headless `-p` session (it requires a workspace-trust
+# dialog acceptance no `-p` session ever presents); a `--settings`-file hook
+# does fire in `-p` (Issue #2419 SubAgent C research, Claude Code hooks
+# reference), which is why `write_bash_guard_settings_file` below produces a
+# `--settings` file rather than relying on the agent definition's `hooks:`.
+# ---------------------------------------------------------------------------
+
+
+def build_bash_guard_hook_decision(command: str, *, policy: DelegatedAgentPermissionPolicy) -> dict[str, Any]:
+    """Real production call site for ``policy.check_bash`` (Issue #2419).
+    Used by ``retrospective_bash_guard_hook.py``. Returns a Claude Code
+    ``PreToolUse`` hook JSON response -- never raises."""
+    try:
+        policy.check_bash(command)
+    except PermissionDenied as exc:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": f"agent-retrospective Bash guard: {exc}",
+            }
+        }
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "agent-retrospective Bash guard: command passed read-only investigation policy",
+        }
+    }
+
+
+def write_bash_guard_settings_file(tmp_dir: Path) -> Path:
+    """Write a run-scoped ephemeral Claude Code ``--settings`` file (Issue
+    #2419) registering ``retrospective_bash_guard_hook.py`` as a
+    ``PreToolUse`` hook for the ``Bash`` tool. Written inside the run's own
+    private temp dir (``run_scoped_temp_dir``) so it is removed with
+    everything else that dir's context manager cleans up."""
+    settings_path = tmp_dir / "bash_guard_settings.json"
+    hook_script = Path(__file__).resolve().parent / "retrospective_bash_guard_hook.py"
+    hook_command = f"{shlex.quote(sys.executable)} {shlex.quote(str(hook_script))}"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Bash", "hooks": [{"type": "command", "command": hook_command}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return settings_path
 
 
 # ---------------------------------------------------------------------------
@@ -3408,7 +3956,6 @@ def run_cli(
     unable to satisfy ``run_observer_wave()``'s identity checks."""
     manual_trigger_preflight(repo_root=repo_root)
     resolved_run_id = run_id or str(uuid.uuid4())
-    policy = DelegatedAgentPermissionPolicy(run_id=resolved_run_id)
 
     def _base_sha_resolver() -> str:
         completed = git_runner(
@@ -3418,7 +3965,20 @@ def run_cli(
             raise ValueError(f"base_sha_resolution_failed:{completed.stderr}")
         return completed.stdout.strip()
 
-    with run_scoped_temp_dir(resolved_run_id, base_dir=temp_base_dir):
+    with run_scoped_temp_dir(resolved_run_id, base_dir=temp_base_dir) as run_tmp_dir:
+        # Issue #2419: `--settings` file registering the real PreToolUse
+        # Bash guard hook, and `read_only_investigation_enabled=True` so
+        # `policy.check_bash` (now a real production call site via
+        # `retrospective_bash_guard_hook.py`) allows the read-only git/gh
+        # investigation surface `codebase-investigator`'s AGY advisory
+        # native fallback genuinely needs, while still denying every
+        # mutating verb (the Issue #2419 incident's root command class).
+        bash_guard_settings_path = write_bash_guard_settings_file(run_tmp_dir)
+        policy = DelegatedAgentPermissionPolicy(
+            run_id=resolved_run_id,
+            read_only_investigation_enabled=True,
+            settings_path=str(bash_guard_settings_path),
+        )
         collectors = [build_repository_collector(repo_root)]
         ctx, plan, results = prepare(
             base_sha_resolver=_base_sha_resolver, collectors=collectors, clock=clock, run_id=resolved_run_id
