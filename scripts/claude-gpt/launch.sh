@@ -247,8 +247,21 @@ CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET="${GH_CONFIG_DIR:-${HOME}/.config/gh}"
 #     settings のパス。isolated HOME 差し替え *前* の ambient 実 HOME を使って
 #     ここで固定する（CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET と同じ理由）。この値
 #     自体は settings.local.json の env フラグメントへ path 文字列としてのみ
-#     baked され、中身（API key 等）は adapter 実行時にのみ読まれる。 ---
-CLAUDE_NATIVE_LATITUDE_SETTINGS_PATH_TARGET="${HOME}/.claude/settings.json"
+#     baked され、中身（API key 等）は adapter 実行時にのみ読まれる。
+#
+#     Issue #2448: 単純な `${HOME}/.claude/settings.json` 固定では、Claude-GPT
+#     から同じ launcher を self-launch する経路（#2455 / PR #2460 で判明）で
+#     child の isolated HOME を Native settings と誤認する。inherited
+#     `CLAUDE_GPT_NATIVE_SETTINGS_PATH`（self-launch 時に settings.local.json
+#     の env 経由で child へ渡る re-entrant carrier）→ ambient
+#     `CLAUDE_CONFIG_DIR`（Claude Code 公式の Native profile authority）→
+#     `${HOME}/.claude/settings.json` フォールバックの順で
+#     `claude_gpt_resolve_native_settings_path()`（lib.sh）に解決させる。この
+#     行は isolated HOME 切替（後段の `export HOME="$CLAUDE_ISOLATED_HOME_TARGET"`）
+#     より前にあるため、ここで参照する `CLAUDE_GPT_NATIVE_SETTINGS_PATH` /
+#     `CLAUDE_CONFIG_DIR` / `HOME` はすべて isolated 化前の ambient 値。 ---
+CLAUDE_NATIVE_LATITUDE_SETTINGS_PATH_TARGET=$(claude_gpt_resolve_native_settings_path \
+  "${CLAUDE_GPT_NATIVE_SETTINGS_PATH:-}" "${CLAUDE_CONFIG_DIR:-}" "${HOME}")
 CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_config_dir)
 CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_cache_dir)
 
