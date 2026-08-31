@@ -1,503 +1,310 @@
-"""Tests for validate_ci_reliability_assessment_v1.py
+"""Reliability V1 fixed-design and workflow-provenance contract tests."""
 
-Covers structural validation (JSON Schema), semantic recomputation
-(reliability_metrics + non_inferiority_evaluation cross-checked against
-raw_attempts), and the Clopper-Pearson exact interval helper.
-"""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
 
 import pytest
 
-SCRIPTS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), ".."
-)
-sys.path.insert(0, os.path.normpath(SCRIPTS_DIR))
-
+SCRIPTS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, SCRIPTS_DIR)
 import validate_ci_reliability_assessment_v1 as validator  # noqa: E402
 
-REPO_ROOT = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "..")
-)
+REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", ".."))
 FIXTURES_DIR = os.path.join(REPO_ROOT, "fixtures", "ci-test-reliability")
 
 
-def _fixture_path(name: str) -> str:
-    return os.path.join(FIXTURES_DIR, name)
+def _rate(numerator: int, denominator: int) -> dict:
+    return {"numerator": numerator, "denominator": denominator, "rate": numerator / denominator}
 
 
-def _load_fixture(name: str) -> dict:
-    with open(_fixture_path(name), encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _validate(name: str, tmp_path) -> tuple[int, dict]:
-    output_path = str(tmp_path / "result.json")
-    exit_code, decision = validator.validate_assessment(_fixture_path(name))
-    with open(output_path, "w", encoding="utf-8") as handle:
-        json.dump(decision, handle)
-    return exit_code, decision
-
-
-# --------------------------------------------------------------------------- #
-# Clopper-Pearson exact interval
-# --------------------------------------------------------------------------- #
-class TestClopperPearsonInterval:
-    def test_clopper_pearson_zero_failure_before_cohort_has_finite_nonzero_upper_bound(self):
-        lower, upper = validator.clopper_pearson_interval(0, 20, 0.95)
-        assert lower == 0.0
-        # matches the ~16.8% TWO-sided 95% exact upper bound (this is the
-        # value historically cited as "one-sided" in issue #2170's Background
-        # -- that labeling was wrong; clopper_pearson_interval() uses alpha/2
-        # on each tail, i.e. two-sided. The correct one-sided 95% upper bound
-        # for 0/20 is ~13.91% -- see
-        # TestNewcombeWilsonRiskDifference.test_clopper_pearson_two_sided_label_matches_math
-        # and docs/dev/ci-test-reliability-assessment.md.
-        assert upper == pytest.approx(0.1684334709830182, abs=1e-9)
-
-    def test_clopper_pearson_all_failures_upper_bound_is_one(self):
-        lower, upper = validator.clopper_pearson_interval(20, 20, 0.95)
-        assert upper == 1.0
-        assert lower == pytest.approx(0.8315665290169818, abs=1e-9)
-
-    def test_clopper_pearson_zero_denominator_returns_full_interval(self):
-        assert validator.clopper_pearson_interval(0, 0, 0.95) == (0.0, 1.0)
-
-    def test_clopper_pearson_midpoint_interval_is_symmetric_around_estimate(self):
-        lower, upper = validator.clopper_pearson_interval(10, 20, 0.95)
-        assert lower < 0.5 < upper
-
-
-# --------------------------------------------------------------------------- #
-# End-to-end fixture-driven validation
-# --------------------------------------------------------------------------- #
-class TestPositiveFixtures:
-    def test_valid_assessment_recomputed_from_raw_attempts_matches_self_report(self, tmp_path):
-        exit_code, decision = _validate(
-            "valid_workflow_failure_rate_non_inferior.json", tmp_path
-        )
-        assert exit_code == 0
-        assert decision["structural_valid"] is True
-        assert decision["semantic_valid"] is True
-        assert decision["errors"] == []
-        recomputed = decision["recomputed_reliability_metrics"]
-        assert recomputed["before"]["workflow_failure_rate"] == {
-            "numerator": 1,
-            "denominator": 20,
-            "rate": pytest.approx(0.05),
-        }
-        assert recomputed["after"]["workflow_failure_rate"] == {
-            "numerator": 1,
-            "denominator": 25,
-            "rate": pytest.approx(0.04),
-        }
-
-    def test_valid_zero_before_failure_clopper_pearson_non_inferiority_passes(self, tmp_path):
-        exit_code, decision = _validate(
-            "valid_zero_before_failure_clopper_pearson.json", tmp_path
-        )
-        assert exit_code == 0
-        assert decision["semantic_valid"] is True
-        assert (
-            decision["recomputed_reliability_metrics"]["before"]["workflow_failure_rate"][
-                "numerator"
-            ]
-            == 0
-        )
-
-
-class TestNegativeFixtures:
-    def test_invalid_denominator_mismatch_is_rejected(self, tmp_path):
-        exit_code, decision = _validate("invalid_denominator_mismatch.json", tmp_path)
-        assert exit_code == 2
-        assert decision["semantic_valid"] is False
-        assert any("denominator" in err for err in decision["errors"])
-
-    def test_invalid_retry_rerun_confusion_rerun_not_counted_as_flaky(self, tmp_path):
-        exit_code, decision = _validate("invalid_retry_rerun_confusion.json", tmp_path)
-        assert exit_code == 2
-        assert decision["semantic_valid"] is False
-        assert any(
-            "playwright_flaky_test_rate" in err for err in decision["errors"]
-        )
-        # the correct recomputation excludes the run_attempt-2 rerun record
-        recomputed = decision["recomputed_reliability_metrics"]
-        assert recomputed["before"]["playwright_flaky_test_rate"]["numerator"] == 1
-
-    def test_invalid_cancelled_misclassification_cancelled_timed_out_classification(
-        self, tmp_path
-    ):
-        exit_code, decision = _validate(
-            "invalid_cancelled_misclassification.json", tmp_path
-        )
-        assert exit_code == 2
-        assert decision["semantic_valid"] is False
-        recomputed = decision["recomputed_reliability_metrics"]
-        # cancelled run is excluded from both numerator and denominator
-        assert recomputed["before"]["workflow_failure_rate"] == {
-            "numerator": 1,
-            "denominator": 20,
-            "rate": pytest.approx(0.05),
-        }
-
-
-class TestClassificationHelpers:
-    def test_cancelled_timed_out_classification_is_not_terminal_failure(self):
-        assert validator._classify_workflow_run("cancelled") == "infrastructure_failure"
-        assert validator._classify_workflow_run("timed_out") == "infrastructure_failure"
-        assert validator._classify_workflow_run("action_required") == "infrastructure_failure"
-        assert validator._classify_workflow_run("failure") == "terminal_failure"
-        assert validator._classify_workflow_run("success") == "success"
-
-    def test_rerun_not_counted_as_flaky_excludes_run_attempt_greater_than_one(self):
-        cohort = {
-            "workflow_runs": [],
-            "playwright_tests": [
-                {
-                    "test_id": "t1",
-                    "workflow_run_id": 1,
-                    "run_attempt": 1,
-                    "attempts": [
-                        {"attempt_number": 1, "status": "failed"},
-                    ],
-                },
-                {
-                    # GitHub Actions rerun of the whole workflow -- a *separate*
-                    # record at run_attempt 2, not a Playwright internal retry.
-                    "test_id": "t1",
-                    "workflow_run_id": 1,
-                    "run_attempt": 2,
-                    "attempts": [
-                        {"attempt_number": 1, "status": "passed"},
-                    ],
-                },
-            ],
-        }
-        recomputed = validator._recompute_metrics_block(cohort)
-        # only the run_attempt == 1 record counts: single attempt, failed,
-        # no internal retries recorded within that attempt -> terminal_failure,
-        # not flaky (the rerun success must not be conflated with a retry).
-        assert recomputed["playwright_flaky_test_rate"]["numerator"] == 0
-        assert recomputed["playwright_terminal_failure_rate"]["numerator"] == 1
-
-    def test_recomputed_from_raw_attempts_playwright_flaky_requires_earlier_failure(self):
-        cohort = {
-            "workflow_runs": [],
-            "playwright_tests": [
-                {
-                    "test_id": "flaky-test",
-                    "workflow_run_id": 1,
-                    "run_attempt": 1,
-                    "attempts": [
-                        {"attempt_number": 1, "status": "failed"},
-                        {"attempt_number": 2, "status": "passed"},
-                    ],
-                }
-            ],
-        }
-        recomputed = validator._recompute_metrics_block(cohort)
-        assert recomputed["playwright_flaky_test_rate"] == {
-            "numerator": 1,
-            "denominator": 1,
-            "rate": 1.0,
-        }
-
-
-class TestStructuralValidation:
-    def test_structural_missing_required_property_is_rejected(self, tmp_path):
-        base = _load_fixture("valid_workflow_failure_rate_non_inferior.json")
-        del base["sample_identity"]
-        broken_path = tmp_path / "structural_missing_required.json"
-        broken_path.write_text(json.dumps(base), encoding="utf-8")
-        exit_code, decision = validator.validate_assessment(str(broken_path))
-        assert exit_code == 2
-        assert decision["structural_valid"] is False
-
-    def test_structural_wrong_schema_const_is_rejected(self, tmp_path):
-        base = _load_fixture("valid_workflow_failure_rate_non_inferior.json")
-        base["schema"] = "SOME_OTHER_SCHEMA"
-        broken_path = tmp_path / "structural_wrong_schema.json"
-        broken_path.write_text(json.dumps(base), encoding="utf-8")
-        exit_code, decision = validator.validate_assessment(str(broken_path))
-        assert exit_code == 2
-        assert decision["structural_valid"] is False
-
-    def test_structural_duplicate_json_key_is_operational_failure(self, tmp_path):
-        broken_path = tmp_path / "structural_duplicate_key.json"
-        broken_path.write_text('{"a": 1, "a": 2}', encoding="utf-8")
-        exit_code, decision = validator.validate_assessment(str(broken_path))
-        assert exit_code == 3
-        assert "operational_error" in decision
-
-
-class TestP0RegressionFindings:
-    """Regression tests for the OWNER adversarial review on PR #2175 (two
-    P0 false-green findings: non-inferiority not a real two-sample test,
-    and sample_identity.key = workflow_run_id not enforced)."""
-
-    def test_duplicate_workflow_run_id_is_rejected(self):
-        cohort = {
-            "workflow_runs": [
-                {"workflow_run_id": 1, "run_attempt": 1, "conclusion": "failure"},
-                {"workflow_run_id": 1, "run_attempt": 1, "conclusion": "success"},
-            ],
-            "playwright_tests": [],
-        }
-        errors: list[str] = []
-        validator._check_duplicate_sample_identities(cohort, "before", errors)
-        assert any("duplicate_workflow_run_id" in err for err in errors)
-        assert any("duplicate_workflow_run_record" in err for err in errors)
-
-    def test_duplicate_playwright_test_record_is_rejected(self):
-        cohort = {
-            "workflow_runs": [],
-            "playwright_tests": [
-                {
-                    "test_id": "t1",
-                    "workflow_run_id": 1,
-                    "run_attempt": 1,
-                    "attempts": [{"attempt_number": 1, "status": "passed"}],
-                },
-                {
-                    "test_id": "t1",
-                    "workflow_run_id": 1,
-                    "run_attempt": 1,
-                    "attempts": [{"attempt_number": 1, "status": "passed"}],
-                },
-            ],
-        }
-        errors: list[str] = []
-        validator._check_duplicate_sample_identities(cohort, "before", errors)
-        assert any("duplicate_playwright_test_record" in err for err in errors)
-
-    def test_duplicate_inflation_cannot_dilute_workflow_failure_rate(self):
-        # A producer duplicating the same low-failure record 99x must not
-        # be able to silently dilute the recomputed failure rate -- the
-        # duplication itself must be surfaced as a hard error, even though
-        # naive summation would recompute a diluted (and self-consistent)
-        # rate.
-        cohort = {
-            "workflow_runs": [
-                {"workflow_run_id": 1, "run_attempt": 1, "conclusion": "failure"}
-            ]
-            + [
-                {"workflow_run_id": 2, "run_attempt": 1, "conclusion": "success"}
-                for _ in range(99)
-            ],
-            "playwright_tests": [],
-        }
-        errors: list[str] = []
-        validator._check_duplicate_sample_identities(cohort, "before", errors)
-        # 99 identical duplicate records of workflow_run_id=2 -- rejected.
-        assert any("workflow_run_id=2" in err for err in errors)
-
-    def test_before_sample_count_below_required_is_inconclusive(self):
-        before_field = {"numerator": 0, "denominator": 5, "rate": 0.0}
-        after_field = {"numerator": 0, "denominator": 25, "rate": 0.0}
-        result = validator.evaluate_non_inferiority(
-            before_field, after_field, confidence_level=0.95, margin=0.2,
-            required_sample_count=20,
-        )
-        assert result["outcome"] == "inconclusive"
-        assert result["point_estimate"] is None
-        assert result["ci_upper"] is None
-
-    def test_two_sample_noninferiority_rejects_false_green(self):
-        # Exact false-PASS scenario from the OWNER adversarial review:
-        # before=1 failure/1 run, after=20 failures/20 runs, margin=0.01.
-        # The old single-arm-only logic reported non_inferior. The fixed
-        # two-sample logic must NOT report non_inferior.
-        before_field = {"numerator": 1, "denominator": 1, "rate": 1.0}
-        after_field = {"numerator": 20, "denominator": 20, "rate": 1.0}
-        result = validator.evaluate_non_inferiority(
-            before_field, after_field, confidence_level=0.95, margin=0.01,
-            required_sample_count=20,
-        )
-        assert result["outcome"] != "non_inferior"
-        # before's denominator (1) is below required_sample_count (20) --
-        # correctly forced inconclusive rather than any spurious PASS.
-        assert result["outcome"] == "inconclusive"
-
-    def test_two_sample_noninferiority_detects_genuine_regression(self):
-        # Both arms meet required_sample_count; after is genuinely much
-        # worse than before -- must be "inferior", not "non_inferior".
-        before_field = {"numerator": 1, "denominator": 20, "rate": 0.05}
-        after_field = {"numerator": 18, "denominator": 20, "rate": 0.9}
-        result = validator.evaluate_non_inferiority(
-            before_field, after_field, confidence_level=0.95, margin=0.2,
-            required_sample_count=20,
-        )
-        assert result["outcome"] == "inferior"
-
-    def test_expected_failure_is_not_terminal_regression(self):
-        # A Playwright test.fail() style test: the attempt's status
-        # ("failed") matches its own expected_status ("failed"). This must
-        # be classified as "success" (an expected result), never as
-        # terminal_failure, even though the raw status literal is "failed".
-        record = {
-            "test_id": "e2e/expected-fail.spec.ts::always-fails",
-            "workflow_run_id": 1,
-            "run_attempt": 1,
-            "attempts": [
-                {"attempt_number": 1, "status": "failed", "expected_status": "failed"}
-            ],
-        }
-        assert validator._classify_playwright_test(record) == "success"
-
-    def test_unexpected_pass_of_expected_fail_test_is_not_silently_success(self):
-        # An expected-to-fail test that unexpectedly passes: status
-        # ("passed") does not match expected_status ("failed") -- this is
-        # NOT a matching/expected outcome. The final-attempt branch
-        # (final_expected is False, final status is "passed", not in
-        # _TERMINAL_FAILURE_TEST_STATUSES) is excluded rather than
-        # silently counted as a normal success, since it does not match
-        # the declared expectation.
-        record = {
-            "test_id": "e2e/expected-fail.spec.ts::unexpectedly-passes",
-            "workflow_run_id": 1,
-            "run_attempt": 1,
-            "attempts": [
-                {"attempt_number": 1, "status": "passed", "expected_status": "failed"}
-            ],
-        }
-        assert validator._classify_playwright_test(record) == "excluded"
-
-    def test_expected_status_absent_preserves_prior_behavior(self):
-        # No expected_status present -- defaults to "passed", identical to
-        # pre-fix classification.
-        record = {
-            "test_id": "e2e/normal.spec.ts::normal",
-            "workflow_run_id": 1,
-            "run_attempt": 1,
-            "attempts": [{"attempt_number": 1, "status": "failed"}],
-        }
-        assert validator._classify_playwright_test(record) == "terminal_failure"
-
-    def test_attempt_numbers_must_be_unique_and_ordered(self):
-        cohort = {
-            "workflow_runs": [],
-            "playwright_tests": [
-                {
-                    "test_id": "t1",
-                    "workflow_run_id": 1,
-                    "run_attempt": 1,
-                    "attempts": [
-                        {"attempt_number": 2, "status": "passed"},
-                        {"attempt_number": 1, "status": "failed"},
-                    ],
-                }
-            ],
-        }
-        errors: list[str] = []
-        validator._check_attempt_number_ordering(cohort, "before", errors)
-        assert any("attempt_number_not_unique_or_ordered" in err for err in errors)
-
-    def test_attempt_numbers_duplicate_is_rejected(self):
-        cohort = {
-            "workflow_runs": [],
-            "playwright_tests": [
-                {
-                    "test_id": "t1",
-                    "workflow_run_id": 1,
-                    "run_attempt": 1,
-                    "attempts": [
-                        {"attempt_number": 1, "status": "failed"},
-                        {"attempt_number": 1, "status": "passed"},
-                    ],
-                }
-            ],
-        }
-        errors: list[str] = []
-        validator._check_attempt_number_ordering(cohort, "before", errors)
-        assert any("attempt_number_not_unique_or_ordered" in err for err in errors)
-
-    def test_attempt_numbers_ordered_and_unique_is_not_rejected(self):
-        cohort = {
-            "workflow_runs": [],
-            "playwright_tests": [
-                {
-                    "test_id": "t1",
-                    "workflow_run_id": 1,
-                    "run_attempt": 1,
-                    "attempts": [
-                        {"attempt_number": 1, "status": "failed"},
-                        {"attempt_number": 2, "status": "passed"},
-                    ],
-                }
-            ],
-        }
-        errors: list[str] = []
-        validator._check_attempt_number_ordering(cohort, "before", errors)
-        assert errors == []
-
-    def test_fixed_declared_sample_count_forces_is_power_derived_false_structurally(
-        self, tmp_path
-    ):
-        base = _load_fixture("valid_workflow_failure_rate_non_inferior.json")
-        base["sample_count_rule"] = {
-            "method": "fixed_declared",
-            "is_power_derived": True,
-            "required_sample_count": 20,
-            "justification": "fixed sample size, not power-derived",
-        }
-        broken_path = tmp_path / "fixed_declared_wrong_is_power_derived.json"
-        broken_path.write_text(json.dumps(base), encoding="utf-8")
-        exit_code, decision = validator.validate_assessment(str(broken_path))
-        assert exit_code == 2
-        assert decision["structural_valid"] is False
-
-
-class TestNewcombeWilsonRiskDifference:
-    def test_wilson_score_one_sided_zero_failure_lower_bound_is_zero(self):
-        lower, _ = validator._wilson_score_interval_one_sided(0, 20, 0.95)
-        assert lower == 0.0
-
-    def test_newcombe_risk_difference_identical_rates_upper_bound_is_positive(self):
-        point_estimate, ci_upper = validator.newcombe_risk_difference_one_sided_upper(
-            10, 20, 10, 20, 0.95
-        )
-        assert point_estimate == pytest.approx(0.0)
-        assert ci_upper > 0.0
-
-    def test_clopper_pearson_two_sided_label_matches_math(self):
-        # 0/20 two-sided 95% CP upper endpoint (alpha/2 tail) is ~16.84%,
-        # NOT the one-sided 95% upper bound (~13.91%). This is the P1
-        # sidedness finding from the OWNER adversarial review -- the
-        # existing clopper_pearson_interval() implementation is correct
-        # (it computes the two-sided interval), but its docstring/tests
-        # must not claim "one-sided".
-        _, two_sided_upper = validator.clopper_pearson_interval(0, 20, 0.95)
-        assert two_sided_upper == pytest.approx(0.1684334709830182, abs=1e-9)
-
-
-class TestMainCLI:
-    def test_main_writes_output_file_and_returns_exit_code(self, tmp_path):
-        output_path = tmp_path / "result.json"
-        exit_code = validator.main(
+def _make_assessment() -> dict:
+    records = []
+    cases = []
+    provenance = {arm: {} for arm in ("before", "after")}
+    metrics = {arm: {} for arm in ("before", "after")}
+    for arm, first_id in (("before", 1000), ("after", 2000)):
+        arm_records = [
+            {
+                "workflow_run_id": first_id + index,
+                "arm": arm,
+                "run_attempt": 1,
+                "conclusion": "failure" if index == 0 else "success",
+            }
+            for index in range(22)
+        ]
+        records.extend(arm_records)
+        # The official TestCase outcome is the sole Playwright source.
+        cases.extend(
             [
-                "--assessment",
-                _fixture_path("valid_workflow_failure_rate_non_inferior.json"),
-                "--output",
-                str(output_path),
+                {
+                    "test_id": f"{arm}-flaky",
+                    "workflow_run_id": first_id + 1,
+                    "arm": arm,
+                    "run_attempt": 1,
+                    "outcome": "flaky",
+                },
+                {
+                    "test_id": f"{arm}-unexpected",
+                    "workflow_run_id": first_id + 2,
+                    "arm": arm,
+                    "run_attempt": 1,
+                    "outcome": "unexpected",
+                },
             ]
         )
-        assert exit_code == 0
-        with open(output_path, encoding="utf-8") as handle:
-            result = json.load(handle)
-        assert result["schema"] == "CI_TEST_RELIABILITY_ASSESSMENT_V1_VALIDATION_RESULT"
-        assert result["semantic_valid"] is True
+        for metric in validator.METRICS:
+            observations = []
+            for record in arm_records:
+                related_cases = [case for case in cases if case["workflow_run_id"] == record["workflow_run_id"]]
+                observations.append(
+                    {
+                        "workflow_run_id": record["workflow_run_id"],
+                        "arm": arm,
+                        "run_attempt": 1,
+                        "classification": validator._canonical_classification(metric, record, related_cases),
+                    }
+                )
+            provenance[arm][metric] = {"design_id": validator.POWER_DESIGN_ID, "observations": observations}
+            numerator = sum(item["classification"] in ("failure", "affected") for item in observations)
+            metrics[arm][metric] = _rate(numerator, len(observations))
+    required = validator.enumerate_static_power_design()["required_sample_count_per_arm"]
+    before = metrics["before"]["workflow_failure_rate"]
+    after = metrics["after"]["workflow_failure_rate"]
+    before_ci = validator.clopper_pearson_interval(before["numerator"], before["denominator"], 0.95)
+    after_ci = validator.clopper_pearson_interval(after["numerator"], after["denominator"], 0.95)
+    outcome = validator.evaluate_non_inferiority(before, after, required)
+    return {
+        "schema": "CI_TEST_RELIABILITY_ASSESSMENT_V1",
+        "schema_version": 1,
+        "issue_number": 2432,
+        "pr_number": None,
+        "measured_at": "2026-08-31T00:00:00Z",
+        "target_metric": "workflow_failure_rate",
+        "reliability_metrics": metrics,
+        "sample_identity": {"key": "workflow_run_id", "required_run_attempt": 1},
+        "confidence_level": 0.95,
+        "non_inferiority_margin": 0.2,
+        "sample_count_rule": {"design_id": validator.POWER_DESIGN_ID, "required_sample_count_per_arm": required},
+        "non_inferiority_evaluation": {
+            "metric": "workflow_failure_rate",
+            "effect_measure": "risk_difference",
+            "method": "newcombe_wilson_hybrid_mover_v1",
+            "sidedness": "one_sided",
+            "before": {
+                "numerator": before["numerator"],
+                "denominator": before["denominator"],
+                "ci_lower": before_ci[0],
+                "ci_upper": before_ci[1],
+            },
+            "after": {
+                "numerator": after["numerator"],
+                "denominator": after["denominator"],
+                "ci_lower": after_ci[0],
+                "ci_upper": after_ci[1],
+            },
+            "risk_difference": {
+                "method": "newcombe_wilson_hybrid_mover_v1",
+                "point_estimate": outcome["point_estimate"],
+                "ci_upper": outcome["ci_upper"],
+            },
+            "outcome": outcome["outcome"],
+        },
+        "workflow_records": records,
+        "playwright_test_cases": cases,
+        "sample_provenance": provenance,
+        # Deliberately contradicting retry history: it remains audit-only.
+        "raw_attempts": [
+            {
+                "workflow_run_id": 1001,
+                "run_attempt": 1,
+                "test_id": "before-flaky",
+                "attempt_number": 1,
+                "status": "passed",
+            }
+        ],
+    }
 
-    def test_main_file_not_found_returns_operational_failure(self, tmp_path):
-        output_path = tmp_path / "result.json"
-        exit_code = validator.main(
-            [
-                "--assessment",
-                str(tmp_path / "does_not_exist.json"),
-                "--output",
-                str(output_path),
-            ]
-        )
-        assert exit_code == 3
+
+def _validate_document(document: dict, tmp_path) -> tuple[int, dict]:
+    path = tmp_path / "assessment.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return validator.validate_assessment(str(path))
+
+
+def test_static_power_designs_all_metrics(tmp_path):
+    document = _make_assessment()
+    exit_code, decision = _validate_document(document, tmp_path)
+    assert exit_code == 0
+    assert decision["semantic_valid"] is True
+    assert validator.POWER_DESIGNS == {
+        validator.POWER_DESIGN_ID: {
+            "alpha": 0.05,
+            "target_power": 0.80,
+            "margin": 0.20,
+            "assumed_before_rate": 0.05,
+            "assumed_after_rate": 0.05,
+            "allocation": "equal_1_to_1",
+            "sample_count": "per_arm",
+            "maximum_runs_per_arm": 100,
+            "over_budget": "design_infeasible",
+        }
+    }
+    for arm in ("before", "after"):
+        for metric in validator.METRICS:
+            assert document["sample_provenance"][arm][metric]["design_id"] == validator.POWER_DESIGN_ID
+
+
+@pytest.mark.parametrize(
+    "mutator, structural",
+    [
+        (lambda item: item["sample_count_rule"].update({"design_id": "post_hoc_design"}), True),
+        (lambda item: item["sample_count_rule"].update({"required_sample_count": 22}), True),
+        (lambda item: item["sample_count_rule"].update({"allocation": "unequal_2_to_1"}), True),
+        (lambda item: item["non_inferiority_evaluation"].update({"method": "farrington_manning"}), True),
+        (lambda item: item["sample_count_rule"].update({"required_sample_count_per_arm": 21}), False),
+    ],
+)
+def test_power_contract_rejections(mutator, structural, tmp_path):
+    document = _make_assessment()
+    mutator(document)
+    exit_code, decision = _validate_document(document, tmp_path)
+    assert exit_code == 2
+    if structural:
+        assert decision["structural_valid"] is False
+    else:
+        assert "required_sample_count_per_arm_mismatch" in decision["errors"]
+
+
+def test_exact_enumeration_algorithm():
+    # n is enumerated incrementally: n=21 dips below n=20, so binary search
+    # would be unjustified; the first >= 0.80 is n=22.
+    assert validator.binomial_pmf(3, 0, 0.0) == 1.0
+    assert validator.binomial_pmf(3, 3, 1.0) == 1.0
+    assert validator.binomial_pmf(3, 4, 0.5) == 0.0
+    assert validator.exact_power_for_n(20) == pytest.approx(0.790213011479415, abs=1e-12)
+    assert validator.exact_power_for_n(21) == pytest.approx(0.7787023565542808, abs=1e-12)
+    result = validator.enumerate_static_power_design()
+    assert result["status"] == "ok"
+    assert result["required_sample_count_per_arm"] == 22
+    assert result["power"] == pytest.approx(0.8454900944198372, abs=1e-12)
+
+
+def test_exact_enumeration_golden_vectors_and_newcombe_boundary():
+    point, upper = validator.newcombe_risk_difference_one_sided_upper(0, 22, 0, 22, 0.95)
+    assert point == 0.0
+    assert upper > 0.0
+    assert validator._is_rejected_pair(0, 0, 22, validator.POWER_DESIGNS[validator.POWER_DESIGN_ID]) is True
+    lower, upper_cp = validator.clopper_pearson_interval(0, 20, 0.95)
+    assert lower == 0.0
+    assert upper_cp == pytest.approx(0.1684334709830182, abs=1e-9)
+    lower, upper_cp = validator.clopper_pearson_interval(20, 20, 0.95)
+    assert upper_cp == 1.0
+    assert lower == pytest.approx(0.8315665290169818, abs=1e-9)
+
+
+@pytest.mark.parametrize(
+    "mutator, code",
+    [
+        (
+            lambda item: item["playwright_test_cases"].append(
+                {"test_id": "orphan", "workflow_run_id": 9999, "arm": "before", "run_attempt": 1, "outcome": "flaky"}
+            ),
+            "orphan_playwright_workflow_run_id",
+        ),
+        (
+            lambda item: item["sample_provenance"]["before"]["workflow_failure_rate"]["observations"].__setitem__(
+                0, {"workflow_run_id": 1000, "arm": "after", "run_attempt": 1, "classification": "failure"}
+            ),
+            "mismatched_arm_provenance",
+        ),
+        (
+            lambda item: item["sample_provenance"]["before"]["workflow_failure_rate"]["observations"].append(
+                copy.deepcopy(item["sample_provenance"]["before"]["workflow_failure_rate"]["observations"][0])
+            ),
+            "duplicate_workflow_run_id",
+        ),
+        (
+            lambda item: item["workflow_records"].append(
+                {"workflow_run_id": 1000, "arm": "after", "run_attempt": 1, "conclusion": "success"}
+            ),
+            "cross_arm_same_workflow_run_id",
+        ),
+        (
+            lambda item: item["sample_provenance"]["before"]["workflow_failure_rate"]["observations"].__setitem__(
+                0, {"workflow_run_id": 1000, "arm": "before", "run_attempt": 2, "classification": "failure"}
+            ),
+            "non_attempt_1_sample",
+        ),
+    ],
+)
+def test_sample_provenance_rejections(mutator, code, tmp_path):
+    document = _make_assessment()
+    mutator(document)
+    exit_code, decision = _validate_document(document, tmp_path)
+    assert exit_code == 2
+    assert any(code in error for error in decision["errors"])
+
+
+def test_legacy_logical_test_denominator_false_green(tmp_path):
+    document = _make_assessment()
+    # Many tests in one workflow run are not statistical observations.
+    document["playwright_test_cases"].extend(
+        [
+            {
+                "test_id": f"many-{number}",
+                "workflow_run_id": 1001,
+                "arm": "before",
+                "run_attempt": 1,
+                "outcome": "expected",
+            }
+            for number in range(100)
+        ]
+    )
+    exit_code, decision = _validate_document(document, tmp_path)
+    assert exit_code == 0
+    assert decision["recomputed_reliability_metrics"]["before"]["playwright_flaky_test_rate"]["denominator"] == 22
+    document["reliability_metrics"]["before"]["playwright_flaky_test_rate"]["denominator"] = 122
+    exit_code, decision = _validate_document(document, tmp_path)
+    assert exit_code == 2
+    assert any("playwright_flaky_test_rate.denominator" in error for error in decision["errors"])
+
+
+def test_official_playwright_outcome_run_classification(tmp_path):
+    document = _make_assessment()
+    document["raw_attempts"].append(
+        {
+            "workflow_run_id": 1002,
+            "run_attempt": 1,
+            "test_id": "invented-retry",
+            "attempt_number": 99,
+            "status": "failed",
+        }
+    )
+    exit_code, decision = _validate_document(document, tmp_path)
+    assert exit_code == 0
+    assert decision["recomputed_reliability_metrics"]["before"]["playwright_flaky_test_rate"]["numerator"] == 1
+    document["playwright_test_cases"][0]["outcome"] = "expected"
+    exit_code, decision = _validate_document(document, tmp_path)
+    assert exit_code == 2
+    assert any("canonical_classification_mismatch" in error for error in decision["errors"])
+
+
+def test_independence_claim_is_not_evidence(tmp_path):
+    document = _make_assessment()
+    document["independence_claim"] = {"class": "independent", "evidence": True}
+    exit_code, decision = _validate_document(document, tmp_path)
+    assert exit_code == 2
+    assert decision["structural_valid"] is False
+
+
+def test_main_writes_result_and_fixture_is_valid(tmp_path):
+    fixture = os.path.join(FIXTURES_DIR, "valid_fixed_design_workflow_runs.json")
+    output = tmp_path / "result.json"
+    assert validator.main(["--assessment", fixture, "--output", str(output)]) == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["schema"] == "CI_TEST_RELIABILITY_ASSESSMENT_V1_VALIDATION_RESULT"
+    assert result["power_design"]["required_sample_count_per_arm"] == 22
