@@ -297,6 +297,10 @@ CODEBASE_INVESTIGATION_RESULT_V1:
   source_evidence_result: <SOURCE_EVIDENCE_ACQUISITION_RESULT_V1 | null> # schema: source_evidence_acquisition_result/v1（#2195）
 ```
 
+### `--json-schema` / agent-retrospective native result のシリアライズ
+
+呼び出し元が `--json-schema` を指定する場合、または agent-retrospective が native result を期待する場合、stdout は上記の既存 8 native fields だけからなる **単一の bare JSON object** にする。`CODEBASE_INVESTIGATION_RESULT_V1` の label/envelope、YAML、Markdown / code fence / prose、scalar / array、前後を含む追加 bytes を stdout に出力してはならない。この規則は人間向けの報告形式より優先する。
+
 ### source_evidence_result フィールド（dispositive な source claim の証跡取得失敗を分類する、#2195）
 
 dispositive source claim の evidence acquisition が failure を返した場合、本 SubAgent（producer）は `source_evidence_result` に単一の `SOURCE_EVIDENCE_ACQUISITION_RESULT_V1` envelope（schema: `source_evidence_acquisition_result/v1`）を格納する。定義は
