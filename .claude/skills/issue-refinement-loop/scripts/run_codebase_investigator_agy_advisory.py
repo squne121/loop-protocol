@@ -63,15 +63,22 @@ def _private_smoke_wrapper_env(
 
     The sole actual-wrapper smoke must exercise the canonical wrapper without
     letting its ``proposal_only`` workspace discover host OAuth, keyring, or
-    configuration paths. Only the test-owned fake's PATH is admitted; HOME
-    and every XDG config/cache/state root are fresh directories below the
+    configuration paths. Only the module-private fake ``AGY_BIN`` is admitted;
+    HOME and every XDG config/cache/state root are fresh directories below the
     controller-owned temporary directory.
     """
-    if test_wrapper_env_overlay is None or set(test_wrapper_env_overlay) != {"PATH"}:
-        raise ValueError("private smoke requires exactly the test-owned PATH overlay")
-    fake_path = test_wrapper_env_overlay["PATH"]
-    if not isinstance(fake_path, str) or not fake_path:
-        raise ValueError("private smoke PATH overlay must be non-empty")
+    if test_wrapper_env_overlay is None or set(test_wrapper_env_overlay) != {"AGY_BIN"}:
+        raise ValueError("private smoke requires exactly the test-owned AGY_BIN overlay")
+    fake_agy_bin = test_wrapper_env_overlay["AGY_BIN"]
+    if not isinstance(fake_agy_bin, str) or not fake_agy_bin:
+        raise ValueError("private smoke AGY_BIN overlay must be non-empty")
+    fake_path = Path(fake_agy_bin)
+    try:
+        fake_mode = fake_path.stat().st_mode
+    except OSError as exc:
+        raise ValueError("private smoke AGY_BIN must be an existing regular file") from exc
+    if not fake_path.is_absolute() or not stat.S_ISREG(fake_mode):
+        raise ValueError("private smoke AGY_BIN must be an absolute regular file")
 
     private_home = private_dir / "private-smoke-home"
     xdg_config = private_dir / "private-smoke-xdg-config"
@@ -88,7 +95,7 @@ def _private_smoke_wrapper_env(
     }
     env.update(
         {
-            "PATH": fake_path,
+            "AGY_BIN": str(fake_path),
             "HOME": str(private_home),
             "XDG_CONFIG_HOME": str(xdg_config),
             "XDG_CACHE_HOME": str(xdg_cache),
@@ -238,14 +245,20 @@ def _prompt(*, purpose: str, root: Path, targets: list[Path], contexts: list[Pat
 
 
 def _read_private_result(path: Path, *, maximum_bytes: int) -> dict[str, Any]:
-    """Strictly read a controller-owned regular result file exactly once."""
+    """Read one controller-owned regular result inode without following links."""
+    descriptor: int | None = None
     try:
-        if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise ProtocolError("private result path is not a regular file")
-        with path.open("rb") as handle:
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
             payload = handle.read(maximum_bytes + 1)
     except OSError as exc:
         raise ProtocolError("private result file is unreadable") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if len(payload) > maximum_bytes:
         raise ProtocolError("wrapper output exceeds byte limit")
     return strict_json_object_bytes(payload)
@@ -382,9 +395,7 @@ def _run_fixed_proposal_only_actual_wrapper_smoke(*, root: Path, fake_agy_bin: s
             }
         ),
         root=root,
-        test_wrapper_env_overlay={
-            "PATH": f"{Path(fake_agy_bin).parent}{os.pathsep}{os.environ.get('PATH', '')}",
-        },
+        test_wrapper_env_overlay={"AGY_BIN": fake_agy_bin},
         _test_profile="proposal_only",
     )
 

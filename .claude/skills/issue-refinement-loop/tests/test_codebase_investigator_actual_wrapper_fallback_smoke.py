@@ -321,7 +321,8 @@ use a mutation tool.
     assert fake_evidence.is_file()
     fake_invocation = json.loads(fake_evidence.read_text(encoding="utf-8"))
     assert "-p" in fake_invocation["argv"]
-    assert fake_invocation["agy_bin"] is None
+    assert fake_invocation["agy_bin"] == str(fake)
+    assert fake_invocation["agy_bin"] != "/ambient/must-not-be-used"
     assert any(str(driver) in command for command in bash_commands), (
         "real codebase-investigator did not invoke the test-only controller driver"
     )

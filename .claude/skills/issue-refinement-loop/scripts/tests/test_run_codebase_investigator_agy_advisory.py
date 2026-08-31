@@ -140,22 +140,23 @@ def test_private_proposal_only_smoke_uses_sterile_wrapper_environment(
         monkeypatch.setenv(key, value)
     calls = _install_subprocess_fake(monkeypatch, result=_wrapper_result())
 
+    private_fake = tmp_path / "private-agy"
+    private_fake.write_text("#!/bin/sh\n", encoding="utf-8")
     run = controller._run_controller(
         _request(),
         root=tmp_path,
-        test_wrapper_env_overlay={"PATH": "/test-owned-fake-bin:/usr/bin"},
+        test_wrapper_env_overlay={"AGY_BIN": str(private_fake)},
         _test_profile="proposal_only",
     )
 
     assert run.decision["status"] == "ok"
     wrapper_env = calls[1][1]["env"]
-    assert wrapper_env["PATH"] == "/test-owned-fake-bin:/usr/bin"
+    assert wrapper_env["AGY_BIN"] == str(private_fake)
     assert Path(wrapper_env["HOME"]).name == "private-smoke-home"
     assert Path(wrapper_env["XDG_CONFIG_HOME"]).name == "private-smoke-xdg-config"
     assert Path(wrapper_env["XDG_CACHE_HOME"]).name == "private-smoke-xdg-cache"
     assert Path(wrapper_env["XDG_STATE_HOME"]).name == "private-smoke-xdg-state"
     for key in {
-        "AGY_BIN",
         "XDG_RUNTIME_DIR",
         "DBUS_SESSION_BUS_ADDRESS",
         "GOOGLE_APPLICATION_CREDENTIALS",
@@ -165,6 +166,7 @@ def test_private_proposal_only_smoke_uses_sterile_wrapper_environment(
     assert not set(host_environment.values()).intersection(wrapper_env.values())
     assert set(wrapper_env) <= {
         "PATH",
+        "AGY_BIN",
         "LANG",
         "LC_ALL",
         "TERM",
@@ -300,13 +302,45 @@ def test_success_sidecar_is_exact_narrow_projection() -> None:
     ("ingress", "expected"),
     [
         ({"agy_investigation_requirement": "advisory"}, "advisory"),
+        ({"agy_investigation_requirement": "explicitly_required"}, "explicitly_required"),
         ({"agy_advisory_native_fallback_allowed": True}, "advisory"),
         ({"agy_advisory_native_fallback_allowed": False}, "explicitly_required"),
         ({}, "explicitly_required"),
     ],
 )
-def test_legacy_ingress_maps_only_the_four_valid_unambiguous_cases(ingress: dict[str, object], expected: str) -> None:
+def test_legacy_ingress_maps_only_the_five_valid_unambiguous_cases(ingress: dict[str, object], expected: str) -> None:
     assert controller._adapt_legacy_investigation_requirement(ingress) == expected
+
+
+def test_private_smoke_environment_uses_only_the_module_private_fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = tmp_path / "fake-agy"
+    fake.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("AGY_BIN", "/ambient/must-not-be-used")
+
+    environment = controller._private_smoke_wrapper_env(tmp_path, {"AGY_BIN": str(fake)})
+
+    assert environment["AGY_BIN"] == str(fake)
+    assert environment["AGY_BIN"] != "/ambient/must-not-be-used"
+    with pytest.raises(ValueError, match="AGY_BIN overlay"):
+        controller._private_smoke_wrapper_env(tmp_path, {"PATH": str(tmp_path)})
+
+
+def test_private_result_read_uses_a_no_follow_file_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = tmp_path / "result.json"
+    result.write_text("{}", encoding="utf-8")
+    native_open = controller.os.open
+    observed_flags: list[int] = []
+
+    def capture_open(path: str | Path, flags: int, mode: int = 0o777) -> int:
+        observed_flags.append(flags)
+        return native_open(path, flags, mode)
+
+    monkeypatch.setattr(controller.os, "open", capture_open)
+
+    assert controller._read_private_result(result, maximum_bytes=64) == {}
+    assert observed_flags == [controller.os.O_RDONLY | controller.os.O_NOFOLLOW]
 
 
 @pytest.mark.parametrize(
