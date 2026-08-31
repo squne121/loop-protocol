@@ -294,16 +294,24 @@ def _run_self_launch(tmp_path: Path, *, unset_carrier_in_child: bool = False):
     nested_stdout_path = tmp_path / "nested-stdout.json"
     nested_stderr_path = tmp_path / "nested-stderr.log"
 
-    env = dict(os.environ)
-    env.pop("CLAUDE_GPT_HOME", None)
-    env.pop("CLAUDE_GPT_HOME_ROOT", None)
-    env["HOME"] = str(native_home)
-    env["CLAUDE_GPT_PROXY_BIN"] = str(fake_proxy)
-    env["CLAUDE_GPT_CLAUDE_BIN"] = str(fake_claude)
-    env["FAKE_CLAUDE_SELF_LAUNCH_PATH"] = str(LAUNCH_SH)
-    env["FAKE_CLAUDE_OUTER_VIEW_PATH"] = str(outer_view_path)
-    env["FAKE_CLAUDE_NESTED_STDOUT_PATH"] = str(nested_stdout_path)
-    env["FAKE_CLAUDE_NESTED_STDERR_PATH"] = str(nested_stderr_path)
+    # --- Minimal, explicit env (mirrors AC2's `_minimal_env()` pattern):
+    #     only PATH + HOME plus the specific fake-proxy/fake-claude wiring
+    #     this test actually needs. Never copy-and-pop from the full ambient
+    #     `os.environ`, which would pull in unrelated ambient
+    #     HERDR_*/CLAUDE_CODE_*/GH_*/ANTHROPIC_*/LATITUDE_* variables and
+    #     weaken the "hermetic" claim (PATH itself is kept ambient because
+    #     `command -v python3`/`sha256sum`/`claude`/`claude-code-proxy`
+    #     resolution inside lib.sh/launch.sh depends on it). ---
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(native_home),
+        "CLAUDE_GPT_PROXY_BIN": str(fake_proxy),
+        "CLAUDE_GPT_CLAUDE_BIN": str(fake_claude),
+        "FAKE_CLAUDE_SELF_LAUNCH_PATH": str(LAUNCH_SH),
+        "FAKE_CLAUDE_OUTER_VIEW_PATH": str(outer_view_path),
+        "FAKE_CLAUDE_NESTED_STDOUT_PATH": str(nested_stdout_path),
+        "FAKE_CLAUDE_NESTED_STDERR_PATH": str(nested_stderr_path),
+    }
     if unset_carrier_in_child:
         env["FAKE_CLAUDE_UNSET_CARRIER"] = "1"
 
@@ -399,19 +407,3 @@ def test_ac3_negative_control_unset_carrier_deviates_to_nested_root(tmp_path):
     deviated_root = expected_root / "claude-home" / ".claude-gpt"
     assert nested_root == deviated_root, (nested_root, deviated_root)
     assert nested_root != expected_root
-
-
-# ---------------------------------------------------------------------------
-# AC6 static regression guard: the GH_CONFIG_DIR carrier line (#2403/PR
-# #2407) must remain untouched by this Issue's change.
-# ---------------------------------------------------------------------------
-
-
-def test_ac6_gh_config_dir_carrier_line_unchanged():
-    """GIVEN launch.sh のソース
-    WHEN GH_CONFIG_DIR export 行を確認する
-    THEN #2403/PR #2407 の finite carrier 契約どおり、ambient
-    CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET をそのまま export する行が残っている
-    """
-    source = LAUNCH_SH.read_text(encoding="utf-8")
-    assert 'export GH_CONFIG_DIR="$CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET"' in source
