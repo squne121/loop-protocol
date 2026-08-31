@@ -127,7 +127,33 @@ _ISOLATION_ENV_KEYS_TO_STRIP = (
 
 def _redact(text: str) -> str:
     text = _ANSI_ESCAPE_RE.sub("", text)
-    return _SECRET_LIKE_RE.sub("<redacted>", text)
+
+    def _replacement(match: re.Match[str]) -> str:
+        value = match.group(0)
+        # Tested-head and digest fields are fixed-length public Git/SHA-256
+        # evidence, not secret-like tokens. Keep their machine-verifiable
+        # values while still redacting every other long token.
+        if len(value) in {40, 64} and re.fullmatch(r"[0-9a-fA-F]+", value):
+            return value
+        return "<redacted>"
+
+    return _SECRET_LIKE_RE.sub(_replacement, text)
+
+
+def _redact_evidence_value(value: object) -> object:
+    """Recursively redact every persisted evidence value, not just errors."""
+    if isinstance(value, str):
+        return _redact(value)
+    if isinstance(value, list):
+        return [_redact_evidence_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_evidence_value(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            _redact(key) if isinstance(key, str) else key: _redact_evidence_value(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _bounded_redacted_lines(raw: str, max_lines: int) -> list[str]:
@@ -4705,9 +4731,10 @@ def run_interactive_herdr_isolated(
 
 def write_evidence(output_dir: Path, *, schema_summary: dict) -> None:
     output_dir.mkdir(parents=True, exist_ok=False)
+    redacted_schema_summary = _redact_evidence_value(schema_summary)
     summary_lines = ["# Runtime Smoke Summary", ""]
-    for key in sorted(schema_summary.keys()):
-        summary_lines.append(f"- {key}: {schema_summary[key]}")
+    for key in sorted(redacted_schema_summary.keys()):
+        summary_lines.append(f"- {key}: {redacted_schema_summary[key]}")
     (output_dir / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
 
@@ -6051,7 +6078,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.evidence_json:
         try:
             Path(args.evidence_json).write_text(
-                json.dumps(schema_summary, indent=2, sort_keys=True, default=str) + "\n",
+                json.dumps(_redact_evidence_value(schema_summary), indent=2, sort_keys=True, default=str) + "\n",
                 encoding="utf-8",
             )
         except OSError as exc:

@@ -1771,6 +1771,27 @@ exit 1
     assert "<redacted>" in summary_text
 
 
+def test_given_home_paths_in_nested_schema_fields_when_evidence_written_then_redacted(tmp_path):
+    module = _load_module()
+    output_dir = tmp_path / "out"
+
+    module.write_evidence(
+        output_dir,
+        schema_summary={
+            "resolved_executable": "/home/someone/.local/bin/claude",
+            "subagent_causal_evidence": {
+                "agent_transcript_path": "/home/someone/.claude/projects/project/agent.jsonl",
+            },
+            "worktree": ".claude/worktrees/issue-2437-fixture",
+        },
+    )
+
+    summary_text = (output_dir / "summary.md").read_text(encoding="utf-8")
+    assert "/home/someone" not in summary_text
+    assert "<redacted>" in summary_text
+    assert ".claude/worktrees/issue-2437-fixture" in summary_text
+
+
 def test_given_ansi_escape_codes_in_error_output_when_evidence_written_then_stripped(
     repo_with_worktree, tmp_path
 ):
