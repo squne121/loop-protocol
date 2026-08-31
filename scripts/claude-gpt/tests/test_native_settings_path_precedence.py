@@ -555,7 +555,10 @@ def test_ac4_self_launch_preserves_outer_native_settings_path_identity(tmp_path)
         "ac": "AC4",
         "issue": 2448,
         "timestamp": generated_at,
-        "environment": "pytest tmp_path fake proxy + fake claude self-launch fixture (hermetic, no live network/credential)",
+        "environment": (
+            "pytest tmp_path fake proxy + fake claude self-launch fixture "
+            "(hermetic, no live network/credential)"
+        ),
         "exit_code": result.returncode,
         "stdout_tail": result.stdout[-2000:],
         "stderr_tail": result.stderr[-2000:],
@@ -635,7 +638,10 @@ def test_ac4_negative_control_unset_carrier_deviates_to_isolated_config_dir(tmp_
             "ac": "AC4-negative-control",
             "issue": 2448,
             "timestamp": generated_at,
-            "environment": "pytest tmp_path fake proxy + fake claude self-launch fixture (hermetic, no live network/credential)",
+            "environment": (
+                "pytest tmp_path fake proxy + fake claude self-launch fixture "
+                "(hermetic, no live network/credential)"
+            ),
             "exit_code": result.returncode,
             "nested_native_settings_path": nested_native_settings_path,
             "expected_native_settings_path_never_matched": expected_native_settings_path,
