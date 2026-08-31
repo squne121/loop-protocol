@@ -1202,7 +1202,18 @@ _DERIVED_SCALAR_FIELD_VALIDATORS: dict[str, re.Pattern] = {
 # sufficient. `text` is the raw source bytes (used to compute
 # `source_text_sha256` and cross-check `candidate_sha256`), not part of the
 # emitted provenance object itself.
-_SOURCE_SPAN_AUTHORITY_KINDS = frozenset({"parent_issue", "owner_anchor", "design_reference"})
+# Issue #2431: `current_issue` is an additive extension -- a same-body,
+# closed-heading-alias-only authority kind used ONLY when the source span's
+# text lives in the SAME Issue body being repaired (never a different Issue
+# or comment). The caller (`run_refinement_preflight.py`'s
+# `_STRUCTURAL_HEADING_ALIAS_TABLE` assembler) is solely responsible for only
+# ever emitting a `current_issue` span when every one of the narrow
+# preconditions in that assembler's docstring hold; this module's own
+# provenance validation (`_validate_source_span_provenance`) applies the SAME
+# generic required-field/enum checks to it as to the other 3 kinds.
+_SOURCE_SPAN_AUTHORITY_KINDS = frozenset(
+    {"parent_issue", "owner_anchor", "design_reference", "current_issue"}
+)
 _SOURCE_SPAN_OBJECT_KINDS = frozenset({"issue_body", "issue_comment", "git_blob"})
 _SOURCE_SPAN_REQUIRED_FIELDS = (
     "authority_kind", "source_repo", "source_object_kind", "source_object_id",
