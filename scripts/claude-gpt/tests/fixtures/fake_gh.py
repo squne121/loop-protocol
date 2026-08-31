@@ -68,12 +68,33 @@ claude-gpt/tests/fixtures/fake_gh.py`, never merged to main) and adapted for
 the native (non-bridge) live scenario harness (Issue #2299), then extended
 for Issue #2306.
 
-Issue #2433 additionally accepts only the fixed Issue REST API shapes emitted by
-`controlled_skill_mutation_exec.py::issue_content.update`: GET with its fixed
-`--jq` projection and exactly one title/body PATCH with `--input`. The fixture
-persists `updatedAt` and a normalized API trace so the launcher smoke can prove
-pre-read, one PATCH, and authoritative post-readback without becoming a generic
-`gh api` fake.
+Issue #2330 additionally teaches this fixture the exact `gh` CLI shapes the
+production consumer `.claude/skills/issue-refinement-loop/scripts/
+root_entry_router.py` actually issues (a compatibility gap PR #2325's
+pr-reviewer flagged as non-blocking, later confirmed authoritative by an
+OWNER adversarial review):
+
+  - `gh repo view <owner>/<repo> --json nameWithOwner --jq .nameWithOwner`
+    -- a POSITIONAL repo argument directly after `view` (not `--repo
+    <repo>`), with a bare-string (`--jq`-filtered, not JSON-quoted) stdout
+    of the repo identity. The prior `--repo <repo>` flag form is still
+    accepted for backward compatibility.
+  - `gh api repos/<owner>/<repo>/git/refs/heads/<base_ref> --jq
+    .object.sha` -- `<base_ref>` is the full suffix after
+    `/git/refs/heads/` (which may itself contain `/`, e.g. `release/next`,
+    not just `main`), and the fixture prints a deterministic 40-hex fake
+    SHA as a bare string (no JSON quoting), derived from the repo path +
+    ref so different refs/repos produce stable-but-distinct fake SHAs.
+    Only this exact `--jq .object.sha` argv shape is understood -- this is
+    not a generic REST router or jq evaluator (Out of Scope, Issue #2330).
+
+PR #2377 OWNER REQUEST_CHANGES fix_delta (P1-1): both shapes above are now
+EXACT-argv contracts, not containment/substring checks -- an argv with an
+extra trailing token (e.g. a stray `--method DELETE`), an empty `base_ref`,
+a missing `owner/repo` structure, an unexpected path segment before the
+`/git/refs/heads/` marker, or a wrong/extra `--jq` selector on the `repo
+view` shape now fails closed (non-zero exit) instead of being silently
+accepted as a near-miss success.
 """
 
 from __future__ import annotations
@@ -89,8 +110,6 @@ import sys
 # endpoint shape -- requires a non-empty `owner/repo` pair and a non-empty
 # `base_ref` suffix (which may itself contain further `/`).
 _REF_SHA_ENDPOINT_RE = re.compile(r"^(repos/[^/]+/[^/]+)/git/refs/heads/(.+)$")
-_ISSUE_ENDPOINT_RE = re.compile(r"^repos/([^/]+)/([^/]+)/issues/(\d+)$")
-_ISSUE_CONTENT_GET_JQ = '{title, body, updatedAt: .updated_at, isPullRequest: has("pull_request")}'
 
 
 def _load(state_path: str) -> dict:
@@ -162,24 +181,6 @@ def _resolve_body(args):
     return None
 
 
-def _issue_api_target(args: list[str], *, endpoint_index: int) -> tuple[str, str, str] | None:
-    """Return the exact fixed Issue API target or reject the argv shape."""
-    if len(args) <= endpoint_index or args[:3] != ["api", "--hostname", "github.com"]:
-        return None
-    match = _ISSUE_ENDPOINT_RE.fullmatch(args[endpoint_index])
-    if not match:
-        return None
-    owner, name, number = match.groups()
-    return f"{owner}/{name}", number, args[endpoint_index]
-
-
-def _issue_api_info(state: dict, repo: str, number: str) -> dict | None:
-    info = state.get("issues", {}).get(number)
-    if info is None or info.get("repo") != repo:
-        return None
-    return info
-
-
 def main() -> int:
     state_path = os.environ.get("FAKE_GH_STATE")
     if not state_path:
@@ -236,75 +237,6 @@ def main() -> int:
         if "--json" in args and "nameWithOwner" in args:
             print(json.dumps(repo or "fake/repo"))
         return 0
-
-    # Issue #2433: only the exact content GET emitted by the controlled
-    # transaction is accepted. This must precede the generic controlled-read
-    # probe below; near-miss API argv never falls through to a success path.
-    if (
-        len(args) == 6
-        and _issue_api_target(args, endpoint_index=3) is not None
-        and args[4:] == ["--jq", _ISSUE_CONTENT_GET_JQ]
-    ):
-        repo, number, _endpoint = _issue_api_target(args, endpoint_index=3)  # type: ignore[misc]
-        info = _issue_api_info(state, repo, number)
-        if info is None:
-            print(f"no issue found for number {number}", file=sys.stderr)
-            return 1
-        _record_call(state, "issue_content_get", repo, ["api", "issue_content_get"], number=number)
-        _save(state_path, state)
-        print(
-            json.dumps(
-                {
-                    "title": info.get("title"),
-                    "body": info.get("body", ""),
-                    "updatedAt": info.get("updatedAt", "2026-08-30T00:00:00Z"),
-                    "isPullRequest": False,
-                }
-            )
-        )
-        return 0
-
-    # Issue #2433: the title/body PATCH has a fixed eight-token argv contract.
-    # No alternative API method, endpoint, field, stdin, or extra argument is
-    # supported by this test fixture.
-    if (
-        len(args) == 8
-        and _issue_api_target(args, endpoint_index=5) is not None
-        and args[3:5] == ["--method", "PATCH"]
-        and args[6] == "--input"
-    ):
-        repo, number, _endpoint = _issue_api_target(args, endpoint_index=5)  # type: ignore[misc]
-        info = _issue_api_info(state, repo, number)
-        input_path = args[7]
-        if info is None or not input_path:
-            print("fake gh: issue content PATCH target/input invalid", file=sys.stderr)
-            return 1
-        try:
-            with open(input_path, encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            print("fake gh: issue content PATCH input invalid", file=sys.stderr)
-            return 1
-        if set(payload) != {"title", "body"} or not all(isinstance(payload[key], str) for key in payload):
-            print("fake gh: issue content PATCH payload invalid", file=sys.stderr)
-            return 1
-        _record_call(state, "issue_content_patch", repo, ["api", "issue_content_patch"], number=number)
-        state["issue_content_patch_count"] = state.get("issue_content_patch_count", 0) + 1
-        if os.environ.get("FAKE_GH_ISSUE_CONTENT_PATCH_NOOP") != "1":
-            info["title"] = payload["title"]
-            info["body"] = payload["body"]
-            info["updatedAt"] = "2026-08-30T00:00:01Z"
-        _save(state_path, state)
-        print(json.dumps({"ok": True}))
-        return 0
-
-    # A malformed Issue endpoint must not fall through to the unrelated
-    # controlled-read compatibility probe below.
-    if args[:3] == ["api", "--hostname", "github.com"] and any(
-        _ISSUE_ENDPOINT_RE.fullmatch(value) for value in args
-    ):
-        print("unsupported fake gh Issue API argv", file=sys.stderr)
-        return 1
 
     if args[:2] == ["issue", "comment"]:
         number = args[2] if len(args) > 2 else None
@@ -386,7 +318,6 @@ def main() -> int:
             "url": info.get("url"),
             "body": info.get("body", ""),
             "state": info.get("state", "open"),
-            "updatedAt": info.get("updatedAt", "2026-08-30T00:00:00Z"),
             # Issue #2278 AC3: additionally surface `labels` (when present in
             # seeded/created state) so a live `gh issue view ... --json
             # title,body,labels,comments` reader (the `implement-issue` /

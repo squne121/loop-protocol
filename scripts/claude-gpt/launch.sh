@@ -1336,7 +1336,6 @@ elif [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "hook-sink-multi-turn" ]; then
 import hashlib
 import json
 import os
-import re
 import sys
 
 
@@ -1350,16 +1349,6 @@ def main() -> None:
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id")
     agent_id = payload.get("agent_id") or payload.get("subagent_id")
-    agent_type = payload.get("agent_type") or payload.get("subagent_type")
-    tool_input = payload.get("tool_input")
-    command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    canonical_issue_editor_txn = bool(
-        isinstance(command, str)
-        and re.fullmatch(
-            r"uv run --locked python3 \.claude/skills/edit-issue/scripts/edit_issue_txn\.py --input-file \S+",
-            command,
-        )
-    )
     nonce = os.environ.get("CLAUDE_GPT_HOOK_SINK_NONCE", "")
     sink_path = os.environ.get("CLAUDE_GPT_HOOK_SINK_PATH")
     prompt = payload.get("prompt") if event == "UserPromptSubmit" else None
@@ -1371,8 +1360,6 @@ def main() -> None:
         "event": event,
         "session_id": session_id,
         "agent_id": agent_id,
-        "agent_type": agent_type if isinstance(agent_type, str) else None,
-        "canonical_issue_editor_txn": canonical_issue_editor_txn,
         "ts": __import__("time").time(),
         "prompt_digest": digest,
     }
@@ -1393,12 +1380,8 @@ HOOK_SINK_WRITER_EOF
   # of) the gate's UserPromptSubmit/SubagentStart/SubagentStop entries
   # above; gate command runs first within each event's hook array.
   # Stop/StopFailure have no gate equivalent, so they get sink-only groups.
-  # The fixed observation writer records only sanitized booleans/digests. It
-  # never returns a permission decision and is enabled only for the explicit
-  # runtime-smoke mode.
   SINK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}'
   UPS_HOOK_GROUPS="${UPS_HOOK_GROUPS}, ${SINK_GROUP}"
-  PTU_HOOK_GROUPS="${PTU_HOOK_GROUPS}, ${SINK_GROUP}"
   # Issue #2426 AC1: append (never replace) so the launcher-owned Latitude
   # Stop hook group set as the default above stays wired even when this
   # runtime-smoke observation sink is also requested.
@@ -1470,14 +1453,10 @@ HOOKS_JSON_FRAGMENT=',
 #     transaction broker であり、この autoMode は project .claude/settings*.json
 #     ではなくこの launcher-owned --settings にのみ注入する） ---
 AUTO_MODE_JSON_FRAGMENT=$(claude_gpt_auto_mode_json_fragment)
-ISSUE_EDITOR_TXN_ALLOW_RULE_JSON=$(claude_gpt_json_escape "$CLAUDE_GPT_ISSUE_EDITOR_TXN_ALLOW_RULE")
 
 cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
 {
   "permissions": {
-    "allow": [
-      ${ISSUE_EDITOR_TXN_ALLOW_RULE_JSON}
-    ],
     "deny": [
       "Read(/${PROXY_CONFIG_DIR_TARGET}/**)",
       "Read(/${PROXY_STATE_DIR_TARGET}/**)",

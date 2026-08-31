@@ -167,7 +167,6 @@ def test_unknown_scenario_does_not_fall_back_to_default_smoke():
 def test_known_scenario_values_are_not_rejected_by_the_ac11_gate():
     source = RUNTIME_SMOKE_SH.read_text(encoding="utf-8")
     assert re.search(r"issue_create\)\s*:\s*;;", source)
-    assert re.search(r"issue_edit\)\s*ISSUE_EDIT_SCENARIO=true\s*;;", source)
     assert re.search(r"issue_to_impl\)\s*ISSUE_TO_IMPL_SCENARIO=true\s*;;", source)
 
 
