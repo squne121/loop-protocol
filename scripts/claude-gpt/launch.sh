@@ -1427,9 +1427,13 @@ HOOKS_JSON_FRAGMENT=',
   }'
 
 # --- Spark authorization sidecar directory deny (Issue #2186 P0 fix-delta,
-#     PR #2244 adversarial review, forgery finding) ---
+#     PR #2244 adversarial review, forgery finding; Issue #2440 migrated the
+#     legacy `Write(path)` rule below to canonical `Edit(path)` -- Claude
+#     Code's file permission check only matches `Edit(path)` for
+#     file-editing tools, so the old `Write(path)` deny was silently
+#     ineffective and only emitted a startup warning) ---
 #
-# `Read`/`Write`/`Edit` deny on SPARK_AUTH_DIR_TARGET is a best-effort
+# `Read`/`Edit` deny on SPARK_AUTH_DIR_TARGET is a best-effort
 # defense against main Claude's built-in tools directly forging or reading
 # the pending-authorization sidecar file. Like the existing
 # PROXY_CONFIG_DIR_TARGET/PROXY_STATE_DIR_TARGET/PROXY_HOME_TARGET denies
@@ -1458,7 +1462,6 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
       "Read(/${PROXY_STATE_DIR_TARGET}/**)",
       "Read(/${PROXY_HOME_TARGET}/**)",
       "Read(/${SPARK_AUTH_DIR_TARGET}/**)",
-      "Write(/${SPARK_AUTH_DIR_TARGET}/**)",
       "Edit(/${SPARK_AUTH_DIR_TARGET}/**)"
     ]
   },

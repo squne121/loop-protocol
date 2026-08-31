@@ -11,7 +11,20 @@
 # --- 定数（GPT 専用ディレクトリ分離。CLAUDE_CONFIG_DIR / CCP_CONFIG_DIR / XDG_STATE_HOME 相当） ---
 
 # CLAUDE_GPT_HOME を上書きしない限り $HOME/.claude-gpt を使う。
+#
+# Issue #2455: launcher が後段で `HOME` を child Claude 用の isolated HOME へ
+# 差し替える（launch.sh の `export HOME="$CLAUDE_ISOLATED_HOME_TARGET"`）ため、
+# ここで解決した canonical runtime root を明示的に `export` しておかないと、
+# child Claude セッションから同じ launcher/lib.sh を self-launch した際に
+# `CLAUDE_GPT_HOME` が未継承のまま isolated HOME を基準に再導出され、nested
+# `<isolated-claude-home>/.claude-gpt` root へ再基準化されてしまう
+# （Background/Outcome 節参照）。復元経路は launcher が child process
+# environment へ export するこの単一経路のみとし、生成済み settings 経由の
+# 別経路は追加しない（AC1）。`CLAUDE_GPT_HOME_ROOT`（Latitude telemetry 用の
+# derived mirror。Issue #2426）はこの root authority の fallback には使わない
+# （AC1/AC2 の回帰テスト対象）。
 : "${CLAUDE_GPT_HOME:=${HOME}/.claude-gpt}"
+export CLAUDE_GPT_HOME
 
 claude_gpt_claude_config_dir() {
   printf '%s/claude\n' "$CLAUDE_GPT_HOME"
