@@ -159,6 +159,13 @@ sys.stdout.write(allowlist.get("LATITUDE_PROJECT") or "")
 #      は行わない。
 #   2. 引数2（ambient `CLAUDE_CONFIG_DIR`）— Claude Code 公式の Native profile
 #      authority。非空なら `${CLAUDE_CONFIG_DIR}/settings.json` を採用する。
+#      `CLAUDE_CONFIG_DIR` が絶対パスならそのまま使う。相対パスの場合は
+#      PR #2466 OWNER review（issuecomment-5478243138 P1）が指摘したとおり、
+#      焼き込んだ carrier 文字列がその後の CWD 変化（self-launch を含む）で
+#      別の filesystem object を指してしまう exact-identity 破綻を防ぐため、
+#      この関数呼び出し時点の outer CWD（`$(pwd)`）を基準に一度だけ**lexical
+#      に**絶対化する（`realpath`/symlink 解決や existence 検証は行わない。
+#      `~` の展開もしない — 既存の絶対パス値の挙動を変えないため）。
 #   3. 引数3（`HOME`）を使った `${HOME}/.claude/settings.json` フォールバック
 #      （従来からの既定動作。#2426 の挙動を保つ）。
 #
@@ -168,7 +175,7 @@ sys.stdout.write(allowlist.get("LATITUDE_PROJECT") or "")
 # して渡す（この関数自体は環境変数を直接読まない）。
 #
 # 引数1: inherited `CLAUDE_GPT_NATIVE_SETTINGS_PATH`（空文字列可）
-# 引数2: ambient `CLAUDE_CONFIG_DIR`（空文字列可）
+# 引数2: ambient `CLAUDE_CONFIG_DIR`（空文字列可。絶対/相対いずれも可）
 # 引数3: `HOME`（非空を期待。isolated HOME 切替前の ambient 実 HOME）
 # 戻り値: resolve された Native settings.json への絶対パス（改行付き）
 claude_gpt_resolve_native_settings_path() {
@@ -180,7 +187,14 @@ claude_gpt_resolve_native_settings_path() {
     return 0
   fi
   if [ -n "$ambient_claude_config_dir" ]; then
-    printf '%s/settings.json\n' "$ambient_claude_config_dir"
+    case "$ambient_claude_config_dir" in
+      /*)
+        printf '%s/settings.json\n' "$ambient_claude_config_dir"
+        ;;
+      *)
+        printf '%s/%s/settings.json\n' "$(pwd)" "$ambient_claude_config_dir"
+        ;;
+    esac
     return 0
   fi
   printf '%s/.claude/settings.json\n' "$ambient_home"

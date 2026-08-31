@@ -429,6 +429,15 @@ if os.environ.get("FAKE_CLAUDE_UNSET_CARRIER") == "1":
     }
 nested_env.update({k: str(v) for k, v in settings_env.items()})
 
+# PR #2466 owner review (issuecomment-5478243138 P1): simulate the
+# self-launch child changing its CWD before re-deriving/carrying the Native
+# settings path, to prove a relative `CLAUDE_CONFIG_DIR` carrier is
+# absolutized at outer resolution time (and therefore survives this CWD
+# change), rather than being silently reinterpreted against the new CWD.
+_chdir_target = os.environ.get("FAKE_CLAUDE_CHDIR_BEFORE_SELF_LAUNCH")
+if _chdir_target:
+    os.chdir(_chdir_target)
+
 outer_view_path = os.environ.get("FAKE_CLAUDE_OUTER_VIEW_PATH")
 if outer_view_path:
     view = {
@@ -473,13 +482,29 @@ def _write_ac4_artifact(payload: dict) -> Path:
     return artifact
 
 
-def _run_self_launch(tmp_path: Path, *, unset_carrier_in_child: bool = False):
+def _run_self_launch(
+    tmp_path: Path,
+    *,
+    unset_carrier_in_child: bool = False,
+    outer_cwd: Path | None = None,
+    claude_config_dir: str | None = None,
+    chdir_before_self_launch: str | None = None,
+):
     """Run a real `launch.sh` normal-mode invocation whose `claude` child is
     the fake self-launching binary above. Never presets `CLAUDE_GPT_HOME`/
-    `CLAUDE_GPT_NATIVE_SETTINGS_PATH`/`CLAUDE_CONFIG_DIR` anywhere in the
-    outer environment (only `PATH` + `HOME`) -- the outer resolved path is
-    derived exactly the way a real ambient shell would derive it (Issue
-    #2448 AC5's normal-case fallback path)."""
+    `CLAUDE_GPT_NATIVE_SETTINGS_PATH` anywhere in the outer environment (only
+    `PATH` + `HOME`, plus optionally `CLAUDE_CONFIG_DIR`) -- the outer
+    resolved path is derived exactly the way a real ambient shell would
+    derive it (Issue #2448 AC5's normal-case fallback path, or the
+    `CLAUDE_CONFIG_DIR` precedence path when `claude_config_dir` is given).
+
+    `outer_cwd` overrides the CWD of the outer `launch.sh` invocation itself
+    (defaults to `SCRIPT_DIR`, as before) -- needed to make a relative
+    `claude_config_dir` resolve against a test-owned directory.
+    `chdir_before_self_launch`, if given, is forwarded to the fake
+    self-launching `claude` child so it changes its own CWD immediately
+    before re-launching `launch.sh --check-only` (PR #2466 owner review P1).
+    """
     native_home = tmp_path / "native-home"
     native_home.mkdir()
 
@@ -504,6 +529,10 @@ def _run_self_launch(tmp_path: Path, *, unset_carrier_in_child: bool = False):
     }
     if unset_carrier_in_child:
         env["FAKE_CLAUDE_UNSET_CARRIER"] = "1"
+    if claude_config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = claude_config_dir
+    if chdir_before_self_launch is not None:
+        env["FAKE_CLAUDE_CHDIR_BEFORE_SELF_LAUNCH"] = chdir_before_self_launch
 
     try:
         result = subprocess.run(
@@ -516,7 +545,7 @@ def _run_self_launch(tmp_path: Path, *, unset_carrier_in_child: bool = False):
                 "text",
                 "--no-session-persistence",
             ],
-            cwd=str(SCRIPT_DIR),
+            cwd=str(outer_cwd) if outer_cwd is not None else str(SCRIPT_DIR),
             env=env,
             capture_output=True,
             text=True,
@@ -650,3 +679,96 @@ def test_ac4_negative_control_unset_carrier_deviates_to_isolated_config_dir(tmp_
     )
 
     assert nested_native_settings_path != expected_native_settings_path
+
+
+def test_ac4_relative_claude_config_dir_absolutized_survives_self_launch_cwd_change(
+    tmp_path,
+):
+    """GIVEN outer 環境で相対パスの `CLAUDE_CONFIG_DIR`（例: ".claude-native"）が
+    与えられている（Issue #2448 PR #2466 owner review issuecomment-5478243138
+    P1 blocker: 相対のまま carrier へ焼き込むと、self-launch 境界を跨いだ CWD
+    変化でその文字列が別の filesystem object を指してしまい exact-identity
+    保証が壊れる）
+    WHEN 実 launch.sh を起動し、fake claude self-launch 子プロセスが self-launch
+    直前に別ディレクトリへ CWD を変更してから同じ launch.sh --check-only を
+    self-launch する
+    THEN outer が解決した `CLAUDE_GPT_NATIVE_SETTINGS_PATH` は絶対パスであり、
+    nested の inherited carrier も CWD 変化にかかわらず同一の
+    settings.json ファイルを指し続ける（CWD-relative な誤再解釈が起きない）
+    """
+    generated_at = datetime.now(timezone.utc).isoformat()
+    outer_cwd = tmp_path / "outer-cwd"
+    outer_cwd.mkdir()
+    relative_config_dir = ".claude-native"
+    native_profile = outer_cwd / relative_config_dir
+    native_profile.mkdir()
+    (native_profile / "settings.json").write_text(
+        json.dumps({"env": {"LATITUDE_PROJECT": "relative-config-dir-project"}}),
+        encoding="utf-8",
+    )
+    different_cwd = tmp_path / "different-cwd-for-self-launch-child"
+    different_cwd.mkdir()
+
+    (
+        result,
+        native_home,
+        outer_view_path,
+        nested_stdout_path,
+        nested_stderr_path,
+    ) = _run_self_launch(
+        tmp_path,
+        outer_cwd=outer_cwd,
+        claude_config_dir=relative_config_dir,
+        chdir_before_self_launch=str(different_cwd),
+    )
+
+    artifact_payload = {
+        "ac": "AC4-relative-config-dir-absolutization",
+        "issue": 2448,
+        "timestamp": generated_at,
+        "environment": (
+            "pytest tmp_path fake proxy + fake claude self-launch fixture "
+            "(hermetic, no live network/credential)"
+        ),
+        "exit_code": result.returncode,
+        "stdout_tail": result.stdout[-2000:],
+        "stderr_tail": result.stderr[-2000:],
+    }
+
+    assert result.returncode == 0, result.stdout + "\n---stderr---\n" + result.stderr
+
+    expected_native_settings_path = str(native_profile / "settings.json")
+
+    assert outer_view_path.exists(), "fake claude was never invoked as the main process"
+    outer_view = json.loads(outer_view_path.read_text(encoding="utf-8"))
+    artifact_payload["outer_view"] = outer_view
+    carrier = outer_view["carrier_from_settings_env"]
+    assert carrier == expected_native_settings_path
+    assert carrier.startswith("/"), "resolved relative CLAUDE_CONFIG_DIR must be absolutized"
+
+    assert nested_stdout_path.exists(), (
+        "nested launch.sh --check-only produced no stdout: "
+        + nested_stderr_path.read_text(encoding="utf-8")
+    )
+    nested_payload = json.loads(nested_stdout_path.read_text(encoding="utf-8"))
+    artifact_payload["nested_check_only_result"] = {
+        "schema": nested_payload.get("schema"),
+        "status": nested_payload.get("status"),
+    }
+    assert nested_payload["schema"] == "CLAUDE_GPT_LAUNCH_RESULT_V1"
+    assert nested_payload["status"] == "ok"
+    assert nested_payload["mode"] == "check_only"
+
+    nested_settings_local = Path(nested_payload["settings_path"])
+    nested_data = json.loads(nested_settings_local.read_text(encoding="utf-8"))
+    nested_native_settings_path = nested_data.get("env", {}).get(
+        "CLAUDE_GPT_NATIVE_SETTINGS_PATH"
+    )
+    artifact_payload["nested_native_settings_path"] = nested_native_settings_path
+    artifact_payload["expected_native_settings_path"] = expected_native_settings_path
+    artifact_payload["chdir_before_self_launch"] = str(different_cwd)
+    artifact_payload["result"] = "PASS"
+
+    _write_ac4_artifact(artifact_payload)
+
+    assert nested_native_settings_path == expected_native_settings_path
