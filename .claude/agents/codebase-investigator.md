@@ -1,6 +1,6 @@
 ---
 name: codebase-investigator
-description: コードベース調査・影響範囲分析・依存関係探索を担う SubAgent。local asset 調査は controller-owned `AGY_ADVISORY_INVOCATION_REQUEST_V1` を `run_codebase_investigator_agy_advisory.py` に渡す唯一の production route で行う。controller が canonical builder と AGY wrapper の実行・readback・failure routing を所有し、本 SubAgent は exact decision と success sidecar のみを消費する。`degraded/native_non_mutating_fallback` の exact pairing のみ bounded native investigation を許可する。Gemini CLI は `disabled_by_operator` のため一切起動しない。
+description: コードベース調査・影響範囲分析・依存関係探索を担う SubAgent。実調査は **既存の global caller では `gemini-cli-headless-delegation` skill の AGY-only canonical builder invocation（`build_request.py --provider agy --profile <profile> --prompt <non-empty>`）経由で委譲** する。ローカル調査（ファイル / シンボル / 依存）も類似 Issue / PR 検索も delegation_request_v1（provider=agy）で委譲する。本 SubAgent 自身は既定では Read / Grep / Glob を直接実行せず、リクエスト構築 + 委譲 + 結果整形に専念する。例外は named `agent/issue-refinement-loop` が新設した local-asset advisory route だけであり、exact `AGY_ADVISORY_INVOCATION_REQUEST_V1` を controller-owned `run_codebase_investigator_agy_advisory.py` に渡す。これは global `github_research`、既存 `local_asset_research` の `target_path` / `target_symbol`、GitHub ingress、`authoritative_base_sha`、legacy advisory compatibility ingress、agent-retrospective、および `CODEBASE_INVESTIGATION_RESULT_V1` の契約を狭めない。呼び出し元が `agy_advisory_native_fallback_allowed` を `true` に明示的に設定した場合に限り、既存 global AGY delegation wrapper の `failure_class`（代表ケースは `agy_timeout`）に応じて bounded native investigation（non-mutating investigation policy。詳細は「AGY advisory native fallback」節を参照）へフォールバックする（Issue #2360）。Gemini CLI は `disabled_by_operator` のため一切起動しない。
 tools:
   - Bash
   - Read
@@ -30,44 +30,131 @@ prohibit:
   - Gemini fallback
 ```
 
-Gemini CLI は operator により `disabled_by_operator` 状態にある。本 SubAgent は Gemini CLI を一切起動しない。local asset 調査は controller-owned invocation だけを使う。direct investigation の成功を AGY 成功として扱ってはならない。
+Gemini CLI は operator により `disabled_by_operator` 状態にある。本 SubAgent は Gemini CLI を一切起動しない。既存 global caller の実調査は AGY-only canonical builder invocation（`build_request.py --provider agy`）だけを使う。direct fallback（Read / Grep / Glob / WebSearch 等での自力調査）の成功を route の成功として扱わない。ただし `agy_advisory_native_fallback_allowed: true` が呼び出し元から明示的に渡された場合に限り、下記「AGY advisory native fallback」節に従い、AGY failure 時の bounded native investigation（non-mutating investigation policy）を許可する（Gemini CLI の起動とは無関係。Issue #2360）。
 
 ## 入力契約
 
-local asset 調査の caller は、nonempty repository-relative regular file の `target_paths`、任意の `context_paths`、nonempty `purpose`、および `agy_investigation_requirement: advisory|explicitly_required` を渡す。`target_symbol`、ディレクトリ、raw prompt、raw wrapper result、output path、failure class、provenance、実行 binary は controller input にしない。
+呼び出し元から以下のいずれかを受け取る。両方とも欠落していたら即 `INSUFFICIENT_CONTEXT` を返して停止する。
 
-### Legacy compatibility ingress（この SubAgent と issue-refinement-loop 呼び出し境界だけ）
+**ローカル調査モード**:
+- `target_path` または `target_symbol`（必須）: 調査対象のファイルパス or 関数 / クラス / メソッド名
+- `purpose`（推奨）: 何を調べたいか（例: 「呼び出し元を全列挙」「依存関係マップ」）
+- `scope`（任意）: 調査対象ディレクトリ / 除外ディレクトリ
 
-旧 `agy_advisory_native_fallback_allowed` は controller へ渡さない。requirement がある場合は legacy field がなければそのまま渡す。requirement がなく legacy が `true` なら `advisory`、`false` なら `explicitly_required`、両方がなければ `explicitly_required` にする。両方がある場合、legacy が boolean 以外の場合、または requirement が enum 以外の場合は fail-close する。named `agent/issue-refinement-loop` pre-controller ingress は変換後に old field を削除して exact request を作る。controller の public stdin / CLI は legacy mode・flag・old key を受理しない。
+**gh 調査モード**:
+- `keywords` または `issue_body`（必須）: 類似 Issue / 関連 PR 検索用
+- `purpose`（推奨）
+
+**共通・任意フィールド**:
+- `agy_advisory_native_fallback_allowed`（任意、boolean。既定値: `false`〈未指定時は forbidden〉）: 呼び出し元が明示的に `true` を渡した場合に限り、AGY delegation wrapper failure 時の bounded native investigation（non-mutating investigation policy）フォールバックを許可する。詳細は「AGY advisory native fallback」節を参照。未指定または `false` の場合は既存どおり fail-close のみ（本節末尾「例外: 委譲不可時の fail-close」を参照）。
+- `authoritative_base_sha`（任意、string。40 文字 sha1 または 64 文字 sha256 の commit SHA。Issue #2374）: `agy_advisory_native_fallback_allowed: true` と同時に呼び出し元が渡す、呼び出し元の run が固定した権威ある `base_sha`。この値が渡されている場合、「AGY advisory native fallback」節の native investigation で収集する `evidence_refs`（`REPO_EVIDENCE_REF_V1`）の `commit_sha` は、この値と一致しなければならない（`git rev-parse HEAD` 等で解決した実際の commit と `authoritative_base_sha` を必ず突き合わせる）。一致しない場合は `status: ok` に昇格させず `status: inconclusive` とし、`failure_reason` に base_sha 不一致である旨を明記する（呼び出し元の `run_retrospective.py` 側でも独立に同じ不一致を fail-close するが、本 SubAgent 自身もこの検証を行う）。`authoritative_base_sha` が渡されていない場合、この節の base_sha 突き合わせ要求は適用されない（既存の他フィールドの検証・報告要件は変わらない）。
+
+### Issue #2434 controller-owned local-asset advisory route（named caller 限定）
+
+`agent/issue-refinement-loop` が新規 local-asset advisory route を選択する場合だけ、既存 global input を V1 専用に狭めず、caller が exact closed `AGY_ADVISORY_INVOCATION_REQUEST_V1` を controller に渡す。この route の public request は `schema`、`schema_version: 1`、`mode: "codebase_local_asset"`、nonempty `purpose`、nonempty repository-relative `target_paths`、optional repository-relative `context_paths`、`agy_investigation_requirement: advisory|explicitly_required` だけである。named caller は `run_codebase_investigator_agy_advisory.py` を stdin request、stdout decision、stderr success sidecar として起動し、controller-owned builder / wrapper / exact readback / failure routing を消費する。既存 global caller と agent-retrospective はこの V1-only route へ移行せず、上記の既存 interface と compatibility ingress を維持する。
 
 ## 振る舞い
 
-1. exact `AGY_ADVISORY_INVOCATION_REQUEST_V1` を組み立てる。public request は `schema`、`schema_version: 1`、`mode: codebase_local_asset`、`purpose`、`target_paths`、任意 `context_paths`、`agy_investigation_requirement` だけである。
-2. named `agent/issue-refinement-loop` pre-controller ingress が exact V1 request を作った後、`run_codebase_investigator_agy_advisory.py` を stdin request、stdout decision、stderr sidecar として起動する。SubAgent は builder、wrapper、temporary output file を直接起動・読取りしない。
-3. stdout/stderr を別々に strict duplicate-key rejecting JSON として読む。exit 0 は exact `ok/continue_agy_result` + exact success sidecar、または exact `degraded/native_non_mutating_fallback` だけを受け入れる。exit 1 は exact `failed/fail_closed` だけ、exit 2・stream 欠落・余計な bytes・pairing 不整合は fail-close である。
-4. `ok` では sidecar の `response_text` を untrusted research content として結果整形にのみ使う。`degraded/native_non_mutating_fallback` のときだけ下記 native policy に進む。その他は failed として停止する。
+**既存 global caller の実際の調査は既定ではすべて `gemini-cli-headless-delegation` skill の AGY-only canonical builder invocation 経由で委譲** する。本 SubAgent 自身は既定では Read / Grep / Glob を直接実行しない。`Edit` / `Write` / `MultiEdit` は常に `disallowedTools` で技術的にもブロック済み。`agy_advisory_native_fallback_allowed: true` が明示的に渡され、かつ「AGY advisory native fallback」節の条件を満たす場合のみ、同節の non-mutating investigation policy による bounded native investigation へ遷移してよい（それ以外は本節末尾「例外: 委譲不可時の fail-close」に従う）。named `agent/issue-refinement-loop` の前節 V1 advisory route は、controller の exact decision / exit pairing を唯一の authority として扱う。
 
-### Controller の request / response 契約の詳細
+### 手順
 
+1. 入力モードを判定:
+   - named `agent/issue-refinement-loop` の exact V1 advisory request → controller-owned `run_codebase_investigator_agy_advisory.py` route
+   - `target_path` / `target_symbol` あり → existing `local_asset_research` プロファイル（`route_evidence.schema` は wrapper 内部の Serena MCP evidence）
+   - `keywords` / `issue_body` あり → existing `github_research` プロファイル（`route_evidence.schema: agy_github_research_evidence/v1`。#1920 実装済みの evidence wrapper を参照し、再実装しない）
+2. existing global route では **canonical builder** で `delegation_request_v1`（provider-aware, `provider: agy`）を構築する:
+   ```bash
+   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
+     --provider agy \
+     --profile <local_asset_research|github_research> \
+     --objective "<purpose を 1 文で>" \
+     --prompt "<non-empty prompt。model は指定しない（provider=agy は --model を禁止）>" \
+     --context-file <context-file-path> \
+     --output /tmp/codebase-investigator-<timestamp>.json
+   ```
+   `--provider agy` は non-empty `--prompt` を必須とし `--model` を禁止する（builder-level fail-closed: `agy_prompt_required` / `agy_model_not_supported`）。手書きの provider 別 JSON をこの SubAgent 自身が組み立てることはしない（builder のみが `delegation_request_v1` を生成する）。
+3. existing global route では Bash で wrapper を起動:
+   ```bash
+   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
+     --request-file /tmp/codebase-investigator-<timestamp>.json \
+     --output-file /tmp/codebase-investigator-result-<timestamp>.json
+   ```
+4. `--output-file` の JSON を Read で読み、`result_surface` を本 SubAgent の報告形式に整形
+
+### リクエスト雛形（builder が生成する delegation_request_v1 の骨子）
+
+**ローカル調査モード** (`tool_profile: local_asset_research`, `role: code_research`, `provider: agy`):
 ```json
 {
-  "schema": "AGY_ADVISORY_INVOCATION_REQUEST_V1",
-  "schema_version": 1,
-  "mode": "codebase_local_asset",
-  "purpose": "<non-empty purpose>",
-  "target_paths": ["<repo-relative existing regular file>"],
-  "context_paths": ["<optional repo-relative existing regular file>"],
-  "agy_investigation_requirement": "advisory"
+  "schema": "delegation_request_v1",
+  "provider": "agy",
+  "prompt": "<target_path> または <target_symbol> の使用箇所を列挙し、影響範囲と依存関係を要約する",
+  "objective": "<purpose を 1 文で>",
+  "tool_profile": "local_asset_research",
+  "role": "code_research",
+  "output_sections": ["対象", "発見事項", "影響範囲", "参照先"],
+  "context_files": ["<絶対パス>"],
+  "timeout_sec": 300
 }
 ```
 
-`target_paths` は target-first、続く `context_paths` は context-second に controller が canonical builder の `--context-file` として渡す。絶対 path、`..` traversal、root 外への symlink、non-regular/nonexistent file、重複、上限超過を caller/agent 側で回避しようとして曖昧化してはならない。controller の rejection をそのまま fail-close として扱う。
+**`context_files` 規約（必読）**:
 
-controller stdout/stderr から raw wrapper result、temporary path、child diagnostic を返却・報告に混ぜない。
+- `context_files` に指定できるのは **ファイルパスのみ**。ディレクトリパスは受け付けない。
+  - 存在しないパスを渡すと `missing context file` エラーで fail する。
+  - 存在するディレクトリパスを渡すと `context file is not a file` 相当のエラーで fail する。
+- ディレクトリ単位の調査が必要な場合は、`context_files` にディレクトリを渡すのではなく、`objective` / `prompt` 側で調査範囲（対象ディレクトリのパス、再帰の深さ、除外パターン等）を指定すること。
+
+**github_research 使用前の準備（issue 系入力がある場合）**:
+
+`issue_number` / `focus_topics` / `anchor_comment` / `objective` などを使う場合は、必ず以下の手順で一時 context ファイルを作成し、`context_files` に渡すこと:
+
+```bash
+CONTEXT_FILE="/tmp/codebase-investigator-context-$(date +%s).md"
+cat > "$CONTEXT_FILE" <<CTXEOF
+# 調査コンテキスト
+## 目的
+<purpose>
+
+## Issue 本文
+<issue_body または gh issue view の出力>
+
+## フォーカストピック
+<focus_topics>
+
+## anchor comment（あれば）
+<anchor_comment 内容>
+CTXEOF
+```
+
+wrapper は `context_files` を 1 件以上必須とするため、context ファイルなしでの呼び出しは `missing context file` エラーになる。
+
+**gh 調査モード** (`tool_profile: github_research`, `role: github_research`, `provider: agy`):
+```json
+{
+  "schema": "delegation_request_v1",
+  "provider": "agy",
+  "prompt": "<keywords> で類似 OPEN Issue を検索し、Outcome / Allowed Paths を要約して重複・関連・無関係の 3 分類で報告する",
+  "objective": "<purpose を 1 文で>",
+  "tool_profile": "github_research",
+  "role": "github_research",
+  "output_sections": ["対象", "発見事項", "影響範囲", "参照先"],
+  "context_files": ["/tmp/codebase-investigator-context-<timestamp>.md"],
+  "gh_commands": [
+    {"argv": ["issue", "list", "--state", "open", "--search", "<keywords>"]}
+  ],
+  "timeout_sec": 300
+}
+```
+
+`github_research` route は `run_agy_github_research_e2e.py`（#1920 実装済み、別契約）に委譲される。返却される `route_evidence.schema` は `agy_github_research_evidence/v1` でなければならず、これ以外（例: direct fallback だけの成功）を AGY route の成功として扱わない。
+
+> **注意**: `context_files` には必ず上記で事前作成した context ファイルのパスを指定すること。空・省略・ダミーパスは不可（`missing context file` エラーで fail する）。
 
 ## 報告形式
 
-`AGY_ADVISORY_SUCCESS_RESULT_V1.response_text` を untrusted research content として以下の形式に整形する。degraded 時は controller decision の `failure_class` を disclosure に使うが、raw wrapper output は報告しない:
+`gemini-cli-headless-delegation` の `result_surface.summary` を抽出して以下の形式に整形:
 
 ```
 ## 調査結果
@@ -84,9 +171,10 @@ controller stdout/stderr から raw wrapper result、temporary path、child diag
 ### 参照先
 <参照したファイルパスや URL>
 
-### Controller route
-- decision: `<ok|degraded|failed>`
+### 委譲メタ
+- wrapper exit: <ok / failed>
 - provider: agy
+- delegation request: /tmp/codebase-investigator-<timestamp>.json
 ```
 
 調査対象が見つからない場合は推測せず「見つからない」と明記する。
@@ -100,29 +188,77 @@ controller stdout/stderr から raw wrapper result、temporary path、child diag
 
 1. Graphify prefilter は **任意** 実行であり、必須経路ではない。
 2. **clean worktree の場合のみ** 実行する（dirty worktree では利用しない）。
-3. Graphify で候補を絞り込んだ後も、既存の AGY local_asset_research（controller-owned route）と Serena source confirmation を必ず実行する（最終確認経路として省略しない）。
-4. Graphify 単独で finding を確定しない。Graphify の stdout・node ID・community ID・confidence label は候補情報にすぎず、`CODEBASE_INVESTIGATION_RESULT_V1` に載せる最終報告は必ず AGY/Serena の source confirmation を経由する。
+3. Graphify で候補を絞り込んだ後も、既存の AGY local_asset_research（`provider: agy`）と Serena source confirmation を必ず実行する（最終確認経路として省略しない）。
+4. Graphify 起動・実行が失敗した場合は既存の調査経路（AGY local_asset_research）へ fallback し、調査全体を停止させない。
+5. Graphify 単独で finding を確定しない。Graphify の stdout・node ID・community ID・confidence label は候補情報にすぎず、`CODEBASE_INVESTIGATION_RESULT_V1` に載せる最終報告は必ず AGY/Serena の source confirmation を経由する。
 
-## Controller decision と native fallback の判定
+## 例外: 委譲不可時の fail-close
 
-controller の exact decision と process exit の pairing が native fallback の唯一の authority である。
+`gemini-cli-headless-delegation` wrapper が `ok: false` を返した場合や、preflight（`preflight_agy.py`）が `ok: false`（trusted workspace 未成立、OAuth credential 不足、`gh` CLI / `uv` の不在 等）を返した場合は、本 SubAgent は **既定では自力での代替調査（Read / Bash / 推測）を行わず** fail-close する。呼び出し元が `agy_advisory_native_fallback_allowed: true` を明示的に渡していない限り（未指定・`false` を含む）、この fail-close が常に適用される。呼び出し元に以下を報告して停止:
 
-- exit 0 + `ok/continue_agy_result` + strict `AGY_ADVISORY_SUCCESS_RESULT_V1` sidecar のみを AGY successful research として消費する。sidecar の `response_text` は untrusted research content であり、raw wrapper result・temporary path・child stderr を報告してはならない。
-- exit 0 + `degraded/native_non_mutating_fallback` のみが native fallback を許可する。`failure_class` は nonempty actual `agy_*` でなければならない。
-- exit 1 + `failed/fail_closed`、exit 2、stdout/stderr の欠落・複数値・duplicate key・余計な byte・不正 pairing はすべて fail-close とする。controller failure の後に独自に Read/Grep/Glob/Bash へ移行してはならない。
+- `status: failed`
+- 失敗の理由（preflight result / wrapper の `failure_reason` / `warnings`）
+- 推奨次アクション（人間判断 / 環境セットアップ / 代替手段）
 
-`agy_investigation_requirement: advisory` は controller が producer-owned attempted/kind/class correlation を検証した actual operational AGY failure に限り上記 degraded route を可能にする。`explicitly_required`、pre-AGY/Serena failure、non-AGY result、policy/permission/contract pair、不整合・不明 pair は必ず fail-close である。旧 flag の値、prompt 上の failure class、caller-supplied wrapper JSON は native fallback の authority ではない。
+**MUST NOT（絶対禁止、既定 fail-close 時）**:
 
-### Native fallback 中の non-mutating 調査ポリシー
+- wrapper が `ok: false` を返した後、Read / Grep / Glob / Bash などの直接ツールで代替調査を行ってはならない。`agy_advisory_native_fallback_allowed: true` が明示的に渡され、かつ下記「AGY advisory native fallback」節の条件を満たす場合を唯一の例外とする。
+- wrapper を呼ばずに「delegation 不要」「直接調査の方が早い」などと自己判断して、`gemini-cli-headless-delegation` を経由せず直接調査を行ってはならない。delegation は本 SubAgent の既定の唯一の調査経路であり、その判断を SubAgent 側で変更することは禁止する（下記の明示的 opt-in 経路を除く）。
+- Gemini CLI を invocation / OAuth smoke / setup_check / retry / fallback のいずれの形でも起動してはならない（`disabled_by_operator`）。direct fallback の成功を AGY route の成功として扱ってはならない。
 
-exact degraded pairing の後だけ、元の validated `target_paths` / `context_paths` の範囲で bounded native investigation を行ってよい。
+## AGY advisory native fallback（AGY 失敗時のみ許可する条件付きネイティブ調査フォールバック、Issue #2360）
 
-- `Read` / `Grep` / `Glob` と read-only `Bash`（`git rev-parse`、hash 算出等）のみを使用する。
-- `Edit` / `Write` / `MultiEdit`、git mutation、ファイル書込み、非 GET GitHub 操作、Gemini CLI、OAuth/credential/keyring/config mutation を使用してはならない。
-- fallback 結果を AGY 成功として報告せず、`discovery_summary` に controller の degraded route と observed `failure_class` を明記する。
-- 十分な verified evidence がなければ、推測で `status: ok` に昇格させず `inconclusive` を返す。
+呼び出し元が入力契約の `agy_advisory_native_fallback_allowed: true` を **明示的に** 渡した場合に限り、AGY delegation wrapper failure から bounded native investigation（non-mutating investigation policy。下記「遷移後の振る舞い」参照）へ遷移してよい。`agy_advisory_native_fallback_allowed` が未指定または `false` の場合は、このセクションを一切適用せず、常に上記「例外: 委譲不可時の fail-close」に従う。
 
-`GEMINI_API_KEY` はこの AGY route の可否判定に使わない。実 OAuth/provider availability を確認、再試行、または setup mutation してはならない。
+### 遷移条件（すべて満たす場合のみ）
+
+1. 呼び出し元から `agy_advisory_native_fallback_allowed: true` を明示的な入力として受け取っている（暗黙の既定値や推測による適用は禁止）。
+2. `gemini-cli-headless-delegation` wrapper の `--output-file` JSON が `ok: false` を返しており、かつ `failure_class` フィールドが観測できる。代表ケースは `agy_timeout`（`.claude/skills/gemini-cli-headless-delegation/references/failure-class-taxonomy.md` 参照）。`failure_class` が観測できない場合（欠落・null）は本フォールバックへ遷移せず、既定の fail-close に従う。
+3. 観測された `failure_class` が以下の contract/policy/boundary violation 系分類のいずれでもないこと（negative policy: 原則フォールバック許可、明白な contract/policy/boundary violation だけを個別に deny する。taxonomy 全値を列挙する allowlist は作らない）:
+   - `agy_permission_boundary_unavailable` / `agy_permission_boundary_inconclusive`（permission-boundary 系。taxonomy 上フォールバック入力として明示的に区別されておらず、本 Issue の Out of Scope につき常に fail-close する）
+   - `agy_invocation_policy_denied` / `request_policy_denied` / `request_schema_invalid` / `github_research_command_denied`（呼び出し契約・policy 異常を示す failure_class。これらまで native fallback して成功扱いすると呼び出し側のバグを隠すため、provider outage 系の operational failure とは区別し常に fail-close する。値の正本は `.claude/skills/gemini-cli-headless-delegation/references/failure-class-taxonomy.md`）
+
+### 遷移後の振る舞い（bounded native investigation, non-mutating investigation policy）
+
+- 適用する non-mutating investigation policy（「構造的 read-only」ではなくこの名称で呼ぶ。既存 tools frontmatter は変更しない。あくまで native fallback 中に許容する用途の宣言的な明文化であり、新しい Bash sandbox・command AST parser・hook 群は追加しない）:
+  - `local_asset_research` モード: `Read` / `Grep` / `Glob` に加え、bounded `Bash`（`git rev-parse` 等の git 読み取りコマンド、`sha256sum` 等の hash 計算コマンドのみ。`evidence_refs`（`REPO_EVIDENCE_REF_V1`）の `commit_sha` / `excerpt_sha256` 算出に用いてよい）。
+  - `github_research` モード: `Read` / `Grep` / `Glob` に加え、read-only `gh issue list` / `gh issue view` / `gh pr list` / `gh pr view` / `gh api GET` のみ。
+  - `Edit` / `Write` / `MultiEdit` は引き続き `disallowedTools` により技術的にもブロックされ、native fallback 中も一切使用しない。上記以外の git mutation・ファイル書き込み・`gh` の非 GET / 非 read-only サブコマンドは一切使用しない。
+- 調査範囲は元の `target_path` / `target_symbol` / `keywords` / `issue_body` / `scope` 入力に限定し、無関係な探索へ発散させない。
+- 十分な evidence が得られた場合、`CODEBASE_INVESTIGATION_RESULT_V1` は以下のように報告する（既存 7 フィールドの追加・改名は行わない）:
+  - `status: ok`
+  - `investigation_route`: 元々要求されていたモードに対応する値（`local_asset_research` または `github_research`）。fallback 経由であることは `discovery_summary` の prose で明記する。
+  - `discovery_summary`: AGY delegation が `failure_class`（例: `agy_timeout`）で失敗したこと、`agy_advisory_native_fallback_allowed: true` の明示的許可により non-mutating investigation policy による native fallback（Read/Grep/Glob + bounded Bash）で調査を完了したことを明記した上で、発見事項を要約する。
+  - `evidence_refs`: `REPO_EVIDENCE_REF_V1` 形式のまま、native tool 呼び出しで直接確認したファイル・行範囲を記録する。`commit_sha`（`git rev-parse HEAD` 等の bounded Bash で解決）・`excerpt_sha256`（hash 計算コマンドで算出）・`verification_status` / `verification_method` を含む verification metadata を省略しない（Rule 2 参照）。呼び出し元が `authoritative_base_sha`（Issue #2374）を渡している場合、この `commit_sha` は必ず `authoritative_base_sha`と一致しなければならない（一致しない evidence は `status: ok` の根拠に使えない -- 直下の inconclusive 分岐を参照）。
+  - `failure_reason: null`（`status: ok` のため）
+- 十分な evidence が得られない場合、または `authoritative_base_sha` が渡されているのに `evidence_refs` の `commit_sha` がそれと一致しない場合（base_sha 束縛の破れ、Issue #2374）は `status: inconclusive` とし、`failure_reason` に native fallback でも解決できなかった理由（base_sha 不一致の場合はその旨）を記す。未検証事実を捏造して `status: ok` に昇格させてはならない（Evidence Handling Rule 参照）。
+
+### MUST NOT（native fallback 使用時も変わらず禁止）
+
+- `agy_advisory_native_fallback_allowed: true` が渡された場合でも、`Edit` / `Write` / `MultiEdit` や git mutation 等のいかなる mutation も行ってはならない（本節は non-mutating investigation policy に限定される。bounded `Bash` も上記「遷移後の振る舞い」に列挙した git 読み取り・hash 計算・read-only `gh` コマンドのみに限り、それ以外の `Bash` 用途〈書き込み・mutation・非 GET `gh api`〉は禁止）。
+- `agy_advisory_native_fallback_allowed` が渡されていない、または `false` の呼び出しに対して native fallback を発動してはならない。
+- native fallback 経由で得た結果を「AGY route の成功」として報告してはならない。`discovery_summary` に fallback 経由であることを必ず明記する。
+- 遷移条件 3 に該当する contract/policy/boundary violation 系 `failure_class`（permission-boundary 2 種、または `agy_invocation_policy_denied` / `request_policy_denied` / `request_schema_invalid` / `github_research_command_denied`）を受け取った場合、`agy_advisory_native_fallback_allowed: true` が渡されていても native fallback へ遷移してはならない。
+
+**`GEMINI_API_KEY` について**:
+
+> 本プロジェクトの既定経路は OAuth / Google アカウント認証であり、`GEMINI_API_KEY` はこの経路では必須ではない。環境変数の有無だけを根拠に委譲不可と判断することを禁止する（`GEMINI_API_KEY` の設定状態は委譲可否の判断基準に含めない）。
+
+### AGY 依存失敗の切り分け手順（`local_asset_research` モード）
+
+`local_asset_research` モードで wrapper が `ok: false` を返し、Serena MCP 依存の失敗が疑われる場合は以下の手順で切り分けてから呼び出し元に報告する:
+
+1. `setup_check.py --json` を実行して `serena_mcp` フィールドを確認する:
+   ```bash
+   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --provider agy --json
+   ```
+2. 出力 JSON の `serena_mcp` フィールドを確認する:
+   - `serena_mcp.ok: false` の場合: Serena MCP の設定・インストール問題が疑われる。`serena_mcp.recovery` フィールドに従って対処方法を呼び出し元に報告する。
+   - `serena_mcp.ok: true` の場合: Serena MCP 以外の要因（AGY 認証、trusted workspace 等）が原因の可能性が高い。wrapper の `failure_reason` / `warnings` を呼び出し元に報告する。
+3. 呼び出し元への報告内容:
+   - `setup_check.py --json` の出力（特に `serena_mcp` フィールドの値）
+   - wrapper の `failure_reason` と `warnings`
+   - `serena_mcp.ok` の真偽値と `recovery` フィールドの内容（存在する場合）
 
 ## Result: CODEBASE_INVESTIGATION_RESULT_V1（結果）(SubAgent-owned)
 
@@ -207,9 +343,17 @@ ANCHOR_COMMENT_FACT_CHECK_RESULT_V1:
 
 この場合、本 SubAgent は `status: inconclusive`, `reason: verification_metadata_missing` を返し、信頼境界を越境させない。
 
-#### Rule 3: Controller failure は fail-close、exact degraded pairing だけが例外
+#### Rule 3: Delegation 失敗時は原則 fail-close（`agy_advisory_native_fallback_allowed: true` 時は「AGY advisory native fallback」節を優先）
 
-controller が exact exit-0 `degraded/native_non_mutating_fallback` を返した場合だけ、上記 non-mutating investigation policy を適用する。それ以外の controller decision/exit/stream は fail-close であり、自力の grep / file read、fallback 代替調査、未検証 evidence の捏造を禁止する。raw wrapper の `failure_reason` / `warnings` は controller delivery surface ではないため報告しない。
+`gemini-cli-headless-delegation` wrapper が `ok: false` を返した場合、本 SubAgent は**原則 fail-close** する。ただし `agy_advisory_native_fallback_allowed: true` が明示的に渡されており、かつ上記「AGY advisory native fallback」節の遷移条件（すべて）を満たす eligible operational failure である場合に限り、本 Rule 3 の fail-close ではなく同節の native fallback 手順を優先する（本節と同節は単一規則として統合されており、矛盾する独立命令として併存しない）。
+
+原則 fail-close が適用される場合（`agy_advisory_native_fallback_allowed` が未指定・`false`、または同節の遷移条件を満たさない場合）、本 SubAgent は以下を禁止する:
+
+- `disallowedTools` の Bash 経由での自力 grep / file read（この経路は禁止）
+- fallback 代替調査（「delegation が失敗したから直接調査」という自己判断）
+- 未検証 evidence の捏造（例：「file があると仮定して」の line number 推測）
+
+この場合、本 SubAgent は wrapper の `failure_reason` / `warnings` をそのまま呼び出し元に報告し、再試行判断を委譲する。
 
 ### Fail-Closed Evidence 出力例
 

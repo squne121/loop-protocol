@@ -646,6 +646,32 @@ def test_ac7_agy_local_asset_research_rejects_context_outside_repo_before_read(t
     assert result["failure_class"] == "local_asset_research context file must be inside repository"
 
 
+def test_issue_2434_global_local_asset_payload_limits_are_intentional(tmp_path) -> None:
+    """Issue #2434 intentionally expands the global producer payload contract.
+
+    These limits belong to ``run_gemini_headless.py``'s existing
+    ``local_asset_research`` producer boundary, not only to the new
+    issue-refinement controller. Keep the contract at 32 files, 1 MiB per
+    file, and 4 MiB aggregate so consumers of the pre-existing route observe
+    the same explicit behavior as the controller.
+    """
+    assert rgh.LOCAL_ASSET_MAX_CONTEXT_FILES == 32
+    assert rgh.LOCAL_ASSET_MAX_CONTEXT_BYTES == 1024 * 1024
+    assert rgh.LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES == 4 * 1024 * 1024
+
+    exact_limit_paths = []
+    for index in range(4):
+        path = tmp_path / f"context-{index}.txt"
+        path.write_bytes(b"x" * rgh.LOCAL_ASSET_MAX_CONTEXT_BYTES)
+        exact_limit_paths.append(path)
+    assert rgh._validate_agy_local_asset_payload_bounds(exact_limit_paths) == []
+
+    over_limit = tmp_path / "over-limit.txt"
+    over_limit.write_bytes(b"x" * (rgh.LOCAL_ASSET_MAX_CONTEXT_BYTES + 1))
+    errors = rgh._validate_agy_local_asset_payload_bounds([over_limit])
+    assert any("context file is too large" in error for error in errors)
+
+
 def test_ac7_agy_github_research_dispatches_to_e2e_route(monkeypatch, tmp_path) -> None:
     """AC7 (superseded by Issue #1920): provider=agy + github_research is now
     implemented, dispatched entirely to run_agy_github_research_e2e.py's
