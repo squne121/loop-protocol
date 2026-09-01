@@ -1320,11 +1320,11 @@ def test_given_isolated_session_cleanup_not_confirmed_removed_when_lane_finishes
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    # ``session delete`` is a no-op: the session marker is never removed, so
-    # the post-cleanup ``session list --json`` still reports it.
+    # A failed own-session delete leaves cleanup unconfirmed; global session
+    # enumeration is deliberately not used by the default lane.
     body = _FAKE_ISOLATED_HERDR_BODY.replace(
         "      delete)\n        rm -f \"$STATE_DIR/$3.session\" \"$STATE_DIR/$3.stopped\"\n        exit 0\n        ;;",
-        "      delete)\n        exit 0\n        ;;",
+        "      delete)\n        exit 1\n        ;;",
     )
     _write_fake_exe(fake_bin / "herdr", body)
     _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
@@ -1344,9 +1344,7 @@ def test_given_isolated_session_cleanup_not_confirmed_removed_when_lane_finishes
 
 
 # ---------------------------------------------------------------------------
-# Session collision avoidance (Issue #1921 P0-4) — unit-level, exercised via
-# direct import since it requires deterministic control over uuid4() to
-# force a collision on the first candidate.
+# Default isolated-session naming must not observe existing namespaces.
 # ---------------------------------------------------------------------------
 
 
@@ -1355,32 +1353,20 @@ class _FakeUUID:
         self.hex = hex_value
 
 
-def test_given_first_candidate_collides_when_new_session_name_generated_then_retries_until_unique(monkeypatch):
+def test_given_default_interactive_lane_when_new_session_name_generated_then_namespace_is_not_enumerated(monkeypatch):
     module = _load_module()
-    taken = f"rts-{'1' * 32}"[:32]
-    fresh = f"rts-{'2' * 32}"[:32]
-    calls = {"n": 0}
+    candidate = f"rts-{'2' * 32}"[:32]
 
-    def fake_uuid4():
-        calls["n"] += 1
-        return _FakeUUID("1" * 32 if calls["n"] == 1 else "2" * 32)
+    monkeypatch.setattr(module.uuid, "uuid4", lambda: _FakeUUID("2" * 32))
+    monkeypatch.setattr(
+        module,
+        "_herdr_session_names",
+        lambda *_args, **_kwargs: pytest.fail(
+            "default session-name generation must not list Herdr namespaces"
+        ),
+    )
 
-    def fake_names(_herdr_bin, env=None):
-        return {taken}
-
-    monkeypatch.setattr(module.uuid, "uuid4", fake_uuid4)
-    monkeypatch.setattr(module, "_herdr_session_names", fake_names)
-
-    name = module.new_isolated_session_name("herdr")
-    assert name == fresh
-    assert calls["n"] == 2
-
-
-def test_given_collision_check_cannot_enumerate_sessions_when_generating_name_then_hard_error(monkeypatch):
-    module = _load_module()
-    monkeypatch.setattr(module, "_herdr_session_names", lambda _herdr_bin, env=None: None)
-    with pytest.raises(module.HerdrLaneError):
-        module.new_isolated_session_name("herdr")
+    assert module.new_isolated_session_name("herdr") == candidate
 
 
 # ---------------------------------------------------------------------------

@@ -555,8 +555,11 @@ runtime-smoke が起動する Claude process は process-local settings で
 `crossSessionInbound: "refuse"` と bare `permissions.deny` の `SendMessage` /
 `ListAgents` を固定する。structured lane は直接 subprocess のまま、interactive
 lane は fresh isolated Herdr namespace の `agent start ... -- [AGENT_ARG]...`
-pass-through を使う。いずれも global Claude/Herdr config や pre-existing human
-namespace を変更しない。
+pass-through を使う。いずれも global Claude/Herdr config を変更せず、default interactive
+lane は pre-existing human namespace を enumerate、list、snapshot、operate、message、observe
+しない。fresh own session の cleanup のみを行う。既存の
+`--require-session-baseline-preservation` を明示した場合だけ before/after preservation
+observation を fail-closed で実行し、通常実行の `preexisting_herdr_preserved` は `null` とする。
 
 この policy は harness-started process の initial/effective policy を public runner
 input から弱めさせないためのものであり、hostile relaunch、OS/user/account isolation

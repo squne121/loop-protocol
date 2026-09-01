@@ -468,9 +468,12 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
   stream JSON／JSONL event と exit code を証跡とする。TUI screen scraping は使わない。
 - **interactive herdr lane** は TUI `/status`、Skill picker、approval 画面、subagent UI 等、structured lane で
   露出しない状態の観測が必要な場合だけ使用する。herdr 未検出・`HERDR_ENV` 未設定は `mode=interactive` の
-  SKIP（exit 77）とし、structured lane の失敗へ波及させない。人間の使用中 Herdr session には一切相乗り
-  せず、実行のたびに isolated named session を新規生成し、終了時に cleanup 完了（session 消失）を
-  確認できない場合は fail-closed で exit 1 とする（PR #1921 human OWNER fix-delta）。
+  SKIP（exit 77）とし、structured lane の失敗へ波及させない。default interactive lane は人間の
+  使用中 Herdr session に相乗りせず、ambient `HERDR_*` を strip した isolated named session を
+  新規生成して own-name cleanup だけを行う。pre-existing/human namespace を enumerate、list、
+  snapshot、operate、message、observe しない。既存の `--require-session-baseline-preservation` を
+  明示した場合だけ before/after preservation observation を fail-closed で行い、通常実行では
+  `preexisting_herdr_preserved` を `null` のままにする。
 - Runner（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は runtime 起動・観測・証跡収集だけを所有し、
   hook reason の意味分類・mutation deny の妥当性・review verdict 等の semantic 判定は caller が引き続き所有する。
 - Claude peer messaging を対象にする immediate verification は、harness-owned invocation-local
@@ -481,8 +484,9 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
   `preexisting_herdr_preserved`) を混同しない。inbound behavior は configured value から推論せず、
   runtime unavailable / nested isolated-Herdr constraint は bounded reason-code SKIP exit 77 として
   artifact を残し、PASS に読み替えない。nested-session policy により fresh isolated launch が
-  拒否された場合は `herdr_isolated_session_unavailable` を記録し、同時に snapshot が
-  利用不能でも SKIP を FAIL へ昇格させない。
+  拒否された場合は `herdr_isolated_session_unavailable` を記録し、baseline-preservation
+  opt-in を指定していない通常 lane は snapshot を試行しないため、snapshot unavailable を
+  SKIP/FAIL の根拠にしない。
 - **SubAgent 実行の causal evidence は hook ID 相関を要求し、marker 文字列出力のみでは不十分とする**（Issue #2183、
   Issue #2174 OWNER REQUEST_CHANGES https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173、
   PR #2214 OWNER レビュー https://github.com/squne121/loop-protocol/pull/2214#issuecomment-5307009937、

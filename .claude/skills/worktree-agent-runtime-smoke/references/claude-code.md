@@ -28,8 +28,8 @@ interactive lane(herdr 経由)は `--output-format` / `--include-hook-events` /
 - structured lane: 実際の fixed-argv invocation 結果(exit code・terminal
   event・capability 分類)
 - interactive lane: herdr の wait timeout、process termination、isolated
-  session の stop・delete・removal 確認(`herdr session list --json` での
-  消失確認)。structured-only flag の forward には依存しない
+  session の own-name stop・delete 成功確認。通常 lane は global `session list` で
+  removal を確認せず、pre-existing/human namespace を観測しない
 
 ## Structured lane（既定）
 
@@ -211,27 +211,18 @@ issue-refinement-loop/scripts/run_native_session_continuation_canary.py` の
 AC6 の reuse 境界により、この workaround 自体は本 SKILL の汎用 harness へは
 追加していない）。
 
-## Herdr 全体 snapshot 保全検証（Issue #2174 AC7）
+## Herdr baseline-preservation opt-in（Issue #2437）
 
-`--mode interactive` は常に（オプトインではなく）、isolated interactive lane 実行の
-前後で呼び出し元自身の（デフォルト、非 isolated）Herdr session の状態を
-`capture_herdr_session_snapshot` 相当の 2 endpoint から取得し比較する:
+通常の `--mode interactive` は high-entropy isolated session を生成し、ambient
+`HERDR_*` を strip して own-name の lifecycle だけを操作する。pre-existing/human
+Herdr namespace を list、snapshot、observe しない。
 
-- `herdr session list --json`: 既存の `snapshot_herdr_sessions`
-  （`name`/`running`/`default`/`socket_path`/`session_dir`、Issue #2176 P0-3）
-- `herdr api snapshot`: 新規 `capture_herdr_workspace_snapshot`
-  （`result.snapshot.agents[].workspace_id`/`tab_id`/`pane_id`、および
-  `focused_workspace_id`/`focused_tab_id`/`focused_pane_id`）
-
-いずれかのフィールドが取得不能な場合は `capture_herdr_workspace_snapshot` が
-`None` を返し、`diff_herdr_workspace_snapshot` はこれを fail-closed で
-preservation failure として扱う（部分的な snapshot を証跡として扱わない）。
-この run 自身が作成した isolated session は比較対象から除外されるが、それ以外の
-workspace/agent/focus の変化は 1 件でも検出されると run 全体が FAIL する。
-`scripts/agent-ops/tests/test_run_worktree_agent_runtime_smoke_workspace_snapshot.py`
-に、focused workspace/tab/pane・agent location それぞれを意図的に変化させた
-negative（poison）test と、CLI 経由の end-to-end poison test（ambient snapshot が
-isolated lane 実行中に変化するケース）を追加した。
+`--require-session-baseline-preservation` を明示した場合だけ、既存の fail-closed
+before/after preservation observation を実行する。`herdr session list --json` による
+session identity と `herdr --session <name> api snapshot` による full
+workspace/agent/focus state を比較し、いずれかが unavailable または変化した場合は
+FAIL とする。`preexisting_herdr_preserved` はこの opt-in の observed evidence だけに
+使い、通常実行では `null` のままにする。
 
 ## claude-gpt launcher の同一 session multi-turn / 複数 SubAgent lifecycle / proxy cleanup（Issue #2219、同一セッション複数ターン・複数サブエージェント生存確認）
 

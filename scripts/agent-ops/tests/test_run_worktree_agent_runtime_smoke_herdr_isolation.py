@@ -140,13 +140,10 @@ if [ "$1" = "--help" ]; then
 fi
 """
 
-# Extends the base fake-herdr fixture (test_run_worktree_agent_runtime_smoke.py's
-# _FAKE_ISOLATED_HERDR_BODY) to additionally append
-# "<subcommand>:HERDR_SESSION=<value>:HERDR_SOCKET_PATH=<value>" to
-# $FAKE_HERDR_ENV_LOG for every ``session list`` / ``session stop`` /
-# ``session delete`` invocation -- i.e. exactly the three calls this
-# fix-delta pins to the explicit isolated_env. A test can then assert that
-# NONE of those log lines ever carry a deliberately poisoned ambient value.
+# ``<subcommand>:HERDR_SESSION=<value>:HERDR_SOCKET_PATH=<value>`` to
+# $FAKE_HERDR_ENV_LOG for control-plane calls.  Default-lane tests assert
+# that only their own stop/delete calls occur; opt-in tests additionally
+# exercise the baseline list/snapshot observation.
 _FAKE_ISOLATED_HERDR_BODY_ENV_LOGGING = """
 STATE_DIR="$FAKE_HERDR_STATE_DIR"
 mkdir -p "$STATE_DIR"
@@ -219,6 +216,7 @@ case "$1" in
   api)
     case "$2" in
       snapshot)
+        log_env "snapshot"
         # Issue #2174 AC7: deterministic, unchanging workspace/agent/focus
         # snapshot -- the same content on every call means before/after
         # comparisons in the runner under test always observe zero drift.
@@ -239,18 +237,12 @@ exit 0
 # ---------------------------------------------------------------------------
 
 
-def test_given_ambient_herdr_identity_poisoned_when_interactive_lane_runs_then_cleanup_never_leaks_it(
+def test_given_ambient_herdr_identity_poisoned_when_default_interactive_lane_runs_then_only_own_cleanup_is_used(
     repo_with_worktree, tmp_path
 ):
-    """Before this fix-delta, ``herdr session stop`` / ``herdr session
-    delete`` / the post-cleanup ``herdr session list --json`` confirmation
-    ran with ``env=None`` and therefore silently inherited whatever
-    ``HERDR_SESSION``/``HERDR_SOCKET_PATH`` the CALLING process (this test's
-    own subprocess environment) happened to carry. This test deliberately
-    poisons that ambient environment with values that do NOT match the
-    isolated session this run actually creates, and asserts none of the
-    session-management calls ever observed the poisoned value -- they must
-    all observe this run's own explicit, stripped isolated identity."""
+    """The normal lane strips poisoned ambient identity and operates only on
+    its generated session.  It must not list or snapshot any pre-existing
+    namespace; explicit opt-in is tested separately."""
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -285,11 +277,12 @@ def test_given_ambient_herdr_identity_poisoned_when_interactive_lane_runs_then_c
     assert created_session_name.startswith("rts-")
 
     log_lines = env_log.read_text(encoding="utf-8").splitlines()
-    # At least the two cleanup calls (stop, delete) and one removal
-    # confirmation (list) must have been observed.
+    # Only the two own-session cleanup calls are permitted.  In particular,
+    # default execution must not list or snapshot any existing namespace.
     assert any(line.startswith("stop:") for line in log_lines)
     assert any(line.startswith("delete:") for line in log_lines)
-    assert any(line.startswith("list:") for line in log_lines)
+    assert not any(line.startswith("list:") for line in log_lines)
+    assert not any(line.startswith("snapshot:") for line in log_lines)
 
     for line in log_lines:
         assert "ambient-poison-session" not in line, (
@@ -418,15 +411,14 @@ def test_given_require_session_baseline_preservation_and_clean_run_when_interact
 def test_given_no_baseline_preservation_flag_when_interactive_lane_runs_then_baseline_fields_absent(
     repo_with_worktree, tmp_path
 ):
-    """AC6-equivalent: omitting --require-session-baseline-preservation
-    leaves the pre-existing behavior unchanged (no baseline fields, no
-    extra herdr calls beyond the pre-existing lifecycle)."""
+    """AC6-equivalent: the default lane never observes existing namespaces."""
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     _write_fake_exe(fake_bin / "herdr", _FAKE_ISOLATED_HERDR_BODY_ENV_LOGGING)
     _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
     state_dir = tmp_path / "herdr-state"
+    env_log = tmp_path / "herdr-env-log.txt"
     prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
     out_dir = tmp_path / "out"
 
@@ -436,12 +428,20 @@ def test_given_no_baseline_preservation_flag_when_interactive_lane_runs_then_bas
         "--prompt-file", str(prompt), "--output-dir", str(out_dir),
         "--expect-marker", "OBSERVED_MARKER",
         fake_bin_dir=fake_bin,
-        extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
+        extra_env={
+            "HERDR_ENV": "1",
+            "FAKE_HERDR_STATE_DIR": str(state_dir),
+            "FAKE_HERDR_ENV_LOG": str(env_log),
+        },
     )
     assert result.returncode == 0, result.stderr
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "session_baseline_before_captured" not in summary
     assert "session_baseline_diffs" not in summary
+    assert "herdr_workspace_snapshot_before_captured" not in summary
+    assert "preexisting_herdr_preserved: None" in summary
+    log_lines = env_log.read_text(encoding="utf-8").splitlines()
+    assert not any(line.startswith(("list:", "snapshot:")) for line in log_lines)
 
 
 # ---------------------------------------------------------------------------
