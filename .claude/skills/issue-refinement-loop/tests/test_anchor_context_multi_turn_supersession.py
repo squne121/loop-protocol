@@ -830,17 +830,28 @@ def test_heavy_mutation_fail_closed_without_owner_evidence():
         assert gate["fail_closed"] is True
         assert gate["is_heavy_mutation"] is True
 
-    # Regression: with explicit owner-sourced evidence the same category is
-    # allowed to proceed.
+    # Regression: only the strict normalized OWNER disposition authorizes
+    # its bound `not_planned` category; it never authorizes `close`.
+    normalized_owner_decision = {
+        "decision": "close_not_planned",
+        "status": "approved_by_trusted_anchor",
+        "anchor_author_association": "OWNER",
+        "authorized_mutation_category": "not_planned",
+        "implementation_go": False,
+    }
     gate_with_owner = _classify_heavy_mutation_gate(
-        mutation_category="close",
-        scope_delta_decision={
-            "status": "approved_by_trusted_anchor",
-            "anchor_author_association": "OWNER",
-        },
+        mutation_category="not_planned",
+        scope_delta_decision=normalized_owner_decision,
     )
     assert gate_with_owner["status"] == "allowed"
     assert gate_with_owner["fail_closed"] is False
+
+    gate_close = _classify_heavy_mutation_gate(
+        mutation_category="close",
+        scope_delta_decision=normalized_owner_decision,
+    )
+    assert gate_close["status"] == "blocked"
+    assert gate_close["fail_closed"] is True
 
     # Regression: non-heavy mutation categories keep the pre-existing
     # warning-only continuation and are never blocked here.
@@ -1219,15 +1230,18 @@ def test_run_preflight_subprocess_heavy_mutation_without_owner_blocks(tmp_path):
 
 
 def test_run_preflight_subprocess_heavy_mutation_with_owner_approval_not_blocked_by_gate(tmp_path):
-    """Regression: an explicit owner-sourced decision must NOT be blocked by
-    the heavy mutation gate (existing normal-path behavior is preserved)."""
+    """A normalized OWNER close-not-planned disposition permits only its
+    bound `not_planned` mutation category through the real preflight gate."""
     fixture = _base_fixture(
         _SUBPROC_ISSUE_HEAVY_MUTATION_OWNER_APPROVED,
         known_context={
-            "mutation_category": "close",
+            "mutation_category": "not_planned",
             "scope_delta_decision": {
+                "decision": "close_not_planned",
                 "status": "approved_by_trusted_anchor",
                 "anchor_author_association": "OWNER",
+                "authorized_mutation_category": "not_planned",
+                "implementation_go": False,
             },
         },
     )
@@ -1241,7 +1255,13 @@ def test_run_preflight_subprocess_heavy_mutation_with_owner_approval_not_blocked
 
     assert preflight.BLOCKER_HEAVY_MUTATION_FAIL_CLOSED not in result.get("blockers", []), result
     assert preflight.BLOCKER_ANCHOR_MULTI_TURN_FAIL_CLOSED not in result.get("blockers", []), result
-    # -- end of test_run_preflight_subprocess_heavy_mutation_with_owner_approval_not_blocked_by_gate --
+    normalized_owner_decision = fixture["known_context"]["scope_delta_decision"]
+    close_gate = _classify_heavy_mutation_gate(
+        mutation_category="close",
+        scope_delta_decision=normalized_owner_decision,
+    )
+    assert close_gate["status"] == "blocked"
+    assert close_gate["fail_closed"] is True
 
 
 def test_run_preflight_subprocess_non_heavy_mutation_not_blocked_by_gate(tmp_path):
