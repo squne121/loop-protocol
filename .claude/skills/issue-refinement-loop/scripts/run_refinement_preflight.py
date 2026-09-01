@@ -165,6 +165,23 @@ try:
         # independently-declared string that could silently diverge).
         STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
         detect_missing_template_sections,
+        # Issue #2431: the known_scalars/source_spans assembler below reuses
+        # these SAME primitives (never a re-declared regex/parser) so the
+        # producer and the assembler always agree on what counts as a valid
+        # `parent_issue` scalar / a parsed `## Heading` section.
+        _mrc_parse,
+        MRC_PARSE_STATUS_OK,
+        _parse_h2_sections,
+        # PR #2469 fix_delta iteration 3 (P1): the SAME line-bound helper
+        # `_apply_insertion_decision()` uses (repair_issue_contract.py) to
+        # compute a section's raw (start_line, end_line) span -- never a
+        # re-derived offset arithmetic -- so the assembler's `line_start`/
+        # `line_end` always point at the section's ACTUAL raw line range
+        # instead of assuming content starts on the line immediately after
+        # the heading (false for the common heading -> blank line -> bullets
+        # shape).
+        _section_line_bounds,
+        _DERIVED_SCALAR_FIELD_VALIDATORS,
     )
 except ImportError:  # pragma: no cover - defensive fallback
     build_structural_repair_bundle = None
@@ -173,6 +190,11 @@ except ImportError:  # pragma: no cover - defensive fallback
     STRUCTURAL_REPAIR_ROUTE_STATUS_NEEDS_FIX = "needs_fix"
     STRUCT_DISPOSITION_AUTO_APPLY_SAFE = "auto_apply_safe"
     detect_missing_template_sections = None
+    _mrc_parse = None
+    MRC_PARSE_STATUS_OK = "ok"
+    _parse_h2_sections = None
+    _section_line_bounds = None
+    _DERIVED_SCALAR_FIELD_VALIDATORS = {}
 
 
 
@@ -6534,7 +6556,30 @@ def consume_trusted_anchor_contract_patch_plan(
             policy_spec = importlib.util.spec_from_file_location("post_update_runtime_policy", policy_path)
             if policy_spec is not None and policy_spec.loader is not None:
                 policy_module = importlib.util.module_from_spec(policy_spec)
-                policy_spec.loader.exec_module(policy_module)
+                # #2473: the module defines a module-level
+                # `@dataclass(frozen=True)` under `from __future__ import
+                # annotations`. Dataclass processing resolves those deferred
+                # string annotations via `sys.modules[cls.__module__]` --
+                # without registering this dynamically-loaded module there
+                # BEFORE `exec_module()` runs, that lookup fails and
+                # `exec_module()` raises unconditionally, which previously
+                # made this gate collapse to `"unavailable"` on every call
+                # regardless of the actual profile/argv validity.
+                #
+                # #2473 fix_delta (owner REQUEST_CHANGES on PR #2476): if
+                # `exec_module()` itself raises, remove the partially
+                # initialized module from `sys.modules` again before
+                # propagating, matching standard import machinery semantics
+                # and the existing pattern in
+                # `.claude/skills/agent-retrospective/scripts/collect_snapshot.py`.
+                # A failed module load must not leave a half-initialized
+                # module registered for a later retry to observe.
+                sys.modules[policy_spec.name] = policy_module
+                try:
+                    policy_spec.loader.exec_module(policy_module)
+                except Exception:
+                    sys.modules.pop(policy_spec.name, None)
+                    raise
                 context = known_context if isinstance(known_context, dict) else {}
                 human_urls = _normalize_comment_url_set(context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD))
                 profile = (
@@ -6849,6 +6894,194 @@ def _resolve_structural_repair_template(
     except OSError:
         return None, None, None
     return candidate_kind, template_text, template_relpath
+
+
+# ---------------------------------------------------------------------------
+# Structural repair known_scalars / source_spans assembler (Issue #2431)
+#
+# Wires `detect_missing_template_sections()`'s (repair_issue_contract.py)
+# `known_scalars`/`source_spans` parameters -- previously never populated by
+# this production preflight path, so a derivation-eligible missing section
+# fell through to `human_review_required` even when it was actually safely
+# derivable (#2426's manifestation) -- from data ALREADY available on this
+# SAME preflight run: the current Issue body's own Machine-Readable Contract
+# / headings, and (only when the caller has already established the anchor
+# comment is a TRUSTED human-context comment via the EXISTING
+# `_determine_repair_source_lane()`/`_resolve_scope_delta_source_kind()`
+# lane classifier -- no new trusted-anchor judgment logic is added here) the
+# anchor comment body. Never performs a new GitHub read of a DIFFERENT
+# Issue: the structural-repair pass stays local-only, matching
+# `_resolve_structural_repair_template()`'s own local-only design above.
+# ---------------------------------------------------------------------------
+
+# Issue #2431 AC2: the closed pair of consumer field-ids a resolved
+# `parent_issue` scalar is ever cross-populated into -- the "## Parent
+# Issue" template heading field and the Machine-Readable Contract's own
+# `parent_issue` key. Both represent the SAME real-world value.
+_PARENT_ISSUE_KNOWN_SCALAR_FIELD_IDS = ("parent-issue", "machine-readable-contract.parent_issue")
+
+# Issue #2431 AC5: closed, one-way, EXACT heading alias table for the
+# `current_issue` same-body `source_span_exact` authority
+# (repair_issue_contract.py's `_SOURCE_SPAN_AUTHORITY_KINDS` additive
+# extension). Only this ONE pair -- never fuzzy/substring/semantic matching,
+# never any other heading pair.
+_STRUCTURAL_HEADING_ALIAS_TABLE: dict[str, str] = {
+    "Proposed Allowed Paths": "Allowed Paths",
+}
+# Canonical heading label (the alias table's VALUE side) -> template
+# field_id, so the assembler below can key its `source_spans` dict by the
+# SAME field_id `detect_missing_template_sections()` uses.
+_STRUCTURAL_HEADING_LABEL_TO_FIELD_ID: dict[str, str] = {
+    "Allowed Paths": "allowed-paths",
+}
+
+
+def _resolve_parent_issue_known_scalar(
+    body: str,
+    *,
+    trusted_anchor_body: "str | None" = None,
+) -> "str | None":
+    """Resolve a single `parent_issue` scalar (Issue #2431 AC2) cross-
+    populatable into both `_PARENT_ISSUE_KNOWN_SCALAR_FIELD_IDS`, from up to
+    3 candidate sources: the current Issue body's own Machine-Readable
+    Contract `parent_issue` key, its own `## Parent Issue` heading section,
+    and -- ONLY when `trusted_anchor_body` is supplied (the caller must
+    already have established this via the existing human-context lane
+    classifier; this function performs no trust judgment of its own) -- an
+    anchor comment `## Parent Issue` heading section.
+
+    Every candidate is validated with repair_issue_contract.py's OWN closed
+    `machine-readable-contract.parent_issue` validator regex (never a
+    locally re-declared pattern). Zero candidates, or 2+ candidates with
+    DISTINCT values, both resolve to `None` (fail-closed) -- this function
+    never guesses between conflicting sources.
+    """
+    if _mrc_parse is None or _parse_h2_sections is None:  # pragma: no cover - defensive
+        return None
+    validator = _DERIVED_SCALAR_FIELD_VALIDATORS.get("machine-readable-contract.parent_issue")
+    if validator is None:  # pragma: no cover - defensive, validator always registered
+        return None
+
+    candidates: set[str] = set()
+
+    mrc_result = _mrc_parse(body)
+    if mrc_result.get("status") == MRC_PARSE_STATUS_OK:
+        raw = mrc_result["keys"].get("parent_issue")
+        if isinstance(raw, str) and validator.match(raw.strip()):
+            candidates.add(raw.strip())
+
+    def _add_heading_candidate(text: str) -> None:
+        for section in _parse_h2_sections(text):
+            if section["heading"].strip().casefold() == "parent issue":
+                raw = section["content"].strip()
+                if validator.match(raw):
+                    candidates.add(raw)
+                break
+
+    _add_heading_candidate(body)
+    if trusted_anchor_body:
+        _add_heading_candidate(trusted_anchor_body)
+
+    if len(candidates) != 1:
+        return None
+    return next(iter(candidates))
+
+
+def _resolve_current_issue_heading_alias_source_spans(
+    body: str,
+    *,
+    repo: str,
+    issue_number: int,
+) -> "dict[str, dict[str, Any]]":
+    """Detect the closed `_STRUCTURAL_HEADING_ALIAS_TABLE` heading alias
+    (Issue #2431 AC4/AC5) in the CURRENT Issue body and, only when every
+    precondition below holds, return a `source_span_exact` candidate
+    (`authority_kind: current_issue`) keyed by the canonical field's
+    field_id:
+
+      - the alias heading is present EXACTLY ONCE in `body`
+      - the canonical heading is NOT already present in `body`
+      - the alias section has non-empty content
+
+    `source_revision` is set to `sha256(body)` -- since `text` is read
+    directly out of this EXACT in-memory `body` (the same `body` this
+    producer run's `original_body_sha256` is computed from), a downstream
+    consumer can independently confirm `source_revision ==
+    "sha256:" + item["original_body_sha256"]` never crossed a stale/
+    different body snapshot (AC4's same-body / digest-match precondition).
+
+    PR #2469 fix_delta iteration 3 (P1): `line_start`/`line_end` are NOT
+    simply "the line right after the heading" -- ordinary Markdown puts a
+    blank separator line between a `## Heading` and its content (heading ->
+    blank line -> bullets), and `_parse_h2_sections()`'s `content` field is
+    `.strip()`-ed, so the FIRST line of `content` is offset from the raw
+    section start by however many leading blank lines precede it (and the
+    LAST line is likewise offset by trailing blank lines the strip()
+    removed). This function locates the actual raw line range the
+    `.strip()`-ed `content` occupies -- using the SAME
+    `_section_line_bounds()` helper `_apply_insertion_decision()` uses for
+    the identical raw-line-range problem, never a re-derived offset -- so
+    `body.splitlines()[line_start - 1:line_end]` always reconstructs
+    exactly `content`.
+    """
+    if _parse_h2_sections is None or _section_line_bounds is None:  # pragma: no cover - defensive
+        return {}
+
+    sections = _parse_h2_sections(body)
+    heading_index: dict[str, list[dict]] = {}
+    for section in sections:
+        heading_index.setdefault(section["heading"].strip().casefold(), []).append(section)
+
+    body_lines = body.split("\n")
+    bounds = _section_line_bounds(sections, len(body_lines))
+
+    body_digest = "sha256:" + _sha256(body)
+    source_url = f"https://github.com/{repo}/issues/{issue_number}"
+    spans: dict[str, dict[str, Any]] = {}
+    for alias_heading, canonical_heading in _STRUCTURAL_HEADING_ALIAS_TABLE.items():
+        field_id = _STRUCTURAL_HEADING_LABEL_TO_FIELD_ID.get(canonical_heading)
+        if field_id is None:  # pragma: no cover - defensive, table always in sync
+            continue
+        alias_matches = heading_index.get(alias_heading.strip().casefold(), [])
+        canonical_matches = heading_index.get(canonical_heading.strip().casefold(), [])
+        if len(alias_matches) != 1 or len(canonical_matches) != 0:
+            continue
+        alias_section = alias_matches[0]
+        alias_content = alias_section["content"].strip()
+        if not alias_content:
+            continue
+        # Raw (pre-strip) line range of this section's content: the line
+        # right after the heading through the line just before the next
+        # section (or end of body) -- the SAME range `_parse_h2_sections()`
+        # itself joined (pre-strip) to produce `content`.
+        _heading_start, section_end_line = bounds[id(alias_section)]
+        raw_content_start_line = alias_section["start_line"] + 1
+        if raw_content_start_line > section_end_line:  # pragma: no cover - defensive, empty section
+            continue
+        raw_content_lines = body_lines[raw_content_start_line - 1 : section_end_line]
+        raw_content_joined = "\n".join(raw_content_lines)
+        leading_ws_len = len(raw_content_joined) - len(raw_content_joined.lstrip())
+        leading_blank_lines = raw_content_joined[:leading_ws_len].count("\n")
+        line_start = raw_content_start_line + leading_blank_lines
+        line_end = line_start + max(0, alias_content.count("\n"))
+        # Regression guard (PR #2469 fix_delta iteration 3, P1): fail-closed
+        # rather than emit a `source_span_exact` candidate whose line range
+        # does not byte-exactly reconstruct `text` -- a downstream consumer
+        # trusts `line_start`/`line_end` without re-deriving them.
+        if "\n".join(body_lines[line_start - 1 : line_end]) != alias_content:  # pragma: no cover - defensive
+            continue
+        spans[field_id] = {
+            "text": alias_content,
+            "source_url": source_url,
+            "line_start": line_start,
+            "line_end": line_end,
+            "authority_kind": "current_issue",
+            "source_repo": repo,
+            "source_object_kind": "issue_body",
+            "source_object_id": str(issue_number),
+            "source_revision": body_digest,
+        }
+    return spans
 
 
 def run_preflight(
@@ -7378,6 +7611,34 @@ def run_preflight(
                 if _struct_head_sha and _struct_head_sha != "unknown"
                 else None
             )
+
+            # Issue #2431: assemble known_scalars/source_spans from data
+            # ALREADY available on this run (current Issue body's own MRC /
+            # headings, plus -- only when `_repair_source_lane` (computed
+            # above, reusing the SAME canonical human-context/anchor/
+            # unanchored classifier `_determine_repair_source_lane()` --
+            # no new trusted-anchor logic) is `human_context` -- the anchor
+            # comment body) instead of leaving both unset, which previously
+            # made every derivation-eligible missing section fall through to
+            # human_review_required even when it was actually derivable
+            # (#2426's manifestation).
+            _struct_trusted_anchor_body = (
+                anchor_body_for_consumer if _repair_source_lane == "human_context" else None
+            )
+            _struct_known_scalars: dict[str, Any] = {}
+            _struct_parent_issue_scalar = _resolve_parent_issue_known_scalar(
+                issue.get("body", "") or "",
+                trusted_anchor_body=_struct_trusted_anchor_body,
+            )
+            if _struct_parent_issue_scalar is not None:
+                for _struct_field_id in _PARENT_ISSUE_KNOWN_SCALAR_FIELD_IDS:
+                    _struct_known_scalars[_struct_field_id] = _struct_parent_issue_scalar
+            _struct_source_spans = _resolve_current_issue_heading_alias_source_spans(
+                issue.get("body", "") or "",
+                repo=repo,
+                issue_number=issue_number,
+            )
+
             structural_repair_action = build_structural_repair_bundle(
                 issue.get("body", "") or "",
                 issue_kind=_struct_kind,
@@ -7386,6 +7647,8 @@ def run_preflight(
                 repo=repo,
                 issue_number=issue_number,
                 original_updated_at=_repair_original_updated_at,
+                known_scalars=_struct_known_scalars or None,
+                source_spans=_struct_source_spans or None,
                 template_git_blob_sha=_struct_git_blob_sha,
                 template_source_ref=_struct_source_ref,
             )
