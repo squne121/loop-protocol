@@ -55,7 +55,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 sys.path.insert(0, str(Path(__file__).parent))
 import run_agy_github_research_broker as broker  # noqa: E402
@@ -600,8 +600,17 @@ def _parse_agy_turn(response_text: str) -> tuple[str, str | None, dict[str, Any]
     return "unparseable", None, None, response_text.strip()
 
 
-def _run_agy_turn(*, prompt: str, timeout_seconds: int) -> tuple[str, str]:
+def _run_agy_turn(
+    *,
+    prompt: str,
+    timeout_seconds: int,
+    _on_agy_subprocess_execution: Callable[[], None] | None = None,
+) -> tuple[str, str]:
     """Run one `agy -p <prompt>` turn in the isolated github_research workspace.
+
+    ``_on_agy_subprocess_execution`` is a producer-private handoff from
+    ``run_gemini_headless``. It is intentionally not represented in the
+    request or CLI contract, and runs only at the direct subprocess boundary.
 
     Returns (response_text, failure_class). failure_class is "" on success.
     """
@@ -615,6 +624,8 @@ def _run_agy_turn(*, prompt: str, timeout_seconds: int) -> tuple[str, str]:
     command = [*prefix, agy_bin, "-p", prompt]
     cwd = str(workspace.workspace_dir) if workspace is not None else None
     try:
+        if _on_agy_subprocess_execution is not None:
+            _on_agy_subprocess_execution()
         completed = subprocess.run(
             command,
             env=env,
@@ -670,6 +681,7 @@ def run_github_research_route(
     *,
     request_warnings: list[str] | None = None,
     gh_token_env: str = "GH_TOKEN",
+    _on_agy_subprocess_execution: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Entry point called from `run_gemini_headless.py`'s provider=='agy' dispatch.
 
@@ -765,7 +777,11 @@ def run_github_research_route(
             break
         iterations_left = LIMITS["max_iterations"] - index
         prompt = _build_turn_prompt(objective=objective, transcript=transcript, iterations_left=iterations_left)
-        response_text, agy_failure = _run_agy_turn(prompt=prompt, timeout_seconds=LIMITS["command_timeout_seconds"] * 2)
+        response_text, agy_failure = _run_agy_turn(
+            prompt=prompt,
+            timeout_seconds=LIMITS["command_timeout_seconds"] * 2,
+            _on_agy_subprocess_execution=_on_agy_subprocess_execution,
+        )
         if agy_failure:
             route_failure_class = agy_failure
             break

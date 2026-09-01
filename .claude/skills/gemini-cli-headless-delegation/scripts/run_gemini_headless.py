@@ -3628,6 +3628,11 @@ _AGY_INVOCATION_ATTEMPTED_CTX: "contextvars.ContextVar[bool]" = contextvars.Cont
 )
 
 
+def _mark_actual_agy_invocation_attempted() -> None:
+    """Record the producer-owned transition at an actual AGY spawn boundary."""
+    _AGY_INVOCATION_ATTEMPTED_CTX.set(True)
+
+
 def _get_agy_audit_raw_command() -> list[str]:
     """Return the `raw_command` value for the current agy invocation
     (Issue #1807 fix_delta Blocker 1).
@@ -3807,7 +3812,7 @@ def _run_agy(
             run_command = command
             if workspace.agy_oauth_token_bwrap_prefix:
                 run_command = list(workspace.agy_oauth_token_bwrap_prefix) + command
-            _AGY_INVOCATION_ATTEMPTED_CTX.set(True)
+            _mark_actual_agy_invocation_attempted()
             completed = subprocess.run(
                 run_command,
                 cwd=str(workspace.workspace_dir),
@@ -6091,7 +6096,11 @@ def _run_delegation_core(
         if tool_profile == GITHUB_RESEARCH_PROFILE:
             from run_agy_github_research_e2e import run_github_research_route  # type: ignore[import]
 
-            return run_github_research_route(request, request_warnings=request_warnings)
+            return run_github_research_route(
+                request,
+                request_warnings=request_warnings,
+                _on_agy_subprocess_execution=_mark_actual_agy_invocation_attempted,
+            )
         # local_asset_research uses wrapper-side Serena evidence + prompt injection.
         local_asset_retrieval_metadata: dict[str, Any] | None = None
         # Issue #1706: set only for fan-out-correlated targeted-evidence

@@ -603,3 +603,99 @@ def test_ac4_policy_denied_mid_route_still_a_harmless_deny_and_can_reach_pass(e2
     assert result["ok"] is True
     evidence = json.loads(Path(result["result_surface"]["primary_artifact"]).read_text())
     assert evidence["status"] == "pass"
+
+
+@pytest.mark.parametrize(
+    ("turns", "expected_ok", "expected_failure_class", "expected_failure_kind"),
+    [
+        (
+            [
+                (0, '{"action": "next", "operation": "get_issue", "params": {"number": 1}}'),
+                (0, '{"action": "stop", "summary": "done"}'),
+            ],
+            True,
+            None,
+            None,
+        ),
+        ([(1, "")], False, "agy_exit_nonzero", "operational"),
+    ],
+)
+def test_github_research_marks_attempted_only_at_direct_agy_subprocess_boundary(
+    rgh,
+    monkeypatch,
+    tmp_path,
+    turns,
+    expected_ok,
+    expected_failure_class,
+    expected_failure_kind,
+):
+    """The github route receives only a producer-private pre-exec handoff.
+
+    In particular, dispatch must not mark an attempt before the route reaches
+    its direct ``agy -p`` subprocess. Both a successful turn sequence and an
+    executed nonzero AGY result retain the producer correlation fields.
+    """
+    route = sys.modules.get("run_agy_github_research_e2e")
+    if route is None:
+        route = _load("run_agy_github_research_e2e", "run_agy_github_research_e2e.py")
+
+    workspace_dir = tmp_path / "isolated-agy-workspace"
+    workspace_dir.mkdir()
+    monkeypatch.setattr(route, "_preflight", lambda **_kwargs: (True, None))
+    monkeypatch.setattr(route, "_run_negative_probes", lambda: [])
+    monkeypatch.setattr(route, "_resolve_agy_binary", lambda: "/fake/agy")
+    monkeypatch.setattr(route, "_resolve_gh_binary", lambda: "/fake/gh")
+    monkeypatch.setattr(route, "_probe_agy_version", lambda _agy_bin: "1.1.10")
+    pre_spawn_attempted: list[bool] = []
+
+    def _fake_isolated_agy_env(_agy_bin):
+        # This setup is reached after route dispatch but before the direct
+        # subprocess boundary, so it catches an invalid eager transition.
+        pre_spawn_attempted.append(rgh._AGY_INVOCATION_ATTEMPTED_CTX.get())
+        return {}, [], types.SimpleNamespace(workspace_dir=workspace_dir)
+
+    monkeypatch.setattr(route, "_isolated_agy_env", _fake_isolated_agy_env)
+    monkeypatch.setattr(
+        route,
+        "_execute_via_broker_subprocess",
+        lambda operation, params, **_kwargs: {
+            "argv": route.broker.build_argv(operation, params),
+            "exit_code": 0,
+            "redacted_output_digest": "sha256:operation",
+            "redacted_stdout_sample": "operation evidence",
+            "redacted_stderr_sample": "",
+            "truncated": False,
+            "timed_out": False,
+            "output_limit_exceeded": False,
+            "duration_ms": 1,
+        },
+    )
+
+    spawn_attempted: list[bool] = []
+    outcomes = iter(turns)
+
+    def _fake_subprocess_run(command, **_kwargs):
+        # This is the direct ``agy -p`` boundary. The producer callback must
+        # have transitioned state by this point, but never at dispatch.
+        spawn_attempted.append(rgh._AGY_INVOCATION_ATTEMPTED_CTX.get())
+        returncode, stdout = next(outcomes)
+        return rgh.subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(route.subprocess, "run", _fake_subprocess_run)
+    assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+
+    result = rgh.run_delegation(
+        {
+            "schema": "delegation_request_v1",
+            "provider": "agy",
+            "tool_profile": "github_research",
+            "prompt": "non-empty",
+        }
+    )
+
+    assert spawn_attempted and all(spawn_attempted)
+    assert pre_spawn_attempted[0] is False
+    assert result["ok"] is expected_ok
+    assert result["agy_invocation_attempted"] is True
+    assert result["failure_class"] == expected_failure_class
+    assert result["agy_failure_kind"] == expected_failure_kind
