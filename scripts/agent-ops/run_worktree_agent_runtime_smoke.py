@@ -4375,6 +4375,18 @@ def run_interactive_herdr_isolated(
                     "--env", "CLAUDE_GPT_CLAUDE_BIN=" + claude_gpt_real_claude_bin,
                 ]
 
+        # Claude-GPT accepts the runtime-smoke peer policy only through its
+        # existing fixed launcher-owned channel.  Thread the default fixed
+        # value through both workspace creation and the already-running pane
+        # shell, because rc files can otherwise erase an inherited value.  A
+        # hook-sink run upgrades this same fixed channel below; no caller value
+        # is accepted or forwarded.
+        launcher_env_pairs: list[tuple[str, str]] = []
+        if runtime == "claude" and claude_adapter == "claude-gpt":
+            launcher_env_pairs = [
+                ("CLAUDE_GPT_RUNTIME_SMOKE_HOOKS", "subagent-start-stop"),
+            ]
+
         # Issue #2219 AC2/AC3/AC13-AC17 (OWNER anchor decision, hook-event
         # evidence channel): wire the interactive lane's durable hook sink
         # the SAME way ``CLAUDE_GPT_CLAUDE_BIN``/``PATH`` are already
@@ -4403,8 +4415,13 @@ def run_interactive_herdr_isolated(
                 hook_sink_path = claude_gpt_hook_sink_path(hook_sink_nonce)
                 hook_sink_path.parent.mkdir(parents=True, exist_ok=True)
                 evidence["hook_sink_path"] = str(hook_sink_path)
+                # Replace only the default fixed launcher channel with the
+                # other already-recognized fixed channel.  This remains a
+                # harness-selected value, never public caller input.
+                launcher_env_pairs[0] = (
+                    "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS", "hook-sink-multi-turn"
+                )
                 hook_sink_env_pairs = [
-                    ("CLAUDE_GPT_RUNTIME_SMOKE_HOOKS", "hook-sink-multi-turn"),
                     ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
                     # launch.sh independently computes this SAME path from
                     # its own launcher-owned constant + this nonce; also
@@ -4445,9 +4462,10 @@ def run_interactive_herdr_isolated(
                     ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
                     ("CLAUDE_GPT_HOOK_SINK_PATH", str(hook_sink_path)),
                 ]
-            for key, value in hook_sink_env_pairs:
-                isolated_env[key] = value
-                workspace_create_argv += ["--env", f"{key}={value}"]
+
+        for key, value in [*launcher_env_pairs, *hook_sink_env_pairs]:
+            isolated_env[key] = value
+            workspace_create_argv += ["--env", f"{key}={value}"]
 
         rc, out, err, timed_out = _run(
             workspace_create_argv,
@@ -4496,23 +4514,23 @@ def run_interactive_herdr_isolated(
                     f"already-running shell: {_redact(_pin_err or _pin_out)}"
                 )
 
-        if hook_sink_env_pairs:
-            # Same re-pin rationale as the ``--claude-bin`` shim above: an
-            # interactive login shell's own rc files can clobber an
-            # inherited env var, so every hook-sink env var is explicitly
-            # re-exported in the already-running pane shell too.
-            _pin_hook_sink_cmd = " && ".join(
+        runtime_env_pairs = [*launcher_env_pairs, *hook_sink_env_pairs]
+        if runtime_env_pairs:
+            # An interactive login shell can clobber inherited launcher policy
+            # or hook-sink env vars, so explicitly re-export the fixed values
+            # in the already-running pane shell before ``agent start``.
+            _pin_runtime_env_cmd = " && ".join(
                 f"export {key}='{value.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
-                for key, value in hook_sink_env_pairs
+                for key, value in runtime_env_pairs
             )
-            _pin_hs_rc, _pin_hs_out, _pin_hs_err, _pin_hs_timed_out = _run(
-                [herdr_bin, "pane", "run", pane_id, _pin_hook_sink_cmd],
+            _pin_runtime_env_rc, _pin_runtime_env_out, _pin_runtime_env_err, _pin_runtime_env_timed_out = _run(
+                [herdr_bin, "pane", "run", pane_id, _pin_runtime_env_cmd],
                 timeout=15.0, env=isolated_env,
             )
-            if _pin_hs_timed_out or _pin_hs_rc != 0:
+            if _pin_runtime_env_timed_out or _pin_runtime_env_rc != 0:
                 raise HerdrLaneError(
-                    "could not pin hook-sink env vars in the isolated pane's "
-                    f"already-running shell: {_redact(_pin_hs_err or _pin_hs_out)}"
+                    "could not pin launcher runtime env vars in the isolated pane's "
+                    f"already-running shell: {_redact(_pin_runtime_env_err or _pin_runtime_env_out)}"
                 )
 
         # Issue #1960 AC5: the interactive lane never forwards
