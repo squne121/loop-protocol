@@ -641,8 +641,10 @@ def test_github_research_marks_attempted_only_at_direct_agy_subprocess_boundary(
 
     workspace_dir = tmp_path / "isolated-agy-workspace"
     workspace_dir.mkdir()
+    expected_direct_agy_prompt = "isolated direct AGY subprocess prompt"
     monkeypatch.setattr(route, "_preflight", lambda **_kwargs: (True, None))
     monkeypatch.setattr(route, "_run_negative_probes", lambda: [])
+    monkeypatch.setattr(route, "_build_turn_prompt", lambda **_kwargs: expected_direct_agy_prompt)
     monkeypatch.setattr(route, "_resolve_agy_binary", lambda: "/fake/agy")
     monkeypatch.setattr(route, "_resolve_gh_binary", lambda: "/fake/gh")
     monkeypatch.setattr(route, "_probe_agy_version", lambda _agy_bin: "1.1.10")
@@ -678,6 +680,9 @@ def test_github_research_marks_attempted_only_at_direct_agy_subprocess_boundary(
         # This is the direct ``agy -p`` boundary. The producer callback must
         # have transitioned state by this point, but never at dispatch.
         spawn_attempted.append(rgh._AGY_INVOCATION_ATTEMPTED_CTX.get())
+        # The exact isolated direct-AGY argv proves this observer did not
+        # accept a broker or unrelated subprocess as the attempt boundary.
+        assert command == ["/fake/agy", "-p", expected_direct_agy_prompt]
         returncode, stdout = next(outcomes)
         return rgh.subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr="")
 
