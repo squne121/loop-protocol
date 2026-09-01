@@ -65,7 +65,21 @@ body:
     attributes:
       label: "Verification Commands"
       value: |
-        - `pnpm test`
+        ```bash
+        $ uv run --locked pytest \
+          .claude/skills/issue-refinement-loop/tests/test_structural_repair_action_apply_consumer.py -q
+        ```
+    validations:
+      required: true
+  - type: textarea
+    id: runtime-verification-applicability
+    attributes:
+      label: "Runtime Verification Applicability"
+      value: |
+        ```yaml
+        decision: not_applicable
+        reason: "fixture only"
+        ```
     validations:
       required: true
   - type: textarea
@@ -100,6 +114,14 @@ change_kind: code
 ## Outcome
 
 text
+
+## Acceptance Criteria
+
+- [ ] GIVEN a fixture WHEN checked THEN it is valid.
+
+## Allowed Paths
+
+- `.claude/skills/issue-refinement-loop/tests/test_structural_repair_action_apply_consumer.py`
 """
 
 REPO = "testowner/testrepo"
@@ -110,14 +132,18 @@ def _hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _build_bundle(body: str = ORIGINAL_BODY, issue_number: int = ISSUE_NUMBER) -> dict:
+def _build_bundle(
+    body: str = ORIGINAL_BODY,
+    issue_number: int = ISSUE_NUMBER,
+    template_text: str = TEMPLATE_TEXT,
+) -> dict:
     """Production-shaped fixture: the REAL producer (Issue #995), never a
     hand-typed digest dict, so every `candidate_section_digest` /
     `anchor_digest` this consumer re-verifies is genuine."""
     return build_structural_repair_bundle(
         body,
         issue_kind="implementation",
-        template_text=TEMPLATE_TEXT,
+        template_text=template_text,
         template_path=".github/ISSUE_TEMPLATE/implementation.yml",
         repo=REPO,
         issue_number=issue_number,
@@ -218,10 +244,12 @@ def test_consumer_reuses_edit_issue_txn_core(tmp_path: Path) -> None:
     result_path = _write_artifact(tmp_path, bundle)
 
     calls: list = []
+    precomputed_readiness: list[dict] = []
     real_dispatch = rrp._dispatch_candidate_body_via_edit_txn
 
     def _spy(**kwargs):
         calls.append(kwargs["issue_number"])
+        precomputed_readiness.append(kwargs["precomputed_readiness"])
         return {"status": "ok", "mutation_started": True, "body_update": {"attempted": True, "status": "ok"},
                 "content_update": {"patch_attempted": True, "mutation_outcome": "applied"}}
 
@@ -235,6 +263,10 @@ def test_consumer_reuses_edit_issue_txn_core(tmp_path: Path) -> None:
         )
 
     assert calls == [ISSUE_NUMBER], "structural consumer's default transaction must call the shared dispatch core"
+    expected_body, synth_error = rrp._synthesize_structural_repaired_body(bundle["items"], ORIGINAL_BODY)
+    assert synth_error is None
+    assert precomputed_readiness[0]["status"] == "go"
+    assert precomputed_readiness[0]["body_sha256"] == f"sha256:{_hex(expected_body)}"
     assert result["mutation_outcome"] == "applied"
     assert real_dispatch is rrp._dispatch_candidate_body_via_edit_txn
 
@@ -612,6 +644,293 @@ def test_receipt_projection_matches_generic_lane_semantics(
     assert len(apply_txn.calls) == 1, "no blind retry -- exactly one dispatch"
     if expected_outcome == "unknown":
         assert result["phase"] != "complete"
+
+def test_structural_go_runs_real_checker_once_then_dispatches_once(tmp_path: Path) -> None:
+    """AC1/AC5: the production synthesized body is checked exactly once;
+    only the GitHub transaction boundary is a spy."""
+    bundle = _build_bundle()
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+    real_run = rrp.subprocess.run
+    readiness_calls: list[list[str]] = []
+
+    def _counting_run(argv, **kwargs):
+        if "contract_readiness_check.py" in str(argv[1]):
+            readiness_calls.append(argv)
+        return real_run(argv, **kwargs)
+
+    with mock.patch.object(rrp.subprocess, "run", side_effect=_counting_run):
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+            apply_transaction=transaction,
+        )
+
+    assert len(readiness_calls) == 1
+    assert len(transaction.calls) == 1
+    assert result["mutation_outcome"] == "applied"
+    assert "readiness_diagnostics" not in result
+
+
+def test_default_structural_shared_core_reuses_real_readiness_once_and_spies_only_transaction(
+    tmp_path: Path,
+) -> None:
+    """AC1/AC5/AC12: exercise the DEFAULT structural route end-to-end.
+
+    Candidate synthesis, structural routing, and static readiness are all
+    production code.  The sole double is the GitHub transaction subprocess,
+    whose invocation also proves the shared core forwards the digest-bound
+    result rather than launching its own readiness checker.
+    """
+    bundle = _build_bundle()
+    result_path = _write_artifact(tmp_path, bundle)
+    expected_body, synth_error = rrp._synthesize_structural_repaired_body(bundle["items"], ORIGINAL_BODY)
+    assert synth_error is None
+    assert expected_body is not None
+    real_run = rrp.subprocess.run
+    readiness_calls: list[list[str]] = []
+    transaction_calls: list[list[str]] = []
+    transaction_inputs: list[dict] = []
+
+    def _spy_transaction_boundary(argv, **kwargs):
+        if "contract_readiness_check.py" in str(argv[1]):
+            readiness_calls.append(argv)
+            return real_run(argv, **kwargs)
+        if "edit_issue_txn.py" in str(argv[1]):
+            transaction_calls.append(argv)
+            transaction_input_path = Path(kwargs["cwd"]) / argv[3]
+            transaction_inputs.append(json.loads(transaction_input_path.read_text(encoding="utf-8")))
+            return mock.Mock(
+                stdout=json.dumps(_applied_txn_result(expected_body)), stderr="", returncode=0
+            )
+        return real_run(argv, **kwargs)
+
+    with mock.patch.object(rrp.subprocess, "run", side_effect=_spy_transaction_boundary):
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+        )
+
+    assert len(readiness_calls) == 1
+    assert len(transaction_calls) == 1
+    assert result["mutation_outcome"] == "applied"
+    readiness_result = transaction_inputs[0]["readiness_forwarding_payload"]["readiness_result"]
+    assert readiness_result["status"] == "go"
+    assert readiness_result["body_sha256"] == f"sha256:{_hex(expected_body)}"
+    assert readiness_result["readiness_result_ref"] == "transaction-local"
+
+
+def test_structural_needs_fix_real_checker_short_circuits_transaction(tmp_path: Path) -> None:
+    """AC2: a real static-checker `needs_fix` result is routed before the
+    transaction boundary and only bounded diagnostics are exposed."""
+    nonready_template = TEMPLATE_TEXT.replace(
+        (
+            "```bash\n"
+            "        $ uv run --locked pytest "
+            "          .claude/skills/issue-refinement-loop/tests/"
+            "test_structural_repair_action_apply_consumer.py -q\n"
+            "        ```"
+        ),
+        "pnpm test",
+    )
+    bundle = _build_bundle(template_text=nonready_template)
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+
+    result = rrp.run_structural_repair_action_apply(
+        repo=REPO,
+        issue_number=ISSUE_NUMBER,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=_fetch_stub(ORIGINAL_BODY),
+        apply_transaction=transaction,
+    )
+
+    assert transaction.calls == []
+    assert result["phase"] == "candidate_readiness"
+    assert result["mutation_outcome"] == "not_attempted"
+    assert result["failure_code"] == "structural_readiness_needs_fix"
+    assert result["failure_code"] != "transaction_execute_error"
+    diagnostics = result["readiness_diagnostics"]
+    assert diagnostics["status"] == "needs_fix"
+    assert diagnostics["rule_ids"] == sorted(set(diagnostics["rule_ids"]))
+    assert diagnostics["truncated"] is False
+    assert set(diagnostics) == {"status", "rule_ids", "truncated"}
+    assert "candidate_body" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    ("status", "returncode", "expected_failure", "expected_rule_ids"),
+    [
+        ("human_judgment", 2, "structural_readiness_human_judgment", ["AAA", "ZZZ"]),
+        ("runtime_error", 4, "structural_readiness_runtime_error", ["AAA", "ZZZ"]),
+        ("input_or_runtime_error", None, "structural_readiness_input_or_runtime_error", []),
+    ],
+)
+def test_structural_non_go_checker_outcomes_short_circuit_without_transaction(
+    tmp_path: Path,
+    status: str,
+    returncode: int | None,
+    expected_failure: str,
+    expected_rule_ids: list[str],
+) -> None:
+    """AC3/AC4: checker-domain and normalized tool outcomes retain their
+    readiness-specific classification rather than becoming transaction errors."""
+    bundle = _build_bundle()
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+    candidate_digest_holder: dict[str, str] = {}
+
+    def _checker_result(*, candidate_body: str, candidate_path: Path):
+        candidate_digest_holder["digest"] = f"sha256:{_hex(candidate_body)}"
+        return (
+            {
+                "status": status,
+                "body_sha256": candidate_digest_holder["digest"],
+                "source_checks": [],
+                "errors": [{"rule_id": "ZZZ"}, {"rule_id": "AAA"}, {"rule_id": "AAA"}],
+            },
+            returncode,
+        )
+
+    with mock.patch.object(rrp, "_evaluate_candidate_static_readiness", side_effect=_checker_result):
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+            apply_transaction=transaction,
+        )
+
+    assert transaction.calls == []
+    assert result["mutation_outcome"] == "not_attempted"
+    assert result["failure_code"] == expected_failure
+    assert result["failure_code"] != "transaction_execute_error"
+    assert result["readiness_diagnostics"] == {
+        "status": status,
+        "rule_ids": expected_rule_ids,
+        "truncated": False,
+    }
+
+
+def test_structural_short_circuit_diagnostics_are_bounded_and_deterministic(tmp_path: Path) -> None:
+    bundle = _build_bundle()
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+
+    def _checker_result(*, candidate_body: str, candidate_path: Path):
+        return (
+            {
+                "status": "needs_fix",
+                "body_sha256": f"sha256:{_hex(candidate_body)}",
+                "source_checks": [],
+                "errors": [{"rule_id": f"RULE_{value:02d}"} for value in range(20, -1, -1)],
+            },
+            1,
+        )
+
+    with mock.patch.object(rrp, "_evaluate_candidate_static_readiness", side_effect=_checker_result):
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+            apply_transaction=transaction,
+        )
+
+    diagnostics = result["readiness_diagnostics"]
+    assert transaction.calls == []
+    assert diagnostics["rule_ids"] == [f"RULE_{value:02d}" for value in range(16)]
+    assert diagnostics["truncated"] is True
+
+
+def test_structural_checker_go_without_digest_is_normalized_before_transaction(tmp_path: Path) -> None:
+    """A syntactically-successful but incomplete `go` envelope cannot promote
+    a consumer-generated digest into transaction authorization."""
+    bundle = _build_bundle()
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+
+    def _checker_without_digest(argv, **_kwargs):
+        assert "contract_readiness_check.py" in str(argv[1])
+        return mock.Mock(stdout=json.dumps({"status": "go"}), stderr="", returncode=0)
+
+    with mock.patch.object(rrp.subprocess, "run", side_effect=_checker_without_digest):
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+            apply_transaction=transaction,
+        )
+
+    rendered = json.dumps(result)
+    assert transaction.calls == []
+    assert result["mutation_outcome"] == "not_attempted"
+    assert result["failure_code"] == "structural_readiness_input_or_runtime_error"
+    assert result["readiness_diagnostics"] == {
+        "status": "input_or_runtime_error",
+        "rule_ids": [],
+        "truncated": False,
+    }
+    assert '"go"' not in rendered
+    assert "Traceback" not in rendered
+
+
+def test_structural_checker_null_errors_is_normalized_before_transaction(tmp_path: Path) -> None:
+    """A digest-correct `needs_fix` envelope still requires list-shaped
+    diagnostics and never leaks malformed checker output to stdout."""
+    bundle = _build_bundle()
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+
+    def _checker_with_null_errors(argv, **_kwargs):
+        assert "contract_readiness_check.py" in str(argv[1])
+        candidate_body = Path(argv[3]).read_text(encoding="utf-8")
+        return mock.Mock(
+            stdout=json.dumps(
+                {
+                    "status": "needs_fix",
+                    "body_sha256": f"sha256:{_hex(candidate_body)}",
+                    "source_checks": [],
+                    "errors": None,
+                }
+            ),
+            stderr="",
+            returncode=1,
+        )
+
+    with mock.patch.object(rrp.subprocess, "run", side_effect=_checker_with_null_errors):
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+            apply_transaction=transaction,
+        )
+
+    rendered = json.dumps(result)
+    assert transaction.calls == []
+    assert result["mutation_outcome"] == "not_attempted"
+    assert result["failure_code"] == "structural_readiness_input_or_runtime_error"
+    assert result["readiness_diagnostics"] == {
+        "status": "input_or_runtime_error",
+        "rule_ids": [],
+        "truncated": False,
+    }
+    assert '"needs_fix"' not in rendered
+    assert '"errors"' not in rendered
+    assert "Traceback" not in rendered
 
 
 if __name__ == "__main__":
