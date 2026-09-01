@@ -3633,6 +3633,27 @@ def _mark_actual_agy_invocation_attempted() -> None:
     _AGY_INVOCATION_ATTEMPTED_CTX.set(True)
 
 
+_BWRAP_STATUS_MAX_BYTES = 64 * 1024
+
+
+def _bwrap_status_reports_child_started(status: bytes) -> bool:
+    """Return whether bwrap's bounded status stream proves it started its child."""
+    if not status or len(status) > _BWRAP_STATUS_MAX_BYTES:
+        return False
+    try:
+        records = [json.loads(line) for line in status.splitlines()]
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not records or any(not isinstance(record, dict) for record in records):
+        return False
+    return any(
+        isinstance(record.get("child-pid"), int)
+        and not isinstance(record.get("child-pid"), bool)
+        and record["child-pid"] > 0
+        for record in records
+    )
+
+
 def _get_agy_audit_raw_command() -> list[str]:
     """Return the `raw_command` value for the current agy invocation
     (Issue #1807 fix_delta Blocker 1).
@@ -3810,25 +3831,48 @@ def _run_agy(
             # `absent` modes leave `agy_oauth_token_bwrap_prefix` `None` and
             # `command` unchanged, matching pre-#1779 behavior exactly.
             bwrap_prefix = workspace.agy_oauth_token_bwrap_prefix
-            run_command = command if not bwrap_prefix else list(bwrap_prefix) + command
             if not bwrap_prefix:
                 # This direct subprocess is the actual AGY execution boundary.
                 _mark_actual_agy_invocation_attempted()
-            completed = subprocess.run(
-                run_command,
-                cwd=str(workspace.workspace_dir),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-                check=False,
-                shell=False,
-            )
-            if bwrap_prefix and completed.returncode == 0:
-                # bwrap has no exec acknowledgement. Only its successful completion
-                # establishes that AGY was reached; a bwrap nonzero/exception remains
-                # attempted:false and must fail closed rather than permit fallback.
-                _mark_actual_agy_invocation_attempted()
+                completed = subprocess.run(
+                    command,
+                    cwd=str(workspace.workspace_dir),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                    check=False,
+                    shell=False,
+                )
+            else:
+                # `bwrap` reports a child-pid only after it has started the
+                # command inside its sandbox. This distinguishes a bwrap setup
+                # failure from an attempted AGY invocation even when both exit
+                # nonzero; do not infer the boundary from the exit status.
+                if bwrap_prefix[-1] != "--":
+                    raise RuntimeError("malformed_bwrap_prefix")
+                with tempfile.TemporaryFile() as status_file:
+                    status_fd = status_file.fileno()
+                    run_command = list(bwrap_prefix[:-1]) + [
+                        "--json-status-fd",
+                        str(status_fd),
+                        "--",
+                    ] + command
+                    completed = subprocess.run(
+                        run_command,
+                        cwd=str(workspace.workspace_dir),
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_sec,
+                        check=False,
+                        shell=False,
+                        pass_fds=(status_fd,),
+                    )
+                    status_file.seek(0)
+                    bwrap_status = status_file.read(_BWRAP_STATUS_MAX_BYTES + 1)
+                if _bwrap_status_reports_child_started(bwrap_status):
+                    _mark_actual_agy_invocation_attempted()
 
             if _AGY_PROVENANCE_AVAILABLE and hook_load_error is None:
                 try:
