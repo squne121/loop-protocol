@@ -574,6 +574,19 @@ peer を start、list、message、observe して inbound behavior を証明し�
 deny 後も維持する lifecycle は `Agent(...)` spawn → terminal completion のみであり、
 post-spawn SendMessage/resume/agent-team coordination は要求しない。feature/runtime が
 利用不能な場合は bounded reason-code SKIP (exit 77) であり PASS へ昇格しない。
+## Claude-GPT 実行時のシークレット非出力固定診断（Issue #2471）
+
+Claude Code linked worktree で `CLAUDE_GPT_HOME` と `HOME` の関係を切り分ける必要がある場合は、任意の環境変数・path・式を受け取る command を作らず、次の fixed literal invocation だけを使う。
+
+```bash
+uv run --locked python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-root-state
+uv run --locked python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-home-class
+uv run --locked python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-root-relation
+```
+
+helper は `CLAUDE_GPT_HOME` と `HOME` だけを classification 内部で読み、各 successful call では fixed enum 一行だけを stdout に出す。raw environment value、raw absolute path、secret は stdout / stderr に出力しない。unknown probe ID、extra argument、または positional probe ID 以外の invocation は `error=invalid_arguments` と nonzero で拒否する。
+
+classification は raw string の非empty `/` prefix と exact string comparison だけを使う。filesystem access、path expansion / normalization / resolution、symlink resolution、file read は行わない。runtime smoke の prompt と `summary.md` にも fixed enum / boolean 以外を残さず、raw output、prompt、transcript、environment value、path を commit または GitHub へ投稿しない。
 
 ## main drift 選択的再束縛の証跡契約（Issue #2102）
 
