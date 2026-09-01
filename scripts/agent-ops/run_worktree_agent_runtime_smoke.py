@@ -4311,6 +4311,7 @@ def run_interactive_herdr_isolated(
         # is the own-session readiness operation; no session-list poll or
         # socket lookup is permitted in the default lane.
         session_proc = create_isolated_session(herdr_bin, session_name, isolated_env, timeout_seconds=20.0)
+        evidence["cleanup"]["session_started"] = True
         isolated_env["HERDR_SESSION"] = session_name
 
         claude_bin_receipt_path: str | None = None
@@ -5678,7 +5679,13 @@ def main(argv: list[str] | None = None) -> int:
                 "detected_agent_confidence": None,
                 "prompt_stall_recovered": None,
                 "turns_completed": 0,
-                "cleanup": {"attempted": False, "stop_rc": None, "delete_rc": None, "confirmed_removed": False},
+                "cleanup": {
+                    "attempted": False,
+                    "session_started": False,
+                    "stop_rc": None,
+                    "delete_rc": None,
+                    "confirmed_removed": False,
+                },
             }
             pane_output_lines: list[str] = []
 
@@ -5970,7 +5977,16 @@ def main(argv: list[str] | None = None) -> int:
                 if args.require_session_baseline_preservation
                 else None
             )
-            if cleanup.get("attempted") and not cleanup.get("confirmed_removed"):
+            # A failed own-session cleanup remains a hard failure once a
+            # session process was successfully started.  A nested-session
+            # refusal can occur before that point; its named session never
+            # existed, so an unconfirmable no-op cleanup must preserve the
+            # already-classified explicit SKIP rather than convert it to FAIL.
+            if (
+                cleanup.get("session_started")
+                and cleanup.get("attempted")
+                and not cleanup.get("confirmed_removed")
+            ):
                 errors.append("herdr isolated session cleanup could not be confirmed removed")
                 exit_code = EXIT_FAIL
 

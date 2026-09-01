@@ -1005,6 +1005,7 @@ case "$1" in
         exit 0
         ;;
       stop)
+        [ -e "$STATE_DIR/$3.session" ] || exit 1
         touch "$STATE_DIR/$3.stopped"
         exit 0
         ;;
@@ -1090,6 +1091,9 @@ def test_given_nested_herdr_refusal_when_interactive_lane_runs_then_exit77_has_b
     assert result.returncode == 77
     evidence = json.loads(evidence_json.read_text(encoding="utf-8"))
     assert evidence["runtime_skip_reason_code"] == "herdr_isolated_session_unavailable"
+    assert evidence["cleanup_attempted"] is True
+    assert evidence["cleanup_confirmed_removed"] is False
+    assert "cleanup could not be confirmed" not in result.stderr
     assert evidence["herdr_namespace_isolated"] is None
     assert evidence["preexisting_herdr_preserved"] is None
 
@@ -1330,15 +1334,21 @@ def test_given_isolated_session_cleanup_not_confirmed_removed_when_lane_finishes
     _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "exit 0\n")
     prompt = _prompt_file(tmp_path)
     out_dir = tmp_path / "out"
+    evidence_json = tmp_path / "interactive-evidence.json"
     result = _run(
         repo, worktree,
         "--runtime", "claude", "--mode", "interactive",
         "--prompt-file", str(prompt), "--output-dir", str(out_dir),
+        "--evidence-json", str(evidence_json),
         fake_bin_dir=fake_bin,
         extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(tmp_path / "herdr-state")},
     )
     assert result.returncode == 1
     assert "cleanup" in result.stderr
+    evidence = json.loads(evidence_json.read_text(encoding="utf-8"))
+    assert "runtime_skip_reason_code" not in evidence
+    assert evidence["cleanup_attempted"] is True
+    assert evidence["cleanup_confirmed_removed"] is False
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "cleanup_confirmed_removed: False" in summary
 
