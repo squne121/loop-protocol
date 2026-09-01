@@ -66,7 +66,8 @@ body:
       label: "Verification Commands"
       value: |
         ```bash
-        $ uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_structural_repair_action_apply_consumer.py -q
+        $ uv run --locked pytest \
+          .claude/skills/issue-refinement-loop/tests/test_structural_repair_action_apply_consumer.py -q
         ```
     validations:
       required: true
@@ -678,7 +679,13 @@ def test_structural_needs_fix_real_checker_short_circuits_transaction(tmp_path: 
     """AC2: a real static-checker `needs_fix` result is routed before the
     transaction boundary and only bounded diagnostics are exposed."""
     nonready_template = TEMPLATE_TEXT.replace(
-        "```bash\n        $ uv run --locked pytest .claude/skills/issue-refinement-loop/tests/test_structural_repair_action_apply_consumer.py -q\n        ```",
+        (
+            "```bash\n"
+            "        $ uv run --locked pytest "
+            "          .claude/skills/issue-refinement-loop/tests/"
+            "test_structural_repair_action_apply_consumer.py -q\n"
+            "        ```"
+        ),
         "pnpm test",
     )
     bundle = _build_bundle(template_text=nonready_template)
