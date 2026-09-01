@@ -3809,10 +3809,11 @@ def _run_agy(
             # in this branch changes -- `degraded_symlink_reachability` /
             # `absent` modes leave `agy_oauth_token_bwrap_prefix` `None` and
             # `command` unchanged, matching pre-#1779 behavior exactly.
-            run_command = command
-            if workspace.agy_oauth_token_bwrap_prefix:
-                run_command = list(workspace.agy_oauth_token_bwrap_prefix) + command
-            _mark_actual_agy_invocation_attempted()
+            bwrap_prefix = workspace.agy_oauth_token_bwrap_prefix
+            run_command = command if not bwrap_prefix else list(bwrap_prefix) + command
+            if not bwrap_prefix:
+                # This direct subprocess is the actual AGY execution boundary.
+                _mark_actual_agy_invocation_attempted()
             completed = subprocess.run(
                 run_command,
                 cwd=str(workspace.workspace_dir),
@@ -3823,6 +3824,11 @@ def _run_agy(
                 check=False,
                 shell=False,
             )
+            if bwrap_prefix and completed.returncode == 0:
+                # bwrap has no exec acknowledgement. Only its successful completion
+                # establishes that AGY was reached; a bwrap nonzero/exception remains
+                # attempted:false and must fail closed rather than permit fallback.
+                _mark_actual_agy_invocation_attempted()
 
             if _AGY_PROVENANCE_AVAILABLE and hook_load_error is None:
                 try:
