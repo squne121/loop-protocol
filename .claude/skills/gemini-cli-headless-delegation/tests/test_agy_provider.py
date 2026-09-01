@@ -1092,36 +1092,75 @@ def test_canonical_agy_failure_kind_rejects_unknown_pair_class() -> None:
 
 
 def test_agy_invocation_attempted_is_false_before_subprocess() -> None:
-    result = rgh.run_delegation(_agy_request(prompt=""))
+    # An invalid request stops before the producer-owned direct subprocess
+    # boundary, rather than merely reporting a false ContextVar afterwards.
+    with patch("subprocess.run", side_effect=AssertionError("pre-AGY request must not spawn a subprocess")):
+        result = rgh.run_delegation(_agy_request(prompt=""))
 
     assert result["ok"] is False
     assert result["agy_invocation_attempted"] is False
 
 
-def test_agy_invocation_attempted_failure_is_true_after_subprocess_boundary() -> None:
-    def fake_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess:
+def test_agy_invocation_attempted_failure_is_true_after_subprocess_boundary(monkeypatch) -> None:
+    fake_agy_bin = "/hermetic/agy-ac10-timing"
+    fixed_prompt = "AC10 timing failure invocation"
+    observed_argvs: list[list[Any]] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+
+    def fake_run(cmd: Any, **_kwargs: Any) -> subprocess.CompletedProcess:
+        # A kernel-enforced OAuth workspace may prepend bwrap. The canonical
+        # AGY argv remains the exact terminal subsequence, so this observer
+        # accepts no broker or unrelated subprocess command.
+        assert isinstance(cmd, list)
+        actual_argv = list(cmd)
+        observed_argvs.append(actual_argv)
+        assert actual_argv[-3:] == [fake_agy_bin, "-p", fixed_prompt]
         assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True
         return _make_completed(1, stderr="simulated process failure")
 
-    with patch("subprocess.run", side_effect=fake_run):
-        result = rgh.run_delegation(_agy_request())
+    try:
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        with patch("subprocess.run", side_effect=fake_run):
+            result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+    finally:
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
 
+    assert observed_argvs and len(observed_argvs) == 1
     assert result["ok"] is False
     assert result["agy_invocation_attempted"] is True
     assert result["agy_failure_kind"] == "operational"
     assert rgh.canonical_agy_failure_kind(result["failure_class"]) == "operational"
 
 
-def test_agy_invocation_attempted_becomes_true_at_subprocess_boundary() -> None:
-    def fake_run(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess:
+def test_agy_invocation_attempted_becomes_true_at_subprocess_boundary(monkeypatch) -> None:
+    fake_agy_bin = "/hermetic/agy-ac10-timing"
+    fixed_prompt = "AC10 timing success invocation"
+    observed_argvs: list[list[Any]] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+
+    def fake_run(cmd: Any, **_kwargs: Any) -> subprocess.CompletedProcess:
+        # See the failure case: bwrap is an optional prefix, not the AGY
+        # invocation being observed.
+        assert isinstance(cmd, list)
+        actual_argv = list(cmd)
+        observed_argvs.append(actual_argv)
+        assert actual_argv[-3:] == [fake_agy_bin, "-p", fixed_prompt]
         assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True
         return _make_completed(0, stdout="LOOP_AGY_SMOKE_OK")
 
-    with patch("subprocess.run", side_effect=fake_run):
-        result = rgh.run_delegation(_agy_request())
+    try:
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        with patch("subprocess.run", side_effect=fake_run):
+            result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+    finally:
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
 
+    assert observed_argvs and len(observed_argvs) == 1
     assert result["ok"] is True
     assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] is None
 
 
 # ---------------------------------------------------------------------------
