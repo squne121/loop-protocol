@@ -549,7 +549,7 @@ Claude Code／Codex CLI の runtime smoke（linked worktree 内での fresh sess
 経由しない。runner は起動・観測・証跡収集だけを所有し、Codex CLI 側の
 sandbox／permission profile（本文書の Root Default Permission Profile）は変更しない。
 
-## Claude-GPT runtime の secret-free fixed diagnostic（Issue #2471）
+## Claude-GPT 実行時のシークレット非出力固定診断（Issue #2471）
 
 Claude Code linked worktree で `CLAUDE_GPT_HOME` と `HOME` の関係を切り分ける必要がある場合は、任意の環境変数・path・式を受け取る command を作らず、次の fixed literal invocation だけを使う。
 
