@@ -554,9 +554,9 @@ sandbox／permission profile（本文書の Root Default Permission Profile）�
 Claude Code linked worktree で `CLAUDE_GPT_HOME` と `HOME` の関係を切り分ける必要がある場合は、任意の環境変数・path・式を受け取る command を作らず、次の fixed literal invocation だけを使う。
 
 ```bash
-python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-root-state
-python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-home-class
-python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-root-relation
+uv run --locked python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-root-state
+uv run --locked python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-home-class
+uv run --locked python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-root-relation
 ```
 
 helper は `CLAUDE_GPT_HOME` と `HOME` だけを classification 内部で読み、各 successful call では fixed enum 一行だけを stdout に出す。raw environment value、raw absolute path、secret は stdout / stderr に出力しない。unknown probe ID、extra argument、または positional probe ID 以外の invocation は `error=invalid_arguments` と nonzero で拒否する。
