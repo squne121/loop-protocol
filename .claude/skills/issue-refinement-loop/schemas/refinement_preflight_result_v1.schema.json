@@ -651,6 +651,7 @@
                       "parent_issue",
                       "owner_anchor",
                       "design_reference",
+                      "current_issue",
                       null
                     ]
                   },
