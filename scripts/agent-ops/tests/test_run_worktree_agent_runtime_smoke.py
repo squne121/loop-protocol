@@ -1810,6 +1810,8 @@ def test_given_secret_like_hex_tokens_when_redacted_then_only_named_public_evide
             "tested_head": poison_hex_40,
             "prompt_sha256": poison_hex_64,
             "mutation_boundary": {"settings_digest_sha256": "c" * 64},
+            "settings_provenance": {"digest_sha256": "d" * 64},
+            "untrusted_metadata": {"digest_sha256": "e" * 64},
         }
     )
     assert evidence["untrusted_hex_40"] == "<redacted>"
@@ -1818,6 +1820,8 @@ def test_given_secret_like_hex_tokens_when_redacted_then_only_named_public_evide
     assert evidence["tested_head"] == poison_hex_40
     assert evidence["prompt_sha256"] == poison_hex_64
     assert evidence["mutation_boundary"]["settings_digest_sha256"] == "c" * 64
+    assert evidence["settings_provenance"]["digest_sha256"] == "d" * 64
+    assert evidence["untrusted_metadata"]["digest_sha256"] == "<redacted>"
 
 
 def test_given_ansi_escape_codes_in_error_output_when_evidence_written_then_stripped(

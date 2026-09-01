@@ -98,13 +98,14 @@ _SECRET_LIKE_RE = re.compile(
 )
 
 # Public integrity values are preserved only by their explicit evidence-field
-# identities during serialization. Never exempt a token merely because its
-# text happens to look like a Git SHA or a digest.
+# paths during serialization. Never exempt a token merely because its text
+# happens to look like a Git SHA or a digest.
 _PUBLIC_EVIDENCE_SHA_LENGTHS = {
-    "tested_head": 40,
-    "prompt_sha256": 64,
-    "resolved_executable_sha256": 64,
-    "settings_digest_sha256": 64,
+    ("tested_head",): 40,
+    ("prompt_sha256",): 64,
+    ("resolved_executable_sha256",): 64,
+    ("mutation_boundary", "settings_digest_sha256"): 64,
+    ("settings_provenance", "digest_sha256"): 64,
 }
 
 # CLI color/formatting escape sequences (observed in real ``herdr`` stderr
@@ -141,26 +142,26 @@ def _redact(text: str) -> str:
     return _SECRET_LIKE_RE.sub("<redacted>", text)
 
 
-def _is_public_evidence_sha(field_name: str | None, value: str) -> bool:
+def _is_public_evidence_sha(field_path: tuple[str, ...], value: str) -> bool:
     """Return whether a validated, explicitly-designated evidence field is safe."""
-    expected_length = _PUBLIC_EVIDENCE_SHA_LENGTHS.get(field_name or "")
+    expected_length = _PUBLIC_EVIDENCE_SHA_LENGTHS.get(field_path)
     return expected_length is not None and bool(
         re.fullmatch(rf"[0-9a-fA-F]{{{expected_length}}}", value)
     )
 
 
-def _redact_evidence_value(value: object, *, field_name: str | None = None) -> object:
+def _redact_evidence_value(value: object, *, field_path: tuple[str, ...] = ()) -> object:
     """Recursively redact persisted evidence, preserving only named SHA fields."""
     if isinstance(value, str):
-        return value if _is_public_evidence_sha(field_name, value) else _redact(value)
+        return value if _is_public_evidence_sha(field_path, value) else _redact(value)
     if isinstance(value, list):
-        return [_redact_evidence_value(item) for item in value]
+        return [_redact_evidence_value(item, field_path=field_path) for item in value]
     if isinstance(value, tuple):
-        return tuple(_redact_evidence_value(item) for item in value)
+        return tuple(_redact_evidence_value(item, field_path=field_path) for item in value)
     if isinstance(value, dict):
         return {
             _redact(key) if isinstance(key, str) else key: _redact_evidence_value(
-                item, field_name=key if isinstance(key, str) else None
+                item, field_path=field_path + (key,) if isinstance(key, str) else field_path
             )
             for key, item in value.items()
         }
