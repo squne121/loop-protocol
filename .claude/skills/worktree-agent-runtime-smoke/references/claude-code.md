@@ -211,7 +211,7 @@ issue-refinement-loop/scripts/run_native_session_continuation_canary.py` の
 AC6 の reuse 境界により、この workaround 自体は本 SKILL の汎用 harness へは
 追加していない）。
 
-## Herdr baseline-preservation opt-in（Issue #2437）
+## Herdr baseline-preservation の明示 opt-in（Issue #2437）
 
 通常の `--mode interactive` は high-entropy isolated session を生成し、ambient
 `HERDR_*` を strip して own-name の lifecycle だけを操作する。pre-existing/human
