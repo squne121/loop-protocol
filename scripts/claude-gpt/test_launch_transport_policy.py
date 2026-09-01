@@ -230,15 +230,34 @@ def test_build_proxy_env_helper_references_same_transport_policy_constant():
     assert "CCP_CODEX_TRANSPORT=" in body
 
 
-def test_claude_gpt_runtime_smoke_settings_contain_exact_fixed_peer_policy(tmp_path):
-    """The launcher, rather than a caller setting, owns the exact policy."""
+def test_default_check_only_settings_exclude_runtime_smoke_peer_policy(tmp_path):
+    """Default launcher invocations must retain unrelated denials only."""
     result = _run_check_only(tmp_path)
     assert result.returncode == 0, result.stderr
 
     settings_path = tmp_path / "claude-gpt-home" / "claude" / "settings.local.json"
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert "crossSessionInbound" not in settings
+    assert "SendMessage" not in settings["permissions"]["deny"]
+    assert "ListAgents" not in settings["permissions"]["deny"]
+
+
+@pytest.mark.parametrize("smoke_channel", ["subagent-start-stop", "hook-sink-multi-turn"])
+def test_recognized_runtime_smoke_channel_settings_contain_exact_fixed_peer_policy(tmp_path, smoke_channel):
+    """Only existing fixed runtime-smoke channels receive the launcher policy."""
+    extra_env = {"CLAUDE_GPT_RUNTIME_SMOKE_HOOKS": smoke_channel}
+    if smoke_channel == "hook-sink-multi-turn":
+        extra_env["CLAUDE_GPT_HOOK_SINK_NONCE"] = "test-nonce"
+    result = _run_check_only(tmp_path, extra_env=extra_env)
+    assert result.returncode == 0, result.stderr
+
+    settings_path = tmp_path / "claude-gpt-home" / "claude" / "settings.local.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    deny = settings["permissions"]["deny"]
     assert settings["crossSessionInbound"] == "refuse"
-    assert settings["permissions"]["deny"][:2] == ["SendMessage", "ListAgents"]
+    assert deny[-2:] == ["SendMessage", "ListAgents"]
+    assert deny.count("SendMessage") == 1
+    assert deny.count("ListAgents") == 1
 
 
 def test_claude_gpt_public_settings_flag_remains_rejected():

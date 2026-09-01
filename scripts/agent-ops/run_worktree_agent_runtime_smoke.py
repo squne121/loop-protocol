@@ -97,6 +97,16 @@ _SECRET_LIKE_RE = re.compile(
     r"([A-Za-z0-9+/]{40,}=*)"
 )
 
+# Public integrity values are preserved only by their explicit evidence-field
+# identities during serialization. Never exempt a token merely because its
+# text happens to look like a Git SHA or a digest.
+_PUBLIC_EVIDENCE_SHA_LENGTHS = {
+    "tested_head": 40,
+    "prompt_sha256": 64,
+    "resolved_executable_sha256": 64,
+    "settings_digest_sha256": 64,
+}
+
 # CLI color/formatting escape sequences (observed in real ``herdr`` stderr
 # output) are cosmetic noise, not secrets, but they degrade the readability
 # of persisted evidence and are stripped for cleanliness.
@@ -126,31 +136,32 @@ _ISOLATION_ENV_KEYS_TO_STRIP = (
 
 
 def _redact(text: str) -> str:
+    """Redact every secret-like token in arbitrary text."""
     text = _ANSI_ESCAPE_RE.sub("", text)
-
-    def _replacement(match: re.Match[str]) -> str:
-        value = match.group(0)
-        # Tested-head and digest fields are fixed-length public Git/SHA-256
-        # evidence, not secret-like tokens. Keep their machine-verifiable
-        # values while still redacting every other long token.
-        if len(value) in {40, 64} and re.fullmatch(r"[0-9a-fA-F]+", value):
-            return value
-        return "<redacted>"
-
-    return _SECRET_LIKE_RE.sub(_replacement, text)
+    return _SECRET_LIKE_RE.sub("<redacted>", text)
 
 
-def _redact_evidence_value(value: object) -> object:
-    """Recursively redact every persisted evidence value, not just errors."""
+def _is_public_evidence_sha(field_name: str | None, value: str) -> bool:
+    """Return whether a validated, explicitly-designated evidence field is safe."""
+    expected_length = _PUBLIC_EVIDENCE_SHA_LENGTHS.get(field_name or "")
+    return expected_length is not None and bool(
+        re.fullmatch(rf"[0-9a-fA-F]{{{expected_length}}}", value)
+    )
+
+
+def _redact_evidence_value(value: object, *, field_name: str | None = None) -> object:
+    """Recursively redact persisted evidence, preserving only named SHA fields."""
     if isinstance(value, str):
-        return _redact(value)
+        return value if _is_public_evidence_sha(field_name, value) else _redact(value)
     if isinstance(value, list):
         return [_redact_evidence_value(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_redact_evidence_value(item) for item in value)
     if isinstance(value, dict):
         return {
-            _redact(key) if isinstance(key, str) else key: _redact_evidence_value(item)
+            _redact(key) if isinstance(key, str) else key: _redact_evidence_value(
+                item, field_name=key if isinstance(key, str) else None
+            )
             for key, item in value.items()
         }
     return value

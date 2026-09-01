@@ -1792,6 +1792,34 @@ def test_given_home_paths_in_nested_schema_fields_when_evidence_written_then_red
     assert ".claude/worktrees/issue-2437-fixture" in summary_text
 
 
+def test_given_secret_like_hex_tokens_when_redacted_then_only_named_public_evidence_is_preserved():
+    module = _load_module()
+    poison_hex_40 = "a" * 40
+    poison_hex_64 = "b" * 64
+    ordinary_long_token = "Z" * 60
+
+    assert module._redact(poison_hex_40) == "<redacted>"
+    assert module._redact(poison_hex_64) == "<redacted>"
+    assert module._redact(ordinary_long_token) == "<redacted>"
+
+    evidence = module._redact_evidence_value(
+        {
+            "untrusted_hex_40": poison_hex_40,
+            "untrusted_hex_64": poison_hex_64,
+            "untrusted_long_token": ordinary_long_token,
+            "tested_head": poison_hex_40,
+            "prompt_sha256": poison_hex_64,
+            "mutation_boundary": {"settings_digest_sha256": "c" * 64},
+        }
+    )
+    assert evidence["untrusted_hex_40"] == "<redacted>"
+    assert evidence["untrusted_hex_64"] == "<redacted>"
+    assert evidence["untrusted_long_token"] == "<redacted>"
+    assert evidence["tested_head"] == poison_hex_40
+    assert evidence["prompt_sha256"] == poison_hex_64
+    assert evidence["mutation_boundary"]["settings_digest_sha256"] == "c" * 64
+
+
 def test_given_ansi_escape_codes_in_error_output_when_evidence_written_then_stripped(
     repo_with_worktree, tmp_path
 ):
