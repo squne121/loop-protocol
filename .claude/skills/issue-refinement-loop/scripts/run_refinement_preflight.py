@@ -6565,8 +6565,21 @@ def consume_trusted_anchor_contract_patch_plan(
                 # `exec_module()` raises unconditionally, which previously
                 # made this gate collapse to `"unavailable"` on every call
                 # regardless of the actual profile/argv validity.
+                #
+                # #2473 fix_delta (owner REQUEST_CHANGES on PR #2476): if
+                # `exec_module()` itself raises, remove the partially
+                # initialized module from `sys.modules` again before
+                # propagating, matching standard import machinery semantics
+                # and the existing pattern in
+                # `.claude/skills/agent-retrospective/scripts/collect_snapshot.py`.
+                # A failed module load must not leave a half-initialized
+                # module registered for a later retry to observe.
                 sys.modules[policy_spec.name] = policy_module
-                policy_spec.loader.exec_module(policy_module)
+                try:
+                    policy_spec.loader.exec_module(policy_module)
+                except Exception:
+                    sys.modules.pop(policy_spec.name, None)
+                    raise
                 context = known_context if isinstance(known_context, dict) else {}
                 human_urls = _normalize_comment_url_set(context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD))
                 profile = (

@@ -680,3 +680,105 @@ def test_ac3_bounded_contract_update_handoff_not_blocked_by_permission_profile_w
     }
     handoff = preflight._bounded_contract_update_handoff(result)
     assert handoff["status"] != "failed", handoff
+
+
+def test_permission_profile_gate_pops_partial_module_from_sys_modules_when_exec_module_raises(tmp_path, monkeypatch):
+    """#2473 fix_delta regression (owner REQUEST_CHANGES on PR #2476): if
+    `exec_module()` raises while loading `skill_runtime_command_policy.py`
+    inside `fresh_checks()`'s `permission_profile` sub-gate, the
+    partially-initialized module must NOT remain registered in
+    `sys.modules` under `"post_update_runtime_policy"` afterward. This
+    matches standard import machinery semantics and the existing
+    registered -> try/except -> pop-on-failure pattern in
+    `.claude/skills/agent-retrospective/scripts/collect_snapshot.py`.
+
+    The real `skill_runtime_command_policy.py` cannot easily be made to
+    fail during `exec_module()`, so this test redirects the dynamic load
+    to a stand-in file (same registered module name, same real path used
+    for the identity check) whose module body raises unconditionally.
+    """
+    repo_root = Path(preflight._find_repo_root())
+    real_policy_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_command_policy.py"
+    assert real_policy_path.is_file()
+
+    broken_policy_path = tmp_path / "broken_skill_runtime_command_policy.py"
+    broken_policy_path.write_text(
+        "raise RuntimeError('forced exec_module failure for #2473 regression test')\n",
+        encoding="utf-8",
+    )
+
+    real_spec_from_file_location = importlib.util.spec_from_file_location
+
+    def fake_spec_from_file_location(name, location, *args, **kwargs):
+        if name == "post_update_runtime_policy" and Path(location) == real_policy_path:
+            return real_spec_from_file_location(name, broken_policy_path, *args, **kwargs)
+        return real_spec_from_file_location(name, location, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "spec_from_file_location", fake_spec_from_file_location)
+
+    state = {"body": PRE_BODY}
+    known_context = {"human_context_comment_urls": [ANCHOR_URL]}
+
+    def fetch_current():
+        return ({"body": state["body"]}, _anchor())
+
+    def apply(_issue, candidate, _readiness):
+        state["body"] = candidate
+        return {"status": "ok"}
+
+    provenance_dir = tmp_path / "artifacts"
+    provenance_dir.mkdir(parents=True, exist_ok=True)
+
+    def fake_issue_artifact_dir(_repo_root, _issue_number):
+        return provenance_dir
+
+    (provenance_dir / "refinement_preflight_provenance_v1.json").write_text(
+        json.dumps(
+            {
+                "runtime_evidence": {
+                    "source": {"comment_url": ANCHOR_URL, "source_kind": "issue_comment"},
+                    "tested_head_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # A prior test in this module may have left `post_update_runtime_policy`
+    # registered after a *successful* load (intended behavior: success
+    # leaves the module registered). Reset that shared global state so this
+    # test observes only the effect of the forced failure below.
+    sys.modules.pop("post_update_runtime_policy", None)
+
+    with (
+        mock.patch.object(preflight, "run_preflight", return_value=({"status": "pass"}, 0)),
+        mock.patch.object(preflight, "_issue_artifact_dir", side_effect=fake_issue_artifact_dir),
+    ):
+        result = preflight.consume_trusted_anchor_contract_patch_plan(
+            repo=REPO,
+            issue_number=ISSUE,
+            issue={"body": PRE_BODY},
+            anchor_url=ANCHOR_URL,
+            anchor_payload=_anchor(),
+            anchor_body=ANCHOR_BODY,
+            contract_patch_plan=_plan(
+                {
+                    "section": "Acceptance Criteria",
+                    "op": "append",
+                    "text": "- [ ] AC1: desired",
+                    "source_evidence_index": 0,
+                }
+            ),
+            known_context=known_context,
+            callbacks={
+                "candidate_readiness": _readiness,
+                "fetch_current": fetch_current,
+                "apply_transaction": apply,
+            },
+        )
+
+    fresh = result["fresh_checks"]
+    assert fresh["permission_profile"] == "unavailable", fresh
+    assert "post_update_runtime_policy" not in sys.modules, (
+        "exec_module() failure must not leave a partially-initialized module registered in sys.modules"
+    )
