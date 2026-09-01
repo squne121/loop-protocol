@@ -784,7 +784,7 @@ def test_existing_artifacts_dir_unrelated_update_fails(tmp_path: Path) -> None:
     `test_independent_writer_process_with_explicit_barrier_succeeds` --
     no fixed sleep on either side) creates a file under
     `artifacts/unrelated/**` (outside the race-tolerant subtree) and its
-    write is confirmed durably on disk before the child command exits
+    write has completed and is observable before the child command exits
     THEN skill_runtime_exec.py must fail-close with unauthorized_write_path.
 
     Deterministic barrier rationale (replaces a fixed-sleep writer): a fixed
@@ -792,15 +792,16 @@ def test_existing_artifacts_dir_unrelated_update_fails(tmp_path: Path) -> None:
     `before_snapshot` capture in `_validate_runtime_context()` (three git
     subprocess calls before the snapshot is taken) is not bounded -- under
     CPU load the before_snapshot capture can itself take longer than the
-    fixed delay, making the unrelated write land *before* before_snapshot
+    fixed delay, making the unrelated write occur *before* before_snapshot
     instead of *during* the race window, which flips the test to a false
     PASS (`returncode == 0`) instead of the expected fail-closed
     `returncode == 2`. The go-file/ack-file barrier removes this race by
     construction: the child command only creates the go-file (opening the
     race window) after `before_snapshot` has already been captured, and it
-    blocks on the ack-file (confirming the independent writer's write landed
-    on disk) before exiting -- so the unrelated write is guaranteed to occur
-    strictly inside the snapshot diff window regardless of system load."""
+    blocks on the ack-file (confirming the independent writer's write has
+    completed and is observable) before exiting -- so the unrelated write is
+    guaranteed to occur strictly inside the snapshot diff window regardless
+    of system load."""
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
     seed_path = repo / "artifacts" / "session-manifest-runtime" / "manifests" / "seed.json"
@@ -814,6 +815,8 @@ def test_existing_artifacts_dir_unrelated_update_fails(tmp_path: Path) -> None:
     writer = _spawn_independent_writer_process(
         repo, go_file, ack_file, unrelated_path, "peer-unrelated\n"
     )
+    writer_stdout = ""
+    writer_stderr = ""
     try:
         result = _run_executor(
             repo,
@@ -822,10 +825,19 @@ def test_existing_artifacts_dir_unrelated_update_fails(tmp_path: Path) -> None:
                 "SKILL_RUNTIME_TEST_BARRIER_ACK_FILE": str(ack_file),
             },
         )
-        writer_stdout, writer_stderr = writer.communicate(timeout=10)
+        try:
+            writer_stdout, writer_stderr = writer.communicate(timeout=10)
+        except subprocess.TimeoutExpired as exc:
+            writer.kill()
+            writer_stdout, writer_stderr = writer.communicate()
+            raise AssertionError(
+                f"independent writer timed out after {exc.timeout} seconds; "
+                f"stdout={writer_stdout!r}; stderr={writer_stderr!r}"
+            ) from exc
     finally:
         if writer.poll() is None:
             writer.kill()
+            writer_stdout, writer_stderr = writer.communicate()
 
     assert writer.returncode == 0, writer_stderr
     assert result.returncode == 2, result.stdout + result.stderr
