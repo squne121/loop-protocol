@@ -1371,15 +1371,23 @@ def _evaluate_candidate_static_readiness(
         # that a transaction was attempted.
         readiness_stdout = ""
     try:
-        readiness = json.loads(readiness_stdout)
+        observed_readiness = json.loads(readiness_stdout)
     except json.JSONDecodeError:
-        readiness = {}
-    if not isinstance(readiness, dict):
-        readiness = {}
+        observed_readiness = {}
+    if not isinstance(observed_readiness, dict):
+        observed_readiness = {}
+
+    # Keep the generic lane's historical degraded normalization unchanged,
+    # while retaining the unmodified parsed envelope for the structural
+    # lane's digest-bound validation below.  In particular, the structural
+    # caller must be able to distinguish an absent checker digest from a
+    # digest inserted by this legacy generic normalization.
+    readiness = dict(observed_readiness)
     readiness.setdefault("status", "input_or_runtime_error")
     readiness.setdefault("body_sha256", f"sha256:{_sha256(candidate_body)}")
     readiness.setdefault("source_checks", [])
     readiness.setdefault("errors", [])
+    readiness["_observed_checker_envelope"] = observed_readiness
     return readiness, returncode
 
 
@@ -2185,29 +2193,54 @@ def _structural_readiness_diagnostics(readiness: dict) -> dict:
 def _structural_digest_bound_readiness(
     *, candidate_body: str, candidate_path: Path
 ) -> dict:
-    """Evaluate and validate a structural candidate before transaction routing."""
+    """Evaluate one structural candidate at the strict digest-bound boundary.
+
+    The generic consumer intentionally retains the readiness normalizations it
+    has historically forwarded through the shared core.  Structural routing is
+    different: it must validate the checker envelope actually observed before
+    any normalized field can influence transaction dispatch.
+    """
     readiness, returncode = _evaluate_candidate_static_readiness(
         candidate_body=candidate_body,
         candidate_path=candidate_path,
     )
-    status = readiness.get("status")
-    expected_exit_code = _STRUCTURAL_READINESS_EXPECTED_EXIT_CODES.get(status)
+    # Production evaluation retains the unmodified parsed checker object under
+    # this private key.  Test doubles that supply the evaluator directly are
+    # treated as the observed envelope, preserving their focused seam.
+    observed = readiness.get("_observed_checker_envelope")
+    if not isinstance(observed, dict):
+        observed = readiness
+
+    status = observed.get("status")
     candidate_digest = f"sha256:{_sha256(candidate_body)}"
+    expected_exit_code = _STRUCTURAL_READINESS_EXPECTED_EXIT_CODES.get(status) if isinstance(status, str) else None
     if (
-        expected_exit_code is None
+        not isinstance(status, str)
+        or expected_exit_code is None
         or returncode != expected_exit_code
-        or readiness.get("body_sha256") != candidate_digest
+        or not isinstance(observed.get("body_sha256"), str)
+        or observed["body_sha256"] != candidate_digest
+        or not isinstance(observed.get("source_checks"), list)
+        or not isinstance(observed.get("errors"), list)
     ):
-        # A malformed process result, unknown status, exit/status disagreement,
-        # or body-digest mismatch cannot be safely forwarded as a candidate
-        # readiness decision. Do not expose the raw checker payload.
+        # Malformed process results, unknown status, exit/status disagreement,
+        # incomplete envelopes, and digest mismatch all fail before the shared
+        # transaction core.  Do not expose the raw checker payload.
         return {
             "status": "input_or_runtime_error",
-            "body_sha256": candidate_digest,
             "source_checks": [],
             "errors": [],
         }
-    return readiness
+
+    # Forward only the validated envelope fields.  This keeps private
+    # evaluator metadata and any unrelated checker output out of the
+    # transaction input and stdout contract.
+    return {
+        "status": status,
+        "body_sha256": observed["body_sha256"],
+        "source_checks": observed["source_checks"],
+        "errors": observed["errors"],
+    }
 
 
 def _structural_apply_not_attempted_result(
@@ -2674,12 +2707,15 @@ def run_structural_repair_action_apply(
     # Structural routing evaluates the real, synthesized whole body before
     # transaction dispatch. The result is digest-bound and reused by the
     # shared core on `go`; every other checker disposition stops here.
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", encoding="utf-8") as readiness_file:
-        readiness_file.write(new_body)
-        readiness_file.flush()
+    # The checker receives a closed, ordinary path.  Keeping it in a private
+    # temporary directory avoids the open NamedTemporaryFile pathname handoff
+    # while retaining one ephemeral, per-invocation candidate file.
+    with tempfile.TemporaryDirectory() as readiness_dir:
+        readiness_path = Path(readiness_dir) / "candidate_body.md"
+        readiness_path.write_text(new_body, encoding="utf-8")
         readiness = _structural_digest_bound_readiness(
             candidate_body=new_body,
-            candidate_path=Path(readiness_file.name),
+            candidate_path=readiness_path,
         )
     readiness_status = readiness.get("status")
     if readiness_status != "go":

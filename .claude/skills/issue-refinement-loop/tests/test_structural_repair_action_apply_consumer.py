@@ -852,5 +852,86 @@ def test_structural_short_circuit_diagnostics_are_bounded_and_deterministic(tmp_
     assert diagnostics["truncated"] is True
 
 
+def test_structural_checker_go_without_digest_is_normalized_before_transaction(tmp_path: Path) -> None:
+    """A syntactically-successful but incomplete `go` envelope cannot promote
+    a consumer-generated digest into transaction authorization."""
+    bundle = _build_bundle()
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+
+    def _checker_without_digest(argv, **_kwargs):
+        assert "contract_readiness_check.py" in str(argv[1])
+        return mock.Mock(stdout=json.dumps({"status": "go"}), stderr="", returncode=0)
+
+    with mock.patch.object(rrp.subprocess, "run", side_effect=_checker_without_digest):
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+            apply_transaction=transaction,
+        )
+
+    rendered = json.dumps(result)
+    assert transaction.calls == []
+    assert result["mutation_outcome"] == "not_attempted"
+    assert result["failure_code"] == "structural_readiness_input_or_runtime_error"
+    assert result["readiness_diagnostics"] == {
+        "status": "input_or_runtime_error",
+        "rule_ids": [],
+        "truncated": False,
+    }
+    assert '"go"' not in rendered
+    assert "Traceback" not in rendered
+
+
+def test_structural_checker_null_errors_is_normalized_before_transaction(tmp_path: Path) -> None:
+    """A digest-correct `needs_fix` envelope still requires list-shaped
+    diagnostics and never leaks malformed checker output to stdout."""
+    bundle = _build_bundle()
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+
+    def _checker_with_null_errors(argv, **_kwargs):
+        assert "contract_readiness_check.py" in str(argv[1])
+        candidate_body = Path(argv[3]).read_text(encoding="utf-8")
+        return mock.Mock(
+            stdout=json.dumps(
+                {
+                    "status": "needs_fix",
+                    "body_sha256": f"sha256:{_hex(candidate_body)}",
+                    "source_checks": [],
+                    "errors": None,
+                }
+            ),
+            stderr="",
+            returncode=1,
+        )
+
+    with mock.patch.object(rrp.subprocess, "run", side_effect=_checker_with_null_errors):
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+            apply_transaction=transaction,
+        )
+
+    rendered = json.dumps(result)
+    assert transaction.calls == []
+    assert result["mutation_outcome"] == "not_attempted"
+    assert result["failure_code"] == "structural_readiness_input_or_runtime_error"
+    assert result["readiness_diagnostics"] == {
+        "status": "input_or_runtime_error",
+        "rule_ids": [],
+        "truncated": False,
+    }
+    assert '"needs_fix"' not in rendered
+    assert '"errors"' not in rendered
+    assert "Traceback" not in rendered
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
