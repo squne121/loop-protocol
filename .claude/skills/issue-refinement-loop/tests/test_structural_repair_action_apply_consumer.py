@@ -675,6 +675,57 @@ def test_structural_go_runs_real_checker_once_then_dispatches_once(tmp_path: Pat
     assert "readiness_diagnostics" not in result
 
 
+def test_default_structural_shared_core_reuses_real_readiness_once_and_spies_only_transaction(
+    tmp_path: Path,
+) -> None:
+    """AC1/AC5/AC12: exercise the DEFAULT structural route end-to-end.
+
+    Candidate synthesis, structural routing, and static readiness are all
+    production code.  The sole double is the GitHub transaction subprocess,
+    whose invocation also proves the shared core forwards the digest-bound
+    result rather than launching its own readiness checker.
+    """
+    bundle = _build_bundle()
+    result_path = _write_artifact(tmp_path, bundle)
+    expected_body, synth_error = rrp._synthesize_structural_repaired_body(bundle["items"], ORIGINAL_BODY)
+    assert synth_error is None
+    assert expected_body is not None
+    real_run = rrp.subprocess.run
+    readiness_calls: list[list[str]] = []
+    transaction_calls: list[list[str]] = []
+    transaction_inputs: list[dict] = []
+
+    def _spy_transaction_boundary(argv, **kwargs):
+        if "contract_readiness_check.py" in str(argv[1]):
+            readiness_calls.append(argv)
+            return real_run(argv, **kwargs)
+        if "edit_issue_txn.py" in str(argv[1]):
+            transaction_calls.append(argv)
+            transaction_input_path = Path(kwargs["cwd"]) / argv[3]
+            transaction_inputs.append(json.loads(transaction_input_path.read_text(encoding="utf-8")))
+            return mock.Mock(
+                stdout=json.dumps(_applied_txn_result(expected_body)), stderr="", returncode=0
+            )
+        return real_run(argv, **kwargs)
+
+    with mock.patch.object(rrp.subprocess, "run", side_effect=_spy_transaction_boundary):
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+        )
+
+    assert len(readiness_calls) == 1
+    assert len(transaction_calls) == 1
+    assert result["mutation_outcome"] == "applied"
+    readiness_result = transaction_inputs[0]["readiness_forwarding_payload"]["readiness_result"]
+    assert readiness_result["status"] == "go"
+    assert readiness_result["body_sha256"] == f"sha256:{_hex(expected_body)}"
+    assert readiness_result["readiness_result_ref"] == "transaction-local"
+
+
 def test_structural_needs_fix_real_checker_short_circuits_transaction(tmp_path: Path) -> None:
     """AC2: a real static-checker `needs_fix` result is routed before the
     transaction boundary and only bounded diagnostics are exposed."""
