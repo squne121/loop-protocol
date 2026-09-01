@@ -11,7 +11,20 @@
 # --- 定数（GPT 専用ディレクトリ分離。CLAUDE_CONFIG_DIR / CCP_CONFIG_DIR / XDG_STATE_HOME 相当） ---
 
 # CLAUDE_GPT_HOME を上書きしない限り $HOME/.claude-gpt を使う。
+#
+# Issue #2455: launcher が後段で `HOME` を child Claude 用の isolated HOME へ
+# 差し替える（launch.sh の `export HOME="$CLAUDE_ISOLATED_HOME_TARGET"`）ため、
+# ここで解決した canonical runtime root を明示的に `export` しておかないと、
+# child Claude セッションから同じ launcher/lib.sh を self-launch した際に
+# `CLAUDE_GPT_HOME` が未継承のまま isolated HOME を基準に再導出され、nested
+# `<isolated-claude-home>/.claude-gpt` root へ再基準化されてしまう
+# （Background/Outcome 節参照）。復元経路は launcher が child process
+# environment へ export するこの単一経路のみとし、生成済み settings 経由の
+# 別経路は追加しない（AC1）。`CLAUDE_GPT_HOME_ROOT`（Latitude telemetry 用の
+# derived mirror。Issue #2426）はこの root authority の fallback には使わない
+# （AC1/AC2 の回帰テスト対象）。
 : "${CLAUDE_GPT_HOME:=${HOME}/.claude-gpt}"
+export CLAUDE_GPT_HOME
 
 claude_gpt_claude_config_dir() {
   printf '%s/claude\n' "$CLAUDE_GPT_HOME"
@@ -130,6 +143,61 @@ spec.loader.exec_module(module)
 allowlist = module.read_native_latitude_allowlist(settings_path)
 sys.stdout.write(allowlist.get("LATITUDE_PROJECT") or "")
 ' "$hook_path" "$native_settings_path" 2>/dev/null
+}
+
+# claude_gpt_resolve_native_settings_path: Native Latitude settings.json
+# authority への絶対パスを、isolated HOME / Claude-GPT config-root への切替
+# *前* の ambient 環境から一度だけ resolve する（Issue #2448。PR #2439 owner
+# review P2 note の follow-up、OWNER review issuecomment-5477101989 の P0
+# self-launch 誤認指摘を受けた precedence 設計）。
+#
+# precedence（決定論的、上から順に最初に非空だったものを採用）:
+#   1. 引数1（inherited `CLAUDE_GPT_NATIVE_SETTINGS_PATH`）— outer launcher が
+#      既に resolve 済みの re-entrant carrier。self-launch（同一 launcher の
+#      再起動）境界を跨いでも exact identity を維持するため、非空なら
+#      無条件でそのまま採用し、二重解決（isolated HOME を基準にした再導出）
+#      は行わない。
+#   2. 引数2（ambient `CLAUDE_CONFIG_DIR`）— Claude Code 公式の Native profile
+#      authority。非空なら `${CLAUDE_CONFIG_DIR}/settings.json` を採用する。
+#      `CLAUDE_CONFIG_DIR` が絶対パスならそのまま使う。相対パスの場合は
+#      PR #2466 OWNER review（issuecomment-5478243138 P1）が指摘したとおり、
+#      焼き込んだ carrier 文字列がその後の CWD 変化（self-launch を含む）で
+#      別の filesystem object を指してしまう exact-identity 破綻を防ぐため、
+#      この関数呼び出し時点の outer CWD（`$(pwd)`）を基準に一度だけ**lexical
+#      に**絶対化する（`realpath`/symlink 解決や existence 検証は行わない。
+#      `~` の展開もしない — 既存の絶対パス値の挙動を変えないため）。
+#   3. 引数3（`HOME`）を使った `${HOME}/.claude/settings.json` フォールバック
+#      （従来からの既定動作。#2426 の挙動を保つ）。
+#
+# 呼び出し側は isolated HOME 切替（`export HOME="$CLAUDE_ISOLATED_HOME_TARGET"`）
+# より前の行でこの関数を呼び出すこと。ambient `CLAUDE_GPT_NATIVE_SETTINGS_PATH`
+# / `CLAUDE_CONFIG_DIR` を上書きしないよう、呼び出し側は展開済みの値を引数と
+# して渡す（この関数自体は環境変数を直接読まない）。
+#
+# 引数1: inherited `CLAUDE_GPT_NATIVE_SETTINGS_PATH`（空文字列可）
+# 引数2: ambient `CLAUDE_CONFIG_DIR`（空文字列可。絶対/相対いずれも可）
+# 引数3: `HOME`（非空を期待。isolated HOME 切替前の ambient 実 HOME）
+# 戻り値: resolve された Native settings.json への絶対パス（改行付き）
+claude_gpt_resolve_native_settings_path() {
+  inherited_native_settings_path="$1"
+  ambient_claude_config_dir="$2"
+  ambient_home="$3"
+  if [ -n "$inherited_native_settings_path" ]; then
+    printf '%s\n' "$inherited_native_settings_path"
+    return 0
+  fi
+  if [ -n "$ambient_claude_config_dir" ]; then
+    case "$ambient_claude_config_dir" in
+      /*)
+        printf '%s/settings.json\n' "$ambient_claude_config_dir"
+        ;;
+      *)
+        printf '%s/%s/settings.json\n' "$(pwd)" "$ambient_claude_config_dir"
+        ;;
+    esac
+    return 0
+  fi
+  printf '%s/.claude/settings.json\n' "$ambient_home"
 }
 
 # --- Model alias mapping（Parent #2154 アーキテクチャ決定 E 準拠） ---

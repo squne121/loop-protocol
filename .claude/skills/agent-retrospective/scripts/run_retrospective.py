@@ -783,10 +783,33 @@ _AGENT_INVOCATION_STATUSES = frozenset(
 #: raw stdout blob (mirrors collect_snapshot.py's `_safe_diagnostic_text`).
 _MAX_STDOUT_EXCERPT = 200
 
-#: subprocess environment passthrough allowlist used when no
-#: ``DelegatedAgentPermissionPolicy`` is supplied (defensive fallback only --
-#: production callers always supply a policy; see ``run_cli``).
-_DEFAULT_ENV_PASSTHROUGH_ALLOWLIST = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ"})
+#: environment variable names never forwarded to a delegated Agent's
+#: subprocess, regardless of what else is present (Issue #2445 AC1:
+#: replaces the prior allowlist-only design). These carry mutation
+#: authority (git/gh credentials, cloud credentials, SSH agent socket) that
+#: has no legitimate use inside a read-only observer/evaluator invocation
+#: (Issue #2237 P0-5). Everything else -- including provider transport env
+#: vars such as ``ANTHROPIC_BASE_URL``/``ANTHROPIC_AUTH_TOKEN``/
+#: ``ANTHROPIC_MODEL``/``CLAUDE_CONFIG_DIR`` -- is inherited from the parent
+#: environment by default (Issue #2445; mirrors the sibling
+#: ``plugins/agent-retrospective/skills/run/scripts/run_retrospective.py``
+#: implementation's denylist semantics, which motivated this replacement).
+_MUTATION_CREDENTIAL_ENV_VARS = frozenset(
+    {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GIT_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "NPM_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "NPM_AUTH_TOKEN",
+    }
+)
 
 # ---------------------------------------------------------------------------
 # codebase-investigator role adapter (Issue #2374; schema-selection/
@@ -842,7 +865,12 @@ def _stdout_excerpt(text: str | None) -> str | None:
 
 
 def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
-    return {k: v for k, v in env.items() if k in _DEFAULT_ENV_PASSTHROUGH_ALLOWLIST}
+    """Issue #2445 AC1: inherit the parent environment by default, stripping
+    only ``_MUTATION_CREDENTIAL_ENV_VARS`` (see that constant's docstring).
+    Used as the fallback when no ``DelegatedAgentPermissionPolicy`` is
+    supplied (defensive fallback only -- production callers always supply a
+    policy; see ``run_cli``)."""
+    return {k: v for k, v in env.items() if k not in _MUTATION_CREDENTIAL_ENV_VARS}
 
 
 #: Matches every markdown fence *delimiter* line (an opening line such as
@@ -2926,31 +2954,12 @@ _DENIED_PIPELINE_OPERATOR_TOKENS = frozenset({";", "&", "&&", "||", "\n", "\r"})
 
 _DENIED_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Agent", "Skill"})
 
-#: environment variable names never forwarded to a delegated Agent's
-#: subprocess, regardless of allowlist configuration -- these carry mutation
-#: authority (git/gh credentials, cloud credentials, SSH agent socket) that
-#: has no legitimate use inside a read-only observer/evaluator invocation
-#: (Issue #2237 P0-5).
-_MUTATION_CREDENTIAL_ENV_VARS = frozenset(
-    {
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_ENTERPRISE_TOKEN",
-        "GIT_ASKPASS",
-        "SSH_AUTH_SOCK",
-        "SSH_AGENT_PID",
-        "NPM_TOKEN",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "NPM_AUTH_TOKEN",
-    }
-)
-#: environment variables always safe to pass through unchanged.
-_ENV_PASSTHROUGH_ALLOWLIST = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TZ"})
-#: caller-supplied run-scoped variables (never credentials) are passed
-#: through when prefixed like this -- e.g. ``AGENT_RETROSPECTIVE_RUN_ID``.
+#: caller-supplied run-scoped variables (never credentials) built by this
+#: module elsewhere (e.g. ``AGENT_RETROSPECTIVE_RUN_ID``). Issue #2445 AC1:
+#: no longer consulted by ``sanitize_subprocess_env``/``_default_sanitized_env``
+#: (those are denylist-based now, see ``_MUTATION_CREDENTIAL_ENV_VARS``) --
+#: retained only for the ``env=`` dict-building call sites below that still
+#: reference this prefix constant.
 _RUN_SCOPED_ENV_PREFIX = "AGENT_RETROSPECTIVE_"
 
 
@@ -3353,19 +3362,21 @@ class DelegatedAgentPermissionPolicy:
 
     def sanitize_subprocess_env(self, env: dict[str, str]) -> dict[str, str]:
         """Build the environment actually forwarded to a delegated Agent's
-        subprocess (Issue #2237 P0-5): unconditionally excludes
-        ``_MUTATION_CREDENTIAL_ENV_VARS`` regardless of what else is
-        allowlisted, passes ``_ENV_PASSTHROUGH_ALLOWLIST`` unchanged, and
-        passes through caller-supplied run-scoped variables (prefixed
-        ``AGENT_RETROSPECTIVE_``, e.g. the run's ``run_id``/``base_sha``) --
-        never the full ambient ``os.environ``."""
-        sanitized: dict[str, str] = {}
-        for key, value in env.items():
-            if key in _MUTATION_CREDENTIAL_ENV_VARS:
-                continue
-            if key in _ENV_PASSTHROUGH_ALLOWLIST or key.startswith(_RUN_SCOPED_ENV_PREFIX):
-                sanitized[key] = value
-        return sanitized
+        subprocess (Issue #2237 P0-5, replaced by Issue #2445 AC1 with
+        denylist-based semantics): inherits ``env`` (built by ``invoke_agent``
+        as ``{**os.environ, **request.env}``) unconditionally excluding only
+        ``_MUTATION_CREDENTIAL_ENV_VARS``. This restores continuity for
+        provider transport / model-selection / other non-mutation Claude
+        runtime env vars (``ANTHROPIC_BASE_URL``, ``ANTHROPIC_AUTH_TOKEN``,
+        ``ANTHROPIC_MODEL``, ``ANTHROPIC_DEFAULT_*_MODEL``,
+        ``CLAUDE_CONFIG_DIR``, ``CLAUDE_CODE_AUTO_COMPACT_WINDOW``, etc.) that
+        the prior allowlist-only design silently dropped (Issue #2436
+        Background) -- no new claude-gpt-specific opt-in flag is introduced;
+        this mirrors the sibling
+        ``plugins/agent-retrospective/skills/run/scripts/run_retrospective.py``
+        implementation's ``sanitize_subprocess_env``/``_default_sanitized_env``
+        pair exactly."""
+        return _default_sanitized_env(env)
 
 
 # ---------------------------------------------------------------------------
