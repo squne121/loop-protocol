@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import json
 import base64
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -468,3 +470,213 @@ def test_uses_only_existing_current_main_paths():
     assert not (SCRIPTS_DIR / "build_refinement_phase_state.py").exists()
     assert not (SKILL_ROOT.parent / "issue-author").exists()
     assert (SCRIPTS_DIR / "scope_signal_delta.py").is_file()
+
+
+# --- #2473: post-update `permission_profile` gate sys.modules regression ---
+#
+# `fresh_checks()`'s `permission_profile` sub-gate dynamically loads
+# `scripts/agent-guards/skill_runtime_command_policy.py` via
+# `importlib.util.spec_from_file_location()` -> `module_from_spec()` ->
+# `exec_module()`. That module defines a module-level `@dataclass(frozen=True)`
+# under `from __future__ import annotations`, whose deferred string
+# annotations are resolved via `sys.modules[cls.__module__]`. Without
+# registering the freshly created module object in `sys.modules` BEFORE
+# `exec_module()` runs, that lookup fails and `exec_module()` raises
+# unconditionally -- collapsing the gate to `"unavailable"` on every call,
+# regardless of the actual profile/argv validity.
+
+
+def test_ac1_production_dynamic_load_pattern_registers_sys_modules_and_succeeds():
+    """AC1: reproduces the exact production `importlib` load path (spec ->
+    module_from_spec -> sys.modules registration -> exec_module) used by
+    `fresh_checks()`'s `permission_profile` gate, and confirms the target
+    parser becomes usable rather than raising (not a grep-only check)."""
+    repo_root = Path(preflight._find_repo_root())
+    policy_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_command_policy.py"
+    assert policy_path.is_file()
+
+    spec = importlib.util.spec_from_file_location("test_post_update_runtime_policy_ac1", policy_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
+
+    assert hasattr(module, "parse_exact_skill_runtime_contract_update_anchor_command")
+    parsed = module.parse_exact_skill_runtime_contract_update_anchor_command(
+        shlex.join(
+            [
+                "uv", "run", "python3", "scripts/agent-guards/skill_runtime_exec.py",
+                "--command-id", "contract_update.run.with_human_context",
+                "--issue-number", str(ISSUE),
+                "--repo", REPO,
+                "--anchor-comment-url", ANCHOR_URL,
+                "--human-context-comment-url", ANCHOR_URL,
+            ]
+        ),
+        str(repo_root),
+    )
+    assert parsed is not None
+
+
+def test_ac2_ac3_consumer_uses_production_fresh_checks_and_permission_profile_gate_passes(tmp_path):
+    """AC2: `consume_trusted_anchor_contract_patch_plan()` regression that does
+    NOT inject a `fresh_checks` callback (no bypass of the real closure) --
+    the production `fresh_checks()` runs for real, including its
+    `permission_profile` sub-gate. Only GitHub mutation / privileged executor
+    / network boundaries unrelated to this defect (`run_preflight()`'s live
+    `gh` reads, and the runtime-evidence artifact directory) are stubbed.
+
+    AC3 (first half): with a valid human-context anchor directive/profile,
+    `permission_profile == "pass"` (never the pre-fix permanent
+    `"unavailable"`)."""
+    state = {"body": PRE_BODY}
+    known_context = {"human_context_comment_urls": [ANCHOR_URL]}
+
+    def fetch_current():
+        return ({"body": state["body"]}, _anchor())
+
+    def apply(_issue, candidate, _readiness):
+        state["body"] = candidate
+        return {"status": "ok"}
+
+    provenance_dir = tmp_path / "artifacts"
+    provenance_dir.mkdir(parents=True, exist_ok=True)
+
+    def fake_issue_artifact_dir(_repo_root, _issue_number):
+        return provenance_dir
+
+    (provenance_dir / "refinement_preflight_provenance_v1.json").write_text(
+        json.dumps(
+            {
+                "runtime_evidence": {
+                    "source": {"comment_url": ANCHOR_URL, "source_kind": "issue_comment"},
+                    "tested_head_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with (
+        mock.patch.object(preflight, "run_preflight", return_value=({"status": "pass"}, 0)),
+        mock.patch.object(preflight, "_issue_artifact_dir", side_effect=fake_issue_artifact_dir),
+    ):
+        result = preflight.consume_trusted_anchor_contract_patch_plan(
+            repo=REPO,
+            issue_number=ISSUE,
+            issue={"body": PRE_BODY},
+            anchor_url=ANCHOR_URL,
+            anchor_payload=_anchor(),
+            anchor_body=ANCHOR_BODY,
+            contract_patch_plan=_plan(
+                {
+                    "section": "Acceptance Criteria",
+                    "op": "append",
+                    "text": "- [ ] AC1: desired",
+                    "source_evidence_index": 0,
+                }
+            ),
+            known_context=known_context,
+            callbacks={
+                "candidate_readiness": _readiness,
+                "fetch_current": fetch_current,
+                "apply_transaction": apply,
+                # NOTE: intentionally no "fresh_checks" callback here -- #2473
+                # AC2 requires exercising the production closure for real.
+            },
+        )
+
+    assert result["status"] == "applied", result
+    fresh = result["fresh_checks"]
+    assert fresh["permission_profile"] == "pass", fresh
+    assert fresh["preflight"] == "pass"
+    assert fresh["review"] == "approve"
+    assert fresh["readiness"] == "go"
+    assert fresh["runtime_evidence"] == "pass"
+
+
+def test_ac3_bounded_contract_update_handoff_not_blocked_by_permission_profile_when_other_gates_pass(tmp_path):
+    """AC3 (second half): with the other five post-update gates fixed at
+    their pass-equivalent values, the six-gate aggregate
+    (`_bounded_contract_update_handoff`) is no longer fail-closed on
+    `permission_profile == "unavailable"` -- confirming the sys.modules
+    registration fix actually unblocks the aggregate, not merely that the
+    gate reports `"pass"` in isolation."""
+    small_valid_body = (
+        "## Acceptance Criteria\n\n- [ ] AC1: placeholder\n\n"
+        "## Allowed Paths\n\n- `scripts/example.py`\n- `tests/example_test.py`\n"
+    )
+    state = {"body": small_valid_body}
+    known_context = {"human_context_comment_urls": [ANCHOR_URL]}
+
+    def fetch_current():
+        return ({"body": state["body"]}, _anchor())
+
+    def apply(_issue, candidate, _readiness):
+        state["body"] = candidate
+        return {"status": "ok"}
+
+    provenance_dir = tmp_path / "artifacts"
+    provenance_dir.mkdir(parents=True, exist_ok=True)
+    (provenance_dir / "refinement_preflight_provenance_v1.json").write_text(
+        json.dumps(
+            {
+                "runtime_evidence": {
+                    "source": {"comment_url": ANCHOR_URL, "source_kind": "issue_comment"},
+                    "tested_head_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_issue_artifact_dir(_repo_root, _issue_number):
+        return provenance_dir
+
+    with (
+        mock.patch.object(preflight, "run_preflight", return_value=({"status": "pass"}, 0)),
+        mock.patch.object(preflight, "_issue_artifact_dir", side_effect=fake_issue_artifact_dir),
+        # The review sub-gate's `check_issue_contract.py` subprocess call and
+        # `allowed_paths`/`permission_profile` are otherwise independent local
+        # checks; only the review subprocess (unrelated to #2473's defect) is
+        # stubbed here so this test can isolate the aggregate's dependency on
+        # `permission_profile` without needing a full C1-C11-compliant body.
+        mock.patch.object(preflight.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")),
+    ):
+        result = preflight.consume_trusted_anchor_contract_patch_plan(
+            repo=REPO,
+            issue_number=ISSUE,
+            issue={"body": small_valid_body},
+            anchor_url=ANCHOR_URL,
+            anchor_payload=_anchor(),
+            anchor_body=ANCHOR_BODY,
+            contract_patch_plan=_plan(
+                {
+                    "section": "Acceptance Criteria",
+                    "op": "append",
+                    "text": "- [ ] AC2: desired",
+                    "source_evidence_index": 0,
+                }
+            ),
+            known_context=known_context,
+            callbacks={
+                "candidate_readiness": _readiness,
+                "fetch_current": fetch_current,
+                "apply_transaction": apply,
+            },
+        )
+
+    fresh = result["fresh_checks"]
+    assert fresh == {
+        "preflight": "pass",
+        "review": "approve",
+        "readiness": "go",
+        "allowed_paths": "pass",
+        "permission_profile": "pass",
+        "runtime_evidence": "pass",
+    }
+    handoff = preflight._bounded_contract_update_handoff(result)
+    assert handoff["status"] != "failed", handoff

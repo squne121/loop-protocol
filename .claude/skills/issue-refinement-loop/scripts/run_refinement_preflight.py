@@ -6556,6 +6556,16 @@ def consume_trusted_anchor_contract_patch_plan(
             policy_spec = importlib.util.spec_from_file_location("post_update_runtime_policy", policy_path)
             if policy_spec is not None and policy_spec.loader is not None:
                 policy_module = importlib.util.module_from_spec(policy_spec)
+                # #2473: the module defines a module-level
+                # `@dataclass(frozen=True)` under `from __future__ import
+                # annotations`. Dataclass processing resolves those deferred
+                # string annotations via `sys.modules[cls.__module__]` --
+                # without registering this dynamically-loaded module there
+                # BEFORE `exec_module()` runs, that lookup fails and
+                # `exec_module()` raises unconditionally, which previously
+                # made this gate collapse to `"unavailable"` on every call
+                # regardless of the actual profile/argv validity.
+                sys.modules[policy_spec.name] = policy_module
                 policy_spec.loader.exec_module(policy_module)
                 context = known_context if isinstance(known_context, dict) else {}
                 human_urls = _normalize_comment_url_set(context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD))
