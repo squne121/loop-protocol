@@ -1435,7 +1435,7 @@ def _extract_vc_ac_refs(vc_section: str) -> set[str]:
     return refs
 
 
-def check_c5_ac_vc_alignment(body: str) -> tuple[str, list[str]]:
+def check_c5_ac_vc_alignment(body: str, issue_kind: str = "implementation") -> tuple[str, list[str]]:
     """C5: AC と VC の番号一致チェック（#993: shared parser ベースに統一）
 
     VC 内の AC 参照として以下の形式を認識する:
@@ -1444,6 +1444,12 @@ def check_c5_ac_vc_alignment(body: str) -> tuple[str, list[str]]:
     - Inline suffix: $ command  # AC1
 
     Range 表記 (# AC2-AC4) は本 Issue のスコープ外であり、サポートしない (AC3b)。
+
+    `.github/ISSUE_TEMPLATE/research.yml` は AC セクションを番号なしの `- [ ]`
+    チェックボックス形式で提示しており、AC[N] 番号を要求しない。
+    issue_kind in ("research", "tracking") かつ AC 番号が一つも見つからない場合は
+    NA を返す（C1/C4/C8/C9 と同じ issue_kind-aware パターン、#2480）。
+    AC 番号が存在する research/tracking Issue では通常通り alignment を検証する。
     """
     ac_section = extract_section(body, "Acceptance Criteria")
     vc_section = extract_section(body, "Verification Commands")
@@ -1467,6 +1473,8 @@ def check_c5_ac_vc_alignment(body: str) -> tuple[str, list[str]]:
 
     # AC 番号と VC 参照が全て一致するか
     if not ac_numbers:
+        if issue_kind in ("research", "tracking"):
+            return CheckResult.NA, []
         return CheckResult.FAIL, ["AC セクションに AC[N] 番号が見つからない"]
 
     missing_in_vc = ac_numbers - vc_ac_refs
@@ -2449,7 +2457,7 @@ def run_checks(
         result.parsed_vc_commands = parse_vc_commands(vc_section)
 
     # C5
-    checks.C5_ac_vc_number_alignment, issues = check_c5_ac_vc_alignment(body)
+    checks.C5_ac_vc_number_alignment, issues = check_c5_ac_vc_alignment(body, issue_kind)
     result.blocking_issues.extend(issues)
     _append_findings(
         result,
