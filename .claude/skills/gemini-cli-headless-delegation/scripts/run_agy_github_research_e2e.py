@@ -51,6 +51,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -137,6 +138,46 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _EVIDENCE_SAMPLE_MAX_CHARS = 2000
 
 _ALLOWED_TURN_ACTION_KEYS = {"action", "operation", "params", "summary"}
+
+# A sandbox-wrapper exit status alone cannot establish that the canonical AGY
+# child was ever started. Read no more than this much of bwrap's independent
+# status FD and require its positive child-pid proof before exposing stdout or
+# reporting a producer-owned actual invocation.
+_BWRAP_STATUS_MAX_BYTES = 64 * 1024
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    record: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in record:
+            raise ValueError("duplicate JSON key")
+        record[key] = value
+    return record
+
+
+def _bwrap_status_reports_child_started(status: bytes) -> bool:
+    """Return whether bounded strict bwrap status records prove child start."""
+    if not status or len(status) > _BWRAP_STATUS_MAX_BYTES:
+        return False
+    try:
+        records = [json.loads(line, object_pairs_hook=_reject_duplicate_json_keys) for line in status.splitlines()]
+    except (UnicodeDecodeError, ValueError):
+        return False
+    if not records or any(not isinstance(record, dict) for record in records):
+        return False
+    return any(
+        isinstance(record.get("child-pid"), int)
+        and not isinstance(record.get("child-pid"), bool)
+        and record["child-pid"] > 0
+        for record in records
+    )
+
+
+def _read_bwrap_status(status_file: Any) -> bytes:
+    """Read the bounded bwrap status stream before its temporary FD closes."""
+    status_file.seek(0)
+    return status_file.read(_BWRAP_STATUS_MAX_BYTES + 1)
+
 
 # Static, deterministic negative probes exercised unconditionally (Issue
 # #1920 AC5 close_requirements: at least one pre-execution deny per class).
@@ -624,19 +665,62 @@ def _run_agy_turn(
     command = [*prefix, agy_bin, "-p", prompt]
     cwd = str(workspace.workspace_dir) if workspace is not None else None
     try:
-        if _on_agy_subprocess_execution is not None:
-            _on_agy_subprocess_execution()
-        completed = subprocess.run(
-            command,
-            env=env,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            shell=False,
-            check=False,
-            stdin=subprocess.DEVNULL,
-        )
+        if not prefix:
+            # Without a sandbox wrapper the direct subprocess is the actual
+            # AGY execution boundary.
+            if _on_agy_subprocess_execution is not None:
+                _on_agy_subprocess_execution()
+            completed = subprocess.run(
+                command,
+                env=env,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                shell=False,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        else:
+            # bwrap itself may succeed or fail without ever starting its
+            # sandbox child. Its status FD is the sole trusted proof boundary;
+            # neither the prefix process nor its stdout establishes an actual
+            # AGY invocation.
+            if prefix[-1] != "--":
+                return "", "agy_bwrap_prefix_invalid"
+            with tempfile.TemporaryFile() as status_file:
+                status_fd = status_file.fileno()
+                run_command = list(prefix[:-1]) + ["--json-status-fd", str(status_fd), "--"] + command[len(prefix) :]
+                try:
+                    completed = subprocess.run(
+                        run_command,
+                        env=env,
+                        cwd=cwd,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_seconds,
+                        shell=False,
+                        check=False,
+                        stdin=subprocess.DEVNULL,
+                        pass_fds=(status_fd,),
+                    )
+                except subprocess.TimeoutExpired:
+                    # Preserve the timeout taxonomy, but only report an
+                    # attempted AGY child when bwrap's bounded status proves
+                    # it had already crossed the sandbox boundary.
+                    bwrap_status = _read_bwrap_status(status_file)
+                    if _bwrap_status_reports_child_started(bwrap_status) and _on_agy_subprocess_execution is not None:
+                        _on_agy_subprocess_execution()
+                    raise
+                bwrap_status = _read_bwrap_status(status_file)
+            if _bwrap_status_reports_child_started(bwrap_status):
+                if _on_agy_subprocess_execution is not None:
+                    _on_agy_subprocess_execution()
+            elif completed.returncode == 0:
+                # A zero bwrap exit does not prove a sandbox child started;
+                # discard its unproven stdout and route through the existing
+                # AGY failure normalization without an attempted transition.
+                return "", "agy_exit_nonzero"
     except subprocess.TimeoutExpired:
         return "", "agy_timeout"
     except FileNotFoundError:
