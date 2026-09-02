@@ -745,6 +745,86 @@ def test_issue_editor_permission_canary_requires_structured_parent_and_child_eve
     assert not canary._stream_json_has_tool_use(stdout, "Agent", subagent_type="issue-creator")
 
 
+def test_issue_editor_permission_canary_binds_helper_evidence_to_canonical_bash_result():
+    tool_use_id = "toolu_canonical_bash"
+    helper_result = {
+        "schema": "ISSUE_EDIT_TXN_RESULT_V1",
+        "status": "failed_no_mutation",
+        "mutation_started": False,
+    }
+    stdout = "\n".join(
+        (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": "Bash",
+                                "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND},
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": json.dumps(helper_result),
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps({"type": "result", "result": canary.ISSUE_EDITOR_PERMISSION_CANARY_MARKER}),
+        )
+    )
+
+    assert canary._stream_json_issue_editor_permission_evidence(stdout) == {
+        "canonical_bash_observed": True,
+        "canonical_bash_result_bound": True,
+        "helper_entrypoint_observed": True,
+        "marker_observed": True,
+    }
+
+
+def test_issue_editor_permission_canary_rejects_unbound_helper_text_and_marker():
+    stdout = "\n".join(
+        (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_canonical_bash",
+                                "name": "Bash",
+                                "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND},
+                            }
+                        ]
+                    },
+                }
+            ),
+            "PermissionRequest denied\nfailed_no_mutation\n" + canary.ISSUE_EDITOR_PERMISSION_CANARY_MARKER,
+        )
+    )
+
+    assert canary._stream_json_issue_editor_permission_evidence(stdout) == {
+        "canonical_bash_observed": False,
+        "canonical_bash_result_bound": False,
+        "helper_entrypoint_observed": False,
+        "marker_observed": False,
+    }
+
+
 # --- AC7: sanitized_evidence ---------------------------------------------------
 
 

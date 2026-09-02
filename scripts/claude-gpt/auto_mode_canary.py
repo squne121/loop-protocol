@@ -154,6 +154,114 @@ def _stream_json_has_tool_use(stdout: str, tool_name: str, **input_values: objec
             return True
     return False
 
+
+def _walk_json_dicts(node: object):
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk_json_dicts(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk_json_dicts(value)
+
+
+def _embedded_json_dicts(value: object):
+    """Yield objects from a bound tool result, including its JSON text output."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _embedded_json_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _embedded_json_dicts(child)
+    elif isinstance(value, str):
+        decoder = json.JSONDecoder()
+        cursor = 0
+        while cursor < len(value):
+            starts = [index for index in (value.find("{", cursor), value.find("[", cursor)) if index >= 0]
+            if not starts:
+                return
+            start = min(starts)
+            try:
+                parsed, length = decoder.raw_decode(value[start:])
+            except ValueError:
+                cursor = start + 1
+                continue
+            yield from _embedded_json_dicts(parsed)
+            cursor = start + max(length, 1)
+
+
+def _stream_json_has_terminal_marker(events: list[dict], marker: str) -> bool:
+    """Accept an exact marker only from a structured assistant/result event."""
+    for event in events:
+        if event.get("type") == "result" and isinstance(event.get("result"), str):
+            if event["result"].strip() == marker:
+                return True
+        if event.get("type") != "assistant":
+            continue
+        message = event.get("message", event)
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip() == marker:
+                    return True
+    return False
+
+
+def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool]:
+    """Bind expected helper evidence to the exact canonical Bash tool use.
+
+    The helper intentionally exits nonzero after returning its structured
+    ``failed_no_mutation`` receipt. Therefore success here means a matching
+    tool result contains that no-mutation receipt, not that Bash returned zero.
+    Unstructured transcript text is never accepted as canary evidence.
+    """
+    events: list[dict] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+
+    canonical_ids = {
+        node["id"]
+        for event in events
+        for node in _walk_json_dicts(event)
+        if node.get("type") == "tool_use"
+        and node.get("name") == "Bash"
+        and isinstance(node.get("id"), str)
+        and isinstance(node.get("input"), dict)
+        and node["input"].get("command") == ISSUE_EDITOR_PERMISSION_CANARY_COMMAND
+    }
+    helper_result_bound = any(
+        result.get("tool_use_id") in canonical_ids
+        and any(
+            receipt.get("schema") == "ISSUE_EDIT_TXN_RESULT_V1"
+            and receipt.get("status") == "failed_no_mutation"
+            and receipt.get("mutation_started") is False
+            for receipt in _embedded_json_dicts(result.get("content"))
+        )
+        for event in events
+        for result in _walk_json_dicts(event)
+        if result.get("type") == "tool_result"
+    )
+    bound_marker = helper_result_bound and _stream_json_has_terminal_marker(
+        events, ISSUE_EDITOR_PERMISSION_CANARY_MARKER
+    )
+    return {
+        "canonical_bash_observed": helper_result_bound,
+        "canonical_bash_result_bound": helper_result_bound,
+        "helper_entrypoint_observed": helper_result_bound,
+        "marker_observed": bound_marker,
+    }
+
 NEGATIVE_CONTROL_CASES = (
     "direct_arbitrary_agy_invocation",
     "provider_not_agy",
@@ -659,17 +767,14 @@ def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[i
         return EXIT_SKIP, {"skip_reason": "claude_gpt_auto_runtime_unavailable"}
 
     transcript_digest = _sha256_text(result.stdout + "\n" + result.stderr)[:16]
+    permission_evidence = _stream_json_issue_editor_permission_evidence(result.stdout)
     detail = {
         "launcher_exit_code": result.returncode,
         "transcript_digest": transcript_digest,
         "parent_issue_editor_delegation_observed": _stream_json_has_tool_use(
             result.stdout, "Agent", subagent_type="issue-editor"
         ),
-        "canonical_bash_observed": _stream_json_has_tool_use(
-            result.stdout, "Bash", command=ISSUE_EDITOR_PERMISSION_CANARY_COMMAND
-        ),
-        "helper_entrypoint_observed": "failed_no_mutation" in result.stdout,
-        "marker_observed": ISSUE_EDITOR_PERMISSION_CANARY_MARKER in result.stdout,
+        **permission_evidence,
     }
     if result.returncode in (3, 4, 7, 8):
         return EXIT_SKIP, {"skip_reason": "claude_gpt_auto_runtime_unavailable", **detail}
