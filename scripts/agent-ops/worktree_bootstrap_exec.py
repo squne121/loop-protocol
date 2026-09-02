@@ -21,8 +21,27 @@ _AGENT_GUARDS_DIR = _ROOT / "scripts" / "agent-guards"
 if str(_AGENT_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_AGENT_GUARDS_DIR))
 
-from skill_runtime_command_policy import TRUSTED_REPO_SLUG, resolve_default_branch, resolve_repo_slug  # noqa: E402
-from skill_runtime_exec import resolve_git_subprocess_executable, sanitized_git_subprocess_env  # noqa: E402
+from skill_runtime_command_policy import (  # noqa: E402
+    TRUSTED_REPO_SLUG,
+    resolve_default_branch,
+    resolve_repo_slug,
+    validate_detached_worktree_path,
+    validate_existing_detached_worktree_path,
+    validate_literal_remote_url,
+)
+from skill_runtime_exec import (  # noqa: E402
+    CONTROL_PLANE_CANONICAL_REMOTE_URL,
+    ControlPlaneUnavailable,
+    GitProtocolDeadline,
+    resolve_git_subprocess_executable,
+    run_control_plane_git_add_detached_locked_worktree,
+    run_control_plane_git_delete_private_ref_cas,
+    run_control_plane_git_read_worktree_head,
+    run_control_plane_git_read_worktree_status_porcelain,
+    run_control_plane_git_remove_existing_detached_locked_worktree,
+    run_control_plane_remote_default_ref_binding,
+    sanitized_git_subprocess_env,
+)
 from worktree_bootstrap_command_policy import (  # noqa: E402
     _is_valid_slug,
     expected_branch_name,
@@ -292,6 +311,192 @@ def acquire_control_plane_preflight_lifecycle_mutex(
             _ACQUIRING_CONTROL_PLANE_KEYS.discard(key)
         if fd is not None:
             os.close(fd)
+
+
+# Issue #2197: the one fixed dedicated worktree identity this module
+# recovers/creates/reuses/refreshes -- deliberately the same fixed identity
+# string already used for the lifecycle mutex above, and never
+# caller-selectable (no `--slug`/`--worktree-path` equivalent exists for
+# this path).
+_FIXED_CONTROL_PLANE_WORKTREE_RELATIVE_PATH = Path("worktrees") / _CONTROL_PLANE_PREFLIGHT_LOCK_IDENTITY
+
+
+def fixed_control_plane_worktree_path(project_root: str | os.PathLike[str]) -> str:
+    """The one fixed dedicated worktree path recovered/created by
+    `recover_or_create_fixed_control_plane_worktree` (Issue #2197 AC5), e.g.
+    `.claude/worktrees/control-plane-preflight`."""
+    root = os.path.realpath(os.fspath(project_root))
+    return str(Path(root) / ".claude" / _FIXED_CONTROL_PLANE_WORKTREE_RELATIVE_PATH)
+
+
+def recover_or_create_fixed_control_plane_worktree(
+    accepted_oid: object,
+    object_format: object,
+    *,
+    project_root: str,
+    canonical_common_dir: Path,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> dict[str, str]:
+    """Fixed dedicated worktree crash/rerun recovery (Issue #2197 AC5).
+
+    - absent (no path, no catalog entry) -> detached+locked create at
+      `accepted_oid`
+    - verified dedicated identity (detached, git-common-dir linkage matches
+      `canonical_common_dir`, and present on disk) with the *same* accepted
+      OID already checked out -> reuse as-is
+    - verified identity with a *different* accepted OID, and a clean working
+      tree -> controlled remove + recreate (never a generic force-remove --
+      see `run_control_plane_git_remove_existing_detached_locked_worktree`)
+    - verified identity but a dirty working tree -> fail closed
+      (`ControlPlaneUnavailable`), regardless of OID match
+    - anything not a verified dedicated identity (not detached, absent from
+      disk despite a catalog entry, or a different git-common-dir) -> fail
+      closed as an unknown owner / linkage mismatch, never recovered
+      automatically
+    - a path occupied outside the worktree catalog entirely (not a
+      registered worktree at all) -> fail closed as an unknown owner
+    """
+    fixed_path = fixed_control_plane_worktree_path(project_root)
+    catalog = list_worktrees(project_root)
+    if catalog is None:
+        raise ControlPlaneUnavailable("control_plane_unavailable:fixed_worktree_catalog_unavailable")
+    entry = find_by_realpath(catalog, fixed_path)
+
+    if entry is None:
+        if os.path.lexists(fixed_path):
+            raise ControlPlaneUnavailable("control_plane_unavailable:fixed_worktree_unknown_owner")
+        fresh_path = validate_detached_worktree_path(fixed_path, project_root)
+        run_control_plane_git_add_detached_locked_worktree(
+            fresh_path,
+            accepted_oid,
+            cwd=project_root,
+            project_root=project_root,
+            deadline=deadline,
+            scratch_root=scratch_root,
+        )
+        return {"state": "created", "worktree_path": fresh_path.value}
+
+    if (
+        not entry.get("detached")
+        or not entry.get("exists_on_disk")
+        or entry.get("git_common_dir") != str(canonical_common_dir)
+    ):
+        raise ControlPlaneUnavailable("control_plane_unavailable:fixed_worktree_linkage_mismatch")
+
+    existing_path = validate_existing_detached_worktree_path(entry["worktree_realpath"], project_root)
+    current_head = run_control_plane_git_read_worktree_head(
+        existing_path, object_format, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+    )
+    # Cleanliness is checked *before* the same-OID reuse decision so a dirty
+    # working tree fails closed regardless of whether `current_head` happens
+    # to already equal `accepted_oid` (Issue #2197 AC5).
+    status = run_control_plane_git_read_worktree_status_porcelain(
+        existing_path, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+    )
+    if status.strip():
+        raise ControlPlaneUnavailable("control_plane_unavailable:fixed_worktree_dirty")
+    if current_head == accepted_oid:
+        return {"state": "reused", "worktree_path": existing_path.value}
+
+    run_control_plane_git_remove_existing_detached_locked_worktree(
+        existing_path, cwd=project_root, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+    )
+    fresh_path = validate_detached_worktree_path(fixed_path, project_root)
+    run_control_plane_git_add_detached_locked_worktree(
+        fresh_path,
+        accepted_oid,
+        cwd=project_root,
+        project_root=project_root,
+        deadline=deadline,
+        scratch_root=scratch_root,
+    )
+    return {"state": "refreshed", "worktree_path": fresh_path.value}
+
+
+def run_control_plane_preflight_session(
+    project_root: str | os.PathLike[str],
+    *,
+    timeout_seconds: float = 30.0,
+    cleanup_reserve_seconds: float = 3.0,
+    scratch_root: str | None = None,
+) -> dict[str, object]:
+    """Session/context-manager seam binding the fixed process-scoped
+    lifecycle guard to the remote-binding protocol and fixed dedicated
+    worktree recovery (Issue #2197 AC6/AC7).
+
+    There is deliberately no caller-supplied remote URL parameter here (Issue
+    #2197 AC1): the only remote authority this closed entry point ever binds
+    to is the code-owned `CONTROL_PLANE_CANONICAL_REMOTE_URL` constant, read
+    from this module's own globals at call time. A test that needs to bind
+    against a local fixture remote instead of the real canonical remote does
+    so the same way every other test in this codebase isolates a module
+    constant: `monkeypatch.setattr(this_module, "CONTROL_PLANE_CANONICAL_REMOTE_URL", ...)`.
+
+    The guard from `acquire_control_plane_preflight_lifecycle_mutex` is
+    acquired -- and `assert_held()`-confirmed -- before any remote operation,
+    held across the remote-binding protocol
+    (`run_control_plane_remote_default_ref_binding`), the fixed worktree
+    recovery transition, and every private-ref terminal CAS cleanup those
+    steps require, and released only after that bounded terminal cleanup
+    completes (success or failure alike -- via `finally`). No lease, TTL,
+    heartbeat, stale-takeover, or daemon is introduced; this is exactly the
+    already-reviewed guard, held for a wider, precisely bounded scope. This
+    function performs no actual child dispatch or artifact validation --
+    those belong to #2199 / #2200 (Out of Scope).
+    """
+    root = os.path.realpath(os.fspath(project_root))
+    guard = acquire_control_plane_preflight_lifecycle_mutex(root, deadline_at=time.monotonic() + timeout_seconds)
+    try:
+        guard.assert_held()
+        literal_remote_url = validate_literal_remote_url(CONTROL_PLANE_CANONICAL_REMOTE_URL)
+        protocol_deadline = GitProtocolDeadline.start(timeout_seconds, cleanup_reserve_seconds)
+        private_ref, accepted_oid, object_format = run_control_plane_remote_default_ref_binding(
+            literal_remote_url,
+            cwd=root,
+            project_root=root,
+            deadline=protocol_deadline,
+            scratch_root=scratch_root,
+        )
+        guard.assert_held()
+
+        def _cleanup_private_ref() -> None:
+            try:
+                run_control_plane_git_delete_private_ref_cas(
+                    private_ref,
+                    accepted_oid,
+                    cwd=root,
+                    project_root=root,
+                    deadline=protocol_deadline,
+                    scratch_root=scratch_root,
+                )
+            except BaseException as cleanup_exc:
+                raise ControlPlaneUnavailable(
+                    "control_plane_unavailable:private_ref_cleanup_failed"
+                ) from cleanup_exc
+
+        try:
+            recovery = recover_or_create_fixed_control_plane_worktree(
+                accepted_oid,
+                object_format,
+                project_root=root,
+                canonical_common_dir=guard.canonical_common_dir,
+                deadline=protocol_deadline,
+                scratch_root=scratch_root,
+            )
+        except BaseException:
+            _cleanup_private_ref()
+            raise
+        _cleanup_private_ref()
+        guard.assert_held()
+        return {
+            "status": "ok",
+            "worktree_path": recovery["worktree_path"],
+            "worktree_state": recovery["state"],
+            "accepted_oid": accepted_oid.value,
+        }
+    finally:
+        guard.release()
 
 
 def _result(
