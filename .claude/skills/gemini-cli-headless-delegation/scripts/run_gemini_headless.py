@@ -3654,6 +3654,12 @@ def _bwrap_status_reports_child_started(status: bytes) -> bool:
     )
 
 
+def _read_bwrap_status(status_file: Any) -> bytes:
+    """Read the bounded bwrap status stream before its temporary FD closes."""
+    status_file.seek(0)
+    return status_file.read(_BWRAP_STATUS_MAX_BYTES + 1)
+
+
 def _get_agy_audit_raw_command() -> list[str]:
     """Return the `raw_command` value for the current agy invocation
     (Issue #1807 fix_delta Blocker 1).
@@ -3858,19 +3864,28 @@ def _run_agy(
                         str(status_fd),
                         "--",
                     ] + command
-                    completed = subprocess.run(
-                        run_command,
-                        cwd=str(workspace.workspace_dir),
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        timeout=timeout_sec,
-                        check=False,
-                        shell=False,
-                        pass_fds=(status_fd,),
-                    )
-                    status_file.seek(0)
-                    bwrap_status = status_file.read(_BWRAP_STATUS_MAX_BYTES + 1)
+                    try:
+                        completed = subprocess.run(
+                            run_command,
+                            cwd=str(workspace.workspace_dir),
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            timeout=timeout_sec,
+                            check=False,
+                            shell=False,
+                            pass_fds=(status_fd,),
+                        )
+                    except subprocess.TimeoutExpired:
+                        # `subprocess.run()` raises before normal completion, but
+                        # bwrap may already have proved it started AGY. Drain its
+                        # still-open status FD before preserving the timeout for
+                        # the existing taxonomy/retry path.
+                        bwrap_status = _read_bwrap_status(status_file)
+                        if _bwrap_status_reports_child_started(bwrap_status):
+                            _mark_actual_agy_invocation_attempted()
+                        raise
+                    bwrap_status = _read_bwrap_status(status_file)
                 if _bwrap_status_reports_child_started(bwrap_status):
                     _mark_actual_agy_invocation_attempted()
 

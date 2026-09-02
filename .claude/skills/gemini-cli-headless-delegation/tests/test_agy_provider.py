@@ -36,6 +36,16 @@ def _load_module() -> types.ModuleType:
 rgh = _load_module()
 
 
+def _load_agy_advisory_fallback_router() -> types.ModuleType:
+    route_path = _SCRIPT_PATH.parents[2] / "issue-refinement-loop" / "scripts" / "route_agy_advisory_fallback.py"
+    spec = importlib.util.spec_from_file_location("route_agy_advisory_fallback", route_path)
+    assert spec is not None
+    router = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(router)  # type: ignore[union-attr]
+    return router
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1246,6 +1256,77 @@ def test_agy_bwrap_child_started_nonzero_marks_actual_invocation(monkeypatch, tm
     assert result["agy_failure_kind"] == "operational"
     assert result["agy_invocation_attempted"] is True
     assert rgh.canonical_agy_failure_kind(result["failure_class"]) == "operational"
+
+
+def test_agy_bwrap_child_started_timeout_marks_actual_invocation_and_preserves_fallback_eligibility(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fake_agy_bin = "/hermetic/agy-ac10-bwrap"
+    fixed_prompt = "AC10 bwrap child timeout"
+    bwrap_prefix = ["bwrap", "--deterministic-child-timeout", "--"]
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=bwrap_prefix
+    )
+    observed_attempted: list[bool] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        actual_argv = list(cmd)
+        assert actual_argv[:2] == bwrap_prefix[:2]
+        assert actual_argv[2] == "--json-status-fd"
+        assert actual_argv[4:] == ["--", fake_agy_bin, "-p", fixed_prompt]
+        assert kwargs["shell"] is False
+        observed_attempted.append(rgh._AGY_INVOCATION_ATTEMPTED_CTX.get())
+        os.write(kwargs["pass_fds"][0], b'{"child-pid":1234}\n')
+        raise subprocess.TimeoutExpired(cmd=actual_argv, timeout=kwargs["timeout"])
+
+    with patch.object(
+        rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+    ):
+        with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+            result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+
+    assert observed_attempted == [False]
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_timeout"
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] == "operational"
+
+    router = _load_agy_advisory_fallback_router()
+    decision = router.route_agy_advisory_fallback(
+        result,
+        requirement="advisory",
+        canonical_failure_kind=rgh.canonical_agy_failure_kind,
+    )
+    assert decision["status"] == "degraded"
+    assert decision["next_action"] == "native_non_mutating_fallback"
+    assert decision["reason_code"] == "advisory_operational"
+
+
+def test_agy_bwrap_preexec_timeout_does_not_mark_actual_invocation(monkeypatch, tmp_path: Path) -> None:
+    fake_agy_bin = "/hermetic/agy-ac10-bwrap"
+    fixed_prompt = "AC10 bwrap pre-exec timeout"
+    bwrap_prefix = ["bwrap", "--deterministic-pre-exec-timeout", "--"]
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=bwrap_prefix
+    )
+    observed_attempted: list[bool] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        observed_attempted.append(rgh._AGY_INVOCATION_ATTEMPTED_CTX.get())
+        raise subprocess.TimeoutExpired(cmd=list(cmd), timeout=kwargs["timeout"])
+
+    with patch.object(
+        rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+    ):
+        with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+            result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+
+    assert observed_attempted == [False]
+    assert result["failure_class"] == "agy_timeout"
+    assert result["agy_invocation_attempted"] is False
+    assert result["agy_failure_kind"] == "operational"
 
 
 # ---------------------------------------------------------------------------
