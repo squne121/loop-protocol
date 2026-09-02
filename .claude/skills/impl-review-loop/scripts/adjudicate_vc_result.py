@@ -149,6 +149,16 @@ def adapt_test_verdict_to_current_vc_result(test_verdict: Any) -> tuple[dict[str
                 "command_hash": command_hash,
                 "raw_command": item.get("command"),
                 "exit_code": item.get("exit_code"),
+                # Issue #2467 P0-1/P1 review fix: carry the per-command
+                # execution facts through losslessly so
+                # adjudicate_vc_result() can require an ACTUAL executed PASS
+                # for a runtime_only (ac, command_hash) on the current side
+                # instead of re-requiring the baseline producer-skip
+                # envelope (see _is_runtime_only_current_execution_pass()).
+                "status": item.get("status"),
+                "fallback_detected": fallback_detected,
+                "human_review_required": human_review_required,
+                "stop_condition_triggered": stop_condition_triggered,
                 "failure_keys": [],
                 "raw_stdout": "",
                 "raw_stderr": item.get("notes") or "",
@@ -167,6 +177,13 @@ def adapt_test_verdict_to_current_vc_result(test_verdict: Any) -> tuple[dict[str
         "results": results,
         "head_sha": head_sha,
         "reviewed_head_sha": reviewed_head_sha,
+        # Issue #2467 P1 review fix: preserve payload-level identity fields
+        # losslessly so a caller can bind runtime_only current-head evidence
+        # to the exact live Issue / PR / diff head by value, not merely by
+        # positive-integer presence.
+        "issue": payload.get("issue_number"),
+        "pr_number": payload.get("pr_number"),
+        "diff_head_sha": payload.get("diff_head_sha"),
     }
     return converted, errors
 # --- end Issue #88 fix_delta Blocker 1 canonical adapter --------------------
@@ -319,6 +336,14 @@ def _normalize_item(item: Any) -> tuple[dict[str, Any] | None, list[str]]:
         "verification_owner": item.get("verification_owner"),
         "deferred_reason": item.get("deferred_reason"),
         "runtime_verification_required": item.get("runtime_verification_required"),
+        # Issue #2467 P0-1: per-command execution facts. Populated by
+        # adapt_test_verdict_to_current_vc_result() for a real test-runner
+        # run; None/absent for a baseline_vc_preflight/v1 producer-skip
+        # envelope item.
+        "status": item.get("status"),
+        "fallback_detected": item.get("fallback_detected"),
+        "human_review_required": item.get("human_review_required"),
+        "stop_condition_triggered": item.get("stop_condition_triggered"),
     }
     if command_hash_note is not None:
         normalized["command_hash_note"] = command_hash_note
@@ -359,6 +384,29 @@ def _is_producer_authorized_runtime_only_skip(item: dict[str, Any]) -> bool:
         and isinstance(item.get("deferred_reason"), str)
         and bool(item["deferred_reason"])
         and item.get("runtime_verification_required") is True
+    )
+
+
+# Issue #2467 P0-1 review fix (PR #2483 REQUEST_CHANGES): the baseline
+# canonical runtime_only skip recognized by
+# _is_producer_authorized_runtime_only_skip() above is delegation
+# AUTHORIZATION only -- it permits the deferred command's real execution to
+# be delegated to post-implementation test-runner. It must never be
+# re-required on the CURRENT side; the current side is supposed to carry the
+# actual execution evidence for that same (ac, command_hash), not another
+# skip declaration. This recognizer instead requires the current item to
+# carry real per-command execution facts (populated by
+# adapt_test_verdict_to_current_vc_result() from a TEST_VERDICT_MACHINE/v2
+# runtime_ac_results[] entry): status == "pass", exit_code == 0, and no
+# fallback / human-review / stop-condition flags for that specific command.
+def _is_runtime_only_current_execution_pass(item: dict[str, Any]) -> bool:
+    """Recognize a current-head runtime_only item as an ACTUAL executed PASS."""
+    return (
+        item.get("status") == "pass"
+        and item.get("exit_code") == 0
+        and item.get("fallback_detected") is False
+        and item.get("human_review_required") is False
+        and item.get("stop_condition_triggered") is False
     )
 
 
@@ -652,10 +700,18 @@ def _runtime_only_current_head_binding_error(
     changed_paths: list[str],
     changed_paths_present: bool,
     allowed_paths: list[str],
+    expected_issue_number: Any = None,
+    expected_pr_number: Any = None,
 ) -> str | None:
     """Return a fail-closed reason unless runtime_only current-head
     independent binding (Issue / PR / current head / reviewed head / diff
-    head / Issue body digest / source integrity) is fully satisfied."""
+    head / Issue body digest / source integrity) is fully satisfied.
+
+    Issue #2467 P1 review fix (PR #2483 REQUEST_CHANGES): the Issue / PR
+    checks below require exact equality against ``expected_issue_number`` /
+    ``expected_pr_number`` -- values the caller (root/orchestrator)
+    independently retrieved from the live Issue and current PR -- not merely
+    positive-integer presence in the evidence payload itself."""
     if not isinstance(contract_snapshot, dict) or not isinstance(current_vc_result, dict):
         return "runtime_only_binding_context_invalid"
     if not isinstance(diff_summary, dict):
@@ -697,10 +753,26 @@ def _runtime_only_current_head_binding_error(
     issue_number = current_vc_result.get("issue")
     if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
         return "runtime_only_issue_number_missing"
+    if (
+        isinstance(expected_issue_number, bool)
+        or not isinstance(expected_issue_number, int)
+        or expected_issue_number <= 0
+    ):
+        return "runtime_only_expected_issue_number_missing"
+    if issue_number != expected_issue_number:
+        return "runtime_only_issue_number_mismatch"
 
     pr_number = diff_summary.get("pr_number")
     if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
         return "runtime_only_pr_number_missing"
+    if (
+        isinstance(expected_pr_number, bool)
+        or not isinstance(expected_pr_number, int)
+        or expected_pr_number <= 0
+    ):
+        return "runtime_only_expected_pr_number_missing"
+    if pr_number != expected_pr_number:
+        return "runtime_only_pr_number_mismatch"
 
     if changed_paths_present is not True:
         return "runtime_only_changed_paths_missing"
@@ -1033,6 +1105,8 @@ def adjudicate_vc_result(
     allowed_paths: list[str] | None,
     test_verdict: Any | None = None,
     require_producer_receipt: bool = False,
+    expected_issue_number: Any = None,
+    expected_pr_number: Any = None,
 ) -> dict[str, Any]:
     # Issue #1648 fix_delta AC9 (P1-3): a caller that forgets to pass
     # --require-producer-receipt must not silently accept a materialized
@@ -1128,7 +1202,14 @@ def adjudicate_vc_result(
         )
         baseline_failure_index.update((entry["kind"], entry["key"]) for entry in norm["failure_keys"])
 
-    normalized_current: list[dict[str, Any]] = []
+    # Issue #2467 P0-2 review fix: `current_order` records every current item
+    # in its ORIGINAL (Issue declaration) order together with its kind
+    # ("normal" / "pr_review_only" / "runtime_only") so per_ac can later be
+    # assembled in that same literal order instead of re-sorting resolved
+    # skip keys (which could reorder a multi-AC binding tuple relative to
+    # the live Issue's Verification Commands, breaking evaluate_step4_vc_gate()'s
+    # ordered command-hash comparison).
+    current_order: list[dict[str, Any]] = []
     current_keys: set[tuple[str, str]] = set()
     seen_current_keys: set[tuple[str, str]] = set()
     excluded_current_count = 0
@@ -1162,19 +1243,26 @@ def adjudicate_vc_result(
                 )
             excluded_current_count += 1
             excluded_current_keys.add(mapping_key)
+            current_order.append({"kind": "pr_review_only", "norm": norm})
             continue
         if mapping_key in excluded_runtime_only_keys:
-            if not _is_producer_authorized_runtime_only_skip(norm):
+            # Issue #2467 P0-1 review fix: the CURRENT side must carry an
+            # ACTUAL executed PASS for this (ac, command_hash) -- the
+            # baseline canonical skip (checked above, when building
+            # excluded_runtime_only_keys) is delegation authorization only
+            # and must never be re-required here.
+            if not _is_runtime_only_current_execution_pass(norm):
                 return _result(
                     overall_status="indeterminate", per_ac=[], rerun_required=True,
                     source_integrity=source_integrity, evidence_refs=evidence_refs,
-                    errors=[f"runtime_only_current_authorization_mismatch:{norm['ac']}"],
+                    errors=[f"runtime_only_current_execution_not_pass:{norm['ac']}"],
                 )
             excluded_current_count += 1
             excluded_current_keys.add(mapping_key)
+            current_order.append({"kind": "runtime_only", "norm": norm})
             continue
         current_keys.add(mapping_key)
-        normalized_current.append(norm)
+        current_order.append({"kind": "normal", "norm": norm})
 
     excluded_skip_keys = excluded_pr_review_only_keys | excluded_runtime_only_keys
     if excluded_current_keys != excluded_skip_keys:
@@ -1216,6 +1304,8 @@ def adjudicate_vc_result(
             changed_paths=changed_paths,
             changed_paths_present=changed_paths_present,
             allowed_paths=normalized_allowed,
+            expected_issue_number=expected_issue_number,
+            expected_pr_number=expected_pr_number,
         )
         if runtime_only_binding_error is not None:
             return _result(
@@ -1232,42 +1322,14 @@ def adjudicate_vc_result(
         changed_paths_present,
         normalized_allowed,
     )
-    if not normalized_current:
-        if excluded_current_count and current_keys != set(baseline_by_key):
-            return _result(
-                overall_status="indeterminate", per_ac=[], rerun_required=True,
-                source_integrity=source_integrity, evidence_refs=evidence_refs,
-                errors=["baseline_current_mapping_mismatch"],
-            )
-        if excluded_current_count and current_pass_certified:
-            per_ac = [
-                {
-                    "ac": ac,
-                    "status": "pass",
-                    "blocking": False,
-                    "command_hash": command_hash,
-                    "failure_keys": [],
-                    "reason_code": "pr_review_only_runtime_evidence_pass",
-                    "summary": "Producer-authorized skip is covered by v2 runtime evidence",
-                }
-                for ac, command_hash in sorted(excluded_pr_review_only_keys)
-            ] + [
-                {
-                    "ac": ac,
-                    "status": "pass",
-                    "blocking": False,
-                    "command_hash": command_hash,
-                    "failure_keys": [],
-                    "reason_code": "runtime_only_current_head_binding_pass",
-                    "summary": "Producer-authorized runtime_only skip is covered by current-head independent binding",
-                }
-                for ac, command_hash in sorted(excluded_runtime_only_keys)
-            ]
-            return _result(
-                overall_status="pass", per_ac=per_ac, rerun_required=False,
-                source_integrity=source_integrity, evidence_refs=evidence_refs,
-                errors=[],
-            )
+    # Issue #2467 P0-2 review fix: build per_ac by walking `current_order` in
+    # its ORIGINAL (Issue declaration) order, including resolved
+    # pr_review_only / runtime_only entries inline at their own position --
+    # never re-sorted and never dropped from per_ac when mixed with ordinary
+    # regression-gate ACs (evaluate_step4_vc_gate()'s ordered command-hash
+    # binding depends on per_ac reflecting the live Issue's literal
+    # Verification Commands order).
+    if not current_order:
         return _result(
             overall_status="indeterminate", per_ac=[], rerun_required=True,
             source_integrity=source_integrity, evidence_refs=evidence_refs,
@@ -1281,8 +1343,56 @@ def adjudicate_vc_result(
             errors=["baseline_current_mapping_mismatch"],
         )
 
+    # Issue #2467 review fix scope note: `has_normal_current` distinguishes a
+    # skip-only current payload from one mixed with ordinary regression-gate
+    # ACs. pr_review_only's existing non-regression precedent (Issue #1540 /
+    # PR #1544) is preserved exactly as-is here: a pr_review_only skip is
+    # only surfaced in per_ac when it is the ONLY current evidence (no
+    # ordinary ACs to compare against); when mixed with ordinary ACs it stays
+    # excluded from the regression comparison per_ac list, matching prior
+    # behavior. Only the NEW runtime_only handling (below) always includes
+    # the resolved AC in per_ac -- Issue #2467 does not extend the
+    # pr_review_only authorized scope (Out of Scope).
+    has_normal_current = bool(current_keys)
+    if not has_normal_current and not current_pass_certified:
+        return _result(
+            overall_status="indeterminate", per_ac=[], rerun_required=True,
+            source_integrity=source_integrity, evidence_refs=evidence_refs,
+            errors=["empty_current_results_without_pass_signal"],
+        )
+
     per_ac: list[dict[str, Any]] = []
-    for norm in normalized_current:
+    for entry in current_order:
+        norm = entry["norm"]
+        if entry["kind"] == "pr_review_only":
+            if has_normal_current:
+                continue
+            per_ac.append(
+                {
+                    "ac": norm["ac"],
+                    "status": "pass",
+                    "blocking": False,
+                    "command_hash": norm["command_hash"],
+                    "failure_keys": [],
+                    "reason_code": "pr_review_only_runtime_evidence_pass",
+                    "summary": "Producer-authorized skip is covered by v2 runtime evidence",
+                }
+            )
+            continue
+        if entry["kind"] == "runtime_only":
+            per_ac.append(
+                {
+                    "ac": norm["ac"],
+                    "status": "pass",
+                    "blocking": False,
+                    "command_hash": norm["command_hash"],
+                    "failure_keys": [],
+                    "reason_code": "runtime_only_current_head_binding_pass",
+                    "summary": "Producer-authorized runtime_only skip is covered by current-head executed PASS evidence",
+                }
+            )
+            continue
+
         baseline_item = baseline_by_key[(norm["ac"], norm["command_hash"])]
         if norm["exit_code"] == 0:
             if norm["failure_keys_present"]:
@@ -1314,7 +1424,7 @@ def adjudicate_vc_result(
             allowed_paths=normalized_allowed,
             source_integrity=source_integrity,
         )
-        entry = {
+        entry_dict = {
             "ac": norm["ac"],
             "status": status,
             "blocking": blocking,
@@ -1324,8 +1434,8 @@ def adjudicate_vc_result(
             "summary": summary,
         }
         if "command_hash_note" in norm:
-            entry["command_hash_note"] = norm["command_hash_note"]
-        per_ac.append(entry)
+            entry_dict["command_hash_note"] = norm["command_hash_note"]
+        per_ac.append(entry_dict)
 
     if not per_ac:
         return _result(
@@ -1632,6 +1742,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allowed-paths-file")
     parser.add_argument("--test-verdict-file")
     parser.add_argument(
+        "--expected-issue-number",
+        type=int,
+        help=(
+            "Issue #2467 P1: the live linked Issue number, independently retrieved "
+            "by the caller, that a runtime_only current-head binding must exactly match."
+        ),
+    )
+    parser.add_argument(
+        "--expected-pr-number",
+        type=int,
+        help=(
+            "Issue #2467 P1: the live current PR number, independently retrieved "
+            "by the caller, that a runtime_only current-head binding must exactly match."
+        ),
+    )
+    parser.add_argument(
         "--require-producer-receipt",
         action="store_true",
         help=(
@@ -1794,6 +1920,8 @@ def main(argv: list[str] | None = None) -> int:
         allowed_paths=allowed_paths,
         test_verdict=test_verdict,
         require_producer_receipt=args.require_producer_receipt,
+        expected_issue_number=args.expected_issue_number,
+        expected_pr_number=args.expected_pr_number,
     )
     result["errors"].extend(contract_errors or [])
     result["errors"].extend(current_errors or [])

@@ -7,6 +7,16 @@ runtime_only delegation candidate. This module does not parse raw marker
 text (`# preflight-scope: runtime_only`) itself -- that remains the
 producer's (`baseline_vc_preflight.py`) responsibility; only the structured
 envelope fields are consulted here (Issue #2467 In Scope).
+
+PR #2483 REQUEST_CHANGES (P0-1) fix: the canonical envelope is recognized on
+the BASELINE side only, as delegation AUTHORIZATION for post-implementation
+execution. The CURRENT side must instead carry an ACTUAL executed PASS for
+that same (ac, command_hash) -- status == "pass", exit_code == 0, and no
+fallback/human-review/stop-condition flags -- exactly what
+adapt_test_verdict_to_current_vc_result() produces from a real test-runner
+TEST_VERDICT_MACHINE/v2 runtime_ac_results[] entry. Echoing the baseline
+skip envelope back unchanged as "current" evidence is never sufficient
+(covered by test_adjudicate_vc_result_non_regression_gate_runtime_only.py).
 """
 
 from __future__ import annotations
@@ -53,6 +63,9 @@ def _runtime_only_item(
     runtime_verification_required: Any = True,
     exit_code: int | None = None,
 ) -> dict[str, Any]:
+    """A canonical baseline producer-skip envelope. Used for the BASELINE
+    side only -- this is delegation authorization, not current-head
+    execution evidence (PR #2483 REQUEST_CHANGES P0-1)."""
     return {
         "ac": ac,
         "command_hash": command_hash,
@@ -66,6 +79,25 @@ def _runtime_only_item(
         "verification_owner": verification_owner,
         "deferred_reason": deferred_reason,
         "runtime_verification_required": runtime_verification_required,
+        "failure_keys": [],
+    }
+
+
+def _runtime_only_executed_pass_item(ac: str, *, command_hash: str) -> dict[str, Any]:
+    """A real test-runner-shaped CURRENT execution result for a
+    runtime_only (ac, command_hash) -- what
+    adapt_test_verdict_to_current_vc_result() produces from a
+    TEST_VERDICT_MACHINE/v2 runtime_ac_results[] entry (PR #2483
+    REQUEST_CHANGES P0-1)."""
+    return {
+        "ac": ac,
+        "command_hash": command_hash,
+        "raw_command": "echo runtime-only-fixture",
+        "exit_code": 0,
+        "status": "pass",
+        "fallback_detected": False,
+        "human_review_required": False,
+        "stop_condition_triggered": False,
         "failure_keys": [],
     }
 
@@ -122,19 +154,24 @@ def _diff_summary(
 
 
 def test_runtime_only_producer_envelope_accepted():
-    # GIVEN a baseline snapshot and current head result both declaring the
-    # exact canonical runtime_only producer-skip envelope, bound to a fresh,
-    # certified current head
+    # GIVEN a baseline snapshot declaring the exact canonical runtime_only
+    # producer-skip envelope (delegation authorization) AND a current-head
+    # result that is a REAL executed PASS for that same (ac, command_hash)
+    # (as adapt_test_verdict_to_current_vc_result() would produce from a
+    # real test-runner report), bound to a fresh, certified current head
     # WHEN adjudicate_vc_result() runs
-    # THEN the AC is adjudicated nonblocking PASS via the runtime_only
-    # current-head binding reason code (not a raw marker-text parse)
-    item = _runtime_only_item("AC1", command_hash="sha256:" + "1" * 64)
+    # THEN the AC is adjudicated nonblocking PASS, appears in per_ac (not
+    # excluded), via the runtime_only current-head binding reason code
+    baseline_item = _runtime_only_item("AC1", command_hash="sha256:" + "1" * 64)
+    current_item = _runtime_only_executed_pass_item("AC1", command_hash="sha256:" + "1" * 64)
 
     result = mod.adjudicate_vc_result(
-        contract_snapshot=_contract_snapshot([item]),
-        current_vc_result=_current_vc_result([item]),
+        contract_snapshot=_contract_snapshot([baseline_item]),
+        current_vc_result=_current_vc_result([current_item]),
         diff_summary=_diff_summary(),
         allowed_paths=[ALLOWED_PATH],
+        expected_issue_number=ISSUE_NUMBER,
+        expected_pr_number=PR_NUMBER,
     )
 
     assert result["overall_status"] == "pass"
@@ -142,6 +179,28 @@ def test_runtime_only_producer_envelope_accepted():
     assert len(result["per_ac"]) == 1
     assert result["per_ac"][0]["ac"] == "AC1"
     assert result["per_ac"][0]["reason_code"] == "runtime_only_current_head_binding_pass"
+
+
+def test_runtime_only_echoed_baseline_skip_as_current_is_not_executed_pass():
+    # GIVEN a baseline canonical skip AND the SAME skip envelope echoed back
+    # unchanged as "current" (no real execution happened)
+    # WHEN adjudicated
+    # THEN this is rejected -- the baseline skip is authorization only, not
+    # current-head execution evidence (PR #2483 REQUEST_CHANGES P0-1)
+    item = _runtime_only_item("AC1", command_hash="sha256:" + "9" * 64)
+
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=_contract_snapshot([item]),
+        current_vc_result=_current_vc_result([item]),
+        diff_summary=_diff_summary(),
+        allowed_paths=[ALLOWED_PATH],
+        expected_issue_number=ISSUE_NUMBER,
+        expected_pr_number=PR_NUMBER,
+    )
+
+    assert result["overall_status"] != "pass"
+    assert result["blocking"] is True
+    assert result["errors"] == ["runtime_only_current_execution_not_pass:AC1"]
 
 
 def test_runtime_only_wrong_verification_owner_is_not_recognized():
