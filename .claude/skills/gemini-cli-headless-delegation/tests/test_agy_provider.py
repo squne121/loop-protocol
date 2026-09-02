@@ -3,6 +3,7 @@
 Covers AC1-AC14 for provider=agy path. Uses mock subprocess to avoid
 requiring the agy CLI to be installed in the test environment.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -35,6 +36,16 @@ def _load_module() -> types.ModuleType:
 rgh = _load_module()
 
 
+def _load_agy_advisory_fallback_router() -> types.ModuleType:
+    route_path = _SCRIPT_PATH.parents[2] / "issue-refinement-loop" / "scripts" / "route_agy_advisory_fallback.py"
+    spec = importlib.util.spec_from_file_location("route_agy_advisory_fallback", route_path)
+    assert spec is not None
+    router = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(router)  # type: ignore[union-attr]
+    return router
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -42,6 +53,24 @@ rgh = _load_module()
 
 def _make_completed(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=["agy", "-p", "test"], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _hermetic_no_bwrap():
+    """Force `materialize_isolated_agy_workspace()`'s bwrap child-pid-proof
+    branch (Issue #2434 AC6/AC10) off for tests that fully patch
+    `subprocess.run()` with a synthetic double rather than exercising a real
+    `bwrap` child process. Without this, a host that happens to have both a
+    real `bwrap` binary AND a real AGY OAuth token file (e.g. a developer
+    workstation with a prior authenticated `agy` session) makes
+    `_run_agy()` route through the `--json-status-fd` proof path even for
+    these fully-mocked calls; since the mock never writes a bwrap status
+    record, the new unproven-bwrap-success fail-close then overwrites the
+    mocked success/failure payload these tests assert on. Patching
+    `_bwrap_available()` keeps `agy_oauth_token_bwrap_prefix` `None` --
+    identical to the CI/no-OAuth-token environment these tests were
+    originally written against -- without altering any other workspace
+    materialization behavior."""
+    return patch.object(rgh._agy_permission_policy, "_bwrap_available", return_value=False)
 
 
 def _valid_hook_event(tool_name: str = "search_web") -> dict[str, Any]:
@@ -130,8 +159,8 @@ def _write_serena_manifest(root: Path, pinned_ref: str = "0123456789abcdef") -> 
             "--from",
             f"git+https://github.com/oraios/serena@{pinned_ref}",
             "serena",
-        "start-mcp-server",
-        "--project-from-cwd",
+            "start-mcp-server",
+            "--project-from-cwd",
         ],
         "read_only_allowlist": sorted(rgh.SERENA_READ_ONLY_TOOLS),
         "dangerous_denylist": sorted(rgh.SERENA_DANGEROUS_TOOLS),
@@ -191,29 +220,33 @@ def test_ac6_unknown_provider_fails_closed() -> None:
 
 def test_ac6_gemini_provider_accepted() -> None:
     """AC6: provider=gemini is valid (default path)."""
-    errors = rgh.validate_request({
-        "schema": "delegation_request_v1",
-        "tool_profile": "no_tools",
-        "provider": "gemini",
-        "objective": "Test gemini provider validation with enough detail",
-        "instructions": ["Step one", "Step two"],
-        "output_sections": ["response"],
-        "context_files": [],
-    })
+    errors = rgh.validate_request(
+        {
+            "schema": "delegation_request_v1",
+            "tool_profile": "no_tools",
+            "provider": "gemini",
+            "objective": "Test gemini provider validation with enough detail",
+            "instructions": ["Step one", "Step two"],
+            "output_sections": ["response"],
+            "context_files": [],
+        }
+    )
     # No unknown_provider error should be present
     assert not any("unknown_provider" in e for e in errors)
 
 
 def test_ac6_missing_provider_defaults_to_gemini() -> None:
     """AC6: provider not specified -> gemini default, no unknown_provider error."""
-    errors = rgh.validate_request({
-        "schema": "delegation_request_v1",
-        "tool_profile": "no_tools",
-        "objective": "Test default provider with enough detail here",
-        "instructions": ["Step one", "Step two"],
-        "output_sections": ["response"],
-        "context_files": [],
-    })
+    errors = rgh.validate_request(
+        {
+            "schema": "delegation_request_v1",
+            "tool_profile": "no_tools",
+            "objective": "Test default provider with enough detail here",
+            "instructions": ["Step one", "Step two"],
+            "output_sections": ["response"],
+            "context_files": [],
+        }
+    )
     assert not any("unknown_provider" in e for e in errors)
 
 
@@ -290,11 +323,12 @@ def test_agy_grounded_research_forbids_gemini_google_search() -> None:
     completed = _make_completed(0, stdout=grounded_output)
     completed.agy_provenance_hook_events = [_valid_hook_event()]  # type: ignore[attr-defined]
     completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
-    with patch.object(rgh, "_run_agy", return_value=completed) as mock_agy, patch.object(
-        rgh,
-        "_run_gemini",
-        side_effect=AssertionError(
-            "_run_gemini (Gemini CLI/API path) must not be called for provider=agy"
+    with (
+        patch.object(rgh, "_run_agy", return_value=completed) as mock_agy,
+        patch.object(
+            rgh,
+            "_run_gemini",
+            side_effect=AssertionError("_run_gemini (Gemini CLI/API path) must not be called for provider=agy"),
         ),
     ):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=300))
@@ -568,10 +602,13 @@ def test_ac7_agy_local_asset_research_success_with_wrapper_validation(tmp_path, 
         context_files=["context.md"],
         prompt="Summarize local repository evidence.",
     )
-    with patch.object(rgh, "_run_agy", side_effect=_run_agy), patch.object(
-        rgh,
-        "_collect_live_serena_read_only_evidence",
-        side_effect=_fake_live_evidence,
+    with (
+        patch.object(rgh, "_run_agy", side_effect=_run_agy),
+        patch.object(
+            rgh,
+            "_collect_live_serena_read_only_evidence",
+            side_effect=_fake_live_evidence,
+        ),
     ):
         result = rgh.run_delegation(req, request_path=repo_root / "request.json")
 
@@ -635,6 +672,32 @@ def test_ac7_agy_local_asset_research_rejects_context_outside_repo_before_read(t
     assert result["ok"] is False
     assert result["failure_reason"].startswith("local_asset_research context file must be inside repository")
     assert result["failure_class"] == "local_asset_research context file must be inside repository"
+
+
+def test_issue_2434_global_local_asset_payload_limits_are_intentional(tmp_path) -> None:
+    """Issue #2434 intentionally expands the global producer payload contract.
+
+    These limits belong to ``run_gemini_headless.py``'s existing
+    ``local_asset_research`` producer boundary, not only to the new
+    issue-refinement controller. Keep the contract at 32 files, 1 MiB per
+    file, and 4 MiB aggregate so consumers of the pre-existing route observe
+    the same explicit behavior as the controller.
+    """
+    assert rgh.LOCAL_ASSET_MAX_CONTEXT_FILES == 32
+    assert rgh.LOCAL_ASSET_MAX_CONTEXT_BYTES == 1024 * 1024
+    assert rgh.LOCAL_ASSET_MAX_CONTEXT_TOTAL_BYTES == 4 * 1024 * 1024
+
+    exact_limit_paths = []
+    for index in range(4):
+        path = tmp_path / f"context-{index}.txt"
+        path.write_bytes(b"x" * rgh.LOCAL_ASSET_MAX_CONTEXT_BYTES)
+        exact_limit_paths.append(path)
+    assert rgh._validate_agy_local_asset_payload_bounds(exact_limit_paths) == []
+
+    over_limit = tmp_path / "over-limit.txt"
+    over_limit.write_bytes(b"x" * (rgh.LOCAL_ASSET_MAX_CONTEXT_BYTES + 1))
+    errors = rgh._validate_agy_local_asset_payload_bounds([over_limit])
+    assert any("context file is too large" in error for error in errors)
 
 
 def test_ac7_agy_github_research_dispatches_to_e2e_route(monkeypatch, tmp_path) -> None:
@@ -824,9 +887,7 @@ def test_ac13_run_agy_uses_shell_false_and_minimal_env() -> None:
 
     # shell=False (default when not specified, but must not be True)
     assert (
-        captured_kwargs.get("shell") is False
-        or "shell" not in captured_kwargs
-        or captured_kwargs.get("shell") is False
+        captured_kwargs.get("shell") is False or "shell" not in captured_kwargs or captured_kwargs.get("shell") is False
     )
     # env must be present and minimal
     env = captured_kwargs.get("env")
@@ -1004,7 +1065,481 @@ def test_agy_file_not_found_returns_failure_class() -> None:
         result = rgh.run_delegation(_agy_request())
     assert result["ok"] is False
     assert result.get("failure_class") == "agy_not_found"
+    assert result.get("agy_failure_kind") == "operational"
     assert "agy_not_found" in (result.get("failure_reason") or "")
+
+
+# ---------------------------------------------------------------------------
+# Issue #2434: producer-owned AGY failure discriminator
+# ---------------------------------------------------------------------------
+
+
+def test_agy_success_has_null_producer_failure_kind() -> None:
+    completed = _make_completed(0, stdout="LOOP_AGY_SMOKE_OK")
+    with patch.object(rgh, "_run_agy", return_value=completed):
+        result = rgh.run_delegation(_agy_request())
+
+    assert result["ok"] is True
+    assert result["agy_failure_kind"] is None
+
+
+def test_agy_operational_failure_has_producer_failure_kind() -> None:
+    with patch.object(rgh, "_run_agy", side_effect=subprocess.TimeoutExpired(cmd="agy", timeout=30)):
+        result = rgh.run_delegation(_agy_request())
+
+    assert result["failure_class"] == "agy_timeout"
+    assert result["agy_failure_kind"] == "operational"
+
+
+def test_agy_policy_or_permission_failure_has_producer_failure_kind() -> None:
+    completed = _make_completed(1, stderr="permission denied")
+    with patch.object(rgh, "_run_agy", return_value=completed):
+        result = rgh.run_delegation(_agy_request())
+
+    assert result["failure_class"] == "agy_permission_denied"
+    assert result["agy_failure_kind"] == "policy_or_permission"
+
+
+def test_agy_contract_failure_has_producer_failure_kind() -> None:
+    result = rgh.run_delegation(_agy_request(prompt=""))
+
+    assert result["failure_class"] == "agy_empty_prompt"
+    assert result["agy_failure_kind"] == "contract"
+
+
+def test_unknown_agy_failure_class_is_conservatively_contract() -> None:
+    assert rgh._agy_failure_kind("agy_future_unclassified") == "contract"
+
+
+def test_canonical_agy_failure_kind_rejects_unknown_pair_class() -> None:
+    assert rgh.canonical_agy_failure_kind("agy_timeout") == "operational"
+    assert rgh.canonical_agy_failure_kind("agy_permission_denied") == "policy_or_permission"
+    assert rgh.canonical_agy_failure_kind("agy_empty_prompt") == "contract"
+    assert rgh.canonical_agy_failure_kind("agy_future_unclassified") is None
+    assert rgh.canonical_agy_failure_kind("request_policy_denied") is None
+
+
+def test_agy_invocation_attempted_is_false_before_subprocess() -> None:
+    # An invalid request stops before the producer-owned direct subprocess
+    # boundary, rather than merely reporting a false ContextVar afterwards.
+    with patch("subprocess.run", side_effect=AssertionError("pre-AGY request must not spawn a subprocess")):
+        result = rgh.run_delegation(_agy_request(prompt=""))
+
+    assert result["ok"] is False
+    assert result["agy_invocation_attempted"] is False
+
+
+def test_agy_invocation_attempted_failure_is_true_after_direct_subprocess_boundary(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fake_agy_bin = "/hermetic/agy-ac10-timing"
+    fixed_prompt = "AC10 timing failure invocation"
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=None
+    )
+    observed_argvs: list[list[Any]] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+
+    def fake_run(cmd: Any, **_kwargs: Any) -> subprocess.CompletedProcess:
+        assert isinstance(cmd, list)
+        actual_argv = list(cmd)
+        observed_argvs.append(actual_argv)
+        assert actual_argv == [fake_agy_bin, "-p", fixed_prompt]
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True
+        return _make_completed(1, stderr="simulated process failure")
+
+    try:
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        with patch.object(
+            rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+        ):
+            with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+                result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+    finally:
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+    assert observed_argvs and len(observed_argvs) == 1
+    assert result["ok"] is False
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] == "operational"
+    assert rgh.canonical_agy_failure_kind(result["failure_class"]) == "operational"
+
+
+def test_agy_invocation_attempted_becomes_true_at_direct_subprocess_boundary(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fake_agy_bin = "/hermetic/agy-ac10-timing"
+    fixed_prompt = "AC10 timing success invocation"
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=None
+    )
+    observed_argvs: list[list[Any]] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+
+    def fake_run(cmd: Any, **_kwargs: Any) -> subprocess.CompletedProcess:
+        assert isinstance(cmd, list)
+        actual_argv = list(cmd)
+        observed_argvs.append(actual_argv)
+        assert actual_argv == [fake_agy_bin, "-p", fixed_prompt]
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True
+        return _make_completed(0, stdout="LOOP_AGY_SMOKE_OK")
+
+    try:
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        with patch.object(
+            rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+        ):
+            with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+                result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+    finally:
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+    assert observed_argvs and len(observed_argvs) == 1
+    assert result["ok"] is True
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] is None
+
+
+def test_agy_minimal_env_direct_subprocess_success_marks_attempted_with_exact_argv(monkeypatch) -> None:
+    """The no-tool-profile branch marks before its exact direct AGY argv runs."""
+    fake_agy_bin = "/hermetic/agy-direct-success"
+    fixed_prompt = "direct minimal-env success"
+    observed_argvs: list[list[Any]] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+    profile_token = rgh._AGY_TOOL_PROFILE_CTX.set(None)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        actual_argv = list(cmd)
+        observed_argvs.append(actual_argv)
+        assert actual_argv == [fake_agy_bin, "-p", fixed_prompt]
+        assert kwargs["env"] == {"PATH": "/minimal-agy-path"}
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True
+        return _make_completed(0, stdout="direct AGY success")
+
+    try:
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        with (
+            patch.object(rgh, "_minimal_agy_env", return_value={"PATH": "/minimal-agy-path"}) as minimal_env,
+            patch.object(rgh, "_AGY_PROVENANCE_AVAILABLE", False),
+            patch("subprocess.run", side_effect=fake_run),
+        ):
+            completed = rgh._run_agy(fixed_prompt, 30)
+        result = rgh._attach_agy_failure_kind(
+            {"provider": "agy"},
+            rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None),
+        )
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(profile_token)
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+    minimal_env.assert_called_once_with()
+    assert observed_argvs == [[fake_agy_bin, "-p", fixed_prompt]]
+    assert completed.returncode == 0
+    assert result["ok"] is True
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] is None
+
+
+def test_agy_minimal_env_direct_subprocess_nonzero_marks_attempted_with_exact_argv(monkeypatch) -> None:
+    """The no-tool-profile direct branch preserves attempted/nonzero correlation."""
+    fake_agy_bin = "/hermetic/agy-direct-failure"
+    fixed_prompt = "direct minimal-env failure"
+    observed_argvs: list[list[Any]] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+    profile_token = rgh._AGY_TOOL_PROFILE_CTX.set(None)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        actual_argv = list(cmd)
+        observed_argvs.append(actual_argv)
+        assert actual_argv == [fake_agy_bin, "-p", fixed_prompt]
+        assert kwargs["env"] == {"PATH": "/minimal-agy-path"}
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True
+        return _make_completed(23, stderr="direct AGY failure")
+
+    try:
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        with (
+            patch.object(rgh, "_minimal_agy_env", return_value={"PATH": "/minimal-agy-path"}) as minimal_env,
+            patch.object(rgh, "_AGY_PROVENANCE_AVAILABLE", False),
+            patch("subprocess.run", side_effect=fake_run),
+        ):
+            completed = rgh._run_agy(fixed_prompt, 30)
+        result = rgh._attach_agy_failure_kind(
+            {"provider": "agy"},
+            rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None),
+        )
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(profile_token)
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+    minimal_env.assert_called_once_with()
+    assert observed_argvs == [[fake_agy_bin, "-p", fixed_prompt]]
+    assert completed.returncode == 23
+    assert result["ok"] is False
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] == "operational"
+
+
+def test_bwrap_status_parser_requires_a_valid_positive_child_pid() -> None:
+    """Only bounded, strict JSON status records with a positive child pid prove spawn."""
+    assert rgh._bwrap_status_reports_child_started(b'{"child-pid":1234}\n') is True
+    for invalid_status in (
+        b"",
+        b'{"exit-code":0}\n',
+        b'{"child-pid":0}\n',
+        b'{"child-pid":-1}\n',
+        b'{"child-pid":true}\n',
+        b'{"child-pid":"1234"}\n',
+        b'{"child-pid":1234}\nnot-json\n',
+        b"x" * (rgh._BWRAP_STATUS_MAX_BYTES + 1),
+    ):
+        assert rgh._bwrap_status_reports_child_started(invalid_status) is False
+
+
+def test_agy_bwrap_preexec_nonzero_does_not_mark_actual_invocation(monkeypatch, tmp_path: Path) -> None:
+    fake_agy_bin = "/hermetic/agy-ac10-bwrap"
+    fixed_prompt = "AC10 bwrap pre-exec failure"
+    bwrap_prefix = ["bwrap", "--deterministic-pre-exec-failure", "--"]
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=bwrap_prefix
+    )
+    observed_argvs: list[list[Any]] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        actual_argv = list(cmd)
+        observed_argvs.append(actual_argv)
+        assert actual_argv[:2] == bwrap_prefix[:2]
+        assert actual_argv[2] == "--json-status-fd"
+        assert actual_argv[4:] == ["--", fake_agy_bin, "-p", fixed_prompt]
+        assert kwargs["shell"] is False
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        return _make_completed(125, stderr="simulated bwrap configuration failure")
+
+    try:
+        with patch.object(
+            rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+        ):
+            with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+                result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+    finally:
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+    assert len(observed_argvs) == 1
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_exit_nonzero"
+    assert result["agy_failure_kind"] == "operational"
+    assert result["agy_invocation_attempted"] is False
+    assert not (result["agy_invocation_attempted"] and result["agy_failure_kind"] == "operational")
+
+
+def test_agy_bwrap_child_pid_success_marks_attempted_and_preserves_success(monkeypatch, tmp_path: Path) -> None:
+    """A valid bwrap child-pid is the sole proof that may authorize AGY success."""
+    fake_agy_bin = "/hermetic/agy-ac10-bwrap"
+    fixed_prompt = "AC10 bwrap child success"
+    bwrap_prefix = ["bwrap", "--deterministic-child-success", "--"]
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=bwrap_prefix
+    )
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        actual_argv = list(cmd)
+        assert actual_argv[:2] == bwrap_prefix[:2]
+        assert actual_argv[2] == "--json-status-fd"
+        assert actual_argv[4:] == ["--", fake_agy_bin, "-p", fixed_prompt]
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        os.write(kwargs["pass_fds"][0], b'{"child-pid":1234}\n{"exit-code":0}\n')
+        return _make_completed(0, stdout="bwrap child AGY success")
+
+    try:
+        with patch.object(
+            rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+        ):
+            with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+                result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+    finally:
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+    assert result["ok"] is True
+    assert result["response_text"] == "bwrap child AGY success"
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] is None
+    router = _load_agy_advisory_fallback_router()
+    decision = router.route_agy_advisory_fallback(
+        result,
+        requirement="advisory",
+        canonical_failure_kind=rgh.canonical_agy_failure_kind,
+    )
+    assert decision["status"] == "ok"
+    assert decision["next_action"] == "continue_agy_result"
+
+
+def test_agy_bwrap_normal_success_without_child_proof_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    """A zero bwrap return without valid child proof cannot expose a response or fallback."""
+    fake_agy_bin = "/hermetic/agy-ac10-bwrap"
+    fixed_prompt = "AC10 bwrap unproven normal success"
+    bwrap_prefix = ["bwrap", "--deterministic-unproven-success", "--"]
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=bwrap_prefix
+    )
+    proof_failures: tuple[tuple[str, bytes | None], ...] = (
+        ("absent", None),
+        ("malformed", b"not-json\n"),
+        ("oversized", b"x" * (rgh._BWRAP_STATUS_MAX_BYTES + 1)),
+        ("no-positive-child-pid", b'{"child-pid":0}\n'),
+    )
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+
+    for case_name, status in proof_failures:
+        attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+
+        def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+            actual_argv = list(cmd)
+            assert actual_argv[:2] == bwrap_prefix[:2]
+            assert actual_argv[2] == "--json-status-fd"
+            assert actual_argv[4:] == ["--", fake_agy_bin, "-p", fixed_prompt]
+            assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+            if status is not None:
+                assert os.write(kwargs["pass_fds"][0], status) == len(status)
+            return _make_completed(0, stdout=f"unproven response: {case_name}")
+
+        try:
+            with patch.object(
+                rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+            ):
+                with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+                    result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+        finally:
+            rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+        assert result["ok"] is False
+        assert result["failure_class"] == "agy_exit_nonzero"
+        assert result["response_text"] is None
+        assert result["agy_invocation_attempted"] is False
+        assert result["agy_failure_kind"] == "operational"
+        router = _load_agy_advisory_fallback_router()
+        decision = router.route_agy_advisory_fallback(
+            result,
+            requirement="advisory",
+            canonical_failure_kind=rgh.canonical_agy_failure_kind,
+        )
+        assert decision["status"] == "failed"
+        assert decision["next_action"] == "fail_closed"
+        assert decision["reason_code"] == "non_agy_or_pre_agy"
+
+
+def test_agy_bwrap_child_started_nonzero_marks_actual_invocation(monkeypatch, tmp_path: Path) -> None:
+    fake_agy_bin = "/hermetic/agy-ac10-bwrap"
+    fixed_prompt = "AC10 bwrap child failure"
+    bwrap_prefix = ["bwrap", "--deterministic-child-failure", "--"]
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=bwrap_prefix
+    )
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        actual_argv = list(cmd)
+        assert actual_argv[:2] == bwrap_prefix[:2]
+        assert actual_argv[2] == "--json-status-fd"
+        assert actual_argv[4:] == ["--", fake_agy_bin, "-p", fixed_prompt]
+        assert kwargs["shell"] is False
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        os.write(kwargs["pass_fds"][0], b'{"child-pid":1234}\n{"exit-code":1}\n')
+        return _make_completed(1, stderr="simulated AGY process failure")
+
+    try:
+        with patch.object(
+            rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+        ):
+            with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+                result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+    finally:
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_exit_nonzero"
+    assert result["agy_failure_kind"] == "operational"
+    assert result["agy_invocation_attempted"] is True
+    assert rgh.canonical_agy_failure_kind(result["failure_class"]) == "operational"
+
+
+def test_agy_bwrap_child_started_timeout_marks_actual_invocation_and_preserves_fallback_eligibility(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fake_agy_bin = "/hermetic/agy-ac10-bwrap"
+    fixed_prompt = "AC10 bwrap child timeout"
+    bwrap_prefix = ["bwrap", "--deterministic-child-timeout", "--"]
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=bwrap_prefix
+    )
+    observed_attempted: list[bool] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        actual_argv = list(cmd)
+        assert actual_argv[:2] == bwrap_prefix[:2]
+        assert actual_argv[2] == "--json-status-fd"
+        assert actual_argv[4:] == ["--", fake_agy_bin, "-p", fixed_prompt]
+        assert kwargs["shell"] is False
+        observed_attempted.append(rgh._AGY_INVOCATION_ATTEMPTED_CTX.get())
+        os.write(kwargs["pass_fds"][0], b'{"child-pid":1234}\n')
+        raise subprocess.TimeoutExpired(cmd=actual_argv, timeout=kwargs["timeout"])
+
+    with patch.object(
+        rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+    ):
+        with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+            result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+
+    assert observed_attempted == [False]
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_timeout"
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] == "operational"
+
+    router = _load_agy_advisory_fallback_router()
+    decision = router.route_agy_advisory_fallback(
+        result,
+        requirement="advisory",
+        canonical_failure_kind=rgh.canonical_agy_failure_kind,
+    )
+    assert decision["status"] == "degraded"
+    assert decision["next_action"] == "native_non_mutating_fallback"
+    assert decision["reason_code"] == "advisory_operational"
+
+
+def test_agy_bwrap_preexec_timeout_does_not_mark_actual_invocation(monkeypatch, tmp_path: Path) -> None:
+    fake_agy_bin = "/hermetic/agy-ac10-bwrap"
+    fixed_prompt = "AC10 bwrap pre-exec timeout"
+    bwrap_prefix = ["bwrap", "--deterministic-pre-exec-timeout", "--"]
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=bwrap_prefix
+    )
+    observed_attempted: list[bool] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        observed_attempted.append(rgh._AGY_INVOCATION_ATTEMPTED_CTX.get())
+        raise subprocess.TimeoutExpired(cmd=list(cmd), timeout=kwargs["timeout"])
+
+    with patch.object(
+        rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+    ):
+        with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+            result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+
+    assert observed_attempted == [False]
+    assert result["failure_class"] == "agy_timeout"
+    assert result["agy_invocation_attempted"] is False
+    assert result["agy_failure_kind"] == "operational"
 
 
 # ---------------------------------------------------------------------------
@@ -1169,7 +1704,7 @@ def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation
         _write_valid_hook_event_for_subprocess_env(kwargs)
         return _make_completed(0, stdout=grounded_output)
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is True
@@ -1252,7 +1787,7 @@ def test_issue_1777_ac3_grounded_research_model_optional_account_default(monkeyp
 
     assert rgh.resolve_agy_grounded_research_model() is None
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is True
@@ -1271,7 +1806,7 @@ def test_issue_1777_ac4_grounded_research_bounded_retry_does_not_exceed_limit() 
         call_count["value"] += 1
         return _make_completed(0, stdout="I searched and found nothing relevant.")
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is False
@@ -1303,7 +1838,7 @@ def test_issue_1777_ac5_grounded_research_retry_uses_fresh_session() -> None:
         _write_valid_hook_event_for_subprocess_env(kwargs)
         return _make_completed(0, stdout=grounded_output)
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is True
@@ -1327,16 +1862,14 @@ def test_issue_1777_ac6_grounded_research_evidence_gate_applies_regardless_of_mo
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
         return _make_completed(0, stdout=hallucinated_output)
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         with_model_result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
     assert with_model_result["ok"] is False
     assert with_model_result["failure_class"] == "agy_web_grounding_tool_call_missing"
 
-    with patch.dict(
-        os.environ, {rgh.AGY_MODEL_AVAILABILITY_OVERRIDE_ENV: '{"claude-sonnet-4-6": false}'}
-    ):
+    with patch.dict(os.environ, {rgh.AGY_MODEL_AVAILABILITY_OVERRIDE_ENV: '{"claude-sonnet-4-6": false}'}):
         assert rgh.resolve_agy_grounded_research_model() is None
-        with patch("subprocess.run", side_effect=mock_run):
+        with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
             no_model_result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
     assert no_model_result["ok"] is False
     assert no_model_result["failure_class"] == "agy_web_grounding_tool_call_missing"
@@ -1349,7 +1882,7 @@ def test_issue_1777_ac6_grounded_research_evidence_gate_applies_regardless_of_mo
 # corrupted by merged stderr.
 # ---------------------------------------------------------------------------
 
-_FAKE_SERENA_STDERR_BACKPRESSURE_SERVER_SOURCE = '''
+_FAKE_SERENA_STDERR_BACKPRESSURE_SERVER_SOURCE = """
 import json
 import sys
 
@@ -1398,7 +1931,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
+"""
 
 
 def test_ac2_serena_collector_survives_stderr_backpressure_fake_mcp_server(tmp_path) -> None:
@@ -1422,10 +1955,11 @@ def test_ac2_serena_collector_survives_stderr_backpressure_fake_mcp_server(tmp_p
         "known_tools": ["find_file", "search_for_pattern", "get_symbols_overview"],
     }
 
-    with patch.object(rgh, "_load_serena_from_mcp_config", _fake_load_serena_from_mcp_config), patch.object(
-        rgh, "SERENA_COLLECTOR_SESSION_DEADLINE_SEC", 20.0
-    ), patch.object(rgh, "SERENA_CLIENT_REQUEST_TIMEOUT_SEC", 10.0), patch.object(
-        rgh, "SERENA_SERVER_TOOL_TIMEOUT_SEC", 8.0
+    with (
+        patch.object(rgh, "_load_serena_from_mcp_config", _fake_load_serena_from_mcp_config),
+        patch.object(rgh, "SERENA_COLLECTOR_SESSION_DEADLINE_SEC", 20.0),
+        patch.object(rgh, "SERENA_CLIENT_REQUEST_TIMEOUT_SEC", 10.0),
+        patch.object(rgh, "SERENA_SERVER_TOOL_TIMEOUT_SEC", 8.0),
     ):
         documents, metadata = rgh._collect_live_serena_read_only_evidence([context_file], repo_root, manifest)
 

@@ -1,0 +1,363 @@
+"""AC8 runtime smoke, executed only by the top-level test runner.
+
+This is the sole thin integration smoke: the private fixed-proposal_only driver
+uses a test-owned AGY fake through the canonical builder and actual wrapper
+before a real codebase-investigator invocation reaches a native read-only
+sentinel. The worker does not execute this test.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, NoReturn
+
+import pytest
+
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parents[4]
+_CONTROLLER_PATH = _REPO_ROOT / ".claude/skills/issue-refinement-loop/scripts/run_codebase_investigator_agy_advisory.py"
+_SPEC = importlib.util.spec_from_file_location("actual_wrapper_smoke_controller", _CONTROLLER_PATH)
+assert _SPEC and _SPEC.loader
+controller = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = controller
+_SPEC.loader.exec_module(controller)
+
+_MUTATING_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
+_UNAVAILABLE_MARKERS = (
+    "Please run /login",
+    "403 WebSocket upgrade",
+    "WebSocket upgrade was rejected",
+    "Not authenticated",
+    "invalid_grant",
+    "command not found",
+    "unrecognized_model",
+)
+_SENTINEL = "AGY_ADVISORY_INVOCATION_REQUEST_V1"
+_AC8_LIVE_VERIFICATION_COMMAND = (
+    "uv run --locked pytest "
+    ".claude/skills/issue-refinement-loop/tests/"
+    "test_codebase_investigator_actual_wrapper_fallback_smoke.py -q -m claude_live"
+)
+
+
+def _tracked_status() -> str:
+    completed = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0
+    return completed.stdout
+
+
+def _resolve_tested_head() -> str:
+    """Return only a validated current worktree HEAD for runtime evidence."""
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, "runtime evidence requires resolving the current git HEAD"
+    tested_head = completed.stdout.strip()
+    assert re.fullmatch(r"[0-9a-f]{40}", tested_head), "runtime evidence requires a lowercase full git HEAD"
+    return tested_head
+
+
+def _write_runtime_evidence(*, result: str, exit_code: int, reason: str) -> Path:
+    """Persist the runtime-policy evidence without raw child output or credentials."""
+    assert result in {"PASS", "SKIP"}
+    assert exit_code in {0, 77}
+    tested_head = _resolve_tested_head()
+    directory = _REPO_ROOT / "artifacts"
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = directory / f"runtime-verification-AC8-{stamp}.log"
+    environment = (
+        f"python={sys.version_info.major}.{sys.version_info.minor}; "
+        f"claude_cli={'available' if shutil.which('claude') else 'unavailable'}"
+    )
+    completion = (
+        ("Selected Test: completed", "SKIP: not used")
+        if result == "PASS"
+        else ("Selected Test: unavailable", "SKIP: exit 77")
+    )
+    content = "\n".join(
+        (
+            "=== Runtime Verification Log ===",
+            "AC: AC8 actual-wrapper native fallback smoke",
+            f"Timestamp: {datetime.now(timezone.utc).isoformat()}",
+            f"Tested Head: {tested_head}",
+            f"Environment: {environment}",
+            "",
+            "--- Input ---",
+            _AC8_LIVE_VERIFICATION_COMMAND,
+            "AGY_BIN: [stripped; module-private fake only]",
+            "",
+            "--- Output ---",
+            "Raw SubAgent stdout/stderr is omitted to preserve the no-secret boundary.",
+            "",
+            "--- Verdict ---",
+            f"Result: {result}",
+            *completion,
+            f"Exit Code: {exit_code}",
+            f"Reason: {reason}",
+            "",
+        )
+    )
+    assert len(content.encode("utf-8")) <= 4096
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_runtime_evidence_binds_the_actual_current_head() -> None:
+    """PASS evidence records the worktree SHA and explicit completed/no-SKIP state."""
+    expected_head = _resolve_tested_head()
+    evidence = _write_runtime_evidence(result="PASS", exit_code=0, reason="focused unit")
+    try:
+        content = evidence.read_text(encoding="utf-8")
+        assert f"Tested Head: {expected_head}" in content
+        assert "Selected Test: completed" in content
+        assert "SKIP: not used" in content
+    finally:
+        evidence.unlink(missing_ok=True)
+
+
+def test_runtime_evidence_fails_closed_without_a_resolved_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed HEAD lookup must not create a runtime-evidence file."""
+    directory = _REPO_ROOT / "artifacts"
+    before = set(directory.glob("runtime-verification-AC8-*.log")) if directory.is_dir() else set()
+
+    def fail_head_lookup(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=["git", "rev-parse", "HEAD"], returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fail_head_lookup)
+    with pytest.raises(AssertionError, match="requires resolving the current git HEAD"):
+        _write_runtime_evidence(result="PASS", exit_code=0, reason="focused unit")
+    after = set(directory.glob("runtime-verification-AC8-*.log")) if directory.is_dir() else set()
+    assert after == before
+
+
+def _exit_runtime_skip(*, reason: str, before: str) -> NoReturn:
+    """Emit the runtime-policy SKIP contract without treating it as PASS."""
+    assert before == _tracked_status(), "tracked worktree status changed before runtime SKIP"
+    evidence = _write_runtime_evidence(result="SKIP", exit_code=77, reason=reason)
+    print(f"SKIP: {reason}; evidence: {evidence}")
+    pytest.exit("runtime verification unavailable", returncode=77)
+
+
+def _write_fake_agy(tmp_path: Path) -> Path:
+    fake_directory = tmp_path / "fake-bin"
+    fake_directory.mkdir()
+    fake = fake_directory / "agy"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+Path(__file__).with_suffix('.invoked').write_text(
+    json.dumps(
+        {"argv": sys.argv[1:], "agy_bin": os.environ.get("AGY_BIN")},
+        separators=(",", ":"),
+    ),
+    encoding="utf-8",
+)
+print('simulated AGY operational failure', file=sys.stderr)
+raise SystemExit(1)
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    return fake
+
+
+def _write_private_controller_driver(tmp_path: Path, fake_agy: Path) -> Path:
+    """Create the smoke-only caller process around the module-private seam."""
+    driver = tmp_path / "private-controller-driver.py"
+    driver.write_text(
+        f"""#!/usr/bin/env python3
+import importlib.util
+import sys
+from pathlib import Path
+
+controller_path = Path({str(_CONTROLLER_PATH)!r})
+spec = importlib.util.spec_from_file_location("issue_2434_private_smoke", controller_path)
+assert spec is not None and spec.loader is not None
+controller = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = controller
+spec.loader.exec_module(controller)
+run = controller._run_fixed_proposal_only_actual_wrapper_smoke(
+    root=Path({str(_REPO_ROOT)!r}), fake_agy_bin={str(fake_agy)!r}
+)
+sys.stdout.buffer.write(controller.encode_closed_json(run.decision))
+raise SystemExit(0 if run.decision["status"] in {{"ok", "degraded"}} else 1)
+""",
+        encoding="utf-8",
+    )
+    driver.chmod(driver.stat().st_mode | stat.S_IXUSR)
+    return driver
+
+
+def _stream_result(stdout: str) -> tuple[list[dict[str, Any]], str]:
+    tools: list[dict[str, Any]] = []
+    result = ""
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "tool_use":
+                    tools.append({"name": block.get("name"), "input": block.get("input")})
+        elif event.get("type") == "result":
+            result = event.get("result") or ""
+    return tools, result
+
+
+@pytest.mark.claude_live
+def test_actual_wrapper_fallback_reaches_real_native_sentinel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The test-runner-only smoke preserves exact controller ownership."""
+    fake = _write_fake_agy(tmp_path)
+    driver = _write_private_controller_driver(tmp_path, fake)
+    decision_path = tmp_path / "controller-decision.json"
+    sidecar_path = tmp_path / "controller-sidecar.json"
+    controller_command = f"{driver} > {decision_path} 2> {sidecar_path}"
+    monkeypatch.setenv("AGY_BIN", "/ambient/must-not-be-used")
+    before = _tracked_status()
+    assert before == "", "AC8 runtime smoke requires a clean worktree"
+
+    claude_bin = shutil.which("claude")
+    if claude_bin is None:
+        _exit_runtime_skip(reason="claude CLI not found on PATH", before=before)
+    prompt = f"""Run the following exact **test-only private controller driver** once. It owns
+canonical builder → actual AGY wrapper → exact result readback and emits its closed
+controller decision only on stdout. Capture stdout and stderr separately exactly as shown:
+
+```bash
+{controller_command}
+```
+
+Use the Read tool separately on both resulting files. The shown shell command is your sole Bash invocation:
+do not run Git, Python, hashing, or any other Bash command. Do not accept a caller-supplied decision, raw wrapper
+result, or provenance. Only if the directly captured decision is exact `degraded` /
+`native_non_mutating_fallback`, the sidecar is empty, and the process exit is 0, perform
+bounded native read-only investigation of `.claude/agents/codebase-investigator.md`, find the literal
+controller request schema identifier there, and return concise CODEBASE_INVESTIGATION_RESULT_V1 YAML
+whose `discovery_summary` contains that identifier exactly. Do not invoke AGY separately, and do not
+use a mutation tool.
+"""
+    completed = subprocess.run(
+        [
+            claude_bin,
+            "-p",
+            "--agent",
+            "codebase-investigator",
+            "--output-format",
+            "stream-json",
+            "--include-hook-events",
+            "--no-session-persistence",
+            "--max-turns",
+            "8",
+            "--verbose",
+        ],
+        cwd=_REPO_ROOT,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    combined = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    unavailable = next((item for item in _UNAVAILABLE_MARKERS if item in combined), None)
+    if completed.returncode != 0 and unavailable is not None:
+        _exit_runtime_skip(
+            reason=f"actual SubAgent runtime unavailable ({unavailable})",
+            before=before,
+        )
+
+    tools, result = _stream_result(completed.stdout or "")
+    bash_commands = [
+        str(tool["input"].get("command", ""))
+        for tool in tools
+        if tool["name"] == "Bash" and isinstance(tool["input"], dict)
+    ]
+    controller_bash_commands = {
+        controller_command,
+        f"{controller_command}; status=$?; printf 'exit=%s\\n' \"$status\"",
+    }
+    assert len(bash_commands) == 1 and bash_commands[0] in controller_bash_commands, (
+        "real codebase-investigator issued a Bash command outside the bounded controller invocation: "
+        f"{bash_commands!r}"
+    )
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    assert decision_path.is_file()
+    assert sidecar_path.is_file()
+    decision = controller.strict_json_object_bytes(decision_path.read_bytes())
+    assert controller.validate_decision(decision) == {
+        "schema": "AGY_ADVISORY_FALLBACK_ROUTE_DECISION_V1",
+        "schema_version": 1,
+        "status": "degraded",
+        "next_action": "native_non_mutating_fallback",
+        "failure_class": "agy_exit_nonzero",
+        "reason_code": "advisory_operational",
+    }
+    assert sidecar_path.read_bytes() == b""
+    fake_evidence = fake.with_suffix(".invoked")
+    assert fake_evidence.is_file()
+    fake_invocation = json.loads(fake_evidence.read_text(encoding="utf-8"))
+    assert "-p" in fake_invocation["argv"]
+    assert fake_invocation["agy_bin"] == str(fake)
+    assert fake_invocation["agy_bin"] != "/ambient/must-not-be-used"
+    assert any(str(driver) in command for command in bash_commands), (
+        "real codebase-investigator did not invoke the test-only controller driver"
+    )
+    source_path = _REPO_ROOT / ".claude/agents/codebase-investigator.md"
+    read_indices = {
+        path: [
+            index
+            for index, tool in enumerate(tools)
+            if tool["name"] == "Read"
+            and isinstance(tool["input"], dict)
+            and tool["input"].get("file_path") == path
+        ]
+        for path in (str(decision_path), str(sidecar_path), str(source_path))
+    }
+    assert all(read_indices.values()), (
+        "real codebase-investigator did not consume controller captures then perform native source reading"
+    )
+    driver_index = next(
+        index
+        for index, tool in enumerate(tools)
+        if tool["name"] == "Bash"
+        and isinstance(tool["input"], dict)
+        and tool["input"].get("command") in controller_bash_commands
+    )
+    decision_index = next(index for index in read_indices[str(decision_path)] if index > driver_index)
+    sidecar_index = next(index for index in read_indices[str(sidecar_path)] if index > driver_index)
+    assert min(read_indices[str(source_path)]) > max(decision_index, sidecar_index)
+    assert not [tool for tool in tools if tool["name"] in _MUTATING_TOOLS]
+    assert before == _tracked_status(), "tracked worktree status changed during smoke"
+    assert _SENTINEL in result, "real codebase-investigator did not reach native sentinel"
+    evidence = _write_runtime_evidence(
+        result="PASS",
+        exit_code=0,
+        reason="controller-owned fake actual-wrapper smoke reached the native sentinel",
+    )
+    assert evidence.is_file()
+    assert before == _tracked_status(), "tracked worktree status changed while writing PASS evidence"
+    print(f"PASS evidence: {evidence.relative_to(_REPO_ROOT)}")
