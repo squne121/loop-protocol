@@ -2291,6 +2291,30 @@ class GitProtocolProcessGroupCleanupFailed(RuntimeError):
     """Fail closed when dedicated process-group absence is not confirmed."""
 
 
+class ControlPlaneUnavailable(RuntimeError):
+    """Fail-closed terminal state for the control-plane remote-binding and
+    fixed-worktree-recovery protocols (Issue #2197 AC3/AC4/AC5/AC7).
+
+    Raised for: a rejected S1/fetch/F/S2 remote-binding state machine (a
+    changed symbolic target, or an `S2` that does not corroborate `F`), a
+    failed builder-owned CAS cleanup of the fetched private ref, or a fixed
+    dedicated worktree recovery state that cannot be proven safe (dirty
+    working tree, unknown owner, or git-common-dir linkage mismatch). This
+    type is never used to report an ordinary programming error -- only a
+    protocol precondition this module deliberately refuses to proceed past
+    without positive proof.
+    """
+
+
+# Issue #2197 AC1: the sole production remote authority. Never sourced from a
+# caller argument, environment variable, or the local repository's `origin`
+# remote configuration (which may itself be SSH) -- `origin` is never read by
+# any control-plane remote-binding operation. Built from the already-trusted,
+# read-only `TRUSTED_REPO_SLUG` constant so this file introduces no second
+# repository-identity literal.
+CONTROL_PLANE_CANONICAL_REMOTE_URL = f"https://github.com/{TRUSTED_REPO_SLUG}.git"
+
+
 @dataclass(frozen=True)
 class GitProtocolDeadline:
     """One monotonic deadline shared by every step in one remote protocol."""
@@ -2381,6 +2405,7 @@ _SUPPORTED_GIT_OPERATION_KINDS = frozenset(
         "read_private_ref_oid",
         "require_commit_object",
         "read_worktree_head",
+        "read_worktree_status_porcelain",
         "add_detached_locked_worktree",
         "remove_detached_locked_worktree",
         "list_worktrees_porcelain",
@@ -2827,6 +2852,8 @@ def _operation_arguments(operation: _GitOperation, *, cwd: str) -> list[str]:
         return ["cat-file", "-e", object_id.value + "^{commit}"]
     if operation.kind == "read_worktree_head":
         return ["rev-parse", "--verify", "HEAD"]
+    if operation.kind == "read_worktree_status_porcelain":
+        return ["status", "--porcelain", "--untracked-files=all"]
     if operation.kind == "add_detached_locked_worktree":
         path = operation.worktree_path
         object_id = _revalidate_object_id(operation.object_id)
@@ -3567,6 +3594,55 @@ def _require_success(result: subprocess.CompletedProcess, operation: str) -> sub
     return result
 
 
+def parse_control_plane_default_ref_symref(stdout: str) -> tuple[str, str]:
+    """Focused, single-purpose parser for the exact output shape of
+    ``git ls-remote --exit-code --symref <canonical-literal> HEAD`` (Issue
+    #2197 AC2). Not a generic ls-remote/symref parsing framework: it only
+    ever accepts a request for exactly one ref (``HEAD``) and rejects
+    anything but that request's own well-formed two-line symref shape.
+
+    Each non-empty output line must be ``<left>\\t<right>``. ``right`` must be
+    exactly ``HEAD`` -- a request for any other ref name never reaches this
+    parser, so anything else here is malformed. ``left`` is classified into
+    either a symbolic-target line (``ref: <target>``) or an object-id
+    candidate line (anything else). Exactly one symbolic-target line and
+    exactly one object-id line are required; any other count -- zero
+    symbolic-target lines (unborn or non-symbolic/direct ``HEAD``), more than
+    one of either kind (duplicate/ambiguous), or a missing/extra object-id
+    line -- fails closed with ``ValueError``.
+
+    This function only proves *shape*. It deliberately does not itself
+    validate the symbolic target against the ``refs/heads/`` namespace grammar
+    or the object id against a specific hash length: those are the existing,
+    already-reviewed responsibilities of ``validate_allowed_remote_ref`` and
+    ``validate_repository_object_id``, which the caller applies to this
+    function's return value. A ref target outside ``refs/heads/`` or an
+    abbreviated/invalid-length/invalid-character object id therefore still
+    fails closed, just one layer up, without this parser duplicating that
+    grammar.
+    """
+    ref_targets: list[str] = []
+    object_id_candidates: list[str] = []
+    for raw_line in stdout.split("\n"):
+        line = raw_line.rstrip("\r")
+        if not line:
+            continue
+        if "\t" not in line:
+            raise ValueError("control_plane_symref_line_malformed")
+        left, right = line.split("\t", 1)
+        if right != "HEAD" or not left:
+            raise ValueError("control_plane_symref_line_malformed")
+        if left.startswith("ref: "):
+            ref_targets.append(left[len("ref: "):])
+        else:
+            object_id_candidates.append(left)
+    if len(ref_targets) != 1:
+        raise ValueError("control_plane_symref_ref_line_count_invalid")
+    if len(object_id_candidates) != 1:
+        raise ValueError("control_plane_symref_object_id_line_count_invalid")
+    return ref_targets[0], object_id_candidates[0]
+
+
 def run_control_plane_git_effective_remote_url(
     expected_remote_url: str,
     *,
@@ -3632,24 +3708,83 @@ def run_control_plane_git_fetch_default_ref(
     remote_url: LiteralRemoteUrl,
     remote_ref: AllowedRemoteRef,
     *,
+    object_format: RepositoryObjectFormat,
     cwd: str,
     project_root: str,
     deadline: GitProtocolDeadline,
     scratch_root: str | None = None,
 ) -> ControlPlanePrivateRef:
+    """Fetch exactly ``remote_ref`` from ``remote_url`` into a fresh nonce
+    private ref this builder allocates itself (Issue #2197 AC3/AC4).
+
+    Once ``private_ref`` is generated, this function owns that ref's own
+    cleanup lifecycle end to end for every exception raised *inside* this one
+    call -- including a genuine git-fetch failure and a post-command cleanup
+    failure. The trusted hooks-dir removal in `_execute_semantic_git`'s own
+    ``finally`` block can itself raise, and per Python's ``finally``
+    semantics that overrides the ``try`` block's return even when the
+    underlying fetch subprocess already succeeded and mutated the private
+    ref -- so this function's own caller must never learn a private ref name
+    it cannot also account for the cleanup of.
+
+    On any such exception, a best-effort read-back of ``private_ref``'s
+    current OID decides what, if anything, needs cleanup: an unreadable ref
+    (the fetch never actually completed) means there is nothing to clean up.
+    A readable ref attempts the same CAS delete already used elsewhere. The
+    exception that reaches the caller is always `ControlPlaneUnavailable`,
+    chained from the original failure when cleanup itself needed no further
+    action or succeeded, or chained from the cleanup failure (reusing the
+    same ``private_ref_cleanup_failed`` reason string convention already
+    used by `run_control_plane_remote_default_ref_binding`) when cleanup
+    itself also failed -- never silently swallowed.
+
+    This complements, and does not duplicate,
+    `run_control_plane_remote_default_ref_binding`'s own except-block CAS
+    cleanup, which only ever runs for exceptions occurring *after* this call
+    has already returned.
+    """
     remote_url = _revalidate_literal_remote_url(remote_url)
     remote_ref = _revalidate_allowed_remote_ref(remote_ref)
+    object_format = _revalidate_object_format(object_format)
     private_ref = make_control_plane_private_ref()
-    _require_success(
-        _execute_semantic_git(
-            _GitOperation("fetch_default_ref", remote_url=remote_url, remote_ref=remote_ref, private_ref=private_ref),
-            cwd=cwd,
-            project_root=project_root,
-            scratch_root=scratch_root,
-            deadline=deadline,
-        ),
-        "fetch_default_ref",
-    )
+    try:
+        _require_success(
+            _execute_semantic_git(
+                _GitOperation(
+                    "fetch_default_ref", remote_url=remote_url, remote_ref=remote_ref, private_ref=private_ref
+                ),
+                cwd=cwd,
+                project_root=project_root,
+                scratch_root=scratch_root,
+                deadline=deadline,
+            ),
+            "fetch_default_ref",
+        )
+    except BaseException as exc:
+        cleanup_deadline = _cleanup_deadline(deadline)
+        try:
+            fetched_oid = run_control_plane_git_read_private_ref_oid(
+                private_ref,
+                object_format,
+                cwd=cwd,
+                project_root=project_root,
+                deadline=cleanup_deadline,
+                scratch_root=scratch_root,
+            )
+        except BaseException:
+            raise ControlPlaneUnavailable(f"control_plane_unavailable:fetch_failed:{exc}") from exc
+        try:
+            run_control_plane_git_delete_private_ref_cas(
+                private_ref,
+                fetched_oid,
+                cwd=cwd,
+                project_root=project_root,
+                deadline=cleanup_deadline,
+                scratch_root=scratch_root,
+            )
+        except BaseException as cleanup_exc:
+            raise ControlPlaneUnavailable("control_plane_unavailable:private_ref_cleanup_failed") from cleanup_exc
+        raise ControlPlaneUnavailable(f"control_plane_unavailable:fetch_failed:{exc}") from exc
     return private_ref
 
 
@@ -3721,12 +3856,184 @@ def run_control_plane_git_read_worktree_head(
     return validate_repository_object_id((result.stdout or "").strip(), object_format)
 
 
-def _rollback_deadline(deadline: GitProtocolDeadline) -> GitProtocolDeadline:
-    """Bound compensation after a terminal add has consumed protocol time.
+def run_control_plane_git_read_worktree_status_porcelain(
+    path: DetachedWorktreePath,
+    *,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> str:
+    """Read-only ``git status --porcelain --untracked-files=all`` for an
+    existing fixed-identity worktree (Issue #2197 AC5 cleanliness check).
+    Empty string means clean. This performs no mutation and no identity
+    verification of its own -- the caller decides what "clean" permits."""
+    path = _revalidate_worktree_path(path, project_root, require_fresh=False)
+    result = _require_success(
+        _execute_semantic_git(
+            _GitOperation("read_worktree_status_porcelain", worktree_path=path),
+            cwd=path.value,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "read_worktree_status_porcelain",
+    )
+    return result.stdout or ""
 
-    This is not a new normal-protocol deadline. It is a bounded recovery window
-    reserved solely to remove a worktree that this builder just created and to
-    prove both its path and its catalog entry are absent.
+
+def run_control_plane_git_remove_existing_detached_locked_worktree(
+    path: DetachedWorktreePath,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> None:
+    """Remove exactly the caller-supplied existing detached+locked worktree
+    path (Issue #2197 AC5 controlled refresh/recreate transition).
+
+    This is a narrow, single-purpose wrapper around the already-closed
+    ``remove_detached_locked_worktree`` operation kind -- the exact same
+    operation kind and argv shape `_rollback_detached_locked_worktree`
+    already uses internally for its own post-add rollback. It is not a new
+    generic force-remove worktree API (Issue #2197 Out of Scope): there is no
+    caller-selectable flag/mode, and the only accepted argument is a path
+    that has already passed `validate_existing_detached_worktree_path`'s
+    fixed `.claude/worktrees` confinement. Callers are responsible for
+    verifying fixed-worktree identity, git-common-dir linkage, and
+    cleanliness *before* calling this -- it performs none of those checks
+    itself.
+    """
+    path = _revalidate_worktree_path(path, project_root, require_fresh=False)
+    _require_success(
+        _execute_semantic_git(
+            _GitOperation("remove_detached_locked_worktree", worktree_path=path),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "remove_detached_locked_worktree",
+    )
+
+
+def run_control_plane_remote_default_ref_binding(
+    remote_url: LiteralRemoteUrl,
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> tuple[ControlPlanePrivateRef, RepositoryObjectId, RepositoryObjectFormat]:
+    """Closed S1 -> fetch -> F -> (optional one) S2 remote default-ref
+    binding protocol (Issue #2197 AC1-AC4).
+
+    S1 observes ``(ref1, oid1)`` from the canonical remote's ``HEAD`` symref
+    via the focused parser (AC2). Exactly one fetch of ``ref1`` follows, into
+    a fresh nonce private ref allocated by
+    ``run_control_plane_git_fetch_default_ref`` -- this protocol never
+    refetches. ``F`` is that private ref's local readback. ``F == oid1``
+    accepts immediately. Otherwise exactly one further S2 observe is
+    permitted, and is accepted only when ``S2.ref == ref1 and S2.oid == F``;
+    any other outcome -- including a changed symbolic target -- is
+    ``ControlPlaneUnavailable`` (AC3). Every ``observe_default_ref`` /
+    ``fetch_default_ref`` call already re-verifies the resolved/literal
+    remote identity inside ``_execute_semantic_git`` (AC1); this function
+    does not duplicate that check.
+
+    Once the fetch has succeeded, the private ref is a live resource this
+    function owns end to end. Every exception raised past that point --
+    including this protocol's own S2 rejection -- triggers a builder-owned
+    best-effort CAS delete of that exact private ref (by the most recently
+    confirmed expected OID) before the exception propagates. A cleanup
+    failure itself is reported as ``ControlPlaneUnavailable``, chained from
+    the underlying cleanup error, never silently swallowed (AC4/AC7). A
+    failure *before* the fetch call (bad remote identity, S1 parse/shape
+    rejection, object-format lookup failure) never creates a private ref, so
+    it propagates unchanged -- there is nothing yet to clean up.
+    """
+    remote_url = _revalidate_literal_remote_url(remote_url)
+    object_format = run_control_plane_git_repository_object_format(
+        cwd=cwd, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+    )
+
+    def _observe() -> tuple[AllowedRemoteRef, RepositoryObjectId]:
+        observed = run_control_plane_git_observe_default_ref(
+            remote_url, cwd=cwd, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+        )
+        raw_ref, raw_object_id = parse_control_plane_default_ref_symref(observed.stdout or "")
+        return (
+            validate_allowed_remote_ref(raw_ref),
+            validate_repository_object_id(raw_object_id, object_format),
+        )
+
+    ref1, oid1 = _observe()
+    private_ref = run_control_plane_git_fetch_default_ref(
+        remote_url,
+        ref1,
+        object_format=object_format,
+        cwd=cwd,
+        project_root=project_root,
+        deadline=deadline,
+        scratch_root=scratch_root,
+    )
+    cleanup_expected_oid: RepositoryObjectId = oid1
+    try:
+        fetched_oid = run_control_plane_git_read_private_ref_oid(
+            private_ref,
+            object_format,
+            cwd=cwd,
+            project_root=project_root,
+            deadline=deadline,
+            scratch_root=scratch_root,
+        )
+        cleanup_expected_oid = fetched_oid
+        if fetched_oid != oid1:
+            ref2, oid2 = _observe()
+            if ref2 != ref1 or oid2 != fetched_oid:
+                raise ControlPlaneUnavailable(
+                    "control_plane_unavailable:remote_default_ref_state_machine_rejected"
+                )
+        run_control_plane_git_require_commit_object(
+            fetched_oid, cwd=cwd, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+        )
+        return private_ref, fetched_oid, object_format
+    except BaseException:
+        try:
+            run_control_plane_git_delete_private_ref_cas(
+                private_ref,
+                cleanup_expected_oid,
+                cwd=cwd,
+                project_root=project_root,
+                deadline=_cleanup_deadline(deadline),
+                scratch_root=scratch_root,
+            )
+        except BaseException as cleanup_exc:
+            raise ControlPlaneUnavailable("control_plane_unavailable:private_ref_cleanup_failed") from cleanup_exc
+        raise
+
+
+def _cleanup_deadline(deadline: GitProtocolDeadline) -> GitProtocolDeadline:
+    """Bound compensation deadline for cleanup-class operations (Issue #2197
+    AC4/AC5 P1).
+
+    `GitProtocolDeadline.execution_seconds()` always denies a normal
+    operation once `remaining <= cleanup_reserve_seconds` -- that reserve
+    exists so cleanup-class operations still have something to spend. But a
+    cleanup-class operation given the *same* shared deadline is denied by
+    that very reserve boundary too, defeating the reserve's own purpose.
+    This helper gives cleanup-class operations (a detached-worktree-add
+    rollback, or a builder-owned CAS delete of a fetched private ref) their
+    own bounded lane that can actually spend (part of) the reserve that was
+    set aside for them.
+
+    This is not a new normal-protocol deadline, and it never unboundedly
+    extends the original wall-clock deadline -- it is a small, bounded
+    recovery window (a fixed multiple of the original
+    `cleanup_reserve_seconds`) reserved solely for already-scoped cleanup
+    purposes: removing a worktree this builder just created and proving both
+    its path and its catalog entry are absent, or a best-effort CAS delete of
+    a private ref this builder owns.
     """
     reserve = _validate_deadline_value(deadline.cleanup_reserve_seconds, "cleanup_reserve")
     return GitProtocolDeadline(
@@ -3751,7 +4058,7 @@ def _rollback_detached_locked_worktree(
     scratch_root: str | None,
     deadline: GitProtocolDeadline,
 ) -> None:
-    recovery_deadline = _rollback_deadline(deadline)
+    recovery_deadline = _cleanup_deadline(deadline)
     if Path(path.value).exists():
         _require_success(
             _execute_semantic_git(
