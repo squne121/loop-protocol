@@ -91,9 +91,57 @@ def test_closed_surface_has_no_generic_or_raw_argv_authority():
         "run_control_plane_git_read_private_ref_oid",
         "run_control_plane_git_add_detached_locked_worktree",
         "run_control_plane_git_delete_private_ref_cas",
+        # Issue #2197 additions -- same closed-executor discipline applies.
+        "run_control_plane_git_read_worktree_status_porcelain",
+        "run_control_plane_git_remove_existing_detached_locked_worktree",
+        "run_control_plane_remote_default_ref_binding",
     ):
         assert "argv" not in inspect.signature(getattr(exec_mod, name)).parameters
     assert "*args" not in inspect.getsource(exec_mod.run_control_plane_git_add_detached_locked_worktree)
+    assert "*args" not in inspect.getsource(exec_mod.run_control_plane_git_remove_existing_detached_locked_worktree)
+
+
+def test_new_control_plane_wrappers_route_through_closed_executor_with_fixed_argv_shapes(monkeypatch, tmp_path):
+    """Issue #2197: `read_worktree_status_porcelain` and
+    `remove_existing_detached_locked_worktree` are narrow, single-purpose
+    wrappers -- not a new generic force-remove/status API. Prove their exact
+    fixed argv shape the same way `test_exact_remote_commands_and_fixed_fetch_cas_shapes`
+    already proves it for the pre-existing wrappers."""
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(operation, **kwargs):
+        args = tuple(
+            exec_mod._exact_git_argv(
+                operation,
+                git_executable=kwargs["git_executable"],
+                cwd=kwargs["cwd"],
+                hooks_dir=kwargs["hooks_dir"],
+            )
+        )
+        calls.append(args)
+        return subprocess.CompletedProcess(list(args), 1 if "config" in args else 0, "", "")
+
+    monkeypatch.setattr(exec_mod, "_run_closed_git_process", fake_run)
+
+    from skill_runtime_command_policy import validate_existing_detached_worktree_path
+
+    worktree_dir = tmp_path / ".claude" / "worktrees" / "existing"
+    worktree_dir.mkdir(parents=True)
+    existing_path = validate_existing_detached_worktree_path(str(worktree_dir), str(tmp_path))
+    deadline = _deadline()
+
+    exec_mod.run_control_plane_git_read_worktree_status_porcelain(
+        existing_path, project_root=str(tmp_path), deadline=deadline
+    )
+    exec_mod.run_control_plane_git_remove_existing_detached_locked_worktree(
+        existing_path, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+    )
+
+    semantic_calls = [call for call in calls if "config" not in call]
+    assert any(call[-3:] == ("status", "--porcelain", "--untracked-files=all") for call in semantic_calls)
+    assert any(
+        call[-5:] == ("worktree", "remove", "--force", "--force", existing_path.value) for call in semantic_calls
+    )
 
 
 def test_exact_remote_commands_and_fixed_fetch_cas_shapes(monkeypatch, tmp_path):
