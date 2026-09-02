@@ -56,6 +56,20 @@ def _make_completed(returncode: int, stdout: str = "", stderr: str = "") -> subp
     return subprocess.CompletedProcess(args=["agy", "-p", "test"], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _hermetic_no_bwrap():
+    """Force `materialize_isolated_agy_workspace()`'s bwrap child-pid-proof
+    branch (Issue #2434 AC6/AC10) off for tests that fully patch
+    `subprocess.run()` with a synthetic double rather than exercising a real
+    `bwrap` child process -- mirrors `test_agy_provider.py`'s helper of the
+    same name. Without this, a host with both a real `bwrap` binary AND a
+    real AGY OAuth token file makes `_run_agy()` route through the
+    `--json-status-fd` proof path even for these fully-mocked calls; since
+    the mock never writes a bwrap status record, the new unproven-bwrap-
+    success fail-close then overwrites the mocked payload these tests
+    assert on."""
+    return patch.object(rgh._agy_permission_policy, "_bwrap_available", return_value=False)
+
+
 def _write_valid_hook_event_for_subprocess_env(kwargs: dict[str, Any], tool_name: str = "search_web") -> None:
     """Append a validated `agy_tool_provenance_v1` PreToolUse hook event line
     to the isolated-workspace hook events log file that this real
@@ -389,7 +403,7 @@ def test_run_agy_raw_command_reflects_selected_model_end_to_end() -> None:
         _write_valid_hook_event_for_subprocess_env(kwargs)
         return _make_completed(0, stdout=grounded_output)
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is True
@@ -442,7 +456,7 @@ def test_run_agy_raw_command_reflects_selected_model_end_to_end_non_empty_chain(
         return _make_completed(0, stdout=grounded_output)
 
     with patch.object(rgh, "load_model_routing", return_value=fake_routing):
-        with patch("subprocess.run", side_effect=mock_run):
+        with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
             result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is True

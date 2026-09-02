@@ -55,6 +55,24 @@ def _make_completed(returncode: int, stdout: str = "", stderr: str = "") -> subp
     return subprocess.CompletedProcess(args=["agy", "-p", "test"], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _hermetic_no_bwrap():
+    """Force `materialize_isolated_agy_workspace()`'s bwrap child-pid-proof
+    branch (Issue #2434 AC6/AC10) off for tests that fully patch
+    `subprocess.run()` with a synthetic double rather than exercising a real
+    `bwrap` child process. Without this, a host that happens to have both a
+    real `bwrap` binary AND a real AGY OAuth token file (e.g. a developer
+    workstation with a prior authenticated `agy` session) makes
+    `_run_agy()` route through the `--json-status-fd` proof path even for
+    these fully-mocked calls; since the mock never writes a bwrap status
+    record, the new unproven-bwrap-success fail-close then overwrites the
+    mocked success/failure payload these tests assert on. Patching
+    `_bwrap_available()` keeps `agy_oauth_token_bwrap_prefix` `None` --
+    identical to the CI/no-OAuth-token environment these tests were
+    originally written against -- without altering any other workspace
+    materialization behavior."""
+    return patch.object(rgh._agy_permission_policy, "_bwrap_available", return_value=False)
+
+
 def _valid_hook_event(tool_name: str = "search_web") -> dict[str, Any]:
     """A validated `agy_tool_provenance_v1` PreToolUse hook event fixture
     (Issue #2038 fix_delta iteration 2): the legacy stdout/marker parser now
@@ -1686,7 +1704,7 @@ def test_issue_1749_grounded_research_end_to_end_forces_model_via_run_delegation
         _write_valid_hook_event_for_subprocess_env(kwargs)
         return _make_completed(0, stdout=grounded_output)
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is True
@@ -1769,7 +1787,7 @@ def test_issue_1777_ac3_grounded_research_model_optional_account_default(monkeyp
 
     assert rgh.resolve_agy_grounded_research_model() is None
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is True
@@ -1788,7 +1806,7 @@ def test_issue_1777_ac4_grounded_research_bounded_retry_does_not_exceed_limit() 
         call_count["value"] += 1
         return _make_completed(0, stdout="I searched and found nothing relevant.")
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is False
@@ -1820,7 +1838,7 @@ def test_issue_1777_ac5_grounded_research_retry_uses_fresh_session() -> None:
         _write_valid_hook_event_for_subprocess_env(kwargs)
         return _make_completed(0, stdout=grounded_output)
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
 
     assert result["ok"] is True
@@ -1844,14 +1862,14 @@ def test_issue_1777_ac6_grounded_research_evidence_gate_applies_regardless_of_mo
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
         return _make_completed(0, stdout=hallucinated_output)
 
-    with patch("subprocess.run", side_effect=mock_run):
+    with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
         with_model_result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
     assert with_model_result["ok"] is False
     assert with_model_result["failure_class"] == "agy_web_grounding_tool_call_missing"
 
     with patch.dict(os.environ, {rgh.AGY_MODEL_AVAILABILITY_OVERRIDE_ENV: '{"claude-sonnet-4-6": false}'}):
         assert rgh.resolve_agy_grounded_research_model() is None
-        with patch("subprocess.run", side_effect=mock_run):
+        with _hermetic_no_bwrap(), patch("subprocess.run", side_effect=mock_run):
             no_model_result = rgh.run_delegation(_agy_request(tool_profile="grounded_research", timeout_sec=120))
     assert no_model_result["ok"] is False
     assert no_model_result["failure_class"] == "agy_web_grounding_tool_call_missing"
