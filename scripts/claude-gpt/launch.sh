@@ -1166,7 +1166,9 @@ def _is_safe_repo_relative_operand(value):
 
 
 def _is_canonical_transaction(payload):
-    tool_input = payload.get("tool_input") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
+        return False
+    tool_input = payload.get("tool_input")
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(command, str):
         return False

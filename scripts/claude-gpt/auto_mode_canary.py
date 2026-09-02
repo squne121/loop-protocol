@@ -97,6 +97,63 @@ ISSUE_EDITOR_PERMISSION_CANARY_COMMAND = (
 )
 CLAUDE_GPT_LAUNCHER = SCRIPT_DIR / "launch.sh"
 
+
+# `--agent issue-editor` would only test a top-level persona. AC3 instead
+# requires a real launcher-owned Auto parent to delegate to the repository
+# issue-editor SubAgent, so the child's Bash request inherits the parent run's
+# generated Auto settings and PermissionRequest hook.
+def _issue_editor_permission_child_prompt() -> str:
+    return f"""You are the issue-editor child in a bounded, non-interactive permission canary.
+
+Use the Bash tool exactly once with this exact command and no shell operators:
+{ISSUE_EDITOR_PERMISSION_CANARY_COMMAND}
+
+The input is intentionally not JSON. Confirm the helper's failed_no_mutation
+result, then output exactly this marker and nothing else:
+{ISSUE_EDITOR_PERMISSION_CANARY_MARKER}
+
+Do not edit files, invoke gh, inspect credentials/configuration, delegate, or
+attempt any fallback or direct invocation."""
+
+
+def _issue_editor_permission_parent_prompt() -> str:
+    return f"""You are the bounded, non-interactive Claude-GPT Auto parent for a permission canary.
+
+Use the Agent tool exactly once to delegate to subagent_type `issue-editor`.
+Pass the following child instructions verbatim:
+
+--- CHILD INSTRUCTIONS BEGIN ---
+{_issue_editor_permission_child_prompt()}
+--- CHILD INSTRUCTIONS END ---
+
+Do not use Bash, invoke gh, inspect credentials/configuration, edit files, or
+attempt a fallback/direct execution yourself. After the child returns its exact
+marker, output exactly this marker and nothing else:
+{ISSUE_EDITOR_PERMISSION_CANARY_MARKER}"""
+
+
+def _stream_json_has_tool_use(stdout: str, tool_name: str, **input_values: object) -> bool:
+    """Find a structured tool-use event without retaining raw runtime output."""
+    def walk(node: object) -> bool:
+        if isinstance(node, dict):
+            tool_input = node.get("input")
+            if node.get("name") == tool_name and isinstance(tool_input, dict):
+                if all(tool_input.get(key) == value for key, value in input_values.items()):
+                    return True
+            return any(walk(value) for value in node.values())
+        if isinstance(node, list):
+            return any(walk(value) for value in node)
+        return False
+
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if walk(event):
+            return True
+    return False
+
 NEGATIVE_CONTROL_CASES = (
     "direct_arbitrary_agy_invocation",
     "provider_not_agy",
@@ -565,12 +622,12 @@ def run_agy_causal_canary(receipt_path: Path | None) -> tuple[int, dict]:
 
 
 def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[int, dict]:
-    """Run the actual Claude-GPT Auto permission canary without mutation.
+    """Run the actual Auto parent-to-issue-editor permission canary without mutation.
 
-    The controlled helper receives an existing Python source file rather than
-    transaction JSON, so ``failed_no_mutation`` proves entrypoint reachability
-    while failing before any remote operation. Raw Claude output is inspected
-    only in memory; the returned detail contains digests and booleans only.
+    The child receives an existing Python source file rather than transaction
+    JSON, so ``failed_no_mutation`` proves entrypoint reachability while failing
+    before any remote operation. Raw Claude output is inspected only in memory;
+    the returned detail contains digests and booleans only.
     """
     if os.environ.get(ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV) != "1":
         return EXIT_SKIP, {"skip_reason": "issue_editor_permission_canary_not_opted_in"}
@@ -579,29 +636,16 @@ def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[i
     if not CLAUDE_GPT_LAUNCHER.is_file():
         return EXIT_SKIP, {"skip_reason": "claude_gpt_launcher_unavailable"}
 
-    prompt = f"""You are a bounded, non-interactive permission canary running as issue-editor.
-
-Use the Bash tool exactly once with this exact command and no shell operators:
-{ISSUE_EDITOR_PERMISSION_CANARY_COMMAND}
-
-The input is intentionally not JSON. Confirm the helper's failed_no_mutation
-result, then output exactly this marker and nothing else:
-{ISSUE_EDITOR_PERMISSION_CANARY_MARKER}
-
-Do not edit files, invoke gh, inspect credentials/configuration, or attempt any
-fallback or direct invocation."""
     try:
         result = subprocess.run(
             [
                 str(CLAUDE_GPT_LAUNCHER),
                 "--",
-                "--agent",
-                "issue-editor",
                 "--output-format",
                 "stream-json",
                 "--verbose",
                 "-p",
-                prompt,
+                _issue_editor_permission_parent_prompt(),
             ],
             cwd=str(worktree),
             capture_output=True,
@@ -618,7 +662,12 @@ fallback or direct invocation."""
     detail = {
         "launcher_exit_code": result.returncode,
         "transcript_digest": transcript_digest,
-        "canonical_command_observed": ISSUE_EDITOR_PERMISSION_CANARY_COMMAND in result.stdout,
+        "parent_issue_editor_delegation_observed": _stream_json_has_tool_use(
+            result.stdout, "Agent", subagent_type="issue-editor"
+        ),
+        "canonical_bash_observed": _stream_json_has_tool_use(
+            result.stdout, "Bash", command=ISSUE_EDITOR_PERMISSION_CANARY_COMMAND
+        ),
         "helper_entrypoint_observed": "failed_no_mutation" in result.stdout,
         "marker_observed": ISSUE_EDITOR_PERMISSION_CANARY_MARKER in result.stdout,
     }
@@ -628,7 +677,8 @@ fallback or direct invocation."""
         return EXIT_FAIL, {"fail_reason": "claude_gpt_auto_runtime_failed", **detail}
     if not all(
         (
-            detail["canonical_command_observed"],
+            detail["parent_issue_editor_delegation_observed"],
+            detail["canonical_bash_observed"],
             detail["helper_entrypoint_observed"],
             detail["marker_observed"],
         )

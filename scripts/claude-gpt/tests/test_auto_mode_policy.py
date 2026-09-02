@@ -67,11 +67,11 @@ _PERMISSION_REQUEST_HOOK_RE = re.compile(
 )
 
 
-def _run_issue_editor_permission_request_hook(command: object) -> dict | None:
+def _run_issue_editor_permission_request_hook(command: object, *, tool_name: object = "Bash") -> dict | None:
     """Execute the exact launcher-embedded PermissionRequest hook source."""
     match = _PERMISSION_REQUEST_HOOK_RE.search(LAUNCH_SH.read_text(encoding="utf-8"))
     assert match is not None, "PermissionRequest hook source markers are missing from launch.sh"
-    payload = {"tool_input": {"command": command}}
+    payload = {"tool_name": tool_name, "tool_input": {"command": command}}
     result = subprocess.run(
         [sys.executable, "-c", match.group(1)],
         input=json.dumps(payload),
@@ -491,6 +491,15 @@ def test_permission_request_hook_allows_only_the_canonical_seven_token_transacti
     }
 
 
+def test_permission_request_hook_returns_no_decision_for_canonical_command_from_non_bash_tool():
+    """A matching command string is never authority outside a Bash request."""
+    command = (
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+        "--input-file .claude/agent-runtime/issue-editor/issue-edit-txn.json"
+    )
+    assert _run_issue_editor_permission_request_hook(command, tool_name="Read") is None
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -722,6 +731,18 @@ def test_issue_editor_permission_canary_unavailable_is_exit_77_not_pass(monkeypa
     rc, detail = canary.run_issue_editor_permission_request_canary(None)
     assert rc == canary.EXIT_SKIP
     assert detail == {"skip_reason": "issue_editor_permission_canary_not_opted_in"}
+
+
+def test_issue_editor_permission_canary_requires_structured_parent_and_child_events():
+    parent = {"name": "Agent", "input": {"subagent_type": "issue-editor"}}
+    child = {"name": "Bash", "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND}}
+    stdout = "\n".join((json.dumps(parent), json.dumps(child)))
+
+    assert canary._stream_json_has_tool_use(stdout, "Agent", subagent_type="issue-editor")
+    assert canary._stream_json_has_tool_use(
+        stdout, "Bash", command=canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND
+    )
+    assert not canary._stream_json_has_tool_use(stdout, "Agent", subagent_type="issue-creator")
 
 
 # --- AC7: sanitized_evidence ---------------------------------------------------

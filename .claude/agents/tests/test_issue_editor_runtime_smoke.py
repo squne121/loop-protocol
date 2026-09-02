@@ -175,6 +175,31 @@ def _digest_runtime_output(stdout: str, stderr: str) -> str:
     return hashlib.sha256((stdout + "\n" + stderr).encode("utf-8")).hexdigest()[:16]
 
 
+def _stream_json_has_tool_use(stdout: str, tool_name: str, **input_values: object) -> bool:
+    """Inspect structured runtime events in memory without persisting them."""
+    import json
+
+    def walk(node: object) -> bool:
+        if isinstance(node, dict):
+            tool_input = node.get("input")
+            if node.get("name") == tool_name and isinstance(tool_input, dict):
+                if all(tool_input.get(key) == value for key, value in input_values.items()):
+                    return True
+            return any(walk(value) for value in node.values())
+        if isinstance(node, list):
+            return any(walk(value) for value in node)
+        return False
+
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if walk(event):
+            return True
+    return False
+
+
 def test_claude_gpt_auto_issue_editor_permission_request_canary():
     """AC3: real Auto parent -> issue-editor -> canonical Bash -> helper entrypoint.
 
@@ -196,7 +221,7 @@ def test_claude_gpt_auto_issue_editor_permission_request_canary():
     if not CLAUDE_GPT_LAUNCHER.is_file():
         pytest.skip("Claude-GPT launcher is unavailable")
 
-    prompt = f"""You are a bounded, non-interactive permission canary running as issue-editor.
+    child_prompt = f"""You are the issue-editor child in a bounded, non-interactive permission canary.
 
 Use the Bash tool exactly once with this exact command and no shell operators:
 {_PERMISSION_CANARY_COMMAND}
@@ -205,15 +230,26 @@ The input is intentionally not JSON. Confirm the helper's failed_no_mutation
 result, then output exactly this marker and nothing else:
 {_PERMISSION_CANARY_MARKER}
 
-Do not edit files, invoke gh, inspect credentials/configuration, or attempt any
-fallback or direct invocation."""
+Do not edit files, invoke gh, inspect credentials/configuration, delegate, or
+attempt any fallback or direct invocation."""
+    prompt = f"""You are the bounded, non-interactive Claude-GPT Auto parent for a permission canary.
+
+Use the Agent tool exactly once to delegate to subagent_type `issue-editor`.
+Pass the following child instructions verbatim:
+
+--- CHILD INSTRUCTIONS BEGIN ---
+{child_prompt}
+--- CHILD INSTRUCTIONS END ---
+
+Do not use Bash, invoke gh, inspect credentials/configuration, edit files, or
+attempt a fallback/direct execution yourself. After the child returns its exact
+marker, output exactly this marker and nothing else:
+{_PERMISSION_CANARY_MARKER}"""
     try:
         result = subprocess.run(
             [
                 str(CLAUDE_GPT_LAUNCHER),
                 "--",
-                "--agent",
-                "issue-editor",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -235,6 +271,11 @@ fallback or direct invocation."""
 
     assert result.returncode == 0, f"Auto canary failed (exit={result.returncode}, digest={output_digest})"
     # stream-json is inspected in memory only; tests never save the raw output.
-    assert _PERMISSION_CANARY_COMMAND in result.stdout, f"canonical Bash event missing (digest={output_digest})"
+    assert _stream_json_has_tool_use(result.stdout, "Agent", subagent_type="issue-editor"), (
+        f"parent-to-issue-editor delegation missing (digest={output_digest})"
+    )
+    assert _stream_json_has_tool_use(result.stdout, "Bash", command=_PERMISSION_CANARY_COMMAND), (
+        f"canonical child Bash event missing (digest={output_digest})"
+    )
     assert "failed_no_mutation" in result.stdout, f"helper entrypoint was not observed (digest={output_digest})"
     assert _PERMISSION_CANARY_MARKER in result.stdout, f"canary marker missing (digest={output_digest})"
