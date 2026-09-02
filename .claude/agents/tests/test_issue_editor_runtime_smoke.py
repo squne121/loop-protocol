@@ -277,10 +277,20 @@ marker, output exactly this marker and nothing else:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        pytest.skip("Claude-GPT Auto runtime timed out; capability is unavailable")
+        # Aligned with auto_mode_canary.py::run_issue_editor_permission_request_canary()
+        # (fail_reason="claude_gpt_auto_runtime_timeout"): a hang is not
+        # "capability unavailable" and must not be masked as SKIP.
+        pytest.fail("Claude-GPT Auto runtime timed out (claude_gpt_auto_runtime_timeout)")
 
     output_digest = _digest_runtime_output(result.stdout, result.stderr)
-    if result.returncode in (3, 4, 7, 8):
+    if result.returncode == 8:
+        # Aligned with auto_mode_canary.py (fail_reason="claude_gpt_auto_mode_readback_failed"):
+        # a readback failure is a real defect, not an unavailable-capability SKIP.
+        pytest.fail(
+            "Claude-GPT Auto readback failed (claude_gpt_auto_mode_readback_failed, "
+            f"launcher exit {result.returncode}, digest={output_digest})"
+        )
+    if result.returncode in (3, 4, 7):
         pytest.skip(f"Claude-GPT Auto capability unavailable (launcher exit {result.returncode}, digest={output_digest})")
 
     assert result.returncode == 0, f"Auto canary failed (exit={result.returncode}, digest={output_digest})"
