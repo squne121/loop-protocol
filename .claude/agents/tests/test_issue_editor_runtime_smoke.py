@@ -37,6 +37,7 @@ unavailable runtime/capability is SKIP (exit 77), never promoted to PASS.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys

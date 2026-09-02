@@ -500,9 +500,15 @@ def test_permission_request_hook_allows_only_the_canonical_seven_token_transacti
         "uv run --locked python3 .claude/skills/other/scripts/edit.py --input-file safe.json",
         "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file safe.json --extra",
         "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file /tmp/input.json",
-        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file .claude/../input.json",
+        (
+            "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+            "--input-file .claude/../input.json"
+        ),
         "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file unsafe;echo",
-        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file safe.json && gh issue edit 2433",
+        (
+            "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+            "--input-file safe.json && gh issue edit 2433"
+        ),
         "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file= safe.json",
         "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file",
         "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file ./safe.json",
