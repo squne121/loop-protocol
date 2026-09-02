@@ -769,7 +769,7 @@ def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[i
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return EXIT_SKIP, {"skip_reason": "claude_gpt_auto_runtime_timeout"}
+        return EXIT_FAIL, {"fail_reason": "claude_gpt_auto_runtime_timeout"}
     except OSError:
         return EXIT_SKIP, {"skip_reason": "claude_gpt_auto_runtime_unavailable"}
 
@@ -783,7 +783,9 @@ def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[i
         ),
         **permission_evidence,
     }
-    if result.returncode in (3, 4, 7, 8):
+    if result.returncode == 8:
+        return EXIT_FAIL, {"fail_reason": "claude_gpt_auto_mode_readback_failed", **detail}
+    if result.returncode in (3, 4, 7):
         return EXIT_SKIP, {"skip_reason": "claude_gpt_auto_runtime_unavailable", **detail}
     if result.returncode != 0:
         return EXIT_FAIL, {"fail_reason": "claude_gpt_auto_runtime_failed", **detail}
@@ -1082,7 +1084,7 @@ def main(argv: list[str] | None = None) -> int:
         results["agy"] = {"exit_code": rc, **detail}
         codes.append(rc)
 
-    if args.mode == "issue-editor-permission":
+    if args.mode in ("issue-editor-permission", "all"):
         rc, detail = run_issue_editor_permission_request_canary(args.issue_editor_permission_worktree)
         results["issue_editor_permission"] = {"exit_code": rc, **detail}
         codes.append(rc)

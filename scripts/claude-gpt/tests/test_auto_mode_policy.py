@@ -473,6 +473,7 @@ def test_permission_request_hook_is_launcher_owned_and_does_not_add_permissions_
     assert set(payload["permissions"]) == {"deny"}
     hook_groups = payload["hooks"]["PermissionRequest"]
     assert len(hook_groups) == 1
+    assert hook_groups[0]["matcher"] == "Bash"
     hook = hook_groups[0]["hooks"]
     assert hook == [{"type": "command", "command": 'python3 "$ISSUE_EDITOR_PERMISSION_REQUEST_HOOK"'}]
 
@@ -723,6 +724,41 @@ def test_runtime_exit_semantics_constants_match_documented_contract():
     assert canary.EXIT_FAIL == 1
     assert canary.EXIT_INVALID_INVOCATION == 2
     assert canary.EXIT_SKIP == 77
+
+
+def test_runtime_exit_semantics_all_mode_includes_issue_editor_permission_lane(tmp_path):
+    """P1-3 regression: `--mode all` は他の lane（agy/github）と同様、
+    issue-editor-permission lane も enumerate しなければならない。以前は
+    `if args.mode == "issue-editor-permission":` という単独 equality 比較の
+    ため `--mode all` から漏れていた。
+
+    github lane が host の ambient `gh` 認証状態に依存して非決定的になるのを
+    避けるため、`gh` を含まない PATH を子プロセスに渡し github lane を
+    deterministic に `gh_binary_not_found` SKIP させる。issue-editor-permission
+    opt-in env var も未設定のままにし、issue-editor-permission lane を
+    deterministic に SKIP させる。
+    """
+    env = dict(os.environ)
+    env["PATH"] = str(tmp_path)
+    env.pop("AUTO_MODE_CANARY_TRUSTED_GH_PATH", None)
+    env.pop(canary.ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV, None)
+    result = subprocess.run(
+        [sys.executable, str(CANARY_PY), "--mode", "all", "--no-evidence"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert result.returncode == canary.EXIT_SKIP, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert "issue_editor_permission" in payload["results"]
+    assert (
+        payload["results"]["issue_editor_permission"]["skip_reason"]
+        == "issue_editor_permission_canary_not_opted_in"
+    )
+    assert "agy" in payload["results"]
+    assert "github" in payload["results"]
+    assert payload["results"]["github"]["skip_reason"] == "gh_binary_not_found"
 
 
 def test_issue_editor_permission_canary_unavailable_is_exit_77_not_pass(monkeypatch):
