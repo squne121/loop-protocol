@@ -524,11 +524,11 @@ def test_policy_denial_does_not_expose_rejected_argument_values() -> None:
 
 
 def test_bwrap_prefix_uses_only_validated_inner_argv(tmp_path: Path) -> None:
-    """Medium 2 (5): when the isolated-workspace `bwrap` read-only prefix is
-    used, the actual subprocess argv is exactly
-    `bwrap_prefix + validated_inner_argv` -- the bwrap wiring never bypasses
-    or duplicates the Issue #1807 allowlist-validated inner command."""
-    bwrap_prefix = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/fake/scratch"]
+    """Medium 2 (5): the isolated-workspace `bwrap` prefix terminates with
+    `--`; production inserts its status-FD arguments before that separator,
+    then appends the validated inner argv without bypassing or duplicating the
+    Issue #1807 allowlist-validated inner command."""
+    bwrap_prefix = ["bwrap", "--dev-bind", "/", "/", "--tmpfs", "/fake/scratch", "--"]
 
     fake_workspace = types.SimpleNamespace(
         env={},
@@ -556,7 +556,11 @@ def test_bwrap_prefix_uses_only_validated_inner_argv(tmp_path: Path) -> None:
     exec_cmd = captured_cmd["value"]
     assert exec_cmd is not None
     expected_inner_argv = rgh._build_agy_inner_argv("agy", "hello world")
-    assert exec_cmd == bwrap_prefix + expected_inner_argv
+    prefix_end = len(bwrap_prefix) - 1
+    assert exec_cmd[:prefix_end] == bwrap_prefix[:-1]
+    assert exec_cmd[prefix_end] == "--json-status-fd"
+    assert exec_cmd[prefix_end + 1].isdigit()
+    assert exec_cmd[prefix_end + 2:] == ["--"] + expected_inner_argv
 
 
 # ---------------------------------------------------------------------------
