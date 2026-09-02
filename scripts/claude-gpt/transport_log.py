@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """scripts/claude-gpt/transport_log.py
 
-`claude-code-proxy`（exact pinned v0.1.34, Issue #2204）が書き出す構造化 JSONL ログ
+`claude-code-proxy`（PR #2205（Issue #2204）で observed/tested v0.1.34）が書き出す構造化 JSONL ログ
 （`<proxy_state_dir>/claude-code-proxy/proxy.log`）を厳密パースし、`request` /
 `codex_upstream_request_started` / `request_completed` の 3 イベントを `fields.reqId`
 で相関して transport policy（Issue #2204）の実 upstream 送出結果を判定する。

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import json
 import base64
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -468,3 +470,315 @@ def test_uses_only_existing_current_main_paths():
     assert not (SCRIPTS_DIR / "build_refinement_phase_state.py").exists()
     assert not (SKILL_ROOT.parent / "issue-author").exists()
     assert (SCRIPTS_DIR / "scope_signal_delta.py").is_file()
+
+
+# --- #2473: post-update `permission_profile` gate sys.modules regression ---
+#
+# `fresh_checks()`'s `permission_profile` sub-gate dynamically loads
+# `scripts/agent-guards/skill_runtime_command_policy.py` via
+# `importlib.util.spec_from_file_location()` -> `module_from_spec()` ->
+# `exec_module()`. That module defines a module-level `@dataclass(frozen=True)`
+# under `from __future__ import annotations`, whose deferred string
+# annotations are resolved via `sys.modules[cls.__module__]`. Without
+# registering the freshly created module object in `sys.modules` BEFORE
+# `exec_module()` runs, that lookup fails and `exec_module()` raises
+# unconditionally -- collapsing the gate to `"unavailable"` on every call,
+# regardless of the actual profile/argv validity.
+
+
+def test_ac1_production_dynamic_load_pattern_registers_sys_modules_and_succeeds():
+    """AC1: reproduces the exact production `importlib` load path (spec ->
+    module_from_spec -> sys.modules registration -> exec_module) used by
+    `fresh_checks()`'s `permission_profile` gate, and confirms the target
+    parser becomes usable rather than raising (not a grep-only check)."""
+    repo_root = Path(preflight._find_repo_root())
+    policy_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_command_policy.py"
+    assert policy_path.is_file()
+
+    spec = importlib.util.spec_from_file_location("test_post_update_runtime_policy_ac1", policy_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
+
+    assert hasattr(module, "parse_exact_skill_runtime_contract_update_anchor_command")
+    parsed = module.parse_exact_skill_runtime_contract_update_anchor_command(
+        shlex.join(
+            [
+                "uv", "run", "python3", "scripts/agent-guards/skill_runtime_exec.py",
+                "--command-id", "contract_update.run.with_human_context",
+                "--issue-number", str(ISSUE),
+                "--repo", REPO,
+                "--anchor-comment-url", ANCHOR_URL,
+                "--human-context-comment-url", ANCHOR_URL,
+            ]
+        ),
+        str(repo_root),
+    )
+    assert parsed is not None
+
+
+def test_ac2_ac3_consumer_uses_production_fresh_checks_and_permission_profile_gate_passes(tmp_path):
+    """AC2: `consume_trusted_anchor_contract_patch_plan()` regression that does
+    NOT inject a `fresh_checks` callback (no bypass of the real closure) --
+    the production `fresh_checks()` runs for real, including its
+    `permission_profile` sub-gate. Only GitHub mutation / privileged executor
+    / network boundaries unrelated to this defect (`run_preflight()`'s live
+    `gh` reads, and the runtime-evidence artifact directory) are stubbed.
+
+    AC3 (first half): with a valid human-context anchor directive/profile,
+    `permission_profile == "pass"` (never the pre-fix permanent
+    `"unavailable"`)."""
+    state = {"body": PRE_BODY}
+    known_context = {"human_context_comment_urls": [ANCHOR_URL]}
+
+    def fetch_current():
+        return ({"body": state["body"]}, _anchor())
+
+    def apply(_issue, candidate, _readiness):
+        state["body"] = candidate
+        return {"status": "ok"}
+
+    provenance_dir = tmp_path / "artifacts"
+    provenance_dir.mkdir(parents=True, exist_ok=True)
+
+    def fake_issue_artifact_dir(_repo_root, _issue_number):
+        return provenance_dir
+
+    (provenance_dir / "refinement_preflight_provenance_v1.json").write_text(
+        json.dumps(
+            {
+                "runtime_evidence": {
+                    "source": {"comment_url": ANCHOR_URL, "source_kind": "issue_comment"},
+                    "tested_head_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with (
+        mock.patch.object(preflight, "run_preflight", return_value=({"status": "pass"}, 0)),
+        mock.patch.object(preflight, "_issue_artifact_dir", side_effect=fake_issue_artifact_dir),
+    ):
+        result = preflight.consume_trusted_anchor_contract_patch_plan(
+            repo=REPO,
+            issue_number=ISSUE,
+            issue={"body": PRE_BODY},
+            anchor_url=ANCHOR_URL,
+            anchor_payload=_anchor(),
+            anchor_body=ANCHOR_BODY,
+            contract_patch_plan=_plan(
+                {
+                    "section": "Acceptance Criteria",
+                    "op": "append",
+                    "text": "- [ ] AC1: desired",
+                    "source_evidence_index": 0,
+                }
+            ),
+            known_context=known_context,
+            callbacks={
+                "candidate_readiness": _readiness,
+                "fetch_current": fetch_current,
+                "apply_transaction": apply,
+                # NOTE: intentionally no "fresh_checks" callback here -- #2473
+                # AC2 requires exercising the production closure for real.
+            },
+        )
+
+    assert result["status"] == "applied", result
+    fresh = result["fresh_checks"]
+    assert fresh["permission_profile"] == "pass", fresh
+    assert fresh["preflight"] == "pass"
+    assert fresh["review"] == "approve"
+    assert fresh["readiness"] == "go"
+    assert fresh["runtime_evidence"] == "pass"
+
+
+def test_ac3_bounded_contract_update_handoff_not_blocked_by_permission_profile_when_other_gates_pass(tmp_path):
+    """AC3 (second half): with the other five post-update gates fixed at
+    their pass-equivalent values, the six-gate aggregate
+    (`_bounded_contract_update_handoff`) is no longer fail-closed on
+    `permission_profile == "unavailable"` -- confirming the sys.modules
+    registration fix actually unblocks the aggregate, not merely that the
+    gate reports `"pass"` in isolation."""
+    small_valid_body = (
+        "## Acceptance Criteria\n\n- [ ] AC1: placeholder\n\n"
+        "## Allowed Paths\n\n- `scripts/example.py`\n- `tests/example_test.py`\n"
+    )
+    state = {"body": small_valid_body}
+    known_context = {"human_context_comment_urls": [ANCHOR_URL]}
+
+    def fetch_current():
+        return ({"body": state["body"]}, _anchor())
+
+    def apply(_issue, candidate, _readiness):
+        state["body"] = candidate
+        return {"status": "ok"}
+
+    provenance_dir = tmp_path / "artifacts"
+    provenance_dir.mkdir(parents=True, exist_ok=True)
+    (provenance_dir / "refinement_preflight_provenance_v1.json").write_text(
+        json.dumps(
+            {
+                "runtime_evidence": {
+                    "source": {"comment_url": ANCHOR_URL, "source_kind": "issue_comment"},
+                    "tested_head_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_issue_artifact_dir(_repo_root, _issue_number):
+        return provenance_dir
+
+    with (
+        mock.patch.object(preflight, "run_preflight", return_value=({"status": "pass"}, 0)),
+        mock.patch.object(preflight, "_issue_artifact_dir", side_effect=fake_issue_artifact_dir),
+        # The review sub-gate's `check_issue_contract.py` subprocess call and
+        # `allowed_paths`/`permission_profile` are otherwise independent local
+        # checks; only the review subprocess (unrelated to #2473's defect) is
+        # stubbed here so this test can isolate the aggregate's dependency on
+        # `permission_profile` without needing a full C1-C11-compliant body.
+        mock.patch.object(preflight.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")),
+    ):
+        result = preflight.consume_trusted_anchor_contract_patch_plan(
+            repo=REPO,
+            issue_number=ISSUE,
+            issue={"body": small_valid_body},
+            anchor_url=ANCHOR_URL,
+            anchor_payload=_anchor(),
+            anchor_body=ANCHOR_BODY,
+            contract_patch_plan=_plan(
+                {
+                    "section": "Acceptance Criteria",
+                    "op": "append",
+                    "text": "- [ ] AC2: desired",
+                    "source_evidence_index": 0,
+                }
+            ),
+            known_context=known_context,
+            callbacks={
+                "candidate_readiness": _readiness,
+                "fetch_current": fetch_current,
+                "apply_transaction": apply,
+            },
+        )
+
+    fresh = result["fresh_checks"]
+    assert fresh == {
+        "preflight": "pass",
+        "review": "approve",
+        "readiness": "go",
+        "allowed_paths": "pass",
+        "permission_profile": "pass",
+        "runtime_evidence": "pass",
+    }
+    handoff = preflight._bounded_contract_update_handoff(result)
+    assert handoff["status"] != "failed", handoff
+
+
+def test_permission_profile_gate_pops_partial_module_from_sys_modules_when_exec_module_raises(tmp_path, monkeypatch):
+    """#2473 fix_delta regression (owner REQUEST_CHANGES on PR #2476): if
+    `exec_module()` raises while loading `skill_runtime_command_policy.py`
+    inside `fresh_checks()`'s `permission_profile` sub-gate, the
+    partially-initialized module must NOT remain registered in
+    `sys.modules` under `"post_update_runtime_policy"` afterward. This
+    matches standard import machinery semantics and the existing
+    registered -> try/except -> pop-on-failure pattern in
+    `.claude/skills/agent-retrospective/scripts/collect_snapshot.py`.
+
+    The real `skill_runtime_command_policy.py` cannot easily be made to
+    fail during `exec_module()`, so this test redirects the dynamic load
+    to a stand-in file (same registered module name, same real path used
+    for the identity check) whose module body raises unconditionally.
+    """
+    repo_root = Path(preflight._find_repo_root())
+    real_policy_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_command_policy.py"
+    assert real_policy_path.is_file()
+
+    broken_policy_path = tmp_path / "broken_skill_runtime_command_policy.py"
+    broken_policy_path.write_text(
+        "raise RuntimeError('forced exec_module failure for #2473 regression test')\n",
+        encoding="utf-8",
+    )
+
+    real_spec_from_file_location = importlib.util.spec_from_file_location
+
+    def fake_spec_from_file_location(name, location, *args, **kwargs):
+        if name == "post_update_runtime_policy" and Path(location) == real_policy_path:
+            return real_spec_from_file_location(name, broken_policy_path, *args, **kwargs)
+        return real_spec_from_file_location(name, location, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "spec_from_file_location", fake_spec_from_file_location)
+
+    state = {"body": PRE_BODY}
+    known_context = {"human_context_comment_urls": [ANCHOR_URL]}
+
+    def fetch_current():
+        return ({"body": state["body"]}, _anchor())
+
+    def apply(_issue, candidate, _readiness):
+        state["body"] = candidate
+        return {"status": "ok"}
+
+    provenance_dir = tmp_path / "artifacts"
+    provenance_dir.mkdir(parents=True, exist_ok=True)
+
+    def fake_issue_artifact_dir(_repo_root, _issue_number):
+        return provenance_dir
+
+    (provenance_dir / "refinement_preflight_provenance_v1.json").write_text(
+        json.dumps(
+            {
+                "runtime_evidence": {
+                    "source": {"comment_url": ANCHOR_URL, "source_kind": "issue_comment"},
+                    "tested_head_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # A prior test in this module may have left `post_update_runtime_policy`
+    # registered after a *successful* load (intended behavior: success
+    # leaves the module registered). Reset that shared global state so this
+    # test observes only the effect of the forced failure below.
+    sys.modules.pop("post_update_runtime_policy", None)
+
+    with (
+        mock.patch.object(preflight, "run_preflight", return_value=({"status": "pass"}, 0)),
+        mock.patch.object(preflight, "_issue_artifact_dir", side_effect=fake_issue_artifact_dir),
+    ):
+        result = preflight.consume_trusted_anchor_contract_patch_plan(
+            repo=REPO,
+            issue_number=ISSUE,
+            issue={"body": PRE_BODY},
+            anchor_url=ANCHOR_URL,
+            anchor_payload=_anchor(),
+            anchor_body=ANCHOR_BODY,
+            contract_patch_plan=_plan(
+                {
+                    "section": "Acceptance Criteria",
+                    "op": "append",
+                    "text": "- [ ] AC1: desired",
+                    "source_evidence_index": 0,
+                }
+            ),
+            known_context=known_context,
+            callbacks={
+                "candidate_readiness": _readiness,
+                "fetch_current": fetch_current,
+                "apply_transaction": apply,
+            },
+        )
+
+    fresh = result["fresh_checks"]
+    assert fresh["permission_profile"] == "unavailable", fresh
+    assert "post_update_runtime_policy" not in sys.modules, (
+        "exec_module() failure must not leave a partially-initialized module registered in sys.modules"
+    )

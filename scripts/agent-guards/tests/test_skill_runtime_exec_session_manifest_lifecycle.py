@@ -779,22 +779,67 @@ def test_existing_artifacts_dir_hook_subtree_update_succeeds(tmp_path: Path) -> 
 
 def test_existing_artifacts_dir_unrelated_update_fails(tmp_path: Path) -> None:
     """GIVEN `artifacts/` already exists (pre-created)
-    WHEN a peer/background writer creates a file under
-    `artifacts/unrelated/**` (outside the race-tolerant subtree)
-    THEN skill_runtime_exec.py must fail-close with unauthorized_write_path."""
+    WHEN a genuinely independent OS process (synchronized via the same
+    explicit go-file/ack-file barrier used by
+    `test_independent_writer_process_with_explicit_barrier_succeeds` --
+    no fixed sleep on either side) creates a file under
+    `artifacts/unrelated/**` (outside the race-tolerant subtree) and its
+    write has completed and is observable before the child command exits
+    THEN skill_runtime_exec.py must fail-close with unauthorized_write_path.
+
+    Deterministic barrier rationale (replaces a fixed-sleep writer): a fixed
+    `delay_seconds=0.2` writer race against skill_runtime_exec.py's own
+    `before_snapshot` capture in `_validate_runtime_context()` (three git
+    subprocess calls before the snapshot is taken) is not bounded -- under
+    CPU load the before_snapshot capture can itself take longer than the
+    fixed delay, making the unrelated write occur *before* before_snapshot
+    instead of *during* the race window, which flips the test to a false
+    PASS (`returncode == 0`) instead of the expected fail-closed
+    `returncode == 2`. The go-file/ack-file barrier removes this race by
+    construction: the child command only creates the go-file (opening the
+    race window) after `before_snapshot` has already been captured, and it
+    blocks on the ack-file (confirming the independent writer's write has
+    completed and is observable) before exiting -- so the unrelated write is
+    guaranteed to occur strictly inside the snapshot diff window regardless
+    of system load."""
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
     seed_path = repo / "artifacts" / "session-manifest-runtime" / "manifests" / "seed.json"
     seed_path.parent.mkdir(parents=True, exist_ok=True)
     seed_path.write_text('{"seed": true}')
 
+    go_file = tmp_path / "barrier-go-unrelated"
+    ack_file = tmp_path / "barrier-ack-unrelated"
     unrelated_path = repo / "artifacts" / "unrelated" / "peer-existing.txt"
-    writer_thread = _write_after_delay(unrelated_path, "peer-unrelated\n", delay_seconds=0.2)
-    try:
-        result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
-    finally:
-        writer_thread.join(timeout=5)
 
+    writer = _spawn_independent_writer_process(
+        repo, go_file, ack_file, unrelated_path, "peer-unrelated\n"
+    )
+    writer_stdout = ""
+    writer_stderr = ""
+    try:
+        result = _run_executor(
+            repo,
+            {
+                "SKILL_RUNTIME_TEST_BARRIER_GO_FILE": str(go_file),
+                "SKILL_RUNTIME_TEST_BARRIER_ACK_FILE": str(ack_file),
+            },
+        )
+        try:
+            writer_stdout, writer_stderr = writer.communicate(timeout=10)
+        except subprocess.TimeoutExpired as exc:
+            writer.kill()
+            writer_stdout, writer_stderr = writer.communicate()
+            raise AssertionError(
+                f"independent writer timed out after {exc.timeout} seconds; "
+                f"stdout={writer_stdout!r}; stderr={writer_stderr!r}"
+            ) from exc
+    finally:
+        if writer.poll() is None:
+            writer.kill()
+            writer_stdout, writer_stderr = writer.communicate()
+
+    assert writer.returncode == 0, writer_stderr
     assert result.returncode == 2, result.stdout + result.stderr
     assert "reason_code=unauthorized_write_path" in result.stderr
     assert "unauthorized write path=artifacts/unrelated/peer-existing.txt" in result.stderr
