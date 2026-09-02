@@ -191,35 +191,36 @@ def _embedded_json_dicts(value: object):
             cursor = start + max(length, 1)
 
 
-def _stream_json_has_terminal_marker(events: list[dict], marker: str) -> bool:
-    """Accept an exact marker only from a structured assistant/result event."""
-    for event in events:
-        if event.get("type") == "result" and isinstance(event.get("result"), str):
-            if event["result"].strip() == marker:
-                return True
-        if event.get("type") != "assistant":
-            continue
-        message = event.get("message", event)
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text")
-                if isinstance(text, str) and text.strip() == marker:
-                    return True
-    return False
+def _stream_json_has_terminal_marker(event: dict, marker: str) -> bool:
+    """Accept an exact marker only from one structured terminal event."""
+    if event.get("type") == "result" and isinstance(event.get("result"), str):
+        return event["result"].strip() == marker
+    if event.get("type") != "assistant":
+        return False
+    message = event.get("message", event)
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content", [])
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+        and block["text"].strip() == marker
+        for block in content
+    )
 
 
 def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool]:
-    """Bind expected helper evidence to the exact canonical Bash tool use.
+    """Bind both canary claims to one canonical Bash tool-use/result chain.
 
-    The helper intentionally exits nonzero after returning its structured
-    ``failed_no_mutation`` receipt. Therefore success here means a matching
-    tool result contains that no-mutation receipt, not that Bash returned zero.
-    Unstructured transcript text is never accepted as canary evidence.
+    The helper deliberately returns a nonzero ``failed_no_mutation`` receipt,
+    so the corresponding structured ``tool_result`` is the success evidence;
+    Bash's process exit itself is not. A terminal marker is accepted only when
+    it appears *after* that same bound result. Raw or prompt transcript text,
+    a duplicate canonical Bash request, and an unrelated marker cannot form a
+    PASS chain.
     """
     events: list[dict] = []
     for line in stdout.splitlines():
@@ -240,23 +241,29 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
         and isinstance(node.get("input"), dict)
         and node["input"].get("command") == ISSUE_EDITOR_PERMISSION_CANARY_COMMAND
     }
-    helper_result_bound = any(
-        result.get("tool_use_id") in canonical_ids
+    canonical_bash_observed = len(canonical_ids) == 1
+    canonical_id = next(iter(canonical_ids), None) if canonical_bash_observed else None
+    bound_result_indices = {
+        index
+        for index, event in enumerate(events)
+        for result in _walk_json_dicts(event)
+        if result.get("type") == "tool_result"
+        and result.get("tool_use_id") == canonical_id
         and any(
             receipt.get("schema") == "ISSUE_EDIT_TXN_RESULT_V1"
             and receipt.get("status") == "failed_no_mutation"
             and receipt.get("mutation_started") is False
             for receipt in _embedded_json_dicts(result.get("content"))
         )
-        for event in events
-        for result in _walk_json_dicts(event)
-        if result.get("type") == "tool_result"
-    )
-    bound_marker = helper_result_bound and _stream_json_has_terminal_marker(
-        events, ISSUE_EDITOR_PERMISSION_CANARY_MARKER
+    }
+    helper_result_bound = bool(bound_result_indices)
+    bound_marker = helper_result_bound and any(
+        index > max(bound_result_indices)
+        and _stream_json_has_terminal_marker(event, ISSUE_EDITOR_PERMISSION_CANARY_MARKER)
+        for index, event in enumerate(events)
     )
     return {
-        "canonical_bash_observed": helper_result_bound,
+        "canonical_bash_observed": canonical_bash_observed,
         "canonical_bash_result_bound": helper_result_bound,
         "helper_entrypoint_observed": helper_result_bound,
         "marker_observed": bound_marker,

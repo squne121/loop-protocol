@@ -38,6 +38,7 @@ unavailable runtime/capability is SKIP (exit 77), never promoted to PASS.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import subprocess
 import sys
@@ -62,6 +63,19 @@ _PERMISSION_CANARY_COMMAND = (
     f"--input-file {_PERMISSION_CANARY_INPUT}"
 )
 CLAUDE_GPT_LAUNCHER = REPO_ROOT / "scripts" / "claude-gpt" / "launch.sh"
+AUTO_MODE_CANARY = REPO_ROOT / "scripts" / "claude-gpt" / "auto_mode_canary.py"
+
+
+def _load_auto_mode_canary():
+    spec = importlib.util.spec_from_file_location("issue_editor_auto_mode_canary", AUTO_MODE_CANARY)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+auto_mode_canary = _load_auto_mode_canary()
 
 PROMPT = f"""You are running as a bounded, non-interactive runtime smoke check.
 
@@ -274,8 +288,10 @@ marker, output exactly this marker and nothing else:
     assert _stream_json_has_tool_use(result.stdout, "Agent", subagent_type="issue-editor"), (
         f"parent-to-issue-editor delegation missing (digest={output_digest})"
     )
-    assert _stream_json_has_tool_use(result.stdout, "Bash", command=_PERMISSION_CANARY_COMMAND), (
-        f"canonical child Bash event missing (digest={output_digest})"
-    )
-    assert "failed_no_mutation" in result.stdout, f"helper entrypoint was not observed (digest={output_digest})"
-    assert _PERMISSION_CANARY_MARKER in result.stdout, f"canary marker missing (digest={output_digest})"
+    permission_evidence = auto_mode_canary._stream_json_issue_editor_permission_evidence(result.stdout)
+    assert permission_evidence == {
+        "canonical_bash_observed": True,
+        "canonical_bash_result_bound": True,
+        "helper_entrypoint_observed": True,
+        "marker_observed": True,
+    }, f"canonical Bash/result/marker evidence incomplete (digest={output_digest})"

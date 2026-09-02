@@ -795,7 +795,14 @@ def test_issue_editor_permission_canary_binds_helper_evidence_to_canonical_bash_
     }
 
 
-def test_issue_editor_permission_canary_rejects_unbound_helper_text_and_marker():
+def test_issue_editor_permission_canary_rejects_false_denial_and_unrelated_stdout():
+    """A canonical Bash request plus prompt-like stdout is not evidence.
+
+    In particular, only a structured tool_result tied to that Bash ID may
+    establish ``failed_no_mutation``; a denial string and marker copied into
+    unrelated raw output must not make the real Auto route pass.
+    """
+    tool_use_id = "toolu_canonical_bash"
     stdout = "\n".join(
         (
             json.dumps(
@@ -805,7 +812,7 @@ def test_issue_editor_permission_canary_rejects_unbound_helper_text_and_marker()
                         "content": [
                             {
                                 "type": "tool_use",
-                                "id": "toolu_canonical_bash",
+                                "id": tool_use_id,
                                 "name": "Bash",
                                 "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND},
                             }
@@ -813,12 +820,26 @@ def test_issue_editor_permission_canary_rejects_unbound_helper_text_and_marker()
                     },
                 }
             ),
-            "PermissionRequest denied\nfailed_no_mutation\n" + canary.ISSUE_EDITOR_PERMISSION_CANARY_MARKER,
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": "PermissionRequest denied; failed_no_mutation",
+                            }
+                        ]
+                    },
+                }
+            ),
+            "prompt echo: failed_no_mutation " + canary.ISSUE_EDITOR_PERMISSION_CANARY_MARKER,
         )
     )
 
     assert canary._stream_json_issue_editor_permission_evidence(stdout) == {
-        "canonical_bash_observed": False,
+        "canonical_bash_observed": True,
         "canonical_bash_result_bound": False,
         "helper_entrypoint_observed": False,
         "marker_observed": False,
