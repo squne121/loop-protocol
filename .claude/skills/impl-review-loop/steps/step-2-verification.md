@@ -54,6 +54,10 @@ TEST_VERDICT（materializer/publisher 経由で PR に投稿される YAML、存
 | 4 | `VC_ADJUDICATION_RESULT_V1.blocking == false` | Step 3（pr-reviewer）へ |
 | 5 | `VC_ADJUDICATION_RESULT_V1.blocking == true` | Step 5 へ。rerun / REQUEST_CHANGES / human escalation を判定 |
 
+## runtime_only VC の取り扱い（Issue #2467）
+
+linked Issue の Verification Commands に `# preflight-scope: runtime_only` marker（正規 producer envelope: `runner=skipped`/`classification=skipped`/`category=preflight_scope_runtime_only`/`decision=go`/`scope_class=runtime_only`/`verification_owner=impl-review-loop`/非空 `deferred_reason`/`runtime_verification_required=true`）が含まれる場合、`adjudicate_vc_result.py` はそのスキップを current-head 独立 binding（Issue / PR / current head / reviewed head / diff head / Issue body digest / source integrity）が完全に成立した場合にのみ nonblocking で adjudicate する。baseline snapshot 上のスキップ宣言だけでは（current 側の独立 binding が伴わない限り）nonblocking PASS にならない。artifact / receipt / TEST_VERDICT はこの判定の必須入力ではなく、存在する場合の診断用 optional provenance に留まる（`pr_review_only` の GitHub Actions readback 必須要件とは異なる）。この分岐は既存の `pr_review_only` authorization scope を拡張するものではなく、独立した fail-closed 経路として扱われる。
+
 ## BEHIND 状態の取り扱い
 
 `merge_state_status: BEHIND` は「head ref が base branch より古い（base が先行している）」状態を意味し、`mergeable: MERGEABLE` と両立する。

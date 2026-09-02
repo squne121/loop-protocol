@@ -340,6 +340,28 @@ def _is_producer_authorized_pr_review_only_skip(item: dict[str, Any]) -> bool:
     )
 
 
+# Issue #2467: exact canonical runtime_only producer-skip envelope. This is
+# a distinct fail-closed recognizer from _is_producer_authorized_pr_review_only_skip
+# above -- runtime_only is NOT an extension of the pr_review_only authorized
+# scope (Issue #2467 Out of Scope / #1540 precedent). Only the literal
+# envelope emitted by baseline_vc_preflight.py for a `# preflight-scope:
+# runtime_only` marker is recognized here; this module never parses the raw
+# marker text itself (that remains the producer's responsibility).
+def _is_producer_authorized_runtime_only_skip(item: dict[str, Any]) -> bool:
+    """Recognize only a complete runtime_only skip produced by the VC producer."""
+    return (
+        item.get("runner") == "skipped"
+        and item.get("scope_class") == "runtime_only"
+        and item.get("classification") == "skipped"
+        and item.get("decision") == "go"
+        and item.get("category") == "preflight_scope_runtime_only"
+        and item.get("verification_owner") == "impl-review-loop"
+        and isinstance(item.get("deferred_reason"), str)
+        and bool(item["deferred_reason"])
+        and item.get("runtime_verification_required") is True
+    )
+
+
 def _load_path_list(raw: Any) -> tuple[list[str], list[str]]:
     if raw is None:
         return [], ["missing_path_input"]
@@ -606,6 +628,84 @@ def _test_verdict_binding_error(
         receipt_artifact = receipt.get("execution_artifact")
         if not isinstance(receipt_artifact, dict) or receipt_artifact.get("artifact_archive_digest") != artifact_digest:
             return "test_verdict_receipt_artifact_digest_mismatch"
+
+    return None
+
+
+# Issue #2467 AC2/AC3: current-head independent binding for a
+# runtime_only producer skip. Unlike _test_verdict_binding_error() above,
+# this does NOT require a GitHub Actions TEST_VERDICT/artifact readback --
+# per Issue #2467 In Scope, artifact / receipt / materialized TEST_VERDICT is
+# optional diagnostic provenance for runtime_only, not a mandatory input.
+# The binding instead uses the orchestrator's own current-head evidence
+# (contract_snapshot / current_vc_result / diff_summary), which is exactly
+# what the orchestrator independently binds to the current head before
+# calling adjudicate_vc_result() (Issue #2467 In Scope: "current routing
+# authority は ... orchestrator が独立に current-head へ binding して生成する
+# VC_ADJUDICATION_RESULT_V1"). A baseline skip declaration alone is
+# insufficient -- every one of the checks below must hold, fail-closed.
+def _runtime_only_current_head_binding_error(
+    *,
+    contract_snapshot: Any,
+    current_vc_result: Any,
+    diff_summary: Any,
+    changed_paths: list[str],
+    changed_paths_present: bool,
+    allowed_paths: list[str],
+) -> str | None:
+    """Return a fail-closed reason unless runtime_only current-head
+    independent binding (Issue / PR / current head / reviewed head / diff
+    head / Issue body digest / source integrity) is fully satisfied."""
+    if not isinstance(contract_snapshot, dict) or not isinstance(current_vc_result, dict):
+        return "runtime_only_binding_context_invalid"
+    if not isinstance(diff_summary, dict):
+        return "runtime_only_diff_context_invalid"
+
+    if contract_snapshot.get("status") != "go":
+        return "runtime_only_contract_not_go"
+    contract_sha = contract_snapshot.get("body_sha256")
+    if not _is_nonempty_string(contract_sha):
+        return "runtime_only_contract_body_sha256_missing"
+
+    if not _is_nonempty_string(current_vc_result.get("generated_at")):
+        return "runtime_only_generated_at_missing"
+    if current_vc_result.get("status") != "pass":
+        return "runtime_only_current_vc_result_not_pass"
+    if current_vc_result.get("errors") != []:
+        return "runtime_only_current_vc_result_errors_present"
+    if current_vc_result.get("fallback_detected") is not False:
+        return "runtime_only_fallback_detected"
+    if current_vc_result.get("human_review_required") is not False:
+        return "runtime_only_human_review_required"
+    if current_vc_result.get("stop_condition_triggered") is not False:
+        return "runtime_only_stop_condition_triggered"
+
+    current_head = current_vc_result.get("head_sha")
+    reviewed_head = current_vc_result.get("reviewed_head_sha")
+    diff_head = diff_summary.get("head_sha")
+    if (
+        not _is_nonempty_string(current_head)
+        or current_head != reviewed_head
+        or current_head != diff_head
+    ):
+        return "runtime_only_head_binding_mismatch"
+
+    source = current_vc_result.get("source")
+    if not isinstance(source, dict) or source.get("body_sha256") != contract_sha:
+        return "runtime_only_source_body_sha256_mismatch"
+
+    issue_number = current_vc_result.get("issue")
+    if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
+        return "runtime_only_issue_number_missing"
+
+    pr_number = diff_summary.get("pr_number")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        return "runtime_only_pr_number_missing"
+
+    if changed_paths_present is not True:
+        return "runtime_only_changed_paths_missing"
+    if not _all_changed_paths_allowed(changed_paths, allowed_paths):
+        return "runtime_only_changed_paths_not_certified"
 
     return None
 
@@ -986,6 +1086,7 @@ def adjudicate_vc_result(
     baseline_failure_index: set[tuple[str, str]] = set()
     baseline_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     excluded_pr_review_only_keys: set[tuple[str, str]] = set()
+    excluded_runtime_only_keys: set[tuple[str, str]] = set()
     seen_baseline_keys: set[tuple[str, str]] = set()
     for idx, item in enumerate(baseline_items):
         norm, errs = _normalize_item(item)
@@ -1008,6 +1109,9 @@ def adjudicate_vc_result(
         seen_baseline_keys.add(mapping_key)
         if _is_producer_authorized_pr_review_only_skip(norm):
             excluded_pr_review_only_keys.add(mapping_key)
+            continue
+        if _is_producer_authorized_runtime_only_skip(norm):
+            excluded_runtime_only_keys.add(mapping_key)
             continue
         if norm["classification"] not in {"expected_fail", "expected_pass"}:
             return _result(
@@ -1059,14 +1163,33 @@ def adjudicate_vc_result(
             excluded_current_count += 1
             excluded_current_keys.add(mapping_key)
             continue
+        if mapping_key in excluded_runtime_only_keys:
+            if not _is_producer_authorized_runtime_only_skip(norm):
+                return _result(
+                    overall_status="indeterminate", per_ac=[], rerun_required=True,
+                    source_integrity=source_integrity, evidence_refs=evidence_refs,
+                    errors=[f"runtime_only_current_authorization_mismatch:{norm['ac']}"],
+                )
+            excluded_current_count += 1
+            excluded_current_keys.add(mapping_key)
+            continue
         current_keys.add(mapping_key)
         normalized_current.append(norm)
 
-    if excluded_current_keys != excluded_pr_review_only_keys:
+    excluded_skip_keys = excluded_pr_review_only_keys | excluded_runtime_only_keys
+    if excluded_current_keys != excluded_skip_keys:
+        missing_pr_review_only = excluded_pr_review_only_keys - excluded_current_keys
+        missing_runtime_only = excluded_runtime_only_keys - excluded_current_keys
+        if missing_runtime_only and not missing_pr_review_only:
+            coverage_error = "runtime_only_coverage_mismatch"
+        elif missing_pr_review_only and not missing_runtime_only:
+            coverage_error = "pr_review_only_coverage_mismatch"
+        else:
+            coverage_error = "skipped_scope_coverage_mismatch"
         return _result(
             overall_status="indeterminate", per_ac=[], rerun_required=True,
             source_integrity=source_integrity, evidence_refs=evidence_refs,
-            errors=["pr_review_only_coverage_mismatch"],
+            errors=[coverage_error],
         )
 
     if excluded_pr_review_only_keys:
@@ -1083,6 +1206,22 @@ def adjudicate_vc_result(
                 overall_status="indeterminate", per_ac=[], rerun_required=True,
                 source_integrity=source_integrity, evidence_refs=evidence_refs,
                 errors=[binding_error],
+            )
+
+    if excluded_runtime_only_keys:
+        runtime_only_binding_error = _runtime_only_current_head_binding_error(
+            contract_snapshot=contract_snapshot,
+            current_vc_result=current_vc_result,
+            diff_summary=diff_summary,
+            changed_paths=changed_paths,
+            changed_paths_present=changed_paths_present,
+            allowed_paths=normalized_allowed,
+        )
+        if runtime_only_binding_error is not None:
+            return _result(
+                overall_status="indeterminate", per_ac=[], rerun_required=True,
+                source_integrity=source_integrity, evidence_refs=evidence_refs,
+                errors=[runtime_only_binding_error],
             )
 
     current_pass_certified = _current_pass_envelope_is_certified(
@@ -1112,6 +1251,17 @@ def adjudicate_vc_result(
                     "summary": "Producer-authorized skip is covered by v2 runtime evidence",
                 }
                 for ac, command_hash in sorted(excluded_pr_review_only_keys)
+            ] + [
+                {
+                    "ac": ac,
+                    "status": "pass",
+                    "blocking": False,
+                    "command_hash": command_hash,
+                    "failure_keys": [],
+                    "reason_code": "runtime_only_current_head_binding_pass",
+                    "summary": "Producer-authorized runtime_only skip is covered by current-head independent binding",
+                }
+                for ac, command_hash in sorted(excluded_runtime_only_keys)
             ]
             return _result(
                 overall_status="pass", per_ac=per_ac, rerun_required=False,
