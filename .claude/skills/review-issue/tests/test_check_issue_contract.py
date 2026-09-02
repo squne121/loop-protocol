@@ -1396,6 +1396,55 @@ class TestC5GroupedAcComment:
         assert result == "fail", f"Expected fail (AC3 uncovered), got {result}"
         assert any("AC3" in msg for msg in issues), f"Expected AC3 in issues: {issues}"
 
+    def test_research_issue_kind_unnumbered_ac_is_na(self):
+        """#2480: research issue_kind with unnumbered AC checkboxes -> NA, not FAIL.
+
+        .github/ISSUE_TEMPLATE/research.yml provides unnumbered '- [ ]' AC
+        checkboxes; C5 must not FAIL a research Issue merely for following
+        the official template.
+        """
+        body = self._body_with(
+            "- [ ] 比較結果が本 Issue 本文に記載されている\n"
+            "- [ ] 本 Issue は close 可能、もしくは追加調査要件が明示されている\n",
+            "$ echo check\n",
+        )
+        result, issues = check_c5_ac_vc_alignment(body, issue_kind="research")
+        assert result == "n/a", f"Expected n/a, got {result}. issues: {issues}"
+        assert issues == []
+
+    def test_tracking_issue_kind_unnumbered_ac_is_na(self):
+        """#2480: tracking issue_kind gets the same unnumbered-AC NA treatment as research."""
+        body = self._body_with(
+            "- [ ] 追跡対象の状態が記載されている\n",
+            "$ echo check\n",
+        )
+        result, issues = check_c5_ac_vc_alignment(body, issue_kind="tracking")
+        assert result == "n/a", f"Expected n/a, got {result}. issues: {issues}"
+        assert issues == []
+
+    def test_implementation_issue_kind_unnumbered_ac_still_fails(self):
+        """#2480: default/implementation issue_kind keeps the strict unconditional FAIL."""
+        body = self._body_with(
+            "- [ ] 番号のない AC\n",
+            "$ echo check\n",
+        )
+        result, issues = check_c5_ac_vc_alignment(body)
+        assert result == "fail", f"Expected fail, got {result}. issues: {issues}"
+        assert any("AC[N]" in msg for msg in issues), f"Expected AC[N] message: {issues}"
+
+        result_explicit, _ = check_c5_ac_vc_alignment(body, issue_kind="implementation")
+        assert result_explicit == "fail"
+
+    def test_research_issue_kind_numbered_ac_still_checks_alignment(self):
+        """#2480: research issue_kind with numbered AC keeps normal alignment enforcement."""
+        body = self._body_with(
+            "- [ ] AC1: foo\n- [ ] AC2: bar\n",
+            "# AC1\n$ echo check\n",
+        )
+        result, issues = check_c5_ac_vc_alignment(body, issue_kind="research")
+        assert result == "fail", f"Expected fail (AC2 uncovered), got {result}. issues: {issues}"
+        assert any("AC2" in msg for msg in issues), f"Expected AC2 in issues: {issues}"
+
     def test_extract_vc_ac_refs_single(self):
         """_extract_vc_ac_refs returns single number correctly."""
         refs = _extract_vc_ac_refs("# AC1\n$ foo")
