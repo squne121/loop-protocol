@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,29 @@ def _run_sh_function(function_name: str, *args: str) -> subprocess.CompletedProc
     quoted_args = " ".join(f'"{arg}"' for arg in args)
     script = f'. "{LIB_SH}"; {function_name} {quoted_args}'
     return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=20)
+
+
+_PERMISSION_REQUEST_HOOK_RE = re.compile(
+    r"# ISSUE_EDITOR_PERMISSION_REQUEST_HOOK_PY_BEGIN\n(.*?)\n# ISSUE_EDITOR_PERMISSION_REQUEST_HOOK_PY_END",
+    re.DOTALL,
+)
+
+
+def _run_issue_editor_permission_request_hook(command: object) -> dict | None:
+    """Execute the exact launcher-embedded PermissionRequest hook source."""
+    match = _PERMISSION_REQUEST_HOOK_RE.search(LAUNCH_SH.read_text(encoding="utf-8"))
+    assert match is not None, "PermissionRequest hook source markers are missing from launch.sh"
+    payload = {"tool_input": {"command": command}}
+    result = subprocess.run(
+        [sys.executable, "-c", match.group(1)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout) if result.stdout else None
 
 
 # --- AC1: generated_settings_defaults ---------------------------------------
@@ -438,6 +462,57 @@ def test_isolation_and_auto_mode_enforcement_settings_has_classify_all_shell_and
     assert any("proxy-config" in rule for rule in deny_rules)
 
 
+def test_permission_request_hook_is_launcher_owned_and_does_not_add_permissions_allow(tmp_path):
+    """AC1: generated settings wire the narrow hook without weakening policy."""
+    result = _run_launch(tmp_path, ["-p", "hello"])
+    assert result.returncode == 0, result.stderr
+    settings_path = tmp_path / "claude-gpt-home" / "claude" / "settings.local.json"
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    assert payload["autoMode"]["classifyAllShell"] is True
+    assert set(payload["permissions"]) == {"deny"}
+    hook_groups = payload["hooks"]["PermissionRequest"]
+    assert len(hook_groups) == 1
+    hook = hook_groups[0]["hooks"]
+    assert hook == [{"type": "command", "command": 'python3 "$ISSUE_EDITOR_PERMISSION_REQUEST_HOOK"'}]
+
+
+def test_permission_request_hook_allows_only_the_canonical_seven_token_transaction():
+    command = (
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+        "--input-file .claude/agent-runtime/issue-editor/issue-edit-txn.json"
+    )
+    output = _run_issue_editor_permission_request_hook(command)
+    assert output == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow"},
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv run --locked python3 -c 'print(1)'",
+        "python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file safe.json",
+        "gh issue edit 2433 --body x",
+        "uv run --locked python3 .claude/skills/other/scripts/edit.py --input-file safe.json",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file safe.json --extra",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file /tmp/input.json",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file .claude/../input.json",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file unsafe;echo",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file safe.json && gh issue edit 2433",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file= safe.json",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file ./safe.json",
+    ],
+)
+def test_permission_request_hook_returns_no_decision_for_every_noncanonical_shape(command):
+    """AC2: shell operators, unsafe operands, and near matches are never allowed."""
+    assert _run_issue_editor_permission_request_hook(command) is None
+
+
 def test_forbidden_extra_flags_list_includes_permission_mode():
     """GIVEN lib.sh の CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS
     WHEN 内容を読む
@@ -633,6 +708,14 @@ def test_runtime_exit_semantics_constants_match_documented_contract():
     assert canary.EXIT_FAIL == 1
     assert canary.EXIT_INVALID_INVOCATION == 2
     assert canary.EXIT_SKIP == 77
+
+
+def test_issue_editor_permission_canary_unavailable_is_exit_77_not_pass(monkeypatch):
+    """AC3: absent explicit runtime capability is a machine-readable SKIP."""
+    monkeypatch.delenv(canary.ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV, raising=False)
+    rc, detail = canary.run_issue_editor_permission_request_canary(None)
+    assert rc == canary.EXIT_SKIP
+    assert detail == {"skip_reason": "issue_editor_permission_canary_not_opted_in"}
 
 
 # --- AC7: sanitized_evidence ---------------------------------------------------

@@ -53,6 +53,15 @@ _CANDIDATE_WORKTREE_ENV_VAR = "RUNTIME_SMOKE_CANDIDATE_WORKTREE"
 
 EXPECT_MARKER = "RUNTIME_SMOKE_ISSUE_EDITOR_READ_OK"
 
+_PERMISSION_CANARY_OPT_IN_ENV_VAR = "CLAUDE_GPT_ISSUE_EDITOR_PERMISSION_CANARY"
+_PERMISSION_CANARY_MARKER = "ISSUE_EDITOR_PERMISSION_CANARY_ENTRYPOINT_REACHED"
+_PERMISSION_CANARY_INPUT = ".claude/agents/tests/test_issue_editor_runtime_smoke.py"
+_PERMISSION_CANARY_COMMAND = (
+    "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+    f"--input-file {_PERMISSION_CANARY_INPUT}"
+)
+CLAUDE_GPT_LAUNCHER = REPO_ROOT / "scripts" / "claude-gpt" / "launch.sh"
+
 PROMPT = f"""You are running as a bounded, non-interactive runtime smoke check.
 
 Use the Read tool to read the file `.claude/skills/edit-issue/SKILL.md`
@@ -158,3 +167,73 @@ def test_canonical_skill_read_smoke():
         # capability confirmed available and successfully exercised).
         assert "main_agent_identity" in summary_text
         assert "skill_evidence" in summary_text
+
+
+def _digest_runtime_output(stdout: str, stderr: str) -> str:
+    """Return a diagnostic that cannot disclose runtime transcript content."""
+    return hashlib.sha256((stdout + "\n" + stderr).encode("utf-8")).hexdigest()[:16]
+
+
+def test_claude_gpt_auto_issue_editor_permission_request_canary():
+    """AC3: real Auto parent -> issue-editor -> canonical Bash -> helper entrypoint.
+
+    This external-runtime lane is deliberately opt-in and never writes a
+    transcript or credential/config material.  Its input is an existing Python
+    test source, so the helper must reject JSON parsing before any GitHub
+    operation; seeing ``failed_no_mutation`` is the entrypoint observation.
+    """
+    worktree = _resolve_candidate_worktree()
+    if worktree is None:
+        pytest.skip(
+            f"real Auto lane requires {_CANDIDATE_WORKTREE_ENV_VAR} to point at "
+            "the explicit linked worktree"
+        )
+    if os.environ.get(_PERMISSION_CANARY_OPT_IN_ENV_VAR) != "1":
+        pytest.skip(
+            f"real Claude-GPT Auto lane requires explicit {_PERMISSION_CANARY_OPT_IN_ENV_VAR}=1"
+        )
+    if not CLAUDE_GPT_LAUNCHER.is_file():
+        pytest.skip("Claude-GPT launcher is unavailable")
+
+    prompt = f"""You are a bounded, non-interactive permission canary running as issue-editor.
+
+Use the Bash tool exactly once with this exact command and no shell operators:
+{_PERMISSION_CANARY_COMMAND}
+
+The input is intentionally not JSON. Confirm the helper's failed_no_mutation
+result, then output exactly this marker and nothing else:
+{_PERMISSION_CANARY_MARKER}
+
+Do not edit files, invoke gh, inspect credentials/configuration, or attempt any
+fallback or direct invocation."""
+    try:
+        result = subprocess.run(
+            [
+                str(CLAUDE_GPT_LAUNCHER),
+                "--",
+                "--agent",
+                "issue-editor",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "-p",
+                prompt,
+            ],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=360,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.skip("Claude-GPT Auto runtime timed out; capability is unavailable")
+
+    output_digest = _digest_runtime_output(result.stdout, result.stderr)
+    if result.returncode in (3, 4, 7, 8):
+        pytest.skip(f"Claude-GPT Auto capability unavailable (launcher exit {result.returncode}, digest={output_digest})")
+
+    assert result.returncode == 0, f"Auto canary failed (exit={result.returncode}, digest={output_digest})"
+    # stream-json is inspected in memory only; tests never save the raw output.
+    assert _PERMISSION_CANARY_COMMAND in result.stdout, f"canonical Bash event missing (digest={output_digest})"
+    assert "failed_no_mutation" in result.stdout, f"helper entrypoint was not observed (digest={output_digest})"
+    assert _PERMISSION_CANARY_MARKER in result.stdout, f"canary marker missing (digest={output_digest})"

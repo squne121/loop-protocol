@@ -85,6 +85,18 @@ FORBIDDEN_OPERATIONS = frozenset(
 
 CANARY_TITLE_PREFIX = "[claude-gpt-auto-mode-canary]"
 
+# Issue #2433: this is deliberately a separate explicit live lane.  A caller
+# must name the linked worktree and opt in before an actual Claude-GPT session
+# is started; absence of either capability is an exit-77 SKIP, never PASS.
+ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV = "CLAUDE_GPT_ISSUE_EDITOR_PERMISSION_CANARY"
+ISSUE_EDITOR_PERMISSION_CANARY_MARKER = "ISSUE_EDITOR_PERMISSION_CANARY_ENTRYPOINT_REACHED"
+ISSUE_EDITOR_PERMISSION_CANARY_INPUT = ".claude/agents/tests/test_issue_editor_runtime_smoke.py"
+ISSUE_EDITOR_PERMISSION_CANARY_COMMAND = (
+    "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+    f"--input-file {ISSUE_EDITOR_PERMISSION_CANARY_INPUT}"
+)
+CLAUDE_GPT_LAUNCHER = SCRIPT_DIR / "launch.sh"
+
 NEGATIVE_CONTROL_CASES = (
     "direct_arbitrary_agy_invocation",
     "provider_not_agy",
@@ -552,6 +564,79 @@ def run_agy_causal_canary(receipt_path: Path | None) -> tuple[int, dict]:
     }
 
 
+def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[int, dict]:
+    """Run the actual Claude-GPT Auto permission canary without mutation.
+
+    The controlled helper receives an existing Python source file rather than
+    transaction JSON, so ``failed_no_mutation`` proves entrypoint reachability
+    while failing before any remote operation. Raw Claude output is inspected
+    only in memory; the returned detail contains digests and booleans only.
+    """
+    if os.environ.get(ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV) != "1":
+        return EXIT_SKIP, {"skip_reason": "issue_editor_permission_canary_not_opted_in"}
+    if worktree is None or not worktree.is_dir() or not (worktree / ".git").exists():
+        return EXIT_SKIP, {"skip_reason": "issue_editor_permission_canary_worktree_unavailable"}
+    if not CLAUDE_GPT_LAUNCHER.is_file():
+        return EXIT_SKIP, {"skip_reason": "claude_gpt_launcher_unavailable"}
+
+    prompt = f"""You are a bounded, non-interactive permission canary running as issue-editor.
+
+Use the Bash tool exactly once with this exact command and no shell operators:
+{ISSUE_EDITOR_PERMISSION_CANARY_COMMAND}
+
+The input is intentionally not JSON. Confirm the helper's failed_no_mutation
+result, then output exactly this marker and nothing else:
+{ISSUE_EDITOR_PERMISSION_CANARY_MARKER}
+
+Do not edit files, invoke gh, inspect credentials/configuration, or attempt any
+fallback or direct invocation."""
+    try:
+        result = subprocess.run(
+            [
+                str(CLAUDE_GPT_LAUNCHER),
+                "--",
+                "--agent",
+                "issue-editor",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "-p",
+                prompt,
+            ],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=360,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return EXIT_SKIP, {"skip_reason": "claude_gpt_auto_runtime_timeout"}
+    except OSError:
+        return EXIT_SKIP, {"skip_reason": "claude_gpt_auto_runtime_unavailable"}
+
+    transcript_digest = _sha256_text(result.stdout + "\n" + result.stderr)[:16]
+    detail = {
+        "launcher_exit_code": result.returncode,
+        "transcript_digest": transcript_digest,
+        "canonical_command_observed": ISSUE_EDITOR_PERMISSION_CANARY_COMMAND in result.stdout,
+        "helper_entrypoint_observed": "failed_no_mutation" in result.stdout,
+        "marker_observed": ISSUE_EDITOR_PERMISSION_CANARY_MARKER in result.stdout,
+    }
+    if result.returncode in (3, 4, 7, 8):
+        return EXIT_SKIP, {"skip_reason": "claude_gpt_auto_runtime_unavailable", **detail}
+    if result.returncode != 0:
+        return EXIT_FAIL, {"fail_reason": "claude_gpt_auto_runtime_failed", **detail}
+    if not all(
+        (
+            detail["canonical_command_observed"],
+            detail["helper_entrypoint_observed"],
+            detail["marker_observed"],
+        )
+    ):
+        return EXIT_FAIL, {"fail_reason": "issue_editor_permission_canary_evidence_incomplete", **detail}
+    return EXIT_OK, detail
+
+
 def run_github_mutation_canary() -> tuple[int, dict]:
     gh_bin = _find_gh_bin()
     if gh_bin is None:
@@ -776,15 +861,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("agy", "github", "negative", "all"),
+        choices=("agy", "github", "negative", "issue-editor-permission", "all"),
         help="agy=AC4 causal receipt 検証 / github=AC5 GitHub mutation broker canary "
-        "/ negative=AC8 negative control のみ / all=全部実行",
+        "/ negative=AC8 negative control のみ / issue-editor-permission=Issue #2433 actual Auto canary / all=全部実行",
     )
     parser.add_argument(
         "--agy-receipt-path",
         type=Path,
         default=None,
         help="live auto-mode セッションが書き出した Issue #2183 causal receipt の JSON path",
+    )
+    parser.add_argument(
+        "--issue-editor-permission-worktree",
+        type=Path,
+        default=None,
+        help="Issue #2433 actual Auto canary の明示 linked worktree path",
     )
     parser.add_argument(
         "--no-evidence",
@@ -827,6 +918,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode in ("agy", "all"):
         rc, detail = run_agy_causal_canary(args.agy_receipt_path)
         results["agy"] = {"exit_code": rc, **detail}
+        codes.append(rc)
+
+    if args.mode == "issue-editor-permission":
+        rc, detail = run_issue_editor_permission_request_canary(args.issue_editor_permission_worktree)
+        results["issue_editor_permission"] = {"exit_code": rc, **detail}
         codes.append(rc)
 
     if args.mode in ("github", "all"):
