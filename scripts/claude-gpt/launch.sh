@@ -1543,6 +1543,21 @@ HOOKS_JSON_FRAGMENT=',
 #     ではなくこの launcher-owned --settings にのみ注入する） ---
 AUTO_MODE_JSON_FRAGMENT=$(claude_gpt_auto_mode_json_fragment)
 
+# Issue #2437: peer policy belongs only to the pre-existing fixed runtime-smoke
+# channels. Unknown values deliberately receive neither this policy nor a new
+# accepted routing surface; arbitrary caller --settings remains rejected above.
+PEER_POLICY_DENY_SUFFIX=""
+PEER_POLICY_SETTINGS_FRAGMENT=""
+case "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" in
+  subagent-start-stop|hook-sink-multi-turn)
+    PEER_POLICY_DENY_SUFFIX=',
+      "SendMessage",
+      "ListAgents"'
+    PEER_POLICY_SETTINGS_FRAGMENT=',
+  "crossSessionInbound": "refuse"'
+    ;;
+esac
+
 cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
 {
   "permissions": {
@@ -1551,9 +1566,9 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
       "Read(/${PROXY_STATE_DIR_TARGET}/**)",
       "Read(/${PROXY_HOME_TARGET}/**)",
       "Read(/${SPARK_AUTH_DIR_TARGET}/**)",
-      "Edit(/${SPARK_AUTH_DIR_TARGET}/**)"
+      "Edit(/${SPARK_AUTH_DIR_TARGET}/**)"${PEER_POLICY_DENY_SUFFIX}
     ]
-  },
+  }${PEER_POLICY_SETTINGS_FRAGMENT},
   "enabledPlugins": {}${HOOKS_JSON_FRAGMENT}${ENV_JSON_FRAGMENT},
   ${AUTO_MODE_JSON_FRAGMENT}
 }

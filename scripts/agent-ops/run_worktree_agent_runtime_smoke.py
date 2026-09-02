@@ -21,15 +21,15 @@ worktree in the expected postcondition.
 
 Isolation (PR #1921 human OWNER fix-delta iteration 5):
 
-- ``mode=interactive`` never touches the human operator's own attached
-  Herdr session. It always creates a brand-new, high-entropy named session
-  (``herdr session list --json`` collision check, then lazily created via
-  ``HERDR_SESSION=<name>``), runs the agent lifecycle inside it, and tears
-  the whole session down (``herdr session stop`` -> ``herdr session
-  delete`` -> ``herdr session list --json`` removal confirmation) in every
-  controlled exit path (success, failure, timeout, SIGINT, SIGTERM).
-  Cleanup that cannot be confirmed removed overrides an otherwise-successful
-  run to FAIL (fail-closed).
+- ``mode=interactive`` never touches or observes a human/pre-existing Herdr
+  session. It generates a brand-new, high-entropy named session without
+  listing namespaces, runs the lifecycle only inside that session, and tears
+  it down via own-name ``herdr session stop`` -> ``herdr session delete`` plus
+  launcher-process termination in every controlled exit path (success,
+  failure, timeout, SIGINT, SIGTERM). Cleanup whose own-session commands or
+  process termination cannot be confirmed overrides an otherwise-successful
+  run to FAIL (fail-closed). ``--require-session-baseline-preservation`` is
+  the sole explicit opt-in to observe pre-existing-session preservation.
 - Inherited ``HERDR_SESSION`` / ``HERDR_SOCKET_PATH`` / ``HERDR_PANE_ID`` /
   ``HERDR_TAB_ID`` / ``HERDR_WORKSPACE_ID`` are stripped before targeting the
   isolated session, so a caller's own runtime namespace never leaks in.
@@ -97,6 +97,17 @@ _SECRET_LIKE_RE = re.compile(
     r"([A-Za-z0-9+/]{40,}=*)"
 )
 
+# Public integrity values are preserved only by their explicit evidence-field
+# paths during serialization. Never exempt a token merely because its text
+# happens to look like a Git SHA or a digest.
+_PUBLIC_EVIDENCE_SHA_LENGTHS = {
+    ("tested_head",): 40,
+    ("prompt_sha256",): 64,
+    ("resolved_executable_sha256",): 64,
+    ("mutation_boundary", "settings_digest_sha256"): 64,
+    ("settings_provenance", "digest_sha256"): 64,
+}
+
 # CLI color/formatting escape sequences (observed in real ``herdr`` stderr
 # output) are cosmetic noise, not secrets, but they degrade the readability
 # of persisted evidence and are stripped for cleanliness.
@@ -126,8 +137,35 @@ _ISOLATION_ENV_KEYS_TO_STRIP = (
 
 
 def _redact(text: str) -> str:
+    """Redact every secret-like token in arbitrary text."""
     text = _ANSI_ESCAPE_RE.sub("", text)
     return _SECRET_LIKE_RE.sub("<redacted>", text)
+
+
+def _is_public_evidence_sha(field_path: tuple[str, ...], value: str) -> bool:
+    """Return whether a validated, explicitly-designated evidence field is safe."""
+    expected_length = _PUBLIC_EVIDENCE_SHA_LENGTHS.get(field_path)
+    return expected_length is not None and bool(
+        re.fullmatch(rf"[0-9a-fA-F]{{{expected_length}}}", value)
+    )
+
+
+def _redact_evidence_value(value: object, *, field_path: tuple[str, ...] = ()) -> object:
+    """Recursively redact persisted evidence, preserving only named SHA fields."""
+    if isinstance(value, str):
+        return value if _is_public_evidence_sha(field_path, value) else _redact(value)
+    if isinstance(value, list):
+        return [_redact_evidence_value(item, field_path=field_path) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_evidence_value(item, field_path=field_path) for item in value)
+    if isinstance(value, dict):
+        return {
+            _redact(key) if isinstance(key, str) else key: _redact_evidence_value(
+                item, field_path=field_path + (key,) if isinstance(key, str) else field_path
+            )
+            for key, item in value.items()
+        }
+    return value
 
 
 def _bounded_redacted_lines(raw: str, max_lines: int) -> list[str]:
@@ -544,11 +582,16 @@ def read_prompt(prompt_file: str) -> str:
 # process-local, this-invocation-only settings overlay -- it never
 # modifies the committed ``.claude/settings.json`` (out of Allowed Paths)
 # and never disables any hook already configured there.
+# This is harness-owned invocation-local input.  Keep the peer policy in the
+# same overlay as the existing observability hooks so every native lane has one
+# exact, auditable policy payload and no global Claude settings are changed.
 _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON = json.dumps({
+    "crossSessionInbound": "refuse",
+    "permissions": {"deny": ["SendMessage", "ListAgents"]},
     "hooks": {
         "SubagentStart": [{"hooks": [{"type": "command", "command": "cat"}]}],
         "SubagentStop": [{"hooks": [{"type": "command", "command": "cat"}]}],
-    }
+    },
 })
 
 
@@ -3667,13 +3710,8 @@ def _isolated_env() -> dict[str, str]:
 def _herdr_sessions(herdr_bin: str, env: dict[str, str] | None = None) -> list[dict] | None:
     """List every herdr session the local supervisor currently knows about.
 
-    Issue #2176 (P0-3 fix-delta): accepts an explicit ``env`` so every
-    caller in the isolated interactive lane -- collision check, creation
-    poll, socket lookup, baseline snapshot, and cleanup confirmation --
-    can be pinned to the exact same explicit environment instead of some
-    of them silently falling back to Python's default ``env=None``
-    (ambient/unstripped inherited environment). ``env=None`` (the default)
-    preserves every pre-existing caller's ambient-environment behavior.
+    Issue #2176 (P0-3 fix-delta): accepts an explicit ``env`` so explicit
+    baseline-preservation opt-in callers use stripped environment identity.
     """
     rc, out, _err, _timed_out = _run(
         [herdr_bin, "session", "list", "--json"], timeout=15.0, env=env
@@ -3973,22 +4011,14 @@ def diff_herdr_workspace_snapshot(before: dict | None, after: dict | None) -> li
 def capture_all_herdr_workspace_snapshots(
     herdr_bin: str, env: dict[str, str] | None,
 ) -> dict[str, dict] | None:
-    """Snapshot the ambient/default herdr session AND every OTHER currently
-    running named session explicitly (Issue #2174 AC7; PR #2176 OWNER
-    REQUEST_CHANGES Finding 4:
-    https://github.com/squne121/loop-protocol/pull/2176#issuecomment-5302819792).
-    Previously only the ambient/default session was ever snapshotted (no
-    session enumeration at all), so a human operator attached to a
-    differently-named session (e.g. ``HERDR_SESSION=development``) was
-    never protected: this run could silently mutate it undetected. The
-    ambient/default session is still captured via the same bare
-    ``api snapshot`` call this lane has always used (keyed here as
-    ``"default"``); every additional named session found by
-    ``herdr session list --json`` is captured via an explicit
-    ``--session <name> api snapshot`` call. Returns ``None`` (fail-closed)
-    if session enumeration itself is unobtainable, or if ANY individual
-    session's own snapshot (including the default one) cannot be
-    captured."""
+    """Capture every existing session only for explicit preservation opt-in.
+
+    The default interactive lane never calls this helper: enumerating or
+    snapshotting the ambient/default and named namespaces would observe human
+    sessions.  When ``--require-session-baseline-preservation`` explicitly
+    requests it, every named session is captured and unavailable data returns
+    ``None`` so the opt-in remains fail-closed.
+    """
     sessions = _herdr_sessions(herdr_bin, env=env)
     if sessions is None:
         return None
@@ -4035,50 +4065,29 @@ def diff_all_herdr_workspace_snapshots(
 
 
 def new_isolated_session_name(herdr_bin: str, env: dict[str, str] | None = None) -> str:
-    """A high-entropy session name not currently present in
-    ``herdr session list``. Never reuses the caller's own session.
+    """Generate a fresh high-entropy name without reading any Herdr namespace.
 
-    Issue #2176 (P0-3 fix-delta): the collision check now defaults to the
-    caller-supplied ``env`` (typically the same stripped, explicit
-    ``isolated_env`` that will go on to create the session), so the
-    collision check and the actual creation always share the same
-    explicit environment identity instead of the collision check silently
-    reading the ambient/unstripped environment.
+    The unused arguments retain the existing helper's call shape for callers
+    and focused tests.  A UUID4-derived name makes accidental collision
+    impracticable without enumerating, listing, or observing a pre-existing
+    or human Herdr session in the default interactive lane.
     """
-    for _attempt in range(5):
-        candidate = f"rts-{uuid.uuid4().hex}"[:32]
-        existing = _herdr_session_names(herdr_bin, env=env)
-        if existing is None:
-            raise HerdrLaneError("could not enumerate existing herdr sessions for collision check")
-        if candidate not in existing:
-            return candidate
-    raise HerdrLaneError("could not generate a unique isolated herdr session name")
+    del herdr_bin, env
+    return f"rts-{uuid.uuid4().hex}"[:32]
 
 
 def create_isolated_session(
     herdr_bin: str, session_name: str, env: dict[str, str], *, timeout_seconds: float = 20.0
 ) -> subprocess.Popen:
-    """Spawn a brand-new, detached, named Herdr session and block until its
-    appearance in ``herdr session list --json`` is confirmed.
+    """Spawn a new detached, named Herdr session without observing others.
 
-    This never reuses -- and never silently falls back to -- the caller's
-    own ambient/attached session. A real ``herdr`` refuses to nest a new
-    session launch inside a shell that is already running inside an active
-    Herdr pane by default ("nested herdr is disabled by default"); any such
-    failure (or any other failure to observe the new session actually
-    appear) is a hard SKIP, not a fallback to operating in the ambient
-    session (Issue #1921 P0-1 fix-delta).
-
-    Issue #2176 (P0-3 fix-delta): ``env`` is now a required, caller-supplied
-    explicit environment (the same stripped ``isolated_env`` the rest of
-    this session's lifecycle -- including its ``herdr session list``
-    creation-confirmation poll below -- uses), instead of this function
-    computing its own separate ``_isolated_env()`` copy that the poll loop
-    then silently did NOT reuse (the poll loop previously queried
-    ``_herdr_session_names(herdr_bin)`` with no ``env`` at all, i.e. the
-    ambient/unstripped environment). Spawn and creation-confirmation now
-    share one identity.
+    Readiness is established by the following own-session ``workspace create``
+    operation.  The default lane deliberately does not poll ``session list``:
+    listing would observe pre-existing or human namespaces.  A process that
+    exits before the own-session workspace lifecycle can start remains a
+    bounded SKIP rather than falling back to an ambient session.
     """
+    del timeout_seconds
     try:
         proc = subprocess.Popen(
             [herdr_bin, "--session", session_name],
@@ -4088,24 +4097,21 @@ def create_isolated_session(
     except OSError as exc:
         raise HerdrLaneError(f"could not spawn isolated herdr session: {exc}", skip=True) from exc
 
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            try:
-                _out, err = proc.communicate(timeout=2.0)
-            except (subprocess.TimeoutExpired, ValueError):
-                err = ""
-            raise HerdrLaneError(
-                "herdr isolated session process exited before becoming ready "
-                f"(nested-session restrictions may be in effect): {_redact((err or '').strip()[:300])}",
-                skip=True,
-            )
-        names = _herdr_session_names(herdr_bin, env=env)
-        if names is not None and session_name in names:
-            return proc
-        time.sleep(0.3)
-    proc.terminate()
-    raise HerdrLaneError("herdr isolated session did not appear in session list within timeout", skip=True)
+    # Let an immediate nested-session refusal surface without inspecting the
+    # Herdr control plane.  Later own-session commands provide the remaining
+    # readiness signal.
+    time.sleep(0.1)
+    if proc.poll() is not None:
+        try:
+            _out, err = proc.communicate(timeout=2.0)
+        except (subprocess.TimeoutExpired, ValueError):
+            err = ""
+        raise HerdrLaneError(
+            "herdr isolated session process exited before becoming ready "
+            f"(nested-session restrictions may be in effect): {_redact((err or '').strip()[:300])}",
+            skip=True,
+        )
+    return proc
 
 
 def _session_socket_path(herdr_bin: str, session_name: str, env: dict[str, str] | None = None) -> str | None:
@@ -4287,16 +4293,9 @@ def run_interactive_herdr_isolated(
     can never produce a false-positive launcher-selection PASS. Omitted by
     default (``claude_bin_override=None``), leaving every pre-existing
     caller's isolated-session ``PATH`` unchanged (AC6)."""
-    # Issue #2176 (P0-3 fix-delta): a single explicit, stripped ``isolated_env``
-    # is computed once, up front, and threaded through EVERY herdr command
-    # for this session's entire lifecycle -- the collision check, session
-    # creation and its creation-confirmation poll, the socket lookup, the
-    # agent lifecycle (workspace/agent/prompt/get/explain/read, already
-    # isolated_env-consistent before this fix-delta), and -- previously the
-    # gap -- the ``finally`` cleanup below (``session stop`` / ``session
-    # delete`` / removal confirmation). No step in this lifecycle silently
-    # falls back to whatever ambient HERDR_SESSION/HERDR_SOCKET_PATH the
-    # CALLING process happens to have inherited.
+    # A single explicit, stripped environment is computed once and threaded
+    # through every own-session Herdr command.  The default lane never lists,
+    # snapshots, or otherwise observes pre-existing/human namespaces.
     isolated_env = _isolated_env()
     session_name = new_isolated_session_name(herdr_bin, env=isolated_env)
     evidence["session_name"] = session_name
@@ -4308,24 +4307,12 @@ def run_interactive_herdr_isolated(
     claude_bin_shim_dir: str | None = None
     hook_sink_shim_dir: str | None = None
     try:
-        # Actually create the isolated session (not merely set an env var and
-        # hope) and block until its independent existence is confirmed via
-        # ``herdr session list --json`` (Issue #1921 P0-1 fix-delta). Any
-        # failure here (including a shell already nested inside an active
-        # Herdr pane, which real herdr refuses by default) raises a SKIP --
-        # it never falls through to operating against the caller's own
-        # session. This call (and everything after it) is inside the same
-        # try/finally as the rest of the lifecycle so a signal/exception
-        # arriving *during* creation confirmation still triggers cleanup
-        # (Issue #1921 P0-2 fix-delta iteration 2: a session/process leak
-        # was observed here when creation and the rest of the lifecycle
-        # were in separate try scopes).
+        # Create and use only the fresh named session.  ``workspace create``
+        # is the own-session readiness operation; no session-list poll or
+        # socket lookup is permitted in the default lane.
         session_proc = create_isolated_session(herdr_bin, session_name, isolated_env, timeout_seconds=20.0)
-
-        socket_path = _session_socket_path(herdr_bin, session_name, env=isolated_env)
+        evidence["cleanup"]["session_started"] = True
         isolated_env["HERDR_SESSION"] = session_name
-        if socket_path:
-            isolated_env["HERDR_SOCKET_PATH"] = socket_path
 
         claude_bin_receipt_path: str | None = None
         claude_bin_launcher_nonce: str | None = None
@@ -4388,6 +4375,18 @@ def run_interactive_herdr_isolated(
                     "--env", "CLAUDE_GPT_CLAUDE_BIN=" + claude_gpt_real_claude_bin,
                 ]
 
+        # Claude-GPT accepts the runtime-smoke peer policy only through its
+        # existing fixed launcher-owned channel.  Thread the default fixed
+        # value through both workspace creation and the already-running pane
+        # shell, because rc files can otherwise erase an inherited value.  A
+        # hook-sink run upgrades this same fixed channel below; no caller value
+        # is accepted or forwarded.
+        launcher_env_pairs: list[tuple[str, str]] = []
+        if runtime == "claude" and claude_adapter == "claude-gpt":
+            launcher_env_pairs = [
+                ("CLAUDE_GPT_RUNTIME_SMOKE_HOOKS", "subagent-start-stop"),
+            ]
+
         # Issue #2219 AC2/AC3/AC13-AC17 (OWNER anchor decision, hook-event
         # evidence channel): wire the interactive lane's durable hook sink
         # the SAME way ``CLAUDE_GPT_CLAUDE_BIN``/``PATH`` are already
@@ -4416,8 +4415,13 @@ def run_interactive_herdr_isolated(
                 hook_sink_path = claude_gpt_hook_sink_path(hook_sink_nonce)
                 hook_sink_path.parent.mkdir(parents=True, exist_ok=True)
                 evidence["hook_sink_path"] = str(hook_sink_path)
+                # Replace only the default fixed launcher channel with the
+                # other already-recognized fixed channel.  This remains a
+                # harness-selected value, never public caller input.
+                launcher_env_pairs[0] = (
+                    "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS", "hook-sink-multi-turn"
+                )
                 hook_sink_env_pairs = [
-                    ("CLAUDE_GPT_RUNTIME_SMOKE_HOOKS", "hook-sink-multi-turn"),
                     ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
                     # launch.sh independently computes this SAME path from
                     # its own launcher-owned constant + this nonce; also
@@ -4458,9 +4462,10 @@ def run_interactive_herdr_isolated(
                     ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
                     ("CLAUDE_GPT_HOOK_SINK_PATH", str(hook_sink_path)),
                 ]
-            for key, value in hook_sink_env_pairs:
-                isolated_env[key] = value
-                workspace_create_argv += ["--env", f"{key}={value}"]
+
+        for key, value in [*launcher_env_pairs, *hook_sink_env_pairs]:
+            isolated_env[key] = value
+            workspace_create_argv += ["--env", f"{key}={value}"]
 
         rc, out, err, timed_out = _run(
             workspace_create_argv,
@@ -4509,35 +4514,44 @@ def run_interactive_herdr_isolated(
                     f"already-running shell: {_redact(_pin_err or _pin_out)}"
                 )
 
-        if hook_sink_env_pairs:
-            # Same re-pin rationale as the ``--claude-bin`` shim above: an
-            # interactive login shell's own rc files can clobber an
-            # inherited env var, so every hook-sink env var is explicitly
-            # re-exported in the already-running pane shell too.
-            _pin_hook_sink_cmd = " && ".join(
+        runtime_env_pairs = [*launcher_env_pairs, *hook_sink_env_pairs]
+        if runtime_env_pairs:
+            # An interactive login shell can clobber inherited launcher policy
+            # or hook-sink env vars, so explicitly re-export the fixed values
+            # in the already-running pane shell before ``agent start``.
+            _pin_runtime_env_cmd = " && ".join(
                 f"export {key}='{value.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
-                for key, value in hook_sink_env_pairs
+                for key, value in runtime_env_pairs
             )
-            _pin_hs_rc, _pin_hs_out, _pin_hs_err, _pin_hs_timed_out = _run(
-                [herdr_bin, "pane", "run", pane_id, _pin_hook_sink_cmd],
+            _pin_runtime_env_rc, _pin_runtime_env_out, _pin_runtime_env_err, _pin_runtime_env_timed_out = _run(
+                [herdr_bin, "pane", "run", pane_id, _pin_runtime_env_cmd],
                 timeout=15.0, env=isolated_env,
             )
-            if _pin_hs_timed_out or _pin_hs_rc != 0:
+            if _pin_runtime_env_timed_out or _pin_runtime_env_rc != 0:
                 raise HerdrLaneError(
-                    "could not pin hook-sink env vars in the isolated pane's "
-                    f"already-running shell: {_redact(_pin_hs_err or _pin_hs_out)}"
+                    "could not pin launcher runtime env vars in the isolated pane's "
+                    f"already-running shell: {_redact(_pin_runtime_env_err or _pin_runtime_env_out)}"
                 )
 
         # Issue #1960 AC5: the interactive lane never forwards
         # structured-only flags (``--output-format`` / ``--include-hook-events``
         # / ``--no-session-persistence`` / ``--max-turns``) to the TUI
         # launch. Bounded execution for this lane comes from herdr's own
-        # wait timeout, process termination, and isolated-session
-        # stop/delete/removal confirmation (see Outcome / Interactive lane
-        # in Issue #1960) -- not from a structured-lane print-mode flag
+        # wait timeout, process termination, and own-name stop/delete command
+        # success -- not from a structured-lane print-mode flag
         # that has not been separately confirmed to be honored by an
         # interactive Claude Code launch.
+        # ``herdr agent start`` explicitly supports ``-- [AGENT_ARG]...``.
+        # Native Claude receives the same fixed, invocation-local policy used
+        # by the structured subprocess. Claude-GPT keeps its launcher-owned
+        # policy channel instead: forwarding --settings to that launcher is a
+        # rejected policy-bypass input. Neither branch alters the isolated
+        # Herdr lifecycle or routes structured execution through Herdr.
         agent_extra_args: list[str] = []
+        if claude_adapter == "native":
+            agent_extra_args = [
+                "--", "--settings", _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON,
+            ]
 
         # A freshly created workspace's shell may not be an "available shell"
         # yet (still initializing). Retry ``agent start`` with a bounded,
@@ -4646,17 +4660,11 @@ def run_interactive_herdr_isolated(
             shutil.rmtree(hook_sink_shim_dir, ignore_errors=True)
         cleanup = evidence["cleanup"]
         cleanup["attempted"] = True
-        # Issue #2176 (P0-3 fix-delta): previously these three calls used
-        # Python's default ``env=None`` (i.e. the ambient/unstripped
-        # environment this whole process inherited from its own caller),
-        # while every OTHER herdr command in this lifecycle
-        # (workspace/agent/prompt/get/explain/read) already used the
-        # explicit ``isolated_env``. That asymmetry meant cleanup -- the
-        # one place a leaked isolated session or a mis-targeted stop/delete
-        # would matter most -- was the one place NOT pinned to the same
-        # explicit identity as the rest of the lifecycle. All three cleanup
-        # calls now share ``isolated_env`` with session creation, the
-        # collision check, and the socket lookup above.
+        # Cleanup is scoped exclusively to the generated name.  The default
+        # lane cannot confirm deletion by listing the global control plane,
+        # because that would observe human/pre-existing namespaces.  Instead
+        # both own-session commands must succeed and the launcher process must
+        # be terminated; either failure remains fail-closed.
         stop_rc, _o, _e, _t = _run(
             [herdr_bin, "session", "stop", session_name, "--json"], timeout=20.0, env=isolated_env,
         )
@@ -4665,19 +4673,22 @@ def run_interactive_herdr_isolated(
             [herdr_bin, "session", "delete", session_name, "--json"], timeout=20.0, env=isolated_env,
         )
         cleanup["delete_rc"] = delete_rc
-        remaining = _herdr_session_names(herdr_bin, env=isolated_env)
-        cleanup["confirmed_removed"] = bool(remaining is not None and session_name not in remaining)
-        # Defense in depth: ``session stop``/``session delete`` should have
-        # already ended the spawned client process, but terminate it
-        # explicitly in case it did not (never leave an orphaned process).
-        # ``session_proc`` can still be ``None`` here if session creation
-        # itself never completed (e.g. it raised before returning).
+        session_process_terminated = session_proc is None
         if session_proc is not None and session_proc.poll() is None:
             session_proc.terminate()
             try:
                 session_proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 session_proc.kill()
+                try:
+                    session_proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    pass
+        if session_proc is not None:
+            session_process_terminated = session_proc.poll() is not None
+        cleanup["confirmed_removed"] = bool(
+            stop_rc == 0 and delete_rc == 0 and session_process_terminated
+        )
         if claude_bin_shim_dir is not None:
             shutil.rmtree(claude_bin_shim_dir, ignore_errors=True)
 
@@ -4690,9 +4701,10 @@ def run_interactive_herdr_isolated(
 
 def write_evidence(output_dir: Path, *, schema_summary: dict) -> None:
     output_dir.mkdir(parents=True, exist_ok=False)
+    redacted_schema_summary = _redact_evidence_value(schema_summary)
     summary_lines = ["# Runtime Smoke Summary", ""]
-    for key in sorted(schema_summary.keys()):
-        summary_lines.append(f"- {key}: {schema_summary[key]}")
+    for key in sorted(redacted_schema_summary.keys()):
+        summary_lines.append(f"- {key}: {redacted_schema_summary[key]}")
     (output_dir / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
 
@@ -4859,17 +4871,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-session-baseline-preservation",
         action="store_true",
         help=(
-            "interactive mode only (Issue #2176 P0-3): snapshot every "
-            "pre-existing herdr session (name/running/default/socket_path/"
-            "session_dir) before the isolated lane starts, snapshot again "
-            "after it finishes (including cleanup), and FAIL if any "
-            "pre-existing session (e.g. the human operator's own attached "
-            "session) changed or disappeared -- excluding only the "
-            "temporary isolated session this run itself created and "
-            "cleaned up. A baseline that could not be captured at all "
-            "(session list failed) is also treated as a failure "
-            "(fail-closed), never silently skipped. Omitted by default, so "
-            "every pre-existing caller's behavior is unchanged."
+            "interactive mode only: explicitly opt in to before/after "
+            "preservation observation of pre-existing Herdr sessions. The "
+            "runner snapshots session identity and full workspace/agent/focus "
+            "state before and after its own isolated lane, excluding only its "
+            "temporary session; any unavailable snapshot or observed change "
+            "fails closed. Omitted by default: the normal lane never lists, "
+            "snapshots, or observes pre-existing/human namespaces."
         ),
     )
     parser.add_argument("--inspect-session-log-metadata", action="store_true")
@@ -5237,6 +5245,16 @@ def main(argv: list[str] | None = None) -> int:
             "until #1881 (pr-reviewer persona safe Read/mutation-deny boundary) "
             "merges"
         ),
+        # Issue #2437: these names deliberately distinguish the two settings
+        # facts from runtime observations. None means the lane did not expose
+        # a trustworthy observation channel; it is never promoted from a
+        # model self-report or an absence of unrelated output.
+        "peer_policy_configured": args.runtime == "claude",
+        "cross_session_inbound_configured_refuse": args.runtime == "claude",
+        "outbound_peer_tools_absent": None,
+        "agent_spawn_completion_observed": None,
+        "herdr_namespace_isolated": None,
+        "preexisting_herdr_preserved": None,
     }
     if args.mode == "interactive":
         # Issue #1960 Design Decision 5 (P1-2 fix-delta): the interactive
@@ -5354,6 +5372,13 @@ def main(argv: list[str] | None = None) -> int:
                 # additive field, independent of mutation_boundary/hermetic
                 # gating above.
                 schema_summary["permission_denials"] = extract_claude_permission_denials(out)
+                denied_peer_tools = {
+                    str(denial.get("tool_name"))
+                    for denial in schema_summary["permission_denials"]
+                    if isinstance(denial, dict)
+                }
+                if {"SendMessage", "ListAgents"}.issubset(denied_peer_tools):
+                    schema_summary["outbound_peer_tools_absent"] = True
             # Issue #2161 (native Codex CLI retirement): the
             # run_structured_codex()-based else branch was removed along
             # with the ``codex`` runtime lane.
@@ -5510,6 +5535,9 @@ def main(argv: list[str] | None = None) -> int:
             schema_summary["child_agent_id"] = child_agent_id
             schema_summary["spawn_elapsed_sec"] = spawn_elapsed_sec
             schema_summary["completion_elapsed_sec"] = completion_elapsed_sec
+            schema_summary["agent_spawn_completion_observed"] = bool(
+                child_spawn_observed and child_completion_observed
+            )
 
             if capability_decision == "capability_skip":
                 # AC2: a known unknown/unrecognized-option parser diagnostic
@@ -5669,18 +5697,21 @@ def main(argv: list[str] | None = None) -> int:
                 "detected_agent_confidence": None,
                 "prompt_stall_recovered": None,
                 "turns_completed": 0,
-                "cleanup": {"attempted": False, "stop_rc": None, "delete_rc": None, "confirmed_removed": False},
+                "cleanup": {
+                    "attempted": False,
+                    "session_started": False,
+                    "stop_rc": None,
+                    "delete_rc": None,
+                    "confirmed_removed": False,
+                },
             }
             pane_output_lines: list[str] = []
 
-            # Issue #2176 (P0-3): capture the existing herdr session
-            # baseline (e.g. any human operator's own attached session)
-            # BEFORE this run's isolated session is created. A snapshot
-            # failure here is fail-closed -- it means baseline preservation
-            # cannot be verified at all, so the run is FAILed immediately
-            # rather than silently proceeding as if no baseline check had
-            # been requested.
+            # Pre-existing-session observation is an explicit opt-in only.
+            # The default interactive lane must not enumerate, list, or
+            # snapshot any human/pre-existing Herdr namespace.
             session_baseline_before: list[dict] | None = None
+            workspace_snapshot_before: dict[str, dict] | None = None
             if args.require_session_baseline_preservation:
                 session_baseline_before = snapshot_herdr_sessions("herdr", _isolated_env())
                 schema_summary["session_baseline_before_captured"] = session_baseline_before is not None
@@ -5691,22 +5722,14 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     exit_code = EXIT_FAIL
 
-            # Issue #2174 AC7: workspace/agent ID + focus preservation is a
-            # mandatory (always-on) runtime-verification requirement for
-            # every interactive lane run -- unlike
-            # ``--require-session-baseline-preservation`` above (an
-            # existing, opt-in, session-identity-only check), this cannot
-            # be disabled. PR #2176 OWNER REQUEST_CHANGES Finding 4: every
-            # currently running named session is snapshotted explicitly
-            # (never just the ambient/default one).
-            workspace_snapshot_before = capture_all_herdr_workspace_snapshots("herdr", _isolated_env())
-            schema_summary["herdr_workspace_snapshot_before_captured"] = workspace_snapshot_before is not None
-            if workspace_snapshot_before is None:
-                errors.append(
-                    "could not capture herdr workspace/agent/focus snapshot before interactive "
-                    "lane (api snapshot failed)"
-                )
-                exit_code = EXIT_FAIL
+                workspace_snapshot_before = capture_all_herdr_workspace_snapshots("herdr", _isolated_env())
+                schema_summary["herdr_workspace_snapshot_before_captured"] = workspace_snapshot_before is not None
+                if workspace_snapshot_before is None:
+                    errors.append(
+                        "could not capture herdr workspace/agent/focus snapshot before interactive "
+                        "lane (api snapshot failed)"
+                    )
+                    exit_code = EXIT_FAIL
 
             # Issue #2219 fix_delta iteration 1 (Option B): captured BEFORE
             # the isolated session is created, so the persisted-transcript
@@ -5885,55 +5908,53 @@ def main(argv: list[str] | None = None) -> int:
             except HerdrLaneError as exc:
                 errors.append(exc.message)
                 exit_code = EXIT_SKIP if exc.skip else EXIT_FAIL
+                if exc.skip:
+                    # A nested-session refusal is an explicit environment
+                    # constraint, not evidence that an existing namespace was
+                    # mutated. Keep its bounded classification through the
+                    # own-session cleanup path below.
+                    schema_summary["runtime_skip_reason_code"] = "herdr_isolated_session_unavailable"
             finally:
-                # Issue #2176 (P0-3): re-snapshot AFTER the isolated lane
-                # (including its own ``finally``-block cleanup above) has
-                # fully run, whether it succeeded, FAILed, or SKIPped. Any
-                # difference from the before-snapshot -- other than the
-                # temporary session this run itself created -- is a
-                # baseline-preservation violation and is treated as a FAIL
-                # regardless of the lane's own exit_code (fail-closed): a
-                # corrupted/leaked ambient session is strictly worse than
-                # whatever this run's own outcome would otherwise have
-                # been, and must never be silently absorbed by it.
-                if args.require_session_baseline_preservation and session_baseline_before is not None:
-                    session_baseline_after = snapshot_herdr_sessions("herdr", _isolated_env())
-                    schema_summary["session_baseline_after_captured"] = session_baseline_after is not None
-                    if session_baseline_after is None:
-                        errors.append(
-                            "could not capture herdr session baseline after interactive lane "
-                            "(session list failed)"
-                        )
-                        exit_code = EXIT_FAIL
-                    else:
-                        created_name = evidence.get("session_name")
-                        baseline_diffs = diff_herdr_session_baseline(
-                            session_baseline_before, session_baseline_after,
-                            new_session_names={created_name} if created_name else set(),
-                        )
-                        schema_summary["session_baseline_diffs"] = baseline_diffs
-                        if baseline_diffs:
+                if args.require_session_baseline_preservation:
+                    # The explicit opt-in preserves the existing fail-closed
+                    # before/after baseline and full workspace observation.
+                    if session_baseline_before is not None:
+                        session_baseline_after = snapshot_herdr_sessions("herdr", _isolated_env())
+                        schema_summary["session_baseline_after_captured"] = session_baseline_after is not None
+                        if session_baseline_after is None:
                             errors.append(
-                                f"herdr session baseline preservation failed: {baseline_diffs}"
+                                "could not capture herdr session baseline after interactive lane "
+                                "(session list failed)"
                             )
                             exit_code = EXIT_FAIL
+                        else:
+                            created_name = evidence.get("session_name")
+                            baseline_diffs = diff_herdr_session_baseline(
+                                session_baseline_before, session_baseline_after,
+                                new_session_names={created_name} if created_name else set(),
+                            )
+                            schema_summary["session_baseline_diffs"] = baseline_diffs
+                            if baseline_diffs:
+                                errors.append(
+                                    f"herdr session baseline preservation failed: {baseline_diffs}"
+                                )
+                                exit_code = EXIT_FAIL
 
-                # Issue #2174 AC7: workspace/agent/focus preservation --
-                # always evaluated (see the mandatory before-capture above),
-                # regardless of ``--require-session-baseline-preservation``.
-                workspace_snapshot_after = capture_all_herdr_workspace_snapshots("herdr", _isolated_env())
-                schema_summary["herdr_workspace_snapshot_after_captured"] = workspace_snapshot_after is not None
-                workspace_snapshot_diffs = diff_all_herdr_workspace_snapshots(
-                    workspace_snapshot_before, workspace_snapshot_after
-                )
-                schema_summary["herdr_workspace_snapshot_diffs"] = workspace_snapshot_diffs
-                schema_summary["herdr_workspace_snapshot_preserved"] = not workspace_snapshot_diffs
-                if workspace_snapshot_diffs:
-                    errors.append(
-                        "herdr workspace/agent/focus snapshot not preserved across isolated "
-                        f"interactive lane run: {workspace_snapshot_diffs}"
+                    workspace_snapshot_after = capture_all_herdr_workspace_snapshots("herdr", _isolated_env())
+                    schema_summary["herdr_workspace_snapshot_after_captured"] = workspace_snapshot_after is not None
+                    workspace_snapshot_diffs = diff_all_herdr_workspace_snapshots(
+                        workspace_snapshot_before, workspace_snapshot_after
                     )
-                    exit_code = EXIT_FAIL
+                    schema_summary["herdr_workspace_snapshot_diffs"] = workspace_snapshot_diffs
+                    schema_summary["herdr_workspace_snapshot_preserved"] = (
+                        None if exit_code == EXIT_SKIP else not workspace_snapshot_diffs
+                    )
+                    if workspace_snapshot_diffs and exit_code != EXIT_SKIP:
+                        errors.append(
+                            "herdr workspace/agent/focus snapshot not preserved across isolated "
+                            f"interactive lane run: {workspace_snapshot_diffs}"
+                        )
+                        exit_code = EXIT_FAIL
 
             schema_summary["session_name"] = evidence.get("session_name")
             schema_summary["pane_id"] = evidence.get("pane_id")
@@ -5961,7 +5982,29 @@ def main(argv: list[str] | None = None) -> int:
             cleanup = evidence.get("cleanup") or {}
             schema_summary["cleanup_attempted"] = cleanup.get("attempted", False)
             schema_summary["cleanup_confirmed_removed"] = cleanup.get("confirmed_removed", False)
-            if cleanup.get("attempted") and not cleanup.get("confirmed_removed"):
+            schema_summary["herdr_namespace_isolated"] = (
+                None if exit_code == EXIT_SKIP else bool(
+                    evidence.get("session_name") and cleanup.get("confirmed_removed")
+                )
+            )
+            # This existing observed evidence key/type is available only for
+            # the explicit baseline-preservation opt-in; default runs leave it
+            # honestly unavailable rather than inferring preservation.
+            schema_summary["preexisting_herdr_preserved"] = (
+                schema_summary.get("herdr_workspace_snapshot_preserved")
+                if args.require_session_baseline_preservation
+                else None
+            )
+            # A failed own-session cleanup remains a hard failure once a
+            # session process was successfully started.  A nested-session
+            # refusal can occur before that point; its named session never
+            # existed, so an unconfirmable no-op cleanup must preserve the
+            # already-classified explicit SKIP rather than convert it to FAIL.
+            if (
+                cleanup.get("session_started")
+                and cleanup.get("attempted")
+                and not cleanup.get("confirmed_removed")
+            ):
                 errors.append("herdr isolated session cleanup could not be confirmed removed")
                 exit_code = EXIT_FAIL
 
@@ -6000,7 +6043,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.evidence_json:
         try:
             Path(args.evidence_json).write_text(
-                json.dumps(schema_summary, indent=2, sort_keys=True, default=str) + "\n",
+                json.dumps(_redact_evidence_value(schema_summary), indent=2, sort_keys=True, default=str) + "\n",
                 encoding="utf-8",
             )
         except OSError as exc:
