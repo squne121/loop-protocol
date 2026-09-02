@@ -1341,6 +1341,56 @@ def _run_repair_apply_fresh_validation(
     }
 
 
+def _evaluate_candidate_static_readiness(
+    *,
+    candidate_body: str,
+    candidate_path: Path,
+) -> tuple[dict, "int | None"]:
+    """Run the one static candidate-readiness evaluation for a dispatch.
+
+    The generic lane retains its existing shared-core evaluation.  The
+    structural lane evaluates its synthesized body before routing and passes
+    this digest-bound result back into that same core, so a `go` candidate
+    never launches a second checker subprocess.
+    """
+    readiness_script = _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
+    returncode: "int | None" = None
+    try:
+        completed_readiness = subprocess.run(
+            [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        readiness_stdout = completed_readiness.stdout
+        returncode = completed_readiness.returncode
+    except (subprocess.TimeoutExpired, OSError):
+        # Static readiness runs strictly before edit_issue_txn.py.  Preserve
+        # the established normalized input/runtime outcome and never imply
+        # that a transaction was attempted.
+        readiness_stdout = ""
+    try:
+        observed_readiness = json.loads(readiness_stdout)
+    except json.JSONDecodeError:
+        observed_readiness = {}
+    if not isinstance(observed_readiness, dict):
+        observed_readiness = {}
+
+    # Keep the generic lane's historical degraded normalization unchanged,
+    # while retaining the unmodified parsed envelope for the structural
+    # lane's digest-bound validation below.  In particular, the structural
+    # caller must be able to distinguish an absent checker digest from a
+    # digest inserted by this legacy generic normalization.
+    readiness = dict(observed_readiness)
+    readiness.setdefault("status", "input_or_runtime_error")
+    readiness.setdefault("body_sha256", f"sha256:{_sha256(candidate_body)}")
+    readiness.setdefault("source_checks", [])
+    readiness.setdefault("errors", [])
+    readiness["_observed_checker_envelope"] = observed_readiness
+    return readiness, returncode
+
+
 def _dispatch_candidate_body_via_edit_txn(
     *,
     current_issue_: dict,
@@ -1351,6 +1401,7 @@ def _dispatch_candidate_body_via_edit_txn(
     root: Path,
     issue_number: int,
     repo: str,
+    precomputed_readiness: "dict | None" = None,
 ) -> dict:
     """Issue #2039 AC8/AC11 (extracted for Issue #2396 AC5 sharing): the ONE
     mutation-dispatch core BOTH `repair_action.apply` (generic
@@ -1370,37 +1421,17 @@ def _dispatch_candidate_body_via_edit_txn(
     """
     from scope_signal_delta import build_issue_edit_txn_input
 
-    readiness_script = _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
-    try:
-        completed_readiness = subprocess.run(
-            [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
-            capture_output=True,
-            text=True,
-            shell=False,
-            timeout=REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS,
+    # Generic callers leave `precomputed_readiness` unset and retain the
+    # historical shared-core evaluation. Structural callers supply their
+    # post-synthesis, candidate-digest-bound result so this core only forwards
+    # it and never re-runs the checker.
+    if precomputed_readiness is None:
+        readiness, _ = _evaluate_candidate_static_readiness(
+            candidate_body=candidate_body,
+            candidate_path=candidate_path,
         )
-        readiness_stdout = completed_readiness.stdout
-    except (subprocess.TimeoutExpired, OSError):
-        # PR #2202 review fix-delta (P0-6, item 2): the readiness check
-        # never touches GitHub -- it runs strictly BEFORE
-        # edit_issue_txn.py is ever invoked below, so a
-        # TimeoutExpired/OSError here proves no mutation could possibly
-        # have been dispatched yet. It is therefore always safe to fall
-        # through to the SAME degraded-readiness fallback already used
-        # for non-JSON readiness stdout below (never a fabricated
-        # "verified"/"unresolved" readiness signal, and never routed
-        # into the mutation-side `unknown` handling this is not).
-        readiness_stdout = ""
-    try:
-        readiness = json.loads(readiness_stdout)
-    except json.JSONDecodeError:
-        readiness = {}
-    if not isinstance(readiness, dict):
-        readiness = {}
-    readiness.setdefault("status", "input_or_runtime_error")
-    readiness.setdefault("body_sha256", f"sha256:{_sha256(candidate_body)}")
-    readiness.setdefault("source_checks", [])
-    readiness.setdefault("errors", [])
+    else:
+        readiness = dict(precomputed_readiness)
     readiness["readiness_result_ref"] = "transaction-local"
     readiness_forwarding = {
         key: readiness[key]
@@ -1511,6 +1542,7 @@ def _dispatch_candidate_body_default_transaction(
     issue_number: int,
     repo: str,
     scratch_subdir: str = "repair-action-apply",
+    precomputed_readiness: "dict | None" = None,
 ) -> dict:
     """Issue #2039 AC8 (extracted for Issue #2396 AC5 sharing): unlike the
     sibling contract_update.run.with_anchor lane (which uses the shared,
@@ -1561,6 +1593,7 @@ def _dispatch_candidate_body_default_transaction(
                 root=root,
                 issue_number=issue_number,
                 repo=repo,
+                precomputed_readiness=precomputed_readiness,
             )
         finally:
             for _tmp_path in (candidate_path, input_path):
@@ -2122,16 +2155,107 @@ STRUCTURAL_REPAIR_APPLY_FAILURE_CONFLICTING_TARGETS = "structural_conflicting_in
 STRUCTURAL_REPAIR_APPLY_FAILURE_BODY_DRIFT = "structural_body_drift"
 STRUCTURAL_REPAIR_APPLY_FAILURE_CROSS_ISSUE = "cross_issue_provenance_mismatch"
 STRUCTURAL_REPAIR_APPLY_FAILURE_READBACK_UNRESOLVABLE = "final_readback_unresolvable"
+STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_NEEDS_FIX = "structural_readiness_needs_fix"
+STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_HUMAN_JUDGMENT = "structural_readiness_human_judgment"
+STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_RUNTIME_ERROR = "structural_readiness_runtime_error"
+STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_INPUT_OR_RUNTIME_ERROR = "structural_readiness_input_or_runtime_error"
+
+_STRUCTURAL_READINESS_EXPECTED_EXIT_CODES = {
+    "go": 0,
+    "needs_fix": 1,
+    "human_judgment": 2,
+    "runtime_error": 4,
+}
+_STRUCTURAL_READINESS_FAILURE_CODES = {
+    "needs_fix": STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_NEEDS_FIX,
+    "human_judgment": STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_HUMAN_JUDGMENT,
+    "runtime_error": STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_RUNTIME_ERROR,
+    "input_or_runtime_error": STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_INPUT_OR_RUNTIME_ERROR,
+}
+
+
+def _structural_readiness_diagnostics(readiness: dict) -> dict:
+    """Project only bounded, deterministic readiness details to stdout."""
+    rule_ids = sorted(
+        {
+            error.get("rule_id")
+            for error in readiness.get("errors", [])
+            if isinstance(error, dict) and isinstance(error.get("rule_id"), str)
+        }
+    )
+    return {
+        "status": readiness.get("status"),
+        "rule_ids": rule_ids[:16],
+        "truncated": len(rule_ids) > 16,
+    }
+
+
+def _structural_digest_bound_readiness(
+    *, candidate_body: str, candidate_path: Path
+) -> dict:
+    """Evaluate one structural candidate at the strict digest-bound boundary.
+
+    The generic consumer intentionally retains the readiness normalizations it
+    has historically forwarded through the shared core.  Structural routing is
+    different: it must validate the checker envelope actually observed before
+    any normalized field can influence transaction dispatch.
+    """
+    readiness, returncode = _evaluate_candidate_static_readiness(
+        candidate_body=candidate_body,
+        candidate_path=candidate_path,
+    )
+    # Production evaluation retains the unmodified parsed checker object under
+    # this private key.  Test doubles that supply the evaluator directly are
+    # treated as the observed envelope, preserving their focused seam.
+    observed = readiness.get("_observed_checker_envelope")
+    if not isinstance(observed, dict):
+        observed = readiness
+
+    status = observed.get("status")
+    candidate_digest = f"sha256:{_sha256(candidate_body)}"
+    expected_exit_code = _STRUCTURAL_READINESS_EXPECTED_EXIT_CODES.get(status) if isinstance(status, str) else None
+    if (
+        not isinstance(status, str)
+        or expected_exit_code is None
+        or returncode != expected_exit_code
+        or not isinstance(observed.get("body_sha256"), str)
+        or observed["body_sha256"] != candidate_digest
+        or not isinstance(observed.get("source_checks"), list)
+        or not isinstance(observed.get("errors"), list)
+    ):
+        # Malformed process results, unknown status, exit/status disagreement,
+        # incomplete envelopes, and digest mismatch all fail before the shared
+        # transaction core.  Do not expose the raw checker payload.
+        return {
+            "status": "input_or_runtime_error",
+            "source_checks": [],
+            "errors": [],
+        }
+
+    # Forward only the validated envelope fields.  This keeps private
+    # evaluator metadata and any unrelated checker output out of the
+    # transaction input and stdout contract.
+    return {
+        "status": status,
+        "body_sha256": observed["body_sha256"],
+        "source_checks": observed["source_checks"],
+        "errors": observed["errors"],
+    }
 
 
 def _structural_apply_not_attempted_result(
-    *, repo: str, issue_number: int, phase: str, failure_code: "str | None"
+    *,
+    repo: str,
+    issue_number: int,
+    phase: str,
+    failure_code: "str | None",
+    readiness_diagnostics: "dict | None" = None,
 ) -> dict:
     """Shared not_attempted stdout-contract shape for every early-exit
     branch of `run_structural_repair_action_apply()`. Never emits a GitHub
     mutation (mirrors `_repair_apply_not_attempted_result()`'s role for the
     sibling generic lane)."""
-    return {
+    result = {
         "schema_version": STRUCTURAL_REPAIR_APPLY_STDOUT_SCHEMA_VERSION,
         "phase": phase,
         "mutation_outcome": "not_attempted",
@@ -2153,6 +2277,9 @@ def _structural_apply_not_attempted_result(
             "final_body_digest_match": None,
         },
     }
+    if readiness_diagnostics is not None:
+        result["readiness_diagnostics"] = readiness_diagnostics
+    return result
 
 
 def _structural_item_rendered_block(item: dict) -> str:
@@ -2577,6 +2704,32 @@ def run_structural_repair_action_apply(
 
     candidate_digest = f"sha256:{hashlib.sha256(new_body.encode('utf-8')).hexdigest()}"
 
+    # Structural routing evaluates the real, synthesized whole body before
+    # transaction dispatch. The result is digest-bound and reused by the
+    # shared core on `go`; every other checker disposition stops here.
+    # The checker receives a closed, ordinary path.  Keeping it in a private
+    # temporary directory avoids the open NamedTemporaryFile pathname handoff
+    # while retaining one ephemeral, per-invocation candidate file.
+    with tempfile.TemporaryDirectory() as readiness_dir:
+        readiness_path = Path(readiness_dir) / "candidate_body.md"
+        readiness_path.write_text(new_body, encoding="utf-8")
+        readiness = _structural_digest_bound_readiness(
+            candidate_body=new_body,
+            candidate_path=readiness_path,
+        )
+    readiness_status = readiness.get("status")
+    if readiness_status != "go":
+        return _structural_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="candidate_readiness",
+            failure_code=_STRUCTURAL_READINESS_FAILURE_CODES.get(
+                readiness_status,
+                STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_INPUT_OR_RUNTIME_ERROR,
+            ),
+            readiness_diagnostics=_structural_readiness_diagnostics(readiness),
+        )
+
     def _default_apply_transaction(current_issue_: dict, candidate_body: str) -> dict:
         # AC5: the EXACT SAME shared dispatch core the generic
         # repair_action.apply lane's own default uses -- never a second,
@@ -2589,6 +2742,7 @@ def run_structural_repair_action_apply(
             issue_number=issue_number,
             repo=repo,
             scratch_subdir="structural-repair-action-apply",
+            precomputed_readiness=readiness,
         )
 
     apply_fn = apply_transaction or _default_apply_transaction
