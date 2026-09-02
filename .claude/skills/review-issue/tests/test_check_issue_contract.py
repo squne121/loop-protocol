@@ -1396,7 +1396,7 @@ class TestC5GroupedAcComment:
         assert result == "fail", f"Expected fail (AC3 uncovered), got {result}"
         assert any("AC3" in msg for msg in issues), f"Expected AC3 in issues: {issues}"
 
-    def test_research_issue_kind_unnumbered_ac_is_na(self):
+    def test_c5_research_no_ac_numbers_is_na(self):
         """#2480: research issue_kind with unnumbered AC checkboxes -> NA, not FAIL.
 
         .github/ISSUE_TEMPLATE/research.yml provides unnumbered '- [ ]' AC
@@ -1412,7 +1412,7 @@ class TestC5GroupedAcComment:
         assert result == "n/a", f"Expected n/a, got {result}. issues: {issues}"
         assert issues == []
 
-    def test_tracking_issue_kind_unnumbered_ac_is_na(self):
+    def test_c5_tracking_no_ac_numbers_is_na(self):
         """#2480: tracking issue_kind gets the same unnumbered-AC NA treatment as research."""
         body = self._body_with(
             "- [ ] 追跡対象の状態が記載されている\n",
@@ -1422,7 +1422,7 @@ class TestC5GroupedAcComment:
         assert result == "n/a", f"Expected n/a, got {result}. issues: {issues}"
         assert issues == []
 
-    def test_implementation_issue_kind_unnumbered_ac_still_fails(self):
+    def test_c5_implementation_no_ac_numbers_still_fail(self):
         """#2480: default/implementation issue_kind keeps the strict unconditional FAIL."""
         body = self._body_with(
             "- [ ] 番号のない AC\n",
@@ -1435,7 +1435,7 @@ class TestC5GroupedAcComment:
         result_explicit, _ = check_c5_ac_vc_alignment(body, issue_kind="implementation")
         assert result_explicit == "fail"
 
-    def test_research_issue_kind_numbered_ac_still_checks_alignment(self):
+    def test_c5_research_with_ac_numbers_alignment_still_applies(self):
         """#2480: research issue_kind with numbered AC keeps normal alignment enforcement."""
         body = self._body_with(
             "- [ ] AC1: foo\n- [ ] AC2: bar\n",
