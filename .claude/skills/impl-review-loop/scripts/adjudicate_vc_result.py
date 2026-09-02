@@ -1388,7 +1388,7 @@ def adjudicate_vc_result(
                     "command_hash": norm["command_hash"],
                     "failure_keys": [],
                     "reason_code": "runtime_only_current_head_binding_pass",
-                    "summary": "Producer-authorized runtime_only skip is covered by current-head executed PASS evidence",
+                    "summary": "Producer-authorized runtime_only skip is covered by current-head PASS evidence",
                 }
             )
             continue
