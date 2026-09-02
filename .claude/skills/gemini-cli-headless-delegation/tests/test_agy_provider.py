@@ -1184,6 +1184,104 @@ def test_agy_invocation_attempted_becomes_true_at_direct_subprocess_boundary(
     assert result["agy_failure_kind"] is None
 
 
+def test_agy_minimal_env_direct_subprocess_success_marks_attempted_with_exact_argv(monkeypatch) -> None:
+    """The no-tool-profile branch marks before its exact direct AGY argv runs."""
+    fake_agy_bin = "/hermetic/agy-direct-success"
+    fixed_prompt = "direct minimal-env success"
+    observed_argvs: list[list[Any]] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+    profile_token = rgh._AGY_TOOL_PROFILE_CTX.set(None)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        actual_argv = list(cmd)
+        observed_argvs.append(actual_argv)
+        assert actual_argv == [fake_agy_bin, "-p", fixed_prompt]
+        assert kwargs["env"] == {"PATH": "/minimal-agy-path"}
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True
+        return _make_completed(0, stdout="direct AGY success")
+
+    try:
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        with (
+            patch.object(rgh, "_minimal_agy_env", return_value={"PATH": "/minimal-agy-path"}) as minimal_env,
+            patch.object(rgh, "_AGY_PROVENANCE_AVAILABLE", False),
+            patch("subprocess.run", side_effect=fake_run),
+        ):
+            completed = rgh._run_agy(fixed_prompt, 30)
+        result = rgh._attach_agy_failure_kind(
+            {"provider": "agy"},
+            rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None),
+        )
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(profile_token)
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+    minimal_env.assert_called_once_with()
+    assert observed_argvs == [[fake_agy_bin, "-p", fixed_prompt]]
+    assert completed.returncode == 0
+    assert result["ok"] is True
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] is None
+
+
+def test_agy_minimal_env_direct_subprocess_nonzero_marks_attempted_with_exact_argv(monkeypatch) -> None:
+    """The no-tool-profile direct branch preserves attempted/nonzero correlation."""
+    fake_agy_bin = "/hermetic/agy-direct-failure"
+    fixed_prompt = "direct minimal-env failure"
+    observed_argvs: list[list[Any]] = []
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+    profile_token = rgh._AGY_TOOL_PROFILE_CTX.set(None)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        actual_argv = list(cmd)
+        observed_argvs.append(actual_argv)
+        assert actual_argv == [fake_agy_bin, "-p", fixed_prompt]
+        assert kwargs["env"] == {"PATH": "/minimal-agy-path"}
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is True
+        return _make_completed(23, stderr="direct AGY failure")
+
+    try:
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        with (
+            patch.object(rgh, "_minimal_agy_env", return_value={"PATH": "/minimal-agy-path"}) as minimal_env,
+            patch.object(rgh, "_AGY_PROVENANCE_AVAILABLE", False),
+            patch("subprocess.run", side_effect=fake_run),
+        ):
+            completed = rgh._run_agy(fixed_prompt, 30)
+        result = rgh._attach_agy_failure_kind(
+            {"provider": "agy"},
+            rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None),
+        )
+    finally:
+        rgh._AGY_TOOL_PROFILE_CTX.reset(profile_token)
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+    minimal_env.assert_called_once_with()
+    assert observed_argvs == [[fake_agy_bin, "-p", fixed_prompt]]
+    assert completed.returncode == 23
+    assert result["ok"] is False
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] == "operational"
+
+
+def test_bwrap_status_parser_requires_a_valid_positive_child_pid() -> None:
+    """Only bounded, strict JSON status records with a positive child pid prove spawn."""
+    assert rgh._bwrap_status_reports_child_started(b'{"child-pid":1234}\n') is True
+    for invalid_status in (
+        b"",
+        b'{"exit-code":0}\n',
+        b'{"child-pid":0}\n',
+        b'{"child-pid":-1}\n',
+        b'{"child-pid":true}\n',
+        b'{"child-pid":"1234"}\n',
+        b'{"child-pid":1234}\nnot-json\n',
+        b"x" * (rgh._BWRAP_STATUS_MAX_BYTES + 1),
+    ):
+        assert rgh._bwrap_status_reports_child_started(invalid_status) is False
+
+
 def test_agy_bwrap_preexec_nonzero_does_not_mark_actual_invocation(monkeypatch, tmp_path: Path) -> None:
     fake_agy_bin = "/hermetic/agy-ac10-bwrap"
     fixed_prompt = "AC10 bwrap pre-exec failure"
@@ -1220,6 +1318,103 @@ def test_agy_bwrap_preexec_nonzero_does_not_mark_actual_invocation(monkeypatch, 
     assert result["agy_failure_kind"] == "operational"
     assert result["agy_invocation_attempted"] is False
     assert not (result["agy_invocation_attempted"] and result["agy_failure_kind"] == "operational")
+
+
+def test_agy_bwrap_child_pid_success_marks_attempted_and_preserves_success(monkeypatch, tmp_path: Path) -> None:
+    """A valid bwrap child-pid is the sole proof that may authorize AGY success."""
+    fake_agy_bin = "/hermetic/agy-ac10-bwrap"
+    fixed_prompt = "AC10 bwrap child success"
+    bwrap_prefix = ["bwrap", "--deterministic-child-success", "--"]
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=bwrap_prefix
+    )
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+    attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+
+    def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+        actual_argv = list(cmd)
+        assert actual_argv[:2] == bwrap_prefix[:2]
+        assert actual_argv[2] == "--json-status-fd"
+        assert actual_argv[4:] == ["--", fake_agy_bin, "-p", fixed_prompt]
+        assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+        os.write(kwargs["pass_fds"][0], b'{"child-pid":1234}\n{"exit-code":0}\n')
+        return _make_completed(0, stdout="bwrap child AGY success")
+
+    try:
+        with patch.object(
+            rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+        ):
+            with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+                result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+    finally:
+        rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+    assert result["ok"] is True
+    assert result["response_text"] == "bwrap child AGY success"
+    assert result["agy_invocation_attempted"] is True
+    assert result["agy_failure_kind"] is None
+    router = _load_agy_advisory_fallback_router()
+    decision = router.route_agy_advisory_fallback(
+        result,
+        requirement="advisory",
+        canonical_failure_kind=rgh.canonical_agy_failure_kind,
+    )
+    assert decision["status"] == "ok"
+    assert decision["next_action"] == "continue_agy_result"
+
+
+def test_agy_bwrap_normal_success_without_child_proof_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    """A zero bwrap return without valid child proof cannot expose a response or fallback."""
+    fake_agy_bin = "/hermetic/agy-ac10-bwrap"
+    fixed_prompt = "AC10 bwrap unproven normal success"
+    bwrap_prefix = ["bwrap", "--deterministic-unproven-success", "--"]
+    fake_workspace = types.SimpleNamespace(
+        env={}, workspace_dir=tmp_path, agy_oauth_token_bwrap_prefix=bwrap_prefix
+    )
+    proof_failures: tuple[tuple[str, bytes | None], ...] = (
+        ("absent", None),
+        ("malformed", b"not-json\n"),
+        ("oversized", b"x" * (rgh._BWRAP_STATUS_MAX_BYTES + 1)),
+        ("no-positive-child-pid", b'{"child-pid":0}\n'),
+    )
+    monkeypatch.setenv("AGY_BIN", fake_agy_bin)
+
+    for case_name, status in proof_failures:
+        attempt_token = rgh._AGY_INVOCATION_ATTEMPTED_CTX.set(False)
+
+        def fake_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
+            actual_argv = list(cmd)
+            assert actual_argv[:2] == bwrap_prefix[:2]
+            assert actual_argv[2] == "--json-status-fd"
+            assert actual_argv[4:] == ["--", fake_agy_bin, "-p", fixed_prompt]
+            assert rgh._AGY_INVOCATION_ATTEMPTED_CTX.get() is False
+            if status is not None:
+                assert os.write(kwargs["pass_fds"][0], status) == len(status)
+            return _make_completed(0, stdout=f"unproven response: {case_name}")
+
+        try:
+            with patch.object(
+                rgh._agy_permission_policy, "materialize_isolated_agy_workspace", return_value=fake_workspace
+            ):
+                with patch("shutil.rmtree"), patch("subprocess.run", side_effect=fake_run):
+                    result = rgh.run_delegation(_agy_request(prompt=fixed_prompt))
+        finally:
+            rgh._AGY_INVOCATION_ATTEMPTED_CTX.reset(attempt_token)
+
+        assert result["ok"] is False
+        assert result["failure_class"] == "agy_exit_nonzero"
+        assert result["response_text"] is None
+        assert result["agy_invocation_attempted"] is False
+        assert result["agy_failure_kind"] == "operational"
+        router = _load_agy_advisory_fallback_router()
+        decision = router.route_agy_advisory_fallback(
+            result,
+            requirement="advisory",
+            canonical_failure_kind=rgh.canonical_agy_failure_kind,
+        )
+        assert decision["status"] == "failed"
+        assert decision["next_action"] == "fail_closed"
+        assert decision["reason_code"] == "non_agy_or_pre_agy"
 
 
 def test_agy_bwrap_child_started_nonzero_marks_actual_invocation(monkeypatch, tmp_path: Path) -> None:

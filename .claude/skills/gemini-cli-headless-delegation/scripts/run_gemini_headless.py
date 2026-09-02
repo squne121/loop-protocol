@@ -3888,6 +3888,17 @@ def _run_agy(
                     bwrap_status = _read_bwrap_status(status_file)
                 if _bwrap_status_reports_child_started(bwrap_status):
                     _mark_actual_agy_invocation_attempted()
+                elif completed.returncode == 0:
+                    # A bwrap exit status cannot prove that its sandbox child
+                    # started. Do not expose unproven bwrap stdout as an AGY
+                    # success: route it through the existing generic AGY
+                    # failure normalization with no response instead.
+                    completed = subprocess.CompletedProcess(
+                        args=completed.args,
+                        returncode=1,
+                        stdout="",
+                        stderr="",
+                    )
 
             if _AGY_PROVENANCE_AVAILABLE and hook_load_error is None:
                 try:
