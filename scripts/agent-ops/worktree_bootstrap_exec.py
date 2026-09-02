@@ -388,14 +388,16 @@ def recover_or_create_fixed_control_plane_worktree(
     current_head = run_control_plane_git_read_worktree_head(
         existing_path, object_format, project_root=project_root, deadline=deadline, scratch_root=scratch_root
     )
-    if current_head == accepted_oid:
-        return {"state": "reused", "worktree_path": existing_path.value}
-
+    # Cleanliness is checked *before* the same-OID reuse decision so a dirty
+    # working tree fails closed regardless of whether `current_head` happens
+    # to already equal `accepted_oid` (Issue #2197 AC5).
     status = run_control_plane_git_read_worktree_status_porcelain(
         existing_path, project_root=project_root, deadline=deadline, scratch_root=scratch_root
     )
     if status.strip():
         raise ControlPlaneUnavailable("control_plane_unavailable:fixed_worktree_dirty")
+    if current_head == accepted_oid:
+        return {"state": "reused", "worktree_path": existing_path.value}
 
     run_control_plane_git_remove_existing_detached_locked_worktree(
         existing_path, cwd=project_root, project_root=project_root, deadline=deadline, scratch_root=scratch_root

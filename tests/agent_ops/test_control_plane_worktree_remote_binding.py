@@ -487,6 +487,42 @@ def test_given_verified_identity_but_dirty_when_recovered_then_fails_closed_rega
         )
 
 
+def test_given_verified_identity_same_oid_but_dirty_when_recovered_then_fails_closed(tmp_path):
+    """P0-1 regression (Issue #2197 AC5): a verified fixed worktree whose
+    HEAD already equals `accepted_oid` must still fail closed when dirty --
+    pre-fix, the same-OID reuse branch returned `state: reused` *before* the
+    cleanliness check ever ran, so this exact case (dirty, but no remote
+    advance / no OID change between recoveries) silently reused a dirty
+    working tree instead of failing closed."""
+    local, _origin, url, _oid1 = _init_remote_fixture(tmp_path)
+    scratch = tmp_path / "scratch"
+    common_dir = BOOTSTRAP._canonical_existing_git_common_dir(local, deadline_at=time.monotonic() + 5)
+
+    _ref1, accepted_oid, object_format = _bound_git(local, url, scratch)
+    created = BOOTSTRAP.recover_or_create_fixed_control_plane_worktree(
+        accepted_oid,
+        object_format,
+        project_root=str(local),
+        canonical_common_dir=common_dir,
+        deadline=_deadline(),
+        scratch_root=str(scratch),
+    )
+    assert created["state"] == "created"
+    (Path(created["worktree_path"]) / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+
+    # Same `accepted_oid` as the create above -- no remote advance, no OID
+    # change. Only the dirty working tree should matter here.
+    with pytest.raises(exec_mod.ControlPlaneUnavailable, match="fixed_worktree_dirty"):
+        BOOTSTRAP.recover_or_create_fixed_control_plane_worktree(
+            accepted_oid,
+            object_format,
+            project_root=str(local),
+            canonical_common_dir=common_dir,
+            deadline=_deadline(),
+            scratch_root=str(scratch),
+        )
+
+
 def test_given_path_occupied_outside_worktree_catalog_when_recovered_then_unknown_owner_fails_closed(tmp_path):
     local, _origin, url, _oid1 = _init_remote_fixture(tmp_path)
     scratch = tmp_path / "scratch"
@@ -647,3 +683,149 @@ def test_given_final_private_ref_cleanup_itself_fails_when_session_succeeds_work
     guard = BOOTSTRAP.acquire_control_plane_preflight_lifecycle_mutex(local, deadline_at=time.monotonic() + 2)
     guard.assert_held()
     guard.release()
+
+
+# ---------------------------------------------------------------------------
+# AC4 P0-2: a post-fetch-success cleanup failure (e.g. the trusted hooks-dir
+# removal) must never lose ownership of the nonce private ref -- the fetch
+# builder itself must own that ref's cleanup lifecycle for every terminal
+# exception path occurring *inside* the fetch call.
+# ---------------------------------------------------------------------------
+
+
+def test_given_fetch_succeeds_but_hooks_dir_cleanup_fails_when_fetched_then_private_ref_not_leaked_and_fails_closed(
+    tmp_path, monkeypatch
+):
+    local, _origin, url, _oid1 = _init_remote_fixture(tmp_path)
+    scratch = tmp_path / "scratch"
+    remote = validate_literal_remote_url(url)
+    ref = validate_allowed_remote_ref("refs/heads/main")
+    object_format = exec_mod.run_control_plane_git_repository_object_format(
+        cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=_deadline()
+    )
+
+    real_rmtree = exec_mod.shutil.rmtree
+    call_count = {"n": 0}
+
+    def flaky_rmtree(path, *args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Only the fetch call's own trusted hooks-dir cleanup fails --
+            # subsequent cleanup-path calls (read-back, CAS delete) must be
+            # able to run their own hooks-dir cleanup normally.
+            raise OSError("simulated_hooks_dir_cleanup_failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(exec_mod.shutil, "rmtree", flaky_rmtree)
+
+    with pytest.raises(exec_mod.ControlPlaneUnavailable):
+        exec_mod.run_control_plane_git_fetch_default_ref(
+            remote,
+            ref,
+            object_format=object_format,
+            cwd=str(local),
+            project_root=str(local),
+            scratch_root=str(scratch),
+            deadline=_deadline(),
+        )
+
+    assert call_count["n"] >= 2  # the fetch call's cleanup failed, but a complementary cleanup was attempted
+
+    refs = subprocess.run(
+        ["git", "-C", str(local), "for-each-ref", "refs/loop-protocol/control-plane/default-ref/"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+    assert refs.strip() == ""  # no leaked private ref despite the terminal exception
+
+
+def test_given_fetch_hooks_cleanup_fails_and_cas_cleanup_also_fails_when_fetched_then_control_plane_unavailable_chained(
+    tmp_path, monkeypatch
+):
+    """P0-2 cleanup-of-the-cleanup: when the fetch's own hooks-dir cleanup
+    fails *and* the builder-owned CAS delete attempted to compensate for it
+    also fails, existing fail-closed semantics are preserved -- a chained
+    `ControlPlaneUnavailable("...:private_ref_cleanup_failed")`, never a
+    silently swallowed exception."""
+    local, _origin, url, _oid1 = _init_remote_fixture(tmp_path)
+    scratch = tmp_path / "scratch"
+    remote = validate_literal_remote_url(url)
+    ref = validate_allowed_remote_ref("refs/heads/main")
+    object_format = exec_mod.run_control_plane_git_repository_object_format(
+        cwd=str(local), project_root=str(local), scratch_root=str(scratch), deadline=_deadline()
+    )
+
+    real_rmtree = exec_mod.shutil.rmtree
+    call_count = {"n": 0}
+
+    def flaky_rmtree(path, *args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Only the fetch call's own hooks-dir cleanup fails here -- the
+            # read-back attempted for cleanup must still be able to run its
+            # own hooks-dir cleanup, so the CAS delete (monkeypatched below)
+            # is actually reached and its own failure is what is asserted.
+            raise OSError("simulated_hooks_dir_cleanup_failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    def failing_delete(*args, **kwargs):
+        raise RuntimeError("delete_private_ref_cas_failed:simulated")
+
+    monkeypatch.setattr(exec_mod.shutil, "rmtree", flaky_rmtree)
+    monkeypatch.setattr(exec_mod, "run_control_plane_git_delete_private_ref_cas", failing_delete)
+
+    with pytest.raises(exec_mod.ControlPlaneUnavailable, match="private_ref_cleanup_failed") as excinfo:
+        exec_mod.run_control_plane_git_fetch_default_ref(
+            remote,
+            ref,
+            object_format=object_format,
+            cwd=str(local),
+            project_root=str(local),
+            scratch_root=str(scratch),
+            deadline=_deadline(),
+        )
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert "simulated" in str(excinfo.value.__cause__)
+
+
+# ---------------------------------------------------------------------------
+# AC4/AC5 P1: cleanup-class operations (CAS private-ref delete) must not be
+# denied by the very `cleanup_reserve_seconds` boundary reserved for them.
+# ---------------------------------------------------------------------------
+
+
+def test_given_deadline_exhausted_to_reserve_boundary_when_cleanup_scoped_deadline_used_then_cas_cleanup_succeeds(
+    tmp_path,
+):
+    local, _origin, url, _oid1 = _init_remote_fixture(tmp_path)
+    scratch = tmp_path / "scratch"
+    private_ref, accepted_oid, _object_format = _bound_git(local, url, scratch)
+    assert _local_private_ref_exists(local, private_ref)
+
+    # Consumed down to (past) its own `cleanup_reserve_seconds` boundary --
+    # `execution_seconds()` denies even a cleanup-class operation given this
+    # raw shared deadline (the pre-fix P1 defect: the very reserve set aside
+    # for cleanup blocks the cleanup itself).
+    exhausted = exec_mod.GitProtocolDeadline(deadline_at=time.monotonic() + 0.5, cleanup_reserve_seconds=1.0)
+    with pytest.raises(exec_mod.GitProtocolDeadlineExhausted):
+        exec_mod.run_control_plane_git_delete_private_ref_cas(
+            private_ref,
+            accepted_oid,
+            cwd=str(local),
+            project_root=str(local),
+            deadline=exhausted,
+            scratch_root=str(scratch),
+        )
+    assert _local_private_ref_exists(local, private_ref)  # not cleaned up by the denied attempt
+
+    cleanup_deadline = exec_mod._cleanup_deadline(exhausted)
+    exec_mod.run_control_plane_git_delete_private_ref_cas(
+        private_ref,
+        accepted_oid,
+        cwd=str(local),
+        project_root=str(local),
+        deadline=cleanup_deadline,
+        scratch_root=str(scratch),
+    )
+    assert not _local_private_ref_exists(local, private_ref)

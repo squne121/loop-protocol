@@ -3708,24 +3708,83 @@ def run_control_plane_git_fetch_default_ref(
     remote_url: LiteralRemoteUrl,
     remote_ref: AllowedRemoteRef,
     *,
+    object_format: RepositoryObjectFormat,
     cwd: str,
     project_root: str,
     deadline: GitProtocolDeadline,
     scratch_root: str | None = None,
 ) -> ControlPlanePrivateRef:
+    """Fetch exactly ``remote_ref`` from ``remote_url`` into a fresh nonce
+    private ref this builder allocates itself (Issue #2197 AC3/AC4).
+
+    Once ``private_ref`` is generated, this function owns that ref's own
+    cleanup lifecycle end to end for every exception raised *inside* this one
+    call -- including a genuine git-fetch failure and a post-command cleanup
+    failure. The trusted hooks-dir removal in `_execute_semantic_git`'s own
+    ``finally`` block can itself raise, and per Python's ``finally``
+    semantics that overrides the ``try`` block's return even when the
+    underlying fetch subprocess already succeeded and mutated the private
+    ref -- so this function's own caller must never learn a private ref name
+    it cannot also account for the cleanup of.
+
+    On any such exception, a best-effort read-back of ``private_ref``'s
+    current OID decides what, if anything, needs cleanup: an unreadable ref
+    (the fetch never actually completed) means there is nothing to clean up.
+    A readable ref attempts the same CAS delete already used elsewhere. The
+    exception that reaches the caller is always `ControlPlaneUnavailable`,
+    chained from the original failure when cleanup itself needed no further
+    action or succeeded, or chained from the cleanup failure (reusing the
+    same ``private_ref_cleanup_failed`` reason string convention already
+    used by `run_control_plane_remote_default_ref_binding`) when cleanup
+    itself also failed -- never silently swallowed.
+
+    This complements, and does not duplicate,
+    `run_control_plane_remote_default_ref_binding`'s own except-block CAS
+    cleanup, which only ever runs for exceptions occurring *after* this call
+    has already returned.
+    """
     remote_url = _revalidate_literal_remote_url(remote_url)
     remote_ref = _revalidate_allowed_remote_ref(remote_ref)
+    object_format = _revalidate_object_format(object_format)
     private_ref = make_control_plane_private_ref()
-    _require_success(
-        _execute_semantic_git(
-            _GitOperation("fetch_default_ref", remote_url=remote_url, remote_ref=remote_ref, private_ref=private_ref),
-            cwd=cwd,
-            project_root=project_root,
-            scratch_root=scratch_root,
-            deadline=deadline,
-        ),
-        "fetch_default_ref",
-    )
+    try:
+        _require_success(
+            _execute_semantic_git(
+                _GitOperation(
+                    "fetch_default_ref", remote_url=remote_url, remote_ref=remote_ref, private_ref=private_ref
+                ),
+                cwd=cwd,
+                project_root=project_root,
+                scratch_root=scratch_root,
+                deadline=deadline,
+            ),
+            "fetch_default_ref",
+        )
+    except BaseException as exc:
+        cleanup_deadline = _cleanup_deadline(deadline)
+        try:
+            fetched_oid = run_control_plane_git_read_private_ref_oid(
+                private_ref,
+                object_format,
+                cwd=cwd,
+                project_root=project_root,
+                deadline=cleanup_deadline,
+                scratch_root=scratch_root,
+            )
+        except BaseException:
+            raise ControlPlaneUnavailable(f"control_plane_unavailable:fetch_failed:{exc}") from exc
+        try:
+            run_control_plane_git_delete_private_ref_cas(
+                private_ref,
+                fetched_oid,
+                cwd=cwd,
+                project_root=project_root,
+                deadline=cleanup_deadline,
+                scratch_root=scratch_root,
+            )
+        except BaseException as cleanup_exc:
+            raise ControlPlaneUnavailable("control_plane_unavailable:private_ref_cleanup_failed") from cleanup_exc
+        raise ControlPlaneUnavailable(f"control_plane_unavailable:fetch_failed:{exc}") from exc
     return private_ref
 
 
@@ -3910,7 +3969,13 @@ def run_control_plane_remote_default_ref_binding(
 
     ref1, oid1 = _observe()
     private_ref = run_control_plane_git_fetch_default_ref(
-        remote_url, ref1, cwd=cwd, project_root=project_root, deadline=deadline, scratch_root=scratch_root
+        remote_url,
+        ref1,
+        object_format=object_format,
+        cwd=cwd,
+        project_root=project_root,
+        deadline=deadline,
+        scratch_root=scratch_root,
     )
     cleanup_expected_oid: RepositoryObjectId = oid1
     try:
@@ -3940,7 +4005,7 @@ def run_control_plane_remote_default_ref_binding(
                 cleanup_expected_oid,
                 cwd=cwd,
                 project_root=project_root,
-                deadline=deadline,
+                deadline=_cleanup_deadline(deadline),
                 scratch_root=scratch_root,
             )
         except BaseException as cleanup_exc:
@@ -3948,12 +4013,27 @@ def run_control_plane_remote_default_ref_binding(
         raise
 
 
-def _rollback_deadline(deadline: GitProtocolDeadline) -> GitProtocolDeadline:
-    """Bound compensation after a terminal add has consumed protocol time.
+def _cleanup_deadline(deadline: GitProtocolDeadline) -> GitProtocolDeadline:
+    """Bound compensation deadline for cleanup-class operations (Issue #2197
+    AC4/AC5 P1).
 
-    This is not a new normal-protocol deadline. It is a bounded recovery window
-    reserved solely to remove a worktree that this builder just created and to
-    prove both its path and its catalog entry are absent.
+    `GitProtocolDeadline.execution_seconds()` always denies a normal
+    operation once `remaining <= cleanup_reserve_seconds` -- that reserve
+    exists so cleanup-class operations still have something to spend. But a
+    cleanup-class operation given the *same* shared deadline is denied by
+    that very reserve boundary too, defeating the reserve's own purpose.
+    This helper gives cleanup-class operations (a detached-worktree-add
+    rollback, or a builder-owned CAS delete of a fetched private ref) their
+    own bounded lane that can actually spend (part of) the reserve that was
+    set aside for them.
+
+    This is not a new normal-protocol deadline, and it never unboundedly
+    extends the original wall-clock deadline -- it is a small, bounded
+    recovery window (a fixed multiple of the original
+    `cleanup_reserve_seconds`) reserved solely for already-scoped cleanup
+    purposes: removing a worktree this builder just created and proving both
+    its path and its catalog entry are absent, or a best-effort CAS delete of
+    a private ref this builder owns.
     """
     reserve = _validate_deadline_value(deadline.cleanup_reserve_seconds, "cleanup_reserve")
     return GitProtocolDeadline(
@@ -3978,7 +4058,7 @@ def _rollback_detached_locked_worktree(
     scratch_root: str | None,
     deadline: GitProtocolDeadline,
 ) -> None:
-    recovery_deadline = _rollback_deadline(deadline)
+    recovery_deadline = _cleanup_deadline(deadline)
     if Path(path.value).exists():
         _require_success(
             _execute_semantic_git(

@@ -183,11 +183,11 @@ def test_exact_remote_commands_and_fixed_fetch_cas_shapes(monkeypatch, tmp_path)
         ).returncode
         == 0
     )
-    private = exec_mod.run_control_plane_git_fetch_default_ref(
-        remote, ref, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
-    )
     fmt = exec_mod.run_control_plane_git_repository_object_format(
         cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
+    )
+    private = exec_mod.run_control_plane_git_fetch_default_ref(
+        remote, ref, object_format=fmt, cwd=str(tmp_path), project_root=str(tmp_path), deadline=deadline
     )
     oid = exec_mod.validate_repository_object_id("a" * 40, fmt)
     exec_mod.run_control_plane_git_delete_private_ref_cas(
@@ -224,6 +224,7 @@ def test_real_fixture_proves_observe_fetch_commit_worktree_head_and_cas(tmp_path
     private = exec_mod.run_control_plane_git_fetch_default_ref(
         remote,
         validate_allowed_remote_ref("refs/heads/main"),
+        object_format=fmt,
         cwd=str(local),
         project_root=str(local),
         scratch_root=str(scratch),
@@ -428,6 +429,7 @@ def test_forged_typed_payloads_and_global_option_injection_fail_before_spawn(mon
         lambda: exec_mod.run_control_plane_git_fetch_default_ref(
             validate_literal_remote_url("file:///tmp/origin.git"),
             exec_mod.AllowedRemoteRef("refs/tags/v1"),
+            object_format=exec_mod.RepositoryObjectFormat("sha1"),
             cwd=str(tmp_path),
             project_root=str(tmp_path),
             deadline=deadline,
@@ -1142,6 +1144,7 @@ def test_git_243_partial_clone_does_not_claim_no_lazy_support(monkeypatch, tmp_p
         exec_mod.run_control_plane_git_fetch_default_ref(
             validate_literal_remote_url(url),
             validate_allowed_remote_ref("refs/heads/main"),
+            object_format=exec_mod.RepositoryObjectFormat("sha1"),
             cwd=str(local),
             project_root=str(local),
             scratch_root=str(tmp_path / "scratch"),
@@ -1179,7 +1182,12 @@ def test_supported_fetch_uses_fixed_no_lazy_fetch_global_option(monkeypatch, tmp
 
     monkeypatch.setattr(exec_mod, "_run_closed_git_process", fake_run)
     exec_mod.run_control_plane_git_fetch_default_ref(
-        remote, ref, cwd=str(tmp_path), project_root=str(tmp_path), deadline=_deadline()
+        remote,
+        ref,
+        object_format=exec_mod.RepositoryObjectFormat("sha1"),
+        cwd=str(tmp_path),
+        project_root=str(tmp_path),
+        deadline=_deadline(),
     )
     fetch = next(args for args in argv if "fetch" in args)
     assert "--no-lazy-fetch" in fetch
