@@ -79,7 +79,12 @@ echo <text>             # stdout 出力のみ
 test -f / test -d <path>
 gh pr view <番号> --json mergeable,mergeStateStatus
 gh api repos/<owner>/<repo>/actions/runs/<run_id>/artifacts
+
+uv run --locked pytest <repo-relative target> [pytest args]
+uv run pytest <repo-relative target> [pytest args]
 ```
+
+Issue #2467 AC8: 上記 2 行は、Issue の Allowed Paths 内の repo-relative なテスト対象（例: `.claude/skills/<skill>/tests/test_*.py`）に対する narrow な pytest 実行のみを許可する。`<repo-relative target>` を省略した全体実行、リポジトリ外パス、`uv run` 経由の任意コマンド実行（`uv run python3 -c "..."` 等）、unrestricted shell execution への一般化は行わない。
 
 `bash scripts/<name>.sh` は原則読み取り専用に限る。実行前に `cat <script>` で内容を確認し、ファイル書き込み操作（`sed -i`, `tee`, `>`, `>>`）がないことを確認してから実行する。
 
