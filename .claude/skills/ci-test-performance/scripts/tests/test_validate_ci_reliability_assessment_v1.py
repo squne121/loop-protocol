@@ -206,6 +206,32 @@ def test_exact_enumeration_golden_vectors_and_newcombe_boundary():
     assert lower == pytest.approx(0.8315665290169818, abs=1e-9)
 
 
+def test_evaluate_non_inferiority_unequal_cohort_is_inconclusive():
+    # Finding 1 regression: the fixed design is equal 1:1 allocation, per-arm
+    # sample count. Both arms individually clear required_sample_count_per_arm
+    # (22), but an unbalanced cohort must never reach non_inferior/inferior.
+    before = {"numerator": 1, "denominator": 25, "rate": 1 / 25}
+    after = {"numerator": 1, "denominator": 40, "rate": 1 / 40}
+    result = validator.evaluate_non_inferiority(before, after, 22)
+    assert result == {"outcome": "inconclusive", "point_estimate": None, "ci_upper": None}
+
+
+def test_evaluate_non_inferiority_actual_power_enforcement_at_observed_n():
+    # Finding 1 regression: equal arms with denominator == the (simulated
+    # stale) required_sample_count_per_arm=20 would have proceeded straight
+    # to the Newcombe/Wilson computation under the pre-fix
+    # >= required_sample_count_per_arm-only check. exact_power_for_n(20) is
+    # below target_power=0.80, so the actual-n power gate must fail closed to
+    # inconclusive. Power is non-monotonic in n (n=21 dips even lower than
+    # n=20), so this must not assume any ordering between n=20 and n=21.
+    assert validator.exact_power_for_n(20) == pytest.approx(0.790213011479415, abs=1e-12)
+    assert validator.exact_power_for_n(21) == pytest.approx(0.7787023565542808, abs=1e-12)
+    before = {"numerator": 1, "denominator": 20, "rate": 1 / 20}
+    after = {"numerator": 1, "denominator": 20, "rate": 1 / 20}
+    result = validator.evaluate_non_inferiority(before, after, 20)
+    assert result == {"outcome": "inconclusive", "point_estimate": None, "ci_upper": None}
+
+
 @pytest.mark.parametrize(
     "mutator, code",
     [

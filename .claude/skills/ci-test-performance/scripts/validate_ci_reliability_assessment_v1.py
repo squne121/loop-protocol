@@ -226,8 +226,25 @@ def enumerate_static_power_design() -> dict[str, Any]:
 def evaluate_non_inferiority(
     before: dict[str, Any], after: dict[str, Any], required_sample_count_per_arm: int
 ) -> dict[str, Any]:
+    # Fail-closed shape reused for both insufficient-count and the two new
+    # equal-arm / actual-power gates below (see docs: "count 不足時の outcome
+    # は inconclusive" now also covers unequal cohorts and under-powered n).
+    inconclusive = {"outcome": "inconclusive", "point_estimate": None, "ci_upper": None}
     if before["denominator"] < required_sample_count_per_arm or after["denominator"] < required_sample_count_per_arm:
-        return {"outcome": "inconclusive", "point_estimate": None, "ci_upper": None}
+        return inconclusive
+    # The fixed design is equal 1:1 allocation, per-arm sample count; an
+    # unbalanced cohort never satisfies the design even if both arms
+    # individually clear required_sample_count_per_arm.
+    if before["denominator"] != after["denominator"]:
+        return inconclusive
+    n = before["denominator"]
+    design = POWER_DESIGNS[POWER_DESIGN_ID]
+    # Re-evaluate the actual achieved power at the actual observed n; power is
+    # not monotonic in n (see exact_power_for_n(20) vs exact_power_for_n(21)),
+    # so required_sample_count_per_arm alone does not guarantee target_power
+    # is met at every n that happens to exceed it.
+    if exact_power_for_n(n, design) < design["target_power"]:
+        return inconclusive
     point, ci_upper = newcombe_risk_difference_one_sided_upper(
         after["numerator"], after["denominator"], before["numerator"], before["denominator"], 0.95
     )
