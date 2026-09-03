@@ -839,29 +839,26 @@ def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",
     }
-    # Only the closed offline fixture sibling may receive its isolated gh
-    # configuration directory.  Production command environments retain their
-    # existing allowlist and PATH/trusted-executable behavior.
-    if command_id == "preflight.run.fixture.with_human_context":
+    # `GH_CONFIG_DIR` is an invocation-scoped GitHub CLI configuration path.
+    # Preserve only the finite command IDs whose actual child path reaches a
+    # GitHub CLI consumer. Do not infer a value when absent, inspect
+    # configuration contents, or widen this to prefixes, all mutation
+    # commands, or all human-context profiles.
+    gh_config_dir_carrier_command_ids = frozenset(
+        {
+            "preflight.run",
+            "contract_update.run.with_anchor",
+            "contract_update.run.with_human_context",
+            "repair_action.apply",
+            "structural_repair_action.apply",
+        }
+    )
+    if command_id in gh_config_dir_carrier_command_ids:
         allowed_keys.add("GH_CONFIG_DIR")
-    # Issue #2311 fix_delta (PR #2320 review P0-1): only the bare
-    # `preflight.run` command's first hop (`workflow_start_entry.py`) reads
-    # an invocation-scoped capability request off these three env vars as
-    # its CLI-flag fallback (the canonical bare `preflight.run` registry
-    # argv itself only ever carries `--issue-number`/`--repo` -- there is no
-    # `--spark-mode`/`--spark-fallback`/`--planned-operations-json` flag on
-    # that argv for a caller to use instead). Without this allowlist
-    # addition, a caller-declared capability request set via these env vars
-    # before invoking the canonical executor was silently dropped by this
-    # function, so `workflow_start_entry.py` always observed `None`/`None`/
-    # `[]` regardless of what the caller actually intended -- masking
-    # `unsupported_operation`/`required+forbidden` Spark blocks that should
-    # have stopped the inner preflight from ever starting. No other command
-    # id receives these three keys: sibling profiles
-    # (`preflight.run.with_anchor` / `.with_human_context` /
-    # `.with_agent_report` / `.fixture` / `.fixture.with_human_context`)
-    # first-hop into `run_refinement_preflight.py` directly and do not
-    # consume this env-based capability request at all.
+
+    # Only bare `preflight.run`'s first hop (`workflow_start_entry.py`) reads
+    # the invocation-scoped capability request. Keep this policy separate
+    # from the GitHub credential carrier policy above.
     if command_id == "preflight.run":
         allowed_keys |= {
             "LOOP_SPARK_MODE",
