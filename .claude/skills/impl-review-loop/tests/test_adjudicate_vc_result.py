@@ -911,6 +911,10 @@ def test_adapt_converts_pass_report_to_baseline_vc_preflight_shape():
             "command_hash": "sha256:" + "c" * 64,
             "raw_command": "pnpm test",
             "exit_code": 0,
+            "status": "pass",
+            "fallback_detected": False,
+            "human_review_required": False,
+            "stop_condition_triggered": False,
             "failure_keys": [],
             "raw_stdout": "",
             "raw_stderr": "",
@@ -918,6 +922,11 @@ def test_adapt_converts_pass_report_to_baseline_vc_preflight_shape():
     ]
     assert converted["fallback_detected"] is False
     assert converted["human_review_required"] is False
+    # Issue #2467 P1 review fix: payload-level identity fields must be
+    # carried through losslessly (not dropped by the adapter).
+    assert converted["issue"] == 88
+    assert converted["pr_number"] == 2312
+    assert converted["diff_head_sha"] == "a" * 40
 
 
 def test_adapt_rejects_wrong_source_schema():
