@@ -215,15 +215,22 @@ def test_ac3_unified_estimator_does_not_incorrectly_pass_35_percent_gate():
     provider_p50 = provider["p50_seconds"]
     assert provider_p50 == 90.0
 
-    # Unified (fixed) computation: both arms use nearest_rank_v1 -- this is
-    # the exact `old_p50 = _nearest_rank_percentile(old_durations, 50)`
-    # call site in test_ci_performance_gate.py after #2180.
-    unified_old_p50 = gate._nearest_rank_percentile(old_durations, 50)
+    # Unified (fixed) computation: #2180 P1 fix_delta (OWNER REQUEST_CHANGES
+    # on PR #2490, issuecomment-5532831822) -- this calls the SAME pure
+    # decision helper (`_legacy_e2e_vs_provider_relative_shortening`) that
+    # `test_ci_performance_gate.py`'s
+    # `test_p50_provider_meets_absolute_and_relative_shortening_threshold`
+    # calls at its `old_p50` site, rather than this test file reconstructing
+    # the percentile-then-ratio-then-threshold computation independently via
+    # a direct `_nearest_rank_percentile()` call. A future change to the
+    # real gate's decision function is now guaranteed to be visible here.
+    unified_shortening = gate._legacy_e2e_vs_provider_relative_shortening(old_durations, provider_p50)
+    unified_old_p50 = unified_shortening["old_p50_seconds"]
     assert unified_old_p50 == 100.0
 
-    unified_relative_shortening = (unified_old_p50 - provider_p50) / unified_old_p50
+    unified_relative_shortening = unified_shortening["relative_shortening"]
     assert unified_relative_shortening == 0.10
-    assert unified_relative_shortening < gate.RELATIVE_SHORTENING_THRESHOLD, (
+    assert not unified_shortening["meets_relative_shortening_threshold"], (
         "unified nearest_rank_v1 computation must NOT incorrectly pass the "
         "35% relative-shortening gate (#2180 AC3)"
     )
@@ -301,6 +308,51 @@ def test_ac4_p95_boundary_nearest_rank_v1_provider_critical_path_declares_estima
     assert result is not None
     assert result["p95_seconds"] == 100.0
     assert result["percentile_method"] == "nearest_rank_v1"
+
+
+# --------------------------------------------------------------------------- #
+# #2180 P1 fix_delta (OWNER REQUEST_CHANGES on PR #2490,
+# issuecomment-5532831822): AC9b gate-ready before/after non-regression
+# decision reversal regression, mirroring AC3's legacy/provider shortening
+# decision reversal above. Calls the SAME pure decision helper
+# (`_gate_ready_before_after_non_regression`) that
+# `test_ci_performance_gate.py`'s `test_p50_gate_ready_latency_not_
+# regressed` calls at its new_p50/old_p50 sites.
+# --------------------------------------------------------------------------- #
+def test_gate_ready_non_regression_decision_reversal_uses_nearest_rank_v1():
+    """GIVEN old gate-ready latencies=[100.0]*10+[200.0]*10 (even-n,
+    nearest_rank_v1 P50=100.0, statistics.median P50=150.0) AND new
+    gate-ready latencies=[120.0]*20 (P50=120.0 under either estimator) WHEN
+    the AC9b non-regression decision is computed through the real gate's
+    shared `_gate_ready_before_after_non_regression` helper THEN it
+    correctly detects a REGRESSION (120.0 > 100.0), reproducing (as a
+    regression guard) the same class of gate-decision-reversal bug AC3
+    guards against: a mixed/legacy computation using
+    `statistics.median(old_latencies) == 150.0` would have INCORRECTLY
+    reported no regression (120.0 <= 150.0), silently hiding a real
+    latency regression from the AC9b gate."""
+    old_latencies = _gate_ready_fixture_latencies([100.0] * 10 + [200.0] * 10)
+    new_latencies = _gate_ready_fixture_latencies([120.0] * 20)
+
+    non_regression = gate._gate_ready_before_after_non_regression(old_latencies, new_latencies)
+    assert non_regression["old_p50_seconds"] == 100.0
+    assert non_regression["new_p50_seconds"] == 120.0
+    assert non_regression["non_regressed"] is False, (
+        "unified nearest_rank_v1 computation must correctly DETECT the "
+        "gate-ready latency regression (#2180 P1 fix_delta)"
+    )
+
+    # Regression guard: prove the pre-#2180 mixed-estimator computation
+    # (statistics.median for the old arm) would have incorrectly hidden
+    # this exact regression.
+    legacy_mixed_old_p50 = statistics.median(old_latencies)
+    assert legacy_mixed_old_p50 == 150.0
+    legacy_mixed_non_regressed = non_regression["new_p50_seconds"] <= legacy_mixed_old_p50
+    assert legacy_mixed_non_regressed is True, (
+        "sanity check: the pre-#2180 mixed-estimator computation must "
+        "reproduce the gate-decision-reversal bug this regression test "
+        "guards against"
+    )
 
 
 # --------------------------------------------------------------------------- #

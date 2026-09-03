@@ -823,6 +823,45 @@ def _provider_critical_path_paired_p50_p95(pairs: list[tuple[object, dict, dict]
 
 
 # --------------------------------------------------------------------------- #
+# #2180 P1 fix_delta (OWNER REQUEST_CHANGES on PR #2490,
+# issuecomment-5532831822): the AC9a relative-shortening DECISION (legacy
+# pre-split `e2e` job P50 via `nearest_rank_v1`, compared against the paired
+# provider critical-path P50, against `RELATIVE_SHORTENING_THRESHOLD`) is
+# extracted into this single pure helper so that BOTH the real,
+# artifact-dependent gate test
+# (`test_p50_provider_meets_absolute_and_relative_shortening_threshold`
+# below) AND the artifact-independent golden-vector regression suite
+# (`test_ci_performance_gate_percentile_consistency.py`'s AC3) call the SAME
+# decision-producing function, rather than the golden test reconstructing
+# the percentile-then-ratio-then-threshold computation by calling
+# `_nearest_rank_percentile()` directly. A future change to this decision
+# (e.g. a different percentile, a different ratio formula, or a different
+# zero-division policy) is now guaranteed to be visible to the golden test
+# instead of silently bypassing it.
+# --------------------------------------------------------------------------- #
+def _legacy_e2e_vs_provider_relative_shortening(
+    old_durations: list[float], provider_p50_seconds: float
+) -> dict:
+    """Computes the legacy pre-split `e2e` job's `nearest_rank_v1` P50 from
+    `old_durations` (the real `_job_duration_seconds()` output) and the
+    AC9a relative-shortening ratio against `provider_p50_seconds` (the
+    already-computed paired provider critical-path P50 from
+    `_provider_critical_path_paired_p50_p95`). Returns a dict with
+    `old_p50_seconds`, `provider_p50_seconds`, `relative_shortening`, and
+    `meets_relative_shortening_threshold` (>= `RELATIVE_SHORTENING_THRESHOLD`)."""
+    old_p50_seconds = _nearest_rank_percentile(old_durations, 50)
+    relative_shortening = (
+        (old_p50_seconds - provider_p50_seconds) / old_p50_seconds if old_p50_seconds else 0.0
+    )
+    return {
+        "old_p50_seconds": old_p50_seconds,
+        "provider_p50_seconds": provider_p50_seconds,
+        "relative_shortening": relative_shortening,
+        "meets_relative_shortening_threshold": relative_shortening >= RELATIVE_SHORTENING_THRESHOLD,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # #2159 AC4 (P0-6): same-clock gate-ready latency.
 # --------------------------------------------------------------------------- #
 def _parse_iso8601(timestamp: str) -> datetime:
@@ -866,6 +905,31 @@ def _gate_ready_latency_seconds(baselines: list[dict]) -> list[float]:
         if latency is not None:
             latencies.append(latency)
     return latencies
+
+
+# --------------------------------------------------------------------------- #
+# #2180 P1 fix_delta (OWNER REQUEST_CHANGES on PR #2490,
+# issuecomment-5532831822): mirrors `_legacy_e2e_vs_provider_relative_
+# shortening` above for the AC9b gate-ready before/after DECISION (both
+# arms' same-clock `nearest_rank_v1` P50, and the non-regression judgment).
+# Shared by the real gate test
+# (`test_p50_gate_ready_latency_not_regressed` below) and the golden-vector
+# regression suite (`test_ci_performance_gate_percentile_consistency.py`),
+# so the two never silently diverge on how "non-regressed" is computed.
+# --------------------------------------------------------------------------- #
+def _gate_ready_before_after_non_regression(old_latencies: list[float], new_latencies: list[float]) -> dict:
+    """Computes both arms' same-clock gate-ready latency `nearest_rank_v1`
+    P50 (from the real `_gate_ready_latency_seconds()` output for each arm)
+    and the AC9b non-regression judgment (`new_p50_seconds <=
+    old_p50_seconds`). Returns a dict with `old_p50_seconds`,
+    `new_p50_seconds`, `non_regressed`."""
+    old_p50_seconds = _nearest_rank_percentile(old_latencies, 50)
+    new_p50_seconds = _nearest_rank_percentile(new_latencies, 50)
+    return {
+        "old_p50_seconds": old_p50_seconds,
+        "new_p50_seconds": new_p50_seconds,
+        "non_regressed": new_p50_seconds <= old_p50_seconds,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -1122,14 +1186,21 @@ def test_p50_provider_meets_absolute_and_relative_shortening_threshold():
     assert old_durations, "cohort must include real elapsed_ms measurements for the pre-split old e2e job"
 
     provider_p50 = provider["p50_seconds"]
-    # #2180 (PR #2172 OWNER adversarial review P1-2): the pre-split old `e2e`
+    # #2180 (PR #2172 OWNER adversarial review P1-2, extended by the #2180
+    # P1 fix_delta issuecomment-5532831822): the pre-split old `e2e`
     # baseline P50 must use the SAME `nearest_rank_v1` estimator as the
     # provider critical-path P50 above -- the Python stdlib's even-n median
     # (which averages the two middle values) disagrees with nearest_rank_v1
     # (which selects the 10th smallest outright for n=20), and that
-    # divergence can flip the AC9a relative-shortening gate decision below
-    # (see tests/ci/test_ci_performance_gate_percentile_consistency.py AC3).
-    old_p50 = _nearest_rank_percentile(old_durations, 50)
+    # divergence can flip the AC9a relative-shortening gate decision below.
+    # `_legacy_e2e_vs_provider_relative_shortening` is the single pure
+    # decision helper shared with
+    # tests/ci/test_ci_performance_gate_percentile_consistency.py AC3, so a
+    # future change to this decision cannot silently bypass that golden
+    # regression suite.
+    shortening = _legacy_e2e_vs_provider_relative_shortening(old_durations, provider_p50)
+    old_p50 = shortening["old_p50_seconds"]
+    relative_shortening = shortening["relative_shortening"]
 
     # AC9a absolute threshold.
     assert provider_p50 <= PROVIDER_P50_ABSOLUTE_THRESHOLD_SECONDS, (
@@ -1139,8 +1210,7 @@ def test_p50_provider_meets_absolute_and_relative_shortening_threshold():
 
     # AC9a relative shortening threshold: >= 35% shorter than the pre-split
     # old `e2e` job's critical-path P50.
-    relative_shortening = (old_p50 - provider_p50) / old_p50 if old_p50 else 0.0
-    assert relative_shortening >= RELATIVE_SHORTENING_THRESHOLD, (
+    assert shortening["meets_relative_shortening_threshold"], (
         f"provider P50={provider_p50:.1f}s vs old e2e P50={old_p50:.1f}s is only "
         f"{relative_shortening:.1%} shorter, below the "
         f"{RELATIVE_SHORTENING_THRESHOLD:.0%} relative-shortening threshold (AC9a)"
@@ -1194,17 +1264,22 @@ def test_p50_gate_ready_latency_not_regressed():
         f"even though the pre-filter baseline count was sufficient (AC9b / #2159 P0-6)"
     )
 
-    # #2180: gate-ready before/after P50 must use the same versioned
+    # #2180 (extended by the #2180 P1 fix_delta issuecomment-5532831822):
+    # gate-ready before/after P50 must use the same versioned
     # `nearest_rank_v1` estimator as every other decision-producing
-    # percentile path in this file (see the AC9a comment above and
-    # tests/ci/test_ci_performance_gate_percentile_consistency.py).
-    new_p50 = _nearest_rank_percentile(new_latencies, 50)
-    old_p50 = _nearest_rank_percentile(old_latencies, 50)
+    # percentile path in this file. `_gate_ready_before_after_non_
+    # regression` is the single pure decision helper shared with
+    # tests/ci/test_ci_performance_gate_percentile_consistency.py, so a
+    # future change to this decision cannot silently bypass that golden
+    # regression suite.
+    non_regression = _gate_ready_before_after_non_regression(old_latencies, new_latencies)
+    new_p50 = non_regression["new_p50_seconds"]
+    old_p50 = non_regression["old_p50_seconds"]
 
     # AC9b: required stable `e2e` aggregate gate-ready latency P50 must not
     # regress relative to the old `e2e` job's gate-ready latency P50,
     # measured on the SAME clock for both arms (AC4).
-    assert new_p50 <= old_p50, (
+    assert non_regression["non_regressed"], (
         f"required stable `e2e` aggregate gate-ready latency P50={new_p50:.1f}s regressed "
         f"vs old `e2e` job gate-ready latency P50={old_p50:.1f}s (AC9b)"
     )
