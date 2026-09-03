@@ -29,6 +29,7 @@ before/after の比較は、任意の 2 コミットを事後的に比較する�
 - **identity 衝突は fail-closed（PR #2182 OWNER adversarial review issuecomment-5302446086 P1 での是正）。** identity は `(workflow_run_id, job, run_attempt)` に固定される。同一 identity を持つ複数レコードは、正規化後の内容が完全にバイト一致する場合のみ「無害な重複」として扱われ、`head_sha`・`conclusion`・`artifact_id`・`artifact_digest`・`workflow_digest`・`workflow_sha`・測定値・comparability fingerprint・選択ポリシー名のいずれか 1 つでも異なれば、その `workflow_run_id` のサンプル全体が fail-closed で cohort から除外される（旧設計は `artifact_id`/`artifact_digest` のみを比較し、それ以外のフィールドの不一致は canonical JSON の `min()` で黙って一方を採用していた）。除外は `evidence_errors`（`reason: run_attempt_identity_collision`）に記録される。`run_attempt` が欠落しているレコードは、この衝突検出のグルーピングにおいてのみ attempt 1 のスロットに含められる（trusted cohort への採用可否とは独立した扱い）ため、欠落キーのレコードと明示的な `run_attempt: 1` レコードが同一 `workflow_run_id` で内容不一致の場合も衝突として検出される。
 - 採用された `run_attempt` の値と選択ポリシー識別子（`rerun_attempt_selection_policy: "initial_attempt_only_v1"`。`schemas/e2e_performance_benchmark_manifest_v1.schema.json` では既知のポリシー名のみを許容する `enum` 制約に絞られている）は、manifest の各 `RunRecord`（同スキーマの後方互換 optional field）に記録される。
 - **collector 側の live-API trusted binding は厳格化されている（PR #2182 OWNER adversarial review issuecomment-5302446086 P0-2 での是正）。** `verify_run_record_against_live_api` は `run_attempt` を trusted evidence として扱い、attempt-specific jobs API（`GET .../actions/runs/{run_id}/attempts/{attempt_number}/jobs` 相当）と突き合わせて binding する。信頼される identity タプルは `(workflow_run_id, run_attempt, job_name, workflow_run_head_sha, job_conclusion, artifact_id, artifact_name, artifact_digest)` の全要素であり、旧設計のように「attempt-specific jobs API のレスポンスに何らかの job が存在する」だけでは足りない -- 対応する job の `name` が記録の `job` と一致し、その job 自身の `head_sha` が期待コミットと一致し、`conclusion == "success"` であることを要求する。さらに artifact 自体の `name` が `.github/workflows/ci.yml` の `actions/upload-artifact` 命名規約（`ci-runtime-baseline-{job}-{run_attempt}`）と一致することも検証する。これにより、attempt 2 の artifact を attempt 1 と偽って申告する relabeling 攻撃が拒否される。ライブ API 上に対応する job/attempt が存在しない、または上記いずれかの要素が不一致の場合は fail-closed で拒否する。
+- **`measured_head_sha` / `workflow_run_head_sha` の分離後（#2184）、live-API の head SHA 照合は「期待コミット（target_sha 相当）との一致」ではなく「record 自身が申告する `workflow_run_head_sha` との自己整合性」のみを見る。** `verify_run_record_against_live_api` は `api_workflow_run.head_sha` / `api_job.head_sha` を `expected_head_sha`（測定対象コミット）とは比較せず、record の `workflow_run_head_sha`（既存 `merge_sha` フィールドから導出。#2184 AC2）と比較する。`measured_head_sha` と `workflow_run_head_sha` が異なること自体は live API 照合の失敗条件にしない（固定SHA benchmark dispatch では意図的に異なる値になる）。`workflow_run_head_sha` を導出できない pre-#2184 の record（`merge_sha` を持たない）に対しては、後方互換のため従来通り `expected_head_sha` との比較にフォールバックする。
 - **artifact 一覧取得の pagination は一貫したページサイズを使用する（PR #2182 OWNER adversarial review issuecomment-5302446086 P0-1 での是正）。** 旧実装は 1 ページ目のみ `per_page` を省略（GitHub のデフォルト値 30 が暗黙に適用される）し、2 ページ目以降だけ `per_page=100` を指定していた。GitHub の Artifacts API のページ番号はページサイズに対して相対的なため、ページサイズが 30 から 100 に途中で変わると「2 ページ目」が指す実際のスライスがずれ、artifact 31〜100 が黙ってスキップされ得た。現在は 1 ページ目から一貫して `per_page=100` を使用し、加えて次の状態を fail-closed（`LiveAPIError`）として検出する: (a) `total_count` に到達する前に空ページに到達、(b) 複数ページに跨って同一 artifact ID が重複出現、(c) 同一フェッチ内で `total_count` が途中で変化。
 
 ## ペア化 critical path（Paired critical path）統計
@@ -84,6 +85,21 @@ fingerprint フィールドが欠損しているか、`""` / `null` / `"unknown"
 - `workflow_digest`: ワークフローファイルの内容ハッシュ（`sha256sum .github/workflows/ci.yml`）。
 
 この 3 フィールドは決して混同・同一性検証の対象にしない（`workflow_sha != head_sha` は正常な状態であり、エラーではない）。
+
+## `measured_head_sha` / `workflow_run_head_sha` の分離（#2184）
+
+上記の既存 `head_sha` フィールドは、「実際に checkout・計測されたコミット」と「GitHub API 上の workflow run 自体の head SHA」という 2 つの異なる概念を単一 field に混同していた（PR #2182 OWNER adversarial review P0-4、issuecomment-5302446086）。#2184 でこの 2 概念を別 field として分離した:
+
+- `measured_head_sha`: `e2e-core` / `e2e-responsive-matrix` の「Collect ci_runtime_baseline_v1 artifact」ステップ自身が、`target_sha` の有無に関わらず独立に実行する `git rev-parse HEAD` の出力。**`workflow_dispatch` の `target_sha` input をそのままコピーした値ではない**（`target_sha` 指定時は、既存の「Verify checked-out HEAD matches dispatched target_sha」ステップが独立にこの観測値と `target_sha` の一致を検証しており、両者が一致することは producer 側の別ステップが保証する不変条件であって、collector 側が `target_sha` を代入して合成しているわけではない）。既存 `head_sha` とは独立した別概念・別値であり、両者が常に同一であるという不変条件は主張しない（`workflow_dispatch` 経由の固定SHA benchmark 実行では、`head_sha` は `github.sha`（dispatch ref のtip）に解決されるため、一般に `measured_head_sha`（= `target_sha`）とは異なる）。
+- `workflow_run_head_sha`: 既存の `ci_runtime_baseline_v1` producer が既に収集している `merge_sha`（`GH_SHA: ${{ github.sha }}`）フィールドから collector（`scripts/ci/collect_e2e_performance_benchmark.py::_derive_workflow_run_head_sha`）が導出する。producer 側に新規 env 変数・新規の `gh api` 呼び出しは追加しない。live API 照合（`verify_run_record_against_live_api`）はこの `workflow_run_head_sha` との自己整合性のみを見る（上記「rerun attempt 選択ポリシー」節末尾を参照）。
+
+固定SHA benchmark dispatch（`workflow_dispatch` + `target_sha` 指定）では、`measured_head_sha`（= `target_sha`）と `workflow_run_head_sha`（= dispatch ref のtip）は意図的に異なる値になる。一方、通常の `pull_request` トリガー実行（`target_sha` 未指定）では `measured_head_sha` は `github.sha`（`pull_request` イベントでは synthetic merge commit を指しうる）を指すため `workflow_run_head_sha` と同値になり、PR head commit を表す `head_sha`（`github.event.pull_request.head.sha`）とは異なりうる。
+
+`schemas/e2e_performance_benchmark_manifest_v1.schema.json` の `RunRecord` はこの分離を **optional field** として反映し、既存 `head_sha` は `required` のまま維持される。`measured_head_sha` / `workflow_run_head_sha` を持たない legacy record（既存 `head_sha` のみ）に対して、これらの新 field を `head_sha` から推測合成することはない。
+
+## `workflow_digest` / `workflow_sha` の既知の限界（#2422 に委ねる）
+
+`workflow_digest`（`sha256sum .github/workflows/ci.yml`）は **checkout 後の** ワークフローファイルから計算されるため、`workflow_sha`（`github.workflow_sha`、workflow 定義の commit）とは別 commit 由来になり得るという既知の限界がある（hybrid `target_sha` benchmark route に起因する構造的制約）。この限界自体の解消（固定SHA benchmark route の置換）は #2184 のスコープ外であり、#2422（本 Issue に `blocked_by` される後続 Issue）に委ねる。#2184 は SHA provenance vocabulary（`measured_head_sha` / `workflow_run_head_sha`）の確立のみを行い、hybrid route 自体は置換しない。
 
 ## `host_runner_image` の provenance 限界（追加指摘 issuecomment-5299412215）
 

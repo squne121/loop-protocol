@@ -194,6 +194,16 @@
         "rerun_attempt_selection_policy": {
           "enum": ["initial_attempt_only_v1"],
           "description": "#2179 AC3/AC4 (narrowed by #2182 fix_delta hygiene item, OWNER adversarial review issuecomment-5302446086): identifies the deterministic, order-independent policy used to select `run_attempt` for this sample. Restricted to the single currently-recognized policy name -- an unrecognized policy string is never silently accepted as if it were a known policy. Backward-compatible OPTIONAL field: manifests produced before #2179 omit it."
+        },
+        "measured_head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "#2184 AC1/AC3: the commit ACTUALLY checked out and measured, observed independently by the collecting step itself via `git rev-parse HEAD` -- never a direct copy of the `workflow_dispatch` `target_sha` input. DISTINCT from `head_sha` above, which resolves to `github.sha` (the workflow_dispatch dispatch ref's tip, NOT `target_sha`) on a fixed-SHA benchmark dispatch; the two fields are never asserted equal. Backward-compatible OPTIONAL field: a record produced before #2184 omits it, and this field is never inferred/synthesized for such a legacy record."
+        },
+        "workflow_run_head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "#2184 AC2/AC3: the head SHA of the GitHub Actions workflow run itself, derived from the raw `ci_runtime_baseline_v1` artifact's existing `merge_sha` field (`GH_SHA: ${{ github.sha }}`, unchanged by this Issue -- no new producer field is introduced for this value). Live-API verification (`verify_run_record_against_live_api`) checks this field for SELF-CONSISTENCY against `api_workflow_run.head_sha` / `api_job.head_sha`, never against `measured_head_sha`/target_sha. Backward-compatible OPTIONAL field: a record produced before #2184 omits it, and this field is never inferred/synthesized for such a legacy record."
         }
       }
     },

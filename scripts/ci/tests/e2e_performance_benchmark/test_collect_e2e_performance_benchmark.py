@@ -47,6 +47,8 @@ def _record(
     workflow_digest: str = "workflow-digest-fixture-v1",
     workflow_sha: str = WORKFLOW_SHA,
     run_attempt: int = 1,
+    measured_head_sha: str | None = None,
+    merge_sha: str | None = None,
 ) -> dict:
     # #2182 fix_delta (OWNER adversarial review issuecomment-5302446086,
     # P0-3): every fixture in this baseline test file now carries an
@@ -56,7 +58,13 @@ def _record(
     # test_collect_e2e_performance_benchmark_rerun_attempt.py's
     # `test_missing_run_attempt_excluded_from_trusted_cohort_and_reported`
     # for the dedicated regression coverage of that exclusion itself).
-    return {
+    #
+    # #2184: `measured_head_sha`/`merge_sha` are OPT-IN (default `None`,
+    # meaning the field is entirely ABSENT -- a pre-#2184 legacy-shaped
+    # record) -- pass them explicitly to construct a new-style record
+    # exercising the #2184 measured_head_sha/workflow_run_head_sha
+    # verification paths (see the dedicated `#2184` test block below).
+    record: dict = {
         "workflow_run_id": workflow_run_id,
         "job": job,
         "head_sha": head_sha,
@@ -67,6 +75,11 @@ def _record(
         "workflow_sha": workflow_sha,
         "run_attempt": run_attempt,
     }
+    if measured_head_sha is not None:
+        record["measured_head_sha"] = measured_head_sha
+    if merge_sha is not None:
+        record["merge_sha"] = merge_sha
+    return record
 
 
 def _full_job_set_records(count: int, head_sha: str, start_id: int = 1) -> list[dict]:
@@ -788,6 +801,159 @@ def test_cli_verify_against_live_api_surfaces_failures_as_evidence_errors(tmp_pa
     assert written["arms"]["before"]["jobs"]["e2e"]["run_count"] == 0
     live_failures = [e for e in written["evidence_errors"] if e["reason"] == "live_api_verification_failed"]
     assert len(live_failures) == 2
+
+
+# --------------------------------------------------------------------------- #
+# #2184 AC4: measured_head_sha / workflow_run_head_sha structural + live-API
+# self-consistency verification and manifest propagation.
+# --------------------------------------------------------------------------- #
+MEASURED_A = "1" * 40
+WORKFLOW_RUN_B = "2" * 40
+
+
+def test_ac4a_measured_and_workflow_run_head_sha_differ_and_propagate_to_manifest():
+    """GIVEN a workflow_dispatch-origin record with `measured_head_sha=A`
+    (matching the benchmark's target_sha) and `merge_sha=B` (A != B --
+    `merge_sha` mirrors the dispatch ref's own `github.sha`) WHEN
+    collected THEN the record is structurally trusted (no
+    `measured_head_sha_mismatch`) AND the resulting manifest RunRecord
+    carries BOTH `measured_head_sha` and `workflow_run_head_sha`
+    (verbatim / derived from `merge_sha`), and they DIFFER -- the
+    expected shape for a fixed-SHA benchmark dispatch (#2184 AC1
+    Outcome), never asserted equal. Live-API self-consistency is verified
+    against `workflow_run_head_sha` (B), NOT `expected_head_sha`/
+    `measured_head_sha` (A) -- proving the two concepts are checked
+    independently (AC4(i))."""
+    record = _record(
+        600,
+        job="e2e-core",
+        head_sha=WORKFLOW_RUN_B,
+        measured_head_sha=MEASURED_A,
+        merge_sha=WORKFLOW_RUN_B,
+    )
+    evidence_errors: list[dict] = []
+    result = collector._collect_arm(
+        arm_name="after",
+        commit_sha=MEASURED_A,
+        raw_records=[record],
+        job_names=("e2e-core",),
+        min_run_count=1,
+        evidence_errors=evidence_errors,
+    )
+    assert evidence_errors == []
+    run = result["jobs"]["e2e-core"]["runs"][0]
+    assert run["measured_head_sha"] == MEASURED_A
+    assert run["workflow_run_head_sha"] == WORKFLOW_RUN_B
+    assert run["measured_head_sha"] != run["workflow_run_head_sha"]
+
+    def fake_api_call(endpoint: str) -> dict:
+        if endpoint == "repos/owner/repo/actions/runs/600/artifacts?per_page=100&page=1":
+            return _fake_artifacts_response(
+                [
+                    _live_api_artifact(
+                        600, record["artifact_digest"], 600, WORKFLOW_RUN_B, name="ci-runtime-baseline-e2e-core-1"
+                    )
+                ]
+            )
+        if endpoint == "repos/owner/repo/actions/runs/600/attempts/1/jobs":
+            return {
+                "jobs": [{"run_attempt": 1, "name": "e2e-core", "head_sha": WORKFLOW_RUN_B, "conclusion": "success"}]
+            }
+        raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+    violations = collector.verify_run_record_against_live_api(record, MEASURED_A, "owner/repo", api_call=fake_api_call)
+    assert violations == []
+
+
+def test_ac4b_measured_head_sha_mismatch_fails_structural_verification():
+    """GIVEN a record whose `measured_head_sha` does NOT match the
+    benchmark's expected commit (target_sha) WHEN structurally verified
+    THEN `measured_head_sha_mismatch` is reported and the record is
+    excluded from the trusted cohort -- `head_sha` itself is never
+    compared for this record (it legitimately differs, resolving to
+    `github.sha`)."""
+    record = _record(
+        601,
+        job="e2e-core",
+        head_sha=WORKFLOW_RUN_B,
+        measured_head_sha="3" * 40,
+        merge_sha=WORKFLOW_RUN_B,
+    )
+    violations = collector._verify_run_record(record, MEASURED_A)
+    assert "measured_head_sha_mismatch" in violations
+    assert "head_sha_mismatch" not in violations
+
+
+def test_ac4c_workflow_run_head_sha_mismatch_vs_live_api_fails():
+    """GIVEN a record whose derived `workflow_run_head_sha` (from
+    `merge_sha`) does NOT match the live API's own head_sha for that
+    artifact/job WHEN verified THEN a self-consistency violation is
+    reported -- even though `measured_head_sha` correctly matches
+    `expected_head_sha`, proving the live-API check compares against
+    `workflow_run_head_sha`, never `expected_head_sha` (#2184 AC4(i))."""
+    record = _record(
+        602,
+        job="e2e-core",
+        head_sha=WORKFLOW_RUN_B,
+        measured_head_sha=MEASURED_A,
+        merge_sha=WORKFLOW_RUN_B,
+    )
+
+    def fake_api_call(endpoint: str) -> dict:
+        if endpoint == "repos/owner/repo/actions/runs/602/artifacts?per_page=100&page=1":
+            return _fake_artifacts_response(
+                [
+                    _live_api_artifact(
+                        602, record["artifact_digest"], 602, "4" * 40, name="ci-runtime-baseline-e2e-core-1"
+                    )
+                ]
+            )
+        if endpoint == "repos/owner/repo/actions/runs/602/attempts/1/jobs":
+            return {"jobs": [{"run_attempt": 1, "name": "e2e-core", "head_sha": "4" * 40, "conclusion": "success"}]}
+        raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+    violations = collector.verify_run_record_against_live_api(record, MEASURED_A, "owner/repo", api_call=fake_api_call)
+    assert any("artifact_head_sha_mismatch_vs_live_api" in v for v in violations)
+    assert any("run_attempt_job_head_sha_mismatch_vs_live_api" in v for v in violations)
+
+
+def test_ac4d_normal_execution_measured_equals_workflow_run_head_sha_passes():
+    """GIVEN normal (non-benchmark) execution records where
+    `measured_head_sha == workflow_run_head_sha` (both derived from the
+    same `github.sha` on a push/pull_request run) for BOTH `e2e-core` and
+    `e2e-responsive-matrix`, sharing the same `workflow_run_id` set, WHEN
+    collected THEN both fields are propagated identically, the after arm
+    is trusted/complete, the manifest still validates against the JSON
+    Schema, and `validate_manifest_semantics` reports no
+    `pair_set_mismatch_e2e_core_e2e_responsive_matrix` -- proving the
+    symmetric #2184 AC1 producer change preserves the existing pair-set
+    invariant (#2184 AC4 last sentence)."""
+    after_records = []
+    for i in range(20):
+        run_id = 700 + i
+        for job in ("e2e-core", "e2e-responsive-matrix"):
+            after_records.append(
+                _record(run_id, job=job, head_sha=AFTER_SHA, measured_head_sha=AFTER_SHA, merge_sha=AFTER_SHA)
+            )
+    before_records = _full_job_set_records(20, BEFORE_SHA, start_id=1)
+
+    manifest = collector.collect_benchmark_manifest(
+        BEFORE_SHA,
+        AFTER_SHA,
+        before_records,
+        after_records,
+        before_job_names=("e2e",),
+        after_job_names=("e2e-core", "e2e-responsive-matrix"),
+    )
+    assert manifest["arms"]["after"]["complete"] is True
+    for job in ("e2e-core", "e2e-responsive-matrix"):
+        for run in manifest["arms"]["after"]["jobs"][job]["runs"]:
+            assert run["measured_head_sha"] == AFTER_SHA
+            assert run["workflow_run_head_sha"] == AFTER_SHA
+
+    collector._validate_against_schema(manifest)
+    violations = collector.validate_manifest_semantics(manifest)
+    assert not any("pair_set_mismatch" in v for v in violations)
 
 
 # --------------------------------------------------------------------------- #

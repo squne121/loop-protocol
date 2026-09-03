@@ -938,13 +938,28 @@ jobs:
           PNPM_VERSION_RAW: ""
           LOCKFILE_HASH_RAW: ""
           WORKFLOW_DIGEST_RAW: ""
+          # #2184 AC1: `measured_head_sha` (distinct from `head_sha`
+          # above, which resolves to `github.sha` -- the workflow_dispatch
+          # ref tip -- on a fixed-SHA benchmark dispatch, NOT `target_sha`).
+          # Populated below via an independent `git rev-parse HEAD`,
+          # regardless of whether `target_sha` was provided, never a
+          # direct copy of the `target_sha` input itself. See
+          # docs/dev/e2e-performance-benchmark.md.
+          GH_MEASURED_HEAD_SHA: ""
         run: |
           mkdir -p ci_runtime_baseline_artifacts
           NODE_VERSION_RAW="$(node -v 2>/dev/null || echo unknown)"
           PNPM_VERSION_RAW="$(pnpm -v 2>/dev/null || echo unknown)"
           LOCKFILE_HASH_RAW="sha256:$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
           WORKFLOW_DIGEST_RAW="sha256:$(sha256sum .github/workflows/ci.yml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
-          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW
+          # #2184 AC1: independent observation of the checked-out commit --
+          # NEVER the `target_sha` input verbatim. On a `target_sha`
+          # dispatch, the "Verify checked-out HEAD matches dispatched
+          # target_sha" step above already hard-fails the job if this
+          # would disagree with `target_sha`; on a normal (non-benchmark)
+          # run, this simply reflects the actual checked-out commit.
+          GH_MEASURED_HEAD_SHA="$(git rev-parse HEAD)"
+          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW GH_MEASURED_HEAD_SHA
           python3 - <<'PY'
           import json, os, pathlib
           fingerprint_fields = {
@@ -977,6 +992,13 @@ jobs:
               # `actions/checkout` `ref:` override to `target_sha`). Recorded
               # as an independent field -- never conflated with `head_sha`.
               "workflow_sha": os.environ.get("GH_WORKFLOW_SHA", "unknown"),
+              # #2184 AC1: the MEASURED application code's commit, observed
+              # independently via `git rev-parse HEAD` in this step (never a
+              # direct copy of the `target_sha` dispatch input). Distinct
+              # from `head_sha` above (which resolves to `github.sha` --
+              # the dispatch ref tip -- on a fixed-SHA benchmark dispatch)
+              # and from `workflow_sha` (the workflow DEFINITION's commit).
+              "measured_head_sha": os.environ.get("GH_MEASURED_HEAD_SHA", "unknown"),
           }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
@@ -1639,13 +1661,28 @@ jobs:
           PNPM_VERSION_RAW: ""
           LOCKFILE_HASH_RAW: ""
           WORKFLOW_DIGEST_RAW: ""
+          # #2184 AC1: `measured_head_sha` (distinct from `head_sha`
+          # above, which resolves to `github.sha` -- the workflow_dispatch
+          # ref tip -- on a fixed-SHA benchmark dispatch, NOT `target_sha`).
+          # Populated below via an independent `git rev-parse HEAD`,
+          # regardless of whether `target_sha` was provided, never a
+          # direct copy of the `target_sha` input itself. See
+          # docs/dev/e2e-performance-benchmark.md.
+          GH_MEASURED_HEAD_SHA: ""
         run: |
           mkdir -p ci_runtime_baseline_artifacts
           NODE_VERSION_RAW="$(node -v 2>/dev/null || echo unknown)"
           PNPM_VERSION_RAW="$(pnpm -v 2>/dev/null || echo unknown)"
           LOCKFILE_HASH_RAW="sha256:$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
           WORKFLOW_DIGEST_RAW="sha256:$(sha256sum .github/workflows/ci.yml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
-          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW
+          # #2184 AC1: independent observation of the checked-out commit --
+          # NEVER the `target_sha` input verbatim. On a `target_sha`
+          # dispatch, the "Verify checked-out HEAD matches dispatched
+          # target_sha" step above already hard-fails the job if this
+          # would disagree with `target_sha`; on a normal (non-benchmark)
+          # run, this simply reflects the actual checked-out commit.
+          GH_MEASURED_HEAD_SHA="$(git rev-parse HEAD)"
+          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW GH_MEASURED_HEAD_SHA
           python3 - <<'PY'
           import json, os, pathlib
           fingerprint_fields = {
@@ -1678,6 +1715,13 @@ jobs:
               # `actions/checkout` `ref:` override to `target_sha`). Recorded
               # as an independent field -- never conflated with `head_sha`.
               "workflow_sha": os.environ.get("GH_WORKFLOW_SHA", "unknown"),
+              # #2184 AC1: the MEASURED application code's commit, observed
+              # independently via `git rev-parse HEAD` in this step (never a
+              # direct copy of the `target_sha` dispatch input). Distinct
+              # from `head_sha` above (which resolves to `github.sha` --
+              # the dispatch ref tip -- on a fixed-SHA benchmark dispatch)
+              # and from `workflow_sha` (the workflow DEFINITION's commit).
+              "measured_head_sha": os.environ.get("GH_MEASURED_HEAD_SHA", "unknown"),
           }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
