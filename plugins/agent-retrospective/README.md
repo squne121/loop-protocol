@@ -1,7 +1,14 @@
 # agent-retrospective（plugin 配布版）
 
-継続的 retrospective の proposal-only orchestrator を、`.claude/` を持たない任意の repository でも
-`claude --plugin-dir` 経由で実行可能にする、self-contained な Claude Code plugin distribution。
+人間の明示トリガーで起動する単発実行（one-shot）の proposal-only orchestrator を、`.claude/` を
+持たない任意の repository でも `claude --plugin-dir` 経由で実行可能にする、self-contained な
+Claude Code plugin distribution。1 回の起動につき 1 回だけ evidence 収集・評価・提案生成を行い、
+起動間で状態を持ち越さない。plugin 版と project Skill 版の本質的な差は liveness ではなく
+persistence である -- project Skill 版も人間の明示トリガーでのみ起動するものであり、常駐 daemon や
+background loop として稼働し続けるわけではない。両版の違いは、plugin 版の previous-state backend が
+fixture-only（`STATE_BACKEND_CHOICES = ("fixture",)`）であり、fixture にヒットしない限り毎回
+`no_history から開始` する点にある -- project Skill 版が持つ persistent cross-run state / delta
+tracking を plugin 版は提供しない（詳細は下記「インストールと起動」節末尾を参照）。
 
 `.claude/skills/agent-retrospective/`（loop-protocol の project Skill 版）のポータブル版であり、
 project Skill 本体はこの plugin では変更していない（Issue #2240 Out of Scope）。project Skill 版が
@@ -38,9 +45,16 @@ plugins/agent-retrospective/
 claude --plugin-dir /path/to/plugins/agent-retrospective
 ```
 
-起動後、plugin 内の Skill は namespaced invocation `/agent-retrospective:run` で明示起動する
-（`disable-model-invocation: true` のため自動起動しない）。実行本体は単一の Bash 呼び出しで
-`skills/run/scripts/run_retrospective.py` を起動する（詳細は `skills/run/SKILL.md` を参照）。
+起動後、plugin 内の Skill は namespaced invocation `/agent-retrospective:run <task text>` で明示起動
+する（`disable-model-invocation: true` のため自動起動しない）。**この標準呼び出しにおいて
+`$ARGUMENTS`（`/agent-retrospective:run` の後ろに入力した文字列）は task text としてのみ扱われる**
+-- 実行本体は単一の Bash 呼び出しで `skills/run/scripts/run_retrospective.py` を起動し
+（詳細は `skills/run/SKILL.md` を参照）、この Bash 呼び出しは `$ARGUMENTS` 全体をそのまま
+`--task "$ARGUMENTS"` へ機械転送するだけである。`$ARGUMENTS` を再解析して他の CLI option（後述の
+`--repository-id`/`--runtime-evidence-file`/`--target-issue` 等）へブリッジする経路は存在しない
+-- 例えば `/agent-retrospective:run --runtime-evidence-file /tmp/x` と入力しても、これは
+`--runtime-evidence-file /tmp/x` という文字列がそのまま task text（`--task` の値）として渡される
+だけであり、`run_retrospective.py --runtime-evidence-file /tmp/x` という CLI 呼び出しにはならない。
 
 ```bash
 UV_PROJECT_ENVIRONMENT="${CLAUDE_PLUGIN_DATA}/venv" \
@@ -51,6 +65,11 @@ uv run --project "${CLAUDE_PLUGIN_ROOT}" --locked python3 \
   --state-backend fixture \
   --task "$ARGUMENTS"
 ```
+
+上記が標準呼び出しの実体である。`--repository-id`/`--target-issue`/`--request-id`/
+`--idempotency-key`/`--runtime-evidence-file`/`--schema-dir` 等は渡されておらず、標準経路では常に
+自動導出・既定値のみで実行される -- これらは `run_retrospective.py` 自身が持つ、標準 Skill 起動の
+外側にある lower-level CLI option である（下記参照）。
 
 - `${CLAUDE_PLUGIN_ROOT}`: この plugin 自身のインストール先（bundled asset -- スクリプト・schema・
   Agent 定義 -- の解決に使う）
@@ -63,12 +82,31 @@ uv run --project "${CLAUDE_PLUGIN_ROOT}" --locked python3 \
   run-scoped temp dir へのみ書き込み、run 終了時に必ず削除する（proposal-only、永続 retrospective
   artifact はここには書き込まない）
 
+### advanced / lower-level interface（`run_retrospective.py` の直接起動）
+
+`--repository-id`・`--runtime-evidence-file`・`--target-issue`・`--request-id`・
+`--idempotency-key`・`--base-ref`・`--schema-dir` は、標準 `/agent-retrospective:run` 呼び出し
+（`$ARGUMENTS` を `--task` へ機械転送するだけの経路）からは指定できない、`run_retrospective.py`
+自身が持つ CLI option である。これらを使いたい場合は、標準 Skill 起動を使わず、呼び出し元シェルから
+上記と同じ `uv run --project ... run_retrospective.py ...` コマンドを直接実行し、必要な option を
+追加する（advanced / lower-level interface）。
+
 `uv` が必須（Python 3.12+ は `uv` 自身が解決する）。初回実行時に依存解決（`jsonschema` の sync）が
-走る。`--repository-id`（省略時は `git remote get-url origin` から自動導出）・`--target-issue`
-（省略時は issue-less run）・`--request-id`/`--idempotency-key`（省略時は UUID 自動生成）は
-すべて任意である。`--task`（省略時は非空の既定 task へフォールバックする。Issue #2240 fix_delta
-P0-1）・`--runtime-evidence-file`（明示指定した場合のみ `retrospective-runtime-observer` を
-起動する。Issue #2240 fix_delta P0-1(d)）も参照。詳細は `skills/run/SKILL.md` の手順書を正本とする。
+走る。`--repository-id`（省略時は `git remote get-url origin` から自動導出。導出できない場合は
+`repository_id_unresolved` として失敗する -- `local/<slug>-<short-sha>` のような fallback 実装は
+現在存在しない。**標準 `/agent-retrospective:run` 起動には `--repository-id` を補う経路が存在しない
+ため、origin remote を持たない repository では標準呼び出しは常に `repository_id_unresolved` で
+失敗する -- この場合は上記の advanced interface で `--repository-id` を明示指定する必要がある**）
+・`--target-issue`（省略時は issue-less run）・`--request-id`/`--idempotency-key`
+（省略時は UUID 自動生成）はすべて任意である。`--task`（省略時は非空の既定 task へフォールバックする。
+Issue #2240 fix_delta P0-1）・`--runtime-evidence-file`（明示指定した場合のみ
+`retrospective-runtime-observer` を起動する。標準 `/agent-retrospective:run` 呼び出しからは指定
+不能であり、advanced interface からの直接起動でのみ指定できる。Issue #2240 fix_delta P0-1(d)）も
+参照。詳細は `skills/run/SKILL.md` の手順書を正本とする。
+
+previous-state backend は `FixturePreviousStateProvider`（`--state-backend fixture`）のみであり、
+fixture にヒットしない限り毎回 `no_history から開始` する（real な永続 cross-run delta tracking は
+未実装である）。
 
 ## Plugin Agent frontmatter の未対応フィールド
 
