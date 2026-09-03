@@ -187,7 +187,16 @@ def test_resolved_executable_is_single_path_shared_by_version_capture_and_invoca
     invocation), and proves both markers were written by *this one*
     on-disk file via ``resolved_executable_sha256`` matching that file's
     own content digest -- independent, non-self-reported evidence that a
-    single resolved executable served both roles."""
+    single resolved executable served both roles.
+
+    Scope note (Issue #2421 fix-delta): this is a regression check for the
+    once-resolved-path invariant above -- it proves the *same on-disk file*
+    (by content digest, captured once at resolution time) was used for
+    both version capture and invocation. It does NOT guarantee that the
+    executable's bytes/inode were not replaced on disk *during* the
+    runtime window between resolution and invocation (a TOCTOU
+    substitution race); no FD pinning, signing, or attestation is
+    performed here or by the implementation under test."""
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

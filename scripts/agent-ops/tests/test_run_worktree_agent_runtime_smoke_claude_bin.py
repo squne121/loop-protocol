@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 import stat
 import subprocess
@@ -157,11 +158,13 @@ def test_claude_bin_absolute_path_bypasses_path_resolution(repo_with_worktree, t
 
     prompt = _prompt_file(tmp_path)
     out_dir = tmp_path / "out"
+    evidence_json_path = tmp_path / "evidence.json"
     result = _run(
         repo, worktree,
         "--runtime", "claude", "--mode", "structured",
         "--prompt-file", str(prompt), "--output-dir", str(out_dir),
         "--claude-bin", str(override_bin),
+        "--evidence-json", str(evidence_json_path),
         fake_bin_dir=decoy_bin,
     )
     assert result.returncode == 0, result.stderr
@@ -176,6 +179,14 @@ def test_claude_bin_absolute_path_bypasses_path_resolution(repo_with_worktree, t
     assert _summary_field(summary, "resolved_executable") == "<redacted>"
     expected_sha256 = hashlib.sha256(Path(override_bin).read_bytes()).hexdigest()
     assert _summary_field(summary, "resolved_executable_sha256") == expected_sha256
+
+    # Issue #2421 P1 fix-delta: the same redaction invariant must hold for
+    # the machine-generated --evidence-json surface, not just summary.md.
+    # Parse the JSON directly (never regex/substring-match it) so the
+    # assertion is against the actual persisted field values.
+    evidence = json.loads(evidence_json_path.read_text(encoding="utf-8"))
+    assert evidence["resolved_executable"] == "<redacted>"
+    assert evidence["resolved_executable_sha256"] == expected_sha256
 
 
 def test_claude_bin_nonexecutable_path_is_skip_not_crash(repo_with_worktree, tmp_path):
