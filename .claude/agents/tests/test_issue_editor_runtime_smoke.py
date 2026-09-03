@@ -37,6 +37,8 @@ unavailable runtime/capability is SKIP (exit 77), never promoted to PASS.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import os
 import subprocess
 import sys
@@ -52,6 +54,28 @@ RUNNER = REPO_ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke
 _CANDIDATE_WORKTREE_ENV_VAR = "RUNTIME_SMOKE_CANDIDATE_WORKTREE"
 
 EXPECT_MARKER = "RUNTIME_SMOKE_ISSUE_EDITOR_READ_OK"
+
+_PERMISSION_CANARY_OPT_IN_ENV_VAR = "CLAUDE_GPT_ISSUE_EDITOR_PERMISSION_CANARY"
+_PERMISSION_CANARY_MARKER = "ISSUE_EDITOR_PERMISSION_CANARY_ENTRYPOINT_REACHED"
+_PERMISSION_CANARY_INPUT = ".claude/agents/tests/test_issue_editor_runtime_smoke.py"
+_PERMISSION_CANARY_COMMAND = (
+    "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+    f"--input-file {_PERMISSION_CANARY_INPUT}"
+)
+CLAUDE_GPT_LAUNCHER = REPO_ROOT / "scripts" / "claude-gpt" / "launch.sh"
+AUTO_MODE_CANARY = REPO_ROOT / "scripts" / "claude-gpt" / "auto_mode_canary.py"
+
+
+def _load_auto_mode_canary():
+    spec = importlib.util.spec_from_file_location("issue_editor_auto_mode_canary", AUTO_MODE_CANARY)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+auto_mode_canary = _load_auto_mode_canary()
 
 PROMPT = f"""You are running as a bounded, non-interactive runtime smoke check.
 
@@ -158,3 +182,126 @@ def test_canonical_skill_read_smoke():
         # capability confirmed available and successfully exercised).
         assert "main_agent_identity" in summary_text
         assert "skill_evidence" in summary_text
+
+
+def _digest_runtime_output(stdout: str, stderr: str) -> str:
+    """Return a diagnostic that cannot disclose runtime transcript content."""
+    return hashlib.sha256((stdout + "\n" + stderr).encode("utf-8")).hexdigest()[:16]
+
+
+def _stream_json_has_tool_use(stdout: str, tool_name: str, **input_values: object) -> bool:
+    """Inspect structured runtime events in memory without persisting them."""
+    import json
+
+    def walk(node: object) -> bool:
+        if isinstance(node, dict):
+            tool_input = node.get("input")
+            if node.get("name") == tool_name and isinstance(tool_input, dict):
+                if all(tool_input.get(key) == value for key, value in input_values.items()):
+                    return True
+            return any(walk(value) for value in node.values())
+        if isinstance(node, list):
+            return any(walk(value) for value in node)
+        return False
+
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if walk(event):
+            return True
+    return False
+
+
+def test_claude_gpt_auto_issue_editor_permission_request_canary():
+    """AC3: real Auto parent -> issue-editor -> canonical Bash -> helper entrypoint.
+
+    This external-runtime lane is deliberately opt-in and never writes a
+    transcript or credential/config material.  Its input is an existing Python
+    test source, so the helper must reject JSON parsing before any GitHub
+    operation; seeing ``failed_no_mutation`` is the entrypoint observation.
+    """
+    worktree = _resolve_candidate_worktree()
+    if worktree is None:
+        pytest.skip(
+            f"real Auto lane requires {_CANDIDATE_WORKTREE_ENV_VAR} to point at "
+            "the explicit linked worktree"
+        )
+    if os.environ.get(_PERMISSION_CANARY_OPT_IN_ENV_VAR) != "1":
+        pytest.skip(
+            f"real Claude-GPT Auto lane requires explicit {_PERMISSION_CANARY_OPT_IN_ENV_VAR}=1"
+        )
+    if not CLAUDE_GPT_LAUNCHER.is_file():
+        pytest.skip("Claude-GPT launcher is unavailable")
+
+    child_prompt = f"""You are the issue-editor child in a bounded, non-interactive permission canary.
+
+Use the Bash tool exactly once with this exact command and no shell operators:
+{_PERMISSION_CANARY_COMMAND}
+
+The input is intentionally not JSON. Confirm the helper's failed_no_mutation
+result, then output exactly this marker and nothing else:
+{_PERMISSION_CANARY_MARKER}
+
+Do not edit files, invoke gh, inspect credentials/configuration, delegate, or
+attempt any fallback or direct invocation."""
+    prompt = f"""You are the bounded, non-interactive Claude-GPT Auto parent for a permission canary.
+
+Use the Agent tool exactly once to delegate to subagent_type `issue-editor`.
+Pass the following child instructions verbatim:
+
+--- CHILD INSTRUCTIONS BEGIN ---
+{child_prompt}
+--- CHILD INSTRUCTIONS END ---
+
+Do not use Bash, invoke gh, inspect credentials/configuration, edit files, or
+attempt a fallback/direct execution yourself. After the child returns its exact
+marker, output exactly this marker and nothing else:
+{_PERMISSION_CANARY_MARKER}"""
+    try:
+        result = subprocess.run(
+            [
+                str(CLAUDE_GPT_LAUNCHER),
+                "--",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "-p",
+                prompt,
+            ],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=360,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        # Aligned with auto_mode_canary.py::run_issue_editor_permission_request_canary()
+        # (fail_reason="claude_gpt_auto_runtime_timeout"): a hang is not
+        # "capability unavailable" and must not be masked as SKIP.
+        pytest.fail("Claude-GPT Auto runtime timed out (claude_gpt_auto_runtime_timeout)")
+
+    output_digest = _digest_runtime_output(result.stdout, result.stderr)
+    if result.returncode == 8:
+        # Aligned with auto_mode_canary.py (fail_reason="claude_gpt_auto_mode_readback_failed"):
+        # a readback failure is a real defect, not an unavailable-capability SKIP.
+        pytest.fail(
+            "Claude-GPT Auto readback failed (claude_gpt_auto_mode_readback_failed, "
+            f"launcher exit {result.returncode}, digest={output_digest})"
+        )
+    if result.returncode in (3, 4, 7):
+        pytest.skip(f"Claude-GPT Auto capability unavailable (launcher exit {result.returncode}, digest={output_digest})")
+
+    assert result.returncode == 0, f"Auto canary failed (exit={result.returncode}, digest={output_digest})"
+    # stream-json is inspected in memory only; tests never save the raw output.
+    assert _stream_json_has_tool_use(result.stdout, "Agent", subagent_type="issue-editor"), (
+        f"parent-to-issue-editor delegation missing (digest={output_digest})"
+    )
+    permission_evidence = auto_mode_canary._stream_json_issue_editor_permission_evidence(result.stdout)
+    assert permission_evidence == {
+        "canonical_bash_observed": True,
+        "canonical_bash_result_bound": True,
+        "helper_entrypoint_observed": True,
+        "marker_observed": True,
+    }, f"canonical Bash/result/marker evidence incomplete (digest={output_digest})"
