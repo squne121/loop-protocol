@@ -49,6 +49,17 @@ pair の一方が欠損している `workflow_run_id`（例: `e2e-core` は成�
 
 P50/P95 の算出には 1-indexed nearest-rank 法（`rank = ceil(percentile/100 * n)`、ソート済みサンプルの `rank` 番目の値）を使う。この method 名はバージョン管理された識別子であり、`tests/ci/test_ci_performance_gate.py::_nearest_rank_percentile` と `.claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py::_nearest_rank_percentile` の両方で同一のセマンティクスを持つ（Allowed Paths の境界上、実装は複製されているが method 名とアルゴリズムは共通）。
 
+**全 decision-producing percentile path が `nearest_rank_v1` に統一されている（#2180、PR #2172 OWNER adversarial review 由来の deferred finding P1-2 の是正）。** 統一前は provider critical-path（post-split `e2e-core` / `e2e-responsive-matrix`）と validator の assessment builder は既に `nearest_rank_v1` を使っていたが、pre-split の旧 `e2e`（before）baseline P50 と gate-ready の before/after P50 は Python 標準ライブラリの偶数件平均型 median を使っており、n=20 のような偶数サンプルサイズで両者は異なりうる不整合があった（`tests/ci/test_ci_performance_gate.py::old_p50` / `test_p50_gate_ready_latency_not_regressed`）。この不整合は AC9a の 35% relative shortening gate の判定を反転させ得た。現在は上記 4 経路すべてが同一の `_nearest_rank_percentile()` を呼び出しており、`tests/ci/test_ci_performance_gate_percentile_consistency.py` の決定論的 golden vector regression test（even-n P50 divergence、35% gate decision reversal regression、P95 boundary、gate/validator semantic parity）でこの一致が固定されている。
+
+## `_job_duration_seconds()` の計測スコープ（`test_e2e*` phase sum のみ、#2180 AC5）
+
+`tests/ci/test_ci_performance_gate.py::_job_duration_seconds()` は、`ci_runtime_baseline_v1` の `measurements[]` のうち `phase_id.startswith("test_e2e")` を満たす phase の `elapsed_ms` のみを合算する test-execution metric として **意図的に固定** されている。install / build / container-startup / artifact-processing 等、job 全体の `started_at`/`completed_at` wall-clock span に含まれるがテスト実行そのものではない時間は、この関数のスコープに含まれない（#2180 Out of Scope: `_job_duration_seconds()` を job 全体の wall-clock span へ broaden することは行わない）。
+
+この除外は測定対象イベントの縮小ではなく、既存の 2 指標が互いに補完する形で役割分担しているためである。
+
+- provider の `test_e2e*` 実行時間 critical path（`_job_duration_seconds()` が担当。テストそのものの実行時間のみ）。
+- workflow 開始から aggregate check completion までの gate-ready latency（`_gate_ready_latency_seconds_same_clock()` が担当。install/build/container-startup を含む end-to-end 待ち時間全体）。
+
 ## Gate-ready latency: 同一時計
 
 before/after の gate-ready latency は、両アームとも GitHub API の同一時計（`workflow_run.run_started_at` を起点、対応する check run の `completed_at` を終点）から計算する（`tests/ci/test_ci_performance_gate.py::_gate_ready_latency_seconds_same_clock`）。旧設計は before 側を `measurements.jsonl` の手動合算、after 側を GitHub API という異なる時計で測定しており、apples-to-oranges 比較になっていた。
@@ -93,7 +104,9 @@ fingerprint フィールドが欠損しているか、`""` / `null` / `"unknown"
 
 ## `CI_TEST_PERFORMANCE_ASSESSMENT_V2` の percentile 再計算（AC8）
 
-`validate_ci_performance_assessment_v2.py` は、`runtime_delta.<cohort>.run_details[].duration_seconds` の raw sample が存在する場合、それらから `nearest_rank_v1` で P50/P95 を再計算し、cohort の自己申告 `p50_seconds` / `p95_seconds` と照合する（`percentile_recomputation_mismatch_p50` / `percentile_recomputation_mismatch_p95`）。`run_details` は `schemas/ci_runtime_delta_v2.schema.json` 上 optional であり、存在しない場合はこのチェックをスキップする（後方互換）。
+`validate_ci_performance_assessment_v2.py` は、`runtime_delta.<cohort>.run_details[].duration_seconds` の raw sample から `nearest_rank_v1` で P50/P95 を再計算し、cohort の自己申告 `p50_seconds` / `p95_seconds` と照合する（`percentile_recomputation_mismatch_p50` / `percentile_recomputation_mismatch_p95`）。
+
+`run_details` は `schemas/ci_runtime_delta_v2.schema.json` 上のキー自体は optional のままだが、**`performance_evidence.status == "complete"` かつ `claim.kind != "none"`（no-op smoke-test ではない実 performance claim）の場合は必須（required）**であり、欠落した場合は `run_details_required_for_complete_non_none_claim_but_missing` blocker で fail-closed になる（P0-7: producer が `run_details` を省略して recomputation を回避することを防ぐため）。この required-when-claim 契約が満たされない場合、percentile 再計算はスキップされるのではなく、assessment 自体が `approval_eligible` にならない。後方互換が残るのは `claim.kind == "none"` の no-op smoke-test producer artifact のみである（#2159 P0-8、#2180 AC6 でこの記述をこの required-when-claim 実装契約と同期）。
 
 ## `CI_TEST_PERFORMANCE_ASSESSMENT_V2` producer の配線（結線, wiring, AC10）
 

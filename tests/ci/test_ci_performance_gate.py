@@ -76,7 +76,6 @@ import json
 import math
 import os
 import pathlib
-import statistics
 from datetime import datetime
 
 import pytest
@@ -1123,7 +1122,14 @@ def test_p50_provider_meets_absolute_and_relative_shortening_threshold():
     assert old_durations, "cohort must include real elapsed_ms measurements for the pre-split old e2e job"
 
     provider_p50 = provider["p50_seconds"]
-    old_p50 = statistics.median(old_durations)
+    # #2180 (PR #2172 OWNER adversarial review P1-2): the pre-split old `e2e`
+    # baseline P50 must use the SAME `nearest_rank_v1` estimator as the
+    # provider critical-path P50 above -- the Python stdlib's even-n median
+    # (which averages the two middle values) disagrees with nearest_rank_v1
+    # (which selects the 10th smallest outright for n=20), and that
+    # divergence can flip the AC9a relative-shortening gate decision below
+    # (see tests/ci/test_ci_performance_gate_percentile_consistency.py AC3).
+    old_p50 = _nearest_rank_percentile(old_durations, 50)
 
     # AC9a absolute threshold.
     assert provider_p50 <= PROVIDER_P50_ABSOLUTE_THRESHOLD_SECONDS, (
@@ -1188,8 +1194,12 @@ def test_p50_gate_ready_latency_not_regressed():
         f"even though the pre-filter baseline count was sufficient (AC9b / #2159 P0-6)"
     )
 
-    new_p50 = statistics.median(new_latencies)
-    old_p50 = statistics.median(old_latencies)
+    # #2180: gate-ready before/after P50 must use the same versioned
+    # `nearest_rank_v1` estimator as every other decision-producing
+    # percentile path in this file (see the AC9a comment above and
+    # tests/ci/test_ci_performance_gate_percentile_consistency.py).
+    new_p50 = _nearest_rank_percentile(new_latencies, 50)
+    old_p50 = _nearest_rank_percentile(old_latencies, 50)
 
     # AC9b: required stable `e2e` aggregate gate-ready latency P50 must not
     # regress relative to the old `e2e` job's gate-ready latency P50,

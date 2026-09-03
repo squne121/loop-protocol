@@ -191,7 +191,7 @@
     },
     "RunDetail": {
       "type": "object",
-      "description": "Per-run raw evidence. Structurally defined but currently unreferenced by the semantic validator (validate_ci_performance_assessment_v2.py does not read run_details or duration_seconds); it is an optional field not listed in Cohort.required. Recomputing P50/P95/delta from these raw samples is a possible future validator extension, not a current enforcement guarantee.",
+      "description": "Per-run raw evidence, consumed by the semantic validator (validate_ci_performance_assessment_v2.py) to recompute nearest_rank_v1 P50/P95 from duration_seconds and cross-check against the cohort's self-reported p50_seconds/p95_seconds. Still not listed in Cohort.required at the schema level (the key itself remains structurally optional), but the validator enforces it as REQUIRED whenever `performance_evidence.status == \"complete\"` && `claim.kind != \"none\"` (a real, non-smoke-test performance claim) -- omitting run_details in that case is a fail-closed blocker (run_details_required_for_complete_non_none_claim_but_missing), not a silently skipped check. Backward compatibility (run_details optional in practice) is preserved only for `claim.kind == \"none\"` no-op smoke-test artifacts.",
       "required": [
         "run_id",
         "workflow_run_id",
