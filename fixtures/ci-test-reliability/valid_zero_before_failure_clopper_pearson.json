@@ -1,43 +1,43 @@
 {
   "schema": "CI_TEST_RELIABILITY_ASSESSMENT_V1",
   "schema_version": 1,
-  "issue_number": 2170,
+  "issue_number": 2432,
   "pr_number": null,
-  "measured_at": "2026-08-14T00:00:00Z",
+  "measured_at": "2026-08-31T00:00:00Z",
   "target_metric": "workflow_failure_rate",
   "reliability_metrics": {
     "before": {
       "workflow_failure_rate": {
         "numerator": 0,
-        "denominator": 20,
+        "denominator": 22,
         "rate": 0.0
       },
       "playwright_flaky_test_rate": {
         "numerator": 1,
-        "denominator": 10,
-        "rate": 0.1
+        "denominator": 22,
+        "rate": 0.045454545454545456
       },
       "playwright_terminal_failure_rate": {
         "numerator": 1,
-        "denominator": 10,
-        "rate": 0.1
+        "denominator": 22,
+        "rate": 0.045454545454545456
       }
     },
     "after": {
       "workflow_failure_rate": {
         "numerator": 1,
-        "denominator": 25,
-        "rate": 0.04
+        "denominator": 22,
+        "rate": 0.045454545454545456
       },
       "playwright_flaky_test_rate": {
         "numerator": 1,
-        "denominator": 10,
-        "rate": 0.1
+        "denominator": 22,
+        "rate": 0.045454545454545456
       },
       "playwright_terminal_failure_rate": {
-        "numerator": 0,
-        "denominator": 10,
-        "rate": 0.0
+        "numerator": 1,
+        "denominator": 22,
+        "rate": 0.045454545454545456
       }
     }
   },
@@ -48,543 +48,1164 @@
   "confidence_level": 0.95,
   "non_inferiority_margin": 0.2,
   "sample_count_rule": {
-    "method": "power_analysis",
-    "is_power_derived": true,
-    "required_sample_count": 20,
-    "target_power": 0.8,
-    "assumed_baseline_rate": 0.05,
-    "justification": "Power analysis for detecting a 20 percentage-point increase in workflow_failure_rate at 95% confidence, 80% power, assuming a 5% baseline failure rate."
+    "design_id": "newcombe_wilson_hybrid_exact_binomial_power_v1",
+    "required_sample_count_per_arm": 22
   },
   "non_inferiority_evaluation": {
     "metric": "workflow_failure_rate",
-    "interval_method": "clopper_pearson_exact",
+    "effect_measure": "risk_difference",
+    "method": "newcombe_wilson_hybrid_mover_v1",
+    "sidedness": "one_sided",
     "before": {
       "numerator": 0,
-      "denominator": 20,
+      "denominator": 22,
       "ci_lower": 0.0,
-      "ci_upper": 0.1684334709830182
+      "ci_upper": 0.154372512815371
     },
     "after": {
       "numerator": 1,
-      "denominator": 25,
-      "ci_lower": 0.0010121996997440874,
-      "ci_upper": 0.20351691392215798
+      "denominator": 22,
+      "ci_lower": 0.0011501475269142247,
+      "ci_upper": 0.2284443976673174
     },
-    "outcome": "non_inferior",
-    "effect_measure": "risk_difference",
-    "sidedness": "one_sided",
     "risk_difference": {
-      "method": "newcombe_score_wilson_hybrid",
-      "point_estimate": 0.04,
-      "ci_upper": 0.16086635709132557
-    }
+      "method": "newcombe_wilson_hybrid_mover_v1",
+      "point_estimate": 0.045454545454545456,
+      "ci_upper": 0.1802583340003912
+    },
+    "outcome": "non_inferior"
   },
-  "raw_attempts": {
+  "workflow_records": [
+    {
+      "workflow_run_id": 1000,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1001,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1002,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1003,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1004,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1005,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1006,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1007,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1008,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1009,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1010,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1011,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1012,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1013,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1014,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1015,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1016,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1017,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1018,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1019,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1020,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 1021,
+      "arm": "before",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2000,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "failure"
+    },
+    {
+      "workflow_run_id": 2001,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2002,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2003,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2004,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2005,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2006,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2007,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2008,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2009,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2010,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2011,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2012,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2013,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2014,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2015,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2016,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2017,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2018,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2019,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2020,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    },
+    {
+      "workflow_run_id": 2021,
+      "arm": "after",
+      "run_attempt": 1,
+      "conclusion": "success"
+    }
+  ],
+  "playwright_test_cases": [
+    {
+      "test_id": "before-flaky",
+      "workflow_run_id": 1001,
+      "arm": "before",
+      "run_attempt": 1,
+      "outcome": "flaky"
+    },
+    {
+      "test_id": "before-unexpected",
+      "workflow_run_id": 1002,
+      "arm": "before",
+      "run_attempt": 1,
+      "outcome": "unexpected"
+    },
+    {
+      "test_id": "after-flaky",
+      "workflow_run_id": 2001,
+      "arm": "after",
+      "run_attempt": 1,
+      "outcome": "flaky"
+    },
+    {
+      "test_id": "after-unexpected",
+      "workflow_run_id": 2002,
+      "arm": "after",
+      "run_attempt": 1,
+      "outcome": "unexpected"
+    }
+  ],
+  "sample_provenance": {
     "before": {
-      "workflow_runs": [
-        {
-          "workflow_run_id": 1001,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1002,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1003,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1004,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1005,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1006,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1007,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1008,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1009,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1010,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1011,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1012,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1013,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1014,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1015,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1016,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1017,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1018,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1019,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1020,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 1021,
-          "run_attempt": 1,
-          "conclusion": "cancelled"
-        },
-        {
-          "workflow_run_id": 1001,
-          "run_attempt": 2,
-          "conclusion": "success"
-        }
-      ],
-      "playwright_tests": [
-        {
-          "test_id": "e2e/login.spec.ts::login",
-          "workflow_run_id": 1001,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "failed"
-            },
-            {
-              "attempt_number": 2,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/checkout.spec.ts::checkout",
-          "workflow_run_id": 1001,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "failed"
-            },
-            {
-              "attempt_number": 2,
-              "status": "failed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav1",
-          "workflow_run_id": 1002,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav2",
-          "workflow_run_id": 1002,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav3",
-          "workflow_run_id": 1003,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav4",
-          "workflow_run_id": 1003,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav5",
-          "workflow_run_id": 1004,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav6",
-          "workflow_run_id": 1004,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav7",
-          "workflow_run_id": 1005,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav8",
-          "workflow_run_id": 1005,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav9",
-          "workflow_run_id": 1006,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "skipped"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/login.spec.ts::login",
-          "workflow_run_id": 1001,
-          "run_attempt": 2,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        }
-      ]
+      "workflow_failure_rate": {
+        "design_id": "newcombe_wilson_hybrid_exact_binomial_power_v1",
+        "observations": [
+          {
+            "workflow_run_id": 1000,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1001,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1002,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1003,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1004,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1005,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1006,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1007,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1008,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1009,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1010,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1011,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1012,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1013,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1014,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1015,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1016,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1017,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1018,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1019,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1020,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 1021,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "success"
+          }
+        ]
+      },
+      "playwright_flaky_test_rate": {
+        "design_id": "newcombe_wilson_hybrid_exact_binomial_power_v1",
+        "observations": [
+          {
+            "workflow_run_id": 1000,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1001,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "affected"
+          },
+          {
+            "workflow_run_id": 1002,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1003,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1004,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1005,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1006,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1007,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1008,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1009,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1010,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1011,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1012,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1013,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1014,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1015,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1016,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1017,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1018,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1019,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1020,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1021,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          }
+        ]
+      },
+      "playwright_terminal_failure_rate": {
+        "design_id": "newcombe_wilson_hybrid_exact_binomial_power_v1",
+        "observations": [
+          {
+            "workflow_run_id": 1000,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1001,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1002,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "affected"
+          },
+          {
+            "workflow_run_id": 1003,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1004,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1005,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1006,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1007,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1008,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1009,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1010,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1011,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1012,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1013,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1014,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1015,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1016,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1017,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1018,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1019,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1020,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 1021,
+            "arm": "before",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          }
+        ]
+      }
     },
     "after": {
-      "workflow_runs": [
-        {
-          "workflow_run_id": 2001,
-          "run_attempt": 1,
-          "conclusion": "failure"
-        },
-        {
-          "workflow_run_id": 2002,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2003,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2004,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2005,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2006,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2007,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2008,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2009,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2010,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2011,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2012,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2013,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2014,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2015,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2016,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2017,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2018,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2019,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2020,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2021,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2022,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2023,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2024,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2025,
-          "run_attempt": 1,
-          "conclusion": "success"
-        },
-        {
-          "workflow_run_id": 2026,
-          "run_attempt": 1,
-          "conclusion": "timed_out"
-        }
-      ],
-      "playwright_tests": [
-        {
-          "test_id": "e2e/login.spec.ts::login",
-          "workflow_run_id": 2001,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/checkout.spec.ts::checkout",
-          "workflow_run_id": 2001,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "failed"
-            },
-            {
-              "attempt_number": 2,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav1",
-          "workflow_run_id": 2002,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav2",
-          "workflow_run_id": 2002,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav3",
-          "workflow_run_id": 2003,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav4",
-          "workflow_run_id": 2003,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav5",
-          "workflow_run_id": 2004,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav6",
-          "workflow_run_id": 2004,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav7",
-          "workflow_run_id": 2005,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        },
-        {
-          "test_id": "e2e/nav.spec.ts::nav8",
-          "workflow_run_id": 2005,
-          "run_attempt": 1,
-          "attempts": [
-            {
-              "attempt_number": 1,
-              "status": "passed"
-            }
-          ]
-        }
-      ]
+      "workflow_failure_rate": {
+        "design_id": "newcombe_wilson_hybrid_exact_binomial_power_v1",
+        "observations": [
+          {
+            "workflow_run_id": 2000,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "failure"
+          },
+          {
+            "workflow_run_id": 2001,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2002,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2003,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2004,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2005,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2006,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2007,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2008,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2009,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2010,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2011,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2012,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2013,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2014,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2015,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2016,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2017,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2018,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2019,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2020,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          },
+          {
+            "workflow_run_id": 2021,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "success"
+          }
+        ]
+      },
+      "playwright_flaky_test_rate": {
+        "design_id": "newcombe_wilson_hybrid_exact_binomial_power_v1",
+        "observations": [
+          {
+            "workflow_run_id": 2000,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2001,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "affected"
+          },
+          {
+            "workflow_run_id": 2002,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2003,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2004,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2005,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2006,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2007,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2008,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2009,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2010,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2011,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2012,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2013,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2014,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2015,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2016,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2017,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2018,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2019,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2020,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2021,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          }
+        ]
+      },
+      "playwright_terminal_failure_rate": {
+        "design_id": "newcombe_wilson_hybrid_exact_binomial_power_v1",
+        "observations": [
+          {
+            "workflow_run_id": 2000,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2001,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2002,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "affected"
+          },
+          {
+            "workflow_run_id": 2003,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2004,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2005,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2006,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2007,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2008,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2009,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2010,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2011,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2012,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2013,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2014,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2015,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2016,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2017,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2018,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2019,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2020,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          },
+          {
+            "workflow_run_id": 2021,
+            "arm": "after",
+            "run_attempt": 1,
+            "classification": "not_affected"
+          }
+        ]
+      }
     }
-  }
+  },
+  "raw_attempts": [
+    {
+      "workflow_run_id": 1001,
+      "run_attempt": 1,
+      "test_id": "before-flaky",
+      "attempt_number": 1,
+      "status": "passed"
+    }
+  ]
 }
