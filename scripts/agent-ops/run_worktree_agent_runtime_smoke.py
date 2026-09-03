@@ -108,6 +108,16 @@ _PUBLIC_EVIDENCE_SHA_LENGTHS = {
     ("settings_provenance", "digest_sha256"): 64,
 }
 
+# Issue #2421: ``resolved_executable`` must never persist a raw absolute
+# path, regardless of prefix (HOME, /tmp, /opt, /mnt, ...). This is a narrow
+# field-semantics special case -- not an extension of ``_SECRET_LIKE_RE`` --
+# because the value is an executable path by definition whenever it is a
+# string (resolution succeeded); ``None`` (unresolved / SKIP) is unaffected
+# since it never reaches the string branch below.
+_ALWAYS_REDACT_FIELD_PATHS = {
+    ("resolved_executable",): "<redacted>",
+}
+
 # CLI color/formatting escape sequences (observed in real ``herdr`` stderr
 # output) are cosmetic noise, not secrets, but they degrade the readability
 # of persisted evidence and are stripped for cleanliness.
@@ -153,6 +163,8 @@ def _is_public_evidence_sha(field_path: tuple[str, ...], value: str) -> bool:
 def _redact_evidence_value(value: object, *, field_path: tuple[str, ...] = ()) -> object:
     """Recursively redact persisted evidence, preserving only named SHA fields."""
     if isinstance(value, str):
+        if field_path in _ALWAYS_REDACT_FIELD_PATHS:
+            return _ALWAYS_REDACT_FIELD_PATHS[field_path]
         return value if _is_public_evidence_sha(field_path, value) else _redact(value)
     if isinstance(value, list):
         return [_redact_evidence_value(item, field_path=field_path) for item in value]
