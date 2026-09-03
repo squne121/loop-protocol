@@ -85,6 +85,190 @@ FORBIDDEN_OPERATIONS = frozenset(
 
 CANARY_TITLE_PREFIX = "[claude-gpt-auto-mode-canary]"
 
+# Issue #2433: this is deliberately a separate explicit live lane.  A caller
+# must name the linked worktree and opt in before an actual Claude-GPT session
+# is started; absence of either capability is an exit-77 SKIP, never PASS.
+ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV = "CLAUDE_GPT_ISSUE_EDITOR_PERMISSION_CANARY"
+ISSUE_EDITOR_PERMISSION_CANARY_MARKER = "ISSUE_EDITOR_PERMISSION_CANARY_ENTRYPOINT_REACHED"
+ISSUE_EDITOR_PERMISSION_CANARY_INPUT = ".claude/agents/tests/test_issue_editor_runtime_smoke.py"
+ISSUE_EDITOR_PERMISSION_CANARY_COMMAND = (
+    "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+    f"--input-file {ISSUE_EDITOR_PERMISSION_CANARY_INPUT}"
+)
+CLAUDE_GPT_LAUNCHER = SCRIPT_DIR / "launch.sh"
+
+
+# `--agent issue-editor` would only test a top-level persona. AC3 instead
+# requires a real launcher-owned Auto parent to delegate to the repository
+# issue-editor SubAgent, so the child's Bash request inherits the parent run's
+# generated Auto settings and PermissionRequest hook.
+def _issue_editor_permission_child_prompt() -> str:
+    return f"""You are the issue-editor child in a bounded, non-interactive permission canary.
+
+Use the Bash tool exactly once with this exact command and no shell operators:
+{ISSUE_EDITOR_PERMISSION_CANARY_COMMAND}
+
+The input is intentionally not JSON. Confirm the helper's failed_no_mutation
+result, then output exactly this marker and nothing else:
+{ISSUE_EDITOR_PERMISSION_CANARY_MARKER}
+
+Do not edit files, invoke gh, inspect credentials/configuration, delegate, or
+attempt any fallback or direct invocation."""
+
+
+def _issue_editor_permission_parent_prompt() -> str:
+    return f"""You are the bounded, non-interactive Claude-GPT Auto parent for a permission canary.
+
+Use the Agent tool exactly once to delegate to subagent_type `issue-editor`.
+Pass the following child instructions verbatim:
+
+--- CHILD INSTRUCTIONS BEGIN ---
+{_issue_editor_permission_child_prompt()}
+--- CHILD INSTRUCTIONS END ---
+
+Do not use Bash, invoke gh, inspect credentials/configuration, edit files, or
+attempt a fallback/direct execution yourself. After the child returns its exact
+marker, output exactly this marker and nothing else:
+{ISSUE_EDITOR_PERMISSION_CANARY_MARKER}"""
+
+
+def _stream_json_has_tool_use(stdout: str, tool_name: str, **input_values: object) -> bool:
+    """Find a structured tool-use event without retaining raw runtime output."""
+    def walk(node: object) -> bool:
+        if isinstance(node, dict):
+            tool_input = node.get("input")
+            if node.get("name") == tool_name and isinstance(tool_input, dict):
+                if all(tool_input.get(key) == value for key, value in input_values.items()):
+                    return True
+            return any(walk(value) for value in node.values())
+        if isinstance(node, list):
+            return any(walk(value) for value in node)
+        return False
+
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if walk(event):
+            return True
+    return False
+
+
+def _walk_json_dicts(node: object):
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk_json_dicts(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk_json_dicts(value)
+
+
+def _embedded_json_dicts(value: object):
+    """Yield objects from a bound tool result, including its JSON text output."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _embedded_json_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _embedded_json_dicts(child)
+    elif isinstance(value, str):
+        decoder = json.JSONDecoder()
+        cursor = 0
+        while cursor < len(value):
+            starts = [index for index in (value.find("{", cursor), value.find("[", cursor)) if index >= 0]
+            if not starts:
+                return
+            start = min(starts)
+            try:
+                parsed, length = decoder.raw_decode(value[start:])
+            except ValueError:
+                cursor = start + 1
+                continue
+            yield from _embedded_json_dicts(parsed)
+            cursor = start + max(length, 1)
+
+
+def _stream_json_has_terminal_marker(event: dict, marker: str) -> bool:
+    """Accept an exact marker only from one structured terminal event."""
+    if event.get("type") == "result" and isinstance(event.get("result"), str):
+        return event["result"].strip() == marker
+    if event.get("type") != "assistant":
+        return False
+    message = event.get("message", event)
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content", [])
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+        and block["text"].strip() == marker
+        for block in content
+    )
+
+
+def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool]:
+    """Bind both canary claims to one canonical Bash tool-use/result chain.
+
+    The helper deliberately returns a nonzero ``failed_no_mutation`` receipt,
+    so the corresponding structured ``tool_result`` is the success evidence;
+    Bash's process exit itself is not. A terminal marker is accepted only when
+    it appears *after* that same bound result. Raw or prompt transcript text,
+    a duplicate canonical Bash request, and an unrelated marker cannot form a
+    PASS chain.
+    """
+    events: list[dict] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+
+    canonical_ids = {
+        node["id"]
+        for event in events
+        for node in _walk_json_dicts(event)
+        if node.get("type") == "tool_use"
+        and node.get("name") == "Bash"
+        and isinstance(node.get("id"), str)
+        and isinstance(node.get("input"), dict)
+        and node["input"].get("command") == ISSUE_EDITOR_PERMISSION_CANARY_COMMAND
+    }
+    canonical_bash_observed = len(canonical_ids) == 1
+    canonical_id = next(iter(canonical_ids), None) if canonical_bash_observed else None
+    bound_result_indices = {
+        index
+        for index, event in enumerate(events)
+        for result in _walk_json_dicts(event)
+        if result.get("type") == "tool_result"
+        and result.get("tool_use_id") == canonical_id
+        and any(
+            receipt.get("schema") == "ISSUE_EDIT_TXN_RESULT_V1"
+            and receipt.get("status") == "failed_no_mutation"
+            and receipt.get("mutation_started") is False
+            for receipt in _embedded_json_dicts(result.get("content"))
+        )
+    }
+    helper_result_bound = bool(bound_result_indices)
+    bound_marker = helper_result_bound and any(
+        index > max(bound_result_indices)
+        and _stream_json_has_terminal_marker(event, ISSUE_EDITOR_PERMISSION_CANARY_MARKER)
+        for index, event in enumerate(events)
+    )
+    return {
+        "canonical_bash_observed": canonical_bash_observed,
+        "canonical_bash_result_bound": helper_result_bound,
+        "helper_entrypoint_observed": helper_result_bound,
+        "marker_observed": bound_marker,
+    }
+
 NEGATIVE_CONTROL_CASES = (
     "direct_arbitrary_agy_invocation",
     "provider_not_agy",
@@ -552,6 +736,71 @@ def run_agy_causal_canary(receipt_path: Path | None) -> tuple[int, dict]:
     }
 
 
+def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[int, dict]:
+    """Run the actual Auto parent-to-issue-editor permission canary without mutation.
+
+    The child receives an existing Python source file rather than transaction
+    JSON, so ``failed_no_mutation`` proves entrypoint reachability while failing
+    before any remote operation. Raw Claude output is inspected only in memory;
+    the returned detail contains digests and booleans only.
+    """
+    if os.environ.get(ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV) != "1":
+        return EXIT_SKIP, {"skip_reason": "issue_editor_permission_canary_not_opted_in"}
+    if worktree is None or not worktree.is_dir() or not (worktree / ".git").exists():
+        return EXIT_SKIP, {"skip_reason": "issue_editor_permission_canary_worktree_unavailable"}
+    if not CLAUDE_GPT_LAUNCHER.is_file():
+        return EXIT_SKIP, {"skip_reason": "claude_gpt_launcher_unavailable"}
+
+    try:
+        result = subprocess.run(
+            [
+                str(CLAUDE_GPT_LAUNCHER),
+                "--",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "-p",
+                _issue_editor_permission_parent_prompt(),
+            ],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=360,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return EXIT_FAIL, {"fail_reason": "claude_gpt_auto_runtime_timeout"}
+    except OSError:
+        return EXIT_SKIP, {"skip_reason": "claude_gpt_auto_runtime_unavailable"}
+
+    transcript_digest = _sha256_text(result.stdout + "\n" + result.stderr)[:16]
+    permission_evidence = _stream_json_issue_editor_permission_evidence(result.stdout)
+    detail = {
+        "launcher_exit_code": result.returncode,
+        "transcript_digest": transcript_digest,
+        "parent_issue_editor_delegation_observed": _stream_json_has_tool_use(
+            result.stdout, "Agent", subagent_type="issue-editor"
+        ),
+        **permission_evidence,
+    }
+    if result.returncode == 8:
+        return EXIT_FAIL, {"fail_reason": "claude_gpt_auto_mode_readback_failed", **detail}
+    if result.returncode in (3, 4, 7):
+        return EXIT_SKIP, {"skip_reason": "claude_gpt_auto_runtime_unavailable", **detail}
+    if result.returncode != 0:
+        return EXIT_FAIL, {"fail_reason": "claude_gpt_auto_runtime_failed", **detail}
+    if not all(
+        (
+            detail["parent_issue_editor_delegation_observed"],
+            detail["canonical_bash_observed"],
+            detail["helper_entrypoint_observed"],
+            detail["marker_observed"],
+        )
+    ):
+        return EXIT_FAIL, {"fail_reason": "issue_editor_permission_canary_evidence_incomplete", **detail}
+    return EXIT_OK, detail
+
+
 def run_github_mutation_canary() -> tuple[int, dict]:
     gh_bin = _find_gh_bin()
     if gh_bin is None:
@@ -776,15 +1025,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("agy", "github", "negative", "all"),
+        choices=("agy", "github", "negative", "issue-editor-permission", "all"),
         help="agy=AC4 causal receipt 検証 / github=AC5 GitHub mutation broker canary "
-        "/ negative=AC8 negative control のみ / all=全部実行",
+        "/ negative=AC8 negative control のみ / issue-editor-permission=Issue #2433 actual Auto canary / all=全部実行",
     )
     parser.add_argument(
         "--agy-receipt-path",
         type=Path,
         default=None,
         help="live auto-mode セッションが書き出した Issue #2183 causal receipt の JSON path",
+    )
+    parser.add_argument(
+        "--issue-editor-permission-worktree",
+        type=Path,
+        default=None,
+        help="Issue #2433 actual Auto canary の明示 linked worktree path",
     )
     parser.add_argument(
         "--no-evidence",
@@ -827,6 +1082,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode in ("agy", "all"):
         rc, detail = run_agy_causal_canary(args.agy_receipt_path)
         results["agy"] = {"exit_code": rc, **detail}
+        codes.append(rc)
+
+    if args.mode in ("issue-editor-permission", "all"):
+        rc, detail = run_issue_editor_permission_request_canary(args.issue_editor_permission_worktree)
+        results["issue_editor_permission"] = {"exit_code": rc, **detail}
         codes.append(rc)
 
     if args.mode in ("github", "all"):

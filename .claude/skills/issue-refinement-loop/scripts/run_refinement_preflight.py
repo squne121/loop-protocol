@@ -165,6 +165,23 @@ try:
         # independently-declared string that could silently diverge).
         STRUCT_DISPOSITION_AUTO_APPLY_SAFE,
         detect_missing_template_sections,
+        # Issue #2431: the known_scalars/source_spans assembler below reuses
+        # these SAME primitives (never a re-declared regex/parser) so the
+        # producer and the assembler always agree on what counts as a valid
+        # `parent_issue` scalar / a parsed `## Heading` section.
+        _mrc_parse,
+        MRC_PARSE_STATUS_OK,
+        _parse_h2_sections,
+        # PR #2469 fix_delta iteration 3 (P1): the SAME line-bound helper
+        # `_apply_insertion_decision()` uses (repair_issue_contract.py) to
+        # compute a section's raw (start_line, end_line) span -- never a
+        # re-derived offset arithmetic -- so the assembler's `line_start`/
+        # `line_end` always point at the section's ACTUAL raw line range
+        # instead of assuming content starts on the line immediately after
+        # the heading (false for the common heading -> blank line -> bullets
+        # shape).
+        _section_line_bounds,
+        _DERIVED_SCALAR_FIELD_VALIDATORS,
     )
 except ImportError:  # pragma: no cover - defensive fallback
     build_structural_repair_bundle = None
@@ -173,6 +190,11 @@ except ImportError:  # pragma: no cover - defensive fallback
     STRUCTURAL_REPAIR_ROUTE_STATUS_NEEDS_FIX = "needs_fix"
     STRUCT_DISPOSITION_AUTO_APPLY_SAFE = "auto_apply_safe"
     detect_missing_template_sections = None
+    _mrc_parse = None
+    MRC_PARSE_STATUS_OK = "ok"
+    _parse_h2_sections = None
+    _section_line_bounds = None
+    _DERIVED_SCALAR_FIELD_VALIDATORS = {}
 
 
 
@@ -1319,6 +1341,56 @@ def _run_repair_apply_fresh_validation(
     }
 
 
+def _evaluate_candidate_static_readiness(
+    *,
+    candidate_body: str,
+    candidate_path: Path,
+) -> tuple[dict, "int | None"]:
+    """Run the one static candidate-readiness evaluation for a dispatch.
+
+    The generic lane retains its existing shared-core evaluation.  The
+    structural lane evaluates its synthesized body before routing and passes
+    this digest-bound result back into that same core, so a `go` candidate
+    never launches a second checker subprocess.
+    """
+    readiness_script = _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
+    returncode: "int | None" = None
+    try:
+        completed_readiness = subprocess.run(
+            [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        readiness_stdout = completed_readiness.stdout
+        returncode = completed_readiness.returncode
+    except (subprocess.TimeoutExpired, OSError):
+        # Static readiness runs strictly before edit_issue_txn.py.  Preserve
+        # the established normalized input/runtime outcome and never imply
+        # that a transaction was attempted.
+        readiness_stdout = ""
+    try:
+        observed_readiness = json.loads(readiness_stdout)
+    except json.JSONDecodeError:
+        observed_readiness = {}
+    if not isinstance(observed_readiness, dict):
+        observed_readiness = {}
+
+    # Keep the generic lane's historical degraded normalization unchanged,
+    # while retaining the unmodified parsed envelope for the structural
+    # lane's digest-bound validation below.  In particular, the structural
+    # caller must be able to distinguish an absent checker digest from a
+    # digest inserted by this legacy generic normalization.
+    readiness = dict(observed_readiness)
+    readiness.setdefault("status", "input_or_runtime_error")
+    readiness.setdefault("body_sha256", f"sha256:{_sha256(candidate_body)}")
+    readiness.setdefault("source_checks", [])
+    readiness.setdefault("errors", [])
+    readiness["_observed_checker_envelope"] = observed_readiness
+    return readiness, returncode
+
+
 def _dispatch_candidate_body_via_edit_txn(
     *,
     current_issue_: dict,
@@ -1329,6 +1401,7 @@ def _dispatch_candidate_body_via_edit_txn(
     root: Path,
     issue_number: int,
     repo: str,
+    precomputed_readiness: "dict | None" = None,
 ) -> dict:
     """Issue #2039 AC8/AC11 (extracted for Issue #2396 AC5 sharing): the ONE
     mutation-dispatch core BOTH `repair_action.apply` (generic
@@ -1348,37 +1421,17 @@ def _dispatch_candidate_body_via_edit_txn(
     """
     from scope_signal_delta import build_issue_edit_txn_input
 
-    readiness_script = _SCRIPTS_DIR.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
-    try:
-        completed_readiness = subprocess.run(
-            [sys.executable, str(readiness_script), "--body-file", str(candidate_path), "--mode", "static"],
-            capture_output=True,
-            text=True,
-            shell=False,
-            timeout=REPAIR_APPLY_READINESS_SUBPROCESS_TIMEOUT_SECONDS,
+    # Generic callers leave `precomputed_readiness` unset and retain the
+    # historical shared-core evaluation. Structural callers supply their
+    # post-synthesis, candidate-digest-bound result so this core only forwards
+    # it and never re-runs the checker.
+    if precomputed_readiness is None:
+        readiness, _ = _evaluate_candidate_static_readiness(
+            candidate_body=candidate_body,
+            candidate_path=candidate_path,
         )
-        readiness_stdout = completed_readiness.stdout
-    except (subprocess.TimeoutExpired, OSError):
-        # PR #2202 review fix-delta (P0-6, item 2): the readiness check
-        # never touches GitHub -- it runs strictly BEFORE
-        # edit_issue_txn.py is ever invoked below, so a
-        # TimeoutExpired/OSError here proves no mutation could possibly
-        # have been dispatched yet. It is therefore always safe to fall
-        # through to the SAME degraded-readiness fallback already used
-        # for non-JSON readiness stdout below (never a fabricated
-        # "verified"/"unresolved" readiness signal, and never routed
-        # into the mutation-side `unknown` handling this is not).
-        readiness_stdout = ""
-    try:
-        readiness = json.loads(readiness_stdout)
-    except json.JSONDecodeError:
-        readiness = {}
-    if not isinstance(readiness, dict):
-        readiness = {}
-    readiness.setdefault("status", "input_or_runtime_error")
-    readiness.setdefault("body_sha256", f"sha256:{_sha256(candidate_body)}")
-    readiness.setdefault("source_checks", [])
-    readiness.setdefault("errors", [])
+    else:
+        readiness = dict(precomputed_readiness)
     readiness["readiness_result_ref"] = "transaction-local"
     readiness_forwarding = {
         key: readiness[key]
@@ -1489,6 +1542,7 @@ def _dispatch_candidate_body_default_transaction(
     issue_number: int,
     repo: str,
     scratch_subdir: str = "repair-action-apply",
+    precomputed_readiness: "dict | None" = None,
 ) -> dict:
     """Issue #2039 AC8 (extracted for Issue #2396 AC5 sharing): unlike the
     sibling contract_update.run.with_anchor lane (which uses the shared,
@@ -1539,6 +1593,7 @@ def _dispatch_candidate_body_default_transaction(
                 root=root,
                 issue_number=issue_number,
                 repo=repo,
+                precomputed_readiness=precomputed_readiness,
             )
         finally:
             for _tmp_path in (candidate_path, input_path):
@@ -2100,16 +2155,107 @@ STRUCTURAL_REPAIR_APPLY_FAILURE_CONFLICTING_TARGETS = "structural_conflicting_in
 STRUCTURAL_REPAIR_APPLY_FAILURE_BODY_DRIFT = "structural_body_drift"
 STRUCTURAL_REPAIR_APPLY_FAILURE_CROSS_ISSUE = "cross_issue_provenance_mismatch"
 STRUCTURAL_REPAIR_APPLY_FAILURE_READBACK_UNRESOLVABLE = "final_readback_unresolvable"
+STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_NEEDS_FIX = "structural_readiness_needs_fix"
+STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_HUMAN_JUDGMENT = "structural_readiness_human_judgment"
+STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_RUNTIME_ERROR = "structural_readiness_runtime_error"
+STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_INPUT_OR_RUNTIME_ERROR = "structural_readiness_input_or_runtime_error"
+
+_STRUCTURAL_READINESS_EXPECTED_EXIT_CODES = {
+    "go": 0,
+    "needs_fix": 1,
+    "human_judgment": 2,
+    "runtime_error": 4,
+}
+_STRUCTURAL_READINESS_FAILURE_CODES = {
+    "needs_fix": STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_NEEDS_FIX,
+    "human_judgment": STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_HUMAN_JUDGMENT,
+    "runtime_error": STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_RUNTIME_ERROR,
+    "input_or_runtime_error": STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_INPUT_OR_RUNTIME_ERROR,
+}
+
+
+def _structural_readiness_diagnostics(readiness: dict) -> dict:
+    """Project only bounded, deterministic readiness details to stdout."""
+    rule_ids = sorted(
+        {
+            error.get("rule_id")
+            for error in readiness.get("errors", [])
+            if isinstance(error, dict) and isinstance(error.get("rule_id"), str)
+        }
+    )
+    return {
+        "status": readiness.get("status"),
+        "rule_ids": rule_ids[:16],
+        "truncated": len(rule_ids) > 16,
+    }
+
+
+def _structural_digest_bound_readiness(
+    *, candidate_body: str, candidate_path: Path
+) -> dict:
+    """Evaluate one structural candidate at the strict digest-bound boundary.
+
+    The generic consumer intentionally retains the readiness normalizations it
+    has historically forwarded through the shared core.  Structural routing is
+    different: it must validate the checker envelope actually observed before
+    any normalized field can influence transaction dispatch.
+    """
+    readiness, returncode = _evaluate_candidate_static_readiness(
+        candidate_body=candidate_body,
+        candidate_path=candidate_path,
+    )
+    # Production evaluation retains the unmodified parsed checker object under
+    # this private key.  Test doubles that supply the evaluator directly are
+    # treated as the observed envelope, preserving their focused seam.
+    observed = readiness.get("_observed_checker_envelope")
+    if not isinstance(observed, dict):
+        observed = readiness
+
+    status = observed.get("status")
+    candidate_digest = f"sha256:{_sha256(candidate_body)}"
+    expected_exit_code = _STRUCTURAL_READINESS_EXPECTED_EXIT_CODES.get(status) if isinstance(status, str) else None
+    if (
+        not isinstance(status, str)
+        or expected_exit_code is None
+        or returncode != expected_exit_code
+        or not isinstance(observed.get("body_sha256"), str)
+        or observed["body_sha256"] != candidate_digest
+        or not isinstance(observed.get("source_checks"), list)
+        or not isinstance(observed.get("errors"), list)
+    ):
+        # Malformed process results, unknown status, exit/status disagreement,
+        # incomplete envelopes, and digest mismatch all fail before the shared
+        # transaction core.  Do not expose the raw checker payload.
+        return {
+            "status": "input_or_runtime_error",
+            "source_checks": [],
+            "errors": [],
+        }
+
+    # Forward only the validated envelope fields.  This keeps private
+    # evaluator metadata and any unrelated checker output out of the
+    # transaction input and stdout contract.
+    return {
+        "status": status,
+        "body_sha256": observed["body_sha256"],
+        "source_checks": observed["source_checks"],
+        "errors": observed["errors"],
+    }
 
 
 def _structural_apply_not_attempted_result(
-    *, repo: str, issue_number: int, phase: str, failure_code: "str | None"
+    *,
+    repo: str,
+    issue_number: int,
+    phase: str,
+    failure_code: "str | None",
+    readiness_diagnostics: "dict | None" = None,
 ) -> dict:
     """Shared not_attempted stdout-contract shape for every early-exit
     branch of `run_structural_repair_action_apply()`. Never emits a GitHub
     mutation (mirrors `_repair_apply_not_attempted_result()`'s role for the
     sibling generic lane)."""
-    return {
+    result = {
         "schema_version": STRUCTURAL_REPAIR_APPLY_STDOUT_SCHEMA_VERSION,
         "phase": phase,
         "mutation_outcome": "not_attempted",
@@ -2131,6 +2277,9 @@ def _structural_apply_not_attempted_result(
             "final_body_digest_match": None,
         },
     }
+    if readiness_diagnostics is not None:
+        result["readiness_diagnostics"] = readiness_diagnostics
+    return result
 
 
 def _structural_item_rendered_block(item: dict) -> str:
@@ -2555,6 +2704,32 @@ def run_structural_repair_action_apply(
 
     candidate_digest = f"sha256:{hashlib.sha256(new_body.encode('utf-8')).hexdigest()}"
 
+    # Structural routing evaluates the real, synthesized whole body before
+    # transaction dispatch. The result is digest-bound and reused by the
+    # shared core on `go`; every other checker disposition stops here.
+    # The checker receives a closed, ordinary path.  Keeping it in a private
+    # temporary directory avoids the open NamedTemporaryFile pathname handoff
+    # while retaining one ephemeral, per-invocation candidate file.
+    with tempfile.TemporaryDirectory() as readiness_dir:
+        readiness_path = Path(readiness_dir) / "candidate_body.md"
+        readiness_path.write_text(new_body, encoding="utf-8")
+        readiness = _structural_digest_bound_readiness(
+            candidate_body=new_body,
+            candidate_path=readiness_path,
+        )
+    readiness_status = readiness.get("status")
+    if readiness_status != "go":
+        return _structural_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="candidate_readiness",
+            failure_code=_STRUCTURAL_READINESS_FAILURE_CODES.get(
+                readiness_status,
+                STRUCTURAL_REPAIR_APPLY_FAILURE_READINESS_INPUT_OR_RUNTIME_ERROR,
+            ),
+            readiness_diagnostics=_structural_readiness_diagnostics(readiness),
+        )
+
     def _default_apply_transaction(current_issue_: dict, candidate_body: str) -> dict:
         # AC5: the EXACT SAME shared dispatch core the generic
         # repair_action.apply lane's own default uses -- never a second,
@@ -2567,6 +2742,7 @@ def run_structural_repair_action_apply(
             issue_number=issue_number,
             repo=repo,
             scratch_subdir="structural-repair-action-apply",
+            precomputed_readiness=readiness,
         )
 
     apply_fn = apply_transaction or _default_apply_transaction
@@ -4125,6 +4301,66 @@ def _anchor_scope_reframe_fence_present(comment_body: str) -> bool:
     return found_related
 
 
+
+_TERMINAL_CLOSE_NOT_PLANNED_MARKER_RE = re.compile(
+    r"^Decision:\s*CLOSE\s*/\s*NOT_PLANNED\s*$", re.IGNORECASE
+)
+
+
+def _has_terminal_close_not_planned_marker(anchor_body: str) -> bool:
+    """Recognize only a final, non-quoted, non-fenced close disposition."""
+    if not isinstance(anchor_body, str):
+        return False
+
+    terminal_lines: list[str] = []
+    in_fence: tuple[str, int] | None = None
+    fence_re = re.compile(r"^ {0,3}(`{3,}|~{3,})(?:[^`~]*)$")
+    for raw_line in anchor_body.splitlines():
+        stripped = raw_line.lstrip()
+        if stripped.startswith(">"):
+            continue
+        fence_match = fence_re.match(raw_line)
+        if in_fence is not None:
+            if fence_match and fence_match.group(1)[0] == in_fence[0] and len(fence_match.group(1)) >= in_fence[1]:
+                in_fence = None
+            continue
+        if fence_match:
+            fence = fence_match.group(1)
+            in_fence = (fence[0], len(fence))
+            continue
+        if raw_line.strip():
+            terminal_lines.append(raw_line.strip())
+
+    return bool(terminal_lines) and bool(
+        _TERMINAL_CLOSE_NOT_PLANNED_MARKER_RE.fullmatch(terminal_lines[-1])
+    )
+
+
+def _approved_close_not_planned_decision(
+    *, author_assoc: str, anchor_url: str, anchor_hash: str, required_rerun: list | None = None
+) -> dict:
+    return {
+        "status": "approved_by_trusted_anchor",
+        "decision": "close_not_planned",
+        "authorized_mutation_category": "not_planned",
+        "implementation_go": False,
+        "anchor_author_association": author_assoc,
+        "anchor_comment_url": anchor_url,
+        "anchor_comment_hash": anchor_hash,
+        "required_rerun": required_rerun or [],
+    }
+
+
+def _is_approved_close_not_planned_decision(decision: "dict | None") -> bool:
+    return (
+        isinstance(decision, dict)
+        and decision.get("status") == "approved_by_trusted_anchor"
+        and decision.get("decision") == "close_not_planned"
+        and decision.get("authorized_mutation_category") == "not_planned"
+        and decision.get("anchor_author_association") == "OWNER"
+        and decision.get("implementation_go") is False
+    )
+
 def _classify_anchor_scope_reframe(
     *,
     comment_payload: "dict",
@@ -4168,6 +4404,23 @@ def _classify_anchor_scope_reframe(
     # Parse ANCHOR_SCOPE_REFRAME_V1 payload from body
     payload = _parse_anchor_scope_reframe_body(anchor_body)
     if payload is None:
+        if _has_terminal_close_not_planned_marker(anchor_body):
+            if author_assoc == "OWNER":
+                return _approved_close_not_planned_decision(
+                    author_assoc=author_assoc,
+                    anchor_url=anchor_url,
+                    anchor_hash=anchor_hash,
+                )
+            return {
+                "status": "fail_closed",
+                "reason": "close_not_planned_requires_owner",
+                "implementation_go": False,
+                "anchor_author_association": author_assoc,
+                "anchor_comment_url": anchor_url,
+                "anchor_comment_hash": anchor_hash,
+                "allowed_path_deltas": [],
+                "required_rerun": [],
+            }
         # #2156 AC1-AC3: distinguish genuine absence (no ```yaml fence at
         # all -- the legitimate freeform lane, #2053/#2086) from
         # present-but-invalid (a fence exists but is malformed YAML,
@@ -4275,9 +4528,30 @@ def _classify_anchor_scope_reframe(
             "required_rerun": [],
         }
 
-    # All checks pass — trusted anchor
+    # close-only termination has a stricter trust boundary than a scope delta.
+    if payload.get("decision") == "close_not_planned":
+        if author_assoc != "OWNER":
+            return {
+                "status": "fail_closed",
+                "reason": "close_not_planned_requires_owner",
+                "implementation_go": False,
+                "anchor_author_association": author_assoc,
+                "anchor_comment_url": anchor_url,
+                "anchor_comment_hash": anchor_hash,
+                "allowed_path_deltas": [],
+                "required_rerun": [],
+            }
+        return _approved_close_not_planned_decision(
+            author_assoc=author_assoc,
+            anchor_url=anchor_url,
+            anchor_hash=anchor_hash,
+            required_rerun=payload.get("required_rerun", []),
+        )
+
+    # All checks pass — trusted scope-delta anchor.
     return {
         "status": "approved_by_trusted_anchor",
+        "decision": "approve_scope_delta",
         "implementation_go": False,
         "anchor_author_association": author_assoc,
         "anchor_comment_url": anchor_url,
@@ -5786,27 +6060,27 @@ def _classify_heavy_mutation_gate(
 
     Heavy mutation categories (close / not planned / replacement Issue
     creation / dependency removal / parent-child relationship change) are
-    blocked unless `scope_delta_decision` reflects an explicit owner-sourced
-    decision (`status == "approved_by_trusted_anchor"` and
-    `anchor_author_association == "OWNER"`). Non-heavy mutation categories
-    (ordinary body improvement / additional investigation / review
+    blocked unless the decision is the exact OWNER-sourced
+    `close_not_planned` disposition bound to the `not_planned` category.
+    Non-heavy mutation categories (ordinary body improvement / additional investigation / review
     continuation) are never blocked here -- they continue with a `warn`
     status, matching the pre-existing advisory-only behavior.
     """
     decision = scope_delta_decision or {}
-    owner_explicit = (
-        decision.get("status") == "approved_by_trusted_anchor"
-        and decision.get("anchor_author_association") == "OWNER"
-    )
     is_heavy = mutation_category in HEAVY_MUTATION_CATEGORIES
+    exact_close_not_planned = (
+        _is_approved_close_not_planned_decision(decision)
+        and mutation_category == "not_planned"
+        and decision.get("authorized_mutation_category") == mutation_category
+    )
 
-    if owner_explicit:
+    if exact_close_not_planned:
         return {
             "mutation_category": mutation_category,
             "is_heavy_mutation": is_heavy,
             "status": "allowed",
             "fail_closed": False,
-            "reason": "owner_explicit_decision_present",
+            "reason": "owner_close_not_planned_decision_present",
         }
 
     if is_heavy:
@@ -6534,7 +6808,30 @@ def consume_trusted_anchor_contract_patch_plan(
             policy_spec = importlib.util.spec_from_file_location("post_update_runtime_policy", policy_path)
             if policy_spec is not None and policy_spec.loader is not None:
                 policy_module = importlib.util.module_from_spec(policy_spec)
-                policy_spec.loader.exec_module(policy_module)
+                # #2473: the module defines a module-level
+                # `@dataclass(frozen=True)` under `from __future__ import
+                # annotations`. Dataclass processing resolves those deferred
+                # string annotations via `sys.modules[cls.__module__]` --
+                # without registering this dynamically-loaded module there
+                # BEFORE `exec_module()` runs, that lookup fails and
+                # `exec_module()` raises unconditionally, which previously
+                # made this gate collapse to `"unavailable"` on every call
+                # regardless of the actual profile/argv validity.
+                #
+                # #2473 fix_delta (owner REQUEST_CHANGES on PR #2476): if
+                # `exec_module()` itself raises, remove the partially
+                # initialized module from `sys.modules` again before
+                # propagating, matching standard import machinery semantics
+                # and the existing pattern in
+                # `.claude/skills/agent-retrospective/scripts/collect_snapshot.py`.
+                # A failed module load must not leave a half-initialized
+                # module registered for a later retry to observe.
+                sys.modules[policy_spec.name] = policy_module
+                try:
+                    policy_spec.loader.exec_module(policy_module)
+                except Exception:
+                    sys.modules.pop(policy_spec.name, None)
+                    raise
                 context = known_context if isinstance(known_context, dict) else {}
                 human_urls = _normalize_comment_url_set(context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD))
                 profile = (
@@ -6849,6 +7146,194 @@ def _resolve_structural_repair_template(
     except OSError:
         return None, None, None
     return candidate_kind, template_text, template_relpath
+
+
+# ---------------------------------------------------------------------------
+# Structural repair known_scalars / source_spans assembler (Issue #2431)
+#
+# Wires `detect_missing_template_sections()`'s (repair_issue_contract.py)
+# `known_scalars`/`source_spans` parameters -- previously never populated by
+# this production preflight path, so a derivation-eligible missing section
+# fell through to `human_review_required` even when it was actually safely
+# derivable (#2426's manifestation) -- from data ALREADY available on this
+# SAME preflight run: the current Issue body's own Machine-Readable Contract
+# / headings, and (only when the caller has already established the anchor
+# comment is a TRUSTED human-context comment via the EXISTING
+# `_determine_repair_source_lane()`/`_resolve_scope_delta_source_kind()`
+# lane classifier -- no new trusted-anchor judgment logic is added here) the
+# anchor comment body. Never performs a new GitHub read of a DIFFERENT
+# Issue: the structural-repair pass stays local-only, matching
+# `_resolve_structural_repair_template()`'s own local-only design above.
+# ---------------------------------------------------------------------------
+
+# Issue #2431 AC2: the closed pair of consumer field-ids a resolved
+# `parent_issue` scalar is ever cross-populated into -- the "## Parent
+# Issue" template heading field and the Machine-Readable Contract's own
+# `parent_issue` key. Both represent the SAME real-world value.
+_PARENT_ISSUE_KNOWN_SCALAR_FIELD_IDS = ("parent-issue", "machine-readable-contract.parent_issue")
+
+# Issue #2431 AC5: closed, one-way, EXACT heading alias table for the
+# `current_issue` same-body `source_span_exact` authority
+# (repair_issue_contract.py's `_SOURCE_SPAN_AUTHORITY_KINDS` additive
+# extension). Only this ONE pair -- never fuzzy/substring/semantic matching,
+# never any other heading pair.
+_STRUCTURAL_HEADING_ALIAS_TABLE: dict[str, str] = {
+    "Proposed Allowed Paths": "Allowed Paths",
+}
+# Canonical heading label (the alias table's VALUE side) -> template
+# field_id, so the assembler below can key its `source_spans` dict by the
+# SAME field_id `detect_missing_template_sections()` uses.
+_STRUCTURAL_HEADING_LABEL_TO_FIELD_ID: dict[str, str] = {
+    "Allowed Paths": "allowed-paths",
+}
+
+
+def _resolve_parent_issue_known_scalar(
+    body: str,
+    *,
+    trusted_anchor_body: "str | None" = None,
+) -> "str | None":
+    """Resolve a single `parent_issue` scalar (Issue #2431 AC2) cross-
+    populatable into both `_PARENT_ISSUE_KNOWN_SCALAR_FIELD_IDS`, from up to
+    3 candidate sources: the current Issue body's own Machine-Readable
+    Contract `parent_issue` key, its own `## Parent Issue` heading section,
+    and -- ONLY when `trusted_anchor_body` is supplied (the caller must
+    already have established this via the existing human-context lane
+    classifier; this function performs no trust judgment of its own) -- an
+    anchor comment `## Parent Issue` heading section.
+
+    Every candidate is validated with repair_issue_contract.py's OWN closed
+    `machine-readable-contract.parent_issue` validator regex (never a
+    locally re-declared pattern). Zero candidates, or 2+ candidates with
+    DISTINCT values, both resolve to `None` (fail-closed) -- this function
+    never guesses between conflicting sources.
+    """
+    if _mrc_parse is None or _parse_h2_sections is None:  # pragma: no cover - defensive
+        return None
+    validator = _DERIVED_SCALAR_FIELD_VALIDATORS.get("machine-readable-contract.parent_issue")
+    if validator is None:  # pragma: no cover - defensive, validator always registered
+        return None
+
+    candidates: set[str] = set()
+
+    mrc_result = _mrc_parse(body)
+    if mrc_result.get("status") == MRC_PARSE_STATUS_OK:
+        raw = mrc_result["keys"].get("parent_issue")
+        if isinstance(raw, str) and validator.match(raw.strip()):
+            candidates.add(raw.strip())
+
+    def _add_heading_candidate(text: str) -> None:
+        for section in _parse_h2_sections(text):
+            if section["heading"].strip().casefold() == "parent issue":
+                raw = section["content"].strip()
+                if validator.match(raw):
+                    candidates.add(raw)
+                break
+
+    _add_heading_candidate(body)
+    if trusted_anchor_body:
+        _add_heading_candidate(trusted_anchor_body)
+
+    if len(candidates) != 1:
+        return None
+    return next(iter(candidates))
+
+
+def _resolve_current_issue_heading_alias_source_spans(
+    body: str,
+    *,
+    repo: str,
+    issue_number: int,
+) -> "dict[str, dict[str, Any]]":
+    """Detect the closed `_STRUCTURAL_HEADING_ALIAS_TABLE` heading alias
+    (Issue #2431 AC4/AC5) in the CURRENT Issue body and, only when every
+    precondition below holds, return a `source_span_exact` candidate
+    (`authority_kind: current_issue`) keyed by the canonical field's
+    field_id:
+
+      - the alias heading is present EXACTLY ONCE in `body`
+      - the canonical heading is NOT already present in `body`
+      - the alias section has non-empty content
+
+    `source_revision` is set to `sha256(body)` -- since `text` is read
+    directly out of this EXACT in-memory `body` (the same `body` this
+    producer run's `original_body_sha256` is computed from), a downstream
+    consumer can independently confirm `source_revision ==
+    "sha256:" + item["original_body_sha256"]` never crossed a stale/
+    different body snapshot (AC4's same-body / digest-match precondition).
+
+    PR #2469 fix_delta iteration 3 (P1): `line_start`/`line_end` are NOT
+    simply "the line right after the heading" -- ordinary Markdown puts a
+    blank separator line between a `## Heading` and its content (heading ->
+    blank line -> bullets), and `_parse_h2_sections()`'s `content` field is
+    `.strip()`-ed, so the FIRST line of `content` is offset from the raw
+    section start by however many leading blank lines precede it (and the
+    LAST line is likewise offset by trailing blank lines the strip()
+    removed). This function locates the actual raw line range the
+    `.strip()`-ed `content` occupies -- using the SAME
+    `_section_line_bounds()` helper `_apply_insertion_decision()` uses for
+    the identical raw-line-range problem, never a re-derived offset -- so
+    `body.splitlines()[line_start - 1:line_end]` always reconstructs
+    exactly `content`.
+    """
+    if _parse_h2_sections is None or _section_line_bounds is None:  # pragma: no cover - defensive
+        return {}
+
+    sections = _parse_h2_sections(body)
+    heading_index: dict[str, list[dict]] = {}
+    for section in sections:
+        heading_index.setdefault(section["heading"].strip().casefold(), []).append(section)
+
+    body_lines = body.split("\n")
+    bounds = _section_line_bounds(sections, len(body_lines))
+
+    body_digest = "sha256:" + _sha256(body)
+    source_url = f"https://github.com/{repo}/issues/{issue_number}"
+    spans: dict[str, dict[str, Any]] = {}
+    for alias_heading, canonical_heading in _STRUCTURAL_HEADING_ALIAS_TABLE.items():
+        field_id = _STRUCTURAL_HEADING_LABEL_TO_FIELD_ID.get(canonical_heading)
+        if field_id is None:  # pragma: no cover - defensive, table always in sync
+            continue
+        alias_matches = heading_index.get(alias_heading.strip().casefold(), [])
+        canonical_matches = heading_index.get(canonical_heading.strip().casefold(), [])
+        if len(alias_matches) != 1 or len(canonical_matches) != 0:
+            continue
+        alias_section = alias_matches[0]
+        alias_content = alias_section["content"].strip()
+        if not alias_content:
+            continue
+        # Raw (pre-strip) line range of this section's content: the line
+        # right after the heading through the line just before the next
+        # section (or end of body) -- the SAME range `_parse_h2_sections()`
+        # itself joined (pre-strip) to produce `content`.
+        _heading_start, section_end_line = bounds[id(alias_section)]
+        raw_content_start_line = alias_section["start_line"] + 1
+        if raw_content_start_line > section_end_line:  # pragma: no cover - defensive, empty section
+            continue
+        raw_content_lines = body_lines[raw_content_start_line - 1 : section_end_line]
+        raw_content_joined = "\n".join(raw_content_lines)
+        leading_ws_len = len(raw_content_joined) - len(raw_content_joined.lstrip())
+        leading_blank_lines = raw_content_joined[:leading_ws_len].count("\n")
+        line_start = raw_content_start_line + leading_blank_lines
+        line_end = line_start + max(0, alias_content.count("\n"))
+        # Regression guard (PR #2469 fix_delta iteration 3, P1): fail-closed
+        # rather than emit a `source_span_exact` candidate whose line range
+        # does not byte-exactly reconstruct `text` -- a downstream consumer
+        # trusts `line_start`/`line_end` without re-deriving them.
+        if "\n".join(body_lines[line_start - 1 : line_end]) != alias_content:  # pragma: no cover - defensive
+            continue
+        spans[field_id] = {
+            "text": alias_content,
+            "source_url": source_url,
+            "line_start": line_start,
+            "line_end": line_end,
+            "authority_kind": "current_issue",
+            "source_repo": repo,
+            "source_object_kind": "issue_body",
+            "source_object_id": str(issue_number),
+            "source_revision": body_digest,
+        }
+    return spans
 
 
 def run_preflight(
@@ -7378,6 +7863,34 @@ def run_preflight(
                 if _struct_head_sha and _struct_head_sha != "unknown"
                 else None
             )
+
+            # Issue #2431: assemble known_scalars/source_spans from data
+            # ALREADY available on this run (current Issue body's own MRC /
+            # headings, plus -- only when `_repair_source_lane` (computed
+            # above, reusing the SAME canonical human-context/anchor/
+            # unanchored classifier `_determine_repair_source_lane()` --
+            # no new trusted-anchor logic) is `human_context` -- the anchor
+            # comment body) instead of leaving both unset, which previously
+            # made every derivation-eligible missing section fall through to
+            # human_review_required even when it was actually derivable
+            # (#2426's manifestation).
+            _struct_trusted_anchor_body = (
+                anchor_body_for_consumer if _repair_source_lane == "human_context" else None
+            )
+            _struct_known_scalars: dict[str, Any] = {}
+            _struct_parent_issue_scalar = _resolve_parent_issue_known_scalar(
+                issue.get("body", "") or "",
+                trusted_anchor_body=_struct_trusted_anchor_body,
+            )
+            if _struct_parent_issue_scalar is not None:
+                for _struct_field_id in _PARENT_ISSUE_KNOWN_SCALAR_FIELD_IDS:
+                    _struct_known_scalars[_struct_field_id] = _struct_parent_issue_scalar
+            _struct_source_spans = _resolve_current_issue_heading_alias_source_spans(
+                issue.get("body", "") or "",
+                repo=repo,
+                issue_number=issue_number,
+            )
+
             structural_repair_action = build_structural_repair_bundle(
                 issue.get("body", "") or "",
                 issue_kind=_struct_kind,
@@ -7386,6 +7899,8 @@ def run_preflight(
                 repo=repo,
                 issue_number=issue_number,
                 original_updated_at=_repair_original_updated_at,
+                known_scalars=_struct_known_scalars or None,
+                source_spans=_struct_source_spans or None,
                 template_git_blob_sha=_struct_git_blob_sha,
                 template_source_ref=_struct_source_ref,
             )
@@ -7574,7 +8089,11 @@ def run_preflight(
             raw_snapshot=raw_snapshot,
         )
 
-    if consume_contract_patch_plan:
+    # A close-only disposition never proposes or consumes a scope-delta update.
+    _close_not_planned_disposition = _is_approved_close_not_planned_decision(
+        known_context.get("scope_delta_decision") if isinstance(known_context, dict) else None
+    )
+    if consume_contract_patch_plan and not _close_not_planned_disposition:
         sidecar = plan.get("scope_signal_guard_decision_v2")
         authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else None
         patch_plan = authority.get("contract_patch_plan") if isinstance(authority, dict) else None
@@ -7964,8 +8483,24 @@ def run_preflight(
         repair_needs_fix=repair_needs_fix,
     )
 
+    # A verified OWNER close-only decision is a termination disposition, not
+    # a malformed implementation contract. Remove only the missing-contract
+    # fail-closed result and retain every unrelated blocker fail-closed.
+    _close_only_missing_contract_blockers = all(
+        blocker == BLOCKER_FAIL_CLOSED or blocker.startswith("missing_required_section")
+        for blocker in blockers
+    )
+    if _close_not_planned_disposition and _close_only_missing_contract_blockers:
+        blockers[:] = []
+        planner_fail_closed_reason_codes = []
+        planner_fail_closed = False
+        status = "warn"
+        exit_code = EXIT_WARN
+
     # Determine next_action
-    if status == "pass":
+    if _close_not_planned_disposition and _close_only_missing_contract_blockers:
+        next_action = "human_judgment_required"
+    elif status == "pass":
         next_action = "proceed"
     elif status == "needs_fix":
         next_action = "apply_deterministic_repair"
@@ -7988,7 +8523,11 @@ def run_preflight(
     # unattached this run (schema-safe) and its reason codes are still
     # surfaced as non-status-affecting informational blockers so the
     # finding is never silently dropped.
-    if structural_repair_action is not None and structural_repair_route is not None:
+    if (
+        structural_repair_action is not None
+        and structural_repair_route is not None
+        and not _close_not_planned_disposition
+    ):
         _structural_target_status = structural_repair_route["status"]
         if _structural_target_status == STRUCTURAL_REPAIR_ROUTE_STATUS_PASS:
             # no_missing_fields_detected: no status constraint; always safe.

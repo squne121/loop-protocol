@@ -15,10 +15,9 @@ This file covers:
    field (focused workspace, in this case) between the before- and
    after-capture and confirm ``diff_herdr_workspace_snapshot`` reliably
    detects it (never a false "preserved").
-3. An end-to-end CLI poison test: a fake ``herdr`` whose ``api snapshot``
-   answer changes between the first (before) and second (after) call
-   (simulating a genuine ambient workspace/focus mutation happening during
-   the isolated interactive lane run) must FAIL the whole run, not exit 0.
+3. An end-to-end explicit-opt-in CLI poison test: a fake ``herdr`` whose
+   ``api snapshot`` answer changes between the first (before) and second
+   (after) call must FAIL the requested preservation observation, not exit 0.
 """
 
 from __future__ import annotations
@@ -237,8 +236,8 @@ def test_capture_workspace_snapshot_missing_focus_field_is_fail_closed(tmp_path)
 
 
 # ---------------------------------------------------------------------------
-# 2. End-to-end CLI poison test: ambient focus mutation during the isolated
-#    interactive lane run must FAIL the whole run.
+# 2. End-to-end opt-in CLI poison test: ambient focus mutation during the
+#    requested preservation observation must fail closed.
 # ---------------------------------------------------------------------------
 
 _STABLE_SNAPSHOT_CASE = (
@@ -332,7 +331,7 @@ _POISON_HERDR_BODY = (
 )
 
 
-def test_given_ambient_focus_poisoned_during_run_when_interactive_lane_runs_then_fails_closed(
+def test_given_ambient_focus_poisoned_during_opt_in_baseline_preservation_then_fails_closed(
     repo_with_worktree, tmp_path
 ):
     repo, worktree = repo_with_worktree
@@ -351,6 +350,7 @@ def test_given_ambient_focus_poisoned_during_run_when_interactive_lane_runs_then
         "--runtime", "claude", "--mode", "interactive",
         "--prompt-file", str(prompt), "--output-dir", str(out_dir),
         "--expect-marker", "OBSERVED_MARKER",
+        "--require-session-baseline-preservation",
         fake_bin_dir=fake_bin,
         extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
     )
@@ -360,7 +360,7 @@ def test_given_ambient_focus_poisoned_during_run_when_interactive_lane_runs_then
     assert "herdr_workspace_snapshot_preserved: False" in summary
 
 
-def test_given_stable_ambient_focus_when_interactive_lane_runs_then_workspace_snapshot_preserved(
+def test_given_stable_ambient_focus_with_opt_in_baseline_preservation_then_workspace_snapshot_preserved(
     repo_with_worktree, tmp_path
 ):
     """Positive control for the poison test above: an unchanging ``api
@@ -384,6 +384,7 @@ def test_given_stable_ambient_focus_when_interactive_lane_runs_then_workspace_sn
         "--runtime", "claude", "--mode", "interactive",
         "--prompt-file", str(prompt), "--output-dir", str(out_dir),
         "--expect-marker", "OBSERVED_MARKER",
+        "--require-session-baseline-preservation",
         fake_bin_dir=fake_bin,
         extra_env={"HERDR_ENV": "1", "FAKE_HERDR_STATE_DIR": str(state_dir)},
     )

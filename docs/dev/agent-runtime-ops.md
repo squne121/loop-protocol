@@ -549,6 +549,45 @@ Claude Code／Codex CLI の runtime smoke（linked worktree 内での fresh sess
 経由しない。runner は起動・観測・証跡収集だけを所有し、Codex CLI 側の
 sandbox／permission profile（本文書の Root Default Permission Profile）は変更しない。
 
+### Claude のピアメッセージング方針（Issue #2437）
+
+runtime-smoke が起動する Claude process は process-local settings で
+`crossSessionInbound: "refuse"` と bare `permissions.deny` の `SendMessage` /
+`ListAgents` を固定する。structured lane は直接 subprocess のまま、interactive
+lane は fresh isolated Herdr namespace の `agent start ... -- [AGENT_ARG]...`
+pass-through を使う。いずれも global Claude/Herdr config を変更せず、default interactive
+lane は pre-existing human namespace を enumerate、list、snapshot、operate、message、observe
+しない。fresh own session の cleanup のみを行う。既存の
+`--require-session-baseline-preservation` を明示した場合だけ before/after preservation
+observation を fail-closed で実行し、通常実行の `preexisting_herdr_preserved` は `null` とする。
+
+この policy は harness-started process の initial/effective policy を public runner
+input から弱めさせないためのものであり、hostile relaunch、OS/user/account isolation
+を証明する security boundary ではない。Claude-GPT は既存 launcher-owned fixed
+runtime-smoke settings channel だけで同じ値を生成し、caller `--settings` は拒否する。
+
+runtime evidence は configured (`peer_policy_configured`,
+`cross_session_inbound_configured_refuse`) と observed
+(`outbound_peer_tools_absent`, `agent_spawn_completion_observed`,
+`herdr_namespace_isolated`, `preexisting_herdr_preserved`) を区別する。human / independent
+peer を start、list、message、observe して inbound behavior を証明しない。`SendMessage`
+deny 後も維持する lifecycle は `Agent(...)` spawn → terminal completion のみであり、
+post-spawn SendMessage/resume/agent-team coordination は要求しない。feature/runtime が
+利用不能な場合は bounded reason-code SKIP (exit 77) であり PASS へ昇格しない。
+## Claude-GPT 実行時のシークレット非出力固定診断（Issue #2471）
+
+Claude Code linked worktree で `CLAUDE_GPT_HOME` と `HOME` の関係を切り分ける必要がある場合は、任意の環境変数・path・式を受け取る command を作らず、次の fixed literal invocation だけを使う。
+
+```bash
+uv run --locked python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-root-state
+uv run --locked python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-home-class
+uv run --locked python3 scripts/agent-ops/claude_runtime_diag.py claude-gpt-root-relation
+```
+
+helper は `CLAUDE_GPT_HOME` と `HOME` だけを classification 内部で読み、各 successful call では fixed enum 一行だけを stdout に出す。raw environment value、raw absolute path、secret は stdout / stderr に出力しない。unknown probe ID、extra argument、または positional probe ID 以外の invocation は `error=invalid_arguments` と nonzero で拒否する。
+
+classification は raw string の非empty `/` prefix と exact string comparison だけを使う。filesystem access、path expansion / normalization / resolution、symlink resolution、file read は行わない。runtime smoke の prompt と `summary.md` にも fixed enum / boolean 以外を残さず、raw output、prompt、transcript、environment value、path を commit または GitHub へ投稿しない。
+
 ## main drift 選択的再束縛の証跡契約（Issue #2102）
 
 main が並行に前進した場合、issue-refinement-loop / impl-review-loop は base-bound evidence

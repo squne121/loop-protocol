@@ -51,12 +51,43 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 しないため実際に書かれる）を evidence source として同一 session identity・複数
 SubAgent lifecycle・forbidden marker 不在を検証できる）
 
-`--mode interactive` は常に（オプトインではなく）、isolated interactive lane 実行の前後で、その時点で running な herdr session すべてに対して明示的に `herdr --session <name> api snapshot`（PR #2176 OWNER REQUEST_CHANGES Finding 4。デフォルト session だけでなく、人間が attach 中の named session も含めすべて明示的に snapshot する）を取得し、full snapshot（agent の kind・`terminal_id`・native `agent_session`、非 agent pane を含む全 pane record、全 tab record、空 workspace を含む全 workspace record、layout の構造）を、この run 自身が作成した isolated session を除いて完全に一致することを検証する（Issue #2174 AC7、PR #2176 OWNER REQUEST_CHANGES Finding 3）。いずれかのフィールドが取得不能な場合も fail-closed で FAIL とする（session 一覧自体が取得不能な場合も同様。空集合として扱わない）。evidence は `herdr_workspace_snapshot_diffs` / `herdr_workspace_snapshot_preserved` として記録される。なお herdr v0.8.0 の公開 `SessionInfo`（`session list`）には name と独立した `session_id` フィールドが存在しないことを実機確認済みであり、本 skill は `agent`（kind）+ `terminal_id` + native `agent_session`（kind/source/value）を実際に利用可能な最強の agent identity として扱う。
+通常の `--mode interactive` は、高エントロピーな isolated named session を新規生成し、ambient `HERDR_*` を strip して、その session だけを start／stop／delete する。pre-existing/human Herdr namespace を enumerate、list、snapshot、operate、message、observe しない。既存の `--require-session-baseline-preservation` は唯一の明示 opt-in であり、指定時だけ before/after の session identity と full workspace/agent/focus snapshot を取得して fail-closed で比較する。`preexisting_herdr_preserved` はこの opt-in の observed evidence に限り、通常実行では unavailable (`null`) のままにする。
 
 `--transport` と `--keep-pane` は存在しない（PR #1921 human OWNER fix-delta）。structured lane は
 常に direct subprocess、interactive lane は常に isolated named herdr session であり、
 呼び出し元は transport を選択できない。検証 session は常に cleanup 対象であり、残す
 オプションは提供しない。
+
+## Invocation-local Claude peer policy（呼び出し単位の peer 方針、Issue #2437）
+
+native Claude の structured / interactive lane は、harness が所有する invocation-local
+settings に常に次を固定する。global `.claude/settings*`、`~/.claude`、既存 Herdr
+namespace は変更しない。
+
+```json
+{
+  "crossSessionInbound": "refuse",
+  "permissions": {"deny": ["SendMessage", "ListAgents"]}
+}
+```
+
+- structured lane は既存 direct subprocess の `--settings` overlay に hook observability
+  とともに追加する。interactive lane は Herdr が公式に提供する
+  `agent start ... -- [AGENT_ARG]...` pass-through で同じ overlay を渡す。
+- `SendMessage` deny により spawn 後の peer / subagent messaging や resume coordination
+  は要求しない。維持対象は同一 main session の `Agent(...)` spawn と terminal completion
+  lifecycle evidence のみである。
+- evidence は `peer_policy_configured` と
+  `cross_session_inbound_configured_refuse` を configured、
+  `outbound_peer_tools_absent`、`agent_spawn_completion_observed`、
+  `herdr_namespace_isolated`、`preexisting_herdr_preserved` を observed として扱う。
+  inbound peer message の behavioral proof は主張せず、人間または独立 peer を開始・観測・
+  送信先にしない。
+- Claude-GPT adapter は caller `--settings` を受け取らず、launcher-owned fixed
+  runtime-smoke settings channel の同じ policy を使う。SKIP exit 77 は runtime PASS ではない。
+  fresh isolated Herdr launch が nested-session policy で拒否された場合の bounded
+  reason code は `herdr_isolated_session_unavailable`。通常 lane は snapshot を試行せず、
+  opt-in preservation observation の unavailable 結果だけを fail-closed で扱う。
 
 ## Lane 選択
 
@@ -76,7 +107,7 @@ structured lane と interactive lane は異なる bounded-execution 保証を持
 interactive lane は `--output-format` / `--include-hook-events` /
 `--no-session-persistence` / `--max-turns` のような structured-only flag を
 forward しない(herdr の wait timeout・process termination・isolated
-session の stop／delete／removal 確認で bounded execution を担保する)。
+session の stop／delete と launcher process termination で bounded execution を担保する)。
 詳細は `references/claude-code.md` を参照。
 
 ### Lane A: structured smoke（既定・非対話ラン）
@@ -95,8 +126,8 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示等
 
 **人間の使用中 Herdr session には一切相乗りしない。** 実行のたびに高エントロピーな
 named session を新規生成し、その session 内だけで agent lifecycle を駆動し、
-終了時に session そのものを stop／delete し、`herdr session list --json` で消失を
-確認する（確認できない場合は fail-closed で exit 1）。詳細は `references/herdr.md` を参照。
+終了時にその session そのものを stop／delete し、両 command の成功と launcher process
+termination を確認する（確認できない場合は fail-closed で exit 1）。詳細は `references/herdr.md` を参照。
 
 ## Main-Session Agent Identity Evidence（メインセッション Agent Identity 証跡、Issue #2046）
 
@@ -397,9 +428,9 @@ payload が構造的に現れないため、`causal_evidence_source` は今の�
 - herdr 未検出・`HERDR_ENV` 未設定は `mode=interactive` の SKIP（exit 77）とし、structured lane の失敗へ波及させない
 - `blocked` / `unknown` の agent lifecycle state を成功として扱わない
 - interactive lane は毎回新規 isolated named session を生成し、人間の使用中 session・pane・
-  agent・workspace には一切触れない。検証終了時は session 全体を stop／delete し、
-  `herdr session list --json` での消失確認が取れない場合は exit 1 とする（`--keep-pane` 相当の
-  opt-out は存在しない）
+  agent・workspace を enumerate、list、snapshot、operate、message、observe しない。検証終了時は
+  その session だけを stop／delete し、両 command の成功と launcher process termination を
+  確認できない場合は exit 1 とする（`--keep-pane` 相当の opt-out は存在しない）
 - SIGINT／SIGTERM を含む全ての終了経路で isolated session cleanup を実行する
 - 新しい schema、digest、receipt、publisher、state store、semantic verdict classifier を追加しない（Issue #2046 で `main_agent_identity` / `agent_definition` / `skill_evidence` / `mutation_boundary` / `settings_provenance` の 5 フィールドが Issue 契約に基づき追加済み — この制約は Issue 契約に基づかない追加の schema/digest/receipt 拡張を禁じるものであり、既存の Issue 契約で明示的に要求された追加を遡って禁止するものではない）
 
