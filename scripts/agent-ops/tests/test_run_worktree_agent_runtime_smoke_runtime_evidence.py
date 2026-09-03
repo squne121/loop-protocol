@@ -16,6 +16,7 @@ preflight-only SKIP path would never create it).
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import stat
@@ -74,6 +75,17 @@ def _prompt_file(tmp_path: Path, text: str = "hello from test\n") -> Path:
     prompt = tmp_path / "prompt.md"
     prompt.write_text(text, encoding="utf-8")
     return prompt
+
+
+def _summary_field(summary: str, key: str) -> str:
+    """Extract the ``- key: value`` line's value from a persisted summary.md.
+
+    Issue #2421: ``resolved_executable`` is always ``<redacted>`` on success,
+    so identity assertions must instead compare ``resolved_executable_sha256``
+    against a fixture-local expected digest (never a raw path).
+    """
+    line = next(line for line in summary.splitlines() if line.startswith(f"- {key}:"))
+    return line.split(":", 1)[1].strip()
 
 
 def _run(
@@ -164,17 +176,36 @@ def test_resolved_executable_is_single_path_shared_by_version_capture_and_invoca
     REQUEST_CHANGES): the runtime executable must be resolved ONCE via
     ``shutil.which()`` and that same resolved absolute path must be used
     for both version capture and the actual fixed-argv invocation, recorded
-    in evidence as ``resolved_executable``. This fixture places the real
-    fake ``claude`` binary at a symlink-resolved absolute path and asserts
-    ``resolved_executable`` in summary.md points at exactly that same
-    on-disk file the invocation marker proves was actually executed."""
+    in evidence as ``resolved_executable``.
+
+    Issue #2421: ``resolved_executable`` is now always redacted to
+    ``<redacted>`` on success (field-level special case, independent of
+    absolute-path prefix), so raw ``summary.md`` path equality can no
+    longer be used to prove single-executable identity. Instead this
+    fixture places distinct markers in the fake ``claude`` binary's
+    ``--version`` branch (version capture) and its default branch (actual
+    invocation), and proves both markers were written by *this one*
+    on-disk file via ``resolved_executable_sha256`` matching that file's
+    own content digest -- independent, non-self-reported evidence that a
+    single resolved executable served both roles.
+
+    Scope note (Issue #2421 fix-delta): this is a regression check for the
+    once-resolved-path invariant above -- it proves the *same on-disk file*
+    (by content digest, captured once at resolution time) was used for
+    both version capture and invocation. It does NOT guarantee that the
+    executable's bytes/inode were not replaced on disk *during* the
+    runtime window between resolution and invocation (a TOCTOU
+    substitution race); no FD pinning, signing, or attestation is
+    performed here or by the implementation under test."""
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     claude_path = fake_bin / "claude"
+    version_marker = tmp_path / "version-captured.marker"
     invoked_marker = tmp_path / "invoked.marker"
     _write_fake_exe(claude_path, f"""
 if [ "$1" = "--version" ]; then
+  touch "{version_marker}"
   echo "9.9.9 (Claude Code)"
   exit 0
 fi
@@ -192,11 +223,10 @@ exit 0
         fake_bin_dir=fake_bin,
     )
     assert result.returncode == 0, result.stderr
-    assert invoked_marker.exists()
+    assert version_marker.exists(), "runner never reached version capture via the resolved executable"
+    assert invoked_marker.exists(), "runner never reached invocation via the resolved executable"
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "runtime_version: 9.9.9" in summary
-    resolved_line = next(
-        line for line in summary.splitlines() if line.startswith("- resolved_executable:")
-    )
-    resolved_value = resolved_line.split(":", 1)[1].strip()
-    assert resolved_value == os.path.realpath(str(claude_path))
+    assert _summary_field(summary, "resolved_executable") == "<redacted>"
+    expected_sha256 = hashlib.sha256(claude_path.read_bytes()).hexdigest()
+    assert _summary_field(summary, "resolved_executable_sha256") == expected_sha256

@@ -24,7 +24,9 @@ section -- it is not simulated here.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import os
 import stat
 import subprocess
@@ -125,6 +127,17 @@ exit 0
 """
 
 
+def _summary_field(summary: str, key: str) -> str:
+    """Extract the ``- key: value`` line's value from a persisted summary.md.
+
+    Issue #2421: ``resolved_executable`` is always ``<redacted>`` on success,
+    so identity assertions must instead compare ``resolved_executable_sha256``
+    against a fixture-local expected digest (never a raw path).
+    """
+    line = next(line for line in summary.splitlines() if line.startswith(f"- {key}:"))
+    return line.split(":", 1)[1].strip()
+
+
 def test_claude_bin_absolute_path_bypasses_path_resolution(repo_with_worktree, tmp_path):
     """AC1: with ``--claude-bin <absolute path>``, the runner uses that exact
     executable, never consulting ``PATH`` at all. A decoy ``claude`` on
@@ -145,11 +158,13 @@ def test_claude_bin_absolute_path_bypasses_path_resolution(repo_with_worktree, t
 
     prompt = _prompt_file(tmp_path)
     out_dir = tmp_path / "out"
+    evidence_json_path = tmp_path / "evidence.json"
     result = _run(
         repo, worktree,
         "--runtime", "claude", "--mode", "structured",
         "--prompt-file", str(prompt), "--output-dir", str(out_dir),
         "--claude-bin", str(override_bin),
+        "--evidence-json", str(evidence_json_path),
         fake_bin_dir=decoy_bin,
     )
     assert result.returncode == 0, result.stderr
@@ -157,11 +172,21 @@ def test_claude_bin_absolute_path_bypasses_path_resolution(repo_with_worktree, t
     assert not decoy_marker.exists(), "runner invoked the PATH-resolved decoy instead of --claude-bin"
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "runtime_version: 9.0.0-claude-gpt" in summary
-    resolved_line = next(
-        line for line in summary.splitlines() if line.startswith("- resolved_executable:")
-    )
-    resolved_value = resolved_line.split(":", 1)[1].strip()
-    assert resolved_value == os.path.realpath(str(override_bin))
+    # Issue #2421: resolved_executable is always redacted on success
+    # (field-level special case, independent of the value's absolute-path
+    # prefix). Identity is proven via resolved_executable_sha256 against the
+    # fixture-local expected digest of the resolved executable's own bytes.
+    assert _summary_field(summary, "resolved_executable") == "<redacted>"
+    expected_sha256 = hashlib.sha256(Path(override_bin).read_bytes()).hexdigest()
+    assert _summary_field(summary, "resolved_executable_sha256") == expected_sha256
+
+    # Issue #2421 P1 fix-delta: the same redaction invariant must hold for
+    # the machine-generated --evidence-json surface, not just summary.md.
+    # Parse the JSON directly (never regex/substring-match it) so the
+    # assertion is against the actual persisted field values.
+    evidence = json.loads(evidence_json_path.read_text(encoding="utf-8"))
+    assert evidence["resolved_executable"] == "<redacted>"
+    assert evidence["resolved_executable_sha256"] == expected_sha256
 
 
 def test_claude_bin_nonexecutable_path_is_skip_not_crash(repo_with_worktree, tmp_path):
@@ -223,11 +248,13 @@ def test_claude_bin_unspecified_default_behavior_is_unchanged(repo_with_worktree
     assert path_marker.exists(), "PATH-resolved claude was not invoked when --claude-bin is omitted"
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
     assert "runtime_version: 1.0.0-path" in summary
-    resolved_line = next(
-        line for line in summary.splitlines() if line.startswith("- resolved_executable:")
-    )
-    resolved_value = resolved_line.split(":", 1)[1].strip()
-    assert resolved_value == os.path.realpath(str(fake_bin / "claude"))
+    # Issue #2421: resolved_executable is always redacted on success, even
+    # for the pre-existing PATH-resolution default lane. Identity is proven
+    # via resolved_executable_sha256 against the fixture-local expected
+    # digest of the resolved executable's own bytes.
+    assert _summary_field(summary, "resolved_executable") == "<redacted>"
+    expected_sha256 = hashlib.sha256((fake_bin / "claude").read_bytes()).hexdigest()
+    assert _summary_field(summary, "resolved_executable_sha256") == expected_sha256
 
 
 def test_claude_bin_argparse_default_is_none():
