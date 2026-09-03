@@ -761,16 +761,16 @@ def test_fixture_human_context_real_subprocess_reaches_contract_update_required_
     # called in-process (env only, no `pwd` patch) to assert the canary
     # planted at `home/.local/bin/gh` is never admitted into the sanitized
     # PATH (the same CWE-427 same-UID lookalike this test used to plant is
-    # now categorically excluded rather than merely observed), while
-    # `GH_CONFIG_DIR` isolation -- independent of trust-root resolution --
-    # is still preserved.
+    # now categorically excluded rather than merely observed). #2403's exact
+    # bare-only policy also strips `GH_CONFIG_DIR` from this non-bare fixture,
+    # independently of trust-root resolution.
     with patch.dict(os.environ, env, clear=True):
         effective_env = skill_runtime_exec_mod._sanitize_env(
             str(repo), "preflight.run.fixture.with_human_context"
         )
     assert str(canary.parent) not in effective_env["PATH"].split(os.pathsep)
     assert shutil.which("gh", path=effective_env["PATH"]) != str(canary)
-    assert effective_env["GH_CONFIG_DIR"] == str(home / "empty-gh-config")
+    assert "GH_CONFIG_DIR" not in effective_env
     subprocess.run(
         [str(canary.parent / "uv"), "run", "python3", "--version"],
         cwd=repo, env=env, check=True, capture_output=True, text=True, timeout=120,
