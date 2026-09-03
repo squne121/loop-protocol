@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,29 @@ def _run_sh_function(function_name: str, *args: str) -> subprocess.CompletedProc
     quoted_args = " ".join(f'"{arg}"' for arg in args)
     script = f'. "{LIB_SH}"; {function_name} {quoted_args}'
     return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=20)
+
+
+_PERMISSION_REQUEST_HOOK_RE = re.compile(
+    r"# ISSUE_EDITOR_PERMISSION_REQUEST_HOOK_PY_BEGIN\n(.*?)\n# ISSUE_EDITOR_PERMISSION_REQUEST_HOOK_PY_END",
+    re.DOTALL,
+)
+
+
+def _run_issue_editor_permission_request_hook(command: object, *, tool_name: object = "Bash") -> dict | None:
+    """Execute the exact launcher-embedded PermissionRequest hook source."""
+    match = _PERMISSION_REQUEST_HOOK_RE.search(LAUNCH_SH.read_text(encoding="utf-8"))
+    assert match is not None, "PermissionRequest hook source markers are missing from launch.sh"
+    payload = {"tool_name": tool_name, "tool_input": {"command": command}}
+    result = subprocess.run(
+        [sys.executable, "-c", match.group(1)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout) if result.stdout else None
 
 
 # --- AC1: generated_settings_defaults ---------------------------------------
@@ -438,6 +462,73 @@ def test_isolation_and_auto_mode_enforcement_settings_has_classify_all_shell_and
     assert any("proxy-config" in rule for rule in deny_rules)
 
 
+def test_permission_request_hook_is_launcher_owned_and_does_not_add_permissions_allow(tmp_path):
+    """AC1: generated settings wire the narrow hook without weakening policy."""
+    result = _run_launch(tmp_path, ["-p", "hello"])
+    assert result.returncode == 0, result.stderr
+    settings_path = tmp_path / "claude-gpt-home" / "claude" / "settings.local.json"
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    assert payload["autoMode"]["classifyAllShell"] is True
+    assert set(payload["permissions"]) == {"deny"}
+    hook_groups = payload["hooks"]["PermissionRequest"]
+    assert len(hook_groups) == 1
+    assert hook_groups[0]["matcher"] == "Bash"
+    hook = hook_groups[0]["hooks"]
+    assert hook == [{"type": "command", "command": 'python3 "$ISSUE_EDITOR_PERMISSION_REQUEST_HOOK"'}]
+
+
+def test_permission_request_hook_allows_only_the_canonical_seven_token_transaction():
+    command = (
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+        "--input-file .claude/agent-runtime/issue-editor/issue-edit-txn.json"
+    )
+    output = _run_issue_editor_permission_request_hook(command)
+    assert output == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow"},
+        }
+    }
+
+
+def test_permission_request_hook_returns_no_decision_for_canonical_command_from_non_bash_tool():
+    """A matching command string is never authority outside a Bash request."""
+    command = (
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+        "--input-file .claude/agent-runtime/issue-editor/issue-edit-txn.json"
+    )
+    assert _run_issue_editor_permission_request_hook(command, tool_name="Read") is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv run --locked python3 -c 'print(1)'",
+        "python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file safe.json",
+        "gh issue edit 2433 --body x",
+        "uv run --locked python3 .claude/skills/other/scripts/edit.py --input-file safe.json",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file safe.json --extra",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file /tmp/input.json",
+        (
+            "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+            "--input-file .claude/../input.json"
+        ),
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file unsafe;echo",
+        (
+            "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+            "--input-file safe.json && gh issue edit 2433"
+        ),
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file= safe.json",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file",
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file ./safe.json",
+    ],
+)
+def test_permission_request_hook_returns_no_decision_for_every_noncanonical_shape(command):
+    """AC2: shell operators, unsafe operands, and near matches are never allowed."""
+    assert _run_issue_editor_permission_request_hook(command) is None
+
+
 def test_forbidden_extra_flags_list_includes_permission_mode():
     """GIVEN lib.sh の CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS
     WHEN 内容を読む
@@ -633,6 +724,162 @@ def test_runtime_exit_semantics_constants_match_documented_contract():
     assert canary.EXIT_FAIL == 1
     assert canary.EXIT_INVALID_INVOCATION == 2
     assert canary.EXIT_SKIP == 77
+
+
+def test_runtime_exit_semantics_all_mode_includes_issue_editor_permission_lane(tmp_path):
+    """P1-3 regression: `--mode all` は他の lane（agy/github）と同様、
+    issue-editor-permission lane も enumerate しなければならない。以前は
+    `if args.mode == "issue-editor-permission":` という単独 equality 比較の
+    ため `--mode all` から漏れていた。
+
+    github lane が host の ambient `gh` 認証状態に依存して非決定的になるのを
+    避けるため、`gh` を含まない PATH を子プロセスに渡し github lane を
+    deterministic に `gh_binary_not_found` SKIP させる。issue-editor-permission
+    opt-in env var も未設定のままにし、issue-editor-permission lane を
+    deterministic に SKIP させる。
+    """
+    env = dict(os.environ)
+    env["PATH"] = str(tmp_path)
+    env.pop("AUTO_MODE_CANARY_TRUSTED_GH_PATH", None)
+    env.pop(canary.ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV, None)
+    result = subprocess.run(
+        [sys.executable, str(CANARY_PY), "--mode", "all", "--no-evidence"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert result.returncode == canary.EXIT_SKIP, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert "issue_editor_permission" in payload["results"]
+    assert (
+        payload["results"]["issue_editor_permission"]["skip_reason"]
+        == "issue_editor_permission_canary_not_opted_in"
+    )
+    assert "agy" in payload["results"]
+    assert "github" in payload["results"]
+    assert payload["results"]["github"]["skip_reason"] == "gh_binary_not_found"
+
+
+def test_issue_editor_permission_canary_unavailable_is_exit_77_not_pass(monkeypatch):
+    """AC3: absent explicit runtime capability is a machine-readable SKIP."""
+    monkeypatch.delenv(canary.ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV, raising=False)
+    rc, detail = canary.run_issue_editor_permission_request_canary(None)
+    assert rc == canary.EXIT_SKIP
+    assert detail == {"skip_reason": "issue_editor_permission_canary_not_opted_in"}
+
+
+def test_issue_editor_permission_canary_requires_structured_parent_and_child_events():
+    parent = {"name": "Agent", "input": {"subagent_type": "issue-editor"}}
+    child = {"name": "Bash", "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND}}
+    stdout = "\n".join((json.dumps(parent), json.dumps(child)))
+
+    assert canary._stream_json_has_tool_use(stdout, "Agent", subagent_type="issue-editor")
+    assert canary._stream_json_has_tool_use(
+        stdout, "Bash", command=canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND
+    )
+    assert not canary._stream_json_has_tool_use(stdout, "Agent", subagent_type="issue-creator")
+
+
+def test_issue_editor_permission_canary_binds_helper_evidence_to_canonical_bash_result():
+    tool_use_id = "toolu_canonical_bash"
+    helper_result = {
+        "schema": "ISSUE_EDIT_TXN_RESULT_V1",
+        "status": "failed_no_mutation",
+        "mutation_started": False,
+    }
+    stdout = "\n".join(
+        (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": "Bash",
+                                "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND},
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": json.dumps(helper_result),
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps({"type": "result", "result": canary.ISSUE_EDITOR_PERMISSION_CANARY_MARKER}),
+        )
+    )
+
+    assert canary._stream_json_issue_editor_permission_evidence(stdout) == {
+        "canonical_bash_observed": True,
+        "canonical_bash_result_bound": True,
+        "helper_entrypoint_observed": True,
+        "marker_observed": True,
+    }
+
+
+def test_issue_editor_permission_canary_rejects_false_denial_and_unrelated_stdout():
+    """A canonical Bash request plus prompt-like stdout is not evidence.
+
+    In particular, only a structured tool_result tied to that Bash ID may
+    establish ``failed_no_mutation``; a denial string and marker copied into
+    unrelated raw output must not make the real Auto route pass.
+    """
+    tool_use_id = "toolu_canonical_bash"
+    stdout = "\n".join(
+        (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": "Bash",
+                                "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND},
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": "PermissionRequest denied; failed_no_mutation",
+                            }
+                        ]
+                    },
+                }
+            ),
+            "prompt echo: failed_no_mutation " + canary.ISSUE_EDITOR_PERMISSION_CANARY_MARKER,
+        )
+    )
+
+    assert canary._stream_json_issue_editor_permission_evidence(stdout) == {
+        "canonical_bash_observed": True,
+        "canonical_bash_result_bound": False,
+        "helper_entrypoint_observed": False,
+        "marker_observed": False,
+    }
 
 
 # --- AC7: sanitized_evidence ---------------------------------------------------

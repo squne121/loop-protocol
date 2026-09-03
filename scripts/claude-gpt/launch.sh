@@ -1130,6 +1130,80 @@ export CLAUDE_GPT_SPARK_AUTH_DIR="$SPARK_AUTH_DIR_TARGET"
 export SPARK_GATE_WRITER
 SPARK_AGENTS_JSON=$(claude_gpt_spark_agents_json_fragment)
 
+# --- Issue #2433: PermissionRequest narrow escape hatch ----------------------
+#
+# Auto mode deliberately classifies every shell command, so permissions.allow
+# is neither an exact authorization grammar nor an Auto false-deny remedy here.
+# This hook runs only when Claude Code has already reached a permission request;
+# it returns an allow decision for exactly one controlled Issue-edit transaction
+# shape and returns no decision for every other input. Existing deny/ask rules
+# remain outside this hook's authority.
+ISSUE_EDITOR_PERMISSION_REQUEST_HOOK="${PROXY_STATE_DIR_TARGET}/issue-editor-permission-request-${SPARK_LAUNCH_NONCE}.py"
+( umask 077 && cat > "$ISSUE_EDITOR_PERMISSION_REQUEST_HOOK" <<'ISSUE_EDITOR_PERMISSION_REQUEST_HOOK_PY_EOF'
+# ISSUE_EDITOR_PERMISSION_REQUEST_HOOK_PY_BEGIN
+import json
+import re
+import shlex
+import sys
+
+_CANONICAL_PREFIX = (
+    "uv",
+    "run",
+    "--locked",
+    "python3",
+    ".claude/skills/edit-issue/scripts/edit_issue_txn.py",
+    "--input-file",
+)
+_SAFE_REPO_RELATIVE_OPERAND = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def _is_safe_repo_relative_operand(value):
+    if not isinstance(value, str) or not value or value.startswith("-"):
+        return False
+    if not _SAFE_REPO_RELATIVE_OPERAND.fullmatch(value) or value.startswith("/") or "//" in value:
+        return False
+    return all(segment not in ("", ".", "..") for segment in value.split("/"))
+
+
+def _is_canonical_transaction(payload):
+    if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
+        return False
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str):
+        return False
+    try:
+        tokens = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return False
+    return len(tokens) == 7 and tuple(tokens[:6]) == _CANONICAL_PREFIX and _is_safe_repo_relative_operand(tokens[6])
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    if _is_canonical_transaction(payload):
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PermissionRequest",
+                        "decision": {"behavior": "allow"},
+                    }
+                }
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()
+# ISSUE_EDITOR_PERMISSION_REQUEST_HOOK_PY_END
+ISSUE_EDITOR_PERMISSION_REQUEST_HOOK_PY_EOF
+)
+export ISSUE_EDITOR_PERMISSION_REQUEST_HOOK
+
 # --- Issue #2274 AC14/AC15 (PR #2285 OWNER fix-delta P0-1): runtime_smoke_test.sh
 #     専用 launcher-owned canary SubAgent fixture の内部合成経路。caller-owned
 #     `--agents` は CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由で引き続き無条件拒否する
@@ -1191,6 +1265,7 @@ fi
 # within the same event's array, never as a replacement.
 UPS_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" user-prompt-submit"}]}'
 PTU_HOOK_GROUPS='{"matcher": "Agent", "hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" pre-tool-use-agent"}]}'
+PERMISSION_REQUEST_HOOK_GROUPS='{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 \"$ISSUE_EDITOR_PERMISSION_REQUEST_HOOK\""}]}'
 SAS_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" subagent-start"}]}'
 SAP_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" subagent-stop"}]}'
 
@@ -1428,6 +1503,7 @@ fi
 # hook-sink-multi-turn mode, which has no gate equivalent to always emit.
 HOOKS_JSON_FRAGMENT=',
   "hooks": {
+    "PermissionRequest": ['"${PERMISSION_REQUEST_HOOK_GROUPS}"'],
     "UserPromptSubmit": ['"${UPS_HOOK_GROUPS}"'],
     "PreToolUse": ['"${PTU_HOOK_GROUPS}"'],
     "SubagentStart": ['"${SAS_HOOK_GROUPS}"'],

@@ -3,8 +3,24 @@
   "title": "ANCHOR_SCOPE_REFRAME_V1",
   "description": "Schema for trusted anchor comment that approves a scope delta in issue-refinement-loop",
   "type": "object",
-  "required": ["schema_version", "target", "decision", "allowed_path_deltas", "rationale", "required_rerun"],
+  "required": ["schema_version", "target", "decision", "rationale", "required_rerun"],
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {"decision": {"const": "approve_scope_delta"}},
+        "required": ["decision"]
+      },
+      "then": {"required": ["allowed_path_deltas"]}
+    },
+    {
+      "if": {
+        "properties": {"decision": {"const": "close_not_planned"}},
+        "required": ["decision"]
+      },
+      "then": {"not": {"required": ["allowed_path_deltas"]}}
+    }
+  ],
   "properties": {
     "schema_version": {
       "type": "string",
@@ -27,7 +43,7 @@
     },
     "decision": {
       "type": "string",
-      "enum": ["approve_scope_delta"]
+      "enum": ["approve_scope_delta", "close_not_planned"]
     },
     "allowed_path_deltas": {
       "type": "array",

@@ -4301,6 +4301,66 @@ def _anchor_scope_reframe_fence_present(comment_body: str) -> bool:
     return found_related
 
 
+
+_TERMINAL_CLOSE_NOT_PLANNED_MARKER_RE = re.compile(
+    r"^Decision:\s*CLOSE\s*/\s*NOT_PLANNED\s*$", re.IGNORECASE
+)
+
+
+def _has_terminal_close_not_planned_marker(anchor_body: str) -> bool:
+    """Recognize only a final, non-quoted, non-fenced close disposition."""
+    if not isinstance(anchor_body, str):
+        return False
+
+    terminal_lines: list[str] = []
+    in_fence: tuple[str, int] | None = None
+    fence_re = re.compile(r"^ {0,3}(`{3,}|~{3,})(?:[^`~]*)$")
+    for raw_line in anchor_body.splitlines():
+        stripped = raw_line.lstrip()
+        if stripped.startswith(">"):
+            continue
+        fence_match = fence_re.match(raw_line)
+        if in_fence is not None:
+            if fence_match and fence_match.group(1)[0] == in_fence[0] and len(fence_match.group(1)) >= in_fence[1]:
+                in_fence = None
+            continue
+        if fence_match:
+            fence = fence_match.group(1)
+            in_fence = (fence[0], len(fence))
+            continue
+        if raw_line.strip():
+            terminal_lines.append(raw_line.strip())
+
+    return bool(terminal_lines) and bool(
+        _TERMINAL_CLOSE_NOT_PLANNED_MARKER_RE.fullmatch(terminal_lines[-1])
+    )
+
+
+def _approved_close_not_planned_decision(
+    *, author_assoc: str, anchor_url: str, anchor_hash: str, required_rerun: list | None = None
+) -> dict:
+    return {
+        "status": "approved_by_trusted_anchor",
+        "decision": "close_not_planned",
+        "authorized_mutation_category": "not_planned",
+        "implementation_go": False,
+        "anchor_author_association": author_assoc,
+        "anchor_comment_url": anchor_url,
+        "anchor_comment_hash": anchor_hash,
+        "required_rerun": required_rerun or [],
+    }
+
+
+def _is_approved_close_not_planned_decision(decision: "dict | None") -> bool:
+    return (
+        isinstance(decision, dict)
+        and decision.get("status") == "approved_by_trusted_anchor"
+        and decision.get("decision") == "close_not_planned"
+        and decision.get("authorized_mutation_category") == "not_planned"
+        and decision.get("anchor_author_association") == "OWNER"
+        and decision.get("implementation_go") is False
+    )
+
 def _classify_anchor_scope_reframe(
     *,
     comment_payload: "dict",
@@ -4344,6 +4404,23 @@ def _classify_anchor_scope_reframe(
     # Parse ANCHOR_SCOPE_REFRAME_V1 payload from body
     payload = _parse_anchor_scope_reframe_body(anchor_body)
     if payload is None:
+        if _has_terminal_close_not_planned_marker(anchor_body):
+            if author_assoc == "OWNER":
+                return _approved_close_not_planned_decision(
+                    author_assoc=author_assoc,
+                    anchor_url=anchor_url,
+                    anchor_hash=anchor_hash,
+                )
+            return {
+                "status": "fail_closed",
+                "reason": "close_not_planned_requires_owner",
+                "implementation_go": False,
+                "anchor_author_association": author_assoc,
+                "anchor_comment_url": anchor_url,
+                "anchor_comment_hash": anchor_hash,
+                "allowed_path_deltas": [],
+                "required_rerun": [],
+            }
         # #2156 AC1-AC3: distinguish genuine absence (no ```yaml fence at
         # all -- the legitimate freeform lane, #2053/#2086) from
         # present-but-invalid (a fence exists but is malformed YAML,
@@ -4451,9 +4528,30 @@ def _classify_anchor_scope_reframe(
             "required_rerun": [],
         }
 
-    # All checks pass — trusted anchor
+    # close-only termination has a stricter trust boundary than a scope delta.
+    if payload.get("decision") == "close_not_planned":
+        if author_assoc != "OWNER":
+            return {
+                "status": "fail_closed",
+                "reason": "close_not_planned_requires_owner",
+                "implementation_go": False,
+                "anchor_author_association": author_assoc,
+                "anchor_comment_url": anchor_url,
+                "anchor_comment_hash": anchor_hash,
+                "allowed_path_deltas": [],
+                "required_rerun": [],
+            }
+        return _approved_close_not_planned_decision(
+            author_assoc=author_assoc,
+            anchor_url=anchor_url,
+            anchor_hash=anchor_hash,
+            required_rerun=payload.get("required_rerun", []),
+        )
+
+    # All checks pass — trusted scope-delta anchor.
     return {
         "status": "approved_by_trusted_anchor",
+        "decision": "approve_scope_delta",
         "implementation_go": False,
         "anchor_author_association": author_assoc,
         "anchor_comment_url": anchor_url,
@@ -5962,27 +6060,27 @@ def _classify_heavy_mutation_gate(
 
     Heavy mutation categories (close / not planned / replacement Issue
     creation / dependency removal / parent-child relationship change) are
-    blocked unless `scope_delta_decision` reflects an explicit owner-sourced
-    decision (`status == "approved_by_trusted_anchor"` and
-    `anchor_author_association == "OWNER"`). Non-heavy mutation categories
-    (ordinary body improvement / additional investigation / review
+    blocked unless the decision is the exact OWNER-sourced
+    `close_not_planned` disposition bound to the `not_planned` category.
+    Non-heavy mutation categories (ordinary body improvement / additional investigation / review
     continuation) are never blocked here -- they continue with a `warn`
     status, matching the pre-existing advisory-only behavior.
     """
     decision = scope_delta_decision or {}
-    owner_explicit = (
-        decision.get("status") == "approved_by_trusted_anchor"
-        and decision.get("anchor_author_association") == "OWNER"
-    )
     is_heavy = mutation_category in HEAVY_MUTATION_CATEGORIES
+    exact_close_not_planned = (
+        _is_approved_close_not_planned_decision(decision)
+        and mutation_category == "not_planned"
+        and decision.get("authorized_mutation_category") == mutation_category
+    )
 
-    if owner_explicit:
+    if exact_close_not_planned:
         return {
             "mutation_category": mutation_category,
             "is_heavy_mutation": is_heavy,
             "status": "allowed",
             "fail_closed": False,
-            "reason": "owner_explicit_decision_present",
+            "reason": "owner_close_not_planned_decision_present",
         }
 
     if is_heavy:
@@ -7991,7 +8089,11 @@ def run_preflight(
             raw_snapshot=raw_snapshot,
         )
 
-    if consume_contract_patch_plan:
+    # A close-only disposition never proposes or consumes a scope-delta update.
+    _close_not_planned_disposition = _is_approved_close_not_planned_decision(
+        known_context.get("scope_delta_decision") if isinstance(known_context, dict) else None
+    )
+    if consume_contract_patch_plan and not _close_not_planned_disposition:
         sidecar = plan.get("scope_signal_guard_decision_v2")
         authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else None
         patch_plan = authority.get("contract_patch_plan") if isinstance(authority, dict) else None
@@ -8381,8 +8483,24 @@ def run_preflight(
         repair_needs_fix=repair_needs_fix,
     )
 
+    # A verified OWNER close-only decision is a termination disposition, not
+    # a malformed implementation contract. Remove only the missing-contract
+    # fail-closed result and retain every unrelated blocker fail-closed.
+    _close_only_missing_contract_blockers = all(
+        blocker == BLOCKER_FAIL_CLOSED or blocker.startswith("missing_required_section")
+        for blocker in blockers
+    )
+    if _close_not_planned_disposition and _close_only_missing_contract_blockers:
+        blockers[:] = []
+        planner_fail_closed_reason_codes = []
+        planner_fail_closed = False
+        status = "warn"
+        exit_code = EXIT_WARN
+
     # Determine next_action
-    if status == "pass":
+    if _close_not_planned_disposition and _close_only_missing_contract_blockers:
+        next_action = "human_judgment_required"
+    elif status == "pass":
         next_action = "proceed"
     elif status == "needs_fix":
         next_action = "apply_deterministic_repair"
@@ -8405,7 +8523,11 @@ def run_preflight(
     # unattached this run (schema-safe) and its reason codes are still
     # surfaced as non-status-affecting informational blockers so the
     # finding is never silently dropped.
-    if structural_repair_action is not None and structural_repair_route is not None:
+    if (
+        structural_repair_action is not None
+        and structural_repair_route is not None
+        and not _close_not_planned_disposition
+    ):
         _structural_target_status = structural_repair_route["status"]
         if _structural_target_status == STRUCTURAL_REPAIR_ROUTE_STATUS_PASS:
             # no_missing_fields_detected: no status constraint; always safe.
