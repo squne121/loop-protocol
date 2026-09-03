@@ -8,31 +8,50 @@ direct subprocess, ``--claude-agent-name pr-reviewer``). This script does
 event parsing -- all of that remains owned by the runner it calls out to
 (Issue #1881 Stop Conditions forbid changing that runner).
 
-Agent discovery route (PR #2385 fix_delta -- confirmed upstream bug workaround)
+Agent discovery route (PR #2385 fix_delta -- historical upstream-bug
+workaround, retained today for a different, current reason -- #2430)
 --------------------------------------------------------------------------------
 The runner's file-based ``--agent pr-reviewer`` project-discovery lookup
-(``.claude/agents/pr-reviewer.md``, scanned by Claude Code itself) hits a
-confirmed OPEN upstream Claude Code bug when cwd is a git worktree linked via
-a ``.git`` file pointing at ``commondir``: custom agents under
-``.claude/agents/`` are not discovered at all
-(https://github.com/anthropics/claude-code/issues/25816). This is NOT a
-workspace-trust issue and NOT something fixable in this repo. To route
-around it without touching the runner (Issue #1881 Stop Conditions forbid
-changing ``run_worktree_agent_runtime_smoke.py``), this script mechanically
-translates the *live* candidate ``.claude/agents/pr-reviewer.md`` frontmatter
-+ body (read fresh from the worktree under test on every case invocation --
-never a cached/hardcoded copy) into the officially-documented, session-local
-``--agents <json>`` CLI format (see ``translate_agent_definition_to_agents_json``)
-and injects it via the runner's own existing, documented ``--claude-bin``
-extension point (an "absolute path to a claude-compatible executable ...
-or a transparent wrapper", per that flag's own help text) rather than
-``--hermetic-agent-definition`` (Issue #2046), which is explicitly out of
-scope here because it hardcodes ``tools: ["Read"]`` and replaces
-``.claude/settings.json`` with a fixed deny-all-mutation session-local
-``--settings`` file -- neither of which would exercise the actual
-``hooks``/``tools``/``permissionMode`` frontmatter fields this Issue's P0/P1
-fixes are being verified against, and both of which would suppress the
-production settings/permission surface AC4/AC5 need to observe.
+(``.claude/agents/pr-reviewer.md``, scanned by Claude Code itself) is a
+genuinely separate mechanism from the session-local ``--agents <json>``
+passthrough this script builds (see ``translate_agent_definition_to_agents_json``
+/ ``build_agents_json_passthrough_argv`` below) -- the two are never treated
+as equivalent here.
+
+Historical reason this passthrough was introduced: upstream
+https://github.com/anthropics/claude-code/issues/25816 ("Custom agents in
+``.claude/agents/`` not discovered when running from git worktree") used to
+make the file-based ``--agent pr-reviewer`` lookup fail entirely when cwd was
+a git worktree linked via a ``.git`` file pointing at ``commondir``. That
+upstream issue is now **CLOSED**, fixed in Claude Code **v2.1.47** (2026-02-18
+release notes: "Fixed custom agents and skills not being discovered when
+running from a git worktree ... (#25816)"), so the file-based lookup is no
+longer known to be broken from a worktree cwd on a current Claude Code
+install.
+
+Current reason this passthrough is still used (not "upstream is still
+broken"): it lets this script freshly read the *live* candidate
+``.claude/agents/pr-reviewer.md`` frontmatter + body straight from the
+worktree under test on every case invocation (never a cached/hardcoded copy)
+and explicitly bind it as a session-local ``--agents <json>`` payload for
+that exact subprocess invocation -- removing any ambiguity about which
+effective agent definition (project-discovered vs. session-local) is
+actually in force at runtime, independent of whichever Claude Code version
+happens to be installed. To keep doing this without touching the runner
+(Issue #1881 Stop Conditions forbid changing
+``run_worktree_agent_runtime_smoke.py``), this script mechanically
+translates that frontmatter + body into the officially-documented
+``--agents <json>`` CLI format and injects it via the runner's own existing,
+documented ``--claude-bin`` extension point (an "absolute path to a
+claude-compatible executable ... or a transparent wrapper", per that flag's
+own help text) rather than ``--hermetic-agent-definition`` (Issue #2046),
+which is explicitly out of scope here because it hardcodes
+``tools: ["Read"]`` and replaces ``.claude/settings.json`` with a fixed
+deny-all-mutation session-local ``--settings`` file -- neither of which
+would exercise the actual ``hooks``/``tools``/``permissionMode`` frontmatter
+fields this Issue's P0/P1 fixes are being verified against, and both of
+which would suppress the production settings/permission surface AC4/AC5
+need to observe.
 See ``build_agents_json_passthrough_argv`` below. This never uses
 ``--add-dir`` (confirmed to break ``CLAUDE_PROJECT_DIR`` resolution needed
 by the hooks' ``${CLAUDE_PROJECT_DIR}`` interpolation).
@@ -261,12 +280,21 @@ EVIDENCE_STATUS_OBSERVED = "observed"
 EVIDENCE_STATUS_UNAVAILABLE = "unavailable"
 
 # Issue #25816 (https://github.com/anthropics/claude-code/issues/25816):
-# confirmed OPEN upstream Claude Code bug -- custom agents under
-# ``.claude/agents/`` are not discovered when cwd is a git worktree. This
-# script routes around it via a session-local ``--agents`` JSON passthrough
-# (see ``translate_agent_definition_to_agents_json`` /
-# ``build_agents_json_passthrough_argv``) instead of relying on the
-# ``--agent <name>`` file-based project-discovery lookup alone.
+# "Custom agents in .claude/agents/ not discovered when running from git
+# worktree" -- this upstream issue is CLOSED, fixed in Claude Code v2.1.47
+# (2026-02-18 release notes: "Fixed custom agents and skills not being
+# discovered when running from a git worktree ... (#25816)"). Historically
+# this was the reason the session-local ``--agents`` JSON passthrough (see
+# ``translate_agent_definition_to_agents_json`` /
+# ``build_agents_json_passthrough_argv``) was introduced as a workaround for
+# the file-based ``--agent <name>`` project-discovery lookup. It is retained
+# today for a different, current reason: it lets this script freshly read
+# and explicitly session-local-bind the candidate's live agent definition on
+# every invocation, avoiding ambiguity about which effective agent
+# definition (project-discovered vs. session-local) is actually in force --
+# not because the file-based discovery route is still known to be broken.
+# The two remain distinct, separate mechanisms; this constant is not used to
+# imply they are equivalent.
 UPSTREAM_WORKTREE_AGENT_DISCOVERY_BUG_REF = (
     "https://github.com/anthropics/claude-code/issues/25816"
 )
@@ -649,10 +677,15 @@ def run_runtime_case(
     if require_clean_postcondition:
         cmd.append("--require-clean-postcondition")
 
-    # Issue #25816 workaround (see module docstring): route agent discovery
-    # through a session-local --agents JSON passthrough instead of relying
-    # on the runner's file-based --agent <name> project-discovery lookup
-    # alone, which is confirmed broken from a git-worktree cwd upstream.
+    # Issue #25816 (see module docstring) is CLOSED, fixed in Claude Code
+    # v2.1.47 -- the file-based --agent <name> project-discovery lookup is
+    # no longer known to be broken from a git-worktree cwd. This script
+    # still routes agent discovery through a session-local --agents JSON
+    # passthrough instead of relying on that file-based lookup alone, but
+    # the current reason is to freshly read and explicitly session-local-
+    # bind the candidate's live agent definition on every invocation
+    # (avoiding ambiguity about which effective definition is actually in
+    # force), not because the file-based route is still broken.
     process_error: str | None = None
     real_claude_bin = shutil.which("claude")
     if real_claude_bin is None:
