@@ -1,6 +1,6 @@
 ---
 name: run
-description: Claude Code / Claude-GPT の run 証跡・repository・live Web から改善候補（agent_improvement_candidate/v1）を proposal-only で生成する単発実行（one-shot）の retrospective orchestrator（agent-retrospective plugin distribution 版）。人間の明示トリガーでのみ起動する（自動起動しない）。`.claude/` を持たない任意の repository に `claude --plugin-dir` でインストールして使う portable 版。
+description: 標準経路では repository/codebase と live Web の 2 source のみを自動調査し、Claude Code / Claude-GPT の run 証跡（runtime evidence）は `run_retrospective.py` を lower-level CLI で直接起動し `--runtime-evidence-file` を明示指定した場合にのみ追加調査する（3 source が標準構成で並列に存在するわけではない）、改善候補（agent_improvement_candidate/v1）を proposal-only で生成する単発実行（one-shot）の retrospective orchestrator（agent-retrospective plugin distribution 版）。人間の明示トリガーでのみ起動する（自動起動しない）。`.claude/` を持たない任意の repository に `claude --plugin-dir` でインストールして使う portable 版。
 disable-model-invocation: true
 allowed-tools: Bash
 ---
@@ -65,12 +65,25 @@ observer には実質のある task が必ず渡り、`findings: []` を決め�
 には到達しない**（Issue #2240 fix_delta P0-1、旧実装は `prompts=None` のとき 3 observer 全員に
 「findings を空配列にせよ」という空調査プロンプトを渡していた回帰バグ）。
 
+**標準経路（上記の単一 Bash 呼び出し）が実際に渡すオプションは `--repo-root`/`--plugin-root`/
+`--state-backend fixture`/`--task "$ARGUMENTS"` のみである。** `$ARGUMENTS` は `--task` の値へ
+機械転送されるだけであり、それを再解析して他の CLI option へブリッジする経路は存在しない -- 例えば
+`/agent-retrospective:run --repository-id foo/bar` と入力しても、これは `--repository-id foo/bar`
+という文字列がそのまま task text として `--task` に渡るだけで、`run_retrospective.py
+--repository-id foo/bar` という CLI 呼び出しにはならない。
+
 `--repository-id` / `--target-issue` / `--request-id` / `--idempotency-key` はすべて任意である
-（下記「入力契約の自動導出」参照）。`--schema-dir` は observer/evaluator 用 JSON Schema の配置先を
-差し替える場合にのみ指定する override option であり、通常は省略してよい（既定値は
-`${CLAUDE_PLUGIN_ROOT}/skills/run/schemas`）。`--runtime-evidence-file <path>` は明示的に runtime
-evidence を渡したい場合にのみ指定する任意 option（下記「observer wave」参照。省略時（標準経路）は
-`retrospective-runtime-observer` 自体を起動しない）。
+（下記「入力契約の自動導出」参照）。ただしこれらは `run_retrospective.py` 自身が持つ CLI option で
+あり、標準 `/agent-retrospective:run` 呼び出しからは指定できない -- 値を渡したい場合は
+`run_retrospective.py` を（`$ARGUMENTS`/標準 Skill 経路を使わず）直接起動する必要がある
+（`../../README.md` の「advanced / lower-level interface」参照）。特に origin remote を持たない
+repository では `--repository-id` の自動導出（`git remote get-url origin`）ができず、標準経路には
+これを補う手段がないため、`repository_id_unresolved` として必ず失敗する。`--schema-dir` は
+observer/evaluator 用 JSON Schema の配置先を差し替える場合にのみ指定する override option であり、
+通常は省略してよい（既定値は `${CLAUDE_PLUGIN_ROOT}/skills/run/schemas`）。`--runtime-evidence-file
+<path>` も同様に、標準 `/agent-retrospective:run` 呼び出しからは指定できない `run_retrospective.py`
+の CLI option である（下記「observer wave」参照。省略時（標準経路）は `retrospective-runtime-
+observer` 自体を起動しない）。
 
 `uv run --project "${CLAUDE_PLUGIN_ROOT}" --locked` は、`${CLAUDE_PLUGIN_ROOT}/pyproject.toml` /
 `uv.lock` が固定する Python dependency closure（`jsonschema`。test-only の `pytest` は
