@@ -171,6 +171,28 @@ clean_install_smoke.sh`（Issue #2240 AC5）は default branch 名が `main` で
 （`git init -b portability-smoke`）でこの smoke を実施し、この portability defect を隠さないことを
 確認する。
 
+## Run Identity Provenance Boundary（base_sha と working tree の境界を明示する節）
+
+`base_sha`（40 桁 commit SHA。上記「base_sha resolution」参照）は `skills/run/scripts/
+collect_snapshot.py` が `git ls-tree -r -z --full-tree <base_sha>` で読み取る、immutable な
+commit-tree snapshot の anchor である。
+
+一方で `codebase-investigator` observer（Read/Grep/Glob。`agents/codebase-investigator.md`
+参照）は実行時の live `${CLAUDE_PROJECT_DIR}` working tree を直接参照する。working tree は
+staged / unstaged / untracked な変更を反映しうるため、`base_sha` は run の repository anchor
+ではあるが、その run のすべての code finding が `base_sha` の内容だけから得られたことを証明する
+provenance attestation ではない -- observer が実際に読んだファイル内容が、`base_sha` が指す
+commit-tree の内容と常に一致するとは限らない。
+
+`source_set_digest` はこの commit-tree や working tree の content digest ではない。
+`source_set_digest` は collector が生成した `source_observations` に対する deterministic
+sha256 digest であり（`skills/run/scripts/validate_retrospective_schema.py` の
+`compute_source_set_digest()` 準拠）、ファイルやツリーの内容そのものを hash したものではない。
+
+`source_set_digest` の主用途は `(repo, base_sha, source_set_digest, scope)` の組による
+idempotency（重複書き込み抑制。`docs/adr/0007-agent-retrospective-boundaries.md` Decision 5
+参照）であり、optimistic-concurrency token（古い前提での上書き防止）ではない。
+
 ## Marketplace / semver / rollback（Out of Scope、対象範囲外）
 
 Marketplace への公開申請・審査対応、明示的な semver version フィールドの必須化・version bump 運用

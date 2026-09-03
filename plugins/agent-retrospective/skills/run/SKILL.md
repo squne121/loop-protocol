@@ -229,6 +229,27 @@ cleanup_required: true
 `schemas/evaluation_result_v1.schema.json`）と、canonical 改善候補 schema
 （`schemas/agent_improvement_candidate_v1.schema.json`）はこの plugin にバンドルされている。
 
+## Run Identity Provenance Boundary（base_sha と working tree の境界を明示する節）
+
+`base_sha`（40 桁 commit SHA。上記「入力契約の自動導出」「3. 準備（prepare）」参照）は
+`scripts/collect_snapshot.py` が `git ls-tree -r -z --full-tree <base_sha>` で読む immutable な
+commit-tree snapshot の anchor である。
+
+`codebase-investigator` observer（Read/Grep/Glob。`agents/codebase-investigator.md` 参照）は
+実行時の live `${CLAUDE_PROJECT_DIR}` working tree を直接参照するため、staged / unstaged /
+untracked な変更を反映しうる。したがって `base_sha` は run の repository anchor ではあるが、その
+run のすべての code finding が `base_sha` の内容だけから得られたことを証明する provenance
+attestation ではない。
+
+`source_set_digest`（上記「Ephemeral wire contract」参照）は commit-tree や working tree の
+content digest ではなく、collector が生成した `source_observations` に対する deterministic
+sha256 digest である（`scripts/validate_retrospective_schema.py` の `compute_source_set_digest()`
+準拠）。
+
+`source_set_digest` の主用途は `(repo, base_sha, source_set_digest, scope)` による idempotency
+（重複抑制。`docs/adr/0007-agent-retrospective-boundaries.md` Decision 5 参照）であり、
+optimistic-concurrency token ではない。
+
 ## Guardrails（ガードレール）
 
 - **Allowed Paths 外を編集しない**
