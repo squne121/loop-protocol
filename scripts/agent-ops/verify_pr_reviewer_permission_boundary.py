@@ -25,19 +25,22 @@ make the file-based ``--agent pr-reviewer`` lookup fail entirely when cwd was
 a git worktree linked via a ``.git`` file pointing at ``commondir``. That
 upstream issue is now **CLOSED**, fixed in Claude Code **v2.1.47** (2026-02-18
 release notes: "Fixed custom agents and skills not being discovered when
-running from a git worktree ... (#25816)"), so the file-based lookup is no
-longer known to be broken from a worktree cwd on a current Claude Code
-install.
+running from a git worktree ... (#25816)"). #25816's startup-time
+worktree discovery defect was fixed in Claude Code v2.1.47; this is not a
+claim that worktree-cwd discovery in general has no other known issues on
+a current Claude Code install.
 
 Current reason this passthrough is still used (not "upstream is still
 broken"): it lets this script freshly read the *live* candidate
 ``.claude/agents/pr-reviewer.md`` frontmatter + body straight from the
 worktree under test on every case invocation (never a cached/hardcoded copy)
 and explicitly bind it as a session-local ``--agents <json>`` payload for
-that exact subprocess invocation -- removing any ambiguity about which
-effective agent definition (project-discovered vs. session-local) is
-actually in force at runtime, independent of whichever Claude Code version
-happens to be installed. To keep doing this without touching the runner
+that exact subprocess invocation -- explicitly supplying the candidate
+definition at session scope, which eliminates ambiguity between the
+candidate project definition and lower-priority project/user/plugin
+discovery paths (session-local ``--agents`` does not override
+higher-priority managed settings, per current Claude Code precedence). To
+keep doing this without touching the runner
 (Issue #1881 Stop Conditions forbid changing
 ``run_worktree_agent_runtime_smoke.py``), this script mechanically
 translates that frontmatter + body into the officially-documented
@@ -472,7 +475,8 @@ def preflight_capability(worktree_abs: str) -> tuple[bool, str, dict[str, Any]]:
     return True, "", detail
 
 
-# ─── Agent discovery: --agents JSON passthrough (Issue #25816 workaround) ──
+# ─── Agent discovery: --agents JSON passthrough (historically introduced
+# for #25816; retained for candidate-definition binding) ──────────────────
 
 
 def translate_agent_definition_to_agents_json(agent_md_path: Path, agent_name: str) -> dict[str, Any]:
@@ -532,8 +536,8 @@ def build_agents_json_passthrough_argv(
 ) -> list[str]:
     """Build the extra runner CLI args that route agent discovery through a
     session-local ``--agents <json>`` payload instead of the file-based
-    ``--agent <name>`` project-discovery lookup alone (Issue #25816
-    workaround, see module docstring).
+    ``--agent <name>`` project-discovery lookup alone (historically
+    introduced for #25816; see module docstring).
 
     Does NOT modify ``run_worktree_agent_runtime_smoke.py``: this uses that
     runner's existing, documented ``--claude-bin`` extension point (an
@@ -677,15 +681,14 @@ def run_runtime_case(
     if require_clean_postcondition:
         cmd.append("--require-clean-postcondition")
 
-    # Issue #25816 (see module docstring) is CLOSED, fixed in Claude Code
-    # v2.1.47 -- the file-based --agent <name> project-discovery lookup is
-    # no longer known to be broken from a git-worktree cwd. This script
-    # still routes agent discovery through a session-local --agents JSON
-    # passthrough instead of relying on that file-based lookup alone, but
-    # the current reason is to freshly read and explicitly session-local-
-    # bind the candidate's live agent definition on every invocation
-    # (avoiding ambiguity about which effective definition is actually in
-    # force), not because the file-based route is still broken.
+    # Issue #25816 (see module docstring) is CLOSED: its startup-time
+    # git-worktree-cwd discovery defect was fixed in Claude Code v2.1.47.
+    # This script still routes agent discovery through a session-local
+    # --agents JSON passthrough instead of relying on that file-based
+    # lookup alone, but the current reason is to freshly read and
+    # explicitly session-local-bind the candidate's live agent definition
+    # on every invocation (explicitly supplying the candidate definition
+    # at session scope), not because the file-based route is still broken.
     process_error: str | None = None
     real_claude_bin = shutil.which("claude")
     if real_claude_bin is None:
