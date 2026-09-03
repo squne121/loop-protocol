@@ -30,6 +30,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[5]
 _GUARDS_DIR = _REPO_ROOT / "scripts" / "agent-guards"
 if str(_GUARDS_DIR) not in sys.path:
@@ -42,6 +44,56 @@ _CAPABILITY_ENV_NAMES = (
     "LOOP_SPARK_FALLBACK",
     "LOOP_PLANNED_OPERATIONS_JSON",
 )
+
+
+_GH_CONFIG_DIR_CARRIER_COMMAND_IDS = (
+    "preflight.run",
+    "contract_update.run.with_anchor",
+    "contract_update.run.with_human_context",
+    "repair_action.apply",
+    "structural_repair_action.apply",
+)
+
+_GH_CONFIG_DIR_NON_CARRIER_COMMAND_IDS = (
+    "",
+    "preflight.run.with_anchor",
+    "preflight.run.with_human_context",
+    "preflight.run.with_agent_report",
+    "preflight.run.fixture",
+    "preflight.run.fixture.with_human_context",
+    "authority_transport.consume",
+    "unrelated.command",
+)
+
+
+@pytest.mark.parametrize("command_id", _GH_CONFIG_DIR_CARRIER_COMMAND_IDS)
+def test_sanitize_env_carries_gh_config_dir_only_for_evidence_backed_consumers(monkeypatch, command_id):
+    """Only exact GitHub CLI consumer commands retain the caller path."""
+    configured_path = "/non-secret/launcher-gh-config"
+    monkeypatch.setenv("GH_CONFIG_DIR", configured_path)
+
+    env = sre._sanitize_env("/fake/project/root", command_id=command_id)
+
+    assert env["GH_CONFIG_DIR"] == configured_path
+
+
+@pytest.mark.parametrize("command_id", _GH_CONFIG_DIR_NON_CARRIER_COMMAND_IDS)
+def test_sanitize_env_strips_gh_config_dir_for_non_carrier_commands(monkeypatch, command_id):
+    """Profiles, mixed-mode transport, and unknown IDs never gain the carrier."""
+    monkeypatch.setenv("GH_CONFIG_DIR", "/non-secret/launcher-gh-config")
+
+    env = sre._sanitize_env("/fake/project/root", command_id=command_id)
+
+    assert "GH_CONFIG_DIR" not in env
+
+
+@pytest.mark.parametrize("command_id", _GH_CONFIG_DIR_CARRIER_COMMAND_IDS)
+def test_sanitize_env_never_synthesizes_gh_config_dir_for_carrier_commands(monkeypatch, command_id):
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    assert "GH_CONFIG_DIR" not in sre._sanitize_env("/fake/project/root", command_id=command_id)
+
+    monkeypatch.setenv("GH_CONFIG_DIR", "")
+    assert "GH_CONFIG_DIR" not in sre._sanitize_env("/fake/project/root", command_id=command_id)
 
 
 def test_sanitize_env_carries_capability_request_for_bare_preflight_run(monkeypatch):

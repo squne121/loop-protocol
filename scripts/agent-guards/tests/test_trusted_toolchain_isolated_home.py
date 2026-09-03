@@ -504,17 +504,16 @@ def test_required_uv_version_reads_repo_pyproject_toml_ssot():
 # ---------------------------------------------------------------------------
 # PR #2247 review P1-4.3: `_sanitize_env` must be proven against a real
 # child process's actual environment/stdout/stderr/artifact, not just an
-# in-process dict comparison. The existing in-process assertions on
-# `_sanitize_env`'s return value are kept elsewhere; this test adds the
-# missing black-box layer.
+# in-process dict comparison. The focused command-ID matrix lives in
+# `test_skill_runtime_exec_env_allowlist.py`; this file retains only the
+# independent black-box secret/non-forwarding proof.
 # ---------------------------------------------------------------------------
 
 
 def test_sanitize_env_secret_canary_never_reaches_real_child_process(monkeypatch, tmp_path):
     """GIVEN a secret canary embedded only in a fake host `GH_CONFIG_DIR`
-    (its env var value AND its on-disk `hosts.yml` content -- the thing an
-    isolated Claude-GPT session's launcher must never forward, per Issue
-    #2241 AC2 / #2232 comment 5316900237)
+    (its env var value AND its on-disk `hosts.yml` content -- data that this
+    default executor command must never forward)
     WHEN `_sanitize_env` builds a child environment for the default
     (non-fixture) command lane, and that environment is used to spawn a
     REAL child process (not an in-process mock)

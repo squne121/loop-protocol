@@ -134,7 +134,7 @@ def _write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def _install_real_capability_preflight_fixture(repo_root: Path) -> None:
+def _install_real_capability_preflight_fixture(repo_root: Path, *, trusted_gh_bin: Path | None = None) -> None:
     """Install the REAL production first-hop chain
     (`skill_runtime_exec.py` -> `workflow_start_entry.py` ->
     `root_entry_router.capability_preflight_result()` ->
@@ -152,6 +152,36 @@ def _install_real_capability_preflight_fixture(repo_root: Path) -> None:
         ".claude/skills/issue-refinement-loop/scripts/root_entry_router.py",
     ):
         _write_from_source(repo_root, rel)
+
+    if trusted_gh_bin is not None:
+        # The real executor intentionally discards caller PATH and constructs
+        # a fixed trusted PATH.  Keep that production selection behavior in
+        # this actual-process fixture, but prepend one fixture-owned fixed
+        # directory so its controlled `gh` is selected instead of any host
+        # GitHub CLI.  Ambient PATH is never used.
+        executor_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_exec.py"
+        source = executor_path.read_text(encoding="utf-8")
+        default_system_path = '''_SYSTEM_STANDARD_PATH_DIRS: tuple[str, ...] = (
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
+'''
+        fixture_system_path = f'''_SYSTEM_STANDARD_PATH_DIRS: tuple[str, ...] = (
+    {str(trusted_gh_bin)!r},
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
+'''
+        assert default_system_path in source
+        executor_path.write_text(source.replace(default_system_path, fixture_system_path), encoding="utf-8")
 
     pin = _pinned_uv_version(REPO_ROOT)
     _write_text(
@@ -224,6 +254,10 @@ def main() -> int:
         marker = Path(marker_path)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("inner-preflight-ran")
+    probe_log_path = os.environ.get("SKILL_RUNTIME_TEST_GH_PROBE_LOG")
+    if probe_log_path:
+        with Path(probe_log_path).open("a", encoding="utf-8") as probe_log:
+            probe_log.write("inner-preflight-start\\n")
     print('{"schema": "refinement_preflight_result/v1", "status": "ready"}')
     return 0
 
@@ -263,6 +297,118 @@ def _run_executor(
         env=env,
         check=False,
     )
+
+
+def _write_controlled_gh(trusted_bin: Path) -> None:
+    """Install a no-network GitHub CLI stand-in for the fixed trusted PATH.
+
+    It reads only GH_CONFIG_DIR presence plus equality with a test-owned
+    expected path, then records an opaque match status and command order.  It
+    never opens configuration files or observes token/HOME values; forwarded
+    credential keys are rejected without expanding or recording their values.
+    """
+    trusted_bin.mkdir(parents=True)
+    gh_path = trusted_bin / "gh"
+    gh_path.write_text(
+        """#!/bin/sh
+set -eu
+if [ -n "${GH_CONFIG_DIR:-}" ] && [ "${GH_CONFIG_DIR}" = "${SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR:-}" ]; then
+    gh_config_state=expected_path
+else
+    gh_config_state=missing_or_wrong_path
+fi
+if [ "${GH_TOKEN+x}" = x ] || \
+   [ "${GITHUB_TOKEN+x}" = x ] || \
+   [ "${GH_ENTERPRISE_TOKEN+x}" = x ] || \
+   [ "${GITHUB_ENTERPRISE_TOKEN+x}" = x ]; then
+    printf '%s\n' "unexpected-credential-environment" >> "${SKILL_RUNTIME_TEST_GH_PROBE_LOG}"
+    exit 65
+fi
+if [ "$#" -eq 5 ] && \
+   [ "$1" = "auth" ] && \
+   [ "$2" = "status" ] && \
+   [ "$3" = "--active" ] && \
+   [ "$4" = "--hostname" ] && \
+   [ "$5" = "github.com" ]; then
+    probe=gh-auth
+elif [ "$#" -eq 5 ] && \
+     [ "$1" = "repo" ] && \
+     [ "$2" = "view" ] && \
+     [ "$3" = "github.com/squne121/loop-protocol" ] && \
+     [ "$4" = "--json" ] && \
+     [ "$5" = "name" ]; then
+    probe=gh-repo-view
+elif [ "$#" -eq 6 ] && \
+     [ "$1" = "api" ] && \
+     [ "$2" = "--hostname" ] && \
+     [ "$3" = "github.com" ] && \
+     [ "$4" = "repos/squne121/loop-protocol" ] && \
+     [ "$5" = "--jq" ] && \
+     [ "$6" = "{name}" ]; then
+    probe=controlled-gh-api
+else
+    printf '%s\n' "unexpected-gh-argv" >> "${SKILL_RUNTIME_TEST_GH_PROBE_LOG}"
+    exit 64
+fi
+printf '%s\\n' "${probe}:gh_config=${gh_config_state}" >> "${SKILL_RUNTIME_TEST_GH_PROBE_LOG}"
+[ "${gh_config_state}" = "expected_path" ]
+""",
+        encoding="utf-8",
+    )
+    gh_path.chmod(0o755)
+
+
+def test_canonical_executor_preserves_gh_config_dir_to_root_github_probes_before_inner_preflight(
+    tmp_path: Path,
+) -> None:
+    """An isolated-HOME process crosses the real executor -> workflow-start
+    -> root router -> capability producer path.  The controlled fixed-PATH
+    `gh` sees only a non-secret GH_CONFIG_DIR path-identity match before the
+    inner preflight starts; no GitHub network/auth/mutation is possible."""
+    repo = _make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    _write_controlled_gh(trusted_gh_bin)
+    _install_real_capability_preflight_fixture(repo, trusted_gh_bin=trusted_gh_bin)
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    gh_config_dir = tmp_path / "launcher-gh-config"
+    gh_config_dir.mkdir()
+    inner_marker = tmp_path / "inner-ran.marker"
+    probe_log = tmp_path / "probe-order.log"
+
+    result = _run_executor(
+        repo,
+        inner_marker,
+        extra_env={
+            "HOME": str(isolated_home),
+            "GH_CONFIG_DIR": str(gh_config_dir),
+            "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
+            "SKILL_RUNTIME_TEST_GH_PROBE_LOG": str(probe_log),
+            "GH_TOKEN": "",
+            "GITHUB_TOKEN": "",
+            "GH_ENTERPRISE_TOKEN": "",
+            "GITHUB_ENTERPRISE_TOKEN": "",
+            "LOOP_PLANNED_OPERATIONS_JSON": json.dumps(
+                [
+                    {
+                        "phase": "workflow_start",
+                        "actor_role": "issue-refinement-loop",
+                        "operation": "issue_comment",
+                        "requires_mutation": True,
+                    }
+                ]
+            ),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert inner_marker.exists()
+    assert probe_log.read_text(encoding="utf-8").splitlines() == [
+        "gh-auth:gh_config=expected_path",
+        "gh-repo-view:gh_config=expected_path",
+        "controlled-gh-api:gh_config=expected_path",
+        "inner-preflight-start",
+    ]
 
 
 def test_canonical_executor_blocks_unsupported_operation_and_required_forbidden_spark_before_inner_starts(
