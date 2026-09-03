@@ -1,15 +1,19 @@
 ---
 name: run
-description: Claude Code / Claude-GPT の run 証跡・repository・Web から改善候補（agent_improvement_candidate/v1）を proposal-only で生成する継続的 retrospective の orchestrator（agent-retrospective plugin distribution 版）。人間の明示トリガーでのみ起動する（自動起動しない）。`.claude/` を持たない任意の repository に `claude --plugin-dir` でインストールして使う portable 版。
+description: 標準経路では repository/codebase と live Web の 2 source のみを自動調査し、Claude Code / Claude-GPT の run 証跡（runtime evidence）は `run_retrospective.py` を lower-level CLI で直接起動し `--runtime-evidence-file` を明示指定した場合にのみ追加調査する（3 source が標準構成で並列に存在するわけではない）、改善候補（agent_improvement_candidate/v1）を proposal-only で生成する単発実行（one-shot）の retrospective orchestrator（agent-retrospective plugin distribution 版）。人間の明示トリガーでのみ起動する（自動起動しない）。`.claude/` を持たない任意の repository に `claude --plugin-dir` でインストールして使う portable 版。
 disable-model-invocation: true
 allowed-tools: Bash
 ---
 
 # Agent Retrospective (Plugin distribution, Orchestrator)
 
-`agent-retrospective` plugin は、repository / runtime / Web の 3 source から収集した evidence を、
-独立 2 段の SubAgent（observer wave → evaluator）で解釈し、`agent_improvement_candidate/v1`
-準拠の改善候補を **proposal-only** で生成する portable Claude Code plugin である。
+`agent-retrospective` plugin は、人間の明示トリガーで起動する単発実行（one-shot）の
+proposal-only orchestrator である。標準実行では repository/codebase と live Web の 2 source を
+`codebase-investigator`/`web-researcher` が自動調査し、runtime evidence だけは
+`--runtime-evidence-file` を明示指定した場合にのみ追加される -- 3 source が並列に扱われるわけでは
+なく、runtime だけが opt-in という非対称な evidence topology である。この evidence を独立 2 段の
+SubAgent（observer wave → evaluator）で解釈し、`agent_improvement_candidate/v1` 準拠の改善候補を
+**proposal-only** で生成する portable Claude Code plugin である。
 
 これは `.claude/skills/agent-retrospective/`（project Skill 版）の distribution 版であり、
 project Skill 本体はこの plugin では変更しない（Issue #2240 Out of Scope）。plugin 版は
@@ -61,12 +65,25 @@ observer には実質のある task が必ず渡り、`findings: []` を決め�
 には到達しない**（Issue #2240 fix_delta P0-1、旧実装は `prompts=None` のとき 3 observer 全員に
 「findings を空配列にせよ」という空調査プロンプトを渡していた回帰バグ）。
 
+**標準経路（上記の単一 Bash 呼び出し）が実際に渡すオプションは `--repo-root`/`--plugin-root`/
+`--state-backend fixture`/`--task "$ARGUMENTS"` のみである。** `$ARGUMENTS` は `--task` の値へ
+機械転送されるだけであり、それを再解析して他の CLI option へブリッジする経路は存在しない -- 例えば
+`/agent-retrospective:run --repository-id foo/bar` と入力しても、これは `--repository-id foo/bar`
+という文字列がそのまま task text として `--task` に渡るだけで、`run_retrospective.py
+--repository-id foo/bar` という CLI 呼び出しにはならない。
+
 `--repository-id` / `--target-issue` / `--request-id` / `--idempotency-key` はすべて任意である
-（下記「入力契約の自動導出」参照）。`--schema-dir` は observer/evaluator 用 JSON Schema の配置先を
-差し替える場合にのみ指定する override option であり、通常は省略してよい（既定値は
-`${CLAUDE_PLUGIN_ROOT}/skills/run/schemas`）。`--runtime-evidence-file <path>` は明示的に runtime
-evidence を渡したい場合にのみ指定する任意 option（下記「observer wave」参照。省略時（標準経路）は
-`retrospective-runtime-observer` 自体を起動しない）。
+（下記「入力契約の自動導出」参照）。ただしこれらは `run_retrospective.py` 自身が持つ CLI option で
+あり、標準 `/agent-retrospective:run` 呼び出しからは指定できない -- 値を渡したい場合は
+`run_retrospective.py` を（`$ARGUMENTS`/標準 Skill 経路を使わず）直接起動する必要がある
+（`../../README.md` の「advanced / lower-level interface」参照）。特に origin remote を持たない
+repository では `--repository-id` の自動導出（`git remote get-url origin`）ができず、標準経路には
+これを補う手段がないため、`repository_id_unresolved` として必ず失敗する。`--schema-dir` は
+observer/evaluator 用 JSON Schema の配置先を差し替える場合にのみ指定する override option であり、
+通常は省略してよい（既定値は `${CLAUDE_PLUGIN_ROOT}/skills/run/schemas`）。`--runtime-evidence-file
+<path>` も同様に、標準 `/agent-retrospective:run` 呼び出しからは指定できない `run_retrospective.py`
+の CLI option である（下記「observer wave」参照。省略時（標準経路）は `retrospective-runtime-
+observer` 自体を起動しない）。
 
 `uv run --project "${CLAUDE_PLUGIN_ROOT}" --locked` は、`${CLAUDE_PLUGIN_ROOT}/pyproject.toml` /
 `uv.lock` が固定する Python dependency closure（`jsonschema`。test-only の `pytest` は
@@ -84,8 +101,9 @@ root Skill が用意するのはこの 1 回の Bash 呼び出しのみ。内部
 ### 2. 入力契約の自動導出
 
 - `--repository-id` を省略した場合、`git remote get-url origin` から `owner/repo` を自動導出する
-  （`default_repository_id_from_git_remote()`）。導出できない場合は明示指定が必要（`repository_id_
-  unresolved` で typed failure を返す）。
+  （`default_repository_id_from_git_remote()`）。導出できない場合は明示指定が必要であり、
+  `repository_id_unresolved` として typed failure を返す（`local/<slug>-<short-sha>` のような
+  fallback 実装は現在存在しない）。
 - `--request-id` / `--idempotency-key` を省略した場合、実行ごとに UUID を自動生成する。
 - `--target-issue` を省略した場合、issue-less run として扱う。`PublishRequest.target_issue` は
   `null` になる（架空の issue 番号を捏造しない）。
@@ -167,6 +185,9 @@ evaluator 起動直後に `previous_state_provider`（既定 `--state-backend fi
 `partial`/`stale` の 5 状態から `compute_delta()` で `new`/`resolved`/`recurrent`/`regressed`/
 `unchanged` を算出し、結果を `finalize(..., delta_results=...)` 経由で
 `PublishRequest.delta_results` に格納する。
+
+state backend は fixture のみ（`STATE_BACKEND_CHOICES = ("fixture",)`）であり、fixture に
+ヒットしない限り毎回 `no_history から開始` する。real な永続 cross-run delta 追跡は未実装である。
 
 ### 8. 確定処理（finalize）
 
