@@ -1,15 +1,19 @@
 ---
 name: run
-description: Claude Code / Claude-GPT の run 証跡・repository・Web から改善候補（agent_improvement_candidate/v1）を proposal-only で生成する継続的 retrospective の orchestrator（agent-retrospective plugin distribution 版）。人間の明示トリガーでのみ起動する（自動起動しない）。`.claude/` を持たない任意の repository に `claude --plugin-dir` でインストールして使う portable 版。
+description: Claude Code / Claude-GPT の run 証跡・repository・live Web から改善候補（agent_improvement_candidate/v1）を proposal-only で生成する単発実行（one-shot）の retrospective orchestrator（agent-retrospective plugin distribution 版）。人間の明示トリガーでのみ起動する（自動起動しない）。`.claude/` を持たない任意の repository に `claude --plugin-dir` でインストールして使う portable 版。
 disable-model-invocation: true
 allowed-tools: Bash
 ---
 
 # Agent Retrospective (Plugin distribution, Orchestrator)
 
-`agent-retrospective` plugin は、repository / runtime / Web の 3 source から収集した evidence を、
-独立 2 段の SubAgent（observer wave → evaluator）で解釈し、`agent_improvement_candidate/v1`
-準拠の改善候補を **proposal-only** で生成する portable Claude Code plugin である。
+`agent-retrospective` plugin は、人間の明示トリガーで起動する単発実行（one-shot）の
+proposal-only orchestrator である。標準実行では repository/codebase と live Web の 2 source を
+`codebase-investigator`/`web-researcher` が自動調査し、runtime evidence だけは
+`--runtime-evidence-file` を明示指定した場合にのみ追加される -- 3 source が並列に扱われるわけでは
+なく、runtime だけが opt-in という非対称な evidence topology である。この evidence を独立 2 段の
+SubAgent（observer wave → evaluator）で解釈し、`agent_improvement_candidate/v1` 準拠の改善候補を
+**proposal-only** で生成する portable Claude Code plugin である。
 
 これは `.claude/skills/agent-retrospective/`（project Skill 版）の distribution 版であり、
 project Skill 本体はこの plugin では変更しない（Issue #2240 Out of Scope）。plugin 版は
@@ -84,8 +88,9 @@ root Skill が用意するのはこの 1 回の Bash 呼び出しのみ。内部
 ### 2. 入力契約の自動導出
 
 - `--repository-id` を省略した場合、`git remote get-url origin` から `owner/repo` を自動導出する
-  （`default_repository_id_from_git_remote()`）。導出できない場合は明示指定が必要（`repository_id_
-  unresolved` で typed failure を返す）。
+  （`default_repository_id_from_git_remote()`）。導出できない場合は明示指定が必要であり、
+  `repository_id_unresolved` として typed failure を返す（`local/<slug>-<short-sha>` のような
+  fallback 実装は現在存在しない）。
 - `--request-id` / `--idempotency-key` を省略した場合、実行ごとに UUID を自動生成する。
 - `--target-issue` を省略した場合、issue-less run として扱う。`PublishRequest.target_issue` は
   `null` になる（架空の issue 番号を捏造しない）。
@@ -167,6 +172,9 @@ evaluator 起動直後に `previous_state_provider`（既定 `--state-backend fi
 `partial`/`stale` の 5 状態から `compute_delta()` で `new`/`resolved`/`recurrent`/`regressed`/
 `unchanged` を算出し、結果を `finalize(..., delta_results=...)` 経由で
 `PublishRequest.delta_results` に格納する。
+
+state backend は fixture のみ（`STATE_BACKEND_CHOICES = ("fixture",)`）であり、fixture に
+ヒットしない限り毎回 `no_history から開始` する。real な永続 cross-run delta 追跡は未実装である。
 
 ### 8. 確定処理（finalize）
 

@@ -1,7 +1,9 @@
 # agent-retrospective（plugin 配布版）
 
-継続的 retrospective の proposal-only orchestrator を、`.claude/` を持たない任意の repository でも
-`claude --plugin-dir` 経由で実行可能にする、self-contained な Claude Code plugin distribution。
+人間の明示トリガーで起動する単発実行（one-shot）の proposal-only orchestrator を、`.claude/` を
+持たない任意の repository でも `claude --plugin-dir` 経由で実行可能にする、self-contained な
+Claude Code plugin distribution。1 回の起動につき 1 回だけ evidence 収集・評価・提案生成を行い、
+起動間で状態を持ち越さない（project Skill 版のように稼働し続ける retrospective 機構ではない）。
 
 `.claude/skills/agent-retrospective/`（loop-protocol の project Skill 版）のポータブル版であり、
 project Skill 本体はこの plugin では変更していない（Issue #2240 Out of Scope）。project Skill 版が
@@ -64,11 +66,17 @@ uv run --project "${CLAUDE_PLUGIN_ROOT}" --locked python3 \
   artifact はここには書き込まない）
 
 `uv` が必須（Python 3.12+ は `uv` 自身が解決する）。初回実行時に依存解決（`jsonschema` の sync）が
-走る。`--repository-id`（省略時は `git remote get-url origin` から自動導出）・`--target-issue`
-（省略時は issue-less run）・`--request-id`/`--idempotency-key`（省略時は UUID 自動生成）は
-すべて任意である。`--task`（省略時は非空の既定 task へフォールバックする。Issue #2240 fix_delta
-P0-1）・`--runtime-evidence-file`（明示指定した場合のみ `retrospective-runtime-observer` を
-起動する。Issue #2240 fix_delta P0-1(d)）も参照。詳細は `skills/run/SKILL.md` の手順書を正本とする。
+走る。`--repository-id`（省略時は `git remote get-url origin` から自動導出。導出できない場合は
+`repository_id_unresolved` として失敗する -- `local/<slug>-<short-sha>` のような fallback 実装は
+現在存在しない）・`--target-issue`（省略時は issue-less run）・`--request-id`/`--idempotency-key`
+（省略時は UUID 自動生成）はすべて任意である。`--task`（省略時は非空の既定 task へフォールバックする。
+Issue #2240 fix_delta P0-1）・`--runtime-evidence-file`（明示指定した場合のみ
+`retrospective-runtime-observer` を起動する。Issue #2240 fix_delta P0-1(d)）も参照。詳細は
+`skills/run/SKILL.md` の手順書を正本とする。
+
+previous-state backend は `FixturePreviousStateProvider`（`--state-backend fixture`）のみであり、
+fixture にヒットしない限り毎回 `no_history から開始` する（real な永続 cross-run delta tracking は
+未実装である）。
 
 ## Plugin Agent frontmatter の未対応フィールド
 
