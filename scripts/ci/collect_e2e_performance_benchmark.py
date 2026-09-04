@@ -39,6 +39,39 @@ is expected to carry (at minimum):
         distinct from head_sha (#2159 issuecomment-5299412215 item 1)>"
     }
 
+#2184 AC1/AC2: two further OPTIONAL fields, when present, are recognized
+and propagated to the output manifest's `RunRecord` (never inferred when
+absent -- a record without them is a pre-#2184 legacy shape, see
+`_verify_run_record` / `_optional_head_sha_provenance_fields`):
+
+    {
+      "measured_head_sha": "<40-hex commit sha the collecting step itself
+        observed via an independent `git rev-parse HEAD`; DISTINCT from
+        `head_sha` above (which resolves to `github.sha` -- the
+        workflow_dispatch dispatch ref's tip -- not `target_sha`, on a
+        fixed-SHA benchmark dispatch) and NEVER a direct copy of the
+        `target_sha` dispatch input>",
+      "merge_sha": "<the SAME 40-hex value the raw ci_runtime_baseline_v1
+        artifact's `merge_sha` field already carries (`GH_SHA: ${{
+        github.sha }}`, unchanged by this Issue); this collector derives
+        `workflow_run_head_sha` SOLELY from it (see
+        `_derive_workflow_run_head_sha`) -- a caller-supplied
+        `workflow_run_head_sha` field, if present on a record, is NEVER
+        consulted and can never override/bypass this derivation (fix_delta
+        after OWNER adversarial review of PR #2493,
+        issuecomment-5540651128: honoring a caller-supplied override was a
+        provenance-laundering path around `merge_sha`)>"
+    }
+
+#2184 AC4(iii): a record for job `e2e-core`/`e2e-responsive-matrix`
+(`LEGACY_AMBIGUOUS_HEAD_SHA_JOBS`) carrying NEITHER `measured_head_sha`
+nor a `workflow_run_head_sha`-derivable `merge_sha` is never promoted
+into the trusted cohort by inference/synthesis -- `_collect_arm` excludes
+it with the explicit `legacy_ambiguous_head_sha` evidence_errors reason.
+Scoped to those two job names only (see `LEGACY_AMBIGUOUS_HEAD_SHA_JOBS`'s
+docstring): the permanently-retired pre-split `e2e` job never carries
+either field, past or future, and is unaffected.
+
 Exit codes:
   0 = manifest written AND every job in every arm reached >= --min-runs
       deduped `workflow_run_id` samples (arms.*.complete == true).
@@ -83,6 +116,21 @@ DEFAULT_JOB_NAMES = ("e2e-core", "e2e-responsive-matrix", "e2e")
 # pre-split).
 DEFAULT_BEFORE_JOB_NAMES = ("e2e",)
 DEFAULT_AFTER_JOB_NAMES = ("e2e-core", "e2e-responsive-matrix")
+
+# #2184 AC4(iii) (fix_delta after pr-reviewer REQUEST_CHANGES on PR #2493):
+# jobs whose `ci_runtime_baseline_v1` producer step is the ONLY one this
+# Issue's In Scope actually modifies to unconditionally emit
+# `measured_head_sha` (`.github/workflows/ci.yml`'s "Collect
+# ci_runtime_baseline_v1 artifact" step for `e2e-core` / `e2e-responsive-
+# matrix`, #2184 AC1). The pre-#2137-split `e2e` job (`DEFAULT_BEFORE_
+# JOB_NAMES` above) is a permanently-retired producer this Issue never
+# touches -- it will NEVER emit `measured_head_sha`/carry a `merge_sha`-
+# derived `workflow_run_head_sha` going forward, past or future, so
+# labeling its records "ambiguous" would be a category error, not a
+# genuine legacy-migration signal. The hard-exclude below (AC4(iii)) is
+# therefore scoped to exactly this tuple, never applied job-name-
+# agnostically to `_collect_arm`'s shared/hermetic selection pipeline.
+LEGACY_AMBIGUOUS_HEAD_SHA_JOBS = ("e2e-core", "e2e-responsive-matrix")
 
 # #2159 P0-4: only a "success" conclusion is eligible to count as a
 # performance sample. failure/cancelled/skipped/timed_out runs are excluded
@@ -281,19 +329,99 @@ def _is_valid_digest(value: object) -> bool:
     return isinstance(value, str) and bool(_DIGEST_RE.match(value))
 
 
+def _derive_workflow_run_head_sha(record: dict) -> object:
+    """#2184 AC2 (narrowed by fix_delta after OWNER adversarial review of
+    PR #2493, issuecomment-5540651128): derives `workflow_run_head_sha`
+    SOLELY from the raw `ci_runtime_baseline_v1` artifact's EXISTING
+    `merge_sha` field (`.github/workflows/ci.yml`'s `GH_SHA: ${{
+    github.sha }}`, unchanged by this Issue) -- no new producer env var or
+    `gh api` call is introduced (AC2). A caller-supplied `workflow_run_head_
+    sha` field on `record` is NEVER consulted here and can never override
+    `merge_sha` -- honoring it would let a caller launder an artifact whose
+    real `merge_sha` provenance disagrees with a self-declared value past
+    the live-API self-consistency check in `verify_run_record_against_live_api`
+    (#2184 AC2 requires `workflow_run_head_sha` be *derived from* the raw
+    artifact's `merge_sha`, not independently suppliable). Returns `None`
+    when `merge_sha` is absent (a pre-#2159 record shape that never carried
+    `merge_sha` at all)."""
+    return record.get("merge_sha")
+
+
+def _optional_head_sha_provenance_fields(record: dict) -> dict:
+    """#2184 AC4(ii): builds the optional `measured_head_sha` /
+    `workflow_run_head_sha` key/value pairs for a trusted record's final
+    manifest `RunRecord` entry -- `measured_head_sha` is propagated
+    verbatim (only a trusted record, already validated by
+    `_verify_run_record`, ever reaches this helper); `workflow_run_head_sha`
+    is derived via `_derive_workflow_run_head_sha` (#2184 AC2). A key is
+    OMITTED entirely (never set to a synthesized/inferred value) when its
+    source value is absent -- this is what keeps a legacy record's output
+    RunRecord free of these two fields (schema `RunRecord.required` never
+    lists them, #2184 AC3)."""
+    fields: dict = {}
+    measured_head_sha = record.get("measured_head_sha")
+    if measured_head_sha is not None:
+        fields["measured_head_sha"] = measured_head_sha
+    workflow_run_head_sha = _derive_workflow_run_head_sha(record)
+    if workflow_run_head_sha is not None:
+        fields["workflow_run_head_sha"] = workflow_run_head_sha
+    return fields
+
+
 def _verify_run_record(record: dict, expected_head_sha: str) -> list[str]:
     """#2159 AC7: verifies artifact ID / artifact digest / head SHA / job
     are all present and well-formed for a single run record. Returns a
-    list of violation reason strings (empty list == record is usable)."""
+    list of violation reason strings (empty list == record is usable).
+
+    #2184 AC1/AC4(i): `head_sha` and `measured_head_sha` are independent
+    concepts -- `head_sha` resolves to `github.sha` (the workflow_dispatch
+    dispatch ref's tip), NOT `target_sha`, on a fixed-SHA benchmark
+    dispatch, so it is expected to differ from `expected_head_sha`
+    (target_sha) for a genuine new-producer record. A record that carries
+    `measured_head_sha` is therefore verified against `expected_head_sha`
+    via `measured_head_sha` (a new, independent structural-binding check),
+    NEVER via `head_sha`. A record WITHOUT `measured_head_sha` is a
+    pre-#2184 legacy-shaped record: per AC4(i) ("既存の head_sha !=
+    expected_head_sha 検証は変更せず、measured_head_sha を持たない legacy
+    record にのみ引き続き適用する"), it continues to be verified via the
+    UNCHANGED pre-#2184 `head_sha != expected_head_sha` check below --
+    this additive-only design is a deliberate compatibility decision.
+
+    #2184 AC4(iii) (fix_delta after pr-reviewer REQUEST_CHANGES on PR
+    #2493): the hard, unconditional trusted-cohort exclusion of a record
+    carrying NEITHER `measured_head_sha` NOR a derivable
+    `workflow_run_head_sha` (the Outcome section's `legacy_ambiguous_
+    head_sha` illustration) is NOT performed here (this function stays
+    pure shape/regex validation, unaware of job identity) -- it is
+    applied by `_collect_arm`, scoped to `LEGACY_AMBIGUOUS_HEAD_SHA_JOBS`
+    (`e2e-core`/`e2e-responsive-matrix`, the only jobs #2184's In Scope
+    actually makes emit `measured_head_sha`). That job-name scoping is
+    what keeps this additive-only design compatible with
+    `scripts/ci/tests/e2e_performance_benchmark/test_collect_e2e_performance_benchmark_rerun_attempt.py`
+    (#2179/#2182's rerun-attempt regression suite, outside Issue #2184's
+    Allowed Paths): every one of its fixtures that reaches a trusted
+    `usable` cohort with neither field present uses the generic `e2e`
+    job name (the permanently-retired pre-split job,
+    `DEFAULT_BEFORE_JOB_NAMES`, which #2184 never touches and which will
+    never carry either field, past or future) -- never `e2e-core`/
+    `e2e-responsive-matrix`, so it is unaffected by the job-scoped
+    exclusion. See `_collect_arm` and this Issue's PR body for the full
+    rationale."""
     violations: list[str] = []
     if not isinstance(record.get("workflow_run_id"), int) or record.get("workflow_run_id", 0) < 1:
         violations.append("missing_or_invalid_workflow_run_id")
     if not isinstance(record.get("job"), str) or not record.get("job"):
         violations.append("missing_or_invalid_job")
+    has_measured_head_sha = record.get("measured_head_sha") is not None
     if not _is_valid_sha(record.get("head_sha")):
         violations.append("missing_or_invalid_head_sha")
-    elif record.get("head_sha") != expected_head_sha:
+    elif not has_measured_head_sha and record.get("head_sha") != expected_head_sha:
         violations.append("head_sha_mismatch")
+    if has_measured_head_sha:
+        if not _is_valid_sha(record.get("measured_head_sha")):
+            violations.append("missing_or_invalid_measured_head_sha")
+        elif record.get("measured_head_sha") != expected_head_sha:
+            violations.append("measured_head_sha_mismatch")
     if not isinstance(record.get("artifact_id"), int) or record.get("artifact_id", 0) < 1:
         violations.append("missing_or_invalid_artifact_id")
     if not _is_valid_digest(record.get("artifact_digest")):
@@ -502,12 +630,32 @@ def verify_run_record_against_live_api(
     eligible in the first place (see `_select_initial_attempt_records`),
     so this function preserves its pre-#2179 behavior/call signature for
     those (unbound, always-excluded-from-selection) callers: only the
-    pre-existing artifacts-listing call is made, no attempt-jobs call."""
+    pre-existing artifacts-listing call is made, no attempt-jobs call.
+
+    #2184 AC4(i): the live API's OWN `head_sha` (`api_workflow_run.
+    head_sha`) is compared for SELF-CONSISTENCY against `record`'s
+    `workflow_run_head_sha`, derived SOLELY from the raw artifact's
+    existing `merge_sha` field (#2184 AC2, `_derive_workflow_run_head_sha`
+    -- a caller-supplied `workflow_run_head_sha` field on `record` is
+    never consulted, fix_delta after OWNER adversarial review of PR #2493,
+    issuecomment-5540651128) -- NEVER against `expected_head_sha`
+    (the measured/target_sha commit): `measured_head_sha` and
+    `workflow_run_head_sha` are independent concepts and are EXPECTED to
+    differ on a fixed-SHA benchmark dispatch, so comparing the live API's
+    head SHA to `expected_head_sha` would reject every genuine new-style
+    record. When `workflow_run_head_sha` cannot be derived (a pre-#2159
+    record lacking `merge_sha` entirely), this falls back to the
+    pre-#2184 `expected_head_sha` comparison, unchanged, to preserve
+    exact backward compatibility for such records."""
     violations: list[str] = []
     workflow_run_id = record.get("workflow_run_id")
     artifact_id = record.get("artifact_id")
     job_name = record.get("job")
     run_attempt, run_attempt_status = _classify_run_attempt(record)
+    workflow_run_head_sha = _derive_workflow_run_head_sha(record)
+    live_head_sha_comparison_target = (
+        workflow_run_head_sha if workflow_run_head_sha is not None else expected_head_sha
+    )
 
     try:
         artifacts = _fetch_all_artifacts_paginated(workflow_run_id, repo, api_call)
@@ -548,9 +696,9 @@ def verify_run_record_against_live_api(
             f"artifact_workflow_run_id_mismatch_vs_live_api: claimed={workflow_run_id!r} "
             f"api={api_workflow_run.get('id')!r}"
         )
-    if api_workflow_run.get("head_sha") != expected_head_sha:
+    if api_workflow_run.get("head_sha") != live_head_sha_comparison_target:
         violations.append(
-            f"artifact_head_sha_mismatch_vs_live_api: expected={expected_head_sha!r} "
+            f"artifact_head_sha_mismatch_vs_live_api: expected={live_head_sha_comparison_target!r} "
             f"api={api_workflow_run.get('head_sha')!r}"
         )
     if record.get("head_sha") != api_workflow_run.get("head_sha"):
@@ -582,9 +730,10 @@ def verify_run_record_against_live_api(
                 )
             else:
                 api_job = matching_jobs[0]
-                if api_job.get("head_sha") != expected_head_sha:
+                if api_job.get("head_sha") != live_head_sha_comparison_target:
                     violations.append(
-                        f"run_attempt_job_head_sha_mismatch_vs_live_api: expected={expected_head_sha!r} "
+                        f"run_attempt_job_head_sha_mismatch_vs_live_api: "
+                        f"expected={live_head_sha_comparison_target!r} "
                         f"api={api_job.get('head_sha')!r}"
                     )
                 if api_job.get("conclusion") != "success":
@@ -715,6 +864,34 @@ def _collect_arm(
                     }
                 )
                 continue
+            # #2184 AC4(iii): a record for a `LEGACY_AMBIGUOUS_HEAD_SHA_JOBS`
+            # job that carries NEITHER `measured_head_sha` NOR a derivable
+            # `workflow_run_head_sha` (no `measured_head_sha` key AND no
+            # `merge_sha`/`workflow_run_head_sha` to derive one from, #2184
+            # AC2) is never promoted into the trusted cohort by inferring/
+            # synthesizing either field -- it is excluded with the explicit
+            # `legacy_ambiguous_head_sha` reason, mirroring
+            # `legacy_unverified_run_attempt` above. Scoped to
+            # `LEGACY_AMBIGUOUS_HEAD_SHA_JOBS` only (see that constant's
+            # docstring): a record for any OTHER job (e.g. the
+            # permanently-retired pre-split `e2e` job, `DEFAULT_BEFORE_
+            # JOB_NAMES`) was never expected to carry these #2184 fields in
+            # the first place and is unaffected by this exclusion.
+            if (
+                job in LEGACY_AMBIGUOUS_HEAD_SHA_JOBS
+                and record.get("measured_head_sha") is None
+                and _derive_workflow_run_head_sha(record) is None
+            ):
+                evidence_errors.append(
+                    {
+                        "arm": arm_name,
+                        "reason": "legacy_ambiguous_head_sha",
+                        "detail": (
+                            f"workflow_run_id={record.get('workflow_run_id')!r} job={job!r}"
+                        ),
+                    }
+                )
+                continue
             usable.append(record)
 
         # #2179 AC1/AC9: `workflow_run_id`s that had verified records but
@@ -773,6 +950,13 @@ def _collect_arm(
                     # consumer.
                     "run_attempt": _normalize_run_attempt(r) or 1,
                     "rerun_attempt_selection_policy": RERUN_ATTEMPT_SELECTION_POLICY,
+                    # #2184 AC4(ii): propagate the trusted record's
+                    # `measured_head_sha` verbatim, and `workflow_run_head_sha`
+                    # derived from the raw artifact's existing `merge_sha`
+                    # field (#2184 AC2) -- ONLY when derivable; never
+                    # inferred/synthesized for a legacy record that lacks
+                    # them (#2184 Outcome).
+                    **_optional_head_sha_provenance_fields(r),
                 }
                 for r in sorted(usable, key=lambda rec: rec["workflow_run_id"])
             ],
