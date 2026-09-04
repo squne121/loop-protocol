@@ -3602,7 +3602,7 @@ jobs:
           exit $_s
       - name: pytest_hook_stop_failure_wiring (timed)
         # Issue #2489 fix_delta iteration 3 (PR #2496 independent pr-reviewer
-        # review, 2nd round REQUEST_CHANGES): these 4 nodeids in
+        # review, 2nd round REQUEST_CHANGES): these nodeids in
         # tests/agent-logs/runtime-verification/test_hook_stop_failure_wiring.py
         # spawn a real `node` child process
         # (.claude/hooks/generate_session_manifest_from_hook.mjs), whose producer
@@ -3618,12 +3618,20 @@ jobs:
         # `pnpm install`, see the setup-node-pnpm step above) and deselect them
         # from python-test-core (see .github/ci/python-test-plan.json deselect +
         # secondary_coverage.dedicated_lanes).
+        # fix_delta iteration 4 (#2489 P0-1 fix, PR #2496 OWNER review
+        # issuecomment-5546874328): the two Stop/StopFailure nodeids were
+        # renamed to reflect that only hook_event.event_type/error_type (turn-
+        # level evidence) are asserted now -- root completion_outcome/
+        # completion_source are no longer set from this hook path. A new
+        # nodeid (test_stop_failure_event_with_structured_error_yields_recognized_error_type)
+        # was added to cover the recognized (non-"unknown") error taxonomy path.
         run: |
           _t0=$(date +%s%3N)
           set +e
           uv run --locked pytest -q \
-            tests/agent-logs/runtime-verification/test_hook_stop_failure_wiring.py::test_stop_event_yields_completed_via_hook \
-            tests/agent-logs/runtime-verification/test_hook_stop_failure_wiring.py::test_stop_failure_event_yields_failed_via_hook \
+            tests/agent-logs/runtime-verification/test_hook_stop_failure_wiring.py::test_stop_event_yields_hook_event_type_only \
+            tests/agent-logs/runtime-verification/test_hook_stop_failure_wiring.py::test_stop_failure_event_yields_hook_event_type_and_error_type_only \
+            tests/agent-logs/runtime-verification/test_hook_stop_failure_wiring.py::test_stop_failure_event_with_structured_error_yields_recognized_error_type \
             tests/agent-logs/runtime-verification/test_hook_stop_failure_wiring.py::test_claude_gpt_claude_bin_presence_switches_runtime_lane \
             tests/agent-logs/runtime-verification/test_hook_stop_failure_wiring.py::test_unobserved_event_does_not_guess_completion_fields \
             -p no:xdist
