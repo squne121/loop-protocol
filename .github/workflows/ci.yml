@@ -98,6 +98,34 @@ on:
           built-in insufficient-evidence smoke fixture.
         type: string
         default: ""
+      # #2423 AC4/AC5 (OWNER controlled-reframe issuecomment-5539310075):
+      # trusted ci_verdict_summary_v2 binding for the close-grade CLI.
+      # Previously the e2e-performance-benchmark-assessment-gate steps
+      # invoked tests/ci/test_ci_performance_gate.py with NO trusted-binding
+      # flags at all, so approval_eligible could never become true through
+      # this route and the CLI's exit code did not even check it. These two
+      # inputs let an operator point the gate at a PREVIOUSLY-UPLOADED
+      # ci_verdict_summary_v2 artifact (e.g. from a prior `ci-verdict-summary`
+      # job run) via the real GitHub Actions Artifacts REST API (artifact ID
+      # -> metadata -> download -> local file -> sha256 -> CLI binding). Both
+      # left empty runs the gate WITHOUT trusted binding (approval_eligible
+      # will be false; the CLI's fail-closed exit code 3, not 0).
+      trusted_ci_verdict_summary_artifact_id:
+        description: >-
+          GitHub Actions artifact ID (integer, from a previously-uploaded
+          ci_verdict_summary_v2 artifact -- e.g. via `gh api
+          repos/OWNER/REPO/actions/artifacts` or the run's "ci-verdict-summary"
+          job's own upload-artifact step output) to bind as AC4 trusted
+          functional evidence. Leave empty to run without trusted binding.
+        type: string
+        default: ""
+      trusted_ci_verdict_summary_expected_head_sha:
+        description: >-
+          Trusted PR/commit head SHA to assert the trusted_ci_verdict_summary_artifact_id
+          artifact's own expected_head_sha field against (AC4). Required
+          whenever trusted_ci_verdict_summary_artifact_id is set.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -699,6 +727,19 @@ jobs:
           BENCHMARK_TARGET_SHA: ${{ github.event.inputs.target_sha }}
         run: |
           set -euo pipefail
+          # #2184 fix_delta (PR #2493, live AC6 workflow_dispatch run
+          # https://github.com/squne121/loop-protocol/actions/runs/33869974220):
+          # this step's shell runs inside the `container:` image above (see
+          # the pre-existing "Collect ci_runtime_baseline_v1 artifact" step's
+          # comment for the same root cause), and the checked-out workspace
+          # at $GITHUB_WORKSPACE is owned by a different UID than the
+          # container's git config sees by default, which makes ANY bare
+          # `git` invocation in this step fail closed with "detected
+          # dubious ownership in repository at '$GITHUB_WORKSPACE'" (exit
+          # 128). This step is gated `if: target_sha != ''` and only runs
+          # on an actual dispatched benchmark run, so it was never exercised
+          # until the first live target_sha dispatch above surfaced it.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           resolved_head="$(git rev-parse HEAD)"
           if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
             echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the explicit checkout ref override did not resolve to the expected commit. Refusing to record a benchmark sample for the wrong commit."
@@ -938,13 +979,43 @@ jobs:
           PNPM_VERSION_RAW: ""
           LOCKFILE_HASH_RAW: ""
           WORKFLOW_DIGEST_RAW: ""
+          # #2184 AC1: `measured_head_sha` (distinct from `head_sha`
+          # above, which resolves to `github.sha` -- the workflow_dispatch
+          # ref tip -- on a fixed-SHA benchmark dispatch, NOT `target_sha`).
+          # Populated below via an independent `git rev-parse HEAD`,
+          # regardless of whether `target_sha` was provided, never a
+          # direct copy of the `target_sha` input itself. See
+          # docs/dev/e2e-performance-benchmark.md.
+          GH_MEASURED_HEAD_SHA: ""
         run: |
           mkdir -p ci_runtime_baseline_artifacts
           NODE_VERSION_RAW="$(node -v 2>/dev/null || echo unknown)"
           PNPM_VERSION_RAW="$(pnpm -v 2>/dev/null || echo unknown)"
           LOCKFILE_HASH_RAW="sha256:$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
           WORKFLOW_DIGEST_RAW="sha256:$(sha256sum .github/workflows/ci.yml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
-          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW
+          # #2184 fix_delta (pr-reviewer REQUEST_CHANGES, PR #2493 blocker 1):
+          # this step's shell runs inside the `container:` image above, and
+          # the checked-out workspace at $GITHUB_WORKSPACE is owned by a
+          # different UID than the container's git config sees by default,
+          # which makes ANY bare `git` invocation in this step fail closed
+          # with "detected dubious ownership in repository at
+          # '$GITHUB_WORKSPACE'" (exit 128). The pre-existing "Verify
+          # checked-out HEAD matches dispatched target_sha" step above never
+          # hit this because it's gated `if: target_sha != ''` and only ever
+          # ran on an actual dispatched benchmark run; this step's
+          # unconditional `git rev-parse HEAD` below runs on every job
+          # invocation (including plain push/pull_request CI), so it must
+          # register the safe.directory exception itself before invoking
+          # `git`.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # #2184 AC1: independent observation of the checked-out commit --
+          # NEVER the `target_sha` input verbatim. On a `target_sha`
+          # dispatch, the "Verify checked-out HEAD matches dispatched
+          # target_sha" step above already hard-fails the job if this
+          # would disagree with `target_sha`; on a normal (non-benchmark)
+          # run, this simply reflects the actual checked-out commit.
+          GH_MEASURED_HEAD_SHA="$(git rev-parse HEAD)"
+          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW GH_MEASURED_HEAD_SHA
           python3 - <<'PY'
           import json, os, pathlib
           fingerprint_fields = {
@@ -977,6 +1048,13 @@ jobs:
               # `actions/checkout` `ref:` override to `target_sha`). Recorded
               # as an independent field -- never conflated with `head_sha`.
               "workflow_sha": os.environ.get("GH_WORKFLOW_SHA", "unknown"),
+              # #2184 AC1: the MEASURED application code's commit, observed
+              # independently via `git rev-parse HEAD` in this step (never a
+              # direct copy of the `target_sha` dispatch input). Distinct
+              # from `head_sha` above (which resolves to `github.sha` --
+              # the dispatch ref tip -- on a fixed-SHA benchmark dispatch)
+              # and from `workflow_sha` (the workflow DEFINITION's commit).
+              "measured_head_sha": os.environ.get("GH_MEASURED_HEAD_SHA", "unknown"),
           }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
@@ -1473,6 +1551,19 @@ jobs:
           BENCHMARK_TARGET_SHA: ${{ github.event.inputs.target_sha }}
         run: |
           set -euo pipefail
+          # #2184 fix_delta (PR #2493, live AC6 workflow_dispatch run
+          # https://github.com/squne121/loop-protocol/actions/runs/33869974220):
+          # this step's shell runs inside the `container:` image above (see
+          # the pre-existing "Collect ci_runtime_baseline_v1 artifact" step's
+          # comment for the same root cause), and the checked-out workspace
+          # at $GITHUB_WORKSPACE is owned by a different UID than the
+          # container's git config sees by default, which makes ANY bare
+          # `git` invocation in this step fail closed with "detected
+          # dubious ownership in repository at '$GITHUB_WORKSPACE'" (exit
+          # 128). This step is gated `if: target_sha != ''` and only runs
+          # on an actual dispatched benchmark run, so it was never exercised
+          # until the first live target_sha dispatch above surfaced it.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           resolved_head="$(git rev-parse HEAD)"
           if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
             echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the explicit checkout ref override did not resolve to the expected commit. Refusing to record a benchmark sample for the wrong commit."
@@ -1639,13 +1730,43 @@ jobs:
           PNPM_VERSION_RAW: ""
           LOCKFILE_HASH_RAW: ""
           WORKFLOW_DIGEST_RAW: ""
+          # #2184 AC1: `measured_head_sha` (distinct from `head_sha`
+          # above, which resolves to `github.sha` -- the workflow_dispatch
+          # ref tip -- on a fixed-SHA benchmark dispatch, NOT `target_sha`).
+          # Populated below via an independent `git rev-parse HEAD`,
+          # regardless of whether `target_sha` was provided, never a
+          # direct copy of the `target_sha` input itself. See
+          # docs/dev/e2e-performance-benchmark.md.
+          GH_MEASURED_HEAD_SHA: ""
         run: |
           mkdir -p ci_runtime_baseline_artifacts
           NODE_VERSION_RAW="$(node -v 2>/dev/null || echo unknown)"
           PNPM_VERSION_RAW="$(pnpm -v 2>/dev/null || echo unknown)"
           LOCKFILE_HASH_RAW="sha256:$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
           WORKFLOW_DIGEST_RAW="sha256:$(sha256sum .github/workflows/ci.yml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
-          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW
+          # #2184 fix_delta (pr-reviewer REQUEST_CHANGES, PR #2493 blocker 1):
+          # this step's shell runs inside the `container:` image above, and
+          # the checked-out workspace at $GITHUB_WORKSPACE is owned by a
+          # different UID than the container's git config sees by default,
+          # which makes ANY bare `git` invocation in this step fail closed
+          # with "detected dubious ownership in repository at
+          # '$GITHUB_WORKSPACE'" (exit 128). The pre-existing "Verify
+          # checked-out HEAD matches dispatched target_sha" step above never
+          # hit this because it's gated `if: target_sha != ''` and only ever
+          # ran on an actual dispatched benchmark run; this step's
+          # unconditional `git rev-parse HEAD` below runs on every job
+          # invocation (including plain push/pull_request CI), so it must
+          # register the safe.directory exception itself before invoking
+          # `git`.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # #2184 AC1: independent observation of the checked-out commit --
+          # NEVER the `target_sha` input verbatim. On a `target_sha`
+          # dispatch, the "Verify checked-out HEAD matches dispatched
+          # target_sha" step above already hard-fails the job if this
+          # would disagree with `target_sha`; on a normal (non-benchmark)
+          # run, this simply reflects the actual checked-out commit.
+          GH_MEASURED_HEAD_SHA="$(git rev-parse HEAD)"
+          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW GH_MEASURED_HEAD_SHA
           python3 - <<'PY'
           import json, os, pathlib
           fingerprint_fields = {
@@ -1678,6 +1799,13 @@ jobs:
               # `actions/checkout` `ref:` override to `target_sha`). Recorded
               # as an independent field -- never conflated with `head_sha`.
               "workflow_sha": os.environ.get("GH_WORKFLOW_SHA", "unknown"),
+              # #2184 AC1: the MEASURED application code's commit, observed
+              # independently via `git rev-parse HEAD` in this step (never a
+              # direct copy of the `target_sha` dispatch input). Distinct
+              # from `head_sha` above (which resolves to `github.sha` --
+              # the dispatch ref tip -- on a fixed-SHA benchmark dispatch)
+              # and from `workflow_sha` (the workflow DEFINITION's commit).
+              "measured_head_sha": os.environ.get("GH_MEASURED_HEAD_SHA", "unknown"),
           }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
@@ -2606,6 +2734,16 @@ jobs:
 
   python-test-core:
     runs-on: ubuntu-latest
+    # Issue #2423 AC5: the opt-in e2e-performance-benchmark-assessment-gate
+    # steps below (`run_performance_assessment_gate: true`) need read access
+    # to the GitHub Actions Artifacts REST API to acquire a trusted
+    # ci_verdict_summary_v2 artifact (artifact ID -> metadata -> download).
+    # Minimal, read-only permission addition (mirrors the existing
+    # visual-impact-policy job's own `actions: read` for the same purpose);
+    # no write permission is granted.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -3183,12 +3321,124 @@ jobs:
           print("cohort_fixture_source=built_in_insufficient_evidence_smoke_fixture")
           PY
           fi
-      - name: Run AC11 evidence gate + P0-8 assessment producer (#2159 OWNER ruling issuecomment-5299412215 items 2/3)
-        if: ${{ github.event.inputs.run_performance_assessment_gate == 'true' }}
+      # #2423 AC5 (OWNER controlled-reframe issuecomment-5539310075): real
+      # GitHub Actions/API acquisition path for the trusted ci_verdict_summary_v2
+      # artifact -- artifact ID -> metadata -> download -> local file ->
+      # sha256 -> CLI binding. No new broker/service/daemon: only `gh api`'s
+      # built-in Artifacts REST endpoints (the same primitives
+      # visual-impact-policy's own download-artifact step family already
+      # uses elsewhere in this file). Skipped entirely (steps.*.outputs stay
+      # empty) when trusted_ci_verdict_summary_artifact_id is not supplied --
+      # the next step's fail-closed exit code 3 makes an un-bound run visibly
+      # not approval_eligible rather than silently exit 0.
+      - name: Acquire trusted ci_verdict_summary_v2 artifact (#2423 AC5 GitHub Actions/API binding)
+        if: ${{ github.event.inputs.run_performance_assessment_gate == 'true' && github.event.inputs.trusted_ci_verdict_summary_artifact_id != '' }}
+        id: acquire-trusted-verdict-summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ github.event.inputs.trusted_ci_verdict_summary_artifact_id }}
+          EXPECTED_HEAD_SHA: ${{ github.event.inputs.trusted_ci_verdict_summary_expected_head_sha }}
         run: |
-          uv run --locked python3 tests/ci/test_ci_performance_gate.py \
-            --cohort-fixture e2e_performance_assessment_gate_artifacts/cohort_fixture.json \
+          set -euo pipefail
+          # #2423 fix_delta P1-4 (OWNER REQUEST_CHANGES issuecomment-5540705404):
+          # an artifact_id without an expected head SHA to bind it against is
+          # fail-closed here -- never silently acquired and forwarded
+          # unbound (the downstream CLI's own fail-closed exit code 3 only
+          # fires once a `--ci-verdict-summary` path is actually supplied,
+          # so an empty EXPECTED_HEAD_SHA must not reach that point at all).
+          if [ -z "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error::trusted_ci_verdict_summary_artifact_id=${ARTIFACT_ID} was supplied without trusted_ci_verdict_summary_expected_head_sha; refusing to acquire an unbound trusted artifact."
+            exit 1
+          fi
+          mkdir -p trusted_ci_verdict_summary_v2_artifacts
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" \
+            > trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json
+          ARTIFACT_EXPIRED="$(python3 -c 'import json; print(json.load(open("trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json")).get("expired", False))')"
+          if [ "$ARTIFACT_EXPIRED" = "True" ]; then
+            echo "::error::trusted_ci_verdict_summary_artifact_id=${ARTIFACT_ID} is expired; cannot bind trusted evidence."
+            exit 1
+          fi
+          # #2423 fix_delta P1-4: the artifact GET response alone (expired
+          # only) does not prove this is the RIGHT artifact -- verify the
+          # metadata `name` matches the `ci-verdict-summary-v2-` naming
+          # contract this workflow's own `ci-verdict-summary` job uses (see
+          # the "Upload ci_verdict_summary_v2 artifact" step's own `name:`
+          # field below) AND that the artifact's OWN `workflow_run.head_sha`
+          # (the run that actually uploaded it, per the Artifacts REST API
+          # response shape) equals the trusted expected head SHA -- an
+          # artifact_id pointing at a stale/unrelated run must fail-closed
+          # here rather than being silently bound.
+          ARTIFACT_NAME="$(python3 -c 'import json; print(json.load(open("trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json")).get("name", ""))')"
+          case "$ARTIFACT_NAME" in
+            ci-verdict-summary-v2-*) ;;
+            *)
+              echo "::error::trusted_ci_verdict_summary_artifact_id=${ARTIFACT_ID} has artifact name='${ARTIFACT_NAME}', which does not match the ci-verdict-summary-v2- naming contract; refusing to bind."
+              exit 1
+              ;;
+          esac
+          ARTIFACT_WORKFLOW_RUN_HEAD_SHA="$(python3 -c 'import json; print((json.load(open("trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json")).get("workflow_run") or {}).get("head_sha") or "")')"
+          if [ -z "$ARTIFACT_WORKFLOW_RUN_HEAD_SHA" ] || [ "$ARTIFACT_WORKFLOW_RUN_HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error::trusted_ci_verdict_summary_artifact_id=${ARTIFACT_ID} artifact metadata workflow_run.head_sha='${ARTIFACT_WORKFLOW_RUN_HEAD_SHA}' does not match trusted_ci_verdict_summary_expected_head_sha='${EXPECTED_HEAD_SHA}'; refusing to bind."
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > trusted_ci_verdict_summary_v2_artifacts/artifact.zip
+          unzip -o -q trusted_ci_verdict_summary_v2_artifacts/artifact.zip -d trusted_ci_verdict_summary_v2_artifacts/extracted
+          # #2423 fix_delta P1-4: `head -n1` on multiple candidates silently
+          # picks an ARBITRARY one -- only accept when exactly one
+          # *ci_verdict_summary_v2*.json candidate exists inside the ZIP.
+          mapfile -t SUMMARY_CANDIDATES < <(find trusted_ci_verdict_summary_v2_artifacts/extracted -name '*ci_verdict_summary_v2*.json')
+          if [ "${#SUMMARY_CANDIDATES[@]}" -eq 0 ]; then
+            echo "::error::no ci_verdict_summary_v2*.json found inside downloaded artifact_id=${ARTIFACT_ID}."
+            exit 1
+          fi
+          if [ "${#SUMMARY_CANDIDATES[@]}" -gt 1 ]; then
+            echo "::error::${#SUMMARY_CANDIDATES[@]} ambiguous ci_verdict_summary_v2*.json candidates found inside downloaded artifact_id=${ARTIFACT_ID}: ${SUMMARY_CANDIDATES[*]}; refusing to pick one arbitrarily."
+            exit 1
+          fi
+          SUMMARY_FILE="${SUMMARY_CANDIDATES[0]}"
+          cp "$SUMMARY_FILE" trusted_ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
+          FILE_SHA256="sha256:$(sha256sum trusted_ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json | cut -d' ' -f1)"
+          ARTIFACT_DIGEST="$(python3 -c 'import json; print(json.load(open("trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json")).get("digest") or "")')"
+          {
+            echo "trusted_summary_path=trusted_ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json"
+            echo "trusted_summary_file_sha256=${FILE_SHA256}"
+            echo "github_artifact_digest=${ARTIFACT_DIGEST}"
+          } >> "$GITHUB_OUTPUT"
+          echo "acquired trusted ci_verdict_summary_v2 artifact_id=${ARTIFACT_ID} file_sha256=${FILE_SHA256} github_artifact_digest=${ARTIFACT_DIGEST}"
+      - name: Upload trusted ci_verdict_summary_v2 binding artifacts (#2423 AC5)
+        if: ${{ !cancelled() && github.event.inputs.run_performance_assessment_gate == 'true' && github.event.inputs.trusted_ci_verdict_summary_artifact_id != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-performance-benchmark-assessment-gate-trusted-binding-${{ github.run_attempt }}
+          path: trusted_ci_verdict_summary_v2_artifacts/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Run AC11 evidence gate + P0-8 assessment producer + AC3 close-grade receipt (#2159 OWNER ruling issuecomment-5299412215 items 2/3; #2423 AC3/AC4/AC5)
+        if: ${{ github.event.inputs.run_performance_assessment_gate == 'true' }}
+        env:
+          TRUSTED_SUMMARY_PATH: ${{ steps.acquire-trusted-verdict-summary.outputs.trusted_summary_path || '' }}
+          TRUSTED_SUMMARY_FILE_SHA256: ${{ steps.acquire-trusted-verdict-summary.outputs.trusted_summary_file_sha256 || '' }}
+          TRUSTED_GITHUB_ARTIFACT_DIGEST: ${{ steps.acquire-trusted-verdict-summary.outputs.github_artifact_digest || '' }}
+          TRUSTED_ARTIFACT_ID: ${{ github.event.inputs.trusted_ci_verdict_summary_artifact_id }}
+          TRUSTED_EXPECTED_HEAD_SHA: ${{ github.event.inputs.trusted_ci_verdict_summary_expected_head_sha }}
+        run: |
+          set -euo pipefail
+          args=(
+            --cohort-fixture e2e_performance_assessment_gate_artifacts/cohort_fixture.json
             --output e2e_performance_assessment_gate_artifacts/gate_result.json
+            --receipt-output e2e_performance_assessment_gate_artifacts/close_grade_receipt.json
+          )
+          if [ -n "$TRUSTED_SUMMARY_PATH" ]; then
+            args+=(
+              --ci-verdict-summary "$TRUSTED_SUMMARY_PATH"
+              --expected-head-sha "$TRUSTED_EXPECTED_HEAD_SHA"
+              --expected-ci-verdict-summary-file-sha256 "$TRUSTED_SUMMARY_FILE_SHA256"
+              --ci-verdict-summary-artifact-id "$TRUSTED_ARTIFACT_ID"
+              --github-artifact-digest "$TRUSTED_GITHUB_ARTIFACT_DIGEST"
+            )
+          fi
+          uv run --locked python3 tests/ci/test_ci_performance_gate.py "${args[@]}"
       - name: Upload e2e-performance-benchmark-assessment-gate artifact
         if: ${{ !cancelled() && github.event.inputs.run_performance_assessment_gate == 'true' }}
         uses: actions/upload-artifact@v7
