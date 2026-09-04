@@ -244,11 +244,17 @@ attestation ではない。
 `source_set_digest`（上記「Ephemeral wire contract」参照）は commit-tree や working tree の
 content digest ではなく、collector が生成した `source_observations` に対する deterministic
 sha256 digest である（`scripts/validate_retrospective_schema.py` の `compute_source_set_digest()`
-準拠）。
+準拠）。この性質上、working tree の staged / unstaged / untracked な内容が書き換えられて
+observer の code finding が変わったとしても、`base_sha` が変わらなければ `source_set_digest`
+は同一値のままになりうる -- `source_set_digest` は observer がその run で実際に読んだ live
+内容を attest（証明）しない。
 
 `source_set_digest` の主用途は `(repo, base_sha, source_set_digest, scope)` による idempotency
 （重複抑制。`docs/adr/0007-agent-retrospective-boundaries.md` Decision 5 参照）であり、
-optimistic-concurrency token ではない。
+optimistic-concurrency token ではない。この idempotency の判定・重複抑制は、本 plugin が
+自ら実行するものではなく、ADR 0007 Decision 5 が定義する downstream の publisher/
+persistence 層の責務である（本 plugin は proposal-only であり、Issue/PR/repository の
+読み書き・mutation を一切行わない。「Guardrails」節参照）。
 
 ## Guardrails（ガードレール）
 

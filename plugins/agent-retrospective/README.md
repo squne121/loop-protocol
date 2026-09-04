@@ -188,10 +188,17 @@ commit-tree の内容と常に一致するとは限らない。
 `source_set_digest` は collector が生成した `source_observations` に対する deterministic
 sha256 digest であり（`skills/run/scripts/validate_retrospective_schema.py` の
 `compute_source_set_digest()` 準拠）、ファイルやツリーの内容そのものを hash したものではない。
+したがって working tree の staged / unstaged / untracked な内容が書き換えられ、observer の
+code finding が変化したとしても、`base_sha` が同一のままであれば `source_set_digest` は同一
+のままでありうる -- `source_set_digest` は observer がその run で実際に読んだ live 内容を
+attest（証明）するものではない。
 
 `source_set_digest` の主用途は `(repo, base_sha, source_set_digest, scope)` の組による
 idempotency（重複書き込み抑制。`docs/adr/0007-agent-retrospective-boundaries.md` Decision 5
-参照）であり、optimistic-concurrency token（古い前提での上書き防止）ではない。
+参照）であり、optimistic-concurrency token（古い前提での上書き防止）ではない。この
+idempotency 判定・重複抑制の実施自体は、Issue/PR/repository への読み書きを一切行わない
+proposal-only な本 plugin（`run_retrospective.py` はいかなる mutation も実行しない）ではなく、
+ADR 0007 Decision 5 が想定する downstream の publisher/persistence 層が担う責務である。
 
 ## Marketplace / semver / rollback（Out of Scope、対象範囲外）
 
