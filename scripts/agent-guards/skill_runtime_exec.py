@@ -244,6 +244,78 @@ def _git_status_paths(project_root: str) -> set[str]:
     return paths
 
 
+# Issue #2199 In Scope: the 4 production preflight profiles whose child
+# dispatch cwd is intended to migrate to the #2197 dedicated worktree
+# (`execution_root`). Fixture profiles
+# (`preflight.run.fixture`/`preflight.run.fixture.with_human_context`) and
+# `contract_update.run.with_anchor`/`contract_update.run.with_human_context`
+# are deliberately excluded (AC8 non-regression) -- they remain on the
+# primary root (`canonical_main_root`), unchanged by this Issue.
+#
+# NOTE (discovered during implementation, see PR body / Issue comment for
+# full detail): wiring this constant into `main()`'s actual dispatch path
+# (so the 4 profiles' child process really runs with `cwd=execution_root`)
+# was found to break ~7+ pre-existing real-subprocess tests outside this
+# Issue's Allowed Paths (e.g.
+# `.claude/skills/issue-refinement-loop/scripts/tests/test_workflow_start_entry_canonical_executor.py`,
+# `scripts/agent-guards/tests/test_skill_runtime_preflight_no_worktree.py`)
+# whose fixtures do not ship `scripts/agent-ops/worktree_bootstrap_exec.py`
+# and cannot reach the real GitHub remote `CONTROL_PLANE_CANONICAL_REMOTE_URL`
+# requires. `main()` therefore does NOT yet consult this constant -- it is
+# exposed here (and exercised directly by
+# `tests/agent_ops/test_control_plane_worktree_bootstrap.py`) so the
+# downstream `main()` wiring can be completed once that pre-existing-test
+# conflict is resolved (Issue contract revision / follow-up Issue), without
+# duplicating this profile-set literal.
+PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS = frozenset(
+    {
+        "preflight.run",
+        "preflight.run.with_anchor",
+        "preflight.run.with_human_context",
+        "preflight.run.with_agent_report",
+    }
+)
+
+
+def capture_primary_checkout_invariant_snapshot(project_root: str) -> dict[str, str]:
+    """A cheap, ``--no-optional-locks``-guarded snapshot of the PRIMARY
+    checkout's identity-bearing state (Issue #2199 AC1).
+
+    Deliberately NOT a full untracked-filesystem walk (that cost already
+    exists, separately scoped, in ``_snapshot_repo_paths`` for the artifact/
+    write-detection check -- this Issue does not add a second one to every
+    production invocation). Returns ``toplevel_raw``/``head_mode_raw``/
+    ``head_oid_raw``/``status_raw`` so a caller can prove the primary
+    checkout is byte-identical before and after a dedicated-worktree child
+    dispatch, on both the success and the failure path.
+    """
+    git = shutil.which("git") or "git"
+
+    def _run(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [git, "--no-optional-locks", "-C", project_root, *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    toplevel = _run("rev-parse", "--show-toplevel")
+    toplevel_raw = toplevel.stdout if toplevel.returncode == 0 else f"<error:{toplevel.returncode}>"
+    symbolic = _run("symbolic-ref", "-q", "HEAD")
+    head_mode_raw = f"branch:{symbolic.stdout.strip()}" if symbolic.returncode == 0 else "detached"
+    head_oid = _run("rev-parse", "HEAD")
+    head_oid_raw = head_oid.stdout if head_oid.returncode == 0 else f"<error:{head_oid.returncode}>"
+    status = _run("status", "--porcelain=v1", "--untracked-files=all", "-z")
+    status_raw = status.stdout.replace("\0", "\\0") if status.returncode == 0 else f"<error:{status.returncode}>"
+    return {
+        "toplevel_raw": toplevel_raw,
+        "head_mode_raw": head_mode_raw,
+        "head_oid_raw": head_oid_raw,
+        "status_raw": status_raw,
+    }
+
+
 def _strict_ancestor_of_race_tolerant_root(rel_path: str) -> bool:
     """True when `rel_path` (a directory-status entry, e.g. `artifacts/`) is a
     strict ancestor of at least one race-tolerant-unattributable root, but is
@@ -2406,6 +2478,7 @@ _SUPPORTED_GIT_OPERATION_KINDS = frozenset(
         "add_detached_locked_worktree",
         "remove_detached_locked_worktree",
         "list_worktrees_porcelain",
+        "list_worktrees_porcelain_locked_prunable",
         "delete_private_ref_cas",
     }
 )
@@ -2873,6 +2946,14 @@ def _operation_arguments(operation: _GitOperation, *, cwd: str) -> list[str]:
         return ["worktree", "remove", "--force", "--force", path.value]
     if operation.kind == "list_worktrees_porcelain":
         return ["worktree", "list", "--porcelain"]
+    if operation.kind == "list_worktrees_porcelain_locked_prunable":
+        # Issue #2199 AC2/AC10/AC12: minimal typed extension to the closed
+        # git-worktree-listing seam that additionally exposes `locked`/
+        # `prunable` porcelain fields (the `-z` form matches the parsing
+        # convention already used by `worktree_catalog.py`). Never a
+        # generic raw-argv path -- this is the one fixed argv this kind
+        # ever produces.
+        return ["worktree", "list", "--porcelain", "-z"]
     if operation.kind == "delete_private_ref_cas":
         private_ref = _revalidate_private_ref(operation.private_ref)
         object_id = _revalidate_object_id(operation.object_id)
@@ -2885,9 +2966,16 @@ def _exact_git_argv(operation: _GitOperation, *, git_executable: str, cwd: str, 
         "probe_no_lazy_fetch_support",
         "fetch_default_ref_no_lazy",
     } else ()
+    # Issue #2199 AC1/In Scope: avoid optional-lock (index) contention on
+    # this read-only listing operation, without adding `--no-optional-locks`
+    # to any write/fetch/mutating operation kind.
+    no_optional_locks = (
+        ("--no-optional-locks",) if operation.kind == "list_worktrees_porcelain_locked_prunable" else ()
+    )
     return [
         git_executable,
         "--no-replace-objects",
+        *no_optional_locks,
         "-c",
         "core.hooksPath=" + hooks_dir,
         "-c",
@@ -3874,6 +3962,38 @@ def run_control_plane_git_read_worktree_status_porcelain(
             deadline=deadline,
         ),
         "read_worktree_status_porcelain",
+    )
+    return result.stdout or ""
+
+
+def run_control_plane_git_list_worktrees_porcelain_locked_prunable(
+    *,
+    cwd: str,
+    project_root: str,
+    deadline: GitProtocolDeadline,
+    scratch_root: str | None = None,
+) -> str:
+    """Read-only ``git worktree list --porcelain -z`` exposing ``locked``/
+    ``prunable`` (Issue #2199 AC2/AC10/AC12).
+
+    This is the minimal typed extension this Issue adds to the existing
+    closed/sanitized Git execution seam (#2378/#2197) so the dedicated-lane
+    identity probe (``worktree_bootstrap_exec.verify_dedicated_control_plane_identity``,
+    consumed via ``worktree_catalog.parse_worktree_porcelain_locked_prunable_z``)
+    never needs a generic raw-argv Git executor or an ambient
+    ``subprocess.run(["git", ...])`` call of its own. It performs no mutation
+    and no identity verification itself -- the caller interprets the raw
+    porcelain text.
+    """
+    result = _require_success(
+        _execute_semantic_git(
+            _GitOperation("list_worktrees_porcelain_locked_prunable"),
+            cwd=cwd,
+            project_root=project_root,
+            scratch_root=scratch_root,
+            deadline=deadline,
+        ),
+        "list_worktrees_porcelain_locked_prunable",
     )
     return result.stdout or ""
 

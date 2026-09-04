@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import json
@@ -36,6 +37,7 @@ from skill_runtime_exec import (  # noqa: E402
     resolve_git_subprocess_executable,
     run_control_plane_git_add_detached_locked_worktree,
     run_control_plane_git_delete_private_ref_cas,
+    run_control_plane_git_list_worktrees_porcelain_locked_prunable,
     run_control_plane_git_read_worktree_head,
     run_control_plane_git_read_worktree_status_porcelain,
     run_control_plane_git_remove_existing_detached_locked_worktree,
@@ -48,7 +50,12 @@ from worktree_bootstrap_command_policy import (  # noqa: E402
     expected_worktree_path,
     normalize_default_branch_ref,
 )
-from worktree_catalog import branch_short_name, find_by_realpath, list_worktrees  # noqa: E402
+from worktree_catalog import (  # noqa: E402
+    branch_short_name,
+    find_by_realpath,
+    list_worktrees,
+    parse_worktree_porcelain_locked_prunable_z,
+)
 
 SCHEMA = "WORKTREE_BOOTSTRAP_RESULT_V1"
 
@@ -497,6 +504,179 @@ def run_control_plane_preflight_session(
         }
     finally:
         guard.release()
+
+
+class DedicatedIdentityViolation(ControlPlaneUnavailable):
+    """Fail-closed terminal state for the dedicated-lane identity probe
+    (Issue #2199 AC2/AC11). Never resolved by falling back to the primary
+    root or by continuing on a different/alternate dedicated identity --
+    the caller must abort the production dispatch entirely.
+    """
+
+
+@contextlib.contextmanager
+def control_plane_dedicated_execution_session(
+    project_root: str | os.PathLike[str],
+    *,
+    timeout_seconds: float = 30.0,
+    cleanup_reserve_seconds: float = 3.0,
+    scratch_root: str | None = None,
+):
+    """Context manager holding the fixed lifecycle guard across bootstrap,
+    dedicated-worktree child dispatch, and existing post-child checks
+    (Issue #2199 AC3/AC4).
+
+    Unlike `run_control_plane_preflight_session` (Issue #2197 AC6/AC7, whose
+    guard is released -- via its own `finally` -- before that function ever
+    returns to its caller), this generator's `with` body runs WHILE the
+    SAME guard is still held: the guard is released only in this
+    generator's own `finally`, after the caller's `with` block (covering
+    child dispatch and post-child checks) completes on both the success and
+    the exception path. No lease, TTL, heartbeat, stale-takeover, or daemon
+    is introduced -- this is exactly the already-reviewed #2198 guard, held
+    for the wider, precisely bounded scope this Issue requires.
+    """
+    root = os.path.realpath(os.fspath(project_root))
+    guard = acquire_control_plane_preflight_lifecycle_mutex(root, deadline_at=time.monotonic() + timeout_seconds)
+    try:
+        guard.assert_held()
+        literal_remote_url = validate_literal_remote_url(CONTROL_PLANE_CANONICAL_REMOTE_URL)
+        protocol_deadline = GitProtocolDeadline.start(timeout_seconds, cleanup_reserve_seconds)
+        private_ref, accepted_oid, object_format = run_control_plane_remote_default_ref_binding(
+            literal_remote_url,
+            cwd=root,
+            project_root=root,
+            deadline=protocol_deadline,
+            scratch_root=scratch_root,
+        )
+        guard.assert_held()
+
+        def _cleanup_private_ref() -> None:
+            try:
+                run_control_plane_git_delete_private_ref_cas(
+                    private_ref,
+                    accepted_oid,
+                    cwd=root,
+                    project_root=root,
+                    deadline=protocol_deadline,
+                    scratch_root=scratch_root,
+                )
+            except BaseException as cleanup_exc:
+                raise ControlPlaneUnavailable(
+                    "control_plane_unavailable:private_ref_cleanup_failed"
+                ) from cleanup_exc
+
+        try:
+            recovery = recover_or_create_fixed_control_plane_worktree(
+                accepted_oid,
+                object_format,
+                project_root=root,
+                canonical_common_dir=guard.canonical_common_dir,
+                deadline=protocol_deadline,
+                scratch_root=scratch_root,
+            )
+        except BaseException:
+            _cleanup_private_ref()
+            raise
+        _cleanup_private_ref()
+        guard.assert_held()
+        session: dict[str, object] = {
+            "guard": guard,
+            "execution_root": recovery["worktree_path"],
+            "worktree_state": recovery["state"],
+            "accepted_oid": accepted_oid,
+            "object_format": object_format,
+            "canonical_common_dir": guard.canonical_common_dir,
+            "deadline": protocol_deadline,
+        }
+        yield session
+        guard.assert_held()
+    finally:
+        guard.release()
+
+
+def verify_dedicated_control_plane_identity(
+    session: dict[str, object],
+    *,
+    project_root: str,
+    execution_root: str,
+    invocation_cwd: str,
+    executor_script_path: str,
+) -> None:
+    """Fail-closed dedicated-lane identity verification (Issue #2199
+    AC2/AC10/AC11).
+
+    Confirms, from the porcelain catalog alone (never a second remote
+    observation -- AC10 reuses the SAME ``session["accepted_oid"]`` already
+    obtained via #2197's remote-binding protocol):
+
+    - exactly one catalog entry matches ``execution_root``'s realpath
+    - that entry is ``detached``, ``locked``, and NOT ``prunable``
+    - its ``head`` equals ``session["accepted_oid"]``
+    - its git-common-dir linkage matches ``session["canonical_common_dir"]``
+      (re-derived the same closed way ``acquire_control_plane_preflight_lifecycle_mutex``
+      already did, never re-queried ad hoc)
+    - ``invocation_cwd``, ``executor_script_path``, and ``execution_root``
+      all resolve to the SAME dedicated identity (no symlink path
+      component in any of the three, ``invocation_cwd`` equals
+      ``execution_root``, and the script path nests under it)
+
+    Any missing/duplicate catalog entry, linkage mismatch, symlink
+    component, non-detached head, ``locked==false``, ``prunable==true``, or
+    OID mismatch raises ``DedicatedIdentityViolation`` -- fail-closed, with
+    no primary fallback and no dedicated-side alternate continuation
+    (AC11). Ambient ``LOOP_DEFAULT_BRANCH`` is never consulted here.
+    """
+    guard = session["guard"]
+    accepted_oid = session["accepted_oid"]
+    canonical_common_dir = session["canonical_common_dir"]
+    deadline = session["deadline"]
+
+    for candidate_path in (execution_root, invocation_cwd, executor_script_path):
+        candidate = Path(candidate_path)
+        if candidate.is_symlink():
+            raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_symlink_component")
+        for component in candidate.parents:
+            if component.is_symlink():
+                raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_symlink_component")
+
+    execution_root_real = os.path.realpath(execution_root)
+    invocation_cwd_real = os.path.realpath(invocation_cwd)
+    executor_script_real = os.path.realpath(executor_script_path)
+
+    if invocation_cwd_real != execution_root_real:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_cwd_mismatch")
+    try:
+        common = os.path.commonpath([execution_root_real, executor_script_real])
+    except ValueError:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_script_mismatch") from None
+    if common != execution_root_real:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_script_mismatch")
+
+    porcelain = run_control_plane_git_list_worktrees_porcelain_locked_prunable(
+        cwd=project_root,
+        project_root=project_root,
+        deadline=deadline,
+    )
+    entries = parse_worktree_porcelain_locked_prunable_z(porcelain)
+    matches = [entry for entry in entries if entry.get("worktree_realpath") == execution_root_real]
+    if len(matches) != 1:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_catalog_match_not_unique")
+    entry = matches[0]
+    if not entry.get("detached"):
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_not_detached")
+    if not entry.get("locked"):
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_not_locked")
+    if entry.get("prunable"):
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_prunable")
+    if entry.get("head") != accepted_oid.value:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_oid_mismatch")
+
+    entry_common_dir = _canonical_existing_git_common_dir(execution_root_real, deadline_at=time.monotonic() + 10.0)
+    if entry_common_dir != canonical_common_dir:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_common_dir_mismatch")
+
+    guard.assert_held()
 
 
 def _result(

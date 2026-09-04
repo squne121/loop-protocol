@@ -21,6 +21,15 @@ import time
 
 SCHEMA_ENTRY = "WORKTREE_CATALOG_ENTRY_V1"
 
+# Issue #2199 AC2/AC10/AC11/AC12: a SEPARATE, additive schema for the
+# dedicated-lane identity probe only. `WORKTREE_CATALOG_ENTRY_V1` /
+# `parse_worktree_porcelain_z()` above are never modified by this Issue --
+# no `locked`/`prunable` field is added to that entry shape. This probe-only
+# schema and its parser are consumed exclusively by dedicated worktree
+# identity verification (`worktree_bootstrap_exec.py`), never by the
+# existing `list_worktrees()` / `select_issue_worktree*()` catalog callers.
+SCHEMA_IDENTITY_PROBE_ENTRY = "WORKTREE_IDENTITY_PROBE_ENTRY_V1"
+
 # Reason code returned when the shared deadline is exhausted.
 GUARD_DEADLINE_EXCEEDED = "guard_deadline_exceeded"
 
@@ -98,6 +107,59 @@ def parse_worktree_porcelain_z(data: str) -> list[dict]:
             current["detached"] = True
         elif field.startswith("HEAD "):
             current["head"] = field[len("HEAD "):]
+    _flush()
+    return entries
+
+
+def parse_worktree_porcelain_locked_prunable_z(data: str) -> list[dict]:
+    """Parse ``git worktree list --porcelain -z`` exposing ``locked``/``prunable``
+    (Issue #2199 AC2/AC10/AC11/AC12).
+
+    This is a deliberately SEPARATE parser from ``parse_worktree_porcelain_z``
+    above -- it returns ``WORKTREE_IDENTITY_PROBE_ENTRY_V1`` dicts, a distinct
+    shape that is never assigned to the existing ``WORKTREE_CATALOG_ENTRY_V1``
+    schema and never consumed by ``list_worktrees()`` / ``select_issue_worktree*()``.
+    Callers pass in porcelain text obtained via the existing closed/sanitized
+    Git execution seam (``skill_runtime_exec.run_control_plane_git_list_worktrees_porcelain_locked_prunable``)
+    -- this module itself performs no ambient ``subprocess.run(["git", ...])``
+    for this probe.
+    """
+    entries: list[dict] = []
+    current: dict | None = None
+
+    def _flush() -> None:
+        if current is not None:
+            entries.append(current)
+
+    for field in data.split("\0"):
+        if field == "":
+            continue
+        if field.startswith("worktree "):
+            _flush()
+            raw = field[len("worktree "):]
+            realpath = os.path.realpath(raw)
+            current = {
+                "schema": SCHEMA_IDENTITY_PROBE_ENTRY,
+                "worktree_realpath": realpath,
+                "branch_ref": None,
+                "detached": False,
+                "head": None,
+                "locked": False,
+                "prunable": False,
+                "exists_on_disk": os.path.isdir(realpath),
+            }
+        elif current is None:
+            continue
+        elif field.startswith("branch "):
+            current["branch_ref"] = field[len("branch "):]
+        elif field == "detached":
+            current["detached"] = True
+        elif field.startswith("HEAD "):
+            current["head"] = field[len("HEAD "):]
+        elif field == "locked" or field.startswith("locked "):
+            current["locked"] = True
+        elif field == "prunable" or field.startswith("prunable "):
+            current["prunable"] = True
     _flush()
     return entries
 
