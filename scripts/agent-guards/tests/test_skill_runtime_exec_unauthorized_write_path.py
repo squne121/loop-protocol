@@ -42,8 +42,16 @@ def _make_repo(tmp_path: Path) -> Path:
     repo.mkdir()
     _git("init", "-q", "-b", "main", cwd=repo)
     _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
+    # Issue #2199: also ignore `.claude/worktrees/` (the fixed
+    # dedicated-worktree path, #2197) and the bare `artifacts/` pattern
+    # (matches `.claude/artifacts/**` too, mirroring the real repo's own
+    # `.gitignore`) so `capture_primary_checkout_invariant_snapshot()`'s
+    # `git status` at `project_root` never sees either as untracked drift,
+    # and so this fixed worktree can itself be reused (not fail-closed as
+    # dirty) across the multiple dispatches a couple of tests below make
+    # against the SAME repo.
     (repo / ".gitignore").write_text(
-        ".cache/\n__pycache__/\ntmp/\n.guard_shadow_log.jsonl\n"
+        ".cache/\n__pycache__/\ntmp/\n.guard_shadow_log.jsonl\n.claude/worktrees/\nartifacts/\n"
     )
     (repo / "README.md").write_text("seed\n")
     _git("add", "README.md", ".gitignore", cwd=repo)
@@ -70,15 +78,106 @@ def _write_text(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def _init_control_plane_origin(repo_root: Path, origin: Path) -> None:
+    """A real, local, deterministic ``file://`` bare remote (Issue #2199)
+    that Issue #2199's dedicated-worktree lifecycle (#2196/#2197/#2198) can
+    bind against with no real GitHub network access
+    (``network_required: false``)."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "push", "-q", str(origin), "HEAD:refs/heads/main"],
+        cwd=str(repo_root),
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    subprocess.run(
+        ["git", "--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def _execution_root(repo_root: Path) -> Path:
+    """The one fixed dedicated worktree path Issue #2199's wired `main()`
+    dispatches `preflight.run`'s child process under (mirrors
+    `worktree_bootstrap_exec.fixed_control_plane_worktree_path()`) -- this
+    fixture's own seed writes, peer-write races, and artifact-existence
+    assertions must target here, not `repo_root`, once the child's cwd is
+    the dedicated worktree."""
+    return repo_root / ".claude" / "worktrees" / "control-plane-preflight"
+
+
+def _wait_for_path(path: Path, timeout: float) -> bool:
+    """Poll (bounded, not a fixed sleep) for `path` to appear."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.02)
+    return path.exists()
+
+
+def _materialize_execution_root(repo: Path) -> Path:
+    """Issue #2199: `execution_root` only comes into existence once
+    `main()`'s dedicated-worktree bootstrap runs (inside a real
+    `_run_executor()` call). `test_shadow_log_create_or_update_fails_as_
+    generic_unauthorized_write_path[update]` below needs to seed a stale
+    `.guard_shadow_log.jsonl` that genuinely predates the real dispatch's
+    before-snapshot (not a genuinely-new mid-run write, which this test is
+    deliberately NOT testing) -- this runs one throwaway, no-extra-env
+    dispatch first solely to materialize `execution_root` (a no-op fixture
+    child, see `run_refinement_preflight.py` below), then returns it for
+    the caller to seed directly. Reused as-is (#2197 AC5) on the test's own
+    subsequent real dispatch, as long as `execution_root`'s own working
+    tree stays clean/git-ignored in between (`_make_repo`'s
+    `.guard_shadow_log.jsonl`/`.claude/worktrees/`/`artifacts/` ignore
+    entries)."""
+    execution_root = _execution_root(repo)
+    if not execution_root.exists():
+        warm_up = _run_executor(repo)
+        assert warm_up.returncode == 0, warm_up.stderr
+    assert execution_root.exists()
+    return execution_root
+
+
 def _install_skill_runtime_exec_fixture(repo_root: Path) -> None:
     source_root = REPO_ROOT
     for rel in (
         "scripts/agent-guards/skill_runtime_exec.py",
         "scripts/agent-guards/skill_runtime_command_policy.py",
+        "scripts/agent-guards/worktree_bootstrap_command_policy.py",
+        "scripts/agent-ops/worktree_bootstrap_exec.py",
+        "scripts/agent-ops/worktree_catalog.py",
     ):
         src = source_root / rel
         dest = repo_root / rel
         _write_text(dest, src.read_text())
+
+    # Issue #2199: `preflight.run` is now a production preflight profile
+    # `main()` dispatches under a dedicated worktree bound to a real
+    # remote's `accepted_oid` (#2197). Source-patch the copied
+    # `skill_runtime_exec.py`'s hardcoded canonical remote constant to this
+    # fixture's own local, deterministic bare remote -- never the real
+    # `https://github.com/...` production remote (`network_required: false`
+    # / `auth_required: false` per this Issue's Runtime Verification
+    # Applicability).
+    control_plane_origin_path = repo_root.parent / "control-plane-origin.git"
+    control_plane_remote_url = control_plane_origin_path.as_uri()
+    executor_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_exec.py"
+    executor_source = executor_path.read_text(encoding="utf-8")
+    default_remote_line = 'CONTROL_PLANE_CANONICAL_REMOTE_URL = f"https://github.com/{TRUSTED_REPO_SLUG}.git"'
+    assert default_remote_line in executor_source
+    fixture_remote_line = f"CONTROL_PLANE_CANONICAL_REMOTE_URL = {control_plane_remote_url!r}"
+    executor_path.write_text(executor_source.replace(default_remote_line, fixture_remote_line), encoding="utf-8")
 
     pin = _pinned_uv_version(source_root)
     _write_text(
@@ -93,24 +192,6 @@ dependencies = []
 required-version = "{pin}"
 managed = false
 ''',
-    )
-
-    _write_text(
-        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
-        """from __future__ import annotations
-
-class Deadline:
-    def subprocess_timeout(self, seconds: float) -> float:
-        return seconds
-
-
-def list_worktrees(project_root: str, deadline=None):
-    return []
-
-
-def select_issue_worktree(catalog, issue_number, root_realpath):
-    return None
-""",
     )
 
     _write_text(
@@ -269,6 +350,15 @@ if __name__ == "__main__":
 """,
     )
 
+    # Issue #2199: the dedicated worktree's child process actually runs FROM
+    # the dedicated worktree checked out at the remote's `accepted_oid` --
+    # everything the child needs must be part of a REAL commit this fixture
+    # pushes to its own local bare origin below, not merely present,
+    # uncommitted, in the outer working tree.
+    _git("add", "-A", cwd=repo_root)
+    _git("commit", "-q", "-m", "install skill runtime fixture", cwd=repo_root)
+    _init_control_plane_origin(repo_root, repo_root.parent / "control-plane-origin.git")
+
 
 def _run_executor(repo: Path, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo)}
@@ -293,8 +383,16 @@ def _run_executor(repo: Path, extra_env: dict[str, str] | None = None) -> subpro
     )
 
 
-def _write_after_delay(path: Path, content: str, delay_seconds: float) -> threading.Thread:
+def _write_after_delay(
+    path: Path, content: str, delay_seconds: float, *, wait_for: "Path | None" = None
+) -> threading.Thread:
     def _worker() -> None:
+        if wait_for is not None:
+            # Issue #2199: never race the dedicated worktree's own `git
+            # worktree add` bootstrap -- pre-creating `_execution_root(repo)`
+            # before that runs would make the fixed dedicated-worktree
+            # recovery fail-close as an unknown owner (#2197 AC5).
+            assert _wait_for_path(wait_for, timeout=30), f"{wait_for} never materialized"
         time.sleep(delay_seconds)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
@@ -310,15 +408,16 @@ def test_unrelated_process_write_to_worktrees_does_not_fail(tmp_path: Path) -> N
     THEN skill_runtime_exec.py must not fail with unauthorized_write_path."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    peer_path = repo / ".claude" / "worktrees" / "issue-9999-peer-session" / "scratch.txt"
-    thread = _write_after_delay(peer_path, "peer-session-write\n", delay_seconds=0.2)
+    execution_root = _execution_root(repo)
+    peer_path = execution_root / ".claude" / "worktrees" / "issue-9999-peer-session" / "scratch.txt"
+    thread = _write_after_delay(peer_path, "peer-session-write\n", delay_seconds=0.2, wait_for=execution_root)
     try:
         result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
     finally:
         thread.join(timeout=5)
     assert result.returncode == 0, result.stderr
     assert peer_path.exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
     assert artifact.exists()
 
 
@@ -330,15 +429,16 @@ def test_unrelated_process_write_to_other_issue_artifacts_does_not_fail(tmp_path
     THEN skill_runtime_exec.py must not fail with unauthorized_write_path."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    peer_path = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1337" / "peer.json"
-    thread = _write_after_delay(peer_path, '{"peer": true}\n', delay_seconds=0.2)
+    execution_root = _execution_root(repo)
+    peer_path = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1337" / "peer.json"
+    thread = _write_after_delay(peer_path, '{"peer": true}\n', delay_seconds=0.2, wait_for=execution_root)
     try:
         result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
     finally:
         thread.join(timeout=5)
     assert result.returncode == 0, result.stderr
     assert peer_path.exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
     assert artifact.exists()
 
 
@@ -392,7 +492,7 @@ def test_self_write_inside_allowed_roots_still_succeeds(tmp_path: Path) -> None:
     _install_skill_runtime_exec_fixture(repo)
     result = _run_executor(repo)
     assert result.returncode == 0, result.stderr
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    artifact = _execution_root(repo) / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
     assert artifact.exists()
     assert json.loads(artifact.read_text()) == {
         "issue_number": "1228",
@@ -422,11 +522,12 @@ def test_self_write_to_worktrees_is_known_unsupported_in_stdlib_mode(tmp_path: P
     """
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
+    execution_root = _execution_root(repo)
     result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SELF_WRITE_WORKTREES": "ignored"})
     assert result.returncode == 0, result.stderr
-    self_write_path = repo / ".claude" / "worktrees" / "issue-9999-self" / "self-write.txt"
+    self_write_path = execution_root / ".claude" / "worktrees" / "issue-9999-self" / "self-write.txt"
     assert self_write_path.exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
     assert artifact.exists()
 
 
@@ -448,15 +549,16 @@ def test_self_write_to_other_issue_artifacts_is_known_unsupported_in_stdlib_mode
     """
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
+    execution_root = _execution_root(repo)
     result = _run_executor(
         repo, {"SKILL_RUNTIME_TEST_SELF_WRITE_OTHER_ISSUE_ARTIFACTS": "ignored"}
     )
     assert result.returncode == 0, result.stderr
     self_write_path = (
-        repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1337" / "self-write.json"
+        execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1337" / "self-write.json"
     )
     assert self_write_path.exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
     assert artifact.exists()
 
 
@@ -483,7 +585,13 @@ def test_shadow_log_create_or_update_fails_as_generic_unauthorized_write_path(
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
     if mode == "update":
-        stale_shadow_log = repo / ".guard_shadow_log.jsonl"
+        # Issue #2199: the stale shadow log must genuinely predate the real
+        # dispatch's before-snapshot (this test is deliberately NOT testing
+        # a genuinely-new mid-run creation, that's the "create" mode above)
+        # -- materialize `execution_root` with a real throwaway dispatch
+        # first, then seed directly into it.
+        execution_root = _materialize_execution_root(repo)
+        stale_shadow_log = execution_root / ".guard_shadow_log.jsonl"
         stale_shadow_log.write_text(
             '{"schema_version":"1","timestamp":"2026-01-01T00:00:00Z","event":"stale"}\n'
         )

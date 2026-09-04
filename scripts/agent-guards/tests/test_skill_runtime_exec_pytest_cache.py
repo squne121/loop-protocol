@@ -63,7 +63,11 @@ def _make_repo(tmp_path: Path) -> Path:
     repo.mkdir()
     _git("init", "-q", "-b", "main", cwd=repo)
     _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
-    (repo / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\n.pytest_cache/\n")
+    # Issue #2199: also ignore `.claude/worktrees/` (the fixed
+    # dedicated-worktree path, #2197) so
+    # `capture_primary_checkout_invariant_snapshot()`'s `git status` at
+    # `project_root` never sees it as untracked drift.
+    (repo / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\n.pytest_cache/\n.claude/worktrees/\n")
     (repo / "README.md").write_text("seed\n")
     _git("add", "README.md", ".gitignore", cwd=repo)
     _git("commit", "-q", "-m", "seed", cwd=repo)
@@ -75,15 +79,73 @@ def _write_text(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def _init_control_plane_origin(repo_root: Path, origin: Path) -> None:
+    """A real, local, deterministic ``file://`` bare remote (Issue #2199)
+    that Issue #2199's dedicated-worktree lifecycle (#2196/#2197/#2198) can
+    bind against with no real GitHub network access
+    (``network_required: false``)."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "push", "-q", str(origin), "HEAD:refs/heads/main"],
+        cwd=str(repo_root),
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    subprocess.run(
+        ["git", "--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def _execution_root(repo_root: Path) -> Path:
+    """The one fixed dedicated worktree path Issue #2199's wired `main()`
+    dispatches the 4 production preflight profiles' child process under
+    (mirrors `worktree_bootstrap_exec.fixed_control_plane_worktree_path()`)
+    -- this fixture's own peer-write races and artifact-existence
+    assertions must target here, not `repo_root`, once the child's cwd is
+    the dedicated worktree."""
+    return repo_root / ".claude" / "worktrees" / "control-plane-preflight"
+
+
 def _install_skill_runtime_exec_fixture(repo_root: Path) -> None:
     source_root = REPO_ROOT
     for rel in (
         "scripts/agent-guards/skill_runtime_exec.py",
         "scripts/agent-guards/skill_runtime_command_policy.py",
+        "scripts/agent-guards/worktree_bootstrap_command_policy.py",
+        "scripts/agent-ops/worktree_bootstrap_exec.py",
+        "scripts/agent-ops/worktree_catalog.py",
     ):
         src = source_root / rel
         dest = repo_root / rel
         _write_text(dest, src.read_text())
+
+    # Issue #2199: `preflight.run` is now one of the 4 production preflight
+    # profiles `main()` dispatches under a dedicated worktree bound to a
+    # real remote's `accepted_oid` (#2197). Source-patch the copied
+    # `skill_runtime_exec.py`'s hardcoded canonical remote constant to this
+    # fixture's own local, deterministic bare remote -- never the real
+    # `https://github.com/...` production remote (`network_required: false`
+    # / `auth_required: false` per this Issue's Runtime Verification
+    # Applicability).
+    control_plane_origin_path = repo_root.parent / "control-plane-origin.git"
+    control_plane_remote_url = control_plane_origin_path.as_uri()
+    executor_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_exec.py"
+    executor_source = executor_path.read_text(encoding="utf-8")
+    default_remote_line = 'CONTROL_PLANE_CANONICAL_REMOTE_URL = f"https://github.com/{TRUSTED_REPO_SLUG}.git"'
+    assert default_remote_line in executor_source
+    fixture_remote_line = f"CONTROL_PLANE_CANONICAL_REMOTE_URL = {control_plane_remote_url!r}"
+    executor_path.write_text(executor_source.replace(default_remote_line, fixture_remote_line), encoding="utf-8")
 
     pin = _pinned_uv_version(source_root)
     _write_text(
@@ -98,24 +160,6 @@ dependencies = []
 required-version = "{pin}"
 managed = false
 ''',
-    )
-
-    _write_text(
-        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
-        """from __future__ import annotations
-
-class Deadline:
-    def subprocess_timeout(self, seconds: float) -> float:
-        return seconds
-
-
-def list_worktrees(project_root: str, deadline=None):
-    return []
-
-
-def select_issue_worktree(catalog, issue_number, root_realpath):
-    return None
-""",
     )
 
     _write_text(
@@ -203,6 +247,25 @@ def main() -> int:
         outside = Path(".mypy_cache")
         outside.mkdir(parents=True, exist_ok=True)
         (outside / "outside.txt").write_text("self-write")
+    # Issue #2199: deterministic independent-process barrier (no fixed
+    # sleep, replaces a fixed-`delay_seconds` writer race against this
+    # executor's own before-snapshot, which is unbounded under CPU load --
+    # see `tests/agent_ops` sibling rationale). The child signals "the
+    # before-snapshot race window is now open" by creating a go-file, then
+    # blocks (bounded poll) until the peer writer thread has durably
+    # created an ack-file confirming its write landed on disk, before the
+    # child itself exits.
+    go_file = os.environ.get("SKILL_RUNTIME_TEST_BARRIER_GO_FILE")
+    ack_file = os.environ.get("SKILL_RUNTIME_TEST_BARRIER_ACK_FILE")
+    if go_file:
+        Path(go_file).parent.mkdir(parents=True, exist_ok=True)
+        Path(go_file).write_text("go")
+    if ack_file:
+        deadline = time.monotonic() + 10.0
+        while not Path(ack_file).exists():
+            if time.monotonic() > deadline:
+                raise RuntimeError("barrier_ack_file_timeout")
+            time.sleep(0.02)
     artifact_dir = Path(".claude") / "artifacts" / "issue-refinement-loop" / args.issue_number
     artifact_dir.mkdir(parents=True, exist_ok=True)
     payload = {"issue_number": args.issue_number, "repo": args.repo}
@@ -215,6 +278,38 @@ if __name__ == "__main__":
     raise SystemExit(main())
 """,
     )
+
+    # Issue #2199 (AC7 non-regression, `test_independent_pytest_process_
+    # writes_real_pytest_cache_and_is_permitted`): committed here, rather
+    # than written at test-invocation time, so it is ALREADY present in the
+    # dedicated worktree's checked-out `accepted_oid` (i.e. present in the
+    # child dispatch's own before-snapshot) -- a real, independent
+    # sibling `pytest` subprocess run with `cwd=execution_root` can collect
+    # and run it without racing `main()`'s own before/after snapshot
+    # timing. Its own "started" sentinel is written under `.pytest_cache/`
+    # (the exempted root this whole file's AC covers), so it is never
+    # itself misreported as an unauthorized new top-level file regardless
+    # of exactly when it appears.
+    _write_text(
+        repo_root / "test_peer_pytest_cache.py",
+        "from pathlib import Path\n"
+        "import time\n"
+        "def test_ok():\n"
+        "    sentinel = Path('.pytest_cache') / 'peer_pytest_started.sentinel'\n"
+        "    sentinel.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    sentinel.write_text('started')\n"
+        "    time.sleep(0.3)\n"
+        "    assert True\n",
+    )
+
+    # Issue #2199: the dedicated worktree's child process actually runs FROM
+    # the dedicated worktree checked out at the remote's `accepted_oid` --
+    # everything the child needs must be part of a REAL commit this fixture
+    # pushes to its own local bare origin below, not merely present,
+    # uncommitted, in the outer working tree.
+    _git("add", "-A", cwd=repo_root)
+    _git("commit", "-q", "-m", "install skill runtime fixture", cwd=repo_root)
+    _init_control_plane_origin(repo_root, repo_root.parent / "control-plane-origin.git")
 
 
 def _run_executor(repo: Path, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -240,8 +335,27 @@ def _run_executor(repo: Path, extra_env: dict[str, str] | None = None) -> subpro
     )
 
 
-def _write_after_delay(path: Path, content: str, delay_seconds: float) -> threading.Thread:
+def _wait_for_path(path: Path, timeout: float) -> bool:
+    """Poll (bounded, not a fixed sleep) for `path` to appear -- a simple
+    file-based barrier/handshake, used here so a peer-write race thread
+    never races the dedicated worktree's own `git worktree add` bootstrap
+    (Issue #2199): pre-creating `_execution_root(repo)` before that
+    bootstrap runs would make the fixed dedicated-worktree recovery
+    fail-close as an unknown owner (#2197 AC5)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.02)
+    return path.exists()
+
+
+def _write_after_delay(
+    path: Path, content: str, delay_seconds: float, *, wait_for: "Path | None" = None
+) -> threading.Thread:
     def _worker() -> None:
+        if wait_for is not None:
+            assert _wait_for_path(wait_for, timeout=30), f"{wait_for} never materialized"
         time.sleep(delay_seconds)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
@@ -251,8 +365,12 @@ def _write_after_delay(path: Path, content: str, delay_seconds: float) -> thread
     return thread
 
 
-def _append_after_delay(path: Path, content: str, delay_seconds: float) -> threading.Thread:
+def _append_after_delay(
+    path: Path, content: str, delay_seconds: float, *, wait_for: "Path | None" = None
+) -> threading.Thread:
     def _worker() -> None:
+        if wait_for is not None:
+            assert _wait_for_path(wait_for, timeout=30), f"{wait_for} never materialized"
         time.sleep(delay_seconds)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
@@ -270,15 +388,22 @@ def test_peer_pytest_nodeids_write_is_permitted(tmp_path: Path) -> None:
     THEN skill_runtime_exec.py must not fail with unauthorized_write_path."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    peer_path = repo / ".pytest_cache" / "v" / "cache" / "nodeids"
-    thread = _write_after_delay(peer_path, json.dumps(["test_x.py::test_a"]), delay_seconds=0.2)
+    execution_root = _execution_root(repo)
+    # Issue #2199: `preflight.run` is now a production dedicated-worktree
+    # profile -- the child (and its own before/after snapshot) actually run
+    # under `execution_root`, not `repo`, so this peer race must target the
+    # SAME root the child observes.
+    peer_path = execution_root / ".pytest_cache" / "v" / "cache" / "nodeids"
+    thread = _write_after_delay(
+        peer_path, json.dumps(["test_x.py::test_a"]), delay_seconds=0.2, wait_for=execution_root
+    )
     try:
         result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
     finally:
         thread.join(timeout=5)
     assert result.returncode == 0, result.stderr
     assert peer_path.exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
     assert artifact.exists()
 
 
@@ -292,15 +417,18 @@ def test_peer_pytest_lastfailed_write_is_permitted(tmp_path: Path) -> None:
     output)."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    peer_path = repo / ".pytest_cache" / "v" / "cache" / "lastfailed"
-    thread = _write_after_delay(peer_path, json.dumps({"test_x.py::test_a": True}), delay_seconds=0.2)
+    execution_root = _execution_root(repo)
+    peer_path = execution_root / ".pytest_cache" / "v" / "cache" / "lastfailed"
+    thread = _write_after_delay(
+        peer_path, json.dumps({"test_x.py::test_a": True}), delay_seconds=0.2, wait_for=execution_root
+    )
     try:
         result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
     finally:
         thread.join(timeout=5)
     assert result.returncode == 0, result.stderr
     assert peer_path.exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
     assert artifact.exists()
 
 
@@ -312,15 +440,18 @@ def test_peer_pytest_custom_cache_key_write_is_permitted(tmp_path: Path) -> None
     THEN skill_runtime_exec.py must not fail with unauthorized_write_path."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    peer_path = repo / ".pytest_cache" / "v" / "cache" / "my_custom_plugin" / "state.json"
-    thread = _write_after_delay(peer_path, json.dumps({"custom": True}), delay_seconds=0.2)
+    execution_root = _execution_root(repo)
+    peer_path = execution_root / ".pytest_cache" / "v" / "cache" / "my_custom_plugin" / "state.json"
+    thread = _write_after_delay(
+        peer_path, json.dumps({"custom": True}), delay_seconds=0.2, wait_for=execution_root
+    )
     try:
         result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
     finally:
         thread.join(timeout=5)
     assert result.returncode == 0, result.stderr
     assert peer_path.exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
     assert artifact.exists()
 
 
@@ -346,15 +477,39 @@ def test_tracked_source_file_unauthorized_write_is_rejected(tmp_path: Path) -> N
     WHEN no `.pytest_cache` exemption applies to a tracked file
     THEN skill_runtime_exec.py must still fail-close with
     unauthorized_write_path (AC5: source/canonical file integrity is
-    unaffected by the `.pytest_cache` reframe)."""
+    unaffected by the `.pytest_cache` reframe).
+
+    Issue #2199: uses the deterministic go-file/ack-file barrier (not a
+    fixed `delay_seconds` race) -- under heavy system load (e.g. the full
+    `scripts/agent-guards/tests/` directory run), a fixed-delay writer can
+    itself race `main()`'s dedicated-worktree bootstrap + before-snapshot
+    capture unpredictably, occasionally landing the write AFTER the
+    after-snapshot instead of during the race window (a false PASS)."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    tracked_path = repo / "README.md"
-    thread = _append_after_delay(tracked_path, "tampered\n", delay_seconds=0.2)
+    execution_root = _execution_root(repo)
+    tracked_path = execution_root / "README.md"
+    go_file = tmp_path / "barrier-go-tracked"
+    ack_file = tmp_path / "barrier-ack-tracked"
+
+    def _append_after_go() -> None:
+        assert _wait_for_path(go_file, timeout=30), "barrier go-file never appeared"
+        with tracked_path.open("a", encoding="utf-8") as handle:
+            handle.write("tampered\n")
+        ack_file.write_text("ack")
+
+    thread = threading.Thread(target=_append_after_go)
+    thread.start()
     try:
-        result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
+        result = _run_executor(
+            repo,
+            {
+                "SKILL_RUNTIME_TEST_BARRIER_GO_FILE": str(go_file),
+                "SKILL_RUNTIME_TEST_BARRIER_ACK_FILE": str(ack_file),
+            },
+        )
     finally:
-        thread.join(timeout=5)
+        thread.join(timeout=10)
     assert result.returncode == 2
     assert "reason_code=unauthorized_write_path" in result.stderr
     assert "target_issue=1526" in result.stderr
@@ -365,15 +520,36 @@ def test_exemption_is_repo_root_specific_not_nested_or_prefix_lookalike(tmp_path
     directory or a prefix-lookalike repo-root `.pytest_cache2/**` directory
     WHEN neither is the exact repo-root `.pytest_cache` exemption
     THEN skill_runtime_exec.py must still fail-close with
-    unauthorized_write_path for both (AC6)."""
+    unauthorized_write_path for both (AC6).
+
+    Issue #2199: uses the deterministic go-file/ack-file barrier (see
+    `test_tracked_source_file_unauthorized_write_is_rejected` above for the
+    fixed-delay-under-load rationale) for both sub-cases."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    nested_peer = repo / "foo" / ".pytest_cache" / "v" / "cache" / "nodeids"
-    thread = _write_after_delay(nested_peer, "[]", delay_seconds=0.2)
+    execution_root = _execution_root(repo)
+    nested_peer = execution_root / "foo" / ".pytest_cache" / "v" / "cache" / "nodeids"
+    go_file = tmp_path / "barrier-go-nested"
+    ack_file = tmp_path / "barrier-ack-nested"
+
+    def _write_nested_after_go() -> None:
+        assert _wait_for_path(go_file, timeout=30), "barrier go-file never appeared"
+        nested_peer.parent.mkdir(parents=True, exist_ok=True)
+        nested_peer.write_text("[]")
+        ack_file.write_text("ack")
+
+    thread = threading.Thread(target=_write_nested_after_go)
+    thread.start()
     try:
-        result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
+        result = _run_executor(
+            repo,
+            {
+                "SKILL_RUNTIME_TEST_BARRIER_GO_FILE": str(go_file),
+                "SKILL_RUNTIME_TEST_BARRIER_ACK_FILE": str(ack_file),
+            },
+        )
     finally:
-        thread.join(timeout=5)
+        thread.join(timeout=10)
     assert result.returncode == 2, result.stderr
     assert "reason_code=unauthorized_write_path" in result.stderr
     assert "unauthorized write path=foo/" in result.stderr
@@ -381,27 +557,32 @@ def test_exemption_is_repo_root_specific_not_nested_or_prefix_lookalike(tmp_path
     (tmp_path / "repo2_root").mkdir(parents=True)
     repo2 = _make_repo(tmp_path / "repo2_root")
     _install_skill_runtime_exec_fixture(repo2)
-    lookalike_peer = repo2 / ".pytest_cache2" / "v" / "cache" / "nodeids"
-    thread2 = _write_after_delay(lookalike_peer, "[]", delay_seconds=0.2)
+    execution_root2 = _execution_root(repo2)
+    lookalike_peer = execution_root2 / ".pytest_cache2" / "v" / "cache" / "nodeids"
+    go_file2 = tmp_path / "barrier-go-lookalike"
+    ack_file2 = tmp_path / "barrier-ack-lookalike"
+
+    def _write_lookalike_after_go() -> None:
+        assert _wait_for_path(go_file2, timeout=30), "barrier go-file never appeared"
+        lookalike_peer.parent.mkdir(parents=True, exist_ok=True)
+        lookalike_peer.write_text("[]")
+        ack_file2.write_text("ack")
+
+    thread2 = threading.Thread(target=_write_lookalike_after_go)
+    thread2.start()
     try:
-        result2 = _run_executor(repo2, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
+        result2 = _run_executor(
+            repo2,
+            {
+                "SKILL_RUNTIME_TEST_BARRIER_GO_FILE": str(go_file2),
+                "SKILL_RUNTIME_TEST_BARRIER_ACK_FILE": str(ack_file2),
+            },
+        )
     finally:
-        thread2.join(timeout=5)
+        thread2.join(timeout=10)
     assert result2.returncode == 2, result2.stderr
     assert "reason_code=unauthorized_write_path" in result2.stderr
     assert "unauthorized write path=.pytest_cache2" in result2.stderr
-
-
-def _wait_for_file(path: Path, timeout: float) -> bool:
-    """Poll (bounded, not a fixed sleep) for `path` to appear -- a simple
-    file-based barrier/handshake so the caller can deterministically know a
-    sibling process has actually started, instead of guessing a delay."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if path.exists():
-            return True
-        time.sleep(0.02)
-    return path.exists()
 
 
 def test_independent_pytest_process_writes_real_pytest_cache_and_is_permitted(tmp_path: Path) -> None:
@@ -417,37 +598,65 @@ def test_independent_pytest_process_writes_real_pytest_cache_and_is_permitted(tm
     invoking the executor)
     THEN skill_runtime_exec.py must not fail with unauthorized_write_path,
     AND the real independent peer pytest process must itself have exited
-    successfully (its exit code is asserted, not ignored)."""
+    successfully (its exit code is asserted, not ignored).
+
+    Issue #2199: `preflight.run` now dispatches its child (and its own
+    before/after snapshot) under `_execution_root(repo)`, not `repo` --
+    so the real peer pytest process must run there too. `execution_root`
+    itself only materializes once `main()`'s dedicated-worktree bootstrap
+    has run, which happens INSIDE the blocking `_run_executor()` call --
+    so the executor is driven from a background thread here, and this
+    thread waits (bounded poll, not a fixed sleep) for `execution_root` to
+    appear before launching the real peer pytest subprocess there.
+    `test_peer_pytest_cache.py` itself is committed as part of the fixture
+    repo (see `_install_skill_runtime_exec_fixture`) -- already checked out
+    in `execution_root` before the child's own before-snapshot is ever
+    captured, so it is never itself misreported as an unauthorized new
+    file (only its `.pytest_cache/**` output during the run is meant to be
+    exercised as the exempted-and-genuinely-concurrent write)."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    started_sentinel = repo / "peer_pytest_started.sentinel"
-    (repo / "test_peer_pytest_cache.py").write_text(
-        "from pathlib import Path\n"
-        "import time\n"
-        "def test_ok():\n"
-        f"    Path({str(started_sentinel)!r}).write_text('started')\n"
-        "    time.sleep(0.3)\n"
-        "    assert True\n"
-    )
-    peer_proc = subprocess.Popen(
-        [sys.executable, "-m", "pytest", "-q", "test_peer_pytest_cache.py"],
-        cwd=str(repo),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    execution_root = _execution_root(repo)
+
+    exec_result: dict[str, subprocess.CompletedProcess[str]] = {}
+
+    def _drive_executor() -> None:
+        exec_result["result"] = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
+
+    exec_thread = threading.Thread(target=_drive_executor)
+    exec_thread.start()
+    peer_proc: "subprocess.Popen[str] | None" = None
+    peer_stdout = ""
     try:
-        assert _wait_for_file(started_sentinel, timeout=10), "peer pytest never started"
-        result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
-    finally:
+        assert _wait_for_path(execution_root, timeout=30), "dedicated worktree never materialized"
+        started_sentinel = execution_root / ".pytest_cache" / "peer_pytest_started.sentinel"
+        # Issue #2199: `PYTHONDONTWRITEBYTECODE=1` for the PEER pytest
+        # process only -- this AC is specifically about `.pytest_cache/**`
+        # cacheprovider writes, not about repo-root `__pycache__/**`
+        # bytecode compilation (a separate, unrelated, unexempted class this
+        # executor still fully audits). Without this, the peer's own
+        # import-time `.pyc` write for `test_peer_pytest_cache.py` races
+        # the child's before-snapshot and makes this test flaky/order-
+        # dependent for a reason orthogonal to the AC under test.
+        peer_proc = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-q", "test_peer_pytest_cache.py"],
+            cwd=str(execution_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        assert _wait_for_path(started_sentinel, timeout=10), "peer pytest never started"
         peer_stdout, _ = peer_proc.communicate(timeout=10)
-        (repo / "test_peer_pytest_cache.py").unlink(missing_ok=True)
-    assert peer_proc.returncode == 0, peer_stdout
+    finally:
+        exec_thread.join(timeout=15)
+    result = exec_result["result"]
+    assert peer_proc is not None and peer_proc.returncode == 0, peer_stdout
     assert result.returncode == 0, result.stderr
-    real_cache_dir = repo / ".pytest_cache"
+    real_cache_dir = execution_root / ".pytest_cache"
     assert real_cache_dir.exists()
     assert (real_cache_dir / "v" / "cache" / "nodeids").exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
     assert artifact.exists()
 
 
@@ -466,16 +675,19 @@ def test_pytest_cache_cold_start_temp_dir_race_is_permitted(tmp_path: Path) -> N
     detail, not canonical evidence)."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    temp_dir = repo / "pytest-cache-files-abc123de"
+    execution_root = _execution_root(repo)
+    temp_dir = execution_root / "pytest-cache-files-abc123de"
     cachedir_tag_content = "Signature: 8a477f597d28d172789f06886806bc55\n"
-    thread = _write_after_delay(temp_dir / "CACHEDIR.TAG", cachedir_tag_content, delay_seconds=0.2)
+    thread = _write_after_delay(
+        temp_dir / "CACHEDIR.TAG", cachedir_tag_content, delay_seconds=0.2, wait_for=execution_root
+    )
     try:
         result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
     finally:
         thread.join(timeout=5)
     assert result.returncode == 0, result.stderr
     assert temp_dir.exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1526" / "preflight.json"
     assert artifact.exists()
 
 
@@ -490,8 +702,11 @@ def test_pytest_cache_cold_start_temp_dir_nested_is_rejected(tmp_path: Path) -> 
     unauthorized_write_path (the exemption is repo-root-top-level-only)."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
-    nested_temp_dir = repo / "sub" / "pytest-cache-files-abc123de" / "CACHEDIR.TAG"
-    thread = _write_after_delay(nested_temp_dir, "Signature: 8a477f597d28d172789f06886806bc55\n", delay_seconds=0.2)
+    execution_root = _execution_root(repo)
+    nested_temp_dir = execution_root / "sub" / "pytest-cache-files-abc123de" / "CACHEDIR.TAG"
+    thread = _write_after_delay(
+        nested_temp_dir, "Signature: 8a477f597d28d172789f06886806bc55\n", delay_seconds=0.2, wait_for=execution_root
+    )
     try:
         result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
     finally:
