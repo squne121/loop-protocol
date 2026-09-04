@@ -114,23 +114,81 @@ fingerprint フィールドが欠損しているか、`""` / `null` / `"unknown"
 
 ### 実 production gate の配線（OWNER scope-authority ruling issuecomment-5299412215, items 2/P0-8・3/P1-3/AC11）
 
-上記の毎回実行される producer とは別に、`.github/workflows/ci.yml` の `e2e-performance-benchmark-assessment-gate` steps (inside the existing `codex-execpolicy` job)（`workflow_dispatch` の `run_performance_assessment_gate: true` で opt-in、通常の push/pull_request では絶対に実行されない）が、`tests/ci/test_ci_performance_gate.py` を実 CLI として呼び出す:
+上記の毎回実行される producer とは別に、`.github/workflows/ci.yml` の `e2e-performance-benchmark-assessment-gate` steps (inside the `python-test-core` job -- these steps were relocated here from the retired `codex-execpolicy` job when Issue #2161 removed native Codex CLI support; see `.claude/skills/ci-test-performance/SKILL.md`'s Operative Status)（`workflow_dispatch` の `run_performance_assessment_gate: true` で opt-in、通常の push/pull_request では絶対に実行されない）が、`tests/ci/test_ci_performance_gate.py` を実 CLI として呼び出す:
 
 ```bash
 uv run --locked python3 tests/ci/test_ci_performance_gate.py \
   --cohort-fixture <cohort_fixture.json> \
-  --output <gate_result.json>
+  --output <gate_result.json> \
+  --receipt-output <close_grade_receipt.json> \
+  --ci-verdict-summary <ci_verdict_summary_v2.json> \
+  --expected-head-sha <trusted head SHA> \
+  --expected-ci-verdict-summary-file-sha256 sha256:<hex> \
+  --ci-verdict-summary-artifact-id <artifact id> \
+  --github-artifact-digest sha256:<hex>
 ```
 
-このエントリポイント（`run_evidence_gate` / `_cli_main`）は 2 つの機構を 1 つの実行可能パスへ配線する:
+このエントリポイント（`run_evidence_gate` / `_cli_main`）は複数の機構を 1 つの実行可能パスへ配線する:
 
 1. **AC11 hard-check の実配線**: `_evidence_readiness_hard_check_post_filter`（post-filter サンプル数を before/after 両アームで再検証）を before/after それぞれに対して呼び出す。いずれかのアームが `MIN_COHORT_RUN_COUNT`（20）未満なら `EvidenceInsufficientError` を捕捉し、`gate_status: insufficient_evidence` を書き出した上で **非 zero exit（1）** で終了する。単体テストの中だけで存在する関数ではなく、実 workflow job の実行結果として非 zero exit が観測される。
 2. **P0-8 real producer の実配線**: 両アームが 20 件以上を満たした場合のみ `build_assessment_from_percentile_cohorts` を呼び出し、`claim.kind != none` の実 assessment を計算し、続けて `validate_ci_performance_assessment_v2.py` の構造/意味検証を通す。検証に失敗した場合も非 zero exit（2）とし、fail-open にしない。
+3. **#2423 AC4 trusted binding の実配線**: `--ci-verdict-summary` / `--expected-head-sha` / `--expected-ci-verdict-summary-file-sha256` が `validate_ci_performance_assessment_v2.py --ci-verdict-summary / --expected-head-sha / --expected-artifact-digest` へそのまま転送される。`gate_status: complete` かつ `semantic_valid` であっても `approval_eligible` が `false`（トラステッド binding 未提供・mismatch を含む）なら **非 zero exit（3）** とする -- `complete && semantic_valid` だけでは exit 0 にならない（#2423 AC4 以前は `semantic_valid` のみを見ており、この 3 番目のチェックが欠落していた実バグ）。
 
 `cohort_fixture_path` を指定しない場合、このジョブは `MIN_COHORT_RUN_COUNT` を意図的に下回る smoke fixture（サンプル数 3）を使って自身を実行する。これは「実 20-run history がこの実装セッションには存在しない」という OWNER が明示的に許容した状態（"20件未満なら fail-closed する production path を先に配線できます"）を、実際の workflow job 実行として証明するためであり、20-run 蓄積そのものは #2155 のスコープのまま変わらない。
 
+### CLI exit code（`_cli_main`、#2423 AC4 で 3 段目を追加）
+
+| exit code | 意味 |
+|---|---|
+| `0` | `gate_status: complete` かつ `semantic_valid` かつ `approval_eligible` |
+| `1` | `gate_status: insufficient_evidence`（AC11 fail-closed） |
+| `2` | `gate_status: complete` だが built assessment が構造/意味検証に失敗 |
+| `3` | `semantic_valid` だが `approval_eligible` が false（#2423 AC4 -- トラステッド binding 未提供・head SHA mismatch・digest mismatch 等） |
+
+### `CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1` receipt スキーマ（#2423 AC3）
+
+`--receipt-output <path>` を指定すると、`tests/ci/test_ci_performance_gate.py::build_close_grade_receipt` が `CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1` を追加で書き出す。これは #2424 が内部関数 import や独自 digest 再発明なしに読む consumer 契約であり、フィールド名は #2424 側とバイト一致させている: `experiment_identity` / `manifest_sha256` / `run_set_digest` / `materialization_policy` / `arms.{monolith,split}.workflow_run_ids`（root run set）/ `arms.{monolith,split}.performance_eligible_workflow_run_ids` / `evidence_errors[]` / `performance_assessment.complete` / `trusted_functional_evidence.{ci_verdict_summary_artifact_id, ci_verdict_summary_file_sha256, github_artifact_digest, expected_head_sha}` / `validation.{semantic_valid, approval_eligible}` / `exit_code`。
+
+#2423 の実装時点では #2422 の immutable manifest v2 producer（dispatch root run set そのものの materialization）はまだ配線されていない。したがってこの receipt は、live Issue #2423 本文が明示的に許容した暫定設計として、`--cohort-fixture` の `"before"`/`"after"` アームを root run set の代替入力として扱い、それぞれ `arms.monolith` / `arms.split` へ投影する（本モジュール既存の before==pre-split / after==post-split 慣習、例えば `test_p50_gate_ready_latency_not_regressed` の `cohort_role` 用法と揃えている）。#2422 の実 manifest reference がこの代替を置き換える際も、この receipt の出力フィールド名/形状自体は変更しない（#2424 と再調整が必要な breaking change を避けるための Stop Condition）。
+
+### close-grade materializer（`_materialize_close_grade_arm`）と `_comparable_cohort()` の違い（#2423 AC2）
+
+`_comparable_cohort()`（本ドキュメント上部で説明した exploratory 用の largest-fingerprint-group majority selection）は close-grade 判定の母集合選択には使わない。`_materialize_close_grade_arm()` は同じ fail-closed building block（`_pair_by_workflow_run_id` / `_select_initial_attempt_baselines` / `_fingerprint` / `_fingerprint_has_placeholder`）を再利用しつつ、root run set の各 `workflow_run_id` を必ず `performance_eligible_workflow_run_ids` か `evidence_errors` のどちらか一方（排他的）に振り分ける -- 除外理由は次の通り:
+
+- `missing_pair_e2e-core` / `missing_pair_e2e-responsive-matrix`（`_pair_by_workflow_run_id` 由来。片方の lane が欠損）
+- `run_attempt_identity_collision` / `legacy_unverified_run_attempt` / `missing_or_invalid_initial_attempt_excluded_from_sample`（`_select_initial_attempt_baselines` 由来）
+- `fingerprint_placeholder_or_missing`（`_fingerprint_has_placeholder` 由来）
+- `fingerprint_mismatch_core_vs_responsive`（同一 `workflow_run_id` の `e2e-core`/`e2e-responsive-matrix` 間で `WITHIN_COHORT_REQUIRED_EQUAL` fingerprint が一致しない）
+- `gate_ready_*`（gate-ready lane 側の同種の除外理由。`gate_ready_` prefix 付き）
+- `gate_ready_timestamp_missing_or_invalid`（gate-ready の `run_started_at`/`check_completed_at` が欠損・不正）
+- `missing_provider_pairing_evidence` / `missing_gate_ready_evidence`（provider・gate-ready いずれかの lane に一切 evidence がない root member）
+
+この不変条件（`expected_root_run_ids == performance_eligible_run_ids ∪ evidence_error_run_ids` かつ両集合が排他）は `_assert_root_eligible_error_invariant()` が実行時に fail-closed で検証する。
+
+### digest 命名の分離（#2423 AC4、OWNER controlled-reframe issuecomment-5539310075 "digest の意味が曖昧" への対応）
+
+- `ci_verdict_summary_file_sha256`: `ci_verdict_summary_v2` JSON ファイル自体の bytes の SHA-256（`validate_ci_performance_assessment_v2.py --expected-artifact-digest` が検証する値と同じ計算対象）。
+- `github_artifact_digest`: GitHub Actions `actions/upload-artifact` が発行する artifact バンドル全体の digest（`actions/artifacts` REST API の `digest` フィールド）。
+
+この 2 つは意味が異なる別々の値であり、同一フィールド名で扱わない。`validate_ci_performance_assessment_v2.py` は `github_artifact_digest` を一切検証しない（そのような概念自体を持たない）。
+
+## トラステッド `ci_verdict_summary_v2` artifact 取得経路（#2423 AC5）
+
+`.github/workflows/ci.yml` の `e2e-performance-benchmark-assessment-gate` steps は、`workflow_dispatch` の `trusted_ci_verdict_summary_artifact_id` / `trusted_ci_verdict_summary_expected_head_sha` input が指定された場合、以下の実 GitHub Actions/API primitive のみで trusted binding 用ファイルを取得する（新規 broker/service/daemon は追加しない）:
+
+1. `gh api repos/OWNER/REPO/actions/artifacts/{artifact_id}` で artifact メタデータ（`expired` フラグ、`digest` フィールド等）を取得する。
+2. `expired: true` の場合は fail-closed（`exit 1`）で停止する。
+3. `gh api repos/OWNER/REPO/actions/artifacts/{artifact_id}/zip` で artifact 本体（zip）を download する。
+4. zip を展開し、`ci_verdict_summary_v2` を含むファイル名の JSON を local file として確定する。
+5. その local file の SHA-256（`ci_verdict_summary_file_sha256`）を計算する。
+6. artifact メタデータの `digest` フィールド（`github_artifact_digest`）と合わせて、`tests/ci/test_ci_performance_gate.py` の `--ci-verdict-summary` / `--expected-head-sha` / `--expected-ci-verdict-summary-file-sha256` / `--ci-verdict-summary-artifact-id` / `--github-artifact-digest` へ渡す（CLI binding）。
+
+`python-test-core` job は上記 API 呼び出しのために `permissions: actions: read`（読み取り専用）を追加している（`visual-impact-policy` job が同様の理由で既に持つ既存パターンに揃えた）。`trusted_ci_verdict_summary_artifact_id` を指定しない場合はこの取得ステップ自体が skip され、gate は trusted binding なしで実行される（結果として `approval_eligible: false` / exit code 3 になる -- fail-closed）。
+
 ## Runtime Verification Applicability
 
-Issue #2159 の `decision: immediate` の下、cohort 依存（実 GitHub Actions 20-run history が必要）な統合テストは、本実装セッションのようにライブ history が存在しない環境では `pytest.skip()`（`tests/ci/test_ci_performance_gate.py` の既存 3 テスト）で SKIP する。これは `docs/dev/runtime-verification-policy.md` の SKIP 規約に従うものであり、fabricated PASS ではない。cohort 非依存のロジック（fingerprint 分類、paired critical path 計算、同一時計 latency、percentile 再計算、collector の artifact 検証）は fixture-driven unit test で実挙動を検証済みである。
+Issue #2159 の `decision: immediate` の下、cohort 依存（実 GitHub Actions 20-run history が必要）な統合テストは、本実装セッションのようにライブ history が存在しない環境では `pytest.skip()`（`tests/ci/test_ci_performance_gate.py` の既存 3 テスト）で SKIP する。これは `docs/dev/runtime-verification-policy.md` の SKIP 規約に従うものであり、fabricated PASS ではない。cohort 非依存のロジック（fingerprint 分類、paired critical path 計算、同一時計 latency、percentile 再計算、collector の artifact 検証、#2423 の close-grade materializer/receipt）は fixture-driven unit test で実挙動を検証済みである。
 
 close-verification（最終ゲート）用途には `EvidenceInsufficientError` / `_evidence_readiness_hard_check` の非 zero exit 経路を使う（AC11）。`pytest.skip()` を close 条件に使用しない。
+
+Issue #2423 の `decision: immediate`（`applicable_acs: [AC6]`）の下、AC6（workflow_dispatch → artifact acquisition → trusted binding → CLI invocation の実配線の live smoke）は、この実装セッションから GitHub Actions workflow_dispatch を起動・観測できない場合、`docs/dev/runtime-verification-policy.md` の SKIP 規約（`fallback_success_is_pass: false`）に従い正確に SKIP を記録する。AC1-AC5（canonical materialization / receipt schema / CLI exit semantics / digest 命名）は本ドキュメントの fixture-driven pytest で決定論的に検証済みであり、SKIP の対象は AC6 の live smoke のみである。
