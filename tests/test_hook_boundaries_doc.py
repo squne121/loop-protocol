@@ -267,13 +267,33 @@ class TestBaseHeadHookTopologyDelta:
     hook topology delta を検証する。
 
     Issue #2264 が要求する「削除は rtk_boundary_shadow_guard 1 handler のみ、
-    surviving handler は不変、added=0」を、head 内整合チェック（
+    surviving handler は不変」を、head 内整合チェック（
     TestSettingsManifestAlignment）だけでなく base/head 間の実際の git diff
     から機械的に証明する。
+
+    Issue #2489 fix_delta（2026-09-04）により、意図的な追加として
+    (session_manifest_coordinator, StopFailure) を ALLOWED_ADDED_HANDLERS に
+    明示登録した。これは既存の StopFailure hook 経路を再利用した新規登録であり
+    Issue #2489 の Allowed Paths / Current Validated Scope に含まれる。
+    未申告の追加を検出する能力を弱めないため、ここでも removed handler と
+    同様に (handler_id, event) の複合キーと具体的な matcher/command/args/timeout
+    タプルの両方を allowlist として固定し、それ以外の追加は引き続き fail させる。
     """
 
     REMOVED_HANDLER_ID = "rtk_boundary_shadow_guard"
     REMOVED_EVENT = "PreToolUse"
+
+    # Issue #2489 fix_delta: 意図的に許可された追加 handler の allowlist。
+    # 新たに handler を追加する場合は、ここに明示的にエントリを追加すること
+    # （申告なしの追加は引き続き test failure として検出される）。
+    ALLOWED_ADDED_HANDLERS: dict[tuple[str, str], dict[str, Any]] = {
+        ("session_manifest_coordinator", "StopFailure"): {
+            "matcher": None,
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_manifest_coordinator.sh",
+            "args": [],
+            "timeout": 55,
+        },
+    }
 
     def test_topology_delta_is_exact_single_handler_removal(self) -> None:
         base_entries = _load_settings_hooks_at_revision(BASE_REVISION_SHA)
@@ -309,10 +329,27 @@ class TestBaseHeadHookTopologyDelta:
             f"removed handler の timeout が想定外です: {removed_entry['timeout']!r}"
         )
 
-        # 2. added_handlers == ∅
-        assert added_keys == set(), (
-            f"added handlers が検出されました（想定は0件）: {added_keys}"
+        # 2. added_handlers == ALLOWED_ADDED_HANDLERS の申告済みキーのみ
+        #    （未申告の追加は引き続き fail する）
+        expected_added_keys = set(self.ALLOWED_ADDED_HANDLERS)
+        assert added_keys == expected_added_keys, (
+            f"added handlers が想定と異なります: {added_keys} "
+            f"(許可済み: {expected_added_keys})"
         )
+        for key, expected in self.ALLOWED_ADDED_HANDLERS.items():
+            added_entry = head_by_key[key]
+            assert added_entry["matcher"] == expected["matcher"], (
+                f"added handler {key} の matcher が想定外です: {added_entry['matcher']!r}"
+            )
+            assert added_entry["command"] == expected["command"], (
+                f"added handler {key} の command が想定外です: {added_entry['command']!r}"
+            )
+            assert added_entry["args"] == expected["args"], (
+                f"added handler {key} の args が想定外です: {added_entry['args']!r}"
+            )
+            assert added_entry["timeout"] == expected["timeout"], (
+                f"added handler {key} の timeout が想定外です: {added_entry['timeout']!r}"
+            )
 
         # 3. changed_survivors == ∅
         #    （他の全 handler の matcher/command/args/timeout が base/head で完全一致）
