@@ -500,7 +500,8 @@
             "SubagentStop",
             "PostToolUse",
             "Stop",
-            "PreToolUse"
+            "PreToolUse",
+            "StopFailure"
           ],
           "description": "Claude Code hook event 種別"
         },
@@ -611,6 +612,37 @@
         }
       ],
       "description": "次に実行すべき Issue 番号（nullable）"
+    },
+    "runtime_lane": {
+      "type": "string",
+      "enum": [
+        "native_claude_code",
+        "claude_gpt",
+        "codex_cli",
+        "unknown"
+      ],
+      "description": "セッションが実行された runtime lane（optional。既存 manifest との backward compatibility のため root required には含めない）。provenance は launcher-set 環境変数 CLAUDE_GPT_CLAUDE_BIN の有無のみに由来し、actor.name や transcript からの推測は行わない。値を取得できない場合は unknown"
+    },
+    "completion_outcome": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "failed",
+        "interrupted",
+        "incomplete",
+        "unavailable"
+      ],
+      "description": "セッション終了の観測された結果（optional）。観測できない事象を推測分類せず、観測不能な場合は unavailable を使う"
+    },
+    "completion_source": {
+      "type": "string",
+      "enum": [
+        "hook",
+        "launcher",
+        "reconciliation",
+        "unavailable"
+      ],
+      "description": "completion_outcome の値がどの経路から得られたか（optional）。値を取得できない場合は unavailable"
     },
     "secret_policy": {
       "type": "object",

@@ -60,6 +60,9 @@ PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・
 | `sanitization_status` | string（enum） | no | 機微情報のサニタイズ状態（hook 記録時に設定） |
 | `human_intervention` | object | no | 人間介入の有無と内容 |
 | `next_action_issue` | integer\|null | no | 次に実行すべき Issue 番号（nullable） |
+| `runtime_lane` | string（enum） | no | セッションが実行された runtime lane（後述。#2489） |
+| `completion_outcome` | string（enum） | no | セッション終了の観測された結果（後述。#2489） |
+| `completion_source` | string（enum） | no | `completion_outcome` の取得元（後述。#2489） |
 
 ### `actor` オブジェクト
 
@@ -154,7 +157,7 @@ hook イベント情報を記録する。Claude Code hook から生成される 
 
 | フィールド | 型 | 必須 | 説明 |
 |---|---|---|---|
-| `event_type` | enum | no | `SubagentStart \| SubagentStop \| PostToolUse \| Stop \| PreToolUse` |
+| `event_type` | enum | no | `SubagentStart \| SubagentStop \| PostToolUse \| Stop \| PreToolUse \| StopFailure`（`StopFailure` は #2489 で追加） |
 | `hook_id` | string\|null | no | hook 実行 ID（optional） |
 | `triggered_at` | string\|null | no | hook トリガー時刻（ISO 8601） |
 
@@ -183,6 +186,50 @@ hook 記録時に設定される機微情報のサニタイズ状態。
 | `required` | boolean | yes | 人間介入が必要だったか |
 | `type` | enum | yes | 介入種別（`none \| approval \| correction \| escalation`） |
 | `summary` | string\|null | no | 介入内容の概要（nullable） |
+
+## Runtime Lane / Completion Taxonomy（実行レーンと完了状態の分類、#2489, #1939 Workstream 2）
+
+`runtime_lane` / `completion_outcome` / `completion_source` は、単一の `stop_reason` enum ではなく 3 フィールドへ reframe した taxonomy である（#2489 human_context_comment P0-1 対応）。
+`interrupt` / `timeout` / `permission_interruption` / `human_clarification_request` のような、現在の hook 経路から観測不能な事象を推測して 1 本の enum に押し込めることを避け、`unavailable` / `unknown` を正規値として扱う。`permission_interruption` / `human_clarification_request` は既存 `human_intervention` オブジェクト側の責務であり、本 taxonomy には含めない。`retry` も terminal reason ではなく transition/action として扱い、本 taxonomy には含めない。
+
+### `runtime_lane`（任意項目、root-level scalar）
+
+| 値 | 説明 |
+|---|---|
+| `native_claude_code` | launcher-set 環境変数 `CLAUDE_GPT_CLAUDE_BIN` が未設定の Claude Code native 実行 |
+| `claude_gpt` | launcher-set 環境変数 `CLAUDE_GPT_CLAUDE_BIN` が設定されている Claude-GPT 実行（#2338 の既存 claude-gpt pin 識別と同じ signal） |
+| `codex_cli` | schema レベルの coverage のみ。Codex CLI 向けの新規 hook infrastructure・producer wiring は本 Issue のスコープ外（別 Issue に委ねる） |
+| `unknown` | provenance を取得できない呼び出し元が渡す値 |
+
+provenance は `.claude/hooks/generate_session_manifest_from_hook.mjs` が既存の launcher-set 環境変数 `CLAUDE_GPT_CLAUDE_BIN` の有無のみから導出する。`actor.name` や transcript 内容からの推測は行わない。`scripts/generate-session-manifest.mjs`（producer 本体）は `--runtime-lane` CLI 引数の値をそのまま受け取るのみで、値の導出ロジックを producer 側には持たない。
+
+### `completion_outcome`（任意項目、root-level scalar）
+
+| 値 | 説明 |
+|---|---|
+| `completed` | `Stop` イベントで正常完了が観測された |
+| `failed` | `StopFailure` イベントで失敗終了が観測された |
+| `interrupted` | 現時点の hook 経路では観測されない（将来の拡張余地として enum のみ予約） |
+| `incomplete` | 現時点の hook 経路では観測されない（将来の拡張余地として enum のみ予約） |
+| `unavailable` | 観測経路が存在しない、または値を取得できない場合 |
+
+### `completion_source`（任意項目、root-level scalar）
+
+| 値 | 説明 |
+|---|---|
+| `hook` | `.claude/hooks/generate_session_manifest_from_hook.mjs` が hook イベント（`Stop` / `StopFailure`）から導出した |
+| `launcher` | launcher 側が直接付与した（本 Issue のスコープでは未使用。将来の producer 拡張用に enum のみ予約） |
+| `reconciliation` | 事後の reconciliation 処理が導出した（本 Issue のスコープでは未使用。将来の producer 拡張用に enum のみ予約） |
+| `unavailable` | 値を取得できない場合 |
+
+### hook イベントと値のマッピング（`.claude/hooks/generate_session_manifest_from_hook.mjs`）
+
+| hook イベント | `completion_outcome` | `completion_source` |
+|---|---|---|
+| `Stop` | `completed` | `hook` |
+| `StopFailure` | `failed` | `hook` |
+
+`.claude/settings.json` は `Stop` hooks 配列に既存 `session_manifest_coordinator.sh` を再利用したまま `StopFailure` イベントを追加登録する（新規 hook script は追加しない）。
 
 ## Main Loop Phase Enum
 

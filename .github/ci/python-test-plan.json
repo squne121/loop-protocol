@@ -57,6 +57,7 @@
     "tests/agent_ops/",
     "tests/session-recording/",
     "tests/test_hook_boundaries_doc.py",
+    "tests/agent-logs/runtime-verification/test_hook_stop_failure_wiring.py",
     "artifacts/claude-code-spawn-observability-research/tests/"
   ],
   "ignore": [

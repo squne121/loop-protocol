@@ -84,6 +84,15 @@ Stop Condition に到達する前に次フェーズへ進まない。
 
 この責務境界により、`agent-run:post` を ChatGPT retro marker や retro index update と混同しない。
 
+### agent-run:complete（完了トランザクション coordinator、#2489）
+
+- `agent-run:complete`（`scripts/agent-logs/complete-agent-run.mjs`、エクスポート関数 `completeAgentRun`）は既存 3 つの upsert 関数（`postAgentRunReport` / `updateRetroIndex` / `upsertChatgptRetroContextComment`）を順番に呼び出すだけの **薄い coordinator** である。各 operation 固有の upsert/duplicate-detection ロジックを再実装しない
+- DB・transaction log・2-phase commit は追加しない。各 operation は既存実装が持つ idempotency（ownership marker による create/noop/supersede 判定）に依拠しており、`agent-run:complete` はそれを 3 回呼び出す以上の状態を持たない
+- 各 artifact（`agent_run_report` / `retro_index` / `chatgpt_retro_context`）の結果は `created | updated | unchanged | failed` の 4 値で返す。`updateRetroIndex` の `status: blocked`（例: `schema_migration_required`）も `failed` へ正規化する
+- 1 つの artifact が `failed` になっても後続の artifact 呼び出しは継続する（best-effort・非中断）。同一 completion command を再実行すれば、既に成功した artifact は `unchanged`（noop）のまま増殖せず、失敗していた artifact のみ再試行される（partial success recovery）
+- malformed / ambiguous な既存 marker（`blocked_malformed` / `blocked_duplicate` / `blocked_malformed_marker_syntax` 等）は個々の upsert 関数が deterministic に throw し、`agent-run:complete` はそれを `failed` として記録するのみで、marker の自動修復・強制上書きは行わない
+- `scripts/agent-logs/finalize-agent-run.mjs` へは責務を寄せない。`finalize-agent-run.mjs` は引き続き report JSON の生成・atomic write のみを行う（human_context_comment P1-3）
+
 ### ChatGPT retro marker の二層構造
 
 外側コメントの ownership marker と内側の embedded payload marker は別契約である。混同しないこと。

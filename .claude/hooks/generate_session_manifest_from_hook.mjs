@@ -229,8 +229,47 @@ function detectAndEmitLegacyProducerState() {
 // Event-type to phase mapping
 const EVENT_PHASE_MAP = {
   Stop: { mainLoop: 'impl', ledgerPhase: 'post_commit_verification' },
+  StopFailure: { mainLoop: 'impl', ledgerPhase: 'post_commit_verification' },
   SubagentStop: { mainLoop: 'impl', ledgerPhase: 'post_commit_verification' },
   PostToolUse: { mainLoop: 'impl', ledgerPhase: 'implementation' },
+}
+
+// Issue #2489: hook_event_name -> completion_outcome / completion_source mapping.
+// Only Stop / StopFailure carry an observed terminal signal via this hook path;
+// all other events leave completion_outcome / completion_source undefined
+// (producer omits the fields rather than guessing a value).
+const EVENT_COMPLETION_MAP = {
+  Stop: { completionOutcome: 'completed', completionSource: 'hook' },
+  StopFailure: { completionOutcome: 'failed', completionSource: 'hook' },
+}
+
+/**
+ * Derive runtime_lane strictly from the launcher-set CLAUDE_GPT_CLAUDE_BIN
+ * environment variable presence (#2338 existing claude-gpt pin signal).
+ * Never inferred from actor.name or transcript content (#2489 human_context_comment P1-3).
+ *
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {'claude_gpt'|'native_claude_code'}
+ */
+export function resolveRuntimeLane(env) {
+  const claudeGptBin = env?.CLAUDE_GPT_CLAUDE_BIN
+  return typeof claudeGptBin === 'string' && claudeGptBin.trim() !== '' ? 'claude_gpt' : 'native_claude_code'
+}
+
+/**
+ * Derive completion_outcome / completion_source strictly from the hook event
+ * name. Events with no observed terminal signal in this hook path return
+ * null for both fields (caller omits the CLI args rather than guessing).
+ *
+ * @param {string} hookEventName
+ * @returns {{completionOutcome: string|null, completionSource: string|null}}
+ */
+export function resolveCompletionFields(hookEventName) {
+  const mapped = EVENT_COMPLETION_MAP[hookEventName]
+  if (!mapped) {
+    return { completionOutcome: null, completionSource: null }
+  }
+  return { completionOutcome: mapped.completionOutcome, completionSource: mapped.completionSource }
 }
 
 // ============================================================================
@@ -496,7 +535,8 @@ export function resolveIssueNumber(hookCtx, { branchName = null, cwdPath = null 
  * @param {{ producerScript: string, repository: string, phaseInfo: {mainLoop:string,ledgerPhase:string},
  *            phaseInstanceId: string, actorType: string, actorName: string,
  *            evidenceSourceKind: string, evidenceSourceRef: string, evidenceVisibility: string,
- *            sessionId: string|null, resolvedIssueNumber: number|null }} params
+ *            sessionId: string|null, resolvedIssueNumber: number|null,
+ *            runtimeLane?: string|null, completionOutcome?: string|null, completionSource?: string|null }} params
  * @returns {string[]}
  */
 export function buildProducerArgs({
@@ -511,6 +551,9 @@ export function buildProducerArgs({
   evidenceVisibility,
   sessionId,
   resolvedIssueNumber,
+  runtimeLane = null,
+  completionOutcome = null,
+  completionSource = null,
 }) {
   const args = [
     producerScript,
@@ -541,6 +584,15 @@ export function buildProducerArgs({
   }
   if (resolvedIssueNumber !== null) {
     args.push('--issue', String(resolvedIssueNumber))
+  }
+  if (runtimeLane) {
+    args.push('--runtime-lane', runtimeLane)
+  }
+  if (completionOutcome) {
+    args.push('--completion-outcome', completionOutcome)
+  }
+  if (completionSource) {
+    args.push('--completion-source', completionSource)
   }
   return args
 }
@@ -660,6 +712,14 @@ async function main() {
       actorName = `claude-code-hook-${safeToolName}`
     }
 
+    // #2489: derive runtime_lane / completion_outcome / completion_source.
+    // runtime_lane provenance is CLAUDE_GPT_CLAUDE_BIN presence only (never
+    // inferred from actor.name / transcript). completion fields are derived
+    // from the hook event name only (Stop/StopFailure); other events omit
+    // both rather than guessing.
+    const runtimeLane = resolveRuntimeLane(process.env)
+    const { completionOutcome, completionSource } = resolveCompletionFields(hookEventName)
+
     // Build producer CLI arguments via exported helper (testable separately)
     const producerArgs = buildProducerArgs({
       producerScript: PRODUCER_SCRIPT,
@@ -673,6 +733,9 @@ async function main() {
       evidenceVisibility: 'private_artifact',
       sessionId,
       resolvedIssueNumber,
+      runtimeLane,
+      completionOutcome,
+      completionSource,
     })
 
     let manifestJson
