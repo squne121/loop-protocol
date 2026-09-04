@@ -1,6 +1,6 @@
 ---
 schema_version: v1
-title: Agent Session Manifest
+title: "Agent Session Manifest（エージェントセッション記録）"
 status: active
 related_issue: "#243"
 ---
@@ -10,7 +10,7 @@ related_issue: "#243"
 LOOP_PROTOCOL の Main Loop 各 phase において AI agent session の metadata を記録するための SSOT schema。
 `metadata-first / full transcript は疑義発生時のみ` 方針（#136 Decision）に基づく。
 
-機械可読 JSON Schema SSOT: [`docs/schemas/agent-session-manifest.schema.json`](agent-session-manifest.schema.json)（JSON Schema Draft 2020-12）
+機械可読 JSON Schema SSOT（正本）: [`docs/schemas/agent-session-manifest.schema.json`](agent-session-manifest.schema.json)（JSON Schema Draft 2020-12 版）
 
 後続の hook 実装 Issue はこの schema を参照する。
 
@@ -18,7 +18,7 @@ LOOP_PROTOCOL の Main Loop 各 phase において AI agent session の metadata
 
 PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・test-runner 呼び出し有無・SKIP exit 0 黙認・PR 本文全面置換・token/context 圧迫）を事後検証するために、各 phase で **どの metadata を retention-limited artifact と opaque ref に残すか** を明文化する。
 
-## 1 manifest = 1 ledger phase 原則
+## 1 manifest = 1 ledger phase 原則（設計原則）
 
 `phase.ledger_phase` は **scalar（単一値）** である。1 つの manifest document は 1 つの ledger_phase にのみ対応する。
 
@@ -72,7 +72,7 @@ PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・
 | `name` | string | yes | エージェント名または `"human"` |
 | `session_id` | string\|null | no | セッション ID（nullable。人間操作の場合は `null` 可） |
 
-## Producer Provenance
+## Producer Provenance（生成元情報）
 
 `producer` は optional object であり、既存 manifest との backward compatibility のため `required` には含めない。  
 `producer.kind` is a self-claim であり、schema 追加だけで真正性を証明するものではない。真正性は `evidence` linkage、および #378 / #402 で扱う hook / CI wiring で担保する。
@@ -161,7 +161,7 @@ hook イベント情報を記録する。Claude Code hook から生成される 
 | `hook_id` | string\|null | no | hook 実行 ID（optional） |
 | `triggered_at` | string\|null | no | hook トリガー時刻（ISO 8601） |
 
-### `sanitization_status`（optional）
+### `sanitization_status`（任意項目、optional）
 
 hook 記録時に設定される機微情報のサニタイズ状態。
 
@@ -231,7 +231,7 @@ provenance は `.claude/hooks/generate_session_manifest_from_hook.mjs` が既存
 
 `.claude/settings.json` は `Stop` hooks 配列に既存 `session_manifest_coordinator.sh` を再利用したまま `StopFailure` イベントを追加登録する（新規 hook script は追加しない）。
 
-## Main Loop Phase Enum
+## Main Loop Phase Enum（フェーズ列挙値）
 
 `phase.main_loop` の取り得る値（7 値）:
 
@@ -324,7 +324,7 @@ JSON Schema によって機械的に禁止されている。
 transcripts / prompts / checkpoint metadata が public repo に commit されると internet から参照可能になる。
 本 schema はこのリスクを防ぐために、manifest 本文ではなく metadata への opaque ref のみを GitHub コメントへ出せる public-safe boundary を採用している。
 
-## Historical GitHub Comment Template（legacy / non-current）
+## Historical GitHub Comment Template（レガシー / 現行外テンプレート）
 
 以下の template は historical 参照用であり、current live public posting の手順ではない。manifest 本文を Issue / PR comment に貼る運用は non-current であり、not live public posting として扱う。
 marker 文字列そのものは legacy parser / detection pattern の説明用に残すが、manifest body の公開許可を意味しない。
@@ -528,7 +528,7 @@ Secret 値を manifest に含めない static producer contract と、runtime bo
 | `producer_contract` | object | yes | static producer declaration。runtime attestation ではない |
 | `runtime_boundary` | object | yes | runtime boundary enforcement の attestation 状態 |
 
-### `producer_contract`
+### `producer_contract`（契約宣言）
 
 | フィールド | 型 | 必須 | 説明 |
 |---|---|---|---|
@@ -538,7 +538,7 @@ Secret 値を manifest に含めない static producer contract と、runtime bo
 | `claims.secret_values_not_serialized` | boolean const true | yes | Secret 値を manifest に serialize しない |
 | `claims.presence_only` | boolean const true | yes | presence-only metadata のみを emit する |
 
-### `runtime_boundary`
+### `runtime_boundary`（実行時境界）
 
 | フィールド | 型 | 必須 | 説明 |
 |---|---|---|---|
