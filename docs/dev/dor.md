@@ -1,6 +1,6 @@
 ---
 doc_id: DOC-DEV-DOR-001
-title: Definition of Ready (DoR) — Implementation Issue
+title: Definition of Ready (DoR) — Implementation Issue（実装 Issue の着手可能条件を定義する文書）
 status: active
 created_by_issue: 72
 parent_issue: 40
@@ -168,7 +168,7 @@ $ test -f nonexistent_file.py
 | `deferred` | — | `skipped` | `go` |
 | 欠落 | 0 | `unexpected_pass` + `missing_annotation` warning | `blocked` |
 
-### pytest exit code semantics
+### pytest exit code semantics（終了コードの意味論）
 
 | exit code | 意味 | 注意事項 |
 |---|---|---|
