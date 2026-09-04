@@ -26,6 +26,20 @@ ci_verdict_summary_v2 artifact to be supplied out-of-band via
 --expected-artifact-digest), and the artifact's own (not self-reported)
 required-check set must independently satisfy the merge-ready floor.
 
+Digest naming (Issue #2423 AC4, OWNER controlled-reframe
+issuecomment-5539310075 -- "digest の意味が曖昧"): --expected-artifact-digest
+is the SHA-256 of the --ci-verdict-summary FILE's own raw bytes (computed
+below via _sha256_of_file / hashlib.sha256(raw_bytes)), i.e. what
+Issue #2423's CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 receipt calls
+`ci_verdict_summary_file_sha256`. It is NEVER the GitHub Actions
+upload-artifact BUNDLE-level digest (what that receipt calls
+`github_artifact_digest`, e.g. the `artifact-digest` output of
+`actions/upload-artifact` or the `digest` field on the GitHub Actions
+Artifacts REST API) -- this validator has no concept of, and never
+computes or checks, that separate bundle-level digest. Callers must not
+pass a GitHub Actions artifact-bundle digest as --expected-artifact-digest
+expecting it to validate against this file's own hash.
+
 Does NOT read or modify CI_TEST_PERFORMANCE_DECISION_V1 / ci_runtime_delta_v1
 (references/decision-matrix.md, templates/runtime-delta.md). Those V1
 contracts are unaffected by this validator.
@@ -899,7 +913,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--expected-artifact-digest",
         default=None,
-        help="Expected sha256:<hex> digest of the --ci-verdict-summary file.",
+        help=(
+            "Expected sha256:<hex> digest of the --ci-verdict-summary FILE's "
+            "own raw bytes (Issue #2423 AC4: called ci_verdict_summary_file_sha256 "
+            "in that Issue's CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 receipt). "
+            "Distinct from, and never checked against, any GitHub Actions "
+            "upload-artifact BUNDLE-level digest (that receipt's separate "
+            "github_artifact_digest field)."
+        ),
     )
     return parser.parse_args(argv)
 
