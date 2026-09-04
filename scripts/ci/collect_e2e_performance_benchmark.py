@@ -60,6 +60,15 @@ absent -- a record without them is a pre-#2184 legacy shape, see
         takes precedence>"
     }
 
+#2184 AC4(iii): a record for job `e2e-core`/`e2e-responsive-matrix`
+(`LEGACY_AMBIGUOUS_HEAD_SHA_JOBS`) carrying NEITHER `measured_head_sha`
+nor a `workflow_run_head_sha`-derivable `merge_sha` is never promoted
+into the trusted cohort by inference/synthesis -- `_collect_arm` excludes
+it with the explicit `legacy_ambiguous_head_sha` evidence_errors reason.
+Scoped to those two job names only (see `LEGACY_AMBIGUOUS_HEAD_SHA_JOBS`'s
+docstring): the permanently-retired pre-split `e2e` job never carries
+either field, past or future, and is unaffected.
+
 Exit codes:
   0 = manifest written AND every job in every arm reached >= --min-runs
       deduped `workflow_run_id` samples (arms.*.complete == true).
@@ -104,6 +113,21 @@ DEFAULT_JOB_NAMES = ("e2e-core", "e2e-responsive-matrix", "e2e")
 # pre-split).
 DEFAULT_BEFORE_JOB_NAMES = ("e2e",)
 DEFAULT_AFTER_JOB_NAMES = ("e2e-core", "e2e-responsive-matrix")
+
+# #2184 AC4(iii) (fix_delta after pr-reviewer REQUEST_CHANGES on PR #2493):
+# jobs whose `ci_runtime_baseline_v1` producer step is the ONLY one this
+# Issue's In Scope actually modifies to unconditionally emit
+# `measured_head_sha` (`.github/workflows/ci.yml`'s "Collect
+# ci_runtime_baseline_v1 artifact" step for `e2e-core` / `e2e-responsive-
+# matrix`, #2184 AC1). The pre-#2137-split `e2e` job (`DEFAULT_BEFORE_
+# JOB_NAMES` above) is a permanently-retired producer this Issue never
+# touches -- it will NEVER emit `measured_head_sha`/carry a `merge_sha`-
+# derived `workflow_run_head_sha` going forward, past or future, so
+# labeling its records "ambiguous" would be a category error, not a
+# genuine legacy-migration signal. The hard-exclude below (AC4(iii)) is
+# therefore scoped to exactly this tuple, never applied job-name-
+# agnostically to `_collect_arm`'s shared/hermetic selection pipeline.
+LEGACY_AMBIGUOUS_HEAD_SHA_JOBS = ("e2e-core", "e2e-responsive-matrix")
 
 # #2159 P0-4: only a "success" conclusion is eligible to count as a
 # performance sample. failure/cancelled/skipped/timed_out runs are excluded
@@ -355,15 +379,28 @@ def _verify_run_record(record: dict, expected_head_sha: str) -> list[str]:
     expected_head_sha 検証は変更せず、measured_head_sha を持たない legacy
     record にのみ引き続き適用する"), it continues to be verified via the
     UNCHANGED pre-#2184 `head_sha != expected_head_sha` check below --
-    this additive-only design is a deliberate compatibility decision: a
-    hard, unconditional trusted-cohort exclusion of every
-    `measured_head_sha`-less record (the Outcome section's
-    `legacy_ambiguous_head_sha` illustration) is intentionally NOT wired
-    into this shared structural gate, because doing so would regress
+    this additive-only design is a deliberate compatibility decision.
+
+    #2184 AC4(iii) (fix_delta after pr-reviewer REQUEST_CHANGES on PR
+    #2493): the hard, unconditional trusted-cohort exclusion of a record
+    carrying NEITHER `measured_head_sha` NOR a derivable
+    `workflow_run_head_sha` (the Outcome section's `legacy_ambiguous_
+    head_sha` illustration) is NOT performed here (this function stays
+    pure shape/regex validation, unaware of job identity) -- it is
+    applied by `_collect_arm`, scoped to `LEGACY_AMBIGUOUS_HEAD_SHA_JOBS`
+    (`e2e-core`/`e2e-responsive-matrix`, the only jobs #2184's In Scope
+    actually makes emit `measured_head_sha`). That job-name scoping is
+    what keeps this additive-only design compatible with
     `scripts/ci/tests/e2e_performance_benchmark/test_collect_e2e_performance_benchmark_rerun_attempt.py`
-    (#2179/#2182's rerun-attempt regression suite, entirely
-    `measured_head_sha`-less by construction and outside Issue #2184's
-    Allowed Paths) -- see this Issue's PR body for the full rationale."""
+    (#2179/#2182's rerun-attempt regression suite, outside Issue #2184's
+    Allowed Paths): every one of its fixtures that reaches a trusted
+    `usable` cohort with neither field present uses the generic `e2e`
+    job name (the permanently-retired pre-split job,
+    `DEFAULT_BEFORE_JOB_NAMES`, which #2184 never touches and which will
+    never carry either field, past or future) -- never `e2e-core`/
+    `e2e-responsive-matrix`, so it is unaffected by the job-scoped
+    exclusion. See `_collect_arm` and this Issue's PR body for the full
+    rationale."""
     violations: list[str] = []
     if not isinstance(record.get("workflow_run_id"), int) or record.get("workflow_run_id", 0) < 1:
         violations.append("missing_or_invalid_workflow_run_id")
@@ -815,6 +852,34 @@ def _collect_arm(
                         "detail": (
                             f"workflow_run_id={record.get('workflow_run_id')!r} "
                             f"job={job!r} conclusion={record['conclusion']!r}"
+                        ),
+                    }
+                )
+                continue
+            # #2184 AC4(iii): a record for a `LEGACY_AMBIGUOUS_HEAD_SHA_JOBS`
+            # job that carries NEITHER `measured_head_sha` NOR a derivable
+            # `workflow_run_head_sha` (no `measured_head_sha` key AND no
+            # `merge_sha`/`workflow_run_head_sha` to derive one from, #2184
+            # AC2) is never promoted into the trusted cohort by inferring/
+            # synthesizing either field -- it is excluded with the explicit
+            # `legacy_ambiguous_head_sha` reason, mirroring
+            # `legacy_unverified_run_attempt` above. Scoped to
+            # `LEGACY_AMBIGUOUS_HEAD_SHA_JOBS` only (see that constant's
+            # docstring): a record for any OTHER job (e.g. the
+            # permanently-retired pre-split `e2e` job, `DEFAULT_BEFORE_
+            # JOB_NAMES`) was never expected to carry these #2184 fields in
+            # the first place and is unaffected by this exclusion.
+            if (
+                job in LEGACY_AMBIGUOUS_HEAD_SHA_JOBS
+                and record.get("measured_head_sha") is None
+                and _derive_workflow_run_head_sha(record) is None
+            ):
+                evidence_errors.append(
+                    {
+                        "arm": arm_name,
+                        "reason": "legacy_ambiguous_head_sha",
+                        "detail": (
+                            f"workflow_run_id={record.get('workflow_run_id')!r} job={job!r}"
                         ),
                     }
                 )

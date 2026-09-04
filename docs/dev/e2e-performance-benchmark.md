@@ -97,6 +97,8 @@ fingerprint フィールドが欠損しているか、`""` / `null` / `"unknown"
 
 `schemas/e2e_performance_benchmark_manifest_v1.schema.json` の `RunRecord` はこの分離を **optional field** として反映し、既存 `head_sha` は `required` のまま維持される。`measured_head_sha` / `workflow_run_head_sha` を持たない legacy record（既存 `head_sha` のみ）に対して、これらの新 field を `head_sha` から推測合成することはない。
 
+`measured_head_sha` を持たず、かつ `merge_sha`（既存フィールド、#2159 以降ずっと収集されている）からも `workflow_run_head_sha` を導出できない record（= 両フィールドとも真に不在な、#2159 より前の record）は、`e2e-core` / `e2e-responsive-matrix`（`collect_e2e_performance_benchmark.py::LEGACY_AMBIGUOUS_HEAD_SHA_JOBS`）に限り、trusted cohort から明示的な `legacy_ambiguous_head_sha` reason（`evidence_errors`）で除外される（`_collect_arm`。AC4(iii)）。`merge_sha` は保持しているが `measured_head_sha` を持たない record（#2159〜#2184 の間に収集された record。`merge_sha` は #2184 以前から無条件に収集されているため、真に両フィールドとも不在なケースは #2159 より前の record に限られる）はこの除外の対象ではなく、既存の `head_sha != expected_head_sha` 検証（後方互換、変更なし）で引き続き trusted cohort に含まれ得る。この除外は `e2e-core` / `e2e-responsive-matrix` の両ジョブに限定される（分割前の `e2e` job は本 Issue の producer 変更対象外であり、過去も将来もこれらの新 field を持つことはないため、ambiguous 除外の対象にはならない）。
+
 ## `workflow_digest` / `workflow_sha` の既知の限界（#2422 に委ねる）
 
 `workflow_digest`（`sha256sum .github/workflows/ci.yml`）は **checkout 後の** ワークフローファイルから計算されるため、`workflow_sha`（`github.workflow_sha`、workflow 定義の commit）とは別 commit 由来になり得るという既知の限界がある（hybrid `target_sha` benchmark route に起因する構造的制約）。この限界自体の解消（固定SHA benchmark route の置換）は #2184 のスコープ外であり、#2422（本 Issue に `blocked_by` される後続 Issue）に委ねる。#2184 は SHA provenance vocabulary（`measured_head_sha` / `workflow_run_head_sha`）の確立のみを行い、hybrid route 自体は置換しない。

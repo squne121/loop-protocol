@@ -36,6 +36,13 @@ AFTER_SHA = "b" * 40
 # as an INDEPENDENT field, never conflated with `head_sha`.
 WORKFLOW_SHA = "c" * 40
 
+# #2184 AC4(iii) fix_delta (pr-reviewer REQUEST_CHANGES on PR #2493):
+# sentinel distinguishing "caller didn't pass merge_sha" (auto-derive, see
+# `_record` below) from an EXPLICIT `merge_sha=None` (construct a record
+# genuinely lacking a derivable `workflow_run_head_sha`, for AC4(iii)
+# hard-exclude coverage).
+_MERGE_SHA_UNSET = object()
+
 
 def _record(
     workflow_run_id: int,
@@ -48,7 +55,7 @@ def _record(
     workflow_sha: str = WORKFLOW_SHA,
     run_attempt: int = 1,
     measured_head_sha: str | None = None,
-    merge_sha: str | None = None,
+    merge_sha: str | None | object = _MERGE_SHA_UNSET,
 ) -> dict:
     # #2182 fix_delta (OWNER adversarial review issuecomment-5302446086,
     # P0-3): every fixture in this baseline test file now carries an
@@ -59,11 +66,26 @@ def _record(
     # `test_missing_run_attempt_excluded_from_trusted_cohort_and_reported`
     # for the dedicated regression coverage of that exclusion itself).
     #
-    # #2184: `measured_head_sha`/`merge_sha` are OPT-IN (default `None`,
-    # meaning the field is entirely ABSENT -- a pre-#2184 legacy-shaped
-    # record) -- pass them explicitly to construct a new-style record
-    # exercising the #2184 measured_head_sha/workflow_run_head_sha
-    # verification paths (see the dedicated `#2184` test block below).
+    # #2184: `measured_head_sha` is OPT-IN (default `None`, meaning the
+    # field is entirely ABSENT) -- pass it explicitly to construct a
+    # new-style record exercising the #2184 measured_head_sha verification
+    # paths (see the dedicated `#2184` test block below).
+    #
+    # #2184 AC4(iii) fix_delta: `merge_sha` (which `workflow_run_head_sha`
+    # is derived from, #2184 AC2) defaults to `head_sha` -- NOT absent --
+    # when the caller doesn't pass it explicitly. This mirrors real CI
+    # history: `ci_runtime_baseline_v1`'s `merge_sha` field
+    # (`GH_SHA: ${{ github.sha }}`) has been recorded unconditionally
+    # since #2159, well before #2184's `measured_head_sha`, so a record
+    # collected from any modern (#2159-era or later) `e2e-core`/
+    # `e2e-responsive-matrix` run always HAS a `merge_sha` even when it
+    # predates #2184's `measured_head_sha` field -- it is never "legacy
+    # ambiguous" (AC4(iii)) on that basis alone. The genuinely ambiguous
+    # case AC4(iii) targets (a record with NEITHER field, i.e. one that
+    # predates even #2159's `merge_sha`) is constructed by passing
+    # `merge_sha=None` explicitly (see the dedicated AC4(iii) test block).
+    if merge_sha is _MERGE_SHA_UNSET:
+        merge_sha = head_sha
     record: dict = {
         "workflow_run_id": workflow_run_id,
         "job": job,
@@ -954,6 +976,103 @@ def test_ac4d_normal_execution_measured_equals_workflow_run_head_sha_passes():
     collector._validate_against_schema(manifest)
     violations = collector.validate_manifest_semantics(manifest)
     assert not any("pair_set_mismatch" in v for v in violations)
+
+
+# --------------------------------------------------------------------------- #
+# #2184 AC4(iii) (fix_delta after pr-reviewer REQUEST_CHANGES on PR #2493):
+# a legacy record carrying NEITHER `measured_head_sha` NOR a derivable
+# `workflow_run_head_sha` is hard-excluded from the trusted cohort with an
+# explicit `legacy_ambiguous_head_sha` evidence_errors reason, scoped to
+# `LEGACY_AMBIGUOUS_HEAD_SHA_JOBS` (`e2e-core`/`e2e-responsive-matrix`).
+# --------------------------------------------------------------------------- #
+def test_ac4e_legacy_record_lacking_both_head_sha_fields_is_hard_excluded():
+    """GIVEN an `e2e-core` record carrying NEITHER `measured_head_sha` NOR
+    a `merge_sha` (so `workflow_run_head_sha` cannot be derived either --
+    the genuinely ambiguous pre-#2159 legacy shape) WHEN collected THEN it
+    is excluded from the trusted cohort with the explicit
+    `legacy_ambiguous_head_sha` reason -- never promoted by inferring/
+    synthesizing either field, and never silently folded into the generic
+    `run_record_verification_failed` bucket (#2184 AC4(iii))."""
+    ambiguous_record = _record(650, job="e2e-core", head_sha=BEFORE_SHA, merge_sha=None)
+    assert "measured_head_sha" not in ambiguous_record
+    assert "merge_sha" not in ambiguous_record
+
+    evidence_errors: list[dict] = []
+    result = collector._collect_arm(
+        arm_name="before",
+        commit_sha=BEFORE_SHA,
+        raw_records=[ambiguous_record],
+        job_names=("e2e-core",),
+        min_run_count=1,
+        evidence_errors=evidence_errors,
+    )
+    assert result["jobs"]["e2e-core"]["run_count"] == 0
+    assert result["jobs"]["e2e-core"]["runs"] == []
+
+    matching_errors = [
+        err
+        for err in evidence_errors
+        if err["arm"] == "before" and "workflow_run_id=650" in err["detail"]
+    ]
+    assert len(matching_errors) == 1
+    assert matching_errors[0]["reason"] == "legacy_ambiguous_head_sha"
+
+
+def test_ac4f_legacy_record_with_derivable_merge_sha_is_not_hard_excluded():
+    """GIVEN an `e2e-core` record lacking `measured_head_sha` but carrying
+    a `merge_sha` (a genuine #2159-era, pre-#2184 record -- `merge_sha`
+    has been recorded unconditionally since #2159, well before #2184)
+    WHEN collected THEN `workflow_run_head_sha` IS derivable from
+    `merge_sha`, so the record is NOT `legacy_ambiguous_head_sha`-excluded
+    -- it remains trusted via the existing (unchanged) `head_sha !=
+    expected_head_sha` structural check (#2184 AC4(i) backward
+    compatibility), and `workflow_run_head_sha` propagates to the
+    manifest while `measured_head_sha` is correctly omitted."""
+    legacy_record = _record(651, job="e2e-core", head_sha=BEFORE_SHA, merge_sha=BEFORE_SHA)
+    assert "measured_head_sha" not in legacy_record
+    assert legacy_record["merge_sha"] == BEFORE_SHA
+
+    evidence_errors: list[dict] = []
+    result = collector._collect_arm(
+        arm_name="before",
+        commit_sha=BEFORE_SHA,
+        raw_records=[legacy_record],
+        job_names=("e2e-core",),
+        min_run_count=1,
+        evidence_errors=evidence_errors,
+    )
+    assert evidence_errors == []
+    run = result["jobs"]["e2e-core"]["runs"][0]
+    assert "measured_head_sha" not in run
+    assert run["workflow_run_head_sha"] == BEFORE_SHA
+
+
+def test_ac4g_legacy_ambiguous_exclusion_scoped_to_e2e_core_responsive_matrix_jobs():
+    """GIVEN a record for the permanently-retired pre-split `e2e` job
+    (`DEFAULT_BEFORE_JOB_NAMES`, never touched by #2184's producer change)
+    carrying NEITHER `measured_head_sha` NOR `merge_sha` WHEN collected
+    THEN it is NOT `legacy_ambiguous_head_sha`-excluded -- the AC4(iii)
+    hard-exclude is scoped to `LEGACY_AMBIGUOUS_HEAD_SHA_JOBS`
+    (`e2e-core`/`e2e-responsive-matrix`) only, since the `e2e` job was
+    never expected to carry either field in the first place (#2184 In
+    Scope), unlike a genuine `e2e-core`/`e2e-responsive-matrix` legacy
+    record."""
+    record = _record(652, job="e2e", head_sha=BEFORE_SHA, merge_sha=None)
+    assert "measured_head_sha" not in record
+    assert "merge_sha" not in record
+
+    evidence_errors: list[dict] = []
+    result = collector._collect_arm(
+        arm_name="before",
+        commit_sha=BEFORE_SHA,
+        raw_records=[record],
+        job_names=("e2e",),
+        min_run_count=1,
+        evidence_errors=evidence_errors,
+    )
+    assert evidence_errors == []
+    assert result["jobs"]["e2e"]["run_count"] == 1
+    assert "workflow_run_head_sha" not in result["jobs"]["e2e"]["runs"][0]
 
 
 # --------------------------------------------------------------------------- #

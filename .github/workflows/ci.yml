@@ -952,6 +952,21 @@ jobs:
           PNPM_VERSION_RAW="$(pnpm -v 2>/dev/null || echo unknown)"
           LOCKFILE_HASH_RAW="sha256:$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
           WORKFLOW_DIGEST_RAW="sha256:$(sha256sum .github/workflows/ci.yml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
+          # #2184 fix_delta (pr-reviewer REQUEST_CHANGES, PR #2493 blocker 1):
+          # this step's shell runs inside the `container:` image above, and
+          # the checked-out workspace at $GITHUB_WORKSPACE is owned by a
+          # different UID than the container's git config sees by default,
+          # which makes ANY bare `git` invocation in this step fail closed
+          # with "detected dubious ownership in repository at
+          # '$GITHUB_WORKSPACE'" (exit 128). The pre-existing "Verify
+          # checked-out HEAD matches dispatched target_sha" step above never
+          # hit this because it's gated `if: target_sha != ''` and only ever
+          # ran on an actual dispatched benchmark run; this step's
+          # unconditional `git rev-parse HEAD` below runs on every job
+          # invocation (including plain push/pull_request CI), so it must
+          # register the safe.directory exception itself before invoking
+          # `git`.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           # #2184 AC1: independent observation of the checked-out commit --
           # NEVER the `target_sha` input verbatim. On a `target_sha`
           # dispatch, the "Verify checked-out HEAD matches dispatched
@@ -1675,6 +1690,21 @@ jobs:
           PNPM_VERSION_RAW="$(pnpm -v 2>/dev/null || echo unknown)"
           LOCKFILE_HASH_RAW="sha256:$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
           WORKFLOW_DIGEST_RAW="sha256:$(sha256sum .github/workflows/ci.yml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
+          # #2184 fix_delta (pr-reviewer REQUEST_CHANGES, PR #2493 blocker 1):
+          # this step's shell runs inside the `container:` image above, and
+          # the checked-out workspace at $GITHUB_WORKSPACE is owned by a
+          # different UID than the container's git config sees by default,
+          # which makes ANY bare `git` invocation in this step fail closed
+          # with "detected dubious ownership in repository at
+          # '$GITHUB_WORKSPACE'" (exit 128). The pre-existing "Verify
+          # checked-out HEAD matches dispatched target_sha" step above never
+          # hit this because it's gated `if: target_sha != ''` and only ever
+          # ran on an actual dispatched benchmark run; this step's
+          # unconditional `git rev-parse HEAD` below runs on every job
+          # invocation (including plain push/pull_request CI), so it must
+          # register the safe.directory exception itself before invoking
+          # `git`.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           # #2184 AC1: independent observation of the checked-out commit --
           # NEVER the `target_sha` input verbatim. On a `target_sha`
           # dispatch, the "Verify checked-out HEAD matches dispatched
