@@ -71,6 +71,7 @@ that real data.
 from __future__ import annotations
 
 import glob
+import hashlib
 import importlib.util
 import json
 import math
@@ -195,7 +196,13 @@ def _cli_run_details_from_pairs(pairs: list[tuple], commit_sha: str) -> list[dic
     return run_details
 
 
-def run_evidence_gate(fixture: dict) -> dict:
+def run_evidence_gate(
+    fixture: dict,
+    *,
+    ci_verdict_summary_path: str | None = None,
+    expected_head_sha: str | None = None,
+    expected_summary_file_sha256: str | None = None,
+) -> dict:
     """#2159 items 2+3 (issuecomment-5299412215): the single production gate
     function -- reads an already-assembled cohort fixture (shape: see
     `--cohort-fixture` CLI help below), re-validates POST-FILTER evidence
@@ -221,7 +228,25 @@ def run_evidence_gate(fixture: dict) -> dict:
     result dict's `gate_ready_evidence_errors` field (`{"before": [...],
     "after": [...]}`) for BOTH the `insufficient_evidence` and `complete`
     outcomes, so a missing/invalid/colliding gate-ready record's id and
-    reason are never silently dropped from the production result."""
+    reason are never silently dropped from the production result.
+
+    #2423 AC4 fix_delta (OWNER controlled-reframe issuecomment-5539310075):
+    `ci_verdict_summary_path` / `expected_head_sha` /
+    `expected_summary_file_sha256` are now threaded through to the
+    validator's `validate_assessment()` call (previously this function
+    called `validate_assessment(assessment_tmp_path)` with NO trusted
+    binding arguments at all -- a real gap: the built assessment's
+    `functional_evidence.ci_verdict_summary_ref` self-report was never
+    cross-checked against a canonical `ci_verdict_summary_v2` artifact, so
+    `approval_eligible` could never become `True` through this path, and
+    conversely nothing here previously enforced that a caller supply a
+    real trusted artifact at all). `expected_summary_file_sha256` maps onto
+    the validator's `--expected-artifact-digest` parameter, which is the
+    SHA-256 of the `ci_verdict_summary_v2` JSON FILE's own bytes -- see
+    `docs/dev/e2e-performance-benchmark.md`'s digest-naming-distinction
+    section for why this is never conflated with a GitHub Actions
+    artifact-bundle-level digest (`github_artifact_digest` in the AC3
+    receipt, which this function does not compute or validate)."""
     validator = _load_validator_module()
 
     before_core = fixture["before"]["core_baselines"]
@@ -293,7 +318,12 @@ def run_evidence_gate(fixture: dict) -> dict:
         json.dump(assessment, handle)
         assessment_tmp_path = handle.name
     try:
-        exit_code, decision = validator.validate_assessment(assessment_tmp_path)
+        exit_code, decision = validator.validate_assessment(
+            assessment_tmp_path,
+            ci_verdict_summary_path=ci_verdict_summary_path,
+            expected_head_sha=expected_head_sha,
+            expected_artifact_digest=expected_summary_file_sha256,
+        )
     finally:
         os.unlink(assessment_tmp_path)
 
@@ -312,8 +342,9 @@ def run_evidence_gate(fixture: dict) -> dict:
 
 def _cli_main(argv: list[str] | None = None) -> int:
     """Real callable entrypoint wired into `.github/workflows/ci.yml`'s
-    `e2e-performance-benchmark-assessment-gate` job (#2159 OWNER
-    scope-authority ruling issuecomment-5299412215, items 2+3). Exit codes:
+    `e2e-performance-benchmark-assessment-gate` steps (#2159 OWNER
+    scope-authority ruling issuecomment-5299412215, items 2+3; exit-code
+    semantics tightened by #2423 AC4). Exit codes:
     0 = gate_status complete AND semantic_valid AND approval_eligible;
     1 = insufficient_evidence (AC11 fail-closed -- the intended, CORRECT
         outcome until a real >= 20-run cohort exists per-arm, per OWNER:
@@ -321,14 +352,25 @@ def _cli_main(argv: list[str] | None = None) -> int:
     2 = complete evidence but the built assessment failed structural/semantic
         validation (defensive fail-closed; not expected given this module's
         own P0-7 hardening, see
-        test_validate_ci_performance_assessment_v2_build_from_cohorts.py)."""
+        test_validate_ci_performance_assessment_v2_build_from_cohorts.py);
+    3 = complete evidence AND semantic_valid, but NOT approval_eligible
+        (#2423 AC4: previously this function only checked `semantic_valid`
+        at this branch point and returned 0 regardless of
+        `approval_eligible` -- a real gap, since a semantically valid
+        assessment can still be `approval_eligible: false` e.g. because no
+        trusted `ci_verdict_summary_v2` artifact was bound at all. A
+        close-grade CLI that exits 0 without independently confirming
+        `approval_eligible` is a false-green risk this AC closes)."""
     import argparse
 
     parser = argparse.ArgumentParser(
         description=(
             "#2159 items 2+3 production gate: fail-closed AC11 evidence "
             "readiness check + P0-8 real CI_TEST_PERFORMANCE_ASSESSMENT_V2 "
-            "producer, wired from a single cohort fixture."
+            "producer, wired from a single cohort fixture. #2423 AC3/AC4/AC5: "
+            "requires complete && semantic_valid && approval_eligible for "
+            "exit 0, and can additionally emit the CI_PERFORMANCE_CLOSE_GRADE_"
+            "RESULT_V1 receipt #2424 consumes."
         )
     )
     parser.add_argument(
@@ -341,31 +383,148 @@ def _cli_main(argv: list[str] | None = None) -> int:
             '"risk_acknowledgement": {...}, "cohort_provenance": {...}, '
             '"before": {"commit_sha": str, "core_baselines": [...], '
             '"responsive_baselines": [...], "gate_ready_baselines": [...]}, '
-            '"after": {...same shape...}}'
+            '"after": {...same shape...}}. #2423: this fixture\'s "before"/'
+            '"after" arms are consumed as the root run set stand-in for the '
+            'AC3 receipt\'s arms.monolith / arms.split respectively, until a '
+            "real #2422 immutable manifest reference supersedes it."
         ),
     )
     parser.add_argument("--output", required=True, help="Path to write the gate result JSON")
+    parser.add_argument(
+        "--ci-verdict-summary",
+        default=None,
+        help=(
+            "#2423 AC4: path to the trusted ci_verdict_summary_v2 artifact "
+            "JSON, forwarded to validate_ci_performance_assessment_v2.py's "
+            "--ci-verdict-summary. Required (together with --expected-head-sha) "
+            "for approval_eligible=true, hence for exit code 0."
+        ),
+    )
+    parser.add_argument(
+        "--expected-head-sha",
+        default=None,
+        help="#2423 AC4: trusted PR head SHA, forwarded to the validator's --expected-head-sha.",
+    )
+    parser.add_argument(
+        "--expected-ci-verdict-summary-file-sha256",
+        default=None,
+        help=(
+            "#2423 AC4: expected sha256:<hex> digest of the --ci-verdict-summary "
+            "FILE's own bytes (forwarded to the validator's --expected-artifact-digest). "
+            "Distinct from --github-artifact-digest, which is the separate GitHub "
+            "Actions upload-artifact bundle-level digest -- never conflated (see "
+            "docs/dev/e2e-performance-benchmark.md)."
+        ),
+    )
+    parser.add_argument(
+        "--ci-verdict-summary-artifact-id",
+        default=None,
+        help=(
+            "#2423 AC3/AC5: GitHub Actions artifact ID the --ci-verdict-summary "
+            "file was downloaded from (receipt provenance only; not re-verified "
+            "by the validator)."
+        ),
+    )
+    parser.add_argument(
+        "--github-artifact-digest",
+        default=None,
+        help=(
+            "#2423 AC3/AC4: GitHub Actions upload-artifact bundle-level digest "
+            "for the artifact --ci-verdict-summary-artifact-id points at (receipt "
+            "provenance field trusted_functional_evidence.github_artifact_digest; "
+            "distinct from --expected-ci-verdict-summary-file-sha256, the sha256 "
+            "of the summary JSON file's own bytes)."
+        ),
+    )
+    parser.add_argument(
+        "--experiment-identity",
+        default=None,
+        help=(
+            "#2423 AC3: stable identity string for the CI_PERFORMANCE_CLOSE_GRADE_"
+            "RESULT_V1 receipt; derived from the fixture when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--manifest-sha256",
+        default=None,
+        help=(
+            "#2423 AC3: sha256:<hex> of the #2422 immutable dispatch root run "
+            "set manifest this fixture was materialized from. Falls back to "
+            "the --cohort-fixture file's own sha256 when omitted (#2422's "
+            "manifest v2 producer is not yet wired as of this Issue; see "
+            "docs/dev/e2e-performance-benchmark.md)."
+        ),
+    )
+    parser.add_argument(
+        "--receipt-output",
+        default=None,
+        help="#2423 AC3: optional path to additionally write the CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 receipt JSON.",
+    )
     args = parser.parse_args(argv)
 
     with open(args.cohort_fixture, encoding="utf-8") as handle:
-        fixture = json.load(handle)
+        fixture_text = handle.read()
+    fixture = json.loads(fixture_text)
 
-    result = run_evidence_gate(fixture)
+    result = run_evidence_gate(
+        fixture,
+        ci_verdict_summary_path=args.ci_verdict_summary,
+        expected_head_sha=args.expected_head_sha,
+        expected_summary_file_sha256=args.expected_ci_verdict_summary_file_sha256,
+    )
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2)
         handle.write("\n")
 
+    validation_decision = result.get("validation_result") or {}
+    semantic_valid = bool(validation_decision.get("semantic_valid"))
+    approval_eligible = bool(validation_decision.get("approval_eligible"))
+
     if result["gate_status"] == "insufficient_evidence":
         print(f"::error::CI_PERFORMANCE_BENCHMARK_EVIDENCE_GATE_RESULT_V1 insufficient_evidence: {result['reason']}")
-        return 1
-    if not (result["validation_result"] or {}).get("semantic_valid"):
+        exit_code = 1
+    elif not semantic_valid:
         print("::error::CI_PERFORMANCE_BENCHMARK_EVIDENCE_GATE_RESULT_V1 built assessment failed semantic validation")
-        return 2
-    claim = result["assessment"]["claim"]
-    print(f"CI_PERFORMANCE_BENCHMARK_EVIDENCE_GATE_RESULT_V1 gate_status=complete claim={claim}")
-    return 0
+        exit_code = 2
+    elif not approval_eligible:
+        print(
+            "::error::CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 semantic_valid but NOT "
+            f"approval_eligible (AC4 fail-closed; blockers={validation_decision.get('blockers')})"
+        )
+        exit_code = 3
+    else:
+        claim = result["assessment"]["claim"]
+        print(f"CI_PERFORMANCE_BENCHMARK_EVIDENCE_GATE_RESULT_V1 gate_status=complete claim={claim}")
+        exit_code = 0
+
+    if args.receipt_output:
+        cohort_fixture_sha256 = "sha256:" + hashlib.sha256(fixture_text.encode("utf-8")).hexdigest()
+        trusted_functional_evidence = {
+            "ci_verdict_summary_artifact_id": args.ci_verdict_summary_artifact_id,
+            "ci_verdict_summary_file_sha256": args.expected_ci_verdict_summary_file_sha256,
+            "github_artifact_digest": args.github_artifact_digest,
+            "expected_head_sha": args.expected_head_sha,
+        }
+        receipt = build_close_grade_receipt(
+            fixture,
+            manifest_sha256=args.manifest_sha256 or cohort_fixture_sha256,
+            trusted_functional_evidence=trusted_functional_evidence,
+            validation_decision=validation_decision,
+            exit_code=exit_code,
+            experiment_identity=args.experiment_identity,
+        )
+        os.makedirs(os.path.dirname(args.receipt_output) or ".", exist_ok=True)
+        with open(args.receipt_output, "w", encoding="utf-8") as handle:
+            json.dump(receipt, handle, indent=2)
+            handle.write("\n")
+        print(
+            f"CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 experiment_identity={receipt['experiment_identity']} "
+            f"performance_assessment.complete={receipt['performance_assessment']['complete']}"
+        )
+
+    return exit_code
 
 
 def _load_validator_module():
@@ -1127,6 +1286,255 @@ def _evidence_readiness_hard_check_post_filter(
         )
 
 
+# --------------------------------------------------------------------------- #
+# #2423 AC1/AC2/AC3: close-grade receipt materializer. #2422 owns the
+# immutable dispatch root run set / manifest v2 producer (this Issue
+# consumes, never reimplements, that producer); #2423 is the performance
+# eligibility PROJECTION owner of that root run set -- root members are
+# never silently dropped, only projected into
+# `performance_eligible_workflow_run_ids` or explained in `evidence_errors`.
+#
+# Deliberately distinct from `_comparable_cohort()` above (see that
+# function's own docstring): `_comparable_cohort()` is an EXPLORATORY-only
+# helper that keeps only the single LARGEST WITHIN_COHORT_REQUIRED_EQUAL
+# fingerprint group per job and REJECTS every other run outright -- a
+# majority-selection design that is correct for the exploratory
+# integration tests below (which only care about "is there a big-enough
+# comparable cohort to report a P50/P95 from") but would be a false-green
+# risk for close-grade evidence (a minority fingerprint mismatch, a
+# collision, or a missing pair would simply vanish from the largest-group
+# selection with no record of why). The functions below reuse
+# `_pair_by_workflow_run_id` / `_select_initial_attempt_baselines` /
+# `_fingerprint` / `_fingerprint_has_placeholder` -- the SAME fail-closed
+# building blocks `_comparable_cohort()` and the AC11 hard-check already
+# use -- rather than duplicating their attempt-trust/dedupe/collision
+# logic, but never apply `_comparable_cohort()`'s majority selection to
+# decide close-grade eligibility.
+# --------------------------------------------------------------------------- #
+CLOSE_GRADE_MATERIALIZATION_POLICY = "close_grade_fail_closed_v1"
+
+
+def _root_workflow_run_ids(*baseline_lists: list[dict]) -> list[object]:
+    """#2423 AC2: the root run set for one arm is every distinct
+    `workflow_run_id` present anywhere in the arm's raw input lists (core /
+    responsive / gate-ready), BEFORE any pairing/attempt/fingerprint
+    filtering -- this is the set the AC2 invariant
+    (`expected_root_run_ids == performance_eligible_run_ids ∪
+    evidence_error_run_ids`) is checked against, so it must never itself be
+    computed from an already-filtered collection."""
+    ids: set[object] = set()
+    for baselines in baseline_lists:
+        for baseline in baselines:
+            workflow_run_id = baseline.get("workflow_run_id")
+            if workflow_run_id is not None:
+                ids.add(workflow_run_id)
+    return sorted(ids, key=str)
+
+
+def _materialize_close_grade_arm(
+    core_baselines: list[dict],
+    responsive_baselines: list[dict],
+    gate_ready_baselines: list[dict],
+    arm_label: str,
+) -> tuple[dict, list[dict]]:
+    """#2423 AC1/AC2: fail-closed close-grade materializer for a single
+    arm's root run set. Every root `workflow_run_id` lands in EXACTLY ONE
+    of `performance_eligible_workflow_run_ids` or `evidence_errors` (never
+    both, never neither -- enforced by `_assert_root_eligible_error_
+    invariant` below) by construction: `evidence_errors` collects every
+    exclusion reason (unpaired provider lane, run_attempt identity
+    collision, missing/invalid initial attempt, provider fingerprint
+    placeholder/mismatch, missing/invalid gate-ready timestamp, or absent
+    gate-ready evidence entirely), and eligibility is simply "root member
+    minus everything `evidence_errors` already explains" -- so the
+    invariant holds by set-complement construction, not by a second,
+    possibly-divergent bookkeeping pass."""
+    root_ids = _root_workflow_run_ids(core_baselines, responsive_baselines, gate_ready_baselines)
+
+    evidence_errors: list[dict] = []
+    error_ids: set[object] = set()
+
+    def _record(workflow_run_id: object, reason: str) -> None:
+        evidence_errors.append(
+            {"workflow_run_id": str(workflow_run_id), "arm": arm_label, "reason": reason}
+        )
+        error_ids.add(workflow_run_id)
+
+    # AC1: the SAME canonical `_pair_by_workflow_run_id` materialization
+    # result the provider sample-count/percentile path consumes -- no
+    # independent raw-artifact re-scan.
+    pairs, pair_errors = _pair_by_workflow_run_id(core_baselines, responsive_baselines)
+    for err in pair_errors:
+        if err["workflow_run_id"] not in error_ids:
+            _record(err["workflow_run_id"], err["reason"])
+
+    for workflow_run_id, core, responsive in pairs:
+        if _fingerprint_has_placeholder(core) or _fingerprint_has_placeholder(responsive):
+            _record(workflow_run_id, "fingerprint_placeholder_or_missing")
+            continue
+        if _fingerprint(core) != _fingerprint(responsive):
+            _record(workflow_run_id, "fingerprint_mismatch_core_vs_responsive")
+
+    gate_ready_selected, gate_ready_selection_errors = _select_initial_attempt_baselines(gate_ready_baselines)
+    for err in gate_ready_selection_errors:
+        if err["workflow_run_id"] not in error_ids:
+            _record(err["workflow_run_id"], f"gate_ready_{err['reason']}")
+    for workflow_run_id, baseline in gate_ready_selected.items():
+        if workflow_run_id in error_ids:
+            continue
+        if _gate_ready_latency_seconds_from_baseline(baseline) is None:
+            _record(workflow_run_id, "gate_ready_timestamp_missing_or_invalid")
+
+    # Close-grade evidence requires BOTH the paired provider lane AND
+    # gate-ready lane -- a root member missing EITHER lane's evidence is
+    # fail-closed excluded, never silently treated as eligible on partial
+    # (provider-only or gate-ready-only) evidence.
+    paired_ids = {workflow_run_id for workflow_run_id, _core, _responsive in pairs}
+    gate_ready_ids = {
+        baseline.get("workflow_run_id")
+        for baseline in gate_ready_baselines
+        if baseline.get("workflow_run_id") is not None
+    }
+    for workflow_run_id in root_ids:
+        if workflow_run_id in error_ids:
+            continue
+        if workflow_run_id not in paired_ids:
+            _record(workflow_run_id, "missing_provider_pairing_evidence")
+            continue
+        if workflow_run_id not in gate_ready_ids:
+            _record(workflow_run_id, "missing_gate_ready_evidence")
+
+    eligible_ids = [wid for wid in root_ids if wid not in error_ids]
+
+    arm_result = {
+        "workflow_run_ids": [str(wid) for wid in root_ids],
+        "performance_eligible_workflow_run_ids": [str(wid) for wid in eligible_ids],
+    }
+    return arm_result, evidence_errors
+
+
+def _assert_root_eligible_error_invariant(arm_result: dict, arm_errors: list[dict], arm_label: str) -> None:
+    """#2423 AC2 invariant, enforced at runtime (fail-closed, never a
+    silently-emitted receipt that violates its own contract):
+    `expected_root_run_ids == performance_eligible_run_ids ∪
+    evidence_error_run_ids` AND the two sets are disjoint."""
+    root = set(arm_result["workflow_run_ids"])
+    eligible = set(arm_result["performance_eligible_workflow_run_ids"])
+    error_ids = {entry["workflow_run_id"] for entry in arm_errors}
+    union = eligible | error_ids
+    if union != root:
+        raise AssertionError(
+            f"#2423 AC2 invariant violated for arm={arm_label!r}: "
+            f"root={root!r} != eligible ∪ evidence_error_ids={union!r}"
+        )
+    overlap = eligible & error_ids
+    if overlap:
+        raise AssertionError(
+            f"#2423 AC2 invariant violated for arm={arm_label!r}: "
+            f"eligible and evidence_error sets are not disjoint: {overlap!r}"
+        )
+
+
+def _run_set_digest(monolith_ids: list[str], split_ids: list[str]) -> str:
+    """#2423 AC3: a deterministic `sha256:<hex>` digest of the two arms'
+    root run set MEMBERSHIP (never their measured values), so #2424 can
+    detect a silent root-set substitution between two receipts claiming
+    the same `experiment_identity`."""
+    payload = json.dumps(
+        {"monolith": sorted(monolith_ids, key=str), "split": sorted(split_ids, key=str)},
+        sort_keys=True,
+    )
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_close_grade_receipt(
+    fixture: dict,
+    *,
+    manifest_sha256: str,
+    trusted_functional_evidence: dict,
+    validation_decision: dict | None,
+    exit_code: int,
+    experiment_identity: str | None = None,
+) -> dict:
+    """#2423 AC3: assembles `CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1`, the
+    machine-readable receipt #2424 reads as a byte-matched consumer
+    contract (field names: `experiment_identity` / `manifest_sha256` /
+    `run_set_digest` / `materialization_policy` /
+    `arms.{monolith,split}.workflow_run_ids` /
+    `arms.{monolith,split}.performance_eligible_workflow_run_ids` /
+    `evidence_errors` / `performance_assessment.complete` /
+    `trusted_functional_evidence.*` / `validation.{semantic_valid,
+    approval_eligible}` / `exit_code`).
+
+    #2423 scope note (live Issue Background / OWNER-authorized design
+    decision, since #2422's real immutable-manifest producer does not
+    exist yet at this Issue's implementation time): this receipt treats
+    the `--cohort-fixture` input's "before"/"after" arms -- the only root
+    run set input actually available today -- as the `arms.monolith` /
+    `arms.split` stand-in respectively (mirroring this module's existing
+    before==pre-split / after==post-split convention, e.g.
+    `test_p50_gate_ready_latency_not_regressed`'s `cohort_role` usage). A
+    real #2422 manifest reference supersedes this stand-in as a follow-up,
+    without changing this function's OUTPUT field names/shape (#2424's own
+    Stop Condition on that renegotiation)."""
+    before = fixture["before"]
+    after = fixture["after"]
+
+    monolith_result, monolith_errors = _materialize_close_grade_arm(
+        before["core_baselines"],
+        before["responsive_baselines"],
+        before.get("gate_ready_baselines", []),
+        "monolith",
+    )
+    split_result, split_errors = _materialize_close_grade_arm(
+        after["core_baselines"],
+        after["responsive_baselines"],
+        after.get("gate_ready_baselines", []),
+        "split",
+    )
+
+    _assert_root_eligible_error_invariant(monolith_result, monolith_errors, "monolith")
+    _assert_root_eligible_error_invariant(split_result, split_errors, "split")
+
+    evidence_errors = monolith_errors + split_errors
+    run_set_digest = _run_set_digest(monolith_result["workflow_run_ids"], split_result["workflow_run_ids"])
+
+    if experiment_identity is None:
+        experiment_identity = (
+            f"issue-{fixture.get('issue_number')}-pr-{fixture.get('pr_number')}-"
+            f"{str(before.get('commit_sha', ''))[:12]}-{str(after.get('commit_sha', ''))[:12]}"
+        )
+
+    complete = (
+        not evidence_errors
+        and bool(monolith_result["performance_eligible_workflow_run_ids"])
+        and bool(split_result["performance_eligible_workflow_run_ids"])
+    )
+
+    validation_decision = validation_decision or {}
+
+    return {
+        "schema": "CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1",
+        "schema_version": 1,
+        "experiment_identity": experiment_identity,
+        "manifest_sha256": manifest_sha256,
+        "run_set_digest": run_set_digest,
+        "materialization_policy": CLOSE_GRADE_MATERIALIZATION_POLICY,
+        "arms": {
+            "monolith": monolith_result,
+            "split": split_result,
+        },
+        "evidence_errors": evidence_errors,
+        "performance_assessment": {"complete": complete},
+        "trusted_functional_evidence": trusted_functional_evidence,
+        "validation": {
+            "semantic_valid": bool(validation_decision.get("semantic_valid")),
+            "approval_eligible": bool(validation_decision.get("approval_eligible")),
+        },
+        "exit_code": exit_code,
+    }
+
+
 def test_p50_provider_meets_absolute_and_relative_shortening_threshold():
     baselines = _find_all_baselines()
     cohort = _comparable_cohort(baselines, ("e2e-core", "e2e-responsive-matrix", "e2e"))
@@ -1336,6 +1744,345 @@ def test_p95_failure_and_flaky_rate_validated_from_real_assessment_artifact():
             f"but NOT approval_eligible (blockers={decision.get('blockers')}) -- exit_code "
             f"alone is insufficient per AC10"
         )
+
+
+# --------------------------------------------------------------------------- #
+# #2423 AC1/AC2/AC3: close-grade receipt materializer tests. Deliberately
+# artifact-independent (unlike the exploratory integration tests above,
+# which SKIP without live `.claude/artifacts/` data) -- these exercise the
+# fail-closed materializer/receipt logic directly against small synthetic
+# fixtures, per repo policy on behavioral verification (docs/dev/
+# runtime-verification-policy.md distinguishes cohort-dependent SKIP tests
+# from cohort-independent logic tests, the latter of which must be real
+# unit tests, not SKIP).
+# --------------------------------------------------------------------------- #
+def _close_grade_paired_baselines(
+    job: str, run_ids: list[int], base_ms: int = 60_000, fingerprint_overrides: dict | None = None
+) -> list[dict]:
+    fingerprint_overrides = fingerprint_overrides or {}
+    baselines = []
+    for i, run_id in enumerate(run_ids):
+        baseline = {
+            "workflow_run_id": run_id,
+            "job": job,
+            "run_attempt": 1,
+            "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": base_ms + i}],
+            "host_runner_image": "Linux/X64",
+            "playwright_container_image_digest": "sha256:" + "c" * 64,
+            "node_version": "20.0.0",
+            "pnpm_version": "9.0.0",
+            "playwright_version": "1.40.0",
+            "lockfile_hash": "sha256:" + "d" * 64,
+            "workflow_digest": "sha256:" + "e" * 64,
+        }
+        baseline.update(fingerprint_overrides.get(run_id, {}))
+        baselines.append(baseline)
+    return baselines
+
+
+def _close_grade_gate_ready_baselines(run_ids: list[int], overrides: dict | None = None) -> list[dict]:
+    overrides = overrides or {}
+    baselines = []
+    for run_id in run_ids:
+        baseline = {
+            "workflow_run_id": run_id,
+            "run_attempt": 1,
+            "run_started_at": "2026-08-15T00:00:00Z",
+            "check_completed_at": "2026-08-15T00:05:00Z",
+        }
+        baseline.update(overrides.get(run_id, {}))
+        baselines.append(baseline)
+    return baselines
+
+
+def test_close_grade_materialization_canonical_result_feeds_both_eligible_ids_and_root_ids():
+    """GIVEN a clean set of paired+gate-ready baselines WHEN the AC1/AC2
+    close-grade materializer runs THEN every root workflow_run_id is
+    eligible (no evidence_errors) and the eligible set is computed from the
+    SAME canonical `_pair_by_workflow_run_id` result the provider
+    sample-count path already consumes (AC1) -- no independent raw
+    artifact scan."""
+    run_ids = [9001, 9002, 9003]
+    core = _close_grade_paired_baselines("e2e-core", run_ids)
+    responsive = _close_grade_paired_baselines("e2e-responsive-matrix", run_ids)
+    gate_ready = _close_grade_gate_ready_baselines(run_ids)
+
+    arm_result, evidence_errors = _materialize_close_grade_arm(core, responsive, gate_ready, "monolith")
+
+    assert evidence_errors == []
+    assert arm_result["workflow_run_ids"] == [str(rid) for rid in run_ids]
+    assert arm_result["performance_eligible_workflow_run_ids"] == [str(rid) for rid in run_ids]
+
+    pairs, pair_errors = _pair_by_workflow_run_id(core, responsive)
+    assert pair_errors == []
+    assert {str(wid) for wid, _c, _r in pairs} == set(arm_result["performance_eligible_workflow_run_ids"])
+
+
+def test_canonical_materialization_provider_sample_count_matches_close_grade_eligible_count():
+    """AC1: the provider post-filter sample count and the close-grade
+    eligible-id count are two views of the SAME canonical
+    `_pair_by_workflow_run_id` materialization result, not two
+    independently (and possibly divergently) computed numbers."""
+    run_ids = list(range(20001, 20021))
+    core = _close_grade_paired_baselines("e2e-core", run_ids)
+    responsive = _close_grade_paired_baselines("e2e-responsive-matrix", run_ids)
+    gate_ready = _close_grade_gate_ready_baselines(run_ids)
+
+    count, evidence_errors = _provider_post_filter_sample_count(core, responsive)
+    arm_result, close_grade_errors = _materialize_close_grade_arm(core, responsive, gate_ready, "split")
+
+    assert evidence_errors == []
+    assert close_grade_errors == []
+    assert count == len(arm_result["performance_eligible_workflow_run_ids"]) == len(run_ids)
+
+
+def test_close_grade_materialization_never_silently_drops_root_members_evidence_error_union():
+    """AC2 invariant: expected_root_run_ids == performance_eligible_run_ids
+    ∪ evidence_error_run_ids, and the two sets are disjoint, even when the
+    input mixes fully-clean runs with a run present ONLY in the gate-ready
+    lane (no provider pairing at all) -- that run must still surface
+    somewhere, never vanish."""
+    paired_ids = [31001, 31002]
+    gate_ready_only_id = 31099
+
+    core = _close_grade_paired_baselines("e2e-core", paired_ids)
+    responsive = _close_grade_paired_baselines("e2e-responsive-matrix", paired_ids)
+    gate_ready = _close_grade_gate_ready_baselines(paired_ids + [gate_ready_only_id])
+
+    arm_result, evidence_errors = _materialize_close_grade_arm(core, responsive, gate_ready, "monolith")
+
+    root = set(arm_result["workflow_run_ids"])
+    eligible = set(arm_result["performance_eligible_workflow_run_ids"])
+    error_ids = {entry["workflow_run_id"] for entry in evidence_errors}
+
+    assert root == {str(rid) for rid in paired_ids + [gate_ready_only_id]}
+    assert eligible | error_ids == root
+    assert not (eligible & error_ids)
+    assert str(gate_ready_only_id) in error_ids
+    assert str(gate_ready_only_id) not in eligible
+
+    _assert_root_eligible_error_invariant(arm_result, evidence_errors, "monolith")
+
+
+def test_close_grade_materialization_identity_collision_recorded_not_dropped():
+    """AC2: a duplicate `workflow_run_id` with disagreeing content
+    (`_detect_run_attempt_identity_collisions`'s existing fail-closed
+    semantics) is recorded in evidence_errors with reason
+    `run_attempt_identity_collision`, never silently absorbed via
+    `_comparable_cohort()`'s largest-fingerprint-group majority
+    selection."""
+    run_id = 41001
+    core = [
+        {
+            "workflow_run_id": run_id,
+            "job": "e2e-core",
+            "run_attempt": 1,
+            "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 60000}],
+        },
+        {
+            "workflow_run_id": run_id,
+            "job": "e2e-core",
+            "run_attempt": 1,
+            "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 99999}],  # disagreeing content
+        },
+    ]
+    responsive = _close_grade_paired_baselines("e2e-responsive-matrix", [run_id])
+    gate_ready = _close_grade_gate_ready_baselines([run_id])
+
+    arm_result, evidence_errors = _materialize_close_grade_arm(core, responsive, gate_ready, "split")
+
+    assert arm_result["performance_eligible_workflow_run_ids"] == []
+    reasons = {entry["reason"] for entry in evidence_errors if entry["workflow_run_id"] == str(run_id)}
+    assert "run_attempt_identity_collision" in reasons
+    _assert_root_eligible_error_invariant(arm_result, evidence_errors, "split")
+
+
+def test_close_grade_materialization_dedupe_by_workflow_run_id_never_double_counts():
+    """AC2: a rerun attempt (same workflow_run_id, run_attempt 2) never
+    inflates the eligible set -- dedupe by workflow_run_id via the
+    existing `_select_initial_attempt_baselines` policy applies here too."""
+    run_id = 51001
+    core = _close_grade_paired_baselines("e2e-core", [run_id])
+    core.append(
+        {
+            **core[0],
+            "run_attempt": 2,
+            "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 61000}],
+        }
+    )
+    responsive = _close_grade_paired_baselines("e2e-responsive-matrix", [run_id])
+    gate_ready = _close_grade_gate_ready_baselines([run_id])
+
+    arm_result, evidence_errors = _materialize_close_grade_arm(core, responsive, gate_ready, "monolith")
+
+    assert arm_result["workflow_run_ids"] == [str(run_id)]
+    assert arm_result["performance_eligible_workflow_run_ids"] == [str(run_id)]
+    assert evidence_errors == []
+
+
+def test_close_grade_materialization_fingerprint_mismatch_recorded_in_evidence_errors():
+    """AC2: `_comparable_cohort()`'s majority-fingerprint selection is NOT
+    used for close-grade eligibility -- a fingerprint mismatch between the
+    paired e2e-core/e2e-responsive-matrix runs is recorded in
+    evidence_errors and excluded, never silently accepted nor silently
+    majority-voted away."""
+    run_id = 61001
+    core = _close_grade_paired_baselines("e2e-core", [run_id])
+    responsive = _close_grade_paired_baselines(
+        "e2e-responsive-matrix",
+        [run_id],
+        fingerprint_overrides={run_id: {"node_version": "18.0.0"}},
+    )
+    gate_ready = _close_grade_gate_ready_baselines([run_id])
+
+    arm_result, evidence_errors = _materialize_close_grade_arm(core, responsive, gate_ready, "split")
+
+    assert arm_result["performance_eligible_workflow_run_ids"] == []
+    reasons = {entry["reason"] for entry in evidence_errors if entry["workflow_run_id"] == str(run_id)}
+    assert "fingerprint_mismatch_core_vs_responsive" in reasons
+
+
+def test_close_grade_materialization_fingerprint_placeholder_recorded_in_evidence_errors():
+    """AC2: a placeholder fingerprint field (#2159 P1-2's `_is_placeholder`)
+    excludes a root member with an explicit evidence_errors reason,
+    mirroring `_fingerprint_has_placeholder`'s existing fail-closed
+    contract."""
+    run_id = 71001
+    core = _close_grade_paired_baselines(
+        "e2e-core", [run_id], fingerprint_overrides={run_id: {"lockfile_hash": "unknown"}}
+    )
+    responsive = _close_grade_paired_baselines("e2e-responsive-matrix", [run_id])
+    gate_ready = _close_grade_gate_ready_baselines([run_id])
+
+    arm_result, evidence_errors = _materialize_close_grade_arm(core, responsive, gate_ready, "monolith")
+
+    assert arm_result["performance_eligible_workflow_run_ids"] == []
+    reasons = {entry["reason"] for entry in evidence_errors if entry["workflow_run_id"] == str(run_id)}
+    assert "fingerprint_placeholder_or_missing" in reasons
+
+
+def test_close_grade_materialization_no_silent_drop_of_root_run_ids_missing_pair():
+    """AC2: a run present only in the e2e-core lane (missing its
+    e2e-responsive-matrix pair) is recorded in evidence_errors via
+    `_pair_by_workflow_run_id`'s existing contract, never silently dropped
+    from the root run set."""
+    paired_id = 81001
+    unpaired_id = 81002
+    core = _close_grade_paired_baselines("e2e-core", [paired_id, unpaired_id])
+    responsive = _close_grade_paired_baselines("e2e-responsive-matrix", [paired_id])
+    gate_ready = _close_grade_gate_ready_baselines([paired_id, unpaired_id])
+
+    arm_result, evidence_errors = _materialize_close_grade_arm(core, responsive, gate_ready, "split")
+
+    assert str(unpaired_id) in arm_result["workflow_run_ids"]
+    assert str(unpaired_id) not in arm_result["performance_eligible_workflow_run_ids"]
+    error_ids = {entry["workflow_run_id"] for entry in evidence_errors}
+    assert str(unpaired_id) in error_ids
+
+
+def test_receipt_build_close_grade_result_v1_field_shape_matches_2424_consumer_contract():
+    """AC3: `build_close_grade_receipt` produces a
+    CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 document with every field #2424's
+    consumer contract requires, byte-matched field names."""
+    run_ids_before = [91001, 91002]
+    run_ids_after = [92001, 92002]
+    fixture = {
+        "issue_number": 2423,
+        "pr_number": 9999,
+        "before": {
+            "commit_sha": "a" * 40,
+            "core_baselines": _close_grade_paired_baselines("e2e-core", run_ids_before),
+            "responsive_baselines": _close_grade_paired_baselines("e2e-responsive-matrix", run_ids_before),
+            "gate_ready_baselines": _close_grade_gate_ready_baselines(run_ids_before),
+        },
+        "after": {
+            "commit_sha": "b" * 40,
+            "core_baselines": _close_grade_paired_baselines("e2e-core", run_ids_after),
+            "responsive_baselines": _close_grade_paired_baselines("e2e-responsive-matrix", run_ids_after),
+            "gate_ready_baselines": _close_grade_gate_ready_baselines(run_ids_after),
+        },
+    }
+
+    receipt = build_close_grade_receipt(
+        fixture,
+        manifest_sha256="sha256:" + "f" * 64,
+        trusted_functional_evidence={
+            "ci_verdict_summary_artifact_id": "12345",
+            "ci_verdict_summary_file_sha256": "sha256:" + "0" * 64,
+            "github_artifact_digest": "sha256:" + "1" * 64,
+            "expected_head_sha": "b" * 40,
+        },
+        validation_decision={"semantic_valid": True, "approval_eligible": True},
+        exit_code=0,
+    )
+
+    assert receipt["schema"] == "CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1"
+    for key in (
+        "experiment_identity",
+        "manifest_sha256",
+        "run_set_digest",
+        "materialization_policy",
+        "arms",
+        "evidence_errors",
+        "performance_assessment",
+        "trusted_functional_evidence",
+        "validation",
+        "exit_code",
+    ):
+        assert key in receipt, f"missing #2424 consumer-contract field: {key}"
+
+    for arm in ("monolith", "split"):
+        assert arm in receipt["arms"]
+        assert "workflow_run_ids" in receipt["arms"][arm]
+        assert "performance_eligible_workflow_run_ids" in receipt["arms"][arm]
+
+    assert receipt["arms"]["monolith"]["workflow_run_ids"] == [str(rid) for rid in run_ids_before]
+    assert receipt["arms"]["split"]["workflow_run_ids"] == [str(rid) for rid in run_ids_after]
+    assert receipt["evidence_errors"] == []
+    assert receipt["performance_assessment"]["complete"] is True
+    assert receipt["trusted_functional_evidence"]["ci_verdict_summary_file_sha256"] == "sha256:" + "0" * 64
+    assert receipt["trusted_functional_evidence"]["github_artifact_digest"] == "sha256:" + "1" * 64
+    assert (
+        receipt["trusted_functional_evidence"]["ci_verdict_summary_file_sha256"]
+        != receipt["trusted_functional_evidence"]["github_artifact_digest"]
+    ), "AC4: ci_verdict_summary_file_sha256 and github_artifact_digest must never be conflated"
+    assert receipt["validation"] == {"semantic_valid": True, "approval_eligible": True}
+    assert receipt["exit_code"] == 0
+
+
+def test_close_grade_result_receipt_evidence_errors_prevent_performance_assessment_complete():
+    """AC2/AC3: a non-empty evidence_errors list forces
+    performance_assessment.complete to false -- a receipt never reports
+    "complete" while root members were excluded."""
+    run_id_before = 93001
+    fixture = {
+        "issue_number": 2423,
+        "pr_number": 9999,
+        "before": {
+            "commit_sha": "a" * 40,
+            "core_baselines": _close_grade_paired_baselines("e2e-core", [run_id_before]),
+            "responsive_baselines": [],  # unpaired -> evidence_errors
+            "gate_ready_baselines": _close_grade_gate_ready_baselines([run_id_before]),
+        },
+        "after": {
+            "commit_sha": "b" * 40,
+            "core_baselines": _close_grade_paired_baselines("e2e-core", [94001]),
+            "responsive_baselines": _close_grade_paired_baselines("e2e-responsive-matrix", [94001]),
+            "gate_ready_baselines": _close_grade_gate_ready_baselines([94001]),
+        },
+    }
+
+    receipt = build_close_grade_receipt(
+        fixture,
+        manifest_sha256="sha256:" + "0" * 64,
+        trusted_functional_evidence={},
+        validation_decision=None,
+        exit_code=1,
+    )
+
+    assert receipt["evidence_errors"], "expected a non-empty evidence_errors list"
+    assert receipt["performance_assessment"]["complete"] is False
+    assert receipt["validation"] == {"semantic_valid": False, "approval_eligible": False}
 
 
 if __name__ == "__main__":

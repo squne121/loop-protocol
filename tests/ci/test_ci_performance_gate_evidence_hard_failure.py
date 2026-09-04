@@ -21,6 +21,7 @@ This file demonstrates the mechanism two ways:
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -205,6 +206,64 @@ _COHORT_FIXTURE_COMMON = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# #2423 AC4/AC5: trusted ci_verdict_summary_v2 binding fixtures. Written
+# per-test into `tmp_path` (never a shared fixture file) so each test's
+# trusted-artifact content stays scoped to its own assertions -- this file's
+# Allowed Paths boundary does not include
+# .claude/skills/ci-test-performance/scripts/fixtures/, so a real trusted
+# artifact is constructed inline instead of reusing that directory's
+# existing trusted_ci_verdict_summary_v2_artifact.json fixture.
+# --------------------------------------------------------------------------- #
+_TRUSTED_EXPECTED_HEAD_SHA = "b" * 40
+
+
+def _write_trusted_ci_verdict_summary_artifact(tmp_path, expected_head_sha: str = _TRUSTED_EXPECTED_HEAD_SHA):
+    """Writes a `ci_verdict_summary_v2` artifact whose shape satisfies
+    `validate_ci_performance_assessment_v2.py::_check_trusted_functional_
+    artifact` for the `functional_evidence.ci_verdict_summary_ref` declared
+    in `_COHORT_FIXTURE_COMMON` above (`check_run_id: 1`, `classification:
+    required`, `status: completed`, `conclusion: success`, `head_sha_match:
+    True`). Returns `(path, file_sha256)` -- `file_sha256` is the sha256 of
+    the FILE's own raw bytes (`ci_verdict_summary_file_sha256`), distinct
+    from any GitHub Actions artifact-bundle-level digest (AC4)."""
+    artifact = {
+        "schema": "ci_verdict_summary_v2",
+        "schema_version": 2,
+        "generated_at": "2026-08-15T00:00:00+00:00",
+        "repository": "squne121/loop-protocol",
+        "workflow_run_id": 555000111,
+        "workflow_run_attempt": 1,
+        "event_name": "pull_request",
+        "expected_head_sha": expected_head_sha,
+        "head_sha": expected_head_sha,
+        "overall_status": "merge_ready",
+        "next_action": "none",
+        "artifact_refs": [],
+        "checks": [
+            {
+                "name": "typecheck",
+                "workflow": "ci",
+                "check_run_id": 1,
+                "status": "completed",
+                "conclusion": "success",
+                "classification": "required",
+                "head_sha": expected_head_sha,
+                "expected_head_sha": expected_head_sha,
+                "head_sha_match": True,
+                "blocking_merge_ready": False,
+                "failure_reason": "none",
+                "artifact_refs": [],
+            }
+        ],
+    }
+    path = tmp_path / "trusted_ci_verdict_summary_v2.json"
+    raw_bytes = json.dumps(artifact, indent=2).encode("utf-8")
+    path.write_bytes(raw_bytes)
+    file_sha256 = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+    return path, file_sha256
+
+
 def test_evidence_gate_insufficient_samples_never_fabricates_a_claim():
     """GIVEN a cohort fixture with fewer than MIN_COHORT_RUN_COUNT
     post-filter samples for the `before` arm WHEN `run_evidence_gate` runs
@@ -270,11 +329,15 @@ def test_evidence_gate_cli_subprocess_exits_non_zero_on_insufficient_evidence(tm
     assert written["gate_status"] == "insufficient_evidence"
 
 
-def test_evidence_gate_cli_subprocess_exits_zero_on_sufficient_evidence(tmp_path):
+def test_evidence_gate_cli_subprocess_exits_zero_on_sufficient_evidence_with_trusted_binding(tmp_path):
     """Subprocess-level proof that the SAME CLI invocation exits 0 and
     writes a `gate_status: complete` result with a real claim once evidence
-    is sufficient -- the production path is not permanently hard-wired to
-    fail regardless of the data it is given."""
+    is sufficient AND the CLI is given a real trusted `ci_verdict_summary_v2`
+    binding (#2423 AC4: exit 0 now additionally requires `approval_eligible`,
+    which requires a real --ci-verdict-summary/--expected-head-sha/
+    --expected-ci-verdict-summary-file-sha256 binding -- not merely
+    sufficient sample counts) -- the production path is not permanently
+    hard-wired to fail regardless of the data/binding it is given."""
     fixture = dict(_COHORT_FIXTURE_COMMON)
     fixture["before"] = _arm_fixture("a" * 40, provider_count=20, gate_ready_count=20, start_id=9000, base_ms=270_000)
     fixture["after"] = _arm_fixture("b" * 40, provider_count=20, gate_ready_count=20, start_id=19000, base_ms=100_000)
@@ -282,9 +345,30 @@ def test_evidence_gate_cli_subprocess_exits_zero_on_sufficient_evidence(tmp_path
     fixture_path = tmp_path / "cohort_fixture.json"
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
     output_path = tmp_path / "gate_result.json"
+    receipt_path = tmp_path / "close_grade_receipt.json"
+    trusted_summary_path, trusted_summary_file_sha256 = _write_trusted_ci_verdict_summary_artifact(tmp_path)
 
     result = subprocess.run(
-        [sys.executable, str(_MODULE_PATH), "--cohort-fixture", str(fixture_path), "--output", str(output_path)],
+        [
+            sys.executable,
+            str(_MODULE_PATH),
+            "--cohort-fixture",
+            str(fixture_path),
+            "--output",
+            str(output_path),
+            "--receipt-output",
+            str(receipt_path),
+            "--ci-verdict-summary",
+            str(trusted_summary_path),
+            "--expected-head-sha",
+            _TRUSTED_EXPECTED_HEAD_SHA,
+            "--expected-ci-verdict-summary-file-sha256",
+            trusted_summary_file_sha256,
+            "--ci-verdict-summary-artifact-id",
+            "555000111",
+            "--github-artifact-digest",
+            "sha256:" + "9" * 64,
+        ],
         capture_output=True,
         text=True,
         timeout=30,
@@ -293,3 +377,82 @@ def test_evidence_gate_cli_subprocess_exits_zero_on_sufficient_evidence(tmp_path
     written = json.loads(output_path.read_text(encoding="utf-8"))
     assert written["gate_status"] == "complete"
     assert written["assessment"]["claim"]["kind"] != "none"
+    assert written["validation_result"]["approval_eligible"] is True
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["schema"] == "CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1"
+    assert receipt["exit_code"] == 0
+    assert receipt["validation"] == {"semantic_valid": True, "approval_eligible": True}
+    assert receipt["trusted_functional_evidence"]["ci_verdict_summary_file_sha256"] == trusted_summary_file_sha256
+    assert receipt["trusted_functional_evidence"]["github_artifact_digest"] == "sha256:" + "9" * 64
+
+
+def test_close_grade_cli_exit_code_zero_requires_approval_eligible_not_only_semantic_valid(tmp_path):
+    """#2423 AC4: sufficient evidence + a semantically valid built
+    assessment is NOT enough for exit code 0 when no trusted
+    `ci_verdict_summary_v2` binding is supplied -- `approval_eligible` must
+    independently be true. Exit code 3 (semantic_valid but not
+    approval_eligible) is distinct from exit codes 1 (insufficient_evidence)
+    and 2 (semantic invalid)."""
+    fixture = dict(_COHORT_FIXTURE_COMMON)
+    fixture["before"] = _arm_fixture("a" * 40, provider_count=20, gate_ready_count=20, start_id=9000, base_ms=270_000)
+    fixture["after"] = _arm_fixture("b" * 40, provider_count=20, gate_ready_count=20, start_id=19000, base_ms=100_000)
+
+    fixture_path = tmp_path / "cohort_fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    output_path = tmp_path / "gate_result.json"
+
+    # No --ci-verdict-summary/--expected-head-sha supplied at all (the
+    # PRE-#2423 CLI invocation shape) -- approval_eligible must be false.
+    result = subprocess.run(
+        [sys.executable, str(_MODULE_PATH), "--cohort-fixture", str(fixture_path), "--output", str(output_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 3, result.stderr
+    assert result.returncode not in (0, 1, 2, 5)
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert written["gate_status"] == "complete"
+    assert written["validation_result"]["semantic_valid"] is True
+    assert written["validation_result"]["approval_eligible"] is False
+
+
+def test_close_grade_cli_approval_eligible_false_head_sha_mismatch_produces_exit_code_three(tmp_path):
+    """#2423 AC4: a trusted artifact IS supplied but its `expected_head_sha`
+    does not match the `--expected-head-sha` the caller asserts -- the
+    validator's existing `functional_evidence_artifact_head_sha_mismatch`
+    blocker must still translate into a non-zero close-grade CLI exit code,
+    not a silently accepted exit 0."""
+    fixture = dict(_COHORT_FIXTURE_COMMON)
+    fixture["before"] = _arm_fixture("a" * 40, provider_count=20, gate_ready_count=20, start_id=9000, base_ms=270_000)
+    fixture["after"] = _arm_fixture("b" * 40, provider_count=20, gate_ready_count=20, start_id=19000, base_ms=100_000)
+
+    fixture_path = tmp_path / "cohort_fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    output_path = tmp_path / "gate_result.json"
+    trusted_summary_path, trusted_summary_file_sha256 = _write_trusted_ci_verdict_summary_artifact(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_MODULE_PATH),
+            "--cohort-fixture",
+            str(fixture_path),
+            "--output",
+            str(output_path),
+            "--ci-verdict-summary",
+            str(trusted_summary_path),
+            "--expected-head-sha",
+            "c" * 40,  # mismatches both the artifact and the ref's "b" * 40
+            "--expected-ci-verdict-summary-file-sha256",
+            trusted_summary_file_sha256,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 3, result.stderr
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert written["validation_result"]["approval_eligible"] is False
+    assert "functional_evidence_artifact_head_sha_mismatch" in written["validation_result"]["blockers"]

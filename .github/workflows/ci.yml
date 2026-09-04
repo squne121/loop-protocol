@@ -98,6 +98,34 @@ on:
           built-in insufficient-evidence smoke fixture.
         type: string
         default: ""
+      # #2423 AC4/AC5 (OWNER controlled-reframe issuecomment-5539310075):
+      # trusted ci_verdict_summary_v2 binding for the close-grade CLI.
+      # Previously the e2e-performance-benchmark-assessment-gate steps
+      # invoked tests/ci/test_ci_performance_gate.py with NO trusted-binding
+      # flags at all, so approval_eligible could never become true through
+      # this route and the CLI's exit code did not even check it. These two
+      # inputs let an operator point the gate at a PREVIOUSLY-UPLOADED
+      # ci_verdict_summary_v2 artifact (e.g. from a prior `ci-verdict-summary`
+      # job run) via the real GitHub Actions Artifacts REST API (artifact ID
+      # -> metadata -> download -> local file -> sha256 -> CLI binding). Both
+      # left empty runs the gate WITHOUT trusted binding (approval_eligible
+      # will be false; the CLI's fail-closed exit code 3, not 0).
+      trusted_ci_verdict_summary_artifact_id:
+        description: >-
+          GitHub Actions artifact ID (integer, from a previously-uploaded
+          ci_verdict_summary_v2 artifact -- e.g. via `gh api
+          repos/OWNER/REPO/actions/artifacts` or the run's "ci-verdict-summary"
+          job's own upload-artifact step output) to bind as AC4 trusted
+          functional evidence. Leave empty to run without trusted binding.
+        type: string
+        default: ""
+      trusted_ci_verdict_summary_expected_head_sha:
+        description: >-
+          Trusted PR/commit head SHA to assert the trusted_ci_verdict_summary_artifact_id
+          artifact's own expected_head_sha field against (AC4). Required
+          whenever trusted_ci_verdict_summary_artifact_id is set.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -2606,6 +2634,16 @@ jobs:
 
   python-test-core:
     runs-on: ubuntu-latest
+    # Issue #2423 AC5: the opt-in e2e-performance-benchmark-assessment-gate
+    # steps below (`run_performance_assessment_gate: true`) need read access
+    # to the GitHub Actions Artifacts REST API to acquire a trusted
+    # ci_verdict_summary_v2 artifact (artifact ID -> metadata -> download).
+    # Minimal, read-only permission addition (mirrors the existing
+    # visual-impact-policy job's own `actions: read` for the same purpose);
+    # no write permission is granted.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -3183,12 +3221,82 @@ jobs:
           print("cohort_fixture_source=built_in_insufficient_evidence_smoke_fixture")
           PY
           fi
-      - name: Run AC11 evidence gate + P0-8 assessment producer (#2159 OWNER ruling issuecomment-5299412215 items 2/3)
-        if: ${{ github.event.inputs.run_performance_assessment_gate == 'true' }}
+      # #2423 AC5 (OWNER controlled-reframe issuecomment-5539310075): real
+      # GitHub Actions/API acquisition path for the trusted ci_verdict_summary_v2
+      # artifact -- artifact ID -> metadata -> download -> local file ->
+      # sha256 -> CLI binding. No new broker/service/daemon: only `gh api`'s
+      # built-in Artifacts REST endpoints (the same primitives
+      # visual-impact-policy's own download-artifact step family already
+      # uses elsewhere in this file). Skipped entirely (steps.*.outputs stay
+      # empty) when trusted_ci_verdict_summary_artifact_id is not supplied --
+      # the next step's fail-closed exit code 3 makes an un-bound run visibly
+      # not approval_eligible rather than silently exit 0.
+      - name: Acquire trusted ci_verdict_summary_v2 artifact (#2423 AC5 GitHub Actions/API binding)
+        if: ${{ github.event.inputs.run_performance_assessment_gate == 'true' && github.event.inputs.trusted_ci_verdict_summary_artifact_id != '' }}
+        id: acquire-trusted-verdict-summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ github.event.inputs.trusted_ci_verdict_summary_artifact_id }}
         run: |
-          uv run --locked python3 tests/ci/test_ci_performance_gate.py \
-            --cohort-fixture e2e_performance_assessment_gate_artifacts/cohort_fixture.json \
+          set -euo pipefail
+          mkdir -p trusted_ci_verdict_summary_v2_artifacts
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" \
+            > trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json
+          ARTIFACT_EXPIRED="$(python3 -c 'import json; print(json.load(open("trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json")).get("expired", False))')"
+          if [ "$ARTIFACT_EXPIRED" = "True" ]; then
+            echo "::error::trusted_ci_verdict_summary_artifact_id=${ARTIFACT_ID} is expired; cannot bind trusted evidence."
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > trusted_ci_verdict_summary_v2_artifacts/artifact.zip
+          unzip -o -q trusted_ci_verdict_summary_v2_artifacts/artifact.zip -d trusted_ci_verdict_summary_v2_artifacts/extracted
+          SUMMARY_FILE="$(find trusted_ci_verdict_summary_v2_artifacts/extracted -name '*ci_verdict_summary_v2*.json' | head -n1)"
+          if [ -z "$SUMMARY_FILE" ]; then
+            echo "::error::no ci_verdict_summary_v2*.json found inside downloaded artifact_id=${ARTIFACT_ID}."
+            exit 1
+          fi
+          cp "$SUMMARY_FILE" trusted_ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
+          FILE_SHA256="sha256:$(sha256sum trusted_ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json | cut -d' ' -f1)"
+          ARTIFACT_DIGEST="$(python3 -c 'import json; print(json.load(open("trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json")).get("digest") or "")')"
+          {
+            echo "trusted_summary_path=trusted_ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json"
+            echo "trusted_summary_file_sha256=${FILE_SHA256}"
+            echo "github_artifact_digest=${ARTIFACT_DIGEST}"
+          } >> "$GITHUB_OUTPUT"
+          echo "acquired trusted ci_verdict_summary_v2 artifact_id=${ARTIFACT_ID} file_sha256=${FILE_SHA256} github_artifact_digest=${ARTIFACT_DIGEST}"
+      - name: Upload trusted ci_verdict_summary_v2 binding artifacts (#2423 AC5)
+        if: ${{ !cancelled() && github.event.inputs.run_performance_assessment_gate == 'true' && github.event.inputs.trusted_ci_verdict_summary_artifact_id != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-performance-benchmark-assessment-gate-trusted-binding-${{ github.run_attempt }}
+          path: trusted_ci_verdict_summary_v2_artifacts/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Run AC11 evidence gate + P0-8 assessment producer + AC3 close-grade receipt (#2159 OWNER ruling issuecomment-5299412215 items 2/3; #2423 AC3/AC4/AC5)
+        if: ${{ github.event.inputs.run_performance_assessment_gate == 'true' }}
+        env:
+          TRUSTED_SUMMARY_PATH: ${{ steps.acquire-trusted-verdict-summary.outputs.trusted_summary_path || '' }}
+          TRUSTED_SUMMARY_FILE_SHA256: ${{ steps.acquire-trusted-verdict-summary.outputs.trusted_summary_file_sha256 || '' }}
+          TRUSTED_GITHUB_ARTIFACT_DIGEST: ${{ steps.acquire-trusted-verdict-summary.outputs.github_artifact_digest || '' }}
+          TRUSTED_ARTIFACT_ID: ${{ github.event.inputs.trusted_ci_verdict_summary_artifact_id }}
+          TRUSTED_EXPECTED_HEAD_SHA: ${{ github.event.inputs.trusted_ci_verdict_summary_expected_head_sha }}
+        run: |
+          set -euo pipefail
+          args=(
+            --cohort-fixture e2e_performance_assessment_gate_artifacts/cohort_fixture.json
             --output e2e_performance_assessment_gate_artifacts/gate_result.json
+            --receipt-output e2e_performance_assessment_gate_artifacts/close_grade_receipt.json
+          )
+          if [ -n "$TRUSTED_SUMMARY_PATH" ]; then
+            args+=(
+              --ci-verdict-summary "$TRUSTED_SUMMARY_PATH"
+              --expected-head-sha "$TRUSTED_EXPECTED_HEAD_SHA"
+              --expected-ci-verdict-summary-file-sha256 "$TRUSTED_SUMMARY_FILE_SHA256"
+              --ci-verdict-summary-artifact-id "$TRUSTED_ARTIFACT_ID"
+              --github-artifact-digest "$TRUSTED_GITHUB_ARTIFACT_DIGEST"
+            )
+          fi
+          uv run --locked python3 tests/ci/test_ci_performance_gate.py "${args[@]}"
       - name: Upload e2e-performance-benchmark-assessment-gate artifact
         if: ${{ !cancelled() && github.event.inputs.run_performance_assessment_gate == 'true' }}
         uses: actions/upload-artifact@v7
