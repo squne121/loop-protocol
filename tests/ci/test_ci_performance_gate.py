@@ -272,18 +272,34 @@ def run_evidence_gate(
         "after": after_gate_ready_evidence_errors,
     }
 
+    # #2423 fix_delta P0-2 (OWNER REQUEST_CHANGES issuecomment-5540705404):
+    # a raw core/responsive/gate-ready record entirely missing
+    # `workflow_run_id` is invisible to every `workflow_run_id`-keyed
+    # bookkeeping path above -- see `_missing_workflow_run_id_raw_record_
+    # count`'s own docstring. Fail-close the whole arm when this happens,
+    # rather than letting the record silently vanish from both the sample
+    # count and every evidence_errors list.
+    before_raw_missing_workflow_run_id_count = _missing_workflow_run_id_raw_record_count(
+        before_core, before_responsive, before_gate_ready
+    )
+    after_raw_missing_workflow_run_id_count = _missing_workflow_run_id_raw_record_count(
+        after_core, after_responsive, after_gate_ready
+    )
+
     try:
         _evidence_readiness_hard_check_post_filter(
             before_provider_count,
             before_evidence_errors,
             {"before": before_gate_ready_count},
             gate_ready_evidence_errors={"before": before_gate_ready_evidence_errors},
+            raw_missing_workflow_run_id_counts={"before": before_raw_missing_workflow_run_id_count},
         )
         _evidence_readiness_hard_check_post_filter(
             after_provider_count,
             after_evidence_errors,
             {"after": after_gate_ready_count},
             gate_ready_evidence_errors={"after": after_gate_ready_evidence_errors},
+            raw_missing_workflow_run_id_counts={"after": after_raw_missing_workflow_run_id_count},
         )
     except EvidenceInsufficientError as exc:
         return {
@@ -513,6 +529,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
             trusted_functional_evidence=trusted_functional_evidence,
             validation_decision=validation_decision,
             exit_code=exit_code,
+            gate_status=result["gate_status"],
             experiment_identity=args.experiment_identity,
         )
         os.makedirs(os.path.dirname(args.receipt_output) or ".", exist_ok=True)
@@ -865,6 +882,33 @@ def _job_duration_seconds(baselines: list[dict]) -> list[float]:
 def _single_baseline_duration_seconds(baseline: dict) -> float | None:
     durations = _job_duration_seconds([baseline])
     return durations[0] if durations else None
+
+
+# --------------------------------------------------------------------------- #
+# #2423 fix_delta P0-2 (OWNER REQUEST_CHANGES issuecomment-5540705404):
+# a raw baseline record that is ENTIRELY missing `workflow_run_id` has no
+# identity any `workflow_run_id`-keyed bookkeeping (`_pair_by_workflow_
+# run_id`'s `all_ids`, `_select_initial_attempt_baselines`'s `by_id`
+# grouping, `_root_workflow_run_ids`) can reference -- every one of those
+# call sites independently `continue`s past it, so it silently vanishes
+# from BOTH the eligible count AND `evidence_errors` with no trace at all
+# (a real false-green risk: an arm could clear MIN_COHORT_RUN_COUNT and
+# report zero evidence_errors purely because a raw identity-less record
+# was never counted either way). Per OWNER: never invent a fake
+# `workflow_run_id` to give such a record a slot in the per-id
+# bookkeeping; callers instead use this raw COUNT to fail-close the WHOLE
+# arm/gate outright.
+# --------------------------------------------------------------------------- #
+def _missing_workflow_run_id_raw_record_count(*baseline_lists: list[dict]) -> int:
+    """Counts raw baseline records across `baseline_lists` whose
+    `workflow_run_id` key is missing or `None` -- BEFORE any
+    pairing/attempt/fingerprint filtering."""
+    return sum(
+        1
+        for baselines in baseline_lists
+        for baseline in baselines
+        if baseline.get("workflow_run_id") is None
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1246,6 +1290,7 @@ def _evidence_readiness_hard_check_post_filter(
     provider_evidence_errors: list[dict],
     gate_ready_post_filter_counts: dict[str, int],
     gate_ready_evidence_errors: dict[str, list[dict]] | None = None,
+    raw_missing_workflow_run_id_counts: dict[str, int] | None = None,
     min_count: int = MIN_COHORT_RUN_COUNT,
 ) -> None:
     """#2159 P0-6 AC11 extension: the close-verification hard-check must
@@ -1266,7 +1311,17 @@ def _evidence_readiness_hard_check_post_filter(
     `min_count` but still has a non-empty exclusion list (a missing/invalid
     `run_attempt`, a duplicate `workflow_run_id`, or an identity collision)
     is STILL rejected here, never silently treated as sufficient just
-    because the raw count happened to clear the floor."""
+    because the raw count happened to clear the floor.
+
+    #2423 fix_delta P0-2 (OWNER REQUEST_CHANGES issuecomment-5540705404):
+    `raw_missing_workflow_run_id_counts` (`{role: count}`) additionally
+    fail-closes a role whose RAW core/responsive/gate-ready input included
+    ANY record entirely missing `workflow_run_id` -- such a record cannot
+    appear in `provider_evidence_errors` / `gate_ready_evidence_errors`
+    (see `_missing_workflow_run_id_raw_record_count`'s own docstring for
+    why), so without this explicit count it would silently vanish from
+    both the sample count AND every evidence_errors list, even though the
+    post-filter counts and evidence_errors above are otherwise clean."""
     problems: dict[str, object] = {}
     if provider_post_filter_count < min_count:
         problems["provider_post_filter_sample_count"] = provider_post_filter_count
@@ -1278,6 +1333,9 @@ def _evidence_readiness_hard_check_post_filter(
     for role, errors in (gate_ready_evidence_errors or {}).items():
         if errors:
             problems[f"gate_ready_evidence_errors[{role}]"] = errors
+    for role, count in (raw_missing_workflow_run_id_counts or {}).items():
+        if count:
+            problems[f"raw_missing_workflow_run_id_count[{role}]"] = count
     if problems:
         raise EvidenceInsufficientError(
             f"insufficient POST-FILTER comparable-cohort evidence (need >= {min_count} "
@@ -1375,6 +1433,28 @@ def _materialize_close_grade_arm(
         if _fingerprint(core) != _fingerprint(responsive):
             _record(workflow_run_id, "fingerprint_mismatch_core_vs_responsive")
 
+    # #2423 fix_delta P0-3 (OWNER REQUEST_CHANGES issuecomment-5540705404):
+    # the per-pair check above only catches SAME-run core-vs-responsive
+    # fingerprint disagreement. It does NOT catch two internally-consistent
+    # -but-DIFFERENT runs within the SAME arm (run A core==responsive==X,
+    # run B core==responsive==Y, X != Y) -- that is cross-run provenance
+    # drift WITHIN one arm's root run set, and the per-pair check alone
+    # silently accepts it. Across every pair that passed the per-run check
+    # above, the WITHIN_COHORT_REQUIRED_EQUAL fingerprint must take exactly
+    # ONE distinct value for the whole arm; if not, fail-close every one of
+    # those pairs (never select a majority/largest fingerprint group --
+    # `_comparable_cohort()`'s own majority-selection behavior is
+    # intentionally left untouched and is NOT reused here, per this
+    # module's #2423 AC1/AC2/AC3 section docstring above).
+    clean_pair_fingerprints: dict[object, tuple] = {
+        workflow_run_id: _fingerprint(core)
+        for workflow_run_id, core, _responsive in pairs
+        if workflow_run_id not in error_ids
+    }
+    if len(set(clean_pair_fingerprints.values())) > 1:
+        for workflow_run_id in clean_pair_fingerprints:
+            _record(workflow_run_id, "arm_wide_fingerprint_drift_across_runs")
+
     gate_ready_selected, gate_ready_selection_errors = _select_initial_attempt_baselines(gate_ready_baselines)
     for err in gate_ready_selection_errors:
         if err["workflow_run_id"] not in error_ids:
@@ -1405,6 +1485,22 @@ def _materialize_close_grade_arm(
             _record(workflow_run_id, "missing_gate_ready_evidence")
 
     eligible_ids = [wid for wid in root_ids if wid not in error_ids]
+
+    # #2423 fix_delta P0-2 (OWNER REQUEST_CHANGES issuecomment-5540705404):
+    # a raw core/responsive/gate-ready record entirely missing
+    # `workflow_run_id` cannot be given a slot in the per-id
+    # evidence_errors bookkeeping above (see
+    # `_missing_workflow_run_id_raw_record_count`'s own docstring for why
+    # -- inventing a fake `workflow_run_id` to force it into that
+    # bookkeeping is explicitly rejected per OWNER). Instead, treat the
+    # WHOLE arm as fail-closed: every id that would otherwise have been
+    # eligible is excluded with a shared reason, so this arm's
+    # `performance_eligible_workflow_run_ids` becomes empty rather than
+    # silently proceeding as if the raw identity gap did not exist.
+    if _missing_workflow_run_id_raw_record_count(core_baselines, responsive_baselines, gate_ready_baselines):
+        for workflow_run_id in eligible_ids:
+            _record(workflow_run_id, "arm_fail_closed_raw_record_missing_workflow_run_id")
+        eligible_ids = []
 
     arm_result = {
         "workflow_run_ids": [str(wid) for wid in root_ids],
@@ -1454,6 +1550,7 @@ def build_close_grade_receipt(
     trusted_functional_evidence: dict,
     validation_decision: dict | None,
     exit_code: int,
+    gate_status: str,
     experiment_identity: str | None = None,
 ) -> dict:
     """#2423 AC3: assembles `CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1`, the
@@ -1476,7 +1573,25 @@ def build_close_grade_receipt(
     `test_p50_gate_ready_latency_not_regressed`'s `cohort_role` usage). A
     real #2422 manifest reference supersedes this stand-in as a follow-up,
     without changing this function's OUTPUT field names/shape (#2424's own
-    Stop Condition on that renegotiation)."""
+    Stop Condition on that renegotiation).
+
+    #2423 fix_delta P0-1 (OWNER REQUEST_CHANGES issuecomment-5540705404):
+    `gate_status` (the caller's real `run_evidence_gate()` result's
+    `gate_status` field, `"insufficient_evidence" | "complete"`) is now a
+    REQUIRED keyword-only argument, and `performance_assessment.complete`
+    is derived SOLELY from `gate_status == "complete"` -- this function no
+    longer re-derives completeness locally from its own
+    `_materialize_close_grade_arm` evidence_errors/eligible-id bookkeeping
+    (the pre-fix_delta rule -- "evidence_errors empty AND each arm has
+    >= 1 eligible run" -- ignored `MIN_COHORT_RUN_COUNT` entirely: a
+    2-run/arm otherwise-clean fixture would have incorrectly reported
+    `complete: True` here even though `run_evidence_gate`'s real
+    `gate_status` was `insufficient_evidence`, i.e. exit code 1). The
+    per-arm `evidence_errors` this function still computes remain the
+    single source of truth for AC2's root/eligible-set invariant, but are
+    deliberately NOT cross-checked against `gate_status` -- production
+    `run_evidence_gate()` is the one and only authority for
+    `performance_assessment.complete`."""
     before = fixture["before"]
     after = fixture["after"]
 
@@ -1505,11 +1620,7 @@ def build_close_grade_receipt(
             f"{str(before.get('commit_sha', ''))[:12]}-{str(after.get('commit_sha', ''))[:12]}"
         )
 
-    complete = (
-        not evidence_errors
-        and bool(monolith_result["performance_eligible_workflow_run_ids"])
-        and bool(split_result["performance_eligible_workflow_run_ids"])
-    )
+    complete = gate_status == "complete"
 
     validation_decision = validation_decision or {}
 
@@ -2014,6 +2125,14 @@ def test_receipt_build_close_grade_result_v1_field_shape_matches_2424_consumer_c
         },
         validation_decision={"semantic_valid": True, "approval_eligible": True},
         exit_code=0,
+        # #2423 fix_delta P0-1: `gate_status` is a REQUIRED explicit
+        # caller-supplied value (production supplies the real
+        # `run_evidence_gate()` result); this shape-only unit test passes
+        # "complete" directly since it is not itself exercising the
+        # single-source-of-truth wiring (see the dedicated P0-1 regression
+        # tests in test_ci_performance_gate_evidence_hard_failure.py for
+        # that full production-path proof).
+        gate_status="complete",
     )
 
     assert receipt["schema"] == "CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1"
@@ -2050,10 +2169,20 @@ def test_receipt_build_close_grade_result_v1_field_shape_matches_2424_consumer_c
     assert receipt["exit_code"] == 0
 
 
-def test_close_grade_result_receipt_evidence_errors_prevent_performance_assessment_complete():
-    """AC2/AC3: a non-empty evidence_errors list forces
-    performance_assessment.complete to false -- a receipt never reports
-    "complete" while root members were excluded."""
+def test_close_grade_result_receipt_complete_sourced_from_gate_status_not_local_evidence_errors():
+    """#2423 fix_delta P0-1 (OWNER REQUEST_CHANGES issuecomment-5540705404):
+    `performance_assessment.complete` is driven SOLELY by the caller-
+    supplied `gate_status`, never re-derived locally from this receipt's
+    own `evidence_errors`/eligible-id bookkeeping. Proven two ways on the
+    SAME evidence-errors-non-empty fixture: (1) `gate_status=
+    "insufficient_evidence"` (the value production's `run_evidence_gate()`
+    would realistically compute here, since an unpaired-responsive arm
+    also fails AC11's post-filter hard check) -> complete is False; (2)
+    `gate_status="complete"` passed explicitly -> complete is True EVEN
+    THOUGH `evidence_errors` is still non-empty -- demonstrating this
+    function performs no cross-check against its own evidence_errors at
+    all, per OWNER's "do not re-derive performance completeness inside
+    the builder" instruction."""
     run_id_before = 93001
     fixture = {
         "issue_number": 2423,
@@ -2072,17 +2201,34 @@ def test_close_grade_result_receipt_evidence_errors_prevent_performance_assessme
         },
     }
 
-    receipt = build_close_grade_receipt(
+    insufficient_receipt = build_close_grade_receipt(
         fixture,
         manifest_sha256="sha256:" + "0" * 64,
         trusted_functional_evidence={},
         validation_decision=None,
         exit_code=1,
+        gate_status="insufficient_evidence",
     )
+    assert insufficient_receipt["evidence_errors"], "expected a non-empty evidence_errors list"
+    assert insufficient_receipt["performance_assessment"]["complete"] is False
+    assert insufficient_receipt["validation"] == {"semantic_valid": False, "approval_eligible": False}
 
-    assert receipt["evidence_errors"], "expected a non-empty evidence_errors list"
-    assert receipt["performance_assessment"]["complete"] is False
-    assert receipt["validation"] == {"semantic_valid": False, "approval_eligible": False}
+    complete_receipt = build_close_grade_receipt(
+        fixture,
+        manifest_sha256="sha256:" + "0" * 64,
+        trusted_functional_evidence={},
+        validation_decision={"semantic_valid": True, "approval_eligible": True},
+        exit_code=0,
+        gate_status="complete",
+    )
+    assert complete_receipt["evidence_errors"] == insufficient_receipt["evidence_errors"], (
+        "the receipt's own materializer evidence_errors must be identical regardless of "
+        "gate_status -- only performance_assessment.complete differs"
+    )
+    assert complete_receipt["performance_assessment"]["complete"] is True, (
+        "P0-1: complete must follow the passed gate_status alone, decoupled from this "
+        "receipt's own (still non-empty) evidence_errors"
+    )
 
 
 if __name__ == "__main__":

@@ -3237,8 +3237,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_ID: ${{ github.event.inputs.trusted_ci_verdict_summary_artifact_id }}
+          EXPECTED_HEAD_SHA: ${{ github.event.inputs.trusted_ci_verdict_summary_expected_head_sha }}
         run: |
           set -euo pipefail
+          # #2423 fix_delta P1-4 (OWNER REQUEST_CHANGES issuecomment-5540705404):
+          # an artifact_id without an expected head SHA to bind it against is
+          # fail-closed here -- never silently acquired and forwarded
+          # unbound (the downstream CLI's own fail-closed exit code 3 only
+          # fires once a `--ci-verdict-summary` path is actually supplied,
+          # so an empty EXPECTED_HEAD_SHA must not reach that point at all).
+          if [ -z "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error::trusted_ci_verdict_summary_artifact_id=${ARTIFACT_ID} was supplied without trusted_ci_verdict_summary_expected_head_sha; refusing to acquire an unbound trusted artifact."
+            exit 1
+          fi
           mkdir -p trusted_ci_verdict_summary_v2_artifacts
           gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" \
             > trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json
@@ -3247,14 +3258,45 @@ jobs:
             echo "::error::trusted_ci_verdict_summary_artifact_id=${ARTIFACT_ID} is expired; cannot bind trusted evidence."
             exit 1
           fi
+          # #2423 fix_delta P1-4: the artifact GET response alone (expired
+          # only) does not prove this is the RIGHT artifact -- verify the
+          # metadata `name` matches the `ci-verdict-summary-v2-` naming
+          # contract this workflow's own `ci-verdict-summary` job uses (see
+          # the "Upload ci_verdict_summary_v2 artifact" step's own `name:`
+          # field below) AND that the artifact's OWN `workflow_run.head_sha`
+          # (the run that actually uploaded it, per the Artifacts REST API
+          # response shape) equals the trusted expected head SHA -- an
+          # artifact_id pointing at a stale/unrelated run must fail-closed
+          # here rather than being silently bound.
+          ARTIFACT_NAME="$(python3 -c 'import json; print(json.load(open("trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json")).get("name", ""))')"
+          case "$ARTIFACT_NAME" in
+            ci-verdict-summary-v2-*) ;;
+            *)
+              echo "::error::trusted_ci_verdict_summary_artifact_id=${ARTIFACT_ID} has artifact name='${ARTIFACT_NAME}', which does not match the ci-verdict-summary-v2- naming contract; refusing to bind."
+              exit 1
+              ;;
+          esac
+          ARTIFACT_WORKFLOW_RUN_HEAD_SHA="$(python3 -c 'import json; print((json.load(open("trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json")).get("workflow_run") or {}).get("head_sha") or "")')"
+          if [ -z "$ARTIFACT_WORKFLOW_RUN_HEAD_SHA" ] || [ "$ARTIFACT_WORKFLOW_RUN_HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error::trusted_ci_verdict_summary_artifact_id=${ARTIFACT_ID} artifact metadata workflow_run.head_sha='${ARTIFACT_WORKFLOW_RUN_HEAD_SHA}' does not match trusted_ci_verdict_summary_expected_head_sha='${EXPECTED_HEAD_SHA}'; refusing to bind."
+            exit 1
+          fi
           gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
             > trusted_ci_verdict_summary_v2_artifacts/artifact.zip
           unzip -o -q trusted_ci_verdict_summary_v2_artifacts/artifact.zip -d trusted_ci_verdict_summary_v2_artifacts/extracted
-          SUMMARY_FILE="$(find trusted_ci_verdict_summary_v2_artifacts/extracted -name '*ci_verdict_summary_v2*.json' | head -n1)"
-          if [ -z "$SUMMARY_FILE" ]; then
+          # #2423 fix_delta P1-4: `head -n1` on multiple candidates silently
+          # picks an ARBITRARY one -- only accept when exactly one
+          # *ci_verdict_summary_v2*.json candidate exists inside the ZIP.
+          mapfile -t SUMMARY_CANDIDATES < <(find trusted_ci_verdict_summary_v2_artifacts/extracted -name '*ci_verdict_summary_v2*.json')
+          if [ "${#SUMMARY_CANDIDATES[@]}" -eq 0 ]; then
             echo "::error::no ci_verdict_summary_v2*.json found inside downloaded artifact_id=${ARTIFACT_ID}."
             exit 1
           fi
+          if [ "${#SUMMARY_CANDIDATES[@]}" -gt 1 ]; then
+            echo "::error::${#SUMMARY_CANDIDATES[@]} ambiguous ci_verdict_summary_v2*.json candidates found inside downloaded artifact_id=${ARTIFACT_ID}: ${SUMMARY_CANDIDATES[*]}; refusing to pick one arbitrarily."
+            exit 1
+          fi
+          SUMMARY_FILE="${SUMMARY_CANDIDATES[0]}"
           cp "$SUMMARY_FILE" trusted_ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json
           FILE_SHA256="sha256:$(sha256sum trusted_ci_verdict_summary_v2_artifacts/ci_verdict_summary_v2.json | cut -d' ' -f1)"
           ARTIFACT_DIGEST="$(python3 -c 'import json; print(json.load(open("trusted_ci_verdict_summary_v2_artifacts/artifact_metadata.json")).get("digest") or "")')"
