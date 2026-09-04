@@ -49,6 +49,7 @@ artifact 名: `ci-runtime-baseline-<job>-<run_attempt>`
 | `run_attempt` | string | GitHub Actions の `run_attempt` |
 | `head_sha` | string | PR head SHA（push 時は `github.sha` と同値） |
 | `merge_sha` | string | `github.sha`（merge commit SHA） |
+| `measured_head_sha` | string | （#2184、fix_delta by PR #2493 issuecomment-5540651128 で記述訂正）`e2e-core` / `e2e-responsive-matrix` ジョブの artifact にのみ追加される optional field。`target_sha` を指定した固定SHA benchmark dispatch 実行時に限らず、通常の `pull_request` / `push` 実行を含む**常時**、収集ステップ自身が実際の checkout HEAD に対して独立に実行する `git rev-parse HEAD` の出力を記録する。`workflow_dispatch` の `target_sha` input のコピーではなく、`head_sha` とも独立した別概念・別値である。**他の job（`typecheck` / `lint` / `test` / `build` / `python-test-core` / `node-backed-hook-tests` / `actionlint` 等）の artifact には出現しない** |
 | `job` | string | job 名（`typecheck` / `lint` / `test` / `build` / `e2e` / `python-test-core` / `codex-execpolicy` / `python-test`（required aggregate）/ `node-backed-hook-tests` / `actionlint`）。Issue #1760 で `python-test` は `python-test-core` + `codex-execpolicy` に分割された |
 | `runner_image` | string | `${ImageOS}/${ImageVersion}` |
 | `measurement_method` | string | `"date_plus3N_ms"`（`date +%s%3N` による ms 計測） |
