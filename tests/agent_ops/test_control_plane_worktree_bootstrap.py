@@ -19,29 +19,34 @@ Covers the additive primitives this Issue adds on top of #2196/#2197/#2198:
   introduces no TTL/lease/daemon/heartbeat/persistent lock broker.
 - AC4/AC8: `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS` is exactly the 4
   production preflight profiles (fixture profiles and `contract_update.*`
-  are excluded), and the session's `execution_root` resolves to a worktree
-  distinct from the primary root.
+  are excluded), and `main()`'s real dispatch-selection logic actually
+  selects `cwd=execution_root` (a worktree distinct from the primary root)
+  for them.
 - AC6/AC7: this Issue does not touch `_sanitize_env()`'s allowlist or
   `command_registry.py`'s REGISTRY argv/`required_cwd` declarations.
 - AC9: the identity probe's `invocation_cwd`/`execution_root` cross-check is
   itself fail-closed (proving the primitive that prevents a "child ran in
-  dedicated root while post-child checks ran against primary root" mix-up).
+  dedicated root while post-child checks ran against primary root" mix-up),
+  AND `main()`'s own post-child-check root selection genuinely branches on
+  `command_id` (production profiles -> `execution_root`, everything else ->
+  `project_root`).
 
-IMPORTANT (see PR body for full detail): wiring `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`
-into `skill_runtime_exec.py::main()`'s actual dispatch -- so a real production
-`preflight.run` invocation's child process genuinely runs with
-`cwd=execution_root` -- was found, during implementation, to break several
-pre-existing real-subprocess tests OUTSIDE this Issue's Allowed Paths (their
-fixtures do not ship `scripts/agent-ops/worktree_bootstrap_exec.py` and
-cannot reach the real GitHub remote `CONTROL_PLANE_CANONICAL_REMOTE_URL`
-requires). `main()` is therefore left unmodified by this Issue -- the tests
-below exercise the primitives directly (the same pattern
-`test_control_plane_worktree_remote_binding.py` already uses for #2197: a
-local `file://` fixture remote bound via
-`monkeypatch.setattr(BOOTSTRAP, "CONTROL_PLANE_CANONICAL_REMOTE_URL", ...)`),
-not `main()` end-to-end. AC5's first-hop-parity marker below therefore
-proves the identity-probe mechanism that WOULD preserve first-hop targeting
-once `main()` is wired, not `main()` itself.
+Issue #2199 Scope Delta (see PR body / Issue comment for full detail):
+`PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS` IS now wired into
+`skill_runtime_exec.py::main()`'s actual dispatch-selection code path (a
+real production `preflight.run` invocation's child process genuinely runs
+with `cwd=execution_root`). The AC4/AC5/AC9-mapped tests below call
+`exec_mod.main()` directly -- the REAL dispatch/post-child-check selection
+logic -- against a real local `file://` fixture remote (never the real
+GitHub remote; `network_required: false`/`auth_required: false` are
+preserved), observing the `cwd` `main()` itself passes down via a
+monkeypatched `_run_child_with_supervision()` leaf (never a reimplemented
+simulation of the selection logic itself -- see `_init_main_dispatch_fixture()`
+and `_fake_supervision_capturing_cwd()` above). The remaining AC1/AC2/AC3/
+AC6/AC7/AC8/AC10/AC11/AC12 tests below continue to exercise the underlying
+primitives directly (the same pattern `test_control_plane_worktree_remote_binding.py`
+already uses for #2197), since those ACs are about the primitives'
+own contracts, not `main()`'s dispatch selection.
 """
 
 from __future__ import annotations
@@ -51,6 +56,7 @@ import os
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from types import ModuleType
 
@@ -67,7 +73,17 @@ if str(AGENT_OPS_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_OPS_DIR))
 
 import skill_runtime_exec as exec_mod  # noqa: E402
+import worktree_bootstrap_exec  # noqa: E402
 import worktree_catalog  # noqa: E402
+
+# AC4/AC5/AC9: `exec_mod.main()`'s own lazy `_load_worktree_bootstrap_exec_module()`
+# does a bare `import worktree_bootstrap_exec` at call time -- Python's
+# module cache means that reuses THIS SAME module object (loaded once,
+# above, under the bare name), not `BOOTSTRAP` (the separately-named
+# `worktree_bootstrap_exec_2199` instance `_load_bootstrap_module()` below
+# loads for this file's other, primitive-level tests). Only monkeypatching
+# THIS bare-named module's `CONTROL_PLANE_CANONICAL_REMOTE_URL` attribute
+# has any effect on what `exec_mod.main()` itself binds against.
 
 
 def _load_bootstrap_module() -> ModuleType:
@@ -135,6 +151,101 @@ def _script_path_under(execution_root: str) -> str:
     return str(
         Path(execution_root) / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "workflow_start_entry.py"
     )
+
+
+def _pinned_uv_version(repo_root: Path) -> str:
+    data = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    return data["tool"]["uv"]["required-version"]
+
+
+def _init_main_dispatch_fixture(
+    tmp_path: Path,
+    *,
+    extra_repo_files: tuple[str, ...] = (),
+    extra_written_files: dict[str, str] | None = None,
+) -> tuple[Path, str]:
+    """A real remote (like `_init_remote_fixture`) PLUS the real production
+    `command_registry.py`/`workflow_start_entry.py` at `project_root` and a
+    `.gitignore` for `.claude/worktrees/` (mirrors this real repo's own
+    `.gitignore`, so the dedicated worktree `main()`'s wired dispatch
+    creates under `local` does not itself register as untracked drift in
+    `capture_primary_checkout_invariant_snapshot()`). Used only by the
+    AC4/AC5/AC9 tests below that call `exec_mod.main()` directly (the REAL
+    dispatch-selection code path), never the other primitive-level tests in
+    this file. ``extra_repo_files`` copies additional real files verbatim
+    from this checkout (by repo-relative path); ``extra_written_files``
+    writes additional fixture-authored file contents (path -> text).
+    """
+    source = tmp_path / "main-dispatch-source"
+    origin = tmp_path / "main-dispatch-origin.git"
+    local = tmp_path / "main-dispatch-local"
+    env = _git_env(tmp_path)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True, env=env)
+    (source / ".gitignore").write_text(".claude/worktrees/\n", encoding="utf-8")
+    (source / "README.md").write_text("fixture\n", encoding="utf-8")
+    pin = _pinned_uv_version(REPO_ROOT)
+    (source / "pyproject.toml").write_text(
+        f'''[project]
+name = "main-dispatch-fixture"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+required-version = "{pin}"
+managed = false
+''',
+        encoding="utf-8",
+    )
+    for rel in (
+        ".claude/skills/issue-refinement-loop/scripts/command_registry.py",
+        ".claude/skills/issue-refinement-loop/scripts/workflow_start_entry.py",
+        *extra_repo_files,
+    ):
+        dest = source / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text((REPO_ROOT / rel).read_text(encoding="utf-8"), encoding="utf-8")
+    for rel, content in (extra_written_files or {}).items():
+        dest = source / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=source, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=source, check=True, env=env)
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, env=env)
+    subprocess.run(["git", "remote", "add", "origin", origin.as_uri()], cwd=source, check=True, env=env)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=source, check=True, env=env)
+    subprocess.run(["git", "--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"], check=True, env=env)
+    subprocess.run(["git", "clone", "-q", origin.as_uri(), str(local)], check=True, env=env)
+    # `resolve_repo_slug()` parses the local `origin` remote URL and needs
+    # an `https://github.com/...` shape to resolve `TRUSTED_REPO_SLUG` --
+    # this is entirely independent of `CONTROL_PLANE_CANONICAL_REMOTE_URL`
+    # (a literal, code-owned constant `run_control_plane_remote_default_ref_binding`
+    # never derives from any locally configured git remote).
+    subprocess.run(
+        ["git", "-C", str(local), "remote", "set-url", "origin", "https://github.com/squne121/loop-protocol.git"],
+        check=True,
+        capture_output=True,
+    )
+    return local, origin.as_uri()
+
+
+def _fake_supervision_capturing_cwd(captured: dict[str, object]):
+    def _fake_supervise(child_argv, *, cwd, env, timeout_seconds, binary_output):
+        captured["cwd"] = cwd
+        captured["child_argv"] = list(child_argv)
+        captured["env"] = dict(env)
+        return exec_mod._ChildSupervisionResult(
+            timed_out=False,
+            returncode=0,
+            stdout="",
+            stderr="",
+            cleanup_scope=exec_mod.CLEANUP_SCOPE_PROCESS_GROUP,
+            cleanup_status=exec_mod.CLEANUP_STATUS_NOT_STARTED,
+            termination=exec_mod.TERMINATION_NOT_NEEDED,
+            leader_reaped=True,
+        )
+
+    return _fake_supervise
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +396,75 @@ def test_given_fixture_and_contract_update_ids_when_checked_then_fixture_and_con
     assert excluded.isdisjoint(exec_mod.PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS)
 
 
+def test_given_main_wired_and_bare_preflight_run_dispatched_when_run_then_production_profile_dedicated_execution_root(
+    tmp_path, monkeypatch
+):
+    """Issue #2199 AC4: calls `exec_mod.main()` itself -- the REAL
+    dispatch-selection code path -- and observes the `cwd` it actually
+    passes to the child process via a monkeypatched
+    `_run_child_with_supervision()` LEAF (never a reimplemented simulation
+    of `main()`'s own selection logic). A same-attribute-equality-only
+    check against `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS` (see the two
+    tests above) does not, by itself, satisfy this AC -- this test is what
+    does."""
+    local, url = _init_main_dispatch_fixture(tmp_path)
+    monkeypatch.setattr(worktree_bootstrap_exec, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(exec_mod, "_run_child_with_supervision", _fake_supervision_capturing_cwd(captured))
+    monkeypatch.chdir(local)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(local))
+    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+
+    exit_code = exec_mod.main(
+        ["--command-id", "preflight.run", "--issue-number", "1228", "--repo", "squne121/loop-protocol"]
+    )
+
+    assert exit_code == 0, captured
+    dispatched_cwd = os.path.realpath(str(captured["cwd"]))
+    assert dispatched_cwd != os.path.realpath(str(local))
+    assert Path(dispatched_cwd).is_dir()
+    assert Path(dispatched_cwd) == Path(worktree_bootstrap_exec.fixed_control_plane_worktree_path(str(local)))
+
+
+def test_given_main_wired_and_contract_update_command_id_dispatched_when_run_then_fixture_and_contract_update_non_regression(
+    tmp_path, monkeypatch
+):
+    """Issue #2199 AC8 non-regression, exercised through the SAME real
+    `main()` dispatch-selection path as the AC4 test above:
+    `contract_update.run.with_anchor` (deliberately NOT in
+    `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`) still dispatches its child
+    at `project_root`, never a dedicated worktree -- `main()`'s own
+    `is_production_dedicated_command` branch, not a reimplemented
+    simulation of it."""
+    local, url = _init_main_dispatch_fixture(
+        tmp_path,
+        extra_repo_files=(".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",),
+    )
+    monkeypatch.setattr(worktree_bootstrap_exec, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
+    assert "contract_update.run.with_anchor" not in exec_mod.PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(exec_mod, "_run_child_with_supervision", _fake_supervision_capturing_cwd(captured))
+    monkeypatch.chdir(local)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(local))
+    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+
+    exit_code = exec_mod.main(
+        [
+            "--command-id",
+            "contract_update.run.with_anchor",
+            "--issue-number",
+            "1228",
+            "--repo",
+            "squne121/loop-protocol",
+            "--anchor-comment-url",
+            "https://github.com/squne121/loop-protocol/issues/1228#issuecomment-1",
+        ]
+    )
+
+    assert exit_code == 0, captured
+    assert os.path.realpath(str(captured["cwd"])) == os.path.realpath(str(local))
+
+
 def test_given_dedicated_session_when_execution_root_read_then_it_differs_from_primary_root(tmp_path, monkeypatch):
     local, _origin, url, _oid = _init_remote_fixture(tmp_path)
     monkeypatch.setattr(BOOTSTRAP, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
@@ -298,9 +478,136 @@ def test_given_dedicated_session_when_execution_root_read_then_it_differs_from_p
 
 
 # ---------------------------------------------------------------------------
-# AC5: dedicated_first_hop_parity (identity-probe mechanism only -- see
-# module docstring for the main() wiring gap)
+# AC5: dedicated_first_hop_parity
 # ---------------------------------------------------------------------------
+
+
+def _write_controlled_gh_always_ok(trusted_bin: Path) -> None:
+    """A trivial, no-network `gh` stand-in: every probe this Issue's
+    dedicated-first-hop test needs (`github_auth`/`github_repo_read`/
+    `controlled_github_read`) only inspects the probe subprocess's exit
+    code (never stdout content), so exit 0 unconditionally is sufficient."""
+    trusted_bin.mkdir(parents=True)
+    gh_path = trusted_bin / "gh"
+    gh_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gh_path.chmod(0o755)
+
+
+_INNER_PREFLIGHT_CWD_PROBE_STUB = """from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+
+
+def _build_compact_stdout(result: dict) -> str:
+    # Issue #2199 AC5: `workflow_start_entry.py` imports this symbol at
+    # MODULE LOAD TIME (`from run_refinement_preflight import
+    # _build_compact_stdout`), unconditionally -- even though this stub's
+    # own ready-path `main()` below is invoked as a subprocess with
+    # inherited stdio, so this function itself is never actually CALLED on
+    # that path (only `workflow_start_entry.py`'s blocked path calls it).
+    # A minimal stand-in is required purely so the import above succeeds;
+    # it must never be exercised in this test's positive path.
+    return f"STATUS: {result.get('status')}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--issue-number", required=True)
+    parser.add_argument("--repo", required=True)
+    parser.parse_args()
+    marker_path = os.environ.get("SKILL_RUNTIME_TEST_INNER_MARKER_PATH")
+    if marker_path:
+        marker = Path(marker_path)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        # Issue #2199 AC5: records the INNER preflight's own real `cwd` --
+        # the strongest possible proof that the wired `main()` dispatch
+        # actually reached the inner refinement preflight AND that every
+        # process hop in between (`workflow_start_entry.py` ->
+        # `root_entry_router` -> this script) inherited the SAME dedicated
+        # `execution_root`, never falling back to `project_root`.
+        marker.write_text(os.getcwd())
+    print('{"schema": "refinement_preflight_result/v1", "status": "ready"}')
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+
+def test_given_main_wired_and_bare_preflight_run_dispatched_when_run_then_dedicated_first_hop_parity(
+    tmp_path, monkeypatch
+):
+    """Issue #2199 AC5: calls `exec_mod.main()` itself (never
+    `_run_child_with_supervision` mocked away this time) so the REAL
+    production process chain -- `skill_runtime_exec.py` (outer, in-process
+    here) -> `_sanitize_env()` -> `workflow_start_entry.py` ->
+    `root_entry_router.capability_preflight_result()` ->
+    `workflow_capability_preflight.py` -> inner `run_refinement_preflight.py`
+    -- is genuinely exercised through `main()`'s wired dispatch, under the
+    dedicated `execution_root`, with invocation-scoped
+    `LOOP_PLANNED_OPERATIONS_JSON` first-hop parity proven end to end. No
+    isolated helper-function call stands in for this."""
+    inner_marker = tmp_path / "inner-ran.marker"
+    local, url = _init_main_dispatch_fixture(
+        tmp_path,
+        extra_repo_files=(
+            "scripts/agent-guards/trusted_runtime_capabilities.py",
+            # `trusted_runtime_capabilities.check_trusted_uv()` imports
+            # `skill_runtime_exec` (and that, in turn,
+            # `skill_runtime_command_policy` -> `worktree_catalog`) from
+            # the DEDICATED `execution_root`'s own `scripts/agent-guards/`
+            # / `scripts/agent-ops/` directories -- not from this real
+            # checkout's `sys.path`-loaded copies -- since `_load_skill_
+            # runtime_exec()` resolves `_GUARDS_DIR` relative to its own
+            # `__file__` (the fixture's copy). Without these, the
+            # producer subprocess fails with `ModuleNotFoundError` and
+            # this test's positive path never reaches the inner preflight.
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "scripts/agent-guards/skill_runtime_command_policy.py",
+            "scripts/agent-ops/worktree_catalog.py",
+            "scripts/claude-gpt/workflow_capability_preflight.py",
+            ".claude/skills/issue-refinement-loop/scripts/root_entry_router.py",
+        ),
+        extra_written_files={
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py": (
+                _INNER_PREFLIGHT_CWD_PROBE_STUB
+            ),
+        },
+    )
+    monkeypatch.setattr(worktree_bootstrap_exec, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
+
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    _write_controlled_gh_always_ok(trusted_gh_bin)
+    monkeypatch.setattr(exec_mod, "_SYSTEM_STANDARD_PATH_DIRS", (str(trusted_gh_bin), *exec_mod._SYSTEM_STANDARD_PATH_DIRS))
+
+    monkeypatch.chdir(local)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(local))
+    monkeypatch.setenv("SKILL_RUNTIME_TEST_INNER_MARKER_PATH", str(inner_marker))
+    # Issue #2199 AC5/AC6: deliberately no LOOP_SPARK_MODE/LOOP_SPARK_FALLBACK
+    # (Spark is `SPARK_NOT_REQUIRED` when unset -- this test's positive path
+    # does not need a Spark route) -- only the invocation-scoped
+    # `LOOP_PLANNED_OPERATIONS_JSON` first-hop parity carrier this AC is
+    # actually about.
+    monkeypatch.setenv(
+        "LOOP_PLANNED_OPERATIONS_JSON",
+        '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
+        '"operation": "issue_comment", "requires_mutation": true}]',
+    )
+    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+    monkeypatch.delenv("LOOP_SPARK_MODE", raising=False)
+    monkeypatch.delenv("LOOP_SPARK_FALLBACK", raising=False)
+
+    exit_code = exec_mod.main(
+        ["--command-id", "preflight.run", "--issue-number", "1228", "--repo", "squne121/loop-protocol"]
+    )
+
+    assert exit_code == 0
+    assert inner_marker.exists()
+    execution_root = worktree_bootstrap_exec.fixed_control_plane_worktree_path(str(local))
+    assert os.path.realpath(inner_marker.read_text(encoding="utf-8").strip()) == os.path.realpath(execution_root)
 
 
 def test_given_script_path_nested_under_execution_root_when_identity_verified_then_dedicated_first_hop_parity(

@@ -245,28 +245,13 @@ def _git_status_paths(project_root: str) -> set[str]:
 
 
 # Issue #2199 In Scope: the 4 production preflight profiles whose child
-# dispatch cwd is intended to migrate to the #2197 dedicated worktree
-# (`execution_root`). Fixture profiles
+# dispatch cwd is migrated to the #2197 dedicated worktree
+# (`execution_root`) by `main()`'s real dispatch-selection logic below.
+# Fixture profiles
 # (`preflight.run.fixture`/`preflight.run.fixture.with_human_context`) and
 # `contract_update.run.with_anchor`/`contract_update.run.with_human_context`
 # are deliberately excluded (AC8 non-regression) -- they remain on the
 # primary root (`canonical_main_root`), unchanged by this Issue.
-#
-# NOTE (discovered during implementation, see PR body / Issue comment for
-# full detail): wiring this constant into `main()`'s actual dispatch path
-# (so the 4 profiles' child process really runs with `cwd=execution_root`)
-# was found to break ~7+ pre-existing real-subprocess tests outside this
-# Issue's Allowed Paths (e.g.
-# `.claude/skills/issue-refinement-loop/scripts/tests/test_workflow_start_entry_canonical_executor.py`,
-# `scripts/agent-guards/tests/test_skill_runtime_preflight_no_worktree.py`)
-# whose fixtures do not ship `scripts/agent-ops/worktree_bootstrap_exec.py`
-# and cannot reach the real GitHub remote `CONTROL_PLANE_CANONICAL_REMOTE_URL`
-# requires. `main()` therefore does NOT yet consult this constant -- it is
-# exposed here (and exercised directly by
-# `tests/agent_ops/test_control_plane_worktree_bootstrap.py`) so the
-# downstream `main()` wiring can be completed once that pre-existing-test
-# conflict is resolved (Issue contract revision / follow-up Issue), without
-# duplicating this profile-set literal.
 PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS = frozenset(
     {
         "preflight.run",
@@ -1541,6 +1526,121 @@ def _emit_timeout_failure(
     return 2
 
 
+def _emit_primary_checkout_drift_failure(issue_number: int) -> int:
+    print(
+        "SKILL_RUNTIME_FAIL: "
+        f"reason_code=primary_checkout_invariant_violated target_issue={issue_number} "
+        "recovery=inspect_primary_checkout_for_unexpected_mutation_during_dedicated_dispatch",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _dispatch_child_and_check_postconditions(
+    *,
+    dispatch_root: str,
+    issue_number: int,
+    command_id: str,
+    child_argv: list[str],
+    env: dict[str, str],
+    timeout_seconds: object,
+    binary_output: bool,
+) -> int:
+    """Dispatch the child at ``dispatch_root`` and run the existing
+    before/after post-child checks against that SAME root (Issue #2199
+    AC9): before/after repo snapshot, unauthorized-write detection, and
+    stdout/artifact projection validation. ``dispatch_root`` is
+    ``project_root`` for every command_id except the 4 production preflight
+    profiles (Issue #2199 In Scope), which pass their dedicated
+    ``execution_root`` here instead -- this function itself has no
+    production/fixture branching of its own, so the caller's root selection
+    is the only thing that ever changes which checkout is touched.
+    """
+    before_snapshot = _snapshot_repo_paths(dispatch_root, str(issue_number), command_id)
+    before_status = _git_status_paths(dispatch_root)
+
+    supervision = _run_child_with_supervision(
+        child_argv,
+        cwd=dispatch_root,
+        env=env,
+        timeout_seconds=timeout_seconds,
+        binary_output=binary_output,
+    )
+    if supervision.timed_out:
+        return _emit_timeout_failure(
+            issue_number,
+            timeout_seconds,
+            cleanup_scope=supervision.cleanup_scope,
+            cleanup_status=supervision.cleanup_status,
+            termination=supervision.termination,
+            leader_reaped=supervision.leader_reaped,
+        )
+    result = supervision
+
+    unauthorized_path = _find_unauthorized_repo_changes(
+        dispatch_root,
+        str(issue_number),
+        before_snapshot,
+        before_status,
+        command_id,
+    )
+    if unauthorized_path is not None:
+        return _emit_unauthorized_write_failure(issue_number, unauthorized_path)
+
+    stdout_for_artifact_projection = (
+        result.stdout.decode("utf-8", errors="surrogateescape")
+        if isinstance(result.stdout, bytes)
+        else result.stdout
+    )
+    artifact_projection_failures = _validate_stdout_artifact_projection(
+        dispatch_root,
+        str(issue_number),
+        stdout_for_artifact_projection,
+        command_id,
+    )
+    if artifact_projection_failures:
+        return _emit_artifact_projection_failure(issue_number, artifact_projection_failures)
+
+    if isinstance(result.stdout, bytes):
+        sys.stdout.buffer.write(result.stdout)
+    elif result.stdout:
+        sys.stdout.write(result.stdout)
+    if isinstance(result.stderr, bytes):
+        sys.stderr.buffer.write(result.stderr)
+    elif result.stderr:
+        sys.stderr.write(result.stderr)
+    return result.returncode
+
+
+_AGENT_OPS_DIR = Path(__file__).resolve().parent.parent / "agent-ops"
+
+
+def _load_worktree_bootstrap_exec_module():
+    """Late-bound import of ``worktree_bootstrap_exec`` (Issue #2199).
+
+    Deferred to call time -- never imported at this module's own top level
+    -- because ``worktree_bootstrap_exec.py`` itself does ``from
+    skill_runtime_exec import (...)``; importing it eagerly from this
+    module's top level would be a circular import.
+
+    The ``sys.modules.setdefault`` below also makes this import safe when
+    THIS file is the running ``__main__`` script (its normal production
+    invocation shape, Issue #2199 AC7's unchanged outward command shape):
+    without it, ``worktree_bootstrap_exec.py``'s own ``from
+    skill_runtime_exec import ...`` would silently re-exec this entire file
+    under a second, distinct module identity, producing a second, unequal
+    copy of every exception type this module defines (e.g.
+    ``ControlPlaneUnavailable``) that this module's own ``except`` clauses
+    would then fail to match.
+    """
+    sys.modules.setdefault("skill_runtime_exec", sys.modules[__name__])
+    if str(_AGENT_OPS_DIR) not in sys.path:
+        sys.path.insert(0, str(_AGENT_OPS_DIR))
+    import worktree_bootstrap_exec  # noqa: E402
+
+    return worktree_bootstrap_exec
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Privileged exact skill runtime executor", allow_abbrev=False)
@@ -2119,9 +2219,9 @@ def main(argv: list[str] | None = None) -> int:
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
 
+    is_production_dedicated_command = args.command_id in PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS
+
     _validate_runtime_context(project_root, args)
-    before_snapshot = _snapshot_repo_paths(project_root, str(args.issue_number), args.command_id)
-    before_status = _git_status_paths(project_root)
     entry = load_registry_entry(args.command_id, project_root)
     validate_registry_entry(args.command_id, entry, str(args.issue_number))
 
@@ -2242,57 +2342,70 @@ def main(argv: list[str] | None = None) -> int:
     child_argv = _resolve_child_argv(child_argv)
 
     timeout_seconds = entry.get("timeout_seconds")
-    supervision = _run_child_with_supervision(
-        child_argv,
-        cwd=project_root,
-        env=_sanitize_env(project_root, args.command_id),
-        timeout_seconds=timeout_seconds,
-        binary_output=is_structural_repair_action_apply_command,
-    )
-    if supervision.timed_out:
-        return _emit_timeout_failure(
-            args.issue_number,
-            timeout_seconds,
-            cleanup_scope=supervision.cleanup_scope,
-            cleanup_status=supervision.cleanup_status,
-            termination=supervision.termination,
-            leader_reaped=supervision.leader_reaped,
+    env = _sanitize_env(project_root, args.command_id)
+    binary_output = is_structural_repair_action_apply_command
+
+    if not is_production_dedicated_command:
+        # Fixture profiles (`preflight.run.fixture` /
+        # `preflight.run.fixture.with_human_context`) and
+        # `contract_update.run.with_anchor` / `.with_human_context` --
+        # along with every non-preflight command_id -- are unaffected by
+        # Issue #2199 and keep dispatching at `project_root` exactly as
+        # before (AC8 non-regression).
+        return _dispatch_child_and_check_postconditions(
+            dispatch_root=project_root,
+            issue_number=args.issue_number,
+            command_id=args.command_id,
+            child_argv=child_argv,
+            env=env,
+            timeout_seconds=timeout_seconds,
+            binary_output=binary_output,
         )
-    result = supervision
 
-    unauthorized_path = _find_unauthorized_repo_changes(
-        project_root,
-        str(args.issue_number),
-        before_snapshot,
-        before_status,
-        args.command_id,
-    )
-    if unauthorized_path is not None:
-        return _emit_unauthorized_write_failure(args.issue_number, unauthorized_path)
-
-    stdout_for_artifact_projection = (
-        result.stdout.decode("utf-8", errors="surrogateescape")
-        if isinstance(result.stdout, bytes)
-        else result.stdout
-    )
-    artifact_projection_failures = _validate_stdout_artifact_projection(
-        project_root,
-        str(args.issue_number),
-        stdout_for_artifact_projection,
-        args.command_id,
-    )
-    if artifact_projection_failures:
-        return _emit_artifact_projection_failure(args.issue_number, artifact_projection_failures)
-
-    if isinstance(result.stdout, bytes):
-        sys.stdout.buffer.write(result.stdout)
-    elif result.stdout:
-        sys.stdout.write(result.stdout)
-    if isinstance(result.stderr, bytes):
-        sys.stderr.buffer.write(result.stderr)
-    elif result.stderr:
-        sys.stderr.write(result.stderr)
-    return result.returncode
+    # Issue #2199: the 4 production preflight profiles
+    # (`PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`) dispatch their child
+    # under the #2197 dedicated worktree (`execution_root`) instead of
+    # `project_root`, with the fixed #2198 lifecycle guard held across
+    # bootstrap, dedicated-identity verification, child dispatch, and the
+    # SAME post-child checks retargeted at `execution_root` (AC3/AC9) --
+    # never a primary-root fallback on any dedicated-identity failure
+    # (AC11). `capture_primary_checkout_invariant_snapshot()` proves the
+    # PRIMARY checkout itself stayed byte-identical across the whole span,
+    # on both the success and the failure path (AC1).
+    bootstrap_mod = _load_worktree_bootstrap_exec_module()
+    primary_before = capture_primary_checkout_invariant_snapshot(project_root)
+    exit_code: int | None = None
+    raised_exc: BaseException | None = None
+    try:
+        with bootstrap_mod.control_plane_dedicated_execution_session(project_root) as session:
+            execution_root = str(session["execution_root"])
+            executor_script_path = str(
+                Path(execution_root) / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / script_name
+            )
+            bootstrap_mod.verify_dedicated_control_plane_identity(
+                session,
+                project_root=project_root,
+                execution_root=execution_root,
+                invocation_cwd=execution_root,
+                executor_script_path=executor_script_path,
+            )
+            exit_code = _dispatch_child_and_check_postconditions(
+                dispatch_root=execution_root,
+                issue_number=args.issue_number,
+                command_id=args.command_id,
+                child_argv=child_argv,
+                env=env,
+                timeout_seconds=timeout_seconds,
+                binary_output=binary_output,
+            )
+    except BaseException as exc:  # noqa: BLE001 -- re-raised below unless the primary-checkout guard below fires
+        raised_exc = exc
+    primary_after = capture_primary_checkout_invariant_snapshot(project_root)
+    if primary_after != primary_before:
+        return _emit_primary_checkout_drift_failure(args.issue_number)
+    if raised_exc is not None:
+        raise raised_exc
+    return exit_code
 
 
 # ---------------------------------------------------------------------------
