@@ -699,6 +699,19 @@ jobs:
           BENCHMARK_TARGET_SHA: ${{ github.event.inputs.target_sha }}
         run: |
           set -euo pipefail
+          # #2184 fix_delta (PR #2493, live AC6 workflow_dispatch run
+          # https://github.com/squne121/loop-protocol/actions/runs/33869974220):
+          # this step's shell runs inside the `container:` image above (see
+          # the pre-existing "Collect ci_runtime_baseline_v1 artifact" step's
+          # comment for the same root cause), and the checked-out workspace
+          # at $GITHUB_WORKSPACE is owned by a different UID than the
+          # container's git config sees by default, which makes ANY bare
+          # `git` invocation in this step fail closed with "detected
+          # dubious ownership in repository at '$GITHUB_WORKSPACE'" (exit
+          # 128). This step is gated `if: target_sha != ''` and only runs
+          # on an actual dispatched benchmark run, so it was never exercised
+          # until the first live target_sha dispatch above surfaced it.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           resolved_head="$(git rev-parse HEAD)"
           if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
             echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the explicit checkout ref override did not resolve to the expected commit. Refusing to record a benchmark sample for the wrong commit."
@@ -1510,6 +1523,19 @@ jobs:
           BENCHMARK_TARGET_SHA: ${{ github.event.inputs.target_sha }}
         run: |
           set -euo pipefail
+          # #2184 fix_delta (PR #2493, live AC6 workflow_dispatch run
+          # https://github.com/squne121/loop-protocol/actions/runs/33869974220):
+          # this step's shell runs inside the `container:` image above (see
+          # the pre-existing "Collect ci_runtime_baseline_v1 artifact" step's
+          # comment for the same root cause), and the checked-out workspace
+          # at $GITHUB_WORKSPACE is owned by a different UID than the
+          # container's git config sees by default, which makes ANY bare
+          # `git` invocation in this step fail closed with "detected
+          # dubious ownership in repository at '$GITHUB_WORKSPACE'" (exit
+          # 128). This step is gated `if: target_sha != ''` and only runs
+          # on an actual dispatched benchmark run, so it was never exercised
+          # until the first live target_sha dispatch above surfaced it.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           resolved_head="$(git rev-parse HEAD)"
           if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
             echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the explicit checkout ref override did not resolve to the expected commit. Refusing to record a benchmark sample for the wrong commit."
