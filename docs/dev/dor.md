@@ -228,7 +228,7 @@ exit 5（no tests collected）を「baseline で fail した」と解釈して�
 | Allowed Paths | Allowed Paths 明示 / worktree・branch 命名 preflight | 機械判定 |
 | Stop Conditions | Stop Conditions 明示（6 定型項目） | 機械判定 |
 | Required Skills | テンプレ準拠（必須セクション存在） | 機械判定 |
-| スコープ妥当性・体験判断 | （本 skill の責務外 — `review-issue` / 人間レビュー） | 人間判断 |
+| スコープ妥当性・体験判断 | （本 skill の責務外 — `review-issue` Skill / 人間レビュー） | 人間判断 |
 
 ## Out of Scope
 

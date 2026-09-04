@@ -58,8 +58,8 @@ Issue 本文の構造品質を `.claude/skills/review-issue/scripts/check_issue_
 | Verdict | invoked_as_loop | アクション |
 |---|---|---|
 | `approve` | * | レビュー結果のみ返して終了 |
-| `needs-fix` | `true` | `diff_proposal` を返し、本文更新は呼び出し元（`issue-refinement-loop`）に委ねる。本 skill では `gh issue edit` しない |
-| `needs-fix` | `false` | ユーザーに「この差分を Issue 本文に適用しますか？（yes/no）」と明示確認。承認時のみ `edit-issue` skill を呼ぶ |
+| `needs-fix` | `true` | `diff_proposal` を返し、本文更新は呼び出し元（`issue-refinement-loop`）に委ねる。本 skill では本文を直接書き換えない |
+| `needs-fix` | `false` | ユーザーに「この差分を Issue 本文に適用しますか？（yes/no）」と明示確認。承認時のみ `edit-issue` skill の controlled executor（`issue_content.update`）経由でのみ本文を更新する |
 
 ## Checker contract（チェッカー契約、C1〜C12）
 
@@ -106,7 +106,7 @@ REVIEW_ISSUE_RESULT_V1:
 ## Guardrails（安全策）
 
 - VC を実装後の動作確認に使わない（baseline fail の構造を見るのみ。動作検証は `pr-review-judge` / `test-runner` の責務）
-- 本文更新は `edit-issue` skill 経由で行い、本 skill から直接 `gh issue edit` しない
+- 本文更新は `edit-issue` skill の controlled executor（`issue_content.update`）経由でのみ行い、本 skill から直接 Issue 本文を書き換えるコマンドを実行しない
 - `approve` 判定時は `invoked_as_loop` の値に関わらず本文更新へ進まない
 - `needs-fix` + `invoked_as_loop: true` の場合は `diff_proposal` だけ返し、本文更新を呼び出し元に委ねる
 - 人間の明示的承認なく本文を書き換えない

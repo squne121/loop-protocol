@@ -46,8 +46,7 @@ Step 1 起動の authority ではない。正本は
 | `codebase-investigator` | read-only | `dontAsk` | Bash, Read | Edit, Write, MultiEdit, Grep, Glob |
 | `pr-reviewer` | read-only | `dontAsk` | Bash, Read, Grep, Glob | Edit, Write, MultiEdit |
 | `test-runner` | read-only | `dontAsk` | Read, Grep, Glob, Bash | Edit, Write, MultiEdit |
-| `review-issue`（standalone SubAgent） | write | `acceptEdits` | Bash, Read, Grep, Glob, Write | Edit, MultiEdit |
-| `issue-reviewer`（loop worker SubAgent） | read-only | `dontAsk` | Bash, Read, Grep, Glob | Agent, Edit, Write, MultiEdit, Skill |
+| `issue-reviewer`（legacy advisory / diagnostic compatibility asset。canonical `issue-refinement-loop` Step 2 の loop worker としては起動されない、#2380） | read-only | `dontAsk` | Bash, Read, Grep, Glob | Agent, Edit, Write, MultiEdit, Skill |
 | `issue-creator` | write | `acceptEdits` | Bash, Read | Agent, Edit, MultiEdit, Write, Skill |
 | `issue-editor` | write | `acceptEdits` | Bash, Read | Agent, Edit, MultiEdit, Write, Skill |
 | `implementation-worker` | write | `acceptEdits` | Read, Grep, Glob, Bash, Edit, Write, MultiEdit | — |
@@ -86,11 +85,13 @@ native Codex CLI 撤去に伴い、`legacy_codex_projection` / `legacy_codex_onl
 
 ### `review-issue` / `issue-reviewer` の使い分け
 
+canonical な public review UX は `review-issue` Skill のみである。standalone write-capable
+`review-issue` SubAgent（`review-issue.md`）は削除済み（本 Issue #2194）。
+
 | エントリ | 種別 | 呼び出し元 | 役割 |
 |---|---|---|---|
-| `review-issue` Skill | Skill（手順書） | main session・各 SubAgent | Issue 本文の品質を決定論的チェックして `REVIEW_ISSUE_RESULT_V1` を返す手順。結果 schema を返す。 |
-| `review-issue` SubAgent（`review-issue.md`） | write SubAgent | main session（standalone） | Issue 本文編集を伴う standalone レビュー。`gh issue edit` を human-in-the-loop で実行する。 |
-| `issue-reviewer` SubAgent（`issue-reviewer.md`） | read-only SubAgent | `issue-refinement-loop`（loop worker） | `review-issue` skill を内部で実行し `REVIEW_ISSUE_RESULT_V1` を返すのみ。Issue の mutation を行わない。 |
+| `review-issue` Skill | Skill（手順書） | main session・各 SubAgent | Issue 本文の品質を決定論的チェックして `REVIEW_ISSUE_RESULT_V1` を返す手順。`invoked_as_loop: false`（人間直起動）では本文書き戻しも `edit-issue` Skill の controlled executor 経由で行う。 |
+| `issue-reviewer` SubAgent（`issue-reviewer.md`） | read-only SubAgent（legacy advisory / diagnostic compatibility asset） | legacy CLI／診断／回帰テスト用途のみ。canonical `issue-refinement-loop` Step 2 の loop worker としては起動されない（#2380） | `review-issue` skill を内部で実行し `REVIEW_ISSUE_RESULT_V1` を返すのみ。Issue の mutation を行わない。 |
 
 ### 役割カテゴリの定義
 
@@ -132,13 +133,13 @@ SubAgent（役割）── Skill（作業手順）
 |---|---|---|
 | `issue-creator` | Issue を **新規起票** する役割（`Skill` tool 非保持。preload は `create-issue` のみ） | `create-issue`（新規起票）|
 | `issue-editor` | 既存 Issue を **修正** する役割（`Skill` tool 非保持。preload は `edit-issue` のみ） | `edit-issue`（既存修正）|
-| `issue-reviewer` | `issue-refinement-loop` の loop worker として Issue 品質を判定する役割（read-only） | `review-issue` |
+| `issue-reviewer` | legacy advisory / diagnostic compatibility asset（read-only）。canonical `issue-refinement-loop` Step 2 の loop worker としては起動されない（#2380） | `review-issue` |
 
 | Skill | 手順 | 呼び出し元の例 |
 |---|---|---|
 | `create-issue` | 新規 Issue 起票の手順（Template Guard / Outcome Quality Guard / scope 重複チェック / `gh issue create`） | `issue-creator` SubAgent、main session、`issue-refinement-loop`、`post-merge-cleanup` |
 | `edit-issue` | 既存 Issue 本文更新の transaction 手順（candidate body / guard / readiness / controlled executor / bounded result）| `issue-editor` SubAgent、`issue-refinement-loop`、`post-merge-cleanup`、`review-issue`（needs-fix 適用時） |
-| `review-issue` | Issue 本文の品質を決定論的にチェックして verdict と差分提案を返す | main session、`issue-reviewer` SubAgent（`issue-refinement-loop` loop worker 経由） |
+| `review-issue` | Issue 本文の品質を決定論的にチェックして verdict と差分提案を返す | main session、`issue-refinement-loop` canonical Step 2（orchestrator が root-owned pipeline 経由で直接呼ぶ、#2380）、`issue-reviewer` SubAgent（legacy CLI/診断用途のみ） |
 | `issue-contract-review` | 実装着手直前に作業計画・コンテクスト・開発フロー適合性を preflight | main session、`implement-issue` の手前 |
 | `issue-refinement-loop` | Issue 改善 4 段ループのオーケストレーター | main session |
 
@@ -849,10 +850,16 @@ WRONG（禁止パターン）:
   orchestrator → Skill tool（implement-issue skill）直接呼び出し
 
 CORRECT（正しいパターン）:
-  orchestrator → issue-reviewer SubAgent → review-issue skill
   orchestrator → implementation-worker SubAgent → implement-issue skill
   orchestrator → issue-editor SubAgent → edit-issue skill
 ```
+
+`issue-refinement-loop` canonical Step 2 は上記の一般原則の documented exception であり、
+`review-issue` Skill も `issue-reviewer` SubAgent も経由しない。orchestrator（main thread）が
+root-owned pipeline script（`run_root_review_pipeline.py` の `produce`）を直接呼び出し、
+戻り値の `compact_result.verdict` / `compact_result.next_action` /
+`verified_transport_artifact` を直接 consume する（#2380）。詳細は
+`.claude/skills/issue-refinement-loop/SKILL.md` の Step 2 routing table を参照する。
 
 #### 違反パターンの例示
 
