@@ -727,6 +727,19 @@ jobs:
           BENCHMARK_TARGET_SHA: ${{ github.event.inputs.target_sha }}
         run: |
           set -euo pipefail
+          # #2184 fix_delta (PR #2493, live AC6 workflow_dispatch run
+          # https://github.com/squne121/loop-protocol/actions/runs/33869974220):
+          # this step's shell runs inside the `container:` image above (see
+          # the pre-existing "Collect ci_runtime_baseline_v1 artifact" step's
+          # comment for the same root cause), and the checked-out workspace
+          # at $GITHUB_WORKSPACE is owned by a different UID than the
+          # container's git config sees by default, which makes ANY bare
+          # `git` invocation in this step fail closed with "detected
+          # dubious ownership in repository at '$GITHUB_WORKSPACE'" (exit
+          # 128). This step is gated `if: target_sha != ''` and only runs
+          # on an actual dispatched benchmark run, so it was never exercised
+          # until the first live target_sha dispatch above surfaced it.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           resolved_head="$(git rev-parse HEAD)"
           if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
             echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the explicit checkout ref override did not resolve to the expected commit. Refusing to record a benchmark sample for the wrong commit."
@@ -966,13 +979,43 @@ jobs:
           PNPM_VERSION_RAW: ""
           LOCKFILE_HASH_RAW: ""
           WORKFLOW_DIGEST_RAW: ""
+          # #2184 AC1: `measured_head_sha` (distinct from `head_sha`
+          # above, which resolves to `github.sha` -- the workflow_dispatch
+          # ref tip -- on a fixed-SHA benchmark dispatch, NOT `target_sha`).
+          # Populated below via an independent `git rev-parse HEAD`,
+          # regardless of whether `target_sha` was provided, never a
+          # direct copy of the `target_sha` input itself. See
+          # docs/dev/e2e-performance-benchmark.md.
+          GH_MEASURED_HEAD_SHA: ""
         run: |
           mkdir -p ci_runtime_baseline_artifacts
           NODE_VERSION_RAW="$(node -v 2>/dev/null || echo unknown)"
           PNPM_VERSION_RAW="$(pnpm -v 2>/dev/null || echo unknown)"
           LOCKFILE_HASH_RAW="sha256:$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
           WORKFLOW_DIGEST_RAW="sha256:$(sha256sum .github/workflows/ci.yml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
-          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW
+          # #2184 fix_delta (pr-reviewer REQUEST_CHANGES, PR #2493 blocker 1):
+          # this step's shell runs inside the `container:` image above, and
+          # the checked-out workspace at $GITHUB_WORKSPACE is owned by a
+          # different UID than the container's git config sees by default,
+          # which makes ANY bare `git` invocation in this step fail closed
+          # with "detected dubious ownership in repository at
+          # '$GITHUB_WORKSPACE'" (exit 128). The pre-existing "Verify
+          # checked-out HEAD matches dispatched target_sha" step above never
+          # hit this because it's gated `if: target_sha != ''` and only ever
+          # ran on an actual dispatched benchmark run; this step's
+          # unconditional `git rev-parse HEAD` below runs on every job
+          # invocation (including plain push/pull_request CI), so it must
+          # register the safe.directory exception itself before invoking
+          # `git`.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # #2184 AC1: independent observation of the checked-out commit --
+          # NEVER the `target_sha` input verbatim. On a `target_sha`
+          # dispatch, the "Verify checked-out HEAD matches dispatched
+          # target_sha" step above already hard-fails the job if this
+          # would disagree with `target_sha`; on a normal (non-benchmark)
+          # run, this simply reflects the actual checked-out commit.
+          GH_MEASURED_HEAD_SHA="$(git rev-parse HEAD)"
+          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW GH_MEASURED_HEAD_SHA
           python3 - <<'PY'
           import json, os, pathlib
           fingerprint_fields = {
@@ -1005,6 +1048,13 @@ jobs:
               # `actions/checkout` `ref:` override to `target_sha`). Recorded
               # as an independent field -- never conflated with `head_sha`.
               "workflow_sha": os.environ.get("GH_WORKFLOW_SHA", "unknown"),
+              # #2184 AC1: the MEASURED application code's commit, observed
+              # independently via `git rev-parse HEAD` in this step (never a
+              # direct copy of the `target_sha` dispatch input). Distinct
+              # from `head_sha` above (which resolves to `github.sha` --
+              # the dispatch ref tip -- on a fixed-SHA benchmark dispatch)
+              # and from `workflow_sha` (the workflow DEFINITION's commit).
+              "measured_head_sha": os.environ.get("GH_MEASURED_HEAD_SHA", "unknown"),
           }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
@@ -1501,6 +1551,19 @@ jobs:
           BENCHMARK_TARGET_SHA: ${{ github.event.inputs.target_sha }}
         run: |
           set -euo pipefail
+          # #2184 fix_delta (PR #2493, live AC6 workflow_dispatch run
+          # https://github.com/squne121/loop-protocol/actions/runs/33869974220):
+          # this step's shell runs inside the `container:` image above (see
+          # the pre-existing "Collect ci_runtime_baseline_v1 artifact" step's
+          # comment for the same root cause), and the checked-out workspace
+          # at $GITHUB_WORKSPACE is owned by a different UID than the
+          # container's git config sees by default, which makes ANY bare
+          # `git` invocation in this step fail closed with "detected
+          # dubious ownership in repository at '$GITHUB_WORKSPACE'" (exit
+          # 128). This step is gated `if: target_sha != ''` and only runs
+          # on an actual dispatched benchmark run, so it was never exercised
+          # until the first live target_sha dispatch above surfaced it.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           resolved_head="$(git rev-parse HEAD)"
           if [ "$resolved_head" != "$BENCHMARK_TARGET_SHA" ]; then
             echo "::error::checked-out HEAD ($resolved_head) does not match dispatched target_sha ($BENCHMARK_TARGET_SHA) -- the explicit checkout ref override did not resolve to the expected commit. Refusing to record a benchmark sample for the wrong commit."
@@ -1667,13 +1730,43 @@ jobs:
           PNPM_VERSION_RAW: ""
           LOCKFILE_HASH_RAW: ""
           WORKFLOW_DIGEST_RAW: ""
+          # #2184 AC1: `measured_head_sha` (distinct from `head_sha`
+          # above, which resolves to `github.sha` -- the workflow_dispatch
+          # ref tip -- on a fixed-SHA benchmark dispatch, NOT `target_sha`).
+          # Populated below via an independent `git rev-parse HEAD`,
+          # regardless of whether `target_sha` was provided, never a
+          # direct copy of the `target_sha` input itself. See
+          # docs/dev/e2e-performance-benchmark.md.
+          GH_MEASURED_HEAD_SHA: ""
         run: |
           mkdir -p ci_runtime_baseline_artifacts
           NODE_VERSION_RAW="$(node -v 2>/dev/null || echo unknown)"
           PNPM_VERSION_RAW="$(pnpm -v 2>/dev/null || echo unknown)"
           LOCKFILE_HASH_RAW="sha256:$(sha256sum pnpm-lock.yaml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
           WORKFLOW_DIGEST_RAW="sha256:$(sha256sum .github/workflows/ci.yml 2>/dev/null | cut -d' ' -f1 || echo unknown)"
-          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW
+          # #2184 fix_delta (pr-reviewer REQUEST_CHANGES, PR #2493 blocker 1):
+          # this step's shell runs inside the `container:` image above, and
+          # the checked-out workspace at $GITHUB_WORKSPACE is owned by a
+          # different UID than the container's git config sees by default,
+          # which makes ANY bare `git` invocation in this step fail closed
+          # with "detected dubious ownership in repository at
+          # '$GITHUB_WORKSPACE'" (exit 128). The pre-existing "Verify
+          # checked-out HEAD matches dispatched target_sha" step above never
+          # hit this because it's gated `if: target_sha != ''` and only ever
+          # ran on an actual dispatched benchmark run; this step's
+          # unconditional `git rev-parse HEAD` below runs on every job
+          # invocation (including plain push/pull_request CI), so it must
+          # register the safe.directory exception itself before invoking
+          # `git`.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # #2184 AC1: independent observation of the checked-out commit --
+          # NEVER the `target_sha` input verbatim. On a `target_sha`
+          # dispatch, the "Verify checked-out HEAD matches dispatched
+          # target_sha" step above already hard-fails the job if this
+          # would disagree with `target_sha`; on a normal (non-benchmark)
+          # run, this simply reflects the actual checked-out commit.
+          GH_MEASURED_HEAD_SHA="$(git rev-parse HEAD)"
+          export NODE_VERSION_RAW PNPM_VERSION_RAW LOCKFILE_HASH_RAW WORKFLOW_DIGEST_RAW GH_MEASURED_HEAD_SHA
           python3 - <<'PY'
           import json, os, pathlib
           fingerprint_fields = {
@@ -1706,6 +1799,13 @@ jobs:
               # `actions/checkout` `ref:` override to `target_sha`). Recorded
               # as an independent field -- never conflated with `head_sha`.
               "workflow_sha": os.environ.get("GH_WORKFLOW_SHA", "unknown"),
+              # #2184 AC1: the MEASURED application code's commit, observed
+              # independently via `git rev-parse HEAD` in this step (never a
+              # direct copy of the `target_sha` dispatch input). Distinct
+              # from `head_sha` above (which resolves to `github.sha` --
+              # the dispatch ref tip -- on a fixed-SHA benchmark dispatch)
+              # and from `workflow_sha` (the workflow DEFINITION's commit).
+              "measured_head_sha": os.environ.get("GH_MEASURED_HEAD_SHA", "unknown"),
           }
           measurements = []
           p = pathlib.Path("measurements.jsonl")
