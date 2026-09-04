@@ -1076,6 +1076,95 @@ def test_ac4g_legacy_ambiguous_exclusion_scoped_to_e2e_core_responsive_matrix_jo
 
 
 # --------------------------------------------------------------------------- #
+# #2184 AC2 (fix_delta after OWNER adversarial review of PR #2493,
+# issuecomment-5540651128): `workflow_run_head_sha` MUST be derived SOLELY
+# from the raw artifact's existing `merge_sha` field -- a caller-supplied
+# `workflow_run_head_sha` field on the raw record is never consulted and
+# can never override/launder `merge_sha`'s provenance.
+# --------------------------------------------------------------------------- #
+def test_ac2_explicit_workflow_run_head_sha_field_cannot_override_merge_sha_provenance():
+    """GIVEN a raw record whose `merge_sha=C` (the genuine
+    `ci_runtime_baseline_v1` provenance source, #2184 AC2) also carries a
+    caller-supplied `workflow_run_head_sha=B` field (B != C -- e.g. a
+    compromised/misbehaving producer step or a hand-crafted input JSON
+    attempting to launder a `merge_sha` disagreement past verification)
+    WHEN derived/collected/live-API-verified THEN `C` (`merge_sha`) is
+    used throughout -- NEVER `B` -- so a live API response reporting
+    `head_sha=B` for that artifact/job is correctly flagged as a
+    self-consistency MISMATCH against `C`, rather than being silently
+    accepted because it happens to equal the attacker-supplied `B`
+    override (the exact laundering path the OWNER review flagged)."""
+    merge_sha_c = "5" * 40
+    explicit_override_b = "6" * 40
+    assert merge_sha_c != explicit_override_b
+
+    record = _record(653, job="e2e-core", head_sha=BEFORE_SHA, merge_sha=merge_sha_c)
+    # Simulate a caller/producer that additionally injected an explicit
+    # `workflow_run_head_sha` field disagreeing with `merge_sha` -- this
+    # must be inert.
+    record["workflow_run_head_sha"] = explicit_override_b
+
+    # 1. `_derive_workflow_run_head_sha` returns `merge_sha` (C), never the
+    #    caller-supplied override (B).
+    assert collector._derive_workflow_run_head_sha(record) == merge_sha_c
+
+    # 2. The derived value propagates into the manifest RunRecord as `C`,
+    #    not `B`.
+    evidence_errors: list[dict] = []
+    result = collector._collect_arm(
+        arm_name="before",
+        commit_sha=BEFORE_SHA,
+        raw_records=[record],
+        job_names=("e2e-core",),
+        min_run_count=1,
+        evidence_errors=evidence_errors,
+    )
+    assert evidence_errors == []
+    run = result["jobs"]["e2e-core"]["runs"][0]
+    assert run["workflow_run_head_sha"] == merge_sha_c
+    assert run["workflow_run_head_sha"] != explicit_override_b
+
+    # 3. Live-API self-consistency: a live API response whose head_sha
+    #    equals the attacker-supplied `B` override (NOT `C`) must be
+    #    reported as a mismatch, never silently accepted.
+    def fake_api_call(endpoint: str) -> dict:
+        if endpoint == "repos/owner/repo/actions/runs/653/artifacts?per_page=100&page=1":
+            return _fake_artifacts_response(
+                [
+                    _live_api_artifact(
+                        653,
+                        record["artifact_digest"],
+                        653,
+                        explicit_override_b,
+                        name="ci-runtime-baseline-e2e-core-1",
+                    )
+                ]
+            )
+        if endpoint == "repos/owner/repo/actions/runs/653/attempts/1/jobs":
+            return {
+                "jobs": [
+                    {
+                        "run_attempt": 1,
+                        "name": "e2e-core",
+                        "head_sha": explicit_override_b,
+                        "conclusion": "success",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+    violations = collector.verify_run_record_against_live_api(
+        record, BEFORE_SHA, "owner/repo", api_call=fake_api_call
+    )
+    assert any(
+        f"artifact_head_sha_mismatch_vs_live_api: expected={merge_sha_c!r}" in v for v in violations
+    )
+    assert any(
+        f"run_attempt_job_head_sha_mismatch_vs_live_api: expected={merge_sha_c!r}" in v for v in violations
+    )
+
+
+# --------------------------------------------------------------------------- #
 # #2159 P0-3: genuine LIVE GitHub API verification (real network call via
 # `gh api`, no injected fake transport). Requires an authenticated `gh` CLI
 # -- SKIPs (not a fabricated PASS) when unavailable, per this repo's

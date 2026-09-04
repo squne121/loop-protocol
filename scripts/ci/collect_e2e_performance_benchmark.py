@@ -54,10 +54,13 @@ absent -- a record without them is a pre-#2184 legacy shape, see
       "merge_sha": "<the SAME 40-hex value the raw ci_runtime_baseline_v1
         artifact's `merge_sha` field already carries (`GH_SHA: ${{
         github.sha }}`, unchanged by this Issue); this collector derives
-        `workflow_run_head_sha` from it (see
-        `_derive_workflow_run_head_sha`) -- a caller MAY instead supply an
-        already-derived `workflow_run_head_sha` field directly, which then
-        takes precedence>"
+        `workflow_run_head_sha` SOLELY from it (see
+        `_derive_workflow_run_head_sha`) -- a caller-supplied
+        `workflow_run_head_sha` field, if present on a record, is NEVER
+        consulted and can never override/bypass this derivation (fix_delta
+        after OWNER adversarial review of PR #2493,
+        issuecomment-5540651128: honoring a caller-supplied override was a
+        provenance-laundering path around `merge_sha`)>"
     }
 
 #2184 AC4(iii): a record for job `e2e-core`/`e2e-responsive-matrix`
@@ -327,17 +330,20 @@ def _is_valid_digest(value: object) -> bool:
 
 
 def _derive_workflow_run_head_sha(record: dict) -> object:
-    """#2184 AC2: derives `workflow_run_head_sha` from the raw
-    `ci_runtime_baseline_v1` artifact's EXISTING `merge_sha` field
-    (`.github/workflows/ci.yml`'s `GH_SHA: ${{ github.sha }}`, unchanged
-    by this Issue) -- no new producer env var or `gh api` call is
-    introduced (AC2). An explicit `workflow_run_head_sha` key on
-    `record`, if a caller already computed one, takes precedence over
-    deriving it from `merge_sha`. Returns `None` when neither is present
-    (a pre-#2159 record shape that never carried `merge_sha` at all)."""
-    explicit = record.get("workflow_run_head_sha")
-    if explicit is not None:
-        return explicit
+    """#2184 AC2 (narrowed by fix_delta after OWNER adversarial review of
+    PR #2493, issuecomment-5540651128): derives `workflow_run_head_sha`
+    SOLELY from the raw `ci_runtime_baseline_v1` artifact's EXISTING
+    `merge_sha` field (`.github/workflows/ci.yml`'s `GH_SHA: ${{
+    github.sha }}`, unchanged by this Issue) -- no new producer env var or
+    `gh api` call is introduced (AC2). A caller-supplied `workflow_run_head_
+    sha` field on `record` is NEVER consulted here and can never override
+    `merge_sha` -- honoring it would let a caller launder an artifact whose
+    real `merge_sha` provenance disagrees with a self-declared value past
+    the live-API self-consistency check in `verify_run_record_against_live_api`
+    (#2184 AC2 requires `workflow_run_head_sha` be *derived from* the raw
+    artifact's `merge_sha`, not independently suppliable). Returns `None`
+    when `merge_sha` is absent (a pre-#2159 record shape that never carried
+    `merge_sha` at all)."""
     return record.get("merge_sha")
 
 
@@ -627,10 +633,12 @@ def verify_run_record_against_live_api(
     pre-existing artifacts-listing call is made, no attempt-jobs call.
 
     #2184 AC4(i): the live API's OWN `head_sha` (`api_workflow_run.
-    head_sha` / `api_job.head_sha`) is compared for SELF-CONSISTENCY
-    against `record`'s own claimed `workflow_run_head_sha` (an explicit
-    field, or derived from the existing `merge_sha` field -- #2184 AC2,
-    `_derive_workflow_run_head_sha`) -- NEVER against `expected_head_sha`
+    head_sha`) is compared for SELF-CONSISTENCY against `record`'s
+    `workflow_run_head_sha`, derived SOLELY from the raw artifact's
+    existing `merge_sha` field (#2184 AC2, `_derive_workflow_run_head_sha`
+    -- a caller-supplied `workflow_run_head_sha` field on `record` is
+    never consulted, fix_delta after OWNER adversarial review of PR #2493,
+    issuecomment-5540651128) -- NEVER against `expected_head_sha`
     (the measured/target_sha commit): `measured_head_sha` and
     `workflow_run_head_sha` are independent concepts and are EXPECTED to
     differ on a fixed-SHA benchmark dispatch, so comparing the live API's
