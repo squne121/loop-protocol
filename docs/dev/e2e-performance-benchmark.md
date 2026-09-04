@@ -145,7 +145,7 @@ uv run --locked python3 tests/ci/test_ci_performance_gate.py \
 | `2` | `gate_status: complete` だが built assessment が構造/意味検証に失敗 |
 | `3` | `semantic_valid` だが `approval_eligible` が false（#2423 AC4 -- トラステッド binding 未提供・head SHA mismatch・digest mismatch 等） |
 
-### `CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1` receipt（#2423 AC3）
+### `CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1` receipt スキーマ（#2423 AC3）
 
 `--receipt-output <path>` を指定すると、`tests/ci/test_ci_performance_gate.py::build_close_grade_receipt` が `CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1` を追加で書き出す。これは #2424 が内部関数 import や独自 digest 再発明なしに読む consumer 契約であり、フィールド名は #2424 側とバイト一致させている: `experiment_identity` / `manifest_sha256` / `run_set_digest` / `materialization_policy` / `arms.{monolith,split}.workflow_run_ids`（root run set）/ `arms.{monolith,split}.performance_eligible_workflow_run_ids` / `evidence_errors[]` / `performance_assessment.complete` / `trusted_functional_evidence.{ci_verdict_summary_artifact_id, ci_verdict_summary_file_sha256, github_artifact_digest, expected_head_sha}` / `validation.{semantic_valid, approval_eligible}` / `exit_code`。
 
