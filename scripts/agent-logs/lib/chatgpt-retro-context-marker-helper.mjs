@@ -264,6 +264,111 @@ export function validateChatgptRetroContextCommentBody(body, {
   }
 }
 
+// #2489 P0-2 fix (PR #2496 OWNER review issuecomment-5546874328): fixed
+// pilot-governance metadata for the chatgpt_retro_context_marker/v1 payload.
+// `safety` is entirely schema-const (untrusted_evidence_mode/forbidden_fields_scan/
+// rendered_markdown_scan/raw_values_emitted/free_form_instructions_present are
+// all `const` in docs/schemas/chatgpt-retro-context-marker.schema.json) and
+// `prerequisites` references fixed governance Issues (#1157 containment,
+// #1220 pilot exception, #1221 capability matrix, #1222 schema, #1223
+// adapter) that do not vary per completion run. Neither object is derived
+// from postAgentRunReport/updateRetroIndex results.
+export const CHATGPT_RETRO_CONTEXT_SAFETY_DEFAULTS = Object.freeze({
+  untrusted_evidence_mode: 'typed_refs_only',
+  free_form_instructions_present: false,
+  forbidden_fields_scan: 'pass',
+  rendered_markdown_scan: 'pass',
+  raw_values_emitted: false,
+})
+
+export const CHATGPT_RETRO_CONTEXT_PREREQUISITES_DEFAULTS = Object.freeze({
+  containment_issue: 1157,
+  pilot_exception_issue: 1220,
+  capability_matrix_issue: 1221,
+  schema_issue: 1222,
+  adapter_issue: 1223,
+  real_pilot_allowed: false,
+  evidence_mode: 'synthetic_only',
+})
+
+const PLACEHOLDER_PAYLOAD_DIGEST = `sha256:${'0'.repeat(64)}`
+
+/**
+ * Builds a chatgpt_retro_context_marker/v1 payload from the ACTUAL results
+ * of the postAgentRunReport / updateRetroIndex upserts (their real
+ * comment_url / digest / canonical_index_digest / source_comment_set_digest)
+ * -- never from a pre-generated markdown file (#2489 P0-2 fix: the prior
+ * design read `--chatgpt-payload-markdown-file` and passed its content
+ * straight through, which broke the existing digest-chain resolver's
+ * convergence on partial-failure retry because the referenced comment
+ * URLs/digests did not correspond to what was actually posted).
+ *
+ * `agentRunReportDigest` is the raw hex digest as returned by
+ * postAgentRunReport's `sha256` field (no `sha256:` prefix); this function
+ * adds the prefix. `retroIndexDigest` / `retroIndexSourceSetDigest` are
+ * already `sha256:`-prefixed as returned by updateRetroIndex's
+ * `canonical_index_digest` / `source_comment_set_digest` fields.
+ *
+ * `templateOverrides` (optional) may supply `marker_kind` / `safety` /
+ * `prerequisites` from a supplemental template payload (e.g. extracted from
+ * a `--chatgpt-payload-markdown-file`); it is never used for `repo` /
+ * `target` / `parent_issue` / `refs` / `canonicalization` / `created_at`,
+ * which always come from the actual arguments passed in.
+ *
+ * @returns {object} an unvalidated chatgpt_retro_context_marker/v1 payload
+ *   (caller is responsible for running it through validateChatgptRetroContextMarker /
+ *   renderPublicMarkdown, matching the existing schema/renderer contract).
+ */
+export function buildChatgptRetroContextPayloadFromResults({
+  repo,
+  targetType,
+  targetNumber,
+  parentIssue,
+  agentRunReportDigest,
+  agentRunReportCommentUrl,
+  agentRunReportSupersedesDigest = null,
+  retroIndexDigest,
+  retroIndexSourceSetDigest,
+  retroIndexCommentUrl,
+  createdAt = new Date().toISOString(),
+  templateOverrides = null,
+}) {
+  const payload = {
+    schema: 'chatgpt_retro_context_marker/v1',
+    marker_kind: templateOverrides?.marker_kind ?? 'CHATGPT_RETRO_CONTEXT_V1',
+    repo,
+    target: { type: targetType, number: targetNumber },
+    parent_issue: parentIssue,
+    canonicalization: {
+      algorithm: 'canonical-json-v1',
+      payload_digest: PLACEHOLDER_PAYLOAD_DIGEST,
+    },
+    refs: {
+      run_reports: [
+        {
+          comment_url: agentRunReportCommentUrl,
+          payload_digest: `sha256:${agentRunReportDigest}`,
+          schema_ref: 'docs/schemas/agent-run-report.schema.json#agent_run_report/v1',
+          validation_verdict: 'pass',
+          supersedes_digest: agentRunReportSupersedesDigest,
+        },
+      ],
+      retro_index: {
+        comment_url: retroIndexCommentUrl,
+        payload_digest: retroIndexDigest,
+        source_set_digest: retroIndexSourceSetDigest,
+        schema_ref: 'docs/schemas/agent-retro-index.schema.json#agent_retro_index/v1',
+        validation_verdict: 'pass',
+      },
+    },
+    safety: templateOverrides?.safety ?? CHATGPT_RETRO_CONTEXT_SAFETY_DEFAULTS,
+    prerequisites: templateOverrides?.prerequisites ?? CHATGPT_RETRO_CONTEXT_PREREQUISITES_DEFAULTS,
+    created_at: createdAt,
+  }
+  payload.canonicalization.payload_digest = computeChatgptRetroContextPayloadDigest(payload)
+  return payload
+}
+
 export function computeChatgptRetroContextPayloadDigest(payload) {
   const normalizedPayload = JSON.parse(JSON.stringify(payload))
   if (normalizedPayload?.canonicalization) {

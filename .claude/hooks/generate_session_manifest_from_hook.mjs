@@ -234,14 +234,42 @@ const EVENT_PHASE_MAP = {
   PostToolUse: { mainLoop: 'impl', ledgerPhase: 'implementation' },
 }
 
-// Issue #2489: hook_event_name -> completion_outcome / completion_source mapping.
-// Only Stop / StopFailure carry an observed terminal signal via this hook path;
-// all other events leave completion_outcome / completion_source undefined
-// (producer omits the fields rather than guessing a value).
-const EVENT_COMPLETION_MAP = {
-  Stop: { completionOutcome: 'completed', completionSource: 'hook' },
-  StopFailure: { completionOutcome: 'failed', completionSource: 'hook' },
-}
+// Issue #2489 P0-1 fix (PR #2496 OWNER review issuecomment-5546874328 / bridge
+// comment issue-2489#issuecomment-5546983884): `Stop` / `StopFailure` are
+// TURN-level Claude Code hook events (upstream hooks reference), not
+// session/run-level completion signals. Root `completion_outcome` /
+// `completion_source` (which represent session/run completion) are therefore
+// NEVER set from this hook path -- only launcher process exit or later
+// reconciliation evidence (e.g. scripts/agent-logs/complete-agent-run.mjs)
+// may set them. This hook path only ever records `hook_event.event_type`
+// (and, for StopFailure, an optional `hook_event.error_type`) as turn-level
+// evidence.
+const KNOWN_HOOK_EVENT_TYPES = new Set([
+  'SubagentStart',
+  'SubagentStop',
+  'PostToolUse',
+  'Stop',
+  'PreToolUse',
+  'StopFailure',
+])
+
+// Upstream Claude Code StopFailure structured error taxonomy (Claude Code
+// hooks reference). Any value outside this set (or a missing value)
+// normalizes to 'unknown' rather than being guessed or omitted -- StopFailure
+// always represents an observed failure, so recording *that* a failure
+// occurred (with an indeterminate specific cause) is preferable to silently
+// dropping the field.
+const KNOWN_STOP_FAILURE_ERROR_TYPES = new Set([
+  'rate_limit',
+  'overloaded',
+  'authentication_failed',
+  'billing_error',
+  'invalid_request',
+  'model_not_found',
+  'server_error',
+  'max_output_tokens',
+  'unknown',
+])
 
 /**
  * Derive runtime_lane strictly from the launcher-set CLAUDE_GPT_CLAUDE_BIN
@@ -257,19 +285,39 @@ export function resolveRuntimeLane(env) {
 }
 
 /**
- * Derive completion_outcome / completion_source strictly from the hook event
- * name. Events with no observed terminal signal in this hook path return
- * null for both fields (caller omits the CLI args rather than guessing).
+ * Resolve the hook_event.event_type value to record as turn-level evidence.
+ * This is NEVER used to set root completion_outcome/completion_source (see
+ * the KNOWN_HOOK_EVENT_TYPES comment above). Unknown event names return null
+ * so the caller omits hook_event.event_type rather than recording a value
+ * outside the schema enum.
  *
  * @param {string} hookEventName
- * @returns {{completionOutcome: string|null, completionSource: string|null}}
+ * @returns {string|null}
  */
-export function resolveCompletionFields(hookEventName) {
-  const mapped = EVENT_COMPLETION_MAP[hookEventName]
-  if (!mapped) {
-    return { completionOutcome: null, completionSource: null }
+export function resolveHookEventType(hookEventName) {
+  return KNOWN_HOOK_EVENT_TYPES.has(hookEventName) ? hookEventName : null
+}
+
+/**
+ * Resolve the optional hook_event.error_type from a StopFailure hook
+ * payload's structured error (upstream Claude Code error taxonomy). Returns
+ * null for any event other than StopFailure (the field only ever applies to
+ * a StopFailure observation). A missing or unrecognized error type value
+ * normalizes to 'unknown' rather than being omitted or guessed -- the event
+ * itself already tells us a failure was observed; only the specific cause is
+ * indeterminate in that case.
+ *
+ * @param {string} hookEventName
+ * @param {object|null} hookCtx
+ * @returns {string|null}
+ */
+export function resolveHookErrorType(hookEventName, hookCtx) {
+  if (hookEventName !== 'StopFailure') return null
+  const rawType = hookCtx?.error?.type ?? hookCtx?.error_type ?? null
+  if (typeof rawType === 'string' && KNOWN_STOP_FAILURE_ERROR_TYPES.has(rawType)) {
+    return rawType
   }
-  return { completionOutcome: mapped.completionOutcome, completionSource: mapped.completionSource }
+  return 'unknown'
 }
 
 // ============================================================================
@@ -536,7 +584,7 @@ export function resolveIssueNumber(hookCtx, { branchName = null, cwdPath = null 
  *            phaseInstanceId: string, actorType: string, actorName: string,
  *            evidenceSourceKind: string, evidenceSourceRef: string, evidenceVisibility: string,
  *            sessionId: string|null, resolvedIssueNumber: number|null,
- *            runtimeLane?: string|null, completionOutcome?: string|null, completionSource?: string|null }} params
+ *            runtimeLane?: string|null, hookEventType?: string|null, hookErrorType?: string|null }} params
  * @returns {string[]}
  */
 export function buildProducerArgs({
@@ -552,8 +600,8 @@ export function buildProducerArgs({
   sessionId,
   resolvedIssueNumber,
   runtimeLane = null,
-  completionOutcome = null,
-  completionSource = null,
+  hookEventType = null,
+  hookErrorType = null,
 }) {
   const args = [
     producerScript,
@@ -588,11 +636,14 @@ export function buildProducerArgs({
   if (runtimeLane) {
     args.push('--runtime-lane', runtimeLane)
   }
-  if (completionOutcome) {
-    args.push('--completion-outcome', completionOutcome)
+  // #2489 P0-1: this hook path never passes --completion-outcome /
+  // --completion-source (root session/run-level completion fields). It only
+  // ever passes turn-level hook_event evidence.
+  if (hookEventType) {
+    args.push('--hook-event-type', hookEventType)
   }
-  if (completionSource) {
-    args.push('--completion-source', completionSource)
+  if (hookErrorType) {
+    args.push('--hook-error-type', hookErrorType)
   }
   return args
 }
@@ -712,13 +763,17 @@ async function main() {
       actorName = `claude-code-hook-${safeToolName}`
     }
 
-    // #2489: derive runtime_lane / completion_outcome / completion_source.
+    // #2489: derive runtime_lane / hook_event.event_type / hook_event.error_type.
     // runtime_lane provenance is CLAUDE_GPT_CLAUDE_BIN presence only (never
-    // inferred from actor.name / transcript). completion fields are derived
-    // from the hook event name only (Stop/StopFailure); other events omit
-    // both rather than guessing.
+    // inferred from actor.name / transcript). hook_event.event_type /
+    // error_type are turn-level evidence derived from the hook event name
+    // (and, for StopFailure, its structured error) only. Root
+    // completion_outcome / completion_source are NEVER derived or passed
+    // from this hook path (#2489 P0-1 fix) -- they are set only by launcher
+    // process exit or later reconciliation evidence.
     const runtimeLane = resolveRuntimeLane(process.env)
-    const { completionOutcome, completionSource } = resolveCompletionFields(hookEventName)
+    const hookEventType = resolveHookEventType(hookEventName)
+    const hookErrorType = resolveHookErrorType(hookEventName, hookCtx)
 
     // Build producer CLI arguments via exported helper (testable separately)
     const producerArgs = buildProducerArgs({
@@ -734,8 +789,8 @@ async function main() {
       sessionId,
       resolvedIssueNumber,
       runtimeLane,
-      completionOutcome,
-      completionSource,
+      hookEventType,
+      hookErrorType,
     })
 
     let manifestJson

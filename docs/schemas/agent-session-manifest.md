@@ -160,6 +160,7 @@ hook イベント情報を記録する。Claude Code hook から生成される 
 | `event_type` | enum | no | `SubagentStart \| SubagentStop \| PostToolUse \| Stop \| PreToolUse \| StopFailure`（`StopFailure` は #2489 で追加） |
 | `hook_id` | string\|null | no | hook 実行 ID（optional） |
 | `triggered_at` | string\|null | no | hook トリガー時刻（ISO 8601） |
+| `error_type` | enum | no | `StopFailure` イベントで観測された upstream structured error taxonomy（`rate_limit \| overloaded \| authentication_failed \| billing_error \| invalid_request \| model_not_found \| server_error \| max_output_tokens \| unknown`、#2489 で追加）。turn-level evidence であり、root `completion_outcome`/`completion_source` の設定には使わない。判定困難な値は `unknown` に正規化する |
 
 ### `sanitization_status`（任意項目、optional）
 
@@ -203,31 +204,38 @@ hook 記録時に設定される機微情報のサニタイズ状態。
 
 provenance は `.claude/hooks/generate_session_manifest_from_hook.mjs` が既存の launcher-set 環境変数 `CLAUDE_GPT_CLAUDE_BIN` の有無のみから導出する。`actor.name` や transcript 内容からの推測は行わない。`scripts/generate-session-manifest.mjs`（producer 本体）は `--runtime-lane` CLI 引数の値をそのまま受け取るのみで、値の導出ロジックを producer 側には持たない。
 
-### `completion_outcome`（任意項目、root-level scalar）
+### `completion_outcome`（任意項目、root-level scalar。session/run-level）
+
+**重要（#2489 P0-1、PR #2496 OWNER 敵対的レビュー issuecomment-5546874328 対応）**: `completion_outcome` は session/run 全体の終了結果を表す。Claude Code upstream 仕様上、`Stop` / `StopFailure` は **turn-level**（1回の応答の終了）イベントであり、`SessionEnd` が **session-level** イベントである。したがってこのフィールドを `Stop` / `StopFailure` hook から直接設定してはならない（観測していない session/run completion を turn 観測から推測することになるため）。
 
 | 値 | 説明 |
 |---|---|
-| `completed` | `Stop` イベントで正常完了が観測された |
-| `failed` | `StopFailure` イベントで失敗終了が観測された |
-| `interrupted` | 現時点の hook 経路では観測されない（将来の拡張余地として enum のみ予約） |
-| `incomplete` | 現時点の hook 経路では観測されない（将来の拡張余地として enum のみ予約） |
+| `completed` | launcher process exit または後段 reconciliation により観測された正常完了（本 Issue のスコープでは producer 側の値充填は未実装。enum のみ予約） |
+| `failed` | launcher process exit または後段 reconciliation により観測された失敗終了（同上） |
+| `interrupted` | 現時点では観測経路未実装（将来の拡張余地として enum のみ予約） |
+| `incomplete` | 現時点では観測経路未実装（将来の拡張余地として enum のみ予約） |
 | `unavailable` | 観測経路が存在しない、または値を取得できない場合 |
 
-### `completion_source`（任意項目、root-level scalar）
+### `completion_source`（任意項目、root-level scalar。session/run-level）
 
 | 値 | 説明 |
 |---|---|
-| `hook` | `.claude/hooks/generate_session_manifest_from_hook.mjs` が hook イベント（`Stop` / `StopFailure`）から導出した |
-| `launcher` | launcher 側が直接付与した（本 Issue のスコープでは未使用。将来の producer 拡張用に enum のみ予約） |
-| `reconciliation` | 事後の reconciliation 処理が導出した（本 Issue のスコープでは未使用。将来の producer 拡張用に enum のみ予約） |
+| `hook` | turn-level hook からの推測ではなく、launcher/reconciliation 側がturn-level evidence（`hook_event` 等）を集約した上で明示的に設定する場合にのみ使う |
+| `launcher` | launcher 側が直接付与した（本 Issue のスコープでは producer 側の値充填は未実装。enum のみ予約） |
+| `reconciliation` | 事後の reconciliation 処理（例: `scripts/agent-logs/complete-agent-run.mjs`）が導出した（同上） |
 | `unavailable` | 値を取得できない場合 |
 
-### hook イベントと値のマッピング（`.claude/hooks/generate_session_manifest_from_hook.mjs`）
+`completion_outcome` / `completion_source` は `dependentRequired`（JSON Schema 2020-12）により、どちらか一方が存在すれば他方も必須になる（片方だけの存在は schema 違反）。
 
-| hook イベント | `completion_outcome` | `completion_source` |
-|---|---|---|
-| `Stop` | `completed` | `hook` |
-| `StopFailure` | `failed` | `hook` |
+### hook イベントと `hook_event` フィールドのマッピング（`.claude/hooks/generate_session_manifest_from_hook.mjs`）
+
+`Stop` / `StopFailure` hook が実際に埋めるのは **turn-level evidence である `hook_event.event_type`（と StopFailure の場合の optional `hook_event.error_type`）のみ**であり、root `completion_outcome` / `completion_source` はこの hook 経路からは一切設定しない（CLI 引数として渡さない）。
+
+| hook イベント | `hook_event.event_type` | `hook_event.error_type` | root `completion_outcome` / `completion_source` |
+|---|---|---|---|
+| `Stop` | `Stop` | （設定しない） | 設定しない（キー自体が存在しない） |
+| `StopFailure` | `StopFailure` | upstream structured error taxonomy値（判定困難時は `unknown`） | 設定しない（キー自体が存在しない） |
+| その他（`PostToolUse` 等） | 対応するイベント名 | （設定しない） | 設定しない |
 
 `.claude/settings.json` は `Stop` hooks 配列に既存 `session_manifest_coordinator.sh` を再利用したまま `StopFailure` イベントを追加登録する（新規 hook script は追加しない）。
 

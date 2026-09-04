@@ -6,20 +6,29 @@ applicable_acs=[AC2]).
 
 `.claude/hooks/generate_session_manifest_from_hook.mjs` を実プロセスとして起動し、
 synthetic Stop / StopFailure stdin JSON を与えて実際に session manifest
-artifact が期待どおりの completion_outcome / completion_source / runtime_lane
-で書き出されることを確認する。
+artifact が期待どおりの hook_event / runtime_lane で書き出されることを確認する。
 
-- 正常系: Stop stdin JSON -> completion_outcome=completed / completion_source=hook
-- 異常系: StopFailure stdin JSON -> completion_outcome=failed / completion_source=hook
+P0-1 fix（PR #2496 OWNER 敵対的レビュー issuecomment-5546874328、ブリッジ
+コメント issue-2489#issuecomment-5546983884）: Claude Code upstream 仕様上
+`Stop` / `StopFailure` は turn-level event（`SessionEnd` が session-level）
+であるため、session/run-level の `completion_outcome` / `completion_source`
+はこの hook 経路からは絶対に設定しない。この hook が実際に埋めるのは
+turn-level evidence である `hook_event.event_type`（と StopFailure の場合の
+optional `hook_event.error_type`）のみである。
+
+- 正常系: Stop stdin JSON -> hook_event.event_type=Stop、root completion_outcome
+  / completion_source は設定されない（キー自体が存在しない）
+- 異常系: StopFailure stdin JSON -> hook_event.event_type=StopFailure、
+  hook_event.error_type が upstream taxonomy 値（判定困難時は unknown）で
+  記録される。root completion_outcome / completion_source は同様に設定
+  されない
 - CLAUDE_GPT_CLAUDE_BIN 環境変数の有無で runtime_lane が claude_gpt /
   native_claude_code に切り替わることを確認する
 - node 実行環境が無い場合は pytest.skip(...) で SKIP 相当（exit 77 に準じる
   非PASS扱い）とし、PASS と誤判定しない
-- fallback 経由の値（producer が推測で埋めた値）を検出した場合は test failure
-  とし、PASS と判定しない（本 hook 経路には fallback 分岐が存在しないため、
-  producer が --runtime-lane / --completion-outcome / --completion-source を
-  そのまま echo し、hook 側が独自に別の値を混入していないことを確認する形で
-  この不変条件を検証する）
+- fallback 経由の値（producer が推測で埋めた値）を検出した場合、または hook
+  から root completion_outcome/completion_source が設定されてしまった場合は
+  test failure とし、PASS と判定しない
 - producer（scripts/generate-session-manifest.mjs）は hook から常に --validate
   付きで起動され、scripts/lib/agent-session-manifest-validation.mjs が動的に
   `ajv`/`ajv-formats`（package.json devDependencies）を import する。これらが
@@ -273,9 +282,11 @@ def _skip_if_node_unavailable():
         )
 
 
-def test_stop_event_yields_completed_via_hook(tmp_path: Path) -> None:
+def test_stop_event_yields_hook_event_type_only(tmp_path: Path) -> None:
     """GIVEN synthetic Stop stdin JSON WHEN the hook wrapper runs as a real subprocess
-    THEN the written manifest has completion_outcome=completed / completion_source=hook."""
+    THEN the written manifest has hook_event.event_type=Stop as turn-level evidence,
+    and root completion_outcome/completion_source are NOT set (P0-1 fix: Stop is a
+    turn-level event, not a session/run-level completion signal)."""
     stdin_payload, records, result_summary = _run_hook(
         tmp_path, event_name="Stop", session_id="ac2-stop-session", claude_gpt_bin=None
     )
@@ -289,8 +300,16 @@ def test_stop_event_yields_completed_via_hook(tmp_path: Path) -> None:
             f"{len(result_summary['attempts'])} attempt(s); attempts={result_summary['attempts']!r}"
         )
         manifest = records[0]
-        assert manifest.get("completion_outcome") == "completed"
-        assert manifest.get("completion_source") == "hook"
+        assert manifest.get("hook_event", {}).get("event_type") == "Stop"
+        assert "error_type" not in manifest.get("hook_event", {})
+        assert "completion_outcome" not in manifest, (
+            "completion_outcome must NOT be set from the Stop hook (turn-level event, "
+            "not a session/run-level completion signal)"
+        )
+        assert "completion_source" not in manifest, (
+            "completion_source must NOT be set from the Stop hook (turn-level event, "
+            "not a session/run-level completion signal)"
+        )
         assert manifest.get("runtime_lane") == "native_claude_code"
         verdict = "PASS"
     except AssertionError as error:
@@ -307,9 +326,12 @@ def test_stop_event_yields_completed_via_hook(tmp_path: Path) -> None:
         )
 
 
-def test_stop_failure_event_yields_failed_via_hook(tmp_path: Path) -> None:
+def test_stop_failure_event_yields_hook_event_type_and_error_type_only(tmp_path: Path) -> None:
     """GIVEN synthetic StopFailure stdin JSON WHEN the hook wrapper runs as a real subprocess
-    THEN the written manifest has completion_outcome=failed / completion_source=hook."""
+    THEN the written manifest has hook_event.event_type=StopFailure and hook_event.error_type
+    (normalized to 'unknown' when no structured error is present in stdin) as turn-level
+    evidence, and root completion_outcome/completion_source are NOT set (P0-1 fix:
+    StopFailure is a turn-level event, not a session/run-level completion signal)."""
     stdin_payload, records, result_summary = _run_hook(
         tmp_path, event_name="StopFailure", session_id="ac2-stopfailure-session", claude_gpt_bin=None
     )
@@ -323,8 +345,57 @@ def test_stop_failure_event_yields_failed_via_hook(tmp_path: Path) -> None:
             f"{len(result_summary['attempts'])} attempt(s); attempts={result_summary['attempts']!r}"
         )
         manifest = records[0]
-        assert manifest.get("completion_outcome") == "failed"
-        assert manifest.get("completion_source") == "hook"
+        assert manifest.get("hook_event", {}).get("event_type") == "StopFailure"
+        assert manifest.get("hook_event", {}).get("error_type") == "unknown"
+        assert "completion_outcome" not in manifest, (
+            "completion_outcome must NOT be set from the StopFailure hook (turn-level "
+            "event, not a session/run-level completion signal)"
+        )
+        assert "completion_source" not in manifest, (
+            "completion_source must NOT be set from the StopFailure hook (turn-level "
+            "event, not a session/run-level completion signal)"
+        )
+        verdict = "PASS"
+    except AssertionError as error:
+        reason = str(error)
+        raise
+    finally:
+        _write_evidence_log(
+            ac="AC2",
+            inputs={"stdin": stdin_payload, "env_overrides": {"CLAUDE_GPT_CLAUDE_BIN": None}},
+            output=result_summary | {"records": records},
+            verdict=verdict,
+            exit_code=result_summary["returncode"],
+            reason=reason,
+        )
+
+
+def test_stop_failure_event_with_structured_error_yields_recognized_error_type(tmp_path: Path) -> None:
+    """GIVEN synthetic StopFailure stdin JSON carrying a recognized upstream structured
+    error (error.type) WHEN the hook wrapper runs as a real subprocess THEN
+    hook_event.error_type records that recognized value verbatim (not normalized to
+    'unknown')."""
+    stdin_payload, records, result_summary = _run_hook(
+        tmp_path,
+        event_name="StopFailure",
+        session_id="ac2-stopfailure-structured-error-session",
+        claude_gpt_bin=None,
+        extra_stdin={"error": {"type": "rate_limit"}},
+    )
+
+    verdict = "FAIL"
+    reason = None
+    try:
+        assert result_summary["returncode"] == 0
+        assert len(records) == 1, (
+            f"expected exactly one manifest artifact, got {len(records)} after "
+            f"{len(result_summary['attempts'])} attempt(s); attempts={result_summary['attempts']!r}"
+        )
+        manifest = records[0]
+        assert manifest.get("hook_event", {}).get("event_type") == "StopFailure"
+        assert manifest.get("hook_event", {}).get("error_type") == "rate_limit"
+        assert "completion_outcome" not in manifest
+        assert "completion_source" not in manifest
         verdict = "PASS"
     except AssertionError as error:
         reason = str(error)
@@ -360,6 +431,9 @@ def test_claude_gpt_claude_bin_presence_switches_runtime_lane(tmp_path: Path) ->
         )
         manifest = records[0]
         assert manifest.get("runtime_lane") == "claude_gpt"
+        assert manifest.get("hook_event", {}).get("event_type") == "Stop"
+        assert "completion_outcome" not in manifest
+        assert "completion_source" not in manifest
         # Fallback / guessed-value guard: actor.name must remain the
         # deterministic hook actor name, never derived from the runtime_lane
         # value itself (no cross-contamination between the two derivations).
@@ -387,9 +461,10 @@ def test_claude_gpt_claude_bin_presence_switches_runtime_lane(tmp_path: Path) ->
 
 
 def test_unobserved_event_does_not_guess_completion_fields(tmp_path: Path) -> None:
-    """GIVEN a hook event with no observed terminal signal on this path (PostToolUse)
+    """GIVEN a hook event with no session/run-level terminal signal (PostToolUse)
     WHEN the hook wrapper runs THEN completion_outcome/completion_source are absent
-    (unavailable) rather than guessed."""
+    (never guessed), while hook_event.event_type is still recorded as ordinary
+    turn-level evidence."""
     stdin_payload, records, result_summary = _run_hook(
         tmp_path,
         event_name="PostToolUse",
@@ -407,6 +482,8 @@ def test_unobserved_event_does_not_guess_completion_fields(tmp_path: Path) -> No
             f"{len(result_summary['attempts'])} attempt(s); attempts={result_summary['attempts']!r}"
         )
         manifest = records[0]
+        assert manifest.get("hook_event", {}).get("event_type") == "PostToolUse"
+        assert "error_type" not in manifest.get("hook_event", {})
         assert "completion_outcome" not in manifest, (
             "completion_outcome must not be guessed for an event with no observed terminal signal"
         )

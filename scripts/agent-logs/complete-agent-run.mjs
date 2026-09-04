@@ -19,6 +19,17 @@
  * partial failure (e.g. run report succeeds, retro index fails) does not
  * block the remaining artifacts from completing on the same invocation or a
  * rerun.
+ *
+ * #2489 P0-2 fix (PR #2496 OWNER review issuecomment-5546874328): the
+ * chatgpt_retro_context payload is built from the ACTUAL agent_run_report /
+ * retro_index upsert results (their real comment_url / digest /
+ * canonical_index_digest / source_comment_set_digest) via
+ * buildChatgptRetroContextPayloadFromResults(), never from a pre-generated
+ * markdown file. If either prerequisite step failed (or has no real comment
+ * reference yet, e.g. a dry-run first-create), the chatgpt_retro_context
+ * step is not attempted at all this invocation -- it is reported as
+ * `failed` with `reason_code: prerequisite_failed` so a rerun of the same
+ * completion command builds the marker once the prerequisites are real.
  */
 
 import { readFileSync } from 'fs'
@@ -27,9 +38,13 @@ import { fileURLToPath } from 'url'
 import { parseArgs, printCliError, runtimeError, CliError } from './lib/args.mjs'
 import { loadDraft } from './lib/draft.mjs'
 import { GhCliIssueCommentsClient, GithubApiError, summarizeGithubApiError } from './lib/github-comments.mjs'
+import { extractPayloadFromMarkdown, renderPublicMarkdown } from '../lib/agent-run-report-validation.mjs'
 import { postAgentRunReport } from './post-agent-run-report.mjs'
 import { updateRetroIndex } from './update-retro-index.mjs'
-import { upsertChatgptRetroContextComment } from './lib/chatgpt-retro-context-marker-helper.mjs'
+import {
+  buildChatgptRetroContextPayloadFromResults,
+  upsertChatgptRetroContextComment,
+} from './lib/chatgpt-retro-context-marker-helper.mjs'
 
 const OPTION_SPEC = {
   '--repo': { key: 'repo', required: true },
@@ -41,7 +56,13 @@ const OPTION_SPEC = {
   '--additional-pull-number': { key: 'additionalPullNumbers', multiple: true },
   '--chatgpt-target-type': { key: 'chatgptTargetType', required: true },
   '--chatgpt-target-number': { key: 'chatgptTargetNumber', required: true },
-  '--chatgpt-payload-markdown-file': { key: 'chatgptPayloadMarkdownFile', required: true },
+  // #2489 P0-2 fix: no longer required / no longer authoritative for
+  // comment URLs or digests. When present, it is read only as a
+  // supplemental template supplying `marker_kind` / `safety` /
+  // `prerequisites` (all fixed pilot-governance metadata); the actual
+  // refs/canonicalization always come from the live postAgentRunReport /
+  // updateRetroIndex results.
+  '--chatgpt-payload-markdown-file': { key: 'chatgptPayloadMarkdownFile' },
   '--chatgpt-expected-supersedes-digest': { key: 'chatgptExpectedSupersedesDigest' },
   '--dry-run': { key: 'dryRun', defaultValue: 'true' },
   '--confirm-live': { key: 'confirmLive', defaultValue: 'false' },
@@ -164,26 +185,69 @@ export async function completeAgentRun({
     return statusFromAction('retro_index', upsert.action, {
       comment_id: upsert.comment_id,
       comment_url: upsert.comment_url,
-      rest: { digest: upsert.canonical_index_digest ?? null },
+      rest: {
+        digest: upsert.canonical_index_digest ?? null,
+        source_set_digest: upsert.source_comment_set_digest ?? null,
+      },
     })
   })
 
-  const chatgptRetroContext = await runStep('chatgpt_retro_context', async () => {
-    const upsert = await upsertChatgptRetroContextComment(chatgptClient, {
-      repo,
-      targetType: chatgptTarget.targetType,
-      targetNumber: chatgptTarget.targetNumber,
-      parentIssue,
-      payloadMarkdown: chatgptTarget.payloadMarkdown,
-      dryRun,
-      expectedSupersedesDigest: chatgptTarget.expectedSupersedesDigest ?? null,
-    })
-    return statusFromAction('chatgpt_retro_context', upsert.action, {
-      comment_id: upsert.comment_id,
-      comment_url: upsert.comment_url,
-      rest: { digest: upsert.digest ?? null },
-    })
-  })
+  // #2489 P0-2 fix: the chatgpt_retro_context marker must reference the
+  // ACTUAL agent_run_report / retro_index comments -- if either prerequisite
+  // did not succeed with a real comment reference this invocation (failed,
+  // or a dry-run first-create with no comment_url yet), do not attempt the
+  // upsert at all. A rerun of the same completion command will pick it up
+  // once both prerequisites have real references (idempotency of the first
+  // two steps means this never duplicates them).
+  const prerequisitesReady = agentRunReport.status !== 'failed'
+    && retroIndex.status !== 'failed'
+    && Boolean(agentRunReport.comment_url)
+    && Boolean(retroIndex.comment_url)
+
+  const chatgptRetroContext = prerequisitesReady
+    ? await runStep('chatgpt_retro_context', async () => {
+        const payload = buildChatgptRetroContextPayloadFromResults({
+          repo,
+          targetType: chatgptTarget.targetType,
+          targetNumber: chatgptTarget.targetNumber,
+          parentIssue,
+          agentRunReportDigest: agentRunReport.digest,
+          agentRunReportCommentUrl: agentRunReport.comment_url,
+          retroIndexDigest: retroIndex.digest,
+          retroIndexSourceSetDigest: retroIndex.source_set_digest,
+          retroIndexCommentUrl: retroIndex.comment_url,
+          // Deterministic across reruns of the SAME completion command: derived
+          // from the run's own start time (part of the input draft), not
+          // wall-clock "now". Using `new Date().toISOString()` here would make
+          // the payload digest differ on every rerun even when nothing about
+          // the underlying run/report/index actually changed, breaking the
+          // idempotent noop convergence this coordinator depends on.
+          createdAt: draft.started_at,
+          templateOverrides: chatgptTarget.templateOverrides ?? null,
+        })
+        const payloadMarkdown = renderPublicMarkdown(payload)
+        const upsert = await upsertChatgptRetroContextComment(chatgptClient, {
+          repo,
+          targetType: chatgptTarget.targetType,
+          targetNumber: chatgptTarget.targetNumber,
+          parentIssue,
+          payloadMarkdown,
+          dryRun,
+          expectedSupersedesDigest: chatgptTarget.expectedSupersedesDigest ?? null,
+        })
+        return statusFromAction('chatgpt_retro_context', upsert.action, {
+          comment_id: upsert.comment_id,
+          comment_url: upsert.comment_url,
+          rest: { digest: upsert.digest ?? null },
+        })
+      })
+    : {
+        artifact: 'chatgpt_retro_context',
+        status: 'failed',
+        reason_code: 'prerequisite_failed',
+        comment_id: null,
+        comment_url: null,
+      }
 
   const artifacts = {
     agent_run_report: agentRunReport,
@@ -217,11 +281,34 @@ async function main() {
   } catch {
     throw runtimeError('agent_run_complete.report_read_failed', 'report file could not be read as JSON')
   }
-  let chatgptPayloadMarkdown
-  try {
-    chatgptPayloadMarkdown = readFileSync(options.chatgptPayloadMarkdownFile, 'utf-8')
-  } catch {
-    throw runtimeError('agent_run_complete.chatgpt_payload_read_failed', 'chatgpt payload markdown file could not be read')
+  // #2489 P0-2 fix: --chatgpt-payload-markdown-file is now optional and, when
+  // present, supplies only supplemental template fields (marker_kind /
+  // safety / prerequisites), never comment URLs or digests (those always
+  // come from the actual postAgentRunReport / updateRetroIndex results built
+  // inside completeAgentRun()). A read/parse failure here is non-fatal: it
+  // only means the fixed defaults (CHATGPT_RETRO_CONTEXT_SAFETY_DEFAULTS /
+  // CHATGPT_RETRO_CONTEXT_PREREQUISITES_DEFAULTS) are used instead.
+  let chatgptTemplateOverrides = null
+  if (options.chatgptPayloadMarkdownFile) {
+    try {
+      const templateMarkdown = readFileSync(options.chatgptPayloadMarkdownFile, 'utf-8')
+      const extraction = extractPayloadFromMarkdown(templateMarkdown, 'chatgpt_retro_context_marker/v1')
+      if (extraction.ok) {
+        chatgptTemplateOverrides = {
+          marker_kind: extraction.payload.marker_kind,
+          safety: extraction.payload.safety,
+          prerequisites: extraction.payload.prerequisites,
+        }
+      } else {
+        console.error(
+          `[agent-run:complete] warn: --chatgpt-payload-markdown-file could not be parsed as a chatgpt_retro_context_marker/v1 template (${extraction.error?.code ?? 'unknown'}); falling back to fixed defaults`,
+        )
+      }
+    } catch {
+      console.error(
+        '[agent-run:complete] warn: --chatgpt-payload-markdown-file could not be read; falling back to fixed defaults',
+      )
+    }
   }
 
   const result = await completeAgentRun({
@@ -232,7 +319,7 @@ async function main() {
     chatgptTarget: {
       targetType: options.chatgptTargetType,
       targetNumber: Number(options.chatgptTargetNumber),
-      payloadMarkdown: chatgptPayloadMarkdown,
+      templateOverrides: chatgptTemplateOverrides,
       expectedSupersedesDigest: options.chatgptExpectedSupersedesDigest ?? null,
     },
     issueNumber: options.issueNumber ?? null,
