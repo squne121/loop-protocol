@@ -1697,6 +1697,98 @@ def extract_claude_final_result_text(stdout: str) -> str | None:
     return None
 
 
+def extract_claude_main_output_text(stdout: str) -> str:
+    """The single, authoritative "main" (non-subagent, non-hook-echo)
+    output text channel (PR #2500 fix_delta for Issue #2498, OWNER
+    REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805,
+    findings P1-1/P1-2): every ``type: "assistant"`` stream-json event's
+    own ``message.content[].text`` block, IN EMISSION ORDER, joined with a
+    newline.
+
+    Two things are deliberately EXCLUDED, both load-bearing:
+
+    * Any ``type: "system"`` hook lifecycle event (e.g.
+      ``UserPromptExpansion``'s own stdin echo of the caller's
+      prompt/command_args/command text). Including those would let a
+      marker or ordered-marker the CALLER merely wrote into the prompt
+      satisfy a ``--expect-marker-source main`` / ``--expect-ordered-
+      marker`` assertion the model itself never produced (P1-1).
+    * The terminal ``type: "result"`` event's own ``result`` field.
+      ``extract_claude_final_result_text``'s docstring already documents
+      (confirmed against a live Claude Code 2.1.261 invocation) that this
+      field REPLAYS the exact text of the last assistant message verbatim
+      -- i.e. it is not independent evidence, it is the SAME content as
+      the last entry already included from the loop above. Including it
+      too would double-count that one final answer as two separate
+      occurrences, which is exactly what let a reverse-order single
+      answer masquerade as forward-order evidence in
+      ``evaluate_ordered_evidence_match`` (P1-2): a cursor-based
+      sequential scan could find an early marker in the assistant event's
+      own text and a later marker only in the result event's replay of
+      that SAME text, incorrectly reporting forward order for content
+      that was actually reversed within one single answer.
+
+    Used as the canonical evidence text for BOTH the ``--expect-marker-
+    source main`` marker search (P1-1) and the ``--expect-ordered-marker``
+    match (P1-2), so the two concerns share one definition of "the main
+    output" rather than drifting independently."""
+    texts: list[str] = []
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "assistant":
+            continue
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    texts.append(text)
+    return "\n".join(texts)
+
+
+_FENCED_JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
+
+
+def _extract_final_output_json_object(text: str) -> dict | None:
+    """Deterministic final-output JSON extraction (PR #2500 fix_delta for
+    Issue #2498, finding P2-2) -- a DISTINCT extraction path from
+    ``_parse_embedded_json_object`` (which remains reserved for the
+    prefix-tolerant hook-payload use case; it is unchanged).
+
+    Accepts, in this FIXED priority order only (never multiple candidates
+    scored/picked by whichever validates against the schema -- that
+    ambiguous approach is explicitly out of scope):
+
+    1. the entire trimmed ``text`` is itself a bare JSON object, or
+    2. ``text`` contains EXACTLY ONE ```json fenced Markdown code block;
+       that block's own content is parsed as JSON.
+
+    Returns ``None`` (extraction failure, never a guess) when neither
+    applies -- including when the text is empty, not an object, or
+    contains zero or more-than-one fenced ```json block."""
+    stripped = text.strip()
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    fenced_blocks = _FENCED_JSON_BLOCK_RE.findall(text)
+    if len(fenced_blocks) == 1:
+        try:
+            parsed = json.loads(fenced_blocks[0].strip())
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def evaluate_output_contract_schema_fields_present(stdout: str, schema_path: str) -> dict:
     """``output_contract_schema_fields_present`` assertion evaluator (Issue
     #2498 AC2): full ``jsonschema.validate()`` validation of a domain output
@@ -1709,9 +1801,11 @@ def evaluate_output_contract_schema_fields_present(stdout: str, schema_path: str
 
     The domain output payload itself is recovered from the structured
     lane's own final assistant response text (``extract_claude_final_result_
-    text``) via the same best-effort embedded-JSON-object parse
-    (``_parse_embedded_json_object``) already used for hook payloads --
-    never guessed, never a self-report.
+    text``) via a DETERMINISTIC final-output JSON extraction
+    (``_extract_final_output_json_object`` -- PR #2500 fix_delta P2-2:
+    bare JSON object or a single fenced ```json block only, never the
+    prefix-tolerant ``_parse_embedded_json_object`` used for hook
+    payloads) -- never guessed, never a self-report.
 
     Returns ``{"verified": bool, "schema_path": str,
     "output_payload_found": bool, "error": str | None}``."""
@@ -1723,7 +1817,7 @@ def evaluate_output_contract_schema_fields_present(stdout: str, schema_path: str
             "output_payload_found": False,
             "error": "no final result text observed in native evidence",
         }
-    payload = _parse_embedded_json_object(result_text)
+    payload = _extract_final_output_json_object(result_text)
     if payload is None:
         return {
             "verified": False,
@@ -1742,7 +1836,12 @@ def evaluate_output_contract_schema_fields_present(stdout: str, schema_path: str
         }
     try:
         jsonschema.validate(instance=payload, schema=schema)
-    except jsonschema.exceptions.ValidationError as exc:
+    except (jsonschema.exceptions.ValidationError, jsonschema.exceptions.SchemaError) as exc:
+        # PR #2500 fix_delta P2-3 (defense in depth): the primary guard is
+        # the pre-launch --output-schema-path meta-schema check in main()
+        # (before any runtime subprocess is spawned) -- this narrow catch
+        # only prevents an unhandled SchemaError here too, it never
+        # replaces that early gate.
         return {
             "verified": False,
             "schema_path": schema_path,
@@ -5408,6 +5507,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.output_schema_path and args.mode != "structured":
         parser.error("--output-schema-path requires --mode structured")
 
+    # PR #2500 fix_delta P2-3 (OWNER REQUEST_CHANGES
+    # https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805):
+    # a structurally invalid --output-schema-path (one jsonschema.validate()
+    # itself would reject via its own meta-schema check, raising
+    # jsonschema.exceptions.SchemaError -- distinct from ValidationError,
+    # which is a rejection of the INSTANCE, not the schema) must fail here,
+    # at argument-validation time, BEFORE the (possibly expensive) runtime
+    # subprocess is ever launched -- never as an unhandled exception deep
+    # inside evaluate_output_contract_schema_fields_present() after runtime
+    # cost has already been paid and no evidence artifact survives to
+    # explain the failure. jsonschema.validators.validator_for() picks the
+    # exact same validator class jsonschema.validate() would use later for
+    # the real instance validation, so this check-schema call is guaranteed
+    # consistent with that later validate() call.
+    if args.output_schema_path:
+        try:
+            schema_text = Path(args.output_schema_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            parser.error(f"--output-schema-path could not be read: {exc}")
+        try:
+            schema_obj = json.loads(schema_text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            parser.error(f"--output-schema-path is not valid JSON: {exc}")
+        try:
+            validator_cls = jsonschema.validators.validator_for(schema_obj)
+            validator_cls.check_schema(schema_obj)
+        except jsonschema.exceptions.SchemaError as exc:
+            parser.error(f"--output-schema-path is not a valid JSON Schema: {exc}")
+
     run_id = uuid.uuid4().hex[:12]
     errors: list[str] = []
 
@@ -5910,8 +6038,26 @@ def main(argv: list[str] | None = None) -> int:
             # output is available to check and a missing marker must not
             # overwrite the authoritative exit-77 classification.
             if args.expect_marker and exit_code == EXIT_OK:
-                combined = out + "\n" + err
-                missing = [m for m in args.expect_marker if m not in combined]
+                # PR #2500 fix_delta P1-1 (OWNER REQUEST_CHANGES
+                # https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805):
+                # '--expect-marker-source main' evidence must come ONLY
+                # from extract_claude_main_output_text() -- the model's own
+                # assistant message text -- never the raw combined
+                # stdout/stderr blob. That raw blob also contains the
+                # UserPromptExpansion hook's own echoed stdin payload
+                # (command_name/command_args/prompt, verbatim from the
+                # CALLER's own prompt text), so a marker the caller merely
+                # WROTE into the prompt could otherwise satisfy this check
+                # even if the model's own output never produced it. The
+                # pre-existing 'subagent' (default/omitted) source keeps
+                # searching the full combined stdout+stderr blob, byte-
+                # identical to every pre-#2498 caller -- this restriction
+                # applies ONLY to the 'main' source path.
+                if args.expect_marker_source == "main":
+                    marker_search_text = extract_claude_main_output_text(out)
+                else:
+                    marker_search_text = out + "\n" + err
+                missing = [m for m in args.expect_marker if m not in marker_search_text]
                 schema_summary["expected_markers_missing"] = missing
                 if missing:
                     errors.append(f"expected markers not observed: {missing}")
@@ -5922,8 +6068,24 @@ def main(argv: list[str] | None = None) -> int:
             # causal-evidence default gate below, and is recorded/evaluated
             # unconditionally (subject only to the same exit_code == EXIT_OK
             # success-only-assertion guard as --expect-marker above).
+            #
+            # PR #2500 fix_delta P1-2: matched against
+            # extract_claude_main_output_text(out) -- the assistant-only
+            # channel -- rather than the raw combined stdout blob. The raw
+            # blob also contains the terminal 'result' event's own replay
+            # of that SAME final assistant text (see
+            # extract_claude_main_output_text's docstring); scanning the
+            # raw blob let a single reversed-order answer masquerade as
+            # forward-order evidence by finding an early marker in the
+            # assistant event's own text and a later marker only in the
+            # result event's duplicate replay of that identical text. Using
+            # the assistant-only channel here means each final answer's
+            # text is present exactly once, so it can never be
+            # double-counted as two independent pieces of ordered evidence.
             if args.expect_ordered_marker:
-                ordered_evidence_match = evaluate_ordered_evidence_match(out, args.expect_ordered_marker)
+                ordered_evidence_match = evaluate_ordered_evidence_match(
+                    extract_claude_main_output_text(out), args.expect_ordered_marker
+                )
                 schema_summary["ordered_evidence_match"] = ordered_evidence_match
                 if exit_code == EXIT_OK and not ordered_evidence_match["verified"]:
                     errors.append(

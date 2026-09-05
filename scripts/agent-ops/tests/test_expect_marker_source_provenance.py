@@ -154,6 +154,54 @@ def _user_prompt_expansion_event(command_name: str) -> str:
     )
 
 
+def _user_prompt_expansion_event_with_prompt_text(command_name: str, prompt_text: str) -> str:
+    """Same native ``UserPromptExpansion`` hook echo shape as
+    ``_user_prompt_expansion_event``, but with a CALLER-supplied
+    ``prompt``/``command_args`` text -- used by the PR #2500 fix_delta
+    P1-1 regression test to embed a marker string ONLY in the hook's own
+    echoed input, never in any assistant/result event."""
+    embedded = json.dumps(
+        {
+            "hook_event_name": "UserPromptExpansion",
+            "expansion_type": "slash_command",
+            "command_name": command_name,
+            "command_args": prompt_text,
+            "command_source": "projectSettings",
+            "prompt": prompt_text,
+        }
+    )
+    return _line(
+        {
+            "type": "system",
+            "subtype": "hook_response",
+            "hook_event": "UserPromptExpansion",
+            "hook_name": "UserPromptExpansion",
+            "stdout": embedded,
+            "output": embedded,
+        }
+    )
+
+
+def _write_fake_claude_with_invocation_marker(
+    path: Path, invocation_marker: Path, stdout_lines: list[str]
+) -> None:
+    """Same shape as ``_write_fake_claude``, but the script also touches
+    ``invocation_marker`` as its very first action -- used by the PR #2500
+    fix_delta P2-3 regression test to prove the runtime subprocess was
+    NEVER launched at all (as opposed to launched-and-then-erroring)."""
+    script_lines = [
+        "#!/usr/bin/env python3",
+        "import sys",
+        f"open({str(invocation_marker)!r}, 'w').write('invoked')",
+        "sys.stdin.read()",
+    ]
+    for line in stdout_lines:
+        script_lines.append(f"print({line!r})")
+    script_lines.append("sys.exit(0)")
+    path.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
 MARKER = "MARKER_ISSUE_2498"
 
 
@@ -222,6 +270,128 @@ def test_expect_marker_source_main_opts_out_of_causal_evidence(tmp_path):
         evidence_sub = json.loads(evidence_json_sub.read_text(encoding="utf-8"))
         assert evidence_sub["expect_marker_source"] == "subagent"
         assert any("subagent causal evidence insufficient" in e for e in evidence_sub["errors"])
+
+
+def test_expect_marker_source_main_rejects_marker_satisfied_only_by_hook_echo(tmp_path):
+    """PR #2500 fix_delta P1-1 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805):
+    a marker string present ONLY in the ``UserPromptExpansion`` hook's own
+    echoed ``prompt``/``command_args`` text (i.e. text the CALLER wrote
+    into the prompt, never something the model itself produced) must NOT
+    satisfy ``--expect-marker-source main`` -- the marker must be reported
+    missing and the run must FAIL, even though the same marker string
+    trivially appears in the raw combined stdout+stderr blob (proving the
+    fix actually restricts the search text, not merely that the marker is
+    absent everywhere)."""
+    repo, worktree = _build_repo_with_worktree(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    leaked_marker = "LEAKED_VIA_HOOK_ECHO_ONLY"
+    _write_fake_claude(
+        fake_bin / "claude",
+        [
+            _init_event(),
+            _user_prompt_expansion_event_with_prompt_text(
+                "review-issue", f"/review-issue please print {leaked_marker} when done"
+            ),
+            _assistant_text_event("some unrelated model output"),
+            _result_event("some unrelated model output"),
+        ],
+    )
+    prompt = _prompt_file(tmp_path, "/review-issue")
+    evidence_json = tmp_path / "evidence.json"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        "--evidence-json", str(evidence_json),
+        "--expect-marker", leaked_marker,
+        "--expect-marker-source", "main",
+        "--expect-skill-command", "review-issue",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1, result.stderr
+    evidence = json.loads(evidence_json.read_text(encoding="utf-8"))
+    assert evidence["expected_markers_missing"] == [leaked_marker]
+
+
+def test_ordered_marker_match_does_not_double_count_terminal_result_replay(tmp_path):
+    """PR #2500 fix_delta P1-2 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805):
+    a reverse-order single answer ("STEP_B STEP_A") that appears both as
+    the assistant's own final text AND (identically) as the terminal
+    ``result`` event's replay of that same text must NOT be accepted as
+    forward-order evidence for ``--expect-ordered-marker STEP_A
+    --expect-ordered-marker STEP_B`` -- a naive raw-stdout cursor scan
+    could otherwise find STEP_A in the assistant event's own occurrence
+    and STEP_B only in the result event's later, duplicate replay of the
+    SAME content, incorrectly reporting forward order for content that
+    was actually reversed within one single answer."""
+    repo, worktree = _build_repo_with_worktree(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    reversed_answer = "STEP_B STEP_A"
+    _write_fake_claude(
+        fake_bin / "claude",
+        [
+            _init_event(),
+            _assistant_text_event(reversed_answer),
+            _result_event(reversed_answer),
+        ],
+    )
+    prompt = _prompt_file(tmp_path, "do the steps")
+    evidence_json = tmp_path / "evidence.json"
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        "--evidence-json", str(evidence_json),
+        "--expect-ordered-marker", "STEP_A",
+        "--expect-ordered-marker", "STEP_B",
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode == 1, result.stderr
+    evidence = json.loads(evidence_json.read_text(encoding="utf-8"))
+    assert evidence["ordered_evidence_match"]["verified"] is False
+    assert evidence["ordered_evidence_match"]["missing_markers"] == ["STEP_B"]
+
+
+def test_invalid_output_schema_path_fails_before_runtime_launch(tmp_path):
+    """PR #2500 fix_delta P2-3 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805):
+    a structurally invalid JSON Schema file passed via
+    ``--output-schema-path`` must be rejected as a controlled, explained
+    usage error BEFORE the (possibly expensive) claude runtime subprocess
+    is ever launched -- never an unhandled
+    ``jsonschema.exceptions.SchemaError`` traceback raised mid-run after
+    runtime cost has already been paid. The fake ``claude`` executable
+    touches an invocation marker file as its very first action, so this
+    test can assert the runtime was never launched at all (not merely
+    that it failed for some other reason)."""
+    repo, worktree = _build_repo_with_worktree(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    invocation_marker = tmp_path / "claude_was_invoked.marker"
+    _write_fake_claude_with_invocation_marker(
+        fake_bin / "claude",
+        invocation_marker,
+        [_init_event(), _result_event(json.dumps({"anything": "here"}))],
+    )
+    schema_path = tmp_path / "invalid_schema.json"
+    schema_path.write_text(json.dumps({"type": "strnig"}), encoding="utf-8")
+    prompt = _prompt_file(tmp_path, "hello")
+    result = _run(
+        repo, worktree,
+        "--runtime", "claude", "--mode", "structured",
+        "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+        "--output-schema-path", str(schema_path),
+        fake_bin_dir=fake_bin,
+    )
+    assert result.returncode not in (0, 77), result.stdout
+    assert "Traceback" not in result.stderr
+    assert not invocation_marker.exists(), (
+        "runtime must not be launched when --output-schema-path is structurally invalid"
+    )
 
 
 def test_expect_marker_source_main_without_expect_skill_command_is_usage_error(tmp_path):
@@ -371,6 +541,13 @@ def test_live_skill_invocation_main_source_non_fallback_pass(tmp_path):
     (skill_dir / "SKILL.md").write_text(_STAND_IN_REVIEW_ISSUE_SKILL_MD, encoding="utf-8")
     prompt = _prompt_file(tmp_path, "/review-issue")
 
+    # PR #2500 fix_delta P2-1 (OWNER REQUEST_CHANGES
+    # https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805):
+    # this main-path invocation MUST also pass --expect-marker so the
+    # --expect-marker-source main gate is actually exercised end-to-end
+    # (previously this run only checked expect_skill_command_observed and
+    # no-child-spawn, never the marker-based non-fallback PASS path at
+    # all).
     evidence_json_main = tmp_path / "evidence-main.json"
     result_main = _run(
         repo, worktree,
@@ -379,6 +556,7 @@ def test_live_skill_invocation_main_source_non_fallback_pass(tmp_path):
         "--evidence-json", str(evidence_json_main),
         "--timeout-seconds", "90",
         "--max-turns", "1",
+        "--expect-marker", "REVIEW_ISSUE_STAND_IN_OK",
         "--expect-marker-source", "main",
         "--expect-skill-command", "review-issue",
     )
@@ -390,6 +568,10 @@ def test_live_skill_invocation_main_source_non_fallback_pass(tmp_path):
     assert result_main.returncode == 0, result_main.stderr
     evidence_main = json.loads(evidence_json_main.read_text(encoding="utf-8"))
     assert evidence_main["capability_decision"] != "capability_skip"
+    # The marker was actually observed via the main-output channel (P1-1),
+    # and the run is a non-fallback PASS WITHOUT requiring SubAgent
+    # causal evidence (--expect-marker-source main's whole point).
+    assert evidence_main["expected_markers_missing"] == []
     assert evidence_main["expect_skill_command_observed"] is True
     assert "review-issue" in evidence_main["user_prompt_expansion_command_names"]
     assert evidence_main["child_spawn_observed"] is False
@@ -414,7 +596,19 @@ def test_live_skill_invocation_main_source_non_fallback_pass(tmp_path):
     assert result_regression.returncode == 1, result_regression.stderr
     evidence_regression = json.loads(evidence_json_regression.read_text(encoding="utf-8"))
     assert evidence_regression["expect_marker_source"] == "subagent"
+    # PR #2500 fix_delta P2-1: the failure reason must SPECIFICALLY be
+    # causal-evidence insufficiency, not the marker being missing --
+    # mirroring the same failure-reason-checking rigor the fake-executable
+    # tests above apply (e.g. "subagent causal evidence insufficient" in
+    # evidence["errors"]). The marker itself WAS observed (this same
+    # model, same reply, same combined-stdout+stderr search text as the
+    # pre-existing default path uses), so the ONLY remaining reason this
+    # run FAILs is the missing SubAgent causal evidence.
+    assert evidence_regression["expected_markers_missing"] == []
     assert (
         evidence_regression["subagent_causal_evidence"]["causal_evidence_source"]
         != "hook_id_correlated"
+    )
+    assert any(
+        "subagent causal evidence insufficient" in e for e in evidence_regression["errors"]
     )

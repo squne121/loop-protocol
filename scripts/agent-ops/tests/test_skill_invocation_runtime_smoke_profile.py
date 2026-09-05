@@ -213,6 +213,84 @@ def test_output_contract_schema_fields_present_missing_schema_file_reports_error
     assert "schema load failed" in verdict["error"]
 
 
+def test_output_contract_schema_fields_present_accepts_single_fenced_json_block() -> None:
+    """PR #2500 fix_delta P2-2 (OWNER REQUEST_CHANGES
+    https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805):
+    a final result text that wraps the domain payload in a single
+    ```json fenced Markdown code block (rather than a bare JSON object)
+    must still be recognized. Previously this incorrectly reported
+    ``output_payload_found: false`` because ``_parse_embedded_json_object``
+    passed everything from the first ``{`` through end-of-string
+    (including the trailing closing ``` fence text) into ``json.loads()``
+    unmodified, which raises."""
+    payload = _minimal_valid_review_issue_result_v1()
+    fenced = "Here is the result:\n\n```json\n" + json.dumps(payload) + "\n```\n"
+    stdout = _result_event(fenced)
+    verdict = smoke.evaluate_output_contract_schema_fields_present(stdout, str(REVIEW_ISSUE_RESULT_V1_SCHEMA_PATH))
+    assert verdict["verified"] is True, verdict
+    assert verdict["output_payload_found"] is True
+
+
+def test_output_contract_schema_fields_present_rejects_multiple_fenced_json_blocks() -> None:
+    """Two fenced ```json blocks in the same final result text is
+    deliberately treated as extraction failure (never guessed by picking
+    whichever candidate validates against the schema -- that ambiguous
+    multi-candidate approach is explicitly out of scope, Issue #2498 PR
+    #2500 fix_delta P2-2)."""
+    payload = _minimal_valid_review_issue_result_v1()
+    fenced = (
+        "```json\n" + json.dumps(payload) + "\n```\n\nand also:\n\n```json\n"
+        + json.dumps(payload) + "\n```\n"
+    )
+    stdout = _result_event(fenced)
+    verdict = smoke.evaluate_output_contract_schema_fields_present(stdout, str(REVIEW_ISSUE_RESULT_V1_SCHEMA_PATH))
+    assert verdict["verified"] is False
+    assert verdict["output_payload_found"] is False
+
+
+def test_extract_claude_main_output_text_excludes_hook_echo_and_result_replay() -> None:
+    """PR #2500 fix_delta P1-1/P1-2: ``extract_claude_main_output_text``
+    returns ONLY the assistant events' own text, in order -- never a
+    ``UserPromptExpansion`` hook's echoed prompt text (P1-1), and never a
+    SECOND, duplicate occurrence of the final answer from the terminal
+    ``result`` event's own replay of that same text (P1-2)."""
+    hook_echo = json.dumps(
+        {
+            "hook_event_name": "UserPromptExpansion",
+            "command_name": "review-issue",
+            "command_args": "please print LEAKED_MARKER when done",
+            "prompt": "please print LEAKED_MARKER when done",
+        }
+    )
+    stdout = "\n".join(
+        [
+            _line(
+                {
+                    "type": "system",
+                    "subtype": "hook_response",
+                    "hook_event": "UserPromptExpansion",
+                    "hook_name": "UserPromptExpansion",
+                    "stdout": hook_echo,
+                    "output": hook_echo,
+                }
+            ),
+            _line({"type": "assistant", "message": {"content": [{"type": "text", "text": "STEP_B STEP_A"}]}}),
+            _result_event("STEP_B STEP_A"),
+        ]
+    )
+    main_text = smoke.extract_claude_main_output_text(stdout)
+    assert "LEAKED_MARKER" not in main_text
+    assert main_text.count("STEP_B STEP_A") == 1
+
+    # The reversed-order single answer must not be accepted as forward
+    # order (P1-2): STEP_A is found within "STEP_B STEP_A", advancing the
+    # cursor past it, leaving no later occurrence of STEP_B to find because
+    # this channel contains that text exactly ONCE (no duplicate replay).
+    ordered = smoke.evaluate_ordered_evidence_match(main_text, ["STEP_A", "STEP_B"])
+    assert ordered["verified"] is False
+    assert ordered["missing_markers"] == ["STEP_B"]
+
+
 def test_extract_claude_final_result_text_recovers_the_final_result_field() -> None:
     stdout = "\n".join(
         [
