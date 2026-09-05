@@ -153,19 +153,6 @@
     ],
     "tools": []
   },
-  "review-issue.md": {
-    "disallowedTools": [
-      "Edit",
-      "MultiEdit"
-    ],
-    "tools": [
-      "Bash",
-      "Glob",
-      "Grep",
-      "Read",
-      "Write"
-    ]
-  },
   "scope-rollup-runner.md": {
     "disallowedTools": [
       "Edit",
