@@ -366,6 +366,31 @@ def _make_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _install_pinned_uv_pyproject(repo_root: Path) -> None:
+    """Install a `pyproject.toml` pinning `[tool.uv].required-version` to
+    this repo's own pin (Issue #2199 fix_delta iteration 0 Blocker 1) -- the
+    same fixture convention `_install_authority_transport_fixture` already
+    uses. `skill_runtime_exec.py._resolve_trusted_executable()` compares the
+    fixture repo's own `pyproject.toml` pin against the resolved `uv`
+    binary's version and fails closed with `uv_version_mismatch` when no
+    `pyproject.toml` is present at all, so every fixture that spawns the
+    real privileged executor as a subprocess needs this file."""
+    pin = _pinned_uv_version(REPO_ROOT)
+    _write_text(
+        repo_root / "pyproject.toml",
+        f'''[project]
+name = "skill-runtime-fixture"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+required-version = "{pin}"
+managed = false
+''',
+    )
+
+
 def _install_decide_run_fixture(repo_root: Path) -> None:
     """Install the REAL (unmodified) privileged executor, policy module,
     `command_registry.py`, and `decide_next_loop_action.py` from the current
@@ -410,6 +435,7 @@ def select_issue_worktree(catalog, issue_number, root_realpath):
     (loop_state_dir / "loop_state.json").write_text(
         json.dumps({"iteration": 0, "max_iterations": 3})
     )
+    _install_pinned_uv_pyproject(repo_root)
     _git("add", "-A", cwd=repo_root)
     _git("commit", "-q", "-m", "install decide.run fixture", cwd=repo_root)
 
@@ -958,6 +984,7 @@ def select_issue_worktree(catalog, issue_number, root_realpath):
     )
     worktree_dir = repo_root / ".claude" / "worktrees" / "issue-2086-decide-authority-e2e-fixture"
     worktree_dir.mkdir(parents=True, exist_ok=True)
+    _install_pinned_uv_pyproject(repo_root)
     _git("add", "-A", cwd=repo_root)
     _git("commit", "-q", "-m", "install decide.run authority e2e fixture", cwd=repo_root)
 

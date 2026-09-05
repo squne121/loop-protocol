@@ -1499,6 +1499,51 @@ def test_given_dedicated_relative_artifact_path_when_repair_action_apply_command
     assert parsed.preflight_result_path == dedicated_relative
 
 
+def test_given_dedicated_relative_artifact_path_when_structural_repair_action_apply_command_parsed_then_accepted(
+    tmp_path,
+):
+    """Issue #2199 fix_delta (test-runner iteration 0 Blocker 2): P1-2's
+    widened `_is_safe_issue_artifact_path()` prefix is shared by BOTH
+    `repair_action.apply` (proven above) AND the sibling
+    `structural_repair_action.apply` lane (Issue #2396) -- this is the exact
+    parser `skill_runtime_exec.py::main()`'s real dispatch calls through
+    `is_exact_skill_runtime_structural_repair_action_apply_executor_command()`.
+    `run_structural_repair_action_apply()` itself reads its artifact via the
+    SAME `secure_read_repair_apply_artifact()` FD-based reader
+    `run_repair_action_apply()` uses (see that function's own docstring), so
+    the real-subprocess end-to-end proof already established above for
+    `repair_action.apply` covers the shared reader; this test closes the
+    remaining gap at the `structural_repair_action.apply`-specific exact
+    parser itself, which is a distinct code path
+    (`parse_exact_skill_runtime_structural_repair_action_apply_command`)."""
+    local, _origin, _url, oid = _init_remote_fixture(tmp_path)
+    dedicated_path = _add_dedicated_detached_worktree(local, oid)
+    result_path = _write_dedicated_repair_candidate(dedicated_path, 2199)
+    dedicated_relative = os.path.relpath(result_path, local)
+
+    command_text = " ".join(
+        [
+            "uv",
+            "run",
+            "python3",
+            command_policy_mod.SKILL_RUNTIME_EXEC_REL,
+            "--command-id",
+            "structural_repair_action.apply",
+            "--issue-number",
+            "2199",
+            "--repo",
+            command_policy_mod.TRUSTED_REPO_SLUG,
+            "--apply-structural-repair-action",
+            dedicated_relative,
+        ]
+    )
+    parsed = command_policy_mod.parse_exact_skill_runtime_structural_repair_action_apply_command(
+        command_text, str(local)
+    )
+    assert parsed is not None
+    assert parsed.preflight_result_path == dedicated_relative
+
+
 # ---------------------------------------------------------------------------
 # OWNER feedback (PR #2495 review) P1-3: human-context investigation evidence
 # resolves against the DEDICATED child's own cwd, not the PRIMARY root the
