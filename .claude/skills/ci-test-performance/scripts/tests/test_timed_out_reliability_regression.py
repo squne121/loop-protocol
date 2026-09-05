@@ -23,6 +23,8 @@ import json
 import os
 import sys
 
+import pytest
+
 SCRIPTS_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, SCRIPTS_DIR)
 import validate_ci_reliability_assessment_v1 as validator  # noqa: E402
@@ -102,10 +104,14 @@ def test_timed_out_workflow_run_is_eligible_sample(tmp_path):
     )
 
 
-def test_timed_out_does_not_affect_playwright_classification(tmp_path):
+@pytest.mark.parametrize("metric", ["playwright_flaky_test_rate", "playwright_terminal_failure_rate"])
+def test_timed_out_does_not_affect_playwright_classification(tmp_path, metric):
     # GIVEN a timed_out workflow run (1000) that carries no Playwright
     # TestCase at all (its correct Playwright classification is
-    # "not_affected" purely because no `flaky` / `unexpected` case exists)
+    # "not_affected" purely because no `flaky` / `unexpected` case exists).
+    # Parameterized over both Playwright metrics: negative coverage of this
+    # boundary was previously skewed toward `playwright_flaky_test_rate`
+    # only.
     document = _make_assessment()
     _set_conclusion(document, "before", 1000, "timed_out")
 
@@ -121,7 +127,7 @@ def test_timed_out_does_not_affect_playwright_classification(tmp_path):
     # same timed_out run (as if the workflow's timed_out conclusion alone
     # justified an "affected" Playwright classification)
     corrupted = copy.deepcopy(document)
-    _set_observation_classification(corrupted, "before", "playwright_flaky_test_rate", 1000, "affected")
+    _set_observation_classification(corrupted, "before", metric, 1000, "affected")
     exit_code, decision = _validate_document(corrupted, tmp_path)
 
     # THEN it is rejected: the canonical classification is still derived
@@ -129,9 +135,7 @@ def test_timed_out_does_not_affect_playwright_classification(tmp_path):
     # proving the timed_out conclusion does not by itself force "affected"
     assert exit_code == 2
     assert any(
-        "canonical_classification_mismatch" in error
-        and "playwright_flaky_test_rate" in error
-        and "workflow_run_id=1000" in error
+        "canonical_classification_mismatch" in error and metric in error and "workflow_run_id=1000" in error
         for error in decision["errors"]
     )
 
@@ -158,14 +162,16 @@ def test_timed_out_canonical_classification_mismatch_rejected(tmp_path):
     )
 
 
-def test_timed_out_requires_three_metric_provenance(tmp_path):
+@pytest.mark.parametrize("metric", ["playwright_flaky_test_rate", "playwright_terminal_failure_rate"])
+def test_timed_out_requires_three_metric_provenance(tmp_path, metric):
     # GIVEN a timed_out, eligible workflow run (1000) whose Playwright
     # provenance observation has been deliberately removed entirely (not
-    # merely misclassified) for one of the 3 shared metrics
+    # merely misclassified) for one of the 3 shared metrics. Parameterized
+    # over both Playwright metrics for symmetric coverage.
     document = _make_assessment()
     _set_conclusion(document, "before", 1000, "timed_out")
-    observations = document["sample_provenance"]["before"]["playwright_flaky_test_rate"]["observations"]
-    document["sample_provenance"]["before"]["playwright_flaky_test_rate"]["observations"] = [
+    observations = document["sample_provenance"]["before"][metric]["observations"]
+    document["sample_provenance"]["before"][metric]["observations"] = [
         observation for observation in observations if observation["workflow_run_id"] != 1000
     ]
 
@@ -179,8 +185,76 @@ def test_timed_out_requires_three_metric_provenance(tmp_path):
     assert exit_code == 2
     assert any(
         "sample_provenance_missing_eligible_workflow_run" in error
-        and "playwright_flaky_test_rate" in error
+        and metric in error
         and "workflow_run_id=1000" in error
+        for error in decision["errors"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "affected_metric", "unaffected_metric", "source_run_id"),
+    [
+        ("flaky", "playwright_flaky_test_rate", "playwright_terminal_failure_rate", 1001),
+        ("unexpected", "playwright_terminal_failure_rate", "playwright_flaky_test_rate", 1002),
+    ],
+)
+def test_timed_out_run_with_matching_official_outcome_is_affected(
+    tmp_path, outcome, affected_metric, unaffected_metric, source_run_id
+):
+    # GIVEN a timed_out workflow run (1000, already eligible and already the
+    # sole "before"-arm workflow_failure_rate failure in the base fixture)
+    # that is additionally the run carrying the official Playwright
+    # TestCase outcome (`flaky` or `unexpected`) — relocated here from its
+    # original run (1001/1002) rather than duplicated. Moving the case
+    # (instead of adding a new run) keeps every declared
+    # reliability_metrics / non_inferiority_evaluation numerator/denominator
+    # untouched: the "before" arm eligible set and the count of
+    # affected runs for `affected_metric` are unchanged (exactly one
+    # affected run, now at a different workflow_run_id), so only the
+    # provenance for the two runs whose TestCase attachment moved needs
+    # updating.
+    #
+    # This closes the coverage gap where every prior `timed_out` test used
+    # workflow_run_id=1000, which never carried any Playwright TestCase —
+    # a hypothetical `if conclusion == "timed_out": return "not_affected"`
+    # special-case in `_canonical_classification()` would have passed all
+    # of them undetected.
+    document = _make_assessment()
+    _set_conclusion(document, "before", 1000, "timed_out")
+    for case in document["playwright_test_cases"]:
+        if case["arm"] == "before" and case["workflow_run_id"] == source_run_id and case["outcome"] == outcome:
+            case["workflow_run_id"] = 1000
+    _set_observation_classification(document, "before", affected_metric, 1000, "affected")
+    _set_observation_classification(document, "before", affected_metric, source_run_id, "not_affected")
+
+    # WHEN validated with correct provenance reflecting the relocated
+    # TestCase
+    exit_code, decision = _validate_document(document, tmp_path)
+
+    # THEN it is accepted: a `timed_out` run that actually carries the
+    # matching official outcome is correctly classified `affected` for that
+    # metric
+    assert exit_code == 0
+    assert decision["semantic_valid"] is True
+
+    # AND the sibling Playwright metric for the same run remains
+    # `not_affected` (no matching TestCase for it was ever attached),
+    # proving the two Playwright metrics are derived independently rather
+    # than coupled as a pair to the `timed_out` conclusion
+    assert not any("workflow_run_id=1000" in error and unaffected_metric in error for error in decision["errors"])
+
+    # AND WHEN provenance for the timed_out run is corrupted back to
+    # `not_affected` for the metric it should actually satisfy
+    corrupted = copy.deepcopy(document)
+    _set_observation_classification(corrupted, "before", affected_metric, 1000, "not_affected")
+    exit_code, decision = _validate_document(corrupted, tmp_path)
+
+    # THEN it is rejected: the canonical classification is derived from the
+    # actual TestCase outcome, not waived away merely because the run's
+    # conclusion is `timed_out`
+    assert exit_code == 2
+    assert any(
+        "canonical_classification_mismatch" in error and affected_metric in error and "workflow_run_id=1000" in error
         for error in decision["errors"]
     )
 

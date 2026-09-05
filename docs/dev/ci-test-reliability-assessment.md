@@ -117,7 +117,10 @@ failures、logical-test denominator false green、official outcome-only classifi
 vector（`n=20`/`n=21`/`n=22`）や stdlib-only enumeration の結果を変更しない。
 
 ```bash
-uv run --locked pytest .claude/skills/ci-test-performance/scripts/tests/test_validate_ci_reliability_assessment_v1.py -q
+uv run --locked pytest \
+  .claude/skills/ci-test-performance/scripts/tests/test_validate_ci_reliability_assessment_v1.py \
+  .claude/skills/ci-test-performance/scripts/tests/test_timed_out_reliability_regression.py \
+  -q
 ```
 
 validator exit code は `0` が structural + semantic valid、`2` が contract invalid、`3` が file /
