@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.dev/schemas/retro_private_audit_index_v1.schema.json",
+  "title": "retro_private_audit_index/v1",
+  "description": "Local-only (never public artifact/GitHub/log/fixture) sidecar manifest binding an existing public-safe agent_improvement_candidate_v1 `evidence_ref` + publication `run_identity` to private local audit evidence (Issue #2376, WS5). additionalProperties: false (top-level and every nested object) closes the key set: unknown/forbidden fields (raw transcript, prompt, tool I/O, stdout/stderr, credential, token, secret, absolute local path) fail schema validation rather than being silently accepted -- there is no free-form instruction field anywhere in this schema. `resolution_key` is a stable identity derived ONLY from `run_identity` + `evidence_ref` (Identity Separation, AC2) -- every other field here (`private_status_at_generation`/`reason_code`/`object_key`/`object_digest`/`expires_at`) is a time-varying generation-snapshot field bound instead by the separate `manifest_digest`, and access-time re-evaluation (source missing/permission changed/digest mismatch/expired) never rewrites either digest -- it only changes the transient, non-persisted `effective_status` `private_audit_resolver.resolve()` computes at read time. `object_key` is an OPAQUE path relative to a caller-configured local audit root -- never an absolute local filesystem path (AC4).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "resolution_key",
+    "manifest_digest",
+    "run_identity",
+    "evidence_ref",
+    "private_status_at_generation",
+    "reason_code",
+    "object_key",
+    "object_digest",
+    "expires_at",
+    "generated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "retro_private_audit_index/v1"
+    },
+    "resolution_key": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "manifest_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "run_identity": {
+      "description": "The exact 3-field stable identity subset (Issue #2376 AC2) -- NOT the full publication run_identity dict, which also carries time-varying generated_at/runtime_version/source_observations that must never enter the resolution_key preimage.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "base_sha", "source_set_digest"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "source_set_digest": { "type": "string", "minLength": 1 }
+      }
+    },
+    "evidence_ref": {
+      "description": "The same public-safe typed evidence_ref shape as agent_improvement_candidate_v1.schema.json's $defs.evidence_ref -- echoed here so the manifest is self-describing without needing side information, never a new/wider shape.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref_type", "source_id", "resource_identity", "projection_digest"],
+      "properties": {
+        "ref_type": {
+          "type": "string",
+          "enum": ["public_github_resource", "repository_blob", "runtime_receipt", "external_primary_source"]
+        },
+        "source_id": {
+          "type": "string",
+          "enum": ["github", "repository", "runtime", "web"]
+        },
+        "resource_identity": { "type": "string", "minLength": 1 },
+        "projection_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "private_status_at_generation": {
+      "type": "string",
+      "enum": ["available", "unavailable"]
+    },
+    "reason_code": {
+      "description": "Bounded generation-time reason (Issue #2376 AC5). Distinct from -- and never overwritten by -- the transient effective_status reason private_audit_resolver.resolve() computes at access time (source_missing/digest_mismatch/permission_denied/expired/not_registered/malformed_manifest), none of which are ever persisted back into this field.",
+      "type": ["string", "null"],
+      "enum": [null, "no_local_source_at_generation"]
+    },
+    "object_key": {
+      "description": "Opaque path relative to the caller-configured local audit root. Never an absolute path (no leading '/', no '..' traversal segment).",
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+    },
+    "object_digest": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "expires_at": {
+      "description": "RFC3339 UTC timestamp, or null meaning no resolver-owned expiry. Judged lazily at access time only by the local resolver -- never by a background daemon/cleanup service.",
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "private_status_at_generation": { "const": "available" } },
+        "required": ["private_status_at_generation"]
+      },
+      "then": {
+        "properties": {
+          "reason_code": { "const": null },
+          "object_key": { "type": "string" },
+          "object_digest": { "type": "string" }
+        },
+        "required": ["reason_code", "object_key", "object_digest"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "private_status_at_generation": { "const": "unavailable" } },
+        "required": ["private_status_at_generation"]
+      },
+      "then": {
+        "properties": {
+          "reason_code": { "type": "string" },
+          "object_key": { "const": null },
+          "object_digest": { "const": null }
+        },
+        "required": ["reason_code", "object_key", "object_digest"]
+      }
+    }
+  ]
+}

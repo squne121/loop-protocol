@@ -151,6 +151,61 @@ def _persist_retrospective_run_module():
     return _load_sibling_module("agent_retrospective_persist_run", "persist_retrospective_run.py")
 
 
+def _private_audit_resolver_module():
+    """Lazily load Issue #2376 (#1939 Workstream 5)'s private-local-audit
+    resolver sibling script (``private_audit_resolver.py``, this Issue's own
+    Allowed Paths). Loaded lazily like every other sibling module above, so
+    importing ``run_retrospective`` never requires it unless a caller
+    actually registers a private audit ref (``register_private_audit_ref``
+    below)."""
+    return _load_sibling_module("agent_retrospective_private_audit_resolver", "private_audit_resolver.py")
+
+
+def register_private_audit_ref(
+    evidence_ref: dict[str, Any],
+    run_identity: dict[str, Any],
+    *,
+    private_content: Any,
+    audit_root: Path | None = None,
+) -> dict[str, Any] | None:
+    """Issue #2376 (#1939 Workstream 5) generation-time sidecar PRODUCER hook
+    (mandatory per the OWNER contract-repair anchor comment,
+    issuecomment-5551373964 blocker 1: a resolver with no producer can only
+    ever return ``unavailable``, since a public ``evidence_ref`` alone
+    cannot be used to locate its own private local audit evidence).
+
+    Registers a private-audit sidecar mapping for ONE already-generated,
+    already public-safe ``evidence_ref`` ONLY when ``private_content`` --
+    the ACTUAL real evidence data this run already collected and used to
+    compute that same ``evidence_ref``'s ``projection_digest`` (e.g. one
+    ``_observer_source_type_index()`` entry) -- is truthy, i.e. a local
+    private source already exists this run. Never fabricates a private
+    source: a falsy ``private_content`` is a no-op (``None`` returned, no
+    manifest written) -- see ``private_audit_resolver.
+    register_private_audit_ref()`` for the actual atomic local-only storage
+    write this delegates to.
+
+    Best-effort / fail-open by design (mirrors the existing Latitude
+    evidence binding convention in ``execute_run()`` immediately below,
+    which never blocks or fails the retrospective run on
+    unavailability/failure): any exception raised while resolving/writing
+    local storage is swallowed and ``None`` is returned, so a local-audit
+    storage problem never turns into a retrospective run failure."""
+    if not private_content:
+        return None
+    try:
+        resolver = _private_audit_resolver_module()
+        root = audit_root if audit_root is not None else resolver.default_audit_root(_REPO_ROOT)
+        return resolver.register_private_audit_ref(
+            evidence_ref=evidence_ref,
+            run_identity=run_identity,
+            private_content=private_content,
+            audit_root=root,
+        )
+    except Exception:
+        return None
+
+
 def compute_source_set_digest(source_observations: list[dict[str, Any]]) -> str:
     """Reuse Child 2's canonical ``source_set_digest`` computation (Issue
     #2235/#2236). Loaded lazily so importing this module never requires the
@@ -2559,6 +2614,37 @@ def execute_run(
         evaluation.candidate_records, latitude_evidence
     )
     evaluation = dataclasses.replace(evaluation, candidate_records=bound_candidate_records)
+
+    # Issue #2376 (#1939 Workstream 5): generation-time private-audit
+    # producer hook. Additive-only, mirroring the fail-open Latitude
+    # binding immediately above -- never mutates `evaluation`/
+    # `bound_candidate_records`/the eventual `PublishRequest` (this loop's
+    # only effect is a local-only sidecar filesystem write via
+    # `register_private_audit_ref()`, which itself swallows every
+    # exception). Registers a private-audit mapping ONLY for THIS run's
+    # newly-generated `evidence_refs[]` (the latest `evaluations[-1]` entry
+    # `_build_evaluation_entry()` just constructed, never carried-over
+    # history) whose `source_id` has REAL backing evidence this run
+    # (`real_evidence_index`, the same real data `_enrich_evidence_ref()`
+    # used to compute each ref's `projection_digest` above) -- never a
+    # fabricated/placeholder private source.
+    digest_run_identity = {
+        "run_id": ctx.run_id,
+        "base_sha": ctx.base_sha,
+        "source_set_digest": plan.source_set_digest,
+    }
+    real_evidence_index = _observer_source_type_index(finding_sets)
+    for candidate in bound_candidate_records:
+        finding_contract = candidate.get("finding_contract") if isinstance(candidate, dict) else None
+        evaluations = finding_contract.get("evaluations") if isinstance(finding_contract, dict) else None
+        if not evaluations:
+            continue
+        latest_evaluation = evaluations[-1]
+        for ref in latest_evaluation.get("evidence_refs") or []:
+            if not isinstance(ref, dict):
+                continue
+            real_content = real_evidence_index.get(ref.get("source_id"))
+            register_private_audit_ref(ref, digest_run_identity, private_content=real_content)
 
     return finalize(
         ctx,
