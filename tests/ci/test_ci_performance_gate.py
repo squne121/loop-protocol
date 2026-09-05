@@ -376,7 +376,12 @@ def _cli_main(argv: list[str] | None = None) -> int:
         assessment can still be `approval_eligible: false` e.g. because no
         trusted `ci_verdict_summary_v2` artifact was bound at all. A
         close-grade CLI that exits 0 without independently confirming
-        `approval_eligible` is a false-green risk this AC closes)."""
+        `approval_eligible` is a false-green risk this AC closes);
+    4 = --production-invocation was passed but --manifest-sha256 and/or
+        --experiment-identity was omitted (#2422 AC10: the production
+        invocation route must never reach the --cohort-fixture-file-sha256
+        fallback -- this is checked and fails closed BEFORE any gate/receipt
+        computation runs)."""
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -466,9 +471,9 @@ def _cli_main(argv: list[str] | None = None) -> int:
         help=(
             "#2423 AC3: sha256:<hex> of the #2422 immutable dispatch root run "
             "set manifest this fixture was materialized from. Falls back to "
-            "the --cohort-fixture file's own sha256 when omitted (#2422's "
-            "manifest v2 producer is not yet wired as of this Issue; see "
-            "docs/dev/e2e-performance-benchmark.md)."
+            "the --cohort-fixture file's own sha256 when omitted -- but ONLY "
+            "outside --production-invocation (#2422 AC10); see that flag's "
+            "help text."
         ),
     )
     parser.add_argument(
@@ -476,7 +481,41 @@ def _cli_main(argv: list[str] | None = None) -> int:
         default=None,
         help="#2423 AC3: optional path to additionally write the CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 receipt JSON.",
     )
+    parser.add_argument(
+        "--production-invocation",
+        action="store_true",
+        help=(
+            "Issue #2422 AC10: marks this invocation as the REAL production "
+            "route (e.g. from .github/workflows/ci.yml), where the "
+            "--manifest-sha256/--experiment-identity fallback-to-fixture-"
+            "sha256 behavior below is STRUCTURALLY UNREACHABLE -- omitting "
+            "--manifest-sha256 or --experiment-identity under this flag is a "
+            "hard, fail-closed error (before any receipt/gate computation "
+            "runs), never a silent fallback to the --cohort-fixture file's "
+            "own sha256. Without this flag (the default), the fixture-sha256 "
+            "fallback remains available exactly as before, for unit / "
+            "fixture / exploratory-smoke invocations only."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.production_invocation:
+        missing = [
+            name
+            for name, value in (
+                ("--manifest-sha256", args.manifest_sha256),
+                ("--experiment-identity", args.experiment_identity),
+            )
+            if not value
+        ]
+        if missing:
+            print(
+                "::error::--production-invocation requires "
+                f"{', '.join(missing)} as authoritative trusted input(s); "
+                "the --cohort-fixture-file-sha256 fallback is unreachable "
+                "from the production invocation route (#2422 AC10)."
+            )
+            return 4
 
     with open(args.cohort_fixture, encoding="utf-8") as handle:
         fixture_text = handle.read()
@@ -516,7 +555,18 @@ def _cli_main(argv: list[str] | None = None) -> int:
         exit_code = 0
 
     if args.receipt_output:
-        cohort_fixture_sha256 = "sha256:" + hashlib.sha256(fixture_text.encode("utf-8")).hexdigest()
+        # Issue #2422 AC10: under --production-invocation, args.manifest_sha256
+        # is ALREADY guaranteed non-empty by the fail-closed check above --
+        # the `or cohort_fixture_sha256` fallback expression is intentionally
+        # NEVER evaluated (a fixture-sha256 substitute must never launder as
+        # a trusted manifest digest on the production route). Outside
+        # --production-invocation (the default), the pre-existing fallback
+        # behavior for unit/fixture/exploratory-smoke callers is unchanged.
+        if args.production_invocation:
+            manifest_sha256_value = args.manifest_sha256
+        else:
+            cohort_fixture_sha256 = "sha256:" + hashlib.sha256(fixture_text.encode("utf-8")).hexdigest()
+            manifest_sha256_value = args.manifest_sha256 or cohort_fixture_sha256
         trusted_functional_evidence = {
             "ci_verdict_summary_artifact_id": args.ci_verdict_summary_artifact_id,
             "ci_verdict_summary_file_sha256": args.expected_ci_verdict_summary_file_sha256,
@@ -525,7 +575,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
         }
         receipt = build_close_grade_receipt(
             fixture,
-            manifest_sha256=args.manifest_sha256 or cohort_fixture_sha256,
+            manifest_sha256=manifest_sha256_value,
             trusted_functional_evidence=trusted_functional_evidence,
             validation_decision=validation_decision,
             exit_code=exit_code,
@@ -1372,6 +1422,68 @@ def _evidence_readiness_hard_check_post_filter(
 CLOSE_GRADE_MATERIALIZATION_POLICY = "close_grade_fail_closed_v1"
 
 
+# --------------------------------------------------------------------------- #
+# Issue #2422 fix_delta Blocker 7 (OWNER REQUEST_CHANGES on PR #2501,
+# issuecomment-5549966497): `_materialize_close_grade_arm` (below) requires
+# BOTH `core_baselines` and `responsive_baselines` to pair by `workflow_run_id`
+# via the UNMODIFIED `_pair_by_workflow_run_id` -- a genuine `monolith` run
+# (Issue #2422's own single-provider topology: core+responsive run
+# sequentially inside ONE `e2e-core` job, `e2e-responsive-matrix` never
+# starts at all) has NO `e2e-responsive-matrix` evidence to pair, so every
+# monolith root member was previously excluded wholesale
+# (`missing_pair_e2e-responsive-matrix`), even though the run itself
+# executed correctly. `_manifest_v2_provider_jobs_to_baselines` below is the
+# adapter/handoff fix this Issue's Allowed Paths scope permits: it reshapes
+# ONE e2e_performance_benchmark_manifest_v2 `Run`'s `provider_jobs[]` into
+# the per-lane baseline-dict shape `_pair_by_workflow_run_id`/
+# `_materialize_close_grade_arm` already consume -- WITHOUT fabricating a
+# fake responsive record (never duplicates the core record) and WITHOUT
+# copying/modifying `_materialize_close_grade_arm`/`_pair_by_workflow_run_id`
+# themselves (Stop Conditions: #2423's eligibility projection logic is
+# never touched). A monolith run correctly and explainably still lands in
+# `evidence_errors` (small-sample `insufficient_evidence` as the eventual
+# gate outcome is an ACCEPTED result of this adapter, per this Issue's own
+# fix_delta text -- not a defect).
+# --------------------------------------------------------------------------- #
+def _manifest_v2_provider_jobs_to_baselines(
+    run: dict, shared_fingerprint_fields: dict
+) -> tuple[list[dict], list[dict]]:
+    """Returns `(core_baselines, responsive_baselines)` -- each either a
+    single-element list (the provider job genuinely started) or an EMPTY
+    list (the provider job is genuinely absent from `run["provider_jobs"]`
+    -- e.g. `e2e-responsive-matrix` on a `monolith` run -- never a
+    synthesized stand-in). `shared_fingerprint_fields` carries the
+    WITHIN_COHORT_REQUIRED_EQUAL-adjacent values Issue #2422 AC1's own
+    frozen non-treatment fingerprint design guarantees are IDENTICAL across
+    both `benchmark_layout` arms (e.g. derived from the manifest's
+    `frozen_non_treatment.lockfile_hash`/`toolchain_digest`) -- this adapter
+    reshapes already-trusted manifest v2 fields, it invents no new
+    provenance."""
+    workflow_run_id = run.get("workflow_run_id")
+    run_attempt = run.get("run_attempt", 1)
+    provider_by_job = {job.get("job"): job for job in run.get("provider_jobs", []) if isinstance(job, dict)}
+
+    def _baseline_for(job_name: str) -> list[dict]:
+        provider_job = provider_by_job.get(job_name)
+        if provider_job is None:
+            return []
+        image = provider_job.get("exact_runner_image") or {}
+        host_runner_image = (
+            f"{image.get('name')}/{image.get('version')}" if image.get("name") and image.get("version") else None
+        )
+        return [
+            {
+                "workflow_run_id": workflow_run_id,
+                "run_attempt": run_attempt,
+                "workflow_digest": run.get("workflow_digest"),
+                "host_runner_image": host_runner_image,
+                **shared_fingerprint_fields,
+            }
+        ]
+
+    return _baseline_for("e2e-core"), _baseline_for("e2e-responsive-matrix")
+
+
 def _root_workflow_run_ids(*baseline_lists: list[dict]) -> list[object]:
     """#2423 AC2: the root run set for one arm is every distinct
     `workflow_run_id` present anywhere in the arm's raw input lists (core /
@@ -1529,6 +1641,86 @@ def _assert_root_eligible_error_invariant(arm_result: dict, arm_errors: list[dic
             f"#2423 AC2 invariant violated for arm={arm_label!r}: "
             f"eligible and evidence_error sets are not disjoint: {overlap!r}"
         )
+
+
+def test_manifest_v2_provider_jobs_adapter_hands_off_real_monolith_split_asymmetric_topology_without_crashing():
+    """Issue #2422 fix_delta Blocker 7 (OWNER REQUEST_CHANGES on PR #2501,
+    issuecomment-5549966497): proves `_manifest_v2_provider_jobs_to_baselines`
+    can accept REAL monolith(1 provider)/split(2 providers) evidence and
+    hand it off to the UNMODIFIED `_materialize_close_grade_arm` without
+    crashing, fabricating evidence, or duplicating the core record as a
+    fake responsive record. A small-sample `insufficient_evidence` FINAL
+    gate outcome is an accepted result here (this Issue's fix_delta text
+    explicitly says so) -- this test only proves the HANDOFF, not the
+    close-grade gate decision."""
+    shared_fields = {
+        "playwright_container_image_digest": "sha256:" + "a" * 64,
+        "node_version": "v20.0.0",
+        "pnpm_version": "9.0.0",
+        "playwright_version": "1.48.0",
+        "lockfile_hash": "sha256:" + "b" * 64,
+    }
+    monolith_run = {
+        "workflow_run_id": 1001,
+        "run_attempt": 1,
+        "workflow_digest": "sha256:" + "c" * 64,
+        "provider_jobs": [
+            {
+                "job": "e2e-core",
+                "workflow_job_id": 5001,
+                "conclusion": "success",
+                "exact_runner_image": {"name": "ubuntu-24.04", "version": "20260901.1.0"},
+            },
+        ],
+    }
+    split_run = {
+        "workflow_run_id": 2001,
+        "run_attempt": 1,
+        "workflow_digest": "sha256:" + "c" * 64,
+        "provider_jobs": [
+            {
+                "job": "e2e-core",
+                "workflow_job_id": 6001,
+                "conclusion": "success",
+                "exact_runner_image": {"name": "ubuntu-24.04", "version": "20260901.1.0"},
+            },
+            {
+                "job": "e2e-responsive-matrix",
+                "workflow_job_id": 6002,
+                "conclusion": "success",
+                "exact_runner_image": {"name": "ubuntu-24.04", "version": "20260901.1.0"},
+            },
+        ],
+    }
+
+    monolith_core, monolith_responsive = _manifest_v2_provider_jobs_to_baselines(monolith_run, shared_fields)
+    split_core, split_responsive = _manifest_v2_provider_jobs_to_baselines(split_run, shared_fields)
+
+    assert len(monolith_core) == 1
+    assert monolith_responsive == []  # genuinely absent -- never fabricated/duplicated
+    assert len(split_core) == 1
+    assert len(split_responsive) == 1
+    assert split_core[0]["host_runner_image"] == split_responsive[0]["host_runner_image"]
+
+    monolith_result, monolith_errors = _materialize_close_grade_arm(monolith_core, monolith_responsive, [], "monolith")
+    split_result, split_errors = _materialize_close_grade_arm(split_core, split_responsive, [], "split")
+
+    # No crash -- both arms produce a coherent, fully-explained result
+    # (the #2423 AC2 root/eligible/error-set invariant holds for both).
+    _assert_root_eligible_error_invariant(monolith_result, monolith_errors, "monolith")
+    _assert_root_eligible_error_invariant(split_result, split_errors, "split")
+
+    # The monolith run's genuinely-absent responsive provider is EXPLAINED
+    # (not silently dropped, not fabricated into a fake pass) -- exactly
+    # the pre-fix_delta defect this Blocker exists to document/handle.
+    assert any("missing_pair_e2e-responsive-matrix" in err["reason"] for err in monolith_errors)
+    assert monolith_result["performance_eligible_workflow_run_ids"] == []
+
+    # The split run's genuine 2-provider evidence is NOT excluded by the
+    # provider-pairing step (it may still be excluded by the SEPARATE
+    # missing-gate-ready-evidence check, since this test passes `[]` for
+    # gate_ready_baselines -- out of scope for this specific adapter fix).
+    assert not any("missing_pair" in err["reason"] for err in split_errors)
 
 
 def _run_set_digest(monolith_ids: list[str], split_ids: list[str]) -> str:
@@ -2229,6 +2421,231 @@ def test_close_grade_result_receipt_complete_sourced_from_gate_status_not_local_
         "P0-1: complete must follow the passed gate_status alone, decoupled from this "
         "receipt's own (still non-empty) evidence_errors"
     )
+
+
+# =============================================================================
+# Issue #2422 AC10: `_cli_main` --production-invocation hardening -- the
+# --cohort-fixture-file-sha256 fallback for --manifest-sha256 must be
+# structurally unreachable from the production invocation route.
+# =============================================================================
+
+
+def _minimal_insufficient_evidence_fixture() -> dict:
+    """A fixture deliberately below MIN_COHORT_RUN_COUNT (3 baselines per
+    arm) -- reaches `gate_status: insufficient_evidence` (exit 1), which is
+    enough to prove `_cli_main` got PAST the --production-invocation
+    fail-closed check and into real gate computation, without requiring a
+    full 20-run comparable cohort."""
+
+    def arm(commit_sha: str, count: int, start_id: int) -> dict:
+        core = [
+            {
+                "workflow_run_id": start_id + i,
+                "job": "e2e-core",
+                "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 60000 + i}],
+            }
+            for i in range(count)
+        ]
+        responsive = [
+            {
+                "workflow_run_id": start_id + i,
+                "job": "e2e-responsive-matrix",
+                "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 60000 + i}],
+            }
+            for i in range(count)
+        ]
+        gate_ready = [
+            {
+                "workflow_run_id": start_id + i,
+                "run_started_at": "2026-08-15T00:00:00Z",
+                "check_completed_at": "2026-08-15T00:05:00Z",
+            }
+            for i in range(count)
+        ]
+        return {
+            "commit_sha": commit_sha,
+            "core_baselines": core,
+            "responsive_baselines": responsive,
+            "gate_ready_baselines": gate_ready,
+        }
+
+    return {
+        "issue_number": 2422,
+        "pr_number": 0,
+        "measured_at": "2026-09-05T00:00:00Z",
+        "functional_evidence": {"proof_level": "check_run_only", "coverage_bound": False},
+        "declared_impact": "AC10 production-invocation hardening test fixture (deliberately insufficient).",
+        "risk_acknowledgement": {
+            "reference": {"source_kind": "issue_comment", "source_id": "test-fixture"},
+            "verification_status": "unverified",
+        },
+        "cohort_provenance": {
+            "runner_image": "ubuntu-24.04",
+            "workers": 1,
+            "scheduler": "loadscope",
+            "command_manifest_digest": "sha256:" + "0" * 64,
+            "test_selection_digest": "sha256:" + "0" * 64,
+        },
+        "before": arm("0" * 40, 3, 9000),
+        "after": arm("1" * 40, 3, 19000),
+    }
+
+
+def test_cli_main_production_invocation_fails_closed_when_manifest_sha256_missing(tmp_path):
+    """GIVEN --production-invocation WHEN --manifest-sha256 is omitted THEN
+    _cli_main exits 4 WITHOUT ever opening --cohort-fixture (a nonexistent
+    path proves this: opening it would raise FileNotFoundError, not
+    return 4) -- Issue #2422 AC10."""
+    output_path = tmp_path / "gate_result.json"
+    exit_code = _cli_main(
+        [
+            "--production-invocation",
+            "--cohort-fixture",
+            str(tmp_path / "does-not-exist.json"),
+            "--output",
+            str(output_path),
+            "--experiment-identity",
+            "exp-1",
+        ]
+    )
+    assert exit_code == 4
+    assert not output_path.exists()
+
+
+def test_cli_main_production_invocation_fails_closed_when_experiment_identity_missing(tmp_path):
+    """Same as above but --experiment-identity is the field omitted --
+    Issue #2422 AC10 requires BOTH trusted inputs, not manifest-sha256
+    alone."""
+    output_path = tmp_path / "gate_result.json"
+    exit_code = _cli_main(
+        [
+            "--production-invocation",
+            "--cohort-fixture",
+            str(tmp_path / "does-not-exist.json"),
+            "--output",
+            str(output_path),
+            "--manifest-sha256",
+            "sha256:" + "a" * 64,
+        ]
+    )
+    assert exit_code == 4
+    assert not output_path.exists()
+
+
+def test_cli_main_production_invocation_with_required_inputs_reaches_gate_computation_and_never_falls_back(tmp_path):
+    """GIVEN --production-invocation WITH both --manifest-sha256 and
+    --experiment-identity supplied WHEN _cli_main runs THEN it reaches real
+    gate computation (exit 1, insufficient_evidence, for this deliberately-
+    small fixture) AND the emitted receipt's `manifest_sha256` is the
+    SUPPLIED value, never the --cohort-fixture file's own sha256 (Issue
+    #2422 AC10 -- proves the fallback expression path was never taken)."""
+    fixture_path = tmp_path / "cohort_fixture.json"
+    fixture_path.write_text(json.dumps(_minimal_insufficient_evidence_fixture()), encoding="utf-8")
+    output_path = tmp_path / "gate_result.json"
+    receipt_path = tmp_path / "receipt.json"
+    supplied_manifest_sha256 = "sha256:" + "7" * 64
+
+    exit_code = _cli_main(
+        [
+            "--production-invocation",
+            "--cohort-fixture",
+            str(fixture_path),
+            "--output",
+            str(output_path),
+            "--receipt-output",
+            str(receipt_path),
+            "--manifest-sha256",
+            supplied_manifest_sha256,
+            "--experiment-identity",
+            "exp-production-1",
+        ]
+    )
+
+    assert exit_code == 1  # insufficient_evidence -- reached real gate computation
+    assert output_path.exists()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["manifest_sha256"] == supplied_manifest_sha256
+
+    fixture_file_sha256 = "sha256:" + hashlib.sha256(fixture_path.read_bytes()).hexdigest()
+    assert receipt["manifest_sha256"] != fixture_file_sha256
+
+
+def test_cli_main_non_production_invocation_still_falls_back_to_fixture_sha256(tmp_path):
+    """GIVEN NO --production-invocation flag (the default -- unit/fixture/
+    exploratory-smoke route) WHEN --manifest-sha256 is omitted THEN the
+    pre-existing --cohort-fixture-file-sha256 fallback behavior is
+    UNCHANGED (Issue #2422 AC10: fallback stays available on this route)."""
+    fixture_path = tmp_path / "cohort_fixture.json"
+    fixture_text = json.dumps(_minimal_insufficient_evidence_fixture())
+    fixture_path.write_text(fixture_text, encoding="utf-8")
+    output_path = tmp_path / "gate_result.json"
+    receipt_path = tmp_path / "receipt.json"
+
+    exit_code = _cli_main(
+        [
+            "--cohort-fixture",
+            str(fixture_path),
+            "--output",
+            str(output_path),
+            "--receipt-output",
+            str(receipt_path),
+        ]
+    )
+
+    assert exit_code == 1  # insufficient_evidence -- reached real gate computation
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    expected_fallback_sha256 = "sha256:" + hashlib.sha256(fixture_text.encode("utf-8")).hexdigest()
+    assert receipt["manifest_sha256"] == expected_fallback_sha256
+
+
+def test_ci_yml_production_gate_call_site_wires_production_invocation_flags():
+    """Issue #2422 fix_delta Blocker 8 (OWNER REQUEST_CHANGES on PR #2501,
+    issuecomment-5549966497): `_cli_main`'s `--production-invocation`
+    hardening (proven by the three tests immediately above) is only a real
+    fix if `.github/workflows/ci.yml`'s ACTUAL production call site (the
+    `python-test-core` job's `Run AC11 evidence gate...` step) passes it --
+    a unit test of `_cli_main` alone cannot prove that. This test parses
+    the REAL workflow YAML (never a hand-copied string literal that could
+    drift from the file) and asserts the step's `run:` text (a) still
+    invokes `tests/ci/test_ci_performance_gate.py` and `--cohort-fixture`
+    (unchanged base invocation) and (b) now ALSO references
+    `--production-invocation` / `--manifest-sha256` / `--experiment-identity`
+    bound to new `manifest_v2_sha256`/`manifest_v2_experiment_identity`
+    workflow_dispatch inputs -- the wiring this fix_delta blocker adds."""
+    yaml = pytest.importorskip("yaml")
+    ci_yml_path = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    with open(ci_yml_path, encoding="utf-8") as handle:
+        workflow = yaml.safe_load(handle)
+
+    # PyYAML's default (YAML 1.1) resolver parses the bare `on:` workflow
+    # trigger key as the boolean `True`, not the string `"on"` -- look up
+    # whichever key form is actually present rather than assuming one.
+    on_section = workflow.get("on", workflow.get(True))
+    dispatch_inputs = on_section["workflow_dispatch"]["inputs"]
+    assert "manifest_v2_sha256" in dispatch_inputs
+    assert "manifest_v2_experiment_identity" in dispatch_inputs
+    assert dispatch_inputs["manifest_v2_sha256"]["default"] == ""
+    assert dispatch_inputs["manifest_v2_experiment_identity"]["default"] == ""
+
+    python_test_core = workflow["jobs"]["python-test-core"]
+    gate_steps = [
+        step
+        for step in python_test_core["steps"]
+        if "tests/ci/test_ci_performance_gate.py" in (step.get("run") or "")
+    ]
+    assert len(gate_steps) == 1, "expected exactly one production gate invocation step"
+    run_text = gate_steps[0]["run"]
+
+    assert "--cohort-fixture" in run_text  # base invocation unchanged
+    assert "--production-invocation" in run_text
+    assert "--manifest-sha256" in run_text
+    assert "--experiment-identity" in run_text
+    assert "MANIFEST_V2_SHA256" in run_text
+    assert "MANIFEST_V2_EXPERIMENT_IDENTITY" in run_text
+
+    env = gate_steps[0].get("env", {})
+    assert env.get("MANIFEST_V2_SHA256") == "${{ github.event.inputs.manifest_v2_sha256 }}"
+    assert env.get("MANIFEST_V2_EXPERIMENT_IDENTITY") == "${{ github.event.inputs.manifest_v2_experiment_identity }}"
 
 
 if __name__ == "__main__":
