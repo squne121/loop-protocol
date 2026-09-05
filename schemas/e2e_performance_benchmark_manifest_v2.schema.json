@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/e2e_performance_benchmark_manifest_v2.schema.json",
+  "title": "E2E Performance Benchmark Manifest V2",
+  "description": "Issue #2422: immutable manifest produced by scripts/ci/collect_e2e_performance_benchmark.py's bounded orchestrator for a frozen-source-SHA `benchmark_layout=monolith|split` A/B/A/B dispatch experiment. Supersedes `e2e_performance_benchmark_manifest_v1`'s `before_sha`/`after_sha`/`pre_split`/`post_split` hybrid semantics (a fixed historical commit compared against a mutable current workflow) with a single frozen source SHA compared across the `benchmark_layout` treatment ONLY. The dispatch root run set (`blocks[].runs[]`) is fixed at dispatch time and is never filtered by outcome (Issue #2422 AC6) -- a `conclusion` other than `success` is recorded, not silently dropped or replaced by an additional dispatch.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "generated_at",
+    "experiment_identity",
+    "experiment_run_set_digest",
+    "frozen_source_sha",
+    "workflow_sha",
+    "workflow_digest",
+    "frozen_non_treatment",
+    "blocks",
+    "evidence_errors"
+  ],
+  "unevaluatedProperties": false,
+  "properties": {
+    "schema": {
+      "const": "e2e_performance_benchmark_manifest_v2"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "generated_at": {
+      "type": "string",
+      "minLength": 1,
+      "format": "date-time"
+    },
+    "experiment_identity": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Free-form stable identifier for this dispatch root run set (operator bookkeeping)."
+    },
+    "experiment_run_set_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Issue #2422 AC5: deterministic digest of the canonicalized (block_id, benchmark_layout, workflow_run_id, run_attempt) tuple set for EVERY run in `blocks[].runs[]`, sorted for input-order independence, via json.dumps(sort_keys=True, separators=(',', ':')) then sha256. Outcome (conclusion) is NEVER an input -- this digest identifies the frozen root run set regardless of which runs succeeded or failed."
+    },
+    "frozen_source_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "The single frozen application-code commit SHA measured by BOTH benchmark_layout arms (monolith and split) -- distinct from `workflow_sha` below. Both arms measure the SAME commit; only `benchmark_layout` (the provider job topology) is the treatment."
+    },
+    "workflow_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Commit SHA of the WORKFLOW DEFINITION (`github.workflow_sha`) shared by every run in this manifest -- required-equal across every block/run/arm (Issue #2422 AC1/AC3)."
+    },
+    "workflow_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "Issue #2422 AC1/AC3: content digest of `.github/workflows/ci.yml` AT the commit `workflow_sha` points to, computed from that commit's own bytes (e.g. via the GitHub Contents API) -- NEVER a sha256sum of a post-checkout local working-tree file, which could silently diverge from the commit `workflow_sha` claims. Required-equal across every block/run/arm."
+    },
+    "frozen_non_treatment": {
+      "$ref": "#/$defs/FrozenNonTreatment"
+    },
+    "blocks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/Block"
+      }
+    },
+    "evidence_errors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/EvidenceError"
+      }
+    }
+  },
+  "$defs": {
+    "FrozenNonTreatment": {
+      "type": "object",
+      "description": "Issue #2422 Outcome/AC1/AC5: the non-treatment fingerprint that must be identical across BOTH benchmark_layout arms -- only `benchmark_layout` (topology) is the treatment.",
+      "required": [
+        "test_inventory_digest",
+        "expected_playwright_invocations",
+        "lockfile_hash",
+        "toolchain_digest"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "test_inventory_digest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Digest identifying the exact frozen Playwright test file inventory measured by both arms."
+        },
+        "expected_playwright_invocations": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Issue #2422 fix_delta Blocker 4 (OWNER REQUEST_CHANGES on PR #2501, issuecomment-5549966497): a LIST of distinct, identifiable Playwright invocations (never a bare test-count integer -- #2424's reliability projection needs to bind per-lane invocation identity, provider placement, and evidence-file correspondence, none of which a plain count can express). This Issue defines the PRODUCER CONTRACT (schema/shape) only -- wiring an actual JSON reporter's output into this array is #2424's responsibility (never pre-implemented here). See `expected_test_count` below for a plain aggregate count, kept separate from invocation identity.",
+          "items": {
+            "$ref": "#/$defs/ExpectedPlaywrightInvocation"
+          }
+        },
+        "expected_test_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Issue #2422 fix_delta Blocker 4: OPTIONAL plain aggregate Playwright test-case count, kept separate from `expected_playwright_invocations`' per-invocation identity list (a consumer that only needs a drift-detection count, not per-lane binding, reads this field instead)."
+        },
+        "lockfile_hash": {
+          "type": "string",
+          "minLength": 1
+        },
+        "toolchain_digest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Combined Node/pnpm/Playwright toolchain fingerprint digest shared by both arms."
+        }
+      }
+    },
+    "ExpectedPlaywrightInvocation": {
+      "type": "object",
+      "description": "Issue #2422 fix_delta Blocker 4: identifies ONE distinct Playwright invocation the frozen non-treatment fingerprint expects -- `invocation_id`/`lane` are the LOGICAL identity (stable across `benchmark_layout` arms), `provider_placement` is the (arm-dependent) PHYSICAL provider job each arm runs it in -- kept separate because monolith runs both lanes sequentially inside `e2e-core` while split runs them as two parallel provider jobs, without changing invocation identity. `evidence_file` names the artifact path this invocation's evidence is expected under. This schema entry defines the PRODUCER CONTRACT shape only -- actual JSON-reporter wiring (Playwright execution + evidence file generation) is #2424's responsibility, never pre-implemented by this Issue.",
+      "required": [
+        "invocation_id",
+        "lane",
+        "provider_placement",
+        "evidence_file"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "invocation_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identifier for this invocation, unique within `expected_playwright_invocations`."
+        },
+        "lane": {
+          "type": "string",
+          "enum": [
+            "core",
+            "responsive"
+          ]
+        },
+        "provider_placement": {
+          "$ref": "#/$defs/LayoutProviderPlacement"
+        },
+        "evidence_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Artifact-relative path this invocation's evidence (e.g. a JSON reporter output or a runtime-evidence file) is expected under."
+        }
+      }
+    },
+    "LayoutProviderPlacement": {
+      "type": "object",
+      "description": "Issue #2422 fix_delta Blocker 4: maps each `benchmark_layout` arm to the provider job name that physically executes this invocation's lane in that arm -- e.g. `monolith` places BOTH `core` and `responsive` lane invocations under `e2e-core` (sequential, single provider), while `split` places them under `e2e-core`/`e2e-responsive-matrix` respectively (parallel, two providers). Required for both arms so a consumer can bind evidence regardless of which arm produced it.",
+      "required": [
+        "monolith",
+        "split"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "monolith": {
+          "type": "string",
+          "minLength": 1
+        },
+        "split": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "Block": {
+      "type": "object",
+      "description": "Issue #2422 AC3/AC7: one matched (monolith, split) pair dispatched in that fixed order -- `block_id` ties the two runs together across the A/B/A/B sequence.",
+      "required": [
+        "block_id",
+        "runs"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "block_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "runs": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/Run"
+          }
+        }
+      }
+    },
+    "Run": {
+      "type": "object",
+      "required": [
+        "benchmark_layout",
+        "workflow_run_id",
+        "run_attempt",
+        "conclusion",
+        "workflow_sha",
+        "workflow_digest",
+        "provider_jobs"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "benchmark_layout": {
+          "type": "string",
+          "enum": [
+            "monolith",
+            "split"
+          ]
+        },
+        "workflow_run_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "conclusion": {
+          "type": "string",
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "skipped",
+            "timed_out"
+          ],
+          "description": "Issue #2422 AC6: recorded as observed, never filtered/excluded from the manifest -- the root run set is fixed at dispatch time regardless of outcome."
+        },
+        "run_url": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Issue #2422 AC7: captured from the workflow dispatch API's `return_run_details: true` response at dispatch time -- never inferred post-hoc via `gh run list`."
+        },
+        "workflow_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "workflow_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "job_names_started": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Issue #2422 AC7/AC8: the full set of job names that actually started for this run -- evidence that only measured provider jobs plus the minimal gate-ready job started (no typecheck/lint/build/etc. unrelated jobs)."
+        },
+        "provider_jobs": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Issue #2422 fix_delta Blocker 6: a run's dispatch always starts at least one measured provider job -- an EMPTY array here (e.g. a `success` conclusion with zero recorded provider-job evidence) is a structural, schema-level fail-closed rejection. Layout-specific minimum composition (monolith needs `e2e-core`; split needs `e2e-core`+`e2e-responsive-matrix`) and the global `workflow_run_id` uniqueness invariant are cross-field checks the schema cannot express -- see `verify_required_provider_jobs_present_for_layout`/`verify_workflow_run_id_global_uniqueness` in scripts/ci/collect_e2e_performance_benchmark.py.",
+          "items": {
+            "$ref": "#/$defs/ProviderJob"
+          }
+        }
+      }
+    },
+    "ProviderJob": {
+      "type": "object",
+      "required": [
+        "job",
+        "workflow_job_id",
+        "conclusion",
+        "exact_runner_image"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "job": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow_job_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "conclusion": {
+          "type": "string",
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "skipped",
+            "timed_out"
+          ]
+        },
+        "exact_runner_image": {
+          "$ref": "#/$defs/ExactRunnerImage"
+        }
+      }
+    },
+    "ExactRunnerImage": {
+      "type": "object",
+      "description": "Issue #2422 AC4: job-level (workflow_job_id + that job's OWN `Set up job` log section) exact Runner Image identity -- never a run-level representative value, never sourced from a different probe job, never OS/architecture only, never `unknown`/empty.",
+      "required": [
+        "name",
+        "version"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "EvidenceError": {
+      "type": "object",
+      "required": [
+        "block_id",
+        "reason",
+        "detail"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "block_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

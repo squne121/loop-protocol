@@ -210,3 +210,76 @@ Issue #2159 の `decision: immediate` の下、cohort 依存（実 GitHub Action
 close-verification（最終ゲート）用途には `EvidenceInsufficientError` / `_evidence_readiness_hard_check` の非 zero exit 経路を使う（AC11）。`pytest.skip()` を close 条件に使用しない。
 
 Issue #2423 の `decision: immediate`（`applicable_acs: [AC6]`）の下、AC6（workflow_dispatch → artifact acquisition → trusted binding → CLI invocation の実配線の live smoke）は、この実装セッションから GitHub Actions workflow_dispatch を起動・観測できない場合、`docs/dev/runtime-verification-policy.md` の SKIP 規約（`fallback_success_is_pass: false`）に従い正確に SKIP を記録する。AC1-AC5（canonical materialization / receipt schema / CLI exit semantics / digest 命名）は本ドキュメントの fixture-driven pytest で決定論的に検証済みであり、SKIP の対象は AC6 の live smoke のみである。
+
+## `e2e_performance_benchmark_manifest_v2`: `benchmark_layout=monolith|split` の A/B/A/B dispatch 配置切替（#2422）
+
+`#2422` は #2159/#2184 の hybrid `before_sha`/`after_sha`（historical checkout と current workflow を混在させる設計）を、同一 frozen source SHA 上で **provider job topology のみ** を treatment とする `benchmark_layout=monolith|split` route へ置換する。`e2e_performance_benchmark_manifest_v1` とそのスキーマ・関数群（`collect_benchmark_manifest`/`_collect_arm` 等）はこの Issue では削除・変更せず、他の既存 consumer のために現状のまま残す（#2422 の Allowed Paths が新規に追加するのは v2 route のみ）。
+
+### 契約差分（v1 → v2）
+
+| 観点 | v1（historical hybrid） | v2（#2422） |
+|---|---|---|
+| treatment | `before_sha`/`after_sha` の 2 つの異なるコミット | 単一の `frozen_source_sha` + `benchmark_layout`（topology のみ） |
+| dispatch 順序 | 単発 dispatch（operator が任意回数繰り返す） | `block_id` 付き A→B（monolith→split）固定順、matched block |
+| root run set 固定 | 明示契約なし | dispatch 直後に `return_run_details: true` レスポンスから固定（outcome 非依存、AC6） |
+| Runner Image identity | run 単位の `host_runner_image`（OS/arch のみ、弱い代替指標） | job 単位（`workflow_job_id` + その job 自身の `Set up job` ログ）の `exact_runner_image`、同一 block 内 required-equal |
+| `workflow_digest` | checkout 後のローカル `sha256sum`（既知の限界、上記参照） | `workflow_sha` が指す commit の bytes から Contents API 経由で算出 |
+| manifest schema | `e2e_performance_benchmark_manifest_v1` | `e2e_performance_benchmark_manifest_v2`（`schemas/e2e_performance_benchmark_manifest_v2.schema.json`） |
+
+### `workflow_digest` の既知の限界の解消
+
+`scripts/ci/collect_e2e_performance_benchmark.py::compute_workflow_digest_from_commit_bytes` は GitHub Contents API（`GET /repos/{repo}/contents/{path}?ref={workflow_sha}`）から `workflow_sha` が指す commit 上の `.github/workflows/ci.yml` bytes を取得し、その sha256 を `workflow_digest` とする（checkout 後のローカルファイルへの `sha256sum` ではない）。`verify_workflow_digest_matches_commit_bytes` はこの値を独立に再計算して照合し、`verify_cross_arm_required_equal` による cross-arm 一致チェック **だけでは検出できない** false-green（両アームが同じ「間違ったコミットから計算した」digest を偶然/意図せず一致させているケース）を拒否する。
+
+### `experiment_run_set_digest` の正規化（canonicalization）
+
+`compute_experiment_run_set_digest` は `blocks[].runs[]` 全件の `(block_id, benchmark_layout, workflow_run_id, run_attempt)` タプルのみを入力とし（`conclusion`/outcome は含めない）、`(block_id, benchmark_layout, workflow_run_id, run_attempt)` でソートしてから `json.dumps(sort_keys=True, separators=(",", ":"))` → sha256 する。入力順序に非依存かつ、後から再実行しても同一 root run set であれば outcome に関わらず同一 digest になる。
+
+### 同一 block 内 Runner Image required-equal（WORKLOAD 単位、fix_delta Blocker 5）
+
+`fetch_exact_runner_image_for_job` は特定の `workflow_job_id` 自身の `Set up job` ログ（別の probe job のログではない）から `Image:` / `Version:` の 2 行を抽出する（`extract_exact_runner_image_from_job_log`）。実 dispatch topology は非対称（monolith は core/responsive を単一 `e2e-core` job 内で逐次実行、split は `e2e-core`/`e2e-responsive-matrix` の 2 job で並列実行）であるため、`verify_exact_runner_image_required_equal_within_block` は job **名**でグルーピングして比較する旧設計ではなく、`WORKLOAD_PROVIDER_JOB_BY_LAYOUT`（`{"monolith": {"core": "e2e-core", "responsive": "e2e-core"}, "split": {"core": "e2e-core", "responsive": "e2e-responsive-matrix"}}`）で workload（`core`/`responsive`）ごとに対応する provider job を解決し、monolith 側の単一 image と split 側の対応する image を比較する。**異なる block 間の比較は行わない**（GitHub hosted runner image のローリング更新は block をまたいで起こり得るため、これを全体不変条件にすると経験上ほぼ確実に experiment 全体が failing になる）。
+
+### bounded orchestrator: `blocks=N`（任意の正整数）と wait/collect/manifest の接続（fix_delta Blocker 2/3）
+
+`build_ab_block_plan` が `block-0001`, `block-0002`, ... の A/B/A/B（monolith→split）固定順プランを構成し、`dispatch_workflow_run`/`run_bounded_experiment`（dispatch のみ、unit-tested、`blocks=22` の deterministic 構造証明はこの関数レベルのまま）は変更していない。
+
+**`execute_bounded_experiment_to_manifest_v2`**（新規、fix_delta Blocker 2/3）が、dispatch から manifest v2 build+validate までを 1 つの bounded orchestration として接続する:
+
+1. plan を `--output`（進捗ファイル）へ dispatch 前に永続化する。
+2. 各 dispatch 直後に `_write_json_atomic`（一時ファイル書き込み→`fsync`→`os.replace`）で進捗ファイルへ都度 flush する。resume 時（`--resume-from`）は既に記録済みの `(block_id, benchmark_layout)` を再 dispatch しない。
+3. `wait_for_run_terminal` が各 run の `status` が GitHub の terminal 値 `"completed"` になるまで bounded polling する（`--max-polls` で fail-closed timeout）。
+4. `collect_run_provider_jobs` が各 run の live jobs API から `job_names_started`（起動した全 job 名、AC7/AC8 証跡）と、`MEASURED_PROVIDER_JOBS` のうち `conclusion != "skipped"` な job だけの `provider_jobs`（`exact_runner_image` を job 単位で bind）を収集する。expected-skip（monolith の `e2e-responsive-matrix`）は決して偽装レコード化されない。
+5. `workflow_digest` は `compute_workflow_digest_from_commit_bytes`（GitHub Contents API 経由、`workflow_sha` の commit bytes から算出）で計算し、`build_manifest_v2` に渡した上で `verify_workflow_digest_matches_commit_bytes` により独立再検証する。両者とも同一の注入可能な `contents_api_call` transport を使うため、実行系列全体が hermetic にテスト可能。
+
+`scripts/ci/collect_e2e_performance_benchmark.py run-experiment`（`main_run_experiment`）はこの `execute_bounded_experiment_to_manifest_v2` を呼び出す CLI へ更新されている。主要フラグ: `--blocks` / `--frozen-source-sha` / `--experiment-id` / `--repo` / `--workflow-sha` / `--frozen-non-treatment-json`（`FrozenNonTreatment` 形状の事前準備済み JSON）/ `--output`（進捗ファイル）/ `--manifest-output`（最終 manifest v2）/ `--resume-from`（任意）。
+
+`N=22`（monolith 22 + split 22 = 44 eligible unique workflow runs、#2155 が要求する close-grade 本番 experiment の規模）は `test_run_bounded_experiment_blocks_22_produces_44_run_root_run_set_deterministically` で **live dispatch を一切行わずに** 構造的正しさ（A/B/A/B 順、block_id の一意性・matched pair、44 件）を証明する。この `N=22` 相当の live dispatch 自体は本 Issue の実装スコープに含めない（#2155 が #2424/#2486 完了後に一度だけ実行する）。
+
+### `expected_playwright_invocations`: invocation 識別リスト（fix_delta Blocker 4）
+
+`frozen_non_treatment.expected_playwright_invocations` は単なるテスト件数の整数ではなく、`invocation_id` / `lane`（`core`/`responsive`）/ `provider_placement`（`monolith`/`split` それぞれで実際に実行する provider job 名 -- 論理 identity と物理配置を分離）/ `evidence_file` を持つオブジェクトのリスト（`ExpectedPlaywrightInvocation`）である。単純なテスト件数が別途必要な場合は `expected_test_count`（任意の整数フィールド）を使う。JSON reporter の実配線自体（Playwright 実行・出力ファイル生成）は #2424 の責務であり、本 Issue は producer contract（schema/形状）の確定のみを行う。
+
+### manifest semantic validator の追加チェック（fix_delta Blocker 6）
+
+`validate_manifest_v2_semantics`/`build_manifest_v2` は以下を追加で検証する:
+
+- `verify_workflow_run_id_global_uniqueness`: 実験全体で同一 `workflow_run_id` が複数の `block_id` に重複配置されていないか（`workflow_run_id_reused_across_blocks`）。
+- `verify_required_provider_jobs_present_for_layout`: `REQUIRED_PROVIDER_JOBS_BY_LAYOUT`（monolith は `e2e-core`、split は `e2e-core`+`e2e-responsive-matrix`）に対して、各 run の `provider_jobs` が必要な job 名を欠いていないか。
+- `verify_success_run_has_provider_job_evidence`: `conclusion: success` なのに `provider_jobs: []` という矛盾を拒否する。加えてスキーマ側にも `Run.provider_jobs` の `minItems: 1` を追加した。
+
+### `benchmark_layout` dispatch の job ルーティングと `python-test-core`/`python-test` の扱い（fix_delta Blocker 1）
+
+`.github/workflows/ci.yml` の `benchmark_layout` input が非空文字の場合、`typecheck`/`lint`/`test`/`build`/`component-vrt-report`/`visual-impact-policy`/`node-backed-hook-tests`/`agy-causal-claim-drift-gate`/`actionlint`/`ci-verdict-summary` の各 job は明示的にスキップされ、`e2e-core`/`e2e-responsive-matrix`/`e2e`（aggregate）が起動する（AC7）。`benchmark_layout=monolith` では `e2e-responsive-matrix` 自体は起動せず（`skipped` conclusion が期待値）、`e2e-core` が標準の core workload の後に追加ステップ（`Run responsive-matrix E2E tests (monolith layout only, timed)`）で responsive workload を逐次実行する。この追加ステップは `playwright.config.ts` を変更せず、step レベルの `LOOP_E2E_LANE: responsive` env override のみで既存のレーン選択ロジック（`E2E_LANE === 'responsive'` の出力先フォルダ切り替えを含む）を再利用する。`e2e`（aggregate）job の判定ロジックは `benchmark_layout=monolith` の場合に限り `e2e-responsive-matrix` の `skipped` を成功として扱う（それ以外の場合は従来通り `skipped` は失敗）。
+
+`python-test-core`/`python-test`（Issue #1760 が固定する `needs: [python-test-core]` + `if: always()` の required aggregate 契約、`scripts/ci/verify_python_test_lane.py`、本 Issue の Allowed Paths 外）は job レベルで完全に除外できない（job-level skip すると `needs.python-test-core.result` が `skipped` になり、`evaluate_python_test_aggregate.py`（`ok = core_result == "success"`）が benchmark route で無条件に fail するため、fix_delta Blocker 1 で修正した）。修正後は `python-test-core` の job-level `if:` を撤去（常時起動、#2422 以前の baseline と同一）し、代わりに実際のテスト実行系ステップ（`uv python install`/`uv sync`/`ruff`/pytest 各レーン/`ci_test_selection` 生成/`ci_runtime_baseline_v1` 収集等）にのみ `if: github.event.inputs.benchmark_layout == ''` を追加した。`actions/checkout`・`./.github/actions/setup-python-uv`・`Verify python-test lane topology invariants (#1760)`（`verify_python_test_lane.py` 自身の自己配線チェックステップ、`check_verifier_not_disabled` が無条件実行を要求）の 3 ステップのみ無条件実行のまま残る。これにより `python-test-core` は benchmark route でも軽量な自己検証のみを行い `success` で終了し、`python-test` の evaluator は誤って fail しない。
+
+### #2423 production close-grade CLI の `--production-invocation` 硬化と実配線（AC10、fix_delta Blocker 8）
+
+`tests/ci/test_ci_performance_gate.py::_cli_main` の `--production-invocation` フラグを指定すると `--manifest-sha256` / `--experiment-identity` の省略は（ゲート計算・receipt 生成が走る前に）即座に exit code 4 で fail-closed になり、`--cohort-fixture` ファイル自身の sha256 へのフォールバック式は **構造的に評価されない**。`.github/workflows/ci.yml` の `e2e-performance-benchmark-assessment-gate` steps（`python-test-core` job 内）は新規 `manifest_v2_sha256`/`manifest_v2_experiment_identity` workflow_dispatch input（両方とも既定は空文字）を追加し、両方が非空のときに限り `--production-invocation --manifest-sha256 "$MANIFEST_V2_SHA256" --experiment-identity "$MANIFEST_V2_EXPERIMENT_IDENTITY"` を実際に付与する（fix_delta Blocker 8: 従来この production call site は `--production-invocation` を一切渡していなかったため、AC10 の硬化が実運用経路では未検証だった）。両方空文字（既定）の場合は従来どおり unit/fixture/exploratory-smoke 経路のまま変更なし。`_materialize_close_grade_arm` 等の #2423 eligibility projection ロジック自体は変更していない。
+
+### monolith（1 provider）と split（2 providers）それぞれの evidence を close-grade materializer へ引き渡す（handoff、fix_delta Blocker 7）
+
+`_materialize_close_grade_arm`/`_pair_by_workflow_run_id`（#2423、無変更）は `core_baselines`/`responsive_baselines` の両方が揃っていることを前提に `workflow_run_id` でペア化する。monolith の実 evidence は `e2e-responsive-matrix` を一切起動しないため、この前提に対して構造的に非対称である。`_manifest_v2_provider_jobs_to_baselines`（`tests/ci/test_ci_performance_gate.py` 新規、manifest-binding adapter のみ）が 1 run の `provider_jobs[]` を per-lane baseline リストへ変換する: 存在しない responsive job は空リスト（偽装レコード化・core レコードの複製のいずれも行わない）として扱われ、`_materialize_close_grade_arm` 自体は無変更のまま `missing_pair_e2e-responsive-matrix` として明示的に説明された `evidence_errors` を生成する。最終的な performance judgment が小標本により `insufficient_evidence` になること自体は、この adapter の欠陥ではなく許容された結果である。
+
+### v1 との共存
+
+`e2e_performance_benchmark_manifest_v1` とその関連関数（`collect_benchmark_manifest` / `_collect_arm` / `verify_run_record_against_live_api` 等）は本 Issue で削除・変更していない。v2 は完全に additive なセクション（`compute_experiment_run_set_digest` 以降)として同一ファイルに追加されており、v1 の呼び出し形（`main(argv)`、レガシー `--before-sha`/`--after-sha` フラグ)は挙動不変である。`scripts/ci/collect_e2e_performance_benchmark.py run-experiment <args>`（`__main__` ブロックでのみ分岐）が v2 専用の新しい CLI サブコマンドである。
