@@ -1317,6 +1317,36 @@ _RUNNER_IMAGE_GROUP_RE = re.compile(r"##\[group\]Runner Image\r?\n(?P<body>.*?)#
 _SET_UP_JOB_IMAGE_RE = re.compile(r"^Image:\s*(?P<name>\S.*?)\s*$", re.MULTILINE)
 _SET_UP_JOB_IMAGE_VERSION_RE = re.compile(r"^Version:\s*(?P<version>\S.*?)\s*$", re.MULTILINE)
 
+# Issue #2422 fix_delta iteration 3 (pr-reviewer REQUEST_CHANGES on PR #2501,
+# `_default_fetch_job_log` real-`gh`-CLI defect): a real `gh api
+# repos/{repo}/actions/jobs/{id}/logs` response is the RAW GitHub Actions
+# log stream -- every line is prefixed by GitHub's own per-line timestamp
+# (e.g. `2026-09-05T08:36:13.8894765Z Image: ubuntu-24.04`), and the very
+# first line carries a UTF-8 BOM. `extract_exact_runner_image_from_job_log`'s
+# `_SET_UP_JOB_IMAGE_RE`/`_SET_UP_JOB_IMAGE_VERSION_RE` are line-anchored
+# (`^Image:`/`^Version:`) and therefore never match against the raw,
+# timestamp-prefixed line -- only against a timestamp-stripped line. This is
+# what the function's own docstring already assumed ("log_text is expected
+# to already have any per-line ... timestamp prefix ... stripped by the
+# caller's log_fetch") but `_default_fetch_job_log` never actually did before
+# this fix (confirmed by feeding a real captured job log, workflow_job_id
+# 101278556600, through `extract_exact_runner_image_from_job_log` directly
+# and observing `None` -- the BOM/timestamp prefix was masking real parsing
+# gaps that the tests' pre-stripped fake `log_fetch` fixtures never exposed).
+_GH_JOB_LOG_TIMESTAMP_PREFIX_RE = re.compile(
+    r"^﻿?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z ", re.MULTILINE
+)
+
+
+def _strip_gh_job_log_timestamp_prefix(log_text: str) -> str:
+    """Issue #2422 fix_delta iteration 3: strips GitHub's per-line log
+    timestamp prefix (and a leading UTF-8 BOM, if present) so the
+    line-anchored `_SET_UP_JOB_IMAGE_RE`/`_SET_UP_JOB_IMAGE_VERSION_RE`
+    regexes in `extract_exact_runner_image_from_job_log` can match against a
+    REAL `gh api .../logs` response, not just against tests' pre-stripped
+    fake fixtures."""
+    return _GH_JOB_LOG_TIMESTAMP_PREFIX_RE.sub("", log_text)
+
 
 def extract_exact_runner_image_from_job_log(log_text: str) -> dict | None:
     """Issue #2422 AC4 (fix_delta after #2422 AC8 live smoke dispatch,
@@ -1660,9 +1690,20 @@ def _default_list_run_jobs(workflow_run_id: int, repo: str) -> list[dict]:
 
 
 def _default_fetch_job_log(workflow_job_id: int, repo: str) -> str:
+    """Issue #2422 fix_delta iteration 3 (pr-reviewer REQUEST_CHANGES on
+    PR #2501): a real GitHub Actions job log commonly contains ANSI escape
+    sequences (e.g. colorized `pnpm`/Playwright output later in the log)
+    that make `gh api` fail-closed with `the response contains terminal
+    escape sequences; pass --allow-escape-sequences to output it anyway`
+    (exit 1) UNLESS `--allow-escape-sequences` is passed -- confirmed
+    against a real live job (workflow_job_id=101278556600) run by this PR
+    itself. The raw response is then further passed through
+    `_strip_gh_job_log_timestamp_prefix` so the caller's line-anchored
+    `Image:`/`Version:` regexes can match (see the module comment above
+    `_GH_JOB_LOG_TIMESTAMP_PREFIX_RE`)."""
     try:
         result = subprocess.run(
-            ["gh", "api", f"repos/{repo}/actions/jobs/{workflow_job_id}/logs"],
+            ["gh", "api", f"repos/{repo}/actions/jobs/{workflow_job_id}/logs", "--allow-escape-sequences"],
             capture_output=True,
             text=True,
             timeout=60,
@@ -1672,7 +1713,7 @@ def _default_fetch_job_log(workflow_job_id: int, repo: str) -> str:
         raise LiveAPIError(f"gh_api_job_log_transport_error: workflow_job_id={workflow_job_id!r}: {exc}") from exc
     if result.returncode != 0:
         raise LiveAPIError(f"gh_api_job_log_fetch_failed: workflow_job_id={workflow_job_id!r}: {result.stderr.strip()}")
-    return result.stdout
+    return _strip_gh_job_log_timestamp_prefix(result.stdout)
 
 
 def collect_run_provider_jobs(

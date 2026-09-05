@@ -1510,6 +1510,94 @@ def test_fetch_exact_runner_image_for_job_returns_parsed_image_on_success():
     assert collector.fetch_exact_runner_image_for_job(123, "squne121/loop-protocol", fake_log_fetch) == _image()
 
 
+# --------------------------------------------------------------------------- #
+# Issue #2422 fix_delta iteration 3 (pr-reviewer REQUEST_CHANGES on PR #2501):
+# every test above this point replaces `log_fetch` with a fake, so the
+# REAL `gh api repos/{repo}/actions/jobs/{id}/logs` subprocess invocation
+# path inside `_default_fetch_job_log` itself was never exercised -- which
+# is exactly how the missing `--allow-escape-sequences` flag (the real `gh`
+# CLI fails closed with `the response contains terminal escape sequences;
+# pass --allow-escape-sequences to output it anyway` whenever a real job
+# log contains ANSI color codes, confirmed against a real live job,
+# workflow_job_id=101278556600, this PR itself dispatched) went undetected.
+# These tests inject a fake `subprocess.run` (never `log_fetch`) so the
+# REAL command construction and REAL response post-processing
+# (`--allow-escape-sequences` flag + timestamp-prefix stripping) are what
+# gets verified.
+# --------------------------------------------------------------------------- #
+def test_default_fetch_job_log_invokes_gh_with_allow_escape_sequences_and_strips_timestamps(monkeypatch):
+    """GIVEN a fake `subprocess.run` returning a REALISTIC live job log
+    (leading UTF-8 BOM, per-line GitHub timestamp prefix, and an ANSI
+    escape sequence later in the log -- the exact condition that makes a
+    real `gh api .../logs` call fail closed without
+    `--allow-escape-sequences`) WHEN `_default_fetch_job_log` is called
+    THEN (a) the invoked `gh` command includes `--allow-escape-sequences`,
+    and (b) the returned text has its timestamp prefixes stripped so
+    `extract_exact_runner_image_from_job_log`'s line-anchored regexes can
+    still parse the REAL `Runner Image` section despite the BOM/ANSI
+    noise."""
+    captured_cmd: dict[str, list[str]] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_cmd["cmd"] = cmd
+        ansi_colored_later_line = "\x1b[36mSome colorized test output\x1b[0m\n"
+        stdout = (
+            "﻿2026-09-05T08:36:13.8834935Z Current runner version: '2.337.0'\n"
+            "2026-09-05T08:36:13.8876658Z ##[group]Runner Image Provisioner\n"
+            "2026-09-05T08:36:13.8878131Z Hosted Compute Agent\n"
+            "2026-09-05T08:36:13.8879155Z Version: 20260828.587\n"
+            "2026-09-05T08:36:13.8885887Z ##[endgroup]\n"
+            "2026-09-05T08:36:13.8893756Z ##[group]Runner Image\n"
+            "2026-09-05T08:36:13.8894765Z Image: ubuntu-24.04\n"
+            "2026-09-05T08:36:13.8895823Z Version: 20260831.293.1\n"
+            "2026-09-05T08:36:13.8903159Z ##[endgroup]\n"
+            f"2026-09-05T08:36:20.0000000Z {ansi_colored_later_line}"
+        )
+        return collector.subprocess.CompletedProcess(cmd, returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(collector.subprocess, "run", fake_run)
+
+    log_text = collector._default_fetch_job_log(101278556600, "squne121/loop-protocol")
+
+    assert "--allow-escape-sequences" in captured_cmd["cmd"]
+    assert collector.extract_exact_runner_image_from_job_log(log_text) == {
+        "name": "ubuntu-24.04",
+        "version": "20260831.293.1",
+    }
+    # The timestamp prefix itself must be gone entirely (never merely
+    # tolerated by a looser downstream regex) -- proves this is a real
+    # strip, not an accidental pass.
+    assert "2026-09-05T08:36:13" not in log_text
+
+
+def test_default_fetch_job_log_raises_live_api_error_on_nonzero_exit(monkeypatch):
+    """Regression for the EXACT failure pr-reviewer reproduced against a
+    real job (workflow_job_id=101278556600) before this fix added
+    `--allow-escape-sequences`: `gh api .../logs` exiting 1 with `the
+    response contains terminal escape sequences; pass
+    --allow-escape-sequences to output it anyway`. This fix makes that
+    specific failure mode unreachable in practice, but
+    `_default_fetch_job_log` must still raise `LiveAPIError` (fail-closed,
+    never a silently-empty return) for ANY nonzero exit, so this failure
+    mode never resurfaces silently if the flag is ever dropped again."""
+
+    def fake_run(cmd, **kwargs):
+        return collector.subprocess.CompletedProcess(
+            cmd,
+            returncode=1,
+            stdout="",
+            stderr=(
+                "the response contains terminal escape sequences; pass "
+                "--allow-escape-sequences to output it anyway"
+            ),
+        )
+
+    monkeypatch.setattr(collector.subprocess, "run", fake_run)
+
+    with pytest.raises(collector.LiveAPIError, match="gh_api_job_log_fetch_failed"):
+        collector._default_fetch_job_log(123, "squne121/loop-protocol")
+
+
 def test_verify_exact_runner_image_required_equal_within_block_detects_mismatch():
     """GIVEN a block whose monolith and split runs disagree on the CORE
     workload's exact_runner_image WHEN verified THEN a violation is
