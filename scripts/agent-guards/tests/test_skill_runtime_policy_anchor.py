@@ -586,47 +586,120 @@ def test_decide_run_only_flags_rejected_for_preflight_run(tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 
+def _pinned_uv_version(repo_root: Path) -> str:
+    import tomllib
+
+    data = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    return data["tool"]["uv"]["required-version"]
+
+
+def _init_control_plane_origin(repo_root: Path, origin: Path) -> None:
+    """A real, local, deterministic ``file://`` bare remote (Issue #2199)
+    that Issue #2199's dedicated-worktree lifecycle (#2196/#2197/#2198) can
+    bind against with no real GitHub network access
+    (``network_required: false``)."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "push", "-q", str(origin), "HEAD:refs/heads/main"],
+        cwd=str(repo_root),
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    subprocess.run(
+        ["git", "--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
 def _install_authority_transport_fixture(repo_root: Path) -> None:
     import shutil
 
     for rel in (
         "scripts/agent-guards/skill_runtime_exec.py",
         "scripts/agent-guards/skill_runtime_command_policy.py",
+        "scripts/agent-guards/worktree_bootstrap_command_policy.py",
+        "scripts/agent-ops/worktree_bootstrap_exec.py",
+        "scripts/agent-ops/worktree_catalog.py",
         ".claude/skills/issue-refinement-loop/scripts/command_registry.py",
         ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
     ):
         _write_text(repo_root / rel, (REPO_ROOT / rel).read_text())
 
+    # Issue #2199 (round 3): `preflight.run.with_human_context` is now a
+    # production preflight profile `main()` dispatches under a dedicated
+    # worktree bound to a real remote's `accepted_oid` (#2197). Source-patch
+    # the copied `skill_runtime_exec.py`'s hardcoded canonical remote
+    # constant to this fixture's own local, deterministic bare remote --
+    # never the real `https://github.com/...` production remote
+    # (`network_required: false` / `auth_required: false` per this Issue's
+    # Runtime Verification Applicability).
+    control_plane_origin_path = repo_root.parent / "control-plane-origin.git"
+    control_plane_remote_url = control_plane_origin_path.as_uri()
+    executor_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_exec.py"
+    executor_source = executor_path.read_text(encoding="utf-8")
+    default_remote_line = 'CONTROL_PLANE_CANONICAL_REMOTE_URL = f"https://github.com/{TRUSTED_REPO_SLUG}.git"'
+    assert default_remote_line in executor_source
+    fixture_remote_line = f"CONTROL_PLANE_CANONICAL_REMOTE_URL = {control_plane_remote_url!r}"
+    executor_path.write_text(executor_source.replace(default_remote_line, fixture_remote_line), encoding="utf-8")
+
+    pin = _pinned_uv_version(REPO_ROOT)
     _write_text(
-        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
-        """from __future__ import annotations
+        repo_root / "pyproject.toml",
+        f'''[project]
+name = "skill-runtime-fixture"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = []
 
-class Deadline:
-    def subprocess_timeout(self, seconds: float) -> float:
-        return seconds
-
-
-def list_worktrees(project_root: str, deadline=None):
-    return []
-
-
-def select_issue_worktree(catalog, issue_number, root_realpath):
-    # #2086 AC9/AC10: authority_transport.produce/consume are NOT
-    # root-no-worktree eligible (unlike decide.run above), so the executor's
-    # active-issue-worktree check requires a non-None entry here for the
-    # fixture's own LOOP_ISSUE_NUMBER=2086 to resolve.
-    return {"issue_number": issue_number, "path": root_realpath}
-""",
+[tool.uv]
+required-version = "{pin}"
+managed = false
+''',
     )
+
     schemas_src = REPO_ROOT / ".claude" / "skills" / "issue-refinement-loop" / "schemas"
     schemas_dst = repo_root / ".claude" / "skills" / "issue-refinement-loop" / "schemas"
     schemas_dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(schemas_src, schemas_dst)
 
+    # Issue #2199 (round 3): the real `worktree_catalog.py` copied above
+    # requires a REAL linked git worktree matching its
+    # `(worktree-)?issue-<N>-*` naming convention for
+    # `resolve_active_issue()`'s `select_issue_worktree()` call to resolve a
+    # non-None entry for `authority_transport.produce`/`consume` (neither is
+    # root-no-worktree eligible, unlike `decide.run` above) -- a bare
+    # untracked directory (the prior hand-written stub's tolerance) no
+    # longer suffices once the catalog is the genuine ``git worktree list``
+    # parser.
     worktree_dir = repo_root / ".claude" / "worktrees" / "issue-2086-authority-transport-fixture"
-    worktree_dir.mkdir(parents=True, exist_ok=True)
+    _git("branch", "issue-2086-authority-transport-fixture", cwd=repo_root)
+
+    # Neither this active-issue worktree nor the dedicated
+    # `control-plane-preflight` worktree the bootstrap below creates may
+    # surface as untracked drift in
+    # `capture_primary_checkout_invariant_snapshot()`'s `git status` at
+    # `repo_root`, mirroring the ignore entry already proven safe by the
+    # round 1/2 fixed sibling fixtures.
+    gitignore_path = repo_root / ".gitignore"
+    gitignore_path.write_text(gitignore_path.read_text() + ".claude/worktrees/\n")
+
     _git("add", "-A", cwd=repo_root)
     _git("commit", "-q", "-m", "install authority_transport fixture", cwd=repo_root)
+    _init_control_plane_origin(repo_root, repo_root.parent / "control-plane-origin.git")
+    _git(
+        "worktree", "add", "-q", str(worktree_dir), "issue-2086-authority-transport-fixture",
+        cwd=repo_root,
+    )
 
 
 def _run_authority_transport_executor(repo: Path, extra_argv: list[str]) -> subprocess.CompletedProcess[str]:
