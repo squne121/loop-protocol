@@ -211,7 +211,7 @@ close-verification（最終ゲート）用途には `EvidenceInsufficientError` 
 
 Issue #2423 の `decision: immediate`（`applicable_acs: [AC6]`）の下、AC6（workflow_dispatch → artifact acquisition → trusted binding → CLI invocation の実配線の live smoke）は、この実装セッションから GitHub Actions workflow_dispatch を起動・観測できない場合、`docs/dev/runtime-verification-policy.md` の SKIP 規約（`fallback_success_is_pass: false`）に従い正確に SKIP を記録する。AC1-AC5（canonical materialization / receipt schema / CLI exit semantics / digest 命名）は本ドキュメントの fixture-driven pytest で決定論的に検証済みであり、SKIP の対象は AC6 の live smoke のみである。
 
-## `e2e_performance_benchmark_manifest_v2`: `benchmark_layout=monolith|split` A/B/A/B dispatch（#2422）
+## `e2e_performance_benchmark_manifest_v2`: `benchmark_layout=monolith|split` の A/B/A/B dispatch 配置切替（#2422）
 
 `#2422` は #2159/#2184 の hybrid `before_sha`/`after_sha`（historical checkout と current workflow を混在させる設計）を、同一 frozen source SHA 上で **provider job topology のみ** を treatment とする `benchmark_layout=monolith|split` route へ置換する。`e2e_performance_benchmark_manifest_v1` とそのスキーマ・関数群（`collect_benchmark_manifest`/`_collect_arm` 等）はこの Issue では削除・変更せず、他の既存 consumer のために現状のまま残す（#2422 の Allowed Paths が新規に追加するのは v2 route のみ）。
 
@@ -230,7 +230,7 @@ Issue #2423 の `decision: immediate`（`applicable_acs: [AC6]`）の下、AC6�
 
 `scripts/ci/collect_e2e_performance_benchmark.py::compute_workflow_digest_from_commit_bytes` は GitHub Contents API（`GET /repos/{repo}/contents/{path}?ref={workflow_sha}`）から `workflow_sha` が指す commit 上の `.github/workflows/ci.yml` bytes を取得し、その sha256 を `workflow_digest` とする（checkout 後のローカルファイルへの `sha256sum` ではない）。`verify_workflow_digest_matches_commit_bytes` はこの値を独立に再計算して照合し、`verify_cross_arm_required_equal` による cross-arm 一致チェック **だけでは検出できない** false-green（両アームが同じ「間違ったコミットから計算した」digest を偶然/意図せず一致させているケース）を拒否する。
 
-### `experiment_run_set_digest` の canonicalization
+### `experiment_run_set_digest` の正規化（canonicalization）
 
 `compute_experiment_run_set_digest` は `blocks[].runs[]` 全件の `(block_id, benchmark_layout, workflow_run_id, run_attempt)` タプルのみを入力とし（`conclusion`/outcome は含めない）、`(block_id, benchmark_layout, workflow_run_id, run_attempt)` でソートしてから `json.dumps(sort_keys=True, separators=(",", ":"))` → sha256 する。入力順序に非依存かつ、後から再実行しても同一 root run set であれば outcome に関わらず同一 digest になる。
 
