@@ -25,7 +25,6 @@ the real review-issue Skill's own (out-of-scope for this Issue) behavior.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import shutil
@@ -334,9 +333,11 @@ def test_expect_skill_command_absent_evidence_fails(tmp_path):
 # .claude/skills/review-issue/SKILL.md -- see module docstring).
 # ---------------------------------------------------------------------------
 
-_STAND_IN_REVIEW_ISSUE_SKILL_MD = """---
+_STAND_IN_REVIEW_ISSUE_SKILL_MD = (
+    """---
 name: review-issue
-description: Issue #2498 AC7 hermetic stand-in for direct-Skill-invocation runtime verification. Never the real review-issue Skill. Trigger word: review-issue.
+description: Issue #2498 AC7 hermetic stand-in for direct-Skill-invocation """
+    """runtime verification. Never the real review-issue Skill. Trigger word: review-issue.
 ---
 
 # Review Issue (AC7 stand-in)
@@ -345,6 +346,7 @@ Reply with exactly this text and nothing else: REVIEW_ISSUE_STAND_IN_OK
 
 Do not call any tools. Do not run any commands. Do not access the network.
 """
+)
 
 
 def test_live_skill_invocation_main_source_non_fallback_pass(tmp_path):
