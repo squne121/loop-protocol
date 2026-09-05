@@ -57,6 +57,7 @@ import time
 import uuid
 from pathlib import Path
 
+import jsonschema
 import yaml
 
 SCHEMA = "WORKTREE_AGENT_RUNTIME_SMOKE_RESULT_V1"
@@ -606,6 +607,33 @@ _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON = json.dumps({
     },
 })
 
+# Issue #2498 AC4: an ADDITIVE sibling of
+# ``_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON`` above -- a SEPARATE
+# constant, never a mutation of the pre-existing one, so every pre-existing
+# caller (including the interactive herdr lane construction below and the
+# native structured lane's default argv) keeps observing byte-identical
+# ``--settings`` JSON (the pinned hook set ``{"SubagentStart",
+# "SubagentStop"}`` this repository's own regression test asserts on). This
+# sibling additionally registers the native ``UserPromptExpansion`` hook
+# (confirmed against a live Claude Code 2.1.261 invocation: a ``command:
+# "cat"`` hook echoes back the hook's own stdin payload, which carries
+# ``command_name``/``command_args``/``command_source`` fields for a direct
+# slash-command/Skill invocation) so ``--expect-skill-command`` has a native
+# evidence channel to read from. Used ONLY when the caller passes
+# ``--expect-skill-command`` (see ``run_structured_claude``'s
+# ``include_user_prompt_expansion_hook`` parameter below) -- every
+# pre-existing caller that omits the new flag still gets the unmodified
+# constant above.
+_CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON = json.dumps({
+    "crossSessionInbound": "refuse",
+    "permissions": {"deny": ["SendMessage", "ListAgents"]},
+    "hooks": {
+        "SubagentStart": [{"hooks": [{"type": "command", "command": "cat"}]}],
+        "SubagentStop": [{"hooks": [{"type": "command", "command": "cat"}]}],
+        "UserPromptExpansion": [{"hooks": [{"type": "command", "command": "cat"}]}],
+    },
+})
+
 
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            max_turns: int, claude_bin: str = "claude",
@@ -613,6 +641,7 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            hermetic_agents_file: str | None = None,
                            hermetic_settings_file: str | None = None,
                            claude_adapter: str = "native",
+                           include_user_prompt_expansion_hook: bool = False,
                            ) -> tuple[int | None, str, str, bool]:
     """Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES
     https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173):
@@ -669,7 +698,20 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
         launch_env = os.environ.copy()
         launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = "subagent-start-stop"
     else:
-        argv += ["--settings", _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON]
+        # Issue #2498 AC4: purely additive -- the extended settings JSON
+        # (adding a "UserPromptExpansion" hook registration) is used ONLY
+        # when the caller opted into ``--expect-skill-command``. Every
+        # pre-existing native-adapter caller (``include_user_prompt_
+        # expansion_hook`` defaults to ``False``) keeps getting the exact,
+        # byte-identical ``_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON``
+        # this repository's own regression test pins to ``{"SubagentStart",
+        # "SubagentStop"}``.
+        settings_json = (
+            _CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON
+            if include_user_prompt_expansion_hook
+            else _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
+        )
+        argv += ["--settings", settings_json]
     # Issue #1734 fix_delta 3 (AC7): purely additive, opt-in persona binding.
     # When ``claude_agent_name`` is provided, insert ``--agent <name>`` so the
     # underlying ``claude`` process actually launches with that Agent as the
@@ -1585,6 +1627,191 @@ def extract_claude_hook_agent_identity(stdout: str) -> dict:
         result["agent_type"] = hook_name_agent_type
         result["source"] = AGENT_TYPE_SOURCE_HOOK_NAME
     return result
+
+
+# ---------------------------------------------------------------------------
+# Issue #2498: ``skill-invocation-runtime-smoke`` profile assertion
+# evaluators (``procedure_steps_executed_in_declared_order`` /
+# ``output_contract_schema_fields_present``), plus the native
+# ``UserPromptExpansion`` evidence channel used by ``--expect-skill-command``
+# (AC1/AC2/AC4). This runner does NOT interpret arbitrary SKILL.md Markdown
+# Procedure text -- the caller supplies the ordered marker list / schema path
+# explicitly; these functions only match that caller-supplied contract
+# against already-captured native evidence.
+# ---------------------------------------------------------------------------
+
+
+def evaluate_ordered_evidence_match(native_evidence_text: str, expected_ordered_markers: list) -> dict:
+    """``procedure_steps_executed_in_declared_order`` assertion evaluator
+    (Issue #2498 AC1): a caller-supplied ORDERED list of expected evidence
+    markers is matched, in order, against ``native_evidence_text`` (the
+    structured lane's own captured stdout -- the native stream-json event
+    text, already in emission order; never stderr, whose write ordering
+    relative to stdout is not reliably interleaved).
+
+    This is a literal, sequential subsequence match -- never a generic
+    Markdown Procedure interpreter: each marker in
+    ``expected_ordered_markers`` must occur as a literal substring at or
+    after the position immediately following the previous marker's match
+    (``str.find(marker, cursor)``). This naturally tolerates a repeated
+    marker appearing more than once (each subsequent occurrence is searched
+    for strictly after the previous one), and fails closed (missing) for
+    both an absent marker and a marker that is present only BEFORE its
+    predecessor in the given order (out-of-order evidence).
+
+    Returns ``{"verified": bool, "expected_order": list[str],
+    "observed_positions": {marker: int}, "missing_markers": list[str]}``.
+    ``verified`` is ``True`` iff every marker was found in order (an empty
+    ``expected_ordered_markers`` trivially verifies)."""
+    observed_positions: dict = {}
+    missing_markers: list = []
+    cursor = 0
+    for marker in expected_ordered_markers:
+        idx = native_evidence_text.find(marker, cursor)
+        if idx < 0:
+            missing_markers.append(marker)
+            continue
+        observed_positions[marker] = idx
+        cursor = idx + len(marker)
+    return {
+        "verified": not missing_markers,
+        "expected_order": list(expected_ordered_markers),
+        "observed_positions": observed_positions,
+        "missing_markers": missing_markers,
+    }
+
+
+def extract_claude_final_result_text(stdout: str) -> str | None:
+    """The final ``type: "result"`` stream-json event's own ``result``
+    field -- Claude Code's own final text response (confirmed against a
+    live Claude Code 2.1.261 invocation: this field carries the exact text
+    of the model's last assistant message). ``None`` (never fabricated)
+    when no ``result`` event was observed or it carries no string
+    ``result`` field."""
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "result":
+            continue
+        text = payload.get("result")
+        if isinstance(text, str):
+            return text
+    return None
+
+
+def evaluate_output_contract_schema_fields_present(stdout: str, schema_path: str) -> dict:
+    """``output_contract_schema_fields_present`` assertion evaluator (Issue
+    #2498 AC2): full ``jsonschema.validate()`` validation of a domain output
+    payload against a SINGLE, caller-supplied, pre-existing canonical JSON
+    Schema file (e.g. ``.claude/skills/review-issue/schemas/
+    review_issue_result_v1.json``) -- never a new required-key-existence-only
+    checker, and never a generic multi-domain schema registry (the schema
+    path is caller-supplied every time, not looked up from any table this
+    runner owns).
+
+    The domain output payload itself is recovered from the structured
+    lane's own final assistant response text (``extract_claude_final_result_
+    text``) via the same best-effort embedded-JSON-object parse
+    (``_parse_embedded_json_object``) already used for hook payloads --
+    never guessed, never a self-report.
+
+    Returns ``{"verified": bool, "schema_path": str,
+    "output_payload_found": bool, "error": str | None}``."""
+    result_text = extract_claude_final_result_text(stdout)
+    if result_text is None:
+        return {
+            "verified": False,
+            "schema_path": schema_path,
+            "output_payload_found": False,
+            "error": "no final result text observed in native evidence",
+        }
+    payload = _parse_embedded_json_object(result_text)
+    if payload is None:
+        return {
+            "verified": False,
+            "schema_path": schema_path,
+            "output_payload_found": False,
+            "error": "final result text did not contain a parseable JSON object",
+        }
+    try:
+        schema = json.loads(Path(schema_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "verified": False,
+            "schema_path": schema_path,
+            "output_payload_found": True,
+            "error": f"schema load failed: {exc}",
+        }
+    try:
+        jsonschema.validate(instance=payload, schema=schema)
+    except jsonschema.exceptions.ValidationError as exc:
+        return {
+            "verified": False,
+            "schema_path": schema_path,
+            "output_payload_found": True,
+            "error": _redact(str(exc))[:2000],
+        }
+    return {
+        "verified": True,
+        "schema_path": schema_path,
+        "output_payload_found": True,
+        "error": None,
+    }
+
+
+_CLAUDE_USER_PROMPT_EXPANSION_HOOK_EVENT = "UserPromptExpansion"
+
+
+def extract_claude_user_prompt_expansion_command_names(stdout: str) -> list:
+    """Every ``command_name`` observed on a native ``UserPromptExpansion``
+    hook lifecycle event, IN ORDER (Issue #2498 AC4). Confirmed against a
+    live Claude Code 2.1.261 invocation: when a ``UserPromptExpansion`` hook
+    is registered (see ``_CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_
+    EXPANSION_SETTINGS_JSON``), its ``command:"cat"`` handler echoes back the
+    hook's own stdin payload -- carrying ``command_name`` / ``command_args``
+    / ``command_source`` -- on both the ``stdout``/``output`` fields of the
+    resulting ``hook_response`` event, exactly like the pre-existing
+    ``SubagentStart``/``SubagentStop`` hook parsing above.
+
+    Per Issue #2498's own research (official docs do not enumerate
+    ``command_source``'s value domain, e.g. whether it uniquely identifies a
+    "main session direct invocation" vs. some other provenance), only
+    ``command_name`` is read here -- ``command_source`` is deliberately never
+    consulted as a pass/fail signal.
+
+    A hook event whose ``stdout``/``output`` channels both parse but
+    DISAGREE on ``command_name`` is treated the same as the pre-existing
+    hook lifecycle parsing above: untrustworthy, and skipped (never guessed
+    by preferring one channel)."""
+    command_names: list = []
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != "system":
+            continue
+        if payload.get("hook_event") != _CLAUDE_USER_PROMPT_EXPANSION_HOOK_EVENT:
+            continue
+        channel_parsed: dict = {}
+        for key in ("stdout", "output"):
+            text = payload.get(key)
+            if not isinstance(text, str) or not text.strip():
+                continue
+            parsed = _parse_embedded_json_object(text)
+            if parsed is not None:
+                channel_parsed[key] = parsed
+        if "stdout" in channel_parsed and "output" in channel_parsed:
+            name_a = channel_parsed["stdout"].get("command_name")
+            name_b = channel_parsed["output"].get("command_name")
+            if (
+                isinstance(name_a, str)
+                and name_a
+                and isinstance(name_b, str)
+                and name_b
+                and name_a != name_b
+            ):
+                continue  # contradictory channels -- never guess
+        for parsed in channel_parsed.values():
+            command_name = parsed.get("command_name")
+            if isinstance(command_name, str) and command_name:
+                command_names.append(command_name)
+                break
+    return command_names
 
 
 def classify_claude_spawn_launch_mode(stdout: str) -> str | None:
@@ -4846,6 +5073,76 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--expect-marker", action="append", default=[])
     parser.add_argument(
+        "--expect-ordered-marker",
+        action="append",
+        default=[],
+        help=(
+            "Issue #2498 AC1 (skill-invocation-runtime-smoke profile, "
+            "procedure_steps_executed_in_declared_order assertion): a "
+            "caller-supplied ORDERED expected-evidence-marker list "
+            "(repeatable, given in the expected order), matched against the "
+            "structured lane's own captured native stdout via "
+            "evaluate_ordered_evidence_match() (a literal, sequential "
+            "subsequence match -- this runner never interprets an arbitrary "
+            "SKILL.md Markdown Procedure). Independent of --expect-marker: "
+            "using this flag alone never triggers the SubAgent "
+            "causal-evidence default gate. Applies to --mode structured "
+            "only. Omitted by default, so every pre-existing caller's "
+            "behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--output-schema-path",
+        default=None,
+        help=(
+            "Issue #2498 AC2 (skill-invocation-runtime-smoke profile, "
+            "output_contract_schema_fields_present assertion): path to a "
+            "single, pre-existing, caller-supplied canonical JSON Schema "
+            "file (e.g. .claude/skills/review-issue/schemas/"
+            "review_issue_result_v1.json) that the structured lane's final "
+            "native result text is validated against via full "
+            "jsonschema.validate() (evaluate_output_contract_schema_fields_"
+            "present()) -- never a new required-key-existence-only checker, "
+            "never a generic multi-domain schema registry. Applies to "
+            "--mode structured only. Omitted by default, so every "
+            "pre-existing caller's behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--expect-marker-source",
+        choices=["main", "subagent"],
+        default="subagent",
+        help=(
+            "Issue #2498 AC3: additive main/subagent evidence-provenance "
+            "input for --expect-marker's existing SubAgent causal-evidence "
+            "default gate (structured lane, Issue #2183 fix-delta). "
+            "'subagent' (default): byte-identical to every pre-existing "
+            "caller's implicit behavior -- causal_evidence_source == "
+            "hook_id_correlated is still required by default whenever "
+            "--expect-marker is given. 'main': opts OUT of that default "
+            "gate for a run asserting a DIRECT (non-delegated) Skill "
+            "invocation instead -- requires --expect-skill-command "
+            "(mandatory pairing; 'main' alone is a usage error, never a "
+            "silent unconditional causal-evidence opt-out). "
+            "--require-subagent-causal-evidence (an explicit, independent "
+            "ask) is unaffected by this flag's value either way."
+        ),
+    )
+    parser.add_argument(
+        "--expect-skill-command",
+        default=None,
+        help=(
+            "Issue #2498 AC4: paired with --expect-marker-source main. "
+            "Verifies a direct Skill/slash-command invocation occurred via "
+            "the native UserPromptExpansion hook event's own "
+            "'command_name' field (extract_claude_user_prompt_expansion_"
+            "command_names()) -- never the undocumented 'command_source' "
+            "value domain. Requires --mode structured and --claude-adapter "
+            "native. Omitted by default, so every pre-existing caller's "
+            "argv and behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--require-subagent-causal-evidence",
         action="store_true",
         help=(
@@ -5087,6 +5384,29 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--require-subagent-causal-evidence requires --runtime claude"
         )
+
+    # Issue #2498 AC4 (Step 2.5 semantic design review, severity: high):
+    # '--expect-marker-source main' MUST NOT be usable on its own -- that
+    # would degrade into an unconditional opt-out of the SubAgent
+    # causal-evidence gate with no substitute assertion at all. Rejected at
+    # parse time (fail fast, before any process is spawned), exactly like
+    # the pre-existing flag/runtime combination checks above.
+    if args.expect_marker_source == "main" and not args.expect_skill_command:
+        parser.error(
+            "--expect-marker-source main requires --expect-skill-command "
+            "(mandatory pairing; 'main' alone would be an unconditional "
+            "causal-evidence opt-out)"
+        )
+    if args.expect_skill_command and args.mode != "structured":
+        parser.error("--expect-skill-command requires --mode structured")
+    if args.expect_skill_command and args.runtime != "claude":
+        parser.error("--expect-skill-command requires --runtime claude")
+    if args.expect_skill_command and args.claude_adapter != "native":
+        parser.error("--expect-skill-command requires --claude-adapter native")
+    if args.expect_ordered_marker and args.mode != "structured":
+        parser.error("--expect-ordered-marker requires --mode structured")
+    if args.output_schema_path and args.mode != "structured":
+        parser.error("--output-schema-path requires --mode structured")
 
     run_id = uuid.uuid4().hex[:12]
     errors: list[str] = []
@@ -5336,6 +5656,7 @@ def main(argv: list[str] | None = None) -> int:
                     hermetic_agents_file=hermetic_agents_file if hermetic_active else None,
                     hermetic_settings_file=hermetic_settings_file if hermetic_active else None,
                     claude_adapter=args.claude_adapter,
+                    include_user_prompt_expansion_hook=bool(args.expect_skill_command),
                 )
                 capability_decision, capability_reason = classify_claude_structured_outcome(
                     rc, out, err, timed_out
@@ -5596,6 +5917,51 @@ def main(argv: list[str] | None = None) -> int:
                     errors.append(f"expected markers not observed: {missing}")
                     exit_code = EXIT_FAIL
 
+            # Issue #2498 AC1: --expect-ordered-marker is independent of
+            # --expect-marker -- it never participates in the SubAgent
+            # causal-evidence default gate below, and is recorded/evaluated
+            # unconditionally (subject only to the same exit_code == EXIT_OK
+            # success-only-assertion guard as --expect-marker above).
+            if args.expect_ordered_marker:
+                ordered_evidence_match = evaluate_ordered_evidence_match(out, args.expect_ordered_marker)
+                schema_summary["ordered_evidence_match"] = ordered_evidence_match
+                if exit_code == EXIT_OK and not ordered_evidence_match["verified"]:
+                    errors.append(
+                        f"ordered evidence match failed: {ordered_evidence_match}"
+                    )
+                    exit_code = EXIT_FAIL
+
+            # Issue #2498 AC2: --output-schema-path is independent of both
+            # --expect-marker and --expect-ordered-marker.
+            if args.output_schema_path:
+                output_contract_schema_validation = evaluate_output_contract_schema_fields_present(
+                    out, args.output_schema_path
+                )
+                schema_summary["output_contract_schema_validation"] = output_contract_schema_validation
+                if exit_code == EXIT_OK and not output_contract_schema_validation["verified"]:
+                    errors.append(
+                        "output contract schema validation failed: "
+                        f"{output_contract_schema_validation.get('error')}"
+                    )
+                    exit_code = EXIT_FAIL
+
+            # Issue #2498 AC3/AC4: recorded unconditionally, same spirit as
+            # subagent_causal_evidence below -- a future reader can always
+            # see which provenance mode this run asserted.
+            schema_summary["expect_marker_source"] = args.expect_marker_source
+            if args.expect_skill_command:
+                observed_skill_commands = extract_claude_user_prompt_expansion_command_names(out)
+                schema_summary["user_prompt_expansion_command_names"] = observed_skill_commands
+                skill_command_observed = args.expect_skill_command in observed_skill_commands
+                schema_summary["expect_skill_command_observed"] = skill_command_observed
+                if exit_code == EXIT_OK and not skill_command_observed:
+                    errors.append(
+                        "expected direct skill invocation not observed via "
+                        f"UserPromptExpansion.command_name: {args.expect_skill_command!r} "
+                        f"(observed={observed_skill_commands!r})"
+                    )
+                    exit_code = EXIT_FAIL
+
             # Issue #2183: structural, hook-ID-correlated causal evidence,
             # recorded unconditionally (never gated on any flag) so a
             # future reader can always see WHY a marker-only PASS was or
@@ -5636,8 +6002,20 @@ def main(argv: list[str] | None = None) -> int:
             # with a runtime other than ``claude``, so by the time this
             # line runs ``args.require_subagent_causal_evidence`` being
             # ``True`` already implies ``args.runtime == "claude"``.
+            #
+            # Issue #2498 AC3: ``--expect-marker-source`` is an ADDITIVE
+            # provenance input scoped ONLY to the implicit "--expect-marker
+            # was given" branch of this gate -- an explicit
+            # ``--require-subagent-causal-evidence`` ask is an independent,
+            # unconditional requirement and is never opted out of by
+            # ``--expect-marker-source main``. The default value
+            # (``"subagent"``) makes ``args.expect_marker_source != "main"``
+            # always ``True``, so this expression is byte-identical to the
+            # pre-#2498 expression for every caller that omits the new flag.
             causal_evidence_required = args.require_subagent_causal_evidence or (
-                args.runtime == "claude" and bool(args.expect_marker)
+                args.runtime == "claude"
+                and bool(args.expect_marker)
+                and args.expect_marker_source != "main"
             )
             if (
                 causal_evidence_required
