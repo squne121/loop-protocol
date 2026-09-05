@@ -4643,6 +4643,81 @@ def _build_anchor_comment_state(
 # ---------------------------------------------------------------------------
 
 
+def _lookup_comment_in_fetched_list(comments: list[dict], comment_id: "str | int") -> Optional[dict]:
+    """Issue #2052 fix_delta A: the actual resolution work of finding a
+    single already-known ``comment_id`` inside an already-fetched,
+    in-memory comments list -- the complete paginated traversal
+    ``run_preflight()`` performs once via ``_fetch_issue_comments()``
+    (Issue #2257 P0-1). Factored into a single named function (instead of
+    being inlined separately at each call site) so both
+    ``_validate_anchor_comment_url()``'s structural check and
+    ``run_preflight()``'s own post-batch-validation resolution route this
+    exact per-``comment_id`` lookup through ``_resolve_anchor_comment_payload``
+    below -- the site that was previously duplicating this scan twice per
+    invocation whenever an anchor comment URL was supplied."""
+    for c in comments:
+        if isinstance(c, dict) and str(c.get("id")) == str(comment_id):
+            return c
+    return None
+
+
+def _resolve_anchor_comment_payload(
+    *,
+    comment_id: "str | int",
+    repo: str,
+    fixture_comments: Optional[list[dict]],
+    transport: "object | None" = None,
+    evidence_index: "object | None" = None,
+) -> "tuple[Optional[dict], str]":
+    """Resolve a single anchor comment's payload for ``comment_id``, either
+    from an already-fetched in-memory ``fixture_comments`` list (the normal
+    live-mode path, Issue #2257 P0-1) or, only when that list is not
+    available (the fresh-readback/TOCTOU fallback), via a single-comment
+    GET (``_fetch_single_comment``).
+
+    Issue #2052 fix_delta A: this is the ONE place both ``run_preflight()``
+    call sites that need this exact ``comment_id`` within a single
+    invocation -- ``_validate_anchor_comment_url()``'s structural check and
+    ``run_preflight()``'s own post-batch-validation re-resolution --
+    perform their lookup/fetch. When an ``evidence_index`` is supplied
+    (``evidence_cache_enabled=True``), the SECOND of those two call sites
+    reuses the first call's result (same phase, same ``resource_id``)
+    instead of repeating an identical list scan / GET -- this is the actual
+    duplicate consumer operation eliminated by this fix_delta (previously
+    ``evidence_index`` was only ever wired into the rare fallback branch,
+    never into this normal, always-exercised-when-an-anchor-is-present
+    path).
+
+    Returns ``(comment_data, err)`` using the same ``err`` convention as
+    ``_fetch_single_comment`` (empty string / falsy on success). A
+    not-found result from the in-memory list branch returns a non-empty,
+    module-internal sentinel ``err`` string that is deliberately never one
+    of ``_fetch_single_comment``'s own semantic_missing/transport_failure
+    prefixes -- callers on that branch must (and, per their pre-existing
+    behavior below, do) decide "not found" purely from ``comment_data is
+    None``, never from ``err`` content, since only the live-fetch branch's
+    ``err`` is meaningfully classified by ``_is_transport_failure()``.
+    """
+
+    if fixture_comments is not None:
+        def _fetch_fn() -> "tuple[Any, str]":
+            found = _lookup_comment_in_fetched_list(fixture_comments, comment_id)
+            return (found, "") if found is not None else (None, "not_found_in_prefetched_comments_list")
+    else:
+        def _fetch_fn() -> "tuple[Any, str]":
+            return _fetch_single_comment(repo, comment_id, transport=transport)
+
+    if evidence_index is not None:
+        outcome = evidence_index.get_or_fetch(
+            repository=repo,
+            resource_kind=_EVIDENCE_RESOURCE_KIND_COMMENT,
+            resource_id=comment_id,
+            fetch_fn=_fetch_fn,
+        )
+        return outcome.raw_snapshot, (outcome.err or "")
+    return _fetch_fn()
+
+
 def _validate_anchor_comment_url(
     url: str,
     repo: str,
@@ -4689,55 +4764,46 @@ def _validate_anchor_comment_url(
 
     comment_id = parsed["comment_id"]
 
-    # Check 3 & 4: comment exists and issue_url field matches
-    if fixture_comments is not None:
-        # Fixture mode: look up comment from pre-fetched data
-        comment_data = None
-        for c in fixture_comments:
-            if isinstance(c, dict) and str(c.get("id")) == str(comment_id):
-                comment_data = c
-                break
-        if comment_data is None:
+    # Check 3 & 4: comment exists and issue_url field matches.
+    #
+    # Issue #2052 fix_delta A: both the `fixture_comments is not None`
+    # branch (the NORMAL live-mode path -- `run_preflight()` always passes
+    # its complete paginated comments traversal here per Issue #2257 P0-1)
+    # and the `fixture_comments is None` branch (the rare
+    # fresh-readback/TOCTOU fallback) now route through the SAME
+    # `_resolve_anchor_comment_payload()` helper, which itself routes
+    # through `evidence_index` (when supplied) either way. This is what
+    # makes the reuse actually observable in normal operation: previously
+    # only the rarely-reached fallback branch was wired to
+    # `evidence_index`, so a normal run (anchor comment already present in
+    # the paginated list) never produced a single cache hit.
+    comment_data, err = _resolve_anchor_comment_payload(
+        comment_id=comment_id,
+        repo=repo,
+        fixture_comments=fixture_comments,
+        transport=transport,
+        evidence_index=evidence_index,
+    )
+    if comment_data is None:
+        if fixture_comments is not None:
+            # Fixture-list branch: absence here means the comment id was
+            # never in the already-fetched list -- always
+            # BLOCKER_ANCHOR_COMMENT_NOT_FOUND (pre-existing behavior,
+            # unchanged; `err` is an internal sentinel, never a
+            # transport/semantic classification here).
             return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND, BLOCKER_ANCHOR_NOT_IN_ISSUE]
-    else:
-        # Live mode WITHOUT a pre-fetched comments list: this is reached
-        # only when `run_preflight()` could not populate `fixture_comments`
-        # from the complete paginated comments traversal it already
-        # performed (Issue #2257 P0-1: the initial anchor must be resolved
-        # from that traversal, not a second single-comment GET -- this
-        # branch is a fresh-readback/TOCTOU fallback, not the normal path).
-        # Fetches via the single read authority (`transport`, threaded down
-        # from `run_preflight()`) -- Issue #2257 AC1. Only a genuine
-        # semantic_missing (true 404) is reported as
+        # Live single-comment GET branch (Issue #2257 AC2/AC3): only a
+        # genuine semantic_missing (true 404) is reported as
         # BLOCKER_ANCHOR_COMMENT_NOT_FOUND; a transport_failure must never
-        # be misreported as "comment not found" (AC2/AC3).
-        #
-        # Issue #2052 AC1: when `evidence_index` is threaded in (opt-in,
-        # `run_preflight(evidence_cache_enabled=True)`), this fetch is
-        # routed through the SAME phase-scoped cache the main-flow
-        # re-lookup in `run_preflight()` also uses for this exact
-        # `comment_id` -- if this validation call already fetched it, that
-        # second lookup reuses the result instead of issuing a second
-        # identical GET.
-        if evidence_index is not None:
-            _outcome = evidence_index.get_or_fetch(
-                repository=repo,
-                resource_kind=_EVIDENCE_RESOURCE_KIND_COMMENT,
-                resource_id=comment_id,
-                fetch_fn=lambda: _fetch_single_comment(repo, comment_id, transport=transport),
+        # be misreported as "comment not found".
+        if _is_transport_failure(err):
+            reason_code = (
+                err[len(_TRANSPORT_FAILURE_PREFIX):]
+                if err.startswith(_TRANSPORT_FAILURE_PREFIX)
+                else "transport_internal_error"
             )
-            comment_data, err = _outcome.raw_snapshot, (_outcome.err or "")
-        else:
-            comment_data, err = _fetch_single_comment(repo, comment_id, transport=transport)
-        if comment_data is None:
-            if _is_transport_failure(err):
-                reason_code = (
-                    err[len(_TRANSPORT_FAILURE_PREFIX):]
-                    if err.startswith(_TRANSPORT_FAILURE_PREFIX)
-                    else "transport_internal_error"
-                )
-                return False, [BLOCKER_ANCHOR_FETCH_TRANSPORT_FAILURE, f"ANCHOR_FETCH_REASON:{reason_code}"]
-            return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND, BLOCKER_ANCHOR_NOT_IN_ISSUE]
+            return False, [BLOCKER_ANCHOR_FETCH_TRANSPORT_FAILURE, f"ANCHOR_FETCH_REASON:{reason_code}"]
+        return False, [BLOCKER_ANCHOR_COMMENT_NOT_FOUND, BLOCKER_ANCHOR_NOT_IN_ISSUE]
 
     # Check 4: issue_url field validation — must be present and non-empty
     issue_url_field = comment_data.get("issue_url")
@@ -7698,13 +7764,24 @@ def run_preflight(
             anchor_url = sorted_urls[0]
             parsed_anchor = _parse_anchor_comment_url(anchor_url)
             comment_id = parsed_anchor.get("comment_id")
-            comment_payload = None
-            if fixture_comment_lookup is not None:
-                for item in fixture_comment_lookup:
-                    if str(item.get("id")) == str(comment_id):
-                        comment_payload = item
-                        break
-            else:
+            # Issue #2052 fix_delta A: this re-resolution of the SAME
+            # `comment_id` that `_validate_anchor_comments_batch()` (via
+            # `_validate_anchor_comment_url()`) already resolved just above
+            # now routes through the SAME shared `_resolve_anchor_comment_payload()`
+            # helper -- when `evidence_index` is supplied, this call is a
+            # cache HIT (no second list scan / no second GET); when it is
+            # not supplied (`evidence_cache_enabled=False`, the pre-existing
+            # default), behavior is byte-for-byte identical to before: a
+            # fresh list scan when `fixture_comment_lookup` is available, or
+            # a fresh single-comment GET otherwise.
+            comment_payload, err = _resolve_anchor_comment_payload(
+                comment_id=comment_id,
+                repo=repo,
+                fixture_comments=fixture_comment_lookup,
+                transport=transport,
+                evidence_index=evidence_index,
+            )
+            if fixture_comment_lookup is None and comment_payload is None:
                 # Issue #2257 (low-priority follow-up noted alongside the
                 # AC1-AC3 fix): keep this re-fetch's err classification
                 # consistent with `_validate_anchor_comment_url` above
@@ -7712,45 +7789,28 @@ def run_preflight(
                 # semantic_missing here (the comment vanished between the
                 # batch validation above and this re-fetch) still gets a
                 # distinguishing blocker, not just a generic GH_API_FAILURE.
-                #
-                # Issue #2052 AC1: routed through the SAME phase-scoped
-                # `evidence_index` (opt-in) as `_validate_anchor_comment_url`
-                # above -- if that validation call already fetched this
-                # exact `comment_id` this invocation, this reuses it instead
-                # of issuing a second identical GET.
-                if evidence_index is not None:
-                    _comment_outcome = evidence_index.get_or_fetch(
-                        repository=repo,
-                        resource_kind=_EVIDENCE_RESOURCE_KIND_COMMENT,
-                        resource_id=comment_id,
-                        fetch_fn=lambda: _fetch_single_comment(repo, comment_id, transport=transport),
-                    )
-                    comment_payload, err = _comment_outcome.raw_snapshot, (_comment_outcome.err or "")
-                else:
-                    comment_payload, err = _fetch_single_comment(repo, comment_id, transport=transport)
-                if comment_payload is None:
-                    blockers.append(BLOCKER_GH_FAILURE)
-                    if not _is_transport_failure(err):
-                        blockers.append(BLOCKER_ANCHOR_COMMENT_NOT_FOUND)
-                    return _emit_failure_result(
-                        repo_root=repo_root,
-                        issue_number=issue_number,
-                        repo=repo,
-                        status="environment_failure",
-                        next_action="fix_environment",
-                        blockers=blockers,
-                        planner_fail_closed_reason_codes=[],
-                        required_sections=[],
-                        required_contract_keys=[],
-                        rewrite_constraints=None,
-                        environment_failure_reason_code=_project_environment_failure_reason(err),
-                        environment_failure_source=(
-                            transport.SOURCE_LABEL
-                            if transport is not None and hasattr(transport, "SOURCE_LABEL")
-                            else "internal"
-                        ),
-                        environment_failure_operation="read_issue_comment",
-                    )
+                blockers.append(BLOCKER_GH_FAILURE)
+                if not _is_transport_failure(err):
+                    blockers.append(BLOCKER_ANCHOR_COMMENT_NOT_FOUND)
+                return _emit_failure_result(
+                    repo_root=repo_root,
+                    issue_number=issue_number,
+                    repo=repo,
+                    status="environment_failure",
+                    next_action="fix_environment",
+                    blockers=blockers,
+                    planner_fail_closed_reason_codes=[],
+                    required_sections=[],
+                    required_contract_keys=[],
+                    rewrite_constraints=None,
+                    environment_failure_reason_code=_project_environment_failure_reason(err),
+                    environment_failure_source=(
+                        transport.SOURCE_LABEL
+                        if transport is not None and hasattr(transport, "SOURCE_LABEL")
+                        else "internal"
+                    ),
+                    environment_failure_operation="read_issue_comment",
+                )
 
             anchor_comment_state, anchor_errors = _build_anchor_comment_state(
                 anchor_url=anchor_url,

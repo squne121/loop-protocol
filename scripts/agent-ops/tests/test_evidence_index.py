@@ -52,20 +52,33 @@ def test_duplicate_read_within_phase_is_cached():
     index.begin_phase("preflight_fetch")
     fetcher = _CountingFetcher([({"body": "hello world"}, "")])
 
+    # Issue #2052 fix_delta D: `duplicate_projection_count` only counts a
+    # cache hit that ALSO supplied a `project_fn` (an actually-suppressed
+    # re-projection) -- a `project_fn` is passed here so this test still
+    # meaningfully exercises that counter under the corrected semantics.
+    project_calls = {"n": 0}
+
+    def _project(raw):
+        project_calls["n"] += 1
+        return {"length": len(raw["body"])}
+
     first = index.get_or_fetch(
         repository=REPO,
         resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
         resource_id=2052,
         fetch_fn=fetcher,
+        project_fn=_project,
     )
     second = index.get_or_fetch(
         repository=REPO,
         resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
         resource_id=2052,
         fetch_fn=fetcher,
+        project_fn=_project,
     )
 
     assert fetcher.calls == 1, "a second reference to the same evidence_key within the same phase must not re-fetch"
+    assert project_calls["n"] == 1, "a cache HIT must reuse the cached projection, never re-run project_fn"
     assert first.reused is False
     assert second.reused is True
     assert second.raw_snapshot == first.raw_snapshot
@@ -75,6 +88,30 @@ def test_duplicate_read_within_phase_is_cached():
     assert metrics["fetch_count"] == 1
     assert metrics["snapshot_reuse_count"] == 1
     assert metrics["duplicate_projection_count"] == 1
+
+
+def test_duplicate_projection_count_not_incremented_without_project_fn():
+    """Issue #2052 fix_delta D: a cache hit for a call that never supplies
+    `project_fn` never ran a projection to begin with, so
+    `duplicate_projection_count` must stay 0 even though
+    `snapshot_reuse_count` still increments normally."""
+    index = evidence_index.EvidenceIndex()
+    index.begin_phase("preflight_fetch")
+    fetcher = _CountingFetcher([({"body": "hello world"}, "")])
+
+    index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=2052, fetch_fn=fetcher,
+    )
+    second = index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=2052, fetch_fn=fetcher,
+    )
+    assert second.reused is True
+
+    metrics = index.metrics_snapshot()
+    assert metrics["snapshot_reuse_count"] == 1
+    assert metrics["duplicate_projection_count"] == 0
 
 
 def test_different_resource_ids_never_collide_in_the_same_phase():
@@ -363,3 +400,200 @@ def test_failing_fallback_read_is_never_treated_as_success():
     assert second.ok is False
     assert second.reused is False
     assert always_fails.calls == 2
+
+
+def test_corrupt_cache_entry_falls_back_to_normal_read_without_crash():
+    """Issue #2052 fix_delta C/AC5: a structurally invalid / incompatible
+    entry injected directly into the cache's internal storage (simulating
+    "corrupt" -- e.g. an entry that does not even have the expected
+    `_CacheEntry` shape) must fall through to a normal fetch, never raise
+    (the pre-existing `test_missing_or_corrupt_cache_falls_back_to_normal_read`
+    only ever exercised the MISSING case, never actually injected a corrupt
+    entry -- confirmed to previously raise `AttributeError` instead of
+    falling back)."""
+    index = evidence_index.EvidenceIndex()
+    index.begin_phase("preflight_fetch")
+
+    class _CorruptEntry:
+        """Deliberately missing `.phase`/`.key` -- not a real `_CacheEntry`."""
+
+    lookup_key = (REPO, evidence_index.RESOURCE_KIND_ISSUE_BODY, "88")
+    index._entries[lookup_key] = _CorruptEntry()  # fault injection
+
+    fetcher = _CountingFetcher([({"body": "fallback succeeded"}, "")])
+    result = index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=88, fetch_fn=fetcher,
+    )
+    assert result.ok is True
+    assert result.reused is False
+    assert result.raw_snapshot == {"body": "fallback succeeded"}
+    assert fetcher.calls == 1
+
+
+def test_corrupt_cache_entry_fallback_failure_is_not_coerced_into_success():
+    """Issue #2052 fix_delta C/AC5(b): when the fallback triggered by a
+    corrupt/incompatible cached entry ITSELF fails (the normal read path
+    is unavailable), that failure must never be reported as a successful
+    fallback."""
+    index = evidence_index.EvidenceIndex()
+    index.begin_phase("preflight_fetch")
+
+    class _CorruptEntry:
+        pass
+
+    lookup_key = (REPO, evidence_index.RESOURCE_KIND_ISSUE_BODY, "89")
+    index._entries[lookup_key] = _CorruptEntry()  # fault injection
+
+    always_fails = _CountingFetcher([(None, "transport_failure:gh_timeout")])
+    result = index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=89, fetch_fn=always_fails,
+    )
+    assert result.ok is False
+    assert result.reused is False
+    assert result.err == "transport_failure:gh_timeout"
+    assert always_fails.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #2052 fix_delta B: force_refresh must invalidate the OLD entry
+# BEFORE attempting the fresh fetch, so a fresh-fetch failure never leaves a
+# stale successful entry in place for a subsequent ordinary call to reuse.
+# ---------------------------------------------------------------------------
+
+
+def test_force_refresh_failure_does_not_leave_stale_entry_for_subsequent_normal_call():
+    index = evidence_index.EvidenceIndex()
+    index.begin_phase("preflight_fetch")
+
+    # Step 1: initial fetch succeeds and caches v1.
+    fetcher = _CountingFetcher([({"body": "v1"}, "")])
+    first = index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=2052, fetch_fn=fetcher,
+    )
+    assert first.raw_snapshot == {"body": "v1"}
+    assert first.reused is False
+
+    # Step 2: force_refresh=True hits a transient failure -- the fetch
+    # itself fails, so nothing new is cached, AND the OLD v1 entry must not
+    # survive either.
+    def _always_fails():
+        return None, "transport_failure:gh_timeout"
+
+    forced = index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=2052, fetch_fn=_always_fails, force_refresh=True,
+    )
+    assert forced.ok is False
+    assert forced.reused is False
+
+    # Step 3: the NEXT ordinary (non-force_refresh) call must be forced to
+    # fetch again -- it must NEVER silently reuse the stale v1 entry as if
+    # it were still current.
+    fetcher_v2 = _CountingFetcher([({"body": "v2"}, "")])
+    third = index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=2052, fetch_fn=fetcher_v2,
+    )
+    assert third.reused is False, "a stale entry surviving a failed force_refresh must never be served as 'reused'"
+    assert third.raw_snapshot == {"body": "v2"}
+    assert fetcher_v2.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #2052 fix_delta C: the cache must never share a mutable object
+# reference with a caller -- neither on the way in (storage) nor on the way
+# out (a cache hit's return value).
+# ---------------------------------------------------------------------------
+
+
+def test_caller_mutation_of_returned_snapshot_never_corrupts_cache_or_sha_correspondence():
+    index = evidence_index.EvidenceIndex()
+    index.begin_phase("preflight_fetch")
+    fetcher = _CountingFetcher([({"body": "original"}, "")])
+
+    first = index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=2052, fetch_fn=fetcher,
+    )
+    original_sha = first.evidence_key.observed_content_sha256
+
+    # Caller mutates the object it received back from get_or_fetch().
+    first.raw_snapshot["body"] = "MUTATED BY CALLER"
+
+    # A second, same-phase reference to the identical evidence_key must
+    # still be served from cache (unaffected by the mutation above) with
+    # its ORIGINAL content and an unchanged, still-correspondingly-correct
+    # observed_content_sha256 -- the mutation above must be visible ONLY
+    # in the caller's own copy, never in the cache's internal state.
+    second = index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=2052, fetch_fn=fetcher,
+    )
+    assert second.reused is True
+    assert second.raw_snapshot == {"body": "original"}, "cache must not observe the caller's mutation"
+    assert second.evidence_key.observed_content_sha256 == original_sha
+    assert fetcher.calls == 1
+
+    # And the SAME guarantee applies in the other direction: mutating what
+    # this second (cache-hit) call returned must not affect a THIRD call.
+    second.raw_snapshot["body"] = "MUTATED A SECOND TIME"
+    third = index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=2052, fetch_fn=fetcher,
+    )
+    assert third.raw_snapshot == {"body": "original"}
+    assert fetcher.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #2052 fix_delta D: begin_phase() must reset the AC7 metrics
+# counters to phase-LOCAL values on a genuine phase TRANSITION (never on
+# re-entering the SAME phase name).
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_are_phase_local_reset_on_transition_not_on_reentry():
+    index = evidence_index.EvidenceIndex()
+
+    index.begin_phase("phase_a")
+    fetcher_a = _CountingFetcher([({"body": "a"}, "")])
+    index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=1, fetch_fn=fetcher_a,
+    )
+    metrics_a = index.metrics_snapshot()
+    assert metrics_a["fetch_count"] == 1
+
+    # Re-entering the SAME phase name must NOT reset the counters -- a
+    # second reference within "phase_a" keeps accumulating on top of the
+    # existing count.
+    index.begin_phase("phase_a")
+    reentry = index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=1, fetch_fn=fetcher_a,
+    )
+    assert reentry.reused is True
+    metrics_a_reentry = index.metrics_snapshot()
+    assert metrics_a_reentry["fetch_count"] == 1
+    assert metrics_a_reentry["snapshot_reuse_count"] == 1
+
+    # A genuine TRANSITION to a different phase name resets every counter
+    # to zero -- phase B's own metrics must never start already "carrying"
+    # phase A's fetch_count/snapshot_reuse_count.
+    index.begin_phase("phase_b")
+    metrics_b_start = index.metrics_snapshot()
+    assert metrics_b_start["fetch_count"] == 0
+    assert metrics_b_start["snapshot_reuse_count"] == 0
+    assert metrics_b_start["emitted_utf8_bytes"] == 0
+    assert metrics_b_start["duplicate_projection_count"] == 0
+
+    fetcher_b = _CountingFetcher([({"body": "b"}, "")])
+    index.get_or_fetch(
+        repository=REPO, resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=2, fetch_fn=fetcher_b,
+    )
+    metrics_b = index.metrics_snapshot()
+    assert metrics_b["fetch_count"] == 1, "phase B's own fetch_count must reflect ONLY phase B's activity"

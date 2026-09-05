@@ -35,6 +35,7 @@ extend this module to cover any of these without a new Issue):
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from dataclasses import dataclass
@@ -91,6 +92,26 @@ def _content_text(raw_snapshot: Any) -> str:
     if isinstance(raw_snapshot, str):
         return raw_snapshot
     return _canonical_json(raw_snapshot)
+
+
+def _defensive_copy(value: Any) -> Any:
+    """Issue #2052 fix_delta C: the single deep-copy boundary used both when
+    storing a fetched ``raw_snapshot``/``projection`` into the cache and
+    when returning a cached entry to a caller. Without this, a caller that
+    mutates the object returned by ``get_or_fetch()`` (e.g.
+    ``outcome.raw_snapshot["body"] = "..."``) would silently also mutate
+    this cache's OWN internal state (they were the exact same object) --
+    the next ``get_or_fetch()`` call for the same key would then return the
+    caller's mutated content while ``EvidenceKey.observed_content_sha256``
+    still reflects the ORIGINAL, pre-mutation content it was computed from,
+    breaking the content<->SHA correspondence Issue #2052 AC3 depends on.
+    ``copy.deepcopy`` is used unconditionally (rather than a shallow copy
+    or a bespoke immutable wrapper) because ``raw_snapshot``/``projection``
+    shapes are caller-defined (``dict``/``list``/``str`` for this module's
+    own Issue/comment fetchers, but an arbitrary caller-supplied
+    ``project_fn`` may return anything) -- a deep copy is the only
+    shape-agnostic way to guarantee independence."""
+    return copy.deepcopy(value)
 
 
 @dataclass(frozen=True)
@@ -187,7 +208,45 @@ class EvidenceIndex:
         self._phase: Optional[str] = None
         self._entries: dict[tuple, _CacheEntry] = {}
 
-        # AC7 metrics -- observed only, never fabricated.
+        # AC7 metrics -- observed only, never fabricated. Reset to zero on
+        # every genuine phase TRANSITION by `begin_phase()` (fix_delta D) --
+        # these are phase-LOCAL counters, not lifetime-of-instance totals.
+        #
+        # Precise measurement boundaries (fix_delta D docs the actual
+        # semantics so the field NAME and what it measures do not drift
+        # apart again):
+        #   fetch_count: incremented exactly once per actual `fetch_fn()`
+        #     invocation (a cache MISS that reached the caller's own
+        #     read/fetch), regardless of whether that fetch succeeded or
+        #     failed. Only counts calls made THROUGH `get_or_fetch()` --
+        #     any read a consumer performs without going through this
+        #     cache (e.g. the paginated `_fetch_issue_comments()` listing
+        #     call in `run_refinement_preflight.py`, which this Issue's
+        #     Allowed Paths deliberately do not route through this cache
+        #     because it is called at most once per phase) is NOT counted
+        #     here.
+        #   emitted_utf8_bytes: the UTF-8 byte length of the canonical
+        #     textual representation (`_content_text()`) of a successfully
+        #     fetched `raw_snapshot`, added exactly once per successful
+        #     cache-MISS fetch (never on a cache hit, and never for a
+        #     failed fetch). This is a proxy for "how much snapshot content
+        #     was newly read from GitHub and would otherwise need
+        #     re-reading downstream" -- it is NOT a measurement of actual
+        #     stdout/artifact emission size (a cache HIT still returns the
+        #     full content to its caller; this counter does not grow for
+        #     that reuse, by design, since AC6 defines "reduction" as this
+        #     counter -- or `fetch_count` -- going down when the SAME
+        #     content is referenced twice).
+        #   snapshot_reuse_count: incremented exactly once per cache HIT
+        #     (a `get_or_fetch()` call that returned an already-cached,
+        #     phase-/config-compatible entry instead of calling
+        #     `fetch_fn()`).
+        #   duplicate_projection_count: incremented exactly once per cache
+        #     HIT where the caller ALSO supplied a non-``None`` ``project_fn``
+        #     -- i.e. a projection computation that was actually suppressed
+        #     by the reuse. A cache hit for a call that never passes
+        #     ``project_fn`` never ran a projection to begin with, so it
+        #     must not increment this counter (fix_delta D).
         self._fetch_count = 0
         self._emitted_utf8_bytes = 0
         self._snapshot_reuse_count = 0
@@ -212,10 +271,29 @@ class EvidenceIndex:
         next reference to any resource -- a snapshot cached in a previous
         phase must never leak into a new one). Calling ``begin_phase()``
         again with the SAME phase name is a no-op (re-entering the same
-        phase does not itself invalidate anything)."""
+        phase does not itself invalidate anything).
+
+        Issue #2052 fix_delta D: a phase transition ALSO resets the AC7
+        metrics counters to phase-LOCAL values (zero). Without this, the
+        counters are instance-wide cumulative totals, so
+        ``context_budget_report.record_from_evidence_index()`` -- which
+        records ``metrics_snapshot()`` as-is for whichever phase is active
+        at call time -- would double count: e.g. phase A does one fetch
+        (``fetch_count`` == 1, recorded for phase A), then phase B does one
+        MORE fetch (``fetch_count`` == 2, recorded for phase B as if phase
+        B alone had performed 2 fetches), and ``totals()`` would then sum
+        1 + 2 == 3 for only 2 real fetches. Re-entering the SAME phase name
+        does not reset counters (matches the pre-existing "no-op" cache
+        semantics for entries -- ongoing accumulation within one phase is
+        intentional, only a genuine transition to a DIFFERENT phase must
+        start that new phase's own count from zero)."""
         if phase != self._phase:
             self._entries.clear()
             self._phase = phase
+            self._fetch_count = 0
+            self._emitted_utf8_bytes = 0
+            self._snapshot_reuse_count = 0
+            self._duplicate_projection_count = 0
 
     def invalidate(self, repository: str, resource_kind: str, resource_id: "str | int") -> None:
         """Explicitly drop any cached entry for this resource. Callers MUST
@@ -268,14 +346,40 @@ class EvidenceIndex:
         resource_id_s = str(resource_id)
         lookup_key = (repository, resource_kind, resource_id_s)
 
-        if not force_refresh and self._phase is not None:
+        if force_refresh:
+            # Issue #2052 fix_delta B: `force_refresh=True` is a caller's
+            # explicit declaration that ANY previously-cached entry for this
+            # resource must never be treated as current again -- drop it
+            # BEFORE attempting the fresh fetch below, not after. Without
+            # this, a fresh fetch that itself fails (transient failure)
+            # would leave the OLD successful entry in place, and the very
+            # next ordinary (non-`force_refresh`) call would silently reuse
+            # that stale entry as if it were still valid (`reused=True,
+            # err=None`) instead of being forced to fetch again.
+            self._entries.pop(lookup_key, None)
+        elif self._phase is not None:
             entry = self._entries.get(lookup_key)
             if entry is not None and self._entry_is_compatible(entry):
                 self._snapshot_reuse_count += 1
-                self._duplicate_projection_count += 1
+                # Issue #2052 fix_delta D: `duplicate_projection_count` must
+                # only count a suppressed re-projection -- i.e. a cache hit
+                # where `project_fn` was actually supplied (and would
+                # otherwise have re-run). A hit with no `project_fn` never
+                # ran a projection in the first place, so there is nothing
+                # to suppress.
+                if project_fn is not None:
+                    self._duplicate_projection_count += 1
+                # Issue #2052 fix_delta C: return an independent deep copy,
+                # never the exact object stored internally -- a caller that
+                # mutates the returned `raw_snapshot`/`projection` (e.g.
+                # `outcome.raw_snapshot["body"] = ...`) must never also
+                # mutate this cache's OWN internal state (which would
+                # silently desynchronize the cached content from
+                # `entry.key.observed_content_sha256`, and would leak into
+                # every subsequent cache hit for this same entry).
                 return FetchOutcome(
-                    raw_snapshot=entry.raw_snapshot,
-                    projection=entry.projection,
+                    raw_snapshot=_defensive_copy(entry.raw_snapshot),
+                    projection=_defensive_copy(entry.projection),
                     err=None,
                     reused=True,
                     evidence_key=entry.key,
@@ -307,8 +411,16 @@ class EvidenceIndex:
         projection = project_fn(raw_snapshot) if project_fn is not None else raw_snapshot
 
         if self._phase is not None:
+            # Issue #2052 fix_delta C: store an independent deep copy of
+            # both `raw_snapshot` and `projection` -- the caller receiving
+            # THIS call's return value below still gets the original,
+            # freshly-fetched objects (mutating those has no effect on what
+            # is stored here, since it is already a separate copy).
             self._entries[lookup_key] = _CacheEntry(
-                key=key, raw_snapshot=raw_snapshot, projection=projection, phase=self._phase
+                key=key,
+                raw_snapshot=_defensive_copy(raw_snapshot),
+                projection=_defensive_copy(projection),
+                phase=self._phase,
             )
 
         return FetchOutcome(
@@ -320,15 +432,28 @@ class EvidenceIndex:
         )
 
     def _entry_is_compatible(self, entry: _CacheEntry) -> bool:
-        return entry.phase == self._phase and entry.key.config_sha256 == self._config_sha256
+        """Issue #2052 AC5: a structurally invalid or otherwise-incompatible
+        cached entry (e.g. a fault-injected object that does not have the
+        expected ``_CacheEntry`` shape) must be treated as "not compatible"
+        -- falling through to a normal fresh fetch in ``get_or_fetch`` --
+        never raise and crash the caller. Any failure to even inspect the
+        candidate ``entry`` therefore counts as incompatible."""
+        try:
+            return entry.phase == self._phase and entry.key.config_sha256 == self._config_sha256
+        except AttributeError:
+            return False
 
     # -- metrics (Issue #2052 AC7: observed only) -------------------------
 
     def metrics_snapshot(self) -> dict:
-        """Observed-only counters accumulated so far on this instance.
-        Never includes token / model-turn figures -- those are not
-        observable at this layer and ``context_budget_report.py`` must not
-        fabricate them either."""
+        """Observed-only counters accumulated since the CURRENT phase began
+        (fix_delta D: ``begin_phase()`` resets these to zero on every
+        genuine phase transition -- they are phase-local, not
+        lifetime-of-instance totals). See the field-by-field measurement
+        boundaries documented next to their initialization in
+        ``__init__``. Never includes token / model-turn figures -- those
+        are not observable at this layer and ``context_budget_report.py``
+        must not fabricate them either."""
         return {
             "fetch_count": self._fetch_count,
             "emitted_utf8_bytes": self._emitted_utf8_bytes,

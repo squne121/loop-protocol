@@ -7,11 +7,23 @@ reimplementation of it), proving that enabling the opt-in
 1. never changes the resulting decision (``status`` / ``next_action`` /
    ``blockers`` / ``must_read`` / ``commands``) -- cache on/off semantic
    equivalence;
-2. measurably reduces ``fetch_count`` for a duplicate same-phase reference
-   to the identical ``evidence_key``, via the SAME production
-   ``EvidenceIndex``/``_fetch_issue`` call path ``run_preflight()`` itself
-   uses (shared explicitly through the new ``evidence_index=`` parameter);
-   and
+2. measurably reduces the number of REAL resolution operations for a
+   genuine, PRODUCTION-PATH duplicate consumer this fix_delta actually
+   found and fixed (Issue #2052 fix_delta A): when an anchor comment URL is
+   supplied, ``run_preflight()`` resolves the exact same ``comment_id``
+   TWICE within a single invocation -- once via
+   ``_validate_anchor_comments_batch()`` (structural validation) and again
+   via its own post-batch-validation re-resolution just below. Both call
+   sites route through the shared ``_resolve_anchor_comment_payload()``
+   helper; with the cache enabled the second resolution is served from
+   cache (0 additional list-scan/GET operations), and without it each
+   resolution does its own independent work (2 total). This is asserted
+   PURELY by observing ``run_preflight()``'s own single call -- no
+   artificial extra call to ``evidence_index.get_or_fetch()`` is made by
+   this test after ``run_preflight()`` returns (a prior version of this
+   test did exactly that, which only proved the cache primitive works in
+   isolation, never that ``run_preflight()`` itself produces a single
+   cache hit in normal operation); and
 3. writes the new, purely-additive ``context_budget_report.json`` artifact
    reflecting only the observed metrics -- never one of the three existing
    fixed-schema artifacts (``raw_issue_snapshot.json`` /
@@ -21,7 +33,12 @@ reimplementation of it), proving that enabling the opt-in
 ``_fetch_issue`` / ``_fetch_issue_comments`` are monkeypatched (there is no
 network access here) but ``run_preflight()``'s own orchestration, its
 evidence-cache wiring, and the real ``plan_refinement_loop.py`` planner
-subprocess it invokes are all exercised for real.
+subprocess it invokes are all exercised for real. The underlying
+comment-list-scan primitive (``_lookup_comment_in_fetched_list()``) is
+wrapped with a call counter (not monkeypatched away) so this test observes
+the REAL number of times ``run_preflight()`` itself performs that
+resolution work -- the exact same production function both call sites
+share.
 """
 from __future__ import annotations
 
@@ -38,7 +55,6 @@ _PREFLIGHT_SCRIPTS_DIR = _REPO_ROOT / ".claude" / "skills" / "issue-refinement-l
 sys.path.insert(0, str(_AGENT_OPS_DIR))
 sys.path.insert(0, str(_PREFLIGHT_SCRIPTS_DIR))
 
-import evidence_index as evidence_index_module  # noqa: E402
 import run_refinement_preflight as preflight  # noqa: E402
 
 
@@ -131,6 +147,31 @@ def _issue_payload() -> dict:
     }
 
 
+ANCHOR_COMMENT_ID = 5550000001
+ANCHOR_COMMENT_URL = f"https://github.com/{REPO}/issues/{ISSUE_NUMBER}#issuecomment-{ANCHOR_COMMENT_ID}"
+
+
+def _anchor_comment_payload() -> dict:
+    """A schema-conformant (``anchor_comment.schema.json``) raw comment
+    payload for ``ANCHOR_COMMENT_ID`` -- present in the SAME paginated
+    comments list ``_fetch_issue_comments()`` returns, so `run_preflight()`
+    resolves it twice per invocation (Issue #2052 fix_delta A's actual
+    production duplicate consumer): once via
+    `_validate_anchor_comments_batch()`, once via its own
+    post-batch-validation re-resolution."""
+    return {
+        "id": ANCHOR_COMMENT_ID,
+        "issue_url": f"https://api.github.com/repos/{REPO}/issues/{ISSUE_NUMBER}",
+        "html_url": ANCHOR_COMMENT_URL,
+        "url": f"https://api.github.com/repos/{REPO}/issues/comments/{ANCHOR_COMMENT_ID}",
+        "user": {"login": "octocat"},
+        "author_association": "OWNER",
+        "body": "anchor comment body for evidence cache integration test",
+        "created_at": "2026-09-05T00:00:00Z",
+        "updated_at": "2026-09-05T00:00:00Z",
+    }
+
+
 def test_cache_toggle_semantic_equivalence_and_fetch_count_reduction(tmp_path, monkeypatch):
     # Two INDEPENDENT repo_root/artifact-dir trees -- each is genuinely the
     # first-ever preflight run for its own issue artifact dir, so neither
@@ -142,6 +183,21 @@ def test_cache_toggle_semantic_equivalence_and_fetch_count_reduction(tmp_path, m
     repo_root_enabled = _init_repo_root(tmp_path / "enabled")
 
     issue_fetch_calls = {"n": 0}
+    comments_fetch_calls = {"n": 0}
+    # Issue #2052 fix_delta A: count REAL invocations of the actual
+    # production resolution primitive both `_validate_anchor_comment_url()`
+    # and `run_preflight()`'s own post-batch-validation re-resolution share
+    # (via `_resolve_anchor_comment_payload()`) -- this is the genuine
+    # duplicate consumer this fix_delta found and fixed. Wrapping (not
+    # monkeypatching away) the real function means this counts EXACTLY how
+    # many times `run_preflight()` itself actually performs that lookup
+    # work, not an artificial proxy.
+    comment_lookup_calls = {"n": 0}
+    _original_lookup = preflight._lookup_comment_in_fetched_list
+
+    def _counting_lookup(comments, comment_id):
+        comment_lookup_calls["n"] += 1
+        return _original_lookup(comments, comment_id)
 
     def _fake_fetch_issue(repo_arg, issue_number):
         assert repo_arg == REPO
@@ -150,23 +206,37 @@ def test_cache_toggle_semantic_equivalence_and_fetch_count_reduction(tmp_path, m
         return _issue_payload(), ""
 
     def _fake_fetch_issue_comments(repo_arg, issue_number):
-        return [], ""
+        comments_fetch_calls["n"] += 1
+        return [_anchor_comment_payload()], ""
 
     monkeypatch.setattr(preflight, "_fetch_issue", _fake_fetch_issue)
     monkeypatch.setattr(preflight, "_fetch_issue_comments", _fake_fetch_issue_comments)
+    monkeypatch.setattr(preflight, "_lookup_comment_in_fetched_list", _counting_lookup)
 
     # --- Baseline: evidence cache disabled (pre-existing default behavior). ---
     monkeypatch.setattr(preflight, "_find_repo_root", lambda: repo_root_disabled)
     issue_fetch_calls["n"] = 0
+    comments_fetch_calls["n"] = 0
+    comment_lookup_calls["n"] = 0
     result_disabled, exit_code_disabled = preflight.run_preflight(
         issue_number=ISSUE_NUMBER,
         repo=REPO,
-        anchor_comment_urls=[],
+        anchor_comment_urls=[ANCHOR_COMMENT_URL],
         fixture_path=None,
         known_context=None,
+        now="2026-09-05T00:00:00+00:00",
         evidence_cache_enabled=False,
     )
     assert issue_fetch_calls["n"] == 1
+    assert comments_fetch_calls["n"] == 1
+    # Disabled (pre-existing default behavior): the SAME comment_id is
+    # resolved from the in-memory comments list TWICE -- once by
+    # `_validate_anchor_comments_batch()`, once by `run_preflight()`'s own
+    # post-batch-validation re-resolution. This is the real, un-suppressed
+    # duplicate this fix_delta's cache wiring targets.
+    assert comment_lookup_calls["n"] == 2, (
+        "evidence cache disabled: the anchor comment is genuinely resolved twice per invocation"
+    )
 
     raw_snapshot_disabled = json.loads(
         (_artifact_dir(repo_root_disabled) / "raw_issue_snapshot.json").read_text(encoding="utf-8")
@@ -175,40 +245,31 @@ def test_cache_toggle_semantic_equivalence_and_fetch_count_reduction(tmp_path, m
         (_artifact_dir(repo_root_disabled) / "planner_input.json").read_text(encoding="utf-8")
     )
 
-    # --- Cache enabled (independent repo_root), sharing an externally-visible EvidenceIndex so this
-    # test can also directly reference the SAME evidence_key a second time
-    # via the real, shared `_fetch_issue` production fetch path, proving
-    # reuse (AC1/AC6) rather than merely asserting it in isolation.
+    # --- Cache enabled (independent repo_root). ---
     monkeypatch.setattr(preflight, "_find_repo_root", lambda: repo_root_enabled)
     issue_fetch_calls["n"] = 0
-    shared_index = evidence_index_module.EvidenceIndex()
+    comments_fetch_calls["n"] = 0
+    comment_lookup_calls["n"] = 0
     result_enabled, exit_code_enabled = preflight.run_preflight(
         issue_number=ISSUE_NUMBER,
         repo=REPO,
-        anchor_comment_urls=[],
+        anchor_comment_urls=[ANCHOR_COMMENT_URL],
         fixture_path=None,
         known_context=None,
+        now="2026-09-05T00:00:00+00:00",
         evidence_cache_enabled=True,
-        evidence_index=shared_index,
     )
-    fetch_count_after_run_preflight = issue_fetch_calls["n"]
-    assert fetch_count_after_run_preflight == 1, "run_preflight() itself performs exactly one real fetch"
-
-    # A duplicate same-phase reference to the identical evidence_key
-    # (repository, resource_kind=issue_body, resource_id=ISSUE_NUMBER),
-    # through the SAME `_fetch_issue` production function `run_preflight()`
-    # itself calls, sharing the SAME EvidenceIndex `run_preflight()` used
-    # internally -- must be served from cache, not re-fetched.
-    shared_index.begin_phase(preflight.EVIDENCE_CACHE_PHASE_PREFLIGHT_FETCH)
-    outcome = shared_index.get_or_fetch(
-        repository=REPO,
-        resource_kind=evidence_index_module.RESOURCE_KIND_ISSUE_BODY,
-        resource_id=ISSUE_NUMBER,
-        fetch_fn=lambda: preflight._fetch_issue(REPO, ISSUE_NUMBER),
-    )
-    assert outcome.reused is True
-    assert issue_fetch_calls["n"] == fetch_count_after_run_preflight, (
-        "a same-phase re-reference to the identical evidence_key must not trigger a second real fetch"
+    assert issue_fetch_calls["n"] == 1
+    assert comments_fetch_calls["n"] == 1
+    # Enabled: the SECOND resolution of the identical comment_id is served
+    # from the phase-scoped EvidenceIndex cache instead of performing a
+    # second real list-scan resolution -- this is the actual,
+    # production-path fetch/resolution-count reduction AC1/AC6 require
+    # (proven here SOLELY by observing `run_preflight()`'s own single call,
+    # with no artificial extra cache reference made by this test).
+    assert comment_lookup_calls["n"] == 1, (
+        "evidence cache enabled: the second reference to the same comment_id must be served from "
+        "cache, not perform a second real resolution"
     )
 
     raw_snapshot_enabled = json.loads(
@@ -240,13 +301,12 @@ def test_cache_toggle_semantic_equivalence_and_fetch_count_reduction(tmp_path, m
     report_payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert report_payload["schema"] == "CONTEXT_BUDGET_REPORT_V1"
     phase_metrics = report_payload["phases"][preflight.EVIDENCE_CACHE_PHASE_PREFLIGHT_FETCH]
-    assert phase_metrics["fetch_count"] == 1
+    # fetch_count: one real issue_body fetch + one real comment resolution
+    # (the SECOND comment reference is the cache hit, not counted here).
+    assert phase_metrics["fetch_count"] == 2
     assert phase_metrics["emitted_utf8_bytes"] > 0
-    # `run_preflight()`'s OWN internal write only covers its own single
-    # fetch; the report artifact must never claim un-observed reuse from
-    # this test's own subsequent direct call (which happened AFTER
-    # `run_preflight()` had already written the report).
-    assert phase_metrics["snapshot_reuse_count"] == 0
+    # The second, cache-served comment reference IS the observed reuse.
+    assert phase_metrics["snapshot_reuse_count"] == 1
 
     disabled_report_path = _artifact_dir(repo_root_disabled) / "context_budget_report.json"
     assert not disabled_report_path.exists()

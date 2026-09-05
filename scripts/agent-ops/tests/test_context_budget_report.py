@@ -94,12 +94,16 @@ def test_record_from_evidence_index_uses_only_observed_counters():
         resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
         resource_id=2052,
         fetch_fn=lambda: ({"body": "hello"}, ""),
+        # Issue #2052 fix_delta D: duplicate_projection_count only counts a
+        # cache hit that ALSO supplied a project_fn.
+        project_fn=lambda raw: raw,
     )
     index.get_or_fetch(
         repository="squne121/loop-protocol",
         resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
         resource_id=2052,
         fetch_fn=lambda: ({"body": "hello"}, ""),
+        project_fn=lambda raw: raw,
     )
 
     report = context_budget_report.ContextBudgetReport(consumer="run_refinement_preflight.py")
@@ -110,6 +114,42 @@ def test_record_from_evidence_index_uses_only_observed_counters():
     assert payload["snapshot_reuse_count"] == 1
     assert payload["duplicate_projection_count"] == 1
     assert payload["emitted_utf8_bytes"] > 0
+
+
+def test_record_from_evidence_index_across_phase_transition_does_not_double_count():
+    """Issue #2052 fix_delta D regression: recording phase A's metrics,
+    then transitioning to phase B and recording ITS metrics, must never
+    have phase B's recorded counters "carry over" phase A's activity --
+    `EvidenceIndex.begin_phase()` resets its own counters to phase-local
+    values on a genuine transition, so `totals()` across both recorded
+    phases reflects exactly the real total work done (not a doubled
+    count for phase A's contribution)."""
+    index = evidence_index.EvidenceIndex()
+    report = context_budget_report.ContextBudgetReport(consumer="run_refinement_preflight.py")
+
+    index.begin_phase("phase_a")
+    index.get_or_fetch(
+        repository="squne121/loop-protocol",
+        resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=1,
+        fetch_fn=lambda: ({"body": "a"}, ""),
+    )
+    report.record_from_evidence_index("phase_a", index)
+
+    index.begin_phase("phase_b")
+    index.get_or_fetch(
+        repository="squne121/loop-protocol",
+        resource_kind=evidence_index.RESOURCE_KIND_ISSUE_BODY,
+        resource_id=2,
+        fetch_fn=lambda: ({"body": "b"}, ""),
+    )
+    report.record_from_evidence_index("phase_b", index)
+
+    payload = report.to_dict()
+    assert payload["phases"]["phase_a"]["fetch_count"] == 1
+    assert payload["phases"]["phase_b"]["fetch_count"] == 1
+    # Exactly 2 real fetches happened in total -- never 3 (1 + (1+1)).
+    assert payload["totals"]["fetch_count"] == 2
 
 
 def test_write_json_and_from_dict_roundtrip(tmp_path):

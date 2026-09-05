@@ -3085,3 +3085,29 @@ retry・GitHub mutation・review/CI/current-head 確認・入力集合を完全�
 束縛できない command は、この cache の suppression 対象に一切ならない
 （未対応の `resource_kind` を渡すと `EvidenceIndexError` で fail-closed
 する）。
+
+以下は fix_delta（PR #2502 OWNER REQUEST_CHANGES 反映）で確定した実装上の
+不変条件であり、今後の変更でも維持すること:
+
+- `force_refresh=True` は対象 entry を即座に invalidate してから fresh
+  fetch を行う。fresh fetch が失敗しても古い成功 entry を残さない（stale
+  reuse を防ぐ）。
+- `get_or_fetch()` の返却値（`raw_snapshot`/`projection`）とキャッシュ内部
+  保持値は常に独立したコピーであり、呼び出し元がどちらか一方を変更しても
+  もう一方（や `evidence_key.observed_content_sha256` との対応）が破壊さ
+  れない。
+- `_entry_is_compatible()` は構造不正・identity 不一致な entry に対して
+  例外を発さず `False`（通常 fetch へのフォールバック）を返す。
+- `fetch_count` / `emitted_utf8_bytes` / `snapshot_reuse_count` /
+  `duplicate_projection_count` は phase-local カウンタであり、
+  `begin_phase()` が異なる phase 名への遷移時にゼロへリセットする（同一
+  phase への再入では維持する）。`context_budget_report.py` 側の
+  `totals()` はこの前提の上でのみ二重計上しない。
+- `run_refinement_preflight.py` の live-mode 経路では、
+  `_validate_anchor_comments_batch()`（`_validate_anchor_comment_url()`
+  経由）と `run_preflight()` 自身の post-batch-validation 再解決が、共有
+  helper `_resolve_anchor_comment_payload()` を経由して同一
+  `evidence_index` を参照する。これは「新設 evidence_index が実際に production
+  の重複 consumer 操作を削減している」ことを保証するために必須の配線であり
+  （PR #2502 fix_delta A）、単に fallback 分岐にのみ接続するリグレッションを
+  再発させないこと。
