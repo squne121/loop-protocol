@@ -232,6 +232,36 @@ try:
 except ImportError:  # pragma: no cover - defensive fallback
     _main_drift_classifier_probe = None
 
+# Issue #2052: opt-in, phase-scoped SHA-bound evidence reuse for this file's
+# own Issue/comment fetch path (`_fetch_issue`/`_fetch_issue_comments`/
+# `_fetch_single_comment`) plus the observed-only per-phase metrics report
+# that measures it. Both live in `scripts/agent-ops/` (shared, not skill-
+# private) -- imported best-effort so a harness that only provisions this
+# skill's own `scripts/` directory keeps its pre-existing behavior
+# (`evidence_cache_enabled=True` degrades to a no-op fresh-read passthrough
+# when this import fails, never to a hard failure).
+_AGENT_OPS_SCRIPTS_DIR = Path(__file__).resolve().parents[4] / "scripts" / "agent-ops"
+if str(_AGENT_OPS_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_SCRIPTS_DIR))
+try:
+    from evidence_index import EvidenceIndex as _EvidenceIndex
+    from evidence_index import RESOURCE_KIND_COMMENT as _EVIDENCE_RESOURCE_KIND_COMMENT
+    from evidence_index import RESOURCE_KIND_ISSUE_BODY as _EVIDENCE_RESOURCE_KIND_ISSUE_BODY
+    from context_budget_report import ContextBudgetReport as _ContextBudgetReport
+except ImportError:  # pragma: no cover - defensive fallback
+    _EvidenceIndex = None
+    _EVIDENCE_RESOURCE_KIND_COMMENT = "comment"
+    _EVIDENCE_RESOURCE_KIND_ISSUE_BODY = "issue_body"
+    _ContextBudgetReport = None
+
+# The single phase name used for the live-mode initial Issue/comment fetch
+# section of `run_preflight()` below (Issue #2052 AC1/AC2: reuse is bounded
+# to this one declared phase of a single process invocation; any other
+# phase -- e.g. a post-mutation precondition/readback fetch inside
+# `run_repair_action_apply`/`run_structural_repair_action_apply` -- never
+# participates in this cache and always reads fresh).
+EVIDENCE_CACHE_PHASE_PREFLIGHT_FETCH = "preflight_fetch"
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -4619,6 +4649,7 @@ def _validate_anchor_comment_url(
     issue_number: int,
     fixture_comments: Optional[list[dict]] = None,
     transport: "object | None" = None,
+    evidence_index: "object | None" = None,
 ) -> tuple[bool, list[str]]:
     """
     Validate a single anchor comment URL structurally.
@@ -4680,7 +4711,24 @@ def _validate_anchor_comment_url(
         # semantic_missing (true 404) is reported as
         # BLOCKER_ANCHOR_COMMENT_NOT_FOUND; a transport_failure must never
         # be misreported as "comment not found" (AC2/AC3).
-        comment_data, err = _fetch_single_comment(repo, comment_id, transport=transport)
+        #
+        # Issue #2052 AC1: when `evidence_index` is threaded in (opt-in,
+        # `run_preflight(evidence_cache_enabled=True)`), this fetch is
+        # routed through the SAME phase-scoped cache the main-flow
+        # re-lookup in `run_preflight()` also uses for this exact
+        # `comment_id` -- if this validation call already fetched it, that
+        # second lookup reuses the result instead of issuing a second
+        # identical GET.
+        if evidence_index is not None:
+            _outcome = evidence_index.get_or_fetch(
+                repository=repo,
+                resource_kind=_EVIDENCE_RESOURCE_KIND_COMMENT,
+                resource_id=comment_id,
+                fetch_fn=lambda: _fetch_single_comment(repo, comment_id, transport=transport),
+            )
+            comment_data, err = _outcome.raw_snapshot, (_outcome.err or "")
+        else:
+            comment_data, err = _fetch_single_comment(repo, comment_id, transport=transport)
         if comment_data is None:
             if _is_transport_failure(err):
                 reason_code = (
@@ -4729,6 +4777,7 @@ def _validate_anchor_comments_batch(
     issue_number: int,
     fixture_comments: Optional[list[dict]] = None,
     transport: "object | None" = None,
+    evidence_index: "object | None" = None,
 ) -> tuple[list[str], list[str]]:
     """
     Validate all anchor comment URLs. Returns (stable_sorted_unique_valid_urls, all_blockers).
@@ -4755,7 +4804,8 @@ def _validate_anchor_comments_batch(
 
     for url in sorted_urls:
         valid, blockers = _validate_anchor_comment_url(
-            url, repo, issue_number, fixture_comments=fixture_comments, transport=transport
+            url, repo, issue_number, fixture_comments=fixture_comments, transport=transport,
+            evidence_index=evidence_index,
         )
         if not valid:
             all_blockers.extend(blockers)
@@ -7348,6 +7398,8 @@ def run_preflight(
     contract_update_callbacks: Optional[dict[str, Any]] = None,
     investigation_evidence_transport_path: "Optional[Path]" = None,
     enable_main_drift_live_readback: bool = False,
+    evidence_cache_enabled: bool = False,
+    evidence_index: "object | None" = None,
 ) -> tuple[dict, int]:
     """
     Main preflight logic.
@@ -7357,6 +7409,31 @@ def run_preflight(
 
     Artifact write guarantee: stdout and disk are written from the same final
     result dict (no post-write mutation). This ensures AC6 failure-path consistency.
+
+    `evidence_cache_enabled` (Issue #2052, default False -- opt-in, zero
+    behavior change for every pre-existing caller/test): when True, the
+    live-mode Issue/comment fetch section below routes through a single
+    `EvidenceIndex` scoped to the `EVIDENCE_CACHE_PHASE_PREFLIGHT_FETCH`
+    phase of THIS invocation only. This never changes `issue`/`comments`
+    content, `next_action`, `blockers`, or any other decision field --
+    enabling/disabling it is required (AC6) to be semantically
+    equivalent, differing only in the observed `fetch_count` /
+    `emitted_utf8_bytes` metrics written to a NEW, purely-additive
+    `context_budget_report.json` artifact (never one of the three
+    existing fixed-schema artifacts). A missing `evidence_index`/
+    `context_budget_report` import (e.g. a harness that only provisions
+    this skill's own `scripts/` directory) degrades this to a no-op --
+    every fetch stays fresh, exactly like `evidence_cache_enabled=False`.
+
+    `evidence_index` (Issue #2052, default None): an already-constructed
+    `EvidenceIndex` the caller wants THIS invocation to share (e.g. an
+    integration test that also calls `_validate_anchor_comments_batch()`
+    directly, afterward, with the same instance, to observe reuse across
+    both call sites within one conceptual phase). Only consulted when
+    `evidence_cache_enabled=True` -- passing an instance without also
+    setting that flag has no effect (the flag is the single opt-in gate;
+    fixture mode never uses a passed-in instance either, since fixture mode
+    never performs a live read at all).
     """
     repo_root = _find_repo_root()
     blockers: list[str] = []
@@ -7383,9 +7460,15 @@ def run_preflight(
     # fixture mode never performs a live read at all) and is set to the
     # single, explicitly-selected read authority in live mode below.
     transport: "object | None" = None
+    # Issue #2052: `evidence_index` (the function parameter, default None)
+    # is forced back to `None` in fixture mode below (fixture mode never
+    # performs a live read, so there is nothing to cache -- a caller-passed
+    # instance must never leak in there) and is only actually consulted in
+    # live mode, and only when `evidence_cache_enabled=True`.
 
     # --- Load data (fixture or live gh) ---
     if fixture_path is not None:
+        evidence_index = None
         # Fixture mode: load pre-fetched snapshot
         try:
             fixture_raw = fixture_path.read_text(encoding="utf-8")
@@ -7456,6 +7539,25 @@ def run_preflight(
         transport = _select_read_transport()
         transport_source = getattr(transport, "SOURCE_LABEL", "internal")
 
+        # Issue #2052 (opt-in, default off): a single EvidenceIndex scoped
+        # to EVIDENCE_CACHE_PHASE_PREFLIGHT_FETCH for this invocation only.
+        # `evidence_index` (the function parameter) is forced back to None
+        # -- a pure passthrough below -- unless the caller explicitly
+        # requested the cache AND the shared module imported successfully;
+        # the flag is the single opt-in gate, so a caller-passed instance
+        # without `evidence_cache_enabled=True` is never consulted. When an
+        # instance IS passed in, it is reused as-is (letting a caller, e.g.
+        # an integration test, observe reuse across this call and a
+        # subsequent direct call to `_validate_anchor_comments_batch()`
+        # sharing the same instance) rather than always constructing a
+        # fresh one.
+        if evidence_cache_enabled and _EvidenceIndex is not None:
+            if evidence_index is None:
+                evidence_index = _EvidenceIndex()
+            evidence_index.begin_phase(EVIDENCE_CACHE_PHASE_PREFLIGHT_FETCH)
+        else:
+            evidence_index = None
+
         # NOTE: `_fetch_issue`/`_fetch_issue_comments` are called WITHOUT an
         # explicit `transport=` keyword here (unlike `_fetch_single_comment`
         # below) so that pre-existing unit tests which monkeypatch these two
@@ -7466,7 +7568,16 @@ def run_preflight(
         # which is memoized (see `_read_transport_cache`) and therefore
         # returns the EXACT SAME `transport` instance already selected on
         # the line above.
-        issue, err = _fetch_issue(repo, issue_number)
+        if evidence_index is not None:
+            _issue_outcome = evidence_index.get_or_fetch(
+                repository=repo,
+                resource_kind=_EVIDENCE_RESOURCE_KIND_ISSUE_BODY,
+                resource_id=issue_number,
+                fetch_fn=lambda: _fetch_issue(repo, issue_number),
+            )
+            issue, err = _issue_outcome.raw_snapshot, (_issue_outcome.err or "")
+        else:
+            issue, err = _fetch_issue(repo, issue_number)
         if issue is None:
             blockers.append(BLOCKER_GH_FAILURE)
             reason_code = _project_environment_failure_reason(err)
@@ -7535,6 +7646,7 @@ def run_preflight(
             issue_number,
             fixture_comments=fixture_comment_lookup,
             transport=transport,
+            evidence_index=evidence_index,
         )
         if anchor_blockers:
             blockers.extend(anchor_blockers)
@@ -7600,7 +7712,22 @@ def run_preflight(
                 # semantic_missing here (the comment vanished between the
                 # batch validation above and this re-fetch) still gets a
                 # distinguishing blocker, not just a generic GH_API_FAILURE.
-                comment_payload, err = _fetch_single_comment(repo, comment_id, transport=transport)
+                #
+                # Issue #2052 AC1: routed through the SAME phase-scoped
+                # `evidence_index` (opt-in) as `_validate_anchor_comment_url`
+                # above -- if that validation call already fetched this
+                # exact `comment_id` this invocation, this reuses it instead
+                # of issuing a second identical GET.
+                if evidence_index is not None:
+                    _comment_outcome = evidence_index.get_or_fetch(
+                        repository=repo,
+                        resource_kind=_EVIDENCE_RESOURCE_KIND_COMMENT,
+                        resource_id=comment_id,
+                        fetch_fn=lambda: _fetch_single_comment(repo, comment_id, transport=transport),
+                    )
+                    comment_payload, err = _comment_outcome.raw_snapshot, (_comment_outcome.err or "")
+                else:
+                    comment_payload, err = _fetch_single_comment(repo, comment_id, transport=transport)
                 if comment_payload is None:
                     blockers.append(BLOCKER_GH_FAILURE)
                     if not _is_transport_failure(err):
@@ -8721,6 +8848,18 @@ def run_preflight(
     )
     try:
         _write_artifacts(repo_root, issue_number, raw_snapshot, planner_input_dict, result)
+        # Issue #2052 AC7: a purely-additive, best-effort side artifact --
+        # never one of the three fixed-schema artifacts above, and never
+        # allowed to turn a successful preflight run into a failure. Only
+        # written when the caller opted into the evidence cache AND the
+        # shared context_budget_report module imported successfully.
+        if evidence_index is not None and _ContextBudgetReport is not None:
+            try:
+                _report = _ContextBudgetReport(consumer="run_refinement_preflight.py")
+                _report.record_from_evidence_index(EVIDENCE_CACHE_PHASE_PREFLIGHT_FETCH, evidence_index)
+                _report.write_json(_issue_artifact_dir(repo_root, issue_number) / "context_budget_report.json")
+            except Exception:  # pragma: no cover - defensive, never fails the run
+                pass
 
     except Exception as exc:
         result = _build_result(
@@ -9364,6 +9503,20 @@ def main(argv: list[str] | None = None) -> None:
         help="Execute a trusted CONTRACT_PATCH_PLAN_V1 through edit_issue_txn.py.",
     )
     parser.add_argument(
+        "--evidence-cache",
+        dest="evidence_cache_enabled",
+        action="store_true",
+        default=False,
+        help="Issue #2052: opt in to phase-scoped SHA-bound reuse of this invocation's "
+        "own Issue/comment fetch results (never a generic command cache; never persisted "
+        "across process invocations). Default off -- every pre-existing caller's behavior "
+        "is unchanged. When on, a purely-additive context_budget_report.json artifact "
+        "(observed fetch_count/emitted_utf8_bytes/snapshot_reuse_count/"
+        "duplicate_projection_count only, never a fabricated token/model-turn figure) is "
+        "written alongside the existing raw_issue_snapshot.json / planner_input.json / "
+        "refinement_preflight_result_v1.json artifacts.",
+    )
+    parser.add_argument(
         "--disable-main-drift-live-readback",
         dest="enable_main_drift_live_readback",
         action="store_false",
@@ -9659,6 +9812,7 @@ def main(argv: list[str] | None = None) -> None:
         consume_contract_patch_plan=args.consume_contract_patch_plan,
         investigation_evidence_transport_path=args.investigation_evidence_transport_path,
         enable_main_drift_live_readback=args.enable_main_drift_live_readback,
+        evidence_cache_enabled=args.evidence_cache_enabled,
     )
     sys.exit(exit_code)
 
