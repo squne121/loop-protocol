@@ -463,6 +463,212 @@ def test_judge_phase_skip_on_capability_skip_classification():
 
 
 # ---------------------------------------------------------------------------
+# Issue #2050: judge_phase_with_bounded_retry() -- resume-phase-only bounded
+# retry so a single transient wait-timeout observation does not immediately
+# freeze the phase verdict at "fail". judge_phase() itself (used directly by
+# the initial/fresh phases) is unchanged; these tests exercise the NEW
+# wrapper in isolation via a pure observation-producing callable, with no
+# real Claude Code launch required.
+# ---------------------------------------------------------------------------
+
+
+def test_bounded_retry_recovers_from_transient_timeout():
+    """AC1: the first observation being timed_out does not immediately
+    return fail -- a bounded retry (default max_retries=1) is attempted."""
+    module = _load_canary_module()
+    observations = iter(
+        [
+            (0, True, "", ""),
+            (0, False, _TERMINAL_SUCCESS_STDOUT, ""),
+        ]
+    )
+    verdict, reason, attempts = module.judge_phase_with_bounded_retry(lambda: next(observations))
+    assert verdict == "ok"
+    assert len(attempts) == 2
+    assert attempts[0]["timed_out"] is True
+    assert attempts[0]["verdict"] == "fail"
+    assert attempts[1]["timed_out"] is False
+    assert attempts[1]["verdict"] == "ok"
+
+
+def test_bounded_retry_final_verdict_reflects_successful_retry_not_stale_timeout():
+    """AC2: once the bounded retry observation succeeds, the FINAL
+    (verdict, reason) returned by judge_phase_with_bounded_retry() reflects
+    that success -- the stale first timeout's own (verdict, reason) must
+    never leak into the returned final result."""
+    module = _load_canary_module()
+    observations = iter(
+        [
+            (0, True, "", ""),
+            (0, False, _TERMINAL_SUCCESS_STDOUT, ""),
+        ]
+    )
+    verdict, reason, attempts = module.judge_phase_with_bounded_retry(lambda: next(observations))
+    assert verdict == "ok"
+    assert reason is None
+    stale_reason = attempts[0]["reason"]
+    assert stale_reason is not None and "timed out" in stale_reason
+    # The final (verdict, reason) must not be the stale timed-out attempt's.
+    assert (verdict, reason) != (attempts[0]["verdict"], attempts[0]["reason"])
+
+
+def test_bounded_retry_exhausted_still_times_out_is_fail():
+    """AC3: if the bounded retry is ALSO timed_out, the final verdict is
+    fail -- and observe_fn is called no more than max_retries + 1 times
+    (bounded, never unlimited)."""
+    module = _load_canary_module()
+    calls = {"n": 0}
+
+    def observe() -> tuple[int, bool, str, str]:
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise AssertionError("observe_fn must not be called more than max_retries + 1 times")
+        return (0, True, "", "")
+
+    verdict, reason, attempts = module.judge_phase_with_bounded_retry(observe)
+    assert verdict == "fail"
+    assert reason is not None
+    assert calls["n"] == 2
+    assert len(attempts) == 2
+    assert all(a["timed_out"] for a in attempts)
+
+
+def test_bounded_retry_single_observation_matches_bare_judge_phase_for_non_timeout():
+    """A non-timed-out first observation is judged exactly like a bare
+    judge_phase() call -- no retry is attempted (only one observe_fn call)."""
+    module = _load_canary_module()
+    calls = {"n": 0}
+
+    def observe() -> tuple[int, bool, str, str]:
+        calls["n"] += 1
+        return (0, False, _TERMINAL_SUCCESS_STDOUT, "")
+
+    verdict, reason, attempts = module.judge_phase_with_bounded_retry(observe)
+    bare_verdict, bare_reason = module.judge_phase(0, False, _TERMINAL_SUCCESS_STDOUT, "")
+    assert (verdict, reason) == (bare_verdict, bare_reason)
+    assert calls["n"] == 1
+    assert len(attempts) == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #2050: regression coverage that a plain `rg "def judge_phase"`
+# substring check is insufficient to prove the real resume call site inside
+# main() is actually wired to judge_phase_with_bounded_retry() (it would
+# also match `def judge_phase_with_bounded_retry`). This test runs the ACTUAL
+# production main() end-to-end with only I/O-boundary primitives (subprocess
+# launch, worktree identity, output-dir preparation, signal handlers)
+# monkeypatched -- proving via call-site spying that judge_phase_with_bounded_
+# retry is invoked for the resume phase and NOT for the initial/fresh phases,
+# which keep calling judge_phase() directly.
+# ---------------------------------------------------------------------------
+
+
+def test_resume_call_site_uses_bounded_retry_wrapper_not_initial_or_fresh(monkeypatch, tmp_path):
+    module = _load_canary_module()
+
+    original_judge_phase = module.judge_phase
+    judge_phase_calls: list[tuple] = []
+
+    def spy_judge_phase(exit_code, timed_out, stdout, stderr):
+        judge_phase_calls.append((exit_code, timed_out, stdout, stderr))
+        return original_judge_phase(exit_code, timed_out, stdout, stderr)
+
+    original_bounded_retry = module.judge_phase_with_bounded_retry
+    bounded_retry_calls: list = []
+
+    def spy_bounded_retry(observe_fn, **kwargs):
+        bounded_retry_calls.append(observe_fn)
+        return original_bounded_retry(observe_fn, **kwargs)
+
+    monkeypatch.setattr(module, "judge_phase", spy_judge_phase)
+    monkeypatch.setattr(module, "judge_phase_with_bounded_retry", spy_bounded_retry)
+
+    # I/O-boundary mocks -- subprocess launch / worktree identity / output-dir
+    # preparation / classification are not this test's concern, only the
+    # CALL-SITE WIRING of judge_phase vs. judge_phase_with_bounded_retry is.
+    monkeypatch.setattr(module, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(module, "_default_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(module, "verify_worktree_identity", lambda worktree_arg, repo_root: worktree_arg)
+    monkeypatch.setattr(module, "prepare_output_dir", lambda output_dir: None)
+    monkeypatch.setattr(module, "preflight_claude_available", lambda claude_bin: ("fake-claude-bin", None))
+    monkeypatch.setattr(module, "extract_claude_resolved_executable_sha256", lambda resolved_bin: "fakehash")
+    monkeypatch.setattr(
+        module,
+        "classify_claude_structured_outcome",
+        lambda exit_code, stdout, stderr, timed_out: ("ok", None),
+    )
+    monkeypatch.setattr(
+        module,
+        "is_terminal_success",
+        lambda stdout: (True, None) if "TERMINAL_OK" in stdout else (False, "not terminal"),
+    )
+    monkeypatch.setattr(module, "marker_recalled", lambda stdout, marker: True)
+
+    def fake_extract_parent_session_id(stdout: str) -> str | None:
+        if "SESSION_A" in stdout:
+            return "session-a"
+        if "SESSION_C" in stdout:
+            return "session-c"
+        return None
+
+    monkeypatch.setattr(module, "extract_claude_parent_session_id", fake_extract_parent_session_id)
+
+    resume_attempts = {"n": 0}
+
+    def fake_run(argv, *, cwd=None, timeout=None, input_text=None, env=None):
+        # _run()'s real return order is (returncode, stdout, stderr, timed_out).
+        if "--resume" in argv:
+            resume_attempts["n"] += 1
+            if resume_attempts["n"] == 1:
+                # Transient wait-timeout observation on the FIRST resume attempt.
+                return 0, "", "", True
+            return 0, "SESSION_A TERMINAL_OK", "", False
+        if "--tools" in argv:
+            return 0, "SESSION_A TERMINAL_OK", "", False
+        return 0, "SESSION_C TERMINAL_OK", "", False
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    output_dir = tmp_path / "evidence"
+    exit_code = module.main(
+        [
+            "--worktree", str(tmp_path),
+            "--claude-adapter", "native",
+            "--output-dir", str(output_dir),
+            "--timeout-seconds", "5",
+        ]
+    )
+
+    evidence_path = output_dir / "evidence.json"
+    assert exit_code == 0, evidence_path.read_text() if evidence_path.is_file() else "no evidence written"
+
+    # judge_phase_with_bounded_retry is invoked EXACTLY ONCE (resume phase only).
+    assert len(bounded_retry_calls) == 1
+
+    # judge_phase() itself is invoked 4 times total: once directly for the
+    # initial phase, once directly for the fresh phase, and twice more
+    # (internally, via the wrapper) for the resume phase's two observations
+    # (AC4: judge_phase() semantics/call sites for initial/fresh unchanged).
+    assert len(judge_phase_calls) == 4
+    timed_out_flags = [call[1] for call in judge_phase_calls]
+    assert timed_out_flags.count(True) == 1
+    assert timed_out_flags.count(False) == 3
+    stdouts = [call[2] for call in judge_phase_calls]
+    assert any("SESSION_A" in s for s in stdouts)
+    assert any("SESSION_C" in s for s in stdouts)
+
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["verdict"] == "PASS"
+    # Bounded-retry evidence: the stale first (timed-out) resume attempt is
+    # preserved as evidence, but the authoritative same_continuation_launch
+    # record reflects the successful retry, not the stale timeout.
+    assert evidence["same_continuation_launch"]["timed_out"] is False
+    stale_attempts = evidence["same_continuation_launch"]["bounded_retry_stale_attempts"]
+    assert len(stale_attempts) == 1
+    assert stale_attempts[0]["timed_out"] is True
+
+
+# ---------------------------------------------------------------------------
 # Issue #2153 OWNER review P1 fix-delta: classify_launcher_receipt() SKIP
 # allowlist (exit 3/4/7 only) vs. everything-else FAIL (caller/launcher
 # integration bugs must never be silently absorbed into SKIP).
