@@ -34,8 +34,9 @@ superseded_by: null
 | 境界 | 保証状況 | 根拠 |
 | --- | --- | --- |
 | 別 run・別 attempt の CheckRun へのすり替え | **防止済み** | `scripts/agent-ops/resolve_visual_impact.py` の `verify_component_vrt_checkrun_provenance()`（PR #2229）が `expected_workflow_run_id` / `expected_run_attempt` の exact match を fail-closed で強制する |
-| artifact 取得の run/attempt 整合性 | **防止済み** | `visual-impact-trusted-consumer.yml` が attempt-specific artifact 名（`visual-impact-decision-v1-${RUN_ATTEMPT}` 等）で取得し、`resolve_visual_impact.py --mode acquire-trusted-artifact` が `--expected-artifact-head-sha` を照合する |
-| V3 manifest の identity 整合性 | **防止済み** | `docs/dev/visual-impact.schema.json` の `VISUAL_IMPACT_DECISION_V1` は `workflow_run_id` / `run_attempt` を required とし（Issue #2230 AC2）、producer 自身の `${{ github.run_id }}` / `${{ github.run_attempt }}` を content に束縛する。rerun 間の stale artifact 誤選択を防止（PR #2379/#2388） |
+| artifact 取得時の run/attempt 選択 | **防止済み** | `visual-impact-trusted-consumer.yml` が attempt-specific artifact 名（`visual-impact-decision-v1-${RUN_ATTEMPT}` 等）で取得し、`resolve_visual_impact.py --mode acquire-trusted-artifact` が `--expected-artifact-head-sha` を照合する |
+| `VISUAL_IMPACT_DECISION_V1` の workflow_run_id/run_attempt identity | **防止済み** | `docs/dev/visual-impact.schema.json` の `VISUAL_IMPACT_DECISION_V1` は `workflow_run_id` / `run_attempt` を required とし（Issue #2230 AC2）、producer 自身の `${{ github.run_id }}` / `${{ github.run_attempt }}` を content に束縛する。rerun 間の stale artifact 誤選択を防止（PR #2379/#2388） |
+| `VISUAL_BASELINE_REVIEW_EVIDENCE_V3` の envelope/record/digest整合性 | **防止済み** | component VRT の evidence manifest（`VISUAL_IMPACT_DECISION_V1` とは別資産）について、`scripts/agent-ops/resolve_visual_impact.py` の `validate_evidence_manifest_v3_envelope()` / `verify_evidence_manifest_v3_record_digest()` が envelope・record・head SHA・run_attempt・digest整合性を検証する（`scripts/agent-ops/tests/test_visual_impact_v3_manifest_seams.py` で固定） |
 | **同一 run 内の producer 自体の偽装（same-run producer authenticity）** | **未保証** | `resolve_visual_impact.py` 内コメント（`verify_component_vrt_checkrun_provenance()` docstring）が明示: 「This deliberately verifies only cross-run/attempt substitution; a candidate-controlled producer inside the same run remains #2101's attestation boundary.」 |
 
 補足: `visual-impact-policy` job（`ci.yml` 内、`needs: [component-vrt-report]`）は `pull_request` トリガーの workflow の一部であり、job定義自体は PR head 由来である。既に「trusted evaluator の base_sha からの materialize」（`git show "${BASE_SHA}:scripts/agent-ops/resolve_visual_impact.py"` 等、Issue #2019 P0-6）により評価ロジック自体の改変余地は縮小済みだが、job のステップ列自体（CheckRun API呼び出し・成功/失敗判定の呼び出し順）は PR head の `ci.yml` が定義する。trusted consumer（`workflow_run` トリガー、base branch の workflow 定義を使用）は独立再導出（`git show`/`git diff` によるstatic data read のみ、candidate PR headのコードは一切checkout・実行しない）でこの job定義自体を信頼せず、base_sha/PR body/changed-paths/registryのハッシュ照合とCheckRun exact-ID/run-attempt照合のみを行う。これが未保証範囲の技術的な形状である。
@@ -44,7 +45,7 @@ superseded_by: null
 
 `.github/workflows/visual-impact-consumer.yml` および `.github/workflows/visual-impact-policy.yml` は過去(`3559ad21`)・現在(`8d405a44`)いずれのcommitにも存在しない（過去のIssue本文の誤記であり、OWNER指摘・fact-check済み）。
 
-`visual-impact-policy` は現時点で GitHub 側の branch protection / ruleset のいずれにも required check として登録されていない（`docs/ops/branch-protection.md` の drift記録）。一方、このリポジトリ自身のCI判定器（`.claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py` の `CLASSIFICATION_MAP`）は `("ci", "visual-impact-policy"): "required"` として分類しており、`classification == "unknown"` は `determine_check_verdict()` が常に blocking（`gh_error`）として扱う。したがって GitHub側のrequired登録有無に関わらず、このリポジトリのPRレビュー経路では実質的にgatingされている。
+`visual-impact-policy` は、`docs/ops/branch-protection.md` の2026-08-08時点のlive確認記録によれば、GitHub 側の branch protection / ruleset のいずれにも required check として登録されていない（本ADR修正時点でlive branch protection APIを再確認できていないため、確認日付きの記録として扱う）。一方、このリポジトリ自身のCI判定器（`.claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py` の `CLASSIFICATION_MAP`）は `("ci", "visual-impact-policy"): "required"` として分類しており、`classification == "unknown"` は `determine_check_verdict()` が常に blocking（`gh_error`）として扱う。したがって GitHub側のrequired登録有無に関わらず、このリポジトリのPRレビュー経路では実質的にgatingされている。
 
 ## Considered Options（検討した選択肢）
 
@@ -62,22 +63,22 @@ GitHub公式ドキュメントの確認結果（web-researcher調査）: full-SH
 
 `visual-impact-policy` producerを独立したfull-SHA pinned reusable workflowとして切り出し、GitHub artifact attestation（`actions/attest`）でevidence manifestに署名し、`visual-impact-policy-trusted`側で `gh attestation verify --signer-workflow --signer-digest` によりsigner identityを検証する。
 
-GitHub公式ドキュメントの確認結果: attestationのpredicateはworkflow参照・commit SHA・triggering eventへのリンクを提供するが、attestation自体は「証拠生成処理（VRT比較ロジック）が正しく実行されたこと」までは保証しない（"Generating attestations alone doesn't provide any security benefit; the attestations must be verified"、predicateの内容自体はworkflow実行結果の自己申告でありcryptographicに保護されるのはcertificateとtimestampのみ）。reusable workflowでattestationを生成するにはcaller・callee双方に`attestations: write`, `id-token: write`, `contents: read`権限が必要（caller側、すなわちPR head由来のpull_requestトリガーworkflowにこれらの書き込み権限を付与することはpermission-scope上のリスク増加を伴う）。
+GitHub公式ドキュメントの確認結果: attestationの署名対象は、subject digestとpredicateをまとめてJSON化したin-totoステートメント全体である（`actions/attest`の実装はcertificateやtimestampのみに署名するのではなく、statementペイロード全体に署名する）。したがって、署名済みステートメントの整合性（署名後の改ざん有無）とsigner identity（どのworkflow・commitが署名したか）は暗号学的に検証可能である。一方で、workflowが署名前に虚偽のpredicate（「所定のVRT比較を実行しSUCCESSだった」等の申告内容）を作成すること自体は、署名の仕組みでは防げない（"Generating attestations alone doesn't provide any security benefit; the attestations must be verified"）。固定producer + attestationを採用すれば、「未承認のproducerが固定producerを呼ばずに自前生成したartifactで成功を偽装する」経路を拒否する追加保証は得られる。ただし、この追加保証がVRT処理の意味的な正しさ（所定の比較処理が実際に正しく実行されたか）まで届くかどうかは、VRTの実行・比較・evidence生成のどこまでを固定producer自身の責務とする設計にするか（呼び出し元の結果を無条件に署名するのか、固定producer内部で独立に検証してから署名するのか）に依存し、この設計選択自体はOption 3採否の決定とは独立の未確定事項である。reusable workflowでattestationを生成するにはcaller・callee双方に`attestations: write`, `id-token: write`, `contents: read`権限が必要（caller側、すなわちPR head由来のpull_requestトリガーworkflowにこれらの書き込み権限を付与することはpermission-scope上のリスク増加を伴う）。
 
 ## Decision
 Decision: DEFER
 ## Rationale
-- 個人趣味開発プロジェクトであり、`same-run producer authenticity` の脅威モデルは「リポジトリへのPR作成権限を持つ攻撃者が、自分のPR内でVRT評価ロジックの実行結果を偽装する」という限定的なものである。現状、最終マージ判断は常に人間（OWNER）が行っており、`visual-impact-policy` はGitHub側のbranch protection/rulesetでもまだrequired checkとして登録されていない（`docs/ops/branch-protection.md` 記載のdrift）。したがって、同一run内producer偽装が成立した場合の実害は「人間レビューを経ずに直接mergeされる」ことではなく、「1つのCI signalが誤った成功を報告する」ことに留まる。
-- Option 3（固定producer + attestation）は、web-researcher調査が示す通り、攻撃者が実際に偽装できるのは「pinned producerが読み込む評価対象データ（VRT差分そのもの）」であり、workflow定義のSHA固定・attestation署名はこの経路を閉じない。GitHub公式も「attestation自体はビルド処理の正当性を保証しない」ことを明記しており、Option 3を採用しても親 #2093 が求める「偽装producerでもSUCCESSにできない」という性質を完全には満たせない。同時に、caller側（PR headから発火するworkflow）へ`attestations: write`/`id-token: write`を付与する必要があり、これは信頼境界を広げる方向のtrade-offである。
+- 個人趣味開発プロジェクトであり、`same-run producer authenticity` の脅威モデルは「リポジトリへのPR作成権限を持つ攻撃者が、自分のPR内でVRT評価ロジックの実行結果を偽装する」という限定的なものである。`visual-impact-policy` はGitHub側のbranch protection/rulesetでは2026-08-08時点の記録ではまだrequired checkとして登録されていない（`docs/ops/branch-protection.md`、確認日付きのdrift記録。本ADR修正時点でlive branch protection APIを再確認できていないため、現時点で確実に未登録とは断定しない）。一方、このリポジトリ自身のCI判定器（`.claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py` の `REQUIRED_CHECKS` および `CLASSIFICATION_MAP`）は `("ci", "visual-impact-policy")` をrequired扱いしており、少なくともこのリポジトリ内部のmerge-ready/CI判定はこのsignalに依存している。したがって、同一run内producer偽装が成立した場合の実害を「1つのCI signalの誤報告に留まる」と軽視すべきではなく、誤ったCI green（same-run producer改変による偽装成功）が人間のレビュー/マージ判断を誤誘導する可能性は現に受容している、と捉えるのが正確である。
+- Option 3（固定producer + attestation）は、「未承認producerが固定producerを呼ばずに自前生成したartifactで成功を偽装する」経路への追加保証を提供し得る。ただし、その保証がVRT処理の意味的な正しさ（所定の比較が実際に正しく実行されたか）まで届くかは、固定producer自体の設計（呼び出し元の結果を無条件に署名するのか、独立検証してから署名するのか）に依存し、実装して詰めなければ確定しない未決事項である。この設計を詰めてproducerを`ci.yml`から切り出し、caller側に`attestations: write`/`id-token: write`を付与し、reusable workflow化・signer identity検証・互換移行の保守コストを負担することは、脅威モデルが上記の限定的な範囲（same-run producer authenticity）に留まる個人開発規模の現時点では、得られる追加保証に対して費用が見合わない。
 - Option 2（full-SHA pinningのみ）は、workflow定義の改変不可性は得られるが、それ自体はOption 1が既に持つ保証（base-locked evaluator materialization, Issue #2019 P0-6）を大きく超えるものではなく、`ci.yml`からのproducer job切り出しという移行コストに見合う追加保証が小さい。
 - Option 1（現状維持）は、既に実装済みの3層防御（cross-run/attempt CheckRun substitution、artifact run/attempt整合性、V3 manifest identity整合性）を後退させず、same-run producer authenticityの未保証範囲を正確に文書化することで、コスト0で現状の透明性を確保する。
 
 以上の費用対効果（移行コスト・権限拡張・保守負担 vs. 個人趣味開発における実害の限定性）から、現時点ではOption 1を維持し、fixed producer + attestation architectureの採用をDEFERする。
 
 ## Residual Risk
-- **same-run producer spoofingは技術的に防止されていない。** これはrisk acceptanceであり、technical preventionではない。PRを作成できる攻撲者（本プロジェクトでは主にリポジトリ所有者自身、または招待されたcollaborator）が、同一run内で`visual-impact-policy` jobのCheckRun API呼び出しシーケンスを改変し、実際にはVRT比較を実行せずに`conclusion: success`を報告するCheckRunを生成した場合、trusted consumer側の現行検証（exact workflow_run_id/run_attempt binding、V3 manifest identity整合性）はこれを検出できない。
+- **same-run producer execution authenticity（同一run内でのproducer実行の真正性）は技術的に検証されていない。** これはrisk acceptanceであり、technical preventionではない。`verify_component_vrt_checkrun_provenance()` が照合しているのは任意の成功CheckRunではなく、実際の `component-vrt-report` Actions jobと、そのjobに対応するexact CheckRun（run ID・attempt・head SHA・job名・成功結果・App identity・`job.check_run_url`とCheckRun IDの対応）である。しかし、PRを作成できる攻撃者（本プロジェクトでは主にリポジトリ所有者自身、または招待されたcollaborator）が、同一run内で実際の `component-vrt-report` jobの処理内容自体を改変し、所定のVRTを実行せずに当該jobを正常終了させ、Actions自身がそのjobに正規のsuccessful CheckRunを付与し、candidateが整合的なdecision/evidenceを生成した場合、現在のrun/attempt/job/CheckRun照合だけでは「所定の処理自体が実際に実行されたか」までは認証できない。この経路をGitHub上で実際に成立させる攻撃実験は、本ADR作成時点で実施していない（未実施であり、実証済みの脆弱性ではない）。
 - 親 #2093 のOWNERコメントが要求する「偽装producerでもSUCCESSにできない」という強い保証目標は、本Decisionにより**未達のまま残る**。この残存gapは、DEFER期間中は明示的なrisk acceptanceとして扱う。
-- `visual-impact-policy` が現在required checkとしてGitHub側に登録されていないため、現状の実害は限定的（人間の最終レビューが常に介在する）が、将来required check化された場合は本Residual Riskの実効性が変化する（`## Reconsideration Trigger` 参照）。
+- `visual-impact-policy` は2026-08-08時点の記録ではGitHub側required checkとして登録されていないが（`docs/ops/branch-protection.md`、本ADR修正時点で未再確認）、このリポジトリ自身のCI判定器（`ci_verdict_summary_v2.py` の `REQUIRED_CHECKS`/`CLASSIFICATION_MAP`）は既にrequired扱いしており、誤ったCI greenが人間のレビュー/マージ判断を誤誘導する可能性は現時点でも受容している。GitHub側でもrequired check化された場合は、この実効性がさらに強まる（`## Reconsideration Trigger` 参照）。
 
 ## Reconsideration Trigger
 以下のいずれかが発生した場合、本Decisionを再検討する:
@@ -86,6 +87,10 @@ Decision: DEFER
 2. 親 #2093 のOWNERが、same-run producer authenticityをmandatory guaranteeとして明示的に再要求した場合
 3. GitHub Actions attestationの権限モデル・料金体系・信頼境界仕様が変更され、caller側への権限拡張なしに同等の保証が得られるようになった場合
 4. component-vrt-report / visual-impact-policy job の偽装が実際に発生した、または発生しうる具体的なインシデント・攻撃シナリオが確認された場合
+5. 人間の最終マージ判断を省略する、または automated merge-ready signal（CI判定器のgreen判定）への依存を強める運用変更が行われた場合
+6. untrusted contributor や未検証の実行主体（外部フォーク、招待前のcollaborator等）を受け入れる方向に脅威モデルが変化した場合
+7. 所定のVRTを実行せずにgreenになる実例が実際に発見された場合
+8. fixed producer / attestation の導入・保守コストが大幅に低下した場合（例: reusable workflow化やattestation検証がテンプレート化・自動化された等）
 
 ## Trust Boundary
 N/A — Decision が DEFER のため、trust boundary（signer identity / consumed evidence / execution identity / producer responsibility / guarantee boundary）の確定は不要。Option 3 採用時の設計要件は `## Considered Options（検討した選択肢）` の Option 3 に記載した論点を再検討の出発点とする。
