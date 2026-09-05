@@ -206,6 +206,41 @@ hook_boundaries_manifest_v1:
       task blocker にしてはならない（AC2）。
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
 
+  - handler_id: session_manifest_coordinator
+    event: StopFailure
+    matcher: null
+    command: "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_manifest_coordinator.sh"
+    args: []
+    timeout: 55
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: StopFailure
+      exit_2_effect: unknown_pending_upstream_claude_code_docs_confirmation
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: silent
+    stderr_contract: machine_readable_timeout_reason_max_10_lines
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      #2489: StopFailure イベントでも session_manifest_coordinator と同一スクリプトを使用（新規 hook script は追加しない）。
+      pending debounce state を flush してから guard / producer を実行する。
+      producer（generate_session_manifest_from_hook.mjs）は StopFailure イベントでは
+      root の completion_outcome / completion_source をこの hook パスから絶対に設定せず、
+      hook_event.event_type / hook_event.error_type という turn-level evidence のみを記録する（AC2, P0-1）。
+      task blocker にしてはならない（AC2）。
+      hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
+      exit_2_effect は Stop/SubagentStop と異なりまだ upstream Claude Code hooks
+      reference で確認されていないため保守的に unknown と明記する。
+
   - handler_id: session_manifest_debounce
     event: PostToolUse
     matcher: "Bash|Edit|Write"
@@ -376,7 +411,7 @@ HOOK_COMMAND_REPAIR_HINT_V1:
 の2行のみが「project PreToolUse で実行された場合の behavioral contract」を記述するもの
 であり、両スクリプトが実際に project PreToolUse から呼び出されているという主張ではない。
 他の行（`secret_boundary_guard.sh` 等の project PreToolUse 登録済み handler、および
-Stop / SubagentStop / PostToolUse で実際に動作する `session_manifest_coordinator.sh` /
+Stop / StopFailure / SubagentStop / PostToolUse で実際に動作する `session_manifest_coordinator.sh` /
 `session_manifest_debounce.mjs`）は、それぞれが実際に登録されているイベントにおける挙動を記述する。
 
 | hook | 分類 | hook failure 時の agent 動作 |
@@ -387,6 +422,7 @@ Stop / SubagentStop / PostToolUse で実際に動作する `session_manifest_coo
 | `guard-japanese-prose.sh` | mode_dependent | unset/off/shadow(legacy alias) モード: 継続（block なし、persistent log なし）/ invalid モード: 継続（exit 1 non-blocking diagnostic、stderr に invalid_guard_mode）/ enforce モード: **停止** |
 | `ci_test_performance_advisory.sh` | warning / fail_open | 継続（advisory 出力のみ、block なし） |
 | `session_manifest_coordinator.sh`（Stop） | telemetry | 継続 |
+| `session_manifest_coordinator.sh`（StopFailure） | telemetry | 継続 |
 | `session_manifest_coordinator.sh`（SubagentStop） | telemetry | 継続 |
 | `session_manifest_debounce.mjs` | telemetry | 継続 |
 
@@ -455,7 +491,7 @@ Issue #2161 で repository から撤去済みであり、以下の表は native 
 
 AC2 対応: 以下の best-effort telemetry フックは作業 blocker にしない。
 
-- `session_manifest_coordinator.sh`（Stop / SubagentStop）: 停止時コーディネータ
+- `session_manifest_coordinator.sh`（Stop / StopFailure / SubagentStop）: 停止時コーディネータ
 - `session_manifest_debounce.mjs`（PostToolUse front gate）: 事前集約ゲート
 
 これらは全て `fail_policy: fail_open` で設計されており、hook failure 時も exit 0 を返す（AC2）。

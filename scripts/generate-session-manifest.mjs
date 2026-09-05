@@ -124,6 +124,19 @@ OPTIONAL OPTIONS:
   --verification-evidence-ref REF  Evidence reference (repeatable) [optional]
   --human-intervention-required BOOL  Human intervention flag: true|false [optional, default: false]
   --human-intervention-reason TEXT  Reason for human intervention [optional]
+  --runtime-lane LANE            Runtime lane: native_claude_code|claude_gpt|codex_cli|unknown [optional]
+  --completion-outcome OUTCOME   Completion outcome (session/run-level; NEVER passed by the Stop/StopFailure
+                                 hook wrapper -- launcher / reconciliation callers only):
+                                 completed|failed|interrupted|incomplete|unavailable [optional]
+  --completion-source SOURCE     Completion source (session/run-level; NEVER passed by the Stop/StopFailure
+                                 hook wrapper -- launcher / reconciliation callers only):
+                                 hook|launcher|reconciliation|unavailable [optional]
+  --hook-event-type TYPE         Turn-level hook_event.event_type (Claude Code hook event name):
+                                 SubagentStart|SubagentStop|PostToolUse|Stop|PreToolUse|StopFailure [optional]
+  --hook-error-type TYPE         Turn-level hook_event.error_type (StopFailure structured error taxonomy,
+                                 only meaningful alongside --hook-event-type StopFailure):
+                                 rate_limit|overloaded|authentication_failed|billing_error|invalid_request|
+                                 model_not_found|server_error|max_output_tokens|unknown [optional]
   --help                         Show this help message
 
 DETERMINISM NOTES:
@@ -256,6 +269,52 @@ function validatePrNumber(value) {
   }
 }
 
+const RUNTIME_LANE_VALUES = ['native_claude_code', 'claude_gpt', 'codex_cli', 'unknown']
+const COMPLETION_OUTCOME_VALUES = ['completed', 'failed', 'interrupted', 'incomplete', 'unavailable']
+const COMPLETION_SOURCE_VALUES = ['hook', 'launcher', 'reconciliation', 'unavailable']
+const HOOK_EVENT_TYPE_VALUES = ['SubagentStart', 'SubagentStop', 'PostToolUse', 'Stop', 'PreToolUse', 'StopFailure']
+const HOOK_ERROR_TYPE_VALUES = [
+  'rate_limit',
+  'overloaded',
+  'authentication_failed',
+  'billing_error',
+  'invalid_request',
+  'model_not_found',
+  'server_error',
+  'max_output_tokens',
+  'unknown',
+]
+
+function validateRuntimeLane(value) {
+  if (!RUNTIME_LANE_VALUES.includes(value)) {
+    throw new Error(`Invalid --runtime-lane: ${value}. Must be one of: ${RUNTIME_LANE_VALUES.join(', ')}`)
+  }
+}
+
+function validateCompletionOutcome(value) {
+  if (!COMPLETION_OUTCOME_VALUES.includes(value)) {
+    throw new Error(`Invalid --completion-outcome: ${value}. Must be one of: ${COMPLETION_OUTCOME_VALUES.join(', ')}`)
+  }
+}
+
+function validateCompletionSource(value) {
+  if (!COMPLETION_SOURCE_VALUES.includes(value)) {
+    throw new Error(`Invalid --completion-source: ${value}. Must be one of: ${COMPLETION_SOURCE_VALUES.join(', ')}`)
+  }
+}
+
+function validateHookEventType(value) {
+  if (!HOOK_EVENT_TYPE_VALUES.includes(value)) {
+    throw new Error(`Invalid --hook-event-type: ${value}. Must be one of: ${HOOK_EVENT_TYPE_VALUES.join(', ')}`)
+  }
+}
+
+function validateHookErrorType(value) {
+  if (!HOOK_ERROR_TYPE_VALUES.includes(value)) {
+    throw new Error(`Invalid --hook-error-type: ${value}. Must be one of: ${HOOK_ERROR_TYPE_VALUES.join(', ')}`)
+  }
+}
+
 
 // ============================================================================
 // Manifest Generation
@@ -304,6 +363,23 @@ function generateManifest(opts) {
   }
   if (opts.pr) {
     validatePrNumber(opts.pr)
+  }
+
+  // #2489: Validate optional runtime_lane / completion_outcome / completion_source
+  if (opts['runtime-lane']) {
+    validateRuntimeLane(opts['runtime-lane'])
+  }
+  if (opts['completion-outcome']) {
+    validateCompletionOutcome(opts['completion-outcome'])
+  }
+  if (opts['completion-source']) {
+    validateCompletionSource(opts['completion-source'])
+  }
+  if (opts['hook-event-type']) {
+    validateHookEventType(opts['hook-event-type'])
+  }
+  if (opts['hook-error-type']) {
+    validateHookErrorType(opts['hook-error-type'])
   }
 
   const manifest = {
@@ -363,6 +439,34 @@ function generateManifest(opts) {
   // Default to null if not provided
   if (!manifest.phase.ledger_phase) {
     manifest.phase.ledger_phase = null
+  }
+
+  // #2489: runtime_lane / completion_outcome / completion_source are optional
+  // root-level scalars. The producer only accepts and validates the CLI value
+  // as-is — it does not derive/infer these values itself (that derivation is
+  // the caller's responsibility, e.g. the hook wrapper).
+  if (opts['runtime-lane']) {
+    manifest.runtime_lane = opts['runtime-lane']
+  }
+  if (opts['completion-outcome']) {
+    manifest.completion_outcome = opts['completion-outcome']
+  }
+  if (opts['completion-source']) {
+    manifest.completion_source = opts['completion-source']
+  }
+
+  // #2489 P0-1: hook_event is turn-level evidence (event_type / optional
+  // error_type), entirely independent of the root completion_outcome /
+  // completion_source fields above. The producer only accepts and validates
+  // the CLI value as-is; derivation is the caller's responsibility (e.g. the
+  // hook wrapper).
+  if (opts['hook-event-type']) {
+    manifest.hook_event = {
+      event_type: opts['hook-event-type'],
+    }
+    if (opts['hook-error-type']) {
+      manifest.hook_event.error_type = opts['hook-error-type']
+    }
   }
 
   // M2: Add verification with semantic rules

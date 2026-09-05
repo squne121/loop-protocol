@@ -47,6 +47,7 @@
     "agent-run:finalize": "node scripts/agent-logs/finalize-agent-run.mjs",
     "agent-run:check": "node scripts/check-agent-run-reports.mjs",
     "agent-run:post": "node scripts/agent-logs/post-agent-run-report.mjs",
+    "agent-run:complete": "node scripts/agent-logs/complete-agent-run.mjs",
     "chatgpt-retro-context:post": "node scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs --command post",
     "chatgpt-retro-context:resolve-fixture": "node scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs --command resolve-fixture",
     "chatgpt-retro-context:resolve-live": "node scripts/agent-logs/lib/chatgpt-retro-context-marker-helper.mjs --command resolve-live",
