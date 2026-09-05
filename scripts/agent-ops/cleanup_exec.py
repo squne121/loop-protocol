@@ -440,25 +440,35 @@ def _pr_state(pr_number: int, project_root: str, repo_slug: str | None, deadline
 # existing ``LINKED_ISSUE_MISMATCH`` reason code — no new reason code is
 # introduced.
 
-_REFS_ISSUE_PATTERN = re.compile(r"Refs #(\d+)")
+_REFS_ISSUE_PATTERN = re.compile(r"Refs #([0-9]+)")
 
 
 def _pr_body_has_exact_refs(body: str, issue_number: int) -> bool:
     """Return True iff ``body`` contains an EXACT ``Refs #<issue_number>``.
 
     Deliberately a small, deterministic helper (NOT a general markdown
-    parser). ``\\d+`` is captured greedily so ``Refs #21010`` never matches a
-    target of ``2101`` (the captured group is the full ``21010`` run, which
-    compares unequal to ``2101`` as integers) — this rejects numeric
-    prefix-collisions without relying on regex word-boundary semantics, which
-    would NOT reject this collision (both ``1`` and ``0`` are word
-    characters, so there is no ``\\b`` boundary between ``2101`` and
-    ``21010``).
+    parser). ``[0-9]+`` (ASCII digits only — NOT ``\\d+``, which also matches
+    Unicode full-width digits such as ``Refs #２１０１``) is captured greedily
+    so ``Refs #21010`` never matches a target of ``2101`` (the captured group
+    is the full ``21010`` run) — this rejects numeric prefix-collisions
+    without relying on regex word-boundary semantics, which would NOT reject
+    this collision (both ``1`` and ``0`` are word characters, so there is no
+    ``\\b`` boundary between ``2101`` and ``21010``).
+
+    The captured digits are compared as STRINGS against ``str(issue_number)``
+    (never ``int()``-converted): (1) this makes zero-padded forms such as
+    ``Refs #02101`` correctly NOT match target ``2101`` (exact-text
+    equality, not numeric equality); (2) it avoids ``int()`` raising
+    ``ValueError`` on pathologically long digit runs (CPython's integer
+    string-conversion length guard), which would otherwise abort the scan
+    before a later, legitimate ``Refs #<issue_number>`` in the same body is
+    ever reached.
     """
     if not body:
         return False
+    target = str(issue_number)
     for match in _REFS_ISSUE_PATTERN.finditer(body):
-        if int(match.group(1)) == issue_number:
+        if match.group(1) == target:
             return True
     return False
 
@@ -490,9 +500,15 @@ def _linked_issue_state(
     if out.returncode != 0:
         return None
     try:
-        return json.loads(out.stdout)
+        payload = json.loads(out.stdout)
     except (json.JSONDecodeError, ValueError):
         return None
+    # Issue #2508 fix_delta P2-1: fail closed (None) when the JSON root is not
+    # a mapping (e.g. ``[]`` or ``true``) instead of returning a value whose
+    # ``.get()`` calls would raise ``AttributeError`` for the caller.
+    if not isinstance(payload, dict):
+        return None
+    return payload
 
 
 def _research_fallback_authorized(
@@ -507,6 +523,17 @@ def _research_fallback_authorized(
          ``parse_machine_readable_contract``) reports ``issue_kind: research``;
       3. the linked Issue is ``state: CLOSED`` with ``stateReason: COMPLETED``.
     Any single failure returns ``False`` (fail-closed).
+
+    Issue #2508 fix_delta P2-1: ``parse_machine_readable_contract()`` catches
+    ``yaml.YAMLError``/``TypeError`` raised while PARSING the YAML fence, but
+    certain malformed *values* (e.g. ``note: 2026-02-30``, ``note: 0x_``,
+    ``note: !!timestamp nope``) raise ``ValueError``/``AttributeError`` while
+    PyYAML CONSTRUCTS the Python object for that value — these propagate
+    through the parser uncaught. This call boundary narrowly guards against
+    that leak so a malformed linked-Issue MRC value never aborts ``run()``;
+    it always degrades to fallback-not-authorized (``False``), which the
+    caller (``_verify_linked_issue``) turns into the existing
+    ``LINKED_ISSUE_MISMATCH`` reason code.
     """
     if not _pr_body_has_exact_refs(pr.get("body") or "", issue_number):
         return False
@@ -517,7 +544,13 @@ def _research_fallback_authorized(
         return False
     if issue.get("stateReason") != "COMPLETED":
         return False
-    parse_result = parse_machine_readable_contract(issue.get("body") or "")
+    body = issue.get("body")
+    if not isinstance(body, str):
+        return False
+    try:
+        parse_result = parse_machine_readable_contract(body)
+    except (ValueError, TypeError, AttributeError, re.error):
+        return False
     if not parse_result.ok:
         return False
     if parse_result.get("issue_kind") != "research":

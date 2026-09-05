@@ -1025,3 +1025,114 @@ class TestResearchFallbackIntegration:
         assert ok is False
         assert reason == LINKED_ISSUE_MISMATCH
         assert verified["linked_issue_match"] is False
+
+
+# ─── Issue #2508 fix_delta P2-1/P2-2: malformed MRC value-construction
+# exception leak + Refs #N ASCII/exact-text-match hardening.
+#
+# PR #2513 REQUEST_CHANGES (P2-1): parse_machine_readable_contract() catches
+# yaml.YAMLError/TypeError from the LOAD step, but certain malformed YAML
+# *values* raise ValueError/AttributeError while PyYAML CONSTRUCTS the Python
+# object — these previously propagated uncaught out of
+# _research_fallback_authorized(), aborting run() instead of degrading to the
+# regular LINKED_ISSUE_MISMATCH / linked_issue_mismatch reason code.
+#
+# PR #2513 REQUEST_CHANGES (P2-2): the old ``Refs #(\d+)`` + int() comparison
+# matched Unicode full-width digits and zero-padded numbers, and could raise
+# ValueError on pathologically long digit runs.
+
+
+def _make_research_issue_mrc_with_note(bad_note_value: str) -> str:
+    """Same shape as ``_make_research_issue_mrc('research')`` but with an
+    additional ``note:`` field carrying a malformed YAML value (Issue #2508
+    fix_delta P2-1)."""
+    return (
+        "## Machine-Readable Contract\n\n"
+        "```yaml\n"
+        "contract_schema_version: v1\n"
+        "issue_kind: research\n"
+        "parent_issue: \"none\"\n"
+        "goal_ref: \"test\"\n"
+        "change_kind: code\n"
+        f"note: {bad_note_value}\n"
+        "```\n"
+    )
+
+
+class TestResearchFallbackMalformedMrcValueConstructionFailsClosed:
+    """PR #2513 P2-1: malformed MRC *values* (not just syntax errors) must not
+    leak an uncaught exception out of _research_fallback_authorized(); they
+    must degrade to fallback-not-authorized (False)."""
+
+    @pytest.mark.parametrize(
+        "bad_note_value",
+        [
+            pytest.param("2026-02-30", id="invalid_calendar_date_raises_value_error"),
+            pytest.param("0x_", id="invalid_hex_int_literal_raises_value_error"),
+            pytest.param("!!timestamp nope", id="explicit_timestamp_tag_raises_attribute_error"),
+        ],
+    )
+    def test_malformed_note_value_fails_closed_without_raising(self, monkeypatch, bad_note_value):
+        monkeypatch.setattr(
+            _ce, "_linked_issue_state",
+            lambda *a, **k: {
+                "state": "CLOSED", "stateReason": "COMPLETED",
+                "body": _make_research_issue_mrc_with_note(bad_note_value),
+            },
+        )
+        pr = TestResearchFallbackAuthorized._pr("Refs #2101")
+        # Must not raise — must fail CLOSED to False.
+        assert _research_fallback_authorized(2101, pr, "/root", "s/r", Deadline(10.0)) is False
+
+    def test_malformed_note_value_end_to_end_yields_linked_issue_mismatch(self, monkeypatch, repo_normal_worktree):
+        """End-to-end: a malformed linked-Issue MRC value must surface via the
+        regular verify_cleanup_authorization() path as LINKED_ISSUE_MISMATCH,
+        not an uncaught exception."""
+        repo = repo_normal_worktree
+        linked_issue = 2101
+        req = _make_req(repo, linked_issue=linked_issue)
+        pr = _make_merged_pr(
+            repo["branch_name"], repo["branch_tip"],
+            closing_issue_refs=[], body=f"Refs #{linked_issue}",
+        )
+        fake_issue = {
+            "state": "CLOSED", "stateReason": "COMPLETED",
+            "body": _make_research_issue_mrc_with_note("2026-02-30"),
+        }
+        with (
+            patch.object(_ce, "_repo_slug", return_value="squne121/loop-protocol"),
+            patch.object(_ce, "_pr_state", return_value=pr),
+            patch.object(_ce, "_linked_issue_state", return_value=fake_issue),
+        ):
+            ok, reason, verified = verify_cleanup_authorization(req, repo["root"], Deadline(30.0))
+        assert ok is False
+        assert reason == LINKED_ISSUE_MISMATCH
+        assert verified["linked_issue_match"] is False
+
+
+class TestPrBodyExactRefsHardening:
+    """PR #2513 P2-2: ASCII-only digits + exact-text (never int()) comparison."""
+
+    def test_fullwidth_digits_rejected(self):
+        """Unicode full-width digits (e.g. U+FF10-U+FF19) must NOT match —
+        ``\\d`` (the old pattern) matches them but ``[0-9]`` does not."""
+        assert _pr_body_has_exact_refs("Refs #２１０１", 2101) is False
+
+    def test_zero_padded_number_rejected(self):
+        """``Refs #02101`` must NOT match target 2101 — exact TEXT match, not
+        numeric equality (the old int()-based comparison would have matched)."""
+        assert _pr_body_has_exact_refs("Refs #02101", 2101) is False
+
+    def test_extremely_long_digit_run_does_not_raise_and_later_match_is_found(self):
+        """A pathologically long digit run before a legitimate ``Refs #2101``
+        must not raise (the old int() conversion would raise ValueError on
+        CPython's integer string-conversion length guard) and the later,
+        correct match must still be found."""
+        body = "Refs #" + "9" * 5000 + "\nRefs #2101"
+        assert _pr_body_has_exact_refs(body, 2101) is True
+
+    def test_prefix_collision_still_rejected(self):
+        """Regression: the existing prefix-collision rejection (Refs #21010
+        vs target 2101) must still hold under the new string-comparison
+        logic."""
+        assert _pr_body_has_exact_refs("Refs #21010", 2101) is False
