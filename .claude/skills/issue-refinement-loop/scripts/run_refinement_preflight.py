@@ -7347,6 +7347,7 @@ def run_preflight(
     consume_contract_patch_plan: bool = False,
     contract_update_callbacks: Optional[dict[str, Any]] = None,
     investigation_evidence_transport_path: "Optional[Path]" = None,
+    investigation_evidence_primary_root: "Optional[Path]" = None,
     enable_main_drift_live_readback: bool = False,
 ) -> tuple[dict, int]:
     """
@@ -7953,14 +7954,45 @@ def run_preflight(
     # chain does; `main()` only ever threads this manifest path through, and
     # this is where it is validated and merged into known_context.
     if investigation_evidence_transport_path is not None:
+        # Issue #2199 OWNER feedback P1-3: `investigation_evidence_transport_path`
+        # is validated by the executor (skill_runtime_command_policy.py) as a
+        # path relative to the PRIMARY checkout, but this script's own
+        # `repo_root` (above) is `_find_repo_root()`, derived from THIS
+        # script's own `__file__` -- the #2197/#2199 dedicated worktree when
+        # dispatched there, not the primary checkout the caller validated
+        # against. `investigation_evidence_primary_root` is the executor's
+        # explicit handoff of that origin (set ONLY for the 4 production
+        # preflight profiles); falling back to `repo_root` when absent keeps
+        # every other caller (fixture profiles, direct Python callers, this
+        # script's own pre-existing test suite) byte-identical to before this
+        # parameter existed.
+        _investigation_evidence_confinement_root = investigation_evidence_primary_root or repo_root
+        # `_confine_artifact_path()` (inside `_validate_investigation_evidence_transport`)
+        # resolves a RELATIVE `path` via `Path.resolve()`, which anchors to
+        # this PROCESS's actual `os.getcwd()` -- NOT to whatever `repo_root`
+        # value is passed alongside it. This process's cwd is always the
+        # #2197/#2199 dedicated worktree once dispatched there (set by the
+        # executor's `subprocess.run(cwd=execution_root, ...)`), regardless
+        # of `investigation_evidence_primary_root`. Pre-joining the relative
+        # transport path against `_investigation_evidence_confinement_root`
+        # here -- making it ABSOLUTE before it ever reaches
+        # `_confine_artifact_path()` -- makes this resolution independent of
+        # this process's actual cwd, instead of merely widening the
+        # (cwd-anchored) boundary check while leaving the resolved candidate
+        # path itself still cwd-anchored.
+        _investigation_evidence_transport_path_for_confinement = investigation_evidence_transport_path
+        if not Path(_investigation_evidence_transport_path_for_confinement).is_absolute():
+            _investigation_evidence_transport_path_for_confinement = (
+                _investigation_evidence_confinement_root / _investigation_evidence_transport_path_for_confinement
+            )
         _validated_literals, _transport_reason = _validate_investigation_evidence_transport(
-            investigation_evidence_transport_path,
-            repo_root=repo_root,
+            _investigation_evidence_transport_path_for_confinement,
+            repo_root=_investigation_evidence_confinement_root,
             issue_number=issue_number,
             repo=repo,
             anchor_url=anchor_url_for_consumer,
             base_issue_body_sha256=_sha256(issue.get("body", "") or ""),
-            git_head_sha=_git_head_sha(repo_root),
+            git_head_sha=_git_head_sha(_investigation_evidence_confinement_root),
         )
         if _validated_literals is not None:
             known_context = dict(known_context) if known_context else {}
@@ -9398,6 +9430,25 @@ def main(argv: list[str] | None = None) -> None:
         "human-context lane; see _validate_investigation_evidence_transport().",
     )
     parser.add_argument(
+        "--investigation-evidence-primary-root",
+        type=Path,
+        default=None,
+        metavar="PRIMARY_ROOT_ABS_PATH",
+        help="Issue #2199 OWNER feedback P1-3: absolute path of the PRIMARY "
+        "checkout `--investigation-evidence-transport-path` is repo-relative "
+        "to. Only ever set by the privileged executor (skill_runtime_exec.py) "
+        "for the 4 production preflight profiles, which run this script's cwd "
+        "at the #2197/#2199 dedicated worktree, not the primary checkout -- "
+        "without this, the SAME repo-relative transport-path string resolves "
+        "against the dedicated worktree's own root (_find_repo_root(), "
+        "derived from this script's own dedicated-checkout __file__) instead "
+        "of the primary root the caller actually validated it against, "
+        "silently missing the real evidence file. When omitted (every other "
+        "command_id, and any non-privileged direct invocation), behavior is "
+        "byte-identical to before this flag existed: the transport path "
+        "resolves against this run's own _find_repo_root().",
+    )
+    parser.add_argument(
         "--invocation-id",
         default=None,
         metavar="ID",
@@ -9658,6 +9709,7 @@ def main(argv: list[str] | None = None) -> None:
         known_context=cli_known_context,
         consume_contract_patch_plan=args.consume_contract_patch_plan,
         investigation_evidence_transport_path=args.investigation_evidence_transport_path,
+        investigation_evidence_primary_root=args.investigation_evidence_primary_root,
         enable_main_drift_live_readback=args.enable_main_drift_live_readback,
     )
     sys.exit(exit_code)

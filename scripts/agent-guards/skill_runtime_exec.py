@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import hashlib
 import json
 import math
 import os
@@ -262,17 +263,93 @@ PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS = frozenset(
 )
 
 
-def capture_primary_checkout_invariant_snapshot(project_root: str) -> dict[str, str]:
-    """A cheap, ``--no-optional-locks``-guarded snapshot of the PRIMARY
-    checkout's identity-bearing state (Issue #2199 AC1).
+def _tracked_dirty_content_digests(project_root: str, status_stdout_z: str) -> dict[str, str]:
+    """SHA-256 content digest of every TRACKED path `status_stdout_z`
+    (porcelain v1, ``-z``) reports as touched in the index or worktree --
+    i.e. every entry that is NEITHER untracked (``??``) NOR ignored (``!!``)
+    (Issue #2199 OWNER feedback P2(b)).
 
-    Deliberately NOT a full untracked-filesystem walk (that cost already
-    exists, separately scoped, in ``_snapshot_repo_paths`` for the artifact/
-    write-detection check -- this Issue does not add a second one to every
-    production invocation). Returns ``toplevel_raw``/``head_mode_raw``/
-    ``head_oid_raw``/``status_raw`` so a caller can prove the primary
-    checkout is byte-identical before and after a dedicated-worktree child
-    dispatch, on both the success and the failure path.
+    Closes a real gap in comparing `git status` TEXT alone: git's status
+    LETTER for an ALREADY-dirty tracked file does not change merely because
+    its content changes further (``M path`` both before and after a span,
+    even though the bytes differ) -- this hashes those paths' actual
+    current bytes so within-span content drift on an already-dirty path is
+    still detected, instead of being silently absorbed into an
+    unchanged-looking status line. Bounded by the number of ALREADY-dirty
+    tracked paths at snapshot time (zero for any invocation starting from a
+    clean primary checkout, the normal production case) -- never a walk of
+    the whole tree, and never a second, independent full-repo scan.
+
+    Mirrors ``_git_status_paths()``'s own rename-pair field consumption
+    (a rename entry's second, bare NUL-terminated field is its ORIGINAL
+    path, never itself a new status entry) so a rename is never
+    misparsed into a bogus phantom path.
+    """
+    digests: dict[str, str] = {}
+    fields = [field for field in status_stdout_z.split("\0") if field]
+    i = 0
+    while i < len(fields):
+        field = fields[i]
+        if len(field) < 4:
+            i += 1
+            continue
+        xy = field[:2]
+        rel_path = field[3:]
+        is_rename = field[0] == "R" or field[1] == "R"
+        i += 2 if (is_rename and i + 1 < len(fields)) else 1
+        if "?" in xy or "!" in xy:
+            continue
+        full_path = Path(project_root) / rel_path
+        try:
+            if full_path.is_symlink() or not full_path.is_file():
+                continue
+            digests[rel_path] = hashlib.sha256(full_path.read_bytes()).hexdigest()
+        except OSError:
+            digests[rel_path] = "<unreadable>"
+    return digests
+
+
+def capture_primary_checkout_invariant_snapshot(project_root: str) -> dict[str, str]:
+    """A ``--no-optional-locks``-guarded snapshot of the PRIMARY checkout's
+    identity-bearing state (Issue #2199 AC1), used as an unconditional
+    STOP-ON-ANY-OBSERVED-CHANGE safety net around a dedicated-worktree
+    child dispatch (Issue #2199 OWNER feedback P2).
+
+    What this DOES prove (compared before vs after a dispatch span, on
+    both the success and the failure path): the primary checkout's
+    toplevel path, HEAD ref/OID, `git status` text (including individual
+    untracked-file enumeration -- see below), AND, for every path already
+    tracked-dirty at snapshot time, that path's own content digest, are
+    all identical. Combined, an already-dirty tracked file's content
+    changing WITHOUT its status letter changing (`M path` before and
+    after, different bytes) is caught by the digest, not just the text
+    (Issue #2199 OWNER feedback P2(b) -- the status-text-only comparison
+    this replaced could not distinguish that case, so "byte-identical" was
+    not, in fact, always true of it).
+
+    What this does NOT prove: that the DEDICATED CHILD ITSELF caused an
+    observed difference, as opposed to any other concurrent process
+    touching the SAME primary checkout during the same span (Issue #2199
+    OWNER feedback P2(a)). This is a conservative, unconditional stop
+    condition -- ANY observed difference in this checkout's state across
+    the span fails closed, regardless of attribution -- not a targeted
+    attribution/causality proof. A caller must not describe a failure here
+    as "the dedicated dispatch mutated primary"; the accurate description
+    is "primary's observable state did not remain unchanged across this
+    span" (see `_emit_primary_checkout_drift_failure()`'s message).
+
+    ``--untracked-files=all`` DOES enumerate individual untracked files
+    (not merely each untracked top-level directory as a single entry) --
+    this is INTENTIONAL, not an oversight: a new file appearing inside an
+    already-untracked directory must also be detected for AC1's
+    byte-identical proof, and `--untracked-files=normal` would silently
+    miss it (the containing directory's own status entry would be
+    identical before and after). This is still far cheaper than
+    `_snapshot_repo_paths()`'s full recursive `os.walk()` +
+    per-entry `lstat()` (a single `git status` subprocess call here, versus
+    a Python-side filesystem walk over the entire tree there) -- but it is
+    not free, and this docstring no longer claims it avoids per-file
+    enumeration.
     """
     git = shutil.which("git") or "git"
 
@@ -293,11 +370,17 @@ def capture_primary_checkout_invariant_snapshot(project_root: str) -> dict[str, 
     head_oid_raw = head_oid.stdout if head_oid.returncode == 0 else f"<error:{head_oid.returncode}>"
     status = _run("status", "--porcelain=v1", "--untracked-files=all", "-z")
     status_raw = status.stdout.replace("\0", "\\0") if status.returncode == 0 else f"<error:{status.returncode}>"
+    tracked_dirty_content_digest_raw = (
+        json.dumps(_tracked_dirty_content_digests(project_root, status.stdout), sort_keys=True)
+        if status.returncode == 0
+        else f"<error:{status.returncode}>"
+    )
     return {
         "toplevel_raw": toplevel_raw,
         "head_mode_raw": head_mode_raw,
         "head_oid_raw": head_oid_raw,
         "status_raw": status_raw,
+        "tracked_dirty_content_digest_raw": tracked_dirty_content_digest_raw,
     }
 
 
@@ -509,6 +592,36 @@ def _ensure_artifact_path_safe(project_root: str, issue_number: str, command_id:
 # trust root (e.g. a system PATH directory such as `/usr/local/bin`); see
 # `_validate_trusted_executable_version` below (Issue #2251 AC7).
 _EXACT_VERSION_PIN_RE = re.compile(r"^==(?P<version>\d+\.\d+\.\d+)$")
+
+
+def _is_managed_uv_project(root: str) -> bool:
+    """True unless `pyproject.toml`'s `[tool.uv].managed` is explicitly
+    `false` (Issue #2199 OWNER feedback P1-1 fix_delta collateral).
+
+    An unmanaged project never triggers `uv`'s own environment sync/`.venv`
+    creation at all -- `uv sync`/`uv run` refuse to manage its environment
+    by design (`error: The project is marked as unmanaged`) -- so it was
+    never exposed to the P1-1 false-positive `unauthorized_write_path`
+    misclassification in the first place, and
+    `ensure_dedicated_execution_environment_ready`'s explicit preparation
+    step has nothing to prepare for it. Treating a read/parse failure as
+    "managed" (the fail-closed default, matching every real production
+    `pyproject.toml`, which never sets `managed = false`) keeps this check
+    itself from becoming a NEW way to silently skip the P1-1 fix.
+    """
+    pyproject_path = Path(root) / "pyproject.toml"
+    try:
+        raw_toml = pyproject_path.read_text(encoding="utf-8")
+    except OSError:
+        return True
+    try:
+        data = tomllib.loads(raw_toml)
+    except tomllib.TOMLDecodeError:
+        return True
+    uv_section = data.get("tool", {}).get("uv")
+    if not isinstance(uv_section, dict):
+        return True
+    return uv_section.get("managed", True) is not False
 
 
 def _required_uv_version(project_root: str) -> str | None:
@@ -1527,10 +1640,16 @@ def _emit_timeout_failure(
 
 
 def _emit_primary_checkout_drift_failure(issue_number: int) -> int:
+    # Issue #2199 OWNER feedback P2(a): this is an unconditional
+    # STOP-ON-ANY-OBSERVED-CHANGE safety net, not a proof that THIS
+    # dispatch's own dedicated child caused the observed difference -- an
+    # unrelated concurrent process touching the SAME primary checkout
+    # during the same span trips this identically. The recovery guidance
+    # below deliberately does not assert dedicated-dispatch causation.
     print(
         "SKILL_RUNTIME_FAIL: "
         f"reason_code=primary_checkout_invariant_violated target_issue={issue_number} "
-        "recovery=inspect_primary_checkout_for_unexpected_mutation_during_dedicated_dispatch",
+        "recovery=inspect_primary_checkout_for_any_state_change_observed_during_this_dispatch_span_cause_unattributed",
         file=sys.stderr,
     )
     return 2
@@ -1916,6 +2035,18 @@ def main(argv: list[str] | None = None) -> int:
                 *(
                     ["--investigation-evidence-transport-path", args.investigation_evidence_transport_path]
                     if args.investigation_evidence_transport_path
+                    else []
+                ),
+                # Issue #2199 OWNER feedback P1-3: this outer command-string
+                # validation gate must see the EXACT same argv shape
+                # `render_command()` will actually render below (P2136 H3:
+                # validated-value-vs-used-value divergence) -- so this
+                # mirrors the SAME condition the render_params block below
+                # uses, not an independent one.
+                *(
+                    ["--investigation-evidence-primary-root", project_root]
+                    if args.investigation_evidence_transport_path
+                    and args.command_id == "preflight.run.with_human_context"
                     else []
                 ),
             ]
@@ -2338,6 +2469,21 @@ def main(argv: list[str] | None = None) -> int:
             render_params["anchor_comment_url"] = args.anchor_comment_url
             if args.investigation_evidence_transport_path:
                 render_params["investigation_evidence_transport_path"] = args.investigation_evidence_transport_path
+                # Issue #2199 OWNER feedback P1-3: `preflight.run.with_human_context`
+                # is one of the 4 production preflight profiles -- its child
+                # always dispatches under the #2197/#2199 dedicated worktree
+                # (`execution_root`, below), never `project_root`. The
+                # transport path was validated above as relative to
+                # `project_root` (the PRIMARY checkout); without this
+                # explicit handoff of that SAME `project_root`, the child's
+                # own `_find_repo_root()` (derived from ITS `__file__`,
+                # under the dedicated worktree once dispatched there) would
+                # resolve the identical relative string against a different
+                # root and silently miss the real evidence file. Always the
+                # executor's OWN already-verified `project_root` -- never a
+                # caller-suppliable value.
+                if args.command_id == "preflight.run.with_human_context":
+                    render_params["investigation_evidence_primary_root"] = project_root
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
 
@@ -2369,9 +2515,13 @@ def main(argv: list[str] | None = None) -> int:
     # bootstrap, dedicated-identity verification, child dispatch, and the
     # SAME post-child checks retargeted at `execution_root` (AC3/AC9) --
     # never a primary-root fallback on any dedicated-identity failure
-    # (AC11). `capture_primary_checkout_invariant_snapshot()` proves the
-    # PRIMARY checkout itself stayed byte-identical across the whole span,
-    # on both the success and the failure path (AC1).
+    # (AC11). `capture_primary_checkout_invariant_snapshot()` is an
+    # unconditional stop condition (Issue #2199 OWNER feedback P2): it
+    # fails closed if the PRIMARY checkout's observable state (including,
+    # for already-dirty tracked paths, their own content) differs at all
+    # across the span, on both the success and the failure path (AC1) --
+    # it does not attribute an observed difference to this dispatch's own
+    # child specifically (see that function's own docstring).
     bootstrap_mod = _load_worktree_bootstrap_exec_module()
     primary_before = capture_primary_checkout_invariant_snapshot(project_root)
     exit_code: int | None = None
@@ -2389,12 +2539,39 @@ def main(argv: list[str] | None = None) -> int:
                 invocation_cwd=execution_root,
                 executor_script_path=executor_script_path,
             )
+            # Issue #2199 OWNER feedback P1-1: the dedicated worktree's own
+            # `uv`-managed project environment is relocated OUTSIDE the
+            # monitored `execution_root` tree via `UV_PROJECT_ENVIRONMENT`
+            # (`bootstrap_mod.dedicated_execution_venv_dir`), and explicitly
+            # prepared (`ensure_dedicated_execution_environment_ready`)
+            # BEFORE `_dispatch_child_and_check_postconditions` takes its
+            # before-snapshot -- so neither a first-run `.venv` creation nor
+            # a first-sync `uv.lock` mtime touch can ever appear inside the
+            # write-monitoring window below. `dedicated_env` (not the outer
+            # `env`) is what actually reaches the monitored child dispatch,
+            # so the child observes the SAME relocated environment this
+            # preparation step just readied.
+            dedicated_env = dict(env)
+            # An unmanaged project (`[tool.uv].managed = false`) never
+            # triggers `uv`'s own environment sync/`.venv` creation at all
+            # (`uv sync`/`uv run` refuse to manage it by design) -- it was
+            # never exposed to the P1-1 misclassification this relocation
+            # exists to prevent, so this step is skipped entirely for it
+            # (never a hard failure), preserving byte-identical pre-#2199
+            # behavior for every unmanaged-project caller/fixture.
+            if _is_managed_uv_project(execution_root):
+                dedicated_env["UV_PROJECT_ENVIRONMENT"] = bootstrap_mod.dedicated_execution_venv_dir(project_root)
+                bootstrap_mod.ensure_dedicated_execution_environment_ready(
+                    execution_root=execution_root,
+                    uv_executable=child_argv[0],
+                    env=dedicated_env,
+                )
             exit_code = _dispatch_child_and_check_postconditions(
                 dispatch_root=execution_root,
                 issue_number=args.issue_number,
                 command_id=args.command_id,
                 child_argv=child_argv,
-                env=env,
+                env=dedicated_env,
                 timeout_seconds=timeout_seconds,
                 binary_output=binary_output,
             )

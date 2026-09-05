@@ -336,6 +336,41 @@ def fixed_control_plane_worktree_path(project_root: str | os.PathLike[str]) -> s
     return str(Path(root) / ".claude" / _FIXED_CONTROL_PLANE_WORKTREE_RELATIVE_PATH)
 
 
+# Fixed, dedicated-worktree-EXTERNAL uv project environment directory (Issue
+# #2199 OWNER feedback P1-1). Deliberately a SIBLING of
+# `_FIXED_CONTROL_PLANE_WORKTREE_RELATIVE_PATH`, never nested inside it.
+_FIXED_CONTROL_PLANE_VENV_RELATIVE_PATH = Path("worktrees") / f"{_CONTROL_PLANE_PREFLIGHT_LOCK_IDENTITY}-venv"
+
+
+def dedicated_execution_venv_dir(project_root: str | os.PathLike[str]) -> str:
+    """Fixed, dedicated-worktree-EXTERNAL `uv` project environment directory
+    for the 4 production preflight profiles (Issue #2199 OWNER feedback
+    P1-1: "managed uv project の初回実行が unauthorized write と誤判定される").
+
+    Deliberately a SIBLING of `fixed_control_plane_worktree_path`'s own
+    dedicated worktree, never nested inside it: `skill_runtime_exec`'s
+    write-monitoring window (`_snapshot_repo_paths`) walks only
+    `execution_root`'s own subtree, so a `uv`-managed project environment
+    that lives outside that subtree (via `UV_PROJECT_ENVIRONMENT`, set by
+    the caller alongside this path) is structurally invisible to the
+    before/after unauthorized-write diff. This is "explicit segregation of
+    the execution environment outside the monitored checkout" (one of the
+    two remedies the OWNER feedback names) -- not a `.venv`-name exclusion
+    list, and not a bare `--no-sync`/`--locked` workaround on an unprepared
+    environment.
+
+    Stable across `recover_or_create_fixed_control_plane_worktree`
+    recreating the dedicated worktree at a new `accepted_oid` (OWNER
+    feedback case 3, "dedicated worktree が再作成された後の初回起動"): only
+    the *worktree* is torn down and rebuilt on an OID change, never this
+    environment directory, so "first launch after worktree recreation"
+    reduces to the ordinary "environment already exists" case rather than a
+    second first-run.
+    """
+    root = os.path.realpath(os.fspath(project_root))
+    return str(Path(root) / ".claude" / _FIXED_CONTROL_PLANE_VENV_RELATIVE_PATH)
+
+
 def recover_or_create_fixed_control_plane_worktree(
     accepted_oid: object,
     object_format: object,
@@ -512,6 +547,70 @@ class DedicatedIdentityViolation(ControlPlaneUnavailable):
     root or by continuing on a different/alternate dedicated identity --
     the caller must abort the production dispatch entirely.
     """
+
+
+class DedicatedEnvironmentPreparationFailed(ControlPlaneUnavailable):
+    """Fail-closed terminal state for the explicit toolchain-preparation
+    phase (Issue #2199 OWNER feedback P1-1). Never resolved by falling back
+    to an unsynced/partial environment or to the primary root -- the caller
+    must abort the production dispatch entirely, exactly like
+    `DedicatedIdentityViolation`.
+    """
+
+
+def ensure_dedicated_execution_environment_ready(
+    *,
+    execution_root: str,
+    uv_executable: str,
+    env: dict[str, str],
+    timeout_seconds: float = 120.0,
+) -> None:
+    """Explicit toolchain-preparation phase for the 4 production preflight
+    profiles (Issue #2199 OWNER feedback P1-1), run by the caller BEFORE the
+    write-monitoring window opens (before
+    `skill_runtime_exec._dispatch_child_and_check_postconditions`'s own
+    before-snapshot).
+
+    Runs ``uv sync --locked`` against the dedicated worktree's OWN
+    ``pyproject.toml``/``uv.lock`` (already present there -- both are
+    ordinary tracked files, checked out by the worktree like any other repo
+    file), targeting the sibling, monitored-tree-EXTERNAL
+    `dedicated_execution_venv_dir` via ``env["UV_PROJECT_ENVIRONMENT"]``
+    (the caller sets this key before calling here, and must pass the SAME
+    ``env`` on to the actual monitored child dispatch afterward).
+
+    ``--locked`` means this never silently rewrites ``uv.lock`` content on
+    a resolution drift -- it fails closed instead (surfacing as a non-zero
+    ``uv`` exit here, raising `DedicatedEnvironmentPreparationFailed`).
+    Running this ONCE, here, before the monitored window opens, is also
+    what keeps a subsequent already-synced ``uv run`` (the actual, monitored
+    child dispatch) from touching ``uv.lock``'s mtime a second time: `uv`
+    only rewrites/touches a lockfile-adjacent path when the environment is
+    not already up to date, so this call absorbs that one-time mtime bump
+    on the caller's behalf, before the caller ever takes its before-snapshot.
+
+    This function itself never touches `execution_root` outside what `uv`
+    itself writes -- it does not create, move, or delete any path.
+    """
+    try:
+        result = subprocess.run(
+            [uv_executable, "sync", "--locked"],
+            cwd=execution_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DedicatedEnvironmentPreparationFailed(
+            "dedicated_environment_preparation_timed_out"
+        ) from exc
+    if result.returncode != 0:
+        raise DedicatedEnvironmentPreparationFailed(
+            "dedicated_environment_preparation_failed: "
+            f"exit={result.returncode} stderr={result.stderr.strip()[:2000]}"
+        )
 
 
 @contextlib.contextmanager

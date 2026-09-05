@@ -234,6 +234,7 @@ REGISTRY = {
             "--anchor-comment-url", "{anchor_comment_url}",
             "--human-context-comment-url", "{anchor_comment_url}",
             "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
+            "--investigation-evidence-primary-root", "{investigation_evidence_primary_root}",
         ],
         "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_anchor",
         "required_cwd": "canonical_main_root", "required_branch": "default_branch",
@@ -246,6 +247,15 @@ REGISTRY = {
                 "type": "github_issue_comment_url", "required": True,
             },
             "investigation_evidence_transport_path": {
+                "type": "path", "required": False, "optional_flag_pair": True,
+            },
+            # Issue #2199 OWNER feedback P1-3: kept in parity with the real
+            # `command_registry.py` entry so this fixture's registry still
+            # matches `skill_runtime_command_policy.py`'s own
+            # `_EXPECTED_ARGV_BY_COMMAND`/`_EXPECTED_PLACEHOLDERS_BY_COMMAND`
+            # (the REAL, copied policy module `validate_registry_entry()`
+            # checks this fixture registry against).
+            "investigation_evidence_primary_root": {
                 "type": "path", "required": False, "optional_flag_pair": True,
             },
         },

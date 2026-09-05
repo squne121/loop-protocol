@@ -51,6 +51,7 @@ own contracts, not `main()`'s dispatch selection.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -67,15 +68,26 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 AGENT_GUARDS_DIR = REPO_ROOT / "scripts" / "agent-guards"
 AGENT_OPS_DIR = REPO_ROOT / "scripts" / "agent-ops"
 BOOTSTRAP_SCRIPT = AGENT_OPS_DIR / "worktree_bootstrap_exec.py"
+# Issue #2199 OWNER feedback P1-2: the SAME real production consumer module
+# `.claude/skills/issue-refinement-loop/tests/test_repair_action_apply_consumer.py`
+# already imports this exact way (identical absolute `_SCRIPTS_DIR`) -- reused
+# here, never a stub/reimplementation, to prove the fixed dedicated-worktree
+# artifact path genuinely reaches the real `run_repair_action_apply()` FD
+# secure reader end to end.
+ISSUE_REFINEMENT_LOOP_SCRIPTS_DIR = REPO_ROOT / ".claude" / "skills" / "issue-refinement-loop" / "scripts"
 
 if str(AGENT_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_GUARDS_DIR))
 if str(AGENT_OPS_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_OPS_DIR))
+if str(ISSUE_REFINEMENT_LOOP_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(ISSUE_REFINEMENT_LOOP_SCRIPTS_DIR))
 
 import skill_runtime_exec as exec_mod  # noqa: E402
+import skill_runtime_command_policy as command_policy_mod  # noqa: E402
 import worktree_bootstrap_exec  # noqa: E402
 import worktree_catalog  # noqa: E402
+import run_refinement_preflight as rrp  # noqa: E402
 
 # AC4/AC5/AC9: `exec_mod.main()`'s own lazy `_load_worktree_bootstrap_exec_module()`
 # does a bare `import worktree_bootstrap_exec` at call time -- Python's
@@ -164,11 +176,12 @@ def _init_main_dispatch_fixture(
     *,
     extra_repo_files: tuple[str, ...] = (),
     extra_written_files: dict[str, str] | None = None,
+    extra_dependencies: tuple[str, ...] = (),
 ) -> tuple[Path, str]:
     """A real remote (like `_init_remote_fixture`) PLUS the real production
     `command_registry.py`/`workflow_start_entry.py` at `project_root` and a
-    `.gitignore` for `.claude/worktrees/` (mirrors this real repo's own
-    `.gitignore`, so the dedicated worktree `main()`'s wired dispatch
+    `.gitignore` for `.claude/worktrees/`/`.venv/` (mirrors this real repo's
+    own `.gitignore`, so the dedicated worktree `main()`'s wired dispatch
     creates under `local` does not itself register as untracked drift in
     `capture_primary_checkout_invariant_snapshot()`). Used only by the
     AC4/AC5/AC9 tests below that call `exec_mod.main()` directly (the REAL
@@ -176,25 +189,38 @@ def _init_main_dispatch_fixture(
     this file. ``extra_repo_files`` copies additional real files verbatim
     from this checkout (by repo-relative path); ``extra_written_files``
     writes additional fixture-authored file contents (path -> text).
+
+    Issue #2199 OWNER feedback P1-1: this fixture's `pyproject.toml` is a
+    genuinely MANAGED `uv` project (no `managed = false`) -- the previous
+    `managed = false` fixture hid the "managed uv project's first `uv run`
+    creates `.venv`" bug this Issue's dedicated dispatch must not
+    misclassify as an unauthorized write, because an unmanaged project never
+    triggers `uv`'s own auto-sync/`.venv`-creation behavior at all.
+    ``extra_dependencies`` (exact-pinned, e.g. this real repo's own resolved
+    `pyyaml==6.0.3`) lets a caller opt into a genuine dependency-install
+    first-run instead of the zero-dependency default every other test here
+    uses (kept dependency-free so unrelated ACs stay fast); a real,
+    offline-resolvable (`UV_OFFLINE=1`) `uv lock` is generated and committed
+    here, exactly like this real repo commits its own `uv.lock`.
     """
     source = tmp_path / "main-dispatch-source"
     origin = tmp_path / "main-dispatch-origin.git"
     local = tmp_path / "main-dispatch-local"
     env = _git_env(tmp_path)
     subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True, env=env)
-    (source / ".gitignore").write_text(".claude/worktrees/\n", encoding="utf-8")
+    (source / ".gitignore").write_text(".claude/worktrees/\n.venv/\n", encoding="utf-8")
     (source / "README.md").write_text("fixture\n", encoding="utf-8")
     pin = _pinned_uv_version(REPO_ROOT)
+    deps_literal = ", ".join(f'"{dep}"' for dep in extra_dependencies)
     (source / "pyproject.toml").write_text(
         f'''[project]
 name = "main-dispatch-fixture"
 version = "0.0.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [{deps_literal}]
 
 [tool.uv]
 required-version = "{pin}"
-managed = false
 ''',
         encoding="utf-8",
     )
@@ -210,6 +236,25 @@ managed = false
         dest = source / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
+    lock_env = dict(env)
+    lock_env["UV_OFFLINE"] = "1"
+    # This test process may itself be running under `uv run` (its own
+    # `VIRTUAL_ENV`/project-scoped interpreter), which would otherwise leak
+    # into this fixture-authoring `uv lock` and constrain its resolution to
+    # THAT unrelated venv's interpreter instead of resolving fresh for this
+    # disposable fixture project.
+    lock_env.pop("VIRTUAL_ENV", None)
+    # `_git_env` above fakes `HOME` (git-identity isolation only) -- left
+    # alone, that empties `uv`'s default `$HOME/.cache/uv` resolution and
+    # makes this OFFLINE `uv lock` unable to find the real host's already
+    # warm cache. Point `UV_CACHE_DIR` at the REAL host cache explicitly so
+    # this fixture-authoring step reuses it instead of resolving against an
+    # empty one.
+    real_cache_dir = subprocess.run(
+        ["uv", "cache", "dir"], check=True, text=True, capture_output=True
+    ).stdout.strip()
+    lock_env["UV_CACHE_DIR"] = real_cache_dir
+    subprocess.run(["uv", "lock"], cwd=source, check=True, env=lock_env, capture_output=True)
     subprocess.run(["git", "add", "-A"], cwd=source, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=source, check=True, env=env)
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, env=env)
@@ -271,6 +316,29 @@ def test_given_dirty_primary_checkout_when_snapshotted_then_primary_snapshot_inv
     after = exec_mod.capture_primary_checkout_invariant_snapshot(str(local))
     assert after != before
     assert after["status_raw"] != ""
+
+
+def test_given_already_dirty_tracked_file_when_content_changes_further_then_primary_snapshot_invariant_still_detects_drift(
+    tmp_path,
+):
+    """Issue #2199 OWNER feedback P2(b): git's status LETTER for an
+    ALREADY-dirty tracked file does not change merely because its content
+    changes further (`M README.md` both before and after, different
+    bytes) -- a status-TEXT-only comparison could not detect this, making
+    the pre-fix_delta "byte-identical" docstring claim false for this
+    case. The digest field this fix_delta adds must still detect it."""
+    local, _origin, _url, _oid = _init_remote_fixture(tmp_path)
+    (local / "README.md").write_text("first dirty edit\n", encoding="utf-8")
+    before = exec_mod.capture_primary_checkout_invariant_snapshot(str(local))
+    assert before["status_raw"] != ""
+    assert json.loads(before["tracked_dirty_content_digest_raw"]) != {}
+    (local / "README.md").write_text("second dirty edit -- different bytes\n", encoding="utf-8")
+    after = exec_mod.capture_primary_checkout_invariant_snapshot(str(local))
+    # The status TEXT alone is byte-identical before/after (same file, same
+    # `M` letter, same path) -- this is the exact gap this fix_delta closes.
+    assert after["status_raw"] == before["status_raw"]
+    assert after["tracked_dirty_content_digest_raw"] != before["tracked_dirty_content_digest_raw"]
+    assert after != before
 
 
 # ---------------------------------------------------------------------------
@@ -1041,3 +1109,623 @@ def test_given_porcelain_output_when_parsed_by_existing_and_new_parsers_then_cat
         assert entry["schema"] == "WORKTREE_IDENTITY_PROBE_ENTRY_V1"
         assert "locked" in entry
         assert "prunable" in entry
+
+
+# ---------------------------------------------------------------------------
+# OWNER feedback (PR #2495 review) P1-1: managed uv project environment
+# segregation -- a genuinely MANAGED uv project's first `uv run` at a fresh
+# dedicated worktree must not be misclassified as `unauthorized_write_path`.
+# ---------------------------------------------------------------------------
+
+_MANAGED_UV_PREFLIGHT_STUB = '''from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--issue-number", required=True)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--anchor-comment-url", required=False, default=None)
+    parser.parse_args()
+    import yaml  # real dependency: proves the managed project's OWN venv actually installed it
+
+    marker_path = os.environ.get("SKILL_RUNTIME_TEST_INNER_MARKER_PATH")
+    if marker_path:
+        marker = Path(marker_path)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"cwd": os.getcwd(), "yaml_module_file": yaml.__file__}))
+    print('{"schema": "refinement_preflight_result/v1", "status": "ready"}')
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def _init_managed_uv_dispatch_fixture(tmp_path: Path) -> tuple[Path, str]:
+    return _init_main_dispatch_fixture(
+        tmp_path,
+        extra_written_files={
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py": _MANAGED_UV_PREFLIGHT_STUB,
+        },
+        extra_dependencies=("pyyaml==6.0.3",),
+    )
+
+
+def _dispatch_managed_preflight_with_anchor(local: Path, marker_path: Path, monkeypatch) -> int:
+    monkeypatch.chdir(local)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(local))
+    monkeypatch.setenv("SKILL_RUNTIME_TEST_INNER_MARKER_PATH", str(marker_path))
+    monkeypatch.setenv("UV_OFFLINE", "1")
+    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+    return exec_mod.main(
+        [
+            "--command-id",
+            "preflight.run.with_anchor",
+            "--issue-number",
+            "1228",
+            "--repo",
+            "squne121/loop-protocol",
+            "--anchor-comment-url",
+            "https://github.com/squne121/loop-protocol/issues/1228#issuecomment-1",
+        ]
+    )
+
+
+def _push_additional_commit_to_origin(origin_url: str, tmp_path: Path, marker_name: str) -> str:
+    """Advance `origin`'s default branch by one commit (via a disposable
+    third clone, never `local` itself) so a subsequent dispatch's remote
+    binding observes a genuinely new `accepted_oid` -- the trigger
+    `recover_or_create_fixed_control_plane_worktree` uses to tear down and
+    recreate the fixed dedicated worktree (Issue #2199 OWNER feedback P1-1
+    case 3)."""
+    env = _git_env(tmp_path)
+    scratch_clone = tmp_path / f"{marker_name}-scratch-clone"
+    subprocess.run(["git", "clone", "-q", origin_url, str(scratch_clone)], check=True, env=env)
+    (scratch_clone / marker_name).write_text("advance\n", encoding="utf-8")
+    subprocess.run(["git", "add", marker_name], cwd=scratch_clone, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "advance for case 3"], cwd=scratch_clone, check=True, env=env)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=scratch_clone, check=True, env=env)
+    return subprocess.run(
+        ["git", "-C", str(scratch_clone), "rev-parse", "HEAD"], check=True, text=True, capture_output=True
+    ).stdout.strip()
+
+
+def test_given_managed_uv_project_when_dedicated_venv_absent_then_first_launch_not_misclassified_unauthorized_write(
+    tmp_path, monkeypatch
+):
+    """Issue #2199 OWNER feedback P1-1 case 1: a genuinely MANAGED uv
+    project (real `pyyaml==6.0.3` dependency, no `managed = false`) whose
+    fixed dedicated worktree has never run `uv` before. Before this
+    fix_delta, `uv run`'s first-launch `.venv` creation happened INSIDE
+    `execution_root`, which the write-monitor misclassified as
+    `unauthorized_write_path`. After the fix, the environment is prepared
+    and relocated to `dedicated_execution_venv_dir` (a SIBLING of
+    `execution_root`, never nested inside it) before the write-monitoring
+    window opens, so the real dependency import succeeds and no `.venv`
+    ever appears inside the monitored dedicated worktree."""
+    inner_marker = tmp_path / "case1-inner-ran.marker"
+    local, url = _init_managed_uv_dispatch_fixture(tmp_path)
+    monkeypatch.setattr(worktree_bootstrap_exec, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
+
+    execution_root = worktree_bootstrap_exec.fixed_control_plane_worktree_path(str(local))
+    dedicated_venv = worktree_bootstrap_exec.dedicated_execution_venv_dir(str(local))
+    assert not Path(execution_root).exists()
+    assert not Path(dedicated_venv).exists()
+
+    exit_code = _dispatch_managed_preflight_with_anchor(local, inner_marker, monkeypatch)
+
+    assert exit_code == 0
+    assert inner_marker.exists()
+    observed = json.loads(inner_marker.read_text(encoding="utf-8"))
+    assert os.path.realpath(observed["cwd"]) == os.path.realpath(execution_root)
+    # The core P1-1 claim: the managed project's own `uv sync` target (this
+    # fixture's real `pyyaml==6.0.3` dependency) never lands inside the
+    # monitored dedicated worktree tree -- it is relocated to the sibling
+    # `dedicated_execution_venv_dir`, which this dispatch's explicit
+    # preparation step (`ensure_dedicated_execution_environment_ready`,
+    # called before the write-monitoring window opens) actually populated.
+    # (The inner script's OWN `yaml` import resolves through whatever
+    # interpreter `_resolve_trusted_executable("python3", ...)` selected --
+    # a pre-existing, unrelated #2073 identity-preservation choice this
+    # Issue does not change -- so it is not itself proof of which `uv`
+    # sync target was used; the absence of `.venv` inside `execution_root`
+    # plus the sibling directory's existence is.)
+    assert not (Path(execution_root) / ".venv").exists()
+    assert Path(dedicated_venv).is_dir()
+    assert (Path(dedicated_venv) / "pyvenv.cfg").is_file()
+
+
+def test_given_managed_uv_project_when_dedicated_venv_already_prepared_then_reexecution_reuses_same_environment(
+    tmp_path, monkeypatch
+):
+    """Issue #2199 OWNER feedback P1-1 case 2: a second dispatch against the
+    SAME fixed dedicated worktree/environment (no new `accepted_oid`, no
+    worktree recreation) reuses the already-prepared environment -- `uv
+    sync --locked`'s own no-op-when-already-synced behavior means the
+    sibling `dedicated_execution_venv_dir`'s `pyvenv.cfg` is never rewritten
+    a second time -- and both dispatches succeed."""
+    local, url = _init_managed_uv_dispatch_fixture(tmp_path)
+    monkeypatch.setattr(worktree_bootstrap_exec, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
+    dedicated_venv = worktree_bootstrap_exec.dedicated_execution_venv_dir(str(local))
+
+    first_marker = tmp_path / "case2-first.marker"
+    exit_code_1 = _dispatch_managed_preflight_with_anchor(local, first_marker, monkeypatch)
+    assert exit_code_1 == 0
+    pyvenv_cfg = Path(dedicated_venv) / "pyvenv.cfg"
+    assert pyvenv_cfg.is_file()
+    mtime_after_first = pyvenv_cfg.stat().st_mtime_ns
+
+    second_marker = tmp_path / "case2-second.marker"
+    exit_code_2 = _dispatch_managed_preflight_with_anchor(local, second_marker, monkeypatch)
+    assert exit_code_2 == 0
+    assert second_marker.exists()
+    assert pyvenv_cfg.stat().st_mtime_ns == mtime_after_first
+
+
+def test_given_dedicated_worktree_recreated_after_oid_update_then_first_launch_after_recreation_reuses_environment(
+    tmp_path, monkeypatch
+):
+    """Issue #2199 OWNER feedback P1-1 case 3: an `accepted_oid` update
+    between two dispatches forces `recover_or_create_fixed_control_plane_worktree`
+    to tear down and recreate the fixed dedicated worktree at the new OID.
+    The environment directory (a sibling of the worktree, never inside it)
+    is untouched by that recreation -- its `pyvenv.cfg` is not rewritten --
+    so this "first launch after worktree recreation" reduces to the
+    ordinary reuse case, never a second first-run misclassified as an
+    unauthorized write."""
+    local, url = _init_managed_uv_dispatch_fixture(tmp_path)
+    monkeypatch.setattr(worktree_bootstrap_exec, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
+    execution_root = worktree_bootstrap_exec.fixed_control_plane_worktree_path(str(local))
+    dedicated_venv = worktree_bootstrap_exec.dedicated_execution_venv_dir(str(local))
+
+    first_marker = tmp_path / "case3-first.marker"
+    exit_code_1 = _dispatch_managed_preflight_with_anchor(local, first_marker, monkeypatch)
+    assert exit_code_1 == 0
+    pyvenv_cfg = Path(dedicated_venv) / "pyvenv.cfg"
+    assert pyvenv_cfg.is_file()
+    mtime_after_first = pyvenv_cfg.stat().st_mtime_ns
+    first_head = subprocess.run(
+        ["git", "-C", execution_root, "rev-parse", "HEAD"], check=True, text=True, capture_output=True
+    ).stdout.strip()
+
+    new_oid = _push_additional_commit_to_origin(url, tmp_path, "CASE3_ADVANCE_MARKER.txt")
+    assert new_oid != first_head
+
+    second_marker = tmp_path / "case3-second.marker"
+    exit_code_2 = _dispatch_managed_preflight_with_anchor(local, second_marker, monkeypatch)
+    assert exit_code_2 == 0
+    assert second_marker.exists()
+
+    recreated_head = subprocess.run(
+        ["git", "-C", execution_root, "rev-parse", "HEAD"], check=True, text=True, capture_output=True
+    ).stdout.strip()
+    assert recreated_head == new_oid
+    assert pyvenv_cfg.stat().st_mtime_ns == mtime_after_first
+
+
+# ---------------------------------------------------------------------------
+# OWNER feedback (PR #2495 review) P1-2: dedicated preflight artifact ->
+# existing repair_action.apply consumer handoff.
+# ---------------------------------------------------------------------------
+
+_P1_2_ORIGINAL_BODY = "original body\n"
+_P1_2_REPAIRED_BODY = "repaired body\n"
+
+
+def _p1_2_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _write_dedicated_repair_candidate(dedicated_worktree: Path, issue_number: int) -> Path:
+    """Write a real `needs_fix`-shaped preflight-result artifact (and its
+    candidate body) UNDER the fixed dedicated worktree's own
+    `.claude/artifacts/issue-refinement-loop/<issue>/` tree -- exactly where
+    the real production preflight profiles now write it post-#2199 (never
+    under primary's own artifact tree). Mirrors
+    `.claude/skills/issue-refinement-loop/tests/test_repair_action_apply_consumer.py`'s
+    own `_write_candidate()` fixture shape (the real, already-reviewed
+    minimal-valid `auto_apply_safe` candidate), not a reinvented one."""
+    artifact_dir = dedicated_worktree / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    candidate_path = artifact_dir / "candidate_body.md"
+    candidate_path.write_text(_P1_2_REPAIRED_BODY)
+    repair_action = {
+        "schema_version": "repair_action/v1",
+        "policy_version": "deterministic-issue-repair/v1",
+        "disposition": "auto_apply_safe",
+        "original_body_sha256": _p1_2_hex(_P1_2_ORIGINAL_BODY),
+        "repaired_body_sha256": _p1_2_hex(_P1_2_REPAIRED_BODY),
+        "diagnostics_artifact": None,
+        "candidate_body_artifact": str(candidate_path),
+        "repair_kinds": ["trailing_whitespace"],
+        "reason_codes": ["trailing_whitespace_stripped"],
+        "source_lane": "unanchored",
+        "preflight_run_identity": "sha256:testrun",
+        "original_updated_at": "2024-01-01T00:00:00Z",
+        "source_refs_digest": None,
+    }
+    preflight_result = {
+        "schema": "issue_refinement_preflight_result/v1",
+        "repair_action": repair_action,
+        "result_core_sha256": "sha256:testrun",
+    }
+    result_path = artifact_dir / "refinement_preflight_result_v1.json"
+    result_path.write_text(json.dumps(preflight_result))
+    return result_path
+
+
+def _add_dedicated_detached_worktree(local: Path, oid: str) -> Path:
+    dedicated_path = Path(worktree_bootstrap_exec.fixed_control_plane_worktree_path(str(local)))
+    subprocess.run(
+        ["git", "-C", str(local), "worktree", "add", "--detach", str(dedicated_path), oid],
+        check=True,
+        capture_output=True,
+    )
+    return dedicated_path
+
+
+def test_given_dedicated_worktree_artifact_when_safe_path_checked_then_dedicated_relative_shape_accepted(tmp_path):
+    """Issue #2199 OWNER feedback P1-2: `_is_safe_issue_artifact_path()`
+    must accept a preflight-result path expressed relative to PRIMARY that
+    carries the fixed dedicated worktree's own prefix segment -- the exact
+    shape a caller derives from the dedicated preflight's own reported
+    absolute artifact path via an ordinary `os.path.relpath` against
+    primary root. Before this fix_delta this was rejected (prefix
+    mismatch), disconnecting the producer from the existing consumer."""
+    local, _origin, _url, oid = _init_remote_fixture(tmp_path)
+    dedicated_path = _add_dedicated_detached_worktree(local, oid)
+    result_path = _write_dedicated_repair_candidate(dedicated_path, 2199)
+    dedicated_relative = os.path.relpath(result_path, local)
+
+    assert command_policy_mod._is_safe_issue_artifact_path(dedicated_relative, str(local), "2199")
+
+    # A DIFFERENT issue number's artifact tree must still be rejected --
+    # this fix widens the accepted PREFIX shape, never the issue binding.
+    assert not command_policy_mod._is_safe_issue_artifact_path(dedicated_relative, str(local), "9999")
+
+    # A path escaping BOTH candidate prefixes is still rejected.
+    assert not command_policy_mod._is_safe_issue_artifact_path(
+        ".claude/worktrees/some-other-worktree/.claude/artifacts/issue-refinement-loop/2199/x.json",
+        str(local),
+        "2199",
+    )
+
+
+def test_given_dedicated_worktree_fixed_identity_when_compared_then_policy_literal_matches_bootstrap_constant():
+    """Guards `skill_runtime_command_policy.py`'s intentionally-duplicated
+    fixed dedicated-worktree literal (Issue #2199 OWNER feedback P1-2 --
+    added instead of a reverse import edge into `worktree_bootstrap_exec.py`)
+    against silent drift from `worktree_bootstrap_exec.py`'s own
+    `_FIXED_CONTROL_PLANE_WORKTREE_RELATIVE_PATH`."""
+    expected = os.path.join(
+        "/primary", ".claude", worktree_bootstrap_exec._FIXED_CONTROL_PLANE_WORKTREE_RELATIVE_PATH.as_posix()
+    )
+    actual = os.path.join("/primary", command_policy_mod._DEDICATED_CONTROL_PLANE_WORKTREE_REPO_RELATIVE)
+    assert expected == actual
+
+
+def test_given_dedicated_preflight_needs_fix_artifact_when_real_repair_consumer_runs_then_artifact_is_read_and_applied(
+    tmp_path,
+):
+    """Issue #2199 OWNER feedback P1-2 production-profile end-to-end proof:
+    a `needs_fix`-shaped preflight-result artifact written under the FIXED
+    dedicated worktree (never primary's own artifact tree) is read by the
+    REAL, unmodified `run_repair_action_apply()` consumer (Issue #2039) --
+    the SAME function `repair_action.apply` dispatches in production --
+    through its own unmodified FD-based secure reader (whose confinement
+    root stays PRIMARY throughout: this fix never changes that reader, only
+    the OUTER path-shape validator in `skill_runtime_command_policy.py`).
+    GitHub mutation itself is stubbed via `run_repair_action_apply()`'s own
+    pre-existing `fetch_current`/`apply_transaction` injection seam (no
+    real `gh` call -- OWNER feedback explicitly allows this)."""
+    local, _origin, _url, oid = _init_remote_fixture(tmp_path)
+    dedicated_path = _add_dedicated_detached_worktree(local, oid)
+    result_path = _write_dedicated_repair_candidate(dedicated_path, 2199)
+    dedicated_relative = os.path.relpath(result_path, local)
+
+    apply_calls: list[tuple[dict, str]] = []
+
+    def _apply_transaction(current_issue: dict, candidate_body: str) -> dict:
+        apply_calls.append((current_issue, candidate_body))
+        return {
+            "status": "ok",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{_p1_2_hex(_P1_2_REPAIRED_BODY)}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+            "errors": [],
+        }
+
+    fetch_bodies = iter([_P1_2_ORIGINAL_BODY, _P1_2_REPAIRED_BODY])
+
+    def _fetch_current():
+        return {"body": next(fetch_bodies), "updatedAt": "2024-01-01T00:00:00Z"}
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2199,
+        preflight_result_path=dedicated_relative,
+        repo_root=Path(local),
+        fetch_current=_fetch_current,
+        apply_transaction=_apply_transaction,
+    )
+
+    assert not (result.get("phase") == "candidate_load" and result.get("failure_code") == "secure_open_rejected")
+    assert result["mutation_outcome"] == "applied"
+    assert result["phase"] == "complete"
+    assert result["failure_code"] is None
+    assert len(apply_calls) == 1
+
+
+def test_given_dedicated_relative_artifact_path_when_repair_action_apply_command_parsed_then_accepted(tmp_path):
+    """Issue #2199 OWNER feedback P1-2, parser-level proof: the FULL
+    `repair_action.apply` exact-command-string parser (not just the
+    underlying `_is_safe_issue_artifact_path()` helper in isolation) now
+    accepts the dedicated-relative artifact shape -- this is the exact
+    parser `skill_runtime_exec.py::main()`'s real dispatch calls through
+    `is_exact_skill_runtime_repair_action_apply_executor_command()`."""
+    local, _origin, _url, oid = _init_remote_fixture(tmp_path)
+    dedicated_path = _add_dedicated_detached_worktree(local, oid)
+    result_path = _write_dedicated_repair_candidate(dedicated_path, 2199)
+    dedicated_relative = os.path.relpath(result_path, local)
+
+    command_text = " ".join(
+        [
+            "uv",
+            "run",
+            "python3",
+            command_policy_mod.SKILL_RUNTIME_EXEC_REL,
+            "--command-id",
+            "repair_action.apply",
+            "--issue-number",
+            "2199",
+            "--repo",
+            command_policy_mod.TRUSTED_REPO_SLUG,
+            "--apply-repair-action",
+            dedicated_relative,
+        ]
+    )
+    parsed = command_policy_mod.parse_exact_skill_runtime_repair_action_apply_command(command_text, str(local))
+    assert parsed is not None
+    assert parsed.preflight_result_path == dedicated_relative
+
+
+# ---------------------------------------------------------------------------
+# OWNER feedback (PR #2495 review) P1-3: human-context investigation evidence
+# resolves against the DEDICATED child's own cwd, not the PRIMARY root the
+# path was validated against.
+# ---------------------------------------------------------------------------
+
+
+def _build_investigation_evidence_manifest(
+    *, issue_number: int, repo: str, anchor_url: str, base_body: str, git_head_sha: str, path_literals: list[str]
+) -> dict:
+    payload = [
+        {
+            "comment_url": anchor_url,
+            "body_sha256": rrp._sha256(base_body),
+            "source_kind": "generated_by_agent",
+            "path_literals": list(path_literals),
+        }
+    ]
+    return {
+        "schema_version": rrp.AUTHORITY_TRANSPORT_SCHEMA_VERSION,
+        "invocation_id": "test-invocation",
+        "issue_number": issue_number,
+        "repo": repo,
+        "git_head_sha": git_head_sha,
+        "generated_at": "2024-01-01T00:00:00Z",
+        "canonicalization_id": "loop-protocol-json-c14n-v1",
+        "source_comment_id": 1,
+        "source_comment_url": anchor_url,
+        "source_issue_body_sha256": rrp._sha256(base_body),
+        "source_kind": "generated_by_agent",
+        "payload": payload,
+        "payload_sha256": rrp._sha256(rrp._canonical_json(payload)),
+    }
+
+
+def test_given_investigation_evidence_only_at_primary_when_child_cwd_is_dedicated_then_relative_confinement_misses_it_but_absolute_handoff_finds_it(
+    tmp_path, monkeypatch
+):
+    """Issue #2199 OWNER feedback P1-3: `_confine_artifact_path()` (inside
+    `run_refinement_preflight.py`'s real, unmodified
+    `_validate_investigation_evidence_transport()`) resolves a RELATIVE
+    path via `Path.resolve()`, which anchors to this PROCESS's actual
+    `os.getcwd()` -- independent of whatever `repo_root` value is passed
+    alongside it. A real dedicated child's cwd is always the #2197/#2199
+    dedicated worktree, so the SAME repo-relative transport-path string the
+    executor validated against PRIMARY silently misses the evidence file,
+    which is never duplicated into the dedicated worktree. The fix
+    (mirrored here, matching `run_preflight()`'s own new pre-join) is to
+    make the candidate path ABSOLUTE against the explicit primary-root
+    handoff BEFORE it ever reaches `_confine_artifact_path()`, which is
+    then cwd-independent."""
+    local, _origin, _url, oid = _init_remote_fixture(tmp_path)
+    dedicated_path = _add_dedicated_detached_worktree(local, oid)
+    issue_number = 2199
+    repo = "squne121/loop-protocol"
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/2199#issuecomment-1"
+    base_body = "issue body\n"
+    manifest = _build_investigation_evidence_manifest(
+        issue_number=issue_number,
+        repo=repo,
+        anchor_url=anchor_url,
+        base_body=base_body,
+        git_head_sha=oid,
+        path_literals=["src/example.py"],
+    )
+    evidence_dir = Path(local) / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    evidence_path = evidence_dir / "investigation_evidence_transport.json"
+    evidence_path.write_text(json.dumps(manifest))
+    relative_transport_path = os.path.relpath(evidence_path, local)
+
+    # Simulates the REAL dedicated child's actual cwd
+    # (`subprocess.run(cwd=execution_root, ...)`), unrelated to whatever
+    # `repo_root` value a caller passes.
+    monkeypatch.chdir(dedicated_path)
+
+    literals_bug, reason_bug = rrp._validate_investigation_evidence_transport(
+        relative_transport_path,
+        repo_root=Path(local),
+        issue_number=issue_number,
+        repo=repo,
+        anchor_url=anchor_url,
+        base_issue_body_sha256=rrp._sha256(base_body),
+        git_head_sha=oid,
+    )
+    assert literals_bug is None
+    # The relative path resolves under the DEDICATED cwd
+    # (`<dedicated_path>/<relative_transport_path>`), which is not under
+    # PRIMARY's own `.claude/artifacts/` boundary at all -- a stronger,
+    # more legible failure than a bare "missing file" would be.
+    assert reason_bug == "path_confinement_outside_artifact_root"
+
+    absolute_transport_path = Path(local) / relative_transport_path
+    literals_fixed, reason_fixed = rrp._validate_investigation_evidence_transport(
+        absolute_transport_path,
+        repo_root=Path(local),
+        issue_number=issue_number,
+        repo=repo,
+        anchor_url=anchor_url,
+        base_issue_body_sha256=rrp._sha256(base_body),
+        git_head_sha=oid,
+    )
+    assert reason_fixed is None
+    assert literals_fixed == ["src/example.py"]
+
+    assert not (
+        dedicated_path
+        / ".claude"
+        / "artifacts"
+        / "issue-refinement-loop"
+        / str(issue_number)
+        / "investigation_evidence_transport.json"
+    ).exists()
+
+
+_INVESTIGATION_EVIDENCE_PREFLIGHT_STUB = '''from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--issue-number", required=True)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--anchor-comment-url", required=False, default=None)
+    parser.add_argument("--human-context-comment-url", required=False, default=None)
+    parser.add_argument("--investigation-evidence-transport-path", required=False, default=None)
+    parser.add_argument("--investigation-evidence-primary-root", required=False, default=None)
+    args = parser.parse_args()
+
+    marker_path = os.environ.get("SKILL_RUNTIME_TEST_INNER_MARKER_PATH")
+    if marker_path and args.investigation_evidence_transport_path:
+        # Mirrors run_refinement_preflight.py's own Issue #2199 P1-3 fix:
+        # pre-join the relative transport path against the EXPLICIT
+        # primary-root handoff (falling back to this process's own cwd
+        # when absent), rather than relying on Path.resolve()'s implicit
+        # cwd anchoring.
+        root = (
+            Path(args.investigation_evidence_primary_root)
+            if args.investigation_evidence_primary_root
+            else Path.cwd()
+        )
+        transport_path = root / args.investigation_evidence_transport_path
+        marker = Path(marker_path)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "cwd": os.getcwd(),
+                    "primary_root_arg": args.investigation_evidence_primary_root,
+                    "transport_path_exists": transport_path.is_file(),
+                    "transport_path_content": (
+                        transport_path.read_text() if transport_path.is_file() else None
+                    ),
+                }
+            )
+        )
+    print('{"schema": "refinement_preflight_result/v1", "status": "ready"}')
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def test_given_main_wired_and_human_context_dispatched_when_evidence_only_at_primary_then_dedicated_child_consumes_primary_origin_evidence(
+    tmp_path, monkeypatch
+):
+    """Issue #2199 OWNER feedback P1-3 production-profile end-to-end proof:
+    `exec_mod.main()` itself (the REAL dispatch-selection path, real
+    registry, real `skill_runtime_command_policy.py` parser) dispatches
+    `preflight.run.with_human_context` to a real subprocess whose cwd is
+    the dedicated worktree, automatically deriving and forwarding
+    `--investigation-evidence-primary-root` (never caller-suppliable) --
+    and the dispatched child genuinely reads the evidence file that exists
+    ONLY at primary (never duplicated into the dedicated worktree)."""
+    inner_marker = tmp_path / "p1-3-inner.marker"
+    evidence_rel = ".claude/artifacts/issue-refinement-loop/1228/investigation_evidence_transport.json"
+    evidence_content = json.dumps({"marker": "primary-only-evidence"})
+    local, url = _init_main_dispatch_fixture(
+        tmp_path,
+        extra_written_files={
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py": (
+                _INVESTIGATION_EVIDENCE_PREFLIGHT_STUB
+            ),
+        },
+    )
+    monkeypatch.setattr(worktree_bootstrap_exec, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
+
+    execution_root = worktree_bootstrap_exec.fixed_control_plane_worktree_path(str(local))
+    evidence_path = local / evidence_rel
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text(evidence_content)
+    # The evidence file exists ONLY at primary -- written AFTER the fixture
+    # commit, as an untracked file never shared with the SEPARATE dedicated
+    # worktree checkout.
+    assert not (Path(execution_root) / evidence_rel).exists()
+
+    monkeypatch.chdir(local)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(local))
+    monkeypatch.setenv("SKILL_RUNTIME_TEST_INNER_MARKER_PATH", str(inner_marker))
+    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+
+    exit_code = exec_mod.main(
+        [
+            "--command-id",
+            "preflight.run.with_human_context",
+            "--issue-number",
+            "1228",
+            "--repo",
+            "squne121/loop-protocol",
+            "--anchor-comment-url",
+            "https://github.com/squne121/loop-protocol/issues/1228#issuecomment-1",
+            "--investigation-evidence-transport-path",
+            evidence_rel,
+        ]
+    )
+
+    assert exit_code == 0, inner_marker.read_text() if inner_marker.exists() else "no marker"
+    assert inner_marker.exists()
+    observed = json.loads(inner_marker.read_text(encoding="utf-8"))
+    assert os.path.realpath(observed["cwd"]) == os.path.realpath(execution_root)
+    assert os.path.realpath(observed["primary_root_arg"]) == os.path.realpath(str(local))
+    assert observed["transport_path_exists"] is True
+    assert json.loads(observed["transport_path_content"]) == {"marker": "primary-only-evidence"}
+    assert not (Path(execution_root) / evidence_rel).exists()
