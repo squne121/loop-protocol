@@ -650,6 +650,48 @@ def _path_contains_symlink_component(root: str, rel_path: str) -> bool:
     return False
 
 
+_ISSUE_ARTIFACT_ROOT_TEMPLATE = ".claude/artifacts/issue-refinement-loop/{issue_number}/"
+
+# Issue #2199 OWNER feedback P1-2 (PR #2495 review): the #2197/#2199 FIXED
+# dedicated control-plane preflight worktree's own repo-relative identity,
+# duplicated here (as a literal, rather than imported) from
+# `worktree_bootstrap_exec.py`'s `_CONTROL_PLANE_PREFLIGHT_LOCK_IDENTITY` /
+# `_FIXED_CONTROL_PLANE_WORKTREE_RELATIVE_PATH` to avoid introducing a
+# reverse import edge from this lower-level policy module toward
+# `worktree_bootstrap_exec.py` (which already imports FROM this module).
+# `tests/agent_ops/test_control_plane_worktree_bootstrap.py` pins both
+# literals equal so they cannot silently drift apart.
+_DEDICATED_CONTROL_PLANE_WORKTREE_REPO_RELATIVE = ".claude/worktrees/control-plane-preflight"
+
+
+def _issue_artifact_root_candidates(issue_number: str) -> list[str]:
+    """The structurally-legitimate producer-root prefixes a preflight-result
+    artifact path may carry (Issue #2199 OWNER feedback P1-2:
+    "dedicated preflight artifact が既存 repair consumer に渡らない").
+
+    - the PRIMARY-relative shape (unchanged): produced by any preflight
+      profile that still dispatches at the primary root (fixture profiles,
+      `contract_update.*`).
+    - the DEDICATED-worktree-relative shape: produced by the 4 production
+      preflight profiles, which (as of Issue #2199) always dispatch under
+      the fixed dedicated worktree -- itself an ORDINARY subdirectory
+      physically nested inside this SAME primary checkout on disk (a git
+      worktree is not a symlink or a separate filesystem/mount; only its
+      own `.git` is a redirect file), so a repo-relative path carrying
+      this extra fixed prefix segment still resolves correctly through the
+      existing repo-root-relative / FD-based secure-open machinery with NO
+      change to that machinery's own root parameter, and with NO silent
+      copy, no primary-side stale-artifact fallback, and no path rewrite
+      required of the caller: the caller only ever needs to express the
+      dedicated preflight's OWN reported absolute artifact path as a path
+      relative to the SAME primary root it already knows (ordinary
+      `os.path.relpath`), exactly as it would for any other repo-relative
+      CLI argument.
+    """
+    base = _ISSUE_ARTIFACT_ROOT_TEMPLATE.format(issue_number=issue_number)
+    return [base, f"{_DEDICATED_CONTROL_PLANE_WORKTREE_REPO_RELATIVE}/{base}"]
+
+
 def _is_safe_issue_artifact_path(path: str, root: str, issue_number: str) -> bool:
     """Require #2136 sibling inputs to stay under their bound artifact root.
 
@@ -659,8 +701,9 @@ def _is_safe_issue_artifact_path(path: str, root: str, issue_number: str) -> boo
     """
     if not _is_safe_repo_relative_fixture_path(path, root):
         return False
-    prefix = f".claude/artifacts/issue-refinement-loop/{issue_number}/"
-    if not path.replace("\\", "/").startswith(prefix):
+    normalized = path.replace("\\", "/")
+    prefix = next((p for p in _issue_artifact_root_candidates(issue_number) if normalized.startswith(p)), None)
+    if prefix is None:
         return False
     # Issue #2136 H1: reject before resolving `artifact_root`/`resolved` via
     # `realpath` -- a symlinked artifact-root prefix (or any intermediate
@@ -1584,6 +1627,30 @@ def _parse_exact_skill_runtime_anchor_command(
         investigation_evidence_transport_path = tokens[base_expected_length + 1]
         if not _is_safe_repo_relative_fixture_path(investigation_evidence_transport_path, root):
             return None
+    elif (
+        # Issue #2199 OWNER feedback P1-3: an OPTIONAL further two-token
+        # `--investigation-evidence-primary-root <primary-root-abs-path>`
+        # suffix, ONLY ever meaningful alongside the transport-path pair
+        # above (never on its own -- see command_registry.py's own
+        # `optional_flag_pair` semantics, which only ever renders this
+        # SECOND pair when the executor ALSO rendered the first). The value
+        # is not a repo-relative path (it names the primary root itself, to
+        # be used as an alternate confinement root by a child whose OWN cwd
+        # is the #2197/#2199 dedicated worktree) -- it is instead pinned
+        # EXACTLY to this parser's own already-verified `root`, so a
+        # tampered/forged value can never redirect confinement to an
+        # attacker-chosen alternate root.
+        allows_investigation_transport
+        and len(tokens) == base_expected_length + 4
+        and tokens[base_expected_length] == "--investigation-evidence-transport-path"
+        and tokens[base_expected_length + 2] == "--investigation-evidence-primary-root"
+    ):
+        investigation_evidence_transport_path = tokens[base_expected_length + 1]
+        investigation_evidence_primary_root = tokens[base_expected_length + 3]
+        if not _is_safe_repo_relative_fixture_path(investigation_evidence_transport_path, root):
+            return None
+        if os.path.realpath(investigation_evidence_primary_root) != root:
+            return None
     else:
         return None
     if lane_flag and (tokens[12] != lane_flag or tokens[13] != anchor_comment_url):
@@ -1925,6 +1992,14 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         # two-token suffix handling for this command_id only.
         "--investigation-evidence-transport-path",
         "{investigation_evidence_transport_path}",
+        # Issue #2199 OWNER feedback P1-3: a further optional trailing pair,
+        # ALSO dropped by `optional_flag_pair` when absent, and ALSO matched
+        # by `_parse_exact_skill_runtime_anchor_command()`'s own extended
+        # optional four-token suffix handling for this command_id only. See
+        # that parser's docstring for why the value is pinned to `root`
+        # rather than treated as a repo-relative path.
+        "--investigation-evidence-primary-root",
+        "{investigation_evidence_primary_root}",
     ],
     "preflight.run.with_agent_report": [
         "uv",
@@ -2092,6 +2167,12 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
         # #2086 P0 fix_delta (Blocker 1/2)
         "investigation_evidence_transport_path": {
+            "type": "path",
+            "required": False,
+            "optional_flag_pair": True,
+        },
+        # Issue #2199 OWNER feedback P1-3
+        "investigation_evidence_primary_root": {
             "type": "path",
             "required": False,
             "optional_flag_pair": True,

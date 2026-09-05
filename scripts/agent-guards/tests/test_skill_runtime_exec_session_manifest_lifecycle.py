@@ -71,7 +71,13 @@ def _make_repo(tmp_path: Path) -> Path:
     # A narrower fixture pattern hides the ignored-ancestor-folding bug that
     # only reproduces when Git collapses the *entire* `artifacts/` tree into
     # a single `!! artifacts/` status entry.
-    (repo / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\nartifacts/\n")
+    # Issue #2199: also ignore `.claude/worktrees/` (the fixed
+    # dedicated-worktree path, #2197) so
+    # `capture_primary_checkout_invariant_snapshot()`'s `git status` at
+    # `project_root` never sees it as untracked drift, and so this fixed
+    # worktree can itself be reused (not fail-closed as dirty) across the
+    # multiple dispatches several tests below make against the SAME repo.
+    (repo / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\nartifacts/\n.claude/worktrees/\n")
     (repo / "README.md").write_text("seed\n")
     _git("add", "README.md", ".gitignore", cwd=repo)
     _git("commit", "-q", "-m", "seed", cwd=repo)
@@ -283,17 +289,106 @@ process.exit(0)
 '''
 
 
+def _init_control_plane_origin(repo_root: Path, origin: Path) -> None:
+    """A real, local, deterministic ``file://`` bare remote (Issue #2199)
+    that Issue #2199's dedicated-worktree lifecycle (#2196/#2197/#2198) can
+    bind against with no real GitHub network access
+    (``network_required: false``)."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "push", "-q", str(origin), "HEAD:refs/heads/main"],
+        cwd=str(repo_root),
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    subprocess.run(
+        ["git", "--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def _execution_root(repo_root: Path) -> Path:
+    """The one fixed dedicated worktree path Issue #2199's wired `main()`
+    dispatches `preflight.run`'s child process under (mirrors
+    `worktree_bootstrap_exec.fixed_control_plane_worktree_path()`) -- this
+    fixture's own seed writes, peer-write races, and artifact-existence
+    assertions must target here, not `repo_root`, once the child's cwd is
+    the dedicated worktree."""
+    return repo_root / ".claude" / "worktrees" / "control-plane-preflight"
+
+
+def _wait_for_path(path: Path, timeout: float) -> bool:
+    """Poll (bounded, not a fixed sleep) for `path` to appear."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.02)
+    return path.exists()
+
+
+def _materialize_execution_root(repo: Path) -> Path:
+    """Issue #2199: `execution_root` only comes into existence once
+    `main()`'s dedicated-worktree bootstrap runs (inside a real
+    `_run_executor()` call). Several tests below need to seed
+    pre-existing content the child's own before-snapshot must observe (not
+    a genuinely-new mid-run write, which several of them are deliberately
+    NOT testing) -- this runs one throwaway, no-extra-env dispatch first
+    solely to materialize `execution_root` (a no-op fixture child, see
+    `main()`'s `_RUN_REFINEMENT_PREFLIGHT_PY` above), then returns it for
+    the caller to seed directly. Reused as-is (#2197 AC5) on the test's own
+    subsequent real dispatch, as long as `execution_root`'s own working
+    tree stays clean/git-ignored in between (`_make_repo`'s `artifacts/`
+    and `.claude/worktrees/` ignore entries)."""
+    execution_root = _execution_root(repo)
+    if not execution_root.exists():
+        warm_up = _run_executor(repo)
+        assert warm_up.returncode == 0, warm_up.stderr
+    assert execution_root.exists()
+    return execution_root
+
+
 def _install_lifecycle_fixture(repo_root: Path) -> None:
     source_root = REPO_ROOT
     for rel in (
         "scripts/agent-guards/skill_runtime_exec.py",
         "scripts/agent-guards/skill_runtime_command_policy.py",
+        "scripts/agent-guards/worktree_bootstrap_command_policy.py",
+        "scripts/agent-ops/worktree_bootstrap_exec.py",
+        "scripts/agent-ops/worktree_catalog.py",
         ".claude/hooks/session_manifest_debounce.mjs",
         ".claude/hooks/generate_session_manifest_from_hook.mjs",
     ):
         src = source_root / rel
         dest = repo_root / rel
         _write_text(dest, src.read_text())
+
+    # Issue #2199: `preflight.run` is now a production preflight profile
+    # `main()` dispatches under a dedicated worktree bound to a real
+    # remote's `accepted_oid` (#2197). Source-patch the copied
+    # `skill_runtime_exec.py`'s hardcoded canonical remote constant to this
+    # fixture's own local, deterministic bare remote -- never the real
+    # `https://github.com/...` production remote (`network_required: false`
+    # / `auth_required: false` per this Issue's Runtime Verification
+    # Applicability).
+    control_plane_origin_path = repo_root.parent / "control-plane-origin.git"
+    control_plane_remote_url = control_plane_origin_path.as_uri()
+    executor_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_exec.py"
+    executor_source = executor_path.read_text(encoding="utf-8")
+    default_remote_line = 'CONTROL_PLANE_CANONICAL_REMOTE_URL = f"https://github.com/{TRUSTED_REPO_SLUG}.git"'
+    assert default_remote_line in executor_source
+    fixture_remote_line = f"CONTROL_PLANE_CANONICAL_REMOTE_URL = {control_plane_remote_url!r}"
+    executor_path.write_text(executor_source.replace(default_remote_line, fixture_remote_line), encoding="utf-8")
 
     pin = _pinned_uv_version(source_root)
     _write_text(
@@ -308,24 +403,6 @@ dependencies = []
 required-version = "{pin}"
 managed = false
 ''',
-    )
-
-    _write_text(
-        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
-        """from __future__ import annotations
-
-class Deadline:
-    def subprocess_timeout(self, seconds: float) -> float:
-        return seconds
-
-
-def list_worktrees(project_root: str, deadline=None):
-    return []
-
-
-def select_issue_worktree(catalog, issue_number, root_realpath):
-    return None
-""",
     )
 
     _write_text(
@@ -403,6 +480,15 @@ def render_command(command_id: str, values: dict[str, object]) -> list[str]:
         _STUB_MANIFEST_PRODUCER_MJS,
     )
 
+    # Issue #2199: the dedicated worktree's child process actually runs FROM
+    # the dedicated worktree checked out at the remote's `accepted_oid` --
+    # everything the child needs must be part of a REAL commit this fixture
+    # pushes to its own local bare origin below, not merely present,
+    # uncommitted, in the outer working tree.
+    _git("add", "-A", cwd=repo_root)
+    _git("commit", "-q", "-m", "install skill runtime fixture", cwd=repo_root)
+    _init_control_plane_origin(repo_root, repo_root.parent / "control-plane-origin.git")
+
 
 def _run_executor(
     repo: Path, extra_env: dict[str, str] | None = None, issue_number: str = "1409"
@@ -429,8 +515,16 @@ def _run_executor(
     )
 
 
-def _write_after_delay(path: Path, content: str, delay_seconds: float) -> threading.Thread:
+def _write_after_delay(
+    path: Path, content: str, delay_seconds: float, *, wait_for: "Path | None" = None
+) -> threading.Thread:
     def _worker() -> None:
+        if wait_for is not None:
+            # Issue #2199: never race the dedicated worktree's own `git
+            # worktree add` bootstrap -- pre-creating `_execution_root(repo)`
+            # before that runs would make the fixed dedicated-worktree
+            # recovery fail-close as an unknown owner (#2197 AC5).
+            assert _wait_for_path(wait_for, timeout=30), f"{wait_for} never materialized"
         time.sleep(delay_seconds)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
@@ -521,18 +615,19 @@ def test_real_debounce_process_write_to_session_manifest_runtime_does_not_fail(t
     _require_node()
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
+    execution_root = _execution_root(repo)
     result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SESSION_MANIFEST_LIFECYCLE": "enabled"})
     assert result.returncode == 0, result.stderr
-    manifests_dir = repo / "artifacts" / "session-manifest-runtime" / "manifests"
+    manifests_dir = execution_root / "artifacts" / "session-manifest-runtime" / "manifests"
     assert any(manifests_dir.glob("private-agent-session-manifest-posttooluse-*.json")), (
         f"expected a real manifest file to have been written; dir contents: "
         f"{list(manifests_dir.iterdir()) if manifests_dir.exists() else '<missing>'}"
     )
-    events_dir = repo / "artifacts" / "session-manifest-runtime" / "events"
+    events_dir = execution_root / "artifacts" / "session-manifest-runtime" / "events"
     assert list(events_dir.glob("*.json")) == [], "event file was not removed after flush -- AC5 violated"
-    lock_path = repo / "artifacts" / "session-manifest-runtime" / "locks" / "worker.lock"
+    lock_path = execution_root / "artifacts" / "session-manifest-runtime" / "locks" / "worker.lock"
     assert not lock_path.exists(), "worker.lock still exists after flush -- AC5 violated"
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1409" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1409" / "preflight.json"
     assert artifact.exists()
 
 
@@ -544,17 +639,22 @@ def test_real_debounce_process_lock_rename_and_failed_rename_lifecycle(tmp_path:
     _require_node()
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
+    execution_root = _execution_root(repo)
 
     # Success path: lock create/remove, tmp create, atomic rename, event delete.
     ok_result = _run_executor(
         repo, {"SKILL_RUNTIME_TEST_SESSION_MANIFEST_LIFECYCLE": "enabled"}, issue_number="1409"
     )
     assert ok_result.returncode == 0, ok_result.stderr
-    manifests_dir = repo / "artifacts" / "session-manifest-runtime" / "manifests"
+    manifests_dir = execution_root / "artifacts" / "session-manifest-runtime" / "manifests"
     assert any(manifests_dir.glob("*.json"))
 
     # Failed-rename path: manifests/ made read-only mid-lifecycle so the real
     # atomic rename fails and the hook falls back to `${tmpPath}.failed`.
+    # Issue #2199: this SAME dedicated worktree is reused for this second
+    # dispatch (`artifacts/` is git-ignored, see `_make_repo`, so the first
+    # dispatch's leftover artifact state never makes `execution_root`'s own
+    # `git status` dirty for reuse).
     failed_result = _run_executor(
         repo,
         {"SKILL_RUNTIME_TEST_SESSION_MANIFEST_LIFECYCLE_FAILED_RENAME": "enabled"},
@@ -563,12 +663,12 @@ def test_real_debounce_process_lock_rename_and_failed_rename_lifecycle(tmp_path:
     assert failed_result.returncode == 0, (
         f"failed-rename lifecycle must not fail-close the executor: {failed_result.stderr}"
     )
-    tmp_dir = repo / "artifacts" / "session-manifest-runtime" / "tmp"
+    tmp_dir = execution_root / "artifacts" / "session-manifest-runtime" / "tmp"
     assert any(tmp_dir.glob("*.failed")), (
         f"expected a *.failed debris file after forced rename failure; tmp dir contents: "
         f"{list(tmp_dir.iterdir()) if tmp_dir.exists() else '<missing>'}"
     )
-    lock_path = repo / "artifacts" / "session-manifest-runtime" / "locks" / "worker.lock"
+    lock_path = execution_root / "artifacts" / "session-manifest-runtime" / "locks" / "worker.lock"
     assert not lock_path.exists()
 
 
@@ -588,20 +688,31 @@ def test_race_tolerant_stdlib_excludes_session_manifest_runtime_subtree(tmp_path
     _require_node()
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
+    execution_root = _execution_root(repo)
 
-    existing_path = repo / "artifacts" / "session-manifest-runtime" / "manifests" / "existing.json"
-    existing_path.parent.mkdir(parents=True, exist_ok=True)
-    existing_path.write_text('{"seed": true}')
+    # Issue #2199: `artifacts/session-manifest-runtime/**` is pruned from
+    # the before/after snapshot diff ENTIRELY (the whole race-tolerant
+    # subtree, `_race_tolerant_unattributable_roots`) regardless of whether
+    # a leaf path under it is new or pre-existing -- so, unlike several
+    # sibling tests below, this one does not need `_materialize_execution_
+    # root()`; the seed write below only needs to land before the delayed
+    # writer thread's own overwrite, which `wait_for=execution_root` (below)
+    # already guarantees without racing `main()`'s dedicated-worktree
+    # bootstrap.
+    existing_path = execution_root / "artifacts" / "session-manifest-runtime" / "manifests" / "existing.json"
 
-    new_path = repo / "artifacts" / "session-manifest-runtime" / "events" / "peer-new.json"
+    new_path = execution_root / "artifacts" / "session-manifest-runtime" / "events" / "peer-new.json"
 
     def _update_existing_after_delay() -> None:
+        assert _wait_for_path(execution_root, timeout=30), f"{execution_root} never materialized"
+        existing_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_path.write_text('{"seed": true}')
         time.sleep(0.2)
         existing_path.write_text('{"seed": true, "updated": true}')
 
     update_thread = threading.Thread(target=_update_existing_after_delay)
     update_thread.start()
-    new_thread = _write_after_delay(new_path, '{"peer": true}\n', delay_seconds=0.2)
+    new_thread = _write_after_delay(new_path, '{"peer": true}\n', delay_seconds=0.2, wait_for=execution_root)
     try:
         result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
     finally:
@@ -611,7 +722,7 @@ def test_race_tolerant_stdlib_excludes_session_manifest_runtime_subtree(tmp_path
     assert result.returncode == 0, result.stderr
     assert new_path.exists()
     assert json.loads(existing_path.read_text()) == {"seed": True, "updated": True}
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1409" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1409" / "preflight.json"
     assert artifact.exists()
 
 
@@ -662,15 +773,16 @@ def test_self_write_to_session_manifest_runtime_is_known_unsupported_in_stdlib_m
     for closing this gap."""
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
+    execution_root = _execution_root(repo)
     result = _run_executor(
         repo, {"SKILL_RUNTIME_TEST_SELF_WRITE_SESSION_MANIFEST_RUNTIME": "ignored"}
     )
     assert result.returncode == 0, result.stderr
     self_write_path = (
-        repo / "artifacts" / "session-manifest-runtime" / "manifests" / "self-write.json"
+        execution_root / "artifacts" / "session-manifest-runtime" / "manifests" / "self-write.json"
     )
     assert self_write_path.exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1409" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1409" / "preflight.json"
     assert artifact.exists()
 
 
@@ -694,10 +806,11 @@ def test_cold_start_peer_writes_only_race_tolerant_subtree_succeeds(tmp_path: Pa
     (Safety Claim: cold-start ignored-ancestor folding does not misfire)."""
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
-    assert not (repo / "artifacts").exists()
+    execution_root = _execution_root(repo)
+    assert not (execution_root / "artifacts").exists()
 
-    new_path = repo / "artifacts" / "session-manifest-runtime" / "events" / "peer-cold-start.json"
-    writer_thread = _write_after_delay(new_path, '{"peer": true}\n', delay_seconds=0.2)
+    new_path = execution_root / "artifacts" / "session-manifest-runtime" / "events" / "peer-cold-start.json"
+    writer_thread = _write_after_delay(new_path, '{"peer": true}\n', delay_seconds=0.2, wait_for=execution_root)
     try:
         result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
     finally:
@@ -705,7 +818,7 @@ def test_cold_start_peer_writes_only_race_tolerant_subtree_succeeds(tmp_path: Pa
 
     assert result.returncode == 0, result.stderr
     assert new_path.exists()
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1409" / "preflight.json"
+    artifact = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1409" / "preflight.json"
     assert artifact.exists()
 
 
@@ -718,27 +831,48 @@ def test_cold_start_peer_writes_subtree_and_unauthorized_sibling_fails(tmp_path:
     THEN skill_runtime_exec.py must fail-close with unauthorized_write_path
     pointing at the leaf path under `artifacts/unrelated/`, not the folded
     `artifacts/` ancestor (Safety Claim: expansion is precise, not a blanket
-    allow of the whole collapsed directory)."""
+    allow of the whole collapsed directory).
+
+    Issue #2199 (round 3): uses the deterministic go-file/ack-file barrier
+    (not a fixed `delay_seconds` race, see
+    `test_tracked_source_file_unauthorized_write_is_rejected` in
+    `test_skill_runtime_exec_pytest_cache.py` for the fixed-delay-under-load
+    rationale) -- under the heavier real-subprocess load this Issue's own
+    round 3 fixtures add to the full CI parallel suite, the previous fixed
+    `time.sleep(0.2)` + `SKILL_RUNTIME_TEST_SLEEP_SECONDS=0.6` writer
+    occasionally raced `main()`'s dedicated-worktree bootstrap unpredictably,
+    landing the peer write after the after-snapshot instead of during the
+    race window (a false PASS observed on live CI)."""
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
-    assert not (repo / "artifacts").exists()
+    execution_root = _execution_root(repo)
+    assert not (execution_root / "artifacts").exists()
 
-    subtree_path = repo / "artifacts" / "session-manifest-runtime" / "events" / "peer-cold-start.json"
-    unrelated_path = repo / "artifacts" / "unrelated" / "peer-cold-start.txt"
+    subtree_path = execution_root / "artifacts" / "session-manifest-runtime" / "events" / "peer-cold-start.json"
+    unrelated_path = execution_root / "artifacts" / "unrelated" / "peer-cold-start.txt"
+    go_file = tmp_path / "barrier-go-cold-start-sibling"
+    ack_file = tmp_path / "barrier-ack-cold-start-sibling"
 
     def _write_both() -> None:
-        time.sleep(0.2)
+        assert _wait_for_path(go_file, timeout=30), "barrier go-file never appeared"
         subtree_path.parent.mkdir(parents=True, exist_ok=True)
         subtree_path.write_text('{"peer": true}\n')
         unrelated_path.parent.mkdir(parents=True, exist_ok=True)
         unrelated_path.write_text("peer-unrelated\n")
+        ack_file.write_text("ack")
 
     writer_thread = threading.Thread(target=_write_both)
     writer_thread.start()
     try:
-        result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
+        result = _run_executor(
+            repo,
+            {
+                "SKILL_RUNTIME_TEST_BARRIER_GO_FILE": str(go_file),
+                "SKILL_RUNTIME_TEST_BARRIER_ACK_FILE": str(ack_file),
+            },
+        )
     finally:
-        writer_thread.join(timeout=5)
+        writer_thread.join(timeout=10)
 
     assert result.returncode == 2, result.stdout + result.stderr
     assert "reason_code=unauthorized_write_path" in result.stderr
@@ -753,11 +887,18 @@ def test_existing_artifacts_dir_hook_subtree_update_succeeds(tmp_path: Path) -> 
     THEN skill_runtime_exec.py must not fail with unauthorized_write_path."""
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
-    seed_path = repo / "artifacts" / "session-manifest-runtime" / "manifests" / "seed.json"
+    # Issue #2199: this test's GIVEN clause ("artifacts/ already exists,
+    # not cold start") is load-bearing for coverage (a pre-existing tracked
+    # `M ...` git-status entry vs. a cold-start folded `?? artifacts/`
+    # entry exercise different branches of `_expand_new_status_paths`) --
+    # materialize `execution_root` with a real dispatch first so the seed
+    # below genuinely predates the SECOND, real dispatch below.
+    execution_root = _materialize_execution_root(repo)
+    seed_path = execution_root / "artifacts" / "session-manifest-runtime" / "manifests" / "seed.json"
     seed_path.parent.mkdir(parents=True, exist_ok=True)
     seed_path.write_text('{"seed": true}')
 
-    new_path = repo / "artifacts" / "session-manifest-runtime" / "events" / "peer-existing.json"
+    new_path = execution_root / "artifacts" / "session-manifest-runtime" / "events" / "peer-existing.json"
 
     def _write_both() -> None:
         time.sleep(0.2)
@@ -804,13 +945,18 @@ def test_existing_artifacts_dir_unrelated_update_fails(tmp_path: Path) -> None:
     of system load."""
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
-    seed_path = repo / "artifacts" / "session-manifest-runtime" / "manifests" / "seed.json"
+    # Issue #2199: same rationale as `test_existing_artifacts_dir_hook_
+    # subtree_update_succeeds` above -- materialize `execution_root` with a
+    # real dispatch first so the seed genuinely predates the SECOND, real
+    # (barrier-synchronized) dispatch below.
+    execution_root = _materialize_execution_root(repo)
+    seed_path = execution_root / "artifacts" / "session-manifest-runtime" / "manifests" / "seed.json"
     seed_path.parent.mkdir(parents=True, exist_ok=True)
     seed_path.write_text('{"seed": true}')
 
     go_file = tmp_path / "barrier-go-unrelated"
     ack_file = tmp_path / "barrier-ack-unrelated"
-    unrelated_path = repo / "artifacts" / "unrelated" / "peer-existing.txt"
+    unrelated_path = execution_root / "artifacts" / "unrelated" / "peer-existing.txt"
 
     writer = _spawn_independent_writer_process(
         repo, go_file, ack_file, unrelated_path, "peer-unrelated\n"
@@ -854,7 +1000,7 @@ def test_artifacts_as_symlink_created_mid_run_fails_closed(tmp_path: Path) -> No
     and expanded/allowed)."""
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
-    assert not (repo / "artifacts").exists()
+    assert not (_execution_root(repo) / "artifacts").exists()
     symlink_target = tmp_path / "artifacts-symlink-target"
 
     result = _run_executor(
@@ -878,7 +1024,7 @@ def test_artifacts_as_file_created_mid_run_fails_closed(tmp_path: Path) -> None:
     directory and expanded/allowed)."""
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
-    assert not (repo / "artifacts").exists()
+    assert not (_execution_root(repo) / "artifacts").exists()
 
     result = _run_executor(repo, {"SKILL_RUNTIME_TEST_CREATE_ARTIFACTS_FILE": "enabled"})
     assert result.returncode == 2, result.stdout + result.stderr
@@ -905,7 +1051,7 @@ def test_independent_writer_process_with_explicit_barrier_succeeds(tmp_path: Pat
 
     go_file = tmp_path / "barrier-go"
     ack_file = tmp_path / "barrier-ack"
-    target_path = repo / "artifacts" / "session-manifest-runtime" / "events" / "independent-peer.json"
+    target_path = _execution_root(repo) / "artifacts" / "session-manifest-runtime" / "events" / "independent-peer.json"
 
     writer = _spawn_independent_writer_process(
         repo, go_file, ack_file, target_path, '{"independent_peer": true}'
@@ -949,23 +1095,29 @@ def test_legacy_runtime_state_present_does_not_deadlock_or_duplicate(tmp_path: P
     _require_node()
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
+    # Issue #2199: none of these legacy paths are in the race-tolerant
+    # exempted class (only `artifacts/session-manifest-runtime/**` is) --
+    # they must genuinely predate the real dispatch's before-snapshot
+    # (materialized via a real throwaway dispatch first) or their mere
+    # presence would itself be misreported as an unauthorized new write.
+    execution_root = _materialize_execution_root(repo)
 
-    legacy_debounce_events = repo / "artifacts" / "session-manifest-debounce" / "events"
+    legacy_debounce_events = execution_root / "artifacts" / "session-manifest-debounce" / "events"
     legacy_debounce_events.mkdir(parents=True, exist_ok=True)
     (legacy_debounce_events / "stale-event.json").write_text("{}")
-    (repo / "artifacts" / "session-manifest-debounce" / "worker.lock").write_text(
+    (execution_root / "artifacts" / "session-manifest-debounce" / "worker.lock").write_text(
         json.dumps({"owner_pid": 999999, "role": "worker", "started_at_ms": 1, "heartbeat_at_ms": 1})
     )
-    (repo / "artifacts" / ".lock-legacy").write_text("legacy-lock")
-    (repo / "artifacts" / ".tmp-legacy").write_text("legacy-tmp")
-    (repo / "artifacts" / "private-agent-session-manifest-legacy.json").write_text("{}")
+    (execution_root / "artifacts" / ".lock-legacy").write_text("legacy-lock")
+    (execution_root / "artifacts" / ".tmp-legacy").write_text("legacy-tmp")
+    (execution_root / "artifacts" / "private-agent-session-manifest-legacy.json").write_text("{}")
 
     result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SESSION_MANIFEST_LIFECYCLE": "enabled"})
     assert result.returncode == 0, result.stderr
-    manifests_dir = repo / "artifacts" / "session-manifest-runtime" / "manifests"
+    manifests_dir = execution_root / "artifacts" / "session-manifest-runtime" / "manifests"
     assert any(manifests_dir.glob("private-agent-session-manifest-posttooluse-*.json")), (
         "expected a new-subtree manifest even with legacy state present"
     )
     # Legacy state must be left untouched (hard cutover -- no migration).
-    assert (repo / "artifacts" / "session-manifest-debounce" / "worker.lock").exists()
-    assert (repo / "artifacts" / ".lock-legacy").exists()
+    assert (execution_root / "artifacts" / "session-manifest-debounce" / "worker.lock").exists()
+    assert (execution_root / "artifacts" / ".lock-legacy").exists()

@@ -1216,3 +1216,43 @@ def test_hooks_directory_is_removed_and_git_status_remains_clean(tmp_path):
         ["git", "status", "--porcelain"], cwd=local, text=True, check=True, capture_output=True
     )
     assert not status.stdout
+
+
+# ---------------------------------------------------------------------------
+# Issue #2199 AC2/AC10/AC12: minimal typed seam extension exposing
+# `locked`/`prunable` porcelain fields for the dedicated-lane identity probe.
+# ---------------------------------------------------------------------------
+
+
+def test_list_worktrees_porcelain_locked_prunable_reports_the_primary_worktree(tmp_path):
+    local, _url, _oid = _init_remote_fixture(tmp_path)
+    raw = exec_mod.run_control_plane_git_list_worktrees_porcelain_locked_prunable(
+        cwd=str(local), project_root=str(local), deadline=_deadline()
+    )
+    assert f"worktree {local}" in raw or f"worktree {os.path.realpath(local)}" in raw
+    assert "\0" in raw
+
+
+def test_list_worktrees_porcelain_locked_prunable_uses_no_optional_locks_and_z_form(tmp_path, monkeypatch):
+    local, _url, _oid = _init_remote_fixture(tmp_path)
+    captured: list[list[str]] = []
+    real_run = exec_mod._run_closed_git_process
+
+    def spy_run(operation, **kwargs):
+        argv = exec_mod._exact_git_argv(
+            operation,
+            git_executable=exec_mod.resolve_git_subprocess_executable(str(local)),
+            cwd=str(local),
+            hooks_dir=str(tmp_path / "hooks"),
+        )
+        captured.append(argv)
+        return real_run(operation, **kwargs)
+
+    monkeypatch.setattr(exec_mod, "_run_closed_git_process", spy_run)
+    exec_mod.run_control_plane_git_list_worktrees_porcelain_locked_prunable(
+        cwd=str(local), project_root=str(local), deadline=_deadline()
+    )
+    assert captured
+    argv = captured[0]
+    assert "--no-optional-locks" in argv
+    assert argv[-4:] == ["worktree", "list", "--porcelain", "-z"]
