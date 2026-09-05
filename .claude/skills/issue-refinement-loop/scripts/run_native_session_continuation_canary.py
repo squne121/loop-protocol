@@ -855,14 +855,11 @@ def main(argv: list[str] | None = None) -> int:
     # retry) always resumes the SAME authoritative claude_code_session_id
     # (observed_id_1) obtained from the initial launch -- no new/synthetic
     # session id is ever created for a retry.
-    resume_record, resume_out, resume_err, resume_timed_out = launch(
-        "resume",
-        "What reference token did I mention earlier in this conversation? "
-        "Respond with exactly that token and nothing else. Do not use any tools.",
-        resume_session_id=observed_id_1,
-    )
-    evidence["same_continuation_launch"] = resume_record
-    resume_attempts_evidence: list[dict[str, Any]] = [dict(resume_record)]
+    resume_record: dict[str, Any] | None = None
+    resume_out = ""
+    resume_err = ""
+    resume_timed_out = False
+    resume_attempts_evidence: list[dict[str, Any]] = []
 
     def _check_resume_attempt_or_raise(record: dict, out: str, err: str, *, retry: bool) -> None:
         label = "resume launch (retry)" if retry else "resume launch"
@@ -881,33 +878,49 @@ def main(argv: list[str] | None = None) -> int:
                 1, "FAIL", error_message=f"{label} argv contract violation: {record['argv_contract_detail']}"
             )
 
-    _check_resume_attempt_or_raise(resume_record, resume_out, resume_err, retry=False)
-
     _resume_observation_count = 0
 
     def _observe_resume() -> tuple[int, bool, str, str]:
+        # Issue #2050 OWNER review P1-a / P2 fix-delta: the initial resume
+        # attempt and any bounded retry attempt are unified through this
+        # SAME observation path -- there is no more special-cased "check the
+        # initial resume attempt before entering the
+        # judge_phase_with_bounded_retry()-protected try/except
+        # _ResumeRetryHardStop scope" structure. Every attempt (first or
+        # retry) is (1) launched, (2) recorded/held as the current
+        # authoritative attempt, THEN (3) structurally checked -- in that
+        # fixed order, for every outcome (success, FAIL, SKIP) consistently.
+        # This means: (P1-a) a structural failure on the very FIRST resume
+        # attempt now reaches the exact same ``_ResumeRetryHardStop``
+        # exception handling as a retry attempt's structural failure (it can
+        # no longer propagate as an uncaught exception, bypassing
+        # ``finish()``); and (P2) if the structural check raises, the
+        # evidence has already been updated with THIS attempt's own
+        # exit_code/timed_out/diagnostic fields (never a stale earlier
+        # attempt's).
         nonlocal resume_record, resume_out, resume_err, resume_timed_out, _resume_observation_count
         _resume_observation_count += 1
-        if _resume_observation_count == 1:
-            # First observation: reuse the attempt already launched above
-            # (do not launch a second time just to obtain the first sample).
-            return resume_record["exit_code"], resume_timed_out, resume_out, resume_err
-        # Bounded retry attempt: relaunch the resume phase, reusing the SAME
-        # observed_id_1 (never a new/synthetic session id).
         record, out, err, timed_out = launch(
             "resume",
             "What reference token did I mention earlier in this conversation? "
             "Respond with exactly that token and nothing else. Do not use any tools.",
             resume_session_id=observed_id_1,
         )
-        _check_resume_attempt_or_raise(record, out, err, retry=True)
         resume_record, resume_out, resume_err, resume_timed_out = record, out, err, timed_out
         resume_attempts_evidence.append(dict(record))
+        _check_resume_attempt_or_raise(record, out, err, retry=_resume_observation_count > 1)
         return record["exit_code"], timed_out, out, err
 
     try:
         verdict, reason, _retry_attempts = judge_phase_with_bounded_retry(_observe_resume)
     except _ResumeRetryHardStop as hard_stop:
+        # (P1-a) reach the same finish() contract as every other return path:
+        # write evidence.json (with the actual failing attempt's fields, not
+        # a stale earlier attempt's -- P2) and return via finish(), instead
+        # of letting the exception propagate uncaught.
+        evidence["same_continuation_launch"] = resume_record
+        if len(resume_attempts_evidence) > 1:
+            evidence["same_continuation_launch"]["bounded_retry_stale_attempts"] = resume_attempts_evidence[:-1]
         if hard_stop.skip_reason is not None:
             return finish(77, "SKIP", skip_reason=hard_stop.skip_reason)
         evidence["errors"].append(hard_stop.error_message)

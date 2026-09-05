@@ -39,17 +39,23 @@ EVIDENCE_ROOT = REPO_ROOT / "artifacts" / "native-session-continuation-canary"
 # The outer subprocess timeout must be a generous multiple of the actual
 # number of timed operations the runner performs for the given adapter, so a
 # genuine per-launch bound (not this outer one) is what fires first (Issue
-# #2153 OWNER review P1 fix-delta). The native lane performs 3 timed
-# launches (initial/resume/fresh); the claude-gpt lane performs 4 (an extra
-# ``--check-only`` preflight probe before the same 3 launches) -- an outer
-# timeout computed only for 3 launches on the claude-gpt lane could fire
-# BEFORE the runner's own process-group cleanup/evidence-write completes.
+# #2153 OWNER review P1 fix-delta). The native lane performs up to 4 timed
+# launches (initial/resume/resume-retry/fresh -- Issue #2050 added one bounded
+# resume retry launch on top of the original 3); the claude-gpt lane performs
+# up to 5 (an extra ``--check-only`` preflight probe before the same 4) -- an
+# outer timeout computed without accounting for the added retry launch could
+# fire BEFORE the runner's own process-group cleanup/evidence-write
+# completes.
 _PER_LAUNCH_TIMEOUT_SECONDS = 180.0
 _MAX_TURNS = 3
 
 
 def _outer_runner_timeout_seconds(adapter: str) -> int:
-    launch_count = 4 if adapter == "claude-gpt" else 3
+    # Issue #2050 OWNER review P1-b fix-delta: launch_count now includes the
+    # resume phase's bounded retry launch (Issue #2050) in addition to the
+    # original initial/resume/fresh launches (and, for claude-gpt, the
+    # ``--check-only`` preflight probe): native = 4, claude-gpt = 5.
+    launch_count = 5 if adapter == "claude-gpt" else 4
     return int(_PER_LAUNCH_TIMEOUT_SECONDS * launch_count + 120)
 
 _UUID_RE = re.compile(
@@ -617,11 +623,15 @@ def test_resume_call_site_uses_bounded_retry_wrapper_not_initial_or_fresh(monkey
 
     def fake_run(argv, *, cwd=None, timeout=None, input_text=None, env=None):
         # _run()'s real return order is (returncode, stdout, stderr, timed_out).
+        # On a real timeout, the actual scripts/agent-ops/run_worktree_agent_
+        # runtime_smoke.py _run() returns returncode=None (not 0) -- matched
+        # here exactly (Issue #2050 OWNER review fix-delta note on
+        # timeout-simulating fixtures).
         if "--resume" in argv:
             resume_attempts["n"] += 1
             if resume_attempts["n"] == 1:
                 # Transient wait-timeout observation on the FIRST resume attempt.
-                return 0, "", "", True
+                return None, "", "", True
             return 0, "SESSION_A TERMINAL_OK", "", False
         if "--tools" in argv:
             return 0, "SESSION_A TERMINAL_OK", "", False
@@ -666,6 +676,238 @@ def test_resume_call_site_uses_bounded_retry_wrapper_not_initial_or_fresh(monkey
     stale_attempts = evidence["same_continuation_launch"]["bounded_retry_stale_attempts"]
     assert len(stale_attempts) == 1
     assert stale_attempts[0]["timed_out"] is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #2050 OWNER review fix-delta P1-a / P2 regression coverage: an
+# initial (first-attempt, non-timeout) resume structural failure must reach
+# the same finish() contract as every other return path (P1-a -- it must
+# never propagate as an uncaught exception), and when a bounded RETRY
+# attempt is itself a structural failure, the evidence must reflect that
+# retry attempt's own exit_code/timed_out/diagnostic fields, never a stale
+# earlier attempt's (P2). All three tests below drive the ACTUAL production
+# main() end-to-end (same I/O-boundary-mock style as
+# test_resume_call_site_uses_bounded_retry_wrapper_not_initial_or_fresh
+# above) so the real control-flow/exception-handling wiring is exercised,
+# not just judge_phase_with_bounded_retry() in isolation.
+# ---------------------------------------------------------------------------
+
+
+def _install_common_main_mocks(module, monkeypatch, tmp_path):
+    """Shared non-launch I/O-boundary mocks for an end-to-end module.main()
+    test. Callers still monkeypatch module._run themselves (the one mock
+    that actually differs per test)."""
+    monkeypatch.setattr(module, "_install_signal_handlers", lambda: None)
+    monkeypatch.setattr(module, "_default_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(module, "verify_worktree_identity", lambda worktree_arg, repo_root: worktree_arg)
+    monkeypatch.setattr(module, "prepare_output_dir", lambda output_dir: None)
+    monkeypatch.setattr(module, "preflight_claude_available", lambda claude_bin: ("fake-claude-bin", None))
+    monkeypatch.setattr(module, "extract_claude_resolved_executable_sha256", lambda resolved_bin: "fakehash")
+    monkeypatch.setattr(
+        module,
+        "classify_claude_structured_outcome",
+        lambda exit_code, stdout, stderr, timed_out: ("ok", None),
+    )
+    monkeypatch.setattr(
+        module,
+        "is_terminal_success",
+        lambda stdout: (True, None) if "TERMINAL_OK" in stdout else (False, "not terminal"),
+    )
+    monkeypatch.setattr(module, "marker_recalled", lambda stdout, marker: True)
+
+    def fake_extract_parent_session_id(stdout: str) -> str | None:
+        if "SESSION_A" in stdout:
+            return "session-a"
+        if "SESSION_C" in stdout:
+            return "session-c"
+        return None
+
+    monkeypatch.setattr(module, "extract_claude_parent_session_id", fake_extract_parent_session_id)
+
+
+def test_resume_first_attempt_launcher_unavailable_reaches_skip_via_finish(monkeypatch, tmp_path):
+    """Regression test 1: a launcher-unavailable receipt on the FIRST
+    (non-retry) resume attempt must reach exit 77/SKIP via finish() -- with
+    evidence.json actually written -- instead of an uncaught
+    _ResumeRetryHardStop exception (Issue #2050 OWNER review P1-a)."""
+    module = _load_canary_module()
+    _install_common_main_mocks(module, monkeypatch, tmp_path)
+
+    resume_attempts = {"n": 0}
+
+    def fake_run(argv, *, cwd=None, timeout=None, input_text=None, env=None):
+        if "--check-only" in argv:
+            # claude-gpt preflight passes cleanly; the SKIP under test comes
+            # from the FIRST resume launch's own launcher receipt, not the
+            # preflight probe.
+            return 0, json.dumps(
+                {"schema": "CLAUDE_GPT_LAUNCH_RESULT_V1", "status": "ok", "model_alias_ok": True}
+            ), "", False
+        if "--resume" in argv:
+            resume_attempts["n"] += 1
+            receipt = {
+                "schema": "CLAUDE_GPT_LAUNCH_RESULT_V1",
+                "status": "blocked",
+                "reason": "claude_binary_not_found",
+            }
+            return 3, json.dumps(receipt), "", False
+        if "--tools" in argv:
+            return 0, "SESSION_A TERMINAL_OK", "", False
+        return 0, "SESSION_C TERMINAL_OK", "", False
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    output_dir = tmp_path / "evidence"
+    exit_code = module.main(
+        [
+            "--worktree", str(tmp_path),
+            "--claude-adapter", "claude-gpt",
+            "--claude-bin", "/fake/launch.sh",
+            "--output-dir", str(output_dir),
+            "--timeout-seconds", "5",
+        ]
+    )
+
+    evidence_path = output_dir / "evidence.json"
+    assert evidence_path.is_file(), "evidence.json must be written even for a first-attempt structural SKIP"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert exit_code == 77
+    assert evidence["verdict"] == "SKIP"
+    assert resume_attempts["n"] == 1, "no additional retry must be attempted for a non-timeout structural failure"
+    assert evidence["same_continuation_launch"]["exit_code"] == 3
+    assert "bounded_retry_stale_attempts" not in evidence["same_continuation_launch"]
+
+
+def test_resume_first_attempt_argv_contract_violation_reaches_fail_via_finish(monkeypatch, tmp_path):
+    """Regression test 2: an argv-contract violation on the FIRST resume
+    attempt must reach a reasoned FAIL (exit 1) via finish() -- with
+    evidence.json actually written, and no additional retry attempted."""
+    module = _load_canary_module()
+    _install_common_main_mocks(module, monkeypatch, tmp_path)
+
+    original_verify_argv_contract = module.verify_argv_contract
+
+    def spy_verify_argv_contract(argv, phase, *, resume_session_id=None):
+        if phase == "resume":
+            return False, "forced argv contract violation for test"
+        return original_verify_argv_contract(argv, phase, resume_session_id=resume_session_id)
+
+    monkeypatch.setattr(module, "verify_argv_contract", spy_verify_argv_contract)
+
+    resume_attempts = {"n": 0}
+
+    def fake_run(argv, *, cwd=None, timeout=None, input_text=None, env=None):
+        if "--resume" in argv:
+            resume_attempts["n"] += 1
+            return 0, "SESSION_A TERMINAL_OK", "", False
+        if "--tools" in argv:
+            return 0, "SESSION_A TERMINAL_OK", "", False
+        return 0, "SESSION_C TERMINAL_OK", "", False
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    output_dir = tmp_path / "evidence"
+    exit_code = module.main(
+        [
+            "--worktree", str(tmp_path),
+            "--claude-adapter", "native",
+            "--output-dir", str(output_dir),
+            "--timeout-seconds", "5",
+        ]
+    )
+
+    evidence_path = output_dir / "evidence.json"
+    assert evidence_path.is_file(), "evidence.json must be written even for a first-attempt argv-contract FAIL"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert evidence["verdict"] == "FAIL"
+    assert resume_attempts["n"] == 1, "no additional retry must be attempted for a non-timeout structural failure"
+    assert any("argv contract violation" in e for e in evidence["errors"])
+
+
+def test_resume_retry_attempt_structural_failure_evidence_reflects_retry_not_stale(monkeypatch, tmp_path):
+    """Regression test 4: when the FIRST resume attempt times out and the
+    bounded RETRY attempt is itself a structural failure (here: a
+    launcher-unavailable receipt), the final evidence's
+    ``same_continuation_launch`` must reflect the RETRY attempt's own
+    exit_code/timed_out fields -- never the stale first (timed-out)
+    attempt's (Issue #2050 OWNER review P2). The stale first attempt is
+    still preserved separately under ``bounded_retry_stale_attempts``."""
+    module = _load_canary_module()
+    _install_common_main_mocks(module, monkeypatch, tmp_path)
+
+    resume_attempts = {"n": 0}
+
+    def fake_run(argv, *, cwd=None, timeout=None, input_text=None, env=None):
+        if "--check-only" in argv:
+            return 0, json.dumps(
+                {"schema": "CLAUDE_GPT_LAUNCH_RESULT_V1", "status": "ok", "model_alias_ok": True}
+            ), "", False
+        if "--resume" in argv:
+            resume_attempts["n"] += 1
+            if resume_attempts["n"] == 1:
+                # _run()'s real timeout return: returncode=None (Issue #2050
+                # OWNER review fix-delta note on timeout-simulating fixtures).
+                return None, "", "", True
+            receipt = {
+                "schema": "CLAUDE_GPT_LAUNCH_RESULT_V1",
+                "status": "blocked",
+                "reason": "claude_binary_not_found",
+            }
+            return 3, json.dumps(receipt), "", False
+        if "--tools" in argv:
+            return 0, "SESSION_A TERMINAL_OK", "", False
+        return 0, "SESSION_C TERMINAL_OK", "", False
+
+    monkeypatch.setattr(module, "_run", fake_run)
+
+    output_dir = tmp_path / "evidence"
+    exit_code = module.main(
+        [
+            "--worktree", str(tmp_path),
+            "--claude-adapter", "claude-gpt",
+            "--claude-bin", "/fake/launch.sh",
+            "--output-dir", str(output_dir),
+            "--timeout-seconds", "5",
+        ]
+    )
+
+    evidence_path = output_dir / "evidence.json"
+    assert evidence_path.is_file()
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert exit_code == 77
+    assert evidence["verdict"] == "SKIP"
+    assert resume_attempts["n"] == 2, "exactly one bounded retry must have been attempted"
+
+    authoritative = evidence["same_continuation_launch"]
+    assert authoritative["timed_out"] is False, "authoritative record must be the retry's, not the stale timeout"
+    assert authoritative["exit_code"] == 3, "authoritative record must carry the retry attempt's own exit_code"
+
+    stale_attempts = authoritative["bounded_retry_stale_attempts"]
+    assert len(stale_attempts) == 1
+    assert stale_attempts[0]["timed_out"] is True
+    assert stale_attempts[0]["exit_code"] is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2050 OWNER review P1-b fix-delta: outer timeout budget arithmetic
+# (defined in this test file, not the runner) must include the added bounded
+# resume-retry launch, and remain strictly greater than the sum of per-launch
+# timeouts for the max number of launches for that adapter.
+# ---------------------------------------------------------------------------
+
+
+def test_outer_runner_timeout_seconds_native_includes_retry_launch():
+    # native: initial + resume + resume-retry + fresh = 4 launches.
+    assert _outer_runner_timeout_seconds("native") == 840
+    assert _outer_runner_timeout_seconds("native") > _PER_LAUNCH_TIMEOUT_SECONDS * 4
+
+
+def test_outer_runner_timeout_seconds_claude_gpt_includes_retry_launch():
+    # claude-gpt: preflight-inclusive max 5 processing slots (--check-only +
+    # initial + resume + resume-retry + fresh).
+    assert _outer_runner_timeout_seconds("claude-gpt") == 1020
+    assert _outer_runner_timeout_seconds("claude-gpt") > _PER_LAUNCH_TIMEOUT_SECONDS * 5
 
 
 # ---------------------------------------------------------------------------
