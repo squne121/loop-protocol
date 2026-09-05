@@ -1411,22 +1411,42 @@ def test_verify_exact_runner_image_accepts_well_formed_value():
     assert collector.verify_exact_runner_image(_image()) == []
 
 
-def test_extract_exact_runner_image_from_job_log_parses_set_up_job_section():
-    """GIVEN a realistic `Set up job` log excerpt WHEN parsed THEN name and
-    version are extracted (Issue #2422 AC4)."""
-    log_text = (
+def _real_set_up_job_log_excerpt(version: str = "20260901.1.0") -> str:
+    """Issue #2422 AC8 fix_delta (live smoke dispatch verification against
+    real `gh api repos/{repo}/actions/jobs/{id}/logs` output, PR #2501):
+    reproduces the ACTUAL GitHub-hosted runner job log shape (confirmed
+    against 6 real job logs from the `blocks=2` AC8 smoke dispatch, e.g.
+    workflow_job_id=101248519729) -- a `##[group]Runner Image Provisioner`
+    section with its OWN decoy `Version:` line (the Hosted Compute Agent's
+    version, never the runner image version) precedes the real
+    `##[group]Runner Image` section, whose bare `Version:` line (never
+    `Image Version:`, which does not occur in a real log) is the genuine
+    runner image version this module must extract."""
+    return (
         "Current runner version: '2.330.0'\n"
-        "Runner Image Provisioner\n"
+        "##[group]Runner Image Provisioner\n"
+        "Hosted Compute Agent\n"
+        "Version: 20260828.587\n"
+        "##[endgroup]\n"
+        "##[group]Runner Image\n"
         "Image: ubuntu-24.04\n"
-        "Image Version: 20260901.1.0\n"
-        "Included Software\n"
+        f"Version: {version}\n"
+        "Included Software: https://github.com/actions/runner-images/blob/ubuntu24/example/Ubuntu2404-Readme.md\n"
+        "##[endgroup]\n"
     )
-    assert collector.extract_exact_runner_image_from_job_log(log_text) == _image()
+
+
+def test_extract_exact_runner_image_from_job_log_parses_set_up_job_section():
+    """GIVEN a realistic `Set up job` log excerpt (including the decoy
+    `Runner Image Provisioner` section's OWN `Version:` line) WHEN parsed
+    THEN name and version are extracted from the REAL `Runner Image` group
+    only -- never the Provisioner's decoy version (Issue #2422 AC4/AC8)."""
+    assert collector.extract_exact_runner_image_from_job_log(_real_set_up_job_log_excerpt()) == _image()
 
 
 def test_extract_exact_runner_image_from_job_log_returns_none_when_absent():
-    """GIVEN a log with no Image/Image Version lines (e.g. a containerized
-    job) WHEN parsed THEN None is returned -- never a synthesized fallback
+    """GIVEN a log with no Image/Version lines (e.g. a containerized job)
+    WHEN parsed THEN None is returned -- never a synthesized fallback
     (Issue #2422 AC4)."""
     assert collector.extract_exact_runner_image_from_job_log("no relevant lines here\n") is None
 
@@ -1445,7 +1465,7 @@ def test_fetch_exact_runner_image_for_job_raises_when_log_lacks_set_up_job_secti
 
 def test_fetch_exact_runner_image_for_job_returns_parsed_image_on_success():
     def fake_log_fetch(workflow_job_id: int, repo: str) -> str:
-        return "Image: ubuntu-24.04\nImage Version: 20260901.1.0\n"
+        return _real_set_up_job_log_excerpt()
 
     assert collector.fetch_exact_runner_image_for_job(123, "squne121/loop-protocol", fake_log_fetch) == _image()
 

@@ -1290,24 +1290,58 @@ def verify_exact_runner_image(image: object) -> list[str]:
     return violations
 
 
+# #2422 AC8 fix_delta (live smoke dispatch verification against real
+# `gh api repos/{repo}/actions/jobs/{id}/logs` output, PR #2501): the
+# pre-fix_delta regexes below were modeled on a HYPOTHETICAL `Image
+# Version:` line that does not exist in a real GitHub-hosted runner job
+# log's `##[group]Runner Image ... ##[endgroup]` section -- the ACTUAL
+# format is a separate bare `Version:` line immediately following `Image:`
+# (confirmed against 6 real job logs from the `blocks=2` AC8 smoke dispatch,
+# e.g. workflow_job_id=101248519729). A blind `^Version:` search (without
+# scoping to the `Runner Image` group) would silently pick up the WRONG
+# `Version:` line -- the log ALSO carries an earlier, unrelated
+# `##[group]Runner Image Provisioner` section with its own `Version:` line
+# (the Hosted Compute Agent's own version, e.g. `20260828.587`) BEFORE the
+# real `##[group]Runner Image` section (whose `Version:` line, e.g.
+# `20260831.293.1`, is the genuine runner-image version). `_RUNNER_IMAGE_GROUP_RE`
+# isolates ONLY the real `##[group]Runner Image` body (never `...
+# Provisioner`, disambiguated by requiring the literal `Runner Image` marker
+# be immediately followed by a newline) before searching for `Image:`/
+# `Version:` within it -- this is what prevents the Provisioner's decoy
+# `Version:` line from ever being mistaken for the exact runner image
+# version. Falls back to searching the full `log_text` when no such group
+# marker is present (e.g. a minimal/synthetic log excerpt with no decoy
+# `Version:` line to disambiguate against).
+_RUNNER_IMAGE_GROUP_RE = re.compile(r"##\[group\]Runner Image\r?\n(?P<body>.*?)##\[endgroup\]", re.DOTALL)
 _SET_UP_JOB_IMAGE_RE = re.compile(r"^Image:\s*(?P<name>\S.*?)\s*$", re.MULTILINE)
-_SET_UP_JOB_IMAGE_VERSION_RE = re.compile(r"^Image Version:\s*(?P<version>\S.*?)\s*$", re.MULTILINE)
+_SET_UP_JOB_IMAGE_VERSION_RE = re.compile(r"^Version:\s*(?P<version>\S.*?)\s*$", re.MULTILINE)
 
 
 def extract_exact_runner_image_from_job_log(log_text: str) -> dict | None:
-    """Issue #2422 AC4: parses the `Set up job` section GitHub Actions
-    emits for a GitHub-hosted runner job, e.g.:
+    """Issue #2422 AC4 (fix_delta after #2422 AC8 live smoke dispatch,
+    PR #2501 -- see the module-level comment above `_RUNNER_IMAGE_GROUP_RE`
+    for the real-log-format defect this replaced): parses the real
+    `##[group]Runner Image ... ##[endgroup]` section GitHub Actions emits
+    for a GitHub-hosted runner job, e.g.:
 
+        ##[group]Runner Image
         Image: ubuntu-24.04
-        Image Version: 20260901.1.0
+        Version: 20260901.1.0
+        ##[endgroup]
 
     Returns `{"name": ..., "version": ...}`, or `None` if either line is
     absent/empty (e.g. a containerized job whose host runner section does
     not surface these lines the same way -- callers must treat `None` as a
     hard verification failure via `fetch_exact_runner_image_for_job`, never
-    silently substitute an OS/architecture-only fallback)."""
-    name_match = _SET_UP_JOB_IMAGE_RE.search(log_text)
-    version_match = _SET_UP_JOB_IMAGE_VERSION_RE.search(log_text)
+    silently substitute an OS/architecture-only fallback). `log_text` is
+    expected to already have any per-line GitHub Actions log timestamp
+    prefix (e.g. `2026-09-05T04:29:18.1156490Z `) stripped by the caller's
+    `log_fetch` -- this function's own line-anchored (`^`) regexes do not
+    strip it themselves."""
+    group_match = _RUNNER_IMAGE_GROUP_RE.search(log_text)
+    scoped_text = group_match.group("body") if group_match else log_text
+    name_match = _SET_UP_JOB_IMAGE_RE.search(scoped_text)
+    version_match = _SET_UP_JOB_IMAGE_VERSION_RE.search(scoped_text)
     if not name_match or not version_match:
         return None
     name = name_match.group("name").strip()
