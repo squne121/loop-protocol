@@ -130,7 +130,6 @@ PLAN_REGISTRY: dict[str, PlanSpec] = {
             ".claude/agents/issue-creator.md",
             ".claude/agents/issue-editor.md",
             ".claude/agents/issue-reviewer.md",
-            ".claude/agents/review-issue.md",
         ],
         do_not_read_initial_only=[
             "docs/product/",

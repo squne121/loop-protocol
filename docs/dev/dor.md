@@ -1,6 +1,6 @@
 ---
 doc_id: DOC-DEV-DOR-001
-title: Definition of Ready (DoR) — Implementation Issue
+title: Definition of Ready (DoR) — Implementation Issue（実装 Issue の着手可能条件を定義する文書）
 status: active
 created_by_issue: 72
 parent_issue: 40
@@ -168,7 +168,7 @@ $ test -f nonexistent_file.py
 | `deferred` | — | `skipped` | `go` |
 | 欠落 | 0 | `unexpected_pass` + `missing_annotation` warning | `blocked` |
 
-### pytest exit code semantics
+### pytest exit code semantics（終了コードの意味論）
 
 | exit code | 意味 | 注意事項 |
 |---|---|---|
@@ -228,7 +228,7 @@ exit 5（no tests collected）を「baseline で fail した」と解釈して�
 | Allowed Paths | Allowed Paths 明示 / worktree・branch 命名 preflight | 機械判定 |
 | Stop Conditions | Stop Conditions 明示（6 定型項目） | 機械判定 |
 | Required Skills | テンプレ準拠（必須セクション存在） | 機械判定 |
-| スコープ妥当性・体験判断 | （本 skill の責務外 — `review-issue` / 人間レビュー） | 人間判断 |
+| スコープ妥当性・体験判断 | （本 skill の責務外 — `review-issue` Skill / 人間レビュー） | 人間判断 |
 
 ## Out of Scope
 
