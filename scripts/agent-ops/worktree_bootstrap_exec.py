@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import json
@@ -36,6 +37,7 @@ from skill_runtime_exec import (  # noqa: E402
     resolve_git_subprocess_executable,
     run_control_plane_git_add_detached_locked_worktree,
     run_control_plane_git_delete_private_ref_cas,
+    run_control_plane_git_list_worktrees_porcelain_locked_prunable,
     run_control_plane_git_read_worktree_head,
     run_control_plane_git_read_worktree_status_porcelain,
     run_control_plane_git_remove_existing_detached_locked_worktree,
@@ -48,7 +50,12 @@ from worktree_bootstrap_command_policy import (  # noqa: E402
     expected_worktree_path,
     normalize_default_branch_ref,
 )
-from worktree_catalog import branch_short_name, find_by_realpath, list_worktrees  # noqa: E402
+from worktree_catalog import (  # noqa: E402
+    branch_short_name,
+    find_by_realpath,
+    list_worktrees,
+    parse_worktree_porcelain_locked_prunable_z,
+)
 
 SCHEMA = "WORKTREE_BOOTSTRAP_RESULT_V1"
 
@@ -329,6 +336,41 @@ def fixed_control_plane_worktree_path(project_root: str | os.PathLike[str]) -> s
     return str(Path(root) / ".claude" / _FIXED_CONTROL_PLANE_WORKTREE_RELATIVE_PATH)
 
 
+# Fixed, dedicated-worktree-EXTERNAL uv project environment directory (Issue
+# #2199 OWNER feedback P1-1). Deliberately a SIBLING of
+# `_FIXED_CONTROL_PLANE_WORKTREE_RELATIVE_PATH`, never nested inside it.
+_FIXED_CONTROL_PLANE_VENV_RELATIVE_PATH = Path("worktrees") / f"{_CONTROL_PLANE_PREFLIGHT_LOCK_IDENTITY}-venv"
+
+
+def dedicated_execution_venv_dir(project_root: str | os.PathLike[str]) -> str:
+    """Fixed, dedicated-worktree-EXTERNAL `uv` project environment directory
+    for the 4 production preflight profiles (Issue #2199 OWNER feedback
+    P1-1: "managed uv project の初回実行が unauthorized write と誤判定される").
+
+    Deliberately a SIBLING of `fixed_control_plane_worktree_path`'s own
+    dedicated worktree, never nested inside it: `skill_runtime_exec`'s
+    write-monitoring window (`_snapshot_repo_paths`) walks only
+    `execution_root`'s own subtree, so a `uv`-managed project environment
+    that lives outside that subtree (via `UV_PROJECT_ENVIRONMENT`, set by
+    the caller alongside this path) is structurally invisible to the
+    before/after unauthorized-write diff. This is "explicit segregation of
+    the execution environment outside the monitored checkout" (one of the
+    two remedies the OWNER feedback names) -- not a `.venv`-name exclusion
+    list, and not a bare `--no-sync`/`--locked` workaround on an unprepared
+    environment.
+
+    Stable across `recover_or_create_fixed_control_plane_worktree`
+    recreating the dedicated worktree at a new `accepted_oid` (OWNER
+    feedback case 3, "dedicated worktree が再作成された後の初回起動"): only
+    the *worktree* is torn down and rebuilt on an OID change, never this
+    environment directory, so "first launch after worktree recreation"
+    reduces to the ordinary "environment already exists" case rather than a
+    second first-run.
+    """
+    root = os.path.realpath(os.fspath(project_root))
+    return str(Path(root) / ".claude" / _FIXED_CONTROL_PLANE_VENV_RELATIVE_PATH)
+
+
 def recover_or_create_fixed_control_plane_worktree(
     accepted_oid: object,
     object_format: object,
@@ -497,6 +539,243 @@ def run_control_plane_preflight_session(
         }
     finally:
         guard.release()
+
+
+class DedicatedIdentityViolation(ControlPlaneUnavailable):
+    """Fail-closed terminal state for the dedicated-lane identity probe
+    (Issue #2199 AC2/AC11). Never resolved by falling back to the primary
+    root or by continuing on a different/alternate dedicated identity --
+    the caller must abort the production dispatch entirely.
+    """
+
+
+class DedicatedEnvironmentPreparationFailed(ControlPlaneUnavailable):
+    """Fail-closed terminal state for the explicit toolchain-preparation
+    phase (Issue #2199 OWNER feedback P1-1). Never resolved by falling back
+    to an unsynced/partial environment or to the primary root -- the caller
+    must abort the production dispatch entirely, exactly like
+    `DedicatedIdentityViolation`.
+    """
+
+
+def ensure_dedicated_execution_environment_ready(
+    *,
+    execution_root: str,
+    uv_executable: str,
+    env: dict[str, str],
+    timeout_seconds: float = 120.0,
+) -> None:
+    """Explicit toolchain-preparation phase for the 4 production preflight
+    profiles (Issue #2199 OWNER feedback P1-1), run by the caller BEFORE the
+    write-monitoring window opens (before
+    `skill_runtime_exec._dispatch_child_and_check_postconditions`'s own
+    before-snapshot).
+
+    Runs ``uv sync --locked`` against the dedicated worktree's OWN
+    ``pyproject.toml``/``uv.lock`` (already present there -- both are
+    ordinary tracked files, checked out by the worktree like any other repo
+    file), targeting the sibling, monitored-tree-EXTERNAL
+    `dedicated_execution_venv_dir` via ``env["UV_PROJECT_ENVIRONMENT"]``
+    (the caller sets this key before calling here, and must pass the SAME
+    ``env`` on to the actual monitored child dispatch afterward).
+
+    ``--locked`` means this never silently rewrites ``uv.lock`` content on
+    a resolution drift -- it fails closed instead (surfacing as a non-zero
+    ``uv`` exit here, raising `DedicatedEnvironmentPreparationFailed`).
+    Running this ONCE, here, before the monitored window opens, is also
+    what keeps a subsequent already-synced ``uv run`` (the actual, monitored
+    child dispatch) from touching ``uv.lock``'s mtime a second time: `uv`
+    only rewrites/touches a lockfile-adjacent path when the environment is
+    not already up to date, so this call absorbs that one-time mtime bump
+    on the caller's behalf, before the caller ever takes its before-snapshot.
+
+    This function itself never touches `execution_root` outside what `uv`
+    itself writes -- it does not create, move, or delete any path.
+    """
+    try:
+        result = subprocess.run(
+            [uv_executable, "sync", "--locked"],
+            cwd=execution_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DedicatedEnvironmentPreparationFailed(
+            "dedicated_environment_preparation_timed_out"
+        ) from exc
+    if result.returncode != 0:
+        raise DedicatedEnvironmentPreparationFailed(
+            "dedicated_environment_preparation_failed: "
+            f"exit={result.returncode} stderr={result.stderr.strip()[:2000]}"
+        )
+
+
+@contextlib.contextmanager
+def control_plane_dedicated_execution_session(
+    project_root: str | os.PathLike[str],
+    *,
+    timeout_seconds: float = 30.0,
+    cleanup_reserve_seconds: float = 3.0,
+    scratch_root: str | None = None,
+):
+    """Context manager holding the fixed lifecycle guard across bootstrap,
+    dedicated-worktree child dispatch, and existing post-child checks
+    (Issue #2199 AC3/AC4).
+
+    Unlike `run_control_plane_preflight_session` (Issue #2197 AC6/AC7, whose
+    guard is released -- via its own `finally` -- before that function ever
+    returns to its caller), this generator's `with` body runs WHILE the
+    SAME guard is still held: the guard is released only in this
+    generator's own `finally`, after the caller's `with` block (covering
+    child dispatch and post-child checks) completes on both the success and
+    the exception path. No lease, TTL, heartbeat, stale-takeover, or daemon
+    is introduced -- this is exactly the already-reviewed #2198 guard, held
+    for the wider, precisely bounded scope this Issue requires.
+    """
+    root = os.path.realpath(os.fspath(project_root))
+    guard = acquire_control_plane_preflight_lifecycle_mutex(root, deadline_at=time.monotonic() + timeout_seconds)
+    try:
+        guard.assert_held()
+        literal_remote_url = validate_literal_remote_url(CONTROL_PLANE_CANONICAL_REMOTE_URL)
+        protocol_deadline = GitProtocolDeadline.start(timeout_seconds, cleanup_reserve_seconds)
+        private_ref, accepted_oid, object_format = run_control_plane_remote_default_ref_binding(
+            literal_remote_url,
+            cwd=root,
+            project_root=root,
+            deadline=protocol_deadline,
+            scratch_root=scratch_root,
+        )
+        guard.assert_held()
+
+        def _cleanup_private_ref() -> None:
+            try:
+                run_control_plane_git_delete_private_ref_cas(
+                    private_ref,
+                    accepted_oid,
+                    cwd=root,
+                    project_root=root,
+                    deadline=protocol_deadline,
+                    scratch_root=scratch_root,
+                )
+            except BaseException as cleanup_exc:
+                raise ControlPlaneUnavailable(
+                    "control_plane_unavailable:private_ref_cleanup_failed"
+                ) from cleanup_exc
+
+        try:
+            recovery = recover_or_create_fixed_control_plane_worktree(
+                accepted_oid,
+                object_format,
+                project_root=root,
+                canonical_common_dir=guard.canonical_common_dir,
+                deadline=protocol_deadline,
+                scratch_root=scratch_root,
+            )
+        except BaseException:
+            _cleanup_private_ref()
+            raise
+        _cleanup_private_ref()
+        guard.assert_held()
+        session: dict[str, object] = {
+            "guard": guard,
+            "execution_root": recovery["worktree_path"],
+            "worktree_state": recovery["state"],
+            "accepted_oid": accepted_oid,
+            "object_format": object_format,
+            "canonical_common_dir": guard.canonical_common_dir,
+            "deadline": protocol_deadline,
+        }
+        yield session
+        guard.assert_held()
+    finally:
+        guard.release()
+
+
+def verify_dedicated_control_plane_identity(
+    session: dict[str, object],
+    *,
+    project_root: str,
+    execution_root: str,
+    invocation_cwd: str,
+    executor_script_path: str,
+) -> None:
+    """Fail-closed dedicated-lane identity verification (Issue #2199
+    AC2/AC10/AC11).
+
+    Confirms, from the porcelain catalog alone (never a second remote
+    observation -- AC10 reuses the SAME ``session["accepted_oid"]`` already
+    obtained via #2197's remote-binding protocol):
+
+    - exactly one catalog entry matches ``execution_root``'s realpath
+    - that entry is ``detached``, ``locked``, and NOT ``prunable``
+    - its ``head`` equals ``session["accepted_oid"]``
+    - its git-common-dir linkage matches ``session["canonical_common_dir"]``
+      (re-derived the same closed way ``acquire_control_plane_preflight_lifecycle_mutex``
+      already did, never re-queried ad hoc)
+    - ``invocation_cwd``, ``executor_script_path``, and ``execution_root``
+      all resolve to the SAME dedicated identity (no symlink path
+      component in any of the three, ``invocation_cwd`` equals
+      ``execution_root``, and the script path nests under it)
+
+    Any missing/duplicate catalog entry, linkage mismatch, symlink
+    component, non-detached head, ``locked==false``, ``prunable==true``, or
+    OID mismatch raises ``DedicatedIdentityViolation`` -- fail-closed, with
+    no primary fallback and no dedicated-side alternate continuation
+    (AC11). Ambient ``LOOP_DEFAULT_BRANCH`` is never consulted here.
+    """
+    guard = session["guard"]
+    accepted_oid = session["accepted_oid"]
+    canonical_common_dir = session["canonical_common_dir"]
+    deadline = session["deadline"]
+
+    for candidate_path in (execution_root, invocation_cwd, executor_script_path):
+        candidate = Path(candidate_path)
+        if candidate.is_symlink():
+            raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_symlink_component")
+        for component in candidate.parents:
+            if component.is_symlink():
+                raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_symlink_component")
+
+    execution_root_real = os.path.realpath(execution_root)
+    invocation_cwd_real = os.path.realpath(invocation_cwd)
+    executor_script_real = os.path.realpath(executor_script_path)
+
+    if invocation_cwd_real != execution_root_real:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_cwd_mismatch")
+    try:
+        common = os.path.commonpath([execution_root_real, executor_script_real])
+    except ValueError:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_script_mismatch") from None
+    if common != execution_root_real:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_script_mismatch")
+
+    porcelain = run_control_plane_git_list_worktrees_porcelain_locked_prunable(
+        cwd=project_root,
+        project_root=project_root,
+        deadline=deadline,
+    )
+    entries = parse_worktree_porcelain_locked_prunable_z(porcelain)
+    matches = [entry for entry in entries if entry.get("worktree_realpath") == execution_root_real]
+    if len(matches) != 1:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_catalog_match_not_unique")
+    entry = matches[0]
+    if not entry.get("detached"):
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_not_detached")
+    if not entry.get("locked"):
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_not_locked")
+    if entry.get("prunable"):
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_prunable")
+    if entry.get("head") != accepted_oid.value:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_oid_mismatch")
+
+    entry_common_dir = _canonical_existing_git_common_dir(execution_root_real, deadline_at=time.monotonic() + 10.0)
+    if entry_common_dir != canonical_common_dir:
+        raise DedicatedIdentityViolation("control_plane_unavailable:dedicated_identity_common_dir_mismatch")
+
+    guard.assert_held()
 
 
 def _result(
