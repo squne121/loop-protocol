@@ -831,7 +831,18 @@ def test_cold_start_peer_writes_subtree_and_unauthorized_sibling_fails(tmp_path:
     THEN skill_runtime_exec.py must fail-close with unauthorized_write_path
     pointing at the leaf path under `artifacts/unrelated/`, not the folded
     `artifacts/` ancestor (Safety Claim: expansion is precise, not a blanket
-    allow of the whole collapsed directory)."""
+    allow of the whole collapsed directory).
+
+    Issue #2199 (round 3): uses the deterministic go-file/ack-file barrier
+    (not a fixed `delay_seconds` race, see
+    `test_tracked_source_file_unauthorized_write_is_rejected` in
+    `test_skill_runtime_exec_pytest_cache.py` for the fixed-delay-under-load
+    rationale) -- under the heavier real-subprocess load this Issue's own
+    round 3 fixtures add to the full CI parallel suite, the previous fixed
+    `time.sleep(0.2)` + `SKILL_RUNTIME_TEST_SLEEP_SECONDS=0.6` writer
+    occasionally raced `main()`'s dedicated-worktree bootstrap unpredictably,
+    landing the peer write after the after-snapshot instead of during the
+    race window (a false PASS observed on live CI)."""
     repo = _make_repo(tmp_path)
     _install_lifecycle_fixture(repo)
     execution_root = _execution_root(repo)
@@ -839,21 +850,29 @@ def test_cold_start_peer_writes_subtree_and_unauthorized_sibling_fails(tmp_path:
 
     subtree_path = execution_root / "artifacts" / "session-manifest-runtime" / "events" / "peer-cold-start.json"
     unrelated_path = execution_root / "artifacts" / "unrelated" / "peer-cold-start.txt"
+    go_file = tmp_path / "barrier-go-cold-start-sibling"
+    ack_file = tmp_path / "barrier-ack-cold-start-sibling"
 
     def _write_both() -> None:
-        assert _wait_for_path(execution_root, timeout=30), f"{execution_root} never materialized"
-        time.sleep(0.2)
+        assert _wait_for_path(go_file, timeout=30), "barrier go-file never appeared"
         subtree_path.parent.mkdir(parents=True, exist_ok=True)
         subtree_path.write_text('{"peer": true}\n')
         unrelated_path.parent.mkdir(parents=True, exist_ok=True)
         unrelated_path.write_text("peer-unrelated\n")
+        ack_file.write_text("ack")
 
     writer_thread = threading.Thread(target=_write_both)
     writer_thread.start()
     try:
-        result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
+        result = _run_executor(
+            repo,
+            {
+                "SKILL_RUNTIME_TEST_BARRIER_GO_FILE": str(go_file),
+                "SKILL_RUNTIME_TEST_BARRIER_ACK_FILE": str(ack_file),
+            },
+        )
     finally:
-        writer_thread.join(timeout=5)
+        writer_thread.join(timeout=10)
 
     assert result.returncode == 2, result.stdout + result.stderr
     assert "reason_code=unauthorized_write_path" in result.stderr
