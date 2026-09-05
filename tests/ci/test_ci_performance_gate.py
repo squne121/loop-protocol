@@ -376,7 +376,12 @@ def _cli_main(argv: list[str] | None = None) -> int:
         assessment can still be `approval_eligible: false` e.g. because no
         trusted `ci_verdict_summary_v2` artifact was bound at all. A
         close-grade CLI that exits 0 without independently confirming
-        `approval_eligible` is a false-green risk this AC closes)."""
+        `approval_eligible` is a false-green risk this AC closes);
+    4 = --production-invocation was passed but --manifest-sha256 and/or
+        --experiment-identity was omitted (#2422 AC10: the production
+        invocation route must never reach the --cohort-fixture-file-sha256
+        fallback -- this is checked and fails closed BEFORE any gate/receipt
+        computation runs)."""
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -466,9 +471,9 @@ def _cli_main(argv: list[str] | None = None) -> int:
         help=(
             "#2423 AC3: sha256:<hex> of the #2422 immutable dispatch root run "
             "set manifest this fixture was materialized from. Falls back to "
-            "the --cohort-fixture file's own sha256 when omitted (#2422's "
-            "manifest v2 producer is not yet wired as of this Issue; see "
-            "docs/dev/e2e-performance-benchmark.md)."
+            "the --cohort-fixture file's own sha256 when omitted -- but ONLY "
+            "outside --production-invocation (#2422 AC10); see that flag's "
+            "help text."
         ),
     )
     parser.add_argument(
@@ -476,7 +481,41 @@ def _cli_main(argv: list[str] | None = None) -> int:
         default=None,
         help="#2423 AC3: optional path to additionally write the CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 receipt JSON.",
     )
+    parser.add_argument(
+        "--production-invocation",
+        action="store_true",
+        help=(
+            "Issue #2422 AC10: marks this invocation as the REAL production "
+            "route (e.g. from .github/workflows/ci.yml), where the "
+            "--manifest-sha256/--experiment-identity fallback-to-fixture-"
+            "sha256 behavior below is STRUCTURALLY UNREACHABLE -- omitting "
+            "--manifest-sha256 or --experiment-identity under this flag is a "
+            "hard, fail-closed error (before any receipt/gate computation "
+            "runs), never a silent fallback to the --cohort-fixture file's "
+            "own sha256. Without this flag (the default), the fixture-sha256 "
+            "fallback remains available exactly as before, for unit / "
+            "fixture / exploratory-smoke invocations only."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.production_invocation:
+        missing = [
+            name
+            for name, value in (
+                ("--manifest-sha256", args.manifest_sha256),
+                ("--experiment-identity", args.experiment_identity),
+            )
+            if not value
+        ]
+        if missing:
+            print(
+                "::error::--production-invocation requires "
+                f"{', '.join(missing)} as authoritative trusted input(s); "
+                "the --cohort-fixture-file-sha256 fallback is unreachable "
+                "from the production invocation route (#2422 AC10)."
+            )
+            return 4
 
     with open(args.cohort_fixture, encoding="utf-8") as handle:
         fixture_text = handle.read()
@@ -516,7 +555,18 @@ def _cli_main(argv: list[str] | None = None) -> int:
         exit_code = 0
 
     if args.receipt_output:
-        cohort_fixture_sha256 = "sha256:" + hashlib.sha256(fixture_text.encode("utf-8")).hexdigest()
+        # Issue #2422 AC10: under --production-invocation, args.manifest_sha256
+        # is ALREADY guaranteed non-empty by the fail-closed check above --
+        # the `or cohort_fixture_sha256` fallback expression is intentionally
+        # NEVER evaluated (a fixture-sha256 substitute must never launder as
+        # a trusted manifest digest on the production route). Outside
+        # --production-invocation (the default), the pre-existing fallback
+        # behavior for unit/fixture/exploratory-smoke callers is unchanged.
+        if args.production_invocation:
+            manifest_sha256_value = args.manifest_sha256
+        else:
+            cohort_fixture_sha256 = "sha256:" + hashlib.sha256(fixture_text.encode("utf-8")).hexdigest()
+            manifest_sha256_value = args.manifest_sha256 or cohort_fixture_sha256
         trusted_functional_evidence = {
             "ci_verdict_summary_artifact_id": args.ci_verdict_summary_artifact_id,
             "ci_verdict_summary_file_sha256": args.expected_ci_verdict_summary_file_sha256,
@@ -525,7 +575,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
         }
         receipt = build_close_grade_receipt(
             fixture,
-            manifest_sha256=args.manifest_sha256 or cohort_fixture_sha256,
+            manifest_sha256=manifest_sha256_value,
             trusted_functional_evidence=trusted_functional_evidence,
             validation_decision=validation_decision,
             exit_code=exit_code,
@@ -2229,6 +2279,181 @@ def test_close_grade_result_receipt_complete_sourced_from_gate_status_not_local_
         "P0-1: complete must follow the passed gate_status alone, decoupled from this "
         "receipt's own (still non-empty) evidence_errors"
     )
+
+
+# =============================================================================
+# Issue #2422 AC10: `_cli_main` --production-invocation hardening -- the
+# --cohort-fixture-file-sha256 fallback for --manifest-sha256 must be
+# structurally unreachable from the production invocation route.
+# =============================================================================
+
+
+def _minimal_insufficient_evidence_fixture() -> dict:
+    """A fixture deliberately below MIN_COHORT_RUN_COUNT (3 baselines per
+    arm) -- reaches `gate_status: insufficient_evidence` (exit 1), which is
+    enough to prove `_cli_main` got PAST the --production-invocation
+    fail-closed check and into real gate computation, without requiring a
+    full 20-run comparable cohort."""
+
+    def arm(commit_sha: str, count: int, start_id: int) -> dict:
+        core = [
+            {
+                "workflow_run_id": start_id + i,
+                "job": "e2e-core",
+                "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 60000 + i}],
+            }
+            for i in range(count)
+        ]
+        responsive = [
+            {
+                "workflow_run_id": start_id + i,
+                "job": "e2e-responsive-matrix",
+                "measurements": [{"phase_id": "test_e2e_core", "elapsed_ms": 60000 + i}],
+            }
+            for i in range(count)
+        ]
+        gate_ready = [
+            {
+                "workflow_run_id": start_id + i,
+                "run_started_at": "2026-08-15T00:00:00Z",
+                "check_completed_at": "2026-08-15T00:05:00Z",
+            }
+            for i in range(count)
+        ]
+        return {
+            "commit_sha": commit_sha,
+            "core_baselines": core,
+            "responsive_baselines": responsive,
+            "gate_ready_baselines": gate_ready,
+        }
+
+    return {
+        "issue_number": 2422,
+        "pr_number": 0,
+        "measured_at": "2026-09-05T00:00:00Z",
+        "functional_evidence": {"proof_level": "check_run_only", "coverage_bound": False},
+        "declared_impact": "AC10 production-invocation hardening test fixture (deliberately insufficient).",
+        "risk_acknowledgement": {
+            "reference": {"source_kind": "issue_comment", "source_id": "test-fixture"},
+            "verification_status": "unverified",
+        },
+        "cohort_provenance": {
+            "runner_image": "ubuntu-24.04",
+            "workers": 1,
+            "scheduler": "loadscope",
+            "command_manifest_digest": "sha256:" + "0" * 64,
+            "test_selection_digest": "sha256:" + "0" * 64,
+        },
+        "before": arm("0" * 40, 3, 9000),
+        "after": arm("1" * 40, 3, 19000),
+    }
+
+
+def test_cli_main_production_invocation_fails_closed_when_manifest_sha256_missing(tmp_path):
+    """GIVEN --production-invocation WHEN --manifest-sha256 is omitted THEN
+    _cli_main exits 4 WITHOUT ever opening --cohort-fixture (a nonexistent
+    path proves this: opening it would raise FileNotFoundError, not
+    return 4) -- Issue #2422 AC10."""
+    output_path = tmp_path / "gate_result.json"
+    exit_code = _cli_main(
+        [
+            "--production-invocation",
+            "--cohort-fixture",
+            str(tmp_path / "does-not-exist.json"),
+            "--output",
+            str(output_path),
+            "--experiment-identity",
+            "exp-1",
+        ]
+    )
+    assert exit_code == 4
+    assert not output_path.exists()
+
+
+def test_cli_main_production_invocation_fails_closed_when_experiment_identity_missing(tmp_path):
+    """Same as above but --experiment-identity is the field omitted --
+    Issue #2422 AC10 requires BOTH trusted inputs, not manifest-sha256
+    alone."""
+    output_path = tmp_path / "gate_result.json"
+    exit_code = _cli_main(
+        [
+            "--production-invocation",
+            "--cohort-fixture",
+            str(tmp_path / "does-not-exist.json"),
+            "--output",
+            str(output_path),
+            "--manifest-sha256",
+            "sha256:" + "a" * 64,
+        ]
+    )
+    assert exit_code == 4
+    assert not output_path.exists()
+
+
+def test_cli_main_production_invocation_with_required_inputs_reaches_gate_computation_and_never_falls_back(tmp_path):
+    """GIVEN --production-invocation WITH both --manifest-sha256 and
+    --experiment-identity supplied WHEN _cli_main runs THEN it reaches real
+    gate computation (exit 1, insufficient_evidence, for this deliberately-
+    small fixture) AND the emitted receipt's `manifest_sha256` is the
+    SUPPLIED value, never the --cohort-fixture file's own sha256 (Issue
+    #2422 AC10 -- proves the fallback expression path was never taken)."""
+    fixture_path = tmp_path / "cohort_fixture.json"
+    fixture_path.write_text(json.dumps(_minimal_insufficient_evidence_fixture()), encoding="utf-8")
+    output_path = tmp_path / "gate_result.json"
+    receipt_path = tmp_path / "receipt.json"
+    supplied_manifest_sha256 = "sha256:" + "7" * 64
+
+    exit_code = _cli_main(
+        [
+            "--production-invocation",
+            "--cohort-fixture",
+            str(fixture_path),
+            "--output",
+            str(output_path),
+            "--receipt-output",
+            str(receipt_path),
+            "--manifest-sha256",
+            supplied_manifest_sha256,
+            "--experiment-identity",
+            "exp-production-1",
+        ]
+    )
+
+    assert exit_code == 1  # insufficient_evidence -- reached real gate computation
+    assert output_path.exists()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["manifest_sha256"] == supplied_manifest_sha256
+
+    fixture_file_sha256 = "sha256:" + hashlib.sha256(fixture_path.read_bytes()).hexdigest()
+    assert receipt["manifest_sha256"] != fixture_file_sha256
+
+
+def test_cli_main_non_production_invocation_still_falls_back_to_fixture_sha256(tmp_path):
+    """GIVEN NO --production-invocation flag (the default -- unit/fixture/
+    exploratory-smoke route) WHEN --manifest-sha256 is omitted THEN the
+    pre-existing --cohort-fixture-file-sha256 fallback behavior is
+    UNCHANGED (Issue #2422 AC10: fallback stays available on this route)."""
+    fixture_path = tmp_path / "cohort_fixture.json"
+    fixture_text = json.dumps(_minimal_insufficient_evidence_fixture())
+    fixture_path.write_text(fixture_text, encoding="utf-8")
+    output_path = tmp_path / "gate_result.json"
+    receipt_path = tmp_path / "receipt.json"
+
+    exit_code = _cli_main(
+        [
+            "--cohort-fixture",
+            str(fixture_path),
+            "--output",
+            str(output_path),
+            "--receipt-output",
+            str(receipt_path),
+        ]
+    )
+
+    assert exit_code == 1  # insufficient_evidence -- reached real gate computation
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    expected_fallback_sha256 = "sha256:" + hashlib.sha256(fixture_text.encode("utf-8")).hexdigest()
+    assert receipt["manifest_sha256"] == expected_fallback_sha256
 
 
 if __name__ == "__main__":

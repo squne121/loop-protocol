@@ -85,6 +85,8 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
@@ -95,6 +97,16 @@ from typing import Any, Callable
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 SCHEMA_PATH = os.path.join(REPO_ROOT, "schemas", "e2e_performance_benchmark_manifest_v1.schema.json")
+
+# Issue #2422: `e2e_performance_benchmark_manifest_v2` supersedes v1's
+# `before_sha`/`after_sha`/`pre_split`/`post_split` hybrid semantics (a fixed
+# historical commit compared against a mutable current workflow) for the
+# dedicated `benchmark_layout=monolith|split` A/B/A/B dispatch route. v1 and
+# its schema/functions above are left unmodified (other, unrelated consumers
+# of this module's rerun-attempt/live-API-verification building blocks are
+# out of this Issue's scope) -- v2 is purely additive, defined below.
+SCHEMA_PATH_V2 = os.path.join(REPO_ROOT, "schemas", "e2e_performance_benchmark_manifest_v2.schema.json")
+MANIFEST_SCHEMA_V2 = "e2e_performance_benchmark_manifest_v2"
 
 EXIT_COMPLETE = 0
 EXIT_INCOMPLETE = 2
@@ -1134,6 +1146,502 @@ def _validate_against_schema(manifest: dict) -> None:
         raise OperationalError(f"manifest_failed_schema_validation: {messages}")
 
 
+# =============================================================================
+# Issue #2422: `benchmark_layout=monolith|split` A/B/A/B bounded-orchestrator
+# manifest v2. Additive to everything above (v1's before/after collector
+# stays available/unmodified for any other in-repo consumer); this section
+# is the ONLY route that produces `e2e_performance_benchmark_manifest_v2`.
+# =============================================================================
+
+BENCHMARK_LAYOUTS = ("monolith", "split")
+MEASURED_PROVIDER_JOBS = ("e2e-core", "e2e-responsive-matrix")
+GATE_READY_JOB_NAME = "e2e"
+# AC7: only these job names may start on a `benchmark_layout != ''` dispatch
+# -- the measured provider jobs plus the single minimal gate-ready job
+# #2423's production close-grade materializer requires.
+ALLOWED_V2_JOB_NAMES = MEASURED_PROVIDER_JOBS + (GATE_READY_JOB_NAME,)
+
+_RUNNER_IMAGE_PLACEHOLDER_VALUES = frozenset({"", "unknown", "unknown/unknown", "n/a"})
+
+
+class OperationalErrorV2(OperationalError):
+    """Alias kept distinct in name (not behavior) so v2 call sites read
+    unambiguously; both are caught identically by v1 CLI error handling."""
+
+
+def compute_experiment_run_set_digest(runs: list[dict]) -> str:
+    """Issue #2422 AC5: `runs` is a list of per-run identity dicts, each
+    carrying ONLY `block_id` / `benchmark_layout` / `workflow_run_id` /
+    `run_attempt` -- NEVER `conclusion`/outcome (this digest identifies the
+    frozen dispatch root run set independent of whether any individual run
+    succeeded or failed, so a later re-run of the SAME plan against the
+    SAME root run set produces the SAME digest regardless of results).
+    Canonicalized via `json.dumps(sort_keys=True, separators=(",", ":"))`
+    over a list SORTED by `(block_id, benchmark_layout, workflow_run_id,
+    run_attempt)` -- the result is independent of the input list's order."""
+    identity_tuples = [
+        {
+            "block_id": r["block_id"],
+            "benchmark_layout": r["benchmark_layout"],
+            "workflow_run_id": r["workflow_run_id"],
+            "run_attempt": r["run_attempt"],
+        }
+        for r in runs
+    ]
+    identity_tuples.sort(
+        key=lambda d: (d["block_id"], d["benchmark_layout"], d["workflow_run_id"], d["run_attempt"])
+    )
+    canonical = json.dumps(identity_tuples, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_workflow_digest_from_commit_bytes(
+    workflow_sha: str,
+    repo: str,
+    path: str = ".github/workflows/ci.yml",
+    api_call: Callable[[str], Any] = _default_gh_api_call,
+) -> str:
+    """Issue #2422 AC1/AC3: fetches `path`'s bytes AT the commit
+    `workflow_sha` via the GitHub Contents API
+    (`GET /repos/{repo}/contents/{path}?ref={workflow_sha}`), and returns
+    `sha256:<hex>` of those EXACT decoded bytes. Deliberately NOT a
+    `sha256sum` of a post-checkout local working-tree file -- the checked-out
+    ref a benchmark dispatch runs under can differ from `workflow_sha` (the
+    dispatch `ref` stays on the current/default branch tip while
+    `workflow_sha` records the commit the workflow definition was actually
+    AT when the run was dispatched, see docs/dev/e2e-performance-benchmark.md
+    "workflow_digest / workflow_sha の既知の限界"), so computing from a local
+    checkout would silently conflate whatever happens to be on disk with the
+    claimed `workflow_sha` provenance pair -- exactly the known limitation
+    #2184 deferred to this Issue."""
+    if not _is_valid_sha(workflow_sha):
+        raise OperationalErrorV2(f"invalid_workflow_sha: {workflow_sha!r}")
+    response = api_call(f"repos/{repo}/contents/{path}?ref={workflow_sha}")
+    if (
+        not isinstance(response, dict)
+        or response.get("encoding") != "base64"
+        or not isinstance(response.get("content"), str)
+    ):
+        raise LiveAPIError(
+            f"contents_api_malformed_response: repo={repo} path={path} ref={workflow_sha}"
+        )
+    raw_bytes = base64.b64decode(response["content"])
+    return "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+
+
+def verify_workflow_digest_matches_commit_bytes(
+    workflow_sha: str,
+    claimed_workflow_digest: str,
+    repo: str,
+    api_call: Callable[[str], Any] = _default_gh_api_call,
+) -> list[str]:
+    """Issue #2422 AC3: independently RECOMPUTES `workflow_digest` from
+    `workflow_sha`'s own commit bytes (never trusting the claimed value) and
+    compares it to `claimed_workflow_digest`. This is what rejects the
+    false-green case AC3 explicitly calls out: two arms could each
+    independently claim the SAME (wrong-commit) digest -- a cross-arm
+    required-equal check ALONE would incorrectly PASS that case (equal, but
+    equally wrong) -- so this recomputation-from-source-of-truth check is
+    REQUIRED IN ADDITION TO, never a replacement for, the cross-arm
+    equality check (see `verify_cross_arm_required_equal` below)."""
+    try:
+        recomputed = compute_workflow_digest_from_commit_bytes(workflow_sha, repo, api_call=api_call)
+    except (LiveAPIError, OperationalErrorV2) as exc:
+        return [f"workflow_digest_recomputation_failed: {exc}"]
+    if recomputed != claimed_workflow_digest:
+        return [
+            f"workflow_digest_mismatch_vs_commit_bytes: workflow_sha={workflow_sha!r} "
+            f"claimed={claimed_workflow_digest!r} recomputed={recomputed!r}"
+        ]
+    return []
+
+
+def verify_cross_arm_required_equal(runs: list[dict]) -> list[str]:
+    """Issue #2422 AC1/AC3: `workflow_sha` and `workflow_digest` must be
+    IDENTICAL across every run in `runs` (both `benchmark_layout` arms) --
+    `benchmark_layout` is the ONLY intended treatment; anything else
+    differing would confound the comparison. Returns a list of violation
+    strings (empty == every run agrees)."""
+    violations: list[str] = []
+    for field in ("workflow_sha", "workflow_digest"):
+        values = {r.get(field) for r in runs if field in r}
+        if len(values) > 1:
+            violations.append(f"cross_arm_fingerprint_mismatch_{field}: values={sorted(values, key=str)!r}")
+    return violations
+
+
+def _is_placeholder_runner_image_value(value: object) -> bool:
+    return not isinstance(value, str) or value.strip().lower() in _RUNNER_IMAGE_PLACEHOLDER_VALUES
+
+
+def verify_exact_runner_image(image: object) -> list[str]:
+    """Issue #2422 AC4: `image` must be an object with non-empty, non-
+    placeholder `name`/`version` string fields -- rejects `unknown`, empty
+    string, `None`, a bare OS/architecture-only value (e.g.
+    `"unknown/unknown"`, this module's own `host_runner_image` fallback
+    shape for a DIFFERENT, run-level concept, never conflated with this
+    job-level exact identity), and a non-object value outright."""
+    if not isinstance(image, dict):
+        return ["exact_runner_image_not_object"]
+    violations: list[str] = []
+    for field in ("name", "version"):
+        if _is_placeholder_runner_image_value(image.get(field)):
+            violations.append(f"exact_runner_image_missing_or_placeholder_{field}")
+    return violations
+
+
+_SET_UP_JOB_IMAGE_RE = re.compile(r"^Image:\s*(?P<name>\S.*?)\s*$", re.MULTILINE)
+_SET_UP_JOB_IMAGE_VERSION_RE = re.compile(r"^Image Version:\s*(?P<version>\S.*?)\s*$", re.MULTILINE)
+
+
+def extract_exact_runner_image_from_job_log(log_text: str) -> dict | None:
+    """Issue #2422 AC4: parses the `Set up job` section GitHub Actions
+    emits for a GitHub-hosted runner job, e.g.:
+
+        Image: ubuntu-24.04
+        Image Version: 20260901.1.0
+
+    Returns `{"name": ..., "version": ...}`, or `None` if either line is
+    absent/empty (e.g. a containerized job whose host runner section does
+    not surface these lines the same way -- callers must treat `None` as a
+    hard verification failure via `fetch_exact_runner_image_for_job`, never
+    silently substitute an OS/architecture-only fallback)."""
+    name_match = _SET_UP_JOB_IMAGE_RE.search(log_text)
+    version_match = _SET_UP_JOB_IMAGE_VERSION_RE.search(log_text)
+    if not name_match or not version_match:
+        return None
+    name = name_match.group("name").strip()
+    version = version_match.group("version").strip()
+    if _is_placeholder_runner_image_value(name) or _is_placeholder_runner_image_value(version):
+        return None
+    return {"name": name, "version": version}
+
+
+def fetch_exact_runner_image_for_job(
+    workflow_job_id: int,
+    repo: str,
+    log_fetch: Callable[[int, str], str],
+) -> dict:
+    """Issue #2422 AC4: `log_fetch(workflow_job_id, repo) -> str` is
+    dependency-injected -- the real implementation fetches ONLY this
+    specific job's own log (e.g. `gh api
+    repos/{repo}/actions/jobs/{workflow_job_id}/logs`), never a different
+    "probe" job's log and never a run-level aggregate. Raises
+    `LiveAPIError` (fail-closed) if the `Set up job` section cannot be
+    parsed out of the fetched log."""
+    log_text = log_fetch(workflow_job_id, repo)
+    image = extract_exact_runner_image_from_job_log(log_text)
+    if image is None:
+        raise LiveAPIError(
+            f"exact_runner_image_not_found_in_set_up_job_log: workflow_job_id={workflow_job_id!r}"
+        )
+    return image
+
+
+def verify_exact_runner_image_required_equal_within_block(block: dict) -> list[str]:
+    """Issue #2422 AC4: image-identity required-equal is scoped to the
+    SAME `block_id`, compared ACROSS its two `benchmark_layout` runs for
+    matching job names ONLY -- deliberately never asserted equal across
+    DIFFERENT blocks (GitHub hosted-runner image rolling updates between
+    blocks are expected and must never fail the whole experiment)."""
+    violations: list[str] = []
+    images_by_job_name: dict[str, list[tuple[str, dict]]] = {}
+    for run in block.get("runs", []):
+        layout = run.get("benchmark_layout")
+        for job in run.get("provider_jobs", []):
+            image = job.get("exact_runner_image")
+            if not isinstance(image, dict):
+                continue
+            images_by_job_name.setdefault(job.get("job"), []).append((layout, image))
+    for job_name, entries in images_by_job_name.items():
+        if len(entries) < 2:
+            continue
+        canonical = json.dumps(entries[0][1], sort_keys=True)
+        for layout, image in entries[1:]:
+            if json.dumps(image, sort_keys=True) != canonical:
+                violations.append(
+                    f"exact_runner_image_mismatch_within_block: block_id={block.get('block_id')!r} "
+                    f"job={job_name!r}"
+                )
+                break
+    return violations
+
+
+def verify_ab_alternating_order(blocks: list[dict]) -> list[str]:
+    """Issue #2422 AC3/Out-of-Scope: every block's `runs` must be exactly
+    `[monolith, split]` in THAT fixed order (never `[split, monolith]`,
+    never AB/BA randomized order -- Out of Scope explicitly keeps the fixed
+    A->B order + block_id matched-block design, deferring randomization to
+    a future Issue)."""
+    violations: list[str] = []
+    for block in blocks:
+        layouts = [r.get("benchmark_layout") for r in block.get("runs", [])]
+        if layouts != ["monolith", "split"]:
+            violations.append(
+                f"ab_order_violation: block_id={block.get('block_id')!r} layouts={layouts!r} "
+                "(expected exactly ['monolith', 'split'])"
+            )
+    return violations
+
+
+def verify_block_ids_unique(blocks: list[dict]) -> list[str]:
+    """Issue #2422 AC3: every `block_id` across the manifest must be
+    unique -- a duplicate would silently merge two distinct matched-block
+    dispatches into one identity."""
+    seen: dict[str, int] = {}
+    for block in blocks:
+        block_id = block.get("block_id")
+        seen[block_id] = seen.get(block_id, 0) + 1
+    return [
+        f"duplicate_block_id: block_id={block_id!r} count={count}"
+        for block_id, count in sorted(seen.items(), key=str)
+        if count > 1
+    ]
+
+
+def build_ab_block_plan(blocks: int) -> list[dict]:
+    """Issue #2422 AC7/AC9: builds the A/B/A/B (monolith -> split, in that
+    fixed order, repeated `blocks` times) dispatch PLAN for ANY positive
+    integer `blocks` (including 22) -- pure computation, no live dispatch.
+    `block_id` is `block-{index:04d}` (deterministic, 1-indexed, unique).
+    Raises `OperationalErrorV2` for a non-positive-int `blocks` (fail-closed
+    -- 0, negative, `bool`, and non-int are all rejected)."""
+    if not isinstance(blocks, int) or isinstance(blocks, bool) or blocks < 1:
+        raise OperationalErrorV2(f"invalid_blocks: {blocks!r} (must be a positive int)")
+    return [{"block_id": f"block-{index:04d}", "layouts": ["monolith", "split"]} for index in range(1, blocks + 1)]
+
+
+def dispatch_workflow_run(
+    layout: str,
+    block_id: str,
+    frozen_source_sha: str,
+    experiment_id: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    dispatch_call: Callable[..., Any],
+) -> dict:
+    """Issue #2422 AC7/Stop-Conditions: dispatches ONE `workflow_dispatch`
+    with `benchmark_layout=layout`, and MUST request
+    `return_run_details=True` from `dispatch_call` -- the response MUST
+    carry an integer `workflow_run_id` (the 200 OK w/ return_run_details
+    shape); a response lacking it (e.g. the 204 No Content GitHub returns
+    when `return_run_details` is NOT requested) is fail-closed (raises
+    `LiveAPIError`), NEVER accepted/inferred/polled-around via a
+    `gh run list` post-hoc guess (this Issue's own Stop Conditions list
+    forbids exactly that)."""
+    if layout not in BENCHMARK_LAYOUTS:
+        raise OperationalErrorV2(f"invalid_benchmark_layout: {layout!r}")
+    inputs = {
+        "benchmark_layout": layout,
+        "frozen_source_sha": frozen_source_sha,
+        "block_id": block_id,
+        "experiment_id": experiment_id,
+    }
+    response = dispatch_call(
+        repo=repo,
+        workflow_file=workflow_file,
+        ref=ref,
+        inputs=inputs,
+        return_run_details=True,
+    )
+    if not isinstance(response, dict) or not isinstance(response.get("workflow_run_id"), int):
+        raise LiveAPIError(
+            "workflow_dispatch_response_missing_workflow_run_id: "
+            f"block_id={block_id!r} layout={layout!r} response={response!r} "
+            "(return_run_details=true must be honored by the dispatch response; "
+            "a 204 No Content / gh run list post-hoc guess is never substituted)"
+        )
+    return {
+        "workflow_run_id": response["workflow_run_id"],
+        "run_url": response.get("html_url") or response.get("run_url"),
+        "benchmark_layout": layout,
+        "block_id": block_id,
+    }
+
+
+def run_bounded_experiment(
+    blocks: int,
+    frozen_source_sha: str,
+    experiment_id: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    dispatch_call: Callable[..., Any],
+) -> list[dict]:
+    """Issue #2422 AC7/AC9: bounded orchestrator entrypoint -- dispatches
+    the FULL A/B/A/B plan for `blocks` matched blocks (2*blocks total
+    dispatches) and returns the dispatch ROOT RUN SET (fixed at dispatch
+    time, before any outcome is known -- Issue #2422 AC6: callers must
+    never later filter this list by outcome or dispatch additional runs to
+    compensate for a failure)."""
+    plan = build_ab_block_plan(blocks)
+    root_run_set: list[dict] = []
+    for block in plan:
+        for layout in block["layouts"]:
+            root_run_set.append(
+                dispatch_workflow_run(
+                    layout,
+                    block["block_id"],
+                    frozen_source_sha,
+                    experiment_id,
+                    repo,
+                    workflow_file,
+                    ref,
+                    dispatch_call,
+                )
+            )
+    return root_run_set
+
+
+def _run_identity_tuples_from_blocks(blocks: list[dict]) -> list[dict]:
+    """Issue #2422 AC5: `block_id` lives on the `Block`, not the `Run`
+    (the schema's `Run` def intentionally omits it -- a run's block
+    membership is unambiguous from its position inside `blocks[]`). This
+    helper reconstructs the per-run `{block_id, benchmark_layout,
+    workflow_run_id, run_attempt}` identity tuple `compute_experiment_run_
+    set_digest` expects by pairing each run with its OWN block's
+    `block_id`."""
+    identity_tuples: list[dict] = []
+    for block in blocks:
+        block_id = block.get("block_id")
+        for run in block.get("runs", []):
+            identity_tuples.append(
+                {
+                    "block_id": block_id,
+                    "benchmark_layout": run.get("benchmark_layout"),
+                    "workflow_run_id": run.get("workflow_run_id"),
+                    "run_attempt": run.get("run_attempt"),
+                }
+            )
+    return identity_tuples
+
+
+def build_manifest_v2(
+    experiment_identity: str,
+    frozen_source_sha: str,
+    workflow_sha: str,
+    workflow_digest: str,
+    frozen_non_treatment: dict,
+    blocks: list[dict],
+    generated_at: str | None = None,
+) -> dict:
+    """Issue #2422 AC5: assembles an `e2e_performance_benchmark_manifest_v2`
+    dict from already-collected `blocks` (each `{"block_id": str, "runs":
+    [<Run>, <Run>]}`, `Run` matching the schema's `Run` def). Computes
+    `experiment_run_set_digest` from every run's identity tuple. Semantic
+    (cross-field) violations -- A/B/A/B ordering, duplicate block_id,
+    cross-arm workflow_sha/workflow_digest mismatch, per-block runner-image
+    mismatch -- are collected into `evidence_errors`, never silently
+    dropped, and NEVER cause this function itself to raise (fail-closed
+    detection is the CALLER's responsibility, matching this module's
+    existing v1 `collect_benchmark_manifest`/`main()` split)."""
+    evidence_errors: list[dict] = []
+    all_runs: list[dict] = []
+    for block in blocks:
+        all_runs.extend(block.get("runs", []))
+
+    for reason in verify_ab_alternating_order(blocks):
+        evidence_errors.append({"block_id": "<plan>", "reason": "ab_order_violation", "detail": reason})
+    for reason in verify_block_ids_unique(blocks):
+        evidence_errors.append({"block_id": "<plan>", "reason": "duplicate_block_id", "detail": reason})
+    for reason in verify_cross_arm_required_equal(all_runs):
+        evidence_errors.append({"block_id": "<all>", "reason": "cross_arm_fingerprint_mismatch", "detail": reason})
+    for block in blocks:
+        for reason in verify_exact_runner_image_required_equal_within_block(block):
+            evidence_errors.append(
+                {
+                    "block_id": block.get("block_id", "<unknown>"),
+                    "reason": "exact_runner_image_mismatch",
+                    "detail": reason,
+                }
+            )
+        for run in block.get("runs", []):
+            for job in run.get("provider_jobs", []):
+                image_violations = verify_exact_runner_image(job.get("exact_runner_image"))
+                for violation in image_violations:
+                    evidence_errors.append(
+                        {
+                            "block_id": block.get("block_id", "<unknown>"),
+                            "reason": "exact_runner_image_invalid",
+                            "detail": (
+                                f"job={job.get('job')!r} "
+                                f"workflow_run_id={run.get('workflow_run_id')!r}: {violation}"
+                            ),
+                        }
+                    )
+
+    run_set_digest = compute_experiment_run_set_digest(_run_identity_tuples_from_blocks(blocks))
+
+    return {
+        "schema": MANIFEST_SCHEMA_V2,
+        "schema_version": 2,
+        "generated_at": generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "experiment_identity": experiment_identity,
+        "experiment_run_set_digest": run_set_digest,
+        "frozen_source_sha": frozen_source_sha,
+        "workflow_sha": workflow_sha,
+        "workflow_digest": workflow_digest,
+        "frozen_non_treatment": frozen_non_treatment,
+        "blocks": blocks,
+        "evidence_errors": evidence_errors,
+    }
+
+
+def validate_manifest_v2_semantics(manifest: dict) -> list[str]:
+    """Issue #2422 AC3/AC5: standalone re-derivation of the same semantic
+    checks `build_manifest_v2` performs, importable for an independent
+    consumer (mirrors this module's existing v1
+    `validate_manifest_semantics` pattern) -- re-verifies A/B/A/B order,
+    block_id uniqueness, cross-arm required-equal fingerprint, per-block
+    runner-image required-equal, AND the `experiment_run_set_digest`
+    recomputation (never trusting the manifest's own claimed digest)."""
+    violations: list[str] = []
+    blocks = manifest.get("blocks", [])
+    all_runs: list[dict] = []
+    for block in blocks:
+        all_runs.extend(block.get("runs", []))
+
+    violations.extend(f"ab_order_violation: {v}" for v in verify_ab_alternating_order(blocks))
+    violations.extend(f"duplicate_block_id: {v}" for v in verify_block_ids_unique(blocks))
+    violations.extend(f"cross_arm_fingerprint_mismatch: {v}" for v in verify_cross_arm_required_equal(all_runs))
+    for block in blocks:
+        violations.extend(
+            f"exact_runner_image_mismatch: {v}" for v in verify_exact_runner_image_required_equal_within_block(block)
+        )
+
+    recomputed_digest = compute_experiment_run_set_digest(_run_identity_tuples_from_blocks(blocks))
+    if manifest.get("experiment_run_set_digest") != recomputed_digest:
+        violations.append(
+            "experiment_run_set_digest_mismatch: "
+            f"claimed={manifest.get('experiment_run_set_digest')!r} recomputed={recomputed_digest!r}"
+        )
+
+    for field in ("workflow_sha", "workflow_digest"):
+        root_value = manifest.get(field)
+        for run in all_runs:
+            if run.get(field) != root_value:
+                violations.append(f"run_{field}_mismatches_root: run={run.get('workflow_run_id')!r}")
+
+    return violations
+
+
+def _validate_against_schema_v2(manifest: dict) -> None:
+    try:
+        from jsonschema import Draft202012Validator
+    except ImportError as exc:
+        raise OperationalErrorV2(f"jsonschema_not_installed: {exc}") from exc
+
+    with open(SCHEMA_PATH_V2, encoding="utf-8") as handle:
+        schema = json.load(handle)
+    Draft202012Validator.check_schema(schema)
+    validator_instance = Draft202012Validator(schema)
+    errors = sorted(validator_instance.iter_errors(manifest), key=lambda e: e.path)
+    if errors:
+        messages = [f"{'/'.join(str(p) for p in err.path) or '<root>'}: {err.message}" for err in errors]
+        raise OperationalErrorV2(f"manifest_v2_failed_schema_validation: {messages}")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1263,5 +1771,121 @@ def main(argv: list[str] | None = None) -> int:
     return EXIT_COMPLETE if complete else EXIT_INCOMPLETE
 
 
+def _default_dispatch_call(
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    inputs: dict,
+    return_run_details: bool = True,
+) -> Any:
+    """Issue #2422 AC7: default `dispatch_call` transport for
+    `dispatch_workflow_run`/`run_bounded_experiment` -- `gh api` POST to the
+    workflow dispatches endpoint, ALWAYS passing `return_run_details: true`
+    in the request body (this is what lets GitHub return `workflow_run_id`
+    synchronously in a 200 OK response body instead of a 204 No Content
+    with no run id, per this Issue's Stop Conditions)."""
+    payload = {"ref": ref, "inputs": inputs, "return_run_details": return_run_details}
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                "--method",
+                "POST",
+                f"repos/{repo}/actions/workflows/{workflow_file}/dispatches",
+                "--input",
+                "-",
+            ],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LiveAPIError(f"gh_api_dispatch_transport_error: {exc}") from exc
+    if result.returncode != 0:
+        raise LiveAPIError(f"gh_api_dispatch_call_failed: {result.stderr.strip()}")
+    stdout = result.stdout.strip()
+    if not stdout:
+        return {}
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise LiveAPIError(f"gh_api_dispatch_response_not_json: {exc}") from exc
+
+
+def parse_run_experiment_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="collect_e2e_performance_benchmark.py run-experiment",
+        description=(
+            "Issue #2422 AC7/AC9: bounded orchestrator -- dispatches an "
+            "A/B/A/B (monolith->split, `blocks` times) benchmark_layout "
+            "experiment and writes the resulting dispatch root run set "
+            "(fixed at dispatch time, before any outcome is known) as JSON."
+        ),
+    )
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        required=True,
+        help="Number of matched (monolith, split) blocks -- any positive int, e.g. 2 or 22",
+    )
+    parser.add_argument(
+        "--frozen-source-sha",
+        required=True,
+        help="Frozen 40-hex application-code commit SHA measured by BOTH benchmark_layout arms",
+    )
+    parser.add_argument("--experiment-id", required=True, help="Free-form experiment identifier")
+    parser.add_argument("--repo", required=True, help="owner/repo, e.g. squne121/loop-protocol")
+    parser.add_argument("--workflow-file", default="ci.yml", help="Workflow file name (default ci.yml)")
+    parser.add_argument(
+        "--ref",
+        default="main",
+        help=(
+            "Dispatch ref -- must stay on the current/default branch tip so "
+            "github.workflow_sha remains current (default main)"
+        ),
+    )
+    parser.add_argument("--output", required=True, help="Path to write the dispatched root run set JSON")
+    return parser.parse_args(argv)
+
+
+def main_run_experiment(argv: list[str] | None = None) -> int:
+    args = parse_run_experiment_args(argv)
+    try:
+        root_run_set = run_bounded_experiment(
+            args.blocks,
+            args.frozen_source_sha,
+            args.experiment_id,
+            args.repo,
+            args.workflow_file,
+            args.ref,
+            _default_dispatch_call,
+        )
+    except (OperationalErrorV2, LiveAPIError) as exc:
+        sys.stderr.write(f"operational_failure: {exc}\n")
+        return EXIT_OPERATIONAL_FAILURE
+
+    output_dir = os.path.dirname(args.output)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(args.output, "w", encoding="utf-8") as handle:
+        json.dump(root_run_set, handle, indent=2)
+        handle.write("\n")
+    print(
+        f"dispatched {len(root_run_set)} runs across {args.blocks} blocks "
+        "(root run set fixed at dispatch time, outcome-independent)"
+    )
+    return EXIT_COMPLETE
+
+
 if __name__ == "__main__":
+    # Issue #2422 AC7/AC9: `run-experiment` is a distinct sub-invocation,
+    # dispatched here (never inside `parse_args()`/`main()` above, which
+    # stay byte-for-byte backward compatible for every existing v1 caller/
+    # test that invokes `main(argv)` directly with the legacy
+    # `--before-sha`/`--after-sha` flag shape).
+    if len(sys.argv) > 1 and sys.argv[1] == "run-experiment":
+        sys.exit(main_run_experiment(sys.argv[2:]))
     sys.exit(main())

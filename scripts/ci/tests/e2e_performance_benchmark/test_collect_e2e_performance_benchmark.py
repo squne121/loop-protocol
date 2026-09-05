@@ -1225,3 +1225,520 @@ def test_live_api_verification_against_real_pr_2172_ci_artifact():
         fabricated_record, real_head_sha, "squne121/loop-protocol"
     )
     assert any("artifact_not_found_via_live_api" in v for v in fabricated_violations)
+
+
+# =============================================================================
+# Issue #2422: `benchmark_layout=monolith|split` A/B/A/B manifest v2 tests.
+# =============================================================================
+
+V2_SCHEMA_PATH = REPO_ROOT / "schemas" / "e2e_performance_benchmark_manifest_v2.schema.json"
+FROZEN_SOURCE_SHA = "d" * 40
+V2_WORKFLOW_SHA = "e" * 40
+V2_WORKFLOW_DIGEST = "sha256:" + "1" * 64
+
+
+def _image(name: str = "ubuntu-24.04", version: str = "20260901.1.0") -> dict:
+    return {"name": name, "version": version}
+
+
+def _provider_job(job: str, workflow_job_id: int, conclusion: str = "success", image: dict | None = None) -> dict:
+    return {
+        "job": job,
+        "workflow_job_id": workflow_job_id,
+        "conclusion": conclusion,
+        "exact_runner_image": image if image is not None else _image(),
+    }
+
+
+def _run(
+    layout: str,
+    workflow_run_id: int,
+    run_attempt: int = 1,
+    conclusion: str = "success",
+    workflow_sha: str = V2_WORKFLOW_SHA,
+    workflow_digest: str = V2_WORKFLOW_DIGEST,
+    provider_jobs: list[dict] | None = None,
+) -> dict:
+    return {
+        "benchmark_layout": layout,
+        "workflow_run_id": workflow_run_id,
+        "run_attempt": run_attempt,
+        "conclusion": conclusion,
+        "run_url": f"https://github.com/squne121/loop-protocol/actions/runs/{workflow_run_id}",
+        "workflow_sha": workflow_sha,
+        "workflow_digest": workflow_digest,
+        "job_names_started": [j["job"] for j in (provider_jobs or [])],
+        "provider_jobs": provider_jobs
+        if provider_jobs is not None
+        else [
+            _provider_job("e2e-core", workflow_run_id * 10 + 1),
+            _provider_job("e2e-responsive-matrix", workflow_run_id * 10 + 2),
+        ],
+    }
+
+
+def _block(block_id: str, monolith_run_id: int, split_run_id: int) -> dict:
+    return {
+        "block_id": block_id,
+        "runs": [
+            _run("monolith", monolith_run_id),
+            _run("split", split_run_id),
+        ],
+    }
+
+
+def _frozen_non_treatment() -> dict:
+    return {
+        "test_inventory_digest": "sha256:" + "2" * 64,
+        "expected_playwright_invocations": 42,
+        "lockfile_hash": "sha256:" + "3" * 64,
+        "toolchain_digest": "sha256:" + "4" * 64,
+    }
+
+
+def test_compute_experiment_run_set_digest_is_order_independent_and_outcome_independent():
+    """GIVEN two equivalent run-identity lists differing only in input
+    order and in `conclusion` (outcome) WHEN the digest is computed THEN
+    the result is identical -- order independence and outcome
+    independence are both required (Issue #2422 AC5)."""
+    runs_a = [
+        {"block_id": "block-0001", "benchmark_layout": "monolith", "workflow_run_id": 100, "run_attempt": 1},
+        {"block_id": "block-0001", "benchmark_layout": "split", "workflow_run_id": 101, "run_attempt": 1},
+    ]
+    runs_b = list(reversed(runs_a))
+    assert collector.compute_experiment_run_set_digest(runs_a) == collector.compute_experiment_run_set_digest(runs_b)
+
+    # A DIFFERENT run_attempt genuinely changes identity -- the digest must
+    # NOT be insensitive to real identity changes (only to ordering/outcome).
+    runs_c = [dict(r) for r in runs_a]
+    runs_c[0]["run_attempt"] = 2
+    assert collector.compute_experiment_run_set_digest(runs_a) != collector.compute_experiment_run_set_digest(runs_c)
+
+    assert collector.compute_experiment_run_set_digest(runs_a).startswith("sha256:")
+
+
+def test_compute_workflow_digest_from_commit_bytes_uses_contents_api_not_local_checkout():
+    """GIVEN a fake Contents API response for a specific workflow_sha WHEN
+    `compute_workflow_digest_from_commit_bytes` is called THEN it hashes
+    the base64-decoded API response bytes (never a local file read) --
+    proven by injecting a fake `api_call` that returns DIFFERENT content
+    per ref and asserting the resulting digests differ accordingly."""
+    import base64
+    import hashlib
+
+    def fake_api_call(endpoint: str):
+        assert "ref=" in endpoint
+        ref = endpoint.split("ref=")[-1]
+        content = f"workflow-bytes-for-{ref}".encode("utf-8")
+        return {"encoding": "base64", "content": base64.b64encode(content).decode("ascii")}
+
+    sha_one = "1" * 40
+    sha_two = "2" * 40
+    digest_one = collector.compute_workflow_digest_from_commit_bytes(
+        sha_one, "squne121/loop-protocol", api_call=fake_api_call
+    )
+    digest_two = collector.compute_workflow_digest_from_commit_bytes(
+        sha_two, "squne121/loop-protocol", api_call=fake_api_call
+    )
+    assert digest_one != digest_two
+    expected_one = "sha256:" + hashlib.sha256(f"workflow-bytes-for-{sha_one}".encode("utf-8")).hexdigest()
+    assert digest_one == expected_one
+
+
+def test_verify_workflow_digest_matches_commit_bytes_rejects_false_green_same_wrong_digest_both_arms():
+    """GIVEN two arms that each independently claim the SAME digest, but
+    that digest was computed from the WRONG commit's bytes (not the
+    claimed workflow_sha's real bytes) WHEN
+    `verify_workflow_digest_matches_commit_bytes` is called for each arm
+    THEN both are rejected -- proving cross-arm equality ALONE is
+    insufficient (Issue #2422 AC3 false-green rejection: a naive check
+    that only compares the two arms' claimed digests to each other would
+    incorrectly PASS this case)."""
+    import base64
+
+    real_sha = "3" * 40
+    real_content = b"the-real-workflow-bytes"
+
+    def fake_api_call(endpoint: str):
+        assert endpoint.endswith(f"ref={real_sha}")
+        return {"encoding": "base64", "content": base64.b64encode(real_content).decode("ascii")}
+
+    wrong_digest = "sha256:" + "9" * 64  # NOT derived from real_content
+    # Both arms claim the SAME wrong digest -- cross-arm equality would pass.
+    runs = [
+        {"workflow_sha": real_sha, "workflow_digest": wrong_digest},
+        {"workflow_sha": real_sha, "workflow_digest": wrong_digest},
+    ]
+    assert collector.verify_cross_arm_required_equal(runs) == []  # cross-arm check alone: false green
+
+    violations = collector.verify_workflow_digest_matches_commit_bytes(
+        real_sha, wrong_digest, "squne121/loop-protocol", api_call=fake_api_call
+    )
+    assert any("workflow_digest_mismatch_vs_commit_bytes" in v for v in violations)
+
+
+def test_verify_cross_arm_required_equal_detects_workflow_sha_and_digest_mismatch():
+    """GIVEN two runs disagreeing on workflow_sha or workflow_digest WHEN
+    verified THEN a violation is reported for each mismatched field
+    (Issue #2422 AC1/AC3)."""
+    runs = [
+        {"workflow_sha": "a" * 40, "workflow_digest": "sha256:" + "0" * 64},
+        {"workflow_sha": "b" * 40, "workflow_digest": "sha256:" + "1" * 64},
+    ]
+    violations = collector.verify_cross_arm_required_equal(runs)
+    assert any("workflow_sha" in v for v in violations)
+    assert any("workflow_digest" in v for v in violations)
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        None,
+        {},
+        {"name": "", "version": "1.0"},
+        {"name": "ubuntu-24.04", "version": ""},
+        {"name": "unknown", "version": "unknown"},
+        {"name": "unknown/unknown", "version": "1.0"},
+    ],
+)
+def test_verify_exact_runner_image_rejects_placeholder_and_malformed_values(image):
+    """GIVEN a missing/placeholder/malformed exact_runner_image WHEN
+    verified THEN it is rejected (Issue #2422 AC4)."""
+    assert collector.verify_exact_runner_image(image) != []
+
+
+def test_verify_exact_runner_image_accepts_well_formed_value():
+    assert collector.verify_exact_runner_image(_image()) == []
+
+
+def test_extract_exact_runner_image_from_job_log_parses_set_up_job_section():
+    """GIVEN a realistic `Set up job` log excerpt WHEN parsed THEN name and
+    version are extracted (Issue #2422 AC4)."""
+    log_text = (
+        "Current runner version: '2.330.0'\n"
+        "Runner Image Provisioner\n"
+        "Image: ubuntu-24.04\n"
+        "Image Version: 20260901.1.0\n"
+        "Included Software\n"
+    )
+    assert collector.extract_exact_runner_image_from_job_log(log_text) == _image()
+
+
+def test_extract_exact_runner_image_from_job_log_returns_none_when_absent():
+    """GIVEN a log with no Image/Image Version lines (e.g. a containerized
+    job) WHEN parsed THEN None is returned -- never a synthesized fallback
+    (Issue #2422 AC4)."""
+    assert collector.extract_exact_runner_image_from_job_log("no relevant lines here\n") is None
+
+
+def test_fetch_exact_runner_image_for_job_raises_when_log_lacks_set_up_job_section():
+    """GIVEN a job log with no parseable Set up job section WHEN fetched
+    THEN LiveAPIError is raised (fail-closed, never a placeholder fallback,
+    Issue #2422 AC4)."""
+
+    def fake_log_fetch(workflow_job_id: int, repo: str) -> str:
+        return "nothing relevant"
+
+    with pytest.raises(collector.LiveAPIError):
+        collector.fetch_exact_runner_image_for_job(123, "squne121/loop-protocol", fake_log_fetch)
+
+
+def test_fetch_exact_runner_image_for_job_returns_parsed_image_on_success():
+    def fake_log_fetch(workflow_job_id: int, repo: str) -> str:
+        return "Image: ubuntu-24.04\nImage Version: 20260901.1.0\n"
+
+    assert collector.fetch_exact_runner_image_for_job(123, "squne121/loop-protocol", fake_log_fetch) == _image()
+
+
+def test_verify_exact_runner_image_required_equal_within_block_detects_mismatch():
+    """GIVEN a block whose monolith and split runs disagree on e2e-core's
+    exact_runner_image WHEN verified THEN a violation is reported (Issue
+    #2422 AC4: required-equal is scoped to the SAME block)."""
+    block = _block("block-0001", 100, 101)
+    block["runs"][1]["provider_jobs"][0]["exact_runner_image"] = _image(version="99999.9.9")
+    violations = collector.verify_exact_runner_image_required_equal_within_block(block)
+    assert any("job='e2e-core'" in v for v in violations)
+
+
+def test_verify_exact_runner_image_required_equal_within_block_never_compares_across_blocks():
+    """GIVEN two DIFFERENT blocks with DIFFERENT (but internally-consistent)
+    runner images WHEN each block is verified independently THEN neither
+    reports a violation -- cross-block image drift (e.g. a rolling GitHub
+    hosted-runner image update between blocks) is explicitly NOT an
+    invariant (Issue #2422 AC4/Outcome)."""
+    block_one = _block("block-0001", 100, 101)
+    block_two = _block("block-0002", 200, 201)
+    for run in block_two["runs"]:
+        for job in run["provider_jobs"]:
+            job["exact_runner_image"] = _image(version="99999.9.9")
+    assert collector.verify_exact_runner_image_required_equal_within_block(block_one) == []
+    assert collector.verify_exact_runner_image_required_equal_within_block(block_two) == []
+
+
+def test_verify_ab_alternating_order_accepts_monolith_then_split():
+    blocks = [_block("block-0001", 100, 101)]
+    assert collector.verify_ab_alternating_order(blocks) == []
+
+
+def test_verify_ab_alternating_order_rejects_split_then_monolith():
+    block = _block("block-0001", 100, 101)
+    block["runs"] = list(reversed(block["runs"]))
+    assert collector.verify_ab_alternating_order([block]) != []
+
+
+def test_verify_block_ids_unique_detects_duplicate():
+    blocks = [_block("block-0001", 100, 101), _block("block-0001", 200, 201)]
+    violations = collector.verify_block_ids_unique(blocks)
+    assert any("block-0001" in v for v in violations)
+
+
+def test_verify_block_ids_unique_accepts_distinct_ids():
+    blocks = [_block("block-0001", 100, 101), _block("block-0002", 200, 201)]
+    assert collector.verify_block_ids_unique(blocks) == []
+
+
+@pytest.mark.parametrize("blocks", [1, 2, 3, 22])
+def test_build_ab_block_plan_handles_arbitrary_positive_blocks(blocks):
+    """GIVEN `blocks` any positive int (including 22, Issue #2422 AC9)
+    WHEN the plan is built THEN it contains exactly `blocks` matched
+    (monolith, split) block entries with unique block_ids, and the plan
+    itself never performs a live dispatch."""
+    plan = collector.build_ab_block_plan(blocks)
+    assert len(plan) == blocks
+    assert len({b["block_id"] for b in plan}) == blocks
+    for block in plan:
+        assert block["layouts"] == ["monolith", "split"]
+
+
+@pytest.mark.parametrize("invalid", [0, -1, -22, True, "22", 2.5, None])
+def test_build_ab_block_plan_rejects_non_positive_int_blocks(invalid):
+    with pytest.raises(collector.OperationalErrorV2):
+        collector.build_ab_block_plan(invalid)
+
+
+def _fake_dispatch_call_factory(next_run_id: list[int], return_details: bool = True):
+    def fake_dispatch_call(repo, workflow_file, ref, inputs, return_run_details):
+        assert return_run_details is True  # Issue #2422 AC7: must always be requested
+        if not return_details:
+            return {}  # simulate 204 No Content shape (no workflow_run_id)
+        run_id = next_run_id[0]
+        next_run_id[0] += 1
+        return {"workflow_run_id": run_id, "html_url": f"https://example.invalid/runs/{run_id}"}
+
+    return fake_dispatch_call
+
+
+def test_dispatch_workflow_run_requires_return_run_details_and_extracts_workflow_run_id():
+    fake_dispatch_call = _fake_dispatch_call_factory([500])
+    result = collector.dispatch_workflow_run(
+        "monolith",
+        "block-0001",
+        FROZEN_SOURCE_SHA,
+        "exp-1",
+        "squne121/loop-protocol",
+        "ci.yml",
+        "main",
+        fake_dispatch_call,
+    )
+    assert result["workflow_run_id"] == 500
+    assert result["benchmark_layout"] == "monolith"
+    assert result["block_id"] == "block-0001"
+
+
+def test_dispatch_workflow_run_fails_closed_when_response_lacks_workflow_run_id():
+    """GIVEN a dispatch response shaped like GitHub's 204 No Content (no
+    workflow_run_id) WHEN dispatched THEN LiveAPIError is raised --
+    `gh run list` post-hoc guessing is never substituted (Issue #2422
+    Stop Conditions)."""
+
+    def fake_dispatch_call(repo, workflow_file, ref, inputs, return_run_details):
+        return {}
+
+    with pytest.raises(collector.LiveAPIError):
+        collector.dispatch_workflow_run(
+            "monolith",
+            "block-0001",
+            FROZEN_SOURCE_SHA,
+            "exp-1",
+            "squne121/loop-protocol",
+            "ci.yml",
+            "main",
+            fake_dispatch_call,
+        )
+
+
+def test_dispatch_workflow_run_rejects_invalid_benchmark_layout():
+    fake_dispatch_call = _fake_dispatch_call_factory([1])
+    with pytest.raises(collector.OperationalErrorV2):
+        collector.dispatch_workflow_run(
+            "neither",
+            "block-0001",
+            FROZEN_SOURCE_SHA,
+            "exp-1",
+            "squne121/loop-protocol",
+            "ci.yml",
+            "main",
+            fake_dispatch_call,
+        )
+
+
+def test_run_bounded_experiment_blocks_2_produces_4_run_ab_ab_root_run_set():
+    """GIVEN blocks=2 WHEN the bounded orchestrator runs THEN it produces
+    EXACTLY 4 dispatches in monolith, split, monolith, split order across
+    2 distinct block_ids -- the exact live smoke shape Issue #2422 AC8
+    requires."""
+    fake_dispatch_call = _fake_dispatch_call_factory([1000])
+    root_run_set = collector.run_bounded_experiment(
+        2, FROZEN_SOURCE_SHA, "exp-1", "squne121/loop-protocol", "ci.yml", "main", fake_dispatch_call
+    )
+    assert len(root_run_set) == 4
+    assert [r["benchmark_layout"] for r in root_run_set] == ["monolith", "split", "monolith", "split"]
+    assert len({r["block_id"] for r in root_run_set}) == 2
+    assert len({r["workflow_run_id"] for r in root_run_set}) == 4
+
+
+def test_run_bounded_experiment_blocks_22_produces_44_run_root_run_set_deterministically():
+    """Issue #2422 AC9: `blocks=22` (monolith 22 + split 22 = 44 eligible
+    unique workflow runs) is proven structurally correct WITHOUT any live
+    dispatch -- this test never contacts a real GitHub API (Stop
+    Conditions: blocks=22 live dispatch is explicitly out of this Issue's
+    scope)."""
+    fake_dispatch_call = _fake_dispatch_call_factory([1])
+    root_run_set = collector.run_bounded_experiment(
+        22, FROZEN_SOURCE_SHA, "exp-1", "squne121/loop-protocol", "ci.yml", "main", fake_dispatch_call
+    )
+    assert len(root_run_set) == 44
+    monolith_count = sum(1 for r in root_run_set if r["benchmark_layout"] == "monolith")
+    split_count = sum(1 for r in root_run_set if r["benchmark_layout"] == "split")
+    assert monolith_count == 22
+    assert split_count == 22
+    assert len({r["block_id"] for r in root_run_set}) == 22
+    # A/B/A/B: layouts strictly alternate starting with monolith.
+    layouts = [r["benchmark_layout"] for r in root_run_set]
+    assert layouts == ["monolith", "split"] * 22
+    # Each block_id appears exactly twice: once monolith, once split.
+    by_block: dict[str, set[str]] = {}
+    for r in root_run_set:
+        by_block.setdefault(r["block_id"], set()).add(r["benchmark_layout"])
+    assert all(layouts_for_block == {"monolith", "split"} for layouts_for_block in by_block.values())
+
+
+def test_build_manifest_v2_happy_path_conforms_to_schema():
+    """GIVEN a well-formed 2-block (blocks=2 smoke-shaped) run set WHEN the
+    v2 manifest is built THEN it conforms to
+    schemas/e2e_performance_benchmark_manifest_v2.schema.json with zero
+    evidence_errors (Issue #2422 AC5)."""
+    jsonschema = pytest.importorskip("jsonschema")
+    blocks = [
+        _block("block-0001", 1001, 1002),
+        _block("block-0002", 1003, 1004),
+    ]
+    manifest = collector.build_manifest_v2(
+        experiment_identity="exp-smoke-1",
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=V2_WORKFLOW_DIGEST,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-05T00:00:00Z",
+    )
+    assert manifest["schema"] == "e2e_performance_benchmark_manifest_v2"
+    assert manifest["evidence_errors"] == []
+    assert manifest["experiment_run_set_digest"].startswith("sha256:")
+
+    schema = json.loads(V2_SCHEMA_PATH.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
+    validator = jsonschema.Draft202012Validator(schema)
+    errors = list(validator.iter_errors(manifest))
+    assert errors == [], [e.message for e in errors]
+
+    assert collector.validate_manifest_v2_semantics(manifest) == []
+
+
+def test_build_manifest_v2_reports_evidence_errors_never_raises_for_ab_order_violation():
+    blocks = [_block("block-0001", 1001, 1002)]
+    blocks[0]["runs"] = list(reversed(blocks[0]["runs"]))
+    manifest = collector.build_manifest_v2(
+        experiment_identity="exp-smoke-1",
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=V2_WORKFLOW_DIGEST,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-05T00:00:00Z",
+    )
+    assert any(e["reason"] == "ab_order_violation" for e in manifest["evidence_errors"])
+
+
+def test_build_manifest_v2_reports_evidence_errors_for_cross_arm_workflow_sha_mismatch():
+    blocks = [_block("block-0001", 1001, 1002)]
+    blocks[0]["runs"][1]["workflow_sha"] = "f" * 40
+    manifest = collector.build_manifest_v2(
+        experiment_identity="exp-smoke-1",
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=V2_WORKFLOW_DIGEST,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-05T00:00:00Z",
+    )
+    assert any(e["reason"] == "cross_arm_fingerprint_mismatch" for e in manifest["evidence_errors"])
+
+
+def test_build_manifest_v2_reports_evidence_errors_for_placeholder_exact_runner_image():
+    blocks = [_block("block-0001", 1001, 1002)]
+    blocks[0]["runs"][0]["provider_jobs"][0]["exact_runner_image"] = {"name": "unknown", "version": "unknown"}
+    manifest = collector.build_manifest_v2(
+        experiment_identity="exp-smoke-1",
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=V2_WORKFLOW_DIGEST,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-05T00:00:00Z",
+    )
+    assert any(e["reason"] == "exact_runner_image_invalid" for e in manifest["evidence_errors"])
+
+
+def test_validate_manifest_v2_semantics_detects_tampered_experiment_run_set_digest():
+    """GIVEN a manifest whose `experiment_run_set_digest` was tampered
+    with (no longer matches a recomputation from blocks[].runs[]) WHEN
+    validated THEN a mismatch violation is reported (Issue #2422 AC5)."""
+    blocks = [_block("block-0001", 1001, 1002)]
+    manifest = collector.build_manifest_v2(
+        experiment_identity="exp-smoke-1",
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=V2_WORKFLOW_DIGEST,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-05T00:00:00Z",
+    )
+    manifest["experiment_run_set_digest"] = "sha256:" + "0" * 64
+    violations = collector.validate_manifest_v2_semantics(manifest)
+    assert any("experiment_run_set_digest_mismatch" in v for v in violations)
+
+
+def test_manifest_v2_schema_rejects_v1_hybrid_before_after_fields():
+    """GIVEN a manifest that still carries v1's `before_sha`/`after_sha`
+    hybrid fields WHEN validated against the v2 schema THEN it is
+    rejected (`unevaluatedProperties: false`) -- Issue #2422 Outcome: v1
+    hybrid semantics are removed from the benchmark route, never silently
+    tolerated as extra keys on a v2 manifest."""
+    jsonschema = pytest.importorskip("jsonschema")
+    blocks = [_block("block-0001", 1001, 1002)]
+    manifest = collector.build_manifest_v2(
+        experiment_identity="exp-smoke-1",
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=V2_WORKFLOW_DIGEST,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-05T00:00:00Z",
+    )
+    manifest["before_sha"] = BEFORE_SHA
+    manifest["after_sha"] = AFTER_SHA
+    schema = json.loads(V2_SCHEMA_PATH.read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    errors = list(validator.iter_errors(manifest))
+    assert errors != []
