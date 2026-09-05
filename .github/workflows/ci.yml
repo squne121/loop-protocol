@@ -877,9 +877,16 @@ jobs:
       # responsive` env override (playwright.config.ts's existing lane
       # selector, unchanged) makes THIS ONE invocation write to the SAME
       # `playwright-report-e2e-responsive-matrix`/`test-results-e2e-
-      # responsive-matrix` output folders e2e-responsive-matrix itself
-      # uses -- no playwright.config.ts change needed. `split` (or a
-      # normal, non-benchmark run) never executes this step at all -- the
+      # responsive-matrix` LOCAL output folders e2e-responsive-matrix itself
+      # uses (these are per-job-runner-local directory names hardcoded in
+      # playwright.config.ts and never collide across jobs since e2e-core
+      # and e2e-responsive-matrix always run on separate runners) -- no
+      # playwright.config.ts change needed. The upload-artifact `name:`
+      # values below are intentionally suffixed `-e2e-core` (distinct from
+      # e2e-responsive-matrix's own upload names) because GitHub Actions
+      # artifact names must be unique across the whole workflow run, unlike
+      # the local directories they are populated from. `split` (or a normal,
+      # non-benchmark run) never executes this step at all -- the
       # e2e-responsive-matrix job's own parallel run is unaffected.
       - name: Run responsive-matrix E2E tests (monolith layout only, timed)
         if: ${{ !cancelled() && github.event.inputs.benchmark_layout == 'monolith' }}
@@ -908,7 +915,7 @@ jobs:
         if: ${{ !cancelled() && github.event.inputs.benchmark_layout == 'monolith' }}
         uses: actions/upload-artifact@v6
         with:
-          name: playwright-report-e2e-responsive-matrix
+          name: playwright-report-e2e-core-responsive
           path: playwright-report-e2e-responsive-matrix/
           if-no-files-found: warn
           retention-days: 30
@@ -917,7 +924,7 @@ jobs:
         if: ${{ !cancelled() && github.event.inputs.benchmark_layout == 'monolith' }}
         uses: actions/upload-artifact@v6
         with:
-          name: test-results-e2e-responsive-matrix
+          name: test-results-e2e-core-responsive
           path: test-results-e2e-responsive-matrix/
           if-no-files-found: warn
           retention-days: 30
@@ -936,7 +943,7 @@ jobs:
         if: ${{ !cancelled() && github.event.inputs.benchmark_layout == 'monolith' }}
         uses: actions/upload-artifact@v6
         with:
-          name: responsive-canvas-runtime-evidence-${{ github.run_attempt }}
+          name: responsive-canvas-runtime-evidence-e2e-core-${{ github.run_attempt }}
           path: responsive-canvas-runtime-evidence-artifact/
           if-no-files-found: error
           retention-days: 30
