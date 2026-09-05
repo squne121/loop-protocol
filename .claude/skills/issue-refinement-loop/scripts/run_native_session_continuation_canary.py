@@ -57,7 +57,7 @@ import secrets
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +302,98 @@ def judge_phase(
     if not ok:
         return "fail", term_reason
     return "ok", None
+
+
+def judge_phase_with_bounded_retry(
+    observe_fn: Callable[[], tuple[int, bool, str, str]],
+    *,
+    max_retries: int = 1,
+) -> tuple[str, str | None, list[dict[str, Any]]]:
+    """Resume-phase-only bounded-retry wrapper around ``judge_phase()``
+    (Issue #2050).
+
+    This function does NOT change ``judge_phase()`` itself, and does NOT
+    apply to the initial/fresh phases -- those call sites keep calling
+    ``judge_phase()`` directly and are unaffected by this wrapper (Issue
+    #2050 Stop Conditions / In Scope).
+
+    ``observe_fn`` is a zero-argument callable that performs (or returns)
+    ONE launch attempt's observation as ``(exit_code, timed_out, stdout,
+    stderr)``, exactly the same four values ``judge_phase()`` itself
+    consumes. Every subsequent invocation of ``observe_fn`` MUST reuse the
+    same authoritative ``claude_code_session_id`` obtained from the
+    canary's initial launch -- this wrapper never synthesizes a session id
+    and has no knowledge of session identity at all; that invariant is the
+    caller's responsibility (see the ``resume`` call site in ``main()``,
+    which always passes the same ``observed_id_1`` to every launch it
+    performs via ``observe_fn``).
+
+    Algorithm: call ``observe_fn()`` and judge the result via
+    ``judge_phase()``. If that first observation was NOT ``timed_out``, its
+    verdict is returned immediately (single observation -- identical to a
+    bare ``judge_phase()`` call). If the first observation WAS
+    ``timed_out``, up to ``max_retries`` additional observations are
+    requested (one bounded retry by default, never unlimited) and
+    re-judged in turn; the loop stops as soon as an observation is not
+    ``timed_out`` (its verdict -- ``ok``, ``skip``, or a non-timeout
+    ``fail`` -- becomes the final verdict) or once ``max_retries``
+    additional attempts have ALL also been ``timed_out`` (in which case the
+    final verdict is the last attempt's ``fail`` verdict from
+    ``judge_phase()``, i.e. still ``fail``).
+
+    Returns ``(verdict, reason, attempts)``. ``verdict``/``reason`` are
+    ``judge_phase()``'s own return value for the LAST attempt actually
+    made -- a stale earlier timed-out attempt's verdict/reason is never
+    mixed into the returned verdict/reason (an old timeout observation is
+    never conflated with a later successful retry's result). ``attempts``
+    is the ordered list of every observation made, each as
+    ``{"attempt", "exit_code", "timed_out", "verdict", "reason"}`` (no
+    stdout/stderr -- callers that need the raw per-attempt stdout/stderr
+    for evidence keep their own record of it, e.g. via closure state in
+    ``observe_fn``), so the first ``timed_out`` observation is preserved as
+    evidence even when the final verdict reflects a later successful
+    retry.
+    """
+    attempts: list[dict[str, Any]] = []
+    attempt_index = 0
+    while True:
+        exit_code, timed_out, stdout, stderr = observe_fn()
+        verdict, reason = judge_phase(exit_code, timed_out, stdout, stderr)
+        attempts.append(
+            {
+                "attempt": attempt_index,
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "verdict": verdict,
+                "reason": reason,
+            }
+        )
+        if not timed_out or attempt_index >= max_retries:
+            return verdict, reason, attempts
+        attempt_index += 1
+
+
+class _ResumeRetryHardStop(Exception):
+    """Internal-only signal raised from the resume phase's ``observe_fn``
+    closure (see the ``main()`` resume call site) when a bounded-retry
+    attempt hits a structural (non-timeout) launcher/argv-contract failure
+    that must terminate the canary immediately -- these are NOT transient
+    timeout conditions and are never retried again by
+    ``judge_phase_with_bounded_retry()``."""
+
+    def __init__(
+        self,
+        finish_code: int,
+        finish_verdict: str,
+        *,
+        skip_reason: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        super().__init__(error_message or skip_reason or finish_verdict)
+        self.finish_code = finish_code
+        self.finish_verdict = finish_verdict
+        self.skip_reason = skip_reason
+        self.error_message = error_message
 
 
 def extract_assistant_texts(stdout: str) -> list[str]:
@@ -755,33 +847,93 @@ def main(argv: list[str] | None = None) -> int:
         return finish(1, "FAIL")
 
     # ---- Phase 2: same-continuation (resume) launch ------------------------
-    resume_record, resume_out, resume_err, resume_timed_out = launch(
-        "resume",
-        "What reference token did I mention earlier in this conversation? "
-        "Respond with exactly that token and nothing else. Do not use any tools.",
-        resume_session_id=observed_id_1,
-    )
-    evidence["same_continuation_launch"] = resume_record
+    # Issue #2050: the resume phase (and ONLY the resume phase -- initial and
+    # fresh above/below keep calling judge_phase() directly, unchanged) is
+    # wired through judge_phase_with_bounded_retry() so a single transient
+    # wait-timeout observation on the resume launch does not immediately
+    # freeze the phase verdict at "fail". Every attempt (first AND any bounded
+    # retry) always resumes the SAME authoritative claude_code_session_id
+    # (observed_id_1) obtained from the initial launch -- no new/synthetic
+    # session id is ever created for a retry.
+    resume_record: dict[str, Any] | None = None
+    resume_out = ""
+    resume_err = ""
+    resume_timed_out = False
+    resume_attempts_evidence: list[dict[str, Any]] = []
 
-    if args.claude_adapter == "claude-gpt":
-        failure_receipt = detect_claude_gpt_launch_failure_receipt(resume_out, resume_err)
-        if failure_receipt is not None:
-            launcher_verdict, launcher_reason = classify_launcher_receipt(
-                resume_record["exit_code"], failure_receipt
+    def _check_resume_attempt_or_raise(record: dict, out: str, err: str, *, retry: bool) -> None:
+        label = "resume launch (retry)" if retry else "resume launch"
+        if args.claude_adapter == "claude-gpt":
+            failure_receipt = detect_claude_gpt_launch_failure_receipt(out, err)
+            if failure_receipt is not None:
+                launcher_verdict, launcher_reason = classify_launcher_receipt(
+                    record["exit_code"], failure_receipt
+                )
+                evidence["claude_gpt_launcher_receipt"] = failure_receipt
+                if launcher_verdict == "skip":
+                    raise _ResumeRetryHardStop(77, "SKIP", skip_reason=f"{label}: {launcher_reason}")
+                raise _ResumeRetryHardStop(1, "FAIL", error_message=f"{label}: {launcher_reason}")
+        if not record["argv_contract_ok"]:
+            raise _ResumeRetryHardStop(
+                1, "FAIL", error_message=f"{label} argv contract violation: {record['argv_contract_detail']}"
             )
-            evidence["claude_gpt_launcher_receipt"] = failure_receipt
-            if launcher_verdict == "skip":
-                return finish(77, "SKIP", skip_reason=f"resume launch: {launcher_reason}")
-            evidence["errors"].append(f"resume launch: {launcher_reason}")
-            return finish(1, "FAIL")
 
-    if not resume_record["argv_contract_ok"]:
-        evidence["errors"].append(f"resume launch argv contract violation: {resume_record['argv_contract_detail']}")
+    _resume_observation_count = 0
+
+    def _observe_resume() -> tuple[int, bool, str, str]:
+        # Issue #2050 OWNER review P1-a / P2 fix-delta: the initial resume
+        # attempt and any bounded retry attempt are unified through this
+        # SAME observation path -- there is no more special-cased "check the
+        # initial resume attempt before entering the
+        # judge_phase_with_bounded_retry()-protected try/except
+        # _ResumeRetryHardStop scope" structure. Every attempt (first or
+        # retry) is (1) launched, (2) recorded/held as the current
+        # authoritative attempt, THEN (3) structurally checked -- in that
+        # fixed order, for every outcome (success, FAIL, SKIP) consistently.
+        # This means: (P1-a) a structural failure on the very FIRST resume
+        # attempt now reaches the exact same ``_ResumeRetryHardStop``
+        # exception handling as a retry attempt's structural failure (it can
+        # no longer propagate as an uncaught exception, bypassing
+        # ``finish()``); and (P2) if the structural check raises, the
+        # evidence has already been updated with THIS attempt's own
+        # exit_code/timed_out/diagnostic fields (never a stale earlier
+        # attempt's).
+        nonlocal resume_record, resume_out, resume_err, resume_timed_out, _resume_observation_count
+        _resume_observation_count += 1
+        record, out, err, timed_out = launch(
+            "resume",
+            "What reference token did I mention earlier in this conversation? "
+            "Respond with exactly that token and nothing else. Do not use any tools.",
+            resume_session_id=observed_id_1,
+        )
+        resume_record, resume_out, resume_err, resume_timed_out = record, out, err, timed_out
+        resume_attempts_evidence.append(dict(record))
+        _check_resume_attempt_or_raise(record, out, err, retry=_resume_observation_count > 1)
+        return record["exit_code"], timed_out, out, err
+
+    try:
+        verdict, reason, _retry_attempts = judge_phase_with_bounded_retry(_observe_resume)
+    except _ResumeRetryHardStop as hard_stop:
+        # (P1-a) reach the same finish() contract as every other return path:
+        # write evidence.json (with the actual failing attempt's fields, not
+        # a stale earlier attempt's -- P2) and return via finish(), instead
+        # of letting the exception propagate uncaught.
+        evidence["same_continuation_launch"] = resume_record
+        if len(resume_attempts_evidence) > 1:
+            evidence["same_continuation_launch"]["bounded_retry_stale_attempts"] = resume_attempts_evidence[:-1]
+        if hard_stop.skip_reason is not None:
+            return finish(77, "SKIP", skip_reason=hard_stop.skip_reason)
+        evidence["errors"].append(hard_stop.error_message)
         return finish(1, "FAIL")
 
-    verdict, reason = judge_phase(
-        resume_record["exit_code"], resume_timed_out, resume_out, resume_err
-    )
+    # The final (possibly retried) attempt is authoritative for downstream
+    # fields (id equality, marker recall, exit code). A stale earlier
+    # timed-out attempt is preserved as evidence but never conflated with
+    # this final result.
+    evidence["same_continuation_launch"] = resume_record
+    if len(resume_attempts_evidence) > 1:
+        evidence["same_continuation_launch"]["bounded_retry_stale_attempts"] = resume_attempts_evidence[:-1]
+
     if verdict == "skip":
         return finish(77, "SKIP", skip_reason=reason)
     if verdict == "fail":
