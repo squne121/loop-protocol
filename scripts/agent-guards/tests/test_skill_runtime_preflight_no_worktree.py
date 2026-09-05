@@ -42,7 +42,12 @@ def _make_repo(tmp_path: Path) -> Path:
     repo.mkdir()
     _git("init", "-q", "-b", "main", cwd=repo)
     _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
-    (repo / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\n")
+    # Issue #2199: mirrors this real repo's own `.gitignore` entry for
+    # `.claude/worktrees/` -- the fixed dedicated-worktree path (#2197)
+    # `capture_primary_checkout_invariant_snapshot()`'s `git status` must
+    # NOT see as untracked drift once `main()` creates it under this
+    # fixture's own `project_root`.
+    (repo / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\n.claude/worktrees/\n")
     (repo / "README.md").write_text("seed\n")
     _git("add", "README.md", ".gitignore", cwd=repo)
     _git("commit", "-q", "-m", "seed", cwd=repo)
@@ -86,15 +91,82 @@ def _write_text(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def _init_control_plane_origin(repo_root: Path, origin: Path) -> None:
+    """A real, local, deterministic ``file://`` bare remote (Issue #2199)
+    that Issue #2199's dedicated-worktree lifecycle (#2196/#2197/#2198) can
+    bind against with no real GitHub network access
+    (``network_required: false``) -- the SAME bare + symbolic-HEAD pattern
+    ``tests/agent_ops/test_control_plane_worktree_bootstrap.py``'s own
+    ``_init_remote_fixture()`` already uses for #2197. Pushes ``repo_root``'s
+    current ``HEAD`` (the already-committed fixture, see
+    ``_install_skill_runtime_exec_fixture`` below) as this bare remote's
+    ``main``."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "push", "-q", str(origin), "HEAD:refs/heads/main"],
+        cwd=str(repo_root),
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    subprocess.run(
+        ["git", "--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def _execution_root(repo_root: Path) -> Path:
+    """The one fixed dedicated worktree path Issue #2199's wired `main()`
+    dispatches the 4 production preflight profiles' child process under
+    (mirrors `worktree_bootstrap_exec.fixed_control_plane_worktree_path()`)
+    -- this fixture's own artifact-existence assertions must look here, not
+    under `repo_root`, once the child's cwd is the dedicated worktree."""
+    return repo_root / ".claude" / "worktrees" / "control-plane-preflight"
+
+
 def _install_skill_runtime_exec_fixture(repo_root: Path) -> None:
     source_root = REPO_ROOT
     for rel in (
         "scripts/agent-guards/skill_runtime_exec.py",
         "scripts/agent-guards/skill_runtime_command_policy.py",
+        "scripts/agent-guards/worktree_bootstrap_command_policy.py",
+        "scripts/agent-ops/worktree_bootstrap_exec.py",
+        "scripts/agent-ops/worktree_catalog.py",
     ):
         src = source_root / rel
         dest = repo_root / rel
         _write_text(dest, src.read_text())
+
+    # Issue #2199: `preflight.run` is now one of the 4 production preflight
+    # profiles `main()` dispatches under a dedicated worktree bound to a
+    # real remote's `accepted_oid` (#2197). Source-patch the copied
+    # `skill_runtime_exec.py`'s hardcoded canonical remote constant to this
+    # fixture's own local, deterministic bare remote (computed here, before
+    # that remote is actually created by `_init_control_plane_origin`
+    # below, so this patch can be committed together with every other
+    # fixture file) -- never the real `https://github.com/...` production
+    # remote (`network_required: false` / `auth_required: false` per this
+    # Issue's Runtime Verification Applicability). This is the same
+    # source-patch technique this repo's sibling
+    # `test_workflow_start_entry_canonical_executor.py` already uses for
+    # its own fixed-PATH `gh` override.
+    control_plane_origin_path = repo_root.parent / "control-plane-origin.git"
+    control_plane_remote_url = control_plane_origin_path.as_uri()
+    executor_path = repo_root / "scripts" / "agent-guards" / "skill_runtime_exec.py"
+    executor_source = executor_path.read_text(encoding="utf-8")
+    default_remote_line = 'CONTROL_PLANE_CANONICAL_REMOTE_URL = f"https://github.com/{TRUSTED_REPO_SLUG}.git"'
+    assert default_remote_line in executor_source
+    fixture_remote_line = f"CONTROL_PLANE_CANONICAL_REMOTE_URL = {control_plane_remote_url!r}"
+    executor_path.write_text(executor_source.replace(default_remote_line, fixture_remote_line), encoding="utf-8")
 
     pin = _pinned_uv_version(source_root)
     _write_text(
@@ -109,24 +181,6 @@ dependencies = []
 required-version = "{pin}"
 managed = false
 ''',
-    )
-
-    _write_text(
-        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
-        """from __future__ import annotations
-
-class Deadline:
-    def subprocess_timeout(self, seconds: float) -> float:
-        return seconds
-
-
-def list_worktrees(project_root: str, deadline=None):
-    return []
-
-
-def select_issue_worktree(catalog, issue_number, root_realpath):
-    return None
-""",
     )
 
     _write_text(
@@ -235,6 +289,16 @@ if __name__ == "__main__":
 """,
     )
 
+    # Issue #2199: the dedicated worktree's child process
+    # (`workflow_start_entry.py` -> `run_refinement_preflight.py`) actually
+    # runs FROM the dedicated worktree checked out at the remote's
+    # `accepted_oid` -- everything the child needs must be part of a REAL
+    # commit this fixture pushes to its own local bare origin below, not
+    # merely present, uncommitted, in the outer working tree.
+    _git("add", "-A", cwd=repo_root)
+    _git("commit", "-q", "-m", "install skill runtime fixture", cwd=repo_root)
+    _init_control_plane_origin(repo_root, control_plane_origin_path)
+
 
 def _run_executor(repo: Path, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo)}
@@ -280,8 +344,13 @@ def test_local_main_branch_guard_no_worktree_local_main_branch_guard(tmp_path: P
     assert result.returncode == 0, result.stderr
     exec_result = _run_executor(repo)
     assert exec_result.returncode == 0, exec_result.stderr
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    # Issue #2199: `preflight.run`'s child now actually runs under the
+    # dedicated worktree (`execution_root`), not `repo` -- proving the
+    # artifact landed THERE (never under `repo`) is itself part of this
+    # non-regression test's coverage of the wired dispatch.
+    artifact = _execution_root(repo) / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
     assert artifact.exists()
+    assert not (repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json").exists()
     assert json.loads(artifact.read_text()) == {
         "issue_number": "1228",
         "repo": "squne121/loop-protocol",
@@ -303,7 +372,7 @@ def test_worktree_scope_guard_no_worktree_worktree_scope_guard(tmp_path: Path) -
     assert result.returncode == 0, result.stderr
     exec_result = _run_executor(repo)
     assert exec_result.returncode == 0, exec_result.stderr
-    artifact = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
+    artifact = _execution_root(repo) / ".claude" / "artifacts" / "issue-refinement-loop" / "1228" / "preflight.json"
     assert artifact.exists()
 
 
