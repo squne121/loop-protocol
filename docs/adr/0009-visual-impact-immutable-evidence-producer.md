@@ -19,8 +19,6 @@ superseded_by: null
 
 # ADR 0009: Visual Impact Evidence Producer — Same-Run Producer Authenticity
 
-<!-- 注記: 本ファイル名は Issue #2101 の Allowed Paths (`docs/adr/0007-visual-impact-immutable-evidence-producer.md`) の指定通りだが、`docs/adr/0007-agent-retrospective-boundaries.md` が既に adr_id "0007" を使用しているため、本ADRの adr_id は次の空き番号 "0009" を採番した。ファイル名の "0007" プレフィックスと adr_id "0009" の不一致は、本Issueのスコープ外のfollow-upリネーム候補として `## Notes` に記録する。 -->
-
 ## Context（背景）
 
 親Issue #2093（visual-impact-policy-trusted の残存検証ギャップ縮小）の子3として、`visual-impact-policy` evidence producer/consumer/verifier について、同一 workflow run 内での candidate-controlled producer 偽装（same-run producer authenticity）に対して、固定 producer・full-SHA pinned reusable workflow・artifact attestation を採用するかどうかを決定する。
@@ -134,7 +132,3 @@ untrusted ZIP artifactの展開は `scripts/agent-ops/resolve_visual_impact.py` 
 - GitHub公式ドキュメント「Reusing workflow configurations」（reusable workflowのSHA固定・呼び出し元checkout挙動に関する一次資料。Option 2の検討で参照）
 - GitHub公式ドキュメント「Artifact attestations concept」および「SLSA v1 Build Level 3」ガイド（attestation predicateの限界・必要な権限要件に関する一次資料。Option 3の検討で参照）
 - GitHub CLIの`gh attestation verify`コマンドのマニュアル（`--signer-workflow` / `--signer-digest`オプションの仕様確認元。Option 3の検討で参照）
-
-## Notes
-
-- ファイル名 `0007-visual-impact-immutable-evidence-producer.md` はIssue #2101のAllowed Pathsの指定通りだが、`docs/adr/0007-agent-retrospective-boundaries.md` が既にadr_id "0007"を使用しているため、本ADRのadr_idは次の空き番号 "0009" を採番した。ファイル名prefixとadr_idの不一致の解消（リネーム）は本Issueのスコープ外であり、follow-up Issue候補として記録するに留める。
