@@ -699,18 +699,41 @@ def test_pytest_cache_cold_start_temp_dir_nested_is_rejected(tmp_path: Path) -> 
     pytest rootdir (repo root for this repository), so a nested occurrence
     can never be pytest's genuine cold-start temp dir
     THEN skill_runtime_exec.py must still fail-close with
-    unauthorized_write_path (the exemption is repo-root-top-level-only)."""
+    unauthorized_write_path (the exemption is repo-root-top-level-only).
+
+    Issue #2199 (CI-observed race fix): uses the deterministic go-file/
+    ack-file barrier (see `test_tracked_source_file_unauthorized_write_is_
+    rejected` above for the fixed-delay-under-load rationale) instead of a
+    fixed `delay_seconds` race -- under increased CI load a fixed 0.2s delay
+    is not reliably shorter than the executor's before/after snapshot
+    window, so the write can land AFTER the after-snapshot instead of
+    during the race window (a false PASS / returncode 0 instead of the
+    expected fail-closed returncode 2)."""
     repo = _make_repo(tmp_path)
     _install_skill_runtime_exec_fixture(repo)
     execution_root = _execution_root(repo)
     nested_temp_dir = execution_root / "sub" / "pytest-cache-files-abc123de" / "CACHEDIR.TAG"
-    thread = _write_after_delay(
-        nested_temp_dir, "Signature: 8a477f597d28d172789f06886806bc55\n", delay_seconds=0.2, wait_for=execution_root
-    )
+    go_file = tmp_path / "barrier-go-nested-temp-dir"
+    ack_file = tmp_path / "barrier-ack-nested-temp-dir"
+
+    def _write_nested_temp_dir_after_go() -> None:
+        assert _wait_for_path(go_file, timeout=30), "barrier go-file never appeared"
+        nested_temp_dir.parent.mkdir(parents=True, exist_ok=True)
+        nested_temp_dir.write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+        ack_file.write_text("ack")
+
+    thread = threading.Thread(target=_write_nested_temp_dir_after_go)
+    thread.start()
     try:
-        result = _run_executor(repo, {"SKILL_RUNTIME_TEST_SLEEP_SECONDS": "0.6"})
+        result = _run_executor(
+            repo,
+            {
+                "SKILL_RUNTIME_TEST_BARRIER_GO_FILE": str(go_file),
+                "SKILL_RUNTIME_TEST_BARRIER_ACK_FILE": str(ack_file),
+            },
+        )
     finally:
-        thread.join(timeout=5)
+        thread.join(timeout=10)
     assert result.returncode == 2, result.stderr
     assert "reason_code=unauthorized_write_path" in result.stderr
     assert "unauthorized write path=sub/" in result.stderr
