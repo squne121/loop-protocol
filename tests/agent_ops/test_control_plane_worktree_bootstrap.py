@@ -176,7 +176,6 @@ def _init_main_dispatch_fixture(
     *,
     extra_repo_files: tuple[str, ...] = (),
     extra_written_files: dict[str, str] | None = None,
-    extra_dependencies: tuple[str, ...] = (),
 ) -> tuple[Path, str]:
     """A real remote (like `_init_remote_fixture`) PLUS the real production
     `command_registry.py`/`workflow_start_entry.py` at `project_root` and a
@@ -195,13 +194,30 @@ def _init_main_dispatch_fixture(
     `managed = false` fixture hid the "managed uv project's first `uv run`
     creates `.venv`" bug this Issue's dedicated dispatch must not
     misclassify as an unauthorized write, because an unmanaged project never
-    triggers `uv`'s own auto-sync/`.venv`-creation behavior at all.
-    ``extra_dependencies`` (exact-pinned, e.g. this real repo's own resolved
-    `pyyaml==6.0.3`) lets a caller opt into a genuine dependency-install
-    first-run instead of the zero-dependency default every other test here
-    uses (kept dependency-free so unrelated ACs stay fast); a real,
-    offline-resolvable (`UV_OFFLINE=1`) `uv lock` is generated and committed
-    here, exactly like this real repo commits its own `uv.lock`.
+    triggers `uv`'s own auto-sync/`.venv`-creation behavior at all. This
+    project is deliberately dependency-free: `uv sync`/`uv run` on a managed
+    project provisions its `.venv` (writes `pyvenv.cfg`, the sibling
+    `dedicated_execution_venv_dir` assertion this Issue's P1-1 tests below
+    check) regardless of whether it has any third-party dependency to
+    install -- verified locally by running `uv sync --locked` against this
+    exact zero-dependency shape and confirming `pyvenv.cfg` is written.
+    Issue #2199 iteration-2 OWNER-CI feedback (live `python-test-core`
+    regression on PR #2495): an earlier revision of this fixture opted a
+    caller into a REAL `pyyaml==6.0.3` PyPI dependency (via an
+    ``extra_dependencies`` parameter) so `uv sync` had "real" install work
+    to do; that made the fixture-authoring `uv lock` reach an actual package
+    registry (even under `UV_OFFLINE=1` + the host's own warm `uv cache
+    dir`, since a NEW project's lock resolution still needs that exact
+    wheel warm in cache), which happened to already be warm on every
+    local/sandbox dev machine but was NOT warm on the GitHub Actions
+    `python-test-core` runner, so that `uv lock` step failed there with
+    uv's own "network was disabled" resolver error -- a genuine `#2199`
+    Runtime Verification Applicability `network_required: false` violation.
+    Since dependency-install is not actually required to exercise the
+    `.venv`-creation behavior this Issue's fix targets, this fixture (and
+    every one of its dispatch-based callers) now stays permanently
+    zero-dependency instead, removing the package registry from this
+    fixture's dependency-resolution graph entirely.
     """
     source = tmp_path / "main-dispatch-source"
     origin = tmp_path / "main-dispatch-origin.git"
@@ -211,13 +227,12 @@ def _init_main_dispatch_fixture(
     (source / ".gitignore").write_text(".claude/worktrees/\n.venv/\n", encoding="utf-8")
     (source / "README.md").write_text("fixture\n", encoding="utf-8")
     pin = _pinned_uv_version(REPO_ROOT)
-    deps_literal = ", ".join(f'"{dep}"' for dep in extra_dependencies)
     (source / "pyproject.toml").write_text(
         f'''[project]
 name = "main-dispatch-fixture"
 version = "0.0.0"
 requires-python = ">=3.12"
-dependencies = [{deps_literal}]
+dependencies = []
 
 [tool.uv]
 required-version = "{pin}"
@@ -237,6 +252,11 @@ required-version = "{pin}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8")
     lock_env = dict(env)
+    # Defense in depth (never actually load-bearing: this project has zero
+    # dependencies, so `uv lock` here never needs to consult a package
+    # registry at all) -- fail loudly rather than silently reaching a real
+    # package index if this fixture ever regresses to a registry-backed
+    # dependency again.
     lock_env["UV_OFFLINE"] = "1"
     # This test process may itself be running under `uv run` (its own
     # `VIRTUAL_ENV`/project-scoped interpreter), which would otherwise leak
@@ -244,16 +264,6 @@ required-version = "{pin}"
     # THAT unrelated venv's interpreter instead of resolving fresh for this
     # disposable fixture project.
     lock_env.pop("VIRTUAL_ENV", None)
-    # `_git_env` above fakes `HOME` (git-identity isolation only) -- left
-    # alone, that empties `uv`'s default `$HOME/.cache/uv` resolution and
-    # makes this OFFLINE `uv lock` unable to find the real host's already
-    # warm cache. Point `UV_CACHE_DIR` at the REAL host cache explicitly so
-    # this fixture-authoring step reuses it instead of resolving against an
-    # empty one.
-    real_cache_dir = subprocess.run(
-        ["uv", "cache", "dir"], check=True, text=True, capture_output=True
-    ).stdout.strip()
-    lock_env["UV_CACHE_DIR"] = real_cache_dir
     subprocess.run(["uv", "lock"], cwd=source, check=True, env=lock_env, capture_output=True)
     subprocess.run(["git", "add", "-A"], cwd=source, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=source, check=True, env=env)
@@ -1131,13 +1141,23 @@ def main() -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--anchor-comment-url", required=False, default=None)
     parser.parse_args()
-    import yaml  # real dependency: proves the managed project's OWN venv actually installed it
-
+    # Issue #2199 iteration-2 OWNER-CI feedback: this stub previously did
+    # `import yaml` here to "prove" a real dependency install -- but this
+    # inner script actually runs under WHATEVER interpreter
+    # `_resolve_trusted_executable("python3", ...)` selects (a pre-existing,
+    # unrelated #2073 identity-preservation choice), never necessarily the
+    # freshly-`uv sync`-prepared `dedicated_execution_venv_dir` itself, so
+    # that import was never actual proof of which `uv sync` target got used
+    # (see the caller tests' own comments) -- only a real PyPI dependency
+    # `uv lock`/`uv sync` had to resolve, which made the fixture-authoring
+    # step reach a real package registry and fail on a CI runner whose `uv`
+    # cache did not have it warm. Dropped entirely; the caller tests'
+    # `.venv` presence/absence assertions are the actual proof.
     marker_path = os.environ.get("SKILL_RUNTIME_TEST_INNER_MARKER_PATH")
     if marker_path:
         marker = Path(marker_path)
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(json.dumps({"cwd": os.getcwd(), "yaml_module_file": yaml.__file__}))
+        marker.write_text(json.dumps({"cwd": os.getcwd()}))
     print('{"schema": "refinement_preflight_result/v1", "status": "ready"}')
     return 0
 
@@ -1153,7 +1173,6 @@ def _init_managed_uv_dispatch_fixture(tmp_path: Path) -> tuple[Path, str]:
         extra_written_files={
             ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py": _MANAGED_UV_PREFLIGHT_STUB,
         },
-        extra_dependencies=("pyyaml==6.0.3",),
     )
 
 
@@ -1199,16 +1218,24 @@ def _push_additional_commit_to_origin(origin_url: str, tmp_path: Path, marker_na
 def test_given_managed_uv_project_when_dedicated_venv_absent_then_first_launch_not_misclassified_unauthorized_write(
     tmp_path, monkeypatch
 ):
-    """Issue #2199 OWNER feedback P1-1 case 1: a genuinely MANAGED uv
-    project (real `pyyaml==6.0.3` dependency, no `managed = false`) whose
-    fixed dedicated worktree has never run `uv` before. Before this
-    fix_delta, `uv run`'s first-launch `.venv` creation happened INSIDE
-    `execution_root`, which the write-monitor misclassified as
-    `unauthorized_write_path`. After the fix, the environment is prepared
-    and relocated to `dedicated_execution_venv_dir` (a SIBLING of
+    """Issue #2199 OWNER feedback P1-1 case 1: a genuinely MANAGED, but
+    dependency-free (Issue #2199 iteration-2 OWNER-CI fix_delta: see
+    `_init_main_dispatch_fixture()`'s docstring for why -- an earlier
+    revision used a REAL `pyyaml==6.0.3` PyPI dependency here, which broke
+    live required CI's hermeticity), `uv` project (no `managed = false`)
+    whose fixed dedicated worktree has never run `uv` before. Before the
+    original P1-1 fix_delta, `uv run`'s first-launch `.venv` creation
+    happened INSIDE `execution_root`, which the write-monitor misclassified
+    as `unauthorized_write_path`. After the fix, the environment is
+    prepared and relocated to `dedicated_execution_venv_dir` (a SIBLING of
     `execution_root`, never nested inside it) before the write-monitoring
-    window opens, so the real dependency import succeeds and no `.venv`
-    ever appears inside the monitored dedicated worktree."""
+    window opens, so no `.venv` ever appears inside the monitored dedicated
+    worktree -- verified locally (with `UV_OFFLINE=1` and a bogus
+    `UV_DEFAULT_INDEX`, simulating a network-disabled CI sandbox) that
+    `uv sync --locked` against this exact zero-dependency shape still
+    provisions `.venv`/`pyvenv.cfg`, so removing the dependency does not
+    weaken this test's proof of the underlying `.venv`-creation
+    misclassification bug."""
     inner_marker = tmp_path / "case1-inner-ran.marker"
     local, url = _init_managed_uv_dispatch_fixture(tmp_path)
     monkeypatch.setattr(worktree_bootstrap_exec, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
@@ -1224,18 +1251,16 @@ def test_given_managed_uv_project_when_dedicated_venv_absent_then_first_launch_n
     assert inner_marker.exists()
     observed = json.loads(inner_marker.read_text(encoding="utf-8"))
     assert os.path.realpath(observed["cwd"]) == os.path.realpath(execution_root)
-    # The core P1-1 claim: the managed project's own `uv sync` target (this
-    # fixture's real `pyyaml==6.0.3` dependency) never lands inside the
-    # monitored dedicated worktree tree -- it is relocated to the sibling
-    # `dedicated_execution_venv_dir`, which this dispatch's explicit
-    # preparation step (`ensure_dedicated_execution_environment_ready`,
+    # The core P1-1 claim: the managed project's own `uv sync` target never
+    # lands inside the monitored dedicated worktree tree -- it is relocated
+    # to the sibling `dedicated_execution_venv_dir`, which this dispatch's
+    # explicit preparation step (`ensure_dedicated_execution_environment_ready`,
     # called before the write-monitoring window opens) actually populated.
-    # (The inner script's OWN `yaml` import resolves through whatever
-    # interpreter `_resolve_trusted_executable("python3", ...)` selected --
-    # a pre-existing, unrelated #2073 identity-preservation choice this
-    # Issue does not change -- so it is not itself proof of which `uv`
-    # sync target was used; the absence of `.venv` inside `execution_root`
-    # plus the sibling directory's existence is.)
+    # The absence of `.venv` inside `execution_root` plus the sibling
+    # directory's `pyvenv.cfg` existence together are the actual proof (a
+    # managed project's `uv sync` provisions `.venv` unconditionally, even
+    # with zero dependencies to install -- verified locally, see the
+    # docstring above).
     assert not (Path(execution_root) / ".venv").exists()
     assert Path(dedicated_venv).is_dir()
     assert (Path(dedicated_venv) / "pyvenv.cfg").is_file()
