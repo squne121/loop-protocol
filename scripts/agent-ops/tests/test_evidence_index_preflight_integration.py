@@ -45,6 +45,12 @@ import run_refinement_preflight as preflight  # noqa: E402
 ISSUE_NUMBER = 2052
 REPO = "testowner/testrepo"
 
+
+def _artifact_dir(repo_root: Path) -> Path:
+    """The per-issue artifact directory shared by every fixed-schema and
+    purely-additive artifact this test asserts on."""
+    return repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER)
+
 ISSUE_BODY = """
 ## Machine-Readable Contract
 
@@ -163,12 +169,10 @@ def test_cache_toggle_semantic_equivalence_and_fetch_count_reduction(tmp_path, m
     assert issue_fetch_calls["n"] == 1
 
     raw_snapshot_disabled = json.loads(
-        (repo_root_disabled / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER) / "raw_issue_snapshot.json")
-        .read_text(encoding="utf-8")
+        (_artifact_dir(repo_root_disabled) / "raw_issue_snapshot.json").read_text(encoding="utf-8")
     )
     planner_input_disabled = json.loads(
-        (repo_root_disabled / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER) / "planner_input.json")
-        .read_text(encoding="utf-8")
+        (_artifact_dir(repo_root_disabled) / "planner_input.json").read_text(encoding="utf-8")
     )
 
     # --- Cache enabled (independent repo_root), sharing an externally-visible EvidenceIndex so this
@@ -208,12 +212,10 @@ def test_cache_toggle_semantic_equivalence_and_fetch_count_reduction(tmp_path, m
     )
 
     raw_snapshot_enabled = json.loads(
-        (repo_root_enabled / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER) / "raw_issue_snapshot.json")
-        .read_text(encoding="utf-8")
+        (_artifact_dir(repo_root_enabled) / "raw_issue_snapshot.json").read_text(encoding="utf-8")
     )
     planner_input_enabled = json.loads(
-        (repo_root_enabled / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER) / "planner_input.json")
-        .read_text(encoding="utf-8")
+        (_artifact_dir(repo_root_enabled) / "planner_input.json").read_text(encoding="utf-8")
     )
 
     # AC6: cache on/off is semantically equivalent -- identical decision AND
@@ -233,9 +235,7 @@ def test_cache_toggle_semantic_equivalence_and_fetch_count_reduction(tmp_path, m
     # AC7 (observed via the real integration, not just the unit test):
     # the NEW, purely-additive context_budget_report.json artifact reflects
     # the real fetch/reuse activity for this phase.
-    report_path = (
-        repo_root_enabled / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER) / "context_budget_report.json"
-    )
+    report_path = _artifact_dir(repo_root_enabled) / "context_budget_report.json"
     assert report_path.is_file()
     report_payload = json.loads(report_path.read_text(encoding="utf-8"))
     assert report_payload["schema"] == "CONTEXT_BUDGET_REPORT_V1"
@@ -248,9 +248,7 @@ def test_cache_toggle_semantic_equivalence_and_fetch_count_reduction(tmp_path, m
     # `run_preflight()` had already written the report).
     assert phase_metrics["snapshot_reuse_count"] == 0
 
-    disabled_report_path = (
-        repo_root_disabled / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER) / "context_budget_report.json"
-    )
+    disabled_report_path = _artifact_dir(repo_root_disabled) / "context_budget_report.json"
     assert not disabled_report_path.exists()
 
 
@@ -272,7 +270,5 @@ def test_disabled_cache_never_writes_context_budget_report(tmp_path, monkeypatch
         evidence_cache_enabled=False,
     )
 
-    report_path = (
-        repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER) / "context_budget_report.json"
-    )
+    report_path = _artifact_dir(repo_root) / "context_budget_report.json"
     assert not report_path.exists()
