@@ -81,6 +81,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -94,6 +95,20 @@ except ImportError:  # pragma: no cover - non-POSIX platform
 _HERE = os.path.dirname(os.path.realpath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+
+# Issue #2508: reuse the canonical, section-bound Machine-Readable Contract
+# parser (mrc_contract_parser.parse_machine_readable_contract) instead of
+# writing an ad-hoc issue_kind parser. cleanup_exec.py's scripts/ dir is
+# scripts/agent-ops/, while the canonical parser lives in
+# .claude/skills/create-issue/scripts/ — the same cross-skill-directory
+# sys.path insertion pattern already used by
+# .claude/skills/review-issue/scripts/check_issue_contract.py is followed here.
+_REPO_ROOT_FOR_MRC = os.path.dirname(os.path.dirname(_HERE))
+_CREATE_ISSUE_SCRIPTS = os.path.join(_REPO_ROOT_FOR_MRC, ".claude", "skills", "create-issue", "scripts")
+if _CREATE_ISSUE_SCRIPTS not in sys.path:
+    sys.path.insert(0, _CREATE_ISSUE_SCRIPTS)
+
+from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
 
 from cleanup_contract_v3 import (  # noqa: E402
     CLEANUP_CONTRACT_CONSUMED,
@@ -395,7 +410,7 @@ def _pr_state(pr_number: int, project_root: str, repo_slug: str | None, deadline
     args = [gh, "pr", "view", str(pr_number), "--json",
             "state,mergedAt,headRefName,headRefOid,baseRefName,"
             "headRepositoryOwner,isCrossRepository,closingIssuesReferences,"
-            "mergeCommit"]
+            "mergeCommit,body"]
     if repo_slug:
         args += ["--repo", repo_slug]
     try:
@@ -411,6 +426,166 @@ def _pr_state(pr_number: int, project_root: str, repo_slug: str | None, deadline
         return json.loads(out.stdout)
     except (json.JSONDecodeError, ValueError):
         return None
+
+
+# Issue #2508: research-issue (closing-keyword-not-used) linked-issue fallback.
+#
+# Canonical linkage (``closingIssuesReferences`` containing the target Issue)
+# remains the fast path and is checked FIRST by ``_verify_linked_issue`` — no
+# extra Issue fetch happens on that path. Only when canonical linkage is
+# ABSENT does the research fallback below get evaluated, and only an EXACT
+# match on ALL three conditions (exact ``Refs #<N>``, linked Issue
+# ``issue_kind: research``, linked Issue ``state: CLOSED`` +
+# ``stateReason: COMPLETED``) authorizes it. Any failure fails CLOSED to the
+# existing ``LINKED_ISSUE_MISMATCH`` reason code — no new reason code is
+# introduced.
+
+_REFS_ISSUE_PATTERN = re.compile(r"Refs #([0-9]+)")
+
+
+def _pr_body_has_exact_refs(body: str, issue_number: int) -> bool:
+    """Return True iff ``body`` contains an EXACT ``Refs #<issue_number>``.
+
+    Deliberately a small, deterministic helper (NOT a general markdown
+    parser). ``[0-9]+`` (ASCII digits only — NOT ``\\d+``, which also matches
+    Unicode full-width digits such as ``Refs #２１０１``) is captured greedily
+    so ``Refs #21010`` never matches a target of ``2101`` (the captured group
+    is the full ``21010`` run) — this rejects numeric prefix-collisions
+    without relying on regex word-boundary semantics, which would NOT reject
+    this collision (both ``1`` and ``0`` are word characters, so there is no
+    ``\\b`` boundary between ``2101`` and ``21010``).
+
+    The captured digits are compared as STRINGS against ``str(issue_number)``
+    (never ``int()``-converted): (1) this makes zero-padded forms such as
+    ``Refs #02101`` correctly NOT match target ``2101`` (exact-text
+    equality, not numeric equality); (2) it avoids ``int()`` raising
+    ``ValueError`` on pathologically long digit runs (CPython's integer
+    string-conversion length guard), which would otherwise abort the scan
+    before a later, legitimate ``Refs #<issue_number>`` in the same body is
+    ever reached.
+    """
+    if not body:
+        return False
+    target = str(issue_number)
+    for match in _REFS_ISSUE_PATTERN.finditer(body):
+        if match.group(1) == target:
+            return True
+    return False
+
+
+def _linked_issue_state(
+    issue_number: int, project_root: str, repo_slug: str, deadline: Deadline
+) -> dict | None:
+    """Fetch the linked Issue's ``body``/``state``/``stateReason`` (Issue #2508).
+
+    ``repo_slug`` MUST be the caller's already-trusted, ``_repo_slug()``-derived
+    value (explicitly pinned via ``--repo``) — this function never derives the
+    repository from untrusted input (PR body, agent input, etc). Any ``gh``
+    failure, non-zero exit, timeout, or malformed JSON response fails closed
+    by returning ``None`` (the caller then treats the research fallback as
+    not authorized, i.e. ``linked_issue_mismatch``).
+    """
+    gh = shutil.which("gh")
+    if not gh:
+        return None
+    args = [gh, "issue", "view", str(issue_number), "--repo", repo_slug,
+            "--json", "body,state,stateReason"]
+    try:
+        out = subprocess.run(
+            args, cwd=project_root, capture_output=True, text=True,
+            timeout=deadline.subprocess_timeout(20.0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        payload = json.loads(out.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    # Issue #2508 fix_delta P2-1: fail closed (None) when the JSON root is not
+    # a mapping (e.g. ``[]`` or ``true``) instead of returning a value whose
+    # ``.get()`` calls would raise ``AttributeError`` for the caller.
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _research_fallback_authorized(
+    issue_number: int, pr: dict, project_root: str, repo_slug: str, deadline: Deadline
+) -> bool:
+    """Evaluate the research-issue fallback's 3 required conditions (Issue #2508).
+
+    Only called when the canonical ``closingIssuesReferences`` fast path did
+    NOT already authorize the linked issue. ALL of the following must hold:
+      1. the PR body contains an exact ``Refs #<issue_number>``;
+      2. the linked Issue's canonical Machine-Readable Contract (reused via
+         ``parse_machine_readable_contract``) reports ``issue_kind: research``;
+      3. the linked Issue is ``state: CLOSED`` with ``stateReason: COMPLETED``.
+    Any single failure returns ``False`` (fail-closed).
+
+    Issue #2508 fix_delta P2-1: ``parse_machine_readable_contract()`` catches
+    ``yaml.YAMLError``/``TypeError`` raised while PARSING the YAML fence, but
+    certain malformed *values* (e.g. ``note: 2026-02-30``, ``note: 0x_``,
+    ``note: !!timestamp nope``) raise ``ValueError``/``AttributeError`` while
+    PyYAML CONSTRUCTS the Python object for that value — these propagate
+    through the parser uncaught. This call boundary narrowly guards against
+    that leak so a malformed linked-Issue MRC value never aborts ``run()``;
+    it always degrades to fallback-not-authorized (``False``), which the
+    caller (``_verify_linked_issue``) turns into the existing
+    ``LINKED_ISSUE_MISMATCH`` reason code.
+    """
+    if not _pr_body_has_exact_refs(pr.get("body") or "", issue_number):
+        return False
+    issue = _linked_issue_state(issue_number, project_root, repo_slug, deadline)
+    if issue is None:
+        return False
+    if issue.get("state") != "CLOSED":
+        return False
+    if issue.get("stateReason") != "COMPLETED":
+        return False
+    body = issue.get("body")
+    if not isinstance(body, str):
+        return False
+    try:
+        parse_result = parse_machine_readable_contract(body)
+    except (ValueError, TypeError, AttributeError, re.error):
+        return False
+    if not parse_result.ok:
+        return False
+    if parse_result.get("issue_kind") != "research":
+        return False
+    return True
+
+
+def _verify_linked_issue(
+    req: dict, pr: dict, project_root: str, repo_slug: str, deadline: Deadline
+) -> tuple[bool, str | None]:
+    """Shared linked-issue determination helper (Issue #2508 AC10).
+
+    Consolidates the previously-duplicated linked-issue check from
+    ``verify_cleanup_authorization`` and
+    ``verify_branch_only_cleanup_authorization`` into a single small helper.
+    ``verify_discard_authorization`` is INTENTIONALLY left untouched — the
+    research fallback never applies to the discard lane (Out of Scope).
+
+    Canonical fast path: when ``linked_issue_number`` is present in the PR's
+    ``closingIssuesReferences``, authorize immediately — no additional Issue
+    fetch is performed. Only when that fast path does NOT authorize is the
+    research fallback (``_research_fallback_authorized``) evaluated. Any
+    failure fails closed to the existing ``LINKED_ISSUE_MISMATCH`` reason
+    code — no new reason code is introduced.
+    """
+    linked = req.get("linked_issue_number")
+    if linked is None:
+        return True, None
+    linked = int(linked)
+    refs = {r.get("number") for r in (pr.get("closingIssuesReferences") or [])}
+    if linked in refs:
+        return True, None
+    if _research_fallback_authorized(linked, pr, project_root, repo_slug, deadline):
+        return True, None
+    return False, LINKED_ISSUE_MISMATCH
 
 
 def _commit_object_exists(project_root: str, commit_oid: str, deadline: Deadline) -> bool:
@@ -678,11 +853,9 @@ def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadlin
     verified.update(equivalence_fields)
     if not head_authorized:
         return False, HEAD_OID_MISMATCH, verified
-    linked = req.get("linked_issue_number")
-    if linked is not None:
-        refs = {r.get("number") for r in (pr.get("closingIssuesReferences") or [])}
-        if int(linked) not in refs:
-            return False, LINKED_ISSUE_MISMATCH, verified
+    linked_ok, linked_reason = _verify_linked_issue(req, pr, project_root, repo_slug, deadline)
+    if not linked_ok:
+        return False, linked_reason, verified
     verified["linked_issue_match"] = True
 
     return True, None, verified
@@ -789,12 +962,10 @@ def verify_branch_only_cleanup_authorization(
     verified.update(equivalence_fields)
     if not head_authorized:
         return False, HEAD_OID_MISMATCH, verified
-    # Linked issue check (AC5)
-    linked = req.get("linked_issue_number")
-    if linked is not None:
-        refs = {r.get("number") for r in (pr.get("closingIssuesReferences") or [])}
-        if int(linked) not in refs:
-            return False, LINKED_ISSUE_MISMATCH, verified
+    # Linked issue check (AC5), consolidated via the shared helper (AC10).
+    linked_ok, linked_reason = _verify_linked_issue(req, pr, project_root, repo_slug, deadline)
+    if not linked_ok:
+        return False, linked_reason, verified
     verified["linked_issue_match"] = True
 
     # All authorization conditions met — mark force-delete as authorized.
