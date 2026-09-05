@@ -44,7 +44,7 @@ METRICS = (
     "playwright_flaky_test_rate",
     "playwright_terminal_failure_rate",
 )
-ELIGIBLE_WORKFLOW_CONCLUSIONS = ("success", "failure")
+ELIGIBLE_WORKFLOW_CONCLUSIONS = ("success", "failure", "timed_out")
 
 
 class StrictJSONError(ValueError):
@@ -262,7 +262,7 @@ def _append_unique(errors: list[str], error: str) -> None:
 
 def _canonical_classification(metric: str, record: dict[str, Any], test_cases: list[dict[str, Any]]) -> str:
     if metric == "workflow_failure_rate":
-        return "failure" if record["conclusion"] == "failure" else "success"
+        return "failure" if record["conclusion"] in ("failure", "timed_out") else "success"
     outcomes = [case["outcome"] for case in test_cases]
     affected_outcome = "flaky" if metric == "playwright_flaky_test_rate" else "unexpected"
     return "affected" if affected_outcome in outcomes else "not_affected"

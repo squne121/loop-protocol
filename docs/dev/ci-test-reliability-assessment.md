@@ -87,12 +87,17 @@ worst-case Type-I error 5% を主張しない。`alpha` というキー名・型
 - duplicate workflow ID、duplicate canonical test case、non-attempt-1 sample、retry/rerun sample inclusion（重複や再試行混入を検出する）
 - included eligible record の欠落、ineligible record の inclusion、canonical classification mismatch（対象記録の欠落や誤分類を検出する）
 
-`success` / `failure` の attempt-1 workflow record は全 metric に一つずつ provenance observation
-を持つ。各 denominator はその validated unique workflow-run set の cardinality であり、同じ run
-の logical test 数や raw retry attempt 数で増えない。`cancelled`、`timed_out`、`action_required`、
+`success` / `failure` / `timed_out` の attempt-1 workflow record は全 metric に一つずつ provenance
+observation を持つ。各 denominator はその validated unique workflow-run set の cardinality であり、
+同じ run の logical test 数や raw retry attempt 数で増えない。`cancelled`、`action_required`、
 `skipped` は eligible close-evidence sample ではない。
 
-`workflow_failure_rate` は workflow conclusion が `failure` の run が affected である。
+`workflow_failure_rate` は workflow conclusion が `failure` または `timed_out` の run が affected
+である。この eligible set 拡張は3 metric 共有のため、`timed_out` run の provenance observation は
+Playwright 2 metric（`playwright_flaky_test_rate` / `playwright_terminal_failure_rate`）でも
+受理・完全性検証の対象になるが、Playwright の分類式自体（下記の official `TestCase.outcome` 判定）
+は変更されない。`timed_out` は `workflow_failure_rate` の分類にのみ影響し、Playwright observation を
+それだけで `affected` にはしない。
 歴史的 field 名を残す Playwright metrics は run-level indicator であり、同じ run に official
 `TestCase.outcome == flaky` が一つでもあれば `playwright_flaky_test_rate`、
 `outcome == unexpected` が一つでもあれば `playwright_terminal_failure_rate` の affected sample
