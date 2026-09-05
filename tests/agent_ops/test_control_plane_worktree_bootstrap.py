@@ -52,6 +52,7 @@ own contracts, not `main()`'s dispatch selection.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -528,6 +529,31 @@ def main() -> int:
         # `root_entry_router` -> this script) inherited the SAME dedicated
         # `execution_root`, never falling back to `project_root`.
         marker.write_text(os.getcwd())
+    env_marker_path = os.environ.get("SKILL_RUNTIME_TEST_INNER_ENV_MARKER_PATH")
+    if env_marker_path:
+        import json as _json
+
+        env_marker = Path(env_marker_path)
+        env_marker.parent.mkdir(parents=True, exist_ok=True)
+        # Issue #2199 AC6: records the environment THIS innermost real
+        # subprocess actually observed (`os.environ`, populated by the OS
+        # from whatever `Popen(env=...)` handed the dedicated-root child
+        # at the top of the chain, then plainly inherited -- never
+        # re-set -- by every unmodified intermediate `subprocess.run()`
+        # hop in between). This is the real dispatched process's own
+        # environment, never a dict hand-inspected inside the test
+        # process itself.
+        observed = {
+            key: os.environ.get(key)
+            for key in (
+                "GH_CONFIG_DIR",
+                "LOOP_SPARK_MODE",
+                "LOOP_SPARK_FALLBACK",
+                "LOOP_PLANNED_OPERATIONS_JSON",
+                "LOOP_PROTOCOL_TEST_UNRELATED_CANARY",
+            )
+        }
+        env_marker.write_text(_json.dumps(observed))
     print('{"schema": "refinement_preflight_result/v1", "status": "ready"}')
     return 0
 
@@ -658,11 +684,101 @@ def test_given_script_path_outside_execution_root_when_identity_verified_then_fi
 # ---------------------------------------------------------------------------
 
 
-def test_given_preflight_run_command_id_when_env_sanitized_then_env_transport_parity(tmp_path):
+def test_given_preflight_run_command_id_when_env_sanitized_in_isolation_then_expected_keys_present_auxiliary(
+    tmp_path, monkeypatch
+):
+    """Auxiliary, isolated-level sanity check only. Per Issue #2199 AC6's own
+    text, an isolated `_sanitize_env()` call alone does NOT satisfy this AC
+    -- the real proof is
+    `test_given_main_wired_and_preflight_run_dispatched_when_run_then_env_transport_parity_into_real_dedicated_child`
+    below, which observes the environment of the REAL dispatched
+    dedicated-root child process end to end. No vacuous/unconditional
+    assertion (no `or True` escape hatch)."""
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "isolated-gh-config"))
     env = exec_mod._sanitize_env(str(tmp_path), "preflight.run")
     # #2311/#2407 carriers this Issue must not touch or broaden.
     assert "CLAUDE_PROJECT_DIR" in env
-    assert "GH_CONFIG_DIR" not in env or True  # absent unless set in os.environ; presence policy unchanged below
+    assert env["GH_CONFIG_DIR"] == str(tmp_path / "isolated-gh-config")
+
+
+def test_given_main_wired_and_preflight_run_dispatched_when_run_then_env_transport_parity_into_real_dedicated_child(
+    tmp_path, monkeypatch
+):
+    """Issue #2199 AC6: extends the SAME AC5 real-process-chain fixture
+    (`exec_mod.main()` itself, never a mocked `_run_child_with_supervision`
+    leaf, never an isolated `_sanitize_env()` call in the test process) so
+    the innermost real subprocess this chain actually reaches (the
+    `run_refinement_preflight.py` stub, launched via
+    `workflow_start_entry.py`'s `_default_invoke_inner_preflight()`, a plain
+    `subprocess.run()` call with no explicit `env=` of its own -- i.e. it
+    plainly inherits whatever `Popen(env=...)` handed the dedicated-root
+    child at the very top) records the ACTUAL environment it observed.
+    Proves invocation-scoped `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK`/
+    `LOOP_PLANNED_OPERATIONS_JSON` (bare `preflight.run`) and the #2407
+    `GH_CONFIG_DIR` carrier arrive UNCHANGED at the real dispatched child,
+    AND that an unrelated, non-allowlisted env var is never generically
+    passed through."""
+    inner_marker = tmp_path / "inner-ran.marker"
+    inner_env_marker = tmp_path / "inner-env.marker"
+    local, url = _init_main_dispatch_fixture(
+        tmp_path,
+        extra_repo_files=(
+            "scripts/agent-guards/trusted_runtime_capabilities.py",
+            "scripts/agent-guards/skill_runtime_exec.py",
+            "scripts/agent-guards/skill_runtime_command_policy.py",
+            "scripts/agent-ops/worktree_catalog.py",
+            "scripts/claude-gpt/workflow_capability_preflight.py",
+            ".claude/skills/issue-refinement-loop/scripts/root_entry_router.py",
+        ),
+        extra_written_files={
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py": (
+                _INNER_PREFLIGHT_CWD_PROBE_STUB
+            ),
+        },
+    )
+    monkeypatch.setattr(worktree_bootstrap_exec, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
+
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    _write_controlled_gh_always_ok(trusted_gh_bin)
+    monkeypatch.setattr(exec_mod, "_SYSTEM_STANDARD_PATH_DIRS", (str(trusted_gh_bin), *exec_mod._SYSTEM_STANDARD_PATH_DIRS))
+
+    monkeypatch.chdir(local)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(local))
+    monkeypatch.setenv("SKILL_RUNTIME_TEST_INNER_MARKER_PATH", str(inner_marker))
+    monkeypatch.setenv("SKILL_RUNTIME_TEST_INNER_ENV_MARKER_PATH", str(inner_env_marker))
+    gh_config_dir = str(tmp_path / "fixture-gh-config")
+    planned_operations_json = (
+        '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
+        '"operation": "issue_comment", "requires_mutation": true}]'
+    )
+    monkeypatch.setenv("GH_CONFIG_DIR", gh_config_dir)
+    # `spark_fallback="allowed"` (rather than `"forbidden"`) keeps the real
+    # producer's decision at `degraded` (not `blocked`) when no real Spark
+    # binary/auth is available in this fixture, so `workflow_start_entry.py`
+    # still invokes the inner preflight -- this test's positive path is
+    # about env-var transport parity, not about forcing a hard Spark
+    # capability failure.
+    monkeypatch.setenv("LOOP_SPARK_MODE", "required")
+    monkeypatch.setenv("LOOP_SPARK_FALLBACK", "allowed")
+    monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", planned_operations_json)
+    # Not allowlisted anywhere in `_sanitize_env()` -- must NOT reach the
+    # dispatched child (proof against generic env pass-through widening).
+    monkeypatch.setenv("LOOP_PROTOCOL_TEST_UNRELATED_CANARY", "should-not-propagate")
+    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+
+    exit_code = exec_mod.main(
+        ["--command-id", "preflight.run", "--issue-number", "1228", "--repo", "squne121/loop-protocol"]
+    )
+
+    assert exit_code == 0
+    assert inner_marker.exists()
+    assert inner_env_marker.exists()
+    observed = json.loads(inner_env_marker.read_text(encoding="utf-8"))
+    assert observed["GH_CONFIG_DIR"] == gh_config_dir
+    assert observed["LOOP_SPARK_MODE"] == "required"
+    assert observed["LOOP_SPARK_FALLBACK"] == "allowed"
+    assert observed["LOOP_PLANNED_OPERATIONS_JSON"] == planned_operations_json
+    assert observed["LOOP_PROTOCOL_TEST_UNRELATED_CANARY"] is None
 
 
 def test_given_non_carrier_command_id_when_env_sanitized_then_spark_keys_not_carried(tmp_path, monkeypatch):
