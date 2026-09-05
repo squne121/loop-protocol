@@ -85,16 +85,29 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 SCHEMA_PATH = os.path.join(REPO_ROOT, "schemas", "e2e_performance_benchmark_manifest_v1.schema.json")
+
+# Issue #2422: `e2e_performance_benchmark_manifest_v2` supersedes v1's
+# `before_sha`/`after_sha`/`pre_split`/`post_split` hybrid semantics (a fixed
+# historical commit compared against a mutable current workflow) for the
+# dedicated `benchmark_layout=monolith|split` A/B/A/B dispatch route. v1 and
+# its schema/functions above are left unmodified (other, unrelated consumers
+# of this module's rerun-attempt/live-API-verification building blocks are
+# out of this Issue's scope) -- v2 is purely additive, defined below.
+SCHEMA_PATH_V2 = os.path.join(REPO_ROOT, "schemas", "e2e_performance_benchmark_manifest_v2.schema.json")
+MANIFEST_SCHEMA_V2 = "e2e_performance_benchmark_manifest_v2"
 
 EXIT_COMPLETE = 0
 EXIT_INCOMPLETE = 2
@@ -1134,6 +1147,1026 @@ def _validate_against_schema(manifest: dict) -> None:
         raise OperationalError(f"manifest_failed_schema_validation: {messages}")
 
 
+# =============================================================================
+# Issue #2422: `benchmark_layout=monolith|split` A/B/A/B bounded-orchestrator
+# manifest v2. Additive to everything above (v1's before/after collector
+# stays available/unmodified for any other in-repo consumer); this section
+# is the ONLY route that produces `e2e_performance_benchmark_manifest_v2`.
+# =============================================================================
+
+BENCHMARK_LAYOUTS = ("monolith", "split")
+MEASURED_PROVIDER_JOBS = ("e2e-core", "e2e-responsive-matrix")
+GATE_READY_JOB_NAME = "e2e"
+# AC7: only these job names may start on a `benchmark_layout != ''` dispatch
+# -- the measured provider jobs plus the single minimal gate-ready job
+# #2423's production close-grade materializer requires.
+ALLOWED_V2_JOB_NAMES = MEASURED_PROVIDER_JOBS + (GATE_READY_JOB_NAME,)
+
+_RUNNER_IMAGE_PLACEHOLDER_VALUES = frozenset({"", "unknown", "unknown/unknown", "n/a"})
+
+
+class OperationalErrorV2(OperationalError):
+    """Alias kept distinct in name (not behavior) so v2 call sites read
+    unambiguously; both are caught identically by v1 CLI error handling."""
+
+
+def compute_experiment_run_set_digest(runs: list[dict]) -> str:
+    """Issue #2422 AC5: `runs` is a list of per-run identity dicts, each
+    carrying ONLY `block_id` / `benchmark_layout` / `workflow_run_id` /
+    `run_attempt` -- NEVER `conclusion`/outcome (this digest identifies the
+    frozen dispatch root run set independent of whether any individual run
+    succeeded or failed, so a later re-run of the SAME plan against the
+    SAME root run set produces the SAME digest regardless of results).
+    Canonicalized via `json.dumps(sort_keys=True, separators=(",", ":"))`
+    over a list SORTED by `(block_id, benchmark_layout, workflow_run_id,
+    run_attempt)` -- the result is independent of the input list's order."""
+    identity_tuples = [
+        {
+            "block_id": r["block_id"],
+            "benchmark_layout": r["benchmark_layout"],
+            "workflow_run_id": r["workflow_run_id"],
+            "run_attempt": r["run_attempt"],
+        }
+        for r in runs
+    ]
+    identity_tuples.sort(
+        key=lambda d: (d["block_id"], d["benchmark_layout"], d["workflow_run_id"], d["run_attempt"])
+    )
+    canonical = json.dumps(identity_tuples, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_workflow_digest_from_commit_bytes(
+    workflow_sha: str,
+    repo: str,
+    path: str = ".github/workflows/ci.yml",
+    api_call: Callable[[str], Any] = _default_gh_api_call,
+) -> str:
+    """Issue #2422 AC1/AC3: fetches `path`'s bytes AT the commit
+    `workflow_sha` via the GitHub Contents API
+    (`GET /repos/{repo}/contents/{path}?ref={workflow_sha}`), and returns
+    `sha256:<hex>` of those EXACT decoded bytes. Deliberately NOT a
+    `sha256sum` of a post-checkout local working-tree file -- the checked-out
+    ref a benchmark dispatch runs under can differ from `workflow_sha` (the
+    dispatch `ref` stays on the current/default branch tip while
+    `workflow_sha` records the commit the workflow definition was actually
+    AT when the run was dispatched, see docs/dev/e2e-performance-benchmark.md
+    "workflow_digest / workflow_sha の既知の限界"), so computing from a local
+    checkout would silently conflate whatever happens to be on disk with the
+    claimed `workflow_sha` provenance pair -- exactly the known limitation
+    #2184 deferred to this Issue."""
+    if not _is_valid_sha(workflow_sha):
+        raise OperationalErrorV2(f"invalid_workflow_sha: {workflow_sha!r}")
+    response = api_call(f"repos/{repo}/contents/{path}?ref={workflow_sha}")
+    if (
+        not isinstance(response, dict)
+        or response.get("encoding") != "base64"
+        or not isinstance(response.get("content"), str)
+    ):
+        raise LiveAPIError(
+            f"contents_api_malformed_response: repo={repo} path={path} ref={workflow_sha}"
+        )
+    raw_bytes = base64.b64decode(response["content"])
+    return "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+
+
+def verify_workflow_digest_matches_commit_bytes(
+    workflow_sha: str,
+    claimed_workflow_digest: str,
+    repo: str,
+    api_call: Callable[[str], Any] = _default_gh_api_call,
+) -> list[str]:
+    """Issue #2422 AC3: independently RECOMPUTES `workflow_digest` from
+    `workflow_sha`'s own commit bytes (never trusting the claimed value) and
+    compares it to `claimed_workflow_digest`. This is what rejects the
+    false-green case AC3 explicitly calls out: two arms could each
+    independently claim the SAME (wrong-commit) digest -- a cross-arm
+    required-equal check ALONE would incorrectly PASS that case (equal, but
+    equally wrong) -- so this recomputation-from-source-of-truth check is
+    REQUIRED IN ADDITION TO, never a replacement for, the cross-arm
+    equality check (see `verify_cross_arm_required_equal` below)."""
+    try:
+        recomputed = compute_workflow_digest_from_commit_bytes(workflow_sha, repo, api_call=api_call)
+    except (LiveAPIError, OperationalErrorV2) as exc:
+        return [f"workflow_digest_recomputation_failed: {exc}"]
+    if recomputed != claimed_workflow_digest:
+        return [
+            f"workflow_digest_mismatch_vs_commit_bytes: workflow_sha={workflow_sha!r} "
+            f"claimed={claimed_workflow_digest!r} recomputed={recomputed!r}"
+        ]
+    return []
+
+
+def verify_cross_arm_required_equal(runs: list[dict]) -> list[str]:
+    """Issue #2422 AC1/AC3: `workflow_sha` and `workflow_digest` must be
+    IDENTICAL across every run in `runs` (both `benchmark_layout` arms) --
+    `benchmark_layout` is the ONLY intended treatment; anything else
+    differing would confound the comparison. Returns a list of violation
+    strings (empty == every run agrees)."""
+    violations: list[str] = []
+    for field in ("workflow_sha", "workflow_digest"):
+        values = {r.get(field) for r in runs if field in r}
+        if len(values) > 1:
+            violations.append(f"cross_arm_fingerprint_mismatch_{field}: values={sorted(values, key=str)!r}")
+    return violations
+
+
+def _is_placeholder_runner_image_value(value: object) -> bool:
+    return not isinstance(value, str) or value.strip().lower() in _RUNNER_IMAGE_PLACEHOLDER_VALUES
+
+
+def verify_exact_runner_image(image: object) -> list[str]:
+    """Issue #2422 AC4: `image` must be an object with non-empty, non-
+    placeholder `name`/`version` string fields -- rejects `unknown`, empty
+    string, `None`, a bare OS/architecture-only value (e.g.
+    `"unknown/unknown"`, this module's own `host_runner_image` fallback
+    shape for a DIFFERENT, run-level concept, never conflated with this
+    job-level exact identity), and a non-object value outright."""
+    if not isinstance(image, dict):
+        return ["exact_runner_image_not_object"]
+    violations: list[str] = []
+    for field in ("name", "version"):
+        if _is_placeholder_runner_image_value(image.get(field)):
+            violations.append(f"exact_runner_image_missing_or_placeholder_{field}")
+    return violations
+
+
+# #2422 AC8 fix_delta (live smoke dispatch verification against real
+# `gh api repos/{repo}/actions/jobs/{id}/logs` output, PR #2501): the
+# pre-fix_delta regexes below were modeled on a HYPOTHETICAL `Image
+# Version:` line that does not exist in a real GitHub-hosted runner job
+# log's `##[group]Runner Image ... ##[endgroup]` section -- the ACTUAL
+# format is a separate bare `Version:` line immediately following `Image:`
+# (confirmed against 6 real job logs from the `blocks=2` AC8 smoke dispatch,
+# e.g. workflow_job_id=101248519729). A blind `^Version:` search (without
+# scoping to the `Runner Image` group) would silently pick up the WRONG
+# `Version:` line -- the log ALSO carries an earlier, unrelated
+# `##[group]Runner Image Provisioner` section with its own `Version:` line
+# (the Hosted Compute Agent's own version, e.g. `20260828.587`) BEFORE the
+# real `##[group]Runner Image` section (whose `Version:` line, e.g.
+# `20260831.293.1`, is the genuine runner-image version). `_RUNNER_IMAGE_GROUP_RE`
+# isolates ONLY the real `##[group]Runner Image` body (never `...
+# Provisioner`, disambiguated by requiring the literal `Runner Image` marker
+# be immediately followed by a newline) before searching for `Image:`/
+# `Version:` within it -- this is what prevents the Provisioner's decoy
+# `Version:` line from ever being mistaken for the exact runner image
+# version. Falls back to searching the full `log_text` when no such group
+# marker is present (e.g. a minimal/synthetic log excerpt with no decoy
+# `Version:` line to disambiguate against).
+_RUNNER_IMAGE_GROUP_RE = re.compile(r"##\[group\]Runner Image\r?\n(?P<body>.*?)##\[endgroup\]", re.DOTALL)
+_SET_UP_JOB_IMAGE_RE = re.compile(r"^Image:\s*(?P<name>\S.*?)\s*$", re.MULTILINE)
+_SET_UP_JOB_IMAGE_VERSION_RE = re.compile(r"^Version:\s*(?P<version>\S.*?)\s*$", re.MULTILINE)
+
+# Issue #2422 fix_delta iteration 3 (pr-reviewer REQUEST_CHANGES on PR #2501,
+# `_default_fetch_job_log` real-`gh`-CLI defect): a real `gh api
+# repos/{repo}/actions/jobs/{id}/logs` response is the RAW GitHub Actions
+# log stream -- every line is prefixed by GitHub's own per-line timestamp
+# (e.g. `2026-09-05T08:36:13.8894765Z Image: ubuntu-24.04`), and the very
+# first line carries a UTF-8 BOM. `extract_exact_runner_image_from_job_log`'s
+# `_SET_UP_JOB_IMAGE_RE`/`_SET_UP_JOB_IMAGE_VERSION_RE` are line-anchored
+# (`^Image:`/`^Version:`) and therefore never match against the raw,
+# timestamp-prefixed line -- only against a timestamp-stripped line. This is
+# what the function's own docstring already assumed ("log_text is expected
+# to already have any per-line ... timestamp prefix ... stripped by the
+# caller's log_fetch") but `_default_fetch_job_log` never actually did before
+# this fix (confirmed by feeding a real captured job log, workflow_job_id
+# 101278556600, through `extract_exact_runner_image_from_job_log` directly
+# and observing `None` -- the BOM/timestamp prefix was masking real parsing
+# gaps that the tests' pre-stripped fake `log_fetch` fixtures never exposed).
+_GH_JOB_LOG_TIMESTAMP_PREFIX_RE = re.compile(
+    r"^﻿?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z ", re.MULTILINE
+)
+
+
+def _strip_gh_job_log_timestamp_prefix(log_text: str) -> str:
+    """Issue #2422 fix_delta iteration 3: strips GitHub's per-line log
+    timestamp prefix (and a leading UTF-8 BOM, if present) so the
+    line-anchored `_SET_UP_JOB_IMAGE_RE`/`_SET_UP_JOB_IMAGE_VERSION_RE`
+    regexes in `extract_exact_runner_image_from_job_log` can match against a
+    REAL `gh api .../logs` response, not just against tests' pre-stripped
+    fake fixtures."""
+    return _GH_JOB_LOG_TIMESTAMP_PREFIX_RE.sub("", log_text)
+
+
+def extract_exact_runner_image_from_job_log(log_text: str) -> dict | None:
+    """Issue #2422 AC4 (fix_delta after #2422 AC8 live smoke dispatch,
+    PR #2501 -- see the module-level comment above `_RUNNER_IMAGE_GROUP_RE`
+    for the real-log-format defect this replaced): parses the real
+    `##[group]Runner Image ... ##[endgroup]` section GitHub Actions emits
+    for a GitHub-hosted runner job, e.g.:
+
+        ##[group]Runner Image
+        Image: ubuntu-24.04
+        Version: 20260901.1.0
+        ##[endgroup]
+
+    Returns `{"name": ..., "version": ...}`, or `None` if either line is
+    absent/empty (e.g. a containerized job whose host runner section does
+    not surface these lines the same way -- callers must treat `None` as a
+    hard verification failure via `fetch_exact_runner_image_for_job`, never
+    silently substitute an OS/architecture-only fallback). `log_text` is
+    expected to already have any per-line GitHub Actions log timestamp
+    prefix (e.g. `2026-09-05T04:29:18.1156490Z `) stripped by the caller's
+    `log_fetch` -- this function's own line-anchored (`^`) regexes do not
+    strip it themselves."""
+    group_match = _RUNNER_IMAGE_GROUP_RE.search(log_text)
+    scoped_text = group_match.group("body") if group_match else log_text
+    name_match = _SET_UP_JOB_IMAGE_RE.search(scoped_text)
+    version_match = _SET_UP_JOB_IMAGE_VERSION_RE.search(scoped_text)
+    if not name_match or not version_match:
+        return None
+    name = name_match.group("name").strip()
+    version = version_match.group("version").strip()
+    if _is_placeholder_runner_image_value(name) or _is_placeholder_runner_image_value(version):
+        return None
+    return {"name": name, "version": version}
+
+
+def fetch_exact_runner_image_for_job(
+    workflow_job_id: int,
+    repo: str,
+    log_fetch: Callable[[int, str], str],
+) -> dict:
+    """Issue #2422 AC4: `log_fetch(workflow_job_id, repo) -> str` is
+    dependency-injected -- the real implementation fetches ONLY this
+    specific job's own log (e.g. `gh api
+    repos/{repo}/actions/jobs/{workflow_job_id}/logs`), never a different
+    "probe" job's log and never a run-level aggregate. Raises
+    `LiveAPIError` (fail-closed) if the `Set up job` section cannot be
+    parsed out of the fetched log."""
+    log_text = log_fetch(workflow_job_id, repo)
+    image = extract_exact_runner_image_from_job_log(log_text)
+    if image is None:
+        raise LiveAPIError(
+            f"exact_runner_image_not_found_in_set_up_job_log: workflow_job_id={workflow_job_id!r}"
+        )
+    return image
+
+
+# Issue #2422 fix_delta Blocker 5 (OWNER REQUEST_CHANGES on PR #2501,
+# issuecomment-5549966497): the real dispatched topology is ASYMMETRIC --
+# `monolith` runs the core AND responsive workloads sequentially inside a
+# SINGLE `e2e-core` provider job; `split` runs the SAME two workloads as TWO
+# parallel provider jobs (`e2e-core` for core, `e2e-responsive-matrix` for
+# responsive). The pre-fix_delta comparison grouped provider images by JOB
+# NAME and only compared groups with >= 2 records -- `e2e-responsive-matrix`
+# never has a monolith-side record (monolith never reports that job name at
+# all), so a responsive-workload-only image drift was silently invisible.
+# This table maps each MEASURED WORKLOAD to the job name that physically
+# executes it, per layout, so comparison is workload-to-workload (monolith's
+# single e2e-core job stands in for BOTH workloads), never job-name-to-
+# job-name.
+WORKLOAD_PROVIDER_JOB_BY_LAYOUT: dict[str, dict[str, str]] = {
+    "monolith": {"core": "e2e-core", "responsive": "e2e-core"},
+    "split": {"core": "e2e-core", "responsive": "e2e-responsive-matrix"},
+}
+MEASURED_WORKLOADS = ("core", "responsive")
+
+
+def _exact_runner_image_by_job_name(run: dict) -> dict[str, dict]:
+    images: dict[str, dict] = {}
+    for job in run.get("provider_jobs", []):
+        image = job.get("exact_runner_image")
+        if isinstance(image, dict):
+            images[job.get("job")] = image
+    return images
+
+
+def verify_exact_runner_image_required_equal_within_block(block: dict) -> list[str]:
+    """Issue #2422 AC4 (fix_delta Blocker 5): image-identity required-equal
+    is scoped to the SAME `block_id`, compared ACROSS its two
+    `benchmark_layout` runs PER MEASURED WORKLOAD (`core`/`responsive`, see
+    `WORKLOAD_PROVIDER_JOB_BY_LAYOUT`) -- never by matching job NAME, which
+    silently missed a responsive-only mismatch under this experiment's real
+    asymmetric monolith(1 provider)/split(2 providers) topology. Missing
+    evidence (a workload's provider job absent from a run, or a job present
+    without a valid `exact_runner_image`) is NOT reported here -- that is
+    `verify_exact_runner_image`'s responsibility; this function only
+    compares pairs where BOTH sides are present. Never asserted equal
+    across DIFFERENT blocks (GitHub hosted-runner image rolling updates
+    between blocks are expected and must never fail the whole experiment)."""
+    violations: list[str] = []
+    runs_by_layout = {r.get("benchmark_layout"): r for r in block.get("runs", [])}
+    monolith_run = runs_by_layout.get("monolith")
+    split_run = runs_by_layout.get("split")
+    if monolith_run is None or split_run is None:
+        # A missing/duplicated layout is an AB-order violation, reported
+        # separately by `verify_ab_alternating_order` -- nothing to compare.
+        return violations
+
+    monolith_images = _exact_runner_image_by_job_name(monolith_run)
+    split_images = _exact_runner_image_by_job_name(split_run)
+    for workload in MEASURED_WORKLOADS:
+        monolith_job_name = WORKLOAD_PROVIDER_JOB_BY_LAYOUT["monolith"][workload]
+        split_job_name = WORKLOAD_PROVIDER_JOB_BY_LAYOUT["split"][workload]
+        monolith_image = monolith_images.get(monolith_job_name)
+        split_image = split_images.get(split_job_name)
+        if monolith_image is None or split_image is None:
+            continue
+        if json.dumps(monolith_image, sort_keys=True) != json.dumps(split_image, sort_keys=True):
+            violations.append(
+                f"exact_runner_image_mismatch_within_block: block_id={block.get('block_id')!r} "
+                f"workload={workload!r} monolith_job={monolith_job_name!r} split_job={split_job_name!r}"
+            )
+    return violations
+
+
+def verify_ab_alternating_order(blocks: list[dict]) -> list[str]:
+    """Issue #2422 AC3/Out-of-Scope: every block's `runs` must be exactly
+    `[monolith, split]` in THAT fixed order (never `[split, monolith]`,
+    never AB/BA randomized order -- Out of Scope explicitly keeps the fixed
+    A->B order + block_id matched-block design, deferring randomization to
+    a future Issue)."""
+    violations: list[str] = []
+    for block in blocks:
+        layouts = [r.get("benchmark_layout") for r in block.get("runs", [])]
+        if layouts != ["monolith", "split"]:
+            violations.append(
+                f"ab_order_violation: block_id={block.get('block_id')!r} layouts={layouts!r} "
+                "(expected exactly ['monolith', 'split'])"
+            )
+    return violations
+
+
+def verify_block_ids_unique(blocks: list[dict]) -> list[str]:
+    """Issue #2422 AC3: every `block_id` across the manifest must be
+    unique -- a duplicate would silently merge two distinct matched-block
+    dispatches into one identity."""
+    seen: dict[str, int] = {}
+    for block in blocks:
+        block_id = block.get("block_id")
+        seen[block_id] = seen.get(block_id, 0) + 1
+    return [
+        f"duplicate_block_id: block_id={block_id!r} count={count}"
+        for block_id, count in sorted(seen.items(), key=str)
+        if count > 1
+    ]
+
+
+def build_ab_block_plan(blocks: int) -> list[dict]:
+    """Issue #2422 AC7/AC9: builds the A/B/A/B (monolith -> split, in that
+    fixed order, repeated `blocks` times) dispatch PLAN for ANY positive
+    integer `blocks` (including 22) -- pure computation, no live dispatch.
+    `block_id` is `block-{index:04d}` (deterministic, 1-indexed, unique).
+    Raises `OperationalErrorV2` for a non-positive-int `blocks` (fail-closed
+    -- 0, negative, `bool`, and non-int are all rejected)."""
+    if not isinstance(blocks, int) or isinstance(blocks, bool) or blocks < 1:
+        raise OperationalErrorV2(f"invalid_blocks: {blocks!r} (must be a positive int)")
+    return [{"block_id": f"block-{index:04d}", "layouts": ["monolith", "split"]} for index in range(1, blocks + 1)]
+
+
+def dispatch_workflow_run(
+    layout: str,
+    block_id: str,
+    frozen_source_sha: str,
+    experiment_id: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    dispatch_call: Callable[..., Any],
+) -> dict:
+    """Issue #2422 AC7/Stop-Conditions: dispatches ONE `workflow_dispatch`
+    with `benchmark_layout=layout`, and MUST request
+    `return_run_details=True` from `dispatch_call` -- the response MUST
+    carry an integer `workflow_run_id` (the 200 OK w/ return_run_details
+    shape); a response lacking it (e.g. the 204 No Content GitHub returns
+    when `return_run_details` is NOT requested) is fail-closed (raises
+    `LiveAPIError`), NEVER accepted/inferred/polled-around via a
+    `gh run list` post-hoc guess (this Issue's own Stop Conditions list
+    forbids exactly that)."""
+    if layout not in BENCHMARK_LAYOUTS:
+        raise OperationalErrorV2(f"invalid_benchmark_layout: {layout!r}")
+    # fix_delta (test-runner live AC8 dispatch, HTTP 422
+    # "Unexpected inputs provided: [\"frozen_source_sha\"...]"): the
+    # `workflow_dispatch.inputs` block in `.github/workflows/ci.yml` has no
+    # `frozen_source_sha` key -- the pre-existing `target_sha` input is the
+    # SAME "measured application-code commit" checkout selector (see its
+    # description there), already consumed unconditionally by the
+    # e2e-core / e2e-responsive-matrix checkout steps regardless of
+    # `benchmark_layout`. Send it under the `target_sha` key the workflow
+    # actually declares; the `frozen_source_sha` PARAMETER name here is kept
+    # as-is (internal Python identifier only, not sent to the API).
+    inputs = {
+        "benchmark_layout": layout,
+        "target_sha": frozen_source_sha,
+        "block_id": block_id,
+        "experiment_id": experiment_id,
+    }
+    response = dispatch_call(
+        repo=repo,
+        workflow_file=workflow_file,
+        ref=ref,
+        inputs=inputs,
+        return_run_details=True,
+    )
+    if not isinstance(response, dict) or not isinstance(response.get("workflow_run_id"), int):
+        raise LiveAPIError(
+            "workflow_dispatch_response_missing_workflow_run_id: "
+            f"block_id={block_id!r} layout={layout!r} response={response!r} "
+            "(return_run_details=true must be honored by the dispatch response; "
+            "a 204 No Content / gh run list post-hoc guess is never substituted)"
+        )
+    return {
+        "workflow_run_id": response["workflow_run_id"],
+        "run_url": response.get("html_url") or response.get("run_url"),
+        "benchmark_layout": layout,
+        "block_id": block_id,
+    }
+
+
+def run_bounded_experiment(
+    blocks: int,
+    frozen_source_sha: str,
+    experiment_id: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    dispatch_call: Callable[..., Any],
+) -> list[dict]:
+    """Issue #2422 AC7/AC9: bounded orchestrator entrypoint -- dispatches
+    the FULL A/B/A/B plan for `blocks` matched blocks (2*blocks total
+    dispatches) and returns the dispatch ROOT RUN SET (fixed at dispatch
+    time, before any outcome is known -- Issue #2422 AC6: callers must
+    never later filter this list by outcome or dispatch additional runs to
+    compensate for a failure)."""
+    plan = build_ab_block_plan(blocks)
+    root_run_set: list[dict] = []
+    for block in plan:
+        for layout in block["layouts"]:
+            root_run_set.append(
+                dispatch_workflow_run(
+                    layout,
+                    block["block_id"],
+                    frozen_source_sha,
+                    experiment_id,
+                    repo,
+                    workflow_file,
+                    ref,
+                    dispatch_call,
+                )
+            )
+    return root_run_set
+
+
+# =============================================================================
+# Issue #2422 fix_delta Blocker 2 (OWNER REQUEST_CHANGES on PR #2501,
+# issuecomment-5549966497): `run_bounded_experiment` above (unchanged, still
+# `blocks=22`-tested at the dispatch-plan level) only dispatches and returns
+# run IDs -- it is never connected to a wait-for-terminal / job-and-image
+# collection / manifest v2 build+validate pipeline. The functions below add
+# that missing connection as ONE bounded orchestration
+# (`execute_bounded_experiment_to_manifest_v2`), without changing
+# `run_bounded_experiment`'s own tested dispatch-only contract. Every
+# successful dispatch is persisted (atomic, fsync'd partial write) BEFORE
+# the next dispatch is attempted, so a mid-experiment failure never loses
+# already-dispatched run records and a resumed invocation never re-dispatches
+# a block/run pair that already has a recorded `workflow_run_id`.
+# =============================================================================
+
+TERMINAL_RUN_STATUS = "completed"
+DEFAULT_WAIT_POLL_INTERVAL_SECONDS = 15.0
+DEFAULT_WAIT_MAX_POLLS = 240  # 240 * 15s == 60 minutes, a bounded ceiling.
+
+
+def _write_json_atomic(path: str, data: Any) -> None:
+    """Issue #2422 fix_delta Blocker 2: writes `data` to `path` via a
+    write-to-temp-then-`os.replace` sequence with an explicit `fsync`
+    before the rename -- this is the "都度 flush" (durable partial write)
+    requirement: a crash/kill between dispatches can never leave `path`
+    truncated or containing a half-written JSON document; `path` always
+    either holds the PREVIOUS complete state or the NEW complete state,
+    never a partial byte sequence."""
+    output_dir = os.path.dirname(path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+
+
+def _default_get_run_status(workflow_run_id: int, repo: str) -> dict:
+    return _default_gh_api_call(f"repos/{repo}/actions/runs/{workflow_run_id}")
+
+
+def wait_for_run_terminal(
+    workflow_run_id: int,
+    repo: str,
+    get_run_status: Callable[[int, str], dict] = _default_get_run_status,
+    poll_interval_seconds: float = DEFAULT_WAIT_POLL_INTERVAL_SECONDS,
+    max_polls: int = DEFAULT_WAIT_MAX_POLLS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Issue #2422 fix_delta Blocker 2: polls `get_run_status(workflow_run_id,
+    repo)` (GitHub Actions `GET /repos/{repo}/actions/runs/{run_id}` shape:
+    `{"status": ..., "conclusion": ..., "run_attempt": ...}`) until `status`
+    reaches GitHub's terminal value `"completed"` (at which point
+    `conclusion` holds the real outcome -- success/failure/cancelled/
+    skipped/timed_out), bounded by `max_polls` so this NEVER polls forever
+    (fail-closed timeout via `LiveAPIError`, matching this module's
+    existing live-API error handling pattern)."""
+    last_status: dict = {}
+    for attempt in range(max_polls):
+        run_status = get_run_status(workflow_run_id, repo)
+        if not isinstance(run_status, dict):
+            raise LiveAPIError(f"get_run_status_malformed_response: workflow_run_id={workflow_run_id!r}")
+        last_status = run_status
+        if run_status.get("status") == TERMINAL_RUN_STATUS:
+            return run_status
+        if attempt < max_polls - 1:
+            sleep(poll_interval_seconds)
+    raise LiveAPIError(
+        f"wait_for_run_terminal_timeout: workflow_run_id={workflow_run_id!r} "
+        f"after {max_polls} polls at {poll_interval_seconds}s interval "
+        f"(last observed status={last_status.get('status')!r})"
+    )
+
+
+def _default_list_run_jobs(workflow_run_id: int, repo: str) -> list[dict]:
+    response = _default_gh_api_call(f"repos/{repo}/actions/runs/{workflow_run_id}/jobs")
+    return list(response.get("jobs", [])) if isinstance(response, dict) else []
+
+
+def _default_fetch_job_log(workflow_job_id: int, repo: str) -> str:
+    """Issue #2422 fix_delta iteration 3 (pr-reviewer REQUEST_CHANGES on
+    PR #2501): a real GitHub Actions job log commonly contains ANSI escape
+    sequences (e.g. colorized `pnpm`/Playwright output later in the log)
+    that make `gh api` fail-closed with `the response contains terminal
+    escape sequences; pass --allow-escape-sequences to output it anyway`
+    (exit 1) UNLESS `--allow-escape-sequences` is passed -- confirmed
+    against a real live job (workflow_job_id=101278556600) run by this PR
+    itself. The raw response is then further passed through
+    `_strip_gh_job_log_timestamp_prefix` so the caller's line-anchored
+    `Image:`/`Version:` regexes can match (see the module comment above
+    `_GH_JOB_LOG_TIMESTAMP_PREFIX_RE`)."""
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/actions/jobs/{workflow_job_id}/logs", "--allow-escape-sequences"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LiveAPIError(f"gh_api_job_log_transport_error: workflow_job_id={workflow_job_id!r}: {exc}") from exc
+    if result.returncode != 0:
+        raise LiveAPIError(f"gh_api_job_log_fetch_failed: workflow_job_id={workflow_job_id!r}: {result.stderr.strip()}")
+    return _strip_gh_job_log_timestamp_prefix(result.stdout)
+
+
+def collect_run_provider_jobs(
+    workflow_run_id: int,
+    repo: str,
+    list_run_jobs: Callable[[int, str], list[dict]] = _default_list_run_jobs,
+    log_fetch: Callable[[int, str], str] = _default_fetch_job_log,
+) -> tuple[list[dict], list[str]]:
+    """Issue #2422 fix_delta Blocker 2 (AC4/AC7/AC8): returns
+    `(provider_jobs, job_names_started)` for one run.
+
+    `job_names_started` records EVERY job name the live jobs API reports
+    for this run attempt, regardless of conclusion -- this is the AC7/AC8
+    evidence that only the allowed job set (measured providers + the
+    minimal gate-ready job) started on a `benchmark_layout` dispatch.
+
+    `provider_jobs` contains ONLY `MEASURED_PROVIDER_JOBS` entries whose
+    `conclusion` is NOT `"skipped"` -- an EXPECTED-skip (e.g.
+    `e2e-responsive-matrix` on a `monolith` run) is absent evidence, never
+    synthesized into a fabricated `ProviderJob` record (the schema's
+    `exact_runner_image` is REQUIRED and non-placeholder; a skipped job has
+    no `Set up job` log section to derive one from at all). This is what
+    `verify_required_provider_jobs_present_for_layout`
+    (Issue #2422 fix_delta Blocker 6) checks against per layout."""
+    jobs = list_run_jobs(workflow_run_id, repo)
+    job_names_started = sorted({job.get("name") for job in jobs if isinstance(job, dict) and job.get("name")})
+
+    provider_jobs: list[dict] = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        name = job.get("name")
+        if name not in MEASURED_PROVIDER_JOBS:
+            continue
+        conclusion = job.get("conclusion")
+        if conclusion == "skipped":
+            continue
+        workflow_job_id = job.get("id")
+        image = fetch_exact_runner_image_for_job(workflow_job_id, repo, log_fetch)
+        provider_jobs.append(
+            {
+                "job": name,
+                "workflow_job_id": workflow_job_id,
+                "conclusion": conclusion,
+                "exact_runner_image": image,
+            }
+        )
+    return provider_jobs, job_names_started
+
+
+def execute_bounded_experiment_to_manifest_v2(
+    blocks: int,
+    frozen_source_sha: str,
+    experiment_id: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    workflow_sha: str,
+    frozen_non_treatment: dict,
+    root_run_set_output: str,
+    dispatch_call: Callable[..., Any] | None = None,
+    get_run_status: Callable[[int, str], dict] = _default_get_run_status,
+    list_run_jobs: Callable[[int, str], list[dict]] = _default_list_run_jobs,
+    log_fetch: Callable[[int, str], str] = _default_fetch_job_log,
+    contents_api_call: Callable[[str], Any] = _default_gh_api_call,
+    poll_interval_seconds: float = DEFAULT_WAIT_POLL_INTERVAL_SECONDS,
+    max_polls: int = DEFAULT_WAIT_MAX_POLLS,
+    sleep: Callable[[float], None] = time.sleep,
+    resume_dispatched_run_set: list[dict] | None = None,
+) -> dict:
+    """Issue #2422 fix_delta Blocker 2/Blocker 3: the SINGLE bounded
+    orchestration connecting (a) plan construction, (b) per-dispatch
+    incremental persistence (never batched until the end), (c) wait-to-
+    terminal per run, (d) per-job Runner Image collection, and (e) manifest
+    v2 build + digest recomputation + semantic validation -- previously
+    `main_run_experiment` only performed step (b)'s dispatch half.
+
+    Resume semantics: `resume_dispatched_run_set` (the `root_run_set` list
+    a PRIOR partial invocation already persisted to `root_run_set_output`)
+    is consulted BEFORE dispatching -- an already-dispatched
+    `(block_id, benchmark_layout)` pair is never re-dispatched (Issue #2422
+    Blocker 2: "resume 時は永続化済みの run ID を再利用し、既に dispatch
+    済みの block/run を再 dispatch しない"). A failed/incomplete run is
+    NEVER excluded from the root set and no compensating extra dispatch is
+    ever issued (AC6, unchanged)."""
+    plan = build_ab_block_plan(blocks)
+    dispatch_call = dispatch_call or _default_dispatch_call
+
+    dispatched_by_key: dict[tuple[str, str], dict] = {
+        (entry["block_id"], entry["benchmark_layout"]): entry for entry in (resume_dispatched_run_set or [])
+    }
+    root_run_set: list[dict] = list(resume_dispatched_run_set or [])
+
+    # (a) plan persisted BEFORE any dispatch -- a crash before the first
+    # dispatch still leaves a resumable, inspectable artifact on disk.
+    _write_json_atomic(
+        root_run_set_output, {"schema": "e2e_experiment_progress_v1", "plan": plan, "root_run_set": root_run_set}
+    )
+
+    for block in plan:
+        for layout in block["layouts"]:
+            key = (block["block_id"], layout)
+            if key in dispatched_by_key:
+                continue
+            dispatched = dispatch_workflow_run(
+                layout, block["block_id"], frozen_source_sha, experiment_id, repo, workflow_file, ref, dispatch_call
+            )
+            root_run_set.append(dispatched)
+            dispatched_by_key[key] = dispatched
+            # (b) persisted immediately after EACH dispatch (partial write,
+            # fsync'd) -- never deferred until the whole loop completes.
+            _write_json_atomic(
+                root_run_set_output,
+                {"schema": "e2e_experiment_progress_v1", "plan": plan, "root_run_set": root_run_set},
+            )
+
+    # (c)+(d): wait each dispatched run to terminal, then collect its
+    # provider-job/Runner-Image evidence.
+    runs_by_block: dict[str, list[dict]] = {block["block_id"]: [] for block in plan}
+    for entry in root_run_set:
+        workflow_run_id = entry["workflow_run_id"]
+        run_status = wait_for_run_terminal(
+            workflow_run_id, repo, get_run_status, poll_interval_seconds, max_polls, sleep
+        )
+        provider_jobs, job_names_started = collect_run_provider_jobs(workflow_run_id, repo, list_run_jobs, log_fetch)
+        run_record = {
+            "benchmark_layout": entry["benchmark_layout"],
+            "workflow_run_id": workflow_run_id,
+            "run_attempt": run_status.get("run_attempt") or 1,
+            "conclusion": run_status.get("conclusion") or "cancelled",
+            "run_url": entry.get("run_url"),
+            "workflow_sha": workflow_sha,
+            "job_names_started": job_names_started,
+            "provider_jobs": provider_jobs,
+        }
+        runs_by_block.setdefault(entry["block_id"], []).append(run_record)
+        _write_json_atomic(
+            root_run_set_output,
+            {
+                "schema": "e2e_experiment_progress_v1",
+                "plan": plan,
+                "root_run_set": root_run_set,
+                "collected_blocks": [
+                    {"block_id": block_id, "runs": runs} for block_id, runs in runs_by_block.items() if runs
+                ],
+            },
+        )
+
+    # (e) manifest v2 build: `workflow_digest` is computed from
+    # `workflow_sha`'s OWN commit bytes (Issue #2422 fix_delta Blocker 3 --
+    # never a local checkout sha256sum), REQUIRED (not merely available) on
+    # this execution path, and independently re-verified via
+    # `verify_workflow_digest_matches_commit_bytes` -- a false-green where
+    # two arms happen to agree on a WRONG digest is caught here, not merely
+    # left to an optional caller.
+    workflow_digest = compute_workflow_digest_from_commit_bytes(workflow_sha, repo, api_call=contents_api_call)
+
+    ordered_blocks: list[dict] = []
+    for block in plan:
+        runs = list(runs_by_block.get(block["block_id"], []))
+        runs.sort(key=lambda r: block["layouts"].index(r["benchmark_layout"]))
+        for run in runs:
+            run["workflow_digest"] = workflow_digest
+        ordered_blocks.append({"block_id": block["block_id"], "runs": runs})
+
+    manifest = build_manifest_v2(
+        experiment_identity=experiment_id,
+        frozen_source_sha=frozen_source_sha,
+        workflow_sha=workflow_sha,
+        workflow_digest=workflow_digest,
+        frozen_non_treatment=frozen_non_treatment,
+        blocks=ordered_blocks,
+    )
+
+    digest_violations = verify_workflow_digest_matches_commit_bytes(
+        workflow_sha, workflow_digest, repo, api_call=contents_api_call
+    )
+    for violation in digest_violations:
+        manifest["evidence_errors"].append(
+            {"block_id": "<all>", "reason": "workflow_digest_recomputation_mismatch", "detail": violation}
+        )
+
+    semantic_violations = validate_manifest_v2_semantics(manifest)
+    for violation in semantic_violations:
+        manifest["evidence_errors"].append({"block_id": "<all>", "reason": "semantic_violation", "detail": violation})
+
+    return manifest
+
+
+def _run_identity_tuples_from_blocks(blocks: list[dict]) -> list[dict]:
+    """Issue #2422 AC5: `block_id` lives on the `Block`, not the `Run`
+    (the schema's `Run` def intentionally omits it -- a run's block
+    membership is unambiguous from its position inside `blocks[]`). This
+    helper reconstructs the per-run `{block_id, benchmark_layout,
+    workflow_run_id, run_attempt}` identity tuple `compute_experiment_run_
+    set_digest` expects by pairing each run with its OWN block's
+    `block_id`."""
+    identity_tuples: list[dict] = []
+    for block in blocks:
+        block_id = block.get("block_id")
+        for run in block.get("runs", []):
+            identity_tuples.append(
+                {
+                    "block_id": block_id,
+                    "benchmark_layout": run.get("benchmark_layout"),
+                    "workflow_run_id": run.get("workflow_run_id"),
+                    "run_attempt": run.get("run_attempt"),
+                }
+            )
+    return identity_tuples
+
+
+# Issue #2422 fix_delta Blocker 6 (OWNER REQUEST_CHANGES on PR #2501,
+# issuecomment-5549966497): `validate_manifest_v2_semantics` previously
+# verified block_id uniqueness, A/B order, cross-arm fingerprint equality,
+# and digest recomputation, but never (a) the GLOBAL uniqueness of
+# `workflow_run_id` across the ENTIRE experiment run set (two block_ids could
+# silently share the same underlying run), (b) that each run's
+# `provider_jobs` actually contains the job(s) its `benchmark_layout`
+# requires, or (c) that a `conclusion: success` run is never accepted with
+# EMPTY `provider_jobs` evidence. `REQUIRED_PROVIDER_JOBS_BY_LAYOUT` names,
+# per layout, the provider job(s) that layout's dispatch is expected to
+# start (Issue #2422 In Scope: monolith's `e2e-core` covers both workloads
+# sequentially; split's `e2e-core`/`e2e-responsive-matrix` run in parallel).
+REQUIRED_PROVIDER_JOBS_BY_LAYOUT: dict[str, frozenset[str]] = {
+    "monolith": frozenset({"e2e-core"}),
+    "split": frozenset({"e2e-core", "e2e-responsive-matrix"}),
+}
+
+
+def verify_workflow_run_id_global_uniqueness(blocks: list[dict]) -> list[str]:
+    """Issue #2422 fix_delta Blocker 6: a genuine dispatch root run set has
+    each `workflow_run_id` bound to EXACTLY ONE `(block_id, benchmark_
+    layout)` slot across the WHOLE experiment -- the same run id appearing
+    under two (or more) different `block_id`s (e.g. the same 2 real runs
+    silently reused for all 22 blocks of a `blocks=22` experiment) is a
+    fail-closed identity violation, never silently accepted as two
+    independent samples."""
+    seen: dict[int, list[str]] = {}
+    for block in blocks:
+        block_id = block.get("block_id")
+        for run in block.get("runs", []):
+            workflow_run_id = run.get("workflow_run_id")
+            if workflow_run_id is None:
+                continue
+            seen.setdefault(workflow_run_id, []).append(block_id)
+    violations: list[str] = []
+    for workflow_run_id in sorted(seen):
+        block_ids = sorted(set(seen[workflow_run_id]))
+        if len(seen[workflow_run_id]) > 1 or len(block_ids) > 1:
+            violations.append(
+                f"workflow_run_id_reused_across_blocks: workflow_run_id={workflow_run_id!r} "
+                f"block_ids={block_ids!r}"
+            )
+    return violations
+
+
+def verify_required_provider_jobs_present_for_layout(run: dict) -> list[str]:
+    """Issue #2422 fix_delta Blocker 6: a run's `provider_jobs` must
+    contain every job name `REQUIRED_PROVIDER_JOBS_BY_LAYOUT` names for its
+    `benchmark_layout` -- an unrecognized `benchmark_layout` value is not
+    checked here (that is `verify_ab_alternating_order`'s responsibility)."""
+    layout = run.get("benchmark_layout")
+    required = REQUIRED_PROVIDER_JOBS_BY_LAYOUT.get(layout)
+    if required is None:
+        return []
+    present = {
+        job.get("job") for job in run.get("provider_jobs", []) if isinstance(job, dict) and job.get("job")
+    }
+    missing = required - present
+    if missing:
+        return [
+            f"missing_required_provider_jobs_for_layout: layout={layout!r} "
+            f"workflow_run_id={run.get('workflow_run_id')!r} missing={sorted(missing)!r}"
+        ]
+    return []
+
+
+def verify_success_run_has_provider_job_evidence(run: dict) -> list[str]:
+    """Issue #2422 fix_delta Blocker 6: a run whose `conclusion` is
+    `success` must carry non-empty `provider_jobs` evidence -- a
+    `success` conclusion with `provider_jobs: []` is a fail-closed
+    contradiction (something concluded successfully with zero recorded
+    provider-job evidence), never silently accepted."""
+    if run.get("conclusion") == "success" and not run.get("provider_jobs"):
+        return [
+            "success_conclusion_missing_provider_jobs_evidence: "
+            f"workflow_run_id={run.get('workflow_run_id')!r}"
+        ]
+    return []
+
+
+def build_manifest_v2(
+    experiment_identity: str,
+    frozen_source_sha: str,
+    workflow_sha: str,
+    workflow_digest: str,
+    frozen_non_treatment: dict,
+    blocks: list[dict],
+    generated_at: str | None = None,
+) -> dict:
+    """Issue #2422 AC5: assembles an `e2e_performance_benchmark_manifest_v2`
+    dict from already-collected `blocks` (each `{"block_id": str, "runs":
+    [<Run>, <Run>]}`, `Run` matching the schema's `Run` def). Computes
+    `experiment_run_set_digest` from every run's identity tuple. Semantic
+    (cross-field) violations -- A/B/A/B ordering, duplicate block_id,
+    cross-arm workflow_sha/workflow_digest mismatch, per-block runner-image
+    mismatch -- are collected into `evidence_errors`, never silently
+    dropped, and NEVER cause this function itself to raise (fail-closed
+    detection is the CALLER's responsibility, matching this module's
+    existing v1 `collect_benchmark_manifest`/`main()` split)."""
+    evidence_errors: list[dict] = []
+    all_runs: list[dict] = []
+    for block in blocks:
+        all_runs.extend(block.get("runs", []))
+
+    for reason in verify_ab_alternating_order(blocks):
+        evidence_errors.append({"block_id": "<plan>", "reason": "ab_order_violation", "detail": reason})
+    for reason in verify_block_ids_unique(blocks):
+        evidence_errors.append({"block_id": "<plan>", "reason": "duplicate_block_id", "detail": reason})
+    for reason in verify_cross_arm_required_equal(all_runs):
+        evidence_errors.append({"block_id": "<all>", "reason": "cross_arm_fingerprint_mismatch", "detail": reason})
+    # Issue #2422 fix_delta Blocker 6: global workflow_run_id identity is an
+    # ACROSS-BLOCK invariant (not scoped to any single block), so it is
+    # checked once here against the full block set, not inside the
+    # per-block loop below.
+    for reason in verify_workflow_run_id_global_uniqueness(blocks):
+        evidence_errors.append(
+            {"block_id": "<all>", "reason": "workflow_run_id_reused_across_blocks", "detail": reason}
+        )
+    for block in blocks:
+        for reason in verify_exact_runner_image_required_equal_within_block(block):
+            evidence_errors.append(
+                {
+                    "block_id": block.get("block_id", "<unknown>"),
+                    "reason": "exact_runner_image_mismatch",
+                    "detail": reason,
+                }
+            )
+        for run in block.get("runs", []):
+            for job in run.get("provider_jobs", []):
+                image_violations = verify_exact_runner_image(job.get("exact_runner_image"))
+                for violation in image_violations:
+                    evidence_errors.append(
+                        {
+                            "block_id": block.get("block_id", "<unknown>"),
+                            "reason": "exact_runner_image_invalid",
+                            "detail": (
+                                f"job={job.get('job')!r} "
+                                f"workflow_run_id={run.get('workflow_run_id')!r}: {violation}"
+                            ),
+                        }
+                    )
+            for reason in verify_required_provider_jobs_present_for_layout(run):
+                evidence_errors.append(
+                    {
+                        "block_id": block.get("block_id", "<unknown>"),
+                        "reason": "missing_required_provider_jobs_for_layout",
+                        "detail": reason,
+                    }
+                )
+            for reason in verify_success_run_has_provider_job_evidence(run):
+                evidence_errors.append(
+                    {
+                        "block_id": block.get("block_id", "<unknown>"),
+                        "reason": "success_conclusion_missing_provider_jobs_evidence",
+                        "detail": reason,
+                    }
+                )
+
+    run_set_digest = compute_experiment_run_set_digest(_run_identity_tuples_from_blocks(blocks))
+
+    return {
+        "schema": MANIFEST_SCHEMA_V2,
+        "schema_version": 2,
+        "generated_at": generated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "experiment_identity": experiment_identity,
+        "experiment_run_set_digest": run_set_digest,
+        "frozen_source_sha": frozen_source_sha,
+        "workflow_sha": workflow_sha,
+        "workflow_digest": workflow_digest,
+        "frozen_non_treatment": frozen_non_treatment,
+        "blocks": blocks,
+        "evidence_errors": evidence_errors,
+    }
+
+
+def validate_manifest_v2_semantics(manifest: dict) -> list[str]:
+    """Issue #2422 AC3/AC5: standalone re-derivation of the same semantic
+    checks `build_manifest_v2` performs, importable for an independent
+    consumer (mirrors this module's existing v1
+    `validate_manifest_semantics` pattern) -- re-verifies A/B/A/B order,
+    block_id uniqueness, cross-arm required-equal fingerprint, per-block
+    runner-image required-equal, AND the `experiment_run_set_digest`
+    recomputation (never trusting the manifest's own claimed digest)."""
+    violations: list[str] = []
+    blocks = manifest.get("blocks", [])
+    all_runs: list[dict] = []
+    for block in blocks:
+        all_runs.extend(block.get("runs", []))
+
+    violations.extend(f"ab_order_violation: {v}" for v in verify_ab_alternating_order(blocks))
+    violations.extend(f"duplicate_block_id: {v}" for v in verify_block_ids_unique(blocks))
+    violations.extend(f"cross_arm_fingerprint_mismatch: {v}" for v in verify_cross_arm_required_equal(all_runs))
+    violations.extend(
+        f"workflow_run_id_reused_across_blocks: {v}" for v in verify_workflow_run_id_global_uniqueness(blocks)
+    )
+    for block in blocks:
+        violations.extend(
+            f"exact_runner_image_mismatch: {v}" for v in verify_exact_runner_image_required_equal_within_block(block)
+        )
+    for run in all_runs:
+        violations.extend(
+            f"missing_required_provider_jobs_for_layout: {v}"
+            for v in verify_required_provider_jobs_present_for_layout(run)
+        )
+        violations.extend(
+            f"success_conclusion_missing_provider_jobs_evidence: {v}"
+            for v in verify_success_run_has_provider_job_evidence(run)
+        )
+
+    recomputed_digest = compute_experiment_run_set_digest(_run_identity_tuples_from_blocks(blocks))
+    if manifest.get("experiment_run_set_digest") != recomputed_digest:
+        violations.append(
+            "experiment_run_set_digest_mismatch: "
+            f"claimed={manifest.get('experiment_run_set_digest')!r} recomputed={recomputed_digest!r}"
+        )
+
+    for field in ("workflow_sha", "workflow_digest"):
+        root_value = manifest.get(field)
+        for run in all_runs:
+            if run.get(field) != root_value:
+                violations.append(f"run_{field}_mismatches_root: run={run.get('workflow_run_id')!r}")
+
+    return violations
+
+
+def _validate_against_schema_v2(manifest: dict) -> None:
+    try:
+        from jsonschema import Draft202012Validator
+    except ImportError as exc:
+        raise OperationalErrorV2(f"jsonschema_not_installed: {exc}") from exc
+
+    with open(SCHEMA_PATH_V2, encoding="utf-8") as handle:
+        schema = json.load(handle)
+    Draft202012Validator.check_schema(schema)
+    validator_instance = Draft202012Validator(schema)
+    errors = sorted(validator_instance.iter_errors(manifest), key=lambda e: e.path)
+    if errors:
+        messages = [f"{'/'.join(str(p) for p in err.path) or '<root>'}: {err.message}" for err in errors]
+        raise OperationalErrorV2(f"manifest_v2_failed_schema_validation: {messages}")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1263,5 +2296,201 @@ def main(argv: list[str] | None = None) -> int:
     return EXIT_COMPLETE if complete else EXIT_INCOMPLETE
 
 
+def _default_dispatch_call(
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    inputs: dict,
+    return_run_details: bool = True,
+) -> Any:
+    """Issue #2422 AC7: default `dispatch_call` transport for
+    `dispatch_workflow_run`/`run_bounded_experiment` -- `gh api` POST to the
+    workflow dispatches endpoint, ALWAYS passing `return_run_details: true`
+    in the request body (this is what lets GitHub return `workflow_run_id`
+    synchronously in a 200 OK response body instead of a 204 No Content
+    with no run id, per this Issue's Stop Conditions)."""
+    payload = {"ref": ref, "inputs": inputs, "return_run_details": return_run_details}
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                "--method",
+                "POST",
+                f"repos/{repo}/actions/workflows/{workflow_file}/dispatches",
+                "--input",
+                "-",
+            ],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LiveAPIError(f"gh_api_dispatch_transport_error: {exc}") from exc
+    if result.returncode != 0:
+        raise LiveAPIError(f"gh_api_dispatch_call_failed: {result.stderr.strip()}")
+    stdout = result.stdout.strip()
+    if not stdout:
+        return {}
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise LiveAPIError(f"gh_api_dispatch_response_not_json: {exc}") from exc
+
+
+def parse_run_experiment_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="collect_e2e_performance_benchmark.py run-experiment",
+        description=(
+            "Issue #2422 AC7/AC9 (fix_delta Blocker 2/Blocker 3): bounded "
+            "orchestrator -- dispatches an A/B/A/B (monolith->split, "
+            "`blocks` times) benchmark_layout experiment, waits each "
+            "dispatched run to terminal, collects per-job Runner Image "
+            "evidence, and builds + validates the resulting "
+            "e2e_performance_benchmark_manifest_v2 -- ONE connected "
+            "pipeline (previously this subcommand only dispatched)."
+        ),
+    )
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        required=True,
+        help="Number of matched (monolith, split) blocks -- any positive int, e.g. 2 or 22",
+    )
+    parser.add_argument(
+        "--frozen-source-sha",
+        required=True,
+        help="Frozen 40-hex application-code commit SHA measured by BOTH benchmark_layout arms",
+    )
+    parser.add_argument("--experiment-id", required=True, help="Free-form experiment identifier")
+    parser.add_argument("--repo", required=True, help="owner/repo, e.g. squne121/loop-protocol")
+    parser.add_argument("--workflow-file", default="ci.yml", help="Workflow file name (default ci.yml)")
+    parser.add_argument(
+        "--ref",
+        default="main",
+        help=(
+            "Dispatch ref -- must stay on the current/default branch tip so "
+            "github.workflow_sha remains current (default main)"
+        ),
+    )
+    parser.add_argument(
+        "--workflow-sha",
+        required=True,
+        help=(
+            "The workflow DEFINITION commit (github.workflow_sha) shared by every "
+            "run -- workflow_digest is computed from THIS commit's own bytes via "
+            "the GitHub Contents API (Issue #2422 fix_delta Blocker 3), never a "
+            "local checkout sha256sum."
+        ),
+    )
+    parser.add_argument(
+        "--frozen-non-treatment-json",
+        required=True,
+        help=(
+            "Path to an already-prepared JSON file matching the manifest v2 "
+            "schema's FrozenNonTreatment shape (test_inventory_digest / "
+            "expected_playwright_invocations / lockfile_hash / toolchain_digest)."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        help=(
+            "Path to the incremental dispatch-progress JSON (written BEFORE the "
+            "first dispatch and after EVERY dispatch/collection step, atomically "
+            "-- Issue #2422 fix_delta Blocker 2's durable partial-write "
+            "requirement). Also the file `--resume-from` reads back."
+        ),
+    )
+    parser.add_argument(
+        "--manifest-output",
+        required=True,
+        help="Path to write the final built+validated e2e_performance_benchmark_manifest_v2 JSON",
+    )
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help=(
+            "Path to a PRIOR run's `--output` progress JSON -- already-dispatched "
+            "(block_id, benchmark_layout) pairs recorded there are never "
+            "re-dispatched (Issue #2422 fix_delta Blocker 2 resume semantics)."
+        ),
+    )
+    parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=DEFAULT_WAIT_POLL_INTERVAL_SECONDS,
+        help=f"Seconds between run-status polls (default {DEFAULT_WAIT_POLL_INTERVAL_SECONDS})",
+    )
+    parser.add_argument(
+        "--max-polls",
+        type=int,
+        default=DEFAULT_WAIT_MAX_POLLS,
+        help=f"Bounded poll ceiling per run before a fail-closed timeout (default {DEFAULT_WAIT_MAX_POLLS})",
+    )
+    return parser.parse_args(argv)
+
+
+def main_run_experiment(argv: list[str] | None = None) -> int:
+    args = parse_run_experiment_args(argv)
+    try:
+        frozen_non_treatment = _load_json_file(args.frozen_non_treatment_json)
+        resume_dispatched_run_set = None
+        if args.resume_from:
+            resume_progress = _load_json_file(args.resume_from)
+            if isinstance(resume_progress, dict):
+                resume_dispatched_run_set = resume_progress.get("root_run_set")
+
+        manifest = execute_bounded_experiment_to_manifest_v2(
+            blocks=args.blocks,
+            frozen_source_sha=args.frozen_source_sha,
+            experiment_id=args.experiment_id,
+            repo=args.repo,
+            workflow_file=args.workflow_file,
+            ref=args.ref,
+            workflow_sha=args.workflow_sha,
+            frozen_non_treatment=frozen_non_treatment,
+            root_run_set_output=args.output,
+            poll_interval_seconds=args.poll_interval_seconds,
+            max_polls=args.max_polls,
+            resume_dispatched_run_set=resume_dispatched_run_set,
+        )
+    except (OperationalError, OperationalErrorV2, LiveAPIError) as exc:
+        sys.stderr.write(f"operational_failure: {exc}\n")
+        return EXIT_OPERATIONAL_FAILURE
+
+    manifest_output_dir = os.path.dirname(args.manifest_output)
+    if manifest_output_dir:
+        os.makedirs(manifest_output_dir, exist_ok=True)
+    with open(args.manifest_output, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+        handle.write("\n")
+
+    try:
+        _validate_against_schema_v2(manifest)
+    except OperationalErrorV2 as exc:
+        sys.stderr.write(f"manifest_schema_validation_failed: {exc}\n")
+        return EXIT_INCOMPLETE
+
+    if manifest.get("evidence_errors"):
+        sys.stderr.write(f"manifest_has_evidence_errors: {json.dumps(manifest['evidence_errors'])}\n")
+        return EXIT_INCOMPLETE
+
+    print(
+        f"experiment complete: {len(manifest['blocks'])} blocks "
+        f"({2 * len(manifest['blocks'])} runs), manifest written to {args.manifest_output}"
+    )
+    return EXIT_COMPLETE
+
+
 if __name__ == "__main__":
+    # Issue #2422 AC7/AC9: `run-experiment` is a distinct sub-invocation,
+    # dispatched here (never inside `parse_args()`/`main()` above, which
+    # stay byte-for-byte backward compatible for every existing v1 caller/
+    # test that invokes `main(argv)` directly with the legacy
+    # `--before-sha`/`--after-sha` flag shape).
+    if len(sys.argv) > 1 and sys.argv[1] == "run-experiment":
+        sys.exit(main_run_experiment(sys.argv[2:]))
     sys.exit(main())
