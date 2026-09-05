@@ -134,6 +134,197 @@ jobs:
           gh_api() { gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
           ARTIFACT_ROOT="$(mktemp -d "${RUNNER_TEMP}/visual-impact-trusted-${RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")"
           mkdir -p "${ARTIFACT_ROOT}/decision" "${ARTIFACT_ROOT}/evidence"
+
+          # Issue #2505 (ADR 0009 "## ZIP Resource Bound" follow-up): known
+          # entry names and the three resource bounds (downloaded ZIP
+          # bytes, original ZIP entry count, selected-entry
+          # decompressed/read bytes) enforced against decision.zip /
+          # evidence.zip below, before either archive's contents ever reach
+          # the semantic verifier. Named as grep-able constants -- see this
+          # Issue's Verification Commands.
+          DECISION_ENTRY_NAME="visual_impact_decision_v1.json"
+          EVIDENCE_ENTRY_NAME_V3="visual_baseline_review_evidence.json"
+          EVIDENCE_ENTRY_NAME_V2="visual_baseline_review_evidence_v2.json"
+          DECISION_ZIP_MAX_BYTES=2097152
+          EVIDENCE_ZIP_MAX_BYTES=8388608
+          DECISION_ZIP_MAX_ENTRIES=16
+          EVIDENCE_ZIP_MAX_ENTRIES=16
+          DECISION_MAX_READ_BYTES=1000000
+          EVIDENCE_MAX_READ_BYTES=5000000
+
+          # Issue #2505: a small, adversarially-testable Python one-off
+          # (see scripts/agent-ops/tests/test_visual_impact_trusted_consumer.py)
+          # that streams `gh api <zip-url>` into a BOUNDED in-memory buffer
+          # -- never written to disk, aborted and reaped the instant it
+          # exceeds the byte cap -- lists the ORIGINAL ZIP entry set before
+          # selecting any target entry (so ambiguity is evaluated against
+          # the full entry list, never a name-narrowed subset -- duplicate
+          # entries and V2+V3 coexistence are both caught), opens the
+          # selected `ZipInfo` object directly (never "open by name", which
+          # is ambiguous when duplicates exist), performs a bounded read of
+          # at most max_read_bytes+1 bytes of only that entry, and writes
+          # ONLY that entry's bytes to one of the fixed destination paths
+          # this step's callers already expect -- never a path derived
+          # from the ZIP entry's own recorded name. Lives only inside this
+          # step: Allowed Paths for Issue #2505 permit only this workflow
+          # YAML and the test file above, never a new production file
+          # under scripts/agent-ops/.
+          BOUNDED_ZIP_RETRIEVE_PY="${ARTIFACT_ROOT}/bounded_zip_retrieve.py"
+          cat > "${BOUNDED_ZIP_RETRIEVE_PY}" <<'BOUNDED_ZIP_RETRIEVE_PY_EOF'
+          from __future__ import annotations
+
+          import argparse
+          import io
+          import subprocess
+          import sys
+          import zipfile
+
+          STATUS_OK = "ok"
+          STATUS_DOWNLOAD_SIZE_EXCEEDED = "download_size_exceeded"
+          STATUS_ENTRY_COUNT_EXCEEDED = "entry_count_exceeded"
+          STATUS_ENTRY_AMBIGUOUS_OR_MISSING = "entry_ambiguous_or_missing"
+          STATUS_READ_SIZE_EXCEEDED = "read_size_exceeded"
+          STATUS_INVALID_ZIP = "invalid_zip"
+          STATUS_DOWNLOAD_COMMAND_FAILED = "download_command_failed"
+
+          EXIT_CODES = {
+              STATUS_OK: 0,
+              STATUS_DOWNLOAD_SIZE_EXCEEDED: 10,
+              STATUS_ENTRY_COUNT_EXCEEDED: 11,
+              STATUS_ENTRY_AMBIGUOUS_OR_MISSING: 12,
+              STATUS_READ_SIZE_EXCEEDED: 13,
+              STATUS_INVALID_ZIP: 14,
+              STATUS_DOWNLOAD_COMMAND_FAILED: 15,
+          }
+
+
+          def write_status(path: str, status: str, artifact: str, limit) -> None:
+              with open(path, "w", encoding="utf-8") as fh:
+                  fh.write(f"STATUS={status}\n")
+                  fh.write(f"ARTIFACT={artifact}\n")
+                  fh.write(f"LIMIT={'' if limit is None else limit}\n")
+
+
+          def bounded_download(zip_url: str, max_download_bytes: int):
+              """Stream `gh api <zip_url>` into a bounded in-memory buffer,
+              aborting and reaping the process the instant more than
+              max_download_bytes have been received. Never writes the
+              response to disk (no post-hoc `stat` of a downloaded file)."""
+              proc = subprocess.Popen(
+                  [
+                      "gh",
+                      "api",
+                      "-H",
+                      "Accept: application/vnd.github+json",
+                      "-H",
+                      "X-GitHub-Api-Version: 2022-11-28",
+                      zip_url,
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+              )
+              buffer = bytearray()
+              chunk_size = 65536
+              assert proc.stdout is not None
+              try:
+                  while True:
+                      chunk = proc.stdout.read(chunk_size)
+                      if not chunk:
+                          break
+                      buffer.extend(chunk)
+                      if len(buffer) > max_download_bytes:
+                          proc.kill()
+                          proc.wait()
+                          return STATUS_DOWNLOAD_SIZE_EXCEEDED, None
+              finally:
+                  proc.stdout.close()
+              returncode = proc.wait()
+              if returncode != 0:
+                  return STATUS_DOWNLOAD_COMMAND_FAILED, None
+              return STATUS_OK, bytes(buffer)
+
+
+          def select_entry(entries, targets):
+              """Evaluate ambiguity against the FULL original entry list
+              (never a name-narrowed subset): exactly one physical entry
+              whose filename is one of the accepted names -- 0 matches
+              (missing), >=2 matches of the SAME accepted name (duplicate),
+              or one-each of two DIFFERENT accepted names (co-existence)
+              are all rejected by this single condition."""
+              matches = [info for info in entries if info.filename in targets]
+              if len(matches) != 1:
+                  return None, None
+              selected = matches[0]
+              return selected, targets[selected.filename]
+
+
+          def main() -> int:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--label", required=True)
+              parser.add_argument("--zip-url", required=True)
+              parser.add_argument("--max-download-bytes", type=int, required=True)
+              parser.add_argument("--max-entries", type=int, required=True)
+              parser.add_argument("--max-read-bytes", type=int, required=True)
+              parser.add_argument(
+                  "--target", nargs=2, metavar=("NAME", "DEST"), action="append", required=True
+              )
+              parser.add_argument("--status-output-file", required=True)
+              args = parser.parse_args()
+              targets = {name: dest for name, dest in args.target}
+
+              status, buffer = bounded_download(args.zip_url, args.max_download_bytes)
+              if status != STATUS_OK:
+                  limit = args.max_download_bytes if status == STATUS_DOWNLOAD_SIZE_EXCEEDED else None
+                  write_status(args.status_output_file, status, args.label, limit)
+                  return EXIT_CODES[status]
+
+              try:
+                  zf = zipfile.ZipFile(io.BytesIO(buffer))
+                  entries = zf.infolist()
+              except zipfile.BadZipFile:
+                  write_status(args.status_output_file, STATUS_INVALID_ZIP, args.label, None)
+                  return EXIT_CODES[STATUS_INVALID_ZIP]
+
+              if len(entries) > args.max_entries:
+                  write_status(args.status_output_file, STATUS_ENTRY_COUNT_EXCEEDED, args.label, args.max_entries)
+                  return EXIT_CODES[STATUS_ENTRY_COUNT_EXCEEDED]
+
+              selected, dest_file = select_entry(entries, targets)
+              if selected is None:
+                  write_status(args.status_output_file, STATUS_ENTRY_AMBIGUOUS_OR_MISSING, args.label, None)
+                  return EXIT_CODES[STATUS_ENTRY_AMBIGUOUS_OR_MISSING]
+
+              try:
+                  with zf.open(selected) as fh:
+                      data = fh.read(args.max_read_bytes + 1)
+              except (zipfile.BadZipFile, NotImplementedError, EOFError, RuntimeError):
+                  write_status(args.status_output_file, STATUS_INVALID_ZIP, args.label, None)
+                  return EXIT_CODES[STATUS_INVALID_ZIP]
+
+              if len(data) > args.max_read_bytes:
+                  write_status(args.status_output_file, STATUS_READ_SIZE_EXCEEDED, args.label, args.max_read_bytes)
+                  return EXIT_CODES[STATUS_READ_SIZE_EXCEEDED]
+
+              with open(dest_file, "wb") as out:
+                  out.write(data)
+
+              write_status(args.status_output_file, STATUS_OK, args.label, None)
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          BOUNDED_ZIP_RETRIEVE_PY_EOF
+
+          DECISION_STATUS_FILE="${ARTIFACT_ROOT}/decision_download_status.kv"
+          EVIDENCE_STATUS_FILE="${ARTIFACT_ROOT}/evidence_download_status.kv"
+
+          write_not_attempted_status() {
+            printf 'STATUS=not_attempted\n' > "$2"
+            printf 'ARTIFACT=%s\n' "$1" >> "$2"
+            printf 'LIMIT=\n' >> "$2"
+          }
+
           # Issue #2230 AC3/AC4/AC5: replaces the former inline
           # `gh api .../artifacts?per_page=100 | jq
           # '[.artifacts[] | select(.name=="...")][0]'` pattern (no
@@ -169,19 +360,75 @@ jobs:
           set -e
           if [ "${DECISION_ACQUIRE_STATUS}" -eq 0 ] && [ -s "${ARTIFACT_ROOT}/decision_artifact_id.txt" ]; then
             DECISION_ARTIFACT_ID="$(cat "${ARTIFACT_ROOT}/decision_artifact_id.txt")"
-            gh_api "repos/${REPO}/actions/artifacts/${DECISION_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/decision.zip"
-            unzip -o -q "${ARTIFACT_ROOT}/decision.zip" -d "${ARTIFACT_ROOT}/decision"
+            set +e
+            uv run --locked python3 "${BOUNDED_ZIP_RETRIEVE_PY}" \
+              --label decision \
+              --zip-url "repos/${REPO}/actions/artifacts/${DECISION_ARTIFACT_ID}/zip" \
+              --max-download-bytes "${DECISION_ZIP_MAX_BYTES}" \
+              --max-entries "${DECISION_ZIP_MAX_ENTRIES}" \
+              --max-read-bytes "${DECISION_MAX_READ_BYTES}" \
+              --status-output-file "${DECISION_STATUS_FILE}" \
+              --target "${DECISION_ENTRY_NAME}" "${ARTIFACT_ROOT}/decision/${DECISION_ENTRY_NAME}"
+            set -e
           else
+            write_not_attempted_status "decision" "${DECISION_STATUS_FILE}"
             echo "::warning::trusted decision artifact '${DECISION_ARTIFACT_NAME}' could not be acquired (fail-closed; exit=${DECISION_ACQUIRE_STATUS})"
           fi
           if [ "${EVIDENCE_ACQUIRE_STATUS}" -eq 0 ] && [ -s "${ARTIFACT_ROOT}/evidence_artifact_id.txt" ]; then
             EVIDENCE_ARTIFACT_ID="$(cat "${ARTIFACT_ROOT}/evidence_artifact_id.txt")"
-            gh_api "repos/${REPO}/actions/artifacts/${EVIDENCE_ARTIFACT_ID}/zip" > "${ARTIFACT_ROOT}/evidence.zip"
-            unzip -o -q "${ARTIFACT_ROOT}/evidence.zip" -d "${ARTIFACT_ROOT}/evidence"
+            set +e
+            uv run --locked python3 "${BOUNDED_ZIP_RETRIEVE_PY}" \
+              --label evidence \
+              --zip-url "repos/${REPO}/actions/artifacts/${EVIDENCE_ARTIFACT_ID}/zip" \
+              --max-download-bytes "${EVIDENCE_ZIP_MAX_BYTES}" \
+              --max-entries "${EVIDENCE_ZIP_MAX_ENTRIES}" \
+              --max-read-bytes "${EVIDENCE_MAX_READ_BYTES}" \
+              --status-output-file "${EVIDENCE_STATUS_FILE}" \
+              --target "${EVIDENCE_ENTRY_NAME_V3}" "${ARTIFACT_ROOT}/evidence/${EVIDENCE_ENTRY_NAME_V3}" \
+              --target "${EVIDENCE_ENTRY_NAME_V2}" "${ARTIFACT_ROOT}/evidence/${EVIDENCE_ENTRY_NAME_V2}"
+            set -e
           else
+            write_not_attempted_status "evidence" "${EVIDENCE_STATUS_FILE}"
             echo "::warning::trusted evidence-manifest artifact '${EVIDENCE_ARTIFACT_NAME}' could not be acquired (fail-closed; exit=${EVIDENCE_ACQUIRE_STATUS})"
           fi
+
+          # Issue #2505 AC7/AC8/AC9: aggregate the two per-artifact status
+          # files into step outputs the Publish step below can distinguish
+          # from trusted_input_derivation_failed /
+          # producer_artifact_verification_rejected -- and hard-fail this
+          # step (never `continue-on-error`) the instant either artifact
+          # hit a resource bound / invalid ZIP / download-command failure,
+          # so the default GitHub Actions same-job step-skip behavior keeps
+          # the `trusted` and `verify` steps below from ever running
+          # against a partial or absent file (AC9: `continue-on-error` is
+          # never used to turn this rejection into a reported success).
+          DOWNLOAD_STATUS="ok"
+          DOWNLOAD_FAILURE_REASON=""
+          DOWNLOAD_FAILURE_DETAIL=""
+          for STATUS_FILE in "${DECISION_STATUS_FILE}" "${EVIDENCE_STATUS_FILE}"; do
+            if [ "${DOWNLOAD_STATUS}" = "ok" ] && [ -f "${STATUS_FILE}" ]; then
+              STATUS=""
+              ARTIFACT=""
+              LIMIT=""
+              # shellcheck disable=SC1090
+              . "${STATUS_FILE}"
+              if [ "${STATUS}" != "ok" ] && [ "${STATUS}" != "not_attempted" ]; then
+                DOWNLOAD_STATUS="rejected"
+                DOWNLOAD_FAILURE_REASON="${STATUS}"
+                DOWNLOAD_FAILURE_DETAIL="artifact=${ARTIFACT} limit=${LIMIT}"
+              fi
+            fi
+          done
+
           echo "artifact_root=${ARTIFACT_ROOT}" >> "$GITHUB_OUTPUT"
+          echo "download_status=${DOWNLOAD_STATUS}" >> "$GITHUB_OUTPUT"
+          echo "download_failure_reason=${DOWNLOAD_FAILURE_REASON}" >> "$GITHUB_OUTPUT"
+          echo "download_failure_detail=${DOWNLOAD_FAILURE_DETAIL}" >> "$GITHUB_OUTPUT"
+
+          if [ "${DOWNLOAD_STATUS}" != "ok" ]; then
+            echo "::error::download/archive validation rejected: ${DOWNLOAD_FAILURE_REASON} (${DOWNLOAD_FAILURE_DETAIL})"
+            exit 1
+          fi
 
       # Issue #2091 AC1: independently obtain/compute every input
       # `verify-trusted-artifact` cross checks the producer decision
@@ -355,6 +602,9 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           TRUSTED_OUTCOME: ${{ steps.trusted.outcome }}
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          DOWNLOAD_STATUS: ${{ steps.download.outputs.download_status }}
+          DOWNLOAD_FAILURE_REASON: ${{ steps.download.outputs.download_failure_reason }}
+          DOWNLOAD_FAILURE_DETAIL: ${{ steps.download.outputs.download_failure_detail }}
         run: |
           set -euo pipefail
           # AC37: bind to the candidate PR's exact CURRENT (freshly
@@ -372,6 +622,16 @@ jobs:
               # publish a verdict for a head that is no longer current.
               CONCLUSION="failure"
               SUMMARY="visual-impact-policy-trusted: stale workflow_run (head_sha ${RUN_HEAD_SHA}) does not match current PR #${PR_NUMBER} head (${LIVE_HEAD_SHA}); rejected."
+            elif [ "${DOWNLOAD_STATUS:-}" = "rejected" ]; then
+              # Issue #2505 AC8: report the ACTUAL archive/download
+              # rejection reason -- never mis-attribute this to
+              # trusted_input_derivation_failed (a different failure class:
+              # the SEPARATE "Independently re-derive trusted-side inputs"
+              # step, which never even runs once the `download` step fails
+              # closed and GitHub Actions' default same-job step-skip
+              # behavior takes over).
+              CONCLUSION="failure"
+              SUMMARY="visual-impact-policy-trusted: download_or_archive_rejected (${DOWNLOAD_FAILURE_REASON:-unknown}; ${DOWNLOAD_FAILURE_DETAIL:-}) for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."
             elif [ "${TRUSTED_OUTCOME}" != "success" ]; then
               CONCLUSION="failure"
               SUMMARY="visual-impact-policy-trusted: trusted_input_derivation_failed; verifier_not_run for PR #${PR_NUMBER} head ${LIVE_HEAD_SHA}."

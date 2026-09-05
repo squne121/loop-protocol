@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import io
 import json
 import os
+import re
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -803,3 +806,701 @@ def test_acquire_component_vrt_checkrun_cli_mode_fails_closed_on_non_2xx(tmp_pat
     output = json.loads(result.stdout)
     assert output["ok"] is False
     assert "component_vrt_acquire_jobs_http_status_invalid" in output["reason_codes"]
+
+
+# --- Issue #2505 (ADR 0009 "## ZIP Resource Bound" follow-up): entry-limited,
+# resource-bounded retrieval of decision.zip / evidence.zip in the `download`
+# step -----------------------------------------------------------------------
+#
+# The bounded-reader logic lives ONLY inline in the `download` step's `run:`
+# script (Allowed Paths permit only this workflow YAML and this test file --
+# no new production file under scripts/agent-ops/). These tests extract that
+# EXACT Python source (a heredoc embedded in the step's shell script) and
+# execute it as a real subprocess against synthetic ZIPs and a fake `gh` on
+# PATH -- the actual implementation seam, never a re-implemented copy.
+
+DECISION_ENTRY_NAME_2505 = "visual_impact_decision_v1.json"
+EVIDENCE_ENTRY_NAME_V3_2505 = "visual_baseline_review_evidence.json"
+EVIDENCE_ENTRY_NAME_V2_2505 = "visual_baseline_review_evidence_v2.json"
+DECISION_ZIP_MAX_BYTES_2505 = 2097152
+EVIDENCE_ZIP_MAX_BYTES_2505 = 8388608
+DECISION_ZIP_MAX_ENTRIES_2505 = 16
+EVIDENCE_ZIP_MAX_ENTRIES_2505 = 16
+DECISION_MAX_READ_BYTES_2505 = 1000000
+EVIDENCE_MAX_READ_BYTES_2505 = 5000000
+
+
+@pytest.fixture(scope="module")
+def download_step(workflow_doc: dict) -> dict:
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    return next(step for step in steps if step.get("id") == "download")
+
+
+@pytest.fixture(scope="module")
+def bounded_zip_retrieve_script(tmp_path_factory: pytest.TempPathFactory, download_step: dict) -> Path:
+    """Extract the EXACT `bounded_zip_retrieve.py` heredoc source embedded in
+    the `download` step's `run:` script -- not a reimplemented copy."""
+    match = re.search(
+        r"<<'BOUNDED_ZIP_RETRIEVE_PY_EOF'\n(.*?)\nBOUNDED_ZIP_RETRIEVE_PY_EOF",
+        download_step["run"],
+        re.S,
+    )
+    assert match is not None, "bounded_zip_retrieve.py heredoc not found in the `download` step"
+    script_dir = tmp_path_factory.mktemp("bounded_zip_retrieve_2505")
+    script_path = script_dir / "bounded_zip_retrieve.py"
+    script_path.write_text(match.group(1), encoding="utf-8")
+    compile(match.group(1), str(script_path), "exec")  # syntax sanity check
+    return script_path
+
+
+def _build_zip_2505(entries: list[tuple[str, str]]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in entries:
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+def _build_zip_stored_2505(entries: list[tuple[str, str]]) -> bytes:
+    """STORED (uncompressed) entries -- the on-disk local-file-data bytes
+    are byte-for-byte identical to `content`, which `_corrupt_first_occurrence`
+    relies on to locate and flip a byte without disturbing ZIP structure."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for name, content in entries:
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+def _corrupt_first_occurrence(payload: bytes, marker: bytes) -> bytes:
+    """Flip one byte inside `marker`'s (STORED, i.e. uncompressed) on-disk
+    occurrence -- same length, so no ZIP structural offset changes, but the
+    CRC-32 recorded for that entry no longer matches its actual bytes."""
+    idx = payload.find(marker)
+    assert idx != -1, "marker not found in payload -- fixture bug"
+    corrupted = bytearray(payload)
+    corrupted[idx] = corrupted[idx] ^ 0xFF
+    return bytes(corrupted)
+
+
+def _run_bounded_retrieve(
+    script_path: Path,
+    tmp_path: Path,
+    *,
+    gh_payload: bytes,
+    gh_exit_code: int = 0,
+    max_download_bytes: int,
+    max_entries: int,
+    max_read_bytes: int,
+    targets: list[tuple[str, str]],
+    label: str = "test",
+) -> tuple["subprocess.CompletedProcess[str]", dict[str, str], Path]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    payload_file = tmp_path / "gh_payload.bin"
+    payload_file.write_bytes(gh_payload)
+    fake_gh = bin_dir / "gh"
+    fake_gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"with open({str(payload_file)!r}, 'rb') as fh:\n"
+        "    sys.stdout.buffer.write(fh.read())\n"
+        f"sys.exit({gh_exit_code})\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    status_file = tmp_path / "status.kv"
+    argv = [
+        sys.executable,
+        str(script_path),
+        "--label",
+        label,
+        "--zip-url",
+        "repos/squne121/loop-protocol/actions/artifacts/1/zip",
+        "--max-download-bytes",
+        str(max_download_bytes),
+        "--max-entries",
+        str(max_entries),
+        "--max-read-bytes",
+        str(max_read_bytes),
+        "--status-output-file",
+        str(status_file),
+    ]
+    for name, dest in targets:
+        argv += ["--target", name, dest]
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    result = subprocess.run(
+        argv,
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    status: dict[str, str] = {}
+    if status_file.exists():
+        for line in status_file.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                status[key] = value
+    return result, status, status_file
+
+
+def test_bounded_retrieve_normal_decision_succeeds(bounded_zip_retrieve_script: Path, tmp_path: Path):
+    payload = _build_zip_2505([(DECISION_ENTRY_NAME_2505, '{"schema":"decision-v1"}')])
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode == 0, result.stderr
+    assert status["STATUS"] == "ok"
+    assert dest.read_text(encoding="utf-8") == '{"schema":"decision-v1"}'
+
+
+def test_bounded_retrieve_normal_v3_evidence_succeeds(bounded_zip_retrieve_script: Path, tmp_path: Path):
+    payload = _build_zip_2505([(EVIDENCE_ENTRY_NAME_V3_2505, '{"schema":"v3","surfaces":[]}')])
+    dest_v3 = tmp_path / "evidence" / EVIDENCE_ENTRY_NAME_V3_2505
+    dest_v2 = tmp_path / "evidence" / EVIDENCE_ENTRY_NAME_V2_2505
+    dest_v3.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=EVIDENCE_ZIP_MAX_BYTES_2505,
+        max_entries=EVIDENCE_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=EVIDENCE_MAX_READ_BYTES_2505,
+        targets=[(EVIDENCE_ENTRY_NAME_V3_2505, str(dest_v3)), (EVIDENCE_ENTRY_NAME_V2_2505, str(dest_v2))],
+        label="evidence",
+    )
+    assert result.returncode == 0, result.stderr
+    assert status["STATUS"] == "ok"
+    assert dest_v3.exists()
+    assert not dest_v2.exists()
+    assert dest_v3.read_text(encoding="utf-8") == '{"schema":"v3","surfaces":[]}'
+
+
+def test_bounded_retrieve_accepted_v2_evidence_succeeds(bounded_zip_retrieve_script: Path, tmp_path: Path):
+    payload = _build_zip_2505([(EVIDENCE_ENTRY_NAME_V2_2505, '{"schema":"v2","surfaces":[]}')])
+    dest_v3 = tmp_path / "evidence" / EVIDENCE_ENTRY_NAME_V3_2505
+    dest_v2 = tmp_path / "evidence" / EVIDENCE_ENTRY_NAME_V2_2505
+    dest_v3.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=EVIDENCE_ZIP_MAX_BYTES_2505,
+        max_entries=EVIDENCE_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=EVIDENCE_MAX_READ_BYTES_2505,
+        targets=[(EVIDENCE_ENTRY_NAME_V3_2505, str(dest_v3)), (EVIDENCE_ENTRY_NAME_V2_2505, str(dest_v2))],
+        label="evidence",
+    )
+    assert result.returncode == 0, result.stderr
+    assert status["STATUS"] == "ok"
+    assert dest_v2.exists()
+    assert not dest_v3.exists()
+    assert dest_v2.read_text(encoding="utf-8") == '{"schema":"v2","surfaces":[]}'
+
+
+def test_bounded_retrieve_v2_v3_coexistence_rejected(bounded_zip_retrieve_script: Path, tmp_path: Path):
+    """Issue #2505's core regression: V2 and V3 both present must be
+    rejected even though each individually appears exactly once -- this must
+    be evaluated against the FULL original entry list, never a
+    name-narrowed subset (the bug the human-context review flagged)."""
+    payload = _build_zip_2505(
+        [
+            (EVIDENCE_ENTRY_NAME_V3_2505, '{"schema":"v3"}'),
+            (EVIDENCE_ENTRY_NAME_V2_2505, '{"schema":"v2"}'),
+        ]
+    )
+    dest_v3 = tmp_path / "evidence" / EVIDENCE_ENTRY_NAME_V3_2505
+    dest_v2 = tmp_path / "evidence" / EVIDENCE_ENTRY_NAME_V2_2505
+    dest_v3.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=EVIDENCE_ZIP_MAX_BYTES_2505,
+        max_entries=EVIDENCE_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=EVIDENCE_MAX_READ_BYTES_2505,
+        targets=[(EVIDENCE_ENTRY_NAME_V3_2505, str(dest_v3)), (EVIDENCE_ENTRY_NAME_V2_2505, str(dest_v2))],
+        label="evidence",
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] == "entry_ambiguous_or_missing"
+    assert not dest_v3.exists()
+    assert not dest_v2.exists()
+
+
+@pytest.mark.parametrize(
+    ("download_bytes_offset", "expect_ok"),
+    [(-1, True), (0, True), (1, False)],
+    ids=["below_limit", "exactly_at_limit", "over_limit"],
+)
+def test_bounded_retrieve_download_bytes_boundary(
+    bounded_zip_retrieve_script: Path, tmp_path: Path, download_bytes_offset: int, expect_ok: bool
+):
+    """AC4: downloaded ZIP bytes below/exactly-at/over the configured limit."""
+    base_payload = _build_zip_2505([(DECISION_ENTRY_NAME_2505, "x")])
+    max_download_bytes = len(base_payload) - download_bytes_offset
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=base_payload,
+        max_download_bytes=max_download_bytes,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    if expect_ok:
+        assert result.returncode == 0, result.stderr
+        assert status["STATUS"] == "ok"
+        assert dest.exists()
+    else:
+        assert result.returncode != 0
+        assert status["STATUS"] == "download_size_exceeded"
+        assert status["LIMIT"] == str(max_download_bytes)
+        assert not dest.exists()
+
+
+def test_bounded_retrieve_download_size_exceeded_kills_and_reaps_process(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """AC4: overflow must be detected DURING streaming (never a post-hoc
+    `stat`) and the downloader process must be terminated/reaped -- proven
+    here by an effectively-unbounded fake `gh` that would hang forever if
+    the bounded reader waited for EOF before checking size."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_gh = bin_dir / "gh"
+    fake_gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "chunk = b'Q' * 65536\n"
+        "try:\n"
+        "    while True:\n"
+        "        sys.stdout.buffer.write(chunk)\n"
+        "        sys.stdout.buffer.flush()\n"
+        "except BrokenPipeError:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    status_file = tmp_path / "status.kv"
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(bounded_zip_retrieve_script),
+            "--label",
+            "decision",
+            "--zip-url",
+            "repos/squne121/loop-protocol/actions/artifacts/1/zip",
+            "--max-download-bytes",
+            str(DECISION_ZIP_MAX_BYTES_2505),
+            "--max-entries",
+            str(DECISION_ZIP_MAX_ENTRIES_2505),
+            "--max-read-bytes",
+            str(DECISION_MAX_READ_BYTES_2505),
+            "--status-output-file",
+            str(status_file),
+            "--target",
+            DECISION_ENTRY_NAME_2505,
+            str(dest),
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=15,  # would hang past this bound if the abort path is broken
+    )
+    assert result.returncode != 0
+    status_text = status_file.read_text(encoding="utf-8")
+    assert "STATUS=download_size_exceeded" in status_text
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize(
+    ("entry_count_offset", "expect_ok"),
+    [(-1, True), (0, True), (1, False)],
+    ids=["below_limit", "exactly_at_limit", "over_limit"],
+)
+def test_bounded_retrieve_entry_count_boundary(
+    bounded_zip_retrieve_script: Path, tmp_path: Path, entry_count_offset: int, expect_ok: bool
+):
+    """AC5: original ZIP entry count below/exactly-at/over the configured
+    limit, judged from the entry list BEFORE any extraction/read."""
+    filler_count = DECISION_ZIP_MAX_ENTRIES_2505 - 1 + entry_count_offset
+    entries = [(f"filler{i}.json", "x") for i in range(filler_count)]
+    entries.append((DECISION_ENTRY_NAME_2505, "target-content"))
+    payload = _build_zip_2505(entries)
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    if expect_ok:
+        assert result.returncode == 0, result.stderr
+        assert status["STATUS"] == "ok"
+        assert dest.exists()
+    else:
+        assert result.returncode != 0
+        assert status["STATUS"] == "entry_count_exceeded"
+        assert status["LIMIT"] == str(DECISION_ZIP_MAX_ENTRIES_2505)
+        assert not dest.exists()
+
+
+@pytest.mark.parametrize(
+    ("read_bytes_offset", "expect_ok"),
+    [(-1, True), (0, True), (1, False)],
+    ids=["below_limit", "exactly_at_limit", "over_limit"],
+)
+def test_bounded_retrieve_read_bytes_boundary(
+    bounded_zip_retrieve_script: Path, tmp_path: Path, read_bytes_offset: int, expect_ok: bool
+):
+    """AC6: selected-entry decompressed/read bytes below/exactly-at/over the
+    configured limit -- an N-byte truncation of an oversized entry must
+    never be reported as success; only genuinely-<=N-byte content passes."""
+    max_read_bytes = 32
+    content_length = max_read_bytes + read_bytes_offset
+    payload = _build_zip_2505([(DECISION_ENTRY_NAME_2505, "a" * content_length)])
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=max_read_bytes,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    if expect_ok:
+        assert result.returncode == 0, result.stderr
+        assert status["STATUS"] == "ok"
+        assert dest.read_text(encoding="utf-8") == "a" * content_length
+    else:
+        assert result.returncode != 0
+        assert status["STATUS"] == "read_size_exceeded"
+        assert status["LIMIT"] == str(max_read_bytes)
+        assert not dest.exists()
+
+
+def test_bounded_retrieve_missing_target_entry_rejected(bounded_zip_retrieve_script: Path, tmp_path: Path):
+    payload = _build_zip_2505([("unrelated.json", "x")])
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] == "entry_ambiguous_or_missing"
+    assert not dest.exists()
+
+
+def test_bounded_retrieve_duplicate_target_entry_rejected(bounded_zip_retrieve_script: Path, tmp_path: Path):
+    payload = _build_zip_2505(
+        [(DECISION_ENTRY_NAME_2505, "first"), (DECISION_ENTRY_NAME_2505, "second")]
+    )
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] == "entry_ambiguous_or_missing"
+    assert not dest.exists()
+
+
+def test_bounded_retrieve_non_target_entries_never_read(bounded_zip_retrieve_script: Path, tmp_path: Path):
+    """A CORRUPTED non-target entry (bad CRC-32 -- would raise if opened and
+    fully read) sits alongside a valid target entry. Success here proves the
+    non-target entry was never opened/read."""
+    marker = b"CORRUPT_NON_TARGET_MARKER_2505"
+    payload = _build_zip_stored_2505(
+        [
+            ("bystander.json", marker.decode("ascii")),
+            (DECISION_ENTRY_NAME_2505, '{"schema":"decision-v1"}'),
+        ]
+    )
+    payload = _corrupt_first_occurrence(payload, marker)
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode == 0, result.stderr
+    assert status["STATUS"] == "ok"
+    assert dest.read_text(encoding="utf-8") == '{"schema":"decision-v1"}'
+
+
+def test_bounded_retrieve_read_failure_corrupted_target_entry_rejected(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """The TARGET entry itself is corrupted (bad CRC-32, small enough to
+    fully decompress within the read bound) -- must be rejected, never
+    silently adopted."""
+    marker = b"CORRUPT_TARGET_MARKER_2505"
+    payload = _build_zip_stored_2505([(DECISION_ENTRY_NAME_2505, marker.decode("ascii"))])
+    payload = _corrupt_first_occurrence(payload, marker)
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] == "invalid_zip"
+    assert not dest.exists()
+
+
+def test_bounded_retrieve_invalid_zip_rejected(bounded_zip_retrieve_script: Path, tmp_path: Path):
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=b"this is not a zip file at all",
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] == "invalid_zip"
+    assert not dest.exists()
+
+
+def test_bounded_retrieve_download_command_failure_rejected(bounded_zip_retrieve_script: Path, tmp_path: Path):
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=b"",
+        gh_exit_code=1,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] == "download_command_failed"
+    assert not dest.exists()
+
+
+def test_bounded_retrieve_never_extracts_outside_destination_directory(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """Even if the ZIP entry's OWN recorded filename looks like a path
+    traversal string, the destination is always the literal `--target ...
+    DEST` path passed in by the caller -- never a path derived from the
+    entry's own name (there is no `ZipFile.extract()` call anywhere in this
+    implementation)."""
+    traversal_name = "../../../evil.json"
+    payload = _build_zip_2505([(traversal_name, "malicious-content")])
+    dest_dir = tmp_path / "decision"
+    dest_dir.mkdir()
+    dest = dest_dir / "safe_output.json"
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(traversal_name, str(dest))],
+    )
+    assert result.returncode == 0, result.stderr
+    assert status["STATUS"] == "ok"
+    assert dest.exists()
+    assert dest.read_text(encoding="utf-8") == "malicious-content"
+    # Nothing was written anywhere outside the destination directory.
+    assert list(dest_dir.iterdir()) == [dest]
+    assert not (tmp_path / "evil.json").exists()
+    assert not (tmp_path.parent / "evil.json").exists()
+
+
+def test_bounded_retrieve_success_content_matches_original_bytes(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """The verifier must receive exactly the same bytes a legacy
+    `unzip -o -q` extraction would have produced -- no transformation."""
+    original_content = json.dumps({"schema": "VISUAL_IMPACT_DECISION_V1", "surfaces": [1, 2, 3]})
+    payload = _build_zip_2505([(DECISION_ENTRY_NAME_2505, original_content)])
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode == 0, result.stderr
+    assert status["STATUS"] == "ok"
+    assert dest.read_bytes() == original_content.encode("utf-8")
+
+
+# --- Issue #2505 AC7/AC8/AC9: workflow-level wiring ---------------------
+
+
+def test_download_step_never_uses_continue_on_error(download_step: dict):
+    """AC9: a resource-bound / archive rejection must hard-fail this step so
+    GitHub Actions' default same-job step-skip behavior keeps `trusted` and
+    `verify` from ever running -- `continue-on-error` would defeat that."""
+    assert download_step.get("continue-on-error") in (None, False)
+    assert 'if [ "${DOWNLOAD_STATUS}" != "ok" ]; then' in download_step["run"]
+    assert "exit 1" in download_step["run"]
+
+
+def test_download_step_emits_diagnostic_outputs_for_publish_step(download_step: dict):
+    """AC8: the download step must expose enough step outputs for the
+    Publish step to distinguish an archive/download rejection from
+    trusted_input_derivation_failed."""
+    run = download_step["run"]
+    for output_name in ("download_status", "download_failure_reason", "download_failure_detail"):
+        assert f'echo "{output_name}=' in run
+
+
+def test_publish_step_consumes_download_step_outputs(workflow_doc: dict):
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
+    assert publish["env"]["DOWNLOAD_STATUS"] == "${{ steps.download.outputs.download_status }}"
+    assert publish["env"]["DOWNLOAD_FAILURE_REASON"] == "${{ steps.download.outputs.download_failure_reason }}"
+    assert publish["env"]["DOWNLOAD_FAILURE_DETAIL"] == "${{ steps.download.outputs.download_failure_detail }}"
+
+
+def _run_publish_step_2505(
+    workflow_doc: dict,
+    tmp_path: Path,
+    *,
+    trusted_outcome: str,
+    verify_outcome: str,
+    download_status: str = "ok",
+    download_failure_reason: str = "",
+    download_failure_detail: str = "",
+) -> list[str]:
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
+    captured_args = tmp_path / "gh-args.txt"
+    fake_gh = tmp_path / "gh"
+    fake_gh.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > \"$FAKE_GH_ARGS\"\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FAKE_GH_ARGS": str(captured_args),
+        "GH_TOKEN": "test-token",
+        "REPO": EXPECTED_REPOSITORY,
+        "RUN_HEAD_SHA": EXPECTED_HEAD_SHA,
+        "LIVE_HEAD_SHA": EXPECTED_HEAD_SHA,
+        "PR_NUMBER": str(EXPECTED_PR_NUMBER),
+        "TRUSTED_OUTCOME": trusted_outcome,
+        "VERIFY_OUTCOME": verify_outcome,
+        "DOWNLOAD_STATUS": download_status,
+        "DOWNLOAD_FAILURE_REASON": download_failure_reason,
+        "DOWNLOAD_FAILURE_DETAIL": download_failure_detail,
+    }
+    result = subprocess.run(
+        ["bash", "-c", publish["run"]],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return captured_args.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.parametrize(
+    "download_failure_reason",
+    [
+        "download_size_exceeded",
+        "entry_count_exceeded",
+        "entry_ambiguous_or_missing",
+        "read_size_exceeded",
+        "invalid_zip",
+        "download_command_failed",
+    ],
+)
+def test_publish_step_reports_actual_download_rejection_reason(
+    workflow_doc: dict, tmp_path: Path, download_failure_reason: str
+):
+    """AC8: the failure CheckRun must name the ACTUAL archive/download
+    rejection reason -- never misreported as trusted_input_derivation_failed
+    (a different failure class: the `trusted` step, which never even runs
+    once `download` fails closed)."""
+    gh_args = _run_publish_step_2505(
+        workflow_doc,
+        tmp_path,
+        trusted_outcome="skipped",
+        verify_outcome="skipped",
+        download_status="rejected",
+        download_failure_reason=download_failure_reason,
+        download_failure_detail="artifact=decision limit=2097152",
+    )
+    assert "conclusion=failure" in gh_args
+    summary = next(arg for arg in gh_args if arg.startswith("output[summary]="))
+    assert download_failure_reason in summary
+    assert "trusted_input_derivation_failed" not in summary
+
+
+def test_publish_step_download_ok_falls_through_to_existing_taxonomy(workflow_doc: dict, tmp_path: Path):
+    """Regression guard: a normal (non-rejected) download must not alter the
+    pre-existing trusted/verify outcome taxonomy."""
+    gh_args = _run_publish_step_2505(
+        workflow_doc,
+        tmp_path,
+        trusted_outcome="success",
+        verify_outcome="success",
+        download_status="ok",
+    )
+    assert "conclusion=success" in gh_args
