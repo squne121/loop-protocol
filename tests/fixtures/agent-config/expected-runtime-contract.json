@@ -40,16 +40,6 @@
       ],
       "model_alias": "haiku"
     },
-    "review-issue": {
-      "claude_agent_path": ".claude/agents/review-issue.md",
-      "claude_permission_mode": "acceptEdits",
-      "mutation_class": "issue-mutation",
-      "runtime_followup_route": "review-issue",
-      "repo_local_skill_surfaces": [
-        ".agents/skills/review-issue/SKILL.md"
-      ],
-      "model_alias": "sonnet"
-    },
     "scope-rollup-runner": {
       "claude_agent_path": ".claude/agents/scope-rollup-runner.md",
       "claude_permission_mode": "auto",
@@ -132,7 +122,6 @@
     ".claude/agents/post-merge-cleanup-worker.md": "shared_claude_runtime",
     ".claude/agents/pr-reviewer-lite.md": "shared_claude_runtime",
     ".claude/agents/pr-reviewer.md": "shared_claude_runtime",
-    ".claude/agents/review-issue.md": "shared_claude_runtime",
     ".claude/agents/scope-rollup-runner.md": "shared_claude_runtime",
     ".claude/agents/test-runner.md": "shared_claude_runtime",
     ".claude/agents/web-researcher.md": "shared_claude_runtime",
