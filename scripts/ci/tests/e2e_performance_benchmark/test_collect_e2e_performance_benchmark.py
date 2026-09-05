@@ -1545,6 +1545,40 @@ def test_dispatch_workflow_run_requires_return_run_details_and_extracts_workflow
     assert result["block_id"] == "block-0001"
 
 
+def test_dispatch_workflow_run_sends_target_sha_not_frozen_source_sha_key():
+    """fix_delta (test-runner live AC8 dispatch, HTTP 422 "Unexpected
+    inputs provided: [\"frozen_source_sha\"...]"):
+    `.github/workflows/ci.yml`'s `workflow_dispatch.inputs` has no
+    `frozen_source_sha` key -- only the pre-existing `target_sha` input,
+    which is the SAME "measured application-code commit" checkout
+    selector. The `inputs` payload `dispatch_workflow_run` sends to
+    `dispatch_call` must carry the frozen source SHA under the
+    `target_sha` key the workflow actually declares, and must NEVER send
+    an undeclared `frozen_source_sha` key (that undeclared-input shape is
+    exactly what produced the live 422)."""
+    captured_inputs: dict = {}
+
+    def capturing_dispatch_call(repo, workflow_file, ref, inputs, return_run_details):
+        captured_inputs.update(inputs)
+        return {"workflow_run_id": 501, "html_url": "https://example.invalid/runs/501"}
+
+    collector.dispatch_workflow_run(
+        "monolith",
+        "block-0001",
+        FROZEN_SOURCE_SHA,
+        "exp-1",
+        "squne121/loop-protocol",
+        "ci.yml",
+        "main",
+        capturing_dispatch_call,
+    )
+    assert "frozen_source_sha" not in captured_inputs
+    assert captured_inputs["target_sha"] == FROZEN_SOURCE_SHA
+    assert captured_inputs["benchmark_layout"] == "monolith"
+    assert captured_inputs["block_id"] == "block-0001"
+    assert captured_inputs["experiment_id"] == "exp-1"
+
+
 def test_dispatch_workflow_run_fails_closed_when_response_lacks_workflow_run_id():
     """GIVEN a dispatch response shaped like GitHub's 204 No Content (no
     workflow_run_id) WHEN dispatched THEN LiveAPIError is raised --

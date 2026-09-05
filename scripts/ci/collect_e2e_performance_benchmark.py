@@ -1432,9 +1432,19 @@ def dispatch_workflow_run(
     forbids exactly that)."""
     if layout not in BENCHMARK_LAYOUTS:
         raise OperationalErrorV2(f"invalid_benchmark_layout: {layout!r}")
+    # fix_delta (test-runner live AC8 dispatch, HTTP 422
+    # "Unexpected inputs provided: [\"frozen_source_sha\"...]"): the
+    # `workflow_dispatch.inputs` block in `.github/workflows/ci.yml` has no
+    # `frozen_source_sha` key -- the pre-existing `target_sha` input is the
+    # SAME "measured application-code commit" checkout selector (see its
+    # description there), already consumed unconditionally by the
+    # e2e-core / e2e-responsive-matrix checkout steps regardless of
+    # `benchmark_layout`. Send it under the `target_sha` key the workflow
+    # actually declares; the `frozen_source_sha` PARAMETER name here is kept
+    # as-is (internal Python identifier only, not sent to the API).
     inputs = {
         "benchmark_layout": layout,
-        "frozen_source_sha": frozen_source_sha,
+        "target_sha": frozen_source_sha,
         "block_id": block_id,
         "experiment_id": experiment_id,
     }
