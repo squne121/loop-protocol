@@ -3618,12 +3618,21 @@ jobs:
     # the native-Codex-CLI-lane job, which was removed (Issue #2161).
     runs-on: ubuntu-latest
     needs: [python-test-core]
-    # Issue #2422 AC7: `if: always()` bypasses `needs` skip-propagation, so
-    # this job must be explicitly excluded here too on a
-    # `benchmark_layout != ''` dispatch (python-test-core above is already
-    # skipped on that route, but `always()` alone would still let this job
-    # run).
-    if: ${{ always() && github.event.inputs.benchmark_layout == '' }}
+    # Issue #1760 AC5 (scripts/ci/verify_python_test_lane.py::check_aggregate_job)
+    # requires this job's `if:` to be the literal `always()` -- this required
+    # aggregate status check must never itself be skippable, even on a
+    # `benchmark_layout != ''` dispatch. Issue #2422 AC7's "exclude unrelated
+    # jobs from a benchmark_layout dispatch" intent is satisfied one level up,
+    # on `python-test-core` above (`if: ${{ github.event.inputs.benchmark_layout
+    # == '' }}`), NOT here: the verifier's AC10 also forbids this job's sole
+    # step (the evaluate_python_test_aggregate.py invocation) from having its
+    # own `if:`, so step-level gating -- the pattern used for typecheck/lint/
+    # build/etc. above -- is not available for this job either. The accepted
+    # side effect is that a `benchmark_layout != ''` workflow_dispatch run will
+    # still execute this job, which will then report failure (core result
+    # `skipped` != `success`) -- an ad-hoc benchmark dispatch run, not a
+    # pull_request-triggered run, so this does not gate any PR merge.
+    if: always()
     steps:
       - uses: actions/checkout@v6
         with:
