@@ -21,6 +21,7 @@ import pytest
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import private_audit_resolver as par  # noqa: E402
 import validate_retrospective_schema as vrs  # noqa: E402
 
 EVIDENCE_REF_ALLOWED_FIELDS = frozenset(
@@ -210,3 +211,58 @@ def test_latitude_evidence_ref_and_identity_never_contain_absolute_path_shape():
         assert not value.startswith("/")
         assert "/home/" not in value
         assert "/Users/" not in value
+
+
+# ---------------------------------------------------------------------------
+# Issue #2376 (#1939 Workstream 5) AC7: retro_private_audit_index/v1 -- the
+# LOCAL-ONLY private-audit manifest must never carry a raw-evidence-shaped
+# field (closed schema key set) and its object_key must never resemble a
+# local absolute filesystem path.
+# ---------------------------------------------------------------------------
+
+
+def _private_audit_index_instance():
+    return copy.deepcopy(vrs.load_fixture("retro_private_audit_index_v1.valid.json"))
+
+
+def test_private_audit_index_schema_is_closed():
+    schema = par.load_manifest_schema()
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["run_identity"]["additionalProperties"] is False
+    assert schema["properties"]["evidence_ref"]["additionalProperties"] is False
+    # no free-form instruction field anywhere in this schema (AC7).
+    for forbidden in ("instruction", "instructions", "prompt", "command"):
+        assert forbidden not in schema["properties"]
+
+
+def test_private_audit_index_schema_has_no_raw_evidence_property():
+    schema = par.load_manifest_schema()
+    top_level_properties = set(schema["properties"].keys())
+    for raw_field in RAW_EVIDENCE_FIELD_NAMES:
+        assert raw_field not in top_level_properties
+
+
+@pytest.mark.parametrize("raw_field", RAW_EVIDENCE_FIELD_NAMES)
+def test_private_audit_index_with_raw_evidence_field_rejected(raw_field):
+    instance = _private_audit_index_instance()
+    instance[raw_field] = "untrusted raw content that must never be schema-allowed"
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        par._validate_manifest_schema(instance)  # noqa: SLF001
+
+
+def test_private_audit_index_well_formed_fixture_accepted():
+    instance = _private_audit_index_instance()
+    par._validate_manifest_schema(instance)  # no error  # noqa: SLF001
+
+
+def test_private_audit_index_object_key_never_resembles_absolute_path():
+    instance = _private_audit_index_instance()
+    object_key = instance["object_key"]
+    assert not object_key.startswith("/")
+    assert "/home/" not in object_key
+    assert "/Users/" not in object_key
+    assert ".." not in object_key.split("/")
+
+    instance["object_key"] = "/etc/passwd"
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        par._validate_manifest_schema(instance)  # noqa: SLF001

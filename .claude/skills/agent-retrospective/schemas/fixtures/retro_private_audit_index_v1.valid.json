@@ -1,0 +1,22 @@
+{
+  "schema_version": "retro_private_audit_index/v1",
+  "resolution_key": "sha256:6457b9c669ba73d97fb655cef0e92a76852b40643f5743153e0b5b1541127e8b",
+  "manifest_digest": "sha256:1fc4454f8e45e998c84dedefb151e5af197ae50fc5e493b58ba6d9ff346d4f63",
+  "run_identity": {
+    "run_id": "run-2376-fixture",
+    "base_sha": "0123456789abcdef0123456789abcdef01234567",
+    "source_set_digest": "sha256-sorted-json-v1:fixture-source-set-digest"
+  },
+  "evidence_ref": {
+    "ref_type": "repository_blob",
+    "source_id": "repository",
+    "resource_identity": ".claude/skills/agent-retrospective/scripts/private_audit_resolver.py#L1",
+    "projection_digest": "sha256:a6e0467949437551e55f41f9d3d467b6deb90c2ad9f831c12f8b1bfec8e2c27d"
+  },
+  "private_status_at_generation": "available",
+  "reason_code": null,
+  "object_key": "objects/56/56aeeddb728c06a6aeae4b9ec638bba4c648c45c45880e25f960f2d44e52ec19.bin",
+  "object_digest": "sha256:56aeeddb728c06a6aeae4b9ec638bba4c648c45c45880e25f960f2d44e52ec19",
+  "expires_at": null,
+  "generated_at": "2026-09-05T00:00:00Z"
+}

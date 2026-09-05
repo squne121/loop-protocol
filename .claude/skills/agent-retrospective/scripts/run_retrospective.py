@@ -151,6 +151,61 @@ def _persist_retrospective_run_module():
     return _load_sibling_module("agent_retrospective_persist_run", "persist_retrospective_run.py")
 
 
+def _private_audit_resolver_module():
+    """Lazily load Issue #2376 (#1939 Workstream 5)'s private-local-audit
+    resolver sibling script (``private_audit_resolver.py``, this Issue's own
+    Allowed Paths). Loaded lazily like every other sibling module above, so
+    importing ``run_retrospective`` never requires it unless a caller
+    actually registers a private audit ref (``register_private_audit_ref``
+    below)."""
+    return _load_sibling_module("agent_retrospective_private_audit_resolver", "private_audit_resolver.py")
+
+
+def register_private_audit_ref(
+    evidence_ref: dict[str, Any],
+    run_identity: dict[str, Any],
+    *,
+    private_content: Any,
+    audit_root: Path | None = None,
+) -> dict[str, Any] | None:
+    """Issue #2376 (#1939 Workstream 5) generation-time sidecar PRODUCER hook
+    (mandatory per the OWNER contract-repair anchor comment,
+    issuecomment-5551373964 blocker 1: a resolver with no producer can only
+    ever return ``unavailable``, since a public ``evidence_ref`` alone
+    cannot be used to locate its own private local audit evidence).
+
+    Registers a private-audit sidecar mapping for ONE already-generated,
+    already public-safe ``evidence_ref`` ONLY when ``private_content`` --
+    the ACTUAL real evidence data this run already collected and used to
+    compute that same ``evidence_ref``'s ``projection_digest`` (e.g. one
+    ``_observer_source_type_index()`` entry) -- is truthy, i.e. a local
+    private source already exists this run. Never fabricates a private
+    source: a falsy ``private_content`` is a no-op (``None`` returned, no
+    manifest written) -- see ``private_audit_resolver.
+    register_private_audit_ref()`` for the actual atomic local-only storage
+    write this delegates to.
+
+    Best-effort / fail-open by design (mirrors the existing Latitude
+    evidence binding convention in ``execute_run()`` immediately below,
+    which never blocks or fails the retrospective run on
+    unavailability/failure): any exception raised while resolving/writing
+    local storage is swallowed and ``None`` is returned, so a local-audit
+    storage problem never turns into a retrospective run failure."""
+    if not private_content:
+        return None
+    try:
+        resolver = _private_audit_resolver_module()
+        root = audit_root if audit_root is not None else resolver.default_audit_root(_REPO_ROOT)
+        return resolver.register_private_audit_ref(
+            evidence_ref=evidence_ref,
+            run_identity=run_identity,
+            private_content=private_content,
+            audit_root=root,
+        )
+    except Exception:
+        return None
+
+
 def compute_source_set_digest(source_observations: list[dict[str, Any]]) -> str:
     """Reuse Child 2's canonical ``source_set_digest`` computation (Issue
     #2235/#2236). Loaded lazily so importing this module never requires the
@@ -1931,6 +1986,21 @@ def _observer_source_type_index(
     return index
 
 
+def _real_evidence_projection_digest(real_findings: list[dict[str, Any]]) -> str:
+    """The exact ``sha256`` digest formula both ``_enrich_evidence_ref``
+    (below) and the private-audit producer hook
+    (``_register_private_audit_refs_from_evidence``, Issue #2376 fix_delta
+    blocker 3) use to recompute an evidence_ref's ``projection_digest`` from
+    the ACTUAL real ``finding_sets`` content for one ``source_id`` -- a
+    JCS-canonicalized hash of the real, already-redacted observer findings.
+    Factored out so both call sites can never drift apart (a digest
+    mismatch between them would otherwise silently defeat blocker 3's
+    Latitude/observer-evidence disambiguation, see that function's
+    docstring)."""
+    projection = json.dumps(real_findings, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(projection.encode("utf-8")).hexdigest()
+
+
 def _enrich_evidence_ref(
     raw_ref: Any, *, real_evidence_index: dict[str, list[dict[str, Any]]]
 ) -> dict[str, Any] | None:
@@ -1963,8 +2033,7 @@ def _enrich_evidence_ref(
     real_findings = real_evidence_index.get(source_id)
     if not real_findings:
         return None
-    projection = json.dumps(real_findings, sort_keys=True, separators=(",", ":"))
-    digest = "sha256:" + hashlib.sha256(projection.encode("utf-8")).hexdigest()
+    digest = _real_evidence_projection_digest(real_findings)
     return {
         "ref_type": ref_type,
         "source_id": source_id,
@@ -1988,6 +2057,95 @@ def _enrich_evidence_refs(
         if enriched_ref is not None:
             enriched_refs.append(enriched_ref)
     return enriched_refs
+
+
+def _register_private_audit_refs_from_evidence(
+    candidate_records: Sequence[dict[str, Any]],
+    *,
+    finding_sets: Sequence[dict[str, Any]],
+    run_identity: dict[str, Any],
+) -> None:
+    """Shared private-audit producer-hook wiring (Issue #2376 fix_delta,
+    OWNER review issuecomment-5552512140 blockers 1/2/3), factored out of
+    ``execute_run()`` so ``run_cli()`` -- the production CLI entrypoint --
+    can call the SAME wiring instead of never reaching this hook at all
+    (blocker 1: previously only ``execute_run()``'s own inline loop invoked
+    ``register_private_audit_ref()``; ``run_cli()``'s own separate
+    ``prepare`` -> ``validate-observers`` -> ``prepare-evaluator`` ->
+    evaluator -> ``finalize`` composition never did).
+
+    ``finding_sets`` MUST be ``evaluator_request.finding_sets`` -- the
+    ALREADY dict-shaped list ``prepare_evaluator_request()`` builds via
+    ``[dataclasses.asdict(fs) for fs in finding_sets]`` -- and never the raw
+    ``list[FindingSet]`` dataclass objects ``build_finding_sets()`` returns
+    (blocker 2: ``_observer_source_type_index()``'s
+    ``isinstance(finding_set, dict)`` guard silently drops every entry of a
+    ``list[FindingSet]``, leaving the resulting index permanently empty and
+    this hook permanently a no-op). This is the exact same
+    ``evaluator_request.finding_sets`` value ``run_evaluation()`` already
+    threads into ``_enrich_evaluation_payload()`` to recompute each
+    candidate's own ``evidence_refs[].projection_digest`` in the first
+    place, so reusing it here (rather than recomputing a fresh index from
+    ``build_finding_sets()``'s output) is also the one real data path the
+    evaluator itself actually saw this run -- never a separately
+    reconstructed/mocked view of it (this Issue's regression tests must
+    exercise this exact conversion, not monkeypatch it).
+
+    Only the LATEST (``evaluations[-1]``) evaluation entry of each candidate
+    is considered -- never carried-over history from a previous run, which
+    this run's producer hook has no business re-registering.
+
+    For each of that latest evaluation's ``evidence_refs[]`` entries, a
+    private-audit mapping is registered ONLY when the ref's own
+    ``projection_digest`` matches the digest INDEPENDENTLY recomputed here
+    (via ``_real_evidence_projection_digest``, the exact same formula
+    ``_enrich_evidence_ref`` used to compute it) from
+    ``real_evidence_index``'s real observer content for that ref's
+    ``source_id`` (blocker 3). This is what distinguishes a ref this run's
+    OWN observer-projection enrichment step actually produced from real
+    observer evidence, from a ref a LATER step
+    (``bind_latitude_evidence_to_candidates``) appended under the SAME
+    ``source_id`` (``"runtime"``) from an entirely unrelated evidence
+    source: a Latitude-bound ``runtime_receipt`` ref's ``projection_digest``
+    is ``latitude_evidence["evidence_identity"]``, computed by a different
+    collector entirely, so it will not match the observer-projection digest
+    recomputed here even when ``real_evidence_index.get("runtime")`` is
+    non-empty (the runtime OBSERVER did report real findings this run --
+    those real findings are simply not what backs the Latitude ref). Such a
+    ref is correctly left unregistered here -- ``private_audit_resolver.
+    resolve()`` then reports ``unavailable`` for it, never silently
+    backfilled with an unrelated observer's real evidence
+    (``object_digest == projection_digest`` is deliberately NOT enforced
+    generically inside the resolver itself -- a public projection and its
+    private original may legitimately differ; this digest-equality check is
+    this producer's own correspondence verification, not a generic resolver
+    invariant).
+
+    Best-effort / fail-open by construction: delegates every actual write to
+    ``register_private_audit_ref()`` (module-level, above), which already
+    swallows every exception from the underlying local storage write -- this
+    function itself performs no I/O of its own beyond that delegation."""
+    real_evidence_index = _observer_source_type_index(finding_sets)
+    for candidate in candidate_records:
+        finding_contract = candidate.get("finding_contract") if isinstance(candidate, dict) else None
+        evaluations = finding_contract.get("evaluations") if isinstance(finding_contract, dict) else None
+        if not evaluations:
+            continue
+        latest_evaluation = evaluations[-1]
+        for ref in latest_evaluation.get("evidence_refs") or []:
+            if not isinstance(ref, dict):
+                continue
+            real_findings = real_evidence_index.get(ref.get("source_id"))
+            if not real_findings:
+                continue
+            if ref.get("projection_digest") != _real_evidence_projection_digest(real_findings):
+                # Blocker 3: this ref's digest was not produced from THIS
+                # source_id's real observer content this run (e.g. a
+                # Latitude-bound `runtime_receipt` ref sharing the same
+                # `source_id` as a real runtime-observer finding set) --
+                # never backfill it with unrelated real evidence.
+                continue
+            register_private_audit_ref(ref, run_identity, private_content=real_findings)
 
 
 def _find_previous_candidate(previous_state: "PreviousStateResult", identity_value: str) -> dict[str, Any] | None:
@@ -2559,6 +2717,32 @@ def execute_run(
         evaluation.candidate_records, latitude_evidence
     )
     evaluation = dataclasses.replace(evaluation, candidate_records=bound_candidate_records)
+
+    # Issue #2376 (#1939 Workstream 5): generation-time private-audit
+    # producer hook. Additive-only, mirroring the fail-open Latitude
+    # binding immediately above -- never mutates `evaluation`/
+    # `bound_candidate_records`/the eventual `PublishRequest` (this hook's
+    # only effect is a local-only sidecar filesystem write, and even that is
+    # entirely delegated to -- and fail-open within --
+    # `_register_private_audit_refs_from_evidence()`/
+    # `register_private_audit_ref()`). Issue #2376 fix_delta (OWNER review
+    # issuecomment-5552512140 blocker 1/2): the actual wiring now lives in
+    # the shared `_register_private_audit_refs_from_evidence()` helper --
+    # also called from `run_cli()` below -- fed `evaluator_request.
+    # finding_sets` (the real, ALREADY dict-shaped evidence the evaluator
+    # itself was given this run), never a freshly-recomputed
+    # `list[FindingSet]` view of `finding_sets` (which silently produced an
+    # always-empty index -- blocker 2).
+    digest_run_identity = {
+        "run_id": ctx.run_id,
+        "base_sha": ctx.base_sha,
+        "source_set_digest": plan.source_set_digest,
+    }
+    _register_private_audit_refs_from_evidence(
+        bound_candidate_records,
+        finding_sets=evaluator_request.finding_sets,
+        run_identity=digest_run_identity,
+    )
 
     return finalize(
         ctx,
@@ -4087,6 +4271,27 @@ def run_cli(
             clock=clock,
         )
         delta_results = compute_delta(previous_state, evaluation.candidate_records)
+
+        # Issue #2376 fix_delta (OWNER review issuecomment-5552512140
+        # blocker 1): the private-audit producer hook was previously wired
+        # ONLY into `execute_run()`'s own call graph -- this production CLI
+        # entrypoint (`run_cli()` -> `main()`, the one the root Skill's
+        # Procedure actually invokes via Bash) never reached it. Reuses the
+        # SAME shared `_register_private_audit_refs_from_evidence()` helper
+        # `execute_run()` calls, fed `evaluator_request.finding_sets` (the
+        # real dict-shaped evidence this run's evaluator was actually given
+        # -- see that helper's docstring for why NOT `finding_sets` itself).
+        digest_run_identity = {
+            "run_id": ctx.run_id,
+            "base_sha": ctx.base_sha,
+            "source_set_digest": plan.source_set_digest,
+        }
+        _register_private_audit_refs_from_evidence(
+            evaluation.candidate_records,
+            finding_sets=evaluator_request.finding_sets,
+            run_identity=digest_run_identity,
+        )
+
         publish_request = finalize(
             ctx,
             plan,
