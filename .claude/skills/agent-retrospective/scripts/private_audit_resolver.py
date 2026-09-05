@@ -245,6 +245,29 @@ def _object_relative_key(object_digest_hex: str) -> str:
     return f"objects/{object_digest_hex[:2]}/{object_digest_hex}.bin"
 
 
+def _contained_object_path(audit_root: Path, object_key: Any) -> Path | None:
+    """Resolve `object_key` (a manifest's stored, supposedly-relative
+    ``object_key`` field) against `audit_root`, returning ``None`` (never
+    raising) when `object_key` is not a non-empty string, is absolute, or
+    would resolve OUTSIDE `audit_root` (Issue #2376 fix_delta, OWNER review
+    issuecomment-5552512140, additional point 2: the schema's `object_key`
+    regex only forbids a LEADING '..'/'/' segment, not an embedded one
+    later in the path, e.g. ``"objects/../../../etc/passwd"`` still matches
+    it). This is a pure filesystem-path computation -- it never reads or
+    writes anything -- so `resolve()` can fold a failing containment check
+    into the same `malformed_manifest` fail-closed outcome as every other
+    corrupted-manifest condition."""
+    if not isinstance(object_key, str) or not object_key or os.path.isabs(object_key):
+        return None
+    resolved_root = audit_root.resolve()
+    candidate = (audit_root / object_key).resolve()
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return audit_root / object_key
+
+
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """``tempfile.mkstemp()`` -> write -> ``os.replace()`` (AC4), restrictive
     ``0600`` permission on the final file."""
@@ -465,7 +488,14 @@ def resolve(
     try:
         with manifest_path.open("r", encoding="utf-8") as fh:
             manifest = json.load(fh)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        # Issue #2376 fix_delta (OWNER review issuecomment-5552512140
+        # blocker 4): a manifest file containing invalid UTF-8 bytes raises
+        # `UnicodeDecodeError` (a `ValueError` subclass, NOT an `OSError` or
+        # `json.JSONDecodeError`) from `TextIOWrapper.read()`/`json.load()`.
+        # Folded into the same fail-closed `malformed_manifest` outcome as
+        # every other malformed-manifest condition here -- never propagates
+        # and never blocks/fails the retrospective run.
         return _unavailable(rk, "malformed_manifest")
 
     if not isinstance(manifest, dict):
@@ -492,6 +522,27 @@ def resolve(
         # never trust the filename alone.
         return _unavailable(rk, "malformed_manifest")
 
+    # Issue #2376 fix_delta (OWNER review issuecomment-5552512140, additional
+    # point 1): the check above only compares the manifest's *recorded*
+    # `resolution_key` field against the value freshly recomputed from the
+    # CALLER's own `run_identity`/`evidence_ref` arguments -- it never
+    # verifies that the manifest's OWN stored `run_identity`/`evidence_ref`
+    # actually hash to that same recorded `resolution_key`. A manifest whose
+    # `resolution_key` field coincidentally matches `rk` but whose stored
+    # `run_identity`/`evidence_ref` sub-objects are internally inconsistent
+    # with it (e.g. corrupted independently of the top-level field) would
+    # previously pass undetected. Recomputing `resolution_key` from the
+    # manifest's own stored sub-objects and requiring it to match the
+    # manifest's own recorded `resolution_key` field closes that gap --
+    # still folds into the existing `malformed_manifest` reason_code, no new
+    # reason_code introduced.
+    try:
+        internal_rk = resolution_key(manifest.get("run_identity"), manifest.get("evidence_ref"))
+    except PrivateAuditResolverError:
+        return _unavailable(rk, "malformed_manifest")
+    if internal_rk != manifest.get("resolution_key"):
+        return _unavailable(rk, "malformed_manifest")
+
     if manifest["private_status_at_generation"] == UNAVAILABLE:
         return _unavailable(rk, manifest["reason_code"])
 
@@ -505,7 +556,19 @@ def resolve(
             return _unavailable(rk, "expired")
 
     object_key = manifest["object_key"]
-    object_path = audit_root / object_key
+    object_path = _contained_object_path(audit_root, object_key)
+    if object_path is None:
+        # Issue #2376 fix_delta (OWNER review issuecomment-5552512140,
+        # additional point 2): the manifest schema's `object_key` `pattern`
+        # forbids a LEADING '..'/'/' but does not forbid an EMBEDDED '..'
+        # path segment later in the string (e.g.
+        # "objects/../../../etc/passwd" still matches
+        # `^[A-Za-z0-9][A-Za-z0-9._/-]*$`). `_contained_object_path` rejects
+        # any `object_key` that would resolve outside `audit_root` --
+        # folded into the existing `malformed_manifest` reason_code (this is
+        # a corrupted/hostile manifest, the same class of defect as every
+        # other `malformed_manifest` condition above).
+        return _unavailable(rk, "malformed_manifest")
     if not object_path.is_file():
         return _unavailable(rk, "source_missing")
 

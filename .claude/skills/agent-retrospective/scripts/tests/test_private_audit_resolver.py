@@ -563,6 +563,452 @@ def test_producer_hook_never_raises_on_storage_failure(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Producer WIRING regression (Issue #2376 fix_delta, OWNER review
+# https://github.com/squne121/loop-protocol/pull/2510#issuecomment-5552512140
+# blockers 1/2/3): `register_private_audit_ref()` itself (tested above) was
+# already correct in isolation -- these tests exercise the ACTUAL
+# `FindingSet` -> `EvaluatorRequest` -> producer conversion inside
+# `execute_run()`/`run_cli()`, which is exactly what a helper-only unit test
+# cannot prove (Verification Commands A/B/C).
+# ---------------------------------------------------------------------------
+
+_FULL_SHA_40 = "a" * 40
+
+
+class _RedirectedResolverModule:
+    """Redirects the producer hook's local-only storage writes to a
+    caller-supplied `audit_root` (a pytest `tmp_path`) instead of
+    `register_private_audit_ref()`'s documented default
+    (`private_audit_resolver.default_audit_root(_REPO_ROOT)`, the REAL
+    repository's `artifacts/agent-retrospective/private-audit` directory) --
+    `execute_run()`/`run_cli()` never accept an `audit_root` parameter of
+    their own, so every one of these end-to-end tests monkeypatches
+    `rr._private_audit_resolver_module` to this redirector (mirroring
+    `test_producer_hook_never_raises_on_storage_failure`'s existing
+    monkeypatch pattern above) rather than writing to the real repo
+    checkout. Delegates every actual write to this file's own already-tested
+    `par.register_private_audit_ref` (the exact same module `resolve()`
+    below reads back through)."""
+
+    def __init__(self, audit_root):
+        self._audit_root = audit_root
+
+    def default_audit_root(self, repo_root):  # noqa: ARG002 - contract parity with the real module
+        return self._audit_root
+
+    def register_private_audit_ref(self, **kwargs):
+        return par.register_private_audit_ref(**kwargs)
+
+
+class _FakeCollectorResult:
+    def __init__(self, observation, private_evidence=None):
+        self.observation = observation
+        self.private_evidence = private_evidence or {}
+
+
+def _fake_repository_collector_result(base_sha):
+    return _FakeCollectorResult(
+        {
+            "source_type": "repository",
+            "source_id": "repository",
+            "source_status": "complete",
+            "pagination_completeness": "complete",
+        }
+    )
+
+
+def _ok_agent_result(rr_mod, payload):
+    return rr_mod.AgentInvocationResult(
+        status="ok", structured_output=payload, raw_stdout_excerpt=None, exit_code=0, reason_code=None
+    )
+
+
+def _wrapper_payload(structured_output):
+    """The actual `claude -p --output-format json` metadata-wrapper shape
+    (Issue #2237 P0-1) -- `run_cli()`'s real subprocess adapter parses this,
+    not the bare business payload."""
+    return {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "assistant text summary",
+        "structured_output": structured_output,
+    }
+
+
+def _observer_request(rr_mod, agent_name):
+    return rr_mod.AgentInvocationRequest(
+        agent_name=agent_name, prompt="observe", json_schema_path="/tmp/schema.json", cwd="/repo"
+    )
+
+
+def _make_observer_invoke(rr_mod, run_id, digest, base_sha=_FULL_SHA_40):
+    def _invoke(request):
+        bundle = rr_mod.EvidenceBundle(
+            run_id=run_id,
+            base_sha=base_sha,
+            source_set_digest=digest,
+            observer_id=request.agent_name,
+            evidence_ref=f"evidence://{run_id}/{request.agent_name}",
+            findings=[{"claim": f"finding from {request.agent_name}", "claim_class": "process"}],
+        )
+        return _ok_agent_result(rr_mod, json.loads(bundle.to_wire()))
+
+    return _invoke
+
+
+def _runtime_backed_judgment_candidate(*, candidate_id="cand-2376-fix-delta"):
+    """A judgment-only evaluator-response candidate (Issue #2362 Scope
+    Reframe wire shape) whose `evidence_refs` references the
+    `retrospective-runtime-observer`'s `source_type: "runtime"` real
+    evidence -- exactly the ref `_enrich_evidence_ref`/the private-audit
+    producer hook must independently recompute the SAME digest for."""
+    return {
+        "candidate_id": candidate_id,
+        "title": "producer hook regression candidate",
+        "description": "exercises the private-audit producer hook wiring end-to-end",
+        "claim_class": "runtime_behavior",
+        "subject_ref": {"kind": "repository_path", "value": "scripts/example.py"},
+        "rule_id": "example_rule",
+        "evidence_refs": [
+            {
+                "ref_type": "runtime_receipt",
+                "source_id": "runtime",
+                "resource_identity": "observer:retrospective-runtime-observer",
+            }
+        ],
+    }
+
+
+def _make_evaluator_invoke(rr_mod, candidate_records):
+    def _invoke(request):
+        payload = {
+            "schema_version": rr_mod.WIRE_SCHEMA_EVALUATION,
+            "run_id": request.run_id,
+            "base_sha": request.base_sha,
+            "source_set_digest": request.source_set_digest,
+            "candidate_records": candidate_records,
+            "evidence_ref": "evidence://evaluation",
+        }
+        return _ok_agent_result(rr_mod, payload)
+
+    return _invoke
+
+
+def _latest_evidence_refs(candidate):
+    return candidate["finding_contract"]["evaluations"][-1]["evidence_refs"]
+
+
+def test_execute_run_registers_real_observer_evidence_end_to_end(tmp_path, monkeypatch):
+    """Verification Command A: `execute_run()`'s real
+    `FindingSet` -> `EvaluatorRequest` -> producer conversion (never
+    monkeypatched/mocked here) ends with an observer evidence_ref that
+    `private_audit_resolver.resolve()` reports `available` for."""
+    rr_mod = _run_retrospective_module()
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(rr_mod, "_private_audit_resolver_module", lambda: _RedirectedResolverModule(audit_root))
+    # execute_run() unconditionally calls collect_latitude_runtime_evidence_once() --
+    # this test is about the OBSERVER-evidence producer path, not Latitude
+    # binding (covered separately below), so short-circuit it to "no evidence".
+    monkeypatch.setattr(rr_mod, "collect_latitude_runtime_evidence_once", lambda **_kwargs: None)
+
+    expected_digest = rr_mod.compute_source_set_digest([_fake_repository_collector_result(_FULL_SHA_40).observation])
+    candidate = _runtime_backed_judgment_candidate()
+
+    publish_request = rr_mod.execute_run(
+        base_sha_resolver=lambda: _FULL_SHA_40,
+        collectors=[lambda base_sha: _fake_repository_collector_result(base_sha)],
+        observer_requests=[_observer_request(rr_mod, "retrospective-runtime-observer")],
+        invoke=_make_observer_invoke(rr_mod, "run-2376-a", expected_digest),
+        invoke_evaluator=_make_evaluator_invoke(rr_mod, [candidate]),
+        repository_id="squne121/loop-protocol",
+        target_issue=2376,
+        request_id="req-2376-a",
+        idempotency_key="idem-2376-a",
+        run_id="run-2376-a",
+    )
+
+    assert len(publish_request.candidate_records) == 1
+    evidence_refs = _latest_evidence_refs(publish_request.candidate_records[0])
+    assert len(evidence_refs) == 1
+    real_evidence_ref = evidence_refs[0]
+    assert real_evidence_ref["source_id"] == "runtime"
+    # the digest was Python-recomputed from real observer content, never a
+    # fabricated/placeholder string (Issue #2362 Scope Reframe invariant).
+    assert real_evidence_ref["projection_digest"] != ""
+
+    run_identity = {"run_id": "run-2376-a", "base_sha": _FULL_SHA_40, "source_set_digest": expected_digest}
+    result = par.resolve(real_evidence_ref, run_identity, audit_root=audit_root)
+    assert result.status == par.AVAILABLE, (
+        "blockers 1/2: execute_run()'s real FindingSet->EvaluatorRequest->producer "
+        "conversion must actually register this run's real observer evidence, not "
+        "silently no-op it."
+    )
+
+
+def test_run_cli_production_path_registers_real_observer_evidence(tmp_path, monkeypatch):
+    """Verification Command B: the PRODUCTION `run_cli()` orchestration
+    (never `execute_run()` directly) actually reaches the same producer
+    hook. Agent/CLI responses are faked via `runner`/`git_runner` (the
+    documented seam), but the `FindingSet` -> `EvaluatorRequest` -> producer
+    conversion inside `run_cli()` itself is never mocked/monkeypatched."""
+    rr_mod = _run_retrospective_module()
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(rr_mod, "_private_audit_resolver_module", lambda: _RedirectedResolverModule(audit_root))
+
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    def _git_runner(argv, **kwargs):  # noqa: ARG001
+        return __import__("subprocess").CompletedProcess(argv, returncode=0, stdout=_FULL_SHA_40 + "\n", stderr="")
+
+    real_observation = rr_mod.build_repository_collector(repo_root)(_FULL_SHA_40).observation
+    expected_digest = rr_mod.compute_source_set_digest([real_observation])
+    candidate = _runtime_backed_judgment_candidate(candidate_id="cand-2376-fix-delta-cli")
+
+    subprocess_mod = __import__("subprocess")
+
+    def _runner(argv, **kwargs):
+        agent_name = argv[argv.index("--agent") + 1]
+        if agent_name == "retrospective-evaluator":
+            evaluator_request = rr_mod.EvaluatorRequest.from_wire(kwargs["input"])
+            evaluation_payload = {
+                "schema_version": rr_mod.WIRE_SCHEMA_EVALUATION,
+                "run_id": evaluator_request.run_id,
+                "base_sha": evaluator_request.base_sha,
+                "source_set_digest": evaluator_request.source_set_digest,
+                "candidate_records": [candidate],
+                "evidence_ref": "evidence://evaluation",
+            }
+            return subprocess_mod.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(evaluation_payload)), stderr=""
+            )
+        bundle = rr_mod.EvidenceBundle(
+            run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
+            base_sha=kwargs["env"].get("AGENT_RETROSPECTIVE_BASE_SHA", ""),
+            source_set_digest=expected_digest,
+            observer_id=agent_name,
+            evidence_ref=f"evidence://{agent_name}",
+            findings=[{"claim": f"finding from {agent_name}", "claim_class": "process"}],
+        )
+        return subprocess_mod.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(bundle.to_wire()))), stderr=""
+        )
+
+    publish_request = rr_mod.run_cli(
+        repo_root=repo_root,
+        repository_id="squne121/loop-protocol",
+        target_issue=2376,
+        request_id="req-2376-b",
+        idempotency_key="idem-2376-b",
+        schema_dir=schema_dir,
+        prompts=None,
+        runner=_runner,
+        git_runner=_git_runner,
+        run_id="run-2376-b",
+        temp_base_dir=tmp_path,
+    )
+
+    assert len(publish_request.candidate_records) == 1
+    evidence_refs = _latest_evidence_refs(publish_request.candidate_records[0])
+    assert len(evidence_refs) == 1
+    real_evidence_ref = evidence_refs[0]
+    assert real_evidence_ref["source_id"] == "runtime"
+
+    run_identity = {"run_id": "run-2376-b", "base_sha": _FULL_SHA_40, "source_set_digest": expected_digest}
+    result = par.resolve(real_evidence_ref, run_identity, audit_root=audit_root)
+    assert result.status == par.AVAILABLE, (
+        "blocker 1: run_cli() (the production entrypoint main()/the root Skill's "
+        "Procedure actually invokes) must reach the SAME private-audit producer "
+        "hook execute_run() does, not silently skip it."
+    )
+
+
+def test_execute_run_never_registers_latitude_runtime_receipt_as_observer_evidence(tmp_path, monkeypatch):
+    """Verification Command C: `bind_latitude_evidence_to_candidates()`
+    appends a SECOND `runtime_receipt`/`runtime` evidence_ref onto the SAME
+    evaluation (Issue #2375) alongside the evaluator's own observer-backed
+    `runtime` ref (Issue #2362 enrichment). Both share `source_id ==
+    "runtime"`, but only the observer-backed one may ever be registered as
+    private audit evidence -- the Latitude-bound ref's `projection_digest`
+    comes from an entirely different collector and has no corresponding
+    local private source in THIS producer's data model, so it must resolve
+    `unavailable`, never be silently backfilled with the runtime observer's
+    unrelated real findings (blocker 3)."""
+    rr_mod = _run_retrospective_module()
+    audit_root = tmp_path / "audit"
+    monkeypatch.setattr(rr_mod, "_private_audit_resolver_module", lambda: _RedirectedResolverModule(audit_root))
+
+    vrs_mod = rr_mod._validate_retrospective_schema_module()
+    collector_version = "latitude-collector/v1"
+    collected_at = "2026-08-29T00:00:00Z"
+    metrics = {"trace_count": 2, "span_count": 6, "duration_ms": 120}
+    latitude_ref = vrs_mod.compute_latitude_evidence_ref(collector_version, dict(metrics), collected_at)
+    latitude_identity = vrs_mod.compute_latitude_evidence_identity(collector_version, latitude_ref, dict(metrics))
+    latitude_evidence = {
+        "schema_version": "latitude_runtime_evidence/v1",
+        "availability": "available",
+        "collected_at": collected_at,
+        "collector_version": collector_version,
+        "evidence_identity": latitude_identity,
+        "evidence_ref": latitude_ref,
+        "metrics": metrics,
+        "reason_code": None,
+    }
+    monkeypatch.setattr(rr_mod, "collect_latitude_runtime_evidence_once", lambda **_kwargs: latitude_evidence)
+
+    expected_digest = rr_mod.compute_source_set_digest([_fake_repository_collector_result(_FULL_SHA_40).observation])
+    candidate = _runtime_backed_judgment_candidate(candidate_id="cand-2376-latitude-negative")
+
+    publish_request = rr_mod.execute_run(
+        base_sha_resolver=lambda: _FULL_SHA_40,
+        collectors=[lambda base_sha: _fake_repository_collector_result(base_sha)],
+        observer_requests=[_observer_request(rr_mod, "retrospective-runtime-observer")],
+        invoke=_make_observer_invoke(rr_mod, "run-2376-c", expected_digest),
+        invoke_evaluator=_make_evaluator_invoke(rr_mod, [candidate]),
+        repository_id="squne121/loop-protocol",
+        target_issue=2376,
+        request_id="req-2376-c",
+        idempotency_key="idem-2376-c",
+        run_id="run-2376-c",
+    )
+
+    evidence_refs = _latest_evidence_refs(publish_request.candidate_records[0])
+    assert len(evidence_refs) == 2
+    latitude_bound_refs = [
+        ref for ref in evidence_refs if ref["projection_digest"] == latitude_identity
+    ]
+    observer_backed_refs = [
+        ref for ref in evidence_refs if ref["projection_digest"] != latitude_identity
+    ]
+    assert len(latitude_bound_refs) == 1
+    assert len(observer_backed_refs) == 1
+    assert latitude_bound_refs[0]["source_id"] == "runtime"
+    assert observer_backed_refs[0]["source_id"] == "runtime"
+
+    run_identity = {"run_id": "run-2376-c", "base_sha": _FULL_SHA_40, "source_set_digest": expected_digest}
+
+    # THEN the observer-backed ref (this run's OWN real evidence) resolves available.
+    observer_result = par.resolve(observer_backed_refs[0], run_identity, audit_root=audit_root)
+    assert observer_result.status == par.AVAILABLE
+
+    # AND the Latitude-bound ref -- despite sharing the same source_id
+    # "runtime" -- was never registered/backfilled with that unrelated
+    # observer evidence: it stays unavailable/not_registered.
+    latitude_result = par.resolve(latitude_bound_refs[0], run_identity, audit_root=audit_root)
+    assert latitude_result.status == par.UNAVAILABLE
+    assert latitude_result.reason_code == "not_registered"
+
+
+# ---------------------------------------------------------------------------
+# AC3/AC8 fix_delta: malformed UTF-8 manifest (Issue #2376 fix_delta, OWNER
+# review issuecomment-5552512140 blocker 4). Verification Command D.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_folds_malformed_utf8_manifest_to_unavailable(tmp_path):
+    """A manifest file containing invalid UTF-8 bytes raises
+    `UnicodeDecodeError` from `TextIOWrapper.read()`/`json.load()` -- a
+    `ValueError` subclass NOT caught by the pre-fix_delta
+    `except (OSError, json.JSONDecodeError)` clause. `resolve()` must fold
+    this into the SAME fail-closed `unavailable`/`malformed_manifest`
+    outcome as every other malformed-manifest condition, never let the
+    exception propagate and abort the retrospective run."""
+    audit_root = tmp_path / "audit"
+    par.register_private_audit_ref(
+        evidence_ref=EVIDENCE_REF, run_identity=RUN_IDENTITY, private_content=REAL_FINDINGS, audit_root=audit_root
+    )
+    rk = par.resolution_key(RUN_IDENTITY, EVIDENCE_REF)
+    manifest_path = par._manifest_path(audit_root, rk)  # noqa: SLF001
+    # 0xff is never a valid UTF-8 lead byte.
+    manifest_path.write_bytes(b"\xff\xfe\x00\x01not-valid-utf8-manifest-bytes")
+
+    result = par.resolve(EVIDENCE_REF, RUN_IDENTITY, audit_root=audit_root)  # must not raise
+    assert result.status == par.UNAVAILABLE
+    assert result.reason_code == "malformed_manifest"
+
+
+# ---------------------------------------------------------------------------
+# Additional review points (Issue #2376 fix_delta, OWNER review
+# issuecomment-5552512140): manifest-internal resolution_key consistency and
+# object_key traversal / audit_root containment.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_detects_internal_run_identity_evidence_ref_inconsistency(tmp_path):
+    """A manifest whose TOP-LEVEL `resolution_key` field coincidentally still
+    matches the caller-supplied run_identity/evidence_ref, but whose OWN
+    stored `evidence_ref` sub-object was independently corrupted (so
+    recomputing `resolution_key` from the manifest's OWN stored
+    run_identity/evidence_ref yields a DIFFERENT value), must fail closed to
+    malformed_manifest -- the pre-fix_delta check only ever compared the
+    manifest's recorded `resolution_key` field against the CALLER's freshly
+    computed value, never against a value independently recomputed from the
+    manifest's own stored sub-objects."""
+    audit_root = tmp_path / "audit"
+    manifest = par.register_private_audit_ref(
+        evidence_ref=EVIDENCE_REF, run_identity=RUN_IDENTITY, private_content=REAL_FINDINGS, audit_root=audit_root
+    )
+    manifest_path = par._manifest_path(audit_root, manifest["resolution_key"])  # noqa: SLF001
+    tampered = dict(manifest)
+    tampered["evidence_ref"] = dict(tampered["evidence_ref"], resource_identity="scripts/tampered.py#L1")
+    # top-level resolution_key/manifest_digest fields are left UNCHANGED --
+    # only the nested evidence_ref sub-object is corrupted -- so the
+    # pre-fix_delta checks (both of which only compare the top-level
+    # `resolution_key` field to something else, never recompute FROM the
+    # nested sub-objects) would still pass this manifest through undetected.
+    manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    result = par.resolve(EVIDENCE_REF, RUN_IDENTITY, audit_root=audit_root)
+    assert result.status == par.UNAVAILABLE
+    assert result.reason_code == "malformed_manifest"
+
+
+def test_resolve_rejects_object_key_path_traversal_outside_audit_root(tmp_path):
+    """The manifest schema's `object_key` `pattern`
+    (`^[A-Za-z0-9][A-Za-z0-9._/-]*$`) forbids a LEADING '..'/'/' segment but
+    does not forbid an EMBEDDED '..' segment later in the string -- e.g.
+    `"objects/../../outside-secret.bin"` still matches it. `resolve()` must
+    independently verify the resolved `object_key` path stays contained
+    within `audit_root` before ever reading it, never trust the schema
+    regex alone to bound the filesystem read to `audit_root`."""
+    audit_root = tmp_path / "audit"
+    outside_target = tmp_path / "outside-secret.bin"
+    outside_target.write_bytes(b"should never be read via an object_key path traversal")
+
+    manifest = par.register_private_audit_ref(
+        evidence_ref=EVIDENCE_REF, run_identity=RUN_IDENTITY, private_content=REAL_FINDINGS, audit_root=audit_root
+    )
+    manifest_path = par._manifest_path(audit_root, manifest["resolution_key"])  # noqa: SLF001
+    tampered = dict(manifest)
+    traversal_key = "objects/../../outside-secret.bin"
+    tampered["object_key"] = traversal_key
+    # recompute object_digest to match the traversal target's REAL bytes so
+    # only the containment check -- not the pre-existing digest_mismatch
+    # check -- can catch this.
+    import hashlib as _hashlib
+
+    tampered["object_digest"] = "sha256:" + _hashlib.sha256(outside_target.read_bytes()).hexdigest()
+    generation_snapshot = {
+        "private_status_at_generation": tampered["private_status_at_generation"],
+        "reason_code": tampered["reason_code"],
+        "object_key": tampered["object_key"],
+        "object_digest": tampered["object_digest"],
+        "expires_at": tampered["expires_at"],
+    }
+    tampered["manifest_digest"] = par.manifest_digest(generation_snapshot)
+    manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    result = par.resolve(EVIDENCE_REF, RUN_IDENTITY, audit_root=audit_root)
+    assert result.status == par.UNAVAILABLE
+    assert result.reason_code == "malformed_manifest"
+    assert not outside_target.read_bytes() == b""  # sanity: target file untouched, never consumed
+
+
+# ---------------------------------------------------------------------------
 # schema fixtures load/validate cleanly (closed schema, AC7 companion coverage
 # -- the dedicated public-safety parametrized suite lives in
 # test_public_safe_evidence_refs.py per this Issue's Verification Commands).
