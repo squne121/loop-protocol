@@ -420,10 +420,12 @@ jobs:
             fi
           done
 
-          echo "artifact_root=${ARTIFACT_ROOT}" >> "$GITHUB_OUTPUT"
-          echo "download_status=${DOWNLOAD_STATUS}" >> "$GITHUB_OUTPUT"
-          echo "download_failure_reason=${DOWNLOAD_FAILURE_REASON}" >> "$GITHUB_OUTPUT"
-          echo "download_failure_detail=${DOWNLOAD_FAILURE_DETAIL}" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact_root=${ARTIFACT_ROOT}"
+            echo "download_status=${DOWNLOAD_STATUS}"
+            echo "download_failure_reason=${DOWNLOAD_FAILURE_REASON}"
+            echo "download_failure_detail=${DOWNLOAD_FAILURE_DETAIL}"
+          } >> "$GITHUB_OUTPUT"
 
           if [ "${DOWNLOAD_STATUS}" != "ok" ]; then
             echo "::error::download/archive validation rejected: ${DOWNLOAD_FAILURE_REASON} (${DOWNLOAD_FAILURE_DETAIL})"
