@@ -1422,6 +1422,68 @@ def _evidence_readiness_hard_check_post_filter(
 CLOSE_GRADE_MATERIALIZATION_POLICY = "close_grade_fail_closed_v1"
 
 
+# --------------------------------------------------------------------------- #
+# Issue #2422 fix_delta Blocker 7 (OWNER REQUEST_CHANGES on PR #2501,
+# issuecomment-5549966497): `_materialize_close_grade_arm` (below) requires
+# BOTH `core_baselines` and `responsive_baselines` to pair by `workflow_run_id`
+# via the UNMODIFIED `_pair_by_workflow_run_id` -- a genuine `monolith` run
+# (Issue #2422's own single-provider topology: core+responsive run
+# sequentially inside ONE `e2e-core` job, `e2e-responsive-matrix` never
+# starts at all) has NO `e2e-responsive-matrix` evidence to pair, so every
+# monolith root member was previously excluded wholesale
+# (`missing_pair_e2e-responsive-matrix`), even though the run itself
+# executed correctly. `_manifest_v2_provider_jobs_to_baselines` below is the
+# adapter/handoff fix this Issue's Allowed Paths scope permits: it reshapes
+# ONE e2e_performance_benchmark_manifest_v2 `Run`'s `provider_jobs[]` into
+# the per-lane baseline-dict shape `_pair_by_workflow_run_id`/
+# `_materialize_close_grade_arm` already consume -- WITHOUT fabricating a
+# fake responsive record (never duplicates the core record) and WITHOUT
+# copying/modifying `_materialize_close_grade_arm`/`_pair_by_workflow_run_id`
+# themselves (Stop Conditions: #2423's eligibility projection logic is
+# never touched). A monolith run correctly and explainably still lands in
+# `evidence_errors` (small-sample `insufficient_evidence` as the eventual
+# gate outcome is an ACCEPTED result of this adapter, per this Issue's own
+# fix_delta text -- not a defect).
+# --------------------------------------------------------------------------- #
+def _manifest_v2_provider_jobs_to_baselines(
+    run: dict, shared_fingerprint_fields: dict
+) -> tuple[list[dict], list[dict]]:
+    """Returns `(core_baselines, responsive_baselines)` -- each either a
+    single-element list (the provider job genuinely started) or an EMPTY
+    list (the provider job is genuinely absent from `run["provider_jobs"]`
+    -- e.g. `e2e-responsive-matrix` on a `monolith` run -- never a
+    synthesized stand-in). `shared_fingerprint_fields` carries the
+    WITHIN_COHORT_REQUIRED_EQUAL-adjacent values Issue #2422 AC1's own
+    frozen non-treatment fingerprint design guarantees are IDENTICAL across
+    both `benchmark_layout` arms (e.g. derived from the manifest's
+    `frozen_non_treatment.lockfile_hash`/`toolchain_digest`) -- this adapter
+    reshapes already-trusted manifest v2 fields, it invents no new
+    provenance."""
+    workflow_run_id = run.get("workflow_run_id")
+    run_attempt = run.get("run_attempt", 1)
+    provider_by_job = {job.get("job"): job for job in run.get("provider_jobs", []) if isinstance(job, dict)}
+
+    def _baseline_for(job_name: str) -> list[dict]:
+        provider_job = provider_by_job.get(job_name)
+        if provider_job is None:
+            return []
+        image = provider_job.get("exact_runner_image") or {}
+        host_runner_image = (
+            f"{image.get('name')}/{image.get('version')}" if image.get("name") and image.get("version") else None
+        )
+        return [
+            {
+                "workflow_run_id": workflow_run_id,
+                "run_attempt": run_attempt,
+                "workflow_digest": run.get("workflow_digest"),
+                "host_runner_image": host_runner_image,
+                **shared_fingerprint_fields,
+            }
+        ]
+
+    return _baseline_for("e2e-core"), _baseline_for("e2e-responsive-matrix")
+
+
 def _root_workflow_run_ids(*baseline_lists: list[dict]) -> list[object]:
     """#2423 AC2: the root run set for one arm is every distinct
     `workflow_run_id` present anywhere in the arm's raw input lists (core /
@@ -1579,6 +1641,86 @@ def _assert_root_eligible_error_invariant(arm_result: dict, arm_errors: list[dic
             f"#2423 AC2 invariant violated for arm={arm_label!r}: "
             f"eligible and evidence_error sets are not disjoint: {overlap!r}"
         )
+
+
+def test_manifest_v2_provider_jobs_adapter_hands_off_real_monolith_split_asymmetric_topology_without_crashing():
+    """Issue #2422 fix_delta Blocker 7 (OWNER REQUEST_CHANGES on PR #2501,
+    issuecomment-5549966497): proves `_manifest_v2_provider_jobs_to_baselines`
+    can accept REAL monolith(1 provider)/split(2 providers) evidence and
+    hand it off to the UNMODIFIED `_materialize_close_grade_arm` without
+    crashing, fabricating evidence, or duplicating the core record as a
+    fake responsive record. A small-sample `insufficient_evidence` FINAL
+    gate outcome is an accepted result here (this Issue's fix_delta text
+    explicitly says so) -- this test only proves the HANDOFF, not the
+    close-grade gate decision."""
+    shared_fields = {
+        "playwright_container_image_digest": "sha256:" + "a" * 64,
+        "node_version": "v20.0.0",
+        "pnpm_version": "9.0.0",
+        "playwright_version": "1.48.0",
+        "lockfile_hash": "sha256:" + "b" * 64,
+    }
+    monolith_run = {
+        "workflow_run_id": 1001,
+        "run_attempt": 1,
+        "workflow_digest": "sha256:" + "c" * 64,
+        "provider_jobs": [
+            {
+                "job": "e2e-core",
+                "workflow_job_id": 5001,
+                "conclusion": "success",
+                "exact_runner_image": {"name": "ubuntu-24.04", "version": "20260901.1.0"},
+            },
+        ],
+    }
+    split_run = {
+        "workflow_run_id": 2001,
+        "run_attempt": 1,
+        "workflow_digest": "sha256:" + "c" * 64,
+        "provider_jobs": [
+            {
+                "job": "e2e-core",
+                "workflow_job_id": 6001,
+                "conclusion": "success",
+                "exact_runner_image": {"name": "ubuntu-24.04", "version": "20260901.1.0"},
+            },
+            {
+                "job": "e2e-responsive-matrix",
+                "workflow_job_id": 6002,
+                "conclusion": "success",
+                "exact_runner_image": {"name": "ubuntu-24.04", "version": "20260901.1.0"},
+            },
+        ],
+    }
+
+    monolith_core, monolith_responsive = _manifest_v2_provider_jobs_to_baselines(monolith_run, shared_fields)
+    split_core, split_responsive = _manifest_v2_provider_jobs_to_baselines(split_run, shared_fields)
+
+    assert len(monolith_core) == 1
+    assert monolith_responsive == []  # genuinely absent -- never fabricated/duplicated
+    assert len(split_core) == 1
+    assert len(split_responsive) == 1
+    assert split_core[0]["host_runner_image"] == split_responsive[0]["host_runner_image"]
+
+    monolith_result, monolith_errors = _materialize_close_grade_arm(monolith_core, monolith_responsive, [], "monolith")
+    split_result, split_errors = _materialize_close_grade_arm(split_core, split_responsive, [], "split")
+
+    # No crash -- both arms produce a coherent, fully-explained result
+    # (the #2423 AC2 root/eligible/error-set invariant holds for both).
+    _assert_root_eligible_error_invariant(monolith_result, monolith_errors, "monolith")
+    _assert_root_eligible_error_invariant(split_result, split_errors, "split")
+
+    # The monolith run's genuinely-absent responsive provider is EXPLAINED
+    # (not silently dropped, not fabricated into a fake pass) -- exactly
+    # the pre-fix_delta defect this Blocker exists to document/handle.
+    assert any("missing_pair_e2e-responsive-matrix" in err["reason"] for err in monolith_errors)
+    assert monolith_result["performance_eligible_workflow_run_ids"] == []
+
+    # The split run's genuine 2-provider evidence is NOT excluded by the
+    # provider-pairing step (it may still be excluded by the SEPARATE
+    # missing-gate-ready-evidence check, since this test passes `[]` for
+    # gate_ready_baselines -- out of scope for this specific adapter fix).
+    assert not any("missing_pair" in err["reason"] for err in split_errors)
 
 
 def _run_set_digest(monolith_ids: list[str], split_ids: list[str]) -> str:
@@ -2454,6 +2596,56 @@ def test_cli_main_non_production_invocation_still_falls_back_to_fixture_sha256(t
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     expected_fallback_sha256 = "sha256:" + hashlib.sha256(fixture_text.encode("utf-8")).hexdigest()
     assert receipt["manifest_sha256"] == expected_fallback_sha256
+
+
+def test_ci_yml_production_gate_call_site_wires_production_invocation_flags():
+    """Issue #2422 fix_delta Blocker 8 (OWNER REQUEST_CHANGES on PR #2501,
+    issuecomment-5549966497): `_cli_main`'s `--production-invocation`
+    hardening (proven by the three tests immediately above) is only a real
+    fix if `.github/workflows/ci.yml`'s ACTUAL production call site (the
+    `python-test-core` job's `Run AC11 evidence gate...` step) passes it --
+    a unit test of `_cli_main` alone cannot prove that. This test parses
+    the REAL workflow YAML (never a hand-copied string literal that could
+    drift from the file) and asserts the step's `run:` text (a) still
+    invokes `tests/ci/test_ci_performance_gate.py` and `--cohort-fixture`
+    (unchanged base invocation) and (b) now ALSO references
+    `--production-invocation` / `--manifest-sha256` / `--experiment-identity`
+    bound to new `manifest_v2_sha256`/`manifest_v2_experiment_identity`
+    workflow_dispatch inputs -- the wiring this fix_delta blocker adds."""
+    yaml = pytest.importorskip("yaml")
+    ci_yml_path = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    with open(ci_yml_path, encoding="utf-8") as handle:
+        workflow = yaml.safe_load(handle)
+
+    # PyYAML's default (YAML 1.1) resolver parses the bare `on:` workflow
+    # trigger key as the boolean `True`, not the string `"on"` -- look up
+    # whichever key form is actually present rather than assuming one.
+    on_section = workflow.get("on", workflow.get(True))
+    dispatch_inputs = on_section["workflow_dispatch"]["inputs"]
+    assert "manifest_v2_sha256" in dispatch_inputs
+    assert "manifest_v2_experiment_identity" in dispatch_inputs
+    assert dispatch_inputs["manifest_v2_sha256"]["default"] == ""
+    assert dispatch_inputs["manifest_v2_experiment_identity"]["default"] == ""
+
+    python_test_core = workflow["jobs"]["python-test-core"]
+    gate_steps = [
+        step
+        for step in python_test_core["steps"]
+        if "tests/ci/test_ci_performance_gate.py" in (step.get("run") or "")
+    ]
+    assert len(gate_steps) == 1, "expected exactly one production gate invocation step"
+    run_text = gate_steps[0]["run"]
+
+    assert "--cohort-fixture" in run_text  # base invocation unchanged
+    assert "--production-invocation" in run_text
+    assert "--manifest-sha256" in run_text
+    assert "--experiment-identity" in run_text
+    assert "MANIFEST_V2_SHA256" in run_text
+    assert "MANIFEST_V2_EXPERIMENT_IDENTITY" in run_text
+
+    env = gate_steps[0].get("env", {})
+    assert env.get("MANIFEST_V2_SHA256") == "${{ github.event.inputs.manifest_v2_sha256 }}"
+    assert env.get("MANIFEST_V2_EXPERIMENT_IDENTITY") == "${{ github.event.inputs.manifest_v2_experiment_identity }}"
 
 
 if __name__ == "__main__":

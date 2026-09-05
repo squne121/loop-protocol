@@ -90,9 +90,17 @@
           "description": "Digest identifying the exact frozen Playwright test file inventory measured by both arms."
         },
         "expected_playwright_invocations": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Issue #2422 fix_delta Blocker 4 (OWNER REQUEST_CHANGES on PR #2501, issuecomment-5549966497): a LIST of distinct, identifiable Playwright invocations (never a bare test-count integer -- #2424's reliability projection needs to bind per-lane invocation identity, provider placement, and evidence-file correspondence, none of which a plain count can express). This Issue defines the PRODUCER CONTRACT (schema/shape) only -- wiring an actual JSON reporter's output into this array is #2424's responsibility (never pre-implemented here). See `expected_test_count` below for a plain aggregate count, kept separate from invocation identity.",
+          "items": {
+            "$ref": "#/$defs/ExpectedPlaywrightInvocation"
+          }
+        },
+        "expected_test_count": {
           "type": "integer",
           "minimum": 1,
-          "description": "Issue #2422 Outcome (item 2 of the OWNER controlled-reframe): the count of Playwright test invocations #2424 consumes to detect a treatment-unrelated test-count drift between arms."
+          "description": "Issue #2422 fix_delta Blocker 4: OPTIONAL plain aggregate Playwright test-case count, kept separate from `expected_playwright_invocations`' per-invocation identity list (a consumer that only needs a drift-detection count, not per-lane binding, reads this field instead)."
         },
         "lockfile_hash": {
           "type": "string",
@@ -102,6 +110,58 @@
           "type": "string",
           "minLength": 1,
           "description": "Combined Node/pnpm/Playwright toolchain fingerprint digest shared by both arms."
+        }
+      }
+    },
+    "ExpectedPlaywrightInvocation": {
+      "type": "object",
+      "description": "Issue #2422 fix_delta Blocker 4: identifies ONE distinct Playwright invocation the frozen non-treatment fingerprint expects -- `invocation_id`/`lane` are the LOGICAL identity (stable across `benchmark_layout` arms), `provider_placement` is the (arm-dependent) PHYSICAL provider job each arm runs it in -- kept separate because monolith runs both lanes sequentially inside `e2e-core` while split runs them as two parallel provider jobs, without changing invocation identity. `evidence_file` names the artifact path this invocation's evidence is expected under. This schema entry defines the PRODUCER CONTRACT shape only -- actual JSON-reporter wiring (Playwright execution + evidence file generation) is #2424's responsibility, never pre-implemented by this Issue.",
+      "required": [
+        "invocation_id",
+        "lane",
+        "provider_placement",
+        "evidence_file"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "invocation_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identifier for this invocation, unique within `expected_playwright_invocations`."
+        },
+        "lane": {
+          "type": "string",
+          "enum": [
+            "core",
+            "responsive"
+          ]
+        },
+        "provider_placement": {
+          "$ref": "#/$defs/LayoutProviderPlacement"
+        },
+        "evidence_file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Artifact-relative path this invocation's evidence (e.g. a JSON reporter output or a runtime-evidence file) is expected under."
+        }
+      }
+    },
+    "LayoutProviderPlacement": {
+      "type": "object",
+      "description": "Issue #2422 fix_delta Blocker 4: maps each `benchmark_layout` arm to the provider job name that physically executes this invocation's lane in that arm -- e.g. `monolith` places BOTH `core` and `responsive` lane invocations under `e2e-core` (sequential, single provider), while `split` places them under `e2e-core`/`e2e-responsive-matrix` respectively (parallel, two providers). Required for both arms so a consumer can bind evidence regardless of which arm produced it.",
+      "required": [
+        "monolith",
+        "split"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "monolith": {
+          "type": "string",
+          "minLength": 1
+        },
+        "split": {
+          "type": "string",
+          "minLength": 1
         }
       }
     },
@@ -190,6 +250,8 @@
         },
         "provider_jobs": {
           "type": "array",
+          "minItems": 1,
+          "description": "Issue #2422 fix_delta Blocker 6: a run's dispatch always starts at least one measured provider job -- an EMPTY array here (e.g. a `success` conclusion with zero recorded provider-job evidence) is a structural, schema-level fail-closed rejection. Layout-specific minimum composition (monolith needs `e2e-core`; split needs `e2e-core`+`e2e-responsive-matrix`) and the global `workflow_run_id` uniqueness invariant are cross-field checks the schema cannot express -- see `verify_required_provider_jobs_present_for_layout`/`verify_workflow_run_id_global_uniqueness` in scripts/ci/collect_e2e_performance_benchmark.py.",
           "items": {
             "$ref": "#/$defs/ProviderJob"
           }

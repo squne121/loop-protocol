@@ -1250,6 +1250,21 @@ def _provider_job(job: str, workflow_job_id: int, conclusion: str = "success", i
     }
 
 
+def _default_provider_jobs_for_layout(layout: str, workflow_run_id: int) -> list[dict]:
+    # Issue #2422 fix_delta Blocker 5 (OWNER REQUEST_CHANGES on PR #2501,
+    # issuecomment-5549966497): the pre-fix_delta version of this fixture
+    # gave BOTH layouts the same two-provider shape, hiding the REAL
+    # asymmetric topology (monolith = 1 provider job covering both
+    # workloads sequentially; split = 2 parallel provider jobs) from every
+    # test that used this default. `monolith` now reports ONLY `e2e-core`.
+    if layout == "monolith":
+        return [_provider_job("e2e-core", workflow_run_id * 10 + 1)]
+    return [
+        _provider_job("e2e-core", workflow_run_id * 10 + 1),
+        _provider_job("e2e-responsive-matrix", workflow_run_id * 10 + 2),
+    ]
+
+
 def _run(
     layout: str,
     workflow_run_id: int,
@@ -1270,10 +1285,7 @@ def _run(
         "job_names_started": [j["job"] for j in (provider_jobs or [])],
         "provider_jobs": provider_jobs
         if provider_jobs is not None
-        else [
-            _provider_job("e2e-core", workflow_run_id * 10 + 1),
-            _provider_job("e2e-responsive-matrix", workflow_run_id * 10 + 2),
-        ],
+        else _default_provider_jobs_for_layout(layout, workflow_run_id),
     }
 
 
@@ -1287,10 +1299,38 @@ def _block(block_id: str, monolith_run_id: int, split_run_id: int) -> dict:
     }
 
 
+def _expected_playwright_invocation(
+    invocation_id: str, lane: str, monolith_provider: str, split_provider: str, evidence_file: str
+) -> dict:
+    return {
+        "invocation_id": invocation_id,
+        "lane": lane,
+        "provider_placement": {"monolith": monolith_provider, "split": split_provider},
+        "evidence_file": evidence_file,
+    }
+
+
 def _frozen_non_treatment() -> dict:
+    # Issue #2422 fix_delta Blocker 4: `expected_playwright_invocations` is a
+    # LIST of identifiable invocations (id/lane/provider placement/evidence
+    # file), never a bare test-count integer -- see the schema's
+    # `ExpectedPlaywrightInvocation` def. `expected_test_count` is the
+    # separate, optional plain aggregate count.
     return {
         "test_inventory_digest": "sha256:" + "2" * 64,
-        "expected_playwright_invocations": 42,
+        "expected_playwright_invocations": [
+            _expected_playwright_invocation(
+                "core", "core", "e2e-core", "e2e-core", "test-results-e2e-core/core-evidence.json"
+            ),
+            _expected_playwright_invocation(
+                "responsive",
+                "responsive",
+                "e2e-core",
+                "e2e-responsive-matrix",
+                "test-results-e2e-responsive-matrix/responsive-canvas-runtime-evidence.json",
+            ),
+        ],
+        "expected_test_count": 42,
         "lockfile_hash": "sha256:" + "3" * 64,
         "toolchain_digest": "sha256:" + "4" * 64,
     }
@@ -1471,13 +1511,61 @@ def test_fetch_exact_runner_image_for_job_returns_parsed_image_on_success():
 
 
 def test_verify_exact_runner_image_required_equal_within_block_detects_mismatch():
-    """GIVEN a block whose monolith and split runs disagree on e2e-core's
-    exact_runner_image WHEN verified THEN a violation is reported (Issue
-    #2422 AC4: required-equal is scoped to the SAME block)."""
+    """GIVEN a block whose monolith and split runs disagree on the CORE
+    workload's exact_runner_image WHEN verified THEN a violation is
+    reported (Issue #2422 AC4: required-equal is scoped to the SAME
+    block, compared per WORKLOAD -- fix_delta Blocker 5)."""
     block = _block("block-0001", 100, 101)
     block["runs"][1]["provider_jobs"][0]["exact_runner_image"] = _image(version="99999.9.9")
     violations = collector.verify_exact_runner_image_required_equal_within_block(block)
-    assert any("job='e2e-core'" in v for v in violations)
+    assert any("workload='core'" in v for v in violations)
+
+
+def test_verify_exact_runner_image_within_block_detects_responsive_mismatch_asymmetric_topology():
+    """Issue #2422 fix_delta Blocker 5 (OWNER REQUEST_CHANGES on PR #2501,
+    issuecomment-5549966497): the REAL dispatched topology is asymmetric --
+    `monolith` runs core+responsive sequentially inside ONE `e2e-core` job;
+    `split` runs them as TWO parallel jobs (`e2e-core` + `e2e-responsive-
+    matrix`). A job-NAME-based comparison (grouping same-name records
+    across arms, requiring >= 2 per group) never has a monolith-side
+    `e2e-responsive-matrix` record to compare against at all, so a
+    responsive-workload-only image mismatch was silently INVISIBLE to the
+    pre-fix_delta comparison (it returned `[]`, no violation). The
+    corrected WORKLOAD-based comparison must detect it."""
+    monolith_run = _run("monolith", 100, provider_jobs=[_provider_job("e2e-core", 1001)])
+    split_run = _run(
+        "split",
+        101,
+        provider_jobs=[
+            _provider_job("e2e-core", 1011),
+            _provider_job("e2e-responsive-matrix", 1012, image=_image(version="99999.9.9")),
+        ],
+    )
+    block = {"block_id": "block-0001", "runs": [monolith_run, split_run]}
+    violations = collector.verify_exact_runner_image_required_equal_within_block(block)
+    assert any("workload='responsive'" in v for v in violations)
+    # The core workload (both sides' e2e-core job) still agrees -- only
+    # responsive differs; the fix must not report a spurious core mismatch.
+    assert not any("workload='core'" in v for v in violations)
+
+
+def test_verify_exact_runner_image_required_equal_within_block_accepts_real_monolith_split_asymmetric_evidence():
+    """Issue #2422 fix_delta Blocker 5: genuine monolith(1 provider)/
+    split(2 providers) evidence with IDENTICAL images across both arms
+    must be accepted with zero violations -- the asymmetric provider
+    COUNT itself is never a violation, only a genuine image disagreement
+    per workload is."""
+    monolith_run = _run("monolith", 100, provider_jobs=[_provider_job("e2e-core", 1001)])
+    split_run = _run(
+        "split",
+        101,
+        provider_jobs=[
+            _provider_job("e2e-core", 1011),
+            _provider_job("e2e-responsive-matrix", 1012),
+        ],
+    )
+    block = {"block_id": "block-0001", "runs": [monolith_run, split_run]}
+    assert collector.verify_exact_runner_image_required_equal_within_block(block) == []
 
 
 def test_verify_exact_runner_image_required_equal_within_block_never_compares_across_blocks():
@@ -1677,6 +1765,262 @@ def test_run_bounded_experiment_blocks_22_produces_44_run_root_run_set_determini
     assert all(layouts_for_block == {"monolith", "split"} for layouts_for_block in by_block.values())
 
 
+def _fake_get_run_status_factory(conclusion_by_run_id: dict[int, str], polls_until_terminal: int = 1):
+    """Issue #2422 fix_delta Blocker 2: a fake `get_run_status` that reports
+    `status: "queued"` for `polls_until_terminal - 1` calls per run id, then
+    `status: "completed"` with the configured `conclusion` -- proves
+    `wait_for_run_terminal` actually POLLS (never trusts the first response
+    blindly) without any real sleeping (the injected `sleep` is a no-op in
+    these tests)."""
+    call_count: dict[int, int] = {}
+
+    def fake_get_run_status(workflow_run_id: int, repo: str) -> dict:
+        call_count[workflow_run_id] = call_count.get(workflow_run_id, 0) + 1
+        if call_count[workflow_run_id] < polls_until_terminal:
+            return {"status": "queued"}
+        return {
+            "status": "completed",
+            "conclusion": conclusion_by_run_id.get(workflow_run_id, "success"),
+            "run_attempt": 1,
+        }
+
+    return fake_get_run_status
+
+
+def _fake_list_run_jobs_factory(jobs_by_run_id: dict[int, list[dict]]):
+    def fake_list_run_jobs(workflow_run_id: int, repo: str) -> list[dict]:
+        return jobs_by_run_id.get(workflow_run_id, [])
+
+    return fake_list_run_jobs
+
+
+def _fake_log_fetch(workflow_job_id: int, repo: str) -> str:
+    return _real_set_up_job_log_excerpt()
+
+
+def test_wait_for_run_terminal_polls_until_completed_and_returns_final_status():
+    """Issue #2422 fix_delta Blocker 2: `wait_for_run_terminal` polls
+    `get_run_status` repeatedly (never accepting a non-`completed` status
+    as done) and returns the run's FINAL status dict once `status ==
+    "completed"`."""
+    fake_get_run_status = _fake_get_run_status_factory({100: "success"}, polls_until_terminal=3)
+    sleeps: list[float] = []
+    result = collector.wait_for_run_terminal(
+        100,
+        "squne121/loop-protocol",
+        fake_get_run_status,
+        poll_interval_seconds=0.01,
+        max_polls=10,
+        sleep=sleeps.append,
+    )
+    assert result["status"] == "completed"
+    assert result["conclusion"] == "success"
+    assert len(sleeps) == 2  # slept between poll 1->2 and 2->3, never after the terminal poll
+
+
+def test_wait_for_run_terminal_times_out_fail_closed_never_polls_forever():
+    """A run that NEVER reaches `completed` within `max_polls` raises
+    `LiveAPIError` -- this must be a BOUNDED wait, never an infinite loop."""
+
+    def fake_get_run_status(workflow_run_id: int, repo: str) -> dict:
+        return {"status": "in_progress"}
+
+    with pytest.raises(collector.LiveAPIError):
+        collector.wait_for_run_terminal(
+            100,
+            "squne121/loop-protocol",
+            fake_get_run_status,
+            poll_interval_seconds=0.0,
+            max_polls=3,
+            sleep=lambda s: None,
+        )
+
+
+def test_collect_run_provider_jobs_excludes_skipped_provider_never_synthesizes_evidence():
+    """Issue #2422 fix_delta Blocker 2/Blocker 7: a monolith run's live
+    jobs API response has `e2e-responsive-matrix` reporting `conclusion:
+    "skipped"` (expected -- monolith never starts that job) -- this must
+    be EXCLUDED from `provider_jobs` (never given a fabricated
+    `exact_runner_image`), while `job_names_started` still records its
+    name as evidence that it was at least considered/reported."""
+    jobs_by_run_id = {
+        100: [
+            {"id": 9001, "name": "e2e-core", "conclusion": "success"},
+            {"id": 9002, "name": "e2e-responsive-matrix", "conclusion": "skipped"},
+            {"id": 9003, "name": "e2e", "conclusion": "success"},
+        ]
+    }
+    fake_list_run_jobs = _fake_list_run_jobs_factory(jobs_by_run_id)
+    provider_jobs, job_names_started = collector.collect_run_provider_jobs(
+        100, "squne121/loop-protocol", fake_list_run_jobs, _fake_log_fetch
+    )
+    assert [j["job"] for j in provider_jobs] == ["e2e-core"]
+    assert provider_jobs[0]["exact_runner_image"] == _image()
+    assert job_names_started == ["e2e", "e2e-core", "e2e-responsive-matrix"]
+
+
+def test_collect_run_provider_jobs_split_layout_collects_both_providers():
+    jobs_by_run_id = {
+        101: [
+            {"id": 9101, "name": "e2e-core", "conclusion": "success"},
+            {"id": 9102, "name": "e2e-responsive-matrix", "conclusion": "success"},
+            {"id": 9103, "name": "e2e", "conclusion": "success"},
+        ]
+    }
+    fake_list_run_jobs = _fake_list_run_jobs_factory(jobs_by_run_id)
+    provider_jobs, job_names_started = collector.collect_run_provider_jobs(
+        101, "squne121/loop-protocol", fake_list_run_jobs, _fake_log_fetch
+    )
+    assert sorted(j["job"] for j in provider_jobs) == ["e2e-core", "e2e-responsive-matrix"]
+    assert all(j["exact_runner_image"]["name"] and j["exact_runner_image"]["version"] for j in provider_jobs)
+
+
+def test_write_json_atomic_never_leaves_a_partial_file_and_is_readable_back(tmp_path):
+    target = tmp_path / "progress.json"
+    collector._write_json_atomic(str(target), {"hello": "world"})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"hello": "world"}
+    # A second write REPLACES atomically -- no leftover .tmp-* file.
+    collector._write_json_atomic(str(target), {"hello": "world2"})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"hello": "world2"}
+    assert list(tmp_path.glob("*.tmp-*")) == []
+
+
+def test_execute_bounded_experiment_to_manifest_v2_connects_dispatch_wait_collect_and_build(tmp_path):
+    """Issue #2422 fix_delta Blocker 2/Blocker 3: the FULL pipeline --
+    dispatch -> incremental persistence -> wait-to-terminal -> per-job
+    Runner Image collection -> manifest v2 build+validate -- connected in
+    ONE call, using a `blocks=2` (4-run, AC8-smoke-shaped) fake
+    experiment. `workflow_digest` must be computed via the injected
+    commit-bytes function (fix_delta Blocker 3), never a bare literal."""
+    fake_dispatch_call = _fake_dispatch_call_factory([1])
+    jobs_by_run_id = {
+        1: [{"id": 101, "name": "e2e-core", "conclusion": "success"}],  # monolith block-0001
+        2: [
+            {"id": 201, "name": "e2e-core", "conclusion": "success"},
+            {"id": 202, "name": "e2e-responsive-matrix", "conclusion": "success"},
+        ],  # split block-0001
+        3: [{"id": 301, "name": "e2e-core", "conclusion": "success"}],  # monolith block-0002
+        4: [
+            {"id": 401, "name": "e2e-core", "conclusion": "success"},
+            {"id": 402, "name": "e2e-responsive-matrix", "conclusion": "success"},
+        ],  # split block-0002
+    }
+    fake_get_run_status = _fake_get_run_status_factory({1: "success", 2: "success", 3: "success", 4: "success"})
+    fake_list_run_jobs = _fake_list_run_jobs_factory(jobs_by_run_id)
+
+    import base64
+    import hashlib
+
+    contents_api_calls: list[str] = []
+    workflow_bytes = b"name: ci\non: [push]\n"
+    expected_digest = "sha256:" + hashlib.sha256(workflow_bytes).hexdigest()
+
+    def fake_contents_api_call(endpoint: str):
+        contents_api_calls.append(endpoint)
+        assert f"ref={V2_WORKFLOW_SHA}" in endpoint
+        return {"encoding": "base64", "content": base64.b64encode(workflow_bytes).decode("ascii")}
+
+    output_path = tmp_path / "progress.json"
+    manifest = collector.execute_bounded_experiment_to_manifest_v2(
+        blocks=2,
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        experiment_id="exp-smoke-1",
+        repo="squne121/loop-protocol",
+        workflow_file="ci.yml",
+        ref="main",
+        workflow_sha=V2_WORKFLOW_SHA,
+        frozen_non_treatment=_frozen_non_treatment(),
+        root_run_set_output=str(output_path),
+        dispatch_call=fake_dispatch_call,
+        get_run_status=fake_get_run_status,
+        list_run_jobs=fake_list_run_jobs,
+        log_fetch=_fake_log_fetch,
+        contents_api_call=fake_contents_api_call,
+        poll_interval_seconds=0.0,
+        max_polls=5,
+        sleep=lambda s: None,
+    )
+
+    assert manifest["schema"] == "e2e_performance_benchmark_manifest_v2"
+    assert manifest["workflow_digest"] == expected_digest
+    # computed once (build) + recomputed once (verify) -- both via the SAME
+    # injected commit-bytes transport, never a bare literal/local sha256sum.
+    assert len(contents_api_calls) == 2
+    assert len(manifest["blocks"]) == 2
+    for block in manifest["blocks"]:
+        assert [r["benchmark_layout"] for r in block["runs"]] == ["monolith", "split"]
+        for run in block["runs"]:
+            assert run["workflow_digest"] == expected_digest
+            assert run["provider_jobs"]
+
+    # AC6/Blocker 2 partial-write requirement: the progress file exists and
+    # was written incrementally (not merely at the very end).
+    progress = json.loads(output_path.read_text(encoding="utf-8"))
+    assert len(progress["root_run_set"]) == 4
+
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads(V2_SCHEMA_PATH.read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    assert list(validator.iter_errors(manifest)) == []
+    assert manifest["evidence_errors"] == []
+
+
+def test_execute_bounded_experiment_to_manifest_v2_never_re_dispatches_on_resume(tmp_path):
+    """Issue #2422 fix_delta Blocker 2 resume semantics: a `(block_id,
+    benchmark_layout)` pair already present in `resume_dispatched_run_set`
+    is NEVER re-dispatched -- only the missing pairs get a fresh
+    dispatch."""
+    dispatch_calls: list[tuple[str, str]] = []
+
+    def counting_dispatch_call(repo, workflow_file, ref, inputs, return_run_details):
+        dispatch_calls.append((inputs["block_id"], inputs["benchmark_layout"]))
+        run_id = 100 + len(dispatch_calls)
+        return {"workflow_run_id": run_id, "html_url": f"https://example.invalid/runs/{run_id}"}
+
+    resume_run_set = [
+        {"workflow_run_id": 1, "run_url": "u1", "benchmark_layout": "monolith", "block_id": "block-0001"},
+    ]
+    jobs_by_run_id = {
+        1: [{"id": 1001, "name": "e2e-core", "conclusion": "success"}],
+        101: [
+            {"id": 1101, "name": "e2e-core", "conclusion": "success"},
+            {"id": 1102, "name": "e2e-responsive-matrix", "conclusion": "success"},
+        ],
+    }
+    fake_get_run_status = _fake_get_run_status_factory({1: "success", 101: "success"})
+    fake_list_run_jobs = _fake_list_run_jobs_factory(jobs_by_run_id)
+
+    import base64
+
+    def fake_contents_api_call(endpoint: str):
+        return {"encoding": "base64", "content": base64.b64encode(b"workflow-bytes").decode("ascii")}
+
+    manifest = collector.execute_bounded_experiment_to_manifest_v2(
+        blocks=1,
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        experiment_id="exp-resume-1",
+        repo="squne121/loop-protocol",
+        workflow_file="ci.yml",
+        ref="main",
+        workflow_sha=V2_WORKFLOW_SHA,
+        frozen_non_treatment=_frozen_non_treatment(),
+        root_run_set_output=str(tmp_path / "progress.json"),
+        dispatch_call=counting_dispatch_call,
+        get_run_status=fake_get_run_status,
+        list_run_jobs=fake_list_run_jobs,
+        log_fetch=_fake_log_fetch,
+        contents_api_call=fake_contents_api_call,
+        poll_interval_seconds=0.0,
+        max_polls=5,
+        sleep=lambda s: None,
+        resume_dispatched_run_set=resume_run_set,
+    )
+    # Only the SPLIT half of block-0001 was missing -- exactly one new dispatch.
+    assert dispatch_calls == [("block-0001", "split")]
+    assert len(manifest["blocks"]) == 1
+    assert [r["workflow_run_id"] for r in manifest["blocks"][0]["runs"]] == [1, 101]
+
+
 def test_build_manifest_v2_happy_path_conforms_to_schema():
     """GIVEN a well-formed 2-block (blocks=2 smoke-shaped) run set WHEN the
     v2 manifest is built THEN it conforms to
@@ -1771,6 +2115,190 @@ def test_validate_manifest_v2_semantics_detects_tampered_experiment_run_set_dige
     manifest["experiment_run_set_digest"] = "sha256:" + "0" * 64
     violations = collector.validate_manifest_v2_semantics(manifest)
     assert any("experiment_run_set_digest_mismatch" in v for v in violations)
+
+
+def test_verify_workflow_run_id_global_uniqueness_detects_run_id_reused_across_blocks():
+    """Issue #2422 fix_delta Blocker 6: the SAME `workflow_run_id` (e.g.
+    from copy-pasting 2 real runs into all 22 blocks of a `blocks=22`
+    experiment) appearing under more than one `block_id` is a fail-closed
+    identity violation."""
+    blocks = [
+        _block("block-0001", 1001, 1002),
+        _block("block-0002", 1001, 1003),  # 1001 reused from block-0001's monolith run
+    ]
+    violations = collector.verify_workflow_run_id_global_uniqueness(blocks)
+    assert any("workflow_run_id=1001" in v for v in violations)
+
+    manifest = collector.build_manifest_v2(
+        experiment_identity="exp-smoke-1",
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=V2_WORKFLOW_DIGEST,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-05T00:00:00Z",
+    )
+    assert any(e["reason"] == "workflow_run_id_reused_across_blocks" for e in manifest["evidence_errors"])
+    assert any(
+        "workflow_run_id_reused_across_blocks" in v for v in collector.validate_manifest_v2_semantics(manifest)
+    )
+
+
+def test_verify_workflow_run_id_global_uniqueness_accepts_disjoint_ids_across_many_blocks():
+    """GIVEN 22 blocks with fully disjoint workflow_run_ids (the genuine
+    blocks=22 shape) WHEN checked THEN zero violations are reported."""
+    blocks = [_block(f"block-{i:04d}", 1000 + 2 * i, 1001 + 2 * i) for i in range(1, 23)]
+    assert collector.verify_workflow_run_id_global_uniqueness(blocks) == []
+
+
+def test_verify_required_provider_jobs_present_for_layout_detects_missing_split_responsive_job():
+    """Issue #2422 fix_delta Blocker 6: a `split` run whose `provider_jobs`
+    is missing `e2e-responsive-matrix` entirely (not merely a non-success
+    conclusion for it -- structurally absent) is rejected."""
+    run = _run("split", 200, provider_jobs=[_provider_job("e2e-core", 2001)])
+    violations = collector.verify_required_provider_jobs_present_for_layout(run)
+    assert any("e2e-responsive-matrix" in v for v in violations)
+
+
+def test_verify_required_provider_jobs_present_for_layout_accepts_genuine_monolith_single_provider():
+    """A genuine monolith run (single e2e-core provider) satisfies its own
+    layout's required-provider-jobs composition."""
+    run = _run("monolith", 200, provider_jobs=[_provider_job("e2e-core", 2001)])
+    assert collector.verify_required_provider_jobs_present_for_layout(run) == []
+
+
+def test_verify_success_run_has_provider_job_evidence_rejects_success_with_empty_provider_jobs():
+    """Issue #2422 fix_delta Blocker 6: `conclusion: success` with
+    `provider_jobs: []` is a fail-closed contradiction -- rejected by the
+    dedicated semantic check (independent of, and in addition to, the
+    schema's own `minItems: 1` structural gate on `provider_jobs`)."""
+    run = _run("monolith", 200, provider_jobs=[])
+    run["conclusion"] = "success"
+    violations = collector.verify_success_run_has_provider_job_evidence(run)
+    assert any("success_conclusion_missing_provider_jobs_evidence" in v for v in violations)
+
+
+def test_verify_success_run_has_provider_job_evidence_accepts_non_success_with_empty_provider_jobs():
+    """A NON-success conclusion (e.g. a wholly-cancelled dispatch) with
+    empty `provider_jobs` is not itself a contradiction this check flags
+    -- only a claimed `success` with zero evidence is."""
+    run = _run("monolith", 200, provider_jobs=[])
+    run["conclusion"] = "cancelled"
+    assert collector.verify_success_run_has_provider_job_evidence(run) == []
+
+
+def test_manifest_v2_schema_rejects_bare_integer_expected_playwright_invocations():
+    """Issue #2422 fix_delta Blocker 4 (OWNER REQUEST_CHANGES on PR #2501,
+    issuecomment-5549966497): `expected_playwright_invocations` must be a
+    LIST of identifiable invocations (id/lane/provider_placement/
+    evidence_file) -- a bare integer test-count (the pre-fix_delta shape)
+    cannot express the per-lane invocation identity #2424 needs and is now
+    rejected by the schema."""
+    jsonschema = pytest.importorskip("jsonschema")
+    blocks = [_block("block-0001", 1001, 1002)]
+    manifest = collector.build_manifest_v2(
+        experiment_identity="exp-smoke-1",
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=V2_WORKFLOW_DIGEST,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-05T00:00:00Z",
+    )
+    manifest["frozen_non_treatment"]["expected_playwright_invocations"] = 42
+    schema = json.loads(V2_SCHEMA_PATH.read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    errors = list(validator.iter_errors(manifest))
+    assert errors != []
+
+
+def test_manifest_v2_schema_expected_playwright_invocations_carries_provider_placement_and_evidence_file():
+    """Issue #2422 fix_delta Blocker 4: each invocation entry must bind a
+    logical `invocation_id`/`lane` identity to its ARM-DEPENDENT physical
+    `provider_placement` (monolith vs split run it under different
+    provider jobs without changing invocation identity) and to the
+    `evidence_file` its evidence is expected under."""
+    jsonschema = pytest.importorskip("jsonschema")
+    blocks = [_block("block-0001", 1001, 1002)]
+    manifest = collector.build_manifest_v2(
+        experiment_identity="exp-smoke-1",
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=V2_WORKFLOW_DIGEST,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-05T00:00:00Z",
+    )
+    invocations = manifest["frozen_non_treatment"]["expected_playwright_invocations"]
+    assert len(invocations) >= 1
+    responsive = next(i for i in invocations if i["lane"] == "responsive")
+    assert responsive["provider_placement"]["monolith"] == "e2e-core"
+    assert responsive["provider_placement"]["split"] == "e2e-responsive-matrix"
+    assert responsive["evidence_file"]
+
+    schema = json.loads(V2_SCHEMA_PATH.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
+    validator = jsonschema.Draft202012Validator(schema)
+    assert list(validator.iter_errors(manifest)) == []
+
+    # A missing provider_placement arm (e.g. `split` omitted) must be rejected --
+    # both arms need evidence-binding regardless of which one produced a run.
+    invocations[0]["provider_placement"].pop("split")
+    errors = list(validator.iter_errors(manifest))
+    assert errors != []
+
+
+def test_manifest_v2_generation_and_verification_path_rejects_false_green_wrong_commit_digest():
+    """Issue #2422 fix_delta Blocker 3 (OWNER REQUEST_CHANGES on PR #2501,
+    issuecomment-5549966497): a regression test at the REAL manifest
+    generation+verification path -- `build_manifest_v2`'s output combined
+    with `verify_workflow_digest_matches_commit_bytes` (exactly as
+    `execute_bounded_experiment_to_manifest_v2` wires them together into
+    the `run-experiment` execution flow), not merely the standalone helper
+    tested in isolation. Both arms of a block report the SAME wrong
+    digest (as would happen if a caller computed it from a local checkout
+    at `head_sha` instead of `workflow_sha`'s own commit bytes) --
+    cross-arm equality ALONE (`verify_cross_arm_required_equal`, already
+    exercised inside `build_manifest_v2`) does NOT catch this; only
+    independent commit-bytes recomputation does."""
+    wrong_digest = "sha256:" + "9" * 64
+    blocks = [_block("block-0001", 1001, 1002)]
+    for block in blocks:
+        for run in block["runs"]:
+            run["workflow_digest"] = wrong_digest
+
+    manifest = collector.build_manifest_v2(
+        experiment_identity="exp-smoke-1",
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=wrong_digest,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-05T00:00:00Z",
+    )
+    # Cross-arm-only check PASSES (both arms agree on the SAME wrong value) --
+    # this is the exact false-green build_manifest_v2/validate_manifest_v2_semantics
+    # alone cannot reject (AC3's explicitly-called-out defect).
+    assert manifest["evidence_errors"] == []
+    assert collector.validate_manifest_v2_semantics(manifest) == []
+
+    # The REAL commit bytes at workflow_sha are DIFFERENT from wrong_digest --
+    # independent recomputation (as execute_bounded_experiment_to_manifest_v2
+    # wires it into the run-experiment execution path) rejects it.
+    import base64
+
+    def fake_contents_api_call(endpoint: str):
+        assert f"ref={V2_WORKFLOW_SHA}" in endpoint
+        return {"encoding": "base64", "content": base64.b64encode(b"the-real-workflow-file-bytes").decode("ascii")}
+
+    violations = collector.verify_workflow_digest_matches_commit_bytes(
+        manifest["workflow_sha"],
+        manifest["workflow_digest"],
+        "squne121/loop-protocol",
+        api_call=fake_contents_api_call,
+    )
+    assert violations != []
+    assert any("workflow_digest_mismatch_vs_commit_bytes" in v for v in violations)
 
 
 def test_manifest_v2_schema_rejects_v1_hybrid_before_after_fields():
