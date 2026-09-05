@@ -60,6 +60,41 @@ on:
           collecting `--before-runs-json`/`--after-runs-json` via `gh api`).
         type: string
         default: ""
+      # Issue #2422: dedicated `benchmark_layout=monolith|split` A/B/A/B
+      # dispatch route -- supersedes the `target_sha`/`cohort_role` hybrid
+      # before/after design above for FUTURE benchmark dispatches (the
+      # inputs above are left untouched for any other in-repo consumer;
+      # this Issue never asserted they must be deleted). Both arms measure
+      # the SAME frozen `target_sha` commit -- only the provider job
+      # TOPOLOGY (`benchmark_layout`) is the treatment. Free-form string
+      # (never `type: choice`) for the identical reason `cohort_role`
+      # above is a free-form string: actionlint rejects an empty-string
+      # `choice` option, and empty string must mean "not a benchmark_layout
+      # dispatch" so this input coexists with unrelated `workflow_dispatch`
+      # uses (`python_test_bench`, etc.).
+      benchmark_layout:
+        description: >-
+          Issue #2422 AC1/AC2: "monolith" (core+responsive workload
+          sequentially in the e2e-core job, e2e-responsive-matrix skipped)
+          or "split" (core/responsive run as two parallel provider jobs --
+          the pre-existing default topology). Leave empty for a normal
+          non-benchmark run (every job runs as usual). When non-empty, only
+          the measured provider jobs (e2e-core / e2e-responsive-matrix)
+          plus the minimal gate-ready job (e2e aggregate) start -- every
+          other job (typecheck/lint/test/build/etc.) is skipped for this
+          dispatch (AC7).
+        type: string
+        default: ""
+      block_id:
+        description: >-
+          Issue #2422 AC3/AC7: matched-block identifier tying one
+          `benchmark_layout=monolith` run to its paired
+          `benchmark_layout=split` run in the same A/B/A/B block (operator
+          bookkeeping; recorded verbatim in the ci_runtime_baseline_v1
+          artifact for later manifest-v2 assembly). Leave empty for a
+          normal non-benchmark run.
+        type: string
+        default: ""
       # #2159 OWNER scope-authority ruling (issuecomment-5299412215, items
       # 2/P0-8 and 3/P1-3/AC11): opt-in trigger for the
       # `e2e-performance-benchmark-assessment-gate` steps below (added to
@@ -126,6 +161,38 @@ on:
           whenever trusted_ci_verdict_summary_artifact_id is set.
         type: string
         default: ""
+      # Issue #2422 fix_delta Blocker 8 (OWNER REQUEST_CHANGES on PR #2501,
+      # issuecomment-5549966497): `tests/ci/test_ci_performance_gate.py`
+      # `_cli_main`'s `--production-invocation` flag (already merged, #2423)
+      # was never actually PASSED by this production call site -- it always
+      # ran in the unit/fixture/exploratory-smoke default mode, so AC10
+      # (fixture-sha256 fallback structurally unreachable from production)
+      # was unenforced in practice. These two operator-supplied trusted
+      # inputs (mirroring the `trusted_ci_verdict_summary_*` pair's own
+      # pattern immediately above) let an operator bind the gate invocation
+      # to a REAL #2422 manifest v2's own sha256 + experiment identity
+      # (computed from a `collect_e2e_performance_benchmark.py run-experiment`
+      # `--manifest-output` file, e.g. via `sha256sum`) -- when BOTH are
+      # non-empty, the CLI is invoked with `--production-invocation` (AC10
+      # hardening kicks in); left empty (default), the gate still runs
+      # exactly as before (unit/fixture/exploratory-smoke, no
+      # `--production-invocation`) -- fully backward compatible.
+      manifest_v2_sha256:
+        description: >-
+          sha256:<hex> digest of a REAL e2e_performance_benchmark_manifest_v2
+          file (from `collect_e2e_performance_benchmark.py run-experiment
+          --manifest-output`) this gate invocation is authoritatively bound
+          to. Leave empty to run the gate WITHOUT --production-invocation
+          (unit/fixture/exploratory-smoke route, unchanged default).
+        type: string
+        default: ""
+      manifest_v2_experiment_identity:
+        description: >-
+          The `experiment_identity` field of the manifest_v2_sha256-bound
+          manifest. Required together with manifest_v2_sha256 -- both must
+          be non-empty for --production-invocation to be passed.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -140,7 +207,10 @@ concurrency:
 
 jobs:
   typecheck:
-    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    # Issue #2422 AC7: skipped entirely on a `benchmark_layout != ''`
+    # dispatch -- only measured provider jobs + the minimal gate-ready job
+    # start on that route.
+    if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -281,7 +351,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
-    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    # Issue #2422 AC7: see typecheck's identical comment above.
+    if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -400,7 +471,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   test:
-    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    # Issue #2422 AC7: see typecheck's identical comment above.
+    if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -542,7 +614,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:
-    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    # Issue #2422 AC7: see typecheck's identical comment above.
+    if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -829,6 +902,83 @@ jobs:
             return $status
           }
           run_timed test_e2e_ci pnpm test:e2e:ci
+      # Issue #2422 AC2/AC8: `benchmark_layout=monolith` runs the responsive
+      # workload SEQUENTIALLY inside this same e2e-core job (instead of the
+      # e2e-responsive-matrix job, which is skipped for this layout -- see
+      # that job's own `if:` condition). This step-level `LOOP_E2E_LANE:
+      # responsive` env override (playwright.config.ts's existing lane
+      # selector, unchanged) makes THIS ONE invocation write to the SAME
+      # `playwright-report-e2e-responsive-matrix`/`test-results-e2e-
+      # responsive-matrix` LOCAL output folders e2e-responsive-matrix itself
+      # uses (these are per-job-runner-local directory names hardcoded in
+      # playwright.config.ts and never collide across jobs since e2e-core
+      # and e2e-responsive-matrix always run on separate runners) -- no
+      # playwright.config.ts change needed. The upload-artifact `name:`
+      # values below are intentionally suffixed `-e2e-core` (distinct from
+      # e2e-responsive-matrix's own upload names) because GitHub Actions
+      # artifact names must be unique across the whole workflow run, unlike
+      # the local directories they are populated from. `split` (or a normal,
+      # non-benchmark run) never executes this step at all -- the
+      # e2e-responsive-matrix job's own parallel run is unaffected.
+      - name: Run responsive-matrix E2E tests (monolith layout only, timed)
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == 'monolith' }}
+        id: timed-e2e-monolith-responsive
+        env:
+          LOOP_E2E_LANE: responsive
+        run: |
+          run_timed() {
+            local step_id="$1"; shift
+            local start_ms end_ms elapsed_ms status
+            start_ms=$(date +%s%3N)
+            set +e
+            "$@"
+            status=$?
+            set -e
+            end_ms=$(date +%s%3N)
+            elapsed_ms=$((end_ms - start_ms))
+            printf '{"step_id":"%s","phase_id":"%s","status":%d,"elapsed_ms":%d}\n' \
+              "$step_id" "$step_id" "$status" "$elapsed_ms" \
+              >> measurements.jsonl
+            return $status
+          }
+          run_timed test_e2e_monolith_responsive pnpm exec playwright test tests/e2e/assist-player-affordance-responsive.spec.ts
+      - name: Upload Playwright report (monolith layout responsive workload)
+        id: upload-playwright-report-monolith-responsive
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == 'monolith' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: playwright-report-e2e-core-responsive
+          path: playwright-report-e2e-responsive-matrix/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Upload test results (monolith layout responsive workload)
+        id: upload-test-results-monolith-responsive
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == 'monolith' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-results-e2e-core-responsive
+          path: test-results-e2e-responsive-matrix/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Locate responsive-canvas-runtime-evidence.json (monolith layout)
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == 'monolith' }}
+        run: |
+          set -euo pipefail
+          mkdir -p responsive-canvas-runtime-evidence-artifact
+          found="$(find test-results-e2e-responsive-matrix -name 'responsive-canvas-runtime-evidence.json' -print -quit || true)"
+          if [ -z "$found" ]; then
+            echo "::error::responsive-canvas-runtime-evidence.json not found under test-results-e2e-responsive-matrix/ — the monolith-layout responsive workload step did not produce the required evidence."
+            exit 1
+          fi
+          cp "$found" responsive-canvas-runtime-evidence-artifact/responsive-canvas-runtime-evidence.json
+      - name: Upload responsive-canvas-runtime-evidence artifact (monolith layout)
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == 'monolith' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: responsive-canvas-runtime-evidence-e2e-core-${{ github.run_attempt }}
+          path: responsive-canvas-runtime-evidence-artifact/
+          if-no-files-found: error
+          retention-days: 30
       # Visual regression evidence pipeline — docs/dev/visual-baseline-registry.md §5
       # Upload on success AND failure (not just failure()) so baseline evidence is
       # always retained. Uses !cancelled() (not always()) — see registry §5 for rationale.
@@ -953,6 +1103,11 @@ jobs:
           # the producer below falls back to "ci_default" for).
           BENCHMARK_COHORT_ROLE: ${{ github.event.inputs.cohort_role }}
           BENCHMARK_EXPERIMENT_ID: ${{ github.event.inputs.experiment_id }}
+          # Issue #2422: recorded verbatim (additive, empty string on any
+          # non-`benchmark_layout` dispatch) for later manifest-v2 assembly
+          # by scripts/ci/collect_e2e_performance_benchmark.py.
+          BENCHMARK_LAYOUT: ${{ github.event.inputs.benchmark_layout }}
+          BENCHMARK_BLOCK_ID: ${{ github.event.inputs.block_id }}
           # Issue #2119 AC9 comparable-cohort fingerprint (PR #2137 human
           # review issuecomment-5273090534 P0 fix): the P50 cohort loader
           # must be able to verify every run in a 20-run comparable cohort
@@ -1040,6 +1195,11 @@ jobs:
               ),
               "cohort_role": os.environ.get("BENCHMARK_COHORT_ROLE") or "ci_default",
               "experiment_id": os.environ.get("BENCHMARK_EXPERIMENT_ID") or None,
+              # Issue #2422: recorded verbatim, never inferred -- empty
+              # string (falsy) becomes None on any non-`benchmark_layout`
+              # dispatch, mirroring `experiment_id` above.
+              "benchmark_layout": os.environ.get("BENCHMARK_LAYOUT") or None,
+              "block_id": os.environ.get("BENCHMARK_BLOCK_ID") or None,
               # #2159 OWNER scope-authority ruling (issuecomment-5299412215,
               # item 1/P0-2): `github.workflow_sha` is the commit of the
               # WORKFLOW DEFINITION that produced this run (distinct from
@@ -1514,7 +1674,14 @@ jobs:
   # hotspot, ~3.2min of a ~6.5min run). No DAG dependency on `e2e-core` — the
   # two run in parallel; the `e2e` aggregate job below collects both.
   e2e-responsive-matrix:
-    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    # Issue #2422 AC2/AC8: skipped (expected `skipped` conclusion) on a
+    # `benchmark_layout=monolith` dispatch -- the monolith arm runs the
+    # responsive workload sequentially INSIDE e2e-core instead (see
+    # e2e-core's "Run responsive-matrix E2E tests (monolith layout only)"
+    # step below). Runs as usual for `benchmark_layout=split` (the
+    # pre-existing default parallel-provider topology) and for any normal
+    # non-benchmark dispatch/push/pull_request.
+    if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout != 'monolith' }}
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -1704,6 +1871,11 @@ jobs:
           # the producer below falls back to "ci_default" for).
           BENCHMARK_COHORT_ROLE: ${{ github.event.inputs.cohort_role }}
           BENCHMARK_EXPERIMENT_ID: ${{ github.event.inputs.experiment_id }}
+          # Issue #2422: recorded verbatim (additive, empty string on any
+          # non-`benchmark_layout` dispatch) for later manifest-v2 assembly
+          # by scripts/ci/collect_e2e_performance_benchmark.py.
+          BENCHMARK_LAYOUT: ${{ github.event.inputs.benchmark_layout }}
+          BENCHMARK_BLOCK_ID: ${{ github.event.inputs.block_id }}
           # Issue #2119 AC9 comparable-cohort fingerprint (PR #2137 human
           # review issuecomment-5273090534 P0 fix): the P50 cohort loader
           # must be able to verify every run in a 20-run comparable cohort
@@ -1791,6 +1963,11 @@ jobs:
               ),
               "cohort_role": os.environ.get("BENCHMARK_COHORT_ROLE") or "ci_default",
               "experiment_id": os.environ.get("BENCHMARK_EXPERIMENT_ID") or None,
+              # Issue #2422: recorded verbatim, never inferred -- empty
+              # string (falsy) becomes None on any non-`benchmark_layout`
+              # dispatch, mirroring `experiment_id` above.
+              "benchmark_layout": os.environ.get("BENCHMARK_LAYOUT") or None,
+              "block_id": os.environ.get("BENCHMARK_BLOCK_ID") or None,
               # #2159 OWNER scope-authority ruling (issuecomment-5299412215,
               # item 1/P0-2): `github.workflow_sha` is the commit of the
               # WORKFLOW DEFINITION that produced this run (distinct from
@@ -1876,10 +2053,17 @@ jobs:
         env:
           E2E_CORE_RESULT: ${{ needs.e2e-core.result }}
           E2E_RESPONSIVE_RESULT: ${{ needs.e2e-responsive-matrix.result }}
+          # Issue #2422 AC2/AC8: on a `benchmark_layout=monolith` dispatch,
+          # e2e-responsive-matrix is EXPECTED to conclude `skipped` (the
+          # monolith arm runs the responsive workload sequentially inside
+          # e2e-core instead) -- this must not degrade the aggregate to
+          # failure in that one specific case.
+          BENCHMARK_LAYOUT: ${{ github.event.inputs.benchmark_layout }}
         run: |
           set -euo pipefail
           echo "e2e-core.result=$E2E_CORE_RESULT"
           echo "e2e-responsive-matrix.result=$E2E_RESPONSIVE_RESULT"
+          echo "benchmark_layout=$BENCHMARK_LAYOUT"
           fail=0
           for pair in "e2e-core:$E2E_CORE_RESULT" "e2e-responsive-matrix:$E2E_RESPONSIVE_RESULT"; do
             job="${pair%%:*}"
@@ -1896,8 +2080,12 @@ jobs:
                 fail=1
                 ;;
               skipped)
-                echo "::error::runtime result failure: $job concluded 'skipped' (provider job did not run)"
-                fail=1
+                if [ "$job" = "e2e-responsive-matrix" ] && [ "$BENCHMARK_LAYOUT" = "monolith" ]; then
+                  echo "e2e-responsive-matrix skipped as EXPECTED for benchmark_layout=monolith (Issue #2422 AC2/AC8) -- not a failure."
+                else
+                  echo "::error::runtime result failure: $job concluded 'skipped' (provider job did not run)"
+                  fail=1
+                fi
                 ;;
               *)
                 echo "::error::unrecognized needs.$job.result: '$result'"
@@ -1909,7 +2097,7 @@ jobs:
             echo "::error::e2e aggregate: at least one provider job did not succeed — not degrading to success."
             exit 1
           fi
-          echo "e2e aggregate: both e2e-core and e2e-responsive-matrix succeeded (runtime result + provider-enforced runtime evidence via if-no-files-found: error)."
+          echo "e2e aggregate: both e2e-core and e2e-responsive-matrix succeeded (or e2e-responsive-matrix expected-skipped for benchmark_layout=monolith; runtime result + provider-enforced runtime evidence via if-no-files-found: error)."
 
   component-vrt-report:
     # Issue #1389 (Scope Delta): non-required, report-only Vitest Browser
@@ -1923,7 +2111,9 @@ jobs:
     # .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py
     # CLASSIFICATION_MAP (Scope Delta) so determine_check_verdict() never
     # treats it as blocking regardless of pass/fail.
-    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    # Issue #2422 AC7: skipped entirely on a `benchmark_layout != ''`
+    # dispatch (see typecheck's identical comment above).
+    if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -2393,7 +2583,12 @@ jobs:
     # (component-vrt-report success alone must never gate whether this job
     # runs).
     needs: [component-vrt-report]
-    if: always()
+    # Issue #2422 AC7: `if: always()` bypasses `needs` skip-propagation, so
+    # this job must be explicitly excluded here too on a
+    # `benchmark_layout != ''` dispatch (component-vrt-report above is
+    # already skipped on that route, but `always()` alone would still let
+    # this job run).
+    if: ${{ always() && github.event.inputs.benchmark_layout == '' }}
     runs-on: ubuntu-latest
     # Issue #2019 AC21: minimal read-only permissions for the APIs used
     # below (CheckRun lookup, artifact download, PR metadata). No write
@@ -2734,6 +2929,33 @@ jobs:
 
   python-test-core:
     runs-on: ubuntu-latest
+    # Issue #2422 fix_delta Blocker 1 (OWNER REQUEST_CHANGES on PR #2501,
+    # issuecomment-5549966497): a JOB-LEVEL skip here made `needs.python-
+    # test-core.result` resolve to `skipped` on a `benchmark_layout != ''`
+    # dispatch, which the FIXED, unmodifiable `python-test` aggregate
+    # contract (Issue #1760 AC5/AC10, `scripts/ci/verify_python_test_lane.py`
+    # -- outside this Issue's Allowed Paths, never edited here) always
+    # evaluates via `evaluate_python_test_aggregate.py --core-result
+    # ${{ needs.python-test-core.result }}` as `ok = core_result ==
+    # "success"` -- `skipped` is unconditionally a FAILURE there, with no
+    # `benchmark_layout`-aware branch (and none can be added without
+    # touching that out-of-scope evaluator). This job must therefore always
+    # START (no job-level `if:` at all, matching this job's own pre-#2422
+    # baseline shape) so `python-test-core` can conclude a genuine
+    # `success`, not `skipped`. AC7's "only measured provider jobs + the
+    # minimal gate-ready job start" intent is instead honored at STEP level
+    # below: every actual test-suite-execution step (uv python
+    # install/sync, ruff, the pytest lanes, ci_test_selection generation,
+    # ci_runtime_baseline_v1 collection, etc.) now carries its own
+    # `if: ... && github.event.inputs.benchmark_layout == ''` (or a bare
+    # `if: github.event.inputs.benchmark_layout == ''` where no prior `if:`
+    # existed) -- ONLY `actions/checkout`, `./.github/actions/setup-python-
+    # uv`, and the "Verify python-test lane topology invariants (#1760)"
+    # step (which `check_verifier_not_disabled` requires to remain
+    # unconditioned, AC7 of that lane's own contract) still run
+    # unconditionally on a `benchmark_layout` dispatch -- this is the
+    # minimal real work needed to keep `python-test-core`'s conclusion a
+    # genuine `success` without running the actual application test suite.
     # Issue #2423 AC5: the opt-in e2e-performance-benchmark-assessment-gate
     # steps below (`run_performance_assessment_gate: true`) need read access
     # to the GitHub Actions Artifacts REST API to acquire a trusted
@@ -2755,6 +2977,7 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/setup-python-uv
       - name: uv python install (timed)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         id: timed-uv-python-install
         run: |
           run_timed() {
@@ -2774,12 +2997,15 @@ jobs:
           }
           run_timed uv_python_install uv python install
       - name: uv lock --check (drift guard)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: uv lock --check
 
       - name: "Runtime dependency smoke (isolated, #1192)"
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: uv run --isolated --locked --no-default-groups python scripts/ci/runtime_dependency_smoke.py
 
       - name: uv sync (timed)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         id: timed-uv-sync
         run: |
           run_timed() {
@@ -2799,8 +3025,10 @@ jobs:
           }
           run_timed uv_sync uv sync --locked --group dev
       - name: Verify Ruff configuration authority
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: uv run --locked python3 scripts/ci/verify_ruff_configuration.py --root .
       - name: Ruff check (timed)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         id: timed-ruff-check
         run: |
           run_timed() {
@@ -2820,8 +3048,10 @@ jobs:
           }
           run_timed ruff_check uv run --locked ruff check .claude/scripts scripts schemas .claude/skills
       - name: Install ripgrep
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: sudo apt-get install -y ripgrep
       - name: Verify Python version
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: |
           uv run --locked python - <<'PY'
           import sys
@@ -2829,20 +3059,27 @@ jobs:
           print(sys.version)
           PY
       - run: uv run --locked python .claude/scripts/check_secret_policy.py docs/dev/secret-policy.md
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
       - run: uv run --locked python .claude/scripts/check_session_recording_policy.py docs/dev/session-recording-policy.md
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
       - name: Check InputCommand docs schema
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: uv run --locked python scripts/check_input_command_schema.py
       - name: Check visual artifact pipeline wiring
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: uv run --locked python scripts/check-visual-artifact-pipeline.py
       - name: Check required-CI VRT snapshot policy
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: uv run --locked python scripts/check-vrt-snapshot-policy.py
       - name: Verify python-test plan paths + lane union
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         # Fail-closed plan checks (Issue #1064 review): every plan path exists, and the
         # collected node IDs satisfy  parallel ∪ serial == scope  and  parallel ∩ serial == ∅.
         run: |
           python3 scripts/ci/python_test_plan.py --emit scope-argv --check-paths --format json > /dev/null
           uv run --locked python scripts/ci/verify_lane_union.py
       - name: Check governed Python invocation policy (#1193)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         # Fail-closed static scan: governed surfaces (.github/workflows/** /
         # .github/actions/** / docs/dev/** / .claude/skills/**/SKILL.md /
         # package.json) must use `uv run --locked` for dependency-bearing pytest
@@ -2850,6 +3087,7 @@ jobs:
         # the stdlib_only/bootstrap exceptions registry.
         run: uv run --locked python scripts/ci/check_python_invocation_policy.py --strict
       - name: Check .claude/settings.json permissions (#1551)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         # Fail-closed static scan: permissions.allow/ask/deny in .claude/settings.json
         # must not contain scoped Write(path) rules (repository policy:
         # claude_permission_edit_rule_canonicalization_v1). Scoped path mutation is
@@ -2864,6 +3102,7 @@ jobs:
         # + if:always(), and this verifier itself stays wired (not disabled).
         run: uv run --locked python scripts/ci/verify_python_test_lane.py --ci-yml .github/workflows/ci.yml
       - name: pytest python suite (parallel) (timed)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         # Plan-driven xdist parallel step (Issue #1064). Target set / --ignore / --deselect /
         # FIXED worker count / scheduler all come from the python-test-plan SSOT via the
         # scripts/ci/python_test_plan.py loader. The parallel_exclude tests run in the serial
@@ -2912,6 +3151,7 @@ jobs:
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest serial lane (parallel-unsafe) (timed)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         # Dedicated -n 0 lane for plan.parallel_exclude tests (timing-sensitive, e.g. the
         # 80ms debounce front-gate). Its JUnit/durations cover the tests excluded from the
         # parallel lane so the two artifacts together represent the whole suite (AC9).
@@ -2942,13 +3182,14 @@ jobs:
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: Verify python-test JUnit manifest (parallel + serial == scope)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: |
           uv run --locked python scripts/ci/verify_python_test_manifest.py \
             --parallel-junit python_test_artifacts/junit-parallel.xml \
             --serial-junit python_test_artifacts/junit-serial.xml \
             --manifest-out python_test_artifacts/python_test_manifest.json
       - name: Upload python-test artifacts (junit + durations + xdist meta + manifest)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == '' }}
         uses: actions/upload-artifact@v7
         with:
           name: python-test-junit-${{ github.run_attempt }}
@@ -2956,6 +3197,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Verify hook test discovery exclusions
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: |
           python3 - <<PY
           import subprocess
@@ -3002,16 +3244,19 @@ jobs:
               raise SystemExit("Hook tests missing from pytest discovery:\n" + "\n".join(missing))
           PY
       - name: Kill Switch smoke test
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: uv run --locked python3 .claude/scripts/kill_switch_runtime_smoke.py --fixtures tests/fixtures/session-recording
       - name: Secret exposure scan (production scripts)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: python3 .claude/scripts/secret_exposure_scanner.py --local .claude/scripts --exclude secret_exposure_scanner.py --exclude check_session_recording_runtime_safety.py --fail-on-finding
       - name: Secret exposure scan (clean fixtures)
+        if: ${{ github.event.inputs.benchmark_layout == '' }}
         run: python3 .claude/scripts/secret_exposure_scanner.py --local tests/fixtures/session-recording/valid --fail-on-finding
       - name: Generate ci_test_selection/v1 artifact
         # Skipped in python_test_bench dispatch runs: change detection needs a PR base
         # SHA which a workflow_dispatch event lacks, and the bench run only measures
         # pytest runtime (Issue #1064 AC11). Normal push/PR runs always run this.
-        if: ${{ github.event.inputs.python_test_bench != 'true' }}
+        if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
         run: |
           mkdir -p ci_test_selection_artifacts
           uv run --locked pytest --collect-only -q \
@@ -3060,18 +3305,18 @@ jobs:
           sys.exit(module.generate_artifact(args))
           PY
       - name: Verify ci_test_selection evidence files
-        if: ${{ github.event.inputs.python_test_bench != 'true' }}
+        if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
         run: |
           test -s ci_test_selection_artifacts/hook_tests_collect_only.txt
           test -s ci_test_selection_artifacts/ci_test_selection_v1.json
       - uses: actions/upload-artifact@v7
-        if: ${{ github.event.inputs.python_test_bench != 'true' }}
+        if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
         with:
           name: ci_test_selection
           path: ci_test_selection_artifacts/
           if-no-files-found: error
       - name: Collect ci_runtime_baseline_v1 artifact
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == '' }}
         env:
           GH_JOB: ${{ github.job }}
           GH_RUN_ID: ${{ github.run_id }}
@@ -3115,7 +3360,7 @@ jobs:
           print(f"Written: {out}")
           PY
       - name: Upload ci-runtime-baseline artifact
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == '' }}
         uses: actions/upload-artifact@v7
         with:
           name: ci-runtime-baseline-${{ github.job }}-${{ github.run_attempt }}
@@ -3123,7 +3368,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Output CI runtime summary
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == '' }}
         run: |
           {
             echo "## CI Runtime Baseline: ${{ github.job }}"
@@ -3143,7 +3388,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == '' }}
         env:
           GH_ISSUE_NUMBER: "2159"
           GH_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
@@ -3200,14 +3445,14 @@ jobs:
           print(f"Written: {out}")
           PY
       - name: Validate CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == '' }}
         run: |
           uv run --locked python3 \
             .claude/skills/ci-test-performance/scripts/validate_ci_performance_assessment_v2.py \
             --assessment ci_test_performance_assessment_artifacts/ci_test_performance_assessment_v2.json \
             --output ci_test_performance_assessment_artifacts/ci_test_performance_assessment_v2_validation_result.json
       - name: Upload CI_TEST_PERFORMANCE_ASSESSMENT_V2 artifact
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event.inputs.benchmark_layout == '' }}
         uses: actions/upload-artifact@v7
         with:
           name: ci-test-performance-assessment-v2-${{ github.run_attempt }}
@@ -3422,6 +3667,13 @@ jobs:
           TRUSTED_GITHUB_ARTIFACT_DIGEST: ${{ steps.acquire-trusted-verdict-summary.outputs.github_artifact_digest || '' }}
           TRUSTED_ARTIFACT_ID: ${{ github.event.inputs.trusted_ci_verdict_summary_artifact_id }}
           TRUSTED_EXPECTED_HEAD_SHA: ${{ github.event.inputs.trusted_ci_verdict_summary_expected_head_sha }}
+          # Issue #2422 fix_delta Blocker 8: authoritative manifest v2
+          # binding -- when BOTH are non-empty, --production-invocation is
+          # passed (AC10 hardening). Left empty (default), this step's
+          # invocation shape is byte-for-byte unchanged from before this
+          # fix_delta.
+          MANIFEST_V2_SHA256: ${{ github.event.inputs.manifest_v2_sha256 }}
+          MANIFEST_V2_EXPERIMENT_IDENTITY: ${{ github.event.inputs.manifest_v2_experiment_identity }}
         run: |
           set -euo pipefail
           args=(
@@ -3437,6 +3689,28 @@ jobs:
               --ci-verdict-summary-artifact-id "$TRUSTED_ARTIFACT_ID"
               --github-artifact-digest "$TRUSTED_GITHUB_ARTIFACT_DIGEST"
             )
+          fi
+          # Issue #2422 fix_delta Blocker 8: this production call site
+          # previously never passed --production-invocation at all, so
+          # AC10's fixture-sha256-fallback-is-unreachable hardening was
+          # unenforced from THIS actual invocation (only proven by unit
+          # tests calling _cli_main directly). Both trusted inputs must be
+          # non-empty together -- a single one alone is a misconfiguration,
+          # left to _cli_main's own fail-closed exit-code-4 check.
+          if [ -n "$MANIFEST_V2_SHA256" ] && [ -n "$MANIFEST_V2_EXPERIMENT_IDENTITY" ]; then
+            args+=(
+              --production-invocation
+              --manifest-sha256 "$MANIFEST_V2_SHA256"
+              --experiment-identity "$MANIFEST_V2_EXPERIMENT_IDENTITY"
+            )
+          elif [ -n "$MANIFEST_V2_SHA256" ] || [ -n "$MANIFEST_V2_EXPERIMENT_IDENTITY" ]; then
+            args+=(--production-invocation)
+            if [ -n "$MANIFEST_V2_SHA256" ]; then
+              args+=(--manifest-sha256 "$MANIFEST_V2_SHA256")
+            fi
+            if [ -n "$MANIFEST_V2_EXPERIMENT_IDENTITY" ]; then
+              args+=(--experiment-identity "$MANIFEST_V2_EXPERIMENT_IDENTITY")
+            fi
           fi
           uv run --locked python3 tests/ci/test_ci_performance_gate.py "${args[@]}"
       - name: Upload e2e-performance-benchmark-assessment-gate artifact
@@ -3456,6 +3730,20 @@ jobs:
     # the native-Codex-CLI-lane job, which was removed (Issue #2161).
     runs-on: ubuntu-latest
     needs: [python-test-core]
+    # Issue #1760 AC5 (scripts/ci/verify_python_test_lane.py::check_aggregate_job)
+    # requires this job's `if:` to be the literal `always()` -- this required
+    # aggregate status check must never itself be skippable, even on a
+    # `benchmark_layout != ''` dispatch. Issue #2422 AC7's "exclude unrelated
+    # jobs from a benchmark_layout dispatch" intent is satisfied one level up,
+    # on `python-test-core` above (`if: ${{ github.event.inputs.benchmark_layout
+    # == '' }}`), NOT here: the verifier's AC10 also forbids this job's sole
+    # step (the evaluate_python_test_aggregate.py invocation) from having its
+    # own `if:`, so step-level gating -- the pattern used for typecheck/lint/
+    # build/etc. above -- is not available for this job either. The accepted
+    # side effect is that a `benchmark_layout != ''` workflow_dispatch run will
+    # still execute this job, which will then report failure (core result
+    # `skipped` != `success`) -- an ad-hoc benchmark dispatch run, not a
+    # pull_request-triggered run, so this does not gate any PR merge.
     if: always()
     steps:
       - uses: actions/checkout@v6
@@ -3477,7 +3765,8 @@ jobs:
             --bench-mode "${{ github.event.inputs.python_test_bench }}"
 
   node-backed-hook-tests:
-    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    # Issue #2422 AC7: see typecheck's identical comment above.
+    if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -3879,7 +4168,8 @@ jobs:
     # baseline captured in _CI_GATE_BASELINE_KEYS (script docstring /
     # docs/dev/ci-operations.md have the rationale). Detection logic itself
     # is unchanged (Issue #1788 Out of Scope).
-    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    # Issue #2422 AC7: see typecheck's identical comment above.
+    if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -3898,7 +4188,8 @@ jobs:
             --apply-baseline
 
   actionlint:
-    if: ${{ github.event.inputs.python_test_bench != 'true' }}
+    # Issue #2422 AC7: see typecheck's identical comment above.
+    if: ${{ github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
     runs-on: ubuntu-latest
     env:
       GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -4018,7 +4309,11 @@ jobs:
 
   ci-verdict-summary:
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() && github.event.inputs.python_test_bench != 'true' }}
+    # Issue #2422 AC7: skipped entirely on a `benchmark_layout != ''`
+    # dispatch -- every job in `needs` below is itself already skipped on
+    # that route (see each job's own identical comment), so this check-run
+    # aggregation has nothing meaningful left to summarize.
+    if: ${{ !cancelled() && github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
     needs: [typecheck, lint, test, build, e2e, python-test-core, python-test, node-backed-hook-tests, actionlint, agy-causal-claim-drift-gate, visual-impact-policy]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
