@@ -3058,3 +3058,63 @@ loop を終了させてしまった構造的欠陥）は、まさにこの誤っ
 原因だった。semantic design finding の解消責務は常に
 `issue-refinement-loop` の Step 2.5（`issue-design-reviewer` SubAgent 経由）
 に留まり、`issue-contract-review` へ押し出してはならない。
+
+## `evidence_index.py` / `context_budget_report.py` の scope 境界（Issue #2052）
+
+`scripts/agent-ops/evidence_index.py` は、`run_refinement_preflight.py` が
+同一 loop 実行内で取得した Issue/comment snapshot の parse/projection
+結果を、SHA-bound `evidence_key`（repository, resource_kind
+[`issue_body` | `comment`], resource_id, observed_content_sha256,
+config_sha256）で **同一 phase 内に限り** 再利用するための opt-in cache
+である（デフォルト無効、`run_preflight(evidence_cache_enabled=True)` /
+CLI `--evidence-cache`）。phase transition、対象への mutation 後、
+explicit refresh、freshness-sensitive decision 直前では常に fresh fetch
+を強制し、snapshot を現在の GitHub state の証明として扱わない。
+`scripts/agent-ops/context_budget_report.py` は、この consumer で実際に
+観測できた `fetch_count` / `emitted_utf8_bytes` / `snapshot_reuse_count` /
+`duplicate_projection_count` のみを phase 単位で記録する新規の
+purely-additive artifact（`context_budget_report.json`）であり、未観測の
+token / model-turn 値を生成しない。
+
+以下は本モジュール群の scope 境界であり、混同・拡張してはならない:
+
+| 既存所有者 | scope | 本モジュールとの関係 |
+|---|---|---|
+| `#88`（`adjudicate_vc_result.py` / `LOOP_STATE.vc_adjudication`） | current-head VC binding・独立VC verdict・review eligibility | 再実装しない。`evidence_index` はこれらの判定に一切関与しない |
+| `#1909` | SubAgent 向け bounded context bundle | 再実装しない。別 bundle / receipt / ledger 形式を新設しない |
+| `#1093` / `#1117` | AGENTS/CLAUDE/skills/hooks/subagents/rules/scripts の**静的テキスト**読み込み inventory / context budget | 独立スコープ。`context_budget_report.py` の出力形式は `#1117` の `CONTEXT_BUDGET_DECISION_V1` 系と揃えることを推奨するが、実装・モジュールは統合しない。本モジュールが扱うのは GitHub **実行時 state**（Issue/comment）のみ |
+| `#2077` | cross-process no-progress ledger（`closed / not_planned`） | 本モジュールは in-process のみで完結し、いかなる形でもディスクへ永続化しない。プロセス終了後は何も残らない |
+
+`evidence_index.py` は汎用 command cache ではない。resource_kind は
+`issue_body` / `comment` の閉じた enum のみを受け付け、任意の command 実行
+結果・test/build/lint・mutable worktree を読む command・一時的失敗後の
+retry・GitHub mutation・review/CI/current-head 確認・入力集合を完全に
+束縛できない command は、この cache の suppression 対象に一切ならない
+（未対応の `resource_kind` を渡すと `EvidenceIndexError` で fail-closed
+する）。
+
+以下は fix_delta（PR #2502 OWNER REQUEST_CHANGES 反映）で確定した実装上の
+不変条件であり、今後の変更でも維持すること:
+
+- `force_refresh=True` は対象 entry を即座に invalidate してから fresh
+  fetch を行う。fresh fetch が失敗しても古い成功 entry を残さない（stale
+  reuse を防ぐ）。
+- `get_or_fetch()` の返却値（`raw_snapshot`/`projection`）とキャッシュ内部
+  保持値は常に独立したコピーであり、呼び出し元がどちらか一方を変更しても
+  もう一方（や `evidence_key.observed_content_sha256` との対応）が破壊さ
+  れない。
+- `_entry_is_compatible()` は構造不正・identity 不一致な entry に対して
+  例外を発さず `False`（通常 fetch へのフォールバック）を返す。
+- `fetch_count` / `emitted_utf8_bytes` / `snapshot_reuse_count` /
+  `duplicate_projection_count` は phase-local カウンタであり、
+  `begin_phase()` が異なる phase 名への遷移時にゼロへリセットする（同一
+  phase への再入では維持する）。`context_budget_report.py` 側の
+  `totals()` はこの前提の上でのみ二重計上しない。
+- `run_refinement_preflight.py` の live-mode 経路では、
+  `_validate_anchor_comments_batch()`（`_validate_anchor_comment_url()`
+  経由）と `run_preflight()` 自身の post-batch-validation 再解決が、共有
+  helper `_resolve_anchor_comment_payload()` を経由して同一
+  `evidence_index` を参照する。これは「新設 evidence_index が実際に production
+  の重複 consumer 操作を削減している」ことを保証するために必須の配線であり
+  （PR #2502 fix_delta A）、単に fallback 分岐にのみ接続するリグレッションを
+  再発させないこと。
