@@ -14,6 +14,14 @@
     "redaction",
     "secret_policy"
   ],
+  "dependentRequired": {
+    "completion_outcome": [
+      "completion_source"
+    ],
+    "completion_source": [
+      "completion_outcome"
+    ]
+  },
   "additionalProperties": false,
   "properties": {
     "schema": {
@@ -500,7 +508,8 @@
             "SubagentStop",
             "PostToolUse",
             "Stop",
-            "PreToolUse"
+            "PreToolUse",
+            "StopFailure"
           ],
           "description": "Claude Code hook event 種別"
         },
@@ -525,6 +534,21 @@
             }
           ],
           "description": "hook トリガー時刻（ISO 8601）"
+        },
+        "error_type": {
+          "type": "string",
+          "enum": [
+            "rate_limit",
+            "overloaded",
+            "authentication_failed",
+            "billing_error",
+            "invalid_request",
+            "model_not_found",
+            "server_error",
+            "max_output_tokens",
+            "unknown"
+          ],
+          "description": "StopFailure イベントで観測された upstream structured error taxonomy（optional）。turn-level evidence であり、root completion_outcome/completion_source の設定には使わない。判定困難な値は unknown に正規化する"
         }
       }
     },
@@ -611,6 +635,37 @@
         }
       ],
       "description": "次に実行すべき Issue 番号（nullable）"
+    },
+    "runtime_lane": {
+      "type": "string",
+      "enum": [
+        "native_claude_code",
+        "claude_gpt",
+        "codex_cli",
+        "unknown"
+      ],
+      "description": "セッションが実行された runtime lane（optional。既存 manifest との backward compatibility のため root required には含めない）。provenance は launcher-set 環境変数 CLAUDE_GPT_CLAUDE_BIN の有無のみに由来し、actor.name や transcript からの推測は行わない。値を取得できない場合は unknown"
+    },
+    "completion_outcome": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "failed",
+        "interrupted",
+        "incomplete",
+        "unavailable"
+      ],
+      "description": "セッション/run 終了の観測された結果（optional, session/run-level）。観測できない事象を推測分類せず、観測不能な場合は unavailable を使う。Stop/StopFailure は turn-level event であり、この session/run-level フィールドをこれらの hook から直接設定してはならない（launcher process exit または後段 reconciliation（例: scripts/agent-logs/complete-agent-run.mjs）からのみ設定する）"
+    },
+    "completion_source": {
+      "type": "string",
+      "enum": [
+        "hook",
+        "launcher",
+        "reconciliation",
+        "unavailable"
+      ],
+      "description": "completion_outcome の値がどの経路から得られたか（optional）。値を取得できない場合は unavailable。`hook` はturn-level hookからの推測ではなく、launcher/reconciliation側がturn-level evidenceを集約した上で明示的に設定する場合にのみ使う"
     },
     "secret_policy": {
       "type": "object",

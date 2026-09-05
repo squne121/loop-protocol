@@ -1,6 +1,6 @@
 ---
 schema_version: v1
-title: Agent Session Manifest
+title: "Agent Session Manifest（エージェントセッション記録）"
 status: active
 related_issue: "#243"
 ---
@@ -10,7 +10,7 @@ related_issue: "#243"
 LOOP_PROTOCOL の Main Loop 各 phase において AI agent session の metadata を記録するための SSOT schema。
 `metadata-first / full transcript は疑義発生時のみ` 方針（#136 Decision）に基づく。
 
-機械可読 JSON Schema SSOT: [`docs/schemas/agent-session-manifest.schema.json`](agent-session-manifest.schema.json)（JSON Schema Draft 2020-12）
+機械可読 JSON Schema SSOT（正本）: [`docs/schemas/agent-session-manifest.schema.json`](agent-session-manifest.schema.json)（JSON Schema Draft 2020-12 版）
 
 後続の hook 実装 Issue はこの schema を参照する。
 
@@ -18,7 +18,7 @@ LOOP_PROTOCOL の Main Loop 各 phase において AI agent session の metadata
 
 PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・test-runner 呼び出し有無・SKIP exit 0 黙認・PR 本文全面置換・token/context 圧迫）を事後検証するために、各 phase で **どの metadata を retention-limited artifact と opaque ref に残すか** を明文化する。
 
-## 1 manifest = 1 ledger phase 原則
+## 1 manifest = 1 ledger phase 原則（設計原則）
 
 `phase.ledger_phase` は **scalar（単一値）** である。1 つの manifest document は 1 つの ledger_phase にのみ対応する。
 
@@ -60,6 +60,9 @@ PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・
 | `sanitization_status` | string（enum） | no | 機微情報のサニタイズ状態（hook 記録時に設定） |
 | `human_intervention` | object | no | 人間介入の有無と内容 |
 | `next_action_issue` | integer\|null | no | 次に実行すべき Issue 番号（nullable） |
+| `runtime_lane` | string（enum） | no | セッションが実行された runtime lane（後述。#2489） |
+| `completion_outcome` | string（enum） | no | セッション終了の観測された結果（後述。#2489） |
+| `completion_source` | string（enum） | no | `completion_outcome` の取得元（後述。#2489） |
 
 ### `actor` オブジェクト
 
@@ -69,7 +72,7 @@ PR #81 / #131 振り返りで明らかになった問題（AC 読み落とし・
 | `name` | string | yes | エージェント名または `"human"` |
 | `session_id` | string\|null | no | セッション ID（nullable。人間操作の場合は `null` 可） |
 
-## Producer Provenance
+## Producer Provenance（生成元情報）
 
 `producer` は optional object であり、既存 manifest との backward compatibility のため `required` には含めない。  
 `producer.kind` is a self-claim であり、schema 追加だけで真正性を証明するものではない。真正性は `evidence` linkage、および #378 / #402 で扱う hook / CI wiring で担保する。
@@ -154,11 +157,12 @@ hook イベント情報を記録する。Claude Code hook から生成される 
 
 | フィールド | 型 | 必須 | 説明 |
 |---|---|---|---|
-| `event_type` | enum | no | `SubagentStart \| SubagentStop \| PostToolUse \| Stop \| PreToolUse` |
+| `event_type` | enum | no | `SubagentStart \| SubagentStop \| PostToolUse \| Stop \| PreToolUse \| StopFailure`（`StopFailure` は #2489 で追加） |
 | `hook_id` | string\|null | no | hook 実行 ID（optional） |
 | `triggered_at` | string\|null | no | hook トリガー時刻（ISO 8601） |
+| `error_type` | enum | no | `StopFailure` イベントで観測された upstream structured error taxonomy（`rate_limit \| overloaded \| authentication_failed \| billing_error \| invalid_request \| model_not_found \| server_error \| max_output_tokens \| unknown`、#2489 で追加）。turn-level evidence であり、root `completion_outcome`/`completion_source` の設定には使わない。判定困難な値は `unknown` に正規化する |
 
-### `sanitization_status`（optional）
+### `sanitization_status`（任意項目、optional）
 
 hook 記録時に設定される機微情報のサニタイズ状態。
 
@@ -184,7 +188,58 @@ hook 記録時に設定される機微情報のサニタイズ状態。
 | `type` | enum | yes | 介入種別（`none \| approval \| correction \| escalation`） |
 | `summary` | string\|null | no | 介入内容の概要（nullable） |
 
-## Main Loop Phase Enum
+## Runtime Lane / Completion Taxonomy（実行レーンと完了状態の分類、#2489, #1939 Workstream 2）
+
+`runtime_lane` / `completion_outcome` / `completion_source` は、単一の `stop_reason` enum ではなく 3 フィールドへ reframe した taxonomy である（#2489 human_context_comment P0-1 対応）。
+`interrupt` / `timeout` / `permission_interruption` / `human_clarification_request` のような、現在の hook 経路から観測不能な事象を推測して 1 本の enum に押し込めることを避け、`unavailable` / `unknown` を正規値として扱う。`permission_interruption` / `human_clarification_request` は既存 `human_intervention` オブジェクト側の責務であり、本 taxonomy には含めない。`retry` も terminal reason ではなく transition/action として扱い、本 taxonomy には含めない。
+
+### `runtime_lane`（任意項目、root-level scalar）
+
+| 値 | 説明 |
+|---|---|
+| `native_claude_code` | launcher-set 環境変数 `CLAUDE_GPT_CLAUDE_BIN` が未設定の Claude Code native 実行 |
+| `claude_gpt` | launcher-set 環境変数 `CLAUDE_GPT_CLAUDE_BIN` が設定されている Claude-GPT 実行（#2338 の既存 claude-gpt pin 識別と同じ signal） |
+| `codex_cli` | schema レベルの coverage のみ。Codex CLI 向けの新規 hook infrastructure・producer wiring は本 Issue のスコープ外（別 Issue に委ねる） |
+| `unknown` | provenance を取得できない呼び出し元が渡す値 |
+
+provenance は `.claude/hooks/generate_session_manifest_from_hook.mjs` が既存の launcher-set 環境変数 `CLAUDE_GPT_CLAUDE_BIN` の有無のみから導出する。`actor.name` や transcript 内容からの推測は行わない。`scripts/generate-session-manifest.mjs`（producer 本体）は `--runtime-lane` CLI 引数の値をそのまま受け取るのみで、値の導出ロジックを producer 側には持たない。
+
+### `completion_outcome`（任意項目、root-level scalar。session/run-level）
+
+**重要（#2489 P0-1、PR #2496 OWNER 敵対的レビュー issuecomment-5546874328 対応）**: `completion_outcome` は session/run 全体の終了結果を表す。Claude Code upstream 仕様上、`Stop` / `StopFailure` は **turn-level**（1回の応答の終了）イベントであり、`SessionEnd` が **session-level** イベントである。したがってこのフィールドを `Stop` / `StopFailure` hook から直接設定してはならない（観測していない session/run completion を turn 観測から推測することになるため）。
+
+| 値 | 説明 |
+|---|---|
+| `completed` | launcher process exit または後段 reconciliation により観測された正常完了（本 Issue のスコープでは producer 側の値充填は未実装。enum のみ予約） |
+| `failed` | launcher process exit または後段 reconciliation により観測された失敗終了（同上） |
+| `interrupted` | 現時点では観測経路未実装（将来の拡張余地として enum のみ予約） |
+| `incomplete` | 現時点では観測経路未実装（将来の拡張余地として enum のみ予約） |
+| `unavailable` | 観測経路が存在しない、または値を取得できない場合 |
+
+### `completion_source`（任意項目、root-level scalar。session/run-level）
+
+| 値 | 説明 |
+|---|---|
+| `hook` | turn-level hook からの推測ではなく、launcher/reconciliation 側がturn-level evidence（`hook_event` 等）を集約した上で明示的に設定する場合にのみ使う |
+| `launcher` | launcher 側が直接付与した（本 Issue のスコープでは producer 側の値充填は未実装。enum のみ予約） |
+| `reconciliation` | 事後の reconciliation 処理（例: `scripts/agent-logs/complete-agent-run.mjs`）が導出した（同上） |
+| `unavailable` | 値を取得できない場合 |
+
+`completion_outcome` / `completion_source` は `dependentRequired`（JSON Schema 2020-12）により、どちらか一方が存在すれば他方も必須になる（片方だけの存在は schema 違反）。
+
+### hook イベントと `hook_event` フィールドのマッピング（`.claude/hooks/generate_session_manifest_from_hook.mjs`）
+
+`Stop` / `StopFailure` hook が実際に埋めるのは **turn-level evidence である `hook_event.event_type`（と StopFailure の場合の optional `hook_event.error_type`）のみ**であり、root `completion_outcome` / `completion_source` はこの hook 経路からは一切設定しない（CLI 引数として渡さない）。
+
+| hook イベント | `hook_event.event_type` | `hook_event.error_type` | root `completion_outcome` / `completion_source` |
+|---|---|---|---|
+| `Stop` | `Stop` | （設定しない） | 設定しない（キー自体が存在しない） |
+| `StopFailure` | `StopFailure` | upstream structured error taxonomy値（判定困難時は `unknown`） | 設定しない（キー自体が存在しない） |
+| その他（`PostToolUse` 等） | 対応するイベント名 | （設定しない） | 設定しない |
+
+`.claude/settings.json` は `Stop` hooks 配列に既存 `session_manifest_coordinator.sh` を再利用したまま `StopFailure` イベントを追加登録する（新規 hook script は追加しない）。
+
+## Main Loop Phase Enum（フェーズ列挙値）
 
 `phase.main_loop` の取り得る値（7 値）:
 
@@ -277,7 +332,7 @@ JSON Schema によって機械的に禁止されている。
 transcripts / prompts / checkpoint metadata が public repo に commit されると internet から参照可能になる。
 本 schema はこのリスクを防ぐために、manifest 本文ではなく metadata への opaque ref のみを GitHub コメントへ出せる public-safe boundary を採用している。
 
-## Historical GitHub Comment Template（legacy / non-current）
+## Historical GitHub Comment Template（レガシー / 現行外テンプレート）
 
 以下の template は historical 参照用であり、current live public posting の手順ではない。manifest 本文を Issue / PR comment に貼る運用は non-current であり、not live public posting として扱う。
 marker 文字列そのものは legacy parser / detection pattern の説明用に残すが、manifest body の公開許可を意味しない。
@@ -481,7 +536,7 @@ Secret 値を manifest に含めない static producer contract と、runtime bo
 | `producer_contract` | object | yes | static producer declaration。runtime attestation ではない |
 | `runtime_boundary` | object | yes | runtime boundary enforcement の attestation 状態 |
 
-### `producer_contract`
+### `producer_contract`（契約宣言）
 
 | フィールド | 型 | 必須 | 説明 |
 |---|---|---|---|
@@ -491,7 +546,7 @@ Secret 値を manifest に含めない static producer contract と、runtime bo
 | `claims.secret_values_not_serialized` | boolean const true | yes | Secret 値を manifest に serialize しない |
 | `claims.presence_only` | boolean const true | yes | presence-only metadata のみを emit する |
 
-### `runtime_boundary`
+### `runtime_boundary`（実行時境界）
 
 | フィールド | 型 | 必須 | 説明 |
 |---|---|---|---|
