@@ -263,6 +263,47 @@ human_authorization_receipt/v1:
 - Latitude は public `source_kind` にしない（`latitude_otlp` は既存 #1223 の private provenance
   のまま。`agent_run_report/v1` の public `source_kind` enum は変更しない）。
 
+## 私設ローカル監査 resolver（retro_private_audit_index/v1、Issue #2376、#1939 Workstream 5）
+
+既存の public-safe `evidence_ref`（`agent_improvement_candidate_v1` schema）と publication
+`run_identity`（`run_id`/`base_sha`/`source_set_digest`）から、private local audit evidence を
+fail-closed に解決・保存する resolver。v1 は project Skill only（`plugins/agent-retrospective/...`
+への mirror なし）。
+
+- resolver: `scripts/private_audit_resolver.py`'s `resolve()`/`resolution_key()`/
+  `manifest_digest()`/`register_private_audit_ref()`/`write_manifest()`。
+- Identity 分離（AC2）: `resolution_key`（`run_identity`+`evidence_ref` のみから決定論的に導出
+  される stable identity）と `manifest_digest`（generation snapshot -- `private_status_at_generation`/
+  `reason_code`/`object_key`/`object_digest`/`expires_at` -- をbindする digest）の2層。access時の
+  再評価（source missing/permission changed/digest mismatch/expired）はどちらも書き換えない。
+- Availability は `available | unavailable` の2値のみ（AC3/AC8）。missing/malformed/digest
+  mismatch/permission mismatch/expired はすべて fail-closed `unavailable` に畳み込む。sibling
+  `latitude_runtime_evidence/v1`（3値 `available | unavailable | error`）契約は変更しない。
+- Storage: atomic write（`tempfile.mkstemp()` -> `os.replace()`）+ `0600` permission、audit root
+  からの opaque relative `object_key`（絶対パスは一切保存しない）。resolver 自身によるこの
+  local-only storage read/write は明示的に許可された core functionality。
+- Producer hook: `scripts/run_retrospective.py`'s `register_private_audit_ref()`（`execute_run()`
+  内、`compute_delta()`/Latitude binding の直後・`finalize()` の直前で呼び出す）。THIS 実行で
+  local private source（実際に収集済みの real evidence data）が既に存在する `evidence_ref` に
+  ついてのみ sidecar mapping を登録する -- 存在しない場合は何も書かない（fabricate しない）。
+  best-effort・fail-open（失敗しても retrospective 本体は止めない）。
+- Expiry: `expires_at: RFC3339 UTC | null`（`null` は resolver 独自の expiry なし）。access 時に
+  local resolver が lazy 評価するのみで、background daemon/cleanup service は追加しない。
+- 再利用: canonical JSON は既存 `json.dumps(value, sort_keys=True, separators=(",", ":"))` パターン
+  （`validate_retrospective_schema.compute_source_set_digest()` 等と同一呼び出し）を再利用し、
+  RFC3339 date-time format checking は既存 `validate_retrospective_schema._validate_with_format_checking()`
+  （module-local stdlib-only FormatChecker）を再利用する。いずれも新規 canonicalization/validation
+  infrastructure は追加しない。
+- Schema/fixtures: `schemas/retro_private_audit_index_v1.schema.json`（closed schema、
+  `additionalProperties: false`、bounded enum、free-form instruction field なし）/
+  `schemas/fixtures/retro_private_audit_index_v1.*.json`。public-safety 再検証（raw transcript/
+  prompt/tool I/O/stdout/stderr/credential/token/secret/absolute local path の混入拒否）は既存
+  `scripts/tests/test_public_safe_evidence_refs.py` の parametrized 検証を再利用・拡張する。
+- Public evidence_ref 単体では claim 真偽を立証できない: `resolve()` はローカル filesystem 上の
+  `audit_root` への実アクセスを必須とし、`evidence_ref`/`run_identity` のみから availability を
+  返す public-only 経路は存在しない。ChatGPT 等の GitHub-only reader が既存 public artifact のみ
+  から claim 真偽を独自判定する手段は提供しない。
+
 ## Guardrails（ガードレール）
 
 - **Allowed Paths 外を編集しない**
