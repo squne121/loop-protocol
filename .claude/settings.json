@@ -137,6 +137,18 @@
         ]
       }
     ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_manifest_coordinator.sh",
+            "args": [],
+            "timeout": 55
+          }
+        ]
+      }
+    ],
     "SubagentStop": [
       {
         "hooks": [
