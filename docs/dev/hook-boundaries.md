@@ -233,8 +233,9 @@ hook_boundaries_manifest_v1:
     notes: >
       #2489: StopFailure イベントでも session_manifest_coordinator と同一スクリプトを使用（新規 hook script は追加しない）。
       pending debounce state を flush してから guard / producer を実行する。
-      producer（generate_session_manifest_from_hook.mjs）は StopFailure イベントで
-      completion_outcome: failed / completion_source: hook を manifest に埋める。
+      producer（generate_session_manifest_from_hook.mjs）は StopFailure イベントでは
+      root の completion_outcome / completion_source をこの hook パスから絶対に設定せず、
+      hook_event.event_type / hook_event.error_type という turn-level evidence のみを記録する（AC2, P0-1）。
       task blocker にしてはならない（AC2）。
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
       exit_2_effect は Stop/SubagentStop と異なりまだ upstream Claude Code hooks
