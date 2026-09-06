@@ -14,11 +14,14 @@ import base64
 import json
 import os
 import pwd
+import re
 import shutil
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -372,6 +375,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 ARTIFACT = Path.cwd() / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
@@ -449,6 +453,15 @@ elif argv == ["api", "repos/squne121/loop-protocol/issues/comments/1"]:
     response = json.loads((ARTIFACT / "fake_anchor.json").read_text(encoding="utf-8"))
 elif len(argv) == len(patch_prefix) + 1 and argv[:-1] == patch_prefix:
     operation = "issue_content_patch"
+    # Issue #2393 P1-B regression harness only: deterministically hang the
+    # PATCH call itself (before the fixture state is ever mutated) so a
+    # real, single-process-group child under `_run_child_with_supervision()`
+    # genuinely times out DURING the mutation attempt, before readback --
+    # never a fixed `sleep` racing the test, since the outer executor's own
+    # timeout (shrunk by the test below) is what actually kills this sleep.
+    _hang_seconds = os.environ.get("SKILL_RUNTIME_TEST_HANG_DURING_PATCH_SECONDS")
+    if _hang_seconds:
+        time.sleep(float(_hang_seconds))
     patch = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
     if set(patch) != {"title", "body"} or not all(isinstance(patch[key], str) for key in patch):
         print("invalid_issue_content_patch", file=sys.stderr)
@@ -459,6 +472,16 @@ elif len(argv) == len(patch_prefix) + 1 and argv[:-1] == patch_prefix:
     state["updatedAt"] = "2026-08-01T00:00:01Z"
     STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
     response = {"ok": True}
+    # Issue #2393 P1-B regression harness only: deterministically inject a
+    # stray write OUTSIDE every allowed root, AFTER the real mutation above
+    # already landed -- proving the outer unauthorized-write check can fire
+    # on a span where the inner transaction genuinely already achieved a
+    # result, distinct from the inner transaction itself ever writing there.
+    _stray_write_rel = os.environ.get("SKILL_RUNTIME_TEST_INJECT_STRAY_WRITE_AFTER_PATCH")
+    if _stray_write_rel:
+        _stray_path = Path.cwd() / _stray_write_rel
+        _stray_path.parent.mkdir(parents=True, exist_ok=True)
+        _stray_path.write_text("stray-unauthorized-write\\n", encoding="utf-8")
 else:
     print("unexpected_fake_gh_argv", file=sys.stderr)
     raise SystemExit(64)
@@ -474,13 +497,51 @@ print(json.dumps(response))
     gh_path.chmod(0o755)
 
 
-def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path) -> Path:
+def _materialize_dedicated_worktree(repo_root: Path, control_plane_remote_url: str, monkeypatch) -> Path:
+    """Pre-materialize the SAME fixed dedicated worktree the real subprocess
+    dispatch below will reuse (Issue #2393).
+
+    `validate_detached_worktree_path()` fail-closed-rejects creating a
+    worktree at a path that already exists, so fixture data cannot be
+    pre-seeded there until the worktree itself exists -- and the worktree
+    cannot exist before ITS OWN first bootstrap. This performs that SAME
+    `control_plane_dedicated_execution_session()` bootstrap the real
+    subprocess dispatch will later reuse (crash/rerun "same accepted OID ->
+    reuse as-is", `worktree_bootstrap_exec.recover_or_create_fixed_control_plane_worktree()`'s
+    own documented contract), using the SOURCE tree's own module directly
+    (never a reimplementation), monkeypatched to the SAME local bare origin
+    the fixture's own COPIED `skill_runtime_exec.py` was patched to use.
+    """
+    agent_ops_dir = REPO_ROOT / "scripts" / "agent-ops"
+    if str(agent_ops_dir) not in sys.path:
+        sys.path.insert(0, str(agent_ops_dir))
+    import worktree_bootstrap_exec as source_bootstrap_mod  # noqa: E402
+
+    monkeypatch.setattr(source_bootstrap_mod, "CONTROL_PLANE_CANONICAL_REMOTE_URL", control_plane_remote_url)
+    with source_bootstrap_mod.control_plane_dedicated_execution_session(str(repo_root)) as session:
+        return Path(str(session["execution_root"]))
+
+
+def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path) -> str:
     """Install the production wrapper and its direct consumers.
 
     Only GitHub and the controlled mutation executor are replaced.  The
     registry, policy, privileged executor, production preflight wrapper,
     planner, candidate readiness, review, and edit transaction helper all run
     as their production files in the temporary repository.
+
+    Issue #2393: `contract_update.run.with_anchor`/`.with_human_context` are
+    now in `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`, so this fixture must
+    ALSO provide the same dedicated-worktree bootstrap infrastructure
+    `_install_skill_runtime_exec_fixture()` already provides for the 4
+    preflight profiles (`worktree_bootstrap_exec.py`, the REAL
+    `worktree_catalog.py` -- not a `list_worktrees() -> []` stub -- and a
+    real local `file://` bare remote), and a real, committed, pushed
+    repository state for the dedicated worktree to actually check out from
+    (never the real GitHub remote; `network_required: false` is preserved).
+    Returns the local bare origin's `file://` URL so callers can patch
+    `worktree_bootstrap_exec.CONTROL_PLANE_CANONICAL_REMOTE_URL` for
+    in-process pre-materialization (see `_materialize_dedicated_worktree()`).
     """
     source_root = REPO_ROOT
     for skill in (
@@ -504,6 +565,9 @@ def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path)
         "scripts/agent-guards/skill_runtime_command_policy.py",
         "scripts/agent-guards/controlled_skill_mutation_exec.py",
         "scripts/agent-guards/controlled_skill_mutation_policy.py",
+        "scripts/agent-guards/worktree_bootstrap_command_policy.py",
+        "scripts/agent-ops/worktree_bootstrap_exec.py",
+        "scripts/agent-ops/worktree_catalog.py",
     ):
         src = source_root / rel
         _write_text(repo_root / rel, src.read_text())
@@ -518,7 +582,20 @@ def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path)
         "*_SYSTEM_STANDARD_PATH_DIRS])\n"
     )
     assert default_safe_path_return in executor_source
-    _write_text(executor_path, executor_source.replace(default_safe_path_return, fixture_safe_path_return))
+    executor_source = executor_source.replace(default_safe_path_return, fixture_safe_path_return)
+
+    # Issue #2393: mirrors `_install_skill_runtime_exec_fixture()`'s own
+    # `CONTROL_PLANE_CANONICAL_REMOTE_URL` patch -- the dedicated worktree
+    # bootstrap this fixture now exercises must bind against a local,
+    # deterministic bare remote, never the real `https://github.com/...`
+    # production remote.
+    control_plane_origin_path = repo_root.parent / "control-plane-origin.git"
+    control_plane_remote_url = control_plane_origin_path.as_uri()
+    default_remote_line = 'CONTROL_PLANE_CANONICAL_REMOTE_URL = f"https://github.com/{TRUSTED_REPO_SLUG}.git"'
+    assert default_remote_line in executor_source
+    fixture_remote_line = f"CONTROL_PLANE_CANONICAL_REMOTE_URL = {control_plane_remote_url!r}"
+    executor_source = executor_source.replace(default_remote_line, fixture_remote_line)
+    _write_text(executor_path, executor_source)
 
     controlled_executor_path = repo_root / "scripts" / "agent-guards" / "controlled_skill_mutation_exec.py"
     controlled_executor_source = controlled_executor_path.read_text(encoding="utf-8")
@@ -541,23 +618,6 @@ def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path)
     # unrelated `.venv/` write.
     subprocess.run(["uv", "sync", "--locked"], cwd=str(repo_root), check=True, capture_output=True, text=True)
 
-    _write_text(
-        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
-        """from __future__ import annotations
-
-class Deadline:
-    def subprocess_timeout(self, seconds: float) -> float:
-        return seconds
-
-
-def list_worktrees(project_root: str, deadline=None):
-    return []
-
-
-def select_issue_worktree(catalog, issue_number, root_realpath):
-    return None
-""",
-    )
     # Fixture-only isolated-home read boundary. The production wrapper selects
     # this credentialless adapter before its authenticated transaction phase;
     # it reads only local fake state and never opens GH_CONFIG_DIR.
@@ -714,7 +774,24 @@ subprocess.run = _fake_gh
 subprocess.Popen.__init__ = _fake_popen_init
 """,
     )
-    return
+
+    # Issue #2393: `.venv/` (created by `uv sync --locked` above) must never
+    # be committed -- it is large, non-reproducible, and irrelevant to the
+    # dedicated worktree anyway (a MANAGED uv project's dedicated dispatch
+    # relocates `UV_PROJECT_ENVIRONMENT` outside `execution_root` entirely,
+    # see `dedicated_execution_venv_dir()`). `_make_repo()`'s own
+    # `.gitignore` already covers `.claude/worktrees/`/`artifacts/`/`tmp/`.
+    gitignore_path = repo_root / ".gitignore"
+    gitignore_path.write_text(gitignore_path.read_text(encoding="utf-8") + ".venv/\n", encoding="utf-8")
+
+    # A real, committed, pushed HEAD is required for the dedicated worktree
+    # bootstrap this fixture now exercises (Issue #2393) to check out a real
+    # `accepted_oid` from -- unlike the non-dedicated path, which just reads
+    # whatever is on disk at `repo_root` regardless of commit status.
+    _git("add", "-A", cwd=repo_root)
+    _git("commit", "-q", "-m", "install real contract update fixture", cwd=repo_root)
+    _init_control_plane_origin(repo_root, control_plane_origin_path)
+    return control_plane_remote_url
 
     _write_text(
         repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "command_registry.py",
@@ -1046,7 +1123,7 @@ def test_executor_preflight_run_unaffected_without_anchor(tmp_path: Path) -> Non
     assert payload["anchor_comment_url"] is None
 
 
-def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_path: Path) -> None:
+def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_path: Path, monkeypatch) -> None:
     """#1877 AC3/AC6/AC10: production process path and fake GitHub boundary.
 
     This runs the real registry, policy, privileged executor,
@@ -1058,15 +1135,29 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     controlled mutation executor runs unchanged apart from a fixture-local
     trusted-path extension; no fixture replaces the phase wrapper or changes
     the production executor's trust policy.
+
+    Issue #2393: both `contract_update.run.*` command_ids now dispatch
+    their child under the SAME dedicated worktree the 4 preflight profiles
+    already use, so this test's artifact/workspace paths live under
+    `execution_root`, not `repo`, once the worktree is pre-materialized
+    (`_materialize_dedicated_worktree()`).
     """
     repo = _make_repo(tmp_path)
     trusted_gh_bin = tmp_path / "trusted-gh-bin"
-    _install_real_contract_update_fixture(repo, trusted_gh_bin)
-    # Canonical repositories provision this approved transaction-local
-    # workspace.  Create it before the executor's before-snapshot; the real
-    # consumer removes its candidate/input files before the child returns.
-    (repo / "tmp").mkdir()
-    artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    # Issue #2393 P1-A: deliberately do NOT pre-create `tmp/` here. A
+    # genuinely cold dedicated worktree (as `_materialize_dedicated_worktree`
+    # above just produced) has no `tmp/` directory at all until the
+    # dispatched child's own inner edit-issue transaction creates it -- the
+    # SAME scenario the production `_dispatch_child_and_check_postconditions`
+    # fix now handles by pre-creating `tmp/` itself, before its own
+    # before-snapshot, rather than relying on this test to paper over the
+    # gap. See `test_contract_update_cold_dedicated_worktree_tmp_not_
+    # misdetected_as_unauthorized_write` below for the dedicated regression
+    # coverage; this test's OWN cold-start dispatch below already exercises
+    # the identical code path.
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     isolated_home = tmp_path / "isolated-home"
     isolated_home.mkdir()
@@ -1125,6 +1216,17 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     # contract review detects the deliberately incomplete new AC.  That is a
     # terminal fail-closed result, never a successful implementation route.
     assert first.returncode == 2, first.stderr
+    # Issue #2393 P1-A regression: this dispatch's `execution_root` was a
+    # genuinely COLD dedicated worktree (no `tmp/` pre-seed above) the very
+    # first time it ran a contract_update dispatch, and the transaction
+    # above genuinely wrote+deleted files under a freshly-created `tmp/`.
+    # The outer supervision layer must never misreport that as an
+    # unauthorized write, and the exit code 2 above must be the INNER
+    # child's own "needs_fix" mapping (relayed via the ordinary success
+    # path), never the outer `SKILL_RUNTIME_FAIL` failure line.
+    assert "SKILL_RUNTIME_FAIL" not in first.stderr, first.stderr
+    assert "unauthorized_write_path" not in first.stderr
+    assert first.stdout.strip(), "expected the inner transaction result to be relayed to the caller"
     # The production controlled executor's authenticated effect is verified
     # below through the fixture-local remote state and ordered fake-gh child
     # operations, rather than through a fixture-specific executor receipt.
@@ -1184,8 +1286,8 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     generic_replay_result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     assert generic_replay_result["contract_update"]["status"] == "failed"
     assert generic_replay_result["contract_update"]["writes"] == 0
-    assert not (repo / "artifacts" / "1498" / "issue-metadata").exists() or len(
-        list((repo / "artifacts" / "1498" / "issue-metadata").rglob("*.input.json"))
+    assert not (execution_root / "artifacts" / "1498" / "issue-metadata").exists() or len(
+        list((execution_root / "artifacts" / "1498" / "issue-metadata").rglob("*.input.json"))
     ) == 1
 
 
@@ -1257,6 +1359,7 @@ def test_anchor_profiles_materialize_only_the_explicit_origin_lane(tmp_path: Pat
 
 def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_real_subprocess(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     """AC1/AC6/P0-3: an approved trusted-anchor ANCHOR_SCOPE_REFRAME_V1 scope
     reframe (not yet reflected in the Issue's Allowed Paths section) reaches
@@ -1265,12 +1368,26 @@ def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_rea
     policy -> privileged executor subprocess -> production
     `run_refinement_preflight.py` -> production `scope_signal_delta.py`
     classifier chain, with ZERO writes and ZERO mutation-executor
-    invocations (full-rewrite handoff, not a mutation attempt)."""
+    invocations (full-rewrite handoff, not a mutation attempt).
+
+    Issue #2393 AC5: this legitimate no-write `handoff_required` /
+    `full_rewrite_required` disposition must reach the caller UNCHANGED now
+    that `contract_update.run.with_anchor` dispatches through the dedicated
+    control-plane runtime -- the outer dedicated-runtime supervision layer
+    (`_dispatch_child_and_check_postconditions`'s before/after checks) never
+    overwrites an already-achieved inner-transaction result; it only ever
+    prints a DIFFERENT failure classification to stderr and returns a
+    different process exit code, never touching the artifact this test reads
+    back below.
+    """
     repo = _make_repo(tmp_path)
     trusted_gh_bin = tmp_path / "trusted-gh-bin"
-    _install_real_contract_update_fixture(repo, trusted_gh_bin)
-    (repo / "tmp").mkdir()
-    artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    # Issue #2393 P1-A: no `tmp/` pre-seed -- this dispatch's own cold start
+    # (a freshly-materialized dedicated worktree with no `tmp/` directory at
+    # all yet) is the exact scenario the production fix now handles.
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     isolated_home = tmp_path / "isolated-home"
     isolated_home.mkdir()
@@ -1354,7 +1471,7 @@ def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_rea
     # mutation executor. Its real marker must therefore be absent, and the
     # fixture-owned gh child may not receive a PATCH argv.
     production_marker_path = (
-        repo
+        execution_root
         / "artifacts"
         / "1498"
         / "issue-metadata"
@@ -1391,3 +1508,560 @@ def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_rea
         else []
     )
     assert "issue_content_patch" not in replay_operations
+
+
+# ---------------------------------------------------------------------------
+# Issue #2393 AC4: a relative GH_CONFIG_DIR resolves to the SAME directory
+# after the dedicated-runtime migration as it did before it (both relative
+# and absolute inputs are covered).
+# ---------------------------------------------------------------------------
+
+
+def test_contract_update_relative_gh_config_dir_resolves_against_invocation_cwd(tmp_path: Path, monkeypatch) -> None:
+    """Issue #2393 AC4: a RELATIVE `GH_CONFIG_DIR` value is anchored to the
+    invocation cwd (`project_root` -- the SAME directory `_run_executor()`
+    passes as both `cwd` and `CLAUDE_PROJECT_DIR`) BEFORE the child's own
+    cwd switches to the dedicated worktree, so it resolves to the SAME
+    directory it would have resolved to under the pre-#2393
+    canonical-main-root-only execution. The ABSOLUTE case is already
+    covered by `test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff`
+    above (its `gh_config_dir` fixture value is an absolute `tmp_path` child
+    and is asserted to reach the fake `gh` unchanged); this reuses that SAME
+    real-`gh`-reaching `contract_update.run.with_human_context` trusted-anchor
+    mutation fixture data, only swapping `GH_CONFIG_DIR` for a RELATIVE
+    value. Both `contract_update.run.*` profiles share the SAME
+    `GH_CONFIG_DIR` resolution code path in `skill_runtime_exec.py` (no
+    command-id branching there), so this single profile's coverage proves
+    the shared logic for both -- `contract_update.run.with_anchor` (no
+    human-context binding) never reaches an authenticated write on a first
+    attempt at all (a separate, pre-existing trust-lane restriction, not
+    something this Issue changes), so it is not a suitable fixture for
+    proving a real-`gh`-reaching mutation."""
+    repo = _make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    # Issue #2393 P1-A: no `tmp/` pre-seed -- this dispatch's own cold start
+    # is the exact scenario the production fix now handles.
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    # RELATIVE to `repo` (the invocation cwd) -- never resolved against
+    # `execution_root` (the child's own cwd once dispatched).
+    relative_gh_config_dir = "rel-gh-config"
+    (repo / relative_gh_config_dir).mkdir()
+    expected_absolute_gh_config_dir = str((repo / relative_gh_config_dir).resolve())
+    config_only_env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": relative_gh_config_dir,
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": expected_absolute_gh_config_dir,
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+    }
+    immutable = json.loads(
+        (
+            REPO_ROOT
+            / ".claude/skills/issue-refinement-loop/tests/fixtures/issue_1835_trusted_anchor_iteration_zero.json"
+        ).read_text(encoding="utf-8")
+    )
+    pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    anchor = {
+        "id": 1,
+        "body": "## Revised AC\n- AC2: trusted fixture directive\n",
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
+
+    result = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+        extra_env=config_only_env,
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert "AC2: trusted fixture directive" in json.loads(
+        (artifact_dir / "fake_remote_issue.json").read_text()
+    )["body"]
+    # The fake `gh` (`_write_controlled_gh`) rejects any call whose
+    # `GH_CONFIG_DIR` does not match `SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR`
+    # (exit 66, `missing_or_wrong_config_path`) -- reaching real `gh` reads
+    # AND the successful mutation above proves the RELATIVE value was
+    # correctly resolved to `expected_absolute_gh_config_dir` before the
+    # child's cwd became `execution_root`.
+    operations = [
+        json.loads(line)
+        for line in (artifact_dir / "fake_gh_operations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert operations, result.stdout + result.stderr
+    config_states = [
+        json.loads(line)
+        for line in (artifact_dir / "fake_gh_config_states.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert config_states == ["expected_path"] * len(operations)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2393 P1-A: a cold dedicated worktree's `tmp/` directory must never
+# be misdetected as an unauthorized write, on EITHER a first-ever dispatch
+# against a fixed worktree path, or a dispatch immediately after that fixed
+# path was torn down and recreated at a new `accepted_oid` (the real
+# `recover_or_create_fixed_control_plane_worktree()` "different OID, clean
+# tree -> remove + recreate" transition). `test_contract_update_phase_
+# reaches_fake_transaction_and_fresh_handoff` above already covers the
+# first case (no `tmp/` pre-seed there); this covers the second.
+# ---------------------------------------------------------------------------
+
+
+def test_contract_update_cold_dedicated_worktree_tmp_not_misdetected_after_worktree_recreation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #2393 P1-A regression (case 2, OWNER review recovery scenario
+    "dedicated worktree が再作成された後の初回起動"): re-running a genuine
+    contract-update mutation against a dedicated worktree that was just
+    removed and recreated at a NEW accepted OID must not regress into the
+    cold-start `unauthorized_write_path` misdetection either. "Cold start" is
+    a structural property of a freshly (re)created dedicated worktree having
+    no `tmp/` directory yet -- not a one-time condition that only holds the
+    very first time a test process ever dispatches against the fixed path.
+    """
+    repo = _make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    origin_path = repo.parent / "control-plane-origin.git"
+
+    immutable = json.loads(
+        (
+            REPO_ROOT
+            / ".claude/skills/issue-refinement-loop/tests/fixtures/issue_1835_trusted_anchor_iteration_zero.json"
+        ).read_text(encoding="utf-8")
+    )
+    pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    anchor = {
+        "id": 1,
+        "body": "## Revised AC\n- AC2: trusted fixture directive\n",
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+
+    def _populate_fixture_state() -> Path:
+        execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+        artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "fake_remote_issue.json").write_text(
+            json.dumps(
+                {
+                    "number": 1498,
+                    "title": "fixture",
+                    "body": pre_body,
+                    "labels": [],
+                    "url": "x",
+                    "updatedAt": "2026-08-01T00:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
+        return execution_root
+
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    gh_config_dir = tmp_path / "test-owned-gh-config"
+    gh_config_dir.mkdir()
+    config_only_env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": str(gh_config_dir),
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+    }
+
+    execution_root_first = _populate_fixture_state()
+    first = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+        extra_env=config_only_env,
+    )
+    assert first.returncode == 2, first.stderr
+    assert "SKILL_RUNTIME_FAIL" not in first.stderr, first.stderr
+    assert "unauthorized_write_path" not in first.stderr
+
+    # Force `accepted_oid` to advance: a new commit pushed onto the SAME bare
+    # origin's `main` -- so the next `_materialize_dedicated_worktree()` call
+    # below takes the REAL "different OID, clean tree -> remove + recreate"
+    # transition (`recover_or_create_fixed_control_plane_worktree`), never a
+    # bespoke test-only teardown of the worktree.
+    (repo / "advance.txt").write_text("advance\n")
+    _git("add", "advance.txt", cwd=repo)
+    _git("commit", "-q", "-m", "advance accepted_oid", cwd=repo)
+    _git("push", "-q", str(origin_path), "HEAD:refs/heads/main", cwd=repo)
+
+    execution_root_second = _populate_fixture_state()
+    assert execution_root_second == execution_root_first
+    assert not (execution_root_second / "tmp").exists(), (
+        "expected the recreated dedicated worktree to be genuinely cold (no tmp/) again"
+    )
+
+    second = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+        extra_env=config_only_env,
+    )
+    assert second.returncode == 2, second.stderr
+    assert "SKILL_RUNTIME_FAIL" not in second.stderr, second.stderr
+    assert "unauthorized_write_path" not in second.stderr
+    operations = [
+        json.loads(line)
+        for line in (
+            execution_root_second
+            / ".claude"
+            / "artifacts"
+            / "issue-refinement-loop"
+            / "1498"
+            / "fake_gh_operations.jsonl"
+        )
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert operations.count("issue_content_patch") == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #2393 AC5: an outer dedicated-runtime supervision failure
+# (timeout / unauthorized-write / artifact-projection / primary-checkout
+# drift) must never overwrite or discard an already-achieved
+# inner-transaction result -- these `_emit_*_failure()` helpers only ever
+# print a stderr classification line and return a process exit code; they
+# never touch the filesystem. This is a direct, subprocess-free unit proof
+# of that invariant against THIS repository's own (dedicated-set-widened)
+# `skill_runtime_exec.py`, complementing the real-subprocess
+# `test_contract_update_phase_full_rewrite_required_reaches_next_action_via_real_subprocess`
+# above (which proves the SAME invariant end-to-end for a real
+# `handoff_required`/`full_rewrite_required`/`writes: 0` disposition).
+# ---------------------------------------------------------------------------
+
+_AGENT_GUARDS_DIR_FOR_UNIT_TEST = REPO_ROOT / "scripts" / "agent-guards"
+if str(_AGENT_GUARDS_DIR_FOR_UNIT_TEST) not in sys.path:
+    sys.path.insert(0, str(_AGENT_GUARDS_DIR_FOR_UNIT_TEST))
+import skill_runtime_exec as _exec_mod_for_unit_test  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "emit_call",
+    [
+        lambda: _exec_mod_for_unit_test._emit_timeout_failure(1498, 120),
+        lambda: _exec_mod_for_unit_test._emit_primary_checkout_drift_failure(1498),
+        lambda: _exec_mod_for_unit_test._emit_unauthorized_write_failure(1498, "some/unexpected/path"),
+        lambda: _exec_mod_for_unit_test._emit_artifact_projection_failure(1498, ["some/stale/path"]),
+    ],
+    ids=["timeout", "primary_checkout_drift", "unauthorized_write", "artifact_projection"],
+)
+def test_outer_failure_emitters_never_touch_an_already_achieved_inner_result(
+    tmp_path: Path, capsys, emit_call
+) -> None:
+    """Issue #2393 AC5: simulates an already-achieved inner-transaction
+    artifact (a real `contract_update` disposition -- `disposition: patch` +
+    `final_readback: verified` + `fresh_review: needs_fix`, mirroring the
+    real fixture above) sitting on disk, then calls each outer-supervision
+    failure emitter and proves: (1) the artifact's bytes are byte-for-byte
+    unchanged, (2) the emitter's own return value is the fail-closed exit
+    code `2`, and (3) nothing is written to stdout (only stderr) -- an
+    outer failure is reported as a DIFFERENT signal, never as a silent
+    overwrite of the inner disposition."""
+    artifact_path = tmp_path / "refinement_preflight_result_v1.json"
+    inner_result = {
+        "contract_update": {
+            "status": "failed",
+            "disposition": "patch",
+            "writes": 1,
+            "iterations": 0,
+            "final_readback": "verified",
+            "fresh_preflight": "pass",
+            "fresh_review": "needs_fix",
+            "fresh_readiness": "go",
+        }
+    }
+    before_bytes = json.dumps(inner_result).encode("utf-8")
+    artifact_path.write_bytes(before_bytes)
+
+    exit_code = emit_call()
+
+    assert exit_code == 2
+    assert artifact_path.read_bytes() == before_bytes
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "SKILL_RUNTIME_FAIL:" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Issue #2393 P1-B: the emitter-only proof above shows `_emit_*_failure()`
+# never CORRUPTS an unrelated file it is handed directly. It does not prove
+# that a caller of the REAL dispatcher (`_dispatch_child_and_check_
+# postconditions()`) can actually RECOVER an already-achieved inner
+# transaction result after a genuine outer-layer failure on a real
+# subprocess span. These two tests drive the actual dispatcher end to end,
+# reusing the SAME real contract-update fixture (fake `gh` + isolated Git +
+# dedicated worktree) as the tests above.
+# ---------------------------------------------------------------------------
+
+
+def test_contract_update_outer_unauthorized_write_failure_preserves_inner_transaction_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #2393 P1-B (timeout/unauthorized-write/artifact-projection
+    sub-classification: unauthorized-write): forces a REAL outer-layer
+    `unauthorized_write_path` failure to occur AFTER the inner GitHub
+    mutation (PATCH) and readback have already genuinely succeeded (via the
+    fake `gh` executable injecting a stray write outside every allowed root,
+    immediately after applying the real patch), and proves the caller can
+    still recover the achieved inner disposition."""
+    repo = _make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    gh_config_dir = tmp_path / "test-owned-gh-config"
+    gh_config_dir.mkdir()
+    config_only_env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": str(gh_config_dir),
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+        # Deterministically injects a stray write OUTSIDE every allowed root
+        # immediately after the fake `gh`'s real PATCH lands (see
+        # `_write_controlled_gh` above) -- a controlled, real synchronization
+        # primitive already wired through `_sanitize_env()`'s
+        # `SKILL_RUNTIME_TEST_` passthrough, not a fixed `sleep`/race.
+        "SKILL_RUNTIME_TEST_INJECT_STRAY_WRITE_AFTER_PATCH": "unexpected_stray_file.txt",
+    }
+    immutable = json.loads(
+        (
+            REPO_ROOT
+            / ".claude/skills/issue-refinement-loop/tests/fixtures/issue_1835_trusted_anchor_iteration_zero.json"
+        ).read_text(encoding="utf-8")
+    )
+    pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    anchor = {
+        "id": 1,
+        "body": "## Revised AC\n- AC2: trusted fixture directive\n",
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
+
+    result = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+        extra_env=config_only_env,
+    )
+
+    # The OUTER dispatch fails closed -- this is a DIFFERENT signal from the
+    # inner child's own exit code, never a silent pass-through.
+    assert "SKILL_RUNTIME_FAIL:" in result.stderr, result.stdout + result.stderr
+    assert "reason_code=unauthorized_write_path" in result.stderr
+    assert "unexpected_stray_file.txt" in result.stderr
+    # The un-verified inner NEXT_ACTION/stdout is never surfaced as a
+    # success by the outer layer -- an outer failure returns BEFORE ever
+    # relaying the child's own stdout.
+    assert result.stdout == ""
+
+    # The inner transaction's result is NOT lost: the caller can recover it
+    # via the `inner_transaction_result_ref=`/`inner_transaction_disposition=`
+    # fields in stderr, AND by directly reading the still-present provenance
+    # artifact under the allowed artifact root.
+    assert "inner_transaction_disposition=patch" in result.stderr, result.stderr
+    ref_match = re.search(r"inner_transaction_result_ref=(\S+)", result.stderr)
+    assert ref_match is not None, result.stderr
+    result_artifact_path = Path(ref_match.group(1))
+    assert result_artifact_path.is_file()
+    on_disk_result = json.loads(result_artifact_path.read_text(encoding="utf-8"))
+    assert on_disk_result["contract_update"]["disposition"] == "patch"
+    assert on_disk_result["contract_update"]["writes"] == 1
+    assert on_disk_result["contract_update"]["final_readback"] == "verified"
+
+    # Exactly one PATCH reached the fake GitHub executable -- the outer
+    # failure must never trigger (nor be caused by) a second mutation
+    # attempt against the SAME dispatch.
+    operations = [
+        json.loads(line)
+        for line in (artifact_dir / "fake_gh_operations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert operations.count("issue_content_patch") == 1
+
+
+def test_contract_update_outer_timeout_during_patch_reports_unknown_inner_state_not_false_unmutated(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #2393 P1-B (timeout/unauthorized-write/artifact-projection
+    sub-classification: timeout): forces a REAL outer-layer timeout DURING
+    the inner GitHub mutation attempt (PATCH), before readback -- mutation
+    success genuinely cannot be confirmed. Asserts the outer failure reports
+    the explicit `inner_transaction_state=unknown` marker, never a false
+    "unmutated"/"no-op" claim, and that no PATCH is observed to have
+    completed (and no second PATCH is ever attempted by this dispatch)."""
+    repo = _make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+
+    # Shrink ONLY `contract_update.run.with_human_context`'s registry
+    # `timeout_seconds` (120 -> 2) so the outer supervisor's real execution
+    # deadline elapses in a couple of seconds instead of two minutes, without
+    # touching any other profile's timeout.
+    registry_path = repo / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "command_registry.py"
+    registry_source = registry_path.read_text(encoding="utf-8")
+    human_context_marker = '"id": "contract_update.run.with_human_context",'
+    marker_index = registry_source.index(human_context_marker)
+    timeout_marker = '"timeout_seconds": 120,'
+    timeout_index = registry_source.index(timeout_marker, marker_index)
+    registry_tail = registry_source[timeout_index + len(timeout_marker) :]
+    registry_source = registry_source[:timeout_index] + '"timeout_seconds": 2,' + registry_tail
+    registry_path.write_text(registry_source, encoding="utf-8")
+
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result_artifact_path = artifact_dir / "refinement_preflight_result_v1.json"
+    assert not result_artifact_path.exists()
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    gh_config_dir = tmp_path / "test-owned-gh-config"
+    gh_config_dir.mkdir()
+    config_only_env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": str(gh_config_dir),
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+        # Deterministically hangs the fake `gh`'s PATCH call itself for
+        # longer than the shrunk 2-second registry timeout above -- the
+        # outer supervisor's own timeout (not a test-side sleep/race) is
+        # what actually bounds this test's wall-clock time.
+        "SKILL_RUNTIME_TEST_HANG_DURING_PATCH_SECONDS": "30",
+    }
+    immutable = json.loads(
+        (
+            REPO_ROOT
+            / ".claude/skills/issue-refinement-loop/tests/fixtures/issue_1835_trusted_anchor_iteration_zero.json"
+        ).read_text(encoding="utf-8")
+    )
+    pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    anchor = {
+        "id": 1,
+        "body": "## Revised AC\n- AC2: trusted fixture directive\n",
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
+
+    result = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+        extra_env=config_only_env,
+    )
+
+    assert "SKILL_RUNTIME_FAIL:" in result.stderr, result.stdout + result.stderr
+    assert "reason_code=child_process_timeout" in result.stderr
+    # Mutation success genuinely cannot be confirmed here -- the explicit
+    # `unknown` marker is required, never a false "unmutated"/"no-op" claim
+    # and never a fabricated disposition.
+    assert "inner_transaction_state=unknown" in result.stderr, result.stderr
+    assert "inner_transaction_disposition=" not in result.stderr
+    assert result.stdout == ""
+    # No result artifact was ever written (the child was killed mid-PATCH,
+    # long before `_write_artifacts()`/`write_provenance_artifact()` run).
+    assert not result_artifact_path.exists()
+    operations_path = artifact_dir / "fake_gh_operations.jsonl"
+    operations = (
+        [json.loads(line) for line in operations_path.read_text(encoding="utf-8").splitlines()]
+        if operations_path.exists()
+        else []
+    )
+    # The PATCH attempt itself never completed (killed mid-sleep, before its
+    # own operation-label append) -- and no second PATCH was ever attempted.
+    assert operations.count("issue_content_patch") == 0

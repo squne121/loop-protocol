@@ -158,6 +158,15 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
             ],
             "network_effect": "github_read_only",
         },
+        # Issue #2393: both `contract_update.run.*` profiles always carry
+        # `mutation: True` in their `command_registry.py` entry (they write
+        # to GitHub via `--consume-contract-patch-plan`) -- `network_effect`
+        # is corrected from the pre-existing, factually-wrong
+        # `github_read_only` to `github_mutation` in the same change that
+        # migrates their child dispatch to the dedicated control-plane
+        # runtime. `validate_registry_entry()` below cross-checks this
+        # value against `command_registry.py`'s own declaration, so both
+        # must change together.
         "contract_update.run.with_anchor": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR,
             "required_cwd": "canonical_main_root",
@@ -166,7 +175,7 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
                 ".claude/artifacts/issue-refinement-loop/{active_issue}/",
                 "artifacts/{active_issue}/issue-metadata/",
             ],
-            "network_effect": "github_read_only",
+            "network_effect": "github_mutation",
         },
         "contract_update.run.with_human_context": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR,
@@ -176,7 +185,7 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
                 ".claude/artifacts/issue-refinement-loop/{active_issue}/",
                 "artifacts/{active_issue}/issue-metadata/",
             ],
-            "network_effect": "github_read_only",
+            "network_effect": "github_mutation",
         },
         # #2086 AC10 (iteration 2): registers the router role of the
         # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 chain (command_registry.py
@@ -327,11 +336,17 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
             ".claude/artifacts/issue-refinement-loop/{active_issue}/",
         ],
     },
+    # Issue #2393: `network_effect` corrected to `github_mutation` (mirrors
+    # `eligible_command_ids` above); both remain root-no-worktree-eligible
+    # (`command_allows_root_no_worktree()` checks every key here against
+    # `eligible_command_ids`, so this invariant table must change in
+    # lock-step or the two profiles would silently lose their existing
+    # root-no-worktree eligibility).
     "contract_update.run.with_anchor": {
         "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR,
         "required_cwd": "canonical_main_root",
         "required_branch": "default_branch",
-        "network_effect": "github_read_only",
+        "network_effect": "github_mutation",
         "allowed_write_roots": [
             ".claude/artifacts/issue-refinement-loop/{active_issue}/",
             "artifacts/{active_issue}/issue-metadata/",
@@ -341,7 +356,7 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
         "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_CONTRACT_UPDATE_ANCHOR,
         "required_cwd": "canonical_main_root",
         "required_branch": "default_branch",
-        "network_effect": "github_read_only",
+        "network_effect": "github_mutation",
         "allowed_write_roots": [
             ".claude/artifacts/issue-refinement-loop/{active_issue}/",
             "artifacts/{active_issue}/issue-metadata/",
