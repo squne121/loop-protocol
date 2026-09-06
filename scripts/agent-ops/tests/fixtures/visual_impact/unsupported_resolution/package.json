@@ -1,0 +1,6 @@
+{
+  "name": "resolve-visual-impact-unsupported-resolution-fixture",
+  "private": true,
+  "type": "module",
+  "exports": "./entry.ts"
+}

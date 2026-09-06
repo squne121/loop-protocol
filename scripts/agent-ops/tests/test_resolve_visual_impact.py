@@ -437,6 +437,150 @@ def test_pr2045_p0_1_pipefail_negative_integration(tmp_path):
     )
 
 
+def _p2_contracts(spec: str, baseline: str) -> dict:
+    return {
+        "runner": "vitest-browser-mode",
+        "spec": spec,
+        "baseline": baseline,
+        "job": "component-vrt-report",
+        "update_command_id": "vitest_component_vrt_update",
+        "verify_command_id": "vitest_component_vrt_verify",
+        "maturity": "provisional",
+    }
+
+
+def test_p2_e2e_verified_unchanged_vrt_evidence_success_path_real_subprocess(tmp_path):
+    """Issue #2525 P2 fix_delta (OWNER REQUEST_CHANGES on PR #2548,
+    2026-09-06): proves the ORDINARY (non-waiver) `verified_unchanged` +
+    VRT-evidence success path end to end -- config files unchanged, only a
+    dependency reachable exclusively through the fixture's unsupported
+    `@app/*` tsconfig path alias changes -- through the REAL
+    resolve_visual_impact.mjs subprocess and resolve_visual_impact.py's
+    resolve() + evaluate_pr_policy(). AC3's existing coverage in
+    test_resolve_visual_impact_fallback_policy.py only proves the
+    all-surfaces-WAIVER success path with a mocked run_mjs; this proves the
+    real verified_unchanged + evidence-manifest binding path with a real
+    Node subprocess boundary, plus the missing-evidence and
+    mismatched-evidence failure directions from the same scenario."""
+    fixture_dir = (
+        REPO_ROOT / "scripts" / "agent-ops" / "tests" / "fixtures" / "visual_impact" / "unsupported_resolution"
+    )
+
+    registry_doc = {
+        "schema_version": 1,
+        "global_invalidators": [],
+        "coverage_roots": ["*.ts"],
+        "surfaces": {
+            "fixture-surface-a": {
+                "producers": {"modules": ["entry.ts"], "styles": [], "assets": [], "config": []},
+                "contracts": _p2_contracts("fixture-a.vrt.test.ts", "fixture-a-baseline.png"),
+                "policy": {"disposition_required": True},
+            },
+            "fixture-surface-b": {
+                "producers": {"modules": ["entry.ts"], "styles": [], "assets": [], "config": []},
+                "contracts": _p2_contracts("fixture-b.vrt.test.ts", "fixture-b-baseline.png"),
+                "policy": {"disposition_required": True},
+            },
+        },
+    }
+    registry_path = tmp_path / "registry.yml"
+    registry_path.write_text(yaml.safe_dump(registry_doc), encoding="utf-8")
+
+    result = rvi.resolve(
+        changed_paths=["dependency.ts"],
+        registry_path=registry_path,
+        schema_path=SCHEMA_PATH,
+        mjs_path=MJS_PATH,
+        repo_root=fixture_dir,
+    )
+    assert not result.errors, result.errors
+    assert result.resolver_fallback_active is True
+    affected = {e["surface_id"] for e in result.affected_surfaces}
+    assert affected == {"fixture-surface-a", "fixture-surface-b"}
+
+    head_sha = "a" * 40
+    declaration_doc = {
+        "surfaces": [
+            {"surface_id": "fixture-surface-a", "disposition": "verified_unchanged"},
+            {"surface_id": "fixture-surface-b", "disposition": "verified_unchanged"},
+        ]
+    }
+
+    def _record(surface_id: str, *, mismatched_pixels: int = 0, verify_succeeded: bool = True) -> dict:
+        surface_def = registry_doc["surfaces"][surface_id]
+        return rvi.build_evidence_manifest_v2_record(
+            surface_id=surface_id,
+            contract_digest=rvi.compute_contract_digest(surface_def),
+            head_sha=head_sha,
+            workflow_run_id=1,
+            check_run_id=None,
+            check_suite_id=None,
+            github_app_id=None,
+            github_app_slug=None,
+            check_conclusion=None,
+            baseline_path=surface_def["contracts"]["baseline"],
+            baseline_sha256="b" * 64,
+            actual_sha256="b" * 64,
+            mismatched_pixels=mismatched_pixels,
+            verify_command_id="vitest_component_vrt_verify",
+            verify_succeeded=verify_succeeded,
+            update_command_id="vitest_component_vrt_update",
+            update_executed=False,
+            update_succeeded=False,
+            expected_artifact_id="expected-1",
+            actual_artifact_id="actual-1",
+            diff_artifact_id="diff-1",
+        )
+
+    full_manifest = {
+        "schema": rvi.EVIDENCE_MANIFEST_V2_SCHEMA,
+        "surfaces": [_record("fixture-surface-a"), _record("fixture-surface-b")],
+    }
+
+    def _evaluate(evidence_manifest: dict) -> dict:
+        return rvi.evaluate_pr_policy(
+            resolve_result=result,
+            declaration_doc=declaration_doc,
+            registry_doc=registry_doc,
+            evidence_manifest=evidence_manifest,
+            head_sha=head_sha,
+            changed_paths=["dependency.ts"],
+            actor="squne121",
+            authorized_owners=set(),
+            today=date(2026, 9, 6),
+            trusted_check_run_id="run-1",
+            trusted_check_suite_id="suite-1",
+            trusted_github_app_id="app-1",
+            trusted_github_app_slug="github-actions",
+            trusted_check_conclusion="success",
+        )
+
+    # Ordinary success path: both surfaces have a full, matching evidence
+    # manifest record.
+    policy_result = _evaluate(full_manifest)
+    assert policy_result["ok"] is True, policy_result["failures"]
+    assert len(policy_result["surface_results"]) == 2
+    assert all(entry["ok"] for entry in policy_result["surface_results"])
+
+    # Omitting the required evidence for just fixture-surface-b -> ok False.
+    manifest_missing_b = {"schema": rvi.EVIDENCE_MANIFEST_V2_SCHEMA, "surfaces": [full_manifest["surfaces"][0]]}
+    result_missing = _evaluate(manifest_missing_b)
+    assert result_missing["ok"] is False
+    assert any("fixture-surface-b" in f for f in result_missing["failures"])
+
+    # A VRT evidence mismatch for fixture-surface-b -> ok False.
+    manifest_mismatch = {
+        "schema": rvi.EVIDENCE_MANIFEST_V2_SCHEMA,
+        "surfaces": [
+            full_manifest["surfaces"][0],
+            _record("fixture-surface-b", mismatched_pixels=42, verify_succeeded=False),
+        ],
+    }
+    result_mismatch = _evaluate(manifest_mismatch)
+    assert result_mismatch["ok"] is False
+    assert any("fixture-surface-b" in f for f in result_mismatch["failures"])
+
+
 def test_command_id_map_resolves_known_ids_only():
     """GIVEN COMMAND_ID_MAP WHEN inspected THEN it only contains the closed
     enum values declared in docs/dev/visual-surfaces.schema.json (no raw
