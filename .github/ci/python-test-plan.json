@@ -74,7 +74,8 @@
     "tests/session-recording/test_fixed_location_cutover.py::test_digest_update_regeneration_order",
     "tests/session-recording/test_fixed_location_cutover.py::test_cross_language_override_resolution_parity",
     "tests/session-recording/test_fixed_location_cutover.py::test_readiness_producer_parent_dir_toctou_hardening",
-    "tests/session-recording/test_fixed_location_cutover.py::test_hermetic_default_path_producer_consumer_roundtrip"
+    "tests/session-recording/test_fixed_location_cutover.py::test_hermetic_default_path_producer_consumer_roundtrip",
+    "tests/session-recording/test_fixed_location_cutover.py::test_js_prepare_private_parent_dir_rejects_fifo_parent_without_blocking"
   ],
   "xdist": {
     "workers": 4,
