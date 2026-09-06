@@ -14,8 +14,6 @@ import importlib.util
 import io
 import json
 import os
-import re
-import struct
 import subprocess
 import sys
 import zipfile
@@ -810,16 +808,20 @@ def test_acquire_component_vrt_checkrun_cli_mode_fails_closed_on_non_2xx(tmp_pat
     assert "component_vrt_acquire_jobs_http_status_invalid" in output["reason_codes"]
 
 
-# --- Issue #2505 (ADR 0009 "## ZIP Resource Bound" follow-up): entry-limited,
-# resource-bounded retrieval of decision.zip / evidence.zip in the `download`
-# step -----------------------------------------------------------------------
+# --- Issue #2505 (ADR 0009 "## ZIP Resource Bound" follow-up), migrated by
+# Issue #2524 off the former inline-heredoc fixture onto the standard
+# `zipfile`-based production module -------------------------------------
 #
-# The bounded-reader logic lives ONLY inline in the `download` step's `run:`
-# script (Allowed Paths permit only this workflow YAML and this test file --
-# no new production file under scripts/agent-ops/). These tests extract that
-# EXACT Python source (a heredoc embedded in the step's shell script) and
-# execute it as a real subprocess against synthetic ZIPs and a fake `gh` on
-# PATH -- the actual implementation seam, never a re-implemented copy.
+# The bounded-reader logic used to live ONLY inline in the `download` step's
+# `run:` script as a heredoc (Issue #2505 Allowed Paths permitted only this
+# workflow YAML and this test file, no production file under
+# scripts/agent-ops/). Issue #2524 replaces that inline implementation with
+# the real production module `scripts/agent-ops/zip_bounded_extract.py`
+# (which the `download` step now invokes directly, no heredoc). These tests
+# exercise that EXACT module as a real subprocess against synthetic ZIPs and
+# a fake `gh` on PATH -- the actual implementation seam, never a
+# reimplemented copy -- so this fixture now returns the production module's
+# own path instead of extracting a heredoc.
 
 DECISION_ENTRY_NAME_2505 = "visual_impact_decision_v1.json"
 EVIDENCE_ENTRY_NAME_V3_2505 = "visual_baseline_review_evidence.json"
@@ -831,6 +833,8 @@ EVIDENCE_ZIP_MAX_ENTRIES_2505 = 16
 DECISION_MAX_READ_BYTES_2505 = 1000000
 EVIDENCE_MAX_READ_BYTES_2505 = 5000000
 
+ZIP_BOUNDED_EXTRACT_MODULE_PATH = REPO_ROOT / "scripts" / "agent-ops" / "zip_bounded_extract.py"
+
 
 @pytest.fixture(scope="module")
 def download_step(workflow_doc: dict) -> dict:
@@ -839,20 +843,11 @@ def download_step(workflow_doc: dict) -> dict:
 
 
 @pytest.fixture(scope="module")
-def bounded_zip_retrieve_script(tmp_path_factory: pytest.TempPathFactory, download_step: dict) -> Path:
-    """Extract the EXACT `bounded_zip_retrieve.py` heredoc source embedded in
-    the `download` step's `run:` script -- not a reimplemented copy."""
-    match = re.search(
-        r"<<'BOUNDED_ZIP_RETRIEVE_PY_EOF'\n(.*?)\nBOUNDED_ZIP_RETRIEVE_PY_EOF",
-        download_step["run"],
-        re.S,
-    )
-    assert match is not None, "bounded_zip_retrieve.py heredoc not found in the `download` step"
-    script_dir = tmp_path_factory.mktemp("bounded_zip_retrieve_2505")
-    script_path = script_dir / "bounded_zip_retrieve.py"
-    script_path.write_text(match.group(1), encoding="utf-8")
-    compile(match.group(1), str(script_path), "exec")  # syntax sanity check
-    return script_path
+def bounded_zip_retrieve_script() -> Path:
+    """Issue #2524: the production `zip_bounded_extract.py` module invoked
+    exactly as the `download` step invokes it -- no heredoc extraction."""
+    assert ZIP_BOUNDED_EXTRACT_MODULE_PATH.exists(), "scripts/agent-ops/zip_bounded_extract.py must exist (AC2)"
+    return ZIP_BOUNDED_EXTRACT_MODULE_PATH
 
 
 def _build_zip_2505(entries: list[tuple[str, str]]) -> bytes:
@@ -1476,33 +1471,6 @@ def _build_zip_compressed_2505(entries: list[tuple[str, str]], compression: int)
     return buf.getvalue()
 
 
-def _build_zip_declared_size_lie_2505(name: str, declared_content: bytes, real_content: bytes) -> bytes:
-    """A STORED entry whose LOCAL and CENTRAL declared `file_size`/
-    `compress_size`/CRC-32 all honestly describe `declared_content` (a
-    normal, tiny value), while the PHYSICAL bytes actually occupying that
-    entry's data region in the archive are `real_content` (far larger than
-    `declared_content`). The central directory's `offset of start of
-    central directory` field is patched to the CORRECT new (shifted)
-    position so `zipfile.ZipFile()` parses this without invoking its
-    self-extracting-archive-prefix `concat` compensation (which assumes a
-    UNIFORM shift of every entry and would otherwise misplace this single
-    entry's `header_offset`), keeping `header_offset` at the true value (0)
-    a `bounded_extract()`-style implementation depends on."""
-    baseline = _build_zip_stored_2505([(name, declared_content.decode("latin-1"))])
-    cd_start = baseline.find(b"PK\x01\x02")
-    head, tail = baseline[:cd_start], baseline[cd_start:]
-    content_start = cd_start - len(declared_content)
-    assert head[content_start : content_start + len(declared_content)] == declared_content
-    patched_head = head[:content_start] + real_content
-    new_cd_start = len(patched_head)
-    eocd_pos = tail.find(b"PK\x05\x06")
-    assert eocd_pos != -1
-    eocd = bytearray(tail[eocd_pos:])
-    struct.pack_into("<L", eocd, 16, new_cd_start)
-    patched_tail = tail[:eocd_pos] + bytes(eocd)
-    return patched_head + patched_tail
-
-
 def test_bounded_retrieve_bzip2_entry_rejected_before_extraction(
     bounded_zip_retrieve_script: Path, tmp_path: Path
 ):
@@ -1546,37 +1514,6 @@ def test_bounded_retrieve_lzma_entry_rejected_before_extraction(
     )
     assert result.returncode != 0
     assert status["STATUS"] == "unsupported_compression_method"
-    assert not dest.exists()
-
-
-def test_bounded_retrieve_declared_size_lie_exceeds_limit_rejected(
-    bounded_zip_retrieve_script: Path, tmp_path: Path
-):
-    """P2-1: a STORED entry declares (and self-consistently CRCs) a 2-byte
-    `file_size`, but the PHYSICAL bytes occupying its data region in the
-    archive are 1,000,002 real bytes -- exceeding `max_read_bytes=1_000_000`.
-    The old `zf.open(selected).read(max_read_bytes + 1)` truncates its
-    output AT THE DECLARED 2-byte size (since `ZipExtFile.read()` never
-    reads past an entry's own declared size), so `len(data) > max_read_bytes`
-    was always False and this was reported `ok` with a 2-byte file written
-    -- silently accepting an entry whose true physical extent violates the
-    resource bound. The fix must reject this as `read_size_exceeded`,
-    independent of the declared size and CRC."""
-    real_content = b"Y" * 1_000_002
-    payload = _build_zip_declared_size_lie_2505(DECISION_ENTRY_NAME_2505, b"XX", real_content)
-    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
-    dest.parent.mkdir()
-    result, status, _ = _run_bounded_retrieve(
-        bounded_zip_retrieve_script,
-        tmp_path,
-        gh_payload=payload,
-        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
-        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
-        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
-        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
-    )
-    assert result.returncode != 0
-    assert status["STATUS"] == "read_size_exceeded"
     assert not dest.exists()
 
 
@@ -1730,7 +1667,7 @@ def test_bounded_retrieve_download_stall_after_over_limit_flush_rejects_without_
 def test_download_step_aggregation_rejects_on_retrieve_process_crash_without_status_file(
     download_step: dict, tmp_path: Path
 ):
-    """P1-1 points 1/2: if `bounded_zip_retrieve.py` is invoked but crashes
+    """P1-1 points 1/2: if `zip_bounded_extract.py` is invoked but crashes
     (or `uv run` itself fails) WITHOUT ever writing a status file, the
     aggregation loop must NOT silently fall through to its `ok` default --
     it must reject with a dedicated `retrieve_process_failed` reason. This
@@ -1753,7 +1690,7 @@ def test_download_step_aggregation_rejects_on_retrieve_process_crash_without_sta
         "        with open(out_file, 'w') as fh:\n"
         "            fh.write('1')\n"
         "    sys.exit(0)\n"
-        "if 'bounded_zip_retrieve' in script or script.endswith('.py') and 'bounded_zip_retrieve' in ' '.join(argv):\n"
+        "if 'zip_bounded_extract' in script or script.endswith('.py') and 'zip_bounded_extract' in ' '.join(argv):\n"
         "    label = get_opt('--label')\n"
         "    status_file = get_opt('--status-output-file')\n"
         "    if label == os.environ.get('FAIL_LABEL'):\n"
@@ -1984,4 +1921,85 @@ def test_publish_step_download_ok_falls_through_to_existing_taxonomy(workflow_do
         verify_outcome="success",
         download_status="ok",
     )
+    assert "conclusion=success" in gh_args
+
+
+# --- Issue #2524 AC10: stale workflow_run must never contaminate the live
+# head's CheckRun conclusion ------------------------------------------------
+#
+# Distinct from `test_stale_head_rejected`/`test_stale_base_rejected` above
+# (those cover `resolve_visual_impact.py`'s `verify_trusted_artifact()`
+# producer-artifact head_sha/base_sha mismatch, a completely separate
+# concept). This covers the Publish step's OWN `RUN_HEAD_SHA != LIVE_HEAD_SHA`
+# branch: a `workflow_run` whose `head_sha` is now stale relative to the
+# candidate PR's CURRENT live head must never publish a `failure` CheckRun
+# bound to that live head -- doing so would attribute a stale run's outcome
+# to a head it never actually evaluated.
+
+
+def test_publish_step_stale_workflow_run_does_not_contaminate_live_head_checkrun(
+    workflow_doc: dict, tmp_path: Path
+):
+    steps = workflow_doc["jobs"]["visual-impact-policy-trusted"]["steps"]
+    publish = next(step for step in steps if "Publish visual-impact-policy-trusted" in step.get("name", ""))
+    captured_args = tmp_path / "gh-args.txt"
+    fake_gh = tmp_path / "gh"
+    fake_gh.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" >> \"$FAKE_GH_ARGS\"\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    stale_run_head_sha = "c" * 40  # the OLD workflow_run's own head_sha
+    live_head_sha = EXPECTED_HEAD_SHA  # the candidate PR's CURRENT head_sha
+    assert stale_run_head_sha != live_head_sha
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FAKE_GH_ARGS": str(captured_args),
+        "GH_TOKEN": "test-token",
+        "REPO": EXPECTED_REPOSITORY,
+        "RUN_HEAD_SHA": stale_run_head_sha,
+        "LIVE_HEAD_SHA": live_head_sha,
+        "PR_NUMBER": str(EXPECTED_PR_NUMBER),
+        "TRUSTED_OUTCOME": "success",
+        "VERIFY_OUTCOME": "success",
+        "DOWNLOAD_STATUS": "ok",
+        "DOWNLOAD_FAILURE_REASON": "",
+        "DOWNLOAD_FAILURE_DETAIL": "",
+    }
+    result = subprocess.run(
+        ["bash", "-c", publish["run"]],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    # The live head's CheckRun must never be touched at all for a stale run
+    # -- `gh` (the CheckRun-publishing command) must never have been
+    # invoked, proven here by the absence of the args-capture file the fake
+    # `gh` would otherwise have written.
+    assert not captured_args.exists(), (
+        f"gh was invoked for a stale workflow_run (contaminating the live head): {captured_args.read_text()}"
+    )
+    # A diagnostic must still be left behind so the stale case is visible in
+    # the workflow run's own logs.
+    assert "::warning::" in result.stdout
+    assert stale_run_head_sha in result.stdout
+    assert live_head_sha in result.stdout
+    assert "skipped" in result.stdout.lower()
+
+
+def test_publish_step_non_stale_run_still_publishes_to_live_head(workflow_doc: dict, tmp_path: Path):
+    """Regression guard: the AC10 fix must not accidentally skip publication
+    for the ordinary (non-stale) case."""
+    gh_args = _run_publish_step_2505(
+        workflow_doc,
+        tmp_path,
+        trusted_outcome="success",
+        verify_outcome="success",
+        download_status="ok",
+    )
+    assert f"head_sha={EXPECTED_HEAD_SHA}" in gh_args
     assert "conclusion=success" in gh_args

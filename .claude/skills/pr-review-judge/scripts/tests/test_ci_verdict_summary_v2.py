@@ -330,6 +330,127 @@ class TestAC11HeadShaNullSkipped:
 
 
 # ---------------------------------------------------------------------------
+# Issue #2524 AC7/AC8/AC9: visual-impact-policy-trusted-consumer excluded
+# classification -- never blocks merge-ready regardless of conclusion, and
+# never weakens the SEPARATE producer ("ci", "visual-impact-policy")
+# required classification.
+# ---------------------------------------------------------------------------
+
+TRUSTED_CONSUMER_WORKFLOW = "visual-impact-policy-trusted-consumer"
+TRUSTED_CONSUMER_CHECK_NAME = "visual-impact-policy-trusted"
+
+
+def _all_other_required_checks_passing() -> list[dict]:
+    """One passing CheckRun for every entry in REQUIRED_CHECKS -- the
+    baseline "everything else is green" fixture the trusted-consumer
+    conclusion is varied against."""
+    import importlib.util as _ilu
+
+    spec = _ilu.spec_from_file_location("ci_verdict_summary_v2", _SCRIPT)
+    v2 = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(v2)
+    return [make_check(name, workflow=workflow) for (workflow, name) in sorted(v2.REQUIRED_CHECKS)]
+
+
+class TestTrustedConsumerExcludedClassification:
+    """AC7: (workflow, check-name) tuple registered as excluded.
+    AC8: failure/neutral/skipped/cancelled/unavailable/not-run on the
+    trusted-consumer CheckRun never blocks merge-ready when every other
+    required check passes.
+    AC9: producer ("ci", "visual-impact-policy") required classification
+    is unchanged.
+    """
+
+    def test_classification_map_registers_excluded(self, v2):
+        assert v2.CLASSIFICATION_MAP[(TRUSTED_CONSUMER_WORKFLOW, TRUSTED_CONSUMER_CHECK_NAME)] == "excluded"
+
+    def test_producer_classification_still_required(self, v2):
+        assert v2.CLASSIFICATION_MAP[("ci", "visual-impact-policy")] == "required"
+
+    @pytest.mark.parametrize("conclusion", ["failure", "neutral", "skipped", "cancelled"])
+    def test_terminal_conclusions_do_not_block_merge_ready(self, v2, conclusion):
+        checks = _all_other_required_checks_passing()
+        checks.append(
+            make_check(
+                TRUSTED_CONSUMER_CHECK_NAME,
+                workflow=TRUSTED_CONSUMER_WORKFLOW,
+                status="completed",
+                conclusion=conclusion,
+            )
+        )
+        artifact = build(v2, checks)
+        trusted_entry = next(
+            c for c in artifact["checks"] if c["name"] == TRUSTED_CONSUMER_CHECK_NAME
+        )
+        assert trusted_entry["classification"] == "excluded"
+        assert trusted_entry["blocking_merge_ready"] is False
+        assert artifact["overall_status"] == "merge_ready", artifact
+
+    def test_unavailable_check_run_absent_entirely_does_not_block(self, v2):
+        """"unavailable": the trusted-consumer CheckRun never appears in the
+        checks payload at all (e.g. GitHub never published one for this
+        head) -- since it is not in REQUIRED_CHECKS, its absence must not
+        prevent merge_ready."""
+        checks = _all_other_required_checks_passing()
+        artifact = build(v2, checks)
+        assert not any(c["name"] == TRUSTED_CONSUMER_CHECK_NAME for c in artifact["checks"])
+        assert artifact["overall_status"] == "merge_ready", artifact
+
+    def test_not_run_status_queued_never_started_does_not_block(self, v2):
+        """"not-run": the trusted-consumer job's CheckRun exists but never
+        left a non-completed status (e.g. the workflow_run that would
+        trigger it never fired) -- still must not block."""
+        checks = _all_other_required_checks_passing()
+        checks.append(
+            make_check(
+                TRUSTED_CONSUMER_CHECK_NAME,
+                workflow=TRUSTED_CONSUMER_WORKFLOW,
+                status="queued",
+                conclusion=None,
+            )
+        )
+        artifact = build(v2, checks)
+        trusted_entry = next(
+            c for c in artifact["checks"] if c["name"] == TRUSTED_CONSUMER_CHECK_NAME
+        )
+        assert trusted_entry["classification"] == "excluded"
+        assert trusted_entry["blocking_merge_ready"] is False
+        assert artifact["overall_status"] == "merge_ready", artifact
+
+    def test_trusted_consumer_success_still_merge_ready(self, v2):
+        """Regression guard: the ordinary green case must still work."""
+        checks = _all_other_required_checks_passing()
+        checks.append(
+            make_check(
+                TRUSTED_CONSUMER_CHECK_NAME,
+                workflow=TRUSTED_CONSUMER_WORKFLOW,
+                status="completed",
+                conclusion="success",
+            )
+        )
+        artifact = build(v2, checks)
+        assert artifact["overall_status"] == "merge_ready", artifact
+
+    def test_producer_failure_still_blocks_even_when_trusted_consumer_succeeds(self, v2):
+        """AC9 companion: relaxing the trusted CONSUMER must never relax the
+        PRODUCER's own required gate."""
+        checks = _all_other_required_checks_passing()
+        for check in checks:
+            if check["workflow"] == "ci" and check["name"] == "visual-impact-policy":
+                check["conclusion"] = "failure"
+        checks.append(
+            make_check(
+                TRUSTED_CONSUMER_CHECK_NAME,
+                workflow=TRUSTED_CONSUMER_WORKFLOW,
+                status="completed",
+                conclusion="success",
+            )
+        )
+        artifact = build(v2, checks)
+        assert artifact["overall_status"] == "blocked", artifact
+
+
+# ---------------------------------------------------------------------------
 # AC12: neutral/skipped are NOT required evidence pass
 # ---------------------------------------------------------------------------
 
