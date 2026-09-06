@@ -3992,14 +3992,26 @@ def _extract_urls(text: str) -> list[str]:
     return found
 
 
+# Issue #2521 live evidence (2026-09-06, real `agy` 1.1.27 stream-json
+# output): the actual tool name AGY reports for a web search call is
+# `search_web` (not `web_search`), and it advertises `read_url_content` /
+# `open_browser_url` for URL/browser access rather than
+# `read_url`/`url_read`/`fetch_url`/`fetch`/`browser_navigate`. The original
+# names are kept (defensive, may still apply to other AGY versions/aliases)
+# and the live-confirmed names are added additively -- mirrors
+# preflight_agy.py's RECOGNIZED_WEB_TOOL_NAMES (kept in sync; see that
+# module's comment for the full rationale).
 RECOGNIZED_WEB_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "web_search",
         "websearch",
+        "search_web",
         "browser_navigate",
         "browser",
+        "open_browser_url",
         "url_read",
         "read_url",
+        "read_url_content",
         "fetch_url",
         "fetch",
     }
@@ -4644,13 +4656,6 @@ def _build_agy_structured_stream_json_grounded_research_metadata(
             ),
         )
 
-    if _QUOTA_EXHAUSTED_RE.search(stdout):
-        return _fail_closed(
-            grounding_status="failed",
-            grounding_backend="none",
-            grounding_failure_class="agy_web_grounding_quota_exhausted",
-        )
-
     if not _PREFLIGHT_AGY_AVAILABLE or _preflight_agy is None:
         # Issue #2038 P0-3: the strict NDJSON parser lives in preflight_agy.py
         # (single source of truth shared with the capability probe); if it
@@ -4663,6 +4668,40 @@ def _build_agy_structured_stream_json_grounded_research_metadata(
         )
 
     stream_parse = _preflight_agy.parse_agy_stream_json_stream(stdout)
+
+    # Issue #2521 fix_delta (PR #2527 Finding 2): quota-exhaustion detection
+    # must NOT regex-match the entire raw stdout -- that includes the tool's
+    # search query text, tool output, and the terminal answer body itself,
+    # any of which can legitimately contain literal strings like
+    # "RESOURCE_EXHAUSTED" (e.g. a successful research answer *about* that
+    # very API error) without AGY actually having hit a quota limit. Scope
+    # the check to the parsed terminal event's own failure-describing string
+    # fields only (populated only once the stream fully validates -- see
+    # `stream_parse["terminal_result"]`), and only when the terminal did not
+    # report success, since a `status: "SUCCESS"` terminal's `response` is a
+    # genuine answer body, never a failure reason.
+    _terminal_event_for_quota_check = stream_parse.get("terminal_result")
+    _terminal_payload_for_quota_check = (
+        _terminal_event_for_quota_check.get("result")
+        if isinstance(_terminal_event_for_quota_check, dict)
+        else None
+    )
+    if (
+        isinstance(_terminal_payload_for_quota_check, dict)
+        and _terminal_payload_for_quota_check.get("status") != "SUCCESS"
+    ):
+        _terminal_failure_text = " ".join(
+            value
+            for key, value in _terminal_payload_for_quota_check.items()
+            if key != "status" and isinstance(value, str)
+        )
+        if _QUOTA_EXHAUSTED_RE.search(_terminal_failure_text):
+            return _fail_closed(
+                grounding_status="failed",
+                grounding_backend="none",
+                grounding_failure_class="agy_web_grounding_quota_exhausted",
+            )
+
     if stream_parse.get("status") != "valid":
         return _fail_closed(
             grounding_status="attempted_no_web_tool_call",
@@ -4679,14 +4718,46 @@ def _build_agy_structured_stream_json_grounded_research_metadata(
     tool_call_confirmed = bool(recognized_tool_calls) or hook_validated
     source_records = stream_parse.get("source_records") or []
     citation_evidence = [{"url": record["url"], "title": record.get("title")} for record in source_records]
+    # Issue #2521 AC8/AC9: tool-derived source records (correlated to a
+    # recognized web tool's `tool_info.output`) remain the ONLY evidence
+    # that can promote `grounding_status` to "grounded" -- see below. Live
+    # evidence (2026-09-06, real `agy` 1.1.27 `search_web` calls) confirmed
+    # the current stream-json `tool_info` never carries a structured
+    # `output.sources`/`.citations`/`.results` field, so `source_records`
+    # is empty for every real search_web call observed so far. When that
+    # happens, concrete URLs found in the terminal answer text itself
+    # (`result.response`) are kept as citation CANDIDATES only -- extracting
+    # a candidate must never, by itself, mark the result "grounded"/
+    # "supported" (mirrors the legacy text-route's pre-existing
+    # "citation_candidates_unverified" precedent in
+    # `_build_agy_grounded_research_metadata()`).
+    citations_have_tool_correlated_source = bool(citation_evidence)
+    if not citation_evidence:
+        terminal_event = stream_parse.get("terminal_result")
+        terminal_payload = terminal_event.get("result") if isinstance(terminal_event, dict) else None
+        terminal_response_text = (
+            terminal_payload.get("response") if isinstance(terminal_payload, dict) else None
+        )
+        if isinstance(terminal_response_text, str):
+            citation_evidence = [
+                {"url": url, "title": None} for url in _extract_urls(terminal_response_text)
+            ]
     url_citation_count = len(citation_evidence)
     web_tool_call_count = len(recognized_tool_calls) if recognized_tool_calls else len(hook_tool_names)
     search_query_count = web_tool_call_count
 
-    if url_citation_count > 0:
+    if url_citation_count > 0 and citations_have_tool_correlated_source:
         grounding_status = "grounded"
         grounding_backend = "agy_native_websearch_structured"
         grounding_failure_class = None
+    elif url_citation_count > 0:
+        # Candidate extraction succeeded (terminal-answer URL fallback
+        # above) but there is no tool-correlated source to corroborate it --
+        # keep the candidate for downstream source-content verification, but
+        # do not report a successful grounded result yet (Issue #2521 AC9).
+        grounding_status = "citation_candidates_unverified"
+        grounding_backend = "agy_final_result"
+        grounding_failure_class = "agy_evidence_quality_unverified"
     elif not tool_call_confirmed:
         grounding_status = "attempted_no_web_tool_call"
         grounding_backend = "none"
@@ -4942,6 +5013,30 @@ def _normalize_agy_result(
                 hook_events=agy_provenance_hook_events,
             )
 
+    # Issue #2521 AC5/AC6: when THIS exact invocation's stdout is a valid
+    # stream-json NDJSON stream (`agy_structured_output_used` true), the
+    # terminal `result.response` is the parent-facing answer text -- never
+    # the raw NDJSON stream (`stdout` includes every `init`/`step_update`
+    # event verbatim). Execution status (`completed.returncode`, already
+    # checked above) and this parser-validity check are independent
+    # diagnostics (Issue #2521 AC7): a parse failure here never changes
+    # `top_level_ok`/`exit_code` by itself for non-grounded_research
+    # profiles -- it only means `response_text`/`result_surface.summary`
+    # fall back to the pre-existing raw-`stdout` behavior, exactly as before
+    # this fix, for structured output unavailable/parse-failed cases.
+    structured_terminal_response_text: str | None = None
+    _agy_structured_output_used = bool(getattr(completed, "agy_structured_output_used", False))
+    if _agy_structured_output_used and _PREFLIGHT_AGY_AVAILABLE and _preflight_agy is not None:
+        _terminal_stream_parse = _preflight_agy.parse_agy_stream_json_stream(stdout)
+        if _terminal_stream_parse.get("status") == "valid":
+            _terminal_event = _terminal_stream_parse.get("terminal_result")
+            _terminal_payload = _terminal_event.get("result") if isinstance(_terminal_event, dict) else None
+            if isinstance(_terminal_payload, dict) and isinstance(_terminal_payload.get("response"), str):
+                structured_terminal_response_text = _terminal_payload["response"]
+    effective_response_text = (
+        structured_terminal_response_text if structured_terminal_response_text is not None else stdout
+    )
+
     top_level_ok = True
     top_level_failure_class: str | None = None
     top_level_failure_reason: str | None = None
@@ -4966,8 +5061,8 @@ def _normalize_agy_result(
         "actual_model": "agy-default",
         "tool_profile": tool_profile,
         "exit_code": 0,
-        "result_surface": _build_result_surface(ok=top_level_ok, response_text=stdout),
-        "response_text": stdout,
+        "result_surface": _build_result_surface(ok=top_level_ok, response_text=effective_response_text),
+        "response_text": effective_response_text,
         "stats": None,
         "stderr": stderr_text or None,
         "warnings": warnings,

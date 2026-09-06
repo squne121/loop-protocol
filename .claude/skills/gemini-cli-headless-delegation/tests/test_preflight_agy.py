@@ -1272,3 +1272,274 @@ def test_wsl2_recovery_docs_include_keyring_daemon_or_unlock_step():
     assert "gnome-keyring-daemon" in text
     assert "unlock" in text
     assert "dbus-run-session" in text
+
+
+# ---------------------------------------------------------------------------
+# Issue #2521: parse_agy_stream_json_stream() -- current official AGY
+# stream-json envelope format (`event` discriminator key, payload nested
+# under a same-named key, terminal `result.response`). Live-confirmed
+# 2026-09-06 against a real authenticated `agy` 1.1.27 binary in this
+# environment (`agy -p <prompt> --output-format stream-json`). See
+# run_gemini_headless.py::test_agy_structured_output.py for the wrapper
+# (_normalize_agy_result / grounded_research metadata) side of this fix.
+# ---------------------------------------------------------------------------
+
+
+def _live_format_stream_json_stdout(
+    url: str = "https://example.com/a", response: str = "The final answer."
+) -> str:
+    """Issue #2521 fix_delta (PR #2527): built via `json.dumps()` rather than
+    `"%s"` string interpolation so a *response* containing newlines, quotes,
+    or backslashes still round-trips as valid per-line JSON."""
+    init_event = {"event": "init", "init": {}}
+    step_update_event = {
+        "event": "step_update",
+        "step_update": {
+            "step_index": 0,
+            "state": "DONE",
+            "step_type": "tool",
+            "tool_info": {
+                "name": "web_search",
+                "output": {"sources": [{"url": url, "title": "A"}]},
+            },
+        },
+    }
+    result_event = {"event": "result", "result": {"status": "SUCCESS", "response": response}}
+    return "\n".join(json.dumps(event) for event in (init_event, step_update_event, result_event))
+
+
+def test_parse_agy_stream_json_stream_accepts_current_event_key_envelope():
+    """AC1/AC2: the current official envelope (`"event": "step_update"`
+    discriminator, payload nested under the `step_update` key) parses as
+    valid and the terminal answer text is readable from
+    `terminal_result["result"]["response"]`."""
+    module = load_module()
+
+    verdict = module.parse_agy_stream_json_stream(_live_format_stream_json_stdout())
+
+    assert verdict["status"] == "valid"
+    assert verdict["init_count"] == 1
+    assert verdict["result_count"] == 1
+    assert verdict["terminal_result"]["event"] == "result"
+    assert verdict["terminal_result"]["result"]["response"] == "The final answer."
+    assert verdict["source_records"][0]["url"] == "https://example.com/a"
+
+
+def test_parse_agy_stream_json_stream_reads_tool_info_under_step_update_nesting():
+    """AC2: `tool_info` must be read from `step_update.tool_info` (nested
+    under the `step_update` payload key), not from the event's top level."""
+    module = load_module()
+    stream_with_top_level_tool_info = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "step_update", "tool_info": '
+            '{"name": "web_search", "output": {"sources": [{"url": "https://example.com/a"}]}}, '
+            '"step_update": {"step_type": "tool"}}',
+            '{"event": "result", "result": {"response": "a"}}',
+        ]
+    )
+
+    verdict = module.parse_agy_stream_json_stream(stream_with_top_level_tool_info)
+
+    # tool_info at the wrong (top) nesting level is simply absent from the
+    # step_update payload -- never contributes a source record.
+    assert verdict["status"] == "valid"
+    assert verdict["source_records"] == []
+
+
+def test_parse_agy_stream_json_stream_missing_terminal_result_current_format():
+    """AC3: missing/duplicate terminal `result` detection is preserved for
+    the current `event`-key format (migrated from the pre-#2521 `type`-key
+    fixture -- Issue #2521 AC4)."""
+    module = load_module()
+    stream = (
+        '{"event": "init", "init": {}}\n'
+        '{"event": "step_update", "step_update": {"step_type": "agent_response"}}'
+    )
+
+    verdict = module.parse_agy_stream_json_stream(stream)
+
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "terminal_event_not_result_or_missing"
+
+
+def test_parse_agy_stream_json_stream_duplicate_terminal_result_current_format():
+    """AC3/AC4: a duplicate terminal `result` event is rejected in the
+    current `event`-key format."""
+    module = load_module()
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "result", "result": {"response": "a"}}',
+            '{"event": "result", "result": {"response": "b"}}',
+        ]
+    )
+
+    verdict = module.parse_agy_stream_json_stream(stream)
+
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "result_count_not_exactly_one"
+
+
+def test_parse_agy_stream_json_stream_malformed_json_line_current_format():
+    """AC3/AC4: a malformed/truncated NDJSON line is rejected outright in
+    the current `event`-key format, never best-effort recovered."""
+    module = load_module()
+    stream = '{"event": "init", "init": {}}\n{"event": "step_update", truncated'
+
+    verdict = module.parse_agy_stream_json_stream(stream)
+
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "line_1_not_valid_json"
+
+
+def test_parse_agy_stream_json_stream_rejects_legacy_type_key_top_level():
+    """AC4: the previously assumed `type`-key top-level discriminator is not
+    kept as a compatibility shim -- a stream using only `type` (no `event`
+    key at all) is rejected exactly like any other unrecognized envelope."""
+    module = load_module()
+    stream = "\n".join(
+        [
+            '{"type": "init"}',
+            '{"type": "step_update", "step_type": "tool_call"}',
+            '{"type": "result"}',
+        ]
+    )
+
+    verdict = module.parse_agy_stream_json_stream(stream)
+
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "line_0_unknown_event_type"
+
+
+def test_parse_agy_stream_json_stream_active_then_done_step_not_double_counted():
+    """Live evidence (Issue #2521): the same `step_index` can appear twice
+    -- once `state: "ACTIVE"`, once `state: "DONE"` -- for a single tool
+    call. Only the terminal state is counted."""
+    module = load_module()
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "step_update", "step_update": {"step_index": 2, "state": "ACTIVE", '
+            '"step_type": "tool", "tool_info": {"name": "search_web", "parameters": {"query": "q"}}}}',
+            '{"event": "step_update", "step_update": {"step_index": 2, "state": "DONE", '
+            '"step_type": "tool", "tool_info": '
+            '{"name": "search_web", "output": {"sources": [{"url": "https://example.com/a"}]}}}}',
+            '{"event": "result", "result": {"response": "done"}}',
+        ]
+    )
+
+    verdict = module.parse_agy_stream_json_stream(stream)
+
+    assert verdict["status"] == "valid"
+    assert len(verdict["tool_call_records"]) == 1
+    assert len(verdict["source_records"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #2521 fix_delta (PR #2527 OWNER REQUEST_CHANGES Finding 1): a
+# syntactically well-formed exactly-one-terminal stream must not be accepted
+# as `status: "valid"` when the terminal `result` payload itself is broken
+# (not an object, or a claimed success with no actual answer text) -- see
+# `parse_agy_stream_json_stream()`'s terminal-payload validation added just
+# before it sets `status: "valid"`.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_agy_stream_json_stream_rejects_non_object_terminal_result_payload():
+    """Finding 1 regression test 2: a terminal `result` event whose `result`
+    field is not a JSON object (here, a bare string) must be rejected as
+    `status: "invalid"` with a dedicated reason_code -- never silently
+    accepted as a valid stream just because exactly-one-terminal holds."""
+    module = load_module()
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "result", "result": "not-an-object"}',
+        ]
+    )
+
+    verdict = module.parse_agy_stream_json_stream(stream)
+
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "terminal_result_payload_not_an_object"
+
+
+def test_parse_agy_stream_json_stream_rejects_missing_terminal_result_field():
+    """Finding 1 regression test 2 (variant): a terminal `result` event
+    entirely missing the nested `result` field is likewise rejected (the
+    missing field is `None`, not a dict)."""
+    module = load_module()
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "result"}',
+        ]
+    )
+
+    verdict = module.parse_agy_stream_json_stream(stream)
+
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "terminal_result_payload_not_an_object"
+
+
+def test_parse_agy_stream_json_stream_rejects_success_status_without_response():
+    """Finding 1 regression test 3: this is the exact broken-terminal
+    scenario from the OWNER's REQUEST_CHANGES repro -- a tool call completed
+    normally, but the terminal `result` reports `status: "SUCCESS"` with no
+    `response` field at all. Must be rejected as `status: "invalid"` so the
+    caller never treats the raw NDJSON stream as a successful structured
+    answer."""
+    module = load_module()
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "step_update", "step_update": {"step_index": 0, "state": "DONE", '
+            '"step_type": "tool", "tool_info": '
+            '{"name": "search_web", "output": {"sources": [{"url": "https://example.com/a"}]}}}}',
+            '{"event": "result", "result": {"status": "SUCCESS"}}',
+        ]
+    )
+
+    verdict = module.parse_agy_stream_json_stream(stream)
+
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "terminal_result_success_missing_response"
+
+
+def test_parse_agy_stream_json_stream_rejects_success_status_with_non_string_response():
+    """Finding 1 regression test 3 (variant): `status: "SUCCESS"` with a
+    non-string `response` (e.g. `null`) is equally rejected -- a `response`
+    field being merely *present* is not sufficient, it must be a string."""
+    module = load_module()
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "result", "result": {"status": "SUCCESS", "response": null}}',
+        ]
+    )
+
+    verdict = module.parse_agy_stream_json_stream(stream)
+
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "terminal_result_success_missing_response"
+
+
+def test_parse_agy_stream_json_stream_non_success_status_stays_valid_without_response():
+    """Finding 1 regression test 4 (Issue #2521 AC7 non-regression): a
+    terminal `result.status` of `"ERROR"` (an AGY execution failure) is a
+    syntactically valid terminal even with no `response` field -- execution
+    status and parser-validity must remain independent."""
+    module = load_module()
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "result", "result": {"status": "ERROR", "error": "something failed"}}',
+        ]
+    )
+
+    verdict = module.parse_agy_stream_json_stream(stream)
+
+    assert verdict["status"] == "valid"
+    assert verdict["reason_code"] == "valid_init_step_result_stream"
+    assert verdict["terminal_result"]["result"]["status"] == "ERROR"
