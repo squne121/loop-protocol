@@ -57,6 +57,7 @@ related_issue: "#135"
 | `agy_permission_boundary_e2e/v1` | `.claude/skills/gemini-cli-headless-delegation/schemas/agy_permission_boundary_e2e_v1.schema.json` | permission-boundary runner | artifact validator / reviewer | `rg -n "agy_permission_boundary_e2e/v1" .claude/skills/gemini-cli-headless-delegation docs/dev/schema-governance.md` |
 | `agy_preflight_result/v1`（additive `capabilities` matrix, Issue #1941） | `.claude/skills/gemini-cli-headless-delegation/scripts/preflight_agy.py`（`build_capability_matrix()` / `run_preflight(compute_capabilities=True)` が唯一の実装 SSOT） | preflight_agy.py | `setup_check.py`（`agy_capabilities` として additive に surface。既存 `agy_preflight["ok"]` 単一 boolean 消費は不変）、`run_gemini_headless.py` | `rg -n "agy_capability_matrix/v1\|CAPABILITY_PREDICATES\|build_capability_matrix" .claude/skills/gemini-cli-headless-delegation` |
 | `agy_github_research_evidence/v1`（Issue #1920） | `schemas/agy_github_research_evidence_v1.schema.json` | `.claude/skills/gemini-cli-headless-delegation/scripts/run_agy_github_research_e2e.py`（`_build_evidence()` / `_write_evidence()`） | `run_gemini_headless.py`（`provider=agy` + `tool_profile=github_research` の dispatch）、`run_agy_github_research_broker.py`（per-iteration `agy_github_research_broker_command_result/v1` record の source）、人間・エージェント reviewer（`.claude/artifacts/agent-provider-route/<run-id>/` artifact consumer）、`test_agy_github_research_contract.py` / `test_agy_github_research_e2e.py` | `rg -n "agy_github_research_evidence/v1\|agy_github_research_broker_command_result/v1\|run_agy_github_research_broker\|run_agy_github_research_e2e" .claude/skills/gemini-cli-headless-delegation schemas` |
+| `WEB_RESEARCH_RESULT_V1`（Issue #2042、#2038/#2059 follow-up） | `.claude/agents/web-researcher.md` | web-researcher SubAgent | `.claude/skills/issue-refinement-loop/scripts/route_web_research_result.py`、`.claude/skills/issue-refinement-loop/references/web-research-routing.md` | `rg -n "WEB_RESEARCH_RESULT_V1\|sources\[\]\|source_id\|source_kind" .claude/agents/web-researcher.md .claude/skills/issue-refinement-loop` |
 
 **Compatibility Decision**: `AGY_CAUSAL_CLAIM_MANIFEST_V1` は本 Issue（#1778）で新規追加された schema であり、既存 schema の破壊的変更は含まない（`additive` — 新規 producer 2 件、既存 consumer への影響なし）。`agy_permission_policy.py` / `run_gemini_headless.py` はどちらも read-only の分析対象であり、本 Issue の PR では一切変更されない（behavior change なし）。
 
@@ -440,6 +441,58 @@ validation_commands:
 notes:
   - "producer（source-evidence producer / codebase-investigator）が route plan 生成・実行・envelope 返却を担い、issue-refinement-loop は envelope 検証と disposition に基づく routing のみを行う（provider の stderr・exit code・retry policy を再解釈しない）。"
   - "budget の残余管理は issue-refinement-loop が単一 refinement run の invocation スコープ内でのみメモリ上保持し、永続 DB は持たない。"
+```
+
+## WEB_RESEARCH_RESULT_V1 詳細登録
+
+**Compatibility Decision（Issue #2042）**: `WEB_RESEARCH_RESULT_V1` はこれまで本ドキュメントの Initial Known Schemas に未登録だった既存 schema であり、本 Issue で初回登録する。本 Issue の変更内容自体（top-level `sources[]` source registry と `claims[].evidence[].source_id` 参照の追加）は **additive** である。`schema_version` は `1` のまま据え置く。既存必須フィールド（`schema_version` / `status` / `failure_class` / `verification_route` / `attempts` / `claims[].evidence[].kind,ref,summary` / `unresolved_risks` / `failure_reason` / `raw_summary`）の削除・rename・型変更は行っていない。
+
+```yaml
+schema_id: WEB_RESEARCH_RESULT_V1
+definition: .claude/agents/web-researcher.md
+related_issue: "#2042"
+related_prior_issues:
+  - "#2038"（AGY structured output protocol、PR #2043 でマージ済み）
+  - "#2059"（success authority を provider trace から URL/source-content evidence へ切替、PR #2150 でマージ済み）
+producer:
+  - web-researcher SubAgent（`.claude/agents/web-researcher.md`）
+consumer:
+  - .claude/skills/issue-refinement-loop/scripts/route_web_research_result.py（`_claims_cover_requested_evidence()` / `_transport_reason()` / `_build_source_registry()`）
+  - .claude/skills/issue-refinement-loop/references/web-research-routing.md（consumer boundary ドキュメント）
+  - .claude/skills/issue-refinement-loop/tests/test_web_research_routing.py（既存回帰テスト）
+  - .claude/skills/issue-refinement-loop/tests/test_web_research_source_id_relation.py（本 Issue で追加した `sources[]` / `source_id` 参照整合性の回帰テスト）
+shape: |
+  top-level: schema_version(1固定), status(ok|inconclusive|failed|insufficient_context),
+  failure_class, verification_route, attempts[], sources[](additive, optional),
+  claims[], unresolved_risks[], failure_reason, raw_summary。
+  sources[] の各要素: source_id(result-local unique string, provider実行証明ではない),
+  url(正規化済み), title, source_kind(agy|native_web),
+  step_idx/tool_name/tool_call_fingerprint(実際に取得できた場合だけ保持する optional diagnostic)。
+  claims[].evidence[] の既存必須フィールド kind:web / ref / summary は維持し、
+  optional source_id を追加できる。source_id 指定時は sources[] 内の対応エントリの
+  url が evidence item の ref と一致することを要求する。
+compatibility:
+  breaking_changes:
+    - sources[] の既存フィールド（source_id/url/title/source_kind）の削除・rename・型変更
+    - claims[].evidence[] の既存必須フィールド（kind/ref/summary）の削除・rename・型変更
+    - source_id と ref の不一致を許容する方向への検証緩和（dual authority の許容）
+    - orphan source を拒否理由にする方向への変更（現行契約は許容）
+  non_breaking_changes:
+    - sources[] エントリへの新規 optional diagnostic フィールド追加
+    - source_kind の新規値追加
+detection_patterns:
+  - 'WEB_RESEARCH_RESULT_V1'
+  - 'sources\[\]'
+  - 'source_id'
+  - 'source_kind'
+validation_commands:
+  - "uv run pytest .claude/skills/issue-refinement-loop/tests/test_web_research_source_id_relation.py -q"
+  - "uv run pytest .claude/skills/issue-refinement-loop/tests/test_web_research_routing.py -q"
+  - "rg -n 'sources:|source_id|source_kind' .claude/agents/web-researcher.md"
+notes:
+  - "source_id は provider-internal な実行証明（tool_call_fingerprint 等）とは同一視しない。run/result-local な参照 ID に過ぎない。"
+  - "source と claim の関係は many-to-many。orphan source（どの claim からも参照されない sources[] エントリ）は単独では拒否理由にしない。"
+  - "source_kind: agy と native_web は route_web_research_result.py で区別なく同一ロジックにより検証される。"
 ```
 
 ## OVERLAP_GATE_BYPASS_V1（#1679 により削除・supersede 済み）

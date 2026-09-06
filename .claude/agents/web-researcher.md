@@ -41,7 +41,7 @@ runtime_followup_route: agy_grounded_research_with_native_web_fallback
 BUILDER_INVOCATION（ビルダー呼び出し）:
 - provider: agy
 - profiles: grounded_research
-- command: `build_request.py --provider agy --profile grounded_research --prompt <non-empty>`
+- command: `build_request.py --provider agy --profile grounded_research --prompt <non-empty> --output <tmp>/request.json`
 - primary_route: agy_grounded_research
 - fallback_route: native_web
 - gemini_state: disabled_by_operator
@@ -50,14 +50,21 @@ Gemini CLI は `disabled_by_operator` のため起動しない。旧 `preflight_
 
 ## 調査手順
 
-1. AGY canonical builder invocation を一度試行する。
+1. AGY canonical builder invocation を一度試行する。以下はコピペで動く具体的な手順（LLM の推測に依存しない）。
    事前に `setup_check.py --provider agy --json` と `preflight_agy.py` で AGY attempt の readiness を確認してよい。
-   builder が request file を返した場合は、既存 wrapper を次の request/output file contract で実行する。
+   invocation ごとに一時ディレクトリを用意し、builder invocation には `--output` を明示して request file を確実に materialize する
+   （`build_request.py` は `--output` を指定しない限り stdout に JSON を表示するだけで、ファイルは作らない）。
+   同じ request file を wrapper の `--request-file` に渡し、結果は `--output-file` で別ファイルへ出力させる。
    ```bash
+   TMP_DIR="$(mktemp -d)"
+   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
+     --provider agy --profile grounded_research --prompt "<non-empty prompt>" \
+     --output "$TMP_DIR/request.json"
    uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
-     --request-file <builder が作成した request file> \
-     --output-file <invocation-private output file>
+     --request-file "$TMP_DIR/request.json" \
+     --output-file "$TMP_DIR/result.json"
    ```
+   `$TMP_DIR/result.json`（`delegation_result/v1`）を読み、トップレベルの `ok`（真偽値）と `response_text` / `warnings` / `failure_reason` で成否を判定する。
 2. AGY が一次資料 citation と claim を支える内容を返した場合、その evidence を評価する。
 3. 以下のいずれかなら停止せず、利用可能な native Web route で同じ critical claim を検証する: auth/capability/query/grounding failure、citation materialization failure、citation extraction failure、provider provenance trace 不足、または AGY evidence quality 不足。
 4. Claude runtime では利用可能な `WebSearch` と `WebFetch` を fallback に使ってよい。Codex runtime 固有の native tool 名はここで仮定しない。
@@ -85,6 +92,10 @@ success authority は provider telemetry ではなく、critical claim ごとの
 
 evidence のない claim は `supported` としてはならない。AGY と native Web の両方で critical claim を検証できなかった場合だけ `inconclusive` または `failed` を返す。
 
+### ソース登録簿への変換（Source Registry Materialization）
+
+AGY 経由・native Web 経由のどちらで確認した source も、同じ `sources[]` 形状へ変換する。source content を実際に確認できた URL ごとに、result 内で一意な `source_id` を割り当て、正規化済み `url` / `title` / `source_kind`（`agy` | `native_web`）を記録する。`step_idx` / `tool_name` / `tool_call_fingerprint` は実際に取得できた場合だけ含め、欠落値を推測で埋めない。claim の `evidence[]` から該当 source を引く場合は `evidence[].source_id` にその `source_id` を設定し、`evidence[].ref` には必ず同じ source の `url` をそのまま使う（`source_id` と `ref` が異なる source を指す状態を作らない）。`source_kind` が `agy` か `native_web` かで検証の扱いを変えない。
+
 ## 結果（Result: WEB_RESEARCH_RESULT_V1）
 
 ```yaml
@@ -102,6 +113,14 @@ WEB_RESEARCH_RESULT_V1:
       citation_count: <int>
       evidence_count: <int>
       notes: <string>
+  sources:
+    - source_id: <result-local unique string>
+      url: <normalized url>
+      title: <string>
+      source_kind: agy | native_web
+      step_idx: <int, optional>
+      tool_name: <string, optional>
+      tool_call_fingerprint: <string, optional>
   claims:
     - claim_id: <string>
       text: <string>
@@ -112,10 +131,15 @@ WEB_RESEARCH_RESULT_V1:
         - kind: web
           ref: <url>
           summary: <claim を支える内容>
+          source_id: <sources[].source_id への参照, optional>
   unresolved_risks: []
   failure_reason: <string|null>
   raw_summary: <string>
 ```
+
+`sources[]` は result 内の source registry である。各エントリの `source_id` は **result-local に一意な参照 ID** であり、provider の実行証明（provenance proof）ではない。`url` は正規化済み URL、`title` は source のタイトル、`source_kind` は `agy`（AGY grounded research 経由で確認）または `native_web`（native Web tool 経由で確認）のいずれかを表す。`step_idx` / `tool_name` / `tool_call_fingerprint` は **実際に取得できた場合だけ保持する optional diagnostic** フィールドであり、取得できない場合に推測・捏造で埋めてはならない。
+
+`claims[].evidence[]` の既存必須フィールド（`kind: web` / `ref` / `summary`）は維持する（後方互換）。`source_id` は任意で、指定する場合は `sources[]` 内の対応エントリの `url` が evidence item の `ref` と一致しなければならない（`ref` と `source_id` が指す source が食い違う状態を作らない）。`sources[]` に存在するがどの claim からも参照されない source（orphan）があってもよい（source と claim は many-to-many であり、未参照であること自体は問題にしない）。
 
 native fallback 成功時は `status: ok` と `verification_route: native_web` を返す。これを AGY success と偽装してはならない。orchestrator は top-level consumer fields だけを読み、attempt/fallback state を LOOP_STATE に保存しない。
 
