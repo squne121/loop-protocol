@@ -551,6 +551,10 @@ def test_skill_md_example_github_research_command_passes_validate_only(tmp_path)
           --output /tmp/gemini/request.json
     """
     output = tmp_path / "request.json"
+    prompt_text = (
+        "GitHub Issue #313 と PR #321 の内容を "
+        "gh issue view / gh pr view で調査し、要点を報告してください。"
+    )
 
     build_result = subprocess.run(
         [
@@ -558,7 +562,7 @@ def test_skill_md_example_github_research_command_passes_validate_only(tmp_path)
             str(_SCRIPTS_DIR / "build_request.py"),
             "--provider", "agy",
             "--profile", "github_research",
-            "--prompt", "GitHub Issue #313 と PR #321 の内容を gh issue view / gh pr view で調査し、要点を報告してください。",
+            "--prompt", prompt_text,
             "--output", str(output),
         ],
         capture_output=True,
