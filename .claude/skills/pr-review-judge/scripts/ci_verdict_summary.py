@@ -69,6 +69,15 @@ HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES: frozenset[tuple[str, str]] = frozenset({
     ("retro-live-verification", "post-canonical-comment"),
 })
 
+# Issue #2524 AC12: trusted consumer (visual-impact-policy-trusted-consumer /
+# visual-impact-policy-trusted) is always advisory in the V1 verdict path,
+# matching ci_verdict_summary_v2.py's "excluded" classification for the
+# same (workflow, check_name) tuple. Producer ("ci", "visual-impact-policy")
+# is NOT in this set and remains fully blocking.
+UNCONDITIONAL_EXCLUDE_RULES: frozenset[tuple[str, str]] = frozenset({
+    ("visual-impact-policy-trusted-consumer", "visual-impact-policy-trusted"),
+})
+
 # Artifact truncation limit (bytes)
 LOG_TRUNCATE_BYTES = 64 * 1024  # 64KB
 
@@ -456,6 +465,11 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     check entry から verdict bucket を決定する。
     returns: "all_pass" | "failed" | "pending_or_queued" | "stale_head_sha" | "excluded"
     """
+    # Issue #2524 AC12: trusted consumer の (workflow, name) は他のどの状態評価よりも
+    # 優先して無条件 excluded にする（V2 の CLASSIFICATION_MAP "excluded" と同じ優先順位）。
+    if (entry.get("workflow") or "", entry.get("name") or "") in UNCONDITIONAL_EXCLUDE_RULES:
+        return "excluded"
+
     # stale: head SHA mismatch
     run_head_sha = _entry_run_head_sha(entry)
     if run_head_sha and run_head_sha != pr_head_sha:

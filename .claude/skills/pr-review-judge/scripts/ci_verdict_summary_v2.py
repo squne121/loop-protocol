@@ -89,6 +89,21 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     # blocking (gh_error). Classified "excluded" (not "evidence"/"required")
     # because this job's pass/fail must never affect merge-ready.
     ("ci", "reliability-assessment"): "excluded",
+    # Issue #2524: visual-impact-policy-trusted-consumer is a SEPARATE
+    # `workflow_run`-triggered advisory re-verification of the producer's
+    # `visual-impact-policy` (`ci`, above) decision -- confirmed on current
+    # HEAD via `.github/workflows/visual-impact-trusted-consumer.yml`'s own
+    # `name:` field (workflow) and its "Publish ... CheckRun" step's
+    # `-f name=` argument (check name). It is intentionally advisory
+    # (never-blocking): a candidate PR that cannot yet trigger a
+    # `workflow_run` (e.g. a brand-new fork PR before the base-branch `ci`
+    # run completes), or whose trusted re-verification job itself
+    # fails/times out/is cancelled for reasons unrelated to the producer's
+    # own decision, must never block merge-ready on its own. The
+    # PRODUCER'S `("ci", "visual-impact-policy")` `"required"` classification
+    # above is UNCHANGED -- this entry only relaxes the separate trusted
+    # CONSUMER re-verification, never the producer gate itself.
+    ("visual-impact-policy-trusted-consumer", "visual-impact-policy-trusted"): "excluded",
     # Check Japanese Content workflow
     ("Check Japanese Content", "PR Body Japanese Check"): "required",
     # Retrospective / conditional — allowlisted excluded

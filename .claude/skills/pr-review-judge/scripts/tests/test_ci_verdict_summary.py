@@ -29,6 +29,7 @@ from ci_verdict_summary import (
     EXIT_STALE,
     HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES,
     STATUS_CHECK_ROLLUP_QUERY,
+    UNCONDITIONAL_EXCLUDE_RULES,
     classify_check,
     classify_gh_error,
     compute_overall_status,
@@ -2042,3 +2043,185 @@ class TestReviewShadowAndRerunCanonicalization:
             if entry["name"] == "PR Review Japanese Check (retrospective)"
         )
         assert retrospective["head_sha"] is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2524 AC12: trusted consumer (visual-impact-policy-trusted-consumer /
+# visual-impact-policy-trusted) is unconditionally advisory in the V1
+# aggregation path used by pr-review-judge (determine_check_verdict()),
+# mirroring ci_verdict_summary_v2.py's CLASSIFICATION_MAP "excluded" entry
+# for the same (workflow, check_name) tuple. Producer ("ci",
+# "visual-impact-policy") must remain fully blocking.
+# ---------------------------------------------------------------------------
+
+TRUSTED_WORKFLOW = "visual-impact-policy-trusted-consumer"
+TRUSTED_CHECK_NAME = "visual-impact-policy-trusted"
+PRODUCER_WORKFLOW = "ci"
+PRODUCER_CHECK_NAME = "visual-impact-policy"
+
+
+def trusted_consumer_check(
+    run_id: int,
+    *,
+    bucket: Optional[str],
+    state: Optional[str],
+    event: str = "pull_request",
+) -> dict:
+    return {
+        "name": TRUSTED_CHECK_NAME,
+        "bucket": bucket,
+        "state": state,
+        "workflow": TRUSTED_WORKFLOW,
+        "link": f"https://github.com/owner/repo/actions/runs/{run_id}",
+        "event": event,
+        "startedAt": "2026-09-01T00:00:00Z",
+        "completedAt": "2026-09-01T00:00:01Z",
+    }
+
+
+def producer_check(run_id: int, *, bucket: str, state: str) -> dict:
+    return {
+        "name": PRODUCER_CHECK_NAME,
+        "bucket": bucket,
+        "state": state,
+        "workflow": PRODUCER_WORKFLOW,
+        "link": f"https://github.com/owner/repo/actions/runs/{run_id}",
+        "event": "pull_request",
+        "startedAt": "2026-09-01T00:00:00Z",
+        "completedAt": "2026-09-01T00:00:01Z",
+    }
+
+
+def other_required_check(run_id: int) -> dict:
+    """`Check Japanese Content` / `PR Body Japanese Check` を「他の必須チェック」の
+    stand-in として再利用する（既存 fixture 資産を再利用し新規基盤を作らない）。"""
+    return provenance_check(
+        run_id,
+        bucket="pass",
+        state="SUCCESS",
+        event="push",
+        completed_at="2026-09-01T00:00:00Z",
+    )
+
+
+class TestAC12TrustedConsumerAdvisory:
+    """Issue #2524 AC12: V1 determine_check_verdict() が trusted consumer を
+    conclusion/state に関わらず無条件 excluded にし、producer は従来通り
+    blocking のままであることを確認する回帰テスト。"""
+
+    def test_unconditional_exclude_rules_contains_trusted_consumer_tuple(self):
+        assert (TRUSTED_WORKFLOW, TRUSTED_CHECK_NAME) in UNCONDITIONAL_EXCLUDE_RULES
+
+    def test_all_pass_with_other_check_success_and_trusted_consumer_success(self):
+        """他の全チェック成功 + trusted consumer success → all_pass（exit 0）"""
+        checks = [
+            other_required_check(401),
+            trusted_consumer_check(402, bucket="pass", state="SUCCESS"),
+        ]
+        runs = {401: completed_run("success"), 402: completed_run("success")}
+        exit_code, out = run_summary_with_details(checks, runs)
+        assert exit_code == EXIT_ALL_PASS
+        assert out["status"] == "all_pass"
+        assert TRUSTED_CHECK_NAME in out["excluded_checks"]
+
+    def test_trusted_consumer_alone_failure_is_not_failed_verdict(self):
+        """trusted consumer 1件のみ・failure → status は "failed" にならない。
+
+        `no_required_evidence` と `failed` は exit code が同じ (10) なので、
+        本テストの主張は exit code ではなく status 文字列で直接検証する。
+        """
+        checks = [trusted_consumer_check(410, bucket="fail", state="FAILURE")]
+        runs = {410: completed_run("failure")}
+        _, out = run_summary_with_details(checks, runs)
+        assert out["status"] != "failed"
+        assert TRUSTED_CHECK_NAME not in out["failed_checks"]
+        assert TRUSTED_CHECK_NAME in out["excluded_checks"]
+
+    @pytest.mark.parametrize("conclusion", ["neutral", "skipped", "cancelled"])
+    def test_trusted_consumer_neutral_skipped_cancelled_do_not_block(self, conclusion: str):
+        """neutral / skipped / cancelled のいずれも単独では blocker(failed) にしない。"""
+        checks = [
+            other_required_check(420),
+            trusted_consumer_check(421, bucket="fail", state=conclusion.upper()),
+        ]
+        runs = {420: completed_run("success"), 421: completed_run(conclusion)}
+        exit_code, out = run_summary_with_details(checks, runs)
+        assert exit_code == EXIT_ALL_PASS
+        assert out["status"] == "all_pass"
+        assert out["failed_checks"] == []
+        assert TRUSTED_CHECK_NAME in out["excluded_checks"]
+
+    def test_trusted_consumer_pending_in_progress_does_not_block(self):
+        """pending/in_progress は excluded 扱いになり status に影響しない。"""
+        checks = [
+            other_required_check(430),
+            trusted_consumer_check(431, bucket="pending", state="IN_PROGRESS"),
+        ]
+        runs = {
+            430: completed_run("success"),
+            431: {
+                "headSha": HEAD_SHA,
+                "status": "in_progress",
+                "jobs": [],
+                "databaseId": 1,
+            },
+        }
+        exit_code, out = run_summary_with_details(checks, runs)
+        assert exit_code == EXIT_ALL_PASS
+        assert out["status"] == "all_pass"
+        assert out["pending_checks"] == []
+        assert TRUSTED_CHECK_NAME in out["excluded_checks"]
+
+    def test_determine_check_verdict_excludes_trusted_consumer_regardless_of_state(self):
+        """determine_check_verdict() 単体呼び出し: failure/neutral/skipped/cancelled/
+        pending/not-run のいずれでも "excluded" を返す。"""
+        base = {"workflow": TRUSTED_WORKFLOW, "name": TRUSTED_CHECK_NAME, "head_sha": HEAD_SHA}
+        cases = [
+            {"bucket": "fail", "conclusion": "failure", "status": "completed"},
+            {"bucket": "fail", "conclusion": "neutral", "status": "completed"},
+            {"bucket": "skipping", "conclusion": "skipped", "status": "completed"},
+            {"bucket": "cancel", "conclusion": "cancelled", "status": "completed"},
+            {"bucket": "pending", "conclusion": None, "status": "in_progress"},
+            {"bucket": None, "conclusion": None, "status": None},  # not-run
+        ]
+        for extra in cases:
+            entry = {**base, **extra}
+            assert determine_check_verdict(entry, pr_head_sha=HEAD_SHA) == "excluded", entry
+
+    def test_determine_check_verdict_excludes_trusted_consumer_even_when_stale(self):
+        """stale_head_sha 条件（run head SHA と PR head SHA の不一致）下でも
+        trusted consumer は excluded が stale_head_sha より優先される。"""
+        entry = {
+            "workflow": TRUSTED_WORKFLOW,
+            "name": TRUSTED_CHECK_NAME,
+            "bucket": "pass",
+            "conclusion": "success",
+            "status": "completed",
+            "head_sha": "0000000000000000000000000000000000dead",
+        }
+        assert entry["head_sha"] != HEAD_SHA
+        assert determine_check_verdict(entry, pr_head_sha=HEAD_SHA) == "excluded"
+
+    def test_producer_visual_impact_policy_failure_still_blocks(self):
+        """producer ("ci", "visual-impact-policy") の failure は引き続き "failed"（exit 10）。"""
+        checks = [producer_check(440, bucket="fail", state="FAILURE")]
+        runs = {440: completed_run("failure")}
+        exit_code, out = run_summary_with_details(checks, runs)
+        assert exit_code == EXIT_FAILED
+        assert out["status"] == "failed"
+        assert PRODUCER_CHECK_NAME in out["failed_checks"]
+
+    def test_producer_failure_blocks_even_when_trusted_consumer_also_fails(self):
+        """producer failure + trusted consumer failure が同時発生しても、
+        producer 由来で "failed" になり、trusted consumer は excluded のまま。"""
+        checks = [
+            producer_check(450, bucket="fail", state="FAILURE"),
+            trusted_consumer_check(451, bucket="fail", state="FAILURE"),
+        ]
+        runs = {450: completed_run("failure"), 451: completed_run("failure")}
+        exit_code, out = run_summary_with_details(checks, runs)
+        assert exit_code == EXIT_FAILED
+        assert out["status"] == "failed"
+        assert PRODUCER_CHECK_NAME in out["failed_checks"]
+        assert TRUSTED_CHECK_NAME not in out["failed_checks"]
+        assert TRUSTED_CHECK_NAME in out["excluded_checks"]
