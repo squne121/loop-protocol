@@ -1,0 +1,12 @@
+[
+  {
+    "ac": "AC1",
+    "status": "applicable",
+    "reason": "verified via uv run --locked pytest tests/test_example.py::test_ac1 -q"
+  },
+  {
+    "ac": "AC3",
+    "status": "pre_existing_failure",
+    "reason": "unrelated pre-existing flaky failure tracked separately; not caused by this no-diff decision"
+  }
+]
