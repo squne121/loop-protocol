@@ -1,0 +1,165 @@
+{
+  "schema": "e2e_performance_benchmark_manifest_v2",
+  "schema_version": 2,
+  "generated_at": "2026-08-01T00:00:00Z",
+  "experiment_identity": "issue-2486-pr-9999-a1b2c3d4e5f6-fed654cba321",
+  "experiment_run_set_digest": "sha256:3cde709c10d743bdb15377e5788019de95422e868c8a764bb5c1bbda1cd58ba4",
+  "frozen_source_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f0abcdef01",
+  "workflow_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "workflow_digest": "sha256:b37ba25c29255927f4ff9b5f88f99b1bafe3fdd9e9c4bc5b7993a3c619b338b7",
+  "frozen_non_treatment": {
+    "test_inventory_digest": "sha256:9ef4eada47a5a744b4e58a9404f4fcc74384910d2566812521ac09e5bce44447",
+    "expected_playwright_invocations": [
+      {
+        "invocation_id": "core-1",
+        "lane": "core",
+        "provider_placement": {
+          "monolith": "e2e-core",
+          "split": "e2e-core"
+        },
+        "evidence_file": "playwright-report/core.json"
+      },
+      {
+        "invocation_id": "responsive-1",
+        "lane": "responsive",
+        "provider_placement": {
+          "monolith": "e2e-core",
+          "split": "e2e-responsive-matrix"
+        },
+        "evidence_file": "playwright-report/responsive.json"
+      }
+    ],
+    "expected_test_count": 42,
+    "lockfile_hash": "sha256:862f2aecf58cf213de5067bb9221a0c8410197ce5e33279035fc2f454dbb75ee",
+    "toolchain_digest": "sha256:9a10e71ed5a061d3b6d91bda7637eeadd8ce2a13f5025a804dd41d1a9dc0e083"
+  },
+  "blocks": [
+    {
+      "block_id": "block-1",
+      "runs": [
+        {
+          "benchmark_layout": "monolith",
+          "workflow_run_id": 1001,
+          "run_attempt": 1,
+          "conclusion": "success",
+          "workflow_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+          "workflow_digest": "sha256:b37ba25c29255927f4ff9b5f88f99b1bafe3fdd9e9c4bc5b7993a3c619b338b7",
+          "run_url": "https://github.com/squne121/loop-protocol/actions/runs/1001",
+          "job_names_started": [
+            "e2e-core",
+            "gate-ready"
+          ],
+          "provider_jobs": [
+            {
+              "job": "e2e-core",
+              "workflow_job_id": 91001,
+              "conclusion": "success",
+              "exact_runner_image": {
+                "name": "ubuntu24",
+                "version": "20260701.1.0"
+              }
+            }
+          ]
+        },
+        {
+          "benchmark_layout": "split",
+          "workflow_run_id": 2001,
+          "run_attempt": 1,
+          "conclusion": "success",
+          "workflow_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+          "workflow_digest": "sha256:b37ba25c29255927f4ff9b5f88f99b1bafe3fdd9e9c4bc5b7993a3c619b338b7",
+          "run_url": "https://github.com/squne121/loop-protocol/actions/runs/2001",
+          "job_names_started": [
+            "e2e-core",
+            "e2e-responsive-matrix",
+            "gate-ready"
+          ],
+          "provider_jobs": [
+            {
+              "job": "e2e-core",
+              "workflow_job_id": 92001,
+              "conclusion": "success",
+              "exact_runner_image": {
+                "name": "ubuntu24",
+                "version": "20260701.1.0"
+              }
+            },
+            {
+              "job": "e2e-responsive-matrix",
+              "workflow_job_id": 92002,
+              "conclusion": "success",
+              "exact_runner_image": {
+                "name": "ubuntu24",
+                "version": "20260701.1.0"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "block_id": "block-2",
+      "runs": [
+        {
+          "benchmark_layout": "monolith",
+          "workflow_run_id": 1002,
+          "run_attempt": 1,
+          "conclusion": "success",
+          "workflow_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+          "workflow_digest": "sha256:b37ba25c29255927f4ff9b5f88f99b1bafe3fdd9e9c4bc5b7993a3c619b338b7",
+          "run_url": "https://github.com/squne121/loop-protocol/actions/runs/1002",
+          "job_names_started": [
+            "e2e-core",
+            "gate-ready"
+          ],
+          "provider_jobs": [
+            {
+              "job": "e2e-core",
+              "workflow_job_id": 91002,
+              "conclusion": "success",
+              "exact_runner_image": {
+                "name": "ubuntu24",
+                "version": "20260701.1.0"
+              }
+            }
+          ]
+        },
+        {
+          "benchmark_layout": "split",
+          "workflow_run_id": 2002,
+          "run_attempt": 1,
+          "conclusion": "success",
+          "workflow_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+          "workflow_digest": "sha256:b37ba25c29255927f4ff9b5f88f99b1bafe3fdd9e9c4bc5b7993a3c619b338b7",
+          "run_url": "https://github.com/squne121/loop-protocol/actions/runs/2002",
+          "job_names_started": [
+            "e2e-core",
+            "e2e-responsive-matrix",
+            "gate-ready"
+          ],
+          "provider_jobs": [
+            {
+              "job": "e2e-core",
+              "workflow_job_id": 92003,
+              "conclusion": "success",
+              "exact_runner_image": {
+                "name": "ubuntu24",
+                "version": "20260701.1.0"
+              }
+            },
+            {
+              "job": "e2e-responsive-matrix",
+              "workflow_job_id": 92004,
+              "conclusion": "success",
+              "exact_runner_image": {
+                "name": "ubuntu24",
+                "version": "20260701.1.0"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "evidence_errors": []
+}
