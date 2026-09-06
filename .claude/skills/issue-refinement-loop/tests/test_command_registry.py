@@ -1193,6 +1193,267 @@ class TestValidateRegistry:
         assert any("undeclared placeholder" in e for e in errors)
         assert any("does not match entry id" in e for e in errors)
 
+    # -- PR #2519 OWNER REQUEST_CHANGES P1: preceding-token validation ------
+
+    def test_optional_flag_pair_preceded_by_executable_is_detected(self, monkeypatch):
+        """P1: an optional_flag_pair whole-token placeholder immediately
+        preceded by the executable position (not a literal flag) must be
+        detected -- dropping the preceding token here would delete the
+        executable itself, leaving an empty argv."""
+        fixture = {
+            "example.badoptional_exec": {
+                "id": "example.badoptional_exec",
+                "argv": ["python3", "{output}"],
+                "placeholders": {
+                    "output": {
+                        "type": "path",
+                        "required": False,
+                        "optional_flag_pair": True,
+                    },
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("optional_flag_pair" in e and "preceding flag" in e for e in errors)
+
+    def test_optional_flag_pair_preceded_by_positional_script_path_is_detected(
+        self, monkeypatch
+    ):
+        """P1: an optional_flag_pair whole-token placeholder immediately
+        preceded by a positional argument / script path (not a literal
+        flag) must be detected."""
+        fixture = {
+            "example.badoptional_positional": {
+                "id": "example.badoptional_positional",
+                "argv": ["python3", "script.py", "{output}"],
+                "placeholders": {
+                    "output": {
+                        "type": "path",
+                        "required": False,
+                        "optional_flag_pair": True,
+                    },
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("optional_flag_pair" in e and "preceding flag" in e for e in errors)
+
+    def test_optional_flag_pair_preceded_by_templated_flag_is_detected(self, monkeypatch):
+        """P1: an optional_flag_pair whole-token placeholder immediately
+        preceded by a flag-like token that itself embeds a placeholder
+        (e.g. "--{flag}") must be detected -- a plain `startswith("-")`
+        check would incorrectly accept this "templated flag" case, but if
+        `flag`'s own value is omitted the preceding token collapses to a
+        bare "--" (or an unresolved placeholder if `flag` is required)."""
+        fixture = {
+            "example.badoptional_templated_flag": {
+                "id": "example.badoptional_templated_flag",
+                "argv": ["tool", "--{flag}", "{output}"],
+                "placeholders": {
+                    "flag": {"type": "string", "required": True},
+                    "output": {
+                        "type": "path",
+                        "required": False,
+                        "optional_flag_pair": True,
+                    },
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("optional_flag_pair" in e and "preceding flag" in e for e in errors)
+
+    def test_optional_flag_pair_preceded_by_option_terminator_is_detected(
+        self, monkeypatch
+    ):
+        """P1: an optional_flag_pair whole-token placeholder immediately
+        preceded by the POSIX "--" option terminator must be detected --
+        dropping "--" changes argument-parsing semantics for every token
+        that follows it."""
+        fixture = {
+            "example.badoptional_terminator": {
+                "id": "example.badoptional_terminator",
+                "argv": ["tool", "--", "{output}"],
+                "placeholders": {
+                    "output": {
+                        "type": "path",
+                        "required": False,
+                        "optional_flag_pair": True,
+                    },
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("optional_flag_pair" in e and "preceding flag" in e for e in errors)
+
+    # -- PR #2519 OWNER REQUEST_CHANGES P2-1: whole-token-only enforcement --
+
+    def test_optional_flag_pair_also_embedded_elsewhere_is_detected(self, monkeypatch):
+        """P2-1: an optional_flag_pair placeholder that is correctly used as
+        a whole token in one place, but *also* appears embedded in a
+        different argv token (e.g. "--cache={output}"), must be detected --
+        omitting the value would leave the embedded reference unresolved."""
+        fixture = {
+            "example.badoptional_embedded": {
+                "id": "example.badoptional_embedded",
+                "argv": ["tool", "--output", "{output}", "--cache={output}"],
+                "placeholders": {
+                    "output": {
+                        "type": "path",
+                        "required": False,
+                        "optional_flag_pair": True,
+                    },
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any(
+            "optional_flag_pair" in e and "embedded" in e and "output" in e
+            for e in errors
+        )
+
+    def test_bool_flag_also_embedded_elsewhere_is_detected(self, monkeypatch):
+        """P2-1: a bool_flag placeholder that is correctly used as a whole
+        token in one place, but also appears embedded in a different argv
+        token (e.g. "--copy={switch}"), must be detected -- the embedded
+        occurrence would receive a plain string substitution instead of the
+        bool_flag emit/omit semantics, diverging from the spec."""
+        fixture = {
+            "example.badboolflag_embedded": {
+                "id": "example.badboolflag_embedded",
+                "argv": ["tool", "{switch}", "--copy={switch}"],
+                "placeholders": {
+                    "switch": {"type": "bool_flag", "flag_literal": "--switch"},
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any(
+            "bool_flag" in e and "embedded" in e and "switch" in e for e in errors
+        )
+
+    # -- PR #2519 OWNER REQUEST_CHANGES P2-2: no crash on malformed input ---
+
+    def test_unhashable_type_value_is_diagnosed_not_raised(self, monkeypatch):
+        """P2-2: a `type` value that is itself unhashable (e.g. a list) must
+        not crash validate_registry() via the `in _KNOWN_PLACEHOLDER_TYPES`
+        frozenset membership check (TypeError: unhashable type: 'list').
+        It must instead be reported as a diagnostic."""
+        fixture = {
+            "example.unhashable_type": {
+                "id": "example.unhashable_type",
+                "argv": ["uv", "run", "python3", "script.py", "{thing}"],
+                "placeholders": {
+                    "thing": {"type": ["path"], "required": True},
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any(
+            "'type'" in e and "thing" in e and "string" in e for e in errors
+        )
+
+    def test_multiple_malformed_entries_all_diagnosed_not_abort(self, monkeypatch):
+        """P2-2: an unhashable `type` in one command and a registry
+        key/id mismatch in another must both surface -- one malformed
+        entry must not abort validate_registry() before the rest of
+        REGISTRY is checked."""
+        fixture = {
+            "example.unhashable_type_multi": {
+                "id": "example.unhashable_type_multi",
+                "argv": ["uv", "run", "python3", "script.py", "{thing}"],
+                "placeholders": {
+                    "thing": {"type": ["path"], "required": True},
+                },
+            },
+            "example.multi_id_mismatch": {
+                "id": "wrong_id",
+                "argv": ["uv", "run", "python3", "script.py"],
+                "placeholders": {},
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert len(errors) >= 2
+        assert any("'type'" in e and "thing" in e for e in errors)
+        assert any("does not match entry id" in e for e in errors)
+
+    def test_non_dict_entry_is_diagnosed_not_raised(self, monkeypatch):
+        """P2-2: a REGISTRY entry that is not a dict (e.g. None) must not
+        crash validate_registry() via `entry.get(...)` (AttributeError).
+        It must instead be reported as a diagnostic, and other entries must
+        still be checked."""
+        fixture = {
+            "example.none_entry": None,
+            "example.multi_id_mismatch2": {
+                "id": "wrong_id_2",
+                "argv": ["uv", "run", "python3", "script.py"],
+                "placeholders": {},
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert len(errors) >= 2
+        assert any("must be a dict" in e and "example.none_entry" in e for e in errors)
+        assert any("does not match entry id" in e for e in errors)
+
+    def test_mixed_str_int_placeholder_keys_no_typeerror(self, monkeypatch):
+        """P2-2: placeholder declaration keys mixing str and int must not
+        crash validate_registry() via `sorted()` on a set containing both
+        types (TypeError: '<' not supported between instances of 'int' and
+        'str'). The non-string key must instead be reported as a
+        diagnostic."""
+        fixture = {
+            "example.mixed_keys": {
+                "id": "example.mixed_keys",
+                "argv": ["uv", "run", "python3", "script.py", "{thing}"],
+                "placeholders": {
+                    "thing": {"type": "string", "required": True},
+                    5: {"type": "string"},
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("placeholder key must be a string" in e for e in errors)
+
+    # -- PR #2519 OWNER REQUEST_CHANGES: normal patterns still pass clean ---
+
+    def test_correct_optional_flag_pair_and_bool_flag_still_pass(self, monkeypatch):
+        """Regression guard: legitimate optional_flag_pair (whole-token,
+        preceded by a plain literal flag) and bool_flag (whole-token, with
+        flag_literal) usages -- including routing the same optional value to
+        two different literal flags -- must still validate clean after the
+        P1/P2-1/P2-2 fixes."""
+        fixture = {
+            "example.good_flags": {
+                "id": "example.good_flags",
+                "argv": [
+                    "tool",
+                    "--output",
+                    "{output}",
+                    "--verbose",
+                    "{verbose}",
+                    "--alt-output",
+                    "{output}",
+                ],
+                "placeholders": {
+                    "output": {
+                        "type": "path",
+                        "required": False,
+                        "optional_flag_pair": True,
+                    },
+                    "verbose": {"type": "bool_flag", "flag_literal": "--verbose-on"},
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors == [], errors
+
 
 # ---------------------------------------------------------------------------
 # Issue #2152: --validate CLI wiring + exit codes

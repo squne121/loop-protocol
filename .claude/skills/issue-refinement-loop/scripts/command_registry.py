@@ -1170,6 +1170,58 @@ _KNOWN_PLACEHOLDER_TYPES: frozenset[str] = frozenset({
 # validate_registry() only applies it to entry["argv"] tokens.
 _PLACEHOLDER_REF_RE = re.compile(r"\{([^{}]+)\}")
 
+# The POSIX "end of options" marker. render_command()'s optional_flag_pair
+# omission logic must never drop this token as if it were an ordinary flag
+# literal -- doing so would change argument-parsing semantics for every
+# token that follows it.
+_OPTION_TERMINATOR = "--"
+
+
+def _is_literal_flag_token(tok: str) -> bool:
+    """Return True if `tok` is a fixed CLI flag literal.
+
+    This is the predicate used to validate the token immediately preceding
+    an `optional_flag_pair` whole-token placeholder: render_command() drops
+    that preceding token unconditionally whenever the placeholder value is
+    omitted, so it must be a stable, self-contained flag -- not something
+    that could itself be missing, be the executable, be a positional
+    argument, or become malformed once its own placeholder is resolved.
+
+    Rejects:
+      - the option terminator "--" (see _OPTION_TERMINATOR)
+      - any token containing a placeholder reference, whole-token
+        ("{name}") or embedded ("--{name}", "--cache={name}") -- such a
+        token is not a *fixed* literal
+      - anything that does not look like a flag at all (executable
+        position, positional arguments, bare script paths, etc.) -- these
+        do not start with "-"
+    """
+    if tok == _OPTION_TERMINATOR:
+        return False
+    if _PLACEHOLDER_REF_RE.search(tok):
+        return False
+    return tok.startswith("-")
+
+
+def _placeholder_occurrences(argv: list[str], name: str) -> list[tuple[int, bool]]:
+    """Return (argv_index, is_whole_token) for every `{name}` reference.
+
+    `is_whole_token` is True only when the match spans the *entire* argv
+    token (i.e. the token is exactly "{name}"). Embedded / partial-token
+    occurrences such as "--cache={name}" report False. Used to enforce
+    that `optional_flag_pair` / `bool_flag` placeholders never appear
+    embedded in a larger token anywhere in argv (Issue #2152 P2-1):
+    render_command() only special-cases whole-token occurrences of these
+    placeholder kinds, so any embedded occurrence would either be left
+    unresolved or silently diverge from the whole-token drop/emit behavior.
+    """
+    pattern = re.compile(r"\{" + re.escape(name) + r"\}")
+    occurrences: list[tuple[int, bool]] = []
+    for idx, tok in enumerate(argv):
+        for match in pattern.finditer(tok):
+            occurrences.append((idx, match.start() == 0 and match.end() == len(tok)))
+    return occurrences
+
 
 def validate_registry() -> list[str]:
     """Validate REGISTRY's structural integrity without side effects.
@@ -1187,11 +1239,23 @@ def validate_registry() -> list[str]:
         `_validate_placeholder_value()`'s own default) is a known type
       - `required` / `optional_flag_pair`, when present, are bool
       - `optional_flag_pair: True` placeholders are used as a whole argv
-        token ("{name}") preceded by a literal (non-placeholder) flag
-        token -- matching render_command()'s unconditional-drop-of-the-
-        preceding-token omission semantics
+        token ("{name}") preceded by a *literal flag token* -- i.e. a
+        token that is not the executable, not a positional argument, not
+        the "--" option terminator, and does not itself contain any
+        placeholder reference (whole-token or embedded) -- matching
+        render_command()'s unconditional-drop-of-the-preceding-token
+        omission semantics (Issue #2152 P1)
+      - `optional_flag_pair` / `bool_flag` placeholders never appear
+        embedded in a larger argv token anywhere in argv -- every
+        occurrence of the placeholder name must be a whole-token
+        occurrence (Issue #2152 P2-1)
       - `bool_flag` placeholders are used as a whole argv token and declare
         a non-empty `flag_literal`
+      - malformed inputs (a non-dict `entry`, a non-string `type` that is
+        unhashable, a non-string placeholder key) are reported as
+        diagnostics rather than raised as exceptions, so a single bad
+        entry never prevents the rest of REGISTRY from being checked
+        (Issue #2152 P2-2)
 
     Returns:
         A list of diagnostic strings, one per detected inconsistency, each
@@ -1204,6 +1268,12 @@ def validate_registry() -> list[str]:
     errors: list[str] = []
 
     for key, entry in REGISTRY.items():
+        if not isinstance(entry, dict):
+            errors.append(
+                f"{key}: registry entry must be a dict, got {type(entry).__name__}"
+            )
+            continue
+
         cmd_id = entry.get("id")
         if cmd_id != key:
             errors.append(
@@ -1233,7 +1303,22 @@ def validate_registry() -> list[str]:
             for match in _PLACEHOLDER_REF_RE.finditer(token):
                 used_names.add(match.group(1))
 
-        declared_names = set(placeholders.keys())
+        # Placeholder keys must be strings for the rest of this function's
+        # set arithmetic (`used_names` is always str, sourced from a regex
+        # group) and for sorted() to be well-defined. A non-string key
+        # (e.g. an int) is reported as its own diagnostic and excluded from
+        # `declared_names` rather than allowed to reach sorted() on a mixed
+        # str/int set, which would raise TypeError and abort the whole
+        # function (Issue #2152 P2-2).
+        declared_names: set[str] = set()
+        for ph_key in placeholders.keys():
+            if not isinstance(ph_key, str):
+                errors.append(
+                    f"{key}: placeholder key must be a string, got "
+                    f"{type(ph_key).__name__}: {ph_key!r}"
+                )
+                continue
+            declared_names.add(ph_key)
 
         for name in sorted(used_names - declared_names):
             errors.append(
@@ -1246,6 +1331,11 @@ def validate_registry() -> list[str]:
             )
 
         for name, spec in placeholders.items():
+            if not isinstance(name, str):
+                # Already reported above; skip further per-placeholder
+                # checks for this malformed key.
+                continue
+
             if not isinstance(spec, dict):
                 errors.append(
                     f"{key}: placeholder '{name}' spec must be a dict, "
@@ -1254,7 +1344,19 @@ def validate_registry() -> list[str]:
                 continue
 
             ph_type = spec.get("type", "string")
-            if ph_type not in _KNOWN_PLACEHOLDER_TYPES:
+            if not isinstance(ph_type, str):
+                # `in _KNOWN_PLACEHOLDER_TYPES` below is a frozenset
+                # membership check, which raises TypeError for unhashable
+                # values (e.g. a list). Guard with an isinstance check
+                # first so a single bad `type` declaration is reported as
+                # a diagnostic instead of aborting validate_registry()
+                # entirely (Issue #2152 P2-2).
+                errors.append(
+                    f"{key}: placeholder '{name}' 'type' must be a string, "
+                    f"got {type(ph_type).__name__}: {ph_type!r}"
+                )
+                ph_type = "string"
+            elif ph_type not in _KNOWN_PLACEHOLDER_TYPES:
                 errors.append(
                     f"{key}: placeholder '{name}' has unknown type {ph_type!r}"
                 )
@@ -1273,8 +1375,10 @@ def validate_registry() -> list[str]:
                     f"be bool, got {type(spec['optional_flag_pair']).__name__}"
                 )
 
-            whole_token_positions = [
-                idx for idx, tok in enumerate(argv) if tok == f"{{{name}}}"
+            occurrences = _placeholder_occurrences(argv, name)
+            whole_token_positions = [idx for idx, is_whole in occurrences if is_whole]
+            embedded_positions = [
+                idx for idx, is_whole in occurrences if not is_whole
             ]
 
             if spec.get("optional_flag_pair") is True:
@@ -1282,6 +1386,14 @@ def validate_registry() -> list[str]:
                     errors.append(
                         f"{key}: placeholder '{name}' optional_flag_pair "
                         f"requires a whole-token '{{{name}}}' occurrence in argv"
+                    )
+                if embedded_positions:
+                    errors.append(
+                        f"{key}: placeholder '{name}' has optional_flag_pair=True "
+                        f"but also appears embedded (partial-token) in argv at "
+                        f"index {embedded_positions}; every reference to an "
+                        f"optional_flag_pair placeholder must be a whole-token "
+                        f"'{{{name}}}' occurrence"
                     )
                 for idx in whole_token_positions:
                     if idx == 0:
@@ -1291,10 +1403,13 @@ def validate_registry() -> list[str]:
                         )
                         continue
                     prev_tok = argv[idx - 1]
-                    if prev_tok.startswith("{") and prev_tok.endswith("}"):
+                    if not _is_literal_flag_token(prev_tok):
                         errors.append(
-                            f"{key} argv[{idx}]: optional_flag_pair "
-                            f"requires a preceding flag"
+                            f"{key} argv[{idx}]: optional_flag_pair requires a "
+                            f"preceding flag (a fixed literal token -- not the "
+                            f"executable, a positional argument, the '--' "
+                            f"terminator, or a token containing a placeholder "
+                            f"reference), got {prev_tok!r}"
                         )
 
             if ph_type == "bool_flag":
@@ -1302,6 +1417,13 @@ def validate_registry() -> list[str]:
                     errors.append(
                         f"{key}: placeholder '{name}' bool_flag requires a "
                         f"whole-token '{{{name}}}' occurrence in argv"
+                    )
+                if embedded_positions:
+                    errors.append(
+                        f"{key}: placeholder '{name}' is bool_flag but also "
+                        f"appears embedded (partial-token) in argv at index "
+                        f"{embedded_positions}; every reference to a bool_flag "
+                        f"placeholder must be a whole-token '{{{name}}}' occurrence"
                     )
                 flag_literal = spec.get("flag_literal")
                 if not isinstance(flag_literal, str) or not flag_literal:
