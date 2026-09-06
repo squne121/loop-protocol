@@ -453,6 +453,13 @@ elif argv == ["api", "repos/squne121/loop-protocol/issues/comments/1"]:
     response = json.loads((ARTIFACT / "fake_anchor.json").read_text(encoding="utf-8"))
 elif len(argv) == len(patch_prefix) + 1 and argv[:-1] == patch_prefix:
     operation = "issue_content_patch"
+    # Issue #2526 fix_delta (PR #2533 OWNER review) regression harness only:
+    # record that the PATCH branch was ENTERED (an attempt), distinct from
+    # the completion evidence appended to fake_gh_operations.jsonl at the
+    # bottom of this script -- so a test can observe attempt count
+    # separately from completion count.
+    with (ARTIFACT / "fake_gh_patch_attempts.jsonl").open("a", encoding="utf-8") as attempt_handle:
+        attempt_handle.write(json.dumps({"argv": argv}) + "\\n")
     # Issue #2393 P1-B regression harness only: deterministically hang the
     # PATCH call itself (before the fixture state is ever mutated) so a
     # real, single-process-group child under `_run_child_with_supervision()`
@@ -1427,31 +1434,6 @@ def test_contract_update_outer_artifact_projection_failure_preserves_inner_trans
         extra_env=config_only_env,
     )
 
-    # AC3: the outer dispatch failed on the artifact-projection branch (not
-    # the inner child's own exit-code relay) -- AND-combined, never OR.
-    assert result_proc.returncode == 2, result_proc.stderr
-    assert result_proc.stdout == "", result_proc.stdout
-    assert "SKILL_RUNTIME_FAIL" in result_proc.stderr, result_proc.stderr
-    assert "reason_code=stale_worktree_runtime_state" in result_proc.stderr, result_proc.stderr
-    assert (
-        "recovery=do_not_publish_artifact_projection_outside_issue_artifact_root" in result_proc.stderr
-    ), result_proc.stderr
-    assert "stale_path=README.md" in result_proc.stderr, result_proc.stderr
-
-    # AC4: BOTH `inner_transaction_result_ref` and
-    # `inner_transaction_disposition=patch` must be recoverable from the
-    # SAME `SKILL_RUNTIME_FAIL` stderr line (OR is forbidden).
-    # `inner_transaction_state=unknown` is a hard FAILURE for this scenario
-    # -- mutation, readback, and result persistence all genuinely succeeded
-    # before the artifact-projection corruption was ever detected.
-    assert "inner_transaction_state=unknown" not in result_proc.stderr, result_proc.stderr
-    ref_match = re.search(r"inner_transaction_result_ref=(\S+)", result_proc.stderr)
-    disposition_match = re.search(r"inner_transaction_disposition=(\S+)", result_proc.stderr)
-    assert ref_match is not None, result_proc.stderr
-    assert disposition_match is not None, result_proc.stderr
-    assert disposition_match.group(1) == "patch", result_proc.stderr
-
-    inner_result_path = Path(ref_match.group(1))
     expected_inner_result_path = (
         execution_root
         / ".claude"
@@ -1460,7 +1442,38 @@ def test_contract_update_outer_artifact_projection_failure_preserves_inner_trans
         / "1498"
         / "refinement_preflight_result_v1.json"
     )
-    assert inner_result_path == expected_inner_result_path, (inner_result_path, expected_inner_result_path)
+
+    # AC3: the outer dispatch failed on the artifact-projection branch (not
+    # the inner child's own exit-code relay) -- AND-combined, never OR.
+    assert result_proc.returncode == 2, result_proc.stderr
+    assert result_proc.stdout == "", result_proc.stdout
+    assert "SKILL_RUNTIME_FAIL" in result_proc.stderr, result_proc.stderr
+
+    # AC4 (fix_delta from PR #2533 OWNER review): extract the SINGLE
+    # `SKILL_RUNTIME_FAIL` stderr line and parse its `key=value` fields into
+    # a dict, so every assertion below is checked against the SAME line --
+    # a part-match against the whole stderr blob (or independent
+    # `re.search()` calls) cannot prove co-location on one failure line.
+    failure_lines = [line for line in result_proc.stderr.splitlines() if line.startswith("SKILL_RUNTIME_FAIL: ")]
+    assert len(failure_lines) == 1, result_proc.stderr
+    failure_line = failure_lines[0]
+    fields = dict(re.findall(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=(\S+)", failure_line))
+
+    assert fields["reason_code"] == "stale_worktree_runtime_state", failure_line
+    assert fields["stale_path"] == "README.md", failure_line
+    assert fields["recovery"] == "do_not_publish_artifact_projection_outside_issue_artifact_root", failure_line
+
+    # BOTH `inner_transaction_result_ref` and `inner_transaction_disposition`
+    # must be recoverable from the SAME `SKILL_RUNTIME_FAIL` line (OR is
+    # forbidden). `inner_transaction_state=unknown` is a hard FAILURE for
+    # this scenario -- mutation, readback, and result persistence all
+    # genuinely succeeded before the artifact-projection corruption was
+    # ever detected.
+    assert "inner_transaction_state" not in fields, failure_line
+    assert fields["inner_transaction_disposition"] == "patch", failure_line
+    assert fields["inner_transaction_result_ref"] == str(expected_inner_result_path), failure_line
+
+    inner_result_path = Path(fields["inner_transaction_result_ref"])
     inner_result = json.loads(inner_result_path.read_text(encoding="utf-8"))
     assert inner_result["contract_update"]["status"] == "failed"
     assert inner_result["contract_update"]["disposition"] == "patch"
@@ -1475,6 +1488,16 @@ def test_contract_update_outer_artifact_projection_failure_preserves_inner_trans
         json.loads(line)
         for line in (artifact_dir / "fake_gh_operations.jsonl").read_text(encoding="utf-8").splitlines()
     ]
+    # AC5 (fix_delta from PR #2533 OWNER review): observe the actual number
+    # of times the fake GitHub executable's PATCH branch was ENTERED, not
+    # just how many times it reached completion -- attempt count and
+    # completion count must both be exactly 1 (no blind resend, no partial
+    # attempt that silently failed before completion).
+    patch_attempts_path = artifact_dir / "fake_gh_patch_attempts.jsonl"
+    patch_attempts = (
+        patch_attempts_path.read_text(encoding="utf-8").splitlines() if patch_attempts_path.exists() else []
+    )
+    assert len(patch_attempts) == 1, patch_attempts
     assert operations.count("issue_content_patch") == 1, operations
 
 
