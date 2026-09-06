@@ -1,0 +1,42 @@
+{
+  "schema": "CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1",
+  "schema_version": 1,
+  "experiment_identity": "issue-2486-pr-9999-a1b2c3d4e5f6-fed654cba321",
+  "manifest_sha256": "sha256:d952f2456a0a624e3c3859cc6a6a15d06b67046405de2b6160a4d05232d80dbd",
+  "run_set_digest": "sha256:ca7fb20d3fa6b8c3e06860811bcb12b60f03cf3b9ebe6e1b7a60e2b506815bda",
+  "materialization_policy": "close_grade_fail_closed_v1",
+  "arms": {
+    "monolith": {
+      "workflow_run_ids": [
+        "1001",
+        "1002"
+      ],
+      "performance_eligible_workflow_run_ids": [
+        "1001",
+        "1002"
+      ]
+    },
+    "split": {
+      "workflow_run_ids": [
+        "2001",
+        "2002"
+      ],
+      "performance_eligible_workflow_run_ids": [
+        "2001",
+        "2002"
+      ]
+    }
+  },
+  "evidence_errors": [],
+  "performance_assessment": {
+    "complete": true
+  },
+  "trusted_functional_evidence": {
+    "gate_ready_probe": "issue-2486-fixture-trusted-evidence"
+  },
+  "validation": {
+    "semantic_valid": true,
+    "approval_eligible": true
+  },
+  "exit_code": 0
+}

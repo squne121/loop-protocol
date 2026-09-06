@@ -1,0 +1,53 @@
+{
+  "schema": "CI_RELIABILITY_CLOSE_GRADE_RESULT_V1",
+  "schema_version": 1,
+  "experiment_identity": "issue-2486-pr-9999-a1b2c3d4e5f6-fed654cba321",
+  "manifest_digest": "sha256:120e4111041862f113bcde06272d4fed6cf4818da245150b600db95f5ddd3f05",
+  "canonical_workflow_run_ids": {
+    "monolith": [
+      1001,
+      1002
+    ],
+    "split": [
+      2001,
+      2002
+    ]
+  },
+  "receipt_run_set_digest": "sha256:ca7fb20d3fa6b8c3e06860811bcb12b60f03cf3b9ebe6e1b7a60e2b506815bda",
+  "assessment_content_digests": {
+    "workflow_failure_rate": "sha256:e67743275f21a9b72cbfac97fd3f8f0186dd60475830ea2418f33ba6a3c3f71c",
+    "playwright_flaky_test_rate": "sha256:4350663fe262e25fb0cc0e012be50e0edb692d8daffd4442edc69f251b99f9ee",
+    "playwright_terminal_failure_rate": "sha256:78480627938350ee7edfb532992381eb334c97ce1b1cf592c366e5da5ea1de3f"
+  },
+  "validator_results": {
+    "workflow_failure_rate": {
+      "schema": "CI_TEST_RELIABILITY_ASSESSMENT_V1_VALIDATION_RESULT",
+      "exit_code": 0,
+      "structural_valid": true,
+      "semantic_valid": true
+    },
+    "playwright_flaky_test_rate": {
+      "schema": "CI_TEST_RELIABILITY_ASSESSMENT_V1_VALIDATION_RESULT",
+      "exit_code": 0,
+      "structural_valid": true,
+      "semantic_valid": true
+    },
+    "playwright_terminal_failure_rate": {
+      "schema": "CI_TEST_RELIABILITY_ASSESSMENT_V1_VALIDATION_RESULT",
+      "exit_code": 0,
+      "structural_valid": true,
+      "semantic_valid": true
+    }
+  },
+  "composite_envelope_digest": "sha256:467b30199f0b10bfed358f15b74e428f49ca8727e4d1c94ab8e06073c7dd8dcd",
+  "invocation_artifacts": [],
+  "aggregate": {
+    "complete": true,
+    "semantic_valid": true,
+    "sample_satisfied": true,
+    "all_non_inferior": true,
+    "exit_code": 0
+  },
+  "diagnostic_errors": [],
+  "canonical_output_digest": "sha256:1682f533c38456f40c706934be448d910cd38c8d4e62f6f5dd8fdc9f174897e5"
+}
