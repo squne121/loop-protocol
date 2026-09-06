@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import zipfile
@@ -1383,6 +1384,419 @@ def test_bounded_retrieve_success_content_matches_original_bytes(
     assert result.returncode == 0, result.stderr
     assert status["STATUS"] == "ok"
     assert dest.read_bytes() == original_content.encode("utf-8")
+
+
+# --- PR #2514 review fix_delta (2026-09): P1-1/P1-2/P2-1/P2-2 -------------
+#
+# Issue #2505 was initially implemented and approved, then an adversarial
+# review of the same HEAD found four concrete bypass paths: (P1-1) a helper
+# crash/kill with no status file silently fell through to the aggregation
+# loop's `ok` default; (P1-2) BZIP2/LZMA entries were opened without regard
+# for the fact that `zlib`-only bounded decompression cannot cap their
+# output; (P2-1) `zf.open(selected).read(N+1)` silently truncates output at
+# the entry's OWN declared (and possibly forged) `file_size` instead of at
+# N; (P2-2) `proc.stdout.read(chunk_size)` blocks until either a full
+# chunk-sized read or EOF, so a sender that flushes an over-limit byte and
+# then stalls without closing the pipe is never detected until it eventually
+# closes (or the caller times out).
+
+
+def _build_zip_compressed_2505(entries: list[tuple[str, str]], compression: int) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression) as zf:
+        for name, content in entries:
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+def _build_zip_declared_size_lie_2505(name: str, declared_content: bytes, real_content: bytes) -> bytes:
+    """A STORED entry whose LOCAL and CENTRAL declared `file_size`/
+    `compress_size`/CRC-32 all honestly describe `declared_content` (a
+    normal, tiny value), while the PHYSICAL bytes actually occupying that
+    entry's data region in the archive are `real_content` (far larger than
+    `declared_content`). The central directory's `offset of start of
+    central directory` field is patched to the CORRECT new (shifted)
+    position so `zipfile.ZipFile()` parses this without invoking its
+    self-extracting-archive-prefix `concat` compensation (which assumes a
+    UNIFORM shift of every entry and would otherwise misplace this single
+    entry's `header_offset`), keeping `header_offset` at the true value (0)
+    a `bounded_extract()`-style implementation depends on."""
+    baseline = _build_zip_stored_2505([(name, declared_content.decode("latin-1"))])
+    cd_start = baseline.find(b"PK\x01\x02")
+    head, tail = baseline[:cd_start], baseline[cd_start:]
+    content_start = cd_start - len(declared_content)
+    assert head[content_start : content_start + len(declared_content)] == declared_content
+    patched_head = head[:content_start] + real_content
+    new_cd_start = len(patched_head)
+    eocd_pos = tail.find(b"PK\x05\x06")
+    assert eocd_pos != -1
+    eocd = bytearray(tail[eocd_pos:])
+    struct.pack_into("<L", eocd, 16, new_cd_start)
+    patched_tail = tail[:eocd_pos] + bytes(eocd)
+    return patched_head + patched_tail
+
+
+def test_bounded_retrieve_bzip2_entry_rejected_before_extraction(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """P1-2: a BZIP2-compressed entry must be rejected BEFORE any attempt to
+    open/decompress it -- BZIP2's decompressor object has no bounded-output
+    `decompress(data, max_length)` primitive, so a bounded read can never be
+    enforced for it."""
+    payload = _build_zip_compressed_2505([(DECISION_ENTRY_NAME_2505, "hello world")], zipfile.ZIP_BZIP2)
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] == "unsupported_compression_method"
+    assert not dest.exists()
+
+
+def test_bounded_retrieve_lzma_entry_rejected_before_extraction(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """P1-2: same as above, for LZMA -- also has no bounded-output
+    decompressor primitive."""
+    payload = _build_zip_compressed_2505([(DECISION_ENTRY_NAME_2505, "hello world")], zipfile.ZIP_LZMA)
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] == "unsupported_compression_method"
+    assert not dest.exists()
+
+
+def test_bounded_retrieve_declared_size_lie_exceeds_limit_rejected(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """P2-1: a STORED entry declares (and self-consistently CRCs) a 2-byte
+    `file_size`, but the PHYSICAL bytes occupying its data region in the
+    archive are 1,000,002 real bytes -- exceeding `max_read_bytes=1_000_000`.
+    The old `zf.open(selected).read(max_read_bytes + 1)` truncates its
+    output AT THE DECLARED 2-byte size (since `ZipExtFile.read()` never
+    reads past an entry's own declared size), so `len(data) > max_read_bytes`
+    was always False and this was reported `ok` with a 2-byte file written
+    -- silently accepting an entry whose true physical extent violates the
+    resource bound. The fix must reject this as `read_size_exceeded`,
+    independent of the declared size and CRC."""
+    real_content = b"Y" * 1_000_002
+    payload = _build_zip_declared_size_lie_2505(DECISION_ENTRY_NAME_2505, b"XX", real_content)
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] == "read_size_exceeded"
+    assert not dest.exists()
+
+
+def test_bounded_retrieve_declared_size_honest_small_entry_still_succeeds(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """Regression guard for the P2-1 fix: an HONEST small STORED entry
+    (declared size matches the real physical content, nothing hidden past
+    it besides the archive's own trailing central directory / EOCD
+    structure) must still succeed with EXACTLY its own content -- the fix
+    must not regress the common case just because it stopped trusting the
+    declared size for the OVER-limit judgement."""
+    payload = _build_zip_stored_2505([(DECISION_ENTRY_NAME_2505, '{"schema":"decision-v1"}')])
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode == 0, result.stderr
+    assert status["STATUS"] == "ok"
+    assert dest.read_text(encoding="utf-8") == '{"schema":"decision-v1"}'
+
+
+def test_bounded_retrieve_corrupted_deflate_stream_never_reports_ok(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """P1-1 point 4: a corrupted DEFLATE stream must raise `zlib.error`
+    (never silently produce a truncated/garbage `ok` result) and must be
+    classified as `invalid_zip`, exercising the broad `except` clause added
+    around `bounded_extract()` (not just the pre-existing `zipfile.BadZipFile`
+    /`EOFError`/`RuntimeError` set)."""
+    payload = _build_zip_2505([(DECISION_ENTRY_NAME_2505, "a" * 200)])
+    marker = _build_zip_2505([(DECISION_ENTRY_NAME_2505, "a" * 200)])
+    assert payload == marker  # sanity: deterministic construction
+    # Flip a byte inside the DEFLATE-compressed data region (not the header)
+    # to corrupt the compressed bitstream itself.
+    zf = zipfile.ZipFile(io.BytesIO(payload))
+    info = zf.infolist()[0]
+    data_start = 30 + len(info.filename)
+    corrupted = bytearray(payload)
+    corrupted[data_start] ^= 0xFF
+    corrupted[data_start + 1] ^= 0xFF
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=bytes(corrupted),
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] in ("invalid_zip", "internal_error")
+    assert not dest.exists()
+
+
+def test_bounded_retrieve_download_stall_after_over_limit_flush_rejects_without_waiting_for_eof(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """P2-2: the fake `gh` flushes `max_download_bytes + 1` bytes and then
+    STALLS (keeps the pipe open, never sends EOF, never closes stdout) while
+    periodically touching a sentinel file. With the pre-fix
+    `proc.stdout.read(chunk_size)` (a full blocking read requesting
+    `chunk_size` bytes), this would hang until the stall ends because the
+    flushed payload here is far smaller than `chunk_size` -- proven
+    separately: the identical scenario against the OLD `read()`-based
+    implementation blocks past a 5s timeout. `read1()` must instead return
+    the already-available over-limit bytes immediately, and the helper must
+    kill+reap the child (proven by the sentinel ceasing to update) rather
+    than waiting for EOF."""
+    max_download_bytes = 100
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    sentinel = tmp_path / "sentinel.txt"
+    fake_gh = bin_dir / "gh"
+    fake_gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, time\n"
+        "sentinel = os.environ['REAP_SENTINEL']\n"
+        f"data = b'Q' * {max_download_bytes + 1}\n"
+        "sys.stdout.buffer.write(data)\n"
+        "sys.stdout.buffer.flush()\n"
+        "try:\n"
+        "    while True:\n"
+        "        with open(sentinel, 'w') as fh:\n"
+        "            fh.write(str(time.time()))\n"
+        "        time.sleep(0.1)\n"
+        "except BrokenPipeError:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    status_file = tmp_path / "status.kv"
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "REAP_SENTINEL": str(sentinel)}
+    t0 = __import__("time").time()
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(bounded_zip_retrieve_script),
+            "--label",
+            "decision",
+            "--zip-url",
+            "repos/squne121/loop-protocol/actions/artifacts/1/zip",
+            "--max-download-bytes",
+            str(max_download_bytes),
+            "--max-entries",
+            str(DECISION_ZIP_MAX_ENTRIES_2505),
+            "--max-read-bytes",
+            str(DECISION_MAX_READ_BYTES_2505),
+            "--status-output-file",
+            str(status_file),
+            "--target",
+            DECISION_ENTRY_NAME_2505,
+            str(dest),
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        # Bounded well below the fake `gh`'s stall duration (which is
+        # effectively unbounded) -- proves EOF was never waited for.
+        timeout=10,
+    )
+    elapsed = __import__("time").time() - t0
+    assert result.returncode != 0
+    status_text = status_file.read_text(encoding="utf-8")
+    assert "STATUS=download_size_exceeded" in status_text
+    assert not dest.exists()
+    assert elapsed < 5, f"helper took {elapsed}s -- looks like it waited for EOF instead of using read1()"
+
+    # The child `gh` process must have been killed/reaped, not merely
+    # detached: its sentinel-touching loop must stop updating once this
+    # helper has returned.
+    mtime_at_exit = sentinel.stat().st_mtime
+    __import__("time").sleep(0.5)
+    mtime_after_grace = sentinel.stat().st_mtime
+    assert mtime_at_exit == mtime_after_grace, "sentinel kept updating -- child process was not reaped"
+
+
+def test_download_step_aggregation_rejects_on_retrieve_process_crash_without_status_file(
+    download_step: dict, tmp_path: Path
+):
+    """P1-1 points 1/2: if `bounded_zip_retrieve.py` is invoked but crashes
+    (or `uv run` itself fails) WITHOUT ever writing a status file, the
+    aggregation loop must NOT silently fall through to its `ok` default --
+    it must reject with a dedicated `retrieve_process_failed` reason. This
+    runs the ACTUAL `download` step `run:` script end-to-end (never a
+    reimplemented copy) against a fake `uv` that intercepts every
+    `uv run --locked python3 <script> ...` invocation the step makes."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, os\n"
+        "argv = sys.argv[1:]\n"
+        "def get_opt(name):\n"
+        "    return argv[argv.index(name) + 1] if name in argv else None\n"
+        "script = next((a for a in argv if a.endswith('.py')), '')\n"
+        "if script.endswith('resolve_visual_impact.py'):\n"
+        "    out_file = get_opt('--artifact-id-output-file')\n"
+        "    if out_file:\n"
+        "        with open(out_file, 'w') as fh:\n"
+        "            fh.write('1')\n"
+        "    sys.exit(0)\n"
+        "if 'bounded_zip_retrieve' in script or script.endswith('.py') and 'bounded_zip_retrieve' in ' '.join(argv):\n"
+        "    label = get_opt('--label')\n"
+        "    status_file = get_opt('--status-output-file')\n"
+        "    if label == os.environ.get('FAIL_LABEL'):\n"
+        "        sys.exit(137)\n"
+        "    with open(status_file, 'w') as fh:\n"
+        "        fh.write('STATUS=ok\\nARTIFACT=%s\\nLIMIT=\\n' % label)\n"
+        "    sys.exit(0)\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    github_output = tmp_path / "github_output.txt"
+    github_output.write_text("", encoding="utf-8")
+    runner_temp = tmp_path / "runner_temp"
+    runner_temp.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "GH_TOKEN": "test-token",
+        "REPO": EXPECTED_REPOSITORY,
+        "RUN_ID": "4242",
+        "RUN_ATTEMPT": "2",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_OUTPUT": str(github_output),
+        "RUNNER_TEMP": str(runner_temp),
+        "EXPECTED_ARTIFACT_HEAD_SHA": EXPECTED_HEAD_SHA,
+        "FAIL_LABEL": "decision",
+    }
+    result = subprocess.run(
+        ["bash", "-c", download_step["run"]],
+        cwd=work_dir,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 1, result.stderr
+    outputs = github_output.read_text(encoding="utf-8")
+    assert "download_status=rejected" in outputs
+    assert "download_failure_reason=retrieve_process_failed" in outputs
+    assert "artifact=decision" in outputs
+    assert "exit=137" in outputs
+
+
+def test_download_step_aggregation_passes_when_all_retrieves_succeed(download_step: dict, tmp_path: Path):
+    """Regression guard: with both retrieve helper invocations reporting
+    `STATUS=ok` and exit 0, the aggregation loop must still emit
+    `download_status=ok` and the step must exit 0 -- the P1-1 fix must not
+    turn a genuinely successful run into a false rejection."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, os\n"
+        "argv = sys.argv[1:]\n"
+        "def get_opt(name):\n"
+        "    return argv[argv.index(name) + 1] if name in argv else None\n"
+        "script = next((a for a in argv if a.endswith('.py')), '')\n"
+        "if script.endswith('resolve_visual_impact.py'):\n"
+        "    out_file = get_opt('--artifact-id-output-file')\n"
+        "    if out_file:\n"
+        "        with open(out_file, 'w') as fh:\n"
+        "            fh.write('1')\n"
+        "    sys.exit(0)\n"
+        "label = get_opt('--label')\n"
+        "status_file = get_opt('--status-output-file')\n"
+        "if status_file:\n"
+        "    with open(status_file, 'w') as fh:\n"
+        "        fh.write('STATUS=ok\\nARTIFACT=%s\\nLIMIT=\\n' % label)\n"
+        "    sys.exit(0)\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    github_output = tmp_path / "github_output.txt"
+    github_output.write_text("", encoding="utf-8")
+    runner_temp = tmp_path / "runner_temp"
+    runner_temp.mkdir()
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "GH_TOKEN": "test-token",
+        "REPO": EXPECTED_REPOSITORY,
+        "RUN_ID": "4242",
+        "RUN_ATTEMPT": "2",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_OUTPUT": str(github_output),
+        "RUNNER_TEMP": str(runner_temp),
+        "EXPECTED_ARTIFACT_HEAD_SHA": EXPECTED_HEAD_SHA,
+    }
+    result = subprocess.run(
+        ["bash", "-c", download_step["run"]],
+        cwd=work_dir,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = github_output.read_text(encoding="utf-8")
+    assert "download_status=ok" in outputs
 
 
 # --- Issue #2505 AC7/AC8/AC9: workflow-level wiring ---------------------

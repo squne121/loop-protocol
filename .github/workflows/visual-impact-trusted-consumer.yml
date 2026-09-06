@@ -175,9 +175,11 @@ jobs:
 
           import argparse
           import io
+          import struct
           import subprocess
           import sys
           import zipfile
+          import zlib
 
           STATUS_OK = "ok"
           STATUS_DOWNLOAD_SIZE_EXCEEDED = "download_size_exceeded"
@@ -186,6 +188,15 @@ jobs:
           STATUS_READ_SIZE_EXCEEDED = "read_size_exceeded"
           STATUS_INVALID_ZIP = "invalid_zip"
           STATUS_DOWNLOAD_COMMAND_FAILED = "download_command_failed"
+          # Issue #2505 PR #2514 review fix_delta P1-2: reject any compress
+          # method other than STORED/DEFLATED before ever opening the entry.
+          STATUS_UNSUPPORTED_COMPRESSION = "unsupported_compression_method"
+          # Issue #2505 PR #2514 review fix_delta P1-1: a default failure
+          # status this helper writes for itself the instant ANY unforeseen
+          # exception escapes the main body below -- so a status file always
+          # exists once this process has started running Python code, even
+          # for a failure mode no individual `except` clause anticipated.
+          STATUS_INTERNAL_ERROR = "internal_error"
 
           EXIT_CODES = {
               STATUS_OK: 0,
@@ -195,7 +206,17 @@ jobs:
               STATUS_READ_SIZE_EXCEEDED: 13,
               STATUS_INVALID_ZIP: 14,
               STATUS_DOWNLOAD_COMMAND_FAILED: 15,
+              STATUS_UNSUPPORTED_COMPRESSION: 16,
+              STATUS_INTERNAL_ERROR: 17,
           }
+
+          # Local file header: signature(4s) + version/flags/method/time/date
+          # (5H) + crc/compress_size/uncompress_size (3L) + filename_len/
+          # extra_len (2H) = 30 bytes fixed, followed by the filename and
+          # extra field.
+          _LOCAL_FILE_HEADER_SIGNATURE = b"PK\x03\x04"
+          _LOCAL_FILE_HEADER_FIXED_STRUCT = "<4s5H3L2H"
+          _LOCAL_FILE_HEADER_FIXED_SIZE = struct.calcsize(_LOCAL_FILE_HEADER_FIXED_STRUCT)
 
 
           def write_status(path: str, status: str, artifact: str, limit) -> None:
@@ -209,7 +230,15 @@ jobs:
               """Stream `gh api <zip_url>` into a bounded in-memory buffer,
               aborting and reaping the process the instant more than
               max_download_bytes have been received. Never writes the
-              response to disk (no post-hoc `stat` of a downloaded file)."""
+              response to disk (no post-hoc `stat` of a downloaded file).
+
+              Issue #2505 PR #2514 review fix_delta P2-2: uses `read1()` (a
+              SINGLE low-level read, returning whatever is immediately
+              available without blocking to fill the full requested size --
+              unlike `read()`, which blocks until either the full amount
+              requested or EOF) so an over-limit byte that has already
+              arrived is detected immediately even if the sender never sends
+              another chunk-sized burst and never closes the pipe."""
               proc = subprocess.Popen(
                   [
                       "gh",
@@ -228,7 +257,8 @@ jobs:
               assert proc.stdout is not None
               try:
                   while True:
-                      chunk = proc.stdout.read(chunk_size)
+                      want = min(chunk_size, max_download_bytes - len(buffer) + 1)
+                      chunk = proc.stdout.read1(want)
                       if not chunk:
                           break
                       buffer.extend(chunk)
@@ -258,6 +288,94 @@ jobs:
               return selected, targets[selected.filename]
 
 
+          def _local_file_header_data_offset(buffer: bytes, info: zipfile.ZipInfo) -> int:
+              """Parse the LOCAL file header at `info.header_offset` directly
+              via `struct` (never trusting the CENTRAL directory's declared
+              sizes -- Issue #2505 PR #2514 review fix_delta P2-1) to compute
+              the byte offset where this entry's raw/compressed data
+              begins."""
+              offset = info.header_offset
+              if buffer[offset : offset + 4] != _LOCAL_FILE_HEADER_SIGNATURE:
+                  raise zipfile.BadZipFile("bad local file header signature")
+              fields = struct.unpack(
+                  _LOCAL_FILE_HEADER_FIXED_STRUCT,
+                  buffer[offset : offset + _LOCAL_FILE_HEADER_FIXED_SIZE],
+              )
+              filename_len = fields[-2]
+              extra_len = fields[-1]
+              return offset + _LOCAL_FILE_HEADER_FIXED_SIZE + filename_len + extra_len
+
+
+          def bounded_extract(buffer: bytes, info: zipfile.ZipInfo, max_read_bytes: int) -> bytes:
+              """Read at most `max_read_bytes + 1` bytes of `info`'s ACTUAL
+              data without ever trusting the central directory's declared
+              `file_size`/`compress_size` to decide when to stop reading
+              (Issue #2505 PR #2514 review fix_delta P2-1): a crafted entry
+              can declare a small size while its true (STORED) physical byte
+              range or (DEFLATED) decompressed byte count is far larger, and
+              `ZipExtFile.read(N)` silently truncates output AT THE DECLARED
+              SIZE instead of at N, letting a beyond-bound entry masquerade
+              as an already-bounded, successfully-read one.
+
+              STORED: the byte range from the data offset to the end of the
+              in-memory buffer is this entry's physical maximum extent;
+              reading `max_read_bytes + 1` bytes of it independently proves
+              whether MORE than the bound physically exists, before ever
+              consulting the declared size. Only once that physical bound has
+              already been confirmed safe does this trust the declared
+              `file_size` (itself bounded to what was actually read) to trim
+              the result to the real entry content -- verified against the
+              entry's own CRC-32 so a corrupted/tampered target entry is
+              still rejected exactly as before.
+
+              DEFLATED: raw deflate streams are self-terminating (a
+              final-block marker inside the compressed bitstream itself,
+              independent of any declared length) -- feeding the
+              decompressor from the data offset through the end of the
+              buffer and stopping at `decompressor.eof` (or once the output
+              budget is exhausted) yields the TRUE decompressed byte count
+              regardless of what `file_size` claims; trailing bytes after the
+              real stream end (next entries / the central directory) are
+              simply never consumed."""
+              data_start = _local_file_header_data_offset(buffer, info)
+
+              if info.compress_type == zipfile.ZIP_STORED:
+                  physical = buffer[data_start : data_start + max_read_bytes + 1]
+                  if len(physical) > max_read_bytes:
+                      return physical
+                  declared_len = min(info.file_size, len(physical))
+                  candidate = bytes(physical[:declared_len])
+                  if zlib.crc32(candidate) & 0xFFFFFFFF != info.CRC:
+                      raise zipfile.BadZipFile("CRC-32 mismatch")
+                  return candidate
+
+              # info.compress_type == zipfile.ZIP_DEFLATED (the only other
+              # compress_type ever reaches this function -- see the
+              # STATUS_UNSUPPORTED_COMPRESSION gate in main() below).
+              decompressor = zlib.decompressobj(-15)
+              remaining_input = buffer[data_start:]
+              pos = 0
+              chunk_size = 65536
+              out = bytearray()
+              while True:
+                  budget = max_read_bytes + 1 - len(out)
+                  if budget <= 0:
+                      break
+                  if decompressor.unconsumed_tail:
+                      feed = decompressor.unconsumed_tail
+                  else:
+                      feed = remaining_input[pos : pos + chunk_size]
+                      pos += chunk_size
+                  if not feed:
+                      break
+                  out.extend(decompressor.decompress(feed, budget))
+                  if decompressor.eof:
+                      break
+              if not decompressor.eof and len(out) <= max_read_bytes:
+                  raise zipfile.BadZipFile("truncated deflate stream")
+              return bytes(out)
+
+
           def main() -> int:
               parser = argparse.ArgumentParser()
               parser.add_argument("--label", required=True)
@@ -272,44 +390,75 @@ jobs:
               args = parser.parse_args()
               targets = {name: dest for name, dest in args.target}
 
-              status, buffer = bounded_download(args.zip_url, args.max_download_bytes)
-              if status != STATUS_OK:
-                  limit = args.max_download_bytes if status == STATUS_DOWNLOAD_SIZE_EXCEEDED else None
-                  write_status(args.status_output_file, status, args.label, limit)
-                  return EXIT_CODES[status]
-
+              # Issue #2505 PR #2514 review fix_delta P1-1 point 3: wrap the
+              # entire processing body in a broad `except Exception` so that
+              # ANY uncaught failure (including one no individual `except`
+              # clause below anticipated -- e.g. a `zlib.error` from a
+              # corrupted DEFLATE stream) still leaves a status file behind.
+              # Without this, the workflow's aggregation step -- which only
+              # ever reads a status file if one exists -- would silently keep
+              # its `ok` default when this helper crashes without writing
+              # anything. A `uv run` launch failure that never reaches this
+              # Python code at all is a SEPARATE failure class caught only by
+              # the bash-side exit-code check the caller performs (this
+              # try/except cannot help there).
               try:
-                  zf = zipfile.ZipFile(io.BytesIO(buffer))
-                  entries = zf.infolist()
-              except zipfile.BadZipFile:
-                  write_status(args.status_output_file, STATUS_INVALID_ZIP, args.label, None)
-                  return EXIT_CODES[STATUS_INVALID_ZIP]
+                  status, buffer = bounded_download(args.zip_url, args.max_download_bytes)
+                  if status != STATUS_OK:
+                      limit = args.max_download_bytes if status == STATUS_DOWNLOAD_SIZE_EXCEEDED else None
+                      write_status(args.status_output_file, status, args.label, limit)
+                      return EXIT_CODES[status]
 
-              if len(entries) > args.max_entries:
-                  write_status(args.status_output_file, STATUS_ENTRY_COUNT_EXCEEDED, args.label, args.max_entries)
-                  return EXIT_CODES[STATUS_ENTRY_COUNT_EXCEEDED]
+                  try:
+                      zf = zipfile.ZipFile(io.BytesIO(buffer))
+                      entries = zf.infolist()
+                  except zipfile.BadZipFile:
+                      write_status(args.status_output_file, STATUS_INVALID_ZIP, args.label, None)
+                      return EXIT_CODES[STATUS_INVALID_ZIP]
 
-              selected, dest_file = select_entry(entries, targets)
-              if selected is None:
-                  write_status(args.status_output_file, STATUS_ENTRY_AMBIGUOUS_OR_MISSING, args.label, None)
-                  return EXIT_CODES[STATUS_ENTRY_AMBIGUOUS_OR_MISSING]
+                  if len(entries) > args.max_entries:
+                      write_status(args.status_output_file, STATUS_ENTRY_COUNT_EXCEEDED, args.label, args.max_entries)
+                      return EXIT_CODES[STATUS_ENTRY_COUNT_EXCEEDED]
 
-              try:
-                  with zf.open(selected) as fh:
-                      data = fh.read(args.max_read_bytes + 1)
-              except (zipfile.BadZipFile, NotImplementedError, EOFError, RuntimeError):
-                  write_status(args.status_output_file, STATUS_INVALID_ZIP, args.label, None)
-                  return EXIT_CODES[STATUS_INVALID_ZIP]
+                  selected, dest_file = select_entry(entries, targets)
+                  if selected is None:
+                      write_status(args.status_output_file, STATUS_ENTRY_AMBIGUOUS_OR_MISSING, args.label, None)
+                      return EXIT_CODES[STATUS_ENTRY_AMBIGUOUS_OR_MISSING]
 
-              if len(data) > args.max_read_bytes:
-                  write_status(args.status_output_file, STATUS_READ_SIZE_EXCEEDED, args.label, args.max_read_bytes)
-                  return EXIT_CODES[STATUS_READ_SIZE_EXCEEDED]
+                  # Issue #2505 PR #2514 review fix_delta P1-2: reject any
+                  # compress method other than STORED/DEFLATED BEFORE ever
+                  # attempting to open/decompress the entry.
+                  # `actions/upload-artifact`'s producer (Node
+                  # `archiver`/`zip-stream`) only ever emits STORED or
+                  # DEFLATED entries; BZIP2/LZMA decompressor objects (unlike
+                  # zlib's) have no bounded-output `decompress(data,
+                  # max_length)` primitive, so a bounded read can never be
+                  # enforced for them at all.
+                  if selected.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                      write_status(args.status_output_file, STATUS_UNSUPPORTED_COMPRESSION, args.label, None)
+                      return EXIT_CODES[STATUS_UNSUPPORTED_COMPRESSION]
 
-              with open(dest_file, "wb") as out:
-                  out.write(data)
+                  try:
+                      data = bounded_extract(bytes(buffer), selected, args.max_read_bytes)
+                  except (zipfile.BadZipFile, NotImplementedError, EOFError, RuntimeError, struct.error, zlib.error):
+                      write_status(args.status_output_file, STATUS_INVALID_ZIP, args.label, None)
+                      return EXIT_CODES[STATUS_INVALID_ZIP]
 
-              write_status(args.status_output_file, STATUS_OK, args.label, None)
-              return 0
+                  if len(data) > args.max_read_bytes:
+                      write_status(args.status_output_file, STATUS_READ_SIZE_EXCEEDED, args.label, args.max_read_bytes)
+                      return EXIT_CODES[STATUS_READ_SIZE_EXCEEDED]
+
+                  with open(dest_file, "wb") as out:
+                      out.write(data)
+
+                  write_status(args.status_output_file, STATUS_OK, args.label, None)
+                  return 0
+              except Exception:
+                  try:
+                      write_status(args.status_output_file, STATUS_INTERNAL_ERROR, args.label, None)
+                  except OSError:
+                      pass
+                  return EXIT_CODES[STATUS_INTERNAL_ERROR]
 
 
           if __name__ == "__main__":
@@ -358,6 +507,16 @@ jobs:
             --artifact-id-output-file "${ARTIFACT_ROOT}/evidence_artifact_id.txt"
           EVIDENCE_ACQUIRE_STATUS=$?
           set -e
+          # Issue #2505 PR #2514 review fix_delta P1-1 point 1: capture each
+          # `bounded_zip_retrieve.py` invocation's own exit code immediately
+          # (same pattern as the existing `*_ACQUIRE_STATUS=$?` above) --
+          # left UNSET when the helper was never invoked at all (the
+          # `write_not_attempted_status` branches below), so the aggregation
+          # loop can distinguish "never attempted" from "attempted and
+          # crashed" (Issue #2230 already treats `not_attempted` as its own,
+          # non-rejecting outcome; unset intentionally preserves that).
+          DECISION_RETRIEVE_STATUS=""
+          EVIDENCE_RETRIEVE_STATUS=""
           if [ "${DECISION_ACQUIRE_STATUS}" -eq 0 ] && [ -s "${ARTIFACT_ROOT}/decision_artifact_id.txt" ]; then
             DECISION_ARTIFACT_ID="$(cat "${ARTIFACT_ROOT}/decision_artifact_id.txt")"
             set +e
@@ -369,6 +528,7 @@ jobs:
               --max-read-bytes "${DECISION_MAX_READ_BYTES}" \
               --status-output-file "${DECISION_STATUS_FILE}" \
               --target "${DECISION_ENTRY_NAME}" "${ARTIFACT_ROOT}/decision/${DECISION_ENTRY_NAME}"
+            DECISION_RETRIEVE_STATUS=$?
             set -e
           else
             write_not_attempted_status "decision" "${DECISION_STATUS_FILE}"
@@ -386,6 +546,7 @@ jobs:
               --status-output-file "${EVIDENCE_STATUS_FILE}" \
               --target "${EVIDENCE_ENTRY_NAME_V3}" "${ARTIFACT_ROOT}/evidence/${EVIDENCE_ENTRY_NAME_V3}" \
               --target "${EVIDENCE_ENTRY_NAME_V2}" "${ARTIFACT_ROOT}/evidence/${EVIDENCE_ENTRY_NAME_V2}"
+            EVIDENCE_RETRIEVE_STATUS=$?
             set -e
           else
             write_not_attempted_status "evidence" "${EVIDENCE_STATUS_FILE}"
@@ -402,21 +563,52 @@ jobs:
           # the `trusted` and `verify` steps below from ever running
           # against a partial or absent file (AC9: `continue-on-error` is
           # never used to turn this rejection into a reported success).
+          #
+          # Issue #2505 PR #2514 review fix_delta P1-1 point 2: this now
+          # checks BOTH the retrieve helper's own exit code AND the status
+          # file's presence/content -- a non-zero exit code (helper crashed,
+          # was killed, or `uv run` itself failed to launch it) or a missing/
+          # unparseable status file must never fall through to the `ok`
+          # default this loop previously kept when no status file existed.
           DOWNLOAD_STATUS="ok"
           DOWNLOAD_FAILURE_REASON=""
           DOWNLOAD_FAILURE_DETAIL=""
-          for STATUS_FILE in "${DECISION_STATUS_FILE}" "${EVIDENCE_STATUS_FILE}"; do
-            if [ "${DOWNLOAD_STATUS}" = "ok" ] && [ -f "${STATUS_FILE}" ]; then
-              STATUS=""
-              ARTIFACT=""
-              LIMIT=""
+          RETRIEVE_LABELS=("decision" "evidence")
+          RETRIEVE_STATUSES=("${DECISION_RETRIEVE_STATUS}" "${EVIDENCE_RETRIEVE_STATUS}")
+          RETRIEVE_STATUS_FILES=("${DECISION_STATUS_FILE}" "${EVIDENCE_STATUS_FILE}")
+          for RETRIEVE_IDX in 0 1; do
+            if [ "${DOWNLOAD_STATUS}" != "ok" ]; then
+              break
+            fi
+            RETRIEVE_LABEL="${RETRIEVE_LABELS[$RETRIEVE_IDX]}"
+            RETRIEVE_EXIT="${RETRIEVE_STATUSES[$RETRIEVE_IDX]}"
+            RETRIEVE_STATUS_FILE="${RETRIEVE_STATUS_FILES[$RETRIEVE_IDX]}"
+            if [ -z "${RETRIEVE_EXIT}" ]; then
+              # Helper was never invoked -- acquire-trusted-artifact already
+              # failed and wrote `not_attempted`; nothing new to evaluate.
+              continue
+            fi
+            STATUS=""
+            ARTIFACT=""
+            LIMIT=""
+            if [ -f "${RETRIEVE_STATUS_FILE}" ]; then
               # shellcheck disable=SC1090
-              . "${STATUS_FILE}"
-              if [ "${STATUS}" != "ok" ] && [ "${STATUS}" != "not_attempted" ]; then
-                DOWNLOAD_STATUS="rejected"
-                DOWNLOAD_FAILURE_REASON="${STATUS}"
-                DOWNLOAD_FAILURE_DETAIL="artifact=${ARTIFACT} limit=${LIMIT}"
-              fi
+              . "${RETRIEVE_STATUS_FILE}"
+            fi
+            if [ "${RETRIEVE_EXIT}" -eq 0 ] && [ "${STATUS}" = "ok" ]; then
+              continue
+            fi
+            if [ -n "${STATUS}" ] && [ "${STATUS}" != "ok" ]; then
+              DOWNLOAD_STATUS="rejected"
+              DOWNLOAD_FAILURE_REASON="${STATUS}"
+              DOWNLOAD_FAILURE_DETAIL="artifact=${ARTIFACT} limit=${LIMIT}"
+            else
+              # The helper exited non-zero (or was killed) WITHOUT ever
+              # writing a parseable status file -- fail closed with a
+              # dedicated reason instead of silently keeping `ok`.
+              DOWNLOAD_STATUS="rejected"
+              DOWNLOAD_FAILURE_REASON="retrieve_process_failed"
+              DOWNLOAD_FAILURE_DETAIL="artifact=${RETRIEVE_LABEL} exit=${RETRIEVE_EXIT}"
             fi
           done
 
