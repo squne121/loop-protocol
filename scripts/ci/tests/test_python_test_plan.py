@@ -278,6 +278,12 @@ def test_real_plan_serial_lane_has_debounce():
         "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_cross_language_override_resolution_parity",
         "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_readiness_producer_parent_dir_toctou_hardening",
         "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_hermetic_default_path_producer_consumer_roundtrip",
+        # PR #2523 review (issuecomment-5557479149 P2): the new JS FIFO
+        # regression test also spawns a real `node` child process (via
+        # bootstrap-source-bound-readiness.mjs --test-invoke-prepare-private-parent-dir),
+        # so it joins the same python-test-core deselect + node-backed-hook-tests
+        # execution precedent as the 8 nodeids above.
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_js_prepare_private_parent_dir_rejects_fifo_parent_without_blocking",
     ]
     par = mod.run_argv(plan, mode="parallel")
     assert not any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
