@@ -244,12 +244,119 @@ def test_malformed_sources_registry_is_rejected_even_when_unreferenced():
     assert result["next_action"] == NEXT_ACTION_HUMAN_JUDGMENT_REQUIRED
 
 
+def test_duplicate_source_id_registry_entries_url_mismatch_rejected_a_then_b():
+    """PR #2517 fix_delta A: `sources[]` with the same `source_id` registered
+    twice with different `url`s is malformed regardless of registration
+    order (registered A-then-B here)."""
+    web_research = _successful_web_result(
+        sources=[
+            _source(source_id="src-1", url="https://example.invalid/page-a"),
+            _source(source_id="src-1", url="https://example.invalid/page-b"),
+        ],
+    )
+    web_research["claims"][0]["evidence"][0]["source_id"] = "src-1"
+
+    result = route_web_research_result(
+        _input(
+            repository_status="determined",
+            disposition="close_not_planned",
+            role="non_dispositive",
+            web_research=web_research,
+        )
+    )
+
+    assert result["transport_status"] == TRANSPORT_STATUS_ENVIRONMENT_FAILURE
+    assert result["next_action"] == NEXT_ACTION_HUMAN_JUDGMENT_REQUIRED
+
+
+def test_duplicate_source_id_registry_entries_url_mismatch_rejected_b_then_a():
+    """Same as above but with registration order reversed (B-then-A): the
+    rejection must not depend on which entry was registered first."""
+    web_research = _successful_web_result(
+        sources=[
+            _source(source_id="src-1", url="https://example.invalid/page-b"),
+            _source(source_id="src-1", url="https://example.invalid/page-a"),
+        ],
+    )
+    web_research["claims"][0]["evidence"][0]["source_id"] = "src-1"
+
+    result = route_web_research_result(
+        _input(
+            repository_status="determined",
+            disposition="close_not_planned",
+            role="non_dispositive",
+            web_research=web_research,
+        )
+    )
+
+    assert result["transport_status"] == TRANSPORT_STATUS_ENVIRONMENT_FAILURE
+    assert result["next_action"] == NEXT_ACTION_HUMAN_JUDGMENT_REQUIRED
+
+
+def test_duplicate_source_id_registry_entries_identical_url_rejected():
+    """PR #2517 fix_delta A: the duplicate itself is the problem, not merely
+    a URL disagreement -- an identical-`url` duplicate `source_id` is
+    rejected too."""
+    ref = "https://example.invalid/hook-semantics"
+    web_research = _successful_web_result(
+        sources=[
+            _source(source_id="src-1", url=ref),
+            _source(source_id="src-1", url=ref),
+        ],
+    )
+    web_research["claims"][0]["evidence"][0]["source_id"] = "src-1"
+
+    result = route_web_research_result(
+        _input(
+            repository_status="determined",
+            disposition="close_not_planned",
+            role="non_dispositive",
+            web_research=web_research,
+        )
+    )
+
+    assert result["transport_status"] == TRANSPORT_STATUS_ENVIRONMENT_FAILURE
+    assert result["next_action"] == NEXT_ACTION_HUMAN_JUDGMENT_REQUIRED
+
+
+def test_multiple_claims_sharing_one_unique_source_remains_valid():
+    """PR #2517 fix_delta A regression guard: several distinct claims
+    referencing the same (non-duplicated) `sources[]` entry must remain
+    valid -- the uniqueness fix must not reject legitimate source reuse
+    across claims."""
+    ref = "https://example.invalid/hook-semantics"
+    web_research = _successful_web_result(
+        sources=[_source(source_id="src-1", url=ref)],
+    )
+    first_claim = web_research["claims"][0]
+    first_claim["evidence"][0]["source_id"] = "src-1"
+    second_claim = copy.deepcopy(first_claim)
+    second_claim["claim_id"] = "claim-2"
+    second_claim["text"] = "A second, distinct critical claim."
+    web_research["claims"].append(second_claim)
+
+    result = route_web_research_result(
+        _input(
+            repository_status="determined",
+            disposition="close_not_planned",
+            role="non_dispositive",
+            web_research=web_research,
+        )
+    )
+
+    assert result["transport_status"] == "ok"
+    assert result["next_action"] == NEXT_ACTION_PROCEED
+
+
 def test_source_id_reference_runtime_subprocess_smoke(tmp_path: Path):
     """AC12: run `route_web_research_result.py` as a real subprocess against a
     `sources[]`/`source_id` fixture and check the stdout JSON `transport_status`.
 
-    SKIPs with exit 77 (pytest.skip) if `uv`/`python3` is unavailable in the
-    execution environment. A fallback path is never treated as PASS.
+    Reports SKIP via `pytest.skip()` (not exit-code-mapped; `pytest.skip()`
+    still exits the pytest process with status 0, it is the per-test report
+    outcome that is recorded as SKIPPED) if `uv`/`python3` is unavailable in
+    the execution environment. A SKIP is never promoted to PASS, and a
+    fallback path is never treated as PASS either.
     """
     uv_path = shutil.which("uv")
     python3_path = shutil.which("python3")

@@ -36,6 +36,9 @@ def _build_source_registry(web_research: dict[str, Any]) -> tuple[dict[str, str]
     distinct from the "field simply absent" legacy case. An orphan source entry
     (referenced by no claim) is not a validity error by itself (#2042 AC8): this
     function only builds the lookup table, it never rejects on orphan sources.
+    A `source_id` that appears more than once in `sources[]` is malformed
+    (fail-closed) regardless of whether the duplicate entries agree on `url`:
+    `source_id` must be unique within the result (#2042 PR #2517 fix_delta A).
     """
     if "sources" not in web_research or web_research.get("sources") is None:
         return {}, True
@@ -54,6 +57,8 @@ def _build_source_registry(web_research: dict[str, Any]) -> tuple[dict[str, str]
             or not isinstance(url, str)
             or not url
         ):
+            return {}, False
+        if source_id in registry:
             return {}, False
         registry[source_id] = url
     return registry, True

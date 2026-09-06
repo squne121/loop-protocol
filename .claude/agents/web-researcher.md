@@ -41,7 +41,7 @@ runtime_followup_route: agy_grounded_research_with_native_web_fallback
 BUILDER_INVOCATION（ビルダー呼び出し）:
 - provider: agy
 - profiles: grounded_research
-- command: `build_request.py --provider agy --profile grounded_research --prompt <non-empty>`
+- command: `build_request.py --provider agy --profile grounded_research --prompt <non-empty> --output <tmp>/request.json`
 - primary_route: agy_grounded_research
 - fallback_route: native_web
 - gemini_state: disabled_by_operator
@@ -50,14 +50,21 @@ Gemini CLI は `disabled_by_operator` のため起動しない。旧 `preflight_
 
 ## 調査手順
 
-1. AGY canonical builder invocation を一度試行する。
+1. AGY canonical builder invocation を一度試行する。以下はコピペで動く具体的な手順（LLM の推測に依存しない）。
    事前に `setup_check.py --provider agy --json` と `preflight_agy.py` で AGY attempt の readiness を確認してよい。
-   builder が request file を返した場合は、既存 wrapper を次の request/output file contract で実行する。
+   invocation ごとに一時ディレクトリを用意し、builder invocation には `--output` を明示して request file を確実に materialize する
+   （`build_request.py` は `--output` を指定しない限り stdout に JSON を表示するだけで、ファイルは作らない）。
+   同じ request file を wrapper の `--request-file` に渡し、結果は `--output-file` で別ファイルへ出力させる。
    ```bash
+   TMP_DIR="$(mktemp -d)"
+   uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
+     --provider agy --profile grounded_research --prompt "<non-empty prompt>" \
+     --output "$TMP_DIR/request.json"
    uv run python3 .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py \
-     --request-file <builder が作成した request file> \
-     --output-file <invocation-private output file>
+     --request-file "$TMP_DIR/request.json" \
+     --output-file "$TMP_DIR/result.json"
    ```
+   `$TMP_DIR/result.json`（`delegation_result/v1`）を読み、トップレベルの `ok`（真偽値）と `response_text` / `warnings` / `failure_reason` で成否を判定する。
 2. AGY が一次資料 citation と claim を支える内容を返した場合、その evidence を評価する。
 3. 以下のいずれかなら停止せず、利用可能な native Web route で同じ critical claim を検証する: auth/capability/query/grounding failure、citation materialization failure、citation extraction failure、provider provenance trace 不足、または AGY evidence quality 不足。
 4. Claude runtime では利用可能な `WebSearch` と `WebFetch` を fallback に使ってよい。Codex runtime 固有の native tool 名はここで仮定しない。
