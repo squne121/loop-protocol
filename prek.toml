@@ -1,0 +1,23 @@
+# prek 設定（Issue #2552 / #1933 research 決定）
+#
+# 目的: staged TS/JS ファイルに対する軽量 ESLint チェックのみを行う小規模 trial。
+# pre-commit stage のみを対象とし、他 stage は本ファイルに定義しない
+# （#1933 AC6 決定。導入しない理由は docs/dev/local-hooks.md 参照）。
+#
+# 既存の `pnpm lint`（`eslint .`、リポジトリ全体走査）は呼ばず、
+# `language: system` で `eslint` バイナリを `--` 経由で直接呼び出し、
+# prek が解決した staged ファイルのみを引数として渡す。
+default_stages = ["pre-commit"]
+default_install_hook_types = ["pre-commit"]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "eslint-staged-ts-js"
+name = "ESLint (staged TS/JS, pre-commit only)"
+language = "system"
+entry = "eslint --"
+types_or = ["javascript", "jsx", "ts", "tsx"]
+stages = ["pre-commit"]
+pass_filenames = true
