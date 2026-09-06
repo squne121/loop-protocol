@@ -19,6 +19,7 @@ import struct
 import subprocess
 import sys
 import zipfile
+import zlib
 from pathlib import Path
 
 import pytest
@@ -1280,6 +1281,72 @@ def test_bounded_retrieve_read_failure_corrupted_target_entry_rejected(
     marker = b"CORRUPT_TARGET_MARKER_2505"
     payload = _build_zip_stored_2505([(DECISION_ENTRY_NAME_2505, marker.decode("ascii"))])
     payload = _corrupt_first_occurrence(payload, marker)
+    dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
+    dest.parent.mkdir()
+    result, status, _ = _run_bounded_retrieve(
+        bounded_zip_retrieve_script,
+        tmp_path,
+        gh_payload=payload,
+        max_download_bytes=DECISION_ZIP_MAX_BYTES_2505,
+        max_entries=DECISION_ZIP_MAX_ENTRIES_2505,
+        max_read_bytes=DECISION_MAX_READ_BYTES_2505,
+        targets=[(DECISION_ENTRY_NAME_2505, str(dest))],
+    )
+    assert result.returncode != 0
+    assert status["STATUS"] == "invalid_zip"
+    assert not dest.exists()
+
+
+def test_bounded_retrieve_read_failure_corrupted_deflated_target_entry_rejected(
+    bounded_zip_retrieve_script: Path, tmp_path: Path
+):
+    """DEFLATED counterpart of
+    `test_bounded_retrieve_read_failure_corrupted_target_entry_rejected`:
+    regression guard for a defect introduced by the P2-1 `bounded_extract()`
+    rewrite itself. `compresslevel=0` makes zlib emit UNCOMPRESSED
+    ("stored", BTYPE=00) DEFLATE blocks -- the block's literal byte region
+    can be corrupted (one byte flipped) WITHOUT breaking the DEFLATE
+    bitstream's own structure (its final-block/length framing is untouched),
+    so `decompressor.eof` still becomes True and the full declared byte
+    count is produced, but the produced content no longer matches the
+    entry's own recorded CRC-32. The DEFLATED branch of `bounded_extract()`
+    must verify the decompressed content's CRC-32 exactly like the STORED
+    branch does -- silently returning tampered content here (as the
+    pre-fix version of the DEFLATED branch did, since it never checked
+    `info.CRC` at all) must never happen."""
+    marker = b"CORRUPT_DEFLATED_TARGET_MARKER_2505_PADDING_TO_KEEP_STORED_BLOCK_LONG_ENOUGH"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=0) as zf:
+        zf.writestr(DECISION_ENTRY_NAME_2505, marker.decode("ascii"))
+    payload = buf.getvalue()
+
+    zf = zipfile.ZipFile(io.BytesIO(payload))
+    info = zf.infolist()[0]
+    assert info.compress_type == zipfile.ZIP_DEFLATED
+    data_start = 30 + len(info.filename)
+    # Skip the 5-byte stored-block header (1 byte BFINAL/BTYPE + 2 bytes LEN
+    # + 2 bytes NLEN) and flip a byte inside the literal data region so the
+    # DEFLATE bitstream framing itself stays intact (decompression still
+    # reaches a clean EOF) while the decompressed bytes differ from the
+    # entry's recorded CRC-32.
+    target_idx = data_start + 5 + 10
+    corrupted = bytearray(payload)
+    corrupted[target_idx] ^= 0xFF
+    payload = bytes(corrupted)
+
+    # Sanity: prove this corruption still decompresses cleanly to EOF with
+    # a byte count matching the original (i.e. it does NOT hit the
+    # "truncated deflate stream" / zlib.error paths already covered by
+    # `test_bounded_retrieve_corrupted_deflate_stream_never_reports_ok`) --
+    # otherwise this test would not be exercising the CRC-check regression
+    # at all.
+    verify_decompressor = zlib.decompressobj(-15)
+    verify_out = verify_decompressor.decompress(payload[data_start:], len(marker) + 1)
+    assert verify_decompressor.eof
+    assert len(verify_out) == len(marker)
+    assert verify_out != marker
+    assert zlib.crc32(verify_out) & 0xFFFFFFFF != info.CRC
+
     dest = tmp_path / "decision" / DECISION_ENTRY_NAME_2505
     dest.parent.mkdir()
     result, status, _ = _run_bounded_retrieve(
