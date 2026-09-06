@@ -67,9 +67,9 @@ def test_legacy_profile_objective_invocation_unaffected_by_model_policy_subcomma
             sys.executable,
             str(_BUILD_REQUEST_PATH),
             "--profile",
-            "github_research",
+            "no_tools",
             "--objective",
-            "Investigate the latest PR for regression issues via gh pr list",
+            "Summarize the repository's README file",
             "--context-file",
             str(context_file),
         ],
@@ -80,8 +80,8 @@ def test_legacy_profile_objective_invocation_unaffected_by_model_policy_subcomma
 
     payload = json.loads(result.stdout)
     assert payload["schema"] == "delegation_request_v1"
-    assert payload["tool_profile"] == "github_research"
-    assert payload["objective"] == "Investigate the latest PR for regression issues via gh pr list"
+    assert payload["tool_profile"] == "no_tools"
+    assert payload["objective"] == "Summarize the repository's README file"
     assert payload["context_files"] == [str(context_file)]
     # model-policy must not leak into the legacy request schema.
     assert "model-policy" not in json.dumps(payload)

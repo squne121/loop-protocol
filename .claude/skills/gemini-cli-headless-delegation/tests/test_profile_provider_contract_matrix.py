@@ -347,6 +347,23 @@ def test_ac2_ten_cells_total() -> None:
     assert count == 10
 
 
+# ---------------------------------------------------------------------------
+# Issue #2522 AC4: profiles.github_research.gemini is unsupported_by_design
+# ---------------------------------------------------------------------------
+
+
+def test_github_research_gemini_cell_is_unsupported_by_design() -> None:
+    """AC4: profiles.github_research.gemini.value is unsupported_by_design,
+    with known_gaps referencing #1886 or #2002 and noting the existing
+    (dormant, not deleted) code is retained."""
+    data = _load_matrix()
+    cell = data["profiles"]["github_research"]["gemini"]
+    assert cell["value"] == "unsupported_by_design"
+    known_gaps = cell["known_gaps"]
+    assert isinstance(known_gaps, list) and known_gaps
+    assert any("#1886" in gap or "#2002" in gap for gap in known_gaps), f"known_gaps={known_gaps!r}"
+
+
 @pytest.mark.parametrize("profile", sorted(_EXPECTED_PROFILES))
 @pytest.mark.parametrize("provider", sorted(_EXPECTED_PROVIDERS))
 def test_ac2_cell_has_exact_keys(profile: str, provider: str) -> None:
