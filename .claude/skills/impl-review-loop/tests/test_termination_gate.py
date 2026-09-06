@@ -607,3 +607,29 @@ def test_b6_no_bidi_in_skill_md():
     assert not found, (
         f"SKILL.md contains forbidden bidi chars: {found}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1116 AC1/AC8: no-diff / superseded termination reaches
+# finalize_no_diff_issue.py without requiring a PR. This is a new,
+# non-overlapping section added to step-5-feedback-and-termination.md
+# (distinct from #1908's human-facing termination-report routing edits) and
+# does not modify any existing termination_reason routing table row.
+# ---------------------------------------------------------------------------
+
+
+def test_no_diff_termination_reaches_finalizer_without_pr():
+    """AC1/AC8: the no-diff / superseded termination section documents a
+    call convention that reaches finalize_no_diff_issue.py directly, without
+    requiring an empty/fabricated PR, and states that it is independent of
+    the PR-based termination_reason routing."""
+    body = _read(STEP5_FT)
+    assert "no-diff / superseded termination" in body
+    idx = body.find("no-diff / superseded termination")
+    section = body[idx : idx + 2500]
+    assert "finalize_no_diff_issue.py" in section
+    assert "空の PR" in section or "架空の PR" in section
+    assert "PR review や live mergeability 評価を経由しない" in section
+    # Existing routing-table rows (Issue #1873 canonical route table) must be
+    # untouched by this new section.
+    assert "`route_loop_verdict_v2()` の `route` を正本とする" in body

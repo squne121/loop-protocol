@@ -2005,17 +2005,87 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
     if len(matches) == 1:
         c = matches[0]
         remote_body_sha256 = hashlib.sha256(c.get("body", "").encode()).hexdigest()
-        if remote_body_sha256 != expected_body_sha256:
-            return _fail("remote_marker_identity_conflict_pre_mutation", status="failed")
-        # No-op: already published by a prior run (or another agent). Refresh
-        # the local cache/audit marker but do not POST again.
-        _write_marker(c.get("id", ""), c.get("url", ""))
+        if remote_body_sha256 == expected_body_sha256:
+            # No-op: already published by a prior run (or another agent).
+            # Refresh the local cache/audit marker but do not POST again.
+            _write_marker(c.get("id", ""), c.get("url", ""))
+            return _ok(
+                {
+                    "status_detail": "already_published",
+                    "comment_id": c.get("id", ""),
+                    "comment_url": c.get("url", ""),
+                    "body_sha256": remote_body_sha256,
+                    "idempotency_marker_written": True,
+                }
+            )
+
+        # -- Issue #1116 AC4: ownership marker matches but content/digest
+        # differs. This is no longer an unconditional conflict -- a caller
+        # (e.g. finalize_no_diff_issue.py, which separates a stable
+        # ownership marker from a content digest marker) may legitimately
+        # need to update its own previously-published marker comment when
+        # the payload changes. PATCH is only attempted when the existing
+        # comment's author is the currently authenticated actor (mirrors the
+        # `_validate_test_verdict_comment` author-check pattern); any other
+        # author is a genuine identity conflict and must fail closed without
+        # ever calling PATCH.
+        authenticated_login, login_err = _fetch_authenticated_login(gh_bin)
+        if login_err:
+            return _fail(f"marker_update_author_check_failed: {login_err}", status="failed")
+        existing_author = (c.get("author") or {}).get("login")
+        if existing_author != authenticated_login:
+            return _fail("remote_marker_author_mismatch_pre_mutation", status="failed")
+
+        numeric_comment_id = _extract_numeric_comment_id_from_url(c.get("url", ""))
+        if not numeric_comment_id:
+            return _fail("remote_marker_comment_id_unresolvable_pre_mutation", status="failed")
+
+        patch_err = _patch_gh_comment(numeric_comment_id, args.repo, comment_body, gh_bin)
+        if patch_err:
+            return _fail(
+                patch_err, status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"}
+            )
+
+        readback = _readback_by_marker_literal(marker, args.issue_number, args.repo, gh_bin)
+        if "error" in readback:
+            return _fail(
+                f"readback_failed: {readback['error']}",
+                status="failed",
+                extra={"patch_attempted": True, "mutation_outcome": "unknown"},
+            )
+        if readback.get("body_sha256") != expected_body_sha256:
+            return _fail(
+                "postcondition_body_sha256_mismatch",
+                status="failed",
+                extra={"patch_attempted": True, "mutation_outcome": "unknown"},
+            )
+
+        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
+        if changed:
+            return _fail(
+                "postcondition_tracked_changes_detected",
+                [f"changed: {f}" for f in changed[:20]],
+                status="applied_but_local_postcondition_failed",
+                extra={
+                    "mutation_outcome": "applied",
+                    "remote_receipt": {
+                        "issue_number": args.issue_number,
+                        "repo": args.repo,
+                        "comment_id": readback.get("comment_id"),
+                        "comment_url": readback.get("comment_url"),
+                        "body_sha256": readback.get("body_sha256"),
+                    },
+                    "retry_policy": "safe_to_retry_remote_marker_precheck_will_detect_already_published",
+                },
+            )
+
+        _write_marker(readback.get("comment_id"), readback.get("comment_url"))
         return _ok(
             {
-                "status_detail": "already_published",
-                "comment_id": c.get("id", ""),
-                "comment_url": c.get("url", ""),
-                "body_sha256": remote_body_sha256,
+                "status_detail": "updated",
+                "comment_id": readback.get("comment_id"),
+                "comment_url": readback.get("comment_url"),
+                "body_sha256": readback.get("body_sha256"),
                 "idempotency_marker_written": True,
             }
         )
@@ -2023,7 +2093,55 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
     # -- matches == 0: no remote marker yet, proceed to post --------------------
     comment_url, comment_id, post_err = _post_gh_comment(args.issue_number, args.repo, comment_body, gh_bin)
     if post_err:
-        return _fail(post_err, status="failed")
+        # Issue #1116 fix_delta P1-2: a POST response can be lost after the
+        # remote mutation actually succeeded (same transport-ambiguity class
+        # already handled by the PATCH/issue_content.update branches above).
+        # Read back once by marker literal before declaring failure -- never
+        # retry the POST itself within the same invocation.
+        post_readback = _readback_by_marker_literal(marker, args.issue_number, args.repo, gh_bin)
+        if post_readback.get("error") == "marker_not_found":
+            # Confirmed: nothing was created remotely by this POST.
+            return _fail(post_err, status="failed")
+        if "error" in post_readback or post_readback.get("body_sha256") != expected_body_sha256:
+            # Readback itself is inconclusive, or a comment matching the
+            # marker exists with unexpected content -- POST success/failure
+            # cannot be determined either way. Fail closed as ambiguous.
+            return _fail(
+                post_err,
+                status="failed",
+                extra={"patch_attempted": False, "mutation_outcome": "unknown"},
+            )
+
+        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
+        if changed:
+            return _fail(
+                "postcondition_tracked_changes_detected",
+                [f"changed: {f}" for f in changed[:20]],
+                status="applied_but_local_postcondition_failed",
+                extra={
+                    "mutation_outcome": "applied",
+                    "remote_receipt": {
+                        "issue_number": args.issue_number,
+                        "repo": args.repo,
+                        "comment_id": post_readback.get("comment_id"),
+                        "comment_url": post_readback.get("comment_url"),
+                        "body_sha256": post_readback.get("body_sha256"),
+                    },
+                    "retry_policy": "safe_to_retry_remote_marker_precheck_will_detect_already_published",
+                },
+            )
+
+        _write_marker(post_readback.get("comment_id"), post_readback.get("comment_url"))
+        return _ok(
+            {
+                "status_detail": "created",
+                "mutation_outcome": "applied",
+                "comment_id": post_readback.get("comment_id"),
+                "comment_url": post_readback.get("comment_url"),
+                "body_sha256": post_readback.get("body_sha256"),
+                "idempotency_marker_written": True,
+            }
+        )
 
     # -- AC4/AC14: postcondition readback by marker — false success not allowed -
     readback = _readback_by_marker_literal(marker, args.issue_number, args.repo, gh_bin)
@@ -2065,6 +2183,7 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
 
     return _ok(
         {
+            "status_detail": "created",
             "comment_id": readback.get("comment_id"),
             "comment_url": readback.get("comment_url"),
             "body_sha256": readback.get("body_sha256"),
@@ -2127,6 +2246,64 @@ def _readback_by_marker_literal(marker_literal: str, issue_number: int, repo: st
         }
     except Exception as exc:
         return {"error": f"readback_exception:{exc}"}
+
+
+# Issue #1116 AC4: single-caller helpers for `_run_issue_comment_publish`'s
+# marker-match + digest-mismatch update branch. `_find_marker_matches` /
+# `_readback_by_marker_literal` return the GraphQL node id (via
+# `gh issue view --json comments`), which is not a valid REST path segment,
+# so the REST-compatible numeric comment id is instead extracted from the
+# comment's permalink (`.../issues/<n>#issuecomment-<numeric-id>`).
+_ISSUE_COMMENT_URL_ID_RE = _re.compile(r"issuecomment-(\d+)$")
+
+
+def _extract_numeric_comment_id_from_url(comment_url: str) -> str:
+    """Extract the numeric REST comment id from a GitHub issue comment
+    permalink. Returns "" if the url does not match the expected shape.
+    Single caller: `_run_issue_comment_publish`."""
+    match = _ISSUE_COMMENT_URL_ID_RE.search(comment_url or "")
+    return match.group(1) if match else ""
+
+
+def _patch_gh_comment(numeric_comment_id: str, repo: str, body: str, gh_bin: str) -> str:
+    """PATCH an existing issue comment's body via the REST API (Issue #1116
+    AC4 update branch). Mirrors `_post_gh_comment`'s argv-list / tempfile
+    pattern. Single caller: `_run_issue_comment_publish`."""
+    import tempfile
+
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tmp:
+            tmp.write(body)
+            tmp_path = tmp.name
+        try:
+            out = subprocess.run(
+                [
+                    gh_bin,
+                    "api",
+                    "--hostname",
+                    _TRUSTED_GITHUB_HOST,
+                    "--method",
+                    "PATCH",
+                    f"repos/{repo}/issues/comments/{numeric_comment_id}",
+                    "--field",
+                    f"body=@{tmp_path}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                shell=False,
+                env=_build_metadata_sanitized_env(),
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        if out.returncode != 0:
+            return _classify_gh_error("gh_api_comment_patch_failed", out.stderr or "")
+        return ""
+    except Exception as exc:
+        return f"gh_api_comment_patch_exception: {exc}"
 
 
 # -- Shared `gh` helpers originally introduced for the controlled PR review
