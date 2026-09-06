@@ -1291,6 +1291,193 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     ) == 1
 
 
+def test_contract_update_outer_artifact_projection_failure_preserves_inner_transaction_result(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Issue #2526 AC1-AC5: real-dispatcher regression test for the THIRD
+    (previously untested) outer-failure emission site in
+    `_dispatch_child_and_check_postconditions()` -- the artifact-projection
+    failure branch, alongside the already-covered timeout / unauthorized-
+    write siblings.
+
+    Reuses the SAME fake GitHub executable + isolated Git fixture
+    (`_install_real_contract_update_fixture()` / the "trusted fixture
+    directive" anchor + pre-body pair) that
+    `test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff`
+    above already establishes, so the inner GitHub mutation, final readback,
+    and inner `refinement_preflight_result_v1.json` persistence all complete
+    for real FIRST -- the identical `disposition: "patch"` / `writes: 1` /
+    `final_readback: "verified"` / `fresh_review: "needs_fix"` outcome as
+    that sibling test's own "first" dispatch. ONLY AFTER that inner
+    transaction has fully succeeded does this test corrupt what the
+    caller-visible stdout says the FIRST (sorted) `ARTIFACT:` entry's path
+    is, to a fixture-available path OUTSIDE the artifact root
+    (``README.md``) -- never an actual write to that path, and never routed
+    through the unauthorized-write check.
+
+    The corruption patches exactly one isolated function,
+    `_render_artifact_projection_lines()` (the final stdout-rendering step),
+    in a COPY of `run_refinement_preflight.py` committed into this test's
+    own isolated, local fixture repository -- never the real repo file, and
+    never `_write_artifacts()`'s own on-disk writes/consistency checks
+    above it in the same module. This is the same kind of fixture-only,
+    non-behavioral source patch this test module already applies to
+    `skill_runtime_exec.py` (its `CONTROL_PLANE_CANONICAL_REMOTE_URL` /
+    safe-PATH patches in `_install_skill_runtime_exec_fixture()` /
+    `_install_real_contract_update_fixture()` above) and to
+    `controlled_skill_mutation_exec.py` (its `_GH_TRUSTED_PATHS` patch
+    above) -- so the persisted result artifact this test reads back below
+    still carries the real, correct `contract_update` fields.
+    """
+    repo = _make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+
+    # Corrupt ONLY the final stdout artifact-projection rendering step of the
+    # copied `run_refinement_preflight.py` -- the real GitHub mutation,
+    # final readback, and `refinement_preflight_result_v1.json` persistence
+    # (all performed by `_write_artifacts()`, a wholly separate function)
+    # are completely unaffected by this patch.
+    preflight_script_path = (
+        repo / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "run_refinement_preflight.py"
+    )
+    preflight_source = preflight_script_path.read_text(encoding="utf-8")
+    default_render_fn = (
+        'def _render_artifact_projection_lines(artifacts: dict[str, str]) -> list[str]:\n'
+        '    lines: list[str] = ["ARTIFACT:"]\n'
+        '    for key, value in sorted(artifacts.items()):\n'
+        '        lines.append(f"  {key}: {value}")\n'
+        '    return lines\n'
+    )
+    assert default_render_fn in preflight_source
+    corrupted_render_fn = (
+        'def _render_artifact_projection_lines(artifacts: dict[str, str]) -> list[str]:\n'
+        '    lines: list[str] = ["ARTIFACT:"]\n'
+        '    for index, (key, value) in enumerate(sorted(artifacts.items())):\n'
+        '        # Issue #2526 regression fixture only: corrupt ONLY the\n'
+        '        # first (sorted) rendered entry to a fixture-available\n'
+        '        # path OUTSIDE the artifact root -- never written to.\n'
+        '        if index == 0:\n'
+        '            value = os.path.join(os.getcwd(), "README.md")\n'
+        '        lines.append(f"  {key}: {value}")\n'
+        '    return lines\n'
+    )
+    preflight_script_path.write_text(
+        preflight_source.replace(default_render_fn, corrupted_render_fn), encoding="utf-8"
+    )
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "install artifact-projection corruption fixture (Issue #2526)", cwd=repo)
+    _init_control_plane_origin(repo, repo.parent / "control-plane-origin.git")
+
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    gh_config_dir = tmp_path / "test-owned-gh-config"
+    gh_config_dir.mkdir()
+    config_only_env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": str(gh_config_dir),
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+    }
+    immutable = json.loads(
+        (
+            REPO_ROOT
+            / ".claude/skills/issue-refinement-loop/tests/fixtures/issue_1835_trusted_anchor_iteration_zero.json"
+        ).read_text(encoding="utf-8")
+    )
+    pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    anchor = {
+        "id": 1,
+        "body": "## Revised AC\n- AC2: trusted fixture directive\n",
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
+
+    result_proc = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        use_fixture_runtime=True,
+        extra_env=config_only_env,
+    )
+
+    # AC3: the outer dispatch failed on the artifact-projection branch (not
+    # the inner child's own exit-code relay) -- AND-combined, never OR.
+    assert result_proc.returncode == 2, result_proc.stderr
+    assert result_proc.stdout == "", result_proc.stdout
+    assert "SKILL_RUNTIME_FAIL" in result_proc.stderr, result_proc.stderr
+    assert "reason_code=stale_worktree_runtime_state" in result_proc.stderr, result_proc.stderr
+    assert (
+        "recovery=do_not_publish_artifact_projection_outside_issue_artifact_root" in result_proc.stderr
+    ), result_proc.stderr
+    assert "stale_path=README.md" in result_proc.stderr, result_proc.stderr
+
+    # AC4: BOTH `inner_transaction_result_ref` and
+    # `inner_transaction_disposition=patch` must be recoverable from the
+    # SAME `SKILL_RUNTIME_FAIL` stderr line (OR is forbidden).
+    # `inner_transaction_state=unknown` is a hard FAILURE for this scenario
+    # -- mutation, readback, and result persistence all genuinely succeeded
+    # before the artifact-projection corruption was ever detected.
+    assert "inner_transaction_state=unknown" not in result_proc.stderr, result_proc.stderr
+    ref_match = re.search(r"inner_transaction_result_ref=(\S+)", result_proc.stderr)
+    disposition_match = re.search(r"inner_transaction_disposition=(\S+)", result_proc.stderr)
+    assert ref_match is not None, result_proc.stderr
+    assert disposition_match is not None, result_proc.stderr
+    assert disposition_match.group(1) == "patch", result_proc.stderr
+
+    inner_result_path = Path(ref_match.group(1))
+    expected_inner_result_path = (
+        execution_root
+        / ".claude"
+        / "artifacts"
+        / "issue-refinement-loop"
+        / "1498"
+        / "refinement_preflight_result_v1.json"
+    )
+    assert inner_result_path == expected_inner_result_path, (inner_result_path, expected_inner_result_path)
+    inner_result = json.loads(inner_result_path.read_text(encoding="utf-8"))
+    assert inner_result["contract_update"]["status"] == "failed"
+    assert inner_result["contract_update"]["disposition"] == "patch"
+    assert inner_result["contract_update"]["writes"] == 1
+    assert inner_result["contract_update"]["final_readback"] == "verified"
+    assert inner_result["contract_update"]["fresh_review"] == "needs_fix"
+
+    # AC5: exactly one mutation/write call reached the fake GitHub
+    # executable -- no blind resend after the outer artifact-projection
+    # failure.
+    operations = [
+        json.loads(line)
+        for line in (artifact_dir / "fake_gh_operations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert operations.count("issue_content_patch") == 1, operations
+
+
 def test_contract_update_phase_cannot_be_reached_through_preflight_command(tmp_path: Path) -> None:
     """The read-only preflight command never receives the consumer flag."""
     repo = _make_repo(tmp_path)
