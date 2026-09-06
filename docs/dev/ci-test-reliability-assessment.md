@@ -129,14 +129,14 @@ count 不足時の outcome は `inconclusive` であり、close evidence とし�
 before/after で不均衡な場合（`equal_1_to_1` 契約違反）や、実際に観測された `n` における power が
 `target_power` に届かない場合も、同じ `inconclusive` outcome に fold される。
 
-## #2424 production wiring 契約
+## #2424 が担う production wiring の契約
 
 本節は #2424（実 CI raw attempts から Reliability V1 close evidence を production 生成する）が
 所有する `scripts/ci/build_ci_reliability_assessment_v1.py` と `.github/workflows/ci.yml` の wiring
 契約を定義する。上記の schema / validator / power design は #2432/#2507 owner surface のままであり、
 本節はこれらを変更しない consumer 契約として追記する。
 
-### 3-run architecture
+### 3 回に分離した workflow 実行（3-run architecture）
 
 1. **monolith measured run** — `.github/workflows/ci.yml` を `benchmark_layout=monolith` かつ
    `reliability_evidence=true` で `workflow_dispatch` する。`e2e-core` job が core lane と
@@ -157,7 +157,7 @@ before/after で不均衡な場合（`equal_1_to_1` 契約違反）や、実際�
 （#2422 owner）のスキーマ・producer 自体は変更しない。既存の `github.event.inputs.benchmark_layout
 == ''` ガードは `reliability_assessment` dispatch でも他ジョブを正しくスキップする。
 
-### Playwright JSON evidence route（AC2）
+### Playwright JSON 証跡経路（AC2）
 
 `playwright.config.ts` は `PLAYWRIGHT_JSON_OUTPUT_FILE` が設定されている場合のみ、追加で
 `['json', { outputFile: PLAYWRIGHT_JSON_OUTPUT_FILE }]` reporter を有効化する（html/list は常に
@@ -215,7 +215,7 @@ monolith run は `{e2e-core, e2e-core-responsive}`、split run は `{e2e-core, e
 4. `--playwright-json-dir`: `<dir>/<monolith|split>/<invocation_id>.json`
    に配置された、公式 Playwright JSON reporter の生出力。
 
-### canonical single output（AC11）
+### 単一の canonical output（AC11）
 
 `ci_reliability_close_grade_result_v1.json` は builder/aggregate が deterministic に生成する唯一の
 canonical output であり、最低限次を含む: `schema`（`CI_RELIABILITY_CLOSE_GRADE_RESULT_V1`）、
