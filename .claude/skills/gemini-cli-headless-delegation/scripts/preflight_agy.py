@@ -893,14 +893,28 @@ def _extract_urls(text: str) -> list[str]:
 # Recognized structured web tool-call names (mirrors run_gemini_headless.py's
 # RECOGNIZED_WEB_TOOL_NAMES — Issue #1266 Blocker 1 reopened: this preflight smoke path
 # had not been migrated to the structured tool_calls trace requirement).
+#
+# Issue #2521 live evidence (2026-09-06, real `agy` 1.1.27 stream-json
+# output): the actual tool name AGY reports for a web search call is
+# `search_web` (not `web_search`), and its `init.tools` advertise
+# `read_url_content` / `open_browser_url` for URL/browser access rather
+# than `read_url`/`url_read`/`fetch_url`/`fetch`/`browser_navigate`. The
+# original names are kept (defensive, may still apply to other AGY
+# versions/aliases) and the live-confirmed names are added additively so a
+# real search_web tool_info is actually recognized (previously it never
+# was, silently defeating citation-candidate extraction for every real
+# grounded_research call).
 RECOGNIZED_WEB_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "web_search",
         "websearch",
+        "search_web",
         "browser_navigate",
         "browser",
+        "open_browser_url",
         "url_read",
         "read_url",
+        "read_url_content",
         "fetch_url",
         "fetch",
     }
@@ -2197,40 +2211,61 @@ _STRUCTURED_OUTPUT_VALUE_RE = re.compile(r"\b(json|stream-json)\b")
 # custom markers (`AGY_GROUNDED_RESEARCH:` / `AGY_WEBSEARCH:` /
 # `grounded_research:` / `grounding:`) or a raw stdout URL scan as
 # "structured" evidence, with no validation against the official Antigravity
-# CLI `stream-json` NDJSON event vocabulary (`init` / `step_update` /
-# terminal `result`, where `tool_info` is an object attached to each
-# `step_update` event rather than an independent event type). This parser is
-# the single source of truth for the structured route: it enforces
-# exactly-one `init` (first line), zero-or-more `step_update`, exactly-one
-# terminal `result` (must be last line), one JSON object per non-empty line,
-# and rejects malformed/truncated/duplicate-terminal input, unrecognized
-# top-level event types, and citation sources that are not correlated to a
-# canonical web tool call's `tool_info.output`. It is intentionally at least
+# CLI `stream-json` NDJSON event vocabulary. Issue #2521 live-verified
+# (2026-09-06, `agy` 1.1.27, `agy -p <prompt> --output-format stream-json`
+# against a real authenticated AGY binary in this environment) that the
+# envelope discriminator key is `event` (not `type`), each event's payload
+# for non-`init` events is nested under a same-named key (`step_update`
+# events carry their payload under `event["step_update"]`, including
+# `step_type` and, when a tool step ran, `tool_info`), and the terminal
+# `result` event carries its payload under `event["result"]` -- the final
+# answer text is `event["result"]["response"]`. This parser is the single
+# source of truth for the structured route: it enforces exactly-one `init`
+# (first line), zero-or-more `step_update`, exactly-one terminal `result`
+# (must be last line), one JSON object per non-empty line, and rejects
+# malformed/truncated/duplicate-terminal input, unrecognized top-level event
+# types, and citation sources that are not correlated to a canonical web
+# tool call's `step_update.tool_info.output`. It is intentionally at least
 # as strict as the legacy Vertex-grounding-limited citation regex fallback
 # (`_VERTEX_GROUNDING_CITATION_RE` equivalent in run_gemini_headless.py) --
 # never more permissive -- and it never accepts the legacy custom markers or
 # an arbitrary stdout URL scan as evidence.
 #
-# `docs/dev/agy-cli-contract-20260701.md` (this repo's "Required Design
-# Reference" for the AGY CLI contract) is evidenced against AGY v1.0.14 and
-# only documents `-p`/`--print`/`--prompt`; it does not evidence the
-# `stream-json` event vocabulary for v1.1.11, so the exact `step_type`
-# enumeration below is a defensive, forward-compatible allowlist rather than
-# a claim of authoritative upstream documentation (Issue #2038 P2 gap --
-# tracked for a follow-up evidence-refresh, not Out of Scope for this fix).
-# Because that authoritative vocabulary is not yet evidenced, unrecognized
-# `step_type` values are recorded (`unknown_step_types`) but are NOT a hard
-# parse failure on their own -- only the closed, load-bearing invariants
-# (top-level `type` enum, init/result cardinality and ordering, one-JSON-
-# object-per-line, and the citation-acceptance correlation chain) are
-# enforced as hard failures.
+# The previously assumed `type`-key top-level discriminator (superseded by
+# this fix) was never evidenced against a real, currently-supported AGY
+# version -- `docs/dev/agy-cli-contract-20260701.md` only documents
+# `-p`/`--print`/`--prompt` for v1.0.14 and never evidenced any stream-json
+# event vocabulary. It is not kept as a compatibility shim (Issue #2521 AC4).
+#
+# The live sample above did not include a `step_update.tool_info.output`
+# field even for a real `search_web` tool call (`tool_info` only carried
+# `name`/`parameters`) -- the source-record extraction below is therefore a
+# defensive, forward-compatible allowlist that activates if/when such
+# structured tool output appears, not a claim that it is currently observed
+# for every tool. `_STREAM_JSON_KNOWN_STEP_TYPES` below IS the live-observed
+# `step_type` vocabulary (`user_input` / `agent_response` / `tool`);
+# unrecognized `step_type` values are still recorded (`unknown_step_types`)
+# but are NOT a hard parse failure on their own -- only the closed,
+# load-bearing invariants (top-level `event` enum, init/result cardinality
+# and ordering, one-JSON-object-per-line, and the citation-acceptance
+# correlation chain) are enforced as hard failures.
 _STREAM_JSON_MAX_LINE_BYTES = 1_000_000
 _STREAM_JSON_MAX_EVENTS = 2000
 _STREAM_JSON_MAX_NESTING_DEPTH = 24
 _STREAM_JSON_EVENT_TYPES: frozenset[str] = frozenset({"init", "step_update", "result"})
 _STREAM_JSON_KNOWN_STEP_TYPES: frozenset[str] = frozenset(
-    {"tool_call", "tool_result", "text", "thought", "plan", "status"}
+    {"user_input", "agent_response", "tool"}
 )
+# Issue #2521 live evidence: a `step_update` event's `state` field (e.g.
+# "ACTIVE" while a step is still streaming/in-progress, "DONE" once it has
+# completed) means the SAME `step_index` can appear multiple times in the
+# stream (an in-progress delta followed by its completion). Only the
+# terminal state for a given step (`state == "DONE"`, or a `step_update`
+# with no `state` field at all -- kept for defensive fixture compatibility)
+# is counted toward `tool_call_records` / `source_records` /
+# `unknown_step_types`, so a single tool call is never double-counted just
+# because it streamed an ACTIVE update before its DONE update.
+_STREAM_JSON_NON_TERMINAL_STEP_STATES: frozenset[str] = frozenset({"ACTIVE"})
 _STREAM_JSON_URL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 _STREAM_JSON_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _STREAM_JSON_MAX_URL_LENGTH = 2048
@@ -2284,13 +2319,19 @@ def _validate_stream_json_source_url(url: Any) -> str | None:
 
 def parse_agy_stream_json_stream(stdout: str) -> dict[str, Any]:
     """Strict NDJSON state-machine parser for the official Antigravity CLI
-    `stream-json` event vocabulary (Issue #2038 P0-3 fix_delta).
+    `stream-json` event vocabulary (Issue #2038 P0-3 fix_delta; envelope
+    shape corrected to the live-confirmed `event`-key format by Issue #2521
+    -- see the module-level comment block above this function).
 
     Returns a dict shaped:
     ``{"status": "valid" | "invalid", "reason_code": str, "event_count": int,
     "init_count": int, "step_update_count": int, "result_count": int,
     "unknown_step_types": list[str], "tool_call_records": list[dict],
     "source_records": list[dict], "terminal_result": dict | None}``.
+    ``terminal_result`` is the raw terminal event dict (i.e.
+    ``{"event": "result", "result": {..., "response": <answer text>}}``),
+    not just its nested `result` payload -- callers that want the final
+    answer text read ``terminal_result["result"]["response"]``.
 
     Hard-fail invariants (any violation -> `status: "invalid"`, stream
     treated as untrusted evidence, never partially accepted):
@@ -2301,8 +2342,8 @@ def parse_agy_stream_json_stream(stdout: str) -> dict[str, Any]:
         parsed JSON nesting depth is <= `_STREAM_JSON_MAX_NESTING_DEPTH`
         (adversarial-payload bounds).
       - total event count is <= `_STREAM_JSON_MAX_EVENTS`.
-      - every event's top-level `type` is a member of the closed
-        `_STREAM_JSON_EVENT_TYPES` enum -- an unrecognized event type is a
+      - every event's top-level `event` discriminator is a member of the
+        closed `_STREAM_JSON_EVENT_TYPES` enum -- an unrecognized value is a
         hard failure (fail-closed, never silently skipped).
       - the first event is `init` and appears exactly once anywhere in the
         stream (a duplicate `init` is rejected even if the first event is
@@ -2312,19 +2353,24 @@ def parse_agy_stream_json_stream(stdout: str) -> dict[str, Any]:
         terminal are rejected).
       - every event strictly between the first and last is `step_update`
         (an unexpected event type in that position, e.g. a second `init` or
-        a non-terminal `result`, is rejected).
+        a non-terminal `result`, is rejected), and its payload (the value
+        under the `step_update` key) must be a JSON object.
 
     Citation acceptance (only once `status == "valid"`): a `step_update`
-    event's `tool_info` (an object attached to that event, not an
-    independent event type) is only consulted for source records when its
-    `tool_info.name`/`tool_info.tool` is a member of
+    event's `tool_info` (an object nested under `event["step_update"]`, not
+    an independent event type) is only consulted for source records when
+    its `tool_info.name`/`tool_info.tool` is a member of
     `RECOGNIZED_WEB_TOOL_NAMES` (step/tool-call correlation); candidate
     source records are read from `tool_info.output.sources` /
     `.citations` / `.results` (list) or a bare `tool_info.output` list, and
     each candidate's `url` must pass `_validate_stream_json_source_url()`.
     Never accepts the legacy custom markers, plain-text prose, or an
     arbitrary stdout URL scan -- this parser is the ONLY evidence source for
-    the structured route.
+    the structured route. Only the terminal (`state != "ACTIVE"`, i.e.
+    `"DONE"` or absent) `step_update` for a given step is consulted, so an
+    in-progress streaming delta and its completion never double-count the
+    same tool call (Issue #2521 live evidence: `state` can repeat the same
+    `step_index` as `"ACTIVE"` then `"DONE"`).
     """
     result: dict[str, Any] = {
         "status": "invalid",
@@ -2366,7 +2412,7 @@ def parse_agy_stream_json_stream(stdout: str) -> dict[str, Any]:
         if _json_nesting_depth(parsed_line) > _STREAM_JSON_MAX_NESTING_DEPTH:
             result["reason_code"] = f"line_{index}_nesting_depth_exceeds_bound"
             return result
-        event_type = parsed_line.get("type")
+        event_type = parsed_line.get("event")
         if not isinstance(event_type, str) or event_type not in _STREAM_JSON_EVENT_TYPES:
             result["reason_code"] = f"line_{index}_unknown_event_type"
             return result
@@ -2374,15 +2420,15 @@ def parse_agy_stream_json_stream(stdout: str) -> dict[str, Any]:
 
     result["event_count"] = len(events)
 
-    if events[0].get("type") != "init":
+    if events[0].get("event") != "init":
         result["reason_code"] = "first_event_not_init"
         return result
-    if events[-1].get("type") != "result":
+    if events[-1].get("event") != "result":
         result["reason_code"] = "terminal_event_not_result_or_missing"
         return result
 
-    init_count = sum(1 for event in events if event.get("type") == "init")
-    result_count = sum(1 for event in events if event.get("type") == "result")
+    init_count = sum(1 for event in events if event.get("event") == "init")
+    result_count = sum(1 for event in events if event.get("event") == "result")
     if init_count != 1:
         result["reason_code"] = "init_count_not_exactly_one"
         return result
@@ -2396,17 +2442,32 @@ def parse_agy_stream_json_stream(stdout: str) -> dict[str, Any]:
     seen_urls: set[str] = set()
 
     for index, event in enumerate(events[1:-1], start=1):
-        if event.get("type") != "step_update":
+        if event.get("event") != "step_update":
             result["reason_code"] = f"line_{index}_unexpected_event_between_init_and_result"
             return result
-        step_type = event.get("step_type")
+        step_update_payload = event.get("step_update")
+        if not isinstance(step_update_payload, dict):
+            result["reason_code"] = f"line_{index}_step_update_payload_not_an_object"
+            return result
+        step_type = step_update_payload.get("step_type")
         if step_type is not None and (not isinstance(step_type, str) or not step_type.strip()):
             result["reason_code"] = f"line_{index}_malformed_step_type"
             return result
+
+        state = step_update_payload.get("state")
+        is_terminal_step_state = not (isinstance(state, str) and state in _STREAM_JSON_NON_TERMINAL_STEP_STATES)
+        if not is_terminal_step_state:
+            # Non-terminal (e.g. "ACTIVE") streaming delta for a step whose
+            # completion will be reported again with a terminal state --
+            # already structurally validated above, but excluded from
+            # unknown_step_types / tool_call_records / source_records so a
+            # single step is never double-counted (Issue #2521).
+            continue
+
         if isinstance(step_type, str) and step_type not in _STREAM_JSON_KNOWN_STEP_TYPES:
             unknown_step_types.append(step_type)
 
-        tool_info = event.get("tool_info")
+        tool_info = step_update_payload.get("tool_info")
         if tool_info is None:
             continue
         if not isinstance(tool_info, dict):

@@ -9,6 +9,7 @@ importlib-based module load, no real `agy` binary required.
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import types
 from pathlib import Path
@@ -333,13 +334,21 @@ def test_structured_output_capability_unavailable_when_preflight_agy_not_importa
 # ---------------------------------------------------------------------------
 
 
-def _make_stream_json_stdout(url: str = "https://example.com/a") -> str:
+def _make_stream_json_stdout(url: str = "https://example.com/a", response: str = "Answer text.") -> str:
+    """Live-confirmed current AGY `stream-json` NDJSON fixture (Issue #2521,
+    2026-09-06, real `agy` 1.1.27 `--output-format stream-json` output):
+    `event` is the top-level discriminator, each event's payload is nested
+    under a same-named key (`step_update`/`result`), and the terminal
+    `result.response` carries the final answer text. This supersedes the
+    pre-#2521 `type`-key-at-top-level fixture, which was never evidenced
+    against a real, currently-supported AGY version (Issue #2521 AC4)."""
     return "\n".join(
         [
-            '{"type": "init"}',
-            '{"type": "step_update", "step_type": "tool_call", "tool_info": '
-            '{"name": "web_search", "output": {"sources": [{"url": "%s", "title": "A"}]}}}' % url,
-            '{"type": "result", "status": "success"}',
+            '{"event": "init", "init": {}}',
+            '{"event": "step_update", "step_update": {"step_index": 0, "state": "DONE", '
+            '"step_type": "tool", "tool_info": '
+            '{"name": "web_search", "output": {"sources": [{"url": "%s", "title": "A"}]}}}}' % url,
+            '{"event": "result", "result": {"status": "SUCCESS", "response": "%s"}}' % response,
         ]
     )
 
@@ -603,10 +612,48 @@ def test_parse_agy_stream_json_stream_accepts_valid_init_step_result() -> None:
     assert verdict["source_records"][0]["url"] == "https://example.com/a"
 
 
+def test_parse_agy_stream_json_stream_accepts_terminal_result_response_text() -> None:
+    """Issue #2521 AC5/AC6: the terminal event's nested `result.response`
+    (the final answer text a parent agent should read) round-trips through
+    `terminal_result` unchanged."""
+    verdict = preflight_agy.parse_agy_stream_json_stream(
+        _make_stream_json_stdout(response="The final answer.")
+    )
+    assert verdict["status"] == "valid"
+    assert verdict["terminal_result"]["event"] == "result"
+    assert verdict["terminal_result"]["result"]["response"] == "The final answer."
+
+
+def test_parse_agy_stream_json_stream_deduplicates_active_then_done_step(
+) -> None:
+    """Issue #2521 live evidence: a real AGY stream can report the SAME
+    `step_index` twice for one tool call -- once `state: "ACTIVE"` (in
+    progress) and once `state: "DONE"` (completed). The ACTIVE delta must
+    not be double-counted as a second tool call / source record."""
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "step_update", "step_update": {"step_index": 1, "state": "ACTIVE", '
+            '"step_type": "tool", "tool_info": {"name": "search_web", "parameters": {"query": "q"}}}}',
+            '{"event": "step_update", "step_update": {"step_index": 1, "state": "DONE", '
+            '"step_type": "tool", "tool_info": '
+            '{"name": "search_web", "output": {"sources": [{"url": "https://example.com/a"}]}}}}',
+            '{"event": "result", "result": {"status": "SUCCESS", "response": "done"}}',
+        ]
+    )
+    verdict = preflight_agy.parse_agy_stream_json_stream(stream)
+    assert verdict["status"] == "valid"
+    assert len(verdict["tool_call_records"]) == 1
+    assert len(verdict["source_records"]) == 1
+
+
 def test_parse_agy_stream_json_stream_rejects_missing_terminal_result() -> None:
     """A stream with no terminal result event (truncated mid-stream) is
     rejected, not partially accepted."""
-    stream = '{"type": "init"}\n{"type": "step_update", "step_type": "text"}'
+    stream = (
+        '{"event": "init", "init": {}}\n'
+        '{"event": "step_update", "step_update": {"step_type": "agent_response"}}'
+    )
     verdict = preflight_agy.parse_agy_stream_json_stream(stream)
     assert verdict["status"] == "invalid"
     assert verdict["reason_code"] == "terminal_event_not_result_or_missing"
@@ -614,18 +661,30 @@ def test_parse_agy_stream_json_stream_rejects_missing_terminal_result() -> None:
 
 def test_parse_agy_stream_json_stream_rejects_duplicate_terminal_result() -> None:
     """Two `result` events in the same stream is rejected (duplicate
-    terminal), even though the last event IS type "result"."""
-    stream = '\n'.join(['{"type": "init"}', '{"type": "result"}', '{"type": "result"}'])
+    terminal), even though the last event IS event "result"."""
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "result", "result": {"response": "a"}}',
+            '{"event": "result", "result": {"response": "b"}}',
+        ]
+    )
     verdict = preflight_agy.parse_agy_stream_json_stream(stream)
     assert verdict["status"] == "invalid"
     assert verdict["reason_code"] == "result_count_not_exactly_one"
 
 
 def test_parse_agy_stream_json_stream_rejects_unknown_event_type() -> None:
-    """An event whose top-level `type` is not in the closed
+    """An event whose top-level `event` discriminator is not in the closed
     {init, step_update, result} enum is rejected (fail-closed, never
     silently skipped)."""
-    stream = '\n'.join(['{"type": "init"}', '{"type": "unknown_future_event"}', '{"type": "result"}'])
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "unknown_future_event"}',
+            '{"event": "result", "result": {"response": "a"}}',
+        ]
+    )
     verdict = preflight_agy.parse_agy_stream_json_stream(stream)
     assert verdict["status"] == "invalid"
     assert verdict["reason_code"] == "line_1_unknown_event_type"
@@ -634,10 +693,26 @@ def test_parse_agy_stream_json_stream_rejects_unknown_event_type() -> None:
 def test_parse_agy_stream_json_stream_rejects_malformed_json_line() -> None:
     """A truncated/malformed NDJSON line is rejected, never best-effort
     recovered."""
-    stream = '{"type": "init"}\n{"type": "step_update", truncated'
+    stream = '{"event": "init", "init": {}}\n{"event": "step_update", truncated'
     verdict = preflight_agy.parse_agy_stream_json_stream(stream)
     assert verdict["status"] == "invalid"
     assert verdict["reason_code"] == "line_1_not_valid_json"
+
+
+def test_parse_agy_stream_json_stream_rejects_step_update_payload_not_object() -> None:
+    """Issue #2521 AC1/AC2: a `step_update` event whose nested `step_update`
+    payload is missing/not an object is rejected -- the parser must read the
+    payload from the nested key, not the event's top level."""
+    stream = "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "step_update", "step_update": "not-an-object"}',
+            '{"event": "result", "result": {"response": "a"}}',
+        ]
+    )
+    verdict = preflight_agy.parse_agy_stream_json_stream(stream)
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "line_1_step_update_payload_not_an_object"
 
 
 def test_parse_agy_stream_json_stream_never_accepts_legacy_marker_text() -> None:
@@ -653,16 +728,33 @@ def test_parse_agy_stream_json_stream_never_accepts_legacy_marker_text() -> None
     assert verdict["status"] == "invalid"
 
 
+def test_parse_agy_stream_json_stream_never_accepts_legacy_type_key_envelope() -> None:
+    """Issue #2521 AC4: the previously assumed `type`-key top-level
+    discriminator format (never evidenced against a real, currently
+    supported AGY version) is NOT kept as a compatibility shim -- it is
+    rejected the same as any other unrecognized event shape."""
+    legacy_type_key_stdout = "\n".join(
+        [
+            '{"type": "init"}',
+            '{"type": "step_update", "step_type": "tool_call"}',
+            '{"type": "result"}',
+        ]
+    )
+    verdict = preflight_agy.parse_agy_stream_json_stream(legacy_type_key_stdout)
+    assert verdict["status"] == "invalid"
+    assert verdict["reason_code"] == "line_0_unknown_event_type"
+
+
 def test_parse_agy_stream_json_stream_rejects_unrecognized_tool_source() -> None:
     """A step_update whose tool_info.name is NOT a recognized canonical web
     tool never contributes a source record, even if its tool_info.output
     contains a well-formed url (step/tool-call correlation requirement)."""
     stream = "\n".join(
         [
-            '{"type": "init"}',
-            '{"type": "step_update", "step_type": "tool_call", "tool_info": '
-            '{"name": "run_shell_command", "output": {"sources": [{"url": "https://example.com/a"}]}}}',
-            '{"type": "result"}',
+            '{"event": "init", "init": {}}',
+            '{"event": "step_update", "step_update": {"step_type": "tool", "tool_info": '
+            '{"name": "run_shell_command", "output": {"sources": [{"url": "https://example.com/a"}]}}}}',
+            '{"event": "result", "result": {"response": "a"}}',
         ]
     )
     verdict = preflight_agy.parse_agy_stream_json_stream(stream)
@@ -726,6 +818,144 @@ def test_normalize_agy_result_structured_route_malformed_stream_fail_closed() ->
     evidence = result["grounded_research_evidence"]
     assert evidence["grounding_failure_class"] == "agy_web_grounding_stream_json_malformed"
     assert result["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #2521 AC5/AC6/AC7: _normalize_agy_result()'s response_text /
+# result_surface.summary must be sourced from the parser's terminal_result
+# (result.response), not raw stdout (the full NDJSON stream), when
+# structured parsing succeeds. AC8/AC9: tool-derived source_records are
+# preserved, and citation-candidate extraction (terminal-answer URLs) never
+# auto-promotes to grounded/supported.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_agy_result_response_text_terminal_result_not_raw_stdout() -> None:
+    """AC5/AC6: when structured parsing succeeds, response_text and
+    result_surface.summary are built from the parser's terminal_result
+    (result.response) -- never the raw stdout NDJSON stream."""
+    stdout = _make_stream_json_stdout(response="This is the final answer text.")
+    completed = subprocess.CompletedProcess(
+        args=["agy", "-p", "x", "--output-format", "stream-json"],
+        returncode=0,
+        stdout=stdout,
+        stderr="",
+    )
+    completed.agy_structured_output_used = True  # type: ignore[attr-defined]
+    completed.agy_structured_output_capability_record = _supported_capability_record()  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_events = []  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
+
+    result = rgh._normalize_agy_result(completed, tool_profile="grounded_research", requested_model=None)
+
+    assert result["response_text"] == "This is the final answer text."
+    assert result["response_text"] != stdout
+    assert '"event"' not in result["response_text"]
+    assert result["result_surface"]["summary"] == "This is the final answer text."
+    # AC7: exit_code (execution status) is unaffected by parser-validity routing.
+    assert result["exit_code"] == 0
+
+
+def test_normalize_agy_result_response_text_falls_back_to_stdout_when_parse_fails() -> None:
+    """AC5: when agy_structured_output_used=True but stdout is NOT a valid
+    stream-json NDJSON stream, response_text falls back to raw stdout
+    unchanged (pre-existing legacy/fail-closed behavior preserved)."""
+    stdout = "plain prose response, not stream-json"
+    completed = subprocess.CompletedProcess(
+        args=["agy", "-p", "x", "--output-format", "stream-json"],
+        returncode=0,
+        stdout=stdout,
+        stderr="",
+    )
+    completed.agy_structured_output_used = True  # type: ignore[attr-defined]
+    completed.agy_structured_output_capability_record = _supported_capability_record()  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_events = []  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
+
+    result = rgh._normalize_agy_result(completed, tool_profile="grounded_research", requested_model=None)
+
+    assert result["response_text"] == stdout
+
+
+def test_normalize_agy_result_response_text_uses_raw_stdout_when_not_structured() -> None:
+    """AC5 fallback regression guard: when agy_structured_output_used is
+    False/absent (e.g. non-grounded_research profiles, which never attach
+    --output-format per this module's Out-of-Scope CLI-invocation
+    boundary), response_text is the raw stdout exactly as before this fix."""
+    completed = subprocess.CompletedProcess(
+        args=["agy", "-p", "x"], returncode=0, stdout="plain text answer", stderr=""
+    )
+    completed.agy_structured_output_used = False  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_events = []  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
+
+    result = rgh._normalize_agy_result(completed, tool_profile="no_tools", requested_model=None)
+
+    assert result["response_text"] == "plain text answer"
+
+
+def _make_stream_json_stdout_no_tool_output(url: str, response: str) -> str:
+    """A stream-json fixture whose recognized web tool call carries NO
+    structured `output.sources`/`.citations`/`.results` -- matches Issue
+    #2521's live-observed real `search_web` tool_info shape (`name`/
+    `parameters` only, no `output`). *url* is accepted for call-site
+    symmetry with `_make_stream_json_stdout()` but is unused here (there is
+    no `output.sources` to place it in)."""
+    del url
+    result_event = {"event": "result", "result": {"status": "SUCCESS", "response": response}}
+    return "\n".join(
+        [
+            '{"event": "init", "init": {}}',
+            '{"event": "step_update", "step_update": {"step_index": 0, "state": "DONE", '
+            '"step_type": "tool", "tool_info": {"name": "search_web", "parameters": {"query": "q"}}}}',
+            json.dumps(result_event),
+        ]
+    )
+
+
+def test_structured_grounded_metadata_extracts_terminal_answer_url_as_candidate_only() -> None:
+    """AC8/AC9: when the recognized tool_info carries no structured
+    output.sources (Issue #2521 live evidence -- the real search_web tool
+    never does), a concrete URL found in the terminal answer text is kept
+    as a citation CANDIDATE (citation_evidence is non-empty) but is NEVER
+    auto-promoted to grounding_status "grounded" -- it resolves to
+    "citation_candidates_unverified" instead, mirroring the legacy
+    text-route precedent."""
+    stdout = _make_stream_json_stdout_no_tool_output(
+        url="unused", response="See https://example.com/evidence for details."
+    )
+    result = rgh._build_agy_structured_stream_json_grounded_research_metadata(stdout, hook_events=[])
+
+    assert result["grounding_status"] == "citation_candidates_unverified"
+    assert result["grounding_failure_class"] == "agy_evidence_quality_unverified"
+    assert result["url_citation_count"] == 1
+    assert result["citation_evidence"] == [{"url": "https://example.com/evidence", "title": None}]
+
+
+def test_structured_grounded_metadata_tool_correlated_source_still_promotes_to_grounded() -> None:
+    """Regression guard: when the recognized tool_info DOES carry a
+    structured output.sources entry, that tool-correlated evidence still
+    promotes grounding_status to "grounded" (AC8: existing tool-derived
+    citation preservation is unaffected by the AC9 candidate-only
+    fallback)."""
+    stdout = _make_stream_json_stdout()
+    result = rgh._build_agy_structured_stream_json_grounded_research_metadata(stdout, hook_events=[])
+
+    assert result["grounding_status"] == "grounded"
+    assert result["citation_evidence"] == [{"url": "https://example.com/a", "title": "A"}]
+
+
+def test_structured_grounded_metadata_no_citations_anywhere_stays_no_citations() -> None:
+    """AC9 boundary: a recognized tool call with neither a structured
+    output.sources entry nor a URL in the terminal answer text stays
+    "attempted_no_citations" -- the terminal-answer fallback never invents
+    a citation that is not actually present."""
+    stdout = _make_stream_json_stdout_no_tool_output(url="unused", response="No links here at all.")
+    result = rgh._build_agy_structured_stream_json_grounded_research_metadata(stdout, hook_events=[])
+
+    assert result["grounding_status"] == "attempted_no_citations"
+    assert result["url_citation_count"] == 0
+    assert result["citation_evidence"] == []
 
 
 # ---------------------------------------------------------------------------
