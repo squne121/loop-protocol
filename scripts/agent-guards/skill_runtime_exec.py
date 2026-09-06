@@ -181,9 +181,20 @@ def _is_symlink_path(path: Path) -> bool:
     return False
 
 
+# Issue #2393: the two contract-update mutation profiles migrated onto the
+# dedicated control-plane runtime. Shared by `_allowed_artifact_roots()`,
+# `_snapshot_repo_paths()`'s `tmp/` directory-node exclusion, the P1-A
+# cold-worktree `tmp/` pre-creation fix, and the P1-B inner-transaction-result
+# evidence lookup below -- kept as ONE source of truth rather than repeating
+# the same literal set at each call site.
+CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS = frozenset(
+    {"contract_update.run.with_anchor", "contract_update.run.with_human_context"}
+)
+
+
 def _allowed_artifact_roots(project_root: str, issue_number: str, command_id: str = "") -> tuple[Path, ...]:
     roots = [Path(project_root) / ".claude" / "artifacts" / "issue-refinement-loop" / issue_number]
-    if command_id in {"contract_update.run.with_anchor", "contract_update.run.with_human_context"}:
+    if command_id in CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS:
         # The existing edit-issue transaction writes its request metadata
         # under this exact Issue-scoped directory.  Do not grant the phase a
         # broader artifacts root or a second Issue's metadata directory.
@@ -248,17 +259,23 @@ def _git_status_paths(project_root: str) -> set[str]:
 # Issue #2199 In Scope: the 4 production preflight profiles whose child
 # dispatch cwd is migrated to the #2197 dedicated worktree
 # (`execution_root`) by `main()`'s real dispatch-selection logic below.
-# Fixture profiles
-# (`preflight.run.fixture`/`preflight.run.fixture.with_human_context`) and
-# `contract_update.run.with_anchor`/`contract_update.run.with_human_context`
-# are deliberately excluded (AC8 non-regression) -- they remain on the
-# primary root (`canonical_main_root`), unchanged by this Issue.
+# Issue #2393 In Scope: `contract_update.run.with_anchor` /
+# `contract_update.run.with_human_context` (the two contract-update
+# mutation profiles #2199 deliberately excluded) are added to this SAME
+# set, routing their child dispatch through the SAME existing
+# `control_plane_dedicated_execution_session()` parent-controller -- no new
+# re-exec route, command entrypoint, or lock protocol. Fixture profiles
+# (`preflight.run.fixture`/`preflight.run.fixture.with_human_context`)
+# remain deliberately excluded (AC8/#2199 non-regression) -- they stay on
+# the primary root (`canonical_main_root`), unaffected by either Issue.
 PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS = frozenset(
     {
         "preflight.run",
         "preflight.run.with_anchor",
         "preflight.run.with_human_context",
         "preflight.run.with_agent_report",
+        "contract_update.run.with_anchor",
+        "contract_update.run.with_human_context",
     }
 )
 
@@ -500,7 +517,7 @@ def _snapshot_repo_paths(project_root: str, issue_number: str, command_id: str =
             allowed_parent_dirs.add(parent)
             if parent == root:
                 break
-    if command_id in {"contract_update.run.with_anchor", "contract_update.run.with_human_context"}:
+    if command_id in CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS:
         # The existing edit-issue transaction uses the repository-approved
         # transaction-local ``tmp/`` workspace for its candidate and input
         # files, and deletes those files before returning.  Ignore only the
@@ -1236,22 +1253,40 @@ def _emit_stale_runtime_failure(issue_number: int, stale_entries: list[tuple[str
     return 2
 
 
-def _emit_artifact_projection_failure(issue_number: int, stale_paths: list[str]) -> int:
+def _format_inner_transaction_evidence_fields(extra_fields: "dict[str, str] | None") -> str:
+    """Render `_resolve_inner_transaction_evidence_fields()`'s output as
+    additional ``key=value `` tokens for an outer-failure `SKILL_RUNTIME_FAIL`
+    line (Issue #2393 P1-B). Empty for every command_id other than the two
+    contract-update mutation profiles (`extra_fields` is `{}`/`None` there),
+    so this is a byte-identical no-op for every other consumer of these
+    emitters."""
+    if not extra_fields:
+        return ""
+    return "".join(f"{key}={value} " for key, value in extra_fields.items())
+
+
+def _emit_artifact_projection_failure(
+    issue_number: int, stale_paths: list[str], *, extra_fields: "dict[str, str] | None" = None
+) -> int:
     print(
         "SKILL_RUNTIME_FAIL: "
         f"reason_code=stale_worktree_runtime_state target_issue={issue_number} "
         f"stale_path={','.join(stale_paths)} "
+        f"{_format_inner_transaction_evidence_fields(extra_fields)}"
         "recovery=do_not_publish_artifact_projection_outside_issue_artifact_root",
         file=sys.stderr,
     )
     return 2
 
 
-def _emit_unauthorized_write_failure(issue_number: int, unauthorized_path: str) -> int:
+def _emit_unauthorized_write_failure(
+    issue_number: int, unauthorized_path: str, *, extra_fields: "dict[str, str] | None" = None
+) -> int:
     print(
         "SKILL_RUNTIME_FAIL: "
         f"reason_code=unauthorized_write_path target_issue={issue_number} "
         f"unauthorized write path={unauthorized_path} "
+        f"{_format_inner_transaction_evidence_fields(extra_fields)}"
         "recovery=do_not_write_outside_allowed_root",
         file=sys.stderr,
     )
@@ -1624,6 +1659,7 @@ def _emit_timeout_failure(
     cleanup_status: str = CLEANUP_STATUS_NOT_STARTED,
     termination: str = TERMINATION_NOT_NEEDED,
     leader_reaped: bool = False,
+    extra_fields: "dict[str, str] | None" = None,
 ) -> int:
     print(
         "SKILL_RUNTIME_FAIL: "
@@ -1633,6 +1669,7 @@ def _emit_timeout_failure(
         f"cleanup_status={cleanup_status} "
         f"termination={termination} "
         f"leader_reaped={'true' if leader_reaped else 'false'} "
+        f"{_format_inner_transaction_evidence_fields(extra_fields)}"
         "recovery=investigate_child_process_hang_or_increase_registry_timeout",
         file=sys.stderr,
     )
@@ -1655,6 +1692,79 @@ def _emit_primary_checkout_drift_failure(issue_number: int) -> int:
     return 2
 
 
+def _contract_update_result_artifact_path(dispatch_root: str, issue_number: int) -> Path:
+    """The canonical result artifact `run_refinement_preflight.py` writes
+    (via `_write_artifacts()`/`write_provenance_artifact()`'s sibling
+    `refinement_preflight_result_v1.json`) under the FIRST allowed artifact
+    root for the two contract-update mutation profiles (Issue #2393 P1-B).
+    This path lives under `.claude/artifacts/issue-refinement-loop/<issue>/`
+    -- never under the transaction-local `tmp/` workspace the inner
+    transaction deletes before returning -- so it survives past the span
+    this function's caller monitors, and is safe to read back after that
+    span ends."""
+    return (
+        Path(dispatch_root)
+        / ".claude"
+        / "artifacts"
+        / "issue-refinement-loop"
+        / str(issue_number)
+        / "refinement_preflight_result_v1.json"
+    )
+
+
+def _stat_identity_or_none(path: Path) -> "tuple[int, int] | None":
+    try:
+        stat_result = path.lstat()
+    except OSError:
+        return None
+    return (stat_result.st_mtime_ns, stat_result.st_size)
+
+
+def _resolve_inner_transaction_evidence_fields(
+    dispatch_root: str,
+    issue_number: int,
+    command_id: str,
+    before_result_stat: "tuple[int, int] | None",
+) -> "dict[str, str]":
+    """Issue #2393 P1-B: on an OUTER dispatch failure (timeout /
+    unauthorized-write / artifact-projection), attempt to recover a
+    reference to an inner transaction result that may already have been
+    achieved (a real GitHub mutation + readback) before the outer failure
+    was detected -- read-only, never writing a new file here.
+
+    Only applies to the two contract-update mutation profiles; every other
+    command_id gets `{}` (a byte-identical no-op for the emitted stderr
+    line).
+
+    Freshness guard: the result artifact's `(mtime_ns, size)` identity is
+    compared against `before_result_stat` (captured BEFORE this dispatch's
+    child ran). A leftover artifact from a PRIOR, unrelated dispatch that
+    this span's child never touched must never be misreported as "achieved
+    by this span" -- if the identity is unchanged (or the file still does
+    not exist), this returns the explicit `inner_transaction_state=unknown`
+    marker, never a fabricated disposition and never a false
+    "unmutated"/"no-op" default.
+    """
+    if command_id not in CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS:
+        return {}
+    result_path = _contract_update_result_artifact_path(dispatch_root, issue_number)
+    after_result_stat = _stat_identity_or_none(result_path)
+    if after_result_stat is None or after_result_stat == before_result_stat:
+        return {"inner_transaction_state": "unknown"}
+    try:
+        parsed_result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {"inner_transaction_state": "unknown"}
+    contract_update = parsed_result.get("contract_update") if isinstance(parsed_result, dict) else None
+    disposition = contract_update.get("disposition") if isinstance(contract_update, dict) else None
+    if not isinstance(disposition, str) or not disposition:
+        return {"inner_transaction_state": "unknown"}
+    return {
+        "inner_transaction_result_ref": str(result_path),
+        "inner_transaction_disposition": disposition,
+    }
+
+
 def _dispatch_child_and_check_postconditions(
     *,
     dispatch_root: str,
@@ -1675,6 +1785,34 @@ def _dispatch_child_and_check_postconditions(
     production/fixture branching of its own, so the caller's root selection
     is the only thing that ever changes which checkout is touched.
     """
+    if command_id in CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS:
+        # Issue #2393 P1-A: a genuinely cold dedicated worktree (one that has
+        # never run a contract_update dispatch before) has no `tmp/`
+        # directory yet. The inner edit-issue transaction creates `tmp/` for
+        # its candidate/input files and deletes those FILES (never the
+        # directory itself) before returning -- leaving a newly-appeared,
+        # now-empty `tmp/` directory that `_snapshot_repo_paths()` already
+        # excludes from ITS OWN filesystem-walk diff (see the `root / "tmp"`
+        # addition to `allowed_parent_dirs` above), but that
+        # `_find_unauthorized_repo_changes()`'s SEPARATE `git status`-based
+        # diff (`before_status`/`after_status`) has no equivalent exclusion
+        # for: a cold-start `!! tmp/` entry with no counterpart in
+        # `before_status` is misreported as an unauthorized write. Creating
+        # `tmp/` here, BEFORE `before_snapshot`/`before_status` are captured
+        # below, makes it present on BOTH sides of both diffs, closing the
+        # gap without weakening either check or excluding `tmp/**` wholesale
+        # (a residual child path left inside `tmp/` after the child returns
+        # is still rejected by both diffs, exactly as before).
+        (Path(dispatch_root) / "tmp").mkdir(parents=True, exist_ok=True)
+    # Issue #2393 P1-B: captured BEFORE the child runs, so
+    # `_resolve_inner_transaction_evidence_fields()` can later distinguish
+    # "this span's own child achieved a fresh result" from "a stale artifact
+    # a prior, unrelated dispatch already left on disk".
+    before_result_stat = (
+        _stat_identity_or_none(_contract_update_result_artifact_path(dispatch_root, issue_number))
+        if command_id in CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS
+        else None
+    )
     before_snapshot = _snapshot_repo_paths(dispatch_root, str(issue_number), command_id)
     before_status = _git_status_paths(dispatch_root)
 
@@ -1693,6 +1831,9 @@ def _dispatch_child_and_check_postconditions(
             cleanup_status=supervision.cleanup_status,
             termination=supervision.termination,
             leader_reaped=supervision.leader_reaped,
+            extra_fields=_resolve_inner_transaction_evidence_fields(
+                dispatch_root, issue_number, command_id, before_result_stat
+            ),
         )
     result = supervision
 
@@ -1704,7 +1845,13 @@ def _dispatch_child_and_check_postconditions(
         command_id,
     )
     if unauthorized_path is not None:
-        return _emit_unauthorized_write_failure(issue_number, unauthorized_path)
+        return _emit_unauthorized_write_failure(
+            issue_number,
+            unauthorized_path,
+            extra_fields=_resolve_inner_transaction_evidence_fields(
+                dispatch_root, issue_number, command_id, before_result_stat
+            ),
+        )
 
     stdout_for_artifact_projection = (
         result.stdout.decode("utf-8", errors="surrogateescape")
@@ -1718,7 +1865,13 @@ def _dispatch_child_and_check_postconditions(
         command_id,
     )
     if artifact_projection_failures:
-        return _emit_artifact_projection_failure(issue_number, artifact_projection_failures)
+        return _emit_artifact_projection_failure(
+            issue_number,
+            artifact_projection_failures,
+            extra_fields=_resolve_inner_transaction_evidence_fields(
+                dispatch_root, issue_number, command_id, before_result_stat
+            ),
+        )
 
     if isinstance(result.stdout, bytes):
         sys.stdout.buffer.write(result.stdout)
@@ -2493,11 +2646,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if not is_production_dedicated_command:
         # Fixture profiles (`preflight.run.fixture` /
-        # `preflight.run.fixture.with_human_context`) and
-        # `contract_update.run.with_anchor` / `.with_human_context` --
-        # along with every non-preflight command_id -- are unaffected by
-        # Issue #2199 and keep dispatching at `project_root` exactly as
-        # before (AC8 non-regression).
+        # `preflight.run.fixture.with_human_context`) -- along with every
+        # other command_id not in `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`
+        # -- are unaffected by Issue #2199/#2393 and keep dispatching at
+        # `project_root` exactly as before (AC8/#2199 non-regression).
+        # `contract_update.run.with_anchor`/`.with_human_context` used to be
+        # excluded here too (#2199 AC8); Issue #2393 moved them into
+        # `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`, so they now take the
+        # dedicated-runtime branch below instead of this one.
         return _dispatch_child_and_check_postconditions(
             dispatch_root=project_root,
             issue_number=args.issue_number,
@@ -2508,7 +2664,8 @@ def main(argv: list[str] | None = None) -> int:
             binary_output=binary_output,
         )
 
-    # Issue #2199: the 4 production preflight profiles
+    # Issue #2199/#2393: the 4 production preflight profiles plus the 2
+    # contract_update mutation profiles
     # (`PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`) dispatch their child
     # under the #2197 dedicated worktree (`execution_root`) instead of
     # `project_root`, with the fixed #2198 lifecycle guard held across
@@ -2552,6 +2709,25 @@ def main(argv: list[str] | None = None) -> int:
             # so the child observes the SAME relocated environment this
             # preparation step just readied.
             dedicated_env = dict(env)
+            # Issue #2393 AC4: a caller-supplied relative `GH_CONFIG_DIR`
+            # (carried through by `_sanitize_env()`'s
+            # `gh_config_dir_carrier_command_ids` allowlist, which already
+            # includes both `contract_update.run.*` profiles) is anchored to
+            # the INVOCATION cwd (`project_root` -- `_validate_runtime_context()`
+            # above already required `os.getcwd() == project_root`) BEFORE
+            # the child's own cwd switches to `execution_root` below.
+            # Without this, a relative value would silently resolve against
+            # the WRONG directory once the child's cwd differs from the
+            # invocation cwd (a gap that did not exist before this dispatch
+            # became dedicated-worktree-routed, since dispatch_root ==
+            # project_root == invocation cwd for every non-dedicated
+            # command_id). Generalizes the same anchoring PR #2407 already
+            # relies on for bare `preflight.run`'s dedicated dispatch. An
+            # absolute value is never modified. No token copying, no
+            # config-content reads, no allowlist widening.
+            raw_gh_config_dir = dedicated_env.get("GH_CONFIG_DIR")
+            if raw_gh_config_dir and not os.path.isabs(raw_gh_config_dir):
+                dedicated_env["GH_CONFIG_DIR"] = os.path.realpath(os.path.join(project_root, raw_gh_config_dir))
             # An unmanaged project (`[tool.uv].managed = false`) never
             # triggers `uv`'s own environment sync/`.venv` creation at all
             # (`uv sync`/`uv run` refuse to manage it by design) -- it was
