@@ -157,6 +157,66 @@ before/after で不均衡な場合（`equal_1_to_1` 契約違反）や、実際�
 （#2422 owner）のスキーマ・producer 自体は変更しない。既存の `github.event.inputs.benchmark_layout
 == ''` ガードは `reliability_assessment` dispatch でも他ジョブを正しくスキップする。
 
+### fix_delta 修正内容（OWNER REQUEST_CHANGES issuecomment-5556542041、PR #2518）
+
+以下は初版 production wiring に対する OWNER REQUEST_CHANGES を反映した修正である。
+
+- **Finding 1（manifest v2 上流互換）**: `expected_playwright_invocations` の
+  論理 `invocation_id`/`lane` は `monolith`/`split` 両 arm で共通の2件
+  （`e2e-core`、`e2e-responsive`）に固定し、物理的にどの provider job が
+  実行するかは `provider_placement.{monolith,split}` でのみ表す
+  （`benchmark_layout_only` という producer-local field は削除）。
+  `expected_test_count` は上流スキーマ通り optional として扱う
+  （`prerequisite_incomplete` の必須キーから除外）。
+- **Finding 2（複数 run/arm 対応）**: `playwright_json_loader` は
+  `(layout, workflow_run_id, invocation_id)` の3引数を取り、artifact
+  保存先も `<layout>/<workflow_run_id>/<invocation_id>.json` にネストする
+  （`run_attempt` は既存の `workflow_evidence_not_attempt_1` 検証で別途
+  `1` に固定されるため追加の path segment は設けない）。`.github/
+  workflows/ci.yml` の `reliability-assessment` job は、operator が
+  供給する `reliability_monolith_run_id`/`reliability_split_run_id`
+  （AC10 fail-closed prerequisite 用の trusted "primary" pair）を receipt
+  自身の `arms.{monolith,split}.workflow_run_ids` に含まれることを確認した
+  上で、実際の fetch/download ループは receipt の canonical run-set 全体を
+  列挙する。これにより 2 run/arm・22 run/arm いずれも同じ本番 CLI 経路
+  （`build_composite_envelope` を1回だけ呼ぶ）で処理できる。
+- **Finding 3（digest 独立検証）**: `manifest.experiment_run_set_digest`
+  は `scripts/ci/collect_e2e_performance_benchmark.py` の公開関数
+  `validate_manifest_v2_semantics` を import して独立に再検証する
+  （#2422 owner algorithm の再実装はしない）。`receipt.manifest_sha256`
+  は `--manifest` file の生バイト列に対する標準 sha256（owner-specific
+  アルゴリズムではない universal operation）で独立に再検証する。
+  `receipt.run_set_digest` については、#2423 owner 側に public な
+  import 可能な production entry point が存在しない（唯一の実装
+  `_run_set_digest` は `tests/ci/test_ci_performance_gate.py` 内の
+  leading-underscore private helper であり、AC1 自身が禁じる「#2423の
+  内部関数import」に該当する）ため、format 検証（`^sha256:[0-9a-f]{64}$`）
+  のみを行う。実際の run-set membership の正しさは
+  `verify_exact_run_set_binding` の直接比較で別途保証されるため、この
+  digest 自体を信頼した判定は行わない。この残存ギャップは root
+  control-plane に報告済みであり、#2423 owner surface 側で public
+  verification entry point を追加する follow-up が必要。
+- **Finding 4（receipt.evidence_errors の分離）**: `receipt.evidence_errors`
+  のうち `gate_ready_timestamp_missing_or_invalid` /
+  `missing_pair_e2e-core` / `missing_pair_e2e-responsive-matrix`
+  （Performance 固有の測定不適格理由）は Reliability を停止させない。
+  それ以外の理由（未知の理由を含む）は引き続き fail-closed とする。
+- **Finding 5（canonical output の完全性）**: `main()` は
+  `composite_envelope.json`（envelope 本体）を追加出力し、`.github/
+  workflows/ci.yml` の artifact upload は `reliability-assessment-input/`
+  （manifest・receipt・workflow evidence・Playwright JSON・artifact
+  index）も同梱する。`--artifact-index`（`gh api .../actions/artifacts`
+  由来の `{artifact_name: {id, digest}}` マッピング）を任意入力とし、
+  `invocation_artifacts` を実際の artifact id/digest で埋める。
+  job-level evidence は `status == "completed"` も確認し（`job_not_
+  completed` エラー）、job 名の存在だけで完了とみなさない。
+- **AC8（live smoke の永続 skip 解消）**: `RELIABILITY_LIVE_MANIFEST_PATH`/
+  `RELIABILITY_LIVE_RECEIPT_PATH` を追加で供給した場合、実際に
+  `gh api`/`gh run download` で証跡を取得し、本番 `build_ci_reliability_
+  assessment_v1.py` の `main()` を実行して canonical output を readback
+  検証する。監視元 dispatch（monolith/split 実行そのもの）は引き続き
+  operator 責務のまま、二重の dispatch orchestrator は実装しない。
+
 ### Playwright JSON 証跡経路（AC2）
 
 `playwright.config.ts` は `PLAYWRIGHT_JSON_OUTPUT_FILE` が設定されている場合のみ、追加で
@@ -176,44 +236,70 @@ before/after で不均衡な場合（`equal_1_to_1` 契約違反）や、実際�
 
 `ci.yml` は `benchmark_layout in (monolith, split)` かつ `reliability_evidence == 'true'` の
 ときだけ、各 Playwright invocation の直前にこれらの env を設定する。`PLAYWRIGHT_JSON_OUTPUT_FILE`
-は `${GITHUB_WORKSPACE}/reliability-evidence/<invocation_id>.json` の full path とする。invocation
-ID は固定 3 種類:
+は `${GITHUB_WORKSPACE}/reliability-evidence/<invocation_id>.json` の full path とする。fix_delta
+（Finding 1、OWNER REQUEST_CHANGES issuecomment-5556542041）以降、invocation_id は
+`monolith`/`split` 両 arm で共通の固定 2 種類（実行 job は `provider_placement` でのみ arm 別に
+変わる。real #2422 schema `ExpectedPlaywrightInvocation` 準拠、`benchmark_layout_only` という
+producer-local field は存在しない）:
 
-| invocation_id | lane | 発生 job / layout |
-| --- | --- | --- |
-| `e2e-core` | `core` | `e2e-core` job（monolith / split 共通、通常の `pnpm test:e2e:ci`） |
-| `e2e-core-responsive` | `responsive` | `e2e-core` job、`benchmark_layout=monolith` のときのみ（sequential responsive workload） |
-| `e2e-responsive` | `responsive` | `e2e-responsive-matrix` job、`benchmark_layout=split` のときのみ |
+| invocation_id | lane | provider_placement.monolith | provider_placement.split |
+| --- | --- | --- | --- |
+| `e2e-core` | `core` | `e2e-core` | `e2e-core` |
+| `e2e-responsive` | `responsive` | `e2e-core`（sequential responsive workload） | `e2e-responsive-matrix` |
 
-monolith run は `{e2e-core, e2e-core-responsive}`、split run は `{e2e-core, e2e-responsive}` の
-2 invocation を生成する（両 arm とも core+responsive の同一 cohort lane をカバーする）。各 JSON は
+monolith run・split run はいずれも `{e2e-core, e2e-responsive}` の同じ2 invocation を生成する
+（両 arm とも core+responsive の同一 cohort lane をカバーする）。各 JSON は
 `ci-reliability-${workflow_run_id}-a${run_attempt}-${invocation_id}` という一意な artifact 名で
-`if-no-files-found: error` を使い upload される。
+`if-no-files-found: error` を使い upload される。ただし monolith の `e2e-responsive` invocation
+だけは、`e2e-core` job 自身の artifact 名が split の `e2e-responsive-matrix` job のものと
+静的に衝突しないよう（`tests/ci/test_verify_e2e_lane_partition.py` が `benchmark_layout` の
+排他性を考慮せず artifact 名の literal 一意性を要求するため）、artifact 名だけ
+`e2e-core-responsive` という suffix を使う（`RELIABILITY_INVOCATION_ID`・manifest の
+`invocation_id` は両 arm とも `e2e-responsive` のまま変えない）。この
+`(layout, invocation_id) -> artifact 名 suffix` の対応表は `ci.yml` の
+`ARTIFACT_NAME_SUFFIX_BY_LAYOUT_AND_INVOCATION` と `build_ci_reliability_assessment_v1.py`
+の同名定数で重複定義し、常に一致させる。
 
 ### builder が消費する evidence 契約
 
 `scripts/ci/build_ci_reliability_assessment_v1.py` は以下 4 種類の入力ファイルを読む consumer で
 あり、いずれも #2422/#2423 の producer 自体を re-import/re-implement しない。
 
-1. `--manifest`: `e2e_performance_benchmark_manifest_v2`（#2422 owner schema）。
-   `frozen_non_treatment.expected_playwright_invocations` は #2424 が定義する opaque pass-through
-   フィールドであり、各要素は `{"invocation_id", "lane", "evidence_file",
-   "benchmark_layout_only"?}`（`benchmark_layout_only` を持たない要素は両 arm 共通）。
-   `frozen_non_treatment.expected_test_count` は全 invocation を跨いだ canonical unique
-   `TestCase` 件数の合計期待値（AC5）。`blocks[].runs[]` から各 `benchmark_layout` の
-   `workflow_run_id` 集合を展開する。
+1. `--manifest`: real #2422 owner schema `e2e_performance_benchmark_manifest_v2`
+   （`schemas/e2e_performance_benchmark_manifest_v2.schema.json` にそのまま適合する。
+   fix_delta 以降、#2424 独自の緩和・追加フィールドは持たない）。
+   `frozen_non_treatment.expected_playwright_invocations[]` は `{"invocation_id", "lane",
+   "provider_placement": {"monolith", "split"}, "evidence_file"}`。builder は
+   `provider_placement[layout]` で物理 job を解決し、`invocation_id`/`lane` は両 arm 共通の
+   期待値として扱う（arm 別フィルタリングはしない）。`frozen_non_treatment.expected_test_count`
+   は schema 通り optional（全 invocation を跨いだ canonical unique `TestCase` 件数の合計期待値、
+   AC5。存在する場合のみ照合する）。`blocks[].runs[]` から各 `benchmark_layout` の
+   `workflow_run_id` 集合を展開する。`manifest.experiment_run_set_digest` は
+   `collect_e2e_performance_benchmark.py` の公開関数 `validate_manifest_v2_semantics` で
+   独立に再検証する。
 2. `--receipt`: #2423 の `CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1`
    （`arms.monolith.workflow_run_ids` / `arms.split.workflow_run_ids` / `run_set_digest` /
    `manifest_sha256` / `materialization_policy` / `evidence_errors`）。展開された
    `workflow_run_id` membership が manifest 側の展開集合と exact 一致することのみ確認し、
    `manifest.experiment_run_set_digest` と `receipt.run_set_digest` の文字列 equality は要求
-   しない。
-3. `--workflow-evidence`: `{"monolith": {"workflow_run_id", "run_attempt", "conclusion",
-   "jobs": [{"name", "conclusion", "status"}]}, "split": {...}}`。GitHub Actions
-   `GET /repos/{repo}/actions/runs/{run_id}` と `.../jobs` の authoritative evidence を
-   `ci.yml` の assessment job が `gh api` で取得し、そのまま渡す。
-4. `--playwright-json-dir`: `<dir>/<monolith|split>/<invocation_id>.json`
-   に配置された、公式 Playwright JSON reporter の生出力。
+   しない。`manifest_sha256` は `--manifest` file の生バイト列に対する標準 sha256 で独立に
+   再検証する。`run_set_digest` は format のみ検証する（Finding 3 の残存ギャップ、上記参照）。
+   `evidence_errors` は Performance 固有の測定不適格理由（`gate_ready_timestamp_missing_or_
+   invalid` / `missing_pair_e2e-core` / `missing_pair_e2e-responsive-matrix`）とそれ以外
+   （identity/run-set/manifest binding 違反、未知の理由）を分離し、後者のみ Reliability を
+   fail-closed にする。
+3. `--workflow-evidence`: `{"monolith": {"<workflow_run_id>": {"run_attempt", "conclusion",
+   "jobs": [{"name", "conclusion", "status"}]}}, "split": {...}}`（複数 `workflow_run_id`
+   キーを持てる）。GitHub Actions `GET /repos/{repo}/actions/runs/{run_id}` と `.../jobs` の
+   authoritative evidence を `ci.yml` の assessment job が receipt の canonical run-set 全体
+   について `gh api` で取得し、そのまま渡す。job evidence は `status == "completed"` も確認する
+   （`job_not_completed` エラー、Finding 5）。
+4. `--playwright-json-dir`: `<dir>/<monolith|split>/<workflow_run_id>/<invocation_id>.json`
+   に配置された、公式 Playwright JSON reporter の生出力（fix_delta 以降、`workflow_run_id` で
+   ネストする -- Finding 2、複数 run/arm での artifact 衝突を防ぐ）。
+5. `--artifact-index`（任意）: `{"<artifact_name>": {"id", "digest"}}` -- `gh api
+   repos/{repo}/actions/artifacts` 由来の GitHub Actions artifact メタデータ。指定時のみ
+   canonical output の `invocation_artifacts` を実データで埋める（Finding 5）。
 
 ### 単一の canonical output（AC11）
 

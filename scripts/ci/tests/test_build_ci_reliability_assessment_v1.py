@@ -22,6 +22,7 @@ import pytest
 
 _MODULE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build_ci_reliability_assessment_v1.py")
 _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+_SCHEMA_PATH = os.path.join(_REPO_ROOT, "schemas", "e2e_performance_benchmark_manifest_v2.schema.json")
 _spec = importlib.util.spec_from_file_location("build_ci_reliability_assessment_v1", _MODULE_PATH)
 builder = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(builder)
@@ -32,20 +33,59 @@ EXPERIMENT_IDENTITY = "exp-2424-smoke-1"
 
 
 def _invocations():
+    """Issue #2424 Finding 1 fix_delta (OWNER REQUEST_CHANGES issuecomment-
+    5556542041): the real #2422 schema (`schemas/
+    e2e_performance_benchmark_manifest_v2.schema.json`) requires a LOGICAL
+    invocation identity (`invocation_id`/`lane`) common to BOTH
+    `benchmark_layout` arms -- only `provider_placement` (the PHYSICAL
+    provider job per arm) varies. There is no `benchmark_layout_only`
+    field in `ExpectedPlaywrightInvocation` (schema `unevaluatedProperties:
+    false` rejects it); this fixture is schema-conformant."""
     return [
-        {"invocation_id": "e2e-core", "lane": "core", "evidence_file": "reliability-evidence/e2e-core.json"},
         {
-            "invocation_id": "e2e-core-responsive",
-            "lane": "responsive",
-            "evidence_file": "reliability-evidence/e2e-core-responsive.json",
-            "benchmark_layout_only": "monolith",
+            "invocation_id": "e2e-core",
+            "lane": "core",
+            "provider_placement": {"monolith": "e2e-core", "split": "e2e-core"},
+            "evidence_file": "reliability-evidence/e2e-core.json",
         },
         {
             "invocation_id": "e2e-responsive",
             "lane": "responsive",
+            "provider_placement": {"monolith": "e2e-core", "split": "e2e-responsive-matrix"},
             "evidence_file": "reliability-evidence/e2e-responsive.json",
-            "benchmark_layout_only": "split",
         },
+    ]
+
+
+def _assert_manifest_matches_real_schema(manifest: dict) -> None:
+    """Issue #2424 Finding 1 fix_delta: every manifest fixture in this file
+    must validate against the REAL #2422 producer schema -- never a
+    #2424-local relaxation of it."""
+    jsonschema = pytest.importorskip("jsonschema")
+    with open(_SCHEMA_PATH, encoding="utf-8") as handle:
+        schema = json.load(handle)
+    jsonschema.Draft202012Validator.check_schema(schema)
+    validator = jsonschema.Draft202012Validator(schema)
+    errors = sorted(validator.iter_errors(manifest), key=lambda e: list(e.path))
+    assert not errors, [e.message for e in errors]
+
+
+def _provider_jobs_for_layout(layout):
+    """Issue #2422 `REQUIRED_PROVIDER_JOBS_BY_LAYOUT`-conformant (owner
+    semantics `verify_required_provider_jobs_present_for_layout`): monolith
+    needs `e2e-core` only, split needs BOTH `e2e-core` and
+    `e2e-responsive-matrix`. Every job shares the SAME `exact_runner_image`
+    so `verify_exact_runner_image_required_equal_within_block` never flags
+    a cross-arm image mismatch."""
+    job_names = ["e2e-core"] if layout == "monolith" else ["e2e-core", "e2e-responsive-matrix"]
+    return [
+        {
+            "job": name,
+            "workflow_job_id": 900000 + i,
+            "conclusion": "success",
+            "exact_runner_image": {"name": "ubuntu-24.04", "version": "20260901.1.0"},
+        }
+        for i, name in enumerate(job_names)
     ]
 
 
@@ -57,8 +97,16 @@ def _run_record(layout, run_id, conclusion):
         "conclusion": conclusion,
         "workflow_sha": WORKFLOW_SHA,
         "workflow_digest": "sha256:" + "2" * 64,
-        "provider_jobs": [{"job": "e2e-core"}],
+        "provider_jobs": _provider_jobs_for_layout(layout),
     }
+
+
+def _real_experiment_run_set_digest(blocks):
+    """Issue #2424 Finding 3 fix_delta: computed via the REAL #2422 owner
+    function (never re-implemented) so `verify_manifest_v2_owner_semantics`
+    accepts these fixtures as self-consistent."""
+    module = builder._load_collect_e2e_performance_benchmark_module()
+    return module.compute_experiment_run_set_digest(module._run_identity_tuples_from_blocks(blocks))
 
 
 def make_manifest(
@@ -70,28 +118,36 @@ def make_manifest(
     expected_test_count=2,
     invocations=None,
 ):
-    return {
+    blocks = [
+        {
+            "block_id": "b1",
+            "runs": [
+                _run_record("monolith", monolith_run_id, monolith_conclusion),
+                _run_record("split", split_run_id, split_conclusion),
+            ],
+        }
+    ]
+    manifest = {
         "schema": "e2e_performance_benchmark_manifest_v2",
         "schema_version": 2,
+        "generated_at": "2026-09-01T00:00:00Z",
         "experiment_identity": experiment_identity,
-        "experiment_run_set_digest": "sha256:" + "1" * 64,
+        "experiment_run_set_digest": _real_experiment_run_set_digest(blocks),
+        "frozen_source_sha": "c" * 40,
         "workflow_sha": WORKFLOW_SHA,
         "workflow_digest": "sha256:" + "2" * 64,
         "frozen_non_treatment": {
+            "test_inventory_digest": "sha256:" + "5" * 64,
             "expected_playwright_invocations": invocations if invocations is not None else _invocations(),
             "expected_test_count": expected_test_count,
+            "lockfile_hash": "sha256:" + "6" * 64,
+            "toolchain_digest": "sha256:" + "7" * 64,
         },
-        "blocks": [
-            {
-                "block_id": "b1",
-                "runs": [
-                    _run_record("monolith", monolith_run_id, monolith_conclusion),
-                    _run_record("split", split_run_id, split_conclusion),
-                ],
-            }
-        ],
+        "blocks": blocks,
         "evidence_errors": [],
     }
+    _assert_manifest_matches_real_schema(manifest)
+    return manifest
 
 
 def make_receipt(
@@ -169,8 +225,12 @@ def _playwright_payload(
     }
 
 
-def _write_playwright_json(base_dir, layout, invocation_id, payload):
-    path = os.path.join(base_dir, layout, f"{invocation_id}.json")
+def _write_playwright_json(base_dir, layout, run_id, invocation_id, payload):
+    """Issue #2424 Finding 2 fix_delta: nested by `workflow_run_id` (never a
+    bare `<layout>/<invocation_id>.json`, which silently collides across
+    multiple runs in the same arm -- see `_default_playwright_json_loader`).
+    """
+    path = os.path.join(base_dir, layout, str(run_id), f"{invocation_id}.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle)
@@ -184,20 +244,24 @@ def _lane_for(invocation_id: str) -> str:
 def _write_all_playwright_json(
     base_dir, manifest, monolith_run_id, split_run_id, monolith_outcomes=None, split_outcomes=None
 ):
+    """Issue #2424 Finding 1 fix_delta: BOTH arms produce the SAME two
+    logical invocation IDs (`e2e-core`/`e2e-responsive`) -- only the
+    PHYSICAL provider job (`provider_placement`) differs, never the
+    invocation identity itself."""
     if monolith_outcomes is None:
-        monolith_outcomes = {"e2e-core": ["expected"], "e2e-core-responsive": ["expected"]}
+        monolith_outcomes = {"e2e-core": ["expected"], "e2e-responsive": ["expected"]}
     if split_outcomes is None:
         split_outcomes = {"e2e-core": ["expected"], "e2e-responsive": ["expected"]}
     for invocation_id, outcomes in monolith_outcomes.items():
         payload = _playwright_payload(
             manifest, monolith_run_id, "monolith", invocation_id, _lane_for(invocation_id), outcomes
         )
-        _write_playwright_json(base_dir, "monolith", invocation_id, payload)
+        _write_playwright_json(base_dir, "monolith", monolith_run_id, invocation_id, payload)
     for invocation_id, outcomes in split_outcomes.items():
         payload = _playwright_payload(
             manifest, split_run_id, "split", invocation_id, _lane_for(invocation_id), outcomes
         )
-        _write_playwright_json(base_dir, "split", invocation_id, payload)
+        _write_playwright_json(base_dir, "split", split_run_id, invocation_id, payload)
 
 
 def _happy_path(
@@ -350,7 +414,7 @@ def test_builds_three_v1_assessments_from_exact_composite_workflow_outcome_and_p
         manifest,
         100,
         200,
-        monolith_outcomes={"e2e-core": ["flaky"], "e2e-core-responsive": ["expected"]},
+        monolith_outcomes={"e2e-core": ["flaky"], "e2e-responsive": ["expected"]},
         split_outcomes={"e2e-core": ["expected"], "e2e-responsive": ["unexpected"]},
     )
     loader = builder._default_playwright_json_loader(playwright_dir)
@@ -464,8 +528,8 @@ def test_rejects_missing_or_cancelled_workflow_outcome_or_playwright_evidence_an
     manifest, receipt, workflow_evidence, _ = _happy_path(tmp_path)
     playwright_dir = str(tmp_path / "partial-playwright")
     only_core_payload = _playwright_payload(manifest, 100, "monolith", "e2e-core", "core", ["expected"])
-    _write_playwright_json(playwright_dir, "monolith", "e2e-core", only_core_payload)
-    # e2e-core-responsive intentionally missing.
+    _write_playwright_json(playwright_dir, "monolith", 100, "e2e-core", only_core_payload)
+    # e2e-responsive intentionally missing (monolith arm).
     _write_all_playwright_json(playwright_dir, manifest, 100, 200, monolith_outcomes={}, split_outcomes=None)
     loader = builder._default_playwright_json_loader(playwright_dir)
     envelope, diagnostic = builder.build_composite_envelope(manifest, receipt, workflow_evidence, loader)
@@ -491,7 +555,7 @@ def test_rejects_missing_or_cancelled_workflow_outcome_or_playwright_evidence_an
     payload_with_errors = _playwright_payload(
         manifest3, 100, "monolith", "e2e-core", "core", ["expected"], report_errors=[{"message": "boom"}]
     )
-    _write_playwright_json(playwright_dir3, "monolith", "e2e-core", payload_with_errors)
+    _write_playwright_json(playwright_dir3, "monolith", 100, "e2e-core", payload_with_errors)
     loader3 = builder._default_playwright_json_loader(playwright_dir3)
     envelope3, diagnostic3 = builder.build_composite_envelope(manifest3, receipt3, workflow_evidence3, loader3)
     assert envelope3 is None
@@ -502,7 +566,7 @@ def test_rejects_missing_or_cancelled_workflow_outcome_or_playwright_evidence_an
     playwright_dir4 = str(tmp_path / "case4" / "playwright")
     _write_all_playwright_json(playwright_dir4, manifest4, 100, 200)
     zero_case_payload = _playwright_payload(manifest4, 100, "monolith", "e2e-core", "core", [])
-    _write_playwright_json(playwright_dir4, "monolith", "e2e-core", zero_case_payload)
+    _write_playwright_json(playwright_dir4, "monolith", 100, "e2e-core", zero_case_payload)
     loader4 = builder._default_playwright_json_loader(playwright_dir4)
     envelope4, diagnostic4 = builder.build_composite_envelope(manifest4, receipt4, workflow_evidence4, loader4)
     assert envelope4 is None
@@ -523,7 +587,7 @@ def test_rejects_missing_or_cancelled_workflow_outcome_or_playwright_evidence_an
         ["expected"],
         metadata_overrides={"experiment_identity": "wrong-experiment"},
     )
-    _write_playwright_json(playwright_dir5, "monolith", "e2e-core", bad_meta_payload)
+    _write_playwright_json(playwright_dir5, "monolith", 100, "e2e-core", bad_meta_payload)
     loader5 = builder._default_playwright_json_loader(playwright_dir5)
     envelope5, diagnostic5 = builder.build_composite_envelope(manifest5, receipt5, workflow_evidence5, loader5)
     assert envelope5 is None
@@ -574,3 +638,241 @@ def test_rejects_missing_or_cancelled_workflow_outcome_or_playwright_evidence_an
     aggregate8 = builder.aggregate_gate(envelope8, diagnostic8, assessments8, tampered_validator_results)
     assert aggregate8["complete"] is False
     assert aggregate8["semantic_valid"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Finding 1 fix_delta (OWNER REQUEST_CHANGES issuecomment-5556542041): a
+# manifest whose `expected_playwright_invocations` entries carry the
+# nonconformant `benchmark_layout_only` field (schema
+# `unevaluatedProperties: false`) must be rejected by the REAL #2422
+# schema -- this module never accepts a producer-local relaxation of it.
+# --------------------------------------------------------------------------- #
+def test_real_schema_rejects_the_removed_benchmark_layout_only_field():
+    jsonschema = pytest.importorskip("jsonschema")
+    with open(_SCHEMA_PATH, encoding="utf-8") as handle:
+        schema = json.load(handle)
+    validator = jsonschema.Draft202012Validator(schema)
+    manifest = make_manifest()
+    manifest["frozen_non_treatment"]["expected_playwright_invocations"][0]["benchmark_layout_only"] = "monolith"
+    errors = list(validator.iter_errors(manifest))
+    assert errors, "benchmark_layout_only must be rejected by the real schema (unevaluatedProperties: false)"
+
+
+def test_expected_test_count_is_optional_per_real_schema(tmp_path):
+    """Issue #2424 Finding 1 fix_delta: `expected_test_count` is OPTIONAL in
+    `FrozenNonTreatment.required` -- a manifest omitting it must not be
+    treated as `prerequisite_incomplete`."""
+    manifest = make_manifest()
+    del manifest["frozen_non_treatment"]["expected_test_count"]
+    _assert_manifest_matches_real_schema(manifest)
+    receipt = make_receipt(manifest)
+    errors = builder.verify_prerequisites_available(manifest, receipt)
+    assert not any("expected_test_count" in e for e in errors), errors
+
+
+def test_common_invocation_identity_resolved_via_provider_placement_per_arm(tmp_path):
+    """Issue #2424 Finding 1 fix_delta: the SAME two logical invocation IDs
+    (`e2e-core`/`e2e-responsive`) are expected under BOTH arms -- only the
+    physical `provider_placement[layout]` job differs (monolith places
+    `e2e-responsive` under its own `e2e-core` job; split places it under
+    `e2e-responsive-matrix`)."""
+    manifest, receipt, workflow_evidence, loader = _happy_path(tmp_path, monolith_conclusion="success")
+    envelope, diagnostic = builder.build_composite_envelope(manifest, receipt, workflow_evidence, loader)
+    assert diagnostic["errors"] == []
+    assert envelope is not None
+    monolith_diag = next(r for r in diagnostic["runs"] if r["layout"] == "monolith")
+    split_diag = next(r for r in diagnostic["runs"] if r["layout"] == "split")
+    assert sorted(monolith_diag["observed_invocations"]) == ["e2e-core", "e2e-responsive"]
+    assert sorted(split_diag["observed_invocations"]) == ["e2e-core", "e2e-responsive"]
+
+
+def test_invocation_missing_provider_placement_for_layout_is_rejected(tmp_path):
+    # Built via a schema-conformant `make_manifest()` first, then mutated to
+    # an invalid state -- `make_manifest()` itself always emits a
+    # schema-valid fixture (Finding 1), so the deliberately-broken
+    # `provider_placement` is introduced AFTER construction, not fed in as
+    # an already-invalid `invocations=` override.
+    manifest = make_manifest()
+    del manifest["frozen_non_treatment"]["expected_playwright_invocations"][1]["provider_placement"]["monolith"]
+    receipt = make_receipt(manifest)
+    workflow_evidence = make_workflow_evidence(manifest)
+    playwright_dir = str(tmp_path / "playwright")
+    _write_all_playwright_json(playwright_dir, manifest, 100, 200)
+    loader = builder._default_playwright_json_loader(playwright_dir)
+    envelope, diagnostic = builder.build_composite_envelope(manifest, receipt, workflow_evidence, loader)
+    assert envelope is None
+    assert any("invocation_missing_provider_placement" in e for e in diagnostic["errors"])
+
+
+# --------------------------------------------------------------------------- #
+# Finding 2 fix_delta: the production loader signature carries
+# `workflow_run_id` -- a SECOND run in the same arm must read its OWN
+# Playwright JSON, never silently re-read the first run's file.
+# --------------------------------------------------------------------------- #
+def test_second_run_in_same_arm_reads_its_own_playwright_json_not_the_first(tmp_path):
+    manifest = make_manifest(monolith_run_id=101, split_run_id=201, monolith_conclusion="success")
+    # A second monolith run (301) sharing the SAME block would violate
+    # `verify_workflow_run_id_global_uniqueness`'s per-(block,layout)
+    # cardinality -- use a second BLOCK instead, matching the real A/B/A/B
+    # multi-block manifest shape.
+    manifest["blocks"].append(
+        {
+            "block_id": "b2",
+            "runs": [_run_record("monolith", 102, "success"), _run_record("split", 202, "success")],
+        }
+    )
+    manifest["experiment_run_set_digest"] = _real_experiment_run_set_digest(manifest["blocks"])
+    _assert_manifest_matches_real_schema(manifest)
+    receipt = make_receipt(manifest, monolith_ids=[101, 102], split_ids=[201, 202])
+    workflow_evidence = make_workflow_evidence(manifest)
+    playwright_dir = str(tmp_path / "playwright")
+    for run_id in (101, 102):
+        _write_all_playwright_json(playwright_dir, manifest, run_id, 201 if run_id == 101 else 202)
+    loader = builder._default_playwright_json_loader(playwright_dir)
+    envelope, diagnostic = builder.build_composite_envelope(manifest, receipt, workflow_evidence, loader)
+    assert diagnostic["errors"] == []
+    assert envelope is not None
+    assert set(envelope["runs_by_arm"]["before"]) == {101, 102}
+    assert set(envelope["runs_by_arm"]["after"]) == {201, 202}
+
+
+# --------------------------------------------------------------------------- #
+# Finding 3 fix_delta: independent digest re-verification.
+# --------------------------------------------------------------------------- #
+def test_owner_semantics_reverification_rejects_tampered_manifest_run_set_digest():
+    manifest = make_manifest()
+    manifest["experiment_run_set_digest"] = "sha256:" + "9" * 64
+    errors = builder.verify_prerequisites_available(manifest, make_receipt(manifest))
+    assert any("experiment_run_set_digest_mismatch" in e for e in errors), errors
+
+
+def test_manifest_sha256_independent_recomputation_rejects_wrong_receipt_value(tmp_path):
+    manifest = make_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    receipt = make_receipt(manifest)
+    receipt["manifest_sha256"] = "sha256:" + "0" * 64  # deliberately wrong
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps(receipt))
+    workflow_evidence_path = tmp_path / "workflow_evidence.json"
+    workflow_evidence_path.write_text(json.dumps(make_workflow_evidence(manifest)))
+    playwright_dir = tmp_path / "playwright"
+    _write_all_playwright_json(str(playwright_dir), manifest, 100, 200)
+    output_dir = tmp_path / "out"
+    exit_code = builder.main(
+        [
+            "--manifest",
+            str(manifest_path),
+            "--receipt",
+            str(receipt_path),
+            "--workflow-evidence",
+            str(workflow_evidence_path),
+            "--playwright-json-dir",
+            str(playwright_dir),
+            "--issue-number",
+            "2424",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+    assert exit_code != 0
+    canonical = json.loads((output_dir / "ci_reliability_close_grade_result_v1.json").read_text())
+    assert any("prerequisite_manifest_sha256_mismatch" in e for e in canonical["diagnostic_errors"])
+
+
+def test_manifest_sha256_independent_recomputation_accepts_the_real_file_bytes_hash(tmp_path):
+    import hashlib
+
+    manifest = make_manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_bytes = json.dumps(manifest).encode("utf-8")
+    manifest_path.write_bytes(manifest_bytes)
+    real_digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+    receipt = make_receipt(manifest)
+    receipt["manifest_sha256"] = real_digest
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(json.dumps(receipt))
+    errors = builder.verify_prerequisites_available(manifest, receipt, manifest_bytes)
+    assert not any("prerequisite_manifest_sha256_mismatch" in e for e in errors), errors
+
+
+def test_run_set_digest_format_validation_rejects_malformed_value():
+    manifest = make_manifest()
+    receipt = make_receipt(manifest)
+    receipt["run_set_digest"] = "not-a-real-digest"
+    errors = builder.verify_prerequisites_available(manifest, receipt)
+    assert any("run_set_digest_malformed" in e for e in errors)
+
+
+def test_differing_but_well_formed_run_set_digests_are_still_accepted_no_string_equality():
+    """Pinning Finding 3's explicit non-goal: two DIFFERENT well-formed
+    digests (#2422 vs #2423, separate owner algorithms) must never be
+    rejected by string-equality alone -- only exact run-id MEMBERSHIP
+    (`verify_exact_run_set_binding`) is authoritative."""
+    manifest = make_manifest()
+    receipt = make_receipt(manifest, run_set_digest="sha256:" + "e" * 64)
+    assert receipt["run_set_digest"] != manifest["experiment_run_set_digest"]
+    errors = builder.verify_prerequisites_available(manifest, receipt)
+    assert not any("run_set_digest" in e for e in errors), errors
+
+
+# --------------------------------------------------------------------------- #
+# Finding 4 fix_delta: receipt.evidence_errors bifurcation -- Performance-
+# only reasons never block Reliability; unrecognized reasons stay
+# fail-closed.
+# --------------------------------------------------------------------------- #
+def test_performance_only_evidence_error_reason_does_not_block_reliability():
+    manifest = make_manifest()
+    receipt = make_receipt(manifest)
+    receipt["evidence_errors"] = [{"workflow_run_id": 999, "reason": "gate_ready_timestamp_missing_or_invalid"}]
+    errors = builder.verify_prerequisites_available(manifest, receipt)
+    assert not any("evidence_errors" in e for e in errors), errors
+
+
+def test_unrecognized_evidence_error_reason_stays_fail_closed():
+    manifest = make_manifest()
+    receipt = make_receipt(manifest)
+    receipt["evidence_errors"] = [{"workflow_run_id": 999, "reason": "some_new_unrecognized_reason"}]
+    errors = builder.verify_prerequisites_available(manifest, receipt)
+    assert any("evidence_errors_contains_non_performance_only_reason" in e for e in errors)
+
+
+def test_identity_class_evidence_error_reason_blocks_reliability():
+    manifest = make_manifest()
+    receipt = make_receipt(manifest)
+    receipt["evidence_errors"] = [{"workflow_run_id": 100, "reason": "run_attempt_identity_collision"}]
+    errors = builder.verify_prerequisites_available(manifest, receipt)
+    assert any("evidence_errors_contains_non_performance_only_reason" in e for e in errors)
+
+
+# --------------------------------------------------------------------------- #
+# Finding 5 fix_delta: job-level completeness (status must be "completed",
+# not merely present) and invocation artifact provenance population.
+# --------------------------------------------------------------------------- #
+def test_job_present_but_not_completed_is_rejected(tmp_path):
+    manifest, receipt, workflow_evidence, loader = _happy_path(tmp_path)
+    workflow_evidence["split"]["200"]["jobs"][0]["status"] = "in_progress"
+    envelope, diagnostic = builder.build_composite_envelope(manifest, receipt, workflow_evidence, loader)
+    assert envelope is None
+    assert any("job_not_completed" in e for e in diagnostic["errors"])
+
+
+def test_invocation_artifacts_populated_from_artifact_index(tmp_path):
+    manifest, receipt, workflow_evidence, loader = _happy_path(tmp_path, monolith_conclusion="success")
+    envelope, diagnostic = builder.build_composite_envelope(manifest, receipt, workflow_evidence, loader)
+    assert diagnostic["errors"] == []
+    artifact_index = {
+        "ci-reliability-100-a1-e2e-core": {"id": 111, "digest": "sha256:" + "a" * 64},
+        # monolith's `e2e-responsive` invocation uploads under the
+        # `e2e-core-responsive` artifact-name suffix (collision-avoidance
+        # with split's `e2e-responsive-matrix` job, see
+        # ARTIFACT_NAME_SUFFIX_BY_LAYOUT_AND_INVOCATION).
+        "ci-reliability-100-a1-e2e-core-responsive": {"id": 112, "digest": "sha256:" + "b" * 64},
+        "ci-reliability-200-a1-e2e-core": {"id": 121, "digest": "sha256:" + "c" * 64},
+        "ci-reliability-200-a1-e2e-responsive": {"id": 122, "digest": "sha256:" + "d" * 64},
+    }
+    invocation_artifacts = builder.build_invocation_artifacts(envelope, manifest, artifact_index)
+    assert len(invocation_artifacts) == 4
+    by_name = {a["artifact_name"]: a for a in invocation_artifacts}
+    assert by_name["ci-reliability-100-a1-e2e-core"]["artifact_id"] == 111
+    assert by_name["ci-reliability-200-a1-e2e-responsive"]["digest"] == "sha256:" + "d" * 64

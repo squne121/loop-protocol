@@ -1020,12 +1020,20 @@ jobs:
         id: timed-e2e-monolith-responsive
         env:
           LOOP_E2E_LANE: responsive
-          # Issue #2424 AC2: this invocation's own distinct JSON evidence
-          # file (never overwriting the "e2e-core" invocation's file above).
-          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ github.event.inputs.reliability_evidence == 'true' && format('{0}/reliability-evidence/e2e-core-responsive.json', github.workspace) || '' }}
+          # Issue #2424 Finding 1 fix_delta (OWNER REQUEST_CHANGES
+          # issuecomment-5556542041): this invocation's LOGICAL identity is
+          # `e2e-responsive` -- the SAME `invocation_id` the split arm's own
+          # responsive invocation uses (real #2422 schema
+          # `ExpectedPlaywrightInvocation`: `invocation_id`/`lane` are
+          # common across BOTH `benchmark_layout` arms; only
+          # `provider_placement[layout]`, the PHYSICAL provider job, differs
+          # -- monolith places it under this SAME `e2e-core` job, split
+          # places it under `e2e-responsive-matrix`). Never `e2e-core-
+          # responsive` (a producer-local id the real schema never defines).
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ github.event.inputs.reliability_evidence == 'true' && format('{0}/reliability-evidence/e2e-responsive.json', github.workspace) || '' }}
           RELIABILITY_EXPERIMENT_IDENTITY: ${{ github.event.inputs.reliability_experiment_identity }}
           RELIABILITY_BENCHMARK_LAYOUT: monolith
-          RELIABILITY_INVOCATION_ID: e2e-core-responsive
+          RELIABILITY_INVOCATION_ID: e2e-responsive
           RELIABILITY_LANE: responsive
           RELIABILITY_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
@@ -1063,13 +1071,31 @@ jobs:
           path: test-results-e2e-responsive-matrix/
           if-no-files-found: warn
           retention-days: 30
-      - name: Upload reliability JSON evidence (e2e-core-responsive invocation)
-        id: upload-reliability-evidence-e2e-core-responsive
+      - name: Upload reliability JSON evidence (e2e-responsive invocation, monolith layout)
+        id: upload-reliability-evidence-e2e-responsive-monolith
+        # Issue #2424 Finding 1/2 fix_delta note: the GitHub Actions
+        # upload-artifact `name:` here is intentionally suffixed
+        # `-e2e-core-responsive` (mirroring this job's own pre-existing
+        # `playwright-report-e2e-core-responsive`/`test-results-e2e-core-
+        # responsive` sibling artifacts two steps above), DISTINCT from
+        # split's `e2e-responsive-matrix` job's own `...-e2e-responsive`
+        # artifact name -- `tests/ci/test_verify_e2e_lane_partition.py`
+        # (Allowed Paths外) statically requires every `e2e-core`/
+        # `e2e-responsive-matrix` upload-artifact NAME to be literally
+        # unique across those two jobs, independent of the mutually-
+        # exclusive `benchmark_layout` runtime `if:` guards. This is an
+        # artifact-NAME-only disambiguation -- the LOGICAL
+        # `invocation_id`/`RELIABILITY_INVOCATION_ID`/manifest binding
+        # identity stays `e2e-responsive` (common across both arms, per
+        # Finding 1); the assessment job's download step below maps
+        # (layout, invocation_id) -> this exact artifact name via an
+        # explicit lookup table, never re-deriving it from `invocation_id`
+        # alone.
         if: ${{ !cancelled() && github.event.inputs.reliability_evidence == 'true' && github.event.inputs.benchmark_layout == 'monolith' }}
         uses: actions/upload-artifact@v6
         with:
           name: ci-reliability-${{ github.run_id }}-a${{ github.run_attempt }}-e2e-core-responsive
-          path: reliability-evidence/e2e-core-responsive.json
+          path: reliability-evidence/e2e-responsive.json
           if-no-files-found: error
           retention-days: 30
       - name: Locate responsive-canvas-runtime-evidence.json (monolith layout)
@@ -2294,6 +2320,16 @@ jobs:
           python3 -c "import json,sys; json.load(open('reliability-assessment-input/manifest.json'))" || { echo "::error::reliability_manifest_json_b64 does not decode to valid JSON"; exit 1; }
           python3 -c "import json,sys; json.load(open('reliability-assessment-input/receipt.json'))" || { echo "::error::reliability_receipt_json_b64 does not decode to valid JSON"; exit 1; }
       - name: Fetch authoritative attempt-1 + latest workflow/job evidence (GitHub API)
+        # Issue #2424 Finding 2 fix_delta (OWNER REQUEST_CHANGES
+        # issuecomment-5556542041): enumerates the CANONICAL run-set
+        # directly from the decoded #2423 receipt's `arms.{monolith,
+        # split}.workflow_run_ids` -- never just the two trusted
+        # `reliability_monolith_run_id`/`reliability_split_run_id` inputs
+        # (which the AC10 fail-closed prerequisite check above still
+        # requires as a sanity-bound "primary" pair, verified below to
+        # belong to the receipt's own arm sets). This is what lets the SAME
+        # assessment job process a real N-run/arm close-grade cohort
+        # (#2155's future usage), not just #2424's own 1-run-per-arm smoke.
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -2305,6 +2341,7 @@ jobs:
           import json
           import os
           import subprocess
+          import sys
 
           repo = os.environ["REPO"]
 
@@ -2328,35 +2365,139 @@ jobs:
                   ],
               }
 
+          with open("reliability-assessment-input/receipt.json", encoding="utf-8") as handle:
+              receipt = json.load(handle)
+
+          arms = receipt.get("arms", {})
+          monolith_ids = [str(x) for x in arms.get("monolith", {}).get("workflow_run_ids", [])]
+          split_ids = [str(x) for x in arms.get("split", {}).get("workflow_run_ids", [])]
+          trusted_monolith = os.environ["MONOLITH_RUN_ID"]
+          trusted_split = os.environ["SPLIT_RUN_ID"]
+          if trusted_monolith not in monolith_ids or trusted_split not in split_ids:
+              sys.exit(
+                  "::error::reliability-assessment: trusted "
+                  f"reliability_monolith_run_id={trusted_monolith!r}/"
+                  f"reliability_split_run_id={trusted_split!r} is not a member of the "
+                  f"decoded receipt's own arms.monolith/arms.split workflow_run_ids "
+                  f"(monolith={monolith_ids!r} split={split_ids!r})."
+              )
+
           evidence = {
-              "monolith": {os.environ["MONOLITH_RUN_ID"]: record_for(os.environ["MONOLITH_RUN_ID"])},
-              "split": {os.environ["SPLIT_RUN_ID"]: record_for(os.environ["SPLIT_RUN_ID"])},
+              "monolith": {run_id: record_for(run_id) for run_id in monolith_ids},
+              "split": {run_id: record_for(run_id) for run_id in split_ids},
           }
           with open("reliability-assessment-input/workflow_evidence.json", "w", encoding="utf-8") as handle:
               json.dump(evidence, handle, indent=2)
           PY
-      - name: Download reliability JSON evidence artifacts (monolith + split runs)
+      - name: Download reliability JSON evidence artifacts + build artifact index (canonical run-set)
+        # Issue #2424 Finding 2/Finding 5 fix_delta: downloads EVERY
+        # (layout, workflow_run_id, invocation_id) combination in the
+        # receipt's canonical run-set into a run-id-nested destination
+        # (`<layout>/<run_id>/<invocation_id>.json`, matching the
+        # production builder's `_default_playwright_json_loader` contract)
+        # -- never a bare `<layout>/<invocation_id>.json` that silently
+        # collides across multiple runs in the same arm. Also records each
+        # downloaded artifact's GitHub Actions artifact id/digest into
+        # `artifact_index.json` (Finding 5's `invocation_artifacts`
+        # provenance).
         env:
           GH_TOKEN: ${{ github.token }}
-          MONOLITH_RUN_ID: ${{ github.event.inputs.reliability_monolith_run_id }}
-          SPLIT_RUN_ID: ${{ github.event.inputs.reliability_split_run_id }}
         run: |
           set -euo pipefail
-          mkdir -p reliability-assessment-input/playwright/monolith reliability-assessment-input/playwright/split
-          for pair in "monolith:e2e-core" "monolith:e2e-core-responsive" "split:e2e-core" "split:e2e-responsive"; do
-            layout="${pair%%:*}"
-            invocation="${pair#*:}"
-            run_id_var="${layout^^}_RUN_ID"
-            run_id="${!run_id_var}"
-            name="ci-reliability-${run_id}-a1-${invocation}"
-            dest="reliability-assessment-input/playwright/${layout}"
-            if ! gh run download "$run_id" -n "$name" --dir "$dest.tmp" 2>/dev/null; then
-              echo "::warning::artifact '$name' not found for run $run_id (layout=$layout invocation=$invocation) -- builder will report this as missing evidence (fail-closed), not silently skip it."
-              continue
-            fi
-            mv "$dest.tmp/${invocation}.json" "$dest/${invocation}.json"
-            rm -rf "$dest.tmp"
-          done
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+          import subprocess
+          import sys
+
+          with open("reliability-assessment-input/receipt.json", encoding="utf-8") as handle:
+              receipt = json.load(handle)
+          with open("reliability-assessment-input/manifest.json", encoding="utf-8") as handle:
+              manifest = json.load(handle)
+
+          arms = receipt.get("arms", {})
+          invocation_ids = [
+              inv["invocation_id"]
+              for inv in manifest.get("frozen_non_treatment", {}).get("expected_playwright_invocations", [])
+          ]
+
+          # Issue #2424 Finding 1/2 fix_delta: the GitHub Actions artifact
+          # NAME is not always identical to the logical `invocation_id` --
+          # monolith's `e2e-responsive` invocation uploads under the
+          # `e2e-core-responsive` artifact-name suffix (see the upload
+          # step's own comment in ci.yml) to stay collision-free against
+          # split's `e2e-responsive-matrix` job artifact of the SAME
+          # invocation_id (enforced by `tests/ci/
+          # test_verify_e2e_lane_partition.py`, Allowed Paths外). This is
+          # an explicit, exhaustive lookup -- never re-derived from
+          # `invocation_id` alone.
+          ARTIFACT_NAME_SUFFIX_BY_LAYOUT_AND_INVOCATION = {
+              ("monolith", "e2e-core"): "e2e-core",
+              ("monolith", "e2e-responsive"): "e2e-core-responsive",
+              ("split", "e2e-core"): "e2e-core",
+              ("split", "e2e-responsive"): "e2e-responsive",
+          }
+
+          def gh_api(endpoint):
+              result = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True, check=False)
+              if result.returncode != 0:
+                  return None
+              return json.loads(result.stdout)
+
+          artifact_index = {}
+          for layout in ("monolith", "split"):
+              run_ids = [str(x) for x in arms.get(layout, {}).get("workflow_run_ids", [])]
+              for run_id in run_ids:
+                  for invocation_id in invocation_ids:
+                      suffix = ARTIFACT_NAME_SUFFIX_BY_LAYOUT_AND_INVOCATION.get((layout, invocation_id))
+                      if suffix is None:
+                          print(
+                              f"::warning::no known artifact-name mapping for layout={layout!r} "
+                              f"invocation_id={invocation_id!r} -- skipping (builder will report this "
+                              "as missing evidence, fail-closed).",
+                              file=sys.stderr,
+                          )
+                          continue
+                      name = f"ci-reliability-{run_id}-a1-{suffix}"
+                      dest = os.path.join("reliability-assessment-input", "playwright", layout, run_id)
+                      tmp_dest = dest + ".tmp"
+                      result = subprocess.run(
+                          ["gh", "run", "download", run_id, "-n", name, "--dir", tmp_dest],
+                          capture_output=True,
+                          text=True,
+                          check=False,
+                      )
+                      if result.returncode != 0:
+                          print(
+                              f"::warning::artifact {name!r} not found for run {run_id} "
+                              f"(layout={layout} invocation_id={invocation_id}) -- builder will "
+                              "report this as missing evidence (fail-closed), not silently skip it.",
+                              file=sys.stderr,
+                          )
+                          continue
+                      os.makedirs(dest, exist_ok=True)
+                      shutil.move(
+                          os.path.join(tmp_dest, f"{invocation_id}.json"),
+                          os.path.join(dest, f"{invocation_id}.json"),
+                      )
+                      shutil.rmtree(tmp_dest, ignore_errors=True)
+
+                      meta = gh_api(f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/artifacts?name={name}")
+                      artifacts = (meta or {}).get("artifacts", [])
+                      match = next((a for a in artifacts if a.get("workflow_run", {}).get("id") == int(run_id)), None)
+                      if match is not None:
+                          digest = match.get("digest") or {}
+                          artifact_index[name] = {
+                              "id": match.get("id"),
+                              "digest": (
+                                  f"sha256:{digest['sha256']}" if isinstance(digest, dict) and digest.get("sha256") else None
+                              ),
+                          }
+
+          with open("reliability-assessment-input/artifact_index.json", "w", encoding="utf-8") as handle:
+              json.dump(artifact_index, handle, indent=2)
+          PY
       - name: Build 3 assessments + validate + aggregate + canonical output
         run: |
           set -euo pipefail
@@ -2366,14 +2507,24 @@ jobs:
             --receipt reliability-assessment-input/receipt.json \
             --workflow-evidence reliability-assessment-input/workflow_evidence.json \
             --playwright-json-dir reliability-assessment-input/playwright \
+            --artifact-index reliability-assessment-input/artifact_index.json \
             --issue-number 2424 \
             --output-dir reliability-assessment-output
-      - name: Upload canonical Reliability V1 close-grade result
+      - name: Upload canonical Reliability V1 close-grade result + raw input evidence
+        # Issue #2424 Finding 5 fix_delta: bundles the RAW inputs (manifest,
+        # receipt, workflow/job evidence, official Playwright JSON, artifact
+        # index) alongside the builder's own output (canonical result,
+        # composite envelope, 3 assessments, 3 validator results,
+        # diagnostic) in the SAME artifact -- never just the output-only
+        # subset, so a downstream reader can independently re-derive
+        # everything without re-fetching from GitHub Actions.
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v6
         with:
           name: ci-reliability-close-grade-result-${{ github.run_id }}-a${{ github.run_attempt }}
-          path: reliability-assessment-output/
+          path: |
+            reliability-assessment-output/
+            reliability-assessment-input/
           if-no-files-found: error
           retention-days: 30
 

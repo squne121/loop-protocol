@@ -71,6 +71,95 @@ DEFAULT_VALIDATOR_PATH = os.path.normpath(
     )
 )
 
+# Issue #2424 Finding 3 fix_delta (OWNER REQUEST_CHANGES issuecomment-
+# 5556542041): the ONLY genuinely public, importable, production (non-test)
+# owner entry point that independently re-derives #2422's
+# `experiment_run_set_digest` (and the manifest's other semantic invariants)
+# from a manifest dict is `validate_manifest_v2_semantics` in
+# `collect_e2e_performance_benchmark.py` -- reused here via file-path import
+# (never copy/re-implemented) so this module never invents a competing
+# digest algorithm. No equivalent public/importable production entry point
+# exists for #2423's `receipt.run_set_digest` (the only implementation,
+# `_run_set_digest`, is a leading-underscore private helper embedded in
+# `tests/ci/test_ci_performance_gate.py`, a test file outside this Issue's
+# Allowed Paths, and importing it would also violate this module's own AC1
+# "never import #2423's internal functions" contract) -- `receipt.
+# run_set_digest` therefore still receives ONLY format validation below
+# (see `verify_prerequisites_available`), not owner-algorithm
+# recomputation. This residual gap is reported to the root control-plane
+# per Finding 3's "重要" escalation clause rather than silently duplicated.
+_COLLECT_E2E_MODULE_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "collect_e2e_performance_benchmark.py")
+)
+_collect_e2e_module = None
+
+
+def _load_collect_e2e_performance_benchmark_module():
+    global _collect_e2e_module
+    if _collect_e2e_module is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "collect_e2e_performance_benchmark_owner", _COLLECT_E2E_MODULE_PATH
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _collect_e2e_module = module
+    return _collect_e2e_module
+
+
+def verify_manifest_v2_owner_semantics(manifest: dict[str, Any]) -> list[str]:
+    """Issue #2424 Finding 3 (AC1): independently re-verifies `manifest`
+    (including a recomputation of `experiment_run_set_digest`) via the real
+    #2422 owner function `validate_manifest_v2_semantics` -- never a
+    re-implementation of that algorithm. Returns the owner function's own
+    violation strings verbatim (empty list means the manifest is
+    self-consistent under #2422's own semantics)."""
+    module = _load_collect_e2e_performance_benchmark_module()
+    return list(module.validate_manifest_v2_semantics(manifest))
+
+
+_SHA256_DIGEST_PATTERN_RE = None
+
+
+def _sha256_digest_pattern():
+    global _SHA256_DIGEST_PATTERN_RE
+    if _SHA256_DIGEST_PATTERN_RE is None:
+        import re
+
+        _SHA256_DIGEST_PATTERN_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+    return _SHA256_DIGEST_PATTERN_RE
+
+
+def is_well_formed_sha256_digest(value: Any) -> bool:
+    return isinstance(value, str) and bool(_sha256_digest_pattern().match(value))
+
+
+# Issue #2424 Finding 4 fix_delta: #2423's `receipt.evidence_errors` mixes
+# two distinct classes of problem: (1) identity/run-set/manifest-binding
+# integrity violations (a genuine Reliability-blocking defect), and (2)
+# Performance-measurement-ineligibility reasons -- a run's OWN Performance
+# metrics could not be computed (e.g. a missing paired Performance provider
+# job, or an invalid gate-ready timestamp) even though the SAME run's
+# workflow/Playwright evidence for Reliability may be completely fine. Only
+# reasons in this explicit allowlist are treated as Performance-only (never
+# block Reliability by themselves); everything else -- including any reason
+# string this module does not recognize -- remains fail-closed, per Finding
+# 4's "未知エラーを無条件に無視しない" requirement. This allowlist is
+# duplicated (not imported) from the #2423 owner's own literal reason
+# strings (`tests/ci/test_ci_performance_gate.py`) -- a fixed set of
+# string labels is not a "digest algorithm" reuse concern (unlike Finding 3
+# above): duplicating a small, stable, already-public string vocabulary
+# used purely for constant-membership classification, never re-executing or
+# re-deriving any owner computation.
+RECEIPT_PERFORMANCE_ONLY_EVIDENCE_ERROR_REASONS = frozenset(
+    {
+        "gate_ready_timestamp_missing_or_invalid",
+        "missing_pair_e2e-core",
+        "missing_pair_e2e-responsive-matrix",
+    }
+)
+
 
 class StrictJSONError(ValueError):
     """Duplicate keys / non-finite constants / invalid JSON."""
@@ -151,7 +240,11 @@ def normalize_workspace_relative_path(full_path: str, workspace: str) -> str:
 # a genuine evidence binding mismatch (AC1/AC3) so a caller never begins
 # runtime execution against an incomplete #2422/#2423/#2432/#2507 surface.
 # --------------------------------------------------------------------------- #
-def verify_prerequisites_available(manifest: dict[str, Any] | None, receipt: dict[str, Any] | None) -> list[str]:
+def verify_prerequisites_available(
+    manifest: dict[str, Any] | None,
+    receipt: dict[str, Any] | None,
+    manifest_raw_bytes: bytes | None = None,
+) -> list[str]:
     errors: list[str] = []
     if manifest is None:
         errors.append("prerequisite_unavailable: manifest")
@@ -160,9 +253,24 @@ def verify_prerequisites_available(manifest: dict[str, Any] | None, receipt: dic
             if key not in manifest:
                 errors.append(f"prerequisite_incomplete: manifest.{key}")
         if isinstance(manifest.get("frozen_non_treatment"), dict):
-            for key in ("expected_playwright_invocations", "expected_test_count"):
-                if key not in manifest["frozen_non_treatment"]:
-                    errors.append(f"prerequisite_incomplete: manifest.frozen_non_treatment.{key}")
+            # Issue #2424 Finding 1 fix_delta: `expected_test_count` is
+            # OPTIONAL in the real #2422 schema (`e2e_performance_benchmark_
+            # manifest_v2.schema.json`'s `FrozenNonTreatment.required` omits
+            # it) -- only `expected_playwright_invocations` is required.
+            # Treating `expected_test_count` as mandatory here was an #2424
+            # producer-local incompatibility with the upstream schema.
+            if "expected_playwright_invocations" not in manifest["frozen_non_treatment"]:
+                errors.append("prerequisite_incomplete: manifest.frozen_non_treatment.expected_playwright_invocations")
+        # Issue #2424 Finding 3 fix_delta: independent re-verification of
+        # `experiment_run_set_digest` (and the manifest's other semantic
+        # invariants) via the real #2422 owner function -- never a
+        # re-implementation of that algorithm (see
+        # `verify_manifest_v2_owner_semantics` above).
+        try:
+            owner_violations = verify_manifest_v2_owner_semantics(manifest)
+        except Exception as exc:  # pragma: no cover -- operational failure only
+            owner_violations = [f"owner_semantics_verification_operational_error: {exc}"]
+        errors.extend(f"manifest_owner_semantics_violation: {v}" for v in owner_violations)
     if receipt is None:
         errors.append("prerequisite_unavailable: receipt")
     else:
@@ -173,8 +281,46 @@ def verify_prerequisites_available(manifest: dict[str, Any] | None, receipt: dic
             for layout in ("monolith", "split"):
                 if layout not in receipt["arms"]:
                     errors.append(f"prerequisite_incomplete: receipt.arms.{layout}")
-        if receipt.get("evidence_errors"):
-            errors.append("prerequisite_incomplete: receipt.evidence_errors_non_empty")
+        # Issue #2424 Finding 4 fix_delta: bifurcate `receipt.evidence_errors`
+        # -- only non-Performance-only reasons block Reliability (fail-closed
+        # for anything not explicitly recognized as Performance-only).
+        evidence_errors = receipt.get("evidence_errors") or []
+        blocking_evidence_errors = [
+            e
+            for e in evidence_errors
+            if not (isinstance(e, dict) and e.get("reason") in RECEIPT_PERFORMANCE_ONLY_EVIDENCE_ERROR_REASONS)
+        ]
+        if blocking_evidence_errors:
+            errors.append(
+                "prerequisite_incomplete: receipt.evidence_errors_contains_non_performance_only_reason: "
+                f"{[e.get('reason') if isinstance(e, dict) else e for e in blocking_evidence_errors]}"
+            )
+        # Issue #2424 Finding 3 fix_delta: `receipt.manifest_sha256` is
+        # independently re-verifiable by this module WITHOUT importing any
+        # #2423 owner algorithm -- it is a standard sha256 digest of the
+        # `--manifest` file's own bytes (the same universal operation this
+        # module already trusts for its own `sha256_of_canonical_json`
+        # helper), never #2423-specific logic.
+        if manifest_raw_bytes is not None and isinstance(receipt.get("manifest_sha256"), str):
+            recomputed = "sha256:" + hashlib.sha256(manifest_raw_bytes).hexdigest()
+            if receipt["manifest_sha256"] != recomputed:
+                errors.append(
+                    "prerequisite_manifest_sha256_mismatch: "
+                    f"receipt={receipt['manifest_sha256']!r} recomputed={recomputed!r}"
+                )
+        # Issue #2424 Finding 3 fix_delta ("重要" residual gap, reported to
+        # root control-plane): no owner-side PUBLIC verification entry point
+        # exists for #2423's `receipt.run_set_digest` algorithm (see the
+        # module-level comment above `_load_collect_e2e_performance_
+        # benchmark_module`) -- this module never invents/duplicates that
+        # algorithm. Format validation only (rejects a structurally
+        # malformed digest); the ACTUAL correctness of the run-set
+        # membership this digest claims to identify is independently
+        # guaranteed by `verify_exact_run_set_binding`'s direct membership
+        # comparison against the manifest (never by trusting this digest).
+        raw_run_set_digest = receipt.get("run_set_digest")
+        if "run_set_digest" in receipt and not is_well_formed_sha256_digest(raw_run_set_digest):
+            errors.append(f"prerequisite_incomplete: receipt.run_set_digest_malformed: {raw_run_set_digest!r}")
     if manifest is not None and receipt is not None and manifest.get("experiment_identity") != receipt.get(
         "experiment_identity"
     ):
@@ -282,9 +428,15 @@ def build_composite_envelope(
     for AC6 rerun detection -- an old attempt-1 artifact is never assumed
     available beyond what `workflow_evidence` actually supplies.
 
-    `playwright_json_loader(layout: str, invocation_id: str) -> dict | None`
-    returns the parsed official Playwright JSON for that invocation, or
-    `None` if the artifact is missing.
+    `playwright_json_loader(layout: str, workflow_run_id: int, invocation_id:
+    str) -> dict | None` returns the parsed official Playwright JSON for
+    that (layout, run, invocation) triple, or `None` if the artifact is
+    missing. Issue #2424 Finding 2 fix_delta: the signature now carries
+    `workflow_run_id` -- MULTIPLE runs per arm (the real 2-run/22-run
+    close-grade cohort case, not just #2424's own 1-run-per-arm smoke) each
+    have their OWN Playwright JSON per invocation; a loader keyed only by
+    `(layout, invocation_id)` cannot distinguish a second run in the same
+    arm from the first, and silently re-reads the first run's file.
 
     Returns `(envelope_or_none, diagnostic)`. `envelope` is `None` whenever
     `diagnostic["errors"]` is non-empty (fail-closed; no partial assessment).
@@ -307,7 +459,16 @@ def build_composite_envelope(
 
     runs_by_arm: dict[str, dict[int, dict[str, Any]]] = {"before": {}, "after": {}}
     expected_test_count = manifest.get("frozen_non_treatment", {}).get("expected_test_count")
-    all_invocations = manifest.get("frozen_non_treatment", {}).get("expected_playwright_invocations", [])
+    # Issue #2424 Finding 1 fix_delta: the real #2422 schema's
+    # `expected_playwright_invocations` entries share the SAME logical
+    # identity (`invocation_id`/`lane`) across BOTH `benchmark_layout` arms
+    # -- only `provider_placement[layout]` (the PHYSICAL provider job) is
+    # arm-dependent. This module never filters the expected-invocation list
+    # by arm (the removed, schema-nonconformant `benchmark_layout_only`
+    # producer-local field, which does not exist in
+    # `ExpectedPlaywrightInvocation`'s schema); every expected invocation is
+    # expected under EVERY arm.
+    expected_invocations = manifest.get("frozen_non_treatment", {}).get("expected_playwright_invocations", [])
 
     for layout in ("monolith", "split"):
         if binding[layout]:
@@ -315,9 +476,6 @@ def build_composite_envelope(
             # attempt evidence resolution against an unverified run set.
             continue
         arm = LAYOUT_TO_ARM[layout]
-        expected_invocations = [
-            inv for inv in all_invocations if inv.get("benchmark_layout_only") in (None, layout)
-        ]
         for run_id in sorted(manifest_run_ids_for_layout(manifest, layout)):
             run_diag: dict[str, Any] = {
                 "layout": layout,
@@ -358,13 +516,29 @@ def build_composite_envelope(
                 rerun_run_ids.add(run_id)
 
             expected_job_names = {job.get("job") for job in manifest_run.get("provider_jobs", [])}
-            observed_job_names = {job.get("name") for job in record.get("jobs", [])}
-            missing_jobs = expected_job_names - observed_job_names
+            observed_jobs_by_name = {job.get("name"): job for job in record.get("jobs", [])}
+            missing_jobs = expected_job_names - set(observed_jobs_by_name)
             if missing_jobs:
                 run_diag["binding_errors"].append(f"missing_expected_job_evidence:{sorted(missing_jobs)}")
                 errors.append(
                     f"missing_expected_job_evidence: layout={layout} workflow_run_id={run_id} "
                     f"jobs={sorted(missing_jobs)}"
+                )
+            # Issue #2424 Finding 5 fix_delta: job-level evidence must prove
+            # the target job actually FINISHED (status=="completed"), not
+            # merely that a job record with that name exists (e.g. a
+            # `queued`/`in_progress` job is not usable evidence). This never
+            # re-defines `workflow_failure_rate` from job-level
+            # conclusions -- it is a completeness check only.
+            incomplete_jobs = sorted(
+                name
+                for name in expected_job_names & set(observed_jobs_by_name)
+                if observed_jobs_by_name[name].get("status") != "completed"
+            )
+            if incomplete_jobs:
+                run_diag["binding_errors"].append(f"job_not_completed:{incomplete_jobs}")
+                errors.append(
+                    f"job_not_completed: layout={layout} workflow_run_id={run_id} jobs={incomplete_jobs}"
                 )
 
             conclusion = record.get("conclusion")
@@ -383,7 +557,22 @@ def build_composite_envelope(
             has_unexpected = False
             collected_cases: list[dict[str, str]] = []
             for inv in expected_invocations:
-                pj = playwright_json_loader(layout, inv["invocation_id"])
+                # Issue #2424 Finding 1 fix_delta: resolve the PHYSICAL
+                # provider job this invocation actually ran under, in THIS
+                # arm, via `provider_placement[layout]` (never a
+                # producer-local `benchmark_layout_only` field).
+                provider_placement = inv.get("provider_placement") or {}
+                provider_job = provider_placement.get(layout)
+                if not provider_job:
+                    run_diag["binding_errors"].append(
+                        f"missing_provider_placement:{inv.get('invocation_id')}:{layout}"
+                    )
+                    errors.append(
+                        f"invocation_missing_provider_placement: layout={layout} workflow_run_id={run_id} "
+                        f"invocation_id={inv.get('invocation_id')!r}"
+                    )
+                    continue
+                pj = playwright_json_loader(layout, run_id, inv["invocation_id"])
                 if pj is None:
                     run_diag["missing_artifacts"].append(inv["invocation_id"])
                     errors.append(
@@ -890,11 +1079,84 @@ def build_canonical_output(
 
 
 # --------------------------------------------------------------------------- #
+# Invocation artifact provenance (AC11/Finding 5) -- optional: populated only
+# when the caller supplies an artifact index (GitHub Actions Artifacts REST
+# API metadata keyed by artifact name), never fabricated.
+# --------------------------------------------------------------------------- #
+# Issue #2424 Finding 1/2/5 fix_delta: the GitHub Actions artifact NAME is
+# not always identical to the logical `invocation_id` -- monolith's
+# `e2e-responsive` invocation uploads under the `e2e-core-responsive`
+# artifact-name suffix (`.github/workflows/ci.yml`'s own upload step
+# comment) to stay collision-free against split's `e2e-responsive-matrix`
+# job artifact of the SAME invocation_id (statically enforced by
+# `tests/ci/test_verify_e2e_lane_partition.py`, Allowed Paths外). Mirrors
+# ci.yml's OWN `ARTIFACT_NAME_SUFFIX_BY_LAYOUT_AND_INVOCATION` table
+# exactly (never re-derived from `invocation_id` alone); an
+# `(layout, invocation_id)` pair not present here falls back to
+# `invocation_id` itself (the default 1:1 pattern for any future
+# invocation this table has not been extended for yet).
+ARTIFACT_NAME_SUFFIX_BY_LAYOUT_AND_INVOCATION = {
+    ("monolith", "e2e-core"): "e2e-core",
+    ("monolith", "e2e-responsive"): "e2e-core-responsive",
+    ("split", "e2e-core"): "e2e-core",
+    ("split", "e2e-responsive"): "e2e-responsive",
+}
+
+
+def build_invocation_artifacts(
+    envelope: dict[str, Any] | None,
+    manifest: dict[str, Any],
+    artifact_index: dict[str, dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Issue #2424 Finding 5 fix_delta: for each (layout, workflow_run_id,
+    invocation_id) triple actually included in `envelope`, records the
+    per-invocation GitHub Actions artifact this evidence was downloaded
+    from -- `artifact_id`/`digest` come from `artifact_index` (built by the
+    CI producer via the GitHub Actions Artifacts REST API, e.g. `gh api
+    repos/{repo}/actions/artifacts`), matched by the SAME
+    `ci-reliability-<run_id>-a1-<invocation_id>` artifact-naming contract
+    AC2 defines. Never fabricates an entry for evidence this run did not
+    actually download."""
+    if envelope is None or not artifact_index:
+        return []
+    invocations = manifest.get("frozen_non_treatment", {}).get("expected_playwright_invocations", [])
+    invocation_ids = [inv["invocation_id"] for inv in invocations]
+    entries: list[dict[str, Any]] = []
+    for arm, runs in envelope.get("runs_by_arm", {}).items():
+        layout = ARM_TO_LAYOUT[arm]
+        for run_id in sorted(runs):
+            for invocation_id in invocation_ids:
+                suffix = ARTIFACT_NAME_SUFFIX_BY_LAYOUT_AND_INVOCATION.get((layout, invocation_id), invocation_id)
+                artifact_name = f"ci-reliability-{run_id}-a1-{suffix}"
+                meta = artifact_index.get(artifact_name)
+                if meta is None:
+                    continue
+                entries.append(
+                    {
+                        "layout": layout,
+                        "workflow_run_id": run_id,
+                        "invocation_id": invocation_id,
+                        "artifact_name": artifact_name,
+                        "artifact_id": meta.get("id"),
+                        "digest": meta.get("digest"),
+                    }
+                )
+    return entries
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def _default_playwright_json_loader(playwright_json_dir: str):
-    def loader(layout: str, invocation_id: str) -> dict[str, Any] | None:
-        path = os.path.join(playwright_json_dir, layout, f"{invocation_id}.json")
+    """Issue #2424 Finding 2 fix_delta: layout is `<dir>/<layout>/
+    <workflow_run_id>/<invocation_id>.json` -- resolves at minimum
+    `run_id x invocation_id` uniquely (attempt is separately hard-bound to
+    `1` by `workflow_evidence_not_attempt_1` in `build_composite_envelope`,
+    so a further `<attempt>` path segment would be redundant, never a
+    second run silently colliding with the first)."""
+
+    def loader(layout: str, workflow_run_id: int, invocation_id: str) -> dict[str, Any] | None:
+        path = os.path.join(playwright_json_dir, layout, str(workflow_run_id), f"{invocation_id}.json")
         if not os.path.isfile(path):
             return None
         try:
@@ -915,6 +1177,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pr-number", type=int, default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--validator-path", default=DEFAULT_VALIDATOR_PATH)
+    parser.add_argument(
+        "--artifact-index",
+        default=None,
+        help=(
+            "Issue #2424 Finding 5: optional path to a JSON object mapping "
+            "GitHub Actions artifact name -> {'id': int, 'digest': "
+            "'sha256:<hex>'} (from the GitHub Actions Artifacts REST API), "
+            "used to populate the canonical output's `invocation_artifacts` "
+            "provenance. Omitted -> `invocation_artifacts` stays empty "
+            "(never fabricated)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -922,11 +1196,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     os.makedirs(args.output_dir, exist_ok=True)
 
+    manifest_raw_bytes: bytes | None = None
     try:
-        manifest = load_json_file(args.manifest)
-    except EnvelopeBuildError as exc:
+        with open(args.manifest, "rb") as handle:
+            manifest_raw_bytes = handle.read()
+        manifest = strict_json_loads(manifest_raw_bytes.decode("utf-8"))
+    except (OSError, StrictJSONError) as exc:
         manifest = None
-        prereq_errors = [str(exc)]
+        prereq_errors = [f"file_not_readable_or_invalid_json: {args.manifest}: {exc}"]
     else:
         prereq_errors = []
     try:
@@ -935,7 +1212,7 @@ def main(argv: list[str] | None = None) -> int:
         receipt = None
         prereq_errors.append(str(exc))
 
-    prereq_errors.extend(verify_prerequisites_available(manifest, receipt))
+    prereq_errors.extend(verify_prerequisites_available(manifest, receipt, manifest_raw_bytes))
     if prereq_errors:
         diagnostic = {
             "schema": "CI_RELIABILITY_COMPOSITE_ENVELOPE_DIAGNOSTIC_V1",
@@ -953,6 +1230,13 @@ def main(argv: list[str] | None = None) -> int:
     loader = _default_playwright_json_loader(args.playwright_json_dir)
     envelope, diagnostic = build_composite_envelope(manifest, receipt, workflow_evidence, loader)
     _write_json_file(os.path.join(args.output_dir, "composite_envelope_diagnostic.json"), diagnostic)
+    # Issue #2424 Finding 5 fix_delta: the composite envelope BODY (not just
+    # its digest, already embedded in the canonical output) is itself
+    # published so a downstream reader can inspect the raw binding this
+    # experiment's assessments were computed from, without needing to
+    # re-derive it.
+    if envelope is not None:
+        _write_json_file(os.path.join(args.output_dir, "composite_envelope.json"), envelope)
 
     assessments = None
     validator_results = None
@@ -968,8 +1252,16 @@ def main(argv: list[str] | None = None) -> int:
     aggregate = aggregate_gate(envelope, diagnostic, assessments, validator_results)
     _write_json_file(os.path.join(args.output_dir, "aggregate_result.json"), aggregate)
 
+    artifact_index = None
+    if args.artifact_index:
+        try:
+            artifact_index = load_json_file(args.artifact_index)
+        except EnvelopeBuildError:
+            artifact_index = None
+    invocation_artifacts = build_invocation_artifacts(envelope, manifest, artifact_index)
+
     canonical = build_canonical_output(
-        manifest, receipt, envelope, diagnostic, assessments, validator_results, aggregate
+        manifest, receipt, envelope, diagnostic, assessments, validator_results, aggregate, invocation_artifacts
     )
     _write_json_file(os.path.join(args.output_dir, "ci_reliability_close_grade_result_v1.json"), canonical)
 
