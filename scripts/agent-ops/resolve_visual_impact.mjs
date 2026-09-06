@@ -21,20 +21,29 @@
 //     import, virtual/generated module specifiers, dynamic plugin
 //     resolution / unresolvable static relative imports.
 //
-// tsconfig paths/baseUrl, Vite resolve.alias, package.json imports/exports
-// are NOT resolved by this module's bare-import walk (only the
+// tsconfig paths/baseUrl (including inherited via `extends`), Vite
+// resolve.alias (including indirection through an imported/spread config
+// object), package.json imports/exports (including the `exports` string
+// shorthand) are NOT resolved by this module's bare-import walk (only the
 // relative-specifier resolution path below is implemented/exercised). PR
-// #2045 OWNER fix_delta P1-1: rather than silently treating a bare import
-// as `external` (out of scope, no impact) whenever one of these settings IS
-// configured, `detectUnsupportedResolutionSettings()` below scans
-// tsconfig.json / vite.config.* / package.json for them and, if present,
-// pushes a resolver-fatal entry into `errors[]` -- which
-// resolve_visual_impact.py's `resolve()` already surfaces as a
-// `resolve_result.errors` entry, and `evaluate_pr_policy()` already fails
-// closed on any non-empty `errors` list (never a silent no-impact PASS).
-// This repository does not configure any of these settings today, so the
-// guard is currently inert; it exists to catch the day one of them is
-// introduced.
+// #2045 OWNER fix_delta P1-1 originally pushed a resolver-fatal entry into
+// `errors[]` whenever one of these settings was detected -- which
+// unconditionally blocked the PR regardless of whether any changed path
+// was actually affected by the gap. Issue #2525 (OWNER anchor comment
+// 2026-09-06, REQUEST_CHANGES on Issue #2019's own fix_delta): this
+// analysis-incompleteness signal is emitted below as
+// `unsupported_resolution_settings` (a diagnostic, never in `errors[]`)
+// instead. resolve_visual_impact.py's `resolve()` connects a non-empty
+// `unsupported_resolution_settings` list to the SAME all-registered-
+// surfaces-affected fallback as `global_invalidators`, so the PR still gets
+// full disposition/VRT evidence evaluation rather than an unconditional
+// resolver-fatal stop. This repository does not configure any of these
+// settings at its own top level today, so the guard is currently inert
+// there; it exists to catch the day one of them is introduced (and is
+// exercised directly against the
+// scripts/agent-ops/tests/fixtures/visual_impact/unsupported_resolution/
+// fixture, whose `repo_root` IS one of these configurations, by
+// tests/agent-ops/resolve-visual-impact-vite-deterministic.test.ts).
 
 import ts from 'typescript'
 import { readFileSync, existsSync, statSync } from 'node:fs'
@@ -301,51 +310,169 @@ class Resolver {
   }
 }
 
-/** PR #2045 OWNER fix_delta P1-1: detect tsconfig `paths`/`baseUrl`, Vite
- * `resolve.alias`, and package.json `imports`/`exports` -- none of which
- * this module's bare-import resolution understands. A repository that
- * configures any of these could have bare specifiers silently resolve to a
- * different file than this walker assumes (or not resolve at all), which
- * would make the affected-surface determination wrong without ever
- * reporting an error. Returns a list of human-readable problem strings
- * (empty when nothing unsupported is configured). This never EXECUTES
- * tsconfig.json / vite.config.* / package.json -- text/JSON parsing only. */
+/** Resolve a tsconfig `extends` specifier relative to `baseDir`. Only
+ * relative specifiers ("./foo", "../foo") are resolved deterministically,
+ * matching this module's existing relative-import philosophy elsewhere.
+ * Returns `null` for a non-relative `extends` (e.g. a bare npm package
+ * specifier like `@tsconfig/node20`) -- the caller treats that as its own
+ * unsupported-resolution problem rather than silently skipping it, since
+ * this walker cannot safely resolve npm package resolution semantics
+ * either. */
+function resolveTsconfigExtendsCandidate(baseDir, extendsSpecifier) {
+  if (!isRelativeSpecifier(extendsSpecifier)) return null
+  let candidate = path.resolve(baseDir, extendsSpecifier)
+  if (path.extname(candidate) !== '.json') candidate += '.json'
+  return candidate
+}
+
+/** PR #2045 OWNER fix_delta P1-1 originally checked ONLY the root
+ * tsconfig.json's own `compilerOptions.paths`/`baseUrl`. Issue #2525: a
+ * root tsconfig with no `compilerOptions` of its own that `extends` a base
+ * config which DOES configure `paths`/`baseUrl` was invisible to that
+ * check -- those inherited settings apply to the exact same bare-import
+ * resolution this walker cannot support, so the `extends` chain must be
+ * walked too (bounded depth against a cyclic/malformed chain; never
+ * executes any config file -- text/JSON parsing only). */
+function detectTsconfigChainProblems(repoRoot) {
+  const problems = []
+  const rootPath = path.join(repoRoot, 'tsconfig.json')
+  if (!existsSync(rootPath)) return problems
+
+  const visited = new Set()
+  let currentPath = rootPath
+  const MAX_EXTENDS_DEPTH = 8
+
+  for (let depth = 0; currentPath && depth < MAX_EXTENDS_DEPTH; depth += 1) {
+    if (visited.has(currentPath)) {
+      problems.push(
+        `tsconfig extends chain starting at ${toPosix(path.relative(repoRoot, rootPath))} contains a cycle at ${currentPath} -- refusing to assume no paths/baseUrl are configured`,
+      )
+      break
+    }
+    visited.add(currentPath)
+
+    if (!existsSync(currentPath)) {
+      problems.push(`tsconfig extends chain references a file that does not exist: ${currentPath}`)
+      break
+    }
+
+    let raw
+    try {
+      raw = readFileSync(currentPath, 'utf8')
+    } catch (err) {
+      problems.push(`${currentPath} read failure: ${String(err)}`)
+      break
+    }
+
+    const parsed = ts.parseConfigFileTextToJson(currentPath, raw)
+    if (parsed.error) {
+      problems.push(
+        `${currentPath} failed to parse (${ts.flattenDiagnosticMessageText(parsed.error.messageText, ' ')}) -- refusing to assume no paths/baseUrl are configured`,
+      )
+      break
+    }
+
+    const config = parsed.config || {}
+    const compilerOptions = config.compilerOptions || {}
+    const relCurrent = toPosix(path.relative(repoRoot, currentPath))
+    if (compilerOptions.paths && Object.keys(compilerOptions.paths).length > 0) {
+      problems.push(`${relCurrent} compilerOptions.paths is configured but not supported by this bare-import resolver`)
+    }
+    if (typeof compilerOptions.baseUrl === 'string' && compilerOptions.baseUrl !== '') {
+      problems.push(`${relCurrent} compilerOptions.baseUrl is configured but not supported by this bare-import resolver`)
+    }
+
+    if (typeof config.extends === 'string' && config.extends !== '') {
+      const nextPath = resolveTsconfigExtendsCandidate(path.dirname(currentPath), config.extends)
+      if (!nextPath) {
+        problems.push(
+          `${relCurrent} extends a non-relative specifier (${config.extends}) that this bare-import resolver cannot safely resolve`,
+        )
+        break
+      }
+      currentPath = nextPath
+    } else {
+      currentPath = null
+    }
+  }
+
+  return problems
+}
+
+/** Strip `//` line comments and `/* *\/` block comments before running any
+ * regex-based config text scan below -- otherwise prose in a comment that
+ * happens to contain the literal substring `resolve:` (e.g. a comment
+ * explaining THIS very guard) can produce a spurious match. Not a full
+ * JS/TS tokenizer (a `//`/`/* *\/` sequence embedded inside a string
+ * literal would still be stripped) -- acceptable because a false positive
+ * here is fail-closed (Runtime Verification Applicability fallback_policy),
+ * never a silent false negative. */
+function stripJsComments(text) {
+  return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+}
+
+/** Issue #2525 (c): a Vite `resolve` field that is NOT an inline object
+ * literal free of spreads (e.g. `resolve: sharedResolveOptions` imported
+ * from another file, or `resolve: { ...sharedResolveOptions }`) may still
+ * configure `alias`/`dedupe` semantics invisible to the direct-alias text
+ * scan below. This module never imports/executes the referenced file to
+ * find out -- any such indirection is reported as its own
+ * unsupported-resolution problem (fallback), never silently assumed to be
+ * alias-free. Conservative text scan only (never executes the config
+ * module): a false positive here is fail-closed (acceptable -- Runtime
+ * Verification Applicability fallback_policy), a false negative would
+ * defeat the entire point of this guard. `viteText` MUST already have
+ * comments stripped (see `stripJsComments`). */
+function detectViteIndirectResolveConfig(viteText, candidateRelPath) {
+  const resolveFieldRe = /\bresolve\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\}|[^,{}\n;]+)/
+  const match = resolveFieldRe.exec(viteText)
+  if (!match) return null
+  const value = match[1].trim()
+  if (!value.startsWith('{')) {
+    // `resolve: someIdentifier` / `resolve: someFn(...)` -- an externally
+    // defined or computed value this module never evaluates.
+    return `${candidateRelPath} "resolve" field references an externally-defined or computed value (${JSON.stringify(value)}) that cannot be statically confirmed to be free of alias/paths configuration`
+  }
+  if (/\.\.\.[A-Za-z_$]/.test(value)) {
+    // `resolve: { ...someSpread, dedupe: [...] }` -- a spread of an
+    // externally-defined object into the resolve config.
+    return `${candidateRelPath} "resolve" field spreads an externally-defined value that cannot be statically confirmed to be free of alias/paths configuration`
+  }
+  return null
+}
+
+/** PR #2045 OWNER fix_delta P1-1 / Issue #2525: detect tsconfig
+ * `paths`/`baseUrl` (including inherited via `extends`), Vite
+ * `resolve.alias` (direct or indirected through an imported/spread
+ * config), and package.json `imports`/`exports` (including the `exports`
+ * string shorthand) -- none of which this module's bare-import resolution
+ * understands. A repository that configures any of these could have bare
+ * specifiers silently resolve to a different file than this walker assumes
+ * (or not resolve at all), which would make the affected-surface
+ * determination wrong without ever reporting it. Returns a list of
+ * human-readable problem strings (empty when nothing unsupported is
+ * configured) -- the caller surfaces these as a diagnostic
+ * (`unsupported_resolution_settings`), never as a resolver-fatal
+ * `errors[]` entry. This never EXECUTES tsconfig.json / vite.config.* /
+ * package.json -- text/JSON parsing only. */
 function detectUnsupportedResolutionSettings(repoRoot) {
   const problems = []
 
-  const tsconfigPath = path.join(repoRoot, 'tsconfig.json')
-  if (existsSync(tsconfigPath)) {
-    try {
-      const raw = readFileSync(tsconfigPath, 'utf8')
-      const parsed = ts.parseConfigFileTextToJson(tsconfigPath, raw)
-      if (parsed.error) {
-        problems.push(
-          `tsconfig.json failed to parse (${ts.flattenDiagnosticMessageText(parsed.error.messageText, ' ')}) -- refusing to assume no paths/baseUrl are configured`,
-        )
-      } else {
-        const compilerOptions = (parsed.config && parsed.config.compilerOptions) || {}
-        if (compilerOptions.paths && Object.keys(compilerOptions.paths).length > 0) {
-          problems.push('tsconfig.json compilerOptions.paths is configured but not supported by this bare-import resolver')
-        }
-        if (typeof compilerOptions.baseUrl === 'string' && compilerOptions.baseUrl !== '') {
-          problems.push('tsconfig.json compilerOptions.baseUrl is configured but not supported by this bare-import resolver')
-        }
-      }
-    } catch (err) {
-      problems.push(`tsconfig.json read/parse failure: ${String(err)}`)
-    }
-  }
+  problems.push(...detectTsconfigChainProblems(repoRoot))
 
   for (const candidate of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts']) {
     const viteConfigPath = path.join(repoRoot, candidate)
     if (!existsSync(viteConfigPath)) continue
-    let viteText
+    let viteTextRaw
     try {
-      viteText = readFileSync(viteConfigPath, 'utf8')
+      viteTextRaw = readFileSync(viteConfigPath, 'utf8')
     } catch (err) {
       problems.push(`${candidate} read failure: ${String(err)}`)
       continue
     }
+    // Comments stripped first so prose (including this guard's own source
+    // comments) can never produce a spurious match.
+    const viteText = stripJsComments(viteTextRaw)
     // Conservative text scan only (never executes the config module): a
     // false positive here is fail-closed (acceptable -- Runtime
     // Verification Applicability fallback_policy), a false negative would
@@ -353,6 +480,8 @@ function detectUnsupportedResolutionSettings(repoRoot) {
     if (/\bresolve\s*:\s*\{[^}]*\balias\s*:/s.test(viteText) || /\balias\s*:\s*(\{|\[)/.test(viteText)) {
       problems.push(`${candidate} appears to configure resolve.alias, which is not supported by this bare-import resolver`)
     }
+    const indirect = detectViteIndirectResolveConfig(viteText, candidate)
+    if (indirect) problems.push(indirect)
   }
 
   const packageJsonPath = path.join(repoRoot, 'package.json')
@@ -362,7 +491,11 @@ function detectUnsupportedResolutionSettings(repoRoot) {
       if (pkg.imports && typeof pkg.imports === 'object' && Object.keys(pkg.imports).length > 0) {
         problems.push('package.json "imports" subpath mapping is configured but not supported by this bare-import resolver')
       }
-      if (pkg.exports && typeof pkg.exports === 'object' && Object.keys(pkg.exports).length > 0) {
+      if (typeof pkg.exports === 'string' && pkg.exports !== '') {
+        problems.push(
+          `package.json "exports" string shorthand (${JSON.stringify(pkg.exports)}) is configured but not supported by this bare-import resolver`,
+        )
+      } else if (pkg.exports && typeof pkg.exports === 'object' && Object.keys(pkg.exports).length > 0) {
         problems.push('package.json "exports" is configured but not supported by this bare-import resolver')
       }
     } catch (err) {
@@ -394,9 +527,11 @@ async function main() {
   const output = {}
   const errors = []
 
-  for (const problem of detectUnsupportedResolutionSettings(repoRoot)) {
-    errors.push(`unsupported_resolution_setting: ${problem}`)
-  }
+  // Issue #2525: diagnostic only -- NEVER pushed into `errors[]` (which is
+  // resolver-fatal, PR block). resolve_visual_impact.py's `resolve()`
+  // connects a non-empty list here to the same all-registered-
+  // surfaces-affected fallback as `global_invalidators`.
+  const unsupportedResolutionSettings = detectUnsupportedResolutionSettings(repoRoot)
 
   for (const [surfaceId, def] of Object.entries(surfaces)) {
     const entries = [
@@ -419,6 +554,7 @@ async function main() {
     resolver_version: RESOLVER_VERSION,
     surfaces: output,
     errors,
+    unsupported_resolution_settings: unsupportedResolutionSettings,
   }, null, 2))
   process.exitCode = errors.length > 0 ? 1 : 0
 }
