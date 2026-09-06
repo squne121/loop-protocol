@@ -1443,6 +1443,60 @@ def _validate_github_research_argv(argv: list[str]) -> list[str]:
     return errors
 
 
+GITHUB_RESEARCH_OPERATOR_DISABLED_FAILURE_CLASS = "github_research_operator_disabled"
+
+
+def _validate_github_research_operator_disabled(request: Mapping[str, Any]) -> list[str]:
+    """Reject tool_profile=github_research when the effective provider is Gemini.
+
+    Issue #2522: `provider=gemini` (explicit) or `provider` omitted (which
+    resolves to the same effective "gemini" default both here --
+    ``request.get("provider", "gemini")`` in ``validate_request_for_provider()``
+    / ``_run_delegation_core()`` -- and in build_request.build_request()'s own
+    ``effective_provider = provider if provider is not None else "gemini"``)
+    combined with `tool_profile="github_research"` is operator-disabled: the
+    only supported GitHub research entry point is `provider=agy`, dispatched
+    entirely to `run_agy_github_research_e2e.py` (Issue #1920 / PR #2005).
+    `#2002` (env scrub / GH_CONFIG_DIR isolation / streaming cap /
+    process-group kill for the Gemini gh_commands route) was closed
+    not_planned in favour of that AGY-only route, and `#1886` is the tracking
+    issue for the resulting matrix/docs/validator split-brain that this check
+    resolves.
+
+    This is the single shared validation seam called from ``validate_request()``
+    -- which is itself the single entrypoint shared by:
+      - ``build_request.py`` (via ``validate_request_for_provider()``)
+      - ``run_gemini_headless.py --validate-only`` (via
+        ``validate_request_for_provider()``)
+      - ``run_gemini_headless.py`` normal execution (via the direct
+        ``validate_request()`` call near the top of the provider="gemini"
+        branch of ``_run_delegation_core()``, which runs before the
+        `gh_commands` pre-exec `subprocess.run(["gh"] + argv, ...)` block and
+        before any Gemini CLI invocation further down in that same function)
+    so the rejection is enforced identically, and before any external
+    process is launched, at all three entry points. The rejection does not
+    depend on `gh`/Gemini auth state: it is a pure request-shape check.
+
+    `provider=auto` + `github_research` is unaffected: `github_research` is
+    not a member of `PROVIDER_AUTO_ELIGIBLE_PROFILES`, so
+    `provider_auto_dispatch()` / `validate_request_for_provider()`'s
+    provider="auto" branch already reject it via `provider_profile_unsupported`
+    before this function (or `validate_request()`) is ever reached.
+    `provider=agy` + `github_research` is unaffected: provider="agy" uses the
+    separate `_validate_agy_request()` validator and never calls
+    `validate_request()`.
+    """
+    if request.get("tool_profile") != GITHUB_RESEARCH_PROFILE:
+        return []
+    return [
+        f"{GITHUB_RESEARCH_OPERATOR_DISABLED_FAILURE_CLASS}: tool_profile="
+        "'github_research' is not supported for the Gemini provider "
+        "(operator-disabled by design; see #1886, #2002). Use --provider agy "
+        "(run_agy_github_research_e2e.py) for GitHub research instead of "
+        "retrying Gemini login/auth or waiting for re-enablement."
+    ]
+
+
 def _validate_github_research_request(request: Mapping[str, Any]) -> list[str]:
     """Validate request for github_research profile.
 
@@ -1599,6 +1653,15 @@ def validate_request(request: Mapping[str, Any], request_path: Path | None = Non
     elif tool_profile == PROPOSAL_ONLY_PROFILE:
         errors.extend(_validate_proposal_only_request(request))
     elif tool_profile == GITHUB_RESEARCH_PROFILE:
+        # Issue #2522: operator-disabled check runs first (and additively, not
+        # as a short-circuit) so existing argv/text-based github_research
+        # denial messages (`_validate_github_research_request()`, dormant
+        # code kept intact -- not deleted) remain present in `errors` for any
+        # caller that inspects them, while the operator-disabled reason is
+        # always included whenever tool_profile=github_research is validated
+        # via this function (i.e. effective provider gemini/auto-eligible;
+        # provider=agy never reaches validate_request() at all).
+        errors.extend(_validate_github_research_operator_disabled(request))
         errors.extend(_validate_github_research_request(request))
 
     # B6: validate post_to_issue_url format when present (any profile).
@@ -6924,8 +6987,23 @@ def _run_delegation_core(
         base_result["stderr"] = "\n".join(validation_errors)
         base_result["warnings"] = validation_errors[:] + request_warnings
         base_result["failure_reason"] = validation_errors[0]
-        # github_research: propagate failure_class for denied commands
+        # Issue #2522: operator-disabled always takes precedence over the
+        # older argv/text-based command-denial classification below -- for
+        # tool_profile=github_research validated through validate_request()
+        # (i.e. any request that reaches this point with an effective
+        # gemini/auto-eligible provider), the operator-disabled error is
+        # unconditionally present (see
+        # _validate_github_research_operator_disabled()), so the
+        # `github_research_command_denied` branch is now unreachable here in
+        # practice; it is kept (not deleted, per #2522 Out of Scope) for any
+        # future reachable path that calls validate_request() without going
+        # through the operator-disabled gate.
         if tool_profile == GITHUB_RESEARCH_PROFILE and any(
+            GITHUB_RESEARCH_OPERATOR_DISABLED_FAILURE_CLASS in e for e in validation_errors
+        ):
+            base_result["failure_class"] = GITHUB_RESEARCH_OPERATOR_DISABLED_FAILURE_CLASS
+        # github_research: propagate failure_class for denied commands
+        elif tool_profile == GITHUB_RESEARCH_PROFILE and any(
             "github_research_command_denied" in e
             or "is not in the allowed subcommand list" in e
             or "forbids post_to_issue_url" in e

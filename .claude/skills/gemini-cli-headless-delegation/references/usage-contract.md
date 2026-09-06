@@ -95,7 +95,7 @@ quota exceeded（`RESOURCE_EXHAUSTED` / HTTP 429 / `quota_exhausted` / `Individu
 | `grounded_research` | isolated temp cwd | gemini: Google Search grounding（Gemini API tool）。agy: AGY ネイティブ WebSearch/WebGrounding（`agy -p` 実行、Gemini API 不使用）| shell execution、file edit/write、repo 探索、Serena MCP |
 | `local_asset_research` | repo root | Serena MCP の read-only tool による WSL-local ローカル資産調査 | Google Search、shell execution、file edit/write、GitHub write、repo 外の任意読み取り、`post_to_issue_url` |
 | `proposal_only` | isolated temp cwd | bounded draft text (`implementation_draft` / `issue_authoring_draft` / `patch_proposal` / `command_plan`) | file edit/write、shell execution、GitHub write / `post_to_issue_url`、repo 探索、実装完了を装う報告 |
-| `github_research` | repo root | wrapper が許可コマンドを `gh` で実行し結果を `inline_context` に prepend。Gemini は結果を解釈して報告を返す | `post_to_issue_url`、gh write コマンド（issue comment/edit/create/close 等）、`gh api` 非 GET method、shell 実行、file edit/write |
+| `github_research` | dormant / operator-disabled（#1886, #2002） | Gemini 側は operator-disabled のため常に拒否（実行前）。GitHub 調査は `provider=agy` を使う | `post_to_issue_url`、gh write コマンド（issue comment/edit/create/close 等）、`gh api` 非 GET method、shell 実行、file edit/write（dormant な旧実装の禁止事項も参考として残す） |
 
 `local_asset_research` は `no_tools` と違い Serena contract を wrapper 側で検証し、repo 内の read-only ローカル資産調査だけを扱う。AGY 本体には repo root、MCP 設定、direct tool access、absolute path を渡さない。`grounded_research` と違い外部 Web grounding は使わない。
 
@@ -811,7 +811,7 @@ return {
 
 | profile | サポート状況 | 許可 allowlist | 備考 |
 |---|---|---|---|
-| `github_research` | **完全実装済み** | `gh issue list/view`、`gh pr list/view/diff`、`gh search issues/prs`、`gh label list`、`gh repo view`、`gh api`（GET のみ） | write コマンド・`gh api` 非 GET method・`post_to_issue_url` は禁止。詳細は下記「github_research」節の「`gh_commands` field 仕様」参照 |
+| `github_research` | **dormant / operator-disabled**（#1886, #2002） | `gh issue list/view`、`gh pr list/view/diff`、`gh search issues/prs`、`gh label list`、`gh repo view`、`gh api`（GET のみ）※ 下記 allowlist はいずれも provider=gemini + github_research request 自体が operator-disabled として到達不能（dormant）。GitHub 調査は `provider=agy` を使う | `provider=gemini`（明示または省略）+ `tool_profile=github_research` は `github_research_operator_disabled` で実行前に拒否される。write コマンド・`gh api` 非 GET method・`post_to_issue_url` の禁止ロジック自体は削除せず保持（詳細は下記「github_research」節の「`gh_commands` field 仕様」参照） |
 | `local_asset_research` | **非対応**（fail-closed） | — | `gh_commands` を指定すると `validate_request()` が `"gh_commands is only allowed with tool_profile='github_research'"` で reject する |
 | `proposal_only` | **非対応**（fail-closed） | — | `gh_commands` を指定すると `validate_request()` が `"gh_commands is only allowed with tool_profile='github_research'"` で reject する |
 | `no_tools` | 非対応（fail-closed） | — | 文脈収集ニーズは `context_files` / `inline_context` で代替 |
@@ -918,6 +918,8 @@ See `references/transport-acp.md` for full lifecycle, timeout design, permission
 - `gh_auth_required`（`gh` が未インストール、または `gh auth status` が失敗）
 
 ### github_research
+
+> **dormant / operator-disabled（#1886, #2002）**: 以下は `provider=gemini`（明示指定または省略）+ `tool_profile=github_research` の従来実装の記述であり、Issue #2522 以降は `validate_request()` が `github_research_operator_disabled` として実行前に一貫して拒否する。実装コードは削除していない（dormant のまま保持）が、GitHub 調査の正規入口は `provider=agy`（下記「github_research 機能（provider=agy 経由で実装、Issue #1920）」節）のみである。
 
 `github_research` profile は GitHub read-only 調査専用。wrapper が許可コマンドを `gh` で実行し、結果を `inline_context` に prepend して Gemini に渡す。
 

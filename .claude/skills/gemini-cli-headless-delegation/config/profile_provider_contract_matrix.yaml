@@ -106,7 +106,7 @@ profiles:
 
   github_research:
     gemini:
-      value: implemented
+      value: unsupported_by_design
       evidence:
         - kind: repo_file
           path: .claude/skills/gemini-cli-headless-delegation/scripts/run_gemini_headless.py
@@ -117,7 +117,7 @@ profiles:
         - kind: repo_file
           path: .claude/skills/gemini-cli-headless-delegation/references/provider-mapping.md
       known_gaps:
-        - "gh_commands は argv ベースの許可コマンドリストに限定され、tool_profile=github_research 以外での指定は validation で拒否される。GitHub read-only 調査のみで書込は許可しない"
+        - "#2522: provider=gemini（明示指定または省略）+ tool_profile=github_research は operator-disabled として実行前に一貫して拒否される（#1886, #2002 が根拠）。既存の gh_commands pre-exec / argv allowlist ロジック（_validate_github_research_request / _validate_github_research_argv、run_gemini_headless.py）は dormant のまま削除せず保持している。GitHub 調査の正規入口は provider=agy（run_agy_github_research_e2e.py）のみ"
     agy:
       value: implemented
       evidence:
