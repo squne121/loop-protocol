@@ -591,7 +591,7 @@ def test_fixture_defect_blocks_all_disposable_issue_creation_and_fails_not_skips
         "}",
         # Simulate a fixture defect (e.g. a body-hygiene/readiness violation)
         # detected by the SAME static check _run_step normally relies on.
-        "_run_readiness_check() { echo '{\"status\":\"not_go\",\"errors\":[\"disposable fixture defect\"]}'; return 1; }",
+        "_run_readiness_check() { echo '{\"status\":\"not_go\"}'; return 1; }",
         "( _main ); echo \"MAIN_RC=$?\"",
         'echo "CREATE_CALL_COUNT=$(cat "${CREATE_COUNTER}")"',
     ]
