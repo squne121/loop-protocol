@@ -402,7 +402,76 @@ def run_mjs(
         mjs_errors = result.get("errors") or [f"mjs exited {proc.returncode} with no explicit errors[] entry"]
         raise RegistryError(f"resolve_visual_impact.mjs exited {proc.returncode}: {mjs_errors}")
 
+    # Issue #2525 AC5 (OWNER REQUEST_CHANGES on PR #2548, 2026-09-06): a
+    # *successful* (schema/version/surface-key-set/exit-code already valid)
+    # result's PER-SURFACE payload shape was never actually validated --
+    # e.g. `{"surfaces": {"fixture": {}}}` (missing reachable_files/
+    # unknown_impact entirely) previously passed through untouched and was
+    # silently treated downstream as "fully resolved, zero reachable files,
+    # zero unknown impact" rather than the malformed/incomplete resolver
+    # output it actually is. Fail closed via the same RegistryError path as
+    # any other malformed resolver output.
+    _validate_mjs_success_result(result, request_surface_ids)
+
     return result
+
+
+def _validate_mjs_success_result(result: dict[str, Any], request_surface_ids: set[str]) -> None:
+    """Issue #2525 AC5: minimal per-surface shape validation for a
+    *successful* RESOLVE_VISUAL_IMPACT_MJS_RESULT_V1 payload (schema/
+    version/exit-code already checked by the caller before this is
+    invoked). Deliberately NOT a schema framework -- just enough structural
+    validation that a malformed/incomplete per-surface payload can never be
+    silently converted into "fully resolved, no impact" fallback success."""
+    surfaces = result.get("surfaces")
+    if not isinstance(surfaces, dict):
+        raise RegistryError(f"resolve_visual_impact.mjs 'surfaces' is not an object: {surfaces!r}")
+    if set(surfaces.keys()) != request_surface_ids:
+        # Belt-and-suspenders -- the caller already checked this before
+        # calling _validate_mjs_success_result, but never assume call order.
+        raise RegistryError(
+            "resolve_visual_impact.mjs surface key set mismatch: "
+            f"requested={sorted(request_surface_ids)} returned={sorted(surfaces.keys())}"
+        )
+
+    for surface_id, surface_value in surfaces.items():
+        if not isinstance(surface_value, dict):
+            raise RegistryError(
+                f"resolve_visual_impact.mjs surface {surface_id!r} value is not an object: {surface_value!r}"
+            )
+        reachable_files = surface_value.get("reachable_files")
+        if not isinstance(reachable_files, list) or not all(isinstance(item, str) for item in reachable_files):
+            raise RegistryError(
+                f"resolve_visual_impact.mjs surface {surface_id!r} 'reachable_files' is not a list of strings: "
+                f"{reachable_files!r}"
+            )
+        unknown_impact = surface_value.get("unknown_impact")
+        if not isinstance(unknown_impact, list):
+            raise RegistryError(
+                f"resolve_visual_impact.mjs surface {surface_id!r} 'unknown_impact' is not a list: {unknown_impact!r}"
+            )
+        for entry in unknown_impact:
+            if not isinstance(entry, dict):
+                raise RegistryError(
+                    f"resolve_visual_impact.mjs surface {surface_id!r} unknown_impact entry is not an object: {entry!r}"
+                )
+            for field_name in ("file", "kind", "detail"):
+                if not isinstance(entry.get(field_name), str):
+                    raise RegistryError(
+                        f"resolve_visual_impact.mjs surface {surface_id!r} unknown_impact entry has a missing/"
+                        f"invalid {field_name!r}: {entry!r}"
+                    )
+
+    errors_field = result.get("errors")
+    if not isinstance(errors_field, list) or not all(isinstance(item, str) for item in errors_field):
+        raise RegistryError(f"resolve_visual_impact.mjs 'errors' is not a list of strings: {errors_field!r}")
+
+    unsupported_field = result.get("unsupported_resolution_settings", [])
+    if not isinstance(unsupported_field, list) or not all(isinstance(item, str) for item in unsupported_field):
+        raise RegistryError(
+            f"resolve_visual_impact.mjs 'unsupported_resolution_settings' is not a list of strings: "
+            f"{unsupported_field!r}"
+        )
 
 
 def match_coverage_roots(changed_path: str, coverage_roots: list[str]) -> bool:

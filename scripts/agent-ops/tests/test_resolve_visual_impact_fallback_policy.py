@@ -645,3 +645,59 @@ def test_ac5_mjs_malformed_json_output_is_a_resolver_error(monkeypatch):
 
     with pytest.raises(rvi.RegistryError, match="invalid JSON"):
         rvi.run_mjs(MJS_PATH, {"repo_root": ".", "surfaces": {}})
+
+
+def test_ac5_mjs_incomplete_per_surface_shape_is_rejected_fail_closed(monkeypatch):
+    """AC5 fix_delta (OWNER REQUEST_CHANGES on PR #2548, 2026-09-06): a
+    *successful* (right schema/version/surface-key-set/exit-code 0) result
+    whose per-surface payload is missing `reachable_files`/`unknown_impact`
+    entirely (e.g. `{"surfaces": {"fixture": {}}}`) must never be silently
+    converted into "fully resolved, zero impact" fallback success -- it must
+    raise the same RegistryError fail-closed path as any other malformed
+    resolver output. subprocess.run is monkeypatched (never spawns Node) so
+    this stays fully Node-independent while still exercising the real
+    production validation code path (`_validate_mjs_success_result`)."""
+
+    def _fake_subprocess_run(cmd, input=None, capture_output=None, text=None, check=None, timeout=None):
+        del cmd, input, capture_output, text, check, timeout
+        payload = {
+            "schema": "RESOLVE_VISUAL_IMPACT_MJS_RESULT_V1",
+            "resolver_version": "1",
+            "surfaces": {"fixture": {}},
+            "errors": [],
+            "unsupported_resolution_settings": ["alias configured"],
+        }
+        return _FakeCompletedProcess(0, json.dumps(payload))
+
+    monkeypatch.setattr(rvi.subprocess, "run", _fake_subprocess_run)
+
+    with pytest.raises(rvi.RegistryError, match="reachable_files"):
+        rvi.run_mjs(MJS_PATH, {"repo_root": ".", "surfaces": {"fixture": {}}})
+
+
+def test_ac5_mjs_unknown_impact_entry_missing_required_field_is_rejected_fail_closed(monkeypatch):
+    """AC5 fix_delta: a per-surface `unknown_impact` entry missing one of
+    its required string fields (file/kind/detail) must also be rejected
+    fail-closed, not silently passed through with a defaulted/missing
+    value."""
+
+    def _fake_subprocess_run(cmd, input=None, capture_output=None, text=None, check=None, timeout=None):
+        del cmd, input, capture_output, text, check, timeout
+        payload = {
+            "schema": "RESOLVE_VISUAL_IMPACT_MJS_RESULT_V1",
+            "resolver_version": "1",
+            "surfaces": {
+                "fixture": {
+                    "reachable_files": [],
+                    "unknown_impact": [{"file": "entry.ts", "kind": "import_meta_glob"}],  # missing "detail"
+                }
+            },
+            "errors": [],
+            "unsupported_resolution_settings": [],
+        }
+        return _FakeCompletedProcess(0, json.dumps(payload))
+
+    monkeypatch.setattr(rvi.subprocess, "run", _fake_subprocess_run)
+
+    with pytest.raises(rvi.RegistryError, match="unknown_impact entry"):
+        rvi.run_mjs(MJS_PATH, {"repo_root": ".", "surfaces": {"fixture": {}}})

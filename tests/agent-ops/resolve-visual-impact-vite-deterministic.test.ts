@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { execFileSync } from 'node:child_process'
-import { resolve } from 'node:path'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 
 /**
  * Issue #2019 AC6: resolve_visual_impact.mjs (TypeScript compiler API)
@@ -93,5 +95,211 @@ describe('resolve_visual_impact.mjs detectUnsupportedResolutionSettings() (Issue
   it('GIVEN the real top-level repo config (no unsupported resolution settings configured) WHEN resolved THEN unsupported_resolution_settings stays empty (no false positive regression)', () => {
     const result = runMjs([FIXTURE_ENTRY])
     expect(result.unsupported_resolution_settings).toEqual([])
+  })
+})
+
+/**
+ * Issue #2525 fix_delta (P1-A/P1-B/P1-C, OWNER REQUEST_CHANGES on PR #2548,
+ * 2026-09-06): regression coverage for the AST-based (never regex/comment-
+ * stripping-based) structural analysis of vite.config.* and tsconfig.json
+ * `extends` chains. Each scenario writes a throwaway `repo_root` under the
+ * OS tmpdir (never a new checked-in fixture file, staying within this
+ * Issue's frozen Allowed Paths list) and invokes the real .mjs subprocess
+ * directly against it.
+ */
+function writeTmpRepo(files: Record<string, string>): string {
+  const dir = mkdtempSync(join(tmpdir(), 'rvi-fixdelta-'))
+  for (const [relPath, content] of Object.entries(files)) {
+    const abs = join(dir, relPath)
+    mkdirSync(dirname(abs), { recursive: true })
+    writeFileSync(abs, content, 'utf8')
+  }
+  return dir
+}
+
+describe('resolve_visual_impact.mjs P1-A: AST-based (never regex-based) Vite config comment/string handling (Issue #2525 fix_delta)', () => {
+  it('GIVEN resolve.alias on the SAME line as a string literal containing "//" (a URL) WHEN resolved THEN resolve.alias is still detected (not silently truncated by comment-stripping)', () => {
+    const dir = writeTmpRepo({
+      'vite.config.ts': [
+        "import { defineConfig } from 'vite'",
+        '',
+        "export default defineConfig({ base: 'https://example.test/', resolve: { alias: { '@app': '/tmp/src/model' } } })",
+        '',
+      ].join('\n'),
+    })
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      const joined = result.unsupported_resolution_settings.join('\n')
+      expect(joined).toMatch(/vite\.config\.ts.*resolve\.alias/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN the ONLY occurrence of "resolve:" is inside a `//` comment WHEN resolved THEN it is NOT falsely detected as a real resolve config', () => {
+    const dir = writeTmpRepo({
+      'vite.config.ts': [
+        "// resolve: { alias: { '@app': '/x' } } -- this is only a comment",
+        "import { defineConfig } from 'vite'",
+        '',
+        "export default defineConfig({ base: '/x' })",
+        '',
+      ].join('\n'),
+    })
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      expect(result.unsupported_resolution_settings).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('resolve_visual_impact.mjs P1-B: structural (never regex) detection of ordinary Vite object syntax (Issue #2525 fix_delta)', () => {
+  it('GIVEN a shorthand `{ resolve }` property (imported from another file, no literal "resolve:" text) WHEN resolved THEN it is reported as an unsupported-resolution diagnostic', () => {
+    const dir = writeTmpRepo({
+      'shared.ts': "export const resolve = { alias: { '@app': '/absolute/path/to/src/model' } }\n",
+      'vite.config.ts': [
+        "import { defineConfig } from 'vite'",
+        "import { resolve } from './shared'",
+        '',
+        'export default defineConfig({ resolve })',
+        '',
+      ].join('\n'),
+    })
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      const joined = result.unsupported_resolution_settings.join('\n')
+      expect(joined).toMatch(/vite\.config\.ts.*"resolve".*shorthand/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN a top-level spread `export default { ...sharedConfig }` (no literal "resolve" key visible) WHEN resolved THEN it is reported as an unsupported-resolution diagnostic (cannot prove absence of resolve)', () => {
+    const dir = writeTmpRepo({
+      'shared-config.ts': "export const sharedConfig = { base: '/x' }\n",
+      'vite.config.ts': [
+        "import { sharedConfig } from './shared-config'",
+        '',
+        'export default { ...sharedConfig }',
+        '',
+      ].join('\n'),
+    })
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      const joined = result.unsupported_resolution_settings.join('\n')
+      expect(joined).toMatch(/vite\.config\.ts config object spreads an externally-defined value/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN a quoted property name `{ \'resolve\': sharedResolve }` referencing an external identifier WHEN resolved THEN it is reported as an unsupported-resolution diagnostic', () => {
+    const dir = writeTmpRepo({
+      'shared-resolve.ts': "export const sharedResolve = { alias: { '@app': '/x' } }\n",
+      'vite.config.ts': [
+        "import { sharedResolve } from './shared-resolve'",
+        '',
+        "export default { 'resolve': sharedResolve }",
+        '',
+      ].join('\n'),
+    })
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      const joined = result.unsupported_resolution_settings.join('\n')
+      expect(joined).toMatch(/vite\.config\.ts.*resolve.*externally-defined/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN `resolve: { ... sharedResolve }` (a spread WITH a space after "...") WHEN resolved THEN it is still reported as an unsupported-resolution diagnostic', () => {
+    const dir = writeTmpRepo({
+      'shared-resolve.ts': "export const sharedResolve = { alias: { '@app': '/x' } }\n",
+      'vite.config.ts': [
+        "import { defineConfig } from 'vite'",
+        "import { sharedResolve } from './shared-resolve'",
+        '',
+        'export default defineConfig({ resolve: { ... sharedResolve } })',
+        '',
+      ].join('\n'),
+    })
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      const joined = result.unsupported_resolution_settings.join('\n')
+      expect(joined).toMatch(/vite\.config\.ts "resolve" field spreads an externally-defined value/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('resolve_visual_impact.mjs P1-C: tsconfig `extends` array + search-depth exhaustion (Issue #2525 fix_delta)', () => {
+  it('GIVEN array-form `extends` WHERE only the referenced target carries `paths` WHEN resolved THEN it is reported as an unsupported-resolution diagnostic', () => {
+    const dir = writeTmpRepo({
+      'tsconfig.json': JSON.stringify({ extends: ['./tsconfig.a.json', './tsconfig.b.json'] }),
+      'tsconfig.a.json': JSON.stringify({}),
+      'tsconfig.b.json': JSON.stringify({ compilerOptions: { paths: { '@x/*': ['./*'] } } }),
+    })
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      const joined = result.unsupported_resolution_settings.join('\n')
+      expect(joined).toMatch(/tsconfig\.b\.json compilerOptions\.paths/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN array-form `extends` WHERE only the referenced target carries `baseUrl` WHEN resolved THEN it is reported as an unsupported-resolution diagnostic', () => {
+    const dir = writeTmpRepo({
+      'tsconfig.json': JSON.stringify({ extends: ['./tsconfig.a.json', './tsconfig.b.json'] }),
+      'tsconfig.a.json': JSON.stringify({}),
+      'tsconfig.b.json': JSON.stringify({ compilerOptions: { baseUrl: '.' } }),
+    })
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      const joined = result.unsupported_resolution_settings.join('\n')
+      expect(joined).toMatch(/tsconfig\.b\.json compilerOptions\.baseUrl/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN an unsupported setting exists ONLY past the current MAX_EXTENDS_DEPTH search-depth limit (a 9-level-deep chain) WHEN resolved THEN a "could not be fully explored" diagnostic fires -- never a clean pass', () => {
+    // tsconfig.json (depth 0) -> level1.json (depth 1) -> ... -> level8.json
+    // (depth 8). MAX_EXTENDS_DEPTH is 8 (depths 0..7 are read; depth 8 is
+    // never visited) -- level8.json is the ONLY config with `paths` set, so
+    // a clean pass here would prove the truncation guard is not wired up.
+    const DEPTH = 8
+    const files: Record<string, string> = {
+      'tsconfig.json': JSON.stringify({ extends: './level1.json' }),
+    }
+    for (let i = 1; i < DEPTH; i += 1) {
+      files[`level${i}.json`] = JSON.stringify({ extends: `./level${i + 1}.json` })
+    }
+    files[`level${DEPTH}.json`] = JSON.stringify({ compilerOptions: { paths: { '@x/*': ['./*'] } } })
+
+    const dir = writeTmpRepo(files)
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      const joined = result.unsupported_resolution_settings.join('\n')
+      // The truncation diagnostic must fire (never a silent clean pass)...
+      expect(joined).toMatch(/could not be fully explored within the search-depth limit/)
+      // ...and the deepest config's own `paths` (beyond the search limit)
+      // must NOT be the source of a clean-looking pass either.
+      expect(joined).not.toMatch(new RegExp(`level${DEPTH}\\.json compilerOptions\\.paths`))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

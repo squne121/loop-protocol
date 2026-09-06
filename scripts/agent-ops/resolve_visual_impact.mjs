@@ -325,35 +325,62 @@ function resolveTsconfigExtendsCandidate(baseDir, extendsSpecifier) {
   return candidate
 }
 
+/** `tsconfig.json`'s `extends` can be a single string OR (TypeScript >=5.0)
+ * an array of strings; both are walked identically. Non-string / empty
+ * entries are dropped defensively (malformed input is caught separately by
+ * `ts.parseConfigFileTextToJson`'s own diagnostics upstream, not here). */
+function normalizeExtendsList(extendsValue) {
+  if (typeof extendsValue === 'string' && extendsValue !== '') return [extendsValue]
+  if (Array.isArray(extendsValue)) return extendsValue.filter((v) => typeof v === 'string' && v !== '')
+  return []
+}
+
 /** PR #2045 OWNER fix_delta P1-1 originally checked ONLY the root
- * tsconfig.json's own `compilerOptions.paths`/`baseUrl`. Issue #2525: a
- * root tsconfig with no `compilerOptions` of its own that `extends` a base
- * config which DOES configure `paths`/`baseUrl` was invisible to that
- * check -- those inherited settings apply to the exact same bare-import
- * resolution this walker cannot support, so the `extends` chain must be
- * walked too (bounded depth against a cyclic/malformed chain; never
- * executes any config file -- text/JSON parsing only). */
+ * tsconfig.json's own `compilerOptions.paths`/`baseUrl`. Issue #2525 P1-C:
+ * `extends` (single string OR array, TS >=5.0) is walked as a DFS with an
+ * explicit ancestry stack per branch -- a true cycle (a config that
+ * transitively extends itself along ONE chain) is detected and terminated
+ * safely; a config reached a second time via a DIFFERENT branch (diamond
+ * inheritance, e.g. two array entries that both extend a shared base) is
+ * simply skipped the second time (its paths/baseUrl were already reported
+ * on first visit) rather than misreported as a cycle. The walk is bounded
+ * by `MAX_EXTENDS_DEPTH` per branch; when that bound is hit while a branch
+ * still has an unexplored config to visit, this is reported as its OWN
+ * diagnostic (never silently treated as "search completed, no problems") --
+ * a config beyond the bound could configure paths/baseUrl this walker never
+ * saw. A non-relative / otherwise unresolvable `extends` target (bare
+ * package-name style extends, or a path that does not resolve to a file) is
+ * likewise reported rather than silently skipped. Never executes any config
+ * file -- text/JSON parsing only. */
 function detectTsconfigChainProblems(repoRoot) {
   const problems = []
   const rootPath = path.join(repoRoot, 'tsconfig.json')
   if (!existsSync(rootPath)) return problems
 
-  const visited = new Set()
-  let currentPath = rootPath
   const MAX_EXTENDS_DEPTH = 8
+  // Files already fully processed via ANY branch -- prevents duplicate
+  // diagnostics (and mis-detected "cycles") on diamond inheritance shapes.
+  const globallyVisited = new Set()
 
-  for (let depth = 0; currentPath && depth < MAX_EXTENDS_DEPTH; depth += 1) {
-    if (visited.has(currentPath)) {
+  function walk(currentPath, depth, ancestryStack) {
+    if (ancestryStack.includes(currentPath)) {
       problems.push(
         `tsconfig extends chain starting at ${toPosix(path.relative(repoRoot, rootPath))} contains a cycle at ${currentPath} -- refusing to assume no paths/baseUrl are configured`,
       )
-      break
+      return
     }
-    visited.add(currentPath)
+    if (depth >= MAX_EXTENDS_DEPTH) {
+      problems.push(
+        `tsconfig extends chain starting at ${toPosix(path.relative(repoRoot, rootPath))} could not be fully explored within the search-depth limit (${MAX_EXTENDS_DEPTH}) -- ${currentPath} (and any further inheritance from it) was never visited -- refusing to assume no paths/baseUrl are configured`,
+      )
+      return
+    }
+    if (globallyVisited.has(currentPath)) return
+    globallyVisited.add(currentPath)
 
     if (!existsSync(currentPath)) {
       problems.push(`tsconfig extends chain references a file that does not exist: ${currentPath}`)
-      break
+      return
     }
 
     let raw
@@ -361,7 +388,7 @@ function detectTsconfigChainProblems(repoRoot) {
       raw = readFileSync(currentPath, 'utf8')
     } catch (err) {
       problems.push(`${currentPath} read failure: ${String(err)}`)
-      break
+      return
     }
 
     const parsed = ts.parseConfigFileTextToJson(currentPath, raw)
@@ -369,7 +396,7 @@ function detectTsconfigChainProblems(repoRoot) {
       problems.push(
         `${currentPath} failed to parse (${ts.flattenDiagnosticMessageText(parsed.error.messageText, ' ')}) -- refusing to assume no paths/baseUrl are configured`,
       )
-      break
+      return
     }
 
     const config = parsed.config || {}
@@ -382,63 +409,208 @@ function detectTsconfigChainProblems(repoRoot) {
       problems.push(`${relCurrent} compilerOptions.baseUrl is configured but not supported by this bare-import resolver`)
     }
 
-    if (typeof config.extends === 'string' && config.extends !== '') {
-      const nextPath = resolveTsconfigExtendsCandidate(path.dirname(currentPath), config.extends)
+    const nextAncestryStack = [...ancestryStack, currentPath]
+    for (const extendsSpecifier of normalizeExtendsList(config.extends)) {
+      const nextPath = resolveTsconfigExtendsCandidate(path.dirname(currentPath), extendsSpecifier)
       if (!nextPath) {
         problems.push(
-          `${relCurrent} extends a non-relative specifier (${config.extends}) that this bare-import resolver cannot safely resolve`,
+          `${relCurrent} extends a non-relative specifier (${extendsSpecifier}) that this bare-import resolver cannot safely resolve`,
         )
-        break
+        continue
       }
-      currentPath = nextPath
-    } else {
-      currentPath = null
+      walk(nextPath, depth + 1, nextAncestryStack)
     }
   }
 
+  walk(rootPath, 0, [])
   return problems
 }
 
-/** Strip `//` line comments and `/* *\/` block comments before running any
- * regex-based config text scan below -- otherwise prose in a comment that
- * happens to contain the literal substring `resolve:` (e.g. a comment
- * explaining THIS very guard) can produce a spurious match. Not a full
- * JS/TS tokenizer (a `//`/`/* *\/` sequence embedded inside a string
- * literal would still be stripped) -- acceptable because a false positive
- * here is fail-closed (Runtime Verification Applicability fallback_policy),
- * never a silent false negative. */
-function stripJsComments(text) {
-  return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+/** Issue #2525 P1-A/P1-B fix_delta (OWNER REQUEST_CHANGES on PR #2548,
+ * 2026-09-06): the previous implementation stripped `//`/`/* *\/` comments
+ * with a regex, then scanned the remaining text with a `resolve\s*:` regex.
+ * This does not distinguish string-literal content from real code -- a
+ * config with e.g. `base: 'https://example.test/', resolve: { alias: ... }`
+ * on one line had everything after `https:` deleted by the `//.*$` removal,
+ * silently destroying a real `resolve.alias` before it could be scanned
+ * (a regression versus the pre-comment-stripping detector). It also could
+ * not structurally recognize ordinary object syntax such as a shorthand
+ * property (`{ resolve }`), a quoted property name (`{ 'resolve': ... }`),
+ * or a top-level spread (`{ ...sharedConfig }`) that might itself carry a
+ * `resolve` key.
+ *
+ * Both functions below instead parse the config source with the same
+ * TypeScript compiler API used elsewhere in this file (`ts.createSourceFile`
+ * + AST traversal) and walk the exported config object EXPRESSION
+ * structurally. Comments are parser trivia and are never visited by
+ * `sourceFile.statements/properties` traversal, so a comment containing the
+ * literal text "resolve:" can never produce a match, and a string literal
+ * (however it is punctuated) is tokenized correctly by the real parser
+ * instead of a regex.
+ *
+ * This is still not a Vite config evaluator: the exported config's shape is
+ * inspected structurally, but a property's VALUE is never executed/
+ * resolved beyond direct object-literal literals. Whenever that structural
+ * walk cannot PROVE the `resolve` field (or the top-level config object
+ * itself) is free of alias/paths-affecting configuration -- an externally
+ * defined identifier, a spread, a computed property name, a non-analyzable
+ * default export shape, etc. -- it is reported as its own
+ * unsupported-resolution problem (routed to the SAME all-registered-
+ * surfaces-affected fallback as a directly-detected `resolve.alias`), never
+ * silently treated as "no config present". A false positive here is
+ * fail-closed (acceptable -- Runtime Verification Applicability
+ * fallback_policy); a false negative would defeat the entire point of this
+ * guard. */
+function tsPropertyNameText(name) {
+  if (ts.isIdentifier(name) || ts.isPrivateIdentifier(name)) return name.text
+  if (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text
+  return null // ComputedPropertyName or another non-statically-readable name
 }
 
-/** Issue #2525 (c): a Vite `resolve` field that is NOT an inline object
- * literal free of spreads (e.g. `resolve: sharedResolveOptions` imported
- * from another file, or `resolve: { ...sharedResolveOptions }`) may still
- * configure `alias`/`dedupe` semantics invisible to the direct-alias text
- * scan below. This module never imports/executes the referenced file to
- * find out -- any such indirection is reported as its own
- * unsupported-resolution problem (fallback), never silently assumed to be
- * alias-free. Conservative text scan only (never executes the config
- * module): a false positive here is fail-closed (acceptable -- Runtime
- * Verification Applicability fallback_policy), a false negative would
- * defeat the entire point of this guard. `viteText` MUST already have
- * comments stripped (see `stripJsComments`). */
-function detectViteIndirectResolveConfig(viteText, candidateRelPath) {
-  const resolveFieldRe = /\bresolve\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\}|[^,{}\n;]+)/
-  const match = resolveFieldRe.exec(viteText)
-  if (!match) return null
-  const value = match[1].trim()
-  if (!value.startsWith('{')) {
-    // `resolve: someIdentifier` / `resolve: someFn(...)` -- an externally
-    // defined or computed value this module never evaluates.
-    return `${candidateRelPath} "resolve" field references an externally-defined or computed value (${JSON.stringify(value)}) that cannot be statically confirmed to be free of alias/paths configuration`
+function unwrapExpression(expr) {
+  let current = expr
+  while (
+    ts.isAsExpression(current) ||
+    ts.isParenthesizedExpression(current) ||
+    ts.isSatisfiesExpression(current) ||
+    ts.isNonNullExpression(current)
+  ) {
+    current = current.expression
   }
-  if (/\.\.\.[A-Za-z_$]/.test(value)) {
-    // `resolve: { ...someSpread, dedupe: [...] }` -- a spread of an
-    // externally-defined object into the resolve config.
-    return `${candidateRelPath} "resolve" field spreads an externally-defined value that cannot be statically confirmed to be free of alias/paths configuration`
+  return current
+}
+
+/** Structural analysis of a `resolve` (or `resolve.alias`/`resolve.dedupe`)
+ * field's VALUE expression. Never executes the config module. */
+function collectResolveValueProblems(valueNode, candidateRelPath, fieldLabel) {
+  const problems = []
+  if (ts.isObjectLiteralExpression(valueNode)) {
+    for (const prop of valueNode.properties) {
+      if (ts.isSpreadAssignment(prop)) {
+        problems.push(
+          `${candidateRelPath} "${fieldLabel}" field spreads an externally-defined value (${prop.expression.getText()}) that cannot be statically confirmed to be free of alias/paths configuration`,
+        )
+        continue
+      }
+      if (ts.isShorthandPropertyAssignment(prop)) {
+        if (prop.name.text === 'alias' || prop.name.text === 'dedupe') {
+          problems.push(
+            `${candidateRelPath} "${fieldLabel}.${prop.name.text}" is configured but not supported by this bare-import resolver`,
+          )
+        }
+        continue
+      }
+      if (
+        ts.isPropertyAssignment(prop) ||
+        ts.isMethodDeclaration(prop) ||
+        ts.isGetAccessor(prop) ||
+        ts.isSetAccessor(prop)
+      ) {
+        const name = tsPropertyNameText(prop.name)
+        if (name === null) {
+          problems.push(
+            `${candidateRelPath} "${fieldLabel}" field has a computed/dynamic property name that cannot be statically confirmed not to be "alias"/"dedupe"`,
+          )
+          continue
+        }
+        if (name === 'alias' || name === 'dedupe') {
+          problems.push(`${candidateRelPath} "${fieldLabel}.${name}" is configured but not supported by this bare-import resolver`)
+        }
+      }
+    }
+    return problems
   }
-  return null
+  // Non-object-literal value (identifier, call expression, conditional,
+  // etc.) -- an externally-defined or computed value this module never
+  // evaluates.
+  problems.push(
+    `${candidateRelPath} "${fieldLabel}" field references an externally-defined or computed value (${JSON.stringify(unwrapExpression(valueNode).getText())}) that cannot be statically confirmed to be free of alias/paths configuration`,
+  )
+  return problems
+}
+
+/** Structural analysis of the exported Vite config object literal's
+ * top-level properties, looking for a `resolve` field by PropertyAssignment
+ * / ShorthandPropertyAssignment / quoted-name PropertyAssignment, and
+ * flagging a top-level SpreadAssignment or computed property name as
+ * undecidable (either could carry a `resolve` key this walker cannot see).
+ * Never executes the config module. */
+function collectConfigObjectResolveProblems(objectLiteral, candidateRelPath) {
+  const problems = []
+  for (const prop of objectLiteral.properties) {
+    if (ts.isSpreadAssignment(prop)) {
+      problems.push(
+        `${candidateRelPath} config object spreads an externally-defined value (${prop.expression.getText()}) that cannot be statically confirmed to be free of a "resolve" field`,
+      )
+      continue
+    }
+    if (ts.isShorthandPropertyAssignment(prop)) {
+      if (prop.name.text === 'resolve') {
+        problems.push(
+          `${candidateRelPath} "resolve" field is a shorthand property referencing an externally-defined value that cannot be statically confirmed to be free of alias/paths configuration`,
+        )
+      }
+      continue
+    }
+    if (ts.isPropertyAssignment(prop)) {
+      const name = tsPropertyNameText(prop.name)
+      if (name === null) {
+        problems.push(
+          `${candidateRelPath} config object has a computed/dynamic property name that cannot be statically confirmed not to be "resolve"`,
+        )
+        continue
+      }
+      if (name !== 'resolve') continue
+      problems.push(...collectResolveValueProblems(prop.initializer, candidateRelPath, 'resolve'))
+    }
+  }
+  return problems
+}
+
+/** Locate `export default {...}` / `export default defineConfig({...})` (or
+ * any other single-call wrapper whose first argument is a static object
+ * literal) and run `collectConfigObjectResolveProblems()` over it. When the
+ * default export's shape cannot be statically reduced to an inspectable
+ * object literal at all (no default export, a bare identifier, a call whose
+ * argument is not itself an object literal, a function-form
+ * `defineConfig((env) => ({...}))`, etc.), this is undecidable -- reported
+ * as its own problem rather than silently treated as "no resolve config
+ * present" (this module does not implement a full Vite config evaluator).
+ * Never executes the config module. */
+function detectViteConfigProblems(viteSourceText, candidateRelPath) {
+  const sourceFile = ts.createSourceFile(candidateRelPath, viteSourceText, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TS)
+
+  let exportExpr = null
+  for (const stmt of sourceFile.statements) {
+    if (ts.isExportAssignment(stmt) && !stmt.isExportEquals) {
+      exportExpr = stmt.expression
+      break
+    }
+  }
+  if (!exportExpr) {
+    return [
+      `${candidateRelPath} has no statically-analyzable "export default" -- cannot confirm absence of a "resolve" field`,
+    ]
+  }
+
+  const expr = unwrapExpression(exportExpr)
+  let configObject = null
+  if (ts.isObjectLiteralExpression(expr)) {
+    configObject = expr
+  } else if (ts.isCallExpression(expr)) {
+    const firstArg = expr.arguments[0]
+    const unwrappedArg = firstArg ? unwrapExpression(firstArg) : null
+    if (unwrappedArg && ts.isObjectLiteralExpression(unwrappedArg)) {
+      configObject = unwrappedArg
+    }
+  }
+  if (!configObject) {
+    return [
+      `${candidateRelPath} "export default" is not a statically-analyzable object literal or defineConfig(...)-style call -- cannot confirm absence of a "resolve" field`,
+    ]
+  }
+
+  return collectConfigObjectResolveProblems(configObject, candidateRelPath)
 }
 
 /** PR #2045 OWNER fix_delta P1-1 / Issue #2525: detect tsconfig
@@ -470,18 +642,10 @@ function detectUnsupportedResolutionSettings(repoRoot) {
       problems.push(`${candidate} read failure: ${String(err)}`)
       continue
     }
-    // Comments stripped first so prose (including this guard's own source
-    // comments) can never produce a spurious match.
-    const viteText = stripJsComments(viteTextRaw)
-    // Conservative text scan only (never executes the config module): a
-    // false positive here is fail-closed (acceptable -- Runtime
-    // Verification Applicability fallback_policy), a false negative would
-    // defeat the entire point of this guard.
-    if (/\bresolve\s*:\s*\{[^}]*\balias\s*:/s.test(viteText) || /\balias\s*:\s*(\{|\[)/.test(viteText)) {
-      problems.push(`${candidate} appears to configure resolve.alias, which is not supported by this bare-import resolver`)
-    }
-    const indirect = detectViteIndirectResolveConfig(viteText, candidate)
-    if (indirect) problems.push(indirect)
+    // Issue #2525 P1-A/P1-B: structural AST-based analysis (see
+    // `detectViteConfigProblems` above) -- never a regex/comment-stripping
+    // text scan (comments are parser trivia and are simply never visited).
+    problems.push(...detectViteConfigProblems(viteTextRaw, candidate))
   }
 
   const packageJsonPath = path.join(repoRoot, 'package.json')
