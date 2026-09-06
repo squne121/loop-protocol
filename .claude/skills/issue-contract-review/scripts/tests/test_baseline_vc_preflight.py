@@ -2695,6 +2695,106 @@ def test_baseline_expect_deferred_is_skipped():
     assert r["decision"] == "go"
 
 
+def test_baseline_expect_fail_existing_file_missing_class_node_id_is_expected_fail():
+    """Issue #2515 AC1: `# baseline-expect: fail` on a pytest VC that references
+    an EXISTING allowed file with a not-yet-created CLASS node-id must override
+    the `existing_file_missing_node_id_noncanonical` heuristic (Issue #1285/
+    #1347) and classify as expected_fail/go, since the author has explicitly
+    declared this baseline-fail is intentional (a new test class being added to
+    this existing file), not an ambiguous/wrong-target VC."""
+    fixture = Path(__file__).parent / "fixtures" / "baseline_expect_fail_existing_file_class_node_id.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    assert r["classification"] == "expected_fail", (
+        f"Expected expected_fail but got {r['classification']} "
+        f"(category={r.get('category')}, decision={r.get('decision')})"
+    )
+    assert r["decision"] == "go", f"Expected go but got {r['decision']}"
+    assert r.get("category") == "existing_file_missing_node_id_declared_fail"
+    assert r.get("annotations", {}).get("baseline_expect") == "fail"
+
+
+def test_baseline_expect_fail_existing_file_missing_function_node_id_is_expected_fail():
+    """Issue #2515 AC3: the same `# baseline-expect: fail` override applies
+    identically to a not-yet-created top-level FUNCTION node-id in an existing
+    file -- the classification does not branch on class vs. function node-ids
+    (neither did the original `existing_file_missing_node_id_noncanonical`
+    heuristic it overrides)."""
+    fixture = Path(__file__).parent / "fixtures" / "baseline_expect_fail_existing_file_function_node_id.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    assert r["classification"] == "expected_fail", (
+        f"Expected expected_fail but got {r['classification']} "
+        f"(category={r.get('category')}, decision={r.get('decision')})"
+    )
+    assert r["decision"] == "go", f"Expected go but got {r['decision']}"
+    assert r.get("category") == "existing_file_missing_node_id_declared_fail"
+    assert r.get("annotations", {}).get("baseline_expect") == "fail"
+
+
+def test_existing_file_missing_class_node_id_without_annotation_still_blocked():
+    """Issue #2515 AC2: WITHOUT a `# baseline-expect: fail` annotation, the exact
+    same existing-file / missing-class-node-id VC shape must keep its
+    pre-existing `existing_file_missing_node_id_noncanonical` / blocked
+    classification unchanged (no regression from the AC1 override)."""
+    fixture = Path(__file__).parent / "fixtures" / "existing_file_missing_class_node_id_no_annotation.md"
+    data = run_preflight(str(fixture))
+    results = data["results"]
+    assert len(results) > 0
+
+    r = results[0]
+    assert r.get("category") == "existing_file_missing_node_id_noncanonical", (
+        f"Expected existing_file_missing_node_id_noncanonical but got "
+        f"category={r.get('category')!r} classification={r.get('classification')!r} "
+        f"decision={r.get('decision')!r}"
+    )
+    assert r["decision"] == "blocked", f"Expected blocked but got {r['decision']}"
+    assert r.get("annotations", {}).get("baseline_expect") is None
+
+
+def test_baseline_expect_fail_existing_file_missing_node_id_e2e_readiness_is_go():
+    """Issue #2515 AC4: production E2E through `contract_readiness_check.py`'s
+    real `run_baseline_vc_preflight()` (execute-mode subprocess supervisor,
+    not a mock) + `map_preflight_result_to_errors()` -- an Issue-body-shaped
+    VC with `# baseline-expect: fail` on an existing-file/missing-class-node-id
+    VC must yield an OVERALL readiness status that is neither `needs_fix` nor
+    `human_judgment` (i.e. this specific VC contributes no readiness error),
+    confirming the AC1 override is wired all the way through to the readiness
+    aggregate, not just the standalone `classify_result()` / CLI layer."""
+    contract_readiness_check_path = (
+        Path(__file__).parent.parent.parent.parent / "issue-contract-review" / "scripts" / "contract_readiness_check.py"
+    )
+    assert contract_readiness_check_path.exists(), (
+        f"contract_readiness_check.py not found at {contract_readiness_check_path}"
+    )
+    sys.path.insert(0, str(contract_readiness_check_path.parent))
+    import contract_readiness_check
+
+    fixture = Path(__file__).parent / "fixtures" / "baseline_expect_fail_existing_file_class_node_id.md"
+    body = fixture.read_text()
+
+    preflight_result, _exit_code = contract_readiness_check.run_baseline_vc_preflight(body)
+    errors, aggregate_status = contract_readiness_check.map_preflight_result_to_errors(preflight_result)
+
+    noncanonical_errors = [
+        e for e in errors if e.get("category") == "existing_file_missing_node_id_noncanonical"
+    ]
+    assert not noncanonical_errors, (
+        f"Expected no existing_file_missing_node_id_noncanonical readiness error "
+        f"once baseline-expect: fail is declared, got: {noncanonical_errors}"
+    )
+    assert aggregate_status not in ("needs_fix", "human_judgment"), (
+        f"Expected non-blocking aggregate readiness status, got {aggregate_status!r} "
+        f"errors={errors!r} preflight_result={preflight_result!r}"
+    )
+
+
 def test_missing_annotation_unexpected_pass_has_hint():
     """Issue #889: annotation absent + exit 0 → unexpected_pass / blocked with missing_annotation hint."""
     fixture = Path(__file__).parent / "fixtures" / "missing_annotation_unexpected_pass.md"
