@@ -1723,11 +1723,21 @@ def test_manifest_v2_provider_jobs_adapter_hands_off_real_monolith_split_asymmet
     assert not any("missing_pair" in err["reason"] for err in split_errors)
 
 
-def _run_set_digest(monolith_ids: list[str], split_ids: list[str]) -> str:
+def compute_run_set_digest(monolith_ids: list[str], split_ids: list[str]) -> str:
     """#2423 AC3: a deterministic `sha256:<hex>` digest of the two arms'
     root run set MEMBERSHIP (never their measured values), so #2424 can
     detect a silent root-set substitution between two receipts claiming
-    the same `experiment_identity`."""
+    the same `experiment_identity`.
+
+    Issue #2424 Finding 3 fix_delta (issue-refinement-loop scope delta
+    review, live Issue #2424 Allowed Paths update): this was previously a
+    leading-underscore private helper (`_run_set_digest`). It is renamed
+    to this public entry point (algorithm unchanged) so #2424's
+    `scripts/ci/build_ci_reliability_assessment_v1.py` can import it and
+    independently re-verify `receipt.run_set_digest` via the real #2423
+    owner algorithm, instead of performing format-only validation. Only
+    the call sites in this module were updated; no digest algorithm or
+    new logic was added (Allowed Paths scope limit)."""
     payload = json.dumps(
         {"monolith": sorted(monolith_ids, key=str), "split": sorted(split_ids, key=str)},
         sort_keys=True,
@@ -1804,7 +1814,7 @@ def build_close_grade_receipt(
     _assert_root_eligible_error_invariant(split_result, split_errors, "split")
 
     evidence_errors = monolith_errors + split_errors
-    run_set_digest = _run_set_digest(monolith_result["workflow_run_ids"], split_result["workflow_run_ids"])
+    run_set_digest = compute_run_set_digest(monolith_result["workflow_run_ids"], split_result["workflow_run_ids"])
 
     if experiment_identity is None:
         experiment_identity = (
