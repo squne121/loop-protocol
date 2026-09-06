@@ -109,6 +109,15 @@ def _real_experiment_run_set_digest(blocks):
     return module.compute_experiment_run_set_digest(module._run_identity_tuples_from_blocks(blocks))
 
 
+def _real_run_set_digest(monolith_ids, split_ids):
+    """Issue #2424 Finding 3 residual-gap closure: computed via the REAL
+    #2423 owner function `compute_run_set_digest` (never re-implemented) so
+    `make_receipt()`'s default `run_set_digest` passes independent
+    owner-algorithm re-verification (`recompute_receipt_run_set_digest`)."""
+    module = builder._load_performance_gate_test_module()
+    return module.compute_run_set_digest(monolith_ids, split_ids)
+
+
 def make_manifest(
     monolith_run_id=100,
     split_run_id=200,
@@ -154,13 +163,22 @@ def make_receipt(
     manifest,
     monolith_ids=None,
     split_ids=None,
-    run_set_digest="sha256:" + "3" * 64,
+    run_set_digest=None,
     experiment_identity=None,
 ):
     if monolith_ids is None:
         monolith_ids = sorted(builder.manifest_run_ids_for_layout(manifest, "monolith"))
     if split_ids is None:
         split_ids = sorted(builder.manifest_run_ids_for_layout(manifest, "split"))
+    # Issue #2424 Finding 3 residual-gap closure: default `run_set_digest`
+    # is now the REAL #2423 owner-algorithm value (computed from this
+    # receipt's own `monolith_ids`/`split_ids`) so ordinary fixtures pass
+    # independent owner-algorithm re-verification
+    # (`recompute_receipt_run_set_digest`) without every call site needing
+    # to know the algorithm. Callers that want to test a deliberately WRONG
+    # digest still pass an explicit `run_set_digest=` override.
+    if run_set_digest is None:
+        run_set_digest = _real_run_set_digest(monolith_ids, split_ids)
     resolved_identity = experiment_identity if experiment_identity is not None else manifest["experiment_identity"]
     return {
         "schema": "CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1",
@@ -295,10 +313,12 @@ def test_rejects_non_exact_manifest_and_canonical_run_set_binding(tmp_path):
     assert any("exact_run_set_membership_mismatch" in e for e in diagnostic["errors"])
 
     # #2422 experiment_run_set_digest and #2423 run_set_digest are SEPARATE
-    # owner algorithms -- differing digest STRINGS must never by themselves
-    # cause a rejection as long as expanded workflow_run_id membership is
-    # exactly equal.
-    non_digest_equal_receipt = make_receipt(manifest, run_set_digest="sha256:" + "9" * 64)
+    # owner algorithms over separate inputs -- a CORRECTLY owner-recomputed
+    # `run_set_digest` need not string-equal manifest's
+    # `experiment_run_set_digest` as long as expanded workflow_run_id
+    # membership is exactly equal (make_receipt()'s default `run_set_digest`
+    # is the real #2423 owner-algorithm value; see `_real_run_set_digest`).
+    non_digest_equal_receipt = make_receipt(manifest)
     assert non_digest_equal_receipt["run_set_digest"] != manifest["experiment_run_set_digest"]
     envelope2, diagnostic2 = builder.build_composite_envelope(
         manifest, non_digest_equal_receipt, workflow_evidence, loader
@@ -806,14 +826,44 @@ def test_run_set_digest_format_validation_rejects_malformed_value():
 
 def test_differing_but_well_formed_run_set_digests_are_still_accepted_no_string_equality():
     """Pinning Finding 3's explicit non-goal: two DIFFERENT well-formed
-    digests (#2422 vs #2423, separate owner algorithms) must never be
-    rejected by string-equality alone -- only exact run-id MEMBERSHIP
-    (`verify_exact_run_set_binding`) is authoritative."""
+    digests (#2422 vs #2423, separate owner algorithms/inputs) must never
+    be rejected by CROSS-digest string-equality alone -- only exact run-id
+    MEMBERSHIP (`verify_exact_run_set_binding`) binds the two contracts
+    together. `receipt.run_set_digest` itself IS independently
+    owner-algorithm re-verified against the receipt's own arms (see
+    `test_owner_algorithm_reverification_rejects_tampered_receipt_run_set_digest`
+    below for the negative case)."""
     manifest = make_manifest()
-    receipt = make_receipt(manifest, run_set_digest="sha256:" + "e" * 64)
+    receipt = make_receipt(manifest)
     assert receipt["run_set_digest"] != manifest["experiment_run_set_digest"]
     errors = builder.verify_prerequisites_available(manifest, receipt)
     assert not any("run_set_digest" in e for e in errors), errors
+
+
+def test_owner_algorithm_reverification_accepts_the_real_computed_run_set_digest():
+    """Issue #2424 Finding 3 residual-gap closure (positive case): a
+    `receipt.run_set_digest` that IS the real #2423 owner-algorithm value
+    for the receipt's own `arms.{monolith,split}.workflow_run_ids` passes
+    independent re-verification (no `run_set_digest` error)."""
+    manifest = make_manifest()
+    receipt = make_receipt(manifest, monolith_ids=[301, 302], split_ids=[401, 402])
+    receipt["run_set_digest"] = _real_run_set_digest([301, 302], [401, 402])
+    errors = builder.verify_prerequisites_available(manifest, receipt)
+    assert not any("run_set_digest" in e for e in errors), errors
+
+
+def test_owner_algorithm_reverification_rejects_tampered_receipt_run_set_digest():
+    """Issue #2424 Finding 3 residual-gap closure (negative case):
+    `receipt.run_set_digest` is now independently re-verified via the real
+    #2423 owner algorithm (`compute_run_set_digest`), not format validation
+    alone -- a well-formed but INCORRECT digest (does not match the
+    receipt's own `arms.{monolith,split}.workflow_run_ids` under owner
+    recomputation) must be rejected."""
+    manifest = make_manifest()
+    receipt = make_receipt(manifest)
+    receipt["run_set_digest"] = "sha256:" + "9" * 64  # well-formed but WRONG
+    errors = builder.verify_prerequisites_available(manifest, receipt)
+    assert any("prerequisite_run_set_digest_mismatch" in e for e in errors), errors
 
 
 # --------------------------------------------------------------------------- #

@@ -103,6 +103,15 @@ def _real_experiment_run_set_digest(blocks):
     return module.compute_experiment_run_set_digest(module._run_identity_tuples_from_blocks(blocks))
 
 
+def _real_run_set_digest(monolith_ids, split_ids):
+    """Issue #2424 Finding 3 residual-gap closure: computed via the REAL
+    #2423 owner function `compute_run_set_digest` (never re-implemented) so
+    `_make_receipt()`'s `run_set_digest` passes independent owner-algorithm
+    re-verification (`recompute_receipt_run_set_digest`)."""
+    module = builder._load_performance_gate_test_module()
+    return module.compute_run_set_digest(monolith_ids, split_ids)
+
+
 def _make_manifest(monolith_ids, split_ids, expected_test_count=2):
     """Issue #2424 Finding 1 fix_delta: one BLOCK per matched
     `(monolith_id, split_id)` pair, each with EXACTLY 2 runs (`[monolith,
@@ -144,15 +153,20 @@ def _make_manifest(monolith_ids, split_ids, expected_test_count=2):
 
 
 def _make_receipt(manifest):
+    monolith_ids = sorted(builder.manifest_run_ids_for_layout(manifest, "monolith"))
+    split_ids = sorted(builder.manifest_run_ids_for_layout(manifest, "split"))
     return {
         "schema": "CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1",
         "experiment_identity": manifest["experiment_identity"],
         "manifest_sha256": "sha256:" + "4" * 64,
-        "run_set_digest": "sha256:" + "3" * 64,
+        # Issue #2424 Finding 3 residual-gap closure: real #2423
+        # owner-algorithm value (not a placeholder) so this fixture passes
+        # independent owner-algorithm re-verification.
+        "run_set_digest": _real_run_set_digest(monolith_ids, split_ids),
         "materialization_policy": "root_run_set_exhaustive_partition",
         "arms": {
-            "monolith": {"workflow_run_ids": sorted(builder.manifest_run_ids_for_layout(manifest, "monolith"))},
-            "split": {"workflow_run_ids": sorted(builder.manifest_run_ids_for_layout(manifest, "split"))},
+            "monolith": {"workflow_run_ids": monolith_ids},
+            "split": {"workflow_run_ids": split_ids},
         },
         "evidence_errors": [],
     }

@@ -78,20 +78,36 @@ DEFAULT_VALIDATOR_PATH = os.path.normpath(
 # from a manifest dict is `validate_manifest_v2_semantics` in
 # `collect_e2e_performance_benchmark.py` -- reused here via file-path import
 # (never copy/re-implemented) so this module never invents a competing
-# digest algorithm. No equivalent public/importable production entry point
-# exists for #2423's `receipt.run_set_digest` (the only implementation,
-# `_run_set_digest`, is a leading-underscore private helper embedded in
-# `tests/ci/test_ci_performance_gate.py`, a test file outside this Issue's
-# Allowed Paths, and importing it would also violate this module's own AC1
-# "never import #2423's internal functions" contract) -- `receipt.
-# run_set_digest` therefore still receives ONLY format validation below
-# (see `verify_prerequisites_available`), not owner-algorithm
-# recomputation. This residual gap is reported to the root control-plane
-# per Finding 3's "重要" escalation clause rather than silently duplicated.
+# digest algorithm.
+#
+# Issue #2424 Finding 3 residual-gap closure (issue-refinement-loop scope
+# delta review, live Issue #2424 Allowed Paths update +
+# `tests/ci/test_ci_performance_gate.py` AC1 clarification note): #2423's
+# `receipt.run_set_digest` algorithm previously had no public/importable
+# production entry point (`_run_set_digest` was a leading-underscore
+# private helper). That helper has since been renamed (algorithm
+# unchanged) to the public `compute_run_set_digest` in
+# `tests/ci/test_ci_performance_gate.py`, which the live Issue body's AC1
+# clarification explicitly authorizes this module to import and use for
+# independent owner-algorithm re-verification of `receipt.run_set_digest`
+# (this is importing an owner-side PUBLIC function, not re-implementing or
+# duplicating #2423's digest algorithm).
 _COLLECT_E2E_MODULE_PATH = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "collect_e2e_performance_benchmark.py")
 )
 _collect_e2e_module = None
+
+_PERFORMANCE_GATE_TEST_MODULE_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "..",
+        "tests",
+        "ci",
+        "test_ci_performance_gate.py",
+    )
+)
+_performance_gate_test_module = None
 
 
 def _load_collect_e2e_performance_benchmark_module():
@@ -108,6 +124,25 @@ def _load_collect_e2e_performance_benchmark_module():
     return _collect_e2e_module
 
 
+def _load_performance_gate_test_module():
+    """Loads #2423's owner module (`tests/ci/test_ci_performance_gate.py`)
+    via file-path import (mirroring `_load_collect_e2e_performance_
+    benchmark_module` above), so this module can call its public
+    `compute_run_set_digest` entry point without re-implementing #2423's
+    digest algorithm."""
+    global _performance_gate_test_module
+    if _performance_gate_test_module is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "ci_performance_gate_owner", _PERFORMANCE_GATE_TEST_MODULE_PATH
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _performance_gate_test_module = module
+    return _performance_gate_test_module
+
+
 def verify_manifest_v2_owner_semantics(manifest: dict[str, Any]) -> list[str]:
     """Issue #2424 Finding 3 (AC1): independently re-verifies `manifest`
     (including a recomputation of `experiment_run_set_digest`) via the real
@@ -117,6 +152,18 @@ def verify_manifest_v2_owner_semantics(manifest: dict[str, Any]) -> list[str]:
     self-consistent under #2422's own semantics)."""
     module = _load_collect_e2e_performance_benchmark_module()
     return list(module.validate_manifest_v2_semantics(manifest))
+
+
+def recompute_receipt_run_set_digest(receipt: dict[str, Any]) -> str:
+    """Issue #2424 Finding 3 residual-gap closure (AC1): independently
+    recomputes #2423's `receipt.run_set_digest` from
+    `receipt.arms.{monolith,split}.workflow_run_ids` via the real #2423
+    owner function `compute_run_set_digest` -- never a re-implementation
+    of that algorithm."""
+    module = _load_performance_gate_test_module()
+    monolith_ids = receipt.get("arms", {}).get("monolith", {}).get("workflow_run_ids", [])
+    split_ids = receipt.get("arms", {}).get("split", {}).get("workflow_run_ids", [])
+    return module.compute_run_set_digest(monolith_ids, split_ids)
 
 
 _SHA256_DIGEST_PATTERN_RE = None
@@ -308,19 +355,32 @@ def verify_prerequisites_available(
                     "prerequisite_manifest_sha256_mismatch: "
                     f"receipt={receipt['manifest_sha256']!r} recomputed={recomputed!r}"
                 )
-        # Issue #2424 Finding 3 fix_delta ("重要" residual gap, reported to
-        # root control-plane): no owner-side PUBLIC verification entry point
-        # exists for #2423's `receipt.run_set_digest` algorithm (see the
-        # module-level comment above `_load_collect_e2e_performance_
-        # benchmark_module`) -- this module never invents/duplicates that
-        # algorithm. Format validation only (rejects a structurally
-        # malformed digest); the ACTUAL correctness of the run-set
-        # membership this digest claims to identify is independently
-        # guaranteed by `verify_exact_run_set_binding`'s direct membership
-        # comparison against the manifest (never by trusting this digest).
+        # Issue #2424 Finding 3 residual-gap closure (issue-refinement-loop
+        # scope delta review): `receipt.run_set_digest` is now independently
+        # re-verified via the real #2423 owner algorithm
+        # (`compute_run_set_digest`, see `recompute_receipt_run_set_digest`
+        # above), not format validation alone. The ACTUAL correctness of the
+        # run-set membership this digest claims to identify is ALSO
+        # independently guaranteed by `verify_exact_run_set_binding`'s
+        # direct membership comparison against the manifest (defense in
+        # depth -- neither check alone is trusted as sufficient).
         raw_run_set_digest = receipt.get("run_set_digest")
-        if "run_set_digest" in receipt and not is_well_formed_sha256_digest(raw_run_set_digest):
-            errors.append(f"prerequisite_incomplete: receipt.run_set_digest_malformed: {raw_run_set_digest!r}")
+        if "run_set_digest" in receipt:
+            if not is_well_formed_sha256_digest(raw_run_set_digest):
+                errors.append(f"prerequisite_incomplete: receipt.run_set_digest_malformed: {raw_run_set_digest!r}")
+            elif isinstance(receipt.get("arms"), dict) and all(
+                layout in receipt["arms"] for layout in ("monolith", "split")
+            ):
+                try:
+                    recomputed_run_set_digest = recompute_receipt_run_set_digest(receipt)
+                except Exception as exc:  # pragma: no cover -- operational failure only
+                    errors.append(f"run_set_digest_owner_recomputation_operational_error: {exc}")
+                else:
+                    if raw_run_set_digest != recomputed_run_set_digest:
+                        errors.append(
+                            "prerequisite_run_set_digest_mismatch: "
+                            f"receipt={raw_run_set_digest!r} recomputed={recomputed_run_set_digest!r}"
+                        )
     if manifest is not None and receipt is not None and manifest.get("experiment_identity") != receipt.get(
         "experiment_identity"
     ):
