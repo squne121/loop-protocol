@@ -848,6 +848,50 @@ def test_js_mkdir_prefix_symlink_loop_not_misclassified_as_trailing_symlink(tmp_
     assert "syscall=mkdirSync" in stdout, stdout
 
 
+# A chain strictly longer than the common OS symlink-traversal limit
+# (Linux's MAXSYMLINKS is 40); resolving `link_{_NONCIRCULAR_SYMLINK_CHAIN_DEPTH - 1}`
+# therefore always fails with ELOOP even though the chain never revisits a
+# link (unlike the circular loop_a/loop_b fixture used for AC1 above).
+_NONCIRCULAR_SYMLINK_CHAIN_DEPTH = 42
+
+
+def test_js_noncircular_symlink_traversal_limit_eloop_not_misclassified_as_trailing_symlink(
+    tmp_path: Path,
+) -> None:
+    """AC2: a long but strictly non-circular symlink chain (`link_0` ->
+    `real_dir`, `link_1` -> `link_0`, ..., `link_41` -> `link_40`) exceeds
+    the OS symlink-traversal limit and fails at mkdirSync() with ELOOP, even
+    though no link in the chain points back at an earlier one (unlike AC1's
+    circular loop_a/loop_b fixture). The trailing path component itself
+    (`not-yet-created-child`) is not a symlink at all, so the auxiliary
+    lstatSync() diagnostic cannot confirm one either (it must resolve the
+    very same over-long, ELOOP-failing chain to even reach it) -- this must
+    be rejected as the generic `parent_unavailable`, NEVER asserted as
+    `parent_is_symlink`, exactly like the circular-chain case.
+    """
+    base = tmp_path / "noncircular-traversal-limit-base"
+    base.mkdir()
+    real_dir = base / "real_dir"
+    real_dir.mkdir()
+
+    previous = real_dir
+    for i in range(_NONCIRCULAR_SYMLINK_CHAIN_DEPTH):
+        link = base / f"link_{i}"
+        os.symlink(previous, link)
+        previous = link
+    deepest_link = previous
+    target = deepest_link / "not-yet-created-child"
+
+    result = _run_node_prepare_private_parent_dir_seam(target)
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout.strip()
+    assert stdout.startswith("REJECTED:parent_unavailable"), stdout
+    assert "parent_is_symlink" not in stdout, stdout
+    assert "errno=ELOOP" in stdout, stdout
+    assert "syscall=mkdirSync" in stdout, stdout
+
+
 def test_js_mkdir_eloop_on_confirmed_trailing_symlink_still_reports_symlink(tmp_path: Path) -> None:
     """AC3 (mkdirSync path): a self-referencing trailing symlink (the final
     path component IS itself a symlink, here one pointing at itself) also
