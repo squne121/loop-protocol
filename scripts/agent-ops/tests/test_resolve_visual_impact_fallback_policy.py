@@ -247,7 +247,12 @@ def test_ac1_unknown_impact_marks_all_registered_surfaces_affected_not_only_the_
     }
     # Per-entry unknown_impact diagnostics are unchanged/kept.
     assert result.unknown_impact == [
-        {"surface_id": "fixture-surface-a", "file": FIXTURE_ENTRY, "kind": "import_meta_glob", "detail": "import.meta.glob('./**/*.ts')"}
+        {
+            "surface_id": "fixture-surface-a",
+            "file": FIXTURE_ENTRY,
+            "kind": "import_meta_glob",
+            "detail": "import.meta.glob('./**/*.ts')",
+        }
     ]
 
 
@@ -330,7 +335,9 @@ def test_ac1_unknown_impact_alone_never_unconditionally_fails_policy():
     resolve_result = rvi.ResolveResult(
         changed_paths=[FIXTURE_DEPENDENCY],
         affected_surfaces=[],
-        unknown_impact=[{"surface_id": "fixture-surface-a", "file": FIXTURE_ENTRY, "kind": "import_meta_glob", "detail": "x"}],
+        unknown_impact=[
+            {"surface_id": "fixture-surface-a", "file": FIXTURE_ENTRY, "kind": "import_meta_glob", "detail": "x"}
+        ],
         resolver_fallback_active=True,
     )
     policy_result = rvi.evaluate_pr_policy(resolve_result=resolve_result, **_base_policy_kwargs())
@@ -358,7 +365,9 @@ def _fallback_resolve_result() -> "rvi.ResolveResult":
     )
 
 
-def _waiver_declaration_doc(*, tracking_issue: str | None = "123", expiry: str = "2099-01-01", reason: str = "ok") -> dict[str, Any]:
+def _waiver_declaration_doc(
+    *, tracking_issue: str | None = "123", expiry: str = "2099-01-01", reason: str = "ok"
+) -> dict[str, Any]:
     waiver: dict[str, Any] = {"expiry": expiry, "reason": reason}
     if tracking_issue is not None:
         waiver["tracking_issue"] = tracking_issue
