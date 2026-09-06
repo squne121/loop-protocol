@@ -248,17 +248,23 @@ def _git_status_paths(project_root: str) -> set[str]:
 # Issue #2199 In Scope: the 4 production preflight profiles whose child
 # dispatch cwd is migrated to the #2197 dedicated worktree
 # (`execution_root`) by `main()`'s real dispatch-selection logic below.
-# Fixture profiles
-# (`preflight.run.fixture`/`preflight.run.fixture.with_human_context`) and
-# `contract_update.run.with_anchor`/`contract_update.run.with_human_context`
-# are deliberately excluded (AC8 non-regression) -- they remain on the
-# primary root (`canonical_main_root`), unchanged by this Issue.
+# Issue #2393 In Scope: `contract_update.run.with_anchor` /
+# `contract_update.run.with_human_context` (the two contract-update
+# mutation profiles #2199 deliberately excluded) are added to this SAME
+# set, routing their child dispatch through the SAME existing
+# `control_plane_dedicated_execution_session()` parent-controller -- no new
+# re-exec route, command entrypoint, or lock protocol. Fixture profiles
+# (`preflight.run.fixture`/`preflight.run.fixture.with_human_context`)
+# remain deliberately excluded (AC8/#2199 non-regression) -- they stay on
+# the primary root (`canonical_main_root`), unaffected by either Issue.
 PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS = frozenset(
     {
         "preflight.run",
         "preflight.run.with_anchor",
         "preflight.run.with_human_context",
         "preflight.run.with_agent_report",
+        "contract_update.run.with_anchor",
+        "contract_update.run.with_human_context",
     }
 )
 
@@ -2493,11 +2499,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if not is_production_dedicated_command:
         # Fixture profiles (`preflight.run.fixture` /
-        # `preflight.run.fixture.with_human_context`) and
-        # `contract_update.run.with_anchor` / `.with_human_context` --
-        # along with every non-preflight command_id -- are unaffected by
-        # Issue #2199 and keep dispatching at `project_root` exactly as
-        # before (AC8 non-regression).
+        # `preflight.run.fixture.with_human_context`) -- along with every
+        # other command_id not in `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`
+        # -- are unaffected by Issue #2199/#2393 and keep dispatching at
+        # `project_root` exactly as before (AC8/#2199 non-regression).
+        # `contract_update.run.with_anchor`/`.with_human_context` used to be
+        # excluded here too (#2199 AC8); Issue #2393 moved them into
+        # `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`, so they now take the
+        # dedicated-runtime branch below instead of this one.
         return _dispatch_child_and_check_postconditions(
             dispatch_root=project_root,
             issue_number=args.issue_number,
@@ -2508,7 +2517,8 @@ def main(argv: list[str] | None = None) -> int:
             binary_output=binary_output,
         )
 
-    # Issue #2199: the 4 production preflight profiles
+    # Issue #2199/#2393: the 4 production preflight profiles plus the 2
+    # contract_update mutation profiles
     # (`PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`) dispatch their child
     # under the #2197 dedicated worktree (`execution_root`) instead of
     # `project_root`, with the fixed #2198 lifecycle guard held across
@@ -2552,6 +2562,25 @@ def main(argv: list[str] | None = None) -> int:
             # so the child observes the SAME relocated environment this
             # preparation step just readied.
             dedicated_env = dict(env)
+            # Issue #2393 AC4: a caller-supplied relative `GH_CONFIG_DIR`
+            # (carried through by `_sanitize_env()`'s
+            # `gh_config_dir_carrier_command_ids` allowlist, which already
+            # includes both `contract_update.run.*` profiles) is anchored to
+            # the INVOCATION cwd (`project_root` -- `_validate_runtime_context()`
+            # above already required `os.getcwd() == project_root`) BEFORE
+            # the child's own cwd switches to `execution_root` below.
+            # Without this, a relative value would silently resolve against
+            # the WRONG directory once the child's cwd differs from the
+            # invocation cwd (a gap that did not exist before this dispatch
+            # became dedicated-worktree-routed, since dispatch_root ==
+            # project_root == invocation cwd for every non-dedicated
+            # command_id). Generalizes the same anchoring PR #2407 already
+            # relies on for bare `preflight.run`'s dedicated dispatch. An
+            # absolute value is never modified. No token copying, no
+            # config-content reads, no allowlist widening.
+            raw_gh_config_dir = dedicated_env.get("GH_CONFIG_DIR")
+            if raw_gh_config_dir and not os.path.isabs(raw_gh_config_dir):
+                dedicated_env["GH_CONFIG_DIR"] = os.path.realpath(os.path.join(project_root, raw_gh_config_dir))
             # An unmanaged project (`[tool.uv].managed = false`) never
             # triggers `uv`'s own environment sync/`.venv` creation at all
             # (`uv sync`/`uv run` refuse to manage it by design) -- it was

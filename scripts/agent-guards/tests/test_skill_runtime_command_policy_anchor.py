@@ -22,8 +22,11 @@ AGENT_GUARDS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(AGENT_GUARDS_DIR))
 
 from skill_runtime_command_policy import (  # noqa: E402
+    SKILL_RUNTIME_COMMAND_POLICY_V2,
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
+    ExactSkillRuntimeCommand,
+    command_allows_root_no_worktree,
     is_exact_skill_runtime_anchor_executor_command,
     is_exact_skill_runtime_contract_update_anchor_executor_command,
     parse_exact_skill_runtime_anchor_command,
@@ -282,6 +285,48 @@ class TestContractUpdateAnchorExecutorCommand:
         assert not is_exact_skill_runtime_contract_update_anchor_executor_command(
             _contract_update_cmd(), str(tmp_git_repo), str(tmp_git_repo)
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2393 AC2: contract_update.run.with_human_context retains its
+# required human-context argument binding and mutation-lane restrictions
+# (the parser tests above are unaffected by this Issue), while its
+# `network_effect` policy declaration is corrected and its
+# root-no-worktree eligibility is preserved in lock-step.
+# ---------------------------------------------------------------------------
+
+
+class TestContractUpdateNetworkEffectCorrection:
+    @pytest.mark.parametrize(
+        "command_id",
+        ["contract_update.run.with_anchor", "contract_update.run.with_human_context"],
+    )
+    def test_policy_network_effect_is_github_mutation(self, command_id: str):
+        """Issue #2393: both `contract_update.run.*` profiles carry
+        `mutation: True` in `command_registry.py` -- the pre-existing
+        `github_read_only` policy declaration was factually wrong.
+        `validate_registry_entry()` cross-checks this value against the
+        registry's own declaration, so both must agree."""
+        policy = SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"][command_id]
+        assert policy["network_effect"] == "github_mutation"
+
+    @pytest.mark.parametrize(
+        "command_id",
+        ["contract_update.run.with_anchor", "contract_update.run.with_human_context"],
+    )
+    def test_root_no_worktree_eligibility_survives_network_effect_correction(self, command_id: str):
+        """Non-regression: correcting `network_effect` must not silently
+        revoke root-no-worktree eligibility for either contract_update
+        profile -- `command_allows_root_no_worktree()` compares every key
+        (including `network_effect`) in `_ROOT_NO_WORKTREE_POLICY_INVARIANTS`
+        against `eligible_command_ids`, so both tables were updated together."""
+        parsed = ExactSkillRuntimeCommand(
+            command_id=command_id,
+            issue_number="981",
+            repo=TRUSTED_REPO_SLUG,
+            argv=(),
+        )
+        assert command_allows_root_no_worktree(parsed) is True
 
 
 def test_parse_exact_anchor_command_rejects_negative_matrix():

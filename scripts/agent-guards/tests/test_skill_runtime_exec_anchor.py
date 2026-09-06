@@ -20,6 +20,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -474,13 +476,51 @@ print(json.dumps(response))
     gh_path.chmod(0o755)
 
 
-def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path) -> Path:
+def _materialize_dedicated_worktree(repo_root: Path, control_plane_remote_url: str, monkeypatch) -> Path:
+    """Pre-materialize the SAME fixed dedicated worktree the real subprocess
+    dispatch below will reuse (Issue #2393).
+
+    `validate_detached_worktree_path()` fail-closed-rejects creating a
+    worktree at a path that already exists, so fixture data cannot be
+    pre-seeded there until the worktree itself exists -- and the worktree
+    cannot exist before ITS OWN first bootstrap. This performs that SAME
+    `control_plane_dedicated_execution_session()` bootstrap the real
+    subprocess dispatch will later reuse (crash/rerun "same accepted OID ->
+    reuse as-is", `worktree_bootstrap_exec.recover_or_create_fixed_control_plane_worktree()`'s
+    own documented contract), using the SOURCE tree's own module directly
+    (never a reimplementation), monkeypatched to the SAME local bare origin
+    the fixture's own COPIED `skill_runtime_exec.py` was patched to use.
+    """
+    agent_ops_dir = REPO_ROOT / "scripts" / "agent-ops"
+    if str(agent_ops_dir) not in sys.path:
+        sys.path.insert(0, str(agent_ops_dir))
+    import worktree_bootstrap_exec as source_bootstrap_mod  # noqa: E402
+
+    monkeypatch.setattr(source_bootstrap_mod, "CONTROL_PLANE_CANONICAL_REMOTE_URL", control_plane_remote_url)
+    with source_bootstrap_mod.control_plane_dedicated_execution_session(str(repo_root)) as session:
+        return Path(str(session["execution_root"]))
+
+
+def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path) -> str:
     """Install the production wrapper and its direct consumers.
 
     Only GitHub and the controlled mutation executor are replaced.  The
     registry, policy, privileged executor, production preflight wrapper,
     planner, candidate readiness, review, and edit transaction helper all run
     as their production files in the temporary repository.
+
+    Issue #2393: `contract_update.run.with_anchor`/`.with_human_context` are
+    now in `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`, so this fixture must
+    ALSO provide the same dedicated-worktree bootstrap infrastructure
+    `_install_skill_runtime_exec_fixture()` already provides for the 4
+    preflight profiles (`worktree_bootstrap_exec.py`, the REAL
+    `worktree_catalog.py` -- not a `list_worktrees() -> []` stub -- and a
+    real local `file://` bare remote), and a real, committed, pushed
+    repository state for the dedicated worktree to actually check out from
+    (never the real GitHub remote; `network_required: false` is preserved).
+    Returns the local bare origin's `file://` URL so callers can patch
+    `worktree_bootstrap_exec.CONTROL_PLANE_CANONICAL_REMOTE_URL` for
+    in-process pre-materialization (see `_materialize_dedicated_worktree()`).
     """
     source_root = REPO_ROOT
     for skill in (
@@ -504,6 +544,9 @@ def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path)
         "scripts/agent-guards/skill_runtime_command_policy.py",
         "scripts/agent-guards/controlled_skill_mutation_exec.py",
         "scripts/agent-guards/controlled_skill_mutation_policy.py",
+        "scripts/agent-guards/worktree_bootstrap_command_policy.py",
+        "scripts/agent-ops/worktree_bootstrap_exec.py",
+        "scripts/agent-ops/worktree_catalog.py",
     ):
         src = source_root / rel
         _write_text(repo_root / rel, src.read_text())
@@ -518,7 +561,20 @@ def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path)
         "*_SYSTEM_STANDARD_PATH_DIRS])\n"
     )
     assert default_safe_path_return in executor_source
-    _write_text(executor_path, executor_source.replace(default_safe_path_return, fixture_safe_path_return))
+    executor_source = executor_source.replace(default_safe_path_return, fixture_safe_path_return)
+
+    # Issue #2393: mirrors `_install_skill_runtime_exec_fixture()`'s own
+    # `CONTROL_PLANE_CANONICAL_REMOTE_URL` patch -- the dedicated worktree
+    # bootstrap this fixture now exercises must bind against a local,
+    # deterministic bare remote, never the real `https://github.com/...`
+    # production remote.
+    control_plane_origin_path = repo_root.parent / "control-plane-origin.git"
+    control_plane_remote_url = control_plane_origin_path.as_uri()
+    default_remote_line = 'CONTROL_PLANE_CANONICAL_REMOTE_URL = f"https://github.com/{TRUSTED_REPO_SLUG}.git"'
+    assert default_remote_line in executor_source
+    fixture_remote_line = f"CONTROL_PLANE_CANONICAL_REMOTE_URL = {control_plane_remote_url!r}"
+    executor_source = executor_source.replace(default_remote_line, fixture_remote_line)
+    _write_text(executor_path, executor_source)
 
     controlled_executor_path = repo_root / "scripts" / "agent-guards" / "controlled_skill_mutation_exec.py"
     controlled_executor_source = controlled_executor_path.read_text(encoding="utf-8")
@@ -541,23 +597,6 @@ def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path)
     # unrelated `.venv/` write.
     subprocess.run(["uv", "sync", "--locked"], cwd=str(repo_root), check=True, capture_output=True, text=True)
 
-    _write_text(
-        repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
-        """from __future__ import annotations
-
-class Deadline:
-    def subprocess_timeout(self, seconds: float) -> float:
-        return seconds
-
-
-def list_worktrees(project_root: str, deadline=None):
-    return []
-
-
-def select_issue_worktree(catalog, issue_number, root_realpath):
-    return None
-""",
-    )
     # Fixture-only isolated-home read boundary. The production wrapper selects
     # this credentialless adapter before its authenticated transaction phase;
     # it reads only local fake state and never opens GH_CONFIG_DIR.
@@ -714,7 +753,24 @@ subprocess.run = _fake_gh
 subprocess.Popen.__init__ = _fake_popen_init
 """,
     )
-    return
+
+    # Issue #2393: `.venv/` (created by `uv sync --locked` above) must never
+    # be committed -- it is large, non-reproducible, and irrelevant to the
+    # dedicated worktree anyway (a MANAGED uv project's dedicated dispatch
+    # relocates `UV_PROJECT_ENVIRONMENT` outside `execution_root` entirely,
+    # see `dedicated_execution_venv_dir()`). `_make_repo()`'s own
+    # `.gitignore` already covers `.claude/worktrees/`/`artifacts/`/`tmp/`.
+    gitignore_path = repo_root / ".gitignore"
+    gitignore_path.write_text(gitignore_path.read_text(encoding="utf-8") + ".venv/\n", encoding="utf-8")
+
+    # A real, committed, pushed HEAD is required for the dedicated worktree
+    # bootstrap this fixture now exercises (Issue #2393) to check out a real
+    # `accepted_oid` from -- unlike the non-dedicated path, which just reads
+    # whatever is on disk at `repo_root` regardless of commit status.
+    _git("add", "-A", cwd=repo_root)
+    _git("commit", "-q", "-m", "install real contract update fixture", cwd=repo_root)
+    _init_control_plane_origin(repo_root, control_plane_origin_path)
+    return control_plane_remote_url
 
     _write_text(
         repo_root / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "command_registry.py",
@@ -1046,7 +1102,7 @@ def test_executor_preflight_run_unaffected_without_anchor(tmp_path: Path) -> Non
     assert payload["anchor_comment_url"] is None
 
 
-def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_path: Path) -> None:
+def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_path: Path, monkeypatch) -> None:
     """#1877 AC3/AC6/AC10: production process path and fake GitHub boundary.
 
     This runs the real registry, policy, privileged executor,
@@ -1058,15 +1114,22 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     controlled mutation executor runs unchanged apart from a fixture-local
     trusted-path extension; no fixture replaces the phase wrapper or changes
     the production executor's trust policy.
+
+    Issue #2393: both `contract_update.run.*` command_ids now dispatch
+    their child under the SAME dedicated worktree the 4 preflight profiles
+    already use, so this test's artifact/workspace paths live under
+    `execution_root`, not `repo`, once the worktree is pre-materialized
+    (`_materialize_dedicated_worktree()`).
     """
     repo = _make_repo(tmp_path)
     trusted_gh_bin = tmp_path / "trusted-gh-bin"
-    _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
     # Canonical repositories provision this approved transaction-local
     # workspace.  Create it before the executor's before-snapshot; the real
     # consumer removes its candidate/input files before the child returns.
-    (repo / "tmp").mkdir()
-    artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    (execution_root / "tmp").mkdir()
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     isolated_home = tmp_path / "isolated-home"
     isolated_home.mkdir()
@@ -1184,8 +1247,8 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     generic_replay_result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     assert generic_replay_result["contract_update"]["status"] == "failed"
     assert generic_replay_result["contract_update"]["writes"] == 0
-    assert not (repo / "artifacts" / "1498" / "issue-metadata").exists() or len(
-        list((repo / "artifacts" / "1498" / "issue-metadata").rglob("*.input.json"))
+    assert not (execution_root / "artifacts" / "1498" / "issue-metadata").exists() or len(
+        list((execution_root / "artifacts" / "1498" / "issue-metadata").rglob("*.input.json"))
     ) == 1
 
 
@@ -1257,6 +1320,7 @@ def test_anchor_profiles_materialize_only_the_explicit_origin_lane(tmp_path: Pat
 
 def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_real_subprocess(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     """AC1/AC6/P0-3: an approved trusted-anchor ANCHOR_SCOPE_REFRAME_V1 scope
     reframe (not yet reflected in the Issue's Allowed Paths section) reaches
@@ -1265,12 +1329,24 @@ def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_rea
     policy -> privileged executor subprocess -> production
     `run_refinement_preflight.py` -> production `scope_signal_delta.py`
     classifier chain, with ZERO writes and ZERO mutation-executor
-    invocations (full-rewrite handoff, not a mutation attempt)."""
+    invocations (full-rewrite handoff, not a mutation attempt).
+
+    Issue #2393 AC5: this legitimate no-write `handoff_required` /
+    `full_rewrite_required` disposition must reach the caller UNCHANGED now
+    that `contract_update.run.with_anchor` dispatches through the dedicated
+    control-plane runtime -- the outer dedicated-runtime supervision layer
+    (`_dispatch_child_and_check_postconditions`'s before/after checks) never
+    overwrites an already-achieved inner-transaction result; it only ever
+    prints a DIFFERENT failure classification to stderr and returns a
+    different process exit code, never touching the artifact this test reads
+    back below.
+    """
     repo = _make_repo(tmp_path)
     trusted_gh_bin = tmp_path / "trusted-gh-bin"
-    _install_real_contract_update_fixture(repo, trusted_gh_bin)
-    (repo / "tmp").mkdir()
-    artifact_dir = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    (execution_root / "tmp").mkdir()
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     isolated_home = tmp_path / "isolated-home"
     isolated_home.mkdir()
@@ -1354,7 +1430,7 @@ def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_rea
     # mutation executor. Its real marker must therefore be absent, and the
     # fixture-owned gh child may not receive a PATCH argv.
     production_marker_path = (
-        repo
+        execution_root
         / "artifacts"
         / "1498"
         / "issue-metadata"
@@ -1391,3 +1467,184 @@ def test_contract_update_phase_full_rewrite_required_reaches_next_action_via_rea
         else []
     )
     assert "issue_content_patch" not in replay_operations
+
+
+# ---------------------------------------------------------------------------
+# Issue #2393 AC4: a relative GH_CONFIG_DIR resolves to the SAME directory
+# after the dedicated-runtime migration as it did before it (both relative
+# and absolute inputs are covered).
+# ---------------------------------------------------------------------------
+
+
+def test_contract_update_relative_gh_config_dir_resolves_against_invocation_cwd(tmp_path: Path, monkeypatch) -> None:
+    """Issue #2393 AC4: a RELATIVE `GH_CONFIG_DIR` value is anchored to the
+    invocation cwd (`project_root` -- the SAME directory `_run_executor()`
+    passes as both `cwd` and `CLAUDE_PROJECT_DIR`) BEFORE the child's own
+    cwd switches to the dedicated worktree, so it resolves to the SAME
+    directory it would have resolved to under the pre-#2393
+    canonical-main-root-only execution. The ABSOLUTE case is already
+    covered by `test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff`
+    above (its `gh_config_dir` fixture value is an absolute `tmp_path` child
+    and is asserted to reach the fake `gh` unchanged); this reuses that SAME
+    real-`gh`-reaching `contract_update.run.with_human_context` trusted-anchor
+    mutation fixture data, only swapping `GH_CONFIG_DIR` for a RELATIVE
+    value. Both `contract_update.run.*` profiles share the SAME
+    `GH_CONFIG_DIR` resolution code path in `skill_runtime_exec.py` (no
+    command-id branching there), so this single profile's coverage proves
+    the shared logic for both -- `contract_update.run.with_anchor` (no
+    human-context binding) never reaches an authenticated write on a first
+    attempt at all (a separate, pre-existing trust-lane restriction, not
+    something this Issue changes), so it is not a suitable fixture for
+    proving a real-`gh`-reaching mutation."""
+    repo = _make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    (execution_root / "tmp").mkdir()
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    # RELATIVE to `repo` (the invocation cwd) -- never resolved against
+    # `execution_root` (the child's own cwd once dispatched).
+    relative_gh_config_dir = "rel-gh-config"
+    (repo / relative_gh_config_dir).mkdir()
+    expected_absolute_gh_config_dir = str((repo / relative_gh_config_dir).resolve())
+    config_only_env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": relative_gh_config_dir,
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": expected_absolute_gh_config_dir,
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+    }
+    immutable = json.loads(
+        (
+            REPO_ROOT
+            / ".claude/skills/issue-refinement-loop/tests/fixtures/issue_1835_trusted_anchor_iteration_zero.json"
+        ).read_text(encoding="utf-8")
+    )
+    pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    anchor = {
+        "id": 1,
+        "body": "## Revised AC\n- AC2: trusted fixture directive\n",
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
+
+    result = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+        extra_env=config_only_env,
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert "AC2: trusted fixture directive" in json.loads(
+        (artifact_dir / "fake_remote_issue.json").read_text()
+    )["body"]
+    # The fake `gh` (`_write_controlled_gh`) rejects any call whose
+    # `GH_CONFIG_DIR` does not match `SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR`
+    # (exit 66, `missing_or_wrong_config_path`) -- reaching real `gh` reads
+    # AND the successful mutation above proves the RELATIVE value was
+    # correctly resolved to `expected_absolute_gh_config_dir` before the
+    # child's cwd became `execution_root`.
+    operations = [
+        json.loads(line)
+        for line in (artifact_dir / "fake_gh_operations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert operations, result.stdout + result.stderr
+    config_states = [
+        json.loads(line)
+        for line in (artifact_dir / "fake_gh_config_states.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert config_states == ["expected_path"] * len(operations)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2393 AC5: an outer dedicated-runtime supervision failure
+# (timeout / unauthorized-write / artifact-projection / primary-checkout
+# drift) must never overwrite or discard an already-achieved
+# inner-transaction result -- these `_emit_*_failure()` helpers only ever
+# print a stderr classification line and return a process exit code; they
+# never touch the filesystem. This is a direct, subprocess-free unit proof
+# of that invariant against THIS repository's own (dedicated-set-widened)
+# `skill_runtime_exec.py`, complementing the real-subprocess
+# `test_contract_update_phase_full_rewrite_required_reaches_next_action_via_real_subprocess`
+# above (which proves the SAME invariant end-to-end for a real
+# `handoff_required`/`full_rewrite_required`/`writes: 0` disposition).
+# ---------------------------------------------------------------------------
+
+_AGENT_GUARDS_DIR_FOR_UNIT_TEST = REPO_ROOT / "scripts" / "agent-guards"
+if str(_AGENT_GUARDS_DIR_FOR_UNIT_TEST) not in sys.path:
+    sys.path.insert(0, str(_AGENT_GUARDS_DIR_FOR_UNIT_TEST))
+import skill_runtime_exec as _exec_mod_for_unit_test  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "emit_call",
+    [
+        lambda: _exec_mod_for_unit_test._emit_timeout_failure(1498, 120),
+        lambda: _exec_mod_for_unit_test._emit_primary_checkout_drift_failure(1498),
+        lambda: _exec_mod_for_unit_test._emit_unauthorized_write_failure(1498, "some/unexpected/path"),
+        lambda: _exec_mod_for_unit_test._emit_artifact_projection_failure(1498, ["some/stale/path"]),
+    ],
+    ids=["timeout", "primary_checkout_drift", "unauthorized_write", "artifact_projection"],
+)
+def test_outer_failure_emitters_never_touch_an_already_achieved_inner_result(
+    tmp_path: Path, capsys, emit_call
+) -> None:
+    """Issue #2393 AC5: simulates an already-achieved inner-transaction
+    artifact (a real `contract_update` disposition -- `disposition: patch` +
+    `final_readback: verified` + `fresh_review: needs_fix`, mirroring the
+    real fixture above) sitting on disk, then calls each outer-supervision
+    failure emitter and proves: (1) the artifact's bytes are byte-for-byte
+    unchanged, (2) the emitter's own return value is the fail-closed exit
+    code `2`, and (3) nothing is written to stdout (only stderr) -- an
+    outer failure is reported as a DIFFERENT signal, never as a silent
+    overwrite of the inner disposition."""
+    artifact_path = tmp_path / "refinement_preflight_result_v1.json"
+    inner_result = {
+        "contract_update": {
+            "status": "failed",
+            "disposition": "patch",
+            "writes": 1,
+            "iterations": 0,
+            "final_readback": "verified",
+            "fresh_preflight": "pass",
+            "fresh_review": "needs_fix",
+            "fresh_readiness": "go",
+        }
+    }
+    before_bytes = json.dumps(inner_result).encode("utf-8")
+    artifact_path.write_bytes(before_bytes)
+
+    exit_code = emit_call()
+
+    assert exit_code == 2
+    assert artifact_path.read_bytes() == before_bytes
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "SKILL_RUNTIME_FAIL:" in captured.err

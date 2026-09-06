@@ -341,7 +341,14 @@ REGISTRY: dict[str, dict[str, Any]] = {
             ".claude/artifacts/issue-refinement-loop/{active_issue}/",
             "artifacts/{active_issue}/issue-metadata/",
         ],
-        "network_effect": "github_read_only",
+        # Issue #2393 AC-adjacent fix: this profile always carries
+        # `mutation: True` (it writes to GitHub via
+        # `--consume-contract-patch-plan`) -- `github_read_only` was
+        # factually wrong from the moment `mutation: True` was declared.
+        # Corrected in the same change that migrates this profile's
+        # `required_cwd`-adjacent dispatch to the dedicated runtime (Issue
+        # #2393), never a standalone drive-by rename.
+        "network_effect": "github_mutation",
         "stdin_contract": "none",
         "stdout_contract": "refinement_preflight_result/v1",
         "timeout_seconds": 120,
@@ -373,7 +380,9 @@ REGISTRY: dict[str, dict[str, Any]] = {
             ".claude/artifacts/issue-refinement-loop/{active_issue}/",
             "artifacts/{active_issue}/issue-metadata/",
         ],
-        "network_effect": "github_read_only",
+        # Issue #2393: same correction as `contract_update.run.with_anchor`
+        # above -- this profile also carries `mutation: True`.
+        "network_effect": "github_mutation",
         "stdin_contract": "none",
         "stdout_contract": "refinement_preflight_result/v1",
         "timeout_seconds": 120,
