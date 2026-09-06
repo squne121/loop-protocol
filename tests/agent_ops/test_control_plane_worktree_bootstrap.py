@@ -18,10 +18,10 @@ Covers the additive primitives this Issue adds on top of #2196/#2197/#2198:
   post-child checks) on both the success and the exception path, and
   introduces no TTL/lease/daemon/heartbeat/persistent lock broker.
 - AC4/AC8: `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS` is exactly the 4
-  production preflight profiles (fixture profiles and `contract_update.*`
-  are excluded), and `main()`'s real dispatch-selection logic actually
-  selects `cwd=execution_root` (a worktree distinct from the primary root)
-  for them.
+  production preflight profiles plus (Issue #2393) the 2 contract_update
+  mutation profiles (fixture profiles remain excluded), and `main()`'s real
+  dispatch-selection logic actually selects `cwd=execution_root` (a
+  worktree distinct from the primary root) for all 6 of them.
 - AC6/AC7: this Issue does not touch `_sanitize_env()`'s allowlist or
   `command_registry.py`'s REGISTRY argv/`required_cwd` declarations.
 - AC9: the identity probe's `invocation_cwd`/`execution_root` cross-check is
@@ -35,7 +35,10 @@ Issue #2199 Scope Delta (see PR body / Issue comment for full detail):
 `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS` IS now wired into
 `skill_runtime_exec.py::main()`'s actual dispatch-selection code path (a
 real production `preflight.run` invocation's child process genuinely runs
-with `cwd=execution_root`). The AC4/AC5/AC9-mapped tests below call
+with `cwd=execution_root`). Issue #2393 widened this SAME set (and this
+SAME wired dispatch-selection code path -- no new re-exec route) to also
+cover `contract_update.run.with_anchor`/`contract_update.run.with_human_context`;
+fixture profiles remain the only ones still excluded. The AC4/AC5/AC9-mapped tests below call
 `exec_mod.main()` directly -- the REAL dispatch/post-child-check selection
 logic -- against a real local `file://` fixture remote (never the real
 GitHub remote; `network_required: false`/`auth_required: false` are
@@ -457,22 +460,33 @@ def test_given_exception_inside_with_body_when_raised_then_lifecycle_guard_still
 
 
 def test_given_production_profile_set_when_inspected_then_production_profile_dedicated_execution_root():
+    """Issue #2393 widened boundary: the 4 production preflight profiles
+    PLUS the 2 contract_update mutation profiles are dedicated -- fixture
+    profiles (checked below) remain the only exclusion."""
     assert exec_mod.PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS == {
         "preflight.run",
         "preflight.run.with_anchor",
         "preflight.run.with_human_context",
         "preflight.run.with_agent_report",
-    }
-
-
-def test_given_fixture_and_contract_update_ids_when_checked_then_fixture_and_contract_update_non_regression():
-    excluded = {
-        "preflight.run.fixture",
-        "preflight.run.fixture.with_human_context",
         "contract_update.run.with_anchor",
         "contract_update.run.with_human_context",
     }
+
+
+def test_given_fixture_profile_ids_when_checked_then_fixture_profiles_remain_excluded():
+    """Issue #2393: only the 2 test-only fixture profiles stay excluded from
+    the dedicated set now that the 2 contract_update mutation profiles have
+    joined it (see the widened-boundary test above)."""
+    excluded = {
+        "preflight.run.fixture",
+        "preflight.run.fixture.with_human_context",
+    }
     assert excluded.isdisjoint(exec_mod.PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS)
+    included = {
+        "contract_update.run.with_anchor",
+        "contract_update.run.with_human_context",
+    }
+    assert included <= exec_mod.PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS
 
 
 def test_given_main_wired_and_bare_preflight_run_dispatched_when_run_then_production_profile_dedicated_execution_root(
@@ -505,22 +519,30 @@ def test_given_main_wired_and_bare_preflight_run_dispatched_when_run_then_produc
     assert Path(dispatched_cwd) == Path(worktree_bootstrap_exec.fixed_control_plane_worktree_path(str(local)))
 
 
-def test_given_main_wired_and_contract_update_command_id_dispatched_when_run_then_fixture_and_contract_update_non_regression(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "command_id",
+    ["contract_update.run.with_anchor", "contract_update.run.with_human_context"],
+)
+def test_given_main_wired_and_contract_update_command_id_dispatched_when_run_then_production_profile_dedicated_execution_root(
+    tmp_path, monkeypatch, command_id: str
 ):
-    """Issue #2199 AC8 non-regression, exercised through the SAME real
-    `main()` dispatch-selection path as the AC4 test above:
-    `contract_update.run.with_anchor` (deliberately NOT in
-    `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`) still dispatches its child
-    at `project_root`, never a dedicated worktree -- `main()`'s own
+    """Issue #2393 AC1/AC2, exercised through the SAME real `main()`
+    dispatch-selection path as the bare-`preflight.run` AC4 test above:
+    both `contract_update.run.with_anchor` and
+    `contract_update.run.with_human_context` (now IN
+    `PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS`) dispatch their child under
+    the SAME fixed dedicated worktree the 4 preflight profiles already use
+    -- never `project_root` -- via `main()`'s own
     `is_production_dedicated_command` branch, not a reimplemented
-    simulation of it."""
+    simulation of it. No new re-exec route/entrypoint/lock protocol is
+    introduced; this is the SAME `control_plane_dedicated_execution_session()`
+    parent-controller PR #2495 already delivered."""
     local, url = _init_main_dispatch_fixture(
         tmp_path,
         extra_repo_files=(".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",),
     )
     monkeypatch.setattr(worktree_bootstrap_exec, "CONTROL_PLANE_CANONICAL_REMOTE_URL", url)
-    assert "contract_update.run.with_anchor" not in exec_mod.PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS
+    assert command_id in exec_mod.PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS
     captured: dict[str, object] = {}
     monkeypatch.setattr(exec_mod, "_run_child_with_supervision", _fake_supervision_capturing_cwd(captured))
     monkeypatch.chdir(local)
@@ -530,7 +552,7 @@ def test_given_main_wired_and_contract_update_command_id_dispatched_when_run_the
     exit_code = exec_mod.main(
         [
             "--command-id",
-            "contract_update.run.with_anchor",
+            command_id,
             "--issue-number",
             "1228",
             "--repo",
@@ -541,7 +563,10 @@ def test_given_main_wired_and_contract_update_command_id_dispatched_when_run_the
     )
 
     assert exit_code == 0, captured
-    assert os.path.realpath(str(captured["cwd"])) == os.path.realpath(str(local))
+    dispatched_cwd = os.path.realpath(str(captured["cwd"]))
+    assert dispatched_cwd != os.path.realpath(str(local))
+    assert Path(dispatched_cwd).is_dir()
+    assert Path(dispatched_cwd) == Path(worktree_bootstrap_exec.fixed_control_plane_worktree_path(str(local)))
 
 
 def test_given_dedicated_session_when_execution_root_read_then_it_differs_from_primary_root(tmp_path, monkeypatch):

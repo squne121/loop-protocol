@@ -94,21 +94,39 @@ def test_registry_sibling_profile_preserves_preflight_run():
 
 
 def test_registry_contract_update_phase_is_explicit_and_preflight_remains_read_only():
-    """#1877 AC3: the mutation consumer is a distinct registry command."""
+    """#1877 AC3: the mutation consumer is a distinct registry command.
+
+    Issue #2393: `network_effect` is `github_mutation`, not
+    `github_read_only` -- both `contract_update.run.*` entries already
+    declare `mutation: True` (they write to GitHub via
+    `--consume-contract-patch-plan`), so `github_read_only` was factually
+    wrong. Corrected in the same change that migrates this profile's child
+    dispatch to the dedicated control-plane runtime.
+    """
     entry = reg.REGISTRY["contract_update.run.with_human_context"]
     assert reg.REGISTRY["preflight.run.with_anchor"]["mutation"] is False
+    assert reg.REGISTRY["preflight.run.with_anchor"]["network_effect"] == "github_read_only"
     assert "--consume-contract-patch-plan" not in reg.REGISTRY["preflight.run.with_anchor"]["argv"]
     assert entry["mutation"] is True
     assert entry["main_control_plane_only"] is True
     assert entry["execution_class"] == "exact_skill_runtime_contract_update_anchor"
     assert entry["required_cwd"] == "canonical_main_root"
     assert entry["required_branch"] == "default_branch"
-    assert entry["network_effect"] == "github_read_only"
+    assert entry["network_effect"] == "github_mutation"
     assert entry["allowed_write_roots"] == [
         ".claude/artifacts/issue-refinement-loop/{active_issue}/",
         "artifacts/{active_issue}/issue-metadata/",
     ]
     assert entry["argv"][-1] == "--consume-contract-patch-plan"
+
+    anchor_entry = reg.REGISTRY["contract_update.run.with_anchor"]
+    assert anchor_entry["mutation"] is True
+    assert anchor_entry["main_control_plane_only"] is True
+    assert anchor_entry["network_effect"] == "github_mutation"
+    assert anchor_entry["allowed_write_roots"] == [
+        ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        "artifacts/{active_issue}/issue-metadata/",
+    ]
 
     url = "https://github.com/squne121/loop-protocol/issues/1877#issuecomment-5143816923"
     assert reg.render_command(
