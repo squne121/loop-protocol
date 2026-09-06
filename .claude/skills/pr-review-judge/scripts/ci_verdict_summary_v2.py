@@ -80,6 +80,15 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     # Scope Delta calls out. Classified "excluded" (not "evidence"/"required")
     # because this job's pass/fail must never affect merge-ready.
     ("ci", "component-vrt-report"): "excluded",
+    # Issue #2424: reliability-assessment is a non-required, read-only
+    # consumer job (`if: ${{ github.event.inputs.benchmark_layout ==
+    # 'reliability_assessment' }}`) that is always `skipped` on ordinary
+    # `pull_request` runs and only executes on operator-triggered
+    # `workflow_dispatch` runs. Without an explicit entry it falls through
+    # to "unknown" -> determine_check_verdict() would treat it as ALWAYS
+    # blocking (gh_error). Classified "excluded" (not "evidence"/"required")
+    # because this job's pass/fail must never affect merge-ready.
+    ("ci", "reliability-assessment"): "excluded",
     # Check Japanese Content workflow
     ("Check Japanese Content", "PR Body Japanese Check"): "required",
     # Retrospective / conditional — allowlisted excluded
