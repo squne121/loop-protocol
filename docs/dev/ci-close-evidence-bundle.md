@@ -74,6 +74,57 @@ close-evidence/
 validator も同じ条件を `inputs/` 配下のコピーから再検証する（`close_evidence.json`
 の存在自体を close-grade eligible の証明として信用しない）。
 
+Reliability については、`validator_results` のキー集合が 3 metric と過不足なく
+一致するだけでなく、`assessment_content_digests` にも同じ 3 metric が過不足なく
+存在し、各 digest が `sha256:<64 桁 hex>` 形式であること、各 `validator_results`
+エントリが object であること（`null` 不可）を要求する。加えて、`aggregate.*` が
+成功を宣言している receipt では、個別の `validator_results.<metric>.exit_code` /
+`structural_valid` / `semantic_valid` のいずれかが aggregate の成功と矛盾しては
+ならない（PR #2528 review fix_delta: `assessment_content_digests` を一切検査せず、
+`validator_results` の中身も確認していなかった欠落の修正）。
+
+## Input cross-binding（3 入力間の相互整合性、PR #2528 review fix_delta）
+
+Performance receipt・Reliability receipt・experiment manifest がそれぞれ個別に
+close-grade eligible であることは、3 者が **同じ実験の評価結果** であることを
+保証しない。producer/validator 共通の `verify_input_cross_binding()` が、bundle
+生成・検証の前提として以下を追加で検証する（いずれか 1 つでも不一致なら
+fail-closed）。
+
+- `manifest.experiment_identity == performance.experiment_identity ==
+  reliability.experiment_identity`（3 者すべて一致。2 者だけの比較では代替しない）。
+- `sha256_of_canonical_json(manifest) == reliability.manifest_digest`
+  （#2424 owner の `sha256_of_canonical_json()` を再利用。新しい digest algorithm
+  は追加しない）。
+- reliability receipt 自身の self-excluding `canonical_output_digest` が
+  内部的に自己整合していること（`canonical_output_digest` フィールド自身を
+  除いた内容を再度 canonical JSON 化して一致することを確認 -- #2424 の
+  `build_canonical_output()` と同じ自己除外パターン）。
+- `performance.run_set_digest == reliability.receipt_run_set_digest`
+  （#2424 が performance receipt の値をそのままコピーしている、同一由来の値）。
+  一方、manifest の `experiment_run_set_digest` と performance の
+  `run_set_digest` は別 owner algorithm であり、比較しない。
+
+## `close_evidence.json` 宣言値の再導出照合（PR #2528 review fix_delta）
+
+`close_evidence.json` 自身が同梱 `inputs/` と一致した raw-byte digest / run-set
+binding を持つことだけでは、宣言された `experiment_identity` や各 digest フィールドが
+改ざんされていないことは証明できない（外側の `bundle_payload_digest` を正しく
+再計算し直せば、これらの宣言値は自由に書き換えられてしまうため）。
+
+そこで validator は、`compute_declared_core_fields()`（producer が `close_evidence.json`
+を組み立てる際に使う関数と同一）を `inputs/` 配下のコピーに対して呼び出し、
+以下 7 フィールドについて再導出した期待値と、`close_evidence.json` 自身が宣言する
+値を個別に比較する。1 つでも不一致、または欠落していれば fail-closed になる。
+
+- `schema`（固定値 `CI_CLOSE_EVIDENCE_BUNDLE_V1`）
+- `schema_version`（固定値 `1`）
+- `experiment_identity`
+- `experiment_manifest_canonical_digest`
+- `reliability_canonical_output_digest`
+- `performance_run_set_digest`
+- `reliability_receipt_run_set_digest`
+
 ## `close_evidence.json` の schema 定義（`CI_CLOSE_EVIDENCE_BUNDLE_V1`）
 
 | field | 型 | 説明 |
@@ -113,6 +164,18 @@ validator も同じ条件を `inputs/` 配下のコピーから再検証する�
 検証する。`performance_eligible_workflow_run_ids`（metric-specific projection）は
 root run-set binding の代用として使わない。
 
+`monolith`/`split` の各 layout は、performance receipt の `arms.<layout>` と
+reliability receipt の `canonical_workflow_run_ids.<layout>` の両方に必須である。
+どちらか一方でも layout 自体が欠落している場合は、`or {}` / `or []` で空集合に
+丸めて「両者とも空集合で一致」と判定してはならず、構造的な欠陥として fail-closed
+になる（PR #2528 review fix_delta: 両 receipt の run-set オブジェクトを空にした
+場合に空集合同士の一致として受理していた欠陥の修正）。
+
+`close_evidence.json` 自身が宣言する `workflow_run_ids` についても、重複検出
+（`find_duplicate_run_ids()`）を **集合化する前に** 適用する（PR #2528 review
+fix_delta: 先に `normalize_run_ids()` で集合化してから比較していたため、bundle 側
+自身の重複 run ID が黙って吸収されていた欠陥の修正）。
+
 ## Artifact semantics（成果物 identity）と publication receipt の分離
 
 `close_evidence.json` は GitHub Actions artifact 自身の ID・digest・URL を含まない
@@ -131,6 +194,14 @@ root run-set binding の代用として使わない。
 | `artifact_url` | artifact の URL |
 
 実際の値の記入・投稿は `#2155` の scope。
+
+## 失敗時の書き込み順序（PR #2528 review fix_delta）
+
+producer は、run ID の `int()` 変換を含む全ての解析・正規化を `inputs/` への
+ファイル書き込みより **前** に完了させる。不正な run ID 表現（整数へ変換できない
+文字列など）は、他の close-grade eligibility / binding / cross-binding チェックと
+同様に、書き込み前に `CloseEvidenceBundleError` として fail-closed になり、
+`inputs/` を含む bundle directory は一切作成されない（部分生成を残さない）。
 
 ## Out of Scope（本 Issue では扱わない）
 

@@ -15,7 +15,24 @@ re-derives the per-layout run-set binding directly from the two receipts
 -- never from `close_evidence.json`'s own `workflow_run_ids` field alone
 -- so a `close_evidence.json` whose OWN content has been tampered with
 (and whose `bundle_payload_digest` has been correctly recomputed after
-that tampering) is still caught (Issue #2486 AC7)."""
+that tampering) is still caught (Issue #2486 AC7).
+
+PR #2528 review fix_delta: in addition to the above, this module also
+(a) cross-binds the three `inputs/` copies to each other (same
+experiment identity, reliability's `manifest_digest` matches the real
+manifest, reliability's own self-excluding `canonical_output_digest` is
+internally self-consistent, performance's `run_set_digest` matches
+reliability's `receipt_run_set_digest` -- see `build_close_evidence_
+bundle_v1.verify_input_cross_binding()`), (b) independently re-derives
+`close_evidence.json`'s declared `experiment_identity` /
+`experiment_manifest_canonical_digest` / `reliability_canonical_output_
+digest` / `performance_run_set_digest` / `reliability_receipt_run_set_
+digest` / `schema` / `schema_version` from the same `inputs/` copies and
+compares them (never trusting the declared value, even when the outer
+`bundle_payload_digest` was correctly recomputed after tampering one of
+them), and (c) duplicate-checks `close_evidence.json`'s OWN declared
+`workflow_run_ids` BEFORE normalizing to a set (never silently absorbing
+a bundle-side duplicate run ID via early set-normalization)."""
 
 from __future__ import annotations
 
@@ -58,6 +75,67 @@ def sha256_of_bytes(raw: bytes) -> str:
 def _read_bytes(path: str) -> bytes:
     with open(path, "rb") as fh:
         return fh.read()
+
+
+# PR #2528 review fix_delta (P1-2): sentinel distinct from a legitimate
+# declared value of `None` -- used only to detect "key entirely absent from
+# close_evidence.json", never compared/serialized itself.
+_ABSENT = object()
+
+
+def _verify_declared_core_fields(producer: Any, close_evidence: dict, expected: dict) -> list[str]:
+    """PR #2528 review fix_delta (P1-2): compares `close_evidence.json`'s
+    OWN declared values for `compute_declared_core_fields()`'s 7 fields
+    against the values independently recomputed from the `inputs/` copies
+    -- so a bundle whose input files are byte-identical and whose OWN
+    `bundle_payload_digest` was correctly recomputed after tampering one of
+    these fields (Issue #2486 AC7's exact adversarial model) is still
+    caught. Deliberately never trusts `close_evidence.json`'s own claim as
+    the source of truth for these fields."""
+    errors: list[str] = []
+    for field, expected_value in expected.items():
+        declared_value = close_evidence.get(field, _ABSENT)
+        if declared_value is _ABSENT or declared_value != expected_value:
+            errors.append(
+                "declared_value_mismatch: "
+                f"field={field} declared={declared_value!r} expected={expected_value!r}"
+            )
+    return errors
+
+
+def _verify_declared_workflow_run_ids(producer: Any, close_evidence: dict, performance_receipt: dict) -> list[str]:
+    """PR #2528 review fix_delta (P2): mirrors `verify_run_set_binding()`'s
+    per-layout structural checks for `close_evidence.json`'s OWN declared
+    `workflow_run_ids` field -- applying `find_duplicate_run_ids()` BEFORE
+    normalizing to a set (never normalizing straight to a set first, which
+    would silently absorb a duplicate run ID the bundle itself declares),
+    and treating a missing required layout as a structural defect (never
+    `or []`-coerced into a trivially-matching empty set)."""
+    errors: list[str] = []
+    declared_workflow_run_ids = close_evidence.get("workflow_run_ids")
+    if not isinstance(declared_workflow_run_ids, dict):
+        errors.append("close_evidence.workflow_run_ids is missing or not an object")
+        declared_workflow_run_ids = {}
+    perf_arms = performance_receipt.get("arms") or {}
+    for layout in producer.REQUIRED_LAYOUTS:
+        if layout not in declared_workflow_run_ids:
+            errors.append(f"close_evidence.workflow_run_ids missing required layout: {layout}")
+            declared_raw_ids: Any = []
+        else:
+            declared_raw_ids = declared_workflow_run_ids.get(layout) or []
+
+        declared_dupes = producer.find_duplicate_run_ids(declared_raw_ids)
+        if declared_dupes:
+            errors.append(f"duplicate_workflow_run_id: layout={layout} source=close_evidence ids={declared_dupes}")
+
+        perf_ids = producer.normalize_run_ids((perf_arms.get(layout) or {}).get("workflow_run_ids"))
+        declared_ids = producer.normalize_run_ids(declared_raw_ids)
+        if perf_ids != declared_ids:
+            errors.append(
+                "close_evidence_workflow_run_ids_mismatch: "
+                f"layout={layout} recomputed={sorted(perf_ids)} declared={sorted(declared_ids)}"
+            )
+    return errors
 
 
 def validate_bundle(bundle_dir: str) -> list[str]:
@@ -148,13 +226,30 @@ def validate_bundle(bundle_dir: str) -> list[str]:
 
     # Re-verify close-grade eligibility directly from the inputs/ copies
     # (Issue #2486 In Scope: never just trust close_evidence.json's
-    # existence as proof of eligibility).
+    # existence as proof of eligibility). PR #2528 review fix_delta
+    # (P1-3): verify_reliability_close_grade_eligible() now also checks the
+    # assessment_content_digests/validator_results structural invariant
+    # (exact 3 metrics, well-formed digests, no individual validator result
+    # contradicting an aggregate success declaration).
     perf_errors = producer.verify_performance_close_grade_eligible(performance_receipt)
     if perf_errors:
         errors.append("performance_close_grade_ineligible: " + "; ".join(perf_errors))
     rel_errors = producer.verify_reliability_close_grade_eligible(reliability_receipt)
     if rel_errors:
         errors.append("reliability_close_grade_ineligible: " + "; ".join(rel_errors))
+
+    # Cross-binding between the three inputs (PR #2528 review fix_delta
+    # P1-1): individually-eligible receipts alone do not prove they
+    # describe the SAME experiment/manifest as each other.
+    cross_binding_errors = producer.verify_input_cross_binding(manifest, performance_receipt, reliability_receipt)
+    errors.extend(cross_binding_errors)
+
+    # Declared-value re-derivation (PR #2528 review fix_delta P1-2):
+    # close_evidence.json's own claims for these 7 fields are never trusted
+    # -- they are independently recomputed from the inputs/ copies via the
+    # SAME pure function the producer uses to build them, and compared.
+    expected_core_fields = producer.compute_declared_core_fields(manifest, performance_receipt, reliability_receipt)
+    errors.extend(_verify_declared_core_fields(producer, close_evidence, expected_core_fields))
 
     # Run-set binding: recomputed directly from the two receipts
     # (independent of close_evidence.json's own workflow_run_ids field),
@@ -164,16 +259,10 @@ def validate_bundle(bundle_dir: str) -> list[str]:
     binding_errors = producer.verify_run_set_binding(performance_receipt, reliability_receipt)
     errors.extend(binding_errors)
 
-    declared_workflow_run_ids = close_evidence.get("workflow_run_ids") or {}
-    perf_arms = performance_receipt.get("arms") or {}
-    for layout in ("monolith", "split"):
-        perf_ids = producer.normalize_run_ids((perf_arms.get(layout) or {}).get("workflow_run_ids"))
-        declared_ids = producer.normalize_run_ids(declared_workflow_run_ids.get(layout))
-        if perf_ids != declared_ids:
-            errors.append(
-                "close_evidence_workflow_run_ids_mismatch: "
-                f"layout={layout} recomputed={sorted(perf_ids)} declared={sorted(declared_ids)}"
-            )
+    # close_evidence.json's OWN declared workflow_run_ids (PR #2528 review
+    # fix_delta P2): duplicate-checked BEFORE set-normalization, required
+    # layouts checked for presence -- never silently `or []`-coerced.
+    errors.extend(_verify_declared_workflow_run_ids(producer, close_evidence, performance_receipt))
 
     # tested_workflow_sha binding (AC5): bound to the manifest's OWN
     # workflow_sha field, never a substitute provenance SHA.

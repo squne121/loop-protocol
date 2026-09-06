@@ -64,6 +64,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 from typing import Any
 
@@ -99,6 +100,20 @@ MANIFEST_INPUT_FILENAME = "experiment-manifest.json"
 PERFORMANCE_INPUT_FILENAME = "performance-close-grade-result.json"
 RELIABILITY_INPUT_FILENAME = "ci_reliability_close_grade_result_v1.json"
 CLOSE_EVIDENCE_FILENAME = "close_evidence.json"
+
+# PR #2528 review fix_delta: run-set layouts are always exactly these two --
+# never derived from receipt content (a receipt missing one of these keys is
+# a structural defect, never silently treated as an empty set).
+REQUIRED_LAYOUTS = ("monolith", "split")
+
+CLOSE_EVIDENCE_SCHEMA = "CI_CLOSE_EVIDENCE_BUNDLE_V1"
+CLOSE_EVIDENCE_SCHEMA_VERSION = 1
+
+# PR #2528 review fix_delta (P1-3): #2424's own assessment digest format --
+# `sha256:` + 64 lowercase hex chars (`sha256_of_canonical_json()`'s own
+# output shape). Used only to check well-formedness, never to recompute the
+# statistic behind the digest.
+_SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 # Issue #2486 AC8: these keys must NEVER appear at close_evidence.json's top
 # level -- they are upload-time-only GitHub Actions artifact identity,
@@ -154,7 +169,22 @@ def verify_reliability_close_grade_eligible(receipt: dict) -> list[str]:
     (`aggregate.*` fields consumed AS-IS from #2424's `aggregate_gate()`
     output -- sample count / non-inferiority statistics are never
     recomputed here), plus the exact-3-metric / matching-`validator_results`
-    structural invariant."""
+    structural invariant.
+
+    PR #2528 review fix_delta (P1-3): "validator_results has exactly the 3
+    metric keys" alone is NOT the real upstream structural invariant --
+    #2424's `build_canonical_output()` keeps `assessment_content_digests`
+    and `validator_results` as two SEPARATE per-metric maps, and its
+    `aggregate` is computed FROM the per-metric `exit_code` /
+    `structural_valid` / `semantic_valid` fields. So this function now also
+    requires: `assessment_content_digests` has the exact 3 metric keys with
+    well-formed `sha256:<hex>` digests, `validator_results` entries are
+    objects (never `null`), and -- since `aggregate.*` above is already
+    required to be a success -- no individual `validator_results` entry may
+    contradict that success (`exit_code != 0` / `structural_valid is not
+    True` / `semantic_valid is not True`). This never recomputes the
+    assessment statistics or re-runs a validator -- only checks the
+    receipt's OWN internal consistency."""
     errors: list[str] = []
     aggregate = receipt.get("aggregate") or {}
     for field in ("complete", "semantic_valid", "sample_satisfied", "all_non_inferior"):
@@ -165,6 +195,23 @@ def verify_reliability_close_grade_eligible(receipt: dict) -> list[str]:
 
     owner = _load_reliability_owner_module()
     required_metrics = set(owner.METRICS)
+
+    assessment_content_digests = receipt.get("assessment_content_digests")
+    if not isinstance(assessment_content_digests, dict):
+        errors.append("assessment_content_digests is missing or not an object")
+        assessment_content_digests = {}
+    present_digest_metrics = set(assessment_content_digests.keys())
+    if present_digest_metrics != required_metrics:
+        missing = sorted(required_metrics - present_digest_metrics)
+        extra = sorted(present_digest_metrics - required_metrics)
+        if missing:
+            errors.append(f"assessment_content_digests missing required metrics: {missing}")
+        if extra:
+            errors.append(f"assessment_content_digests has unexpected extra metrics: {extra}")
+    for metric, digest_value in assessment_content_digests.items():
+        if not isinstance(digest_value, str) or not _SHA256_DIGEST_RE.match(digest_value):
+            errors.append(f"assessment_content_digests.{metric} is not a well-formed sha256 digest: {digest_value!r}")
+
     validator_results = receipt.get("validator_results")
     if not isinstance(validator_results, dict):
         errors.append("validator_results is missing or not an object")
@@ -177,6 +224,17 @@ def verify_reliability_close_grade_eligible(receipt: dict) -> list[str]:
             errors.append(f"validator_results missing required metrics: {missing}")
         if extra:
             errors.append(f"validator_results has unexpected extra metrics: {extra}")
+    for metric, result in validator_results.items():
+        if not isinstance(result, dict):
+            errors.append(f"validator_results.{metric} is not an object (got {result!r})")
+            continue
+        if result.get("exit_code") != 0:
+            errors.append(f"validator_results.{metric}.exit_code is not 0 (got {result.get('exit_code')!r})")
+        if result.get("structural_valid") is not True:
+            errors.append(f"validator_results.{metric}.structural_valid is not true")
+        if result.get("semantic_valid") is not True:
+            errors.append(f"validator_results.{metric}.semantic_valid is not true")
+
     return errors
 
 
@@ -204,13 +262,35 @@ def verify_run_set_binding(performance_receipt: dict, reliability_receipt: dict)
     run-set membership binding between #2423's `arms.<layout>.
     workflow_run_ids` and #2424's `canonical_workflow_run_ids.<layout>`.
     Deliberately never reads `performance_eligible_workflow_run_ids` (a
-    metric-specific projection, not the root run set)."""
+    metric-specific projection, not the root run set).
+
+    PR #2528 review fix_delta (P2): a required arm/layout that is entirely
+    ABSENT from a receipt is a structural defect, never silently coerced to
+    an empty run-set via `or {}` / `or []` (two receipts that both omit a
+    required layout must NOT be accepted as "matching empty sets")."""
     errors: list[str] = []
-    perf_arms = performance_receipt.get("arms") or {}
-    rel_canonical = reliability_receipt.get("canonical_workflow_run_ids") or {}
-    for layout in ("monolith", "split"):
-        perf_raw_ids = (perf_arms.get(layout) or {}).get("workflow_run_ids") or []
-        rel_raw_ids = rel_canonical.get(layout) or []
+    perf_arms = performance_receipt.get("arms")
+    if not isinstance(perf_arms, dict):
+        errors.append("performance_receipt.arms is missing or not an object")
+        perf_arms = {}
+    rel_canonical = reliability_receipt.get("canonical_workflow_run_ids")
+    if not isinstance(rel_canonical, dict):
+        errors.append("reliability_receipt.canonical_workflow_run_ids is missing or not an object")
+        rel_canonical = {}
+
+    for layout in REQUIRED_LAYOUTS:
+        perf_arm = perf_arms.get(layout)
+        if not isinstance(perf_arm, dict) or "workflow_run_ids" not in perf_arm:
+            errors.append(f"performance_receipt missing required arm workflow_run_ids: layout={layout}")
+            perf_raw_ids: Any = []
+        else:
+            perf_raw_ids = perf_arm.get("workflow_run_ids") or []
+
+        if layout not in rel_canonical:
+            errors.append(f"reliability_receipt missing required canonical_workflow_run_ids: layout={layout}")
+            rel_raw_ids: Any = []
+        else:
+            rel_raw_ids = rel_canonical.get(layout) or []
 
         perf_dupes = find_duplicate_run_ids(perf_raw_ids)
         if perf_dupes:
@@ -229,12 +309,119 @@ def verify_run_set_binding(performance_receipt: dict, reliability_receipt: dict)
     return errors
 
 
+def verify_input_cross_binding(manifest: dict, performance_receipt: dict, reliability_receipt: dict) -> list[str]:
+    """PR #2528 review fix_delta (P1-1): cross-binds the THREE validated
+    inputs to each other -- each being individually close-grade eligible is
+    NOT sufficient to prove they describe the SAME experiment run. Catches
+    receipt/manifest mix-ups from a stale or different evaluation run that
+    `verify_performance_close_grade_eligible()` / `verify_reliability_
+    close_grade_eligible()` alone cannot see:
+
+    - `manifest.experiment_identity == performance.experiment_identity ==
+      reliability.experiment_identity` (all three, never just two).
+    - `sha256_of_canonical_json(manifest) == reliability.manifest_digest`
+      (reuses #2424's OWN `sha256_of_canonical_json()` helper -- never a
+      new digest algorithm).
+    - reliability's OWN self-excluding `canonical_output_digest` is
+      internally self-consistent (recomputed the same way #2424's
+      `build_canonical_output()` computes it: canonical-JSON-hash the
+      receipt dict with `canonical_output_digest` itself excluded).
+    - `performance.run_set_digest == reliability.receipt_run_set_digest`
+      (same upstream value, copied verbatim by #2424 -- see module
+      docstring). Deliberately never compares `manifest.
+      experiment_run_set_digest` to `performance.run_set_digest` -- those
+      are a DIFFERENT owner algorithm over a different input (#2424
+      module's own docstring)."""
+    errors: list[str] = []
+    owner = _load_reliability_owner_module()
+
+    manifest_identity = manifest.get("experiment_identity")
+    performance_identity = performance_receipt.get("experiment_identity")
+    reliability_identity = reliability_receipt.get("experiment_identity")
+    if not manifest_identity:
+        errors.append("experiment_identity_missing: source=manifest")
+    if not performance_identity:
+        errors.append("experiment_identity_missing: source=performance")
+    if not reliability_identity:
+        errors.append("experiment_identity_missing: source=reliability")
+    if len({manifest_identity, performance_identity, reliability_identity}) != 1:
+        errors.append(
+            "experiment_identity_cross_binding_mismatch: "
+            f"manifest={manifest_identity!r} performance={performance_identity!r} "
+            f"reliability={reliability_identity!r}"
+        )
+
+    recomputed_manifest_canonical_digest = owner.sha256_of_canonical_json(manifest)
+    reliability_manifest_digest = reliability_receipt.get("manifest_digest")
+    if recomputed_manifest_canonical_digest != reliability_manifest_digest:
+        errors.append(
+            "reliability_manifest_digest_mismatch: "
+            f"recomputed={recomputed_manifest_canonical_digest} declared={reliability_manifest_digest!r}"
+        )
+
+    reliability_declared_canonical_output_digest = reliability_receipt.get("canonical_output_digest")
+    reliability_without_self_digest = {
+        key: value for key, value in reliability_receipt.items() if key != "canonical_output_digest"
+    }
+    recomputed_canonical_output_digest = owner.sha256_of_canonical_json(reliability_without_self_digest)
+    if recomputed_canonical_output_digest != reliability_declared_canonical_output_digest:
+        errors.append(
+            "reliability_canonical_output_digest_self_inconsistent: "
+            f"recomputed={recomputed_canonical_output_digest} "
+            f"declared={reliability_declared_canonical_output_digest!r}"
+        )
+
+    performance_run_set_digest = performance_receipt.get("run_set_digest")
+    reliability_receipt_run_set_digest = reliability_receipt.get("receipt_run_set_digest")
+    if performance_run_set_digest != reliability_receipt_run_set_digest:
+        errors.append(
+            "performance_reliability_run_set_digest_mismatch: "
+            f"performance.run_set_digest={performance_run_set_digest!r} "
+            f"reliability.receipt_run_set_digest={reliability_receipt_run_set_digest!r}"
+        )
+
+    return errors
+
+
+def compute_declared_core_fields(manifest: dict, performance_receipt: dict, reliability_receipt: dict) -> dict:
+    """PR #2528 review fix_delta (P1-2): a pure function computing the
+    subset of `close_evidence.json`'s declared fields that are copied
+    VERBATIM from validated inputs (schema/schema_version are fixed
+    constants; the rest are `.get()` passthroughs already used by
+    `build_close_evidence_bundle()`) -- shared by the producer (to build
+    `close_evidence.json`) and the validator (to independently recompute
+    the EXPECTED value from the same `inputs/` copies and compare against
+    whatever `close_evidence.json` itself declares, instead of trusting
+    it). This is the single source of truth for those 7 fields so a future
+    field addition cannot add a "write" without also adding the matching
+    "verify"."""
+    return {
+        "schema": CLOSE_EVIDENCE_SCHEMA,
+        "schema_version": CLOSE_EVIDENCE_SCHEMA_VERSION,
+        "experiment_identity": performance_receipt.get("experiment_identity"),
+        "experiment_manifest_canonical_digest": reliability_receipt.get("manifest_digest"),
+        "reliability_canonical_output_digest": reliability_receipt.get("canonical_output_digest"),
+        "performance_run_set_digest": performance_receipt.get("run_set_digest"),
+        "reliability_receipt_run_set_digest": reliability_receipt.get("receipt_run_set_digest"),
+    }
+
+
 def build_workflow_run_ids(performance_receipt: dict) -> dict:
+    """PR #2528 review fix_delta (operational P5): raises
+    `CloseEvidenceBundleError` (never a bare `ValueError`) on a
+    non-integer-parseable run ID, so callers can require this to run
+    BEFORE any filesystem write (see `build_close_evidence_bundle()`) --
+    "the producer never emits a partial bundle directory" must also cover
+    parsing failures that happen while assembling `close_evidence.json`,
+    not just the earlier eligibility/binding checks."""
     arms = performance_receipt.get("arms") or {}
     result: dict[str, list[int]] = {}
-    for layout in ("monolith", "split"):
+    for layout in REQUIRED_LAYOUTS:
         ids = (arms.get(layout) or {}).get("workflow_run_ids") or []
-        result[layout] = sorted(int(x) for x in ids)
+        try:
+            result[layout] = sorted(int(x) for x in ids)
+        except (TypeError, ValueError) as exc:
+            raise CloseEvidenceBundleError(f"workflow_run_id_not_integer: layout={layout}: {exc}") from exc
     return result
 
 
@@ -267,6 +454,13 @@ def build_close_evidence_bundle(
     if binding_errors:
         raise CloseEvidenceBundleError("run_set_binding_invalid: " + "; ".join(binding_errors))
 
+    # PR #2528 review fix_delta (P1-1): individually-eligible receipts are
+    # not enough -- they must also describe the SAME experiment/manifest as
+    # each other (see verify_input_cross_binding() docstring).
+    cross_binding_errors = verify_input_cross_binding(manifest, performance_receipt, reliability_receipt)
+    if cross_binding_errors:
+        raise CloseEvidenceBundleError("input_cross_binding_invalid: " + "; ".join(cross_binding_errors))
+
     tested_workflow_sha = manifest.get("workflow_sha")
     if not tested_workflow_sha:
         raise CloseEvidenceBundleError("experiment_manifest.workflow_sha missing")
@@ -278,6 +472,14 @@ def build_close_evidence_bundle(
             f"computed={experiment_manifest_file_sha256} "
             f"receipt={performance_receipt.get('manifest_sha256')!r}"
         )
+
+    # PR #2528 review fix_delta (operational P5): parse/normalize
+    # `workflow_run_ids` (including the `int()` conversion that used to
+    # happen only when building the close_evidence dict, AFTER the
+    # inputs/ writes below) BEFORE any filesystem write, so a malformed
+    # run ID never leaves a partial bundle directory behind.
+    workflow_run_ids = build_workflow_run_ids(performance_receipt)
+    declared_core_fields = compute_declared_core_fields(manifest, performance_receipt, reliability_receipt)
 
     # Fail-closed checks above all passed -- only now perform filesystem
     # writes (never emit a partial/incomplete bundle directory).
@@ -291,18 +493,12 @@ def build_close_evidence_bundle(
         fh.write(reliability_raw)
 
     close_evidence: dict[str, Any] = {
-        "schema": "CI_CLOSE_EVIDENCE_BUNDLE_V1",
-        "schema_version": 1,
-        "experiment_identity": performance_receipt.get("experiment_identity"),
+        **declared_core_fields,
         "tested_workflow_sha": tested_workflow_sha,
-        "workflow_run_ids": build_workflow_run_ids(performance_receipt),
+        "workflow_run_ids": workflow_run_ids,
         "experiment_manifest_file_sha256": experiment_manifest_file_sha256,
-        "experiment_manifest_canonical_digest": reliability_receipt.get("manifest_digest"),
         "performance_close_grade_result_file_sha256": sha256_of_bytes(performance_raw),
         "reliability_close_grade_result_file_sha256": sha256_of_bytes(reliability_raw),
-        "reliability_canonical_output_digest": reliability_receipt.get("canonical_output_digest"),
-        "performance_run_set_digest": performance_receipt.get("run_set_digest"),
-        "reliability_receipt_run_set_digest": reliability_receipt.get("receipt_run_set_digest"),
     }
 
     owner = _load_reliability_owner_module()

@@ -277,3 +277,320 @@ def test_tampered_reliability_result_survives_outer_digest_recompute_fails_close
     assert not any("bundle_payload_digest_mismatch" in e for e in errors)
     assert any("reliability_close_grade_result_file_sha256_mismatch" in e for e in errors)
     assert any("reliability_close_grade_ineligible" in e for e in errors)
+
+
+# --------------------------------------------------------------------------- #
+# PR #2528 review fix_delta (P1-1): cross-binding between the three
+# inputs/ copies -- individually eligible receipts alone do not prove they
+# describe the SAME experiment/manifest. Each case tampers ONLY the
+# reliability receipt's inputs/ copy (never close_evidence.json) and, where
+# needed, correctly recomputes reliability's OWN self-excluding
+# `canonical_output_digest` so the specific cross-binding check under test
+# is isolated from the receipt's own self-consistency check.
+# --------------------------------------------------------------------------- #
+def _recompute_reliability_self_digest(producer, reliability_data: dict) -> None:
+    owner = producer._load_reliability_owner_module()
+    without_digest = {k: v for k, v in reliability_data.items() if k != "canonical_output_digest"}
+    reliability_data["canonical_output_digest"] = owner.sha256_of_canonical_json(without_digest)
+
+
+def test_cross_binding_experiment_identity_mismatch_fails_closed(validator, producer, valid_bundle):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    reliability_data["experiment_identity"] = "issue-2486-a-different-experiment-run"
+    _recompute_reliability_self_digest(producer, reliability_data)
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("experiment_identity_cross_binding_mismatch" in e for e in errors)
+
+
+def test_cross_binding_reliability_manifest_digest_mismatch_fails_closed(validator, producer, valid_bundle):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    reliability_data["manifest_digest"] = "sha256:" + "1" * 64
+    _recompute_reliability_self_digest(producer, reliability_data)
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("reliability_manifest_digest_mismatch" in e for e in errors)
+
+
+def test_cross_binding_reliability_canonical_output_digest_invalid_fails_closed(validator, valid_bundle):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    # Deliberately NOT recomputed -- the receipt's own content is untouched,
+    # but its self-excluding digest claim itself is wrong.
+    reliability_data["canonical_output_digest"] = "sha256:" + "2" * 64
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("reliability_canonical_output_digest_self_inconsistent" in e for e in errors)
+
+
+def test_cross_binding_performance_reliability_run_set_digest_mismatch_fails_closed(validator, producer, valid_bundle):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    reliability_data["receipt_run_set_digest"] = "sha256:" + "3" * 64
+    _recompute_reliability_self_digest(producer, reliability_data)
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("performance_reliability_run_set_digest_mismatch" in e for e in errors)
+
+
+# --------------------------------------------------------------------------- #
+# PR #2528 review fix_delta (P1-2): close_evidence.json's OWN declared
+# values -- independently re-derived from inputs/ and compared. Each case
+# tampers exactly ONE declared field, leaves inputs/ untouched, and
+# correctly recomputes the outer `bundle_payload_digest` (Issue #2486 AC7's
+# exact adversarial model: passing the outer self-consistency check alone
+# must never be sufficient).
+# --------------------------------------------------------------------------- #
+_DECLARED_VALUE_TAMPER_CASES = [
+    ("experiment_identity", lambda d: d.__setitem__("experiment_identity", "issue-2486-tampered-identity")),
+    (
+        "experiment_manifest_canonical_digest",
+        lambda d: d.__setitem__("experiment_manifest_canonical_digest", "sha256:" + "4" * 64),
+    ),
+    (
+        "reliability_canonical_output_digest",
+        lambda d: d.__setitem__("reliability_canonical_output_digest", "sha256:" + "5" * 64),
+    ),
+    ("performance_run_set_digest", lambda d: d.__setitem__("performance_run_set_digest", "sha256:" + "6" * 64)),
+    (
+        "reliability_receipt_run_set_digest",
+        lambda d: d.__setitem__("reliability_receipt_run_set_digest", "sha256:" + "7" * 64),
+    ),
+    ("schema", lambda d: d.__setitem__("schema", "CI_CLOSE_EVIDENCE_BUNDLE_V2_UNKNOWN")),
+    ("schema_version", lambda d: d.__setitem__("schema_version", 2)),
+]
+
+
+@pytest.mark.parametrize(
+    "field,mutate",
+    [(c[0], c[1]) for c in _DECLARED_VALUE_TAMPER_CASES],
+    ids=[c[0] for c in _DECLARED_VALUE_TAMPER_CASES],
+)
+def test_declared_value_tamper_survives_outer_digest_recompute_fails_closed(
+    validator, producer, valid_bundle, field, mutate
+):
+    tampered = _rewrite_close_evidence(producer, valid_bundle, mutate)
+    assert tampered["bundle_payload_digest"] == _recompute_bundle_payload_digest(producer, tampered)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert not any("bundle_payload_digest_mismatch" in e for e in errors)
+    assert any(f"declared_value_mismatch: field={field}" in e for e in errors)
+
+
+def test_declared_experiment_identity_deleted_fails_closed(validator, producer, valid_bundle):
+    def _delete_identity(d):
+        del d["experiment_identity"]
+
+    tampered = _rewrite_close_evidence(producer, valid_bundle, _delete_identity)
+    assert tampered["bundle_payload_digest"] == _recompute_bundle_payload_digest(producer, tampered)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert not any("bundle_payload_digest_mismatch" in e for e in errors)
+    assert any("declared_value_mismatch: field=experiment_identity" in e for e in errors)
+
+
+def test_declared_bundle_side_duplicate_run_id_fails_closed(validator, producer, valid_bundle):
+    """Exact reproduction from the PR #2528 review comment: bundle's OWN
+    declared `workflow_run_ids` gains a duplicate that naive
+    set-normalization-before-dedup-check would silently absorb."""
+
+    def _duplicate_monolith_run_id(d):
+        d["workflow_run_ids"]["monolith"] = d["workflow_run_ids"]["monolith"] + [
+            d["workflow_run_ids"]["monolith"][0]
+        ]
+
+    tampered = _rewrite_close_evidence(producer, valid_bundle, _duplicate_monolith_run_id)
+    assert tampered["bundle_payload_digest"] == _recompute_bundle_payload_digest(producer, tampered)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert not any("bundle_payload_digest_mismatch" in e for e in errors)
+    assert any("duplicate_workflow_run_id" in e and "source=close_evidence" in e for e in errors)
+
+
+def test_declared_workflow_run_ids_missing_required_layout_fails_closed(validator, producer, valid_bundle):
+    def _delete_split_layout(d):
+        del d["workflow_run_ids"]["split"]
+
+    tampered = _rewrite_close_evidence(producer, valid_bundle, _delete_split_layout)
+    assert tampered["bundle_payload_digest"] == _recompute_bundle_payload_digest(producer, tampered)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert not any("bundle_payload_digest_mismatch" in e for e in errors)
+    assert any("close_evidence.workflow_run_ids missing required layout: split" in e for e in errors)
+
+
+def test_declared_workflow_run_ids_field_missing_entirely_fails_closed(validator, producer, valid_bundle):
+    def _delete_workflow_run_ids(d):
+        del d["workflow_run_ids"]
+
+    tampered = _rewrite_close_evidence(producer, valid_bundle, _delete_workflow_run_ids)
+    assert tampered["bundle_payload_digest"] == _recompute_bundle_payload_digest(producer, tampered)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert not any("bundle_payload_digest_mismatch" in e for e in errors)
+    assert any("close_evidence.workflow_run_ids is missing or not an object" in e for e in errors)
+
+
+# --------------------------------------------------------------------------- #
+# PR #2528 review fix_delta (P1-3): reliability receipt structural
+# invariants, re-verified by the validator directly from inputs/ (never
+# just "validator_results has the 3 metric keys").
+# --------------------------------------------------------------------------- #
+def test_reliability_assessment_content_digests_missing_metric_fails_closed(validator, valid_bundle):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    del reliability_data["assessment_content_digests"]["playwright_flaky_test_rate"]
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("assessment_content_digests missing" in e for e in errors)
+
+
+def test_reliability_assessment_content_digests_extra_metric_fails_closed(validator, valid_bundle):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    reliability_data["assessment_content_digests"]["extra_metric_not_in_contract"] = "sha256:" + "0" * 64
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("assessment_content_digests has unexpected" in e for e in errors)
+
+
+def test_reliability_assessment_content_digest_malformed_fails_closed(validator, valid_bundle):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    reliability_data["assessment_content_digests"]["workflow_failure_rate"] = "not-a-digest"
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("not a well-formed sha256 digest" in e for e in errors)
+
+
+def test_reliability_validator_results_missing_metric_fails_closed(validator, valid_bundle):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    del reliability_data["validator_results"]["playwright_terminal_failure_rate"]
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("validator_results missing" in e for e in errors)
+
+
+def test_reliability_validator_result_null_fails_closed(validator, valid_bundle):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    reliability_data["validator_results"]["workflow_failure_rate"] = None
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("is not an object" in e for e in errors)
+
+
+def test_reliability_individual_validator_exit_code_failure_with_aggregate_success_fails_closed(validator, valid_bundle):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    reliability_data["validator_results"]["workflow_failure_rate"]["exit_code"] = 3
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("exit_code is not 0" in e for e in errors)
+
+
+def test_reliability_individual_validator_structural_valid_false_with_aggregate_success_fails_closed(
+    validator, valid_bundle
+):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    reliability_data["validator_results"]["playwright_flaky_test_rate"]["structural_valid"] = False
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("structural_valid is not true" in e for e in errors)
+
+
+def test_reliability_individual_validator_semantic_valid_false_with_aggregate_success_fails_closed(
+    validator, valid_bundle
+):
+    reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
+    reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
+    reliability_data["validator_results"]["playwright_terminal_failure_rate"]["semantic_valid"] = False
+    _write_json(reliability_path, reliability_data)
+
+    errors = validator.validate_bundle(str(valid_bundle))
+    assert any("semantic_valid is not true" in e for e in errors)
+
+
+# --------------------------------------------------------------------------- #
+# Offline integration/compatibility test (PR #2528 review): feeds a
+# reliability receipt produced by #2424's REAL, public
+# `build_canonical_output()` (never a hand-rolled fixture) through this
+# Issue's producer -> validator pipeline, to catch drift between
+# hand-written fixtures and the real upstream output shape. This is a
+# compatibility check, distinct from production close judgment -- offline
+# only, no real GitHub Actions dispatch or 44-run experiment.
+# --------------------------------------------------------------------------- #
+def test_offline_integration_with_real_reliability_owner_canonical_output_builder(validator, producer, tmp_path):
+    reliability_owner = producer._load_reliability_owner_module()
+
+    manifest_path = tmp_path / "experiment-manifest.json"
+    performance_path = tmp_path / "performance-close-grade-result.json"
+    reliability_path = tmp_path / "ci_reliability_close_grade_result_v1.json"
+    shutil.copyfile(_FIXTURES_DIR / "experiment_manifest.fixture.json", manifest_path)
+    shutil.copyfile(_FIXTURES_DIR / "performance_close_grade_result.fixture.json", performance_path)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    performance_receipt = json.loads(performance_path.read_text(encoding="utf-8"))
+
+    assessments = {
+        metric: {"schema": "CI_TEST_RELIABILITY_ASSESSMENT_V1", "metric": metric, "value": 0.0}
+        for metric in reliability_owner.METRICS
+    }
+    validator_results = {
+        metric: {
+            "schema": "CI_TEST_RELIABILITY_ASSESSMENT_V1_VALIDATION_RESULT",
+            "exit_code": 0,
+            "structural_valid": True,
+            "semantic_valid": True,
+        }
+        for metric in reliability_owner.METRICS
+    }
+    aggregate = {
+        "complete": True,
+        "semantic_valid": True,
+        "sample_satisfied": True,
+        "all_non_inferior": True,
+        "exit_code": 0,
+    }
+    # build_canonical_output() only reads `run_set_digest` off its `receipt`
+    # parameter (see #2424 module docstring) -- a minimal stub is correct,
+    # never a second hand-rolled full receipt.
+    receipt_stub = {"run_set_digest": performance_receipt["run_set_digest"]}
+
+    reliability_receipt = reliability_owner.build_canonical_output(
+        manifest,
+        receipt_stub,
+        None,
+        {},
+        assessments,
+        validator_results,
+        aggregate,
+    )
+    _write_json(reliability_path, reliability_receipt)
+
+    output_dir = tmp_path / "close-evidence"
+    close_evidence = producer.build_close_evidence_bundle(
+        performance_receipt_path=str(performance_path),
+        reliability_receipt_path=str(reliability_path),
+        manifest_path=str(manifest_path),
+        output_dir=str(output_dir),
+    )
+    assert close_evidence["reliability_canonical_output_digest"] == reliability_receipt["canonical_output_digest"]
+
+    errors = validator.validate_bundle(str(output_dir))
+    assert errors == []
