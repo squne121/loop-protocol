@@ -5884,7 +5884,31 @@ def _main_impl() -> int:
                         "Investigate regression or update annotation."
                     )
         elif _job_baseline_expect == "fail":
-            pass
+            # Issue #2515: an explicit author-declared `# baseline-expect: fail`
+            # is a deterministic override for the `existing_file_missing_node_id_
+            # noncanonical` heuristic (Issue #1285/#1347/PR #1305). That heuristic
+            # exists to catch a VC that AMBIGUOUSLY references a not-yet-existing
+            # node-id (function or class) inside an EXISTING file -- it cannot
+            # tell a genuine typo/wrong-target VC apart from an intentional
+            # "this class/function is being added to this existing allowed file"
+            # VC. When the author has explicitly annotated the VC with
+            # `# baseline-expect: fail`, that ambiguity is resolved by the
+            # author's own declaration, so the ordinary `expected_baseline_fail`
+            # path applies instead of the non-canonical-shape block. This does
+            # NOT distinguish function vs. class node-ids (neither did the
+            # original heuristic) and does NOT change behavior for any other
+            # `category` -- only `existing_file_missing_node_id_noncanonical`
+            # with `decision == "blocked"` is affected, and only when the
+            # annotation is present.
+            if (
+                _category == "existing_file_missing_node_id_noncanonical"
+                and _decision == "blocked"
+            ):
+                _classification = "expected_fail"
+                _category = "existing_file_missing_node_id_declared_fail"
+                _decision = "go"
+                _scope_class = "baseline_fail_expected"
+                _fix_hint = None
         else:
             if _classification == "unexpected_pass" and _decision == "blocked":
                 _existing_hint = _fix_hint or ""
