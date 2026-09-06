@@ -850,6 +850,116 @@ class TestMutationOutcomeOnPostconditionFailure:
 
 
 # =============================================================================
+# Issue #1116 AC4: issue_comment.publish marker-match + digest-mismatch update
+# branch (`_run_issue_comment_publish` PATCH path, author-checked).
+# =============================================================================
+
+
+def test_issue_comment_publish_update_on_marker_match_digest_mismatch(tmp_project, monkeypatch):
+    """Marker (identity) matches an existing remote comment, but its body
+    digest differs from the caller's new comment_body, and the existing
+    comment's author is the currently authenticated actor: the executor
+    must PATCH the existing comment (not fail closed, not double-post)."""
+    monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+    marker = "<!-- issue_finalize_report:v1 repo=o/r issue=1166 run_id=abc -->"
+    new_comment_body = (
+        f"{marker}\n<!-- issue_finalize_report_digest:v1 sha256=" + "b" * 64 + " -->\n\nnew payload"
+    )
+    old_comment_body = (
+        f"{marker}\n<!-- issue_finalize_report_digest:v1 sha256=" + "a" * 64 + " -->\n\nold payload"
+    )
+    expected_body_sha256 = hashlib.sha256(new_comment_body.encode()).hexdigest()
+    remote_comment = {
+        "id": "IC_kwDOSfQcDc8AAAAB0000",
+        "url": "https://github.com/o/r/issues/1166#issuecomment-555000",
+        "body": old_comment_body,
+        "author": {"login": "loop-protocol-bot"},
+    }
+
+    monkeypatch.setattr(_exec, "_find_marker_matches", lambda *a, **k: ([remote_comment], ""))
+    monkeypatch.setattr(_exec, "_fetch_authenticated_login", lambda *a, **k: ("loop-protocol-bot", ""))
+
+    patch_calls: list[tuple] = []
+
+    def _fake_patch(numeric_comment_id, repo, body, gh_bin):
+        patch_calls.append((numeric_comment_id, repo, body, gh_bin))
+        return ""
+
+    monkeypatch.setattr(_exec, "_patch_gh_comment", _fake_patch)
+    monkeypatch.setattr(
+        _exec,
+        "_readback_by_marker_literal",
+        lambda *a, **k: {
+            "comment_id": "IC_kwDOSfQcDc8AAAAB0000",
+            "comment_url": remote_comment["url"],
+            "body_sha256": expected_body_sha256,
+        },
+    )
+    monkeypatch.setattr(_exec, "_check_no_tracked_changes", lambda *a, **k: [])
+    post_calls: list = []
+    monkeypatch.setattr(_exec, "_post_gh_comment", lambda *a, **k: post_calls.append(a) or ("", "", "should_not_post"))
+
+    args = SimpleNamespace(
+        issue_number=1166,
+        command_id=COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+        repo=TRUSTED_REPO,
+        dry_run=False,
+        output_json=False,
+    )
+    input_data = {"comment_body": new_comment_body, "marker": marker}
+    _fail, _ok, calls = _capture_fail_ok()
+
+    rc = _exec._run_issue_comment_publish(args, "", input_data, "gh", _fail, _ok)
+
+    assert rc == 0
+    assert post_calls == []  # create-path POST must never be attempted here
+    assert len(patch_calls) == 1
+    assert patch_calls[0][0] == "555000"  # numeric id extracted from the comment permalink
+    assert patch_calls[0][2] == new_comment_body
+    assert calls["ok_extra"]["status_detail"] == "updated"
+    assert calls["ok_extra"]["body_sha256"] == expected_body_sha256
+    assert calls["ok_extra"]["idempotency_marker_written"] is True
+
+
+def test_issue_comment_publish_update_rejects_author_mismatch(tmp_project, monkeypatch):
+    """Marker matches but the existing comment's author differs from the
+    currently authenticated actor: this must fail closed as an identity
+    conflict, and PATCH must never be attempted."""
+    monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+    marker = "<!-- issue_finalize_report:v1 repo=o/r issue=1166 run_id=abc -->"
+    new_comment_body = f"{marker}\n<!-- issue_finalize_report_digest:v1 sha256=" + "b" * 64 + " -->\n\nnew payload"
+    old_comment_body = f"{marker}\n<!-- issue_finalize_report_digest:v1 sha256=" + "a" * 64 + " -->\n\nold payload"
+    remote_comment = {
+        "id": "IC_kwDOSfQcDc8AAAAB0001",
+        "url": "https://github.com/o/r/issues/1166#issuecomment-555001",
+        "body": old_comment_body,
+        "author": {"login": "someone-else"},
+    }
+
+    monkeypatch.setattr(_exec, "_find_marker_matches", lambda *a, **k: ([remote_comment], ""))
+    monkeypatch.setattr(_exec, "_fetch_authenticated_login", lambda *a, **k: ("loop-protocol-bot", ""))
+
+    patch_calls: list = []
+    monkeypatch.setattr(_exec, "_patch_gh_comment", lambda *a, **k: patch_calls.append(a) or "")
+
+    args = SimpleNamespace(
+        issue_number=1166,
+        command_id=COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+        repo=TRUSTED_REPO,
+        dry_run=False,
+        output_json=False,
+    )
+    input_data = {"comment_body": new_comment_body, "marker": marker}
+    _fail, _ok, calls = _capture_fail_ok()
+
+    rc = _exec._run_issue_comment_publish(args, "", input_data, "gh", _fail, _ok)
+
+    assert rc == 1
+    assert calls["reason"] == "remote_marker_author_mismatch_pre_mutation"
+    assert patch_calls == []
+
+
+# =============================================================================
 # Issue #1632: issue_dependency.remove
 # =============================================================================
 

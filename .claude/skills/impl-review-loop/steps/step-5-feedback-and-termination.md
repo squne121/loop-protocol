@@ -398,6 +398,44 @@ gh issue comment <issue_number> --body "## impl-review-loop: 人間判断要請 
 - 人間の確認後、ループ再開または別アプローチを選択してください"
 ```
 
+## 終了処理（no-diff / superseded termination）
+
+PR を作成しない no-diff / superseded termination の呼び出し規約（Issue #1116）。
+
+no-diff / superseded の判断自体（`completed` か `not_planned` か、supersedes 対象は
+どれか）は既存運用（#107/#36 の実例）どおり root（main agent/orchestrator）が行う。
+本セクションは新しい自動判定ブランチを追加しない — root が既に確定した終了判断を、
+PR を経由せず `finalize_no_diff_issue.py` へ接続するための呼び出し規約のみを定義する。
+`implement-issue`（Step 1 worker）の `IMPLEMENT_RESULT_V1` はこの呼び出し規約による
+変更を受けない（no-diff 検出フィールドを追加しない）。
+
+root は、対象 Issue が実装差分不要（no-diff）または他 Issue に置き換えられた
+（superseded）と判断した場合、空の PR や架空の PR 情報を作らず、次の呼び出しで
+`finalize_no_diff_issue.py` を直接実行する:
+
+```bash
+uv run --locked python3 \
+  .claude/skills/impl-review-loop/scripts/finalize_no_diff_issue.py \
+  --issue-number <issue_number> \
+  --repo squne121/loop-protocol \
+  --reason completed|not_planned \
+  --ac-results-file <ac_results.json> \
+  --evidence-body-file <evidence.md> \
+  [--supersedes <other_issue_number> ...] \
+  [--run-id <stable-run-id>]
+```
+
+`finalize_no_diff_issue.py` はこの呼び出し規約に従い、渡された終了判断（close 理由・
+AC ごとの検証結果・証跡本文・supersedes 対象）の意味を再評価せず、証跡コメントの
+冪等 upsert（`issue_comment.publish` 経由）・対象 Issue の close・supersedes 対象への
+not_planned close＋コメント・close 後の read-back 検証を実行し、
+`ISSUE_FINALIZE_RESULT_V1`（`applied | no_op | failed_no_mutation |
+failed_after_mutation | result_unknown` の対象ごとの状態を含む）を返す（詳細スキーマは
+`finalize_no_diff_issue.py` 本体のモジュール docstring 参照）。途中失敗しても自動
+rollback は行わず、再実行時は GitHub の現在状態を読み直して未完了の操作だけを補完する。
+このルートは通常の PR-based termination（`termination_reason: approved` 等）とは独立
+しており、PR review や live mergeability 評価を経由しない。
+
 ## Publish Failure Safety Lane（publish 失敗時の安全レーン）
 
 implementation-worker / open-pr が branch publish 境界で停止した場合、CI 結果や手動 remote 更新の事後成功だけで安全扱いしてはならない。
