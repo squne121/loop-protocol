@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -44,6 +45,7 @@ from unittest.mock import patch
 import pytest
 
 _GUARDS_DIR = Path(__file__).resolve().parent.parent
+_REPO_ROOT = _GUARDS_DIR.parent.parent
 if str(_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(_GUARDS_DIR))
 
@@ -2184,3 +2186,191 @@ class TestIssueRelationshipUpdateParentRebindSingleMutation:
         assert results["outcome"] == "ok"
         assert len(results["completed_operations"]) == 1
         assert results["completed_operations"][0] == "set_parent:1860"
+
+
+# =============================================================================
+# Issue #1116 fix_delta P1-2: the plain `issue_comment.publish` POST path
+# (no remote marker found by the pre-mutation precheck) must reconcile a
+# lost-response POST via `_readback_by_marker_literal` exactly like the
+# PATCH / issue_content.update branches already do, instead of failing
+# closed purely because the local process never received the POST's own
+# HTTP response.
+# =============================================================================
+
+
+class TestIssueCommentPublishPostFailureReadbackReconciliation:
+    def test_post_failure_readback_confirms_reconciled_as_created(self, tmp_project, monkeypatch):
+        """A lost POST response is reconciled via readback: the comment was
+        actually created remotely, so this must succeed as `created` --
+        never a duplicate POST, never a false failure."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        comment_body = "status update <!-- marker-1166 -->"
+        marker = "<!-- marker-1166 -->"
+        expected_body_sha256 = hashlib.sha256(comment_body.encode()).hexdigest()
+
+        monkeypatch.setattr(_exec, "_find_marker_matches", lambda *a, **k: ([], ""))
+        monkeypatch.setattr(
+            _exec, "_post_gh_comment", lambda *a, **k: ("", "", "gh_api_post_comment_response_parse_error: boom")
+        )
+        monkeypatch.setattr(
+            _exec,
+            "_readback_by_marker_literal",
+            lambda *a, **k: {
+                "comment_id": "1",
+                "comment_url": "https://example/comment/1",
+                "body_sha256": expected_body_sha256,
+            },
+        )
+        monkeypatch.setattr(_exec, "_check_no_tracked_changes", lambda *a, **k: [])
+
+        args = SimpleNamespace(
+            issue_number=1166,
+            command_id=COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+            repo=TRUSTED_REPO,
+            dry_run=False,
+            output_json=False,
+        )
+        input_data = {"comment_body": comment_body, "marker": marker}
+        _fail, _ok, calls = _capture_fail_ok()
+
+        rc = _exec._run_issue_comment_publish(args, "", input_data, "gh", _fail, _ok)
+
+        assert rc == 0
+        assert calls["ok_extra"]["status_detail"] == "created"
+        assert calls["ok_extra"]["comment_id"] == "1"
+        assert calls["ok_extra"]["body_sha256"] == expected_body_sha256
+        assert calls["ok_extra"]["idempotency_marker_written"] is True
+
+    def test_post_failure_readback_marker_not_found_fails_no_mutation(self, tmp_project, monkeypatch):
+        """A lost POST response reconciled via readback that confirms
+        nothing was created remotely (`marker_not_found`) is a clean,
+        unambiguous failure -- no `mutation_outcome` extra, so callers know
+        no retry-vs-duplicate ambiguity exists."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        comment_body = "status update <!-- marker-1166 -->"
+        marker = "<!-- marker-1166 -->"
+
+        monkeypatch.setattr(_exec, "_find_marker_matches", lambda *a, **k: ([], ""))
+        monkeypatch.setattr(_exec, "_post_gh_comment", lambda *a, **k: ("", "", "gh_api_post_comment_failed_rc_1"))
+        monkeypatch.setattr(_exec, "_readback_by_marker_literal", lambda *a, **k: {"error": "marker_not_found"})
+
+        args = SimpleNamespace(
+            issue_number=1166,
+            command_id=COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+            repo=TRUSTED_REPO,
+            dry_run=False,
+            output_json=False,
+        )
+        input_data = {"comment_body": comment_body, "marker": marker}
+        _fail, _ok, calls = _capture_fail_ok()
+
+        rc = _exec._run_issue_comment_publish(args, "", input_data, "gh", _fail, _ok)
+
+        assert rc == 1
+        assert calls["reason"] == "gh_api_post_comment_failed_rc_1"
+        assert calls["extra"] is None  # no mutation_outcome extra: confirmed nothing was created
+
+    def test_post_failure_readback_inconclusive_reports_mutation_outcome_unknown(self, tmp_project, monkeypatch):
+        """A lost POST response whose readback is itself inconclusive
+        (transport error, not a confirmed absence) must fail closed while
+        reporting `mutation_outcome: unknown` -- POST success/failure
+        genuinely cannot be determined either way."""
+        monkeypatch.setattr(_exec, "PROJECT_ROOT", tmp_project)
+        comment_body = "status update <!-- marker-1166 -->"
+        marker = "<!-- marker-1166 -->"
+
+        monkeypatch.setattr(_exec, "_find_marker_matches", lambda *a, **k: ([], ""))
+        monkeypatch.setattr(
+            _exec, "_post_gh_comment", lambda *a, **k: ("", "", "gh_api_post_comment_exception: timeout")
+        )
+        monkeypatch.setattr(_exec, "_readback_by_marker_literal", lambda *a, **k: {"error": "gh_failed_rc_1"})
+
+        args = SimpleNamespace(
+            issue_number=1166,
+            command_id=COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+            repo=TRUSTED_REPO,
+            dry_run=False,
+            output_json=False,
+        )
+        input_data = {"comment_body": comment_body, "marker": marker}
+        _fail, _ok, calls = _capture_fail_ok()
+
+        rc = _exec._run_issue_comment_publish(args, "", input_data, "gh", _fail, _ok)
+
+        assert rc == 1
+        assert calls["reason"] == "gh_api_post_comment_exception: timeout"
+        assert calls["status"] == "failed"
+        assert calls["extra"]["patch_attempted"] is False
+        assert calls["extra"]["mutation_outcome"] == "unknown"
+
+
+# =============================================================================
+# Issue #1116 AC8: controlled_skill_mutation_exec.py's own CLI entrypoint must
+# be reachable as a genuine OS subprocess, not only via the in-process
+# `_exec.main([...])` calls used throughout the rest of this file. This uses
+# `--dry-run`, which returns before any `gh` call is made: `_find_gh_bin()`
+# in this module pins discovery to a fixed trusted path list that ignores
+# PATH by design (Issue #1539 hardening) and is outside this Issue's allowed
+# change surface (`_run_issue_comment_publish` + its single-caller helpers
+# only). In this environment that fixed path resolves to a real,
+# already-authenticated system `gh` -- so no test in this suite may let a
+# real subprocess reach an actual `gh` call through it (Issue #1116 AC8
+# explicitly forbids ever closing a live Issue). The create/update/no-op/
+# reconciliation logic itself remains covered at the function level by the
+# rest of this file and by `--dry-run`-independent monkeypatch coverage.
+# =============================================================================
+
+
+class TestControlledExecutorRealSubprocessBoundary:
+    def test_dry_run_reachable_as_real_os_subprocess(self):
+        script = _REPO_ROOT / "scripts" / "agent-guards" / "controlled_skill_mutation_exec.py"
+        issue_dir = _REPO_ROOT / "artifacts" / "1116"
+        pre_existing_issue_dir = issue_dir.exists()
+        namespace_dir = issue_dir / "issue-metadata" / COMMAND_ID_ISSUE_COMMENT_PUBLISH
+        namespace_dir.mkdir(parents=True, exist_ok=True)
+        input_file = namespace_dir / "subprocess_boundary_dry_run_input.json"
+        input_file.write_text(
+            json.dumps(
+                {
+                    "schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1",
+                    "issue_number": 1116,
+                    "comment_body": "dry-run subprocess boundary probe <!-- marker-ac8 -->",
+                    "marker": "<!-- marker-ac8 -->",
+                }
+            )
+        )
+        rel_input = (
+            f"artifacts/1116/issue-metadata/{COMMAND_ID_ISSUE_COMMENT_PUBLISH}/"
+            "subprocess_boundary_dry_run_input.json"
+        )
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--command-id",
+                    COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+                    "--issue-number",
+                    "1116",
+                    "--input-file",
+                    rel_input,
+                    "--repo",
+                    TRUSTED_REPO,
+                    "--json",
+                    "--dry-run",
+                ],
+                cwd=str(_REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            if pre_existing_issue_dir:
+                input_file.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(issue_dir, ignore_errors=True)
+
+        assert proc.returncode == 0, proc.stderr
+        parsed = json.loads(proc.stdout)
+        assert parsed["status"] == "dry_run_ok"
+        assert parsed["command_id"] == COMMAND_ID_ISSUE_COMMENT_PUBLISH

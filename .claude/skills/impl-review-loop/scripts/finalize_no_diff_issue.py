@@ -347,11 +347,16 @@ def _publish_marker_comment(
 
     if out.returncode != 0 or result.get("status") != "ok":
         reason = result.get("reason", f"issue_comment_publish_failed_rc_{out.returncode}")
-        # Issue #2163 pattern: distinguish "mutation may have actually
-        # happened remotely" (patch_attempted / applied_but_* statuses) from
-        # a clean precondition reject, so callers never mistake a genuine
-        # remote side effect for "nothing happened".
-        if result.get("patch_attempted") or result.get("mutation_outcome") == "applied":
+        # Issue #2163 pattern, extended by Issue #1116 fix_delta P1-2: distinguish
+        # "mutation may have actually happened remotely (or its outcome cannot
+        # be determined either way)" -- patch_attempted / mutation_outcome in
+        # ("applied", "unknown") -- from a clean precondition reject, so
+        # callers never mistake a genuine (or merely ambiguous) remote side
+        # effect for "nothing happened". This now also covers the plain POST
+        # path's own write-response-loss reconciliation (mutation_outcome:
+        # "unknown" when readback itself is inconclusive), not just the PATCH
+        # branches.
+        if result.get("patch_attempted") or result.get("mutation_outcome") in ("applied", "unknown"):
             reason = f"mutation_outcome_unknown:{reason}"
         return "", "", "", str(reason)
 
@@ -363,10 +368,11 @@ def _publish_marker_comment(
     )
 
 
-def _verify_existing_comment_url(issue_number: int, repo: str, url: str, gh_bin: str) -> str:
-    """AC2 alternate evidence source: verify a caller-referenced existing
-    comment actually exists on the target Issue, instead of publishing a
-    new one. Returns "" on success, else an error string."""
+def _fetch_issue_comments(issue_number: int, repo: str, gh_bin: str) -> tuple[list | None, str]:
+    """Shared low-level fetch of an Issue's comments (id/url/body), used by
+    both the existing-comment-reference verification and the post-close
+    evidence-comment read-back confirmation (Issue #1116 AC5 fix_delta:
+    postcondition-based reconciliation). Returns (comments, error)."""
     try:
         out = subprocess.run(
             [gh_bin, "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"],
@@ -376,13 +382,63 @@ def _verify_existing_comment_url(issue_number: int, repo: str, url: str, gh_bin:
             shell=False,
         )
         if out.returncode != 0:
-            return f"gh_failed_rc_{out.returncode}"
+            return None, f"gh_failed_rc_{out.returncode}"
         data = json.loads(out.stdout)
     except Exception as exc:  # noqa: BLE001
-        return f"existing_comment_verify_exception:{exc}"
+        return None, f"issue_comments_fetch_exception:{exc}"
     comments = data.get("comments", []) if isinstance(data, dict) else []
-    if not any(c.get("url") == url for c in comments):
-        return "existing_evidence_comment_url_not_found"
+    return comments, ""
+
+
+def _verify_existing_comment_url(issue_number: int, repo: str, url: str, gh_bin: str) -> tuple[str, str]:
+    """AC2 alternate evidence source: verify a caller-referenced existing
+    comment actually exists on the target Issue, instead of publishing a
+    new one. Returns (error, body_sha256): error is "" on success, and
+    body_sha256 is the digest of the verified comment's body (used later to
+    detect drift on the post-close re-check -- AC7: never returns/logs the
+    full body itself)."""
+    comments, err = _fetch_issue_comments(issue_number, repo, gh_bin)
+    if err:
+        return f"existing_comment_verify_exception:{err}", ""
+    match = next((c for c in comments if c.get("url") == url), None)
+    if match is None:
+        return "existing_evidence_comment_url_not_found", ""
+    return "", _sha256_hex(match.get("body", ""))
+
+
+def _verify_evidence_comment_marker_present(
+    issue_number: int, repo: str, ownership_marker: str, digest_marker: str, gh_bin: str
+) -> str:
+    """AC5 fix_delta: post-close read-back confirmation that the evidence
+    comment this run published/updated is still present remotely, with both
+    the ownership marker and the digest marker intact. Returns "" on
+    success, else an error string. Never returns/logs the full comment body
+    (AC7)."""
+    comments, err = _fetch_issue_comments(issue_number, repo, gh_bin)
+    if err:
+        return f"evidence_comment_final_readback_failed:{err}"
+    matches = [c for c in comments if ownership_marker in c.get("body", "")]
+    if not matches:
+        return "evidence_comment_missing_after_close"
+    if len(matches) > 1:
+        return "evidence_comment_ambiguous_after_close"
+    if digest_marker not in matches[0].get("body", ""):
+        return "evidence_comment_digest_mismatch_after_close"
+    return ""
+
+
+def _verify_existing_comment_unchanged(
+    issue_number: int, repo: str, url: str, expected_body_sha256: str, gh_bin: str
+) -> str:
+    """AC5 fix_delta: for the caller-referenced existing-comment evidence
+    source, confirm after close that the same comment still exists with
+    unchanged content (digest-only comparison -- AC7: never returns/logs
+    the full body). Returns "" on success, else an error string."""
+    err, body_sha256 = _verify_existing_comment_url(issue_number, repo, url, gh_bin)
+    if err:
+        return f"existing_evidence_comment_final_readback_failed:{err}"
+    if body_sha256 != expected_body_sha256:
+        return "existing_evidence_comment_changed_after_close"
     return ""
 
 
@@ -429,9 +485,21 @@ def _finalize_one_target(
     snapshot = initial_snapshot
     result["observed_state"] = snapshot
 
+    # `evidence_mutated` tracks whether THIS run actually created/updated the
+    # evidence comment (vs. a pure reference/no-op verification), used below
+    # to classify applied vs. no_op independently of `close_attempted`
+    # (Issue #1116 fix_delta #5). `evidence_marker_info` / `evidence_existing_check`
+    # carry what's needed to re-verify the evidence comment after close
+    # (fix_delta #3), without ever holding/logging the full comment body.
+    evidence_mutated = False
+    evidence_marker_info: tuple[str, str] | None = None
+    evidence_existing_check: tuple[str, str] | None = None
+
     # -- Evidence comment ------------------------------------------------
     if existing_evidence_comment_url:
-        verify_err = _verify_existing_comment_url(issue_number, repo, existing_evidence_comment_url, gh_bin)
+        verify_err, existing_body_sha256 = _verify_existing_comment_url(
+            issue_number, repo, existing_evidence_comment_url, gh_bin
+        )
         if verify_err:
             result["incomplete_operations"].append("evidence_comment")
             result["errors"].append(verify_err)
@@ -441,8 +509,10 @@ def _finalize_one_target(
                 "status_detail": "existing_reference_verified",
                 "comment_url": existing_evidence_comment_url,
             }
+            evidence_existing_check = (existing_evidence_comment_url, existing_body_sha256)
     else:
         comment_body, ownership_marker = build_evidence_comment_body(repo, issue_number, run_id, payload_markdown)
+        digest_marker = comment_body.splitlines()[1]
         status_detail, comment_id, comment_url, publish_err = _publish_marker_comment(
             issue_number=issue_number,
             repo=repo,
@@ -464,58 +534,95 @@ def _finalize_one_target(
                 "comment_id": comment_id,
                 "comment_url": comment_url,
             }
+            evidence_mutated = status_detail != "already_published"
+            evidence_marker_info = (ownership_marker, digest_marker)
 
     # -- Close -------------------------------------------------------------
     # Only close a target that is confirmed live-OPEN right now (never
     # inferred from a stale marker/comment -- Issue #1116 AC6). If already
     # CLOSED with the requested reason, this is a no-op close (no second
     # `gh issue close` call); if already CLOSED with a *different* reason,
-    # this is a mismatch that is never silently corrected by reopening.
+    # this is a mismatch that is never silently corrected by reopening. Any
+    # transport error from the close call itself is recorded as diagnostic
+    # information only -- it never by itself decides completed/incomplete;
+    # that decision is deferred entirely to the read-back below (fix_delta #4).
     close_attempted = False
     if snapshot["state"] == "OPEN":
         close_attempted = True
         close_err = _close_issue_live(issue_number, repo, reason, gh_bin)
         if close_err:
-            result["incomplete_operations"].append("close")
             result["errors"].append(close_err)
-        else:
-            result["completed_operations"].append("close")
     elif snapshot["state"] == "CLOSED" and snapshot.get("state_reason") == reason:
-        result["completed_operations"].append("close")
+        pass
     else:
-        result["incomplete_operations"].append("close")
         result["errors"].append(
             f"close_state_reason_mismatch: observed_state_reason={snapshot.get('state_reason')!r} "
             f"requested_reason={reason!r}"
         )
 
-    # -- AC5: read-back after any mutation attempt. Read-back failure or
-    # mismatch is never treated as success.
+    # -- AC5: read-back after any mutation attempt. The final completed/
+    # incomplete classification of `close` is derived exclusively from this
+    # read-back -- never from `close_attempted` alone (fix_delta #1). This
+    # means a target that was already CLOSED+matching at the start but gets
+    # reopened by something else during processing is correctly reported as
+    # incomplete, and, symmetrically, a `gh issue close` call that reported a
+    # transport error but actually applied remotely is correctly reconciled
+    # as complete (fix_delta #4). Read-back failure or mismatch is never
+    # treated as success.
     after_snapshot, after_err = _fetch_issue_snapshot(issue_number, repo, gh_bin)
+    close_verified = False
     if after_err:
         result["result_unknown"] = True
         result["retryable"] = True
         result["errors"].append(f"post_mutation_readback_failed:{after_err}")
     else:
         result["observed_state"] = after_snapshot
-        if close_attempted and after_snapshot["state"] != "CLOSED":
-            if "close" in result["completed_operations"]:
-                result["completed_operations"].remove("close")
-            if "close" not in result["incomplete_operations"]:
-                result["incomplete_operations"].append("close")
+        close_verified = after_snapshot["state"] == "CLOSED" and after_snapshot.get("state_reason") == reason
+        if after_snapshot["state"] != "CLOSED":
             result["errors"].append("postcondition_close_state_mismatch")
-        if after_snapshot["state"] == "CLOSED" and after_snapshot.get("state_reason") != reason:
-            if "close" in result["completed_operations"]:
-                result["completed_operations"].remove("close")
-            if "close" not in result["incomplete_operations"]:
-                result["incomplete_operations"].append("close")
+        elif after_snapshot.get("state_reason") != reason:
             result["errors"].append("postcondition_state_reason_mismatch")
 
+    if close_verified:
+        result["completed_operations"].append("close")
+    else:
+        result["incomplete_operations"].append("close")
+
+    # -- AC5 fix_delta #3: read back the evidence comment itself after close,
+    # for both the newly-published/updated-marker path and the caller-
+    # referenced existing-comment path. A vanished or drifted evidence
+    # comment is never reported as success, even though `evidence_comment`
+    # was already provisionally appended to completed_operations above.
+    if "evidence_comment" in result["completed_operations"]:
+        if evidence_marker_info is not None:
+            ownership_marker, digest_marker = evidence_marker_info
+            evidence_verify_err = _verify_evidence_comment_marker_present(
+                issue_number, repo, ownership_marker, digest_marker, gh_bin
+            )
+        elif evidence_existing_check is not None:
+            existing_url, expected_body_sha256 = evidence_existing_check
+            evidence_verify_err = _verify_existing_comment_unchanged(
+                issue_number, repo, existing_url, expected_body_sha256, gh_bin
+            )
+        else:
+            evidence_verify_err = ""
+        if evidence_verify_err:
+            result["completed_operations"].remove("evidence_comment")
+            result["incomplete_operations"].append("evidence_comment")
+            result["errors"].append(evidence_verify_err)
+
     # -- Classification (Issue #1116 AC6 vocabulary) ------------------------
+    # `applied` requires that THIS run actually mutated something (a close
+    # this run executed and that the read-back confirms, and/or an evidence
+    # comment this run created/updated) -- not merely that every operation is
+    # confirmed complete (fix_delta #5). Otherwise a target that started
+    # already-terminal and stayed that way is `no_op`.
+    mutation_occurred = (close_attempted and close_verified) or evidence_mutated
+
     if result["result_unknown"]:
         result["target_status"] = TARGET_STATUS_RESULT_UNKNOWN
     elif not result["incomplete_operations"]:
-        result["target_status"] = TARGET_STATUS_APPLIED if close_attempted else TARGET_STATUS_NO_OP
+        result["target_status"] = TARGET_STATUS_APPLIED if mutation_occurred else TARGET_STATUS_NO_OP
     elif result["completed_operations"]:
         result["target_status"] = TARGET_STATUS_FAILED_AFTER_MUTATION
         result["retryable"] = True

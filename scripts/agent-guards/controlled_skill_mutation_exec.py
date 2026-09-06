@@ -2093,7 +2093,55 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
     # -- matches == 0: no remote marker yet, proceed to post --------------------
     comment_url, comment_id, post_err = _post_gh_comment(args.issue_number, args.repo, comment_body, gh_bin)
     if post_err:
-        return _fail(post_err, status="failed")
+        # Issue #1116 fix_delta P1-2: a POST response can be lost after the
+        # remote mutation actually succeeded (same transport-ambiguity class
+        # already handled by the PATCH/issue_content.update branches above).
+        # Read back once by marker literal before declaring failure -- never
+        # retry the POST itself within the same invocation.
+        post_readback = _readback_by_marker_literal(marker, args.issue_number, args.repo, gh_bin)
+        if post_readback.get("error") == "marker_not_found":
+            # Confirmed: nothing was created remotely by this POST.
+            return _fail(post_err, status="failed")
+        if "error" in post_readback or post_readback.get("body_sha256") != expected_body_sha256:
+            # Readback itself is inconclusive, or a comment matching the
+            # marker exists with unexpected content -- POST success/failure
+            # cannot be determined either way. Fail closed as ambiguous.
+            return _fail(
+                post_err,
+                status="failed",
+                extra={"patch_attempted": False, "mutation_outcome": "unknown"},
+            )
+
+        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
+        if changed:
+            return _fail(
+                "postcondition_tracked_changes_detected",
+                [f"changed: {f}" for f in changed[:20]],
+                status="applied_but_local_postcondition_failed",
+                extra={
+                    "mutation_outcome": "applied",
+                    "remote_receipt": {
+                        "issue_number": args.issue_number,
+                        "repo": args.repo,
+                        "comment_id": post_readback.get("comment_id"),
+                        "comment_url": post_readback.get("comment_url"),
+                        "body_sha256": post_readback.get("body_sha256"),
+                    },
+                    "retry_policy": "safe_to_retry_remote_marker_precheck_will_detect_already_published",
+                },
+            )
+
+        _write_marker(post_readback.get("comment_id"), post_readback.get("comment_url"))
+        return _ok(
+            {
+                "status_detail": "created",
+                "mutation_outcome": "applied",
+                "comment_id": post_readback.get("comment_id"),
+                "comment_url": post_readback.get("comment_url"),
+                "body_sha256": post_readback.get("body_sha256"),
+                "idempotency_marker_written": True,
+            }
+        )
 
     # -- AC4/AC14: postcondition readback by marker — false success not allowed -
     readback = _readback_by_marker_literal(marker, args.issue_number, args.repo, gh_bin)
@@ -2135,6 +2183,7 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
 
     return _ok(
         {
+            "status_detail": "created",
             "comment_id": readback.get("comment_id"),
             "comment_url": readback.get("comment_url"),
             "body_sha256": readback.get("body_sha256"),
