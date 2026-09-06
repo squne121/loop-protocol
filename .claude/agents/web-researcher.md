@@ -85,7 +85,7 @@ success authority は provider telemetry ではなく、critical claim ごとの
 
 evidence のない claim は `supported` としてはならない。AGY と native Web の両方で critical claim を検証できなかった場合だけ `inconclusive` または `failed` を返す。
 
-### Source Registry Materialization（source registry への変換）
+### ソース登録簿への変換（Source Registry Materialization）
 
 AGY 経由・native Web 経由のどちらで確認した source も、同じ `sources[]` 形状へ変換する。source content を実際に確認できた URL ごとに、result 内で一意な `source_id` を割り当て、正規化済み `url` / `title` / `source_kind`（`agy` | `native_web`）を記録する。`step_idx` / `tool_name` / `tool_call_fingerprint` は実際に取得できた場合だけ含め、欠落値を推測で埋めない。claim の `evidence[]` から該当 source を引く場合は `evidence[].source_id` にその `source_id` を設定し、`evidence[].ref` には必ず同じ source の `url` をそのまま使う（`source_id` と `ref` が異なる source を指す状態を作らない）。`source_kind` が `agy` か `native_web` かで検証の扱いを変えない。
 
