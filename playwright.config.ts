@@ -132,6 +132,39 @@ if (process.env.LOOP_E2E_LANE !== undefined) {
   }
 }
 
+// Issue #2424 AC2: lane-aware official JSON reporter evidence route.
+// `PLAYWRIGHT_JSON_OUTPUT_FILE` is set by `.github/workflows/ci.yml` ONLY on
+// a `reliability_evidence=true` benchmark_layout dispatch, as the full
+// `$GITHUB_WORKSPACE`-relative path of the manifest's per-invocation
+// `evidence_file`. When unset (every normal local/CI run, including a
+// `benchmark_layout` performance-only dispatch), the JSON reporter is never
+// added and no JSON stdout/file is produced -- html/list remain the only
+// reporters, unchanged from the pre-#2424 baseline. The official Playwright
+// JSON reporter itself (not a custom reporter/HTML scraper) is the only
+// evidence producer; this file never parses or post-processes its output.
+const RELIABILITY_JSON_OUTPUT_FILE = (() => {
+  const raw = process.env.PLAYWRIGHT_JSON_OUTPUT_FILE
+  return raw && raw.trim() !== '' ? raw : undefined
+})()
+
+// Playwright's official config-level `metadata` is serialized verbatim into
+// the JSON reporter's `config.metadata` (and each project's own `metadata`)
+// -- this is the ONLY per-invocation stable identity carrier #2424's builder
+// (`scripts/ci/build_ci_reliability_assessment_v1.py`) binds against. Only
+// populated on the evidence-required route (RELIABILITY_JSON_OUTPUT_FILE
+// set) so a normal run's config never carries reliability-specific fields.
+const RELIABILITY_METADATA = RELIABILITY_JSON_OUTPUT_FILE
+  ? {
+      experiment_identity: process.env.RELIABILITY_EXPERIMENT_IDENTITY ?? '',
+      workflow_run_id: process.env.GITHUB_RUN_ID ?? '',
+      run_attempt: process.env.GITHUB_RUN_ATTEMPT ?? '',
+      benchmark_layout: process.env.RELIABILITY_BENCHMARK_LAYOUT ?? '',
+      invocation_id: process.env.RELIABILITY_INVOCATION_ID ?? '',
+      lane: process.env.RELIABILITY_LANE ?? '',
+      workflow_sha: process.env.RELIABILITY_WORKFLOW_SHA ?? '',
+    }
+  : undefined
+
 export default defineConfig({
   testDir: './tests/e2e',
   // Exclusive lane contract (Issue #2119 AC14): exactly one of
@@ -170,7 +203,11 @@ export default defineConfig({
           : 'playwright-report',
     }],
     ['list'],
+    // Issue #2424 AC2: additive-only -- appended after html/list, never
+    // replacing them, and only when the evidence-required route is active.
+    ...(RELIABILITY_JSON_OUTPUT_FILE ? [['json', { outputFile: RELIABILITY_JSON_OUTPUT_FILE }] as const] : []),
   ],
+  ...(RELIABILITY_METADATA ? { metadata: RELIABILITY_METADATA } : {}),
   use: {
     /* Base URL — matches the preview server port. Preview-namespace lane
      * (Issue #1283 AC9/AC15) points at the nested `VITE_BASE_PATH` prefix
