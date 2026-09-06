@@ -14,7 +14,7 @@ disable-model-invocation: true
 | `grounded_research` | provider-aware: `provider=gemini`（既定）は Gemini API Google Search grounding、`provider=agy` は AGY native WebSearch/WebGrounding（`agy -p`、Gemini API 不使用、timeout_sec: 300+ 推奨）。両者は別実装であり、AGY 側は machine-verifiable tool-call トレース必須。詳細は `references/provider-mapping.md` / `references/usage-contract.md` 参照。 |
 | `local_asset_research` | Serena MCP read-only によるローカル資産調査 |
 | `proposal_only` | 実装案・Issue 本文案・patch proposal のドラフト生成 |
-| `github_research` | GitHub read-only 調査（gh コマンド allowlist）|
+| `github_research` | GitHub read-only 調査。**Gemini 側は operator-disabled**（#1886, #2002）。正規入口は `--provider agy`（`run_agy_github_research_e2e.py`）のみ |
 
 詳細は `references/usage-contract.md`（SSOT）・`references/model-routing.md`・`references/result-surface.md` を参照。
 
@@ -29,12 +29,20 @@ disable-model-invocation: true
 1. **request JSON を build_request.py で生成する（推奨）**:
    ```bash
    uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
-     --profile github_research \
-     --objective 'Issue #313 と PR #321 を gh issue view / gh pr view で調査する' \
+     --profile no_tools \
+     --objective 'Summarize the context file for testing purposes' \
      --context-file .claude/skills/gemini-cli-headless-delegation/references/usage-contract.md \
-     --gh-issue 313 --gh-pr 321 \
      --output /tmp/gemini/request.json
    ```
+   `tool_profile=github_research` の GitHub 調査は **`--provider agy` が正規入口**（Gemini 側は operator-disabled、#1886, #2002）:
+   ```bash
+   uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/build_request.py \
+     --provider agy \
+     --profile github_research \
+     --prompt 'GitHub Issue #313 と PR #321 の内容を gh issue view / gh pr view で調査し、要点を報告してください。' \
+     --output /tmp/gemini/request.json
+   ```
+   `--provider agy` は non-empty `--prompt` を必須とし、旧 `--gh-issue`/`--gh-pr` は AGY 分岐にはそのまま渡らない（調査対象の Issue/PR は `--prompt` 本文に含める）。`provider=gemini`（明示または省略）+ `tool_profile=github_research` は実行前に一貫して拒否される。
    または手動で `delegation_request_v1` JSON を作成する（`references/usage-contract.md` 参照）。
 
 2. **preflight を実行する（必要に応じて agy の grounded_research 検証を含める）**:

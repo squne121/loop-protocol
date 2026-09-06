@@ -1521,7 +1521,12 @@ def make_github_research_request(context_file: str = "context.md") -> dict:
 
 
 def test_validate_request_accepts_github_research_with_allowed_gh_commands(tmp_path, monkeypatch):
-    """github_research: 許可 argv (issue view) が通ること。"""
+    """Issue #2522 migration: 許可 argv (issue view) であっても、gemini/default
+    provider + github_research は operator-disabled として一貫して拒否される
+    （#1886, #2002）。旧来の argv allowlist ロジック自体は dormant のまま保持され、
+    その denial message（"not in the allowed subcommand list" 等）はここでは
+    出現しない -- allowed argv だからこそ argv-level denial は起きず、
+    operator-disabled のみが理由になることを確認する。"""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1530,7 +1535,8 @@ def test_validate_request_accepts_github_research_with_allowed_gh_commands(tmp_p
 
     errors = module.validate_request(request)
 
-    assert errors == [], f"unexpected errors: {errors}"
+    assert any("github_research_operator_disabled" in e for e in errors), f"errors={errors}"
+    assert not any("not in the allowed subcommand list" in e for e in errors), f"errors={errors}"
 
 
 def test_validate_request_rejects_github_research_issue_comment_argv(tmp_path, monkeypatch):
@@ -1573,7 +1579,9 @@ def test_validate_request_rejects_github_research_api_method_delete(tmp_path, mo
 
 
 def test_validate_request_accepts_github_research_api_get(tmp_path, monkeypatch):
-    """github_research: gh api (GET 既定) は許可されること。"""
+    """Issue #2522 migration: gh api (GET 既定) の argv 自体は依然として
+    allowlist 上は許可されるが、gemini/default provider + github_research は
+    operator-disabled として一貫して拒否される（#1886, #2002）。"""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1582,7 +1590,7 @@ def test_validate_request_accepts_github_research_api_get(tmp_path, monkeypatch)
 
     errors = module.validate_request(request)
 
-    assert errors == [], f"unexpected errors: {errors}"
+    assert any("github_research_operator_disabled" in e for e in errors), f"errors={errors}"
 
 
 def test_validate_request_rejects_github_research_post_to_issue_url(tmp_path, monkeypatch):
@@ -1622,7 +1630,13 @@ def test_validate_request_rejects_github_research_text_denied_command(tmp_path, 
 
 
 def test_run_delegation_github_research_deny_sets_failure_class(tmp_path, monkeypatch):
-    """github_research: 拒否 request は failure_class: github_research_command_denied が設定されること。"""
+    """Issue #2522 migration: gemini/default provider + github_research is now
+    operator-disabled (#1886, #2002), which takes precedence over the
+    argv-specific `github_research_command_denied` classification -- even for
+    a request whose gh_commands argv would independently be denied (`issue
+    comment`). The underlying argv-denial logic itself remains dormant (not
+    deleted) and is still exercised directly via
+    test_validate_request_rejects_github_research_issue_comment_argv()."""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1632,7 +1646,7 @@ def test_run_delegation_github_research_deny_sets_failure_class(tmp_path, monkey
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
     assert result["ok"] is False
-    assert result.get("failure_class") == "github_research_command_denied"
+    assert result.get("failure_class") == "github_research_operator_disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -1724,7 +1738,10 @@ def test_validate_request_rejects_github_research_field_equals_form(tmp_path, mo
     ["-f", "-F", "--field", "--raw-field", "--input"],
 )
 def test_run_delegation_github_research_implicit_post_flag_sets_failure_class(tmp_path, monkeypatch, flag):
-    """run_delegation with gh api implicit-POST flag sets failure_class: github_research_command_denied."""
+    """Issue #2522 migration: gemini/default provider + github_research is
+    operator-disabled (#1886, #2002) even for an implicit-POST `gh api`
+    argv -- operator-disabled takes precedence over the dormant
+    `github_research_command_denied` classification."""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1734,11 +1751,14 @@ def test_run_delegation_github_research_implicit_post_flag_sets_failure_class(tm
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
     assert result["ok"] is False
-    assert result.get("failure_class") == "github_research_command_denied"
+    assert result.get("failure_class") == "github_research_operator_disabled"
 
 
 def test_run_delegation_github_research_api_graphql_sets_failure_class(tmp_path, monkeypatch):
-    """run_delegation with gh api graphql sets failure_class: github_research_command_denied."""
+    """Issue #2522 migration: gemini/default provider + github_research is
+    operator-disabled (#1886, #2002) even for a `gh api graphql` argv --
+    operator-disabled takes precedence over the dormant
+    `github_research_command_denied` classification."""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1748,7 +1768,7 @@ def test_run_delegation_github_research_api_graphql_sets_failure_class(tmp_path,
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
     assert result["ok"] is False
-    assert result.get("failure_class") == "github_research_command_denied"
+    assert result.get("failure_class") == "github_research_operator_disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -1757,7 +1777,10 @@ def test_run_delegation_github_research_api_graphql_sets_failure_class(tmp_path,
 
 
 def test_run_delegation_github_research_post_to_issue_url_sets_failure_class(tmp_path, monkeypatch):
-    """github_research with post_to_issue_url sets failure_class: github_research_command_denied."""
+    """Issue #2522 migration: gemini/default provider + github_research is
+    operator-disabled (#1886, #2002) even when combined with
+    post_to_issue_url -- operator-disabled takes precedence over the dormant
+    `github_research_command_denied` classification."""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1768,7 +1791,7 @@ def test_run_delegation_github_research_post_to_issue_url_sets_failure_class(tmp
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
     assert result["ok"] is False
-    assert result.get("failure_class") == "github_research_command_denied"
+    assert result.get("failure_class") == "github_research_operator_disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -1777,7 +1800,12 @@ def test_run_delegation_github_research_post_to_issue_url_sets_failure_class(tmp
 
 
 def test_run_delegation_github_research_all_gh_commands_fail_returns_gh_auth_required(tmp_path, monkeypatch):
-    """When all gh_commands fail (e.g. FileNotFoundError), ok=False and failure_class=gh_auth_required."""
+    """Issue #2522 migration: gemini/default provider + github_research is
+    operator-disabled (#1886, #2002) *before* the request ever reaches the
+    gh_commands pre-exec block, so the dormant `gh_auth_required` fail-close
+    path (all gh_commands failing) is now unreachable for this provider --
+    `fake_subprocess_run` below must never be invoked (zero external `gh`
+    calls, consistent with AC3)."""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1785,15 +1813,139 @@ def test_run_delegation_github_research_all_gh_commands_fail_returns_gh_auth_req
     request["gh_commands"] = [{"argv": ["issue", "view", "2232"]}]
 
     def fake_subprocess_run(cmd, **kwargs):
-        raise FileNotFoundError("gh: command not found")
+        raise AssertionError(f"gh subprocess must not be invoked (operator-disabled); cmd={cmd!r}")
 
     monkeypatch.setattr(module.subprocess, "run", fake_subprocess_run)
 
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
     assert result["ok"] is False
-    assert result.get("failure_class") == "gh_auth_required"
-    assert "all gh_commands failed" in (result.get("failure_reason") or "")
+    assert result.get("failure_class") == "github_research_operator_disabled"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2522: provider=gemini (explicit or omitted) + github_research is
+# operator-disabled across all three entry points; provider=auto / provider=agy
+# github_research behavior is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_only_rejects_provider_gemini_github_research(tmp_path, monkeypatch):
+    """AC1: --validate-only (validate_request_for_provider) rejects an
+    explicit provider=gemini + tool_profile=github_research request as
+    operator-disabled, before any gh/Gemini CLI invocation is possible."""
+    module = load_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
+    request = make_github_research_request()
+    request["provider"] = "gemini"
+    request["gh_commands"] = [{"argv": ["issue", "view", "2232"]}]
+
+    errors = module.validate_request_for_provider(request)
+
+    assert any("github_research_operator_disabled" in e for e in errors), f"errors={errors}"
+
+
+def test_validate_only_rejects_provider_omitted_github_research(tmp_path, monkeypatch):
+    """AC2: --validate-only (validate_request_for_provider) rejects a request
+    with `provider` omitted (which resolves to the same effective Gemini
+    provider) + tool_profile=github_research as operator-disabled, identical
+    to the explicit provider=gemini case."""
+    module = load_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
+    request = make_github_research_request()
+    assert "provider" not in request
+    request["gh_commands"] = [{"argv": ["issue", "view", "2232"]}]
+
+    errors = module.validate_request_for_provider(request)
+
+    assert any("github_research_operator_disabled" in e for e in errors), f"errors={errors}"
+
+
+def test_normal_execution_rejects_effective_gemini_github_research_zero_external_calls(tmp_path, monkeypatch):
+    """AC1/AC2/AC3: run_gemini_headless.py normal execution (run_delegation)
+    rejects an effective-gemini (provider omitted) + github_research request
+    as operator-disabled with zero `gh` subprocess invocations and zero
+    Gemini CLI invocations -- the rejection happens strictly before both.
+    provider=auto/agy github_research is verified unaffected by the two
+    tests immediately below."""
+    module = load_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
+    request = make_github_research_request()
+    assert "provider" not in request
+    request["gh_commands"] = [{"argv": ["issue", "view", "2232"]}]
+
+    def fail_if_gh_invoked(cmd, **kwargs):
+        raise AssertionError(f"gh subprocess must not be invoked (operator-disabled); cmd={cmd!r}")
+
+    def fail_if_gemini_invoked(*args, **kwargs):
+        raise AssertionError("Gemini CLI must not be invoked (operator-disabled)")
+
+    monkeypatch.setattr(module.subprocess, "run", fail_if_gh_invoked)
+    monkeypatch.setattr(module, "_run_gemini", fail_if_gemini_invoked)
+
+    result = module.run_delegation(request, request_path=tmp_path / "request.json")
+
+    assert result["ok"] is False
+    assert result.get("failure_class") == "github_research_operator_disabled"
+    assert "operator-disabled" in (result.get("failure_reason") or "")
+
+
+def test_provider_auto_github_research_still_unsupported(tmp_path, monkeypatch):
+    """AC3: provider=auto + github_research keeps its existing
+    `provider_profile_unsupported` behavior unchanged (github_research is not
+    a member of PROVIDER_AUTO_ELIGIBLE_PROFILES, so provider_auto_dispatch()
+    never attempts either candidate provider and never reaches the new
+    operator-disabled check)."""
+    module = load_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
+    request = make_github_research_request()
+    request["provider"] = "auto"
+    request["gh_commands"] = [{"argv": ["issue", "view", "2232"]}]
+
+    result = module.run_delegation(request, request_path=tmp_path / "request.json")
+
+    assert result["ok"] is False
+    assert result.get("failure_class") == "provider_profile_unsupported"
+    assert result.get("failure_class") != "github_research_operator_disabled"
+
+
+def test_provider_agy_github_research_still_dispatches(tmp_path, monkeypatch):
+    """AC3: provider=agy + github_research keeps dispatching to
+    run_agy_github_research_e2e.run_github_research_route() unchanged (Issue
+    #1920 dispatch is not affected by the new operator-disabled check, which
+    only applies to validate_request(), never called for provider=agy).
+
+    Asserts on run_github_research_route()'s own distinctive base_result shape
+    (safety_mode="degraded_wrapper_only" / actual_model="agy-default") rather
+    than a specific exit_code: depending on whether the executing environment
+    happens to have a live `agy` CLI / authenticated `gh` (this route's own
+    `_preflight()` probes both), the route may SKIP fail-closed (exit 77),
+    succeed (exit 0), or fail for an environment-specific runtime reason (e.g.
+    exit 1) -- none of which is the operator-disabled / unsupported_provider_profile
+    class this Issue is scoped to. See test_agy_github_research_contract.py /
+    test_agy_github_research_e2e.py for the full AGY-side contract."""
+    module = load_module()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    request = {
+        "schema": "delegation_request_v1",
+        "provider": "agy",
+        "tool_profile": "github_research",
+        "prompt": "Investigate GitHub issue #2232 via gh issue view.",
+    }
+
+    result = module.run_delegation(request, request_path=tmp_path / "request.json")
+
+    assert result["tool_profile"] == "github_research"
+    assert result.get("provider") == "agy"
+    assert result.get("safety_mode") == "degraded_wrapper_only"
+    assert result.get("actual_model") == "agy-default"
+    assert result.get("failure_class") != "unsupported_provider_profile"
+    assert result.get("failure_class") != "github_research_operator_disabled"
 
 
 # ---------------------------------------------------------------------------
@@ -1906,7 +2058,10 @@ def test_validate_github_research_argv_allows_equals_form_get(argv):
 
 
 def test_run_delegation_github_research_method_equals_post_sets_failure_class(tmp_path, monkeypatch):
-    """run_delegation: gh api --method=POST は failure_class: github_research_command_denied を返すこと。"""
+    """Issue #2522 migration: gemini/default provider + github_research is
+    operator-disabled (#1886, #2002) even for a `gh api --method=POST` argv --
+    operator-disabled takes precedence over the dormant
+    `github_research_command_denied` classification."""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1916,11 +2071,14 @@ def test_run_delegation_github_research_method_equals_post_sets_failure_class(tm
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
     assert result["ok"] is False
-    assert result.get("failure_class") == "github_research_command_denied"
+    assert result.get("failure_class") == "github_research_operator_disabled"
 
 
 def test_run_delegation_github_research_x_equals_delete_sets_failure_class(tmp_path, monkeypatch):
-    """run_delegation: gh api -X=DELETE は failure_class: github_research_command_denied を返すこと。"""
+    """Issue #2522 migration: gemini/default provider + github_research is
+    operator-disabled (#1886, #2002) even for a `gh api -X=DELETE` argv --
+    operator-disabled takes precedence over the dormant
+    `github_research_command_denied` classification."""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -1930,7 +2088,7 @@ def test_run_delegation_github_research_x_equals_delete_sets_failure_class(tmp_p
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
     assert result["ok"] is False
-    assert result.get("failure_class") == "github_research_command_denied"
+    assert result.get("failure_class") == "github_research_operator_disabled"
 
 
 def test_text_denied_pattern_blocks_method_equals_form(tmp_path, monkeypatch):
@@ -2017,7 +2175,10 @@ def test_validate_request_rejects_github_research_empty_gh_commands(tmp_path, mo
 
 
 def test_run_delegation_github_research_empty_gh_commands_sets_failure_class(tmp_path, monkeypatch):
-    """run_delegation: gh_commands=[] は failure_class: github_research_command_denied を返すこと。"""
+    """Issue #2522 migration: gemini/default provider + github_research is
+    operator-disabled (#1886, #2002) even for gh_commands=[] -- operator-disabled
+    takes precedence over the dormant `github_research_command_denied`
+    classification."""
     module = load_module()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "context.md").write_text("ctx", encoding="utf-8")
@@ -2027,8 +2188,8 @@ def test_run_delegation_github_research_empty_gh_commands_sets_failure_class(tmp
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
     assert result["ok"] is False
-    assert result.get("failure_class") == "github_research_command_denied", (
-        f"expected failure_class=github_research_command_denied, got: {result.get('failure_class')}"
+    assert result.get("failure_class") == "github_research_operator_disabled", (
+        f"expected failure_class=github_research_operator_disabled, got: {result.get('failure_class')}"
     )
 
 
