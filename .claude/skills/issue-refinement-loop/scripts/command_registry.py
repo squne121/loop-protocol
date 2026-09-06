@@ -1141,6 +1141,179 @@ def render_command(command_id: str, params: dict[str, Any]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Registry structural validator (Issue #2152)
+#
+# validate_registry() is a pure, side-effect-free static check of REGISTRY's
+# structural integrity. It does NOT call render_command() and does NOT
+# mutate REGISTRY. It aggregates every detected inconsistency instead of
+# aborting on the first one, so a single invocation surfaces the full set of
+# problems across the whole registry.
+# ---------------------------------------------------------------------------
+
+_KNOWN_PLACEHOLDER_TYPES: frozenset[str] = frozenset({
+    "positive_int",
+    "owner_repo",
+    "path",
+    "repo_relative_file",
+    "body_file",
+    "url",
+    "github_issue_comment_url",
+    "verdict",
+    "string",
+    "bool_flag",
+})
+
+# Matches a `{name}` placeholder reference anywhere inside an argv token,
+# including partial-token placeholders (e.g. "repos/{repo}/issues/{issue_number}")
+# and multiple placeholders packed into a single token. Text outside argv
+# (e.g. allowed_write_roots values) is never scanned by this pattern because
+# validate_registry() only applies it to entry["argv"] tokens.
+_PLACEHOLDER_REF_RE = re.compile(r"\{([^{}]+)\}")
+
+
+def validate_registry() -> list[str]:
+    """Validate REGISTRY's structural integrity without side effects.
+
+    Checks performed per entry:
+      - registry key matches entry['id']
+      - argv is a non-empty list[str]
+      - the SET of placeholder names referenced in argv (whole-token or
+        embedded in a larger literal token) matches the SET of declared
+        `placeholders` keys (occurrence count / exactly-once is NOT
+        enforced -- repeated use of the same placeholder, or multiple
+        placeholders inside one token, are both valid)
+      - each placeholder spec is a dict
+      - `type` (defaulting to "string" when absent, matching
+        `_validate_placeholder_value()`'s own default) is a known type
+      - `required` / `optional_flag_pair`, when present, are bool
+      - `optional_flag_pair: True` placeholders are used as a whole argv
+        token ("{name}") preceded by a literal (non-placeholder) flag
+        token -- matching render_command()'s unconditional-drop-of-the-
+        preceding-token omission semantics
+      - `bool_flag` placeholders are used as a whole argv token and declare
+        a non-empty `flag_literal`
+
+    Returns:
+        A list of diagnostic strings, one per detected inconsistency, each
+        prefixed with the offending command id (and argv index where
+        applicable) so multiple issues -- even across different commands --
+        can be told apart. An empty list means REGISTRY passed validation.
+        This function never raises; all findings are aggregated instead of
+        aborting on the first inconsistency.
+    """
+    errors: list[str] = []
+
+    for key, entry in REGISTRY.items():
+        cmd_id = entry.get("id")
+        if cmd_id != key:
+            errors.append(
+                f"{key}: registry key {key!r} does not match entry id {cmd_id!r}"
+            )
+
+        argv = entry.get("argv")
+        if not isinstance(argv, list) or not argv:
+            errors.append(f"{key}: argv must be a non-empty list[str], got {argv!r}")
+            continue
+        if not all(isinstance(tok, str) for tok in argv):
+            errors.append(f"{key}: argv must contain only str tokens")
+            continue
+
+        placeholders = entry.get("placeholders")
+        if not isinstance(placeholders, dict):
+            errors.append(
+                f"{key}: placeholders must be a dict, got {type(placeholders).__name__}"
+            )
+            placeholders = {}
+
+        # Set of placeholder names actually referenced in argv (whole-token
+        # or partial-token). Occurrence count and exactly-once are
+        # deliberately not tracked here.
+        used_names: set[str] = set()
+        for token in argv:
+            for match in _PLACEHOLDER_REF_RE.finditer(token):
+                used_names.add(match.group(1))
+
+        declared_names = set(placeholders.keys())
+
+        for name in sorted(used_names - declared_names):
+            errors.append(
+                f"{key}: argv references undeclared placeholder '{{{name}}}'"
+            )
+        for name in sorted(declared_names - used_names):
+            errors.append(
+                f"{key}: placeholder '{name}' is declared in placeholders "
+                f"but never used in argv"
+            )
+
+        for name, spec in placeholders.items():
+            if not isinstance(spec, dict):
+                errors.append(
+                    f"{key}: placeholder '{name}' spec must be a dict, "
+                    f"got {type(spec).__name__}"
+                )
+                continue
+
+            ph_type = spec.get("type", "string")
+            if ph_type not in _KNOWN_PLACEHOLDER_TYPES:
+                errors.append(
+                    f"{key}: placeholder '{name}' has unknown type {ph_type!r}"
+                )
+
+            if "required" in spec and not isinstance(spec["required"], bool):
+                errors.append(
+                    f"{key}: placeholder '{name}' 'required' must be bool, "
+                    f"got {type(spec['required']).__name__}"
+                )
+
+            if "optional_flag_pair" in spec and not isinstance(
+                spec["optional_flag_pair"], bool
+            ):
+                errors.append(
+                    f"{key}: placeholder '{name}' 'optional_flag_pair' must "
+                    f"be bool, got {type(spec['optional_flag_pair']).__name__}"
+                )
+
+            whole_token_positions = [
+                idx for idx, tok in enumerate(argv) if tok == f"{{{name}}}"
+            ]
+
+            if spec.get("optional_flag_pair") is True:
+                if not whole_token_positions:
+                    errors.append(
+                        f"{key}: placeholder '{name}' optional_flag_pair "
+                        f"requires a whole-token '{{{name}}}' occurrence in argv"
+                    )
+                for idx in whole_token_positions:
+                    if idx == 0:
+                        errors.append(
+                            f"{key} argv[{idx}]: optional_flag_pair "
+                            f"requires a preceding flag"
+                        )
+                        continue
+                    prev_tok = argv[idx - 1]
+                    if prev_tok.startswith("{") and prev_tok.endswith("}"):
+                        errors.append(
+                            f"{key} argv[{idx}]: optional_flag_pair "
+                            f"requires a preceding flag"
+                        )
+
+            if ph_type == "bool_flag":
+                if not whole_token_positions:
+                    errors.append(
+                        f"{key}: placeholder '{name}' bool_flag requires a "
+                        f"whole-token '{{{name}}}' occurrence in argv"
+                    )
+                flag_literal = spec.get("flag_literal")
+                if not isinstance(flag_literal, str) or not flag_literal:
+                    errors.append(
+                        f"{key}: placeholder '{name}' bool_flag requires a "
+                        f"non-empty 'flag_literal'"
+                    )
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Shell string validator (AC4, Blocker 5, Blocker 6)
 # ---------------------------------------------------------------------------
 
@@ -1227,20 +1400,46 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="ISSUE_REFINEMENT_COMMAND_REGISTRY_V1 CLI"
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--list",
         action="store_true",
         help="Print ISSUE_REFINEMENT_COMMAND_REGISTRY_V1 JSON to stdout",
+    )
+    group.add_argument(
+        "--validate",
+        action="store_true",
+        help=(
+            "Validate REGISTRY structural integrity (side-effect-free static "
+            "check; does not call render_command()). Exit 0 with a PASS "
+            "summary on stdout when consistent, exit 1 with per-command "
+            "diagnostics on stderr otherwise."
+        ),
     )
     return parser.parse_args(argv if argv is not None else sys.argv[1:])
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
-    if args.list:
+    if args.validate:
+        errors = validate_registry()
+        if errors:
+            print(
+                f"FAIL: {len(errors)} registry inconsistency(ies) detected "
+                f"across {len(REGISTRY)} commands:",
+                file=sys.stderr,
+            )
+            for err in errors:
+                print(f"  - {err}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"PASS: {len(REGISTRY)} registry entries validated, "
+            f"no structural inconsistencies found"
+        )
+    elif args.list:
         print(json.dumps(export_registry(), ensure_ascii=False, indent=2))
     else:
-        print("Usage: command_registry.py --list", file=sys.stderr)
+        print("Usage: command_registry.py --list | --validate", file=sys.stderr)
         sys.exit(1)
 
 

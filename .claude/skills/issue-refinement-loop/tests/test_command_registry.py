@@ -950,3 +950,337 @@ class TestAuthorityTransportPrivilegedExecutorRealSubprocessDispatch:
         payload = json.loads(result.stdout)
         assert payload["status"] == "environment_failure", payload
         assert payload["reason_code"] == "missing_file", payload
+
+
+# ---------------------------------------------------------------------------
+# Issue #2152: validate_registry() static structural checker + --validate CLI
+# ---------------------------------------------------------------------------
+
+def _run_validate_against(fixture_registry: dict, monkeypatch) -> list:
+    """Run validate_registry() against a fixture registry dict, without
+    permanently mutating the real module-level REGISTRY (monkeypatch
+    auto-restores it at test teardown)."""
+    monkeypatch.setattr(reg, "REGISTRY", fixture_registry)
+    return reg.validate_registry()
+
+
+class TestValidateRegistry:
+    """Unit tests for command_registry.validate_registry() (Issue #2152 AC1/AC2)."""
+
+    def test_current_registry_passes_validation(self):
+        """AC2: the real, unmodified REGISTRY validates clean -- none of the
+        existing normal patterns (partial-token / multiple-placeholders-per-
+        token / repeated placeholder use / optional_flag_pair / bool_flag /
+        placeholder-less command / argv-external '{active_issue}' / same
+        placeholder routed to two different flags) is misdetected as an
+        inconsistency."""
+        errors = reg.validate_registry()
+        assert errors == [], errors
+
+    def test_current_registry_named_normal_patterns_are_present_and_pass(self):
+        """AC2 (explicit coverage): pin down that the specific REGISTRY
+        entries cited in the Issue as normal patterns actually exist with the
+        expected shape, so this test fails loudly (instead of vacuously
+        passing) if one of those entries is ever removed or renamed."""
+        # 1 argv token containing multiple placeholders.
+        assert any(
+            "{repo}" in tok and "{issue_number}" in tok
+            for tok in reg.REGISTRY["gh.issue.comments.list"]["argv"]
+        )
+        # Same placeholder used more than once in argv.
+        human_ctx_argv = reg.REGISTRY["preflight.run.with_human_context"]["argv"]
+        assert human_ctx_argv.count("{anchor_comment_url}") >= 2
+        # optional_flag_pair.
+        assert (
+            reg.REGISTRY["decide.run"]["placeholders"]["max_iterations"]["optional_flag_pair"]
+            is True
+        )
+        # bool_flag without an explicit 'required' key.
+        authority_expected_spec = reg.REGISTRY["decide.run"]["placeholders"]["authority_expected"]
+        assert authority_expected_spec["type"] == "bool_flag"
+        assert "required" not in authority_expected_spec
+        # Placeholder-less command.
+        assert reg.REGISTRY["plan.run"]["placeholders"] == {}
+        assert not any("{" in tok for tok in reg.REGISTRY["plan.run"]["argv"])
+        # argv-external '{active_issue}' lives in allowed_write_roots, not argv.
+        assert any(
+            "{active_issue}" in root
+            for root in reg.REGISTRY["preflight.run"]["allowed_write_roots"]
+        )
+        assert not any("{active_issue}" in tok for tok in reg.REGISTRY["preflight.run"]["argv"])
+        # Same placeholder name routed to two different flags.
+        fixture_argv = reg.REGISTRY["preflight.run.fixture.with_human_context"]["argv"]
+        anchor_positions = [i for i, t in enumerate(fixture_argv) if t == "{anchor_comment_url}"]
+        assert len(anchor_positions) == 2
+        assert fixture_argv[anchor_positions[0] - 1] != fixture_argv[anchor_positions[1] - 1]
+
+        assert reg.validate_registry() == []
+
+    def test_undeclared_placeholder_in_argv_is_detected(self, monkeypatch):
+        """AC1: argv references a placeholder with no matching `placeholders`
+        declaration must be detected."""
+        fixture = {
+            "example.undeclared": {
+                "id": "example.undeclared",
+                "argv": ["uv", "run", "python3", "script.py", "--foo", "{foo}"],
+                "placeholders": {},
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("undeclared placeholder" in e and "foo" in e for e in errors)
+
+    def test_declared_but_unused_placeholder_is_detected(self, monkeypatch):
+        """AC1: a placeholder declared in `placeholders` but never referenced
+        anywhere in argv must be detected."""
+        fixture = {
+            "example.unused": {
+                "id": "example.unused",
+                "argv": ["uv", "run", "python3", "script.py"],
+                "placeholders": {
+                    "unused_name": {"type": "string", "required": True},
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("never used in argv" in e and "unused_name" in e for e in errors)
+
+    def test_non_list_argv_is_detected(self, monkeypatch):
+        """AC1: argv that is not a list must be detected."""
+        fixture = {
+            "example.badargv": {
+                "id": "example.badargv",
+                "argv": "uv run python3 script.py",
+                "placeholders": {},
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("non-empty list[str]" in e for e in errors)
+
+    def test_empty_argv_is_detected(self, monkeypatch):
+        """AC1: an empty argv list must be detected."""
+        fixture = {
+            "example.emptyargv": {
+                "id": "example.emptyargv",
+                "argv": [],
+                "placeholders": {},
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("non-empty list[str]" in e for e in errors)
+
+    def test_unknown_placeholder_type_is_detected(self, monkeypatch):
+        """AC1: an unrecognized `type` value must be detected."""
+        fixture = {
+            "example.badtype": {
+                "id": "example.badtype",
+                "argv": ["uv", "run", "python3", "script.py", "{thing}"],
+                "placeholders": {
+                    "thing": {"type": "not_a_real_type", "required": True},
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("unknown type" in e for e in errors)
+
+    def test_optional_flag_pair_without_preceding_flag_is_detected(self, monkeypatch):
+        """AC1: an optional_flag_pair whole-token placeholder whose preceding
+        argv token is not a literal flag (here: it's the first token) must be
+        detected."""
+        fixture = {
+            "example.badoptional": {
+                "id": "example.badoptional",
+                "argv": ["{thing}"],
+                "placeholders": {
+                    "thing": {
+                        "type": "string",
+                        "required": False,
+                        "optional_flag_pair": True,
+                    },
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("optional_flag_pair" in e and "preceding flag" in e for e in errors)
+
+    def test_optional_flag_pair_preceded_by_placeholder_is_detected(self, monkeypatch):
+        """AC1: an optional_flag_pair whole-token placeholder preceded by
+        another placeholder token (not a literal flag) must be detected."""
+        fixture = {
+            "example.badoptional2": {
+                "id": "example.badoptional2",
+                "argv": ["uv", "{other}", "{thing}"],
+                "placeholders": {
+                    "other": {"type": "string", "required": True},
+                    "thing": {
+                        "type": "string",
+                        "required": False,
+                        "optional_flag_pair": True,
+                    },
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("optional_flag_pair" in e and "preceding flag" in e for e in errors)
+
+    def test_bool_flag_without_flag_literal_is_detected(self, monkeypatch):
+        """AC1: a bool_flag placeholder missing (or with empty) `flag_literal`
+        must be detected."""
+        fixture = {
+            "example.badboolflag": {
+                "id": "example.badboolflag",
+                "argv": ["uv", "run", "python3", "script.py", "{thing}"],
+                "placeholders": {
+                    "thing": {"type": "bool_flag"},
+                },
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("flag_literal" in e for e in errors)
+
+    def test_registry_key_id_mismatch_is_detected(self, monkeypatch):
+        """AC1: entry['id'] must match its REGISTRY dict key."""
+        fixture = {
+            "example.keymismatch": {
+                "id": "example.other_id",
+                "argv": ["uv", "run", "python3", "script.py"],
+                "placeholders": {},
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("does not match entry id" in e for e in errors)
+
+    def test_placeholder_spec_not_dict_is_detected(self, monkeypatch):
+        """AC1: a placeholder spec that is not itself a dict must be
+        detected."""
+        fixture = {
+            "example.badspec": {
+                "id": "example.badspec",
+                "argv": ["uv", "run", "python3", "script.py", "{thing}"],
+                "placeholders": {"thing": "not-a-dict"},
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert errors
+        assert any("must be a dict" in e for e in errors)
+
+    def test_multiple_inconsistencies_are_all_aggregated_not_abort_on_first(self, monkeypatch):
+        """AC1: validate_registry() does not raise / abort on the first
+        detected problem -- distinct inconsistencies across multiple commands
+        must all be present in a single returned list."""
+        fixture = {
+            "example.multi_a": {
+                "id": "example.multi_a",
+                "argv": ["uv", "run", "python3", "script.py", "{undeclared}"],
+                "placeholders": {},
+            },
+            "example.multi_b": {
+                "id": "wrong_id",
+                "argv": ["uv", "run", "python3", "script.py"],
+                "placeholders": {},
+            },
+        }
+        errors = _run_validate_against(fixture, monkeypatch)
+        assert len(errors) >= 2
+        assert any("undeclared placeholder" in e for e in errors)
+        assert any("does not match entry id" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2152: --validate CLI wiring + exit codes
+# ---------------------------------------------------------------------------
+
+class TestValidateRegistryCLI:
+    """CLI wiring / exit-code tests for `--validate` (Issue #2152 AC3-AC5)."""
+
+    def test_validate_success_exit_0_with_pass_summary_on_stdout(self):
+        """AC3: `--validate` against the real (consistent) REGISTRY exits 0
+        and prints a PASS summary to stdout."""
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "command_registry.py"), "--validate"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+        assert "PASS" in result.stdout
+        assert result.stderr == ""
+
+    def test_validate_failure_exit_1_with_command_id_and_location_diagnostics(
+        self, monkeypatch, capsys
+    ):
+        """AC3: `--validate` against an inconsistent registry exits 1 and
+        prints diagnostics identifying the offending command id and problem
+        location to stderr."""
+        fixture = {
+            "example.cli_bad": {
+                "id": "example.cli_bad",
+                "argv": ["uv", "run", "python3", "script.py", "{undeclared_flag}"],
+                "placeholders": {},
+            },
+        }
+        monkeypatch.setattr(reg, "REGISTRY", fixture)
+        with pytest.raises(SystemExit) as exc_info:
+            reg.main(["--validate"])
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "example.cli_bad" in captured.err
+        assert "undeclared_flag" in captured.err
+        assert captured.out == ""
+
+    def test_list_and_validate_together_exit_2(self):
+        """AC4: `--list --validate` together must be rejected via argparse's
+        mutually exclusive group, exit code 2."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "command_registry.py"),
+                "--list",
+                "--validate",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 2, (result.returncode, result.stdout, result.stderr)
+
+    def test_list_alone_still_exits_0_with_json(self):
+        """AC5 regression: `--list` alone still exits 0 with the existing
+        JSON output contract, unchanged by the `--validate` addition."""
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "command_registry.py"), "--list"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+        data = json.loads(result.stdout)
+        assert data["schema"] == "ISSUE_REFINEMENT_COMMAND_REGISTRY_V1"
+
+    def test_no_args_still_exits_1_with_stderr_usage(self):
+        """AC5 regression: no args still exits 1 with a stderr usage message,
+        unchanged by the `--validate` addition."""
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "command_registry.py")],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1, (result.returncode, result.stdout, result.stderr)
+        assert "Usage" in result.stderr
+        assert result.stdout == ""
+
+    def test_help_mentions_both_list_and_validate(self):
+        """`--help` documents both `--list` and `--validate` usage, exit 0."""
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "command_registry.py"), "--help"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+        assert "--list" in result.stdout
+        assert "--validate" in result.stdout
