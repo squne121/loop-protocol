@@ -1387,30 +1387,78 @@ class PrivateParentDirError(Exception):
         super().__init__(reason_code)
 
 
-def _open_parent_dir_nofollow(parent: Path) -> int:
-    """Open ``parent`` with O_NOFOLLOW, raising ``PrivateParentDirError``
-    (never silently falling through) on any failure. A single fd from this
-    call is reused for every subsequent check (fstat, fchmod) so there is no
-    lstat-then-act TOCTOU window: the fd is pinned to whatever inode was
-    actually opened, not to a pathname that could be swapped afterwards
-    (Issue #2004 P1-1).
+def _diagnose_parent_is_symlink(parent: Path) -> bool:
+    """Non-blocking, non-authoritative diagnostic used ONLY to choose which
+    reason_code to attach to an open() call that has ALREADY failed and
+    ALREADY rejected the parent (Issue #2029).
 
-    Deliberately does NOT also pass O_DIRECTORY: per POSIX,
-    open(O_DIRECTORY | O_NOFOLLOW) on a symlink is required to fail with
-    ENOTDIR (not ELOOP), which is indistinguishable from "this path
-    component genuinely is not a directory". O_NOFOLLOW alone reliably
-    fails with ELOOP for a symlink regardless of its target type; the
-    caller's separate ``stat.S_ISDIR`` check (against the fd of whatever WAS
-    actually opened) is what verifies "is a directory".
+    ``Path.is_symlink()`` is an ``lstat()`` under the hood: it inspects the
+    directory entry itself without ever opening or following the target,
+    so it never blocks regardless of what kind of file (FIFO, device,
+    regular file, another symlink, ...) the entry is or points to. This is
+    deliberately NOT re-opening the path, NOT following the symlink to see
+    what is on the other end, and NOT capable of turning an already-made
+    rejection back into an acceptance -- it only decides between two
+    already-rejecting reason_codes.
+    """
+    try:
+        return parent.is_symlink()
+    except OSError:
+        return False
+
+
+def _open_parent_dir_nofollow(parent: Path) -> int:
+    """Open ``parent`` with O_DIRECTORY | O_NOFOLLOW, raising
+    ``PrivateParentDirError`` (never silently falling through) on any
+    failure. A single fd from this call is reused for every subsequent
+    check (fstat, fchmod) so there is no lstat-then-act TOCTOU window: the
+    fd is pinned to whatever inode was actually opened, not to a pathname
+    that could be swapped afterwards (Issue #2004 P1-1).
+
+    Issue #2029: O_DIRECTORY is included (guarded by ``hasattr(os,
+    "O_DIRECTORY")`` the same way O_NOFOLLOW already is). Its purpose here
+    is NOT reason classification -- it is what makes THIS open() call
+    itself non-blocking. Without O_DIRECTORY, calling ``os.open()`` on a
+    path whose final component is a FIFO (or certain other special files)
+    can block INSIDE the open() call indefinitely if there is no writer on
+    the other end -- long before any later ``stat.S_ISDIR`` check would get
+    a chance to reject it. O_DIRECTORY makes the kernel fail the open
+    itself the moment path resolution finds a non-directory final
+    component, before any FIFO/device-specific open() semantics ever run.
+
+    A prior version of this function deliberately omitted O_DIRECTORY,
+    reasoning that combining it with O_NOFOLLOW would make ELOOP (symlink)
+    and ENOTDIR (existing non-directory) ambiguous. Empirically (verified
+    against the real syscall) that reasoning had it backwards: WITHOUT
+    O_DIRECTORY, O_NOFOLLOW alone reliably reports ELOOP for a trailing
+    symlink; but WITH O_DIRECTORY added, a trailing symlink (even one
+    pointing at a real, valid directory) is ALSO reported as ENOTDIR on
+    this platform, not ELOOP -- i.e. adding the one flag needed to avoid
+    blocking on a FIFO also makes the errno alone insufficient to tell a
+    symlink apart from a genuine non-directory. Per Issue #2029 guidance,
+    the specific errno is NOT treated as a portable reject-vs-accept
+    contract either way (both cases reject just the same); ELOOP is still
+    checked first for platforms/kernels where it IS reported, and ENOTDIR
+    falls back to the non-blocking, non-authoritative
+    ``_diagnose_parent_is_symlink()`` lstat purely to choose a more
+    specific diagnostic reason_code for an already-rejected open -- never
+    to reopen with weaker flags or to retry after following the symlink.
     """
     flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         return os.open(parent, flags)
     except OSError as exc:
-        if getattr(exc, "errno", None) == errno.ELOOP:
+        errno_value = getattr(exc, "errno", None)
+        if errno_value == errno.ELOOP:
             raise PrivateParentDirError("parent_is_symlink") from exc
+        if errno_value == errno.ENOTDIR:
+            if _diagnose_parent_is_symlink(parent):
+                raise PrivateParentDirError("parent_is_symlink") from exc
+            raise PrivateParentDirError("parent_not_a_directory") from exc
         raise PrivateParentDirError("parent_unavailable") from exc
 
 
@@ -1474,31 +1522,65 @@ def validate_private_parent_dir_readonly(path: Path, *, expected_uid: int | None
     verifies the parent directory is a real, non-symlink directory owned by
     ``expected_uid`` before the caller trusts anything read from inside it.
 
-    Returns ``None`` on success, ``"parent_missing"`` if the parent does not
-    exist (the artifact inside it cannot exist either -- treat as the
-    ordinary "missing" case, not a rejection), or one of the
-    ``PrivateParentDirError`` reason_codes above.
+    Returns ``None`` on success, ``"parent_missing"`` ONLY if the parent
+    path does not exist at all (ENOENT -- the artifact inside it cannot
+    exist either, so this is the ordinary "missing" case, not a rejection),
+    or one of the ``PrivateParentDirError`` reason_codes above.
+
+    Issue #2029: a parent path that DOES exist but is not usable as a
+    directory (a FIFO, a device node, a regular file, etc.) is never
+    classified as ``"parent_missing"`` -- that previously conflated "there
+    is genuinely nothing here yet" with "something exists here and it is
+    wrong", which both silently downgraded a real non-directory hazard to
+    the ordinary missing-artifact code path AND (before O_DIRECTORY was
+    added below) could leave this open() call itself blocking indefinitely
+    on a FIFO with no writer. It is now classified as
+    ``"parent_not_a_directory"``, the same reason_code the write-side
+    ``prepare_private_parent_dir`` / ``_open_parent_dir_nofollow`` already
+    use for an existing non-directory parent -- see that function's
+    docstring for why O_DIRECTORY (guarded by ``hasattr(os,
+    "O_DIRECTORY")``, mirroring the existing O_NOFOLLOW availability guard)
+    is what makes this open() itself non-blocking, and why (once
+    O_DIRECTORY is combined with O_NOFOLLOW) the specific errno alone no
+    longer reliably distinguishes ELOOP-shaped "symlink" from
+    ENOTDIR-shaped "existing non-directory" -- see
+    ``_diagnose_parent_is_symlink()``'s docstring for the non-blocking,
+    non-authoritative lstat used to tell the two apart purely for this
+    reason_code, never to reopen or retry.
     """
     if expected_uid is None:
         expected_uid = os.getuid()
 
-    # See _open_parent_dir_nofollow()'s docstring: O_DIRECTORY is
-    # deliberately NOT combined with O_NOFOLLOW here either, for the same
-    # POSIX ENOTDIR-vs-ELOOP ambiguity reason.
     parent = path.parent
     flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(parent, flags)
     except OSError as exc:
-        if getattr(exc, "errno", None) == errno.ELOOP:
+        errno_value = getattr(exc, "errno", None)
+        if errno_value == errno.ENOENT:
+            return "parent_missing"
+        if errno_value == errno.ELOOP:
             return "parent_is_symlink"
+        if errno_value == errno.ENOTDIR:
+            if _diagnose_parent_is_symlink(parent):
+                return "parent_is_symlink"
+            return "parent_not_a_directory"
+        # Any other open() failure (e.g. EACCES) is fail-closed as
+        # "parent_missing": the caller cannot distinguish "not there" from
+        # "there but unusable" without further privileged inspection, and
+        # both must result in refusing to trust the artifact underneath.
         return "parent_missing"
 
     try:
         st = os.fstat(fd)
         if not stat.S_ISDIR(st.st_mode):
+            # Defense in depth for a runtime lacking os.O_DIRECTORY: the
+            # open() above could not fail fast on a non-directory, so this
+            # fstat()-based check is the only thing rejecting it.
             return "parent_not_a_directory"
         if st.st_uid != expected_uid:
             return "parent_owner_mismatch"

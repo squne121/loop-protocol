@@ -31,6 +31,7 @@ import {
   existsSync,
   fchmodSync,
   fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -139,6 +140,38 @@ function maybePrintResolvedOverrideAndExit() {
 }
 maybePrintResolvedOverrideAndExit()
 
+// Issue #2029 test seam: invoke preparePrivateParentDir() directly from an
+// actual separate child process
+// (`--test-invoke-prepare-private-parent-dir <dir>`) so an isolated-fixture
+// regression test can assert its real fail-closed rejection of a
+// mkfifo-created FIFO parent directory WITHOUT ever blocking, without
+// duplicating preparePrivateParentDir()'s logic in the test suite itself.
+// Exits 0 with `ACCEPTED` or `REJECTED:<reason>` on stdout in both the
+// success and the handled-rejection case (only a genuine crash -- e.g. a
+// missing arg, or an uncaught non-PrivateParentDirError bug -- exits
+// non-zero); the parent test process is the one that enforces the external
+// watchdog timeout via its own subprocess spawn call, never a same-thread
+// timer inside this process. Never reached by production callers.
+function maybeInvokePreparePrivateParentDirAndExit() {
+  const argv = process.argv.slice(2)
+  const idx = argv.indexOf('--test-invoke-prepare-private-parent-dir')
+  if (idx === -1) return
+  const dirArg = argv[idx + 1]
+  if (!dirArg) {
+    fail('--test-invoke-prepare-private-parent-dir requires <dir>')
+    return
+  }
+  try {
+    preparePrivateParentDir(dirArg)
+    process.stdout.write('ACCEPTED\n')
+    process.exit(0)
+  } catch (err) {
+    process.stdout.write(`REJECTED:${err?.message ?? err}\n`)
+    process.exit(0)
+  }
+}
+maybeInvokePreparePrivateParentDirAndExit()
+
 // Issue #2004: moved from .claude/tmp/ to tmp/ (repo-approved local
 // temporary workspace root, Issue #1995 / #2001) in lockstep with the
 // eligibility producer/loader (check_session_recording_runtime_safety.py)
@@ -246,9 +279,9 @@ function main() {
   process.stdout.write(`bootstrap-source-bound-readiness: wrote ${readinessPath}\n`)
 }
 
-// Issue #2004 P1-1: validate and (only if newly created) chmod the parent
-// directory of the fixed private readiness artifact, mirroring the Python
-// eligibility producer's prepare_private_parent_dir() (see
+// Issue #2004 P1-1 / Issue #2029: validate and (only if newly created) chmod
+// the parent directory of the fixed private readiness artifact, mirroring
+// the Python eligibility producer's prepare_private_parent_dir() (see
 // .claude/scripts/check_session_recording_runtime_safety.py). The previous
 // implementation did an unconditional mkdirSync(..., {recursive: true}) +
 // chmodSync(dir, 0o700) with no verification at all, so a pre-existing
@@ -258,28 +291,54 @@ function main() {
 //     when it does not already exist; the resulting path is then opened
 //     and validated through the fd before fchmodSync(), the same as the
 //     pre-existing-parent case below;
-//   - for a pre-existing parent, opens it with O_RDONLY (adding
-//     O_NOFOLLOW when the runtime exposes fs.constants.O_NOFOLLOW) and
+//   - for a pre-existing parent, opens it with O_RDONLY | O_DIRECTORY
+//     (adding O_NOFOLLOW when the runtime exposes those constants) and
 //     verifies -- via the open file descriptor, never the pathname
 //     again, using fstatSync() -- that it is a real directory and, when
 //     process.getuid() is available, that its uid matches the current
 //     uid, before repairing its mode to exactly 0700 (a
 //     looser mode left by an older version of this script is explicitly
 //     repaired by policy, never silently trusted as-is).
+//
+// Issue #2029: O_DIRECTORY is now included whenever the runtime exposes
+// fs.constants.O_DIRECTORY (mirroring the existing O_NOFOLLOW availability
+// guard). Its purpose here is NOT reason classification -- it is what makes
+// this open call itself non-blocking. Without O_DIRECTORY, opening a path
+// whose final component is a FIFO (or any other special file that a bare
+// open() would otherwise wait on, e.g. a device) can block INSIDE the
+// open()/openSync() call indefinitely if there is no writer on the other
+// end -- long before fstatSync().isDirectory() ever gets a chance to reject
+// it. O_DIRECTORY makes the kernel fail the open itself the moment it
+// resolves a non-directory final path component, before any FIFO/device-
+// specific open() semantics run.
+//
+// Empirically (verified against the real syscall), combining O_DIRECTORY
+// with O_NOFOLLOW means a trailing symlink -- even one pointing at a real,
+// valid directory -- is ALSO reported as ENOTDIR, not ELOOP: the one flag
+// needed to avoid blocking on a FIFO also makes the errno/code alone
+// insufficient to tell a symlink apart from a genuine non-directory. Per
+// Issue #2029 guidance, the specific error code is NOT a portable
+// reject-vs-accept contract either way (both cases reject just the same);
+// ELOOP is still checked first for runtimes/kernels that DO report it, and
+// ENOTDIR falls back to a non-blocking, non-authoritative `lstatSync()`
+// (see `diagnoseParentIsSymlink()`) purely to choose a more specific
+// diagnostic reason for an ALREADY-rejected open -- never to reopen with
+// weaker flags or retry after following the symlink.
+function diagnoseParentIsSymlink(dir) {
+  try {
+    return lstatSync(dir).isSymbolicLink()
+  } catch {
+    return false
+  }
+}
+
 function preparePrivateParentDir(dir) {
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 })
   }
 
-  // Deliberately NOT combining O_DIRECTORY with O_NOFOLLOW here; this
-  // function does not rely on any specific errno precedence between them.
-  // O_NOFOLLOW is added to flags only when the runtime exposes
-  // fs.constants.O_NOFOLLOW, and only rejects a symlink at the trailing
-  // (basename) path component -- it does not affect earlier path
-  // components. Whether the opened path is actually a directory is
-  // verified separately below via fstatSync().isDirectory() against the
-  // fd of whatever was actually opened, not via the open() flags alone.
   let flags = fsConstants.O_RDONLY
+  if (typeof fsConstants.O_DIRECTORY === 'number') flags |= fsConstants.O_DIRECTORY
   if (typeof fsConstants.O_NOFOLLOW === 'number') flags |= fsConstants.O_NOFOLLOW
 
   let fd
@@ -289,11 +348,20 @@ function preparePrivateParentDir(dir) {
     if (err && err.code === 'ELOOP') {
       throw new Error('parent_is_symlink', { cause: err })
     }
+    if (err && err.code === 'ENOTDIR') {
+      if (diagnoseParentIsSymlink(dir)) {
+        throw new Error('parent_is_symlink', { cause: err })
+      }
+      throw new Error('parent_not_a_directory', { cause: err })
+    }
     throw new Error('parent_unavailable', { cause: err })
   }
   try {
     const st = fstatSync(fd)
     if (!st.isDirectory()) {
+      // Defense in depth for a runtime lacking fs.constants.O_DIRECTORY:
+      // the open() above could not fail fast on a non-directory, so this
+      // fstatSync()-based check is the only thing rejecting it.
       throw new Error('parent_not_a_directory')
     }
     if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {

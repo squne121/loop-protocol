@@ -907,3 +907,161 @@ def test_hermetic_default_path_producer_consumer_roundtrip(tmp_path: Path) -> No
     record_symlink = _run_default_path_consumer("inv-2004-hermetic-symlink-parent", tmp_path / "capture-symlink")
     assert record_symlink["parser_status"] == "eligibility_invalid_parent_symlink"
     assert stat.S_IMODE(os.stat(real_elsewhere).st_mode) == 0o755  # untouched
+
+
+# ---------------------------------------------------------------------------
+# Issue #2029 AC1/AC2/AC3/AC8: preparePrivateParentDir() (JS) /
+# prepare_private_parent_dir() (Python) / validate_private_parent_dir_readonly()
+# (Python) must fail-closed WITHOUT blocking when the parent directory PATH
+# is a real mkfifo-created FIFO. Each regression below runs the REAL target
+# function in an ACTUAL separate child process (a Node child process for
+# the JS function, a Python child process for the Python functions) while
+# THIS test process enforces an external (~4s) watchdog via
+# subprocess.run(timeout=...) -- never an in-process/same-thread timer. If
+# the fix under test regresses, the child process blocks inside its own
+# open()/openSync() call and subprocess.run raises TimeoutExpired, which
+# propagates uncaught and fails the test outright (never reinterpreted as a
+# pass just because the timed-out child was killed). A child spawn failure
+# or a syntax/import error inside the child also fails the test via a
+# non-zero/non-"REJECTED:" assertion below -- neither is ever treated as a
+# pass.
+# ---------------------------------------------------------------------------
+
+_FIFO_WATCHDOG_TIMEOUT_SECONDS = 4
+
+# Issue #2029: a tiny child-process harness (never a reimplementation of
+# prepare_private_parent_dir() / validate_private_parent_dir_readonly() --
+# it imports and calls the REAL production module, the same way this test
+# file itself does at import time) written to a fixture tmp_path at test
+# run time. It never touches the repo tree.
+_FIFO_PARENT_DIR_HARNESS_SOURCE = f"""
+import sys
+sys.path.insert(0, {str(_SCRIPTS_DIR)!r})
+import check_session_recording_runtime_safety as srrs
+from pathlib import Path
+
+
+def main() -> None:
+    parent_dir = Path(sys.argv[1])
+    mode = sys.argv[2]
+    path = parent_dir / "artifact.json"
+    if mode == "prepare":
+        try:
+            srrs.prepare_private_parent_dir(path)
+            print("ACCEPTED")
+        except srrs.PrivateParentDirError as exc:
+            print(f"REJECTED:{{exc.reason_code}}")
+    else:
+        reason = srrs.validate_private_parent_dir_readonly(path)
+        print("ACCEPTED" if reason is None else f"REJECTED:{{reason}}")
+
+
+main()
+"""
+
+
+def _write_fifo_parent_dir_harness(tmp_path: Path) -> Path:
+    harness_path = tmp_path / "fifo_parent_dir_harness.py"
+    harness_path.write_text(_FIFO_PARENT_DIR_HARNESS_SOURCE, encoding="utf-8")
+    return harness_path
+
+
+def _run_python_fifo_parent_dir_harness(
+    harness_path: Path, fifo_dir: Path, mode: str,
+) -> subprocess.CompletedProcess[str]:
+    # subprocess.run's own `timeout` is the external, separate-process
+    # watchdog: it polls/waits from THIS (parent) process and forcibly
+    # kills the child on expiry -- it is not a timer running inside the
+    # child being tested.
+    return subprocess.run(
+        [sys.executable, str(harness_path), str(fifo_dir), mode],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=_FIFO_WATCHDOG_TIMEOUT_SECONDS,
+    )
+
+
+def _run_node_fifo_parent_dir_seam(fifo_dir: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["node", str(BOOTSTRAP_SCRIPT), "--test-invoke-prepare-private-parent-dir", str(fifo_dir)],
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=str(REPO_ROOT),
+        timeout=_FIFO_WATCHDOG_TIMEOUT_SECONDS,
+    )
+
+
+def test_js_prepare_private_parent_dir_rejects_fifo_parent_without_blocking(tmp_path: Path) -> None:
+    """AC1/AC2/AC8: preparePrivateParentDir() (Node child process) must
+    reject a real FIFO parent directory with its normal fail-closed
+    rejection within the external watchdog window, never blocking inside
+    openSync().
+    """
+    fifo_dir = tmp_path / "js-fifo-parent"
+    os.mkfifo(fifo_dir)
+
+    result = _run_node_fifo_parent_dir_seam(fifo_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "REJECTED:parent_not_a_directory", (result.stdout, result.stderr)
+
+
+def test_python_prepare_private_parent_dir_rejects_fifo_parent_without_blocking(tmp_path: Path) -> None:
+    """AC1/AC2/AC8: prepare_private_parent_dir() (Python child process,
+    write-side producer) must reject a real FIFO parent directory with its
+    normal fail-closed rejection within the external watchdog window, never
+    blocking inside os.open().
+    """
+    fifo_dir = tmp_path / "py-prepare-fifo-parent"
+    os.mkfifo(fifo_dir)
+    harness_path = _write_fifo_parent_dir_harness(tmp_path)
+
+    result = _run_python_fifo_parent_dir_harness(harness_path, fifo_dir, "prepare")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "REJECTED:parent_not_a_directory", (result.stdout, result.stderr)
+
+
+def test_python_validate_private_parent_dir_readonly_rejects_fifo_parent_without_blocking(
+    tmp_path: Path,
+) -> None:
+    """AC1/AC2/AC3/AC8: validate_private_parent_dir_readonly() (Python
+    child process, readonly consumer) must reject a real FIFO parent
+    directory with the SAME reason_code the write-side uses
+    (``parent_not_a_directory``) -- specifically NOT ``parent_missing`` --
+    within the external watchdog window, never blocking inside os.open().
+    """
+    fifo_dir = tmp_path / "py-validate-fifo-parent"
+    os.mkfifo(fifo_dir)
+    harness_path = _write_fifo_parent_dir_harness(tmp_path)
+
+    result = _run_python_fifo_parent_dir_harness(harness_path, fifo_dir, "validate")
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout.strip()
+    assert stdout == "REJECTED:parent_not_a_directory", (stdout, result.stderr)
+    assert "parent_missing" not in stdout
+
+
+def test_python_parent_dir_functions_still_accept_real_directory_via_child_process(
+    tmp_path: Path,
+) -> None:
+    """AC4 sanity check via the SAME child-process harness used for the
+    FIFO regressions above: a normal, real, owned directory must still be
+    accepted by both prepare_private_parent_dir() and
+    validate_private_parent_dir_readonly() -- the FIFO fix must not turn
+    into a blanket rejection of ordinary directories.
+    """
+    real_dir = tmp_path / "py-real-dir-parent"
+    real_dir.mkdir(mode=0o700)
+    harness_path = _write_fifo_parent_dir_harness(tmp_path)
+
+    prepare_result = _run_python_fifo_parent_dir_harness(harness_path, real_dir, "prepare")
+    assert prepare_result.returncode == 0, prepare_result.stderr
+    assert prepare_result.stdout.strip() == "ACCEPTED", prepare_result.stdout
+
+    validate_result = _run_python_fifo_parent_dir_harness(harness_path, real_dir, "validate")
+    assert validate_result.returncode == 0, validate_result.stderr
+    assert validate_result.stdout.strip() == "ACCEPTED", validate_result.stdout
