@@ -126,6 +126,24 @@ class ResolveResult:
     # call produced. `head_doc` lets `_run_policy_check` reuse the single
     # validated document (never a second, unvalidated `yaml.safe_load`).
     head_doc: dict[str, Any] | None = None
+    # Issue #2525: True when EITHER resolve_visual_impact.mjs detected an
+    # unsupported resolution setting (package.json `exports` string
+    # shorthand, inherited tsconfig `paths`/`baseUrl` via `extends`, or a
+    # statically-unconfirmable Vite `resolve` config) OR any surface's
+    # producer graph walk hit an `unknown_impact` construct. Both connect to
+    # the SAME all-registered-surfaces-affected fallback as
+    # `global_invalidators` (never a resolver-fatal `errors[]` entry).
+    # `evaluate_pr_policy()` uses this to avoid ALSO double-counting
+    # `unmapped_visual_candidates` caused by this same analysis
+    # incompleteness as an independent blocking failure (Issue #2525 AC2) --
+    # a genuinely broken resolver run (`resolve_result.errors`) is NEVER
+    # excused by this flag (AC5).
+    resolver_fallback_active: bool = False
+    # Raw diagnostic strings from resolve_visual_impact.mjs's
+    # `detectUnsupportedResolutionSettings()` (never dropped -- retained for
+    # visibility even though they no longer feed a resolver-fatal
+    # `errors[]` entry).
+    unsupported_resolution_settings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +154,8 @@ class ResolveResult:
             "unknown_impact": self.unknown_impact,
             "unmapped_visual_candidates": self.unmapped_visual_candidates,
             "errors": self.errors,
+            "resolver_fallback_active": self.resolver_fallback_active,
+            "unsupported_resolution_settings": self.unsupported_resolution_settings,
         }
 
 
@@ -382,7 +402,76 @@ def run_mjs(
         mjs_errors = result.get("errors") or [f"mjs exited {proc.returncode} with no explicit errors[] entry"]
         raise RegistryError(f"resolve_visual_impact.mjs exited {proc.returncode}: {mjs_errors}")
 
+    # Issue #2525 AC5 (OWNER REQUEST_CHANGES on PR #2548, 2026-09-06): a
+    # *successful* (schema/version/surface-key-set/exit-code already valid)
+    # result's PER-SURFACE payload shape was never actually validated --
+    # e.g. `{"surfaces": {"fixture": {}}}` (missing reachable_files/
+    # unknown_impact entirely) previously passed through untouched and was
+    # silently treated downstream as "fully resolved, zero reachable files,
+    # zero unknown impact" rather than the malformed/incomplete resolver
+    # output it actually is. Fail closed via the same RegistryError path as
+    # any other malformed resolver output.
+    _validate_mjs_success_result(result, request_surface_ids)
+
     return result
+
+
+def _validate_mjs_success_result(result: dict[str, Any], request_surface_ids: set[str]) -> None:
+    """Issue #2525 AC5: minimal per-surface shape validation for a
+    *successful* RESOLVE_VISUAL_IMPACT_MJS_RESULT_V1 payload (schema/
+    version/exit-code already checked by the caller before this is
+    invoked). Deliberately NOT a schema framework -- just enough structural
+    validation that a malformed/incomplete per-surface payload can never be
+    silently converted into "fully resolved, no impact" fallback success."""
+    surfaces = result.get("surfaces")
+    if not isinstance(surfaces, dict):
+        raise RegistryError(f"resolve_visual_impact.mjs 'surfaces' is not an object: {surfaces!r}")
+    if set(surfaces.keys()) != request_surface_ids:
+        # Belt-and-suspenders -- the caller already checked this before
+        # calling _validate_mjs_success_result, but never assume call order.
+        raise RegistryError(
+            "resolve_visual_impact.mjs surface key set mismatch: "
+            f"requested={sorted(request_surface_ids)} returned={sorted(surfaces.keys())}"
+        )
+
+    for surface_id, surface_value in surfaces.items():
+        if not isinstance(surface_value, dict):
+            raise RegistryError(
+                f"resolve_visual_impact.mjs surface {surface_id!r} value is not an object: {surface_value!r}"
+            )
+        reachable_files = surface_value.get("reachable_files")
+        if not isinstance(reachable_files, list) or not all(isinstance(item, str) for item in reachable_files):
+            raise RegistryError(
+                f"resolve_visual_impact.mjs surface {surface_id!r} 'reachable_files' is not a list of strings: "
+                f"{reachable_files!r}"
+            )
+        unknown_impact = surface_value.get("unknown_impact")
+        if not isinstance(unknown_impact, list):
+            raise RegistryError(
+                f"resolve_visual_impact.mjs surface {surface_id!r} 'unknown_impact' is not a list: {unknown_impact!r}"
+            )
+        for entry in unknown_impact:
+            if not isinstance(entry, dict):
+                raise RegistryError(
+                    f"resolve_visual_impact.mjs surface {surface_id!r} unknown_impact entry is not an object: {entry!r}"
+                )
+            for field_name in ("file", "kind", "detail"):
+                if not isinstance(entry.get(field_name), str):
+                    raise RegistryError(
+                        f"resolve_visual_impact.mjs surface {surface_id!r} unknown_impact entry has a missing/"
+                        f"invalid {field_name!r}: {entry!r}"
+                    )
+
+    errors_field = result.get("errors")
+    if not isinstance(errors_field, list) or not all(isinstance(item, str) for item in errors_field):
+        raise RegistryError(f"resolve_visual_impact.mjs 'errors' is not a list of strings: {errors_field!r}")
+
+    unsupported_field = result.get("unsupported_resolution_settings", [])
+    if not isinstance(unsupported_field, list) or not all(isinstance(item, str) for item in unsupported_field):
+        raise RegistryError(
+            f"resolve_visual_impact.mjs 'unsupported_resolution_settings' is not a list of strings: "
+            f"{unsupported_field!r}"
+        )
 
 
 def match_coverage_roots(changed_path: str, coverage_roots: list[str]) -> bool:
@@ -526,6 +615,23 @@ def resolve(
 
     result.errors.extend(mjs_result.get("errors", []))
 
+    # Issue #2525 AC1: an unsupported resolution setting (package.json
+    # `exports` string shorthand, inherited tsconfig `paths`/`baseUrl` via
+    # `extends`, or a statically-unconfirmable Vite `resolve` config) means
+    # this walker's bare-import resolution cannot be trusted for ANY
+    # surface in this diff -- connect to the SAME all-registered-surfaces-
+    # affected fallback as `global_invalidators` above, never a
+    # resolver-fatal `errors[]` entry (PR #2045-era behavior pushed this
+    # into `errors[]` and blocked the PR unconditionally regardless of
+    # whether any changed path was actually affected by the gap).
+    unsupported_resolution_settings = mjs_result.get("unsupported_resolution_settings") or []
+    result.unsupported_resolution_settings = list(unsupported_resolution_settings)
+    fallback_active = False
+    if unsupported_resolution_settings:
+        fallback_active = True
+        for surface_id in union_surfaces:
+            affected_surface_ids.setdefault(surface_id, "unsupported_resolution_fallback")
+
     for surface_id, surface_result in mjs_result.get("surfaces", {}).items():
         reachable = set(surface_result.get("reachable_files", []))
         if reachable & changed_set and surface_id not in affected_surface_ids:
@@ -533,12 +639,20 @@ def resolve(
         for entry in surface_result.get("unknown_impact", []):
             result.unknown_impact.append({"surface_id": surface_id, **entry})
 
-    # unknown_impact fail-closed: any surface whose producer graph walk hit
-    # an unresolvable/dynamic construct must NOT be silently treated as "no
-    # impact" for that surface.
-    for surface_id, surface_result in mjs_result.get("surfaces", {}).items():
-        if surface_result.get("unknown_impact") and surface_id not in affected_surface_ids:
-            affected_surface_ids[surface_id] = "unknown_impact"
+    # Issue #2525 AC1: same all-registered-surfaces-affected fallback as
+    # above for `unknown_impact` (import.meta.glob, variable dynamic
+    # import, virtual module, etc.). Previously only the SPECIFIC surface
+    # whose own producer graph walk hit the construct was marked affected,
+    # and `evaluate_pr_policy()` separately treated ANY `unknown_impact`
+    # entry as an unconditional policy failure (see the removed block
+    # there) -- this analysis incompleteness is not resolver-fatal either.
+    # Per-entry diagnostics above (`result.unknown_impact`) are unchanged.
+    if any(surface_result.get("unknown_impact") for surface_result in mjs_result.get("surfaces", {}).values()):
+        fallback_active = True
+        for surface_id in union_surfaces:
+            affected_surface_ids.setdefault(surface_id, "unknown_impact_fallback")
+
+    result.resolver_fallback_active = fallback_active
 
     for surface_id, reason in affected_surface_ids.items():
         result.affected_surfaces.append({"surface_id": surface_id, "reason": reason})
@@ -1440,14 +1554,32 @@ def evaluate_pr_policy(
     trusted_check_conclusion: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate every affected surface's disposition. Never passes on
-    declaration self-report alone (AC12); unmapped/unknown_impact always
-    fail closed (AC8).
+    declaration self-report alone (AC12); a genuinely broken resolver run
+    (`resolve_result.errors`) always fails closed (AC8/Issue #2525 AC5).
 
     PR #2045 OWNER fix_delta P0-2: `resolve_result.errors` (resolver/schema
     internal failures -- invalid base registry, mjs crash/schema mismatch,
     etc.) are now themselves policy failures; they were previously silently
     swallowed, letting a broken resolver run degrade to "no affected
     surfaces found" -> unconditional PASS.
+
+    Issue #2525 AC1/AC2: `resolve_result.unknown_impact` is no longer an
+    unconditional policy failure on its own -- `resolve()` already connects
+    it (and `resolve_result.unsupported_resolution_settings`) to the
+    all-registered-surfaces-affected fallback
+    (`resolve_result.resolver_fallback_active`), so every affected surface
+    still goes through the normal disposition/VRT-evidence evaluation loop
+    below and can fail there (e.g. `missing VISUAL_IMPACT_DECLARATION_V1
+    entry`) exactly like any other affected surface. Similarly,
+    `resolve_result.unmapped_visual_candidates` is diagnostic-only (kept,
+    never dropped) while `resolver_fallback_active` is True -- the analysis
+    incompleteness that produced BOTH signals is the same one already
+    covered by the fallback, so it is never double-counted as an
+    independent blocking failure. When `resolver_fallback_active` is False,
+    a non-empty `unmapped_visual_candidates` is still blocking exactly as
+    before (a changed path under `coverage_roots` mapped to NO surface,
+    with a fully deterministic producer graph, must never be silent
+    no-impact).
 
     PR #2045 OWNER fix_delta P1-3: when `codeowners_rules` is supplied,
     waiver authority is scoped to the SPECIFIC surface's own contract paths
@@ -1461,10 +1593,8 @@ def evaluate_pr_policy(
 
     if resolve_result.errors:
         failures.append(f"resolver_error: {resolve_result.errors}")
-    if resolve_result.unmapped_visual_candidates:
+    if resolve_result.unmapped_visual_candidates and not resolve_result.resolver_fallback_active:
         failures.append(f"unmapped_visual_candidate: {resolve_result.unmapped_visual_candidates}")
-    if resolve_result.unknown_impact:
-        failures.append(f"unknown_impact: {resolve_result.unknown_impact}")
 
     actor_handle = actor if actor.startswith("@") else f"@{actor}" if actor else None
 
