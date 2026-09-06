@@ -48,6 +48,23 @@ LOG_FILE="${ARTIFACT_DIR}/${TS}.log"
 EDIT_TXN_SCRIPT="${REPO_ROOT}/.claude/skills/edit-issue/scripts/edit_issue_txn.py"
 READINESS_SCRIPT_PATH="${REPO_ROOT}/.claude/skills/issue-contract-review/scripts/contract_readiness_check.py"
 
+# Issue #1917 fix_delta P1: run-local isolation. RUN_DIR / RELATIVE_RUN_DIR
+# are populated by _init_run_dir (called once environment preflight passes,
+# or explicitly by the offline regression test harness) so every canary
+# execution -- and every offline test scenario that sources this script --
+# gets its own uniquely named directory (created with `mktemp -d`, a real
+# collision-free directory, not a lock file) under which ALL run-local
+# artifacts (body files, transaction input JSON, run log) live. This
+# replaces the previous role+step-only path
+# (`${RELATIVE_ARTIFACT_DIR}/${role}-${marker}.body.md`), which let
+# concurrent or repeated runs silently overwrite each other's body fixtures.
+# LIVE_CANARY_ARTIFACT_ROOT lets the offline regression test point its run
+# directories at a location distinct from where real (non-test) canary
+# executions create theirs, so a test run can never read or clobber a real
+# live run's artifacts, and vice versa.
+RUN_DIR=""
+RELATIVE_RUN_DIR=""
+
 mkdir -p "${ARTIFACT_DIR}" 2>/dev/null || true
 
 _log() {
@@ -57,6 +74,34 @@ _log() {
 _skip() {
   _log "SKIP: $1"
   exit 77
+}
+
+# Idempotent: a second call once RUN_DIR already refers to a real directory
+# is a no-op. Must run before any function that stages a body / txn-input
+# fixture (_write_body_file, _build_txn_input) -- those fail loudly instead
+# of silently falling back to a shared/root path when RELATIVE_RUN_DIR is
+# still empty. LIVE_CANARY_ARTIFACT_ROOT (if set) overrides the base
+# directory mktemp creates the run directory under; the production default
+# is ARTIFACT_DIR.
+_init_run_dir() {
+  if [ -n "${RUN_DIR}" ] && [ -d "${RUN_DIR}" ]; then
+    return 0
+  fi
+  local base="${LIVE_CANARY_ARTIFACT_ROOT:-${ARTIFACT_DIR}}"
+  mkdir -p "${base}" 2>/dev/null || true
+  RUN_DIR="$(mktemp -d "${base}/run-XXXXXXXX" 2>/dev/null || true)"
+  if [ -z "${RUN_DIR}" ] || [ ! -d "${RUN_DIR}" ]; then
+    _log "FAIL: could not create a unique run directory under ${base}"
+    return 1
+  fi
+  RELATIVE_RUN_DIR="${RUN_DIR#"${REPO_ROOT}"/}"
+  if [ "${RELATIVE_RUN_DIR}" = "${RUN_DIR}" ]; then
+    _log "FAIL: run directory ${RUN_DIR} is not inside repo root ${REPO_ROOT}"
+    return 1
+  fi
+  LOG_FILE="${RUN_DIR}/run.log"
+  _log "run_dir: ${RUN_DIR}"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -139,7 +184,11 @@ BODY_EOF
 
 _write_body_file() {
   local role="$1" run_id="$2" marker="$3"
-  local rel="${RELATIVE_ARTIFACT_DIR}/${role}-${marker}.body.md"
+  if [ -z "${RELATIVE_RUN_DIR}" ]; then
+    _log "FAIL: _write_body_file called before _init_run_dir (no run directory)"
+    return 1
+  fi
+  local rel="${RELATIVE_RUN_DIR}/${role}-${marker}.body.md"
   local abs="${REPO_ROOT}/${rel}"
   mkdir -p "$(dirname "${abs}")"
   _render_step_body "${role}" "${run_id}" "${marker}" > "${abs}"
@@ -264,15 +313,27 @@ import sys
 
 reasons = []
 
+# Sentinel distinct from every possible json.loads() result (including the
+# JSON literal `null`, which decodes to Python's ``None`` and must NOT be
+# mistaken for "parsing failed" -- Issue #1917 fix_delta P1-2). Only a
+# genuine json.loads() exception sets a value to this sentinel; anything
+# json.loads() actually returns (None/[]/"" /0/False included) is compared
+# against it with `is`, never truthiness.
+_PARSE_FAILED = object()
+
 if int(txn_exit) != 0:
     reasons.append(f"txn_child_exit_nonzero:{txn_exit}")
 else:
     try:
         txn = json.loads(txn_stdout)
     except Exception as exc:
-        txn = None
+        txn = _PARSE_FAILED
         reasons.append(f"txn_stdout_not_json:{exc}")
-    if isinstance(txn, dict):
+    if txn is _PARSE_FAILED:
+        pass
+    elif not isinstance(txn, dict):
+        reasons.append(f"txn_stdout_not_object:{type(txn).__name__}")
+    else:
         if txn.get("schema") != "ISSUE_EDIT_TXN_RESULT_V1":
             reasons.append("txn_schema_mismatch")
         if txn.get("issue_number") != int(subject):
@@ -281,12 +342,16 @@ else:
             reasons.append("txn_repo_mismatch")
         if txn.get("status") != "ok":
             reasons.append(f"txn_status_not_ok:{txn.get('status')}")
-        if not (txn.get("body_update") or {}).get("attempted"):
+        body_update = txn.get("body_update")
+        if not isinstance(body_update, dict):
+            reasons.append(f"txn_body_update_not_object:{type(body_update).__name__}")
+        elif body_update.get("attempted") is not True:
             reasons.append("body_update_not_attempted")
-        if not (txn.get("content_update") or {}).get("patch_attempted"):
+        content_update = txn.get("content_update")
+        if not isinstance(content_update, dict):
+            reasons.append(f"txn_content_update_not_object:{type(content_update).__name__}")
+        elif content_update.get("patch_attempted") is not True:
             reasons.append("content_update_not_patch_attempted")
-    elif txn is not None:
-        reasons.append("txn_stdout_not_object")
 
 if int(readback_exit) != 0:
     reasons.append(f"readback_process_failed_exit:{readback_exit}")
@@ -294,9 +359,13 @@ else:
     try:
         rb = json.loads(readback_json)
     except Exception as exc:
-        rb = None
+        rb = _PARSE_FAILED
         reasons.append(f"readback_not_json:{exc}")
-    if isinstance(rb, dict):
+    if rb is _PARSE_FAILED:
+        pass
+    elif not isinstance(rb, dict):
+        reasons.append(f"readback_stdout_not_object:{type(rb).__name__}")
+    else:
         expected_after = json.loads(expected_after_json)
         if rb.get("title") != expected_title:
             reasons.append("readback_title_mismatch")
@@ -316,8 +385,6 @@ else:
             reasons.append("readback_blocked_by_unexpected_pagination")
         if rb.get("blocking_has_next_page") is not False:
             reasons.append("readback_blocking_unexpected_pagination")
-    elif rb is not None:
-        reasons.append("readback_stdout_not_object")
 
 if reasons:
     print(";".join(reasons))
@@ -556,9 +623,24 @@ _run_step() {
     return 1
   fi
 
+  # Issue #1917 fix_delta P1: the expected body SHA-256 is fixed HERE --
+  # immediately after body generation + static validation, and strictly
+  # BEFORE `_invoke_txn` performs the remote mutation -- and reused
+  # unchanged all the way to `_evaluate_step` below. It is never recomputed
+  # by re-reading `${body_abs}` after the transaction/readback have run,
+  # because that would let a later mutation of the (now run-isolated, but
+  # still theoretically re-writable) body file retroactively change what
+  # "expected" means for a step whose remote mutation already happened.
+  local body_expected_sha
+  body_expected_sha="$(_sha256_of_file "${body_abs}")"
+  if [ -z "${body_expected_sha}" ]; then
+    _log "FAIL step${step}: could not compute expected body sha256 before mutation"
+    return 1
+  fi
+
   local native_json input_rel
   native_json="$(_native_relationships_json "${step}" "${p1}" "${p2}")"
-  input_rel="${RELATIVE_ARTIFACT_DIR}/${subject}-step${step}.txn_input.json"
+  input_rel="${RELATIVE_RUN_DIR}/${subject}-step${step}.txn_input.json"
   if ! _build_txn_input "${subject}" "${REPO}" "${body_rel}" "${title}" "relationship_cycle_step_${step}" \
     "${CUR_BODY_SHA}" "${CUR_UPDATED_AT}" "${readiness_json}" "${native_json}" "${input_rel}"; then
     _log "FAIL step${step}: txn_input_build_failed"
@@ -575,9 +657,8 @@ _run_step() {
   readback_exit=$?
   echo "step${step} readback=${readback_json}" >>"${LOG_FILE}"
 
-  local expected_after body_expected_sha
+  local expected_after
   expected_after="$(_expected_after_snapshot "${step}" "${p1}" "${p2}")"
-  body_expected_sha="$(_sha256_of_file "${body_abs}")"
 
   local eval_out eval_exit
   eval_out="$(_evaluate_step "${subject}" "${REPO}" "${txn_exit}" "${txn_stdout}" "${title}" \
@@ -610,11 +691,71 @@ _run_all_steps() {
   return 0
 }
 
+# Issue #1917 fix_delta P2: validates every creation-time (S/P1/P2) and
+# per-step (1..7) body fixture -- the SAME static readiness/hygiene checks
+# `_run_step` / `_create_disposable_issue` perform later -- strictly BEFORE
+# any disposable Issue is created on GitHub. A defect in any fixture is a
+# FAIL (never rounded to SKIP/exit 77 -- exit 77 stays reserved for the
+# environment preconditions `_check_environment_preflight` detects), and
+# zero `gh issue create` calls happen once any fixture fails: this function
+# never calls `_create_disposable_issue` / `gh` itself. The body path and
+# readiness result computed here are deterministic (pure functions of
+# role/run_id/marker) and _create_disposable_issue / _run_step recomputing
+# them later is intentional -- an idempotent re-validation, not a
+# correctness dependency on caching -- so no fixture cache needs to be
+# threaded through global state.
+_validate_fixtures_before_creation() {
+  local run_id="$1"
+  local role step body_rel body_abs readiness_json readiness_exit
+
+  for role in S P1 P2; do
+    body_rel="$(_write_body_file "${role}" "${run_id}" "create")"
+    if [ -z "${body_rel}" ]; then
+      _log "FAIL fixture_validation[create:${role}]: could not write body fixture"
+      return 1
+    fi
+    body_abs="${REPO_ROOT}/${body_rel}"
+    readiness_json="$(_run_readiness_check "${body_abs}")"
+    readiness_exit=$?
+    if [ "${readiness_exit}" -ne 0 ]; then
+      _log "FAIL fixture_validation[create:${role}]: readiness_check_not_go exit=${readiness_exit} output=${readiness_json}"
+      return 1
+    fi
+  done
+
+  for step in 1 2 3 4 5 6 7; do
+    body_rel="$(_write_body_file "S" "${run_id}" "step-${step}")"
+    if [ -z "${body_rel}" ]; then
+      _log "FAIL fixture_validation[step:${step}]: could not write body fixture"
+      return 1
+    fi
+    body_abs="${REPO_ROOT}/${body_rel}"
+    readiness_json="$(_run_readiness_check "${body_abs}")"
+    readiness_exit=$?
+    if [ "${readiness_exit}" -ne 0 ]; then
+      _log "FAIL fixture_validation[step:${step}]: readiness_check_not_go exit=${readiness_exit} output=${readiness_json}"
+      return 1
+    fi
+  done
+
+  return 0
+}
+
 _main() {
   if ! _check_environment_preflight; then
     _skip "${PREFLIGHT_SKIP_REASON:-environment_precheck_failed}"
   fi
+
+  if ! _init_run_dir; then
+    _log "FAIL: could not initialize an isolated run directory"
+    exit 1
+  fi
   _log "preflight: gh binary + uv binary + auth + graphql reachability confirmed"
+
+  if ! _validate_fixtures_before_creation "${TS}"; then
+    _log "FAIL: fixture validation (creation + all 7 step bodies) did not pass; no disposable Issue was created"
+    exit 1
+  fi
 
   if ! _create_all_disposables "${TS}"; then
     _cleanup
