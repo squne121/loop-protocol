@@ -85,6 +85,10 @@ success authority は provider telemetry ではなく、critical claim ごとの
 
 evidence のない claim は `supported` としてはならない。AGY と native Web の両方で critical claim を検証できなかった場合だけ `inconclusive` または `failed` を返す。
 
+### Source Registry Materialization（source registry への変換）
+
+AGY 経由・native Web 経由のどちらで確認した source も、同じ `sources[]` 形状へ変換する。source content を実際に確認できた URL ごとに、result 内で一意な `source_id` を割り当て、正規化済み `url` / `title` / `source_kind`（`agy` | `native_web`）を記録する。`step_idx` / `tool_name` / `tool_call_fingerprint` は実際に取得できた場合だけ含め、欠落値を推測で埋めない。claim の `evidence[]` から該当 source を引く場合は `evidence[].source_id` にその `source_id` を設定し、`evidence[].ref` には必ず同じ source の `url` をそのまま使う（`source_id` と `ref` が異なる source を指す状態を作らない）。`source_kind` が `agy` か `native_web` かで検証の扱いを変えない。
+
 ## 結果（Result: WEB_RESEARCH_RESULT_V1）
 
 ```yaml
@@ -102,6 +106,14 @@ WEB_RESEARCH_RESULT_V1:
       citation_count: <int>
       evidence_count: <int>
       notes: <string>
+  sources:
+    - source_id: <result-local unique string>
+      url: <normalized url>
+      title: <string>
+      source_kind: agy | native_web
+      step_idx: <int, optional>
+      tool_name: <string, optional>
+      tool_call_fingerprint: <string, optional>
   claims:
     - claim_id: <string>
       text: <string>
@@ -112,10 +124,15 @@ WEB_RESEARCH_RESULT_V1:
         - kind: web
           ref: <url>
           summary: <claim を支える内容>
+          source_id: <sources[].source_id への参照, optional>
   unresolved_risks: []
   failure_reason: <string|null>
   raw_summary: <string>
 ```
+
+`sources[]` は result 内の source registry である。各エントリの `source_id` は **result-local に一意な参照 ID** であり、provider の実行証明（provenance proof）ではない。`url` は正規化済み URL、`title` は source のタイトル、`source_kind` は `agy`（AGY grounded research 経由で確認）または `native_web`（native Web tool 経由で確認）のいずれかを表す。`step_idx` / `tool_name` / `tool_call_fingerprint` は **実際に取得できた場合だけ保持する optional diagnostic** フィールドであり、取得できない場合に推測・捏造で埋めてはならない。
+
+`claims[].evidence[]` の既存必須フィールド（`kind: web` / `ref` / `summary`）は維持する（後方互換）。`source_id` は任意で、指定する場合は `sources[]` 内の対応エントリの `url` が evidence item の `ref` と一致しなければならない（`ref` と `source_id` が指す source が食い違う状態を作らない）。`sources[]` に存在するがどの claim からも参照されない source（orphan）があってもよい（source と claim は many-to-many であり、未参照であること自体は問題にしない）。
 
 native fallback 成功時は `status: ok` と `verification_route: native_web` を返す。これを AGY success と偽装してはならない。orchestrator は top-level consumer fields だけを読み、attempt/fallback state を LOOP_STATE に保存しない。
 

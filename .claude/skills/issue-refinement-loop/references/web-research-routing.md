@@ -84,3 +84,9 @@ preflight の `STATUS: environment_failure` とは異なり、external provider 
 ## Must not store（保存禁止）
 
 retry / fallback / attempt log の内部状態を orchestrator 側（LOOP_STATE）に保存してはならない。これらは SubAgent 側で完結させる。
+
+## sources[] / source_id（source registry の参照整合性、#2042）
+
+`WEB_RESEARCH_RESULT_V1` の additive top-level `sources[]`（source registry）と `claims[].evidence[].source_id` は、既存の routing rules（`status` / `verification_route` の非空チェックを中心とする上記ルール）を変更しない。`sources[]` / `source_id` の追加は `status: ok` の判定条件に対する additive な精緻化であり、`status` / `verification_route` の判定そのものは従来通りである。
+
+`sources[]` / `source_id` の参照整合性検証（存在しない `source_id` 参照の拒否、同一 claim 内での `source_id` 重複参照の拒否、`source_id` が指す `sources[]` エントリの `url` と evidence item の `ref` の一致確認、orphan source の許容、legacy 形式（`source_id` なし evidence）との両立、`source_kind: agy` / `native_web` の区別のない検証）は `route_web_research_result.py` の責務である。この consumer boundary ドキュメントは producer 側の `sources[]` 形状（`.claude/agents/web-researcher.md` が SSOT）を再定義しない。

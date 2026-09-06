@@ -28,8 +28,41 @@ TRANSPORT_STATUS_OK = "ok"
 TRANSPORT_STATUS_ENVIRONMENT_FAILURE = "environment_failure"
 
 
+def _build_source_registry(web_research: dict[str, Any]) -> tuple[dict[str, str], bool]:
+    """Build a source_id -> url map from the additive `sources[]` registry.
+
+    `sources[]` is optional (legacy results omit it entirely). A present-but-malformed
+    `sources[]` is treated as an unusable/malformed producer result (fail-closed),
+    distinct from the "field simply absent" legacy case. An orphan source entry
+    (referenced by no claim) is not a validity error by itself (#2042 AC8): this
+    function only builds the lookup table, it never rejects on orphan sources.
+    """
+    if "sources" not in web_research or web_research.get("sources") is None:
+        return {}, True
+    sources = web_research["sources"]
+    if not isinstance(sources, list):
+        return {}, False
+    registry: dict[str, str] = {}
+    for entry in sources:
+        if not isinstance(entry, dict):
+            return {}, False
+        source_id = entry.get("source_id")
+        url = entry.get("url")
+        if (
+            not isinstance(source_id, str)
+            or not source_id
+            or not isinstance(url, str)
+            or not url
+        ):
+            return {}, False
+        registry[source_id] = url
+    return registry, True
+
+
 def _claims_cover_requested_evidence(
-    claims: list[Any], required_claim_texts: set[str]
+    claims: list[Any],
+    required_claim_texts: set[str],
+    source_registry: dict[str, str],
 ) -> bool:
     """Require an `ok` result to materialize usable evidence for every request."""
     covered_claim_texts: set[str] = set()
@@ -50,6 +83,7 @@ def _claims_cover_requested_evidence(
             or not evidence
         ):
             return False
+        seen_source_ids: set[str] = set()
         for item in evidence:
             if (
                 not isinstance(item, dict)
@@ -60,6 +94,21 @@ def _claims_cover_requested_evidence(
                 or not item["summary"]
             ):
                 return False
+            # `source_id` is optional (legacy evidence without it remains valid,
+            # #2042 AC3). When present it must resolve to a `sources[]` entry
+            # whose `url` matches this evidence item's `ref` (no divergent
+            # dual-authority state, AC4), must not be unknown (AC5), and must
+            # not be reused within the same claim's evidence list (AC6).
+            source_id = item.get("source_id")
+            if source_id is not None:
+                if not isinstance(source_id, str) or not source_id:
+                    return False
+                if source_id in seen_source_ids:
+                    return False
+                seen_source_ids.add(source_id)
+                resolved_url = source_registry.get(source_id)
+                if resolved_url is None or resolved_url != item["ref"]:
+                    return False
         covered_claim_texts.add(text)
     return required_claim_texts.issubset(covered_claim_texts)
 
@@ -83,9 +132,11 @@ def _transport_reason(web_research: Any, required_claim_texts: set[str]) -> str 
     if not isinstance(claims, list) or not isinstance(unresolved_risks, list):
         return "web_research_result_missing_or_malformed"
     if status == "ok":
+        source_registry, sources_well_formed = _build_source_registry(web_research)
         if (
             failure_class is not None
-            or not _claims_cover_requested_evidence(claims, required_claim_texts)
+            or not sources_well_formed
+            or not _claims_cover_requested_evidence(claims, required_claim_texts, source_registry)
         ):
             return "web_research_result_missing_or_malformed"
         return None
