@@ -492,7 +492,9 @@ def test_reliability_validator_result_null_fails_closed(validator, valid_bundle)
     assert any("is not an object" in e for e in errors)
 
 
-def test_reliability_individual_validator_exit_code_failure_with_aggregate_success_fails_closed(validator, valid_bundle):
+def test_reliability_individual_validator_exit_code_failure_with_aggregate_success_fails_closed(
+    validator, valid_bundle
+):
     reliability_path = valid_bundle / "inputs" / "ci_reliability_close_grade_result_v1.json"
     reliability_data = json.loads(reliability_path.read_text(encoding="utf-8"))
     reliability_data["validator_results"]["workflow_failure_rate"]["exit_code"] = 3
