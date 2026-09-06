@@ -341,16 +341,28 @@ def _make_stream_json_stdout(url: str = "https://example.com/a", response: str =
     under a same-named key (`step_update`/`result`), and the terminal
     `result.response` carries the final answer text. This supersedes the
     pre-#2521 `type`-key-at-top-level fixture, which was never evidenced
-    against a real, currently-supported AGY version (Issue #2521 AC4)."""
-    return "\n".join(
-        [
-            '{"event": "init", "init": {}}',
-            '{"event": "step_update", "step_update": {"step_index": 0, "state": "DONE", '
-            '"step_type": "tool", "tool_info": '
-            '{"name": "web_search", "output": {"sources": [{"url": "%s", "title": "A"}]}}}}' % url,
-            '{"event": "result", "result": {"status": "SUCCESS", "response": "%s"}}' % response,
-        ]
-    )
+    against a real, currently-supported AGY version (Issue #2521 AC4).
+
+    Issue #2521 fix_delta (PR #2527): built via `json.dumps()` rather than
+    `"%s"` string interpolation, so an *response* containing newlines,
+    quotes, or backslashes (a completely normal AGY answer body) still
+    round-trips as valid per-line JSON instead of producing a malformed
+    NDJSON line."""
+    init_event = {"event": "init", "init": {}}
+    step_update_event = {
+        "event": "step_update",
+        "step_update": {
+            "step_index": 0,
+            "state": "DONE",
+            "step_type": "tool",
+            "tool_info": {
+                "name": "web_search",
+                "output": {"sources": [{"url": url, "title": "A"}]},
+            },
+        },
+    }
+    result_event = {"event": "result", "result": {"status": "SUCCESS", "response": response}}
+    return "\n".join(json.dumps(event) for event in (init_event, step_update_event, result_event))
 
 
 def _supported_capability_record() -> dict[str, Any]:
@@ -956,6 +968,227 @@ def test_structured_grounded_metadata_no_citations_anywhere_stays_no_citations()
     assert result["grounding_status"] == "attempted_no_citations"
     assert result["url_citation_count"] == 0
     assert result["citation_evidence"] == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #2521 fix_delta (PR #2527 OWNER REQUEST_CHANGES Finding 1/Finding 2).
+#
+# Finding 1: a broken structured terminal (well-formed NDJSON, exactly one
+# terminal, but `status: "SUCCESS"` with no actual `response`) must never be
+# treated as a successful grounded_research answer -- the strict parser now
+# rejects it (`preflight_agy.parse_agy_stream_json_stream()`), which this
+# module's existing `stream_parse.get("status") != "valid"` fail-closed
+# branch automatically routes to `agy_web_grounding_stream_json_malformed`.
+#
+# Finding 2: quota-exhaustion detection must be scoped to the terminal
+# event's own failure-describing fields, never a regex match against the
+# ENTIRE raw stdout (which can legitimately contain literal
+# "RESOURCE_EXHAUSTED"/"quota exhausted" text inside a normal search query
+# or a normal, successful answer body).
+# ---------------------------------------------------------------------------
+
+
+def test_structured_grounded_metadata_broken_success_terminal_fails_closed_not_grounded() -> None:
+    """Finding 1 regression test: this is the OWNER's exact repro -- a tool
+    call completed and reported a source, but the terminal `result` claims
+    `status: "SUCCESS"` with no `response` field at all. Must fail-closed to
+    `agy_web_grounding_stream_json_malformed` (never `grounded`), and the raw
+    NDJSON must never be surfaced as a successful answer."""
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "init": {}}),
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "step_index": 0,
+                        "state": "DONE",
+                        "step_type": "tool",
+                        "tool_info": {
+                            "name": "search_web",
+                            "output": {"sources": [{"url": "https://example.com/a"}]},
+                        },
+                    },
+                }
+            ),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS"}}),
+        ]
+    )
+
+    result = rgh._build_agy_structured_stream_json_grounded_research_metadata(stdout, hook_events=[])
+
+    assert result["grounding_status"] == "attempted_no_web_tool_call"
+    assert result["grounding_failure_class"] == "agy_web_grounding_stream_json_malformed"
+    assert (
+        result["parsed_evidence"]["stream_json_reason_code"]
+        == "terminal_result_success_missing_response"
+    )
+
+
+def test_normalize_agy_result_broken_success_terminal_never_reported_ok() -> None:
+    """Finding 1 regression test (end-to-end via `_normalize_agy_result()`):
+    the broken-terminal repro above must also flip the outer
+    `delegation_result/v1.ok` to False for the grounded_research profile --
+    never let the raw NDJSON reach the parent as a successful `response_text`
+    with `ok: true`."""
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "init": {}}),
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "step_index": 0,
+                        "state": "DONE",
+                        "step_type": "tool",
+                        "tool_info": {
+                            "name": "search_web",
+                            "output": {"sources": [{"url": "https://example.com/a"}]},
+                        },
+                    },
+                }
+            ),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS"}}),
+        ]
+    )
+    completed = subprocess.CompletedProcess(
+        args=["agy", "-p", "x", "--output-format", "stream-json"],
+        returncode=0,
+        stdout=stdout,
+        stderr="",
+    )
+    completed.agy_structured_output_used = True  # type: ignore[attr-defined]
+    completed.agy_structured_output_capability_record = _supported_capability_record()  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_events = []  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
+
+    result = rgh._normalize_agy_result(completed, tool_profile="grounded_research", requested_model=None)
+
+    assert result["ok"] is False
+    assert result["grounded_research_evidence"]["grounding_failure_class"] == "agy_web_grounding_stream_json_malformed"
+
+
+def test_normalize_agy_result_response_text_with_newlines_and_quotes_round_trips() -> None:
+    """Regression test 1: a normal, successful answer containing quotes and
+    a backslash -- characters that would corrupt a naive `"%s"` string
+    interpolation into invalid JSON -- must still round-trip correctly
+    through `_normalize_agy_result()`; response_text/result_surface.summary
+    come from the actual answer text, not a corrupted/truncated fixture."""
+    tricky_response = 'Answer with "quotes" and a backslash: \\ end.'
+    stdout = _make_stream_json_stdout(response=tricky_response)
+    completed = subprocess.CompletedProcess(
+        args=["agy", "-p", "x", "--output-format", "stream-json"],
+        returncode=0,
+        stdout=stdout,
+        stderr="",
+    )
+    completed.agy_structured_output_used = True  # type: ignore[attr-defined]
+    completed.agy_structured_output_capability_record = _supported_capability_record()  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_events = []  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
+
+    result = rgh._normalize_agy_result(completed, tool_profile="grounded_research", requested_model=None)
+
+    assert result["response_text"] == tricky_response
+    assert result["result_surface"]["summary"] == tricky_response
+    assert result["ok"] is True
+
+
+def test_normalize_agy_result_response_text_with_multiline_answer_preserved_in_full() -> None:
+    """Regression test 1 (multiline variant): a multi-line answer (embedded
+    newlines -- another naive `"%s"` interpolation hazard) must still
+    round-trip in full via `response_text`, even though `result_surface.
+    summary` is deliberately a one-line derived preview (pre-existing
+    `_derive_summary()` behavior, unrelated to this fix)."""
+    multiline_response = 'Line one.\nLine "two" has quotes.\nLine three.'
+    stdout = _make_stream_json_stdout(response=multiline_response)
+    completed = subprocess.CompletedProcess(
+        args=["agy", "-p", "x", "--output-format", "stream-json"],
+        returncode=0,
+        stdout=stdout,
+        stderr="",
+    )
+    completed.agy_structured_output_used = True  # type: ignore[attr-defined]
+    completed.agy_structured_output_capability_record = _supported_capability_record()  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_events = []  # type: ignore[attr-defined]
+    completed.agy_provenance_hook_load_error = None  # type: ignore[attr-defined]
+
+    result = rgh._normalize_agy_result(completed, tool_profile="grounded_research", requested_model=None)
+
+    assert result["response_text"] == multiline_response
+    assert '"event"' not in result["response_text"]
+    assert result["ok"] is True
+
+
+def test_structured_grounded_metadata_quota_string_in_successful_query_not_misclassified() -> None:
+    """Finding 2 regression test 6: a normal, successful search query/answer
+    that happens to mention "RESOURCE_EXHAUSTED" (e.g. researching how to
+    handle that very API error) must NOT be misclassified as a quota
+    failure -- the citation/answer evidence must be preserved."""
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "init": {}}),
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "step_index": 0,
+                        "state": "DONE",
+                        "step_type": "tool",
+                        "tool_info": {
+                            "name": "search_web",
+                            "parameters": {"query": "how to handle Google API RESOURCE_EXHAUSTED errors"},
+                            "output": {"sources": [{"url": "https://example.com/quota-help", "title": "Help"}]},
+                        },
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "status": "SUCCESS",
+                        "response": (
+                            "To fix RESOURCE_EXHAUSTED errors, implement exponential backoff. "
+                            "See https://example.com/quota-help for details."
+                        ),
+                    },
+                }
+            ),
+        ]
+    )
+
+    result = rgh._build_agy_structured_stream_json_grounded_research_metadata(stdout, hook_events=[])
+
+    assert result["grounding_failure_class"] != "agy_web_grounding_quota_exhausted"
+    assert result["grounding_status"] == "grounded"
+    assert result["citation_evidence"] == [{"url": "https://example.com/quota-help", "title": "Help"}]
+
+
+def test_structured_grounded_metadata_genuine_quota_failure_terminal_still_classified() -> None:
+    """Finding 2 regression test 7: a genuine quota-exhausted AGY failure --
+    the terminal `result` itself reports a non-success status whose own
+    failure-describing field explicitly says RESOURCE_EXHAUSTED -- must
+    still be classified as `agy_web_grounding_quota_exhausted`."""
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "init": {}}),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "status": "ERROR",
+                        "error": "RESOURCE_EXHAUSTED: quota exceeded for this project",
+                    },
+                }
+            ),
+        ]
+    )
+
+    result = rgh._build_agy_structured_stream_json_grounded_research_metadata(stdout, hook_events=[])
+
+    assert result["grounding_failure_class"] == "agy_web_grounding_quota_exhausted"
+    assert result["grounding_status"] == "failed"
 
 
 # ---------------------------------------------------------------------------

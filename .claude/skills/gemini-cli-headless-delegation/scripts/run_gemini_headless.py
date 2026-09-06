@@ -4656,13 +4656,6 @@ def _build_agy_structured_stream_json_grounded_research_metadata(
             ),
         )
 
-    if _QUOTA_EXHAUSTED_RE.search(stdout):
-        return _fail_closed(
-            grounding_status="failed",
-            grounding_backend="none",
-            grounding_failure_class="agy_web_grounding_quota_exhausted",
-        )
-
     if not _PREFLIGHT_AGY_AVAILABLE or _preflight_agy is None:
         # Issue #2038 P0-3: the strict NDJSON parser lives in preflight_agy.py
         # (single source of truth shared with the capability probe); if it
@@ -4675,6 +4668,40 @@ def _build_agy_structured_stream_json_grounded_research_metadata(
         )
 
     stream_parse = _preflight_agy.parse_agy_stream_json_stream(stdout)
+
+    # Issue #2521 fix_delta (PR #2527 Finding 2): quota-exhaustion detection
+    # must NOT regex-match the entire raw stdout -- that includes the tool's
+    # search query text, tool output, and the terminal answer body itself,
+    # any of which can legitimately contain literal strings like
+    # "RESOURCE_EXHAUSTED" (e.g. a successful research answer *about* that
+    # very API error) without AGY actually having hit a quota limit. Scope
+    # the check to the parsed terminal event's own failure-describing string
+    # fields only (populated only once the stream fully validates -- see
+    # `stream_parse["terminal_result"]`), and only when the terminal did not
+    # report success, since a `status: "SUCCESS"` terminal's `response` is a
+    # genuine answer body, never a failure reason.
+    _terminal_event_for_quota_check = stream_parse.get("terminal_result")
+    _terminal_payload_for_quota_check = (
+        _terminal_event_for_quota_check.get("result")
+        if isinstance(_terminal_event_for_quota_check, dict)
+        else None
+    )
+    if (
+        isinstance(_terminal_payload_for_quota_check, dict)
+        and _terminal_payload_for_quota_check.get("status") != "SUCCESS"
+    ):
+        _terminal_failure_text = " ".join(
+            value
+            for key, value in _terminal_payload_for_quota_check.items()
+            if key != "status" and isinstance(value, str)
+        )
+        if _QUOTA_EXHAUSTED_RE.search(_terminal_failure_text):
+            return _fail_closed(
+                grounding_status="failed",
+                grounding_backend="none",
+                grounding_failure_class="agy_web_grounding_quota_exhausted",
+            )
+
     if stream_parse.get("status") != "valid":
         return _fail_closed(
             grounding_status="attempted_no_web_tool_call",

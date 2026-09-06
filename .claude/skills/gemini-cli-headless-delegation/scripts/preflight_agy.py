@@ -2266,6 +2266,14 @@ _STREAM_JSON_KNOWN_STEP_TYPES: frozenset[str] = frozenset(
 # `unknown_step_types`, so a single tool call is never double-counted just
 # because it streamed an ACTIVE update before its DONE update.
 _STREAM_JSON_NON_TERMINAL_STEP_STATES: frozenset[str] = frozenset({"ACTIVE"})
+# Issue #2521 fix_delta (PR #2527 Finding 1): the only terminal `result.status`
+# value confirmed against real `agy` 1.1.27 output that means "AGY produced an
+# actual answer" -- when this value is present, `result.response` MUST be a
+# string or the terminal is malformed/incomplete, not a genuine success. Any
+# other `result.status` value (e.g. "ERROR") is a legitimate AGY execution
+# failure and must NOT be required to carry a `response` (Issue #2521 AC7:
+# execution status and parser-validity are independent).
+_STREAM_JSON_TERMINAL_SUCCESS_STATUS = "SUCCESS"
 _STREAM_JSON_URL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 _STREAM_JSON_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _STREAM_JSON_MAX_URL_LENGTH = 2048
@@ -2355,6 +2363,21 @@ def parse_agy_stream_json_stream(stdout: str) -> dict[str, Any]:
         (an unexpected event type in that position, e.g. a second `init` or
         a non-terminal `result`, is rejected), and its payload (the value
         under the `step_update` key) must be a JSON object.
+      - the terminal `result` event's `result` field (i.e. `events[-1]["result"]`)
+        must itself be a JSON object (Issue #2521 fix_delta P2/Finding 1); a
+        non-object terminal payload is rejected with
+        `reason_code: "terminal_result_payload_not_an_object"`.
+      - when that terminal `result` object's own `status` field equals
+        `"SUCCESS"` (the only terminal execution-status value confirmed
+        against real `agy` 1.1.27 output to mean "AGY produced an actual
+        answer"), its `response` field must be present and a string --
+        otherwise the terminal is rejected with
+        `reason_code: "terminal_result_success_missing_response"`. Any other
+        `result.status` value (e.g. `"ERROR"`, or no `status` field at all)
+        is treated as a legitimate AGY execution failure and is NOT required
+        to carry a `response` (Issue #2521 AC7: execution status and
+        parser-validity are independent -- a well-formed failure terminal is
+        still a syntactically `"valid"` stream).
 
     Citation acceptance (only once `status == "valid"`): a `step_update`
     event's `tool_info` (an object nested under `event["step_update"]`, not
@@ -2513,6 +2536,25 @@ def parse_agy_stream_json_stream(stdout: str) -> dict[str, Any]:
                 )
         tool_call_records.append(record)
 
+    # Issue #2521 fix_delta (PR #2527 Finding 1): a syntactically well-formed
+    # exactly-one-terminal stream can still carry a terminal `result` payload
+    # that is not a dict, or (when AGY reports success) is missing the actual
+    # answer text -- neither case is a genuine, machine-verifiable structured
+    # answer, so both must be rejected here rather than silently accepted as
+    # `status: "valid"` (which previously let a broken terminal be treated as
+    # a real success by downstream callers).
+    terminal_event = events[-1]
+    terminal_result_payload = terminal_event.get("result")
+    if not isinstance(terminal_result_payload, dict):
+        result["reason_code"] = "terminal_result_payload_not_an_object"
+        return result
+    terminal_status = terminal_result_payload.get("status")
+    if terminal_status == _STREAM_JSON_TERMINAL_SUCCESS_STATUS:
+        terminal_response = terminal_result_payload.get("response")
+        if not isinstance(terminal_response, str):
+            result["reason_code"] = "terminal_result_success_missing_response"
+            return result
+
     result["status"] = "valid"
     result["reason_code"] = "valid_init_step_result_stream"
     result["init_count"] = init_count
@@ -2521,7 +2563,7 @@ def parse_agy_stream_json_stream(stdout: str) -> dict[str, Any]:
     result["unknown_step_types"] = unknown_step_types
     result["tool_call_records"] = tool_call_records
     result["source_records"] = source_records
-    result["terminal_result"] = events[-1]
+    result["terminal_result"] = terminal_event
     return result
 
 
