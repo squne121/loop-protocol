@@ -1919,18 +1919,46 @@ def test_provider_agy_github_research_still_dispatches(tmp_path, monkeypatch):
     #1920 dispatch is not affected by the new operator-disabled check, which
     only applies to validate_request(), never called for provider=agy).
 
-    Asserts on run_github_research_route()'s own distinctive base_result shape
-    (safety_mode="degraded_wrapper_only" / actual_model="agy-default") rather
-    than a specific exit_code: depending on whether the executing environment
-    happens to have a live `agy` CLI / authenticated `gh` (this route's own
-    `_preflight()` probes both), the route may SKIP fail-closed (exit 77),
-    succeed (exit 0), or fail for an environment-specific runtime reason (e.g.
-    exit 1) -- none of which is the operator-disabled / unsupported_provider_profile
-    class this Issue is scoped to. See test_agy_github_research_contract.py /
-    test_agy_github_research_e2e.py for the full AGY-side contract."""
+    Hermetic by construction: the real dispatch target
+    (run_agy_github_research_e2e.run_github_research_route) is stubbed via
+    monkeypatch, so this test never shells out to a live `agy` CLI, never
+    reads/needs `gh` credentials, and never makes a network call. It only
+    proves that run_delegation() reaches that exact call site with the
+    expected request shape and returns the callee's result unchanged --
+    i.e. that the new Gemini operator-disabled check (scoped to
+    validate_request(), never invoked for provider=agy) does not intercept
+    this route. The full AGY-side runtime contract (live preflight, gh
+    command allowlisting, evidence artifacts) is covered separately by
+    test_agy_github_research_contract.py / test_agy_github_research_e2e.py."""
     module = load_module()
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("GH_TOKEN", raising=False)
+
+    # run_gemini_headless.py resolves this via a call-time
+    # `from run_agy_github_research_e2e import run_github_research_route`
+    # (see scripts/run_gemini_headless.py's GITHUB_RESEARCH_PROFILE
+    # dispatch branch), so the stub must replace the attribute on the
+    # `run_agy_github_research_e2e` module object itself -- not on
+    # `module` (run_gemini_headless has no such name in its own
+    # namespace until that import statement executes).
+    import run_agy_github_research_e2e as e2e_module
+
+    calls: list[dict[str, object]] = []
+    sentinel_result = {
+        "schema": "delegation_result/v1",
+        "provider": "agy",
+        "tool_profile": "github_research",
+        "safety_mode": "degraded_wrapper_only",
+        "actual_model": "agy-default",
+        "ok": True,
+        "exit_code": 0,
+        "sentinel_marker": "test_provider_agy_github_research_still_dispatches-9f3c1a",
+    }
+
+    def _stub_run_github_research_route(request, **kwargs):
+        calls.append({"request": request, "kwargs": kwargs})
+        return dict(sentinel_result)
+
+    monkeypatch.setattr(e2e_module, "run_github_research_route", _stub_run_github_research_route)
+
     request = {
         "schema": "delegation_request_v1",
         "provider": "agy",
@@ -1940,10 +1968,30 @@ def test_provider_agy_github_research_still_dispatches(tmp_path, monkeypatch):
 
     result = module.run_delegation(request, request_path=tmp_path / "request.json")
 
+    # 1. stub was dispatched exactly once.
+    assert len(calls) == 1
+
+    # 2. the stub received the expected provider/tool_profile/prompt.
+    called_request = calls[0]["request"]
+    assert called_request.get("provider") == "agy"
+    assert called_request.get("tool_profile") == "github_research"
+    assert called_request.get("prompt") == request["prompt"]
+
+    # 3. request_warnings (the other significant kwarg the real dispatcher
+    #    passes through) was forwarded.
+    assert "request_warnings" in calls[0]["kwargs"]
+
+    # 4. the stub's sentinel result is what run_delegation() surfaces back
+    #    to the caller (run_delegation() shallow-copies and adds
+    #    agy_invocation_attempted/agy_failure_kind for provider=agy
+    #    requests, so compare by sentinel content, not identity).
+    assert result.get("sentinel_marker") == sentinel_result["sentinel_marker"]
     assert result["tool_profile"] == "github_research"
     assert result.get("provider") == "agy"
     assert result.get("safety_mode") == "degraded_wrapper_only"
     assert result.get("actual_model") == "agy-default"
+
+    # 5. no fall-through to the Gemini operator-disabled / unsupported route.
     assert result.get("failure_class") != "unsupported_provider_profile"
     assert result.get("failure_class") != "github_research_operator_disabled"
 

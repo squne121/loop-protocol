@@ -20,11 +20,17 @@ disable-model-invocation: true
 
 ## Workflow（作業手順）
 
-0. **setup_check で依存ツール・trusted folder・Serena MCP・settings.json を確認する（必須）**:
+0. **setup_check で依存ツール・trusted folder・Serena MCP・settings.json を確認する（Gemini を使う profile では必須）**:
    ```bash
    uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --json
    ```
    `ok: false` → `recovery` に従って対処。副作用ある操作（trustedFolders / .gemini/settings.json 変更）は `--fix` を付ける。
+
+   `tool_profile=github_research` を `--provider agy` で使う場合、Gemini 側は operator-disabled のためこの
+   Gemini 向け setup_check は不要。代わりに AGY 向け診断を使う（診断が必要な場合のみ）:
+   ```bash
+   uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/setup_check.py --provider agy --json
+   ```
 
 1. **request JSON を build_request.py で生成する（推奨）**:
    ```bash
@@ -45,17 +51,24 @@ disable-model-invocation: true
    `--provider agy` は non-empty `--prompt` を必須とし、旧 `--gh-issue`/`--gh-pr` は AGY 分岐にはそのまま渡らない（調査対象の Issue/PR は `--prompt` 本文に含める）。`provider=gemini`（明示または省略）+ `tool_profile=github_research` は実行前に一貫して拒否される。
    または手動で `delegation_request_v1` JSON を作成する（`references/usage-contract.md` 参照）。
 
-2. **preflight を実行する（必要に応じて agy の grounded_research 検証を含める）**:
+2. **preflight を実行する（Gemini を使う profile が対象。`--provider agy --profile github_research` は対象外）**:
 ```bash
 uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_gemini_headless.py \
   --output-file tmp/gemini-headless-preflight.json
 ```
-`agy` の grounded_research を含む検証が必要な場合:
+   `ok: false` → `failure_reason` / `next_action` を確認して修正する。
+
+   `--provider agy --profile github_research`（正規の GitHub 調査経路）では、この Gemini 向け preflight
+   は要求しない（Gemini operator-disabled のため）。AGY 側の preflight は
+   `run_agy_github_research_e2e.py` が Step 3 実行時に内部で自動実施する（version・permission-boundary
+   gate を含む）ため、事前に別スクリプトを呼ぶ必要はない。事前診断が必要な場合は Step 0 の
+   `setup_check.py --provider agy --json` を使う。
+
+   `agy` の grounded_research（github_research 以外）を含む検証が必要な場合:
 ```bash
 uv run --locked python3 .claude/skills/gemini-cli-headless-delegation/scripts/preflight_agy.py \
   --grounded-research --json
 ```
-   `ok: false` → `failure_reason` / `next_action` を確認して修正する。
 
 3. **`scripts/run_gemini_headless.py` で request を検証・実行する**:
    ```bash
