@@ -1,6 +1,6 @@
 ---
 doc_id: DOC-LOCAL-HOOKS-001
-title: prek によるローカル pre-commit hook（staged TS/JS lint trial）
+doc_title_ja: コミット前軽量フック試験運用
 status: trial
 related_issue: 2552
 related_research_issue: 1933
@@ -27,7 +27,7 @@ last_updated_by_issue: 2552
 
 設定本体は repo ルートの [`prek.toml`](../../prek.toml) を参照。
 
-## install / bootstrap 手順
+## 導入手順（install / bootstrap）
 
 trial に参加する開発者は、自分の作業ディレクトリ（**worktree 単位ではなくメイン checkout 単位**、後述）で以下を実行する。
 
