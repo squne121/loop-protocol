@@ -581,7 +581,9 @@ def run_finalize(request: dict, *, gh_bin: str = "gh", project_root: Path | None
 
     targets_out = {}
 
-    def _finalize_or_unknown(*, target: int, role: str, target_reason: str, payload: str, existing_url: str | None) -> dict:
+    def _finalize_or_unknown(
+        *, target: int, role: str, target_reason: str, payload: str, existing_url: str | None
+    ) -> dict:
         pf = preflight[target]
         if pf["snapshot"] is None:
             tr = _target_result_skeleton(role)

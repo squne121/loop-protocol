@@ -25,11 +25,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import re
 import sys
 from pathlib import Path
-
-import pytest
 
 _THIS_DIR = Path(__file__).resolve().parent
 _SCRIPTS_DIR = _THIS_DIR.parent / "scripts"
@@ -195,15 +192,22 @@ def test_marker_and_digest_separation_create_update_noop(monkeypatch):
 
     # -- update: issue OPEN, prior evidence comment had a different digest --
     snapshots_by_call2 = [_snapshot("OPEN"), _snapshot("CLOSED", state_reason="completed")]
-    monkeypatch.setattr(finalize_no_diff_issue, "_fetch_issue_snapshot", lambda *a, **k: (snapshots_by_call2.pop(0), ""))
+    monkeypatch.setattr(
+        finalize_no_diff_issue, "_fetch_issue_snapshot", lambda *a, **k: (snapshots_by_call2.pop(0), "")
+    )
     monkeypatch.setattr(finalize_no_diff_issue, "_publish_marker_comment", make_publish("updated"))
     result_update = finalize_no_diff_issue.run_finalize(request)
     assert result_update["targets"]["1116"]["evidence_comment"]["status_detail"] == "updated"
     assert result_update["targets"]["1116"]["target_status"] == "applied"
 
     # -- no-op: issue already CLOSED with matching reason, evidence matches -
-    snapshots_by_call3 = [_snapshot("CLOSED", state_reason="completed"), _snapshot("CLOSED", state_reason="completed")]
-    monkeypatch.setattr(finalize_no_diff_issue, "_fetch_issue_snapshot", lambda *a, **k: (snapshots_by_call3.pop(0), ""))
+    snapshots_by_call3 = [
+        _snapshot("CLOSED", state_reason="completed"),
+        _snapshot("CLOSED", state_reason="completed"),
+    ]
+    monkeypatch.setattr(
+        finalize_no_diff_issue, "_fetch_issue_snapshot", lambda *a, **k: (snapshots_by_call3.pop(0), "")
+    )
     monkeypatch.setattr(finalize_no_diff_issue, "_publish_marker_comment", make_publish("already_published"))
     result_noop = finalize_no_diff_issue.run_finalize(request)
     assert result_noop["targets"]["1116"]["evidence_comment"]["status_detail"] == "already_published"
