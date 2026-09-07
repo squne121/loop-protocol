@@ -1415,8 +1415,11 @@ class PrivateParentDirError(Exception):
 
 def _diagnose_parent_is_symlink(parent: Path) -> bool:
     """Non-blocking, non-authoritative diagnostic used ONLY to choose which
-    reason_code to attach to an open() call that has ALREADY failed and
-    ALREADY rejected the parent (Issue #2029).
+    reason_code to attach to an mkdir()/open() call that has ALREADY failed
+    and ALREADY rejected the parent (Issue #2029; shared by both the
+    mkdir()-side and open()-side classification paths via
+    ``_classify_and_raise_parent_dir_failure()`` since Issue #2547 -- never
+    ``open()``-only).
 
     ``Path.is_symlink()`` is an ``lstat()`` under the hood: it inspects the
     directory entry itself without ever opening or following the target,
@@ -1566,7 +1569,25 @@ def prepare_private_parent_dir(path: Path, *, expected_uid: int | None = None) -
         expected_uid = os.getuid()
 
     parent = path.parent
-    if not parent.exists():
+    try:
+        parent_confirmed_to_exist = parent.exists()
+    except OSError:
+        # Issue #2547 P2 (PR #2560 review): on Python 3.12, ``Path.exists()``
+        # only swallows ENOENT/ENOTDIR/EBADF/ELOOP into ``False`` -- any
+        # OTHER OSError (e.g. EACCES/EPERM from a non-searchable ancestor
+        # directory) propagates raw out of this preflight probe itself,
+        # BEFORE the mkdir() try/except below ever runs. Never leak that raw
+        # exception here: treat "the exists() probe itself failed" the same
+        # as "not confirmed to exist yet" and fall through to mkdir(), whose
+        # own OSError is what actually gets diagnosed below -- almost always
+        # the SAME underlying failure, since mkdir() must traverse the exact
+        # same ancestor path exists() just failed to traverse. This
+        # deliberately avoids introducing a new operation="stat" diagnostic
+        # value: the real, already-diagnosed failure is the one mkdir()
+        # itself raises.
+        parent_confirmed_to_exist = False
+
+    if not parent_confirmed_to_exist:
         # Issue #2547: previously uncaught -- any mkdir() failure (e.g. a
         # circular or long non-circular symlink chain in the path PREFIX
         # failing with ELOOP) propagated as a raw, undiagnosed OSError. This

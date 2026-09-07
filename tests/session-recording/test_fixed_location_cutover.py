@@ -1066,7 +1066,7 @@ def test_python_noncircular_symlink_traversal_limit_eloop_not_misclassified_as_t
     assert isinstance(err.__cause__, OSError)
 
 
-def test_python_mkdir_eloop_on_confirmed_trailing_symlink_still_reports_symlink(tmp_path: Path) -> None:
+def test_python_classifier_eloop_on_confirmed_trailing_symlink_still_reports_symlink(tmp_path: Path) -> None:
     """AC1/AC3: when the classifier's ELOOP branch IS able to confirm (via
     `_diagnose_parent_is_symlink()`, a real lstat against a real symlink
     fixture) that the failing path is itself a trailing symlink, the
@@ -1139,6 +1139,75 @@ def test_python_mkdir_failure_preserves_errno_operation_path_and_cause(tmp_path:
     assert err.path == str(target_parent)
     assert isinstance(err.__cause__, OSError)
     assert err.__cause__.errno == errno.ENOTDIR
+
+
+@pytest.mark.skipif(
+    os.getuid() == 0,
+    reason="permission-denial via chmod 0000 is not meaningful as root",
+)
+def test_python_eacces_from_exists_preflight_is_diagnosed_not_leaked(tmp_path: Path) -> None:
+    """P2 regression (PR #2560 review comment): on Python 3.12,
+    ``Path.exists()`` only swallows ``ENOENT``/``ENOTDIR``/``EBADF``/
+    ``ELOOP`` into ``False`` -- any OTHER ``OSError`` (e.g. ``EACCES``/
+    ``EPERM`` raised while trying to stat through a non-searchable ancestor
+    directory) propagates raw out of ``Path.exists()`` itself.
+    ``prepare_private_parent_dir()``'s original ``if not parent.exists():``
+    preflight ran BEFORE the mkdir() try/except that funnels into
+    ``_classify_and_raise_parent_dir_failure()``, so this raw ``OSError``
+    bypassed the classifier entirely and leaked out of the function
+    undiagnosed -- unlike every other mkdir()/open() failure in this
+    module, it carried no ``reason_code`` / ``errno_value`` / ``operation``
+    / ``path`` diagnostic metadata at all.
+
+    First confirms, against a REAL non-searchable (``chmod 0o000``)
+    ancestor directory -- same real-filesystem style as the ELOOP fixtures
+    above, never a fabricated/monkeypatched exception -- that
+    ``Path.exists()`` really does raise a raw ``OSError`` here, documenting
+    the root cause this regression test guards against. Then confirms the
+    fixed ``prepare_private_parent_dir()`` raises ``PrivateParentDirError``
+    (never a raw ``OSError``/``PermissionError``) through the SAME shared
+    classifier used by every other mkdir()/open() failure path in this
+    module, carrying the same diagnostic contract (``reason_code``/
+    ``errno_value``/``operation``/``path``/chained ``__cause__``).
+
+    Restores the ancestor directory's permissions in a ``finally`` block so
+    a failure here can never leave an inaccessible directory behind for
+    ``tmp_path``'s own cleanup (or any other test) to trip over.
+    """
+    base = tmp_path / "py-exists-preflight-eacces-base"
+    base.mkdir()
+    non_searchable_ancestor = base / "non_searchable_ancestor"
+    non_searchable_ancestor.mkdir()
+    target_parent = non_searchable_ancestor / "child"
+    artifact_path = target_parent / "artifact.json"
+
+    non_searchable_ancestor.chmod(0o000)
+    try:
+        # Root cause: Path.exists() itself raises a raw OSError (EACCES)
+        # here -- EACCES/EPERM are NOT among the errnos exists() swallows
+        # into False (ENOENT/ENOTDIR/EBADF/ELOOP only).
+        with pytest.raises(OSError) as real_exists_error:
+            target_parent.exists()
+        assert real_exists_error.value.errno in (errno.EACCES, errno.EPERM)
+
+        # Fixed behavior: the same underlying failure, reached through
+        # prepare_private_parent_dir(), is diagnosed through the shared
+        # classifier -- never leaked as a raw OSError/PermissionError, and
+        # never routed through a new operation="stat" value (still
+        # "mkdir", since it is mkdir()'s own OSError that is ultimately
+        # classified).
+        with pytest.raises(srrs.PrivateParentDirError) as excinfo:
+            srrs.prepare_private_parent_dir(artifact_path)
+
+        err = excinfo.value
+        assert err.reason_code == "parent_unavailable"
+        assert err.errno_value in (errno.EACCES, errno.EPERM)
+        assert err.operation == "mkdir"
+        assert err.path == str(target_parent)
+        assert isinstance(err.__cause__, OSError)
+        assert err.__cause__.errno == err.errno_value
+    finally:
+        non_searchable_ancestor.chmod(0o755)
 
 
 def test_python_open_parent_dir_nofollow_unconfirmed_eloop_reports_parent_unavailable(
