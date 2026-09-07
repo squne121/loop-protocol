@@ -3,7 +3,7 @@ doc_id: DOC-ROADMAP-001
 title: Post-M1 Playable Outcome Roadmap（M1後 playable outcome ロードマップ）
 status: active
 note: conceptual roadmap（概念ロードマップ）; not GitHub Milestone object creation（GitHub Milestone object 作成そのものは含まない）
-last_updated_by_issue: 1171
+last_updated_by_issue: 2573
 ---
 
 # Post-M1 Playable Outcome Roadmap
@@ -20,7 +20,7 @@ last_updated_by_issue: 1171
 - **体験概要（非正本）**: `docs/product/game-overview.md` — MVP Loop の参照元として使用するが、要件の正本としては扱わない
 - **Milestone 命名規則**: `docs/dev/milestone-ops.md`
 - 個別機能の stable な仕様は `docs/product/features/<feature>.md` へ昇格させる
-- **Milestone boundary authority**: M2 / M3 / M4 / M5 の conceptual milestone boundary は本 roadmap の各 milestone セクションと mapping table を参照元とする。ただし global scope / global non-goals の正本は `docs/product/requirements.md` であり、本 roadmap を global 要件の正本へ格上げしない。GitHub Milestone object はこの roadmap を反映する外部メタデータとして扱う。
+- **Milestone boundary authority**: M2〜M8 の conceptual milestone boundary は本 roadmap の各 milestone セクションと mapping table を参照元とする。ただし global scope / global non-goals の正本は `docs/product/requirements.md` であり、本 roadmap を global 要件の正本へ格上げしない。GitHub Milestone object はこの roadmap を反映する外部メタデータとして扱う。M6〜M8 は conceptual definition のみであり、GitHub Milestone object / parent Issue の materialize は本文書のスコープ外。
 
 ---
 
@@ -39,14 +39,43 @@ last_updated_by_issue: 1171
 
 ## Conceptual Milestone to GitHub Milestone Mapping（概念マイルストーンと GitHub マイルストーンの対応表）
 
-readback_date: 2026-06-27 # GitHub マイルストーンの読取確認を行った日
+readback_date: 2026-09-08 # GitHub マイルストーンの読取確認を行った日
 
 | conceptual_milestone_id | conceptual_title | github_milestone_number | github_milestone_title | mapping_status | decision_note |
 |---|---|---:|---|---|---|
 | M2 | M2: Gameplay Core (v0.2.x) | 4 | M2: Combat MVP Gate (v0.2.x) | mismatch_pending_rename | conceptual boundary は gameplay core、GitHub milestone object は旧 title のまま残っている。rename 判断は別スコープ。 |
 | M3 | M3: Result Persistence (v0.3.x) | 3 | M3: Result Persistence (v0.3.x) | aligned | conceptual title と GitHub milestone title は一致している。formal close / readback の最終判断は `#733` 側で扱う。 |
-| M4 | M4: Upgrade Loop (v0.4.x) | 2 | M4: Upgrade Loop (v0.4.x) | aligned | conceptual boundary と GitHub milestone object の readback が一致。title はライブ readback で確認済み。 |
-| M5 | M5: Playable Slice Hardening (v0.5.x) | null | null | unmapped | 2026-06-21 readback 時点で対応する GitHub milestone object は未作成。conceptual milestone のみ存在する。 |
+| M4 | M4: Upgrade Loop (v0.4.x) | 2 | M4: Upgrade Loop (v0.4.x) | aligned | conceptual boundary と GitHub milestone object の readback が一致。title はライブ readback で確認済み。M4 parent tracker `#1176` は 2026-09-08 live readback で `CLOSED / COMPLETED` を確認し、M5 へ phase handoff 済み。 |
+| M5 | M5: Playable Slice Hardening (v0.5.x) | 5 | M5: Playable Slice Hardening (v0.5.x) | aligned | conceptual boundary と GitHub milestone object の readback が一致。2026-09-08 に GitHub Milestone (number 5) を新規作成し、parent tracker #2572 を直接割り当てた。 |
+| M6 | M6: Ace Intervention (v0.6.x) | null | null | unmapped | 2026-09-08 時点で GitHub Milestone object と parent Issue は未作成。今回の phase handoff では conceptual definition のみを追加し、GitHub 側の materialize は M5 close 後に別スコープで扱う。 |
+| M7 | M7: Tech Extraction Loop (v0.7.x) | null | null | unmapped | 2026-09-08 時点で GitHub Milestone object と parent Issue は未作成。M6 close 後に別スコープで扱う。 |
+| M8 | M8: Validated Vertical Slice (v0.8.x) | null | null | unmapped | 2026-09-08 時点で GitHub Milestone object と parent Issue は未作成。M7 close 後に別スコープで扱う。 |
+
+---
+
+## Milestone Dependency Policy（M4〜M8 依存境界）
+
+```text
+M4: Upgrade Loop
+        ↓
+M5: Playable Slice Hardening
+        ↓
+M6: Ace Intervention
+        ↓
+M7: Tech Extraction Loop
+        ↓
+M8: Validated Vertical Slice
+```
+
+- Milestone の close と、次 milestone の**主要 runtime implementation** の開始は直列である。次 milestone の主要 runtime implementation は、原則として current milestone close 後の current-main から開始する。
+- ただし次 milestone に関する以下の作業は、current milestone 進行中でも**先行並列可能**とする（先行 runtime merge を許可する意味ではない）。
+  - research（web / codebase research を含む）
+  - product spec draft / review
+  - adversarial review
+  - Issue decomposition
+  - issue-refinement-loop
+  - feasibility spike
+- この境界は M5〜M8 の各 milestone セクションの `dependencies` と close_conditions に反映し、次 milestone の core mechanic を current milestone の close 条件として先取りしない（例: M5 の close_conditions は M6 の ally/assist-player runtime を要求しない）。
 
 ---
 
@@ -171,33 +200,203 @@ spec_destination:
 ```yaml
 milestone_id: M5
 title: "M5: Playable Slice Hardening (v0.5.x)"
+github_milestone_number: 5
+github_milestone_title: "M5: Playable Slice Hardening (v0.5.x)"
+mapping_status: aligned
+decision_note: "conceptual boundary と GitHub milestone object の readback が一致。2026-09-08 に GitHub Milestone (number 5) を新規作成し、parent tracker #2572 を直接割り当てた。"
+parent_issue: 2572
+source_mvp_loop:
+  - dom_canvas_separation
+  - result_resource_loop
+scope: |
+  M2〜M4で成立した sortie → result/resource → upgrade → next sortie の playable slice を、
+  新しい core mechanic を増やさず安定して繰り返し遊べる状態へ硬化するフェーズ。対象:
+  M4→M5 phase handoff、player-facing normal flow、HUD / combat readability、
+  result / preparation UX、save / load / reload continuity、player-blocking balance / tuning、
+  supported viewport / browser runtime、applicable automated regression / E2E / VRT、
+  current-main に束縛した developer-self playtest。
+dependencies:
+  - M4: Upgrade Loop (v0.4.x) — M2〜M4 の実装が完了し、一連の loop が成立していること（parent tracker #1176 は CLOSED / COMPLETED、2026-09-08 live readback で確認）
+close_conditions:
+  - M4 completion が live state で確認できる
+  - M4→M5 SSOT handoff が同期済み
+  - GitHub M5 Milestone mapping が live readback と一致
+  - fresh state から通常 UI のみで preparation → sortie → result → resource → upgrade → next sortie を完遂できる
+  - saved state / reload / Load Game 後も progression と upgrade が維持され次 sortie へ反映される
+  - developer-self human_internal playtest を 3〜5 sortie 完遂できる
+  - normal progression に debug UI / storage 手編集 / test-only seed を必要としない
+  - player-blocking readability / focus / overflow / interaction gap が残っていない
+  - Canvas / DOM 分離、systems boundary、60Hz fixed timestep、snapshot storage boundary を維持
+  - current canonical quality gates（pnpm typecheck / lint / test / build）と applicable runtime verification が PASS
+  - M5 baseline で close blocker と判定した gap が全て解消済み
+  - M6 以降の core mechanic を M5 完了のために先取りしていない
+non_goals:
+  - ally NPC / assist_player の新規 core runtime
+  - full RTS
+  - command queue / formation / pathfinding
+  - M7 technology-choice expansion
+  - 大規模な upgrade tree
+  - campaign / territory / world map
+  - base building
+  - network / multiplayer
+  - 本格的な audio 実装
+  - 高品質アセット前提の演出
+  - external tester recruitment
+  - Release Candidate 化
+  - 新規 dashboard / telemetry backend / control-plane
+spec_destination:
+  - docs/product/features/ui-information-architecture.md — HUD / combat readability の詳細仕様
+  - docs/product/features/persistence.md — save / load / reload continuity の詳細仕様
+```
+
+---
+
+### M6: Ace Intervention (v0.6.x) / エース介入
+
+```yaml
+milestone_id: M6
+title: "M6: Ace Intervention (v0.6.x)"
 github_milestone_number: null
 github_milestone_title: null
 mapping_status: unmapped
-decision_note: "2026-06-21 readback 時点で対応する GitHub milestone object は未作成。conceptual milestone としてのみ管理する。"
+decision_note: "GitHub Milestone object と parent Issue は未作成。conceptual definition のみ。M5 closed/completed 後に materialize を別スコープで検討する。"
 source_mvp_loop:
+  - result_resource_loop
+scope: |
+  プレイヤーが「自分の直接介入によって局所戦況が変わった」と知覚できる戦闘構造を成立させる。
+  最小 ally NPC と単一の軽量 macro intent を導入し、full RTS へ拡張せず、
+  accepted Game Thesis の HYP-001-ace-intervention を playable runtime で検証可能にする。
+dependencies:
+  - M5: Playable Slice Hardening (v0.5.x) — closed/completed 後に主要 runtime implementation を開始する
+  - research / spec / issue-refinement は M5 進行中に先行可能
+close_conditions:
+  - ally/NPC/command の stable spec が implementation authority を持つ
+  - 最小 1 種類の ally archetype
+  - semi-autonomous ally behavior
+  - macro command intent 最大 1 種類
+  - command 有無による局所戦況差を deterministic evidence で観測可能
+  - player combat agency が ally AI に奪われていない
+  - developer-self 3〜5 sortie で HYP-001 を評価
+  - invalidated hypothesis があれば Spec Delta を先に処理
+  - M5 progression / persistence / readability に回帰なし
+  - canonical quality / runtime gates PASS
+non_goals:
+  - multi-select
+  - command queue
+  - formation
+  - direct RTS movement command
+  - pathfinding / navmesh
+  - multiple command intents
+  - full behavior tree / GOAP
+  - base building
+  - territory
+  - campaign
+  - multiplayer
+spec_destination:
+  - docs/product/features/unit-operations-and-npc-behavior.md — ally NPC / macro command intent の詳細仕様
+```
+
+---
+
+### M7: Tech Extraction Loop (v0.7.x) / 技術抽出ループ
+
+```yaml
+milestone_id: M7
+title: "M7: Tech Extraction Loop (v0.7.x)"
+github_milestone_number: null
+github_milestone_title: null
+mapping_status: unmapped
+decision_note: "GitHub Milestone object と parent Issue は未作成。conceptual definition のみ。M6 closed/completed 後に materialize を別スコープで検討する。"
+source_mvp_loop:
+  - result_resource_loop
+scope: |
+  M4で成立した generic resource / upgrade loop を、「敵技術を解析・取り込んで次戦の能力へ変える」
+  progression fantasy として成立させる。numeric inflation ではなく、意味の異なる strengthening choice を選び、
+  その選択が次 sortie の gameplay へ観測可能に反映される状態を目標とする。
+dependencies:
+  - M6: Ace Intervention (v0.6.x) — closed/completed 後に主要 runtime implementation を開始する
+  - research / spec / issue-refinement は M6 進行中に先行可能
+close_conditions:
+  - tech extraction / progression choice の stable spec
+  - sortie result が enemy technology / analysis として player-facing に読める
+  - 少なくとも 2 つの意味の異なる strengthening choice
+  - choice が次 sortie の behavior 差として観測可能
+  - choice persistence / reload continuity
+  - atomic save semantics 維持
+  - developer-self 3〜5 sortie で HYP-002 を評価
+  - "`just numbers` / generic currency に見えるかを観測"
+  - invalidated hypothesis なら Spec Delta
+  - M6 ace-intervention との統合で combat readability を壊さない
+  - canonical gates PASS
+non_goals:
+  - 大規模な upgrade tree
+  - dozens of upgrades
+  - skill tree
+  - loot rarity system
+  - crafting
+  - respec / refund economy
+  - complex multi-currency economy
+  - campaign progression
+  - multiplayer
+spec_destination:
+  - docs/product/features/upgrade.md — tech extraction choice の拡張仕様
+  - docs/product/features/resource.md — enemy technology analysis の記録仕様
+```
+
+---
+
+### M8: Validated Vertical Slice (v0.8.x) / 検証済み垂直スライス
+
+```yaml
+milestone_id: M8
+title: "M8: Validated Vertical Slice (v0.8.x)"
+github_milestone_number: null
+github_milestone_title: null
+mapping_status: unmapped
+decision_note: "GitHub Milestone object と parent Issue は未作成。conceptual definition のみ。M7 closed/completed 後に materialize を別スコープで検討する。Release Candidate 化ではない。"
+source_mvp_loop:
+  - result_resource_loop
   - dom_canvas_separation
 scope: |
-  M2〜M4 で構築した DOM / Canvas 分離を壊さず playable slice を硬化するフェーズ。
-  HUD / telemetry / balance / UX hardening を対象とする。
-  高品質アセット・本格 audio は除外する。
-  dom_canvas_separation invariant を M5 完了時点でも維持していることを close_conditions で確認する。
+  M5〜M7で成立した combat readability / ace intervention / tech extraction progression を
+  一つの連続 play session として統合し、LOOP_PROTOCOL の core product hypothesis を検証済み
+  vertical slice として固定するフェーズ。新しい大型 mechanic を追加するフェーズではなく、
+  HYP-MVP-001〜003 の統合 validation / regression 解消 / player-facing flow completion を行う。
 dependencies:
-  - M4: Upgrade Loop (v0.4.x) — M2〜M4 の実装が完了し、一連の loop が成立していること
+  - M7: Tech Extraction Loop (v0.7.x) — closed/completed（transitive に M5/M6/M7 completion を要求する）
 close_conditions:
-  - M2〜M4 の一連の loop が破綻なく手動プレイできる
-  - DOM / Canvas 分離が維持されている（MVP-001 遵守）
-  - MVP non-goals（campaign / audio / network / 高品質アセット）を侵食していない
-  - pnpm typecheck && pnpm lint && pnpm test && pnpm build が通る
+  - M5〜M7 closed/completed
+  - fresh browser/profile から通常 UI のみで開始可能
+  - 3〜5 sortie 内で prepare → intervene → resolve → analyze/extract → choose upgrade → persist → next sortie が成立
+  - ally/lightweight command と player agency が両立
+  - progression choice が次 sortie へ反映
+  - reload / Load Game 継続可能
+  - HYP-MVP-001 evidence
+  - HYP-MVP-002 evidence
+  - HYP-MVP-003 evidence
+  - unresolved design hypothesis invalidated = 0
+  - supported viewport / input で player-blocker = 0
+  - architecture invariant 維持
+  - current canonical quality / runtime gates PASS
+  - roadmap / current-focus へ次 phase handoff を記録
 non_goals:
-  - 高品質アセット前提の演出
-  - 本格的な audio 実装
-  - network / multiplayer
-  - campaign / territory 管理
-  - requirements.md の Global Non-Goals 全般
+  - Release Candidate 認定
+  - commercial release readiness
+  - store submission
+  - external tester recruitment
+  - campaign
+  - world map
+  - territory
+  - base building
+  - full RTS
+  - 大規模 tech tree
+  - multiplayer
+  - full audio production
+  - high-fidelity art replacement
+  - analytics SaaS / telemetry platform
+  - M9 大型 mechanic の先取り
 spec_destination:
-  - docs/product/features/hud.md — HUD / telemetry の詳細仕様
-  - docs/product/features/balance.md — バランス調整の方針と仕様
+  - docs/product/game-thesis.md — HYP-MVP-001〜003 の統合 validation 記録先
 ```
 
 ---
@@ -213,6 +412,6 @@ spec_destination:
 ## Maintenance Policy（保守方針）
 
 - この文書は conceptual roadmap の正本であり、個別機能仕様の正本ではない。
-- M2〜M5 の Parent Issue が materialize された時点で、対応する issue number を追記する。
+- M2〜M8 の Parent Issue が materialize された時点で、対応する issue number を各 milestone YAML block の `parent_issue` に追記する（M5: `#2572`）。
 - GitHub Milestone object の対応は `github_milestone_number` / `github_milestone_title` / `mapping_status` / `decision_note` を更新し、readback date を残す。
 - feature spec が作成された後は、詳細仕様は `docs/product/features/<feature>.md` を正本とし、本 roadmap は概要・依存関係・到達条件のみを保持する。

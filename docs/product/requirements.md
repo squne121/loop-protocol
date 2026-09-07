@@ -2,8 +2,8 @@
 doc_id: DOC-REQ-001
 title: LOOP_PROTOCOL Requirements Baseline
 status: active
-capability_gate: M4 Upgrade Loop (v0.4.x)
-last_updated_by_issue: 1094
+capability_gate: M5 Playable Slice Hardening (v0.5.x)
+last_updated_by_issue: 2573
 ---
 
 # Requirements Baseline
@@ -32,7 +32,8 @@ last_updated_by_issue: 1094
 
 - M1 Foundation Gate (v0.1.x) の基盤・guardrail・workflow・最小仕様正本は確立済み。
 - M3 の実装と自動検証は完了済みである。
-- 現在の capability gate は `M4: Upgrade Loop (v0.4.x)` とする。formal close / milestone readback の最終判断は `#733` 側で扱う。
+- M4 Upgrade Loop (v0.4.x) は完了済み（parent tracker `#1176` は `CLOSED / COMPLETED`、2026-09-08 live readback で確認）。formal close / milestone readback の最終判断は `#733` 側で扱う。
+- 現在の capability gate は `M5: Playable Slice Hardening (v0.5.x)` とする（delivery-rollup parent tracker: `#2572`）。
 
 ## Global Non-Goals
 
@@ -43,8 +44,15 @@ last_updated_by_issue: 1094
 - 高品質アセット前提の演出
 - Issue や spec にない大規模機能の先行追加
 
-## Milestone Scope: M4 Upgrade Loop (v0.4.x)
+## Milestone Scope: M5 Playable Slice Hardening (v0.5.x)
 
+- 現行の実装対象スコープは `M5: Playable Slice Hardening (v0.5.x)`（global 要件の正本は本 requirements.md であり、milestone は実装対象を指す）。delivery-rollup parent tracker は `#2572`。
+- M5 の scope / close_conditions / non_goals の詳細は `docs/product/playable-roadmap.md` の M5 セクションを正本とする。
+- M5 は新規 core mechanic を追加せず、M2〜M4 で成立した playable slice の hardening（player-facing normal flow、persistence continuity、combat readability、balance、runtime evidence）に限定する。
+
+## Milestone Scope: M4 Upgrade Loop (v0.4.x)（完了済み）
+
+- `M4: Upgrade Loop (v0.4.x)` は完了済み（parent tracker `#1176` は `CLOSED / COMPLETED`）。以下は M4 完了時点の記録として残す。
 - 現行の実装対象スコープは `M4: Upgrade Loop (v0.4.x)`（global 要件の正本は本 requirements.md であり、milestone は実装対象を指す）。
 - M4 では、M3 で永続化済みの resource を消費して最小 upgrade を適用し、次 sortie の挙動変化として観測できるまでをスコープとする。
 - M4 は MVP Loop の「resource が次の強化導線へ接続できること」を最小成立させるフェーズであり、M3 persistence 境界と `src/data` の data-driven 定義の両立を前提にする。
