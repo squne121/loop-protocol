@@ -4290,7 +4290,7 @@ jobs:
             $_s $(($(date +%s%3N)-_t0)) >> measurements.jsonl
           exit $_s
       - name: pytest_session_recording_fixed_location_cutover (timed)
-        # Issue #2004 P1-2 (PR #2008 OWNER REQUEST_CHANGES): these 8 nodeids
+        # Issue #2004 P1-2 (PR #2008 OWNER REQUEST_CHANGES): these nodeids
         # in tests/session-recording/test_fixed_location_cutover.py spawn a
         # real `node` child process (the readiness bootstrap producer,
         # directly or via its `--repo-root` / `--print-resolved-override`
@@ -4299,7 +4299,15 @@ jobs:
         # job's Python-only invariant. The remaining
         # pure-Python nodeids in the same file stay in python-test-core (see
         # .github/ci/python-test-plan.json deselect +
-        # secondary_coverage.dedicated_lanes).
+        # secondary_coverage.dedicated_lanes). Issue #2028 added 5 more
+        # nodeids (all via the same `--test-invoke-prepare-private-parent-dir`
+        # seam as the pre-existing FIFO nodeid) covering the new
+        # mkdirSync()-failure diagnosis path (including the AC2 non-circular
+        # symlink-traversal-limit regression added in fix_delta iteration 1
+        # and registered here in fix_delta iteration 2); see
+        # .github/ci/python-test-plan.json's
+        # secondary_coverage.session_recording_fixed_location_cutover_lane
+        # note for the full, current nodeid count.
         run: |
           _t0=$(date +%s%3N)
           set +e
@@ -4313,6 +4321,11 @@ jobs:
             tests/session-recording/test_fixed_location_cutover.py::test_readiness_producer_parent_dir_toctou_hardening \
             tests/session-recording/test_fixed_location_cutover.py::test_hermetic_default_path_producer_consumer_roundtrip \
             tests/session-recording/test_fixed_location_cutover.py::test_js_prepare_private_parent_dir_rejects_fifo_parent_without_blocking \
+            tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_prefix_symlink_loop_not_misclassified_as_trailing_symlink \
+            tests/session-recording/test_fixed_location_cutover.py::test_js_noncircular_symlink_traversal_limit_eloop_not_misclassified_as_trailing_symlink \
+            tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_eloop_on_confirmed_trailing_symlink_still_reports_symlink \
+            tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_failure_is_diagnosed_instead_of_raw_uncaught_exception \
+            tests/session-recording/test_fixed_location_cutover.py::test_js_accept_semantics_unchanged_after_mkdir_diagnosis_added \
             -p no:xdist
           _s=$?
           set -e
@@ -4374,6 +4387,11 @@ jobs:
             tests/session-recording/test_fixed_location_cutover.py::test_readiness_producer_parent_dir_toctou_hardening \
             tests/session-recording/test_fixed_location_cutover.py::test_hermetic_default_path_producer_consumer_roundtrip \
             tests/session-recording/test_fixed_location_cutover.py::test_js_prepare_private_parent_dir_rejects_fifo_parent_without_blocking \
+            tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_prefix_symlink_loop_not_misclassified_as_trailing_symlink \
+            tests/session-recording/test_fixed_location_cutover.py::test_js_noncircular_symlink_traversal_limit_eloop_not_misclassified_as_trailing_symlink \
+            tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_eloop_on_confirmed_trailing_symlink_still_reports_symlink \
+            tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_failure_is_diagnosed_instead_of_raw_uncaught_exception \
+            tests/session-recording/test_fixed_location_cutover.py::test_js_accept_semantics_unchanged_after_mkdir_diagnosis_added \
             > ci_test_selection_artifacts/node_backed_hook_tests_collect_only.txt
           uv run --locked pytest --collect-only -q \
             .claude/hooks/tests/ \
@@ -4412,6 +4430,11 @@ jobs:
                   "tests/session-recording/test_fixed_location_cutover.py::test_readiness_producer_parent_dir_toctou_hardening",
                   "tests/session-recording/test_fixed_location_cutover.py::test_hermetic_default_path_producer_consumer_roundtrip",
                   "tests/session-recording/test_fixed_location_cutover.py::test_js_prepare_private_parent_dir_rejects_fifo_parent_without_blocking",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_prefix_symlink_loop_not_misclassified_as_trailing_symlink",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_js_noncircular_symlink_traversal_limit_eloop_not_misclassified_as_trailing_symlink",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_eloop_on_confirmed_trailing_symlink_still_reports_symlink",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_failure_is_diagnosed_instead_of_raw_uncaught_exception",
+                  "tests/session-recording/test_fixed_location_cutover.py::test_js_accept_semantics_unchanged_after_mkdir_diagnosis_added",
               ],
               plan=".github/ci/python-test-plan.json",
               pr_head_sha="${{ github.event.pull_request.head.sha || github.sha }}",

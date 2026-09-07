@@ -77,6 +77,55 @@ class ArtifactOverridePathError extends Error {
   }
 }
 
+// Issue #2028: carries the original errno (`err.code` from the failed
+// `mkdirSync`/`openSync` call, when available) and which of those two
+// syscalls failed, all the way through to any caller that merely reads
+// `.message` (the existing `main()` CLI failure path, and the
+// `--test-invoke-prepare-private-parent-dir` test seam below, both already
+// do only that) -- without requiring either of those call sites to change.
+// The diagnostic reason code remains the FIRST token of `.message` so
+// existing exact-match consumers can still match on a stable prefix.
+//
+// Declared here (near the top of the module, ahead of the argv-dispatched
+// `--test-invoke-prepare-private-parent-dir` seam below) rather than next to
+// `preparePrivateParentDir()` itself: that seam calls
+// `preparePrivateParentDir()` synchronously at module top-level evaluation
+// time, before any later `class` declaration in the file would have run.
+//
+// Issue #2028 fix_delta (PR #2549 review): the diagnostic message previously
+// dropped the failing filesystem path entirely, so a CLI user could no
+// longer see WHICH path triggered e.g. `parent_unavailable (errno=ELOOP,
+// syscall=mkdirSync)` -- only the raw pre-fix uncaught exception's message
+// used to show it. This now retains it as an additional `path="..."`
+// segment, preferring the underlying fs error's own `.path` (surfaced via
+// `cause.path`, since `cause` IS that original fs error) and falling back to
+// the `path` option (the classifier's `dir` argument) when the fs error
+// itself did not carry one. `reasonCode` stays the first token of
+// `.message` and `errno`/`op` are unchanged -- only the path is added.
+class PrivateParentDirError extends Error {
+  constructor(reasonCode, { errno = null, op = null, cause, path = null } = {}) {
+    let resolvedPath = null
+    if (cause && typeof cause.path === 'string') {
+      resolvedPath = cause.path
+    } else if (typeof path === 'string') {
+      resolvedPath = path
+    }
+    const parts = []
+    if (errno || op) {
+      parts.push(`errno=${errno ?? 'unknown'}`, `syscall=${op ?? 'unknown'}`)
+    }
+    if (resolvedPath !== null) {
+      parts.push(`path=${JSON.stringify(resolvedPath)}`)
+    }
+    const detail = parts.length ? ` (${parts.join(', ')})` : ''
+    super(`${reasonCode}${detail}`, cause === undefined ? undefined : { cause })
+    this.reasonCode = reasonCode
+    this.errnoCode = errno
+    this.op = op
+    this.path = resolvedPath
+  }
+}
+
 // Issue #2004 P1-3: pure string-level (never filesystem-touching) lexical
 // normalization, kept byte-for-byte in parity with the Python eligibility
 // producer/consumer's _lexically_normalize_override_segments(). Node's
@@ -324,6 +373,19 @@ function main() {
 // (see `diagnoseParentIsSymlink()`) purely to choose a more specific
 // diagnostic reason for an ALREADY-rejected open -- never to reopen with
 // weaker flags or retry after following the symlink.
+//
+// Issue #2028: ELOOP is NOT exclusively caused by a trailing symlink -- a
+// circular (or merely very long, non-circular) symlink chain earlier in the
+// path PREFIX also fails with ELOOP, and on such a path `lstatSync(dir)`
+// itself fails to resolve (it must walk the very same broken prefix) rather
+// than confirming a trailing symlink. `diagnoseParentIsSymlink()` is used
+// for ELOOP the same way it already was for ENOTDIR: purely to decide
+// whether THIS specific rejection may be reported as the more specific
+// `parent_is_symlink` reason. When it cannot confirm a trailing symlink
+// (either because `dir` genuinely is not one, or because the auxiliary
+// `lstatSync()` call itself failed and could not tell), the ELOOP is
+// reported as `parent_unavailable` instead -- never asserted as a symlink
+// loop that was never actually confirmed.
 function diagnoseParentIsSymlink(dir) {
   try {
     return lstatSync(dir).isSymbolicLink()
@@ -332,9 +394,53 @@ function diagnoseParentIsSymlink(dir) {
   }
 }
 
+// Issue #2028: both `mkdirSync()` (only reached when `dir` does not already
+// exist) and `openSync()` (always reached afterward) can fail with the same
+// family of errnos coming from the same underlying path-resolution
+// machinery, so both funnel through this single classifier -- never two
+// independently-drifting copies of the same ELOOP/ENOTDIR reasoning. `op`
+// (`'mkdirSync'` or `'openSync'`) and `err.code` are always attached to the
+// thrown `PrivateParentDirError` (never swallowed) so callers/CLI output can
+// report exactly which syscall failed with which errno, in addition to the
+// (possibly-unconfirmed) diagnostic reason. This always throws.
+function classifyAndThrowParentDirFailure(dir, err, op) {
+  const code = (err && err.code) || null
+  if (code === 'ELOOP') {
+    if (diagnoseParentIsSymlink(dir)) {
+      throw new PrivateParentDirError('parent_is_symlink', { errno: code, op, cause: err, path: dir })
+    }
+    // Confirmed NOT a trailing symlink, or the auxiliary lstatSync() itself
+    // could not tell (e.g. it failed trying to resolve the very same broken
+    // path prefix) -- either way, an unconfirmed ELOOP must never be
+    // reported as a symlink loop. The original errno/op are still attached
+    // above; only the diagnostic reason is downgraded to the generic,
+    // already-existing `parent_unavailable`.
+    throw new PrivateParentDirError('parent_unavailable', { errno: code, op, cause: err, path: dir })
+  }
+  if (code === 'ENOTDIR') {
+    if (diagnoseParentIsSymlink(dir)) {
+      throw new PrivateParentDirError('parent_is_symlink', { errno: code, op, cause: err, path: dir })
+    }
+    throw new PrivateParentDirError('parent_not_a_directory', { errno: code, op, cause: err, path: dir })
+  }
+  throw new PrivateParentDirError('parent_unavailable', { errno: code, op, cause: err, path: dir })
+}
+
 function preparePrivateParentDir(dir) {
   if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    // Issue #2028: previously uncaught -- any mkdirSync() failure (e.g. a
+    // circular or long non-circular symlink chain in the path PREFIX
+    // failing with ELOOP) propagated as a raw, undiagnosed exception. This
+    // now runs the SAME classification openSync() failures already used
+    // below, so a path-prefix ELOOP is diagnosed (and, when unconfirmed as
+    // a trailing symlink, NOT asserted as one) at the point it actually
+    // occurs, rather than only being caught later at openSync() (which,
+    // for a mkdirSync failure, is never even reached).
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+    } catch (err) {
+      classifyAndThrowParentDirFailure(dir, err, 'mkdirSync')
+    }
   }
 
   let flags = fsConstants.O_RDONLY
@@ -345,27 +451,20 @@ function preparePrivateParentDir(dir) {
   try {
     fd = openSync(dir, flags)
   } catch (err) {
-    if (err && err.code === 'ELOOP') {
-      throw new Error('parent_is_symlink', { cause: err })
-    }
-    if (err && err.code === 'ENOTDIR') {
-      if (diagnoseParentIsSymlink(dir)) {
-        throw new Error('parent_is_symlink', { cause: err })
-      }
-      throw new Error('parent_not_a_directory', { cause: err })
-    }
-    throw new Error('parent_unavailable', { cause: err })
+    classifyAndThrowParentDirFailure(dir, err, 'openSync')
   }
   try {
     const st = fstatSync(fd)
     if (!st.isDirectory()) {
       // Defense in depth for a runtime lacking fs.constants.O_DIRECTORY:
       // the open() above could not fail fast on a non-directory, so this
-      // fstatSync()-based check is the only thing rejecting it.
-      throw new Error('parent_not_a_directory')
+      // fstatSync()-based check is the only thing rejecting it. Not an
+      // errno-bearing failure (open() itself succeeded), so no errno/op is
+      // attached.
+      throw new PrivateParentDirError('parent_not_a_directory', { op: 'fstatSync' })
     }
     if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
-      throw new Error('parent_owner_mismatch')
+      throw new PrivateParentDirError('parent_owner_mismatch', { op: 'fstatSync' })
     }
     fchmodSync(fd, 0o700)
   } finally {
