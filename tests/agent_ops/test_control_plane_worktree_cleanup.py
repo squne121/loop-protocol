@@ -25,10 +25,18 @@ Covers:
   racing for the SAME fixed lifecycle mutex are synchronized to attempt
   acquisition at the same instant via `multiprocessing.Barrier` (never a
   fixed `sleep`), and mutual exclusion is observed end-to-end via `flock`.
+- PR #2557 review fix-delta (item 2): a real consumer-side E2E continuation
+  of the AC3 generation-invalidation test above -- after the old
+  generation's artifact is gone, the REAL, unmodified
+  `run_repair_action_apply()` consumer fails closed (`not_attempted` /
+  `secure_open_rejected`) against the now-removed path, never falling back
+  to some same-named path elsewhere, and never invoking its
+  `apply_transaction`/`fetch_current` injection seams.
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import multiprocessing
@@ -45,15 +53,25 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 AGENT_GUARDS_DIR = REPO_ROOT / "scripts" / "agent-guards"
 AGENT_OPS_DIR = REPO_ROOT / "scripts" / "agent-ops"
 BOOTSTRAP_SCRIPT = AGENT_OPS_DIR / "worktree_bootstrap_exec.py"
+# PR #2557 review fix-delta (item 2): the SAME real production consumer
+# module `tests/agent_ops/test_control_plane_worktree_bootstrap.py` already
+# imports this exact way (identical absolute `ISSUE_REFINEMENT_LOOP_SCRIPTS_DIR`)
+# -- reused here, never a stub/reimplementation, so the generation-boundary
+# continuation below proves the REAL `run_repair_action_apply()` fails
+# closed, not a hand-rolled approximation of it.
+ISSUE_REFINEMENT_LOOP_SCRIPTS_DIR = REPO_ROOT / ".claude" / "skills" / "issue-refinement-loop" / "scripts"
 
 if str(AGENT_GUARDS_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_GUARDS_DIR))
 if str(AGENT_OPS_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_OPS_DIR))
+if str(ISSUE_REFINEMENT_LOOP_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(ISSUE_REFINEMENT_LOOP_SCRIPTS_DIR))
 
 import skill_runtime_exec as exec_mod  # noqa: E402
 import skill_runtime_command_policy as command_policy_mod  # noqa: E402
 import worktree_catalog  # noqa: E402
+import run_refinement_preflight as rrp  # noqa: E402
 
 
 def _load_bootstrap_module() -> ModuleType:
@@ -257,6 +275,120 @@ def test_given_accepted_oid_updated_and_clean_tree_when_worktree_recovered_then_
         ["git", "-C", second["worktree_path"], "rev-parse", "HEAD"], check=True, text=True, capture_output=True
     ).stdout.strip()
     assert head_after == new_oid.value
+
+
+_GENERATION_ORIGINAL_BODY = "original body\n"
+_GENERATION_REPAIRED_BODY = "repaired body\n"
+
+
+def _write_dedicated_repair_candidate_needs_fix(dedicated_worktree: Path, issue_number: int) -> Path:
+    """PR #2557 review fix-delta (item 2): mirrors the SAME needs_fix-shaped
+    preflight-result artifact shape
+    `tests/agent_ops/test_control_plane_worktree_bootstrap.py::_write_dedicated_repair_candidate()`
+    already proves the REAL `run_repair_action_apply()` consumer reads (an
+    `auto_apply_safe` repair_action with its own `candidate_body.md`
+    sidecar), written under the dedicated worktree's own
+    `.claude/artifacts/issue-refinement-loop/<issue>/` tree."""
+    artifact_dir = dedicated_worktree / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    candidate_path = artifact_dir / "candidate_body.md"
+    candidate_path.write_text(_GENERATION_REPAIRED_BODY)
+    repair_action = {
+        "schema_version": "repair_action/v1",
+        "policy_version": "deterministic-issue-repair/v1",
+        "disposition": "auto_apply_safe",
+        "original_body_sha256": hashlib.sha256(_GENERATION_ORIGINAL_BODY.encode("utf-8")).hexdigest(),
+        "repaired_body_sha256": hashlib.sha256(_GENERATION_REPAIRED_BODY.encode("utf-8")).hexdigest(),
+        "diagnostics_artifact": None,
+        "candidate_body_artifact": str(candidate_path),
+        "repair_kinds": ["trailing_whitespace"],
+        "reason_codes": ["trailing_whitespace_stripped"],
+        "source_lane": "unanchored",
+        "preflight_run_identity": "sha256:testrun",
+        "original_updated_at": "2024-01-01T00:00:00Z",
+        "source_refs_digest": None,
+    }
+    preflight_result = {
+        "schema": "issue_refinement_preflight_result/v1",
+        "repair_action": repair_action,
+        "result_core_sha256": "sha256:testrun",
+    }
+    result_path = artifact_dir / "refinement_preflight_result_v1.json"
+    result_path.write_text(json.dumps(preflight_result))
+    return result_path
+
+
+def test_given_needs_fix_artifact_and_generation_boundary_when_real_repair_consumer_runs_against_stale_path_then_not_attempted_and_zero_mutation_calls(
+    tmp_path,
+):
+    """PR #2557 review fix-delta (item 2): a real consumer-side E2E
+    continuation of
+    `test_given_accepted_oid_updated_and_clean_tree_when_worktree_recovered_then_refreshed_and_old_generation_gone`
+    above -- after the SAME accepted-OID refresh removes the OLD
+    generation's `needs_fix`-shaped preflight-result artifact, the REAL,
+    unmodified `run_repair_action_apply()` consumer
+    (`.claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py`)
+    must fail closed against the now-removed path -- `not_attempted` /
+    `secure_open_rejected` (the SAME existing not_attempted/secure_open_rejected
+    contract `test_repair_action_apply_stale_guard.py` already documents for
+    this class of failure) -- rather than silently reading through to a
+    same-named path in the primary checkout or elsewhere. This is a pure
+    test addition: it requires no change to `run_repair_action_apply()`
+    itself and adds no new consumer routing -- fresh-preflight restart
+    routing stays explicitly OUT of Issue #2200's scope."""
+    local, source_origin, _url, oid = _init_remote_fixture(tmp_path)
+    object_format = command_policy_mod.validate_repository_object_format("sha1")
+    deadline = _deadline()
+    canonical_common_dir = _canonical_common_dir(local)
+    old_oid = command_policy_mod.validate_repository_object_id(oid, object_format)
+
+    first = BOOTSTRAP.recover_or_create_fixed_control_plane_worktree(
+        old_oid, object_format, project_root=str(local), canonical_common_dir=canonical_common_dir, deadline=deadline
+    )
+    assert first["state"] == "created"
+    dedicated_path = Path(first["worktree_path"])
+    old_generation_artifact = _write_dedicated_repair_candidate_needs_fix(dedicated_path, 2200)
+    dedicated_relative = os.path.relpath(old_generation_artifact, local)
+    assert old_generation_artifact.exists()
+
+    # Same generation boundary as the test above: a fresh accepted-OID
+    # observation with a clean working tree recreates the whole checkout.
+    source_like = tmp_path / "source"
+    new_oid_text = _commit_new_head(source_like, _git_env(tmp_path), source_origin.as_uri())
+    new_oid = command_policy_mod.validate_repository_object_id(new_oid_text, object_format)
+    subprocess.run(["git", "-C", str(local), "fetch", "-q", "origin", "main"], check=True)
+
+    second = BOOTSTRAP.recover_or_create_fixed_control_plane_worktree(
+        new_oid, object_format, project_root=str(local), canonical_common_dir=canonical_common_dir, deadline=deadline
+    )
+    assert second["state"] == "refreshed"
+    assert not old_generation_artifact.exists()
+
+    apply_calls: list[tuple] = []
+    fetch_calls: list[bool] = []
+
+    def _apply_transaction(current_issue: dict, candidate_body: str) -> dict:
+        apply_calls.append((current_issue, candidate_body))
+        raise AssertionError("apply_transaction must never be invoked against a stale/removed artifact")
+
+    def _fetch_current():
+        fetch_calls.append(True)
+        raise AssertionError("fetch_current must never be invoked against a stale/removed artifact")
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=2200,
+        preflight_result_path=dedicated_relative,
+        repo_root=Path(local),
+        fetch_current=_fetch_current,
+        apply_transaction=_apply_transaction,
+    )
+
+    assert result["mutation_outcome"] == "not_attempted"
+    assert result["failure_code"] == "secure_open_rejected"
+    assert result["phase"] == "candidate_load"
+    assert apply_calls == []
+    assert fetch_calls == []
 
 
 # ---------------------------------------------------------------------------

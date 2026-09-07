@@ -22,10 +22,20 @@ Covers:
 - Scope: the new checks are a byte-identical no-op for the 2 contract_update
   mutation profiles and for every command_id outside
   `ARTIFACT_CONFINEMENT_COMMAND_IDS`.
+- PR #2557 review fix-delta (P1-1): when the artifact self-declares the
+  canonical `schema_version` a real `run_refinement_preflight.py` result
+  carries, the strengthened provenance check also validates the top-level
+  `repo` field (when the caller supplies its own expected `repo`), the
+  presence of `repair_action.preflight_run_identity`, and -- when a
+  `repair_action.candidate_body_artifact` sidecar is present -- that
+  sidecar's digest against `repair_action.repaired_body_sha256`. A
+  non-canonical (or absent) `schema_version` keeps the pre-existing
+  issue_number-only behavior unchanged.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -221,6 +231,247 @@ def test_given_mismatched_owner_field_when_confinement_checked_then_stale_artifa
 
 
 # ---------------------------------------------------------------------------
+# PR #2557 review fix-delta (P1-1): strengthened provenance checks for an
+# artifact that self-declares the CANONICAL `schema_version` a real
+# `run_refinement_preflight.py` result actually carries (never the
+# test-only `"schema"` key the OTHER fixtures above use, which the real
+# producer never emits and which this strengthened check therefore never
+# recognizes -- keeping every existing test above byte-identical).
+# ---------------------------------------------------------------------------
+
+_CANONICAL_ORIGINAL_BODY = "original body\n"
+_CANONICAL_REPAIRED_BODY = "repaired body\n"
+
+
+def _hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _write_canonical_result_with_repair_action(
+    artifact_dir: Path,
+    *,
+    issue_number: int = 2200,
+    repo: "str | None" = "squne121/loop-protocol",
+    preflight_run_identity: "str | None" = "sha256:testrun",
+    candidate_body_artifact: "Path | None | str" = "__default__",
+    repaired_body_sha256: "str | None" = "__default__",
+) -> Path:
+    """Canonical-shaped fixture (Issue #2200 PR #2557 review item 3): unlike
+    `_write_result_artifact()` above (test-only `"schema"` key), this uses
+    the EXACT field names the real producer (`run_refinement_preflight.py`'s
+    `_build_result()`/`SCHEMA_VERSION_RESULT`) emits at the top level
+    (`schema_version`, `status`, `issue_number`, `repo`, `hashes`) and
+    nested under `repair_action` (`preflight_run_identity`,
+    `candidate_body_artifact`, `repaired_body_sha256`), so the NEW
+    provenance-validating tests below are never accidentally green against
+    a non-canonical shape."""
+    candidate_path: "Path | None"
+    if candidate_body_artifact == "__default__":
+        candidate_path = artifact_dir / "candidate_body.md"
+        candidate_path.write_text(_CANONICAL_REPAIRED_BODY, encoding="utf-8")
+    else:
+        candidate_path = candidate_body_artifact  # type: ignore[assignment]
+
+    if repaired_body_sha256 == "__default__":
+        repaired_body_sha256 = f"sha256:{_hex(_CANONICAL_REPAIRED_BODY)}"
+
+    repair_action: dict = {
+        "schema_version": "repair_action/v1",
+        "policy_version": "deterministic-issue-repair/v1",
+        "disposition": "auto_apply_safe",
+        "original_body_sha256": f"sha256:{_hex(_CANONICAL_ORIGINAL_BODY)}",
+        "repaired_body_sha256": repaired_body_sha256,
+        "candidate_body_artifact": str(candidate_path) if candidate_path is not None else None,
+        "repair_kinds": ["trailing_whitespace"],
+        "reason_codes": ["trailing_whitespace_stripped"],
+        "source_lane": "unanchored",
+        "preflight_run_identity": preflight_run_identity,
+        "original_updated_at": "2024-01-01T00:00:00Z",
+        "source_refs_digest": None,
+    }
+    payload: dict = {
+        "schema_version": "refinement_preflight_result/v1",
+        "status": "needs_fix",
+        "issue_number": issue_number,
+        "hashes": {"result_core_sha256": "sha256:testrun"},
+        "repair_action": repair_action,
+    }
+    if repo is not None:
+        payload["repo"] = repo
+    result_path = artifact_dir / "refinement_preflight_result_v1.json"
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    return result_path
+
+
+def test_given_canonical_schema_version_and_matching_fields_when_confinement_checked_then_accepted(tmp_path):
+    artifact_dir = _make_artifact_dir(tmp_path, 2200)
+    artifact_path = _write_canonical_result_with_repair_action(artifact_dir, issue_number=2200)
+
+    reason, offending = exec_mod._validate_artifact_confinement_bounds(
+        str(tmp_path), "2200", [str(artifact_path)], repo="squne121/loop-protocol"
+    )
+    assert reason is None
+    assert offending == []
+
+
+def test_given_canonical_schema_version_repo_mismatch_when_confinement_checked_then_stale_artifact_rejected(tmp_path):
+    """AC4 strengthening: a canonical-schema artifact that declares a
+    FOREIGN `repo` is rejected exactly like an `issue_number` mismatch,
+    when the caller supplies its own expected `repo`."""
+    artifact_dir = _make_artifact_dir(tmp_path, 2200)
+    artifact_path = _write_canonical_result_with_repair_action(
+        artifact_dir, issue_number=2200, repo="someone-else/other-repo"
+    )
+
+    reason, offending = exec_mod._validate_artifact_confinement_bounds(
+        str(tmp_path), "2200", [str(artifact_path)], repo="squne121/loop-protocol"
+    )
+    assert reason == exec_mod.ARTIFACT_CONFINEMENT_REASON_STALE_ARTIFACT
+    assert offending == [str(artifact_path)]
+
+
+def test_given_no_expected_repo_supplied_when_confinement_checked_then_repo_field_never_consulted(tmp_path):
+    """Backward compatibility: a caller that does not know its own expected
+    `repo` (`repo=None`, the default) never has the artifact's declared
+    `repo` field consulted at all -- a foreign `repo` value is a legitimate
+    omission from THIS caller's point of view, never a mismatch."""
+    artifact_dir = _make_artifact_dir(tmp_path, 2200)
+    artifact_path = _write_canonical_result_with_repair_action(
+        artifact_dir, issue_number=2200, repo="someone-else/other-repo"
+    )
+
+    reason, offending = exec_mod._validate_artifact_confinement_bounds(str(tmp_path), "2200", [str(artifact_path)])
+    assert reason is None
+    assert offending == []
+
+
+def test_given_canonical_schema_version_missing_run_identity_when_confinement_checked_then_stale_artifact_rejected(
+    tmp_path,
+):
+    """AC4 strengthening: a canonical-schema artifact's `repair_action` that
+    omits `preflight_run_identity` (an already-schema'd provenance field
+    every real production result populates) can never be trusted as
+    fresh."""
+    artifact_dir = _make_artifact_dir(tmp_path, 2200)
+    artifact_path = _write_canonical_result_with_repair_action(
+        artifact_dir, issue_number=2200, preflight_run_identity=None
+    )
+
+    reason, offending = exec_mod._validate_artifact_confinement_bounds(
+        str(tmp_path), "2200", [str(artifact_path)], repo="squne121/loop-protocol"
+    )
+    assert reason == exec_mod.ARTIFACT_CONFINEMENT_REASON_STALE_ARTIFACT
+    assert offending == [str(artifact_path)]
+
+
+def test_given_canonical_schema_version_candidate_digest_mismatch_when_confinement_checked_then_stale_artifact_rejected(
+    tmp_path,
+):
+    """AC4 strengthening: when `repair_action.candidate_body_artifact` is
+    present, its digest is verified against `repair_action.repaired_body_sha256`
+    -- a sidecar whose actual content disagrees with the recorded digest is
+    rejected as stale, even though the artifact's own `issue_number`/`repo`
+    match."""
+    artifact_dir = _make_artifact_dir(tmp_path, 2200)
+    artifact_path = _write_canonical_result_with_repair_action(artifact_dir, issue_number=2200)
+    # Corrupt the candidate body AFTER the digest was already recorded.
+    candidate_path = artifact_dir / "candidate_body.md"
+    candidate_path.write_text("a completely different body\n", encoding="utf-8")
+
+    reason, offending = exec_mod._validate_artifact_confinement_bounds(
+        str(tmp_path), "2200", [str(artifact_path)], repo="squne121/loop-protocol"
+    )
+    assert reason == exec_mod.ARTIFACT_CONFINEMENT_REASON_STALE_ARTIFACT
+    assert offending == [str(artifact_path)]
+
+
+def test_given_canonical_schema_version_missing_candidate_body_when_confinement_checked_then_stale_artifact_rejected(
+    tmp_path,
+):
+    """AC4 strengthening: `repair_action.candidate_body_artifact` pointing
+    at a non-existent path (e.g. already cleaned up, or never actually
+    written) fails closed rather than being silently skipped."""
+    artifact_dir = _make_artifact_dir(tmp_path, 2200)
+    missing_candidate = artifact_dir / "never_written_candidate.md"
+    artifact_path = _write_canonical_result_with_repair_action(
+        artifact_dir, issue_number=2200, candidate_body_artifact=missing_candidate
+    )
+
+    reason, offending = exec_mod._validate_artifact_confinement_bounds(
+        str(tmp_path), "2200", [str(artifact_path)], repo="squne121/loop-protocol"
+    )
+    assert reason == exec_mod.ARTIFACT_CONFINEMENT_REASON_STALE_ARTIFACT
+    assert offending == [str(artifact_path)]
+
+
+def test_given_non_canonical_schema_version_when_confinement_checked_then_strengthened_checks_skipped(tmp_path):
+    """Scope guard: an artifact whose `schema_version` is present but is
+    NOT the exact canonical value never reaches the strengthened
+    `preflight_run_identity`/digest checks -- only the pre-existing,
+    schema-independent `issue_number`/`repo` top-level checks apply,
+    byte-identical to before this fix_delta. This artifact's own
+    `repair_action.preflight_run_identity` is absent (which WOULD be
+    rejected if this were treated as the canonical schema), proving the
+    strengthened path is genuinely skipped rather than coincidentally
+    passing."""
+    artifact_dir = _make_artifact_dir(tmp_path, 2200)
+    artifact_path = artifact_dir / "repair_action_only.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "repair_action/v1",
+                "issue_number": 2200,
+                "repo": "squne121/loop-protocol",
+                "repair_action": {"disposition": "auto_apply_safe"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reason, offending = exec_mod._validate_artifact_confinement_bounds(
+        str(tmp_path), "2200", [str(artifact_path)], repo="squne121/loop-protocol"
+    )
+    assert reason is None
+    assert offending == []
+
+
+def test_given_production_dispatch_and_repo_mismatch_when_dispatched_then_publish_blocked(
+    tmp_path, monkeypatch, capsys
+):
+    """AC1/AC5 end-to-end: the REAL `_dispatch_child_and_check_postconditions()`
+    entrypoint, given its own known `repo`, rejects a canonical-schema
+    artifact declaring a foreign `repo` BEFORE stdout publication."""
+    _init_git_repo(tmp_path)
+    artifact_dir = _make_artifact_dir(tmp_path, 2200)
+    artifact_path = _write_canonical_result_with_repair_action(
+        artifact_dir, issue_number=2200, repo="someone-else/other-repo"
+    )
+    stdout = f"STATUS: needs_fix\nARTIFACT:\n  refinement_preflight_result_v1: {artifact_path}\n"
+
+    monkeypatch.setattr(
+        exec_mod,
+        "_run_child_with_supervision",
+        lambda *a, **k: _FakeSupervision(returncode=0, stdout=stdout),
+    )
+
+    exit_code = exec_mod._dispatch_child_and_check_postconditions(
+        dispatch_root=str(tmp_path),
+        issue_number=2200,
+        command_id="preflight.run",
+        child_argv=["true"],
+        env={},
+        timeout_seconds=5.0,
+        binary_output=False,
+        repo="squne121/loop-protocol",
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "STATUS: needs_fix" not in captured.out
+    assert "reason_code=stale_artifact" in captured.err
+
+
+# ---------------------------------------------------------------------------
 # Category 1 (In Scope): bounded cleanup of unpublished failed-run leftovers.
 # ---------------------------------------------------------------------------
 
@@ -295,6 +546,44 @@ def test_given_symlinked_scratch_leftover_when_cleanup_run_then_artifact_escape_
     assert reason == exec_mod.ARTIFACT_CONFINEMENT_REASON_ARTIFACT_ESCAPE
     assert removed == []
     assert real_target.exists()
+
+
+def test_given_directory_scan_budget_exceeded_by_non_matching_entries_when_cleanup_run_then_artifact_oversized_rejected(
+    tmp_path,
+):
+    """PR #2557 review fix-delta (P2-4): the directory-scan cost itself is
+    bounded, independent of `ARTIFACT_CONFINEMENT_MAX_COUNT`'s post-filter
+    candidate-count cap. A directory containing more than
+    `_LEFTOVER_SCRATCH_DIRECTORY_SCAN_BUDGET` entries fails closed as
+    oversized even when ZERO of those entries actually match the leftover
+    scratch-temp naming pattern (i.e. this is a scan-cost bound, never a
+    candidate-count bound in disguise)."""
+    artifact_dir = _make_artifact_dir(tmp_path, 2200)
+    for i in range(exec_mod._LEFTOVER_SCRATCH_DIRECTORY_SCAN_BUDGET + 1):
+        (artifact_dir / f"unrelated_{i}.json").write_text("{}", encoding="utf-8")
+
+    ok, reason, removed = exec_mod._bounded_cleanup_stale_artifact_leftovers(
+        str(tmp_path), "2200", "preflight.run", not_before_mtime=2_000_000_000.0
+    )
+    assert ok is False
+    assert reason == exec_mod.ARTIFACT_CONFINEMENT_REASON_ARTIFACT_OVERSIZED
+    assert removed == []
+
+
+def test_given_directory_within_scan_budget_when_cleanup_run_then_unaffected(tmp_path):
+    """Non-regression: a directory with entries under the scan budget (and
+    zero matching leftovers) still trivially succeeds -- the new bounded
+    scan changes cost characteristics only, never behavior within bounds."""
+    artifact_dir = _make_artifact_dir(tmp_path, 2200)
+    for i in range(exec_mod._LEFTOVER_SCRATCH_DIRECTORY_SCAN_BUDGET - 1):
+        (artifact_dir / f"unrelated_{i}.json").write_text("{}", encoding="utf-8")
+
+    ok, reason, removed = exec_mod._bounded_cleanup_stale_artifact_leftovers(
+        str(tmp_path), "2200", "preflight.run", not_before_mtime=2_000_000_000.0
+    )
+    assert ok is True
+    assert reason is None
+    assert removed == []
 
 
 # ---------------------------------------------------------------------------

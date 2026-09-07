@@ -1272,6 +1272,14 @@ ARTIFACT_CONFINEMENT_MAX_FILE_BYTES = 4 * 1024 * 1024
 ARTIFACT_CONFINEMENT_MAX_TOTAL_BYTES = 16 * 1024 * 1024
 ARTIFACT_CONFINEMENT_MAX_COUNT = 16
 
+# PR #2557 review fix-delta (P2-4): a fixed, non-caller-configurable
+# directory-scan budget for `_bounded_cleanup_stale_artifact_leftovers()`'s
+# `os.scandir()` enumeration -- bounds the SCAN itself (not just the
+# post-filter candidate count already capped by `ARTIFACT_CONFINEMENT_MAX_COUNT`
+# above), so an allowed artifact root containing an unbounded number of
+# non-matching entries can never make the scan itself unbounded cost.
+_LEFTOVER_SCRATCH_DIRECTORY_SCAN_BUDGET = 64
+
 # Fixed reason codes (Issue #2200 In Scope). Never a free-form string --
 # every caller of `_emit_artifact_confinement_failure()` /
 # `_bounded_cleanup_stale_artifact_leftovers()` passes one of exactly these.
@@ -1380,7 +1388,31 @@ def _read_bounded_fd(fd: int, max_bytes: int) -> "bytes | None":
     return b"".join(chunks)
 
 
-def _artifact_owner_field_mismatch(payload: bytes, issue_number: str) -> bool:
+# Issue #2200 PR #2557 review fix-delta (P1-1): the EXACT literal
+# `run_refinement_preflight.py`'s canonical result producer emits as its
+# own `schema_version` field (that script's `SCHEMA_VERSION_RESULT`
+# constant). Only an artifact that self-declares THIS EXACT value gets the
+# strengthened provenance checks below; any other/absent `schema_version`
+# keeps the pre-existing issue_number-only "legitimate omission" behavior
+# byte-identical to before this fix_delta.
+_CANONICAL_PREFLIGHT_RESULT_SCHEMA_VERSION = "refinement_preflight_result/v1"
+
+
+def _strip_sha256_prefix(value: object) -> "str | None":
+    """Normalize a `sha256:<hex>` or bare-`<hex>` digest string to its bare
+    lowercase hex form. Mirrors `run_refinement_preflight.py`'s own
+    `_repair_apply_strip_sha_prefix()` (duplicated rather than
+    cross-imported -- this module never imports a skill script)."""
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith("sha256:"):
+        value = value[len("sha256:") :]
+    return value.lower()
+
+
+def _artifact_owner_field_mismatch(
+    payload: bytes, issue_number: str, repo: "str | None", project_root: str
+) -> bool:
     """Issue #2200 AC4 freshness/ownership check: when the artifact's own
     JSON body declares a top-level `issue_number` field, it must match the
     dispatch's `issue_number`. A parse failure, a non-dict payload, or the
@@ -1389,21 +1421,71 @@ def _artifact_owner_field_mismatch(payload: bytes, issue_number: str) -> bool:
     present and DOES disagree, never for content this validator cannot
     read as declaring ownership at all (Issue #2200 AC4: "JSON内の任意文字列や
     `must_read` を生成artifactと誤分類しない" -- this reads exactly one fixed,
-    already-schema'd field, never a generic string scan)."""
+    already-schema'd field, never a generic string scan).
+
+    PR #2557 review fix-delta (P1-1): when `repo` (the dispatch's own
+    known repo slug) is supplied and the artifact ALSO declares a top-level
+    `repo` field, that field is checked the same way as `issue_number`
+    above. When the artifact additionally self-declares the canonical
+    `schema_version` (`_CANONICAL_PREFLIGHT_RESULT_SCHEMA_VERSION`), this
+    also reads the SAME already-schema'd `repair_action.preflight_run_identity`
+    field as an additional freshness signal (a canonical-schema artifact
+    that omits it can never be trusted as fresh), and -- when a
+    `repair_action.candidate_body_artifact` sidecar is present alongside
+    its own `repaired_body_sha256` -- verifies that sidecar's digest
+    through the SAME no-follow-opened, same-fd-fstat-confirmed
+    regular-file reader `_validate_artifact_confinement_bounds()` already
+    uses for the artifact itself (never a new open helper, never a generic
+    string scan, never a new registry/lease/timestamp protocol). Any
+    `schema_version` other than the exact canonical value -- including its
+    absence -- skips all of this and stays byte-identical to the
+    pre-existing issue_number-only check."""
     try:
         parsed = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
     if not isinstance(parsed, dict):
         return False
-    candidate = parsed.get("issue_number")
-    if candidate is None:
+    candidate_issue = parsed.get("issue_number")
+    if candidate_issue is not None and str(candidate_issue) != str(issue_number):
+        return True
+    if repo is not None:
+        candidate_repo = parsed.get("repo")
+        if candidate_repo is not None and str(candidate_repo) != str(repo):
+            return True
+    if parsed.get("schema_version") != _CANONICAL_PREFLIGHT_RESULT_SCHEMA_VERSION:
         return False
-    return str(candidate) != str(issue_number)
+    repair_action = parsed.get("repair_action")
+    if not isinstance(repair_action, dict):
+        return False
+    if repair_action.get("preflight_run_identity") is None:
+        return True
+    candidate_body_artifact = repair_action.get("candidate_body_artifact")
+    expected_digest = _strip_sha256_prefix(repair_action.get("repaired_body_sha256"))
+    if not candidate_body_artifact or not expected_digest:
+        return False
+    candidate_path = (
+        candidate_body_artifact
+        if os.path.isabs(candidate_body_artifact)
+        else str(Path(project_root) / candidate_body_artifact)
+    )
+    opened = _open_confined_regular_fd(candidate_path, project_root)
+    if opened is None:
+        return True
+    fd, size = opened
+    try:
+        if size > ARTIFACT_CONFINEMENT_MAX_FILE_BYTES:
+            return True
+        body_bytes = _read_bounded_fd(fd, ARTIFACT_CONFINEMENT_MAX_FILE_BYTES)
+    finally:
+        os.close(fd)
+    if body_bytes is None:
+        return True
+    return hashlib.sha256(body_bytes).hexdigest() != expected_digest
 
 
 def _validate_artifact_confinement_bounds(
-    project_root: str, issue_number: str, artifact_paths: list[str]
+    project_root: str, issue_number: str, artifact_paths: list[str], repo: "str | None" = None
 ) -> "tuple[str | None, list[str]]":
     """Issue #2200 AC4: confinement bounds for the compact stdout artifact
     projection, layered strictly ON TOP of `_validate_stdout_artifact_projection()`'s
@@ -1442,7 +1524,7 @@ def _validate_artifact_confinement_bounds(
             os.close(fd)
         if payload is None:
             return ARTIFACT_CONFINEMENT_REASON_ARTIFACT_OVERSIZED, [raw_path]
-        if _artifact_owner_field_mismatch(payload, issue_number):
+        if _artifact_owner_field_mismatch(payload, issue_number, repo, project_root):
             return ARTIFACT_CONFINEMENT_REASON_STALE_ARTIFACT, [raw_path]
     return None, []
 
@@ -1468,17 +1550,34 @@ def _bounded_cleanup_stale_artifact_leftovers(
     Returns `(ok, reason_code, removed_paths)`. `reason_code` is one of
     `cleanup_failed`/`artifact_escape`/`artifact_oversized` on failure
     (`ok is False`), `None` on success (removing nothing, including a
-    not-yet-existing artifact root, is a trivial success)."""
+    not-yet-existing artifact root, is a trivial success).
+
+    PR #2557 review fix-delta (P2-4): the directory is enumerated via a
+    streaming `os.scandir()` bounded by `_LEFTOVER_SCRATCH_DIRECTORY_SCAN_BUDGET`
+    (a fixed, non-caller-configurable scan-cost ceiling, separate from
+    `ARTIFACT_CONFINEMENT_MAX_COUNT`'s post-filter candidate-count cap
+    below) -- never a full `list(root.iterdir())` materialization first.
+    Exceeding the scan budget before the directory is fully enumerated
+    fails closed exactly like an oversized candidate count."""
     removed: list[str] = []
     for root in _allowed_artifact_roots(dispatch_root, issue_number, command_id):
         if root.is_symlink() or not root.is_dir():
             continue
+        candidates: list[Path] = []
+        scanned = 0
+        scan_budget_exceeded = False
         try:
-            entries = list(root.iterdir())
+            with os.scandir(root) as directory_iterator:
+                for entry in directory_iterator:
+                    scanned += 1
+                    if scanned > _LEFTOVER_SCRATCH_DIRECTORY_SCAN_BUDGET:
+                        scan_budget_exceeded = True
+                        break
+                    if _LEFTOVER_SCRATCH_TEMP_PATTERN.match(entry.name):
+                        candidates.append(Path(entry.path))
         except OSError:
             return False, ARTIFACT_CONFINEMENT_REASON_CLEANUP_FAILED, removed
-        candidates = [entry for entry in entries if _LEFTOVER_SCRATCH_TEMP_PATTERN.match(entry.name)]
-        if len(candidates) > ARTIFACT_CONFINEMENT_MAX_COUNT:
+        if scan_budget_exceeded or len(candidates) > ARTIFACT_CONFINEMENT_MAX_COUNT:
             return False, ARTIFACT_CONFINEMENT_REASON_ARTIFACT_OVERSIZED, removed
         for entry in candidates:
             if entry.is_symlink():
@@ -2043,6 +2142,7 @@ def _dispatch_child_and_check_postconditions(
     env: dict[str, str],
     timeout_seconds: object,
     binary_output: bool,
+    repo: "str | None" = None,
 ) -> int:
     """Dispatch the child at ``dispatch_root`` and run the existing
     before/after post-child checks against that SAME root (Issue #2199
@@ -2160,6 +2260,7 @@ def _dispatch_child_and_check_postconditions(
             dispatch_root,
             str(issue_number),
             _parse_artifact_projection(stdout_for_artifact_projection),
+            repo=repo,
         )
         if confinement_reason is not None:
             return _emit_artifact_confinement_failure(issue_number, confinement_reason, confinement_paths)
@@ -2959,6 +3060,7 @@ def main(argv: list[str] | None = None) -> int:
             env=env,
             timeout_seconds=timeout_seconds,
             binary_output=binary_output,
+            repo=args.repo,
         )
 
     # Issue #2199/#2393: the 4 production preflight profiles plus the 2
@@ -3047,6 +3149,7 @@ def main(argv: list[str] | None = None) -> int:
                 env=dedicated_env,
                 timeout_seconds=timeout_seconds,
                 binary_output=binary_output,
+                repo=args.repo,
             )
     except BaseException as exc:  # noqa: BLE001 -- re-raised below unless the primary-checkout guard below fires
         raised_exc = exc
