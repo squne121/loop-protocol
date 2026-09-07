@@ -243,6 +243,19 @@ def test_narrow_policy_scope_mentions_only_trusted_repo_and_agy_route():
     assert "対象外" in env_label
 
 
+def test_narrow_policy_scope_names_only_the_controlled_issue_edit_transaction_identity():
+    """The autoMode allow SSOT describes the exact canonical transaction."""
+    result = _run_sh_function("claude_gpt_auto_mode_standalone_json")
+    assert result.returncode == 0, result.stderr
+    allow_label = json.loads(result.stdout)["autoMode"]["allow"][1]
+    assert (
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+        "--input-file <repo-relative-safe-operand>"
+    ) in allow_label
+    assert "token/argv identity" in allow_label
+    assert "generic uv/Python/raw gh" in allow_label
+
+
 def test_narrow_policy_scope_documents_second_gate_not_authority():
     """GIVEN narrow label
     WHEN authority に関する記述を確認する
@@ -861,14 +874,12 @@ def test_issue_editor_permission_canary_binds_child_lineage_hook_allow_and_helpe
         "canonical_bash_observed": True,
         "canonical_bash_result_bound": True,
         "permission_allow_observed": True,
-        "permission_no_decision_observed": False,
-        "permission_denied_observed": False,
         "helper_entrypoint_observed": True,
         "marker_observed": True,
     }
 
 
-def test_issue_editor_permission_canary_accepts_observed_no_decision_after_auto_classification():
+def test_issue_editor_permission_canary_does_not_infer_permission_decision_from_absence():
     parent_tool_use_id = "toolu_parent_issue_editor"
     tool_use_id = "toolu_canonical_bash"
     helper_result = {
@@ -941,8 +952,6 @@ def test_issue_editor_permission_canary_accepts_observed_no_decision_after_auto_
     assert evidence["canonical_bash_observed"] is True
     assert evidence["canonical_bash_result_bound"] is True
     assert evidence["permission_allow_observed"] is False
-    assert evidence["permission_no_decision_observed"] is True
-    assert evidence["permission_denied_observed"] is False
     assert evidence["helper_entrypoint_observed"] is True
     assert evidence["marker_observed"] is True
 
@@ -1008,7 +1017,6 @@ def test_issue_editor_permission_canary_rejects_out_of_order_lineage_and_helper_
     )
     assert helper_before_bash["child_lineage_bound"] is True
     assert helper_before_bash["canonical_bash_result_bound"] is False
-    assert helper_before_bash["permission_no_decision_observed"] is False
     assert helper_before_bash["helper_entrypoint_observed"] is False
     assert helper_before_bash["marker_observed"] is False
 
@@ -1017,25 +1025,8 @@ def test_issue_editor_permission_canary_rejects_out_of_order_lineage_and_helper_
     )
     assert parent_after_child["child_lineage_bound"] is False
     assert parent_after_child["canonical_bash_result_bound"] is True
-    assert parent_after_child["permission_no_decision_observed"] is False
     assert parent_after_child["helper_entrypoint_observed"] is True
     assert parent_after_child["marker_observed"] is True
-
-
-def test_issue_editor_permission_canary_treats_unbound_permission_denied_as_failure_evidence():
-    valid_denial = json.dumps(
-        {
-            "type": "system",
-            "subtype": "permission_denied",
-            "tool_name": "Bash",
-        }
-    )
-    malformed_denial = '{"type":"system","subtype":"permission_denied"'
-    escaped_malformed_denial = '{"type":"system","subtype":"permission' + chr(92) + 'u005fdenied"'
-
-    for stdout in (valid_denial, malformed_denial, escaped_malformed_denial):
-        evidence = canary._stream_json_issue_editor_permission_evidence(stdout)
-        assert evidence["permission_denied_observed"] is True
 
 
 def test_issue_editor_permission_canary_rejects_direct_parent_bash_even_with_hook_allow():
@@ -1152,8 +1143,6 @@ def test_issue_editor_permission_canary_rejects_false_denial_and_unrelated_stdou
         "canonical_bash_observed": True,
         "canonical_bash_result_bound": False,
         "permission_allow_observed": False,
-        "permission_no_decision_observed": False,
-        "permission_denied_observed": False,
         "helper_entrypoint_observed": False,
         "marker_observed": False,
     }

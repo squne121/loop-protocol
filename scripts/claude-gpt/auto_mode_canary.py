@@ -40,7 +40,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import secrets
 import shutil
 import subprocess
@@ -227,34 +226,22 @@ def _walk_json_dicts_with_lineage(node: object, parent_tool_use_id: str | None =
             yield from _walk_json_dicts_with_lineage(value, parent_tool_use_id)
 
 
-def _malformed_line_contains_permission_denied(line: str) -> bool:
-    """Recognize an escaped denial marker without retaining malformed input."""
-    normalized = re.sub(
-        r"\\u([0-9a-fA-F]{4})",
-        lambda match: chr(int(match.group(1), 16)),
-        line,
-    ).casefold()
-    return "permission_denied" in normalized
-
-
 def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool]:
-    """Bind the actual child, permission decision, and helper result causally.
+    """Prove only the AC3 causal transaction chain from structured events.
 
-    ``PermissionRequest`` is observable only with ``--include-hook-events``.
-    The hook response provides the narrow allow decision; the documented child
-    ``parent_tool_use_id`` must point to the one observed parent Agent call.
-    A ``failed_no_mutation`` result and terminal marker are then bound to that
-    same child Bash request. Raw runtime output is inspected only in memory.
+    AC3 PASS is limited to the observed parent ``Agent(issue-editor)`` -> its
+    child canonical ``Bash`` -> that tool-use-id's successful
+    ``failed_no_mutation`` result -> terminal marker chain. PermissionRequest
+    is not part of this proof: classifier direct-deny and PermissionRequest are
+    distinct runtime paths. We retain an allow diagnostic only when an actual
+    PermissionRequest allow response is present; its absence makes no claim.
+    Raw runtime output is inspected only in memory.
     """
     events: list[dict] = []
-    malformed_permission_denied_observed = False
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
         except ValueError:
-            # A malformed structured denial cannot be safely distinguished from
-            # an omitted tool result, so retain no raw line and fail closed.
-            malformed_permission_denied_observed |= _malformed_line_contains_permission_denied(line)
             continue
         if isinstance(event, dict):
             events.append(event)
@@ -318,66 +305,35 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
     canonical_bash_result_bound = (
         helper_result_bound and canonical_index is not None and canonical_index < min(bound_result_indices)
     )
-
-    permission_hook_events_observed = any(
-        event.get("type") == "system" and isinstance(event.get("hook_event"), str) for event in events
-    )
-    permission_request_started_indices = {
-        index
-        for index, event in enumerate(events)
-        if event.get("type") == "system"
-        and event.get("subtype") == "hook_started"
-        and event.get("hook_event") == "PermissionRequest"
-    }
-    permission_request_response_indices = {
-        index
-        for index, event in enumerate(events)
-        if event.get("type") == "system"
-        and event.get("subtype") == "hook_response"
-        and event.get("hook_event") == "PermissionRequest"
-    }
-    permission_decision_behaviors = {
-        output.get("hookSpecificOutput", {}).get("decision", {}).get("behavior")
-        for index in permission_request_response_indices
-        for output in _embedded_json_dicts(events[index].get("output"))
-        if isinstance(output.get("hookSpecificOutput"), dict)
-        and isinstance(output.get("hookSpecificOutput", {}).get("decision"), dict)
-        and output.get("hookSpecificOutput", {}).get("hookEventName") == "PermissionRequest"
-    }
-    permission_allow_observed = (
-        len(permission_request_response_indices) == 1
-        and permission_decision_behaviors == {"allow"}
-        and canonical_index is not None
-        and min(permission_request_response_indices) > canonical_index
-        and canonical_bash_result_bound
-        and min(permission_request_response_indices) < min(bound_result_indices)
-    )
-    # When the Auto classifier authorizes the one canonical Bash without
-    # requesting permission, Claude Code emits no PermissionRequest event at
-    # all. With --include-hook-events active, that absence is a verifiable
-    # no-decision outcome, not an unobserved fallback.
-    permission_no_decision_observed = (
-        permission_hook_events_observed
-        and not permission_request_started_indices
-        and not permission_request_response_indices
-        and canonical_bash_result_bound
-    )
-    permission_denied_observed = malformed_permission_denied_observed or any(
-        event.get("type") == "system" and event.get("subtype") == "permission_denied" for event in events
-    ) or "deny" in permission_decision_behaviors
     bound_marker = canonical_bash_result_bound and any(
         index > max(bound_result_indices)
         and _stream_json_has_terminal_marker(event, ISSUE_EDITOR_PERMISSION_CANARY_MARKER)
         for index, event in enumerate(events)
     )
+
+    permission_allow_observed = False
+    if canonical_bash_result_bound and canonical_index is not None:
+        permission_allow_observed = any(
+            canonical_index < index < min(bound_result_indices)
+            and event.get("type") == "system"
+            and event.get("subtype") == "hook_response"
+            and event.get("hook_event") == "PermissionRequest"
+            and any(
+                output.get("hookSpecificOutput", {}).get("hookEventName") == "PermissionRequest"
+                and output.get("hookSpecificOutput", {}).get("decision", {}).get("behavior") == "allow"
+                for output in _embedded_json_dicts(event.get("output"))
+                if isinstance(output.get("hookSpecificOutput"), dict)
+                and isinstance(output.get("hookSpecificOutput", {}).get("decision"), dict)
+            )
+            for index, event in enumerate(events)
+        )
+
     return {
         "parent_issue_editor_delegation_observed": parent_issue_editor_delegation_observed,
         "child_lineage_bound": child_lineage_bound,
         "canonical_bash_observed": canonical_bash_observed,
         "canonical_bash_result_bound": canonical_bash_result_bound,
         "permission_allow_observed": permission_allow_observed,
-        "permission_no_decision_observed": permission_no_decision_observed,
-        "permission_denied_observed": permission_denied_observed,
         "helper_entrypoint_observed": canonical_bash_result_bound,
         "marker_observed": bound_marker,
     }
@@ -906,8 +862,6 @@ def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[i
             detail["child_lineage_bound"],
             detail["canonical_bash_observed"],
             detail["canonical_bash_result_bound"],
-            detail["permission_allow_observed"] or detail["permission_no_decision_observed"],
-            not detail["permission_denied_observed"],
             detail["helper_entrypoint_observed"],
             detail["marker_observed"],
         )
