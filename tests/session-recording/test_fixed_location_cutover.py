@@ -916,11 +916,21 @@ def test_js_mkdir_eloop_on_confirmed_trailing_symlink_still_reports_symlink(tmp_
 
 def test_js_mkdir_failure_is_diagnosed_instead_of_raw_uncaught_exception(tmp_path: Path) -> None:
     """AC7 / Outcome: prior to Issue #2028, mkdirSync() failures were never
-    caught at all, so `--test-invoke-prepare-private-parent-dir` would exit
-    non-zero with an uncaught-exception stack trace instead of the normal
-    `REJECTED:<reason>` contract every other rejection case in this file
-    uses. Any not-yet-existing target under a broken symlink prefix must now
-    follow that same REJECTED contract.
+    caught at the `preparePrivateParentDir()`/`classifyAndThrowParentDirFailure()`
+    level at all -- the `--test-invoke-prepare-private-parent-dir` CLI seam's
+    own outer try/catch already turned any such raw, undiagnosed exception
+    into exit 0 with `REJECTED:<raw fs error message>` (the seam was never
+    the part that was broken; it always exits 0 either way). What Issue
+    #2028 actually fixes is that a broken symlink PREFIX failing at
+    mkdirSync() now gets the SAME diagnosed `<reason> (errno=..., syscall=...,
+    path="...")` shape every other rejection in this file already has,
+    instead of a raw, undiagnosed fs error message with no stable reason
+    token and (pre-fix_delta) no retained failing path.
+
+    Issue #2028 fix_delta (PR #2549 review): the diagnostic message must
+    retain the actual failing filesystem path -- not just the reason/errno/
+    syscall -- so this is strengthened into a path-retention regression
+    test using the same prefix-symlink-loop fixture as AC1 above.
     """
     base = tmp_path / "mkdir-diagnosed-base"
     base.mkdir()
@@ -933,7 +943,11 @@ def test_js_mkdir_failure_is_diagnosed_instead_of_raw_uncaught_exception(tmp_pat
     result = _run_node_prepare_private_parent_dir_seam(target)
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip().startswith("REJECTED:"), (result.stdout, result.stderr)
+    stdout = result.stdout.strip()
+    assert stdout.startswith("REJECTED:parent_unavailable"), (stdout, result.stderr)
+    assert "errno=ELOOP" in stdout, stdout
+    assert "syscall=mkdirSync" in stdout, stdout
+    assert str(target) in stdout, stdout
 
 
 def test_js_accept_semantics_unchanged_after_mkdir_diagnosis_added(tmp_path: Path) -> None:

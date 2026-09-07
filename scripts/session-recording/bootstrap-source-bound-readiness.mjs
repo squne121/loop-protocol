@@ -91,13 +91,38 @@ class ArtifactOverridePathError extends Error {
 // `preparePrivateParentDir()` itself: that seam calls
 // `preparePrivateParentDir()` synchronously at module top-level evaluation
 // time, before any later `class` declaration in the file would have run.
+//
+// Issue #2028 fix_delta (PR #2549 review): the diagnostic message previously
+// dropped the failing filesystem path entirely, so a CLI user could no
+// longer see WHICH path triggered e.g. `parent_unavailable (errno=ELOOP,
+// syscall=mkdirSync)` -- only the raw pre-fix uncaught exception's message
+// used to show it. This now retains it as an additional `path="..."`
+// segment, preferring the underlying fs error's own `.path` (surfaced via
+// `cause.path`, since `cause` IS that original fs error) and falling back to
+// the `path` option (the classifier's `dir` argument) when the fs error
+// itself did not carry one. `reasonCode` stays the first token of
+// `.message` and `errno`/`op` are unchanged -- only the path is added.
 class PrivateParentDirError extends Error {
-  constructor(reasonCode, { errno = null, op = null, cause } = {}) {
-    const detail = errno || op ? ` (errno=${errno ?? 'unknown'}, syscall=${op ?? 'unknown'})` : ''
+  constructor(reasonCode, { errno = null, op = null, cause, path = null } = {}) {
+    let resolvedPath = null
+    if (cause && typeof cause.path === 'string') {
+      resolvedPath = cause.path
+    } else if (typeof path === 'string') {
+      resolvedPath = path
+    }
+    const parts = []
+    if (errno || op) {
+      parts.push(`errno=${errno ?? 'unknown'}`, `syscall=${op ?? 'unknown'}`)
+    }
+    if (resolvedPath !== null) {
+      parts.push(`path=${JSON.stringify(resolvedPath)}`)
+    }
+    const detail = parts.length ? ` (${parts.join(', ')})` : ''
     super(`${reasonCode}${detail}`, cause === undefined ? undefined : { cause })
     this.reasonCode = reasonCode
     this.errnoCode = errno
     this.op = op
+    this.path = resolvedPath
   }
 }
 
@@ -382,7 +407,7 @@ function classifyAndThrowParentDirFailure(dir, err, op) {
   const code = (err && err.code) || null
   if (code === 'ELOOP') {
     if (diagnoseParentIsSymlink(dir)) {
-      throw new PrivateParentDirError('parent_is_symlink', { errno: code, op, cause: err })
+      throw new PrivateParentDirError('parent_is_symlink', { errno: code, op, cause: err, path: dir })
     }
     // Confirmed NOT a trailing symlink, or the auxiliary lstatSync() itself
     // could not tell (e.g. it failed trying to resolve the very same broken
@@ -390,15 +415,15 @@ function classifyAndThrowParentDirFailure(dir, err, op) {
     // reported as a symlink loop. The original errno/op are still attached
     // above; only the diagnostic reason is downgraded to the generic,
     // already-existing `parent_unavailable`.
-    throw new PrivateParentDirError('parent_unavailable', { errno: code, op, cause: err })
+    throw new PrivateParentDirError('parent_unavailable', { errno: code, op, cause: err, path: dir })
   }
   if (code === 'ENOTDIR') {
     if (diagnoseParentIsSymlink(dir)) {
-      throw new PrivateParentDirError('parent_is_symlink', { errno: code, op, cause: err })
+      throw new PrivateParentDirError('parent_is_symlink', { errno: code, op, cause: err, path: dir })
     }
-    throw new PrivateParentDirError('parent_not_a_directory', { errno: code, op, cause: err })
+    throw new PrivateParentDirError('parent_not_a_directory', { errno: code, op, cause: err, path: dir })
   }
-  throw new PrivateParentDirError('parent_unavailable', { errno: code, op, cause: err })
+  throw new PrivateParentDirError('parent_unavailable', { errno: code, op, cause: err, path: dir })
 }
 
 function preparePrivateParentDir(dir) {
