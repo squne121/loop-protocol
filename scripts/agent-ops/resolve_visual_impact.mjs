@@ -109,12 +109,76 @@ function isVirtualSpecifier(specifier) {
   return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(specifier) && !specifier.startsWith('node:')
 }
 
+// --- Issue #2551: CSS bounded lexical scanner helpers -----------------------
+//
+// CSS `@import`/`url()` references follow different rules than JS/TS module
+// specifiers (`isRelativeSpecifier()` above, which is untouched and still
+// governs JS/TS module resolution only): a bare specifier with no leading
+// `./`/`../` (e.g. `icon.svg`) is STILL a repo-local relative reference in
+// CSS -- there is no bare-package-import convention for CSS -- and a single
+// leading `/` is a Vite `public/` root-absolute reference, never an OS-root
+// absolute filesystem path.
+
+/** Classify a CSS `@import`/`url()` reference (already stripped of any
+ * trailing fragment/query suffix). Returns one of: 'fragment' (`#...`),
+ * 'network-path' (`//host/...`), 'scheme' (`data:`/`http:`/`https:`/etc.),
+ * 'root-absolute' (a single leading `/`), or 'relative' (everything else,
+ * `./`/`../`-prefixed or bare). */
+function classifyCssReference(spec) {
+  if (spec.startsWith('#')) return 'fragment'
+  if (spec.startsWith('//')) return 'network-path'
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(spec)) return 'scheme'
+  if (spec.startsWith('/')) return 'root-absolute'
+  return 'relative'
+}
+
+/** Strip a trailing fragment/query suffix from a CSS reference (e.g.
+ * `icon.svg#view` or `icon.svg?raw`) before filesystem resolution. */
+function stripCssReferenceSuffix(spec) {
+  return spec.split('#')[0].split('?')[0]
+}
+
+// `@import "x.css"` / `@import 'x.css'` / `@import url("x.css")` /
+// `@import url('x.css')` / `@import url(x.css)` -- quoted/unquoted, with or
+// without a leading `./`. Two alternatives: the `url(...)` form (capture
+// groups 1/2) and the bare quoted-string form (capture groups 3/4).
+const CSS_IMPORT_RE_SOURCE = "@import\\s+(?:url\\(\\s*(['\"]?)([^'\")]+)\\1\\s*\\)|(['\"])([^'\"]+)\\3)"
+
+// An ordinary `url(...)` reference (quoted or unquoted). Applied to CSS text
+// AFTER `@import` statements have already been stripped out, so an
+// `@import url(...)` is never double-processed as a plain `url()` asset
+// reference below.
+const CSS_URL_RE_SOURCE = "url\\(\\s*(['\"]?)([^'\")]+)\\1\\s*\\)"
+
+/** CSS comments are replaced with equal-length whitespace (never simply
+ * deleted), so token adjacency across a removed comment can never
+ * accidentally fuse two otherwise-unrelated tokens. A dead reference inside
+ * a comment must never be treated as a real dependency (Issue #2551 AC4).
+ * This is a bounded lexical pass, not a full CSS tokenizer -- it does not
+ * attempt to distinguish a comment-opening sequence that happens to appear
+ * inside a quoted string literal (not a real-world concern for this
+ * repository's own stylesheets). */
+function stripCssComments(text) {
+  return text.replace(/\/\*[\s\S]*?\*\//g, (match) => ' '.repeat(match.length))
+}
+
 class Resolver {
-  constructor(repoRoot) {
+  constructor(repoRoot, cssOptions = {}) {
     this.repoRoot = repoRoot
     this.visited = new Set()
     this.reachable = new Set()
     this.unknownImpact = []
+    // Issue #2551 AC7: Vite `public/` root-absolute CSS `url()` resolution
+    // is only attempted when the repo's own vite.config.* has been
+    // confirmed (by detectViteRootOrPublicDirProblems() in main()) to leave
+    // `root`/`publicDir` at their Vite defaults. When that cannot be
+    // confirmed, root-absolute references are left unresolved here -- the
+    // caller already routes the underlying diagnostic into the SAME
+    // all-registered-surfaces-affected fallback as any other unsupported
+    // resolution setting, so this must never silently mis-resolve against
+    // the OS filesystem root instead.
+    this.viteRootPublicDirIsDefault = cssOptions.viteRootPublicDirIsDefault !== false
+    this.publicDirAbs = cssOptions.publicDirAbs || path.join(repoRoot, 'public')
   }
 
   relPath(absPath) {
@@ -194,24 +258,76 @@ class Resolver {
       return
     }
     const dir = path.dirname(fileAbs)
-    const importRe = /@import\s+(?:url\()?['"]([^'"]+)['"]\)?/g
+    // Issue #2551: bounded lexical scanner. CSS comments are stripped first
+    // (never scanned as dependencies -- AC4); `@import` targets are
+    // extracted and, when local, recursively walked (AC2/AC3) BEFORE the
+    // remaining text is scanned for ordinary `url(...)` references, so an
+    // `@import url(...)` form is never also double-processed as a plain
+    // asset url() below.
+    const withoutComments = stripCssComments(text)
+    const importRe = new RegExp(CSS_IMPORT_RE_SOURCE, 'g')
     let m
-    while ((m = importRe.exec(text))) {
-      const spec = m[1]
-      if (!isRelativeSpecifier(spec)) continue
-      const abs = path.resolve(dir, spec)
-      if (existsSync(abs)) this.visitCss(abs)
+    while ((m = importRe.exec(withoutComments))) {
+      const rawSpec = m[2] !== undefined ? m[2] : m[4]
+      this.handleCssImportReference(rawSpec, dir, fileAbs)
     }
-    const urlRe = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g
-    while ((m = urlRe.exec(text))) {
-      const spec = m[2]
-      if (spec.startsWith('data:') || /^https?:\/\//.test(spec) || spec.startsWith('#')) continue
-      if (!isRelativeSpecifier(spec)) continue
-      const abs = path.resolve(dir, spec.split('#')[0].split('?')[0])
-      if (existsSync(abs)) {
-        this.visited.add(abs)
-        this.reachable.add(this.relPath(abs))
-      }
+    const withoutImports = withoutComments.replace(new RegExp(CSS_IMPORT_RE_SOURCE, 'g'), (match) => ' '.repeat(match.length))
+    const urlRe = new RegExp(CSS_URL_RE_SOURCE, 'g')
+    while ((m = urlRe.exec(withoutImports))) {
+      this.handleCssUrlReference(m[2], dir, fileAbs)
+    }
+  }
+
+  /** `@import` is recursively walked ONLY for a repo-local relative target
+   * (Issue #2551 AC2/AC3: `./`/`../`/bare-no-prefix, quoted or unquoted
+   * url()). A missing local `@import` target is recorded as unknown_impact
+   * (fail-closed, matching this module's existing read-failure philosophy)
+   * rather than silently dropped. */
+  handleCssImportReference(rawSpec, dir, containingFileAbs) {
+    // Classification MUST run on the raw (unstripped) specifier -- e.g.
+    // `#frag` is a fragment-only reference in its entirety, whereas
+    // `./foo.css#frag` is a relative reference carrying a fragment suffix.
+    // Stripping the suffix first would misclassify the former as an empty
+    // (and therefore trivially "relative") specifier.
+    if (classifyCssReference(rawSpec) !== 'relative') return
+    const spec = stripCssReferenceSuffix(rawSpec)
+    const abs = path.resolve(dir, spec)
+    if (existsSync(abs)) {
+      this.visitCss(abs)
+    } else {
+      this.addUnknown(containingFileAbs, 'css_missing_local_reference', rawSpec)
+    }
+  }
+
+  /** An ordinary `url(...)` reference is NEVER recursively walked as CSS
+   * (Issue #2551 AC3) -- a resolved local target is added to `reachable` as
+   * an asset dependency only. Fragment-only (`#...`), URI-scheme
+   * (`data:`/`http:`/`https:`/etc.), and network-path (`//host/...`)
+   * references are never local and must never be misclassified as a missing
+   * local reference (AC5). A Vite `public/` root-absolute reference
+   * (`/logo.svg`) resolves against `<root>/public/...` (AC7) only when the
+   * repo's Vite `root`/`publicDir` configuration has been confirmed to be
+   * left at its defaults. */
+  handleCssUrlReference(rawSpec, dir, containingFileAbs) {
+    // Classification MUST run on the raw (unstripped) specifier -- see the
+    // matching comment in handleCssImportReference() above.
+    const kind = classifyCssReference(rawSpec)
+    if (kind === 'fragment' || kind === 'scheme' || kind === 'network-path') return
+    const spec = stripCssReferenceSuffix(rawSpec)
+
+    let abs
+    if (kind === 'root-absolute') {
+      if (!this.viteRootPublicDirIsDefault) return
+      abs = path.resolve(this.publicDirAbs, spec.slice(1))
+    } else {
+      abs = path.resolve(dir, spec)
+    }
+
+    if (existsSync(abs)) {
+      this.visited.add(abs)
+      this.reachable.add(this.relPath(abs))
+    } else {
+      this.addUnknown(containingFileAbs, 'css_missing_local_reference', rawSpec)
     }
   }
 
@@ -613,6 +729,111 @@ function detectViteConfigProblems(viteSourceText, candidateRelPath) {
   return collectConfigObjectResolveProblems(configObject, candidateRelPath)
 }
 
+/** Issue #2551 AC7: `url("/logo.svg")` (Vite `public/` root-absolute
+ * reference) must resolve to `<root>/public/logo.svg` under the CURRENT
+ * repo's Vite default semantics (`root` = project root, `publicDir` =
+ * "public") -- never silently mis-resolved against the OS filesystem root,
+ * and never assumed safe when `root`/`publicDir` cannot be statically
+ * confirmed to still be at their defaults. This locates the same exported
+ * config object literal shape `detectViteConfigProblems()` above locates,
+ * but is kept as a fully separate function (rather than a refactor of that
+ * `resolve`-focused walk) so that walk's existing diagnostic message text
+ * (asserted on verbatim by existing tests) never changes. Never executes
+ * the config module. */
+function locateViteConfigObjectLiteralForRootPublicDir(viteSourceText, candidateRelPath) {
+  const sourceFile = ts.createSourceFile(candidateRelPath, viteSourceText, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TS)
+  let exportExpr = null
+  for (const stmt of sourceFile.statements) {
+    if (ts.isExportAssignment(stmt) && !stmt.isExportEquals) {
+      exportExpr = stmt.expression
+      break
+    }
+  }
+  if (!exportExpr) return null
+  const expr = unwrapExpression(exportExpr)
+  if (ts.isObjectLiteralExpression(expr)) return expr
+  if (ts.isCallExpression(expr)) {
+    const firstArg = expr.arguments[0]
+    const unwrappedArg = firstArg ? unwrapExpression(firstArg) : null
+    if (unwrappedArg && ts.isObjectLiteralExpression(unwrappedArg)) return unwrappedArg
+  }
+  return null
+}
+
+const VITE_ROOT_PUBLIC_DIR_DEFAULTS = { root: new Set(['.', './']), publicDir: new Set(['public']) }
+
+/** Structural analysis of the exported Vite config object literal's
+ * top-level properties, looking for `root` / `publicDir` fields whose value
+ * is anything other than the Vite default literal. A top-level spread,
+ * computed property name, or shorthand property referencing `root`/
+ * `publicDir` is undecidable and is reported the same way (fail-closed --
+ * never assumed to be the default). */
+function collectRootOrPublicDirProblems(objectLiteral, candidateRelPath) {
+  const problems = []
+  for (const prop of objectLiteral.properties) {
+    if (ts.isSpreadAssignment(prop)) {
+      problems.push(
+        `${candidateRelPath} config object spreads an externally-defined value (${prop.expression.getText()}) that cannot be statically confirmed to leave "root"/"publicDir" at their Vite defaults`,
+      )
+      continue
+    }
+    if (ts.isShorthandPropertyAssignment(prop)) {
+      if (prop.name.text === 'root' || prop.name.text === 'publicDir') {
+        problems.push(
+          `${candidateRelPath} "${prop.name.text}" field is a shorthand property referencing an externally-defined value that cannot be statically confirmed to be the Vite default`,
+        )
+      }
+      continue
+    }
+    if (ts.isPropertyAssignment(prop)) {
+      const name = tsPropertyNameText(prop.name)
+      if (name === null) {
+        problems.push(
+          `${candidateRelPath} config object has a computed/dynamic property name that cannot be statically confirmed not to be "root"/"publicDir"`,
+        )
+        continue
+      }
+      if (name !== 'root' && name !== 'publicDir') continue
+      const valueNode = unwrapExpression(prop.initializer)
+      if (ts.isStringLiteral(valueNode) && VITE_ROOT_PUBLIC_DIR_DEFAULTS[name].has(valueNode.text)) continue
+      problems.push(
+        `${candidateRelPath} "${name}" is configured to a non-default value (or a value that cannot be statically confirmed to be the Vite default) -- Vite "public/" root-absolute CSS url() resolution requires root=project root, publicDir="public"`,
+      )
+    }
+  }
+  return problems
+}
+
+/** Returns diagnostic strings (empty when `root`/`publicDir` are confirmed
+ * left at their Vite defaults across every discovered vite.config.*
+ * candidate). The caller (main()) both merges these into the shared
+ * `unsupported_resolution_settings` diagnostic list AND uses
+ * `.length === 0` to decide whether per-surface CSS root-absolute `url()`
+ * resolution (Issue #2551 AC7) may be attempted at all. */
+function detectViteRootOrPublicDirProblems(repoRoot) {
+  const problems = []
+  for (const candidate of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts']) {
+    const viteConfigPath = path.join(repoRoot, candidate)
+    if (!existsSync(viteConfigPath)) continue
+    let viteTextRaw
+    try {
+      viteTextRaw = readFileSync(viteConfigPath, 'utf8')
+    } catch (err) {
+      problems.push(`${candidate} read failure: ${String(err)}`)
+      continue
+    }
+    const configObject = locateViteConfigObjectLiteralForRootPublicDir(viteTextRaw, candidate)
+    if (!configObject) {
+      problems.push(
+        `${candidate} "export default" is not a statically-analyzable object literal or defineConfig(...)-style call -- cannot confirm Vite "root"/"publicDir" are left at their defaults`,
+      )
+      continue
+    }
+    problems.push(...collectRootOrPublicDirProblems(configObject, candidate))
+  }
+  return problems
+}
+
 /** PR #2045 OWNER fix_delta P1-1 / Issue #2525: detect tsconfig
  * `paths`/`baseUrl` (including inherited via `extends`), Vite
  * `resolve.alias` (direct or indirected through an imported/spread
@@ -697,6 +918,19 @@ async function main() {
   // surfaces-affected fallback as `global_invalidators`.
   const unsupportedResolutionSettings = detectUnsupportedResolutionSettings(repoRoot)
 
+  // Issue #2551 AC7: tracked separately so a per-surface Resolver can decide
+  // whether Vite `public/` root-absolute CSS url() resolution may be
+  // attempted at all -- but any problem found here is ALSO merged into the
+  // same diagnostic list above, connecting to the SAME all-registered-
+  // surfaces-affected fallback (never a resolver-fatal errors[] entry, never
+  // silent mis-resolution against the OS filesystem root).
+  const rootPublicDirProblems = detectViteRootOrPublicDirProblems(repoRoot)
+  unsupportedResolutionSettings.push(...rootPublicDirProblems)
+  const cssOptions = {
+    viteRootPublicDirIsDefault: rootPublicDirProblems.length === 0,
+    publicDirAbs: path.join(repoRoot, 'public'),
+  }
+
   for (const [surfaceId, def] of Object.entries(surfaces)) {
     const entries = [
       ...(def.modules || []),
@@ -704,7 +938,7 @@ async function main() {
       ...(def.assets || []),
       ...(def.config || []),
     ]
-    const resolver = new Resolver(repoRoot)
+    const resolver = new Resolver(repoRoot, cssOptions)
     try {
       output[surfaceId] = resolver.run(entries)
     } catch (err) {
