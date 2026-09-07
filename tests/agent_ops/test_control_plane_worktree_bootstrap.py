@@ -1516,6 +1516,27 @@ def test_given_dedicated_preflight_needs_fix_artifact_when_real_repair_consumer_
     assert len(apply_calls) == 1
 
 
+def test_given_same_dedicated_preflight_artifact_when_executor_confinement_checked_then_also_accepted(tmp_path):
+    """Issue #2200 AC2 strengthening: the EXACT SAME dedicated-worktree
+    artifact the test above proves the real consumer
+    (`run_repair_action_apply()`) reads without a manual move ALSO passes
+    the NEW producer-side confinement bounds gate
+    (`skill_runtime_exec._validate_artifact_confinement_bounds()`), closing
+    the loop between the two independently-developed validators. This
+    artifact's `issue_refinement_preflight_result/v1` schema carries no
+    top-level `issue_number` field -- a real, already-shipped legitimate
+    omission (AC4), never a mismatch."""
+    local, _origin, _url, oid = _init_remote_fixture(tmp_path)
+    dedicated_path = _add_dedicated_detached_worktree(local, oid)
+    result_path = _write_dedicated_repair_candidate(dedicated_path, 2199)
+
+    reason, offending = exec_mod._validate_artifact_confinement_bounds(
+        str(dedicated_path), "2199", [str(result_path)]
+    )
+    assert reason is None
+    assert offending == []
+
+
 def test_given_dedicated_relative_artifact_path_when_repair_action_apply_command_parsed_then_accepted(tmp_path):
     """Issue #2199 OWNER feedback P1-2, parser-level proof: the FULL
     `repair_action.apply` exact-command-string parser (not just the
