@@ -263,6 +263,29 @@ on:
           be non-empty for --production-invocation to be passed.
         type: string
         default: ""
+      # Issue #2555 AC1/AC2: manual opt-in route for the `close-evidence-
+      # publication` job below. single Reliability close-grade artifact ID
+      # (produced by the `reliability-assessment` job's own upload step
+      # above) -- the ONLY operator-facing source input; there is no
+      # runner-local path input for the experiment manifest / Performance
+      # close-grade result / Reliability close-grade result (those are read
+      # from inside this ONE artifact, see the job's download step).
+      close_evidence_source_artifact_id:
+        description: >-
+          single Reliability close-grade artifact ID (GitHub Actions
+          artifact ID of a previously-uploaded ci-reliability-close-grade-
+          result-* artifact from the reliability-assessment job) to build,
+          validate, and publish a close-evidence bundle from. Leave empty
+          for a normal (non-close-evidence-publication) dispatch.
+        type: string
+        # not required: true -- shared workflow_dispatch namespace (this
+        # `workflow_dispatch.inputs` block is shared by every job in this
+        # workflow file; a schema-level `required: true` here would force a
+        # value on every unrelated `workflow_dispatch` invocation too). The
+        # sole runtime guard for an empty value is the close-evidence-
+        # publication job's own job-level `if:` gate (AC1/AC2) -- no
+        # duplicate step-level check is added.
+        default: ""
 
 permissions:
   contents: read
@@ -2525,6 +2548,95 @@ jobs:
           path: |
             reliability-assessment-output/
             reliability-assessment-input/
+          if-no-files-found: error
+          retention-days: 30
+
+  # Issue #2555: manual opt-in workflow_dispatch route wiring the
+  # close-evidence bundle producer (#2486 build_close_evidence_bundle_v1.py)
+  # -> standalone validator (#2486 validate_close_evidence_bundle_v1.py) ->
+  # GitHub Actions artifact upload -> publication receipt, from a REAL
+  # production Reliability close-grade artifact (the `reliability-assessment`
+  # job above's own upload). Producer/validator core logic (digest
+  # computation, cross-binding verification) is NEVER modified here --
+  # #2486/PR#2528 ownership is kept (see In Scope / Out of Scope).
+  close-evidence-publication:
+    # AC1: never runs on push/pull_request or an unrelated workflow_dispatch
+    # (e.g. python_test_bench / benchmark_layout dispatches). The sole
+    # runtime guard for an empty close_evidence_source_artifact_id is this
+    # job-level `if:` gate (see the input's own `default: ""` comment
+    # above); no duplicate step-level check is added -- once this gate is
+    # false, the job's steps never start, so a step-level check would be
+    # unreachable and meaningless.
+    if: ${{ github.event.inputs.close_evidence_source_artifact_id != '' }}
+    runs-on: ubuntu-latest
+    # AC1: close-evidence-publication: cross-run Reliability artifact readback -- minimal read-only permission addition (mirrors the existing trusted_ci_verdict_summary_artifact_id / reliability-assessment jobs' own `actions: read` for the same GitHub Actions Artifacts REST API purpose). No write permission, OIDC, attestation, signing, or external credential is added.
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-uv
+      - name: Download close_evidence_source_artifact_id Reliability artifact (AC3)
+        id: download-source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ github.event.inputs.close_evidence_source_artifact_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p close-evidence-source
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" \
+            > close-evidence-source/artifact_metadata.json
+          ARTIFACT_EXPIRED="$(python3 -c 'import json; print(json.load(open("close-evidence-source/artifact_metadata.json")).get("expired", False))')"
+          if [ "$ARTIFACT_EXPIRED" = "True" ]; then
+            echo "::error::close_evidence_source_artifact_id=${ARTIFACT_ID} is expired; cannot build close-evidence bundle."
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > close-evidence-source/artifact.zip
+          unzip -o -q close-evidence-source/artifact.zip -d close-evidence-source/extracted
+          test -f close-evidence-source/extracted/reliability-assessment-input/manifest.json
+          test -f close-evidence-source/extracted/reliability-assessment-input/receipt.json
+          test -f close-evidence-source/extracted/reliability-assessment-output/ci_reliability_close_grade_result_v1.json
+      - name: Build close-evidence bundle (build_close_evidence_bundle_v1.py, AC3)
+        run: |
+          set -euo pipefail
+          uv run --locked python3 scripts/ci/build_close_evidence_bundle_v1.py build \
+            --performance-receipt close-evidence-source/extracted/reliability-assessment-input/receipt.json \
+            --reliability-receipt close-evidence-source/extracted/reliability-assessment-output/ci_reliability_close_grade_result_v1.json \
+            --experiment-manifest close-evidence-source/extracted/reliability-assessment-input/manifest.json \
+            --output-dir close-evidence
+      - name: Validate close-evidence bundle (validate_close_evidence_bundle_v1.py, AC4)
+        run: |
+          set -euo pipefail
+          uv run --locked python3 scripts/ci/validate_close_evidence_bundle_v1.py \
+            --bundle-dir close-evidence
+      - name: Upload close-evidence bundle (artifact A, close-evidence-bundle-v1, AC5)
+        id: upload-bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: close-evidence-bundle-v1
+          path: close-evidence/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Generate publication receipt via build_publication_receipt() (verbatim artifact identity, AC6)
+        run: |
+          set -euo pipefail
+          uv run --locked python3 scripts/ci/build_close_evidence_bundle_v1.py publication-receipt \
+            --close-evidence-json close-evidence/close_evidence.json \
+            --github-artifact-id "${{ steps.upload-bundle.outputs.artifact-id }}" \
+            --github-artifact-digest "${{ steps.upload-bundle.outputs.artifact-digest }}" \
+            --artifact-url "${{ steps.upload-bundle.outputs.artifact-url }}" \
+            --output close-evidence-publication-receipt-v1.json
+      - name: Upload publication receipt (artifact B, close-evidence-publication-receipt-v1, AC7)
+        uses: actions/upload-artifact@v7
+        with:
+          name: close-evidence-publication-receipt-v1
+          path: close-evidence-publication-receipt-v1.json
           if-no-files-found: error
           retention-days: 30
 

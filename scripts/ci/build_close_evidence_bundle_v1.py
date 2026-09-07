@@ -53,8 +53,12 @@ conflated):
 GitHub Actions artifact ID/digest/URL are deliberately NEVER written into
 `close_evidence.json` (see Artifact semantics below) -- they belong to the
 separate, smaller `CI_CLOSE_EVIDENCE_PUBLICATION_RECEIPT_V1` schema
-(`build_publication_receipt()`), whose actual population/posting is #2155's
-scope, not this Issue's.
+(`build_publication_receipt()`). Issue #2555 adds the `publication-receipt`
+CLI subcommand (`_run_publication_receipt()`) that actually wires
+`.github/workflows/ci.yml`'s `close-evidence-publication` job's
+`actions/upload-artifact@v7` outputs into this existing function -- this
+module's own producer logic (digest computation, cross-binding
+verification) is unchanged by that addition.
 """
 
 from __future__ import annotations
@@ -526,9 +530,10 @@ def build_publication_receipt(
     upload-time-only GitHub Actions artifact identity. `close_evidence.json`
     itself is generated BEFORE upload and must never carry these 3 fields
     (a circular dependency -- the bundle cannot know its own future
-    artifact ID/digest/URL). Actually populating and posting this receipt
-    is #2155's scope, not this Issue's; this function only defines the
-    schema shape."""
+    artifact ID/digest/URL). This function's own schema shape/logic is
+    unchanged by Issue #2555 -- see `_run_publication_receipt()` (the
+    `publication-receipt` CLI subcommand) for the actual wiring that calls
+    it with real `.github/workflows/ci.yml` upload-artifact outputs."""
     return {
         "schema": "CI_CLOSE_EVIDENCE_PUBLICATION_RECEIPT_V1",
         "schema_version": 1,
@@ -540,21 +545,7 @@ def build_publication_receipt(
     }
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Issue #2486: build a standalone-verifiable close-evidence bundle "
-            "from #2423's performance close-grade receipt and #2424's "
-            "reliability close-grade receipt, only when both are close-grade "
-            "eligible."
-        )
-    )
-    parser.add_argument("--performance-receipt", required=True, help="#2423 CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 file")
-    parser.add_argument("--reliability-receipt", required=True, help="#2424 CI_RELIABILITY_CLOSE_GRADE_RESULT_V1 file")
-    parser.add_argument("--experiment-manifest", required=True, help="#2422 e2e_performance_benchmark_manifest_v2 file")
-    parser.add_argument("--output-dir", required=True, help="Destination close-evidence/ bundle directory")
-    args = parser.parse_args(argv)
-
+def _run_build(args: argparse.Namespace) -> int:
     try:
         close_evidence = build_close_evidence_bundle(
             performance_receipt_path=args.performance_receipt,
@@ -572,6 +563,123 @@ def main(argv: list[str] | None = None) -> int:
         f"path={close_evidence_path} bundle_payload_digest={close_evidence['bundle_payload_digest']}"
     )
     return 0
+
+
+def _run_publication_receipt(args: argparse.Namespace) -> int:
+    """Issue #2555 AC6: minor caller wiring only -- passes the
+    `actions/upload-artifact@v7` action outputs (`artifact-id`/`artifact-url`
+    /`artifact-digest`) VERBATIM (no `sha256:` prefix add/strip, no other
+    transform) into `build_publication_receipt()`'s existing
+    `github_artifact_id`/`artifact_url`/`github_artifact_digest` parameters.
+    Never re-implements/changes `build_publication_receipt()`'s own schema
+    shape (Issue #2486 ownership retained)."""
+    owner = _load_reliability_owner_module()
+    try:
+        with open(args.close_evidence_json, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        print(
+            f"::error::close_evidence_publication_receipt_fail_closed: close_evidence_json_not_readable: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        close_evidence = owner.strict_json_loads(raw.decode("utf-8"))
+    except owner.StrictJSONError as exc:
+        print(f"::error::close_evidence_publication_receipt_fail_closed: invalid_json: {exc}", file=sys.stderr)
+        return 1
+
+    publication_receipt = build_publication_receipt(
+        close_evidence,
+        github_artifact_id=args.github_artifact_id,
+        github_artifact_digest=args.github_artifact_digest,
+        artifact_url=args.artifact_url,
+    )
+
+    with open(args.output, "w", encoding="utf-8") as fh:
+        json.dump(publication_receipt, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+    print(
+        "close_evidence_publication_receipt_generated: "
+        f"path={args.output} github_artifact_id={args.github_artifact_id}"
+    )
+    return 0
+
+
+# PR #2559 review fix_delta (item E): the two real CLI subcommands -- kept
+# as the single source of truth for the legacy-invocation shim in main()
+# below (never a second, possibly-drifted literal list).
+KNOWN_SUBCOMMANDS = ("build", "publication-receipt")
+
+
+def main(argv: list[str] | None = None) -> int:
+    # PR #2559 review fix_delta (item E): legacy flat-invocation
+    # compatibility shim. Before Issue #2555 added the `publication-receipt`
+    # subcommand, this CLI took `--performance-receipt ... --output-dir ...`
+    # directly (no subcommand) -- some existing callers still invoke it that
+    # way. If the first token is not a known subcommand (covers both a
+    # missing/empty argv and an argv whose first token is an option like
+    # `--performance-receipt`), transparently prepend `build` so the
+    # existing `argparse` subparsers below still parse it. This NEVER
+    # changes `_run_build()` / `_run_publication_receipt()`'s own logic --
+    # only which subcommand argv is routed to when none was given.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] not in KNOWN_SUBCOMMANDS:
+        argv = ["build", *argv]
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Issue #2486: build a standalone-verifiable close-evidence bundle "
+            "from #2423's performance close-grade receipt and #2424's "
+            "reliability close-grade receipt, only when both are close-grade "
+            "eligible. Issue #2555 adds a second `publication-receipt` "
+            "subcommand that wires actions/upload-artifact outputs into the "
+            "existing build_publication_receipt() function. PR #2559 review "
+            "fix_delta: a legacy flat invocation (no subcommand) is "
+            "transparently routed to `build` for backward compatibility."
+        )
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    build_parser = subparsers.add_parser("build", help="Build the close-evidence/ bundle (Issue #2486 AC1)")
+    build_parser.add_argument(
+        "--performance-receipt", required=True, help="#2423 CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 file"
+    )
+    build_parser.add_argument(
+        "--reliability-receipt", required=True, help="#2424 CI_RELIABILITY_CLOSE_GRADE_RESULT_V1 file"
+    )
+    build_parser.add_argument(
+        "--experiment-manifest", required=True, help="#2422 e2e_performance_benchmark_manifest_v2 file"
+    )
+    build_parser.add_argument("--output-dir", required=True, help="Destination close-evidence/ bundle directory")
+    build_parser.set_defaults(func=_run_build)
+
+    receipt_parser = subparsers.add_parser(
+        "publication-receipt",
+        help="Issue #2555 AC6: call build_publication_receipt() with verbatim actions/upload-artifact@v7 outputs",
+    )
+    receipt_parser.add_argument(
+        "--close-evidence-json", required=True, help="Path to the already-built close_evidence.json"
+    )
+    receipt_parser.add_argument(
+        "--github-artifact-id", required=True, help="actions/upload-artifact@v7 outputs.artifact-id (verbatim)"
+    )
+    receipt_parser.add_argument(
+        "--github-artifact-digest",
+        required=True,
+        help="actions/upload-artifact@v7 outputs.artifact-digest (verbatim)",
+    )
+    receipt_parser.add_argument(
+        "--artifact-url", required=True, help="actions/upload-artifact@v7 outputs.artifact-url (verbatim)"
+    )
+    receipt_parser.add_argument(
+        "--output", required=True, help="Destination close-evidence-publication-receipt-v1.json path"
+    )
+    receipt_parser.set_defaults(func=_run_publication_receipt)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
 
 
 if __name__ == "__main__":
