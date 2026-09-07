@@ -581,6 +581,139 @@ def test_p2_e2e_verified_unchanged_vrt_evidence_success_path_real_subprocess(tmp
     assert any("fixture-surface-b" in f for f in result_mismatch["failures"])
 
 
+def _write_css_global_invalidator_fixture(tmp_path) -> None:
+    """Shared fixture for AC8/AC9: a `style.css` global invalidator that
+    `@import`s a nested CSS file, which in turn references an image via a
+    plain `url()` (never itself recursively walked as CSS). `entry.ts` is a
+    schema-required non-empty `producers.modules` placeholder that imports
+    nothing (so it never introduces an independent producer_reachable hit)."""
+    (tmp_path / "styles").mkdir()
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "entry.ts").write_text("export {}\n", encoding="utf-8")
+    (tmp_path / "style.css").write_text('@import "styles/nested.css";\n', encoding="utf-8")
+    (tmp_path / "styles" / "nested.css").write_text(
+        '.a { background: url("../assets/icon.svg"); }\n', encoding="utf-8"
+    )
+    (tmp_path / "assets" / "icon.svg").write_text("<svg></svg>\n", encoding="utf-8")
+
+
+def test_ac8_css_global_invalidator_transitive_dependency_change_affects_registered_surfaces(tmp_path):
+    """AC8: `src/style.css` itself is NOT changed -- only its transitive
+    `@import`/`url()` dependency (`assets/icon.svg`, reached via
+    `styles/nested.css`) is. `build_mjs_request()`/`resolve()` must add the
+    registered CSS `global_invalidators` entry (`style.css`) as an extra
+    graph root for every surface so this transitive change is detected as
+    `producer_reachable` -- NEVER via a direct `global_invalidator` string
+    match (the invalidator itself is deliberately excluded from
+    `changed_paths` so a direct-match hit can never hide this gap)."""
+    _write_css_global_invalidator_fixture(tmp_path)
+    registry_doc = {
+        "schema_version": 1,
+        "global_invalidators": ["style.css"],
+        "coverage_roots": ["unused/**"],
+        "surfaces": {
+            "combat-hud-running": {
+                "producers": {"modules": ["entry.ts"], "styles": [], "assets": [], "config": []},
+                "contracts": _p2_contracts("fixture-a.vrt.test.ts", "fixture-a-baseline.png"),
+                "policy": {"disposition_required": True},
+            },
+            "combat-hud-critical": {
+                "producers": {"modules": ["entry.ts"], "styles": [], "assets": [], "config": []},
+                "contracts": _p2_contracts("fixture-b.vrt.test.ts", "fixture-b-baseline.png"),
+                "policy": {"disposition_required": True},
+            },
+        },
+    }
+    registry_path = tmp_path / "registry.yml"
+    registry_path.write_text(yaml.safe_dump(registry_doc), encoding="utf-8")
+
+    result = rvi.resolve(
+        changed_paths=["assets/icon.svg"],  # style.css itself is NOT in changed_paths
+        registry_path=registry_path,
+        schema_path=SCHEMA_PATH,
+        mjs_path=MJS_PATH,
+        repo_root=tmp_path,
+    )
+    assert not result.errors, result.errors
+    affected = {e["surface_id"]: e["reason"] for e in result.affected_surfaces}
+    assert {"combat-hud-running", "combat-hud-critical"} <= set(affected.keys())
+    assert affected["combat-hud-running"] != "global_invalidator"
+    assert affected["combat-hud-critical"] != "global_invalidator"
+
+
+def test_ac9_base_head_union_preserves_css_global_invalidator_transitive_reachability(tmp_path, monkeypatch):
+    """AC9 (base/head union negative regression): the BASE registry
+    registers `style.css` as a CSS `global_invalidators` entry; the HEAD
+    registry has REMOVED that registration. `style.css` itself is never in
+    `changed_paths` -- only a file it transitively `@import`s/references is
+    changed. Because `resolve()`'s base/head UNION (PR #2045 OWNER
+    fix_delta P0-3) is supposed to preserve base-side `global_invalidators`
+    coverage, the registered surfaces must still be reported affected."""
+    _write_css_global_invalidator_fixture(tmp_path)
+    surfaces_doc = {
+        "combat-hud-running": {
+            "producers": {"modules": ["entry.ts"], "styles": [], "assets": [], "config": []},
+            "contracts": _p2_contracts("fixture-a.vrt.test.ts", "fixture-a-baseline.png"),
+            "policy": {"disposition_required": True},
+        },
+        "combat-hud-critical": {
+            "producers": {"modules": ["entry.ts"], "styles": [], "assets": [], "config": []},
+            "contracts": _p2_contracts("fixture-b.vrt.test.ts", "fixture-b-baseline.png"),
+            "policy": {"disposition_required": True},
+        },
+    }
+    base_doc = {
+        "schema_version": 1,
+        "global_invalidators": ["style.css"],
+        "coverage_roots": ["unused/**"],
+        "surfaces": surfaces_doc,
+    }
+    head_doc = {
+        "schema_version": 1,
+        "global_invalidators": [],  # removed on head
+        "coverage_roots": ["unused/**"],
+        "surfaces": surfaces_doc,
+    }
+
+    def fake_load(registry_path, schema_path, git_ref, repo_root):
+        return head_doc if git_ref == "HEAD" else base_doc
+
+    monkeypatch.setattr(rvi, "load_and_validate_registry", fake_load)
+
+    result = rvi.resolve(
+        changed_paths=["assets/icon.svg"],  # style.css itself is NOT in changed_paths
+        registry_path=tmp_path / "unused_registry.yml",
+        schema_path=SCHEMA_PATH,
+        mjs_path=MJS_PATH,
+        repo_root=tmp_path,
+        base_ref="BASE",
+        head_ref="HEAD",
+    )
+    assert not result.errors, result.errors
+    affected = {e["surface_id"]: e["reason"] for e in result.affected_surfaces}
+    assert {"combat-hud-running", "combat-hud-critical"} <= set(affected.keys())
+    assert affected["combat-hud-running"] != "global_invalidator"
+    assert affected["combat-hud-critical"] != "global_invalidator"
+
+
+def test_ac10_vitest_visual_config_ts_is_a_global_invalidator():
+    """AC10: `vitest.visual.config.ts` is registered in
+    docs/dev/visual-surfaces.yml's `global_invalidators` -- changing ONLY
+    that file must mark every registered surface affected."""
+    result = rvi.resolve(
+        changed_paths=["vitest.visual.config.ts"],
+        registry_path=REGISTRY_PATH,
+        schema_path=SCHEMA_PATH,
+        mjs_path=MJS_PATH,
+        repo_root=REPO_ROOT,
+    )
+    head_doc = yaml.safe_load(REGISTRY_PATH.read_text(encoding="utf-8"))
+    all_surface_ids = set(head_doc["surfaces"].keys())
+    affected = {e["surface_id"]: e["reason"] for e in result.affected_surfaces}
+    assert all_surface_ids <= set(affected.keys())
+    assert affected["combat-hud-running"] == "global_invalidator"
+
+
 def test_command_id_map_resolves_known_ids_only():
     """GIVEN COMMAND_ID_MAP WHEN inspected THEN it only contains the closed
     enum values declared in docs/dev/visual-surfaces.schema.json (no raw

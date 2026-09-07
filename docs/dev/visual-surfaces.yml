@@ -24,6 +24,10 @@ global_invalidators:
   - src/style.css
   - vite.config.ts
   - tsconfig.json
+  # Issue #2551: a change to the Vitest visual-VRT config itself must
+  # invalidate every registered surface's evidence the same way vite.config.ts
+  # / tsconfig.json already do.
+  - vitest.visual.config.ts
 
 # UI 変更 candidate path の閉域判定 glob。producers/global_invalidators の
 # いずれにも mapping されないこのパターン配下の変更は
