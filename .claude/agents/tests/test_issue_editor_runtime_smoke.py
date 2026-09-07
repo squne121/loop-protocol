@@ -266,6 +266,7 @@ marker, output exactly this marker and nothing else:
                 "--",
                 "--output-format",
                 "stream-json",
+                "--include-hook-events",
                 "--verbose",
                 "-p",
                 prompt,
@@ -299,9 +300,11 @@ marker, output exactly this marker and nothing else:
         f"parent-to-issue-editor delegation missing (digest={output_digest})"
     )
     permission_evidence = auto_mode_canary._stream_json_issue_editor_permission_evidence(result.stdout)
-    assert permission_evidence == {
-        "canonical_bash_observed": True,
-        "canonical_bash_result_bound": True,
-        "helper_entrypoint_observed": True,
-        "marker_observed": True,
-    }, f"canonical Bash/result/marker evidence incomplete (digest={output_digest})"
+    assert permission_evidence["parent_issue_editor_delegation_observed"] is True
+    assert permission_evidence["child_lineage_bound"] is True
+    assert permission_evidence["canonical_bash_observed"] is True
+    assert permission_evidence["canonical_bash_result_bound"] is True
+    assert permission_evidence["permission_allow_observed"] or permission_evidence["permission_no_decision_observed"]
+    assert permission_evidence["permission_denied_observed"] is False
+    assert permission_evidence["helper_entrypoint_observed"] is True
+    assert permission_evidence["marker_observed"] is True

@@ -212,15 +212,28 @@ def _stream_json_has_terminal_marker(event: dict, marker: str) -> bool:
     )
 
 
-def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool]:
-    """Bind both canary claims to one canonical Bash tool-use/result chain.
+def _walk_json_dicts_with_lineage(node: object, parent_tool_use_id: str | None = None):
+    """Yield structured values with their nearest enclosing Agent lineage."""
+    if isinstance(node, dict):
+        lineage = node.get("parent_tool_use_id", node.get("parentToolUseId", parent_tool_use_id))
+        if not isinstance(lineage, str):
+            lineage = None
+        yield node, lineage
+        for value in node.values():
+            yield from _walk_json_dicts_with_lineage(value, lineage)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk_json_dicts_with_lineage(value, parent_tool_use_id)
 
-    The helper deliberately returns a nonzero ``failed_no_mutation`` receipt,
-    so the corresponding structured ``tool_result`` is the success evidence;
-    Bash's process exit itself is not. A terminal marker is accepted only when
-    it appears *after* that same bound result. Raw or prompt transcript text,
-    a duplicate canonical Bash request, and an unrelated marker cannot form a
-    PASS chain.
+
+def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool]:
+    """Bind the actual child, permission decision, and helper result causally.
+
+    ``PermissionRequest`` is observable only with ``--include-hook-events``.
+    The hook response provides the narrow allow decision; the documented child
+    ``parent_tool_use_id`` must point to the one observed parent Agent call.
+    A ``failed_no_mutation`` result and terminal marker are then bound to that
+    same child Bash request. Raw runtime output is inspected only in memory.
     """
     events: list[dict] = []
     for line in stdout.splitlines():
@@ -231,18 +244,44 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
         if isinstance(event, dict):
             events.append(event)
 
-    canonical_ids = {
-        node["id"]
+    parent_records = [
+        node
         for event in events
         for node in _walk_json_dicts(event)
         if node.get("type") == "tool_use"
-        and node.get("name") == "Bash"
+        and node.get("name") == "Agent"
         and isinstance(node.get("id"), str)
         and isinstance(node.get("input"), dict)
+        and node["input"].get("subagent_type") == "issue-editor"
+    ]
+    parent_ids = {node["id"] for node in parent_records}
+    parent_issue_editor_delegation_observed = len(parent_records) == len(parent_ids) == 1
+
+    all_bash_records = [
+        (index, node, parent_tool_use_id)
+        for index, event in enumerate(events)
+        for node, parent_tool_use_id in _walk_json_dicts_with_lineage(event)
+        if node.get("type") == "tool_use" and node.get("name") == "Bash"
+    ]
+    canonical_records = [
+        (index, node, parent_tool_use_id)
+        for index, node, parent_tool_use_id in all_bash_records
+        if isinstance(node.get("id"), str)
+        and isinstance(node.get("input"), dict)
         and node["input"].get("command") == ISSUE_EDITOR_PERMISSION_CANARY_COMMAND
-    }
-    canonical_bash_observed = len(canonical_ids) == 1
-    canonical_id = next(iter(canonical_ids), None) if canonical_bash_observed else None
+    ]
+    canonical_ids = {node["id"] for _, node, _ in canonical_records}
+    canonical_bash_observed = len(all_bash_records) == len(canonical_records) == len(canonical_ids) == 1
+    canonical_index, canonical_id, canonical_parent_tool_use_id = (None, None, None)
+    if canonical_bash_observed:
+        canonical_index, canonical_node, canonical_parent_tool_use_id = canonical_records[0]
+        canonical_id = canonical_node["id"]
+    child_lineage_bound = (
+        canonical_bash_observed
+        and parent_issue_editor_delegation_observed
+        and canonical_parent_tool_use_id in parent_ids
+    )
+
     bound_result_indices = {
         index
         for index, event in enumerate(events)
@@ -257,14 +296,69 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
         )
     }
     helper_result_bound = bool(bound_result_indices)
+
+    permission_hook_events_observed = any(
+        event.get("type") == "system" and isinstance(event.get("hook_event"), str) for event in events
+    )
+    permission_request_started_indices = {
+        index
+        for index, event in enumerate(events)
+        if event.get("type") == "system"
+        and event.get("subtype") == "hook_started"
+        and event.get("hook_event") == "PermissionRequest"
+    }
+    permission_request_response_indices = {
+        index
+        for index, event in enumerate(events)
+        if event.get("type") == "system"
+        and event.get("subtype") == "hook_response"
+        and event.get("hook_event") == "PermissionRequest"
+    }
+    permission_decision_behaviors = {
+        output.get("hookSpecificOutput", {}).get("decision", {}).get("behavior")
+        for index in permission_request_response_indices
+        for output in _embedded_json_dicts(events[index].get("output"))
+        if isinstance(output.get("hookSpecificOutput"), dict)
+        and isinstance(output.get("hookSpecificOutput", {}).get("decision"), dict)
+        and output.get("hookSpecificOutput", {}).get("hookEventName") == "PermissionRequest"
+    }
+    permission_allow_observed = (
+        len(permission_request_response_indices) == 1
+        and permission_decision_behaviors == {"allow"}
+        and canonical_index is not None
+        and min(permission_request_response_indices) > canonical_index
+        and helper_result_bound
+        and min(permission_request_response_indices) < min(bound_result_indices)
+    )
+    # When the Auto classifier authorizes the one canonical Bash without
+    # requesting permission, Claude Code emits no PermissionRequest event at
+    # all. With --include-hook-events active, that absence is a verifiable
+    # no-decision outcome, not an unobserved fallback.
+    permission_no_decision_observed = (
+        permission_hook_events_observed
+        and not permission_request_started_indices
+        and not permission_request_response_indices
+        and helper_result_bound
+    )
+    permission_denied_observed = any(
+        event.get("type") == "system"
+        and event.get("subtype") == "permission_denied"
+        and event.get("tool_use_id") == canonical_id
+        for event in events
+    ) or "deny" in permission_decision_behaviors
     bound_marker = helper_result_bound and any(
         index > max(bound_result_indices)
         and _stream_json_has_terminal_marker(event, ISSUE_EDITOR_PERMISSION_CANARY_MARKER)
         for index, event in enumerate(events)
     )
     return {
+        "parent_issue_editor_delegation_observed": parent_issue_editor_delegation_observed,
+        "child_lineage_bound": child_lineage_bound,
         "canonical_bash_observed": canonical_bash_observed,
         "canonical_bash_result_bound": helper_result_bound,
+        "permission_allow_observed": permission_allow_observed,
+        "permission_no_decision_observed": permission_no_decision_observed,
+        "permission_denied_observed": permission_denied_observed,
         "helper_entrypoint_observed": helper_result_bound,
         "marker_observed": bound_marker,
     }
@@ -758,6 +852,7 @@ def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[i
                 "--",
                 "--output-format",
                 "stream-json",
+                "--include-hook-events",
                 "--verbose",
                 "-p",
                 _issue_editor_permission_parent_prompt(),
@@ -778,9 +873,6 @@ def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[i
     detail = {
         "launcher_exit_code": result.returncode,
         "transcript_digest": transcript_digest,
-        "parent_issue_editor_delegation_observed": _stream_json_has_tool_use(
-            result.stdout, "Agent", subagent_type="issue-editor"
-        ),
         **permission_evidence,
     }
     if result.returncode == 8:
@@ -792,7 +884,11 @@ def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[i
     if not all(
         (
             detail["parent_issue_editor_delegation_observed"],
+            detail["child_lineage_bound"],
             detail["canonical_bash_observed"],
+            detail["canonical_bash_result_bound"],
+            detail["permission_allow_observed"] or detail["permission_no_decision_observed"],
+            not detail["permission_denied_observed"],
             detail["helper_entrypoint_observed"],
             detail["marker_observed"],
         )
