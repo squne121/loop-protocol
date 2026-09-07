@@ -40,6 +40,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -226,6 +227,16 @@ def _walk_json_dicts_with_lineage(node: object, parent_tool_use_id: str | None =
             yield from _walk_json_dicts_with_lineage(value, parent_tool_use_id)
 
 
+def _malformed_line_contains_permission_denied(line: str) -> bool:
+    """Recognize an escaped denial marker without retaining malformed input."""
+    normalized = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        lambda match: chr(int(match.group(1), 16)),
+        line,
+    ).casefold()
+    return "permission_denied" in normalized
+
+
 def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool]:
     """Bind the actual child, permission decision, and helper result causally.
 
@@ -243,7 +254,7 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
         except ValueError:
             # A malformed structured denial cannot be safely distinguished from
             # an omitted tool result, so retain no raw line and fail closed.
-            malformed_permission_denied_observed |= "permission_denied" in line.casefold()
+            malformed_permission_denied_observed |= _malformed_line_contains_permission_denied(line)
             continue
         if isinstance(event, dict):
             events.append(event)

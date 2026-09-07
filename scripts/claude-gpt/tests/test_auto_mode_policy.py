@@ -1031,8 +1031,9 @@ def test_issue_editor_permission_canary_treats_unbound_permission_denied_as_fail
         }
     )
     malformed_denial = '{"type":"system","subtype":"permission_denied"'
+    escaped_malformed_denial = '{"type":"system","subtype":"permission' + chr(92) + 'u005fdenied"'
 
-    for stdout in (valid_denial, malformed_denial):
+    for stdout in (valid_denial, malformed_denial, escaped_malformed_denial):
         evidence = canary._stream_json_issue_editor_permission_evidence(stdout)
         assert evidence["permission_denied_observed"] is True
 
