@@ -305,7 +305,9 @@ def test_given_symlinked_scratch_leftover_when_cleanup_run_then_artifact_escape_
 # ---------------------------------------------------------------------------
 
 
-def test_given_production_profile_and_stale_artifact_when_dispatched_then_publish_blocked(tmp_path, monkeypatch, capsys):
+def test_given_production_profile_and_stale_artifact_when_dispatched_then_publish_blocked(
+    tmp_path, monkeypatch, capsys
+):
     _init_git_repo(tmp_path)
     artifact_dir = _make_artifact_dir(tmp_path, 2200)
     artifact_path = _write_result_artifact(artifact_dir, issue_number=9999)
