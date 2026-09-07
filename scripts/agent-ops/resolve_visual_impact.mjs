@@ -138,17 +138,168 @@ function stripCssReferenceSuffix(spec) {
   return spec.split('#')[0].split('?')[0]
 }
 
-// `@import "x.css"` / `@import 'x.css'` / `@import url("x.css")` /
-// `@import url('x.css')` / `@import url(x.css)` -- quoted/unquoted, with or
-// without a leading `./`. Two alternatives: the `url(...)` form (capture
-// groups 1/2) and the bare quoted-string form (capture groups 3/4).
-const CSS_IMPORT_RE_SOURCE = "@import\\s+(?:url\\(\\s*(['\"]?)([^'\")]+)\\1\\s*\\)|(['\"])([^'\"]+)\\3)"
+// Issue #2551 PR #2558 fix_delta: the two-regexp `CSS_IMPORT_RE_SOURCE` /
+// `CSS_URL_RE_SOURCE` approach below was replaced with a small bounded
+// lexical scanner (`scanCssImportReferences()` / `scanCssUrlReferences()` /
+// `parseUrlArgs()`) so `url(...)`/`@import` token recognition can be made
+// ASCII case-insensitive (`URL(`/`@IMPORT`), whitespace immediately inside
+// `url(...)` can be handled precisely (leading whitespace skipped before
+// value read starts; for an UNQUOTED value, trailing whitespace before the
+// closing `)` is excluded from the captured value and anything other than
+// whitespace-then-`)` after the value is treated as a malformed token and
+// skipped entirely -- never partially matched), and a QUOTED value is never
+// `.trim()`-ed (an intentional leading/trailing space inside a quoted
+// literal is preserved; only unquoted trailing whitespace is ever dropped).
+// No new parser dependency is introduced (no PostCSS et al.) -- this remains
+// a bounded lexical pass, not a full CSS tokenizer.
 
-// An ordinary `url(...)` reference (quoted or unquoted). Applied to CSS text
-// AFTER `@import` statements have already been stripped out, so an
-// `@import url(...)` is never double-processed as a plain `url()` asset
-// reference below.
-const CSS_URL_RE_SOURCE = "url\\(\\s*(['\"]?)([^'\")]+)\\1\\s*\\)"
+const CSS_WHITESPACE_CHARS = new Set([' ', '\t', '\n', '\r', '\f'])
+
+function isCssWhitespaceChar(ch) {
+  return CSS_WHITESPACE_CHARS.has(ch)
+}
+
+function skipCssWhitespace(text, index) {
+  let i = index
+  while (i < text.length && isCssWhitespaceChar(text[i])) i += 1
+  return i
+}
+
+/** Case-insensitive (ASCII) literal match of `keyword` (already lowercase)
+ * against `text` starting at `index`. Never throws on an out-of-range
+ * `index` -- simply returns `false`. */
+function matchCssKeywordCI(text, index, keyword) {
+  if (index < 0 || index + keyword.length > text.length) return false
+  return text.slice(index, index + keyword.length).toLowerCase() === keyword
+}
+
+/** Parse the argument of a `url(...)` construct. `openParenIndex` MUST be
+ * the index of the `(` character itself (immediately after the `url`
+ * token). Returns `{ spec, endIndex }` (`endIndex` is the index immediately
+ * AFTER the matching `)`) on success, or `null` when the construct is
+ * malformed (unterminated quoted string; an unquoted value followed by
+ * whitespace then anything other than `)`; or no `)` found at all) -- a
+ * malformed `url(...)` is never partially matched, it is simply not treated
+ * as a reference (matching this scanner's bounded, non-full-tokenizer
+ * scope). A QUOTED value is returned verbatim (never trimmed); an UNQUOTED
+ * value has any whitespace between the value and the closing `)` excluded
+ * from the returned `spec` (that whitespace is never part of the URL). */
+function parseUrlArgs(text, openParenIndex) {
+  let i = skipCssWhitespace(text, openParenIndex + 1)
+  if (i >= text.length) return null
+
+  const quote = text[i]
+  if (quote === '"' || quote === "'") {
+    let j = i + 1
+    let value = ''
+    while (j < text.length && text[j] !== quote) {
+      value += text[j]
+      j += 1
+    }
+    if (j >= text.length) return null // unterminated quoted string
+    j = skipCssWhitespace(text, j + 1)
+    if (text[j] !== ')') return null
+    return { spec: value, endIndex: j + 1 }
+  }
+
+  // Unquoted: read up to the first whitespace or `)`.
+  let j = i
+  let value = ''
+  while (j < text.length && text[j] !== ')' && !isCssWhitespaceChar(text[j])) {
+    value += text[j]
+    j += 1
+  }
+  if (value === '') return null
+  j = skipCssWhitespace(text, j)
+  if (text[j] !== ')') return null
+  return { spec: value, endIndex: j + 1 }
+}
+
+/** Scan `text` (already comment-stripped) for `@import` references (ASCII
+ * case-insensitive `@import`, required whitespace before the value, then
+ * either a `url(...)` form -- quoted or unquoted -- or a bare quoted
+ * string). Returns an ordered, non-overlapping list of
+ * `{ spec, start, end }` (`start`/`end` are text offsets spanning the WHOLE
+ * matched `@import ...` construct, used by the caller to blank the span out
+ * before the subsequent plain-`url()` scan so an `@import url(...)` is never
+ * double-processed as an ordinary asset `url()` reference). A malformed or
+ * unrecognized `@import`-looking token is simply skipped (never partially
+ * matched, never thrown). */
+function scanCssImportReferences(text) {
+  const matches = []
+  let i = 0
+  while (i < text.length) {
+    if (!matchCssKeywordCI(text, i, '@import')) {
+      i += 1
+      continue
+    }
+    const afterKeyword = i + '@import'.length
+    const afterWhitespace = skipCssWhitespace(text, afterKeyword)
+    if (afterWhitespace === afterKeyword) {
+      // No whitespace between `@import` and its value -- not a recognized
+      // `@import` construct (matches the previous regex's `\s+` requirement).
+      i += 1
+      continue
+    }
+    if (matchCssKeywordCI(text, afterWhitespace, 'url(')) {
+      const parsed = parseUrlArgs(text, afterWhitespace + 'url'.length)
+      if (parsed) {
+        matches.push({ spec: parsed.spec, start: i, end: parsed.endIndex })
+        i = parsed.endIndex
+        continue
+      }
+    } else if (text[afterWhitespace] === '"' || text[afterWhitespace] === "'") {
+      const quote = text[afterWhitespace]
+      let j = afterWhitespace + 1
+      let value = ''
+      while (j < text.length && text[j] !== quote) {
+        value += text[j]
+        j += 1
+      }
+      if (j < text.length) {
+        matches.push({ spec: value, start: i, end: j + 1 })
+        i = j + 1
+        continue
+      }
+    }
+    i += 1
+  }
+  return matches
+}
+
+/** Scan `text` for ordinary `url(...)` references (ASCII case-insensitive
+ * `url(`). Callers apply this AFTER `@import` spans have been blanked out of
+ * the text, so an `@import url(...)` is never double-processed here. Same
+ * malformed-token-is-skipped philosophy as `scanCssImportReferences()`. */
+function scanCssUrlReferences(text) {
+  const matches = []
+  let i = 0
+  while (i < text.length) {
+    if (matchCssKeywordCI(text, i, 'url(')) {
+      const parsed = parseUrlArgs(text, i + 'url'.length)
+      if (parsed) {
+        matches.push({ spec: parsed.spec, start: i, end: parsed.endIndex })
+        i = parsed.endIndex
+        continue
+      }
+    }
+    i += 1
+  }
+  return matches
+}
+
+/** Replace each `[start, end)` span in `text` with equal-length whitespace
+ * (never simply deleted, so token adjacency across a blanked span can never
+ * accidentally fuse two otherwise-unrelated tokens -- same rationale as
+ * `stripCssComments()` below). `ranges` MUST already be in ascending,
+ * non-overlapping order (guaranteed by `scanCssImportReferences()`). */
+function blankOutRanges(text, ranges) {
+  let result = text
+  for (const { start, end } of ranges) {
+    result = result.slice(0, start) + ' '.repeat(end - start) + result.slice(end)
+  }
+  return result
+}
 
 /** CSS comments are replaced with equal-length whitespace (never simply
  * deleted), so token adjacency across a removed comment can never
@@ -258,23 +409,21 @@ class Resolver {
       return
     }
     const dir = path.dirname(fileAbs)
-    // Issue #2551: bounded lexical scanner. CSS comments are stripped first
-    // (never scanned as dependencies -- AC4); `@import` targets are
-    // extracted and, when local, recursively walked (AC2/AC3) BEFORE the
-    // remaining text is scanned for ordinary `url(...)` references, so an
-    // `@import url(...)` form is never also double-processed as a plain
-    // asset url() below.
+    // Issue #2551 (PR #2558 fix_delta): bounded lexical scanner. CSS
+    // comments are stripped first (never scanned as dependencies -- AC4);
+    // `@import` targets are extracted and, when local, recursively walked
+    // (AC2/AC3) BEFORE the remaining text is scanned for ordinary
+    // `url(...)` references, so an `@import url(...)` form is never also
+    // double-processed as a plain asset url() below.
     const withoutComments = stripCssComments(text)
-    const importRe = new RegExp(CSS_IMPORT_RE_SOURCE, 'g')
-    let m
-    while ((m = importRe.exec(withoutComments))) {
-      const rawSpec = m[2] !== undefined ? m[2] : m[4]
-      this.handleCssImportReference(rawSpec, dir, fileAbs)
+    const importRefs = scanCssImportReferences(withoutComments)
+    for (const ref of importRefs) {
+      this.handleCssImportReference(ref.spec, dir, fileAbs)
     }
-    const withoutImports = withoutComments.replace(new RegExp(CSS_IMPORT_RE_SOURCE, 'g'), (match) => ' '.repeat(match.length))
-    const urlRe = new RegExp(CSS_URL_RE_SOURCE, 'g')
-    while ((m = urlRe.exec(withoutImports))) {
-      this.handleCssUrlReference(m[2], dir, fileAbs)
+    const withoutImports = blankOutRanges(withoutComments, importRefs)
+    const urlRefs = scanCssUrlReferences(withoutImports)
+    for (const ref of urlRefs) {
+      this.handleCssUrlReference(ref.spec, dir, fileAbs)
     }
   }
 
@@ -305,9 +454,26 @@ class Resolver {
    * (`data:`/`http:`/`https:`/etc.), and network-path (`//host/...`)
    * references are never local and must never be misclassified as a missing
    * local reference (AC5). A Vite `public/` root-absolute reference
-   * (`/logo.svg`) resolves against `<root>/public/...` (AC7) only when the
-   * repo's Vite `root`/`publicDir` configuration has been confirmed to be
-   * left at its defaults. */
+   * (`/logo.svg`) is only attempted at all (AC7) when the repo's Vite
+   * `root`/`publicDir` configuration has been confirmed to be left at its
+   * defaults -- when it cannot be confirmed this returns immediately (never
+   * silently mis-resolved against the OS filesystem root), leaving the
+   * caller's existing `unsupported_resolution_settings` all-registered-
+   * surfaces-affected fallback to cover it.
+   *
+   * Issue #2551 PR #2558 fix_delta: when it CAN be confirmed, resolution
+   * follows the same priority order Vite 8.0.13 itself applies to a
+   * root-absolute reference under default `root`/`publicDir` -- `public/
+   * <path>` is tried first (a Vite `public/` asset is served/copied
+   * verbatim at its root-absolute URL and always wins when it exists); only
+   * when nothing exists under `public/` is `<repoRoot>/<path>` (a
+   * SOURCE-root-relative asset, e.g. imported by another module under
+   * `/src/...`) tried; when NEITHER exists this is a genuine dead
+   * reference and falls through to the same `css_missing_local_reference`
+   * unknown_impact recording used by every other unresolved CSS reference
+   * below (never a silent no-impact skip). This is not a full Vite resolver
+   * reimplementation -- only this one two-candidate priority order is
+   * implemented. */
   handleCssUrlReference(rawSpec, dir, containingFileAbs) {
     // Classification MUST run on the raw (unstripped) specifier -- see the
     // matching comment in handleCssImportReference() above.
@@ -318,7 +484,13 @@ class Resolver {
     let abs
     if (kind === 'root-absolute') {
       if (!this.viteRootPublicDirIsDefault) return
-      abs = path.resolve(this.publicDirAbs, spec.slice(1))
+      const publicCandidate = path.resolve(this.publicDirAbs, spec.slice(1))
+      if (existsSync(publicCandidate)) {
+        abs = publicCandidate
+      } else {
+        const sourceRootCandidate = path.resolve(this.repoRoot, spec.slice(1))
+        abs = existsSync(sourceRootCandidate) ? sourceRootCandidate : publicCandidate
+      }
     } else {
       abs = path.resolve(dir, spec)
     }
@@ -812,7 +984,12 @@ function collectRootOrPublicDirProblems(objectLiteral, candidateRelPath) {
  * resolution (Issue #2551 AC7) may be attempted at all. */
 function detectViteRootOrPublicDirProblems(repoRoot) {
   const problems = []
-  for (const candidate of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts']) {
+  // Issue #2551 PR #2558 fix_delta: `.cjs`/`.cts` added to Vite 8's default
+  // config-file candidate set (previously only `.js`/`.mjs`/`.ts`/`.mts`
+  // were searched). This does not extend to tracking an arbitrary custom
+  // `vite --config <path>` -- out of scope; this repository does not use
+  // one today.
+  for (const candidate of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts', 'vite.config.cjs', 'vite.config.cts']) {
     const viteConfigPath = path.join(repoRoot, candidate)
     if (!existsSync(viteConfigPath)) continue
     let viteTextRaw
@@ -853,7 +1030,12 @@ function detectUnsupportedResolutionSettings(repoRoot) {
 
   problems.push(...detectTsconfigChainProblems(repoRoot))
 
-  for (const candidate of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts']) {
+  // Issue #2551 PR #2558 fix_delta: `.cjs`/`.cts` added to Vite 8's default
+  // config-file candidate set (previously only `.js`/`.mjs`/`.ts`/`.mts`
+  // were searched). This does not extend to tracking an arbitrary custom
+  // `vite --config <path>` -- out of scope; this repository does not use
+  // one today.
+  for (const candidate of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts', 'vite.config.cjs', 'vite.config.cts']) {
     const viteConfigPath = path.join(repoRoot, candidate)
     if (!existsSync(viteConfigPath)) continue
     let viteTextRaw
