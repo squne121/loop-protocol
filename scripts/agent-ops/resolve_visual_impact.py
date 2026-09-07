@@ -318,13 +318,30 @@ def diff_producer_mappings(base_doc: dict[str, Any], head_doc: dict[str, Any]) -
     return affected
 
 
-def build_mjs_request(repo_root: Path, surfaces: dict[str, Any]) -> dict[str, Any]:
+def build_mjs_request(
+    repo_root: Path,
+    surfaces: dict[str, Any],
+    css_global_invalidators: frozenset[str] | set[str] = frozenset(),
+) -> dict[str, Any]:
+    """Issue #2551: `css_global_invalidators` (the CSS-extension subset of
+    the base/head UNION `global_invalidators` -- computed by the caller,
+    `resolve()` below) is added to EVERY surface's `styles` graph-root list
+    so a transitive dependency of a registered CSS global invalidator (e.g.
+    `src/style.css`'s own `@import`/`url()` graph) is walked and can be
+    matched against `changed_paths`, even for a surface whose own registered
+    `producers.styles` never lists that invalidator directly (Issue #2551
+    AC8/AC9). This never introduces a new global graph subsystem or a new
+    external request/output schema -- it only widens the existing per-surface
+    `styles` input already accepted by resolve_visual_impact.mjs's
+    RESOLVE_VISUAL_IMPACT_MJS_REQUEST_V1 contract."""
     request_surfaces = {}
+    extra_styles = sorted(css_global_invalidators)
     for surface_id, surface_def in surfaces.items():
         producers = surface_def.get("producers", {})
+        styles = list(dict.fromkeys((producers.get("styles", []) or []) + extra_styles))
         request_surfaces[surface_id] = {
             "modules": producers.get("modules", []) or [],
-            "styles": producers.get("styles", []) or [],
+            "styles": styles,
             "assets": producers.get("assets", []) or [],
             "config": producers.get("config", []) or [],
         }
@@ -606,7 +623,13 @@ def resolve(
         affected_surface_ids.setdefault(surface_id, "mapping_deleted")
 
     # 4. TypeScript-compiler-API graph resolution (transitive reachability).
-    request = build_mjs_request(repo_root, union_surfaces)
+    # Issue #2551 AC8/AC9: the CSS-extension subset of the base/head UNION
+    # `global_invalidators` computed above is added as an extra graph root
+    # for every surface (never head-registry-only) -- a transitive
+    # dependency of a registered CSS global invalidator is walked even when
+    # only the BASE registry (not head) still registers it.
+    css_global_invalidators = {p for p in global_invalidators if p.endswith(".css")}
+    request = build_mjs_request(repo_root, union_surfaces, css_global_invalidators=css_global_invalidators)
     try:
         mjs_result = run_mjs(mjs_path, request, node_bin=node_bin)
     except RegistryError as exc:

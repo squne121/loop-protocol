@@ -303,3 +303,372 @@ describe('resolve_visual_impact.mjs P1-C: tsconfig `extends` array + search-dept
     }
   })
 })
+
+/**
+ * Issue #2551 AC1-AC7: bounded CSS lexical scanner/extractor regression
+ * coverage for resolve_visual_impact.mjs's `visitCss()`. Each scenario
+ * writes a throwaway `repo_root` under the OS tmpdir via `writeTmpRepo()`
+ * (never a new checked-in fixture file, staying within this Issue's frozen
+ * Allowed Paths list) and invokes the real .mjs subprocess directly against
+ * it -- never a reimplementation of the CSS scanner under test.
+ */
+describe('resolve_visual_impact.mjs CSS bounded lexical scanner (Issue #2551)', () => {
+  it('GIVEN url("icon.svg") with no "./" prefix WHEN resolved THEN it is reachable as a repo-local relative reference (AC1)', () => {
+    const dir = writeTmpRepo({
+      'style.css': '.a { background: url("icon.svg"); }\n',
+      'icon.svg': '<svg></svg>\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toContain('icon.svg')
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN every @import syntax variant (quoted/unquoted string, quoted/unquoted url(), "./" optional) WHEN resolved THEN every import target is recognized as a local dependency and is reachable (AC2)', () => {
+    const dir = writeTmpRepo({
+      'a.css': '@import "b.css";\n',
+      'b.css': "@import 'c.css';\n",
+      'c.css': '@import url("d.css");\n',
+      'd.css': "@import url('e.css');\n",
+      'e.css': '@import url(f.css);\n',
+      'f.css': '.leaf { color: blue; }\n',
+    })
+    try {
+      const result = runMjs(['a.css'], dir)
+      expect(result.errors).toEqual([])
+      const reachable = result.surfaces.fixture.reachable_files
+      for (const file of ['a.css', 'b.css', 'c.css', 'd.css', 'e.css', 'f.css']) {
+        expect(reachable).toContain(file)
+      }
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN a local @import chain whose imported CSS has a nested relative url() WHEN resolved THEN the nested asset is transitively reachable, and is never itself recursively walked as CSS (AC3)', () => {
+    const dir = writeTmpRepo({
+      'root.css': '@import "./nested/inner.css";\n',
+      'nested/inner.css': '.b { background: url("./deep.svg"); }\n',
+      'nested/deep.svg': '<svg></svg>\n',
+    })
+    try {
+      const result = runMjs(['root.css'], dir)
+      expect(result.errors).toEqual([])
+      const reachable = result.surfaces.fixture.reachable_files
+      expect(reachable).toContain('nested/inner.css')
+      expect(reachable).toContain('nested/deep.svg')
+      // the asset itself is never treated as a CSS graph root/traversed
+      expect(reachable).not.toContain('nested/deep.svg.css')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN a CSS comment containing a dead url() reference to a nonexistent file WHEN resolved THEN it is never treated as a dependency and never triggers unknown_impact (AC4)', () => {
+    const dir = writeTmpRepo({
+      'style.css': ['/* old: background: url("./deleted.png"); */', '.a { color: red; }', ''].join('\n'),
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toEqual(['style.css'])
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN fragment-only, URI-scheme, and network-path url() references WHEN resolved THEN none are classified as a missing local reference (AC5)', () => {
+    const dir = writeTmpRepo({
+      'style.css': [
+        '.a { background: url(#fragment-ref); }',
+        '.b { background: url("data:image/png;base64,AAAA"); }',
+        '.c { background: url("https://example.test/img.png"); }',
+        '.d { background: url("//cdn.example.test/img.png"); }',
+        '',
+      ].join('\n'),
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN url("./missing.svg") referencing a nonexistent local file WHEN resolved THEN it is recorded in unknown_impact (AC6)', () => {
+    const dir = writeTmpRepo({
+      'style.css': '.a { background: url("./missing.svg"); }\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      const unknown = result.surfaces.fixture.unknown_impact as Array<{ file: string; kind: string; detail: string }>
+      expect(unknown.length).toBeGreaterThanOrEqual(1)
+      expect(unknown.some((entry) => entry.file === 'style.css' && entry.detail === './missing.svg')).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN url("/logo.svg") (Vite public/ root-absolute reference) under the repo\'s default Vite root/publicDir semantics WHEN resolved THEN it resolves to <root>/public/logo.svg, never the OS filesystem root (AC7)', () => {
+    const dir = writeTmpRepo({
+      'style.css': '.a { background: url("/logo.svg"); }\n',
+      'public/logo.svg': '<svg></svg>\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toContain('public/logo.svg')
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN a non-default Vite "root" in vite.config.ts WHEN a CSS root-absolute url() is present THEN root-absolute resolution is skipped (never silently mis-resolved against the OS filesystem root) and the non-default root is reported as an unsupported-resolution diagnostic (AC7 fallback path)', () => {
+    const dir = writeTmpRepo({
+      'vite.config.ts': [
+        "import { defineConfig } from 'vite'",
+        '',
+        "export default defineConfig({ root: './app' })",
+        '',
+      ].join('\n'),
+      'style.css': '.a { background: url("/logo.svg"); }\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).not.toContain('public/logo.svg')
+      const joined = result.unsupported_resolution_settings.join('\n')
+      expect(joined).toMatch(/vite\.config\.ts.*"root"/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * Issue #2551 PR #2558 fix_delta (OWNER-normalized comment 2026-09-07): a
+ * root-absolute CSS `url()` reference under default `root`/`publicDir`
+ * semantics must follow the SAME priority order the real Vite 8.0.13
+ * resolver applies -- `public/<path>` first, `<repoRoot>/<path>` (a
+ * source-root asset) only when nothing exists under `public/`, and
+ * `public/` wins when BOTH exist.
+ */
+describe('resolve_visual_impact.mjs root-absolute CSS url() Vite priority order (Issue #2551 PR #2558 fix_delta)', () => {
+  it('GIVEN url("/logo.svg") WHERE only public/logo.svg exists WHEN resolved THEN it resolves to the public/ asset', () => {
+    const dir = writeTmpRepo({
+      'style.css': '.a { background: url("/logo.svg"); }\n',
+      'public/logo.svg': '<svg></svg>\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toContain('public/logo.svg')
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN url("/src/icon.svg") WHERE only src/icon.svg exists (no public/ counterpart) WHEN resolved THEN it resolves to the source-root asset', () => {
+    const dir = writeTmpRepo({
+      'style.css': '.a { background: url("/src/icon.svg"); }\n',
+      'src/icon.svg': '<svg></svg>\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toContain('src/icon.svg')
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN url("/shared.svg") WHERE the SAME root-absolute path exists under BOTH public/ and the source root WHEN resolved THEN the public/ asset is preferred (matching Vite\'s own priority order)', () => {
+    const dir = writeTmpRepo({
+      'style.css': '.a { background: url("/shared.svg"); }\n',
+      'public/shared.svg': '<svg data-origin="public"></svg>\n',
+      'shared.svg': '<svg data-origin="source-root"></svg>\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toContain('public/shared.svg')
+      expect(result.surfaces.fixture.reachable_files).not.toContain('shared.svg')
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * Issue #2551 PR #2558 fix_delta: the bounded lexical scanner
+ * (`scanCssImportReferences()` / `scanCssUrlReferences()` / `parseUrlArgs()`
+ * in resolve_visual_impact.mjs) replaced the previous two-regexp approach so
+ * `url`/`@import` token recognition is ASCII case-insensitive and
+ * whitespace handling inside `url(...)` is precise (unquoted trailing
+ * whitespace before `)` is excluded from the captured value; quoted values
+ * are never trimmed).
+ */
+describe('resolve_visual_impact.mjs CSS scanner case-insensitivity and whitespace handling (Issue #2551 PR #2558 fix_delta)', () => {
+  it('GIVEN url(icon.svg ) (unquoted, trailing whitespace before the closing paren) WHEN resolved THEN the trailing whitespace is excluded from the resolved reference', () => {
+    const dir = writeTmpRepo({
+      'style.css': '.a { background: url(icon.svg ); }\n',
+      'icon.svg': '<svg></svg>\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toContain('icon.svg')
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN url( icon.svg ) (unquoted, leading AND trailing whitespace) WHEN resolved THEN it still resolves to icon.svg', () => {
+    const dir = writeTmpRepo({
+      'style.css': '.a { background: url( icon.svg ); }\n',
+      'icon.svg': '<svg></svg>\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toContain('icon.svg')
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN @import url(base.css ); (unquoted url() inside @import, trailing whitespace) WHEN resolved THEN base.css is recursively walked as a local @import target', () => {
+    const dir = writeTmpRepo({
+      'root.css': '@import url(base.css );\n',
+      'base.css': '.leaf { color: blue; }\n',
+    })
+    try {
+      const result = runMjs(['root.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toContain('base.css')
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN URL(icon.svg) (uppercase "url" token) WHEN resolved THEN it is still recognized as an ordinary url() reference', () => {
+    const dir = writeTmpRepo({
+      'style.css': '.a { background: URL(icon.svg); }\n',
+      'icon.svg': '<svg></svg>\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toContain('icon.svg')
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN @IMPORT "theme.css" (uppercase "@import" token, quoted string form) WHEN resolved THEN theme.css is still recognized and recursively walked as a local @import target', () => {
+    const dir = writeTmpRepo({
+      'root.css': '@IMPORT "theme.css";\n',
+      'theme.css': '.leaf { color: blue; }\n',
+    })
+    try {
+      const result = runMjs(['root.css'], dir)
+      expect(result.errors).toEqual([])
+      expect(result.surfaces.fixture.reachable_files).toContain('theme.css')
+      expect(result.surfaces.fixture.unknown_impact).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * Issue #2551 PR #2558 fix_delta: `.cjs`/`.cts` added to the Vite config
+ * discovery candidate set (`detectViteRootOrPublicDirProblems()` /
+ * `detectUnsupportedResolutionSettings()`).
+ */
+describe('resolve_visual_impact.mjs vite.config.cjs / vite.config.cts discovery (Issue #2551 PR #2558 fix_delta)', () => {
+  it('GIVEN a vite.config.cjs (CommonJS-style, not a statically-analyzable "export default") WHEN resolved THEN it is discovered and reported as an unsupported-resolution diagnostic (never silently ignored)', () => {
+    const dir = writeTmpRepo({
+      'vite.config.cjs': ["module.exports = {", "  root: './app',", '}', ''].join('\n'),
+    })
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      const joined = result.unsupported_resolution_settings.join('\n')
+      expect(joined).toMatch(/vite\.config\.cjs/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('GIVEN a vite.config.cts with a non-default "root" WHEN resolved THEN the non-default root is detected and reported as an unsupported-resolution diagnostic', () => {
+    const dir = writeTmpRepo({
+      'vite.config.cts': [
+        "import { defineConfig } from 'vite'",
+        '',
+        "export default defineConfig({ root: './app' })",
+        '',
+      ].join('\n'),
+    })
+    try {
+      const result = runMjs([], dir)
+      expect(result.errors).toEqual([])
+      const joined = result.unsupported_resolution_settings.join('\n')
+      expect(joined).toMatch(/vite\.config\.cts.*"root"/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+/**
+ * Issue #2551 AC3 non-recursion regression strengthening (PR #2558
+ * fix_delta): an ordinary `url()` asset target (e.g. an SVG) is never
+ * recursively walked as CSS even when its OWN file content looks
+ * CSS-like. No implementation change is required here -- the existing
+ * non-recursion behavior (`dispatch()`/`handleCssUrlReference()` never call
+ * `visitCss()` for a plain asset `url()` target) is already correct; this
+ * strengthens the regression coverage that would catch a future
+ * regression.
+ */
+describe('resolve_visual_impact.mjs AC3 non-recursion strengthened regression (Issue #2551 PR #2558 fix_delta)', () => {
+  it('GIVEN a url() target (icon.svg) whose OWN file content contains a CSS-looking nested url() reference WHEN resolved THEN the nested reference is never followed (not reachable, not unknown_impact)', () => {
+    const dir = writeTmpRepo({
+      'style.css': '.a { background: url("icon.svg"); }\n',
+      'icon.svg': [
+        '<svg xmlns="http://www.w3.org/2000/svg">',
+        '<style>.x { background: url("./must-not-be-followed.png"); }</style>',
+        '</svg>',
+        '',
+      ].join('\n'),
+      'must-not-be-followed.png': 'binary-placeholder\n',
+    })
+    try {
+      const result = runMjs(['style.css'], dir)
+      expect(result.errors).toEqual([])
+      const reachable = result.surfaces.fixture.reachable_files
+      expect(reachable).toContain('icon.svg')
+      expect(reachable).not.toContain('must-not-be-followed.png')
+      const unknown = result.surfaces.fixture.unknown_impact as Array<{ file: string; kind: string; detail: string }>
+      expect(unknown.some((entry) => entry.detail.includes('must-not-be-followed.png'))).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
