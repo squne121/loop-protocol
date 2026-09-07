@@ -279,6 +279,17 @@ PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS = frozenset(
     }
 )
 
+# Issue #2200 In Scope: the new artifact-confinement/bounded-cleanup/
+# generation-invalidation semantics apply ONLY to the 4 production preflight
+# profiles, never to the 2 contract_update mutation profiles (those keep
+# ONLY the pre-existing PR #2520/#2533 inner-transaction-result-preservation
+# contract, unmodified by this Issue). Computed as a set difference from the
+# two frozensets above so this can never silently drift from either one.
+ARTIFACT_CONFINEMENT_COMMAND_IDS = (
+    PRODUCTION_DEDICATED_WORKTREE_COMMAND_IDS - CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS
+)
+
+
 
 def _tracked_dirty_content_digests(project_root: str, status_stdout_z: str) -> dict[str, str]:
     """SHA-256 content digest of every TRACKED path `status_stdout_z`
@@ -1241,6 +1252,363 @@ def _validate_stdout_artifact_projection(
     return failures
 
 
+# ---------------------------------------------------------------------------
+# Issue #2200: artifact confinement bounds + bounded dedicated-artifact
+# cleanup, layered on top of the existing #2199/#2393 producer/consumer
+# transport (`_validate_stdout_artifact_projection()` above, and the FD-based
+# secure reader `run_refinement_preflight.secure_read_repair_apply_artifact()`
+# on the consumer side -- neither of those is redesigned by this Issue).
+#
+# Scope: applies ONLY to `ARTIFACT_CONFINEMENT_COMMAND_IDS` (the 4 production
+# preflight profiles). The 2 contract_update mutation profiles keep ONLY
+# their existing PR #2520/#2533 inner-transaction-result-preservation
+# contract, untouched by any function below.
+# ---------------------------------------------------------------------------
+
+# Fixed, non-caller-configurable bounds (Issue #2200 AC4). No new registry
+# field, no environment-variable override -- a single literal ceiling shared
+# by every production preflight profile's confinement check.
+ARTIFACT_CONFINEMENT_MAX_FILE_BYTES = 4 * 1024 * 1024
+ARTIFACT_CONFINEMENT_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+ARTIFACT_CONFINEMENT_MAX_COUNT = 16
+
+# PR #2557 review fix-delta (P2-4): a fixed, non-caller-configurable
+# directory-scan budget for `_bounded_cleanup_stale_artifact_leftovers()`'s
+# `os.scandir()` enumeration -- bounds the SCAN itself (not just the
+# post-filter candidate count already capped by `ARTIFACT_CONFINEMENT_MAX_COUNT`
+# above), so an allowed artifact root containing an unbounded number of
+# non-matching entries can never make the scan itself unbounded cost.
+_LEFTOVER_SCRATCH_DIRECTORY_SCAN_BUDGET = 64
+
+# Fixed reason codes (Issue #2200 In Scope). Never a free-form string --
+# every caller of `_emit_artifact_confinement_failure()` /
+# `_bounded_cleanup_stale_artifact_leftovers()` passes one of exactly these.
+ARTIFACT_CONFINEMENT_REASON_CLEANUP_FAILED = "cleanup_failed"
+ARTIFACT_CONFINEMENT_REASON_ARTIFACT_ESCAPE = "artifact_escape"
+ARTIFACT_CONFINEMENT_REASON_ARTIFACT_OVERSIZED = "artifact_oversized"
+ARTIFACT_CONFINEMENT_REASON_STALE_ARTIFACT = "stale_artifact"
+
+# `_atomic_write_json()`/`_atomic_write_text()` in `run_refinement_preflight.py`
+# both use this exact `tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+# dir=path.parent)` naming shape for their crash-safe rename-into-place
+# writes, and already `finally: temporary.unlink()` it on every normal
+# completion (success or exception) -- a survivor of that pattern can only
+# mean the writing process was killed between `mkstemp()` and that `finally`
+# (e.g. the Issue #2075 supervisor's SIGKILL escalation on a hung child).
+# This is therefore the ONLY filename shape bounded cleanup ever considers;
+# it never does a generic "delete anything old" sweep.
+_LEFTOVER_SCRATCH_TEMP_PATTERN = re.compile(r"^\.[^/]+\.tmp$")
+
+
+def _no_follow_path_components(root_real: str, candidate_unresolved_abs: str) -> bool:
+    """True iff every path component from `root_real` down to
+    `candidate_unresolved_abs` (inclusive of the final component) is
+    confirmed to NOT be a symlink via `Path.is_symlink()` on each
+    intermediate prefix.
+
+    This is a component-wise walk over the UNRESOLVED candidate path
+    (Issue #2200 AC4) -- deliberately never `os.path.realpath()`'d before
+    this check runs. `realpath()` silently follows through every
+    intermediate symlink and returns an already-resolved string with no
+    symlink component left to detect; checking components AFTER that
+    resolution would make this check a tautology (a fully-resolved path's
+    own components are never symlinks by construction). The caller must
+    pass the path exactly as it names the artifact on disk, only
+    normalized (not resolved) and joined with `project_root` if relative.
+    """
+    try:
+        rel = os.path.relpath(os.path.normpath(candidate_unresolved_abs), root_real)
+    except ValueError:
+        return False
+    if rel == os.curdir or rel.startswith(os.pardir):
+        return False
+    current = Path(root_real)
+    for part in Path(rel).parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    return True
+
+
+def _open_confined_regular_fd(candidate_path: str, project_root: str) -> "tuple[int, int] | None":
+    """Open `candidate_path` read-only for confinement validation (Issue
+    #2200 AC4). Returns `(fd, size)` or `None` on ANY confinement
+    violation (the fd is always closed before returning `None`).
+
+    Order of checks, all against the SAME opened fd (never a separate
+    `stat()`/`lstat()` call on the path string, which would be a TOCTOU
+    race against the fd this function hands back for reading):
+
+    1. component-wise no-follow walk from `project_root`, over the
+       UNRESOLVED candidate path (never a pre-computed `realpath()`)
+    2. `os.open(..., O_NOFOLLOW)` on that SAME unresolved leaf (rejects a
+       leaf that is itself a symlink, independent of #1 -- POSIX
+       `O_NOFOLLOW` only ever guards the trailing path component)
+    3. `os.fstat(fd)` confirms `S_ISREG` on the OPENED fd -- never a
+       directory, FIFO, device, or socket masquerading as a result file
+    """
+    root_real = os.path.realpath(project_root)
+    candidate_abs = candidate_path if os.path.isabs(candidate_path) else str(Path(project_root) / candidate_path)
+    if not _no_follow_path_components(root_real, candidate_abs):
+        return None
+    try:
+        # `O_NONBLOCK` is load-bearing here, not merely defensive: opening a
+        # FIFO `O_RDONLY` WITHOUT it blocks the caller until some writer
+        # opens the same path, which would turn a non-regular-file rejection
+        # into an indefinite hang instead of a fast, fail-closed
+        # `artifact_escape`. It has no effect on an ordinary regular file
+        # (the actual, expected case) -- reads proceed normally below.
+        fd = os.open(candidate_abs, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        file_stat = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        return None
+    if not stat.S_ISREG(file_stat.st_mode):
+        os.close(fd)
+        return None
+    return fd, file_stat.st_size
+
+
+def _read_bounded_fd(fd: int, max_bytes: int) -> "bytes | None":
+    """Read at most `max_bytes` from `fd`. Returns `None` (never a
+    silently-truncated partial read) if the content exceeds `max_bytes`."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+# Issue #2200 PR #2557 review fix-delta (P1-1): the EXACT literal
+# `run_refinement_preflight.py`'s canonical result producer emits as its
+# own `schema_version` field (that script's `SCHEMA_VERSION_RESULT`
+# constant). Only an artifact that self-declares THIS EXACT value gets the
+# strengthened provenance checks below; any other/absent `schema_version`
+# keeps the pre-existing issue_number-only "legitimate omission" behavior
+# byte-identical to before this fix_delta.
+_CANONICAL_PREFLIGHT_RESULT_SCHEMA_VERSION = "refinement_preflight_result/v1"
+
+
+def _strip_sha256_prefix(value: object) -> "str | None":
+    """Normalize a `sha256:<hex>` or bare-`<hex>` digest string to its bare
+    lowercase hex form. Mirrors `run_refinement_preflight.py`'s own
+    `_repair_apply_strip_sha_prefix()` (duplicated rather than
+    cross-imported -- this module never imports a skill script)."""
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith("sha256:"):
+        value = value[len("sha256:") :]
+    return value.lower()
+
+
+def _artifact_owner_field_mismatch(
+    payload: bytes, issue_number: str, repo: "str | None", project_root: str
+) -> bool:
+    """Issue #2200 AC4 freshness/ownership check: when the artifact's own
+    JSON body declares a top-level `issue_number` field, it must match the
+    dispatch's `issue_number`. A parse failure, a non-dict payload, or the
+    field's outright absence is a LEGITIMATE OMISSION (never a
+    mismatch) -- this function only ever returns True for a field that IS
+    present and DOES disagree, never for content this validator cannot
+    read as declaring ownership at all (Issue #2200 AC4: "JSON内の任意文字列や
+    `must_read` を生成artifactと誤分類しない" -- this reads exactly one fixed,
+    already-schema'd field, never a generic string scan).
+
+    PR #2557 review fix-delta (P1-1): when `repo` (the dispatch's own
+    known repo slug) is supplied and the artifact ALSO declares a top-level
+    `repo` field, that field is checked the same way as `issue_number`
+    above. When the artifact additionally self-declares the canonical
+    `schema_version` (`_CANONICAL_PREFLIGHT_RESULT_SCHEMA_VERSION`), this
+    also reads the SAME already-schema'd `repair_action.preflight_run_identity`
+    field as an additional freshness signal (a canonical-schema artifact
+    that omits it can never be trusted as fresh), and -- when a
+    `repair_action.candidate_body_artifact` sidecar is present alongside
+    its own `repaired_body_sha256` -- verifies that sidecar's digest
+    through the SAME no-follow-opened, same-fd-fstat-confirmed
+    regular-file reader `_validate_artifact_confinement_bounds()` already
+    uses for the artifact itself (never a new open helper, never a generic
+    string scan, never a new registry/lease/timestamp protocol). Any
+    `schema_version` other than the exact canonical value -- including its
+    absence -- skips all of this and stays byte-identical to the
+    pre-existing issue_number-only check."""
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    candidate_issue = parsed.get("issue_number")
+    if candidate_issue is not None and str(candidate_issue) != str(issue_number):
+        return True
+    if repo is not None:
+        candidate_repo = parsed.get("repo")
+        if candidate_repo is not None and str(candidate_repo) != str(repo):
+            return True
+    if parsed.get("schema_version") != _CANONICAL_PREFLIGHT_RESULT_SCHEMA_VERSION:
+        return False
+    repair_action = parsed.get("repair_action")
+    if not isinstance(repair_action, dict):
+        return False
+    if repair_action.get("preflight_run_identity") is None:
+        return True
+    candidate_body_artifact = repair_action.get("candidate_body_artifact")
+    expected_digest = _strip_sha256_prefix(repair_action.get("repaired_body_sha256"))
+    if not candidate_body_artifact or not expected_digest:
+        return False
+    candidate_path = (
+        candidate_body_artifact
+        if os.path.isabs(candidate_body_artifact)
+        else str(Path(project_root) / candidate_body_artifact)
+    )
+    opened = _open_confined_regular_fd(candidate_path, project_root)
+    if opened is None:
+        return True
+    fd, size = opened
+    try:
+        if size > ARTIFACT_CONFINEMENT_MAX_FILE_BYTES:
+            return True
+        body_bytes = _read_bounded_fd(fd, ARTIFACT_CONFINEMENT_MAX_FILE_BYTES)
+    finally:
+        os.close(fd)
+    if body_bytes is None:
+        return True
+    return hashlib.sha256(body_bytes).hexdigest() != expected_digest
+
+
+def _validate_artifact_confinement_bounds(
+    project_root: str, issue_number: str, artifact_paths: list[str], repo: "str | None" = None
+) -> "tuple[str | None, list[str]]":
+    """Issue #2200 AC4: confinement bounds for the compact stdout artifact
+    projection, layered strictly ON TOP of `_validate_stdout_artifact_projection()`'s
+    existing allowed-root check (this function assumes every path it is
+    given has ALREADY passed that check -- it never re-derives or widens
+    the allowed-root membership decision itself).
+
+    Returns `(reason_code, offending_paths)`; `reason_code` is `None` when
+    every artifact is within bounds (including the trivial case of zero
+    artifacts -- a command whose status/execution path legitimately
+    produces none is never treated as a missing-artifact error here).
+    Never re-serializes/re-encodes any artifact -- only a bounded read
+    through the no-follow-opened, same-fd-fstat-confirmed regular-file
+    descriptor above.
+    """
+    if len(artifact_paths) > ARTIFACT_CONFINEMENT_MAX_COUNT:
+        return ARTIFACT_CONFINEMENT_REASON_ARTIFACT_OVERSIZED, list(artifact_paths)
+    total_bytes = 0
+    for raw_path in artifact_paths:
+        # Deliberately NOT `os.path.realpath()`'d here -- `_open_confined_regular_fd()`
+        # itself needs the UNRESOLVED path (see its own docstring) to detect
+        # a symlink at any component. Only join with `project_root` when
+        # `raw_path` is relative; never resolve.
+        opened = _open_confined_regular_fd(raw_path, project_root)
+        if opened is None:
+            return ARTIFACT_CONFINEMENT_REASON_ARTIFACT_ESCAPE, [raw_path]
+        fd, size = opened
+        try:
+            if size > ARTIFACT_CONFINEMENT_MAX_FILE_BYTES:
+                return ARTIFACT_CONFINEMENT_REASON_ARTIFACT_OVERSIZED, [raw_path]
+            total_bytes += size
+            if total_bytes > ARTIFACT_CONFINEMENT_MAX_TOTAL_BYTES:
+                return ARTIFACT_CONFINEMENT_REASON_ARTIFACT_OVERSIZED, [raw_path]
+            payload = _read_bounded_fd(fd, ARTIFACT_CONFINEMENT_MAX_FILE_BYTES)
+        finally:
+            os.close(fd)
+        if payload is None:
+            return ARTIFACT_CONFINEMENT_REASON_ARTIFACT_OVERSIZED, [raw_path]
+        if _artifact_owner_field_mismatch(payload, issue_number, repo, project_root):
+            return ARTIFACT_CONFINEMENT_REASON_STALE_ARTIFACT, [raw_path]
+    return None, []
+
+
+def _bounded_cleanup_stale_artifact_leftovers(
+    dispatch_root: str, issue_number: str, command_id: str, not_before_mtime: float
+) -> "tuple[bool, str | None, list[str]]":
+    """Issue #2200 In Scope category 1 (unpublished temporary files /
+    failed-run leftovers): best-effort, strictly-bounded removal of exactly
+    the `_atomic_write_json()`/`_atomic_write_text()` `mkstemp()` scratch
+    naming shape (`_LEFTOVER_SCRATCH_TEMP_PATTERN`) sitting DIRECTLY inside
+    this command_id/issue_number's own already-verified allowed artifact
+    root(s) (never a nested-subdirectory walk, never any other filename
+    shape).
+
+    A candidate is eligible for removal only when its own `lstat().st_mtime`
+    is STRICTLY BEFORE `not_before_mtime` (the caller's own before-dispatch
+    snapshot time) -- this dispatch's own still-running child can never have
+    its own in-flight scratch file removed out from under it. Never touches
+    the published `refinement_preflight_result_v1.json` (or any other
+    non-`.tmp`-suffixed) artifact.
+
+    Returns `(ok, reason_code, removed_paths)`. `reason_code` is one of
+    `cleanup_failed`/`artifact_escape`/`artifact_oversized` on failure
+    (`ok is False`), `None` on success (removing nothing, including a
+    not-yet-existing artifact root, is a trivial success).
+
+    PR #2557 review fix-delta (P2-4): the directory is enumerated via a
+    streaming `os.scandir()` bounded by `_LEFTOVER_SCRATCH_DIRECTORY_SCAN_BUDGET`
+    (a fixed, non-caller-configurable scan-cost ceiling, separate from
+    `ARTIFACT_CONFINEMENT_MAX_COUNT`'s post-filter candidate-count cap
+    below) -- never a full `list(root.iterdir())` materialization first.
+    Exceeding the scan budget before the directory is fully enumerated
+    fails closed exactly like an oversized candidate count."""
+    removed: list[str] = []
+    for root in _allowed_artifact_roots(dispatch_root, issue_number, command_id):
+        if root.is_symlink() or not root.is_dir():
+            continue
+        candidates: list[Path] = []
+        scanned = 0
+        scan_budget_exceeded = False
+        try:
+            with os.scandir(root) as directory_iterator:
+                for entry in directory_iterator:
+                    scanned += 1
+                    if scanned > _LEFTOVER_SCRATCH_DIRECTORY_SCAN_BUDGET:
+                        scan_budget_exceeded = True
+                        break
+                    if _LEFTOVER_SCRATCH_TEMP_PATTERN.match(entry.name):
+                        candidates.append(Path(entry.path))
+        except OSError:
+            return False, ARTIFACT_CONFINEMENT_REASON_CLEANUP_FAILED, removed
+        if scan_budget_exceeded or len(candidates) > ARTIFACT_CONFINEMENT_MAX_COUNT:
+            return False, ARTIFACT_CONFINEMENT_REASON_ARTIFACT_OVERSIZED, removed
+        for entry in candidates:
+            if entry.is_symlink():
+                return False, ARTIFACT_CONFINEMENT_REASON_ARTIFACT_ESCAPE, removed
+            try:
+                entry_stat = entry.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(entry_stat.st_mode):
+                return False, ARTIFACT_CONFINEMENT_REASON_ARTIFACT_ESCAPE, removed
+            if entry_stat.st_mtime >= not_before_mtime:
+                continue
+            try:
+                entry.unlink()
+            except OSError:
+                return False, ARTIFACT_CONFINEMENT_REASON_CLEANUP_FAILED, removed
+            removed.append(str(entry))
+    return True, None, removed
+
+
+def _emit_artifact_confinement_failure(issue_number: int, reason_code: str, offending_paths: list[str]) -> int:
+    print(
+        "SKILL_RUNTIME_FAIL: "
+        f"reason_code={reason_code} target_issue={issue_number} "
+        f"artifact_path={','.join(offending_paths)} "
+        "recovery=treat_as_stale_artifact_and_defer_to_fresh_preflight",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _emit_stale_runtime_failure(issue_number: int, stale_entries: list[tuple[str, str]]) -> int:
     print(
         "SKILL_RUNTIME_FAIL: "
@@ -1774,6 +2142,7 @@ def _dispatch_child_and_check_postconditions(
     env: dict[str, str],
     timeout_seconds: object,
     binary_output: bool,
+    repo: "str | None" = None,
 ) -> int:
     """Dispatch the child at ``dispatch_root`` and run the existing
     before/after post-child checks against that SAME root (Issue #2199
@@ -1815,6 +2184,12 @@ def _dispatch_child_and_check_postconditions(
     )
     before_snapshot = _snapshot_repo_paths(dispatch_root, str(issue_number), command_id)
     before_status = _git_status_paths(dispatch_root)
+    # Issue #2200: wall-clock mark for the bounded-cleanup mtime guard below
+    # (`_bounded_cleanup_stale_artifact_leftovers()`'s `not_before_mtime`) --
+    # captured at the same point as the other before-snapshots, strictly
+    # before the child ever runs, so a scratch file THIS span's own child
+    # creates can never be misidentified as a pre-existing leftover.
+    before_dispatch_wall_time = time.time()
 
     supervision = _run_child_with_supervision(
         child_argv,
@@ -1872,6 +2247,29 @@ def _dispatch_child_and_check_postconditions(
                 dispatch_root, issue_number, command_id, before_result_stat
             ),
         )
+
+    # Issue #2200 AC1/AC4/AC5: confinement bounds + bounded stale-leftover
+    # cleanup, layered strictly ON TOP of the existing allowed-root check
+    # above, and strictly BEFORE stdout is ever published below (preserving
+    # the existing "検証 → 公開" ordering this Issue must not break). Scoped
+    # to the 4 production preflight profiles only -- a byte-identical no-op
+    # for the 2 contract_update mutation profiles and every other
+    # command_id, which keep their existing, unmodified behavior.
+    if command_id in ARTIFACT_CONFINEMENT_COMMAND_IDS:
+        confinement_reason, confinement_paths = _validate_artifact_confinement_bounds(
+            dispatch_root,
+            str(issue_number),
+            _parse_artifact_projection(stdout_for_artifact_projection),
+            repo=repo,
+        )
+        if confinement_reason is not None:
+            return _emit_artifact_confinement_failure(issue_number, confinement_reason, confinement_paths)
+
+        cleanup_ok, cleanup_reason, _removed = _bounded_cleanup_stale_artifact_leftovers(
+            dispatch_root, str(issue_number), command_id, before_dispatch_wall_time
+        )
+        if not cleanup_ok:
+            return _emit_artifact_confinement_failure(issue_number, cleanup_reason or "cleanup_failed", [])
 
     if isinstance(result.stdout, bytes):
         sys.stdout.buffer.write(result.stdout)
@@ -2662,6 +3060,7 @@ def main(argv: list[str] | None = None) -> int:
             env=env,
             timeout_seconds=timeout_seconds,
             binary_output=binary_output,
+            repo=args.repo,
         )
 
     # Issue #2199/#2393: the 4 production preflight profiles plus the 2
@@ -2750,6 +3149,7 @@ def main(argv: list[str] | None = None) -> int:
                 env=dedicated_env,
                 timeout_seconds=timeout_seconds,
                 binary_output=binary_output,
+                repo=args.repo,
             )
     except BaseException as exc:  # noqa: BLE001 -- re-raised below unless the primary-checkout guard below fires
         raised_exc = exc
