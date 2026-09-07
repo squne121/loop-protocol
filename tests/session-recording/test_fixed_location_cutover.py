@@ -780,6 +780,13 @@ def test_readiness_producer_parent_dir_toctou_hardening(tmp_path: Path) -> None:
     result = _run_bootstrap_readiness(readiness_path)
     assert result.returncode != 0
     assert "parent_is_symlink" in result.stderr
+    # Issue #2028 AC5: the original errno and the failed syscall
+    # (mkdirSync/openSync) must reach the CLI-visible output of the SAME
+    # production call path main()/writeReadinessAtomic() use (not just the
+    # `--test-invoke-prepare-private-parent-dir` test seam) -- confirming
+    # the diagnostic info is not special-cased to the test seam only.
+    assert "errno=ENOTDIR" in result.stderr
+    assert "syscall=openSync" in result.stderr
     assert not readiness_path.exists()
     assert stat.S_IMODE(os.stat(real_target).st_mode) == 0o755  # untouched
 
@@ -792,6 +799,177 @@ def test_readiness_producer_parent_dir_toctou_hardening(tmp_path: Path) -> None:
     result = _run_bootstrap_readiness(loose_readiness_path)
     assert result.returncode == 0, result.stderr
     assert stat.S_IMODE(os.stat(loose_parent).st_mode) == 0o700
+
+
+# ---------------------------------------------------------------------------
+# Issue #2028: preparePrivateParentDir() must diagnose BOTH mkdirSync() and
+# openSync() failures, must never assert an unconfirmed ELOOP as a trailing
+# symlink, and must surface the original errno + failed syscall through the
+# `--test-invoke-prepare-private-parent-dir` CLI seam.
+# ---------------------------------------------------------------------------
+
+
+def _run_node_prepare_private_parent_dir_seam(dir_path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["node", str(BOOTSTRAP_SCRIPT), "--test-invoke-prepare-private-parent-dir", str(dir_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+        cwd=str(REPO_ROOT),
+        timeout=_FIFO_WATCHDOG_TIMEOUT_SECONDS,
+    )
+
+
+def test_js_mkdir_prefix_symlink_loop_not_misclassified_as_trailing_symlink(tmp_path: Path) -> None:
+    """AC1: a circular symlink chain in the path PREFIX (never the trailing
+    component itself) makes the not-yet-existing target fail at mkdirSync()
+    with ELOOP. Because the target itself is not a symlink, the auxiliary
+    lstatSync() diagnostic cannot confirm one either (it must resolve the
+    very same broken prefix and fails too) -- so this must be rejected as
+    the generic `parent_unavailable`, NEVER asserted as `parent_is_symlink`.
+    The original errno (ELOOP) and failed syscall (mkdirSync) must still be
+    visible on stdout.
+    """
+    base = tmp_path / "prefix-loop-base"
+    base.mkdir()
+    loop_a = base / "loop_a"
+    loop_b = base / "loop_b"
+    os.symlink(loop_b, loop_a)
+    os.symlink(loop_a, loop_b)
+    target = loop_a / "not-yet-created-child"
+
+    result = _run_node_prepare_private_parent_dir_seam(target)
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout.strip()
+    assert stdout.startswith("REJECTED:parent_unavailable"), stdout
+    assert "parent_is_symlink" not in stdout, stdout
+    assert "errno=ELOOP" in stdout, stdout
+    assert "syscall=mkdirSync" in stdout, stdout
+
+
+# A chain strictly longer than the common OS symlink-traversal limit
+# (Linux's MAXSYMLINKS is 40); resolving `link_{_NONCIRCULAR_SYMLINK_CHAIN_DEPTH - 1}`
+# therefore always fails with ELOOP even though the chain never revisits a
+# link (unlike the circular loop_a/loop_b fixture used for AC1 above).
+_NONCIRCULAR_SYMLINK_CHAIN_DEPTH = 42
+
+
+def test_js_noncircular_symlink_traversal_limit_eloop_not_misclassified_as_trailing_symlink(
+    tmp_path: Path,
+) -> None:
+    """AC2: a long but strictly non-circular symlink chain (`link_0` ->
+    `real_dir`, `link_1` -> `link_0`, ..., `link_41` -> `link_40`) exceeds
+    the OS symlink-traversal limit and fails at mkdirSync() with ELOOP, even
+    though no link in the chain points back at an earlier one (unlike AC1's
+    circular loop_a/loop_b fixture). The trailing path component itself
+    (`not-yet-created-child`) is not a symlink at all, so the auxiliary
+    lstatSync() diagnostic cannot confirm one either (it must resolve the
+    very same over-long, ELOOP-failing chain to even reach it) -- this must
+    be rejected as the generic `parent_unavailable`, NEVER asserted as
+    `parent_is_symlink`, exactly like the circular-chain case.
+    """
+    base = tmp_path / "noncircular-traversal-limit-base"
+    base.mkdir()
+    real_dir = base / "real_dir"
+    real_dir.mkdir()
+
+    previous = real_dir
+    for i in range(_NONCIRCULAR_SYMLINK_CHAIN_DEPTH):
+        link = base / f"link_{i}"
+        os.symlink(previous, link)
+        previous = link
+    deepest_link = previous
+    target = deepest_link / "not-yet-created-child"
+
+    result = _run_node_prepare_private_parent_dir_seam(target)
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout.strip()
+    assert stdout.startswith("REJECTED:parent_unavailable"), stdout
+    assert "parent_is_symlink" not in stdout, stdout
+    assert "errno=ELOOP" in stdout, stdout
+    assert "syscall=mkdirSync" in stdout, stdout
+
+
+def test_js_mkdir_eloop_on_confirmed_trailing_symlink_still_reports_symlink(tmp_path: Path) -> None:
+    """AC3 (mkdirSync path): a self-referencing trailing symlink (the final
+    path component IS itself a symlink, here one pointing at itself) also
+    fails at mkdirSync() with ELOOP -- but here the auxiliary lstatSync()
+    diagnostic CAN confirm the target is a symlink (the dirent itself
+    exists, unlike the broken-prefix case above), so the existing
+    `parent_is_symlink` diagnosis/throw behavior must be preserved even
+    though the failure now originates from mkdirSync() rather than
+    openSync().
+    """
+    self_loop = tmp_path / "self-referencing-symlink"
+    os.symlink(self_loop, self_loop)
+
+    result = _run_node_prepare_private_parent_dir_seam(self_loop)
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout.strip()
+    assert stdout.startswith("REJECTED:parent_is_symlink"), stdout
+    assert "errno=ELOOP" in stdout, stdout
+    assert "syscall=mkdirSync" in stdout, stdout
+
+
+def test_js_mkdir_failure_is_diagnosed_instead_of_raw_uncaught_exception(tmp_path: Path) -> None:
+    """AC7 / Outcome: prior to Issue #2028, mkdirSync() failures were never
+    caught at the `preparePrivateParentDir()`/`classifyAndThrowParentDirFailure()`
+    level at all -- the `--test-invoke-prepare-private-parent-dir` CLI seam's
+    own outer try/catch already turned any such raw, undiagnosed exception
+    into exit 0 with `REJECTED:<raw fs error message>` (the seam was never
+    the part that was broken; it always exits 0 either way). What Issue
+    #2028 actually fixes is that a broken symlink PREFIX failing at
+    mkdirSync() now gets the SAME diagnosed `<reason> (errno=..., syscall=...,
+    path="...")` shape every other rejection in this file already has,
+    instead of a raw, undiagnosed fs error message with no stable reason
+    token and (pre-fix_delta) no retained failing path.
+
+    Issue #2028 fix_delta (PR #2549 review): the diagnostic message must
+    retain the actual failing filesystem path -- not just the reason/errno/
+    syscall -- so this is strengthened into a path-retention regression
+    test using the same prefix-symlink-loop fixture as AC1 above.
+    """
+    base = tmp_path / "mkdir-diagnosed-base"
+    base.mkdir()
+    loop_a = base / "loop_a"
+    loop_b = base / "loop_b"
+    os.symlink(loop_b, loop_a)
+    os.symlink(loop_a, loop_b)
+    target = loop_a / "child"
+
+    result = _run_node_prepare_private_parent_dir_seam(target)
+
+    assert result.returncode == 0, result.stderr
+    stdout = result.stdout.strip()
+    assert stdout.startswith("REJECTED:parent_unavailable"), (stdout, result.stderr)
+    assert "errno=ELOOP" in stdout, stdout
+    assert "syscall=mkdirSync" in stdout, stdout
+    assert str(target) in stdout, stdout
+
+
+def test_js_accept_semantics_unchanged_after_mkdir_diagnosis_added(tmp_path: Path) -> None:
+    """AC6 (non-regression): ordinary new-directory creation and acceptance
+    through a normal, non-symlinked ancestor directory must remain
+    unaffected by the new mkdirSync() error-handling path (which only
+    activates on an actual mkdirSync() failure).
+    """
+    new_dir_target = tmp_path / "brand-new-dir"
+    result = _run_node_prepare_private_parent_dir_seam(new_dir_target)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ACCEPTED", result.stdout
+    assert stat.S_IMODE(os.stat(new_dir_target).st_mode) == 0o700
+
+    ancestor_real = tmp_path / "real-ancestor"
+    ancestor_real.mkdir()
+    ancestor_link = tmp_path / "ancestor-link"
+    os.symlink(ancestor_real, ancestor_link)
+    via_ancestor_symlink_target = ancestor_link / "nested-new-dir"
+    result_ancestor = _run_node_prepare_private_parent_dir_seam(via_ancestor_symlink_target)
+    assert result_ancestor.returncode == 0, result_ancestor.stderr
+    assert result_ancestor.stdout.strip() == "ACCEPTED", result_ancestor.stdout
 
 
 def test_hermetic_default_path_producer_consumer_roundtrip(tmp_path: Path) -> None:
@@ -998,6 +1176,13 @@ def test_js_prepare_private_parent_dir_rejects_fifo_parent_without_blocking(tmp_
     reject a real FIFO parent directory with its normal fail-closed
     rejection within the external watchdog window, never blocking inside
     openSync().
+
+    Issue #2028 AC5: the exact-match assertion here was widened (never
+    weakened) to also require the original errno (ENOTDIR) and failed
+    syscall (openSync) now appended to the diagnostic reason -- the FIFO
+    case fails at openSync(), never mkdirSync() (mkdirSync() is skipped
+    entirely because the FIFO already exists at that path), so it must
+    always report `syscall=openSync`.
     """
     fifo_dir = tmp_path / "js-fifo-parent"
     os.mkfifo(fifo_dir)
@@ -1005,7 +1190,10 @@ def test_js_prepare_private_parent_dir_rejects_fifo_parent_without_blocking(tmp_
     result = _run_node_fifo_parent_dir_seam(fifo_dir)
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "REJECTED:parent_not_a_directory", (result.stdout, result.stderr)
+    stdout = result.stdout.strip()
+    assert stdout.startswith("REJECTED:parent_not_a_directory"), (stdout, result.stderr)
+    assert "errno=ENOTDIR" in stdout, (stdout, result.stderr)
+    assert "syscall=openSync" in stdout, (stdout, result.stderr)
 
 
 def test_python_prepare_private_parent_dir_rejects_fifo_parent_without_blocking(tmp_path: Path) -> None:
