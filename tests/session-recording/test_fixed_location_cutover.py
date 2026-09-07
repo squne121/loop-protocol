@@ -16,6 +16,7 @@ location:
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -970,6 +971,296 @@ def test_js_accept_semantics_unchanged_after_mkdir_diagnosis_added(tmp_path: Pat
     result_ancestor = _run_node_prepare_private_parent_dir_seam(via_ancestor_symlink_target)
     assert result_ancestor.returncode == 0, result_ancestor.stderr
     assert result_ancestor.stdout.strip() == "ACCEPTED", result_ancestor.stdout
+
+
+# ---------------------------------------------------------------------------
+# Issue #2547: check_session_recording_runtime_safety.py (Python side) must
+# be brought up to the same diagnostic standard as the Node readiness
+# producer's preparePrivateParentDir() (Issue #2028 / PR #2549, tested by
+# the test_js_* functions above): a common classifier
+# (`_classify_and_raise_parent_dir_failure()`) funnels BOTH mkdir() and
+# open() OSError failures through the same ELOOP/ENOTDIR reasoning, an
+# unconfirmed ELOOP is never asserted as `parent_is_symlink`, and
+# `PrivateParentDirError` carries additive errno/operation/path/chained-
+# cause diagnostic metadata. These are direct in-process (no subprocess)
+# regression tests -- the module is already imported as `srrs` above -- each
+# one exercises a REAL mkdir()/open() syscall failure against a REAL
+# filesystem fixture (never a static string/grep check, never a fabricated
+# OSError for the syscall-triggering step itself).
+# ---------------------------------------------------------------------------
+
+
+def test_python_mkdir_prefix_symlink_loop_not_misclassified_as_trailing_symlink(tmp_path: Path) -> None:
+    """AC1/AC2: a circular symlink chain in the path PREFIX (never the
+    trailing component itself) makes the not-yet-existing target fail at
+    mkdir() with ELOOP. Because the target itself is not a symlink, the
+    auxiliary `_diagnose_parent_is_symlink()` lstat cannot confirm one
+    either (it must resolve the very same broken prefix and fails too) --
+    so this must be classified as the generic `parent_unavailable`, NEVER
+    asserted as `parent_is_symlink`. errno/operation/path/chained-cause must
+    all be preserved on the raised `PrivateParentDirError`.
+    """
+    base = tmp_path / "py-prefix-loop-base"
+    base.mkdir()
+    loop_a = base / "loop_a"
+    loop_b = base / "loop_b"
+    os.symlink(loop_b, loop_a)
+    os.symlink(loop_a, loop_b)
+    target_parent = loop_a / "not-yet-created-child"
+    artifact_path = target_parent / "artifact.json"
+
+    with pytest.raises(srrs.PrivateParentDirError) as excinfo:
+        srrs.prepare_private_parent_dir(artifact_path)
+
+    err = excinfo.value
+    assert err.reason_code == "parent_unavailable"
+    assert err.errno_value == errno.ELOOP
+    assert err.operation == "mkdir"
+    assert err.path == str(target_parent)
+    assert isinstance(err.__cause__, OSError)
+    assert err.__cause__.errno == errno.ELOOP
+
+
+# A chain strictly longer than the common OS symlink-traversal limit
+# (Linux's MAXSYMLINKS is 40); resolving `link_{_NONCIRCULAR_SYMLINK_CHAIN_DEPTH - 1}`
+# therefore always fails with ELOOP even though the chain never revisits a
+# link (mirrors the JS-side `_NONCIRCULAR_SYMLINK_CHAIN_DEPTH` fixture
+# above).
+_PY_NONCIRCULAR_SYMLINK_CHAIN_DEPTH = 42
+
+
+def test_python_noncircular_symlink_traversal_limit_eloop_not_misclassified_as_trailing_symlink(
+    tmp_path: Path,
+) -> None:
+    """AC1/AC2: a long but strictly non-circular symlink chain (`link_0` ->
+    `real_dir`, `link_1` -> `link_0`, ..., `link_41` -> `link_40`) exceeds
+    the OS symlink-traversal limit and fails at mkdir() with ELOOP, even
+    though no link in the chain points back at an earlier one (unlike the
+    circular loop_a/loop_b fixture above). The trailing path component
+    itself (`not-yet-created-child`) is not a symlink at all, so this must
+    be classified as `parent_unavailable`, never `parent_is_symlink`,
+    exactly like the circular-chain case.
+    """
+    base = tmp_path / "py-noncircular-traversal-limit-base"
+    base.mkdir()
+    real_dir = base / "real_dir"
+    real_dir.mkdir()
+
+    previous = real_dir
+    for i in range(_PY_NONCIRCULAR_SYMLINK_CHAIN_DEPTH):
+        link = base / f"link_{i}"
+        os.symlink(previous, link)
+        previous = link
+    deepest_link = previous
+    target_parent = deepest_link / "not-yet-created-child"
+    artifact_path = target_parent / "artifact.json"
+
+    with pytest.raises(srrs.PrivateParentDirError) as excinfo:
+        srrs.prepare_private_parent_dir(artifact_path)
+
+    err = excinfo.value
+    assert err.reason_code == "parent_unavailable"
+    assert err.errno_value == errno.ELOOP
+    assert err.operation == "mkdir"
+    assert err.path == str(target_parent)
+    assert isinstance(err.__cause__, OSError)
+
+
+def test_python_classifier_eloop_on_confirmed_trailing_symlink_still_reports_symlink(tmp_path: Path) -> None:
+    """AC1/AC3: when the classifier's ELOOP branch IS able to confirm (via
+    `_diagnose_parent_is_symlink()`, a real lstat against a real symlink
+    fixture) that the failing path is itself a trailing symlink, the
+    existing `parent_is_symlink` diagnosis must be preserved.
+
+    Empirically (verified against the real syscall on this platform, unlike
+    Node's `mkdirSync(..., {recursive: true})` -- see the `test_js_*`
+    equivalent above), a bare POSIX `mkdir()` never itself reports ELOOP for
+    a trailing symlink: since the final path component already exists as a
+    dirent (the symlink itself), `mkdir()` fails with EEXIST instead,
+    without ever resolving it -- so `prepare_private_parent_dir()`'s
+    mkdir() call cannot be driven into this specific branch on this
+    platform. This test instead exercises the shared classifier directly
+    (the exact same function `prepare_private_parent_dir()`'s mkdir() path
+    and `_open_parent_dir_nofollow()`'s open() path both funnel through)
+    with a REAL `OSError` obtained from a REAL `os.open(path, O_RDONLY |
+    O_NOFOLLOW)` call (deliberately omitting `O_DIRECTORY`, which this
+    module's own `_open_parent_dir_nofollow()` docstring notes changes the
+    reported errno from ELOOP to ENOTDIR on this platform) against a REAL,
+    confirmed trailing symlink pointing at a real directory -- so the
+    triggering failure is a genuine, real filesystem syscall failure, never
+    a fabricated/synthetic exception.
+    """
+    real_dir = tmp_path / "py-eloop-confirmed-real-dir"
+    real_dir.mkdir()
+    trailing_symlink = tmp_path / "py-eloop-confirmed-trailing-symlink"
+    os.symlink(real_dir, trailing_symlink)
+    assert trailing_symlink.is_symlink()  # confirmed by a real lstat, same as the classifier uses
+
+    with pytest.raises(OSError) as real_os_error:
+        os.open(trailing_symlink, os.O_RDONLY | os.O_NOFOLLOW)
+    assert real_os_error.value.errno == errno.ELOOP
+
+    with pytest.raises(srrs.PrivateParentDirError) as excinfo:
+        srrs._classify_and_raise_parent_dir_failure(trailing_symlink, real_os_error.value, "open")
+
+    err = excinfo.value
+    assert err.reason_code == "parent_is_symlink"
+    assert err.errno_value == errno.ELOOP
+    assert err.operation == "open"
+    assert err.path == str(trailing_symlink)
+    assert err.__cause__ is real_os_error.value
+
+
+def test_python_mkdir_failure_preserves_errno_operation_path_and_cause(tmp_path: Path) -> None:
+    """AC2/AC3: an mkdir() failure that is neither ELOOP nor a confirmed
+    symlink (here: an ancestor path component is a REAL, ordinary regular
+    file rather than a directory, so mkdir() fails with ENOTDIR and
+    `_diagnose_parent_is_symlink()` correctly reports False -- the ancestor
+    genuinely is not a symlink) is still classified (`parent_not_a_directory`)
+    AND still carries the original errno, the failed operation (`"mkdir"`),
+    the failing path, and Python exception chaining back to the real
+    `OSError` -- never propagating uncaught, never silently dropping the
+    diagnostic metadata.
+    """
+    base = tmp_path / "py-mkdir-failure-metadata-base"
+    base.mkdir()
+    not_a_dir = base / "not_a_dir"
+    not_a_dir.write_text("this is a regular file, not a directory")
+    target_parent = not_a_dir / "child"
+    artifact_path = target_parent / "artifact.json"
+
+    with pytest.raises(srrs.PrivateParentDirError) as excinfo:
+        srrs.prepare_private_parent_dir(artifact_path)
+
+    err = excinfo.value
+    assert err.reason_code == "parent_not_a_directory"
+    assert err.errno_value == errno.ENOTDIR
+    assert err.operation == "mkdir"
+    assert err.path == str(target_parent)
+    assert isinstance(err.__cause__, OSError)
+    assert err.__cause__.errno == errno.ENOTDIR
+
+
+@pytest.mark.skipif(
+    os.getuid() == 0,
+    reason="permission-denial via chmod 0000 is not meaningful as root",
+)
+def test_python_eacces_from_exists_preflight_is_diagnosed_not_leaked(tmp_path: Path) -> None:
+    """P2 regression (PR #2560 review comment): on Python 3.12,
+    ``Path.exists()`` only swallows ``ENOENT``/``ENOTDIR``/``EBADF``/
+    ``ELOOP`` into ``False`` -- any OTHER ``OSError`` (e.g. ``EACCES``/
+    ``EPERM`` raised while trying to stat through a non-searchable ancestor
+    directory) propagates raw out of ``Path.exists()`` itself.
+    ``prepare_private_parent_dir()``'s original ``if not parent.exists():``
+    preflight ran BEFORE the mkdir() try/except that funnels into
+    ``_classify_and_raise_parent_dir_failure()``, so this raw ``OSError``
+    bypassed the classifier entirely and leaked out of the function
+    undiagnosed -- unlike every other mkdir()/open() failure in this
+    module, it carried no ``reason_code`` / ``errno_value`` / ``operation``
+    / ``path`` diagnostic metadata at all.
+
+    First confirms, against a REAL non-searchable (``chmod 0o000``)
+    ancestor directory -- same real-filesystem style as the ELOOP fixtures
+    above, never a fabricated/monkeypatched exception -- that
+    ``Path.exists()`` really does raise a raw ``OSError`` here, documenting
+    the root cause this regression test guards against. Then confirms the
+    fixed ``prepare_private_parent_dir()`` raises ``PrivateParentDirError``
+    (never a raw ``OSError``/``PermissionError``) through the SAME shared
+    classifier used by every other mkdir()/open() failure path in this
+    module, carrying the same diagnostic contract (``reason_code``/
+    ``errno_value``/``operation``/``path``/chained ``__cause__``).
+
+    Restores the ancestor directory's permissions in a ``finally`` block so
+    a failure here can never leave an inaccessible directory behind for
+    ``tmp_path``'s own cleanup (or any other test) to trip over.
+    """
+    base = tmp_path / "py-exists-preflight-eacces-base"
+    base.mkdir()
+    non_searchable_ancestor = base / "non_searchable_ancestor"
+    non_searchable_ancestor.mkdir()
+    target_parent = non_searchable_ancestor / "child"
+    artifact_path = target_parent / "artifact.json"
+
+    non_searchable_ancestor.chmod(0o000)
+    try:
+        # Root cause: Path.exists() itself raises a raw OSError (EACCES)
+        # here -- EACCES/EPERM are NOT among the errnos exists() swallows
+        # into False (ENOENT/ENOTDIR/EBADF/ELOOP only).
+        with pytest.raises(OSError) as real_exists_error:
+            target_parent.exists()
+        assert real_exists_error.value.errno in (errno.EACCES, errno.EPERM)
+
+        # Fixed behavior: the same underlying failure, reached through
+        # prepare_private_parent_dir(), is diagnosed through the shared
+        # classifier -- never leaked as a raw OSError/PermissionError, and
+        # never routed through a new operation="stat" value (still
+        # "mkdir", since it is mkdir()'s own OSError that is ultimately
+        # classified).
+        with pytest.raises(srrs.PrivateParentDirError) as excinfo:
+            srrs.prepare_private_parent_dir(artifact_path)
+
+        err = excinfo.value
+        assert err.reason_code == "parent_unavailable"
+        assert err.errno_value in (errno.EACCES, errno.EPERM)
+        assert err.operation == "mkdir"
+        assert err.path == str(target_parent)
+        assert isinstance(err.__cause__, OSError)
+        assert err.__cause__.errno == err.errno_value
+    finally:
+        non_searchable_ancestor.chmod(0o755)
+
+
+def test_python_open_parent_dir_nofollow_unconfirmed_eloop_reports_parent_unavailable(
+    tmp_path: Path,
+) -> None:
+    """AC1: `_open_parent_dir_nofollow()` exercised directly (never blocked
+    by `prepare_private_parent_dir()`'s mkdir() call, which is only reached
+    when the parent does not already exist) must ALSO never assert an
+    unconfirmed ELOOP as `parent_is_symlink`. Reuses the same circular
+    prefix-symlink-loop fixture as the mkdir-side regression above, but
+    drives the open()-side classification path directly, and separately
+    confirms the SAME diagnostic metadata (errno/operation/path/chained
+    cause) is preserved on this path too.
+    """
+    base = tmp_path / "py-open-side-prefix-loop-base"
+    base.mkdir()
+    loop_a = base / "loop_a"
+    loop_b = base / "loop_b"
+    os.symlink(loop_b, loop_a)
+    os.symlink(loop_a, loop_b)
+    target_parent = loop_a / "not-yet-created-child"
+
+    with pytest.raises(srrs.PrivateParentDirError) as excinfo:
+        srrs._open_parent_dir_nofollow(target_parent)
+
+    err = excinfo.value
+    assert err.reason_code == "parent_unavailable"
+    assert "parent_is_symlink" != err.reason_code
+    assert err.errno_value == errno.ELOOP
+    assert err.operation == "open"
+    assert err.path == str(target_parent)
+    assert isinstance(err.__cause__, OSError)
+    assert err.__cause__.errno == errno.ELOOP
+
+
+def test_python_accept_semantics_unchanged_after_mkdir_diagnosis_added(tmp_path: Path) -> None:
+    """AC5 (non-regression): ordinary new-directory creation/acceptance
+    through a normal, non-symlinked ancestor directory must remain
+    unaffected by the new mkdir()-side error-handling path (which only
+    activates on an actual mkdir() failure) -- mirrors the JS-side
+    `test_js_accept_semantics_unchanged_after_mkdir_diagnosis_added` above.
+    """
+    new_dir_target = tmp_path / "py-brand-new-dir" / "artifact.json"
+    srrs.prepare_private_parent_dir(new_dir_target)
+    assert stat.S_IMODE(os.stat(new_dir_target.parent).st_mode) == 0o700
+
+    ancestor_real = tmp_path / "py-real-ancestor"
+    ancestor_real.mkdir()
+    ancestor_link = tmp_path / "py-ancestor-link"
+    os.symlink(ancestor_real, ancestor_link)
+    via_ancestor_symlink_target = ancestor_link / "nested-new-dir" / "artifact.json"
+    srrs.prepare_private_parent_dir(via_ancestor_symlink_target)
+    assert stat.S_IMODE(os.stat(via_ancestor_symlink_target.parent).st_mode) == 0o700
 
 
 def test_hermetic_default_path_producer_consumer_roundtrip(tmp_path: Path) -> None:

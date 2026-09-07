@@ -48,7 +48,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 # ---------------------------------------------------------------------------
 # Exit codes
@@ -1380,17 +1380,46 @@ def resolve_session_recording_artifact_override(override: str, repo_root: Path) 
 
 class PrivateParentDirError(Exception):
     """Raised when a fixed private artifact's parent directory cannot be
-    safely prepared/trusted (Issue #2004 P1-1)."""
+    safely prepared/trusted (Issue #2004 P1-1).
 
-    def __init__(self, reason_code: str) -> None:
+    Issue #2547: additive diagnostic metadata is now attached alongside
+    ``reason_code`` (mirroring the Node readiness producer's
+    ``PrivateParentDirError`` -- Issue #2028 / PR #2549): the original
+    ``errno`` value (``errno_value``), the failed operation (``operation``,
+    ``"mkdir"`` or ``"open"``), and the failing ``path``. Python's own
+    exception chaining (``raise ... from exc``, surfaced as
+    ``self.__cause__``) already carries the original ``OSError`` for any
+    caller that wants it directly. These fields default to ``None`` for
+    call sites that do not originate from an ``OSError`` (e.g. the
+    post-``fstat`` ``parent_not_a_directory`` / ``parent_owner_mismatch``
+    checks below, which are not filesystem-call failures). The
+    ``reason_code`` set (``parent_is_symlink`` / ``parent_not_a_directory``
+    / ``parent_owner_mismatch`` / ``parent_unavailable``) and its meaning
+    are unchanged -- these fields are additive only.
+    """
+
+    def __init__(
+        self,
+        reason_code: str,
+        *,
+        errno_value: int | None = None,
+        operation: str | None = None,
+        path: str | None = None,
+    ) -> None:
         self.reason_code = reason_code
+        self.errno_value = errno_value
+        self.operation = operation
+        self.path = path
         super().__init__(reason_code)
 
 
 def _diagnose_parent_is_symlink(parent: Path) -> bool:
     """Non-blocking, non-authoritative diagnostic used ONLY to choose which
-    reason_code to attach to an open() call that has ALREADY failed and
-    ALREADY rejected the parent (Issue #2029).
+    reason_code to attach to an mkdir()/open() call that has ALREADY failed
+    and ALREADY rejected the parent (Issue #2029; shared by both the
+    mkdir()-side and open()-side classification paths via
+    ``_classify_and_raise_parent_dir_failure()`` since Issue #2547 -- never
+    ``open()``-only).
 
     ``Path.is_symlink()`` is an ``lstat()`` under the hood: it inspects the
     directory entry itself without ever opening or following the target,
@@ -1405,6 +1434,57 @@ def _diagnose_parent_is_symlink(parent: Path) -> bool:
         return parent.is_symlink()
     except OSError:
         return False
+
+
+def _classify_and_raise_parent_dir_failure(parent: Path, exc: OSError, operation: str) -> NoReturn:
+    """Classify an ``OSError`` raised by ``mkdir`` or ``open`` on ``parent``
+    into the appropriate ``PrivateParentDirError`` reason_code, and raise it
+    (never returns). Mirrors the Node readiness producer's
+    ``classifyAndThrowParentDirFailure()`` (Issue #2028 / PR #2549) so both
+    the ``mkdir``-side and ``open``-side failures in this module funnel
+    through a single classification rule -- never two independently
+    drifting copies of the same ELOOP/ENOTDIR reasoning (Issue #2547).
+
+    - ``ELOOP``: only ``parent_is_symlink`` when
+      ``_diagnose_parent_is_symlink()`` positively confirms ``parent`` is a
+      trailing symlink; otherwise (either ``parent`` genuinely is not one,
+      or the auxiliary ``lstat()`` itself could not tell -- e.g. it fails
+      trying to resolve the very same broken path prefix) the ELOOP is
+      downgraded to ``parent_unavailable``. An unconfirmed ELOOP must never
+      be asserted as a symlink loop that was never actually confirmed.
+    - ``ENOTDIR``: ``parent_is_symlink`` when confirmed by the same
+      diagnostic, otherwise ``parent_not_a_directory``.
+    - any other ``OSError``: ``parent_unavailable``.
+
+    ``errno``, ``operation`` (``"mkdir"`` or ``"open"``), and the failing
+    ``path`` (preferring ``exc.filename`` when the OS attached one, falling
+    back to ``str(parent)``) are always attached to the raised
+    ``PrivateParentDirError`` as additive diagnostic metadata, and Python's
+    own exception chaining (``raise ... from exc``) is always preserved --
+    this always raises, never swallows or downgrades to a bare
+    ``OSError``.
+    """
+    errno_value = getattr(exc, "errno", None)
+    failing_path = getattr(exc, "filename", None) or str(parent)
+    if errno_value == errno.ELOOP:
+        if _diagnose_parent_is_symlink(parent):
+            raise PrivateParentDirError(
+                "parent_is_symlink", errno_value=errno_value, operation=operation, path=failing_path
+            ) from exc
+        raise PrivateParentDirError(
+            "parent_unavailable", errno_value=errno_value, operation=operation, path=failing_path
+        ) from exc
+    if errno_value == errno.ENOTDIR:
+        if _diagnose_parent_is_symlink(parent):
+            raise PrivateParentDirError(
+                "parent_is_symlink", errno_value=errno_value, operation=operation, path=failing_path
+            ) from exc
+        raise PrivateParentDirError(
+            "parent_not_a_directory", errno_value=errno_value, operation=operation, path=failing_path
+        ) from exc
+    raise PrivateParentDirError(
+        "parent_unavailable", errno_value=errno_value, operation=operation, path=failing_path
+    ) from exc
 
 
 def _open_parent_dir_nofollow(parent: Path) -> int:
@@ -1452,14 +1532,10 @@ def _open_parent_dir_nofollow(parent: Path) -> int:
     try:
         return os.open(parent, flags)
     except OSError as exc:
-        errno_value = getattr(exc, "errno", None)
-        if errno_value == errno.ELOOP:
-            raise PrivateParentDirError("parent_is_symlink") from exc
-        if errno_value == errno.ENOTDIR:
-            if _diagnose_parent_is_symlink(parent):
-                raise PrivateParentDirError("parent_is_symlink") from exc
-            raise PrivateParentDirError("parent_not_a_directory") from exc
-        raise PrivateParentDirError("parent_unavailable") from exc
+        # Issue #2547: funnel through the shared classifier (also used by
+        # prepare_private_parent_dir()'s mkdir() failure path below) instead
+        # of duplicating the ELOOP/ENOTDIR reasoning here.
+        _classify_and_raise_parent_dir_failure(parent, exc, "open")
 
 
 def prepare_private_parent_dir(path: Path, *, expected_uid: int | None = None) -> None:
@@ -1493,8 +1569,37 @@ def prepare_private_parent_dir(path: Path, *, expected_uid: int | None = None) -
         expected_uid = os.getuid()
 
     parent = path.parent
-    if not parent.exists():
-        parent.mkdir(parents=True, mode=0o700)
+    try:
+        parent_confirmed_to_exist = parent.exists()
+    except OSError:
+        # Issue #2547 P2 (PR #2560 review): on Python 3.12, ``Path.exists()``
+        # only swallows ENOENT/ENOTDIR/EBADF/ELOOP into ``False`` -- any
+        # OTHER OSError (e.g. EACCES/EPERM from a non-searchable ancestor
+        # directory) propagates raw out of this preflight probe itself,
+        # BEFORE the mkdir() try/except below ever runs. Never leak that raw
+        # exception here: treat "the exists() probe itself failed" the same
+        # as "not confirmed to exist yet" and fall through to mkdir(), whose
+        # own OSError is what actually gets diagnosed below -- almost always
+        # the SAME underlying failure, since mkdir() must traverse the exact
+        # same ancestor path exists() just failed to traverse. This
+        # deliberately avoids introducing a new operation="stat" diagnostic
+        # value: the real, already-diagnosed failure is the one mkdir()
+        # itself raises.
+        parent_confirmed_to_exist = False
+
+    if not parent_confirmed_to_exist:
+        # Issue #2547: previously uncaught -- any mkdir() failure (e.g. a
+        # circular or long non-circular symlink chain in the path PREFIX
+        # failing with ELOOP) propagated as a raw, undiagnosed OSError. This
+        # now funnels through the same classifier _open_parent_dir_nofollow()
+        # already uses below, so a path-prefix ELOOP is diagnosed (and, when
+        # unconfirmed as a trailing symlink, NOT asserted as one) at the
+        # point it actually occurs, rather than only being caught later at
+        # open() (which, for an mkdir() failure, is never even reached).
+        try:
+            parent.mkdir(parents=True, mode=0o700)
+        except OSError as exc:
+            _classify_and_raise_parent_dir_failure(parent, exc, "mkdir")
 
     fd = _open_parent_dir_nofollow(parent)
     try:
