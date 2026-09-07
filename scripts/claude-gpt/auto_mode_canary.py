@@ -341,10 +341,7 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
         and helper_result_bound
     )
     permission_denied_observed = any(
-        event.get("type") == "system"
-        and event.get("subtype") == "permission_denied"
-        and event.get("tool_use_id") == canonical_id
-        for event in events
+        event.get("type") == "system" and event.get("subtype") == "permission_denied" for event in events
     ) or "deny" in permission_decision_behaviors
     bound_marker = helper_result_bound and any(
         index > max(bound_result_indices)

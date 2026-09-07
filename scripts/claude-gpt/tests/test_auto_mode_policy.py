@@ -941,6 +941,19 @@ def test_issue_editor_permission_canary_accepts_observed_no_decision_after_auto_
     assert evidence["permission_denied_observed"] is False
 
 
+def test_issue_editor_permission_canary_treats_unbound_permission_denied_as_failure_evidence():
+    stdout = json.dumps(
+        {
+            "type": "system",
+            "subtype": "permission_denied",
+            "tool_name": "Bash",
+        }
+    )
+
+    evidence = canary._stream_json_issue_editor_permission_evidence(stdout)
+    assert evidence["permission_denied_observed"] is True
+
+
 def test_issue_editor_permission_canary_rejects_direct_parent_bash_even_with_hook_allow():
     parent_tool_use_id = "toolu_parent_issue_editor"
     tool_use_id = "toolu_direct_parent_bash"
