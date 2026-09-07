@@ -607,7 +607,27 @@ def _run_publication_receipt(args: argparse.Namespace) -> int:
     return 0
 
 
+# PR #2559 review fix_delta (item E): the two real CLI subcommands -- kept
+# as the single source of truth for the legacy-invocation shim in main()
+# below (never a second, possibly-drifted literal list).
+KNOWN_SUBCOMMANDS = ("build", "publication-receipt")
+
+
 def main(argv: list[str] | None = None) -> int:
+    # PR #2559 review fix_delta (item E): legacy flat-invocation
+    # compatibility shim. Before Issue #2555 added the `publication-receipt`
+    # subcommand, this CLI took `--performance-receipt ... --output-dir ...`
+    # directly (no subcommand) -- some existing callers still invoke it that
+    # way. If the first token is not a known subcommand (covers both a
+    # missing/empty argv and an argv whose first token is an option like
+    # `--performance-receipt`), transparently prepend `build` so the
+    # existing `argparse` subparsers below still parse it. This NEVER
+    # changes `_run_build()` / `_run_publication_receipt()`'s own logic --
+    # only which subcommand argv is routed to when none was given.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] not in KNOWN_SUBCOMMANDS:
+        argv = ["build", *argv]
+
     parser = argparse.ArgumentParser(
         description=(
             "Issue #2486: build a standalone-verifiable close-evidence bundle "
@@ -615,7 +635,9 @@ def main(argv: list[str] | None = None) -> int:
             "reliability close-grade receipt, only when both are close-grade "
             "eligible. Issue #2555 adds a second `publication-receipt` "
             "subcommand that wires actions/upload-artifact outputs into the "
-            "existing build_publication_receipt() function."
+            "existing build_publication_receipt() function. PR #2559 review "
+            "fix_delta: a legacy flat invocation (no subcommand) is "
+            "transparently routed to `build` for backward compatibility."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
