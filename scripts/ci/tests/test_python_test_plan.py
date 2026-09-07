@@ -284,6 +284,20 @@ def test_real_plan_serial_lane_has_debounce():
         # so it joins the same python-test-core deselect + node-backed-hook-tests
         # execution precedent as the 8 nodeids above.
         "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_js_prepare_private_parent_dir_rejects_fifo_parent_without_blocking",
+        # Issue #2028: mkdirSync()/openSync() parent-directory failure
+        # diagnosis regressions -- all 5 use the same
+        # `--test-invoke-prepare-private-parent-dir` real `node` child
+        # process seam as the FIFO nodeid above, so they join the same
+        # python-test-core deselect + node-backed-hook-tests precedent.
+        # (fix_delta iteration 2, PR #2549 review issuecomment-5560509393:
+        # the AC2 non-circular symlink-traversal-limit nodeid added in
+        # iteration 1 was missing from this golden list and is registered
+        # here alongside the other 4.)
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_prefix_symlink_loop_not_misclassified_as_trailing_symlink",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_js_noncircular_symlink_traversal_limit_eloop_not_misclassified_as_trailing_symlink",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_eloop_on_confirmed_trailing_symlink_still_reports_symlink",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_js_mkdir_failure_is_diagnosed_instead_of_raw_uncaught_exception",
+        "--deselect=tests/session-recording/test_fixed_location_cutover.py::test_js_accept_semantics_unchanged_after_mkdir_diagnosis_added",
     ]
     par = mod.run_argv(plan, mode="parallel")
     assert not any(a.startswith("--ignore=") and "session_manifest_debounce" in a for a in par)
