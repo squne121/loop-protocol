@@ -16,19 +16,28 @@
 ## 既知の drift（Issue #2019 で確認・記録のみ）
 
 2026-08-08 時点の live 確認で、本書の記述（5 required checks: `typecheck`/`lint`/`test`/`build`/
-`python-test`）と実際の設定に以下の drift があることが判明した。本 Issue はこの drift を
-**記述の更新のみ**で解消する（live API mutation は行わない。ruleset/branch protection の実 API
-mutation は別途 post-merge ops step で扱う）。
+`python-test`）と実際の設定に以下の drift があることが判明した。以下は live 確認時点の記録であり、
+本更新は GitHub 側の実際の設定変更（API mutation）を一切行わない。**Classic branch protection と
+Ruleset 間の 6 件 vs 5 件の乖離自体はこの更新では解消せず、記録のまま残す。**本更新が解消するのは、
+下記 `visual-impact-policy` に関する記述の陳腐化（かつて post-merge ops として予定していた
+hard-required 登録が現在の必須作業から外れたこと）のみである。
 
 - **Classic branch protection**（`/branches/main/protection`）の `required_status_checks.contexts` は
   実際には **6 件**（`typecheck`/`lint`/`test`/`build`/`python-test`/`validate-generated-artifact`）で、
   本書の記述（5 件、`validate-generated-artifact` 欠落）と乖離している。
 - **Ruleset**（id `16796903`）の `required_status_checks` は本書の記述通り **5 件**
   （`validate-generated-artifact` を含まない）であり、両層間でも drift がある。
-- `visual-impact-policy`（本 Issue で追加した新規 required check）は、両層のどちらにもまだ
-  registered されていない。required 化・GitHub Actions source pin・`require_code_owner_reviews`
-  有効化は、本 Issue の実装 PR には含めず、マージ後の明示 ops step として別途実行する
-  （Issue #2019 In Scope G）。
+- `visual-impact-policy`（本 Issue で追加した新規 required check）は、以前は post-merge ops として
+  GitHub configuration 上の hard-required 登録を予定していたが、Issue #2019 の現行 contract
+  （2026-09-06 第五 reframe、OWNER anchor comment issuecomment-5560250669 由来）でこの予定は
+  現在の必須作業から外れた。
+  `visual-impact-policy` は repository workflow policy 上（merge-ready 判定）では引き続き required
+  として扱う。一方で GitHub configuration 上の hard-required 登録・当該 check の source pin・
+  `require_code_owner_reviews` 有効化は、いずれも現在の完了条件ではない。これらは、外部
+  contributor の受け入れや unattended auto-merge の導入等が実際に決定された場合に、別 Issue で
+  再検討する reconsideration trigger として位置づける。ただし trigger の発生自体は、上記三設定を
+  自動的・一括で必須化する決定を意味しない。旧 In Scope G（Issue #2019）は現在の Issue #2019
+  本文には存在しない、撤回済みの過去 snapshot としてのみ言及する。
 
 ## 採用構成（多層防御）
 
