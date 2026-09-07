@@ -25,12 +25,15 @@ publication receipt の生成/投稿は `#2155` の scope。
 ### producer（生成コマンド）
 
 ```bash
-uv run --locked python3 scripts/ci/build_close_evidence_bundle_v1.py \
+uv run --locked python3 scripts/ci/build_close_evidence_bundle_v1.py build \
   --performance-receipt <path to CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 file> \
   --reliability-receipt <path to CI_RELIABILITY_CLOSE_GRADE_RESULT_V1 file> \
   --experiment-manifest <path to e2e_performance_benchmark_manifest_v2 file> \
   --output-dir close-evidence
 ```
+
+`build` サブコマンド（Issue #2555 で追加。producer/validator の中核ロジック自体は
+変更していない、CLI のサブコマンド化のみ）。
 
 両 receipt が close-grade eligible（下記「Close-grade success condition」参照）である
 場合のみ `close-evidence/` を生成する。いずれかが不合格の場合は non-zero exit で
@@ -193,7 +196,67 @@ fix_delta: 先に `normalize_run_ids()` で集合化してから比較してい�
 | `github_artifact_digest` | GitHub Actions artifact digest |
 | `artifact_url` | artifact の URL |
 
-実際の値の記入・投稿は `#2155` の scope。
+実際の値の記入・投稿は `#2555` の scope（`publication-receipt` サブコマンド、下記）。
+
+## 手動 workflow_dispatch 配線（`close-evidence-publication` job、Issue #2555）
+
+`.github/workflows/ci.yml` に `workflow_dispatch` トリガーの手動 opt-in job
+`close-evidence-publication` が追加されている。operator は
+`close_evidence_source_artifact_id`（`reliability-assessment` job が upload した
+`ci-reliability-close-grade-result-*` artifact の GitHub Actions artifact ID）
+1 個のみを指定して dispatch する。空値の場合、job-level `if:` gate
+（`github.event.inputs.close_evidence_source_artifact_id != ''`）により
+job 自体が起動しない（push/pull_request イベントでも同様に起動しない）。
+
+job は次の順に実行する:
+
+1. `close_evidence_source_artifact_id` で指定された artifact を
+   `gh api repos/${{ github.repository }}/actions/artifacts/{id}` /
+   `.../zip` でダウンロードし、`reliability-assessment-input/manifest.json` /
+   `reliability-assessment-input/receipt.json` /
+   `reliability-assessment-output/ci_reliability_close_grade_result_v1.json`
+   を固定パスから取得する。
+2. `build_close_evidence_bundle_v1.py build` を実行し `close-evidence/` を生成する。
+3. `validate_close_evidence_bundle_v1.py` を実行し PASS した場合のみ後続へ進む。
+4. `close-evidence/` ディレクトリ全体を `actions/upload-artifact@v7`
+   （`if-no-files-found: error`）で artifact 名 `close-evidence-bundle-v1`
+   として upload する（artifact A）。
+5. artifact A の upload step の action outputs（`artifact-id` / `artifact-url` /
+   `artifact-digest`）を **値を加工せず verbatim** で
+   `scripts/ci/build_close_evidence_bundle_v1.py publication-receipt` へ渡し、
+   `build_publication_receipt()` を呼び出して
+   `close-evidence-publication-receipt-v1.json` を生成する。
+
+   ```bash
+   uv run --locked python3 scripts/ci/build_close_evidence_bundle_v1.py publication-receipt \
+     --close-evidence-json close-evidence/close_evidence.json \
+     --github-artifact-id <artifact A upload outputs.artifact-id> \
+     --github-artifact-digest <artifact A upload outputs.artifact-digest> \
+     --artifact-url <artifact A upload outputs.artifact-url> \
+     --output close-evidence-publication-receipt-v1.json
+   ```
+
+6. 生成した `close-evidence-publication-receipt-v1.json` を artifact A とは
+   別の artifact 名 `close-evidence-publication-receipt-v1` として
+   `actions/upload-artifact@v7`（`if-no-files-found: error`）で upload する
+   （artifact B）。
+
+job-level `permissions` は `contents: read` に加え `actions: read`
+（cross-run Reliability artifact readback 用途に限定。write 権限・OIDC・
+attestation・署名・外部 credential は追加しない）。
+
+### AC8 動作検証（bounded smoke run）
+
+`scripts/ci/dispatch_close_evidence_publication_smoke_v1.py`
+（`scripts/ci/tests/test_dispatch_close_evidence_publication_smoke_v1.py`
+経由で `uv run pytest` から起動）が、既存の実在する Reliability close-grade
+artifact ID を自動解決した上で `close-evidence-publication` job を実際に
+`workflow_dispatch` し、run 完了を poll し、conclusion が success であること、
+artifact A/B の両方が生成されたことを検証する。`GH_TOKEN`/`GITHUB_TOKEN` に
+`actions: read` scope が無い場合、または smoke に使用可能な既存 Reliability
+artifact ID をリポジトリ内から解決できない場合（または現在の worktree の
+HEAD が origin へ push 済みでない場合）は SKIP（pytest.skip()、exit 相当 77）
+を返す。SKIP は PASS の代替ではない。
 
 ## 失敗時の書き込み順序（PR #2528 review fix_delta）
 
@@ -206,7 +269,9 @@ producer は、run ID の `int()` 変換を含む全ての解析・正規化を 
 ## Out of Scope（本 Issue では扱わない）
 
 - `#2423`/`#2424` の統計計算・cohort materialization・eligibility ロジック自体の変更。
-- `#2155` の実 CI dispatch・実 run readback・publication receipt の実際の生成/投稿・
-  AC6/AC7 の close 判断自体。
+- `#2155` の AC6/AC7 close 判断自体（本 bundle・publication receipt を証跡として
+  参照するのみで、close 可否の判定ロジックは `#2155` の scope）。
+- 44-run 本番実験の実行そのもの、自動トリガー（push/PR 時の自動実行）化
+  （`#2555` は手動 opt-in `workflow_dispatch` route の追加のみ）。
 - monolith の `missing_pair_e2e-responsive-matrix` performance 適格性問題の修正
   （`#2422`/`#2423` owner scope）。
