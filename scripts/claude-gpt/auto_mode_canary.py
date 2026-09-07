@@ -236,17 +236,21 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
     same child Bash request. Raw runtime output is inspected only in memory.
     """
     events: list[dict] = []
+    malformed_permission_denied_observed = False
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
         except ValueError:
+            # A malformed structured denial cannot be safely distinguished from
+            # an omitted tool result, so retain no raw line and fail closed.
+            malformed_permission_denied_observed |= "permission_denied" in line.casefold()
             continue
         if isinstance(event, dict):
             events.append(event)
 
     parent_records = [
-        node
-        for event in events
+        (index, node)
+        for index, event in enumerate(events)
         for node in _walk_json_dicts(event)
         if node.get("type") == "tool_use"
         and node.get("name") == "Agent"
@@ -254,7 +258,7 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
         and isinstance(node.get("input"), dict)
         and node["input"].get("subagent_type") == "issue-editor"
     ]
-    parent_ids = {node["id"] for node in parent_records}
+    parent_ids = {node["id"] for _, node in parent_records}
     parent_issue_editor_delegation_observed = len(parent_records) == len(parent_ids) == 1
 
     all_bash_records = [
@@ -276,10 +280,14 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
     if canonical_bash_observed:
         canonical_index, canonical_node, canonical_parent_tool_use_id = canonical_records[0]
         canonical_id = canonical_node["id"]
+    parent_index = parent_records[0][0] if parent_issue_editor_delegation_observed else None
     child_lineage_bound = (
         canonical_bash_observed
         and parent_issue_editor_delegation_observed
         and canonical_parent_tool_use_id in parent_ids
+        and parent_index is not None
+        and canonical_index is not None
+        and parent_index < canonical_index
     )
 
     bound_result_indices = {
@@ -296,6 +304,9 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
         )
     }
     helper_result_bound = bool(bound_result_indices)
+    canonical_bash_result_bound = (
+        helper_result_bound and canonical_index is not None and canonical_index < min(bound_result_indices)
+    )
 
     permission_hook_events_observed = any(
         event.get("type") == "system" and isinstance(event.get("hook_event"), str) for event in events
@@ -327,7 +338,7 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
         and permission_decision_behaviors == {"allow"}
         and canonical_index is not None
         and min(permission_request_response_indices) > canonical_index
-        and helper_result_bound
+        and canonical_bash_result_bound
         and min(permission_request_response_indices) < min(bound_result_indices)
     )
     # When the Auto classifier authorizes the one canonical Bash without
@@ -338,12 +349,12 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
         permission_hook_events_observed
         and not permission_request_started_indices
         and not permission_request_response_indices
-        and helper_result_bound
+        and canonical_bash_result_bound
     )
-    permission_denied_observed = any(
+    permission_denied_observed = malformed_permission_denied_observed or any(
         event.get("type") == "system" and event.get("subtype") == "permission_denied" for event in events
     ) or "deny" in permission_decision_behaviors
-    bound_marker = helper_result_bound and any(
+    bound_marker = canonical_bash_result_bound and any(
         index > max(bound_result_indices)
         and _stream_json_has_terminal_marker(event, ISSUE_EDITOR_PERMISSION_CANARY_MARKER)
         for index, event in enumerate(events)
@@ -352,11 +363,11 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
         "parent_issue_editor_delegation_observed": parent_issue_editor_delegation_observed,
         "child_lineage_bound": child_lineage_bound,
         "canonical_bash_observed": canonical_bash_observed,
-        "canonical_bash_result_bound": helper_result_bound,
+        "canonical_bash_result_bound": canonical_bash_result_bound,
         "permission_allow_observed": permission_allow_observed,
         "permission_no_decision_observed": permission_no_decision_observed,
         "permission_denied_observed": permission_denied_observed,
-        "helper_entrypoint_observed": helper_result_bound,
+        "helper_entrypoint_observed": canonical_bash_result_bound,
         "marker_observed": bound_marker,
     }
 

@@ -936,22 +936,105 @@ def test_issue_editor_permission_canary_accepts_observed_no_decision_after_auto_
     )
 
     evidence = canary._stream_json_issue_editor_permission_evidence(stdout)
+    assert evidence["parent_issue_editor_delegation_observed"] is True
+    assert evidence["child_lineage_bound"] is True
+    assert evidence["canonical_bash_observed"] is True
+    assert evidence["canonical_bash_result_bound"] is True
     assert evidence["permission_allow_observed"] is False
     assert evidence["permission_no_decision_observed"] is True
     assert evidence["permission_denied_observed"] is False
+    assert evidence["helper_entrypoint_observed"] is True
+    assert evidence["marker_observed"] is True
+
+
+def test_issue_editor_permission_canary_rejects_out_of_order_lineage_and_helper_result():
+    """Causal witness must be parent Agent -> child Bash -> helper result."""
+    parent_tool_use_id = "toolu_parent_issue_editor"
+    tool_use_id = "toolu_canonical_bash"
+    helper_result = {
+        "schema": "ISSUE_EDIT_TXN_RESULT_V1",
+        "status": "failed_no_mutation",
+        "mutation_started": False,
+    }
+    parent = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": parent_tool_use_id,
+                        "name": "Agent",
+                        "input": {"subagent_type": "issue-editor"},
+                    }
+                ]
+            },
+        }
+    )
+    child = json.dumps(
+        {
+            "type": "assistant",
+            "parent_tool_use_id": parent_tool_use_id,
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "Bash",
+                        "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND},
+                    }
+                ]
+            },
+        }
+    )
+    helper = json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": json.dumps(helper_result),
+                    }
+                ]
+            },
+        }
+    )
+    marker = json.dumps({"type": "result", "result": canary.ISSUE_EDITOR_PERMISSION_CANARY_MARKER})
+
+    helper_before_bash = canary._stream_json_issue_editor_permission_evidence(
+        "\n".join((parent, helper, child, marker))
+    )
+    assert helper_before_bash["child_lineage_bound"] is True
+    assert helper_before_bash["canonical_bash_result_bound"] is False
+    assert helper_before_bash["permission_no_decision_observed"] is False
+    assert helper_before_bash["helper_entrypoint_observed"] is False
+    assert helper_before_bash["marker_observed"] is False
+
+    parent_after_child = canary._stream_json_issue_editor_permission_evidence(
+        "\n".join((child, parent, helper, marker))
+    )
+    assert parent_after_child["child_lineage_bound"] is False
+    assert parent_after_child["canonical_bash_result_bound"] is True
+    assert parent_after_child["permission_no_decision_observed"] is False
+    assert parent_after_child["helper_entrypoint_observed"] is True
+    assert parent_after_child["marker_observed"] is True
 
 
 def test_issue_editor_permission_canary_treats_unbound_permission_denied_as_failure_evidence():
-    stdout = json.dumps(
+    valid_denial = json.dumps(
         {
             "type": "system",
             "subtype": "permission_denied",
             "tool_name": "Bash",
         }
     )
+    malformed_denial = '{"type":"system","subtype":"permission_denied"'
 
-    evidence = canary._stream_json_issue_editor_permission_evidence(stdout)
-    assert evidence["permission_denied_observed"] is True
+    for stdout in (valid_denial, malformed_denial):
+        evidence = canary._stream_json_issue_editor_permission_evidence(stdout)
+        assert evidence["permission_denied_observed"] is True
 
 
 def test_issue_editor_permission_canary_rejects_direct_parent_bash_even_with_hook_allow():
