@@ -672,7 +672,8 @@ def test_component_vrt_provenance_uses_strict_attempt_and_exact_checkrun(workflo
     verify = next(step for step in steps if step.get("id") == "verify")
 
     assert trusted["env"]["RUN_ID"] == "${{ github.event.workflow_run.id }}"
-    assert trusted["env"]["RUN_ATTEMPT"] == "${{ github.event.workflow_run.run_attempt }}"
+    assert trusted["env"]["PRODUCER_ATTEMPT"] == "${{ steps.download.outputs.producer_attempt }}"
+    assert "${{ github.event.workflow_run.run_attempt }}" not in trusted["run"]
     assert "--mode acquire-component-vrt-checkrun" in trusted["run"]
     assert '--run-id "${EXPECTED_RUN_ID}"' in trusted["run"]
     assert '--run-attempt "${EXPECTED_RUN_ATTEMPT}"' in trusted["run"]
@@ -682,7 +683,7 @@ def test_component_vrt_provenance_uses_strict_attempt_and_exact_checkrun(workflo
     assert "set -euo pipefail" in trusted["run"]
 
     assert verify["env"]["EXPECTED_WORKFLOW_RUN_ID"] == "${{ github.event.workflow_run.id }}"
-    assert verify["env"]["EXPECTED_WORKFLOW_RUN_ATTEMPT"] == "${{ github.event.workflow_run.run_attempt }}"
+    assert verify["env"]["EXPECTED_WORKFLOW_RUN_ATTEMPT"] == "${{ steps.download.outputs.producer_attempt }}"
     for argument in (
         "--expected-workflow-run-id",
         "--expected-workflow-run-attempt",
@@ -692,6 +693,17 @@ def test_component_vrt_provenance_uses_strict_attempt_and_exact_checkrun(workflo
     ):
         assert argument in verify["run"]
 
+
+
+def test_download_resolves_pair_and_never_reuses_overall_run_attempt(download_step: dict):
+    """A failed-job rerun must authenticate/download the selected producer
+    attempt, not the trigger's later overall attempt."""
+    run = download_step["run"]
+    assert "--mode acquire-trusted-artifact-pair" in run
+    assert "--producer-attempt-output-file" in run
+    assert "producer_attempt=${SELECTED_PRODUCER_ATTEMPT}" in run
+    assert "visual-impact-decision-v1-${RUN_ATTEMPT}" not in run
+    assert "component-vrt-evidence-manifest-${RUN_ATTEMPT}" not in run
 
 
 # --- PR #2229 review fix_delta P1-3: end-to-end CLI runtime evidence -----
@@ -1685,10 +1697,17 @@ def test_download_step_aggregation_rejects_on_retrieve_process_crash_without_sta
         "    return argv[argv.index(name) + 1] if name in argv else None\n"
         "script = next((a for a in argv if a.endswith('.py')), '')\n"
         "if script.endswith('resolve_visual_impact.py'):\n"
-        "    out_file = get_opt('--artifact-id-output-file')\n"
-        "    if out_file:\n"
-        "        with open(out_file, 'w') as fh:\n"
-        "            fh.write('1')\n"
+        "    outputs = (\n"
+        "        ('--producer-attempt-output-file', '1'),\n"
+        "        ('--decision-artifact-id-output-file', '1'),\n"
+        "        ('--evidence-artifact-id-output-file', '2'),\n"
+        "        ('--artifact-id-output-file', '1'),\n"
+        "    )\n"
+        "    for option, value in outputs:\n"
+        "        out_file = get_opt(option)\n"
+        "        if out_file:\n"
+        "            with open(out_file, 'w') as fh:\n"
+        "                fh.write(value)\n"
         "    sys.exit(0)\n"
         "if 'zip_bounded_extract' in script or script.endswith('.py') and 'zip_bounded_extract' in ' '.join(argv):\n"
         "    label = get_opt('--label')\n"
@@ -1755,10 +1774,17 @@ def test_download_step_aggregation_passes_when_all_retrieves_succeed(download_st
         "    return argv[argv.index(name) + 1] if name in argv else None\n"
         "script = next((a for a in argv if a.endswith('.py')), '')\n"
         "if script.endswith('resolve_visual_impact.py'):\n"
-        "    out_file = get_opt('--artifact-id-output-file')\n"
-        "    if out_file:\n"
-        "        with open(out_file, 'w') as fh:\n"
-        "            fh.write('1')\n"
+        "    outputs = (\n"
+        "        ('--producer-attempt-output-file', '1'),\n"
+        "        ('--decision-artifact-id-output-file', '1'),\n"
+        "        ('--evidence-artifact-id-output-file', '2'),\n"
+        "        ('--artifact-id-output-file', '1'),\n"
+        "    )\n"
+        "    for option, value in outputs:\n"
+        "        out_file = get_opt(option)\n"
+        "        if out_file:\n"
+        "            with open(out_file, 'w') as fh:\n"
+        "                fh.write(value)\n"
         "    sys.exit(0)\n"
         "label = get_opt('--label')\n"
         "status_file = get_opt('--status-output-file')\n"

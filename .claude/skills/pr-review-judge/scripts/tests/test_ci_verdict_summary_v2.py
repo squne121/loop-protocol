@@ -451,6 +451,38 @@ class TestTrustedConsumerExcludedClassification:
 
 
 # ---------------------------------------------------------------------------
+# Issue #2433 PR #2561: ordinary pull_request-only intentional skip
+# ---------------------------------------------------------------------------
+
+
+class TestCloseEvidencePublicationExcludedClassification:
+    def test_ordinary_pr_skip_is_excluded_without_relaxing_other_checks(self, v2):
+        checks = _all_other_required_checks_passing()
+        checks.append(
+            make_check(
+                "close-evidence-publication",
+                workflow="ci",
+                status="completed",
+                conclusion="skipped",
+            )
+        )
+        artifact = build(v2, checks)
+        entry = next(check for check in artifact["checks"] if check["name"] == "close-evidence-publication")
+        assert entry["classification"] == "excluded"
+        assert entry["blocking_merge_ready"] is False
+        assert artifact["overall_status"] == "merge_ready", artifact
+
+    def test_unknown_skipped_ci_job_remains_fail_closed(self, v2):
+        checks = _all_other_required_checks_passing()
+        checks.append(make_check("unrelated-dispatch-only-job", workflow="ci", conclusion="skipped"))
+        artifact = build(v2, checks)
+        entry = next(check for check in artifact["checks"] if check["name"] == "unrelated-dispatch-only-job")
+        assert entry["classification"] == "unknown"
+        assert entry["failure_reason"] == "gh_error"
+        assert artifact["overall_status"] == "gh_error", artifact
+
+
+# ---------------------------------------------------------------------------
 # AC12: neutral/skipped are NOT required evidence pass
 # ---------------------------------------------------------------------------
 

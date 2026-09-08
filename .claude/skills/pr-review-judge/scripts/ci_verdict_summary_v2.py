@@ -89,6 +89,11 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     # blocking (gh_error). Classified "excluded" (not "evidence"/"required")
     # because this job's pass/fail must never affect merge-ready.
     ("ci", "reliability-assessment"): "excluded",
+    # Issue #2433 PR #2561 merge-readiness repair: this job is gated on a
+    # workflow_dispatch-only input and is therefore intentionally skipped on
+    # ordinary pull_request runs.  It is not required evidence; unknown jobs
+    # remain fail-closed below.
+    ("ci", "close-evidence-publication"): "excluded",
     # Issue #2524: visual-impact-policy-trusted-consumer is a SEPARATE
     # `workflow_run`-triggered advisory re-verification of the producer's
     # `visual-impact-policy` (`ci`, above) decision -- confirmed on current
