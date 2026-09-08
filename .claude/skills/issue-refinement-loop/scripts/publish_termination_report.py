@@ -100,6 +100,7 @@ _HUMAN_HISTORY_MARKER_RE = __import__("re").compile(
 )
 _HUMAN_HISTORY_ISSUE_REF_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
 _HUMAN_HISTORY_PR_REF_RE = __import__("re").compile(r"^refs/pull/([1-9][0-9]*)/head@([0-9a-f]{40})$")
+_HUMAN_HISTORY_HEAD_SHA_RE = __import__("re").compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
 _SECRET_OR_UNSAFE_RE = __import__("re").compile(
     r"(?:gh[porsu]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|authorization:\s*bearer|(?:^|\s)/[^\s]+)",
     __import__("re").I,
@@ -131,7 +132,9 @@ def _validate_human_history_identity(identity: object) -> tuple[dict | None, str
     valid = {
         ("issue-refinement-loop", "review-complete", "issue"): {"completed", "needs_fix", "human_judgment"},
         ("impl-review-loop", "pre-PR-binding", "issue"): {"completed", "needs_fix", "human_judgment"},
-        ("impl-review-loop", "binding-validation", "issue"): {"binding_missing", "binding_ambiguous", "binding_wrong_repo", "binding_gone"},
+        (
+            "impl-review-loop", "binding-validation", "issue"
+        ): {"binding_missing", "binding_ambiguous", "binding_wrong_repo", "binding_gone"},
         ("impl-review-loop", "post-PR-binding", "pull_request"): {"completed", "needs_fix", "human_judgment"},
         ("impl-review-loop", "post-PR-head-drift", "pull_request"): {"head_drift"},
         ("impl-review-loop", "conflict-resolution", "issue"): {"human_escalation"},
@@ -186,10 +189,20 @@ def render_human_history_comment(
         assert clean is not None
         evidence.append(clean)
     stale_line = ""
+    is_head_drift = value["phase"] == "post-PR-head-drift"
+    if is_head_drift and stale_evidence is None:
+        return None, "human_history_head_drift_stale_evidence_missing"
     if stale_evidence is not None:
         clean, text_error = _validate_public_safe_human_text(stale_evidence, "stale_evidence")
         if text_error:
             return None, text_error
+        # The controlled executor makes the authoritative direct PR-head read
+        # immediately before its create/PATCH/noop decision.  Require exactly
+        # one public-safe latest-head value here so a diagnostic can be
+        # reconciled under its existing stable identity rather than using an
+        # unbound prose-only stale transition.
+        if is_head_drift and len(_HUMAN_HISTORY_HEAD_SHA_RE.findall(clean)) != 1:
+            return None, "human_history_head_drift_stale_evidence_head_invalid"
         stale_line = f"\n- stale evidence: {clean}"
     identity_sha256 = hashlib.sha256(_human_history_jcs(value)).hexdigest()
     marker = f"{_HUMAN_HISTORY_MARKER_PREFIX}{identity_sha256} -->"

@@ -54,7 +54,12 @@ def test_versioned_marker_jcs_identity_json_types_and_reason_enum_known_values()
     assert rendered["marker"] == f"<!-- loop-protocol/human-history:v1:sha256:{digest} -->"
     assert "\n" + rendered["marker"] + "\n" in rendered["body"]
 
-    for field, bad in (("source_issue_number", "1908"), ("target_number", True), ("reviewed_ref", "sha256:" + "a" * 64)):
+    invalid_fields = (
+        ("source_issue_number", "1908"),
+        ("target_number", True),
+        ("reviewed_ref", "sha256:" + "a" * 64),
+    )
+    for field, bad in invalid_fields:
         invalid = _issue_identity()
         invalid[field] = bad
         assert publisher._validate_human_history_identity(invalid)[0] is None

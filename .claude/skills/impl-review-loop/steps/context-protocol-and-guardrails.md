@@ -37,6 +37,13 @@ latest head で同じ diagnostic identity を再reconcileする。accepted noop 
 head を再読し、latest diagnostic の readback/noop reconciliation 成功後にだけ latest head を re-review
 する。
 
+controlled executor が `status: stale_head` または `applied_but_head_drift` と
+`head_drift.route` を返した場合、Step 5 は成功として終了してはならない。
+`reconcile_head_drift_then_rereview` は current_head_sha で既存 `head_drift` identity の
+reconciliation を開始し、`reconcile_same_head_drift_identity_then_rereview` は stale evidence だけを
+latest current_head_sha に更新して同じ identity を再reconcileする。後者の successful readback または
+valid noop reconciliation を確認してから、その latest head にだけ Step 4 re-review を enqueue する。
+
 `conflict_hard_stop` は history event ではない。同一 iteration で resolve/revalidate 後にも連続する
 conflict だけが `conflict-resolution` / `human_escalation` を emit する。
 

@@ -15,7 +15,8 @@ _ROOT = Path(__file__).resolve().parents[4]
 _IMPLEMENTATION_PR = 2578
 _REPO = "squne121/loop-protocol"
 _spec = importlib.util.spec_from_file_location(
-    "human_history_live", _ROOT / ".claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
+    "human_history_live",
+    _ROOT / ".claude/skills/issue-refinement-loop/scripts/publish_termination_report.py",
 )
 publisher = importlib.util.module_from_spec(_spec)
 assert _spec and _spec.loader
@@ -41,7 +42,8 @@ def test_opt_in_confirmed_draft_pr_create_patch_noop_and_readback():
         _skip_77("runtime-verification opt-in is absent")
     if os.environ.get("LOOP_RUNTIME_TARGET_PR") != str(_IMPLEMENTATION_PR):
         _skip_77("exact implementation Draft PR binding is absent")
-    allowlist = {item.strip() for item in os.environ.get("LOOP_RUNTIME_TARGET_ALLOWLIST", "").split(",") if item.strip()}
+    allowlist_raw = os.environ.get("LOOP_RUNTIME_TARGET_ALLOWLIST", "")
+    allowlist = {item.strip() for item in allowlist_raw.split(",") if item.strip()}
     if str(_IMPLEMENTATION_PR) not in allowlist:
         _skip_77("implementation Draft PR is not in the explicit allowlist")
     writer_serial = os.environ.get("LOOP_RUNTIME_WRITER_SERIAL", "")
@@ -49,59 +51,119 @@ def test_opt_in_confirmed_draft_pr_create_patch_noop_and_readback():
         _skip_77("writer serial is absent or invalid")
 
     probe = subprocess.run(
-        ["gh", "pr", "view", str(_IMPLEMENTATION_PR), "--repo", _REPO, "--json", "number,isDraft,headRefOid,url"],
-        text=True, capture_output=True, check=False, timeout=30,
+        [
+            "gh", "pr", "view", str(_IMPLEMENTATION_PR), "--repo", _REPO,
+            "--json", "number,isDraft,headRefOid,url",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
     )
     if probe.returncode != 0:
         _skip_77("authenticated gh PR preflight failed")
     pr = json.loads(probe.stdout)
-    if pr.get("number") != _IMPLEMENTATION_PR or pr.get("isDraft") is not True or not isinstance(pr.get("headRefOid"), str):
+    target_matches = (
+        pr.get("number") == _IMPLEMENTATION_PR
+        and pr.get("isDraft") is True
+        and isinstance(pr.get("headRefOid"), str)
+    )
+    if not target_matches:
         _skip_77("exact target is not a confirmed Draft PR")
 
     identity = {
-        "loop_kind": "impl-review-loop", "phase": "post-PR-binding",
-        "source_issue_number": 1908, "target_kind": "pull_request", "target_number": _IMPLEMENTATION_PR,
-        "route_or_termination_reason": "needs_fix", "reviewed_ref": f"refs/pull/{_IMPLEMENTATION_PR}/head@{pr['headRefOid']}",
+        "loop_kind": "impl-review-loop",
+        "phase": "post-PR-binding",
+        "source_issue_number": 1908,
+        "target_kind": "pull_request",
+        "target_number": _IMPLEMENTATION_PR,
+        "route_or_termination_reason": "needs_fix",
+        "reviewed_ref": f"refs/pull/{_IMPLEMENTATION_PR}/head@{pr['headRefOid']}",
     }
-    events: list[dict] = [{"preflight": {"pr_url": pr["url"], "head": pr["headRefOid"], "writer_serial": writer_serial}}]
+    events: list[dict] = [
+        {
+            "preflight": {
+                "pr_url": pr["url"],
+                "head": pr["headRefOid"],
+                "writer_serial": writer_serial,
+            }
+        }
+    ]
     outcome = "FAIL"
     try:
         create = publisher.publish_human_history(
-            target_number=_IMPLEMENTATION_PR, repo=_REPO, identity=identity, result="live canary の作成を確認しました",
-            evidence_refs=[pr["url"]], recommended_action="canary を確認してください",
-            recommended_reason="controlled lane の作成を検証するためです", impact_if_unaddressed="更新経路を確認できません",
+            target_number=_IMPLEMENTATION_PR,
+            repo=_REPO,
+            identity=identity,
+            result="live canary の作成を確認しました",
+            evidence_refs=[pr["url"]],
+            recommended_action="canary を確認してください",
+            recommended_reason="controlled lane の作成を検証するためです",
+            impact_if_unaddressed="更新経路を確認できません",
         )
         events.append({"create": create})
         assert create == 0
         patch = publisher.publish_human_history(
-            target_number=_IMPLEMENTATION_PR, repo=_REPO, identity=identity, result="live canary の更新を確認しました",
-            evidence_refs=[pr["url"]], recommended_action="canary 結果を確認してください",
-            recommended_reason="同一 identity の PATCH を検証するためです", impact_if_unaddressed="更新経路を確認できません",
+            target_number=_IMPLEMENTATION_PR,
+            repo=_REPO,
+            identity=identity,
+            result="live canary の更新を確認しました",
+            evidence_refs=[pr["url"]],
+            recommended_action="canary 結果を確認してください",
+            recommended_reason="同一 identity の PATCH を検証するためです",
+            impact_if_unaddressed="更新経路を確認できません",
         )
         events.append({"patch": patch})
         assert patch == 0
         noop = publisher.publish_human_history(
-            target_number=_IMPLEMENTATION_PR, repo=_REPO, identity=identity, result="live canary の更新を確認しました",
-            evidence_refs=[pr["url"]], recommended_action="canary 結果を確認してください",
-            recommended_reason="同一 identity の PATCH を検証するためです", impact_if_unaddressed="更新経路を確認できません",
+            target_number=_IMPLEMENTATION_PR,
+            repo=_REPO,
+            identity=identity,
+            result="live canary の更新を確認しました",
+            evidence_refs=[pr["url"]],
+            recommended_action="canary 結果を確認してください",
+            recommended_reason="同一 identity の PATCH を検証するためです",
+            impact_if_unaddressed="更新経路を確認できません",
         )
         events.append({"noop": noop})
         assert noop == 0
         rendered, error = publisher.render_human_history_comment(
-            identity=identity, result="live canary の更新を確認しました", evidence_refs=[pr["url"]],
-            recommended_action="canary 結果を確認してください", recommended_reason="同一 identity の PATCH を検証するためです",
+            identity=identity,
+            result="live canary の更新を確認しました",
+            evidence_refs=[pr["url"]],
+            recommended_action="canary 結果を確認してください",
+            recommended_reason="同一 identity の PATCH を検証するためです",
             impact_if_unaddressed="更新経路を確認できません",
         )
         assert error == "" and rendered
         readback = subprocess.run(
             ["gh", "pr", "view", str(_IMPLEMENTATION_PR), "--repo", _REPO, "--json", "comments"],
-            text=True, capture_output=True, check=False, timeout=30,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
         )
         assert readback.returncode == 0
-        matches = [comment for comment in json.loads(readback.stdout)["comments"] if rendered["marker"] in comment.get("body", "")]
+        comments = json.loads(readback.stdout)["comments"]
+        matches = [comment for comment in comments if rendered["marker"] in comment.get("body", "")]
         assert len(matches) == 1
         assert matches[0]["body"] == rendered["body"]
-        events.append({"comment_get_readback": {"comment_url": matches[0].get("url"), "body_sha256": hashlib.sha256(matches[0]["body"].encode()).hexdigest()}})
+        events.append(
+            {
+                "comment_get_readback": {
+                    "comment_url": matches[0].get("url"),
+                    "body_sha256": hashlib.sha256(matches[0]["body"].encode()).hexdigest(),
+                }
+            }
+        )
         outcome = "PASS"
     finally:
-        _artifact({"ac": "AC2", "result": outcome, "events": events, "target_pr": _IMPLEMENTATION_PR, "writer_serial": writer_serial})
+        _artifact(
+            {
+                "ac": "AC2",
+                "result": outcome,
+                "events": events,
+                "target_pr": _IMPLEMENTATION_PR,
+                "writer_serial": writer_serial,
+            }
+        )

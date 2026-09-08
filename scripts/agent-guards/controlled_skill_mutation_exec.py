@@ -2313,6 +2313,90 @@ def _human_history_readback(
     }, ""
 
 
+_HUMAN_HISTORY_POST_PR_DECISION_RE = _re.compile(
+    r"(?m)^- phase: (?P<phase>post-PR-binding|post-PR-head-drift)\r?$\n"
+    r"^- reviewed_ref: refs/pull/(?P<pr_number>[1-9][0-9]*)/head@(?P<reviewed_head>[0-9a-f]{40})\r?$"
+)
+_HUMAN_HISTORY_STALE_EVIDENCE_HEAD_RE = _re.compile(
+    r"(?mi)^- stale evidence: .*?(?P<head>[0-9a-f]{40})(?:\r?$|[^0-9a-f])"
+)
+
+
+def _human_history_post_pr_decision_binding(body: str) -> tuple[dict | None, str]:
+    """Extract the rendered post-PR state that the controlled lane must bind.
+
+    The comment identity remains the existing seven-field marker digest.  This
+    parser reads only the publisher's rendered, public-safe fields so that a
+    decision cannot use a caller's cached PR head.  A diagnostic additionally
+    carries the latest observed head in its existing ``stale evidence`` text;
+    its marker identity deliberately remains bound to the original snapshot.
+    """
+    match = _HUMAN_HISTORY_POST_PR_DECISION_RE.search(body)
+    if match is None:
+        return None, ""
+    phase = match.group("phase")
+    expected_head = match.group("reviewed_head")
+    if phase == "post-PR-head-drift":
+        stale = _HUMAN_HISTORY_STALE_EVIDENCE_HEAD_RE.search(body)
+        if stale is None:
+            return None, "human_history_head_drift_stale_evidence_head_missing"
+        expected_head = stale.group("head")
+    return {
+        "phase": phase,
+        "pr_number": int(match.group("pr_number")),
+        "reviewed_head": match.group("reviewed_head"),
+        "decision_head": expected_head,
+    }, ""
+
+
+def _recheck_human_history_pr_head_before_decision(
+    *, body: str, repo: str, gh_bin: str
+) -> tuple[dict | None, str]:
+    """Directly read the PR head immediately before a post-PR decision.
+
+    Returning a structured binding permits the caller to emit a deterministic
+    reconciliation route instead of treating a stale create/PATCH/noop as a
+    successful publication.  This is intentionally in the controlled
+    executor, where the actual remote mutation decision occurs, rather than
+    relying on an earlier documentation-level or publisher-level read.
+    """
+    binding, binding_err = _human_history_post_pr_decision_binding(body)
+    if binding_err or binding is None:
+        return binding, binding_err
+    current_head, head_err = _fetch_pr_head_sha(
+        binding["pr_number"], repo, gh_bin, env=_build_metadata_sanitized_env()
+    )
+    if head_err:
+        return None, f"human_history_pr_head_direct_read_failed:{head_err}"
+    assert current_head is not None
+    binding["current_head"] = current_head
+    if current_head != binding["decision_head"]:
+        if binding["phase"] == "post-PR-binding":
+            return binding, "human_history_primary_head_drift_reconciliation_required"
+        return binding, "human_history_diagnostic_head_drift_reconciliation_required"
+    return binding, ""
+
+
+def _human_history_head_drift_result_extra(binding: dict, *, patch_attempted: bool) -> dict:
+    """Return the required reconciliation/re-review route without new state."""
+    is_primary = binding["phase"] == "post-PR-binding"
+    return {
+        "mutation_outcome": "applied" if patch_attempted else "not_applied",
+        "head_drift": {
+            "phase": binding["phase"],
+            "reviewed_head_sha": binding["reviewed_head"],
+            "decision_head_sha": binding["decision_head"],
+            "current_head_sha": binding["current_head"],
+            "route": (
+                "reconcile_head_drift_then_rereview"
+                if is_primary
+                else "reconcile_same_head_drift_identity_then_rereview"
+            ),
+        },
+        "rerun_required": {"pr_review": True},
+    }
+
+
 def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> int:
     """Create, PATCH, or noop one human-history identity in the existing lane.
 
@@ -2365,7 +2449,22 @@ def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> 
     if len(matching) > 1:
         return _fail("human_history_duplicate_owned_marker", status="failed")
 
-    def finalize(status_detail: str, *, patch_attempted: bool) -> int:
+    def fresh_head_before_decision(*, patch_attempted: bool) -> tuple[dict | None, int | None]:
+        """Make the decision-time read the last operation before create/PATCH/noop."""
+        binding, head_err = _recheck_human_history_pr_head_before_decision(
+            body=comment_body, repo=args.repo, gh_bin=gh_bin
+        )
+        if not head_err:
+            return binding, None
+        if binding is not None and "reconciliation_required" in head_err:
+            return None, _fail(
+                head_err,
+                status="stale_head",
+                extra=_human_history_head_drift_result_extra(binding, patch_attempted=patch_attempted),
+            )
+        return None, _fail(head_err, status="failed")
+
+    def finalize(status_detail: str, *, patch_attempted: bool, decision_binding: dict | None) -> int:
         readback, readback_err = _human_history_readback(
             marker=marker,
             expected_digest=expected["content_digest"],
@@ -2376,6 +2475,25 @@ def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> 
         )
         if readback_err:
             return _fail(f"human_history_readback_failed:{readback_err}", status="failed")
+
+        # A readback (including an accepted noop) is not a terminal acceptance
+        # boundary. Re-read directly before returning so an old primary cannot
+        # authorize a new head and a diagnostic must be reconciled again.
+        if decision_binding is not None:
+            post_binding, post_head_err = _recheck_human_history_pr_head_before_decision(
+                body=comment_body, repo=args.repo, gh_bin=gh_bin
+            )
+            if post_head_err:
+                if post_binding is not None and "reconciliation_required" in post_head_err:
+                    return _fail(
+                        post_head_err,
+                        status="applied_but_head_drift" if patch_attempted else "stale_head",
+                        extra=_human_history_head_drift_result_extra(
+                            post_binding, patch_attempted=patch_attempted
+                        ),
+                    )
+                return _fail(post_head_err, status="failed")
+
         changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
         if changed:
             return _fail(
@@ -2398,15 +2516,24 @@ def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> 
         if remote["content_digest"] == expected["content_digest"]:
             # A noop is still read back through the same marker/author/digest
             # boundary so it cannot silently accept a stale or foreign state.
-            return finalize("already_published", patch_attempted=False)
+            decision_binding, decision_result = fresh_head_before_decision(patch_attempted=False)
+            if decision_result is not None:
+                return decision_result
+            return finalize("already_published", patch_attempted=False, decision_binding=decision_binding)
         numeric_comment_id = _extract_numeric_comment_id_from_url(comment.get("url", ""))
         if not numeric_comment_id:
             return _fail("human_history_remote_marker_comment_id_unresolvable", status="failed")
+        decision_binding, decision_result = fresh_head_before_decision(patch_attempted=True)
+        if decision_result is not None:
+            return decision_result
         patch_err = _patch_gh_comment(numeric_comment_id, args.repo, comment_body, gh_bin)
         if patch_err:
             return _fail(patch_err, status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
-        return finalize("updated", patch_attempted=True)
+        return finalize("updated", patch_attempted=True, decision_binding=decision_binding)
 
+    decision_binding, decision_result = fresh_head_before_decision(patch_attempted=False)
+    if decision_result is not None:
+        return decision_result
     _url, _id, post_err = _post_gh_comment(args.issue_number, args.repo, comment_body, gh_bin)
     if post_err:
         # POST may have succeeded while its response was lost.  A single strict
@@ -2421,8 +2548,8 @@ def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> 
         )
         if readback_err:
             return _fail(post_err, status="failed", extra={"mutation_outcome": "unknown"})
-        return finalize("created_reconciled", patch_attempted=False)
-    return finalize("created", patch_attempted=False)
+        return finalize("created_reconciled", patch_attempted=False, decision_binding=decision_binding)
+    return finalize("created", patch_attempted=False, decision_binding=decision_binding)
 
 
 def _find_marker_matches(marker_literal: str, issue_number: int, repo: str, gh_bin: str) -> tuple[list[dict], str]:
