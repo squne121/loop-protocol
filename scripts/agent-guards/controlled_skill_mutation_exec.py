@@ -2377,11 +2377,17 @@ def _recheck_human_history_pr_head_before_decision(
     return binding, ""
 
 
-def _human_history_head_drift_result_extra(binding: dict, *, patch_attempted: bool) -> dict:
-    """Return the required reconciliation/re-review route without new state."""
+def _human_history_head_drift_result_extra(binding: dict, *, mutation_applied: bool) -> dict:
+    """Return the required reconciliation/re-review route without new state.
+
+    ``patch_attempted`` cannot represent a successful create: POST is a
+    mutation too, while noop is not.  Report the confirmed write fact rather
+    than the PATCH-specific transport detail so post-create head drift never
+    claims the already-read-back comment was not applied.
+    """
     is_primary = binding["phase"] == "post-PR-binding"
     return {
-        "mutation_outcome": "applied" if patch_attempted else "not_applied",
+        "mutation_outcome": "applied" if mutation_applied else "not_applied",
         "head_drift": {
             "phase": binding["phase"],
             "reviewed_head_sha": binding["reviewed_head"],
@@ -2449,7 +2455,7 @@ def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> 
     if len(matching) > 1:
         return _fail("human_history_duplicate_owned_marker", status="failed")
 
-    def fresh_head_before_decision(*, patch_attempted: bool) -> tuple[dict | None, int | None]:
+    def fresh_head_before_decision() -> tuple[dict | None, int | None]:
         """Make the decision-time read the last operation before create/PATCH/noop."""
         binding, head_err = _recheck_human_history_pr_head_before_decision(
             body=comment_body, repo=args.repo, gh_bin=gh_bin
@@ -2460,11 +2466,13 @@ def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> 
             return None, _fail(
                 head_err,
                 status="stale_head",
-                extra=_human_history_head_drift_result_extra(binding, patch_attempted=patch_attempted),
+                extra=_human_history_head_drift_result_extra(binding, mutation_applied=False),
             )
         return None, _fail(head_err, status="failed")
 
-    def finalize(status_detail: str, *, patch_attempted: bool, decision_binding: dict | None) -> int:
+    def finalize(
+        status_detail: str, *, patch_attempted: bool, mutation_applied: bool, decision_binding: dict | None
+    ) -> int:
         readback, readback_err = _human_history_readback(
             marker=marker,
             expected_digest=expected["content_digest"],
@@ -2487,9 +2495,9 @@ def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> 
                 if post_binding is not None and "reconciliation_required" in post_head_err:
                     return _fail(
                         post_head_err,
-                        status="applied_but_head_drift" if patch_attempted else "stale_head",
+                        status="applied_but_head_drift" if mutation_applied else "stale_head",
                         extra=_human_history_head_drift_result_extra(
-                            post_binding, patch_attempted=patch_attempted
+                            post_binding, mutation_applied=mutation_applied
                         ),
                     )
                 return _fail(post_head_err, status="failed")
@@ -2516,22 +2524,24 @@ def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> 
         if remote["content_digest"] == expected["content_digest"]:
             # A noop is still read back through the same marker/author/digest
             # boundary so it cannot silently accept a stale or foreign state.
-            decision_binding, decision_result = fresh_head_before_decision(patch_attempted=False)
+            decision_binding, decision_result = fresh_head_before_decision()
             if decision_result is not None:
                 return decision_result
-            return finalize("already_published", patch_attempted=False, decision_binding=decision_binding)
+            return finalize(
+                "already_published", patch_attempted=False, mutation_applied=False, decision_binding=decision_binding
+            )
         numeric_comment_id = _extract_numeric_comment_id_from_url(comment.get("url", ""))
         if not numeric_comment_id:
             return _fail("human_history_remote_marker_comment_id_unresolvable", status="failed")
-        decision_binding, decision_result = fresh_head_before_decision(patch_attempted=True)
+        decision_binding, decision_result = fresh_head_before_decision()
         if decision_result is not None:
             return decision_result
         patch_err = _patch_gh_comment(numeric_comment_id, args.repo, comment_body, gh_bin)
         if patch_err:
             return _fail(patch_err, status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
-        return finalize("updated", patch_attempted=True, decision_binding=decision_binding)
+        return finalize("updated", patch_attempted=True, mutation_applied=True, decision_binding=decision_binding)
 
-    decision_binding, decision_result = fresh_head_before_decision(patch_attempted=False)
+    decision_binding, decision_result = fresh_head_before_decision()
     if decision_result is not None:
         return decision_result
     _url, _id, post_err = _post_gh_comment(args.issue_number, args.repo, comment_body, gh_bin)
@@ -2548,8 +2558,10 @@ def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> 
         )
         if readback_err:
             return _fail(post_err, status="failed", extra={"mutation_outcome": "unknown"})
-        return finalize("created_reconciled", patch_attempted=False, decision_binding=decision_binding)
-    return finalize("created", patch_attempted=False, decision_binding=decision_binding)
+        return finalize(
+            "created_reconciled", patch_attempted=False, mutation_applied=True, decision_binding=decision_binding
+        )
+    return finalize("created", patch_attempted=False, mutation_applied=True, decision_binding=decision_binding)
 
 
 def _find_marker_matches(marker_literal: str, issue_number: int, repo: str, gh_bin: str) -> tuple[list[dict], str]:

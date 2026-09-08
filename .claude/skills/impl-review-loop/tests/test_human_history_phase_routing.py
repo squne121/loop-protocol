@@ -197,6 +197,27 @@ def test_post_pr_head_drift_routes_reconciliation_before_or_after_noop():
     assert failures[-1][1]["status"] == "stale_head"
     assert failures[-1][1]["extra"]["head_drift"]["route"] == "reconcile_head_drift_then_rereview"
 
+    # A successful create is a write even though it is not a PATCH.  If the
+    # post-readback head check detects drift, preserve the historical result
+    # and report the committed write rather than falsely calling it a noop.
+    failures.clear()
+    with patch.object(executor, "_capture_pre_mutation_snapshot", return_value=(object(), None)), \
+         patch.object(executor, "_fetch_authenticated_login", return_value=("writer", "")), \
+         patch.object(executor, "_list_issue_comments", return_value=([], "")), \
+         patch.object(executor, "_post_gh_comment", return_value=("url", "x", "")) as post, \
+         patch.object(executor, "_human_history_readback", return_value=({
+             "comment_id": "x", "comment_url": "url", "identity_sha256": "a" * 64,
+             "content_digest": parsed["content_digest"],
+         }, "")), \
+         patch.object(executor, "_fetch_pr_head_sha", side_effect=[("b" * 40, ""), ("c" * 40, "")]):
+        assert executor._run_human_history_comment_publish(
+            args, data, "/bin/gh", lambda *a, **k: failures.append((a, k)) or 1, lambda _: 0
+        ) == 1
+    post.assert_called_once()
+    assert failures[-1][0][0] == "human_history_primary_head_drift_reconciliation_required"
+    assert failures[-1][1]["status"] == "applied_but_head_drift"
+    assert failures[-1][1]["extra"]["mutation_outcome"] == "applied"
+
     diagnostic = _identity("impl-review-loop", "post-PR-head-drift", "pull_request", "head_drift")
     diagnostic["reviewed_ref"] = primary["reviewed_ref"]
     diagnostic_data, _ = _post_pr_publish_input(diagnostic, stale_evidence="latest head: " + "c" * 40)
