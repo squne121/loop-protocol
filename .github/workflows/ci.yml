@@ -3397,17 +3397,22 @@ jobs:
         # existing guard pattern already used elsewhere in this file (see
         # the `PR_NUMBER: ... || 0` / `GH_PR_NUMBER: ... || ''` steps
         # above/below) rather than inventing a new one. When PR_NUMBER is
-        # empty, no `gh api` call is made and `pr_body.md` is written empty;
-        # the genuine `pull_request` event path (PR_NUMBER non-empty) is
-        # byte-for-byte unchanged.
+        # empty, no `gh api` call is made and `pr_body.md` stays empty; the
+        # genuine `pull_request` event path (PR_NUMBER non-empty) is
+        # byte-for-byte unchanged (the same direct `gh api ... > pr_body.md`
+        # acquisition line still runs, and remains the LAST write to
+        # `pr_body.md` in this step -- required for
+        # `scripts/agent-ops/tests/test_pr_body_acquisition_parity.py`'s
+        # direct-persistence parity check with
+        # `visual-impact-trusted-consumer.yml`, which rejects any later
+        # rewrite of the acquired output file).
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || '' }}
         run: |
+          : > pr_body.md
           if [ -n "${PR_NUMBER}" ]; then
             gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""' > pr_body.md
-          else
-            : > pr_body.md
           fi
       - name: Write trusted base-branch CODEOWNERS
         env:
