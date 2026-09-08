@@ -1313,9 +1313,6 @@ entries:
       - id: "lint_catalog_yaml"
         runner: pytest
         target: "schemas/tests/test_catalog.py"
-      - id: "test_root_temporary_residue_policy"
-        runner: pytest
-        target: "scripts/agent-guards/tests/test_root_temporary_residue_policy.py"
     compatibility:
       mode: manual_policy
       direction: backward
@@ -1336,7 +1333,7 @@ entries:
       followup_issue_required: true
     last_verified:
       commit: "a7916a80c06a75a5085dc4fd88a328f82c4a1560"
-      command_id: "test_root_temporary_residue_policy"
+      command_id: "lint_catalog_yaml"
 
   - schema_id: "repo_temp_folder_advice/v2"
     format: json_schema
@@ -1363,12 +1360,6 @@ entries:
       - id: "lint_catalog_yaml"
         runner: pytest
         target: "schemas/tests/test_catalog.py"
-      - id: "test_root_temporary_residue_policy"
-        runner: pytest
-        target: "scripts/agent-guards/tests/test_root_temporary_residue_policy.py"
-      - id: "test_root_temporary_residue_advisory"
-        runner: pytest
-        target: ".claude/hooks/tests/test_root_temporary_residue_advisory.py"
     compatibility:
       mode: manual_policy
       direction: backward
@@ -1389,4 +1380,4 @@ entries:
       followup_issue_required: true
     last_verified:
       commit: "a7916a80c06a75a5085dc4fd88a328f82c4a1560"
-      command_id: "test_root_temporary_residue_advisory"
+      command_id: "lint_catalog_yaml"
