@@ -195,6 +195,49 @@ def test_explicit_schema_version_v1_matches_pre_v2_payload_shape():
     _validate_against_schema(advice)
 
 
+# --------------------------------------------------------------------------- #
+# fix_delta MEDIUM 2: real CLI subprocess byte-level golden regression, for
+# both no-flag and explicit --schema-version v1. Pins field order / JSON
+# serialization style / trailing-newline behavior of `print()`, not just
+# Python dict equality (which the tests above already cover).
+# --------------------------------------------------------------------------- #
+_V1_CLI_GOLDEN_STDOUT = (
+    json.dumps(
+        {
+            "schema": "REPO_TEMP_FOLDER_ADVICE_V1",
+            "block": False,
+            "reason_code": "root_temporary_alias",
+            "observed_path": ".tmp/",
+            "approved_replacement": "tmp/",
+            "approved_temporary_roots": ["tmp/", ".claude/tmp/"],
+            "cleanup_required": True,
+            "policy_doc": "docs/dev/repository-folder-policy.md",
+            "message_ja": (
+                "repo root の一時 alias は残置ノイズになります。tmp/ または .claude/tmp/ を使い、"
+                "終了時に削除または報告してください。"
+            ),
+        },
+        ensure_ascii=False,
+    )
+    + "\n"
+)
+
+
+@pytest.mark.parametrize("extra_args", [[], ["--schema-version", "v1"]])
+def test_v1_cli_subprocess_stdout_bytes_match_golden(extra_args: list[str]):
+    script_path = REPO_ROOT / "scripts" / "agent-guards" / "root_temporary_residue_policy.py"
+    stdin_payload = json.dumps({"tool_input": {"command": "mkdir -p .tmp/cache"}})
+    result = subprocess.run(
+        [sys.executable, str(script_path), *extra_args],
+        input=stdin_payload,
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+    )
+    assert result.returncode == 0
+    assert result.stdout == _V1_CLI_GOLDEN_STDOUT
+
+
 def test_v1_legacy_root_write_still_silent_regardless_of_schema_version():
     """.claude/tmp/** write must remain silent under v1 (only v2 flags it)."""
     payload = {
@@ -312,6 +355,53 @@ def test_v2_legacy_root_delete_via_bash_is_silent():
         schema_version="v2",
     )
     assert advice is None
+
+
+# --------------------------------------------------------------------------- #
+# fix_delta P0: destination-aware `.claude/tmp/**` Bash-command classifier
+# (_detect_bash_legacy_root_write). Narrow, bounded fixture matrix -- exactly
+# the cases called out by the human PR review comment on #2581 plus the
+# compound-segment-splitting pin.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat input > .claude/tmp/output",
+        "sed -i 's/a/b/' .claude/tmp/file",
+        "ls .claude/tmp && mkdir -p .claude/tmp/new",
+        "cp tmp/input .claude/tmp/output",
+        "tee .claude/tmp/output",
+    ],
+)
+def test_v2_legacy_root_write_bash_classifier_true_positives(command: str):
+    advice = build_temp_folder_advice(
+        {"cwd": str(REPO_ROOT), "tool_input": {"command": command}},
+        repo_root=REPO_ROOT,
+        schema_version="v2",
+    )
+    assert advice is not None, f"expected deprecated_legacy_root_write advisory for: {command}"
+    assert advice["reason_code"] == "deprecated_legacy_root_write"
+    assert advice["observed_path"] == ".claude/tmp/"
+    _validate_against_schema_v2(advice)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cp .claude/tmp/result.json tmp/result.json",
+        "echo .claude/tmp/result.json",
+        "printf '%s' .claude/tmp/result.json",
+        "git status -- .claude/tmp/result.json",
+        "sed 's/a/b/' .claude/tmp/file",
+    ],
+)
+def test_v2_legacy_root_write_bash_classifier_true_negatives(command: str):
+    advice = build_temp_folder_advice(
+        {"cwd": str(REPO_ROOT), "tool_input": {"command": command}},
+        repo_root=REPO_ROOT,
+        schema_version="v2",
+    )
+    assert advice is None, f"expected no advisory for: {command}"
 
 
 def test_gitignore_root_anchor_matches_expected_paths():

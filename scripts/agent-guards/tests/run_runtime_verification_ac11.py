@@ -13,9 +13,14 @@ the same pattern as
   - exit 1  : any targeted test genuinely FAILED (or pytest could not even
               collect the target -- fail-closed, never silently exit 0).
   - exit 77 : the ENTIRE targeted suite was skipped by pytest's own
-              internal SKIP semantics (e.g. no ``claude`` binary or hook
-              execution environment available in this environment).
+              internal SKIP semantics (e.g. no hook execution environment --
+              bash/python3/hook script -- available in this environment).
               Prints ``SKIP: <reason>`` to stdout.
+
+This wrapper and the suite it wraps exercise the real hook process
+(bash spawning the python3 producer script) only. They do not invoke the
+``claude`` CLI and do not exercise Claude Code authentication, network
+access, or model availability.
 
 A log evidence file is written to
 ``artifacts/runtime-verification-AC11-<timestamp>.log`` with the required
@@ -52,12 +57,10 @@ _MAX_OUTPUT_LINES = 500
 
 
 def _environment_summary() -> str:
-    claude_bin = shutil.which("claude")
     bash_bin = shutil.which("bash")
     python3_bin = shutil.which("python3")
     return (
         f"OS={platform.platform()}; Python={platform.python_version()}; "
-        f"claude_on_PATH={'yes' if claude_bin else 'no'}; "
         f"bash_on_PATH={'yes' if bash_bin else 'no'}; "
         f"python3_on_PATH={'yes' if python3_bin else 'no'}"
     )
@@ -233,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if passed == 0:
             # Every collected test hit pytest's own internal SKIP (e.g. no
-            # `claude` binary / hook execution environment in this
+            # bash/python3/hook execution environment available in this
             # environment) -- the whole targeted suite SKIPs (never
             # promoted to a fabricated PASS).
             skip_reasons = _skip_reasons(junit_path)

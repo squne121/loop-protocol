@@ -50,6 +50,15 @@ READ_ONLY_COMMANDS = {
 DELETE_COMMANDS = {"rm", "rmdir", "unlink"}
 WRITE_COMMANDS = {"cp", "echo", "install", "ln", "mkdir", "mv", "printf", "tee", "touch"}
 REDIRECTION_PREFIXES = (">>", ">", "1>>", "1>", "2>>", "2>")
+# V2 legacy-write (``.claude/tmp/**``) Bash-command classification only
+# (``_detect_bash_legacy_root_write`` below). Deliberately narrower/more
+# destination-aware than the generic WRITE_COMMANDS scan used by
+# ``_match_command`` for V1 / V2 root-alias detection, which is left
+# untouched (Issue #2007 fix_delta P0).
+_COMPOUND_OPERATOR_TOKENS = {"&&", "||", ";", "|&", "|", "&"}
+_MKDIR_TOUCH_TEE_VERBS = {"mkdir", "touch", "tee"}
+_CP_MV_LN_INSTALL_VERBS = {"cp", "mv", "ln", "install"}
+_SED_INPLACE_PREFIXES = ("-i", "--in-place")
 
 
 @dataclass(frozen=True)
@@ -214,15 +223,193 @@ def _payload_cwd(payload: dict[str, Any], *, repo_root: Path) -> Path:
     return repo_root
 
 
+def _split_bash_command_segments(command: str) -> list[list[str]]:
+    """Split a Bash command string into minimal top-level segments on the
+    shell control operators ``&&``, ``||``, ``;``, ``|&``, ``|``, ``&`` and
+    on newline boundaries, tokenizing each line quote-safely via ``shlex``.
+
+    This is intentionally NOT a general shell grammar/AST — it is a bounded,
+    destination-aware splitter dedicated to V2 ``.claude/tmp/**``
+    legacy-write classification (Issue #2007 fix_delta P0). Quoting within a
+    line is respected via ``shlex`` posix tokenization; splitting across
+    ``&&``/``||``/``;``/``|&``/``|``/``&`` uses ``shlex``'s
+    ``punctuation_chars`` support so operator runs (e.g. ``&&``) are
+    recognized as single tokens without being torn apart by quote handling.
+    """
+    segments: list[list[str]] = []
+    for line in command.splitlines():
+        if not line.strip():
+            continue
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars="&|;")
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+        except ValueError:
+            continue
+        current: list[str] = []
+        for token in tokens:
+            if token in _COMPOUND_OPERATOR_TOKENS:
+                if current:
+                    segments.append(current)
+                current = []
+                continue
+            current.append(token)
+        if current:
+            segments.append(current)
+    return segments
+
+
+def _match_redirection_destination_in_args(
+    args: list[str], *, cwd: Path, repo_root: Path
+) -> RootTemporaryResidueMatch | None:
+    """Match a legacy-root redirection destination, handling both the glued
+    form (``>./.claude/tmp/out``, a single token) and the space-separated
+    form (``>`` and ``.claude/tmp/out`` as two adjacent tokens) — the latter
+    is not handled by the existing ``_match_redirection_token`` alone since
+    it inspects a single token in isolation.
+    """
+    for index, token in enumerate(args):
+        glued_match = _match_redirection_token(
+            token, cwd=cwd, repo_root=repo_root, matcher=_match_legacy_root_relative_path
+        )
+        if glued_match is not None:
+            return glued_match
+        if token in REDIRECTION_PREFIXES and index + 1 < len(args):
+            target = args[index + 1]
+            match = _extract_match_from_token(
+                target, cwd=cwd, repo_root=repo_root, matcher=_match_legacy_root_relative_path
+            )
+            if match is not None:
+                return match
+    return None
+
+
+def _match_sed_inplace_target(
+    args: list[str], *, cwd: Path, repo_root: Path
+) -> RootTemporaryResidueMatch | None:
+    """``sed`` is a READ_ONLY_COMMANDS verb, but ``sed -i``/``--in-place``
+    (with or without an in-place backup suffix, e.g. ``-i.bak``) rewrites its
+    file argument(s) in place and must be treated as a write. Plain ``sed``
+    without an in-place flag must stay silent (it filters stdin/stdout).
+    """
+    inplace = any(arg.startswith(prefix) for arg in args for prefix in _SED_INPLACE_PREFIXES)
+    if not inplace:
+        return None
+    positionals = [arg for arg in args if not arg.startswith("-")]
+    # positionals[0] is the sed script/expression; remaining positionals are
+    # the file(s) rewritten in place.
+    for target in positionals[1:]:
+        match = _extract_match_from_token(
+            target, cwd=cwd, repo_root=repo_root, matcher=_match_legacy_root_relative_path
+        )
+        if match is not None:
+            return match
+    return None
+
+
+def _match_any_positional_argument(
+    args: list[str], *, cwd: Path, repo_root: Path
+) -> RootTemporaryResidueMatch | None:
+    """``mkdir``/``touch``/``tee``: every non-flag argument is inherently a
+    creation target, so any of them resolving under ``.claude/tmp/`` counts.
+    """
+    for token in args:
+        if token.startswith("-"):
+            continue
+        match = _extract_match_from_token(
+            token, cwd=cwd, repo_root=repo_root, matcher=_match_legacy_root_relative_path
+        )
+        if match is not None:
+            return match
+    return None
+
+
+def _match_destination_positional_argument(
+    args: list[str], *, cwd: Path, repo_root: Path
+) -> RootTemporaryResidueMatch | None:
+    """``cp``/``mv``/``ln``/``install``: standard Unix ``SOURCE... DEST``
+    semantics — only the last non-flag positional argument (the destination)
+    counts as a write target. A legacy-root *source* argument must not fire.
+    """
+    positionals = [arg for arg in args if not arg.startswith("-")]
+    if not positionals:
+        return None
+    destination = positionals[-1]
+    return _extract_match_from_token(
+        destination, cwd=cwd, repo_root=repo_root, matcher=_match_legacy_root_relative_path
+    )
+
+
+def _segment_legacy_write_match(
+    tokens: list[str], *, cwd: Path, repo_root: Path
+) -> RootTemporaryResidueMatch | None:
+    if not tokens:
+        return None
+    verb = Path(tokens[0]).name
+    args = tokens[1:]
+
+    # Redirection to a legacy-root destination is a write regardless of the
+    # command verb (e.g. `cat input > .claude/tmp/output`).
+    redirection_match = _match_redirection_destination_in_args(args, cwd=cwd, repo_root=repo_root)
+    if redirection_match is not None:
+        return redirection_match
+
+    if verb == "sed":
+        return _match_sed_inplace_target(args, cwd=cwd, repo_root=repo_root)
+
+    if verb in READ_ONLY_COMMANDS or verb in DELETE_COMMANDS:
+        return None
+
+    if verb in {"echo", "printf"}:
+        # Their plain arguments are literal output content, not paths being
+        # written to — only a redirected destination (already checked above)
+        # counts.
+        return None
+
+    if verb in _MKDIR_TOUCH_TEE_VERBS:
+        return _match_any_positional_argument(args, cwd=cwd, repo_root=repo_root)
+
+    if verb in _CP_MV_LN_INSTALL_VERBS:
+        return _match_destination_positional_argument(args, cwd=cwd, repo_root=repo_root)
+
+    # Unknown/other commands: a bare `.claude/tmp/**` argument is ambiguous
+    # (could be a read, a reference, or something else entirely) and stays
+    # silent per the Issue's "ambiguous case is silent" allowance.
+    return None
+
+
+def _detect_bash_legacy_root_write(
+    command: str, *, cwd: Path, repo_root: Path
+) -> RootTemporaryResidueMatch | None:
+    """V2-only, destination-aware Bash-command classifier dedicated to
+    ``.claude/tmp/**`` legacy-write detection (Issue #2007 fix_delta P0).
+
+    Deliberately separate from the generic ``_match_command()`` used for V1
+    root-alias detection and V2's non-legacy root-alias detection (both left
+    unchanged): those either scan every write-verb argument (too broad for
+    destination-aware legacy-write classification, causing false positives
+    such as a `cp` *source* argument) or fully skip READ_ONLY_COMMANDS verbs
+    (too narrow, missing e.g. `cat ... > .claude/tmp/x` or `sed -i`). This
+    helper does not use ``RAW_COMMAND_PATTERN`` at all, so it cannot be
+    affected by that fallback's substring matching inside literal
+    `echo`/`printf`/`git status` argument text.
+    """
+    for tokens in _split_bash_command_segments(command):
+        match = _segment_legacy_write_match(tokens, cwd=cwd, repo_root=repo_root)
+        if match is not None:
+            return match
+    return None
+
+
 def _detect_legacy_root_write(
     payload: dict[str, Any], tool_input: dict[str, Any], *, cwd: Path, repo_root: Path
 ) -> RootTemporaryResidueMatch | None:
     """V2-only: flag write operations targeting ``.claude/tmp/**`` (the
     deprecated legacy write root). Read / scan / delete operations must not
     match here — the write/read/delete distinction is derived from
-    ``tool_name`` (Write/Edit) for file_path-based tool inputs and from the
-    existing verb classification (READ_ONLY_COMMANDS / DELETE_COMMANDS /
-    WRITE_COMMANDS) for Bash commands.
+    ``tool_name`` (Write/Edit) for file_path-based tool inputs and from
+    ``_detect_bash_legacy_root_write()``'s destination-aware classification
+    for Bash commands.
     """
     tool_name = payload.get("tool_name")
     file_path = tool_input.get("file_path")
@@ -234,9 +421,7 @@ def _detect_legacy_root_write(
             return match
     command = tool_input.get("command")
     if isinstance(command, str):
-        match = _match_command(
-            command, cwd=cwd, repo_root=repo_root, matcher=_match_legacy_root_relative_path
-        )
+        match = _detect_bash_legacy_root_write(command, cwd=cwd, repo_root=repo_root)
         if match is not None:
             return match
     return None

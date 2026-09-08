@@ -1,10 +1,10 @@
 """test_root_temporary_residue_advisory_runtime_smoke.py -- AC11 runtime
 verification pytest suite (Issue #2007).
 
-Spawns the real ``.claude/hooks/root_temporary_residue_advisory.sh``
-PreToolUse hook process (bash script -> python3 producer invoked with
-``--schema-version v2``) for ``.claude/tmp/**`` write / read / scan / delete
-operations, and asserts:
+This is a real hook-process integration test: it spawns the real
+``.claude/hooks/root_temporary_residue_advisory.sh`` PreToolUse hook process
+(bash script -> python3 producer invoked with ``--schema-version v2``) for
+``.claude/tmp/**`` write / read / scan / delete operations, and asserts:
 
   - process ``returncode == 0`` in every case (fail-open, never blocks)
   - the output JSON never contains ``hookSpecificOutput.permissionDecision``
@@ -15,9 +15,12 @@ operations, and asserts:
     is prohibited (docs/dev/runtime-verification-policy.md fallback_policy)
   - read / scan / delete cases produce no advisory output at all
 
-Skips (``pytest.skip``) every test if the ``claude`` CLI binary or a
-runnable hook execution environment (bash + python3 + the hook script
-itself) is not available in this environment. This mirrors the existing
+This test only exercises the hook process itself (``bash`` invoking the
+``python3`` producer script); it does not invoke the ``claude`` CLI and does
+not exercise Claude Code authentication, network access, or model
+availability. Skips (``pytest.skip``) every test if a runnable hook
+execution environment (bash + python3 + the hook script itself) is not
+available in this environment. This mirrors the existing
 ``scripts/agent-ops/tests/run_runtime_verification_ac18.py`` wrapped-suite
 pattern (Issue #2161) so that the non-pytest-collected
 ``run_runtime_verification_ac11.py`` wrapper can classify PASS / FAIL / SKIP
@@ -42,8 +45,7 @@ _SUBPROCESS_TIMEOUT_SECONDS = 30.0
 
 def _hook_environment_available() -> bool:
     return (
-        shutil.which("claude") is not None
-        and shutil.which("bash") is not None
+        shutil.which("bash") is not None
         and shutil.which("python3") is not None
         and HOOK.is_file()
     )
@@ -51,10 +53,7 @@ def _hook_environment_available() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _hook_environment_available(),
-    reason=(
-        "SKIP: claude CLI binary or hook execution environment "
-        "(bash/python3/hook script) not available"
-    ),
+    reason=("SKIP: hook execution environment (bash/python3/hook script) not available"),
 )
 
 
