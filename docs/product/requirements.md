@@ -1,9 +1,10 @@
 ---
 doc_id: DOC-REQ-001
 title: LOOP_PROTOCOL Requirements Baseline
+note: 全体要件と非ゴールの正本を記録するドキュメントである
 status: active
-capability_gate: M4 Upgrade Loop (v0.4.x)
-last_updated_by_issue: 1094
+capability_gate: M5 Playable Slice Hardening (v0.5.x)
+last_updated_by_issue: 2573
 ---
 
 # Requirements Baseline
@@ -11,7 +12,7 @@ last_updated_by_issue: 1094
 `LOOP_PROTOCOL` における全体要件と非ゴールの正本。
 詳細な機能仕様は本文で定義した方針に従って、後続の feature spec へ分離する。
 
-## Document Priority
+## ドキュメント優先順位（Document Priority）
 
 - `CLAUDE.md`: repo 全体の不変原則と読む順序。
 - `.claude/rules/project-constitution.md`: 実装手順、docs 更新規則、検証ルール。
@@ -28,13 +29,14 @@ last_updated_by_issue: 1094
 - 個別機能の詳細仕様の正本: `docs/product/features/<feature>.md`。
 - この階層を逆転させない。`playable-roadmap.md` を global 要件の正本として上書き扱いしない。
 
-## Current Capability Gate
+## 現在の能力ゲート（Current Capability Gate）
 
 - M1 Foundation Gate (v0.1.x) の基盤・guardrail・workflow・最小仕様正本は確立済み。
 - M3 の実装と自動検証は完了済みである。
-- 現在の capability gate は `M4: Upgrade Loop (v0.4.x)` とする。formal close / milestone readback の最終判断は `#733` 側で扱う。
+- M4 Upgrade Loop (v0.4.x) は完了済み（parent tracker `#1176` は `CLOSED / COMPLETED`、2026-09-08 live readback で確認）。M4 の close authority / evidence は `#1176`（M4 parent tracker）に一本化する。
+- 現在の capability gate は `M5: Playable Slice Hardening (v0.5.x)` とする（delivery-rollup parent tracker: `#2572`）。
 
-## Global Non-Goals
+## 全体非ゴール（Global Non-Goals）
 
 - 既存作品の直接再現
 - 複雑な campaign / territory 管理
@@ -43,22 +45,29 @@ last_updated_by_issue: 1094
 - 高品質アセット前提の演出
 - Issue や spec にない大規模機能の先行追加
 
-## Milestone Scope: M4 Upgrade Loop (v0.4.x)
+## Milestone Scope: M5 Playable Slice Hardening (v0.5.x)（現行スコープ）
 
-- 現行の実装対象スコープは `M4: Upgrade Loop (v0.4.x)`（global 要件の正本は本 requirements.md であり、milestone は実装対象を指す）。
+- 現行の実装対象スコープは `M5: Playable Slice Hardening (v0.5.x)`（global 要件の正本は本 requirements.md であり、milestone は実装対象を指す）。delivery-rollup parent tracker は `#2572`。
+- M5 の scope / close_conditions / non_goals の詳細は `docs/product/playable-roadmap.md` の M5 セクションを正本とする。
+- M5 は新規 core mechanic を追加せず、M2〜M4 で成立した playable slice の hardening（player-facing normal flow、persistence continuity、combat readability、balance、runtime evidence）に限定する。
+
+## Milestone Scope: M4 Upgrade Loop (v0.4.x)（完了済み）
+
+- `M4: Upgrade Loop (v0.4.x)` は完了済み（parent tracker `#1176` は `CLOSED / COMPLETED`）。以下は M4 完了時点の記録として残す。
+- M4 当時の実装対象スコープは `M4: Upgrade Loop (v0.4.x)`（global 要件の正本は本 requirements.md であり、milestone は実装対象を指す）。
 - M4 では、M3 で永続化済みの resource を消費して最小 upgrade を適用し、次 sortie の挙動変化として観測できるまでをスコープとする。
 - M4 は MVP Loop の「resource が次の強化導線へ接続できること」を最小成立させるフェーズであり、M3 persistence 境界と `src/data` の data-driven 定義の両立を前提にする。
 - resource consumption / upgrade の詳細仕様（消費量、負値禁止、反映対象、次 sortie への適用境界など）は feature spec（`docs/product/features/<feature>.md`）で定義する。
 - GitHub Milestone object の title mismatch や close 判断は本 requirements 更新のスコープ外であり、`docs/product/playable-roadmap.md` の mapping readback と `docs/dev/milestone-ops.md` に従って別途扱う。
 
-### M4 Non-Goals
+### M4 非ゴール（M4 Non-Goals）
 
 - 大規模な upgrade tree（アップグレードツリー）の構築。
 - 複数武器の追加・切替。
 - campaign / territory の管理。
 - M4 / M5 境界の詳細は `docs/product/playable-roadmap.md` を参照する。
 
-## Current MVP Requirements
+## 現在のMVP要件（Current MVP Requirements）
 
 ### MVP-001 戦闘表示と UI の分離
 
@@ -94,7 +103,7 @@ last_updated_by_issue: 1094
 - 少なくとも `pnpm typecheck` `pnpm lint` `pnpm test` `pnpm build` を通せること。
 - 受け入れ条件と non-goals は Issue または feature spec と対応づけて扱う。
 
-## Feature Spec Policy
+## 機能仕様方針（Feature Spec Policy）
 
 - 個別機能の stable な仕様は `docs/product/features/<feature>.md` に置く。
 - feature spec は YAML フロントマター付き Markdown を採用する。
@@ -107,7 +116,7 @@ last_updated_by_issue: 1094
   - related tests
 - `movement + projectile` のような個別機能は、この配置規則に従って後続 Issue で追加する。
 
-## Acceptance Ownership
+## 受け入れ責任（Acceptance Ownership）
 
 - 全体要件の境界はこの文書が持つ。
 - 実装単位の受け入れ条件は Issue 本文で作業契約として定義し、stable 化したら feature spec へ昇格する。
