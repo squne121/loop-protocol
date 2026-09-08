@@ -1,49 +1,47 @@
 ---
 doc_id: DOC-FOCUS-001
 title: Current Focus
+note: 現在の開発フェーズと優先順位を記録するドキュメントである
 status: active
-milestone: M4 Upgrade Loop (v0.4.x)
-last_updated_by_issue: 1094
+milestone: M5 Playable Slice Hardening (v0.5.x)
+last_updated_by_issue: 2573
 ---
 
-# Current Focus
+# Current Focus（現在のフォーカス）
 
-## Current Phase
+## 現在のフェーズ（Current Phase）
 
-- 現在は `M4: Upgrade Loop (v0.4.x)` を進行中。
-- 目的は、M3 で成立した resource 永続化の上に resource consumption と最小 upgrade を載せ、次 sortie へ反映される MVP Loop を閉じること。
-- M3 の実装と自動検証は完了済みだが、parent close / milestone readback の最終判断は `#733` 側で扱う。
+- `M4: Upgrade Loop (v0.4.x)` は完了済み。parent tracker `#1176` は `CLOSED / COMPLETED`（2026-09-08 live readback で確認）。
+- 現在は `M5: Playable Slice Hardening (v0.5.x)` へ phase handoff済みで、これを進行中とする。
+- 目的は、既存 M2〜M4 slice（sortie → result/resource → upgrade → next sortie）を、新規 core mechanic を増やさず player-facing / persistence / readability / balance / runtime evidence の各境界で硬化する baseline acceptance である。
 
-## Current Milestone
+## 現在のマイルストーン（Current Milestone）
 
-- `M4: Upgrade Loop (v0.4.x)`
-- 完了条件は、sortie → resource 獲得 → upgrade → 次 sortie での挙動変化までの最小 Loop が成立し、既存品質ゲートを安定して通せること。
-- M3 / M4 / M5 の境界の参照元は `docs/product/playable-roadmap.md`、global scope / non-goals の正本は `docs/product/requirements.md`。
+- `M5: Playable Slice Hardening (v0.5.x)`（delivery-rollup parent tracker: `#2572`）
+- 完了条件は `docs/product/playable-roadmap.md` の M5 セクション `close_conditions` を正本とする。
+- M4 / M5 / M6〜M8 の境界の参照元は `docs/product/playable-roadmap.md`、global scope / non-goals の正本は `docs/product/requirements.md`。
 
-## Priority Order
+## 優先順位（Priority Order）
 
-1. M4 の resource consumption / upgrade boundary を issue contract と product spec に同期する
-2. sortie → resource → upgrade → 次 sortie 反映の最小 Loop を実装・検証順へ分解する
+1. M5 baseline-first 方針で、既存 M2〜M4 slice の player-facing normal flow / persistence continuity / combat readability を現行 current-main で評価する（`#2572` Workstream 2）。
+2. baseline で実際に観測された M5 blocker のみを narrow child Issue として分解する（speculative hardening を先行させない）。
 
-## Carry-Forward Notes
+## 今やること（Do Now）
 
-- `#733` は M3 parent close / readback の最終判断を保持しており、M4 着手と同時に自動 close されたものとして扱わない。
-- `#690` の人間動画採取・waiver 解消は M2 / M3 系の carry-forward note として残るが、M4 current phase の primary outcome ではない。
+- M5 baseline acceptance（fresh state flow / saved・reload flow / developer-self 3〜5 sortie playtest / architecture invariant / canonical quality gates）を現行 current-main で実行する。
+- baseline で観測された blocker のみを narrow implementation child Issue として起票する。
 
-## Do Now
+## M5でやらないこと（Do Not Do in M5）
 
-- resource 消費の制約、最小 upgrade 定義、次 sortie への反映点を feature spec / issue contract に固定する。
-- `src/storage` で永続化済みの resource を、`src/data` 駆動の upgrade 定義へ安全に接続する準備を進める。
-
-## Do Not Do in M4
-
-- 複雑な upgrade tree や大規模な複数武器導線を M4 に持ち込まない。
+- 複雑な upgrade tree や大規模な複数武器導線を M5 に持ち込まない（引き続き非ゴール）。
 - campaign / territory / network / audio / 高品質アセット前提の作業へ広げない。
-- GitHub milestone object の rename / create / close を、この current-focus 更新だけで解決したものとして扱わない。
+- M6 の ally NPC / assist-player runtime 実装を M5 に持ち込まない。
+- M7 の technology-choice expansion（tech extraction runtime）を M5 に持ち込まない。
+- GitHub milestone object の close を、この current-focus 更新だけで解決したものとして扱わない。
 
-## Decision Notes
+## 決定事項（Decision Notes）
 
 - NotebookLM は運用の主役ではなく、必要時のレビュー支援として使う。
 - `docs/product/game-overview.md` は概要文書であり、全体要件の正本ではない。
 - 個別機能 spec の標準配置は `docs/product/features/<feature>.md` とする。
-- global scope / global non-goals の正本は `docs/product/requirements.md`、M3 / M4 / M5 milestone 境界の参照元は `docs/product/playable-roadmap.md`。
+- global scope / global non-goals の正本は `docs/product/requirements.md`、M4 / M5 / M6〜M8 milestone 境界の参照元は `docs/product/playable-roadmap.md`。
