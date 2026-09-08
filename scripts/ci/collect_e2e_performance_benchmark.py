@@ -1524,6 +1524,7 @@ def dispatch_workflow_run(
     workflow_file: str,
     ref: str,
     dispatch_call: Callable[..., Any],
+    reliability_evidence: bool = False,
 ) -> dict:
     """Issue #2422 AC7/Stop-Conditions: dispatches ONE `workflow_dispatch`
     with `benchmark_layout=layout`, and MUST request
@@ -1552,6 +1553,13 @@ def dispatch_workflow_run(
         "block_id": block_id,
         "experiment_id": experiment_id,
     }
+    # Issue #2585: additive-only -- `reliability_evidence` is only added to
+    # `inputs` when explicitly requested (True). The default (False /
+    # omitted) preserves the EXACT pre-existing 4-key dict above, so every
+    # caller that never asked for reliability evidence keeps its current
+    # dispatch payload byte-for-byte (AC2 backward compatibility).
+    if reliability_evidence:
+        inputs["reliability_evidence"] = "true"
     response = dispatch_call(
         repo=repo,
         workflow_file=workflow_file,
@@ -1582,6 +1590,7 @@ def run_bounded_experiment(
     workflow_file: str,
     ref: str,
     dispatch_call: Callable[..., Any],
+    reliability_evidence: bool = False,
 ) -> list[dict]:
     """Issue #2422 AC7/AC9: bounded orchestrator entrypoint -- dispatches
     the FULL A/B/A/B plan for `blocks` matched blocks (2*blocks total
@@ -1603,6 +1612,7 @@ def run_bounded_experiment(
                     workflow_file,
                     ref,
                     dispatch_call,
+                    reliability_evidence=reliability_evidence,
                 )
             )
     return root_run_set
@@ -1783,6 +1793,7 @@ def execute_bounded_experiment_to_manifest_v2(
     max_polls: int = DEFAULT_WAIT_MAX_POLLS,
     sleep: Callable[[float], None] = time.sleep,
     resume_dispatched_run_set: list[dict] | None = None,
+    reliability_evidence: bool = False,
 ) -> dict:
     """Issue #2422 fix_delta Blocker 2/Blocker 3: the SINGLE bounded
     orchestration connecting (a) plan construction, (b) per-dispatch
@@ -1819,7 +1830,15 @@ def execute_bounded_experiment_to_manifest_v2(
             if key in dispatched_by_key:
                 continue
             dispatched = dispatch_workflow_run(
-                layout, block["block_id"], frozen_source_sha, experiment_id, repo, workflow_file, ref, dispatch_call
+                layout,
+                block["block_id"],
+                frozen_source_sha,
+                experiment_id,
+                repo,
+                workflow_file,
+                ref,
+                dispatch_call,
+                reliability_evidence=reliability_evidence,
             )
             root_run_set.append(dispatched)
             dispatched_by_key[key] = dispatched
@@ -2430,6 +2449,17 @@ def parse_run_experiment_args(argv: list[str] | None = None) -> argparse.Namespa
         default=DEFAULT_WAIT_MAX_POLLS,
         help=f"Bounded poll ceiling per run before a fail-closed timeout (default {DEFAULT_WAIT_MAX_POLLS})",
     )
+    parser.add_argument(
+        "--reliability-evidence",
+        action="store_true",
+        default=False,
+        help=(
+            "Issue #2585: when set, adds `reliability_evidence: \"true\"` to every "
+            "dispatched run's workflow_dispatch inputs so the `reliability-assessment` "
+            "job (Issue #2424) becomes eligible to run. Default False preserves the "
+            "existing Performance-only dispatch payload unchanged (AC2)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -2456,6 +2486,7 @@ def main_run_experiment(argv: list[str] | None = None) -> int:
             poll_interval_seconds=args.poll_interval_seconds,
             max_polls=args.max_polls,
             resume_dispatched_run_set=resume_dispatched_run_set,
+            reliability_evidence=args.reliability_evidence,
         )
     except (OperationalError, OperationalErrorV2, LiveAPIError) as exc:
         sys.stderr.write(f"operational_failure: {exc}\n")

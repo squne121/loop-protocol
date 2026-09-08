@@ -1775,6 +1775,63 @@ def test_dispatch_workflow_run_sends_target_sha_not_frozen_source_sha_key():
     assert captured_inputs["experiment_id"] == "exp-1"
 
 
+def test_dispatch_workflow_run_reliability_evidence_true_adds_input_key():
+    """Issue #2585 AC1: `dispatch_workflow_run(..., reliability_evidence=True)`
+    MUST add `"reliability_evidence": "true"` to the dispatched `inputs`
+    dict (on top of the existing 4 keys), unblocking the
+    `reliability-assessment` job (Issue #2424)."""
+    captured_inputs: dict = {}
+
+    def capturing_dispatch_call(repo, workflow_file, ref, inputs, return_run_details):
+        captured_inputs.update(inputs)
+        return {"workflow_run_id": 502, "html_url": "https://example.invalid/runs/502"}
+
+    collector.dispatch_workflow_run(
+        "monolith",
+        "block-0001",
+        FROZEN_SOURCE_SHA,
+        "exp-1",
+        "squne121/loop-protocol",
+        "ci.yml",
+        "main",
+        capturing_dispatch_call,
+        reliability_evidence=True,
+    )
+    assert captured_inputs["reliability_evidence"] == "true"
+    assert captured_inputs["benchmark_layout"] == "monolith"
+    assert captured_inputs["target_sha"] == FROZEN_SOURCE_SHA
+    assert captured_inputs["block_id"] == "block-0001"
+    assert captured_inputs["experiment_id"] == "exp-1"
+
+
+def test_dispatch_workflow_run_reliability_evidence_false_keeps_exact_four_keys():
+    """Issue #2585 AC2: `reliability_evidence=False` (and the default /
+    omitted case, covered separately by
+    `test_dispatch_workflow_run_sends_target_sha_not_frozen_source_sha_key`)
+    MUST keep the dispatched `inputs` dict to EXACTLY the pre-existing 4
+    keys -- `reliability_evidence` must be entirely absent, never present
+    with a false-ish value."""
+    captured_inputs: dict = {}
+
+    def capturing_dispatch_call(repo, workflow_file, ref, inputs, return_run_details):
+        captured_inputs.update(inputs)
+        return {"workflow_run_id": 503, "html_url": "https://example.invalid/runs/503"}
+
+    collector.dispatch_workflow_run(
+        "monolith",
+        "block-0001",
+        FROZEN_SOURCE_SHA,
+        "exp-1",
+        "squne121/loop-protocol",
+        "ci.yml",
+        "main",
+        capturing_dispatch_call,
+        reliability_evidence=False,
+    )
+    assert set(captured_inputs.keys()) == {"benchmark_layout", "target_sha", "block_id", "experiment_id"}
+    assert "reliability_evidence" not in captured_inputs
+
+
 def test_dispatch_workflow_run_fails_closed_when_response_lacks_workflow_run_id():
     """GIVEN a dispatch response shaped like GitHub's 204 No Content (no
     workflow_run_id) WHEN dispatched THEN LiveAPIError is raised --
@@ -1851,6 +1908,50 @@ def test_run_bounded_experiment_blocks_22_produces_44_run_root_run_set_determini
     for r in root_run_set:
         by_block.setdefault(r["block_id"], set()).add(r["benchmark_layout"])
     assert all(layouts_for_block == {"monolith", "split"} for layouts_for_block in by_block.values())
+
+
+def test_run_bounded_experiment_reliability_evidence_propagates_to_every_dispatch():
+    """Issue #2585 AC3: `run_bounded_experiment(..., reliability_evidence=True)`
+    MUST propagate the flag to EVERY underlying `dispatch_workflow_run` call
+    (all 4 dispatches for `blocks=2`), not just the first."""
+    captured_inputs_by_run: dict[int, dict] = {}
+
+    def capturing_dispatch_call(repo, workflow_file, ref, inputs, return_run_details):
+        run_id = len(captured_inputs_by_run) + 1
+        captured_inputs_by_run[run_id] = dict(inputs)
+        return {"workflow_run_id": run_id, "html_url": f"https://example.invalid/runs/{run_id}"}
+
+    root_run_set = collector.run_bounded_experiment(
+        2,
+        FROZEN_SOURCE_SHA,
+        "exp-1",
+        "squne121/loop-protocol",
+        "ci.yml",
+        "main",
+        capturing_dispatch_call,
+        reliability_evidence=True,
+    )
+    assert len(root_run_set) == 4
+    assert len(captured_inputs_by_run) == 4
+    assert all(inputs["reliability_evidence"] == "true" for inputs in captured_inputs_by_run.values())
+
+
+def test_run_bounded_experiment_reliability_evidence_default_false_omits_key_everywhere():
+    """Issue #2585 AC2/AC3: default (omitted) `reliability_evidence` MUST
+    keep every dispatch's `inputs` free of the `reliability_evidence` key
+    -- backward compatible for existing Performance-only callers."""
+    captured_inputs_by_run: dict[int, dict] = {}
+
+    def capturing_dispatch_call(repo, workflow_file, ref, inputs, return_run_details):
+        run_id = len(captured_inputs_by_run) + 1
+        captured_inputs_by_run[run_id] = dict(inputs)
+        return {"workflow_run_id": run_id, "html_url": f"https://example.invalid/runs/{run_id}"}
+
+    collector.run_bounded_experiment(
+        2, FROZEN_SOURCE_SHA, "exp-1", "squne121/loop-protocol", "ci.yml", "main", capturing_dispatch_call
+    )
+    assert len(captured_inputs_by_run) == 4
+    assert all("reliability_evidence" not in inputs for inputs in captured_inputs_by_run.values())
 
 
 def _fake_get_run_status_factory(conclusion_by_run_id: dict[int, str], polls_until_terminal: int = 1):
@@ -2107,6 +2208,57 @@ def test_execute_bounded_experiment_to_manifest_v2_never_re_dispatches_on_resume
     assert dispatch_calls == [("block-0001", "split")]
     assert len(manifest["blocks"]) == 1
     assert [r["workflow_run_id"] for r in manifest["blocks"][0]["runs"]] == [1, 101]
+
+
+def test_execute_bounded_experiment_to_manifest_v2_reliability_evidence_propagates_to_dispatch(tmp_path):
+    """Issue #2585 AC3: `execute_bounded_experiment_to_manifest_v2(...,
+    reliability_evidence=True)` MUST propagate the flag all the way down
+    to every `dispatch_workflow_run` -> `dispatch_call` invocation's
+    `inputs` dict."""
+    captured_inputs_by_run: dict[int, dict] = {}
+
+    def capturing_dispatch_call(repo, workflow_file, ref, inputs, return_run_details):
+        run_id = len(captured_inputs_by_run) + 1
+        captured_inputs_by_run[run_id] = dict(inputs)
+        return {"workflow_run_id": run_id, "html_url": f"https://example.invalid/runs/{run_id}"}
+
+    jobs_by_run_id = {
+        1: [{"id": 101, "name": "e2e-core", "conclusion": "success"}],
+        2: [
+            {"id": 201, "name": "e2e-core", "conclusion": "success"},
+            {"id": 202, "name": "e2e-responsive-matrix", "conclusion": "success"},
+        ],
+    }
+    fake_get_run_status = _fake_get_run_status_factory({1: "success", 2: "success"})
+    fake_list_run_jobs = _fake_list_run_jobs_factory(jobs_by_run_id)
+
+    import base64
+
+    def fake_contents_api_call(endpoint: str):
+        return {"encoding": "base64", "content": base64.b64encode(b"workflow-bytes").decode("ascii")}
+
+    collector.execute_bounded_experiment_to_manifest_v2(
+        blocks=1,
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        experiment_id="exp-reliability-1",
+        repo="squne121/loop-protocol",
+        workflow_file="ci.yml",
+        ref="main",
+        workflow_sha=V2_WORKFLOW_SHA,
+        frozen_non_treatment=_frozen_non_treatment(),
+        root_run_set_output=str(tmp_path / "progress.json"),
+        dispatch_call=capturing_dispatch_call,
+        get_run_status=fake_get_run_status,
+        list_run_jobs=fake_list_run_jobs,
+        log_fetch=_fake_log_fetch,
+        contents_api_call=fake_contents_api_call,
+        poll_interval_seconds=0.0,
+        max_polls=5,
+        sleep=lambda s: None,
+        reliability_evidence=True,
+    )
+    assert len(captured_inputs_by_run) == 2
+    assert all(inputs["reliability_evidence"] == "true" for inputs in captured_inputs_by_run.values())
 
 
 def test_build_manifest_v2_happy_path_conforms_to_schema():
@@ -2412,3 +2564,43 @@ def test_manifest_v2_schema_rejects_v1_hybrid_before_after_fields():
     validator = jsonschema.Draft202012Validator(schema)
     errors = list(validator.iter_errors(manifest))
     assert errors != []
+
+
+def _run_experiment_argv(extra: list[str] | None = None) -> list[str]:
+    """Issue #2585 AC4: minimal required `run-experiment` argv (all
+    `required=True` flags populated) shared by the `--reliability-evidence`
+    parsing tests below."""
+    argv = [
+        "--blocks",
+        "2",
+        "--frozen-source-sha",
+        FROZEN_SOURCE_SHA,
+        "--experiment-id",
+        "exp-1",
+        "--repo",
+        "squne121/loop-protocol",
+        "--workflow-sha",
+        V2_WORKFLOW_SHA,
+        "--frozen-non-treatment-json",
+        "/tmp/does-not-need-to-exist.json",
+        "--output",
+        "/tmp/progress.json",
+        "--manifest-output",
+        "/tmp/manifest.json",
+    ]
+    return argv + (extra or [])
+
+
+def test_parse_run_experiment_args_reliability_evidence_flag_sets_true():
+    """Issue #2585 AC4: `parse_run_experiment_args([..., "--reliability-evidence"])`
+    MUST return `args.reliability_evidence == True`."""
+    args = collector.parse_run_experiment_args(_run_experiment_argv(["--reliability-evidence"]))
+    assert args.reliability_evidence is True
+
+
+def test_parse_run_experiment_args_reliability_evidence_omitted_defaults_false():
+    """Issue #2585 AC4: omitting `--reliability-evidence` MUST default
+    `args.reliability_evidence` to `False` (backward compatible for every
+    existing Performance-only `run-experiment` caller)."""
+    args = collector.parse_run_experiment_args(_run_experiment_argv())
+    assert args.reliability_evidence is False
