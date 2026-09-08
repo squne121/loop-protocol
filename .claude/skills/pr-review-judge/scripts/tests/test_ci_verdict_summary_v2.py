@@ -465,12 +465,15 @@ class TestTrustedConsumerExcludedClassification:
 # ---------------------------------------------------------------------------
 
 
-class TestCloseEvidencePublicationExcludedClassification:
-    """The conditional exclusion is valid only for a fully bound ordinary PR skip."""
+CONDITIONAL_EXCLUDED_NAMES = ("reliability-assessment", "close-evidence-publication")
 
-    def _ordinary_pr_skip(self, **overrides) -> dict:
+
+class TestOrdinaryPrDispatchOnlyExcludedClassification:
+    """Both dispatch-only jobs require identical fully bound ordinary-PR skips."""
+
+    def _ordinary_pr_skip(self, name: str = "close-evidence-publication", **overrides) -> dict:
         check = make_check(
-            "close-evidence-publication",
+            name,
             workflow="ci",
             status="completed",
             conclusion="skipped",
@@ -480,13 +483,14 @@ class TestCloseEvidencePublicationExcludedClassification:
         check.update(overrides)
         return check
 
-    def test_exact_ordinary_pr_skip_is_excluded_without_relaxing_other_checks(self, v2):
+    @pytest.mark.parametrize("name", CONDITIONAL_EXCLUDED_NAMES)
+    def test_exact_ordinary_pr_skip_is_excluded_without_relaxing_other_checks(self, v2, name):
         raw_checks = v2.check_runs_api_to_raw_checks(
             {
                 "check_runs": [
                     {
                         "id": 24_333,
-                        "name": "close-evidence-publication",
+                        "name": name,
                         "status": "completed",
                         "conclusion": "skipped",
                         "head_sha": EXPECTED_SHA,
@@ -500,11 +504,12 @@ class TestCloseEvidencePublicationExcludedClassification:
         checks = _all_other_required_checks_passing()
         checks.extend(raw_checks)
         artifact = build(v2, checks)
-        entry = next(check for check in artifact["checks"] if check["name"] == "close-evidence-publication")
+        entry = next(check for check in artifact["checks"] if check["name"] == name)
         assert entry["classification"] == "excluded"
         assert entry["blocking_merge_ready"] is False
         assert artifact["overall_status"] == "merge_ready", artifact
 
+    @pytest.mark.parametrize("name", CONDITIONAL_EXCLUDED_NAMES)
     @pytest.mark.parametrize(
         ("label", "overrides", "event_name"),
         [
@@ -516,18 +521,19 @@ class TestCloseEvidencePublicationExcludedClassification:
             ("wrong_event", {}, "workflow_dispatch"),
         ],
     )
-    def test_non_exact_close_evidence_publication_tuple_is_fail_closed(
-        self, v2, label, overrides, event_name
+    def test_non_exact_conditional_tuple_is_fail_closed(
+        self, v2, name, label, overrides, event_name
     ):
-        artifact = build(v2, [self._ordinary_pr_skip(**overrides)], event_name=event_name)
+        artifact = build(v2, [self._ordinary_pr_skip(name, **overrides)], event_name=event_name)
         entry = artifact["checks"][0]
         assert entry["classification"] == "unknown", label
         assert entry["blocking_merge_ready"] is True, label
         assert entry["failure_reason"] == "gh_error", label
         assert artifact["overall_status"] == "gh_error", label
 
-    def test_missing_check_run_id_is_incomplete_and_fail_closed(self, v2):
-        check = self._ordinary_pr_skip()
+    @pytest.mark.parametrize("name", CONDITIONAL_EXCLUDED_NAMES)
+    def test_missing_check_run_id_is_incomplete_and_fail_closed(self, v2, name):
+        check = self._ordinary_pr_skip(name)
         del check["id"]
         artifact = build(v2, [check])
         entry = artifact["checks"][0]

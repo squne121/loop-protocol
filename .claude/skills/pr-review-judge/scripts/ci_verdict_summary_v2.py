@@ -80,15 +80,9 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     # Scope Delta calls out. Classified "excluded" (not "evidence"/"required")
     # because this job's pass/fail must never affect merge-ready.
     ("ci", "component-vrt-report"): "excluded",
-    # Issue #2424: reliability-assessment is a non-required, read-only
-    # consumer job (`if: ${{ github.event.inputs.benchmark_layout ==
-    # 'reliability_assessment' }}`) that is always `skipped` on ordinary
-    # `pull_request` runs and only executes on operator-triggered
-    # `workflow_dispatch` runs. Without an explicit entry it falls through
-    # to "unknown" -> determine_check_verdict() would treat it as ALWAYS
-    # blocking (gh_error). Classified "excluded" (not "evidence"/"required")
-    # because this job's pass/fail must never affect merge-ready.
-    ("ci", "reliability-assessment"): "excluded",
+    # Issue #2433: reliability-assessment is a non-required, read-only
+    # workflow_dispatch consumer. Its ordinary-PR skipped CheckRun is handled
+    # conditionally below, never as a blanket exclusion.
     # Issue #2524: visual-impact-policy-trusted-consumer is a SEPARATE
     # `workflow_run`-triggered advisory re-verification of the producer's
     # `visual-impact-policy` (`ci`, above) decision -- confirmed on current
@@ -112,12 +106,15 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     ("Check Japanese Content", "Issue Body Japanese Check (retrospective)"): "excluded",
 }
 
-# Issue #2433 PR #2561: unlike ordinary unconditional exclusions, this job is
-# excluded only for its intentionally skipped ordinary-PR CheckRun.  The run
+# Issue #2433 PR #2561: unlike ordinary unconditional exclusions, these jobs
+# are excluded only for intentionally skipped ordinary-PR CheckRuns. The run
 # binding is represented by the adapter's github_check_run_api provenance:
 # check_runs_api_to_raw_checks() accepts that provenance only after binding the
 # CheckRun details URL to the exact workflow_run_id.
-CONDITIONAL_EXCLUDED_TUPLE = ("ci", "close-evidence-publication")
+CONDITIONAL_EXCLUDED_TUPLES: frozenset[tuple[str, str]] = frozenset({
+    ("ci", "reliability-assessment"),
+    ("ci", "close-evidence-publication"),
+})
 EXACT_CHECK_RUN_PROVENANCE = "github_check_run_api"
 
 
@@ -188,21 +185,22 @@ def get_classification(workflow: str, check_name: str) -> str:
     return CLASSIFICATION_MAP.get((workflow, check_name), "unknown")
 
 
-def is_exact_close_evidence_publication_skip(
+def is_exact_ordinary_pr_dispatch_only_skip(
     check: dict[str, Any],
     event_name: str | None,
 ) -> bool:
-    """Return whether the one conditional exclusion is fully proven.
+    """Return whether a conditional exclusion is fully proven.
 
-    A matching name is not enough: the CheckRun must be an exact, addressable
-    current-head row from the current workflow run and the ordinary PR route
-    must have completed it as skipped. Every incomplete or divergent case is
-    deliberately classified as unknown and therefore blocks fail-closed.
+    A matching tuple is not enough: the CheckRun must be an exact,
+    addressable current-head row from the current workflow run and the
+    ordinary PR route must have completed it as skipped. Every incomplete or
+    divergent case is deliberately classified as unknown and therefore blocks
+    fail-closed.
     """
     check_run_id = check.get("check_run_id")
     return (
         event_name == "pull_request"
-        and (check.get("workflow"), check.get("name")) == CONDITIONAL_EXCLUDED_TUPLE
+        and (check.get("workflow"), check.get("name")) in CONDITIONAL_EXCLUDED_TUPLES
         and check.get("status") == "completed"
         and check.get("conclusion") == "skipped"
         and check.get("head_sha") is not None
@@ -352,13 +350,12 @@ def build_check_entry(
     if provenance is not None:
         entry["provenance"] = provenance
 
-    # Do not make this workflow_dispatch-only job a blanket exclusion. Its
-    # exclusion is available only after status, current-head, and exact-run
-    # provenance have all been established above.
-    if (workflow, name) == CONDITIONAL_EXCLUDED_TUPLE:
+    # Dispatch-only jobs are exclusions only after status, current-head, and
+    # exact-run provenance have all been established above.
+    if (workflow, name) in CONDITIONAL_EXCLUDED_TUPLES:
         entry["classification"] = (
             "excluded"
-            if is_exact_close_evidence_publication_skip(entry, event_name)
+            if is_exact_ordinary_pr_dispatch_only_skip(entry, event_name)
             else "unknown"
         )
 
