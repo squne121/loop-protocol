@@ -154,7 +154,9 @@ def _build_parent_body(
     sections = [
         (
             "Machine-Readable Contract",
-            "```yaml\ncontract_schema_version: v1\nissue_kind: parent\ngoal_ref: g\nchange_kind: workflow\nparent_mode: quality-gate\nclosure_mode: measurement-ready\n```",
+            "```yaml\ncontract_schema_version: v1\nissue_kind: parent\ngoal_ref: g\n"
+            "change_kind: workflow\nparent_mode: quality-gate\n"
+            "closure_mode: measurement-ready\n```",
         ),
         ("Summary", "summary"),
         ("Goal", "goal"),
