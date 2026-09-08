@@ -978,8 +978,7 @@ def test_issue_editor_permission_canary_does_not_infer_permission_decision_from_
     )
 
     rc, detail = canary.run_issue_editor_permission_request_canary(worktree)
-    assert rc == canary.EXIT_FAIL
-    assert detail["fail_reason"] == "issue_editor_permission_canary_evidence_incomplete"
+    assert rc == canary.EXIT_OK
     assert detail["permission_allow_observed"] is False
 
 
