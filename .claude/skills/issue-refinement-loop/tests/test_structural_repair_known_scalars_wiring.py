@@ -152,7 +152,10 @@ def _build_parent_body(
 ) -> str:
     """Build a valid parent contract with only selected required headings absent."""
     sections = [
-        ("Machine-Readable Contract", "```yaml\ncontract_schema_version: v1\nissue_kind: parent\ngoal_ref: g\nchange_kind: workflow\nparent_mode: quality-gate\nclosure_mode: measurement-ready\n```"),
+        (
+            "Machine-Readable Contract",
+            "```yaml\ncontract_schema_version: v1\nissue_kind: parent\ngoal_ref: g\nchange_kind: workflow\nparent_mode: quality-gate\nclosure_mode: measurement-ready\n```",
+        ),
         ("Summary", "summary"),
         ("Goal", "goal"),
         ("Desired Destination", "destination"),
