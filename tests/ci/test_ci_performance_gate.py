@@ -249,15 +249,43 @@ def run_evidence_gate(
     receipt, which this function does not compute or validate)."""
     validator = _load_validator_module()
 
-    before_core = fixture["before"]["core_baselines"]
-    before_responsive = fixture["before"]["responsive_baselines"]
-    after_core = fixture["after"]["core_baselines"]
-    after_responsive = fixture["after"]["responsive_baselines"]
+    before_core_raw = fixture["before"]["core_baselines"]
+    before_responsive_raw = fixture["before"]["responsive_baselines"]
+    after_core_raw = fixture["after"]["core_baselines"]
+    after_responsive_raw = fixture["after"]["responsive_baselines"]
     before_gate_ready = fixture["before"].get("gate_ready_baselines", [])
     after_gate_ready = fixture["after"].get("gate_ready_baselines", [])
 
+    # Issue #2554: layout-aware provider observation materialization -- the
+    # existing `arms.monolith` <- `fixture["before"]` / `arms.split` <-
+    # `fixture["after"]` stand-in convention (also used by
+    # `build_close_grade_receipt()` below) fixes the EXPLICIT topology tag
+    # passed here; it is never inferred from `before_responsive_raw`'s
+    # content (e.g. being empty).
+    before_core, before_responsive = _layout_aware_provider_baselines(
+        PERFORMANCE_TOPOLOGY_MONOLITH, before_core_raw, before_responsive_raw
+    )
+    after_core, after_responsive = _layout_aware_provider_baselines(
+        PERFORMANCE_TOPOLOGY_SPLIT, after_core_raw, after_responsive_raw
+    )
+
     before_pairs, before_evidence_errors = _pair_by_workflow_run_id(before_core, before_responsive)
     after_pairs, after_evidence_errors = _pair_by_workflow_run_id(after_core, after_responsive)
+
+    # Issue #2554 fix_delta P1: `_layout_aware_provider_baselines()` above
+    # already excluded any monolith run missing a required Performance
+    # phase from `before_core`/`before_responsive` -- but that exclusion
+    # makes such a run invisible to `_pair_by_workflow_run_id()`'s own
+    # `raw_ids`/`evidence_errors` bookkeeping (it is not present in either
+    # of that call's input lists at all). Recover it from the RAW
+    # (pre-filter) `before_core_raw` list here so it is never silently
+    # dropped from this function's own `evidence_errors` view either.
+    before_evidence_errors = before_evidence_errors + [
+        {"workflow_run_id": workflow_run_id, "reason": MISSING_MONOLITH_PERFORMANCE_PHASE_REASON}
+        for workflow_run_id in sorted(
+            _monolith_incomplete_required_phase_workflow_run_ids(before_core_raw), key=str
+        )
+    ]
 
     before_provider_count, _ = _provider_post_filter_sample_count(before_core, before_responsive)
     after_provider_count, _ = _provider_post_filter_sample_count(after_core, after_responsive)
@@ -279,11 +307,17 @@ def run_evidence_gate(
     # count`'s own docstring. Fail-close the whole arm when this happens,
     # rather than letting the record silently vanish from both the sample
     # count and every evidence_errors list.
+    # Uses the RAW (pre-layout-transform) core/responsive lists -- this
+    # preflight scan is documented to run BEFORE any pairing/attempt/
+    # fingerprint filtering, and a genuine monolith `responsive_baselines
+    # == []` must never itself be misread as a "missing workflow_run_id"
+    # raw record (#2554: only a record that is PRESENT but lacks an id is
+    # counted here).
     before_raw_missing_workflow_run_id_count = _missing_workflow_run_id_raw_record_count(
-        before_core, before_responsive, before_gate_ready
+        before_core_raw, before_responsive_raw, before_gate_ready
     )
     after_raw_missing_workflow_run_id_count = _missing_workflow_run_id_raw_record_count(
-        after_core, after_responsive, after_gate_ready
+        after_core_raw, after_responsive_raw, after_gate_ready
     )
 
     try:
@@ -959,6 +993,190 @@ def _missing_workflow_run_id_raw_record_count(*baseline_lists: list[dict]) -> in
         for baseline in baselines
         if baseline.get("workflow_run_id") is None
     )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #2554 (OWNER REQUEST_CHANGES issuecomment-5575198296, confirmed by
+# read-only codebase-investigator fact-check P0-1/P0-2/P0-3): the production
+# Performance provider observation/materialization path was NOT layout-aware
+# -- `_manifest_v2_provider_jobs_to_baselines` (below) is an adapter with no
+# production call site, so a `monolith` run whose `responsive_baselines` is
+# genuinely empty (no separate `e2e-responsive-matrix` job ever starts)
+# always fell into the SAME `missing_pair_e2e-responsive-matrix` fail-closed
+# path a genuine SPLIT-topology gap would, making `arms.monolith.
+# performance_eligible_workflow_run_ids` structurally `[]` no matter how
+# much evidence a monolith run set actually has.
+#
+# `_layout_aware_provider_baselines()` is the SINGLE common helper every
+# production consumer of provider pairing converges on --
+# `run_evidence_gate()`'s pairing / provider post-filter sample count /
+# percentile+run-details assessment input, AND `_materialize_close_grade_arm()`
+# 's close-grade receipt eligibility (via `build_close_grade_receipt()`).
+# Topology is an EXPLICIT caller-supplied tag (`monolith` / `split`), never
+# auto-inferred from baseline content (Issue #2554 Outcome) -- callers pass
+# it through the existing `arms.monolith` <- `fixture["before"]` /
+# `arms.split` <- `fixture["after"]` stand-in convention that already binds
+# `_materialize_close_grade_arm`'s `arm_label` argument today.
+# --------------------------------------------------------------------------- #
+PERFORMANCE_TOPOLOGY_MONOLITH = "monolith"
+PERFORMANCE_TOPOLOGY_SPLIT = "split"
+_VALID_PERFORMANCE_TOPOLOGIES = (PERFORMANCE_TOPOLOGY_MONOLITH, PERFORMANCE_TOPOLOGY_SPLIT)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #2554 fix_delta P1 (human anchor review, PR #2575 review URL
+# issuecomment-5584055868): a monolith run's single `e2e-core` job
+# self-pairs against itself (below), so `_pair_by_workflow_run_id()` and
+# `_provider_critical_path_paired_p50_p95()` never independently notice
+# whether the REQUIRED `test_e2e_ci` + `test_e2e_monolith_responsive`
+# phase PAIR is actually complete on that one baseline -- `_job_duration_
+# seconds()` happily sums whatever partial phase set is present, so a
+# baseline carrying only ONE of the two phases still yields a non-zero,
+# apparently-valid duration and silently self-pairs as if it were a
+# genuine, complete monolith observation. `_MONOLITH_REQUIRED_PERFORMANCE_
+# PHASE_IDS` and the two helpers below are the SINGLE shared semantics
+# `_layout_aware_provider_baselines()` (provider pairing / sample count /
+# assessment run-details) and `build_close_grade_receipt()` (close-grade
+# eligibility) both converge on to reject that case, instead of two
+# separately (and possibly divergently) written completeness checks.
+# --------------------------------------------------------------------------- #
+_MONOLITH_REQUIRED_PERFORMANCE_PHASE_IDS = ("test_e2e_ci", "test_e2e_monolith_responsive")
+
+# Issue #2554 fix_delta P1: deliberately distinct from the existing
+# `missing_pair_e2e-core` / `missing_pair_e2e-responsive-matrix` /
+# `missing_provider_pairing_evidence` reasons `_pair_by_workflow_run_id()`
+# / `_materialize_close_grade_arm()` already emit for a provider lane that
+# is ENTIRELY absent -- this run's `e2e-core` evidence IS present, it is
+# only missing one of its two REQUIRED internal phases. Confirmed by
+# reading `scripts/ci/build_ci_reliability_assessment_v1.py` directly
+# (Allowed Paths for this fix_delta do not permit editing that file) that
+# its `RECEIPT_PERFORMANCE_ONLY_EVIDENCE_ERROR_REASONS` allowlist
+# recognizes only `gate_ready_timestamp_missing_or_invalid` /
+# `missing_pair_e2e-core` / `missing_pair_e2e-responsive-matrix` -- it does
+# NOT recognize `missing_provider_pairing_evidence` as Performance-only, so
+# reusing that unrelated existing reason for this genuinely-different gap
+# would risk that downstream consumer misclassifying a Performance-only
+# concern as Reliability-blocking. Using this distinct reason string keeps
+# the gap honestly labeled even though this file's own Allowed Paths scope
+# does not extend to updating that consumer's allowlist.
+MISSING_MONOLITH_PERFORMANCE_PHASE_REASON = "missing_monolith_performance_phase"
+
+
+def _monolith_required_phase_completeness(baseline: dict) -> bool:
+    """Returns False only when `baseline["measurements"]` exhibits the
+    known monolith two-phase shape (carries the `phase_id` KEY for AT
+    LEAST ONE of `_MONOLITH_REQUIRED_PERFORMANCE_PHASE_IDS`) but does not
+    have a real, usable duration (`elapsed_ms` a positive number) for
+    BOTH -- the same per-phase usability bar `_job_duration_seconds()`
+    already applies in aggregate (`total_ms > 0`), just checked per
+    required phase instead of on the summed total, so a baseline missing
+    (or carrying a zero/negative/non-numeric `elapsed_ms` for) either
+    required phase is never treated as a complete monolith Performance
+    observation merely because the OTHER phase alone still sums to a
+    non-zero total.
+
+    Deliberately scoped to baselines that ALREADY show evidence of using
+    this specific two-phase shape: a baseline using neither required
+    phase id at all (e.g. an unrelated legacy/generic single-phase
+    fixture such as this module's own `_close_grade_paired_baselines()`
+    `test_e2e_core` shape, consumed elsewhere for SPLIT-arm and
+    topology-agnostic fixtures) is left to the existing aggregate
+    `_job_duration_seconds()` rule -- it is not itself claiming to be a
+    real two-phase monolith observation, so this stricter completeness
+    bar must not misfire on it."""
+    elapsed_ms_by_phase: dict[str, object] = {}
+    for measurement in baseline.get("measurements", []):
+        if not isinstance(measurement, dict):
+            continue
+        elapsed_ms_by_phase[measurement.get("phase_id")] = measurement.get("elapsed_ms")
+    if not any(phase_id in elapsed_ms_by_phase for phase_id in _MONOLITH_REQUIRED_PERFORMANCE_PHASE_IDS):
+        return True
+    return all(
+        isinstance(elapsed_ms_by_phase.get(phase_id), (int, float))
+        and not isinstance(elapsed_ms_by_phase.get(phase_id), bool)
+        and elapsed_ms_by_phase[phase_id] > 0
+        for phase_id in _MONOLITH_REQUIRED_PERFORMANCE_PHASE_IDS
+    )
+
+
+def _monolith_incomplete_required_phase_workflow_run_ids(core_baselines: list[dict]) -> set:
+    """Returns the raw (not string-coerced) `workflow_run_id` set among
+    `core_baselines` whose monolith `e2e-core` job fails
+    `_monolith_required_phase_completeness()`. A raw record entirely
+    missing `workflow_run_id` is excluded here -- that gap is already
+    separately fail-closed, arm-wide, by the existing
+    `_missing_workflow_run_id_raw_record_count()` check."""
+    incomplete_ids: set = set()
+    for baseline in core_baselines:
+        workflow_run_id = baseline.get("workflow_run_id")
+        if workflow_run_id is None:
+            continue
+        if not _monolith_required_phase_completeness(baseline):
+            incomplete_ids.add(workflow_run_id)
+    return incomplete_ids
+
+
+def _layout_aware_provider_baselines(
+    topology: str, core_baselines: list[dict], responsive_baselines: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Returns the `(core_baselines, responsive_baselines)` pair every
+    downstream production consumer (`_pair_by_workflow_run_id()`,
+    `_provider_post_filter_sample_count()`, `_materialize_close_grade_arm()`)
+    must receive, given an EXPLICIT `topology` tag.
+
+    - `monolith`: the only physical provider is `e2e-core`. This helper
+      returns the SAME `core_baselines` list in BOTH the core and responsive
+      slots -- `_pair_by_workflow_run_id()` therefore pairs each run against
+      itself (self-fingerprint-matching by construction, since both sides
+      are literally the same baseline objects), and
+      `_provider_critical_path_paired_p50_p95()`'s `max(core, responsive)`
+      collapses to that single `e2e-core` baseline's own duration (the SUM
+      of its `test_e2e_ci` + `test_e2e_monolith_responsive` phases via the
+      existing `_job_duration_seconds()`/`_single_baseline_duration_seconds()`
+      -- computed and counted exactly ONCE, never double-counted, since both
+      "sides" of the pair resolve to the identical measurements list). The
+      genuinely-empty `responsive_baselines` a real monolith run set carries
+      is intentionally ignored/discarded here -- no synthetic
+      `e2e-responsive-matrix` baseline/record is ever created.
+
+      Issue #2554 fix_delta P1: a monolith `e2e-core` baseline whose
+      `measurements[]` is missing (or carries an unusable duration for)
+      EITHER `_MONOLITH_REQUIRED_PERFORMANCE_PHASE_IDS` phase is EXCLUDED
+      from the returned core/responsive lists (via
+      `_monolith_incomplete_required_phase_workflow_run_ids()`) BEFORE
+      self-pairing, so it can never silently self-pair on a partial-phase
+      duration and be counted as a valid provider sample. Its
+      `workflow_run_id` is never fabricated a slot here nor silently
+      forgotten -- callers (`run_evidence_gate()` / `build_close_grade_
+      receipt()`) independently recover it via the same helper applied to
+      the RAW (pre-filter) baseline list and surface it as an explicit
+      `MISSING_MONOLITH_PERFORMANCE_PHASE_REASON` evidence error.
+    - `split`: unchanged -- returns `(core_baselines, responsive_baselines)`
+      as-is. A genuinely missing `e2e-responsive-matrix` provider still
+      surfaces through the existing `missing_pair_e2e-responsive-matrix`
+      fail-closed path in `_pair_by_workflow_run_id()`, untouched by this
+      helper. The required-phase completeness check above is monolith-only
+      -- split baselines use a different (single-phase) measurement shape
+      and are never subject to it.
+
+    `_pair_by_workflow_run_id()` / `_provider_critical_path_paired_p50_p95()`
+    / `_materialize_close_grade_arm()` themselves are never modified -- this
+    helper only assembles their topology-appropriate inputs (Issue #2554
+    Stop Condition: no private helper signature change for those three
+    functions)."""
+    if topology not in _VALID_PERFORMANCE_TOPOLOGIES:
+        raise ValueError(
+            f"unknown performance topology: {topology!r} (expected one of {_VALID_PERFORMANCE_TOPOLOGIES!r})"
+        )
+    if topology == PERFORMANCE_TOPOLOGY_MONOLITH:
+        incomplete_ids = _monolith_incomplete_required_phase_workflow_run_ids(core_baselines)
+        if not incomplete_ids:
+            return core_baselines, core_baselines
+        complete_core_baselines = [
+            baseline for baseline in core_baselines if baseline.get("workflow_run_id") not in incomplete_ids
+        ]
+        return complete_core_baselines, complete_core_baselines
+    return core_baselines, responsive_baselines
 
 
 # --------------------------------------------------------------------------- #
@@ -1797,15 +2015,80 @@ def build_close_grade_receipt(
     before = fixture["before"]
     after = fixture["after"]
 
+    # Issue #2554: the SAME common helper `run_evidence_gate()` uses above
+    # assembles the topology-appropriate `(core, responsive)` input here --
+    # the explicit `"monolith"` / `"split"` `arm_label` argument below
+    # already encodes this fixture's stand-in convention, so the SAME
+    # literal is threaded through as the topology tag (never re-derived
+    # from `before`/`after`'s baseline content).
+    monolith_core, monolith_responsive = _layout_aware_provider_baselines(
+        PERFORMANCE_TOPOLOGY_MONOLITH, before["core_baselines"], before["responsive_baselines"]
+    )
     monolith_result, monolith_errors = _materialize_close_grade_arm(
-        before["core_baselines"],
-        before["responsive_baselines"],
+        monolith_core,
+        monolith_responsive,
         before.get("gate_ready_baselines", []),
         "monolith",
     )
+
+    # Issue #2554 fix_delta P1 (human anchor review issuecomment-5584055868):
+    # `_layout_aware_provider_baselines()` above already excluded any
+    # monolith run missing a required Performance phase from
+    # `monolith_core`/`monolith_responsive` (Stop Condition:
+    # `_materialize_close_grade_arm()` itself is never modified) -- so
+    # THAT function's own generic `missing_provider_pairing_evidence`
+    # fallback reason (its existing contract for a root member absent from
+    # BOTH provider lanes entirely) is the one that fires for these ids by
+    # construction, WHEN they are still visible to it via `gate_ready_
+    # baselines`. That generic reason is NOT in `scripts/ci/build_ci_
+    # reliability_assessment_v1.py`'s `RECEIPT_PERFORMANCE_ONLY_EVIDENCE_
+    # ERROR_REASONS` allowlist (verified by reading that module directly),
+    # so leaving it in place would make a genuinely Performance-only gap
+    # (present-but-incomplete monolith phase evidence) incorrectly block
+    # Reliability downstream. Relabel ONLY the entries for the specific ids
+    # this module itself determined are phase-incomplete (every other
+    # `_materialize_close_grade_arm`-produced reason, e.g. a genuinely
+    # unpaired split run, is left untouched) to the distinct `MISSING_
+    # MONOLITH_PERFORMANCE_PHASE_REASON` -- a caller-side output relabel of
+    # already-computed evidence_errors, never a change to
+    # `_materialize_close_grade_arm`'s own logic, signature, or 2-sided
+    # pair invariant.
+    #
+    # A phase-incomplete run that ALSO has no gate-ready evidence for that
+    # `workflow_run_id` is invisible to EVERY list `_materialize_close_
+    # grade_arm` receives (core/responsive/gate-ready all lack it), so its
+    # id never reaches that function's own root-run-id bookkeeping at all
+    # -- the relabel above alone would silently drop it. Explicitly
+    # reunite it with BOTH this arm's root `workflow_run_ids` and
+    # `evidence_errors` here (never inside the protected function) so the
+    # AC2 root/eligible/error invariant -- and the close-grade receipt
+    # itself -- never silently lose it.
+    monolith_incomplete_phase_ids = {
+        str(workflow_run_id)
+        for workflow_run_id in _monolith_incomplete_required_phase_workflow_run_ids(before["core_baselines"])
+    }
+    if monolith_incomplete_phase_ids:
+        monolith_errors = [
+            {**err, "reason": MISSING_MONOLITH_PERFORMANCE_PHASE_REASON}
+            if err["workflow_run_id"] in monolith_incomplete_phase_ids
+            else err
+            for err in monolith_errors
+        ]
+        already_covered_ids = {err["workflow_run_id"] for err in monolith_errors}
+        for str_id in sorted(monolith_incomplete_phase_ids - already_covered_ids, key=str):
+            monolith_errors.append(
+                {"workflow_run_id": str_id, "arm": "monolith", "reason": MISSING_MONOLITH_PERFORMANCE_PHASE_REASON}
+            )
+        combined_root_ids = sorted(set(monolith_result["workflow_run_ids"]) | monolith_incomplete_phase_ids, key=str)
+        if combined_root_ids != monolith_result["workflow_run_ids"]:
+            monolith_result = {**monolith_result, "workflow_run_ids": combined_root_ids}
+
+    split_core, split_responsive = _layout_aware_provider_baselines(
+        PERFORMANCE_TOPOLOGY_SPLIT, after["core_baselines"], after["responsive_baselines"]
+    )
     split_result, split_errors = _materialize_close_grade_arm(
-        after["core_baselines"],
-        after["responsive_baselines"],
+        split_core,
+        split_responsive,
         after.get("gate_ready_baselines", []),
         "split",
     )
@@ -2296,7 +2579,18 @@ def test_close_grade_materialization_no_silent_drop_of_root_run_ids_missing_pair
 def test_receipt_build_close_grade_result_v1_field_shape_matches_2424_consumer_contract():
     """AC3: `build_close_grade_receipt` produces a
     CI_PERFORMANCE_CLOSE_GRADE_RESULT_V1 document with every field #2424's
-    consumer contract requires, byte-matched field names."""
+    consumer contract requires, byte-matched field names.
+
+    Issue #2554 fix_delta P1: the `before` (monolith) arm uses
+    `_monolith_e2e_core_baselines()` -- a genuine monolith `e2e-core`
+    baseline carrying BOTH required `test_e2e_ci` +
+    `test_e2e_monolith_responsive` phases -- rather than the generic
+    single-`test_e2e_core`-phase `_close_grade_paired_baselines()` shape
+    (that generic shape is a legitimate SPLIT-arm fixture, but never a
+    legitimate monolith one post-#2554: a real monolith run always carries
+    both required phases on its single `e2e-core` job, and the P1
+    required-phase completeness check would otherwise correctly (not
+    spuriously) flag it as evidence-incomplete)."""
     run_ids_before = [91001, 91002]
     run_ids_after = [92001, 92002]
     fixture = {
@@ -2304,8 +2598,8 @@ def test_receipt_build_close_grade_result_v1_field_shape_matches_2424_consumer_c
         "pr_number": 9999,
         "before": {
             "commit_sha": "a" * 40,
-            "core_baselines": _close_grade_paired_baselines("e2e-core", run_ids_before),
-            "responsive_baselines": _close_grade_paired_baselines("e2e-responsive-matrix", run_ids_before),
+            "core_baselines": _monolith_e2e_core_baselines(run_ids_before),
+            "responsive_baselines": [],
             "gate_ready_baselines": _close_grade_gate_ready_baselines(run_ids_before),
         },
         "after": {
@@ -2378,13 +2672,22 @@ def test_close_grade_result_receipt_complete_sourced_from_gate_status_not_local_
     own `evidence_errors`/eligible-id bookkeeping. Proven two ways on the
     SAME evidence-errors-non-empty fixture: (1) `gate_status=
     "insufficient_evidence"` (the value production's `run_evidence_gate()`
-    would realistically compute here, since an unpaired-responsive arm
-    also fails AC11's post-filter hard check) -> complete is False; (2)
+    would realistically compute here, since a missing-gate-ready-evidence
+    arm also fails AC11's post-filter hard check) -> complete is False; (2)
     `gate_status="complete"` passed explicitly -> complete is True EVEN
     THOUGH `evidence_errors` is still non-empty -- demonstrating this
     function performs no cross-check against its own evidence_errors at
     all, per OWNER's "do not re-derive performance completeness inside
-    the builder" instruction."""
+    the builder" instruction.
+
+    #2554 fix_delta: the `before` arm is now genuinely topology-aware
+    `monolith` (self-paired via `_layout_aware_provider_baselines()`), so a
+    `responsive_baselines: []` alone no longer produces a
+    `missing_pair_e2e-responsive-matrix` evidence error here (that reason
+    is the pre-#2554 defect this Issue fixes). This fixture instead leaves
+    `gate_ready_baselines` empty to force a genuine (topology-independent)
+    `missing_gate_ready_evidence` evidence error, preserving this test's
+    original "evidence-errors-non-empty" precondition."""
     run_id_before = 93001
     fixture = {
         "issue_number": 2423,
@@ -2392,8 +2695,8 @@ def test_close_grade_result_receipt_complete_sourced_from_gate_status_not_local_
         "before": {
             "commit_sha": "a" * 40,
             "core_baselines": _close_grade_paired_baselines("e2e-core", [run_id_before]),
-            "responsive_baselines": [],  # unpaired -> evidence_errors
-            "gate_ready_baselines": _close_grade_gate_ready_baselines([run_id_before]),
+            "responsive_baselines": [],  # #2554: ignored for monolith topology (self-paired)
+            "gate_ready_baselines": [],  # missing gate-ready evidence -> evidence_errors
         },
         "after": {
             "commit_sha": "b" * 40,
@@ -2431,6 +2734,491 @@ def test_close_grade_result_receipt_complete_sourced_from_gate_status_not_local_
         "P0-1: complete must follow the passed gate_status alone, decoupled from this "
         "receipt's own (still non-empty) evidence_errors"
     )
+
+
+# =============================================================================
+# Issue #2554: production Performance provider observation/materialization
+# must be layout-aware (monolith vs split), via the common
+# `_layout_aware_provider_baselines()` helper both `run_evidence_gate()` and
+# `build_close_grade_receipt()` converge on. AC1-AC6 regression tests below.
+# =============================================================================
+
+
+def _monolith_e2e_core_baselines(
+    run_ids: list[int], core_ms: int = 120_000, responsive_ms: int = 90_000
+) -> list[dict]:
+    """#2554: builds genuine monolith-topology baselines -- ONE physical
+    `e2e-core` baseline per run whose `measurements[]` contains BOTH the
+    `test_e2e_ci` and `test_e2e_monolith_responsive` phases (the real
+    monolith workflow shape confirmed by the OWNER anchor's P0-2 fact-check
+    -- both phases run sequentially inside the SAME job), never a separate
+    `e2e-responsive-matrix` baseline."""
+    baselines = []
+    for i, run_id in enumerate(run_ids):
+        baselines.append(
+            {
+                "workflow_run_id": run_id,
+                "job": "e2e-core",
+                "run_attempt": 1,
+                "measurements": [
+                    {"phase_id": "test_e2e_ci", "elapsed_ms": core_ms + i},
+                    {"phase_id": "test_e2e_monolith_responsive", "elapsed_ms": responsive_ms + i},
+                ],
+                "host_runner_image": "Linux/X64",
+                "playwright_container_image_digest": "sha256:" + "c" * 64,
+                "node_version": "20.0.0",
+                "pnpm_version": "9.0.0",
+                "playwright_version": "1.40.0",
+                "lockfile_hash": "sha256:" + "d" * 64,
+                "workflow_digest": "sha256:" + "e" * 64,
+            }
+        )
+    return baselines
+
+
+def test_monolith_provider_post_filter_sample_count_equals_run_count_with_no_responsive_provider():
+    """Issue #2554 AC1: a monolith 20-run fixture (each run has exactly one
+    physical `e2e-core` baseline whose `measurements[]` includes both
+    `test_e2e_ci` and `test_e2e_monolith_responsive`, `responsive_
+    baselines=[]`) reaches a provider post-filter sample count of 20 -- NOT
+    0, the pre-#2554 structural defect where a genuinely-empty responsive
+    lane always fail-closed a monolith run set to 0 samples."""
+    run_ids = list(range(101001, 101021))
+    core = _monolith_e2e_core_baselines(run_ids)
+
+    monolith_core, monolith_responsive = _layout_aware_provider_baselines(
+        PERFORMANCE_TOPOLOGY_MONOLITH, core, []
+    )
+    count, evidence_errors = _provider_post_filter_sample_count(monolith_core, monolith_responsive)
+
+    assert evidence_errors == []
+    assert count == 20
+
+
+def test_monolith_arm_close_grade_receipt_eligible_ids_has_20_entries_via_before_stand_in():
+    """Issue #2554 AC2: the SAME AC1 monolith 20-run fixture, placed in
+    `fixture["before"]` per the existing `arms.monolith` <-
+    `fixture["before"]` stand-in convention, yields `arms.monolith.
+    performance_eligible_workflow_run_ids` with 20 entries via
+    `build_close_grade_receipt()`."""
+    run_ids = list(range(102001, 102021))
+    fixture = {
+        "issue_number": 2554,
+        "pr_number": 9999,
+        "before": {
+            "commit_sha": "a" * 40,
+            "core_baselines": _monolith_e2e_core_baselines(run_ids),
+            "responsive_baselines": [],
+            "gate_ready_baselines": _close_grade_gate_ready_baselines(run_ids),
+        },
+        "after": {
+            "commit_sha": "b" * 40,
+            "core_baselines": _close_grade_paired_baselines("e2e-core", [201001]),
+            "responsive_baselines": _close_grade_paired_baselines("e2e-responsive-matrix", [201001]),
+            "gate_ready_baselines": _close_grade_gate_ready_baselines([201001]),
+        },
+    }
+
+    receipt = build_close_grade_receipt(
+        fixture,
+        manifest_sha256="sha256:" + "2" * 64,
+        trusted_functional_evidence={},
+        validation_decision={"semantic_valid": True, "approval_eligible": True},
+        exit_code=0,
+        gate_status="complete",
+    )
+
+    assert receipt["arms"]["monolith"]["performance_eligible_workflow_run_ids"] == [
+        str(rid) for rid in run_ids
+    ]
+    assert len(receipt["arms"]["monolith"]["performance_eligible_workflow_run_ids"]) == 20
+
+
+def test_monolith_run_duration_equals_sum_of_core_and_monolith_responsive_phases_no_synthetic_record():
+    """Issue #2554 AC3: for the AC1 monolith fixture, any one run's
+    Performance duration observation equals the sum of the `test_e2e_ci` +
+    `test_e2e_monolith_responsive` phases inside that run's single
+    `e2e-core` baseline -- and no synthetic `e2e-responsive-matrix`
+    baseline/record is ever materialized."""
+    run_id = 103001
+    core_ms = 150_000
+    responsive_ms = 45_000
+    core = _monolith_e2e_core_baselines([run_id], core_ms=core_ms, responsive_ms=responsive_ms)
+
+    monolith_core, monolith_responsive = _layout_aware_provider_baselines(
+        PERFORMANCE_TOPOLOGY_MONOLITH, core, []
+    )
+
+    # No synthetic e2e-responsive-matrix record: the "responsive" slot is
+    # literally the SAME list/objects as the core slot, never a distinct
+    # fabricated baseline with job == "e2e-responsive-matrix".
+    assert monolith_responsive is monolith_core
+    assert all(b.get("job") != "e2e-responsive-matrix" for b in monolith_responsive)
+
+    pairs, evidence_errors = _pair_by_workflow_run_id(monolith_core, monolith_responsive)
+    assert evidence_errors == []
+    assert len(pairs) == 1
+    _workflow_run_id, pair_core, pair_responsive = pairs[0]
+    assert pair_core is pair_responsive  # self-pair, never a duplicated-but-distinct record
+
+    provider_stats = _provider_critical_path_paired_p50_p95(pairs)
+    expected_duration_seconds = (core_ms + responsive_ms) / 1000
+    assert provider_stats["p50_seconds"] == expected_duration_seconds
+    assert provider_stats["sample_count"] == 1
+    assert _single_baseline_duration_seconds(pair_core) == expected_duration_seconds
+
+
+def test_split_arm_preserves_max_core_responsive_critical_path_semantics_via_after_stand_in():
+    """Issue #2554 AC4: a split 20-run fixture (both `e2e-core` and
+    `e2e-responsive-matrix`), placed in `fixture["after"]` per the existing
+    `arms.split` <- `fixture["after"]` stand-in convention, still uses
+    `max(core, responsive)` critical-path semantics for duration, provider
+    count, and close-grade receipt eligibility after the #2554 layout-aware
+    wiring."""
+    run_ids = list(range(104001, 104021))
+    core = _close_grade_paired_baselines("e2e-core", run_ids, base_ms=100_000)
+    responsive = _close_grade_paired_baselines("e2e-responsive-matrix", run_ids, base_ms=130_000)
+    gate_ready = _close_grade_gate_ready_baselines(run_ids)
+
+    split_core, split_responsive = _layout_aware_provider_baselines(
+        PERFORMANCE_TOPOLOGY_SPLIT, core, responsive
+    )
+    assert split_core is core
+    assert split_responsive is responsive
+
+    count, evidence_errors = _provider_post_filter_sample_count(split_core, split_responsive)
+    assert evidence_errors == []
+    assert count == 20
+
+    pairs, pair_errors = _pair_by_workflow_run_id(split_core, split_responsive)
+    assert pair_errors == []
+    for _workflow_run_id, pair_core_baseline, pair_responsive_baseline in pairs:
+        core_duration = _single_baseline_duration_seconds(pair_core_baseline)
+        responsive_duration = _single_baseline_duration_seconds(pair_responsive_baseline)
+        assert responsive_duration > core_duration  # base_ms offset makes responsive dominate
+        assert max(core_duration, responsive_duration) == responsive_duration
+
+    fixture = {
+        "issue_number": 2554,
+        "pr_number": 9999,
+        "before": {
+            "commit_sha": "a" * 40,
+            "core_baselines": _close_grade_paired_baselines("e2e-core", [201002]),
+            "responsive_baselines": [],
+            "gate_ready_baselines": _close_grade_gate_ready_baselines([201002]),
+        },
+        "after": {
+            "commit_sha": "b" * 40,
+            "core_baselines": core,
+            "responsive_baselines": responsive,
+            "gate_ready_baselines": gate_ready,
+        },
+    }
+    receipt = build_close_grade_receipt(
+        fixture,
+        manifest_sha256="sha256:" + "3" * 64,
+        trusted_functional_evidence={},
+        validation_decision={"semantic_valid": True, "approval_eligible": True},
+        exit_code=0,
+        gate_status="complete",
+    )
+    assert receipt["arms"]["split"]["performance_eligible_workflow_run_ids"] == [
+        str(rid) for rid in run_ids
+    ]
+    assert len(receipt["arms"]["split"]["performance_eligible_workflow_run_ids"]) == 20
+
+
+def test_split_arm_genuinely_missing_responsive_provider_still_fails_closed():
+    """Issue #2554 AC5 (negative regression): a split fixture where the
+    `e2e-responsive-matrix` provider is genuinely missing for one run still
+    produces the existing fail-closed `missing_pair_e2e-responsive-matrix`
+    evidence error -- the #2554 layout-aware wiring must never weaken this
+    SPLIT-topology negative semantics."""
+    paired_id = 105001
+    missing_responsive_id = 105002
+    core = _close_grade_paired_baselines("e2e-core", [paired_id, missing_responsive_id])
+    responsive = _close_grade_paired_baselines("e2e-responsive-matrix", [paired_id])  # missing_responsive_id absent
+    gate_ready = _close_grade_gate_ready_baselines([paired_id, missing_responsive_id])
+
+    split_core, split_responsive = _layout_aware_provider_baselines(
+        PERFORMANCE_TOPOLOGY_SPLIT, core, responsive
+    )
+    pairs, evidence_errors = _pair_by_workflow_run_id(split_core, split_responsive)
+
+    assert any(
+        err["workflow_run_id"] == missing_responsive_id
+        and "missing_pair_e2e-responsive-matrix" in err["reason"]
+        for err in evidence_errors
+    )
+
+    arm_result, arm_errors = _materialize_close_grade_arm(split_core, split_responsive, gate_ready, "split")
+    assert str(missing_responsive_id) not in arm_result["performance_eligible_workflow_run_ids"]
+    assert any(
+        e["workflow_run_id"] == str(missing_responsive_id)
+        and "missing_pair_e2e-responsive-matrix" in e["reason"]
+        for e in arm_errors
+    )
+
+
+_AC6_COHORT_FIXTURE_COMMON = {
+    "issue_number": 2554,
+    "pr_number": 9999,
+    "measured_at": "2026-09-08T00:00:00Z",
+    "functional_evidence": {"proof_level": "check_run_only", "coverage_bound": False},
+    "declared_impact": "Issue #2554 AC6 convergence regression fixture.",
+    "risk_acknowledgement": {
+        "reference": {"source_kind": "issue_comment", "source_id": "issuecomment-5575198296"},
+        "verification_status": "unverified",
+    },
+    "cohort_provenance": {
+        "runner_image": "ubuntu-24.04",
+        "workers": 1,
+        "scheduler": "loadscope",
+        "command_manifest_digest": "sha256:" + "0" * 64,
+        "test_selection_digest": "sha256:" + "0" * 64,
+    },
+}
+
+
+def test_production_assessment_input_uses_same_layout_aware_observation_as_close_grade_receipt():
+    """Issue #2554 AC6: production assessment input (percentile calc /
+    run-details, via `run_evidence_gate()`) for the monolith `before` arm
+    and split `after` arm uses the SAME layout-aware materialized
+    observation `build_close_grade_receipt()`'s close-grade eligibility
+    does -- proving convergence, not two independently (and possibly
+    divergently) computed sets of duration values."""
+    before_run_ids = list(range(106001, 106021))
+    after_run_ids = list(range(107001, 107021))
+    core_ms = 200_000
+    responsive_ms = 30_000
+
+    before_core = _monolith_e2e_core_baselines(before_run_ids, core_ms=core_ms, responsive_ms=responsive_ms)
+    after_core = _close_grade_paired_baselines("e2e-core", after_run_ids, base_ms=90_000)
+    after_responsive = _close_grade_paired_baselines("e2e-responsive-matrix", after_run_ids, base_ms=120_000)
+
+    fixture = dict(_AC6_COHORT_FIXTURE_COMMON)
+    fixture["before"] = {
+        "commit_sha": "a" * 40,
+        "core_baselines": before_core,
+        "responsive_baselines": [],
+        "gate_ready_baselines": _close_grade_gate_ready_baselines(before_run_ids),
+    }
+    fixture["after"] = {
+        "commit_sha": "b" * 40,
+        "core_baselines": after_core,
+        "responsive_baselines": after_responsive,
+        "gate_ready_baselines": _close_grade_gate_ready_baselines(after_run_ids),
+    }
+
+    result = run_evidence_gate(fixture)
+    assert result["gate_status"] == "complete"
+    assert result["before_provider_post_filter_count"] == 20
+    assert result["after_provider_post_filter_count"] == 20
+
+    before_run_details = result["assessment"]["performance_evidence"]["runtime_delta"]["before"]["run_details"]
+    before_by_id = {rd["workflow_run_id"]: rd["duration_seconds"] for rd in before_run_details}
+    for i, run_id in enumerate(before_run_ids):
+        assert before_by_id[run_id] == (core_ms + i + responsive_ms + i) / 1000
+
+    after_run_details = result["assessment"]["performance_evidence"]["runtime_delta"]["after"]["run_details"]
+    after_by_id = {rd["workflow_run_id"]: rd["duration_seconds"] for rd in after_run_details}
+    for i, run_id in enumerate(after_run_ids):
+        assert after_by_id[run_id] == max(90_000 + i, 120_000 + i) / 1000
+
+    # Convergence: `build_close_grade_receipt()`'s arms.monolith/arms.split
+    # eligible sets are computed from the SAME layout-aware pairing this
+    # assessment input used -- not an independent re-scan.
+    receipt = build_close_grade_receipt(
+        fixture,
+        manifest_sha256="sha256:" + "4" * 64,
+        trusted_functional_evidence={},
+        validation_decision=result.get("validation_result"),
+        exit_code=0,
+        gate_status=result["gate_status"],
+    )
+    assert receipt["arms"]["monolith"]["performance_eligible_workflow_run_ids"] == [
+        str(rid) for rid in before_run_ids
+    ]
+    assert receipt["arms"]["split"]["performance_eligible_workflow_run_ids"] == [
+        str(rid) for rid in after_run_ids
+    ]
+    assert (
+        len(receipt["arms"]["monolith"]["performance_eligible_workflow_run_ids"])
+        == result["before_provider_post_filter_count"]
+    )
+    assert (
+        len(receipt["arms"]["split"]["performance_eligible_workflow_run_ids"])
+        == result["after_provider_post_filter_count"]
+    )
+
+
+def test_monolith_completeness_check_does_not_misfire_on_legacy_generic_single_phase_baselines():
+    """Issue #2554 fix_delta P1 guard (human anchor review
+    issuecomment-5584055868): `_monolith_required_phase_completeness()` is
+    scoped to baselines that already carry AT LEAST ONE of the two known
+    monolith phase ids -- a legacy/generic single-`test_e2e_core`-phase
+    baseline (used elsewhere for SPLIT-arm and topology-agnostic fixtures,
+    e.g. `_close_grade_paired_baselines()`) must not be misclassified as
+    an incomplete monolith observation."""
+    baseline = _close_grade_paired_baselines("e2e-core", [999001])[0]
+    assert _monolith_required_phase_completeness(baseline) is True
+
+
+def test_monolith_run_missing_responsive_phase_excluded_from_provider_count_eligibility_and_run_details():
+    """Issue #2554 fix_delta P1 (human anchor review issuecomment-5584055868,
+    PRIMARY counterexample): a 20-run monolith fixture where ONE run's
+    single `e2e-core` baseline is missing usable `test_e2e_monolith_
+    responsive` phase evidence (only `test_e2e_ci` remains) must never
+    self-pair on the remaining phase alone and be counted as a valid
+    Performance observation. Verifies ALL of: (1) provider post-filter
+    sample count excludes it (19, not 20), (2) it is excluded from the
+    assessment run-details input (the SAME `_cli_run_details_from_pairs`
+    call `run_evidence_gate()` uses), (3) it is excluded from
+    `performance_eligible_workflow_run_ids` in the close-grade receipt,
+    and (4) it is NEVER silently dropped from the root run set -- it
+    surfaces with an explicit `MISSING_MONOLITH_PERFORMANCE_PHASE_REASON`
+    evidence error in both the receipt and `run_evidence_gate()` itself."""
+    run_ids = list(range(108001, 108021))
+    incomplete_run_id = run_ids[7]
+    core = _monolith_e2e_core_baselines(run_ids)
+    for baseline in core:
+        if baseline["workflow_run_id"] == incomplete_run_id:
+            baseline["measurements"] = [
+                m for m in baseline["measurements"] if m["phase_id"] != "test_e2e_monolith_responsive"
+            ]
+
+    monolith_core, monolith_responsive = _layout_aware_provider_baselines(
+        PERFORMANCE_TOPOLOGY_MONOLITH, core, []
+    )
+
+    # (1) provider post-filter sample count excludes the incomplete run.
+    count, _pair_evidence_errors = _provider_post_filter_sample_count(monolith_core, monolith_responsive)
+    assert count == 19
+
+    # (2) the SAME pairs `run_evidence_gate()` feeds `_cli_run_details_
+    # from_pairs` to build assessment run-details/percentile input also
+    # exclude the incomplete run.
+    pairs, _ = _pair_by_workflow_run_id(monolith_core, monolith_responsive)
+    run_details = _cli_run_details_from_pairs(pairs, "a" * 40)
+    assert incomplete_run_id not in {rd["workflow_run_id"] for rd in run_details}
+    assert len(run_details) == 19
+
+    # (3)+(4) close-grade receipt: not eligible, but never silently
+    # dropped from the root run set -- explicitly explained instead.
+    fixture = {
+        "issue_number": 2554,
+        "pr_number": 9999,
+        "before": {
+            "commit_sha": "a" * 40,
+            "core_baselines": core,
+            "responsive_baselines": [],
+            "gate_ready_baselines": _close_grade_gate_ready_baselines(run_ids),
+        },
+        "after": {
+            "commit_sha": "b" * 40,
+            "core_baselines": _close_grade_paired_baselines("e2e-core", [201003]),
+            "responsive_baselines": _close_grade_paired_baselines("e2e-responsive-matrix", [201003]),
+            "gate_ready_baselines": _close_grade_gate_ready_baselines([201003]),
+        },
+    }
+    receipt = build_close_grade_receipt(
+        fixture,
+        manifest_sha256="sha256:" + "5" * 64,
+        trusted_functional_evidence={},
+        validation_decision={"semantic_valid": True, "approval_eligible": True},
+        exit_code=0,
+        gate_status="complete",
+    )
+    eligible = receipt["arms"]["monolith"]["performance_eligible_workflow_run_ids"]
+    assert str(incomplete_run_id) not in eligible
+    assert len(eligible) == 19
+    assert str(incomplete_run_id) in receipt["arms"]["monolith"]["workflow_run_ids"]
+    monolith_reasons = {
+        e["reason"]
+        for e in receipt["evidence_errors"]
+        if e["arm"] == "monolith" and e["workflow_run_id"] == str(incomplete_run_id)
+    }
+    assert MISSING_MONOLITH_PERFORMANCE_PHASE_REASON in monolith_reasons
+
+    # (4, continued) `run_evidence_gate()` itself must also thread this
+    # reason into its OWN evidence_errors -- and correctly fail-closes
+    # `gate_status` as a result (any non-empty evidence_errors is an
+    # existing fail-closed contract of `_evidence_readiness_hard_check_
+    # post_filter` this fix_delta does not relax).
+    gate_fixture = dict(_AC6_COHORT_FIXTURE_COMMON)
+    gate_fixture["before"] = fixture["before"]
+    gate_fixture["after"] = {
+        "commit_sha": "b" * 40,
+        "core_baselines": _close_grade_paired_baselines("e2e-core", list(range(109001, 109021)), base_ms=90_000),
+        "responsive_baselines": _close_grade_paired_baselines(
+            "e2e-responsive-matrix", list(range(109001, 109021)), base_ms=120_000
+        ),
+        "gate_ready_baselines": _close_grade_gate_ready_baselines(list(range(109001, 109021))),
+    }
+    result = run_evidence_gate(gate_fixture)
+    assert result["gate_status"] == "insufficient_evidence"
+    assert result["before_provider_post_filter_count"] == 19
+    assert MISSING_MONOLITH_PERFORMANCE_PHASE_REASON in result["reason"]
+
+
+def test_monolith_run_missing_test_e2e_ci_phase_symmetric_case_excluded_and_recorded():
+    """Issue #2554 fix_delta P1 SYMMETRIC counterexample (mirror of the
+    primary counterexample above): a run missing `test_e2e_ci` (rather
+    than `test_e2e_monolith_responsive`) is excluded and recorded the same
+    way -- proves the completeness check genuinely covers BOTH required
+    phases, not only one direction."""
+    run_ids = list(range(110001, 110021))
+    incomplete_run_id = run_ids[3]
+    core = _monolith_e2e_core_baselines(run_ids)
+    for baseline in core:
+        if baseline["workflow_run_id"] == incomplete_run_id:
+            baseline["measurements"] = [m for m in baseline["measurements"] if m["phase_id"] != "test_e2e_ci"]
+
+    monolith_core, monolith_responsive = _layout_aware_provider_baselines(
+        PERFORMANCE_TOPOLOGY_MONOLITH, core, []
+    )
+    count, _ = _provider_post_filter_sample_count(monolith_core, monolith_responsive)
+    assert count == 19
+
+    pairs, _ = _pair_by_workflow_run_id(monolith_core, monolith_responsive)
+    run_details = _cli_run_details_from_pairs(pairs, "a" * 40)
+    assert incomplete_run_id not in {rd["workflow_run_id"] for rd in run_details}
+    assert len(run_details) == 19
+
+    fixture = {
+        "issue_number": 2554,
+        "pr_number": 9999,
+        "before": {
+            "commit_sha": "a" * 40,
+            "core_baselines": core,
+            "responsive_baselines": [],
+            "gate_ready_baselines": _close_grade_gate_ready_baselines(run_ids),
+        },
+        "after": {
+            "commit_sha": "b" * 40,
+            "core_baselines": _close_grade_paired_baselines("e2e-core", [201004]),
+            "responsive_baselines": _close_grade_paired_baselines("e2e-responsive-matrix", [201004]),
+            "gate_ready_baselines": _close_grade_gate_ready_baselines([201004]),
+        },
+    }
+    receipt = build_close_grade_receipt(
+        fixture,
+        manifest_sha256="sha256:" + "6" * 64,
+        trusted_functional_evidence={},
+        validation_decision={"semantic_valid": True, "approval_eligible": True},
+        exit_code=0,
+        gate_status="complete",
+    )
+    eligible = receipt["arms"]["monolith"]["performance_eligible_workflow_run_ids"]
+    assert str(incomplete_run_id) not in eligible
+    assert len(eligible) == 19
+    assert str(incomplete_run_id) in receipt["arms"]["monolith"]["workflow_run_ids"]
+    monolith_reasons = {
+        e["reason"]
+        for e in receipt["evidence_errors"]
+        if e["arm"] == "monolith" and e["workflow_run_id"] == str(incomplete_run_id)
+    }
+    assert MISSING_MONOLITH_PERFORMANCE_PHASE_REASON in monolith_reasons
 
 
 # =============================================================================
