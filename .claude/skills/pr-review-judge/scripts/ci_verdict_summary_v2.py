@@ -89,11 +89,6 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     # blocking (gh_error). Classified "excluded" (not "evidence"/"required")
     # because this job's pass/fail must never affect merge-ready.
     ("ci", "reliability-assessment"): "excluded",
-    # Issue #2433 PR #2561 merge-readiness repair: this job is gated on a
-    # workflow_dispatch-only input and is therefore intentionally skipped on
-    # ordinary pull_request runs.  It is not required evidence; unknown jobs
-    # remain fail-closed below.
-    ("ci", "close-evidence-publication"): "excluded",
     # Issue #2524: visual-impact-policy-trusted-consumer is a SEPARATE
     # `workflow_run`-triggered advisory re-verification of the producer's
     # `visual-impact-policy` (`ci`, above) decision -- confirmed on current
@@ -116,6 +111,15 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     ("Check Japanese Content", "Issue Comment Japanese Check (retrospective)"): "excluded",
     ("Check Japanese Content", "Issue Body Japanese Check (retrospective)"): "excluded",
 }
+
+# Issue #2433 PR #2561: unlike ordinary unconditional exclusions, this job is
+# excluded only for its intentionally skipped ordinary-PR CheckRun.  The run
+# binding is represented by the adapter's github_check_run_api provenance:
+# check_runs_api_to_raw_checks() accepts that provenance only after binding the
+# CheckRun details URL to the exact workflow_run_id.
+CONDITIONAL_EXCLUDED_TUPLE = ("ci", "close-evidence-publication")
+EXACT_CHECK_RUN_PROVENANCE = "github_check_run_api"
+
 
 # REQUIRED_CHECKS: (workflow, name) tuples that MUST appear with conclusion=success
 # for overall_status to be merge_ready. Absence → no_required_evidence.
@@ -182,6 +186,32 @@ FAILURE_REASON_ENUM = [
 
 def get_classification(workflow: str, check_name: str) -> str:
     return CLASSIFICATION_MAP.get((workflow, check_name), "unknown")
+
+
+def is_exact_close_evidence_publication_skip(
+    check: dict[str, Any],
+    event_name: str | None,
+) -> bool:
+    """Return whether the one conditional exclusion is fully proven.
+
+    A matching name is not enough: the CheckRun must be an exact, addressable
+    current-head row from the current workflow run and the ordinary PR route
+    must have completed it as skipped. Every incomplete or divergent case is
+    deliberately classified as unknown and therefore blocks fail-closed.
+    """
+    check_run_id = check.get("check_run_id")
+    return (
+        event_name == "pull_request"
+        and (check.get("workflow"), check.get("name")) == CONDITIONAL_EXCLUDED_TUPLE
+        and check.get("status") == "completed"
+        and check.get("conclusion") == "skipped"
+        and check.get("head_sha") is not None
+        and check.get("head_sha_match") is True
+        and check.get("provenance") == EXACT_CHECK_RUN_PROVENANCE
+        and isinstance(check_run_id, int)
+        and not isinstance(check_run_id, bool)
+        and check_run_id > 0
+    )
 
 
 def is_pending_status(status: str | None) -> bool:
@@ -283,6 +313,7 @@ def build_check_entry(
     raw: dict[str, Any],
     workflow: str,
     expected_head_sha: str,
+    event_name: str | None = None,
 ) -> dict[str, Any]:
     name = raw.get("name", "")
     # REST CheckRun API uses ``id``. The API adapter intentionally preserves
@@ -320,6 +351,16 @@ def build_check_entry(
 
     if provenance is not None:
         entry["provenance"] = provenance
+
+    # Do not make this workflow_dispatch-only job a blanket exclusion. Its
+    # exclusion is available only after status, current-head, and exact-run
+    # provenance have all been established above.
+    if (workflow, name) == CONDITIONAL_EXCLUDED_TUPLE:
+        entry["classification"] = (
+            "excluded"
+            if is_exact_close_evidence_publication_skip(entry, event_name)
+            else "unknown"
+        )
 
     blocking, failure_reason = determine_check_verdict(entry, expected_head_sha)
     entry["blocking_merge_ready"] = blocking
@@ -403,7 +444,7 @@ def generate_verdict(
     checks = []
     for raw in raw_checks:
         workflow = raw.get("workflow", raw.get("workflowName", "unknown"))
-        entry = build_check_entry(raw, workflow, expected_head_sha)
+        entry = build_check_entry(raw, workflow, expected_head_sha, event_name)
         checks.append(entry)
 
     overall_status, next_action = compute_overall_status(
