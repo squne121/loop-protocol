@@ -1,13 +1,15 @@
----
+# Herdr Cold Restart Capability Spike（cold restart実現可能性spike, #2571）
+
+このメタデータは機械可読な要約であり、詳細は本文を参照する。
+
+```yaml
 issue: "#2571"
 parent_issue: "#2562"
 dependent_issue: "#2569"
 status: completed
 feasibility_verdict: partially_feasible_with_constraints
 executed_at: "2026-09-08"
----
-
-# Herdr Cold Restart Capability Spike (#2571)
+```
 
 ## 目的
 
@@ -15,7 +17,7 @@ Herdr cold restart経路でのproject-scoped dispatcher/PATH-shim interception�
 disposable named Herdr sessionに対する実際のcold restart canaryのcausal runtime proofで判定する。
 production code実装（#2569）は本spikeのスコープに含まない。
 
-## Baseline
+## Baseline（前提条件）
 
 | 項目 | 値 |
 |---|---|
@@ -53,14 +55,14 @@ $ herdr --session lp2571-repro-4945a854 workspace list
 
 ## Cold Restart Canary 実行結果（causal process-boundary evidence）
 
-### disposable session
+### disposable session（使い捨てセッション）
 
 - 命名: `lp2571-repro-4945a854`（run固有nonce付き、人間の`default` sessionとは名前空間上完全分離）
 - collision確認: `herdr session list --json` で事前に存在しないことを確認してから作成
 - lifecycle: create → (canary実行) → cold restart(stop→再起動) → (canary継続) → stop → delete
 - **human default session は無傷**: canary実行前後で `herdr workspace list`（default session）は一貫して人間の実ワークスペース `w4`（pane_count=7）のみであることを確認済み。outer workspace（`wS`、このrun専用）は実行後に `herdr workspace close` で除去済み。
 
-### Pre-restart baseline
+### Pre-restart baseline（再起動前の基準確認）
 
 - disposable session内に `herdr --session <name> workspace create --env PATH=<shim>:<decoy>:<system-path>` でworkspace作成（pane `w2:p1`）
 - **重要な発見**: `--env PATH=...` によるherdr側のprocess env注入だけでは、対話bashシェルの起動時に `~/.local/bin` 等がPATH先頭へ再prependされるため、`command -v claude` は意図したforwarderではなく real native claude (`/home/squne/.local/bin/claude`) に解決された。receipt file・decoy markerともに未生成（forwarder/decoyどちらも呼ばれず）。これはcold restart以前の時点で既に発生する、ambient PATH-onlyアプローチの限界を示すcausal evidenceである。
@@ -70,7 +72,7 @@ $ herdr --session lp2571-repro-4945a854 workspace list
   - receipt file に run-scoped nonce (`5d6d7e20ee2e446e90cf5421ff820d51`) が正しく書き込まれ、事前生成したnonceと一致
   - ambient decoy（別ディレクトリの偽`claude`）は未発火（`decoy_marker.txt` 不存在）
 
-### Resumable Claude conversation
+### Resumable Claude conversation（再開可能な会話の作成）
 
 - `claude -p --output-format json` でforwarder経由の実conversationを作成
 - session ID を取得（本文書では `run_worktree_agent_runtime_smoke.py` の既存方針＝session_idはevidenceに含めない、PR #1921 P1 fix-deltaに合わせてredact。以下 `<session-id>` と表記）
@@ -97,11 +99,11 @@ $ herdr --session lp2571-repro-4945a854 workspace list
   → receipt file のnonce一致を再確認
   → ambient decoy不発火を再確認
 
-### Native Claude絶対path pinning（self-recursion回避）
+### Native Claude絶対path pinning（自己再帰の回避確認）
 
 forwarder scriptは `command -v claude` へのfallbackを一切行わず、pre-shim段階（shimをPATHへ追加する前）に解決した real native claude絶対path (`/home/squne/.local/bin/claude`) を forwarder script生成時点で固定的にexec対象へ埋め込んでいる（`exec '/home/squne/.local/bin/claude' "$@"`）。このためforwarder自身が自己参照するself-recursionのリスクは構造的に排除されている（`CLAUDE_GPT_CLAUDE_BIN` pre-shim resolutionパターン、commit `205ec3f5` と同型の設計）。
 
-## Cleanup
+## Cleanup（後片付け）
 
 - disposable named Herdr session: `herdr session stop` → `herdr session delete` 実行、`herdr session list --json` で消失確認済み（最終状態は `default` セッションのみ）。
 - outer workspace（`wS`、このrun専用）: `herdr workspace close` で除去済み。
@@ -128,7 +130,7 @@ Herdr cold restart経路でのproject-scoped `claude` forwarder interceptionは�
 
 この制約は、Issue #2571 の概念図に示された `dispatcher → scripts/claude-gpt/launch.sh --claude-bin "$REAL_CLAUDE" -- --resume "$SESSION_ID"` という、PATH shadowingに依存せず明示的にdispatcherを起動する設計（launch.shの `--claude-bin` 明示指定パターン）であれば、そもそもPATH解決の順序問題を回避できる可能性が高い。#2569 実装時は、ambient PATH-shim方式ではなく、この明示dispatcher呼び出し方式を優先することを推奨する。
 
-## Next Action（Handoff）
+## Next Action（次のアクション）
 
 - #2569 は本判定（`partially_feasible_with_constraints`）を前提に着手可能。ただし上記の追加制約（repository-owned bootstrap機構によるPATH再主張、または明示dispatcher呼び出し方式の採用）を設計に反映すること。
 - `run_worktree_agent_runtime_smoke.py` の `HERDR_SESSION` 環境変数依存箇所は、#2569実装時に `--session` flagベースへの見直しを検討すること（本spikeでは変更していない）。
