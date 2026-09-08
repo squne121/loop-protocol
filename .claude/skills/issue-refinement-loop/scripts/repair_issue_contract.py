@@ -1340,6 +1340,126 @@ def _reject_forged_current_issue_source_spans(
     return filtered
 
 
+def _validate_owner_anchor_source_span_authority(
+    span: dict,
+    *,
+    field_id: str,
+    repo: Optional[str],
+    issue_number: Optional[int],
+    owner_anchor_snapshot: Optional[dict],
+    field_labels: dict[str, str],
+) -> bool:
+    """Validate an existing ``owner_anchor`` span against the producer's
+    separately supplied, trusted anchor snapshot before classification.
+
+    The span itself is untrusted handoff data. Its source URL/id/revision and
+    line range must bind to the exact OWNER comment snapshot that preflight
+    already structurally resolved; otherwise this generic producer boundary
+    drops it before ``source_span_exact`` can become auto-apply-safe.
+    """
+    if span.get("authority_kind") != "owner_anchor":
+        return True
+    if not isinstance(owner_anchor_snapshot, dict) or repo is None or issue_number is None:
+        return False
+    body = owner_anchor_snapshot.get("body")
+    comment_id = owner_anchor_snapshot.get("comment_id")
+    comment_url = owner_anchor_snapshot.get("comment_url")
+    if (
+        not isinstance(body, str)
+        or not body
+        or not isinstance(comment_id, str)
+        or not comment_id.isdecimal()
+        or not isinstance(comment_url, str)
+        or owner_anchor_snapshot.get("repo") != repo
+        or owner_anchor_snapshot.get("target_issue_number") != issue_number
+        or owner_anchor_snapshot.get("author_association") != "OWNER"
+        or not isinstance(owner_anchor_snapshot.get("comment_updated_at"), str)
+        or not owner_anchor_snapshot["comment_updated_at"].strip()
+        or owner_anchor_snapshot.get("body_sha256") != _sha256(body)
+    ):
+        return False
+    expected_url = f"https://github.com/{repo}/issues/{issue_number}#issuecomment-{comment_id}"
+    if (
+        comment_url != expected_url
+        or span.get("source_url") != expected_url
+        or span.get("source_repo") != repo
+        or span.get("source_object_kind") != "issue_comment"
+        or span.get("source_object_id") != comment_id
+        or span.get("source_revision") != _sha256(body)
+    ):
+        return False
+    expected_heading = field_labels.get(field_id)
+    if not isinstance(expected_heading, str) or not expected_heading:
+        return False
+    sections = _parse_h2_sections(body)
+    matches = [section for section in sections if section["heading"].strip() == expected_heading]
+    if len(matches) != 1:
+        return False
+    section = matches[0]
+    text = section["content"].strip()
+    if not text or span.get("text") != text:
+        return False
+    body_lines = body.split("\n")
+    _heading_start, section_end_line = _section_line_bounds(sections, len(body_lines))[id(section)]
+    raw_content_start_line = section["start_line"] + 1
+    if raw_content_start_line > section_end_line:
+        return False
+    raw_content = "\n".join(body_lines[raw_content_start_line - 1 : section_end_line])
+    leading_ws_len = len(raw_content) - len(raw_content.lstrip())
+    line_start = raw_content_start_line + raw_content[:leading_ws_len].count("\n")
+    line_end = line_start + text.count("\n")
+    return (
+        span.get("line_start") == line_start
+        and span.get("line_end") == line_end
+        and "\n".join(body_lines[line_start - 1 : line_end]) == text
+    )
+
+
+def _reject_forged_owner_anchor_source_spans(
+    source_spans: Optional[dict],
+    *,
+    repo: Optional[str],
+    issue_number: Optional[int],
+    owner_anchor_snapshot: Optional[dict],
+    field_labels: dict[str, str],
+) -> Optional[dict]:
+    """Drop unbound owner-anchor candidates, including list entries, before
+    classification. A dropped sole candidate follows the established
+    human-review-required path rather than introducing a new disposition."""
+    if not source_spans:
+        return source_spans
+    filtered: dict = {}
+    for field_id, entry in source_spans.items():
+        if isinstance(entry, list):
+            kept = [
+                candidate
+                for candidate in entry
+                if not isinstance(candidate, dict)
+                or _validate_owner_anchor_source_span_authority(
+                    candidate,
+                    field_id=field_id,
+                    repo=repo,
+                    issue_number=issue_number,
+                    owner_anchor_snapshot=owner_anchor_snapshot,
+                    field_labels=field_labels,
+                )
+            ]
+            if kept:
+                filtered[field_id] = kept
+            continue
+        if isinstance(entry, dict) and not _validate_owner_anchor_source_span_authority(
+            entry,
+            field_id=field_id,
+            repo=repo,
+            issue_number=issue_number,
+            owner_anchor_snapshot=owner_anchor_snapshot,
+            field_labels=field_labels,
+        ):
+            continue
+        filtered[field_id] = entry
+    return filtered
+
+
 def parse_issue_template_fields(template_text: str, template_path: str) -> list[dict]:
     """Parse a GitHub issue-form YAML template (`.github/ISSUE_TEMPLATE/*.yml`)
     into ordered field metadata.
@@ -2018,6 +2138,7 @@ def build_structural_repair_bundle(
     original_updated_at: Optional[str] = None,
     known_scalars: Optional[dict] = None,
     source_spans: Optional[dict] = None,
+    owner_anchor_snapshot: Optional[dict] = None,
     template_git_blob_sha: Optional[str] = None,
     template_source_ref: Optional[str] = None,
 ) -> dict:
@@ -2048,6 +2169,20 @@ def build_structural_repair_bundle(
     source_spans = _reject_forged_current_issue_source_spans(
         source_spans, repo=repo, issue_number=issue_number,
         original_body_sha256=original_body_sha256,
+    )
+    # Issue #2582: unlike `current_issue`, an owner-anchor source lives in a
+    # separate comment. Bind its span to the independently supplied, already
+    # trusted snapshot before the common classifier reads any candidate.
+    field_labels = {
+        field["field_id"]: field["label"]
+        for field in parse_issue_template_fields(template_text, template_path)
+    }
+    source_spans = _reject_forged_owner_anchor_source_spans(
+        source_spans,
+        repo=repo,
+        issue_number=issue_number,
+        owner_anchor_snapshot=owner_anchor_snapshot,
+        field_labels=field_labels,
     )
     items = detect_missing_template_sections(
         body,

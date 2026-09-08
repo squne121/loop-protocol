@@ -7452,6 +7452,110 @@ def _resolve_current_issue_heading_alias_source_spans(
     return spans
 
 
+# Issue #2582: closed mapping of pre-existing parent-template required fields
+# that may be copied from an explicit human-context OWNER anchor. This is not a
+# new authority, derivation mode, or template profile: it only binds existing
+# template field ids to their exact canonical H2 labels.
+_OWNER_ANCHOR_REQUIRED_SECTION_FIELDS: dict[str, str] = {
+    "Quality Decision Record": "quality-decision-record",
+    "Child Issues": "child-issues",
+    "Remaining Parent Gaps": "remaining-parent-gaps",
+}
+
+
+def _resolve_owner_anchor_required_section_source_spans(
+    target_body: str,
+    *,
+    anchor_body: str,
+    anchor_url: str,
+    anchor_comment: dict[str, Any],
+    repo: str,
+    issue_number: int,
+) -> "dict[str, dict[str, Any]]":
+    """Return exact parent-template section spans from one trusted OWNER
+    comment, or no spans at all when any source binding is invalid.
+
+    The caller has already selected the explicit ``human_context`` lane. This
+    helper adds the narrower producer-side binding required for the existing
+    ``owner_anchor`` authority: exact comment URL/id/repository/target/body
+    snapshot and revision, followed by fence-aware exact-H2 extraction. It
+    deliberately does not infer human origin from a URL and never accepts a
+    MEMBER/COLLABORATOR/agent anchor for this owner-only lane.
+    """
+    if _parse_h2_sections is None or _section_line_bounds is None:
+        return {}
+    if not isinstance(anchor_comment, dict) or not isinstance(anchor_body, str) or not anchor_body:
+        return {}
+    parsed_url = _parse_anchor_comment_url(anchor_url)
+    if (
+        not parsed_url.get("valid")
+        or f"{parsed_url.get('owner')}/{parsed_url.get('repo')}" != repo
+        or parsed_url.get("issue_number") != issue_number
+        or str(anchor_comment.get("id")) != str(parsed_url.get("comment_id"))
+        or anchor_comment.get("html_url") != anchor_url
+        or anchor_comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{issue_number}"
+        or anchor_comment.get("author_association") != "OWNER"
+        or anchor_comment.get("body") != anchor_body
+        or not isinstance(anchor_comment.get("updated_at"), str)
+        or not anchor_comment["updated_at"].strip()
+    ):
+        return {}
+
+    target_sections = _parse_h2_sections(target_body)
+    anchor_sections = _parse_h2_sections(anchor_body)
+    target_index: dict[str, list[dict]] = {}
+    anchor_index: dict[str, list[dict]] = {}
+    for section in target_sections:
+        target_index.setdefault(section["heading"].strip().casefold(), []).append(section)
+    for section in anchor_sections:
+        anchor_index.setdefault(section["heading"].strip().casefold(), []).append(section)
+
+    anchor_lines = anchor_body.split("\n")
+    anchor_bounds = _section_line_bounds(anchor_sections, len(anchor_lines))
+    source_revision = "sha256:" + _sha256(anchor_body)
+    spans: dict[str, dict[str, Any]] = {}
+    for heading, field_id in _OWNER_ANCHOR_REQUIRED_SECTION_FIELDS.items():
+        normalized = heading.casefold()
+        target_matches = target_index.get(normalized, [])
+        anchor_matches = anchor_index.get(normalized, [])
+        # Source headings must use the template's byte-exact canonical label;
+        # case-folding above is used only to also reject a casing-variant
+        # duplicate as ambiguous rather than treating it as absent.
+        if len(anchor_matches) == 1 and anchor_matches[0]["heading"].strip() != heading:
+            anchor_matches = []
+        # Missing target heading and precisely one non-empty anchor heading
+        # are both mandatory. Duplicate/empty/malformed parse results remain
+        # human-review candidates in the existing structural model.
+        if len(target_matches) != 0 or len(anchor_matches) != 1:
+            continue
+        anchor_section = anchor_matches[0]
+        content = anchor_section["content"].strip()
+        if not content:
+            continue
+        _heading_start, section_end_line = anchor_bounds[id(anchor_section)]
+        raw_content_start_line = anchor_section["start_line"] + 1
+        if raw_content_start_line > section_end_line:
+            continue
+        raw_content = "\n".join(anchor_lines[raw_content_start_line - 1 : section_end_line])
+        leading_ws_len = len(raw_content) - len(raw_content.lstrip())
+        line_start = raw_content_start_line + raw_content[:leading_ws_len].count("\n")
+        line_end = line_start + content.count("\n")
+        if "\n".join(anchor_lines[line_start - 1 : line_end]) != content:
+            continue
+        spans[field_id] = {
+            "text": content,
+            "source_url": anchor_url,
+            "line_start": line_start,
+            "line_end": line_end,
+            "authority_kind": "owner_anchor",
+            "source_repo": repo,
+            "source_object_kind": "issue_comment",
+            "source_object_id": str(parsed_url["comment_id"]),
+            "source_revision": source_revision,
+        }
+    return spans
+
+
 def run_preflight(
     issue_number: int,
     repo: str,
@@ -8078,6 +8182,46 @@ def run_preflight(
                 repo=repo,
                 issue_number=issue_number,
             )
+            _struct_owner_anchor_snapshot: Optional[dict[str, Any]] = None
+            # Issue #2582: only the already-established explicit human-context
+            # lane can reach the narrow owner-anchor assembler. It independently
+            # binds the OWNER comment identity/snapshot/revision before it emits
+            # any existing `owner_anchor` / `source_span_exact` provenance.
+            if (
+                _repair_source_lane == "human_context"
+                and isinstance(anchor_body_for_consumer, str)
+                and isinstance(anchor_url_for_consumer, str)
+                and isinstance(anchor_payload_for_consumer, dict)
+            ):
+                _owner_anchor_spans = _resolve_owner_anchor_required_section_source_spans(
+                    issue.get("body", "") or "",
+                    anchor_body=anchor_body_for_consumer,
+                    anchor_url=anchor_url_for_consumer,
+                    anchor_comment=anchor_payload_for_consumer,
+                    repo=repo,
+                    issue_number=issue_number,
+                )
+                if _owner_anchor_spans:
+                    _struct_owner_anchor_snapshot = {
+                        "repo": repo,
+                        "target_issue_number": issue_number,
+                        "comment_id": str(anchor_payload_for_consumer["id"]),
+                        "comment_url": anchor_url_for_consumer,
+                        "body": anchor_body_for_consumer,
+                        "body_sha256": "sha256:" + _sha256(anchor_body_for_consumer),
+                        "comment_updated_at": anchor_payload_for_consumer.get("updated_at"),
+                        "author_association": anchor_payload_for_consumer.get("author_association"),
+                    }
+                for _struct_field_id, _owner_span in _owner_anchor_spans.items():
+                    _existing_span = _struct_source_spans.get(_struct_field_id)
+                    if _existing_span is None:
+                        _struct_source_spans[_struct_field_id] = _owner_span
+                    elif isinstance(_existing_span, list):
+                        _struct_source_spans[_struct_field_id] = [*_existing_span, _owner_span]
+                    else:
+                        # An independently-derived candidate for the same
+                        # field is an ambiguity, not a priority decision.
+                        _struct_source_spans[_struct_field_id] = [_existing_span, _owner_span]
 
             structural_repair_action = build_structural_repair_bundle(
                 issue.get("body", "") or "",
@@ -8089,6 +8233,7 @@ def run_preflight(
                 original_updated_at=_repair_original_updated_at,
                 known_scalars=_struct_known_scalars or None,
                 source_spans=_struct_source_spans or None,
+                owner_anchor_snapshot=_struct_owner_anchor_snapshot,
                 template_git_blob_sha=_struct_git_blob_sha,
                 template_source_ref=_struct_source_ref,
             )
