@@ -78,6 +78,17 @@ UNCONDITIONAL_EXCLUDE_RULES: frozenset[tuple[str, str]] = frozenset({
     ("visual-impact-policy-trusted-consumer", "visual-impact-policy-trusted"),
 })
 
+# Issue #2433 / PR #2561: these dispatch-only CI jobs are intentionally skipped
+# on ordinary pull_request runs.  This narrowly scoped rule is deliberately
+# stricter than UNCONDITIONAL_EXCLUDE_RULES: an exact, provenance-complete,
+# current-head skipped CheckRun from the ordinary PR event is required.  A
+# failure, any other event, stale provenance, incomplete direct detail, and
+# every unknown tuple remain blocking.
+ORDINARY_PR_SKIPPED_EXCLUDE_RULES: frozenset[tuple[str, str]] = frozenset({
+    ("ci", "reliability-assessment"),
+    ("ci", "close-evidence-publication"),
+})
+
 # Artifact truncation limit (bytes)
 LOG_TRUNCATE_BYTES = 64 * 1024  # 64KB
 
@@ -480,6 +491,20 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     status = entry.get("status")
     name = entry.get("name") or ""
     workflow = entry.get("workflow") or ""
+
+    # Only the two exact workflow_dispatch-only jobs may be excluded, and
+    # only for their intentional ordinary-PR skipped CheckRun at this head.
+    # Do not grant this exemption to a failed/cancelled/pending check, stale
+    # provenance, incomplete direct CheckRun detail, or a similarly named job.
+    if (
+        (workflow, name) in ORDINARY_PR_SKIPPED_EXCLUDE_RULES
+        and entry.get("event") == "pull_request"
+        and status == "completed"
+        and conclusion == "skipped"
+        and _entry_run_head_sha(entry) == pr_head_sha
+        and entry.get("run_detail_complete") is True
+    ):
+        return "excluded"
 
     # Allowlist exclusion: head_sha=None + conclusion=skipped + (workflow, name) in rules
     # These are conditional/retrospective checks that do not run on PR commits.
