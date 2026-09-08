@@ -1776,10 +1776,12 @@ def test_dispatch_workflow_run_sends_target_sha_not_frozen_source_sha_key():
 
 
 def test_dispatch_workflow_run_reliability_evidence_true_adds_input_key():
-    """Issue #2585 AC1: `dispatch_workflow_run(..., reliability_evidence=True)`
-    MUST add `"reliability_evidence": "true"` to the dispatched `inputs`
-    dict (on top of the existing 4 keys), unblocking the
-    `reliability-assessment` job (Issue #2424)."""
+    """Issue #2585 AC1 / Issue #2592 AC1: `dispatch_workflow_run(...,
+    reliability_evidence=True)` MUST add `"reliability_evidence": "true"`
+    AND `"reliability_experiment_identity": <experiment_id>` to the
+    dispatched `inputs` dict (on top of the existing 4 keys), unblocking
+    the `reliability-assessment` job (Issue #2424) and its Playwright
+    metadata binding check (Issue #2592)."""
     captured_inputs: dict = {}
 
     def capturing_dispatch_call(repo, workflow_file, ref, inputs, return_run_details):
@@ -1798,6 +1800,7 @@ def test_dispatch_workflow_run_reliability_evidence_true_adds_input_key():
         reliability_evidence=True,
     )
     assert captured_inputs["reliability_evidence"] == "true"
+    assert captured_inputs["reliability_experiment_identity"] == "exp-1"
     assert captured_inputs["benchmark_layout"] == "monolith"
     assert captured_inputs["target_sha"] == FROZEN_SOURCE_SHA
     assert captured_inputs["block_id"] == "block-0001"

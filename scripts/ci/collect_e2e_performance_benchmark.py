@@ -1560,6 +1560,17 @@ def dispatch_workflow_run(
     # dispatch payload byte-for-byte (AC2 backward compatibility).
     if reliability_evidence:
         inputs["reliability_evidence"] = "true"
+        # Issue #2592: `.github/workflows/ci.yml` also declares a separate
+        # `reliability_experiment_identity` workflow_dispatch input, which
+        # is embedded into the Playwright JSON reporter metadata and
+        # cross-checked by `build_ci_reliability_assessment_v1.py` against
+        # the manifest's own `experiment_identity` (derived from this same
+        # `experiment_id` parameter). Without sending it here, the input
+        # stays empty and every reliability-assessment run fails closed
+        # with `playwright_metadata_binding_mismatch`. Additive-only, same
+        # as `reliability_evidence` above: only sent when reliability
+        # evidence was explicitly requested (AC2 backward compatibility).
+        inputs["reliability_experiment_identity"] = experiment_id
     response = dispatch_call(
         repo=repo,
         workflow_file=workflow_file,
