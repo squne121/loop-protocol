@@ -794,7 +794,7 @@ def test_issue_editor_permission_canary_requires_structured_parent_and_child_eve
     assert not canary._stream_json_has_tool_use(stdout, "Agent", subagent_type="issue-creator")
 
 
-def test_issue_editor_permission_canary_binds_child_lineage_hook_allow_and_helper_result():
+def test_issue_editor_permission_canary_binds_child_lineage_hook_allow_and_helper_result(monkeypatch, tmp_path):
     parent_tool_use_id = "toolu_parent_issue_editor"
     tool_use_id = "toolu_canonical_bash"
     helper_result = {
@@ -878,8 +878,21 @@ def test_issue_editor_permission_canary_binds_child_lineage_hook_allow_and_helpe
         "marker_observed": True,
     }
 
+    worktree = tmp_path / "linked-worktree"
+    (worktree / ".git").mkdir(parents=True)
+    monkeypatch.setenv(canary.ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV, "1")
+    monkeypatch.setattr(
+        canary.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout, ""),
+    )
 
-def test_issue_editor_permission_canary_does_not_infer_permission_decision_from_absence():
+    rc, detail = canary.run_issue_editor_permission_request_canary(worktree)
+    assert rc == canary.EXIT_OK
+    assert detail["permission_allow_observed"] is True
+
+
+def test_issue_editor_permission_canary_does_not_infer_permission_decision_from_absence(monkeypatch, tmp_path):
     parent_tool_use_id = "toolu_parent_issue_editor"
     tool_use_id = "toolu_canonical_bash"
     helper_result = {
@@ -954,6 +967,20 @@ def test_issue_editor_permission_canary_does_not_infer_permission_decision_from_
     assert evidence["permission_allow_observed"] is False
     assert evidence["helper_entrypoint_observed"] is True
     assert evidence["marker_observed"] is True
+
+    worktree = tmp_path / "linked-worktree"
+    (worktree / ".git").mkdir(parents=True)
+    monkeypatch.setenv(canary.ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV, "1")
+    monkeypatch.setattr(
+        canary.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout, ""),
+    )
+
+    rc, detail = canary.run_issue_editor_permission_request_canary(worktree)
+    assert rc == canary.EXIT_FAIL
+    assert detail["fail_reason"] == "issue_editor_permission_canary_evidence_incomplete"
+    assert detail["permission_allow_observed"] is False
 
 
 def test_issue_editor_permission_canary_rejects_out_of_order_lineage_and_helper_result():
@@ -1096,7 +1123,7 @@ def test_issue_editor_permission_canary_rejects_direct_parent_bash_even_with_hoo
     evidence = canary._stream_json_issue_editor_permission_evidence(stdout)
     assert evidence["parent_issue_editor_delegation_observed"] is True
     assert evidence["child_lineage_bound"] is False
-    assert evidence["permission_allow_observed"] is True
+    assert evidence["permission_allow_observed"] is False
 
 
 def test_issue_editor_permission_canary_rejects_false_denial_and_unrelated_stdout():

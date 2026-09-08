@@ -230,12 +230,11 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
     """Prove only the AC3 causal transaction chain from structured events.
 
     AC3 PASS is limited to the observed parent ``Agent(issue-editor)`` -> its
-    child canonical ``Bash`` -> that tool-use-id's successful
-    ``failed_no_mutation`` result -> terminal marker chain. PermissionRequest
-    is not part of this proof: classifier direct-deny and PermissionRequest are
-    distinct runtime paths. We retain an allow diagnostic only when an actual
-    PermissionRequest allow response is present; its absence makes no claim.
-    Raw runtime output is inspected only in memory.
+    child canonical ``Bash`` -> a causally bound ``PermissionRequest`` allow
+    decision -> that tool-use-id's successful ``failed_no_mutation`` result ->
+    terminal marker chain. A missing PermissionRequest decision is unknown,
+    not evidence of no-decision or successful execution. Raw runtime output is
+    inspected only in memory.
     """
     events: list[dict] = []
     for line in stdout.splitlines():
@@ -312,7 +311,7 @@ def _stream_json_issue_editor_permission_evidence(stdout: str) -> dict[str, bool
     )
 
     permission_allow_observed = False
-    if canonical_bash_result_bound and canonical_index is not None:
+    if child_lineage_bound and canonical_bash_result_bound and canonical_index is not None:
         permission_allow_observed = any(
             canonical_index < index < min(bound_result_indices)
             and event.get("type") == "system"
@@ -862,6 +861,7 @@ def run_issue_editor_permission_request_canary(worktree: Path | None) -> tuple[i
             detail["child_lineage_bound"],
             detail["canonical_bash_observed"],
             detail["canonical_bash_result_bound"],
+            detail["permission_allow_observed"],
             detail["helper_entrypoint_observed"],
             detail["marker_observed"],
         )
