@@ -1,29 +1,11 @@
 """Issue #2555 AC10 focused regression test for
 `scripts/ci/build_close_evidence_bundle_v1.py`'s `build_publication_receipt()`.
 
-Context: `actions/upload-artifact@v7`'s real `artifact-digest` action output is
-a BARE 64-hex-character SHA-256 string with NO `sha256:` prefix (confirmed by
-the OWNER anchor comment fact-check in #2555's "## Runtime Verification
-Ownership Disposition" table, finding #3, web-researcher SubAgent primary
-source check against the action's own README/outputs contract). This is a
-DIFFERENT wire representation than the GitHub Artifacts REST API's `digest`
-field, which IS `sha256:`-prefixed.
-
-The existing regression coverage in
-`scripts/ci/tests/test_build_close_evidence_bundle_v1.py::
-test_close_evidence_json_excludes_github_upload_only_keys` (line ~197-212)
-only exercises the `sha256:`-prefixed shape. This file adds the missing
-bare-hex (no prefix) counterpart so both real wire shapes that
-`build_publication_receipt()` may actually receive from
-`.github/workflows/ci.yml` are covered by deterministic regression.
-
-Scope note (#2555 Out of Scope): this test asserts CURRENT verbatim-passthrough
-behavior of `build_publication_receipt()`. It does not add, and must not be
-read as requiring, any `sha256:` prefix normalization logic -- that
-readback-time normalization (if ever needed) belongs to #2155's production
-verification, per #2555's Out of Scope / Runtime Verification Ownership
-Disposition. `build_publication_receipt()` itself is NOT modified by this
-Issue; only this new deterministic test file is added.
+This file guards AC10's bare-hex verbatim regression: `actions/upload-artifact@v7`'s
+`artifact-digest` action output and the GitHub Artifacts REST API's readback
+`digest` field are different wire representations (bare hex vs `sha256:`-prefixed).
+REST-side prefix comparison/normalization at readback time is Issue #2155's
+ownership, not this file's.
 """
 
 from __future__ import annotations
@@ -89,35 +71,3 @@ def test_publication_receipt_accepts_bare_hex_digest_verbatim(builder):
     for key in builder.GITHUB_UPLOAD_ONLY_KEYS:
         assert key in publication_receipt
     assert publication_receipt["bundle_payload_digest"] == close_evidence["bundle_payload_digest"]
-
-
-def test_publication_receipt_bare_hex_and_prefixed_digest_both_verbatim_distinct(builder):
-    """GIVEN two publication receipts built with the two real digest wire
-    shapes (bare-hex from `actions/upload-artifact@v7` vs.
-    `sha256:`-prefixed from the GitHub Artifacts REST API `digest` field)
-    THEN each stores its own input verbatim and the two are NOT
-    conflated or cross-normalized into a shared representation --
-    `build_publication_receipt()` performs no shape detection or
-    normalization of any kind."""
-    close_evidence = {
-        "experiment_identity": "issue-2555-digest-shape-distinction",
-        "bundle_payload_digest": "sha256:" + "d" * 64,
-    }
-    prefixed_digest = "sha256:" + "e" * 64
-
-    bare_receipt = builder.build_publication_receipt(
-        close_evidence,
-        github_artifact_id="7",
-        github_artifact_digest=_BARE_HEX_DIGEST,
-        artifact_url="https://github.com/squne121/loop-protocol/actions/runs/2/artifacts/7",
-    )
-    prefixed_receipt = builder.build_publication_receipt(
-        close_evidence,
-        github_artifact_id="7",
-        github_artifact_digest=prefixed_digest,
-        artifact_url="https://github.com/squne121/loop-protocol/actions/runs/2/artifacts/7",
-    )
-
-    assert bare_receipt["github_artifact_digest"] == _BARE_HEX_DIGEST
-    assert prefixed_receipt["github_artifact_digest"] == prefixed_digest
-    assert bare_receipt["github_artifact_digest"] != prefixed_receipt["github_artifact_digest"]
