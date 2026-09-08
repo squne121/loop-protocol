@@ -3387,11 +3387,28 @@ jobs:
         # intervening body edits). Fetch the SAME live REST endpoint here,
         # at actual producer-job execution time, so both sides bind to a
         # freshly-read body instead of two different snapshots.
+        #
+        # Issue #2594: on a `push` event (or a PR-less `workflow_dispatch`)
+        # there is no `github.event.pull_request.number`, so `PR_NUMBER` was
+        # previously empty and the unconditional `gh api pulls/${PR_NUMBER}`
+        # call 404'd, failing this job on every non-`pull_request` trigger
+        # (confirmed live: 35/36 historical push runs failed this way). The
+        # `|| ''` fallback + empty-string check before use follows the same
+        # existing guard pattern already used elsewhere in this file (see
+        # the `PR_NUMBER: ... || 0` / `GH_PR_NUMBER: ... || ''` steps
+        # above/below) rather than inventing a new one. When PR_NUMBER is
+        # empty, no `gh api` call is made and `pr_body.md` is written empty;
+        # the genuine `pull_request` event path (PR_NUMBER non-empty) is
+        # byte-for-byte unchanged.
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
         run: |
-          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""' > pr_body.md
+          if [ -n "${PR_NUMBER}" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""' > pr_body.md
+          else
+            : > pr_body.md
+          fi
       - name: Write trusted base-branch CODEOWNERS
         env:
           BASE_SHA: ${{ steps.shas.outputs.base_sha }}
