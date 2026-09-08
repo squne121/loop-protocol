@@ -33,7 +33,7 @@ last_updated_by_issue: 2573
 
 - M1 Foundation Gate (v0.1.x) の基盤・guardrail・workflow・最小仕様正本は確立済み。
 - M3 の実装と自動検証は完了済みである。
-- M4 Upgrade Loop (v0.4.x) は完了済み（parent tracker `#1176` は `CLOSED / COMPLETED`、2026-09-08 live readback で確認）。formal close / milestone readback の最終判断は `#733` 側で扱う。
+- M4 Upgrade Loop (v0.4.x) は完了済み（parent tracker `#1176` は `CLOSED / COMPLETED`、2026-09-08 live readback で確認）。M4 の close authority / evidence は `#1176`（M4 parent tracker）に一本化する。
 - 現在の capability gate は `M5: Playable Slice Hardening (v0.5.x)` とする（delivery-rollup parent tracker: `#2572`）。
 
 ## 全体非ゴール（Global Non-Goals）
@@ -54,7 +54,7 @@ last_updated_by_issue: 2573
 ## Milestone Scope: M4 Upgrade Loop (v0.4.x)（完了済み）
 
 - `M4: Upgrade Loop (v0.4.x)` は完了済み（parent tracker `#1176` は `CLOSED / COMPLETED`）。以下は M4 完了時点の記録として残す。
-- 現行の実装対象スコープは `M4: Upgrade Loop (v0.4.x)`（global 要件の正本は本 requirements.md であり、milestone は実装対象を指す）。
+- M4 当時の実装対象スコープは `M4: Upgrade Loop (v0.4.x)`（global 要件の正本は本 requirements.md であり、milestone は実装対象を指す）。
 - M4 では、M3 で永続化済みの resource を消費して最小 upgrade を適用し、次 sortie の挙動変化として観測できるまでをスコープとする。
 - M4 は MVP Loop の「resource が次の強化導線へ接続できること」を最小成立させるフェーズであり、M3 persistence 境界と `src/data` の data-driven 定義の両立を前提にする。
 - resource consumption / upgrade の詳細仕様（消費量、負値禁止、反映対象、次 sortie への適用境界など）は feature spec（`docs/product/features/<feature>.md`）で定義する。

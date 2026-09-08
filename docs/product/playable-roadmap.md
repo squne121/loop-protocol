@@ -216,7 +216,7 @@ scope: |
   supported viewport / browser runtime、applicable automated regression / E2E / VRT、
   current-main に束縛した developer-self playtest。
 dependencies:
-  - M4: Upgrade Loop (v0.4.x) — M2〜M4 の実装が完了し、一連の loop が成立していること（parent tracker #1176 は CLOSED / COMPLETED、2026-09-08 live readback で確認）
+  - "M4: Upgrade Loop (v0.4.x) — M2〜M4 の実装が完了し、一連の loop が成立していること（parent tracker #1176 は CLOSED / COMPLETED、2026-09-08 live readback で確認）"
 close_conditions:
   - M4 completion が live state で確認できる
   - M4→M5 SSOT handoff が同期済み
@@ -267,7 +267,7 @@ scope: |
   最小 ally NPC と単一の軽量 macro intent を導入し、full RTS へ拡張せず、
   accepted Game Thesis の HYP-001-ace-intervention を playable runtime で検証可能にする。
 dependencies:
-  - M5: Playable Slice Hardening (v0.5.x) — closed/completed 後に主要 runtime implementation を開始する
+  - "M5: Playable Slice Hardening (v0.5.x) — closed/completed 後に主要 runtime implementation を開始する"
   - research / spec / issue-refinement は M5 進行中に先行可能
 close_conditions:
   - ally/NPC/command の stable spec が implementation authority を持つ
@@ -314,7 +314,7 @@ scope: |
   progression fantasy として成立させる。numeric inflation ではなく、意味の異なる strengthening choice を選び、
   その選択が次 sortie の gameplay へ観測可能に反映される状態を目標とする。
 dependencies:
-  - M6: Ace Intervention (v0.6.x) — closed/completed 後に主要 runtime implementation を開始する
+  - "M6: Ace Intervention (v0.6.x) — closed/completed 後に主要 runtime implementation を開始する"
   - research / spec / issue-refinement は M6 進行中に先行可能
 close_conditions:
   - tech extraction / progression choice の stable spec
@@ -363,7 +363,7 @@ scope: |
   vertical slice として固定するフェーズ。新しい大型 mechanic を追加するフェーズではなく、
   HYP-MVP-001〜003 の統合 validation / regression 解消 / player-facing flow completion を行う。
 dependencies:
-  - M7: Tech Extraction Loop (v0.7.x) — closed/completed（transitive に M5/M6/M7 completion を要求する）
+  - "M7: Tech Extraction Loop (v0.7.x) — closed/completed（transitive に M5/M6/M7 completion を要求する）"
 close_conditions:
   - M5〜M7 closed/completed
   - fresh browser/profile から通常 UI のみで開始可能

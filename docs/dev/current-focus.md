@@ -26,11 +26,6 @@ last_updated_by_issue: 2573
 1. M5 baseline-first 方針で、既存 M2〜M4 slice の player-facing normal flow / persistence continuity / combat readability を現行 current-main で評価する（`#2572` Workstream 2）。
 2. baseline で実際に観測された M5 blocker のみを narrow child Issue として分解する（speculative hardening を先行させない）。
 
-## 引き継ぎ事項（Carry-Forward Notes）
-
-- `#733` は M3 parent close / readback の最終判断を保持しており、M5 着手と同時に自動 close されたものとして扱わない。
-- `#690` の人間動画採取・waiver 解消は M2 / M3 系の carry-forward note として残るが、M5 current phase の primary outcome ではない。
-
 ## 今やること（Do Now）
 
 - M5 baseline acceptance（fresh state flow / saved・reload flow / developer-self 3〜5 sortie playtest / architecture invariant / canonical quality gates）を現行 current-main で実行する。
