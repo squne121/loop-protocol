@@ -20,8 +20,8 @@ production code実装（#2569）は本spikeのスコープに含まない。
 | 項目 | 値 |
 |---|---|
 | main HEAD（実行時） | `2dd034a9` |
-| Herdr version | `herdr 0.8.2` |
-| Herdr integration status | `claude: current (v8)`（Claude Code integration インストール済み、`herdr integration status` 出力） |
+| Herdr version（`herdr --version`） | `herdr 0.8.2` |
+| Herdr integration status（`herdr integration status`） | `claude: current (v8)`（Claude Code integration インストール済み） |
 | Claude Code version | `2.1.263 (Claude Code)` |
 | real native claude 絶対path（pre-shim解決） | `/home/squne/.local/bin/claude` |
 | herdr binary絶対path | `/home/squne/.local/bin/herdr` |
