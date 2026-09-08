@@ -633,6 +633,21 @@ termination payload 正規化」節・「`canonical_step2_route: step_5_operator
 
 ## Termination Summary Publish Flow（終了サマリー投稿フロー, #1873）
 
+### New human-history only（Issue #1908）
+
+`issue-refinement-loop` が review-complete を得た時は、existing machine-readable termination
+summary を変更せず、source Issue を target とする new human-history を一件 reconcile する。
+`loop_kind: issue-refinement-loop`、`phase: review-complete`、reason は `completed` / `needs_fix` /
+`human_judgment` に限定し、review phase 直前の source Issue body SHA-256（prefix なし）を
+`reviewed_ref` にする。`publish_termination_report.py::publish_human_history()` に public-safe
+日本語の実施内容・推奨 action/reason/impact・evidence refs を渡す。stable marker は RFC 8785 JCS
+identity の SHA-256 であり、同じ identity は create / PATCH / noop のいずれでも一 event と数える。
+controlled readback が失敗した場合は成功扱いにせず diagnostic failure とする。
+
+この scoped quality rule は本 Issue が生成する new human-history だけに適用する。PR/Issue 全体を
+finalize する仕組み、finalizer SubAgent、新 publisher / ledger / run-id store / hook は導入しない。
+
+
 #1873（bounded review loops）で `render_termination_report.py`（`TERMINATION_REPORT_INPUT_V1` ->
 `TERMINATION_REPORT_RENDER_RESULT_V1` の renderer/validator パイプライン、attempt/guard/
 dynamic-fence を含む）は撤去された。orchestrator は次の手順で終了時のコメントを投稿する。

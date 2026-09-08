@@ -4,6 +4,29 @@ Step 2-4 の結果を統合して、ループを次イテレーションに進�
 
 ## 終了条件マトリクス（Issue #1873、`route_loop_verdict_v2()` の `route` を正本とする）
 
+### Human-history emission / PR head safety（Issue #1908）
+
+Step 5 は machine-readable verdict comment を移動・更新・削除しない。route を確定した後、
+new human-history だけを `context-protocol-and-guardrails.md#human-history-v1` の identity / template
+contract で emit する。`publish_termination_report.py::publish_human_history()` が既存
+`issue_comment.publish` lane に渡す target は次の matrix 固定値である。
+
+| origin | phase / reason | target | reviewed_ref |
+| --- | --- | --- | --- |
+| pre PR review | `pre-PR-binding` / completed, needs_fix, human_judgment | source Issue | review 直前 Issue body SHA-256 |
+| binding invalid | `binding-validation` / binding_missing, binding_ambiguous, binding_wrong_repo, binding_gone | source Issue | failure 時 Issue body SHA-256 |
+| valid PR review | `post-PR-binding` / completed, needs_fix, human_judgment | bound PR | review 直前 `refs/pull/<pr>/head@<head>` |
+| target drift | `post-PR-head-drift` / head_drift | bound PR | original stale PR snapshot |
+| repeated same-iteration conflict | `conflict-resolution` / human_escalation | origin target | origin mapping の reviewed_ref |
+
+For post-PR, snapshot → review → direct PR-head read (direct PR head read) happens before every primary
+create/PATCH/noop decision. A mismatch starts the existing `head_drift` reconciliation rather than
+mutating an old primary identity. Before a diagnostic decision, direct-read head must equal its stale
+evidence; otherwise re-reconcile the **same** diagnostic identity with the latest head. After accepted
+noop and every controlled write/readback, re-read head; re-review only after the latest diagnostic has
+successful readback or valid noop reconciliation. `conflict_hard_stop` alone emits no history.
+
+
 reviewer_verdict（`verdict`/`reviewed_head_sha`/`blockers`/`warnings`）と live_mergeability
 （`gh pr view` で取得した `mergeable`/`merge_state_status`）を `route_loop_verdict_v2()` に渡し、
 返る `route` で分岐する。詳細な `route` 一覧と判定条件は `step-5-mergeability-handling.md` を参照。

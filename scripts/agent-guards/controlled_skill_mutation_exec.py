@@ -480,6 +480,67 @@ def _validate_issue_comment_publish_fields(data: dict) -> str:
     return ""
 
 
+# Issue #1908: human-history comments deliberately use the existing generic
+# issue_comment.publish lane.  They are distinguished only by this new marker
+# namespace; existing machine-readable markers remain on the generic path.
+_HUMAN_HISTORY_NAMESPACE = "loop-protocol/human-history"
+_HUMAN_HISTORY_MARKER_RE = _re.compile(
+    r"^<!-- loop-protocol/human-history:v1:sha256:([0-9a-f]{64}) -->$"
+)
+
+
+def _is_human_history_body_or_marker(comment_body: str, marker: str) -> bool:
+    return _HUMAN_HISTORY_NAMESPACE in comment_body or _HUMAN_HISTORY_NAMESPACE in marker
+
+
+def _parse_human_history_marker_source(body: str) -> tuple[dict | None, str]:
+    """Validate and remove the one strict v1 marker from a raw comment body.
+
+    This intentionally scans every namespace occurrence before normalizing the
+    content.  A malformed namespace token is never treated as harmless prose,
+    which prevents it from being hidden by digest canonicalization.
+    """
+    occurrences = []
+    start = 0
+    while True:
+        pos = body.find(_HUMAN_HISTORY_NAMESPACE, start)
+        if pos < 0:
+            break
+        occurrences.append(pos)
+        start = pos + len(_HUMAN_HISTORY_NAMESPACE)
+    if len(occurrences) != 1:
+        return None, "human_history_marker_namespace_occurrence_count_invalid"
+
+    pos = occurrences[0]
+    opening = body.rfind("<!--", 0, pos + 1)
+    closing = body.find("-->", pos)
+    if opening < 0 or closing < 0:
+        return None, "human_history_marker_malformed_delimiter"
+    closing += 3
+    token = body[opening:closing]
+    match = _HUMAN_HISTORY_MARKER_RE.fullmatch(token)
+    if match is None:
+        return None, "human_history_marker_malformed_grammar"
+
+    # The token itself must be the entire final non-empty line.  Only newline
+    # terminators may follow it; no spaces, prose, or a second line may follow.
+    line_start = max(body.rfind("\n", 0, opening), body.rfind("\r", 0, opening)) + 1
+    if line_start != opening or any(ch not in "\r\n" for ch in body[closing:]):
+        return None, "human_history_marker_not_final_exact_line"
+    marker_line_end = closing
+    # Removing the exact marker line leaves its terminal line terminator for
+    # normal content-digest terminal-LF stripping, as required by the contract.
+    without_marker = body[:opening] + body[marker_line_end:]
+    normalized = without_marker.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+    digest = hashlib.sha256(normalized.encode("utf-8", "strict")).hexdigest()
+    return {
+        "marker": token,
+        "identity_sha256": match.group(1),
+        "content_digest": digest,
+        "content_without_marker": without_marker,
+    }, ""
+
+
 _PR_HEAD_SHA_RE = _re.compile(r"^[0-9a-f]{40}$")
 
 # Issue #1647: this transaction is deliberately distinct from the generic
@@ -1943,6 +2004,9 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
     if field_err:
         return _fail(field_err)
 
+    if _is_human_history_body_or_marker(input_data["comment_body"], input_data["marker"]):
+        return _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok)
+
     marker = input_data["marker"]
     comment_body = input_data["comment_body"]
     expected_body_sha256 = hashlib.sha256(comment_body.encode()).hexdigest()
@@ -2190,6 +2254,175 @@ def _run_issue_comment_publish(args, canonical_input, input_data, gh_bin, _fail,
             "idempotency_marker_written": True,
         }
     )
+
+
+def _list_issue_comments(issue_number: int, repo: str, gh_bin: str) -> tuple[list[dict], str]:
+    """Return raw comment records for the human-history controlled sublane."""
+    try:
+        out = subprocess.run(
+            [gh_bin, "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            shell=False,
+            env=_build_metadata_sanitized_env(),
+        )
+        if out.returncode != 0:
+            return [], f"gh_failed_rc_{out.returncode}"
+        data = json.loads(out.stdout)
+        comments = data.get("comments", [])
+        if not isinstance(comments, list) or not all(isinstance(item, dict) for item in comments):
+            return [], "gh_comments_schema_invalid"
+        return comments, ""
+    except Exception as exc:
+        return [], f"human_history_comment_list_exception:{exc}"
+
+
+def _human_history_readback(
+    *, marker: str, expected_digest: str, expected_author: str, issue_number: int, repo: str, gh_bin: str
+) -> tuple[dict | None, str]:
+    """Read back exactly one owned identity marker and its canonical digest."""
+    comments, err = _list_issue_comments(issue_number, repo, gh_bin)
+    if err:
+        return None, err
+    owned: list[tuple[dict, dict]] = []
+    for comment in comments:
+        body = comment.get("body", "")
+        if not isinstance(body, str) or _HUMAN_HISTORY_NAMESPACE not in body:
+            continue
+        parsed, marker_err = _parse_human_history_marker_source(body)
+        if marker_err:
+            return None, f"human_history_marker_diagnostic_failure:{marker_err}"
+        assert parsed is not None
+        if parsed["marker"] != marker:
+            continue
+        author = (comment.get("author") or {}).get("login")
+        if author != expected_author:
+            return None, "human_history_remote_marker_author_mismatch"
+        owned.append((comment, parsed))
+    if len(owned) != 1:
+        return None, "human_history_owned_marker_cardinality_invalid"
+    comment, parsed = owned[0]
+    if parsed["content_digest"] != expected_digest:
+        return None, "human_history_readback_content_digest_mismatch"
+    return {
+        "comment_id": comment.get("id", ""),
+        "comment_url": comment.get("url", ""),
+        "content_digest": parsed["content_digest"],
+        "identity_sha256": parsed["identity_sha256"],
+    }, ""
+
+
+def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> int:
+    """Create, PATCH, or noop one human-history identity in the existing lane.
+
+    Unlike generic comment markers, namespace grammar is security-relevant:
+    every raw namespace candidate is diagnosed before a mutation, digesting,
+    or author ownership decision.  This leaves existing machine-comment
+    discovery and payload semantics unchanged.
+    """
+    comment_body = input_data["comment_body"]
+    marker = input_data["marker"]
+    expected, expected_err = _parse_human_history_marker_source(comment_body)
+    if expected_err:
+        return _fail(f"human_history_marker_diagnostic_failure:{expected_err}")
+    assert expected is not None
+    if marker != expected["marker"]:
+        return _fail("human_history_marker_input_mismatch")
+    if args.dry_run:
+        return _ok({
+            "status_detail": "dry_run_ok",
+            "human_history_identity_sha256": expected["identity_sha256"],
+            "human_history_content_digest": expected["content_digest"],
+        })
+
+    write_root = f"artifacts/{args.issue_number}/{ISSUE_METADATA_NAMESPACE_SEGMENT}/{args.command_id}/"
+    pre_mutation_snapshot, snapshot_err = _capture_pre_mutation_snapshot(PROJECT_ROOT, args.issue_number, write_root)
+    if snapshot_err is not None:
+        return _fail(f"pre_mutation_snapshot_capture_failed: {snapshot_err}", status="failed")
+    authenticated_login, login_err = _fetch_authenticated_login(gh_bin)
+    if login_err:
+        return _fail(f"human_history_author_check_failed:{login_err}", status="failed")
+
+    comments, list_err = _list_issue_comments(args.issue_number, args.repo, gh_bin)
+    if list_err:
+        return _fail(f"human_history_marker_precheck_failed:{list_err}", status="failed")
+    matching: list[tuple[dict, dict]] = []
+    # Validate every namespace occurrence before deciding whether this identity
+    # exists; malformed tokens are diagnostics, never ignorable prose.
+    for comment in comments:
+        body = comment.get("body", "")
+        if not isinstance(body, str) or _HUMAN_HISTORY_NAMESPACE not in body:
+            continue
+        parsed, parse_err = _parse_human_history_marker_source(body)
+        if parse_err:
+            return _fail(f"human_history_marker_diagnostic_failure:{parse_err}", status="failed")
+        assert parsed is not None
+        if parsed["marker"] == marker:
+            if (comment.get("author") or {}).get("login") != authenticated_login:
+                return _fail("human_history_remote_marker_author_mismatch", status="failed")
+            matching.append((comment, parsed))
+    if len(matching) > 1:
+        return _fail("human_history_duplicate_owned_marker", status="failed")
+
+    def finalize(status_detail: str, *, patch_attempted: bool) -> int:
+        readback, readback_err = _human_history_readback(
+            marker=marker,
+            expected_digest=expected["content_digest"],
+            expected_author=authenticated_login,
+            issue_number=args.issue_number,
+            repo=args.repo,
+            gh_bin=gh_bin,
+        )
+        if readback_err:
+            return _fail(f"human_history_readback_failed:{readback_err}", status="failed")
+        changed = _check_no_tracked_changes(PROJECT_ROOT, args.issue_number, write_root, pre_mutation_snapshot)
+        if changed:
+            return _fail(
+                "postcondition_tracked_changes_detected",
+                [f"changed: {item}" for item in changed[:20]],
+                status="applied_but_local_postcondition_failed",
+            )
+        assert readback is not None
+        return _ok({
+            "status_detail": status_detail,
+            "comment_id": readback["comment_id"],
+            "comment_url": readback["comment_url"],
+            "human_history_identity_sha256": readback["identity_sha256"],
+            "human_history_content_digest": readback["content_digest"],
+            "patch_attempted": patch_attempted,
+        })
+
+    if matching:
+        comment, remote = matching[0]
+        if remote["content_digest"] == expected["content_digest"]:
+            # A noop is still read back through the same marker/author/digest
+            # boundary so it cannot silently accept a stale or foreign state.
+            return finalize("already_published", patch_attempted=False)
+        numeric_comment_id = _extract_numeric_comment_id_from_url(comment.get("url", ""))
+        if not numeric_comment_id:
+            return _fail("human_history_remote_marker_comment_id_unresolvable", status="failed")
+        patch_err = _patch_gh_comment(numeric_comment_id, args.repo, comment_body, gh_bin)
+        if patch_err:
+            return _fail(patch_err, status="failed", extra={"patch_attempted": True, "mutation_outcome": "unknown"})
+        return finalize("updated", patch_attempted=True)
+
+    _url, _id, post_err = _post_gh_comment(args.issue_number, args.repo, comment_body, gh_bin)
+    if post_err:
+        # POST may have succeeded while its response was lost.  A single strict
+        # readback reconciles that ambiguity without a second POST.
+        readback, readback_err = _human_history_readback(
+            marker=marker,
+            expected_digest=expected["content_digest"],
+            expected_author=authenticated_login,
+            issue_number=args.issue_number,
+            repo=args.repo,
+            gh_bin=gh_bin,
+        )
+        if readback_err:
+            return _fail(post_err, status="failed", extra={"mutation_outcome": "unknown"})
+        return finalize("created_reconciled", patch_attempted=False)
+    return finalize("created", patch_attempted=False)
 
 
 def _find_marker_matches(marker_literal: str, issue_number: int, repo: str, gh_bin: str) -> tuple[list[dict], str]:

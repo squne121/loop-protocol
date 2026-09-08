@@ -82,6 +82,156 @@ CONTROLLED_SKILL_MUTATION_EXEC_SCRIPT = _AGENT_GUARDS_DIR / "controlled_skill_mu
 # Artifact directory relative to cwd (or absolute via env var)
 ARTIFACT_DIR = Path(os.environ.get("PUBLISH_ARTIFACT_DIR", "artifacts"))
 
+# Issue #1908: this is a mode of the existing controlled publisher, not a new
+# GitHub transport.  The identity and marker are deliberately self-contained
+# in the new human-history comment so legacy machine-readable comments retain
+# their target, marker, payload, and consumers unchanged.
+_HUMAN_HISTORY_FIELDS = (
+    "loop_kind", "phase", "source_issue_number", "target_kind", "target_number",
+    "route_or_termination_reason", "reviewed_ref",
+)
+_HUMAN_HISTORY_REASONS = frozenset({
+    "completed", "needs_fix", "human_judgment", "binding_missing", "binding_ambiguous",
+    "binding_wrong_repo", "binding_gone", "head_drift", "human_escalation",
+})
+_HUMAN_HISTORY_MARKER_PREFIX = "<!-- loop-protocol/human-history:v1:sha256:"
+_HUMAN_HISTORY_MARKER_RE = __import__("re").compile(
+    r"^<!-- loop-protocol/human-history:v1:sha256:[0-9a-f]{64} -->$"
+)
+_HUMAN_HISTORY_ISSUE_REF_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
+_HUMAN_HISTORY_PR_REF_RE = __import__("re").compile(r"^refs/pull/([1-9][0-9]*)/head@([0-9a-f]{40})$")
+_SECRET_OR_UNSAFE_RE = __import__("re").compile(
+    r"(?:gh[porsu]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|authorization:\s*bearer|(?:^|\s)/[^\s]+)",
+    __import__("re").I,
+)
+
+
+def _human_history_jcs(identity: dict) -> bytes:
+    """The identity value domain is ASCII-only, so sorted compact JSON is the
+    RFC 8785 JCS representation for this fixed object shape."""
+    return json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _validate_human_history_identity(identity: object) -> tuple[dict | None, str]:
+    if not isinstance(identity, dict) or set(identity) != set(_HUMAN_HISTORY_FIELDS):
+        return None, "human_history_identity_key_set_invalid"
+    normalized = {name: identity[name] for name in _HUMAN_HISTORY_FIELDS}
+    for field in ("loop_kind", "phase", "target_kind", "route_or_termination_reason", "reviewed_ref"):
+        if not isinstance(normalized[field], str):
+            return None, f"human_history_identity_type_invalid:{field}"
+    for field in ("source_issue_number", "target_number"):
+        if type(normalized[field]) is not int or normalized[field] <= 0:
+            return None, f"human_history_identity_type_invalid:{field}"
+    loop = normalized["loop_kind"]
+    phase = normalized["phase"]
+    target_kind = normalized["target_kind"]
+    reason = normalized["route_or_termination_reason"]
+    if loop not in {"issue-refinement-loop", "impl-review-loop"} or reason not in _HUMAN_HISTORY_REASONS:
+        return None, "human_history_identity_literal_invalid"
+    valid = {
+        ("issue-refinement-loop", "review-complete", "issue"): {"completed", "needs_fix", "human_judgment"},
+        ("impl-review-loop", "pre-PR-binding", "issue"): {"completed", "needs_fix", "human_judgment"},
+        ("impl-review-loop", "binding-validation", "issue"): {"binding_missing", "binding_ambiguous", "binding_wrong_repo", "binding_gone"},
+        ("impl-review-loop", "post-PR-binding", "pull_request"): {"completed", "needs_fix", "human_judgment"},
+        ("impl-review-loop", "post-PR-head-drift", "pull_request"): {"head_drift"},
+        ("impl-review-loop", "conflict-resolution", "issue"): {"human_escalation"},
+        ("impl-review-loop", "conflict-resolution", "pull_request"): {"human_escalation"},
+    }
+    if reason not in valid.get((loop, phase, target_kind), set()):
+        return None, "human_history_identity_matrix_combination_invalid"
+    if target_kind == "issue":
+        if normalized["target_number"] != normalized["source_issue_number"]:
+            return None, "human_history_issue_target_number_mismatch"
+        if not _HUMAN_HISTORY_ISSUE_REF_RE.fullmatch(normalized["reviewed_ref"]):
+            return None, "human_history_issue_reviewed_ref_invalid"
+    else:
+        reference = _HUMAN_HISTORY_PR_REF_RE.fullmatch(normalized["reviewed_ref"])
+        if reference is None or int(reference.group(1)) != normalized["target_number"]:
+            return None, "human_history_pr_reviewed_ref_invalid"
+    return normalized, ""
+
+
+def _validate_public_safe_human_text(value: object, field: str) -> tuple[str | None, str]:
+    if not isinstance(value, str) or not value.strip() or "```" in value or _SECRET_OR_UNSAFE_RE.search(value):
+        return None, f"human_history_public_safe_text_invalid:{field}"
+    return value.strip(), ""
+
+
+def render_human_history_comment(
+    *, identity: object, result: object, evidence_refs: object, recommended_action: object,
+    recommended_reason: object, impact_if_unaddressed: object, stale_evidence: object = None,
+) -> tuple[dict | None, str]:
+    """Build a public-safe Japanese human-history body and stable marker."""
+    value, error = _validate_human_history_identity(identity)
+    if error:
+        return None, error
+    assert value is not None
+    text_values: dict[str, str] = {}
+    for name, raw in {
+        "result": result, "recommended_action": recommended_action,
+        "recommended_reason": recommended_reason, "impact_if_unaddressed": impact_if_unaddressed,
+    }.items():
+        clean, text_error = _validate_public_safe_human_text(raw, name)
+        if text_error:
+            return None, text_error
+        assert clean is not None
+        text_values[name] = clean
+    if not isinstance(evidence_refs, list) or not evidence_refs:
+        return None, "human_history_evidence_refs_invalid"
+    evidence: list[str] = []
+    for item in evidence_refs:
+        clean, text_error = _validate_public_safe_human_text(item, "evidence_ref")
+        if text_error:
+            return None, text_error
+        assert clean is not None
+        evidence.append(clean)
+    stale_line = ""
+    if stale_evidence is not None:
+        clean, text_error = _validate_public_safe_human_text(stale_evidence, "stale_evidence")
+        if text_error:
+            return None, text_error
+        stale_line = f"\n- stale evidence: {clean}"
+    identity_sha256 = hashlib.sha256(_human_history_jcs(value)).hexdigest()
+    marker = f"{_HUMAN_HISTORY_MARKER_PREFIX}{identity_sha256} -->"
+    body = (
+        "## review loop の作業履歴\n\n"
+        f"- 実施内容: {text_values['result']}\n"
+        f"- phase: {value['phase']}\n"
+        f"- reviewed_ref: {value['reviewed_ref']}\n"
+        f"- 推奨アクション: {text_values['recommended_action']}\n"
+        f"- 推奨する理由: {text_values['recommended_reason']}\n"
+        f"- 対応しない場合の影響: {text_values['impact_if_unaddressed']}\n"
+        f"- evidence refs: {'; '.join(evidence)}{stale_line}\n\n{marker}\n"
+    )
+    return {
+        "body": body,
+        "marker": marker,
+        "identity": value,
+        "identity_sha256": identity_sha256,
+    }, ""
+
+
+def publish_human_history(
+    *, target_number: int, repo: str, identity: object, result: object, evidence_refs: object,
+    recommended_action: object, recommended_reason: object, impact_if_unaddressed: object,
+    stale_evidence: object = None,
+) -> int:
+    """Publish one human-history event through existing issue_comment.publish."""
+    rendered, error = render_human_history_comment(
+        identity=identity, result=result, evidence_refs=evidence_refs,
+        recommended_action=recommended_action, recommended_reason=recommended_reason,
+        impact_if_unaddressed=impact_if_unaddressed, stale_evidence=stale_evidence,
+    )
+    if error or rendered is None:
+        _record_artifact(issue_number=target_number, reason_code=error or "human_history_render_failed")
+        return 1
+    if type(target_number) is not int or target_number <= 0 or rendered["identity"]["target_number"] != target_number:
+        _record_artifact(issue_number=target_number, reason_code="human_history_target_binding_invalid")
+        return 1
+    return _post_github_comment(
+        issue_number=target_number, body=rendered["body"], repo=repo, marker=rendered["marker"],
+    )
+
 
 # ---------------------------------------------------------------------------
 # Artifact logging (fail-closed: logs to local file, never leaks body to stderr)
@@ -130,7 +280,7 @@ def _record_artifact(
 # GitHub comment posting (fail-closed)
 # ---------------------------------------------------------------------------
 
-def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
+def _post_github_comment(*, issue_number: int, body: str, repo: str, marker: str | None = None) -> int:
     """
     Post body as a GitHub issue comment via the issue_comment.publish
     controlled mutation lane (Issue #1633).
@@ -150,18 +300,23 @@ def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
     Returns the executor's exit code (0 on success, -1 on timeout, or the
     executor's nonzero exit on failure).
     """
-    exec_marker = os.environ.get("CONTROLLED_EXEC_MARKER", "")
-    if exec_marker:
-        marker = f"<!-- CONTROLLED_EXEC_MARKER:{exec_marker} -->"
+    if marker is None:
+        exec_marker = os.environ.get("CONTROLLED_EXEC_MARKER", "")
+        if exec_marker:
+            marker = f"<!-- CONTROLLED_EXEC_MARKER:{exec_marker} -->"
+        else:
+            # Issue #1639 fix_delta P1-2: the fallback marker must not collide
+            # across different repos/issues that happen to share identical body.
+            fallback_seed = f"{repo}\x00{issue_number}\x00{body}".encode("utf-8")
+            content_hash = hashlib.sha256(fallback_seed).hexdigest()[:32]
+            marker = f"<!-- CONTROLLED_EXEC_MARKER:{content_hash} -->"
+        comment_body = body + f"\n{marker}"
     else:
-        # Issue #1639 fix_delta P1-2: the fallback marker must not collide
-        # across different repos/issues that happen to share identical body
-        # content -- hash repo + issue_number + body (NUL-separated to avoid
-        # ambiguous concatenation), not body alone.
-        fallback_seed = f"{repo}\x00{issue_number}\x00{body}".encode("utf-8")
-        content_hash = hashlib.sha256(fallback_seed).hexdigest()[:32]
-        marker = f"<!-- CONTROLLED_EXEC_MARKER:{content_hash} -->"
-    comment_body = body + f"\n{marker}"
+        # #1908 passes its stable identity marker intact to the existing bridge;
+        # adding a legacy marker would alter the new comment's digest semantics.
+        if marker not in body:
+            return 1
+        comment_body = body
 
     request = build_isolation_issue_comment_request(
         issue_number=issue_number, repo=repo, comment_body=comment_body, marker=marker,
@@ -186,6 +341,11 @@ def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
         "--repo", repo,
     ]
     env = os.environ.copy()
+    # The controlled lane binds its CLI number to the *comment target*.  A PR
+    # history event legitimately carries a distinct source Issue identity, so
+    # an inherited source-issue session binding must not mis-bind this target.
+    if marker.startswith(_HUMAN_HISTORY_MARKER_PREFIX):
+        env.pop("LOOP_ISSUE_NUMBER", None)
     env["GH_PROMPT_DISABLED"] = "1"
     env.setdefault("GH_NO_UPDATE_NOTIFIER", "1")
     try:
