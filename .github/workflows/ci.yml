@@ -2288,6 +2288,109 @@ jobs:
           fi
           echo "e2e aggregate: both e2e-core and e2e-responsive-matrix succeeded (or e2e-responsive-matrix expected-skipped for benchmark_layout=monolith; runtime result + provider-enforced runtime evidence via if-no-files-found: error)."
 
+  # Issue #2589: `ci-verdict-summary` (the sole producer of the
+  # `ci_runtime_baseline_v1` gate-ready-latency artifact) is entirely
+  # skipped on a `benchmark_layout=monolith|split` dispatch (see its own
+  # `if:` -- it aggregates jobs that are themselves skipped on that route),
+  # which structurally starved the Reliability close-grade track of
+  # gate-ready evidence for every measured run. This job is an ADDITIVE
+  # duplicate of `ci-verdict-summary`'s "Record gate-ready latency" /
+  # "Upload ci_runtime_baseline_v1" steps, scoped EXCLUSIVELY to
+  # `benchmark_layout=monolith|split` so that `ci-verdict-summary`'s own
+  # behavior on a normal (`benchmark_layout==''`) dispatch is completely
+  # unchanged (no artifact-name collision within the same run: exactly one
+  # of the two jobs runs per dispatch route).
+  ci-runtime-baseline-gate-ready:
+    runs-on: ubuntu-latest
+    needs: [e2e]
+    if: ${{ !cancelled() && (github.event.inputs.benchmark_layout == 'monolith' || github.event.inputs.benchmark_layout == 'split') }}
+    steps:
+      - name: Fetch check-runs for gate-ready latency
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          gh api \
+            "repos/${GH_REPOSITORY}/commits/${GH_HEAD_SHA}/check-runs?per_page=100" \
+            > ci_verdict_summary_v2_check_runs.json
+          test -s ci_verdict_summary_v2_check_runs.json
+      # Issue #2119 AC9(b) (PR #2137 human review issuecomment-5273090534 P0
+      # fix): gate-ready latency is the wall-clock time from workflow-run
+      # start until the required stable `e2e` aggregate check itself
+      # reaches a conclusion. Computed here (not inside jobs.e2e itself,
+      # which check-visual-artifact-pipeline.py's AC13 guard forbids from
+      # carrying any upload-artifact/download-artifact step) from the real
+      # per-commit check-run `completed_at` for the "e2e" check (fetched
+      # above) minus the real workflow-run `run_started_at` (both
+      # authoritative GitHub API timestamps, not self-measured wall-clock
+      # deltas).
+      - name: Record gate-ready latency (ci_runtime_baseline_v1)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p ci_runtime_baseline_artifacts
+          RUN_STARTED_AT="$(gh api "repos/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}" --jq .run_started_at)"
+          export RUN_STARTED_AT
+          python3 - <<'PY'
+          import json, os, pathlib
+          from datetime import datetime, timezone
+
+          run_started_at = datetime.fromisoformat(
+              os.environ["RUN_STARTED_AT"].replace("Z", "+00:00")
+          )
+
+          check_runs = json.loads(
+              pathlib.Path("ci_verdict_summary_v2_check_runs.json").read_text(encoding="utf-8")
+          ).get("check_runs", [])
+          e2e_runs = [c for c in check_runs if c.get("name") == "e2e" and c.get("status") == "completed"]
+
+          artifact = {
+              "schema": "ci_runtime_baseline_v1",
+              "run_id": os.environ["GH_RUN_ID"],
+              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
+              "head_sha": os.environ["GH_HEAD_SHA"],
+              "merge_sha": os.environ["GH_SHA"],
+              "job": "e2e",
+              "run_started_at": os.environ["RUN_STARTED_AT"],
+              "measurements": [],
+          }
+
+          if e2e_runs:
+              completed_at = datetime.fromisoformat(
+                  e2e_runs[0]["completed_at"].replace("Z", "+00:00")
+              )
+              gate_ready_latency_ms = int((completed_at - run_started_at).total_seconds() * 1000)
+              artifact["gate_ready_latency_ms"] = gate_ready_latency_ms
+              artifact["gate_ready_at"] = e2e_runs[0]["completed_at"]
+              print(f"gate_ready_latency_ms={gate_ready_latency_ms}")
+          else:
+              # The "e2e" check-run was not found completed at fetch time --
+              # do NOT fabricate a latency value (fail-closed: this run is
+              # simply excluded from the gate-ready-latency cohort rather
+              # than silently degrading to success).
+              print("no completed 'e2e' check-run found; gate_ready_latency_ms omitted")
+
+          out = pathlib.Path("ci_runtime_baseline_artifacts") / "ci_runtime_baseline_v1_e2e.json"
+          out.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+          PY
+      - name: Upload ci_runtime_baseline_v1 (e2e aggregate gate-ready latency)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-runtime-baseline-e2e-gate-ready-${{ github.run_attempt }}
+          path: ci_runtime_baseline_artifacts/ci_runtime_baseline_v1_e2e.json
+          if-no-files-found: error
+          retention-days: 30
+
   # Issue #2424: the THIRD run of the 3-run architecture. Starts ONLY on a
   # `benchmark_layout=reliability_assessment` dispatch, and ONLY after the
   # operator has confirmed BOTH the monolith and split measured runs

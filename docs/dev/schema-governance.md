@@ -58,6 +58,8 @@ related_issue: "#135"
 | `agy_preflight_result/v1`（additive `capabilities` matrix, Issue #1941） | `.claude/skills/gemini-cli-headless-delegation/scripts/preflight_agy.py`（`build_capability_matrix()` / `run_preflight(compute_capabilities=True)` が唯一の実装 SSOT） | preflight_agy.py | `setup_check.py`（`agy_capabilities` として additive に surface。既存 `agy_preflight["ok"]` 単一 boolean 消費は不変）、`run_gemini_headless.py` | `rg -n "agy_capability_matrix/v1\|CAPABILITY_PREDICATES\|build_capability_matrix" .claude/skills/gemini-cli-headless-delegation` |
 | `agy_github_research_evidence/v1`（Issue #1920） | `schemas/agy_github_research_evidence_v1.schema.json` | `.claude/skills/gemini-cli-headless-delegation/scripts/run_agy_github_research_e2e.py`（`_build_evidence()` / `_write_evidence()`） | `run_gemini_headless.py`（`provider=agy` + `tool_profile=github_research` の dispatch）、`run_agy_github_research_broker.py`（per-iteration `agy_github_research_broker_command_result/v1` record の source）、人間・エージェント reviewer（`.claude/artifacts/agent-provider-route/<run-id>/` artifact consumer）、`test_agy_github_research_contract.py` / `test_agy_github_research_e2e.py` | `rg -n "agy_github_research_evidence/v1\|agy_github_research_broker_command_result/v1\|run_agy_github_research_broker\|run_agy_github_research_e2e" .claude/skills/gemini-cli-headless-delegation schemas` |
 | `WEB_RESEARCH_RESULT_V1`（Issue #2042、#2038/#2059 follow-up） | `.claude/agents/web-researcher.md` | web-researcher SubAgent | `.claude/skills/issue-refinement-loop/scripts/route_web_research_result.py`、`.claude/skills/issue-refinement-loop/references/web-research-routing.md` | `rg -n "WEB_RESEARCH_RESULT_V1\|sources\[\]\|source_id\|source_kind" .claude/agents/web-researcher.md .claude/skills/issue-refinement-loop` |
+| `repo_temp_folder_advice/v1`（Issue #1418 吸収分、Issue #2007 で catalog 登録） | `schemas/repo_temp_folder_advice_v1.schema.json` | `scripts/agent-guards/root_temporary_residue_policy.py`（フラグ無指定または `--schema-version v1` 明示時） | `.claude/hooks/root_temporary_residue_advisory.sh`（Issue #2007 以降は明示的に `--schema-version v2` を指定するため live 経路の直接呼び出し元ではないが、V1 emit 経路自体は producer に残る） | `rg -n "REPO_TEMP_FOLDER_ADVICE_V1" .` |
+| `repo_temp_folder_advice/v2`（Issue #2007） | `schemas/repo_temp_folder_advice_v2.schema.json` | `scripts/agent-guards/root_temporary_residue_policy.py`（`--schema-version v2` 指定時） | `.claude/hooks/root_temporary_residue_advisory.sh`（live hook が明示的に `--schema-version v2` を指定） | `rg -n "REPO_TEMP_FOLDER_ADVICE_V2" .` |
 
 **Compatibility Decision**: `AGY_CAUSAL_CLAIM_MANIFEST_V1` は本 Issue（#1778）で新規追加された schema であり、既存 schema の破壊的変更は含まない（`additive` — 新規 producer 2 件、既存 consumer への影響なし）。`agy_permission_policy.py` / `run_gemini_headless.py` はどちらも read-only の分析対象であり、本 Issue の PR では一切変更されない（behavior change なし）。
 
@@ -156,6 +158,57 @@ validation_commands:
 notes:
   - "本 schema は accidental isolation model のみを実装する。marker は deletion authority ではない。"
   - "duplicate JSON key・NaN/Infinity・oversized・symlink・group/other writable marker は invalid として扱う。"
+```
+
+## repo_temp_folder_advice/v1 と repo_temp_folder_advice/v2 詳細登録（Issue #2007）
+
+```yaml
+schema_id: repo_temp_folder_advice/v1
+definition: schemas/repo_temp_folder_advice_v1.schema.json
+related_issue: "#1418（吸収分）, #2007（catalog 登録）"
+producer:
+  - scripts/agent-guards/root_temporary_residue_policy.py（フラグ無指定または --schema-version v1 明示時）
+consumer:
+  - .claude/hooks/root_temporary_residue_advisory.sh（Issue #2007 以前の live 呼び出し形状。Issue #2007
+    以降 live hook は --schema-version v2 を明示するため、V1 emit 経路自体は producer に残るが
+    live hook からは呼ばれない）
+compatibility:
+  breaking_changes:
+    - remove_required_field
+    - rename_field
+    - narrow_type
+detection_patterns:
+  - 'REPO_TEMP_FOLDER_ADVICE_V1'
+validation_commands:
+  - "uv run --locked pytest scripts/agent-guards/tests/test_root_temporary_residue_policy.py -q"
+  - "uv run --locked pytest schemas/tests/test_catalog.py -q"
+notes:
+  - "approved_temporary_roots は tmp/ と .claude/tmp/ の 2 値のまま維持する（v1 emit 経路の breaking change は行わない）。"
+  - "V1 は本 Issue #2007 のスコープでは削除・deprecation マーキングしない（別 Issue）。"
+
+schema_id: repo_temp_folder_advice/v2
+definition: schemas/repo_temp_folder_advice_v2.schema.json
+related_issue: "#2007"
+producer:
+  - scripts/agent-guards/root_temporary_residue_policy.py（--schema-version v2 指定時）
+consumer:
+  - .claude/hooks/root_temporary_residue_advisory.sh（live hook。--schema-version v2 を明示的に指定する）
+compatibility:
+  breaking_changes:
+    - remove_required_field
+    - rename_field
+    - narrow_type
+    - change_write_root_semantics（approved_write_roots / deprecated_legacy_roots の分離）
+detection_patterns:
+  - 'REPO_TEMP_FOLDER_ADVICE_V2'
+validation_commands:
+  - "uv run --locked pytest scripts/agent-guards/tests/test_root_temporary_residue_policy.py -q"
+  - "uv run --locked pytest .claude/hooks/tests/test_root_temporary_residue_advisory.py -q"
+  - "uv run --locked pytest schemas/tests/test_catalog.py -q"
+notes:
+  - "approved_write_roots は tmp/ の 1 値（const）のみ。deprecated_legacy_roots は .claude/tmp/ の 1 値（const）のみ。"
+  - ".claude/tmp/** への write は reason_code: deprecated_legacy_root_write として advisory 対象に追加された。read / scan / report / delete は妨げない。"
+  - "block: false は維持し、outer envelope に permissionDecision は出力しない（通常の permission flow を変更しない）。"
 ```
 
 ## agent_session_manifest/v1 詳細登録

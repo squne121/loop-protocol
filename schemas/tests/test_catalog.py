@@ -50,7 +50,7 @@ REPO_ROOT = Path(__file__).parents[2]
 CATALOG_YAML = REPO_ROOT / "schemas" / "catalog.yaml"
 CATALOG_SCHEMA_JSON = REPO_ROOT / "schemas" / "catalog.schema.json"
 
-EXPECTED_ENTRY_COUNT = 25  # #2170: +CI_TEST_RELIABILITY_ASSESSMENT_V1
+EXPECTED_ENTRY_COUNT = 27  # #2007: +repo_temp_folder_advice/v1, +repo_temp_folder_advice/v2
 
 AMBIGUOUS_PATTERNS = re.compile(
     r"推定|TBD|TODO|不明|unknown",
@@ -450,6 +450,8 @@ EXPECTED_SCHEMA_IDS = {
     "CI_TEST_PERFORMANCE_ASSESSMENT_V2_VALIDATION_RESULT_V1",
     "AGY_GROUNDING_EVIDENCE_VERDICT_V1",
     "CI_TEST_RELIABILITY_ASSESSMENT_V1",
+    "repo_temp_folder_advice/v1",
+    "repo_temp_folder_advice/v2",
 }
 
 
