@@ -151,6 +151,33 @@ def _build_bundle(
     )
 
 
+def _mark_owner_anchor_items(bundle: dict, source_body: str, *, item_count: int) -> tuple[str, int]:
+    """Attach producer-shaped OWNER anchor provenance to selected items."""
+    comment_id = 5584982649
+    source_url = f"https://github.com/{REPO}/issues/{ISSUE_NUMBER}#issuecomment-{comment_id}"
+    source_span = {
+        "authority_kind": "owner_anchor",
+        "source_repo": REPO,
+        "source_object_kind": "issue_comment",
+        "source_object_id": str(comment_id),
+        "source_revision": f"sha256:{_hex(source_body)}",
+    }
+    for item in bundle["items"][:item_count]:
+        item["source_url"] = source_url
+        item["source_span"] = dict(source_span)
+    return source_url, comment_id
+
+
+def _owner_anchor_comment(source_body: str, *, source_url: str, comment_id: int) -> dict:
+    return {
+        "id": comment_id,
+        "body": source_body,
+        "html_url": source_url,
+        "issue_url": f"https://api.github.com/repos/{REPO}/issues/{ISSUE_NUMBER}",
+        "author_association": "OWNER",
+    }
+
+
 def _write_artifact(tmp_path: Path, bundle: dict, issue_number: int = ISSUE_NUMBER) -> Path:
     artifact_dir = tmp_path / ".claude" / "artifacts" / "issue-refinement-loop" / str(issue_number)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -391,6 +418,94 @@ def test_multi_item_synthesis_reverifies_digests_before_dispatch(tmp_path: Path)
     assert positions == sorted(positions), "items must appear in ascending template_field_order"
     for item in items:
         assert item["candidate_value"] in new_body
+
+
+def test_owner_anchor_stale_source_is_rejected_before_transaction(tmp_path: Path) -> None:
+    """A source comment revision drift is a pre-dispatch fail-closed guard."""
+    bundle = _build_bundle()
+    source_body = "## Quality Decision Record\n\n- original source\n"
+    source_url, comment_id = _mark_owner_anchor_items(bundle, source_body, item_count=1)
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+    source_fetches: list[int] = []
+
+    def _stale_source_fetch(repo: str, fetched_comment_id: int):
+        source_fetches.append(fetched_comment_id)
+        return _owner_anchor_comment(
+            source_body + "- changed after preflight\n",
+            source_url=source_url,
+            comment_id=comment_id,
+        ), ""
+
+    with mock.patch.object(rrp, "_fetch_single_comment", side_effect=_stale_source_fetch):
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+            apply_transaction=transaction,
+        )
+
+    assert result["mutation_outcome"] == "not_attempted", result
+    assert result["failure_code"] == "structural_item_digest_mismatch"
+    assert transaction.calls == []
+    assert source_fetches == [comment_id]
+
+
+def test_owner_anchor_same_revision_is_applied_after_fresh_source_check(tmp_path: Path) -> None:
+    """An unchanged trusted source permits the existing transaction path."""
+    bundle = _build_bundle()
+    source_body = "## Quality Decision Record\n\n- current source\n"
+    source_url, comment_id = _mark_owner_anchor_items(bundle, source_body, item_count=1)
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+
+    with mock.patch.object(
+        rrp,
+        "_fetch_single_comment",
+        return_value=(_owner_anchor_comment(source_body, source_url=source_url, comment_id=comment_id), ""),
+    ) as fetch_source:
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+            apply_transaction=transaction,
+        )
+
+    assert result["mutation_outcome"] == "applied", result
+    assert len(transaction.calls) == 1
+    fetch_source.assert_called_once_with(REPO, comment_id)
+
+
+def test_owner_anchor_source_fetch_is_deduplicated_for_three_items(tmp_path: Path) -> None:
+    """Three items from one comment trigger exactly one fresh source read."""
+    bundle = _build_bundle()
+    assert len(bundle["items"]) >= 3
+    source_body = "## Quality Decision Record\n\n- shared source\n"
+    source_url, comment_id = _mark_owner_anchor_items(bundle, source_body, item_count=3)
+    result_path = _write_artifact(tmp_path, bundle)
+    transaction = RecordingApplyTransaction(_applied_txn_result("unused"))
+
+    with mock.patch.object(
+        rrp,
+        "_fetch_single_comment",
+        return_value=(_owner_anchor_comment(source_body, source_url=source_url, comment_id=comment_id), ""),
+    ) as fetch_source:
+        result = rrp.run_structural_repair_action_apply(
+            repo=REPO,
+            issue_number=ISSUE_NUMBER,
+            preflight_result_path=str(result_path.relative_to(tmp_path)),
+            repo_root=tmp_path,
+            fetch_current=_fetch_stub(ORIGINAL_BODY),
+            apply_transaction=transaction,
+        )
+
+    assert result["mutation_outcome"] == "applied", result
+    assert len(transaction.calls) == 1
+    fetch_source.assert_called_once_with(REPO, comment_id)
 
 
 # ---------------------------------------------------------------------------

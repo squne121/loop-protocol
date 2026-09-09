@@ -804,6 +804,74 @@ def test_trusted_owner_anchor_required_sections_are_auto_safe_and_fresh_prefligh
     assert fresh_result["structural_repair_action"]["items"] == []
 
 
+def test_owner_anchor_required_section_candidates_are_exact_column_zero_h2_only():
+    """Owner-anchor section sourcing ignores prose, fences, and containers."""
+    issue_number = 2572
+    target_body = _build_parent_body()
+    anchor_body = """Owner decision prose stays outside the canonical sections.
+
+```yaml
+example_heading: "## Quality Decision Record"
+```
+
+```markdown
+## Child Issues
+
+- fenced false positive
+```
+
+- ## Remaining Parent Gaps
+
+## Quality Decision Record
+
+- `Status`: measurement-ready
+
+## Child Issues
+
+- [ ] #2582 — repair
+
+## Remaining Parent Gaps
+
+- [ ] resume on current main
+"""
+    url, comment = _owner_anchor_comment(issue_number=issue_number, comment_id=5584982649, body=anchor_body)
+    spans = wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=anchor_body,
+        anchor_url=url,
+        anchor_comment=comment,
+        repo=REPO,
+        issue_number=issue_number,
+    )
+    assert {field_id: span["text"] for field_id, span in spans.items()} == {
+        "quality-decision-record": "- `Status`: measurement-ready",
+        "child-issues": "- [ ] #2582 — repair",
+        "remaining-parent-gaps": "- [ ] resume on current main",
+    }
+
+    container_only = """- ## Quality Decision Record
+
+  ## Child Issues
+
+- [ ] not a canonical heading
+
+> ## Remaining Parent Gaps
+
+- [ ] not a canonical heading
+"""
+    container_url, container_comment = _owner_anchor_comment(
+        issue_number=issue_number, comment_id=5584982650, body=container_only
+    )
+    assert wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=container_only,
+        anchor_url=container_url,
+        anchor_comment=container_comment,
+        repo=REPO,
+        issue_number=issue_number,
+    ) == {}
+
+
 def test_owner_anchor_source_assembly_fails_closed_for_invalid_provenance():
     issue_number = 2572
     target_body = _build_parent_body()

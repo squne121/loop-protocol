@@ -2403,6 +2403,58 @@ def _verify_structural_items_against_live_body(items: list[dict], live_body: str
     return None
 
 
+def _revalidate_owner_anchor_sources_before_dispatch(
+    items: list[dict], *, repo: str, issue_number: int
+) -> "str | None":
+    """Freshly bind every owner-anchor item to its live source comment.
+
+    Structural artifacts are untrusted handoffs. Immediately before the one
+    controlled mutation dispatch, re-fetch each distinct owner anchor once and
+    require the same comment identity, target Issue, OWNER association, and
+    body revision that the producer recorded. Any source read or binding
+    failure maps to the existing digest-mismatch fail-closed outcome.
+    """
+    by_comment_id: dict[str, list[dict]] = {}
+    for item in items:
+        source_span = item.get("source_span")
+        if not isinstance(source_span, dict) or source_span.get("authority_kind") != "owner_anchor":
+            continue
+        comment_id = source_span.get("source_object_id")
+        if (
+            source_span.get("source_repo") != repo
+            or source_span.get("source_object_kind") != "issue_comment"
+            or not isinstance(comment_id, str)
+            or not comment_id.isdecimal()
+            or item.get("source_url")
+            != f"https://github.com/{repo}/issues/{issue_number}#issuecomment-{comment_id}"
+            or not isinstance(source_span.get("source_revision"), str)
+        ):
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+        by_comment_id.setdefault(comment_id, []).append(source_span)
+
+    for comment_id, source_spans in by_comment_id.items():
+        try:
+            live_comment, source_error = _fetch_single_comment(repo, int(comment_id))
+        except Exception:
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+        if not isinstance(live_comment, dict) or source_error:
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+        expected_url = f"https://github.com/{repo}/issues/{issue_number}#issuecomment-{comment_id}"
+        live_body = live_comment.get("body")
+        if (
+            not isinstance(live_body, str)
+            or str(live_comment.get("id")) != comment_id
+            or live_comment.get("html_url") != expected_url
+            or live_comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{issue_number}"
+            or live_comment.get("author_association") != "OWNER"
+        ):
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+        live_revision = f"sha256:{_sha256(live_body)}"
+        if any(source_span.get("source_revision") != live_revision for source_span in source_spans):
+            return STRUCTURAL_REPAIR_APPLY_FAILURE_DIGEST_MISMATCH
+    return None
+
+
 def _synthesize_structural_repaired_body(items: list[dict], live_body: str) -> "tuple[str | None, str | None]":
     """Issue #2396: deterministically synthesize a SINGLE repaired body from
     every item's `insertion` metadata, applied against the live body from
@@ -2776,6 +2828,16 @@ def run_structural_repair_action_apply(
         )
 
     apply_fn = apply_transaction or _default_apply_transaction
+    owner_anchor_failure = _revalidate_owner_anchor_sources_before_dispatch(
+        items, repo=repo, issue_number=issue_number
+    )
+    if owner_anchor_failure is not None:
+        return _structural_apply_not_attempted_result(
+            repo=repo,
+            issue_number=issue_number,
+            phase="provenance_validation",
+            failure_code=owner_anchor_failure,
+        )
     txn_result = apply_fn(current_issue, new_body)
 
     def _resolve_readback() -> "str | None":
@@ -7518,15 +7580,15 @@ def _resolve_owner_anchor_required_section_source_spans(
         normalized = heading.casefold()
         target_matches = target_index.get(normalized, [])
         anchor_matches = anchor_index.get(normalized, [])
-        # Source headings must use the template's byte-exact canonical label;
-        # case-folding above is used only to also reject a casing-variant
-        # duplicate as ambiguous rather than treating it as absent.
-        if len(anchor_matches) == 1 and anchor_matches[0]["heading"].strip() != heading:
-            anchor_matches = []
-        # Missing target heading and precisely one non-empty anchor heading
-        # are both mandatory. Duplicate/empty/malformed parse results remain
-        # human-review candidates in the existing structural model.
-        if len(target_matches) != 0 or len(anchor_matches) != 1:
+        # A trusted owner source must be the literal canonical H2 at column
+        # zero. Keep the generic parser for fence-aware section bounds, but
+        # never let its CommonMark-compatible indented/trailing-hash forms
+        # qualify as this narrower authority's canonical candidate.
+        if (
+            len(target_matches) != 0
+            or len(anchor_matches) != 1
+            or anchor_lines[anchor_matches[0]["start_line"] - 1] != f"## {heading}"
+        ):
             continue
         anchor_section = anchor_matches[0]
         content = anchor_section["content"].strip()
