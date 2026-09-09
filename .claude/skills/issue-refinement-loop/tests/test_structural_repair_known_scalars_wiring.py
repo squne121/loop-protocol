@@ -982,6 +982,29 @@ def test_owner_anchor_provenance_is_revalidated_at_bundle_boundary():
         item["field_id"]: item for item in bundle_for(spans)["items"]
     }["quality-decision-record"]["disposition"] == ric.STRUCT_DISPOSITION_AUTO_APPLY_SAFE
 
+    # The producer's generic parser accepts up to three leading spaces for
+    # CommonMark compatibility. An untrusted handoff must not use that wider
+    # rule to forge the narrower owner-anchor authority at this boundary.
+    indented_anchor_body = "  ## Quality Decision Record\n\n- `Status`: measurement-ready\n"
+    forged_indented_span = dict(
+        spans["quality-decision-record"],
+        source_revision=ric._sha256(indented_anchor_body),
+        line_start=3,
+        line_end=3,
+    )
+    indented_snapshot = dict(
+        snapshot,
+        body=indented_anchor_body,
+        body_sha256=ric._sha256(indented_anchor_body),
+    )
+    item = {
+        item["field_id"]: item
+        for item in bundle_for(
+            {"quality-decision-record": forged_indented_span}, indented_snapshot
+        )["items"]
+    }["quality-decision-record"]
+    assert item["disposition"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
+
     for mutation in (
         lambda span: span.update(source_repo="other/repo"),
         lambda span: span.update(source_object_id="1"),

@@ -1396,10 +1396,14 @@ def _validate_owner_anchor_source_span_authority(
     if len(matches) != 1:
         return False
     section = matches[0]
+    body_lines = body.split("\n")
+    # owner_anchor is narrower than the generic CommonMark-compatible parser:
+    # only its literal, column-0 canonical H2 can back source_span_exact.
+    if body_lines[section["start_line"] - 1] != f"## {expected_heading}":
+        return False
     text = section["content"].strip()
     if not text or span.get("text") != text:
         return False
-    body_lines = body.split("\n")
     _heading_start, section_end_line = _section_line_bounds(sections, len(body_lines))[id(section)]
     raw_content_start_line = section["start_line"] + 1
     if raw_content_start_line > section_end_line:
