@@ -1613,6 +1613,8 @@ def test_bounded_retrieve_download_stall_after_over_limit_flush_rejects_without_
         "#!/usr/bin/env python3\n"
         "import os, sys, time\n"
         "sentinel = os.environ['REAP_SENTINEL']\n"
+        "with open(sentinel, 'w') as fh:\n"
+        "    fh.write(str(time.time()))\n"
         f"data = b'Q' * {max_download_bytes + 1}\n"
         "sys.stdout.buffer.write(data)\n"
         "sys.stdout.buffer.flush()\n"
