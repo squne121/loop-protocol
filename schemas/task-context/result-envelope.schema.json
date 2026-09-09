@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://loop-protocol.local/schemas/task-context/result-envelope.schema.json",
+  "title": "Task Context v1 result envelope",
+  "description": "Frozen result envelope shape (Issue #2563 AC8). `data` internals are additive/open per-operation and are NOT constrained by this schema. `status`/`code` are the business-result semantics and are deliberately independent of the CLI process exit code.",
+  "type": "object",
+  "required": ["schema_version", "status", "code", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "task-context-result/v1"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "error"]
+    },
+    "code": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Business result code, e.g. OK, VALIDATION_ERROR, TEMPORARILY_UNAVAILABLE, CONFLICT, NOT_FOUND, CORRUPT_DATABASE, SCHEMA_TOO_NEW, INTERNAL_ERROR. See error-taxonomy.md."
+    },
+    "data": {
+      "type": "object",
+      "description": "Operation-specific fields. Intentionally open -- future consumer children add fields additively without changing this envelope."
+    }
+  }
+}
