@@ -4,7 +4,7 @@ Step 2-4 の結果を統合して、ループを次イテレーションに進�
 
 ## 終了条件マトリクス（Issue #1873、`route_loop_verdict_v2()` の `route` を正本とする）
 
-### Human-history emission / PR head safety（Issue #1908）
+### Human-history の投稿と PR head の安全性（Issue #1908）
 
 Step 5 は machine-readable verdict comment を移動・更新・削除しない。route を確定した後、
 new human-history だけを `context-protocol-and-guardrails.md#human-history-v1` の identity / template
@@ -19,12 +19,13 @@ contract で emit する。`publish_termination_report.py::publish_human_history
 | target drift | `post-PR-head-drift` / head_drift | bound PR | original stale PR snapshot |
 | repeated same-iteration conflict | `conflict-resolution` / human_escalation | origin target | origin mapping の reviewed_ref |
 
-For post-PR, snapshot → review → direct PR-head read (direct PR head read) happens before every primary
-create/PATCH/noop decision. A mismatch starts the existing `head_drift` reconciliation rather than
-mutating an old primary identity. Before a diagnostic decision, direct-read head must equal its stale
-evidence; otherwise re-reconcile the **same** diagnostic identity with the latest head. After accepted
-noop and every controlled write/readback, re-read head; re-review only after the latest diagnostic has
-successful readback or valid noop reconciliation. `conflict_hard_stop` alone emits no history.
+post-PR では、snapshot → review → direct PR-head read の順で処理し、primary の create/PATCH/noop
+の各 decision の直前に direct PR-head read を行う。不一致なら old primary identity を mutation
+せず、既存の `head_drift` reconciliation を開始する。diagnostic の decision 前には direct-read head が
+stale evidence と一致しなければならず、不一致なら latest head で**同じ** diagnostic identity を
+再 reconcile する。accepted noop と全ての controlled write/readback の後にも head を再読し、latest
+diagnostic の successful readback または valid noop reconciliation の後にだけ re-review する。
+`conflict_hard_stop` 単独では history を emit しない。
 
 
 reviewer_verdict（`verdict`/`reviewed_head_sha`/`blockers`/`warnings`）と live_mergeability
