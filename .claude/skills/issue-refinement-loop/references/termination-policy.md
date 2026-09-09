@@ -633,7 +633,7 @@ termination payload 正規化」節・「`canonical_step2_route: step_5_operator
 
 ## Termination Summary Publish Flow（終了サマリー投稿フロー, #1873）
 
-### New human-history only（Issue #1908）
+### 新規 human-history のみ（Issue #1908）
 
 `issue-refinement-loop` が review-complete を得た時は、existing machine-readable termination
 summary を変更せず、source Issue を target とする new human-history を一件 reconcile する。
