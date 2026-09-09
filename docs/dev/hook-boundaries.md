@@ -338,14 +338,28 @@ hook_boundaries_manifest_v1:
       on_no_match: proceed_silently
       on_any_failure: proceed
     notes: >
-      repo root の `.tmp/`、`.temp/`、`.tmp-*` を検出した場合に
-      REPO_TEMP_FOLDER_ADVICE_V1 を stdout に出力する non-blocking advisory。
+      repo root の `.tmp/`、`.temp/`、`.tmp-*` を検出した場合、および
+      `.claude/tmp/**`（非推奨の legacy write root）への write 操作を検出した場合に
+      REPO_TEMP_FOLDER_ADVICE_V2 を stdout に出力する non-blocking advisory
+      （Issue #2007 以降、live hook は producer を明示的に `--schema-version v2` で呼び出す）。
       stdout 形式は hookSpecificOutput.additionalContext ラッパーに準拠する:
-      { "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": "REPO_TEMP_FOLDER_ADVICE_V1 {inner_json}" } }
-      inner payload スキーマ: schemas/repo_temp_folder_advice_v1.schema.json
-      block: false を固定し、tool call を止めずに `tmp/` または `.claude/tmp/` への移行を案内する。
+      { "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": "REPO_TEMP_FOLDER_ADVICE_V2 {inner_json}" } }
+      inner payload スキーマ: schemas/repo_temp_folder_advice_v2.schema.json
+      block: false を固定し、tool call を止めずに `tmp/` への移行を案内する。outer envelope に
+      permissionDecision は出力せず、Claude Code の通常の permission flow を変更しない。
       local_main_branch_guard の classification: blocker は維持し、この hook に deny logic を混在させない。
-      schema（`repo_temp_folder_advice_v1.schema.json`）の `approved_temporary_roots` enum は `tmp/` / `.claude/tmp/` の 2 値のままとし、本 Issue #1995 では変更しない（enum を 1 値化する breaking change は schema v2 migration の follow-up Issue で扱う）。ドキュメント上の推奨は `tmp/` を canonical とし、`.claude/tmp/` は非推奨（deprecated）の legacy root として案内するが、 advisory 出力自体（block: false・両 root への言及）は変更しない。
+
+      **schema v1 → v2 migration（Issue #2007、Issue #1995 の記載を更新）**: V1（`repo_temp_folder_advice_v1.schema.json`）は
+      `approved_temporary_roots` enum に `tmp/` / `.claude/tmp/` の 2 値を維持したまま producer 内に残置し、
+      breaking change を避ける（V1 emit 経路は `--schema-version v1` 明示または無指定時に維持される。
+      `schemas/catalog.yaml` に `repo_temp_folder_advice/v1`（#1418 吸収分）として本 Issue で新規登録した）。
+      V2（`repo_temp_folder_advice_v2.schema.json`）は `approved_write_roots`（`const: ["tmp/"]`）と
+      `deprecated_legacy_roots`（`const: [".claude/tmp/"]`）を分離した schema であり、`tmp/` を新規書き込みの
+      唯一の canonical destination とする。live hook（このエントリ）は V2 を選択して呼び出す。
+      V2 live mode では `.claude/tmp/**` への Write/Edit と、明確に write と判定できる Bash operation を
+      `reason_code: deprecated_legacy_root_write` として advisory 対象に追加する一方、read / scan / report / delete
+      （`.claude/tmp/**` を含む）は妨げない。`temp_residue_marker.py` / `temp_residue_classifier.py` の
+      `.claude/tmp/` に対する legacy residue 認識ロジック（read/scan/report）は本 Issue では変更していない。
 ```
 
 ## HOOK_COMMAND_REPAIR_HINT_V1（Hook コマンド修復ヒント）
