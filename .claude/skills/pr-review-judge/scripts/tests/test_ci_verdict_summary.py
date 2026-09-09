@@ -1548,7 +1548,14 @@ class TestExtractRunId:
 class TestIntentionalOrdinaryPrSkips:
     """Only exact, current-head ordinary-PR skipped CheckRuns are advisory."""
 
-    @pytest.mark.parametrize("check_name", ["reliability-assessment", "close-evidence-publication"])
+    @pytest.mark.parametrize(
+        "check_name",
+        [
+            "reliability-assessment",
+            "close-evidence-publication",
+            "ci-runtime-baseline-gate-ready",
+        ],
+    )
     def test_exact_current_head_ordinary_pr_skip_is_excluded(self, check_name: str):
         assert ("ci", check_name) in ORDINARY_PR_SKIPPED_EXCLUDE_RULES
         entry = {
@@ -1609,7 +1616,14 @@ class TestIntentionalOrdinaryPrSkips:
         }
         assert determine_check_verdict(entry, HEAD_SHA) == "failed"
 
-    @pytest.mark.parametrize("check_name", ["reliability-assessment", "close-evidence-publication"])
+    @pytest.mark.parametrize(
+        "check_name",
+        [
+            "reliability-assessment",
+            "close-evidence-publication",
+            "ci-runtime-baseline-gate-ready",
+        ],
+    )
     def test_exact_tuple_failure_stays_blocking(self, check_name: str):
         entry = {
             "workflow": "ci",

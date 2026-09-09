@@ -87,6 +87,7 @@ UNCONDITIONAL_EXCLUDE_RULES: frozenset[tuple[str, str]] = frozenset({
 ORDINARY_PR_SKIPPED_EXCLUDE_RULES: frozenset[tuple[str, str]] = frozenset({
     ("ci", "reliability-assessment"),
     ("ci", "close-evidence-publication"),
+    ("ci", "ci-runtime-baseline-gate-ready"),
 })
 
 # Artifact truncation limit (bytes)
@@ -492,7 +493,7 @@ def determine_check_verdict(entry: dict, pr_head_sha: str) -> str:
     name = entry.get("name") or ""
     workflow = entry.get("workflow") or ""
 
-    # Only the two exact workflow_dispatch-only jobs may be excluded, and
+    # Only the three exact workflow_dispatch-only jobs may be excluded, and
     # only for their intentional ordinary-PR skipped CheckRun at this head.
     # Do not grant this exemption to a failed/cancelled/pending check, stale
     # provenance, incomplete direct CheckRun detail, or a similarly named job.
