@@ -43,11 +43,38 @@ PR #2503 review fix_delta (issuecomment-5550095642) additions:
   (AC3, positive) exercises these formatting variants through the SAME
   `extract_acquisition_spec`/`check_acquisition_parity` functions AC1
   uses.
+
+PR #2595 review fix_delta (issuecomment-5601783521) P1 addition (Issue
+#2594):
+
+- AC1-AC3 above check STRUCTURAL acquisition-semantics parity (endpoint
+  pattern / jq filter / direct-persistence shape) but never actually
+  EXECUTE the producer's `run:` shell text, so they could not catch the
+  original #2594 regression itself: an unconditional `gh api
+  .../pulls/${PR_NUMBER}` call with no `PR_NUMBER` empty-string guard,
+  which 404'd on 35/36 historical `push`-event runs (there is no
+  `github.event.pull_request.number` on a `push` event).
+- `test_producer_step_skips_gh_call_when_pr_number_empty` and
+  `test_producer_step_invokes_gh_with_expected_endpoint_and_persists_stdout_unchanged`
+  extract the LIVE producer step's `run:` text via the SAME
+  `_load_workflow`/`_find_unique_pr_body_acquisition_step` helpers AC1
+  already uses (no second extraction mechanism), then actually EXECUTE
+  that shell text (with a fake `gh` binary injected via `PATH`, no real
+  network/`gh` call) for the `PR_NUMBER=""` and `PR_NUMBER="2595"` cases.
+- `test_mutation_reverting_to_unconditional_gh_call_fails_the_pr_number_empty_assertion`
+  reuses the exact assertion helper the first of those two tests calls,
+  against a deliberately un-guarded (pre-#2594-fix) mutation of the
+  `run:` text, and asserts it raises `AssertionError` -- proving the new
+  positive test actually catches the original regression rather than
+  passing regardless of whether the guard is present.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import stat
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -576,3 +603,216 @@ def test_direct_acquisition_regex_rejects_near_miss_caller_tokens():
     }
     with pytest.raises(AcquisitionSpecError):
         extract_acquisition_spec(step)
+
+
+# ---------------------------------------------------------------------------
+# AC4 (Issue #2594 regression, PR #2595 review fix_delta P1): behavioral
+# execution of the LIVE producer step's `run:` text against a fake `gh`
+# binary, covering the PR_NUMBER="" (push-event) and PR_NUMBER="2595"
+# (pull_request-event) cases the structural AC1-AC3 tests above never
+# actually execute.
+# ---------------------------------------------------------------------------
+
+_FAKE_GITHUB_REPOSITORY = "squne121/loop-protocol"
+
+
+def _write_fake_gh(
+    tmp_path: Path,
+    *,
+    log_path: Path,
+    stdout_path: Optional[Path],
+    fail_if_invoked: bool,
+) -> Path:
+    """Write an executable fake `gh` binary into `tmp_path/fakebin/gh` that
+    logs every invocation (arg count on its own line, then one argument
+    per line) to `log_path`, and either:
+
+    - `fail_if_invoked=True`: exits non-zero after logging (used for the
+      PR_NUMBER="" case, where `gh` must never be called at all -- if the
+      guard regresses and `gh` IS invoked, this non-zero exit fails the
+      overall `run:` script under the default GitHub Actions `bash -eo
+      pipefail` shell, which the caller asserts against).
+    - `stdout_path` given: `cat`s that file's bytes to stdout UNCHANGED
+      (used for the PR_NUMBER="2595" case, to verify byte-for-byte
+      persistence with no canonicalization, including trailing
+      newlines).
+
+    Returns the `fakebin` directory to prepend to `PATH`.
+    """
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir(parents=True, exist_ok=True)
+    gh_path = fakebin / "gh"
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        (
+            '{ printf "%s\\n" "$#"; for a in "$@"; do printf "%s\\n" "$a"; '
+            f'done; }} >> "{log_path}"'
+        ),
+    ]
+    if fail_if_invoked:
+        lines.append("exit 7")
+    elif stdout_path is not None:
+        lines.append(f'cat "{stdout_path}"')
+    else:
+        lines.append("exit 0")
+    gh_path.write_text("\n".join(lines) + "\n")
+    gh_path.chmod(gh_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return fakebin
+
+
+def _execute_producer_run_text(
+    run_text: str,
+    *,
+    workdir: Path,
+    fakebin: Path,
+    pr_number: str,
+) -> subprocess.CompletedProcess:
+    """Execute `run_text` (a GitHub Actions step `run:` block's literal
+    text) as a POSIX shell script inside `workdir`, under the SAME shell
+    invocation GitHub Actions uses by default for a `run:` step on an
+    Ubuntu runner (`bash --noprofile --norc -eo pipefail -c <script>`),
+    with `fakebin` prepended to `PATH` so the fake `gh` binary is used
+    instead of any real `gh` CLI / network call."""
+    env = dict(os.environ)
+    env["PATH"] = f"{fakebin}:{env.get('PATH', '')}"
+    env["GH_TOKEN"] = "fake-token-for-test"
+    env["PR_NUMBER"] = pr_number
+    env["GITHUB_REPOSITORY"] = _FAKE_GITHUB_REPOSITORY
+    return subprocess.run(
+        ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", run_text],
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        timeout=10,
+    )
+
+
+def _get_live_producer_run_text() -> str:
+    """Extract the LIVE `.github/workflows/ci.yml` producer step's `run:`
+    text via the SAME `_load_workflow`/`_find_unique_pr_body_acquisition_step`
+    helpers `test_live_pr_body_acquisition_parity` (AC1) already uses --
+    no second extraction mechanism."""
+    ci_doc = _load_workflow(CI_WORKFLOW_PATH)
+    producer_step = _find_unique_pr_body_acquisition_step(ci_doc)
+    return producer_step.get("run") or ""
+
+
+def _assert_pr_number_empty_skips_gh_call(run_text: str, tmp_path: Path) -> None:
+    """Core assertion logic for the PR_NUMBER="" acquisition-guard
+    behavior, factored out of `test_producer_step_skips_gh_call_when_pr_number_empty`
+    so the mutation fixture below can reuse the SAME assertions against a
+    deliberately un-guarded run text and prove they actually fail
+    (instead of hand-reimplementing a parallel check that could silently
+    drift from what the positive test actually asserts)."""
+    log_path = tmp_path / "gh_invocations.log"
+    fakebin = _write_fake_gh(
+        tmp_path, log_path=log_path, stdout_path=None, fail_if_invoked=True
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    result = _execute_producer_run_text(
+        run_text, workdir=workdir, fakebin=fakebin, pr_number=""
+    )
+
+    assert result.returncode == 0, (
+        "expected exit 0 with PR_NUMBER=\"\", got "
+        f"{result.returncode}: stderr={result.stderr.decode(errors='replace')!r}"
+    )
+    assert not log_path.exists() or log_path.read_bytes() == b"", (
+        "fake gh was invoked even though PR_NUMBER was empty -- this is "
+        "the exact #2594 regression: an unconditional `gh api "
+        ".../pulls/${PR_NUMBER}` call with PR_NUMBER empty 404s on every "
+        "push-event run"
+    )
+    pr_body_path = workdir / "pr_body.md"
+    assert pr_body_path.exists(), "pr_body.md was not created"
+    assert pr_body_path.read_bytes() == b"", (
+        f"expected pr_body.md to be empty, got {pr_body_path.read_bytes()!r}"
+    )
+
+
+def test_producer_step_skips_gh_call_when_pr_number_empty(tmp_path):
+    """GIVEN the LIVE `.github/workflows/ci.yml` producer step's actual
+    `run:` block text, WHEN executed with `PR_NUMBER=""` (the push-event /
+    PR-less `workflow_dispatch` shape), THEN it exits 0, never invokes the
+    fake `gh` binary at all, and leaves `pr_body.md` present and exactly 0
+    bytes -- this is the exact original bug (#2594) this test guards
+    against: an unconditional `gh api .../pulls/${PR_NUMBER}` call with an
+    empty `PR_NUMBER` 404'd on 35/36 historical push-event runs."""
+    run_text = _get_live_producer_run_text()
+    _assert_pr_number_empty_skips_gh_call(run_text, tmp_path)
+
+
+def test_producer_step_invokes_gh_with_expected_endpoint_and_persists_stdout_unchanged(
+    tmp_path,
+):
+    """GIVEN the LIVE `.github/workflows/ci.yml` producer step's actual
+    `run:` block text, WHEN executed with `PR_NUMBER="2595"` (the
+    `pull_request`-event shape), THEN the fake `gh` binary is invoked
+    exactly once with the expected Pull Request REST endpoint
+    `repos/${GITHUB_REPOSITORY}/pulls/2595` and the `--jq '.body // ""'`
+    filter preserved, and the fake `gh`'s stdout bytes (including a
+    payload with trailing newlines, to verify byte-for-byte persistence
+    with no canonicalization-changing intermediate) end up in
+    `pr_body.md` unchanged."""
+    run_text = _get_live_producer_run_text()
+
+    stdout_payload = b"Sample PR body content.\nWith a second line.\n\n"
+    stdout_path = tmp_path / "fake_gh_stdout.bin"
+    stdout_path.write_bytes(stdout_payload)
+    log_path = tmp_path / "gh_invocations.log"
+    fakebin = _write_fake_gh(
+        tmp_path, log_path=log_path, stdout_path=stdout_path, fail_if_invoked=False
+    )
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    result = _execute_producer_run_text(
+        run_text, workdir=workdir, fakebin=fakebin, pr_number="2595"
+    )
+
+    assert result.returncode == 0, (
+        f"expected exit 0, got {result.returncode}: "
+        f"stderr={result.stderr.decode(errors='replace')!r}"
+    )
+
+    log_lines = log_path.read_text().splitlines()
+    expected_endpoint = f"repos/{_FAKE_GITHUB_REPOSITORY}/pulls/2595"
+    assert log_lines == ["4", "api", expected_endpoint, "--jq", '.body // ""'], (
+        "expected gh to be invoked exactly once with "
+        f"('api', {expected_endpoint!r}, '--jq', '.body // \"\"'), "
+        f"got log lines: {log_lines!r}"
+    )
+
+    pr_body_path = workdir / "pr_body.md"
+    assert pr_body_path.read_bytes() == stdout_payload, (
+        "expected fake gh's stdout bytes to be persisted to pr_body.md "
+        f"unchanged (byte-for-byte, including trailing newlines); got "
+        f"{pr_body_path.read_bytes()!r} instead of {stdout_payload!r}"
+    )
+
+
+# The ORIGINAL historical buggy shape (pre-#2594-fix): an unconditional
+# `gh api ... > pr_body.md` call with no `if [ -n "${PR_NUMBER}" ]` guard
+# at all -- confirmed live: 35/36 push-event `visual-impact-policy` runs
+# 404'd this way before the fix.
+_MUTATED_UNGUARDED_RUN_TEXT = (
+    'gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" '
+    "--jq '.body // \"\"' > pr_body.md\n"
+)
+
+
+def test_mutation_reverting_to_unconditional_gh_call_fails_the_pr_number_empty_assertion(
+    tmp_path,
+):
+    """GIVEN the ORIGINAL historical buggy `run:` shape restored (the
+    unconditional `gh api ... > pr_body.md` call with the `PR_NUMBER`
+    empty-string guard removed -- the exact regression #2594 fixed), WHEN
+    the SAME assertion helper `test_producer_step_skips_gh_call_when_pr_number_empty`
+    calls is applied to this mutated run text, THEN it raises
+    `AssertionError` -- proving the new positive test actually catches
+    this regression instead of passing vacuously regardless of whether
+    the guard is present."""
+    with pytest.raises(AssertionError):
+        _assert_pr_number_empty_skips_gh_call(_MUTATED_UNGUARDED_RUN_TEXT, tmp_path)
