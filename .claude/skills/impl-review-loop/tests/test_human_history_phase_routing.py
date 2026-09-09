@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -308,3 +309,198 @@ def test_diagnostic_noop_rechecks_head_after_readback_before_rereview():
     assert failures[-1][0][0] == "human_history_diagnostic_head_drift_reconciliation_required"
     assert failures[-1][1]["status"] == "stale_head"
     assert failures[-1][1]["extra"]["rerun_required"] == {"pr_review": True}
+
+
+def _write_fake_gh(tmp_path: Path, comments: list[dict]) -> tuple[Path, Path]:
+    """Build a stateful fake that exercises the production subprocess boundary."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    state_path = tmp_path / "fake-gh.json"
+    state_path.write_text(json.dumps({"comments": comments, "calls": []}), encoding="utf-8")
+    fake_gh = tmp_path / "fake-gh"
+    fake_gh.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+state_path = Path(__file__).with_suffix(".json")
+state = json.loads(state_path.read_text(encoding="utf-8"))
+args = sys.argv[1:]
+
+def save():
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+def endpoint():
+    return next(value for value in args if value.startswith("repos/"))
+
+def field_body():
+    field = args[args.index("--field") + 1]
+    return Path(field.removeprefix("body=@")).read_text(encoding="utf-8")
+
+if args[:2] == ["issue", "view"]:
+    state["calls"].append({"method": "LIST", "endpoint": "issues/" + args[2] + "/comments"})
+    save()
+    print(json.dumps({"comments": state["comments"]}))
+elif "user" in args:
+    print("writer")
+elif any(value.startswith("repos/") and "/pulls/" in value for value in args):
+    print("b" * 40)
+elif "--method" in args and args[args.index("--method") + 1] == "POST":
+    target = endpoint()
+    state["calls"].append({"method": "POST", "endpoint": target})
+    body = field_body()
+    comment_id = str(len(state["comments"]) + 1)
+    state["comments"].append({
+        "id": comment_id,
+        "url": "https://github.com/squne121/loop-protocol/issues/1#issuecomment-" + comment_id,
+        "body": body,
+        "author": {"login": "writer"},
+    })
+    save()
+    response = {
+        "id": comment_id,
+        "html_url": "https://github.com/squne121/loop-protocol/issues/1#issuecomment-" + comment_id,
+    }
+    print(json.dumps(response))
+elif "--method" in args and args[args.index("--method") + 1] == "PATCH":
+    target = endpoint()
+    state["calls"].append({"method": "PATCH", "endpoint": target})
+    comment_id = target.rsplit("/", 1)[-1]
+    for comment in state["comments"]:
+        if str(comment["id"]) == comment_id:
+            comment["body"] = field_body()
+    save()
+    print("{}")
+else:
+    raise SystemExit("unexpected fake gh argv: " + repr(args))
+""",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    return fake_gh, state_path
+
+
+def test_fake_gh_destination_and_diagnostic_non_mutation_preserve_machine_comments(tmp_path: Path):
+    # The production executor calls the fake via subprocess; this is not a
+    # renderer/text test.  The legacy marker remains a non-human-history
+    # comment and neither routing destination mutates it.
+    legacy = {
+        "id": "legacy",
+        "url": "https://github.com/squne121/loop-protocol/issues/1908#issuecomment-99",
+        "body": "<!-- loop-protocol/legacy-machine:v1 -->",
+        "author": {"login": "other"},
+    }
+    fake_gh, state_path = _write_fake_gh(tmp_path, [legacy])
+
+    def publish(identity: dict, target: int) -> dict:
+        data, _ = _post_pr_publish_input(identity)
+        accepted: list[dict] = []
+        args = SimpleNamespace(
+            issue_number=target,
+            repo="squne121/loop-protocol",
+            command_id="issue_comment.publish",
+            dry_run=False,
+        )
+        with (
+            patch.object(executor, "_capture_pre_mutation_snapshot", return_value=(object(), None)),
+            patch.object(executor, "_check_no_tracked_changes", return_value=[]),
+        ):
+            assert executor._run_human_history_comment_publish(
+                args, data, str(fake_gh), lambda *_args, **_kwargs: 1, lambda value: accepted.append(value) or 0
+            ) == 0
+        assert accepted[-1]["status_detail"] == "created"
+        return data
+
+    issue_identity = _identity("impl-review-loop", "pre-PR-binding", "issue", "completed")
+    publish(issue_identity, 1908)
+    pr_identity = _identity("impl-review-loop", "post-PR-binding", "pull_request", "completed")
+    pr_data = publish(pr_identity, 47)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["comments"][0] == legacy
+    assert {tuple(sorted(call.items())) for call in state["calls"]} >= {
+        tuple(sorted({"method": "POST", "endpoint": "repos/squne121/loop-protocol/issues/1908/comments"}.items())),
+        tuple(sorted({"method": "POST", "endpoint": "repos/squne121/loop-protocol/issues/47/comments"}.items())),
+    }
+
+    malformed_remote = {
+        "id": "bad",
+        "url": "https://github.com/squne121/loop-protocol/issues/47#issuecomment-100",
+        "body": "unclosed loop-protocol/human-history:v1:sha256:" + "a" * 64,
+        "author": {"login": "writer"},
+    }
+    blocked_gh, blocked_state_path = _write_fake_gh(tmp_path / "blocked", [legacy, malformed_remote])
+    failures: list[str] = []
+    args = SimpleNamespace(
+        issue_number=47,
+        repo="squne121/loop-protocol",
+        command_id="issue_comment.publish",
+        dry_run=False,
+    )
+    with patch.object(executor, "_capture_pre_mutation_snapshot", return_value=(object(), None)):
+        assert executor._run_human_history_comment_publish(
+            args,
+            pr_data,
+            str(blocked_gh),
+            lambda reason, **_kwargs: failures.append(reason) or 1,
+            lambda _value: 0,
+        ) == 1
+    blocked_state = json.loads(blocked_state_path.read_text(encoding="utf-8"))
+    assert failures == ["human_history_marker_diagnostic_failure:human_history_marker_malformed_delimiter"]
+    assert all(call["method"] not in {"POST", "PATCH"} for call in blocked_state["calls"])
+    assert blocked_state["comments"] == [legacy, malformed_remote]
+
+
+def test_conflict_origin_mappings_bind_real_publisher_targets_and_reviewed_refs():
+    source_issue = 1908
+    body_sha = "a" * 64
+    bound_pr = 47
+    reviewed_head = "b" * 40
+    latest_head = "c" * 40
+    cases = (
+        ("conflict-resolution", "issue", source_issue, body_sha, "human_escalation", None),
+        ("binding-validation", "issue", source_issue, body_sha, "binding_missing", None),
+        (
+            "post-PR-binding",
+            "pull_request",
+            bound_pr,
+            f"refs/pull/{bound_pr}/head@{reviewed_head}",
+            "needs_fix",
+            None,
+        ),
+        (
+            "post-PR-head-drift",
+            "pull_request",
+            bound_pr,
+            f"refs/pull/{bound_pr}/head@{reviewed_head}",
+            "head_drift",
+            f"latest head: {latest_head}",
+        ),
+    )
+    calls: list[dict] = []
+    with patch.object(publisher, "_post_github_comment", side_effect=lambda **kwargs: calls.append(kwargs) or 0):
+        for phase, target_kind, target_number, reviewed_ref, reason, stale_evidence in cases:
+            identity = {
+                "loop_kind": "impl-review-loop",
+                "phase": phase,
+                "source_issue_number": source_issue,
+                "target_kind": target_kind,
+                "target_number": target_number,
+                "route_or_termination_reason": reason,
+                "reviewed_ref": reviewed_ref,
+            }
+            assert publisher.publish_human_history(
+                target_number=target_number,
+                repo="squne121/loop-protocol",
+                identity=identity,
+                result="判定を記録しました",
+                evidence_refs=["https://github.com/squne121/loop-protocol/issues/1908"],
+                recommended_action="次の判断を実施してください",
+                recommended_reason="現在の証跡に基づくためです",
+                impact_if_unaddressed="判断根拠が不足します",
+                stale_evidence=stale_evidence,
+            ) == 0
+    assert [call["issue_number"] for call in calls] == [source_issue, source_issue, bound_pr, bound_pr]
+    for call, case in zip(calls, cases, strict=True):
+        _phase, _target_kind, _target_number, reviewed_ref, _reason, stale_evidence = case
+        assert f"- reviewed_ref: {reviewed_ref}" in call["body"]
+        assert ("- stale evidence:" in call["body"]) is (stale_evidence is not None)

@@ -146,3 +146,63 @@ def test_foreign_different_identity_marker_blocks_create_before_any_mutation():
     post.assert_not_called()
     patch_comment.assert_not_called()
     readback.assert_not_called()
+
+
+def test_marker_source_vectors_and_diagnostic_failures_are_non_mutating():
+    marker = _marker("strict-vectors")
+    canonical = _body("é", marker)
+    nfd = _body("é", marker)
+    parsed_nfc, nfc_error = executor._parse_human_history_marker_source(canonical)
+    parsed_nfd, nfd_error = executor._parse_human_history_marker_source(nfd)
+    assert nfc_error == nfd_error == ""
+    assert parsed_nfc and parsed_nfd
+    assert parsed_nfc["content_digest"] == "4a99557e4033c3539de2eb65472017cad5f9557f7a0625a09f1c3f6e2ba69c4c"
+    assert parsed_nfd["content_digest"] == "bf12767b0f2a56b2190075bae8169f656e3ce8d6357d4aff184bc6c7ea48f9f6"
+    assert parsed_nfc["content_digest"] != parsed_nfd["content_digest"]
+
+    malformed = {
+        "missing_delimiter": "prefix loop-protocol/human-history:v1:sha256:" + "a" * 64,
+        "version_mismatch": _body(marker="<!-- loop-protocol/human-history:v2:sha256:" + "a" * 64 + " -->"),
+        "missing_digest": _body(marker="<!-- loop-protocol/human-history:v1:sha256: -->"),
+        "uppercase_digest": _body(marker="<!-- loop-protocol/human-history:v1:sha256:" + "A" * 64 + " -->"),
+        "extra_attribute": _body(marker=marker[:-3] + " extra -->"),
+        "leading_whitespace": _body(marker=" " + marker),
+        "trailing_whitespace": _body(marker=marker + " "),
+        "inline": "visible " + marker + "\n",
+        "nonfinal": _body(marker=marker) + "later\n",
+        "multiline": "visible\n<!-- loop-protocol/human-history:v1:sha256:" + "a" * 32 + "\n" + "a" * 32 + " -->\n",
+        "multiple": _body(marker=marker) + marker,
+    }
+    for name, body in malformed.items():
+        parsed, error = executor._parse_human_history_marker_source(body)
+        assert parsed is None, name
+        assert error, name
+
+    # All terminal newline forms retain the same byte-level visible content.
+    for body in (canonical, canonical[:-1], canonical + "\n\n", canonical.replace("\n", "\r\n")):
+        parsed, error = executor._parse_human_history_marker_source(body)
+        assert error == "" and parsed
+        assert parsed["content_digest"] == parsed_nfc["content_digest"]
+
+    args = SimpleNamespace(
+        issue_number=1908, repo="squne121/loop-protocol", command_id="issue_comment.publish", dry_run=False
+    )
+    for name, body in malformed.items():
+        failures: list[str] = []
+        with (
+            patch.object(executor, "_post_gh_comment") as post,
+            patch.object(executor, "_patch_gh_comment") as patch_comment,
+            patch.object(executor, "_human_history_readback") as readback,
+        ):
+            assert executor._run_human_history_comment_publish(
+                args,
+                {"comment_body": body, "marker": marker},
+                "/bin/gh",
+                lambda reason, **_kwargs: failures.append(reason) or 1,
+                lambda _value: 0,
+            ) == 1
+        expected_error = executor._parse_human_history_marker_source(body)[1]
+        assert failures == ["human_history_marker_diagnostic_failure:" + expected_error], name
+        post.assert_not_called()
+        patch_comment.assert_not_called()
+        readback.assert_not_called()

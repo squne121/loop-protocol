@@ -85,3 +85,26 @@ def test_stable_identity_excludes_rendered_content_and_time():
     assert "timestamp" not in publisher._HUMAN_HISTORY_FIELDS
     assert "random_run_id" not in publisher._HUMAN_HISTORY_FIELDS
     assert "rendered_body" not in publisher._HUMAN_HISTORY_FIELDS
+
+
+def test_jcs_fixed_vectors_preserve_nfc_nfd_codepoints_without_normalization():
+    # RFC 8785 sorts member names by Unicode code point.  These fixed vectors
+    # exercise the production JCS encoder directly: NFC and NFD are distinct
+    # input byte sequences and must not be normalized into one identity.
+    nfc = {"é": "é"}
+    nfd = {"é": "é"}
+    mixed = {"é": "é", "é": "é"}
+    vectors = (
+        (nfc, b'{"\xc3\xa9":"\xc3\xa9"}', "e8b55b29bf172acb65a8ec20d1762cd9d6112c7abd6799895503d9151b8f42ab"),
+        (nfd, b'{"e\xcc\x81":"e\xcc\x81"}', "b98131ef426c7a9368e586407f639060d85b2b4582d1fe96851950bf6de90ee2"),
+        (
+            mixed,
+            b'{"e\xcc\x81":"\xc3\xa9","\xc3\xa9":"e\xcc\x81"}',
+            "3d223b585f1598fd3a92e778748ea935f3a02f868cb3cf943aafc06f4b3c592a",
+        ),
+    )
+    for value, expected_bytes, expected_digest in vectors:
+        actual = publisher._human_history_jcs(value)
+        assert actual == expected_bytes
+        assert hashlib.sha256(actual).hexdigest() == expected_digest
+    assert publisher._human_history_jcs(nfc) != publisher._human_history_jcs(nfd)
