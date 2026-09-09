@@ -25,6 +25,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _MODULE_PATH = Path(__file__).resolve().parent.parent / "resolve_visual_impact.py"
 _MODULE_NAME = "resolve_visual_impact_issue_2230_artifact_attempt_binding"
 _spec = importlib.util.spec_from_file_location(_MODULE_NAME, _MODULE_PATH)
@@ -357,6 +359,153 @@ def _paged_transport(
         )
 
     return _transport
+
+
+def _pair_artifact(
+    *,
+    artifact_id: int,
+    name: str,
+    expired: bool = False,
+    digest: str | None = None,
+    workflow_run: dict | None = None,
+) -> dict:
+    return {
+        "id": artifact_id,
+        "name": name,
+        "expired": expired,
+        "digest": digest if digest is not None else "sha256:" + ("a" * 64),
+        "workflow_run": workflow_run if workflow_run is not None else {"id": RUN_ID, "head_sha": HEAD_SHA},
+    }
+
+
+def _pair_for_attempt(attempt: int, *, decision_id: int, evidence_id: int) -> list[dict]:
+    return [
+        _pair_artifact(artifact_id=decision_id, name=f"visual-impact-decision-v1-{attempt}"),
+        _pair_artifact(artifact_id=evidence_id, name=f"component-vrt-evidence-manifest-{attempt}"),
+    ]
+
+
+def _acquire_pair(artifacts: list[dict]):
+    return rvi.acquire_trusted_artifact_pair(
+        transport=_paged_transport([artifacts]),
+        repository=REPOSITORY,
+        run_id=RUN_ID,
+        expected_head_sha=HEAD_SHA,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2433 PR #2561: resolve the actual producer pair rather than the
+# triggering workflow's overall rerun attempt.
+# ---------------------------------------------------------------------------
+
+
+def test_pair_resolver_selects_normal_attempt_one():
+    result = _acquire_pair(_pair_for_attempt(1, decision_id=10, evidence_id=11))
+    assert result.ok is True
+    assert result.producer_attempt == 1
+    assert (result.decision_artifact_id, result.evidence_artifact_id) == (10, 11)
+
+
+def test_pair_resolver_uses_only_valid_attempt_one_after_overall_attempt_three_rerun():
+    """A failed unrelated job can advance the overall run attempt to 3 while
+    the successful producer artifacts remain suffix 1."""
+    result = _acquire_pair(_pair_for_attempt(1, decision_id=10, evidence_id=11))
+    assert result.ok is True
+    assert result.producer_attempt == 1
+
+
+def test_pair_resolver_selects_newest_complete_valid_pair():
+    result = _acquire_pair(
+        _pair_for_attempt(1, decision_id=10, evidence_id=11)
+        + _pair_for_attempt(3, decision_id=30, evidence_id=31)
+    )
+    assert result.ok is True
+    assert result.producer_attempt == 3
+    assert (result.decision_artifact_id, result.evidence_artifact_id) == (30, 31)
+
+
+@pytest.mark.parametrize(
+    ("artifacts", "reason"),
+    [
+        (
+            [_pair_artifact(artifact_id=10, name="visual-impact-decision-v1-1")],
+            "trusted_artifact_pair_evidence_cardinality_invalid:1",
+        ),
+        (
+            _pair_for_attempt(1, decision_id=10, evidence_id=11)
+            + [_pair_artifact(artifact_id=12, name="visual-impact-decision-v1-1")],
+            "trusted_artifact_pair_decision_cardinality_invalid:1",
+        ),
+        (
+            _pair_for_attempt(1, decision_id=10, evidence_id=11)
+            + [_pair_artifact(artifact_id=12, name="visual-impact-decision-v1-0")],
+            "trusted_artifact_pair_name_malformed",
+        ),
+        (
+            _pair_for_attempt(1, decision_id=10, evidence_id=11)
+            + [_pair_artifact(artifact_id=12, name="visual-impact-decision-v1-2")],
+            "trusted_artifact_pair_evidence_cardinality_invalid:2",
+        ),
+        (
+            _pair_for_attempt(1, decision_id=10, evidence_id=11)
+            + [
+                _pair_artifact(
+                    artifact_id=12,
+                    name="component-vrt-evidence-manifest-2",
+                    expired=True,
+                )
+            ],
+            "trusted_artifact_pair_decision_cardinality_invalid:2",
+        ),
+        ([_pair_artifact(artifact_id=10, name="unrelated")], "trusted_artifact_pair_missing"),
+    ],
+)
+def test_pair_resolver_rejects_incomplete_duplicate_malformed_newer_invalid_or_missing_pairs(artifacts, reason):
+    result = _acquire_pair(artifacts)
+    assert result.ok is False
+    assert reason in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    [
+        (
+            lambda artifact: artifact.update(
+                {"workflow_run": {"id": RUN_ID + 1, "head_sha": HEAD_SHA}}
+            ),
+            "trusted_artifact_pair_decision_workflow_run_id_mismatch:1",
+        ),
+        (
+            lambda artifact: artifact.update(
+                {"workflow_run": {"id": RUN_ID, "head_sha": "b" * 40}}
+            ),
+            "trusted_artifact_pair_decision_workflow_run_head_sha_mismatch:1",
+        ),
+        (
+            lambda artifact: artifact.update({"digest": "sha256:" + ("z" * 64)}),
+            "trusted_artifact_pair_decision_digest_invalid:1",
+        ),
+        (
+            lambda artifact: artifact.update({"expired": True}),
+            "trusted_artifact_pair_decision_expired:1",
+        ),
+    ],
+)
+def test_pair_resolver_rejects_tampered_service_metadata(mutate, reason):
+    artifacts = _pair_for_attempt(1, decision_id=10, evidence_id=11)
+    mutate(artifacts[0])
+    result = _acquire_pair(artifacts)
+    assert result.ok is False
+    assert reason in result.reason_codes
+
+
+def test_pair_resolver_rejects_tampered_duplicate_artifact_id():
+    artifacts = _pair_for_attempt(1, decision_id=10, evidence_id=11)
+    artifacts[1]["id"] = 10
+    result = _acquire_pair(artifacts)
+    assert result.ok is False
+    assert "trusted_artifact_pair_id_duplicate" in result.reason_codes
 
 
 # ---------------------------------------------------------------------------

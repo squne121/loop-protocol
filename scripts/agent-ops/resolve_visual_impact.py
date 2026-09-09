@@ -2302,6 +2302,195 @@ def acquire_trusted_artifact(
     return TrustedArtifactAcquisitionResult(ok=True, reason_codes=[], artifact_id=artifact["id"], artifacts=artifacts)
 
 
+# Issue #2433 PR #2561: a workflow run can be rerun after the visual-impact
+# producer already succeeded.  The triggering workflow's overall run_attempt
+# then advances without creating a new producer pair.  Resolve the producer
+# attempt from the only exact decision/evidence pair instead of assuming the
+# overall attempt is the producer attempt.
+_DECISION_ARTIFACT_PAIR_RE = re.compile(r"\Avisual-impact-decision-v1-([1-9][0-9]*)\Z")
+_EVIDENCE_ARTIFACT_PAIR_RE = re.compile(r"\Acomponent-vrt-evidence-manifest-([1-9][0-9]*)\Z")
+_SERVICE_ARTIFACT_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True)
+class TrustedArtifactPairAcquisitionResult:
+    """A unique, complete producer artifact pair selected by its own attempt."""
+
+    ok: bool
+    reason_codes: list[str]
+    producer_attempt: int | None = None
+    decision_artifact_id: int | None = None
+    evidence_artifact_id: int | None = None
+    decision_artifact_digest: str | None = None
+    evidence_artifact_digest: str | None = None
+    artifacts: list[dict[str, Any]] | None = None
+
+
+def _trusted_artifact_pair_kind_and_attempt(name: object) -> tuple[str, int] | None:
+    if not isinstance(name, str):
+        return None
+    decision_match = _DECISION_ARTIFACT_PAIR_RE.fullmatch(name)
+    if decision_match:
+        return "decision", int(decision_match.group(1))
+    evidence_match = _EVIDENCE_ARTIFACT_PAIR_RE.fullmatch(name)
+    if evidence_match:
+        return "evidence", int(evidence_match.group(1))
+    return None
+
+
+def acquire_trusted_artifact_pair(
+    *,
+    transport: Callable[[str], HttpTransportResponse],
+    repository: str,
+    run_id: int,
+    expected_head_sha: str,
+    page_size: int = 100,
+    max_pages: int = 1000,
+) -> TrustedArtifactPairAcquisitionResult:
+    """Acquire the newest complete exact producer pair for one run/head.
+
+    Unlike ``acquire_trusted_artifact()``, this intentionally lists the whole
+    triggering run so it can derive the producer's actual attempt.  Every
+    recognised pair member is validated before selection; an invalid newest
+    pair never falls back to an older pair.
+    """
+    if (
+        not isinstance(repository, str)
+        or not repository
+        or type(run_id) is not int
+        or run_id <= 0
+        or not isinstance(expected_head_sha, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", expected_head_sha)
+    ):
+        return TrustedArtifactPairAcquisitionResult(
+            ok=False, reason_codes=["trusted_artifact_pair_arguments_invalid"]
+        )
+
+    reasons: list[str] = []
+    artifacts: list[dict[str, Any]] = []
+    artifact_ids: set[int] = set()
+    total_count: int | None = None
+    page = 1
+    while True:
+        if page > max_pages:
+            return TrustedArtifactPairAcquisitionResult(
+                ok=False, reason_codes=["trusted_artifact_pair_max_pages_exceeded"], artifacts=artifacts
+            )
+        response = transport(
+            f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page={page_size}&page={page}"
+        )
+        if response.status_code != 200:
+            return TrustedArtifactPairAcquisitionResult(
+                ok=False, reason_codes=["trusted_artifact_pair_http_status_invalid"], artifacts=artifacts
+            )
+        body = response.json_body
+        if not isinstance(body, dict):
+            return TrustedArtifactPairAcquisitionResult(
+                ok=False, reason_codes=["trusted_artifact_pair_response_invalid"], artifacts=artifacts
+            )
+        page_total = body.get("total_count")
+        page_artifacts = body.get("artifacts")
+        if type(page_total) is not int or page_total < 0:
+            return TrustedArtifactPairAcquisitionResult(
+                ok=False, reason_codes=["trusted_artifact_pair_total_count_invalid"], artifacts=artifacts
+            )
+        if not isinstance(page_artifacts, list) or any(not isinstance(item, dict) for item in page_artifacts):
+            return TrustedArtifactPairAcquisitionResult(
+                ok=False, reason_codes=["trusted_artifact_pair_response_invalid"], artifacts=artifacts
+            )
+        if len(page_artifacts) > page_size:
+            return TrustedArtifactPairAcquisitionResult(
+                ok=False, reason_codes=["trusted_artifact_pair_page_oversized"], artifacts=artifacts
+            )
+        if total_count is None:
+            total_count = page_total
+        elif total_count != page_total:
+            return TrustedArtifactPairAcquisitionResult(
+                ok=False, reason_codes=["trusted_artifact_pair_total_count_changed"], artifacts=artifacts
+            )
+        for artifact in page_artifacts:
+            artifact_id = artifact.get("id")
+            if type(artifact_id) is not int or artifact_id <= 0:
+                return TrustedArtifactPairAcquisitionResult(
+                    ok=False, reason_codes=["trusted_artifact_pair_id_invalid"], artifacts=artifacts
+                )
+            if artifact_id in artifact_ids:
+                return TrustedArtifactPairAcquisitionResult(
+                    ok=False, reason_codes=["trusted_artifact_pair_id_duplicate"], artifacts=artifacts
+                )
+            artifact_ids.add(artifact_id)
+        artifacts.extend(page_artifacts)
+        if len(artifacts) > total_count:
+            return TrustedArtifactPairAcquisitionResult(
+                ok=False, reason_codes=["trusted_artifact_pair_pagination_exceeded_total"], artifacts=artifacts
+            )
+        if len(artifacts) == total_count:
+            break
+        if not page_artifacts:
+            return TrustedArtifactPairAcquisitionResult(
+                ok=False, reason_codes=["trusted_artifact_pair_pagination_incomplete"], artifacts=artifacts
+            )
+        page += 1
+
+    pairs: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    for artifact in artifacts:
+        name = artifact.get("name")
+        pair_key = _trusted_artifact_pair_kind_and_attempt(name)
+        if pair_key is None:
+            if isinstance(name, str) and (
+                name.startswith("visual-impact-decision-v1")
+                or name.startswith("component-vrt-evidence-manifest")
+            ):
+                reasons.append("trusted_artifact_pair_name_malformed")
+            continue
+        kind, attempt = pair_key
+        pairs.setdefault(attempt, {"decision": [], "evidence": []})[kind].append(artifact)
+
+    if reasons:
+        return TrustedArtifactPairAcquisitionResult(ok=False, reason_codes=reasons, artifacts=artifacts)
+    if not pairs:
+        return TrustedArtifactPairAcquisitionResult(
+            ok=False, reason_codes=["trusted_artifact_pair_missing"], artifacts=artifacts
+        )
+
+    producer_attempt = max(pairs)
+    selected = pairs[producer_attempt]
+    for kind in ("decision", "evidence"):
+        candidates = selected[kind]
+        if len(candidates) != 1:
+            reasons.append(f"trusted_artifact_pair_{kind}_cardinality_invalid:{producer_attempt}")
+            continue
+        artifact = candidates[0]
+        if artifact.get("expired") is not False:
+            reasons.append(f"trusted_artifact_pair_{kind}_expired:{producer_attempt}")
+        digest = artifact.get("digest")
+        if not isinstance(digest, str) or not _SERVICE_ARTIFACT_DIGEST_RE.fullmatch(digest):
+            reasons.append(f"trusted_artifact_pair_{kind}_digest_invalid:{producer_attempt}")
+        workflow_run = artifact.get("workflow_run")
+        if not isinstance(workflow_run, dict):
+            reasons.append(f"trusted_artifact_pair_{kind}_workflow_run_missing:{producer_attempt}")
+        else:
+            if workflow_run.get("id") != run_id:
+                reasons.append(f"trusted_artifact_pair_{kind}_workflow_run_id_mismatch:{producer_attempt}")
+            if workflow_run.get("head_sha") != expected_head_sha:
+                reasons.append(f"trusted_artifact_pair_{kind}_workflow_run_head_sha_mismatch:{producer_attempt}")
+    if reasons:
+        return TrustedArtifactPairAcquisitionResult(ok=False, reason_codes=reasons, artifacts=artifacts)
+
+    decision = selected["decision"][0]
+    evidence = selected["evidence"][0]
+    return TrustedArtifactPairAcquisitionResult(
+        ok=True,
+        reason_codes=[],
+        producer_attempt=producer_attempt,
+        decision_artifact_id=decision["id"],
+        evidence_artifact_id=evidence["id"],
+        decision_artifact_digest=decision["digest"],
+        evidence_artifact_digest=evidence["digest"],
+        artifacts=artifacts,
+    )
+
+
 def _gh_api_transport(path: str) -> HttpTransportResponse:
     """Production transport for `acquire_component_vrt_checkrun()`: shells
     out to the `gh` CLI (which reads `GH_TOKEN`/`GITHUB_TOKEN` from the
@@ -2365,6 +2554,47 @@ def _run_acquire_trusted_artifact(args: argparse.Namespace) -> int:
     print(json.dumps(output, indent=2))
     if args.artifact_id_output_file and result.ok:
         Path(args.artifact_id_output_file).write_text(str(result.artifact_id), encoding="utf-8")
+    return 0 if result.ok else 1
+
+
+def _run_acquire_trusted_artifact_pair(args: argparse.Namespace) -> int:
+    if not args.repository or not args.run_id or not args.expected_artifact_head_sha:
+        output = {
+            "schema": "TRUSTED_ARTIFACT_PAIR_ACQUISITION_RESULT_V1",
+            "ok": False,
+            "reason_codes": ["trusted_artifact_pair_arguments_invalid"],
+            "producer_attempt": None,
+            "decision_artifact_id": None,
+            "evidence_artifact_id": None,
+        }
+        print(json.dumps(output, indent=2))
+        return 1
+    result = acquire_trusted_artifact_pair(
+        transport=_gh_api_transport,
+        repository=args.repository,
+        run_id=args.run_id,
+        expected_head_sha=args.expected_artifact_head_sha,
+    )
+    output = {
+        "schema": "TRUSTED_ARTIFACT_PAIR_ACQUISITION_RESULT_V1",
+        "ok": result.ok,
+        "reason_codes": result.reason_codes,
+        "producer_attempt": result.producer_attempt,
+        "decision_artifact_id": result.decision_artifact_id,
+        "evidence_artifact_id": result.evidence_artifact_id,
+        "decision_artifact_digest": result.decision_artifact_digest,
+        "evidence_artifact_digest": result.evidence_artifact_digest,
+    }
+    print(json.dumps(output, indent=2))
+    if result.ok:
+        outputs = (
+            (args.producer_attempt_output_file, result.producer_attempt),
+            (args.decision_artifact_id_output_file, result.decision_artifact_id),
+            (args.evidence_artifact_id_output_file, result.evidence_artifact_id),
+        )
+        for output_file, value in outputs:
+            if output_file:
+                Path(output_file).write_text(str(value), encoding="utf-8")
     return 0 if result.ok else 1
 
 
@@ -3120,18 +3350,14 @@ def resolve_trusted_minimum(
     return affected_surface_ids, unmapped_visual_candidates
 
 
-# PR #2229 review fix_delta P1-2 (scope narrowing, not an implementation
-# gap in THIS function): `verify_trusted_artifact()` proves that the
-# component-vrt CheckRun/decision/pr_body/changed-paths/registry blobs it
-# cross-checks belong to the exact triggering run_attempt (via
-# `verify_component_vrt_checkrun_provenance()`). It does NOT additionally
-# bind the `visual-impact-decision-v1` / `component-vrt-evidence-manifest`
-# ARTIFACT bytes themselves to that same run_attempt -- the GitHub REST
-# artifact-list API has no `attempt_number` filter and artifact objects
-# carry no attempt-identity field, so the caller workflow's `[0]` pick of a
-# same-named artifact cannot be made attempt-exact without a `ci.yml`
-# change, which is outside this Issue's Allowed Paths. This is tracked as
-# a separate, explicit follow-up: Issue #2230.
+# Issue #2433 PR #2561: `verify_trusted_artifact()` continues to verify the
+# semantic decision/evidence content against the independently authenticated
+# component-vrt CheckRun provenance.  Transport selection is deliberately
+# separate: `acquire_trusted_artifact_pair()` derives one exact producer
+# attempt from the newest complete pair of attempt-suffixed artifacts before
+# this verifier is invoked.  The verifier receives that selected attempt via
+# its existing expected-workflow-run-attempt boundary; it never derives or
+# substitutes the triggering workflow's overall run_attempt itself.
 def verify_trusted_artifact(
     *,
     decision_raw: bytes | None,
@@ -4004,6 +4230,7 @@ def main(argv: list[str] | None = None) -> int:
             "resolve-trusted-registry-blob",
             "acquire-component-vrt-checkrun",
             "acquire-trusted-artifact",
+            "acquire-trusted-artifact-pair",
         ],
         default="resolve",
     )
@@ -4107,6 +4334,9 @@ def main(argv: list[str] | None = None) -> int:
     # Issue #2230: `--mode acquire-trusted-artifact` CLI surface.
     parser.add_argument("--expected-artifact-name", type=str, default=None)
     parser.add_argument("--artifact-id-output-file", type=str, default=None)
+    parser.add_argument("--producer-attempt-output-file", type=str, default=None)
+    parser.add_argument("--decision-artifact-id-output-file", type=str, default=None)
+    parser.add_argument("--evidence-artifact-id-output-file", type=str, default=None)
     # Issue #2230 fix_delta P2-1 (best-effort): optional nested
     # `workflow_run.id`/`workflow_run.head_sha` cross-check on the selected
     # artifact -- omitted entirely (skips the check) when not supplied.
@@ -4148,6 +4378,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mode == "acquire-trusted-artifact":
         return _run_acquire_trusted_artifact(args)
+
+    if args.mode == "acquire-trusted-artifact-pair":
+        return _run_acquire_trusted_artifact_pair(args)
 
     if args.mode == "resolve-trusted-registry-blob":
         return _run_resolve_trusted_registry_blob(args)

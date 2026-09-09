@@ -118,15 +118,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
-          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           REPO: ${{ github.repository }}
-          # Issue #2230 fix_delta P2-1 (best-effort): the triggering
-          # workflow_run's OWN head_sha -- this is what the acquired
-          # artifact's nested `workflow_run.head_sha` should equal (this is
-          # a same-run consistency check, distinct from the separate
-          # RUN_HEAD_SHA-vs-LIVE_HEAD_SHA staleness check the publish step
-          # below already performs).
-          EXPECTED_ARTIFACT_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          # Pair selection binds artifacts to the current PR head as well as
+          # the triggering run. A stale workflow_run is rejected here and is
+          # never reclassified as a valid producer pair for the live head.
+          EXPECTED_ARTIFACT_HEAD_SHA: ${{ steps.pr.outputs.live_head_sha }}
         run: |
           set -euo pipefail
           # PR #2229 review fix_delta P2: pin the REST API version/media
@@ -186,52 +182,41 @@ jobs:
             printf 'LIMIT=\n' >> "$2"
           }
 
-          # Issue #2230 AC3/AC4/AC5: replaces the former inline
-          # `gh api .../artifacts?per_page=100 | jq
-          # '[.artifacts[] | select(.name=="...")][0]'` pattern (no
-          # pagination-completion check, no cardinality check, no `expired`
-          # check -- silently adopted the FIRST same-named artifact
-          # regardless of which run attempt produced it) with
-          # `acquire_trusted_artifact()` -- an executable, adversarially
-          # tested Python function (scripts/agent-ops/tests/
-          # test_resolve_visual_impact_artifact_attempt_binding.py) that
-          # queries the `name=` filter, paginates fully via `per_page=100`,
-          # fails closed on `total_count` mismatch/incomplete pagination,
-          # and requires cardinality exactly one for the expected
-          # attempt-specific name.
-          DECISION_ARTIFACT_NAME="visual-impact-decision-v1-${RUN_ATTEMPT}"
-          EVIDENCE_ARTIFACT_NAME="component-vrt-evidence-manifest-${RUN_ATTEMPT}"
+          # Issue #2433 PR #2561: do not treat the triggering workflow's
+          # overall run_attempt as the producer attempt. A failed unrelated
+          # rerun can increment it while the only complete visual producer
+          # pair remains at an earlier suffix. Resolve one exact, fully
+          # validated pair and carry its selected attempt through CheckRun
+          # authentication and semantic verification below.
+          PRODUCER_ATTEMPT_FILE="${ARTIFACT_ROOT}/producer_attempt.txt"
+          DECISION_ARTIFACT_ID_FILE="${ARTIFACT_ROOT}/decision_artifact_id.txt"
+          EVIDENCE_ARTIFACT_ID_FILE="${ARTIFACT_ROOT}/evidence_artifact_id.txt"
           set +e
           uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
-            --mode acquire-trusted-artifact \
+            --mode acquire-trusted-artifact-pair \
             --repository "${REPO}" \
             --run-id "${RUN_ID}" \
-            --expected-artifact-name "${DECISION_ARTIFACT_NAME}" \
             --expected-artifact-head-sha "${EXPECTED_ARTIFACT_HEAD_SHA}" \
-            --artifact-id-output-file "${ARTIFACT_ROOT}/decision_artifact_id.txt"
-          DECISION_ACQUIRE_STATUS=$?
-          uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
-            --mode acquire-trusted-artifact \
-            --repository "${REPO}" \
-            --run-id "${RUN_ID}" \
-            --expected-artifact-name "${EVIDENCE_ARTIFACT_NAME}" \
-            --expected-artifact-head-sha "${EXPECTED_ARTIFACT_HEAD_SHA}" \
-            --artifact-id-output-file "${ARTIFACT_ROOT}/evidence_artifact_id.txt"
-          EVIDENCE_ACQUIRE_STATUS=$?
+            --producer-attempt-output-file "${PRODUCER_ATTEMPT_FILE}" \
+            --decision-artifact-id-output-file "${DECISION_ARTIFACT_ID_FILE}" \
+            --evidence-artifact-id-output-file "${EVIDENCE_ARTIFACT_ID_FILE}"
+          PAIR_ACQUIRE_STATUS=$?
           set -e
-          # Issue #2505 PR #2514 review fix_delta P1-1 point 1: capture each
-          # `zip_bounded_extract.py` (Issue #2524) invocation's own exit
-          # code immediately
-          # (same pattern as the existing `*_ACQUIRE_STATUS=$?` above) --
-          # left UNSET when the helper was never invoked at all (the
-          # `write_not_attempted_status` branches below), so the aggregation
-          # loop can distinguish "never attempted" from "attempted and
-          # crashed" (Issue #2230 already treats `not_attempted` as its own,
-          # non-rejecting outcome; unset intentionally preserves that).
-          DECISION_RETRIEVE_STATUS=""
-          EVIDENCE_RETRIEVE_STATUS=""
-          if [ "${DECISION_ACQUIRE_STATUS}" -eq 0 ] && [ -s "${ARTIFACT_ROOT}/decision_artifact_id.txt" ]; then
-            DECISION_ARTIFACT_ID="$(cat "${ARTIFACT_ROOT}/decision_artifact_id.txt")"
+          DECISION_ACQUIRE_STATUS=${PAIR_ACQUIRE_STATUS}
+          EVIDENCE_ACQUIRE_STATUS=${PAIR_ACQUIRE_STATUS}
+          SELECTED_PRODUCER_ATTEMPT=""
+          DECISION_ARTIFACT_NAME="unresolved"
+          EVIDENCE_ARTIFACT_NAME="unresolved"
+          if [ "${PAIR_ACQUIRE_STATUS}" -eq 0 ] \
+            && [ -s "${PRODUCER_ATTEMPT_FILE}" ] \
+            && [ -s "${DECISION_ARTIFACT_ID_FILE}" ] \
+            && [ -s "${EVIDENCE_ARTIFACT_ID_FILE}" ]; then
+            SELECTED_PRODUCER_ATTEMPT="$(<"${PRODUCER_ATTEMPT_FILE}")"
+            DECISION_ARTIFACT_NAME="visual-impact-decision-v1-${SELECTED_PRODUCER_ATTEMPT}"
+            EVIDENCE_ARTIFACT_NAME="component-vrt-evidence-manifest-${SELECTED_PRODUCER_ATTEMPT}"
+          fi
+          if [ "${DECISION_ACQUIRE_STATUS}" -eq 0 ] && [ -s "${DECISION_ARTIFACT_ID_FILE}" ]; then
+            DECISION_ARTIFACT_ID="$(<"${DECISION_ARTIFACT_ID_FILE}")"
             set +e
             uv run --locked python3 "${ZIP_BOUNDED_EXTRACT_PY}" \
               --label decision \
@@ -245,10 +230,10 @@ jobs:
             set -e
           else
             write_not_attempted_status "decision" "${DECISION_STATUS_FILE}"
-            echo "::warning::trusted decision artifact '${DECISION_ARTIFACT_NAME}' could not be acquired (fail-closed; exit=${DECISION_ACQUIRE_STATUS})"
+            echo "::warning::trusted decision artifact '${DECISION_ARTIFACT_NAME}' could not be acquired as part of an exact pair (fail-closed; exit=${DECISION_ACQUIRE_STATUS})"
           fi
-          if [ "${EVIDENCE_ACQUIRE_STATUS}" -eq 0 ] && [ -s "${ARTIFACT_ROOT}/evidence_artifact_id.txt" ]; then
-            EVIDENCE_ARTIFACT_ID="$(cat "${ARTIFACT_ROOT}/evidence_artifact_id.txt")"
+          if [ "${EVIDENCE_ACQUIRE_STATUS}" -eq 0 ] && [ -s "${EVIDENCE_ARTIFACT_ID_FILE}" ]; then
+            EVIDENCE_ARTIFACT_ID="$(<"${EVIDENCE_ARTIFACT_ID_FILE}")"
             set +e
             uv run --locked python3 "${ZIP_BOUNDED_EXTRACT_PY}" \
               --label evidence \
@@ -263,7 +248,7 @@ jobs:
             set -e
           else
             write_not_attempted_status "evidence" "${EVIDENCE_STATUS_FILE}"
-            echo "::warning::trusted evidence-manifest artifact '${EVIDENCE_ARTIFACT_NAME}' could not be acquired (fail-closed; exit=${EVIDENCE_ACQUIRE_STATUS})"
+            echo "::warning::trusted evidence-manifest artifact '${EVIDENCE_ARTIFACT_NAME}' could not be acquired as part of an exact pair (fail-closed; exit=${EVIDENCE_ACQUIRE_STATUS})"
           fi
 
           # Issue #2505 AC7/AC8/AC9: aggregate the two per-artifact status
@@ -324,9 +309,21 @@ jobs:
               DOWNLOAD_FAILURE_DETAIL="artifact=${RETRIEVE_LABEL} exit=${RETRIEVE_EXIT}"
             fi
           done
+          # Pair resolution itself is a trust boundary. A failed resolver or
+          # incomplete output must not fall through as a nominally successful
+          # download and let a later step guess an overall run attempt.
+          if [ "${PAIR_ACQUIRE_STATUS}" -ne 0 ] \
+            || [ -z "${SELECTED_PRODUCER_ATTEMPT}" ] \
+            || [ ! -s "${DECISION_ARTIFACT_ID_FILE}" ] \
+            || [ ! -s "${EVIDENCE_ARTIFACT_ID_FILE}" ]; then
+            DOWNLOAD_STATUS="rejected"
+            DOWNLOAD_FAILURE_REASON="producer_artifact_pair_rejected"
+            DOWNLOAD_FAILURE_DETAIL="pair_resolver_exit=${PAIR_ACQUIRE_STATUS}"
+          fi
 
           {
             echo "artifact_root=${ARTIFACT_ROOT}"
+            echo "producer_attempt=${SELECTED_PRODUCER_ATTEMPT}"
             echo "download_status=${DOWNLOAD_STATUS}"
             echo "download_failure_reason=${DOWNLOAD_FAILURE_REASON}"
             echo "download_failure_detail=${DOWNLOAD_FAILURE_DETAIL}"
@@ -359,7 +356,7 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           LIVE_HEAD_SHA: ${{ steps.pr.outputs.live_head_sha }}
           RUN_ID: ${{ github.event.workflow_run.id }}
-          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          PRODUCER_ATTEMPT: ${{ steps.download.outputs.producer_attempt }}
         run: |
           set -euo pipefail
           # PR #2229 review fix_delta P2: pin the REST API version/media
@@ -377,7 +374,7 @@ jobs:
           # makes an earlier run attempt or an unvisited page ineligible as
           # evidence, same as before.
           EXPECTED_RUN_ID="${RUN_ID:?missing workflow run id}"
-          EXPECTED_RUN_ATTEMPT="${RUN_ATTEMPT:?missing workflow run attempt}"
+          EXPECTED_RUN_ATTEMPT="${PRODUCER_ATTEMPT:?missing selected producer attempt}"
           uv run --locked python3 scripts/agent-ops/resolve_visual_impact.py \
             --mode acquire-component-vrt-checkrun \
             --repository "${REPO}" \
@@ -440,7 +437,7 @@ jobs:
           EXPECTED_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           ARTIFACT_ROOT: ${{ steps.download.outputs.artifact_root }}
           EXPECTED_WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
-          EXPECTED_WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          EXPECTED_WORKFLOW_RUN_ATTEMPT: ${{ steps.download.outputs.producer_attempt }}
         run: |
           set -euo pipefail
           DECISION_FILE="${ARTIFACT_ROOT}/decision/visual_impact_decision_v1.json"

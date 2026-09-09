@@ -243,6 +243,19 @@ def test_narrow_policy_scope_mentions_only_trusted_repo_and_agy_route():
     assert "対象外" in env_label
 
 
+def test_narrow_policy_scope_names_only_the_controlled_issue_edit_transaction_identity():
+    """The autoMode allow SSOT describes the exact canonical transaction."""
+    result = _run_sh_function("claude_gpt_auto_mode_standalone_json")
+    assert result.returncode == 0, result.stderr
+    allow_label = json.loads(result.stdout)["autoMode"]["allow"][1]
+    assert (
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+        "--input-file <repo-relative-safe-operand>"
+    ) in allow_label
+    assert "token/argv identity" in allow_label
+    assert "generic uv/Python/raw gh" in allow_label
+
+
 def test_narrow_policy_scope_documents_second_gate_not_authority():
     """GIVEN narrow label
     WHEN authority に関する記述を確認する
@@ -781,7 +794,8 @@ def test_issue_editor_permission_canary_requires_structured_parent_and_child_eve
     assert not canary._stream_json_has_tool_use(stdout, "Agent", subagent_type="issue-creator")
 
 
-def test_issue_editor_permission_canary_binds_helper_evidence_to_canonical_bash_result():
+def test_issue_editor_permission_canary_binds_child_lineage_hook_allow_and_helper_result(monkeypatch, tmp_path):
+    parent_tool_use_id = "toolu_parent_issue_editor"
     tool_use_id = "toolu_canonical_bash"
     helper_result = {
         "schema": "ISSUE_EDIT_TXN_RESULT_V1",
@@ -793,6 +807,128 @@ def test_issue_editor_permission_canary_binds_helper_evidence_to_canonical_bash_
             json.dumps(
                 {
                     "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": parent_tool_use_id,
+                                "name": "Agent",
+                                "input": {"subagent_type": "issue-editor"},
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "parent_tool_use_id": parent_tool_use_id,
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": "Bash",
+                                "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND},
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "hook_response",
+                    "hook_event": "PermissionRequest",
+                    "output": json.dumps(
+                        {
+                            "hookSpecificOutput": {
+                                "hookEventName": "PermissionRequest",
+                                "decision": {"behavior": "allow"},
+                            }
+                        }
+                    ),
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": json.dumps(helper_result),
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps({"type": "result", "result": canary.ISSUE_EDITOR_PERMISSION_CANARY_MARKER}),
+        )
+    )
+
+    assert canary._stream_json_issue_editor_permission_evidence(stdout) == {
+        "parent_issue_editor_delegation_observed": True,
+        "child_lineage_bound": True,
+        "canonical_bash_observed": True,
+        "canonical_bash_result_bound": True,
+        "permission_allow_observed": True,
+        "helper_entrypoint_observed": True,
+        "marker_observed": True,
+    }
+
+    worktree = tmp_path / "linked-worktree"
+    (worktree / ".git").mkdir(parents=True)
+    monkeypatch.setenv(canary.ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV, "1")
+    monkeypatch.setattr(
+        canary.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout, ""),
+    )
+
+    rc, detail = canary.run_issue_editor_permission_request_canary(worktree)
+    assert rc == canary.EXIT_OK
+    assert detail["permission_allow_observed"] is True
+
+
+def test_issue_editor_permission_canary_does_not_infer_permission_decision_from_absence(monkeypatch, tmp_path):
+    parent_tool_use_id = "toolu_parent_issue_editor"
+    tool_use_id = "toolu_canonical_bash"
+    helper_result = {
+        "schema": "ISSUE_EDIT_TXN_RESULT_V1",
+        "status": "failed_no_mutation",
+        "mutation_started": False,
+    }
+    stdout = "\n".join(
+        (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": parent_tool_use_id,
+                                "name": "Agent",
+                                "input": {"subagent_type": "issue-editor"},
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "hook_response",
+                    "hook_event": "UserPromptSubmit",
+                    "output": "",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "parent_tool_use_id": parent_tool_use_id,
                     "message": {
                         "content": [
                             {
@@ -823,21 +959,174 @@ def test_issue_editor_permission_canary_binds_helper_evidence_to_canonical_bash_
         )
     )
 
-    assert canary._stream_json_issue_editor_permission_evidence(stdout) == {
-        "canonical_bash_observed": True,
-        "canonical_bash_result_bound": True,
-        "helper_entrypoint_observed": True,
-        "marker_observed": True,
+    evidence = canary._stream_json_issue_editor_permission_evidence(stdout)
+    assert evidence["parent_issue_editor_delegation_observed"] is True
+    assert evidence["child_lineage_bound"] is True
+    assert evidence["canonical_bash_observed"] is True
+    assert evidence["canonical_bash_result_bound"] is True
+    assert evidence["permission_allow_observed"] is False
+    assert evidence["helper_entrypoint_observed"] is True
+    assert evidence["marker_observed"] is True
+
+    worktree = tmp_path / "linked-worktree"
+    (worktree / ".git").mkdir(parents=True)
+    monkeypatch.setenv(canary.ISSUE_EDITOR_PERMISSION_CANARY_OPT_IN_ENV, "1")
+    monkeypatch.setattr(
+        canary.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout, ""),
+    )
+
+    rc, detail = canary.run_issue_editor_permission_request_canary(worktree)
+    assert rc == canary.EXIT_OK
+    assert detail["permission_allow_observed"] is False
+
+
+def test_issue_editor_permission_canary_rejects_out_of_order_lineage_and_helper_result():
+    """Causal witness must be parent Agent -> child Bash -> helper result."""
+    parent_tool_use_id = "toolu_parent_issue_editor"
+    tool_use_id = "toolu_canonical_bash"
+    helper_result = {
+        "schema": "ISSUE_EDIT_TXN_RESULT_V1",
+        "status": "failed_no_mutation",
+        "mutation_started": False,
     }
+    parent = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": parent_tool_use_id,
+                        "name": "Agent",
+                        "input": {"subagent_type": "issue-editor"},
+                    }
+                ]
+            },
+        }
+    )
+    child = json.dumps(
+        {
+            "type": "assistant",
+            "parent_tool_use_id": parent_tool_use_id,
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "Bash",
+                        "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND},
+                    }
+                ]
+            },
+        }
+    )
+    helper = json.dumps(
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": json.dumps(helper_result),
+                    }
+                ]
+            },
+        }
+    )
+    marker = json.dumps({"type": "result", "result": canary.ISSUE_EDITOR_PERMISSION_CANARY_MARKER})
+
+    helper_before_bash = canary._stream_json_issue_editor_permission_evidence(
+        "\n".join((parent, helper, child, marker))
+    )
+    assert helper_before_bash["child_lineage_bound"] is True
+    assert helper_before_bash["canonical_bash_result_bound"] is False
+    assert helper_before_bash["helper_entrypoint_observed"] is False
+    assert helper_before_bash["marker_observed"] is False
+
+    parent_after_child = canary._stream_json_issue_editor_permission_evidence(
+        "\n".join((child, parent, helper, marker))
+    )
+    assert parent_after_child["child_lineage_bound"] is False
+    assert parent_after_child["canonical_bash_result_bound"] is True
+    assert parent_after_child["helper_entrypoint_observed"] is True
+    assert parent_after_child["marker_observed"] is True
+
+
+def test_issue_editor_permission_canary_rejects_direct_parent_bash_even_with_hook_allow():
+    parent_tool_use_id = "toolu_parent_issue_editor"
+    tool_use_id = "toolu_direct_parent_bash"
+    helper_result = {
+        "schema": "ISSUE_EDIT_TXN_RESULT_V1",
+        "status": "failed_no_mutation",
+        "mutation_started": False,
+    }
+    stdout = "\n".join(
+        (
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": parent_tool_use_id,
+                                "name": "Agent",
+                                "input": {"subagent_type": "issue-editor"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": "Bash",
+                                "input": {"command": canary.ISSUE_EDITOR_PERMISSION_CANARY_COMMAND},
+                            },
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "system",
+                    "subtype": "hook_response",
+                    "hook_event": "PermissionRequest",
+                    "output": json.dumps(
+                        {
+                            "hookSpecificOutput": {
+                                "hookEventName": "PermissionRequest",
+                                "decision": {"behavior": "allow"},
+                            }
+                        }
+                    ),
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": json.dumps(helper_result),
+                            }
+                        ]
+                    },
+                }
+            ),
+            json.dumps({"type": "result", "result": canary.ISSUE_EDITOR_PERMISSION_CANARY_MARKER}),
+        )
+    )
+
+    evidence = canary._stream_json_issue_editor_permission_evidence(stdout)
+    assert evidence["parent_issue_editor_delegation_observed"] is True
+    assert evidence["child_lineage_bound"] is False
+    assert evidence["permission_allow_observed"] is False
 
 
 def test_issue_editor_permission_canary_rejects_false_denial_and_unrelated_stdout():
-    """A canonical Bash request plus prompt-like stdout is not evidence.
-
-    In particular, only a structured tool_result tied to that Bash ID may
-    establish ``failed_no_mutation``; a denial string and marker copied into
-    unrelated raw output must not make the real Auto route pass.
-    """
+    """Unbound result text and an unrelated marker never establish entrypoint reachability."""
     tool_use_id = "toolu_canonical_bash"
     stdout = "\n".join(
         (
@@ -875,8 +1164,11 @@ def test_issue_editor_permission_canary_rejects_false_denial_and_unrelated_stdou
     )
 
     assert canary._stream_json_issue_editor_permission_evidence(stdout) == {
+        "parent_issue_editor_delegation_observed": False,
+        "child_lineage_bound": False,
         "canonical_bash_observed": True,
         "canonical_bash_result_bound": False,
+        "permission_allow_observed": False,
         "helper_entrypoint_observed": False,
         "marker_observed": False,
     }
