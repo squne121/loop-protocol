@@ -4,9 +4,23 @@
 Not a pytest test module itself (leading underscore keeps pytest from
 collecting it). Connects to the given DB file and runs the migration
 runner, retrying a bounded number of times on TEMPORARILY_UNAVAILABLE (the
-correct caller-level behavior -- see docs/dev/task-context.md ## Busy/Retry
-Budget). Prints the resulting JSON {"user_version": <int>} to stdout on
-success, or {"error": "<code>"} and a non-zero exit code on failure.
+correct caller-level behavior -- see docs/dev/task-context.md
+## Busy/Retry Budget and its
+### `journal_mode=WAL` mode-transition contention subsection). Prints the
+resulting JSON {"user_version": <int>} to stdout on success, or
+{"error": "<code>"} and a non-zero exit code on failure.
+
+Both `db.connect()` and `migration_runner.migrate()` can raise
+`TemporarilyUnavailableError` -- `connect()` itself can hit the fresh-DB
+`PRAGMA journal_mode=WAL` mode-transition contention documented in
+task-context.md when many OS processes race to open the same brand-new DB
+file for the first time (this is exactly what this test exercises with 8
+concurrent processes). Per the fix_delta finding 5 contract, the
+connection-level `busy_timeout` is the single owner of the *SQLite-internal*
+waiting budget for any one `connect()`/pragma/statement attempt; this
+caller-level loop is the explicit, visible, bounded retry that sits above
+that single budget -- so both call sites must be retried here, not just
+`migrate()`.
 """
 
 from __future__ import annotations
@@ -35,7 +49,12 @@ def main() -> int:
     db_file = pathlib.Path(sys.argv[1])
     last_error = None
     for _ in range(MAX_RETRIES):
-        conn = db.connect(db_file)
+        try:
+            conn = db.connect(db_file)
+        except errors.TemporarilyUnavailableError as exc:
+            last_error = exc
+            time.sleep(RETRY_SLEEP_SECONDS)
+            continue
         try:
             version = migration_runner.migrate(conn)
             print(json.dumps({"user_version": version}))

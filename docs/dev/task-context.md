@@ -230,7 +230,7 @@ live ref-claim を取得し、競合した場合 loser は
 `task_context_service.claim_task_ref` の `{"status": "conflict",
 "winning_task_id": ...}` 経由で winning Task を readback する。
 
-## Logical FK / Relational Integrity（fix_delta finding 7）
+## Logical FK / 論理的な関連整合性（fix_delta finding 7 対応）
 
 AC1 の unique/partial-unique 制約に加え、以下の relational integrity も
 DB 物理制約（application validation だけでなく）で保証する:
@@ -369,6 +369,29 @@ genuine な corruption（`OperationalError` ではない
 `sqlite3.DatabaseError`、例えば "file is not a database"）は transient
 contention と混同されず即座に `CorruptDatabaseError` として raise される
 （AC9）。
+
+**単一 budget として吸収される、とは「必ず budget 内に収まる」ことを意味
+しない。** `busy_timeout`（default 200ms）はあくまで有限の budget であり、
+fresh DB への同時初回接続の並列度が十分高い場合（AC11 test の 8 process
+のように）、その budget 自体が枯渇して `connect()` が
+`TemporarilyUnavailableError` を raise することは正常な有り得る結果である
+（budget 枯渇後に無限 wait / hang するのではなく、bounded な時間で必ず
+typed error に落ちる、という保証の話であって、connect() が常に成功する
+という保証ではない）。したがって `connect()` を呼ぶ **caller** 側は、
+`migrate()` と同様に `connect()` 自体の `TemporarilyUnavailableError` も
+明示的かつ bounded に retry する責任を持つ。AC11 の
+`tests/task-context/_migration_worker.py` は、以前は `migrate()` 呼び出し
+のみを caller-level retry でラップしており `connect()` 呼び出しはラップ
+していなかった（fix_delta finding 5 で `_execute_with_lock_retry` の
+connect 内部での隠れ retry を削除した副作用として、高並列時に
+`connect()` の `TemporarilyUnavailableError` が worker の外へ直接
+伝播してしまう regression があった）。現在は `connect()` と `migrate()`
+の両方の呼び出しをそれぞれ独立に caller-level retry loop でラップして
+いる — これは新しい隠れた `busy_timeout * N` amplification では **ない**
+（各呼び出しは相変わらず単一の 200ms budget しか持たない。ここで bounded
+になっている追加の待機は、caller が明示的に選んだ `RETRY_SLEEP_SECONDS`
+間隔での再試行であり、connection-level budget の内側に隠れて積み上がる
+ものではない）。
 
 ## Migration Ordering and Concurrency（AC2, AC9, AC11） — マイグレーションの順序と並行実行
 
@@ -587,7 +610,7 @@ bug ではない）時に最新の transaction を失う可能性のみだと述
 必要な将来の specific write path のために明示的な override として利用
 可能（`task_context_db.connect(..., synchronous="FULL")`）のままとする。
 
-### DB boundary での corruption typed translation（fix_delta finding 6）
+### DB 境界における corruption の型付き変換（fix_delta finding 6 対応）
 
 corruption が typed `CorruptDatabaseError`（silent reset ではなく）として
 必ず検出されるのは `connect()`/`migrate()` が走るタイミング（`task-contextctl`
