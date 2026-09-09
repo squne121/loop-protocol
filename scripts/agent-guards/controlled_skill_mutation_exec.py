@@ -2448,9 +2448,15 @@ def _run_human_history_comment_publish(args, input_data, gh_bin, _fail, _ok) -> 
         if parse_err:
             return _fail(f"human_history_marker_diagnostic_failure:{parse_err}", status="failed")
         assert parsed is not None
+        # All valid human-history markers on this target are controlled-lane
+        # state, not merely candidates for this invocation's identity. A
+        # foreign or unowned marker therefore makes the target diagnostically
+        # unsafe before any create, noop, or PATCH decision. In particular,
+        # do not ignore a different-identity foreign marker and create beside
+        # it: that would turn a discovery failure into a remote mutation.
+        if (comment.get("author") or {}).get("login") != authenticated_login:
+            return _fail("human_history_remote_marker_author_mismatch", status="failed")
         if parsed["marker"] == marker:
-            if (comment.get("author") or {}).get("login") != authenticated_login:
-                return _fail("human_history_remote_marker_author_mismatch", status="failed")
             matching.append((comment, parsed))
     if len(matching) > 1:
         return _fail("human_history_duplicate_owned_marker", status="failed")

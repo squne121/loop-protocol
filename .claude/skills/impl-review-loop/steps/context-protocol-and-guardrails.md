@@ -4,7 +4,7 @@
 
 **各 Step 完了直後** に LOOP_STATE YAML を会話履歴へ明示記録する。次イテレーション開始時に最新値を読み戻す。
 
-## Human-history v1（Issue #1908）
+## Human-history v1（人間向け作業履歴、Issue #1908）
 
 既存の machine-readable comment（target / marker / payload / consumer）は変更しない。
 new human-history だけを既存 `issue_comment.publish` controlled lane 経由で投稿する。

@@ -109,3 +109,40 @@ def test_marker_ownership_uniqueness_create_noop_patch_and_readback_reconciliati
             args, data, "/bin/gh", lambda *a, **k: 1, lambda _: 0
         ) == 1
         post.assert_not_called()
+
+
+def test_foreign_different_identity_marker_blocks_create_before_any_mutation():
+    marker = _marker("owned identity")
+    foreign_marker = _marker("foreign identity")
+    args = SimpleNamespace(
+        issue_number=1908,
+        repo="squne121/loop-protocol",
+        command_id="issue_comment.publish",
+        dry_run=False,
+    )
+    foreign_different_identity = {
+        "body": _body("別の有効な履歴", marker=foreign_marker),
+        "url": "https://github.com/x/y/issues/1#issuecomment-43",
+        "id": "foreign",
+        "author": {"login": "other"},
+    }
+    failures: list[str] = []
+    with (
+        patch.object(executor, "_capture_pre_mutation_snapshot", return_value=(object(), None)),
+        patch.object(executor, "_fetch_authenticated_login", return_value=("writer", "")),
+        patch.object(executor, "_list_issue_comments", return_value=([foreign_different_identity], "")),
+        patch.object(executor, "_post_gh_comment") as post,
+        patch.object(executor, "_patch_gh_comment") as patch_comment,
+        patch.object(executor, "_human_history_readback") as readback,
+    ):
+        assert executor._run_human_history_comment_publish(
+            args,
+            {"comment_body": _body(marker=marker), "marker": marker},
+            "/bin/gh",
+            lambda reason, **_kwargs: failures.append(reason) or 1,
+            lambda _value: 0,
+        ) == 1
+    assert failures == ["human_history_remote_marker_author_mismatch"]
+    post.assert_not_called()
+    patch_comment.assert_not_called()
+    readback.assert_not_called()
