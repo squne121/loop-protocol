@@ -106,7 +106,7 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     ("Check Japanese Content", "Issue Body Japanese Check (retrospective)"): "excluded",
 }
 
-# Issue #2433 PR #2561: unlike ordinary unconditional exclusions, these jobs
+# Issue #2433 PR #2561: unlike ordinary unconditional exclusions, these tuples
 # are excluded only for intentionally skipped ordinary-PR CheckRuns. The run
 # binding is represented by the adapter's github_check_run_api provenance:
 # check_runs_api_to_raw_checks() accepts that provenance only after binding the
@@ -114,6 +114,7 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
 CONDITIONAL_EXCLUDED_TUPLES: frozenset[tuple[str, str]] = frozenset({
     ("ci", "reliability-assessment"),
     ("ci", "close-evidence-publication"),
+    ("ci", "ci-runtime-baseline-gate-ready"),
 })
 EXACT_CHECK_RUN_PROVENANCE = "github_check_run_api"
 

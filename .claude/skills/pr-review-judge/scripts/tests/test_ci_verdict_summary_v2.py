@@ -465,11 +465,15 @@ class TestTrustedConsumerExcludedClassification:
 # ---------------------------------------------------------------------------
 
 
-CONDITIONAL_EXCLUDED_NAMES = ("reliability-assessment", "close-evidence-publication")
+CONDITIONAL_EXCLUDED_NAMES = (
+    "reliability-assessment",
+    "close-evidence-publication",
+    "ci-runtime-baseline-gate-ready",
+)
 
 
 class TestOrdinaryPrDispatchOnlyExcludedClassification:
-    """Both dispatch-only jobs require identical fully bound ordinary-PR skips."""
+    """All dispatch-only jobs require identical fully bound ordinary-PR skips."""
 
     def _ordinary_pr_skip(self, name: str = "close-evidence-publication", **overrides) -> dict:
         check = make_check(
