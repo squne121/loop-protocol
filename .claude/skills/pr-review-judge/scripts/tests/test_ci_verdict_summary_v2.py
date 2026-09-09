@@ -53,8 +53,9 @@ def make_check(
     status: str | None = "completed",
     conclusion: str | None = "success",
     head_sha: str | None = EXPECTED_SHA,
+    provenance: str | None = None,
 ) -> dict:
-    return {
+    check = {
         "id": 10_000 + len(name),
         "name": name,
         "workflow": workflow,
@@ -62,16 +63,25 @@ def make_check(
         "conclusion": conclusion,
         "headSha": head_sha,
     }
+    if provenance is not None:
+        check["provenance"] = provenance
+    return check
 
 
-def build(v2, checks: list[dict], expected_sha: str = EXPECTED_SHA, pr_head_sha: str | None = EXPECTED_SHA) -> dict:
+def build(
+    v2,
+    checks: list[dict],
+    expected_sha: str = EXPECTED_SHA,
+    pr_head_sha: str | None = EXPECTED_SHA,
+    event_name: str = "pull_request",
+) -> dict:
     return v2.generate_verdict(
         expected_head_sha=expected_sha,
         pr_head_sha=pr_head_sha,
         repository="owner/repo",
         workflow_run_id=1,
         workflow_run_attempt=1,
-        event_name="pull_request",
+        event_name=event_name,
         raw_checks=checks,
     )
 
@@ -448,6 +458,117 @@ class TestTrustedConsumerExcludedClassification:
         )
         artifact = build(v2, checks)
         assert artifact["overall_status"] == "blocked", artifact
+
+
+# ---------------------------------------------------------------------------
+# Issue #2433 PR #2561: ordinary pull_request-only intentional skip
+# ---------------------------------------------------------------------------
+
+
+CONDITIONAL_EXCLUDED_NAMES = (
+    "reliability-assessment",
+    "close-evidence-publication",
+    "ci-runtime-baseline-gate-ready",
+)
+
+
+class TestOrdinaryPrDispatchOnlyExcludedClassification:
+    """All dispatch-only jobs require identical fully bound ordinary-PR skips."""
+
+    def _ordinary_pr_skip(self, name: str = "close-evidence-publication", **overrides) -> dict:
+        check = make_check(
+            name,
+            workflow="ci",
+            status="completed",
+            conclusion="skipped",
+            head_sha=EXPECTED_SHA,
+            provenance="github_check_run_api",
+        )
+        check.update(overrides)
+        return check
+
+    @pytest.mark.parametrize("name", CONDITIONAL_EXCLUDED_NAMES)
+    def test_exact_ordinary_pr_skip_is_excluded_without_relaxing_other_checks(self, v2, name):
+        raw_checks = v2.check_runs_api_to_raw_checks(
+            {
+                "check_runs": [
+                    {
+                        "id": 24_333,
+                        "name": name,
+                        "status": "completed",
+                        "conclusion": "skipped",
+                        "head_sha": EXPECTED_SHA,
+                        "details_url": "https://github.com/owner/repo/actions/runs/1/job/1",
+                        "app": {"slug": "github-actions"},
+                    }
+                ]
+            },
+            workflow_run_id=1,
+        )
+        checks = _all_other_required_checks_passing()
+        checks.extend(raw_checks)
+        artifact = build(v2, checks)
+        entry = next(check for check in artifact["checks"] if check["name"] == name)
+        assert entry["classification"] == "excluded"
+        assert entry["blocking_merge_ready"] is False
+        assert artifact["overall_status"] == "merge_ready", artifact
+
+    @pytest.mark.parametrize("name", CONDITIONAL_EXCLUDED_NAMES)
+    @pytest.mark.parametrize(
+        ("label", "overrides", "event_name"),
+        [
+            ("failed", {"conclusion": "failure"}, "pull_request"),
+            ("cancelled", {"conclusion": "cancelled"}, "pull_request"),
+            ("pending", {"status": "queued", "conclusion": None}, "pull_request"),
+            ("stale", {"headSha": OTHER_SHA}, "pull_request"),
+            ("incomplete_provenance", {"provenance": "needs_result_synthetic"}, "pull_request"),
+            ("wrong_event", {}, "workflow_dispatch"),
+        ],
+    )
+    def test_non_exact_conditional_tuple_is_fail_closed(
+        self, v2, name, label, overrides, event_name
+    ):
+        artifact = build(v2, [self._ordinary_pr_skip(name, **overrides)], event_name=event_name)
+        entry = artifact["checks"][0]
+        assert entry["classification"] == "unknown", label
+        assert entry["blocking_merge_ready"] is True, label
+        assert entry["failure_reason"] == "gh_error", label
+        assert artifact["overall_status"] == "gh_error", label
+
+    @pytest.mark.parametrize("name", CONDITIONAL_EXCLUDED_NAMES)
+    def test_missing_check_run_id_is_incomplete_and_fail_closed(self, v2, name):
+        check = self._ordinary_pr_skip(name)
+        del check["id"]
+        artifact = build(v2, [check])
+        entry = artifact["checks"][0]
+        assert entry["classification"] == "unknown"
+        assert entry["blocking_merge_ready"] is True
+        assert entry["failure_reason"] == "gh_error"
+
+    def test_wrong_tuple_remains_unknown_and_fail_closed(self, v2):
+        check = self._ordinary_pr_skip(workflow="wrong-workflow")
+        artifact = build(v2, [check])
+        entry = artifact["checks"][0]
+        assert entry["classification"] == "unknown"
+        assert entry["blocking_merge_ready"] is True
+        assert entry["failure_reason"] == "gh_error"
+
+    @pytest.mark.parametrize("name", ["typecheck", "e2e"])
+    def test_required_and_evidence_skips_remain_fail_closed(self, v2, name):
+        artifact = build(v2, [make_check(name, conclusion="skipped")])
+        entry = artifact["checks"][0]
+        assert entry["classification"] in {"required", "evidence"}
+        assert entry["blocking_merge_ready"] is True
+        assert entry["failure_reason"] == "skipped_required"
+
+    def test_unknown_skipped_ci_job_remains_fail_closed(self, v2):
+        checks = _all_other_required_checks_passing()
+        checks.append(make_check("unrelated-dispatch-only-job", workflow="ci", conclusion="skipped"))
+        artifact = build(v2, checks)
+        entry = next(check for check in artifact["checks"] if check["name"] == "unrelated-dispatch-only-job")
+        assert entry["classification"] == "unknown"
+        assert entry["failure_reason"] == "gh_error"
+        assert artifact["overall_status"] == "gh_error", artifact
 
 
 # ---------------------------------------------------------------------------
