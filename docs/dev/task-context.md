@@ -1,4 +1,5 @@
 ---
+summary_ja: "本ドキュメントは Task Context v1 の SQLite registry / schema / migration / typed API 契約の正本である。"
 feature: task-context-v1-core
 status: implemented (core registry / schema / typed API only)
 related_issue: "#2563"
@@ -53,7 +54,7 @@ scripts.task_context...` は valid ではない）。本サブシステムの各
 された failure mode：`sys.path` bootstrap を行う別 skill のテストスイート間
 で `schema` や `db` のような汎用的な bare name が衝突する）。
 
-## Repository Instance Identity（`repo_instance_key`）
+## Repository Instance Identity（`repo_instance_key`） — リポジトリインスタンス識別子の定義
 
 ```python
 repo_instance_key = sha256(realpath(git rev-parse --path-format=absolute --git-common-dir)).hexdigest()
@@ -87,7 +88,7 @@ repo_instance_key = sha256(realpath(git rev-parse --path-format=absolute --git-c
 ### `XDG_STATE_HOME` 未設定時の default
 
 [freedesktop.org XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
-より:
+より、`XDG_STATE_HOME` 未設定時の挙動を定義した一節を引用する:
 
 > `$XDG_STATE_HOME` defines the base directory relative to which
 > user-specific state files should be stored. If `$XDG_STATE_HOME` is
@@ -96,6 +97,11 @@ repo_instance_key = sha256(realpath(git rev-parse --path-format=absolute --git-c
 >
 > All paths set in these environment variables must be absolute. If a path
 > is relative, the behavior is undefined.
+>
+> （日本語訳の要旨: `$XDG_STATE_HOME` が未設定または空の場合は
+> `$HOME/.local/state` を既定値として使う。これらの環境変数に設定する
+> パスはすべて絶対パスでなければならず、相対パスの場合の挙動は
+> 仕様上未定義である。）
 
 本実装はこの "undefined" なケースを曖昧なままにせず具体化する：
 **relative（absolute でない）`$XDG_STATE_HOME` は無効/未設定として扱い**、
@@ -108,7 +114,7 @@ non-blocking warning を、曖昧なままにせず具体的に解決する。
 
 canonical DB file path は常に `<resolved-root>/task-context.sqlite3`。
 
-## Current-State Tables（v1、`PRAGMA user_version = 1`）
+## Current-State Tables（v1、`PRAGMA user_version = 1`） — 現在状態を保持するテーブル一覧
 
 固定 10 テーブル構成（Issue body の Scope Growth Guard 参照 — v1 consumer が
 存在しない table/field は追加しない）:
@@ -155,7 +161,7 @@ Outcome 本文は「Herdr locator は mutable observation として保存する�
 `tests/task-context/test_execution_runs_and_bindings.py::test_given_binding_when_relocated_then_task_and_activity_fk_bindings_are_unaffected`
 参照。
 
-## Physical Constraints（AC1）
+## Physical Constraints（AC1） — 物理制約
 
 すべて SQLite の `UNIQUE`/partial `UNIQUE INDEX`/`CHECK` で強制する
 （application logic のみに依存しない）。各制約は
@@ -185,7 +191,7 @@ live ref-claim を取得し、競合した場合 loser は
 `task_context_service.claim_task_ref` の `{"status": "conflict",
 "winning_task_id": ...}` 経由で winning Task を readback する。
 
-## Transaction Boundaries（AC2）
+## Transaction Boundaries（AC2） — トランザクション境界
 
 `task_context_service` の状態変更 function はすべて **正確に 1 回**
 `task_context_db.write_transaction` context manager を開く。これは明示的な
@@ -232,7 +238,7 @@ two-phase な flow は、external I/O を **transaction の外側** で挟める
   Herdr/statusLine projection I/O を行う → `ack_projection`（DB のみ、
   conditional delete）。
 
-## Busy/Retry Budget
+## Busy/Retry Budget — ビジー時リトライ予算
 
 `PRAGMA busy_timeout`（default `200ms`、
 `task_context_db.DEFAULT_BUSY_TIMEOUT_MS`）が `BEGIN IMMEDIATE` contention
@@ -285,7 +291,7 @@ genuine な corruption（`OperationalError` ではない `sqlite3.DatabaseError`
 例えば "file is not a database"）は transient contention と混同されず、
 即座に `CorruptDatabaseError` として raise される（AC9）。
 
-## Migration Ordering and Concurrency（AC2, AC9, AC11）
+## Migration Ordering and Concurrency（AC2, AC9, AC11） — マイグレーションの順序と並行実行
 
 `scripts/task-context/migrations/task_context_migration_runner.py::migrate`:
 
@@ -324,7 +330,7 @@ table/index/trigger 名が **ちょうど 1 回** だけ現れること（double
 なし）、`PRAGMA integrity_check` が依然 `ok` を返すこと（half-migrated
 state なし）を assert する。
 
-## Typed Error / Result Taxonomy（AC8, AC9）
+## Typed Error / Result Taxonomy（AC8, AC9） — 型付きエラーと結果の分類
 
 code 表全体は `schemas/task-context/error-taxonomy.md` を参照。
 source of truth は `scripts/task-context/task_context_errors.py`。
@@ -336,7 +342,7 @@ business outcome を記述する JSON object を 1 個だけ carry する）た�
 shell caller は exit code で分岐し、structured consumer は JSON body を
 parse できる（AC8）。
 
-## Request/Result Envelope（AC8）
+## Request/Result Envelope（AC8） — リクエスト/レスポンス封筒
 
 凍結された形状（`schemas/task-context/request-envelope.schema.json`、
 `result-envelope.schema.json`）:
@@ -356,7 +362,7 @@ workflow signal、#2568 runtime-smoke 等）は、envelope 自体を変更せず
 `tests/task-context/test_envelope_and_cli.py::test_given_hook_event_when_run_via_cli_with_extra_additive_payload_fields_then_still_accepted`
 で検証。
 
-## Typed CLI Surface（`task-contextctl`）
+## Typed CLI Surface（`task-contextctl`） — 型付き CLI インターフェース
 
 ```
 task-contextctl hook <event>
@@ -391,7 +397,7 @@ carry する。stderr は diagnostics-only（parse されない）。
    （`prompt`、`transcript`、`command`、`message_body`、`raw_input`、
    `text`）と oversized-string case について negative test を持つ。
 
-## `projection_outbox` の Revision-Aware Conditional Ack（AC12）
+## `projection_outbox` の Revision-Aware Conditional Ack（AC12） — リビジョン整合の確認応答
 
 `projection_outbox` は **`projection_key` ごとに 1 行**を保持し、最新の
 desired revision のみへ coalesce する（per-event history queue には
@@ -412,7 +418,7 @@ desired revision のみへ coalesce する（per-event history queue には
   `tests/task-context/test_projection_outbox.py::test_given_race_between_flush_read_and_ack_when_enqueue_advances_revision_then_ack_does_not_delete_it`
   で検証。
 
-## `synchronous=NORMAL` vs `synchronous=FULL`（AC10）
+## `synchronous=NORMAL` vs `synchronous=FULL`（AC10） — 同期モードの比較
 
 AC10 は 2 つの **別々に検証される** ものを要求する:
 
