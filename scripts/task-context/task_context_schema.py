@@ -71,21 +71,46 @@ DDL_V1: list[str] = [
     """
     CREATE INDEX ix_task_refs_task_id ON task_refs(task_id)
     """,
+    # Composite covering unique index used purely as the *parent* side of the
+    # `task_ref_claims` composite FOREIGN KEY below (fix_delta finding 7b).
+    # SQLite requires an explicit unique index over the exact parent column
+    # tuple referenced by a composite FK. This lets task_ref_claims keep its
+    # own (repo, ref_kind, ref_number, task_id) columns -- required because
+    # SQLite partial UNIQUE INDEXes cannot span a join -- while making it
+    # physically impossible for those columns to disagree with the
+    # task_refs row they claim.
+    """
+    CREATE UNIQUE INDEX ux_task_refs_id_task_id_repo_kind_number
+        ON task_refs(id, task_id, repo, ref_kind, ref_number)
+    """,
     # -- task_ref_claims ------------------------------------------------------
     # AC1(a)/AC4: a live (released_at IS NULL) claim on the same
     # (repo, ref_kind, ref_number) tuple can never be held by more than one
     # claim row (regardless of task_id) -- this is the DB-physical guard
     # against Issue/PR split-brain across candidate Tasks.
+    #
+    # task_id/repo/ref_kind/ref_number duplicate fields already present on
+    # the referenced task_refs row (via task_ref_id). They cannot be
+    # dropped outright because the ux_task_ref_claims_live partial unique
+    # index below must be a single-table index (SQLite partial indexes
+    # cannot span a join to task_refs). Instead, the composite FOREIGN KEY
+    # below makes it a DB-physical impossibility for these redundant
+    # columns to disagree with the task_refs row identified by
+    # task_ref_id (fix_delta finding 7b) -- a raw SQL row that names one
+    # task_ref_id but a different task_id/repo/ref_kind/ref_number is
+    # rejected by SQLite itself, not merely by application code.
     """
     CREATE TABLE task_ref_claims (
         id TEXT PRIMARY KEY,
-        task_ref_id TEXT NOT NULL REFERENCES task_refs(id),
+        task_ref_id TEXT NOT NULL,
         task_id TEXT NOT NULL REFERENCES tasks(id),
         repo TEXT NOT NULL,
         ref_kind TEXT NOT NULL CHECK (ref_kind IN ('issue', 'pr')),
         ref_number INTEGER NOT NULL,
         claimed_at TEXT NOT NULL,
-        released_at TEXT
+        released_at TEXT,
+        FOREIGN KEY (task_ref_id, task_id, repo, ref_kind, ref_number)
+            REFERENCES task_refs(id, task_id, repo, ref_kind, ref_number)
     )
     """,
     """
@@ -131,6 +156,21 @@ DDL_V1: list[str] = [
         updated_at TEXT NOT NULL
     )
     """,
+    # fix_delta finding 3: `current_claude_session_id` is a durable
+    # recovery-facing field required by #2569 cold-restore contract, so it
+    # is intentionally NOT removed. Without this index, `set_binding_session`
+    # could previously write the *same* non-null session id onto more than
+    # one Binding, creating a second, un-synchronized SSOT alongside the
+    # execution_runs.claude_session_id partial-unique guard (AC1e). This
+    # partial unique index makes "session_id S -> at most one Binding
+    # currently claims S" a DB-physical invariant, so
+    # `task_context_service.get_binding_by_current_session` can resolve
+    # "session_id S -> exactly one current Binding" deterministically.
+    """
+    CREATE UNIQUE INDEX ux_tab_bindings_current_session
+        ON tab_bindings(current_claude_session_id)
+        WHERE current_claude_session_id IS NOT NULL
+    """,
     # -- runtime_locations ---------------------------------------------------
     # AC1(c): at most 1 *unreleased* (released_at IS NULL) location
     # observation per binding at a time. Relocating = release the old
@@ -158,6 +198,22 @@ DDL_V1: list[str] = [
     # is_managed distinguishes a "managed operator run/session" (Native
     # Claude Code / Claude-GPT operator loop) from other run kinds
     # (SubAgent, runtime-smoke) for the purposes of AC1(d)/(e).
+    #
+    # fix_delta finding 2: is_managed is NOT an independent caller-supplied
+    # flag -- it is fully *derived* from run_kind
+    # (native_operator/claude_gpt => managed; subagent/runtime_smoke =>
+    # non-managed). The CHECK below makes any other combination a DB
+    # physical impossibility, closing the two bypasses of the AC1(d)/(e)
+    # operator invariants that were previously possible by naming an
+    # arbitrary is_managed value from a raw SQL caller:
+    #   (a) run_kind='native_operator'/'claude_gpt' with is_managed=0 would
+    #       have silently escaped the AC1(d)/(e) partial unique indexes;
+    #   (b) run_kind='subagent'/'runtime_smoke' with is_managed=1 would have
+    #       falsely impersonated a managed operator run and consumed the
+    #       AC1(d)/(e) uniqueness slot on behalf of a non-operator run.
+    # `task_context_service.start_execution_run` also derives is_managed
+    # from run_kind in application code (belt-and-suspenders), but this
+    # CHECK is the authoritative physical guard.
     """
     CREATE TABLE execution_runs (
         id TEXT PRIMARY KEY,
@@ -171,31 +227,67 @@ DDL_V1: list[str] = [
         claude_session_id TEXT,
         is_managed INTEGER NOT NULL DEFAULT 0 CHECK (is_managed IN (0, 1)),
         started_at TEXT NOT NULL,
-        ended_at TEXT
+        ended_at TEXT,
+        CHECK (
+            (run_kind IN ('native_operator', 'claude_gpt') AND is_managed = 1)
+            OR
+            (run_kind IN ('subagent', 'runtime_smoke') AND is_managed = 0)
+        )
     )
     """,
-    # AC1(d): at most 1 open (ended_at IS NULL) managed operator run per binding.
+    # AC1(d): at most 1 open (ended_at IS NULL) managed operator run per
+    # binding. The index authority is `run_kind IN (...)` rather than
+    # `is_managed = 1` (fix_delta finding 2) -- these are guaranteed
+    # equivalent by the table CHECK above, but keying the index directly off
+    # run_kind means the *index itself* never silently trusts a
+    # caller-supplied is_managed value.
     """
     CREATE UNIQUE INDEX ux_execution_runs_open_managed_per_binding
         ON execution_runs(binding_id)
-        WHERE is_managed = 1 AND ended_at IS NULL AND binding_id IS NOT NULL
+        WHERE run_kind IN ('native_operator', 'claude_gpt') AND ended_at IS NULL AND binding_id IS NOT NULL
     """,
     # AC1(e): partial unique index restricted to rows where
-    # claude_session_id IS NOT NULL AND is_managed=1 AND ended_at IS NULL --
-    # i.e. only *currently open* managed/operator runs enforce
-    # claude_session_id uniqueness. Historical (ended) runs and non-managed
-    # runs are exempt, so re-attaching the same claude_session_id to a new
-    # ExecutionRun after the prior one ended remains allowed.
+    # claude_session_id IS NOT NULL AND run_kind IN ('native_operator',
+    # 'claude_gpt') AND ended_at IS NULL -- i.e. only *currently open*
+    # managed/operator runs enforce claude_session_id uniqueness. Historical
+    # (ended) runs and non-managed runs are exempt, so re-attaching the same
+    # claude_session_id to a new ExecutionRun after the prior one ended
+    # remains allowed.
     """
     CREATE UNIQUE INDEX ux_execution_runs_open_managed_session
         ON execution_runs(claude_session_id)
-        WHERE claude_session_id IS NOT NULL AND is_managed = 1 AND ended_at IS NULL
+        WHERE claude_session_id IS NOT NULL
+            AND run_kind IN ('native_operator', 'claude_gpt')
+            AND ended_at IS NULL
     """,
     """
     CREATE INDEX ix_execution_runs_task_id ON execution_runs(task_id)
     """,
     """
     CREATE INDEX ix_execution_runs_binding_id ON execution_runs(binding_id)
+    """,
+    # fix_delta finding 7a: execution_runs.task_id and .activity_id must
+    # never point at different Tasks. Application code
+    # (`task_context_service._validate_task_activity_consistency`) already
+    # checks this before every INSERT/UPDATE, but these triggers are the
+    # DB-physical backstop against a raw SQL write bypassing the typed API.
+    """
+    CREATE TRIGGER trg_execution_runs_task_activity_consistency_insert
+        BEFORE INSERT ON execution_runs
+        WHEN NEW.task_id IS NOT NULL AND NEW.activity_id IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'execution_runs.activity_id must belong to execution_runs.task_id')
+            WHERE (SELECT task_id FROM activities WHERE id = NEW.activity_id) IS NOT NEW.task_id;
+        END
+    """,
+    """
+    CREATE TRIGGER trg_execution_runs_task_activity_consistency_update
+        BEFORE UPDATE ON execution_runs
+        WHEN NEW.task_id IS NOT NULL AND NEW.activity_id IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'execution_runs.activity_id must belong to execution_runs.task_id')
+            WHERE (SELECT task_id FROM activities WHERE id = NEW.activity_id) IS NOT NEW.task_id;
+        END
     """,
     # -- events ---------------------------------------------------------------
     # Append-only retrospective history. Enforced append-only at the DB
@@ -233,15 +325,22 @@ DDL_V1: list[str] = [
     """,
     # -- projection_outbox ------------------------------------------------------
     # AC12: coalesces to the latest desired revision only (one row per
-    # projection_key). flush() reads (desired_revision, payload); ack()
-    # performs a conditional DELETE keyed on the *read* revision so a
-    # concurrent enqueue() that has advanced desired_revision beyond the
-    # read revision is never lost.
+    # projection_key). flush() reads desired_revision; ack() performs a
+    # conditional DELETE keyed on the *read* revision so a concurrent
+    # enqueue() that has advanced desired_revision beyond the read revision
+    # is never lost.
+    #
+    # fix_delta finding 4: projection_outbox holds ONLY the
+    # (projection_key, desired_revision) marker -- it is deliberately not a
+    # second SSOT for projection payload content. The projector/flush
+    # consumer re-derives the actual projection content by reading canonical
+    # DB state (Task/Activity/Binding/... tables) for `desired_revision` at
+    # flush time; it does not read a stored payload snapshot out of this
+    # table.
     """
     CREATE TABLE projection_outbox (
         projection_key TEXT PRIMARY KEY,
         desired_revision INTEGER NOT NULL,
-        payload_json TEXT,
         enqueued_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )

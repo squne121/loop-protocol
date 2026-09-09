@@ -112,3 +112,39 @@ def test_given_two_connections_contending_when_second_begin_immediate_blocked_th
     # Bounded budget: must not exceed the connection's busy_timeout by more
     # than a small scheduling-jitter margin (never multi-second blocking).
     assert elapsed < 2.0
+
+
+def test_given_full_open_migrate_operation_path_when_write_lock_held_then_wait_is_bounded_by_single_busy_timeout_budget(
+    db_file,
+):
+    """Deterministic bounded-wait CORRECTNESS test (fix_delta finding 5),
+    replacing the previous loose ``elapsed < 2.0`` assertion that only
+    exercised an already-open connection's ``write_transaction`` and never
+    measured the ``connect()`` path at all. This test contends against the
+    FULL ``connect() -> migrate() -> service write`` hot path (the actual
+    caller-visible path every ``task-contextctl`` invocation takes) and
+    asserts the observed wait stays close to the single configured
+    ``busy_timeout_ms`` budget -- never the ~5x-amplified, multi-layered
+    retry behavior a prior version of ``task_context_db.connect()`` had
+    (which could turn a 200ms budget into >1s of hot-path blocking). The
+    300ms margin absorbs ordinary CI scheduling jitter without being a
+    flaky tight performance threshold; it is a correctness bound, not a
+    performance benchmark."""
+    import task_context_migration_runner as migration_runner
+
+    busy_timeout_ms = 200
+    conn_a = db.connect(db_file, busy_timeout_ms=busy_timeout_ms)
+    migration_runner.migrate(conn_a)
+    conn_a.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        with pytest.raises(errors.TemporarilyUnavailableError):
+            conn_b = db.connect(db_file, busy_timeout_ms=busy_timeout_ms)
+            migration_runner.migrate(conn_b)
+            service.create_task(conn_b, title="contended")
+        elapsed = time.monotonic() - started
+    finally:
+        conn_a.execute("ROLLBACK")
+        conn_a.close()
+
+    assert elapsed < (busy_timeout_ms / 1000.0) + 0.3

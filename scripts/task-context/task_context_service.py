@@ -62,7 +62,7 @@ def create_task(conn: sqlite3.Connection, *, title: str | None = None) -> dict[s
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = db.execute_readonly(conn, "SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         raise errors.NotFoundError(f"task {task_id} not found")
     return _row_to_dict(row)  # type: ignore[return-value]
@@ -112,7 +112,8 @@ def claim_task_ref(
                 (claim_id, ref_id, task_id, repo, ref_kind, ref_number, now_iso()),
             )
     except errors.ConflictError:
-        winner = conn.execute(
+        winner = db.execute_readonly(
+            conn,
             "SELECT task_id FROM task_ref_claims "
             "WHERE repo = ? AND ref_kind = ? AND ref_number = ? AND released_at IS NULL",
             (repo, ref_kind, ref_number),
@@ -156,7 +157,7 @@ def transition_activity(conn: sqlite3.Connection, task_id: str, kind: str) -> di
 
 
 def get_activity(conn: sqlite3.Connection, activity_id: str) -> dict[str, Any]:
-    row = conn.execute("SELECT * FROM activities WHERE id = ?", (activity_id,)).fetchone()
+    row = db.execute_readonly(conn, "SELECT * FROM activities WHERE id = ?", (activity_id,)).fetchone()
     if row is None:
         raise errors.NotFoundError(f"activity {activity_id} not found")
     return _row_to_dict(row)  # type: ignore[return-value]
@@ -180,9 +181,21 @@ def create_binding(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def get_binding(conn: sqlite3.Connection, binding_id: str) -> dict[str, Any]:
-    row = conn.execute("SELECT * FROM tab_bindings WHERE id = ?", (binding_id,)).fetchone()
+    row = db.execute_readonly(conn, "SELECT * FROM tab_bindings WHERE id = ?", (binding_id,)).fetchone()
     if row is None:
         raise errors.NotFoundError(f"binding {binding_id} not found")
+    return _row_to_dict(row)  # type: ignore[return-value]
+
+
+def get_binding_by_current_session(conn: sqlite3.Connection, claude_session_id: str) -> dict[str, Any]:
+    """Resolve ``session_id S -> exactly one current Binding`` (fix_delta
+    finding 3). Relies on the ``ux_tab_bindings_current_session`` DB
+    partial-unique index to guarantee at most one row can match."""
+    row = db.execute_readonly(
+        conn, "SELECT * FROM tab_bindings WHERE current_claude_session_id = ?", (claude_session_id,)
+    ).fetchone()
+    if row is None:
+        raise errors.NotFoundError(f"no binding currently claims session {claude_session_id!r}")
     return _row_to_dict(row)  # type: ignore[return-value]
 
 
@@ -208,16 +221,63 @@ def relocate_binding(conn: sqlite3.Connection, binding_id: str, herdr_locator: s
 
 
 def get_current_location(conn: sqlite3.Connection, binding_id: str) -> dict[str, Any] | None:
-    row = conn.execute(
+    row = db.execute_readonly(
+        conn,
         "SELECT * FROM runtime_locations WHERE binding_id = ? AND released_at IS NULL",
         (binding_id,),
     ).fetchone()
     return _row_to_dict(row)
 
 
-def set_binding_session(conn: sqlite3.Connection, binding_id: str, claude_session_id: str | None) -> dict[str, Any]:
+def set_binding_session(
+    conn: sqlite3.Connection,
+    binding_id: str,
+    claude_session_id: str | None,
+    *,
+    execution_run_id: str | None = None,
+) -> dict[str, Any]:
+    """Set (or clear) the Binding's current Claude session claim.
+
+    fix_delta finding 3 ("Claude session identity の二重SSOT"): setting a
+    non-null ``claude_session_id`` requires ``execution_run_id`` to name an
+    *open* (``ended_at IS NULL``), *managed* (``run_kind IN
+    ('native_operator', 'claude_gpt')``) ExecutionRun already attached to
+    this exact ``binding_id`` and already carrying the identical
+    ``claude_session_id`` -- verified inside the same transaction as the
+    write. This keeps the Binding-level "current session" copy synchronized
+    with the ExecutionRun-level SSOT (the AC1e partial unique index) instead
+    of letting the two drift independently. The
+    ``ux_tab_bindings_current_session`` DB partial-unique index additionally
+    guarantees at most one Binding can claim a given non-null session as
+    "current" at a time, so ``session_id S -> exactly one current managed
+    Binding/run`` is resolvable via ``get_binding_by_current_session``.
+    Clearing (``claude_session_id=None``) never requires
+    ``execution_run_id``.
+    """
     with db.write_transaction(conn):
         get_binding(conn, binding_id)
+        if claude_session_id is not None:
+            if not execution_run_id:
+                raise errors.ValidationError(
+                    "setting a non-null claude_session_id requires execution_run_id of the "
+                    "open managed ExecutionRun it is being synchronized with"
+                )
+            run = conn.execute(
+                "SELECT claude_session_id FROM execution_runs "
+                "WHERE id = ? AND binding_id = ? AND ended_at IS NULL "
+                "AND run_kind IN ('native_operator', 'claude_gpt')",
+                (execution_run_id, binding_id),
+            ).fetchone()
+            if run is None:
+                raise errors.ValidationError(
+                    f"execution_run_id {execution_run_id!r} is not an open managed "
+                    f"ExecutionRun attached to binding {binding_id!r}"
+                )
+            if run["claude_session_id"] != claude_session_id:
+                raise errors.ValidationError(
+                    "execution_run_id's claude_session_id does not match the session "
+                    "being set on the binding -- the two SSOTs must agree"
+                )
         conn.execute(
             "UPDATE tab_bindings SET current_claude_session_id = ?, updated_at = ? WHERE id = ?",
             (claude_session_id, now_iso(), binding_id),
@@ -244,12 +304,41 @@ def set_binding_health(conn: sqlite3.Connection, binding_id: str, runtime_health
 
 VALID_RUN_KINDS = frozenset({"native_operator", "subagent", "runtime_smoke", "claude_gpt"})
 
+# fix_delta finding 2: is_managed is derived from run_kind, never an
+# independent caller-supplied flag. This mirrors the DB-physical CHECK
+# constraint in task_context_schema.py -- the two must always agree.
+MANAGED_RUN_KINDS = frozenset({"native_operator", "claude_gpt"})
+
+
+def _is_managed_for_run_kind(run_kind: str) -> bool:
+    return run_kind in MANAGED_RUN_KINDS
+
+
+def _validate_task_activity_consistency(
+    conn: sqlite3.Connection, task_id: str | None, activity_id: str | None
+) -> None:
+    """fix_delta finding 7a: an ExecutionRun's task_id and activity_id must
+    never point at different Tasks. Application-level guard; the
+    ``trg_execution_runs_task_activity_consistency_*`` DB triggers are the
+    physical backstop against a raw SQL write bypassing this check."""
+    if task_id is None or activity_id is None:
+        return
+    activity_row = db.execute_readonly(
+        conn, "SELECT task_id FROM activities WHERE id = ?", (activity_id,)
+    ).fetchone()
+    if activity_row is None:
+        raise errors.NotFoundError(f"activity {activity_id} not found")
+    if activity_row["task_id"] != task_id:
+        raise errors.ValidationError(
+            f"activity {activity_id!r} belongs to task {activity_row['task_id']!r}, "
+            f"not {task_id!r} -- execution_runs.task_id/activity_id must reference the same Task"
+        )
+
 
 def start_execution_run(
     conn: sqlite3.Connection,
     *,
     run_kind: str,
-    is_managed: bool = False,
     task_id: str | None = None,
     activity_id: str | None = None,
     binding_id: str | None = None,
@@ -259,9 +348,11 @@ def start_execution_run(
 ) -> dict[str, Any]:
     if run_kind not in VALID_RUN_KINDS:
         raise errors.ValidationError(f"run_kind must be one of {sorted(VALID_RUN_KINDS)}, got {run_kind!r}")
+    is_managed = _is_managed_for_run_kind(run_kind)
     run_id = new_id("run")
     ts = now_iso()
     with db.write_transaction(conn):
+        _validate_task_activity_consistency(conn, task_id, activity_id)
         conn.execute(
             "INSERT INTO execution_runs "
             "(id, task_id, activity_id, binding_id, run_kind, runtime_profile, resume_profile, "
@@ -284,7 +375,7 @@ def start_execution_run(
 
 
 def get_execution_run(conn: sqlite3.Connection, run_id: str) -> dict[str, Any]:
-    row = conn.execute("SELECT * FROM execution_runs WHERE id = ?", (run_id,)).fetchone()
+    row = db.execute_readonly(conn, "SELECT * FROM execution_runs WHERE id = ?", (run_id,)).fetchone()
     if row is None:
         raise errors.NotFoundError(f"execution_run {run_id} not found")
     return _row_to_dict(row)  # type: ignore[return-value]
@@ -302,11 +393,14 @@ def attach_execution_run(
     known (AC6). No external I/O -- caller resolves identities beforehand."""
     with db.write_transaction(conn):
         current = get_execution_run(conn, run_id)
+        final_task_id = task_id if task_id is not None else current["task_id"]
+        final_activity_id = activity_id if activity_id is not None else current["activity_id"]
+        _validate_task_activity_consistency(conn, final_task_id, final_activity_id)
         conn.execute(
             "UPDATE execution_runs SET task_id = ?, activity_id = ?, binding_id = ? WHERE id = ?",
             (
-                task_id if task_id is not None else current["task_id"],
-                activity_id if activity_id is not None else current["activity_id"],
+                final_task_id,
+                final_activity_id,
                 binding_id if binding_id is not None else current["binding_id"],
                 run_id,
             ),
@@ -407,50 +501,53 @@ def append_event(
                 now_iso(),
             ),
         )
-    row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+    row = db.execute_readonly(conn, "SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
     return _row_to_dict(row)  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
 # projection_outbox (AC12) -- coalescing, revision-aware conditional ack.
+#
+# fix_delta finding 4: this table (and these functions) hold ONLY the
+# (projection_key, desired_revision) marker. There is no payload column and
+# no payload parameter -- projection_outbox is not a second SSOT for
+# projection content. The actual projection consumer re-derives the content
+# to project by reading canonical DB state (Task/Activity/Binding/...) at
+# `desired_revision` flush time, outside of any DB write transaction.
 # ---------------------------------------------------------------------------
 
 
-def enqueue_projection(
-    conn: sqlite3.Connection, projection_key: str, revision: int, payload: dict[str, Any] | None = None
-) -> dict[str, Any]:
+def enqueue_projection(conn: sqlite3.Connection, projection_key: str, revision: int) -> dict[str, Any]:
     ts = now_iso()
-    payload_json = json.dumps(payload if payload is not None else {}, sort_keys=True)
     with db.write_transaction(conn):
         row = conn.execute(
             "SELECT desired_revision FROM projection_outbox WHERE projection_key = ?", (projection_key,)
         ).fetchone()
         if row is None:
             conn.execute(
-                "INSERT INTO projection_outbox "
-                "(projection_key, desired_revision, payload_json, enqueued_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (projection_key, revision, payload_json, ts, ts),
+                "INSERT INTO projection_outbox (projection_key, desired_revision, enqueued_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (projection_key, revision, ts, ts),
             )
         elif revision > row["desired_revision"]:
             conn.execute(
-                "UPDATE projection_outbox SET desired_revision = ?, payload_json = ?, updated_at = ? "
-                "WHERE projection_key = ?",
-                (revision, payload_json, ts, projection_key),
+                "UPDATE projection_outbox SET desired_revision = ?, updated_at = ? WHERE projection_key = ?",
+                (revision, ts, projection_key),
             )
     return read_projection(conn, projection_key)  # type: ignore[return-value]
 
 
 def read_projection(conn: sqlite3.Connection, projection_key: str) -> dict[str, Any] | None:
-    row = conn.execute(
-        "SELECT * FROM projection_outbox WHERE projection_key = ?", (projection_key,)
+    row = db.execute_readonly(
+        conn, "SELECT * FROM projection_outbox WHERE projection_key = ?", (projection_key,)
     ).fetchone()
     return _row_to_dict(row)
 
 
 def flush_projection(conn: sqlite3.Connection, projection_key: str) -> dict[str, Any] | None:
-    """Read-only: returns the current (desired_revision, payload) snapshot
-    for the caller to project *outside* of any DB transaction. Does NOT
+    """Read-only: returns the current ``{projection_key, desired_revision,
+    ...}`` marker snapshot for the caller to (re-derive from canonical DB
+    state and) project *outside* of any DB transaction. Does NOT
     delete/ack -- call ``ack_projection`` afterwards with the
     ``desired_revision`` this call returned."""
     return read_projection(conn, projection_key)

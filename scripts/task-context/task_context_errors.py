@@ -56,9 +56,11 @@ class NotFoundError(TaskContextError):
 
 
 class CorruptDatabaseError(TaskContextError):
-    """``PRAGMA integrity_check`` failed, or sqlite3 raised
-    ``DatabaseError``/``sqlite3.DatabaseError`` while opening the DB file.
-    Never silently reset to an empty DB (AC9)."""
+    """``PRAGMA integrity_check`` failed, or sqlite3 raised a
+    corruption-class ``sqlite3.DatabaseError`` while opening/configuring the
+    connection, or while executing a read or write against it (see
+    ``task_context_db.connect``/``execute_readonly``/``write_transaction``
+    -- fix_delta finding 6). Never silently reset to an empty DB (AC9)."""
 
     code = "CORRUPT_DATABASE"
     exit_code = 6

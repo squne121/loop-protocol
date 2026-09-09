@@ -174,15 +174,54 @@ SQLite 自身から raise されることを確認する negative test を持つ
 | 1(a) | 同一 Issue/PR を 2 Task が同時に live-claim できない | `ux_task_ref_claims_live` — `UNIQUE(repo, ref_kind, ref_number) WHERE released_at IS NULL` |
 | 1(b) | 1 Task の `ACTIVE` Activity は最大 1 | `ux_activities_active_per_task` — `UNIQUE(task_id) WHERE status = 'ACTIVE'` |
 | 1(c) | 1 Binding の unreleased location observation は最大 1 | `ux_runtime_locations_unreleased_per_binding` — `UNIQUE(binding_id) WHERE released_at IS NULL` |
-| 1(d) | 1 Binding の open managed operator run/session は最大 1 | `ux_execution_runs_open_managed_per_binding` — `UNIQUE(binding_id) WHERE is_managed = 1 AND ended_at IS NULL AND binding_id IS NOT NULL` |
-| 1(e) | `claude_session_id` は **currently open managed** run の間でのみ unique | `ux_execution_runs_open_managed_session` — `UNIQUE(claude_session_id) WHERE claude_session_id IS NOT NULL AND is_managed = 1 AND ended_at IS NULL` |
+| 1(d) | 1 Binding の open managed operator run/session は最大 1 | `ux_execution_runs_open_managed_per_binding` — `UNIQUE(binding_id) WHERE run_kind IN ('native_operator', 'claude_gpt') AND ended_at IS NULL AND binding_id IS NOT NULL` |
+| 1(e) | `claude_session_id` は **currently open managed** run の間でのみ unique | `ux_execution_runs_open_managed_session` — `UNIQUE(claude_session_id) WHERE claude_session_id IS NOT NULL AND run_kind IN ('native_operator', 'claude_gpt') AND ended_at IS NULL` |
 
-(e) は意図的に `is_managed = 1 AND ended_at IS NULL` にスコープしている：
-historical（ended）run と non-managed run（例: SubAgent）はこの制約から除外
-される。したがって、先行 run が ended した後に同一 `claude_session_id` を
-新しい `ExecutionRun` へ再 attach することは引き続き許可される
+(e) は意図的に `run_kind IN ('native_operator', 'claude_gpt') AND ended_at
+IS NULL` にスコープしている：historical（ended）run と non-managed run
+（例: SubAgent）はこの制約から除外される。したがって、先行 run が ended
+した後に同一 `claude_session_id` を新しい `ExecutionRun` へ再 attach する
+ことは引き続き許可される
 （`test_given_historical_ended_run_when_same_session_id_reattached_to_new_run_then_allowed`
 で明示的にテスト）。
+
+### `is_managed` は `run_kind` から derive される（fix_delta finding 2）
+
+`is_managed` は caller が独立に指定できるフラグでは **ない**。
+`execution_runs` の `CHECK` 制約が
+`(run_kind IN ('native_operator', 'claude_gpt') AND is_managed = 1) OR
+(run_kind IN ('subagent', 'runtime_smoke') AND is_managed = 0)`
+を強制し、`task_context_service.start_execution_run` も同じ導出を
+application 層で行う（belt-and-suspenders）。以前は `is_managed` が
+`run_kind` と無関係に自由指定でき、raw SQL 経由で (a)
+`native_operator`/`claude_gpt` を `is_managed=0` として AC1(d)/(e) の
+partial unique index を回避する、(b) `subagent`/`runtime_smoke` を
+`is_managed=1` として managed operator run を偽装する、という 2 つの
+bypass が可能だった。上記 CHECK と、1(d)/(e) の index 自体を
+`is_managed` ではなく `run_kind IN (...)` を authority にする変更により、
+どちらも DB 物理的に不可能になった。
+
+### `tab_bindings.current_claude_session_id` の一意性（fix_delta finding 3）
+
+`current_claude_session_id` は `#2569` cold-restore が要求する durable
+recovery field であり、削除しない。一方で以前は `set_binding_session()` が
+同じ非 null session id を任意の複数 Binding へ書き込め、
+`execution_runs.claude_session_id` の AC1(e) partial unique index と
+無関係な第 2 の SSOT になっていた（"session identity の二重 SSOT"）。
+
+- `ux_tab_bindings_current_session` — `UNIQUE(current_claude_session_id)
+  WHERE current_claude_session_id IS NOT NULL`: 非 null な session id を
+  「current」として claim できる Binding は同時に最大 1 個という DB
+  物理制約。
+- `task_context_service.set_binding_session()` は非 null な
+  `claude_session_id` を設定する際、対象 binding 上の open かつ managed な
+  `ExecutionRun`（`execution_run_id` で指定、`run_kind IN
+  ('native_operator', 'claude_gpt')` かつ `ended_at IS NULL`）が同じ
+  `claude_session_id` を保持していることを同一 transaction 内で検証する。
+  これにより Binding 側のコピーと ExecutionRun 側の SSOT が
+  transaction 境界で同期される。
+- `task_context_service.get_binding_by_current_session()` が
+  `session_id S -> exactly one current Binding` を解決する。
 
 「duplicate open Task」はこの表の制約対象では **ない** — Issue が明示的に
 未定義の dedupe basis として除外している（AC1 note、AC4）。
@@ -190,6 +229,33 @@ historical（ended）run と non-managed run（例: SubAgent）はこの制約�
 live ref-claim を取得し、競合した場合 loser は
 `task_context_service.claim_task_ref` の `{"status": "conflict",
 "winning_task_id": ...}` 経由で winning Task を readback する。
+
+## Logical FK / Relational Integrity（fix_delta finding 7）
+
+AC1 の unique/partial-unique 制約に加え、以下の relational integrity も
+DB 物理制約（application validation だけでなく）で保証する:
+
+- **`execution_runs.task_id`/`activity_id` の整合性**: 1 つの
+  `ExecutionRun` の `task_id` と `activity_id` は同じ Task を指さなければ
+  ならない。`task_context_service._validate_task_activity_consistency` が
+  `start_execution_run`/`attach_execution_run` の中で事前検証する
+  （typed `ValidationError`）。加えて
+  `trg_execution_runs_task_activity_consistency_insert`/`_update`
+  トリガーが raw SQL による bypass を物理的に拒否する
+  （`RAISE(ABORT, ...)`、NULL-safe な `IS NOT` 比較）。
+- **`task_ref_claims` の冗長 column**: `task_ref_claims.task_id`/`repo`/
+  `ref_kind`/`ref_number` は参照元 `task_refs`（`task_ref_id` 経由）の
+  値と重複している。これらを削除できないのは、AC1(a) の
+  `ux_task_ref_claims_live` partial unique index が `task_ref_claims`
+  単独テーブル上でしか定義できない（SQLite の partial index は join を
+  跨げない）ためである。代わりに `task_refs(id, task_id, repo, ref_kind,
+  ref_number)` 上の covering unique index
+  （`ux_task_refs_id_task_id_repo_kind_number`）を parent 側キーとする
+  composite `FOREIGN KEY (task_ref_id, task_id, repo, ref_kind,
+  ref_number) REFERENCES task_refs(id, task_id, repo, ref_kind,
+  ref_number)` を `task_ref_claims` に追加した。これにより、ある
+  `task_ref_id` に対して不整合な `task_id`/`repo`/`ref_kind`/`ref_number`
+  を持つ行を raw SQL で insert することが DB 物理的に不可能になる。
 
 ## Transaction Boundaries（AC2） — トランザクション境界
 
@@ -257,9 +323,14 @@ two-phase な flow は、external I/O を **transaction の外側** で挟める
   近づくことは全くないほど余裕があり、かつ genuinely stuck な writer
   （transaction を open したまま止まる bug 等）は fail fast で typed かつ
   retryable な error を返す短さでもある。
-- **application 側のコードはこの上に第 2 の retry/sleep loop を積まない。**
-  `task_context_db.write_transaction` と
-  `task_context_db._execute_with_lock_retry` は busy_timeout の期限切れを
+- **application 側のコードはこの上に第 2 の retry/sleep loop を積まない
+  （fix_delta finding 5）。** `task_context_db.write_transaction` と
+  `task_context_db._configure_pragma`（旧
+  `_execute_with_lock_retry` — 以前の実装は `busy_timeout_ms` の **5倍**
+  の deadline で独自の sleep/retry loop を回しており、connection-level
+  budget の上に第 2 の budget を積み上げていた。この amplification は削除
+  済みで、`_configure_pragma` は `conn.execute(sql)` を 1 回呼び、その
+  outcome を型付き例外へ翻訳するだけである）は busy_timeout の期限切れを
   そのまま `TemporarilyUnavailableError`（`TEMPORARILY_UNAVAILABLE`）に
   変換して即座に return する — caller（例: AC11 の concurrent-migration
   test helper `tests/task-context/_migration_worker.py`）が、必要なら
@@ -268,7 +339,11 @@ two-phase な flow は、external I/O を **transaction の外側** で挟める
   caller に可視な独立した決定である。
 - bounded budget を超えない（hang しない、数秒単位で block しない）ことは
   `tests/task-context/test_transactions_and_busy_retry.py::test_given_two_connections_contending_when_second_begin_immediate_blocked_then_temporarily_unavailable_and_bounded`
-  で検証する。
+  および、`connect() -> migrate() -> service write` の full path を対象と
+  した deterministic correctness test
+  `test_given_full_open_migrate_operation_path_when_write_lock_held_then_wait_is_bounded_by_single_busy_timeout_budget`
+  で検証する（後者が fix_delta finding 5 の "既存テストは connect path を
+  測っていない" 指摘への対応）。
 
 `BEGIN IMMEDIATE` の競合は、最初の `BEGIN IMMEDIATE` 自体が lock を取れない
 場合と、transaction 途中で同種の `sqlite3.OperationalError` が発生した場合
@@ -282,14 +357,18 @@ hang することもない。
 test で実際に発生させている）の下では、`PRAGMA journal_mode=WAL` の
 mode-transition 操作自体が、service layer の transaction 機構がまだ何も
 動いていない connect() 時点で retryable な "database is locked"
-`OperationalError` を raise することがある。`task_context_db.connect()` は
-各 configuration pragma（このpragma を含む）を `_execute_with_lock_retry`
-でラップし、`OperationalError`（"locked"/"busy"）に対しては小さな sleep を
-挟みつつ `busy_timeout_ms` の倍数でbounded な retry を行い、budget を使い
-切った場合は typed `TemporarilyUnavailableError` を raise する — 一方で
-genuine な corruption（`OperationalError` ではない `sqlite3.DatabaseError`、
-例えば "file is not a database"）は transient contention と混同されず、
-即座に `CorruptDatabaseError` として raise される（AC9）。
+`OperationalError` を raise することがある。この待機は
+`sqlite3.connect(..., timeout=busy_timeout_ms / 1000.0)` が connect() の
+最初に登録する SQLite 自身の native busy handler（`PRAGMA busy_timeout` と
+等価）によって **単一の budget として** 既に吸収されている（fix_delta
+finding 5）。`task_context_db.connect()` は各 configuration pragma を
+`_configure_pragma` でラップするが、これは追加の sleep/retry loop では
+なく、その 1 回きりの実行結果を型付き例外へ翻訳するだけである:
+`OperationalError`（"locked"/"busy"）は `TemporarilyUnavailableError` へ、
+genuine な corruption（`OperationalError` ではない
+`sqlite3.DatabaseError`、例えば "file is not a database"）は transient
+contention と混同されず即座に `CorruptDatabaseError` として raise される
+（AC9）。
 
 ## Migration Ordering and Concurrency（AC2, AC9, AC11） — マイグレーションの順序と並行実行
 
@@ -362,6 +441,23 @@ workflow signal、#2568 runtime-smoke 等）は、envelope 自体を変更せず
 `tests/task-context/test_envelope_and_cli.py::test_given_hook_event_when_run_via_cli_with_extra_additive_payload_fields_then_still_accepted`
 で検証。
 
+**CLI は実際に top-level envelope を検証・unwrap する（fix_delta finding
+1）**: 以前は `task-contextctl` が stdin の生 JSON をそのまま operation
+payload として扱っており、この節が説明する凍結 envelope 形状を
+実際には検証していなかった。`task_context_envelope.validate_and_unwrap_request`
+が stdin の non-empty JSON object を top-level envelope として厳密に検証
+する（`additionalProperties: false` 相当の extra-field 拒否、missing
+field 拒否、`schema_version` 一致検証、`payload` が object であることの
+検証）。加えて、argv/subcommand から決定される operation（例:
+`hook`/`signal_apply`/`query_current`/`projection_flush`/`smoke_seed`）と
+`envelope.operation` の一致を検証し、不一致は typed `ValidationError`
+にする。stdin が完全に空の場合のみ（payload 不要な operation 向け）
+envelope 検証をスキップし、payload を `{}` として扱う。
+`tests/task-context/test_envelope_and_cli.py` に、実際の `task_contextctl.py`
+を subprocess として起動し canonical envelope を渡す end-to-end test、
+および envelope の missing/extra field・schema_version 不一致・operation
+不一致を検証する negative test を追加した。
+
 ## Typed CLI Surface（`task-contextctl`） — 型付き CLI インターフェース
 
 ```
@@ -401,14 +497,21 @@ carry する。stderr は diagnostics-only（parse されない）。
 
 `projection_outbox` は **`projection_key` ごとに 1 行**を保持し、最新の
 desired revision のみへ coalesce する（per-event history queue には
-しない — Scope Growth Guard）:
+しない — Scope Growth Guard）。
 
-- `enqueue_projection(key, revision, payload)`: upsert。
+**marker-only SSOT（fix_delta finding 4）**: `projection_outbox` は
+`projection_key`/`desired_revision`/`enqueued_at`/`updated_at` のみを
+持ち、projection payload そのものは保持しない（`payload_json` column は
+存在しない）。projection の実際の内容は、flush 時に canonical DB state
+（Task/Activity/Binding/... の各テーブル）から都度再導出する —
+`projection_outbox` を projection content の第 2 の SSOT にはしない。
+
+- `enqueue_projection(key, revision)`: upsert。
   `revision > current desired_revision` の場合のみ上書きする（古い
   revision へ後退しない）。
 - `flush_projection(key)`: caller が DB transaction の **外側** で
-  projection を行うための `(desired_revision, payload)` の read-only
-  snapshot。
+  canonical DB state から実際の projection content を再導出するための
+  `desired_revision` marker の read-only snapshot。
 - `ack_projection(key, read_revision)`: `DELETE ... WHERE projection_key =
   ? AND desired_revision = ?` — caller が実際に読んだ revision をキーに
   した **conditional** delete。caller の `flush_projection` read と
@@ -439,34 +542,42 @@ module docstring 参照）:
 LTS、Python 3.12.3、本リポジトリの filesystem（WSL2 VM 内の ext4、
 Windows drive の `/mnt/c` mount ではない）。
 `uv run python3 scripts/task-context/measure_synchronous_latency.py`
-（mode ごとに通常 commit 200 回 + 強制 `PRAGMA
-wal_checkpoint(TRUNCATE)` 直後の commit 30 回）を独立に 2 回実行:
+（mode ごとに通常 commit 200 回 + 「50 行書き込んで WAL を再度太らせてから
+`PRAGMA wal_checkpoint(TRUNCATE)` **そのものの呼び出し時間**を計測」を
+30 trial）を独立に 2 回実行（fix_delta finding 8 — 計測方法の修正:
+以前の版は `wal_checkpoint(TRUNCATE)` を **計測開始前に完了** させてから
+次の commit を計測しており、checkpoint 自体のコストがタイマーの外に
+出てしまっていた。現在の版は checkpoint operation 呼び出しそのものを
+計測するため、"何を測っているか" と "実際に測っているもの" が一致する）:
 
 | Mode | Metric | Run 1 (mean / p95 / max, ms) | Run 2 (mean / p95 / max, ms) |
 |---|---|---|---|
-| `NORMAL` | 通常 commit | 0.010 / 0.018 / 0.042 | 0.006 / 0.007 / 0.045 |
-| `NORMAL` | WAL checkpoint boundary 直後の commit | 2.729 / 2.875 / 5.199 | 2.736 / 3.022 / 5.040 |
-| `FULL`   | 通常 commit | 2.637 / 3.080 / 4.210 | 2.682 / 2.957 / 16.136 |
-| `FULL`   | WAL checkpoint boundary 直後の commit | 5.165 / 5.494 / 5.917 | 5.403 / 6.441 / 8.289 |
+| `NORMAL` | 通常 commit | 0.007 / 0.015 / 0.061 | 0.006 / 0.007 / 0.029 |
+| `NORMAL` | checkpoint operation（`wal_checkpoint(TRUNCATE)` 呼び出し自体） | 4.580 / 5.977 / 6.824 | 4.327 / 5.200 / 6.013 |
+| `FULL`   | 通常 commit | 2.750 / 3.132 / 14.665 | 2.650 / 3.142 / 4.426 |
+| `FULL`   | checkpoint operation（`wal_checkpoint(TRUNCATE)` 呼び出し自体） | 2.930 / 3.970 / 3.985 | 2.907 / 3.837 / 3.988 |
 
 解釈: WAL mode の `synchronous=NORMAL` では commit ごとに `fsync` が
-発生しない（checkpoint boundary でのみ発生する）ため、通常の hot-path
-commit（`UserPromptSubmit` 等）は `synchronous=FULL`（すべての commit で
-`fsync` する）に対して **数百倍高速**（約0.01ms vs 約2.6ms、本 host）に
-なる。`NORMAL` のコストは代わりに checkpoint boundary で周期的に発生する
-（ここでは約2.7ms）が、これは全 hot-path write ではなく少数の checkpoint
-event が負担するコストであり、observed worst case（最大約5.2ms）でも
-200ms の busy_timeout budget に十分収まる。
+発生しない（checkpoint operation 実行時にのみ発生する）ため、通常の
+hot-path commit（`UserPromptSubmit` 等）は `synchronous=FULL`（すべての
+commit で `fsync` する）に対して **数百倍高速**（約0.006–0.007ms vs
+約2.6–2.8ms、本 host）になる。`NORMAL` のコストは代わりに checkpoint
+operation 実行時にまとめて発生する（ここでは約4.3–4.6ms、`FULL` の
+checkpoint operation 自体はこれより若干安い約2.9ms 程度 — `FULL` は
+各 commit で既に fsync 済みのため checkpoint 時に追加で fsync すべき
+差分が少ないことと整合する）が、これは全 hot-path write ではなく
+少数の checkpoint 呼び出しが負担するコストであり、observed worst case
+（最大約6.8ms）でも 200ms の busy_timeout budget に十分収まる。
 
 ### 採用した決定
 
 **`synchronous=NORMAL` を primary hot-path 設定として採用する**
 （`task_context_db.DEFAULT_SYNCHRONOUS = "NORMAL"`）。これは Issue 自身が
 "first candidate" として位置づけていることと整合する。上記の実測 evidence
-がこれを支持する: typical-case latency の win（本 host で約260倍）は 2 回の
-実測 run を通じて大きく一貫しており、worst-case の checkpoint-boundary tail
-latency も一桁 ms 台の小さな値に留まり（multi-second hot-path blocking には
-程遠い）、
+がこれを支持する: typical-case latency の win（本 host で約400倍前後）は
+2 回の実測 run を通じて大きく一貫しており、worst-case の checkpoint
+operation latency も一桁 ms 台の小さな値に留まり（multi-second hot-path
+blocking には程遠い）、
 [SQLite 自身のドキュメント](https://www.sqlite.org/pragma.html#pragma_synchronous)
 は WAL mode における `synchronous=NORMAL` がアプリケーションクラッシュに
 対しては安全であり、リスクがあるのは *power loss/OS crash*（application
@@ -476,35 +587,45 @@ bug ではない）時に最新の transaction を失う可能性のみだと述
 必要な将来の specific write path のために明示的な override として利用
 可能（`task_context_db.connect(..., synchronous="FULL")`）のままとする。
 
-### 既知の non-blocking limitation
+### DB boundary での corruption typed translation（fix_delta finding 6）
 
 corruption が typed `CorruptDatabaseError`（silent reset ではなく）として
 必ず検出されるのは `connect()`/`migrate()` が走るタイミング（`task-contextctl`
 の各 invocation は常に open+migrate を経て dispatch するため、これは毎回
-発生する）である。既に current な `user_version` にある DB が最後の
-successful open の *後に* corrupt し、かつそれが `PRAGMA
-journal_mode=WAL`/`PRAGMA user_version` の read に触れない形で発生した
-場合、hot-path の毎 open で `PRAGMA integrity_check`（full-DB scan であり
-hot-path のコストとして許容できない）を eager に走らせるわけではないため
-proactive には検出されない — そのような corruption は、破損した page に
-最初に触れた service-layer の read/write から生の
-`sqlite3.DatabaseError` として表出し、CLI の generic exception handler に
-捕捉され `CORRUPT_DATABASE` ではなく `INTERNAL_ERROR` として報告される。
-これは AC9 の要求（"silent reset しない"。本実装には reset code path 自体
-が存在しないため、この要求自体は無条件に成立している）より狭いギャップ
-であるが、後続 Issue での改善余地（例: 定期的な integrity check）として
-ここに記録する。
+発生する）だけではない。以前は、既に current な `user_version` にある DB
+（`migrate()` の早期 no-op return が `PRAGMA integrity_check` 自体に到達
+しない経路）が最後の successful open の *後に* corrupt した場合、破損した
+page に最初に触れる service-layer の plain read（例: `get_task`）が生の
+`sqlite3.DatabaseError` を raise し、CLI の generic exception handler に
+捕捉されて `CORRUPT_DATABASE` ではなく `INTERNAL_ERROR` として報告されて
+いた。
+
+これを閉じるため、`task_context_db.execute_readonly()` という DB
+boundary wrapper を導入し、`task_context_service` の全ての read-only
+lookup（`get_task`/`get_activity`/`get_binding`/`get_execution_run`/
+`get_current_location`/`read_projection`/... 等）をこの wrapper 経由に
+した。`write_transaction()` にも同様に、`IntegrityError`（→
+`ConflictError`）でも locked/busy `OperationalError`（→
+`TemporarilyUnavailableError`）でもない `sqlite3.DatabaseError` を
+`CorruptDatabaseError` へ翻訳する分岐を追加した。これにより、hot-path の
+毎 open で `PRAGMA integrity_check`（full-DB scan）を eager に走らせる
+ことなく、実際に corruption に触れた最初の DB 操作が常に typed
+`CorruptDatabaseError` として報告されるようになった
+（`tests/task-context/test_schema_and_migration.py` の
+`test_given_readonly_execute_when_database_error_raised_then_translated_to_corrupt_database_error`、
+`test_given_service_get_task_when_underlying_read_hits_database_error_then_corrupt_database_error_not_internal`、
+`test_given_write_transaction_when_database_error_raised_mid_transaction_then_corrupt_database_error_and_rollback`
+参照）。
 
 ## Repository CI に関する注記（non-blocking）
 
 `tests/task-context/` は本 Issue で追加された新規 pytest target
 directory である。`.github/ci/python-test-plan.json`（`python-test` CI job
-が consume する repository-wide pytest target-set の SSOT）への登録は
-本 Issue の Allowed Paths（`docs/dev/task-context.md`、
-`schemas/task-context/**`、`scripts/task-context/**`、
-`tests/task-context/**` のみ）の **外側** であるため、本 PR では意図的に
-行っていない。Issue 自身の Verification Command である
+が consume する repository-wide pytest target-set の SSOT）の `targets`
+への `tests/task-context/` 登録は、PR #2588 の Owner レビューで承認された
+Scope Delta（Issue #2563 Allowed Paths に明記済み: `targets` への当該行
+追加のみに限定し、他の `targets`/`ignore`/`deselect`/xdist 設定は変更
+しない）として実施済みである。Issue 自身の Verification Command である
 `uv run --locked pytest tests/task-context -q` はローカルで pass し、この
-登録には依存しない。repository-wide CI plan への follow-up 登録が必要か
-どうかは reviewer/maintainer の判断に委ね、必要であれば当該ファイルのみを
-touch する trivial な follow-up PR で対応する。
+登録はその CI 常設ゲート化（`python-test` job の
+`uncovered_changed_test_files` gate 対応）を目的とする。

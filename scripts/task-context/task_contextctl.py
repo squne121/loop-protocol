@@ -52,7 +52,14 @@ EXIT_CODE_BY_ERROR_CODE = {
 }
 
 
-def _read_stdin_payload() -> dict:
+def _read_stdin_object() -> dict:
+    """Read stdin as a raw parsed JSON object (or ``{}`` if stdin is empty).
+
+    This is the *envelope* object -- it is validated/unwrapped separately by
+    ``envelope.validate_and_unwrap_request`` in ``main()`` (fix_delta finding
+    1). Renamed from the former ``_read_stdin_payload`` because it no longer
+    returns an operation payload directly.
+    """
     raw = sys.stdin.read()
     if not raw.strip():
         return {}
@@ -121,7 +128,6 @@ def _dispatch(operation: str, payload: dict) -> dict:
             run = service.start_execution_run(
                 conn,
                 run_kind="runtime_smoke",
-                is_managed=False,
                 task_id=task["id"],
                 activity_id=activity["id"],
                 binding_id=binding["id"],
@@ -172,15 +178,12 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    try:
-        payload = _read_stdin_payload()
-    except errors.ValidationError as exc:
-        result = envelope.build_error_result(exc.code, exc.message)
-        print(json.dumps(result), file=sys.stdout)
-        return exc.exit_code
-
+    # The CLI subcommand/argv shape deterministically decides the operation
+    # *before* stdin is even read -- this is the "argv から決定される
+    # operation" that the request envelope's `operation` field (if a full
+    # envelope is provided on stdin) is validated against below (fix_delta
+    # finding 1).
     if args.command == "hook":
-        payload.setdefault("event", args.event)
         operation = "hook"
     elif args.command == "signal" and args.signal_command == "apply":
         operation = "signal_apply"
@@ -194,6 +197,25 @@ def main(argv: list[str] | None = None) -> int:
         result = envelope.build_error_result("VALIDATION_ERROR", "unrecognized command")
         print(json.dumps(result), file=sys.stdout)
         return errors.ValidationError.exit_code
+
+    try:
+        stdin_obj = _read_stdin_object()
+        # Empty stdin (`{}` from a completely empty pipe/no input) means "no
+        # request envelope provided" -- some operations (e.g. `smoke seed`)
+        # need no payload at all. Any *non-empty* stdin content, however,
+        # MUST be a fully valid request envelope: this is where the frozen
+        # `{schema_version, operation, request_id, payload}` shape is
+        # actually enforced end-to-end against the real CLI (fix_delta
+        # finding 1) -- unwrapping `payload` as the operation-specific
+        # input and rejecting mismatched/missing/extra top-level fields.
+        payload = envelope.validate_and_unwrap_request(stdin_obj, expected_operation=operation) if stdin_obj else {}
+    except errors.ValidationError as exc:
+        result = envelope.build_error_result(exc.code, exc.message, exc.details)
+        print(json.dumps(result), file=sys.stdout)
+        return exc.exit_code
+
+    if args.command == "hook":
+        payload.setdefault("event", args.event)
 
     result, exit_code = _run(operation, payload)
     print(json.dumps(result), file=sys.stdout)

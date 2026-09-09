@@ -13,6 +13,21 @@ Ordering invariant (documented in docs/dev/task-context.md
 
 Only *after* all of the above does any caller open a ``BEGIN`` /
 ``BEGIN IMMEDIATE`` transaction (e.g. migrations, or a service-layer write).
+
+Waiting-budget ownership (fix_delta finding 5): ``sqlite3.connect(...,
+timeout=busy_timeout_ms / 1000.0)`` registers SQLite's own native busy
+handler (equivalent to ``PRAGMA busy_timeout``) for this connection *before*
+any of the pragmas below run, so every one of them -- including the
+``journal_mode=WAL`` mode-transition, which itself needs a momentary
+exclusive lock and can raise a retryable "database is locked"
+``OperationalError`` under heavy concurrent first-open contention (AC11) --
+is already covered by that single SQLite-native waiting budget. Connection
+setup therefore does NOT run its own Python-level sleep/retry loop on top of
+it (a prior version did, stacking a second ~5x-amplified budget on top of
+the connection-level one and turning a ~200ms hot-path bound into
+multi-second worst-case blocking). ``_configure_pragma`` below only
+translates the *outcome* of that single wait into a typed exception; it
+never adds additional waiting of its own.
 """
 
 from __future__ import annotations
@@ -72,47 +87,77 @@ def connect(
         ) from exc
 
     conn.row_factory = sqlite3.Row
-    # Each pragma below goes through a small manual lock-retry wrapper: the
-    # `journal_mode=WAL` mode-transition on a brand-new file can itself
-    # raise a retryable "database is locked"/"database is busy"
-    # OperationalError under heavy concurrent first-open contention (e.g.
-    # many processes racing to open the same fresh DB file, AC11), which is
-    # NOT reliably absorbed by the connection-level `PRAGMA busy_timeout`
-    # alone since it fires before that pragma has necessarily taken effect
-    # for this specific mode-change operation. Genuine corruption
-    # ("file is not a database") is a *non-retryable* `sqlite3.DatabaseError`
-    # and is translated to the typed `CorruptDatabaseError` (AC9) --
-    # `sqlite3.OperationalError` is a subtype of `sqlite3.DatabaseError`, so
-    # it is always checked first.
-    _execute_with_lock_retry(conn, f"PRAGMA busy_timeout={int(busy_timeout_ms)}", busy_timeout_ms)
-    _execute_with_lock_retry(conn, "PRAGMA foreign_keys=ON", busy_timeout_ms)
-    _execute_with_lock_retry(conn, "PRAGMA journal_mode=WAL", busy_timeout_ms)
-    _execute_with_lock_retry(conn, f"PRAGMA synchronous={synchronous}", busy_timeout_ms)
+    # Single waiting-budget owner (fix_delta finding 5): `timeout=` above
+    # already registered SQLite's native busy handler for this connection,
+    # so each pragma below is executed exactly once -- no additional
+    # Python-level sleep/retry loop is stacked on top of it. `_configure_pragma`
+    # only translates the outcome (success / still-locked-after-budget /
+    # genuine corruption) into the appropriate typed exception.
+    _configure_pragma(conn, f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+    _configure_pragma(conn, "PRAGMA foreign_keys=ON")
+    _configure_pragma(conn, "PRAGMA journal_mode=WAL")
+    _configure_pragma(conn, f"PRAGMA synchronous={synchronous}")
     return conn
 
 
-def _execute_with_lock_retry(conn: sqlite3.Connection, sql: str, busy_timeout_ms: int) -> None:
-    deadline = time.monotonic() + (max(busy_timeout_ms, 200) / 1000.0) * 5
-    while True:
-        try:
-            conn.execute(sql)
-            return
-        except sqlite3.OperationalError as exc:
-            if ("locked" in str(exc).lower() or "busy" in str(exc).lower()) and time.monotonic() < deadline:
-                time.sleep(0.01)
-                continue
+def _configure_pragma(conn: sqlite3.Connection, sql: str) -> None:
+    """Run a one-off connection-setup pragma, translating its *outcome* into
+    a typed exception. Does not retry/sleep on its own -- the connection's
+    own ``timeout=``/``PRAGMA busy_timeout`` (set once, above) is the single
+    owner of the waiting budget for lock contention (fix_delta finding 5).
+    Genuine corruption (``sqlite3.DatabaseError`` that is not a
+    locked/busy ``OperationalError``, e.g. "file is not a database") is
+    never confused with transient contention and is translated immediately
+    to the typed ``CorruptDatabaseError`` (AC9). ``sqlite3.OperationalError``
+    is a subtype of ``sqlite3.DatabaseError``, so it is always checked
+    first.
+    """
+    try:
+        conn.execute(sql)
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
             raise errors.TemporarilyUnavailableError(
                 f"could not run {sql!r} within the busy_timeout budget while connecting"
             ) from exc
-        except sqlite3.DatabaseError as exc:
-            raise errors.CorruptDatabaseError(
-                f"failed to configure Task Context DB connection ({sql!r}): {exc}"
-            ) from exc
+        raise errors.CorruptDatabaseError(
+            f"unexpected SQLite operational error while configuring connection ({sql!r}): {exc}"
+        ) from exc
+    except sqlite3.DatabaseError as exc:
+        raise errors.CorruptDatabaseError(
+            f"failed to configure Task Context DB connection ({sql!r}): {exc}"
+        ) from exc
 
 
 def integrity_check(conn: sqlite3.Connection) -> bool:
     row = conn.execute("PRAGMA integrity_check").fetchone()
     return bool(row) and row[0] == "ok"
+
+
+def execute_readonly(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+    """DB-boundary wrapper for read-only queries executed *outside* an
+    explicit ``write_transaction`` block (e.g. the ``get_*``/``read_*``
+    lookups in ``task_context_service``).
+
+    fix_delta finding 6: previously, a ``sqlite3.DatabaseError`` raised by a
+    plain ``conn.execute(...)`` read call (e.g. "database disk image is
+    malformed" surfacing on a DB that is already at
+    ``CURRENT_SCHEMA_VERSION`` -- so ``migrate()``'s cheap version-match
+    early-return never reached its own ``PRAGMA integrity_check``) had no
+    typed-translation boundary to pass through and leaked as a raw
+    ``sqlite3.DatabaseError`` up to the CLI's generic exception handler,
+    which reports it as ``INTERNAL_ERROR`` instead of the more actionable
+    ``CORRUPT_DATABASE`` (AC9). Routing every read through this helper
+    closes that gap without requiring an eager ``PRAGMA integrity_check`` on
+    every hot-path open.
+    """
+    try:
+        return conn.execute(sql, params)
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            raise errors.TemporarilyUnavailableError(f"read blocked within the busy_timeout budget: {exc}") from exc
+        raise errors.CorruptDatabaseError(f"unexpected SQLite operational error on read: {exc}") from exc
+    except sqlite3.DatabaseError as exc:
+        raise errors.CorruptDatabaseError(f"SQLite database error on read (possible corruption): {exc}") from exc
 
 
 @contextmanager
@@ -147,6 +192,17 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
                 waited_seconds=time.monotonic() - started,
             ) from exc
         raise
+    except sqlite3.DatabaseError as exc:
+        # fix_delta finding 6: a genuine corruption-class error
+        # (`sqlite3.DatabaseError` that is neither the `IntegrityError`
+        # constraint-violation case above nor a locked/busy
+        # `OperationalError`) surfacing mid-transaction must also be typed
+        # as `CorruptDatabaseError` rather than leaking as a raw sqlite3
+        # exception up to the CLI's generic catch-all (AC9).
+        conn.execute("ROLLBACK")
+        raise errors.CorruptDatabaseError(
+            f"SQLite database error mid-transaction (possible corruption): {exc}"
+        ) from exc
     except Exception:
         conn.execute("ROLLBACK")
         raise

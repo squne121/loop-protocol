@@ -13,8 +13,16 @@ them. Future consumer children (#2564/#2565/#2568/...) add fields inside
 
 from __future__ import annotations
 
+import os
+import sys
 import uuid
 from typing import Any
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+import task_context_errors as errors  # noqa: E402
 
 REQUEST_SCHEMA_VERSION = "task-context-request/v1"
 RESULT_SCHEMA_VERSION = "task-context-result/v1"
@@ -66,6 +74,76 @@ def is_valid_request_envelope(obj: Any) -> bool:
         and isinstance(obj.get("request_id"), str)
         and isinstance(obj.get("payload"), dict)
     )
+
+
+def validate_and_unwrap_request(obj: Any, *, expected_operation: str) -> dict[str, Any]:
+    """Strictly validate a top-level request envelope object against the
+    frozen shape and unwrap its ``payload`` (fix_delta finding 1 --
+    ``task-contextctl`` must actually validate/unwrap the request envelope
+    it claims to freeze, instead of treating raw stdin JSON as the operation
+    payload directly).
+
+    Unlike ``is_valid_request_envelope`` (a loose boolean shape check used
+    by envelope-builder self-tests), this raises a typed
+    ``errors.ValidationError`` that identifies exactly what is wrong, and
+    additionally rejects:
+
+    - any top-level field not in ``REQUEST_ENVELOPE_KEYS`` (schema
+      ``additionalProperties: false``),
+    - a missing required top-level field,
+    - a ``schema_version`` other than ``REQUEST_SCHEMA_VERSION``,
+    - a non-string/empty ``operation`` or ``request_id``,
+    - a non-object ``payload``,
+    - an ``operation`` that does not match ``expected_operation`` (the
+      operation the CLI already deterministically derived from argv/the
+      subcommand invoked).
+
+    Returns the envelope's ``payload`` dict on success -- this becomes the
+    operation-specific input passed to ``task_contextctl._dispatch``.
+    """
+    if not isinstance(obj, dict):
+        raise errors.ValidationError("request envelope must be a JSON object (mapping)")
+
+    extra = set(obj.keys()) - REQUEST_ENVELOPE_KEYS
+    if extra:
+        raise errors.ValidationError(
+            f"request envelope has unexpected top-level field(s): {sorted(extra)}", extra_fields=sorted(extra)
+        )
+
+    missing = REQUEST_ENVELOPE_KEYS - set(obj.keys())
+    if missing:
+        raise errors.ValidationError(
+            f"request envelope is missing required top-level field(s): {sorted(missing)}",
+            missing_fields=sorted(missing),
+        )
+
+    schema_version = obj.get("schema_version")
+    if schema_version != REQUEST_SCHEMA_VERSION:
+        raise errors.ValidationError(
+            f"request envelope schema_version must be {REQUEST_SCHEMA_VERSION!r}, got {schema_version!r}"
+        )
+
+    operation = obj.get("operation")
+    if not isinstance(operation, str) or not operation:
+        raise errors.ValidationError("request envelope 'operation' must be a non-empty string")
+
+    request_id = obj.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise errors.ValidationError("request envelope 'request_id' must be a non-empty string")
+
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        raise errors.ValidationError("request envelope 'payload' must be a JSON object (mapping)")
+
+    if operation != expected_operation:
+        raise errors.ValidationError(
+            f"request envelope operation {operation!r} does not match the operation "
+            f"{expected_operation!r} determined from the CLI command invoked",
+            envelope_operation=operation,
+            expected_operation=expected_operation,
+        )
+
+    return payload
 
 
 def is_valid_result_envelope(obj: Any) -> bool:
