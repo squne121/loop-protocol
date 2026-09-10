@@ -73,53 +73,44 @@ def _record(
     )
 
 
-def _bump_projection(conn, binding_id: str | None) -> None:
+def _bump_projection(conn, binding_id: str | None) -> dict[str, Any]:
     """Enqueue a fresh desired-revision marker for this Binding's Herdr
-    projection (coalescing -- `service.enqueue_projection` only advances,
-    never regresses). The actual Herdr I/O happens later, out-of-band, in
-    the async ``herdr_projection`` adapter consumer -- never synchronously
-    inside a hook's hot path (Outcome: "projection を UserPromptSubmit hot
-    path へ同期的に抱え込まない")."""
+    projection (coalescing -- ``enqueue_projection`` only advances, never
+    regresses), and report the resulting key/revision so the caller can pass
+    them back to the adapter.
+
+    The actual Herdr I/O happens out-of-band, in a projection worker the
+    adapter starts **after** this mutation has committed (fix_delta 2's
+    causal ``commit -> project`` ordering) -- never synchronously inside a
+    hook's hot path (Outcome: "projection を UserPromptSubmit hot path へ
+    同期的に抱え込まない")."""
     if not binding_id:
-        return
+        return {}
     projection_key = f"tab_binding:{binding_id}"
     current = service.read_projection(conn, projection_key)
     next_revision = (current["desired_revision"] + 1) if current else 1
     service.enqueue_projection(conn, projection_key, next_revision)
+    return {"projection_key": projection_key, "projection_revision": next_revision}
 
 
-def _ensure_active_activity(conn, task_id: str, *, kind: str = "native_operator") -> str:
-    existing = service.get_active_activity_for_task(conn, task_id)
-    if existing is not None:
-        return existing["id"]
-    activity = service.transition_activity(conn, task_id, kind=kind)
-    return activity["id"]
+_LOCATION_PAYLOAD_KEYS = ("cwd", "worktree", "branch")
 
 
-def _resolve_or_create_task_for_target(conn, repo: str, ref_kind: str, ref_number: int) -> str:
-    live = service.find_live_claim(conn, repo, ref_kind, ref_number)
-    if live is not None:
-        return live["task_id"]
-    task = service.create_task(conn, title=f"{repo}#{ref_number}")
-    result = service.claim_task_ref(conn, task["id"], repo, ref_kind, ref_number)
-    if result["status"] == "conflict":
-        # Race: another Task claimed this ref between the read above and our
-        # attempt. The loser readback tells us the actual winner.
-        return result["winning_task_id"]
-    return task["id"]
+def _location_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Extract the display-only RuntimeLocation observation fields
+    (fix_delta 7). These are recorded on ``runtime_locations`` for the
+    statusLine only -- they never take part in Task identity, rebind or
+    block decisions (AC7)."""
+    return {key: payload.get(key) or None for key in _LOCATION_PAYLOAD_KEYS}
 
 
-def _attach_binding_run(conn, binding_id: str, task_id: str, activity_id: str, execution_run_id: str | None) -> None:
-    if execution_run_id is not None:
-        service.attach_execution_run(conn, execution_run_id, task_id=task_id, activity_id=activity_id)
-        return
-    # No open managed run yet on this binding (should not normally happen --
-    # SessionStart always starts one -- but degrade gracefully instead of
-    # raising if it does).
-    run = service.start_execution_run(
-        conn, run_kind="native_operator", task_id=task_id, activity_id=activity_id, binding_id=binding_id
-    )
-    service.set_binding_session(conn, binding_id, run["claude_session_id"], execution_run_id=run["id"])
+def _projection_fields(result: dict[str, Any]) -> dict[str, Any]:
+    """Extract the projection key/revision a coarse service operation
+    reports, in the shape the adapter expects on the hook result."""
+    key = result.get("projection_key")
+    if not key:
+        return {}
+    return {"projection_key": key, "projection_revision": result.get("projection_revision")}
 
 
 # ---------------------------------------------------------------------------
@@ -157,10 +148,12 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
     if source in _RECOVERABLE_SOURCES:
         existing_binding = service.get_binding_by_current_location(conn, herdr_locator)
 
+    location_fields = _location_fields(payload)
+
     if existing_binding is None:
         binding = service.create_binding(conn)
         binding_id = binding["id"]
-        service.relocate_binding(conn, binding_id, herdr_locator)
+        service.relocate_binding(conn, binding_id, herdr_locator, **location_fields)
         run = service.start_execution_run(conn, run_kind="native_operator", binding_id=binding_id)
         if claude_session_id:
             _set_session_on_run(conn, binding_id, run["id"], claude_session_id)
@@ -171,8 +164,13 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
             execution_run_id=run["id"],
             metadata=_event_metadata("startup_new_binding", "ok"),
         )
-        _bump_projection(conn, binding_id)
-        return {"decision": "pass", "reason_code": f"{source}_new_binding", "binding_id": binding_id}
+        projection = _bump_projection(conn, binding_id)
+        return {
+            "decision": "pass",
+            "reason_code": f"{source}_new_binding",
+            "binding_id": binding_id,
+            **projection,
+        }
 
     binding_id = existing_binding["id"]
 
@@ -198,7 +196,7 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
     run = service.start_execution_run(
         conn, run_kind="native_operator", task_id=task_id, activity_id=activity_id, binding_id=binding_id
     )
-    service.relocate_binding(conn, binding_id, herdr_locator)
+    service.relocate_binding(conn, binding_id, herdr_locator, **location_fields)
     service.set_binding_health(conn, binding_id, "ACTIVE")
     if claude_session_id:
         _set_session_on_run(conn, binding_id, run["id"], claude_session_id)
@@ -211,12 +209,13 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         execution_run_id=run["id"],
         metadata=_event_metadata(f"{source}_restored_binding", "ok"),
     )
-    _bump_projection(conn, binding_id)
+    projection = _bump_projection(conn, binding_id)
     return {
         "decision": "pass",
         "reason_code": f"{source}_restored_binding",
         "binding_id": binding_id,
         "task_id": task_id,
+        **projection,
     }
 
 
@@ -284,21 +283,22 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
         return {"decision": "pass", "reason_code": "malformed_target_payload"}
 
     if current_task_id is None:
-        task_id = _resolve_or_create_task_for_target(conn, target_repo, target_ref_kind, target_ref_number)
-        activity_id = _ensure_active_activity(conn, task_id)
-        _attach_binding_run(conn, binding_id, task_id, activity_id, current_run_id)
-        _record(
+        bound = service.bind_target_to_binding(
             conn,
-            event_type="hook:UserPromptSubmit",
-            task_id=task_id,
-            activity_id=activity_id,
             binding_id=binding_id,
             execution_run_id=current_run_id,
+            repo=target_repo,
+            ref_kind=target_ref_kind,
+            ref_number=target_ref_number,
             reason_code="autobind",
-            status="pass",
         )
-        _bump_projection(conn, binding_id)
-        return {"decision": "pass", "reason_code": "autobind", "task_id": task_id, "activity_id": activity_id}
+        return {
+            "decision": "pass",
+            "reason_code": "autobind",
+            "task_id": bound["task_id"],
+            "activity_id": bound["activity_id"],
+            **_projection_fields(bound),
+        }
 
     live_claim = service.find_live_claim(conn, target_repo, target_ref_kind, target_ref_number)
     if live_claim is not None and live_claim["task_id"] == current_task_id:
@@ -311,43 +311,44 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
     if refs_count == 0 and live_claim is None:
         # AC4: ACTIVE Task with 0 live GitHub refs is provisional/absorbent
         # -- the first high-confidence primary GitHub target claims it
-        # rather than being treated as a different-Task rebind.
-        service.claim_task_ref(conn, current_task_id, target_repo, target_ref_kind, target_ref_number)
-        _record(
+        # rather than being treated as a different-Task rebind. Atomic
+        # (fix_delta 3): claim + Activity + run attach + event + outbox all
+        # commit together, or not at all.
+        absorbed = service.absorb_ref_into_task(
             conn,
-            event_type="hook:UserPromptSubmit",
-            task_id=current_task_id,
-            activity_id=current_activity_id,
             binding_id=binding_id,
             execution_run_id=current_run_id,
+            task_id=current_task_id,
+            repo=target_repo,
+            ref_kind=target_ref_kind,
+            ref_number=target_ref_number,
             reason_code="provisional_absorb",
-            status="pass",
         )
-        _bump_projection(conn, binding_id)
-        return {"decision": "pass", "reason_code": "provisional_absorb", "task_id": current_task_id}
+        return {
+            "decision": "pass",
+            "reason_code": "provisional_absorb",
+            "task_id": absorbed["task_id"],
+            **_projection_fields(absorbed),
+        }
 
     if activity_is_terminal_or_missing:
         # AC5: terminal Activity -> legal same-Task advance / different-Task
         # rebind via a normal prompt (no /task needed).
-        task_id = (
-            live_claim["task_id"]
-            if live_claim is not None
-            else _resolve_or_create_task_for_target(conn, target_repo, target_ref_kind, target_ref_number)
-        )
-        activity_id = _ensure_active_activity(conn, task_id)
-        _attach_binding_run(conn, binding_id, task_id, activity_id, current_run_id)
-        _record(
+        advanced = service.bind_target_to_binding(
             conn,
-            event_type="hook:UserPromptSubmit",
-            task_id=task_id,
-            activity_id=activity_id,
             binding_id=binding_id,
             execution_run_id=current_run_id,
+            repo=target_repo,
+            ref_kind=target_ref_kind,
+            ref_number=target_ref_number,
             reason_code="terminal_advance_or_rebind",
-            status="pass",
         )
-        _bump_projection(conn, binding_id)
-        return {"decision": "pass", "reason_code": "terminal_advance_or_rebind", "task_id": task_id}
+        return {
+            "decision": "pass",
+            "reason_code": "terminal_advance_or_rebind",
+            "task_id": advanced["task_id"],
+            **_projection_fields(advanced),
+        }
 
     # AC4: ACTIVE current Activity + different high-confidence primary
     # target -> block before Claude processes the prompt.
@@ -376,34 +377,48 @@ def _apply_slash_task_rebind(
     it always supersedes the normal primary-target guard, atomically, in a
     single UserPromptSubmit adapter invocation, regardless of hook
     registration/execution order relative to other handlers (AC13:
-    commit-on-submission, no rollback on a sibling hook's later block)."""
+    commit-on-submission, no rollback on a sibling hook's later block).
+
+    "Atomic" here is literal (fix_delta 3): the whole
+    resolve-or-create-Task -> claim ref -> ensure ACTIVE Activity -> attach
+    ExecutionRun -> append event -> bump projection outbox sequence runs
+    inside a single ``BEGIN IMMEDIATE`` in the service layer, so a `/task`
+    rebind can never be half-applied (and a lost ref-claim race can never
+    leave an orphan OPEN Task behind)."""
+    del current_task_id, current_activity_id  # superseded unconditionally by `/task`
     target_repo = payload.get("slash_task_target_repo")
     target_ref_kind = payload.get("slash_task_target_ref_kind")
     target_ref_number = payload.get("slash_task_target_ref_number")
     ad_hoc_title = payload.get("slash_task_ad_hoc_title")
 
     if target_repo and target_ref_kind and target_ref_number is not None:
-        task_id = _resolve_or_create_task_for_target(conn, target_repo, target_ref_kind, target_ref_number)
+        rebound = service.bind_target_to_binding(
+            conn,
+            binding_id=binding_id,
+            execution_run_id=current_run_id,
+            repo=target_repo,
+            ref_kind=target_ref_kind,
+            ref_number=target_ref_number,
+            reason_code="slash_task_rebind",
+        )
     elif ad_hoc_title:
-        task = service.create_task(conn, title=ad_hoc_title)
-        task_id = task["id"]
+        rebound = service.bind_ad_hoc_task_to_binding(
+            conn,
+            binding_id=binding_id,
+            execution_run_id=current_run_id,
+            title=ad_hoc_title,
+            reason_code="slash_task_rebind",
+        )
     else:
         return {"decision": "block", "reason_code": "slash_task_missing_target"}
 
-    activity_id = _ensure_active_activity(conn, task_id)
-    _attach_binding_run(conn, binding_id, task_id, activity_id, current_run_id)
-    _record(
-        conn,
-        event_type="hook:UserPromptSubmit",
-        task_id=task_id,
-        activity_id=activity_id,
-        binding_id=binding_id,
-        execution_run_id=current_run_id,
-        reason_code="slash_task_rebind",
-        status="pass",
-    )
-    _bump_projection(conn, binding_id)
-    return {"decision": "pass", "reason_code": "slash_task_rebind", "task_id": task_id, "activity_id": activity_id}
+    return {
+        "decision": "pass",
+        "reason_code": "slash_task_rebind",
+        "task_id": rebound["task_id"],
+        "activity_id": rebound["activity_id"],
+        **_projection_fields(rebound),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +427,13 @@ def _apply_slash_task_rebind(
 
 
 def on_cwd_changed(conn, payload: dict[str, Any]) -> dict[str, Any]:
+    """AC7 + fix_delta 7: record cwd / worktree / branch as a mutable
+    ``RuntimeLocation`` **observation** alongside the Herdr locator, so the
+    statusLine can show which worktree/branch this operator is in.
+
+    This is display-only. `CwdChanged` never switches Task/Activity, never
+    rebinds and never blocks -- promoting worktree/branch to Task identity is
+    an explicit Issue #2564 Stop Condition."""
     claude_session_id = payload.get("claude_session_id")
     herdr_locator = payload.get("herdr_locator")
     if not claude_session_id or not herdr_locator:
@@ -421,14 +443,17 @@ def on_cwd_changed(conn, payload: dict[str, Any]) -> dict[str, Any]:
     except errors.NotFoundError:
         return {"decision": "pass", "reason_code": "no_binding_for_session"}
     binding_id = binding["id"]
+    location_fields = _location_fields(payload)
     current_location = service.get_current_location(conn, binding_id)
     if current_location is not None and current_location["herdr_locator"] == herdr_locator:
-        return {"decision": "pass", "reason_code": "location_unchanged"}
-    # AC7: cwd/worktree change updates RuntimeLocation only -- never a
-    # Task/Activity switch or block condition.
-    service.relocate_binding(conn, binding_id, herdr_locator)
-    _bump_projection(conn, binding_id)
-    return {"decision": "pass", "reason_code": "relocated", "binding_id": binding_id}
+        unchanged = all(
+            current_location.get(key) == location_fields[key] for key in _LOCATION_PAYLOAD_KEYS
+        )
+        if unchanged:
+            return {"decision": "pass", "reason_code": "location_unchanged"}
+    service.relocate_binding(conn, binding_id, herdr_locator, **location_fields)
+    projection = _bump_projection(conn, binding_id)
+    return {"decision": "pass", "reason_code": "relocated", "binding_id": binding_id, **projection}
 
 
 # ---------------------------------------------------------------------------
@@ -436,19 +461,29 @@ def on_cwd_changed(conn, payload: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _parent_task_activity_for_session(conn, claude_session_id: str | None):
+    if not claude_session_id:
+        return None, None
+    try:
+        binding = service.get_binding_by_current_session(conn, claude_session_id)
+    except errors.NotFoundError:
+        return None, None
+    task_id, activity_id, _ = service.get_current_task_activity_for_binding(conn, binding["id"])
+    return task_id, activity_id
+
+
 def on_subagent_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
+    """AC8 (+ fix_delta 5): SubAgent runs roll up under the parent
+    Task/Activity as a non-managed ExecutionRun -- never given their own
+    TabBinding -- and record the Claude Code ``agent_id`` so the matching
+    ``SubagentStop`` can end this exact run even when sibling SubAgents are
+    running concurrently."""
     claude_session_id = payload.get("claude_session_id")
-    task_id = None
-    activity_id = None
-    if claude_session_id:
-        try:
-            binding = service.get_binding_by_current_session(conn, claude_session_id)
-            task_id, activity_id, _ = service.get_current_task_activity_for_binding(conn, binding["id"])
-        except errors.NotFoundError:
-            pass
-    # AC8: SubAgent runs roll up under the parent Task/Activity as a
-    # non-managed ExecutionRun -- never given its own TabBinding.
-    run = service.start_execution_run(conn, run_kind="subagent", task_id=task_id, activity_id=activity_id)
+    agent_id = payload.get("agent_id") or None
+    task_id, activity_id = _parent_task_activity_for_session(conn, claude_session_id)
+    run = service.start_execution_run(
+        conn, run_kind="subagent", task_id=task_id, activity_id=activity_id, agent_id=agent_id
+    )
     _record(
         conn,
         event_type="hook:SubagentStart",
@@ -459,36 +494,66 @@ def on_subagent_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         reason_code="subagent_started",
         status="pass",
     )
-    return {"decision": "pass", "reason_code": "subagent_started", "execution_run_id": run["id"]}
+    return {
+        "decision": "pass",
+        "reason_code": "subagent_started",
+        "execution_run_id": run["id"],
+        "agent_id": agent_id,
+    }
 
 
 def on_subagent_stop(conn, payload: dict[str, Any]) -> dict[str, Any]:
+    """fix_delta 5: end the ExecutionRun belonging to the *exact*
+    ``agent_id`` that stopped.
+
+    Previously this ended ``open_subagent_runs[0]``, so with two concurrent
+    SubAgents (A started, B started, A stops) the stop for A could end B's
+    run. When Claude Code does supply ``agent_id`` we now resolve the run
+    exactly; when it does not, we only close an unambiguous single open run
+    and otherwise close nothing rather than guessing."""
     claude_session_id = payload.get("claude_session_id")
-    task_id = None
-    activity_id = None
-    if claude_session_id:
-        try:
-            binding = service.get_binding_by_current_session(conn, claude_session_id)
-            task_id, activity_id, _ = service.get_current_task_activity_for_binding(conn, binding["id"])
-        except errors.NotFoundError:
-            pass
-    open_subagent_runs = service.find_open_execution_runs(
-        conn, task_id=task_id, activity_id=activity_id, run_kind="subagent"
-    )
-    if not open_subagent_runs:
-        return {"decision": "pass", "reason_code": "no_open_subagent_run"}
-    run = service.end_execution_run(conn, open_subagent_runs[0]["id"])
+    agent_id = payload.get("agent_id") or None
+    task_id, activity_id = _parent_task_activity_for_session(conn, claude_session_id)
+
+    if agent_id is not None:
+        matching = service.find_open_execution_runs(conn, run_kind="subagent", agent_id=agent_id)
+        if not matching:
+            return {"decision": "pass", "reason_code": "no_open_subagent_run_for_agent_id", "agent_id": agent_id}
+        target_run_id = matching[0]["id"]
+    else:
+        open_subagent_runs = service.find_open_execution_runs(
+            conn, task_id=task_id, activity_id=activity_id, run_kind="subagent"
+        )
+        if not open_subagent_runs:
+            return {"decision": "pass", "reason_code": "no_open_subagent_run"}
+        if len(open_subagent_runs) > 1:
+            # Ambiguous without an agent_id -- never guess which concurrent
+            # SubAgent stopped; leave every run open rather than ending the
+            # wrong one. The next stop carrying an agent_id resolves exactly.
+            return {
+                "decision": "pass",
+                "reason_code": "subagent_stop_ambiguous_without_agent_id",
+                "open_subagent_run_count": len(open_subagent_runs),
+            }
+        target_run_id = open_subagent_runs[0]["id"]
+
+    run = service.end_execution_run(conn, target_run_id)
     _record(
         conn,
         event_type="hook:SubagentStop",
-        task_id=task_id,
-        activity_id=activity_id,
+        task_id=run["task_id"],
+        activity_id=run["activity_id"],
         binding_id=None,
         execution_run_id=run["id"],
         reason_code="subagent_ended",
         status="pass",
     )
-    return {"decision": "pass", "reason_code": "subagent_ended", "execution_run_id": run["id"]}
+    return {
+        "decision": "pass",
+        "reason_code": "subagent_ended",
+        "execution_run_id": run["id"],
+        "agent_id": agent_id,
+    }
 
 
 # ---------------------------------------------------------------------------

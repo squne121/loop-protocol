@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""Task Context v1 — async Herdr projection flush hook (Issue #2564).
+"""Task Context v1 — detached Herdr projection flush worker (Issue #2564).
 
-Wired from `.claude/settings.json` as a *separate*, ``"async": true`` hook
-entry (distinct from `hook_entry.py`'s synchronous decision-making
-invocation on the same events) so Herdr I/O never blocks the
-UserPromptSubmit hot path (Outcome: "projection を UserPromptSubmit hot
-path へ同期的に抱え込まない").
+PR #2615 fix_delta 2: this script is **not** wired into
+`.claude/settings.json` as a Claude Code-native ``"async": true`` sibling
+hook entry anymore. A Claude Code ``"async": true`` hook entry for the same
+event runs concurrently with (and can race ahead of) the synchronous
+`hook_entry.py` invocation for that same event -- which means it could try
+to consume `projection_outbox` *before* the very DB mutation transaction
+that enqueued it has committed. Instead, `hook_entry.py` launches this
+script itself as a **detached subprocess** (``subprocess.Popen`` with
+``start_new_session=True``, never waited on) only *after*
+`ctl_client.call_hook` has already returned -- i.e. only after the DB
+mutation transaction it triggered has already committed. That enforces the
+causal ``commit -> project`` ordering `fix_delta 2` requires, while still
+never blocking the hot path (the parent hook process never waits for this
+one to finish).
 
 Flow: `query current` (read the current projection for this session) ->
 `projection flush` (read the outbox marker for this Binding) -> if a marker
@@ -72,9 +81,12 @@ def main(argv: list[str]) -> int:
     tab_label = herdr_projection.build_tab_label(
         data.get("task"), data.get("activity"), data.get("task_refs") or []
     )
-    state_labels = herdr_projection.build_pane_state_labels(data.get("task"), data.get("activity"), binding)
+    pane_tokens = herdr_projection.build_pane_tokens(data.get("task"), data.get("activity"), binding)
+    state_label = herdr_projection.build_pane_state_label(binding)
 
-    projected = herdr_projection.project_to_herdr(pane_id, tab_label, state_labels, revision=revision)
+    projected = herdr_projection.project_to_herdr(
+        pane_id, tab_label, pane_tokens, revision=revision, state_label=state_label
+    )
     if projected:
         # AC10: only ack on success -- a failed projection leaves the
         # outbox marker in place so the next lifecycle event retries it.
