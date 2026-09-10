@@ -1,0 +1,247 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.dev/schemas/session_window_coverage_v1.schema.json",
+  "title": "session_window_coverage/v1",
+  "description": "Issue #2601 (P0): machine-readable session-source coverage and checkpoint-advancement disposition for `run_retrospective.py --since-last-retrospective`. This schema is a NEW, session-window/collector-level vocabulary -- deliberately NOT a reuse of `agent_improvement_candidate_v1.schema.json`'s finding-level `evaluation.source_coverage` (`complete|partial|unavailable|blocked`) nor `latitude_runtime_evidence_v1.schema.json`'s `availability` (`available|unavailable|error`). Both existing vocabularies describe a single already-collected finding/evidence item; this schema describes, for one retrospective run, EVERY required runtime session source's collector-wiring/observation state at once, plus the resulting watermark and checkpoint-advancement decision (AC1). Reused patterns from those two existing schemas (Issue #2601 AC1 requirement): (1) a `reason_code` field that is forced null exactly when its paired status implies success and forced non-null otherwise (mirrors `latitude_runtime_evidence_v1`'s `availability`/`reason_code` forcing invariant), and (2) a closed status enum with an allOf-based forcing invariant (mirrors `agent_improvement_candidate_v1`'s `source_coverage` -> `evaluation_status: indeterminate` forcing invariant). `orchestration.status` (whether the collector/computation pipeline itself completed without a defect) is represented as a field structurally separate from `analysis_completeness` (whether the requested session analysis can be considered complete) -- AC7's core invariant: `orchestration.status: succeeded` is never usable as evidence that `analysis_completeness: complete`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "orchestration",
+    "required_sources",
+    "source_coverage",
+    "analysis_completeness",
+    "cross_runtime_comparison",
+    "watermark",
+    "checkpoint"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "session_window_coverage/v1"
+    },
+    "orchestration": {
+      "description": "AC7: orchestration (pipeline execution) success/failure, kept structurally independent of `analysis_completeness`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason_code"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["succeeded", "failed"]
+        },
+        "reason_code": {
+          "type": ["string", "null"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "succeeded" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": { "reason_code": { "const": null } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "const": "failed" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": { "reason_code": { "type": "string" } },
+            "required": ["reason_code"]
+          }
+        }
+      ]
+    },
+    "required_sources": {
+      "description": "The session sources this run was asked to analyze (e.g. [\"claude_code\", \"claude_gpt\"]). Every entry MUST have a matching key in `source_coverage`.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "source_coverage": {
+      "description": "Per-source-id coverage entry. Keys are not restricted to `required_sources` -- a source present in the collector registry but NOT requested this run (e.g. a caller narrowing `--session-sources`) is represented with status `not_requested` rather than omitted, so a reader can always distinguish 'never asked about this source' from 'asked, but collector unwired' (`required`).",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "reason_code", "selected_session_count"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["required", "observed", "unavailable", "partial", "not_requested"]
+          },
+          "reason_code": {
+            "type": ["string", "null"]
+          },
+          "selected_session_count": {
+            "description": "Never conflates '0 sessions observed' with 'not observed' (AC2/AC4): non-null only when status is `observed` or (best-effort) `partial`; always null for `required`/`unavailable`/`not_requested`.",
+            "type": ["integer", "null"],
+            "minimum": 0
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "status": { "const": "observed" } },
+              "required": ["status"]
+            },
+            "then": {
+              "properties": {
+                "reason_code": { "const": null },
+                "selected_session_count": { "type": "integer" }
+              },
+              "required": ["reason_code", "selected_session_count"]
+            }
+          },
+          {
+            "if": {
+              "properties": { "status": { "enum": ["required", "unavailable", "not_requested"] } },
+              "required": ["status"]
+            },
+            "then": {
+              "properties": {
+                "selected_session_count": { "const": null }
+              },
+              "required": ["selected_session_count"]
+            }
+          },
+          {
+            "if": {
+              "properties": { "status": { "enum": ["required", "unavailable", "partial"] } },
+              "required": ["status"]
+            },
+            "then": {
+              "properties": {
+                "reason_code": { "type": "string" }
+              },
+              "required": ["reason_code"]
+            }
+          },
+          {
+            "if": {
+              "properties": { "status": { "const": "not_requested" } },
+              "required": ["status"]
+            },
+            "then": {
+              "properties": { "reason_code": { "const": null } }
+            }
+          }
+        ]
+      }
+    },
+    "analysis_completeness": {
+      "description": "AC2/AC4/AC7: 'complete' iff every required_sources entry has status 'observed' (a coverage-complete run with selected_session_count 0 for every source is still 'complete' -- AC4). 'unavailable' iff no required source is 'observed' or 'partial' (AC2's false-green scenario: zero collector wiring at all). 'degraded' otherwise (mixed coverage, AC3).",
+      "type": "string",
+      "enum": ["complete", "degraded", "unavailable"]
+    },
+    "cross_runtime_comparison": {
+      "description": "AC3: null only when fewer than 2 sources were required this run (a cross-runtime comparison is not meaningful with a single source). Otherwise always present.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["available", "partial", "unavailable"]
+        },
+        "reason_code": {
+          "type": ["string", "null"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "available" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": { "reason_code": { "const": null } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "status": { "enum": ["partial", "unavailable"] } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": { "reason_code": { "type": "string" } },
+            "required": ["reason_code"]
+          }
+        }
+      ]
+    },
+    "watermark": {
+      "description": "AC5: the from_exclusive/to_inclusive/covered_sources invariant. `covered_sources` names only sources this run actually observed (status 'observed') -- a source that was NOT observed this run is never added to `covered_sources`, so a caller inspecting only the returned watermark can never infer coverage for a source that was not actually confirmed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from_exclusive", "to_inclusive", "covered_sources"],
+      "properties": {
+        "from_exclusive": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "to_inclusive": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "covered_sources": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "checkpoint": {
+      "description": "AC6: durable-checkpoint-advancement disposition. `checkpoint_advanced: true` here is only ever a PROPOSAL -- this schema instance is not itself the durable persistence write (that requires a separately authorized publish channel, mirroring `PublishRequest.authorization_required`); `blocked_no_publish_authorization` makes that distinction explicit rather than reporting a proposal as an already-durable checkpoint (AC6).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkpoint_advanced", "checkpoint_advance_reason"],
+      "properties": {
+        "checkpoint_advanced": {
+          "type": "boolean"
+        },
+        "checkpoint_advance_reason": {
+          "type": "string",
+          "enum": [
+            "first_run_no_prior_state",
+            "advanced_full_coverage",
+            "no_new_sessions_selected",
+            "blocked_missing_required_source",
+            "blocked_no_publish_authorization"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "checkpoint_advanced": { "const": true } },
+            "required": ["checkpoint_advanced"]
+          },
+          "then": {
+            "properties": {
+              "checkpoint_advance_reason": {
+                "enum": ["first_run_no_prior_state", "advanced_full_coverage", "no_new_sessions_selected"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "checkpoint_advanced": { "const": false } },
+            "required": ["checkpoint_advanced"]
+          },
+          "then": {
+            "properties": {
+              "checkpoint_advance_reason": {
+                "enum": ["blocked_missing_required_source", "blocked_no_publish_authorization"]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
