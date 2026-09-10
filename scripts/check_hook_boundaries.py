@@ -37,6 +37,15 @@ SETTINGS_PATH = REPO_ROOT / ".claude" / "settings.json"
 # config topology checks were removed along with the config file.
 _FASTPATH_CLASSIFIER_MODULE_NAME = "pretool_fastpath_classifier"
 
+# Issue #2564 PR #2615 fix_delta 8: interpreter commands whose actual
+# handler identity lives in ``args`` (the first non-flag argument, i.e. the
+# script path), not in ``command`` itself. Claude Code's exec-form hook
+# invocation (``{"command": "python3", "args": ["<script>", ...]}``) is a
+# normally-supported invocation shape, not something to work around by
+# wrapping scripts in shell -- so ``resolve_handler_id`` must generalize to
+# every interpreter this repo's hooks actually use, not just ``node``.
+_INTERPRETER_COMMAND_NAMES = frozenset({"python", "python3", "node", "bash", "sh"})
+
 # ─── manifest 抽出 ────────────────────────────────────────────────────────────
 
 MANIFEST_PATTERN = re.compile(
@@ -87,25 +96,30 @@ def resolve_handler_id(hook: dict[str, Any]) -> str:
     """
     hook dict から handler_id を解決する。
 
-    AC6: command が "node" の場合は args[0] のファイル名を使う
-    （PostToolUse の node ラッパーを取り逃がさない）。
+    AC6 / fix_delta 8: command が interpreter wrapper
+    （python/python3/node/bash/sh のいずれか。フルパスでもファイル名で判定）
+    の場合は args の最初の非フラグ引数（スクリプトパス）のファイル名を使う
+    （PostToolUse の node ラッパー、Task Context の python3 ラッパー双方とも
+    取り逃がさない）。exec-form invocation（``{"command": "python3", "args":
+    [...]}``）は Claude Code 公式にサポートされた形であり、これを shell
+    wrapper 化して checker を満足させる対応はしない（product/runtime 実装
+    を checker に合わせて歪めない）。
 
     handler_id はスクリプトのファイル名（拡張子なし）をそのまま使用する。
     ハイフンを含む場合もファイル名通りに保持する（例: guard-japanese-prose）。
     """
     command: str = hook.get("command", "")
     args: list[str] = hook.get("args", [])
+    command_name = Path(command).name
 
-    # node ラッパーパターン: command が "node" かつ args[0] がスクリプトパス
-    # Path(command).name が "node" であることを確認（フルパスの場合も含む）
-    if Path(command).name == "node":
+    if command_name in _INTERPRETER_COMMAND_NAMES:
         if not args:
-            # B1 guard: node wrapper without args はエラーとして扱う（caller で検出）
-            return "__node_no_args__"
-        script_path = args[0]
-        # パス展開変数を除去してファイル名を取得
-        stem = Path(script_path).stem
-        return stem
+            # B1 guard: interpreter wrapper without args はエラーとして扱う
+            # （caller で検出）。
+            return f"__{command_name}_no_args__"
+        # args[0] をスクリプトパスとみなす（既存の "node" 専用ロジックと
+        # 同一の解決規則を全 interpreter に一般化する）。
+        return Path(args[0]).stem
 
     # 通常パターン: command パスのファイル名（拡張子なし）を handler_id とする
     stem = Path(command).stem
