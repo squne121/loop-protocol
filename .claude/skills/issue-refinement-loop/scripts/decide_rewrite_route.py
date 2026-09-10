@@ -1036,6 +1036,172 @@ def classify_scope_reframe_disposition(
 
 
 # ---------------------------------------------------------------------------
+# #2620: explicit trusted human_review_directive -> issue_editor_required
+# handoff, independent of the STRUCTURED ANCHOR_SCOPE_REFRAME_V1 scope-
+# reframe route above (decide_scope_reframe_contract_route() /
+# classify_scope_reframe_disposition()). Routing priority (do not let this
+# route shadow the existing ones):
+#   1. existing section-bound CONTRACT_PATCH_PLAN_V1 safely derivable ->
+#      existing contract_update route (classify_scope_reframe_disposition
+#      "patch" disposition) -- unaffected.
+#   2. existing approved scope-reframe full-rewrite (empty operations[] via
+#      a STRUCTURED ANCHOR_SCOPE_REFRAME_V1 payload) -> existing
+#      issue_editor_required, owned by decide_scope_reframe_contract_route()
+#      above -- unaffected.
+#   3. an explicit trusted human_review_directive whose derived
+#      operations[] is empty (no safe section-bound patch representation
+#      could be derived) and which is NOT governed by a structured scope
+#      reframe -> issue_editor_required (THIS function; the new #2620
+#      eligibility).
+#   4. ambiguous / untrusted / invalid binding -> existing fail-closed,
+#      writes=0 -- unaffected.
+#
+# Eligibility uses ONLY existing predicates the caller has independently
+# re-derived from scope_signal_delta.classify_scope_delta_authority()
+# against a FRESH SCOPE_DELTA_AUTHORITY_EVIDENCE_V1 -- this function
+# introduces no new classifier/heuristic of its own (#2620 Out of Scope);
+# it only combines already-computed facts into a single routing decision,
+# so there remains exactly one place (this SSOT) that decides the route.
+# `run_refinement_preflight.py` may only call into this function -- it must
+# never re-implement this eligibility combination as an ad-hoc branch of
+# its own (that would duplicate the routing SSOT).
+# ---------------------------------------------------------------------------
+
+REASON_EXPLICIT_TRUSTED_HUMAN_DIRECTIVE_REQUIRES_ISSUE_EDITOR = (
+    "explicit_trusted_human_directive_requires_issue_editor"
+)
+
+_AUTHORITY_CATEGORY_HUMAN_REVIEW_DIRECTIVE = "human_review_directive"
+_DIRECTIVE_CONFIDENCE_EXPLICIT = "explicit"
+_SCOPE_DELTA_AUTHORITY_ROUTE_CONTRACT_UPDATE_REQUIRED = "contract_update_required"
+
+
+@dataclass(frozen=True)
+class HUMAN_REVIEW_DIRECTIVE_EDITOR_ROUTE_STATE_V1:
+    """Input state for decide_human_review_directive_editor_route().
+
+    Every field is a caller-supplied FACT the caller has already
+    independently verified via an EXISTING predicate (#2620 In Scope: no
+    new classifier/heuristic is introduced here). This function performs
+    no re-derivation of trust, confidence, or binding of its own -- it only
+    combines the supplied facts into a single eligibility decision.
+
+    Fields:
+        authority_category: `SCOPE_DELTA_AUTHORITY_EVIDENCE_V1`'s own
+            `authority_category` from a FRESH
+            `classify_scope_delta_authority()` re-classification (never
+            inferred from the pre-built patch plan's mere shape).
+        directive_confidence: the same fresh classification's
+            `directive.confidence`.
+        route_action: the same fresh classification's `route.action` --
+            must be `contract_update_required` (the existing route action
+            for an explicit, boundary-clear human_review_directive).
+        with_human_context: True iff the anchor comment resolves to the
+            trusted operator-selected `with_human_context` lane (existing
+            `_resolve_scope_delta_source_kind() == "issue_comment"`
+            predicate), never inferred from the directive text itself.
+        anchor_binding_ok: True iff the evidence's own `comment_url` /
+            `body_sha256` match THIS transaction's anchor URL / anchor
+            body (fresh binding re-check, closing a TOCTOU window between
+            evidence construction and this routing decision).
+        same_target_ok: True iff the evidence's own `source_issue_number`
+            matches the target Issue this transaction is operating on.
+        operations_empty: True iff the freshly re-derived
+            `contract_patch_plan.operations` is empty -- i.e. no safe
+            section-bound patch representation exists.
+        is_structured_scope_reframe: True iff a STRUCTURED
+            `ANCHOR_SCOPE_REFRAME_V1` scope-reframe decision governs this
+            same transaction -- when True, priority 2
+            (`decide_scope_reframe_contract_route()`) owns the routing
+            decision and this function must never shadow it.
+        reviewer_feedback_url: the canonical anchor comment URL (never the
+            raw `anchor_comment.snapshot` body text) to hand off to
+            issue-editor when this route is selected.
+    """
+
+    authority_category: Optional[str]
+    directive_confidence: Optional[str]
+    route_action: Optional[str]
+    with_human_context: bool
+    anchor_binding_ok: bool
+    same_target_ok: bool
+    operations_empty: bool
+    is_structured_scope_reframe: bool
+    reviewer_feedback_url: Optional[str]
+
+
+@dataclass(frozen=True)
+class HumanReviewDirectiveEditorRouteResult:
+    """Terminal result from decide_human_review_directive_editor_route().
+
+    `route` is `None` when this transaction is not eligible for the #2620
+    handoff (existing routes / fail-closed apply instead) -- callers MUST
+    NOT construct an `issue_editor_required` route themselves when this
+    result's `route` is `None`.
+    """
+
+    route: Optional[str]
+    reason_code: Optional[str]
+    reviewer_feedback_url: Optional[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "human_review_directive_editor_route_result/v1",
+            "route": self.route,
+            "reason_code": self.reason_code,
+            "reviewer_feedback_url": (
+                self.reviewer_feedback_url if self.route == ROUTE_ISSUE_EDITOR_REQUIRED else None
+            ),
+        }
+
+
+def decide_human_review_directive_editor_route(
+    state: HUMAN_REVIEW_DIRECTIVE_EDITOR_ROUTE_STATE_V1,
+) -> HumanReviewDirectiveEditorRouteResult:
+    """#2620 AC1/AC2: route an explicit trusted human_review_directive with
+    no safe section-bound patch representation to `issue_editor_required`,
+    writes=0 -- WITHOUT the caller (`preflight`/`contract_update`) ever
+    executing the controlled transaction itself.
+
+    Returns `route=None` (no opinion; existing behavior applies) unless
+    EVERY one of the following existing-predicate facts holds:
+      - `authority_category == "human_review_directive"`
+      - `directive_confidence == "explicit"`
+      - `route_action == "contract_update_required"`
+      - `with_human_context` is True
+      - `anchor_binding_ok` and `same_target_ok` are True
+      - `operations_empty` is True (no safe section-bound patch exists)
+      - `is_structured_scope_reframe` is False (priority 2 does not own
+        this transaction)
+      - `reviewer_feedback_url` is a non-empty string
+
+    AC3/AC4: any single failing predicate returns `route=None` -- callers
+    MUST treat that as "not eligible for this route" and fall through to
+    the existing fail-closed / no_change behavior; this function never
+    fails open.
+    """
+    eligible = (
+        state.authority_category == _AUTHORITY_CATEGORY_HUMAN_REVIEW_DIRECTIVE
+        and state.directive_confidence == _DIRECTIVE_CONFIDENCE_EXPLICIT
+        and state.route_action == _SCOPE_DELTA_AUTHORITY_ROUTE_CONTRACT_UPDATE_REQUIRED
+        and state.with_human_context is True
+        and state.anchor_binding_ok is True
+        and state.same_target_ok is True
+        and state.operations_empty is True
+        and state.is_structured_scope_reframe is False
+        and isinstance(state.reviewer_feedback_url, str)
+        and bool(state.reviewer_feedback_url)
+    )
+    if not eligible:
+        return HumanReviewDirectiveEditorRouteResult(route=None, reason_code=None, reviewer_feedback_url=None)
+    return HumanReviewDirectiveEditorRouteResult(
+        route=ROUTE_ISSUE_EDITOR_REQUIRED,
+        reason_code=REASON_EXPLICIT_TRUSTED_HUMAN_DIRECTIVE_REQUIRES_ISSUE_EDITOR,
+        reviewer_feedback_url=state.reviewer_feedback_url,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Schema validation (AC8 enforcement at runtime)
 # ---------------------------------------------------------------------------
 

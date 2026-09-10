@@ -193,3 +193,32 @@ planner 入力に渡されたときのみ計算される。`plan_refinement_loop
 同じ判定は `scope_signal_delta.run_trusted_anchor_iteration_zero()`（実際に mutation を試みる
 production 経路）でも `result["rewrite_route"]` として付与され、両者は同じ
 `decide_scope_reframe_contract_route()` を呼び出すので一致する。
+
+## explicit trusted human_review_directive の issue_editor_required 拡張（#2620）
+
+`issue_editor_required` の到達条件は「承認済み scope reframe + empty operations[]」（上記
+`scope_delta_decision.rewrite_route`）に限定されない。構造化 `ANCHOR_SCOPE_REFRAME_V1`
+scope reframe が存在しない（`known_context["scope_delta_decision"]` が `absent`）場合でも、
+既存 section-bound patch derivation で表現不能な explicit trusted `human_review_directive`
+を検出すると、同じ `NEXT_ACTION: issue_editor_required` へ到達する。
+
+このルートは `consume_trusted_anchor_contract_patch_plan()`
+（`run_refinement_preflight.py`）が `known_context["scope_delta_authority_evidence"]`
+（freeform `SCOPE_DELTA_AUTHORITY_EVIDENCE_V1`）を `scope_signal_delta.classify_
+scope_delta_authority()` で fresh に再分類し、`decide_rewrite_route.py` の
+`decide_human_review_directive_editor_route()`（routing SSOT、`HUMAN_REVIEW_DIRECTIVE_
+EDITOR_ROUTE_STATE_V1` を入力とする）へ既存 predicate の組み合わせだけを渡して判定する。
+
+| field | meaning |
+|---|---|
+| `route` | `issue_editor_required`（適格時）または `None`（既存 route/fail-closed のまま） |
+| `reason_code` | `explicit_trusted_human_directive_requires_issue_editor` |
+| `reviewer_feedback_url` | canonical anchor comment URL（raw `anchor_comment.snapshot` 本文ではない） |
+
+適格性は次の既存 predicate の論理積のみで決まる（新しい classifier/heuristic は追加しない）:
+`authority_category == "human_review_directive"`、`directive_confidence == "explicit"`、
+`route_action == "contract_update_required"`、`with_human_context`（trusted operator-selected
+lane）、`anchor_binding_ok` / `same_target_ok`（fresh binding re-check）、`operations_empty`
+（section-bound patch representation が存在しない）、`is_structured_scope_reframe == False`
+（上記の構造化 scope-reframe route を上書きしない）。いずれか一つでも成立しなければ `route: None`
+のまま既存の fail-closed / `no_change` 挙動が維持される。

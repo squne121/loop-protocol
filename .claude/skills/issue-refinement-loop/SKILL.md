@@ -161,8 +161,8 @@ wrapper の出力フィールドを確認する:
 - `ARTIFACT:` — 書き込まれた artifact の key: path 一覧（空の場合は省略）。`STATUS: needs_fix` の場合は `repair_diagnostics` / `repair_candidate_body` も含まれる（Issue #2016 iteration-3 P1-1。`repair_action.diagnostics_artifact` / `.candidate_body_artifact` と同一パスを canonical artifact map からも参照可能にする）
 - `REPAIR_ACTION:` — versioned `repair_action` disposition（Issue #2016。`STATUS: needs_fix` の場合のみ出力される。`disposition: auto_apply_safe` と diagnostics/candidate body artifact パス・original/repaired SHA を含む）
 
-**`NEXT_ACTION: issue_editor_required`（Issue #2048 Scope Delta）:**
-`contract_update.run.with_human_context` 経由の `--consume-contract-patch-plan` 実行が `full_rewrite_required` disposition を検出した場合（承認済み trusted anchor scope reframe に非空の `allowed_path_deltas` があるが、派生 `CONTRACT_PATCH_PLAN_V1.operations[]` が空で section-bound patch を materialize できない場合）に返る。このとき:
+**`NEXT_ACTION: issue_editor_required`（Issue #2048 Scope Delta、Issue #2620 で拡張）:**
+`contract_update.run.with_human_context` 経由の `--consume-contract-patch-plan` 実行が `full_rewrite_required` disposition を検出した場合に返る。到達経路は (1) 承認済み trusted anchor scope reframe（構造化 `ANCHOR_SCOPE_REFRAME_V1`、非空 `allowed_path_deltas`）で派生 `CONTRACT_PATCH_PLAN_V1.operations[]` が空（#2048）、または (2) 構造化 scope reframe が存在せず section-bound patch derivation でも表現不能な explicit trusted `human_review_directive`（`authority_category == human_review_directive` かつ explicit confidence かつ `with_human_context` lane かつ trusted principal かつ same-target/anchor binding valid、#2620）の 2 つ。(2) は `decide_rewrite_route.decide_human_review_directive_editor_route()`（routing SSOT）が判定し、`consume_trusted_anchor_contract_patch_plan()` がその結果だけを consume する（新規 classifier 不使用）。handoff payload は canonical `reviewer_feedback_url`（anchor comment URL）を含み、raw snapshot 本文は転送しない。いずれの経路でも:
 - `contract_update.run.with_human_context` を再実行しない（no-progress な同一 mutation の再試行は禁止）
 - scope-reframe comment を再投稿しない（trusted anchor は既に Issue 上に存在するため新規 comment は不要）
 - 既存の `issue-editor` / `edit-issue` controlled transaction route（Step 4 相当）へ handoff し、Issue 本文の完全な rewrite を行う
@@ -346,7 +346,7 @@ empty operations は無条件に `issue_editor_required` を意味しない。�
 
 `plan_refinement_loop.py` 側にも同じ判定を `decisions.scope_delta_decision.rewrite_route` として echo する opt-in 経路（`known_context.scope_delta_decision.operations` が渡された場合限定）があるが、これは診断用の echo であり canonical な mutation-phase routing は上記 consumer 境界が担う。
 
-`full_rewrite_required` が検出された場合、`run_refinement_preflight.py` の wrapper は通常の `STATUS` 由来 `NEXT_ACTION` 判定を上書きし `NEXT_ACTION: issue_editor_required` を stdout・result artifact の両方に反映する（`contract_update.status` は既存の `applied`/`no_change`/`rebased`/`failed` 4 値のみを使い、`no_change` を full-rewrite-required の意味に流用しない）。この受信後の orchestrator 手順は Step 0g の「`NEXT_ACTION: issue_editor_required` 受信時」を参照する。
+`full_rewrite_required` が検出された場合、`run_refinement_preflight.py` の wrapper は通常の `STATUS` 由来 `NEXT_ACTION` 判定を上書きし `NEXT_ACTION: issue_editor_required` を stdout・result artifact の両方に反映する（`contract_update.status` は既存の `applied`/`no_change`/`rebased`/`failed` 4 値のみを使い、`no_change` を full-rewrite-required の意味に流用しない）。この受信後の orchestrator 手順は Step 0g の「`NEXT_ACTION: issue_editor_required` 受信時」を参照する。#2620 の explicit `human_review_directive` route（priority 3、既存 route を上書きしない）は `decide_rewrite_route.decide_human_review_directive_editor_route()` が SSOT。詳細は `references/loop-state.md` の「explicit trusted human_review_directive の issue_editor_required 拡張（#2620）」参照。
 
 ### Step 4.5: 子Issue/follow-up の実体化 (Materialization)
 

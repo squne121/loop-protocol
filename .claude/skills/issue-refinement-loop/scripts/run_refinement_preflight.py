@@ -6725,6 +6725,116 @@ def _check_scope_reframe_deltas_reflected(
     return "present"
 
 
+def _decide_human_review_directive_editor_route(
+    *,
+    known_context: Optional[dict[str, Any]],
+    anchor_url: str,
+    anchor_body: str,
+    issue_number: int,
+    repo: str,
+    issue_body_sha256: str,
+) -> Optional[dict[str, Any]]:
+    """#2620: assemble the existing-predicate facts
+    `decide_rewrite_route.decide_human_review_directive_editor_route()`
+    (the routing SSOT) needs, and project its result into the same shape
+    `consume_trusted_anchor_contract_patch_plan()` returns for its other
+    dispositions.
+
+    This function performs NO eligibility classification of its own --
+    every fact it supplies is either read verbatim from
+    `known_context["scope_delta_authority_evidence"]` (the EXISTING
+    `_build_scope_delta_authority_evidence()` producer output already
+    computed earlier in this same preflight run) or freshly re-derived by
+    calling the EXISTING `scope_signal_delta.classify_scope_delta_authority()`
+    classifier again against that same evidence (matching the "fresh
+    rerun" pattern already used elsewhere in this file, e.g.
+    `consume_authority_transport()`'s own re-classification). The actual
+    routing decision is made entirely by the SSOT function in
+    `decide_rewrite_route.py`.
+
+    Returns `None` when there is no freeform
+    `SCOPE_DELTA_AUTHORITY_EVIDENCE_V1` to classify at all, or when the
+    SSOT function determines this transaction is not eligible -- callers
+    MUST fall through to the existing behavior (no_change / fail-closed)
+    in both cases.
+    """
+    if not isinstance(known_context, dict):
+        return None
+    evidence_list = known_context.get("scope_delta_authority_evidence")
+    if not isinstance(evidence_list, list) or not evidence_list:
+        return None
+    evidence_primary = evidence_list[0]
+    if not isinstance(evidence_primary, dict):
+        return None
+
+    try:
+        from decide_rewrite_route import (
+            ROUTE_ISSUE_EDITOR_REQUIRED,
+            HUMAN_REVIEW_DIRECTIVE_EDITOR_ROUTE_STATE_V1,
+            decide_human_review_directive_editor_route,
+        )
+        from scope_signal_delta import classify_scope_delta_authority
+    except ImportError:
+        return None
+
+    # Fresh, independent re-classification against the SAME evidence --
+    # never trust the caller-supplied patch plan's mere shape.
+    try:
+        authority = classify_scope_delta_authority(
+            evidence_list,
+            target_issue_number=issue_number,
+            expected_repo=repo,
+            base_issue_body_sha256=issue_body_sha256,
+        )
+    except Exception:
+        return None
+    if not isinstance(authority, dict):
+        return None
+
+    with_human_context = (
+        _resolve_scope_delta_source_kind(
+            anchor_url,
+            human_context_comment_urls=known_context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD),
+            agent_report_comment_urls=known_context.get(_AGENT_REPORT_COMMENT_URLS_FIELD),
+        )
+        == "issue_comment"
+    )
+    anchor_binding_ok = (
+        evidence_primary.get("comment_url") == anchor_url
+        and evidence_primary.get("body_sha256") == _sha256(anchor_body)
+    )
+    same_target_ok = evidence_primary.get("source_issue_number") == issue_number
+
+    fresh_patch_plan = authority.get("contract_patch_plan")
+    fresh_operations = fresh_patch_plan.get("operations") if isinstance(fresh_patch_plan, dict) else None
+    operations_empty = isinstance(fresh_operations, list) and not fresh_operations
+
+    route_state = HUMAN_REVIEW_DIRECTIVE_EDITOR_ROUTE_STATE_V1(
+        authority_category=authority.get("authority_category"),
+        directive_confidence=(authority.get("directive") or {}).get("confidence"),
+        route_action=(authority.get("route") or {}).get("action"),
+        with_human_context=with_human_context,
+        anchor_binding_ok=bool(anchor_binding_ok),
+        same_target_ok=bool(same_target_ok),
+        operations_empty=bool(operations_empty),
+        # The caller only reaches this helper when `_decision_kind ==
+        # "absent"` -- no STRUCTURED ANCHOR_SCOPE_REFRAME_V1 decision
+        # governs this transaction, so priority 2 does not apply here.
+        is_structured_scope_reframe=False,
+        reviewer_feedback_url=anchor_url,
+    )
+    route_result = decide_human_review_directive_editor_route(route_state)
+    if route_result.route != ROUTE_ISSUE_EDITOR_REQUIRED:
+        return None
+    return {
+        "status": "handoff_required",
+        "writes": 0,
+        "iterations": 0,
+        "rewrite_route": route_result.to_dict(),
+        "reviewer_feedback_url": route_result.reviewer_feedback_url,
+    }
+
+
 def consume_trusted_anchor_contract_patch_plan(
     *,
     repo: str,
@@ -6793,6 +6903,31 @@ def consume_trusted_anchor_contract_patch_plan(
             "writes": 0,
             "iterations": 0,
         }
+
+    # #2620: an explicit trusted human_review_directive whose derived
+    # operations[] is empty (no safe section-bound patch representation)
+    # and which is NOT governed by a STRUCTURED ANCHOR_SCOPE_REFRAME_V1
+    # scope reframe (`_decision_kind == "absent"` -- a "valid" decision is
+    # priority 2, owned by decide_scope_reframe_contract_route() further
+    # below via run_trusted_anchor_iteration_zero(), and is left
+    # untouched). Without this branch, `run_trusted_anchor_iteration_
+    # zero()`'s own `classify_scope_reframe_disposition()` call is only
+    # reachable when `allowed_path_deltas` is non-empty (the STRUCTURED
+    # lane), so this freeform case would otherwise silently fall through
+    # to an ordinary "no_change" no-op instead of hand off to issue-editor
+    # -- the exact #2620 control-plane gap.
+    if _decision_kind == "absent" and not _raw_operations:
+        _editor_route_result = _decide_human_review_directive_editor_route(
+            known_context=known_context,
+            anchor_url=anchor_url,
+            anchor_body=anchor_body,
+            issue_number=issue_number,
+            repo=repo,
+            issue_body_sha256=_sha256(issue.get("body", "")),
+        )
+        if _editor_route_result is not None:
+            return _editor_route_result
+
     # PR #2057 OWNER review P1-4/P1-5: the Allowed-Paths-reflected tri-state
     # is intentionally NOT computed here against `issue["body"]` (the
     # pre-fetch snapshot passed into this function). It is computed by

@@ -1004,3 +1004,196 @@ class TestScopeReframeDeltasReflectedFalsePositiveResistance:
             current_body=body, allowed_path_deltas=[]
         )
         assert status == "invalid_or_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# #2620 AC1/AC2/AC3/AC4/AC6: explicit trusted human_review_directive (a
+# FREEFORM with_human_context comment, not a structured
+# ANCHOR_SCOPE_REFRAME_V1 payload) whose derived operations[] is empty
+# reaches NEXT_ACTION: issue_editor_required through the real,
+# production-reachable run_preflight() -> consume_trusted_anchor_
+# contract_patch_plan() call chain -- never a unit-level shortcut. See
+# test_decide_rewrite_route_human_review_directive.py for the SSOT-level
+# and direct-consumer-level unit coverage of the same eligibility.
+# ---------------------------------------------------------------------------
+
+_HRD_ISSUE = 2620
+_HRD_COMMENT_ID = 2620099
+_HRD_URL = f"https://github.com/{_E2E_REPO}/issues/{_HRD_ISSUE}#issuecomment-{_HRD_COMMENT_ID}"
+_HRD_EXPLICIT_BODY = (
+    "Please restructure the onboarding walkthrough narrative so new "
+    "contributors are not dropped mid-flow.\n\n"
+    "- Please restructure the onboarding walkthrough narrative to add "
+    "clarifying context for new contributors.\n"
+)
+_HRD_PROSE_ONLY_BODY = "This section could probably be clearer at some point."
+
+
+def _hrd_issue_body() -> str:
+    return (
+        "## Machine-Readable Contract\n\n"
+        "```yaml\n"
+        "contract_schema_version: v1\n"
+        "issue_kind: implementation\n"
+        "parent_issue: none\n"
+        "goal_ref: test\n"
+        "change_kind: workflow\n"
+        "```\n\n"
+        "## Parent Issue\n\nnone\n\n"
+        "## Parent Goal Ref\n\ntest\n\n"
+        "## Current Validated Scope\n\n- test\n\n"
+        "## Remaining Parent Gaps\n\nnone\n\n"
+        "## Outcome\n\ntest\n\n"
+        "## In Scope\n\n- test\n\n"
+        "## Out of Scope\n\n- none\n\n"
+        "## Acceptance Criteria\n\n- [ ] AC1: test\n\n"
+        "## Verification Commands\n\n```bash\n$ true\n```\n\n"
+        "## Allowed Paths\n\n- docs/product/features/existing.md\n\n"
+        "## Stop Conditions\n\n- none\n\n"
+        "## Required Skills\n\n- none\n\n"
+        "## Runtime Verification Applicability\n\n"
+        "- decision: not_applicable\n"
+        "- reason: static verification only for this fixture\n"
+    )
+
+
+def _hrd_anchor_comment(
+    *, body: str, author_association: str = "OWNER", comment_id: int = _HRD_COMMENT_ID, url: str = _HRD_URL
+) -> dict:
+    return {
+        "id": comment_id,
+        "body": body,
+        "issue_url": f"https://api.github.com/repos/{_E2E_REPO}/issues/{_HRD_ISSUE}",
+        "created_at": "2026-09-10T00:00:00Z",
+        "updated_at": "2026-09-10T00:00:00Z",
+        "html_url": url,
+        "url": f"https://api.github.com/repos/{_E2E_REPO}/issues/comments/{comment_id}",
+        "user": {"login": "squne121", "type": "User"},
+        "author_association": author_association,
+    }
+
+
+def _hrd_run_preflight(
+    tmp_path,
+    *,
+    anchor_body: str,
+    run_id: str,
+    author_association: str = "OWNER",
+    human_context_comment_urls=(_HRD_URL,),
+    comment_id: int = _HRD_COMMENT_ID,
+    url: str = _HRD_URL,
+):
+    issue_body = _hrd_issue_body()
+    anchor_comment = _hrd_anchor_comment(
+        body=anchor_body, author_association=author_association, comment_id=comment_id, url=url
+    )
+    fixture = {
+        "schema_version": "refinement_preflight_input/v1",
+        "issue_number": _HRD_ISSUE,
+        "repo": _E2E_REPO,
+        "now": "2026-09-10T00:00:00Z",
+        "issue": {"number": _HRD_ISSUE, "title": "test", "body": issue_body, "labels": []},
+        "comments": [],
+        "anchor_comment_urls": [url],
+        "anchor_comments": [anchor_comment],
+    }
+    fixture_path = tmp_path / f"preflight_hrd_{run_id}.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    calls = {"apply_transaction": 0, "fresh_checks": 0}
+    state = {"body": issue_body}
+
+    def fetch_current():
+        return (
+            {"body": state["body"], "updatedAt": "2026-09-10T00:00:00Z"},
+            dict(anchor_comment, html_url=url),
+        )
+
+    def candidate_readiness(_body):
+        return {
+            "status": "go",
+            "body_sha256": "sha256:candidate",
+            "source_checks": [],
+            "errors": [],
+            "readiness_result_ref": "fixture",
+        }
+
+    def apply_transaction(current_issue, candidate_body, readiness):
+        calls["apply_transaction"] += 1
+        state["body"] = candidate_body
+        return {"status": "applied"}
+
+    def fresh_checks(_current_issue):
+        calls["fresh_checks"] += 1
+        return {
+            "preflight": "unavailable",
+            "review": "unavailable",
+            "readiness": "unavailable",
+            "allowed_paths": "unavailable",
+            "permission_profile": "unavailable",
+            "runtime_evidence": "unavailable",
+        }
+
+    callbacks = {
+        "fetch_current": fetch_current,
+        "candidate_readiness": candidate_readiness,
+        "apply_transaction": apply_transaction,
+        "fresh_checks": fresh_checks,
+    }
+    artifact_dir = _E2E_SKILL_ROOT.parent.parent / "artifacts" / "issue-refinement-loop" / str(_HRD_ISSUE)
+    try:
+        result, exit_code = _e2e_preflight.run_preflight(
+            issue_number=_HRD_ISSUE,
+            repo=_E2E_REPO,
+            anchor_comment_urls=[url],
+            fixture_path=fixture_path,
+            known_context={"human_context_comment_urls": list(human_context_comment_urls)},
+            consume_contract_patch_plan=True,
+            contract_update_callbacks=callbacks,
+        )
+    finally:
+        if artifact_dir.exists():
+            shutil.rmtree(artifact_dir)
+    return result, exit_code, calls
+
+
+def test_ac1_ac6_explicit_human_review_directive_reaches_next_action_production_reachable(tmp_path, capsys):
+    """AC1/AC6: an explicit trusted human_review_directive (freeform
+    with_human_context comment, NOT a structured ANCHOR_SCOPE_REFRAME_V1
+    payload) whose derived operations[] is empty reaches
+    NEXT_ACTION: issue_editor_required through the REAL run_preflight() ->
+    consume_trusted_anchor_contract_patch_plan() call chain, with writes=0
+    (mutation count 0) -- production-reachable, not a helper-only
+    shortcut (AC6: a result reached only via a fallback path is FAIL, not
+    PASS)."""
+    result, _exit_code, calls = _hrd_run_preflight(tmp_path, anchor_body=_HRD_EXPLICIT_BODY, run_id="positive")
+    captured = capsys.readouterr()
+
+    assert "NEXT_ACTION: issue_editor_required" in captured.out
+    assert result["next_action"] == "issue_editor_required"
+    assert result["contract_update"]["writes"] == 0
+    assert calls["apply_transaction"] == 0
+
+
+def test_ac3_untrusted_author_association_never_escalates_production_reachable(tmp_path):
+    """AC3: an untrusted author association (NONE) never reaches
+    issue_editor_required through the real run_preflight() -- fails
+    closed, writes=0."""
+    result, _exit_code, calls = _hrd_run_preflight(
+        tmp_path, anchor_body=_HRD_EXPLICIT_BODY, run_id="untrusted", author_association="NONE"
+    )
+
+    assert result["next_action"] != "issue_editor_required"
+    assert calls["apply_transaction"] == 0
+
+
+def test_ac4_ambiguous_prose_only_directive_never_escalates_production_reachable(tmp_path):
+    """AC4: a freeform human-context comment with no bullet-list directive
+    content (no imperative ask) never reaches explicit confidence -- fails
+    closed through the real run_preflight(), never issue_editor_required."""
+    result, _exit_code, calls = _hrd_run_preflight(
+        tmp_path, anchor_body=_HRD_PROSE_ONLY_BODY, run_id="ambiguous"
+    )
+
+    assert result["next_action"] != "issue_editor_required"
+    assert calls["apply_transaction"] == 0
