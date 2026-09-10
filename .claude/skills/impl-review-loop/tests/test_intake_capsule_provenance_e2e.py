@@ -31,10 +31,14 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import shutil
+import subprocess
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 TEST_REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPT_PATH = (
@@ -260,6 +264,8 @@ def test_cli_provenance_conflict_same_url_both_lanes_is_fail_closed(tmp_path):
         _REPO,
         "--artifact-dir",
         str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
         "--human-context-comment-url",
         _HUMAN_COMMENT_URL,
         "--agent-report-comment-url",
@@ -276,6 +282,11 @@ def test_cli_provenance_conflict_same_url_both_lanes_is_fail_closed(tmp_path):
 
 
 def test_cli_nonexistent_comment_id_is_fail_closed(tmp_path):
+    """#2606 AC5: a comment ID absent from the target Issue's own comments
+    AND unresolvable via the comment-ID direct lookup (e.g. the comment
+    truly does not exist -- ``gh api`` returns non-zero) still fails closed
+    with the pre-existing not-found error semantics (exit code 1,
+    ``human_supplied_comment_not_found:<id>``)."""
     run_cmd = _run_command_side_effect_factory(
         [
             (0, _issue_view_json(), ""),
@@ -283,6 +294,9 @@ def test_cli_nonexistent_comment_id_is_fail_closed(tmp_path):
             (0, "main\n", ""),
             (0, "  \n", ""),
             (0, _comments_stdout(), ""),
+            # #2606: comment-ID direct lookup fallback -- comment truly does
+            # not exist, so `gh api` returns non-zero (404).
+            (1, "", "gh: Not Found (HTTP 404)"),
         ]
     )
     artifact_dir = tmp_path / "artifacts"
@@ -294,6 +308,8 @@ def test_cli_nonexistent_comment_id_is_fail_closed(tmp_path):
         _REPO,
         "--artifact-dir",
         str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
         "--human-context-comment-url",
         f"{_ISSUE_URL}#issuecomment-999999999999",
     ]
@@ -327,6 +343,8 @@ def test_cli_agent_report_missing_structured_marker_is_fail_closed(tmp_path):
         _REPO,
         "--artifact-dir",
         str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
         "--agent-report-comment-url",
         f"{_ISSUE_URL}#issuecomment-{_UNRELATED_COMMENT_ID}",
     ]
@@ -388,6 +406,8 @@ def test_cli_agent_report_marker_only_inside_quoted_text_is_fail_closed(tmp_path
         _REPO,
         "--artifact-dir",
         str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
         "--agent-report-comment-url",
         f"{_ISSUE_URL}#issuecomment-{quoted_only_comment_id}",
     ]
@@ -438,6 +458,8 @@ def test_cli_agent_report_non_allowlisted_schema_id_is_fail_closed(tmp_path):
         _REPO,
         "--artifact-dir",
         str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
         "--agent-report-comment-url",
         f"{_ISSUE_URL}#issuecomment-{unlisted_comment_id}",
     ]
@@ -491,6 +513,8 @@ def test_cli_agent_report_multiple_blocks_is_fail_closed(tmp_path):
         _REPO,
         "--artifact-dir",
         str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
         "--agent-report-comment-url",
         f"{_ISSUE_URL}#issuecomment-{multi_block_comment_id}",
     ]
@@ -526,6 +550,8 @@ def test_no_context_urls_leaves_capsule_backward_compatible(tmp_path):
         _REPO,
         "--artifact-dir",
         str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
     ]
 
     exit_code, stdout_text = _run_main(argv, run_cmd)
@@ -690,7 +716,11 @@ def test_build_capsule_argv_e2e_subprocess_invocation_resolves_context_inputs(tm
 def test_validate_step1_dispatch_payload_noop_when_context_inputs_absent():
     """When `context_inputs` is None/empty, `validate_step1_dispatch_payload()`
     is a no-op (per step-1-implementation.md: "context_inputs が存在しない
-    場合、この節は no-op")."""
+    場合、この節は no-op"). Covers both the `None` shape and the
+    structurally-empty-but-present shape (#2606 PR #2614 review comment:
+    this empty-context assertion was previously mis-placed inside the AC9
+    live canary and gated on GitHub availability; it is a pure unit
+    assertion and must always run)."""
     allowed, errors = mod.validate_step1_dispatch_payload(None, {})
     assert allowed is True
     assert errors == []
@@ -700,3 +730,500 @@ def test_validate_step1_dispatch_payload_noop_when_context_inputs_absent():
     )
     assert allowed_empty is True
     assert errors_empty == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #2606: extend --human-context-comment-url / --agent-report-comment-url
+# resolution to implementation-PR conversation issue comments via a
+# comment-ID direct lookup, gated on the target Issue's own comments_by_id
+# map missing the ID first.
+#
+# AC1: target Issue's own comment still resolves via the pre-existing path
+#      (comments_by_id map hit -- no direct lookup, no regression).
+# AC2: an implementation PR's conversation comment resolves via direct
+#      lookup for --human-context-comment-url.
+# AC3: same, for --agent-report-comment-url, with schema validation intact.
+# AC4: a PR comment on a PR that does NOT close the target Issue fails
+#      closed.
+# AC5: covered above by test_cli_nonexistent_comment_id_is_fail_closed.
+# AC6: readback html_url / issue-number binding mismatches fail closed.
+# AC7: PR inline review comment URL shapes are never accepted.
+# ---------------------------------------------------------------------------
+
+_PR_NUMBER = 4321
+_PR_COMMENT_ID = 6100000001
+
+
+def _pr_comment_lookup_json(
+    *,
+    comment_id: int,
+    html_url: str,
+    body: str = "PR conversation comment body (not an Issue-side comment).",
+    author: str = "squne121",
+    author_id: int = 63350259,
+    author_type: str = "User",
+    author_association: str = "OWNER",
+    updated_at: str = "2026-08-02T00:03:00Z",
+) -> str:
+    return json.dumps(
+        {
+            "id": comment_id,
+            "html_url": html_url,
+            "created_at": updated_at,
+            "updated_at": updated_at,
+            "body": body,
+            "author": author,
+            "author_id": author_id,
+            "author_type": author_type,
+            "author_association": author_association,
+        }
+    )
+
+
+def _closing_issues_json(issue_numbers: list[int], repo: str = _REPO) -> str:
+    owner, name = repo.split("/", 1)
+    return json.dumps(
+        {
+            "closingIssuesReferences": [
+                {
+                    "number": n,
+                    "url": f"https://github.com/{repo}/issues/{n}",
+                    "repository": {"name": name, "owner": {"login": owner}},
+                }
+                for n in issue_numbers
+            ]
+        }
+    )
+
+
+def test_ac1_target_issue_own_comment_still_resolves_no_direct_lookup(tmp_path):
+    """#2606 AC1: a comment_id already present in the target Issue's own
+    comments_by_id map resolves via the pre-existing path -- no direct
+    lookup / PR closing-issue check is ever invoked (only the 5 pre-existing
+    `_run_command` calls fire; a 6th call would raise IndexError)."""
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, _comments_stdout(), ""),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
+        "--human-context-comment-url",
+        _HUMAN_COMMENT_URL,
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 0, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    assert stdout_payload["context_inputs"]["human_supplied"][0]["comment_id"] == _HUMAN_COMMENT_ID
+
+
+def test_ac2_pr_conversation_comment_resolves_via_direct_lookup_human_lane(tmp_path):
+    """#2606 AC2: a PR conversation comment absent from the target Issue's
+    own comments (map miss) resolves via the read-only comment-ID direct
+    lookup when the PR's closingIssuesReferences names the target Issue."""
+    pr_comment_url = f"https://github.com/{_REPO}/pull/{_PR_NUMBER}#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, _comments_stdout(), ""),
+            (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=pr_comment_url), ""),
+            (0, _closing_issues_json([_ISSUE_NUMBER]), ""),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
+        "--human-context-comment-url",
+        pr_comment_url,
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 0, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    human_supplied = stdout_payload["context_inputs"]["human_supplied"]
+    assert len(human_supplied) == 1
+    assert human_supplied[0]["comment_id"] == _PR_COMMENT_ID
+    assert human_supplied[0]["url"] == pr_comment_url
+    assert "body" not in human_supplied[0]  # AC7-adjacent: stdout still excludes raw body
+
+    artifact_path = artifact_dir / f"intake-capsule-{_ISSUE_NUMBER}.json"
+    artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact_human = artifact_payload["context_inputs"]["human_supplied"][0]
+    assert artifact_human["body"] == "PR conversation comment body (not an Issue-side comment)."
+
+
+def test_ac3_pr_conversation_comment_resolves_via_direct_lookup_agent_lane(tmp_path):
+    """#2606 AC3: the same PR-side direct lookup path applies to
+    --agent-report-comment-url, and the existing structured agent-report
+    schema validation still runs against the readback body."""
+    agent_comment_id = 6100000002
+    pr_comment_url = f"https://github.com/{_REPO}/pull/{_PR_NUMBER}#issuecomment-{agent_comment_id}"
+    agent_body = "```yaml\nIMPLEMENT_RESULT_V1:\n  status: ok\n```\nstructured agent report."
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, _comments_stdout(), ""),
+            (
+                0,
+                _pr_comment_lookup_json(
+                    comment_id=agent_comment_id,
+                    html_url=pr_comment_url,
+                    body=agent_body,
+                    author="github-actions",
+                    author_id=41898282,
+                    author_type="Bot",
+                    author_association="NONE",
+                ),
+                "",
+            ),
+            (0, _closing_issues_json([_ISSUE_NUMBER]), ""),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
+        "--agent-report-comment-url",
+        pr_comment_url,
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 0, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    agent_generated = stdout_payload["context_inputs"]["agent_generated"]
+    assert len(agent_generated) == 1
+    assert agent_generated[0]["comment_id"] == agent_comment_id
+    assert agent_generated[0]["validated_schema_id"] == "IMPLEMENT_RESULT_V1"
+    assert agent_generated[0]["validation_status"] == "ok"
+
+
+def test_ac4_pr_comment_on_unrelated_pr_is_fail_closed(tmp_path):
+    """#2606 AC4: a PR conversation comment on a PR that does NOT list the
+    target Issue in closingIssuesReferences must fail-closed."""
+    pr_comment_url = f"https://github.com/{_REPO}/pull/{_PR_NUMBER}#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, _comments_stdout(), ""),
+            (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=pr_comment_url), ""),
+            (0, _closing_issues_json([999999]), ""),  # unrelated Issue
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
+        "--human-context-comment-url",
+        pr_comment_url,
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 1, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    assert any(
+        err.startswith("human_supplied_comment_pr_not_closing_target_issue:")
+        for err in stdout_payload["fatal_errors"]
+    ), stdout_payload
+
+
+def test_pr_closes_same_numbered_issue_in_different_repo_fails_closed(tmp_path):
+    """#2606 fix_delta (PR #2614 review comment): a PR whose
+    closingIssuesReferences names an issue with the SAME number as the
+    target Issue but in a DIFFERENT repository must never be accepted as
+    closing the target Issue -- ``number`` alone is not sufficient identity,
+    ``url`` (repo-qualified) must also match."""
+    pr_comment_url = f"https://github.com/{_REPO}/pull/{_PR_NUMBER}#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, _comments_stdout(), ""),
+            (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=pr_comment_url), ""),
+            (0, _closing_issues_json([_ISSUE_NUMBER], repo="other-owner/other-repo"), ""),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
+        "--human-context-comment-url",
+        pr_comment_url,
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 1, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    assert any(
+        err.startswith("human_supplied_comment_pr_not_closing_target_issue:")
+        for err in stdout_payload["fatal_errors"]
+    ), stdout_payload
+
+
+def test_ac6_direct_lookup_html_url_mismatch_is_fail_closed(tmp_path):
+    """#2606 AC6: readback html_url must exact-bind to the input URL; a
+    mismatch (e.g. comment-ID collision) fails closed."""
+    requested_url = f"https://github.com/{_REPO}/pull/{_PR_NUMBER}#issuecomment-{_PR_COMMENT_ID}"
+    spoofed_html_url = f"https://github.com/{_REPO}/pull/9999#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, _comments_stdout(), ""),
+            (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=spoofed_html_url), ""),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
+        "--human-context-comment-url",
+        requested_url,
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 1, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    assert any(
+        err.startswith("human_supplied_comment_url_html_url_mismatch:")
+        for err in stdout_payload["fatal_errors"]
+    ), stdout_payload
+
+
+def test_ac6_issue_shaped_direct_lookup_wrong_issue_number_is_fail_closed(tmp_path):
+    """#2606 AC6: an /issues/N#issuecomment-ID URL resolved via direct
+    lookup must bind N == target Issue number; a foreign Issue's comment
+    fails closed even when the html_url readback matches the input URL."""
+    foreign_comment_id = 6100000003
+    foreign_issue_url = f"https://github.com/{_REPO}/issues/1#issuecomment-{foreign_comment_id}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, _comments_stdout(), ""),
+            (0, _pr_comment_lookup_json(comment_id=foreign_comment_id, html_url=foreign_issue_url), ""),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
+        "--human-context-comment-url",
+        foreign_issue_url,
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 1, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    assert any(
+        err.startswith("human_supplied_comment_issue_number_mismatch:")
+        for err in stdout_payload["fatal_errors"]
+    ), stdout_payload
+
+
+def test_ac7_pr_inline_review_comment_shape_is_rejected(tmp_path):
+    """#2606 AC7: a PR inline review comment permalink (`#discussion_r<ID>`)
+    is out of scope and is rejected at the initial URL parse -- it never
+    triggers a direct-lookup `gh api` call (only the 5 pre-existing
+    `_run_command` calls fire)."""
+    inline_review_url = f"https://github.com/{_REPO}/pull/{_PR_NUMBER}#discussion_r123456789"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, _comments_stdout(), ""),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
+        "--human-context-comment-url",
+        inline_review_url,
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 1, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    assert any(
+        err.startswith("human_supplied_comment_url_unparseable:")
+        for err in stdout_payload["fatal_errors"]
+    ), stdout_payload
+
+
+# ---------------------------------------------------------------------------
+# Issue #2606 AC9 (runtime-verification: true): read-only live canary
+# against the known real-world case (Issue #2587 / PR #2597 comment
+# #5612029072) that originally failed to resolve via the old
+# comments_by_id-only path.
+#
+# This test does NOT patch `_run_command` -- it exercises the real `gh` /
+# `git` subprocess boundary end to end, matching the pattern established by
+# `test_ac1_live_issue_no_environment_failure.py`. Per the Issue body's
+# `fallback_policy` ("fallback 経路は設けない... mock/fixture への切替を
+# PASS として扱わない"): `gh` unauthenticated/unreachable is a SKIP (not
+# PASS/FAIL); a reachable-but-failing run is a genuine FAIL, never silently
+# downgraded to a fixture-backed PASS.
+# ---------------------------------------------------------------------------
+
+_AC9_ISSUE_NUMBER = 2587
+_AC9_PR_NUMBER = 2597
+_AC9_COMMENT_ID = 5612029072
+_AC9_HUMAN_URL = f"https://github.com/{_REPO}/pull/{_AC9_PR_NUMBER}#issuecomment-{_AC9_COMMENT_ID}"
+
+
+def _gh_unavailable_reason() -> str | None:
+    """Runtime (not collection-time) availability check for the AC9 live
+    canary. Checked from inside the test body, never from a
+    `pytest.mark.skipif(...)` decorator argument -- decorator arguments are
+    evaluated at module collection time, which would spawn `gh` subprocesses
+    on every collection (#2606 PR #2614 review comment)."""
+    gh = shutil.which("gh")
+    if gh is None:
+        return "gh CLI not installed"
+    try:
+        auth = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return "gh CLI invocation failed"
+    if auth.returncode != 0:
+        return "gh CLI not authenticated"
+    try:
+        api_check = subprocess.run(
+            [gh, "api", "-X", "GET", "/rate_limit"], capture_output=True, text=True, timeout=15
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "api.github.com unreachable"
+    if api_check.returncode != 0:
+        return "api.github.com unreachable"
+    return None
+
+
+def test_ac9_runtime_canary_known_pr_comment_resolves_against_real_github():
+    """#2606 AC9: exercises the real comment-ID direct lookup +
+    closingIssuesReferences check against live GitHub, using the exact
+    known real-world case cited in the Issue body."""
+    skip_reason = _gh_unavailable_reason()
+    if skip_reason is not None:
+        pytest.skip(f"{skip_reason} (SKIP, not PASS/FAIL) -- #2606 AC9")
+
+    artifacts_dir = TEST_REPO_ROOT / "artifacts" / "issue-2606" / "ac9_runtime_canary"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    capsule, artifact_payload, exit_code = mod.build_intake_capsule(
+        issue_number=_AC9_ISSUE_NUMBER,
+        repo=_REPO,
+        human_context_comment_urls=[_AC9_HUMAN_URL],
+    )
+
+    stdout_log = json.dumps(
+        {
+            "exit_code": exit_code,
+            "issue_number": _AC9_ISSUE_NUMBER,
+            "human_context_comment_url": _AC9_HUMAN_URL,
+            "context_inputs": capsule.get("context_inputs"),
+            "fatal_errors": capsule.get("fatal_errors"),
+            "warnings": capsule.get("warnings"),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    print(stdout_log)
+    (artifacts_dir / "latest_run.json").write_text(stdout_log, encoding="utf-8")
+
+    # fallback_policy: no fallback -- an authenticated-but-failed resolution
+    # is a genuine FAIL, never silently accepted.
+    assert exit_code == 0, capsule
+    assert "context_inputs" in capsule, capsule
+    human_supplied = capsule["context_inputs"]["human_supplied"]
+    assert len(human_supplied) == 1, capsule
+    assert human_supplied[0]["comment_id"] == _AC9_COMMENT_ID
+    assert human_supplied[0]["url"] == _AC9_HUMAN_URL
+    assert not any(str(_AC9_COMMENT_ID) in err for err in capsule.get("fatal_errors", [])), capsule

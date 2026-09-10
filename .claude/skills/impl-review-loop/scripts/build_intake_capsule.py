@@ -352,10 +352,103 @@ def _validate_agent_report_schema(body: str) -> tuple["str | None", str, list[st
     return matched_ids[0], "ok", []
 
 
+_ISSUE_OR_PR_COMMENT_URL_RE = re.compile(
+    r"^https://github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)#issuecomment-(\d+)$"
+)
+
+
+def _parse_issue_or_pr_comment_url(url: str) -> tuple[str, str, int, int] | None:
+    """#2606: parse a github.com top-level conversation comment permalink
+    shaped like ``.../issues/N#issuecomment-ID`` or
+    ``.../pull/N#issuecomment-ID``.
+
+    Returns ``(repo, kind, number, comment_id)`` where ``kind`` is
+    ``"issues"`` or ``"pull"``, or ``None`` if the shape doesn't match. PR
+    inline review comments (``#discussion_r<ID>``) and top-level PR review
+    permalinks (``#pullrequestreview-<ID>``) intentionally never match this
+    pattern (AC7) -- only top-level PR/Issue conversation issue comments are
+    in scope.
+    """
+    match = _ISSUE_OR_PR_COMMENT_URL_RE.match(url)
+    if match is None:
+        return None
+    return match.group(1), match.group(2), int(match.group(3)), int(match.group(4))
+
+
+def _direct_lookup_comment(
+    repo: str,
+    comment_id: int,
+    command_log: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """#2606 AC2/AC3: read-only comment-ID direct lookup, used ONLY when
+    ``comment_id`` is absent from the already-fetched target-Issue
+    ``comments_by_id`` map. Uses the GitHub Issues API comment-ID endpoint
+    (``repos/{repo}/issues/comments/{comment_id}``), which resolves both
+    Issue comments and PR conversation comments -- PR conversation issue
+    comments are Issues-API comments under the hood."""
+    argv = [
+        "gh",
+        "api",
+        f"repos/{repo}/issues/comments/{comment_id}",
+        "--jq",
+        "{id, html_url, created_at, updated_at, body, "
+        "author: .user.login, author_id: .user.id, "
+        "author_type: .user.type, author_association}",
+    ]
+    rc, stdout, stderr = _run_command(argv)
+    _record_command(command_log, "issue_comment_direct_lookup", argv, rc, stdout, stderr)
+    if rc != 0:
+        return None
+    return _safe_load_json(stdout)
+
+
+def _pr_closes_target_issue(
+    repo: str,
+    pr_number: int,
+    issue_number: int,
+    command_log: list[dict[str, Any]],
+) -> bool:
+    """#2606: read-only verification that ``pr_number`` references
+    ``issue_number`` as a closing issue, via ``closingIssuesReferences``
+    (``gh pr view --json closingIssuesReferences`` equivalent). A PR
+    conversation comment on an unrelated PR (one that does NOT list the
+    target Issue as a closing issue) must never be accepted (AC4)."""
+    argv = [
+        "gh",
+        "pr",
+        "view",
+        str(pr_number),
+        "--repo",
+        repo,
+        "--json",
+        "closingIssuesReferences",
+    ]
+    rc, stdout, stderr = _run_command(argv)
+    _record_command(command_log, "pr_view_closing_issues", argv, rc, stdout, stderr)
+    if rc != 0:
+        return False
+    payload = _safe_load_json(stdout)
+    if payload is None:
+        return False
+    refs = payload.get("closingIssuesReferences")
+    if not isinstance(refs, list):
+        return False
+    expected_url = f"https://github.com/{repo}/issues/{issue_number}"
+    return any(
+        isinstance(ref, dict)
+        and ref.get("number") == issue_number
+        and ref.get("url") == expected_url
+        for ref in refs
+    )
+
+
 def _resolve_context_comments(
     urls: list[str],
     lane: str,
     comments_by_id: dict[int, dict[str, Any]],
+    issue_number: int,
+    repo: str,
+    command_log: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """#1950 AC6/AC7/AC8: resolve --human-context-comment-url /
     --agent-report-comment-url values against the already-fetched comments
@@ -368,8 +461,24 @@ def _resolve_context_comments(
     inferred from ``comment`` contents, only from which CLI flag the caller
     used to pass ``urls``.
 
+    #2606 AC2-AC7: when ``comment_id`` is absent from ``comments_by_id``
+    (i.e. it does not belong to the target Issue's own comments), a
+    read-only comment-ID direct lookup (``_direct_lookup_comment()``) is
+    attempted instead of immediately failing. The lookup result is
+    exact-bound to the input ``url`` via ``html_url`` equality, and then
+    additionally bound by shape:
+
+    - ``/issues/N#issuecomment-ID``: ``N`` must equal ``issue_number``.
+    - ``/pull/N#issuecomment-ID``: PR ``N`` must reference ``issue_number``
+      as a closing issue (``_pr_closes_target_issue()``).
+
+    Any URL shape other than these two (e.g. PR inline review comments,
+    top-level PR review permalinks) is never routed through direct lookup
+    at all -- it fails the initial parse.
+
     Returns ``(resolved_entries, errors)``. Any resolution failure
-    (unparseable URL, comment not found, html_url readback mismatch, or --
+    (unparseable URL, comment not found, html_url readback mismatch,
+    repo mismatch, issue-number mismatch, PR-not-closing-target-issue, or --
     for the agent_generated lane only -- a missing structured report
     marker) is fail-closed: the offending URL is dropped from
     ``resolved_entries`` and an error string is appended instead.
@@ -384,8 +493,32 @@ def _resolve_context_comments(
         comment_id = int(match.group(1))
         comment = comments_by_id.get(comment_id)
         if comment is None:
-            errors.append(f"{lane}_comment_not_found:{comment_id}")
-            continue
+            # #2606: map miss -> read-only comment-ID direct lookup,
+            # restricted to top-level PR/Issue conversation comments and
+            # exact-bound to the target Issue.
+            parsed_url = _parse_issue_or_pr_comment_url(url)
+            if parsed_url is None:
+                errors.append(f"{lane}_comment_not_found:{comment_id}")
+                continue
+            url_repo, url_kind, url_number, _url_comment_id = parsed_url
+            if url_repo != repo:
+                errors.append(f"{lane}_comment_repo_mismatch:{comment_id}")
+                continue
+            looked_up = _direct_lookup_comment(repo, comment_id, command_log)
+            if looked_up is None:
+                errors.append(f"{lane}_comment_not_found:{comment_id}")
+                continue
+            if str(looked_up.get("html_url") or "") != url:
+                errors.append(f"{lane}_comment_url_html_url_mismatch:{comment_id}")
+                continue
+            if url_kind == "issues":
+                if url_number != issue_number:
+                    errors.append(f"{lane}_comment_issue_number_mismatch:{comment_id}")
+                    continue
+            elif not _pr_closes_target_issue(repo, url_number, issue_number, command_log):
+                errors.append(f"{lane}_comment_pr_not_closing_target_issue:{comment_id}")
+                continue
+            comment = looked_up
         html_url = str(comment.get("html_url") or "")
         if html_url != url:
             errors.append(f"{lane}_comment_url_html_url_mismatch:{comment_id}")
@@ -828,10 +961,10 @@ def build_intake_capsule(
             url for url in agent_report_comment_urls if url not in provenance_conflict_urls
         ]
         human_resolved, human_errors = _resolve_context_comments(
-            human_urls_to_resolve, "human_supplied", comments_by_id
+            human_urls_to_resolve, "human_supplied", comments_by_id, issue_number, repo, command_log
         )
         agent_resolved, agent_errors = _resolve_context_comments(
-            agent_urls_to_resolve, "agent_generated", comments_by_id
+            agent_urls_to_resolve, "agent_generated", comments_by_id, issue_number, repo, command_log
         )
         provenance_conflict_entries = [
             {"url": url, "reason": "provenance_conflict_url_in_both_lanes"}

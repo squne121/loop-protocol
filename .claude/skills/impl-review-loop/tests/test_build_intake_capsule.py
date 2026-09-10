@@ -628,3 +628,327 @@ def test_ensure_contract_snapshot_parse_error_is_advisory_warning(tmp_path):
     assert exit_code == 0
     assert "ensure_contract_snapshot_result_parse_error" in capsule["warnings"]
     assert capsule["fatal_errors"] == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #2606: comment-ID direct lookup for PR-side conversation comments
+# (map miss in the target Issue's own comments_by_id).
+# ---------------------------------------------------------------------------
+
+_PR_NUMBER = 4242
+_PR_COMMENT_ID = 6000000001
+
+
+def _pr_comment_lookup_json(
+    *,
+    comment_id: int,
+    html_url: str,
+    body: str = "PR conversation comment body.",
+    author: str = _TRUSTED_AUTHOR_LOGIN,
+    author_id: int = _TRUSTED_AUTHOR_ID,
+    author_type: str = _TRUSTED_AUTHOR_TYPE,
+    author_association: str = _TRUSTED_AUTHOR_ASSOCIATION,
+    updated_at: str = "2026-06-19T00:02:00Z",
+) -> str:
+    return json.dumps(
+        {
+            "id": comment_id,
+            "html_url": html_url,
+            "created_at": updated_at,
+            "updated_at": updated_at,
+            "body": body,
+            "author": author,
+            "author_id": author_id,
+            "author_type": author_type,
+            "author_association": author_association,
+        }
+    )
+
+
+def _closing_issues_json(issue_numbers: list[int], repo: str = "squne121/loop-protocol") -> str:
+    owner, name = repo.split("/", 1)
+    return json.dumps(
+        {
+            "closingIssuesReferences": [
+                {
+                    "number": n,
+                    "url": f"https://github.com/{repo}/issues/{n}",
+                    "repository": {"name": name, "owner": {"login": owner}},
+                }
+                for n in issue_numbers
+            ]
+        }
+    )
+
+
+def test_ac2_pr_comment_direct_lookup_resolves_human_context_url():
+    """#2606 AC2: a PR conversation comment absent from the target Issue's
+    own comments_by_id map resolves via the read-only comment-ID direct
+    lookup when the PR's `closingIssuesReferences` names the target Issue."""
+    pr_comment_url = f"https://github.com/squne121/loop-protocol/pull/{_PR_NUMBER}#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, "", ""),  # target Issue's own comments -- PR comment is not among them
+            (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=pr_comment_url), ""),
+            (0, _closing_issues_json([958]), ""),
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, artifact, exit_code = mod.build_intake_capsule(
+            958,
+            "squne121/loop-protocol",
+            None,
+            human_context_comment_urls=[pr_comment_url],
+        )
+
+    assert exit_code == 0, capsule
+    human_supplied = capsule["context_inputs"]["human_supplied"]
+    assert len(human_supplied) == 1
+    assert human_supplied[0]["comment_id"] == _PR_COMMENT_ID
+    assert human_supplied[0]["url"] == pr_comment_url
+    assert artifact["context_inputs"]["human_supplied"][0]["body"] == "PR conversation comment body."
+
+
+def test_ac3_pr_comment_direct_lookup_resolves_agent_report_url_with_schema_validation():
+    """#2606 AC3: the same PR-side direct-lookup path applies to
+    --agent-report-comment-url, and the existing structured-schema
+    validation (allowlisted top-level fenced block) still runs."""
+    agent_comment_id = 6000000002
+    pr_comment_url = f"https://github.com/squne121/loop-protocol/pull/{_PR_NUMBER}#issuecomment-{agent_comment_id}"
+    agent_body = "```yaml\nIMPLEMENT_RESULT_V1:\n  status: ok\n```\n"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, "", ""),
+            (
+                0,
+                _pr_comment_lookup_json(
+                    comment_id=agent_comment_id,
+                    html_url=pr_comment_url,
+                    body=agent_body,
+                    author="github-actions",
+                    author_id=41898282,
+                    author_type="Bot",
+                    author_association="NONE",
+                ),
+                "",
+            ),
+            (0, _closing_issues_json([958]), ""),
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(
+            958,
+            "squne121/loop-protocol",
+            None,
+            agent_report_comment_urls=[pr_comment_url],
+        )
+
+    assert exit_code == 0, capsule
+    agent_generated = capsule["context_inputs"]["agent_generated"]
+    assert len(agent_generated) == 1
+    assert agent_generated[0]["comment_id"] == agent_comment_id
+    assert agent_generated[0]["validated_schema_id"] == "IMPLEMENT_RESULT_V1"
+    assert agent_generated[0]["validation_status"] == "ok"
+
+
+def test_ac4_pr_comment_not_closing_target_issue_is_fail_closed():
+    """#2606 AC4: a PR conversation comment on a PR that does NOT list the
+    target Issue in `closingIssuesReferences` must fail-closed -- an
+    unrelated PR comment must never be accepted."""
+    pr_comment_url = f"https://github.com/squne121/loop-protocol/pull/{_PR_NUMBER}#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, "", ""),
+            (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=pr_comment_url), ""),
+            (0, _closing_issues_json([1111]), ""),  # closes a DIFFERENT issue
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(
+            958,
+            "squne121/loop-protocol",
+            None,
+            human_context_comment_urls=[pr_comment_url],
+        )
+
+    assert exit_code == 1, capsule
+    assert any(
+        err.startswith("human_supplied_comment_pr_not_closing_target_issue:")
+        for err in capsule["fatal_errors"]
+    ), capsule
+
+
+def test_pr_closes_same_numbered_issue_in_different_repo_fails_closed():
+    """#2606 fix_delta (PR #2614 review comment): a PR whose
+    `closingIssuesReferences` names an issue with the SAME number as the
+    target Issue but in a DIFFERENT repository must never be accepted as
+    closing the target Issue -- `number` alone is not sufficient identity,
+    `url` (repo-qualified) must also match."""
+    pr_comment_url = f"https://github.com/squne121/loop-protocol/pull/{_PR_NUMBER}#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, "", ""),
+            (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=pr_comment_url), ""),
+            (0, _closing_issues_json([958], repo="other-owner/other-repo"), ""),
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(
+            958,
+            "squne121/loop-protocol",
+            None,
+            human_context_comment_urls=[pr_comment_url],
+        )
+
+    assert exit_code == 1, capsule
+    assert any(
+        err.startswith("human_supplied_comment_pr_not_closing_target_issue:")
+        for err in capsule["fatal_errors"]
+    ), capsule
+
+
+def test_ac6_direct_lookup_html_url_readback_mismatch_is_fail_closed():
+    """#2606 AC6: if the direct-lookup readback `html_url` does not exactly
+    match the input URL, resolution fails closed (defends against a
+    comment-ID collision / spoofed URL)."""
+    requested_url = f"https://github.com/squne121/loop-protocol/pull/{_PR_NUMBER}#issuecomment-{_PR_COMMENT_ID}"
+    different_html_url = f"https://github.com/squne121/loop-protocol/pull/9999#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, "", ""),
+            (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=different_html_url), ""),
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(
+            958,
+            "squne121/loop-protocol",
+            None,
+            human_context_comment_urls=[requested_url],
+        )
+
+    assert exit_code == 1, capsule
+    assert any(
+        err.startswith("human_supplied_comment_url_html_url_mismatch:")
+        for err in capsule["fatal_errors"]
+    ), capsule
+
+
+def test_ac6_issue_shaped_direct_lookup_wrong_issue_number_is_fail_closed():
+    """#2606 AC6: an `/issues/N#issuecomment-ID` URL resolved via direct
+    lookup must have N == target Issue number; a foreign Issue's comment
+    (even with a matching html_url readback) fails closed."""
+    foreign_comment_id = 6000000003
+    foreign_issue_url = (
+        f"https://github.com/squne121/loop-protocol/issues/1234#issuecomment-{foreign_comment_id}"
+    )
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, "", ""),
+            (0, _pr_comment_lookup_json(comment_id=foreign_comment_id, html_url=foreign_issue_url), ""),
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(
+            958,
+            "squne121/loop-protocol",
+            None,
+            human_context_comment_urls=[foreign_issue_url],
+        )
+
+    assert exit_code == 1, capsule
+    assert any(
+        err.startswith("human_supplied_comment_issue_number_mismatch:")
+        for err in capsule["fatal_errors"]
+    ), capsule
+
+
+def test_ac7_pr_inline_review_comment_url_shape_is_not_accepted():
+    """#2606 AC7: a PR inline review comment (`#discussion_r<ID>` permalink
+    shape) is out of scope and must not be routed through direct lookup at
+    all -- it fails the initial `#issuecomment-` suffix parse, exactly like
+    an unparseable URL, and never triggers a `gh api` call."""
+    inline_review_url = f"https://github.com/squne121/loop-protocol/pull/{_PR_NUMBER}#discussion_r123456789"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, "", ""),
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(
+            958,
+            "squne121/loop-protocol",
+            None,
+            human_context_comment_urls=[inline_review_url],
+        )
+
+    assert exit_code == 1, capsule
+    assert any(
+        err.startswith("human_supplied_comment_url_unparseable:")
+        for err in capsule["fatal_errors"]
+    ), capsule
+
+
+def test_cross_repo_direct_lookup_url_is_fail_closed_without_extra_gh_call():
+    """A comment URL shaped for a different repo must fail closed on the
+    repo-binding check alone, without issuing an extra `gh api` call (no
+    6th mocked command is provided -- an IndexError would surface if the
+    implementation attempted a lookup)."""
+    foreign_repo_url = f"https://github.com/someone-else/other-repo/issues/958#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, "", ""),
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(
+            958,
+            "squne121/loop-protocol",
+            None,
+            human_context_comment_urls=[foreign_repo_url],
+        )
+
+    assert exit_code == 1, capsule
+    assert any(
+        err.startswith("human_supplied_comment_repo_mismatch:") for err in capsule["fatal_errors"]
+    ), capsule
