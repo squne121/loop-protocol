@@ -151,6 +151,33 @@ def test_missing_config_carrier_is_fixture_authentication_failure(monkeypatch, i
     assert graphql_error.value.reason_code == "gh_graphql_failed"
 
 
+@pytest.mark.parametrize("unavailable_path", [("issue", "view"), ("api", "graphql")])
+def test_given_child_resource_exception_when_canary_runs_then_it_is_supplemental_unavailability(
+    monkeypatch, capsys, isolated_config_only_env, unavailable_path
+):
+    """GIVEN an unavailable child resource WHEN the canary runs THEN it never escapes as failure."""
+    fake_gh, _selected_config, _marker = isolated_config_only_env
+    canary = _load_runtime_canary()
+    monkeypatch.setattr(canary.rsrp, "_resolve_trusted_gh_binary", lambda _root: str(fake_gh))
+
+    def unavailable_run_gh(_gh_bin, args, **_kwargs):
+        if tuple(args[:2]) == unavailable_path:
+            raise rsrp.ScopeRollupPreflightError("gh_timeout")
+        if args[:2] == ["issue", "view"]:
+            return 0, '{"number":2611}', ""
+        return 0, '{"data":{"viewer":{"login":"fixture-user"}}}', ""
+
+    monkeypatch.setattr(canary.rsrp, "_run_gh", unavailable_run_gh)
+
+    exit_code = canary.main(["--repo", "squne121/loop-protocol", "--issue-number", "2611"])
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 77
+    assert result["verdict"] == "UNAVAILABLE/SKIP"
+    assert result["failure_class"] == "child_resource_unavailable"
+    assert result["fallback"] is False
+
+
 def test_graphql_non_auth_failures_remain_distinct_and_fail_closed(monkeypatch, capsys, tmp_path):
     """GIVEN a GraphQL partial response WHEN canary runs THEN it is not rewritten as auth or success."""
     fake_gh, selected_config, _marker = _write_fake_gh(tmp_path, graphql_partial_error=True)

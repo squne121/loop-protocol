@@ -114,10 +114,29 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _child_resource_unavailable() -> int:
+    """Classify a failed child invocation as supplemental unavailability."""
+    return _emit(
+        _result(
+            "UNAVAILABLE/SKIP",
+            carrier_source="gh_config_dir",
+            carrier_path_match=None,
+            failure_class="child_resource_unavailable",
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.repo != TRUSTED_REPO or args.issue_number <= 0:
-        return _emit(_result("FAIL", carrier_source=None, carrier_path_match=None, failure_class="invalid_target"))
+        return _emit(
+            _result(
+                "FAIL",
+                carrier_source=None,
+                carrier_path_match=None,
+                failure_class="invalid_target",
+            )
+        )
 
     # The canary must not infer an XDG/HOME fallback.  Without a caller-selected
     # carrier it cannot test the exact boundary and is diagnostic-only unavailable.
@@ -163,7 +182,10 @@ def main(argv: list[str] | None = None) -> int:
         "--json",
         "number",
     ]
-    issue_rc, issue_out, issue_err = rsrp._run_gh(gh_bin, issue_args)
+    try:
+        issue_rc, issue_out, issue_err = rsrp._run_gh(gh_bin, issue_args)
+    except rsrp.ScopeRollupPreflightError:
+        return _child_resource_unavailable()
     if issue_rc != 0:
         return _emit(
             _result(
@@ -183,18 +205,23 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
 
-    graphql_rc, graphql_out, graphql_err = rsrp._run_gh(
-        gh_bin,
-        ["api", "graphql", "-f", "query=query { viewer { login } }"],
-        timeout=rsrp.GRAPHQL_TIMEOUT_SECONDS,
-    )
+    try:
+        graphql_rc, graphql_out, graphql_err = rsrp._run_gh(
+            gh_bin,
+            ["api", "graphql", "-f", "query=query { viewer { login } }"],
+            timeout=rsrp.GRAPHQL_TIMEOUT_SECONDS,
+        )
+    except rsrp.ScopeRollupPreflightError:
+        return _child_resource_unavailable()
     if graphql_rc != 0:
         return _emit(
             _result(
                 "FAIL",
                 carrier_source="gh_config_dir",
                 carrier_path_match=None,
-                failure_class=("authentication_failure" if _is_auth_failure(graphql_err) else "graphql_resource_failure"),
+                failure_class=(
+                    "authentication_failure" if _is_auth_failure(graphql_err) else "graphql_resource_failure"
+                ),
             )
         )
     graphql_data = _parse_json_object(graphql_out)
