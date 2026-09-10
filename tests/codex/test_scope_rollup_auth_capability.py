@@ -115,26 +115,34 @@ def test_child_preserves_launcher_selected_config_carrier(isolated_config_only_e
 
 
 def test_actual_process_runtime_canary_requires_direct_graphql_provenance_without_fallback(
-    monkeypatch, capsys, isolated_config_only_env
+    monkeypatch, capsys, isolated_config_only_env, tmp_path
 ):
     """GIVEN config-only auth WHEN canary runs THEN issue and direct GraphQL use the real child boundary."""
-    fake_gh, _selected_config, marker = isolated_config_only_env
+    fake_gh, selected_config, marker = isolated_config_only_env
+    monkeypatch.chdir(tmp_path)
     canary = _load_runtime_canary()
     monkeypatch.setattr(canary.rsrp, "_resolve_trusted_gh_binary", lambda _root: str(fake_gh))
 
     exit_code = canary.main(["--repo", "squne121/loop-protocol", "--issue-number", "2611"])
-    result = json.loads(capsys.readouterr().out)
+    output = capsys.readouterr().out
     calls = [json.loads(line) for line in marker.read_text(encoding="utf-8").splitlines()]
+    artifacts = list((tmp_path / "artifacts").glob("runtime-verification-AC4-*.log"))
 
     assert exit_code == 0
-    assert result["verdict"] == "PASS"
-    assert result["execution_path"] == "direct_graphql"
-    assert result["fallback"] is False
-    assert result["carrier_source"] == "gh_config_dir"
-    assert result["carrier_path_match"] is True
+    assert "verdict=PASS" in output
+    assert "execution_path=direct_graphql" in output
+    assert "fallback=false" in output
+    assert "carrier_source=gh_config_dir" in output
+    assert "carrier_path_match=true" in output
     assert [call["path"] for call in calls] == ["auth_status", "issue_view", "graphql"]
     assert all(call["carrier_path_match"] for call in calls)
     assert all(call["tokens_unset"] for call in calls)
+    assert len(artifacts) == 1
+    artifact = artifacts[0].read_text(encoding="utf-8")
+    assert artifact.startswith("=== Runtime Verification Log ===\nAC: AC4")
+    assert "Result: PASS" in artifact
+    assert str(selected_config) not in artifact
+    assert "SCOPE_ROLLUP_AUTH_CAPABILITY_RUNTIME_V1" not in artifact
 
 
 def test_missing_config_carrier_is_fixture_authentication_failure(monkeypatch, isolated_config_only_env):
@@ -153,10 +161,11 @@ def test_missing_config_carrier_is_fixture_authentication_failure(monkeypatch, i
 
 @pytest.mark.parametrize("unavailable_path", [("issue", "view"), ("api", "graphql")])
 def test_given_child_resource_exception_when_canary_runs_then_it_is_supplemental_unavailability(
-    monkeypatch, capsys, isolated_config_only_env, unavailable_path
+    monkeypatch, capsys, isolated_config_only_env, unavailable_path, tmp_path
 ):
     """GIVEN an unavailable child resource WHEN the canary runs THEN it never escapes as failure."""
     fake_gh, _selected_config, _marker = isolated_config_only_env
+    monkeypatch.chdir(tmp_path)
     canary = _load_runtime_canary()
     monkeypatch.setattr(canary.rsrp, "_resolve_trusted_gh_binary", lambda _root: str(fake_gh))
 
@@ -170,17 +179,18 @@ def test_given_child_resource_exception_when_canary_runs_then_it_is_supplemental
     monkeypatch.setattr(canary.rsrp, "_run_gh", unavailable_run_gh)
 
     exit_code = canary.main(["--repo", "squne121/loop-protocol", "--issue-number", "2611"])
-    result = json.loads(capsys.readouterr().out)
+    output = capsys.readouterr().out
 
     assert exit_code == 77
-    assert result["verdict"] == "UNAVAILABLE/SKIP"
-    assert result["failure_class"] == "child_resource_unavailable"
-    assert result["fallback"] is False
+    assert "verdict=UNAVAILABLE/SKIP" in output
+    assert "failure_class=child_resource_unavailable" in output
+    assert "fallback=false" in output
 
 
 def test_graphql_non_auth_failures_remain_distinct_and_fail_closed(monkeypatch, capsys, tmp_path):
     """GIVEN a GraphQL partial response WHEN canary runs THEN it is not rewritten as auth or success."""
     fake_gh, selected_config, _marker = _write_fake_gh(tmp_path, graphql_partial_error=True)
+    monkeypatch.chdir(tmp_path)
     for key, value in {
         "HOME": str(tmp_path / "isolated-home"),
         "XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
@@ -196,20 +206,21 @@ def test_graphql_non_auth_failures_remain_distinct_and_fail_closed(monkeypatch, 
     monkeypatch.setattr(canary.rsrp, "_resolve_trusted_gh_binary", lambda _root: str(fake_gh))
 
     exit_code = canary.main(["--repo", "squne121/loop-protocol", "--issue-number", "2611"])
-    result = json.loads(capsys.readouterr().out)
+    output = capsys.readouterr().out
 
     assert exit_code == 1
-    assert result["verdict"] == "FAIL"
-    assert result["failure_class"] == "graphql_partial_error"
-    assert result["failure_class"] != "authentication_failure"
-    assert result["fallback"] is False
+    assert "verdict=FAIL" in output
+    assert "failure_class=graphql_partial_error" in output
+    assert "failure_class=authentication_failure" not in output
+    assert "fallback=false" in output
 
 
 def test_runtime_canary_and_regressions_never_expose_secret_or_config_content(
-    monkeypatch, capsys, isolated_config_only_env
+    monkeypatch, capsys, isolated_config_only_env, tmp_path
 ):
     """GIVEN secret-like ambient values WHEN regression runs THEN its diagnostic has only nonsecret provenance."""
     fake_gh, selected_config, _marker = isolated_config_only_env
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GH_TOKEN", "ambient-token-must-not-reach-child")
     monkeypatch.setenv("GITHUB_TOKEN", "ambient-github-token-must-not-reach-child")
     canary = _load_runtime_canary()
