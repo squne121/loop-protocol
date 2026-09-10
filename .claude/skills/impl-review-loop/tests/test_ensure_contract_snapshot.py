@@ -48,6 +48,9 @@ is_go_base_binding_current = _ecs_mod.is_go_base_binding_current
 _real_verify_snapshot_authority_postcondition = (
     _ecs_mod.verify_snapshot_authority_postcondition
 )
+_real_verify_controlled_publisher_comment_id_binding = (
+    _ecs_mod.verify_controlled_publisher_comment_id_binding
+)
 
 _PARSER_PATH = (
     _HERE.parent.parent / "issue-contract-review" / "scripts"
@@ -3091,3 +3094,245 @@ class TestProducerParserEscapedAdvisoryRoundTrip:
         assert isinstance(vc_preflight["classifications"], list)
         assert vc_preflight["classifications"][0]["ac"] == classifications[0]["ac"]
         assert vc_preflight["classifications_transport"]["compact"] is True
+
+
+class TestPatchCommentTransportAndReconciliation:
+    """Issue #2619 real producer/PATCH/readback/parser regressions."""
+
+    _COMMENT_ID = 2619001
+
+    @staticmethod
+    def _trusted_remote_comment(body: str) -> dict:
+        return {
+            "id": TestPatchCommentTransportAndReconciliation._COMMENT_ID,
+            "issue_url": f"https://api.github.com/repos/{_REPO}/issues/{_ISSUE_NUMBER}",
+            "html_url": f"{_ISSUE_URL}#issuecomment-{TestPatchCommentTransportAndReconciliation._COMMENT_ID}",
+            "user": {"login": "squne121", "id": 63350259, "type": "User"},
+            "author_association": "OWNER",
+            "body": body,
+        }
+
+    @staticmethod
+    def _review_result(classifications: list[dict]) -> dict:
+        return {
+            "checks": {
+                "readiness": "go",
+                "blockers": "pass",
+                "product_spec": "pass",
+                "product_spec_check": {"decision": "pass"},
+                "vc_preflight": "pass",
+                "declared_path_overlap": {"advisory": True},
+            },
+            "vc_preflight_classifications": classifications,
+        }
+
+    def _final_comment_body(self, classifications: list[dict]) -> str:
+        fingerprint = {
+            "issue_number": _ISSUE_NUMBER,
+            "contract_source_kind": "issue_comment",
+            "contract_source_id": str(self._COMMENT_ID),
+            "contract_body_sha256": _SAMPLE_BODY_SHA256,
+            "allowed_paths_normalized_sha256": "b" * 64,
+            "base_ref": "main",
+            "base_sha_at_snapshot": "c" * 40,
+        }
+        return _ecs_mod._build_contract_review_comment(
+            issue_number=_ISSUE_NUMBER,
+            repo=_REPO,
+            review_result=self._review_result(classifications),
+            idempotency_marker="<!-- marker -->",
+            body_sha256=_SAMPLE_BODY_SHA256,
+            expected_contract_fingerprint=fingerprint,
+        )
+
+    def _install_remote_boundary(self, monkeypatch, remote: dict, patch_response: str, after_patch=None):
+        endpoint = f"repos/{_REPO}/issues/comments/{self._COMMENT_ID}"
+        calls = {"patch": [], "get": []}
+
+        def fake_run(command, *, input=None, **_kwargs):
+            if "--method" in command:
+                assert command[command.index("--method") + 1] == "PATCH"
+                assert "--silent" in command
+                assert command.count(endpoint) == 1
+                assert command[command.index("--input") - 1] == endpoint
+                assert input is not None
+                payload = json.loads(input.decode("utf-8"))
+                calls["patch"].append(payload)
+                remote["body"] = payload["body"]
+                if after_patch is not None:
+                    after_patch(remote)
+                if patch_response == "invalid_json":
+                    return MagicMock(returncode=0, stdout=b"{")
+                response = dict(remote)
+                if patch_response == "id_mismatch":
+                    response["id"] += 1
+                elif patch_response == "body_mismatch":
+                    response["body"] = "stale PATCH representation"
+                return MagicMock(
+                    returncode=0,
+                    stdout=json.dumps(response).encode("utf-8"),
+                )
+
+            assert command.count(endpoint) == 1
+            assert command[-1] == endpoint
+            calls["get"].append(command)
+            if patch_response == "get_failure":
+                return MagicMock(returncode=1, stdout="")
+            return MagicMock(returncode=0, stdout=json.dumps(remote))
+
+        monkeypatch.setattr(_ecs_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(_ecs_mod, "patch_comment", patch_comment)
+        monkeypatch.setattr(
+            _ecs_mod,
+            "verify_controlled_publisher_comment_id_binding",
+            _real_verify_controlled_publisher_comment_id_binding,
+        )
+        return calls
+
+    def test_given_small_non_compacted_escaping_values_when_patched_then_exact_body_round_trips_through_real_parser(
+        self, monkeypatch
+    ):
+        classifications = [
+            {
+                "ac": "AC1a",
+                "decision": "pass",
+                "stdout_head": [r"\^[[2K", "\x1b[2K", r"path\foo\bar"],
+                "stderr_head": [r"\q", "runner's output", "line1\nline2\tvalue"],
+            }
+        ]
+        final_body = self._final_comment_body(classifications)
+        remote = self._trusted_remote_comment("provisional")
+        calls = self._install_remote_boundary(monkeypatch, remote, "exact")
+
+        ok, error = _ecs_mod.patch_comment(
+            _ISSUE_NUMBER, _REPO, self._COMMENT_ID, final_body
+        )
+
+        assert (ok, error) == (True, None)
+        assert len(calls["patch"]) == 1
+        assert calls["patch"][0]["body"] == final_body
+        assert remote["body"] == final_body
+        assert len(calls["get"]) == 1
+        parsed = _parser_mod.parse_contract_review_results([remote], _ISSUE_URL)
+        assert len(parsed) == 1
+        assert parsed[0]["status"] == "go"
+        assert _parser_mod.is_fingerprint_ready_go(
+            parsed[0]["inner"], self._COMMENT_ID, _ISSUE_NUMBER
+        )
+        parsed_classification = parsed[0]["inner"]["checks"]["vc_preflight"]["classifications"][0]
+        assert parsed_classification == classifications[0]
+        assert parsed[0]["inner"]["checks"]["vc_preflight"]["classifications_transport"] == {
+            "schema": "vc_preflight_classifications_transport/v1",
+            "classification_count": 1,
+            "original_payload_sha256": _ecs_mod.sha256_of(
+                json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
+            ),
+            "compact": False,
+            "truncated": False,
+        }
+
+    def test_given_large_payload_when_patched_then_compaction_metadata_and_nonverbose_fields_round_trip_to_valid_go(
+        self, monkeypatch
+    ):
+        classifications = [
+            {
+                "ac": "AC1b",
+                "decision": "pass",
+                "category": "regression_gate",
+                "stdout_head": [r"\^[[2K" + "x" * 17_000],
+                "stderr_head": ["\x1b[2K" + "y" * 17_000],
+                "runner_env_delta": {"large": "z" * 17_000},
+            }
+        ]
+        final_body = self._final_comment_body(classifications)
+        remote = self._trusted_remote_comment("provisional")
+        calls = self._install_remote_boundary(monkeypatch, remote, "exact")
+
+        ok, error = _ecs_mod.patch_comment(
+            _ISSUE_NUMBER, _REPO, self._COMMENT_ID, final_body
+        )
+
+        assert (ok, error) == (True, None)
+        assert len(calls["patch"]) == 1
+        assert calls["patch"][0]["body"] == final_body
+        assert len(calls["get"]) == 1
+        parsed = _parser_mod.parse_contract_review_results([remote], _ISSUE_URL)
+        assert len(parsed) == 1
+        assert parsed[0]["status"] == "go"
+        vc_preflight = parsed[0]["inner"]["checks"]["vc_preflight"]
+        assert vc_preflight["classifications"] == [{
+            "ac": "AC1b", "decision": "pass", "category": "regression_gate"
+        }]
+        assert vc_preflight["classifications_transport"] == {
+            "schema": "vc_preflight_classifications_transport/v1",
+            "classification_count": 1,
+            "original_payload_sha256": _ecs_mod.sha256_of(
+                json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
+            ),
+            "compact": True,
+            "truncated": True,
+        }
+        assert _parser_mod.is_fingerprint_ready_go(
+            parsed[0]["inner"], self._COMMENT_ID, _ISSUE_NUMBER
+        )
+
+    @pytest.mark.parametrize(
+        "patch_response", ["invalid_json", "id_mismatch", "body_mismatch"]
+    )
+    def test_given_untrusted_patch_success_representation_when_authoritative_get_fully_binds_then_reconciles_once(
+        self, monkeypatch, patch_response
+    ):
+        remote = self._trusted_remote_comment("before")
+        calls = self._install_remote_boundary(monkeypatch, remote, patch_response)
+
+        ok, error = _ecs_mod.patch_comment(
+            _ISSUE_NUMBER, _REPO, self._COMMENT_ID, "final body"
+        )
+
+        assert (ok, error) == (True, None)
+        assert len(calls["patch"]) == 1
+        assert len(calls["get"]) == 1
+
+    @pytest.mark.parametrize(
+        ("failure", "expected_error"),
+        [
+            ("get_failure", "binding_readback_error"),
+            ("comment_id", "binding_id_mismatch"),
+            ("body", "binding_body_hash_mismatch"),
+            ("issue", "binding_issue_mismatch"),
+            ("html_url", "binding_html_url_mismatch"),
+            ("publisher", "binding_publisher_untrusted"),
+        ],
+    )
+    def test_given_untrusted_patch_success_representation_when_authoritative_get_binding_fails_then_fails_closed(
+        self, monkeypatch, failure, expected_error
+    ):
+        remote = self._trusted_remote_comment("before")
+
+        def tamper_readback(comment):
+            if failure == "comment_id":
+                comment["id"] += 1
+            elif failure == "body":
+                comment["body"] = "wrong final body"
+            elif failure == "issue":
+                comment["issue_url"] = "https://api.github.com/repos/other/repo/issues/1"
+            elif failure == "html_url":
+                comment["html_url"] = f"{_ISSUE_URL}#issuecomment-999"
+            elif failure == "publisher":
+                comment["user"] = {"login": "outside", "id": 1, "type": "User"}
+
+        calls = self._install_remote_boundary(
+            monkeypatch,
+            remote,
+            "get_failure" if failure == "get_failure" else "body_mismatch",
+            after_patch=tamper_readback,
+        )
+
+        ok, error = _ecs_mod.patch_comment(
+            _ISSUE_NUMBER, _REPO, self._COMMENT_ID, "final body"
+        )
+
+        assert ok is False
+        assert error == f"patch_get_reconciliation_failed:{expected_error}"
+        assert len(calls["patch"]) == 1
+        assert len(calls["get"]) == 1
