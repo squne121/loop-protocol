@@ -39,6 +39,7 @@ reviewer_verdict（`verdict`/`reviewed_head_sha`/`blockers`/`warnings`）と liv
 | `route_scope_clean_reconciliation`（#2102） | main drift による base-bound evidence の選択的失効を実行してから Step 5 を resume する（終了しない。手順は下記「main drift の scope-clean reconciliation 再開（resume）手順」参照） |
 | `route_stale_head_rereview` | 現在 head で PR review を再実行（終了しない） |
 | `continue_loop` | LOOP_STATE.iteration += 1、Step 1 に戻る（blockers を fix_delta として渡す） |
+| `already_satisfied`（#2607。`step-5-mergeability-handling.md` の「already_satisfied recovery route」参照） | `termination_reason: already_satisfied` を立て、終了処理へ。`decision.selected_action` の `result`/`recommendation` を報告するのみで、PR/Issue の close 等の mutation は実行しない |
 | `route_human_escalation` | `termination_reason: human_escalation` を立て、即停止（`HUMAN_REVIEW_REQUIRED` verdict、または max iteration 到達・secret/protected-path gate 等の実 hard gate の場合のみ） |
 | `conflict_hard_stop` | CONFLICTING PR Escalation Runbook 発動（actual conflict のみ。#1860 Owner Decision の唯一の hard stop） |
 | `fail_closed`（`mergeability_unknown` / `merge_state_status_*_not_conflict_defer_to_ci_evaluator`） | warning として記録し、bounded retry または次サイクルでの current-head CI / branch-protection 再評価に委ねる（human escalation にはしない） |
@@ -556,8 +557,8 @@ LOOP_STATE:
   iteration: <最終 iteration 数>
   max_iterations: <上限>
   last_step: judgment
-  termination_reason: approved | max_iterations | human_escalation
-  last_route: approved | continue_loop | route_to_update_branch | route_scope_clean_reconciliation | route_stale_head_rereview | route_human_escalation | conflict_hard_stop | fail_closed | null
+  termination_reason: approved | max_iterations | human_escalation | already_satisfied
+  last_route: approved | continue_loop | already_satisfied | route_to_update_branch | route_scope_clean_reconciliation | route_stale_head_rereview | route_human_escalation | conflict_hard_stop | fail_closed | null
   unresolved_blockers: []
   scope_rollup_decision: <ISSUE_SCOPE_ROLLUP_DECISION_V2、advisory>
 ```
