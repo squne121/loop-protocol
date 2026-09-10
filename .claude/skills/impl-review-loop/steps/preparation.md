@@ -222,10 +222,12 @@ intake_gate:
 
 **単一の共通 choke point（特定の分岐内にネストしない）**: 上記 0-a のステップ 5〜8（`next_action.route` が `proceed_to_step_1` / `request_readiness_check` / `run_contract_blocker_triage` / `human_review_required` のどの値であっても）、および下記「1-d. Product Spec Check の評価」で `product_spec_preflight.routing_action` が `continue` / `stop_human` / `refresh_contract_snapshot` のどの値であっても、それらの分岐が Step 1（implementation-worker dispatch）へ実際に到達する **直前**に、以下の共通判定を必ず一度だけ評価する。本 choke point は `## 0. Intake Gate` を通過済み（`INTAKE_GATE_RESULT_V1.status: pass`）の場合にのみ評価される。
 
+本 choke point の判定ロジック自体は、`route_loop_verdict_v2.py` の production 関数 `resolve_already_satisfied_early_exit_decision(next_action_route, product_spec_routing_action, pr_exists, base_ac_satisfied)` の出力（`dispatch_step1` / `early_exit` / `recommendation`）に従う。判定ロジックを本手順内や test ファイル内で再実装しない（Issue #2607 fix_delta iteration 1, P0-1）。以下の 1・2 は、この production 関数に渡す `pr_exists` / `base_ac_satisfied` の各入力事実をどう取得するかの手順であり、判定そのものではない。
+
 判定条件（両方成立した場合のみ early-exit）:
 
-1. **PR 未作成**: 対象 Issue にリンクされた open/merged PR が存在しない（`gh pr list --repo <repo> --search "<issue_number> in:body" --state all` 等で確認する。closed/not-planned な過去 PR は「未作成」として扱わない別ケースであり、本判定は open/merged PR の不在のみを見る）
-2. **base_ac_satisfied が true**: current main HEAD（`git rev-parse HEAD`）に対して `test-runner` SubAgent を独立実行し、対象 Issue の `## Verification Commands` を current main の checkout に対して評価させた `TEST_VERDICT_MACHINE/v2`（`head_sha` に current main HEAD SHA を記録）の `runtime_ac_results` が全て `status: pass` であること
+1. **PR 未作成（`no_linked_pr_ever` = true。`pr_exists` の否定）**: 対象 Issue に GitHub 上で構造化リンクされた PR が all-state（open/closed/merged）で一件も存在しない。判定には `gh pr list --search "<issue_number> in:body"` のような自由文検索を用いず、`gh pr list --repo <repo> --state all --json number,closingIssuesReferences` で取得できる `closingIssuesReferences`（構造化リンク情報）を用いる（`build_intake_capsule.py::_pr_closes_target_issue()` が個別 PR に対して採用している構造化リンク判定と同一パターンを、PR 一覧取得側で踏襲する。`build_intake_capsule.py` 自体は本 Issue の Allowed Paths 外であり変更しない）。取得した各エントリの `closingIssuesReferences[].number` のいずれかが対象 Issue 番号と一致する PR が1件でもあれば `pr_exists = true`（early-exit 不発）
+2. **base_ac_satisfied が true**: `evidence_base_sha`（current main HEAD の live SHA）を、`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py` の `fetch_live_issue()` が使う既存パターンと同一の `gh api repos/<repo>/git/refs/heads/main --jq '.object.sha'` で取得する（ローカル worktree の `git rev-parse HEAD` は使わない。ローカル checkout の HEAD は live main と乖離しうるため）。取得した `evidence_base_sha` の checkout に対して `test-runner` SubAgent を独立実行し、対象 Issue の `## Verification Commands` を current main の checkout に対して評価させた `TEST_VERDICT_MACHINE/v2`（`head_sha` に `evidence_base_sha` を記録）の `runtime_ac_results` が全て `status: pass` であること
 
 いずれか一方でも成立しない場合は本 choke point は不発（no-op）であり、通常どおり Step 1 へ進む。
 

@@ -178,7 +178,7 @@ Draft PR を要求しているため、単独では human escalation の理由�
 
 recovery route は early-exit が不発だった（PR が既に作成された）場合にのみ到達しうる後続の safety net であり、early-exit の再実行ではない。両者は同一サイクル内で二重に発火しない（early-exit は PR 未作成時のみ評価され、recovery route は PR 既存時のみ評価されるため、条件が排他的）。
 
-control-plane は Step 5 の通常 `live_mergeability` 構築（`build_step5_live_mergeability()`）に加えて、`already_satisfied_evidence` を独立に構築する場合のみ以下を `live_mergeability` へ追加する（未構築なら追加しない。追加しなければ `route_loop_verdict_v2()` は従来どおり `continue_loop` を返す）:
+control-plane は Step 5 の通常 `live_mergeability` 構築（`build_step5_live_mergeability()`）に加えて、`already_satisfied_evidence` を独立に構築する場合のみ以下を `live_mergeability` へ追加する（未構築なら追加しない。追加しなければ `route_loop_verdict_v2()` は従来どおり `continue_loop` を返す）。`already_satisfied_evidence` の3値は自由に組み立てず、`route_loop_verdict_v2.py` の production pure function `build_already_satisfied_evidence(base_test_verdict, pr_head_test_verdict, live_main_sha, live_pr_head_sha)`（Issue #2607 AC13。canonical producer）にそのまま渡して導出する:
 
 ```yaml
 already_satisfied_evidence:

@@ -17,15 +17,14 @@ upstream route values the Issue calls out:
 and that Step 1 (implementation-worker dispatch) is never reached in either
 case once `base_ac_satisfied=true` and no PR exists for the fixture Issue.
 
-This Issue's Allowed Paths do not include a new production script for the
-choke point itself (only SKILL.md / route_loop_verdict_v2.py /
-preparation.md / step-5 docs / these two test files). The choke-point
-decision function therefore lives in `test_already_satisfied_routing.py`
-(this directory) and is loaded here by absolute file path (importlib,
-established pattern -- see e.g. `test_adjudicate_vc_result_e2e_runtime_only.py`
-loading `adjudicate_vc_result.py` the same way) so both the unit-level
-coverage there and this real-dispatch-chain e2e coverage exercise the exact
-same, single-source-of-truth decision function.
+Issue #2607 fix_delta iteration 1 (PR #2626 review comment, P0-1): the
+choke-point decision function, `resolve_already_satisfied_early_exit_
+decision()`, is a PRODUCTION function of `route_loop_verdict_v2.py` (this
+Issue's Allowed Paths exact file) -- imported normally here, exactly as
+`test_already_satisfied_routing.py` (this directory) imports it, so both
+the unit-level coverage there and this real-dispatch-chain e2e coverage
+exercise the exact same, single-source-of-truth production decision
+function (not a test-local re-definition).
 
 SKIP / fallback policy (`docs/dev/runtime-verification-policy.md`):
   - `uv` / repo-local python3 unavailable, or `build_intake_capsule.py`'s
@@ -58,10 +57,17 @@ import pytest
 TESTS_DIR = Path(__file__).resolve().parent
 IMPL_REVIEW_LOOP_DIR = TESTS_DIR.parent
 REPO_ROOT = IMPL_REVIEW_LOOP_DIR.parents[2]
+SCRIPTS_DIR = IMPL_REVIEW_LOOP_DIR / "scripts"
 
 BUILD_INTAKE_CAPSULE_PATH = IMPL_REVIEW_LOOP_DIR / "scripts" / "build_intake_capsule.py"
 EVALUATE_PRODUCT_SPEC_GATE_PATH = IMPL_REVIEW_LOOP_DIR / "scripts" / "evaluate_product_spec_gate.py"
-ALREADY_SATISFIED_ROUTING_TEST_PATH = TESTS_DIR / "test_already_satisfied_routing.py"
+
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from route_loop_verdict_v2 import (  # noqa: E402
+    resolve_already_satisfied_early_exit_decision,
+)
 
 _ARTIFACTS_DIR = REPO_ROOT / "artifacts"
 _ARTIFACT_LOG_PATH = _ARTIFACTS_DIR / (
@@ -116,9 +122,6 @@ def _load_module(name: str, path: Path):
 
 
 _build_intake_capsule = _load_module("already_satisfied_e2e_build_intake_capsule", BUILD_INTAKE_CAPSULE_PATH)
-_already_satisfied_routing = _load_module(
-    "already_satisfied_e2e_routing_helper", ALREADY_SATISFIED_ROUTING_TEST_PATH
-)
 
 
 def _assert_no_fallback_markers(payload: Any) -> None:
@@ -213,7 +216,7 @@ def test_ac12_proceed_to_step_1_route_never_reaches_step1_dispatch_when_already_
     def _dispatch_implementation_worker() -> None:
         calls.append("dispatched")
 
-    decision = _already_satisfied_routing.resolve_already_satisfied_early_exit_decision(
+    decision = resolve_already_satisfied_early_exit_decision(
         next_action_route=real_route,
         product_spec_routing_action="continue",
         pr_exists=False,
@@ -237,7 +240,7 @@ def test_ac12_refresh_contract_snapshot_routing_action_never_reaches_step1_dispa
     def _dispatch_implementation_worker() -> None:
         calls.append("dispatched")
 
-    decision = _already_satisfied_routing.resolve_already_satisfied_early_exit_decision(
+    decision = resolve_already_satisfied_early_exit_decision(
         next_action_route="proceed_to_step_1",
         product_spec_routing_action=real_routing_action,
         pr_exists=False,
@@ -266,7 +269,7 @@ def test_ac12_proceed_to_step_1_route_dispatches_step1_when_base_not_satisfied()
     def _dispatch_implementation_worker() -> None:
         calls.append("dispatched")
 
-    decision = _already_satisfied_routing.resolve_already_satisfied_early_exit_decision(
+    decision = resolve_already_satisfied_early_exit_decision(
         next_action_route=real_route,
         product_spec_routing_action="continue",
         pr_exists=False,
@@ -288,7 +291,7 @@ def test_ac12_refresh_contract_snapshot_routing_action_dispatches_step1_when_pr_
     def _dispatch_implementation_worker() -> None:
         calls.append("dispatched")
 
-    decision = _already_satisfied_routing.resolve_already_satisfied_early_exit_decision(
+    decision = resolve_already_satisfied_early_exit_decision(
         next_action_route="proceed_to_step_1",
         product_spec_routing_action=real_routing_action,
         pr_exists=True,

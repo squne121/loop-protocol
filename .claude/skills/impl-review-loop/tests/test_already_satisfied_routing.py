@@ -32,7 +32,11 @@ SCRIPTS_DIR = IMPL_REVIEW_LOOP_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from route_loop_verdict_v2 import route_loop_verdict_v2  # noqa: E402
+from route_loop_verdict_v2 import (  # noqa: E402
+    build_already_satisfied_evidence,
+    resolve_already_satisfied_early_exit_decision,
+    route_loop_verdict_v2,
+)
 
 SHA_MAIN = "a" * 40
 SHA_OTHER = "b" * 40
@@ -100,62 +104,16 @@ def _evidence(
 # ---------------------------------------------------------------------------
 # preparation.md's early-exit choke point (Issue #2607, PR未作成 path).
 #
-# No new production script is in this Issue's Allowed Paths (only SKILL.md /
-# route_loop_verdict_v2.py / preparation.md / step-5 docs / these two test
-# files). This pure function mirrors, 1:1, the single common choke point
-# documented in preparation.md's "0-a-1. Already-Satisfied Early-Exit choke
-# point" section -- it is loaded directly (via importlib, by absolute path)
-# from test_already_satisfied_early_exit_e2e_runtime_only.py so both the
-# unit-level coverage here and the real-subprocess-driven e2e coverage there
-# exercise the exact same decision function (single source of truth).
-# ---------------------------------------------------------------------------
-
-
-def resolve_already_satisfied_early_exit_decision(
-    *,
-    next_action_route: str,
-    product_spec_routing_action: str,
-    pr_exists: bool,
-    base_ac_satisfied: bool,
-) -> dict[str, Any]:
-    """Pure decision function for preparation.md's `0-a-1` choke point.
-
-    Fires (dispatch_step1=False) iff `pr_exists` is False AND
-    `base_ac_satisfied` is True -- regardless of `next_action_route` /
-    `product_spec_routing_action` (AC5: single common choke point,
-    independent of which upstream branch value is currently driving Step 1
-    continuation).
-    """
-    if pr_exists or not base_ac_satisfied:
-        return {
-            "early_exit": False,
-            "dispatch_step1": True,
-            "reason": "pr_already_exists" if pr_exists else "base_ac_not_satisfied",
-            "upstream_route": next_action_route,
-            "upstream_product_spec_routing_action": product_spec_routing_action,
-        }
-    return {
-        "early_exit": True,
-        "dispatch_step1": False,
-        "reason": "already_satisfied_no_pr_created",
-        "result": {
-            "status": "no_change_required",
-            "termination_reason": "already_satisfied",
-            "merge_ready": False,
-        },
-        "recommendation": {
-            "pr": {"action": "none", "reason": "no_pr_created"},
-            "issue": {
-                "action": "close",
-                "state_reason": "completed",
-                "reason": "requirement_already_delivered",
-            },
-        },
-        "upstream_route": next_action_route,
-        "upstream_product_spec_routing_action": product_spec_routing_action,
-    }
-
-
+# Issue #2607 fix_delta iteration 1 (PR #2626 review comment, P0-1):
+# resolve_already_satisfied_early_exit_decision() is a PRODUCTION function of
+# route_loop_verdict_v2.py (imported above), not a test-local decision
+# helper. This mirrors, 1:1, the single common choke point documented in
+# preparation.md's "0-a-1. Already-Satisfied Early-Exit choke point" section.
+# test_already_satisfied_early_exit_e2e_runtime_only.py imports the SAME
+# production function so both the unit-level coverage here and the
+# real-subprocess-driven e2e coverage there exercise the exact same decision
+# function (single source of truth, reachable from the real production
+# dispatch chain).
 # ---------------------------------------------------------------------------
 # AC2: four-condition gate.
 # ---------------------------------------------------------------------------
@@ -549,3 +507,166 @@ def test_ac11_case8_already_satisfied_selected_action_is_pure_data():
                 _walk(v)
 
     _walk(dict(result.selected_action))
+
+
+# ---------------------------------------------------------------------------
+# AC13: build_already_satisfied_evidence() is the canonical producer of the
+# already_satisfied_evidence triple -- callers do not assemble it freely.
+# ---------------------------------------------------------------------------
+
+SHA_LIVE_MAIN = "d" * 40
+SHA_LIVE_PR_HEAD = "e" * 40
+
+
+def _test_verdict(*, head_sha: str, ac_results: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema": "TEST_VERDICT_MACHINE/v2",
+        "head_sha": head_sha,
+        "runtime_ac_results": ac_results,
+    }
+
+
+def test_ac13_base_ac_satisfied_true_when_fresh_base_run_all_pass():
+    evidence = build_already_satisfied_evidence(
+        base_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_MAIN,
+            ac_results=[
+                {"ac": "AC1", "status": "pass"},
+                {"ac": "AC2", "status": "pass"},
+            ],
+        ),
+        pr_head_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_PR_HEAD,
+            ac_results=[
+                {"ac": "AC1", "status": "pass"},
+                {"ac": "AC2", "status": "pass"},
+            ],
+        ),
+        live_main_sha=SHA_LIVE_MAIN,
+        live_pr_head_sha=SHA_LIVE_PR_HEAD,
+    )
+    assert evidence["base_ac_satisfied"] is True
+    assert evidence["meaningful_pr_delta"] is False
+    assert evidence["evidence_base_sha"] == SHA_LIVE_MAIN
+
+
+def test_ac13_base_ac_satisfied_false_when_base_run_stale_not_live_main():
+    """A base_test_verdict whose head_sha does not match live_main_sha was
+    not actually run against current main -- must fail closed to False, not
+    be trusted."""
+    evidence = build_already_satisfied_evidence(
+        base_test_verdict=_test_verdict(
+            head_sha=SHA_OTHER,  # != live_main_sha
+            ac_results=[{"ac": "AC1", "status": "pass"}],
+        ),
+        pr_head_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_PR_HEAD,
+            ac_results=[{"ac": "AC1", "status": "pass"}],
+        ),
+        live_main_sha=SHA_LIVE_MAIN,
+        live_pr_head_sha=SHA_LIVE_PR_HEAD,
+    )
+    assert evidence["base_ac_satisfied"] is False
+
+
+def test_ac13_base_ac_satisfied_false_when_any_ac_fails():
+    evidence = build_already_satisfied_evidence(
+        base_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_MAIN,
+            ac_results=[
+                {"ac": "AC1", "status": "pass"},
+                {"ac": "AC2", "status": "fail"},
+            ],
+        ),
+        pr_head_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_PR_HEAD,
+            ac_results=[{"ac": "AC1", "status": "pass"}],
+        ),
+        live_main_sha=SHA_LIVE_MAIN,
+        live_pr_head_sha=SHA_LIVE_PR_HEAD,
+    )
+    assert evidence["base_ac_satisfied"] is False
+
+
+def test_ac13_meaningful_pr_delta_true_when_pass_sets_differ():
+    evidence = build_already_satisfied_evidence(
+        base_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_MAIN,
+            ac_results=[
+                {"ac": "AC1", "status": "pass"},
+                {"ac": "AC2", "status": "pass"},
+            ],
+        ),
+        pr_head_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_PR_HEAD,
+            ac_results=[
+                {"ac": "AC1", "status": "pass"},
+                {"ac": "AC2", "status": "fail"},
+            ],
+        ),
+        live_main_sha=SHA_LIVE_MAIN,
+        live_pr_head_sha=SHA_LIVE_PR_HEAD,
+    )
+    assert evidence["meaningful_pr_delta"] is True
+
+
+def test_ac13_meaningful_pr_delta_fails_safe_true_when_pr_head_report_stale():
+    """A pr_head_test_verdict whose head_sha does not match live_pr_head_sha
+    is stale -- the comparison cannot be trusted, so meaningful_pr_delta must
+    fail closed to True (never silently assume no delta)."""
+    evidence = build_already_satisfied_evidence(
+        base_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_MAIN,
+            ac_results=[{"ac": "AC1", "status": "pass"}],
+        ),
+        pr_head_test_verdict=_test_verdict(
+            head_sha=SHA_STALE,  # != live_pr_head_sha
+            ac_results=[{"ac": "AC1", "status": "pass"}],
+        ),
+        live_main_sha=SHA_LIVE_MAIN,
+        live_pr_head_sha=SHA_LIVE_PR_HEAD,
+    )
+    assert evidence["meaningful_pr_delta"] is True
+
+
+def test_ac13_evidence_base_sha_is_always_live_main_sha_not_invented():
+    evidence = build_already_satisfied_evidence(
+        base_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_MAIN,
+            ac_results=[{"ac": "AC1", "status": "pass"}],
+        ),
+        pr_head_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_PR_HEAD,
+            ac_results=[{"ac": "AC1", "status": "pass"}],
+        ),
+        live_main_sha=SHA_LIVE_MAIN,
+        live_pr_head_sha=SHA_LIVE_PR_HEAD,
+    )
+    assert evidence["evidence_base_sha"] == SHA_LIVE_MAIN
+
+
+def test_ac13_output_is_directly_consumable_by_route_loop_verdict_v2():
+    """The producer's output feeds route_loop_verdict_v2() unmodified as
+    already_satisfied_evidence -- proving there is no caller-side free
+    assembly step between the two."""
+    evidence = build_already_satisfied_evidence(
+        base_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_MAIN,
+            ac_results=[{"ac": "AC1", "status": "pass"}],
+        ),
+        pr_head_test_verdict=_test_verdict(
+            head_sha=SHA_LIVE_PR_HEAD,
+            ac_results=[{"ac": "AC1", "status": "pass"}],
+        ),
+        live_main_sha=SHA_LIVE_MAIN,
+        live_pr_head_sha=SHA_LIVE_PR_HEAD,
+    )
+    result = route_loop_verdict_v2(
+        _reviewer_verdict(reviewed_head_sha=SHA_LIVE_PR_HEAD),
+        _live_mergeability(
+            head_sha=SHA_LIVE_PR_HEAD,
+            already_satisfied_evidence=evidence,
+            main_drift=_main_drift(current_base_sha=SHA_LIVE_MAIN, head_sha=SHA_LIVE_PR_HEAD),
+        ),
+    )
+    assert result.route == "already_satisfied"

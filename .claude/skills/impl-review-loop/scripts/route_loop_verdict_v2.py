@@ -36,6 +36,30 @@ Public API
 ----------
 route_loop_verdict_v2(reviewer_verdict, live_mergeability) -> RouteDecision
 
+Issue #2607 (PR review fix_delta iteration 1, P0-1/P1): the preparation.md
+pre-dispatch choke point and the already_satisfied_evidence producer are
+ALSO production functions of this module -- not helpers re-implemented in a
+test file:
+
+resolve_already_satisfied_early_exit_decision(
+    *, next_action_route, product_spec_routing_action, pr_exists,
+    base_ac_satisfied,
+) -> dict
+    Pure decision function backing preparation.md's "0-a-1. Already-Satisfied
+    Early-Exit choke point". Fires (dispatch_step1=False) iff pr_exists is
+    False AND base_ac_satisfied is True, independent of the upstream
+    next_action_route / product_spec_routing_action value (AC5/AC12).
+
+build_already_satisfied_evidence(
+    *, base_test_verdict, pr_head_test_verdict, live_main_sha,
+    live_pr_head_sha,
+) -> dict
+    Canonical producer (AC13) of already_satisfied_evidence's three values
+    (base_ac_satisfied / meaningful_pr_delta / evidence_base_sha) from two
+    independent TEST_VERDICT_MACHINE/v2 reports plus the two live SHAs the
+    caller already resolved. Callers do not assemble the three values
+    themselves.
+
 Issue #1870 (#1856): this function does not accept a ``test_verdict``
 argument. BEHIND routing is derived solely from
 ``live_mergeability["merge_state_status"] == "BEHIND"``. The protected
@@ -636,6 +660,163 @@ def _evaluate_already_satisfied(live_mergeability: Mapping[str, Any]) -> RouteDe
         return None
 
     return _already_satisfied_decision()
+
+
+# ---------------------------------------------------------------------------
+# Issue #2607 fix_delta iteration 1 (PR #2626 review comment, P0-1): the
+# preparation.md pre-dispatch choke point's decision logic is a production
+# function of THIS module, not a helper duplicated inside a test file. Both
+# .claude/skills/impl-review-loop/tests/test_already_satisfied_routing.py
+# and test_already_satisfied_early_exit_e2e_runtime_only.py import this
+# function rather than re-defining it, so unit-level and real-subprocess
+# e2e coverage exercise the exact same single source of truth.
+# ---------------------------------------------------------------------------
+
+
+def resolve_already_satisfied_early_exit_decision(
+    *,
+    next_action_route: str,
+    product_spec_routing_action: str,
+    pr_exists: bool,
+    base_ac_satisfied: bool,
+) -> dict[str, Any]:
+    """Pure decision function for preparation.md's `0-a-1` choke point.
+
+    Fires (dispatch_step1=False) iff `pr_exists` is False AND
+    `base_ac_satisfied` is True -- regardless of `next_action_route` /
+    `product_spec_routing_action` (AC5: single common choke point,
+    independent of which upstream branch value is currently driving Step 1
+    continuation).
+    """
+    if pr_exists or not base_ac_satisfied:
+        return {
+            "early_exit": False,
+            "dispatch_step1": True,
+            "reason": "pr_already_exists" if pr_exists else "base_ac_not_satisfied",
+            "upstream_route": next_action_route,
+            "upstream_product_spec_routing_action": product_spec_routing_action,
+        }
+    return {
+        "early_exit": True,
+        "dispatch_step1": False,
+        "reason": "already_satisfied_no_pr_created",
+        "result": {
+            "status": "no_change_required",
+            "termination_reason": "already_satisfied",
+            "merge_ready": False,
+        },
+        "recommendation": {
+            "pr": {"action": "none", "reason": "no_pr_created"},
+            "issue": {
+                "action": "close",
+                "state_reason": "completed",
+                "reason": "requirement_already_delivered",
+            },
+        },
+        "upstream_route": next_action_route,
+        "upstream_product_spec_routing_action": product_spec_routing_action,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Issue #2607 fix_delta iteration 1 (PR #2626 review comment, P1): canonical
+# producer of already_satisfied_evidence's three values (AC13). Callers
+# supply two independent TEST_VERDICT_MACHINE/v2 reports (test-runner's
+# existing read-only report contract, .claude/agents/test-runner.md) plus
+# the two live SHAs they already resolved (live main HEAD via the
+# fetch_live_issue()-style `gh api .../git/refs/heads/<base_ref>` pattern,
+# and the live PR head SHA) -- this function performs no subprocess / gh /
+# git access of its own (module-level "no gh, git, network, or subprocess
+# calls" invariant, module docstring) and derives the three values rather
+# than letting a caller assemble them freely.
+# ---------------------------------------------------------------------------
+
+
+def _pass_ac_ids(verdict: Any) -> frozenset[str] | None:
+    """Return the set of AC ids with status == "pass" in a
+    TEST_VERDICT_MACHINE/v2's `runtime_ac_results` (`.claude/agents/
+    test-runner.md`'s `runtime_ac_results[].ac` field), or None if the
+    report is malformed/empty and therefore cannot be trusted for a
+    PASS-set comparison."""
+    if not isinstance(verdict, Mapping):
+        return None
+    results = verdict.get("runtime_ac_results")
+    if not isinstance(results, list) or not results:
+        return None
+    ac_ids: set[str] = set()
+    for entry in results:
+        if not isinstance(entry, Mapping):
+            return None
+        ac_id = entry.get("ac")
+        status = entry.get("status")
+        if not isinstance(ac_id, str) or not ac_id:
+            return None
+        if status == "pass":
+            ac_ids.add(ac_id)
+        elif status not in ("fail", "skip"):
+            return None
+    return frozenset(ac_ids)
+
+
+def build_already_satisfied_evidence(
+    *,
+    base_test_verdict: Mapping[str, Any],
+    pr_head_test_verdict: Mapping[str, Any],
+    live_main_sha: str,
+    live_pr_head_sha: str,
+) -> dict[str, Any]:
+    """Derive already_satisfied_evidence's three values (AC13).
+
+    base_ac_satisfied:
+        True only when `base_test_verdict["head_sha"] == live_main_sha`
+        (the base run was actually executed against the SHA the caller just
+        resolved as current live main -- not some earlier/stale checkout)
+        AND every entry in its `runtime_ac_results` has `status: pass`.
+        A stale/mismatched base run fails closed to False rather than being
+        silently trusted.
+
+    meaningful_pr_delta:
+        PASS-set comparison between `base_test_verdict` and
+        `pr_head_test_verdict`'s `runtime_ac_results` (AC4 -- never a
+        `blockers[]` free-text heuristic). Fails closed to True (assume a
+        delta exists) when the PR-head report is stale
+        (`pr_head_test_verdict["head_sha"] != live_pr_head_sha`) or either
+        report is malformed/empty, since an untrustworthy comparison must
+        never suppress `already_satisfied`.
+
+    evidence_base_sha:
+        Always `live_main_sha` -- the live main SHA the caller resolved via
+        the canonical `gh api repos/<repo>/git/refs/heads/<base_ref>
+        --jq '.object.sha'` pattern (see preparation.md), not a value this
+        function invents.
+    """
+    base_ac_satisfied = (
+        isinstance(base_test_verdict, Mapping)
+        and base_test_verdict.get("head_sha") == live_main_sha
+        and _pass_ac_ids(base_test_verdict) is not None
+        and all(
+            isinstance(entry, Mapping) and entry.get("status") == "pass"
+            for entry in base_test_verdict.get("runtime_ac_results", [])
+        )
+    )
+
+    pr_head_fresh = (
+        isinstance(pr_head_test_verdict, Mapping)
+        and pr_head_test_verdict.get("head_sha") == live_pr_head_sha
+    )
+    base_pass_ids = _pass_ac_ids(base_test_verdict)
+    pr_pass_ids = _pass_ac_ids(pr_head_test_verdict) if pr_head_fresh else None
+
+    if base_pass_ids is None or pr_pass_ids is None:
+        meaningful_pr_delta = True
+    else:
+        meaningful_pr_delta = base_pass_ids != pr_pass_ids
+
+    return {
+        "base_ac_satisfied": bool(base_ac_satisfied),
+        "meaningful_pr_delta": bool(meaningful_pr_delta),
+        "evidence_base_sha": live_main_sha,
+    }
 
 
 def _reconciliation_decision(drift: MainDriftDecision) -> RouteDecision:
