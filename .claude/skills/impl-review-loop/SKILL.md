@@ -150,7 +150,7 @@ LOOP_STATE:
 
 > **重要**: `verdict: APPROVE` 単独では終了しない。live mergeability が `CLEAN`/`HAS_HOOKS` かつ `blockers == []` の両条件が必要（`route_loop_verdict_v2()` が判定する）。
 
-## Already-Satisfied Recommendation Structure（`already_satisfied` の recommendation 構造、Issue #2607 AC8）
+## Already-Satisfied Recommendation Structure（要求が既に充足済みの場合の推奨構造。`already_satisfied` の recommendation 構造、Issue #2607 AC8）
 
 `already_satisfied` は 2 つの経路（`preparation.md` の early-exit、`route_loop_verdict_v2()` の Step 5 recovery route）のいずれから到達しても、以下と同じ `result` / `recommendation` 構造で報告する。`route_loop_verdict_v2()` 側は `RouteDecision.selected_action` の `result` / `recommendation` キーとしてこの構造をそのまま返す（新規 top-level schema は新設しない）。
 

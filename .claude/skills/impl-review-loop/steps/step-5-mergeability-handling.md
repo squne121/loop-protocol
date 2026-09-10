@@ -154,7 +154,7 @@ Issue #1870（#1856）: `route_loop_verdict_v2()` は `test_verdict` を一切�
 |---|---|---|
 | `approved` | `APPROVE` かつ mergeable/merge_state_status が `MERGEABLE`/`CLEAN` または `MERGEABLE`/`HAS_HOOKS` | 終了（approved）。`step-5-feedback-and-termination.md` の残り gate を確認 |
 | `continue_loop` | `REQUEST_CHANGES`（actual conflict がない場合。`already_satisfied_evidence` 未提供、または下記 `already_satisfied` の 4 条件のいずれかが不成立） | 次イテレーションへ（blockers を fix_delta に） |
-| `already_satisfied` | `REQUEST_CHANGES` かつ `live_mergeability.already_satisfied_evidence.base_ac_satisfied == true` かつ `meaningful_pr_delta == false` かつ `evidence_base_sha` が `live_mergeability.main_drift.current_base_sha` と一致（#2607。下記「already_satisfied recovery route（Step 5）」参照） | 終了。`decision.selected_action` の `result`/`recommendation` を `SKILL.md` の Already-Satisfied Recommendation Structure に従って報告。PR/Issue の close は control-plane・router のいずれも実行しない |
+| `already_satisfied` | `REQUEST_CHANGES` かつ `live_mergeability.already_satisfied_evidence.base_ac_satisfied == true` かつ `meaningful_pr_delta == false` かつ `evidence_base_sha` が `live_mergeability.main_drift.current_base_sha` と一致（#2607。下記「already_satisfied recovery route（既存 PR に対する Step 5 回復ルート）」参照） | 終了。`decision.selected_action` の `result`/`recommendation` を `SKILL.md` の Already-Satisfied Recommendation Structure に従って報告。PR/Issue の close は control-plane・router のいずれも実行しない |
 | `route_stale_head_rereview` | `APPROVE` かつ `reviewed_head_sha != live head_sha`（actual conflict がない場合） | Step 4 を現在の head で再委譲し、Step 5 を最初からやり直す |
 | `route_to_update_branch` | `APPROVE` かつ `merge_state_status == BEHIND` | 下記「BEHIND 分岐 routing」参照 |
 | `route_human_escalation` | `HUMAN_REVIEW_REQUIRED`（actual conflict がない場合） | 人間判断を仰いで停止（`termination_reason: human_escalation`）。max iteration 到達や secret/protected-path 等の実 hard gate と合わせて、正当な human stop 理由の一つ |
@@ -167,7 +167,7 @@ Issue #1870（#1856）: `route_loop_verdict_v2()` は `test_verdict` を一切�
 `HUMAN_REVIEW_REQUIRED` を含む）より必ず先に評価される。`DRAFT` は Issue #1873 の Delivery Rule が
 Draft PR を要求しているため、単独では human escalation の理由にしない。
 
-## already_satisfied recovery route（Step 5、#2607）
+## already_satisfied recovery route（既存 PR に対する Step 5 回復ルート、#2607）
 
 `already_satisfied` は `preparation.md` の `0-a-1. Already-Satisfied Early-Exit choke point` とは責務が分離した **別経路**（recovery route）である。両者の呼び出し順序・責務分離は以下のとおり:
 
