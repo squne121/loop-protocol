@@ -374,6 +374,22 @@ def start_execution_run(
     return get_execution_run(conn, run_id)
 
 
+def set_execution_run_session(conn: sqlite3.Connection, run_id: str, claude_session_id: str) -> dict[str, Any]:
+    """Attach ``claude_session_id`` to an already-started ExecutionRun after
+    the fact (Issue #2564 SessionStart recovery/new-binding flows only learn
+    the actual Claude session id once the hook payload arrives, after the
+    run row already exists). Still fully covered by the existing AC1(e)
+    partial unique index -- SQLite re-checks it on this UPDATE the same as
+    any INSERT."""
+    with db.write_transaction(conn):
+        get_execution_run(conn, run_id)
+        conn.execute(
+            "UPDATE execution_runs SET claude_session_id = ? WHERE id = ?",
+            (claude_session_id, run_id),
+        )
+    return get_execution_run(conn, run_id)
+
+
 def get_execution_run(conn: sqlite3.Connection, run_id: str) -> dict[str, Any]:
     row = db.execute_readonly(conn, "SELECT * FROM execution_runs WHERE id = ?", (run_id,)).fetchone()
     if row is None:
@@ -564,3 +580,166 @@ def ack_projection(conn: sqlite3.Connection, projection_key: str, read_revision:
         )
         acked = cur.rowcount == 1
     return {"acked": acked}
+
+
+# ---------------------------------------------------------------------------
+# Issue #2564 additive read helpers.
+#
+# These are pure read-only lookups (no new invariants, no external I/O) that
+# the Native Claude operator hook adapter / statusLine projection needs on
+# top of the #2563 core surface. They deliberately reuse the existing
+# tables/columns only (no schema change) -- "current task/activity for a
+# binding" is derived by joining through the binding's open *managed*
+# ExecutionRun (native_operator/claude_gpt, ended_at IS NULL), since
+# `tab_bindings` itself intentionally carries no task_id column (see
+# docs/dev/task-context.md "runtime_locations を tab_bindings から分離した
+# 理由").
+# ---------------------------------------------------------------------------
+
+
+def find_open_execution_runs(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str | None = None,
+    activity_id: str | None = None,
+    binding_id: str | None = None,
+    run_kind: str | None = None,
+    claude_session_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read-only lookup of currently-open (``ended_at IS NULL``)
+    ExecutionRuns matching the given (optional) filters, most-recently
+    started first."""
+    conditions = ["ended_at IS NULL"]
+    params: list[Any] = []
+    if task_id is not None:
+        conditions.append("task_id = ?")
+        params.append(task_id)
+    if activity_id is not None:
+        conditions.append("activity_id = ?")
+        params.append(activity_id)
+    if binding_id is not None:
+        conditions.append("binding_id = ?")
+        params.append(binding_id)
+    if run_kind is not None:
+        conditions.append("run_kind = ?")
+        params.append(run_kind)
+    if claude_session_id is not None:
+        conditions.append("claude_session_id = ?")
+        params.append(claude_session_id)
+    sql = "SELECT * FROM execution_runs WHERE " + " AND ".join(conditions) + " ORDER BY started_at DESC"
+    rows = db.execute_readonly(conn, sql, tuple(params)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_current_task_activity_for_binding(
+    conn: sqlite3.Connection, binding_id: str
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve ``binding_id -> (task_id, activity_id, execution_run_id)`` via
+    the binding's currently open *managed* ExecutionRun (native_operator /
+    claude_gpt). Returns ``(None, None, None)`` if the binding has no open
+    managed run yet (e.g. a freshly created, still-unbound Tab)."""
+    for run_kind in MANAGED_RUN_KINDS:
+        runs = find_open_execution_runs(conn, binding_id=binding_id, run_kind=run_kind)
+        if runs:
+            run = runs[0]
+            return run["task_id"], run["activity_id"], run["id"]
+    return None, None, None
+
+
+def get_most_recent_execution_run_for_binding(
+    conn: sqlite3.Connection, binding_id: str, *, run_kind: str | None = None
+) -> dict[str, Any] | None:
+    """Most recently started ExecutionRun for ``binding_id`` regardless of
+    whether it has ended -- used to recover the last-known Task/Activity
+    identity for a Binding whose managed run already ended cleanly (e.g.
+    `/quit` -> SessionEnd already called ``end_execution_run``) so that a
+    later `SessionStart` restore keeps the same Task/Activity (AC3)."""
+    conditions = ["binding_id = ?"]
+    params: list[Any] = [binding_id]
+    if run_kind is not None:
+        conditions.append("run_kind = ?")
+        params.append(run_kind)
+    sql = "SELECT * FROM execution_runs WHERE " + " AND ".join(conditions) + " ORDER BY started_at DESC LIMIT 1"
+    row = db.execute_readonly(conn, sql, tuple(params)).fetchone()
+    return _row_to_dict(row)
+
+
+def get_active_activity_for_task(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | None:
+    row = db.execute_readonly(
+        conn, "SELECT * FROM activities WHERE task_id = ? AND status = 'ACTIVE'", (task_id,)
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def get_binding_by_current_location(conn: sqlite3.Connection, herdr_locator: str) -> dict[str, Any] | None:
+    """Resolve the Binding (if any) whose *current* (unreleased)
+    RuntimeLocation observation matches ``herdr_locator`` -- used by
+    `SessionStart` `startup`/`resume` to deterministically recover a
+    suspended Binding for the same live Herdr Tab (AC3)."""
+    row = db.execute_readonly(
+        conn,
+        "SELECT tb.* FROM tab_bindings tb "
+        "JOIN runtime_locations rl ON rl.binding_id = tb.id "
+        "WHERE rl.herdr_locator = ? AND rl.released_at IS NULL",
+        (herdr_locator,),
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def find_live_claim(conn: sqlite3.Connection, repo: str, ref_kind: str, ref_number: int) -> dict[str, Any] | None:
+    """Read-only lookup of the live (unreleased) claim, if any, on
+    ``(repo, ref_kind, ref_number)``."""
+    row = db.execute_readonly(
+        conn,
+        "SELECT * FROM task_ref_claims WHERE repo = ? AND ref_kind = ? AND ref_number = ? AND released_at IS NULL",
+        (repo, ref_kind, ref_number),
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def count_live_task_ref_claims(conn: sqlite3.Connection, task_id: str) -> int:
+    """Number of live (unreleased) ref claims currently owned by ``task_id``
+    -- used to detect a "provisional/absorbent" ad-hoc Task (0 live refs)."""
+    row = db.execute_readonly(
+        conn, "SELECT COUNT(*) AS c FROM task_ref_claims WHERE task_id = ? AND released_at IS NULL", (task_id,)
+    ).fetchone()
+    return int(row["c"])
+
+
+def list_live_task_refs(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+    rows = db.execute_readonly(
+        conn,
+        "SELECT repo, ref_kind, ref_number FROM task_ref_claims WHERE task_id = ? AND released_at IS NULL "
+        "ORDER BY claimed_at ASC",
+        (task_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_current_projection_for_session(conn: sqlite3.Connection, claude_session_id: str) -> dict[str, Any]:
+    """Read-only ``session_id -> Binding -> Task / Activity / RuntimeLocation
+    / runtime health`` join for the statusLine `query current` projection
+    (AC9). Raises ``errors.NotFoundError`` if no Binding currently claims
+    ``claude_session_id`` -- callers (the read-only CLI path) turn that into
+    a degraded/empty projection rather than propagating an error to a
+    statusLine renderer.
+
+    ``attention`` is an intentional forward-compatible placeholder (``None``)
+    -- the actual Attention signal is produced by the workflow-trusted
+    completion-signal producer, which is explicitly Out of Scope for this
+    Issue (#2565 child)."""
+    binding = get_binding_by_current_session(conn, claude_session_id)
+    task_id, activity_id, execution_run_id = get_current_task_activity_for_binding(conn, binding["id"])
+    task = get_task(conn, task_id) if task_id else None
+    activity = get_activity(conn, activity_id) if activity_id else None
+    location = get_current_location(conn, binding["id"])
+    task_refs = list_live_task_refs(conn, task_id) if task_id else []
+    return {
+        "binding": binding,
+        "task": task,
+        "activity": activity,
+        "runtime_location": location,
+        "task_refs": task_refs,
+        "execution_run_id": execution_run_id,
+        "attention": None,
+    }

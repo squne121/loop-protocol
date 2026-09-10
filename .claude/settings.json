@@ -78,7 +78,94 @@
   "enabledPlugins": {
     "context-mode@context-mode": true
   },
+  "statusLine": {
+    "type": "command",
+    "command": "python3 ${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/statusline.py",
+    "padding": 0
+  },
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "SessionStart"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "UserPromptSubmit"],
+            "timeout": 2
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/projection_flush_entry.py"],
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "CwdChanged"],
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/projection_flush_entry.py"],
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "SubagentStart"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "SessionEnd"],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash|Read|Write|Edit|Grep|Glob|MultiEdit",
@@ -123,6 +210,17 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "PreToolUse"],
+            "timeout": 5
+          }
+        ]
       }
     ],
     "Stop": [
@@ -133,6 +231,16 @@
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_manifest_coordinator.sh",
             "args": [],
             "timeout": 55
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "Stop"],
+            "timeout": 5
           }
         ]
       }
@@ -147,6 +255,16 @@
             "timeout": 55
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "StopFailure"],
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SubagentStop": [
@@ -157,6 +275,16 @@
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/session_manifest_coordinator.sh",
             "args": [],
             "timeout": 55
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "SubagentStop"],
+            "timeout": 5
           }
         ]
       }
