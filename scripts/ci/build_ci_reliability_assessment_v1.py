@@ -204,6 +204,7 @@ RECEIPT_PERFORMANCE_ONLY_EVIDENCE_ERROR_REASONS = frozenset(
         "gate_ready_timestamp_missing_or_invalid",
         "missing_pair_e2e-core",
         "missing_pair_e2e-responsive-matrix",
+        "missing_monolith_performance_phase",
     }
 )
 

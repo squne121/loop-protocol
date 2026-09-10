@@ -196,11 +196,16 @@ before/after で不均衡な場合（`equal_1_to_1` 契約違反）や、実際�
   digest 自体を信頼した判定は行わない。この残存ギャップは root
   control-plane に報告済みであり、#2423 owner surface 側で public
   verification entry point を追加する follow-up が必要。
-- **Finding 4（receipt.evidence_errors の分離）**: `receipt.evidence_errors`
-  のうち `gate_ready_timestamp_missing_or_invalid` /
-  `missing_pair_e2e-core` / `missing_pair_e2e-responsive-matrix`
-  （Performance 固有の測定不適格理由）は Reliability を停止させない。
-  それ以外の理由（未知の理由を含む）は引き続き fail-closed とする。
+- **Finding 4（receipt.evidence_errors の fault-domain 分離）**:
+  `scripts/ci/build_ci_reliability_assessment_v1.py` の consumer は、次の
+  **exact literal** だけを `RECEIPT_PERFORMANCE_ONLY_EVIDENCE_ERROR_REASONS`
+  として Performance-only に分類する: `gate_ready_timestamp_missing_or_invalid`,
+  `missing_pair_e2e-core`, `missing_pair_e2e-responsive-matrix`,
+  `missing_monolith_performance_phase`。prefix / wildcard / unknown-reason
+  matching は存在しない。これらは Performance 測定の不適格を表すため、単独では
+  Reliability を停止させない。一方、unknown、identity/run-set/manifest binding
+  error、および Reliability 自身の workflow / Playwright evidence の欠落は同じ
+  receipt に上記 reason が共存しても fail-closed である。
 - **Finding 5（canonical output の完全性）**: `main()` は
   `composite_envelope.json`（envelope 本体）を追加出力し、`.github/
   workflows/ci.yml` の artifact upload は `reliability-assessment-input/`
@@ -284,10 +289,11 @@ monolith run・split run はいずれも `{e2e-core, e2e-responsive}` の同じ2
    `manifest.experiment_run_set_digest` と `receipt.run_set_digest` の文字列 equality は要求
    しない。`manifest_sha256` は `--manifest` file の生バイト列に対する標準 sha256 で独立に
    再検証する。`run_set_digest` は format のみ検証する（Finding 3 の残存ギャップ、上記参照）。
-   `evidence_errors` は Performance 固有の測定不適格理由（`gate_ready_timestamp_missing_or_
-   invalid` / `missing_pair_e2e-core` / `missing_pair_e2e-responsive-matrix`）とそれ以外
-   （identity/run-set/manifest binding 違反、未知の理由）を分離し、後者のみ Reliability を
-   fail-closed にする。
+   `evidence_errors` は Performance-only の exact reason allowlist
+   （`gate_ready_timestamp_missing_or_invalid` / `missing_pair_e2e-core` /
+   `missing_pair_e2e-responsive-matrix` / `missing_monolith_performance_phase`）とそれ以外
+   （Reliability 自身の evidence 欠落、identity/run-set/manifest binding 違反、未知の理由）を
+   分離する。allowlist は prefix / wildcard を使わず、後者は必ず Reliability を fail-closed にする。
 3. `--workflow-evidence`: `{"monolith": {"<workflow_run_id>": {"run_attempt", "conclusion",
    "jobs": [{"name", "conclusion", "status"}]}}, "split": {...}}`（複数 `workflow_run_id`
    キーを持てる）。GitHub Actions `GET /repos/{repo}/actions/runs/{run_id}` と `.../jobs` の
