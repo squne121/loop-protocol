@@ -7219,6 +7219,46 @@ _STRUCTURAL_ISSUE_KIND_RE = re.compile(r"(?m)^[ \t]*issue_kind:[ \t]*([A-Za-z0-9
 _KNOWN_STRUCTURAL_ISSUE_KINDS = frozenset({"parent", "implementation", "research"})
 
 
+def _structural_deadlock_eligible_blocker(
+    blocker: str, structural_repair_action: "dict | None"
+) -> bool:
+    """Issue #2598: shared predicate used by BOTH
+    `_structural_deadlock_override_eligible()`'s per-blocker allowlist check
+    and the post-override blocker cleanup at the structural-repair routing
+    call site, so the two stay in sync by construction rather than by
+    convention (they mirrored the same literal reason-code condition in two
+    separate places before this extraction; this is a closed, narrow
+    predicate over specific literal reason-code strings, not a new generic
+    policy framework).
+
+    `missing_required_section`[`:*`], `structural_repair_action_deferred:*`,
+    and the bare `PLANNER_FAIL_CLOSED` companion marker are eligible
+    unconditionally (unchanged #2396 behavior; see #2180's incident report
+    for why the companion marker is not an unrelated blocker namespace).
+
+    The bare parent-specific `missing_required_parent_section` reason code
+    is ALSO eligible, but ONLY when the structural bundle being evaluated
+    is itself independently resolved as `issue_kind: parent` -- the blocker
+    STRING alone is never trusted to imply the bundle's own shape. A
+    SUFFIXED form (`missing_required_parent_section:*`) does NOT count,
+    matching the existing bare-code-only precedent already established for
+    `PLANNER_FAIL_CLOSED`.
+    """
+    if (
+        blocker == "missing_required_section"
+        or blocker.startswith("missing_required_section:")
+        or blocker.startswith("structural_repair_action_deferred:")
+        or blocker == BLOCKER_FAIL_CLOSED
+    ):
+        return True
+    if blocker == "missing_required_parent_section":
+        return (
+            isinstance(structural_repair_action, dict)
+            and structural_repair_action.get("issue_kind") == "parent"
+        )
+    return False
+
+
 def _structural_deadlock_override_eligible(
     structural_repair_action: "dict | None",
     blockers: list[str],
@@ -7239,19 +7279,25 @@ def _structural_deadlock_override_eligible(
     All of the following must hold, or this returns False (existing defer
     behavior is preserved):
       1. every item's own `disposition` is `auto_apply_safe`
-      2. no item's `insertion.disposition` is `"ambiguous"` (a producer bug
-         or a hand-crafted/adversarial artifact could otherwise smuggle an
-         unanchorable item through under a false auto_apply_safe summary)
+      2. every item's `insertion.disposition` is exactly `"exact"` (a
+         positive allowlist, not merely "not ambiguous" -- a producer bug,
+         a hand-crafted/adversarial artifact, or a future non-`"ambiguous"`
+         disposition value could otherwise smuggle an unanchorable item
+         through under a false auto_apply_safe summary)
       3. the bundle's own covered targets (whole-section `label`s plus
          Machine-Readable-Contract key names) are EXACTLY the union of
          `required_sections`/`required_contract_keys` (neither more nor
          less) -- when that union is empty, coverage can never be
          established from the anonymous `missing_required_section` planner
          blocker alone, so the override never fires
-      4. `blockers` contains ONLY `missing_required_section`[`:*`] and/or
-         `structural_repair_action_deferred:*` namespaced entries -- any
-         other blocker (allowed_paths, secret, environment, etc.) keeps the
-         existing blocked status untouched
+      4. `blockers` contains ONLY entries accepted by
+         `_structural_deadlock_eligible_blocker()` -- `missing_required_section`
+         [`:*`], `structural_repair_action_deferred:*`, the bare
+         `PLANNER_FAIL_CLOSED` companion marker, and (Issue #2598) the bare
+         `missing_required_parent_section` code when this bundle's own
+         `issue_kind` is `parent` -- any other blocker (allowed_paths,
+         secret, environment, etc.) keeps the existing blocked status
+         untouched
     """
     if not isinstance(structural_repair_action, dict):
         return False
@@ -7265,7 +7311,7 @@ def _structural_deadlock_override_eligible(
         if not isinstance(item, dict) or item.get("disposition") != STRUCT_DISPOSITION_AUTO_APPLY_SAFE:
             return False
         insertion = item.get("insertion")
-        if not isinstance(insertion, dict) or insertion.get("disposition") == "ambiguous":
+        if not isinstance(insertion, dict) or insertion.get("disposition") != "exact":
             return False
         field_id = item.get("field_id")
         if isinstance(field_id, str) and field_id.startswith("machine-readable-contract."):
@@ -7281,18 +7327,7 @@ def _structural_deadlock_override_eligible(
         return False
 
     for _b in blockers:
-        if (
-            _b == "missing_required_section"
-            or _b.startswith("missing_required_section:")
-            or _b.startswith("structural_repair_action_deferred:")
-            # BLOCKER_FAIL_CLOSED ("PLANNER_FAIL_CLOSED") is the generic
-            # companion marker `_apply_exit_code_mapping()` always appends
-            # alongside the planner's own `missing_required_section` reason
-            # code (Issue #2180's own incident report shows exactly these
-            # THREE blockers together) -- it is not an unrelated blocker
-            # namespace and must not, by itself, prevent the override.
-            or _b == BLOCKER_FAIL_CLOSED
-        ):
+        if _structural_deadlock_eligible_blocker(_b, structural_repair_action):
             continue
         return False
     return True
@@ -8992,12 +9027,7 @@ def run_preflight(
                 blockers[:] = [
                     _b
                     for _b in blockers
-                    if not (
-                        _b == "missing_required_section"
-                        or _b.startswith("missing_required_section:")
-                        or _b.startswith("structural_repair_action_deferred:")
-                        or _b == BLOCKER_FAIL_CLOSED
-                    )
+                    if not _structural_deadlock_eligible_blocker(_b, structural_repair_action)
                 ]
             elif _current_rank > _target_rank:
                 for _struct_rc in structural_repair_route["reason_codes"]:
