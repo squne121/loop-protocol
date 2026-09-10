@@ -193,3 +193,65 @@ planner 入力に渡されたときのみ計算される。`plan_refinement_loop
 同じ判定は `scope_signal_delta.run_trusted_anchor_iteration_zero()`（実際に mutation を試みる
 production 経路）でも `result["rewrite_route"]` として付与され、両者は同じ
 `decide_scope_reframe_contract_route()` を呼び出すので一致する。
+
+## explicit trusted human_review_directive の issue_editor_required 拡張（#2620）
+
+`issue_editor_required` の到達条件は「承認済み scope reframe + empty operations[]」（上記
+`scope_delta_decision.rewrite_route`）に限定されない。構造化 `ANCHOR_SCOPE_REFRAME_V1`
+scope reframe が存在しない（`known_context["scope_delta_decision"]` が `absent`）場合でも、
+既存 section-bound patch derivation で表現不能な explicit trusted `human_review_directive`
+を検出すると、同じ `NEXT_ACTION: issue_editor_required` へ到達する。
+
+このルートは `consume_trusted_anchor_contract_patch_plan()`
+（`run_refinement_preflight.py`）が `known_context["scope_delta_authority_evidence"]`
+（freeform `SCOPE_DELTA_AUTHORITY_EVIDENCE_V1`）を `scope_signal_delta.classify_
+scope_delta_authority()` で fresh に再分類し、`decide_rewrite_route.py` の
+`decide_human_review_directive_editor_route()`（routing SSOT、`HUMAN_REVIEW_DIRECTIVE_
+EDITOR_ROUTE_STATE_V1` を入力とする）へ既存 predicate の組み合わせだけを渡して判定する。
+
+| field | meaning |
+|---|---|
+| `route` | `issue_editor_required`（適格時）または `None`（既存 route/fail-closed のまま） |
+| `reason_code` | `explicit_trusted_human_directive_requires_issue_editor` |
+| `reviewer_feedback_url` | canonical anchor comment URL（raw `anchor_comment.snapshot` 本文ではない） |
+
+適格性は次の既存 predicate の論理積のみで決まる（新しい classifier/heuristic は追加しない）:
+`authority_category == "human_review_directive"`、`directive_confidence == "explicit"`、
+`route_action == "contract_update_required"`、`with_human_context`（trusted operator-selected
+lane）、`anchor_binding_ok` / `same_target_ok`（fresh binding re-check）、`operations_empty`
+（section-bound patch representation が存在しない）、`is_structured_scope_reframe == False`
+（上記の構造化 scope-reframe route を上書きしない）。いずれか一つでも成立しなければ `route: None`
+のまま既存の fail-closed / `no_change` 挙動が維持される。
+
+**fresh readback による TOCTOU 防止（PR #2623 review fix、finding 2）**: 上記の適格性判定は
+呼び出し時点で既に手元にある `anchor_body` / evidence に基づく。`_decide_human_review_directive_
+editor_route()` は適格と判定した直後、`consume_trusted_anchor_contract_patch_plan()` が
+`run_trusted_anchor_iteration_zero()` に渡すのと同じ `fetch_current()` callback を使って
+anchor comment を fresh に再取得し、body / 識別子が変化していないことを確認してから
+`issue_editor_required` を返す。fresh readback で変化を検出した場合は `route: None` と同じ扱い
+（既存 fallback へフォールスルーし、そちらも独自の fresh readback を行う）とする。
+
+**integrity/environment failure の区別（PR #2623 review fix、finding 3）**: `known_context` に
+freeform evidence が存在しない、または SSOT が not eligible と判定した「通常の non-applicable」
+は `None` を返す（呼び出し元は既存 fallback へフォールスルーする）。一方、import failure・
+classifier 例外・fresh readback の transport failure のような integrity/environment failure は
+`None` を返さず、既存の `status: "invalid"` disposition 語彙（`_decision_kind == "invalid"` と
+同じ `{"status": "invalid", "disposition": {"schema_version": "scope_reframe_decision/v1",
+"disposition": "invalid", "reason_code": <specific reason>}}` 形状、
+`human_review_directive_route_import_failed` / `_classifier_error` /
+`_fresh_readback_failed`）を再利用して返す。`_bounded_contract_update_handoff()` はこれを
+`status: "failed"` / `disposition: "invalid"` / `writes: 0` へ projection し、この integrity
+failure が普通の `no_change` / `proven_no_change` に化けることを防ぐ。新しい schema/key-set は
+追加しない。
+
+**`reviewer_feedback_url` の伝搬範囲（PR #2623 review fix、finding 4）**: 上表の
+`reviewer_feedback_url` は `consume_trusted_anchor_contract_patch_plan()` の内部 consumer
+結果（`rewrite_route.reviewer_feedback_url`）にのみ存在する。`_bounded_contract_update_
+handoff()` の canonical `contract_update` projection（`status`/`disposition`/`writes`/
+`iterations`/`final_readback`/`fresh_preflight`/`fresh_review`/`fresh_readiness`/`reason_code`
+のみ）はこれを含まず、`preflight.run` / `contract_update.run.with_human_context` の
+stdout・ARTIFACT を通じて main/root thread へ新規伝搬されるフィールドではない。
+`NEXT_ACTION: issue_editor_required` を受信した main/root thread は、`contract_update.run.
+with_human_context` 呼び出し時に自身が渡した canonical anchor URL（`--anchor-comment-url` /
+`--human-context-comment-url`）を、そのまま Step 4 `issue-editor` の `reviewer_feedback_url`
+として再利用する（canonical result からの新規伝搬ではない）。

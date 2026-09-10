@@ -95,7 +95,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
@@ -6725,6 +6725,219 @@ def _check_scope_reframe_deltas_reflected(
     return "present"
 
 
+def _human_review_directive_route_environment_failure(reason_code: str) -> dict[str, Any]:
+    """PR #2623 review fix (P1 finding 3): a distinguishable, fail-closed
+    outcome for integrity/environment failures inside
+    `_decide_human_review_directive_editor_route()` (broken import,
+    classifier exception, fresh-readback transport failure).
+
+    Reuses the EXISTING `status: "invalid"` / `disposition: {...}` vocabulary
+    `consume_trusted_anchor_contract_patch_plan()` already emits for
+    `_decision_kind == "invalid"` (binding-mismatched scope-delta decision,
+    see immediately above this function's caller) -- no new schema/key-set
+    is introduced. `_bounded_contract_update_handoff()` already projects
+    this exact shape into `status: "failed"`, `disposition: "invalid"`,
+    `writes: 0`, `reason_code: <reason_code>`.
+
+    This is intentionally distinct from returning `None`: `None` means
+    "this route has no opinion, fall through to the existing fail-closed /
+    no_change behavior" (a normal, non-failure outcome for evidence this
+    route simply doesn't apply to). An environment/integrity failure must
+    never be silently absorbed into that same ordinary fallback -- it would
+    surface as an innocuous `no_change`/`proven_no_change` result even
+    though the routing decision itself could not be trusted.
+    """
+    return {
+        "status": "invalid",
+        "disposition": {
+            "schema_version": "scope_reframe_decision/v1",
+            "disposition": "invalid",
+            "reason_code": reason_code,
+        },
+        "writes": 0,
+        "iterations": 0,
+    }
+
+
+def _decide_human_review_directive_editor_route(
+    *,
+    known_context: Optional[dict[str, Any]],
+    anchor_url: str,
+    anchor_body: str,
+    issue_number: int,
+    repo: str,
+    issue_body_sha256: str,
+    fetch_current: Optional[Callable[[], tuple[dict, dict]]] = None,
+) -> Optional[dict[str, Any]]:
+    """#2620: assemble the existing-predicate facts
+    `decide_rewrite_route.decide_human_review_directive_editor_route()`
+    (the routing SSOT) needs, and project its result into the same shape
+    `consume_trusted_anchor_contract_patch_plan()` returns for its other
+    dispositions.
+
+    This function performs NO eligibility classification of its own --
+    every fact it supplies is either read verbatim from
+    `known_context["scope_delta_authority_evidence"]` (the EXISTING
+    `_build_scope_delta_authority_evidence()` producer output already
+    computed earlier in this same preflight run) or freshly re-derived by
+    calling the EXISTING `scope_signal_delta.classify_scope_delta_authority()`
+    classifier again against that same evidence (matching the "fresh
+    rerun" pattern already used elsewhere in this file, e.g.
+    `consume_authority_transport()`'s own re-classification). The actual
+    routing decision is made entirely by the SSOT function in
+    `decide_rewrite_route.py`.
+
+    Returns `None` when there is no freeform
+    `SCOPE_DELTA_AUTHORITY_EVIDENCE_V1` to classify at all, when the SSOT
+    function determines this transaction is not eligible, or when a fresh
+    `fetch_current()` readback (see below) shows the anchor has changed --
+    callers MUST fall through to the existing behavior (no_change /
+    fail-closed) in all three cases. Returns a distinguishable
+    `_human_review_directive_route_environment_failure()` dict (never
+    `None`) for an integrity/environment failure (broken import, classifier
+    exception, or an unreachable/failing fresh readback) -- see that
+    helper's docstring for why these must never collapse into the same
+    `None` as ordinary ineligibility.
+
+    PR #2623 review fix (P1 finding 2): once the SSOT determines this
+    transaction IS eligible, this function performs one more, genuinely
+    fresh `fetch_current()` re-read of the anchor comment -- never trusting
+    the (possibly stale, already-in-hand) `anchor_body` / evidence alone --
+    and only authorizes the handoff when the freshly re-read anchor's body
+    and identity still match. This closes the same TOCTOU window
+    `run_trusted_anchor_iteration_zero()` already closes for the
+    STRUCTURED scope-reframe lane, for this freeform lane too.
+    """
+    if not isinstance(known_context, dict):
+        return None
+    evidence_list = known_context.get("scope_delta_authority_evidence")
+    if not isinstance(evidence_list, list) or not evidence_list:
+        return None
+    evidence_primary = evidence_list[0]
+    if not isinstance(evidence_primary, dict):
+        return None
+
+    try:
+        from decide_rewrite_route import (
+            ROUTE_ISSUE_EDITOR_REQUIRED,
+            HUMAN_REVIEW_DIRECTIVE_EDITOR_ROUTE_STATE_V1,
+            decide_human_review_directive_editor_route,
+        )
+        from scope_signal_delta import classify_scope_delta_authority
+    except ImportError:
+        return _human_review_directive_route_environment_failure(
+            "human_review_directive_route_import_failed"
+        )
+
+    # Fresh, independent re-classification against the SAME evidence --
+    # never trust the caller-supplied patch plan's mere shape.
+    try:
+        authority = classify_scope_delta_authority(
+            evidence_list,
+            target_issue_number=issue_number,
+            expected_repo=repo,
+            base_issue_body_sha256=issue_body_sha256,
+            # PR #2623 review fix (P1 finding 1): forward the SAME
+            # producer-validated `investigation_derived_path_literals`
+            # transport `_ensure_scope_signal_delta_input()` /
+            # `_validate_investigation_evidence_transport()` already placed
+            # on `known_context` earlier in this preflight run (see the
+            # `investigation_evidence_transport_path is not None` block
+            # near `main()`'s planner invocation). This function performs
+            # no new validation/normalization of its own -- it forwards the
+            # already-validated value verbatim, the same way
+            # `classify_scope_delta_authority()`'s other production call
+            # sites in this file do.
+            investigation_derived_path_literals=known_context.get(
+                "investigation_derived_path_literals"
+            ),
+        )
+    except Exception:
+        return _human_review_directive_route_environment_failure(
+            "human_review_directive_route_classifier_error"
+        )
+    if not isinstance(authority, dict):
+        return _human_review_directive_route_environment_failure(
+            "human_review_directive_route_classifier_error"
+        )
+
+    with_human_context = (
+        _resolve_scope_delta_source_kind(
+            anchor_url,
+            human_context_comment_urls=known_context.get(_HUMAN_CONTEXT_COMMENT_URLS_FIELD),
+            agent_report_comment_urls=known_context.get(_AGENT_REPORT_COMMENT_URLS_FIELD),
+        )
+        == "issue_comment"
+    )
+    anchor_binding_ok = (
+        evidence_primary.get("comment_url") == anchor_url
+        and evidence_primary.get("body_sha256") == _sha256(anchor_body)
+    )
+    same_target_ok = evidence_primary.get("source_issue_number") == issue_number
+
+    fresh_patch_plan = authority.get("contract_patch_plan")
+    fresh_operations = fresh_patch_plan.get("operations") if isinstance(fresh_patch_plan, dict) else None
+    operations_empty = isinstance(fresh_operations, list) and not fresh_operations
+
+    route_state = HUMAN_REVIEW_DIRECTIVE_EDITOR_ROUTE_STATE_V1(
+        authority_category=authority.get("authority_category"),
+        directive_confidence=(authority.get("directive") or {}).get("confidence"),
+        route_action=(authority.get("route") or {}).get("action"),
+        with_human_context=with_human_context,
+        anchor_binding_ok=bool(anchor_binding_ok),
+        same_target_ok=bool(same_target_ok),
+        operations_empty=bool(operations_empty),
+        # The caller only reaches this helper when `_decision_kind ==
+        # "absent"` -- no STRUCTURED ANCHOR_SCOPE_REFRAME_V1 decision
+        # governs this transaction, so priority 2 does not apply here.
+        is_structured_scope_reframe=False,
+        reviewer_feedback_url=anchor_url,
+    )
+    route_result = decide_human_review_directive_editor_route(route_state)
+    if route_result.route != ROUTE_ISSUE_EDITOR_REQUIRED:
+        return None
+
+    # PR #2623 review fix (P1 finding 2): the SSOT's eligibility decision
+    # above was computed from `anchor_body` / evidence the CALLER already
+    # had in hand at invocation time -- it is not itself a fresh read. A
+    # concurrent anchor edit or trust revocation between that snapshot being
+    # captured and this decision must never be authorized on stale
+    # evidence. `fetch_current` is REQUIRED to authorize a handoff; when the
+    # caller did not inject it, fail closed to `None` (existing fallback
+    # applies -- it performs its own fresh readback).
+    if fetch_current is None:
+        return None
+    try:
+        fresh_issue, fresh_anchor = fetch_current()
+    except Exception:
+        return _human_review_directive_route_environment_failure(
+            "human_review_directive_route_fresh_readback_failed"
+        )
+    if not isinstance(fresh_issue, dict) or not isinstance(fresh_anchor, dict):
+        return _human_review_directive_route_environment_failure(
+            "human_review_directive_route_fresh_readback_failed"
+        )
+    fresh_anchor_body = fresh_anchor.get("body", "")
+    fresh_binding_ok = (
+        fresh_anchor.get("html_url") == anchor_url and _sha256(fresh_anchor_body) == _sha256(anchor_body)
+    )
+    if not fresh_binding_ok:
+        # The anchor changed (body/identity/binding) since this evidence
+        # was captured -- never authorize a handoff on stale evidence. Fall
+        # through to the existing (also fresh-readback-safe) fallback
+        # instead of inventing a new outcome for this detected-but-benign
+        # state change.
+        return None
+
+    return {
+        "status": "handoff_required",
+        "writes": 0,
+        "iterations": 0,
+        "rewrite_route": route_result.to_dict(),
+        "reviewer_feedback_url": route_result.reviewer_feedback_url,
+    }
+
+
 def consume_trusted_anchor_contract_patch_plan(
     *,
     repo: str,
@@ -6793,22 +7006,16 @@ def consume_trusted_anchor_contract_patch_plan(
             "writes": 0,
             "iterations": 0,
         }
-    # PR #2057 OWNER review P1-4/P1-5: the Allowed-Paths-reflected tri-state
-    # is intentionally NOT computed here against `issue["body"]` (the
-    # pre-fetch snapshot passed into this function). It is computed by
-    # `run_trusted_anchor_iteration_zero()` itself, against a FRESH
-    # `fetch_current()` re-read, immediately before it decides between
-    # `proven_no_change` and `full_rewrite_required` -- closing the TOCTOU
-    # window where the Issue body could have been edited (by a concurrent
-    # issue-editor write reflecting the very delta this call is
-    # classifying) between this consumer being invoked and the disposition
-    # being decided.
-    def _reflected_checker(fresh_body: str) -> str:
-        return _check_scope_reframe_deltas_reflected(
-            current_body=fresh_body,
-            allowed_path_deltas=_validated_allowed_path_deltas or [],
-        )
 
+    # PR #2623 review fix (P1 finding 2): `fetch_current()` is hoisted
+    # above the #2620 freeform editor-route branch below so that branch can
+    # perform its own fresh, independent GitHub re-read immediately before
+    # authorizing an issue-editor handoff -- closing the same TOCTOU window
+    # `run_trusted_anchor_iteration_zero()` already closes for the
+    # STRUCTURED scope-reframe lane (see the comment further down). This is
+    # the SAME primitive (and the SAME `callbacks["fetch_current"]`
+    # injection point) `run_trusted_anchor_iteration_zero()` is given below;
+    # no new GitHub access layer is introduced.
     def fetch_current() -> tuple[dict, dict]:
         injected = callbacks.get("fetch_current")
         if injected is not None:
@@ -6824,6 +7031,47 @@ def consume_trusted_anchor_contract_patch_plan(
         current_anchor["html_url"] = anchor_url
         current_anchor["source_body_sha256"] = f"sha256:{_sha256(current_anchor.get('body', ''))}"
         return current_issue, current_anchor
+
+    # #2620: an explicit trusted human_review_directive whose derived
+    # operations[] is empty (no safe section-bound patch representation)
+    # and which is NOT governed by a STRUCTURED ANCHOR_SCOPE_REFRAME_V1
+    # scope reframe (`_decision_kind == "absent"` -- a "valid" decision is
+    # priority 2, owned by decide_scope_reframe_contract_route() further
+    # below via run_trusted_anchor_iteration_zero(), and is left
+    # untouched). Without this branch, `run_trusted_anchor_iteration_
+    # zero()`'s own `classify_scope_reframe_disposition()` call is only
+    # reachable when `allowed_path_deltas` is non-empty (the STRUCTURED
+    # lane), so this freeform case would otherwise silently fall through
+    # to an ordinary "no_change" no-op instead of hand off to issue-editor
+    # -- the exact #2620 control-plane gap.
+    if _decision_kind == "absent" and not _raw_operations:
+        _editor_route_result = _decide_human_review_directive_editor_route(
+            known_context=known_context,
+            anchor_url=anchor_url,
+            anchor_body=anchor_body,
+            issue_number=issue_number,
+            repo=repo,
+            issue_body_sha256=_sha256(issue.get("body", "")),
+            fetch_current=fetch_current,
+        )
+        if _editor_route_result is not None:
+            return _editor_route_result
+
+    # PR #2057 OWNER review P1-4/P1-5: the Allowed-Paths-reflected tri-state
+    # is intentionally NOT computed here against `issue["body"]` (the
+    # pre-fetch snapshot passed into this function). It is computed by
+    # `run_trusted_anchor_iteration_zero()` itself, against a FRESH
+    # `fetch_current()` re-read, immediately before it decides between
+    # `proven_no_change` and `full_rewrite_required` -- closing the TOCTOU
+    # window where the Issue body could have been edited (by a concurrent
+    # issue-editor write reflecting the very delta this call is
+    # classifying) between this consumer being invoked and the disposition
+    # being decided.
+    def _reflected_checker(fresh_body: str) -> str:
+        return _check_scope_reframe_deltas_reflected(
+            current_body=fresh_body,
+            allowed_path_deltas=_validated_allowed_path_deltas or [],
+        )
 
     def candidate_readiness(candidate_body: str) -> dict:
         injected = callbacks.get("candidate_readiness")
