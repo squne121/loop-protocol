@@ -328,22 +328,21 @@ def patch_comment(
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> tuple[bool, Optional[str]]:
     """
-    PATCH an already-posted comment's body via the GitHub REST API (AC1
-    step 2 of the two-phase materialize flow: POST provisional body, then
-    PATCH the same comment id with the final body once the real comment id
-    is known and can be embedded in expected_contract_fingerprint's
-    contract_source_id).
-
-    Returns (success, error_code_or_None).  The exact canonical UTF-8 JSON
-    payload is sent once, then the PATCH response and an independent GET are
-    both bound to that same body.  A transport timeout is reconciled by GET;
-    ambiguity remains fail-closed.
+    Send one canonical PATCH for an already-posted comment's final body (AC1
+    step 2 of the two-phase materialize flow).  A zero PATCH subprocess exit
+    proves mutation transport success only: its response representation is not
+    application-level authority.  Never blind-retry PATCH.  Immediately use
+    the existing authoritative direct-GET full-binding verifier; success
+    requires matching comment id, Issue binding, html_url, trusted publisher,
+    and the decoded Markdown body's UTF-8 SHA256.  Timeout and transport
+    ambiguity use that same GET reconciliation and remain fail-closed unless
+    the binding is confirmed.
     """
     try:
         payload = json.dumps({"body": body}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         result = subprocess.run(
             [
-                "gh", "api", "--method", "PATCH",
+                "gh", "api", "--silent", "--method", "PATCH",
                 f"repos/{repo}/issues/comments/{comment_id}", "--input", "-",
             ],
             input=payload,
@@ -351,14 +350,12 @@ def patch_comment(
             timeout=timeout,
         )
         if result.returncode == 0:
-            try:
-                response = json.loads(result.stdout.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                return False, "patch_response_invalid_json"
-            if not isinstance(response, dict) or response.get("id") != comment_id:
-                return False, "patch_response_id_mismatch"
-            if response.get("body") != body:
-                return False, "patch_response_body_mismatch"
+            # A successful subprocess only proves that gh accepted the PATCH
+            # response. Its representation is intentionally non-authoritative:
+            # invalid JSON and id/body mismatches therefore share this same
+            # one-GET reconciliation path with an exact representation. Never
+            # retry PATCH; the direct binding verifier is the authority for
+            # comment id, issue, html_url, publisher, and decoded body hash.
             ok, err = verify_controlled_publisher_comment_id_binding(
                 issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
             )
