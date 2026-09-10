@@ -108,6 +108,19 @@
         ]
       }
     ],
+    "UserPromptExpansion": [
+      {
+        "matcher": "task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "UserPromptExpansion"],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
     "CwdChanged": [
       {
         "hooks": [

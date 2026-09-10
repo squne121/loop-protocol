@@ -640,6 +640,48 @@ lookup（`get_task`/`get_activity`/`get_binding`/`get_execution_run`/
 `test_given_write_transaction_when_database_error_raised_mid_transaction_then_corrupt_database_error_and_rollback`
 参照）。
 
+## UserPromptSubmit の admission-gate 化を禁止する（advisory-only 化、Issue #2625）
+
+Issue #2564（PR #2615）は ACTIVE current Activity + different high-confidence
+primary target を検出した ordinary `UserPromptSubmit` を `decision: block`
+（adapter は exit 2）として hard block していた。この設計は実 Herdr /
+Native Claude runtime で、SubAgent completion delivery が `UserPromptSubmit`
+として誤発火し（upstream `anthropics/claude-code#16952`）、人間が新規 prompt
+を送信していないにもかかわらず進行中 workflow を停止する runtime regression
+を引き起こした（Issue #2625 Runtime Incident）。
+
+Issue #2625 の Owner Decision により、この hard block は撤去された。
+canonical contract は以下のとおりである。
+
+- **Task Context を ordinary Claude workflow の admission controller として
+  使用しない。** Task Context の目的は routing / display / mistake
+  detection / state synchronization であり、Task Context 自身の誤検知・
+  hook lifecycle anomaly・DB/adapter failure によって Claude 本体の作業を
+  停止させない。
+- ACTIVE current Activity + different primary target を検出しても
+  `task_context_hook_flows.on_user_prompt_submit` は常に `decision: pass`
+  を返す。current Task/Activity/Binding は一切変更せず、target ref の
+  claim も silent rebind も行わない。
+- mismatch 検出そのもの（mistake-detection capability）は維持する。
+  advisory 化は hard-block の撤去であり、observability の撤去ではない --
+  `different_primary_target_active` は EventJournal への **必須**記録
+  （non-blocking `status="pass"` の observation）として残る（AC1/AC2）。
+- `.claude/hooks/task_context/hook_entry.py` は adapter-level の二重
+  fail-open invariant を持つ（AC3）: service が regression/version skew で
+  予期せず `decision: block` を返しても、`main()` は event ==
+  "UserPromptSubmit" で常に exit 0 を返す。stderr への advisory 診断のみ
+  行う。
+- `/task <target>` の state-changing authority は、raw prompt 文字列を
+  `UserPromptSubmit` hook 内で special-case 判定する経路（Issue #2564）から、
+  Claude Code の `UserPromptExpansion` command lifecycle
+  （`command_name == "task"`、`command_args` から構造化 target を受け取る）
+  へ一本化された（AC6）。詳細は `.claude/skills/task/SKILL.md` を参照する。
+
+canonical hook 責務・fail policy・exit-code contract の正本は
+`docs/dev/hook-boundaries.md` の `hook_boundaries_manifest_v1`
+（`handler_id: hook_entry`, `event: UserPromptSubmit` / `event:
+UserPromptExpansion` の各エントリ）である。
+
 ## Repository CI に関する注記（non-blocking）
 
 `tests/task-context/` は本 Issue で追加された新規 pytest target

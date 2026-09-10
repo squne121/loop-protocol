@@ -1,10 +1,13 @@
-"""Task Context v1 — Native Claude operator hook lifecycle flows (Issue #2564).
+"""Task Context v1 — Native Claude operator hook lifecycle flows (Issue #2564,
+advisory-only ACTIVE different-primary guard + `/task` authority move to
+`UserPromptExpansion`: Issue #2625).
 
 This module is the "thin Claude-native hook adapter -> core typed API" glue
 the Issue's In Scope section requires: it contains the multi-step
 orchestration for each Claude Code hook lifecycle event (SessionStart /
-UserPromptSubmit / CwdChanged / SubagentStart / SubagentStop / PreToolUse /
-Stop / StopFailure / SessionEnd), built *entirely* out of the existing
+UserPromptSubmit / UserPromptExpansion / CwdChanged / SubagentStart /
+SubagentStop / PreToolUse / Stop / StopFailure / SessionEnd), built *entirely*
+out of the existing
 ``task_context_service`` primitives (create_task/claim_task_ref/
 transition_activity/start_execution_run/attach_execution_run/
 end_execution_run/relocate_binding/set_binding_session/set_binding_health/
@@ -233,8 +236,22 @@ def _set_session_on_run(conn, binding_id: str, execution_run_id: str, claude_ses
 
 
 # ---------------------------------------------------------------------------
-# UserPromptSubmit (AC4, AC5, AC6, AC12, AC13)
+# UserPromptSubmit (AC1, AC2, AC5, AC7, AC9 -- Issue #2625: the ACTIVE
+# different-primary-target branch is advisory-only, never an admission
+# gate. `/task` state-changing authority lives exclusively in
+# `on_user_prompt_expansion` below (AC6) -- a raw `/task ...`-looking prompt
+# observed here performs no mutation whatsoever.)
 # ---------------------------------------------------------------------------
+
+# Issue #2625 AC6: classification kinds that never mutate Task/Activity/
+# Binding state on ordinary UserPromptSubmit -- SLASH_TASK is included here
+# (not dispatched to a rebind) because raw prompt text is no longer a
+# state-changing authority signal on this event; only the explicit
+# `UserPromptExpansion` `command_name == "task"` command lifecycle can rebind.
+_NO_MUTATION_REASON_CODES = {
+    "AMBIGUOUS": "ambiguous_no_silent_rebind",
+    "SLASH_TASK": "slash_task_raw_text_no_state_authority",
+}
 
 
 def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
@@ -259,11 +276,8 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
         conn, binding_id
     )
 
-    if kind == "SLASH_TASK":
-        return _apply_slash_task_rebind(conn, payload, binding_id, current_run_id, current_task_id, current_activity_id)
-
-    if kind in ("NONE", "REFERENCE_ONLY", "AMBIGUOUS"):
-        reason = "ambiguous_no_silent_rebind" if kind == "AMBIGUOUS" else "reference_only_or_none"
+    if kind in ("NONE", "REFERENCE_ONLY", "AMBIGUOUS", "SLASH_TASK"):
+        reason = _NO_MUTATION_REASON_CODES.get(kind, "reference_only_or_none")
         _record(
             conn,
             event_type="hook:UserPromptSubmit",
@@ -350,8 +364,16 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
             **_projection_fields(advanced),
         }
 
-    # AC4: ACTIVE current Activity + different high-confidence primary
-    # target -> block before Claude processes the prompt.
+    # Issue #2625 AC1/AC2/AC9 (supersedes Issue #2564 AC4's hard block):
+    # ACTIVE current Activity + different high-confidence primary target is
+    # advisory-only. Claude prompt processing always continues (decision:
+    # pass); current Task/Activity/Binding are left completely untouched
+    # (no mutation above this point in this branch, no silent rebind, no
+    # target-ref claim created); the mismatch is recorded to EventJournal as
+    # a *required*, non-blocking observation (status="pass", never
+    # status="block" -- this is an advisory record, not a hard-block
+    # state). Producer workflows are never rolled back because of this
+    # advisory (AC9) -- there is nothing here that could roll anything back.
     _record(
         conn,
         event_type="hook:UserPromptSubmit",
@@ -360,32 +382,61 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
         binding_id=binding_id,
         execution_run_id=current_run_id,
         reason_code="different_primary_target_active",
-        status="block",
+        status="pass",
     )
-    return {"decision": "block", "reason_code": "different_primary_target_active"}
+    return {"decision": "pass", "reason_code": "different_primary_target_active", "advisory": True}
 
 
-def _apply_slash_task_rebind(
-    conn,
-    payload: dict[str, Any],
-    binding_id: str,
-    current_run_id: str | None,
-    current_task_id: str | None,
-    current_activity_id: str | None,
-) -> dict[str, Any]:
-    """AC6/AC12: `/task <target>` is the sole explicit human escape hatch --
-    it always supersedes the normal primary-target guard, atomically, in a
-    single UserPromptSubmit adapter invocation, regardless of hook
-    registration/execution order relative to other handlers (AC13:
-    commit-on-submission, no rollback on a sibling hook's later block).
+# ---------------------------------------------------------------------------
+# UserPromptExpansion (AC6 -- Issue #2625): the sole explicit human
+# state-changing authority for `/task <target>`. Reached only for Claude
+# Code's own user-typed slash/Skill command expansion lifecycle -- never for
+# ordinary natural-language `UserPromptSubmit` prompts. `command_name`
+# values other than ``"task"`` are not this module's concern (some other
+# Skill/command being expanded) and are always a silent, non-mutating
+# pass-through.
+# ---------------------------------------------------------------------------
 
-    "Atomic" here is literal (fix_delta 3): the whole
-    resolve-or-create-Task -> claim ref -> ensure ACTIVE Activity -> attach
-    ExecutionRun -> append event -> bump projection outbox sequence runs
-    inside a single ``BEGIN IMMEDIATE`` in the service layer, so a `/task`
-    rebind can never be half-applied (and a lost ref-claim race can never
-    leave an orphan OPEN Task behind)."""
-    del current_task_id, current_activity_id  # superseded unconditionally by `/task`
+
+def on_user_prompt_expansion(conn, payload: dict[str, Any]) -> dict[str, Any]:
+    """AC6: `/task <target>` always supersedes whatever Task/Activity is
+    currently ACTIVE for this Binding, atomically, in a single
+    UserPromptExpansion adapter invocation -- the sole explicit human escape
+    hatch, moved off the raw-text `UserPromptSubmit` special-case (Issue
+    #2564 PR #2615) onto this dedicated command lifecycle event.
+
+    "Atomic" here is literal (carried over from PR #2615 fix_delta 3): the
+    whole resolve-or-create-Task -> claim ref -> ensure ACTIVE Activity ->
+    attach ExecutionRun -> append event -> bump projection outbox sequence
+    runs inside a single ``BEGIN IMMEDIATE`` in the service layer, so a
+    `/task` rebind can never be half-applied. Target validation failure,
+    persistence failure, and (at the adapter layer) transport failure are
+    all surfaced as an explicit `/task` *command* failure (``decision:
+    block``) -- never silently swallowed as if the rebind had succeeded."""
+    command_name = payload.get("command_name")
+    if command_name != "task":
+        return {"decision": "pass", "reason_code": "not_task_command"}
+
+    herdr_tab_id = payload.get("herdr_tab_id")
+    claude_session_id = payload.get("claude_session_id")
+
+    if not herdr_tab_id:
+        # AC11-equivalent (carried over from SessionStart): a non-Herdr
+        # canonical interactive Claude session is observe-only -- there is
+        # no TabBinding to rebind, so `/task` is not-applicable here (not a
+        # validation failure of the target itself).
+        return {"decision": "pass", "reason_code": "observe_only_non_herdr"}
+    if not claude_session_id:
+        return {"decision": "block", "reason_code": "missing_session_id"}
+
+    try:
+        binding = service.get_binding_by_current_session(conn, claude_session_id)
+    except errors.NotFoundError:
+        return {"decision": "block", "reason_code": "no_binding_for_session"}
+
+    binding_id = binding["id"]
+    _, _, current_run_id = service.get_current_task_activity_for_binding(conn, binding_id)
+
     target_repo = payload.get("slash_task_target_repo")
     target_ref_kind = payload.get("slash_task_target_ref_kind")
     target_ref_number = payload.get("slash_task_target_ref_number")
@@ -412,6 +463,16 @@ def _apply_slash_task_rebind(
     else:
         return {"decision": "block", "reason_code": "slash_task_missing_target"}
 
+    _record(
+        conn,
+        event_type="hook:UserPromptExpansion",
+        task_id=rebound["task_id"],
+        activity_id=rebound["activity_id"],
+        binding_id=binding_id,
+        execution_run_id=current_run_id,
+        reason_code="slash_task_rebind",
+        status="pass",
+    )
     return {
         "decision": "pass",
         "reason_code": "slash_task_rebind",
@@ -618,6 +679,7 @@ def on_session_end(conn, payload: dict[str, Any]) -> dict[str, Any]:
 EVENT_HANDLERS = {
     "SessionStart": on_session_start,
     "UserPromptSubmit": on_user_prompt_submit,
+    "UserPromptExpansion": on_user_prompt_expansion,
     "CwdChanged": on_cwd_changed,
     "SubagentStart": on_subagent_start,
     "SubagentStop": on_subagent_stop,
