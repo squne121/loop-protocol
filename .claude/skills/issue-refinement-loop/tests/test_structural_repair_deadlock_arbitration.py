@@ -114,7 +114,14 @@ def _seed_template(tmp_path: Path) -> None:
     (template_dir / "implementation.yml").write_text(TEMPLATE_TEXT, encoding="utf-8")
 
 
-def _write_fixture(tmp_path: Path, issue_number: int, body: str) -> Path:
+def _write_fixture(
+    tmp_path: Path,
+    issue_number: int,
+    body: str,
+    *,
+    anchor_comment_urls: "list[str] | None" = None,
+    anchor_comments: "list[dict] | None" = None,
+) -> Path:
     fixture = {
         "schema_version": "refinement_preflight_input/v1",
         "issue_number": issue_number,
@@ -128,11 +135,81 @@ def _write_fixture(tmp_path: Path, issue_number: int, body: str) -> Path:
             "updatedAt": "2026-01-01T00:00:00Z",
         },
         "comments": [],
-        "anchor_comment_urls": [],
+        "anchor_comment_urls": anchor_comment_urls or [],
+        "anchor_comments": anchor_comments or [],
     }
     fixture_path = tmp_path / f"fixture-{issue_number}.json"
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
     return fixture_path
+
+
+# ---------------------------------------------------------------------------
+# Issue #2598: parent-shaped (`issue_kind: parent`, `parent_mode:
+# delivery-rollup`) fixtures for the `missing_required_parent_section`
+# deadlock-override extension. `_PARENT_TEMPLATE_TEXT` is the REAL, checked-in
+# `.github/ISSUE_TEMPLATE/parent.yml` (not a fixture-invented template) so
+# `_PARENT_TARGET_SECTIONS` below are the template's own actual required
+# section labels -- a renamed/fictional reason-code string could not make
+# these assertions pass by coincidence.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_PARENT_TEMPLATE_PATH = _REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "parent.yml"
+_PARENT_TEMPLATE_TEXT = _PARENT_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+_PARENT_TARGET_SECTIONS = ("Quality Decision Record", "Child Issues", "Remaining Parent Gaps")
+
+_PARENT_REQUIRED_SECTIONS_IN_ORDER = [
+    (
+        "Machine-Readable Contract",
+        "```yaml\ncontract_schema_version: v1\nissue_kind: parent\ngoal_ref: g\n"
+        "change_kind: workflow\nparent_mode: delivery-rollup\nclosure_mode: child-complete\n```",
+    ),
+    ("Summary", "summary"),
+    ("Goal", "goal"),
+    ("Desired Destination", "destination"),
+    ("Current Validated Scope", "- scope"),
+    ("Decisions Fixed", "- 2026-01-01: decision"),
+    ("Quality Decision Record", "- `Status`: N/A"),
+    ("Parent Closure Rule", "- delivery-rollup: child rollup complete"),
+    ("Child Issues", "- [ ] #1 — child"),
+    ("Remaining Parent Gaps", "- none"),
+    ("Phase Handoff Contract", "- handoff"),
+    ("Acceptance Criteria", "- [ ] AC1"),
+]
+
+
+def _seed_parent_template(tmp_path: Path) -> None:
+    template_dir = tmp_path / ".github" / "ISSUE_TEMPLATE"
+    template_dir.mkdir(parents=True, exist_ok=True)
+    (template_dir / "parent.yml").write_text(_PARENT_TEMPLATE_TEXT, encoding="utf-8")
+
+
+def _build_parent_body(*, omit_sections: "frozenset[str] | set[str]" = frozenset()) -> str:
+    """Build a valid, production-shaped parent delivery-rollup contract
+    (real `.github/ISSUE_TEMPLATE/parent.yml` required-section labels),
+    omitting only `omit_sections`."""
+    sections = [
+        (label, content)
+        for label, content in _PARENT_REQUIRED_SECTIONS_IN_ORDER
+        if label not in omit_sections
+    ]
+    return "\n\n".join(f"## {heading}\n\n{content}" for heading, content in sections) + "\n"
+
+
+def _owner_anchor_comment(*, issue_number: int, comment_id: int, body: str) -> "tuple[str, dict]":
+    url = f"https://github.com/testowner/testrepo/issues/{issue_number}#issuecomment-{comment_id}"
+    return url, {
+        "id": comment_id,
+        "body": body,
+        "issue_url": f"https://api.github.com/repos/testowner/testrepo/issues/{issue_number}",
+        "html_url": url,
+        "url": f"https://api.github.com/repos/testowner/testrepo/issues/comments/{comment_id}",
+        "user": {"login": "owner-user", "type": "User"},
+        "author_association": "OWNER",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+    }
 
 
 def _mock_plan_blocked(*, required_sections: list, reason_codes: "list | None" = None) -> dict:
@@ -154,9 +231,24 @@ def _mock_plan_blocked(*, required_sections: list, reason_codes: "list | None" =
     }
 
 
-def _run_preflight_with_mock_plan(tmp_path: Path, issue_number: int, body: str, plan: dict):
-    fixture_path = _write_fixture(tmp_path, issue_number, body)
+def _run_preflight_with_mock_plan(
+    tmp_path: Path,
+    issue_number: int,
+    body: str,
+    plan: dict,
+    *,
+    anchor_comment_urls: "list[str] | None" = None,
+    anchor_comments: "list[dict] | None" = None,
+    known_context: "dict | None" = None,
+    seed_parent_template: bool = False,
+):
+    fixture_path = _write_fixture(
+        tmp_path, issue_number, body,
+        anchor_comment_urls=anchor_comment_urls, anchor_comments=anchor_comments,
+    )
     _seed_template(tmp_path)
+    if seed_parent_template:
+        _seed_parent_template(tmp_path)
     with (
         mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
         mock.patch.object(wrapper, "_invoke_planner", return_value=(plan, 0, "", "")),
@@ -164,8 +256,9 @@ def _run_preflight_with_mock_plan(tmp_path: Path, issue_number: int, body: str, 
         return wrapper.run_preflight(
             issue_number=issue_number,
             repo="testowner/testrepo",
-            anchor_comment_urls=[],
+            anchor_comment_urls=anchor_comment_urls or [],
             fixture_path=fixture_path,
+            known_context=known_context,
         )
 
 
@@ -309,6 +402,204 @@ class TestAC3RegressionStillDeferred:
         _validate_against_result_schema(result)
 
 
+class TestAC1ParentMissingSectionOverrideNotDeferred:
+    """Issue #2598 AC1: a bare `missing_required_parent_section` planner
+    blocker, for a production-shaped `issue_kind: parent` /
+    `parent_mode: delivery-rollup` body whose structural repair bundle
+    itself resolves ALL of the actually-missing parent target sections
+    (`Quality Decision Record` / `Child Issues` / `Remaining Parent Gaps`,
+    the REAL `.github/ISSUE_TEMPLATE/parent.yml` required-section labels)
+    with `exact` `auto_apply_safe` insertions and full coverage, resolves
+    the SAME #2180-shaped severity-arbitration deadlock #2396 already fixed
+    for the generic `missing_required_section` code."""
+
+    def test_parent_delivery_rollup_full_coverage_not_deferred(self, tmp_path: Path) -> None:
+        issue_number = 259801
+        anchor_body = (
+            "\n\n".join(
+                f"## {label}\n\n{content}"
+                for label, content in (
+                    ("Quality Decision Record", "- `Status`: N/A"),
+                    ("Child Issues", "- [ ] #1 — child"),
+                    ("Remaining Parent Gaps", "- none"),
+                )
+            )
+            + "\n"
+        )
+        url, anchor_comment = _owner_anchor_comment(
+            issue_number=issue_number, comment_id=5599001001, body=anchor_body
+        )
+        body = _build_parent_body(omit_sections=frozenset(_PARENT_TARGET_SECTIONS))
+        plan = _mock_plan_blocked(
+            required_sections=list(_PARENT_TARGET_SECTIONS),
+            reason_codes=["missing_required_parent_section"],
+        )
+        result, exit_code = _run_preflight_with_mock_plan(
+            tmp_path,
+            issue_number,
+            body,
+            plan,
+            anchor_comment_urls=[url],
+            anchor_comments=[anchor_comment],
+            known_context={"human_context_comment_urls": [url]},
+            seed_parent_template=True,
+        )
+
+        assert result["status"] == "needs_fix", result
+        assert result["next_action"] == "apply_deterministic_structural_repair", result
+        assert exit_code == wrapper.EXIT_NEEDS_FIX
+        sra = result.get("structural_repair_action")
+        assert sra is not None, result
+        assert sra["issue_kind"] == "parent"
+        assert sra["disposition_summary"] == "auto_apply_safe"
+        items = sra["items"]
+        assert {i["label"] for i in items} == set(_PARENT_TARGET_SECTIONS)
+        assert all(i["disposition"] == "auto_apply_safe" for i in items)
+        assert all(i["insertion"]["disposition"] == "exact" for i in items)
+        assert "missing_required_parent_section" not in result["blockers"], result
+        assert not any(
+            b.startswith("structural_repair_action_deferred:") for b in result["blockers"]
+        ), result
+        assert wrapper.BLOCKER_FAIL_CLOSED not in result["blockers"], result
+        _validate_against_result_schema(result)
+
+
+class TestParentDeadlockNegativeRegressions:
+    """Issue #2598 negative regressions: the SAME parent-shaped
+    `missing_required_parent_section` code must NOT trigger the override
+    when any single AC3-precedent condition is violated. Uses a
+    hand-constructed `structural_repair_action` (`issue_kind: parent`)
+    mocked directly at `build_structural_repair_bundle()`, mirroring
+    `TestAC3RegressionStillDeferred`'s adversarial-bundle style above --
+    this file's owner-anchor/source-span provenance matrix itself is
+    exercised elsewhere (PR #2583 / test_structural_repair_known_scalars_wiring.py)
+    and is intentionally NOT duplicated here."""
+
+    def _bundle(self, *, items: list, issue_kind: str = "parent") -> dict:
+        return {
+            "schema_version": "structural_repair_action/v1",
+            "policy_version": "template-derived-structural-repair/v1",
+            "issue_kind": issue_kind,
+            "repo": "testowner/testrepo",
+            "issue_number": 0,
+            "original_body_sha256": "sha256:" + "0" * 64,
+            "original_updated_at": "2026-01-01T00:00:00Z",
+            "items": items,
+            "disposition_summary": "auto_apply_safe",
+            "template_git_blob_sha": None,
+            "template_source_ref": None,
+        }
+
+    def _safe_item(
+        self, label: str, field_id: str, *, disposition: str = "auto_apply_safe", insertion_disposition: str = "exact"
+    ) -> dict:
+        return {
+            "field_id": field_id,
+            "label": label,
+            "required": True,
+            "template_field_order": 1,
+            "template_path": ".github/ISSUE_TEMPLATE/parent.yml",
+            "template_digest": "sha256:" + "1" * 64,
+            "expected_cardinality": 1,
+            "observed_cardinality": 0,
+            "disposition": disposition,
+            "derivation": "source_span_exact",
+            "reason_codes": [],
+            "candidate_value": "- x",
+            "candidate_digest": "sha256:" + "2" * 64,
+            "repo": "testowner/testrepo",
+            "issue_number": 0,
+            "original_body_sha256": "sha256:" + "0" * 64,
+            "original_updated_at": "2026-01-01T00:00:00Z",
+            "insertion": {
+                "disposition": insertion_disposition,
+                "relation": "replace_section_content",
+                "anchor_field_id": field_id,
+                "anchor_heading": label,
+                "anchor_start_line": 1,
+                "anchor_digest": "sha256:" + "3" * 64,
+                "rendered_heading": f"## {label}",
+                "candidate_section_digest": "sha256:" + "4" * 64,
+            },
+        }
+
+    def _run(
+        self,
+        tmp_path: Path,
+        issue_number: int,
+        bundle: dict,
+        required_sections: list,
+        reason_codes: "list | None" = None,
+    ):
+        body = _build_parent_body(omit_sections=frozenset(_PARENT_TARGET_SECTIONS))
+        plan = _mock_plan_blocked(
+            required_sections=required_sections,
+            reason_codes=reason_codes or ["missing_required_parent_section"],
+        )
+        with mock.patch.object(wrapper, "build_structural_repair_bundle", return_value=bundle):
+            return _run_preflight_with_mock_plan(
+                tmp_path, issue_number, body, plan, seed_parent_template=True
+            )
+
+    def _assert_deferred(self, result: dict, exit_code: int) -> None:
+        assert result["status"] == "blocked", result
+        assert exit_code == wrapper.EXIT_BLOCKED
+        assert any(b.startswith("structural_repair_action_deferred:") for b in result["blockers"]), result
+        assert result.get("structural_repair_action") is None, result
+        _validate_against_result_schema(result)
+
+    def test_parent_ambiguous_insertion_still_deferred(self, tmp_path: Path) -> None:
+        """A non-exact (`ambiguous`) insertion on an otherwise auto_apply_safe
+        item must keep the deadlock deferred."""
+        items = [
+            self._safe_item("Quality Decision Record", "quality-decision-record", insertion_disposition="ambiguous"),
+            self._safe_item("Child Issues", "child-issues"),
+            self._safe_item("Remaining Parent Gaps", "remaining-parent-gaps"),
+        ]
+        result, exit_code = self._run(tmp_path, 259802, self._bundle(items=items), list(_PARENT_TARGET_SECTIONS))
+        self._assert_deferred(result, exit_code)
+
+    def test_parent_incomplete_coverage_fewer_still_deferred(self, tmp_path: Path) -> None:
+        """The bundle covers FEWER targets than the planner's own
+        required_sections -- coverage is incomplete."""
+        items = [
+            self._safe_item("Quality Decision Record", "quality-decision-record"),
+            self._safe_item("Child Issues", "child-issues"),
+        ]
+        result, exit_code = self._run(tmp_path, 259804, self._bundle(items=items), list(_PARENT_TARGET_SECTIONS))
+        self._assert_deferred(result, exit_code)
+
+    def test_parent_incomplete_coverage_extra_still_deferred(self, tmp_path: Path) -> None:
+        """The bundle covers MORE targets than the planner's own
+        required_sections -- coverage is not EXACT."""
+        items = [
+            self._safe_item("Quality Decision Record", "quality-decision-record"),
+            self._safe_item("Child Issues", "child-issues"),
+            self._safe_item("Remaining Parent Gaps", "remaining-parent-gaps"),
+            self._safe_item("Acceptance Criteria", "acceptance-criteria"),
+        ]
+        result, exit_code = self._run(tmp_path, 259805, self._bundle(items=items), list(_PARENT_TARGET_SECTIONS))
+        self._assert_deferred(result, exit_code)
+
+    def test_parent_unrelated_blocker_still_deferred(self, tmp_path: Path) -> None:
+        """Full auto_apply_safe coverage, but an UNRELATED blocker
+        namespace is also present -- the override must not fire."""
+        items = [
+            self._safe_item("Quality Decision Record", "quality-decision-record"),
+            self._safe_item("Child Issues", "child-issues"),
+            self._safe_item("Remaining Parent Gaps", "remaining-parent-gaps"),
+        ]
+        result, exit_code = self._run(
+            tmp_path,
+            259806,
+            self._bundle(items=items),
+            list(_PARENT_TARGET_SECTIONS),
+            reason_codes=["missing_required_parent_section", "some_unrelated_blocker_namespace"],
+        )
+        assert "some_unrelated_blocker_namespace" in result["blockers"], result
+        self._assert_deferred(result, exit_code)
+
+
 class TestDirectOverrideEligibilityUnit:
     """Direct unit coverage of `_structural_deadlock_override_eligible()`
     (hygiene, not a literal AC's VC -- strengthens confidence beyond the
@@ -358,6 +649,108 @@ class TestDirectOverrideEligibilityUnit:
         assert wrapper._structural_deadlock_override_eligible(
             bundle, ["missing_required_section"], [], ["change_kind"]
         ) is True
+
+    # -- Issue #2598: bare `missing_required_parent_section` code --------
+
+    def _parent_bundle(self, *, issue_kind: str = "parent") -> dict:
+        return {
+            "issue_kind": issue_kind,
+            "items": [
+                self._safe_item(label, field_id)
+                for label, field_id in (
+                    ("Quality Decision Record", "quality-decision-record"),
+                    ("Child Issues", "child-issues"),
+                    ("Remaining Parent Gaps", "remaining-parent-gaps"),
+                )
+            ],
+        }
+
+    def test_parent_reason_code_eligible_when_bundle_issue_kind_parent(self) -> None:
+        bundle = self._parent_bundle(issue_kind="parent")
+        assert wrapper._structural_deadlock_override_eligible(
+            bundle, ["missing_required_parent_section"], list(_PARENT_TARGET_SECTIONS), []
+        ) is True
+
+    def test_parent_reason_code_not_eligible_when_bundle_issue_kind_mismatched(self) -> None:
+        """Defense-in-depth: the blocker STRING alone is never trusted to
+        imply the bundle's own shape -- a bundle independently resolved as a
+        different issue_kind must not be adopted even if `blockers` claims
+        `missing_required_parent_section`."""
+        bundle = self._parent_bundle(issue_kind="implementation")
+        assert wrapper._structural_deadlock_override_eligible(
+            bundle, ["missing_required_parent_section"], list(_PARENT_TARGET_SECTIONS), []
+        ) is False
+
+    def test_parent_non_auto_apply_safe_item_never_eligible(self) -> None:
+        """An item that is not itself `auto_apply_safe` must keep the
+        deadlock deferred (direct unit coverage, bypassing the separate
+        disposition_summary/items consistency schema check that an
+        end-to-end adversarial fixture would otherwise trip)."""
+        bundle = {
+            "issue_kind": "parent",
+            "items": [
+                {
+                    "field_id": "quality-decision-record",
+                    "label": "Quality Decision Record",
+                    "disposition": "human_review_required",
+                    "insertion": {"disposition": "exact"},
+                },
+                self._safe_item("Child Issues", "child-issues"),
+                self._safe_item("Remaining Parent Gaps", "remaining-parent-gaps"),
+            ],
+        }
+        assert wrapper._structural_deadlock_override_eligible(
+            bundle, ["missing_required_parent_section"], list(_PARENT_TARGET_SECTIONS), []
+        ) is False
+
+    def test_suffixed_parent_reason_code_never_eligible(self) -> None:
+        """Only the EXACT bare `missing_required_parent_section` code
+        counts -- a suffixed form is an unrelated blocker namespace,
+        matching the existing bare-code-only precedent for
+        `PLANNER_FAIL_CLOSED`."""
+        bundle = self._parent_bundle(issue_kind="parent")
+        assert wrapper._structural_deadlock_override_eligible(
+            bundle,
+            ["missing_required_parent_section:some_detail"],
+            list(_PARENT_TARGET_SECTIONS),
+            [],
+        ) is False
+
+
+class TestStructuralDeadlockEligibleBlockerUnit:
+    """Direct unit coverage of the shared `_structural_deadlock_eligible_blocker()`
+    predicate (Issue #2598) extracted for use by BOTH the eligibility check
+    and the post-override blocker cleanup."""
+
+    def test_generic_codes_always_eligible_regardless_of_bundle(self) -> None:
+        for blocker in (
+            "missing_required_section",
+            "missing_required_section:Outcome",
+            "structural_repair_action_deferred:some_reason",
+            wrapper.BLOCKER_FAIL_CLOSED,
+        ):
+            assert wrapper._structural_deadlock_eligible_blocker(blocker, None) is True
+
+    def test_bare_parent_code_eligible_only_when_bundle_issue_kind_parent(self) -> None:
+        assert wrapper._structural_deadlock_eligible_blocker(
+            "missing_required_parent_section", {"issue_kind": "parent"}
+        ) is True
+        assert wrapper._structural_deadlock_eligible_blocker(
+            "missing_required_parent_section", {"issue_kind": "implementation"}
+        ) is False
+        assert wrapper._structural_deadlock_eligible_blocker(
+            "missing_required_parent_section", None
+        ) is False
+
+    def test_suffixed_parent_code_never_eligible(self) -> None:
+        assert wrapper._structural_deadlock_eligible_blocker(
+            "missing_required_parent_section:detail", {"issue_kind": "parent"}
+        ) is False
+
+    def test_unrelated_blocker_never_eligible(self) -> None:
+        assert wrapper._structural_deadlock_eligible_blocker(
+            "some_unrelated_blocker_namespace", {"issue_kind": "parent"}
+        ) is False
 
 
 if __name__ == "__main__":
