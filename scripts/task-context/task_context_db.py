@@ -100,6 +100,35 @@ def connect(
     return conn
 
 
+def connect_readonly(db_file: pathlib.Path) -> sqlite3.Connection | None:
+    """Open a genuinely read-only connection to an *existing* DB file --
+    never creating the parent directory, the DB file itself, or running any
+    migration/write-capable initialization (Issue #2564 AC9: the statusLine
+    `query current` path must be truly read-only).
+
+    Returns ``None`` if ``db_file`` does not exist yet -- callers must treat
+    this as "no Task Context state yet" (render an empty/degraded
+    projection) rather than creating the DB as a side effect of a read.
+    """
+    db_file = pathlib.Path(db_file)
+    if not db_file.exists():
+        return None
+    uri = f"file:{db_file}?mode=ro"
+    try:
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000.0,
+            isolation_level=None,
+        )
+    except sqlite3.Error as exc:
+        raise errors.CorruptDatabaseError(
+            f"failed to open Task Context DB read-only at {db_file}: {exc}"
+        ) from exc
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def _configure_pragma(conn: sqlite3.Connection, sql: str) -> None:
     """Run a one-off connection-setup pragma, translating its *outcome* into
     a typed exception. Does not retry/sleep on its own -- the connection's

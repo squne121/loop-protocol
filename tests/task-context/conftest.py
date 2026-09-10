@@ -19,8 +19,14 @@ import pytest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SCRIPTS_DIR = _REPO_ROOT / "scripts" / "task-context"
 _MIGRATIONS_DIR = _SCRIPTS_DIR / "migrations"
+# Issue #2564: the Claude-native hook adapter modules (classifier.py,
+# ctl_client.py, herdr_projection.py, ...) live under
+# `.claude/hooks/task_context/` -- also a hyphen/dot-containing path that
+# cannot be a normal importable package, so it gets the same bare-module
+# sys.path treatment as `scripts/task-context` above.
+_HOOKS_DIR = _REPO_ROOT / ".claude" / "hooks" / "task_context"
 
-for _dir in (str(_SCRIPTS_DIR), str(_MIGRATIONS_DIR)):
+for _dir in (str(_SCRIPTS_DIR), str(_MIGRATIONS_DIR), str(_HOOKS_DIR)):
     if _dir not in sys.path:
         sys.path.insert(0, _dir)
 
@@ -31,6 +37,7 @@ import task_context_migration_runner as migration_runner  # noqa: E402
 REPO_ROOT = _REPO_ROOT
 SCRIPTS_DIR = _SCRIPTS_DIR
 MIGRATIONS_DIR = _MIGRATIONS_DIR
+HOOKS_DIR = _HOOKS_DIR
 
 
 @pytest.fixture
