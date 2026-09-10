@@ -4,11 +4,12 @@ wires it (`python3 hook_entry.py <EventName>` with the Claude Code hook JSON
 on stdin and `HERDR_TAB_ID`/`HERDR_PANE_ID` env vars). This is the
 "isolated ... actual hooks" layer the Issue's Runtime Verification
 Applicability calls for, short of a genuine live Herdr + Native Claude
-runtime (which this suite deliberately never touches -- ``herdr`` itself is
-never invoked here since ``hook_entry.py``'s synchronous path never calls
-it; only the separate async ``projection_flush_entry.py`` does, covered by
-``test_herdr_projection.py`` with a faked ``herdr`` binary instead of the
-real one)."""
+runtime (which this suite deliberately never touches -- the real ``herdr``
+binary is never on ``PATH`` in this suite, so the detached projection-flush
+child `hook_entry.py` launches after a DB-mutating event (PR #2615
+fix_delta 2) fails closed at `resolve_current_tab_id` and performs no
+Herdr I/O; ``test_herdr_projection.py`` covers the actual Herdr CLI
+invocation shape with a faked ``herdr`` binary instead)."""
 
 from __future__ import annotations
 
@@ -161,6 +162,136 @@ def test_given_cwd_changed_invoked_when_relocated_then_exit_zero_task_unaffected
     assert result.returncode == 0, result.stderr
     binding = _read_binding_by_location(state_root, "wV:p9-moved")
     assert binding is not None
+
+
+def test_given_cwd_changed_in_real_git_worktree_when_invoked_then_worktree_and_branch_observed(
+    state_root, tmp_path
+):
+    """fix_delta 7: `cwd` inside a real git checkout resolves `worktree` and
+    `branch` on the RuntimeLocation observation, display-only (AC7)."""
+    env_extra = {"HERDR_TAB_ID": "wV:t9", "HERDR_PANE_ID": "wV:p9"}
+    _run_hook("SessionStart", {"session_id": "s1", "source": "startup"}, state_root=state_root, env_extra=env_extra)
+    result = _run_hook(
+        "CwdChanged",
+        {"session_id": "s1", "cwd": str(_REPO_ROOT)},
+        state_root=state_root,
+        env_extra=env_extra,
+    )
+    assert result.returncode == 0, result.stderr
+    binding = _read_binding_by_location(state_root, "wV:p9")
+    assert binding is not None
+
+    conn = db.connect(config.db_path())
+    try:
+        location = service.get_current_location(conn, binding["id"])
+    finally:
+        conn.close()
+    assert location is not None
+    assert location["cwd"] == str(_REPO_ROOT)
+    assert location["worktree"], "expected a resolved git worktree toplevel"
+    assert location["branch"], "expected a resolved git branch"
+
+
+def test_given_slash_task_when_ctl_transport_fails_then_exit_two_never_fail_open(state_root):
+    """fix_delta 4: `/task` is an explicit state-changing command -- a CLI
+    transport error / invalid result envelope must surface as exit 2, never
+    a silent fail-open pass (unlike every other prompt kind)."""
+    broken_state_root = "relative/not/absolute/path"
+    env = dict(os.environ)
+    env.pop("HERDR_TAB_ID", None)
+    env.pop("HERDR_PANE_ID", None)
+    env["LOOP_TASK_CONTEXT_STATE_ROOT"] = broken_state_root
+    env["HERDR_TAB_ID"] = "wV:t9"
+    env["HERDR_PANE_ID"] = "wV:p9"
+    proc = subprocess.run(
+        [sys.executable, str(_HOOK_ENTRY), "UserPromptSubmit"],
+        input=json.dumps({"session_id": "s1", "prompt": "/task owner/repo#5", "cwd": str(state_root)}),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert proc.returncode == 2
+    assert "/task failed" in proc.stderr
+
+
+def test_given_normal_prompt_when_ctl_transport_fails_then_exit_zero_fail_open(state_root):
+    """The fix_delta 4 fail-closed carve-out is specific to SLASH_TASK --
+    every other prompt kind keeps the pre-existing fail-open default."""
+    broken_state_root = "relative/not/absolute/path"
+    env = dict(os.environ)
+    env.pop("HERDR_TAB_ID", None)
+    env.pop("HERDR_PANE_ID", None)
+    env["LOOP_TASK_CONTEXT_STATE_ROOT"] = broken_state_root
+    env["HERDR_TAB_ID"] = "wV:t9"
+    env["HERDR_PANE_ID"] = "wV:p9"
+    proc = subprocess.run(
+        [sys.executable, str(_HOOK_ENTRY), "UserPromptSubmit"],
+        input=json.dumps({"session_id": "s1", "prompt": "work on owner/repo#5", "cwd": str(state_root)}),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_given_slash_task_missing_target_when_invoked_then_exit_two_block(state_root):
+    """fix_delta 4: an explicit `/task` with no resolvable target/title is a
+    validation failure the adapter surfaces as decision:block, not a silent
+    no-op."""
+    env_extra = {"HERDR_TAB_ID": "wV:t9", "HERDR_PANE_ID": "wV:p9"}
+    _run_hook("SessionStart", {"session_id": "s1", "source": "startup"}, state_root=state_root, env_extra=env_extra)
+    result = _run_hook(
+        "UserPromptSubmit",
+        {"session_id": "s1", "prompt": "/task", "cwd": str(state_root)},
+        state_root=state_root,
+        env_extra=env_extra,
+    )
+    assert result.returncode == 2
+    assert "/task failed" in result.stderr
+
+
+def test_given_subagent_start_and_stop_when_agent_id_supplied_then_forwarded_and_correlated(state_root):
+    """fix_delta 5: the official Claude Code `agent_id` hook payload field is
+    forwarded end-to-end so SubagentStop ends the exact run that started."""
+    env_extra = {"HERDR_TAB_ID": "wV:t9", "HERDR_PANE_ID": "wV:p9"}
+    _run_hook("SessionStart", {"session_id": "s1", "source": "startup"}, state_root=state_root, env_extra=env_extra)
+    _run_hook(
+        "UserPromptSubmit",
+        {"session_id": "s1", "prompt": "work on owner/repo#1", "cwd": str(state_root)},
+        state_root=state_root,
+        env_extra=env_extra,
+    )
+
+    start_a = _run_hook(
+        "SubagentStart", {"session_id": "s1", "agent_id": "agent-a"}, state_root=state_root, env_extra=env_extra
+    )
+    assert start_a.returncode == 0, start_a.stderr
+    start_b = _run_hook(
+        "SubagentStart", {"session_id": "s1", "agent_id": "agent-b"}, state_root=state_root, env_extra=env_extra
+    )
+    assert start_b.returncode == 0, start_b.stderr
+
+    conn = db.connect(config.db_path())
+    try:
+        open_before_stop = service.find_open_execution_runs(conn, run_kind="subagent")
+    finally:
+        conn.close()
+    assert len(open_before_stop) == 2
+
+    stop_a = _run_hook(
+        "SubagentStop", {"session_id": "s1", "agent_id": "agent-a"}, state_root=state_root, env_extra=env_extra
+    )
+    assert stop_a.returncode == 0, stop_a.stderr
+
+    conn = db.connect(config.db_path())
+    try:
+        still_open = service.find_open_execution_runs(conn, run_kind="subagent")
+    finally:
+        conn.close()
+    assert len(still_open) == 1
+    assert still_open[0]["agent_id"] == "agent-b", "stopping agent-a must never end agent-b's run"
 
 
 def test_given_missing_event_arg_when_invoked_then_exit_zero_never_blocks(state_root):

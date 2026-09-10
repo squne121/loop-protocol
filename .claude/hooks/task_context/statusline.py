@@ -90,6 +90,18 @@ def render(data: dict) -> str:
         if health and health != "ACTIVE":
             parts.append(f"health={health}")
 
+    # fix_delta 7 (AC9: "statusLine に詳細... worktree/branch/runtime
+    # health を出す"): display-only RuntimeLocation observation -- never
+    # part of Task/Binding identity (AC7).
+    location = data.get("runtime_location")
+    if location is not None:
+        worktree = location.get("worktree")
+        branch = location.get("branch")
+        if worktree:
+            parts.append(f"worktree={worktree}")
+        if branch:
+            parts.append(f"branch={branch}")
+
     if attention:
         parts.append(f"! {attention}")
 

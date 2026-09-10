@@ -71,3 +71,57 @@ def test_given_attention_present_when_rendered_then_surfaced():
     }
     text = statusline.render(data)
     assert "needs human review" in text
+
+
+def test_given_runtime_location_with_worktree_and_branch_when_rendered_then_surfaced():
+    """fix_delta 7 (AC9): worktree/branch RuntimeLocation observation is
+    display-only detail on the statusLine."""
+    data = {
+        "degraded": False,
+        "task": {"id": "task_1", "title": "My Task"},
+        "activity": {"kind": "impl"},
+        "binding": None,
+        "task_refs": [],
+        "attention": None,
+        "runtime_location": {
+            "herdr_locator": "wV:p9",
+            "cwd": "/home/user/repo/.claude/worktrees/issue-2564",
+            "worktree": "/home/user/repo/.claude/worktrees/issue-2564",
+            "branch": "worktree-issue-2564-task-context-native-hooks",
+        },
+    }
+    text = statusline.render(data)
+    assert "worktree=/home/user/repo/.claude/worktrees/issue-2564" in text
+    assert "branch=worktree-issue-2564-task-context-native-hooks" in text
+
+
+def test_given_runtime_location_without_worktree_or_branch_when_rendered_then_omitted():
+    """A RuntimeLocation observation with no resolved git worktree/branch
+    (e.g. non-git cwd) must never render an empty `worktree=`/`branch=`."""
+    data = {
+        "degraded": False,
+        "task": {"id": "task_1", "title": "My Task"},
+        "activity": {"kind": "impl"},
+        "binding": None,
+        "task_refs": [],
+        "attention": None,
+        "runtime_location": {"herdr_locator": "wV:p9", "cwd": None, "worktree": None, "branch": None},
+    }
+    text = statusline.render(data)
+    assert "worktree=" not in text
+    assert "branch=" not in text
+
+
+def test_given_no_runtime_location_when_rendered_then_no_crash():
+    data = {
+        "degraded": False,
+        "task": {"id": "task_1", "title": "My Task"},
+        "activity": {"kind": "impl"},
+        "binding": None,
+        "task_refs": [],
+        "attention": None,
+        "runtime_location": None,
+    }
+    text = statusline.render(data)
+    assert "worktree=" not in text
+    assert "branch=" not in text

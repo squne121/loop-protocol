@@ -170,6 +170,46 @@ _EXPLICIT_TARGET_KIND_WORD_RE = re.compile(
 )
 
 
+def needs_current_repo_resolution(prompt: str) -> bool:
+    """PR #2615 fix_delta 6: cheap lexical pre-check -- does ``prompt``
+    contain a pattern whose classification would actually consult
+    ``current_repo``? Full GitHub URLs and explicit ``owner/repo#N``
+    targets never need it (the repo is already spelled out), so the
+    caller (``hook_entry.py``) can skip its ``git remote get-url origin``
+    subprocess call entirely for those prompts instead of running it
+    unconditionally on every ``UserPromptSubmit``.
+
+    Only a syntactic (not full ``classify()``) check -- it may return
+    ``True`` for a prompt that ``classify()`` later discards for other
+    reasons (e.g. inside a reference-only marker), but it must never
+    return ``False`` for a prompt that actually needs ``current_repo``."""
+    if not prompt:
+        return False
+
+    slash_match = _SLASH_TASK_RE.match(prompt)
+    if slash_match:
+        raw_target = (slash_match.group(1) or "").strip()
+        if not raw_target:
+            return False
+        if _EXPLICIT_TARGET_URL_RE.match(raw_target) or _EXPLICIT_TARGET_OWNER_REPO_RE.match(raw_target):
+            return False
+        # `parse_slash_task_target` only consults `current_repo` for a bare
+        # number (`#N`/`N`) or a bare `issue|pr #N` kind-word target -- any
+        # other raw_target falls through to the ad-hoc-title branch, which
+        # never touches current_repo.
+        return bool(
+            _EXPLICIT_TARGET_BARE_RE.match(raw_target) or _EXPLICIT_TARGET_KIND_WORD_RE.match(raw_target)
+        )
+
+    authority_text = _strip_authority_exclusions(prompt)
+    for match in _BARE_HASH_RE.finditer(authority_text):
+        start = match.start()
+        if start > 0 and authority_text[start - 1] == "/":
+            continue
+        return True
+    return False
+
+
 def parse_slash_task_target(raw_target: str, *, current_repo: str | None) -> tuple[Target | None, str | None]:
     """Resolve the ``/task <target>`` raw target string into either a
     structured :class:`Target` (GitHub ref) or an ad-hoc task title.
