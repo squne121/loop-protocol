@@ -77,6 +77,25 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _parse_iso8601(value: str) -> datetime | None:
+    """Issue #2601 PR #2612 fix_delta (OWNER REQUEST_CHANGES Finding 1):
+    best-effort ISO-8601 parse used by the session-window filters below.
+    Mirrors ``collect_snapshot._parse_iso8601`` (duplicated rather than
+    reached into across the dynamically-loaded sibling module, matching
+    this file's existing ``_utcnow``/``_iso`` duplication convention).
+    Returns ``None`` (never raises) on an unparseable value."""
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 # ---------------------------------------------------------------------------
 # sibling module loading (reuse Child 2/3 logic without editing it -- those
 # files are outside this Issue's Allowed Paths)
@@ -4386,14 +4405,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         # always prints a schema-valid `session_window_coverage/v1` envelope
         # and returns exit code 0, distinct from the default mode's typed
         # failure/nonzero-exit contract below.
+        #
+        # Issue #2601 PR #2612 fix_delta (OWNER REQUEST_CHANGES Finding 4):
+        # the `--prior-watermark-file` read/parse previously happened HERE,
+        # before calling `run_since_last_retrospective_cli()` -- outside
+        # that function's own typed-failure try/except boundary. A missing
+        # file or malformed JSON therefore raised a raw
+        # `FileNotFoundError`/`json.JSONDecodeError` straight out of
+        # `main()`, contradicting the documented "always schema-valid
+        # envelope, exit 0" contract for this mode. The path is now passed
+        # straight through; `run_since_last_retrospective_cli()` does the
+        # read/parse itself, inside its own try/except.
         required_sources = [s.strip() for s in args.session_sources.split(",") if s.strip()]
-        prior_watermark: dict[str, Any] | None = None
-        if args.prior_watermark_file:
-            prior_watermark = json.loads(Path(args.prior_watermark_file).read_text(encoding="utf-8"))
+        prior_watermark_file = Path(args.prior_watermark_file) if args.prior_watermark_file else None
         result = run_since_last_retrospective_cli(
             repo_root=Path(args.repo_root),
             required_sources=required_sources,
-            prior_watermark=prior_watermark,
+            prior_watermark_file=prior_watermark_file,
             publish_authorized=args.publish_authorized,
         )
         print(json.dumps(result, sort_keys=True))
@@ -4664,18 +4692,28 @@ def bind_latitude_evidence_to_candidates(
 #     mirrors the Issue's own Desired Outcome ("不足がある場合も...evidence
 #     を捨てずに degraded/partial として返してよい") and AC7's explicit
 #     separation of orchestration success from analysis completeness.
-#   - Durable checkpoint persistence (an actual write of the advanced
-#     watermark somewhere durable) is OUT OF SCOPE for this CLI mode: every
-#     `checkpoint_advanced: true` value this module computes is a PROPOSAL
-#     only, requiring a separate, human-authorized publish channel -- exactly
-#     mirroring the existing `PublishRequest.authorization_required` design
-#     already established elsewhere in this file. `--prior-watermark-file`
-#     (a caller-supplied local JSON file) is therefore the ONLY prior-state
-#     input this CLI mode reads; it deliberately does NOT introduce a new
-#     GitHub-comment-based checkpoint-persistence read/write protocol (that
-#     would itself become a new persistent control-plane mechanism -- see
-#     this Issue's Stop Conditions). A caller wanting real durable
-#     persistence supplies/updates that file via its own authorized process.
+#   - Durable checkpoint persistence: `checkpoint_advanced: true` remains a
+#     PROPOSAL gated on the SAME explicit `--publish-authorized` flag this
+#     module already required -- mirroring the existing
+#     `PublishRequest.authorization_required` design established elsewhere
+#     in this file. UPDATED (Issue #2601 PR #2612 fix_delta, OWNER
+#     REQUEST_CHANGES Finding 3): once that proposal is authorized AND this
+#     run's checkpoint disposition actually advances,
+#     `run_since_last_retrospective_cli()` now atomically writes the new
+#     watermark back to the SAME local `--prior-watermark-file` path it read
+#     from (`_write_prior_watermark_file`: temp-file + `os.replace`, no
+#     partial-write window) -- so a NEXT invocation pointed at the same
+#     local file path genuinely reads and uses this run's boundary (AC6's
+#     "next run behavior deterministic" requirement, provable end-to-end
+#     without a human manually copying the proposal into the file). This is
+#     STILL deliberately NOT a new GitHub-comment-based checkpoint-
+#     persistence read/write protocol, DB, or daemon -- see this Issue's
+#     Stop Conditions -- it is the SAME local file the prior design already
+#     treated as authoritative prior state; only the identity of the
+#     process that writes it changed (this authorized invocation itself,
+#     rather than requiring a separate external process to copy the
+#     proposal by hand). `--prior-watermark-file` remains the ONLY
+#     prior-state input this CLI mode reads.
 
 WIRE_SCHEMA_SESSION_WINDOW_COVERAGE = "session_window_coverage/v1"
 
@@ -4756,12 +4794,49 @@ def _session_window_coverage_schema() -> dict[str, Any]:
     return json.loads(_SESSION_WINDOW_COVERAGE_SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
+def _check_date_time_format(value: object) -> bool:
+    """Issue #2601 PR #2612 fix_delta (OWNER REQUEST_CHANGES Finding 5):
+    ``jsonschema.validate()``'s plain form never performs `format` keyword
+    validation unless a ``format_checker`` is explicitly supplied (the
+    library's own documented behavior) -- so the schema's declared
+    ``format: "date-time"`` on ``watermark.from_exclusive``/``to_inclusive``
+    was previously decorative. This repository has no ``rfc3339-validator``
+    dependency installed (that package backs `jsonschema`'s built-in
+    ``date-time`` checker), and adding one would mean editing the
+    repo-root ``pyproject.toml``/lockfile -- outside this Issue's Allowed
+    Paths. This is therefore a small, dependency-free checker registered
+    into a LOCAL ``jsonschema.FormatChecker`` (module-scoped, never mutates
+    the global default checker) using the stdlib's own
+    ``datetime.fromisoformat`` (Python 3.11+ accepts a trailing ``Z``
+    natively; this normalizes it to ``+00:00`` first for broader
+    compatibility)."""
+    if not isinstance(value, str):
+        return True  # format checkers only ever apply to string instances; `type` is a separate keyword
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        datetime.fromisoformat(candidate)
+    except ValueError:
+        return False
+    return True
+
+
+_SESSION_WINDOW_COVERAGE_FORMAT_CHECKER = jsonschema.FormatChecker()
+_SESSION_WINDOW_COVERAGE_FORMAT_CHECKER.checks("date-time")(_check_date_time_format)
+
+
 def validate_session_window_coverage(instance: dict[str, Any]) -> None:
     """Real ``jsonschema.validate`` re-verification against
     ``session_window_coverage_v1.schema.json`` (not a hand-rolled structural
     check) -- raises ``jsonschema.exceptions.ValidationError`` on any
-    violation."""
-    jsonschema.validate(instance=instance, schema=_session_window_coverage_schema())
+    violation, INCLUDING the schema's ``format: "date-time"`` constraint on
+    ``watermark.from_exclusive``/``to_inclusive`` (Issue #2601 PR #2612
+    fix_delta Finding 5 -- see ``_check_date_time_format``'s docstring for
+    why a plain ``jsonschema.validate()`` call silently skipped this)."""
+    jsonschema.validate(
+        instance=instance,
+        schema=_session_window_coverage_schema(),
+        format_checker=_SESSION_WINDOW_COVERAGE_FORMAT_CHECKER,
+    )
 
 
 def compute_source_coverage_entry(
@@ -4885,6 +4960,7 @@ def compute_session_window(
     *,
     prior_watermark: dict[str, Any] | None,
     source_coverage: dict[str, dict[str, Any]],
+    window_end: datetime | None = None,
     clock: Callable[[], datetime] = _utcnow,
 ) -> dict[str, Any]:
     """Issue #2601 AC5: ``from_exclusive``/``to_inclusive``/``covered_sources``
@@ -4892,9 +4968,24 @@ def compute_session_window(
     actually observed (``status == "observed"``) -- a source not observed
     this run is never added, regardless of whether it appeared in
     ``prior_watermark.covered_sources`` (that cross-run regression case is
-    ``guard_checkpoint_advancement``'s job, not this pure projection's)."""
+    ``guard_checkpoint_advancement``'s job, not this pure projection's).
+
+    Issue #2601 PR #2612 fix_delta (OWNER REQUEST_CHANGES Finding 1):
+    ``window_end``, when supplied, is reported as ``to_inclusive`` verbatim
+    instead of calling ``clock()`` again here. A caller that already froze
+    ``window_end = clock()`` once at run start (before session collection)
+    MUST pass that SAME value through so the boundary this function reports
+    is identical to the boundary actually used to filter session selection
+    (``resolve_claude_code_session_paths``) -- two independent ``clock()``
+    calls at different points in the same run would let the reported
+    boundary silently drift from the boundary sessions were actually
+    filtered against. Omitted (``None``, the default) preserves this
+    function's prior standalone behavior (calls ``clock()`` itself) for
+    existing callers that invoke it directly, outside a full
+    ``run_since_last_retrospective_cli`` run."""
     from_exclusive = prior_watermark.get("to_inclusive") if prior_watermark else None
-    to_inclusive = _iso(clock())
+    resolved_window_end = window_end if window_end is not None else clock()
+    to_inclusive = _iso(resolved_window_end)
     covered_sources = sorted(
         source_id for source_id, entry in source_coverage.items() if entry["status"] == "observed"
     )
@@ -4973,18 +5064,27 @@ def build_session_window_coverage_result(
     collector_results: dict[str, Any | None],
     prior_watermark: dict[str, Any] | None,
     publish_authorized: bool,
+    window_end: datetime | None = None,
     clock: Callable[[], datetime] = _utcnow,
 ) -> dict[str, Any]:
     """Issue #2601: pure top-level builder combining every function above
     into one ``session_window_coverage/v1``-schema-valid envelope. Always
     schema-validates its own output before returning (fail closed on an
     internal contract violation, never silently returns an
-    invalid/inconsistent envelope)."""
+    invalid/inconsistent envelope).
+
+    ``window_end`` (Issue #2601 PR #2612 fix_delta Finding 1), when
+    supplied, is forwarded verbatim to ``compute_session_window`` so the
+    reported ``watermark.to_inclusive`` matches the SAME frozen boundary
+    ``run_since_last_retrospective_cli`` already used to filter session
+    selection, rather than a second independent ``clock()`` call here."""
     resolved_required_sources = list(required_sources)
     source_coverage = compute_source_coverage_map(resolved_required_sources, collector_results)
     analysis_completeness = compute_analysis_completeness(resolved_required_sources, source_coverage)
     cross_runtime_comparison = compute_cross_runtime_comparison(resolved_required_sources, source_coverage)
-    watermark = compute_session_window(prior_watermark=prior_watermark, source_coverage=source_coverage, clock=clock)
+    watermark = compute_session_window(
+        prior_watermark=prior_watermark, source_coverage=source_coverage, window_end=window_end, clock=clock
+    )
     checkpoint = compute_checkpoint_disposition(
         required_sources=resolved_required_sources,
         source_coverage=source_coverage,
@@ -5035,15 +5135,108 @@ def default_claude_code_sessions_dir(env: dict[str, str], *, repo_root: Path) ->
     return Path(home) / ".claude" / "projects" / _claude_code_project_slug(repo_root)
 
 
-def resolve_claude_code_session_paths(sessions_dir: Path) -> list[Path]:
+def _claude_code_session_completed_at(path: Path) -> tuple[datetime | None, str]:
+    """Issue #2601 PR #2612 fix_delta (OWNER REQUEST_CHANGES Finding 1/6):
+    best-effort completion-time signal for ONE session transcript file, used
+    by ``resolve_claude_code_session_paths``'s window filter below.
+
+    Finding 6 investigation: this repository's existing
+    ``agent_session_manifest/v1`` SSOT (``docs/schemas/agent-session-manifest
+    .schema.json``, produced by ``scripts/generate-session-manifest.mjs``)
+    was evaluated as a possible window index and rejected for this role --
+    it is a per-Main-Loop-phase record published as an OPAQUE ref in a
+    GitHub Issue/PR comment (reading it back needs `gh` network calls and is
+    keyed by `phase_instance_id`/`issue_number`, not by which local
+    ``~/.claude/projects/<slug>/*.jsonl`` file a session lives in), and it is
+    only produced for recorded Main Loop phases -- not for every raw Claude
+    Code session. Reusing it here would silently miss every session that
+    never produced a published manifest. Per Finding 1's own stated
+    preference order, this instead prefers an ACTUAL session completion
+    signal extracted from the transcript itself: the latest valid
+    ``timestamp`` field across the file's JSONL records (the same field
+    ``collect_claude_code_source``'s own redaction allowlist already
+    retains). Only when the transcript carries no parseable ``timestamp`` at
+    all does this fall back to the file's mtime -- mtime is never the
+    sole/authoritative selector on its own, per Finding 1.
+
+    Returns ``(completed_at, source)`` where ``source`` is ``"transcript"``,
+    ``"mtime"``, or ``"unavailable"`` (I/O failure -- the caller excludes
+    the session from a window-filtered selection rather than guessing
+    window membership)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None, "unavailable"
+    latest: datetime | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        timestamp = record.get("timestamp")
+        if not isinstance(timestamp, str):
+            continue
+        parsed = _parse_iso8601(timestamp)
+        if parsed is not None and (latest is None or parsed > latest):
+            latest = parsed
+    if latest is not None:
+        return latest, "transcript"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None, "unavailable"
+    return datetime.fromtimestamp(mtime, tz=timezone.utc), "mtime"
+
+
+def resolve_claude_code_session_paths(
+    sessions_dir: Path,
+    *,
+    min_completed_at: str | None = None,
+    max_completed_at: str | None = None,
+) -> list[Path]:
     """Deterministic, sorted discovery of every ``*.jsonl`` transcript under
     ``sessions_dir``. Returns ``[]`` (never raises) when ``sessions_dir``
     does not exist -- the collector itself (``collect_claude_code_source``)
     already reports an empty ``session_paths`` list as ``unavailable``, so
-    this never silently manufactures a false ``observed``."""
+    this never silently manufactures a false ``observed``.
+
+    Issue #2601 PR #2612 fix_delta (OWNER REQUEST_CHANGES Finding 1, P0):
+    when ``min_completed_at``/``max_completed_at`` (ISO-8601 strings) are
+    supplied, this is where ``--since-last-retrospective``'s watermark is
+    ACTUALLY applied to session selection -- every returned path's
+    ``_claude_code_session_completed_at()`` must fall in the SAME
+    ``(min_completed_at, max_completed_at]`` exclusive-lower/inclusive-upper
+    convention ``compute_session_window`` reports, rather than every session
+    under ``sessions_dir`` being collected unconditionally on every run (the
+    false-green this finding identified: watermark computed for reporting
+    but never fed back into which sessions get collected). A session whose
+    completion time cannot be determined at all (``source ==
+    "unavailable"``) is excluded once a window bound is active -- fail
+    closed, never silently included as in-window."""
     if not sessions_dir.is_dir():
         return []
-    return sorted(sessions_dir.glob("**/*.jsonl"))
+    all_paths = sorted(sessions_dir.glob("**/*.jsonl"))
+    if min_completed_at is None and max_completed_at is None:
+        return all_paths
+
+    lower = _parse_iso8601(min_completed_at) if min_completed_at else None
+    upper = _parse_iso8601(max_completed_at) if max_completed_at else None
+    selected: list[Path] = []
+    for path in all_paths:
+        completed_at, _source = _claude_code_session_completed_at(path)
+        if completed_at is None:
+            continue
+        if lower is not None and completed_at <= lower:
+            continue
+        if upper is not None and completed_at > upper:
+            continue
+        selected.append(path)
+    return selected
 
 
 def default_claude_gpt_hook_sink_path(env: dict[str, str]) -> Path | None:
@@ -5062,7 +5255,8 @@ def collect_session_sources(
     required_sources: Sequence[str],
     env: dict[str, str],
     repo_root: Path,
-    run_nonce: str,
+    window_start_exclusive: str | None = None,
+    window_end_inclusive: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
 ) -> dict[str, Any | None]:
     """Issue #2601 In Scope: minimal, deterministic collector wiring for
@@ -5073,25 +5267,82 @@ def collect_session_sources(
     source's dict value is left as ``None`` (a collector never invoked at
     all) rather than invented/guessed -- ``compute_source_coverage_entry``
     reports that as ``required``/``collector_not_configured``, never
-    silently promoted to ``observed``."""
+    silently promoted to ``observed``.
+
+    Issue #2601 PR #2612 fix_delta (OWNER REQUEST_CHANGES Finding 1/2):
+
+    - ``window_start_exclusive``/``window_end_inclusive`` (ISO-8601
+      strings, the SAME ``prior_watermark.to_inclusive``/frozen
+      ``window_end`` the caller also feeds into ``compute_session_window``)
+      are threaded into ``resolve_claude_code_session_paths`` so the
+      watermark actually bounds WHICH sessions get collected, not merely
+      what gets reported afterward (Finding 1).
+    - ``claude_gpt`` no longer receives this retrospective invocation's own
+      freshly-minted run id as a correlation nonce (that value can never
+      match a PAST launch's own nonce -- Finding 2's structural bug).
+      ``collect_snapshot.collect_claude_gpt_source`` is called with
+      ``run_nonce=None`` so it auto-derives the correlation nonce from the
+      sink file's own embedded identity instead.
+    - ``known_source_nonempty`` is passed to
+      ``collect_snapshot.collect_claude_code_source`` based on whether the
+      UNFILTERED glob (before window bounds) found any session file at all
+      -- so a window narrowing selection to zero is reported as `observed`/
+      `complete` with 0 sessions (AC4), never conflated with a genuinely
+      never-wired/empty source (AC2)."""
     collect_snapshot = _collect_snapshot_module()
     results: dict[str, Any | None] = {}
     if "claude_code" in required_sources:
         sessions_dir = default_claude_code_sessions_dir(env, repo_root=repo_root)
         if sessions_dir is not None:
-            session_paths = resolve_claude_code_session_paths(sessions_dir)
-            results["claude_code"] = collect_snapshot.collect_claude_code_source(session_paths, clock=clock)
+            all_session_paths = resolve_claude_code_session_paths(sessions_dir)
+            session_paths = resolve_claude_code_session_paths(
+                sessions_dir,
+                min_completed_at=window_start_exclusive,
+                max_completed_at=window_end_inclusive,
+            )
+            results["claude_code"] = collect_snapshot.collect_claude_code_source(
+                session_paths, known_source_nonempty=bool(all_session_paths), clock=clock
+            )
         else:
             results["claude_code"] = None
     if "claude_gpt" in required_sources:
         hook_sink_path = default_claude_gpt_hook_sink_path(env)
         if hook_sink_path is not None:
             results["claude_gpt"] = collect_snapshot.collect_claude_gpt_source(
-                hook_sink_path, run_nonce=run_nonce, clock=clock
+                hook_sink_path,
+                run_nonce=None,
+                min_completed_at=window_start_exclusive,
+                max_completed_at=window_end_inclusive,
+                clock=clock,
             )
         else:
             results["claude_gpt"] = None
     return results
+
+
+def _write_prior_watermark_file(path: Path, watermark: dict[str, Any]) -> None:
+    """Issue #2601 PR #2612 fix_delta (OWNER REQUEST_CHANGES Finding 3,
+    preferred fix): atomically persists ``watermark`` to ``path`` -- the
+    SAME ``--prior-watermark-file`` path a NEXT
+    ``--since-last-retrospective`` invocation reads -- via temp-file +
+    ``os.replace`` (no partial-write window ever observable). This is
+    deliberately still NOT a new GitHub-comment-based checkpoint-persistence
+    protocol / DB / daemon (this module's own Stop Conditions rule that
+    out): the local file itself IS the durable checkpoint state, and the
+    caller updating it is this SAME ``--publish-authorized`` invocation
+    rather than a separate external process reading this module's proposal
+    and writing it back by hand."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(watermark, fh, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def run_since_last_retrospective_cli(
@@ -5099,6 +5350,7 @@ def run_since_last_retrospective_cli(
     repo_root: Path,
     required_sources: Sequence[str] | None = None,
     prior_watermark: dict[str, Any] | None = None,
+    prior_watermark_file: Path | None = None,
     publish_authorized: bool = False,
     env: dict[str, str] | None = None,
     run_id: str | None = None,
@@ -5120,26 +5372,95 @@ def run_since_last_retrospective_cli(
     envelope's ``orchestration`` field). Any unexpected internal failure
     (e.g. a malformed ``prior_watermark``, ``repo_root`` not a git checkout)
     is caught here and converted into a typed ``orchestration.status:
-    "failed"`` result rather than propagating."""
+    "failed"`` result rather than propagating.
+
+    ``prior_watermark_file`` (Issue #2601 PR #2612 fix_delta Finding 3/4):
+
+    - When supplied, its JSON content is read and parsed INSIDE this
+      function's own try/except boundary below (Finding 4), never before
+      calling this function (``main()`` previously did the read *before*
+      calling this function, outside any typed-failure boundary -- that was
+      the bug: a raw exception escaped straight to the CLI caller).
+      Malformed JSON content (``json.JSONDecodeError``) becomes a typed
+      ``orchestration.status: "failed"`` result with that exception's class
+      name as ``reason_code``. A path that does not exist AT ALL
+      (``FileNotFoundError``) is instead treated as legitimate first-run
+      "no prior state" (``resolved_prior_watermark`` stays ``None``) rather
+      than a failure -- this is what makes the read/write design below
+      usable end-to-end: the very first invocation pointed at a given path
+      has nothing to read yet, and (per the next bullet) this SAME run then
+      durably creates that file so the NEXT invocation's read succeeds. A
+      file that DOES exist but is malformed remains a genuine typed
+      failure -- unlike an absent path, a corrupt existing file is never an
+      expected/intentional state. Takes precedence over an in-memory
+      ``prior_watermark`` dict when both are supplied (the file path is the
+      production/CLI path; the in-memory dict remains for direct
+      programmatic/test callers that never touch the filesystem).
+    - When this run's checkpoint disposition actually advances
+      (``result["checkpoint"]["checkpoint_advanced"]``, which already
+      implies ``publish_authorized`` and full required-source coverage --
+      see ``compute_checkpoint_disposition``'s priority order), the new
+      watermark is durably written back to this SAME file
+      (``_write_prior_watermark_file``, Finding 3) so a NEXT invocation
+      pointed at the same path genuinely uses this run's boundary."""
     resolved_required_sources = list(required_sources) if required_sources else list(DEFAULT_REQUIRED_SESSION_SOURCES)
     resolved_env = env if env is not None else dict(os.environ)
-    resolved_run_id = run_id or str(uuid.uuid4())
+    # `run_id` (Issue #2601 PR #2612 fix_delta Finding 2) is this
+    # retrospective invocation's OWN operational identity, accepted for
+    # backward compatibility / future caller-side tracing only -- it is
+    # deliberately never threaded into `collect_session_sources`'s
+    # claude_gpt correlation any more (that nonce is now auto-derived from
+    # the sink's own content instead; see `collect_session_sources`'s
+    # docstring for why the retrospective's own freshly-minted id could
+    # never match a PAST claude-gpt launch's nonce).
+    resolved_prior_watermark = prior_watermark
     try:
         manual_trigger_preflight(repo_root=repo_root)
+        if prior_watermark_file is not None:
+            try:
+                watermark_text = prior_watermark_file.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                # Bootstrap: a caller-supplied `--prior-watermark-file` path
+                # that does not exist YET is legitimately "no prior state"
+                # (this is the FIRST invocation ever pointed at this path),
+                # never a failure -- this is what makes Finding 3's
+                # read/write design usable end-to-end at all: the first
+                # invocation has nothing to read, and after this run
+                # completes this SAME path is where the new watermark gets
+                # durably written (below), so the NEXT invocation's read
+                # succeeds. A file that DOES exist but is malformed (the
+                # `json.loads` below) remains a genuine typed failure --
+                # unlike a missing path, a corrupt existing file is never an
+                # expected/intentional state.
+                resolved_prior_watermark = None
+            else:
+                resolved_prior_watermark = json.loads(watermark_text)
+        # Issue #2601 PR #2612 fix_delta (Finding 1): frozen ONCE here,
+        # before session collection, and reused verbatim (never a second
+        # independent `clock()` call) for both the session-selection filter
+        # bound below and the reported `watermark.to_inclusive`.
+        window_end = clock()
         collector_results = collect_session_sources(
             required_sources=resolved_required_sources,
             env=resolved_env,
             repo_root=repo_root,
-            run_nonce=resolved_run_id,
+            window_start_exclusive=(
+                resolved_prior_watermark.get("to_inclusive") if resolved_prior_watermark else None
+            ),
+            window_end_inclusive=_iso(window_end),
             clock=clock,
         )
-        return build_session_window_coverage_result(
+        result = build_session_window_coverage_result(
             required_sources=resolved_required_sources,
             collector_results=collector_results,
-            prior_watermark=prior_watermark,
+            prior_watermark=resolved_prior_watermark,
             publish_authorized=publish_authorized,
+            window_end=window_end,
             clock=clock,
         )
+        if prior_watermark_file is not None and result["checkpoint"]["checkpoint_advanced"]:
+            _write_prior_watermark_file(prior_watermark_file, result["watermark"])
+        return result
     except Exception as exc:  # noqa: BLE001 -- AC2: this CLI mode never raises; every unexpected
         # failure is reported as a typed orchestration failure instead, still schema-shaped, still
         # exit 0 (never silently promoted to `analysis_completeness: "complete"`).
@@ -5162,7 +5483,7 @@ def run_since_last_retrospective_cli(
                 else None
             ),
             "watermark": {
-                "from_exclusive": prior_watermark.get("to_inclusive") if prior_watermark else None,
+                "from_exclusive": resolved_prior_watermark.get("to_inclusive") if resolved_prior_watermark else None,
                 "to_inclusive": _iso(clock()),
                 "covered_sources": [],
             },

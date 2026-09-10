@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -464,7 +465,6 @@ def test_collect_session_sources_unwired_when_env_unresolvable(tmp_path):
         required_sources=["claude_code", "claude_gpt"],
         env={},
         repo_root=tmp_path,
-        run_nonce="nonce-1",
         clock=_clock,
     )
     assert results == {"claude_code": None, "claude_gpt": None}
@@ -481,11 +481,556 @@ def test_collect_session_sources_wires_real_claude_code_collector(tmp_path):
         required_sources=["claude_code"],
         env={"HOME": str(tmp_path)},
         repo_root=tmp_path,
-        run_nonce="nonce-1",
         clock=_clock,
     )
     assert results["claude_code"] is not None
     assert results["claude_code"].observation["source_status"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# OWNER REQUEST_CHANGES fix_delta (PR #2612 issuecomment-5613892754):
+# Finding 1 -- watermark actually bounds session SELECTION, not just
+# reporting.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_claude_code_session_paths_no_bounds_returns_everything(tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "a.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2020-01-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    assert len(rr.resolve_claude_code_session_paths(sessions_dir)) == 1
+
+
+def test_resolve_claude_code_session_paths_uses_transcript_timestamp_not_mtime(tmp_path):
+    """Regression item 3/4: a session whose TRANSCRIPT timestamp is inside
+    the window is selected even if the file's mtime (this test's own write
+    time) is outside it -- proving the transcript signal, not mtime, is
+    authoritative when both are available."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    in_window = sessions_dir / "in-window.jsonl"
+    in_window.write_text(json.dumps({"type": "user", "timestamp": "2026-06-15T00:00:00Z"}) + "\n", encoding="utf-8")
+    before_window = sessions_dir / "before-window.jsonl"
+    before_window.write_text(
+        json.dumps({"type": "user", "timestamp": "2026-01-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    selected = rr.resolve_claude_code_session_paths(
+        sessions_dir, min_completed_at="2026-06-01T00:00:00Z", max_completed_at="2026-07-01T00:00:00Z"
+    )
+    assert [p.name for p in selected] == ["in-window.jsonl"]
+
+
+def test_resolve_claude_code_session_paths_falls_back_to_mtime_when_no_transcript_timestamp(tmp_path):
+    """Regression item 3: a transcript with no parseable `timestamp` field
+    falls back to file mtime (never the sole/authoritative selector when a
+    real transcript signal exists, but the only available signal here)."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    no_timestamp = sessions_dir / "no-timestamp.jsonl"
+    no_timestamp.write_text(json.dumps({"type": "user"}) + "\n", encoding="utf-8")
+    now = datetime.now(timezone.utc)
+    selected = rr.resolve_claude_code_session_paths(
+        sessions_dir,
+        min_completed_at=(now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        max_completed_at=(now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    assert [p.name for p in selected] == ["no-timestamp.jsonl"]
+
+
+def test_resolve_claude_code_session_paths_boundary_exclusive_lower_inclusive_upper(tmp_path):
+    """Regression item 4: exactly `from_exclusive` is EXCLUDED, exactly
+    `to_inclusive` is INCLUDED."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    (sessions_dir / "at-lower.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2026-06-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    (sessions_dir / "at-upper.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2026-07-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    selected = rr.resolve_claude_code_session_paths(
+        sessions_dir, min_completed_at="2026-06-01T00:00:00Z", max_completed_at="2026-07-01T00:00:00Z"
+    )
+    assert [p.name for p in selected] == ["at-upper.jsonl"]
+
+
+def test_collect_session_sources_applies_window_bounds_to_claude_code(tmp_path):
+    """Finding 1 end-to-end: `collect_session_sources` actually threads
+    window bounds into `resolve_claude_code_session_paths` -- a source that
+    globs to 2 files unconditionally globs to only the in-window one when a
+    window is supplied."""
+    slug = str(tmp_path.resolve()).replace("/", "-")
+    sessions_dir = tmp_path / ".claude" / "projects" / slug
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "old.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2020-01-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    (sessions_dir / "new.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2026-09-05T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    unbounded = rr.collect_session_sources(
+        required_sources=["claude_code"], env={"HOME": str(tmp_path)}, repo_root=tmp_path, clock=_clock
+    )
+    assert unbounded["claude_code"].private_evidence["provenance"]["sessions_read"] == 2
+
+    windowed = rr.collect_session_sources(
+        required_sources=["claude_code"],
+        env={"HOME": str(tmp_path)},
+        repo_root=tmp_path,
+        window_start_exclusive="2026-01-01T00:00:00Z",
+        window_end_inclusive="2026-12-31T00:00:00Z",
+        clock=_clock,
+    )
+    assert windowed["claude_code"].private_evidence["provenance"]["sessions_read"] == 1
+
+
+def test_run_since_last_retrospective_cli_second_run_excludes_prior_window_sessions(tmp_path):
+    """Regression items 1/2/3: end-to-end proof that a SECOND invocation
+    with a real prior watermark genuinely selects fewer/different sessions
+    than an unbounded first run -- not the same "all sessions" result every
+    time (the exact false-green Finding 1 identified)."""
+    (tmp_path / ".git").mkdir()
+    slug = str(tmp_path.resolve()).replace("/", "-")
+    sessions_dir = tmp_path / ".claude" / "projects" / slug
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "before.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2026-01-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+
+    def _clock_run1():
+        return datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+    first = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={"HOME": str(tmp_path)},
+        publish_authorized=True,
+        clock=_clock_run1,
+    )
+    assert first["source_coverage"]["claude_code"]["selected_session_count"] == 1
+    assert first["watermark"]["to_inclusive"] == "2026-06-01T00:00:00Z"
+
+    # A session created strictly AFTER run 1's window end.
+    (sessions_dir / "after.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2026-08-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+
+    def _clock_run2():
+        return datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+    second = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={"HOME": str(tmp_path)},
+        prior_watermark=first["watermark"],
+        publish_authorized=True,
+        clock=_clock_run2,
+    )
+    # Only the NEW session (created after run 1's boundary) is selected --
+    # "before.jsonl" (already covered by run 1) is correctly excluded.
+    assert second["source_coverage"]["claude_code"]["selected_session_count"] == 1
+    assert second["analysis_completeness"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Finding 2 -- claude_gpt nonce auto-derivation (never the retrospective's
+# own freshly-minted id).
+# ---------------------------------------------------------------------------
+
+
+def _write_hook_sink(path: Path, records: list[dict[str, Any]]) -> None:
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+
+def test_collect_claude_gpt_source_auto_derives_nonce_from_sink_content(tmp_path):
+    sink = tmp_path / "hook-sink-real-launch-nonce.jsonl"
+    _write_hook_sink(
+        sink,
+        [
+            {"run_nonce": "real-launch-nonce", "event": "UserPromptSubmit", "session_id": "s1", "ts": 100.0},
+            {"run_nonce": "real-launch-nonce", "event": "Stop", "session_id": "s1", "ts": 200.0},
+        ],
+    )
+    result = _collect_snapshot.collect_claude_gpt_source(sink, clock=_clock)
+    assert result.observation["source_status"] == "complete"
+    assert result.private_evidence["provenance"]["complete_sessions"] == ["s1"]
+    assert result.private_evidence["diagnostics"]["nonce_source"] == "auto_derived"
+
+
+def test_collect_claude_gpt_source_explicit_run_nonce_still_strict_match(tmp_path):
+    """Regression item 5: the OLD bug -- passing an unrelated freshly-minted
+    id as `run_nonce` -- must NOT silently succeed by accident. Explicit
+    strict-match behavior is preserved for a caller that passes a WRONG
+    nonce on purpose (never auto-promoted to a match)."""
+    sink = tmp_path / "sink.jsonl"
+    _write_hook_sink(
+        sink,
+        [
+            {"run_nonce": "real-launch-nonce", "event": "UserPromptSubmit", "session_id": "s1", "ts": 100.0},
+            {"run_nonce": "real-launch-nonce", "event": "Stop", "session_id": "s1", "ts": 200.0},
+        ],
+    )
+    # A freshly-minted retrospective UUID passed explicitly must NOT match --
+    # this is exactly the structural bug Finding 2 identified.
+    mismatched = _collect_snapshot.collect_claude_gpt_source(
+        sink, run_nonce="00000000-0000-4000-8000-000000000000", clock=_clock
+    )
+    assert mismatched.observation["source_status"] == "unavailable"
+    assert mismatched.private_evidence["diagnostics"]["reason_code"] == "stale_runtime_evidence"
+
+    matched = _collect_snapshot.collect_claude_gpt_source(sink, run_nonce="real-launch-nonce", clock=_clock)
+    assert matched.observation["source_status"] == "complete"
+
+
+def test_collect_claude_gpt_source_ambiguous_multiple_nonces_fails_closed(tmp_path):
+    sink = tmp_path / "sink.jsonl"
+    _write_hook_sink(
+        sink,
+        [
+            {"run_nonce": "launch-a", "event": "UserPromptSubmit", "session_id": "s1", "ts": 100.0},
+            {"run_nonce": "launch-b", "event": "UserPromptSubmit", "session_id": "s2", "ts": 100.0},
+        ],
+    )
+    result = _collect_snapshot.collect_claude_gpt_source(sink, clock=_clock)
+    assert result.observation["source_status"] == "unavailable"
+    assert result.private_evidence["diagnostics"]["nonce_source"] == "unresolvable_ambiguous_nonces"
+
+
+def test_collect_claude_gpt_source_window_bounds_filter_by_ts(tmp_path):
+    sink = tmp_path / "sink.jsonl"
+    old_ts = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+    new_ts = datetime(2026, 8, 1, tzinfo=timezone.utc).timestamp()
+    _write_hook_sink(
+        sink,
+        [
+            {"run_nonce": "n", "event": "UserPromptSubmit", "session_id": "old", "ts": old_ts},
+            {"run_nonce": "n", "event": "Stop", "session_id": "old", "ts": old_ts},
+            {"run_nonce": "n", "event": "UserPromptSubmit", "session_id": "new", "ts": new_ts},
+            {"run_nonce": "n", "event": "Stop", "session_id": "new", "ts": new_ts},
+        ],
+    )
+    windowed = _collect_snapshot.collect_claude_gpt_source(
+        sink, min_completed_at="2026-06-01T00:00:00Z", max_completed_at="2026-12-31T00:00:00Z", clock=_clock
+    )
+    assert windowed.private_evidence["provenance"]["complete_sessions"] == ["new"]
+
+
+def test_run_since_last_retrospective_cli_claude_gpt_uses_real_nonce_not_run_id(tmp_path, monkeypatch):
+    """Finding 2 end-to-end: `run_id`/an internal freshly-minted id must
+    never be threaded into GPT correlation -- real sink evidence tagged with
+    its OWN launch nonce must correlate successfully regardless of what
+    `run_id` this retrospective invocation happens to be given."""
+    (tmp_path / ".git").mkdir()
+    sink = tmp_path / "sink.jsonl"
+    _write_hook_sink(
+        sink,
+        [
+            {"run_nonce": "a-real-launch-nonce", "event": "UserPromptSubmit", "session_id": "s1", "ts": 100.0},
+            {"run_nonce": "a-real-launch-nonce", "event": "Stop", "session_id": "s1", "ts": 100.0},
+        ],
+    )
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_gpt"],
+        env={rr._CLAUDE_GPT_HOOK_SINK_PATH_ENV: str(sink)},
+        run_id="totally-unrelated-retrospective-invocation-id",
+        publish_authorized=True,
+        clock=_clock,
+    )
+    assert result["source_coverage"]["claude_gpt"]["status"] == "observed"
+    assert result["analysis_completeness"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Finding 3 -- durable checkpoint write/readback via --prior-watermark-file.
+# ---------------------------------------------------------------------------
+
+
+def test_run_since_last_retrospective_cli_writes_watermark_file_on_advancement(tmp_path):
+    (tmp_path / ".git").mkdir()
+    slug = str(tmp_path.resolve()).replace("/", "-")
+    sessions_dir = tmp_path / ".claude" / "projects" / slug
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "session1.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2026-01-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    watermark_file = tmp_path / "watermark.json"
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={"HOME": str(tmp_path)},
+        prior_watermark_file=watermark_file,
+        publish_authorized=True,
+        clock=_clock,
+    )
+    assert result["checkpoint"]["checkpoint_advanced"] is True
+    written = json.loads(watermark_file.read_text(encoding="utf-8"))
+    assert written == result["watermark"]
+
+
+def test_run_since_last_retrospective_cli_does_not_write_watermark_file_when_not_authorized(tmp_path):
+    (tmp_path / ".git").mkdir()
+    watermark_file = tmp_path / "watermark.json"
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={},
+        prior_watermark_file=watermark_file,
+        publish_authorized=False,
+        clock=_clock,
+    )
+    assert result["checkpoint"]["checkpoint_advanced"] is False
+    assert not watermark_file.exists()
+
+
+def test_run_since_last_retrospective_cli_second_invocation_reads_back_written_watermark(tmp_path):
+    """Regression item 9: a durable write on invocation 1 is actually READ
+    and USED by invocation 2 -- the core AC6 "next run behavior
+    deterministic" proof."""
+    (tmp_path / ".git").mkdir()
+    slug = str(tmp_path.resolve()).replace("/", "-")
+    sessions_dir = tmp_path / ".claude" / "projects" / slug
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "session1.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2026-01-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    watermark_file = tmp_path / "watermark.json"
+
+    def _clock_run1():
+        return datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+    first = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={"HOME": str(tmp_path)},
+        prior_watermark_file=watermark_file,
+        publish_authorized=True,
+        clock=_clock_run1,
+    )
+    assert first["source_coverage"]["claude_code"]["selected_session_count"] == 1
+    assert watermark_file.exists()
+
+    def _clock_run2():
+        return datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+    # No NEW session created -- invocation 2 must read back invocation 1's
+    # written watermark (via `--prior-watermark-file`, never an in-memory
+    # `prior_watermark` dict this test never passes) and therefore select 0
+    # sessions (the one existing session is now excluded by the boundary).
+    second = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={"HOME": str(tmp_path)},
+        prior_watermark_file=watermark_file,
+        publish_authorized=True,
+        clock=_clock_run2,
+    )
+    assert second["source_coverage"]["claude_code"]["selected_session_count"] == 0
+    assert second["watermark"]["from_exclusive"] == first["watermark"]["to_inclusive"]
+
+
+# ---------------------------------------------------------------------------
+# Finding 4 -- malformed/missing --prior-watermark-file is a typed failure,
+# never a raw uncaught exception.
+# ---------------------------------------------------------------------------
+
+
+def test_run_since_last_retrospective_cli_missing_watermark_file_bootstraps_as_first_run(tmp_path):
+    """Regression item 6: a `--prior-watermark-file` path that does not
+    exist yet is a legitimate BOOTSTRAP (first-ever invocation at this
+    path), never a raw exception nor a typed failure -- it must behave
+    identically to no prior state at all (here: `env={}` leaves the
+    `claude_code` collector genuinely unwired, so the checkpoint still
+    cannot advance -- but for THAT reason, never because the missing file
+    itself was treated as an error)."""
+    (tmp_path / ".git").mkdir()
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={},
+        prior_watermark_file=tmp_path / "does-not-exist.json",
+        publish_authorized=True,
+        clock=_clock,
+    )
+    assert result["orchestration"]["status"] == "succeeded"
+    assert result["source_coverage"]["claude_code"]["status"] == "required"
+    assert result["source_coverage"]["claude_code"]["reason_code"] == "collector_not_configured"
+    assert result["checkpoint"]["checkpoint_advance_reason"] == "blocked_missing_required_source"
+    rr.validate_session_window_coverage(result)
+
+
+def test_run_since_last_retrospective_cli_missing_watermark_file_with_wired_collector_advances_and_writes(tmp_path):
+    """Same bootstrap scenario, but with the `claude_code` collector
+    actually wired -- proves the missing-file bootstrap path reaches a real
+    `first_run_no_prior_state` advancement and durably writes the file,
+    not just a degraded no-op."""
+    (tmp_path / ".git").mkdir()
+    slug = str(tmp_path.resolve()).replace("/", "-")
+    sessions_dir = tmp_path / ".claude" / "projects" / slug
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "session1.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2026-01-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    watermark_file = tmp_path / "does-not-exist-yet.json"
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={"HOME": str(tmp_path)},
+        prior_watermark_file=watermark_file,
+        publish_authorized=True,
+        clock=_clock,
+    )
+    assert result["orchestration"]["status"] == "succeeded"
+    assert result["checkpoint"] == {
+        "checkpoint_advanced": True,
+        "checkpoint_advance_reason": "first_run_no_prior_state",
+    }
+    assert watermark_file.exists()
+    assert json.loads(watermark_file.read_text(encoding="utf-8")) == result["watermark"]
+
+
+def test_run_since_last_retrospective_cli_malformed_watermark_json_is_typed_failure(tmp_path):
+    (tmp_path / ".git").mkdir()
+    watermark_file = tmp_path / "watermark.json"
+    watermark_file.write_text("{not valid json", encoding="utf-8")
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={},
+        prior_watermark_file=watermark_file,
+        publish_authorized=True,
+        clock=_clock,
+    )
+    assert result["orchestration"]["status"] == "failed"
+    assert result["orchestration"]["reason_code"] == "JSONDecodeError"
+    rr.validate_session_window_coverage(result)
+
+
+def test_main_missing_watermark_file_never_raises_raw_exception(tmp_path, capsys):
+    (tmp_path / ".git").mkdir()
+    exit_code = rr.main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--since-last-retrospective",
+            "--session-sources",
+            "claude_code",
+            "--prior-watermark-file",
+            str(tmp_path / "does-not-exist.json"),
+        ]
+    )
+    assert exit_code == 0
+    printed = json.loads(capsys.readouterr().out)
+    # A missing --prior-watermark-file path is a legitimate first-run
+    # bootstrap (see test_run_since_last_retrospective_cli_missing_watermark_
+    # file_bootstraps_as_first_run's docstring) -- the load-bearing
+    # assertion here is that `main()` never raises a raw exception and
+    # always prints a schema-valid envelope, matching the documented
+    # "always schema-valid envelope, exit 0" contract.
+    assert printed["orchestration"]["status"] == "succeeded"
+    rr.validate_session_window_coverage(printed)
+
+
+def test_main_malformed_watermark_file_never_raises_raw_exception(tmp_path, capsys):
+    (tmp_path / ".git").mkdir()
+    watermark_file = tmp_path / "watermark.json"
+    watermark_file.write_text("{not valid json", encoding="utf-8")
+    exit_code = rr.main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--since-last-retrospective",
+            "--session-sources",
+            "claude_code",
+            "--prior-watermark-file",
+            str(watermark_file),
+        ]
+    )
+    assert exit_code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["orchestration"]["status"] == "failed"
+    assert printed["orchestration"]["reason_code"] == "JSONDecodeError"
+
+
+# ---------------------------------------------------------------------------
+# Finding 5 -- schema `format: "date-time"` is actually enforced.
+# ---------------------------------------------------------------------------
+
+
+def test_schema_rejects_invalid_date_time_string():
+    zero_result = _collector_result(source_status="complete", provenance={"sessions_read": 0})
+    result = rr.build_session_window_coverage_result(
+        required_sources=["claude_code"],
+        collector_results={"claude_code": zero_result},
+        prior_watermark=None,
+        publish_authorized=True,
+        clock=_clock,
+    )
+    result["watermark"]["to_inclusive"] = "not-a-valid-date-time"
+    with pytest.raises(jsonschema.exceptions.ValidationError):
+        rr.validate_session_window_coverage(result)
+
+
+def test_schema_accepts_valid_date_time_string():
+    zero_result = _collector_result(source_status="complete", provenance={"sessions_read": 0})
+    result = rr.build_session_window_coverage_result(
+        required_sources=["claude_code"],
+        collector_results={"claude_code": zero_result},
+        prior_watermark=None,
+        publish_authorized=True,
+        clock=_clock,
+    )
+    rr.validate_session_window_coverage(result)  # must not raise -- to_inclusive is real ISO-8601
+
+
+# ---------------------------------------------------------------------------
+# Finding 1 -- window_end is frozen once, reused for filtering AND reporting.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_session_window_reuses_supplied_window_end_verbatim():
+    coverage = rr.compute_source_coverage_map(["claude_code"], {})
+    fixed_end = datetime(2026, 3, 3, 3, 3, 3, tzinfo=timezone.utc)
+    watermark = rr.compute_session_window(prior_watermark=None, source_coverage=coverage, window_end=fixed_end)
+    assert watermark["to_inclusive"] == "2026-03-03T03:03:03Z"
+
+
+# ---------------------------------------------------------------------------
+# Regression item 10: source unavailable/partial does not let the checkpoint
+# cross the unobserved gap (existing guard, re-confirmed against the
+# corrected selector).
+# ---------------------------------------------------------------------------
+
+
+def test_ac5_guard_still_blocks_after_selector_fix_when_source_regresses(tmp_path):
+    (tmp_path / ".git").mkdir()
+    slug = str(tmp_path.resolve()).replace("/", "-")
+    sessions_dir = tmp_path / ".claude" / "projects" / slug
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "session1.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2026-06-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    prior_watermark_both = {
+        "from_exclusive": None,
+        "to_inclusive": "2026-01-01T00:00:00Z",
+        "covered_sources": ["claude_code", "claude_gpt"],
+    }
+    # This run only asks about claude_code (claude_gpt regresses to unwired)
+    # even though the prior watermark covered both -- the guard must still
+    # block checkpoint advancement, using the corrected window-aware
+    # selector.
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={"HOME": str(tmp_path)},
+        prior_watermark=prior_watermark_both,
+        publish_authorized=True,
+        clock=_clock,
+    )
+    assert result["checkpoint"]["checkpoint_advanced"] is False
+    assert result["checkpoint"]["checkpoint_advance_reason"] == "blocked_missing_required_source"
 
 
 def test_run_since_last_retrospective_cli_end_to_end_degraded_when_unwired(tmp_path):
