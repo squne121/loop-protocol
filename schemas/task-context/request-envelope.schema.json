@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://loop-protocol.local/schemas/task-context/request-envelope.schema.json",
+  "title": "Task Context v1 request envelope",
+  "description": "Frozen request envelope shape (Issue #2563 AC8). `payload` internals are additive/open per-operation and are NOT constrained by this schema.",
+  "type": "object",
+  "required": ["schema_version", "operation", "request_id", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "task-context-request/v1"
+    },
+    "operation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload": {
+      "type": "object",
+      "description": "Operation-specific fields. Intentionally open -- future consumer children add fields additively without changing this envelope."
+    }
+  }
+}

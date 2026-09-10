@@ -28,6 +28,7 @@ from ci_verdict_summary import (
     EXIT_PENDING,
     EXIT_STALE,
     HEAD_SHA_NULL_SKIPPED_EXCLUDE_RULES,
+    ORDINARY_PR_SKIPPED_EXCLUDE_RULES,
     STATUS_CHECK_ROLLUP_QUERY,
     UNCONDITIONAL_EXCLUDE_RULES,
     classify_check,
@@ -1538,6 +1539,104 @@ class TestExtractRunId:
 
     def test_returns_none_for_none(self):
         assert extract_run_id_from_link(None) is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #2433 / PR #2561: intentional ordinary-PR CI skips
+# ---------------------------------------------------------------------------
+
+class TestIntentionalOrdinaryPrSkips:
+    """Only exact, current-head ordinary-PR skipped CheckRuns are advisory."""
+
+    @pytest.mark.parametrize(
+        "check_name",
+        [
+            "reliability-assessment",
+            "close-evidence-publication",
+            "ci-runtime-baseline-gate-ready",
+        ],
+    )
+    def test_exact_current_head_ordinary_pr_skip_is_excluded(self, check_name: str):
+        assert ("ci", check_name) in ORDINARY_PR_SKIPPED_EXCLUDE_RULES
+        entry = {
+            "workflow": "ci",
+            "name": check_name,
+            "event": "pull_request",
+            "status": "completed",
+            "conclusion": "skipped",
+            "bucket": "skipping",
+            "head_sha": None,
+            "_run_head_sha": HEAD_SHA,
+            "run_detail_complete": True,
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "excluded"
+
+    @pytest.mark.parametrize("field,value", [
+        ("event", "workflow_dispatch"),
+        ("_run_head_sha", STALE_SHA),
+        ("run_detail_complete", False),
+    ])
+    def test_skip_without_exact_ordinary_pr_provenance_stays_blocking(self, field: str, value: object):
+        entry = {
+            "workflow": "ci",
+            "name": "close-evidence-publication",
+            "event": "pull_request",
+            "status": "completed",
+            "conclusion": "skipped",
+            "bucket": "skipping",
+            "head_sha": None,
+            "_run_head_sha": HEAD_SHA,
+            "run_detail_complete": True,
+        }
+        entry[field] = value
+        assert determine_check_verdict(entry, HEAD_SHA) != "excluded"
+
+    @pytest.mark.parametrize(
+        "workflow,check_name",
+        [
+            ("ci", "test"),
+            ("ci", "e2e"),
+            ("ci", "unknown-pr-check"),
+            ("other-workflow", "close-evidence-publication"),
+        ],
+    )
+    def test_required_evidence_unknown_or_wrong_tuple_skip_stays_blocking(
+        self, workflow: str, check_name: str
+    ):
+        entry = {
+            "workflow": workflow,
+            "name": check_name,
+            "event": "pull_request",
+            "status": "completed",
+            "conclusion": "skipped",
+            "bucket": "skipping",
+            "head_sha": None,
+            "_run_head_sha": HEAD_SHA,
+            "run_detail_complete": True,
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "failed"
+
+    @pytest.mark.parametrize(
+        "check_name",
+        [
+            "reliability-assessment",
+            "close-evidence-publication",
+            "ci-runtime-baseline-gate-ready",
+        ],
+    )
+    def test_exact_tuple_failure_stays_blocking(self, check_name: str):
+        entry = {
+            "workflow": "ci",
+            "name": check_name,
+            "event": "pull_request",
+            "status": "completed",
+            "conclusion": "failure",
+            "bucket": "fail",
+            "head_sha": None,
+            "_run_head_sha": HEAD_SHA,
+            "run_detail_complete": True,
+        }
+        assert determine_check_verdict(entry, HEAD_SHA) == "failed"
 
 
 # ---------------------------------------------------------------------------

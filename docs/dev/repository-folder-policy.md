@@ -86,7 +86,7 @@ denied alias（`.tmp/` `.temp/` `.tmp-*/`）配下は、有効な `temp_residue_
 
 ## 運用ルール
 
-- `.tmp/`、`.temp/`、`.tmp-*` は作業を block しない。ただし hook は `REPO_TEMP_FOLDER_ADVICE_V1` を返し、`tmp/` または `.claude/tmp/` への移行を案内する。
+- `.tmp/`、`.temp/`、`.tmp-*` は作業を block しない。ただし hook は `REPO_TEMP_FOLDER_ADVICE_V2` を返し、`tmp/` への移行を案内する（Issue #2007 以降。producer `scripts/agent-guards/root_temporary_residue_policy.py` は `--schema-version {v1,v2}` を持ち、live hook は `v2` を明示的に指定する。V1 emit 経路は breaking change を避けるため producer 内に残る）。
 - 新規書き込みは `tmp/` のみ。`.claude/tmp/` は legacy residue の read/scan/report と登録済み例外のみとし、新規の書き込み先として使わない。終了時に自分の session subdirectory を削除するか、残置理由を報告する。owned session subdirectory かどうかは `temp_residue_owner/v1` ownership marker（`scripts/agent-ops/temp_residue_marker.py`）で判定できる。
 - `.claude/worktrees/` は managed worktree root であり、agent が ad hoc temporary workspace の代替として使わない。cleanup は `cleanup_exec.py` の認可境界に限定する。
 - root temporary residue の read-only 分類は `scripts/agent-ops/temp_residue_classifier.py`（`temp_residue_classification/v1`）が担う。ownership marker 不明の `.tmp/**` / `.temp/**` / `.tmp-*/**` は report-only とし、classifier 自体は削除を実行しない。実削除 executor は別 scope。
@@ -95,7 +95,7 @@ denied alias（`.tmp/` `.temp/` `.tmp-*/`）配下は、有効な `temp_residue_
 ## 正本と非推奨の区別（Canonical / Deprecated, Issue #1995）
 
 - `tmp/` を新規書き込みの canonical write destination とする。エージェントが新たに session artifact を書き出す場合は `tmp/` を使う。
-- `.claude/tmp/` は非推奨（deprecated）の legacy root である。構造・read/scan/report・`never_delete` safety rule は温存し、新規の書き込み先としては使わない。既存 residue の分類（`temp_residue_classifier.py`）・marker（`temp_residue_marker.py`）・schema（`repo_temp_folder_advice_v1.schema.json`）は本 Issue のスコープでは変更しない。
+- `.claude/tmp/` は非推奨（deprecated）の legacy root である。構造・read/scan/report・`never_delete` safety rule は温存し、新規の書き込み先としては使わない。既存 residue の分類（`temp_residue_classifier.py`）・marker（`temp_residue_marker.py`）のロジック自体は Issue #2007 でも変更しない。schema については Issue #2007 で `repo_temp_folder_advice_v2.schema.json`（`approved_write_roots: ["tmp/"]` / `deprecated_legacy_roots: [".claude/tmp/"]` に分離）を新規追加し、`repo_temp_folder_advice_v1.schema.json` は breaking change を避けるため producer 内に emit 経路を残したまま維持する。V2 live hook は `.claude/tmp/**` への新規書き込みを `deprecated_legacy_root_write` として advisory 対象に追加する（read/scan/report/delete は妨げない）。
 
 ## フォルダ運用変更の変更動線
 

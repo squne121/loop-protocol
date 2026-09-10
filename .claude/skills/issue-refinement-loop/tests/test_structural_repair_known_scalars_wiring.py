@@ -47,6 +47,8 @@ import run_refinement_preflight as wrapper  # noqa: E402
 
 _TEMPLATE_PATH = _REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "implementation.yml"
 _TEMPLATE_TEXT = _TEMPLATE_PATH.read_text(encoding="utf-8")
+_PARENT_TEMPLATE_PATH = _REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / "parent.yml"
+_PARENT_TEMPLATE_TEXT = _PARENT_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 REPO = "testowner/testrepo"
 
@@ -70,6 +72,7 @@ def _seed_real_template(tmp_path: Path) -> None:
     template_dir = tmp_path / ".github" / "ISSUE_TEMPLATE"
     template_dir.mkdir(parents=True, exist_ok=True)
     (template_dir / "implementation.yml").write_text(_TEMPLATE_TEXT, encoding="utf-8")
+    (template_dir / "parent.yml").write_text(_PARENT_TEMPLATE_TEXT, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +142,38 @@ def _build_body(
         "## Required Skills", "", "- none", "",
     ]
     return "\n".join(lines) + "\n"
+
+
+def _build_parent_body(
+    *,
+    include_quality_decision_record: bool = False,
+    include_child_issues: bool = False,
+    include_remaining_parent_gaps: bool = False,
+) -> str:
+    """Build a valid parent contract with only selected required headings absent."""
+    sections = [
+        (
+            "Machine-Readable Contract",
+            "```yaml\ncontract_schema_version: v1\nissue_kind: parent\ngoal_ref: g\n"
+            "change_kind: workflow\nparent_mode: quality-gate\n"
+            "closure_mode: measurement-ready\n```",
+        ),
+        ("Summary", "summary"),
+        ("Goal", "goal"),
+        ("Desired Destination", "destination"),
+        ("Current Validated Scope", "- scope"),
+        ("Decisions Fixed", "- 2026-01-01: decision"),
+        ("Parent Closure Rule", "- quality-gate: decision recorded"),
+        ("Phase Handoff Contract", "- handoff"),
+        ("Acceptance Criteria", "- [ ] AC1"),
+    ]
+    if include_quality_decision_record:
+        sections.insert(6, ("Quality Decision Record", "- `Status`: measurement-ready"))
+    if include_child_issues:
+        sections.insert(-2, ("Child Issues", "- [ ] #2582 — repair"))
+    if include_remaining_parent_gaps:
+        sections.insert(-2, ("Remaining Parent Gaps", "- [ ] follow-up"))
+    return "\n\n".join(f"## {heading}\n\n{content}" for heading, content in sections) + "\n"
 
 
 def _write_fixture(
@@ -688,3 +723,307 @@ def test_no_new_derivation_mode_added():
         ric.DERIVATION_DERIVED_SCALAR_EXACT,
     })
     assert len(ric.CLOSED_DERIVATION_MODES) == 3
+
+
+def _owner_anchor_comment(*, issue_number: int, comment_id: int, body: str) -> tuple[str, dict]:
+    url = f"https://github.com/{REPO}/issues/{issue_number}#issuecomment-{comment_id}"
+    return url, {
+        "id": comment_id,
+        "body": body,
+        "issue_url": f"https://api.github.com/repos/{REPO}/issues/{issue_number}",
+        "html_url": url,
+        "url": f"https://api.github.com/repos/{REPO}/issues/comments/{comment_id}",
+        "user": {"login": "owner-user", "type": "User"},
+        "author_association": "OWNER",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+    }
+
+
+def test_trusted_owner_anchor_required_sections_are_auto_safe_and_fresh_preflight_is_clean(tmp_path):
+    """AC1/AC2: the explicit human-context owner lane supplies only exact
+    parent-template sections, and their synthesized patch clears fresh repair."""
+    issue_number = 2572
+    anchor_body = """## Quality Decision Record
+
+- `Status`: measurement-ready
+
+## Child Issues
+
+- [ ] #2582 — repair
+
+## Remaining Parent Gaps
+
+- [ ] resume on current main
+"""
+    url, anchor_comment = _owner_anchor_comment(
+        issue_number=issue_number, comment_id=5584982649, body=anchor_body
+    )
+    body = _build_parent_body()
+    result, exit_code = _run_preflight(
+        tmp_path,
+        issue_number,
+        body,
+        anchor_comment_urls=[url],
+        anchor_comments=[anchor_comment],
+        known_context={"human_context_comment_urls": [url]},
+    )
+
+    items = _items_by_field_id(result)
+    expected = {
+        "quality-decision-record": "- `Status`: measurement-ready",
+        "child-issues": "- [ ] #2582 — repair",
+        "remaining-parent-gaps": "- [ ] resume on current main",
+    }
+    assert set(items) == set(expected)
+    for field_id, expected_text in expected.items():
+        item = items[field_id]
+        assert item["disposition"] == ric.STRUCT_DISPOSITION_AUTO_APPLY_SAFE
+        assert item["derivation"] == ric.DERIVATION_SOURCE_SPAN_EXACT
+        assert item["candidate_value"] == expected_text
+        assert item["source_span"]["authority_kind"] == "owner_anchor"
+        assert item["source_span"]["source_object_kind"] == "issue_comment"
+        assert item["source_span"]["source_object_id"] == "5584982649"
+        assert item["source_span"]["source_revision"] == ric._sha256(anchor_body)
+    assert exit_code == wrapper.EXIT_NEEDS_FIX
+
+    repaired_body, synth_error = wrapper._synthesize_structural_repaired_body(
+        result["structural_repair_action"]["items"], body
+    )
+    assert synth_error is None
+    assert repaired_body is not None
+    fresh_result, fresh_exit = _run_preflight(
+        tmp_path,
+        issue_number,
+        repaired_body,
+        anchor_comment_urls=[url],
+        anchor_comments=[anchor_comment],
+        known_context={"human_context_comment_urls": [url]},
+    )
+    assert fresh_exit == wrapper.EXIT_PASS
+    assert fresh_result["structural_repair_action"]["items"] == []
+
+
+def test_owner_anchor_required_section_candidates_are_exact_column_zero_h2_only():
+    """Owner-anchor section sourcing ignores prose, fences, and containers."""
+    issue_number = 2572
+    target_body = _build_parent_body()
+    anchor_body = """Owner decision prose stays outside the canonical sections.
+
+```yaml
+example_heading: "## Quality Decision Record"
+```
+
+```markdown
+## Child Issues
+
+- fenced false positive
+```
+
+- ## Remaining Parent Gaps
+
+## Quality Decision Record
+
+- `Status`: measurement-ready
+
+## Child Issues
+
+- [ ] #2582 — repair
+
+## Remaining Parent Gaps
+
+- [ ] resume on current main
+"""
+    url, comment = _owner_anchor_comment(issue_number=issue_number, comment_id=5584982649, body=anchor_body)
+    spans = wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=anchor_body,
+        anchor_url=url,
+        anchor_comment=comment,
+        repo=REPO,
+        issue_number=issue_number,
+    )
+    assert {field_id: span["text"] for field_id, span in spans.items()} == {
+        "quality-decision-record": "- `Status`: measurement-ready",
+        "child-issues": "- [ ] #2582 — repair",
+        "remaining-parent-gaps": "- [ ] resume on current main",
+    }
+
+    container_only = """- ## Quality Decision Record
+
+  ## Child Issues
+
+- [ ] not a canonical heading
+
+> ## Remaining Parent Gaps
+
+- [ ] not a canonical heading
+"""
+    container_url, container_comment = _owner_anchor_comment(
+        issue_number=issue_number, comment_id=5584982650, body=container_only
+    )
+    assert wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=container_only,
+        anchor_url=container_url,
+        anchor_comment=container_comment,
+        repo=REPO,
+        issue_number=issue_number,
+    ) == {}
+
+
+def test_owner_anchor_source_assembly_fails_closed_for_invalid_provenance():
+    issue_number = 2572
+    target_body = _build_parent_body()
+    anchor_body = "## Quality Decision Record\n\n- `Status`: measurement-ready\n"
+    url, comment = _owner_anchor_comment(issue_number=issue_number, comment_id=5584982649, body=anchor_body)
+
+    assert wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=anchor_body,
+        anchor_url=url,
+        anchor_comment=comment,
+        repo=REPO,
+        issue_number=issue_number,
+    )
+
+    wrong_identity = dict(comment)
+    wrong_identity["id"] = 999
+    assert wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=anchor_body,
+        anchor_url=url,
+        anchor_comment=wrong_identity,
+        repo=REPO,
+        issue_number=issue_number,
+    ) == {}
+
+    wrong_target_url = url.replace(f"/issues/{issue_number}", f"/issues/{issue_number + 1}")
+    assert wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=anchor_body,
+        anchor_url=wrong_target_url,
+        anchor_comment=comment,
+        repo=REPO,
+        issue_number=issue_number,
+    ) == {}
+
+    wrong_repo_url = url.replace(REPO, "other/repo")
+    assert wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=anchor_body,
+        anchor_url=wrong_repo_url,
+        anchor_comment=comment,
+        repo=REPO,
+        issue_number=issue_number,
+    ) == {}
+
+    duplicate_heading = anchor_body + "\n## Quality Decision Record\n\n- duplicate\n"
+    duplicate_comment = dict(comment, body=duplicate_heading)
+    assert wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=duplicate_heading,
+        anchor_url=url,
+        anchor_comment=duplicate_comment,
+        repo=REPO,
+        issue_number=issue_number,
+    ) == {}
+
+    untrusted_comment = dict(comment, author_association="MEMBER")
+    assert wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=anchor_body,
+        anchor_url=url,
+        anchor_comment=untrusted_comment,
+        repo=REPO,
+        issue_number=issue_number,
+    ) == {}
+
+
+def test_owner_anchor_provenance_is_revalidated_at_bundle_boundary():
+    """Wrong source identity, target, revision, or snapshot digest cannot
+    bypass the generic structural-repair producer after assembly."""
+    issue_number = 2572
+    target_body = _build_parent_body()
+    anchor_body = "## Quality Decision Record\n\n- `Status`: measurement-ready\n"
+    url, comment = _owner_anchor_comment(issue_number=issue_number, comment_id=5584982649, body=anchor_body)
+    spans = wrapper._resolve_owner_anchor_required_section_source_spans(
+        target_body,
+        anchor_body=anchor_body,
+        anchor_url=url,
+        anchor_comment=comment,
+        repo=REPO,
+        issue_number=issue_number,
+    )
+    snapshot = {
+        "repo": REPO,
+        "target_issue_number": issue_number,
+        "comment_id": "5584982649",
+        "comment_url": url,
+        "body": anchor_body,
+        "body_sha256": ric._sha256(anchor_body),
+        "comment_updated_at": comment["updated_at"],
+        "author_association": "OWNER",
+    }
+
+    def bundle_for(source_spans, owner_snapshot=snapshot):
+        return ric.build_structural_repair_bundle(
+            target_body,
+            issue_kind="parent",
+            template_text=_PARENT_TEMPLATE_TEXT,
+            template_path=str(_PARENT_TEMPLATE_PATH),
+            repo=REPO,
+            issue_number=issue_number,
+            source_spans=source_spans,
+            owner_anchor_snapshot=owner_snapshot,
+        )
+
+    assert {
+        item["field_id"]: item for item in bundle_for(spans)["items"]
+    }["quality-decision-record"]["disposition"] == ric.STRUCT_DISPOSITION_AUTO_APPLY_SAFE
+
+    # The producer's generic parser accepts up to three leading spaces for
+    # CommonMark compatibility. An untrusted handoff must not use that wider
+    # rule to forge the narrower owner-anchor authority at this boundary.
+    indented_anchor_body = "  ## Quality Decision Record\n\n- `Status`: measurement-ready\n"
+    forged_indented_span = dict(
+        spans["quality-decision-record"],
+        source_revision=ric._sha256(indented_anchor_body),
+        line_start=3,
+        line_end=3,
+    )
+    indented_snapshot = dict(
+        snapshot,
+        body=indented_anchor_body,
+        body_sha256=ric._sha256(indented_anchor_body),
+    )
+    item = {
+        item["field_id"]: item
+        for item in bundle_for(
+            {"quality-decision-record": forged_indented_span}, indented_snapshot
+        )["items"]
+    }["quality-decision-record"]
+    assert item["disposition"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
+
+    for mutation in (
+        lambda span: span.update(source_repo="other/repo"),
+        lambda span: span.update(source_object_id="1"),
+        lambda span: span.update(source_revision="sha256:" + "0" * 64),
+    ):
+        mutated = {field_id: dict(span) for field_id, span in spans.items()}
+        mutation(mutated["quality-decision-record"])
+        item = {item["field_id"]: item for item in bundle_for(mutated)["items"]}["quality-decision-record"]
+        assert item["disposition"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
+
+    stale_snapshot = dict(snapshot, target_issue_number=issue_number + 1)
+    item = {
+        item["field_id"]: item for item in bundle_for(spans, stale_snapshot)["items"]
+    }["quality-decision-record"]
+    assert item["disposition"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED
+
+    mismatched_digest_snapshot = dict(snapshot, body_sha256=ric._sha256("different body"))
+    item = {
+        item["field_id"]: item
+        for item in bundle_for(spans, mismatched_digest_snapshot)["items"]
+    }["quality-decision-record"]
+    assert item["disposition"] == ric.STRUCT_DISPOSITION_HUMAN_REVIEW_REQUIRED

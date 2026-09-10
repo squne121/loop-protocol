@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loop-protocol.local/schemas/repo_temp_folder_advice_v2.schema.json",
+  "title": "Repo Temp Folder Advice V2",
+  "description": "Schema for REPO_TEMP_FOLDER_ADVICE_V2 inner payload emitted via hookSpecificOutput.additionalContext when a root temporary alias (.tmp/, .temp/, .tmp-*/) or a deprecated legacy write root (.claude/tmp/) is detected. V2 separates the single canonical write root (approved_write_roots) from the deprecated legacy root that is still recognized for read/scan/report/delete (deprecated_legacy_roots).",
+  "type": "object",
+  "required": [
+    "schema",
+    "block",
+    "reason_code",
+    "observed_path",
+    "approved_replacement",
+    "approved_write_roots",
+    "deprecated_legacy_roots",
+    "cleanup_required",
+    "policy_doc",
+    "message_ja"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "REPO_TEMP_FOLDER_ADVICE_V2"
+    },
+    "block": {
+      "type": "boolean",
+      "const": false
+    },
+    "reason_code": {
+      "type": "string",
+      "enum": ["root_temporary_alias", "deprecated_legacy_root_write"]
+    },
+    "observed_path": {
+      "type": "string",
+      "pattern": "^\\.(tmp|tmp-\\*|temp|claude/tmp)/$"
+    },
+    "approved_replacement": {
+      "type": "string",
+      "const": "tmp/"
+    },
+    "approved_write_roots": {
+      "type": "array",
+      "const": ["tmp/"]
+    },
+    "deprecated_legacy_roots": {
+      "type": "array",
+      "const": [".claude/tmp/"]
+    },
+    "cleanup_required": {
+      "type": "boolean",
+      "const": true
+    },
+    "policy_doc": {
+      "type": "string",
+      "const": "docs/dev/repository-folder-policy.md"
+    },
+    "message_ja": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}
