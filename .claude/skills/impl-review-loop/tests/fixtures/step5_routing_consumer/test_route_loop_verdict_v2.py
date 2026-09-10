@@ -38,7 +38,7 @@ SCRIPTS_DIR = IMPL_REVIEW_LOOP_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from route_loop_verdict_v2 import RouteDecision, route_loop_verdict_v2  # noqa: E402
+from route_loop_verdict_v2 import ROUTE_ALREADY_SATISFIED, RouteDecision, route_loop_verdict_v2  # noqa: E402
 
 FIXTURE_DIR = Path(__file__).parent
 
@@ -395,3 +395,64 @@ def test_route_decision_fields():
     assert hasattr(rd, "rerun_required")
     assert hasattr(rd, "selected_action")
     assert hasattr(rd, "errors")
+
+
+# ---------------------------------------------------------------------------
+# Issue #2607: already_satisfied terminal route -- regression coverage for
+# this fixture-driven consumer file (AC11 second VC references this exact
+# file). No new .yml fixtures are added (not in this Issue's Allowed Paths);
+# cases are constructed inline, matching the style already used above by
+# test_conflict_precedes_request_changes() et al.
+# ---------------------------------------------------------------------------
+
+_SHA_A = "1" * 40
+_SHA_B = "2" * 40
+
+
+def _already_satisfied_main_drift(current_base_sha: str = _SHA_B) -> dict:
+    return {
+        "current_base_sha": current_base_sha,
+        "evidence_base_sha": current_base_sha,
+        "allowed_paths_snapshot_base_sha": current_base_sha,
+        "allowed_paths": ["some/path.py"],
+        "latest_main_net_diff": [],
+        "expected_old_sha": _SHA_A,
+        "observed_old_sha": _SHA_A,
+    }
+
+
+def test_already_satisfied_route_constant_exported():
+    assert ROUTE_ALREADY_SATISFIED == "already_satisfied"
+
+
+def test_already_satisfied_reachable_from_request_changes_with_evidence():
+    reviewer_verdict = {
+        "verdict": "REQUEST_CHANGES",
+        "reviewed_head_sha": _SHA_A,
+        "blockers": ["addressed by current main already"],
+    }
+    live_mergeability = {
+        "head_sha": _SHA_A,
+        "mergeable": "MERGEABLE",
+        "merge_state_status": "CLEAN",
+        "already_satisfied_evidence": {
+            "base_ac_satisfied": True,
+            "meaningful_pr_delta": False,
+            "evidence_base_sha": _SHA_B,
+        },
+        "main_drift": _already_satisfied_main_drift(),
+    }
+    result = route_loop_verdict_v2(reviewer_verdict, live_mergeability)
+    assert result.route == ROUTE_ALREADY_SATISFIED
+    assert result.fail_closed is False
+    assert result.selected_action["recommendation"]["pr"]["action"] == "close"
+
+
+def test_pre_2607_request_changes_fixtures_unaffected_by_already_satisfied():
+    """Regression: existing REQUEST_CHANGES fixtures (no
+    already_satisfied_evidence key at all) must still route continue_loop,
+    byte-identical to pre-#2607 behavior."""
+    fx = _load_fixture_by_name("positive_continue_loop.yml")
+    result = route_loop_verdict_v2(fx["reviewer_verdict"], fx["live_mergeability"])
+    assert result.route == "continue_loop"
+    assert result.route != ROUTE_ALREADY_SATISFIED
