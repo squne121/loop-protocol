@@ -155,11 +155,16 @@ _GH_SANITIZED_DROP_KEYS = (
     "GH_FORCE_TTY",
     "GH_PAGER",
     "PAGER",
-    "GH_CONFIG_DIR",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
     "GH_DEBUG",
     "GH_PATH",
     "GH_PROMPT_DISABLED",
 )
+# Issue #2611: GH_CONFIG_DIR is the sole caller-selected authentication
+# carrier permitted through this exact child-gh boundary.  Its value is copied
+# only when already present; this module never derives it from HOME/XDG or
+# examines config/credential contents.
 _GH_SANITIZED_ALLOWED_KEYS = frozenset(
     {
         "HOME",
@@ -169,8 +174,7 @@ _GH_SANITIZED_ALLOWED_KEYS = frozenset(
         "PATH",
         "SSL_CERT_DIR",
         "SSL_CERT_FILE",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
+        "GH_CONFIG_DIR",
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",

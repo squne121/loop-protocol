@@ -2480,6 +2480,29 @@ def _is_uv_runtime_smoke_command(argv: List[str]) -> bool:
     return list(argv) in list(_CANONICAL_RUNTIME_SMOKE_ARGVS)
 
 
+# Issue #2611: this is a separate exact-argv exception, not a generic uv or
+# Python permission.  Its fixed target means VC preflight can recognize the
+# diagnostic without admitting altered issue numbers, options, or scripts.
+_CANONICAL_SCOPE_ROLLUP_AUTH_CANARY_ARGV = [
+    "uv",
+    "run",
+    "--isolated",
+    "--locked",
+    "--no-default-groups",
+    "python3",
+    "scripts/agent-guards/verify_scope_rollup_auth_capability_runtime.py",
+    "--repo",
+    "squne121/loop-protocol",
+    "--issue-number",
+    "2611",
+]
+
+
+def _is_uv_scope_rollup_auth_canary_command(argv: List[str]) -> bool:
+    """Return True only for Issue #2611's finite live-diagnostic argv."""
+    return list(argv) == _CANONICAL_SCOPE_ROLLUP_AUTH_CANARY_ARGV
+
+
 def _is_pytest_invocation(command: str) -> bool:
     """
     コマンドが pytest invocation かどうかを argv/token ベースで検出。
@@ -4043,8 +4066,8 @@ def classify_static_command(
             )
 
         if len(argv) >= 2 and argv[1] == "run":
-            # Runtime smoke canonical allowlist (raw argv exact shape)
-            if _is_uv_runtime_smoke_command(argv):
+            # Runtime diagnostics are admitted only by their own exact raw argv.
+            if _is_uv_runtime_smoke_command(argv) or _is_uv_scope_rollup_auth_canary_command(argv):
                 return None
 
             unwrapped = _strip_uv_run_options(argv)
