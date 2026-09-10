@@ -62,6 +62,12 @@ def test_marker_ownership_uniqueness_create_noop_patch_and_readback_reconciliati
 
     # The full handler routes same identity/digest to noop and changed visible
     # content to PATCH. A foreign valid marker is never a mutation target.
+    # Issue #1908 fix_delta HIGH-1: the handler now requires a rendered
+    # `- phase:` line before any create/PATCH/noop decision, so this body
+    # (unlike `canonical` above, which only exercises marker/digest
+    # mechanics) carries a known non-post-PR phase -- no PR-head recheck is
+    # required for it, and it stays a pure marker-ownership/noop exercise.
+    handler_body = _body("日本語の公開可能な履歴\n- phase: review-complete", marker=marker)
     args = SimpleNamespace(
         issue_number=1908,
         repo="squne121/loop-protocol",
@@ -70,12 +76,12 @@ def test_marker_ownership_uniqueness_create_noop_patch_and_readback_reconciliati
     )
     calls: list[str] = []
     remote = {
-        "body": canonical,
+        "body": handler_body,
         "url": "https://github.com/x/y/issues/1#issuecomment-42",
         "id": "x",
         "author": {"login": "writer"},
     }
-    data = {"comment_body": canonical, "marker": marker}
+    data = {"comment_body": handler_body, "marker": marker}
     readback = {
         "comment_id": "x",
         "comment_url": "url",

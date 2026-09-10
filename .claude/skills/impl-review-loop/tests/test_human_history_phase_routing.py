@@ -504,3 +504,127 @@ def test_conflict_origin_mappings_bind_real_publisher_targets_and_reviewed_refs(
         _phase, _target_kind, _target_number, reviewed_ref, _reason, stale_evidence = case
         assert f"- reviewed_ref: {reviewed_ref}" in call["body"]
         assert ("- stale evidence:" in call["body"]) is (stale_evidence is not None)
+
+
+def test_corrupted_post_pr_template_fails_closed_before_any_mutation():
+    """Issue #1908 fix_delta HIGH-1: a namespace-detected human-history body
+    whose phase/reviewed_ref lines are missing or don't parse in the
+    canonical form must fail-closed before create/PATCH/noop -- never
+    silently skip the decision-time PR-head recheck as "no binding
+    required".
+    """
+    primary = _identity("impl-review-loop", "post-PR-binding", "pull_request", "completed")
+    data, _parsed = _post_pr_publish_input(primary)
+    args = SimpleNamespace(
+        issue_number=47, repo="squne121/loop-protocol", command_id="issue_comment.publish", dry_run=False
+    )
+
+    # Case 1: reviewed_ref is present but no longer in the canonical
+    # `refs/pull/<pr>/head@<40-lowercase-sha>` form (uppercase sha).
+    malformed_ref_body = data["comment_body"].replace(
+        f"- reviewed_ref: {primary['reviewed_ref']}",
+        "- reviewed_ref: refs/pull/47/head@" + "B" * 40,
+    )
+    assert malformed_ref_body != data["comment_body"]
+
+    # Case 2: the phase line itself is dropped entirely (template reordering
+    # / field loss), leaving only the reviewed_ref line.
+    phase_dropped_body = data["comment_body"].replace("- phase: post-PR-binding\n", "")
+    assert "- phase:" not in phase_dropped_body
+
+    for corrupted_body, expected_reason in (
+        (malformed_ref_body, "human_history_post_pr_reviewed_ref_binding_invalid"),
+        (phase_dropped_body, "human_history_phase_field_missing_or_ambiguous"),
+    ):
+        corrupted_data = {"comment_body": corrupted_body, "marker": data["marker"]}
+        failures: list[tuple[tuple, dict]] = []
+        with (
+            patch.object(executor, "_capture_pre_mutation_snapshot", return_value=(object(), None)),
+            patch.object(executor, "_fetch_authenticated_login", return_value=("writer", "")),
+            patch.object(executor, "_list_issue_comments", return_value=([], "")),
+            patch.object(executor, "_post_gh_comment") as post,
+            patch.object(executor, "_patch_gh_comment") as patch_comment,
+            patch.object(executor, "_fetch_pr_head_sha") as head_read,
+        ):
+            assert executor._run_human_history_comment_publish(
+                args, corrupted_data, "/bin/gh", lambda reason, **k: failures.append((reason, k)) or 1, lambda _: 0
+            ) == 1
+        post.assert_not_called()
+        patch_comment.assert_not_called()
+        # The decision-time PR-head read is never even attempted for a body
+        # whose binding cannot be trusted; failing closed here must not
+        # depend on the parser inventing a head to check.
+        head_read.assert_not_called()
+        assert failures[-1][0] == expected_reason, expected_reason
+        assert failures[-1][1]["status"] == "failed", expected_reason
+
+
+def test_publish_human_history_exposes_raw_status_detail_via_receipt():
+    """Issue #1908 fix_delta HIGH-2: publish_human_history()'s optional
+    `receipt` out-param must carry the controlled executor's raw
+    status_detail, not just the transport exit code, so a caller (including
+    the AC2 live canary) can assert real create/update/noop operation
+    semantics instead of an exit-code-only false-green claim.
+    """
+    identity = _identity("impl-review-loop", "post-PR-binding", "pull_request", "completed")
+    common_kwargs = dict(
+        target_number=47,
+        repo="squne121/loop-protocol",
+        identity=identity,
+        result="判定を記録しました",
+        evidence_refs=["https://github.com/squne121/loop-protocol/pull/47"],
+        recommended_action="次の判断を実施してください",
+        recommended_reason="現在の証跡に基づくためです",
+        impact_if_unaddressed="判断根拠が不足します",
+    )
+
+    def _fake_proc(status_detail: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "schema": "CONTROLLED_SKILL_MUTATION_RESULT_V1",
+                "status": "ok",
+                "command_id": "issue_comment.publish",
+                "issue_number": 47,
+                "repo": "squne121/loop-protocol",
+                "status_detail": status_detail,
+                "comment_id": "x",
+                "comment_url": "https://github.com/squne121/loop-protocol/issues/47#issuecomment-1",
+            }),
+            stderr="",
+        )
+
+    for status_detail in ("created", "updated", "already_published"):
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return _fake_proc(status_detail)
+
+        with (
+            patch.object(publisher.subprocess, "run", side_effect=fake_run),
+            patch.object(
+                publisher, "materialize_isolation_issue_comment_request",
+                return_value=("artifacts/47/issue-metadata/issue_comment.publish/x.json", ""),
+            ),
+        ):
+            receipt: dict = {}
+            exit_code = publisher.publish_human_history(receipt=receipt, **common_kwargs)
+        assert exit_code == 0
+        # Same HEAD replayed with an unchanged marker must never be labeled
+        # "created" by the receipt: the raw status_detail from the
+        # controlled executor is the ground truth, not the publisher's
+        # transport-only exit code.
+        assert receipt["status_detail"] == status_detail
+        assert calls and "--json" in calls[0]
+
+    # A caller that doesn't request a receipt keeps the unchanged int-only
+    # contract (backward compatible).
+    with (
+        patch.object(publisher.subprocess, "run", side_effect=lambda cmd, **k: _fake_proc("created")),
+        patch.object(
+            publisher, "materialize_isolation_issue_comment_request",
+            return_value=("artifacts/47/issue-metadata/issue_comment.publish/x.json", ""),
+        ),
+    ):
+        assert publisher.publish_human_history(**common_kwargs) == 0

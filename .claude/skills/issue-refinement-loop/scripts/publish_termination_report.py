@@ -102,7 +102,18 @@ _HUMAN_HISTORY_ISSUE_REF_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
 _HUMAN_HISTORY_PR_REF_RE = __import__("re").compile(r"^refs/pull/([1-9][0-9]*)/head@([0-9a-f]{40})$")
 _HUMAN_HISTORY_HEAD_SHA_RE = __import__("re").compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
 _SECRET_OR_UNSAFE_RE = __import__("re").compile(
-    r"(?:gh[porsu]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|authorization:\s*bearer|(?:^|\s)/[^\s]+)",
+    r"(?:"
+    r"gh[porsu]_[A-Za-z0-9]{16,}"
+    r"|github_pat_[A-Za-z0-9_]{16,}"
+    r"|authorization:\s*bearer"
+    r"|(?:^|\s)/[^\s]+"
+    # Windows drive-absolute path (e.g. C:\Users\...).
+    r"|[A-Za-z]:\\\S+"
+    # UNC path (e.g. \\server\share\...).
+    r"|\\\\\S+\\\S+"
+    # Explicit credential assignment (password=, api_key:, token=, ...).
+    r"|(?:password|passwd|pwd|api[_-]?key|secret|access[_-]?key|token)\s*[:=]\s*\S+"
+    r")",
     __import__("re").I,
 )
 
@@ -227,9 +238,19 @@ def render_human_history_comment(
 def publish_human_history(
     *, target_number: int, repo: str, identity: object, result: object, evidence_refs: object,
     recommended_action: object, recommended_reason: object, impact_if_unaddressed: object,
-    stale_evidence: object = None,
+    stale_evidence: object = None, dry_run: bool = False, receipt: dict | None = None,
 ) -> int:
-    """Publish one human-history event through existing issue_comment.publish."""
+    """Publish one human-history event through existing issue_comment.publish.
+
+    `receipt`, when passed a mutable dict, is populated with the controlled
+    executor's structured CONTROLLED_SKILL_MUTATION_RESULT_V1 fields
+    (including the raw `status_detail`, e.g. `created` / `updated` /
+    `already_published` / `dry_run_ok`) so a caller can assert on the actual
+    remote operation semantics rather than only the int exit code (Issue
+    #1908 fix_delta HIGH-2). The exit code remains the success/failure
+    transport contract; it is unchanged for callers that don't pass
+    `receipt`.
+    """
     rendered, error = render_human_history_comment(
         identity=identity, result=result, evidence_refs=evidence_refs,
         recommended_action=recommended_action, recommended_reason=recommended_reason,
@@ -243,6 +264,7 @@ def publish_human_history(
         return 1
     return _post_github_comment(
         issue_number=target_number, body=rendered["body"], repo=repo, marker=rendered["marker"],
+        dry_run=dry_run, receipt=receipt,
     )
 
 
@@ -293,7 +315,15 @@ def _record_artifact(
 # GitHub comment posting (fail-closed)
 # ---------------------------------------------------------------------------
 
-def _post_github_comment(*, issue_number: int, body: str, repo: str, marker: str | None = None) -> int:
+def _post_github_comment(
+    *,
+    issue_number: int,
+    body: str,
+    repo: str,
+    marker: str | None = None,
+    dry_run: bool = False,
+    receipt: dict | None = None,
+) -> int:
     """
     Post body as a GitHub issue comment via the issue_comment.publish
     controlled mutation lane (Issue #1633).
@@ -309,6 +339,12 @@ def _post_github_comment(*, issue_number: int, body: str, repo: str, marker: str
     AC4/AC17 shared authority -- raw `gh issue comment` is never called
     directly from this module).
     Enforces a 30-second timeout; on timeout fails closed.
+
+    `dry_run` forwards --dry-run to the controlled executor (validate/render
+    only, no remote mutation). `receipt`, when a mutable dict is passed, is
+    populated with the executor's parsed CONTROLLED_SKILL_MUTATION_RESULT_V1
+    JSON (requested via --json) so a caller can read the raw `status_detail`
+    (Issue #1908 fix_delta HIGH-2) instead of only the exit code.
 
     Returns the executor's exit code (0 on success, -1 on timeout, or the
     executor's nonzero exit on failure).
@@ -352,7 +388,10 @@ def _post_github_comment(*, issue_number: int, body: str, repo: str, marker: str
         "--issue-number", str(issue_number),
         "--input-file", materialized_rel_path,
         "--repo", repo,
+        "--json",
     ]
+    if dry_run:
+        cmd.append("--dry-run")
     env = os.environ.copy()
     # The controlled lane binds its CLI number to the *comment target*.  A PR
     # history event legitimately carries a distinct source Issue identity, so
@@ -378,6 +417,14 @@ def _post_github_comment(*, issue_number: int, body: str, repo: str, marker: str
             file=sys.stderr,
         )
         return -1
+
+    if receipt is not None:
+        try:
+            parsed_receipt = json.loads(proc.stdout)
+        except (json.JSONDecodeError, TypeError):
+            parsed_receipt = None
+        if isinstance(parsed_receipt, dict):
+            receipt.update(parsed_receipt)
 
     if proc.returncode != 0:
         print(
@@ -425,6 +472,98 @@ def publish(
 
 
 # ---------------------------------------------------------------------------
+# Human-history production entrypoint (Issue #1908 fix_delta BLOCKER)
+#
+# This is the exact, single production call site that turns a structured
+# HUMAN_HISTORY_PUBLISH_REQUEST_V1 request into publish_human_history() ->
+# render_human_history_comment() -> the existing issue_comment.publish
+# controlled lane. It is not a second publisher, event_ledger, run_id_store,
+# or hook -- it dispatches to the same publish_human_history() any other
+# caller uses. It never replaces or bypasses the legacy plain
+# --issue-number/--repo/--body-file mode below.
+# ---------------------------------------------------------------------------
+
+_HUMAN_HISTORY_REQUEST_SCHEMA = "HUMAN_HISTORY_PUBLISH_REQUEST_V1"
+_HUMAN_HISTORY_REQUEST_REQUIRED_KEYS = frozenset({
+    "identity", "result", "evidence_refs", "recommended_action", "recommended_reason",
+    "impact_if_unaddressed",
+})
+_HUMAN_HISTORY_REQUEST_OPTIONAL_KEYS = frozenset({"stale_evidence"})
+
+
+def _run_human_history_request_cli(*, request_path: str, repo: str, dry_run: bool) -> int:
+    """CLI-facing production entrypoint for a HUMAN_HISTORY_PUBLISH_REQUEST_V1
+    JSON file. Reads/validates the structured request, then calls
+    publish_human_history() exactly as any other production caller would.
+
+    Prints a single-line JSON receipt (status_detail / exit_code only --
+    never the rendered body) to stdout so a subprocess caller (including a
+    test harness) can assert on the actual controlled-lane outcome.
+
+    Exit codes:
+        0 - publish_human_history() succeeded (including dry-run validation)
+        1 - publish_human_history() failed (fail-closed)
+        2 - usage error: request file missing/unreadable/malformed
+    """
+    try:
+        raw = Path(request_path).read_text(encoding="utf-8")
+    except Exception as exc:
+        print(f"[publish_termination_report] failed to read human-history request file: {exc}", file=sys.stderr)
+        return 2
+    try:
+        request = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"[publish_termination_report] human-history request file is not valid JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(request, dict):
+        print("[publish_termination_report] human-history request must be a JSON object", file=sys.stderr)
+        return 2
+
+    keys = set(request)
+    missing = _HUMAN_HISTORY_REQUEST_REQUIRED_KEYS - keys
+    unknown = keys - _HUMAN_HISTORY_REQUEST_REQUIRED_KEYS - _HUMAN_HISTORY_REQUEST_OPTIONAL_KEYS
+    if missing or unknown:
+        print(
+            f"[publish_termination_report] human-history request key set invalid "
+            f"(missing={sorted(missing)}, unknown={sorted(unknown)})",
+            file=sys.stderr,
+        )
+        return 2
+
+    identity = request["identity"]
+    if not isinstance(identity, dict):
+        print("[publish_termination_report] human-history request identity must be an object", file=sys.stderr)
+        return 2
+    target_number = identity.get("target_number")
+    if type(target_number) is not int or target_number <= 0:
+        print("[publish_termination_report] human-history request identity.target_number is invalid", file=sys.stderr)
+        return 2
+
+    receipt: dict = {}
+    exit_code = publish_human_history(
+        target_number=target_number,
+        repo=repo,
+        identity=identity,
+        result=request["result"],
+        evidence_refs=request["evidence_refs"],
+        recommended_action=request["recommended_action"],
+        recommended_reason=request["recommended_reason"],
+        impact_if_unaddressed=request["impact_if_unaddressed"],
+        stale_evidence=request.get("stale_evidence"),
+        dry_run=dry_run,
+        receipt=receipt,
+    )
+    status_detail = receipt.get("status_detail")
+    print(
+        f"[publish_termination_report] human-history publish exit={exit_code} status_detail={status_detail!r}",
+        file=sys.stderr,
+    )
+    # routing-relevant fields only -- never the rendered comment body.
+    print(json.dumps({"status_detail": status_detail, "exit_code": exit_code}, ensure_ascii=False))
+    return 0 if exit_code == 0 else 1
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -436,8 +575,8 @@ def main() -> int:
     parser.add_argument(
         "--issue-number",
         type=int,
-        required=True,
-        help="GitHub issue number to comment on",
+        default=None,
+        help="GitHub issue number to comment on (legacy plain-body mode)",
     )
     parser.add_argument(
         "--repo",
@@ -449,9 +588,38 @@ def main() -> int:
         "--body-file",
         type=str,
         default=None,
-        help="Path to a plain markdown body file (default: stdin)",
+        help="Path to a plain markdown body file (default: stdin; legacy plain-body mode)",
+    )
+    parser.add_argument(
+        "--human-history-request-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a HUMAN_HISTORY_PUBLISH_REQUEST_V1 JSON file (Issue #1908 "
+            "production entrypoint). Mutually exclusive with legacy plain-body mode."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate/render the human-history request without posting (forwarded to the controlled executor)",
     )
     args = parser.parse_args()
+
+    if args.human_history_request_file:
+        return _run_human_history_request_cli(
+            request_path=args.human_history_request_file,
+            repo=args.repo,
+            dry_run=args.dry_run,
+        )
+
+    if args.issue_number is None:
+        print(
+            "[publish_termination_report] --issue-number is required for legacy plain-body mode "
+            "(or pass --human-history-request-file)",
+            file=sys.stderr,
+        )
+        return 2
 
     # Read input
     if args.body_file:

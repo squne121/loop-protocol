@@ -89,6 +89,14 @@ def test_opt_in_confirmed_draft_pr_create_patch_noop_and_readback():
             }
         }
     ]
+    # Issue #1908 fix_delta HIGH-2: the exit code alone cannot prove which
+    # remote operation happened (a PATCH against an existing comment also
+    # returns 0). The raw controlled-executor `status_detail` is the ground
+    # truth for the create/PATCH/noop claim; a same-digest replay on an
+    # unchanged HEAD must never be recorded as "created".
+    create_receipt: dict = {}
+    patch_receipt: dict = {}
+    noop_receipt: dict = {}
     outcome = "FAIL"
     try:
         create = publisher.publish_human_history(
@@ -100,9 +108,11 @@ def test_opt_in_confirmed_draft_pr_create_patch_noop_and_readback():
             recommended_action="canary を確認してください",
             recommended_reason="controlled lane の作成を検証するためです",
             impact_if_unaddressed="更新経路を確認できません",
+            receipt=create_receipt,
         )
-        events.append({"create": create})
+        events.append({"create": create, "status_detail": create_receipt.get("status_detail")})
         assert create == 0
+        assert create_receipt.get("status_detail") in {"created", "created_reconciled"}
         patch = publisher.publish_human_history(
             target_number=_IMPLEMENTATION_PR,
             repo=_REPO,
@@ -112,9 +122,11 @@ def test_opt_in_confirmed_draft_pr_create_patch_noop_and_readback():
             recommended_action="canary 結果を確認してください",
             recommended_reason="同一 identity の PATCH を検証するためです",
             impact_if_unaddressed="更新経路を確認できません",
+            receipt=patch_receipt,
         )
-        events.append({"patch": patch})
+        events.append({"patch": patch, "status_detail": patch_receipt.get("status_detail")})
         assert patch == 0
+        assert patch_receipt.get("status_detail") == "updated"
         noop = publisher.publish_human_history(
             target_number=_IMPLEMENTATION_PR,
             repo=_REPO,
@@ -124,9 +136,13 @@ def test_opt_in_confirmed_draft_pr_create_patch_noop_and_readback():
             recommended_action="canary 結果を確認してください",
             recommended_reason="同一 identity の PATCH を検証するためです",
             impact_if_unaddressed="更新経路を確認できません",
+            receipt=noop_receipt,
         )
-        events.append({"noop": noop})
+        events.append({"noop": noop, "status_detail": noop_receipt.get("status_detail")})
         assert noop == 0
+        # A same-identity/same-digest replay must be the executor's own
+        # `already_published` noop outcome, never re-reported as "created".
+        assert noop_receipt.get("status_detail") == "already_published"
         rendered, error = publisher.render_human_history_comment(
             identity=identity,
             result="live canary の更新を確認しました",

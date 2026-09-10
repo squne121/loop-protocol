@@ -2321,6 +2321,21 @@ _HUMAN_HISTORY_STALE_EVIDENCE_HEAD_RE = _re.compile(
     r"(?mi)^- stale evidence: .*?(?P<head>[0-9a-f]{40})(?:\r?$|[^0-9a-f])"
 )
 
+# Issue #1908 fix_delta HIGH-1: every valid human-history identity has a
+# rendered `- phase: <literal>` line drawn from this fixed six-value set
+# (mirrors the publisher's _validate_human_history_identity() matrix
+# literals). Enforcing this here -- on the controlled-lane side, from the
+# rendered body itself -- closes the gap where a template that lost,
+# reordered, or corrupted its phase/reviewed_ref lines would otherwise
+# silently look like "no post-PR binding required" and skip the decision-time
+# PR-head recheck entirely.
+_HUMAN_HISTORY_KNOWN_PHASES = frozenset({
+    "review-complete", "pre-PR-binding", "binding-validation",
+    "post-PR-binding", "post-PR-head-drift", "conflict-resolution",
+})
+_HUMAN_HISTORY_POST_PR_PHASES = frozenset({"post-PR-binding", "post-PR-head-drift"})
+_HUMAN_HISTORY_PHASE_LINE_RE = _re.compile(r"(?m)^- phase: (?P<phase>[^\r\n]*)\r?$")
+
 
 def _human_history_post_pr_decision_binding(body: str) -> tuple[dict | None, str]:
     """Extract the rendered post-PR state that the controlled lane must bind.
@@ -2330,11 +2345,26 @@ def _human_history_post_pr_decision_binding(body: str) -> tuple[dict | None, str
     decision cannot use a caller's cached PR head.  A diagnostic additionally
     carries the latest observed head in its existing ``stale evidence`` text;
     its marker identity deliberately remains bound to the original snapshot.
+
+    A missing/ambiguous/unknown `phase` line, or a post-PR phase whose
+    `reviewed_ref` cannot be extracted uniquely in the canonical
+    `refs/pull/<pr>/head@<40-lowercase-sha>` form, is a template-corruption
+    diagnostic -- not "no binding required". The caller must treat a
+    non-empty error here as fail-closed before any create/PATCH/noop
+    decision (Issue #1908 fix_delta HIGH-1).
     """
-    match = _HUMAN_HISTORY_POST_PR_DECISION_RE.search(body)
-    if match is None:
+    phase_matches = _HUMAN_HISTORY_PHASE_LINE_RE.findall(body)
+    if len(phase_matches) != 1:
+        return None, "human_history_phase_field_missing_or_ambiguous"
+    phase = phase_matches[0]
+    if phase not in _HUMAN_HISTORY_KNOWN_PHASES:
+        return None, "human_history_phase_field_unknown"
+    if phase not in _HUMAN_HISTORY_POST_PR_PHASES:
         return None, ""
-    phase = match.group("phase")
+
+    match = _HUMAN_HISTORY_POST_PR_DECISION_RE.search(body)
+    if match is None or match.group("phase") != phase:
+        return None, "human_history_post_pr_reviewed_ref_binding_invalid"
     expected_head = match.group("reviewed_head")
     if phase == "post-PR-head-drift":
         stale = _HUMAN_HISTORY_STALE_EVIDENCE_HEAD_RE.search(body)
