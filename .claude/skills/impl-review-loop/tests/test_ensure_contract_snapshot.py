@@ -3472,9 +3472,7 @@ class TestPostCommentTransportAndReconciliation:
         )
         assert (bound_ok, binding_err) == (True, None)
 
-    def test_given_staging_digest_coincidentally_matches_unrelated_value_when_get_diverges_from_expected_final_then_binding_fails(
-        self, monkeypatch
-    ):
+    def test_staging_digest_coincidental_match_get_diverges_binding_fails(self, monkeypatch):
         coincidental_body = "same text used for both staging and one expected value"
         persisted_body_diverges = "different text actually persisted"
         remote = {
