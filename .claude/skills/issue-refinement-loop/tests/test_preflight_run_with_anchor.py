@@ -1082,6 +1082,8 @@ def _hrd_run_preflight(
     human_context_comment_urls=(_HRD_URL,),
     comment_id: int = _HRD_COMMENT_ID,
     url: str = _HRD_URL,
+    known_context_extra: "dict | None" = None,
+    fresh_anchor_body: "str | None" = None,
 ):
     issue_body = _hrd_issue_body()
     anchor_comment = _hrd_anchor_comment(
@@ -1100,13 +1102,21 @@ def _hrd_run_preflight(
     fixture_path = tmp_path / f"preflight_hrd_{run_id}.json"
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 
-    calls = {"apply_transaction": 0, "fresh_checks": 0}
+    calls = {"apply_transaction": 0, "fresh_checks": 0, "fetch_current": 0}
     state = {"body": issue_body}
+    # PR #2623 review fix (P1 finding 2): `fresh_anchor_body` lets a caller
+    # simulate a concurrent anchor edit between evidence capture and the
+    # TOCTOU-safe fresh readback `_decide_human_review_directive_editor_
+    # route()` now performs -- defaults to the SAME `anchor_body` (no
+    # drift), matching every pre-existing caller of this helper byte-for-
+    # byte.
+    fresh_body = fresh_anchor_body if fresh_anchor_body is not None else anchor_body
 
     def fetch_current():
+        calls["fetch_current"] += 1
         return (
             {"body": state["body"], "updatedAt": "2026-09-10T00:00:00Z"},
-            dict(anchor_comment, html_url=url),
+            dict(anchor_comment, html_url=url, body=fresh_body),
         )
 
     def candidate_readiness(_body):
@@ -1140,6 +1150,9 @@ def _hrd_run_preflight(
         "apply_transaction": apply_transaction,
         "fresh_checks": fresh_checks,
     }
+    known_context = {"human_context_comment_urls": list(human_context_comment_urls)}
+    if known_context_extra:
+        known_context.update(known_context_extra)
     artifact_dir = _E2E_SKILL_ROOT.parent.parent / "artifacts" / "issue-refinement-loop" / str(_HRD_ISSUE)
     try:
         result, exit_code = _e2e_preflight.run_preflight(
@@ -1147,7 +1160,7 @@ def _hrd_run_preflight(
             repo=_E2E_REPO,
             anchor_comment_urls=[url],
             fixture_path=fixture_path,
-            known_context={"human_context_comment_urls": list(human_context_comment_urls)},
+            known_context=known_context,
             consume_contract_patch_plan=True,
             contract_update_callbacks=callbacks,
         )
@@ -1173,6 +1186,10 @@ def test_ac1_ac6_explicit_human_review_directive_reaches_next_action_production_
     assert result["next_action"] == "issue_editor_required"
     assert result["contract_update"]["writes"] == 0
     assert calls["apply_transaction"] == 0
+    # PR #2623 review fix (P1 finding 2): the fresh, TOCTOU-safe readback
+    # genuinely ran -- this route is never authorized from a stale in-hand
+    # snapshot alone.
+    assert calls["fetch_current"] >= 1
 
 
 def test_ac3_untrusted_author_association_never_escalates_production_reachable(tmp_path):
@@ -1197,3 +1214,110 @@ def test_ac4_ambiguous_prose_only_directive_never_escalates_production_reachable
 
     assert result["next_action"] != "issue_editor_required"
     assert calls["apply_transaction"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PR #2623 review fix (P1 finding 1): `investigation_derived_path_literals`
+# forwarding from `known_context` into the fresh
+# `classify_scope_delta_authority()` re-classification inside
+# `_decide_human_review_directive_editor_route()`. Prior to this fix, a
+# trusted operator-selected human-context directive that named an
+# architecture/workflow-level Allowed Paths expansion in prose (no exact
+# backtick literal in the comment itself) stayed fail-closed at
+# `human_escalation` (`expands_allowed_paths` boundary) EVEN WHEN the caller
+# had already supplied agent-investigation-derived exact path literals on
+# `known_context` -- because this specific call site silently dropped that
+# key. Both tests below exercise the REAL run_preflight() -> consume_
+# trusted_anchor_contract_patch_plan() -> _decide_human_review_directive_
+# editor_route() call chain (production-reachable, not a unit-level
+# shortcut).
+# ---------------------------------------------------------------------------
+
+_HRD_VAGUE_ALLOWED_PATHS_BODY = "\n".join(
+    [
+        "この issue-refinement-loop の欠陥は他の workflow skill にも共通するため、",
+        "allowed paths を必要に応じて拡張してください。",
+        "- impl-review-loop も合わせて直してください。",
+        "- build_intake_capsule と implement-issue の関連処理も修正してください。",
+    ]
+)
+_HRD_INVESTIGATION_DERIVED_LITERALS = [
+    "docs/dev/workflow.md",
+    ".claude/skills/impl-review-loop/SKILL.md",
+    ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+    ".claude/skills/implement-issue/SKILL.md",
+]
+
+
+def test_finding1_investigation_derived_path_literals_forwarded_reaches_issue_editor_required(tmp_path):
+    """A trusted, explicit, with_human_context directive that only names an
+    Allowed Paths expansion in semantic prose (no exact backtick literal)
+    would normally fail closed at `expands_allowed_paths` boundary
+    (`human_escalation`, #1952). When the caller has already derived exact
+    repository-relative path literals via read-only investigation
+    (`known_context["investigation_derived_path_literals"]`, #2086 AC3/AC4)
+    and `contract_patch_plan.operations` still resolves empty (no known
+    section marker heading in the comment, so no section-bound patch can be
+    built either), this must reach `NEXT_ACTION: issue_editor_required`
+    with `writes == 0` -- the exact #2620 handoff, now reachable for this
+    lane."""
+    result, _exit_code, calls = _hrd_run_preflight(
+        tmp_path,
+        anchor_body=_HRD_VAGUE_ALLOWED_PATHS_BODY,
+        run_id="investigation_literals_forwarded",
+        known_context_extra={"investigation_derived_path_literals": _HRD_INVESTIGATION_DERIVED_LITERALS},
+    )
+
+    assert result["next_action"] == "issue_editor_required"
+    assert result["contract_update"]["writes"] == 0
+    assert calls["apply_transaction"] == 0
+    assert calls["fetch_current"] >= 1
+
+
+def test_finding1_regression_without_investigation_derived_path_literals_stays_fail_closed(tmp_path):
+    """The SAME vague Allowed-Paths-expansion directive, but WITHOUT
+    `investigation_derived_path_literals` on `known_context` -- the
+    pre-existing #1952 fail-closed lock is unaffected by this fix, it is
+    only ever cleared when the caller explicitly supplies validated
+    investigation-derived literals."""
+    result, _exit_code, calls = _hrd_run_preflight(
+        tmp_path,
+        anchor_body=_HRD_VAGUE_ALLOWED_PATHS_BODY,
+        run_id="investigation_literals_absent",
+    )
+
+    assert result["next_action"] != "issue_editor_required"
+    assert calls["apply_transaction"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PR #2623 review fix (P1 finding 2): TOCTOU-safe fresh readback inside
+# `_decide_human_review_directive_editor_route()`. A concurrent anchor edit
+# between evidence capture and this routing decision must never authorize a
+# handoff on stale evidence -- production-reachable via the REAL
+# run_preflight() call chain (see `test_ac1_ac6_explicit_human_review_
+# directive_reaches_next_action_production_reachable` above for the
+# unchanged-anchor positive case, which already asserts
+# `calls["fetch_current"] >= 1`).
+# ---------------------------------------------------------------------------
+
+
+def test_finding2_anchor_drift_at_fresh_readback_fails_closed_production_reachable(tmp_path):
+    """The SAME explicit, eligible directive as the AC1/AC6 positive case,
+    but the anchor comment's body has changed by the time the fresh
+    `fetch_current()` readback runs (simulating a concurrent edit) -- this
+    must NOT reach `issue_editor_required`; it fails closed to the existing
+    fallback (`no_change`) instead, with writes == 0."""
+    result, _exit_code, calls = _hrd_run_preflight(
+        tmp_path,
+        anchor_body=_HRD_EXPLICIT_BODY,
+        run_id="anchor_drift",
+        fresh_anchor_body=_HRD_EXPLICIT_BODY + "\nEdited after evidence capture.\n",
+    )
+
+    assert result["next_action"] != "issue_editor_required"
+    assert result["contract_update"]["writes"] == 0
+    assert calls["apply_transaction"] == 0
+    # The fresh readback genuinely ran and detected the drift -- this is
+    # not merely "never checked", it is "checked and correctly rejected".
+    assert calls["fetch_current"] >= 1

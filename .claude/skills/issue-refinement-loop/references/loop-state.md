@@ -222,3 +222,36 @@ lane）、`anchor_binding_ok` / `same_target_ok`（fresh binding re-check）、`
 （section-bound patch representation が存在しない）、`is_structured_scope_reframe == False`
 （上記の構造化 scope-reframe route を上書きしない）。いずれか一つでも成立しなければ `route: None`
 のまま既存の fail-closed / `no_change` 挙動が維持される。
+
+**fresh readback による TOCTOU 防止（PR #2623 review fix、finding 2）**: 上記の適格性判定は
+呼び出し時点で既に手元にある `anchor_body` / evidence に基づく。`_decide_human_review_directive_
+editor_route()` は適格と判定した直後、`consume_trusted_anchor_contract_patch_plan()` が
+`run_trusted_anchor_iteration_zero()` に渡すのと同じ `fetch_current()` callback を使って
+anchor comment を fresh に再取得し、body / 識別子が変化していないことを確認してから
+`issue_editor_required` を返す。fresh readback で変化を検出した場合は `route: None` と同じ扱い
+（既存 fallback へフォールスルーし、そちらも独自の fresh readback を行う）とする。
+
+**integrity/environment failure の区別（PR #2623 review fix、finding 3）**: `known_context` に
+freeform evidence が存在しない、または SSOT が not eligible と判定した「通常の non-applicable」
+は `None` を返す（呼び出し元は既存 fallback へフォールスルーする）。一方、import failure・
+classifier 例外・fresh readback の transport failure のような integrity/environment failure は
+`None` を返さず、既存の `status: "invalid"` disposition 語彙（`_decision_kind == "invalid"` と
+同じ `{"status": "invalid", "disposition": {"schema_version": "scope_reframe_decision/v1",
+"disposition": "invalid", "reason_code": <specific reason>}}` 形状、
+`human_review_directive_route_import_failed` / `_classifier_error` /
+`_fresh_readback_failed`）を再利用して返す。`_bounded_contract_update_handoff()` はこれを
+`status: "failed"` / `disposition: "invalid"` / `writes: 0` へ projection し、この integrity
+failure が普通の `no_change` / `proven_no_change` に化けることを防ぐ。新しい schema/key-set は
+追加しない。
+
+**`reviewer_feedback_url` の伝搬範囲（PR #2623 review fix、finding 4）**: 上表の
+`reviewer_feedback_url` は `consume_trusted_anchor_contract_patch_plan()` の内部 consumer
+結果（`rewrite_route.reviewer_feedback_url`）にのみ存在する。`_bounded_contract_update_
+handoff()` の canonical `contract_update` projection（`status`/`disposition`/`writes`/
+`iterations`/`final_readback`/`fresh_preflight`/`fresh_review`/`fresh_readiness`/`reason_code`
+のみ）はこれを含まず、`preflight.run` / `contract_update.run.with_human_context` の
+stdout・ARTIFACT を通じて main/root thread へ新規伝搬されるフィールドではない。
+`NEXT_ACTION: issue_editor_required` を受信した main/root thread は、`contract_update.run.
+with_human_context` 呼び出し時に自身が渡した canonical anchor URL（`--anchor-comment-url` /
+`--human-context-comment-url`）を、そのまま Step 4 `issue-editor` の `reviewer_feedback_url`
+として再利用する（canonical result からの新規伝搬ではない）。
