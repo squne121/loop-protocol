@@ -871,28 +871,55 @@ def test_owner_algorithm_reverification_rejects_tampered_receipt_run_set_digest(
 # only reasons never block Reliability; unrecognized reasons stay
 # fail-closed.
 # --------------------------------------------------------------------------- #
-def test_performance_only_evidence_error_reason_does_not_block_reliability():
+EXPECTED_RECEIPT_PERFORMANCE_ONLY_EVIDENCE_ERROR_REASONS = frozenset(
+    {
+        "gate_ready_timestamp_missing_or_invalid",
+        "missing_pair_e2e-core",
+        "missing_pair_e2e-responsive-matrix",
+        "missing_monolith_performance_phase",
+    }
+)
+
+
+def test_performance_only_evidence_error_allowlist_is_exact_and_has_no_pattern_entries():
+    """The consumer owns a narrow literal allowlist, not a wildcard policy."""
+    assert builder.RECEIPT_PERFORMANCE_ONLY_EVIDENCE_ERROR_REASONS == (
+        EXPECTED_RECEIPT_PERFORMANCE_ONLY_EVIDENCE_ERROR_REASONS
+    )
+    assert all(
+        "*" not in reason and not reason.endswith("-")
+        for reason in builder.RECEIPT_PERFORMANCE_ONLY_EVIDENCE_ERROR_REASONS
+    )
+
+
+@pytest.mark.parametrize("reason", sorted(builder.RECEIPT_PERFORMANCE_ONLY_EVIDENCE_ERROR_REASONS))
+def test_each_production_performance_only_evidence_error_reason_does_not_block_reliability(reason):
+    """Parameterize from the production constant so every approved literal is exercised."""
     manifest = make_manifest()
     receipt = make_receipt(manifest)
-    receipt["evidence_errors"] = [{"workflow_run_id": 999, "reason": "gate_ready_timestamp_missing_or_invalid"}]
+    receipt["evidence_errors"] = [{"workflow_run_id": 999, "reason": reason}]
     errors = builder.verify_prerequisites_available(manifest, receipt)
-    assert not any("evidence_errors" in e for e in errors), errors
+    assert not any("evidence_errors" in error for error in errors), errors
 
 
-def test_unrecognized_evidence_error_reason_stays_fail_closed():
+@pytest.mark.parametrize("reason", ["some_new_unrecognized_reason", "run_attempt_identity_collision"])
+def test_unknown_and_identity_binding_evidence_error_reasons_stay_fail_closed(reason):
     manifest = make_manifest()
     receipt = make_receipt(manifest)
-    receipt["evidence_errors"] = [{"workflow_run_id": 999, "reason": "some_new_unrecognized_reason"}]
+    receipt["evidence_errors"] = [{"workflow_run_id": 100, "reason": reason}]
     errors = builder.verify_prerequisites_available(manifest, receipt)
-    assert any("evidence_errors_contains_non_performance_only_reason" in e for e in errors)
+    assert any("evidence_errors_contains_non_performance_only_reason" in error for error in errors)
 
 
-def test_identity_class_evidence_error_reason_blocks_reliability():
+def test_performance_only_monolith_reason_does_not_mask_missing_reliability_evidence():
     manifest = make_manifest()
     receipt = make_receipt(manifest)
-    receipt["evidence_errors"] = [{"workflow_run_id": 100, "reason": "run_attempt_identity_collision"}]
+    receipt["evidence_errors"] = [
+        {"workflow_run_id": 100, "reason": "missing_monolith_performance_phase"},
+        {"workflow_run_id": 100, "reason": "missing_playwright_json_artifact"},
+    ]
     errors = builder.verify_prerequisites_available(manifest, receipt)
-    assert any("evidence_errors_contains_non_performance_only_reason" in e for e in errors)
+    assert any("missing_playwright_json_artifact" in error for error in errors)
 
 
 # --------------------------------------------------------------------------- #
