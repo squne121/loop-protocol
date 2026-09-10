@@ -886,6 +886,25 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "cwd_policy": "repo_root",
         "stdin_contract": "none",
         "stdout_contract": "root_review_pipeline_result/v1",
+        # Issue #2610 AC7 (fresh 5-item consumer inventory, OWNER
+        # REQUEST_CHANGES reflected): no repository-owned consumer reads
+        # this field for this command_id today -- it is NOT one of
+        # `scripts/agent-guards/skill_runtime_command_policy.py`'s
+        # `eligible_command_ids`, so `skill_runtime_exec.py` (the only
+        # in-repo reader of any REGISTRY entry's `timeout_seconds`) never
+        # dispatches `root_review_pipeline.produce` and never applies this
+        # value as a real subprocess deadline. This 90 is therefore
+        # unenforced / informational, see SKILL.md Step 2 background+join contract
+        # for the actual execution model (explicit
+        # `run_in_background: true` + mandatory completion join, governed
+        # by Claude Code's own background task semantics; the REAL bounded
+        # runtime deadline is the invocation-local `ReviewBudget` that
+        # `reviewer_transport.run_reviewer_transport()` enforces via its
+        # own SIGTERM->grace->SIGKILL->reap implementation). Do not treat
+        # this 90 as a canonical runtime budget, and do not bump it to an
+        # arbitrary larger fixed value -- if a real repository-owned
+        # consumer for this field is ever added, derive its outer deadline
+        # from the full `produce` envelope (see Issue #2610) instead.
         "timeout_seconds": 90,
         "mutation": False,
         "placeholders": {
