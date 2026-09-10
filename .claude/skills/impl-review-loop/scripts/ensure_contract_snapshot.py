@@ -78,7 +78,6 @@ import datetime
 import hashlib
 import importlib.util
 import json
-import os
 import re
 import subprocess
 import sys
@@ -720,42 +719,45 @@ def post_comment(
 
     post_status_code: posted | permission_denied | rate_limited |
                       validation_failed_or_spam | ambiguous_no_retry
+
+    Transport (Issue #2627 AC3): mirrors ``patch_comment()`` -- the request
+    body is serialized once as canonical JSON UTF-8 bytes and piped to
+    ``gh api --method POST ... --input -`` via stdin. No temporary file and
+    no field-style file upload flag is used, so there is no implicit OS
+    text-mode newline translation between "the bytes this function built"
+    and "the bytes gh sent". This function's own successful exit and any
+    ``.html_url``
+    it decodes from the immediate POST response are a POST-staging
+    representation only (Issue #2627 AC2): they prove transport acceptance,
+    not persisted-body authority. Callers must not treat this return value's
+    body content as authoritative; the sole final persisted-body authority
+    remains the decoded Markdown body's UTF-8 SHA256 from a subsequent
+    direct-GET readback (verify_controlled_publisher_comment_id_binding /
+    verify_snapshot_authority_postcondition), exactly as with patch_comment.
     """
-    import tempfile
-
-    # Write body to temp file to avoid shell escaping issues
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".md", delete=False, encoding="utf-8"
-        ) as tmp:
-            tmp.write(body)
-            tmp_path = tmp.name
-
-        try:
-            result = subprocess.run(
-                [
-                    "gh", "api",
-                    "--method", "POST",
-                    f"repos/{repo}/issues/{issue_number}/comments",
-                    "--field", f"body=@{tmp_path}",
-                    "--jq", ".html_url",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+        payload = json.dumps({"body": body}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        result = subprocess.run(
+            [
+                "gh", "api",
+                "--method", "POST",
+                f"repos/{repo}/issues/{issue_number}/comments",
+                "--input", "-",
+                "--jq", ".html_url",
+            ],
+            input=payload,
+            capture_output=True,
+            timeout=timeout,
+        )
+        stdout_text = result.stdout.decode("utf-8", errors="replace")
+        stderr_text = result.stderr.decode("utf-8", errors="replace")
 
         if result.returncode == 0:
-            url = result.stdout.strip() or None
+            url = stdout_text.strip() or None
             return url, POST_STATUS_POSTED, None
 
         # Extract HTTP status from stderr
-        http_status = _extract_http_status(result.stderr)
+        http_status = _extract_http_status(stderr_text)
         if http_status:
             # Handle 404/410 as ambiguous_no_retry
             if http_status in (404, 410):
@@ -1451,11 +1453,18 @@ def ensure_contract_snapshot(
         # independent direct-GET readback -- before treating the freshly
         # materialized snapshot as authoritative. Fail-closed on mismatch.
         expected_comment_id = extract_comment_id_from_url(url)
+        # Issue #2627 AC2: this is the POST-staging digest -- it binds only
+        # the just-POSTed provisional (pre-fingerprint) comment body to this
+        # one immediate direct-GET readback. It intentionally does not share
+        # a name with the final persisted-body authority digest below: it
+        # never gates the eventual materialized_go decision on its own, and
+        # is discarded once this provisional binding check completes.
+        staging_post_body_sha256 = sha256_of(comment_body)
         bound_ok, binding_err = verify_controlled_publisher_comment_id_binding(
             issue_number,
             repo,
             expected_comment_id,
-            expected_body_sha256=sha256_of(comment_body),
+            expected_body_sha256=staging_post_body_sha256,
         )
         if not bound_ok:
             result["status"] = "controlled_publisher_binding_failed"
@@ -1496,11 +1505,18 @@ def ensure_contract_snapshot(
             result["errors"].append(f"fingerprint_patch_failed: {patch_err}")
             return result
 
+        # Issue #2627 AC2: this is the final persisted-body authority digest
+        # -- distinct from staging_post_body_sha256 above -- and is the value
+        # that ultimately gates whether this run may report status: ok. It is
+        # reused verbatim as expected_comment_body_sha256 in the final
+        # verify_snapshot_authority_postcondition anchor call below so both
+        # authority checks are bound to the exact same digest.
+        final_persisted_body_sha256 = sha256_of(final_comment_body)
         final_bound_ok, final_binding_err = verify_controlled_publisher_comment_id_binding(
             issue_number,
             repo,
             expected_comment_id,
-            expected_body_sha256=sha256_of(final_comment_body),
+            expected_body_sha256=final_persisted_body_sha256,
         )
         if not final_bound_ok:
             result["status"] = "controlled_publisher_binding_failed"
@@ -1535,7 +1551,7 @@ def ensure_contract_snapshot(
             expected_body_sha256=body_sha256,
             expected_updated_at=authority_updated_at,
             expected_comment_id=expected_comment_id,
-            expected_comment_body_sha256=sha256_of(final_comment_body),
+            expected_comment_body_sha256=final_persisted_body_sha256,
             expected_fingerprint=expected_contract_fingerprint,
         )
         if not authority_ok:
