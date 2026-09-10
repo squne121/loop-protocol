@@ -82,6 +82,27 @@ _KNOWN_CANONICAL_STEP2_ROUTES = frozenset(
 _SUBPROCESS_TIMEOUT_SECONDS = 1200
 
 
+def _skip_or_exit(message: str, returncode: int) -> None:
+    """SKIP this test without crashing an xdist worker.
+
+    ``pytest.exit()`` terminates the whole test *session* (fine for the
+    Issue #2610 AC9 standalone invocation, where it yields the documented
+    exit code 77 -- docs/dev/runtime-verification-policy.md's SKIP
+    convention), but inside a pytest-xdist worker process it is fatal:
+    the controller detects the worker's session-abort as a crashed item
+    (``INTERNALERROR> AssertionError`` in ``xdist/dsession.py``), failing
+    the entire parallel run this file is now collected into. Detect the
+    xdist worker via ``PYTEST_XDIST_WORKER`` (set by pytest-xdist in each
+    worker process, unset otherwise) and use a normal ``pytest.skip()``
+    there instead -- functionally equivalent for this always-opt-in test,
+    and safe under xdist.
+    """
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        pytest.skip(message)
+    else:
+        pytest.exit(message, returncode=returncode)
+
+
 def _write_evidence_log(*, verdict: str, exit_code: int, reason: str, extra: dict) -> Path:
     artifact_dir = Path(os.environ.get("RUNTIME_VERIFICATION_ARTIFACT_DIR", "artifacts"))
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -115,21 +136,21 @@ def test_ac9_step2_execution_surface_canary_against_issue_2584() -> None:
             "one-time read-only canary against Issue #2584 -- it is never "
             "run automatically (Out of Scope: standing CI live-mutation gate)."
         )
-        pytest.exit(f"SKIP: {_ENABLE_ENV_VAR} not enabled", returncode=77)
+        _skip_or_exit(f"SKIP: {_ENABLE_ENV_VAR} not enabled", 77)
 
     gh = shutil.which("gh")
     if gh is None:
         print("SKIP: gh CLI unavailable in PATH; cannot fetch the live Issue #2584 body")
-        pytest.exit("SKIP: step2_execution_surface_canary unavailable (gh not found)", returncode=77)
+        _skip_or_exit("SKIP: step2_execution_surface_canary unavailable (gh not found)", 77)
 
     try:
         auth = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=15)
     except OSError as exc:
         print(f"SKIP: gh auth status could not be executed ({exc})")
-        pytest.exit("SKIP: step2_execution_surface_canary unavailable (gh auth exec failed)", returncode=77)
+        _skip_or_exit("SKIP: step2_execution_surface_canary unavailable (gh auth exec failed)", 77)
     if auth.returncode != 0:
         print("SKIP: gh is not authenticated in this runtime; cannot read Issue #2584 live")
-        pytest.exit("SKIP: step2_execution_surface_canary unavailable (gh auth unavailable)", returncode=77)
+        _skip_or_exit("SKIP: step2_execution_surface_canary unavailable (gh auth unavailable)", 77)
 
     assert _PRODUCE_SCRIPT.is_file(), f"canonical Step 2 producer script missing: {_PRODUCE_SCRIPT}"
 
