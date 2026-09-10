@@ -351,14 +351,12 @@ def patch_comment(
             timeout=timeout,
         )
         if result.returncode == 0:
-            try:
-                response = json.loads(result.stdout.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                return False, "patch_response_invalid_json"
-            if not isinstance(response, dict) or response.get("id") != comment_id:
-                return False, "patch_response_id_mismatch"
-            if response.get("body") != body:
-                return False, "patch_response_body_mismatch"
+            # A successful subprocess only proves that gh accepted the PATCH
+            # response. Its representation is intentionally non-authoritative:
+            # invalid JSON and id/body mismatches therefore share this same
+            # one-GET reconciliation path with an exact representation. Never
+            # retry PATCH; the direct binding verifier is the authority for
+            # comment id, issue, html_url, publisher, and decoded body hash.
             ok, err = verify_controlled_publisher_comment_id_binding(
                 issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
             )
