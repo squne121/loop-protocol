@@ -161,14 +161,34 @@ def _gate_ready_baselines(count: int, start_id: int = 1) -> list[dict]:
 
 
 def _arm_fixture(
-    commit_sha: str, provider_count: int, gate_ready_count: int, start_id: int, base_ms: int = 60_000
+    commit_sha: str,
+    provider_count: int,
+    gate_ready_count: int,
+    start_id: int,
+    *,
+    topology: str,
+    base_ms: int = 60_000,
 ) -> dict:
+    run_ids = list(range(start_id, start_id + provider_count))
+    if topology == gate.PERFORMANCE_TOPOLOGY_MONOLITH:
+        core_baselines = gate._monolith_e2e_core_baselines(
+            run_ids,
+            core_ms=base_ms // 2,
+            responsive_ms=base_ms - (base_ms // 2),
+        )
+        responsive_baselines = []
+    elif topology == gate.PERFORMANCE_TOPOLOGY_SPLIT:
+        core_baselines = _paired_baselines(provider_count, "e2e-core", start_id, base_ms=base_ms)
+        responsive_baselines = _paired_baselines(
+            provider_count, "e2e-responsive-matrix", start_id, base_ms=base_ms
+        )
+    else:
+        raise ValueError(f"unsupported topology: {topology}")
+
     return {
         "commit_sha": commit_sha,
-        "core_baselines": _paired_baselines(provider_count, "e2e-core", start_id, base_ms=base_ms),
-        "responsive_baselines": _paired_baselines(
-            provider_count, "e2e-responsive-matrix", start_id, base_ms=base_ms
-        ),
+        "core_baselines": core_baselines,
+        "responsive_baselines": responsive_baselines,
         "gate_ready_baselines": _gate_ready_baselines(gate_ready_count, start_id),
     }
 
@@ -276,8 +296,20 @@ def test_evidence_gate_insufficient_samples_never_fabricates_a_claim():
     ("20件未満なら fail-closed する"), since no real >= 20-run cohort exists
     in this implementation session."""
     fixture = dict(_COHORT_FIXTURE_COMMON)
-    fixture["before"] = _arm_fixture("a" * 40, provider_count=5, gate_ready_count=5, start_id=9000)
-    fixture["after"] = _arm_fixture("b" * 40, provider_count=20, gate_ready_count=20, start_id=19000)
+    fixture["before"] = _arm_fixture(
+        "a" * 40,
+        provider_count=5,
+        gate_ready_count=5,
+        start_id=9000,
+        topology=gate.PERFORMANCE_TOPOLOGY_MONOLITH,
+    )
+    fixture["after"] = _arm_fixture(
+        "b" * 40,
+        provider_count=20,
+        gate_ready_count=20,
+        start_id=19000,
+        topology=gate.PERFORMANCE_TOPOLOGY_SPLIT,
+    )
 
     result = gate.run_evidence_gate(fixture)
     assert result["gate_status"] == "insufficient_evidence"
@@ -294,8 +326,22 @@ def test_evidence_gate_sufficient_samples_computes_real_claim():
     is wired end-to-end into a callable path, not merely unit-tested in
     isolation."""
     fixture = dict(_COHORT_FIXTURE_COMMON)
-    fixture["before"] = _arm_fixture("a" * 40, provider_count=20, gate_ready_count=20, start_id=9000, base_ms=270_000)
-    fixture["after"] = _arm_fixture("b" * 40, provider_count=20, gate_ready_count=20, start_id=19000, base_ms=100_000)
+    fixture["before"] = _arm_fixture(
+        "a" * 40,
+        provider_count=20,
+        gate_ready_count=20,
+        start_id=9000,
+        topology=gate.PERFORMANCE_TOPOLOGY_MONOLITH,
+        base_ms=270_000,
+    )
+    fixture["after"] = _arm_fixture(
+        "b" * 40,
+        provider_count=20,
+        gate_ready_count=20,
+        start_id=19000,
+        topology=gate.PERFORMANCE_TOPOLOGY_SPLIT,
+        base_ms=100_000,
+    )
 
     result = gate.run_evidence_gate(fixture)
     assert result["gate_status"] == "complete"
@@ -314,8 +360,20 @@ def test_evidence_gate_cli_subprocess_exits_non_zero_on_insufficient_evidence(tm
     `e2e-performance-benchmark-assessment-gate` job uses) with an
     insufficient-evidence fixture terminates with a non-zero exit code."""
     fixture = dict(_COHORT_FIXTURE_COMMON)
-    fixture["before"] = _arm_fixture("a" * 40, provider_count=3, gate_ready_count=3, start_id=9000)
-    fixture["after"] = _arm_fixture("b" * 40, provider_count=3, gate_ready_count=3, start_id=19000)
+    fixture["before"] = _arm_fixture(
+        "a" * 40,
+        provider_count=3,
+        gate_ready_count=3,
+        start_id=9000,
+        topology=gate.PERFORMANCE_TOPOLOGY_MONOLITH,
+    )
+    fixture["after"] = _arm_fixture(
+        "b" * 40,
+        provider_count=3,
+        gate_ready_count=3,
+        start_id=19000,
+        topology=gate.PERFORMANCE_TOPOLOGY_SPLIT,
+    )
 
     fixture_path = tmp_path / "cohort_fixture.json"
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
@@ -343,8 +401,22 @@ def test_evidence_gate_cli_subprocess_exits_zero_on_sufficient_evidence_with_tru
     sufficient sample counts) -- the production path is not permanently
     hard-wired to fail regardless of the data/binding it is given."""
     fixture = dict(_COHORT_FIXTURE_COMMON)
-    fixture["before"] = _arm_fixture("a" * 40, provider_count=20, gate_ready_count=20, start_id=9000, base_ms=270_000)
-    fixture["after"] = _arm_fixture("b" * 40, provider_count=20, gate_ready_count=20, start_id=19000, base_ms=100_000)
+    fixture["before"] = _arm_fixture(
+        "a" * 40,
+        provider_count=20,
+        gate_ready_count=20,
+        start_id=9000,
+        topology=gate.PERFORMANCE_TOPOLOGY_MONOLITH,
+        base_ms=270_000,
+    )
+    fixture["after"] = _arm_fixture(
+        "b" * 40,
+        provider_count=20,
+        gate_ready_count=20,
+        start_id=19000,
+        topology=gate.PERFORMANCE_TOPOLOGY_SPLIT,
+        base_ms=100_000,
+    )
 
     fixture_path = tmp_path / "cohort_fixture.json"
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
@@ -411,11 +483,20 @@ def test_evidence_gate_cli_subprocess_exits_zero_on_sufficient_evidence_with_tru
 # EVIDENCE-CLEAN at the receipt materializer level -- required to prove the
 # P0-1/P0-2 regressions below are not masked by an unrelated fingerprint gap.
 # --------------------------------------------------------------------------- #
-def _clean_close_grade_arm_fixture(commit_sha: str, run_ids: list[int]) -> dict:
+def _clean_close_grade_arm_fixture(commit_sha: str, run_ids: list[int], *, topology: str) -> dict:
+    if topology == gate.PERFORMANCE_TOPOLOGY_MONOLITH:
+        core_baselines = gate._monolith_e2e_core_baselines(run_ids)
+        responsive_baselines = []
+    elif topology == gate.PERFORMANCE_TOPOLOGY_SPLIT:
+        core_baselines = gate._close_grade_paired_baselines("e2e-core", run_ids)
+        responsive_baselines = gate._close_grade_paired_baselines("e2e-responsive-matrix", run_ids)
+    else:
+        raise ValueError(f"unsupported topology: {topology}")
+
     return {
         "commit_sha": commit_sha,
-        "core_baselines": gate._close_grade_paired_baselines("e2e-core", run_ids),
-        "responsive_baselines": gate._close_grade_paired_baselines("e2e-responsive-matrix", run_ids),
+        "core_baselines": core_baselines,
+        "responsive_baselines": responsive_baselines,
         "gate_ready_baselines": gate._close_grade_gate_ready_baselines(run_ids),
     }
 
@@ -433,8 +514,12 @@ def test_close_grade_receipt_complete_false_and_exit_code_one_for_below_threshol
     (CLI exit code 1). The fixed single-source-of-truth implementation
     must report `complete: False` here."""
     fixture = dict(_COHORT_FIXTURE_COMMON)
-    fixture["before"] = _clean_close_grade_arm_fixture("a" * 40, [97001, 97002])
-    fixture["after"] = _clean_close_grade_arm_fixture("b" * 40, [98001, 98002])
+    fixture["before"] = _clean_close_grade_arm_fixture(
+        "a" * 40, [97001, 97002], topology=gate.PERFORMANCE_TOPOLOGY_MONOLITH
+    )
+    fixture["after"] = _clean_close_grade_arm_fixture(
+        "b" * 40, [98001, 98002], topology=gate.PERFORMANCE_TOPOLOGY_SPLIT
+    )
 
     fixture_path = tmp_path / "cohort_fixture.json"
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
@@ -494,8 +579,12 @@ def test_close_grade_receipt_complete_false_and_nonzero_exit_on_raw_record_missi
     before_ids = list(range(97101, 97121))  # 20 valid ids
     after_ids = list(range(98101, 98121))  # 20 valid ids
     fixture = dict(_COHORT_FIXTURE_COMMON)
-    fixture["before"] = _clean_close_grade_arm_fixture("a" * 40, before_ids)
-    fixture["after"] = _clean_close_grade_arm_fixture("b" * 40, after_ids)
+    fixture["before"] = _clean_close_grade_arm_fixture(
+        "a" * 40, before_ids, topology=gate.PERFORMANCE_TOPOLOGY_MONOLITH
+    )
+    fixture["after"] = _clean_close_grade_arm_fixture(
+        "b" * 40, after_ids, topology=gate.PERFORMANCE_TOPOLOGY_SPLIT
+    )
 
     # An EXTRA raw gate-ready record with no `workflow_run_id` at all --
     # the 20 valid ids above are untouched, so the naive post-filter
@@ -581,8 +670,22 @@ def test_close_grade_cli_exit_code_zero_requires_approval_eligible_not_only_sema
     approval_eligible) is distinct from exit codes 1 (insufficient_evidence)
     and 2 (semantic invalid)."""
     fixture = dict(_COHORT_FIXTURE_COMMON)
-    fixture["before"] = _arm_fixture("a" * 40, provider_count=20, gate_ready_count=20, start_id=9000, base_ms=270_000)
-    fixture["after"] = _arm_fixture("b" * 40, provider_count=20, gate_ready_count=20, start_id=19000, base_ms=100_000)
+    fixture["before"] = _arm_fixture(
+        "a" * 40,
+        provider_count=20,
+        gate_ready_count=20,
+        start_id=9000,
+        topology=gate.PERFORMANCE_TOPOLOGY_MONOLITH,
+        base_ms=270_000,
+    )
+    fixture["after"] = _arm_fixture(
+        "b" * 40,
+        provider_count=20,
+        gate_ready_count=20,
+        start_id=19000,
+        topology=gate.PERFORMANCE_TOPOLOGY_SPLIT,
+        base_ms=100_000,
+    )
 
     fixture_path = tmp_path / "cohort_fixture.json"
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
@@ -611,8 +714,22 @@ def test_close_grade_cli_approval_eligible_false_head_sha_mismatch_produces_exit
     blocker must still translate into a non-zero close-grade CLI exit code,
     not a silently accepted exit 0."""
     fixture = dict(_COHORT_FIXTURE_COMMON)
-    fixture["before"] = _arm_fixture("a" * 40, provider_count=20, gate_ready_count=20, start_id=9000, base_ms=270_000)
-    fixture["after"] = _arm_fixture("b" * 40, provider_count=20, gate_ready_count=20, start_id=19000, base_ms=100_000)
+    fixture["before"] = _arm_fixture(
+        "a" * 40,
+        provider_count=20,
+        gate_ready_count=20,
+        start_id=9000,
+        topology=gate.PERFORMANCE_TOPOLOGY_MONOLITH,
+        base_ms=270_000,
+    )
+    fixture["after"] = _arm_fixture(
+        "b" * 40,
+        provider_count=20,
+        gate_ready_count=20,
+        start_id=19000,
+        topology=gate.PERFORMANCE_TOPOLOGY_SPLIT,
+        base_ms=100_000,
+    )
 
     fixture_path = tmp_path / "cohort_fixture.json"
     fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
