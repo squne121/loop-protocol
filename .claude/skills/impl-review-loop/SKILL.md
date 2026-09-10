@@ -64,6 +64,7 @@ subprocess 分離方式（`invocation_token` による再提示）は撤回済�
     route: route_to_update_branch → worker 委譲（update_branch）→ 検証・PR review 再実行
     route: route_stale_head_rereview → 現在 head で PR review 再実行
     route: continue_loop（REQUEST_CHANGES） → Step 1 に戻る（fix_delta を渡す）
+    route: already_satisfied（REQUEST_CHANGES かつ base_ac_satisfied かつ meaningful_pr_delta なし、#2607） → 終了。recommendation を構造化して報告（自動 close は実行しない）
     route: route_human_escalation（verdict: HUMAN_REVIEW_REQUIRED） → 人間判断を仰ぐ
     route: conflict_hard_stop（actual conflict のみ） → CONFLICTING PR Escalation Runbook
     route: fail_closed（schema 不正 / UNKNOWN / BLOCKED / UNSTABLE / DRAFT 等） → warning 記録、次サイクルで再評価（自動 human escalation ではない）
@@ -104,7 +105,7 @@ LOOP_STATE:
   last_loop_verdict: APPROVE | REQUEST_CHANGES | HUMAN_REVIEW_REQUIRED | null
   blockers_history: []
   external_research_skip_basis: "<理由 or null>"
-  termination_reason: null | approved | max_iterations | human_escalation | intake_gate_failed
+  termination_reason: null | approved | max_iterations | human_escalation | intake_gate_failed | already_satisfied
   product_spec_preflight:
     source: contract_snapshot.checks.product_spec_check
     applicability: applicable | not_applicable | missing
@@ -140,6 +141,7 @@ LOOP_STATE:
 | `route_to_update_branch`（live `merge_state_status == BEHIND`） | 終了しない。合成された `update_branch` action を worker に委譲し、検証・PR review を再実行する |
 | `route_stale_head_rereview`（`reviewed_head_sha` が現在の PR head と不一致） | 終了しない。現在 head で PR review を再実行する |
 | `continue_loop`（`verdict: REQUEST_CHANGES`、actual conflict がない場合） | 終了しない。Step 1 に戻り blockers を fix_delta として渡す |
+| `already_satisfied`（`verdict: REQUEST_CHANGES` かつ `already_satisfied_evidence.base_ac_satisfied == true` かつ `meaningful_pr_delta == false` かつ `evidence_base_sha` が current main HEAD と一致、#2607） | 終了。`termination_reason: already_satisfied` を LOOP_STATE に記録。recommendation を構造化して報告する（詳細は下記「Already-Satisfied Recommendation Structure」）。PR/Issue の close は本 route 自身では実行しない |
 | `iteration ≥ max_iterations` | fail-close。`termination_reason: max_iterations` を LOOP_STATE に記録、人間判断を仰ぐ |
 | `route_human_escalation`（`verdict: HUMAN_REVIEW_REQUIRED`、actual conflict がない場合） | 即停止、人間判断を仰ぐ |
 | Step 1-4 のいずれかで `human_review_required: true`（真偽値の自己申告）を SubAgent が返した | #1860 Owner Decision により即停止しない。warning として記録し、iteration 余裕があれば継続する（`step-5-feedback-and-termination.md` の「human_review_required の扱い」参照）。ループを止める human veto は live Issue/PR コメント上の明示的な停止指示、または実 Git conflict／target PR mergeability に限定する |
@@ -147,6 +149,28 @@ LOOP_STATE:
 | `fail_closed`（schema 不正、`APPROVE` かつ `blockers` 非空、mergeability `UNKNOWN`、`BLOCKED`/`UNSTABLE`/`DRAFT`） | `reason_code` を warning として記録。`UNKNOWN` は bounded retry（最大 3 回）後も warning のまま継続。`BLOCKED`/`UNSTABLE`/`DRAFT` は current-head required-CI / branch-protection evaluator の判定に委ね、human escalation にはしない |
 
 > **重要**: `verdict: APPROVE` 単独では終了しない。live mergeability が `CLEAN`/`HAS_HOOKS` かつ `blockers == []` の両条件が必要（`route_loop_verdict_v2()` が判定する）。
+
+## Already-Satisfied Recommendation Structure（要求が既に充足済みの場合の推奨構造。`already_satisfied` の recommendation 構造、Issue #2607 AC8）
+
+`already_satisfied` は 2 つの経路（`preparation.md` の early-exit、`route_loop_verdict_v2()` の Step 5 recovery route）のいずれから到達しても、以下と同じ `result` / `recommendation` 構造で報告する。`route_loop_verdict_v2()` 側は `RouteDecision.selected_action` の `result` / `recommendation` キーとしてこの構造をそのまま返す（新規 top-level schema は新設しない）。
+
+```yaml
+result:
+  status: no_change_required
+  termination_reason: already_satisfied
+  merge_ready: false
+recommendation:
+  pr:
+    action: none | close   # none: PR 未作成の early-exit経路 / close: PR 既存の Step 5 recovery 経路
+    reason: no_pr_created | no_meaningful_delta
+  issue:
+    action: close
+    state_reason: completed
+    reason: requirement_already_delivered
+```
+
+- `already_satisfied` route 自身は PR/Issue の close 等の mutation を直接実行しない（recommendation の構造化のみ。`route_loop_verdict_v2.py` の module docstring が維持する "no gh, git, network, or subprocess calls" 不変条件は本 route でも変更しない）。
+- `meaningful_pr_delta` の判定（`recommendation.pr.action: close` の根拠）は **対象 Issue 自身の AC/VC 範囲（`runtime_ac_results` が被覆する範囲）に限定した比較**であり、PR diff 全体の監査ではない。`recommendation.pr.action: close` は常にこの限定つきの判定であることを consumer 向けに明記する。`#2041` 等の将来の consumer は、本 recommendation だけを根拠に無条件で PR close を実行してはならず、独立した diff review を経由すべきである（対象 Issue の AC/VC 範囲外で PR が独立した価値を持つ場合、この比較だけでは no-op PR と区別できないため）。
 
 ## 外部仕様調査の取扱い
 
