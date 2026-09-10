@@ -3146,11 +3146,15 @@ class TestPatchCommentTransportAndReconciliation:
         )
 
     def _install_remote_boundary(self, monkeypatch, remote: dict, patch_response: str, after_patch=None):
-        calls = {"patch": [], "get": 0}
+        endpoint = f"repos/{_REPO}/issues/comments/{self._COMMENT_ID}"
+        calls = {"patch": [], "get": []}
 
         def fake_run(command, *, input=None, **_kwargs):
             if "--method" in command:
                 assert command[command.index("--method") + 1] == "PATCH"
+                assert "--silent" in command
+                assert command.count(endpoint) == 1
+                assert command[command.index("--input") - 1] == endpoint
                 assert input is not None
                 payload = json.loads(input.decode("utf-8"))
                 calls["patch"].append(payload)
@@ -3169,7 +3173,9 @@ class TestPatchCommentTransportAndReconciliation:
                     stdout=json.dumps(response).encode("utf-8"),
                 )
 
-            calls["get"] += 1
+            assert command.count(endpoint) == 1
+            assert command[-1] == endpoint
+            calls["get"].append(command)
             if patch_response == "get_failure":
                 return MagicMock(returncode=1, stdout="")
             return MagicMock(returncode=0, stdout=json.dumps(remote))
@@ -3206,7 +3212,7 @@ class TestPatchCommentTransportAndReconciliation:
         assert len(calls["patch"]) == 1
         assert calls["patch"][0]["body"] == final_body
         assert remote["body"] == final_body
-        assert calls["get"] == 1
+        assert len(calls["get"]) == 1
         parsed = _parser_mod.parse_contract_review_results([remote], _ISSUE_URL)
         assert len(parsed) == 1
         assert parsed[0]["status"] == "go"
@@ -3249,7 +3255,7 @@ class TestPatchCommentTransportAndReconciliation:
         assert (ok, error) == (True, None)
         assert len(calls["patch"]) == 1
         assert calls["patch"][0]["body"] == final_body
-        assert calls["get"] == 1
+        assert len(calls["get"]) == 1
         parsed = _parser_mod.parse_contract_review_results([remote], _ISSUE_URL)
         assert len(parsed) == 1
         assert parsed[0]["status"] == "go"
@@ -3285,7 +3291,7 @@ class TestPatchCommentTransportAndReconciliation:
 
         assert (ok, error) == (True, None)
         assert len(calls["patch"]) == 1
-        assert calls["get"] == 1
+        assert len(calls["get"]) == 1
 
     @pytest.mark.parametrize(
         ("failure", "expected_error"),
@@ -3329,4 +3335,4 @@ class TestPatchCommentTransportAndReconciliation:
         assert ok is False
         assert error == f"patch_get_reconciliation_failed:{expected_error}"
         assert len(calls["patch"]) == 1
-        assert calls["get"] == 1
+        assert len(calls["get"]) == 1
