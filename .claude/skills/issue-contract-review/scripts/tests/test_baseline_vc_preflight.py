@@ -918,6 +918,39 @@ def test_runtime_dependency_smoke_rejects_inline_and_non_repo_scripts():
     ])
 
 
+def test_scope_rollup_runtime_canary_allowance_is_finite_and_fail_closed():
+    """Issue #2611 AC7: only the literal canary argv is admitted; variants deny."""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    repo_root = Path(__file__).parents[5]
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import (
+        _is_uv_scope_rollup_auth_canary_command,
+        classify_static_command,
+    )
+
+    canonical = [
+        "uv", "run", "--isolated", "--locked", "--no-default-groups", "python3",
+        "scripts/agent-guards/verify_scope_rollup_auth_capability_runtime.py",
+        "--repo", "squne121/loop-protocol", "--issue-number", "2611",
+    ]
+    assert _is_uv_scope_rollup_auth_canary_command(canonical)
+    assert classify_static_command(" ".join(canonical), repo_root) is None
+
+    forbidden = [
+        canonical[:-1] + ["2612"],
+        canonical[:2] + ["--locked", "--isolated"] + canonical[4:],
+        canonical + ["--unexpected"],
+        canonical[:-2] + ["--issue-number=2611"],
+        canonical + ["--issue-number", "2611"],
+        canonical[:7] + ["--repo=squne121/loop-protocol"] + canonical[9:],
+        canonical[:6] + ["scripts/agent-guards/run_scope_rollup_preflight.py"] + canonical[7:],
+        canonical[:6] + ["-c", "print(1)"],
+    ]
+    for argv in forbidden:
+        assert not _is_uv_scope_rollup_auth_canary_command(argv), argv
+        assert classify_static_command(" ".join(argv), repo_root) is not None, argv
+
+
 def test_pytest_invocation_detect_non_pytest():
     """AC1: _is_pytest_invocation rejects non-pytest commands"""
     script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
