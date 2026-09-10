@@ -80,9 +80,6 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     # Scope Delta calls out. Classified "excluded" (not "evidence"/"required")
     # because this job's pass/fail must never affect merge-ready.
     ("ci", "component-vrt-report"): "excluded",
-    # Issue #2587: conditional ordinary-PR skips remain fail-closed unless
-    # is_exact_ordinary_pr_dispatch_only_skip() proves the exact route below.
-    ("ci", "close-evidence-publication"): "excluded",
     # Issue #2433: reliability-assessment is a non-required, read-only
     # workflow_dispatch consumer. Its ordinary-PR skipped CheckRun is handled
     # conditionally below, never as a blanket exclusion.

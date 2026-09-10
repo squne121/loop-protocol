@@ -475,10 +475,6 @@ CONDITIONAL_EXCLUDED_NAMES = (
 class TestOrdinaryPrDispatchOnlyExcludedClassification:
     """All dispatch-only jobs require identical fully bound ordinary-PR skips."""
 
-    def test_close_evidence_publication_is_registered_as_excluded(self, v2):
-        """Issue #2587: preserve the explicit conditional-skip classification."""
-        assert v2.CLASSIFICATION_MAP[("ci", "close-evidence-publication")] == "excluded"
-
     def _ordinary_pr_skip(self, name: str = "close-evidence-publication", **overrides) -> dict:
         check = make_check(
             name,
