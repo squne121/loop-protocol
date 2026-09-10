@@ -275,6 +275,20 @@ class TestBaseHeadHookTopologyDelta:
     (session_manifest_coordinator, StopFailure) を ALLOWED_ADDED_HANDLERS に
     明示登録した。これは既存の StopFailure hook 経路を再利用した新規登録であり
     Issue #2489 の Allowed Paths / Current Validated Scope に含まれる。
+
+    Issue #2564 PR #2615 により、Task Context v1 の Claude-native hook adapter
+    エントリポイント `hook_entry.py`（handler_id: hook_entry, command: python3）が
+    SessionStart / UserPromptSubmit / CwdChanged / SubagentStart / SessionEnd /
+    Stop / StopFailure / SubagentStop の 8 event に新規配線された（Allowed Paths:
+    `.claude/settings.json`）。PreToolUse への配線は行わない（fix_delta 6:
+    PreToolUse handler は observability-only no-op のため hot-path 削減のため
+    settings.json への登録自体を見送った。`hook_entry.py` 側の PreToolUse
+    dispatch コードは残置する）。async sibling `projection_flush_entry.py` の
+    settings.json 登録も行わない（fix_delta 2: Herdr projection flush は
+    `hook_entry.py` が DB commit 後に detached subprocess として自ら起動する
+    設計に変更したため、Claude Code native `"async": true` sibling hook entry
+    としては登録しない）。
+
     未申告の追加を検出する能力を弱めないため、ここでも removed handler と
     同様に (handler_id, event) の複合キーと具体的な matcher/command/args/timeout
     タプルの両方を allowlist として固定し、それ以外の追加は引き続き fail させる。
@@ -283,9 +297,17 @@ class TestBaseHeadHookTopologyDelta:
     REMOVED_HANDLER_ID = "rtk_boundary_shadow_guard"
     REMOVED_EVENT = "PreToolUse"
 
-    # Issue #2489 fix_delta: 意図的に許可された追加 handler の allowlist。
-    # 新たに handler を追加する場合は、ここに明示的にエントリを追加すること
-    # （申告なしの追加は引き続き test failure として検出される）。
+    def _hook_entry_added(event: str, timeout: int) -> dict[str, Any]:
+        return {
+            "matcher": None,
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", event],
+            "timeout": timeout,
+        }
+
+    # Issue #2489 / #2564 fix_delta: 意図的に許可された追加 handler の
+    # allowlist。新たに handler を追加する場合は、ここに明示的にエントリを
+    # 追加すること（申告なしの追加は引き続き test failure として検出される）。
     ALLOWED_ADDED_HANDLERS: dict[tuple[str, str], dict[str, Any]] = {
         ("session_manifest_coordinator", "StopFailure"): {
             "matcher": None,
@@ -293,7 +315,17 @@ class TestBaseHeadHookTopologyDelta:
             "args": [],
             "timeout": 55,
         },
+        ("hook_entry", "SessionStart"): _hook_entry_added("SessionStart", 5),
+        ("hook_entry", "UserPromptSubmit"): _hook_entry_added("UserPromptSubmit", 2),
+        ("hook_entry", "CwdChanged"): _hook_entry_added("CwdChanged", 5),
+        ("hook_entry", "SubagentStart"): _hook_entry_added("SubagentStart", 5),
+        ("hook_entry", "SessionEnd"): _hook_entry_added("SessionEnd", 5),
+        ("hook_entry", "Stop"): _hook_entry_added("Stop", 5),
+        ("hook_entry", "StopFailure"): _hook_entry_added("StopFailure", 5),
+        ("hook_entry", "SubagentStop"): _hook_entry_added("SubagentStop", 5),
     }
+
+    del _hook_entry_added
 
     def test_topology_delta_is_exact_single_handler_removal(self) -> None:
         base_entries = _load_settings_hooks_at_revision(BASE_REVISION_SHA)

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """``task-contextctl`` — machine-only typed CLI surface for Task Context v1.
 
-Subcommands (Issue #2563 contract):
+Subcommands (Issue #2563 contract; ``projection ack`` and the
+``query current`` ``session_id`` selector are additive Issue #2564
+extensions -- see Issue #2564 Stop Conditions carve-out permitting additive
+typed API/CLI operations within this directory):
 
     task-contextctl hook <event>
     task-contextctl signal apply
-    task-contextctl query current
+    task-contextctl query current           # payload: {task_id} or {session_id}
     task-contextctl projection flush
+    task-contextctl projection ack
     task-contextctl smoke seed
 
 Wire contract: stdin/stdout carry **exactly one UTF-8 JSON object** (the
@@ -34,8 +38,23 @@ import task_context_config as config  # noqa: E402
 import task_context_db as db  # noqa: E402
 import task_context_envelope as envelope  # noqa: E402
 import task_context_errors as errors  # noqa: E402
+import task_context_hook_flows as hook_flows  # noqa: E402
 import task_context_migration_runner as migration_runner  # noqa: E402
 import task_context_service as service  # noqa: E402
+
+# Empty/degraded projection shape returned by the read-only `query current`
+# session-selector path (AC9) when there is no DB yet or no Binding
+# currently claims the given session_id. Never an error -- a statusLine
+# renderer must be able to show "no Task Context yet" without crashing.
+_EMPTY_SESSION_PROJECTION = {
+    "task": None,
+    "activity": None,
+    "binding": None,
+    "runtime_location": None,
+    "task_refs": [],
+    "execution_run_id": None,
+    "attention": None,
+}
 
 EXIT_OK = 0
 EXIT_INTERNAL_ERROR = 1
@@ -79,21 +98,57 @@ def _open_db_and_migrate(cwd: str | None = None):
     return conn
 
 
+def _dispatch_query_current_by_session(session_id: str) -> dict:
+    """AC9: the statusLine `query current` session-selector path is genuinely
+    read-only -- it never creates the state-root directory, never creates or
+    migrates the DB file, and never mutates projection/GitHub/Herdr state.
+    ``task_context_db.connect_readonly`` returns ``None`` when the DB file
+    does not exist yet, which we turn into an empty/degraded projection
+    rather than creating one."""
+    db_file = config.db_path()
+    conn = db.connect_readonly(db_file)
+    if conn is None:
+        data = dict(_EMPTY_SESSION_PROJECTION)
+        data["degraded"] = True
+        data["degraded_reason"] = "no_state_db"
+        return envelope.build_ok_result(data)
+    try:
+        try:
+            projection = service.get_current_projection_for_session(conn, session_id)
+        except errors.NotFoundError:
+            data = dict(_EMPTY_SESSION_PROJECTION)
+            data["degraded"] = True
+            data["degraded_reason"] = "no_binding_for_session"
+            return envelope.build_ok_result(data)
+        projection["degraded"] = False
+        projection["degraded_reason"] = None
+        return envelope.build_ok_result(projection)
+    finally:
+        conn.close()
+
+
 def _dispatch(operation: str, payload: dict) -> dict:
+    if operation == "query_current" and payload.get("session_id") and not payload.get("task_id"):
+        return _dispatch_query_current_by_session(payload["session_id"])
+
+    if (
+        operation == "hook"
+        and payload.get("event") in hook_flows.EVENT_HANDLERS
+        and not payload.get("herdr_tab_id")
+    ):
+        # AC11: non-Herdr canonical interactive Claude is observe-only for
+        # *every* Native operator lifecycle event, not just SessionStart --
+        # short-circuit here so a plain (non-Herdr) Claude Code session
+        # never materializes the Task Context state-root/DB file at all as
+        # a side effect of a no-op hook firing.
+        return envelope.build_ok_result({"decision": "pass", "reason_code": "observe_only_non_herdr"})
+
     conn = _open_db_and_migrate()
     try:
         if operation == "hook":
             event = payload.get("event", "unknown")
-            result = service.append_event(
-                conn,
-                event_type=f"hook:{event}",
-                task_id=payload.get("task_id"),
-                activity_id=payload.get("activity_id"),
-                binding_id=payload.get("binding_id"),
-                execution_run_id=payload.get("execution_run_id"),
-                metadata=payload.get("metadata") or {},
-            )
-            return envelope.build_ok_result({"event_id": result["id"], "event_type": result["event_type"]})
+            result = hook_flows.dispatch_hook_event(conn, event, payload)
+            return envelope.build_ok_result(result)
 
         if operation == "signal_apply":
             task_id = payload.get("task_id")
@@ -120,6 +175,14 @@ def _dispatch(operation: str, payload: dict) -> dict:
                 raise errors.ValidationError("projection flush requires projection_key in payload")
             row = service.flush_projection(conn, projection_key)
             return envelope.build_ok_result({"projection": row})
+
+        if operation == "projection_ack":
+            projection_key = payload.get("projection_key")
+            read_revision = payload.get("read_revision")
+            if not projection_key or read_revision is None:
+                raise errors.ValidationError("projection ack requires projection_key and read_revision in payload")
+            result = service.ack_projection(conn, projection_key, int(read_revision))
+            return envelope.build_ok_result(result)
 
         if operation == "smoke_seed":
             task = service.create_task(conn, title=payload.get("title") or "task-context smoke seed")
@@ -171,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     projection_p = sub.add_parser("projection")
     projection_sub = projection_p.add_subparsers(dest="projection_command", required=True)
     projection_sub.add_parser("flush")
+    projection_sub.add_parser("ack")
 
     smoke_p = sub.add_parser("smoke")
     smoke_sub = smoke_p.add_subparsers(dest="smoke_command", required=True)
@@ -191,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         operation = "query_current"
     elif args.command == "projection" and args.projection_command == "flush":
         operation = "projection_flush"
+    elif args.command == "projection" and args.projection_command == "ack":
+        operation = "projection_ack"
     elif args.command == "smoke" and args.smoke_command == "seed":
         operation = "smoke_seed"
     else:  # pragma: no cover - argparse enforces this is unreachable

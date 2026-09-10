@@ -30,7 +30,7 @@ a v1 consumer — see "Scope Growth Guard" in the Issue body):
 
 from __future__ import annotations
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # v1 DDL (PRAGMA user_version target = 1)
@@ -347,6 +347,49 @@ DDL_V1: list[str] = [
     """,
 ]
 
+# ---------------------------------------------------------------------------
+# v2 DDL (PRAGMA user_version target = 2) -- strictly ADDITIVE (Issue #2564
+# PR #2615 fix_delta 5 + 7). No table/column/index defined by v1 is dropped,
+# renamed, or has its type or constraints changed, so every v1 consumer keeps
+# working unchanged (the Issue #2564 Stop Condition is about *breaking*
+# schema migrations / incompatible contract changes, not additive columns).
+# ---------------------------------------------------------------------------
+DDL_V2: list[str] = [
+    # -- execution_runs.agent_id (fix_delta 5) ------------------------------
+    # Claude Code's SubagentStart/SubagentStop hook payloads both carry an
+    # `agent_id` UUID that uniquely identifies the SubAgent *instance*.
+    # Without persisting it, SubagentStop could only guess which open
+    # `run_kind='subagent'` ExecutionRun to end (it closed "the first open
+    # one"), which ends the wrong run whenever two SubAgents overlap.
+    """
+    ALTER TABLE execution_runs ADD COLUMN agent_id TEXT
+    """,
+    # At most one *open* subagent run may claim a given agent_id at a time,
+    # so `SubagentStop(agent_id=X)` resolves to exactly one run. Historical
+    # (ended) runs are exempt so an agent_id can be reused later.
+    """
+    CREATE UNIQUE INDEX ux_execution_runs_open_subagent_agent_id
+        ON execution_runs(agent_id)
+        WHERE agent_id IS NOT NULL AND run_kind = 'subagent' AND ended_at IS NULL
+    """,
+    # -- runtime_locations cwd/worktree/branch (fix_delta 7) ------------------
+    # `CwdChanged` observations. These are display-only RuntimeLocation
+    # *observations* (statusLine rendering); they are deliberately NOT part
+    # of Task/Binding identity and never drive rebind/block decisions
+    # (AC7 + Issue #2564 Stop Condition: "worktree/branch/Herdr tab position
+    # を Task identity へ昇格する必要が生じた場合" は Stop).
+    """
+    ALTER TABLE runtime_locations ADD COLUMN cwd TEXT
+    """,
+    """
+    ALTER TABLE runtime_locations ADD COLUMN worktree TEXT
+    """,
+    """
+    ALTER TABLE runtime_locations ADD COLUMN branch TEXT
+    """,
+]
+
 MIGRATIONS: dict[int, list[str]] = {
     1: DDL_V1,
+    2: DDL_V2,
 }
