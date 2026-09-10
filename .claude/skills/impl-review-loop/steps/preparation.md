@@ -218,6 +218,38 @@ intake_gate:
   evaluated_at: "<ISO8601>"
 ```
 
+## 0-a-1. Already-Satisfied Early-Exit choke point（実装着手前の no-op 判定、#2607）
+
+**単一の共通 choke point（特定の分岐内にネストしない）**: 上記 0-a のステップ 5〜8（`next_action.route` が `proceed_to_step_1` / `request_readiness_check` / `run_contract_blocker_triage` / `human_review_required` のどの値であっても）、および下記「1-d. Product Spec Check の評価」で `product_spec_preflight.routing_action` が `continue` / `stop_human` / `refresh_contract_snapshot` のどの値であっても、それらの分岐が Step 1（implementation-worker dispatch）へ実際に到達する **直前**に、以下の共通判定を必ず一度だけ評価する。本 choke point は `## 0. Intake Gate` を通過済み（`INTAKE_GATE_RESULT_V1.status: pass`）の場合にのみ評価される。
+
+判定条件（両方成立した場合のみ early-exit）:
+
+1. **PR 未作成**: 対象 Issue にリンクされた open/merged PR が存在しない（`gh pr list --repo <repo> --search "<issue_number> in:body" --state all` 等で確認する。closed/not-planned な過去 PR は「未作成」として扱わない別ケースであり、本判定は open/merged PR の不在のみを見る）
+2. **base_ac_satisfied が true**: current main HEAD（`git rev-parse HEAD`）に対して `test-runner` SubAgent を独立実行し、対象 Issue の `## Verification Commands` を current main の checkout に対して評価させた `TEST_VERDICT_MACHINE/v2`（`head_sha` に current main HEAD SHA を記録）の `runtime_ac_results` が全て `status: pass` であること
+
+いずれか一方でも成立しない場合は本 choke point は不発（no-op）であり、通常どおり Step 1 へ進む。
+
+両方成立した場合、implementation-worker dispatch および PR 作成を行わず、以下を出力して停止する（PR/Issue の close 等の mutation は本 choke point 自身では一切実行しない。`SKILL.md` の「Already-Satisfied Recommendation Structure」参照）:
+
+```yaml
+result:
+  status: no_change_required
+  termination_reason: already_satisfied
+  merge_ready: false
+recommendation:
+  pr:
+    action: none
+    reason: no_pr_created
+  issue:
+    action: close
+    state_reason: completed
+    reason: requirement_already_delivered
+```
+
+`LOOP_STATE.termination_reason: already_satisfied` を記録する。
+
+**scope 限界（fail-closed、Issue #2607 Evidence producers 節）**: 対象 Issue の Verification Commands に `preflight-scope: pr_review_only` の VC が含まれる場合、PR が存在しないため live CI/CheckRun に束縛できず、base_ac_satisfied は構造的に true になり得ない。この場合本 choke point は常に不発であり、これは意図された安全側の挙動である（誤判定ではない）。
+
 ## 1. Inputs の確認
 
 ```yaml

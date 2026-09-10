@@ -42,6 +42,33 @@ argument. BEHIND routing is derived solely from
 TEST_VERDICT producer/publisher lane established by #1856 is unaffected by
 this module; it simply has no input into ordinary review routing.
 
+Issue #2607: when ``verdict == "REQUEST_CHANGES"``, an OPTIONAL
+``live_mergeability["already_satisfied_evidence"]`` key (same optional-key
+pattern as ``main_drift``, Issue #2102 -- the public two-input signature
+does not change) lets the caller supply independently-derived evidence that
+the target Issue's Verification Commands already pass on current main and
+that the open PR carries no meaningful delta over that base run:
+
+    already_satisfied_evidence:
+      base_ac_satisfied: bool     # independent base-checkout TEST_VERDICT/v2
+      meaningful_pr_delta: bool   # PASS-set comparison between base and PR head
+      evidence_base_sha: <sha>    # commit the base run was executed against
+
+This router does not compute these facts itself (no subprocess/gh access);
+it only compares ``evidence_base_sha`` against ``live_mergeability["main_drift"]
+["current_base_sha"]`` (freshness) and requires both booleans plus a real
+Git conflict absence. Only when ALL FOUR conditions hold (REQUEST_CHANGES
+verdict, base_ac_satisfied is True, meaningful_pr_delta is False,
+evidence_base_sha == current main HEAD) does the router select
+ROUTE_ALREADY_SATISFIED instead of ROUTE_CONTINUE_LOOP; ``main_drift``
+missing (freshness undecidable) or any condition failing falls back to the
+ordinary ROUTE_CONTINUE_LOOP -- the pre-#2607 REQUEST_CHANGES behavior is
+byte-identical when ``already_satisfied_evidence`` is absent.
+ROUTE_ALREADY_SATISFIED is a pure result-structuring route: it never
+performs (and this module never gains the ability to perform) any PR/Issue
+close mutation itself -- see the module-level "no gh, git, network, or
+subprocess calls" invariant above, which this route does not weaken.
+
 RouteDecision fields
 ---------------------
 route:            one of the ROUTE_* constants below
@@ -72,6 +99,7 @@ from typing import Any, Iterable, Literal, Mapping
 
 ROUTE_APPROVED = "approved"
 ROUTE_CONTINUE_LOOP = "continue_loop"
+ROUTE_ALREADY_SATISFIED = "already_satisfied"
 ROUTE_TO_UPDATE_BRANCH = "route_to_update_branch"
 ROUTE_SCOPE_CLEAN_RECONCILIATION = "route_scope_clean_reconciliation"
 ROUTE_STALE_HEAD_REREVIEW = "route_stale_head_rereview"
@@ -284,6 +312,7 @@ class RouteDecision:
     route: Literal[
         "approved",
         "continue_loop",
+        "already_satisfied",
         "route_to_update_branch",
         "route_scope_clean_reconciliation",
         "route_stale_head_rereview",
@@ -532,6 +561,83 @@ def _classify_implementation_main_drift(
         return None
 
 
+# ---------------------------------------------------------------------------
+# Issue #2607: already_satisfied terminal route (Step 5 recovery path).
+# ---------------------------------------------------------------------------
+
+
+def _already_satisfied_decision() -> RouteDecision:
+    """Build the ROUTE_ALREADY_SATISFIED RouteDecision.
+
+    Structuring only -- see module docstring: this router never performs
+    the PR/Issue close mutation itself, only recommends it. `pr.action:
+    close` is used here (not `none`) because this route is only reachable
+    from the Step 5 recovery path, where the PR already exists (the
+    early-exit `pr.action: none` variant belongs to preparation.md's
+    pre-dispatch choke point, which runs before any PR/reviewer_verdict
+    exists and therefore never calls this router at all).
+    """
+    return _decision(
+        ROUTE_ALREADY_SATISFIED,
+        reason_code="already_satisfied_no_meaningful_pr_delta",
+        selected_action={
+            "kind": "already_satisfied",
+            "result": {
+                "status": "no_change_required",
+                "termination_reason": "already_satisfied",
+                "merge_ready": False,
+            },
+            "recommendation": {
+                "pr": {"action": "close", "reason": "no_meaningful_delta"},
+                "issue": {
+                    "action": "close",
+                    "state_reason": "completed",
+                    "reason": "requirement_already_delivered",
+                },
+            },
+        },
+    )
+
+
+def _evaluate_already_satisfied(live_mergeability: Mapping[str, Any]) -> RouteDecision | None:
+    """Return ROUTE_ALREADY_SATISFIED iff all four AC2 conditions hold given
+    a REQUEST_CHANGES verdict, else None (caller falls back to
+    ROUTE_CONTINUE_LOOP -- byte-identical to pre-#2607 behavior).
+
+    Deliberately reads ONLY `already_satisfied_evidence` (a caller-supplied
+    fact triple) and `main_drift.current_base_sha` (freshness comparator,
+    #2102 reuse). It never reads `reviewer_verdict["blockers"]` free text
+    (AC4) and never requires `reviewed_head_sha == live head_sha` (AC3 --
+    that equality check is specific to the APPROVE stale-head path and is
+    not part of this evaluation).
+    """
+    evidence = live_mergeability.get("already_satisfied_evidence")
+    if not isinstance(evidence, Mapping):
+        return None
+
+    base_ac_satisfied = evidence.get("base_ac_satisfied")
+    meaningful_pr_delta = evidence.get("meaningful_pr_delta")
+    evidence_base_sha = evidence.get("evidence_base_sha")
+
+    if base_ac_satisfied is not True or meaningful_pr_delta is not False:
+        return None
+    if not isinstance(evidence_base_sha, str) or not _MAIN_DRIFT_SHA.fullmatch(evidence_base_sha):
+        return None
+
+    # Co-occurrence requirement (Issue #2607 Evidence producers section):
+    # main_drift missing means freshness is undecidable -> stale evidence,
+    # not eligible (falls back to continue_loop, not a schema error).
+    main_drift = live_mergeability.get("main_drift")
+    if not isinstance(main_drift, Mapping):
+        return None
+
+    current_base_sha = main_drift.get("current_base_sha")
+    if evidence_base_sha != current_base_sha:
+        return None
+
+    return _already_satisfied_decision()
+
+
 def _reconciliation_decision(drift: MainDriftDecision) -> RouteDecision:
     return _decision(
         ROUTE_SCOPE_CLEAN_RECONCILIATION,
@@ -580,7 +686,11 @@ def route_loop_verdict_v2(
        merge_state_status == "DIRTY") is evaluated BEFORE any reviewer
        verdict is inspected, and hard-stops regardless of verdict.
     3. Reviewer verdict dispatch (HUMAN_REVIEW_REQUIRED / REQUEST_CHANGES /
-       APPROVE).
+       APPROVE). For REQUEST_CHANGES, an already_satisfied_evidence check
+       (Issue #2607) runs first: only when base_ac_satisfied is True,
+       meaningful_pr_delta is False, and evidence_base_sha matches
+       live_mergeability["main_drift"]["current_base_sha"] does this select
+       ROUTE_ALREADY_SATISFIED instead of ROUTE_CONTINUE_LOOP.
     4. For APPROVE: blockers must be empty; a stale reviewed_head_sha routes
        to re-review rather than dispatching any action; otherwise live
        mergeability determines approved / update_branch / deferred-to-CI /
@@ -656,6 +766,9 @@ def route_loop_verdict_v2(
         )
 
     if verdict_str == "REQUEST_CHANGES":
+        already_satisfied = _evaluate_already_satisfied(live_mergeability)
+        if already_satisfied is not None:
+            return already_satisfied
         return _decision(ROUTE_CONTINUE_LOOP)
 
     # verdict_str == "APPROVE" from here on (validated above).

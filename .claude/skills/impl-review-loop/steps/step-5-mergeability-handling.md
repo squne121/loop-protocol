@@ -153,7 +153,8 @@ Issue #1870（#1856）: `route_loop_verdict_v2()` は `test_verdict` を一切�
 | `route` | 意味 | 次アクション |
 |---|---|---|
 | `approved` | `APPROVE` かつ mergeable/merge_state_status が `MERGEABLE`/`CLEAN` または `MERGEABLE`/`HAS_HOOKS` | 終了（approved）。`step-5-feedback-and-termination.md` の残り gate を確認 |
-| `continue_loop` | `REQUEST_CHANGES`（actual conflict がない場合） | 次イテレーションへ（blockers を fix_delta に） |
+| `continue_loop` | `REQUEST_CHANGES`（actual conflict がない場合。`already_satisfied_evidence` 未提供、または下記 `already_satisfied` の 4 条件のいずれかが不成立） | 次イテレーションへ（blockers を fix_delta に） |
+| `already_satisfied` | `REQUEST_CHANGES` かつ `live_mergeability.already_satisfied_evidence.base_ac_satisfied == true` かつ `meaningful_pr_delta == false` かつ `evidence_base_sha` が `live_mergeability.main_drift.current_base_sha` と一致（#2607。下記「already_satisfied recovery route（Step 5）」参照） | 終了。`decision.selected_action` の `result`/`recommendation` を `SKILL.md` の Already-Satisfied Recommendation Structure に従って報告。PR/Issue の close は control-plane・router のいずれも実行しない |
 | `route_stale_head_rereview` | `APPROVE` かつ `reviewed_head_sha != live head_sha`（actual conflict がない場合） | Step 4 を現在の head で再委譲し、Step 5 を最初からやり直す |
 | `route_to_update_branch` | `APPROVE` かつ `merge_state_status == BEHIND` | 下記「BEHIND 分岐 routing」参照 |
 | `route_human_escalation` | `HUMAN_REVIEW_REQUIRED`（actual conflict がない場合） | 人間判断を仰いで停止（`termination_reason: human_escalation`）。max iteration 到達や secret/protected-path 等の実 hard gate と合わせて、正当な human stop 理由の一つ |
@@ -165,6 +166,28 @@ Issue #1870（#1856）: `route_loop_verdict_v2()` は `test_verdict` を一切�
 `merge_state_status == DIRTY` の場合のみであり、この判定は reviewer verdict（`REQUEST_CHANGES` /
 `HUMAN_REVIEW_REQUIRED` を含む）より必ず先に評価される。`DRAFT` は Issue #1873 の Delivery Rule が
 Draft PR を要求しているため、単独では human escalation の理由にしない。
+
+## already_satisfied recovery route（Step 5、#2607）
+
+`already_satisfied` は `preparation.md` の `0-a-1. Already-Satisfied Early-Exit choke point` とは責務が分離した **別経路**（recovery route）である。両者の呼び出し順序・責務分離は以下のとおり:
+
+| 経路 | 発火位置 | 前提 | `recommendation.pr.action` |
+|---|---|---|---|
+| early-exit（`preparation.md` 0-a-1） | Step 1 起動前（implementation-worker dispatch 前） | PR 未作成 | `none`（`reason: no_pr_created`） |
+| recovery route（本節、`route_loop_verdict_v2()`） | Step 5（PR 既存、`REQUEST_CHANGES` verdict 受信後） | PR 既存 | `close`（`reason: no_meaningful_delta`） |
+
+recovery route は early-exit が不発だった（PR が既に作成された）場合にのみ到達しうる後続の safety net であり、early-exit の再実行ではない。両者は同一サイクル内で二重に発火しない（early-exit は PR 未作成時のみ評価され、recovery route は PR 既存時のみ評価されるため、条件が排他的）。
+
+control-plane は Step 5 の通常 `live_mergeability` 構築（`build_step5_live_mergeability()`）に加えて、`already_satisfied_evidence` を独立に構築する場合のみ以下を `live_mergeability` へ追加する（未構築なら追加しない。追加しなければ `route_loop_verdict_v2()` は従来どおり `continue_loop` を返す）:
+
+```yaml
+already_satisfied_evidence:
+  base_ac_satisfied: <bool>     # current main HEAD に対する独立 TEST_VERDICT_MACHINE/v2 が全 AC PASS
+  meaningful_pr_delta: <bool>   # base 実行と直近 PR head 実行の runtime_ac_results PASS 集合比較
+  evidence_base_sha: <sha>      # base 実行時点の current main HEAD SHA
+```
+
+`evidence_base_sha` の freshness は `main_drift.current_base_sha`（Issue #2102、既存の main-drift facts）と比較される。`main_drift` を省略した場合、`already_satisfied_evidence` を渡しても freshness 判定不能として `already_satisfied` は成立しない（`continue_loop` へフォールバック）。
 
 ## BEHIND 分岐 routing
 
