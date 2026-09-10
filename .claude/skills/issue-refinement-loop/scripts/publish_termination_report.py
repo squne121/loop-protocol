@@ -82,6 +82,191 @@ CONTROLLED_SKILL_MUTATION_EXEC_SCRIPT = _AGENT_GUARDS_DIR / "controlled_skill_mu
 # Artifact directory relative to cwd (or absolute via env var)
 ARTIFACT_DIR = Path(os.environ.get("PUBLISH_ARTIFACT_DIR", "artifacts"))
 
+# Issue #1908: this is a mode of the existing controlled publisher, not a new
+# GitHub transport.  The identity and marker are deliberately self-contained
+# in the new human-history comment so legacy machine-readable comments retain
+# their target, marker, payload, and consumers unchanged.
+_HUMAN_HISTORY_FIELDS = (
+    "loop_kind", "phase", "source_issue_number", "target_kind", "target_number",
+    "route_or_termination_reason", "reviewed_ref",
+)
+_HUMAN_HISTORY_REASONS = frozenset({
+    "completed", "needs_fix", "human_judgment", "binding_missing", "binding_ambiguous",
+    "binding_wrong_repo", "binding_gone", "head_drift", "human_escalation",
+})
+_HUMAN_HISTORY_MARKER_PREFIX = "<!-- loop-protocol/human-history:v1:sha256:"
+_HUMAN_HISTORY_MARKER_RE = __import__("re").compile(
+    r"^<!-- loop-protocol/human-history:v1:sha256:[0-9a-f]{64} -->$"
+)
+_HUMAN_HISTORY_ISSUE_REF_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
+_HUMAN_HISTORY_PR_REF_RE = __import__("re").compile(r"^refs/pull/([1-9][0-9]*)/head@([0-9a-f]{40})$")
+_HUMAN_HISTORY_HEAD_SHA_RE = __import__("re").compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
+_SECRET_OR_UNSAFE_RE = __import__("re").compile(
+    r"(?:"
+    r"gh[porsu]_[A-Za-z0-9]{16,}"
+    r"|github_pat_[A-Za-z0-9_]{16,}"
+    r"|authorization:\s*bearer"
+    r"|(?:^|\s)/[^\s]+"
+    # Windows drive-absolute path (e.g. C:\Users\...).
+    r"|[A-Za-z]:\\\S+"
+    # UNC path (e.g. \\server\share\...).
+    r"|\\\\\S+\\\S+"
+    # Explicit credential assignment (password=, api_key:, token=, ...).
+    r"|(?:password|passwd|pwd|api[_-]?key|secret|access[_-]?key|token)\s*[:=]\s*\S+"
+    r")",
+    __import__("re").I,
+)
+
+
+def _human_history_jcs(identity: dict) -> bytes:
+    """The identity value domain is ASCII-only, so sorted compact JSON is the
+    RFC 8785 JCS representation for this fixed object shape."""
+    return json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _validate_human_history_identity(identity: object) -> tuple[dict | None, str]:
+    if not isinstance(identity, dict) or set(identity) != set(_HUMAN_HISTORY_FIELDS):
+        return None, "human_history_identity_key_set_invalid"
+    normalized = {name: identity[name] for name in _HUMAN_HISTORY_FIELDS}
+    for field in ("loop_kind", "phase", "target_kind", "route_or_termination_reason", "reviewed_ref"):
+        if not isinstance(normalized[field], str):
+            return None, f"human_history_identity_type_invalid:{field}"
+    for field in ("source_issue_number", "target_number"):
+        if type(normalized[field]) is not int or normalized[field] <= 0:
+            return None, f"human_history_identity_type_invalid:{field}"
+    loop = normalized["loop_kind"]
+    phase = normalized["phase"]
+    target_kind = normalized["target_kind"]
+    reason = normalized["route_or_termination_reason"]
+    if loop not in {"issue-refinement-loop", "impl-review-loop"} or reason not in _HUMAN_HISTORY_REASONS:
+        return None, "human_history_identity_literal_invalid"
+    valid = {
+        ("issue-refinement-loop", "review-complete", "issue"): {"completed", "needs_fix", "human_judgment"},
+        ("impl-review-loop", "pre-PR-binding", "issue"): {"completed", "needs_fix", "human_judgment"},
+        (
+            "impl-review-loop", "binding-validation", "issue"
+        ): {"binding_missing", "binding_ambiguous", "binding_wrong_repo", "binding_gone"},
+        ("impl-review-loop", "post-PR-binding", "pull_request"): {"completed", "needs_fix", "human_judgment"},
+        ("impl-review-loop", "post-PR-head-drift", "pull_request"): {"head_drift"},
+        ("impl-review-loop", "conflict-resolution", "issue"): {"human_escalation"},
+        ("impl-review-loop", "conflict-resolution", "pull_request"): {"human_escalation"},
+    }
+    if reason not in valid.get((loop, phase, target_kind), set()):
+        return None, "human_history_identity_matrix_combination_invalid"
+    if target_kind == "issue":
+        if normalized["target_number"] != normalized["source_issue_number"]:
+            return None, "human_history_issue_target_number_mismatch"
+        if not _HUMAN_HISTORY_ISSUE_REF_RE.fullmatch(normalized["reviewed_ref"]):
+            return None, "human_history_issue_reviewed_ref_invalid"
+    else:
+        reference = _HUMAN_HISTORY_PR_REF_RE.fullmatch(normalized["reviewed_ref"])
+        if reference is None or int(reference.group(1)) != normalized["target_number"]:
+            return None, "human_history_pr_reviewed_ref_invalid"
+    return normalized, ""
+
+
+def _validate_public_safe_human_text(value: object, field: str) -> tuple[str | None, str]:
+    if not isinstance(value, str) or not value.strip() or "```" in value or _SECRET_OR_UNSAFE_RE.search(value):
+        return None, f"human_history_public_safe_text_invalid:{field}"
+    return value.strip(), ""
+
+
+def render_human_history_comment(
+    *, identity: object, result: object, evidence_refs: object, recommended_action: object,
+    recommended_reason: object, impact_if_unaddressed: object, stale_evidence: object = None,
+) -> tuple[dict | None, str]:
+    """Build a public-safe Japanese human-history body and stable marker."""
+    value, error = _validate_human_history_identity(identity)
+    if error:
+        return None, error
+    assert value is not None
+    text_values: dict[str, str] = {}
+    for name, raw in {
+        "result": result, "recommended_action": recommended_action,
+        "recommended_reason": recommended_reason, "impact_if_unaddressed": impact_if_unaddressed,
+    }.items():
+        clean, text_error = _validate_public_safe_human_text(raw, name)
+        if text_error:
+            return None, text_error
+        assert clean is not None
+        text_values[name] = clean
+    if not isinstance(evidence_refs, list) or not evidence_refs:
+        return None, "human_history_evidence_refs_invalid"
+    evidence: list[str] = []
+    for item in evidence_refs:
+        clean, text_error = _validate_public_safe_human_text(item, "evidence_ref")
+        if text_error:
+            return None, text_error
+        assert clean is not None
+        evidence.append(clean)
+    stale_line = ""
+    is_head_drift = value["phase"] == "post-PR-head-drift"
+    if is_head_drift and stale_evidence is None:
+        return None, "human_history_head_drift_stale_evidence_missing"
+    if stale_evidence is not None:
+        clean, text_error = _validate_public_safe_human_text(stale_evidence, "stale_evidence")
+        if text_error:
+            return None, text_error
+        # The controlled executor makes the authoritative direct PR-head read
+        # immediately before its create/PATCH/noop decision.  Require exactly
+        # one public-safe latest-head value here so a diagnostic can be
+        # reconciled under its existing stable identity rather than using an
+        # unbound prose-only stale transition.
+        if is_head_drift and len(_HUMAN_HISTORY_HEAD_SHA_RE.findall(clean)) != 1:
+            return None, "human_history_head_drift_stale_evidence_head_invalid"
+        stale_line = f"\n- stale evidence: {clean}"
+    identity_sha256 = hashlib.sha256(_human_history_jcs(value)).hexdigest()
+    marker = f"{_HUMAN_HISTORY_MARKER_PREFIX}{identity_sha256} -->"
+    body = (
+        "## review loop の作業履歴\n\n"
+        f"- 実施内容: {text_values['result']}\n"
+        f"- phase: {value['phase']}\n"
+        f"- reviewed_ref: {value['reviewed_ref']}\n"
+        f"- 推奨アクション: {text_values['recommended_action']}\n"
+        f"- 推奨する理由: {text_values['recommended_reason']}\n"
+        f"- 対応しない場合の影響: {text_values['impact_if_unaddressed']}\n"
+        f"- evidence refs: {'; '.join(evidence)}{stale_line}\n\n{marker}\n"
+    )
+    return {
+        "body": body,
+        "marker": marker,
+        "identity": value,
+        "identity_sha256": identity_sha256,
+    }, ""
+
+
+def publish_human_history(
+    *, target_number: int, repo: str, identity: object, result: object, evidence_refs: object,
+    recommended_action: object, recommended_reason: object, impact_if_unaddressed: object,
+    stale_evidence: object = None, dry_run: bool = False, receipt: dict | None = None,
+) -> int:
+    """Publish one human-history event through existing issue_comment.publish.
+
+    `receipt`, when passed a mutable dict, is populated with the controlled
+    executor's structured CONTROLLED_SKILL_MUTATION_RESULT_V1 fields
+    (including the raw `status_detail`, e.g. `created` / `updated` /
+    `already_published` / `dry_run_ok`) so a caller can assert on the actual
+    remote operation semantics rather than only the int exit code (Issue
+    #1908 fix_delta HIGH-2). The exit code remains the success/failure
+    transport contract; it is unchanged for callers that don't pass
+    `receipt`.
+    """
+    rendered, error = render_human_history_comment(
+        identity=identity, result=result, evidence_refs=evidence_refs,
+        recommended_action=recommended_action, recommended_reason=recommended_reason,
+        impact_if_unaddressed=impact_if_unaddressed, stale_evidence=stale_evidence,
+    )
+    if error or rendered is None:
+        _record_artifact(issue_number=target_number, reason_code=error or "human_history_render_failed")
+        return 1
+    if type(target_number) is not int or target_number <= 0 or rendered["identity"]["target_number"] != target_number:
+        _record_artifact(issue_number=target_number, reason_code="human_history_target_binding_invalid")
+        return 1
+    return _post_github_comment(
+        issue_number=target_number, body=rendered["body"], repo=repo, marker=rendered["marker"],
+        dry_run=dry_run, receipt=receipt,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Artifact logging (fail-closed: logs to local file, never leaks body to stderr)
@@ -130,7 +315,15 @@ def _record_artifact(
 # GitHub comment posting (fail-closed)
 # ---------------------------------------------------------------------------
 
-def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
+def _post_github_comment(
+    *,
+    issue_number: int,
+    body: str,
+    repo: str,
+    marker: str | None = None,
+    dry_run: bool = False,
+    receipt: dict | None = None,
+) -> int:
     """
     Post body as a GitHub issue comment via the issue_comment.publish
     controlled mutation lane (Issue #1633).
@@ -147,21 +340,32 @@ def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
     directly from this module).
     Enforces a 30-second timeout; on timeout fails closed.
 
+    `dry_run` forwards --dry-run to the controlled executor (validate/render
+    only, no remote mutation). `receipt`, when a mutable dict is passed, is
+    populated with the executor's parsed CONTROLLED_SKILL_MUTATION_RESULT_V1
+    JSON (requested via --json) so a caller can read the raw `status_detail`
+    (Issue #1908 fix_delta HIGH-2) instead of only the exit code.
+
     Returns the executor's exit code (0 on success, -1 on timeout, or the
     executor's nonzero exit on failure).
     """
-    exec_marker = os.environ.get("CONTROLLED_EXEC_MARKER", "")
-    if exec_marker:
-        marker = f"<!-- CONTROLLED_EXEC_MARKER:{exec_marker} -->"
+    if marker is None:
+        exec_marker = os.environ.get("CONTROLLED_EXEC_MARKER", "")
+        if exec_marker:
+            marker = f"<!-- CONTROLLED_EXEC_MARKER:{exec_marker} -->"
+        else:
+            # Issue #1639 fix_delta P1-2: the fallback marker must not collide
+            # across different repos/issues that happen to share identical body.
+            fallback_seed = f"{repo}\x00{issue_number}\x00{body}".encode("utf-8")
+            content_hash = hashlib.sha256(fallback_seed).hexdigest()[:32]
+            marker = f"<!-- CONTROLLED_EXEC_MARKER:{content_hash} -->"
+        comment_body = body + f"\n{marker}"
     else:
-        # Issue #1639 fix_delta P1-2: the fallback marker must not collide
-        # across different repos/issues that happen to share identical body
-        # content -- hash repo + issue_number + body (NUL-separated to avoid
-        # ambiguous concatenation), not body alone.
-        fallback_seed = f"{repo}\x00{issue_number}\x00{body}".encode("utf-8")
-        content_hash = hashlib.sha256(fallback_seed).hexdigest()[:32]
-        marker = f"<!-- CONTROLLED_EXEC_MARKER:{content_hash} -->"
-    comment_body = body + f"\n{marker}"
+        # #1908 passes its stable identity marker intact to the existing bridge;
+        # adding a legacy marker would alter the new comment's digest semantics.
+        if marker not in body:
+            return 1
+        comment_body = body
 
     request = build_isolation_issue_comment_request(
         issue_number=issue_number, repo=repo, comment_body=comment_body, marker=marker,
@@ -184,8 +388,16 @@ def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
         "--issue-number", str(issue_number),
         "--input-file", materialized_rel_path,
         "--repo", repo,
+        "--json",
     ]
+    if dry_run:
+        cmd.append("--dry-run")
     env = os.environ.copy()
+    # The controlled lane binds its CLI number to the *comment target*.  A PR
+    # history event legitimately carries a distinct source Issue identity, so
+    # an inherited source-issue session binding must not mis-bind this target.
+    if marker.startswith(_HUMAN_HISTORY_MARKER_PREFIX):
+        env.pop("LOOP_ISSUE_NUMBER", None)
     env["GH_PROMPT_DISABLED"] = "1"
     env.setdefault("GH_NO_UPDATE_NOTIFIER", "1")
     try:
@@ -205,6 +417,14 @@ def _post_github_comment(*, issue_number: int, body: str, repo: str) -> int:
             file=sys.stderr,
         )
         return -1
+
+    if receipt is not None:
+        try:
+            parsed_receipt = json.loads(proc.stdout)
+        except (json.JSONDecodeError, TypeError):
+            parsed_receipt = None
+        if isinstance(parsed_receipt, dict):
+            receipt.update(parsed_receipt)
 
     if proc.returncode != 0:
         print(
@@ -252,6 +472,98 @@ def publish(
 
 
 # ---------------------------------------------------------------------------
+# Human-history production entrypoint (Issue #1908 fix_delta BLOCKER)
+#
+# This is the exact, single production call site that turns a structured
+# HUMAN_HISTORY_PUBLISH_REQUEST_V1 request into publish_human_history() ->
+# render_human_history_comment() -> the existing issue_comment.publish
+# controlled lane. It is not a second publisher, event_ledger, run_id_store,
+# or hook -- it dispatches to the same publish_human_history() any other
+# caller uses. It never replaces or bypasses the legacy plain
+# --issue-number/--repo/--body-file mode below.
+# ---------------------------------------------------------------------------
+
+_HUMAN_HISTORY_REQUEST_SCHEMA = "HUMAN_HISTORY_PUBLISH_REQUEST_V1"
+_HUMAN_HISTORY_REQUEST_REQUIRED_KEYS = frozenset({
+    "identity", "result", "evidence_refs", "recommended_action", "recommended_reason",
+    "impact_if_unaddressed",
+})
+_HUMAN_HISTORY_REQUEST_OPTIONAL_KEYS = frozenset({"stale_evidence"})
+
+
+def _run_human_history_request_cli(*, request_path: str, repo: str, dry_run: bool) -> int:
+    """CLI-facing production entrypoint for a HUMAN_HISTORY_PUBLISH_REQUEST_V1
+    JSON file. Reads/validates the structured request, then calls
+    publish_human_history() exactly as any other production caller would.
+
+    Prints a single-line JSON receipt (status_detail / exit_code only --
+    never the rendered body) to stdout so a subprocess caller (including a
+    test harness) can assert on the actual controlled-lane outcome.
+
+    Exit codes:
+        0 - publish_human_history() succeeded (including dry-run validation)
+        1 - publish_human_history() failed (fail-closed)
+        2 - usage error: request file missing/unreadable/malformed
+    """
+    try:
+        raw = Path(request_path).read_text(encoding="utf-8")
+    except Exception as exc:
+        print(f"[publish_termination_report] failed to read human-history request file: {exc}", file=sys.stderr)
+        return 2
+    try:
+        request = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"[publish_termination_report] human-history request file is not valid JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(request, dict):
+        print("[publish_termination_report] human-history request must be a JSON object", file=sys.stderr)
+        return 2
+
+    keys = set(request)
+    missing = _HUMAN_HISTORY_REQUEST_REQUIRED_KEYS - keys
+    unknown = keys - _HUMAN_HISTORY_REQUEST_REQUIRED_KEYS - _HUMAN_HISTORY_REQUEST_OPTIONAL_KEYS
+    if missing or unknown:
+        print(
+            f"[publish_termination_report] human-history request key set invalid "
+            f"(missing={sorted(missing)}, unknown={sorted(unknown)})",
+            file=sys.stderr,
+        )
+        return 2
+
+    identity = request["identity"]
+    if not isinstance(identity, dict):
+        print("[publish_termination_report] human-history request identity must be an object", file=sys.stderr)
+        return 2
+    target_number = identity.get("target_number")
+    if type(target_number) is not int or target_number <= 0:
+        print("[publish_termination_report] human-history request identity.target_number is invalid", file=sys.stderr)
+        return 2
+
+    receipt: dict = {}
+    exit_code = publish_human_history(
+        target_number=target_number,
+        repo=repo,
+        identity=identity,
+        result=request["result"],
+        evidence_refs=request["evidence_refs"],
+        recommended_action=request["recommended_action"],
+        recommended_reason=request["recommended_reason"],
+        impact_if_unaddressed=request["impact_if_unaddressed"],
+        stale_evidence=request.get("stale_evidence"),
+        dry_run=dry_run,
+        receipt=receipt,
+    )
+    status_detail = receipt.get("status_detail")
+    print(
+        f"[publish_termination_report] human-history publish exit={exit_code} status_detail={status_detail!r}",
+        file=sys.stderr,
+    )
+    # routing-relevant fields only -- never the rendered comment body.
+    print(json.dumps({"status_detail": status_detail, "exit_code": exit_code}, ensure_ascii=False))
+    return 0 if exit_code == 0 else 1
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -263,8 +575,8 @@ def main() -> int:
     parser.add_argument(
         "--issue-number",
         type=int,
-        required=True,
-        help="GitHub issue number to comment on",
+        default=None,
+        help="GitHub issue number to comment on (legacy plain-body mode)",
     )
     parser.add_argument(
         "--repo",
@@ -276,9 +588,38 @@ def main() -> int:
         "--body-file",
         type=str,
         default=None,
-        help="Path to a plain markdown body file (default: stdin)",
+        help="Path to a plain markdown body file (default: stdin; legacy plain-body mode)",
+    )
+    parser.add_argument(
+        "--human-history-request-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a HUMAN_HISTORY_PUBLISH_REQUEST_V1 JSON file (Issue #1908 "
+            "production entrypoint). Mutually exclusive with legacy plain-body mode."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate/render the human-history request without posting (forwarded to the controlled executor)",
     )
     args = parser.parse_args()
+
+    if args.human_history_request_file:
+        return _run_human_history_request_cli(
+            request_path=args.human_history_request_file,
+            repo=args.repo,
+            dry_run=args.dry_run,
+        )
+
+    if args.issue_number is None:
+        print(
+            "[publish_termination_report] --issue-number is required for legacy plain-body mode "
+            "(or pass --human-history-request-file)",
+            file=sys.stderr,
+        )
+        return 2
 
     # Read input
     if args.body_file:
