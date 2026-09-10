@@ -7279,9 +7279,11 @@ def _structural_deadlock_override_eligible(
     All of the following must hold, or this returns False (existing defer
     behavior is preserved):
       1. every item's own `disposition` is `auto_apply_safe`
-      2. no item's `insertion.disposition` is `"ambiguous"` (a producer bug
-         or a hand-crafted/adversarial artifact could otherwise smuggle an
-         unanchorable item through under a false auto_apply_safe summary)
+      2. every item's `insertion.disposition` is exactly `"exact"` (a
+         positive allowlist, not merely "not ambiguous" -- a producer bug,
+         a hand-crafted/adversarial artifact, or a future non-`"ambiguous"`
+         disposition value could otherwise smuggle an unanchorable item
+         through under a false auto_apply_safe summary)
       3. the bundle's own covered targets (whole-section `label`s plus
          Machine-Readable-Contract key names) are EXACTLY the union of
          `required_sections`/`required_contract_keys` (neither more nor
@@ -7309,7 +7311,7 @@ def _structural_deadlock_override_eligible(
         if not isinstance(item, dict) or item.get("disposition") != STRUCT_DISPOSITION_AUTO_APPLY_SAFE:
             return False
         insertion = item.get("insertion")
-        if not isinstance(insertion, dict) or insertion.get("disposition") == "ambiguous":
+        if not isinstance(insertion, dict) or insertion.get("disposition") != "exact":
             return False
         field_id = item.get("field_id")
         if isinstance(field_id, str) and field_id.startswith("machine-readable-contract."):

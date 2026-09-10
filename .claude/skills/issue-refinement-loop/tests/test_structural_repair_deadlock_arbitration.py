@@ -716,6 +716,46 @@ class TestDirectOverrideEligibilityUnit:
             [],
         ) is False
 
+    def test_unknown_future_insertion_disposition_never_eligible(self) -> None:
+        """Issue #2603 P2 fix: the `insertion.disposition` check must be a
+        POSITIVE allowlist (`== "exact"`), not merely `!= "ambiguous"`.
+        Direct-call coverage here bypasses schema validation (which today
+        only accepts `exact`/`ambiguous`) so that a hypothetical future
+        non-`"ambiguous"` disposition value is proven rejected by the
+        predicate itself, independent of whatever the current schema's enum
+        happens to allow."""
+        bundle = self._bundle(
+            items=[
+                {
+                    "field_id": "quality-decision-record",
+                    "label": "Quality Decision Record",
+                    "disposition": "auto_apply_safe",
+                    "insertion": {"disposition": "partial"},
+                },
+                self._safe_item("Child Issues", "child-issues"),
+                self._safe_item("Remaining Parent Gaps", "remaining-parent-gaps"),
+            ]
+        )
+        assert wrapper._structural_deadlock_override_eligible(
+            bundle, ["missing_required_section"], list(_PARENT_TARGET_SECTIONS), []
+        ) is False
+
+        bundle_alt = self._bundle(
+            items=[
+                {
+                    "field_id": "quality-decision-record",
+                    "label": "Quality Decision Record",
+                    "disposition": "auto_apply_safe",
+                    "insertion": {"disposition": "unknown_future_value"},
+                },
+                self._safe_item("Child Issues", "child-issues"),
+                self._safe_item("Remaining Parent Gaps", "remaining-parent-gaps"),
+            ]
+        )
+        assert wrapper._structural_deadlock_override_eligible(
+            bundle_alt, ["missing_required_section"], list(_PARENT_TARGET_SECTIONS), []
+        ) is False
+
 
 class TestStructuralDeadlockEligibleBlockerUnit:
     """Direct unit coverage of the shared `_structural_deadlock_eligible_blocker()`
