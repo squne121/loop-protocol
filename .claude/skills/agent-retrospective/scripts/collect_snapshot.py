@@ -126,6 +126,24 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _parse_iso8601(value: str) -> datetime | None:
+    """Issue #2601 PR #2612 fix_delta (OWNER REQUEST_CHANGES Finding 1/2):
+    best-effort ISO-8601 parse used by the window-bound filters below.
+    Returns ``None`` (never raises) on an unparseable value -- callers treat
+    that as "membership in the window cannot be determined", never as a
+    fabricated in-window/out-of-window verdict."""
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _digest(records: Any) -> str:
     canonical = json.dumps(records, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -320,6 +338,7 @@ def collect_claude_code_source(
     session_paths: Sequence[Path],
     *,
     source_id: str = "claude_code",
+    known_source_nonempty: bool = False,
     clock: Callable[[], datetime] = _utcnow,
 ) -> CollectorResult:
     """Collect Claude Code session evidence from `session_paths` (JSONL
@@ -337,6 +356,24 @@ def collect_claude_code_source(
     (`malformed_response`) even though usable records exist (PR #2269
     hardening: a prior asymmetry allowed malformed evidence to be silently
     absorbed whenever at least one valid record was present).
+
+    ``known_source_nonempty`` (Issue #2601 PR #2612 fix_delta Finding 1):
+    the ORCHESTRATION layer (``run_retrospective.collect_session_sources``)
+    now window-filters ``session_paths`` before calling this adapter
+    (``--since-last-retrospective`` watermark). An empty ``session_paths``
+    is therefore ambiguous on its own: it could mean "this source has never
+    recorded ANY evidence" (AC2's false-green state -- stays `unavailable`,
+    the prior/default behavior when this flag is omitted), or it could mean
+    "this source genuinely has evidence, a window filter just narrowed
+    selection to zero THIS run" (AC4's "coverage complete, 0 selected" --
+    the expected STEADY-STATE result once no new sessions have occurred
+    since the last checkpoint). The caller, which already knows whether its
+    OWN unfiltered glob was non-empty, disambiguates by passing this flag;
+    an empty ``session_paths`` together with ``known_source_nonempty=True``
+    is reported as `complete` with 0 sessions rather than `unavailable`. A
+    non-empty ``session_paths`` with no parseable content (e.g. every line
+    malformed) is UNAFFECTED by this flag -- that remains `unavailable`,
+    a genuine content problem unrelated to window scoping.
     """
     fetch_started_at = _iso(clock())
     normalized: list[dict[str, Any]] = []
@@ -374,7 +411,9 @@ def collect_claude_code_source(
         )
 
     fetch_completed_at = _iso(clock())
-    if not normalized:
+    if not session_paths and known_source_nonempty:
+        status, pagination, reason = "complete", "complete", None
+    elif not normalized:
         status, pagination, reason = "unavailable", "unknown", None
     elif malformed_line_count > 0:
         status, pagination, reason = "partial", "partial", "malformed_response"
@@ -397,7 +436,11 @@ def collect_claude_code_source(
             "provenance": {"session_count": len(session_paths), "sessions_read": sessions_read},
             "diagnostics": {
                 "malformed_line_count": malformed_line_count,
-                "reason_code": reason if reason else (None if normalized else "source_not_present"),
+                "reason_code": (
+                    "window_narrowed_to_zero"
+                    if (not session_paths and known_source_nonempty)
+                    else (reason if reason else (None if normalized else "source_not_present"))
+                ),
             },
         },
     )
@@ -480,7 +523,9 @@ def _load_transport_log_module():
 def collect_claude_gpt_source(
     hook_sink_path: Path,
     *,
-    run_nonce: str,
+    run_nonce: str | None = None,
+    min_completed_at: str | None = None,
+    max_completed_at: str | None = None,
     transport_log_path: Path | None = None,
     source_id: str = "claude_gpt",
     clock: Callable[[], datetime] = _utcnow,
@@ -498,16 +543,79 @@ def collect_claude_gpt_source(
     A source with malformed hook-sink lines alongside otherwise-complete
     session pairing no longer reports `complete` -- see the module docstring
     (PR #2269 hardening).
+
+    ``run_nonce``, when explicitly supplied, keeps the PRIOR strict-match
+    behavior (only records whose own recorded ``run_nonce`` equals it are
+    correlated) -- for a caller that already knows the specific launch nonce
+    it wants (e.g. the currently-running launch's own nonce). When omitted
+    (``None``, the default), the correlation nonce is instead AUTO-DERIVED
+    from the sink's own content (Issue #2601 PR #2612 fix_delta, OWNER
+    REQUEST_CHANGES Finding 2: a caller looking BACKWARD at a past launch's
+    evidence -- e.g. ``--since-last-retrospective`` -- never itself minted
+    that launch's nonce and must not be required to guess it). Each
+    hook-sink file is created per-launch with a single launcher-baked nonce
+    baked into both its filename (``launch.sh``'s ``hook-sink-<nonce>.jsonl``)
+    and every record it contains, so the (post-window-filter) file's own
+    single, uniform ``run_nonce`` value IS that launch's real identity. A
+    file whose in-window records carry more than one distinct ``run_nonce``
+    violates that one-file-one-launch invariant and is treated as
+    unresolvable (fail closed -- never silently guesses one).
+
+    ``min_completed_at``/``max_completed_at`` (ISO-8601 strings, optional)
+    restrict correlation to records whose ``ts`` (hook-trigger epoch
+    seconds) falls in ``(min_completed_at, max_completed_at]`` -- the same
+    exclusive-lower/inclusive-upper watermark convention
+    ``run_retrospective.compute_session_window`` uses. A record with an
+    unparseable/missing ``ts`` is excluded once either bound is active
+    (fail closed: window membership is never assumed).
     """
     fetch_started_at = _iso(clock())
     try:
-        records, malformed_line_count = _parse_hook_sink(hook_sink_path)
+        all_records, malformed_line_count = _parse_hook_sink(hook_sink_path)
     except _AdapterOperationalError as exc:
         return _operational_result(
             source_type="runtime", source_id=source_id, fetch_started_at=fetch_started_at, clock=clock, exc=exc
         )
 
-    nonce_matched = [r for r in records if r.get("run_nonce") == run_nonce]
+    # Issue #2601 PR #2612 fix_delta Finding 2: nonce auto-derivation reads
+    # the FULL (unfiltered) sink content -- the launch identity a file
+    # carries is a property of the FILE, not of which of its timestamps
+    # happen to fall inside THIS run's window.
+    resolved_run_nonce = run_nonce
+    nonce_source = "explicit"
+    if resolved_run_nonce is None:
+        observed_nonces = {r.get("run_nonce") for r in all_records if r.get("run_nonce")}
+        if len(observed_nonces) == 1:
+            resolved_run_nonce = next(iter(observed_nonces))
+            nonce_source = "auto_derived"
+        else:
+            nonce_source = "unresolvable_no_nonce" if not observed_nonces else "unresolvable_ambiguous_nonces"
+
+    nonce_matched_all = (
+        [r for r in all_records if r.get("run_nonce") == resolved_run_nonce] if resolved_run_nonce is not None else []
+    )
+
+    # Issue #2601 PR #2612 fix_delta Finding 1: window bounds are applied
+    # AFTER nonce correlation, to the already-nonce-matched set -- so the
+    # window narrows WHICH of this launch's own records are in scope,
+    # without altering which launch was identified as authoritative.
+    nonce_matched = nonce_matched_all
+    if min_completed_at is not None or max_completed_at is not None:
+        lower = _parse_iso8601(min_completed_at) if min_completed_at else None
+        upper = _parse_iso8601(max_completed_at) if max_completed_at else None
+        windowed_records: list[dict[str, Any]] = []
+        for record in nonce_matched_all:
+            ts = record.get("ts")
+            if not isinstance(ts, (int, float)):
+                continue
+            record_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            if lower is not None and record_dt <= lower:
+                continue
+            if upper is not None and record_dt > upper:
+                continue
+            windowed_records.append(record)
+        nonce_matched = windowed_records
+
     prompt_session_ids = {r.get("session_id") for r in nonce_matched if r.get("event") == "UserPromptSubmit"}
     stop_session_ids = {r.get("session_id") for r in nonce_matched if r.get("event") == "Stop"}
     stop_failure_events = [r for r in nonce_matched if r.get("event") == "StopFailure"]
@@ -518,19 +626,28 @@ def collect_claude_gpt_source(
         "nonce_matched_count": len(nonce_matched),
         "complete_session_count": len(complete_sessions),
         "stop_failure_count": len(stop_failure_events),
+        "nonce_source": nonce_source,
     }
     if transport_log_path is not None:
         transport_module = _load_transport_log_module()
         verdict = transport_module.evaluate_transport_log(str(transport_log_path))
         diagnostics["transport_verdict"] = verdict.to_dict()
 
-    if not records:
+    if not all_records:
         status, pagination, reason = "unavailable", "unknown", "source_not_present"
-    elif not nonce_matched:
+    elif not nonce_matched_all:
         # Records exist but none match this run's nonce -- e.g. only a stale
         # flat-transcript-style artifact from a previous run is present.
         # AC8: presence alone is never sufficient for "complete".
         status, pagination, reason = "unavailable", "unknown", "stale_runtime_evidence"
+    elif not nonce_matched:
+        # Issue #2601 PR #2612 fix_delta Finding 1: this launch's evidence
+        # genuinely exists (`nonce_matched_all` non-empty) but a window
+        # filter narrowed IT to zero records THIS run -- AC4's "coverage
+        # complete, 0 selected", never `unavailable` (that would be AC2's
+        # false-green state, reserved for when this launch's evidence
+        # doesn't exist / doesn't correlate at all).
+        status, pagination, reason = "complete", "complete", None
     elif complete_sessions:
         if malformed_line_count > 0:
             status, pagination, reason = "partial", "partial", "malformed_response"
