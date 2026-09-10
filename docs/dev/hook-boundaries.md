@@ -360,6 +360,293 @@ hook_boundaries_manifest_v1:
       `reason_code: deprecated_legacy_root_write` として advisory 対象に追加する一方、read / scan / report / delete
       （`.claude/tmp/**` を含む）は妨げない。`temp_residue_marker.py` / `temp_residue_classifier.py` の
       `.claude/tmp/` に対する legacy residue 認識ロジック（read/scan/report）は本 Issue では変更していない。
+
+  - handler_id: hook_entry
+    event: SessionStart
+    matcher: null
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "SessionStart"
+    timeout: 5
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: SessionStart
+      exit_2_effect: unknown_pending_upstream_claude_code_docs_confirmation
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: hookSpecificOutput_additionalContext_on_bound_task_silent_otherwise
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2564 (PR #2615): Task Context v1 の Claude-native hook adapter エントリポイント。
+      command が "python3" で、実際のスクリプトは args[0] に、Claude Code event 名は args[1] に格納される
+      （fix_delta 8: resolve_handler_id は interpreter wrapper 一般化により args[0] のファイル名から
+      handler_id "hook_entry" を解決する）。
+      SessionStart イベントでは `task-contextctl hook SessionStart` を呼び出して Task/Activity/Binding の
+      autobind・recovery・self-heal を行うが、`main()` はこのイベントで非ゼロを返す分岐を一切持たず常に exit 0
+      （fail-open）。stdout は decision:pass かつ Task が bound の場合のみ
+      `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}` を出力し、
+      それ以外は無出力。task semantics/SQL は `scripts/task-context/task_context_hook_flows.py` に集約し、
+      本 hook へ重複実装しない。task blocker にしてはならない。
+
+  - handler_id: hook_entry
+    event: UserPromptSubmit
+    matcher: null
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "UserPromptSubmit"
+    timeout: 2
+    classification: blocker
+    fail_policy: fail_closed
+    script_exit_contract:
+      normal: 0
+      block: 2
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: UserPromptSubmit
+      exit_2_effect: blocks_prompt_submission
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: silent
+    stderr_contract: structural_block_reason_on_block_else_silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_nonzero: stop_tool_call
+      on_zero: proceed
+    notes: >
+      Issue #2564 (PR #2615) の wrong-primary-prompt guard（AC4/AC12）。ここでの exit 2 は
+      「tool call」ではなく prompt そのものが Claude へ渡る前に block されることを指す
+      （agent_action.on_nonzero の `stop_tool_call` は本 manifest の固定語彙をそのまま流用しており、
+      実際の効果は claude_event_semantics.exit_2_effect: blocks_prompt_submission を正とする）。
+
+      classification: blocker / fail_policy: fail_closed は「genuine decision（different-primary-target
+      block、`/task` 検証失敗）は必ず block する」という契約を指す。timeout 予算は既定 30 秒ではなく
+      HOT_PATH_TIMEOUT_SECONDS=1 秒の bounded hot-path budget（既存 SQLite busy_timeout 200ms との整合、
+      PR #2615 fix_delta 6）。
+
+      重要な非対称性（Issue #2564 In Scope の DB busy/unavailable fail policy）: adapter 自身の transport
+      failure（DB busy/unavailable/timeout/CLI crash/malformed envelope）は既定で **fail-open**
+      （decision を pass にフォールバックし exit 0 のまま Claude へ処理を続けさせる）。唯一の例外が
+      PR #2615 fix_delta 4 の carve-out で、classifier が `/task <target>` （`classification_kind ==
+      "SLASH_TASK"`）と判定したプロンプトに限り、同じ transport failure / invalid envelope /
+      persistence failure でも fail-open にはせず exit 2 を返す（`/task` は明示的な state-changing
+      command であり、rebind 成功を偽装してはならないため）。それ以外のプロンプト種別は本表の
+      fail_policy: fail_closed が指す「genuine decision」経路のみが block し、adapter 自身の内部障害は
+      block しない。fix_delta 6 により、bare `#N` 等 current_repo 解決が実際に必要なプロンプトのみ
+      `git remote get-url origin` subprocess を呼ぶ（classifier.needs_current_repo_resolution による
+      lexical pre-check）。fix_delta 2 により、DB 書き込みが commit した後にのみ Herdr projection flush を
+      detached subprocess（`projection_flush_entry.py`）として起動し、hot path 自体は待たない。
+
+  - handler_id: hook_entry
+    event: CwdChanged
+    matcher: null
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "CwdChanged"
+    timeout: 5
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: CwdChanged
+      exit_2_effect: unknown_pending_upstream_claude_code_docs_confirmation
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: silent
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2564 (PR #2615 fix_delta 7): cwd/worktree/branch を display-only な RuntimeLocation
+      observation として `runtime_locations` へ記録するのみで、Task/Activity/Binding identity・
+      rebind・block 判定には一切使わない（AC7、Issue Stop Condition:
+      "worktree/branch/Herdr tab position を Task identity へ昇格する必要が生じた場合"）。
+      `main()` はこのイベントで非ゼロを返す分岐を持たず常に exit 0（fail-open）。
+
+  - handler_id: hook_entry
+    event: SubagentStart
+    matcher: null
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "SubagentStart"
+    timeout: 5
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: SubagentStart
+      exit_2_effect: unknown_pending_upstream_claude_code_docs_confirmation
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: silent
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2564 AC8 + PR #2615 fix_delta 5: SubAgent 実行は parent Task/Activity 配下の
+      非managed ExecutionRun として roll-up され、独自の TabBinding は作らない。Claude Code の
+      SubagentStart/SubagentStop hook payload に公式に含まれる `agent_id`（SubAgent instance を
+      一意識別する UUID）をそのまま `execution_runs.agent_id` へ転記し、後続の SubagentStop が
+      exact match で終了対象の run を解決できるようにする。`main()` はこのイベントで非ゼロを返す
+      分岐を持たず常に exit 0（fail-open）。
+
+  - handler_id: hook_entry
+    event: SessionEnd
+    matcher: null
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "SessionEnd"
+    timeout: 5
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: SessionEnd
+      exit_2_effect: unknown_pending_upstream_claude_code_docs_confirmation
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: silent
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2564 AC3: `/quit` 相当の SessionEnd で operator ExecutionRun を終了し Binding を
+      SUSPENDED にする（runtime fact のみ、Claude の自然言語 final response から completion を
+      推測しない）。SessionEnd の正常受信を復元の前提条件にせず、次回 SessionStart の self-heal に
+      委ねる（AC1(d)）。`main()` はこのイベントで非ゼロを返す分岐を持たず常に exit 0（fail-open）。
+
+  - handler_id: hook_entry
+    event: Stop
+    matcher: null
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "Stop"
+    timeout: 5
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: Stop
+      exit_2_effect: prevents_stop
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: silent
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2564: Stop は runtime fact のみを同期する（Claude の自然言語 final response から Task
+      completion を推測しない）。`main()` はこのイベントで非ゼロを返す分岐を持たず常に exit 0
+      （fail-open）。task blocker にしてはならない。session_manifest_coordinator.sh と同一イベントに
+      並列登録されるが、hook 実行順に依存しない（Issue In Scope 「既存hook群と順序非依存で配線する」）。
+
+  - handler_id: hook_entry
+    event: StopFailure
+    matcher: null
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "StopFailure"
+    timeout: 5
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: StopFailure
+      exit_2_effect: unknown_pending_upstream_claude_code_docs_confirmation
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: silent
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2564: StopFailure でも Stop と同じ runtime-fact-only 同期（`_end_current_run`）を行う。
+      `main()` はこのイベントで非ゼロを返す分岐を持たず常に exit 0（fail-open）。session_manifest_coordinator.sh
+      と同一イベントに並列登録されるが、hook 実行順に依存しない。exit_2_effect は Stop/SubagentStop と異なり
+      まだ upstream Claude Code hooks reference で確認されていないため保守的に unknown と明記する。
+
+  - handler_id: hook_entry
+    event: SubagentStop
+    matcher: null
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "SubagentStop"
+    timeout: 5
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: SubagentStop
+      exit_2_effect: prevents_subagent_stop
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: silent
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2564 AC8 + PR #2615 fix_delta 5: `agent_id` が渡された場合はその exact agent_id を持つ
+      open な run のみを終了する。`agent_id` が渡されない場合、open な subagent run が複数あれば
+      どれも終了せず（"ambiguous without agent_id" として pass）、1件だけなら従来どおり終了する
+      （sibling SubAgent が同時実行中でも誤って別 run を終了しない）。`main()` はこのイベントで
+      非ゼロを返す分岐を持たず常に exit 0（fail-open）。session_manifest_coordinator.sh と同一イベントに
+      並列登録されるが、hook 実行順に依存しない。
 ```
 
 ## HOOK_COMMAND_REPAIR_HINT_V1（Hook コマンド修復ヒント）
@@ -439,6 +726,8 @@ Stop / StopFailure / SubagentStop / PostToolUse で実際に動作する `sessio
 | `session_manifest_coordinator.sh`（StopFailure） | telemetry | 継続 |
 | `session_manifest_coordinator.sh`（SubagentStop） | telemetry | 継続 |
 | `session_manifest_debounce.mjs` | telemetry | 継続 |
+| `hook_entry.py`（SessionStart/CwdChanged/SubagentStart/SessionEnd/Stop/StopFailure/SubagentStop） | telemetry | 継続（`main()` はこれらの event で非ゼロを返す分岐を持たない） |
+| `hook_entry.py`（UserPromptSubmit） | blocker（genuine decision のみ。adapter 自身の transport failure は fail-open。`/task` 失敗時のみ例外的に fail-closed、PR #2615 fix_delta 4） | **prompt submission を停止**（different-primary-target guard、`/task` 検証失敗時） |
 
 ### local_main_branch_guard の gh CLI コマンド 5 分類（#1124）
 
