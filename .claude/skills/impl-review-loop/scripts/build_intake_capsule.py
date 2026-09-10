@@ -433,7 +433,13 @@ def _pr_closes_target_issue(
     refs = payload.get("closingIssuesReferences")
     if not isinstance(refs, list):
         return False
-    return any(isinstance(ref, dict) and ref.get("number") == issue_number for ref in refs)
+    expected_url = f"https://github.com/{repo}/issues/{issue_number}"
+    return any(
+        isinstance(ref, dict)
+        and ref.get("number") == issue_number
+        and ref.get("url") == expected_url
+        for ref in refs
+    )
 
 
 def _resolve_context_comments(

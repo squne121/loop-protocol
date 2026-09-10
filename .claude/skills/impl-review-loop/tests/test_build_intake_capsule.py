@@ -665,8 +665,20 @@ def _pr_comment_lookup_json(
     )
 
 
-def _closing_issues_json(issue_numbers: list[int]) -> str:
-    return json.dumps({"closingIssuesReferences": [{"number": n} for n in issue_numbers]})
+def _closing_issues_json(issue_numbers: list[int], repo: str = "squne121/loop-protocol") -> str:
+    owner, name = repo.split("/", 1)
+    return json.dumps(
+        {
+            "closingIssuesReferences": [
+                {
+                    "number": n,
+                    "url": f"https://github.com/{repo}/issues/{n}",
+                    "repository": {"name": name, "owner": {"login": owner}},
+                }
+                for n in issue_numbers
+            ]
+        }
+    )
 
 
 def test_ac2_pr_comment_direct_lookup_resolves_human_context_url():
@@ -763,6 +775,40 @@ def test_ac4_pr_comment_not_closing_target_issue_is_fail_closed():
             (0, "", ""),
             (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=pr_comment_url), ""),
             (0, _closing_issues_json([1111]), ""),  # closes a DIFFERENT issue
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(
+            958,
+            "squne121/loop-protocol",
+            None,
+            human_context_comment_urls=[pr_comment_url],
+        )
+
+    assert exit_code == 1, capsule
+    assert any(
+        err.startswith("human_supplied_comment_pr_not_closing_target_issue:")
+        for err in capsule["fatal_errors"]
+    ), capsule
+
+
+def test_pr_closes_same_numbered_issue_in_different_repo_fails_closed():
+    """#2606 fix_delta (PR #2614 review comment): a PR whose
+    `closingIssuesReferences` names an issue with the SAME number as the
+    target Issue but in a DIFFERENT repository must never be accepted as
+    closing the target Issue -- `number` alone is not sufficient identity,
+    `url` (repo-qualified) must also match."""
+    pr_comment_url = f"https://github.com/squne121/loop-protocol/pull/{_PR_NUMBER}#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, "", ""),
+            (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=pr_comment_url), ""),
+            (0, _closing_issues_json([958], repo="other-owner/other-repo"), ""),
         ]
     )
 

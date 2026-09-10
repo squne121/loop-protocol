@@ -716,10 +716,20 @@ def test_build_capsule_argv_e2e_subprocess_invocation_resolves_context_inputs(tm
 def test_validate_step1_dispatch_payload_noop_when_context_inputs_absent():
     """When `context_inputs` is None/empty, `validate_step1_dispatch_payload()`
     is a no-op (per step-1-implementation.md: "context_inputs が存在しない
-    場合、この節は no-op")."""
+    場合、この節は no-op"). Covers both the `None` shape and the
+    structurally-empty-but-present shape (#2606 PR #2614 review comment:
+    this empty-context assertion was previously mis-placed inside the AC9
+    live canary and gated on GitHub availability; it is a pure unit
+    assertion and must always run)."""
     allowed, errors = mod.validate_step1_dispatch_payload(None, {})
     assert allowed is True
     assert errors == []
+
+    allowed_empty, errors_empty = mod.validate_step1_dispatch_payload(
+        {"human_supplied": [], "agent_generated": []}, {}
+    )
+    assert allowed_empty is True
+    assert errors_empty == []
 
 
 # ---------------------------------------------------------------------------
@@ -770,8 +780,20 @@ def _pr_comment_lookup_json(
     )
 
 
-def _closing_issues_json(issue_numbers: list[int]) -> str:
-    return json.dumps({"closingIssuesReferences": [{"number": n} for n in issue_numbers]})
+def _closing_issues_json(issue_numbers: list[int], repo: str = _REPO) -> str:
+    owner, name = repo.split("/", 1)
+    return json.dumps(
+        {
+            "closingIssuesReferences": [
+                {
+                    "number": n,
+                    "url": f"https://github.com/{repo}/issues/{n}",
+                    "repository": {"name": name, "owner": {"login": owner}},
+                }
+                for n in issue_numbers
+            ]
+        }
+    )
 
 
 def test_ac1_target_issue_own_comment_still_resolves_no_direct_lookup(tmp_path):
@@ -953,6 +975,49 @@ def test_ac4_pr_comment_on_unrelated_pr_is_fail_closed(tmp_path):
     ), stdout_payload
 
 
+def test_pr_closes_same_numbered_issue_in_different_repo_fails_closed(tmp_path):
+    """#2606 fix_delta (PR #2614 review comment): a PR whose
+    closingIssuesReferences names an issue with the SAME number as the
+    target Issue but in a DIFFERENT repository must never be accepted as
+    closing the target Issue -- ``number`` alone is not sufficient identity,
+    ``url`` (repo-qualified) must also match."""
+    pr_comment_url = f"https://github.com/{_REPO}/pull/{_PR_NUMBER}#issuecomment-{_PR_COMMENT_ID}"
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "  \n", ""),
+            (0, _comments_stdout(), ""),
+            (0, _pr_comment_lookup_json(comment_id=_PR_COMMENT_ID, html_url=pr_comment_url), ""),
+            (0, _closing_issues_json([_ISSUE_NUMBER], repo="other-owner/other-repo"), ""),
+        ]
+    )
+    artifact_dir = tmp_path / "artifacts"
+    argv = [
+        "build_intake_capsule.py",
+        "--issue-number",
+        str(_ISSUE_NUMBER),
+        "--repo",
+        _REPO,
+        "--artifact-dir",
+        str(artifact_dir),
+        "--max-stdout-bytes",
+        "65536",
+        "--human-context-comment-url",
+        pr_comment_url,
+    ]
+
+    exit_code, stdout_text = _run_main(argv, run_cmd)
+
+    assert exit_code == 1, stdout_text
+    stdout_payload = json.loads(stdout_text)
+    assert any(
+        err.startswith("human_supplied_comment_pr_not_closing_target_issue:")
+        for err in stdout_payload["fatal_errors"]
+    ), stdout_payload
+
+
 def test_ac6_direct_lookup_html_url_mismatch_is_fail_closed(tmp_path):
     """#2606 AC6: readback html_url must exact-bind to the input URL; a
     mismatch (e.g. comment-ID collision) fails closed."""
@@ -1095,25 +1160,40 @@ _AC9_COMMENT_ID = 5612029072
 _AC9_HUMAN_URL = f"https://github.com/{_REPO}/pull/{_AC9_PR_NUMBER}#issuecomment-{_AC9_COMMENT_ID}"
 
 
-def _gh_auth_available() -> bool:
+def _gh_unavailable_reason() -> str | None:
+    """Runtime (not collection-time) availability check for the AC9 live
+    canary. Checked from inside the test body, never from a
+    `pytest.mark.skipif(...)` decorator argument -- decorator arguments are
+    evaluated at module collection time, which would spawn `gh` subprocesses
+    on every collection (#2606 PR #2614 review comment)."""
     gh = shutil.which("gh")
     if gh is None:
-        return False
+        return "gh CLI not installed"
     try:
-        completed = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=15)
+        auth = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=15)
     except (subprocess.TimeoutExpired, OSError):
-        return False
-    return completed.returncode == 0
+        return "gh CLI invocation failed"
+    if auth.returncode != 0:
+        return "gh CLI not authenticated"
+    try:
+        api_check = subprocess.run(
+            [gh, "api", "-X", "GET", "/rate_limit"], capture_output=True, text=True, timeout=15
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "api.github.com unreachable"
+    if api_check.returncode != 0:
+        return "api.github.com unreachable"
+    return None
 
 
-@pytest.mark.skipif(
-    not _gh_auth_available(),
-    reason="gh CLI not installed/authenticated in this execution environment (SKIP, not PASS/FAIL) -- #2606 AC9",
-)
 def test_ac9_runtime_canary_known_pr_comment_resolves_against_real_github():
     """#2606 AC9: exercises the real comment-ID direct lookup +
     closingIssuesReferences check against live GitHub, using the exact
     known real-world case cited in the Issue body."""
+    skip_reason = _gh_unavailable_reason()
+    if skip_reason is not None:
+        pytest.skip(f"{skip_reason} (SKIP, not PASS/FAIL) -- #2606 AC9")
+
     artifacts_dir = TEST_REPO_ROOT / "artifacts" / "issue-2606" / "ac9_runtime_canary"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1147,9 +1227,3 @@ def test_ac9_runtime_canary_known_pr_comment_resolves_against_real_github():
     assert human_supplied[0]["comment_id"] == _AC9_COMMENT_ID
     assert human_supplied[0]["url"] == _AC9_HUMAN_URL
     assert not any(str(_AC9_COMMENT_ID) in err for err in capsule.get("fatal_errors", [])), capsule
-
-    allowed_empty, errors_empty = mod.validate_step1_dispatch_payload(
-        {"human_supplied": [], "agent_generated": []}, {}
-    )
-    assert allowed_empty is True
-    assert errors_empty == []
