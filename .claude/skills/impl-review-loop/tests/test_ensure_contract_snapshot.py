@@ -3183,7 +3183,9 @@ class TestPatchCommentTransportAndReconciliation:
         )
         return calls
 
-    def test_given_small_non_compacted_escaping_values_when_patched_then_exact_body_round_trips_through_real_parser(self, monkeypatch):
+    def test_given_small_non_compacted_escaping_values_when_patched_then_exact_body_round_trips_through_real_parser(
+        self, monkeypatch
+    ):
         classifications = [
             {
                 "ac": "AC1a",
@@ -3223,7 +3225,9 @@ class TestPatchCommentTransportAndReconciliation:
             "truncated": False,
         }
 
-    def test_given_large_payload_when_patched_then_compaction_metadata_and_nonverbose_fields_round_trip_to_valid_go(self, monkeypatch):
+    def test_given_large_payload_when_patched_then_compaction_metadata_and_nonverbose_fields_round_trip_to_valid_go(
+        self, monkeypatch
+    ):
         classifications = [
             {
                 "ac": "AC1b",
@@ -3266,8 +3270,12 @@ class TestPatchCommentTransportAndReconciliation:
             parsed[0]["inner"], self._COMMENT_ID, _ISSUE_NUMBER
         )
 
-    @pytest.mark.parametrize("patch_response", ["invalid_json", "id_mismatch", "body_mismatch"])
-    def test_given_untrusted_patch_success_representation_when_authoritative_get_fully_binds_then_reconciles_once(self, monkeypatch, patch_response):
+    @pytest.mark.parametrize(
+        "patch_response", ["invalid_json", "id_mismatch", "body_mismatch"]
+    )
+    def test_given_untrusted_patch_success_representation_when_authoritative_get_fully_binds_then_reconciles_once(
+        self, monkeypatch, patch_response
+    ):
         remote = self._trusted_remote_comment("before")
         calls = self._install_remote_boundary(monkeypatch, remote, patch_response)
 
@@ -3290,7 +3298,9 @@ class TestPatchCommentTransportAndReconciliation:
             ("publisher", "binding_publisher_untrusted"),
         ],
     )
-    def test_given_untrusted_patch_success_representation_when_authoritative_get_binding_fails_then_fails_closed(self, monkeypatch, failure, expected_error):
+    def test_given_untrusted_patch_success_representation_when_authoritative_get_binding_fails_then_fails_closed(
+        self, monkeypatch, failure, expected_error
+    ):
         remote = self._trusted_remote_comment("before")
 
         def tamper_readback(comment):
