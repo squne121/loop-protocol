@@ -1,9 +1,14 @@
-"""Issue #2564 AC4, AC5, AC6, AC12, AC13 -- UserPromptSubmit precedence:
-observe-only, autobind, provisional/absorbent Task, different-primary-target
-block, terminal-Activity advance/rebind, `/task` escape hatch, and
-order-independent commit-on-submission semantics."""
+"""Issue #2625 AC1, AC2, AC5, AC7, AC9 (supersedes Issue #2564 AC4/AC6/AC12's
+hard-block contract) -- UserPromptSubmit precedence: observe-only, autobind,
+provisional/absorbent Task, different-primary-target ADVISORY (never a
+block), terminal-Activity advance/rebind, raw `/task`-looking text as a
+non-mutating no-op (state-changing authority moved to `UserPromptExpansion`
+-- see test_hook_flows_user_prompt_expansion.py), and order-independent
+commit-on-submission semantics."""
 
 from __future__ import annotations
+
+import json
 
 import task_context_hook_flows as hook_flows
 import task_context_service as service
@@ -22,6 +27,15 @@ conn_holder = {}
 def _submit(session_id: str, tab_id: str, **fields):
     payload = {"herdr_tab_id": tab_id, "claude_session_id": session_id, **fields}
     return hook_flows.on_user_prompt_submit(conn_holder["conn"], payload)
+
+
+def _expand(session_id: str, tab_id: str, **fields):
+    """AC6: `/task` state-changing authority now lives in the
+    `UserPromptExpansion` command lifecycle (`command_name == "task"`), not
+    `UserPromptSubmit` -- test setup that needs an ad-hoc Task must go
+    through this instead of `_submit(..., classification_kind="SLASH_TASK")`."""
+    payload = {"herdr_tab_id": tab_id, "claude_session_id": session_id, "command_name": "task", **fields}
+    return hook_flows.on_user_prompt_expansion(conn_holder["conn"], payload)
 
 
 def setup_function(_fn):
@@ -70,13 +84,14 @@ def test_given_ambiguous_classification_when_prompt_submitted_then_pass_with_adv
 
 
 def test_given_active_task_with_zero_refs_when_new_primary_target_submitted_then_absorbed_not_blocked(conn):
-    """AC4: provisional/absorbent ad-hoc Task (task_refs == 0) absorbs the
-    first high-confidence primary GitHub target instead of being treated as
-    a different-Task rebind."""
+    """AC4 (Issue #2564, unchanged by #2625): provisional/absorbent ad-hoc
+    Task (task_refs == 0) absorbs the first high-confidence primary GitHub
+    target instead of being treated as a different-Task rebind."""
     conn_holder["conn"] = conn
     _start_session("tab-1", "s1")
-    # No ref yet -- create an ad-hoc provisional Task via /task with a label.
-    slash_result = _submit("s1", "tab-1", classification_kind="SLASH_TASK", slash_task_ad_hoc_title="ad-hoc work")
+    # No ref yet -- create an ad-hoc provisional Task via the UserPromptExpansion
+    # `/task` command lifecycle (AC6) with a label.
+    slash_result = _expand("s1", "tab-1", slash_task_ad_hoc_title="ad-hoc work")
     task_id = slash_result["task_id"]
     assert service.count_live_task_ref_claims(conn, task_id) == 0
 
@@ -90,21 +105,84 @@ def test_given_active_task_with_zero_refs_when_new_primary_target_submitted_then
     assert service.count_live_task_ref_claims(conn, task_id) == 1
 
 
-def test_given_active_task_with_a_live_ref_when_different_primary_target_submitted_then_blocked(conn):
-    """AC4: once a Task has >=1 live ref, a *different* high-confidence
-    primary target while the Activity is still ACTIVE is blocked."""
+def test_given_active_task_with_a_live_ref_when_different_primary_target_submitted_then_advisory_not_blocked(conn):
+    """Issue #2625 AC1/AC2 (supersedes Issue #2564 AC4's hard block): once a
+    Task has >=1 live ref, a *different* high-confidence primary target
+    while the Activity is still ACTIVE is advisory-only -- Claude prompt
+    processing continues (decision: pass), and current Task/Activity/
+    Binding are left completely unchanged (no silent rebind, no claim)."""
+    conn_holder["conn"] = conn
+    binding_id = _start_session("tab-1", "s1")
+    first = _submit(
+        "s1", "tab-1", classification_kind="EXPLICIT", target_repo="owner/repo", target_ref_kind="issue",
+        target_ref_number=1,
+    )
+    task_a = first["task_id"]
+
+    result = _submit(
+        "s1", "tab-1", classification_kind="EXPLICIT", target_repo="owner/other", target_ref_kind="issue",
+        target_ref_number=2,
+    )
+    assert result["decision"] == "pass"
+    assert result["reason_code"] == "different_primary_target_active"
+    assert result["advisory"] is True
+
+    # AC1: Task A's Binding/Activity/claims are unchanged -- no silent
+    # rebind to the mismatched target B, no claim created for it either.
+    current_task_id, current_activity_id, _ = service.get_current_task_activity_for_binding(conn, binding_id)
+    assert current_task_id == task_a
+    assert current_activity_id == first["activity_id"]
+    assert service.find_live_claim(conn, "owner/other", "issue", 2) is None
+
+
+def test_given_different_primary_target_advisory_when_recorded_then_event_journal_status_is_non_blocking(conn):
+    """AC2: the different_primary_target_active advisory is *required* to be
+    recorded to EventJournal, but as a non-blocking ``pass`` observation --
+    never the hard-block ``status="block"`` state Issue #2564 used."""
     conn_holder["conn"] = conn
     _start_session("tab-1", "s1")
     _submit(
         "s1", "tab-1", classification_kind="EXPLICIT", target_repo="owner/repo", target_ref_kind="issue",
         target_ref_number=1,
     )
-    result = _submit(
+    _submit(
         "s1", "tab-1", classification_kind="EXPLICIT", target_repo="owner/other", target_ref_kind="issue",
         target_ref_number=2,
     )
-    assert result["decision"] == "block"
-    assert result["reason_code"] == "different_primary_target_active"
+    rows = conn.execute(
+        "SELECT metadata_json FROM events WHERE event_type = 'hook:UserPromptSubmit' ORDER BY occurred_at"
+    ).fetchall()
+    metadatas = [json.loads(row["metadata_json"]) for row in rows]
+    mismatch_events = [m for m in metadatas if m.get("reason_code") == "different_primary_target_active"]
+    assert mismatch_events, "different_primary_target_active advisory が EventJournal に記録されていません"
+    assert mismatch_events[-1]["status"] == "pass", (
+        f"advisory の EventJournal status は non-blocking 'pass' である想定: "
+        f"{mismatch_events[-1]['status']!r}"
+    )
+
+
+def test_given_raw_slash_task_text_on_ordinary_submit_when_processed_then_no_state_mutation(conn):
+    """AC6: ordinary UserPromptSubmit no longer treats raw `/task ...`-looking
+    prompt text as a state-changing authority signal -- classification_kind
+    == SLASH_TASK observed here performs no Task/Activity/Binding mutation
+    at all (the sole authority is UserPromptExpansion's command_name ==
+    "task" lifecycle -- see test_hook_flows_user_prompt_expansion.py)."""
+    conn_holder["conn"] = conn
+    binding_id = _start_session("tab-1", "s1")
+    first = _submit(
+        "s1", "tab-1", classification_kind="EXPLICIT", target_repo="owner/repo", target_ref_kind="issue",
+        target_ref_number=1,
+    )
+    task_a = first["task_id"]
+
+    result = _submit("s1", "tab-1", classification_kind="SLASH_TASK", slash_task_target_repo="owner/other",
+                      slash_task_target_ref_kind="issue", slash_task_target_ref_number=99)
+    assert result["decision"] == "pass"
+    assert result["reason_code"] == "slash_task_raw_text_no_state_authority"
+
+    current_task_id, _, _ = service.get_current_task_activity_for_binding(conn, binding_id)
+    assert current_task_id == task_a
+    assert service.find_live_claim(conn, "owner/other", "issue", 99) is None
 
 
 def test_given_same_target_as_current_task_when_prompt_submitted_then_passed_through(conn):
@@ -143,42 +221,6 @@ def test_given_terminal_activity_when_different_target_submitted_then_advance_al
     assert result["decision"] == "pass"
     assert result["reason_code"] == "terminal_advance_or_rebind"
     assert result["task_id"] != task_a
-
-
-def test_given_active_task_a_when_raw_slash_task_b_submitted_then_rebind_not_blocked(conn):
-    """AC6/AC12: `/task B` always supersedes the block guard, even while
-    Task A's Activity is ACTIVE and Task A already owns a live ref."""
-    conn_holder["conn"] = conn
-    _start_session("tab-1", "s1")
-    task_a_result = _submit(
-        "s1", "tab-1", classification_kind="EXPLICIT", target_repo="owner/repo", target_ref_kind="issue",
-        target_ref_number=1,
-    )
-    task_a = task_a_result["task_id"]
-
-    rebind_result = _submit(
-        "s1",
-        "tab-1",
-        classification_kind="SLASH_TASK",
-        slash_task_target_repo="owner/other",
-        slash_task_target_ref_kind="issue",
-        slash_task_target_ref_number=99,
-    )
-    assert rebind_result["decision"] == "pass"
-    assert rebind_result["reason_code"] == "slash_task_rebind"
-    assert rebind_result["task_id"] != task_a
-
-    binding_id = service.get_binding_by_current_session(conn, "s1")["id"]
-    current_task_id, _, _ = service.get_current_task_activity_for_binding(conn, binding_id)
-    assert current_task_id == rebind_result["task_id"]
-
-
-def test_given_slash_task_missing_target_when_submitted_then_blocked_not_silently_ignored(conn):
-    conn_holder["conn"] = conn
-    _start_session("tab-1", "s1")
-    result = _submit("s1", "tab-1", classification_kind="SLASH_TASK")
-    assert result["decision"] == "block"
-    assert result["reason_code"] == "slash_task_missing_target"
 
 
 def test_given_reference_only_marker_when_active_task_present_then_never_blocks(conn):

@@ -1,4 +1,6 @@
-"""Issue #2564 -- real subprocess invocation of the actual Claude-native hook
+"""Issue #2564 (advisory-only ACTIVE different-primary guard + `/task`
+authority moved to `UserPromptExpansion`: Issue #2625) -- real subprocess
+invocation of the actual Claude-native hook
 adapter entrypoint (`hook_entry.py`), exactly as `.claude/settings.json`
 wires it (`python3 hook_entry.py <EventName>` with the Claude Code hook JSON
 on stdin and `HERDR_TAB_ID`/`HERDR_PANE_ID` env vars). This is the
@@ -101,31 +103,48 @@ def test_given_explicit_target_prompt_when_user_prompt_submit_invoked_then_autob
     assert live is not None
 
 
-def test_given_different_primary_target_while_active_when_user_prompt_submit_invoked_then_exit_two_block(
+def test_given_different_primary_target_while_active_when_user_prompt_submit_invoked_then_exit_zero_advisory_only(
     state_root,
 ):
+    """Issue #2625 AC1/AC3 (supersedes Issue #2564 AC4's hard block) at the
+    real subprocess entrypoint layer: a different-primary-target mismatch on
+    ordinary UserPromptSubmit is advisory-only -- exit 0, Claude prompt
+    processing continues, current Task/Binding untouched (no silent
+    rebind)."""
     env_extra = {"HERDR_TAB_ID": "wV:t9", "HERDR_PANE_ID": "wV:p9"}
     _run_hook("SessionStart", {"session_id": "s1", "source": "startup"}, state_root=state_root, env_extra=env_extra)
-    _run_hook(
+    first = _run_hook(
         "UserPromptSubmit",
         {"session_id": "s1", "prompt": "work on owner/repo#1", "cwd": str(state_root)},
         state_root=state_root,
         env_extra=env_extra,
     )
+    assert first.returncode == 0, first.stderr
 
-    blocked = _run_hook(
+    mismatch = _run_hook(
         "UserPromptSubmit",
         {"session_id": "s1", "prompt": "actually switch to owner/other#2", "cwd": str(state_root)},
         state_root=state_root,
         env_extra=env_extra,
     )
-    assert blocked.returncode == 2
-    assert "blocked" in blocked.stderr
+    assert mismatch.returncode == 0, mismatch.stderr
+    assert "advisory" in mismatch.stderr
+
+    conn = db.connect(config.db_path())
+    try:
+        # No silent rebind / claim for the mismatched target B.
+        assert service.find_live_claim(conn, "owner/other", "issue", 2) is None
+    finally:
+        conn.close()
 
 
-def test_given_slash_task_after_block_scenario_when_invoked_then_exit_zero_rebind_succeeds(state_root):
-    """AC6/AC12 at the real subprocess entrypoint layer -- `/task` is never
-    itself blocked by the guard it supersedes."""
+def test_given_slash_task_after_advisory_scenario_when_expanded_then_exit_zero_rebind_succeeds(state_root):
+    """AC6 at the real subprocess entrypoint layer: `/task` state-changing
+    authority lives exclusively in the `UserPromptExpansion` command
+    lifecycle (`command_name == "task"`) -- it always supersedes whatever
+    Task/Activity is currently ACTIVE, exactly as before, just via a
+    different Claude Code hook event than the (now-advisory-only) ordinary
+    UserPromptSubmit prompt."""
     env_extra = {"HERDR_TAB_ID": "wV:t9", "HERDR_PANE_ID": "wV:p9"}
     _run_hook("SessionStart", {"session_id": "s1", "source": "startup"}, state_root=state_root, env_extra=env_extra)
     _run_hook(
@@ -135,8 +154,8 @@ def test_given_slash_task_after_block_scenario_when_invoked_then_exit_zero_rebin
         env_extra=env_extra,
     )
     rebind = _run_hook(
-        "UserPromptSubmit",
-        {"session_id": "s1", "prompt": "/task owner/other#2", "cwd": str(state_root)},
+        "UserPromptExpansion",
+        {"session_id": "s1", "command_name": "task", "command_args": "owner/other#2", "cwd": str(state_root)},
         state_root=state_root,
         env_extra=env_extra,
     )
@@ -193,9 +212,10 @@ def test_given_cwd_changed_in_real_git_worktree_when_invoked_then_worktree_and_b
 
 
 def test_given_slash_task_when_ctl_transport_fails_then_exit_two_never_fail_open(state_root):
-    """fix_delta 4: `/task` is an explicit state-changing command -- a CLI
-    transport error / invalid result envelope must surface as exit 2, never
-    a silent fail-open pass (unlike every other prompt kind)."""
+    """AC6 (carried over from PR #2615 fix_delta 4, now scoped to
+    UserPromptExpansion): `/task` is an explicit state-changing command -- a
+    CLI transport error / invalid result envelope must surface as exit 2,
+    never a silent fail-open pass (unlike every other command_name)."""
     broken_state_root = "relative/not/absolute/path"
     env = dict(os.environ)
     env.pop("HERDR_TAB_ID", None)
@@ -204,8 +224,10 @@ def test_given_slash_task_when_ctl_transport_fails_then_exit_two_never_fail_open
     env["HERDR_TAB_ID"] = "wV:t9"
     env["HERDR_PANE_ID"] = "wV:p9"
     proc = subprocess.run(
-        [sys.executable, str(_HOOK_ENTRY), "UserPromptSubmit"],
-        input=json.dumps({"session_id": "s1", "prompt": "/task owner/repo#5", "cwd": str(state_root)}),
+        [sys.executable, str(_HOOK_ENTRY), "UserPromptExpansion"],
+        input=json.dumps(
+            {"session_id": "s1", "command_name": "task", "command_args": "owner/repo#5", "cwd": str(state_root)}
+        ),
         capture_output=True,
         text=True,
         env=env,
@@ -236,20 +258,35 @@ def test_given_normal_prompt_when_ctl_transport_fails_then_exit_zero_fail_open(s
     assert proc.returncode == 0, proc.stderr
 
 
-def test_given_slash_task_missing_target_when_invoked_then_exit_two_block(state_root):
-    """fix_delta 4: an explicit `/task` with no resolvable target/title is a
-    validation failure the adapter surfaces as decision:block, not a silent
-    no-op."""
+def test_given_slash_task_missing_target_when_expanded_then_exit_two_block(state_root):
+    """AC6 (carried over from PR #2615 fix_delta 4, now scoped to
+    UserPromptExpansion): an explicit `/task` with no resolvable
+    target/title is a validation failure the adapter surfaces as
+    decision:block, not a silent no-op."""
     env_extra = {"HERDR_TAB_ID": "wV:t9", "HERDR_PANE_ID": "wV:p9"}
     _run_hook("SessionStart", {"session_id": "s1", "source": "startup"}, state_root=state_root, env_extra=env_extra)
     result = _run_hook(
-        "UserPromptSubmit",
-        {"session_id": "s1", "prompt": "/task", "cwd": str(state_root)},
+        "UserPromptExpansion",
+        {"session_id": "s1", "command_name": "task", "command_args": "", "cwd": str(state_root)},
         state_root=state_root,
         env_extra=env_extra,
     )
     assert result.returncode == 2
     assert "/task failed" in result.stderr
+
+
+def test_given_other_command_name_when_expanded_then_exit_zero_never_touches_task_context(state_root):
+    """AC6: `command_name != "task"` is not this hook's concern at all --
+    always a silent, non-mutating exit 0, regardless of Task Context state."""
+    env_extra = {"HERDR_TAB_ID": "wV:t9", "HERDR_PANE_ID": "wV:p9"}
+    _run_hook("SessionStart", {"session_id": "s1", "source": "startup"}, state_root=state_root, env_extra=env_extra)
+    result = _run_hook(
+        "UserPromptExpansion",
+        {"session_id": "s1", "command_name": "some-other-skill", "command_args": "anything", "cwd": str(state_root)},
+        state_root=state_root,
+        env_extra=env_extra,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_given_subagent_start_and_stop_when_agent_id_supplied_then_forwarded_and_correlated(state_root):

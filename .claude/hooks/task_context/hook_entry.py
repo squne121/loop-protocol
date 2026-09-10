@@ -22,17 +22,29 @@ Responsibilities (and *only* these -- Task semantics/SQL live in
 Fail-open by construction: any adapter-side failure (DB busy/unavailable,
 CLI transport error, timeout, malformed output) is treated as "no
 result" -- the default decision remains ``pass`` and Claude Code proceeds
-normally. Only an *actual* well-formed ``decision: block`` result blocks a
-prompt (AC4/AC12 "wrong-primary-prompt guard" -- never DB-degraded blocking).
+normally.
 
-PR #2615 fix_delta 4 carves out exactly one exception to that fail-open
-default: when the classifier determines this prompt is the explicit
-``/task <target>`` escape hatch (``classification_kind == "SLASH_TASK"``),
-a CLI transport error / invalid result envelope / persistence failure must
-NOT be silently swallowed as a fail-open ``pass`` -- ``/task`` is a
-user-visible, explicit state-changing command, so failing to apply it must
-be surfaced as an explicit failure (exit 2) rather than pretending the
-rebind succeeded. Every other prompt kind keeps the fail-open default.
+Issue #2625 (supersedes Issue #2564 / PR #2615's "wrong-primary-prompt hard
+block"): ordinary ``UserPromptSubmit`` is **never** an admission gate for
+Task Context. This adapter enforces a double fail-open invariant on that
+event (AC3): even if the service unexpectedly returns a well-formed
+``decision: block`` (future regression/version skew), ``main()`` still
+returns exit 0 for ``UserPromptSubmit`` -- a mismatch is only ever surfaced
+as a non-blocking stderr advisory, never as a blocked prompt. The one-time
+PR #2615 fix_delta 4 carve-out (an explicit-looking raw `/task` prompt text
+on ``UserPromptSubmit`` could still fail-closed) is retired along with the
+raw-text special-case's state-changing authority.
+
+The sole explicit human escape hatch for switching the ACTIVE Task,
+``/task <target>``, is state-changing authority that now lives exclusively
+in the ``UserPromptExpansion`` command lifecycle (``command_name ==
+"task"``) -- see ``_apply_user_prompt_expansion_fields`` below and
+``task_context_hook_flows.on_user_prompt_expansion``. There, and only
+there, a CLI transport error / invalid result envelope / persistence
+failure is surfaced as an explicit `/task` command failure (exit 2) rather
+than silently pretending the rebind succeeded -- because `/task` is a
+user-visible, explicit state-changing command. Every other ``command_name``
+on ``UserPromptExpansion`` (i.e. not `/task`) is untouched by this hook.
 """
 
 from __future__ import annotations
@@ -197,6 +209,46 @@ def _apply_user_prompt_submit_fields(payload: dict, hook_input: dict) -> None:
         payload["target_ref_number"] = classification.target.ref_number
 
 
+def _command_args_to_raw_target(command_args: object) -> str:
+    """AC6: ``UserPromptExpansion.command_args`` shape is not pinned by a
+    confirmed first-party schema at implementation time -- normalize the two
+    shapes actually observed in this repo's own runtime-smoke evidence
+    (``scripts/agent-ops/run_worktree_agent_runtime_smoke.py``'s
+    ``extract_claude_user_prompt_expansion_command_names``): a single raw
+    string, or a list of string tokens. Anything else (``None``,
+    non-string/non-list) degrades to an empty raw target -- never raises."""
+    if isinstance(command_args, str):
+        return command_args.strip()
+    if isinstance(command_args, list):
+        return " ".join(str(token) for token in command_args).strip()
+    return ""
+
+
+def _apply_user_prompt_expansion_fields(payload: dict, hook_input: dict) -> None:
+    """AC6: reached only for Claude Code's own user-typed slash/Skill command
+    expansion lifecycle -- never for ordinary natural-language prompts.
+    ``command_name != "task"`` is not this hook's concern (some other
+    Skill/command being expanded) and is passed through untouched; only
+    ``command_name == "task"`` reduces ``command_args`` to the same small
+    structured target fields ``classifier.parse_slash_task_target`` already
+    produces for the (now-retired as a state-changing path) raw-text
+    `/task` special-case -- the target-parsing logic itself is reused, not
+    reimplemented; only its authority moves (Issue #2625 In Scope #3)."""
+    command_name = hook_input.get("command_name") or None
+    payload["command_name"] = command_name
+    if command_name != "task":
+        return
+    raw_target = _command_args_to_raw_target(hook_input.get("command_args"))
+    current_repo = _current_repo(hook_input.get("cwd"))
+    target, ad_hoc_title = classifier.parse_slash_task_target(raw_target, current_repo=current_repo)
+    if target is not None:
+        payload["slash_task_target_repo"] = target.repo
+        payload["slash_task_target_ref_kind"] = target.ref_kind
+        payload["slash_task_target_ref_number"] = target.ref_number
+    elif ad_hoc_title:
+        payload["slash_task_ad_hoc_title"] = ad_hoc_title
+
+
 def _apply_cwd_changed_fields(payload: dict, hook_input: dict) -> None:
     """fix_delta 7: record the display-only ``cwd``/``worktree``/``branch``
     RuntimeLocation observation fields. Purely additive to the existing
@@ -248,14 +300,17 @@ def main(argv: list[str]) -> int:
     payload = _build_base_payload(event, hook_input)
 
     timeout = DEFAULT_TIMEOUT_SECONDS
-    is_slash_task = False
 
     if event == "SessionStart":
         payload["source"] = hook_input.get("source") or "startup"
     elif event == "UserPromptSubmit":
         timeout = HOT_PATH_TIMEOUT_SECONDS
         _apply_user_prompt_submit_fields(payload, hook_input)
-        is_slash_task = payload.get("classification_kind") == classifier.KIND_SLASH_TASK
+    elif event == "UserPromptExpansion":
+        # AC6: bounded hot-path budget, same as UserPromptSubmit -- `/task`
+        # is a lightweight single-Task-mutation command, not a large lookup.
+        timeout = HOT_PATH_TIMEOUT_SECONDS
+        _apply_user_prompt_expansion_fields(payload, hook_input)
     elif event == "CwdChanged":
         _apply_cwd_changed_fields(payload, hook_input)
     elif event in ("SubagentStart", "SubagentStop"):
@@ -278,7 +333,9 @@ def main(argv: list[str]) -> int:
     # A well-formed result envelope has `status: ok` AND a recognized
     # `decision` value. Anything else (transport failure, CLI error,
     # malformed/invalid envelope) is treated identically for the fail-open
-    # default below -- except the SLASH_TASK carve-out (fix_delta 4).
+    # default below -- except the `/task` (UserPromptExpansion,
+    # command_name == "task") carve-out below (AC6, carried over from PR
+    # #2615 fix_delta 4, now scoped to UserPromptExpansion only).
     envelope_ok = raw_decision in _VALID_DECISIONS
     decision = raw_decision if envelope_ok else "pass"
 
@@ -289,28 +346,51 @@ def main(argv: list[str]) -> int:
         _launch_detached_projection_flush(hook_input)
 
     if event == "UserPromptSubmit":
-        if is_slash_task and not envelope_ok:
+        # Issue #2625 AC3: adapter-level double fail-open invariant --
+        # ordinary UserPromptSubmit NEVER exits 2 for a Task Context
+        # decision, even if the service unexpectedly returns a well-formed
+        # `decision: block` (future regression/version skew). `/task`
+        # state-changing authority no longer lives on this event (AC6), so
+        # there is no carve-out left here at all -- every branch below this
+        # point is diagnostic-only. The service's *expected* normal-path
+        # response for a mismatch is already `decision: pass` with
+        # `reason_code: different_primary_target_active` (AC1/AC2), so the
+        # advisory is surfaced whenever that reason_code is present --
+        # `decision == "block"` is only the defensive regression case.
+        reason_code = data.get("reason_code")
+        if reason_code == "different_primary_target_active" or decision == "block":
+            reason_code = reason_code or "different_primary_target_active"
             print(
-                "[task-context] /task failed: Task Context service returned an invalid or "
-                "unavailable result -- the rebind was NOT applied. Retry `/task <target>`.",
+                "[task-context] advisory: this prompt appears to target a different "
+                f"ACTIVE Task/Activity ({reason_code}). Continuing -- Task Context no longer "
+                "blocks ordinary prompts for this; use `/task <target>` to explicitly switch.",
                 file=sys.stderr,
             )
-            return 2
-        if decision == "block":
-            reason_code = data.get("reason_code", "different_primary_target_active")
-            if is_slash_task:
+        return 0
+
+    if event == "UserPromptExpansion":
+        # AC6: `/task <target>`'s sole explicit state-changing authority.
+        # Every other command_name is this hook's silent no-op (exit 0) --
+        # see `_apply_user_prompt_expansion_fields` / `on_user_prompt_
+        # expansion`; `decision`/`envelope_ok` were only ever mutated by the
+        # service for `command_name == "task"` in the first place.
+        if payload.get("command_name") == "task":
+            if not envelope_ok:
+                print(
+                    "[task-context] /task failed: Task Context service returned an invalid or "
+                    "unavailable result -- the rebind was NOT applied. Retry `/task <target>`.",
+                    file=sys.stderr,
+                )
+                return 2
+            if decision == "block":
+                reason_code = data.get("reason_code", "slash_task_missing_target")
                 print(
                     f"[task-context] /task failed: {reason_code}. Provide an explicit target, "
                     "e.g. `/task owner/repo#123` or `/task <ad-hoc title>`.",
                     file=sys.stderr,
                 )
-            else:
-                print(
-                    "[task-context] blocked: this prompt targets a different ACTIVE Task/Activity "
-                    f"({reason_code}). Use `/task <target>` to explicitly switch Tasks.",
-                    file=sys.stderr,
-                )
-            return 2
+                return 2
+        return 0
 
     if event == "SessionStart" and decision == "pass":
         _emit_session_start_context(payload.get("claude_session_id"), event)
