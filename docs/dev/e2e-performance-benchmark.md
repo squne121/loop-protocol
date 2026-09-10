@@ -276,7 +276,7 @@ Issue #2423 の `decision: immediate`（`applicable_acs: [AC6]`）の下、AC6�
 
 `tests/ci/test_ci_performance_gate.py::_cli_main` の `--production-invocation` フラグを指定すると `--manifest-sha256` / `--experiment-identity` の省略は（ゲート計算・receipt 生成が走る前に）即座に exit code 4 で fail-closed になり、`--cohort-fixture` ファイル自身の sha256 へのフォールバック式は **構造的に評価されない**。`.github/workflows/ci.yml` の `e2e-performance-benchmark-assessment-gate` steps（`python-test-core` job 内）は新規 `manifest_v2_sha256`/`manifest_v2_experiment_identity` workflow_dispatch input（両方とも既定は空文字）を追加し、両方が非空のときに限り `--production-invocation --manifest-sha256 "$MANIFEST_V2_SHA256" --experiment-identity "$MANIFEST_V2_EXPERIMENT_IDENTITY"` を実際に付与する（fix_delta Blocker 8: 従来この production call site は `--production-invocation` を一切渡していなかったため、AC10 の硬化が実運用経路では未検証だった）。両方空文字（既定）の場合は従来どおり unit/fixture/exploratory-smoke 経路のまま変更なし。`_materialize_close_grade_arm` 等の #2423 eligibility projection ロジック自体は変更していない。
 
-### monolith（1 provider）と split（2 providers）の completeness / critical-path 契約
+### monolith（単一 provider）と split（2 provider）の完全性および critical-path 契約
 
 `monolith` は `e2e-responsive-matrix` を起動しない。ただし単一の `e2e-core`
 baseline が Performance observation として complete / eligible になるのは、同じ
