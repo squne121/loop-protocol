@@ -119,12 +119,40 @@ def parse_allowed_paths(lines: list[str]) -> list[str]:
     return paths
 
 
+def _extract_baseline_expect_from_preceding_comments(
+    lines: list[str], command_line_index: int
+) -> Optional[str]:
+    """Return the baseline expectation from a command's contiguous comment block.
+
+    This mirrors the production annotation scope: only comment lines directly
+    preceding a command are considered, with AC, preflight-scope, and vc-role
+    markers transparent within that block.
+    """
+    baseline_expect: Optional[str] = None
+    transparent_comment = re.compile(r"^#\s*(?:AC\d+|preflight-scope:|vc-role:)")
+    annotation = re.compile(r"^#\s*baseline-expect:\s*(\S+)\s*$")
+
+    for index in range(command_line_index - 1, -1, -1):
+        comment = lines[index].strip()
+        if not comment or not comment.startswith("#"):
+            break
+        match = annotation.match(comment)
+        if match:
+            baseline_expect = match.group(1)
+        elif not transparent_comment.match(comment):
+            break
+    return baseline_expect
+
+
 def _extract_vc_pytest_command_lines(
     lines: list[str], vc_start: int, vc_end: int
-) -> list[tuple[int, str]]:
-    """Return [(line_index, command_text)] for $-prefixed pytest command lines
-    inside canonical fenced ```bash blocks within the VC section."""
-    entries: list[tuple[int, str]] = []
+) -> list[tuple[int, str, Optional[str]]]:
+    """Return pytest command lines and their scoped baseline expectation.
+
+    Only $-prefixed pytest commands inside canonical fenced ```bash blocks
+    are included.
+    """
+    entries: list[tuple[int, str, Optional[str]]] = []
     i = vc_start + 1
     in_block = False
     while i < vc_end:
@@ -142,7 +170,7 @@ def _extract_vc_pytest_command_lines(
             if stripped.startswith("$ "):
                 cmd = stripped[2:].strip()
                 if "pytest" in shlex_safe_tokens(cmd):
-                    entries.append((i, cmd))
+                    entries.append((i, cmd, _extract_baseline_expect_from_preceding_comments(lines, i)))
         i += 1
     return entries
 
@@ -386,6 +414,7 @@ def classify_pytest_command(
     repo_root: Path,
     allowed_paths: set[str],
     used_candidates: set[str],
+    baseline_expect: Optional[str] = None,
 ) -> Optional[dict]:
     """Classify a single pytest VC command line.
 
@@ -424,6 +453,14 @@ def classify_pytest_command(
             if _SIMPLE_NODE_ID_RE.match(node_id):
                 return {"status": STATUS_ALREADY_CANONICAL}
             return {"status": STATUS_NOT_AUTOFIXABLE, "reason_code": REASON_COMPLEX_NODE_ID}
+
+        if baseline_expect == "fail":
+            # Issue #1434: baseline_vc_preflight.py already treats an explicit
+            # author declaration as the escape hatch for intentional test
+            # additions to an existing allowed file (including class node IDs).
+            # Preserve that command before applying this compiler's narrower
+            # simple-top-level-function rewrite heuristic.
+            return {"status": STATUS_ALREADY_CANONICAL}
 
         if not _SIMPLE_NODE_ID_RE.match(node_id):
             # class selector / parametrized selector on an existing file (AC3)
@@ -506,8 +543,10 @@ def compile_body(body: str, repo_root: Path) -> dict:
     any_change = False
     any_not_autofixable = False
 
-    for line_no, raw_cmd in command_entries:
-        result = classify_pytest_command(raw_cmd, repo_root, allowed_paths, used_candidates)
+    for line_no, raw_cmd, baseline_expect in command_entries:
+        result = classify_pytest_command(
+            raw_cmd, repo_root, allowed_paths, used_candidates, baseline_expect
+        )
         if result is None:
             continue
         if result["status"] == STATUS_ALREADY_CANONICAL:

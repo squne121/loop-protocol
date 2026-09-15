@@ -666,6 +666,24 @@ def test_unexpected_pass_maps_to_needs_fix():
     )
 
 
+def test_vc_no_tests_collected_is_needs_fix():
+    """Issue #1434: producer exit-5 output maps to body-fixable needs_fix."""
+    body = UNEXPECTED_PASS_BODY.replace(
+        '$ rg -n "ISSUE_CONTRACT_READINESS_RESULT_V1" .claude/skills/issue-contract-review/scripts/contract_readiness_check.py',
+        "$ uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/test_contract_readiness.py -k issue_1434_missing_test -q",
+    )
+
+    data, exit_code = run_readiness_with_body(body, mode="execute")
+
+    assert data["status"] == "needs_fix", data["errors"]
+    assert exit_code == 1
+    preflight_errors = [
+        error for error in data["errors"]
+        if error["source_check"] == "baseline_vc_preflight"
+    ]
+    assert [error["category"] for error in preflight_errors] == ["vc_no_tests_collected"]
+
+
 def test_existing_file_missing_node_id_noncanonical_maps_to_needs_fix():
     """PR #1366 review (Blocker 1) / Issue #1347: existing_file_missing_node_id_noncanonical
     from baseline_vc_preflight must map to needs_fix (body-author fixable), not

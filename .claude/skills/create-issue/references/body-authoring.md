@@ -144,12 +144,14 @@ Issue 起票時に動作検証の適用判定セクションを記載する。`r
 
 ### pytest baseline-fail VC の正規形（canonical form, marker: pytest_baseline_fail_canonical_rules）
 
-pytest で baseline-fail（`expected_baseline_fail`）を表す VC は、**まだ存在しないテストファイルへの node-id** で記述する（`missing_new_test_file.py::test_name`）。既存ファイルに対する `-k <未作成関数>` や既存ファイルへの missing node-id は禁止形であり、`vc_baseline_shape_compiler.py`（`.claude/skills/issue-contract-review/scripts/vc_baseline_shape_compiler.py`）が machine-readable な rewrite hint を返す。
+pytest で baseline-fail（`expected_baseline_fail`）を表す VC は、原則として**まだ存在しないテストファイルへの node-id** で記述する（`missing_new_test_file.py::test_name`）。既存ファイルに対する `-k <未作成関数>` は禁止形であり、`vc_baseline_shape_compiler.py`（`.claude/skills/issue-contract-review/scripts/vc_baseline_shape_compiler.py`）が machine-readable な rewrite hint を返す。
+
+既存の Allowed Paths 内テストファイルに新しい test class/function を追加する意図を明示する場合だけは、既存ファイルの missing node-id の直前に `# baseline-expect: fail` を置く。この annotation は `baseline_vc_preflight.py` の既存 escape hatch を選択し、compiler も元のファイル・node-id を維持する。annotation なしの existing-file missing node-id は従来どおり禁止形である。
 
 | 禁止形 | 推奨形（canonical） | 理由 |
 |---|---|---|
 | `pytest existing_test_file.py -k test_new_name` | `pytest missing_new_test_file.py::test_new_name` | 既存ファイルへの `-k` 新規テスト名指定は pytest exit 5（no tests collected）で `vc_no_tests_collected` として hard block される |
-| `pytest existing_test_file.py::test_missing_name` | `pytest missing_new_test_file.py::test_missing_name` | 既存ファイルへの missing node-id は判定不能（ファイル自体は存在するため baseline-fail の意味が曖昧になる） |
+| `pytest existing_test_file.py::test_missing_name`（annotation なし） | `pytest missing_new_test_file.py::test_missing_name` | annotation なしでは既存ファイルへの missing node-id は判定不能。意図的な追加は直前の `# baseline-expect: fail` で明示する |
 | `pytest existing_test_file.py -k "test_a or test_b"`（boolean / class selector / parametrized selector） | 対象 AC を分割し、それぞれ missing-file node-id で記述する | 複合 `-k` 式は `not_autofixable`（compiler が安全に書き換えられない） |
 
 - `-k` の書き換え対象は単一 bare `test_*` identifier のみ。boolean 式・class selector・parametrized selector は書き換えない。

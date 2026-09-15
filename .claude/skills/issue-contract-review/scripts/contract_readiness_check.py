@@ -1070,6 +1070,7 @@ _PREFLIGHT_CATEGORY_TO_READINESS: dict[str, str] = {
     "file_not_found_expected": "go",
     "env_missing_dep": "human_judgment",
     "file_not_found_unrunnable": "needs_fix",
+    "vc_no_tests_collected": "needs_fix",
     "timeout": "human_judgment",
     "unexpected_pass": "needs_fix",
     "unknown": "human_judgment",

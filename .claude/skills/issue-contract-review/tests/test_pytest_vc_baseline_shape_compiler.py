@@ -125,6 +125,36 @@ def test_ac2_missing_node_id_on_existing_file_rewritten(tmp_path: Path):
     assert rw["suggested_command"].endswith(f"{candidate}::test_missing_name")
 
 
+def test_baseline_expect_fail_preserves_original_node_id(tmp_path: Path):
+    """Issue #1434: explicit fail annotation preserves an intentional existing-file node-id."""
+    compiler = _load_compiler()
+
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    existing = pkg_dir / "test_existing.py"
+    existing.write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+    original_command = "pytest some_dir/test_existing.py::test_missing_name"
+
+    direct_result = compiler.classify_pytest_command(
+        original_command,
+        tmp_path,
+        {"some_dir/test_existing.py"},
+        set(),
+        baseline_expect="fail",
+    )
+    assert direct_result == {"status": compiler.STATUS_ALREADY_CANONICAL}
+
+    body = _make_body(
+        vc_bash_block=f"# baseline-expect: fail\n$ {original_command}",
+        allowed_paths=["some_dir/test_existing.py"],
+    )
+    result = compiler.compile_body(body, tmp_path)
+
+    assert result["status"] == "already_canonical"
+    assert result["rewrites"] == []
+    assert result["warnings"] == []
+
+
 def test_ac2_existing_node_id_is_not_rewritten(tmp_path: Path):
     """GIVEN existing_test_file.py::test_alpha where test_alpha genuinely exists /
     WHEN compiled / THEN no rewrite (out of scope)."""
