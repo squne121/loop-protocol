@@ -669,8 +669,11 @@ def test_unexpected_pass_maps_to_needs_fix():
 def test_vc_no_tests_collected_is_needs_fix():
     """Issue #1434: producer exit-5 output maps to body-fixable needs_fix."""
     body = UNEXPECTED_PASS_BODY.replace(
-        '$ rg -n "ISSUE_CONTRACT_READINESS_RESULT_V1" .claude/skills/issue-contract-review/scripts/contract_readiness_check.py',
-        "$ uv run --locked pytest .claude/skills/issue-contract-review/scripts/tests/test_contract_readiness.py -k issue_1434_missing_test -q",
+        '$ rg -n "ISSUE_CONTRACT_READINESS_RESULT_V1" '
+        ".claude/skills/issue-contract-review/scripts/contract_readiness_check.py",
+        "$ uv run --locked pytest "
+        ".claude/skills/issue-contract-review/scripts/tests/test_contract_readiness.py "
+        "-k issue_1434_missing_test -q",
     )
 
     data, exit_code = run_readiness_with_body(body, mode="execute")
