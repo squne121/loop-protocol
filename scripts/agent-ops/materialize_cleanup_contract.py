@@ -167,7 +167,14 @@ def materialize(
             "--json",
         ]
         if linked_issue_number is not None:
-            argv[3:3] = ["--linked-issue-number", str(linked_issue_number)]
+            # Issue #2628 fix: appending to the end (instead of splicing into
+            # ``argv[3:3]``, which lands BEFORE the ``--pr-number`` value at
+            # index 3 and corrupts it into
+            # ``--pr-number --linked-issue-number <N> <pr_number> ...``) keeps
+            # every existing flag's value in place regardless of insertion
+            # position — argparse accepts flags in any order, so appending is
+            # both correct and insertion-position-independent.
+            argv.extend(["--linked-issue-number", str(linked_issue_number)])
 
         return {
             "status": "ok",
