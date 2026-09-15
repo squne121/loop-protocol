@@ -199,6 +199,20 @@ class TestAC10EnumExhaustiveness:
         for (wf, name), cls in v2.CLASSIFICATION_MAP.items():
             assert cls in valid, f"({wf},{name}) has invalid classification: {cls}"
 
+    def test_conditional_exclusions_are_not_duplicated_in_static_map(self, v2):
+        """Issue #2604 PR #2630 review: CLASSIFICATION_MAP and
+        CONDITIONAL_EXCLUDED_TUPLES must never both own the same
+        (workflow, check_name) tuple. CONDITIONAL_EXCLUDED_TUPLES entries
+        are excluded only for intentionally skipped ordinary-PR CheckRuns
+        (see the CONDITIONAL_EXCLUDED_TUPLES comment); a duplicate static
+        CLASSIFICATION_MAP entry would silently reintroduce an unconditional
+        exclusion and bypass that conditional-skip binding."""
+        overlap = set(v2.CLASSIFICATION_MAP) & v2.CONDITIONAL_EXCLUDED_TUPLES
+        assert not overlap, (
+            "conditional exclusions must not also be registered in "
+            f"CLASSIFICATION_MAP: {sorted(overlap)}"
+        )
+
     def test_merge_ready_reachable(self, v2):
         """All required checks pass → merge_ready."""
         checks = [
