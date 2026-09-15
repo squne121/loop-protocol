@@ -323,6 +323,61 @@ class TestCheckOnlyMode:
         assert result["status"] == "human_judgment"
         assert result["source"] == "readiness_blocked"
 
+    def test_no_candidate_at_all_still_returns_no_existing_go_comment(self, monkeypatch):
+        """#1513 AC4: with zero parsed results (no candidate of any kind),
+        the reason code stays no_existing_go_comment -- not the new
+        go_like_candidate_authority_unmet classification (non-regression)."""
+        parser_mod = _mock_parser_mod(comments=[], go_comment=None, latest=None)
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                result = ensure_contract_snapshot(
+                    issue_number=_ISSUE_NUMBER,
+                    repo=_REPO,
+                    mode="check-only",
+                )
+
+        assert result["status"] == "human_judgment"
+        assert any("no_existing_go_comment" in e for e in result["errors"])
+        assert not any("go_like_candidate_authority_unmet" in e for e in result["errors"])
+
+    def test_go_like_candidate_excluded_by_authority_returns_new_reason_code(self, monkeypatch):
+        """#1513 AC3: a go-status comment is present in the parsed results
+        (find_latest_result() detects a candidate) but is excluded from
+        find_latest_go(trusted_only=True, fingerprint_ready_only=True)
+        candidacy (untrusted publisher or not fingerprint-ready) -> the new
+        go_like_candidate_authority_unmet reason code, distinct from
+        no_existing_go_comment."""
+        go_like_result = {
+            "comment_id": 1001,
+            "html_url": _GO_COMMENT["html_url"],
+            "created_at": "2026-06-13T08:00:00Z",
+            "status": "go",
+            "inner": _fresh_inner(_SAMPLE_BODY_SHA256),
+        }
+        parser_mod = MagicMock()
+        parser_mod.fetch_issue_comments.return_value = ([_GO_COMMENT], None)
+        parser_mod.parse_contract_review_results.return_value = [go_like_result]
+        # trusted_only=True excludes the untrusted-author go comment from
+        # both latest-result precedence and go candidacy.
+        parser_mod.find_latest_result.return_value = None
+        parser_mod.find_latest_go.return_value = None
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                result = ensure_contract_snapshot(
+                    issue_number=_ISSUE_NUMBER,
+                    repo=_REPO,
+                    mode="check-only",
+                )
+
+        assert result["status"] == "human_judgment"
+        assert result["source"] == "readiness_blocked"
+        assert any("go_like_candidate_authority_unmet" in e for e in result["errors"])
+        assert not any(
+            e.startswith("no_existing_go_comment") for e in result["errors"]
+        )
+
     def test_latest_blocked_returns_blocked_needs_refinement(self, monkeypatch):
         """Latest result is blocked → blocked_needs_refinement."""
         latest = {
@@ -2698,6 +2753,59 @@ class TestControlledPublisherCommentIdBinding:
             )
         assert bound_ok is False
         assert reason == "binding_body_hash_mismatch"
+
+    def test_binding_verification_body_hash_mismatch_with_expected_body_text_populates_diagnostics(self):
+        """#1513 AC1: when the caller supplies expected_body_text (holds the
+        expected body in scope, not only its sha256), a
+        binding_body_hash_mismatch populates diagnostics_out with bounded
+        UTF-8 byte-level diagnostics."""
+        expected_body = "expected-body"
+        actual_body = "different-body-than-expected"
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(body=actual_body)
+            )
+            diagnostics: dict = {}
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER,
+                _AB_REPO,
+                1234,
+                expected_body_sha256=_ecs_mod.sha256_of(expected_body),
+                expected_body_text=expected_body,
+                diagnostics_out=diagnostics,
+            )
+        assert bound_ok is False
+        assert reason == "binding_body_hash_mismatch"
+        assert diagnostics["expected_byte_len"] == len(expected_body.encode("utf-8"))
+        assert diagnostics["actual_byte_len"] == len(actual_body.encode("utf-8"))
+        assert diagnostics["first_diff_byte_offset"] == 0
+        assert diagnostics["expected_sha"] == _ecs_mod.sha256_of(expected_body)
+        assert diagnostics["actual_sha"] == _ecs_mod.sha256_of(actual_body)
+
+    def test_binding_verification_body_hash_mismatch_without_expected_body_text_no_dummy_diagnostics(self):
+        """#1513 AC2: when only expected_body_sha256 is passed (the caller
+        does not hold the expected body text in scope), no dummy
+        expected_byte_len / first_diff_byte_offset diagnostics are
+        synthesized -- diagnostics_out stays empty."""
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(body="different-body-than-expected")
+            )
+            diagnostics: dict = {}
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER,
+                _AB_REPO,
+                1234,
+                expected_body_sha256=_ecs_mod.sha256_of("expected-body"),
+                diagnostics_out=diagnostics,
+            )
+        assert bound_ok is False
+        assert reason == "binding_body_hash_mismatch"
+        assert diagnostics == {}
+        assert "expected_byte_len" not in diagnostics
+        assert "first_diff_byte_offset" not in diagnostics
 
     def test_binding_verification_body_hash_match_succeeds(self):
         with patch("subprocess.run") as run_mock:

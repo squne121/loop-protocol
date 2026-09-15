@@ -807,11 +807,27 @@ def extract_comment_id_from_url(url: Optional[str]) -> Optional[int]:
     return int(m.group(1))
 
 
+def _first_diff_byte_offset(expected: bytes, actual: bytes) -> int:
+    """
+    Return the byte index of the first differing byte between two byte
+    strings. If one is a strict prefix of the other (no differing byte
+    within the shared overlap), return the length of the shorter string
+    (the point of divergence).
+    """
+    overlap = min(len(expected), len(actual))
+    for i in range(overlap):
+        if expected[i] != actual[i]:
+            return i
+    return overlap
+
+
 def verify_controlled_publisher_comment_id_binding(
     issue_number: int,
     repo: str,
     expected_comment_id: Optional[int],
     expected_body_sha256: Optional[str] = None,
+    expected_body_text: Optional[str] = None,
+    diagnostics_out: Optional[dict[str, Any]] = None,
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> tuple[bool, Optional[str]]:
     """
@@ -823,6 +839,16 @@ def verify_controlled_publisher_comment_id_binding(
     Fail-closed (#1475 fix_delta P1 item 3): a missing/invalid id, fetch
     error, invalid payload, id mismatch, issue mismatch, untrusted publisher
     identity, or body hash mismatch all return (False, <reason_code>).
+
+    #1513 AC1/AC2: when the caller holds the expected body text in scope (not
+    only its sha256) and passes it via `expected_body_text`, a
+    `binding_body_hash_mismatch` also populates `diagnostics_out` (if
+    provided) with bounded UTF-8 byte-level diagnostics:
+    `expected_byte_len` / `actual_byte_len` / `first_diff_byte_offset` /
+    `expected_sha` / `actual_sha`. When `expected_body_text` is not supplied
+    (only `expected_body_sha256` is known to the caller), no diagnostics are
+    synthesized -- `diagnostics_out` (if provided) is left untouched so no
+    dummy byte-length/offset values are ever fabricated.
 
     This function only re-validates the state of the comment id at the
     moment it is called (publish-time direct GET). It does NOT by itself
@@ -903,6 +929,24 @@ def verify_controlled_publisher_comment_id_binding(
         body = str(payload.get("body") or "")
         actual_body_sha256 = sha256_of(body)
         if actual_body_sha256 != expected_body_sha256:
+            # #1513 AC1/AC2: only compute byte-level diagnostics when the
+            # caller supplied the expected body text itself (not only its
+            # sha256). No dummy expected_byte_len/first_diff_byte_offset is
+            # ever synthesized from the hash alone.
+            if expected_body_text is not None and diagnostics_out is not None:
+                expected_bytes = expected_body_text.encode("utf-8")
+                actual_bytes = body.encode("utf-8")
+                diagnostics_out.update(
+                    {
+                        "expected_byte_len": len(expected_bytes),
+                        "actual_byte_len": len(actual_bytes),
+                        "first_diff_byte_offset": _first_diff_byte_offset(
+                            expected_bytes, actual_bytes
+                        ),
+                        "expected_sha": expected_body_sha256,
+                        "actual_sha": actual_body_sha256,
+                    }
+                )
             return False, "binding_body_hash_mismatch"
 
     return True, None
@@ -1033,6 +1077,13 @@ def ensure_contract_snapshot(
     existing_go_result: Optional[dict[str, Any]] = None
     existing_go_authority: Optional[tuple[str, str, str]] = None
     existing_go_base_binding_drift = False
+    # #1513 AC3: distinct from existing_go_base_binding_drift (a candidate
+    # DID pass trusted+fingerprint-ready filtering but its base ref/sha is
+    # stale) -- this flags the separate case where a status: go comment
+    # exists but is excluded from find_latest_go(trusted_only=True,
+    # fingerprint_ready_only=True) candidacy itself (untrusted publisher or
+    # not fingerprint-ready).
+    go_like_candidate_authority_unmet = False
 
     # Step 1/2: read a candidate snapshot.  A fresh existing go needs one
     # bounded recheck, otherwise a body edit between the two API calls could
@@ -1073,6 +1124,20 @@ def ensure_contract_snapshot(
             # Do not fall back to its trusted-only result: absence of the
             # predicate is non-authoritative by contract.
             go_result = None
+
+        # #1513 AC3: when no trusted+fingerprint-ready go candidate is found,
+        # distinguish "no go-like comment exists at all" (no_existing_go_comment,
+        # unchanged) from "a go-like comment exists but is excluded from
+        # candidacy by trusted_only/fingerprint_ready_only filtering"
+        # (go_like_candidate_authority_unmet, additive-only new
+        # classification). This inspects the already-parsed `results` list
+        # directly (no additional find_latest_go() call) so it does not
+        # disturb existing find_latest_go() call-count/side_effect
+        # expectations in callers/tests.
+        if go_result is None:
+            go_like_candidate_authority_unmet = any(
+                isinstance(r, dict) and r.get("status") == "go" for r in results
+            )
 
         # latest (trusted) blocked retains precedence over existing-go adoption.
         if latest and latest["status"] == "blocked":
@@ -1169,6 +1234,15 @@ def ensure_contract_snapshot(
         if existing_go_base_binding_drift:
             result["errors"].append(
                 "existing_go_base_binding_drift: run issue-contract-review to generate a fresh snapshot"
+            )
+        elif go_like_candidate_authority_unmet:
+            # #1513 AC3: a go-like comment was found by the unfiltered
+            # find_latest_go(), but find_latest_go(trusted_only=True,
+            # fingerprint_ready_only=True) excluded it (untrusted publisher
+            # or not fingerprint-ready) -- distinct from "no candidate at
+            # all" (no_existing_go_comment, AC4).
+            result["errors"].append(
+                "go_like_candidate_authority_unmet: run issue-contract-review to generate a fresh snapshot"
             )
         else:
             result["errors"].append(
@@ -1460,11 +1534,14 @@ def ensure_contract_snapshot(
         # never gates the eventual materialized_go decision on its own, and
         # is discarded once this provisional binding check completes.
         staging_post_body_sha256 = sha256_of(comment_body)
+        staging_binding_diagnostics: dict[str, Any] = {}
         bound_ok, binding_err = verify_controlled_publisher_comment_id_binding(
             issue_number,
             repo,
             expected_comment_id,
             expected_body_sha256=staging_post_body_sha256,
+            expected_body_text=comment_body,
+            diagnostics_out=staging_binding_diagnostics,
         )
         if not bound_ok:
             result["status"] = "controlled_publisher_binding_failed"
@@ -1472,6 +1549,19 @@ def ensure_contract_snapshot(
             result["errors"].append(
                 f"controlled_publisher_binding_failed: {binding_err}"
             )
+            # #1513 AC1: this call site holds the expected staging body text
+            # in scope, so a binding_body_hash_mismatch carries bounded
+            # byte-level diagnostics alongside the reason code.
+            if binding_err == "binding_body_hash_mismatch" and staging_binding_diagnostics:
+                result["errors"].append(
+                    "binding_body_hash_mismatch_diagnostics: "
+                    f"expected_byte_len={staging_binding_diagnostics['expected_byte_len']} "
+                    f"actual_byte_len={staging_binding_diagnostics['actual_byte_len']} "
+                    "first_diff_byte_offset="
+                    f"{staging_binding_diagnostics['first_diff_byte_offset']} "
+                    f"expected_sha={staging_binding_diagnostics['expected_sha']} "
+                    f"actual_sha={staging_binding_diagnostics['actual_sha']}"
+                )
             return result
 
         # #1537 AC1 (two-phase materialize, step 2): the real comment id is
@@ -1512,11 +1602,14 @@ def ensure_contract_snapshot(
         # verify_snapshot_authority_postcondition anchor call below so both
         # authority checks are bound to the exact same digest.
         final_persisted_body_sha256 = sha256_of(final_comment_body)
+        final_binding_diagnostics: dict[str, Any] = {}
         final_bound_ok, final_binding_err = verify_controlled_publisher_comment_id_binding(
             issue_number,
             repo,
             expected_comment_id,
             expected_body_sha256=final_persisted_body_sha256,
+            expected_body_text=final_comment_body,
+            diagnostics_out=final_binding_diagnostics,
         )
         if not final_bound_ok:
             result["status"] = "controlled_publisher_binding_failed"
@@ -1524,6 +1617,19 @@ def ensure_contract_snapshot(
             result["errors"].append(
                 f"fingerprint_patch_binding_failed: {final_binding_err}"
             )
+            # #1513 AC1: this call site holds the expected final (PATCHed)
+            # body text in scope, so a binding_body_hash_mismatch carries
+            # bounded byte-level diagnostics alongside the reason code.
+            if final_binding_err == "binding_body_hash_mismatch" and final_binding_diagnostics:
+                result["errors"].append(
+                    "binding_body_hash_mismatch_diagnostics: "
+                    f"expected_byte_len={final_binding_diagnostics['expected_byte_len']} "
+                    f"actual_byte_len={final_binding_diagnostics['actual_byte_len']} "
+                    "first_diff_byte_offset="
+                    f"{final_binding_diagnostics['first_diff_byte_offset']} "
+                    f"expected_sha={final_binding_diagnostics['expected_sha']} "
+                    f"actual_sha={final_binding_diagnostics['actual_sha']}"
+                )
             return result
 
         # The POST/PATCH/read-back sequence is not an atomic transaction with
