@@ -407,18 +407,79 @@ hook_boundaries_manifest_v1:
       - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
       - "UserPromptSubmit"
     timeout: 2
-    classification: blocker
-    fail_policy: fail_closed
+    classification: telemetry
+    fail_policy: fail_open
     script_exit_contract:
       normal: 0
-      block: 2
       internal_producer_failure: 0
     claude_event_semantics:
       event: UserPromptSubmit
       exit_2_effect: blocks_prompt_submission
       other_nonzero_effect: non_blocking_error_or_stderr_visible
     stdout_contract: silent
-    stderr_contract: structural_block_reason_on_block_else_silent
+    stderr_contract: advisory_mismatch_reason_on_mismatch_else_silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2625（Issue #2564 / PR #2615 の "wrong-primary-prompt" hard block を supersede、
+      Owner Decision）: ordinary UserPromptSubmit はもはや Task Context を理由に prompt
+      submission を停止しない。service（`task_context_hook_flows.on_user_prompt_submit`）は
+      ACTIVE current Activity + different high-confidence primary target を検出しても
+      `decision: pass` を返す（旧 `decision: block` は撤去）。adapter 側にも
+      "genuine decision は block する" という carve-out はもう存在せず、`main()` は
+      event == "UserPromptSubmit" で常に exit 0 を返す（adapter-level 二重 fail-open
+      invariant、AC3 -- service が regression/version skew で予期せず `decision: block` を
+      返しても block は再導入されない）。mismatch（`different_primary_target_active`）は
+      current Task/Activity/Binding を一切変更せず、target ref の claim も silent rebind も
+      行わず、EventJournal への必須記録（`status="pass"` の non-blocking observation。
+      hard-block state を示す `status="block"` ではない）と stderr 上の advisory 診断のみで
+      扱う（AC1/AC2）。
+
+      `/task <target>` の state-changing authority はこのイベントから完全に撤去された
+      （AC6）。raw prompt 文字列の `/task` special-case 判定（`classifier._SLASH_TASK_RE`）
+      は classification 結果としては引き続き観測されるが、`on_user_prompt_submit` はこれを
+      他の no-mutation kind（NONE/REFERENCE_ONLY/AMBIGUOUS）と同列の非破壊 no-op として扱う
+      のみで、一切の Task/Activity/Binding mutation を行わない。`/task` の唯一の
+      state-changing 経路は `UserPromptExpansion`（handler_id: hook_entry, event:
+      UserPromptExpansion, matcher: task）へ一本化された（下記エントリ参照）。
+
+      timeout 予算は既定 30 秒ではなく HOT_PATH_TIMEOUT_SECONDS=1 秒の bounded hot-path
+      budget（既存 SQLite busy_timeout 200ms との整合、PR #2615 fix_delta 6 を維持）。
+      adapter 自身の transport failure（DB busy/unavailable/timeout/CLI crash/malformed
+      envelope）は既定で fail-open（decision を pass にフォールバックし exit 0 のまま
+      Claude へ処理を続けさせる）。このイベントにはもはや fail-closed carve-out が一切
+      存在しない（`/task` 失敗時の fail-closed 例外は UserPromptExpansion 側にのみ残る）。
+      fix_delta 6 により、bare `#N` 等 current_repo 解決が実際に必要なプロンプトのみ
+      `git remote get-url origin` subprocess を呼ぶ（classifier.needs_current_repo_resolution
+      による lexical pre-check）。fix_delta 2 により、DB 書き込みが commit した後にのみ
+      Herdr projection flush を detached subprocess（`projection_flush_entry.py`）として
+      起動し、hot path 自体は待たない。
+
+  - handler_id: hook_entry
+    event: UserPromptExpansion
+    matcher: task
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "UserPromptExpansion"
+    timeout: 2
+    classification: blocker
+    fail_policy: fail_closed
+    script_exit_contract:
+      normal: 0
+      block: 2
+      internal_producer_failure: 2
+    claude_event_semantics:
+      event: UserPromptExpansion
+      exit_2_effect: unknown_pending_upstream_claude_code_docs_confirmation
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: silent
+    stderr_contract: structural_command_failure_reason_on_block_else_silent
     redaction_contract:
       no_raw_command: true
       no_raw_secret_like_value: true
@@ -428,28 +489,35 @@ hook_boundaries_manifest_v1:
       on_nonzero: stop_tool_call
       on_zero: proceed
     notes: >
-      Issue #2564 (PR #2615) の wrong-primary-prompt guard（AC4/AC12）。ここでの exit 2 は
-      「tool call」ではなく prompt そのものが Claude へ渡る前に block されることを指す
-      （agent_action.on_nonzero の `stop_tool_call` は本 manifest の固定語彙をそのまま流用しており、
-      実際の効果は claude_event_semantics.exit_2_effect: blocks_prompt_submission を正とする）。
+      Issue #2625 AC6: `/task <target>` の state-changing authority を、`UserPromptSubmit` の
+      raw 文字列 special-case（Issue #2564 / PR #2615）から、Claude Code の
+      `UserPromptExpansion` command lifecycle（`command_name == "task"`、`command_args` から
+      target を構造的に受け取る、user-typed slash/Skill command 専用の別イベント）へ一本化する。
+      `matcher: task` はこのリポジトリの `scripts/agent-ops/run_worktree_agent_runtime_smoke.py`
+      が別目的（Issue #2498 runtime-smoke）で既に確認済みの `command_name`/`command_args`/
+      `command_source` payload shape を前提とする。
 
-      classification: blocker / fail_policy: fail_closed は「genuine decision（different-primary-target
-      block、`/task` 検証失敗）は必ず block する」という契約を指す。timeout 予算は既定 30 秒ではなく
-      HOT_PATH_TIMEOUT_SECONDS=1 秒の bounded hot-path budget（既存 SQLite busy_timeout 200ms との整合、
-      PR #2615 fix_delta 6）。
+      `command_name != "task"` の呼び出しは `_apply_user_prompt_expansion_fields` /
+      `task_context_hook_flows.on_user_prompt_expansion` のいずれでも常に無条件で
+      `decision: pass` かつ exit 0 とし、他の Skill/command の expansion を一切妨げない
+      （agent_action.on_zero の "proceed" はこの no-op 経路を含む）。`command_name == "task"`
+      のときのみ、target 解析済み文字列から atomic rebind（現在 ACTIVE な Task/Activity を
+      無条件に supersede）を試みる。成功時は exit 0。target validation failure
+      （target 不在）・persistence failure・adapter 自身の transport failure / invalid result
+      envelope はいずれも exit 2 として明示的にこの `/task` command 自体を失敗させ、
+      rebind 成功を偽装しない（PR #2615 fix_delta 4 の carve-out をこのイベントへ継承）。
 
-      重要な非対称性（Issue #2564 In Scope の DB busy/unavailable fail policy）: adapter 自身の transport
-      failure（DB busy/unavailable/timeout/CLI crash/malformed envelope）は既定で **fail-open**
-      （decision を pass にフォールバックし exit 0 のまま Claude へ処理を続けさせる）。唯一の例外が
-      PR #2615 fix_delta 4 の carve-out で、classifier が `/task <target>` （`classification_kind ==
-      "SLASH_TASK"`）と判定したプロンプトに限り、同じ transport failure / invalid envelope /
-      persistence failure でも fail-open にはせず exit 2 を返す（`/task` は明示的な state-changing
-      command であり、rebind 成功を偽装してはならないため）。それ以外のプロンプト種別は本表の
-      fail_policy: fail_closed が指す「genuine decision」経路のみが block し、adapter 自身の内部障害は
-      block しない。fix_delta 6 により、bare `#N` 等 current_repo 解決が実際に必要なプロンプトのみ
-      `git remote get-url origin` subprocess を呼ぶ（classifier.needs_current_repo_resolution による
-      lexical pre-check）。fix_delta 2 により、DB 書き込みが commit した後にのみ Herdr projection flush を
-      detached subprocess（`projection_flush_entry.py`）として起動し、hot path 自体は待たない。
+      `exit_2_effect: unknown_pending_upstream_claude_code_docs_confirmation` としているのは、
+      `UserPromptExpansion` の exit 2 が Claude Code 側で実際にどう作用するか（command 自体を
+      失敗させるのか、何らかの別の効果を持つのか）を一次資料で確定できていないため
+      （`UserPromptSubmit` の確認済み `blocks_prompt_submission` をそのまま流用しない、
+      Required Skills: Claude Code hooks 公式仕様の一次資料読解）。classification: blocker /
+      fail_policy: fail_closed は「`command_name == "task"` の target validation / persistence
+      failure は必ず `/task` command を失敗させる」という契約を指し、`UserPromptSubmit` 側の
+      "prompt processing 自体を止める" 意味とは異なる（agent_action.on_nonzero の
+      `stop_tool_call` は本 manifest の固定語彙をそのまま流用しており、実際の効果は
+      「`/task` command 自体の失敗」であって「tool call の停止」ではない）。raw prompt/
+      command_args 文字列自体は `events.metadata_json` へは書き込まない（AC8）。
 
   - handler_id: hook_entry
     event: CwdChanged
@@ -726,8 +794,8 @@ Stop / StopFailure / SubagentStop / PostToolUse で実際に動作する `sessio
 | `session_manifest_coordinator.sh`（StopFailure） | telemetry | 継続 |
 | `session_manifest_coordinator.sh`（SubagentStop） | telemetry | 継続 |
 | `session_manifest_debounce.mjs` | telemetry | 継続 |
-| `hook_entry.py`（SessionStart/CwdChanged/SubagentStart/SessionEnd/Stop/StopFailure/SubagentStop） | telemetry | 継続（`main()` はこれらの event で非ゼロを返す分岐を持たない） |
-| `hook_entry.py`（UserPromptSubmit） | blocker（genuine decision のみ。adapter 自身の transport failure は fail-open。`/task` 失敗時のみ例外的に fail-closed、PR #2615 fix_delta 4） | **prompt submission を停止**（different-primary-target guard、`/task` 検証失敗時） |
+| `hook_entry.py`（SessionStart/UserPromptSubmit/CwdChanged/SubagentStart/SessionEnd/Stop/StopFailure/SubagentStop） | telemetry | 継続（`main()` はこれらの event で非ゼロを返す分岐を持たない。Issue #2625: UserPromptSubmit の different-primary-target mismatch は advisory のみで、prompt submission は停止しない） |
+| `hook_entry.py`（UserPromptExpansion, matcher: task） | blocker（`command_name == "task"` の target validation / persistence failure、および adapter 自身の transport failure / invalid envelope のみ。`command_name != "task"` は常に exit 0） | **`/task` command 自体を停止**（他 Skill/command の expansion は一切妨げない。Issue #2625: `/task` の state-changing authority は UserPromptSubmit の raw 文字列 special-case からこのイベントへ移った） |
 
 ### local_main_branch_guard の gh CLI コマンド 5 分類（#1124）
 
