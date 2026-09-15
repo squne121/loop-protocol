@@ -328,6 +328,61 @@ class TestCheckOnlyMode:
         assert result["status"] == "human_judgment"
         assert result["source"] == "readiness_blocked"
 
+    def test_no_candidate_at_all_still_returns_no_existing_go_comment(self, monkeypatch):
+        """#1513 AC4: with zero parsed results (no candidate of any kind),
+        the reason code stays no_existing_go_comment -- not the new
+        go_like_candidate_authority_unmet classification (non-regression)."""
+        parser_mod = _mock_parser_mod(comments=[], go_comment=None, latest=None)
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                result = ensure_contract_snapshot(
+                    issue_number=_ISSUE_NUMBER,
+                    repo=_REPO,
+                    mode="check-only",
+                )
+
+        assert result["status"] == "human_judgment"
+        assert any("no_existing_go_comment" in e for e in result["errors"])
+        assert not any("go_like_candidate_authority_unmet" in e for e in result["errors"])
+
+    def test_go_like_candidate_excluded_by_authority_returns_new_reason_code(self, monkeypatch):
+        """#1513 AC3: a go-status comment is present in the parsed results
+        (find_latest_result() detects a candidate) but is excluded from
+        find_latest_go(trusted_only=True, fingerprint_ready_only=True)
+        candidacy (untrusted publisher or not fingerprint-ready) -> the new
+        go_like_candidate_authority_unmet reason code, distinct from
+        no_existing_go_comment."""
+        go_like_result = {
+            "comment_id": 1001,
+            "html_url": _GO_COMMENT["html_url"],
+            "created_at": "2026-06-13T08:00:00Z",
+            "status": "go",
+            "inner": _fresh_inner(_SAMPLE_BODY_SHA256),
+        }
+        parser_mod = MagicMock()
+        parser_mod.fetch_issue_comments.return_value = ([_GO_COMMENT], None)
+        parser_mod.parse_contract_review_results.return_value = [go_like_result]
+        # trusted_only=True excludes the untrusted-author go comment from
+        # both latest-result precedence and go candidacy.
+        parser_mod.find_latest_result.return_value = None
+        parser_mod.find_latest_go.return_value = None
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                result = ensure_contract_snapshot(
+                    issue_number=_ISSUE_NUMBER,
+                    repo=_REPO,
+                    mode="check-only",
+                )
+
+        assert result["status"] == "human_judgment"
+        assert result["source"] == "readiness_blocked"
+        assert any("go_like_candidate_authority_unmet" in e for e in result["errors"])
+        assert not any(
+            e.startswith("no_existing_go_comment") for e in result["errors"]
+        )
+
     def test_latest_blocked_returns_blocked_needs_refinement(self, monkeypatch):
         """Latest result is blocked → blocked_needs_refinement."""
         latest = {
@@ -1723,7 +1778,7 @@ class TestFingerprintMaterializeEndToEnd:
 
         patched_calls = []
 
-        def fake_patch(issue_number, repo, comment_id, body, timeout=30):
+        def fake_patch(issue_number, repo, comment_id, body, **kwargs):
             patched_calls.append((comment_id, body))
             return (True, None)
 
@@ -1815,6 +1870,135 @@ class TestFingerprintMaterializeEndToEnd:
 
         assert result["status"] == "controlled_publisher_binding_failed"
         assert result["contract_snapshot_url"] is None
+
+    def test_final_patch_internal_get_reconciliation_body_hash_mismatch_surfaces_bounded_diagnostics(
+        self, monkeypatch
+    ):
+        """#1513 P2 fix_delta regression.
+
+        When patch_comment()'s own internal GET reconciliation (the GET it
+        performs right after the final fingerprint PATCH) observes a
+        binding_body_hash_mismatch on the final PATCHed body, the bounded
+        byte-level diagnostics it computes must reach
+        ensure_contract_snapshot()'s result["errors"] -- not be dropped at
+        patch_comment()'s own (bool, reason_code) return.
+
+        This exercises the real patch_comment() and real
+        verify_controlled_publisher_comment_id_binding() production code
+        path end-to-end (both restored from the file's autouse
+        return-value-only mock), not a mocked return value.
+        """
+        parser_mod = _mock_parser_mod(comments=[], go_comment=None, latest=None)
+        parser_mod.parse_contract_review_results.return_value = []
+        parser_mod.find_latest_go.return_value = None
+        parser_mod.find_latest_result.return_value = None
+        # Wire the trust check through to the real parser implementation so
+        # this end-to-end run exercises real publisher-trust logic too, not
+        # just a MagicMock truthy default.
+        parser_mod.is_trusted_snapshot_author = _parser_mod.is_trusted_snapshot_author
+
+        review_result = _make_review_result("go")
+        real_comment_id = 555777
+        real_url = f"{_ISSUE_URL}#issuecomment-{real_comment_id}"
+        tampered_final_body = (
+            "tampered persisted body observed by patch_comment's internal GET"
+        )
+        endpoint = f"repos/{_REPO}/issues/comments/{real_comment_id}"
+
+        staged_bodies: list[str] = []
+
+        def fake_post(issue_number, repo, body, timeout=30):
+            staged_bodies.append(body)
+            return (real_url, POST_STATUS_POSTED, None)
+
+        call_log = {"get": 0, "patch": 0}
+
+        def fake_run(command, *, input=None, **kwargs):
+            trusted_user = {"login": "squne121", "id": 63350259, "type": "User"}
+            if "--method" in command:
+                assert command[command.index("--method") + 1] == "PATCH"
+                call_log["patch"] += 1
+                return MagicMock(returncode=0, stdout=b"", stderr=b"")
+            assert command[-1] == endpoint
+            call_log["get"] += 1
+            if call_log["get"] == 1:
+                # Staging binding GET, invoked directly inside
+                # ensure_contract_snapshot right after post_comment()
+                # succeeds: must exactly match the just-staged body so the
+                # flow proceeds to the fingerprint PATCH step below.
+                body = staged_bodies[0]
+            else:
+                # patch_comment()'s own internal GET reconciliation after
+                # the PATCH: deliberately diverges from the final PATCHed
+                # body so its internal binding check observes a mismatch.
+                body = tampered_final_body
+            payload = {
+                "id": real_comment_id,
+                "issue_url": f"https://api.github.com/repos/{_REPO}/issues/{_ISSUE_NUMBER}",
+                "html_url": f"{_ISSUE_URL}#issuecomment-{real_comment_id}",
+                "user": trusted_user,
+                "author_association": "OWNER",
+                "body": body,
+            }
+            return MagicMock(
+                returncode=0, stdout=json.dumps(payload).encode("utf-8"), stderr=b""
+            )
+
+        monkeypatch.setattr(
+            _ecs_mod, "capture_base_ref_and_sha", lambda *a, **kw: ("main", "d" * 40)
+        )
+        # #1513 P2 fix_delta: explicitly restore the real functions the
+        # file-wide autouse fixture mocks to a static (True, None), so this
+        # regression actually walks the production patch_comment() ->
+        # verify_controlled_publisher_comment_id_binding() code path.
+        monkeypatch.setattr(_ecs_mod, "patch_comment", patch_comment)
+        monkeypatch.setattr(
+            _ecs_mod,
+            "verify_controlled_publisher_comment_id_binding",
+            _real_verify_controlled_publisher_comment_id_binding,
+        )
+        monkeypatch.setattr(_ecs_mod.subprocess, "run", fake_run)
+
+        with patch.object(_ecs_mod, "_import_parser_module", return_value=parser_mod):
+            with patch.object(_ecs_mod, "fetch_issue_snapshot", return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None)):
+                with patch.object(_ecs_mod, "run_contract_review_once", return_value=(review_result, None)):
+                    with patch.object(_ecs_mod, "post_comment", side_effect=fake_post):
+                        result = ensure_contract_snapshot(
+                            issue_number=_ISSUE_NUMBER,
+                            repo=_REPO,
+                            mode="auto",
+                            do_post=True,
+                        )
+
+        assert result["status"] == "controlled_publisher_binding_failed"
+        assert result["contract_snapshot_url"] is None
+        assert call_log["patch"] == 1
+        assert call_log["get"] == 2
+
+        patch_failed_errors = [
+            e for e in result["errors"] if e.startswith("fingerprint_patch_failed:")
+        ]
+        assert patch_failed_errors == [
+            "fingerprint_patch_failed: patch_get_reconciliation_failed:binding_body_hash_mismatch"
+        ]
+
+        diagnostics_errors = [
+            e
+            for e in result["errors"]
+            if e.startswith("binding_body_hash_mismatch_diagnostics:")
+        ]
+        assert len(diagnostics_errors) == 1
+        diag = diagnostics_errors[0]
+        # The final PATCHed body text itself is constructed internally by
+        # _build_contract_review_comment and not directly captured by this
+        # test's doubles, so assert on the fields whose values are
+        # independently known to this test (the tampered actual body, and
+        # the presence of every bounded diagnostics field) instead.
+        assert "expected_byte_len=" in diag
+        assert "first_diff_byte_offset=" in diag
+        assert "expected_sha=" in diag
+        assert f"actual_byte_len={len(tampered_final_body.encode('utf-8'))}" in diag
+        assert f"actual_sha={sha256_of(tampered_final_body)}" in diag
 
 
 class TestExistingGoFingerprintReuseGate:
@@ -1968,7 +2152,7 @@ class TestExistingGoBaseBindingFreshness:
         posted_url = f"{_ISSUE_URL}#issuecomment-{posted_comment_id}"
         patched_bodies = []
 
-        def fake_patch(_issue, _repo, comment_id, body, timeout=30):
+        def fake_patch(_issue, _repo, comment_id, body, **kwargs):
             assert comment_id == posted_comment_id
             patched_bodies.append(body)
             return True, None
@@ -2704,6 +2888,59 @@ class TestControlledPublisherCommentIdBinding:
         assert bound_ok is False
         assert reason == "binding_body_hash_mismatch"
 
+    def test_binding_verification_body_hash_mismatch_with_expected_body_text_populates_diagnostics(self):
+        """#1513 AC1: when the caller supplies expected_body_text (holds the
+        expected body in scope, not only its sha256), a
+        binding_body_hash_mismatch populates diagnostics_out with bounded
+        UTF-8 byte-level diagnostics."""
+        expected_body = "expected-body"
+        actual_body = "different-body-than-expected"
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(body=actual_body)
+            )
+            diagnostics: dict = {}
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER,
+                _AB_REPO,
+                1234,
+                expected_body_sha256=_ecs_mod.sha256_of(expected_body),
+                expected_body_text=expected_body,
+                diagnostics_out=diagnostics,
+            )
+        assert bound_ok is False
+        assert reason == "binding_body_hash_mismatch"
+        assert diagnostics["expected_byte_len"] == len(expected_body.encode("utf-8"))
+        assert diagnostics["actual_byte_len"] == len(actual_body.encode("utf-8"))
+        assert diagnostics["first_diff_byte_offset"] == 0
+        assert diagnostics["expected_sha"] == _ecs_mod.sha256_of(expected_body)
+        assert diagnostics["actual_sha"] == _ecs_mod.sha256_of(actual_body)
+
+    def test_binding_verification_body_hash_mismatch_without_expected_body_text_no_dummy_diagnostics(self):
+        """#1513 AC2: when only expected_body_sha256 is passed (the caller
+        does not hold the expected body text in scope), no dummy
+        expected_byte_len / first_diff_byte_offset diagnostics are
+        synthesized -- diagnostics_out stays empty."""
+        with patch("subprocess.run") as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = json.dumps(
+                self._full_payload(body="different-body-than-expected")
+            )
+            diagnostics: dict = {}
+            bound_ok, reason = _ab_real_verify_controlled_publisher_comment_id_binding(
+                _AB_ISSUE_NUMBER,
+                _AB_REPO,
+                1234,
+                expected_body_sha256=_ecs_mod.sha256_of("expected-body"),
+                diagnostics_out=diagnostics,
+            )
+        assert bound_ok is False
+        assert reason == "binding_body_hash_mismatch"
+        assert diagnostics == {}
+        assert "expected_byte_len" not in diagnostics
+        assert "first_diff_byte_offset" not in diagnostics
+
     def test_binding_verification_body_hash_match_succeeds(self):
         with patch("subprocess.run") as run_mock:
             run_mock.return_value.returncode = 0
@@ -3342,6 +3579,108 @@ class TestPatchCommentTransportAndReconciliation:
         assert error == f"patch_get_reconciliation_failed:{expected_error}"
         assert len(calls["patch"]) == 1
         assert len(calls["get"]) == 1
+
+    def test_body_hash_mismatch_at_internal_get_reconciliation_populates_diagnostics_when_expected_body_text_passed(
+        self, monkeypatch
+    ):
+        """#1513 P2 fix_delta: patch_comment() must forward
+        expected_body_text / diagnostics_out through to its internal GET
+        reconciliation call (the PATCH-success branch) so a
+        binding_body_hash_mismatch there also carries bounded byte-level
+        diagnostics, not just the (False, reason_code) tuple."""
+        remote = self._trusted_remote_comment("before")
+
+        def tamper_readback(comment):
+            comment["body"] = "wrong final body"
+
+        calls = self._install_remote_boundary(
+            monkeypatch, remote, "body_mismatch", after_patch=tamper_readback
+        )
+
+        final_body = "final body"
+        diagnostics: dict = {}
+        ok, error = _ecs_mod.patch_comment(
+            _ISSUE_NUMBER,
+            _REPO,
+            self._COMMENT_ID,
+            final_body,
+            expected_body_text=final_body,
+            diagnostics_out=diagnostics,
+        )
+
+        assert ok is False
+        assert error == "patch_get_reconciliation_failed:binding_body_hash_mismatch"
+        assert len(calls["patch"]) == 1
+        assert len(calls["get"]) == 1
+        assert diagnostics["expected_byte_len"] == len(final_body.encode("utf-8"))
+        assert diagnostics["actual_byte_len"] == len("wrong final body".encode("utf-8"))
+        assert diagnostics["expected_sha"] == _ecs_mod.sha256_of(final_body)
+        assert diagnostics["actual_sha"] == _ecs_mod.sha256_of("wrong final body")
+        assert "first_diff_byte_offset" in diagnostics
+
+    @pytest.mark.parametrize(
+        "patch_behavior", ["patch_success", "patch_nonzero", "patch_timeout"]
+    )
+    def test_all_three_internal_get_reconciliation_paths_forward_expected_body_text_and_diagnostics(
+        self, monkeypatch, patch_behavior
+    ):
+        """#1513 P2 fix_delta (optional parametrize): all three
+        patch_comment() internal GET reconciliation call sites -- after a
+        successful PATCH subprocess exit, after a non-zero PATCH transport
+        exit, and after a PATCH subprocess timeout -- must forward
+        expected_body_text / diagnostics_out through to
+        verify_controlled_publisher_comment_id_binding() so a
+        binding_body_hash_mismatch observed on any of the three carries
+        bounded diagnostics."""
+        remote = self._trusted_remote_comment("wrong final body")
+        endpoint = f"repos/{_REPO}/issues/comments/{self._COMMENT_ID}"
+
+        def fake_run(command, *, input=None, **kwargs):
+            if "--method" in command:
+                if patch_behavior == "patch_success":
+                    return MagicMock(returncode=0, stdout=b"", stderr=b"")
+                if patch_behavior == "patch_nonzero":
+                    return MagicMock(returncode=1, stdout=b"", stderr=b"boom")
+                raise _ecs_mod.subprocess.TimeoutExpired(cmd=command, timeout=30)
+            assert command[-1] == endpoint
+            return MagicMock(
+                returncode=0, stdout=json.dumps(remote).encode("utf-8"), stderr=b""
+            )
+
+        monkeypatch.setattr(_ecs_mod.subprocess, "run", fake_run)
+        # #1513 P2 fix_delta: this test must exercise the real production
+        # chain (patch_comment() -> verify_controlled_publisher_comment_id_
+        # binding()); the file-wide autouse fixture otherwise mocks both to
+        # a static (True, None).
+        monkeypatch.setattr(
+            _ecs_mod,
+            "verify_controlled_publisher_comment_id_binding",
+            _real_verify_controlled_publisher_comment_id_binding,
+        )
+
+        final_body = "final body"
+        diagnostics: dict = {}
+        ok, error = patch_comment(
+            _ISSUE_NUMBER,
+            _REPO,
+            self._COMMENT_ID,
+            final_body,
+            expected_body_text=final_body,
+            diagnostics_out=diagnostics,
+        )
+
+        assert ok is False
+        if patch_behavior == "patch_success":
+            assert error == "patch_get_reconciliation_failed:binding_body_hash_mismatch"
+        elif patch_behavior == "patch_nonzero":
+            assert error == "patch_transport_unreconciled"
+        else:
+            assert error == "patch_timeout_unreconciled"
+        assert diagnostics["expected_byte_len"] == len(final_body.encode("utf-8"))
+        assert diagnostics["actual_byte_len"] == len("wrong final body".encode("utf-8"))
+        assert diagnostics["expected_sha"] == _ecs_mod.sha256_of(final_body)
+        assert diagnostics["actual_sha"] == _ecs_mod.sha256_of("wrong final body")
+        assert "first_diff_byte_offset" in diagnostics
 
 
 class TestPostCommentTransportAndReconciliation:
