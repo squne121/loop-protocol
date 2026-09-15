@@ -93,15 +93,17 @@ def resolve_current_tab_id(
 
 
 def build_tab_label(task: dict[str, Any] | None, activity: dict[str, Any] | None, task_refs: list) -> str:
-    """`#N · refine|impl|cleanup`等の瞬間識別を優先する Herdr Tab label."""
+    """Herdr Tab label (Issue #2634): bound 時は `#<N>`（``task_refs`` があれば）
+    または `adhoc`（なければ）のみ。unbound（``task`` が ``None``）時は
+    `Unbound`。タブ本数を圧迫しないよう activity kind サフィックスは持たない
+    (``activity`` はシグネチャ互換のため保持するが未使用 -- Issue #2634 In
+    Scope: "`· <kind>` の activity kind サフィックスを除去する")."""
+    del activity  # unused: kept for call-site signature compatibility (Issue #2634 Stop Conditions)
     if task is None:
-        return "task-ctx: unbound"
+        return "Unbound"
     if task_refs:
-        ident = f"#{task_refs[0]['ref_number']}"
-    else:
-        ident = "adhoc"
-    kind = activity["kind"] if activity else "-"
-    return f"{ident} · {kind}"
+        return f"#{task_refs[0]['ref_number']}"
+    return "adhoc"
 
 
 def build_pane_tokens(
