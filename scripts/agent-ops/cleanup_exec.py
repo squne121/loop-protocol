@@ -28,13 +28,26 @@ and, if so, authorizes a ``git branch -D`` branch-only cleanup.
 ``verify_cleanup_authorization`` is NOT changed and ``materialize_cleanup_contract``
 cannot reach the branch-only verifier.
 
-Squash-merge head-OID equivalence (Issue #1337): GitHub squash merge always mints
-a brand-new commit SHA for the default branch, so ``headRefOid`` never equals the
-feature branch tip even when content is identical. ``_resolve_head_equivalence()``
-authorizes cleanup via delta-equivalence ONLY when the candidate merge commit is
-verified to be a genuine squash-shaped commit (object exists locally AND has
-EXACTLY ONE parent). Normal merge commits (2+ parents) always fail-closed to the
-existing exact-OID comparison.
+Squash-merge head-OID equivalence (Issue #1337, corrected in Issue #2628):
+terminology — H = the PR's ``headRefOid`` (the PR head branch tip as GitHub
+reports it), L = the local branch tip (``local_tip``, the worktree's branch
+ref), M = the squash-merge commit GitHub mints on the base branch
+(``pr.mergeCommit.oid``).
+
+squash merge自体はfeature branch側の履歴（H→Lの親子関係）自体を書き換えない
+— GitHub の squash merge は base branch 上に M を新規発行するだけであり、
+feature branch 側の commit グラフには一切手を加えないため、通常のケースでは
+H は L の祖先であり続ける（あるいは、それ以上ローカルでコミットが積まれてい
+なければ H はそのまま L と一致する）。``headRefOid``
+（H）が ``local_tip``（L）と食い違うのは、squash merge というイベント自体が
+原因ではなく、PR マージ後にローカルブランチで amend・rebase・追加コミットな
+どが行われた結果である。``_resolve_head_equivalence()`` はまず H と L の
+厳密一致（exact OID match）を試み、それが失敗した場合にのみ、M が本物の
+squash 形状のコミットであること（ローカルにオブジェクトが存在し、親が
+ちょうど 1 個であること）を検証したうえで、M と L の内容が一致するかという
+delta-equivalence で authorize する。通常の merge commit（親が 2 個以上）は
+常にこの delta-equivalence を使わず、既存の exact-OID 比較のまま fail-closed
+する。
 
 Branch-only compare-and-delete + local-only discard lane (Issue #1523):
 
@@ -645,10 +658,25 @@ def _squash_equivalence_path_set(
     Issue #1337 P1 fix: uses ``git diff --name-only -z`` (NUL-separated output)
     instead of ``--name-only`` + ``splitlines()`` so filenames containing
     newlines or other special characters are handled correctly.
+
+    Issue #2628 fix: passes ``--no-renames`` so this path set is a deterministic
+    enumeration of every changed path, independent of git's content-similarity
+    rename heuristic. Without ``--no-renames``, ``git diff --name-only`` (rename
+    detection ON by default) reports ONLY the post-image path for a detected
+    rename/copy pair and OMITS the pre-image path entirely. If the local branch
+    both deletes a path AND adds a differently-named path whose content is
+    similar enough to be rename-detected, the deleted (pre-image) path silently
+    disappears from this path set, and the downstream ``_squash_content_matches``
+    restricted-path comparison then never inspects it — a genuine, un-integrated
+    local deletion could go unnoticed by the equivalence check. ``--no-renames``
+    makes git report the deletion and the addition as two independent entries
+    instead of collapsing them into a rename pair, so neither is lost. This is
+    the minimal fix (no new similarity heuristic is introduced): every path git
+    would otherwise fold into a rename pair is still individually reported.
     """
     try:
         out = _git(
-            ["-C", project_root, "diff", "--name-only", "-z", merge_base, local_tip],
+            ["-C", project_root, "diff", "--no-renames", "--name-only", "-z", merge_base, local_tip],
             deadline, 15.0,
         )
     except (OSError, subprocess.TimeoutExpired):
