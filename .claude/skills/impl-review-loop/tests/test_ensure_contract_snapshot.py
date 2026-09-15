@@ -20,6 +20,7 @@ import importlib.util
 import inspect
 import json
 import builtins
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -52,6 +53,10 @@ _real_verify_snapshot_authority_postcondition = (
 _real_verify_controlled_publisher_comment_id_binding = (
     _ecs_mod.verify_controlled_publisher_comment_id_binding
 )
+# Issue #2635: captured before any autouse fixture stubs
+# ``_ecs_mod.patch_comment`` to a success-only lambda, so a focused test can
+# restore the real POST/PATCH/GET orchestration end-to-end.
+_real_patch_comment = _ecs_mod.patch_comment
 
 _PARSER_PATH = (
     _HERE.parent.parent / "issue-contract-review" / "scripts"
@@ -3525,3 +3530,182 @@ class TestPostCommentTransportAndReconciliation:
         )
         assert bound_ok is False
         assert binding_err == "binding_body_hash_mismatch"
+
+    def test_staging_final_digest_orchestration_regression_via_real_ensure_contract_snapshot(
+        self, monkeypatch
+    ):
+        """Issue #2635 gap fix.
+
+        The prior tests in this class call ``post_comment()`` and
+        ``verify_controlled_publisher_comment_id_binding()`` directly,
+        without ever going through the real ``ensure_contract_snapshot()``
+        orchestration -- so they cannot detect a production wiring
+        regression where the PATCH-after binding call is accidentally
+        rewired to ``expected_body_sha256=staging_post_body_sha256``
+        (instead of ``final_persisted_body_sha256``).
+
+        This test builds a stateful fake ``gh api`` remote (POST creates a
+        comment holding the staging body; the subsequent single-comment GET
+        and the list-comments GET both reflect whatever is currently
+        persisted; PATCH overwrites the persisted body) and drives the REAL
+        ``ensure_contract_snapshot()`` end-to-end through it, with the real
+        ``verify_controlled_publisher_comment_id_binding()``,
+        ``patch_comment()``, and ``verify_snapshot_authority_postcondition()``
+        (restored here from this file's success-stub autouse fixture) and
+        the real contract-review-result parser module.
+
+        AC2 mutation verification (manual, not committed -- see PR
+        description): temporarily changing the PATCH-after
+        ``verify_controlled_publisher_comment_id_binding()`` call in
+        ``ensure_contract_snapshot.py`` to pass
+        ``expected_body_sha256=staging_post_body_sha256`` makes this test
+        fail, because the fake remote's persisted body at that point is
+        already the final (post-PATCH) body, not the staging body.
+        """
+        remote_comment_id = 2635901
+        remote: dict = {
+            "comments": {},
+            "next_id": remote_comment_id,
+            "staging_body": None,
+            "final_body": None,
+        }
+
+        def fake_run(command, *, input=None, **kwargs):
+            if "--method" in command:
+                method = command[command.index("--method") + 1]
+                url_arg = command[command.index("--method") + 2]
+                if method == "POST":
+                    assert url_arg == f"repos/{_REPO}/issues/{_ISSUE_NUMBER}/comments"
+                    payload = json.loads(input.decode("utf-8"))
+                    comment_id = remote["next_id"]
+                    remote["next_id"] += 1
+                    remote["staging_body"] = payload["body"]
+                    remote["comments"][comment_id] = {
+                        "id": comment_id,
+                        "html_url": f"{_ISSUE_URL}#issuecomment-{comment_id}",
+                        "issue_url": (
+                            f"https://api.github.com/repos/{_REPO}/issues/{_ISSUE_NUMBER}"
+                        ),
+                        "created_at": "2026-06-13T08:00:00Z",
+                        "updated_at": "2026-06-13T08:00:00Z",
+                        "body": payload["body"],
+                        "user": {
+                            "login": "squne121",
+                            "id": 63350259,
+                            "type": "User",
+                        },
+                        "author_association": "OWNER",
+                    }
+                    return MagicMock(
+                        returncode=0,
+                        stdout=remote["comments"][comment_id]["html_url"].encode(
+                            "utf-8"
+                        ),
+                        stderr=b"",
+                    )
+                if method == "PATCH":
+                    comment_id = int(url_arg.rsplit("/", 1)[-1])
+                    payload = json.loads(input.decode("utf-8"))
+                    remote["final_body"] = payload["body"]
+                    remote["comments"][comment_id]["body"] = payload["body"]
+                    remote["comments"][comment_id]["updated_at"] = (
+                        "2026-06-13T09:00:00Z"
+                    )
+                    return MagicMock(returncode=0, stdout=b"", stderr=b"")
+                raise AssertionError(f"unexpected gh api --method {method}")
+
+            if "--paginate" in command:
+                lines = [
+                    json.dumps(
+                        {
+                            "id": c["id"],
+                            "html_url": c["html_url"],
+                            "created_at": c["created_at"],
+                            "updated_at": c["updated_at"],
+                            "body": c["body"],
+                            "author": c["user"]["login"],
+                            "author_id": c["user"]["id"],
+                            "author_type": c["user"]["type"],
+                            "author_association": c["author_association"],
+                        }
+                    )
+                    for c in remote["comments"].values()
+                ]
+                return MagicMock(returncode=0, stdout="\n".join(lines), stderr="")
+
+            last = str(command[-1])
+            m = re.match(
+                rf"repos/{re.escape(_REPO)}/issues/comments/(\d+)$", last
+            )
+            if m:
+                comment_id = int(m.group(1))
+                c = remote["comments"].get(comment_id)
+                if c is None:
+                    return MagicMock(returncode=1, stdout="", stderr="HTTP 404")
+                payload = {
+                    "id": c["id"],
+                    "issue_url": c["issue_url"],
+                    "html_url": c["html_url"],
+                    "user": c["user"],
+                    "author_association": c["author_association"],
+                    "body": c["body"],
+                }
+                return MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+            raise AssertionError(f"unexpected gh api command: {command}")
+
+        monkeypatch.setattr(_ecs_mod.subprocess, "run", fake_run)
+        # Restore the real implementations this file's autouse fixture
+        # otherwise stubs to success -- this test's whole point is to
+        # exercise the real POST/PATCH/GET reconciliation, not a stub.
+        monkeypatch.setattr(
+            _ecs_mod,
+            "verify_controlled_publisher_comment_id_binding",
+            _real_verify_controlled_publisher_comment_id_binding,
+        )
+        monkeypatch.setattr(_ecs_mod, "patch_comment", _real_patch_comment)
+        monkeypatch.setattr(
+            _ecs_mod,
+            "verify_snapshot_authority_postcondition",
+            _real_verify_snapshot_authority_postcondition,
+        )
+
+        review_result = _make_review_result("go")
+
+        with patch.object(
+            _ecs_mod,
+            "_import_parser_module",
+            return_value=_real_parser_mod_for_fp_tests,
+        ):
+            with patch.object(
+                _ecs_mod,
+                "fetch_issue_snapshot",
+                return_value=(_SAMPLE_BODY, _SAMPLE_UPDATED_AT, None),
+            ):
+                with patch.object(
+                    _ecs_mod,
+                    "run_contract_review_once",
+                    return_value=(review_result, None),
+                ):
+                    result = ensure_contract_snapshot(
+                        issue_number=_ISSUE_NUMBER,
+                        repo=_REPO,
+                        mode="auto",
+                        do_post=True,
+                    )
+
+        assert result["status"] == "ok"
+        assert result["source"] == "materialized_go"
+        assert (
+            result["contract_snapshot_url"]
+            == remote["comments"][remote_comment_id]["html_url"]
+        )
+
+        # The precondition the AC2 mutation check depends on: the POST-time
+        # staging body and the post-PATCH final persisted body must actually
+        # be different byte sequences.
+        assert remote["staging_body"] is not None
+        assert remote["final_body"] is not None
+        assert remote["staging_body"] != remote["final_body"]
+        assert sha256_of(remote["staging_body"]) != sha256_of(remote["final_body"])
+        assert remote["comments"][remote_comment_id]["body"] == remote["final_body"]
