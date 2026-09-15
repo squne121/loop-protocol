@@ -324,6 +324,8 @@ def patch_comment(
     repo: str,
     comment_id: int,
     body: str,
+    expected_body_text: Optional[str] = None,
+    diagnostics_out: Optional[dict[str, Any]] = None,
     timeout: int = _DEFAULT_TIMEOUT,
 ) -> tuple[bool, Optional[str]]:
     """
@@ -336,6 +338,15 @@ def patch_comment(
     and the decoded Markdown body's UTF-8 SHA256.  Timeout and transport
     ambiguity use that same GET reconciliation and remain fail-closed unless
     the binding is confirmed.
+
+    #1513 P2 fix_delta: when the caller holds the expected final body text in
+    scope, it may pass `expected_body_text` and a `diagnostics_out` dict so
+    that a `binding_body_hash_mismatch` on this internal GET reconciliation
+    (across all three call sites below) also populates bounded byte-level
+    diagnostics (`expected_byte_len` / `actual_byte_len` /
+    `first_diff_byte_offset` / `expected_sha` / `actual_sha`), matching the
+    same pattern already used by ensure_contract_snapshot's own staging and
+    final binding checks. The public return type is unchanged.
     """
     try:
         payload = json.dumps({"body": body}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -356,18 +367,36 @@ def patch_comment(
             # retry PATCH; the direct binding verifier is the authority for
             # comment id, issue, html_url, publisher, and decoded body hash.
             ok, err = verify_controlled_publisher_comment_id_binding(
-                issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
+                issue_number,
+                repo,
+                comment_id,
+                expected_body_sha256=sha256_of(body),
+                expected_body_text=expected_body_text,
+                diagnostics_out=diagnostics_out,
+                timeout=timeout,
             )
             return (True, None) if ok else (False, f"patch_get_reconciliation_failed:{err}")
 
         # The remote may have applied the update despite a transport error.
         ok, _err = verify_controlled_publisher_comment_id_binding(
-            issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
+            issue_number,
+            repo,
+            comment_id,
+            expected_body_sha256=sha256_of(body),
+            expected_body_text=expected_body_text,
+            diagnostics_out=diagnostics_out,
+            timeout=timeout,
         )
         return (True, None) if ok else (False, "patch_transport_unreconciled")
     except subprocess.TimeoutExpired:
         ok, _err = verify_controlled_publisher_comment_id_binding(
-            issue_number, repo, comment_id, expected_body_sha256=sha256_of(body), timeout=timeout
+            issue_number,
+            repo,
+            comment_id,
+            expected_body_sha256=sha256_of(body),
+            expected_body_text=expected_body_text,
+            diagnostics_out=diagnostics_out,
+            timeout=timeout,
         )
         return (True, None) if ok else (False, "patch_timeout_unreconciled")
     except Exception:
@@ -1586,13 +1615,41 @@ def ensure_contract_snapshot(
             body_sha256=body_sha256,
             expected_contract_fingerprint=expected_contract_fingerprint,
         )
+        # #1513 P2 fix_delta: declared before the patch_comment() call so the
+        # same dict is passed through to patch_comment()'s own internal GET
+        # reconciliation (which may itself be the first GET to observe a
+        # binding_body_hash_mismatch on the final PATCHed body) and reused
+        # verbatim by the final_bound_ok verification below.
+        final_binding_diagnostics: dict[str, Any] = {}
         patch_ok, patch_err = patch_comment(
-            issue_number, repo, expected_comment_id, final_comment_body
+            issue_number,
+            repo,
+            expected_comment_id,
+            final_comment_body,
+            expected_body_text=final_comment_body,
+            diagnostics_out=final_binding_diagnostics,
         )
         if not patch_ok:
             result["status"] = "controlled_publisher_binding_failed"
             result["contract_snapshot_url"] = None
             result["errors"].append(f"fingerprint_patch_failed: {patch_err}")
+            # #1513 P2 fix_delta: patch_comment()'s internal GET reconciliation
+            # may itself observe a binding_body_hash_mismatch on the final
+            # PATCHed body (patch_err takes the form
+            # "patch_get_reconciliation_failed:binding_body_hash_mismatch").
+            # Surface the same bounded byte-level diagnostics format used by
+            # the other two binding checks in this function so this failure
+            # mode is not silently dropped.
+            if patch_err and patch_err.endswith("binding_body_hash_mismatch") and final_binding_diagnostics:
+                result["errors"].append(
+                    "binding_body_hash_mismatch_diagnostics: "
+                    f"expected_byte_len={final_binding_diagnostics['expected_byte_len']} "
+                    f"actual_byte_len={final_binding_diagnostics['actual_byte_len']} "
+                    "first_diff_byte_offset="
+                    f"{final_binding_diagnostics['first_diff_byte_offset']} "
+                    f"expected_sha={final_binding_diagnostics['expected_sha']} "
+                    f"actual_sha={final_binding_diagnostics['actual_sha']}"
+                )
             return result
 
         # Issue #2627 AC2: this is the final persisted-body authority digest
@@ -1602,7 +1659,6 @@ def ensure_contract_snapshot(
         # verify_snapshot_authority_postcondition anchor call below so both
         # authority checks are bound to the exact same digest.
         final_persisted_body_sha256 = sha256_of(final_comment_body)
-        final_binding_diagnostics: dict[str, Any] = {}
         final_bound_ok, final_binding_err = verify_controlled_publisher_comment_id_binding(
             issue_number,
             repo,
