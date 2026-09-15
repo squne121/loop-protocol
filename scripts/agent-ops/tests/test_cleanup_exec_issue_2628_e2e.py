@@ -44,7 +44,7 @@ MATERIALIZE_CONTRACT = AGENT_OPS_DIR / "materialize_cleanup_contract.py"
 
 sys.path.insert(0, str(AGENT_OPS_DIR))
 
-from cleanup_exec import _squash_equivalence_path_set  # noqa: E402
+from cleanup_exec import _squash_content_matches, _squash_equivalence_path_set  # noqa: E402
 from worktree_catalog import Deadline  # noqa: E402
 
 
@@ -101,6 +101,14 @@ def _init_repo(root: Path) -> str:
     _git("init", "-q", "-b", "main", cwd=root)
     _git("config", "user.email", "t@t.com", cwd=root)
     _git("config", "user.name", "T", cwd=root)
+    # Pin rename detection ON at the repository level so AC1's sanity check
+    # (asserting git's DEFAULT rename-detection behavior hides the rename
+    # source) is deterministic regardless of the invoking user's/CI's
+    # ambient `diff.renames` setting. `--no-renames` in the fixed
+    # `_squash_equivalence_path_set()` overrides this per-invocation
+    # regardless, so this only pins the "buggy" baseline this fixture
+    # demonstrates — it does not weaken what the fix itself verifies.
+    _git("config", "diff.renames", "true", cwd=root)
     _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=root)
     (root / "README.md").write_text("seed\n", encoding="utf-8")
     _git("add", "README.md", cwd=root)
@@ -187,12 +195,38 @@ def _branch_exists(root: Path, branch_name: str) -> bool:
 
 
 def test_rename_source_deletion_not_lost_from_equivalence_path_set(tmp_path):
-    """GIVEN M (squash merge) still has A.txt, and L (local tip) renamed A.txt
-    to B.txt (git-rename-detectable, same content) WHEN the path set is
-    recomputed post-fix THEN A.txt (the rename source, deleted from L) is
-    present in the path set AND the normal-cleanup public CLI entry fails
-    closed with ``pr_head_oid_mismatch`` (the genuine, un-integrated
-    difference between M and L is no longer hidden by rename detection)."""
+    """GIVEN a fixture that reproduces the ACTUAL false-authorization this
+    Issue fixes — not just a flagged-but-differently-rejected diff — WHEN
+    the normal-cleanup public CLI entry runs THEN it correctly fails closed
+    on the un-integrated ``A.txt`` deletion, whereas the OLD (rename-
+    detection-on) path-set behavior, demonstrated via the real
+    ``_squash_content_matches()`` helper fed the raw-git buggy path set,
+    would have incorrectly authorized the same input.
+
+    Fixture shape (common ancestor / M / L):
+
+    ================  =======  =======
+    state             A.txt    B.txt
+    ================  =======  =======
+    common ancestor   present  absent
+    M (squash merge)  present  present (== L's content)
+    L (local tip)     absent   present (renamed from A, same content)
+    ================  =======  =======
+
+    L renamed A to B (git-rename-detectable, identical content). M is built
+    independently on top of the SAME common ancestor and adds B with
+    matching content WITHOUT touching A — i.e. M never received the rename;
+    it picked up B's content through an unrelated path, and A.txt's
+    deletion on the local branch was never integrated into M. This is a
+    genuine un-integrated difference, not a rename artifact.
+
+    Under the OLD (rename-detection-on) path set, only B.txt is visible
+    (A.txt's deletion is folded into the rename pair and lost), and B
+    matches between M and L — so the old path-set behavior would
+    incorrectly authorize cleanup despite A.txt's un-integrated deletion.
+    Under the FIXED (``--no-renames``) path set, both A.txt and B.txt are
+    visible; A.txt exists in M but not in L, so content-restricted
+    comparison correctly detects the mismatch and refuses."""
     root = tmp_path / "root"
     sha_seed = _init_repo(root)
     (root / "A.txt").write_text("shared-content\n", encoding="utf-8")
@@ -206,29 +240,48 @@ def test_rename_source_deletion_not_lost_from_equivalence_path_set(tmp_path):
     _git("commit", "-q", "-m", "local rename A to B", cwd=root)
     sha_l = _rev_parse(root, "HEAD")
 
-    # Sanity: git's DEFAULT (rename-detection-on) --name-only view of this
-    # exact range hides the deleted pre-image path — this is the bug being
-    # fixed, demonstrated on the raw git primitive before asserting on the
-    # fixed helper below.
+    # Sanity: git's DEFAULT (rename-detection-on, per _init_repo's pinned
+    # diff.renames=true) --name-only view of this exact range hides the
+    # deleted pre-image path — this is the bug being fixed, demonstrated on
+    # the raw git primitive before asserting on the fixed helper below.
     buggy_paths = _git("diff", "--name-only", sha_seed, sha_l, cwd=root).splitlines()
     assert buggy_paths == ["B.txt"], "sanity: rename detection hides A.txt pre-fix"
 
     _git("checkout", "-q", "main", cwd=root)
-    (root / "PR_MARKER.txt").write_text("pr marker\n", encoding="utf-8")
-    _git("add", "PR_MARKER.txt", cwd=root)
+    (root / "B.txt").write_text("shared-content\n", encoding="utf-8")
+    _git("add", "B.txt", cwd=root)
     _git("commit", "-q", "-m", f"squash merge {branch_name}", cwd=root)
     sha_m = _rev_parse(root, "HEAD")
     parents = _git("rev-list", "--parents", "-n", "1", sha_m, cwd=root).split()
     assert parents[1:] == [sha_seed], "M must be a genuine squash-shaped (single-parent) commit"
+    assert (root / "A.txt").exists(), "M must still contain A.txt (never received the rename)"
 
     wt_path = _make_worktree(root, branch_name, "ac1")
     assert _git("branch", "--show-current", cwd=root) == "main"
+
+    # Counterfactual (old behavior): feeding the OLD, rename-collapsed path
+    # set to the real (unmodified) production content-comparison helper
+    # shows it would have matched — i.e. the pre-fix path set would have
+    # caused a false authorization on this exact input. No production code
+    # is monkeypatched; only the raw-git buggy path set (computed above via
+    # git's default rename-detection primitive) is substituted as input to
+    # demonstrate what the pre-fix path set would have produced.
+    counterfactual_match = _squash_content_matches(str(root), sha_m, sha_l, buggy_paths, Deadline(20.0))
+    assert counterfactual_match is True, (
+        "counterfactual: the OLD rename-collapsed path set must appear to "
+        "match (mis-authorize) despite A.txt's un-integrated deletion"
+    )
 
     # Direct helper-level assertion: the FIXED path set includes A.txt.
     fixed_paths = _squash_equivalence_path_set(str(root), sha_seed, sha_l, Deadline(20.0))
     assert fixed_paths is not None
     assert "A.txt" in fixed_paths, "fixed path set must include the rename source deletion"
     assert "B.txt" in fixed_paths
+
+    # And the fixed path set correctly detects the mismatch that the
+    # counterfactual (buggy) path set above could not see.
+    fixed_match = _squash_content_matches(str(root), sha_m, sha_l, fixed_paths, Deadline(20.0))
+    assert fixed_match is False, "fixed path set must detect A.txt's un-integrated deletion"
 
     pr_json = _make_pr_json(branch_name=branch_name, head_ref_oid=sha_seed, merge_commit_oid=sha_m)
     env = _build_env(tmp_path, root, pr_json)
@@ -373,13 +426,32 @@ def test_materialize_confirmation_argv_with_linked_issue_parses_via_real_cli(tmp
 
 
 def test_public_entry_autonomous_cleanup_completes_for_squash_equivalent_history(tmp_path):
-    """GIVEN a PR #2623-style fixture (squash merge; M and L agree on
-    content restricted to the local delta path set; H is NOT a literal
-    ancestor of L — a message-only amend makes H and L siblings, mirroring
-    the amend/rebase-after-merge cause identified in Current Validated
-    Scope) WHEN the normal-cleanup public CLI entry (subprocess, not a
-    helper call) runs THEN cleanup completes (``git worktree remove`` +
-    ``git branch -d``) with NO human confirmation step."""
+    """GIVEN a synthetic fixture built with a message-only amend (H and L
+    are distinct commits with identical trees, so H is NOT a literal
+    ancestor of L, while M and L agree on content restricted to the local
+    delta path set) WHEN the normal-cleanup public CLI entry (subprocess,
+    not a helper call) runs THEN cleanup completes (``git worktree remove``
+    + a same-invocation fallback to expected-OID compare-and-delete when
+    ``git branch -d`` refuses the historically-unmerged branch) with NO
+    human confirmation step.
+
+    This fixture constructs a state where H != L but the path-restricted
+    content is integrated — it does not identify or reproduce the actual
+    root cause of PR #2623 / Issue #2620's original ``pr_head_oid_mismatch``
+    incident, which Issue #2628's Current Validated Scope records as
+    unknown (no contemporaneous evidence of whether amend, rebase, a stale
+    local branch, or a missing object was the actual cause). The
+    message-only amend here is only one of several possible ways to
+    construct "H != L, content already integrated"; it is not a claim about
+    what happened in the historical incident.
+
+    Completion here relies on the existing branch-only fallback: because H
+    and L are historically unmerged (the amend rewrote L's own commit
+    object), ``git branch -d`` fails, and ``run()``'s existing
+    same-invocation re-authorization path (``verify_branch_only_cleanup_authorization``
+    → expected-OID compare-and-delete, Issue #1523) completes the branch
+    removal instead. This is the actual completion path this fixture
+    exercises, not a plain ``git branch -d`` success."""
     root = tmp_path / "root"
     sha_base = _init_repo(root)
 

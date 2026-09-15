@@ -722,14 +722,21 @@ def _resolve_head_equivalence(
 ) -> tuple[bool, dict]:
     """Authorize head OID either by exact match or squash-merge delta equivalence.
 
-    Issue #1337: GitHub squash merge always mints a brand-new commit SHA for the
-    default branch, so ``headRefOid`` (really the merge commit) never equals the
-    feature branch tip even when content is identical. This resolver keeps the
-    existing exact-match fail-closed behavior for non-squash merges, and ONLY
-    attempts the squash-equivalence fallback when ``mergeCommit`` is present AND
-    verified to be a genuine squash-shaped commit (object exists locally, exactly
-    ONE parent). A normal merge commit (2+ parents) always fails closed to
-    ``pr_head_oid_mismatch``, even if its ``oid`` happens to be present.
+    Issue #1337 (terminology corrected in Issue #2628): H = the PR's
+    ``headRefOid`` (the PR head branch tip), L = ``local_tip`` (the worktree's
+    branch ref), M = the squash-merge commit GitHub mints on the default
+    branch (``pr.mergeCommit.oid``). H and L can diverge after a squash merge
+    when the local branch keeps moving (amend / rebase / additional commits)
+    — not because the squash merge itself rewrites feature-branch history. M
+    is a distinct new commit on the default branch and is never compared
+    against H; only L is compared, first by exact OID match and then, on
+    mismatch, by content-restricted delta-equivalence against M. This resolver
+    keeps the existing exact-match fail-closed behavior for non-squash merges,
+    and ONLY attempts the squash-equivalence fallback when ``mergeCommit`` is
+    present AND verified to be a genuine squash-shaped commit (object exists
+    locally, exactly ONE parent). A normal merge commit (2+ parents) always
+    fails closed to ``pr_head_oid_mismatch``, even if its ``oid`` happens to
+    be present.
 
     Returns ``(authorized, additive_fields)`` where ``additive_fields`` always
     carries the four additive ``verified`` keys.
