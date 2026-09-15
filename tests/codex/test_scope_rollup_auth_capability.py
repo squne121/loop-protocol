@@ -12,7 +12,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "agent-guards"))
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "ci"))
 
+import python_test_plan  # noqa: E402
 import run_scope_rollup_preflight as rsrp  # noqa: E402
 
 
@@ -171,11 +173,12 @@ def test_given_token_only_auth_when_production_gh_paths_run_then_token_fallback_
 
 
 def test_given_python_test_plan_when_scope_rollup_suite_is_registered_then_it_is_exactly_once_and_collectable():
-    """GIVEN CI targets WHEN this suite is registered THEN its one target collects successfully."""
+    """GIVEN CI selection WHEN canonical scope argv is built THEN target appears once."""
     target = "tests/codex/test_scope_rollup_auth_capability.py"
-    plan = json.loads((REPO_ROOT / ".github" / "ci" / "python-test-plan.json").read_text(encoding="utf-8"))
+    plan = python_test_plan.load_plan()
+    canonical_scope_argv = python_test_plan.scope_argv(plan)
 
-    assert plan["targets"].count(target) == 1
+    assert canonical_scope_argv.count(target) == 1
     collected = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", target],
         cwd=REPO_ROOT,
