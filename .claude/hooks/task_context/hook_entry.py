@@ -54,6 +54,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -88,14 +89,14 @@ def _read_stdin_json() -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _current_repo(cwd: str | None) -> str | None:
+def _current_repo(cwd: str | None, *, timeout: float = _GIT_REMOTE_TIMEOUT_SECONDS) -> str | None:
     try:
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=_GIT_REMOTE_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except Exception:
         return None
@@ -224,7 +225,7 @@ def _command_args_to_raw_target(command_args: object) -> str:
     return ""
 
 
-def _apply_user_prompt_expansion_fields(payload: dict, hook_input: dict) -> None:
+def _apply_user_prompt_expansion_fields(payload: dict, hook_input: dict, budget_seconds: float) -> float:
     """AC6: reached only for Claude Code's own user-typed slash/Skill command
     expansion lifecycle -- never for ordinary natural-language prompts.
     ``command_name != "task"`` is not this hook's concern (some other
@@ -233,13 +234,34 @@ def _apply_user_prompt_expansion_fields(payload: dict, hook_input: dict) -> None
     structured target fields ``classifier.parse_slash_task_target`` already
     produces for the (now-retired as a state-changing path) raw-text
     `/task` special-case -- the target-parsing logic itself is reused, not
-    reimplemented; only its authority moves (Issue #2625 In Scope #3)."""
+    reimplemented; only its authority moves (Issue #2625 In Scope #3).
+
+    Issue #2625 fix_delta (OWNER PR review P2): mirrors the already-correct
+    ``UserPromptSubmit`` pattern (fix_delta 6, ``classifier.
+    needs_current_repo_resolution``) -- only pay for a ``git remote
+    get-url origin`` subprocess call when ``raw_target`` actually needs
+    ``current_repo`` resolution (bare ``#N`` / kind-word shorthand); a full
+    URL, explicit ``owner/repo#N`` target, or ad-hoc title never needs it.
+    ``budget_seconds`` is this hook's remaining hot-path time budget (starts
+    at ``HOT_PATH_TIMEOUT_SECONDS``); when a git lookup *is* needed it is
+    given a timeout capped at ``min(_GIT_REMOTE_TIMEOUT_SECONDS,
+    budget_seconds)`` and its measured wall-clock cost is deducted from the
+    budget before returning it, so ``main()`` can pass the *remaining*
+    budget on to the subsequent ``ctl_client.call_hook(...)`` call instead
+    of always spending the full budget on both subprocess calls
+    independently."""
     command_name = hook_input.get("command_name") or None
     payload["command_name"] = command_name
     if command_name != "task":
-        return
+        return budget_seconds
     raw_target = _command_args_to_raw_target(hook_input.get("command_args"))
-    current_repo = _current_repo(hook_input.get("cwd"))
+    current_repo = None
+    if classifier.raw_target_needs_current_repo_resolution(raw_target):
+        git_timeout = min(_GIT_REMOTE_TIMEOUT_SECONDS, budget_seconds)
+        started_at = time.monotonic()
+        current_repo = _current_repo(hook_input.get("cwd"), timeout=git_timeout)
+        elapsed = time.monotonic() - started_at
+        budget_seconds = max(0.0, budget_seconds - elapsed)
     target, ad_hoc_title = classifier.parse_slash_task_target(raw_target, current_repo=current_repo)
     if target is not None:
         payload["slash_task_target_repo"] = target.repo
@@ -247,6 +269,7 @@ def _apply_user_prompt_expansion_fields(payload: dict, hook_input: dict) -> None
         payload["slash_task_target_ref_number"] = target.ref_number
     elif ad_hoc_title:
         payload["slash_task_ad_hoc_title"] = ad_hoc_title
+    return budget_seconds
 
 
 def _apply_cwd_changed_fields(payload: dict, hook_input: dict) -> None:
@@ -309,8 +332,13 @@ def main(argv: list[str]) -> int:
     elif event == "UserPromptExpansion":
         # AC6: bounded hot-path budget, same as UserPromptSubmit -- `/task`
         # is a lightweight single-Task-mutation command, not a large lookup.
-        timeout = HOT_PATH_TIMEOUT_SECONDS
-        _apply_user_prompt_expansion_fields(payload, hook_input)
+        # fix_delta (OWNER PR review P2): the optional git-lookup subprocess
+        # inside `_apply_user_prompt_expansion_fields` and the subsequent
+        # `ctl_client.call_hook` CLI subprocess below now share this single
+        # HOT_PATH_TIMEOUT_SECONDS budget instead of each having its own
+        # independent timeout -- `timeout` here is reassigned to whatever
+        # budget remains after the (possibly skipped) git lookup.
+        timeout = _apply_user_prompt_expansion_fields(payload, hook_input, HOT_PATH_TIMEOUT_SECONDS)
     elif event == "CwdChanged":
         _apply_cwd_changed_fields(payload, hook_input)
     elif event in ("SubagentStart", "SubagentStop"):
@@ -376,9 +404,22 @@ def main(argv: list[str]) -> int:
         # service for `command_name == "task"` in the first place.
         if payload.get("command_name") == "task":
             if not envelope_ok:
+                # Issue #2625 fix_delta (OWNER PR review P1 supplement): the
+                # service-side rebind write is atomic (one `write_transaction`
+                # covering the Task/Activity switch + its event), but that
+                # commit happens inside the `task-contextctl` child process,
+                # independent of whether *this* adapter successfully reads
+                # back its response. A transport failure / timeout / malformed
+                # envelope here means the CLI call did not confirm success --
+                # it does NOT mean the rebind definitely did not happen, so we
+                # must not claim "NOT applied", and an unconditional retry
+                # could create a duplicate ad-hoc Task if the first call
+                # actually did commit.
                 print(
-                    "[task-context] /task failed: Task Context service returned an invalid or "
-                    "unavailable result -- the rebind was NOT applied. Retry `/task <target>`.",
+                    "[task-context] /task failed: Task Context service result could not be "
+                    "confirmed (transport/timeout error) -- whether the rebind was applied is "
+                    "unknown. Check the current Task (e.g. statusLine) before retrying "
+                    "`/task <target>`.",
                     file=sys.stderr,
                 )
                 return 2

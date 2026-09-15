@@ -258,6 +258,42 @@ def test_given_normal_prompt_when_ctl_transport_fails_then_exit_zero_fail_open(s
     assert proc.returncode == 0, proc.stderr
 
 
+def test_given_slash_task_when_ctl_transport_fails_then_stderr_conveys_uncertainty_not_not_applied(state_root):
+    """Regression for OWNER PR review P1 supplement: a CLI transport
+    failure / timeout / malformed envelope for `/task` means the rebind's
+    outcome could not be *confirmed* by this adapter -- the underlying
+    service-side write is atomic and may have already committed inside the
+    `task-contextctl` child process regardless of whether this adapter
+    successfully read the response back. The message must never claim the
+    rebind was "not applied" (that would be a false negative when it
+    actually succeeded), and must not push the user toward an unconditional
+    retry (which could create a duplicate ad-hoc Task if the first call
+    actually committed). Exit code stays 2 (still a genuine, surfaced
+    command failure)."""
+    broken_state_root = "relative/not/absolute/path"
+    env = dict(os.environ)
+    env.pop("HERDR_TAB_ID", None)
+    env.pop("HERDR_PANE_ID", None)
+    env["LOOP_TASK_CONTEXT_STATE_ROOT"] = broken_state_root
+    env["HERDR_TAB_ID"] = "wV:t9"
+    env["HERDR_PANE_ID"] = "wV:p9"
+    proc = subprocess.run(
+        [sys.executable, str(_HOOK_ENTRY), "UserPromptExpansion"],
+        input=json.dumps(
+            {"session_id": "s1", "command_name": "task", "command_args": "owner/repo#5", "cwd": str(state_root)}
+        ),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    assert proc.returncode == 2
+    assert "/task failed" in proc.stderr
+    assert "NOT applied" not in proc.stderr, "transport失敗時に'NOT applied'と断定してはならない(実際は不明)"
+    assert "Retry `/task" not in proc.stderr, "無条件retryを促す文言があってはならない"
+    assert "unknown" in proc.stderr or "unconfirmed" in proc.stderr or "could not be confirmed" in proc.stderr
+
+
 def test_given_slash_task_missing_target_when_expanded_then_exit_two_block(state_root):
     """AC6 (carried over from PR #2615 fix_delta 4, now scoped to
     UserPromptExpansion): an explicit `/task` with no resolvable

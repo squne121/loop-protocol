@@ -451,6 +451,7 @@ def on_user_prompt_expansion(conn, payload: dict[str, Any]) -> dict[str, Any]:
             ref_kind=target_ref_kind,
             ref_number=target_ref_number,
             reason_code="slash_task_rebind",
+            event_type="hook:UserPromptExpansion",
         )
     elif ad_hoc_title:
         rebound = service.bind_ad_hoc_task_to_binding(
@@ -459,20 +460,11 @@ def on_user_prompt_expansion(conn, payload: dict[str, Any]) -> dict[str, Any]:
             execution_run_id=current_run_id,
             title=ad_hoc_title,
             reason_code="slash_task_rebind",
+            event_type="hook:UserPromptExpansion",
         )
     else:
         return {"decision": "block", "reason_code": "slash_task_missing_target"}
 
-    _record(
-        conn,
-        event_type="hook:UserPromptExpansion",
-        task_id=rebound["task_id"],
-        activity_id=rebound["activity_id"],
-        binding_id=binding_id,
-        execution_run_id=current_run_id,
-        reason_code="slash_task_rebind",
-        status="pass",
-    )
     return {
         "decision": "pass",
         "reason_code": "slash_task_rebind",
