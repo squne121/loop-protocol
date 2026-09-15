@@ -323,6 +323,21 @@ class TestBaseHeadHookTopologyDelta:
         ("hook_entry", "Stop"): _hook_entry_added("Stop", 5),
         ("hook_entry", "StopFailure"): _hook_entry_added("StopFailure", 5),
         ("hook_entry", "SubagentStop"): _hook_entry_added("SubagentStop", 5),
+        # Issue #2625 AC6: `/task <target>` state-changing authority moved
+        # off the raw-text `UserPromptSubmit` special-case (Issue #2564 /
+        # PR #2615) onto Claude Code's own `UserPromptExpansion` command
+        # lifecycle (`command_name == "task"`). Unlike every other
+        # `hook_entry` registration above, this one carries a non-null
+        # matcher (`"task"`) -- `_hook_entry_added` hardcodes `matcher:
+        # None`, so this entry is declared explicitly rather than via that
+        # helper (Allowed Paths expanded to include this file for #2625,
+        # human-approved).
+        ("hook_entry", "UserPromptExpansion"): {
+            "matcher": "task",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "UserPromptExpansion"],
+            "timeout": 2,
+        },
     }
 
     del _hook_entry_added

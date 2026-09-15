@@ -17,6 +17,7 @@ B2 atomicity: body_sha256 OR updatedAt 変化 → stale_or_conflicting_snapshot
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import builtins
 from pathlib import Path
@@ -3336,3 +3337,191 @@ class TestPatchCommentTransportAndReconciliation:
         assert error == f"patch_get_reconciliation_failed:{expected_error}"
         assert len(calls["patch"]) == 1
         assert len(calls["get"]) == 1
+
+
+class TestPostCommentTransportAndReconciliation:
+    """Issue #2627 AC1/AC2/AC3: post_comment() transport unification, the
+    staging/final-authority role separation it makes explicit, and the
+    deliberately-divergent regression that fixes the boundary between them.
+
+    AC3: post_comment() must use canonical JSON UTF-8 -> ``gh api --method
+    POST ... --input -`` (mirroring patch_comment()'s existing transport),
+    with no tempfile / no ``--field body=@file``, and its
+    (html_url_or_None, post_status_code, http_status_or_None) return
+    contract must be unchanged.
+
+    AC2: the POST-staging digest (of what was just POSTed) and the final
+    persisted-body authority digest (of what a direct-GET readback reports)
+    must be distinctly named in source, never sharing an authority-like name.
+
+    AC1 (deliberately-divergent regression): a fake gh transport where the
+    POST-staging body differs from what a subsequent direct-GET readback
+    reports as persisted.
+      (a) When the final direct-GET body matches the expected final body,
+          binding must PASS even though the staging digest differs from the
+          final persisted digest.
+      (b) When the final direct-GET body does NOT match the expected final
+          body -- even though a staging-side digest coincidentally matches
+          some unrelated expected value -- binding must FAIL.
+    """
+
+    _COMMENT_ID = 2627001
+
+    def test_post_comment_uses_canonical_json_stdin_transport_no_tempfile(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_run(command, *, input=None, **kwargs):
+            captured["command"] = command
+            captured["input"] = input
+            captured["kwargs"] = kwargs
+            return MagicMock(
+                returncode=0,
+                stdout=f"{_ISSUE_URL}#issuecomment-{self._COMMENT_ID}".encode("utf-8"),
+                stderr=b"",
+            )
+
+        monkeypatch.setattr(_ecs_mod.subprocess, "run", fake_run)
+
+        body = "staged comment body"
+        url, post_code, http_status = _ecs_mod.post_comment(_ISSUE_NUMBER, _REPO, body)
+
+        assert (url, post_code, http_status) == (
+            f"{_ISSUE_URL}#issuecomment-{self._COMMENT_ID}",
+            POST_STATUS_POSTED,
+            None,
+        )
+        command = captured["command"]
+        assert command[0:2] == ["gh", "api"]
+        assert command[command.index("--method") + 1] == "POST"
+        assert command.count(f"repos/{_REPO}/issues/{_ISSUE_NUMBER}/comments") == 1
+        assert "--input" in command
+        assert command[command.index("--input") + 1] == "-"
+        assert "--jq" in command
+        assert not any(str(arg).startswith("--field") for arg in command)
+        assert not any(str(arg).startswith("body=@") for arg in command)
+        assert captured["kwargs"].get("capture_output") is True
+        assert "timeout" in captured["kwargs"]
+        assert captured["input"] == json.dumps(
+            {"body": body}, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+
+    def test_post_comment_source_has_no_tempfile_or_field_upload(self):
+        source = inspect.getsource(_ecs_mod.post_comment)
+        assert "import tempfile" not in source
+        assert "NamedTemporaryFile" not in source
+        assert "--field" not in source
+        assert "body=@" not in source
+
+    def test_role_separated_digest_names_are_distinct_in_source(self):
+        source = inspect.getsource(_ecs_mod.ensure_contract_snapshot)
+        assert "staging_post_body_sha256" in source
+        assert "final_persisted_body_sha256" in source
+        assert "staging_post_body_sha256" != "final_persisted_body_sha256"
+
+    def test_given_staging_digest_diverges_from_final_persisted_digest_when_get_matches_expected_then_binding_passes(
+        self, monkeypatch
+    ):
+        staged_body = "STAGING representation (never persisted verbatim)"
+        final_persisted_body = "FINAL persisted body from direct GET"
+        remote = {
+            "id": self._COMMENT_ID,
+            "issue_url": f"https://api.github.com/repos/{_REPO}/issues/{_ISSUE_NUMBER}",
+            "html_url": f"{_ISSUE_URL}#issuecomment-{self._COMMENT_ID}",
+            "user": {"login": "squne121", "id": 63350259, "type": "User"},
+            "author_association": "OWNER",
+            "body": final_persisted_body,
+        }
+
+        def fake_run(command, *, input=None, **kwargs):
+            if "--method" in command:
+                assert command[command.index("--method") + 1] == "POST"
+                payload = json.loads(input.decode("utf-8"))
+                assert payload["body"] == staged_body
+                return MagicMock(
+                    returncode=0,
+                    stdout=remote["html_url"].encode("utf-8"),
+                    stderr=b"",
+                )
+            assert command[-1] == f"repos/{_REPO}/issues/comments/{self._COMMENT_ID}"
+            return MagicMock(
+                returncode=0, stdout=json.dumps(remote).encode("utf-8"), stderr=b""
+            )
+
+        monkeypatch.setattr(_ecs_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            _ecs_mod,
+            "verify_controlled_publisher_comment_id_binding",
+            _real_verify_controlled_publisher_comment_id_binding,
+        )
+
+        url, post_code, http_status = _ecs_mod.post_comment(_ISSUE_NUMBER, _REPO, staged_body)
+        assert (post_code, http_status) == (POST_STATUS_POSTED, None)
+
+        # The staging digest (of what was POSTed) intentionally differs from
+        # the final persisted digest (of what GET reports as persisted).
+        staging_post_body_sha256 = sha256_of(staged_body)
+        final_persisted_body_sha256 = sha256_of(final_persisted_body)
+        assert staging_post_body_sha256 != final_persisted_body_sha256
+
+        expected_comment_id = _ecs_mod.extract_comment_id_from_url(url)
+        bound_ok, binding_err = _ecs_mod.verify_controlled_publisher_comment_id_binding(
+            _ISSUE_NUMBER,
+            _REPO,
+            expected_comment_id,
+            expected_body_sha256=final_persisted_body_sha256,
+        )
+        assert (bound_ok, binding_err) == (True, None)
+
+    def test_staging_digest_coincidental_match_get_diverges_binding_fails(self, monkeypatch):
+        coincidental_body = "same text used for both staging and one expected value"
+        persisted_body_diverges = "different text actually persisted"
+        remote = {
+            "id": self._COMMENT_ID,
+            "issue_url": f"https://api.github.com/repos/{_REPO}/issues/{_ISSUE_NUMBER}",
+            "html_url": f"{_ISSUE_URL}#issuecomment-{self._COMMENT_ID}",
+            "user": {"login": "squne121", "id": 63350259, "type": "User"},
+            "author_association": "OWNER",
+            "body": persisted_body_diverges,
+        }
+
+        def fake_run(command, *, input=None, **kwargs):
+            if "--method" in command:
+                payload = json.loads(input.decode("utf-8"))
+                assert payload["body"] == coincidental_body
+                return MagicMock(
+                    returncode=0,
+                    stdout=remote["html_url"].encode("utf-8"),
+                    stderr=b"",
+                )
+            return MagicMock(
+                returncode=0, stdout=json.dumps(remote).encode("utf-8"), stderr=b""
+            )
+
+        monkeypatch.setattr(_ecs_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            _ecs_mod,
+            "verify_controlled_publisher_comment_id_binding",
+            _real_verify_controlled_publisher_comment_id_binding,
+        )
+
+        url, post_code, http_status = _ecs_mod.post_comment(
+            _ISSUE_NUMBER, _REPO, coincidental_body
+        )
+        assert (post_code, http_status) == (POST_STATUS_POSTED, None)
+
+        # A staging-side digest that coincidentally equals some unrelated
+        # expected value must never be substituted for the expected final
+        # persisted-body digest when binding the final authority check.
+        staging_post_body_sha256 = sha256_of(coincidental_body)
+        expected_final_body_sha256 = sha256_of("intended final persisted body")
+        assert staging_post_body_sha256 != expected_final_body_sha256
+
+        expected_comment_id = _ecs_mod.extract_comment_id_from_url(url)
+        bound_ok, binding_err = _ecs_mod.verify_controlled_publisher_comment_id_binding(
+            _ISSUE_NUMBER,
+            _REPO,
+            expected_comment_id,
+            expected_body_sha256=expected_final_body_sha256,
+        )
+        assert bound_ok is False
+        assert binding_err == "binding_body_hash_mismatch"

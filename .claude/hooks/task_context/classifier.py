@@ -210,6 +210,32 @@ def needs_current_repo_resolution(prompt: str) -> bool:
     return False
 
 
+def raw_target_needs_current_repo_resolution(raw_target: str) -> bool:
+    """Issue #2625 fix_delta (OWNER PR review): the ``UserPromptExpansion``
+    counterpart of ``needs_current_repo_resolution`` above, operating
+    directly on an already-``/task``-prefix-stripped ``raw_target`` string
+    (as produced by ``hook_entry._command_args_to_raw_target``) instead of
+    the raw prompt text with the leading ``/task`` still attached.
+
+    Only the bare-number (``#N``/``N``) and kind-word (``issue|pr #N``)
+    shapes ever consult ``current_repo`` inside ``parse_slash_task_target``
+    below -- a full URL or explicit ``owner/repo#N`` target already spells
+    out the repo, and anything else falls through to the ad-hoc-title
+    branch, which never touches ``current_repo`` either.
+
+    Only a syntactic pre-check (mirrors the same invariant as
+    ``needs_current_repo_resolution``): it must never return ``False`` for a
+    ``raw_target`` that actually needs ``current_repo``."""
+    raw_target = (raw_target or "").strip()
+    if not raw_target:
+        return False
+    if _EXPLICIT_TARGET_URL_RE.match(raw_target) or _EXPLICIT_TARGET_OWNER_REPO_RE.match(raw_target):
+        return False
+    return bool(
+        _EXPLICIT_TARGET_BARE_RE.match(raw_target) or _EXPLICIT_TARGET_KIND_WORD_RE.match(raw_target)
+    )
+
+
 def parse_slash_task_target(raw_target: str, *, current_repo: str | None) -> tuple[Target | None, str | None]:
     """Resolve the ``/task <target>`` raw target string into either a
     structured :class:`Target` (GitHub ref) or an ad-hoc task title.
