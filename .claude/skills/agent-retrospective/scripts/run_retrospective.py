@@ -45,6 +45,7 @@ import contextlib
 import copy
 import dataclasses
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -54,8 +55,11 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import typing
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -1160,10 +1164,184 @@ def build_agent_invocation_argv(
     return argv
 
 
+# ---------------------------------------------------------------------------
+# child-process lifecycle registry (Issue #2646 AC6): a small, module-level
+# process-handle registry (never a general concurrency/security framework --
+# OWNER review anchor comment's "推奨する実装の形") that lets a SIGINT/SIGTERM
+# delivered to THIS process locate and terminate every still-running
+# observer subprocess dispatched by `run_observer_wave`'s fan-out, and lets
+# an observer's OWN per-request timeout be handled as terminate -> bounded
+# grace -> kill -> reap rather than an unconditional immediate kill. These
+# two paths are deliberately kept separate (case (b) vs case (c) below):
+#   - case (b) (`_terminate_and_reap_process`, called from
+#     `_lifecycle_subprocess_run`'s OWN worker thread after ITS OWN
+#     `communicate(timeout=...)` already raised `TimeoutExpired`) safely
+#     calls `Popen.communicate()` again on that SAME Popen -- an officially
+#     supported retry pattern (see `subprocess.Popen.communicate`'s own
+#     docstring) because only ONE thread (the one that owns this Popen) is
+#     ever the party -- and always has been the ONLY party -- calling
+#     `communicate()`/`wait()` on it.
+#   - case (c) (`terminate_all_active_child_processes`, called from
+#     `run_scoped_temp_dir`'s SIGINT/SIGTERM handler, i.e. the MAIN thread)
+#     NEVER calls `communicate()`/`wait()` on a process it does not own --
+#     doing so concurrently with the owning worker thread's own in-flight
+#     `communicate()` call is unsafe (not thread-safe per the stdlib). It
+#     only ever sends signals (`terminate()`/`kill()`, both plain
+#     `os.kill()` calls, safe from any thread) and then polls this
+#     registry until the owning thread's own `finally:
+#     _unregister_active_child_process(...)` confirms the reap actually
+#     happened.
+# ---------------------------------------------------------------------------
+
+#: Issue #2646 AC6: bounded grace period (seconds) between SIGTERM and a
+#: SIGKILL escalation for any observer subprocess this module manages
+#: directly -- both an observer's own per-request timeout (case (b)) and a
+#: parent SIGINT/SIGTERM (case (c)) share this constant. Tests that need a
+#: fast, deterministic timeline monkeypatch this module attribute rather
+#: than waiting out the real production default.
+_CHILD_PROCESS_TERMINATE_GRACE_SEC: float = 5.0
+
+_ACTIVE_CHILD_PROCESSES_LOCK = threading.Lock()
+_ACTIVE_CHILD_PROCESSES: dict[int, subprocess.Popen] = {}
+_ACTIVE_CHILD_PROCESS_HANDLE_SEQ = itertools.count()
+
+
+def _register_active_child_process(proc: "subprocess.Popen") -> int:
+    handle_id = next(_ACTIVE_CHILD_PROCESS_HANDLE_SEQ)
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        _ACTIVE_CHILD_PROCESSES[handle_id] = proc
+    return handle_id
+
+
+def _unregister_active_child_process(handle_id: int) -> None:
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        _ACTIVE_CHILD_PROCESSES.pop(handle_id, None)
+
+
+def _terminate_and_reap_process(proc: "subprocess.Popen", *, grace_sec: float | None = None) -> int | None:
+    """AC6 case (b): terminate -> bounded grace -> (if still alive) kill ->
+    reap, called from the SAME thread that already owns ``proc`` (i.e. is
+    already blocked inside, or has already called, ``proc.communicate()``).
+    Idempotent against an already-exited process (never sends a signal to a
+    pid that has already terminated)."""
+    grace = _CHILD_PROCESS_TERMINATE_GRACE_SEC if grace_sec is None else grace_sec
+    if proc.poll() is not None:
+        return proc.returncode
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        proc.communicate(timeout=grace)
+        return proc.returncode
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    proc.communicate()
+    return proc.returncode
+
+
+def terminate_all_active_child_processes(
+    *, grace_sec: float | None = None, reap_timeout_sec: float = 30.0
+) -> list[int]:
+    """AC6 case (c): terminate every currently-registered child subprocess,
+    escalate to SIGKILL for any still alive after a bounded grace period,
+    then block (bounded by ``reap_timeout_sec``) until every one of them has
+    actually been reaped by its OWNING worker thread (see module note
+    above for why this never calls ``communicate()``/``wait()`` itself).
+    Called synchronously from `run_scoped_temp_dir`'s SIGINT/SIGTERM
+    handler BEFORE ``RunInterrupted`` is raised, so callers always observe:
+    terminate -> grace -> kill -> reap confirmed -> (exception propagates)
+    -> temp dir cleanup (never the reverse). Returns the PIDs this call
+    acted on (diagnostics/tests)."""
+    grace = _CHILD_PROCESS_TERMINATE_GRACE_SEC if grace_sec is None else grace_sec
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        snapshot = dict(_ACTIVE_CHILD_PROCESSES)
+    if not snapshot:
+        return []
+    for proc in snapshot.values():
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + grace
+    remaining_ids = set(snapshot)
+    while remaining_ids and time.monotonic() < deadline:
+        with _ACTIVE_CHILD_PROCESSES_LOCK:
+            remaining_ids = {hid for hid in remaining_ids if hid in _ACTIVE_CHILD_PROCESSES}
+        if remaining_ids:
+            time.sleep(0.02)
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        remaining_ids = {hid for hid in remaining_ids if hid in _ACTIVE_CHILD_PROCESSES}
+    for hid in remaining_ids:
+        proc = snapshot[hid]
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+    reap_deadline = time.monotonic() + reap_timeout_sec
+    while time.monotonic() < reap_deadline:
+        with _ACTIVE_CHILD_PROCESSES_LOCK:
+            still_present = any(hid in _ACTIVE_CHILD_PROCESSES for hid in snapshot)
+        if not still_present:
+            break
+        time.sleep(0.02)
+    return [proc.pid for proc in snapshot.values()]
+
+
+def _lifecycle_subprocess_run(
+    argv: Sequence[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    input: str | None = None,  # noqa: A002 -- matches subprocess.run's own kwarg name
+    capture_output: bool = True,
+    text: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    """Issue #2646 AC6: the production default ``runner`` for
+    ``invoke_agent``/``invoke_agent_with_role_adapter``/``run_cli``. From
+    the caller's point of view this behaves exactly like
+    ``subprocess.run(argv, cwd=cwd, env=env, input=input,
+    capture_output=capture_output, text=text, timeout=timeout)`` (same
+    ``CompletedProcess`` return shape, same ``subprocess.TimeoutExpired`` on
+    timeout) EXCEPT the live ``Popen`` handle is kept registered in this
+    module's active-child-process registry for its entire lifetime (so a
+    parent SIGINT/SIGTERM can find and terminate it -- case (c)), and its
+    OWN timeout is handled as terminate -> bounded grace -> kill -> reap
+    (case (b)) rather than the unconditional immediate ``kill()`` the
+    stdlib's own ``subprocess.run`` performs on timeout."""
+    proc = subprocess.Popen(
+        list(argv),
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None,
+        text=text,
+    )
+    handle_id = _register_active_child_process(proc)
+    try:
+        try:
+            stdout, stderr = proc.communicate(input=input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_and_reap_process(proc)
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=timeout) from None
+        return subprocess.CompletedProcess(args=list(argv), returncode=proc.returncode, stdout=stdout, stderr=stderr)
+    finally:
+        _unregister_active_child_process(handle_id)
+
+
 def invoke_agent(
     request: AgentInvocationRequest,
     *,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    runner: Callable[..., subprocess.CompletedProcess] = _lifecycle_subprocess_run,
     policy: "DelegatedAgentPermissionPolicy | None" = None,
 ) -> AgentInvocationResult:
     """Production Agent invocation adapter. ``runner`` is dependency-injected
@@ -1628,7 +1806,7 @@ def invoke_agent_with_role_adapter(
     *,
     ctx: "RunContext",
     plan: "SourcePlan",
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    runner: Callable[..., subprocess.CompletedProcess] = _lifecycle_subprocess_run,
     policy: "DelegatedAgentPermissionPolicy | None" = None,
 ) -> AgentInvocationResult:
     """Issue #2374: thin wrapper around ``invoke_agent`` that applies
@@ -1716,6 +1894,40 @@ class ObserverWaveFailed(Exception):
         super().__init__(message)
         self.reason_code = reason_code if reason_code is not None else type(self).__name__
         self.exit_code = exit_code
+        #: Issue #2646 AC5: the all-terminal per-observer aggregate for the
+        #: wave this exception was raised from -- ``()`` (never ``None``)
+        #: until `run_observer_wave` fills it in (right before raising),
+        #: so `getattr(exc, "observer_results", ())` is always safe.
+        self.observer_results: tuple["ObserverWaveObserverResult", ...] = ()
+
+
+@dataclass(frozen=True)
+class ObserverWaveObserverResult:
+    """Issue #2646 AC5: one required observer's terminal outcome from a
+    single `run_observer_wave` fan-out/fan-in call -- always present for
+    EVERY dispatched request regardless of whether any OTHER observer in
+    the same wave succeeded or failed (the all-terminal barrier guarantees
+    this). ``observer_id`` here is always the REQUEST-side
+    ``AgentInvocationRequest.agent_name`` -- never the returned payload's
+    own claimed ``observer_id`` -- this is the aggregate's identity
+    authority (Issue #2646 anchor review P1 finding #1: an observer_id
+    swap in the RETURNED payload must never silently become the aggregate's
+    key)."""
+
+    observer_id: str
+    status: str  # "ok" | "failed"
+    reason_code: str | None
+    exit_code: int | None
+
+
+#: Issue #2646 AC3: every dispatched observer's real headless CLI subprocess
+#: invocation is the only genuinely blocking step in `run_observer_wave` --
+#: `max_workers` is sized to the actual request count (never less) so no
+#: dispatched observer is ever left queued behind another observer's own
+#: completion (a bounded pool smaller than the manifest would silently
+#: reintroduce sequential-style blocking for the observers beyond its size).
+def _observer_wave_max_workers(request_count: int) -> int:
+    return max(request_count, 1)
 
 
 def run_observer_wave(
@@ -1727,67 +1939,207 @@ def run_observer_wave(
     repair: Callable[[str, WireContractError], str] | None = None,
     expected_manifest: Sequence[ObserverRoleSpec] | None = None,
 ) -> list[EvidenceBundle]:
-    """``validate-observers`` phase (fan-out half): invoke every observer in
-    ``observer_requests`` and strictly validate its serialized output into an
-    ``EvidenceBundle``. All observers must succeed -- the first failure
-    aborts the wave (fail-closed; ``observer_parallelism: 3`` is an execution
-    budget for the caller's actual concurrency, not modeled by this
-    sequential reference implementation).
+    """``validate-observers`` phase: fan-out every observer in
+    ``observer_requests`` -- dispatched concurrently via a bounded thread
+    pool, so no observer's ``invoke`` call is ever blocked waiting on
+    another observer's own completion (AC3) -- then fan-in: wait for EVERY
+    dispatched observer to reach a terminal outcome (success or one of the
+    typed failure classes below) before this function EVER raises or
+    returns (AC1). A single observer's failure never cancels or skips
+    collection of its peers -- every peer is still invoked and its own
+    result/bundle validated, exactly as if it had been the only observer in
+    the wave.
+
+    Per-observer terminal failure classes (Issue #2646 AC4): non-``ok``
+    ``AgentInvocationResult.status`` (timeout / malformed output / nonzero
+    exit / api_error / partial_result), schema repair exhaustion
+    (``WireContractError``/``SchemaRepairExhausted``), an ``observer_id``
+    in the RETURNED bundle that does not match the REQUEST's own
+    ``agent_name`` (``observer_id_mismatch`` -- Issue #2646 anchor review
+    P1 finding #1: an identity swap between two observers whose
+    ``run_id``/``base_sha``/``source_set_digest`` all agree must still be
+    caught, independently of those checks), a ``run_id``/
+    ``source_set_digest``/``base_sha`` mismatch, a duplicate observer_id
+    among the dispatched requests, or (when ``expected_manifest`` is
+    supplied) an observer_id outside the expected manifest / a manifest
+    that ends up incomplete.
+
+    Exactly ONE observer failing re-raises that SAME failure's own
+    exception instance/type unchanged (e.g. ``SchemaRepairExhausted``) --
+    preserving this function's pre-#2646 single-failure contract exactly,
+    including for ``pytest.raises(rr.SchemaRepairExhausted)``-style
+    callers. TWO OR MORE observers failing raises a single
+    ``ObserverWaveFailed`` with ``reason_code:
+    "observer_wave_multiple_failures"`` instead of representing the wave by
+    only the first failure encountered (Issue #2646 AC5) -- every
+    exception raised from here (single- or multiple-failure) carries the
+    full all-terminal ``observer_results`` aggregate (`main()` surfaces it
+    additively on the failure JSON).
 
     Every bundle's ``base_sha`` MUST equal ``ctx.base_sha`` (Issue #2237
-    P0-6 -- previously unchecked here, letting a mismatched ``base_sha`` slip
-    through and then be silently overwritten downstream). When
-    ``expected_manifest`` is supplied, the observer_id set MUST match it
-    exactly (no missing, no extra, no duplicate observer_id)."""
+    P0-6). When ``expected_manifest`` is supplied, the observer_id set MUST
+    match it exactly (no missing, no extra, no duplicate observer_id)."""
     expected_ids = {spec.observer_id for spec in expected_manifest} if expected_manifest is not None else None
-    seen_ids: set[str] = set()
-    bundles: list[EvidenceBundle] = []
-    for request in observer_requests:
-        result = invoke(request)
+
+    def _process_one(
+        request: AgentInvocationRequest,
+    ) -> tuple[AgentInvocationRequest, EvidenceBundle | None, BaseException | None, str | None, int | None]:
+        """Runs entirely inside ONE fan-out worker thread: invokes this ONE
+        observer (the only actually-blocking step -- a real headless CLI
+        subprocess call) and, on success, performs every per-observer
+        (non-cross-observer) validation this module previously did
+        sequentially. NEVER lets an exception escape -- `run_observer_wave`
+        itself is the only place a wave-level exception is ever raised,
+        and only after every OTHER dispatched observer has also reached a
+        terminal outcome."""
+        try:
+            result = invoke(request)
+        except BaseException as exc:  # pragma: no cover -- defensive: production
+            # `invoke` (== invoke_agent[_with_role_adapter]) never raises;
+            # a caller-supplied fake in tests legitimately might.
+            return (
+                request,
+                None,
+                exc,
+                getattr(exc, "reason_code", type(exc).__name__),
+                getattr(exc, "exit_code", None),
+            )
         if result.status != "ok":
             # Issue #2341 AC1: thread the underlying adapter-level
             # reason_code/exit_code through so main()'s top-level failure
             # output is diagnosable (e.g. distinguishes
             # missing_structured_output from other observer_failed causes).
-            raise ObserverWaveFailed(
+            exc = ObserverWaveFailed(
                 f"observer_failed:{request.agent_name}:{result.status}",
                 reason_code=result.reason_code,
                 exit_code=result.exit_code,
             )
+            return request, None, exc, exc.reason_code, exc.exit_code
         raw_text = json.dumps(result.structured_output, sort_keys=True, separators=(",", ":"))
-        bundle = parse_agent_output_with_repair(raw_text, EvidenceBundle, repair=repair)
+        try:
+            bundle = parse_agent_output_with_repair(raw_text, EvidenceBundle, repair=repair)
+        except WireContractError as exc:
+            return request, None, exc, getattr(exc, "reason_code", type(exc).__name__), None
+        # Issue #2646 AC4 / anchor review P1 finding #1: the REQUEST-side
+        # agent_name is the aggregate's identity authority -- a returned
+        # `observer_id` that does not match the observer THIS request
+        # actually launched is an independent terminal failure, never
+        # silently accepted merely because run_id/base_sha/
+        # source_set_digest also happen to agree (an observer_id swap
+        # alone does not disturb those).
+        if bundle.observer_id != request.agent_name:
+            exc = ObserverWaveFailed(
+                f"observer_id_mismatch:request={request.agent_name}:returned={bundle.observer_id}",
+                reason_code="observer_id_mismatch",
+            )
+            return request, None, exc, exc.reason_code, exc.exit_code
         if bundle.run_id != ctx.run_id:
-            raise ObserverWaveFailed(
+            exc = ObserverWaveFailed(
                 f"observer_run_id_mismatch:{request.agent_name}",
                 reason_code="observer_run_id_mismatch",
             )
+            return request, None, exc, exc.reason_code, exc.exit_code
         if bundle.source_set_digest != plan.source_set_digest:
-            raise ObserverWaveFailed(
+            exc = ObserverWaveFailed(
                 f"observer_source_set_digest_mismatch:{request.agent_name}",
                 reason_code="observer_source_set_digest_mismatch",
             )
+            return request, None, exc, exc.reason_code, exc.exit_code
         if bundle.base_sha != ctx.base_sha:
-            raise ObserverWaveFailed(
+            exc = ObserverWaveFailed(
                 f"observer_base_sha_mismatch:{request.agent_name}",
                 reason_code="observer_base_sha_mismatch",
             )
-        if bundle.observer_id in seen_ids:
-            raise ObserverWaveFailed(
-                f"duplicate_observer_id:{bundle.observer_id}",
-                reason_code="duplicate_observer_id",
+            return request, None, exc, exc.reason_code, exc.exit_code
+        return request, bundle, None, None, None
+
+    # Fan-out: every request is SUBMITTED before this call site ever blocks
+    # on any one of them (AC3) -- `ThreadPoolExecutor.submit` returns
+    # immediately; the real blocking work (`invoke`, ultimately a headless
+    # CLI subprocess call) happens inside each worker thread, independent
+    # of every other dispatched observer's own progress.
+    with ThreadPoolExecutor(max_workers=_observer_wave_max_workers(len(observer_requests))) as executor:
+        futures = [executor.submit(_process_one, request) for request in observer_requests]
+        # Fan-in: wait for EVERY dispatched observer to reach a terminal
+        # outcome -- a failure in one future is never allowed to cancel or
+        # skip collection of the others (AC1). Iterated in REQUEST order
+        # (not completion order) so downstream ordering (duplicate
+        # detection, `bundles` list order) stays deterministic regardless
+        # of which observer actually finishes first. `_process_one` never
+        # raises, so `.result()` here never raises either.
+        outcomes = [future.result() for future in futures]
+
+    seen_ids: set[str] = set()
+    bundles: list[EvidenceBundle] = []
+    failures: list[tuple[AgentInvocationRequest, BaseException, str | None, int | None]] = []
+    observer_results: list[ObserverWaveObserverResult] = []
+
+    def _record_failure(
+        request: AgentInvocationRequest, exc: BaseException, reason_code: str | None, exit_code: int | None
+    ) -> None:
+        failures.append((request, exc, reason_code, exit_code))
+        observer_results.append(
+            ObserverWaveObserverResult(
+                observer_id=request.agent_name, status="failed", reason_code=reason_code, exit_code=exit_code
             )
-        if expected_ids is not None and bundle.observer_id not in expected_ids:
-            raise ObserverWaveFailed(
-                f"observer_id_not_in_manifest:{bundle.observer_id}",
-                reason_code="observer_id_not_in_manifest",
+        )
+
+    for request, bundle, exc, reason_code, exit_code in outcomes:
+        if exc is not None:
+            _record_failure(request, exc, reason_code, exit_code)
+            continue
+        assert bundle is not None
+        if request.agent_name in seen_ids:
+            dup_exc = ObserverWaveFailed(
+                f"duplicate_observer_id:{request.agent_name}", reason_code="duplicate_observer_id"
             )
-        seen_ids.add(bundle.observer_id)
+            _record_failure(request, dup_exc, dup_exc.reason_code, None)
+            continue
+        if expected_ids is not None and request.agent_name not in expected_ids:
+            unmanifested_exc = ObserverWaveFailed(
+                f"observer_id_not_in_manifest:{request.agent_name}", reason_code="observer_id_not_in_manifest"
+            )
+            _record_failure(request, unmanifested_exc, unmanifested_exc.reason_code, None)
+            continue
+        seen_ids.add(request.agent_name)
         bundles.append(bundle)
-    if expected_ids is not None and seen_ids != expected_ids:
-        raise ObserverWaveFailed(
+        observer_results.append(
+            ObserverWaveObserverResult(observer_id=request.agent_name, status="ok", reason_code=None, exit_code=None)
+        )
+
+    if not failures and expected_ids is not None and seen_ids != expected_ids:
+        incomplete_exc = ObserverWaveFailed(
             f"observer_manifest_incomplete:missing={sorted(expected_ids - seen_ids)}",
             reason_code="observer_manifest_incomplete",
         )
+        incomplete_exc.observer_results = tuple(observer_results)
+        raise incomplete_exc
+
+    if len(failures) == 1:
+        _, exc, _reason_code, _exit_code = failures[0]
+        # Issue #2646 AC5: attach the full all-terminal aggregate even for
+        # the single-failure path, which re-raises the ORIGINAL exception
+        # instance/type unchanged (e.g. `SchemaRepairExhausted`) for exact
+        # pre-#2646 `pytest.raises`/reason_code compatibility.
+        exc.observer_results = tuple(observer_results)  # type: ignore[attr-defined]
+        raise exc
+    if failures:
+        # Issue #2646 AC5: multiple simultaneous failures are never
+        # represented by only the first one encountered -- a dedicated
+        # top-level reason_code makes this case structurally
+        # distinguishable from any single known-allowlisted failure (an
+        # existing live verifier's allowlist keyed on a single granular
+        # reason_code, e.g. `observer_run_id_mismatch`, must not mistake a
+        # MIXED allowlisted+unallowlisted multi-failure wave for a
+        # known-safe single failure).
+        message = "observer_wave_multiple_failures:" + ",".join(
+            f"{request.agent_name}={reason_code or type(exc).__name__}"
+            for request, exc, reason_code, _exit_code in failures
+        )
+        aggregate_exc = ObserverWaveFailed(message, reason_code="observer_wave_multiple_failures", exit_code=None)
+        aggregate_exc.observer_results = tuple(observer_results)
+        raise aggregate_exc
+
     return bundles
 
 
@@ -1813,7 +2165,20 @@ def build_finding_sets(
     function. A discovery-role (web) finding that claims an
     ``evidence_digest`` not matching ``source_digest_registry`` raises
     ``UnboundEvidenceAuthority`` (fail-closed -- an unbound claim is rejected
-    outright rather than silently downgraded)."""
+    outright rather than silently downgraded).
+
+    Role lookup here is keyed on ``bundle.observer_id`` -- Issue #2646
+    anchor review P1 finding #1 noted this alone would trust a returned
+    payload's own (potentially swapped) identity claim. The production call
+    graph (`run_cli`'s ``bundles = run_observer_wave(...)``) closes that gap
+    UPSTREAM of this function: `run_observer_wave` only ever returns bundles
+    for which ``bundle.observer_id == request.agent_name`` (its own
+    request-side authority) already held -- an observer_id swap is rejected
+    there as an independent ``observer_id_mismatch`` terminal failure and
+    NEVER reaches this function's ``bundles`` argument. This function's own
+    precondition is therefore: every ``bundle.observer_id`` it is given is
+    already the REQUEST-side identity that launched it, not merely
+    whatever the response payload happened to claim."""
     role_by_id = {spec.observer_id: spec.role for spec in manifest}
     source_type_by_id = {spec.observer_id: spec.source_type for spec in manifest}
     finding_sets: list[FindingSet] = []
@@ -3660,6 +4025,11 @@ class RunInterrupted(BaseException):
     def __init__(self, signum: int) -> None:
         super().__init__(f"run_interrupted:signal={signum}")
         self.signum = signum
+        #: Issue #2646 AC5/AC6: additive so `main()`'s typed-failure catch
+        #: (`getattr(exc, "reason_code", type(exc).__name__)`) surfaces an
+        #: explicit, stable ``"run_interrupted"`` reason_code instead of
+        #: falling back to the class name.
+        self.reason_code = "run_interrupted"
 
 
 @contextlib.contextmanager
@@ -3679,6 +4049,12 @@ def run_scoped_temp_dir(run_id: str, *, base_dir: Path | None = None):
     os.chmod(path, 0o700)  # explicit: `mkdir(mode=...)` is masked by umask
 
     def _signal_handler(signum: int, _frame: Any) -> None:
+        # Issue #2646 AC6 case (c): terminate every still-running child
+        # subprocess (bounded grace -> kill escalation) and confirm every
+        # one has actually been reaped by its OWNING worker thread BEFORE
+        # this raises -- so this context manager's own `finally` cleanup
+        # below never runs while a child this run launched is still alive.
+        terminate_all_active_child_processes()
         raise RunInterrupted(signum)
 
     previous_handlers: dict[int, Any] = {}
@@ -4120,7 +4496,7 @@ def run_cli(
     idempotency_key: str,
     schema_dir: Path,
     prompts: dict[str, str] | None = None,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    runner: Callable[..., subprocess.CompletedProcess] = _lifecycle_subprocess_run,
     git_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     clock: Callable[[], datetime] = _utcnow,
     run_id: str | None = None,
@@ -4469,7 +4845,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             prompts=prompts,
             previous_state_provider=previous_state_provider,
         )
-    except (ObserverWaveFailed, EvaluatorInvocationFailed, WireContractError, ValueError, GhAuthUnavailable) as exc:
+    except (
+        ObserverWaveFailed,
+        EvaluatorInvocationFailed,
+        WireContractError,
+        ValueError,
+        GhAuthUnavailable,
+        # Issue #2646 AC6: `RunInterrupted` subclasses `BaseException` (NOT
+        # `Exception`, see its own docstring) specifically so it is never
+        # accidentally swallowed by an unrelated bare `except Exception`
+        # deep in this call graph -- but `main()` IS this module's outermost
+        # boundary and must still convert it into the same typed-failure
+        # JSON/exit-1 contract as every other phase failure, rather than
+        # letting a raw traceback escape the stable executable entrypoint.
+        RunInterrupted,
+    ) as exc:
         # Issue #2341 AC1: additive diagnosability -- exit_code (when the
         # underlying failure traces back to a real subprocess Agent
         # invocation, e.g. ObserverWaveFailed/EvaluatorInvocationFailed) is
@@ -4478,9 +4868,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         # back to None via getattr's default, unchanged from prior behavior.
         reason_code = getattr(exc, "reason_code", type(exc).__name__)
         exit_code = getattr(exc, "exit_code", None)
+        # Issue #2646 AC5: when the underlying failure carries the
+        # all-terminal per-observer aggregate (`run_observer_wave`'s
+        # `ObserverWaveObserverResult` tuple, attached to whichever
+        # exception it ultimately raised -- see `run_observer_wave`'s
+        # docstring), surface it as an ADDITIVE field on the failure JSON
+        # (never replacing/removing any existing field) so a caller can
+        # always recover every dispatched observer's own status/
+        # reason_code/exit_code, not just the single top-level reason_code.
+        observer_results = getattr(exc, "observer_results", None)
+        payload: dict[str, Any] = {
+            "status": "failed",
+            "reason_code": reason_code,
+            "exit_code": exit_code,
+            "reason": str(exc),
+        }
+        if observer_results:
+            payload["observer_results"] = [dataclasses.asdict(r) for r in observer_results]
         print(
             json.dumps(
-                {"status": "failed", "reason_code": reason_code, "exit_code": exit_code, "reason": str(exc)},
+                payload,
                 sort_keys=True,
             )
         )

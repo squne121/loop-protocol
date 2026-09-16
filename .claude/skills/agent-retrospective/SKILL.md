@@ -62,7 +62,8 @@ root Skill が用意するのはこの 1 回の Bash 呼び出しのみ。内部
 `base_sha` 単一引数の closure へ束縛）を含む collectors を `prepare()` に渡し、`run_id`（run-scoped
 nonce）と `base_sha`（一度だけ解決、以降再解決しない）を固定した `RunContext` と `SourcePlan` を得る。
 
-### 3. observer wave（fan-out、`observer_parallelism: 3`、`EXPECTED_OBSERVER_MANIFEST` 固定 3 件）
+### 3. observer wave（fan-out/fan-in all-terminal barrier、`observer_parallelism: 3`、
+`EXPECTED_OBSERVER_MANIFEST` 固定 3 件、Issue #2646）
 
 `build_observer_requests()` で以下 3 observer の `AgentInvocationRequest` を組み立て、
 `invoke_agent()`（headless CLI subprocess `claude -p --agent <name> --output-format json
@@ -86,10 +87,27 @@ nonce）と `base_sha`（一度だけ解決、以降再解決しない）を固�
 - `web-researcher`（既存 SubAgent の再利用。discovery role。`evidence_digest` が Web collector の
   再取得済み digest と一致しない場合は `UnboundEvidenceAuthority` で reject される）
 
-`run_observer_wave()` が `EvidenceBundle`（`OBSERVER_RESULT_V1`）へ strict validation し、
-`ctx.base_sha` との一致・observer_id 重複なし・manifest 完全一致を検証する。失敗時は
+`run_observer_wave()` は required observer 3 体を、先に dispatch した observer の completion を
+待たずに同時 dispatch する（fan-out）。1 体が通常失敗（malformed/schema 不一致/nonzero exit 等）
+しても他 observer の dispatch/completion は止まらず、全 3 体が terminal になるまで待つ（fan-in、
+all-terminal barrier）。各 observer の返却 `EvidenceBundle`（`OBSERVER_RESULT_V1`）は strict
+validation され、`bundle.observer_id == request.agent_name`（返却 payload 側ではなく起動要求側の
+observer_id を identity authority とする）・`ctx.base_sha` との一致・observer_id 重複なし・manifest
+完全一致を検証する。observer_id の不一致（入れ替え）は `observer_id_mismatch` という独立した terminal
+failure として扱われ、他 observer の回収は継続し、evaluator は起動しない。失敗時は
 `schema_repair_retries: 1` まで repair を試み、それでも失敗すれば **evaluator を起動せず**
-fail-closed で終了する（AC14）。
+fail-closed で終了する（AC14）。1 observer のみの失敗は既存の granular `reason_code` を維持し、
+複数 observer が同時に失敗した場合は `observer_wave_multiple_failures` という専用の top-level
+`reason_code` を用いて、単一の「最初の失敗理由」で他の失敗を隠さない。全 observer の
+`status`/`reason_code`/`exit_code` は aggregate として `main()` の呼び出し元まで取得可能（CLI 失敗
+JSON の `observer_results` フィールド）。
+
+observer 自身の timeout では、その observer の実 subprocess を terminate → 有限の猶予 → 必要なら
+kill → reap してから terminal record を確定し、他 observer は継続する。親プロセスへの
+SIGINT/SIGTERM では、起動済みの全 observer 子プロセスへ終了要求を出し、有限の猶予後に必要なら
+kill し、全ての子プロセスの終了・reap を確認してから run-scoped temporary directory の cleanup を
+実行する（`run_scoped_temp_dir()`/`terminate_all_active_child_processes()`）。詳細は
+`references/execution-budget.md` を参照。
 
 `DelegatedAgentPermissionPolicy`（`run_retrospective.py`）が実際の subprocess argv（`--disallowedTools`）
 と subprocess env（mutation credential を除去した allowlist）へ直接反映され、`git commit`/`git push`/
