@@ -4914,7 +4914,7 @@ def compute_confidence(category: str) -> str:
         "broad_search_path_unbounded",   # AC2: Issue #648
         "new_file_missing_expected",     # AC11: Issue #1328
         "expected_pass_resolved_on_current_head",  # PR #1497 review Major 2: Issue #1488
-        VC_GREP_SYNTAX_ERROR_CATEGORY,   # Issue #2638: bounded rg/grep exit_code==2 syntax/usage error (optional per Notes for Reviewer)
+        VC_GREP_SYNTAX_ERROR_CATEGORY,   # Issue #2638: bounded rg/grep exit_code==2 syntax/usage error
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
