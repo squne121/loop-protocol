@@ -62,8 +62,8 @@ root Skill が用意するのはこの 1 回の Bash 呼び出しのみ。内部
 `base_sha` 単一引数の closure へ束縛）を含む collectors を `prepare()` に渡し、`run_id`（run-scoped
 nonce）と `base_sha`（一度だけ解決、以降再解決しない）を固定した `RunContext` と `SourcePlan` を得る。
 
-### 3. observer wave（fan-out/fan-in all-terminal barrier、`observer_parallelism: 3`、
-`EXPECTED_OBSERVER_MANIFEST` 固定 3 件、Issue #2646）
+### 3. observer wave（fan-out/fan-in の全 observer 終端バリア。`observer_parallelism: 3`、
+`EXPECTED_OBSERVER_MANIFEST` は固定 3 件、Issue #2646 で追加）
 
 `build_observer_requests()` で以下 3 observer の `AgentInvocationRequest` を組み立て、
 `invoke_agent()`（headless CLI subprocess `claude -p --agent <name> --output-format json
