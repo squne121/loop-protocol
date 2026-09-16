@@ -7,15 +7,26 @@ from __future__ import annotations
 import statusline
 
 
-def test_given_degraded_projection_when_rendered_then_shows_degraded_reason():
+def test_given_degraded_projection_no_state_db_when_rendered_then_shows_degraded():
+    """Issue #2634 AC3: a genuine DB/query failure reason (e.g. no_state_db)
+    renders plain `Degraded` -- the diagnostic reason is no longer surfaced
+    in the presentation string itself (kept as an internal data field only)."""
     text = statusline.render({"degraded": True, "degraded_reason": "no_state_db"})
-    assert "degraded" in text
-    assert "no_state_db" in text
+    assert text == "Degraded"
+    assert "no_state_db" not in text
+
+
+def test_given_degraded_no_binding_for_session_when_rendered_then_shows_unbound():
+    """Issue #2634 AC3: `degraded_reason == "no_binding_for_session"` is
+    semantically just "no task bound to this session yet" -- renders
+    `Unbound`, not `Degraded`."""
+    text = statusline.render({"degraded": True, "degraded_reason": "no_binding_for_session"})
+    assert text == "Unbound"
 
 
 def test_given_unbound_projection_when_rendered_then_shows_unbound():
     text = statusline.render({"degraded": False, "task": None})
-    assert "unbound" in text
+    assert text == "Unbound"
 
 
 def test_given_bound_task_with_ref_when_rendered_then_shows_osc8_hyperlink_and_activity():
@@ -28,10 +39,13 @@ def test_given_bound_task_with_ref_when_rendered_then_shows_osc8_hyperlink_and_a
         "attention": None,
     }
     text = statusline.render(data)
-    assert "owner/repo#42" in text
+    assert "#42" in text
+    assert "owner/repo#42" not in text  # Issue #2634 AC2: no repo name in the ref label
     assert "https://github.com/owner/repo/issues/42" in text
-    assert "activity=impl" in text
+    assert "impl" in text
+    assert "activity=" not in text  # PR #2640 review fix_delta: no `activity=` prefix
     assert "health=" not in text  # ACTIVE is the default/healthy state -- not surfaced
+    assert not text.startswith("[Task Context] ")  # Issue #2634 AC2: prefix removed
 
 
 def test_given_pr_ref_when_rendered_then_pull_url_used():
