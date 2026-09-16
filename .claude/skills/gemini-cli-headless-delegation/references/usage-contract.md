@@ -234,7 +234,7 @@ Gemini CLI とは別の認証状態を持つため、次を Stop Conditions と�
 - system keyring / desktop session / dbus / runtime dir に依存する認証状態が不確かな場合、`_minimal_agy_env()` の allowlist env では認証情報にアクセスできず fail-closed し得る。
 - API key（`GEMINI_API_KEY` 等）は `provider=agy` の認証前提には使わない。API key 経路は `provider=gemini` の暫定回避専用であり、`provider=agy` には継承しない。
 
-#### current official Antigravity CLI install contract の API-key route（参考記録、Issue #2616 AC1）
+#### 現行の Antigravity CLI 公式インストール文書が定める API-key route（参考記録、Issue #2616 AC1）
 
 Antigravity CLI（`agy`）自体の current official install docs
 （`https://antigravity.google/docs/cli/install/`, 確認日 2026-09-17）は、account-session
