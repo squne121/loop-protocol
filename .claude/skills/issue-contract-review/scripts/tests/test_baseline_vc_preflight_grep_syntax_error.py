@@ -25,15 +25,37 @@ This file verifies:
   - AC5: the 4 bounded patterns (rg regex parse error, rg invalid option,
     grep regex error, grep invalid option) are each recognized, table-driven.
 
+PR #2643 review (OWNER, https://github.com/squne121/loop-protocol/pull/2643#issuecomment-5699118823)
+found 3 remaining classification-boundary gaps in the above and requested
+fixes without redesigning the annotation post-processing / readiness
+mapping already covered above. This file additionally verifies:
+  - Finding 1 (P2): a grep invoked via an absolute path (`/usr/bin/grep`)
+    is recognized the same as bare `grep`, even though some grep builds
+    echo the VERBATIM `argv[0]` (not just its basename) in their
+    diagnostic prefix.
+  - Finding 2 (P2): representative additional grep/rg syntax/usage-error
+    diagnoses (`Unmatched ( or \(`, `Invalid range end`, `option requires
+    an argument`, `invalid max count`, rg's `missing value for flag`) are
+    recognized, without absorbing exit_code==2 in general.
+  - Finding 3 (P2): a `RIPGREP_CONFIG_PATH`-referenced config file
+    containing an invalid option must not cause an otherwise-correct rg VC
+    to be misclassified as `vc_grep_syntax_error` (negative control).
+
 Stderr fixtures below were captured from REAL local subprocess invocations
 (ripgrep 14.1.0 / GNU grep 3.11) against a plain existing file, not
 hand-guessed strings -- see `baseline_vc_preflight.py`'s
-`_RG_REGEX_PARSE_ERROR_LINE` / `_RG_INVALID_OPTION_LINE` /
-`_GREP_REGEX_ERROR_LINE` / `_GREP_INVALID_OPTION_LINE` docstrings for the
-exact commands used to capture them.
+`_RG_REGEX_PARSE_ERROR_LINE_TEMPLATE` / `_RG_INVALID_OPTION_LINE_TEMPLATE` /
+`_GREP_REGEX_ERROR_LINE_TEMPLATE` / `_GREP_INVALID_OPTION_LINE_TEMPLATE`
+docstrings for the exact commands used to capture them. The Finding
+1/2/3 tests below additionally capture stderr LIVE (real subprocess, not
+hardcoded) from whatever rg/grep build is actually installed in the
+current environment, so they self-validate against this environment's
+actual diagnostics rather than a potentially stale fixture string.
 """
 
 import json
+import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -104,6 +126,44 @@ def _run_preflight_cli(body: str, body_file: Path, issue_num: int = 999) -> dict
     )
     assert result.stdout, f"No output: {result.stderr}"
     return json.loads(result.stdout)
+
+
+def _run_preflight_cli_with_env(body: str, body_file: Path, env: dict, issue_num: int = 999) -> dict:
+    """Like `_run_preflight_cli()` above, but launches the preflight CLI
+    subprocess with a CALLER-SUPPLIED environment. Used by the Finding 3
+    (`RIPGREP_CONFIG_PATH`) negative-control test below, which must set
+    `RIPGREP_CONFIG_PATH` in the PARENT of the preflight CLI subprocess (to
+    reproduce a user's shell environment) and confirm the isolation happens
+    inside `run_command()`, not merely by coincidence of this test's own
+    environment already lacking the variable."""
+    body_file.write_text(body, encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT_PATH),
+            "--body-file",
+            str(body_file),
+            "--issue",
+            str(issue_num),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+    )
+    assert result.stdout, f"No output: {result.stderr}"
+    return json.loads(result.stdout)
+
+
+def _live_subprocess_result(argv):
+    """Run `argv` as a REAL subprocess (bypassing any interactive-shell
+    aliasing/functions, since `subprocess.run()` with a list argv never
+    goes through a shell) and return the completed process. Used by the
+    Finding 1/2 tests below to capture this environment's ACTUAL rg/grep
+    diagnostic text at test-run time, rather than a hardcoded fixture
+    string that could silently drift from what a real invocation now
+    produces."""
+    return subprocess.run(argv, capture_output=True, text=True, timeout=10)
 
 
 def _vc_body(annotation_line, command: str) -> str:
@@ -374,3 +434,258 @@ def test_non_rg_grep_exit2_not_classified_as_syntax_error():
         "diff -u a.txt b.txt", 2, "diff: regex parse error: not really\n"
     )
     assert subtype is None
+
+
+# ---------------------------------------------------------------------------
+# PR #2643 review Finding 1 (P2): a grep invoked via an absolute path
+# (`/usr/bin/grep`) must be recognized the same as bare `grep`, even though
+# some grep builds echo the VERBATIM `argv[0]` (not just its basename) in
+# their diagnostic prefix.
+# ---------------------------------------------------------------------------
+
+
+def test_grep_bare_and_absolute_path_argv0_regex_error_classified_identically():
+    """Finding 1: `grep -E '[' file` and `/usr/bin/grep -E '[' file` must
+    both be recognized as `grep_regex_error`, even though (verified live
+    below) their stderr diagnostic prefixes literally differ (`grep:` vs
+    `/usr/bin/grep:`)."""
+    bare = _live_subprocess_result(["grep", "-E", "[", "/etc/passwd"])
+    absolute = _live_subprocess_result(["/usr/bin/grep", "-E", "[", "/etc/passwd"])
+    assert bare.returncode == 2, bare
+    assert absolute.returncode == 2, absolute
+    # Regression guard: confirm this environment's grep build actually
+    # exhibits the argv[0]-verbatim prefix divergence this test defends
+    # against (if some future grep build normalized to a fixed basename
+    # prefix, this assertion documents that the reproduction premise
+    # changed, instead of this test silently no-op-ing).
+    assert bare.stderr != absolute.stderr, (bare.stderr, absolute.stderr)
+    assert bare.stderr.startswith("grep:"), bare.stderr
+    assert absolute.stderr.startswith("/usr/bin/grep:"), absolute.stderr
+
+    bare_command = "grep -E '[' /etc/passwd"
+    absolute_command = "/usr/bin/grep -E '[' /etc/passwd"
+
+    bare_subtype = baseline_vc_preflight._detect_rg_grep_exit2_syntax_error(
+        bare_command, bare.returncode, bare.stderr
+    )
+    absolute_subtype = baseline_vc_preflight._detect_rg_grep_exit2_syntax_error(
+        absolute_command, absolute.returncode, absolute.stderr
+    )
+    assert bare_subtype == "grep_regex_error", bare_subtype
+    assert absolute_subtype == "grep_regex_error", absolute_subtype
+
+    for command, result in ((bare_command, bare), (absolute_command, absolute)):
+        classification, category, decision, fix_hint, scope_class = baseline_vc_preflight.classify_result(
+            exit_code=result.returncode,
+            stdout="",
+            stderr=result.stderr,
+            command=command,
+            allowed_paths=None,
+            static_policy_passed=True,
+        )
+        assert category == "vc_grep_syntax_error", (command, category)
+        assert classification == "blocked", (command, classification)
+        assert decision == "blocked", (command, decision)
+
+
+def test_grep_bare_and_absolute_path_argv0_invalid_option_classified_identically():
+    """Finding 1: the same argv[0]-prefix-divergence issue also affects the
+    invalid-option pattern, not just the regex-error pattern."""
+    bare = _live_subprocess_result(["grep", "--definitely-invalid-option", "foo", "/etc/passwd"])
+    absolute = _live_subprocess_result(["/usr/bin/grep", "--definitely-invalid-option", "foo", "/etc/passwd"])
+    assert bare.returncode == 2, bare
+    assert absolute.returncode == 2, absolute
+    assert bare.stderr.startswith("grep:"), bare.stderr
+    assert absolute.stderr.startswith("/usr/bin/grep:"), absolute.stderr
+
+    bare_command = "grep --definitely-invalid-option foo /etc/passwd"
+    absolute_command = "/usr/bin/grep --definitely-invalid-option foo /etc/passwd"
+
+    bare_subtype = baseline_vc_preflight._detect_rg_grep_exit2_syntax_error(
+        bare_command, bare.returncode, bare.stderr
+    )
+    absolute_subtype = baseline_vc_preflight._detect_rg_grep_exit2_syntax_error(
+        absolute_command, absolute.returncode, absolute.stderr
+    )
+    assert bare_subtype == "grep_invalid_option", bare_subtype
+    assert absolute_subtype == "grep_invalid_option", absolute_subtype
+
+
+def test_grep_absolute_path_argv0_preflight_cli_classified_as_needs_fix(tmp_path):
+    """Finding 1, full CLI-level regression: `/usr/bin/grep -E '[' /etc/passwd`
+    (absolute-path invocation) is classified as `vc_grep_syntax_error` end
+    to end via the real CLI subprocess and maps to `needs_fix` -- exactly
+    like the bare `grep` case already covered by
+    `test_syntax_error_patterns_table_driven` above."""
+    data = _run_preflight_cli(
+        _vc_body(None, "/usr/bin/grep -E '[' /etc/passwd"), tmp_path / "abs_grep.md"
+    )
+    r = data["results"][0]
+    assert r["category"] == "vc_grep_syntax_error", r
+    assert r["classification"] == "blocked", r
+    assert r["decision"] == "blocked", r
+    mapped = contract_readiness_check._PREFLIGHT_CATEGORY_TO_READINESS.get(r["category"])
+    assert mapped == "needs_fix", f"Expected needs_fix mapping but got {mapped!r}"
+
+
+# ---------------------------------------------------------------------------
+# PR #2643 review Finding 2 (P2): representative additional grep/rg
+# syntax/usage-error diagnostics beyond the original single pattern per
+# category, captured LIVE from a real subprocess invocation in this
+# environment (not hardcoded strings), so each test self-validates against
+# whatever rg/grep build/version/locale is actually installed.
+# ---------------------------------------------------------------------------
+
+_FINDING_B_LIVE_CASES = [
+    pytest.param(
+        ["grep", "-E", "(", "/etc/passwd"],
+        "grep_regex_error",
+        "Unmatched",
+        id="grep_unmatched_paren",
+    ),
+    pytest.param(
+        ["grep", "-E", "[z-a]", "/etc/passwd"],
+        "grep_regex_error",
+        "Invalid range end",
+        id="grep_invalid_range_end",
+    ),
+    pytest.param(
+        ["grep", "foo", "/etc/passwd", "-e"],
+        "grep_invalid_option",
+        "option requires an argument",
+        id="grep_option_requires_argument",
+    ),
+    pytest.param(
+        ["grep", "--max-count=no", "foo", "/etc/passwd"],
+        "grep_invalid_option",
+        "invalid max count",
+        id="grep_invalid_max_count",
+    ),
+    pytest.param(
+        ["rg", "foo", "/etc/passwd", "--max-count"],
+        "rg_invalid_option",
+        "missing value for flag",
+        id="rg_missing_value_for_flag",
+    ),
+]
+
+
+@pytest.mark.parametrize("argv,expected_subtype,expected_message_fragment", _FINDING_B_LIVE_CASES)
+def test_finding_b_additional_syntax_error_patterns_live_capture(argv, expected_subtype, expected_message_fragment):
+    """Finding 2: additional representative grep/rg syntax/usage-error
+    diagnostics -- not just the single pattern per category the original PR
+    covered -- are recognized as `vc_grep_syntax_error` / the correct
+    bounded subtype, not silently dropped to `unknown` / `human_judgment`."""
+    result = _live_subprocess_result(argv)
+    assert result.returncode == 2, (argv, result.returncode, result.stdout, result.stderr)
+    assert expected_message_fragment in result.stderr, (argv, result.stderr)
+
+    command = " ".join(shlex.quote(a) for a in argv)
+    subtype = baseline_vc_preflight._detect_rg_grep_exit2_syntax_error(command, result.returncode, result.stderr)
+    assert subtype == expected_subtype, (argv, result.stderr, subtype)
+
+    classification, category, decision, fix_hint, scope_class = baseline_vc_preflight.classify_result(
+        exit_code=result.returncode,
+        stdout="",
+        stderr=result.stderr,
+        command=command,
+        allowed_paths=None,
+        static_policy_passed=True,
+    )
+    assert category == "vc_grep_syntax_error", (argv, category)
+    assert classification == "blocked", (argv, classification)
+    assert decision == "blocked", (argv, decision)
+    assert fix_hint is not None
+
+
+def test_finding_b_grep_unmatched_paren_annotation_matrix(tmp_path):
+    """Finding 2, representative pattern exercised through the full
+    annotation matrix (none / baseline-expect: fail / baseline-expect:
+    pass) via the real CLI subprocess -- confirms the newly-recognized
+    `Unmatched ( or \\(` grep diagnostic survives
+    `_finalize_and_store_job()`'s annotation post-processing the same way
+    the pre-existing `Invalid regular expression` pattern already does."""
+    command = "grep -E '(' /etc/passwd"
+
+    data_none = _run_preflight_cli(_vc_body(None, command), tmp_path / "b_none.md")
+    r_none = data_none["results"][0]
+    assert r_none["category"] == "vc_grep_syntax_error", r_none
+    assert r_none["classification"] == "blocked", r_none
+    assert r_none["decision"] == "blocked", r_none
+    mapped = contract_readiness_check._PREFLIGHT_CATEGORY_TO_READINESS.get(r_none["category"])
+    assert mapped == "needs_fix", f"Expected needs_fix mapping but got {mapped!r}"
+
+    data_fail = _run_preflight_cli(_vc_body("# baseline-expect: fail", command), tmp_path / "b_fail.md")
+    r_fail = data_fail["results"][0]
+    assert r_fail["category"] == "vc_grep_syntax_error", r_fail
+    assert r_fail["decision"] != "go", r_fail
+
+    data_pass = _run_preflight_cli(_vc_body("# baseline-expect: pass", command), tmp_path / "b_pass.md")
+    r_pass = data_pass["results"][0]
+    assert r_pass["category"] == "vc_grep_syntax_error", r_pass
+    assert r_pass["category"] != "baseline_regression_failed", r_pass
+    assert r_pass["classification"] != "human_judgment", r_pass
+
+
+# ---------------------------------------------------------------------------
+# PR #2643 review Finding 3 (P2) negative control: a
+# `RIPGREP_CONFIG_PATH`-referenced config file containing an invalid option
+# must NOT cause an otherwise-correct rg VC to be misclassified as
+# `vc_grep_syntax_error`. Also confirms the isolation never mutates the
+# user's own shell/global environment (`os.environ` itself).
+# ---------------------------------------------------------------------------
+
+
+def test_rg_config_path_invalid_option_env_delta_unsets_it_for_rg_only():
+    """Finding 3, unit-level: `_fixed_env_delta_for_argv()` returns an
+    `_ENV_UNSET_SENTINEL` for `RIPGREP_CONFIG_PATH` when `argv[0]` is `rg`,
+    and returns an EMPTY delta for a non-rg command (e.g. `grep`) even when
+    that non-rg argv is otherwise identical in shape -- the isolation is
+    scoped to rg only, per Finding 3's requirement 5."""
+    rg_delta = baseline_vc_preflight._fixed_env_delta_for_argv(["rg", "-F", "foo", "sample.txt"])
+    assert rg_delta.get("RIPGREP_CONFIG_PATH") == baseline_vc_preflight._ENV_UNSET_SENTINEL, rg_delta
+
+    grep_delta = baseline_vc_preflight._fixed_env_delta_for_argv(["grep", "-F", "foo", "sample.txt"])
+    assert "RIPGREP_CONFIG_PATH" not in grep_delta, grep_delta
+
+
+def test_ripgrep_config_path_false_positive_negative_control(tmp_path):
+    """Finding 3, full CLI-level negative control: a `RIPGREP_CONFIG_PATH`
+    pointed at a config file containing an invalid option must not cause
+    the correct VC `rg -F foo sample.txt` to be misclassified as
+    `vc_grep_syntax_error`. The PARENT preflight CLI subprocess itself is
+    launched with `RIPGREP_CONFIG_PATH` set (reproducing a user's shell
+    environment), confirming the isolation happens inside `run_command()`
+    when it launches the VC's OWN rg subprocess -- not merely an artifact
+    of this test's own environment already lacking the variable."""
+    sample = tmp_path / "sample.txt"
+    sample.write_text("foo bar baz\n", encoding="utf-8")
+    config = tmp_path / "bad_ripgreprc"
+    config.write_text("--definitely-invalid-option\n", encoding="utf-8")
+
+    # Confirm (independently of the preflight script) that this config file
+    # really does break rg the way Finding 3 describes, so this negative
+    # control is exercising a genuine false-positive risk, not a no-op.
+    poisoned_env = dict(os.environ)
+    poisoned_env["RIPGREP_CONFIG_PATH"] = str(config)
+    poisoned = subprocess.run(
+        ["rg", "-F", "foo", str(sample)], capture_output=True, text=True, env=poisoned_env, timeout=10
+    )
+    assert poisoned.returncode == 2, poisoned
+    assert "--definitely-invalid-option" in poisoned.stderr, poisoned.stderr
+
+    command = f"rg -F foo {sample}"
+    data = _run_preflight_cli_with_env(
+        _vc_body("# baseline-expect: pass", command), tmp_path / "config_leak.md", poisoned_env
+    )
+    r = data["results"][0]
+    assert r["exit_code"] == 0, r
+    assert r["category"] != "vc_grep_syntax_error", r
+    assert r["classification"] == "expected_pass", r
+    assert r["decision"] == "go", r
+
+    # The isolation must apply ONLY to the launched subprocess's env, never
+    # to the caller-supplied env dict itself (which still has the poisoned
+    # value set, exactly as a real user's shell environment would) -- i.e.
+    # `run_command()` mutates a COPY, not `poisoned_env` in place.
+    assert poisoned_env["RIPGREP_CONFIG_PATH"] == str(config), "caller's own env dict must be untouched"
