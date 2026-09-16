@@ -1106,6 +1106,16 @@ _PREFLIGHT_CATEGORY_TO_READINESS: dict[str, str] = {
     # contract_readiness_human_judgment`) to the operator-intervention route
     # instead of the ordinary Step 4 rewrite loop.
     "command_not_allowed": "needs_fix",
+    # Issue #2638: rg/grep exit_code==2 regex-syntax / invalid-option /
+    # usage-error VCs (`classify_result()`'s new bounded category, see
+    # `baseline_vc_preflight.py::VC_GREP_SYNTAX_ERROR_CATEGORY`) are a
+    # body-author-fixable VC design mistake, not an environment/tooling
+    # issue -> needs_fix (not human_judgment). Before this entry, this
+    # category was NOT a key here and fell through to the human_judgment
+    # default below (same failure mode Issue #2397 fixed for
+    # `command_not_allowed`), incorrectly routing to operator-intervention
+    # instead of the ordinary Step 4 rewrite loop.
+    "vc_grep_syntax_error": "needs_fix",
 }
 
 

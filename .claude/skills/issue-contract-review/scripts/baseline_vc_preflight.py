@@ -2114,7 +2114,16 @@ def run_command(command: str, timeout_seconds: int, cwd: str) -> Tuple[int, str,
     run_env = None
     if env_delta:
         run_env = os.environ.copy()
-        run_env.update(env_delta)
+        # Issue #2638 P2 fix (PR #2643 review Finding 3): a `_ENV_UNSET_SENTINEL`
+        # value means "delete this key from the subprocess env" (e.g. rg's
+        # `RIPGREP_CONFIG_PATH` isolation), not "set it to that literal
+        # string". Ordinary string values are applied as before. This only
+        # ever mutates the COPY made above, never `os.environ` itself.
+        for _env_key, _env_value in env_delta.items():
+            if _env_value == _ENV_UNSET_SENTINEL:
+                run_env.pop(_env_key, None)
+            else:
+                run_env[_env_key] = _env_value
 
     start = datetime.now()
     process: Optional[subprocess.Popen] = None
@@ -3273,12 +3282,54 @@ def _is_allowed_env_invocation(argv: List[str]) -> bool:
     return len(argv) == 2 and argv[1] in ("--help", "--version")
 
 
+# Issue #2638 P2 fix (PR #2643 review Finding 3): sentinel value for an
+# `env_delta` dict entry meaning "unset this environment variable for the
+# VC subprocess" -- as opposed to a normal string value, which means "set
+# this environment variable to this value". `_fixed_env_delta_for_argv()`'s
+# return type is `Dict[str, str]` (a flat key -> value delta) and cannot
+# natively express key deletion; this sentinel closes that gap without
+# widening the function's contract. `run_command()` below is the single
+# place that interprets this sentinel when applying `env_delta` to the
+# subprocess's environment.
+_ENV_UNSET_SENTINEL = "__baseline_vc_preflight_env_unset__"
+
+
 def _fixed_env_delta_for_argv(argv: List[str]) -> Dict[str, str]:
-    """Return a fixed runner-side env delta for exact safe commands only."""
+    """Return a fixed runner-side env delta for exact safe commands only.
+
+    Issue #2638 P2 fix (PR #2643 review Finding 3): two independent,
+    additive conditions may each contribute keys to the returned delta --
+    the pre-existing pnpm-gate delta (keyed off `_canonical_pnpm_gate(argv)`)
+    and rg's `RIPGREP_CONFIG_PATH` isolation delta (keyed off
+    `os.path.basename(argv[0]) == "rg"`). Neither branch overwrites the
+    other; both are evaluated and merged into the same dict (in practice a
+    single argv cannot match both conditions, since pnpm and rg are
+    different executables)."""
+    delta: Dict[str, str] = {}
     key = _canonical_pnpm_gate(argv)
-    if key is None:
-        return {}
-    return dict(pnpm_gate_registry.RUNNER_ENV_DELTA)
+    if key is not None:
+        delta.update(pnpm_gate_registry.RUNNER_ENV_DELTA)
+    if argv and os.path.basename(argv[0]) == "rg":
+        # A user's shell/global environment may set `RIPGREP_CONFIG_PATH`
+        # to point at a config file containing an option that is invalid
+        # or unsupported by the invoked rg binary. ripgrep prepends the
+        # config file's own arguments to the CLI argv and reparses them
+        # with the SAME parser (verified locally against ripgrep 14.1.0:
+        # a config file containing `--definitely-invalid-option` makes
+        # even the well-formed VC `rg -F foo sample.txt` fail with
+        # `rg: unrecognized flag --definitely-invalid-option`, exit code
+        # 2 -- identical in shape to a genuinely broken VC command line).
+        # Without this isolation, `_detect_rg_grep_exit2_syntax_error()`
+        # would misclassify this pre-existing environment/config condition
+        # as a body-author-fixable `vc_grep_syntax_error`, even though the
+        # VC command text itself is correct. Isolate ONLY this VC
+        # subprocess (never the caller's actual shell/global environment --
+        # `run_command()` applies `env_delta` to a COPY of `os.environ`,
+        # never to `os.environ` itself) by unsetting `RIPGREP_CONFIG_PATH`
+        # via the sentinel above. Scoped to `prog == "rg"` only: grep and
+        # every other command are unaffected.
+        delta["RIPGREP_CONFIG_PATH"] = _ENV_UNSET_SENTINEL
+    return delta
 
 
 def _is_package_manager_no_tty_prompt(command: str, stdout: str, stderr: str) -> bool:
@@ -4164,6 +4215,145 @@ def _is_rg_missing_path_error(stderr: str) -> bool:
     return _rg_stderr_indicates_missing_path(stderr) and not _rg_stderr_indicates_error_not_missing_path(stderr)
 
 
+# Issue #2638: the new preflight category returned by
+# `_detect_rg_grep_exit2_syntax_error()` for rg/grep exit_code==2 regex-syntax
+# / invalid-option / usage-error VCs. Deliberately a single category name
+# used consistently for all 4 bounded subtypes (rg_regex_parse_error /
+# rg_invalid_option / grep_regex_error / grep_invalid_option); the subtype
+# itself is only surfaced in the fix_hint text, not as a separate category.
+VC_GREP_SYNTAX_ERROR_CATEGORY = "vc_grep_syntax_error"
+
+# Issue #2638 P2 fix (PR #2643 review Finding 1): some grep builds echo the
+# VERBATIM `argv[0]` as invoked (not its basename) in their diagnostic
+# prefix -- e.g. invoking `/usr/bin/grep -E '[' file` on GNU grep 3.11
+# locally prints `/usr/bin/grep: Invalid regular expression`, not
+# `grep: Invalid regular expression` -- even though the classifier's own
+# executable-family detection (`prog = os.path.basename(argv[0])`, below)
+# correctly recognizes this as a grep invocation. ripgrep, by contrast, was
+# verified locally (14.1.0) to ALWAYS self-identify as the fixed literal
+# `rg:` regardless of invocation path (`rg`, `/usr/bin/rg`, etc. all print
+# `rg: ...`). To cover both behaviors without guessing which one a given
+# build uses, the diagnostic-prefix regex tries exactly 2 bounded
+# candidates -- the verbatim `argv[0]` string and its basename -- built
+# fresh per invocation from the PARSED argv (never an unbounded wildcard
+# such as `.*grep:`, which could false-match unrelated text).
+def _stderr_diagnostic_prefix_alternation(argv0: str) -> str:
+    """Build a regex alternation (already `re.escape()`d) of the bounded
+    diagnostic-prefix candidates for `argv0`: the literal string as invoked
+    and its basename. Used as the `{prefix}` slot in the message-line regex
+    templates below."""
+    candidates = sorted({argv0, os.path.basename(argv0)})
+    return "|".join(re.escape(candidate) for candidate in candidates)
+
+
+# Issue #2638: rg's OWN regex-parse-error stderr format is a multi-line
+# message starting with the literal line "rg: regex parse error:" (verified
+# against ripgrep 14.1.0 locally), which is structurally distinct from
+# grep/egrep/fgrep's single-line "grep: Invalid regular expression" format.
+_RG_REGEX_PARSE_ERROR_LINE_TEMPLATE = r"^(?:{prefix}): regex parse error:"
+
+# Issue #2638 (P2 fix, PR #2643 review Finding 2): rg's own invalid-option/
+# usage-error stderr formats. "unrecognized flag" / "unrecognized option" /
+# "unrecognized file type" / "error parsing flag" were observed locally
+# (ripgrep 14.1.0); "missing value for flag" (e.g.
+# `rg: missing value for flag --max-count: missing argument for option
+# '--max-count'`, from `rg foo file --max-count`) was added after local
+# reproduction during PR #2643 review. All are single-line and begin with
+# "rg: " (distinct from the multi-line regex-parse-error format above).
+# This is a narrow, bounded allowlist -- NOT a reuse of
+# `_RG_STDERR_ERROR_NOT_MISSING_PATH_PATTERNS` (that blacklist also matches
+# permission/config/env errors such as "Permission denied" / "bad config",
+# which must NOT be absorbed into this new body-author-fixable category).
+_RG_INVALID_OPTION_MESSAGES = (
+    "unrecognized flag",
+    "unrecognized option",
+    "unrecognized file type",
+    "error parsing flag",
+    "missing value for flag",
+)
+_RG_INVALID_OPTION_LINE_TEMPLATE = (
+    r"^(?:{prefix}): (?:" + "|".join(re.escape(m) for m in _RG_INVALID_OPTION_MESSAGES) + r")\b"
+)
+
+# Issue #2638 (P2 fix, PR #2643 review Finding 2): GNU grep's own
+# regex-error stderr formats. "Invalid regular expression" was observed
+# locally (GNU grep 3.11, e.g. `grep -E '[' file`); "Unmatched ( or \\("
+# (from `grep -E '(' file`) and "Invalid range end" (from
+# `grep -E '[z-a]' file`) were added after local reproduction during PR
+# #2643 review. egrep/fgrep are symlinks to the same binary and share this
+# format, prefixed with their own invoked name instead of "grep:".
+_GREP_REGEX_ERROR_MESSAGES = (
+    "Invalid regular expression",
+    "Unmatched ( or \\(",
+    "Invalid range end",
+)
+_GREP_REGEX_ERROR_LINE_TEMPLATE = (
+    r"^(?:{prefix}): (?:" + "|".join(re.escape(m) for m in _GREP_REGEX_ERROR_MESSAGES) + r")"
+)
+
+# Issue #2638 (P2 fix, PR #2643 review Finding 2): GNU grep's own
+# invalid-option/usage-error stderr formats. "unrecognized option '...'"
+# (followed by a "Usage: grep [OPTION]..." banner line) and "invalid
+# option --" (used by some grep builds/locales) were observed locally (GNU
+# grep 3.11). "option requires an argument" (from `grep foo file -e`) and
+# "invalid max count" (from `grep --max-count=no foo file`) were added
+# after local reproduction during PR #2643 review.
+_GREP_INVALID_OPTION_MESSAGES = (
+    "unrecognized option",
+    "invalid option",
+    "option requires an argument",
+    "invalid max count",
+)
+_GREP_INVALID_OPTION_LINE_TEMPLATE = (
+    r"^(?:{prefix}): (?:" + "|".join(re.escape(m) for m in _GREP_INVALID_OPTION_MESSAGES) + r")\b"
+)
+
+
+def _detect_rg_grep_exit2_syntax_error(command: str, exit_code: int, stderr: str) -> Optional[str]:
+    """Issue #2638: positively identify exactly 4 bounded rg/grep exit_code==2
+    regex-syntax / invalid-option / usage-error patterns via the PARSED argv
+    executable basename -- mirroring `_candidate_new_allowed_path_target()`'s
+    `os.path.basename(argv[0])` style executable-name detection -- rather
+    than a raw substring search over the raw command string (e.g. "rg" or
+    "grep" appearing anywhere in the command text, which could false-match
+    an unrelated command whose arguments merely contain those substrings).
+
+    Returns one of "rg_regex_parse_error" | "rg_invalid_option" |
+    "grep_regex_error" | "grep_invalid_option" if the command's executable
+    is rg/grep-family, exit_code == 2, AND stderr matches the corresponding
+    bounded positive pattern above; otherwise None (including when exit_code
+    != 2, or the executable is not rg/grep/egrep/fgrep, or stderr does not
+    match any of the bounded patterns -- e.g. permission/config/env/I/O
+    failures, or the Issue #1328 missing-path special case, are never
+    absorbed into this category by this function). PR #2643 review Finding
+    1: the diagnostic-prefix candidates are derived from THIS invocation's
+    own `argv[0]` (verbatim + basename), so `/usr/bin/grep`-style absolute
+    invocations are recognized the same as bare `grep`."""
+    if exit_code != 2:
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    prog = os.path.basename(argv[0])
+    prefix = _stderr_diagnostic_prefix_alternation(argv[0])
+    if prog == "rg":
+        if re.search(_RG_REGEX_PARSE_ERROR_LINE_TEMPLATE.format(prefix=prefix), stderr, re.MULTILINE):
+            return "rg_regex_parse_error"
+        if re.search(_RG_INVALID_OPTION_LINE_TEMPLATE.format(prefix=prefix), stderr, re.MULTILINE):
+            return "rg_invalid_option"
+        return None
+    if prog in ("grep", "egrep", "fgrep"):
+        if re.search(_GREP_REGEX_ERROR_LINE_TEMPLATE.format(prefix=prefix), stderr, re.MULTILINE):
+            return "grep_regex_error"
+        if re.search(_GREP_INVALID_OPTION_LINE_TEMPLATE.format(prefix=prefix), stderr, re.MULTILINE):
+            return "grep_invalid_option"
+        return None
+    return None
+
+
 def _normalize_repo_relative_path_strict(path: str) -> Optional[str]:
     """Issue #1328 (OWNER Blocker 2): strict repo-relative POSIX path
     normalization, mirroring `AllowedPathsMatcher.normalize_path()` in
@@ -4677,6 +4867,29 @@ def classify_result(
                         "baseline_fail_expected",
                     )
 
+    # Issue #2638: rg/grep exit_code==2 regex-syntax / invalid-option /
+    # usage-error VCs are a body-author-fixable VC design mistake, not an
+    # environment/runtime failure -- classify deterministically instead of
+    # falling through to the generic `unknown` / `human_judgment` fallback
+    # at the bottom of this function. This check runs AFTER the
+    # `new_file_missing_expected` special case above (Issue #1328) so a
+    # genuine missing-Allowed-Path rg invocation is never reclassified here
+    # (its stderr, "No such file or directory", never matches any of the 4
+    # bounded regex-syntax/invalid-option patterns below).
+    _syntax_error_subtype = _detect_rg_grep_exit2_syntax_error(command, exit_code, stderr)
+    if _syntax_error_subtype is not None:
+        return (
+            "blocked",
+            VC_GREP_SYNTAX_ERROR_CATEGORY,
+            "blocked",
+            f"VC command failed with a recognized rg/grep syntax/usage error "
+            f"({_syntax_error_subtype}, exit code 2). This is a body-author-fixable "
+            "VC design mistake (invalid regex pattern or unsupported command-line "
+            "option), not an environment/runtime failure -- fix the regex pattern "
+            "or option usage in the Verification Command.",
+            "baseline_fail_expected",
+        )
+
     # env_missing_dep: command not found (127), permission denied (126), ModuleNotFoundError, etc.
     if exit_code in (126, 127):
         return (
@@ -4800,6 +5013,7 @@ def compute_confidence(category: str) -> str:
         "broad_search_path_unbounded",   # AC2: Issue #648
         "new_file_missing_expected",     # AC11: Issue #1328
         "expected_pass_resolved_on_current_head",  # PR #1497 review Major 2: Issue #1488
+        VC_GREP_SYNTAX_ERROR_CATEGORY,   # Issue #2638: bounded rg/grep exit_code==2 syntax/usage error
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
@@ -5872,7 +6086,20 @@ def _main_impl() -> int:
                 _scope_class = "regression_gate"
                 _fix_hint = None
             elif _outcome["exit_code"] is not None and _outcome["exit_code"] != 0:
-                if _category == "package_manager_no_tty_prompt":
+                # Issue #2638: `vc_grep_syntax_error` is exempted from this
+                # `baseline-expect: pass` override for the SAME reason
+                # `package_manager_no_tty_prompt` already is -- it is a
+                # deterministically recognized VC-design defect (rg/grep
+                # regex-syntax / invalid-option / usage error, exit code 2),
+                # not a genuine baseline regression. Without this exemption,
+                # `classify_result()`'s new category would be silently
+                # overwritten back to `human_judgment` / `baseline_regression_failed`
+                # here, defeating the whole point of the new category (OWNER
+                # REQUEST_CHANGES P1-1). This exemption is intentionally
+                # scoped to ONLY these two categories; every other genuine
+                # baseline regression (env_missing_dep, timeout, etc.) keeps
+                # the existing override behavior unchanged.
+                if _category in ("package_manager_no_tty_prompt", VC_GREP_SYNTAX_ERROR_CATEGORY):
                     pass
                 else:
                     _classification = "human_judgment"
