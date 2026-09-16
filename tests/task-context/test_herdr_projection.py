@@ -101,21 +101,24 @@ def fake_herdr_metadata_fails(tmp_path):
     return str(script)
 
 
-def test_given_build_tab_label_with_refs_when_called_then_ident_and_activity_kind():
+def test_given_build_tab_label_with_refs_when_called_then_ident_only_no_activity_suffix():
+    """Issue #2634 AC1: bound + task_refs -> `#<N>` only, no `· <kind>` suffix."""
     label = herdr_projection.build_tab_label(
         {"id": "task_1", "title": "x"}, {"kind": "impl"}, [{"repo": "o/r", "ref_number": 42, "ref_kind": "issue"}]
     )
-    assert label == "#42 · impl"
+    assert label == "#42"
 
 
 def test_given_build_tab_label_no_refs_when_called_then_adhoc_label():
+    """Issue #2634 AC1: bound + no task_refs -> `adhoc` only, no `· <kind>` suffix."""
     label = herdr_projection.build_tab_label({"id": "task_1", "title": "x"}, {"kind": "refine"}, [])
-    assert label == "adhoc · refine"
+    assert label == "adhoc"
 
 
 def test_given_build_tab_label_no_task_when_called_then_unbound_label():
+    """Issue #2634 AC1: unbound (task is None) -> `Unbound`, not `task-ctx: unbound`."""
     label = herdr_projection.build_tab_label(None, None, [])
-    assert label == "task-ctx: unbound"
+    assert label == "Unbound"
 
 
 def test_given_build_pane_tokens_when_called_then_includes_task_activity_health():
