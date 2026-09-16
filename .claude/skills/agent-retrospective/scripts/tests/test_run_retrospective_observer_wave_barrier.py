@@ -672,6 +672,62 @@ def test_observer_timeout_terminates_and_reaps_subprocess(tmp_path: Path, monkey
         os.kill(child_pid, 0)
 
 
+def test_observer_timeout_terminates_and_reaps_subprocess_that_ignores_sigterm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2646 AC6 requires distinguishing a child-only timeout from a
+    child that IGNORES SIGTERM. Every other AC6 test's child dies
+    immediately from a plain SIGTERM (the default disposition), so the
+    ``kill()`` escalation branch inside ``_terminate_and_reap_process()``
+    (case (b), the observer's OWN timeout path) was never actually
+    exercised. This test uses a REAL child subprocess that explicitly
+    installs ``signal.signal(signal.SIGTERM, signal.SIG_IGN)`` (never a
+    mock/exception standing in for signal delivery), so
+    ``proc.terminate()`` alone is a genuine no-op and the bounded grace
+    period must actually elapse before ``proc.kill()`` (SIGKILL, which
+    cannot be ignored) fires -- proven both by elapsed wall time (>= the
+    monkeypatched grace period) and by the child's own pid (written by the
+    child itself, read back from disk) genuinely vanishing
+    (``os.kill(pid, 0)`` -> ``ProcessLookupError``) after the call
+    returns."""
+    grace_sec = 0.3
+    monkeypatch.setattr(rr, "_CHILD_PROCESS_TERMINATE_GRACE_SEC", grace_sec)
+    pidfile = tmp_path / "child.pid"
+    script = "\n".join(
+        [
+            "import os, signal, time",
+            # installed as the child's very first action (microseconds),
+            # well before the 0.2s timeout below can ever fire.
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+            f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))",
+            "time.sleep(30)",
+        ]
+    )
+
+    started_at = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        rr._lifecycle_subprocess_run(
+            [sys.executable, "-c", script], cwd=str(tmp_path), env=dict(os.environ),
+            input=None, capture_output=True, text=True, timeout=0.2,
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 5.0  # never waited out the child's own 30s sleep
+    # a plain SIGTERM alone is a genuine no-op against this child's SIG_IGN
+    # -- proves the bounded grace period was actually spent (and the
+    # kill() escalation branch actually fired), not skipped.
+    assert elapsed >= grace_sec * 0.8
+    assert not rr._ACTIVE_CHILD_PROCESSES  # unregistered -> reaped by the owning call itself
+
+    deadline = time.monotonic() + 5.0
+    while not pidfile.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pidfile.exists(), "child never started in time"
+    child_pid = int(pidfile.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
 def test_parent_sigterm_terminates_all_children_before_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A SIGTERM delivered to the PARENT process terminates every
     still-registered REAL child subprocess, confirms each one is actually
@@ -723,6 +779,83 @@ def test_parent_sigterm_terminates_all_children_before_cleanup(tmp_path: Path, m
         os.kill(child_pid, 0)
     assert not rr._ACTIVE_CHILD_PROCESSES
     assert not (scope_dir / "agent-retrospective-run-run-ac6-sigterm").exists()
+
+
+def test_parent_sigterm_terminates_all_children_before_cleanup_when_child_ignores_sigterm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2646 AC6 requires distinguishing a parent-only SIGTERM from a
+    child that IGNORES SIGTERM. ``test_parent_sigterm_terminates_all_children_before_cleanup``'s
+    child dies immediately from a plain SIGTERM (the default disposition),
+    so the ``kill()`` escalation branch inside
+    ``terminate_all_active_child_processes()`` (case (c), the PARENT
+    SIGTERM path) was never actually exercised. This test uses a REAL
+    child subprocess that explicitly installs
+    ``signal.signal(signal.SIGTERM, signal.SIG_IGN)`` (never a mock/
+    exception standing in for signal delivery), so the plain
+    ``proc.terminate()`` call ``terminate_all_active_child_processes()``
+    sends is a genuine no-op, forcing it to wait out the bounded grace
+    period and then escalate to ``proc.kill()`` (SIGKILL, which cannot be
+    ignored) -- proven both by elapsed wall time (>= the monkeypatched
+    grace period) and by the child's own pid genuinely vanishing
+    (``os.kill(pid, 0)`` -> ``ProcessLookupError``), with
+    ``run_scoped_temp_dir``'s own cleanup only proceeding after that reap
+    is confirmed."""
+    grace_sec = 0.3
+    monkeypatch.setattr(rr, "_CHILD_PROCESS_TERMINATE_GRACE_SEC", grace_sec)
+    pidfile = tmp_path / "child.pid"
+    script = "\n".join(
+        [
+            "import os, signal, time",
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+            f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))",
+            "time.sleep(30)",
+        ]
+    )
+    worker_errors: list[BaseException] = []
+
+    def _run_child() -> None:
+        try:
+            rr._lifecycle_subprocess_run(
+                [sys.executable, "-c", script], cwd=str(tmp_path), env=dict(os.environ),
+                input=None, capture_output=True, text=True, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            worker_errors.append(AssertionError("child should have been killed by the SIGTERM escalation, not timed out"))
+        except BaseException as exc:  # pragma: no cover - diagnostics only
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=_run_child, daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 5.0
+    while not rr._ACTIVE_CHILD_PROCESSES and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert rr._ACTIVE_CHILD_PROCESSES, "child never registered in time"
+    deadline = time.monotonic() + 5.0
+    while not pidfile.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pidfile.exists(), "child never started in time"
+    child_pid = int(pidfile.read_text())
+    assert os.kill(child_pid, 0) is None  # still alive at this point
+
+    scope_dir = tmp_path / "scope"
+    started_at = time.monotonic()
+    with pytest.raises(rr.RunInterrupted):
+        with rr.run_scoped_temp_dir("run-ac6-sigterm-ignoring-child", base_dir=scope_dir):
+            os.kill(os.getpid(), signal.SIGTERM)
+    elapsed = time.monotonic() - started_at
+
+    worker.join(timeout=5.0)
+    assert not worker.is_alive()
+    assert worker_errors == []
+    # a plain terminate() alone is a genuine no-op against this child's
+    # SIG_IGN -- proves the bounded grace period was actually spent (and
+    # the kill() escalation branch actually fired), not skipped.
+    assert elapsed >= grace_sec * 0.8
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    assert not rr._ACTIVE_CHILD_PROCESSES
+    assert not (scope_dir / "agent-retrospective-run-run-ac6-sigterm-ignoring-child").exists()
 
 
 def test_sigterm_vs_observer_timeout_lifecycle_ordering(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
