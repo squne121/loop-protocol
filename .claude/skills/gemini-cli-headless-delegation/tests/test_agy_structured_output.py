@@ -36,6 +36,29 @@ rgh = _load_module(_RUN_HEADLESS_PATH, "run_gemini_headless")
 preflight_agy = _load_module(_PREFLIGHT_AGY_PATH, "preflight_agy")
 
 
+def _hermetic_no_bwrap():
+    """Force `materialize_isolated_agy_workspace()`'s bwrap child-pid-proof
+    branch off for tests that fully patch `subprocess.run()` with a
+    synthetic double rather than exercising a real `bwrap` child process
+    (Issue #2616 AC7 fix_delta, mirrors `test_agy_provider.py`'s identically
+    named helper).
+
+    Without this, a host that happens to have both a real `bwrap` binary AND
+    a real AGY OAuth token file (e.g. a developer workstation with a prior
+    authenticated `agy` session) makes `_run_agy()` route through the
+    `--json-status-fd` proof path even for these fully-mocked
+    `run_delegation()` end-to-end calls; since the mock never writes a bwrap
+    status record, the unproven-bwrap-success fail-close then silently
+    overwrites the mocked `returncode=0` / stdout payload these tests assert
+    on (surfacing as `failure_class: "agy_exit_nonzero"` and a
+    `grounded_research_evidence` key that was never populated). Patching
+    `_bwrap_available()` keeps `agy_oauth_token_bwrap_prefix` `None` --
+    identical to the CI/no-OAuth-token environment these tests were
+    originally written against -- without altering any other workspace
+    materialization behavior."""
+    return patch.object(rgh._agy_permission_policy, "_bwrap_available", return_value=False)
+
+
 # ---------------------------------------------------------------------------
 # AC1: --output-format allowlist (argv builder + positional structure
 # allowlist validator).
@@ -422,22 +445,23 @@ def test_run_agy_supported_capability_end_to_end_uses_structured_parser() -> Non
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=_make_stream_json_stdout(), stderr="")
 
-    with patch.object(
-        rgh, "_resolve_run_agy_structured_output_capability_record", return_value=_supported_capability_record()
-    ):
-        with patch("subprocess.run", side_effect=mock_run):
-            result = rgh.run_delegation(
-                {
-                    "schema": "delegation_request_v1",
-                    "tool_profile": "grounded_research",
-                    "provider": "agy",
-                    "prompt": "Search for something",
-                    "objective": "Test structured route end-to-end wiring",
-                    "instructions": ["Search", "Cite sources"],
-                    "output_sections": ["response"],
-                    "context_files": [],
-                }
-            )
+    with _hermetic_no_bwrap():
+        with patch.object(
+            rgh, "_resolve_run_agy_structured_output_capability_record", return_value=_supported_capability_record()
+        ):
+            with patch("subprocess.run", side_effect=mock_run):
+                result = rgh.run_delegation(
+                    {
+                        "schema": "delegation_request_v1",
+                        "tool_profile": "grounded_research",
+                        "provider": "agy",
+                        "prompt": "Search for something",
+                        "objective": "Test structured route end-to-end wiring",
+                        "instructions": ["Search", "Cite sources"],
+                        "output_sections": ["response"],
+                        "context_files": [],
+                    }
+                )
 
     assert result["ok"] is True
     evidence = result["grounded_research_evidence"]
@@ -509,24 +533,25 @@ def test_run_agy_legacy_citations_without_provenance_are_candidates_for_native_q
     def mock_run(cmd: Any, **kwargs: Any) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=grounded_output, stderr="")
 
-    with patch.object(
-        rgh,
-        "_resolve_run_agy_structured_output_capability_record",
-        return_value=_unsupported_capability_record(),
-    ):
-        with patch("subprocess.run", side_effect=mock_run):
-            result = rgh.run_delegation(
-                {
-                    "schema": "delegation_request_v1",
-                    "tool_profile": "grounded_research",
-                    "provider": "agy",
-                    "prompt": "Search for something",
-                    "objective": "Test legacy route regression-proofing",
-                    "instructions": ["Search", "Cite sources"],
-                    "output_sections": ["response"],
-                    "context_files": [],
-                }
-            )
+    with _hermetic_no_bwrap():
+        with patch.object(
+            rgh,
+            "_resolve_run_agy_structured_output_capability_record",
+            return_value=_unsupported_capability_record(),
+        ):
+            with patch("subprocess.run", side_effect=mock_run):
+                result = rgh.run_delegation(
+                    {
+                        "schema": "delegation_request_v1",
+                        "tool_profile": "grounded_research",
+                        "provider": "agy",
+                        "prompt": "Search for something",
+                        "objective": "Test legacy route regression-proofing",
+                        "instructions": ["Search", "Cite sources"],
+                        "output_sections": ["response"],
+                        "context_files": [],
+                    }
+                )
 
     evidence = result["grounded_research_evidence"]
     assert evidence["grounding_status"] == "citation_candidates_unverified"

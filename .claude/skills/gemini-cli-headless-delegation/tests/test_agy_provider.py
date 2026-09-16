@@ -708,9 +708,37 @@ def test_ac7_agy_github_research_dispatches_to_e2e_route(monkeypatch, tmp_path) 
     route SKIPs (exit_code 77) fail-closed rather than reporting a fabricated
     PASS or falling back to Gemini; see test_agy_github_research_contract.py
     and test_agy_github_research_e2e.py for the full contract.
+
+    Issue #2616 AC6 fix_delta: this precondition-missing scenario must be
+    made deterministic regardless of ambient host state. `_preflight()`'s
+    read-only-auth check intentionally falls back to a real `gh auth login`
+    stored credential when `GH_TOKEN` is absent (Issue #2012 design) -- a
+    developer workstation (or this same sandbox at pr-review time) that
+    happens to have both a real `agy` binary AND an authenticated ambient
+    `gh` session would otherwise pass `_preflight()` despite `GH_TOKEN`
+    being unset, then attempt a genuine `agy` subprocess invocation with no
+    real AGY account session, which fails with a runtime
+    `failure_class: "agy_exit_nonzero"` (`exit_code: 1`) instead of the
+    intended `github_research_skip` (`exit_code: 77`). This precondition-
+    missing scenario is exercised by directly forcing the dispatch target's
+    `_preflight()` to report the documented `gh_readonly_auth_unverifiable`
+    SKIP reason (mirrors `test_agy_github_research_e2e.py`'s own hermetic
+    `_preflight` monkeypatch pattern), which is exactly the classification
+    this AC requires `run_gemini_headless.py`'s dispatch to route through
+    without any misclassification as a runtime FAIL.
     """
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("GH_TOKEN", raising=False)
+    e2e_route = sys.modules.get("run_agy_github_research_e2e")
+    if e2e_route is None:
+        _e2e_spec = importlib.util.spec_from_file_location(
+            "run_agy_github_research_e2e", _SCRIPT_PATH.parent / "run_agy_github_research_e2e.py"
+        )
+        assert _e2e_spec is not None and _e2e_spec.loader is not None
+        e2e_route = importlib.util.module_from_spec(_e2e_spec)
+        sys.modules["run_agy_github_research_e2e"] = e2e_route
+        _e2e_spec.loader.exec_module(e2e_route)  # type: ignore[union-attr]
+    monkeypatch.setattr(e2e_route, "_preflight", lambda **_kwargs: (False, "gh_readonly_auth_unverifiable"))
     req = _agy_request(tool_profile="github_research")
     result = rgh.run_delegation(req)
     assert result["tool_profile"] == "github_research"
@@ -719,6 +747,42 @@ def test_ac7_agy_github_research_dispatches_to_e2e_route(monkeypatch, tmp_path) 
     if result["exit_code"] == 77:
         assert result["ok"] is False
         assert result["failure_class"] == "github_research_skip"
+
+
+def test_ac7_agy_github_research_runtime_timeout_never_misclassified_as_skip(monkeypatch, tmp_path) -> None:
+    """Issue #2616 AC6: a genuine runtime timeout inside the dispatched
+    `run_agy_github_research_e2e.py` route (`_run_agy_turn()`'s own
+    `subprocess.TimeoutExpired` handling, which returns failure_class
+    "agy_timeout") must never be misclassified as the precondition-driven
+    `github_research_skip` (`exit_code: 77`) SKIP path -- the two are kept
+    strictly separate (Notes for Reviewer: this dispatch-level distinction
+    was not otherwise exercised anywhere in this file; the pre-existing
+    provider=agy timeout tests above patch `_run_agy()` directly, which is
+    an entirely different code path from the `github_research` dispatch
+    exercised here)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    e2e_route = sys.modules.get("run_agy_github_research_e2e")
+    if e2e_route is None:
+        _e2e_spec = importlib.util.spec_from_file_location(
+            "run_agy_github_research_e2e", _SCRIPT_PATH.parent / "run_agy_github_research_e2e.py"
+        )
+        assert _e2e_spec is not None and _e2e_spec.loader is not None
+        e2e_route = importlib.util.module_from_spec(_e2e_spec)
+        sys.modules["run_agy_github_research_e2e"] = e2e_route
+        _e2e_spec.loader.exec_module(e2e_route)  # type: ignore[union-attr]
+    monkeypatch.setattr(e2e_route, "_preflight", lambda **_kwargs: (True, None))
+    monkeypatch.setattr(e2e_route, "_run_negative_probes", lambda: [])
+    # Mirrors `_run_agy_turn()`'s own `except subprocess.TimeoutExpired:
+    # return "", "agy_timeout"` branch (Issue #2616 pinned evidence: real
+    # execution-time timeout, not a precondition).
+    monkeypatch.setattr(e2e_route, "_run_agy_turn", lambda **_kwargs: ("", "agy_timeout"))
+    req = _agy_request(tool_profile="github_research")
+    result = rgh.run_delegation(req)
+    assert result["tool_profile"] == "github_research"
+    assert result["exit_code"] != 77
+    assert result["ok"] is False
+    assert result["failure_class"] == "agy_timeout"
 
 
 # ---------------------------------------------------------------------------
