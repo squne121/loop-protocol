@@ -42,7 +42,8 @@ def test_given_bound_task_with_ref_when_rendered_then_shows_osc8_hyperlink_and_a
     assert "#42" in text
     assert "owner/repo#42" not in text  # Issue #2634 AC2: no repo name in the ref label
     assert "https://github.com/owner/repo/issues/42" in text
-    assert "activity=impl" in text
+    assert "impl" in text
+    assert "activity=" not in text  # PR #2640 review fix_delta: no `activity=` prefix
     assert "health=" not in text  # ACTIVE is the default/healthy state -- not surfaced
     assert not text.startswith("[Task Context] ")  # Issue #2634 AC2: prefix removed
 

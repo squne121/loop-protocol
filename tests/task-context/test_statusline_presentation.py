@@ -213,7 +213,7 @@ def test_given_query_ok_bound_when_main_invoked_then_prints_rendered_line(monkey
     exit_code = statusline.main([])
     assert exit_code == 0
     out = capsys.readouterr().out.strip()
-    assert out == "My Task · activity=impl"
+    assert out == "My Task · impl"
 
 
 # --- AC4: activity kind -> human-readable label + unknown fallback ---------
@@ -229,8 +229,9 @@ def test_given_known_run_kind_vocabulary_when_activity_rendered_then_mapped_labe
         "attention": None,
     }
     text = statusline.render(data)
-    assert "activity=native" in text
-    assert "activity=native_operator" not in text
+    assert "native" in text
+    assert "native_operator" not in text
+    assert "activity=" not in text  # PR #2640 review fix_delta: no `activity=` prefix
 
 
 def test_given_known_free_form_kind_when_activity_rendered_then_mapped_label():
@@ -243,12 +244,14 @@ def test_given_known_free_form_kind_when_activity_rendered_then_mapped_label():
         "attention": None,
     }
     text = statusline.render(data)
-    assert "activity=refine" in text
+    assert "refine" in text
+    assert "activity=" not in text  # PR #2640 review fix_delta: no `activity=` prefix
 
 
 def test_given_unknown_activity_kind_when_rendered_then_falls_back_to_raw_value_no_raise():
-    """AC4: unmapped kinds never raise and never silently drop the
-    ``activity=`` token -- they fall back to the raw kind value."""
+    """AC4: unmapped kinds never raise and never silently drop the activity
+    information -- they fall back to the raw kind value, appended bare (no
+    ``activity=`` prefix, PR #2640 review fix_delta)."""
     data = {
         "degraded": False,
         "task": {"id": "task_1", "title": "My Task"},
@@ -258,7 +261,8 @@ def test_given_unknown_activity_kind_when_rendered_then_falls_back_to_raw_value_
         "attention": None,
     }
     text = statusline.render(data)
-    assert "activity=some_future_kind" in text
+    assert "some_future_kind" in text
+    assert "activity=" not in text  # PR #2640 review fix_delta: no `activity=` prefix
 
 
 def test_given_activity_labels_table_when_looked_up_directly_then_matches_render_output():

@@ -28,14 +28,25 @@
 #      `NotFoundError` -> `degraded_reason="no_binding_for_session"`) ->
 #      `render()` -> stdout == "Unbound" (AC1/AC3), exercising the full live
 #      round trip end to end.
-#   3. opportunistic (best-effort, does not affect PASS/FAIL): if this
+#   3. bound-session display check (AC7, PR #2640 review fix_delta): if this
 #      environment currently has ANY live Task Context Binding claimed by a
 #      real `current_claude_session_id` (this repo instance's shared state
 #      DB -- worktrees of one repo share one DB per
-#      `task_context_config.repo_instance_key()`), that session_id is also
-#      run through the real statusLine command and the output is logged as
-#      additional live evidence (structural checks only: no legacy
-#      `[Task Context]` prefix, no crash).
+#      `task_context_config.repo_instance_key()`), that session_id is
+#      independently re-probed via the exact live query boundary
+#      (`ctl_client.call_query_current_by_session` ->
+#      `task_contextctl.py query current` -> DB) to obtain a ground-truth
+#      expected Task/ref identifier, then run through the real statusLine
+#      command. A non-zero exit, empty output, `Degraded`, or an
+#      unexplained `Unbound` (the immediate recheck still showed the
+#      session bound) is FAIL -- this check DOES affect the script's
+#      overall PASS/FAIL, unlike the previous log-only version. If no
+#      live-bound session exists in this environment (or the discovered one
+#      lost its binding in the race between discovery and recheck), this
+#      specific bound-display check is SKIP-equivalent and is reported as
+#      such in the final verdict message -- it does not retroactively
+#      invalidate the already-completed, independently-valuable check 1 /
+#      check 2 live round trips.
 #
 # fallback_policy (docs/dev/runtime-verification-policy.md #3): this script
 # never treats a subprocess crash / non-JSON output / unexpected exception
@@ -92,6 +103,13 @@ _finish() {
   echo "evidence log: $LOG_FILE"
   exit "$exit_code"
 }
+
+# PR #2640 review fix_delta (non-blocking improvement): pin the script's own
+# cwd to the repo root before any DB-path resolution or statusline.py
+# invocation, so the DB path resolved below and the repository instance
+# `statusline.py -> ctl_client -> task_contextctl.py` resolves at run time
+# can never drift apart due to an inherited caller cwd.
+cd "$REPO_ROOT" || _finish FAIL "cannot enter repository root ($REPO_ROOT)" 1
 
 # --- skip_condition: python3 / statusline.py / task_contextctl.py missing -
 if ! command -v python3 >/dev/null 2>&1; then
@@ -167,12 +185,11 @@ if [ "$OUT_2" != "Unbound" ]; then
   _finish FAIL "synthetic unbound session_id: expected stdout 'Unbound' (live DB round trip via degraded_reason=no_binding_for_session), got '$OUT_2' -- fallback-shaped output is FAIL, not PASS" 1
 fi
 
-# --- live check 3 (opportunistic, best-effort, never affects PASS/FAIL) ----
+# --- live check 3: bound-session display verification (AC7) ----------------
 # discover any session_id currently live-bound to a Task Context Binding in
-# this repo instance's shared state DB, and run it through the real
-# statusLine command as additional live evidence.
+# this repo instance's shared state DB.
 LIVE_SESSION_ID="$(
-  cd "$REPO_ROOT" && python3 - "$DB_PATH" <<'PYEOF' 2>>"$LOG_FILE"
+  python3 - "$DB_PATH" <<'PYEOF' 2>>"$LOG_FILE"
 import sqlite3
 import sys
 
@@ -184,7 +201,7 @@ try:
         "WHERE current_claude_session_id IS NOT NULL LIMIT 1"
     ).fetchone()
     conn.close()
-except Exception as exc:  # noqa: BLE001 - opportunistic probe must never crash the script
+except Exception as exc:  # noqa: BLE001 - discovery probe must never crash the script
     print(f"probe error: {exc}", file=sys.stderr)
     sys.exit(0)
 if row and row[0]:
@@ -192,29 +209,115 @@ if row and row[0]:
 PYEOF
 )"
 _log ""
-_log "[check 3, opportunistic] discovered live-bound session_id: ${LIVE_SESSION_ID:-<none>}"
+_log "[check 3] discovered live-bound session_id: ${LIVE_SESSION_ID:-<none>}"
+
+BOUND_CHECK_STATUS="not_applicable"
+BOUND_CHECK_NOTE="no live-bound Task Context session (tab_bindings.current_claude_session_id) found in this environment -- the AC7 bound-display check was not exercised this run (check 1 / check 2 live round trips above are unaffected and already PASS)"
 
 if [ -n "$LIVE_SESSION_ID" ]; then
-  OUT_3="$(printf '{"session_id": "%s"}' "$LIVE_SESSION_ID" | python3 "$STATUSLINE_PY" 2>>"$LOG_FILE")"
-  EXIT_3=$?
-  _log "exit=$EXIT_3 stdout=$OUT_3"
-  if [ "$EXIT_3" -eq 0 ]; then
+  # Independent recheck immediately before invoking statusline.py: fetch the
+  # projection DATA (never the rendered TEXT) via the exact same live query
+  # boundary statusline.py itself uses
+  # (ctl_client.call_query_current_by_session -> task_contextctl.py query
+  # current -> DB), so we have a ground-truth expected Task/ref identifier
+  # to assert against the actual rendered stdout below -- a positive
+  # assertion, not merely "no legacy prefix".
+  PROBE_JSON="$(
+    python3 - "$LIVE_SESSION_ID" <<'PYEOF' 2>>"$LOG_FILE"
+import json
+import sys
+
+sys.path.insert(0, ".claude/hooks/task_context")
+import ctl_client  # noqa: E402
+
+session_id = sys.argv[1]
+envelope = ctl_client.call_query_current_by_session(session_id, timeout=2.0)
+if not envelope or envelope.get("status") != "ok":
+    print(json.dumps({"probe_status": "transport_failure"}))
+    sys.exit(0)
+data = envelope.get("data") or {}
+if data.get("degraded"):
+    print(json.dumps({"probe_status": "degraded", "degraded_reason": data.get("degraded_reason")}))
+    sys.exit(0)
+task = data.get("task")
+if not task:
+    print(json.dumps({"probe_status": "unbound"}))
+    sys.exit(0)
+refs = data.get("task_refs") or []
+if refs:
+    expected = f"#{refs[0].get('ref_number')}"
+else:
+    expected = task.get("title") or task.get("id")
+print(json.dumps({"probe_status": "bound", "expected_identifier": expected}))
+PYEOF
+  )"
+  _log "[check 3] bound-session recheck probe: $PROBE_JSON"
+
+  PROBE_STATUS="$(printf '%s' "$PROBE_JSON" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("probe_status", "parse_error"))
+except Exception:
+    print("parse_error")' 2>>"$LOG_FILE")"
+
+  if [ "$PROBE_STATUS" = "bound" ]; then
+    EXPECTED_IDENTIFIER="$(printf '%s' "$PROBE_JSON" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("expected_identifier") or "")
+except Exception:
+    print("")' 2>>"$LOG_FILE")"
+
+    OUT_3="$(printf '{"session_id": "%s"}' "$LIVE_SESSION_ID" | python3 "$STATUSLINE_PY" 2>>"$LOG_FILE")"
+    EXIT_3=$?
+    _log "[check 3] statusline.py bound-session run: exit=$EXIT_3 stdout=$OUT_3 expected_identifier=$EXPECTED_IDENTIFIER"
+
+    if [ "$EXIT_3" -ne 0 ]; then
+      _finish FAIL "bound-session statusLine check: statusline.py exited $EXIT_3 for a confirmed-bound session_id (expected 0) -- see log" 1
+    fi
+    if [ -z "$OUT_3" ]; then
+      _finish FAIL "bound-session statusLine check: empty stdout for a confirmed-bound session_id -- see log" 1
+    fi
+    if [ "$OUT_3" = "Degraded" ]; then
+      _finish FAIL "bound-session statusLine check: stdout was 'Degraded' for a confirmed-bound session_id -- see log" 1
+    fi
+    if [ "$OUT_3" = "Unbound" ]; then
+      _finish FAIL "bound-session statusLine check: stdout was 'Unbound' immediately after an independent recheck confirmed the session was still bound -- unexplained regression, not a race (see log)" 1
+    fi
     case "$OUT_3" in
-      "[Task Context]"*)
-        _finish FAIL "opportunistic live-bound session_id check: stdout still uses the removed legacy '[Task Context]' prefix ('$OUT_3') -- AC2 regression" 1
-        ;;
-      *)
-        _log "opportunistic live-bound session_id check: presentation shape OK (no legacy prefix)"
+      *"activity="*)
+        _finish FAIL "bound-session statusLine check: stdout still carries the removed legacy 'activity=' prefix ('$OUT_3') -- AC4 regression" 1
         ;;
     esac
+    case "$OUT_3" in
+      "[Task Context]"*)
+        _finish FAIL "bound-session statusLine check: stdout still uses the removed legacy '[Task Context]' prefix ('$OUT_3') -- AC2 regression" 1
+        ;;
+    esac
+    if [ -n "$EXPECTED_IDENTIFIER" ]; then
+      case "$OUT_3" in
+        *"$EXPECTED_IDENTIFIER"*) : ;;
+        *)
+          _finish FAIL "bound-session statusLine check: expected identifier '$EXPECTED_IDENTIFIER' (from the independent live query probe, not from statusline.py's own rendered text) was not found in rendered stdout '$OUT_3'" 1
+          ;;
+      esac
+    fi
+    BOUND_CHECK_STATUS="pass"
+    BOUND_CHECK_NOTE="confirmed-bound session_id $LIVE_SESSION_ID rendered '$OUT_3', which contains the independently-probed expected identifier '$EXPECTED_IDENTIFIER'"
   else
-    _log "opportunistic live-bound session_id check: statusline.py exited $EXIT_3 (non-fatal to this script's overall verdict, logged only)"
+    # The session discovered by the earlier SELECT lost its binding by the
+    # time of this immediate recheck -- a real, explainable race (e.g. the
+    # bound Claude Code session ended between the two queries), not a bug.
+    # SKIP-equivalent for this specific bound-display check only; the
+    # already-completed check 1 / check 2 live round trips above are
+    # unaffected.
+    BOUND_CHECK_STATUS="skipped_race"
+    BOUND_CHECK_NOTE="live-bound session_id $LIVE_SESSION_ID discovered by the earlier SELECT was no longer bound at recheck time (probe_status=$PROBE_STATUS) -- AC7 bound-display check skipped this run as an explainable race, not treated as PASS or FAIL"
   fi
 fi
 
-if [ -n "$LIVE_SESSION_ID" ]; then
-  OPPORTUNISTIC_NOTE="observed a live-bound session and confirmed its presentation shape, see log"
-else
-  OPPORTUNISTIC_NOTE="none observed in this environment, not required for PASS"
+_log ""
+_log "[check 3] verdict: status=$BOUND_CHECK_STATUS note=$BOUND_CHECK_NOTE"
+
+if [ "$BOUND_CHECK_STATUS" = "pass" ]; then
+  _finish PASS "live statusLine execution path (statusline.py -> ctl_client -> task_contextctl.py query current -> DB) rendered 'Unbound' for both the no-session and synthetic-unbound-session_id cases, AND rendered the correct bound-session identifier for a confirmed-bound live session, against the live DB at $DB_PATH. Bound-session check: $BOUND_CHECK_NOTE." 0
 fi
-_finish PASS "live statusLine execution path (statusline.py -> ctl_client -> task_contextctl.py query current -> DB) rendered 'Unbound' for both the no-session and synthetic-unbound-session_id cases against the live DB at $DB_PATH. Opportunistic live-bound session check: $OPPORTUNISTIC_NOTE." 0
+_finish PASS "live statusLine execution path (statusline.py -> ctl_client -> task_contextctl.py query current -> DB) rendered 'Unbound' for both the no-session and synthetic-unbound-session_id cases against the live DB at $DB_PATH. Bound-session display check (AC7) status: $BOUND_CHECK_STATUS -- $BOUND_CHECK_NOTE." 0

@@ -49,7 +49,9 @@ def _osc8_link(url: str, label: str) -> str:
 # actually observed in practice (`impl`/`refine`/`cleanup`/`review`/`smoke`,
 # see `task_contextctl.py`'s `smoke seed` and the `tests/task-context`
 # fixtures). Any kind not present here falls back to the raw value rather
-# than raising or silently dropping the `activity=` token (AC4).
+# than raising or silently dropping the activity label (AC4). The rendered
+# label itself carries no `activity=` prefix -- it is appended as a bare
+# `·`-separated token (PR #2640 review fix_delta).
 _ACTIVITY_LABELS: dict[str, str] = {
     "native_operator": "native",
     "subagent": "subagent",
@@ -66,7 +68,8 @@ _ACTIVITY_LABELS: dict[str, str] = {
 def _activity_label(kind: str) -> str:
     """Human-readable label for a raw ``activity.kind`` value; falls back to
     the raw ``kind`` itself for anything not in ``_ACTIVITY_LABELS`` (AC4:
-    never raise, never silently drop)."""
+    never raise, never silently drop). Returned bare (no ``activity=``
+    prefix); callers append it directly as a presentation token."""
     return _ACTIVITY_LABELS.get(kind, kind)
 
 
@@ -130,7 +133,7 @@ def render(data: dict) -> str:
         parts.append(task.get("title") or task["id"])
 
     if activity is not None:
-        parts.append(f"activity={_activity_label(activity['kind'])}")
+        parts.append(_activity_label(activity["kind"]))
 
     if binding is not None:
         health = binding.get("runtime_health")
