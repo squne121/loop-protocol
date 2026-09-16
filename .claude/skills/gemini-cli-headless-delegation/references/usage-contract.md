@@ -234,6 +234,24 @@ Gemini CLI とは別の認証状態を持つため、次を Stop Conditions と�
 - system keyring / desktop session / dbus / runtime dir に依存する認証状態が不確かな場合、`_minimal_agy_env()` の allowlist env では認証情報にアクセスできず fail-closed し得る。
 - API key（`GEMINI_API_KEY` 等）は `provider=agy` の認証前提には使わない。API key 経路は `provider=gemini` の暫定回避専用であり、`provider=agy` には継承しない。
 
+#### current official Antigravity CLI install contract の API-key route（参考記録、Issue #2616 AC1）
+
+Antigravity CLI（`agy`）自体の current official install docs
+（`https://antigravity.google/docs/cli/install/`, 確認日 2026-09-17）は、account-session
+route（Google Sign-In。OS ネイティブ credential manager — Linux では Secret Service via
+D-Bus — をまず確認し、無ければ browser sign-in にフォールバックする）とは別に、settings
+`modelProvider: "gemini"` **かつ** 環境変数 `GEMINI_API_KEY` の両方を要求する API-key route
+を提供している（`modelProvider` のみ、または `GEMINI_API_KEY` のみでは起動しない）。この
+API-key route は account session を完全に bypass する、`agy` バイナリ自身が持つ現行公式の
+別インストール/起動経路である。
+
+この記録は current official install contract を正確に反映するための参考情報であり、
+**本リポジトリの `provider=agy` dispatch の decision semantics を変更しない**: 上記の
+既存制約（`provider=agy` の認証前提は OAuth/Google Sign-In の account session のみであり、
+API key はこのラッパーの `provider=agy` 実行経路には継承しない）は Issue #2616 でも維持
+される。将来 `provider=agy` 実行に API-key route を採用する場合は、本節の記録とは別に、
+provider decision semantics 変更として明示的な Issue で扱う。
+
 ### `context_files` のパス解決
 
 wrapper は **isolated temp cwd**（`tempfile.mkdtemp()` で生成されたディレクトリ）から Gemini を起動する。このため、`context_files` のパスは以下のルールで解決される:

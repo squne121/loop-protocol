@@ -1543,3 +1543,238 @@ def test_parse_agy_stream_json_stream_non_success_status_stays_valid_without_res
     assert verdict["status"] == "valid"
     assert verdict["reason_code"] == "valid_init_step_result_stream"
     assert verdict["terminal_result"]["result"]["status"] == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2616 AC2/AC4: Stage 2 model-backed runtime verification primitives
+# (explicit account-session mode gate, env builder, bounded process-group
+# runner, and primary/flag-acceptance classification). These are unit tests
+# against the classification/env-building logic only -- they never invoke a
+# real `agy` binary; the real, bounded, live runtime probe itself is
+# `tests/test_agy_structured_output_capability_runtime.py --stage2-model-backed`
+# (`# preflight-scope: runtime_only`, executed separately per the Issue's
+# Runtime Verification Applicability, not by this hermetic unit test file).
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_account_session_mode_enabled_requires_exact_flag(monkeypatch):
+    module = load_module()
+    monkeypatch.delenv(module.RUNTIME_ACCOUNT_SESSION_MODE_ENV_VAR, raising=False)
+    assert module.runtime_account_session_mode_enabled() is False
+    monkeypatch.setenv(module.RUNTIME_ACCOUNT_SESSION_MODE_ENV_VAR, "true")
+    assert module.runtime_account_session_mode_enabled() is False
+    monkeypatch.setenv(module.RUNTIME_ACCOUNT_SESSION_MODE_ENV_VAR, "1")
+    assert module.runtime_account_session_mode_enabled() is True
+
+
+def test_runtime_verification_account_session_env_preserves_real_home_and_passes_dbus_xdg(monkeypatch):
+    """Unlike `_isolated_probe_env()`, the account-session-mode env must
+    preserve the real ambient HOME/XDG (never override to an isolated tmp
+    root), and opaquely pass through the limited D-Bus/XDG runtime variable
+    set when present."""
+    module = load_module()
+    monkeypatch.setenv("HOME", "/real/home/user")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+
+    env = module.runtime_verification_account_session_env()
+
+    assert env["HOME"] == "/real/home/user"
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
+    assert env["XDG_RUNTIME_DIR"] == "/run/user/1000"
+
+
+def test_runtime_verification_account_session_env_always_strips_prohibited_keys(monkeypatch):
+    """ADC/API-key/Cloud SDK variables are prohibited in explicit
+    account-session mode -- always stripped even if ambient, so this mode
+    structurally cannot fall back to them (Issue #2616 AC2)."""
+    module = load_module()
+    for key in module.RUNTIME_VERIFICATION_PROHIBITED_ENV_KEYS:
+        monkeypatch.setenv(key, "ambient-value-should-never-appear")
+
+    env = module.runtime_verification_account_session_env()
+
+    for key in module.RUNTIME_VERIFICATION_PROHIBITED_ENV_KEYS:
+        assert key not in env
+
+
+def test_run_runtime_verification_process_group_returns_exit_zero_stdout():
+    module = load_module()
+    result = module.run_runtime_verification_process_group(
+        ["/usr/bin/env", "python3", "-c", "print('hello')"],
+        env=module._minimal_agy_env(),
+        cwd=Path("/tmp"),
+    )
+    assert result["timed_out"] is False
+    assert result["cleanup_ok"] is True
+    assert result["exit_code"] == 0
+    assert "hello" in result["stdout"]
+
+
+def test_run_runtime_verification_process_group_kills_process_group_on_deadline(monkeypatch):
+    """A process that never terminates on its own is TERM'd, then reaped
+    within the grace window, and never reported as a cleanup failure when
+    termination succeeds (Issue #2616 AC2 cleanup contract)."""
+    module = load_module()
+    monkeypatch.setattr(module, "RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS", 0.2)
+    monkeypatch.setattr(module, "RUNTIME_VERIFICATION_TERM_GRACE_SECONDS", 2)
+
+    result = module.run_runtime_verification_process_group(
+        ["/usr/bin/env", "python3", "-c", "import time; time.sleep(30)"],
+        env=module._minimal_agy_env(),
+        cwd=Path("/tmp"),
+    )
+
+    assert result["timed_out"] is True
+    assert result["cleanup_ok"] is True
+
+
+def test_run_runtime_verification_process_group_agy_not_found():
+    module = load_module()
+    result = module.run_runtime_verification_process_group(
+        ["/nonexistent/agy-binary-loop-2616", "-p", "x"],
+        env=module._minimal_agy_env(),
+        cwd=Path("/tmp"),
+    )
+    assert result["exit_code"] is None
+    assert result["stderr"] == "agy_not_found"
+
+
+def _valid_success_stdout(response: str = "LOOP_AGY_STAGE2_RUNTIME_OK") -> str:
+    return "\n".join(
+        [
+            json.dumps({"event": "init", "init": {}}),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": response}}),
+        ]
+    )
+
+
+def test_classify_runtime_verification_primary_execution_pass():
+    module = load_module()
+    execution = {"exit_code": 0, "stdout": _valid_success_stdout(), "stderr": "", "timed_out": False}
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "PASS", "reason_code": "primary_execution_valid_success_terminal"}
+
+
+def test_classify_runtime_verification_primary_execution_cleanup_failure_overrides_everything():
+    module = load_module()
+    execution = {
+        "exit_code": 0,
+        "stdout": _valid_success_stdout(),
+        "stderr": "",
+        "timed_out": False,
+        "cleanup_ok": False,
+    }
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "FAIL", "reason_code": "cleanup_failure"}
+
+
+def test_classify_runtime_verification_primary_execution_genuine_auth_required_is_skip():
+    module = load_module()
+    execution = {"exit_code": 1, "stdout": "", "stderr": "Error: authentication required", "timed_out": False}
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+
+
+def test_classify_runtime_verification_primary_execution_silent_timeout_is_fail_not_skip():
+    """A bounded timeout with no captured `authentication required` text is
+    a genuine runtime FAIL, never silently promoted to a precondition SKIP
+    (Issue #2616 AC2/Stop Conditions: the two must never be conflated)."""
+    module = load_module()
+    execution = {"exit_code": None, "stdout": "", "stderr": "", "timed_out": True}
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "FAIL", "reason_code": "primary_execution_timeout"}
+
+
+def test_classify_runtime_verification_primary_execution_route_boundary_violation_is_fail():
+    module = load_module()
+    execution = {
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "google sign-in is required to continue",
+        "timed_out": False,
+    }
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict["verdict"] == "FAIL"
+    assert verdict["reason_code"].startswith("auth_or_provider_signal:")
+
+
+def test_classify_runtime_verification_primary_execution_nonzero_exit_is_fail():
+    module = load_module()
+    execution = {"exit_code": 1, "stdout": "", "stderr": "boom", "timed_out": False}
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "FAIL", "reason_code": "agy_exit_nonzero"}
+
+
+def test_classify_runtime_verification_primary_execution_malformed_stream_is_fail():
+    module = load_module()
+    execution = {"exit_code": 0, "stdout": "not ndjson at all", "stderr": "", "timed_out": False}
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict["verdict"] == "FAIL"
+    assert verdict["reason_code"].startswith("stream_json_invalid:")
+
+
+def test_classify_runtime_verification_primary_execution_non_success_terminal_is_fail():
+    module = load_module()
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "init": {}}),
+            json.dumps({"event": "result", "result": {"status": "ERROR", "error": "boom"}}),
+        ]
+    )
+    execution = {"exit_code": 0, "stdout": stdout, "stderr": "", "timed_out": False}
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "FAIL", "reason_code": "non_success_terminal:ERROR"}
+
+
+def test_classify_runtime_verification_primary_execution_structured_error_present_is_fail():
+    module = load_module()
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "init": {}}),
+            json.dumps(
+                {"event": "result", "result": {"status": "SUCCESS", "response": "x", "error": "unexpected"}}
+            ),
+        ]
+    )
+    execution = {"exit_code": 0, "stdout": stdout, "stderr": "", "timed_out": False}
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "FAIL", "reason_code": "structured_error_present"}
+
+
+def test_classify_runtime_verification_flag_acceptance_outer_deadline_is_pass():
+    """A bounded outer-deadline timeout on the flag-acceptance-only probe is
+    never itself proof of flag rejection (Issue #2616 AC2: this repository's
+    300s deadline, not AGY's own `--print-timeout` semantics, is what ends
+    it)."""
+    module = load_module()
+    execution = {"exit_code": None, "stdout": "", "stderr": "", "timed_out": True}
+    verdict = module.classify_runtime_verification_flag_acceptance_execution(execution)
+    assert verdict == {
+        "verdict": "PASS",
+        "reason_code": "print_timeout_flag_accepted_outer_deadline_reached",
+    }
+
+
+def test_classify_runtime_verification_flag_acceptance_unrecognized_option_is_fail():
+    module = load_module()
+    execution = {
+        "exit_code": 2,
+        "stdout": "",
+        "stderr": "Error: unrecognized option '--print-timeout'",
+        "timed_out": False,
+    }
+    verdict = module.classify_runtime_verification_flag_acceptance_execution(execution)
+    assert verdict == {"verdict": "FAIL", "reason_code": "print_timeout_flag_rejected"}
+
+
+def test_classify_runtime_verification_flag_acceptance_genuine_auth_required_is_skip():
+    module = load_module()
+    execution = {
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "authentication required",
+        "timed_out": False,
+    }
+    verdict = module.classify_runtime_verification_flag_acceptance_execution(execution)
+    assert verdict == {"verdict": "SKIP", "reason_code": "account_session_unavailable"}

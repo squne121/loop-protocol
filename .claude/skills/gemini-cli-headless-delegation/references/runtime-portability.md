@@ -536,6 +536,18 @@ tool deny の唯一の実効的な防御機構は、`PROFILE_ALLOWED_TOOLS` ベ�
 > 伴わない到達可能性の付与にすぎなかった（`AGY_READONLY_BOUNDARY_V1`）。上の
 > 「`agy_oauth_token_readonly_mode`: read-only 境界の真正性」セクションを参照。
 
+> **注意（historical claim reclassification、Issue #2616 AC3）**: 以下の本セクション記述
+> （「実行環境の `agy` は独自の OAuth トークンファイルを認証に使用しており…」等）は、#1494
+> の特定の live fan-out 試行（3〜4 回目、2025 時点の `agy` バイナリ）で観測された
+> point-in-time な診断結果であり、`agy` の current（現行）または唯一の persistence backend
+> であるという current-fact の主張ではない。current official docs
+> （`https://antigravity.google/docs/cli/install/`、確認日 2026-09-17）は account-session
+> route を「OS ネイティブ credential manager（Linux では Secret Service via D-Bus）を
+> まず確認し、無ければ browser sign-in にフォールバックする」と記述しており、本リポジトリは
+> これを現行 `agy` バイナリに対して再検証していない。下記の read-only symlink 露出
+> （`_expose_agy_oauth_token_read_only()` / `agy_oauth_token_path`）自体は Issue #2616 で
+> 削除・変更しない既存の legacy operational behavior として維持する。
+
 #1730 で gcloud ADC 到達性（`$HOME/.config/gcloud` の read-only 露出）を追加した後も、
 #1494 の live fan-out 実行（3 回目の試行）では依然として全 subtask が
 `failure_class: "agy_auth_required"` で失敗し続けた。3 回目の詳細診断（read-only 存在確認・

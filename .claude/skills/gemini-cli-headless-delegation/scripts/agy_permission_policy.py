@@ -99,15 +99,22 @@ ALLOWED_PROFILES: frozenset[str] = frozenset(
 # `grounded_research` / `proposal_only` vocabulary (Issue #1779 Notes for
 # Reviewer).
 #
-# `AGY_AUTH_ABLATION_V1` (recorded in Issue #1779's Source section) proved
-# that only `agy_oauth_token_path` is necessary and sufficient for AGY auth
-# to succeed -- `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` /
+# `AGY_AUTH_ABLATION_V1` (recorded in Issue #1779's Source section; historical
+# claim, reclassified by Issue #2616 AC3) observed that, for the specific
+# host/binary/session state under test at that time, exposing only
+# `agy_oauth_token_path` was sufficient for that ablation run's `agy` auth to
+# succeed -- `DBUS_SESSION_BUS_ADDRESS` / `XDG_RUNTIME_DIR` /
 # `GOOGLE_APPLICATION_CREDENTIALS` / `gcloud_adc_path` (added defensively by
-# #1726 / #1730 while diagnosing #1494's `agy_auth_required` failures) are
-# not required. `AGY_AUTH_PROFILE_MINIMAL` is therefore the default and
-# excludes all four; `AGY_AUTH_PROFILE_EXTENDED` is an explicit opt-in for
-# environments that may need them in the future (kept, not deleted, per
-# Issue #1779 In Scope item 1).
+# #1726 / #1730 while diagnosing #1494's `agy_auth_required` failures) were
+# not required for that observed run. This is a point-in-time observed
+# result, not a current-fact claim that the token file is the necessary and
+# sufficient channel for every environment/binary version -- current
+# official docs describe an OS-native-credential-manager-first account
+# session route this repository has not re-verified against a current `agy`
+# binary. `AGY_AUTH_PROFILE_MINIMAL` is therefore the default and excludes
+# all four; `AGY_AUTH_PROFILE_EXTENDED` remains an explicit opt-in for
+# environments that may need them (kept, not deleted, per Issue #1779 In
+# Scope item 1).
 AGY_AUTH_PROFILE_MINIMAL = "auth_minimal"
 AGY_AUTH_PROFILE_EXTENDED = "auth_extended"
 
@@ -565,17 +572,23 @@ def _expose_gcloud_adc_read_only(xdg_config_home: Path) -> "Path | None":
     return link_path
 
 
-# Issue #1740: `agy` (Antigravity CLI) does not authenticate via dbus
-# secret-service (#1726) or gcloud ADC (#1730) -- diagnosis during #1494's
-# third live fan-out attempt confirmed it uses its own OAuth token file,
-# `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` (mode 600).
-# Exposing *only* this file read-only inside the isolated workspace was
-# confirmed sufficient for `agy -p "..."` to exit 0 (see Issue #1740 Source
-# section). `$HOME/.gemini/antigravity-cli/` also contains other mode-600
+# Issue #1740 (historical claim, reclassified by Issue #2616 AC3): during
+# #1494's third live fan-out attempt, dbus secret-service (#1726) and gcloud
+# ADC (#1730) reachability additions did not resolve an observed
+# `agy_auth_required` failure, while exposing
+# `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` (mode 600)
+# read-only inside the isolated workspace did let that specific `agy -p
+# "..."` invocation exit 0 (see Issue #1740 Source section). This is a
+# point-in-time observed result for that host/binary/session, not a
+# current-fact claim about `agy`'s present or exclusive persistence
+# backend -- this repository has not re-verified it against a current `agy`
+# binary. `$HOME/.gemini/antigravity-cli/` also contains other mode-600
 # files (`jetski_state.pbtxt`, `history.jsonl`, `settings.json`) that were
 # investigated but are not exposed here: the OAuth token file alone was
-# already confirmed sufficient for auth reachability, and exposing only the
-# minimal necessary subpath keeps the #1705 secret-hygiene design intact.
+# sufficient for that observed run's auth reachability, and exposing only
+# the minimal necessary subpath keeps the #1705 secret-hygiene design
+# intact. This legacy read-only exposure behavior is unchanged by Issue
+# #2616 (AC3 reclassifies only the surrounding claim, not the mechanism).
 ANTIGRAVITY_CLI_DIRNAME = "antigravity-cli"
 AGY_OAUTH_TOKEN_FILENAME = "antigravity-oauth-token"
 
@@ -947,12 +960,14 @@ def materialize_isolated_agy_workspace(
         gcloud_adc_path = _expose_gcloud_adc_read_only(xdg_config)
 
     # Issue #1740 AC1/AC2, #1743: expose the real agy OAuth token file (if
-    # any) as a reachable symlink under this workspace's isolated HOME --
-    # the actual auth channel `agy` uses; see
+    # any) as a reachable symlink under this workspace's isolated HOME; see
     # `_expose_agy_oauth_token_read_only()` docstring. Unconditional
-    # regardless of `auth_profile` -- `AGY_AUTH_ABLATION_V1` proved this is
-    # the one surface necessary and sufficient for auth to succeed (Issue
-    # #1779 AC2).
+    # regardless of `auth_profile` -- `AGY_AUTH_ABLATION_V1`'s historical
+    # observation (Issue #1779 AC2, reclassified by Issue #2616 AC3) found
+    # this surface sufficient for that ablation run's auth to succeed; kept
+    # unconditional here as an always-safe, defensively-harmless exposure,
+    # not as a current-fact claim that it is `agy`'s exclusive persistence
+    # channel today.
     agy_oauth_token_path = _expose_agy_oauth_token_read_only(workspace_dir)
 
     # Issue #1758: generate the real AGY settings.json with an explicit
