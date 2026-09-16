@@ -821,7 +821,9 @@ def test_parent_sigterm_terminates_all_children_before_cleanup_when_child_ignore
                 input=None, capture_output=True, text=True, timeout=30,
             )
         except subprocess.TimeoutExpired:
-            worker_errors.append(AssertionError("child should have been killed by the SIGTERM escalation, not timed out"))
+            worker_errors.append(
+                AssertionError("child should have been killed by the SIGTERM escalation, not timed out")
+            )
         except BaseException as exc:  # pragma: no cover - diagnostics only
             worker_errors.append(exc)
 
