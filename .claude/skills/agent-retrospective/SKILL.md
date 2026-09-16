@@ -95,7 +95,7 @@ fail-closed で終了する（AC14）。
 と subprocess env（mutation credential を除去した allowlist）へ直接反映され、`git commit`/`git push`/
 `gh issue`/`gh pr`/filesystem write/unapproved Bash/対象 run 外 resume を拒否する。
 
-#### transport normalization（headless CLI stdout の shape 正規化、Issue #2645）
+#### headless CLI 標準出力の形状正規化処理（transport normalization、Issue #2645 対応）
 
 `invoke_agent()` は `completed.stdout` を `json.loads()` した直後、既存の result-wrapper business
 validation（type/subtype/is_error 判定、`structured_output` compatibility recovery、JSON Schema
