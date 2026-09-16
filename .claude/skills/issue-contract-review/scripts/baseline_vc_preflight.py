@@ -4164,6 +4164,97 @@ def _is_rg_missing_path_error(stderr: str) -> bool:
     return _rg_stderr_indicates_missing_path(stderr) and not _rg_stderr_indicates_error_not_missing_path(stderr)
 
 
+# Issue #2638: the new preflight category returned by
+# `_detect_rg_grep_exit2_syntax_error()` for rg/grep exit_code==2 regex-syntax
+# / invalid-option / usage-error VCs. Deliberately a single category name
+# used consistently for all 4 bounded subtypes (rg_regex_parse_error /
+# rg_invalid_option / grep_regex_error / grep_invalid_option); the subtype
+# itself is only surfaced in the fix_hint text, not as a separate category.
+VC_GREP_SYNTAX_ERROR_CATEGORY = "vc_grep_syntax_error"
+
+# Issue #2638: rg's OWN regex-parse-error stderr format is a multi-line
+# message starting with the literal line "rg: regex parse error:" (verified
+# against ripgrep 14.1.0 locally), which is structurally distinct from
+# grep/egrep/fgrep's single-line "grep: Invalid regular expression" format.
+# Anchored with re.MULTILINE so it only matches at the start of a stderr
+# line (not merely "regex parse error" appearing anywhere, e.g. inside an
+# unrelated pytest failure message).
+_RG_REGEX_PARSE_ERROR_LINE = re.compile(r"^rg: regex parse error:", re.MULTILINE)
+
+# Issue #2638: rg's own invalid-option/usage-error stderr formats observed
+# locally (ripgrep 14.1.0): "rg: unrecognized flag ...", "rg: unrecognized
+# option ...", "rg: unrecognized file type: ...", "rg: error parsing flag
+# ...: ...". All are single-line and begin with "rg: " (distinct from the
+# multi-line regex-parse-error format above). This is a narrow, bounded
+# allowlist -- NOT a reuse of `_RG_STDERR_ERROR_NOT_MISSING_PATH_PATTERNS`
+# (that blacklist also matches permission/config/env errors such as
+# "Permission denied" / "bad config", which must NOT be absorbed into this
+# new body-author-fixable category).
+_RG_INVALID_OPTION_LINE = re.compile(
+    r"^rg: (unrecognized flag|unrecognized option|unrecognized file type|error parsing flag)\b",
+    re.MULTILINE,
+)
+
+# Issue #2638: GNU grep's own regex-error stderr format observed locally
+# (GNU grep 3.11): a single line "grep: Invalid regular expression" (egrep /
+# fgrep are symlinks to the same binary and share this format, prefixed with
+# their own invoked name instead of "grep:").
+_GREP_REGEX_ERROR_LINE = re.compile(
+    r"^(grep|egrep|fgrep): Invalid regular expression",
+    re.MULTILINE,
+)
+
+# Issue #2638: GNU grep's own invalid-option/usage-error stderr format
+# observed locally (GNU grep 3.11): "grep: unrecognized option '...'"
+# followed by a "Usage: grep [OPTION]..." banner line. Also covers the
+# "invalid option --" phrasing used by some grep builds/locales.
+_GREP_INVALID_OPTION_LINE = re.compile(
+    r"^(grep|egrep|fgrep): (unrecognized option|invalid option)\b",
+    re.MULTILINE,
+)
+
+
+def _detect_rg_grep_exit2_syntax_error(command: str, exit_code: int, stderr: str) -> Optional[str]:
+    """Issue #2638: positively identify exactly 4 bounded rg/grep exit_code==2
+    regex-syntax / invalid-option / usage-error patterns via the PARSED argv
+    executable basename -- mirroring `_candidate_new_allowed_path_target()`'s
+    `os.path.basename(argv[0])` style executable-name detection -- rather
+    than a raw substring search over the raw command string (e.g. "rg" or
+    "grep" appearing anywhere in the command text, which could false-match
+    an unrelated command whose arguments merely contain those substrings).
+
+    Returns one of "rg_regex_parse_error" | "rg_invalid_option" |
+    "grep_regex_error" | "grep_invalid_option" if the command's executable
+    is rg/grep-family, exit_code == 2, AND stderr matches the corresponding
+    bounded positive pattern above; otherwise None (including when exit_code
+    != 2, or the executable is not rg/grep/egrep/fgrep, or stderr does not
+    match any of the 4 bounded patterns -- e.g. permission/config/env/I/O
+    failures, or the Issue #1328 missing-path special case, are never
+    absorbed into this category by this function)."""
+    if exit_code != 2:
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if not argv:
+        return None
+    prog = os.path.basename(argv[0])
+    if prog == "rg":
+        if _RG_REGEX_PARSE_ERROR_LINE.search(stderr):
+            return "rg_regex_parse_error"
+        if _RG_INVALID_OPTION_LINE.search(stderr):
+            return "rg_invalid_option"
+        return None
+    if prog in ("grep", "egrep", "fgrep"):
+        if _GREP_REGEX_ERROR_LINE.search(stderr):
+            return "grep_regex_error"
+        if _GREP_INVALID_OPTION_LINE.search(stderr):
+            return "grep_invalid_option"
+        return None
+    return None
+
+
 def _normalize_repo_relative_path_strict(path: str) -> Optional[str]:
     """Issue #1328 (OWNER Blocker 2): strict repo-relative POSIX path
     normalization, mirroring `AllowedPathsMatcher.normalize_path()` in
@@ -4677,6 +4768,29 @@ def classify_result(
                         "baseline_fail_expected",
                     )
 
+    # Issue #2638: rg/grep exit_code==2 regex-syntax / invalid-option /
+    # usage-error VCs are a body-author-fixable VC design mistake, not an
+    # environment/runtime failure -- classify deterministically instead of
+    # falling through to the generic `unknown` / `human_judgment` fallback
+    # at the bottom of this function. This check runs AFTER the
+    # `new_file_missing_expected` special case above (Issue #1328) so a
+    # genuine missing-Allowed-Path rg invocation is never reclassified here
+    # (its stderr, "No such file or directory", never matches any of the 4
+    # bounded regex-syntax/invalid-option patterns below).
+    _syntax_error_subtype = _detect_rg_grep_exit2_syntax_error(command, exit_code, stderr)
+    if _syntax_error_subtype is not None:
+        return (
+            "blocked",
+            VC_GREP_SYNTAX_ERROR_CATEGORY,
+            "blocked",
+            f"VC command failed with a recognized rg/grep syntax/usage error "
+            f"({_syntax_error_subtype}, exit code 2). This is a body-author-fixable "
+            "VC design mistake (invalid regex pattern or unsupported command-line "
+            "option), not an environment/runtime failure -- fix the regex pattern "
+            "or option usage in the Verification Command.",
+            "baseline_fail_expected",
+        )
+
     # env_missing_dep: command not found (127), permission denied (126), ModuleNotFoundError, etc.
     if exit_code in (126, 127):
         return (
@@ -4800,6 +4914,7 @@ def compute_confidence(category: str) -> str:
         "broad_search_path_unbounded",   # AC2: Issue #648
         "new_file_missing_expected",     # AC11: Issue #1328
         "expected_pass_resolved_on_current_head",  # PR #1497 review Major 2: Issue #1488
+        VC_GREP_SYNTAX_ERROR_CATEGORY,   # Issue #2638: bounded rg/grep exit_code==2 syntax/usage error (optional per Notes for Reviewer)
     }
     medium_confidence = {"timeout", "unexpected_pass"}
 
@@ -5872,7 +5987,20 @@ def _main_impl() -> int:
                 _scope_class = "regression_gate"
                 _fix_hint = None
             elif _outcome["exit_code"] is not None and _outcome["exit_code"] != 0:
-                if _category == "package_manager_no_tty_prompt":
+                # Issue #2638: `vc_grep_syntax_error` is exempted from this
+                # `baseline-expect: pass` override for the SAME reason
+                # `package_manager_no_tty_prompt` already is -- it is a
+                # deterministically recognized VC-design defect (rg/grep
+                # regex-syntax / invalid-option / usage error, exit code 2),
+                # not a genuine baseline regression. Without this exemption,
+                # `classify_result()`'s new category would be silently
+                # overwritten back to `human_judgment` / `baseline_regression_failed`
+                # here, defeating the whole point of the new category (OWNER
+                # REQUEST_CHANGES P1-1). This exemption is intentionally
+                # scoped to ONLY these two categories; every other genuine
+                # baseline regression (env_missing_dep, timeout, etc.) keeps
+                # the existing override behavior unchanged.
+                if _category in ("package_manager_no_tty_prompt", VC_GREP_SYNTAX_ERROR_CATEGORY):
                     pass
                 else:
                     _classification = "human_judgment"
