@@ -155,11 +155,15 @@ _GH_SANITIZED_DROP_KEYS = (
     "GH_FORCE_TTY",
     "GH_PAGER",
     "PAGER",
-    "GH_CONFIG_DIR",
     "GH_DEBUG",
     "GH_PATH",
     "GH_PROMPT_DISABLED",
 )
+# Issue #2611: this exact child-gh boundary preserves caller-selected GitHub
+# authentication carriers only. GH_CONFIG_DIR is copied only when already
+# present; this module never derives it from HOME/XDG or examines
+# config/credential contents. Existing GH_TOKEN and GITHUB_TOKEN support is
+# likewise retained only for this child boundary.
 _GH_SANITIZED_ALLOWED_KEYS = frozenset(
     {
         "HOME",
@@ -169,6 +173,7 @@ _GH_SANITIZED_ALLOWED_KEYS = frozenset(
         "PATH",
         "SSL_CERT_DIR",
         "SSL_CERT_FILE",
+        "GH_CONFIG_DIR",
         "GH_TOKEN",
         "GITHUB_TOKEN",
         "XDG_CACHE_HOME",
