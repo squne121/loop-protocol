@@ -47,7 +47,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import os
 import shutil
 import subprocess
 import tempfile
@@ -369,9 +368,14 @@ def run_stage2_model_backed_cli(caller_context: "str | None" = None) -> int:
         print(f"SKIP: {overall_reason}")
         return 77
 
+    ac_suffix = (
+        f"/{_CALLER_CONTEXT_AC_SUFFIX[caller_context]}"
+        if caller_context in _CALLER_CONTEXT_AC_SUFFIX
+        else ""
+    )
     result_payload = {
         "schema": preflight_agy.RUNTIME_VERIFICATION_SCHEMA,
-        "ac": "AC2" + (f"/{_CALLER_CONTEXT_AC_SUFFIX[caller_context]}" if caller_context in _CALLER_CONTEXT_AC_SUFFIX else ""),
+        "ac": "AC2" + ac_suffix,
         "caller_context": caller_context,
         "verdict": overall_verdict,
         "reason_code": overall_reason,
