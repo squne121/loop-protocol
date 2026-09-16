@@ -62,6 +62,14 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Reuse the production VC annotation grammar rather than maintaining a
+# compiler-specific approximation of its scope rules.
+_VC_SYNTAX_DIR = Path(__file__).resolve().parent
+if str(_VC_SYNTAX_DIR) not in sys.path:
+    sys.path.insert(0, str(_VC_SYNTAX_DIR))
+
+from vc_contract_syntax import extract_baseline_expect_annotation  # noqa: E402
+
 SCHEMA = "vc_baseline_shape_compiler/v1"
 
 STATUS_CHANGED = "changed"
@@ -88,7 +96,7 @@ _SIMPLE_NODE_ID_RE = re.compile(r"^test_[A-Za-z0-9_]*$")
 _MAX_CANDIDATE_ATTEMPTS = 20
 
 
-# ─── Body / section parsing (self-contained; no cross-skill import) ─────────
+# ─── Body / section parsing ───────────────────────────────────────────────────
 
 
 def extract_section_lines(lines: list[str], heading: str) -> tuple[int, int]:
@@ -119,31 +127,6 @@ def parse_allowed_paths(lines: list[str]) -> list[str]:
     return paths
 
 
-def _extract_baseline_expect_from_preceding_comments(
-    lines: list[str], command_line_index: int
-) -> Optional[str]:
-    """Return the baseline expectation from a command's contiguous comment block.
-
-    This mirrors the production annotation scope: only comment lines directly
-    preceding a command are considered, with AC, preflight-scope, and vc-role
-    markers transparent within that block.
-    """
-    baseline_expect: Optional[str] = None
-    transparent_comment = re.compile(r"^#\s*(?:AC\d+|preflight-scope:|vc-role:)")
-    annotation = re.compile(r"^#\s*baseline-expect:\s*(\S+)\s*$")
-
-    for index in range(command_line_index - 1, -1, -1):
-        comment = lines[index].strip()
-        if not comment or not comment.startswith("#"):
-            break
-        match = annotation.match(comment)
-        if match:
-            baseline_expect = match.group(1)
-        elif not transparent_comment.match(comment):
-            break
-    return baseline_expect
-
-
 def _extract_vc_pytest_command_lines(
     lines: list[str], vc_start: int, vc_end: int
 ) -> list[tuple[int, str, Optional[str]]]:
@@ -170,7 +153,8 @@ def _extract_vc_pytest_command_lines(
             if stripped.startswith("$ "):
                 cmd = stripped[2:].strip()
                 if "pytest" in shlex_safe_tokens(cmd):
-                    entries.append((i, cmd, _extract_baseline_expect_from_preceding_comments(lines, i)))
+                    baseline_expect, _, _ = extract_baseline_expect_annotation(lines, i)
+                    entries.append((i, cmd, baseline_expect))
         i += 1
     return entries
 

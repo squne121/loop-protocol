@@ -15,6 +15,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 COMPILER_SCRIPT = Path(__file__).parent.parent / "scripts" / "vc_baseline_shape_compiler.py"
 AUTOFIX_SCRIPT = (
     Path(__file__).parent.parent.parent / "edit-issue" / "scripts" / "issue_contract_hygiene_autofix.py"
@@ -153,6 +155,150 @@ def test_baseline_expect_fail_preserves_original_node_id(tmp_path: Path):
     assert result["status"] == "already_canonical"
     assert result["rewrites"] == []
     assert result["warnings"] == []
+
+
+@pytest.mark.parametrize(
+    "transparent_markers",
+    [
+        "# AC1\n# preflight-scope: runtime_only\n# vc-role: regression",
+        "# preflight-scope: unsupported_scope",
+    ],
+)
+def test_baseline_expect_fail_uses_shared_transparent_marker_grammar(
+    tmp_path: Path, transparent_markers: str
+):
+    """A declared fail annotation survives only shared-parser transparent markers."""
+    compiler = _load_compiler()
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    existing = pkg_dir / "test_existing.py"
+    existing.write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+
+    body = _make_body(
+        vc_bash_block=(
+            "# baseline-expect: fail\n"
+            f"{transparent_markers}\n"
+            "$ pytest some_dir/test_existing.py::test_missing_name"
+        ),
+        allowed_paths=["some_dir/test_existing.py"],
+    )
+
+    assert compiler.compile_body(body, tmp_path)["status"] == "already_canonical"
+
+
+@pytest.mark.parametrize(
+    "scope_boundary",
+    [
+        "",
+        "$ printf 'another command\\n'",
+        "# AC1: invalid suffix",
+        "# AC1 unexpected suffix",
+        "# vc-role:",
+    ],
+)
+def test_baseline_expect_fail_does_not_cross_shared_parser_scope_boundaries(
+    tmp_path: Path, scope_boundary: str
+):
+    """Blank, command, and invalid marker boundaries revoke preservation."""
+    compiler = _load_compiler()
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    existing = pkg_dir / "test_existing.py"
+    existing.write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+    candidate = "some_dir/test_existing_new_test.py"
+
+    body = _make_body(
+        vc_bash_block=(
+            "# baseline-expect: fail\n"
+            f"{scope_boundary}\n"
+            "$ pytest some_dir/test_existing.py::test_missing_name"
+        ),
+        allowed_paths=["some_dir/test_existing.py", candidate],
+    )
+    result = compiler.compile_body(body, tmp_path)
+
+    assert result["status"] == "changed"
+    assert result["rewrites"][0]["reason_code"] == compiler.REASON_MISSING_NODE_ID
+
+
+@pytest.mark.parametrize("invalid_annotation", ["# baseline-expect: invalid", "# baseline-expect:"])
+def test_invalid_or_empty_baseline_expect_does_not_preserve_node_id(
+    tmp_path: Path, invalid_annotation: str
+):
+    """Invalid shared-parser values are not equivalent to `baseline-expect: fail`."""
+    compiler = _load_compiler()
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    existing = pkg_dir / "test_existing.py"
+    existing.write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+    candidate = "some_dir/test_existing_new_test.py"
+
+    body = _make_body(
+        vc_bash_block=(
+            f"{invalid_annotation}\n"
+            "$ pytest some_dir/test_existing.py::test_missing_name"
+        ),
+        allowed_paths=["some_dir/test_existing.py", candidate],
+    )
+
+    assert compiler.compile_body(body, tmp_path)["status"] == "changed"
+
+
+@pytest.mark.parametrize(
+    "node_id",
+    [
+        "TestFeature::test_missing_method",
+        "test_missing_case[param]",
+    ],
+)
+def test_baseline_expect_fail_preserves_complex_existing_file_node_ids(
+    tmp_path: Path, node_id: str
+):
+    """The explicit escape hatch applies before the compiler's narrow node-id heuristic."""
+    compiler = _load_compiler()
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    existing = pkg_dir / "test_existing.py"
+    existing.write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+
+    body = _make_body(
+        vc_bash_block=(
+            "# baseline-expect: fail\n"
+            f"$ pytest some_dir/test_existing.py::{node_id}"
+        ),
+        allowed_paths=["some_dir/test_existing.py"],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+    assert result["status"] == "already_canonical"
+    assert result["rewrites"] == []
+
+
+@pytest.mark.parametrize(
+    "node_id",
+    [
+        "TestFeature::test_missing_method",
+        "test_missing_case[param]",
+    ],
+)
+def test_annotation_free_complex_existing_file_node_ids_remain_not_autofixable(
+    tmp_path: Path, node_id: str
+):
+    """Without an explicit valid annotation, complex node ids are never accepted."""
+    compiler = _load_compiler()
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    existing = pkg_dir / "test_existing.py"
+    existing.write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+
+    body = _make_body(
+        vc_bash_block=f"$ pytest some_dir/test_existing.py::{node_id}",
+        allowed_paths=["some_dir/test_existing.py"],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+    assert result["status"] == "not_autofixable"
+    assert result["rewrites"] == []
 
 
 def test_ac2_existing_node_id_is_not_rewritten(tmp_path: Path):
