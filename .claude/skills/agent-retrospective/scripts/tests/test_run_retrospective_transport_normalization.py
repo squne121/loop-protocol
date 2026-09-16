@@ -20,6 +20,22 @@ Fixture/mock-based only for AC2-AC5 (hermetic, no real subprocess; the
 exactly as in ``test_run_retrospective.py`` /
 ``test_run_retrospective_structured_output_prose_fence.py``).
 
+PR #2649 review fix_delta (anchor
+https://github.com/squne121/loop-protocol/pull/2649#issuecomment-5701116062,
+P2-1/P2-2): AC3's primary test now drives the SAME event-array/single-object
+fixtures through the full production pipeline (``rr.prepare`` ->
+``rr.run_observer_wave``) against the real ``observer_result_v1.schema.json``
+production schema, not only a bare ``invoke_agent()`` call against a trivial
+``{}`` schema, so downstream JSON-Schema validation and
+run_id/base_sha/source_set_digest identity binding (``EvidenceBundle``,
+``parse_agent_output_with_repair``) are demonstrably NOT bypassed by array
+normalization. AC6's live test additionally instruments (never gates on)
+which of ``invoke_agent()``'s two success paths (direct ``structured_output``
+field vs. ``_structured_output_from_result_compat`` recovery from ``result``
+text) this environment's real CLI response actually took, via a
+test-local ``monkeypatch`` spy, so the PR body can report the OBSERVED path
+instead of an unverified claim.
+
 Runtime Verification Applicability: immediate for AC6 only (this module's
 one ``claude_live``-marked test,
 ``test_real_claude_cli_round_trip_normalizes_whichever_shape_is_observed``;
@@ -68,6 +84,24 @@ _PRE_FIX_BASE_SHA = "cc0ccce201a29ac9ac75417060214364632883e1"
 #: live test indefinitely; generous enough for a single haiku-model turn
 #: (mirrors `test_run_retrospective_live_cli.py`'s `_LIVE_TIMEOUT_SEC`).
 _LIVE_TIMEOUT_SEC = 180
+
+#: base_sha for AC3's full-pipeline (`rr.prepare` -> `rr.run_observer_wave`)
+#: tests -- an arbitrary but valid 40-char hex commit SHA, distinct from
+#: `_PRE_FIX_BASE_SHA` above (a real, in-repo commit id used for a different
+#: purpose) so the two are never confused.
+_AC3_BASE_SHA = "b" * 40
+
+
+class _FakeCollectorResult:
+    """Minimal `rr.prepare()` collector-result shape (Issue #2237/#2236):
+    only `.observation` is read by `prepare()` itself. Duplicated locally
+    per this test suite's existing per-file convention (mirrors
+    `test_run_retrospective.py`'s own `_FakeCollectorResult`) rather than
+    importing across test modules."""
+
+    def __init__(self, observation: dict[str, Any]) -> None:
+        self.observation = observation
+        self.private_evidence: dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -120,12 +154,23 @@ def _valid_event_array_fixture(structured_output: dict[str, Any]) -> list[dict[s
     single-object case already succeeds with. AC2 and AC3 both consume
     this exact fixture (never independently re-derived), so the two tests
     together directly evidence this Issue's before/after contract
-    change."""
+    change.
+
+    Non-terminal event ordering (PR #2649 review fix_delta,
+    https://github.com/squne121/loop-protocol/issues/2645, "低コストなら合わせて
+    対応"): ``system`` then ``assistant`` then the terminal ``result`` --
+    closer to the actually-observed native Claude Code ``--verbose``/
+    ``viewMode`` event ordering (Anthropic Issue #84784) than the prior
+    synthetic ``system, assistant, tool_use, tool_result, result`` sequence
+    this fixture used before. ``rate_limit_event`` is intentionally omitted
+    (the Issue explicitly marks it optional: "rate_limit_event（必要なら）"),
+    and the fail-closed tests below deliberately keep their OWN independent,
+    synthetic ``tool_use``/``tool_result`` event lists (they exercise
+    unknown-shape/ordering edge cases, not this happy-path ordering, so they
+    must not be coupled to this shared builder's shape)."""
     return [
         _system_init_event(),
         _assistant_message_event(),
-        _tool_use_event(),
-        _tool_result_event(),
         _terminal_result_event(structured_output),
     ]
 
@@ -179,9 +224,16 @@ def _legacy_pre_fix_payload_gate(payload: Any) -> "tuple[str | None, str | None]
     regression/documentation fixture forever, independent of any future
     refinement to the normalization adapter itself.
 
-    This is a test-local, hand-written characterization, not a dynamically
-    re-executed historical module load from git history, per the Issue
-    #2645 ``issue-refinement-loop`` OWNER anchor review guidance
+    This is a test-local, hand-written HISTORICAL CHARACTERIZATION -- a
+    narrow, permanently-frozen documentation gate for what the removed
+    legacy code did, not a dynamically re-executed historical module load
+    from git history, and not itself proof that the CURRENT (post-#2645)
+    ``invoke_agent()`` was ever executed against the pre-fix source tree.
+    (PR #2649 review fix_delta, anchor
+    https://github.com/squne121/loop-protocol/pull/2649#issuecomment-5701116062:
+    the PR body must keep this hand-written replica's evidence distinct
+    from the separate, genuine out-of-band before/after transcript
+    described below.) Per the Issue #2645 ``issue-refinement-loop`` OWNER anchor review guidance
     (https://github.com/squne121/loop-protocol/issues/2645#issuecomment-5699109387)
     to reuse the existing mock-runner fixture pattern rather than introduce
     a new, larger test harness. Independent, genuine confirmation that the
@@ -235,7 +287,19 @@ def test_event_array_normalizes_to_canonical_result(tmp_path: Path) -> None:
     ``structured_output=<payload>`` result AC1's single-object input
     reaches for byte-identical business content (semantic equivalence,
     verified here by also invoking `invoke_agent` on the single-object
-    form of the same terminal event and comparing results)."""
+    form of the same terminal event and comparing results).
+
+    PR #2649 review fix_delta (P2-2): the trivial ``{}`` schema this test
+    used before is replaced with the real, production
+    ``observer_result_v1.schema.json`` -- ``invoke_agent()``'s own
+    ``AgentInvocationResult.structured_output`` equality check here is
+    therefore already schema-shape-relevant, but the full downstream
+    JSON-Schema + identity-binding validation
+    (``EvidenceBundle``/``run_observer_wave``) is additionally exercised end
+    to end by ``test_event_array_normalizes_through_full_observer_wave_pipeline``
+    below -- this test alone (a bare ``invoke_agent()`` call) still only
+    proves the transport-normalization layer, not the business validation
+    that consumes it."""
     schema_path = _schema_path(tmp_path)
     structured_output = {"schema_version": "observer_result/v1", "ok": True}
 
@@ -258,6 +322,153 @@ def test_event_array_normalizes_to_canonical_result(tmp_path: Path) -> None:
     assert array_result.raw_stdout_excerpt is None
     assert array_result.structured_output == structured_output
     assert array_result.structured_output == single_object_result.structured_output
+
+
+def test_event_array_normalizes_through_full_observer_wave_pipeline() -> None:
+    """AC3 (PR #2649 review fix_delta, P2-2 primary fix): proves the
+    event-array shape reaches an identical, GENUINE result not only at
+    ``invoke_agent()``'s own boundary but all the way through the real
+    production ``validate-observers`` pipeline this Issue's fix feeds --
+    ``rr.prepare()`` (real ``RunContext``/``SourcePlan``) ->
+    ``rr.run_observer_wave()`` (real ``observer_result_v1.schema.json``
+    JSON-Schema validation via ``parse_agent_output_with_repair`` PLUS the
+    run_id/base_sha/source_set_digest identity-binding checks Issue #2237
+    P0-6 added) -- using the exact same schema-conformant ``EvidenceBundle``
+    content for both the array-wrapped and single-object-wrapped transport
+    shapes, and asserting the two resulting, independently-parsed
+    ``EvidenceBundle`` instances are wire-identical to each other AND to the
+    bundle this test itself constructed. A prior version of this AC3
+    coverage only asserted ``invoke_agent()``'s own
+    ``AgentInvocationResult.structured_output`` dict equality against a
+    trivial ``{}`` schema, which could not demonstrate that array
+    normalization survives real downstream business/identity validation
+    unchanged (anchor
+    https://github.com/squne121/loop-protocol/pull/2649#issuecomment-5701116062,
+    P2-2)."""
+    ctx, plan, _results = rr.prepare(
+        base_sha_resolver=lambda: _AC3_BASE_SHA,
+        collectors=[lambda base_sha: _FakeCollectorResult({"source_type": "repository", "source_id": "repository"})],
+        run_id="run-ac3-event-array-full-pipeline",
+    )
+    bundle = rr.EvidenceBundle(
+        run_id=ctx.run_id,
+        base_sha=ctx.base_sha,
+        source_set_digest=plan.source_set_digest,
+        observer_id="retrospective-runtime-observer",
+        evidence_ref="evidence://ac3-full-pipeline/retrospective-runtime-observer",
+        findings=[{"claim": "ac3-full-pipeline-finding", "claim_class": "process"}],
+    )
+    structured_output = json.loads(bundle.to_wire())
+
+    def _invoke_via(fixture_stdout: Any) -> Any:
+        def _invoke(request: rr.AgentInvocationRequest) -> rr.AgentInvocationResult:
+            return rr.invoke_agent(request, runner=_runner_for_stdout(json.dumps(fixture_stdout)))
+
+        return _invoke
+
+    observer_requests = [_invocation_request(str(_OBSERVER_SCHEMA_PATH))]
+
+    single_object_bundles = rr.run_observer_wave(
+        ctx,
+        plan,
+        invoke=_invoke_via(_terminal_result_event(structured_output)),
+        observer_requests=observer_requests,
+    )
+    array_bundles = rr.run_observer_wave(
+        ctx,
+        plan,
+        invoke=_invoke_via(_valid_event_array_fixture(structured_output)),
+        observer_requests=observer_requests,
+    )
+
+    assert len(single_object_bundles) == 1
+    assert len(array_bundles) == 1
+    assert single_object_bundles[0].to_wire() == bundle.to_wire()
+    assert array_bundles[0].to_wire() == bundle.to_wire()
+    assert array_bundles[0].to_wire() == single_object_bundles[0].to_wire()
+
+
+def test_event_array_wrapped_compat_recovery_normalizes_through_full_pipeline() -> None:
+    """AC3 sub-coverage (PR #2649 review fix_delta, item 2b): the array
+    normalization layer must not interfere with the SEPARATE, pre-existing
+    ``_structured_output_from_result_compat`` recovery path (Issue #2348) --
+    a terminal ``type: "result"`` event that itself omits
+    ``structured_output`` (``None``) but carries a fenced-JSON
+    schema-conformant business payload inside its own ``result`` text must
+    still recover successfully, and the recovered ``EvidenceBundle`` must
+    still pass every downstream identity-binding check, when that terminal
+    event is wrapped inside a top-level event array."""
+    ctx, plan, _results = rr.prepare(
+        base_sha_resolver=lambda: _AC3_BASE_SHA,
+        collectors=[lambda base_sha: _FakeCollectorResult({"source_type": "repository", "source_id": "repository"})],
+        run_id="run-ac3-event-array-compat-recovery",
+    )
+    bundle = rr.EvidenceBundle(
+        run_id=ctx.run_id,
+        base_sha=ctx.base_sha,
+        source_set_digest=plan.source_set_digest,
+        observer_id="retrospective-runtime-observer",
+        evidence_ref="evidence://ac3-compat-recovery/retrospective-runtime-observer",
+        findings=[{"claim": "ac3-compat-recovery-finding", "claim_class": "process"}],
+    )
+    fenced_result_text = (
+        "Here is the observer result you requested:\n\n```json\n" + bundle.to_wire() + "\n```\n\nEnd of report."
+    )
+    terminal_event_missing_structured_output = _terminal_result_event(None, result_text=fenced_result_text)
+    array_fixture = [
+        _system_init_event(),
+        _assistant_message_event(),
+        terminal_event_missing_structured_output,
+    ]
+
+    def _invoke(request: rr.AgentInvocationRequest) -> rr.AgentInvocationResult:
+        return rr.invoke_agent(request, runner=_runner_for_stdout(json.dumps(array_fixture)))
+
+    array_bundles = rr.run_observer_wave(
+        ctx,
+        plan,
+        invoke=_invoke,
+        observer_requests=[_invocation_request(str(_OBSERVER_SCHEMA_PATH))],
+    )
+
+    assert len(array_bundles) == 1
+    assert array_bundles[0].to_wire() == bundle.to_wire()
+
+
+def test_event_array_wrapped_identity_mismatch_rejected_by_observer_wave() -> None:
+    """AC3 sub-coverage (PR #2649 review fix_delta, item 2c): array
+    normalization must never let a schema-VALID but identity-MISMATCHED
+    (wrong ``run_id``) ``EvidenceBundle`` slip past ``run_observer_wave()``'s
+    Issue #2237 P0-6 identity-binding rejection -- proves the array
+    normalization layer sits strictly BEFORE, and does not shortcut, that
+    downstream rejection."""
+    ctx, plan, _results = rr.prepare(
+        base_sha_resolver=lambda: _AC3_BASE_SHA,
+        collectors=[lambda base_sha: _FakeCollectorResult({"source_type": "repository", "source_id": "repository"})],
+        run_id="run-ac3-event-array-identity-mismatch",
+    )
+    mismatched_bundle = rr.EvidenceBundle(
+        run_id="a-completely-different-run-id",
+        base_sha=ctx.base_sha,
+        source_set_digest=plan.source_set_digest,
+        observer_id="retrospective-runtime-observer",
+        evidence_ref="evidence://ac3-identity-mismatch/retrospective-runtime-observer",
+        findings=[{"claim": "ac3-identity-mismatch-finding", "claim_class": "process"}],
+    )
+    array_fixture = _valid_event_array_fixture(json.loads(mismatched_bundle.to_wire()))
+
+    def _invoke(request: rr.AgentInvocationRequest) -> rr.AgentInvocationResult:
+        return rr.invoke_agent(request, runner=_runner_for_stdout(json.dumps(array_fixture)))
+
+    with pytest.raises(rr.ObserverWaveFailed) as excinfo:
+        rr.run_observer_wave(
+            ctx,
+            plan,
+            invoke=_invoke,
+            observer_requests=[_invocation_request(str(_OBSERVER_SCHEMA_PATH))],
+        )
+
+    assert excinfo.value.reason_code == "observer_run_id_mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +651,7 @@ def _claude_live_skip_reason() -> str | None:
 
 
 @pytest.mark.claude_live
-def test_real_claude_cli_round_trip_normalizes_whichever_shape_is_observed() -> None:
+def test_real_claude_cli_round_trip_normalizes_whichever_shape_is_observed(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC6: live round trip against the real ``claude`` CLI through the
     fixed ``invoke_agent()``. ``build_agent_invocation_argv()`` is invoked
     completely unmodified (Issue #2645 Out of Scope: this test must not
@@ -459,16 +670,45 @@ def test_real_claude_cli_round_trip_normalizes_whichever_shape_is_observed() -> 
 
     Runtime unavailable (``claude`` missing or unauthenticated) -> SKIP,
     per the Issue's documented skip_conditions -- never silently promoted
-    to PASS. A fallback-only success (e.g. a schema-mismatch structured
-    output recovered only through ``_structured_output_from_result_compat``
-    rather than a byte-exact schema match) is intentionally never treated
-    as this AC's genuine PASS (``fallback_policy.notes``): this test
-    asserts ``reason_code is None`` and an exact ``structured_output``
-    payload match, precisely so a hidden compat-recovery path can never
-    silently count as PASS."""
+    to PASS.
+
+    PR #2649 review fix_delta (anchor
+    https://github.com/squne121/loop-protocol/pull/2649#issuecomment-5701116062,
+    P2-1): once ``invoke_agent()`` reaches a terminal, non-error wrapper
+    (``type == "result"``, ``subtype == "success"``), BOTH of its two
+    success paths -- ``structured_output`` present directly as a dict, or
+    absent/``None`` and recovered from the wrapper's own ``result`` text via
+    ``_structured_output_from_result_compat`` -- converge on the exact same
+    ``AgentInvocationResult(status="ok", reason_code=None,
+    structured_output=<payload>)`` shape. Asserting only ``reason_code is
+    None`` and an exact ``structured_output`` match therefore does NOT, by
+    itself, prove which of the two paths this environment's live CLI
+    response actually took -- a genuine compat-recovery success looks
+    IDENTICAL to a genuine direct-field success at that boundary. This test
+    no longer claims (as a prior revision incorrectly did) that a passing
+    assertion here proves "fallback not used"; instead it installs a
+    ``monkeypatch`` spy around ``rr._structured_output_from_result_compat``
+    that delegates to the real implementation while recording whether it was
+    ever called, and reports the OBSERVED value
+    (``compat_recovery_used=True/False``) as a diagnostic. Both a genuine
+    direct-field success and a genuine compat-recovery success are equally
+    valid PASSes for this AC -- compat recovery is a pre-existing, already
+    schema-validated (Issue #2348) production success path, not a
+    degraded/fallback outcome to be suppressed or treated as FAIL."""
     skip_reason = _claude_live_skip_reason()
     if skip_reason is not None:
         pytest.skip(skip_reason)
+
+    compat_recovery_used = {"value": False}
+    _original_structured_output_from_result_compat = rr._structured_output_from_result_compat
+
+    def _spy_structured_output_from_result_compat(*args: Any, **kwargs: Any) -> Any:
+        compat_recovery_used["value"] = True
+        return _original_structured_output_from_result_compat(*args, **kwargs)
+
+    monkeypatch.setattr(
+        rr, "_structured_output_from_result_compat", _spy_structured_output_from_result_compat
+    )
 
     run_id = f"live-transport-{uuid.uuid4()}"
     nonce = uuid.uuid4().hex
@@ -530,7 +770,8 @@ def test_real_claude_cli_round_trip_normalizes_whichever_shape_is_observed() -> 
     print(
         "test_real_claude_cli_round_trip_normalizes_whichever_shape_is_observed: "
         f"observed_top_level_shape={observed_shape} adapter_status={result.status} "
-        f"adapter_reason_code={result.reason_code} child_exit_code={result.exit_code}"
+        f"adapter_reason_code={result.reason_code} child_exit_code={result.exit_code} "
+        f"compat_recovery_used={compat_recovery_used['value']}"
     )
 
     assert result.status == "ok", (observed_shape, result.status, result.reason_code, result.raw_stdout_excerpt)
