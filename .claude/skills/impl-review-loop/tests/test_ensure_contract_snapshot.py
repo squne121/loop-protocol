@@ -3910,11 +3910,22 @@ class TestPostCommentTransportAndReconciliation:
         }
 
         def fake_run(command, *, input=None, **kwargs):
+            # PR #2639 review (P3): extract the ``repos/...`` endpoint
+            # semantically instead of by positional index, so this fake
+            # stays correct if production reorders its ``gh api`` argv
+            # (e.g. flag placement) without changing the endpoint itself.
+            endpoints = [
+                arg
+                for arg in command[2:]
+                if isinstance(arg, str) and arg.startswith("repos/")
+            ]
+            assert len(endpoints) == 1, command
+            endpoint = endpoints[0]
+
             if "--method" in command:
                 method = command[command.index("--method") + 1]
-                url_arg = command[command.index("--method") + 2]
                 if method == "POST":
-                    assert url_arg == f"repos/{_REPO}/issues/{_ISSUE_NUMBER}/comments"
+                    assert endpoint == f"repos/{_REPO}/issues/{_ISSUE_NUMBER}/comments"
                     payload = json.loads(input.decode("utf-8"))
                     comment_id = remote["next_id"]
                     remote["next_id"] += 1
@@ -3943,7 +3954,7 @@ class TestPostCommentTransportAndReconciliation:
                         stderr=b"",
                     )
                 if method == "PATCH":
-                    comment_id = int(url_arg.rsplit("/", 1)[-1])
+                    comment_id = int(endpoint.rsplit("/", 1)[-1])
                     payload = json.loads(input.decode("utf-8"))
                     remote["final_body"] = payload["body"]
                     remote["comments"][comment_id]["body"] = payload["body"]
@@ -3972,9 +3983,8 @@ class TestPostCommentTransportAndReconciliation:
                 ]
                 return MagicMock(returncode=0, stdout="\n".join(lines), stderr="")
 
-            last = str(command[-1])
             m = re.match(
-                rf"repos/{re.escape(_REPO)}/issues/comments/(\d+)$", last
+                rf"repos/{re.escape(_REPO)}/issues/comments/(\d+)$", endpoint
             )
             if m:
                 comment_id = int(m.group(1))
@@ -4033,7 +4043,7 @@ class TestPostCommentTransportAndReconciliation:
                         do_post=True,
                     )
 
-        assert result["status"] == "ok"
+        assert result["status"] == "ok", result
         assert result["source"] == "materialized_go"
         assert (
             result["contract_snapshot_url"]
