@@ -557,13 +557,17 @@ def _run_full_pipeline(call_log: list[str]) -> tuple[rr.RunContext, rr.SourcePla
 
 
 def test_evaluator_waits_for_observer_call_order() -> None:
+    # Issue #2646: `run_observer_wave` now dispatches every observer
+    # concurrently (fan-out) rather than one-at-a-time, so the RELATIVE
+    # order between peer observers is no longer deterministic -- only that
+    # both observers are called, and that the evaluator is called last
+    # (after the fan-in barrier), which is still guaranteed.
     call_log: list[str] = []
     _run_full_pipeline(call_log)
-    assert call_log == [
-        "observer:retrospective-runtime-observer",
-        "observer:codebase-investigator",
-        "evaluator",
-    ]
+    assert call_log[-1] == "evaluator"
+    assert sorted(call_log[:-1]) == sorted(
+        ["observer:retrospective-runtime-observer", "observer:codebase-investigator"]
+    )
 
 
 def test_evaluator_waits_for_observer_never_invoked_on_observer_failure() -> None:

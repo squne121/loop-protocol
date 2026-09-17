@@ -45,6 +45,7 @@ import contextlib
 import copy
 import dataclasses
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -54,8 +55,11 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import typing
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -1257,10 +1261,383 @@ def build_agent_invocation_argv(
     return argv
 
 
+# ---------------------------------------------------------------------------
+# child-process lifecycle registry (Issue #2646 AC6; P1-1/P1-2 fix_delta
+# hardening): a small, module-level process-handle registry (never a general
+# concurrency/security framework -- OWNER review anchor comment's "推奨する
+# 実装の形") that lets a SIGINT/SIGTERM delivered to THIS process locate and
+# terminate every still-running observer subprocess dispatched by
+# `run_observer_wave`'s fan-out (and the evaluator's own main-thread-owned
+# subprocess), and lets an observer's OWN per-request timeout be handled as
+# terminate -> bounded grace -> kill -> reap rather than an unconditional
+# immediate kill. These two paths are deliberately kept separate (case (b)
+# vs case (c) below):
+#   - case (b) (`_terminate_and_reap_process`, called from
+#     `_lifecycle_subprocess_run`'s OWN thread -- ordinary control flow,
+#     NEVER a signal handler -- either after ITS OWN
+#     `communicate(timeout=...)` already raised `TimeoutExpired`, or in its
+#     own `finally` when some OTHER exception unwound that same call) safely
+#     calls `Popen.communicate()` again on that SAME Popen -- an officially
+#     supported retry pattern (see `subprocess.Popen.communicate`'s own
+#     docstring) because only ONE thread (the one that owns this Popen) is
+#     ever the party -- and always has been the ONLY party -- calling
+#     `communicate()`/`wait()` on it. This is also the mechanism a
+#     main-thread-owned subprocess (e.g. the evaluator, invoked synchronously
+#     from `run_cli`'s main thread -- Issue #2646 P1-1 fix_delta) reaps
+#     ITSELF when a signal-raised `RunInterrupted` unwinds its own blocked
+#     `communicate()` call: this thread's own `finally` performs the reap
+#     inline, never depending on a signal handler or a peer thread to do it
+#     (that dependency was the pre-fix_delta "self-wait": the SIGINT/SIGTERM
+#     handler used to poll THIS registry waiting for the owning thread's own
+#     unregister -- but when the owning thread WAS the interrupted thread,
+#     itself frozen inside the nested handler call, it could never reach
+#     that unregister until the handler -- which was doing the waiting --
+#     returned).
+#   - case (c) (`terminate_all_active_child_processes`, called from ORDINARY
+#     control flow -- `run_scoped_temp_dir`'s own `finally`, and
+#     `run_observer_wave`'s fan-in `except` clause -- NEVER from inside the
+#     raw OS signal handler itself, see `_request_interrupt`'s docstring)
+#     NEVER calls `communicate()`/`wait()` on a process it does not own --
+#     doing so concurrently with the owning thread's own in-flight
+#     `communicate()` call is unsafe (not thread-safe per the stdlib). It
+#     only ever sends signals (`terminate()`/`kill()`, both plain
+#     `os.kill()` calls, safe from any thread) and then polls this registry
+#     (and `_LAUNCHES_IN_FLIGHT`, see below) until the owning thread's own
+#     `finally: _unregister_active_child_process(...)` confirms the reap
+#     actually happened.
+#
+# `_LAUNCHES_IN_FLIGHT` (Issue #2646 P1-2 fix_delta) closes the race between
+# a child's `Popen()` completing and this registry actually recording it:
+# `_reserve_launch_slot()` reserves a handle (and refuses to reserve one at
+# all once an interrupt has already been requested) BEFORE `Popen()` ever
+# runs; `_promote_launch_to_active()` moves that SAME handle into the real
+# active registry the instant `Popen()` returns. A child that is Popen'ed
+# but not yet promoted is still visible (as "in flight") to
+# `terminate_all_active_child_processes()`'s convergence loop, which keeps
+# re-sampling BOTH sets until neither has anything left -- never declaring
+# convergence from a single one-shot snapshot.
+# ---------------------------------------------------------------------------
+
+#: Issue #2646 AC6: bounded grace period (seconds) between SIGTERM and a
+#: SIGKILL escalation for any observer subprocess this module manages
+#: directly -- both an observer's own per-request timeout (case (b)) and a
+#: parent SIGINT/SIGTERM (case (c)) share this constant. Tests that need a
+#: fast, deterministic timeline monkeypatch this module attribute rather
+#: than waiting out the real production default.
+_CHILD_PROCESS_TERMINATE_GRACE_SEC: float = 5.0
+
+_ACTIVE_CHILD_PROCESSES_LOCK = threading.Lock()
+_ACTIVE_CHILD_PROCESSES: dict[int, subprocess.Popen] = {}
+#: Issue #2646 P1-2 (fix_delta): handles reserved via `_reserve_launch_slot`
+#: whose `Popen()` has not (yet) been promoted into `_ACTIVE_CHILD_PROCESSES`
+#: -- the Popen()-completed/registration-pending race window closer.
+_LAUNCHES_IN_FLIGHT: set[int] = set()
+_ACTIVE_CHILD_PROCESS_HANDLE_SEQ = itertools.count()
+
+#: Issue #2646 P1-1 (fix_delta): the ONLY two pieces of state a signal
+#: handler is ever allowed to touch (see `_request_interrupt`). Setting a
+#: `threading.Event` takes that Event's OWN internal lock -- never
+#: `_ACTIVE_CHILD_PROCESSES_LOCK` -- so this can never self-deadlock the way
+#: re-acquiring `_ACTIVE_CHILD_PROCESSES_LOCK` from inside the handler could
+#: (the exact pre-fix_delta bug: if the interrupted thread already held that
+#: Lock -- e.g. mid `_reserve_launch_slot`/`_promote_launch_to_active` -- a
+#: handler that tried to re-acquire the SAME non-reentrant `Lock` on that
+#: SAME thread would block forever). `_INTERRUPT_SIGNUM` is a single plain
+#: attribute write (atomic under the GIL); it is only ever READ after
+#: `_INTERRUPT_REQUESTED.is_set()` is already `True`.
+_INTERRUPT_REQUESTED = threading.Event()
+_INTERRUPT_SIGNUM: int | None = None
+
+
+def _current_interrupt_signum() -> int:
+    """Best-effort signum for a `RunInterrupted` raised somewhere other than
+    directly inside the signal handler itself (e.g. `_reserve_launch_slot`
+    refusing a brand-new launch, or `_lifecycle_subprocess_run` noticing
+    `_INTERRUPT_REQUESTED` after its own child already completed
+    naturally). Falls back to `SIGTERM` in the (should-never-happen) case
+    this is read before `_INTERRUPT_SIGNUM` was ever set."""
+    return _INTERRUPT_SIGNUM if _INTERRUPT_SIGNUM is not None else signal.SIGTERM
+
+
+def _request_interrupt(signum: int) -> None:
+    """Issue #2646 P1-1 (fix_delta): the ENTIRE body of work a signal
+    handler is ever allowed to perform -- no `_ACTIVE_CHILD_PROCESSES_LOCK`
+    acquisition, no blocking wait, no `terminate()`/`kill()` calls, no reap
+    polling. Just records that an interrupt was requested so ordinary
+    (non-signal) control flow can react: `_reserve_launch_slot` refuses new
+    launches once this is set, and `terminate_all_active_child_processes`
+    (called from ordinary code -- `run_scoped_temp_dir`'s own `finally`, or
+    `run_observer_wave`'s fan-in `except` clause -- never from the handler
+    itself) performs the actual terminate -> grace -> kill -> reap
+    convergence."""
+    global _INTERRUPT_SIGNUM
+    _INTERRUPT_SIGNUM = signum
+    _INTERRUPT_REQUESTED.set()
+
+
+def _reset_interrupt_state() -> None:
+    """Issue #2646 P1-2 (fix_delta): re-armed at both the start and the end
+    of every `run_scoped_temp_dir` use so one run's interrupt FLAG
+    (module-global, shared across every run in this same process -- e.g.
+    across tests) can never leak into the next run and make
+    `_reserve_launch_slot` refuse every launch before that next run even
+    begins. Deliberately never touches `_ACTIVE_CHILD_PROCESSES` /
+    `_LAUNCHES_IN_FLIGHT` themselves: those reflect REAL, currently-live
+    process handles that may have been registered from code running
+    entirely OUTSIDE this exact context-manager scope (e.g. a worker
+    thread's own already-in-flight dispatch) and must never be silently
+    discarded out from under their owning thread -- only that owning
+    thread's own `_unregister_active_child_process` may ever remove them."""
+    global _INTERRUPT_SIGNUM
+    _INTERRUPT_REQUESTED.clear()
+    _INTERRUPT_SIGNUM = None
+
+
+def _reserve_launch_slot() -> int | None:
+    """Issue #2646 P1-2 (fix_delta): reserve a launch slot BEFORE `Popen()`
+    ever runs. Returns `None` (caller MUST NOT launch) once an interrupt has
+    already been requested -- this module never starts a brand-new child
+    after that point."""
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        if _INTERRUPT_REQUESTED.is_set():
+            return None
+        handle_id = next(_ACTIVE_CHILD_PROCESS_HANDLE_SEQ)
+        _LAUNCHES_IN_FLIGHT.add(handle_id)
+        return handle_id
+
+
+def _promote_launch_to_active(handle_id: int, proc: "subprocess.Popen") -> None:
+    """Issue #2646 P1-2 (fix_delta): moves a reserved launch slot into the
+    real active registry the instant `Popen()` returns -- closes the
+    Popen()-completed/registration-pending race window `_reserve_launch_slot`
+    alone cannot: even if a parent interrupt lands in between, this child is
+    still visible (as "in flight") to `terminate_all_active_child_processes`
+    until this exact call runs, and visible (as "active") from it onward --
+    never a gap where it is visible to neither."""
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        _LAUNCHES_IN_FLIGHT.discard(handle_id)
+        _ACTIVE_CHILD_PROCESSES[handle_id] = proc
+
+
+def _unregister_active_child_process(handle_id: int) -> None:
+    """Removes ``handle_id`` from BOTH the in-flight and active views
+    (idempotent, harmless if it was never promoted -- e.g. ``Popen()``
+    itself raised before any promotion ever happened)."""
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        _LAUNCHES_IN_FLIGHT.discard(handle_id)
+        _ACTIVE_CHILD_PROCESSES.pop(handle_id, None)
+
+
+def _terminate_and_reap_process(proc: "subprocess.Popen", *, grace_sec: float | None = None) -> int | None:
+    """AC6 case (b): terminate -> bounded grace -> (if still alive) kill ->
+    reap, called from the SAME thread that already owns ``proc`` (i.e. is
+    already blocked inside, or has already called, ``proc.communicate()``).
+    Idempotent against an already-exited process (never sends a signal to a
+    pid that has already terminated)."""
+    grace = _CHILD_PROCESS_TERMINATE_GRACE_SEC if grace_sec is None else grace_sec
+    if proc.poll() is not None:
+        return proc.returncode
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        proc.communicate(timeout=grace)
+        return proc.returncode
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    proc.communicate()
+    return proc.returncode
+
+
+def terminate_all_active_child_processes(
+    *, grace_sec: float | None = None, reap_timeout_sec: float = 30.0
+) -> list[int]:
+    """AC6 case (c) (Issue #2646 P1-1/P1-2 fix_delta hardening): the actual
+    terminate -> bounded grace -> kill -> reap CONVERGENCE step -- called
+    from ORDINARY control flow (`run_scoped_temp_dir`'s own `finally`,
+    `run_observer_wave`'s fan-in `except` clause) -- NEVER from inside the
+    raw OS signal handler itself (see `_request_interrupt`'s docstring for
+    why: no blocking convergence and no `_ACTIVE_CHILD_PROCESSES_LOCK`
+    acquisition may ever happen there).
+
+    Unlike a single one-shot registry snapshot, this repeatedly re-samples
+    BOTH `_LAUNCHES_IN_FLIGHT` (a child whose `Popen()` may not have
+    completed -- or may have completed but not yet been promoted into the
+    active registry -- at the exact instant an interrupt was requested) and
+    `_ACTIVE_CHILD_PROCESSES` until NEITHER contains anything: no launch is
+    still in flight, and every registered child has actually been reaped by
+    its OWNING thread's own `_lifecycle_subprocess_run` (never
+    `wait()`/`communicate()`'d from here). `_reserve_launch_slot` already
+    guarantees no BRAND NEW launch can begin once an interrupt has been
+    requested, so this in-flight/active state can only ever shrink once
+    that happens. A safe (idempotent) no-op when nothing was ever launched.
+    Returns the PIDs this call sent a signal to (diagnostics/tests)."""
+    grace = _CHILD_PROCESS_TERMINATE_GRACE_SEC if grace_sec is None else grace_sec
+    seen_pids: set[int] = set()
+
+    def _terminate_currently_registered() -> bool:
+        """Sends `terminate()` to every currently-registered, still-alive
+        child. Returns whether everything has already converged (nothing in
+        flight, nothing registered)."""
+        with _ACTIVE_CHILD_PROCESSES_LOCK:
+            in_flight = bool(_LAUNCHES_IN_FLIGHT)
+            snapshot = dict(_ACTIVE_CHILD_PROCESSES)
+        for proc in snapshot.values():
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                else:
+                    seen_pids.add(proc.pid)
+        return not in_flight and not snapshot
+
+    deadline = time.monotonic() + grace
+    while True:
+        if _terminate_currently_registered():
+            return sorted(seen_pids)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+
+    # escalate: SIGKILL anything still alive after the grace period
+    # (including anything only JUST promoted at the very end of it).
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        snapshot = dict(_ACTIVE_CHILD_PROCESSES)
+    for proc in snapshot.values():
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            else:
+                seen_pids.add(proc.pid)
+
+    # bounded safety net: converge on both sets becoming empty -- never
+    # merely "the FIRST snapshot is now empty" -- escalating straight to
+    # `kill()` (skipping another full grace period) for anything that only
+    # shows up this late.
+    reap_deadline = time.monotonic() + reap_timeout_sec
+    while time.monotonic() < reap_deadline:
+        with _ACTIVE_CHILD_PROCESSES_LOCK:
+            converged = not _LAUNCHES_IN_FLIGHT and not _ACTIVE_CHILD_PROCESSES
+            snapshot = dict(_ACTIVE_CHILD_PROCESSES)
+        if converged:
+            break
+        for proc in snapshot.values():
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                else:
+                    seen_pids.add(proc.pid)
+        time.sleep(0.02)
+    return sorted(seen_pids)
+
+
+def _lifecycle_subprocess_run(
+    argv: Sequence[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    input: str | None = None,  # noqa: A002 -- matches subprocess.run's own kwarg name
+    capture_output: bool = True,
+    text: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    """Issue #2646 AC6 (P1-1/P1-2 fix_delta hardening): the production
+    default ``runner`` for
+    ``invoke_agent``/``invoke_agent_with_role_adapter``/``run_cli``. From
+    the caller's point of view this behaves exactly like
+    ``subprocess.run(argv, cwd=cwd, env=env, input=input,
+    capture_output=capture_output, text=text, timeout=timeout)`` (same
+    ``CompletedProcess`` return shape, same ``subprocess.TimeoutExpired`` on
+    timeout) EXCEPT:
+
+    - a launch slot is reserved (`_reserve_launch_slot`) BEFORE ``Popen()``
+      ever runs, and refused (raising ``RunInterrupted``, never starting a
+      process) once a parent interrupt has already been requested;
+    - the live ``Popen`` handle is promoted into this module's
+      active-child-process registry the INSTANT ``Popen()`` returns (so a
+      parent SIGINT/SIGTERM can find and terminate it -- case (c) -- even if
+      it arrives in the narrow window right after ``Popen()`` but before
+      this function would otherwise have registered it);
+    - its OWN timeout is handled as terminate -> bounded grace -> kill ->
+      reap (case (b)) rather than the unconditional immediate ``kill()`` the
+      stdlib's own ``subprocess.run`` performs on timeout;
+    - THIS thread reaps its OWN child inline, in its own ``finally``,
+      regardless of *why* the block below unwound -- a signal-raised
+      ``RunInterrupted`` while blocked in ``communicate()`` (e.g. a
+      main-thread-owned evaluator invocation) never depends on the signal
+      handler, or a peer thread, to do that reap (Issue #2646 P1-1: this is
+      what makes a main-thread-owned child's own interruption never
+      self-wait on its own not-yet-reached ``finally``);
+    - if an interrupt was already requested BEFORE this exact call ever
+      began, this raises ``RunInterrupted`` immediately and never starts a
+      process at all; once a process HAS been started, this child being
+      reached by the parent interrupt (via
+      ``terminate_all_active_child_processes``'s own ``terminate()``/
+      ``kill()``) is observed here as an ordinary (signal-shaped, negative)
+      ``returncode`` on a normal return -- exactly like ``subprocess.run``
+      itself would report it -- never as an exception this call's own
+      caller has to additionally special-case."""
+    handle_id = _reserve_launch_slot()
+    if handle_id is None:
+        raise RunInterrupted(_current_interrupt_signum())
+    proc: "subprocess.Popen | None" = None
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE if capture_output else None,
+            stderr=subprocess.PIPE if capture_output else None,
+            text=text,
+        )
+        _promote_launch_to_active(handle_id, proc)
+        try:
+            stdout, stderr = proc.communicate(input=input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=timeout) from None
+        # Issue #2646 P1-2 (fix_delta): deliberately does NOT raise
+        # `RunInterrupted` merely because `_INTERRUPT_REQUESTED` happens to
+        # be set once `communicate()` returns -- a parent SIGINT/SIGTERM
+        # that reaches THIS child (via `terminate_all_active_child_processes`
+        # sending it a real `terminate()`/`kill()`) is observed here as an
+        # ordinary negative `returncode`, exactly like `subprocess.run`
+        # itself would report it -- never as an exception the caller has to
+        # additionally special-case (AC6's pre-existing
+        # terminate-vs-timeout distinction: this call returning NORMALLY
+        # here, with a signal-shaped `returncode`, is exactly what proves
+        # the child was actually reached by the terminate/kill escalation
+        # rather than left to run out its own timeout).
+        return subprocess.CompletedProcess(args=list(argv), returncode=proc.returncode, stdout=stdout, stderr=stderr)
+    finally:
+        # Issue #2646 P1-1 (fix_delta): guarantee THIS thread's own child is
+        # actually terminated and reaped -- a REAL `os.waitpid` outcome
+        # (`proc.poll()`), never merely "removed from this dict" -- before
+        # its handle is ever removed from the registry, on ANY abnormal
+        # unwind of the block above (this own timeout already reaps via the
+        # `except` clause, but a signal-raised `RunInterrupted` or any other
+        # exception reaches this SAME guarantee here). Never `unregister`
+        # without confirming the reap first.
+        if proc is not None and proc.poll() is None:
+            _terminate_and_reap_process(proc)
+        _unregister_active_child_process(handle_id)
+
+
 def invoke_agent(
     request: AgentInvocationRequest,
     *,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    runner: Callable[..., subprocess.CompletedProcess] = _lifecycle_subprocess_run,
     policy: "DelegatedAgentPermissionPolicy | None" = None,
 ) -> AgentInvocationResult:
     """Production Agent invocation adapter. ``runner`` is dependency-injected
@@ -1730,7 +2107,7 @@ def invoke_agent_with_role_adapter(
     *,
     ctx: "RunContext",
     plan: "SourcePlan",
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    runner: Callable[..., subprocess.CompletedProcess] = _lifecycle_subprocess_run,
     policy: "DelegatedAgentPermissionPolicy | None" = None,
 ) -> AgentInvocationResult:
     """Issue #2374: thin wrapper around ``invoke_agent`` that applies
@@ -1818,6 +2195,40 @@ class ObserverWaveFailed(Exception):
         super().__init__(message)
         self.reason_code = reason_code if reason_code is not None else type(self).__name__
         self.exit_code = exit_code
+        #: Issue #2646 AC5: the all-terminal per-observer aggregate for the
+        #: wave this exception was raised from -- ``()`` (never ``None``)
+        #: until `run_observer_wave` fills it in (right before raising),
+        #: so `getattr(exc, "observer_results", ())` is always safe.
+        self.observer_results: tuple["ObserverWaveObserverResult", ...] = ()
+
+
+@dataclass(frozen=True)
+class ObserverWaveObserverResult:
+    """Issue #2646 AC5: one required observer's terminal outcome from a
+    single `run_observer_wave` fan-out/fan-in call -- always present for
+    EVERY dispatched request regardless of whether any OTHER observer in
+    the same wave succeeded or failed (the all-terminal barrier guarantees
+    this). ``observer_id`` here is always the REQUEST-side
+    ``AgentInvocationRequest.agent_name`` -- never the returned payload's
+    own claimed ``observer_id`` -- this is the aggregate's identity
+    authority (Issue #2646 anchor review P1 finding #1: an observer_id
+    swap in the RETURNED payload must never silently become the aggregate's
+    key)."""
+
+    observer_id: str
+    status: str  # "ok" | "failed"
+    reason_code: str | None
+    exit_code: int | None
+
+
+#: Issue #2646 AC3: every dispatched observer's real headless CLI subprocess
+#: invocation is the only genuinely blocking step in `run_observer_wave` --
+#: `max_workers` is sized to the actual request count (never less) so no
+#: dispatched observer is ever left queued behind another observer's own
+#: completion (a bounded pool smaller than the manifest would silently
+#: reintroduce sequential-style blocking for the observers beyond its size).
+def _observer_wave_max_workers(request_count: int) -> int:
+    return max(request_count, 1)
 
 
 def run_observer_wave(
@@ -1829,67 +2240,251 @@ def run_observer_wave(
     repair: Callable[[str, WireContractError], str] | None = None,
     expected_manifest: Sequence[ObserverRoleSpec] | None = None,
 ) -> list[EvidenceBundle]:
-    """``validate-observers`` phase (fan-out half): invoke every observer in
-    ``observer_requests`` and strictly validate its serialized output into an
-    ``EvidenceBundle``. All observers must succeed -- the first failure
-    aborts the wave (fail-closed; ``observer_parallelism: 3`` is an execution
-    budget for the caller's actual concurrency, not modeled by this
-    sequential reference implementation).
+    """``validate-observers`` phase: fan-out every observer in
+    ``observer_requests`` -- dispatched concurrently via a bounded thread
+    pool, so no observer's ``invoke`` call is ever blocked waiting on
+    another observer's own completion (AC3) -- then fan-in: wait for EVERY
+    dispatched observer to reach a terminal outcome (success or one of the
+    typed failure classes below) before this function EVER raises or
+    returns (AC1). A single observer's failure never cancels or skips
+    collection of its peers -- every peer is still invoked and its own
+    result/bundle validated, exactly as if it had been the only observer in
+    the wave.
+
+    Per-observer terminal failure classes (Issue #2646 AC4): non-``ok``
+    ``AgentInvocationResult.status`` (timeout / malformed output / nonzero
+    exit / api_error / partial_result), schema repair exhaustion
+    (``WireContractError``/``SchemaRepairExhausted``), an ``observer_id``
+    in the RETURNED bundle that does not match the REQUEST's own
+    ``agent_name`` (``observer_id_mismatch`` -- Issue #2646 anchor review
+    P1 finding #1: an identity swap between two observers whose
+    ``run_id``/``base_sha``/``source_set_digest`` all agree must still be
+    caught, independently of those checks), a ``run_id``/
+    ``source_set_digest``/``base_sha`` mismatch, a duplicate observer_id
+    among the dispatched requests, or (when ``expected_manifest`` is
+    supplied) an observer_id outside the expected manifest / a manifest
+    that ends up incomplete.
+
+    Exactly ONE observer failing re-raises that SAME failure's own
+    exception instance/type unchanged (e.g. ``SchemaRepairExhausted``) --
+    preserving this function's pre-#2646 single-failure contract exactly,
+    including for ``pytest.raises(rr.SchemaRepairExhausted)``-style
+    callers. TWO OR MORE observers failing raises a single
+    ``ObserverWaveFailed`` with ``reason_code:
+    "observer_wave_multiple_failures"`` instead of representing the wave by
+    only the first failure encountered (Issue #2646 AC5) -- every
+    exception raised from here (single- or multiple-failure) carries the
+    full all-terminal ``observer_results`` aggregate (`main()` surfaces it
+    additively on the failure JSON).
 
     Every bundle's ``base_sha`` MUST equal ``ctx.base_sha`` (Issue #2237
-    P0-6 -- previously unchecked here, letting a mismatched ``base_sha`` slip
-    through and then be silently overwritten downstream). When
-    ``expected_manifest`` is supplied, the observer_id set MUST match it
-    exactly (no missing, no extra, no duplicate observer_id)."""
+    P0-6). When ``expected_manifest`` is supplied, the observer_id set MUST
+    match it exactly (no missing, no extra, no duplicate observer_id)."""
     expected_ids = {spec.observer_id for spec in expected_manifest} if expected_manifest is not None else None
-    seen_ids: set[str] = set()
-    bundles: list[EvidenceBundle] = []
-    for request in observer_requests:
-        result = invoke(request)
+
+    def _process_one(
+        request: AgentInvocationRequest,
+    ) -> tuple[AgentInvocationRequest, EvidenceBundle | None, BaseException | None, str | None, int | None]:
+        """Runs entirely inside ONE fan-out worker thread: invokes this ONE
+        observer (the only actually-blocking step -- a real headless CLI
+        subprocess call) and, on success, performs every per-observer
+        (non-cross-observer) validation this module previously did
+        sequentially. NEVER lets an exception escape -- `run_observer_wave`
+        itself is the only place a wave-level exception is ever raised,
+        and only after every OTHER dispatched observer has also reached a
+        terminal outcome."""
+        try:
+            result = invoke(request)
+        except BaseException as exc:  # pragma: no cover -- defensive: production
+            # `invoke` (== invoke_agent[_with_role_adapter]) never raises;
+            # a caller-supplied fake in tests legitimately might.
+            return (
+                request,
+                None,
+                exc,
+                getattr(exc, "reason_code", type(exc).__name__),
+                getattr(exc, "exit_code", None),
+            )
         if result.status != "ok":
             # Issue #2341 AC1: thread the underlying adapter-level
             # reason_code/exit_code through so main()'s top-level failure
             # output is diagnosable (e.g. distinguishes
             # missing_structured_output from other observer_failed causes).
-            raise ObserverWaveFailed(
+            exc = ObserverWaveFailed(
                 f"observer_failed:{request.agent_name}:{result.status}",
                 reason_code=result.reason_code,
                 exit_code=result.exit_code,
             )
+            return request, None, exc, exc.reason_code, exc.exit_code
         raw_text = json.dumps(result.structured_output, sort_keys=True, separators=(",", ":"))
-        bundle = parse_agent_output_with_repair(raw_text, EvidenceBundle, repair=repair)
+        try:
+            bundle = parse_agent_output_with_repair(raw_text, EvidenceBundle, repair=repair)
+        except WireContractError as exc:
+            # Issue #2646 P2 (fix_delta): the underlying process already
+            # completed with `result.exit_code` (e.g. `0`) BEFORE this
+            # post-process schema validation ever ran -- that observed
+            # exit code is never discarded merely because the *content* it
+            # produced later failed validation.
+            return request, None, exc, getattr(exc, "reason_code", type(exc).__name__), result.exit_code
+        # Issue #2646 AC4 / anchor review P1 finding #1: the REQUEST-side
+        # agent_name is the aggregate's identity authority -- a returned
+        # `observer_id` that does not match the observer THIS request
+        # actually launched is an independent terminal failure, never
+        # silently accepted merely because run_id/base_sha/
+        # source_set_digest also happen to agree (an observer_id swap
+        # alone does not disturb those).
+        if bundle.observer_id != request.agent_name:
+            exc = ObserverWaveFailed(
+                f"observer_id_mismatch:request={request.agent_name}:returned={bundle.observer_id}",
+                reason_code="observer_id_mismatch",
+                # Issue #2646 P2 (fix_delta): preserve the real observed
+                # exit code (typically `0` -- the process itself
+                # succeeded) even though this identity check fails it.
+                exit_code=result.exit_code,
+            )
+            return request, None, exc, exc.reason_code, exc.exit_code
         if bundle.run_id != ctx.run_id:
-            raise ObserverWaveFailed(
+            exc = ObserverWaveFailed(
                 f"observer_run_id_mismatch:{request.agent_name}",
                 reason_code="observer_run_id_mismatch",
+                exit_code=result.exit_code,
             )
+            return request, None, exc, exc.reason_code, exc.exit_code
         if bundle.source_set_digest != plan.source_set_digest:
-            raise ObserverWaveFailed(
+            exc = ObserverWaveFailed(
                 f"observer_source_set_digest_mismatch:{request.agent_name}",
                 reason_code="observer_source_set_digest_mismatch",
+                exit_code=result.exit_code,
             )
+            return request, None, exc, exc.reason_code, exc.exit_code
         if bundle.base_sha != ctx.base_sha:
-            raise ObserverWaveFailed(
+            exc = ObserverWaveFailed(
                 f"observer_base_sha_mismatch:{request.agent_name}",
                 reason_code="observer_base_sha_mismatch",
+                exit_code=result.exit_code,
             )
-        if bundle.observer_id in seen_ids:
-            raise ObserverWaveFailed(
-                f"duplicate_observer_id:{bundle.observer_id}",
-                reason_code="duplicate_observer_id",
+            return request, None, exc, exc.reason_code, exc.exit_code
+        # Issue #2646 P2 (fix_delta): thread the real observed
+        # `result.exit_code` through on the success path too -- previously
+        # this was hardcoded to `None`, discarding it even when the
+        # process exited cleanly (`0`).
+        return request, bundle, None, None, result.exit_code
+
+    # Fan-out: every request is SUBMITTED before this call site ever blocks
+    # on any one of them (AC3) -- `ThreadPoolExecutor.submit` returns
+    # immediately; the real blocking work (`invoke`, ultimately a headless
+    # CLI subprocess call) happens inside each worker thread, independent
+    # of every other dispatched observer's own progress.
+    with ThreadPoolExecutor(max_workers=_observer_wave_max_workers(len(observer_requests))) as executor:
+        futures = [executor.submit(_process_one, request) for request in observer_requests]
+        try:
+            # Fan-in: wait for EVERY dispatched observer to reach a terminal
+            # outcome -- a failure in one future is never allowed to cancel
+            # or skip collection of the others (AC1). Iterated in REQUEST
+            # order (not completion order) so downstream ordering (duplicate
+            # detection, `bundles` list order) stays deterministic
+            # regardless of which observer actually finishes first.
+            # `_process_one` never raises for an ORDINARY per-observer
+            # failure (it always returns a tuple), so `.result()` here only
+            # ever raises for a genuine parent-interrupt-raised
+            # `RunInterrupted` (this thread was blocked waiting on a PEER
+            # worker thread's own future when the signal fired) or an
+            # equally unexpected bug.
+            outcomes = [future.result() for future in futures]
+        except BaseException:
+            # Issue #2646 P1-2 (fix_delta): a PEER worker thread's own
+            # subprocess is never this thread's to `communicate()`/`wait()`
+            # on directly, but (whether it is fully registered yet or only
+            # `_reserve_launch_slot`-reserved/mid-`Popen()`) it must be
+            # actively drained NOW, from this ORDINARY control flow (never
+            # the signal handler itself), so this `with ThreadPoolExecutor`
+            # block's own `__exit__` (`shutdown(wait=True)`) below never
+            # blocks on a peer that would otherwise run to its own
+            # unbounded natural completion.
+            terminate_all_active_child_processes()
+            raise
+
+    seen_ids: set[str] = set()
+    bundles: list[EvidenceBundle] = []
+    failures: list[tuple[AgentInvocationRequest, BaseException, str | None, int | None]] = []
+    observer_results: list[ObserverWaveObserverResult] = []
+
+    def _record_failure(
+        request: AgentInvocationRequest, exc: BaseException, reason_code: str | None, exit_code: int | None
+    ) -> None:
+        failures.append((request, exc, reason_code, exit_code))
+        observer_results.append(
+            ObserverWaveObserverResult(
+                observer_id=request.agent_name, status="failed", reason_code=reason_code, exit_code=exit_code
             )
-        if expected_ids is not None and bundle.observer_id not in expected_ids:
-            raise ObserverWaveFailed(
-                f"observer_id_not_in_manifest:{bundle.observer_id}",
-                reason_code="observer_id_not_in_manifest",
+        )
+
+    for request, bundle, exc, reason_code, exit_code in outcomes:
+        if exc is not None:
+            _record_failure(request, exc, reason_code, exit_code)
+            continue
+        assert bundle is not None
+        if request.agent_name in seen_ids:
+            dup_exc = ObserverWaveFailed(
+                f"duplicate_observer_id:{request.agent_name}", reason_code="duplicate_observer_id"
             )
-        seen_ids.add(bundle.observer_id)
+            # Issue #2646 P2 (fix_delta): `exit_code` here is the outcome
+            # tuple's own observed exit code (the process behind this
+            # bundle already completed, typically `0`) -- never discarded
+            # merely because a cross-observer duplicate check fails it.
+            _record_failure(request, dup_exc, dup_exc.reason_code, exit_code)
+            continue
+        if expected_ids is not None and request.agent_name not in expected_ids:
+            unmanifested_exc = ObserverWaveFailed(
+                f"observer_id_not_in_manifest:{request.agent_name}", reason_code="observer_id_not_in_manifest"
+            )
+            _record_failure(request, unmanifested_exc, unmanifested_exc.reason_code, exit_code)
+            continue
+        seen_ids.add(request.agent_name)
         bundles.append(bundle)
-    if expected_ids is not None and seen_ids != expected_ids:
-        raise ObserverWaveFailed(
+        # Issue #2646 P2 (fix_delta): thread the real observed
+        # `exit_code` (this outcome's own, from `_process_one`'s success
+        # return) into the success record too, instead of hardcoding
+        # `None`.
+        observer_results.append(
+            ObserverWaveObserverResult(
+                observer_id=request.agent_name, status="ok", reason_code=None, exit_code=exit_code
+            )
+        )
+
+    if not failures and expected_ids is not None and seen_ids != expected_ids:
+        incomplete_exc = ObserverWaveFailed(
             f"observer_manifest_incomplete:missing={sorted(expected_ids - seen_ids)}",
             reason_code="observer_manifest_incomplete",
         )
+        incomplete_exc.observer_results = tuple(observer_results)
+        raise incomplete_exc
+
+    if len(failures) == 1:
+        _, exc, _reason_code, _exit_code = failures[0]
+        # Issue #2646 AC5: attach the full all-terminal aggregate even for
+        # the single-failure path, which re-raises the ORIGINAL exception
+        # instance/type unchanged (e.g. `SchemaRepairExhausted`) for exact
+        # pre-#2646 `pytest.raises`/reason_code compatibility.
+        exc.observer_results = tuple(observer_results)  # type: ignore[attr-defined]
+        raise exc
+    if failures:
+        # Issue #2646 AC5: multiple simultaneous failures are never
+        # represented by only the first one encountered -- a dedicated
+        # top-level reason_code makes this case structurally
+        # distinguishable from any single known-allowlisted failure (an
+        # existing live verifier's allowlist keyed on a single granular
+        # reason_code, e.g. `observer_run_id_mismatch`, must not mistake a
+        # MIXED allowlisted+unallowlisted multi-failure wave for a
+        # known-safe single failure).
+        message = "observer_wave_multiple_failures:" + ",".join(
+            f"{request.agent_name}={reason_code or type(exc).__name__}"
+            for request, exc, reason_code, _exit_code in failures
+        )
+        aggregate_exc = ObserverWaveFailed(message, reason_code="observer_wave_multiple_failures", exit_code=None)
+        aggregate_exc.observer_results = tuple(observer_results)
+        raise aggregate_exc
+
     return bundles
 
 
@@ -1915,7 +2510,20 @@ def build_finding_sets(
     function. A discovery-role (web) finding that claims an
     ``evidence_digest`` not matching ``source_digest_registry`` raises
     ``UnboundEvidenceAuthority`` (fail-closed -- an unbound claim is rejected
-    outright rather than silently downgraded)."""
+    outright rather than silently downgraded).
+
+    Role lookup here is keyed on ``bundle.observer_id`` -- Issue #2646
+    anchor review P1 finding #1 noted this alone would trust a returned
+    payload's own (potentially swapped) identity claim. The production call
+    graph (`run_cli`'s ``bundles = run_observer_wave(...)``) closes that gap
+    UPSTREAM of this function: `run_observer_wave` only ever returns bundles
+    for which ``bundle.observer_id == request.agent_name`` (its own
+    request-side authority) already held -- an observer_id swap is rejected
+    there as an independent ``observer_id_mismatch`` terminal failure and
+    NEVER reaches this function's ``bundles`` argument. This function's own
+    precondition is therefore: every ``bundle.observer_id`` it is given is
+    already the REQUEST-side identity that launched it, not merely
+    whatever the response payload happened to claim."""
     role_by_id = {spec.observer_id: spec.role for spec in manifest}
     source_type_by_id = {spec.observer_id: spec.source_type for spec in manifest}
     finding_sets: list[FindingSet] = []
@@ -3762,6 +4370,11 @@ class RunInterrupted(BaseException):
     def __init__(self, signum: int) -> None:
         super().__init__(f"run_interrupted:signal={signum}")
         self.signum = signum
+        #: Issue #2646 AC5/AC6: additive so `main()`'s typed-failure catch
+        #: (`getattr(exc, "reason_code", type(exc).__name__)`) surfaces an
+        #: explicit, stable ``"run_interrupted"`` reason_code instead of
+        #: falling back to the class name.
+        self.reason_code = "run_interrupted"
 
 
 @contextlib.contextmanager
@@ -3774,13 +4387,42 @@ def run_scoped_temp_dir(run_id: str, *, base_dir: Path | None = None):
     Cleanup failure (``shutil.rmtree`` raising) is surfaced -- not silently
     swallowed -- so callers observe a leaked private temp directory rather
     than believing cleanup silently succeeded (Issue #2237 fix_delta gate
-    #12: ``test_temp_scope_is_on_production_path_and_cleanup_failure_surfaces``)."""
+    #12: ``test_temp_scope_is_on_production_path_and_cleanup_failure_surfaces``).
+
+    Issue #2646 P1-1/P1-2 (fix_delta): the SIGINT/SIGTERM handler installed
+    here is deliberately minimal (see `_request_interrupt`'s docstring) --
+    it never touches `_ACTIVE_CHILD_PROCESSES_LOCK` and never runs the
+    actual terminate/grace/kill/reap convergence itself. That convergence
+    (`terminate_all_active_child_processes`) instead runs in this context
+    manager's own `finally`, i.e. from ORDINARY control flow once the
+    signal-raised `RunInterrupted` has already unwound back to here -- the
+    externally-observable ordering callers rely on is unchanged (every
+    still-running child is confirmed terminated and reaped BEFORE this
+    `finally`'s own `shutil.rmtree` ever runs -- terminate -> grace -> kill
+    -> reap confirmed -> temp dir cleanup, never the reverse), but a
+    main-thread-owned child (e.g. the evaluator) is now reaped inline by its
+    OWN `_lifecycle_subprocess_run` call frame as that exception unwinds
+    through it, rather than by this handler polling a registry entry only
+    that exact call frame could ever remove (the pre-fix_delta self-wait)."""
     base = base_dir if base_dir is not None else Path(tempfile.gettempdir())
     path = base / f"agent-retrospective-run-{run_id}"
     path.mkdir(mode=0o700, parents=True, exist_ok=False)
     os.chmod(path, 0o700)  # explicit: `mkdir(mode=...)` is masked by umask
 
+    # Issue #2646 P1-2 (fix_delta): re-armed at the START of every use so a
+    # PRIOR run's interrupt/registry state (module-global, shared across
+    # runs in this same process -- e.g. across tests) can never leak into
+    # THIS run.
+    _reset_interrupt_state()
+
     def _signal_handler(signum: int, _frame: Any) -> None:
+        # Issue #2646 P1-1 (fix_delta): see `_request_interrupt`'s own
+        # docstring -- this is the ENTIRE body of work this handler is ever
+        # allowed to perform. The actual terminate -> grace -> kill -> reap
+        # convergence happens below, in this context manager's OWN
+        # `finally` (ordinary control flow, never signal-handler code),
+        # once this raise has already unwound back to it.
+        _request_interrupt(signum)
         raise RunInterrupted(signum)
 
     previous_handlers: dict[int, Any] = {}
@@ -3790,9 +4432,19 @@ def run_scoped_temp_dir(run_id: str, *, base_dir: Path | None = None):
     try:
         yield path
     finally:
-        for sig, handler in previous_handlers.items():
-            signal.signal(sig, handler)
-        shutil.rmtree(path)
+        try:
+            # Issue #2646 P1-1/P1-2 (fix_delta): the real terminate ->
+            # bounded grace -> kill -> reap CONVERGENCE (never performed by
+            # the signal handler itself) -- runs unconditionally (a cheap,
+            # idempotent no-op when nothing was ever launched) so it also
+            # covers an ordinary non-signal exception raised while a child
+            # happened to still be mid-launch.
+            terminate_all_active_child_processes()
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
+            shutil.rmtree(path)
+            _reset_interrupt_state()
 
 
 # ---------------------------------------------------------------------------
@@ -4222,7 +4874,7 @@ def run_cli(
     idempotency_key: str,
     schema_dir: Path,
     prompts: dict[str, str] | None = None,
-    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    runner: Callable[..., subprocess.CompletedProcess] = _lifecycle_subprocess_run,
     git_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     clock: Callable[[], datetime] = _utcnow,
     run_id: str | None = None,
@@ -4571,7 +5223,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             prompts=prompts,
             previous_state_provider=previous_state_provider,
         )
-    except (ObserverWaveFailed, EvaluatorInvocationFailed, WireContractError, ValueError, GhAuthUnavailable) as exc:
+    except (
+        ObserverWaveFailed,
+        EvaluatorInvocationFailed,
+        WireContractError,
+        ValueError,
+        GhAuthUnavailable,
+        # Issue #2646 AC6: `RunInterrupted` subclasses `BaseException` (NOT
+        # `Exception`, see its own docstring) specifically so it is never
+        # accidentally swallowed by an unrelated bare `except Exception`
+        # deep in this call graph -- but `main()` IS this module's outermost
+        # boundary and must still convert it into the same typed-failure
+        # JSON/exit-1 contract as every other phase failure, rather than
+        # letting a raw traceback escape the stable executable entrypoint.
+        RunInterrupted,
+    ) as exc:
         # Issue #2341 AC1: additive diagnosability -- exit_code (when the
         # underlying failure traces back to a real subprocess Agent
         # invocation, e.g. ObserverWaveFailed/EvaluatorInvocationFailed) is
@@ -4580,9 +5246,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         # back to None via getattr's default, unchanged from prior behavior.
         reason_code = getattr(exc, "reason_code", type(exc).__name__)
         exit_code = getattr(exc, "exit_code", None)
+        # Issue #2646 AC5: when the underlying failure carries the
+        # all-terminal per-observer aggregate (`run_observer_wave`'s
+        # `ObserverWaveObserverResult` tuple, attached to whichever
+        # exception it ultimately raised -- see `run_observer_wave`'s
+        # docstring), surface it as an ADDITIVE field on the failure JSON
+        # (never replacing/removing any existing field) so a caller can
+        # always recover every dispatched observer's own status/
+        # reason_code/exit_code, not just the single top-level reason_code.
+        observer_results = getattr(exc, "observer_results", None)
+        payload: dict[str, Any] = {
+            "status": "failed",
+            "reason_code": reason_code,
+            "exit_code": exit_code,
+            "reason": str(exc),
+        }
+        if observer_results:
+            payload["observer_results"] = [dataclasses.asdict(r) for r in observer_results]
         print(
             json.dumps(
-                {"status": "failed", "reason_code": reason_code, "exit_code": exit_code, "reason": str(exc)},
+                payload,
                 sort_keys=True,
             )
         )
