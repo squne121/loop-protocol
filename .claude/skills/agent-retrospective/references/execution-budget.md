@@ -9,16 +9,23 @@ api_error_with_partial_text: reject_as_evidence
 timeout_status: typed operational failure
 interruption_status: aborted
 cleanup_required: true
+observer_wave_concurrency_model: fan_out_fan_in_all_terminal
 ```
 
-- `observer_parallelism: 3` -- root Skill が同時起動してよい observer 数の上限（`run_retrospective.py`
-  自体は sequential reference 実装であり、実際の並列起動は root Skill の `Agent` tool 呼び出し側の責務）
+- `observer_parallelism: 3` -- 同時に起動しうる observer 数の上限（`EXPECTED_OBSERVER_MANIFEST` の固定
+  3 件と一致）。Issue #2646 以降、`run_retrospective.py` の `run_observer_wave()` 自体が required
+  observer 全件を fan-out（互いの completion を待たずに `ThreadPoolExecutor` へ同時 submit）し、全件が
+  terminal になるまで fan-in（all-terminal barrier）する実装であり、「Python 側は sequential 参照実装で
+  実際の並列起動は root Skill 側の責務」という記述はもはや正しくない（旧記述はこの節の下で置き換え済み）
 - `schema_repair_retries: 1` -- `parse_agent_output_with_repair` の `max_retries` 既定値。超過すると
   `SchemaRepairExhausted` を送出し、evaluator は起動しない
 - `evaluator_retries: 0` -- evaluator 呼び出しは再試行しない（`run_evaluation` は 1 回のみ `invoke_evaluator`
   を呼ぶ）
 - `partial_agent_output: reject` -- 一部の observer が成功しても、全 observer 成功前は evaluator を
-  起動しない（`run_observer_wave` は最初の失敗で `ObserverWaveFailed` を送出し即座に停止する）
+  起動しない。`run_observer_wave()` は required observer 全件を fan-out/fan-in（all-terminal）で回収した
+  上で、1 件でも失敗があれば evaluator を起動せず fail-closed で終了する（1 件失敗時は既存の granular
+  `reason_code` を維持した単一の例外を、2 件以上同時失敗時は `reason_code: observer_wave_multiple_failures`
+  を持つ集約例外を送出する -- 単一の「最初の失敗理由」で他の失敗を隠さない）
 - `api_error_with_partial_text: reject_as_evidence` -- `invoke_agent` は `is_error` を含む応答を
   `partial_result` として扱い、`run_observer_wave`/`run_evaluation` は non-`ok` status を常に失敗として
   扱う（`api_error_with_partial_text` の内容が finding evidence として採用されることはない）
@@ -26,7 +33,30 @@ cleanup_required: true
   はいずれも typed operational failure として扱われ、プログラマバグ（`KeyError`/`AssertionError` 等）と
   混同されない（`collect_snapshot.py` の既存規約と同じ方針）
 - `cleanup_required: true` -- `run_scoped_temp_dir` が success/exception/SIGINT/SIGTERM の全経路で
-  private temp artifact ディレクトリ（mode `0700`）を削除する
+  private temp artifact ディレクトリ（mode `0700`）を削除する。Issue #2646 以降、cleanup
+  （`shutil.rmtree`）の前に、起動済みの全 observer 子プロセスへ終了要求を出し（`terminate()`）、有限の
+  猶予後に必要なら `kill()` へ escalate し、全ての子プロセスが実際に reap されたことを確認する。外部
+  から観測される順序は常に「終了要求 → 猶予 → (必要なら) kill → reap 確認 → 例外伝播 → temp dir
+  cleanup」であり、逆順にはならない。ただし PR #2650 fix_delta（P1-1/P1-2）以降、この収束処理
+  （``terminate_all_active_child_processes()``）自体は SIGINT/SIGTERM の生の Python シグナルハンドラの
+  中では実行しない -- ハンドラは「中断要求の記録（`_request_interrupt()`）＋即時 raise」のみに限定され、
+  `_ACTIVE_CHILD_PROCESSES_LOCK` の取得やブロッキング待機を一切行わない。実際の収束処理は
+  `run_scoped_temp_dir()` 自身の `finally`（通常の制御フロー、シグナルハンドラではない）で、raise された
+  `RunInterrupted` がそこまで unwind してきた後に実行する。これは evaluator のように main thread が
+  自身の子プロセスを同期呼び出し中（`_lifecycle_subprocess_run()`）に割り込まれるケースで、シグナル
+  ハンドラが「自分自身が所有する子プロセスの reap 完了」を待とうとして自己待機する構造的欠陥（および
+  同一 Lock の再取得によるデッドロック）を防ぐ。main thread 自身が所有する子プロセスは、その
+  `_lifecycle_subprocess_run()` 自身の `finally` で inline に reap される（signal handler や別スレッドの
+  reap 完了に依存しない）。また `Popen()` 完了から registry 登録（`_promote_launch_to_active()`）までの
+  間に親 interrupt が競合しても、その launch は `_reserve_launch_slot()`/`_LAUNCHES_IN_FLIGHT` により
+  収束対象から漏れない（一度の registry snapshot だけで収束済みと判定しない）
+- `observer_wave_concurrency_model: fan_out_fan_in_all_terminal` -- `run_observer_wave()` は required
+  observer 全件を、先に dispatch した observer の completion を待たずに同時 dispatch（fan-out）し、
+  全件が terminal になるまで待つ（fan-in）。1 件の通常失敗（malformed/schema 不一致/nonzero exit 等）は
+  他 observer の dispatch/completion を止めない。observer 自身の timeout はその observer の実
+  subprocess を terminate → 有限猶予 → 必要なら kill → reap してから terminal record を確定し、他
+  observer は継続する（`_terminate_and_reap_process()`）。evaluator は、required observer 全件が
+  terminal かつ全件 successful + schema-valid のときにのみ、fan-in 完了後に正確に 1 回だけ起動される
 
 `.claude/agents/retrospective-runtime-observer.md` / `.claude/agents/retrospective-evaluator.md` の
 frontmatter に固定された具体値:
