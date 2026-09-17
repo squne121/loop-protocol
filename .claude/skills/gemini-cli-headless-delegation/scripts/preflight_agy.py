@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -2890,6 +2891,68 @@ def runtime_verification_account_session_env() -> dict[str, str]:
     return env
 
 
+def _process_group_has_live_member(pgid: int) -> bool:
+    """Return True iff process group *pgid* still has at least one member
+    process (Issue #2616 P2-1).
+
+    Uses `os.killpg(pgid, 0)` -- signal 0 is a no-op existence probe (POSIX
+    `kill(2)`); it never actually signals anything. `ProcessLookupError`
+    (`ESRCH`) means the process group no longer contains any process. This
+    is the only way to detect a *descendant* the runner's own leader-process
+    `communicate()` cannot see -- e.g. a grandchild that does not hold the
+    leader's stdout/stderr pipe open (so `communicate()` returns as soon as
+    the leader itself exits) but remains alive in the same process group
+    after ignoring SIGTERM.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A member process still exists but this process lacks permission
+        # to signal it -- should not happen for a runner-owned child group,
+        # but fail-closed: treat as still alive rather than silently
+        # assuming cleanup succeeded.
+        return True
+    return True
+
+
+def _await_process_group_empty(pgid: int, *, timeout_seconds: float, poll_interval_seconds: float = 0.05) -> bool:
+    """Poll (bounded by *timeout_seconds*) until process group *pgid* has no
+    remaining member process. Returns True iff the group was confirmed empty
+    before the deadline (Issue #2616 P2-1)."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if not _process_group_has_live_member(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval_seconds)
+
+
+def _finalize_process_group_cleanup(pgid: int) -> bool:
+    """Confirm process group *pgid* is actually empty, escalating to SIGKILL
+    against the whole group (not just the leader) if a member is still
+    found (Issue #2616 P2-1).
+
+    The leader process's own `communicate()` completing (pipe EOF once the
+    leader exits) only proves the LEADER exited -- it does NOT prove no
+    other process remains in the same process group. A descendant that
+    ignores SIGTERM and does not hold the leader's stdout/stderr pipe open
+    would otherwise silently survive as an orphan even though the runner
+    reports `cleanup_ok: True`. This is the only check that inspects the
+    process group itself rather than the leader's own wait/communicate()
+    result.
+    """
+    if _await_process_group_empty(pgid, timeout_seconds=RUNTIME_VERIFICATION_TERM_GRACE_SECONDS):
+        return True
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    return _await_process_group_empty(pgid, timeout_seconds=RUNTIME_VERIFICATION_TERM_GRACE_SECONDS)
+
+
 def run_runtime_verification_process_group(
     argv: "list[str]", *, env: dict[str, str], cwd: Path
 ) -> dict[str, Any]:
@@ -2897,11 +2960,18 @@ def run_runtime_verification_process_group(
     `RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS` deadline (Issue #2616 AC2).
 
     On deadline expiry: SIGTERM the process group, wait up to
-    `RUNTIME_VERIFICATION_TERM_GRACE_SECONDS`, then SIGKILL and reap. Never
-    leaves an orphaned child. Returns a dict describing
-    exit_code/stdout/stderr/timed_out/cleanup_ok; raw stdout/stderr are
-    returned only for immediate in-memory ephemeral classification by the
-    caller -- callers MUST NOT persist them verbatim to any artifact/log.
+    `RUNTIME_VERIFICATION_TERM_GRACE_SECONDS`, then SIGKILL and reap. Before
+    returning in every path (including a clean, non-timed-out leader exit),
+    `_finalize_process_group_cleanup()` additionally confirms the whole
+    process group -- not just the leader `communicate()` waited on -- is
+    actually empty, escalating to a group-wide SIGKILL if a descendant is
+    still alive (Issue #2616 P2-1: a leader that exits cleanly, closing the
+    runner's stdout/stderr pipe, does not by itself prove no descendant
+    survived). Never leaves an orphaned child when cleanup succeeds. Returns
+    a dict describing exit_code/stdout/stderr/timed_out/cleanup_ok; raw
+    stdout/stderr are returned only for immediate in-memory ephemeral
+    classification by the caller -- callers MUST NOT persist them verbatim
+    to any artifact/log.
     """
     result: dict[str, Any] = {
         "exit_code": None,
@@ -2928,6 +2998,7 @@ def run_runtime_verification_process_group(
         result["exit_code"] = proc.returncode
         result["stdout"] = stdout or ""
         result["stderr"] = stderr or ""
+        result["cleanup_ok"] = _finalize_process_group_cleanup(proc.pid)
         return result
     except subprocess.TimeoutExpired:
         result["timed_out"] = True
@@ -2951,7 +3022,25 @@ def run_runtime_verification_process_group(
         except subprocess.TimeoutExpired:
             result["cleanup_ok"] = False
     result["exit_code"] = proc.returncode
+    if result["cleanup_ok"]:
+        result["cleanup_ok"] = _finalize_process_group_cleanup(proc.pid)
     return result
+
+
+def _stage2_terminal_structured_error_text(terminal_payload: Any) -> str:
+    """Extract only the parsed terminal `result` object's own `error`/
+    `message` string fields (Issue #2616 P2-2). Never reads free-text
+    `response`/step content -- a genuine successful stream's model-generated
+    text is not an eligible auth-signal source (see
+    `classify_runtime_verification_primary_execution()`)."""
+    if not isinstance(terminal_payload, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("error", "message"):
+        value = terminal_payload.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    return "\n".join(parts)
 
 
 def classify_runtime_verification_primary_execution(execution: dict[str, Any]) -> dict[str, Any]:
@@ -2967,37 +3056,78 @@ def classify_runtime_verification_primary_execution(execution: dict[str, Any]) -
     Classifies from this ONE execution only; callers must never issue a
     second diagnostic-classification-only call after a non-success verdict
     here (Owner Decision, Issue #2616 AC2).
+
+    Issue #2616 P2-2 fix_delta: auth-signal detection is scoped to CLI
+    diagnostics (stderr) and, once a terminal has actually been parsed, the
+    parsed non-success terminal's own structured `error`/`message` fields
+    ONLY -- it is NEVER applied to a genuine successful terminal's
+    `response` text or to any pre-terminal `step_update` free text, so a
+    model producing an answer that happens to mention authentication (e.g.
+    "No authentication required to answer this prompt.") can never be
+    misclassified as SKIP/FAIL.
     """
     if not execution.get("cleanup_ok", True):
         return {"verdict": "FAIL", "reason_code": "cleanup_failure"}
-    combined = f"{execution.get('stdout') or ''}\n{execution.get('stderr') or ''}"
+    stderr_text = execution.get("stderr") or ""
+
     if execution.get("timed_out"):
-        if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(combined):
+        # No terminal was ever parsed in this branch -- the only eligible
+        # auth-signal evidence is CLI-diagnostics stderr, never the
+        # (possibly partial) stdout.
+        if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(stderr_text):
             return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
         return {"verdict": "FAIL", "reason_code": "primary_execution_timeout"}
+
     if execution.get("exit_code") is None:
         return {"verdict": "FAIL", "reason_code": "agy_not_found"}
-    if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(combined):
-        return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
-    auth_signal = _classify_auth_signal(combined)
-    if auth_signal:
-        return {"verdict": "FAIL", "reason_code": f"auth_or_provider_signal:{auth_signal}"}
+
     if execution.get("exit_code") != 0:
+        # A nonzero exit never carries a genuine successful stream in this
+        # branch -- but auth-signal detection is still scoped to stderr
+        # diagnostics only, never a raw stdout free-text scan.
+        if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(stderr_text):
+            return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+        auth_signal = _classify_auth_signal(stderr_text)
+        if auth_signal:
+            return {"verdict": "FAIL", "reason_code": f"auth_or_provider_signal:{auth_signal}"}
         return {"verdict": "FAIL", "reason_code": "agy_exit_nonzero"}
+
     parser_verdict = parse_agy_stream_json_stream(execution.get("stdout") or "")
     if parser_verdict.get("status") != "valid":
+        if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(stderr_text):
+            return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+        auth_signal = _classify_auth_signal(stderr_text)
+        if auth_signal:
+            return {"verdict": "FAIL", "reason_code": f"auth_or_provider_signal:{auth_signal}"}
         return {
             "verdict": "FAIL",
             "reason_code": f"stream_json_invalid:{parser_verdict.get('reason_code')}",
         }
+
     terminal_event = parser_verdict.get("terminal_result")
     terminal_payload = terminal_event.get("result") if isinstance(terminal_event, dict) else None
     status = terminal_payload.get("status") if isinstance(terminal_payload, dict) else None
+    has_structured_error = isinstance(terminal_payload, dict) and terminal_payload.get("error") not in (None, "")
+
+    if status == _STREAM_JSON_TERMINAL_SUCCESS_STATUS and not has_structured_error:
+        # Genuine successful terminal: its `response` text (and any
+        # pre-terminal step free text) is NEVER treated as auth-signal
+        # evidence (Issue #2616 P2-2).
+        return {"verdict": "PASS", "reason_code": "primary_execution_valid_success_terminal"}
+
+    # Non-success terminal, or a SUCCESS terminal unexpectedly carrying a
+    # structured error: the only eligible auth-signal evidence here is
+    # CLI-diagnostics stderr plus the parsed terminal's own structured
+    # error/message fields -- never the terminal's free-text `response`.
+    candidate_text = f"{stderr_text}\n{_stage2_terminal_structured_error_text(terminal_payload)}"
+    if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(candidate_text):
+        return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+    auth_signal = _classify_auth_signal(candidate_text)
+    if auth_signal:
+        return {"verdict": "FAIL", "reason_code": f"auth_or_provider_signal:{auth_signal}"}
     if status != _STREAM_JSON_TERMINAL_SUCCESS_STATUS:
         return {"verdict": "FAIL", "reason_code": f"non_success_terminal:{status}"}
-    if isinstance(terminal_payload, dict) and terminal_payload.get("error") not in (None, ""):
-        return {"verdict": "FAIL", "reason_code": "structured_error_present"}
-    return {"verdict": "PASS", "reason_code": "primary_execution_valid_success_terminal"}
+    return {"verdict": "FAIL", "reason_code": "structured_error_present"}
 
 
 def classify_runtime_verification_flag_acceptance_execution(execution: dict[str, Any]) -> dict[str, Any]:
@@ -3006,34 +3136,94 @@ def classify_runtime_verification_flag_acceptance_execution(execution: dict[str,
 
     `--print-timeout 15m` is never actually waited out -- this repository's
     own `RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS` (300s) always fires
-    first if the model call itself is slow. This function therefore only
-    confirms the flag was *accepted* (the process started and did not
-    immediately reject it as an unrecognized option); it does NOT require
-    the call to reach a terminal result. Only called when the primary
-    stream-json execution has already independently reached PASS -- a
-    non-PASS primary result is classified from that primary execution alone
-    without spending this second call (see
+    first if the model call itself is slow. This function confirms the flag
+    was *accepted* (the process started and did not immediately reject it as
+    an unrecognized option) -- it does NOT require the call to reach a
+    terminal result, but it also never conflates "the outer deadline fired"
+    with "the invocation genuinely succeeded"; a bounded timeout is only
+    ever flag-*surface* acceptance evidence, never runtime-execution-success
+    evidence, and every other observable failure signal (cleanup failure,
+    a rejected flag, POSIX signal termination, a nonzero exit, or a
+    malformed/non-`SUCCESS`/errored structured result) fails closed rather
+    than being silently promoted to PASS (Issue #2616 fix_delta P1-2). Only
+    called when the primary stream-json execution has already independently
+    reached PASS -- a non-PASS primary result is classified from that
+    primary execution alone without spending this second call (see
     `classify_runtime_verification_primary_execution()`).
     """
-    if execution.get("exit_code") is None and not execution.get("timed_out"):
-        return {"verdict": "FAIL", "reason_code": "agy_not_found"}
-    combined = f"{execution.get('stdout') or ''}\n{execution.get('stderr') or ''}"
+    if not execution.get("cleanup_ok", True):
+        # Issue #2616 P1-2: cleanup failure overrides every other
+        # provisional signal, including a timed-out flag-acceptance probe
+        # that would otherwise be classified PASS below.
+        return {"verdict": "FAIL", "reason_code": "cleanup_failure"}
+
+    stderr_text = execution.get("stderr") or ""
+
     if execution.get("timed_out"):
-        if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(combined):
+        if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(stderr_text):
             return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+        if _UNRECOGNIZED_OPTION_RE.search(stderr_text):
+            # Issue #2616 P1-2: flag rejection evidence, when actually
+            # observed, is checked BEFORE the outer-deadline-timeout
+            # shortcut below -- a timeout alone is never sufficient to
+            # infer the flag was accepted if rejection text is present.
+            return {"verdict": "FAIL", "reason_code": "print_timeout_flag_rejected"}
         # Issue #2616 AC2: a bounded outer-deadline timeout on this
-        # flag-acceptance-only probe is never itself proof of flag
-        # rejection; the flag surface was reachable enough to start a real
-        # invocation and this repository's own deadline -- not AGY's own
-        # `--print-timeout` semantics -- is what ended it.
+        # flag-acceptance-only probe, with no flag-rejection evidence
+        # observed, is treated as flag surface acceptance only -- this
+        # repository's own deadline (not AGY's own `--print-timeout`
+        # semantics) is what ended it.
         return {"verdict": "PASS", "reason_code": "print_timeout_flag_accepted_outer_deadline_reached"}
-    if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(combined):
+
+    if execution.get("exit_code") is None:
+        return {"verdict": "FAIL", "reason_code": "agy_not_found"}
+
+    if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(stderr_text):
         return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
-    auth_signal = _classify_auth_signal(combined)
+    auth_signal = _classify_auth_signal(stderr_text)
     if auth_signal:
         return {"verdict": "FAIL", "reason_code": f"auth_or_provider_signal:{auth_signal}"}
-    if _UNRECOGNIZED_OPTION_RE.search(combined):
+    if _UNRECOGNIZED_OPTION_RE.search(stderr_text):
         return {"verdict": "FAIL", "reason_code": "print_timeout_flag_rejected"}
+
+    # Issue #2616 P1-2: flag *acceptance* (the process started and did not
+    # reject the flag) is a distinct concept from runtime *execution*
+    # success -- a non-timeout exit is still only ever classified from its
+    # own actual exit/structured-output evidence, never assumed successful
+    # merely because no rejection text was seen.
+    if execution.get("exit_code") < 0:
+        # A negative return code is POSIX signal-termination evidence
+        # (Python's subprocess reports it as `-signum`) -- never a clean
+        # flag-acceptance outcome.
+        return {
+            "verdict": "FAIL",
+            "reason_code": f"print_timeout_probe_signal_terminated:{-execution['exit_code']}",
+        }
+    if execution.get("exit_code") != 0:
+        return {"verdict": "FAIL", "reason_code": "print_timeout_probe_nonzero_exit"}
+
+    stdout_text = execution.get("stdout") or ""
+    if not stdout_text.strip():
+        # A clean exit 0 with no output at all is still flag-surface
+        # acceptance evidence only (no JSON to validate); Issue #2616's
+        # flag-acceptance contract does not require a terminal result here.
+        return {"verdict": "PASS", "reason_code": "print_timeout_flag_accepted"}
+
+    try:
+        parsed_json = json.loads(stdout_text)
+    except json.JSONDecodeError:
+        return {"verdict": "FAIL", "reason_code": "print_timeout_probe_malformed_json"}
+    if not isinstance(parsed_json, dict):
+        return {"verdict": "FAIL", "reason_code": "print_timeout_probe_malformed_json"}
+    json_status = parsed_json.get("status")
+    if json_status != _STREAM_JSON_TERMINAL_SUCCESS_STATUS:
+        return {
+            "verdict": "FAIL",
+            "reason_code": f"print_timeout_probe_non_success_status:{json_status}",
+        }
+    json_error = parsed_json.get("error")
+    if json_error not in (None, ""):
+        return {"verdict": "FAIL", "reason_code": "print_timeout_probe_structured_error"}
     return {"verdict": "PASS", "reason_code": "print_timeout_flag_accepted"}
 
 

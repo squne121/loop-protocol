@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -1778,3 +1781,243 @@ def test_classify_runtime_verification_flag_acceptance_genuine_auth_required_is_
     }
     verdict = module.classify_runtime_verification_flag_acceptance_execution(execution)
     assert verdict == {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+
+
+# ---------------------------------------------------------------------------
+# Issue #2616 fix_delta P1-2: the secondary `--print-timeout` flag-acceptance
+# probe must fail closed on every observed anomaly rather than promoting it
+# to PASS. Parameterized on the exact reproduction cases from the PR #2653
+# review (https://github.com/squne121/loop-protocol/pull/2653#issuecomment-5712360624).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("execution", "expected_reason_code"),
+    [
+        pytest.param(
+            {"exit_code": None, "stdout": "", "stderr": "", "timed_out": True, "cleanup_ok": False},
+            "cleanup_failure",
+            id="timed_out_cleanup_failure_overrides_pass",
+        ),
+        pytest.param(
+            {
+                "exit_code": 2,
+                "stdout": "",
+                "stderr": "Error: unrecognized option '--print-timeout'",
+                "timed_out": True,
+            },
+            "print_timeout_flag_rejected",
+            id="unknown_flag_then_timeout_is_still_rejected",
+        ),
+        pytest.param(
+            {"exit_code": -11, "stdout": "", "stderr": "", "timed_out": False},
+            "print_timeout_probe_signal_terminated:11",
+            id="negative_exit_code_is_signal_terminated",
+        ),
+        pytest.param(
+            {"exit_code": 0, "stdout": "not json", "stderr": "", "timed_out": False},
+            "print_timeout_probe_malformed_json",
+            id="exit_zero_non_json_stdout_is_malformed",
+        ),
+        pytest.param(
+            {
+                "exit_code": 0,
+                "stdout": '{"status":"ERROR","error":"boom"}',
+                "stderr": "",
+                "timed_out": False,
+            },
+            "print_timeout_probe_non_success_status:ERROR",
+            id="exit_zero_structured_error_status_is_fail",
+        ),
+    ],
+)
+def test_classify_runtime_verification_flag_acceptance_fails_closed_on_reviewer_reproduction_cases(
+    execution, expected_reason_code
+):
+    module = load_module()
+    verdict = module.classify_runtime_verification_flag_acceptance_execution(execution)
+    assert verdict["verdict"] == "FAIL"
+    assert verdict["reason_code"] == expected_reason_code
+
+
+def test_classify_runtime_verification_flag_acceptance_success_json_status_is_pass():
+    """Non-regression: a genuinely valid `SUCCESS` JSON terminal (exit 0,
+    well-formed JSON, `status: "SUCCESS"`, no `error`) is still accepted as
+    flag-acceptance PASS evidence (Issue #2616 fix_delta P1-2 must not
+    over-correct into rejecting the real success shape)."""
+    module = load_module()
+    execution = {
+        "exit_code": 0,
+        "stdout": '{"status":"SUCCESS","response":"LOOP_AGY_STAGE2_RUNTIME_OK"}',
+        "stderr": "",
+        "timed_out": False,
+    }
+    verdict = module.classify_runtime_verification_flag_acceptance_execution(execution)
+    assert verdict == {"verdict": "PASS", "reason_code": "print_timeout_flag_accepted"}
+
+
+# ---------------------------------------------------------------------------
+# Issue #2616 fix_delta P2-2: auth-signal classification authority must be
+# scoped to CLI-diagnostics stderr and parsed non-success terminal
+# error/message fields ONLY -- never a genuine successful terminal's
+# `response` text or pre-terminal step free text.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_runtime_verification_primary_execution_success_response_mentioning_auth_stays_pass():
+    """Case A: a SUCCESS stream whose model-generated `response` text
+    happens to contain an auth-related phrase (e.g. "No authentication
+    required to answer this prompt.") must still classify PASS -- free-text
+    success content is never eligible auth-signal evidence."""
+    module = load_module()
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "init": {}}),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "status": "SUCCESS",
+                        "response": "No authentication required to answer this prompt. The answer is 42.",
+                    },
+                }
+            ),
+        ]
+    )
+    execution = {"exit_code": 0, "stdout": stdout, "stderr": "", "timed_out": False}
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "PASS", "reason_code": "primary_execution_valid_success_terminal"}
+
+
+def test_classify_runtime_verification_primary_execution_success_stream_step_text_mentioning_auth_stays_pass():
+    """Case A variant: the same non-eligibility applies to a pre-terminal
+    `step_update`'s free text, not just the terminal `response`."""
+    module = load_module()
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "init": {}}),
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "step_type": "agent_response",
+                        "state": "DONE",
+                        "text": "No authentication required to answer this prompt.",
+                    },
+                }
+            ),
+            json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "42"}}),
+        ]
+    )
+    execution = {"exit_code": 0, "stdout": stdout, "stderr": "", "timed_out": False}
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "PASS", "reason_code": "primary_execution_valid_success_terminal"}
+
+
+def test_classify_runtime_verification_primary_execution_genuine_stderr_auth_failure_stays_skip():
+    """Case B: a genuine CLI authentication failure surfaced on stderr (CLI
+    diagnostics) must still classify SKIP -- this is the case P2-2's
+    narrowing must not regress."""
+    module = load_module()
+    execution = {
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": "Error: authentication required",
+        "timed_out": False,
+    }
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+
+
+def test_classify_runtime_verification_primary_execution_genuine_terminal_error_field_auth_failure_stays_skip():
+    """Case B variant: a genuine authentication failure surfaced in the
+    parsed non-success terminal's own structured `error` field (not free
+    response/step text) must still classify SKIP."""
+    module = load_module()
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "init": {}}),
+            json.dumps(
+                {"event": "result", "result": {"status": "ERROR", "error": "authentication required"}}
+            ),
+        ]
+    )
+    execution = {"exit_code": 0, "stdout": stdout, "stderr": "", "timed_out": False}
+    verdict = module.classify_runtime_verification_primary_execution(execution)
+    assert verdict == {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+
+
+# ---------------------------------------------------------------------------
+# Issue #2616 fix_delta P2-1: `run_runtime_verification_process_group()`
+# must detect and reap a descendant that survives the leader process's own
+# exit/communicate() (e.g. a grandchild that ignores SIGTERM and does not
+# hold the leader's stdout/stderr pipe open).
+# ---------------------------------------------------------------------------
+
+
+def test_run_runtime_verification_process_group_reaps_surviving_grandchild_after_leader_exits(
+    tmp_path, monkeypatch
+):
+    """A grandchild that ignores SIGTERM and does not hold the runner's own
+    stdout/stderr pipe open (so the leader's own `communicate()` returns
+    promptly once the leader itself dies from the group-wide SIGTERM) must
+    still be detected and killed -- the leader's own `communicate()`
+    completing is NOT sufficient proof the whole process group is empty
+    (Issue #2616 P2-1)."""
+    module = load_module()
+    monkeypatch.setattr(module, "RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS", 0.3)
+    monkeypatch.setattr(module, "RUNTIME_VERIFICATION_TERM_GRACE_SECONDS", 2)
+
+    pid_file = tmp_path / "grandchild.pid"
+    parent_script = (
+        "import subprocess, sys, time\n"
+        "gc = subprocess.Popen(\n"
+        "    [sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'],\n"
+        "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        f"open(r'{pid_file}', 'w').write(str(gc.pid))\n"
+        "time.sleep(60)\n"
+    )
+
+    grandchild_pid = None
+    try:
+        result = module.run_runtime_verification_process_group(
+            ["/usr/bin/env", "python3", "-c", parent_script],
+            env=module._minimal_agy_env(),
+            cwd=Path(str(tmp_path)),
+        )
+
+        assert result["timed_out"] is True
+        assert result["cleanup_ok"] is True
+
+        deadline = time.monotonic() + 5
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert pid_file.exists(), "grandchild never wrote its pid file"
+        grandchild_pid = int(pid_file.read_text().strip())
+
+        with pytest.raises(ProcessLookupError):
+            os.kill(grandchild_pid, 0)
+    finally:
+        if grandchild_pid is not None:
+            try:
+                os.kill(grandchild_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+
+def test_run_runtime_verification_process_group_clean_exit_still_confirms_group_empty(monkeypatch):
+    """Non-regression: the common case (leader exits cleanly, no
+    descendants) must still report `cleanup_ok: True` promptly -- the new
+    P2-1 group-empty confirmation must not introduce a false negative."""
+    module = load_module()
+    result = module.run_runtime_verification_process_group(
+        ["/usr/bin/env", "python3", "-c", "print('hello')"],
+        env=module._minimal_agy_env(),
+        cwd=Path("/tmp"),
+    )
+    assert result["timed_out"] is False
+    assert result["cleanup_ok"] is True
+    assert result["exit_code"] == 0
+    assert "hello" in result["stdout"]
