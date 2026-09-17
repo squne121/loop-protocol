@@ -612,6 +612,62 @@ def test_aggregate_failure_position_rotated_across_observers(failing_observer: s
 # ---------------------------------------------------------------------------
 
 
+def _wait_for_ready_pid(pidfile: Path, *, timeout_sec: float = 5.0) -> int:
+    """CI flake fix_delta (observed on ``python-test-core``, same xdist
+    worker, as ``ValueError: invalid literal for int() with base 10: ''``):
+    every AC6 child script below writes its own pid via the NON-ATOMIC
+    ``open(pidfile, "w").write(str(os.getpid()))`` -- ``open(..., "w")``
+    already creates a zero-byte file (so a bare ``pidfile.exists()`` poll
+    can observe ``True``) BEFORE the subsequent ``.write()`` call has
+    actually landed any content. A poll that trusts ``.exists()`` alone as
+    the ready condition can therefore read back an EMPTY string and blow up
+    on ``int("")`` instead of genuinely never observing the child in time.
+    This bounded poll instead treats "ready" as: the file exists AND its
+    content is non-empty AND that content parses as an int -- never
+    ``.exists()`` alone."""
+    deadline = time.monotonic() + timeout_sec
+    last_error: ValueError | None = None
+    while time.monotonic() < deadline:
+        if pidfile.exists():
+            content = pidfile.read_text().strip()
+            if content:
+                try:
+                    return int(content)
+                except ValueError as exc:
+                    last_error = exc
+        time.sleep(0.01)
+    if last_error is not None:
+        raise AssertionError(
+            f"child pid file {pidfile} never contained a parseable pid in time (last read: invalid)"
+        ) from last_error
+    raise AssertionError(f"child pid file {pidfile} never appeared in time")
+
+
+@pytest.fixture(autouse=True)
+def _reap_leaked_ac6_child_processes_after_test():
+    """CI flake fix_delta: when an AC6 test's OWN assertion fails partway
+    through (e.g. the ``_wait_for_ready_pid`` race this fixture's sibling
+    helper above fixes), the test aborts BEFORE its own
+    ``run_scoped_temp_dir``/``terminate_all_active_child_processes`` cleanup
+    ever runs, leaving a REAL, still-alive (possibly SIGTERM-ignoring) child
+    subprocess registered in the production
+    ``rr._ACTIVE_CHILD_PROCESSES``/``rr._LAUNCHES_IN_FLIGHT`` module-global
+    registries. On the SAME xdist worker, the NEXT AC6 test's own
+    ``assert not rr._ACTIVE_CHILD_PROCESSES`` then observes this leaked
+    entry from a PRIOR, unrelated test and fails for a reason that has
+    nothing to do with its own behaviour under test. This autouse,
+    function-scoped, module-local fixture (deliberately never touching any
+    test's own assertions) calls the exact production reap primitive
+    (``terminate_all_active_child_processes`` -- the same tool every AC6
+    test itself already relies on for this precise job) after EVERY test in
+    this file, so a leaked child/registry entry can never survive into the
+    next test regardless of how the current one ended."""
+    yield
+    if rr._ACTIVE_CHILD_PROCESSES or rr._LAUNCHES_IN_FLIGHT:
+        rr.terminate_all_active_child_processes(grace_sec=0.0, reap_timeout_sec=5.0)
+    rr._reset_interrupt_state()
+
+
 def test_cancel_vs_terminal_collection(tmp_path: Path) -> None:
     """A normal (non-timeout) failure in one observer's REAL subprocess
     must never cancel/kill a PEER observer's own REAL subprocess -- the
@@ -677,11 +733,7 @@ def test_observer_timeout_terminates_and_reaps_subprocess(tmp_path: Path, monkey
     assert elapsed < 5.0  # never waited out the child's own 30s sleep
     assert not rr._ACTIVE_CHILD_PROCESSES  # unregistered -> reaped by the owning call itself
 
-    deadline = time.monotonic() + 5.0
-    while not pidfile.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert pidfile.exists(), "child never started in time"
-    child_pid = int(pidfile.read_text())
+    child_pid = _wait_for_ready_pid(pidfile)
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)
 
@@ -733,11 +785,7 @@ def test_observer_timeout_terminates_and_reaps_subprocess_that_ignores_sigterm(
     assert elapsed >= grace_sec * 0.8
     assert not rr._ACTIVE_CHILD_PROCESSES  # unregistered -> reaped by the owning call itself
 
-    deadline = time.monotonic() + 5.0
-    while not pidfile.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert pidfile.exists(), "child never started in time"
-    child_pid = int(pidfile.read_text())
+    child_pid = _wait_for_ready_pid(pidfile)
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)
 
@@ -774,11 +822,7 @@ def test_parent_sigterm_terminates_all_children_before_cleanup(tmp_path: Path, m
     while not rr._ACTIVE_CHILD_PROCESSES and time.monotonic() < deadline:
         time.sleep(0.01)
     assert rr._ACTIVE_CHILD_PROCESSES, "child never registered in time"
-    deadline = time.monotonic() + 5.0
-    while not pidfile.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert pidfile.exists(), "child never started in time"
-    child_pid = int(pidfile.read_text())
+    child_pid = _wait_for_ready_pid(pidfile)
     assert os.kill(child_pid, 0) is None  # still alive at this point
 
     scope_dir = tmp_path / "scope"
@@ -847,11 +891,7 @@ def test_parent_sigterm_terminates_all_children_before_cleanup_when_child_ignore
     while not rr._ACTIVE_CHILD_PROCESSES and time.monotonic() < deadline:
         time.sleep(0.01)
     assert rr._ACTIVE_CHILD_PROCESSES, "child never registered in time"
-    deadline = time.monotonic() + 5.0
-    while not pidfile.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert pidfile.exists(), "child never started in time"
-    child_pid = int(pidfile.read_text())
+    child_pid = _wait_for_ready_pid(pidfile)
     assert os.kill(child_pid, 0) is None  # still alive at this point
 
     scope_dir = tmp_path / "scope"
@@ -894,10 +934,7 @@ def test_sigterm_vs_observer_timeout_lifecycle_ordering(tmp_path: Path, monkeypa
             [sys.executable, "-c", script_a], cwd=str(tmp_path), env=dict(os.environ),
             input=None, capture_output=True, text=True, timeout=0.2,
         )
-    deadline = time.monotonic() + 5.0
-    while not pidfile_a.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    pid_a = int(pidfile_a.read_text())
+    pid_a = _wait_for_ready_pid(pidfile_a)
     with pytest.raises(ProcessLookupError):
         os.kill(pid_a, 0)
     assert not rr._ACTIVE_CHILD_PROCESSES
@@ -923,11 +960,7 @@ def test_sigterm_vs_observer_timeout_lifecycle_ordering(tmp_path: Path, monkeypa
 
     worker = threading.Thread(target=_run_child_b, daemon=True)
     worker.start()
-    deadline = time.monotonic() + 5.0
-    while not pidfile_b.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert pidfile_b.exists(), "child B never started in time"
-    pid_b = int(pidfile_b.read_text())
+    pid_b = _wait_for_ready_pid(pidfile_b)
     assert os.kill(pid_b, 0) is None
 
     scope_dir = tmp_path / "scope"
@@ -1056,8 +1089,7 @@ def test_main_thread_evaluator_interruption_no_deadlock_no_zombie(
     assert not rr._ACTIVE_CHILD_PROCESSES
     assert not rr._LAUNCHES_IN_FLIGHT
 
-    assert pidfile.exists(), "child never started in time"
-    child_pid = int(pidfile.read_text())
+    child_pid = _wait_for_ready_pid(pidfile)
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)  # actually reaped by THIS same thread -- never a zombie
     assert not (scope_dir / "agent-retrospective-run-run-p1-1-main-thread-evaluator").exists()
@@ -1154,11 +1186,7 @@ def test_popen_registry_registration_race_child_not_lost(
         worker.start()
 
         assert reached_popen_boundary.wait(timeout=5.0), "Popen() never completed in time"
-        deadline = time.monotonic() + 5.0
-        while not pidfile.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert pidfile.exists(), "child never started in time"
-        child_pid = int(pidfile.read_text())
+        child_pid = _wait_for_ready_pid(pidfile)
         assert os.kill(child_pid, 0) is None  # real OS process genuinely exists already
 
         # the race window is now OPEN and pinned: `Popen()` has completed
