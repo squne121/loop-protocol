@@ -11,9 +11,11 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +31,17 @@ AGY_RUNTIME_PROBE_COST_CONFIRM_ENV_VAR = "AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_CO
 GROUNDING_PROBE_PROMPT = "Search for: latest reliable news and return exactly one source URL."
 GROUNDING_TIMEOUT_SECONDS = 40
 NONINTERACTIVE_FLAGS = ["-p", "--print", "--prompt"]
-UNEXPECTED_CAPABILITY_KEYWORDS = ["chat", "--output-format"]
+# Issue #2616 AC2: `--output-format` is a documented, official current headless
+# surface (`https://antigravity.google/docs/cli/headless/`), not an
+# unexpected/undocumented capability drift -- removed from this list so a
+# capability classification never labels the documented
+# `-p ... --output-format {json,stream-json}` flag as "unexpected" (the
+# `agy_capability_matrix/v1` two-stage same-binary probe in
+# `structured_output_capability_status()` remains the sole authority on
+# whether `--output-format` is actually *supported* for the current binary;
+# this list is unrelated to that predicate and only flags genuinely
+# undocumented/legacy surface such as `chat`).
+UNEXPECTED_CAPABILITY_KEYWORDS = ["chat"]
 SMOKE_SAMPLE_MAX_CHARS = 500
 _QUOTA_EXHAUSTED_RE = re.compile(
     r"RESOURCE_EXHAUSTED|quota[_ ]exhausted|Individual quota reached",
@@ -292,11 +304,21 @@ def _detect_gcloud_adc(env_home: str | None = None) -> dict[str, Any]:
     }
 
 
-# Issue #1740: `agy` (Antigravity CLI) does not authenticate via dbus
-# secret-service (#1726) or gcloud ADC (#1730). Diagnosis during #1494's
-# third live fan-out attempt confirmed it uses its own OAuth token file,
-# `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` (mode 600) -- see
-# Issue #1740 Source section.
+# Issue #1740 (historical claim, reclassified by Issue #2616 AC3): during
+# #1494's third live fan-out attempt on 2025-era `agy` builds, dbus
+# secret-service (#1726) and gcloud ADC (#1730) reachability additions did
+# not resolve an observed `agy_auth_required` failure, while exposing
+# `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` (mode 600) read-only
+# did. This is a point-in-time observed result, not a current-fact claim
+# about `agy`'s present persistence backend -- current official docs
+# (`https://antigravity.google/docs/cli/install/`, checked 2026-09-17)
+# describe the account-session route as first checking the OS-native
+# credential manager (Secret Service via D-Bus on Linux) before falling back
+# to browser sign-in, which this repository has not re-verified against a
+# current `agy` binary. The legacy read-only file-token exposure below is
+# kept unchanged (Issue #2616 AC3: no behavior removed) as a still-useful,
+# defensively-harmless auth-reachability channel; it is not asserted to be
+# the current, or the only, persistence mechanism.
 ANTIGRAVITY_CLI_DIRNAME = "antigravity-cli"
 AGY_OAUTH_TOKEN_FILENAME = "antigravity-oauth-token"
 
@@ -306,11 +328,13 @@ def _detect_agy_oauth_token(env_home: str | None = None) -> dict[str, Any]:
 
     Existence-check only (Issue #1740 AC3) -- never opens or reads the token
     file content, only whether
-    `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` exists. This is
-    the actual auth channel `agy` uses; it is distinct from both
-    `_detect_keyring()`'s D-Bus secret-service inference (#1726) and
-    `_detect_gcloud_adc()`'s gcloud ADC file-based cache (#1730), neither of
-    which `agy` consults for auth (confirmed during #1740's diagnosis).
+    `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` exists. Issue
+    #1740's point-in-time diagnosis (see module-level comment above) observed
+    this file as one channel that resolved an auth failure the D-Bus
+    secret-service inference (#1726) and gcloud ADC file-based cache (#1730)
+    checks did not; that historical observation is not re-verified here as
+    the current, or exclusive, persistence backend `agy` uses today (Issue
+    #2616 AC3).
     """
     real_home = env_home if env_home is not None else os.environ.get("HOME")
     if not real_home:
@@ -408,14 +432,17 @@ def _build_auth_diagnostics(
         else:
             auth_mode, auth_mode_confidence = "system_keyring_cached", "inferred"
     elif agy_oauth_token_info.get("token_file_present"):
-        # Issue #1740: agy's own OAuth token file is the actual auth channel
-        # `agy` uses -- confirmed during #1494's live fan-out diagnosis that
-        # neither dbus secret-service (#1726) nor gcloud ADC (#1730) resolve
-        # `agy_auth_required` on their own. Checked ahead of the gcloud ADC /
-        # keyring-failure_class fallbacks below so a real, existing agy OAuth
-        # token session is not misreported as "unauthenticated" or
-        # "gcloud_adc_file_based" purely because those other signals are also
-        # present or absent.
+        # Issue #1740 (historical): during #1494's live fan-out diagnosis,
+        # this OAuth token file's presence correlated with a resolved
+        # `agy_auth_required` failure that neither dbus secret-service
+        # (#1726) nor gcloud ADC (#1730) resolved on their own. Checked
+        # ahead of the gcloud ADC / keyring-failure_class fallbacks below so
+        # a real, existing token file is not misreported as
+        # "unauthenticated" or "gcloud_adc_file_based" purely because those
+        # other signals are also present or absent. This is an inferred
+        # (not observed-live) classification here, and does not assert that
+        # the token file is `agy`'s current or exclusive persistence
+        # backend -- Issue #2616 AC3.
         auth_mode, auth_mode_confidence = "agy_oauth_token_file_based", "inferred"
     elif gcloud_adc_info.get("adc_file_present") or gcloud_adc_info.get("access_tokens_db_present"):
         # Issue #1730: gcloud ADC is a file-based auth cache that does not
@@ -2793,6 +2820,416 @@ def get_or_compute_structured_output_capability(agy_bin: str) -> dict[str, Any]:
     record = structured_output_capability_status(help_result, semantic_probe_result=semantic_probe_result)
     _STRUCTURED_OUTPUT_CAPABILITY_MEMO_CACHE[identity_key] = record
     return record
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 model-backed runtime verification, explicit account-session mode
+# only (Issue #2616 AC2). This is a DIFFERENT code path from
+# `_run_structured_output_semantic_probe()` / `get_or_compute_structured_output_capability()`
+# above, which is the always-isolated, no-real-credential capability
+# memoization used by ordinary `grounded_research` dispatch decisions and is
+# unaffected by this section. This section is invoked only by the dedicated
+# runtime verification runner
+# (`tests/test_agy_structured_output_capability_runtime.py --stage2-model-backed`)
+# under the owner-authorized explicit account-session mode flag, and never
+# by any production dispatch path.
+# ---------------------------------------------------------------------------
+
+RUNTIME_VERIFICATION_SCHEMA = "runtime_verification_result/v1"
+RUNTIME_ACCOUNT_SESSION_MODE_ENV_VAR = "AGY_PREFLIGHT_RUNTIME_ACCOUNT_SESSION_MODE"
+RUNTIME_VERIFICATION_SENTINEL_PROMPT = "Return exactly: LOOP_AGY_STAGE2_RUNTIME_OK"
+RUNTIME_VERIFICATION_PRINT_TIMEOUT_FLAG_VALUE = "15m"
+RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS = 300
+RUNTIME_VERIFICATION_TERM_GRACE_SECONDS = 2
+# Issue #2616 AC2: a limited, opaque D-Bus/XDG runtime variable pass-through
+# for an *existing* noninteractive account session -- values are never
+# inspected/enumerated/logged, only copied verbatim when present.
+RUNTIME_VERIFICATION_DBUS_XDG_PASSTHROUGH_KEYS = ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
+# Issue #2616 AC2: ADC, Cloud SDK, API-key, and provider-fallback variables
+# are prohibited in explicit account-session mode -- always stripped from the
+# child env below even if present in the ambient parent environment, so this
+# mode structurally cannot invoke via anything other than the account-session
+# route.
+RUNTIME_VERIFICATION_PROHIBITED_ENV_KEYS = (
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "AGY_ADC_AUTH",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLOUDSDK_CONFIG",
+    "CLOUDSDK_ACTIVE_CONFIG_NAME",
+)
+_RUNTIME_VERIFICATION_AUTH_REQUIRED_RE = re.compile(r"authentication required", re.IGNORECASE)
+
+
+def runtime_account_session_mode_enabled() -> bool:
+    """Explicit opt-in flag gate for Issue #2616 AC2 Stage 2 -- never
+    inferred from any other signal (mirrors `_runtime_probe_cost_confirmed()`'s
+    existing cost-confirmation gate pattern, but for the separate
+    account-session-mode authorization)."""
+    return os.environ.get(RUNTIME_ACCOUNT_SESSION_MODE_ENV_VAR, "").strip() == "1"
+
+
+def runtime_verification_account_session_env() -> dict[str, str]:
+    """Child env for the explicit-account-session-mode Stage 2 probe.
+
+    Starts from the real-HOME-preserving `_minimal_agy_env()` allowlist
+    (never the isolated/overridden HOME `_isolated_probe_env()` uses for the
+    always-hermetic production capability probe), opaquely passes through a
+    limited D-Bus/XDG runtime variable set an *existing* noninteractive
+    account session may need, and always strips
+    `RUNTIME_VERIFICATION_PROHIBITED_ENV_KEYS` so this mode can never
+    accidentally invoke via ADC/API-key/Cloud SDK even if the ambient parent
+    environment happens to define one of them.
+    """
+    env = _minimal_agy_env()
+    for key in RUNTIME_VERIFICATION_DBUS_XDG_PASSTHROUGH_KEYS:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    for key in RUNTIME_VERIFICATION_PROHIBITED_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
+def _process_group_has_live_member(pgid: int) -> bool:
+    """Return True iff process group *pgid* still has at least one member
+    process (Issue #2616 P2-1).
+
+    Uses `os.killpg(pgid, 0)` -- signal 0 is a no-op existence probe (POSIX
+    `kill(2)`); it never actually signals anything. `ProcessLookupError`
+    (`ESRCH`) means the process group no longer contains any process. This
+    is the only way to detect a *descendant* the runner's own leader-process
+    `communicate()` cannot see -- e.g. a grandchild that does not hold the
+    leader's stdout/stderr pipe open (so `communicate()` returns as soon as
+    the leader itself exits) but remains alive in the same process group
+    after ignoring SIGTERM.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A member process still exists but this process lacks permission
+        # to signal it -- should not happen for a runner-owned child group,
+        # but fail-closed: treat as still alive rather than silently
+        # assuming cleanup succeeded.
+        return True
+    return True
+
+
+def _await_process_group_empty(pgid: int, *, timeout_seconds: float, poll_interval_seconds: float = 0.05) -> bool:
+    """Poll (bounded by *timeout_seconds*) until process group *pgid* has no
+    remaining member process. Returns True iff the group was confirmed empty
+    before the deadline (Issue #2616 P2-1)."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if not _process_group_has_live_member(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval_seconds)
+
+
+def _finalize_process_group_cleanup(pgid: int) -> bool:
+    """Confirm process group *pgid* is actually empty, escalating to SIGKILL
+    against the whole group (not just the leader) if a member is still
+    found (Issue #2616 P2-1).
+
+    The leader process's own `communicate()` completing (pipe EOF once the
+    leader exits) only proves the LEADER exited -- it does NOT prove no
+    other process remains in the same process group. A descendant that
+    ignores SIGTERM and does not hold the leader's stdout/stderr pipe open
+    would otherwise silently survive as an orphan even though the runner
+    reports `cleanup_ok: True`. This is the only check that inspects the
+    process group itself rather than the leader's own wait/communicate()
+    result.
+    """
+    if _await_process_group_empty(pgid, timeout_seconds=RUNTIME_VERIFICATION_TERM_GRACE_SECONDS):
+        return True
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    return _await_process_group_empty(pgid, timeout_seconds=RUNTIME_VERIFICATION_TERM_GRACE_SECONDS)
+
+
+def run_runtime_verification_process_group(
+    argv: "list[str]", *, env: dict[str, str], cwd: Path
+) -> dict[str, Any]:
+    """Run *argv* in its own process group with a runner-owned
+    `RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS` deadline (Issue #2616 AC2).
+
+    On deadline expiry: SIGTERM the process group, wait up to
+    `RUNTIME_VERIFICATION_TERM_GRACE_SECONDS`, then SIGKILL and reap. Before
+    returning in every path (including a clean, non-timed-out leader exit),
+    `_finalize_process_group_cleanup()` additionally confirms the whole
+    process group -- not just the leader `communicate()` waited on -- is
+    actually empty, escalating to a group-wide SIGKILL if a descendant is
+    still alive (Issue #2616 P2-1: a leader that exits cleanly, closing the
+    runner's stdout/stderr pipe, does not by itself prove no descendant
+    survived). Never leaves an orphaned child when cleanup succeeds. Returns
+    a dict describing exit_code/stdout/stderr/timed_out/cleanup_ok; raw
+    stdout/stderr are returned only for immediate in-memory ephemeral
+    classification by the caller -- callers MUST NOT persist them verbatim
+    to any artifact/log.
+    """
+    result: dict[str, Any] = {
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "cleanup_ok": True,
+    }
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        result["stderr"] = "agy_not_found"
+        return result
+    try:
+        stdout, stderr = proc.communicate(timeout=RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS)
+        result["exit_code"] = proc.returncode
+        result["stdout"] = stdout or ""
+        result["stderr"] = stderr or ""
+        result["cleanup_ok"] = _finalize_process_group_cleanup(proc.pid)
+        return result
+    except subprocess.TimeoutExpired:
+        result["timed_out"] = True
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        stdout, stderr = proc.communicate(timeout=RUNTIME_VERIFICATION_TERM_GRACE_SECONDS)
+        result["stdout"] = stdout or ""
+        result["stderr"] = stderr or ""
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=RUNTIME_VERIFICATION_TERM_GRACE_SECONDS)
+            result["stdout"] = stdout or ""
+            result["stderr"] = stderr or ""
+        except subprocess.TimeoutExpired:
+            result["cleanup_ok"] = False
+    result["exit_code"] = proc.returncode
+    if result["cleanup_ok"]:
+        result["cleanup_ok"] = _finalize_process_group_cleanup(proc.pid)
+    return result
+
+
+def _stage2_terminal_structured_error_text(terminal_payload: Any) -> str:
+    """Extract only the parsed terminal `result` object's own `error`/
+    `message` string fields (Issue #2616 P2-2). Never reads free-text
+    `response`/step content -- a genuine successful stream's model-generated
+    text is not an eligible auth-signal source (see
+    `classify_runtime_verification_primary_execution()`)."""
+    if not isinstance(terminal_payload, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("error", "message"):
+        value = terminal_payload.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def classify_runtime_verification_primary_execution(execution: dict[str, Any]) -> dict[str, Any]:
+    """Classify a single primary Stage 2 execution's process result (Issue
+    #2616 AC2). Returns ``{"verdict": "PASS"|"FAIL"|"SKIP", "reason_code": str}``.
+
+    Genuine `authentication required` text (the current official headless
+    contract's documented non-interactive-unauthenticated exit signal) is the
+    ONLY signal classified as `account_session_unavailable` SKIP; every other
+    non-success condition -- timeout, cleanup failure, a different
+    auth/keyring/provider signal (route-boundary violation), non-zero exit,
+    a malformed/invalid stream, or a non-`SUCCESS` terminal status -- is FAIL.
+    Classifies from this ONE execution only; callers must never issue a
+    second diagnostic-classification-only call after a non-success verdict
+    here (Owner Decision, Issue #2616 AC2).
+
+    Issue #2616 P2-2 fix_delta: auth-signal detection is scoped to CLI
+    diagnostics (stderr) and, once a terminal has actually been parsed, the
+    parsed non-success terminal's own structured `error`/`message` fields
+    ONLY -- it is NEVER applied to a genuine successful terminal's
+    `response` text or to any pre-terminal `step_update` free text, so a
+    model producing an answer that happens to mention authentication (e.g.
+    "No authentication required to answer this prompt.") can never be
+    misclassified as SKIP/FAIL.
+    """
+    if not execution.get("cleanup_ok", True):
+        return {"verdict": "FAIL", "reason_code": "cleanup_failure"}
+    stderr_text = execution.get("stderr") or ""
+
+    if execution.get("timed_out"):
+        # No terminal was ever parsed in this branch -- the only eligible
+        # auth-signal evidence is CLI-diagnostics stderr, never the
+        # (possibly partial) stdout.
+        if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(stderr_text):
+            return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+        return {"verdict": "FAIL", "reason_code": "primary_execution_timeout"}
+
+    if execution.get("exit_code") is None:
+        return {"verdict": "FAIL", "reason_code": "agy_not_found"}
+
+    if execution.get("exit_code") != 0:
+        # A nonzero exit never carries a genuine successful stream in this
+        # branch -- but auth-signal detection is still scoped to stderr
+        # diagnostics only, never a raw stdout free-text scan.
+        if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(stderr_text):
+            return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+        auth_signal = _classify_auth_signal(stderr_text)
+        if auth_signal:
+            return {"verdict": "FAIL", "reason_code": f"auth_or_provider_signal:{auth_signal}"}
+        return {"verdict": "FAIL", "reason_code": "agy_exit_nonzero"}
+
+    parser_verdict = parse_agy_stream_json_stream(execution.get("stdout") or "")
+    if parser_verdict.get("status") != "valid":
+        if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(stderr_text):
+            return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+        auth_signal = _classify_auth_signal(stderr_text)
+        if auth_signal:
+            return {"verdict": "FAIL", "reason_code": f"auth_or_provider_signal:{auth_signal}"}
+        return {
+            "verdict": "FAIL",
+            "reason_code": f"stream_json_invalid:{parser_verdict.get('reason_code')}",
+        }
+
+    terminal_event = parser_verdict.get("terminal_result")
+    terminal_payload = terminal_event.get("result") if isinstance(terminal_event, dict) else None
+    status = terminal_payload.get("status") if isinstance(terminal_payload, dict) else None
+    has_structured_error = isinstance(terminal_payload, dict) and terminal_payload.get("error") not in (None, "")
+
+    if status == _STREAM_JSON_TERMINAL_SUCCESS_STATUS and not has_structured_error:
+        # Genuine successful terminal: its `response` text (and any
+        # pre-terminal step free text) is NEVER treated as auth-signal
+        # evidence (Issue #2616 P2-2).
+        return {"verdict": "PASS", "reason_code": "primary_execution_valid_success_terminal"}
+
+    # Non-success terminal, or a SUCCESS terminal unexpectedly carrying a
+    # structured error: the only eligible auth-signal evidence here is
+    # CLI-diagnostics stderr plus the parsed terminal's own structured
+    # error/message fields -- never the terminal's free-text `response`.
+    candidate_text = f"{stderr_text}\n{_stage2_terminal_structured_error_text(terminal_payload)}"
+    if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(candidate_text):
+        return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+    auth_signal = _classify_auth_signal(candidate_text)
+    if auth_signal:
+        return {"verdict": "FAIL", "reason_code": f"auth_or_provider_signal:{auth_signal}"}
+    if status != _STREAM_JSON_TERMINAL_SUCCESS_STATUS:
+        return {"verdict": "FAIL", "reason_code": f"non_success_terminal:{status}"}
+    return {"verdict": "FAIL", "reason_code": "structured_error_present"}
+
+
+def classify_runtime_verification_flag_acceptance_execution(execution: dict[str, Any]) -> dict[str, Any]:
+    """Classify the secondary, flag-acceptance-only `--print-timeout` probe
+    (Issue #2616 AC2).
+
+    `--print-timeout 15m` is never actually waited out -- this repository's
+    own `RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS` (300s) always fires
+    first if the model call itself is slow. This function confirms the flag
+    was *accepted* (the process started and did not immediately reject it as
+    an unrecognized option) -- it does NOT require the call to reach a
+    terminal result, but it also never conflates "the outer deadline fired"
+    with "the invocation genuinely succeeded"; a bounded timeout is only
+    ever flag-*surface* acceptance evidence, never runtime-execution-success
+    evidence, and every other observable failure signal (cleanup failure,
+    a rejected flag, POSIX signal termination, a nonzero exit, or a
+    malformed/non-`SUCCESS`/errored structured result) fails closed rather
+    than being silently promoted to PASS (Issue #2616 fix_delta P1-2). Only
+    called when the primary stream-json execution has already independently
+    reached PASS -- a non-PASS primary result is classified from that
+    primary execution alone without spending this second call (see
+    `classify_runtime_verification_primary_execution()`).
+    """
+    if not execution.get("cleanup_ok", True):
+        # Issue #2616 P1-2: cleanup failure overrides every other
+        # provisional signal, including a timed-out flag-acceptance probe
+        # that would otherwise be classified PASS below.
+        return {"verdict": "FAIL", "reason_code": "cleanup_failure"}
+
+    stderr_text = execution.get("stderr") or ""
+
+    if execution.get("timed_out"):
+        if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(stderr_text):
+            return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+        if _UNRECOGNIZED_OPTION_RE.search(stderr_text):
+            # Issue #2616 P1-2: flag rejection evidence, when actually
+            # observed, is checked BEFORE the outer-deadline-timeout
+            # shortcut below -- a timeout alone is never sufficient to
+            # infer the flag was accepted if rejection text is present.
+            return {"verdict": "FAIL", "reason_code": "print_timeout_flag_rejected"}
+        # Issue #2616 AC2: a bounded outer-deadline timeout on this
+        # flag-acceptance-only probe, with no flag-rejection evidence
+        # observed, is treated as flag surface acceptance only -- this
+        # repository's own deadline (not AGY's own `--print-timeout`
+        # semantics) is what ended it.
+        return {"verdict": "PASS", "reason_code": "print_timeout_flag_accepted_outer_deadline_reached"}
+
+    if execution.get("exit_code") is None:
+        return {"verdict": "FAIL", "reason_code": "agy_not_found"}
+
+    if _RUNTIME_VERIFICATION_AUTH_REQUIRED_RE.search(stderr_text):
+        return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+    auth_signal = _classify_auth_signal(stderr_text)
+    if auth_signal:
+        return {"verdict": "FAIL", "reason_code": f"auth_or_provider_signal:{auth_signal}"}
+    if _UNRECOGNIZED_OPTION_RE.search(stderr_text):
+        return {"verdict": "FAIL", "reason_code": "print_timeout_flag_rejected"}
+
+    # Issue #2616 P1-2: flag *acceptance* (the process started and did not
+    # reject the flag) is a distinct concept from runtime *execution*
+    # success -- a non-timeout exit is still only ever classified from its
+    # own actual exit/structured-output evidence, never assumed successful
+    # merely because no rejection text was seen.
+    if execution.get("exit_code") < 0:
+        # A negative return code is POSIX signal-termination evidence
+        # (Python's subprocess reports it as `-signum`) -- never a clean
+        # flag-acceptance outcome.
+        return {
+            "verdict": "FAIL",
+            "reason_code": f"print_timeout_probe_signal_terminated:{-execution['exit_code']}",
+        }
+    if execution.get("exit_code") != 0:
+        return {"verdict": "FAIL", "reason_code": "print_timeout_probe_nonzero_exit"}
+
+    stdout_text = execution.get("stdout") or ""
+    if not stdout_text.strip():
+        # A clean exit 0 with no output at all is still flag-surface
+        # acceptance evidence only (no JSON to validate); Issue #2616's
+        # flag-acceptance contract does not require a terminal result here.
+        return {"verdict": "PASS", "reason_code": "print_timeout_flag_accepted"}
+
+    try:
+        parsed_json = json.loads(stdout_text)
+    except json.JSONDecodeError:
+        return {"verdict": "FAIL", "reason_code": "print_timeout_probe_malformed_json"}
+    if not isinstance(parsed_json, dict):
+        return {"verdict": "FAIL", "reason_code": "print_timeout_probe_malformed_json"}
+    json_status = parsed_json.get("status")
+    if json_status != _STREAM_JSON_TERMINAL_SUCCESS_STATUS:
+        return {
+            "verdict": "FAIL",
+            "reason_code": f"print_timeout_probe_non_success_status:{json_status}",
+        }
+    json_error = parsed_json.get("error")
+    if json_error not in (None, ""):
+        return {"verdict": "FAIL", "reason_code": "print_timeout_probe_structured_error"}
+    return {"verdict": "PASS", "reason_code": "print_timeout_flag_accepted"}
+
+
+_UNRECOGNIZED_OPTION_RE = re.compile(
+    r"unrecognized (?:option|argument)|unknown (?:option|flag)|no such option", re.IGNORECASE
+)
 
 
 _CAPABILITY_MEMO_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
