@@ -21,6 +21,40 @@ Per this Issue's `skip_conditions`:
   evidence alone can never itself promote to `"supported"`).
 
 SKIP is never converted to PASS (`fallback_success_is_pass: false`).
+
+Issue #2616 AC2 adds a second, distinct entry point to this same file: running
+it directly as a script (not via pytest) with `--stage2-model-backed`
+performs the real, model-backed Stage 2 runtime verification described in
+Issue #2616's `## Runtime Verification Applicability` -- a genuine `agy -p
+<sentinel> --output-format stream-json` invocation (and, only on PASS, a
+flag-acceptance-only `--output-format json --print-timeout 15m` follow-up)
+against an *existing* noninteractive account session, gated behind the
+explicit `AGY_PREFLIGHT_RUNTIME_ACCOUNT_SESSION_MODE=1` flag (in addition to
+the existing `AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST=1` cost-confirmation
+gate). See
+`.claude/skills/gemini-cli-headless-delegation/scripts/preflight_agy.py`'s
+"Stage 2 model-backed runtime verification" section for the shared
+classification primitives this entry point uses. This script entry point
+never fabricates a PASS, never retains raw agy stdout/stderr, and always
+emits either `SKIP: <reason>` (exit 77) or a single `runtime_verification_result/v1`
+JSON object (exit 0 for PASS, exit 1 for FAIL).
+
+`--caller-context claude-code|claude-gpt` is a self-reported label (never
+cryptographically/process verified) recorded on the emitted evidence, and
+(Issue #2616 fix_delta P1-1) also SELECTS a structurally different route:
+supplying it routes AC8/AC9 through
+`run_canonical_delegation_route_probe()`, which calls the CANONICAL
+`run_gemini_headless.py::run_delegation()` delegation path (the same
+function a real Claude Code / Claude-GPT SubAgent's own delegation calls
+use) and classifies its normalized `ok`/`failure_class`/`response_text`
+result -- never `run_stage2_model_backed_cli()`'s own direct-CLI probe,
+which remains AC2's job and is reached only when `--caller-context` is
+omitted. This separation exists because a direct-CLI headless-contract
+probe (AC2: does `agy` itself honor the documented `--output-format`/
+`--print-timeout` surface?) and a canonical-route reachability probe
+(AC8/AC9: does the actual production SubAgent delegation code path reach a
+real `agy` child process?) are different claims and must never share one
+evidence source.
 """
 
 from __future__ import annotations
@@ -28,11 +62,14 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
+import tempfile
 import types
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -170,3 +207,621 @@ def test_structured_output_capability_runtime_probe_same_binary_evidence() -> No
         help_result={"exit_code": help_result["exit_code"], "stdout_excerpt": help_result["stdout"][:2000]},
         capability_record=capability_record,
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2616 AC2/AC8/AC9: Stage 2 model-backed runtime verification CLI
+# entry point (`--stage2-model-backed [--caller-context claude-code|claude-gpt]`).
+# Invoked directly as a script, never via pytest -- see module docstring.
+# ---------------------------------------------------------------------------
+
+_CALLER_CONTEXT_AC_SUFFIX = {"claude-code": "AC8", "claude-gpt": "AC9"}
+
+
+def _write_stage2_runtime_verification_log(
+    *,
+    verdict: str,
+    reason_code: str,
+    caller_context: "str | None",
+    binary_identity: "dict[str, object] | None",
+    stage1_status: "str | None",
+    primary_classification: "dict[str, str] | None",
+    secondary_classification: "dict[str, str] | None",
+) -> Path:
+    """Write the redacted `runtime_verification_result/v1` evidence log.
+
+    Never includes raw agy stdout/stderr, prompt text, credential, or
+    account-identity content -- only classification metadata and same-binary
+    identity (realpath/sha256/version), matching this Issue's
+    `artifact_requirements` (secret-redacted, worktree-local, untracked).
+    """
+    _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ac_suffix = _CALLER_CONTEXT_AC_SUFFIX.get(caller_context or "")
+    filename_suffix = f"-{ac_suffix}" if ac_suffix else ""
+    log_path = _ARTIFACTS_DIR / f"runtime-verification-AC2{filename_suffix}-{timestamp}.log"
+    payload = {
+        "schema": preflight_agy.RUNTIME_VERIFICATION_SCHEMA,
+        "ac": "AC2" + (f"/{ac_suffix}" if ac_suffix else ""),
+        "timestamp_utc": timestamp,
+        "caller_context": caller_context,
+        "binary_identity": binary_identity,
+        "stage1_status": stage1_status,
+        "primary_execution_classification": primary_classification,
+        "secondary_execution_classification": secondary_classification,
+        "verdict": verdict,
+        "reason_code": reason_code,
+    }
+    lines = [
+        "=== Runtime Verification Log ===",
+        "AC: AC2 Stage 2 model-backed runtime verification (Issue #2616)"
+        + (f", caller_context={caller_context} ({ac_suffix})" if ac_suffix else ""),
+        f"Timestamp: {timestamp}",
+        "Environment: real `agy` binary + existing noninteractive account session"
+        " (explicit account-session mode); raw stdout/stderr never retained.",
+        "",
+        "--- Output (redacted -- no raw prompt/response/credential content) ---",
+        json.dumps(payload, indent=2, sort_keys=True),
+        "",
+        "--- Verdict ---",
+        f"Result: {verdict}",
+        f"Reason: {reason_code}",
+    ]
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return log_path
+
+
+def _stage2_skip(*, reason_code: str, caller_context: "str | None", **extra: object) -> int:
+    _write_stage2_runtime_verification_log(
+        verdict="SKIP",
+        reason_code=reason_code,
+        caller_context=caller_context,
+        binary_identity=extra.get("binary_identity"),
+        stage1_status=extra.get("stage1_status"),
+        primary_classification=extra.get("primary_classification"),
+        secondary_classification=extra.get("secondary_classification"),
+    )
+    print(f"SKIP: {reason_code}")
+    return 77
+
+
+def _stage2_fail(*, reason_code: str, caller_context: "str | None", **extra: object) -> int:
+    """Emit a FAIL verdict (Issue #2616 P2-3: e.g. a same-binary identity
+    mismatch observed mid-run) -- never promoted to PASS or silently
+    downgraded to SKIP."""
+    _write_stage2_runtime_verification_log(
+        verdict="FAIL",
+        reason_code=reason_code,
+        caller_context=caller_context,
+        binary_identity=extra.get("binary_identity"),
+        stage1_status=extra.get("stage1_status"),
+        primary_classification=extra.get("primary_classification"),
+        secondary_classification=extra.get("secondary_classification"),
+    )
+    print(f"FAIL: {reason_code}")
+    return 1
+
+
+def _compute_stage2_binary_identity(resolved: Path) -> "dict[str, object]":
+    """Same-binary identity fingerprint (canonical absolute path, SHA-256,
+    size) for Issue #2616 P2-3.
+
+    Computed once at pin time from the given already-resolved canonical
+    path, and again at each recheck checkpoint
+    (`_stage2_binary_identity_unchanged()`) by independently re-resolving
+    the ORIGINAL (possibly-symlink) input path -- so a mid-run symlink
+    retarget is observable as an identity mismatch even though every actual
+    invocation argv always uses the pinned canonical path from the first
+    resolution (never a live re-resolution of a possibly-swapped symlink).
+    """
+    return {
+        "realpath": str(resolved),
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+        "size": resolved.stat().st_size,
+    }
+
+
+def _stage2_binary_identity_unchanged(agy_bin: str, pinned_identity: "dict[str, object]") -> bool:
+    """Re-resolve *agy_bin* (the original, possibly-symlink input path) and
+    return True iff its current identity still matches *pinned_identity*
+    (Issue #2616 P2-3). A path that is no longer resolvable/readable at
+    recheck time is always a mismatch (fail-closed)."""
+    try:
+        current = _compute_stage2_binary_identity(Path(agy_bin).resolve())
+    except OSError:
+        return False
+    return (
+        current.get("realpath") == pinned_identity.get("realpath")
+        and current.get("sha256") == pinned_identity.get("sha256")
+        and current.get("size") == pinned_identity.get("size")
+    )
+
+
+def run_stage2_model_backed_cli(caller_context: "str | None" = None) -> int:
+    """Execute Issue #2616 AC2/AC8/AC9's Stage 2 model-backed runtime
+    verification.
+
+    AC2 (``caller_context is None``) performs a direct-CLI headless-contract
+    probe: it invokes the pinned `agy` binary itself, bypassing
+    `run_gemini_headless.py` entirely, to verify the documented
+    `--output-format`/`--print-timeout` stream-json/JSON surface.
+
+    AC8/AC9 (``caller_context in {"claude-code", "claude-gpt"}``) instead
+    route through the CANONICAL delegation path,
+    `run_gemini_headless.run_delegation()`, and classify its normalized
+    `ok`/`failure_class`/`response_text` result (Issue #2616 fix_delta
+    P1-1) -- this is a structurally different code path from AC2's direct
+    probe, and is the only route that actually proves the Claude
+    Code/Claude-GPT SubAgent-facing canonical delegation route reaches a
+    real `agy` child process.
+
+    Returns the process exit code (77 for SKIP, 0 for PASS, 1 for FAIL) --
+    never fabricates a PASS, never performs a second diagnostic-
+    classification-only call after a non-success primary execution, and
+    never persists raw agy stdout/stderr/response text.
+    """
+    if not preflight_agy._runtime_probe_cost_confirmed():
+        return _stage2_skip(reason_code="runtime_probe_cost_not_confirmed", caller_context=caller_context)
+    if not preflight_agy.runtime_account_session_mode_enabled():
+        return _stage2_skip(reason_code="account_session_mode_not_enabled", caller_context=caller_context)
+
+    if caller_context in _CALLER_CONTEXT_AC_SUFFIX:
+        # Issue #2616 fix_delta P1-1: AC8/AC9 must exercise the canonical
+        # `run_gemini_headless.py::run_delegation()` delegation route, never
+        # this function's own direct-CLI probe below (that remains AC2's
+        # job, reached only when caller_context is None).
+        return run_canonical_delegation_route_probe(caller_context)
+
+    agy_bin = shutil.which("agy")
+    if agy_bin is None:
+        return _stage2_skip(reason_code="agy_cli_unavailable", caller_context=caller_context)
+
+    resolved = Path(agy_bin).resolve()
+    binary_identity = _compute_stage2_binary_identity(resolved)
+    try:
+        version_proc = subprocess.run(
+            [str(resolved), "--version"], capture_output=True, text=True, timeout=20, check=False
+        )
+        binary_identity["version_stdout"] = (version_proc.stdout or "").strip()
+    except (subprocess.TimeoutExpired, OSError):
+        binary_identity["version_stdout"] = None
+
+    try:
+        # Issue #2616 P2-3: every actual invocation argv uses the pinned
+        # canonical `resolved` path (obtained above from a ONE-TIME
+        # resolution of *agy_bin*), never the possibly-still-a-symlink
+        # `agy_bin` string itself -- execution is therefore immune to a
+        # later symlink retarget, while `_stage2_binary_identity_unchanged()`
+        # below independently re-resolves `agy_bin` at each checkpoint to
+        # make such a retarget observable as a fail-closed mismatch.
+        help_proc = subprocess.run(
+            [str(resolved), "--help"], capture_output=True, text=True, timeout=20, check=False
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return _stage2_skip(
+            reason_code="agy_help_probe_unavailable", caller_context=caller_context, binary_identity=binary_identity
+        )
+    if not _stage2_binary_identity_unchanged(agy_bin, binary_identity):
+        return _stage2_fail(
+            reason_code="binary_identity_mismatch_after_help_probe",
+            caller_context=caller_context,
+            binary_identity=binary_identity,
+        )
+    help_result = {
+        "exit_code": help_proc.returncode,
+        "stdout": help_proc.stdout or "",
+        "stderr": help_proc.stderr or "",
+        "binary_identity": preflight_agy.compute_binary_identity(str(resolved)),
+    }
+    stage1 = preflight_agy.structured_output_capability_status(help_result)
+    if stage1["status"] != "inconclusive":
+        # Issue #2616 AC2: Stage 2 is permitted only when Stage 1 is
+        # "inconclusive" -- a same-binary Stage 1 status that has already
+        # resolved definitively (supported/unsupported/unavailable/
+        # evidence_invalid) is a precondition state, not a runtime
+        # invocation outcome, so this is a SKIP rather than a FAIL.
+        return _stage2_skip(
+            reason_code=f"stage1_not_inconclusive:{stage1['status']}",
+            caller_context=caller_context,
+            binary_identity=binary_identity,
+            stage1_status=stage1["status"],
+        )
+
+    env = preflight_agy.runtime_verification_account_session_env()
+    with tempfile.TemporaryDirectory(prefix="agy-stage2-runtime-verification-") as temp_dir:
+        primary_argv = [
+            str(resolved),
+            "-p",
+            preflight_agy.RUNTIME_VERIFICATION_SENTINEL_PROMPT,
+            "--output-format",
+            "stream-json",
+        ]
+        primary_execution = preflight_agy.run_runtime_verification_process_group(
+            primary_argv, env=env, cwd=Path(temp_dir)
+        )
+        if not _stage2_binary_identity_unchanged(agy_bin, binary_identity):
+            return _stage2_fail(
+                reason_code="binary_identity_mismatch_after_primary_execution",
+                caller_context=caller_context,
+                binary_identity=binary_identity,
+                stage1_status=stage1["status"],
+            )
+        primary_classification = preflight_agy.classify_runtime_verification_primary_execution(primary_execution)
+
+        secondary_classification: "dict[str, str] | None" = None
+        overall_verdict = primary_classification["verdict"]
+        overall_reason = primary_classification["reason_code"]
+        if primary_classification["verdict"] == "PASS":
+            secondary_argv = [
+                str(resolved),
+                "-p",
+                preflight_agy.RUNTIME_VERIFICATION_SENTINEL_PROMPT,
+                "--output-format",
+                "json",
+                "--print-timeout",
+                preflight_agy.RUNTIME_VERIFICATION_PRINT_TIMEOUT_FLAG_VALUE,
+            ]
+            secondary_execution = preflight_agy.run_runtime_verification_process_group(
+                secondary_argv, env=env, cwd=Path(temp_dir)
+            )
+            if not _stage2_binary_identity_unchanged(agy_bin, binary_identity):
+                return _stage2_fail(
+                    reason_code="binary_identity_mismatch_after_secondary_execution",
+                    caller_context=caller_context,
+                    binary_identity=binary_identity,
+                    stage1_status=stage1["status"],
+                    primary_classification=primary_classification,
+                )
+            secondary_classification = preflight_agy.classify_runtime_verification_flag_acceptance_execution(
+                secondary_execution
+            )
+            overall_verdict = secondary_classification["verdict"]
+            overall_reason = secondary_classification["reason_code"]
+
+    _write_stage2_runtime_verification_log(
+        verdict=overall_verdict,
+        reason_code=overall_reason,
+        caller_context=caller_context,
+        binary_identity=binary_identity,
+        stage1_status=stage1["status"],
+        primary_classification=primary_classification,
+        secondary_classification=secondary_classification,
+    )
+
+    if overall_verdict == "SKIP":
+        print(f"SKIP: {overall_reason}")
+        return 77
+
+    ac_suffix = (
+        f"/{_CALLER_CONTEXT_AC_SUFFIX[caller_context]}"
+        if caller_context in _CALLER_CONTEXT_AC_SUFFIX
+        else ""
+    )
+    result_payload = {
+        "schema": preflight_agy.RUNTIME_VERIFICATION_SCHEMA,
+        "ac": "AC2" + ac_suffix,
+        "route": "direct_cli",
+        "caller_context": caller_context,
+        "verdict": overall_verdict,
+        "reason_code": overall_reason,
+        "binary_identity": binary_identity,
+        "stage1_status": stage1["status"],
+    }
+    print(json.dumps(result_payload, indent=2, sort_keys=True))
+    return 0 if overall_verdict == "PASS" else 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #2616 fix_delta P1-1: AC8/AC9 canonical delegation route (distinct
+# from AC2's direct-CLI probe above). Routes through
+# `run_gemini_headless.py::run_delegation()` -- the SAME code path a Claude
+# Code / Claude-GPT SubAgent's own delegation calls use -- rather than
+# invoking `agy` directly, so a PASS here actually proves the canonical
+# route reaches a real `agy` child process and returns a normalized
+# structured result.
+# ---------------------------------------------------------------------------
+
+_RUN_GEMINI_HEADLESS_PATH = Path(__file__).resolve().parents[1] / "scripts" / "run_gemini_headless.py"
+
+
+def _load_run_gemini_headless_module() -> types.ModuleType:
+    return _load_module(_RUN_GEMINI_HEADLESS_PATH, "run_gemini_headless_stage2_canonical_route")
+
+
+def _classify_canonical_delegation_route_result(result: dict[str, Any]) -> "dict[str, str]":
+    """Classify a `run_delegation()` normalized result for Issue #2616
+    AC8/AC9 (Issue #2616 fix_delta P1-1).
+
+    Never inspects raw stdout/stderr/response TEXT content -- only the
+    normalized `ok`/`failure_class`/`response_text` (presence-only, never
+    read) fields `run_delegation()` itself already computed from the actual
+    `agy` child process invocation it performed. A genuine
+    `failure_class == "agy_auth_required"` (production's own existing
+    auth-required classification, `_classify_agy_failure()`) is the ONLY
+    signal treated as `account_session_unavailable` SKIP -- every other
+    non-`ok` result is FAIL, and this function never promotes a SKIP to
+    PASS.
+    """
+    if not isinstance(result, dict):
+        return {"verdict": "FAIL", "reason_code": "canonical_delegation_route_result_malformed"}
+    if result.get("ok") is True:
+        response_text = result.get("response_text")
+        if not isinstance(response_text, str) or not response_text.strip():
+            return {
+                "verdict": "FAIL",
+                "reason_code": "canonical_delegation_route_ok_without_response_text",
+            }
+        return {"verdict": "PASS", "reason_code": "canonical_delegation_route_success"}
+    failure_class = result.get("failure_class")
+    if failure_class == "agy_auth_required":
+        return {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+    return {
+        "verdict": "FAIL",
+        "reason_code": f"canonical_delegation_route_failure:{failure_class}",
+    }
+
+
+def run_canonical_delegation_route_probe(caller_context: str) -> int:
+    """AC8/AC9: route Issue #2616 Stage 2 model-backed verification through
+    the canonical `run_gemini_headless.py::run_delegation()` delegation
+    route (Issue #2616 fix_delta P1-1).
+
+    Never fabricates a PASS. Because production dispatch redirects
+    `HOME`/`XDG_*` into a fresh isolated workspace for every recognized
+    `tool_profile` (Issue #1705's permission-isolation safety boundary,
+    which this Issue's Allowed Paths and Stop Conditions do not authorize
+    changing), a genuine existing noninteractive account session tied to
+    the real `$HOME` is typically NOT reachable through this exact
+    production path -- an honest `SKIP: account_session_unavailable` result
+    is therefore an expected, not a failing, outcome; it is never promoted
+    to PASS.
+    """
+    agy_bin = os.environ.get("AGY_BIN") or shutil.which("agy")
+    if agy_bin is None:
+        return _stage2_skip(reason_code="agy_cli_unavailable", caller_context=caller_context)
+
+    resolved = Path(agy_bin).resolve()
+    binary_identity = _compute_stage2_binary_identity(resolved)
+
+    run_gemini_headless = _load_run_gemini_headless_module()
+    request: dict[str, Any] = {
+        "schema": "delegation_request_v1",
+        "tool_profile": "no_tools",
+        "provider": "agy",
+        "prompt": preflight_agy.RUNTIME_VERIFICATION_SENTINEL_PROMPT,
+        "objective": "Issue #2616 AC8/AC9 canonical delegation route runtime verification.",
+        "instructions": ["Return exactly the requested sentinel text.", "Do not use any tools."],
+        "output_sections": ["response"],
+        "context_files": [],
+        "timeout_sec": preflight_agy.RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS,
+    }
+    result = run_gemini_headless.run_delegation(request)
+    classification = _classify_canonical_delegation_route_result(result)
+
+    _write_stage2_runtime_verification_log(
+        verdict=classification["verdict"],
+        reason_code=classification["reason_code"],
+        caller_context=caller_context,
+        binary_identity=binary_identity,
+        stage1_status=None,
+        primary_classification=classification,
+        secondary_classification=None,
+    )
+
+    if classification["verdict"] == "SKIP":
+        print(f"SKIP: {classification['reason_code']}")
+        return 77
+
+    ac_suffix = _CALLER_CONTEXT_AC_SUFFIX[caller_context]
+    result_payload = {
+        "schema": preflight_agy.RUNTIME_VERIFICATION_SCHEMA,
+        "ac": f"AC2/{ac_suffix}",
+        "route": "canonical_delegation",
+        "caller_context": caller_context,
+        "verdict": classification["verdict"],
+        "reason_code": classification["reason_code"],
+        "binary_identity": binary_identity,
+    }
+    print(json.dumps(result_payload, indent=2, sort_keys=True))
+    return 0 if classification["verdict"] == "PASS" else 1
+
+
+# ---------------------------------------------------------------------------
+# Hermetic regression tests (no real `agy` binary, no network/model cost).
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_agy(tmp_path: Path, name: str, body: str) -> Path:
+    """Write a strict-argv-guarded fake `agy` executable (mirrors
+    `test_agy_real_subprocess.py`'s pattern) that only accepts the exact
+    `-p <RUNTIME_VERIFICATION_SENTINEL_PROMPT>` argv `_build_agy_inner_argv()`
+    produces for the `no_tools` tool_profile (no `--model`/`--output-format`
+    flags)."""
+    guard = (
+        'test "$#" -eq 2 || exit 90\n'
+        'test "$1" = "-p" || exit 91\n'
+        f'test "$2" = "{preflight_agy.RUNTIME_VERIFICATION_SENTINEL_PROMPT}" || exit 92\n'
+    )
+    binary = tmp_path / name
+    binary.write_text("#!/bin/sh\n" + guard + body, encoding="utf-8")
+    binary.chmod(0o700)
+    return binary
+
+
+# --- Issue #2616 fix_delta P2-3: same-binary identity pin/recheck ----------
+
+
+def test_stage2_binary_identity_unchanged_matches_when_binary_untouched(tmp_path: Path) -> None:
+    binary = tmp_path / "agy-stable"
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o700)
+
+    pinned = _compute_stage2_binary_identity(binary.resolve())
+
+    assert _stage2_binary_identity_unchanged(str(binary), pinned) is True
+
+
+def test_stage2_binary_identity_unchanged_detects_symlink_retarget(tmp_path: Path) -> None:
+    """Issue #2616 P2-3: swapping the symlink `agy_bin` points at (a
+    different executable, same or different content) between the pin-time
+    resolution and a recheck must be observable as a fail-closed mismatch,
+    even though actual invocation argv always uses the FIRST resolution's
+    canonical path (never a live re-resolution of the symlink)."""
+    binary_a = tmp_path / "agy-binary-a"
+    binary_a.write_text("#!/bin/sh\nprintf 'A'\nexit 0\n", encoding="utf-8")
+    binary_a.chmod(0o700)
+    binary_b = tmp_path / "agy-binary-b"
+    binary_b.write_text("#!/bin/sh\nprintf 'B'\nexit 0\n", encoding="utf-8")
+    binary_b.chmod(0o700)
+
+    symlink_path = tmp_path / "agy"
+    symlink_path.symlink_to(binary_a)
+
+    pinned = _compute_stage2_binary_identity(symlink_path.resolve())
+    assert pinned["realpath"] == str(binary_a.resolve())
+
+    symlink_path.unlink()
+    symlink_path.symlink_to(binary_b)
+
+    assert _stage2_binary_identity_unchanged(str(symlink_path), pinned) is False
+
+
+def test_stage2_binary_identity_unchanged_detects_same_path_content_overwrite(tmp_path: Path) -> None:
+    """A content overwrite AT the pinned canonical path itself (not just a
+    symlink retarget) must also be caught by the SHA-256/size comparison."""
+    binary = tmp_path / "agy-in-place"
+    binary.write_text("#!/bin/sh\nprintf 'ORIGINAL'\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o700)
+
+    pinned = _compute_stage2_binary_identity(binary.resolve())
+
+    binary.write_text("#!/bin/sh\nprintf 'TAMPERED-WITH-DIFFERENT-CONTENT'\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o700)
+
+    assert _stage2_binary_identity_unchanged(str(binary), pinned) is False
+
+
+def test_stage2_binary_identity_unchanged_missing_path_is_mismatch(tmp_path: Path) -> None:
+    binary = tmp_path / "agy-vanishing"
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o700)
+    pinned = _compute_stage2_binary_identity(binary.resolve())
+
+    binary.unlink()
+
+    assert _stage2_binary_identity_unchanged(str(binary), pinned) is False
+
+
+# --- Issue #2616 fix_delta P1-1: AC8/AC9 canonical delegation route --------
+
+
+def test_classify_canonical_delegation_route_result_pass_requires_ok_and_response_text() -> None:
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": True, "failure_class": None, "response_text": "LOOP_AGY_STAGE2_RUNTIME_OK"}
+    )
+    assert verdict == {"verdict": "PASS", "reason_code": "canonical_delegation_route_success"}
+
+
+def test_classify_canonical_delegation_route_result_ok_without_response_text_is_fail() -> None:
+    """`ok: True` with no actual response text is never trusted as PASS
+    evidence (Issue #2616 fix_delta P1-1 -- classification is scoped to the
+    normalized fields `run_delegation()` computed, but a structurally
+    incoherent `ok: True` with nothing to show for it still fails closed)."""
+    verdict = _classify_canonical_delegation_route_result({"ok": True, "failure_class": None, "response_text": None})
+    assert verdict["verdict"] == "FAIL"
+    assert verdict["reason_code"] == "canonical_delegation_route_ok_without_response_text"
+
+
+def test_classify_canonical_delegation_route_result_auth_required_is_skip() -> None:
+    """Issue #2616 AC9 Notes for Reviewer: a genuine `agy_auth_required`
+    result from the canonical route -- expected when production's own
+    tool-profile isolation (Issue #1705) redirects HOME away from the real
+    account session -- is an honest SKIP, never promoted to PASS."""
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": False, "failure_class": "agy_auth_required", "response_text": None}
+    )
+    assert verdict == {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
+
+
+def test_classify_canonical_delegation_route_result_other_failure_is_fail() -> None:
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": False, "failure_class": "agy_exit_nonzero", "response_text": None}
+    )
+    assert verdict == {
+        "verdict": "FAIL",
+        "reason_code": "canonical_delegation_route_failure:agy_exit_nonzero",
+    }
+
+
+def test_run_canonical_delegation_route_probe_fails_when_canonical_route_binary_fails(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Issue #2616 fix_delta P1-1: AC8/AC9's verifier must actually depend
+    on `run_gemini_headless.run_delegation()` succeeding -- a fake `AGY_BIN`
+    that the canonical route invokes and which fails (nonzero exit) must
+    make this probe FAIL, never PASS, proving the verifier is not
+    independent of the real canonical-route invocation outcome."""
+    fake_agy = _write_fake_agy(tmp_path, "agy-broken", "echo 'boom' >&2\nexit 23\n")
+    monkeypatch.setenv("AGY_BIN", str(fake_agy))
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = run_canonical_delegation_route_probe("claude-code")
+
+    assert exit_code == 1
+
+
+def test_run_canonical_delegation_route_probe_fails_when_canonical_route_returns_malformed_json(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A fake `AGY_BIN` that exits 0 but emits no usable stdout must also
+    fail closed (never PASS) through the canonical route."""
+    fake_agy = _write_fake_agy(tmp_path, "agy-empty", "exit 0\n")
+    monkeypatch.setenv("AGY_BIN", str(fake_agy))
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = run_canonical_delegation_route_probe("claude-code")
+
+    assert exit_code == 1
+
+
+def test_run_canonical_delegation_route_probe_passes_when_canonical_route_succeeds(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The positive counterpart to the two FAIL cases above: when the
+    canonical route's own `agy` child process genuinely succeeds, the
+    probe reaches PASS -- demonstrating the verifier's PASS is actually
+    contingent on `run_delegation()`'s real outcome, not independent of it
+    (Issue #2616 fix_delta P1-1)."""
+    fake_agy = _write_fake_agy(
+        tmp_path,
+        "agy-success",
+        f"printf '%s\\n' '{preflight_agy.RUNTIME_VERIFICATION_SENTINEL_PROMPT}'\nexit 0\n",
+    )
+    monkeypatch.setenv("AGY_BIN", str(fake_agy))
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = run_canonical_delegation_route_probe("claude-code")
+
+    assert exit_code == 0
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--stage2-model-backed",
+        action="store_true",
+        help="Run Issue #2616 AC2's real, model-backed Stage 2 runtime verification (never via pytest).",
+    )
+    parser.add_argument(
+        "--caller-context",
+        choices=sorted(_CALLER_CONTEXT_AC_SUFFIX),
+        default=None,
+        help="Self-reported (not cryptographically verified) execution-context label for evidence purposes only.",
+    )
+    cli_args = parser.parse_args()
+    if not cli_args.stage2_model_backed:
+        parser.error("--stage2-model-backed is required when invoking this file directly as a script")
+    sys.exit(run_stage2_model_backed_cli(cli_args.caller_context))
