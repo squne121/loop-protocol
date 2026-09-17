@@ -113,6 +113,34 @@ kill し、全ての子プロセスの終了・reap を確認してから run-sc
 と subprocess env（mutation credential を除去した allowlist）へ直接反映され、`git commit`/`git push`/
 `gh issue`/`gh pr`/filesystem write/unapproved Bash/対象 run 外 resume を拒否する。
 
+#### headless CLI 標準出力の形状正規化処理（transport normalization、Issue #2645 対応）
+
+`invoke_agent()` は `completed.stdout` を `json.loads()` した直後、既存の result-wrapper business
+validation（type/subtype/is_error 判定、`structured_output` compatibility recovery、JSON Schema
+validation、identity binding、role adapter validation）へ渡す**前段**で、`_normalize_transport_payload()`
+（薄い transport normalization adapter）を通す。
+
+- 単一 object payload（従来からの唯一の正当な shape）はそのまま無変更で通過する（regression-free）。
+- 正当な event-array payload（`system`/`assistant`/`tool_use`/`tool_result` 等の非 terminal event に続き、
+  一意な terminal `type: "result"` event が **配列末尾** に存在する shape）は、その terminal event の
+  dict をそのまま canonical result object として抽出し、既存 business validation へそのまま渡す。
+  terminal event が 0 件・複数件（success/failure subtype で絞り込む前にカウントする -- success 1件 +
+  error 1件 の配列は曖昧として拒否）・terminal event の後に継続 event が存在する・配列要素が object で
+  ない、のいずれかの場合は fail-closed のまま維持される（`payload[-1]` の機械的採用や、nested JSON の
+  recursive search による business result 採取は行わない）。
+- 単一 object でも配列でもない top-level JSON 値（文字列・数値・null 等）は、従来どおり
+  `reason_code="payload_not_object"` のまま fail-closed。
+
+**fact-check（原因調査自体は拡大しない、In Scope）**: 配列 shape の発生は Claude-GPT/self-hosted
+固有と断定できない。native Claude Code 側の公開 Issue
+（https://github.com/anthropics/claude-code/issues/84784）は、`--verbose`（および公式 CLI reference
+https://code.claude.com/docs/en/cli-reference が記す、それを上書きする `viewMode: "verbose"` 設定）が
+native Claude Code 自身の `--output-format json` を単一 object から JSON 配列へ変える既知挙動を報告して
+いる。`_normalize_transport_payload()` はこの事実を踏まえ、どの launcher/brand が発生させたかではなく
+observed な top-level JSON shape のみを見て分岐する runtime-agnostic 実装である。これは
+`--output-format stream-json`（改行区切り JSON/NDJSON）とは無関係 -- NDJSON の top-level
+`json.loads()` は本 adapter に到達する前に `json_decode_failure` で fail-closed する。
+
 ### 4. prepare-evaluator（評価準備・fan-in）
 
 全 observer が成功した場合のみ（`partial_agent_output: reject`）、

@@ -942,6 +942,103 @@ def _stdout_excerpt(text: str | None) -> str | None:
     return text[:_MAX_STDOUT_EXCERPT]
 
 
+#: Issue #2645: thin transport-reception normalization adapter. A JSON-decoded
+#: ``claude -p --output-format json`` stdout payload is normally a single
+#: wrapper object (``type: "result"``, ``subtype``, ``is_error``, ``result``,
+#: optionally ``structured_output``). Some observed transport shapes instead
+#: emit a top-level JSON ARRAY of session events (e.g. ``system``,
+#: ``assistant``, ``tool_use``/``tool_result``, ... , a single terminal
+#: ``type: "result"`` event). Fact-check (Issue #2645 In Scope; see the
+#: `issue-refinement-loop` OWNER anchor review,
+#: https://github.com/squne121/loop-protocol/issues/2645#issuecomment-5699109387):
+#: this is NOT confirmed to be Claude-GPT/self-hosted-specific. A native
+#: Claude Code report (https://github.com/anthropics/claude-code/issues/84784)
+#: documents ``--verbose`` (and, per the official CLI reference at
+#: https://code.claude.com/docs/en/cli-reference, the ``viewMode: "verbose"``
+#: user setting it overrides) changing ``--output-format json`` from a single
+#: object to a JSON array on native Claude Code itself. This normalizer is
+#: therefore intentionally runtime-agnostic: it dispatches on the OBSERVED
+#: top-level JSON shape, never on which brand/launcher produced it. It is
+#: also unrelated to ``--output-format stream-json``'s newline-delimited JSON
+#: (NDJSON): a top-level ``json.loads`` of NDJSON output raises
+#: ``JSONDecodeError`` well before this function is ever reached, and that
+#: path is untouched (`malformed_output` / `json_decode_failure`, unchanged).
+def _normalize_transport_payload(payload: Any) -> "tuple[dict[str, Any] | None, str | None]":
+    """Normalize a JSON-decoded headless CLI stdout payload to the canonical
+    single-object result-wrapper shape every existing downstream business
+    validation in ``invoke_agent()`` (type/subtype/is_error checks,
+    ``structured_output`` compatibility recovery, JSON Schema validation,
+    identity binding, role adapter validation) already expects, WITHOUT
+    reimplementing or weakening any of that downstream validation itself.
+
+    Returns ``(canonical_result_object, None)`` on success, or
+    ``(None, <reason_code>)`` when the payload must remain fail-closed --
+    the caller (``invoke_agent``) turns the latter into
+    ``AgentInvocationResult(status="malformed_output", ...)`` exactly as the
+    pre-existing bare ``isinstance(payload, dict)`` gate did.
+
+    - a ``dict`` payload passes through completely unchanged (regression-free
+      for every existing single-object caller, AC1).
+    - a ``list`` payload (an event-array) is normalized ONLY when exactly one
+      top-level element is a JSON object carrying ``type == "result"`` (the
+      terminal result event -- the same wrapper marker the pre-existing
+      single-object contract has always required) AND that element is the
+      LAST element in the array (no continuation event follows the terminal
+      event). The unique terminal event's OWN dict is returned as-is, exactly
+      as if it had been the single top-level object all along -- every
+      existing downstream check then runs unmodified against it.
+    - every other event-array shape remains fail-closed, with a distinct
+      diagnostic ``reason_code`` (never a same-named reuse of
+      ``payload_not_object`` for a shape that should now succeed -- Issue
+      #2645 Outcome): an empty array or an array with zero ``type=="result"``
+      elements (no terminal result / partial-incomplete stream), more than
+      one such element (counted BEFORE any success/failure ``subtype``
+      filtering -- a success-result-plus-error-result array is correctly
+      rejected as ambiguous, never silently resolved by picking the
+      "successful" one, per the OWNER anchor review), a terminal event that
+      is not the array's last element (an invalid continuation event
+      following the terminal result), or any non-object array element
+      (unknown event-array shape).
+    - anything else at the top level (a bare string/number/bool/null, or any
+      other non-dict, non-list JSON value) keeps the exact pre-existing
+      ``"payload_not_object"`` reason_code -- unchanged regression behavior
+      for shapes this Issue's Outcome never asked to be normalized.
+
+    Deliberately does NOT: adopt ``payload[-1]`` unconditionally, recurse
+    into any array element's NESTED fields (``structured_output``,
+    ``tool_use``/``tool_result`` payloads, etc.) searching for a
+    plausible-looking business result, or perform any success/failure
+    filtering before counting terminal events -- all three are explicit
+    Issue #2645 Stop Conditions. Only the array's own top-level (depth-1)
+    elements are inspected; nothing below that depth is ever read by this
+    function."""
+    if isinstance(payload, dict):
+        return payload, None
+    if not isinstance(payload, list):
+        return None, "payload_not_object"
+
+    if not payload:
+        return None, "transport_event_array_no_terminal_result"
+
+    terminal_indices: list[int] = []
+    for index, event in enumerate(payload):
+        if not isinstance(event, dict):
+            return None, "transport_event_array_unknown_shape"
+        if event.get("type") == "result":
+            terminal_indices.append(index)
+
+    if not terminal_indices:
+        return None, "transport_event_array_no_terminal_result"
+    if len(terminal_indices) > 1:
+        return None, "transport_event_array_multiple_terminal_results"
+
+    terminal_index = terminal_indices[0]
+    if terminal_index != len(payload) - 1:
+        return None, "transport_event_array_terminal_result_not_last"
+
+    return payload[terminal_index], None
+
+
 def _default_sanitized_env(env: dict[str, str]) -> dict[str, str]:
     """Issue #2445 AC1: inherit the parent environment by default, stripping
     only ``_MUTATION_CREDENTIAL_ENV_VARS`` (see that constant's docstring).
@@ -1402,7 +1499,7 @@ def invoke_agent(
         )
 
     try:
-        payload = json.loads(completed.stdout)
+        raw_payload = json.loads(completed.stdout)
     except json.JSONDecodeError:
         return AgentInvocationResult(
             status="malformed_output",
@@ -1411,13 +1508,18 @@ def invoke_agent(
             exit_code=completed.returncode,
             reason_code="json_decode_failure",
         )
-    if not isinstance(payload, dict):
+    # Issue #2645: thin transport-reception normalization adapter, strictly
+    # BEFORE every existing result-wrapper business validation below. See
+    # `_normalize_transport_payload`'s docstring for the full normalization
+    # contract and fail-closed cases.
+    payload, transport_reason_code = _normalize_transport_payload(raw_payload)
+    if payload is None:
         return AgentInvocationResult(
             status="malformed_output",
             structured_output=None,
             raw_stdout_excerpt=_stdout_excerpt(completed.stdout),
             exit_code=completed.returncode,
-            reason_code="payload_not_object",
+            reason_code=transport_reason_code,
         )
 
     # `api_error_with_partial_text: reject_as_evidence` (P1-2 budget): a
