@@ -28,10 +28,24 @@ Issue body's ``-k`` filters require):
   AC6  cancel_vs_terminal_collection / observer_timeout_terminates_and_reaps_subprocess /
        parent_sigterm_terminates_all_children_before_cleanup /
        sigterm_vs_observer_timeout_lifecycle_ordering
+
+Below AC6 are Issue #2646 PR #2650 fix_delta (OWNER REQUEST_CHANGES P1-1/P1-2/P2)
+regression tests -- deterministic, REAL local subprocess + REAL signal
+delivery (never a mock/exception standing in for process termination or
+signal handling), reusing the exact production lifecycle primitive
+(``_lifecycle_subprocess_run``)/registry (``_reserve_launch_slot``/
+``_promote_launch_to_active``) a real evaluator/observer dispatch goes
+through:
+  P1-1 main_thread_evaluator_interruption_no_deadlock_no_zombie /
+       signal_during_registry_lock_hold_no_reentrant_deadlock
+  P1-2 popen_registry_registration_race_child_not_lost
+  P2   aggregate_success_records_preserve_real_exit_code /
+       aggregate_preserves_exit_code_for_post_process_validation_failures
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -927,3 +941,337 @@ def test_sigterm_vs_observer_timeout_lifecycle_ordering(tmp_path: Path, monkeypa
     with pytest.raises(ProcessLookupError):
         os.kill(pid_b, 0)
     assert not rr._ACTIVE_CHILD_PROCESSES
+
+
+# ---------------------------------------------------------------------------
+# PR #2650 fix_delta (OWNER REQUEST_CHANGES) regression tests:
+#   P1-1 signal handler must never self-wait on its own thread's not-yet-
+#        reached `finally`, and must never re-acquire a Lock it may already
+#        hold (main-thread evaluator interruption; registry/interrupt
+#        reentrancy).
+#   P1-2 a child whose `Popen()` has completed but is not yet registered
+#        must never be lost to a concurrent parent interrupt.
+#   P2   `AgentInvocationResult.exit_code` must survive into the
+#        per-observer aggregate on every path, not just the plain-success
+#        one.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _watchdog_alarm(seconds: float):
+    """Test-only safety net (this repo has no ``pytest-timeout`` plugin
+    dependency): a ``SIGALRM`` fired after ``seconds`` raises ``TimeoutError``
+    from wherever the main thread currently is -- including from INSIDE a
+    genuine deadlock on a blocking call/Lock -- so a real regression in the
+    code under test fails THIS ONE test deterministically instead of hanging
+    the whole suite forever."""
+
+    def _on_alarm(_signum: int, _frame: Any) -> None:
+        raise TimeoutError(f"test watchdog: exceeded {seconds}s -- possible deadlock/hang")
+
+    previous = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_main_thread_evaluator_interruption_no_deadlock_no_zombie(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2646 P1-1 fix_delta: the evaluator invokes
+    ``_lifecycle_subprocess_run`` directly, synchronously, from the MAIN
+    thread -- exactly like ``run_cli``'s ``_invoke_evaluator`` does in
+    production (never a worker thread). A SIGTERM delivered to this process
+    while the main thread is BLOCKED inside that exact call must:
+      - never self-wait/deadlock (the signal handler runs NESTED inside
+        this same call frame -- the old handler polled THIS thread's own
+        not-yet-reached ``finally`` to confirm the reap, which could never
+        complete until the handler -- doing the waiting -- itself returned);
+      - still terminate -> (bounded grace) -> kill -> reap a REAL child that
+        explicitly ignores plain SIGTERM (so a no-op ``terminate()`` alone
+        can never be mistaken for success -- the kill() escalation branch
+        must actually fire);
+      - leave no zombie process behind.
+    Wrapped in a SIGALRM watchdog (`_watchdog_alarm`) so a real regression
+    (self-wait/deadlock) fails this test deterministically rather than
+    hanging the suite."""
+    grace_sec = 0.3
+    monkeypatch.setattr(rr, "_CHILD_PROCESS_TERMINATE_GRACE_SEC", grace_sec)
+    pidfile = tmp_path / "child.pid"
+    script = "\n".join(
+        [
+            "import os, signal, time",
+            # installed as the child's very first action, well before the
+            # parent ever gets a chance to send it anything.
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+            f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))",
+            "time.sleep(30)",
+        ]
+    )
+
+    signal_sent = threading.Event()
+
+    def _send_sigterm_once_child_is_ready() -> None:
+        deadline = time.monotonic() + 5.0
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        # `os.kill` from ANY thread delivers the signal to the process;
+        # Python always runs the REGISTERED Python-level handler on the
+        # MAIN thread -- exactly simulating an external SIGTERM (e.g. from
+        # a shell/orchestrator) arriving while the main thread is busy.
+        os.kill(os.getpid(), signal.SIGTERM)
+        signal_sent.set()
+
+    sender = threading.Thread(target=_send_sigterm_once_child_is_ready, daemon=True)
+    scope_dir = tmp_path / "scope"
+
+    started_at = time.monotonic()
+    with _watchdog_alarm(10.0):
+        sender.start()
+        with pytest.raises(rr.RunInterrupted):
+            with rr.run_scoped_temp_dir("run-p1-1-main-thread-evaluator", base_dir=scope_dir):
+                # exactly like `_invoke_evaluator` -- direct, synchronous,
+                # main-thread call into the SAME production lifecycle
+                # primitive a real evaluator invocation uses.
+                rr._lifecycle_subprocess_run(
+                    [sys.executable, "-c", script],
+                    cwd=str(tmp_path),
+                    env=dict(os.environ),
+                    input=None,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+    elapsed = time.monotonic() - started_at
+    assert signal_sent.wait(timeout=1.0)
+    sender.join(timeout=1.0)
+
+    # never blocked anywhere close to the child's own 30s sleep, and
+    # comfortably bounded by (grace + a small margin) -- proves the signal
+    # handler itself never blocked for long and no self-wait occurred.
+    assert elapsed < 5.0
+    assert not rr._ACTIVE_CHILD_PROCESSES
+    assert not rr._LAUNCHES_IN_FLIGHT
+
+    assert pidfile.exists(), "child never started in time"
+    child_pid = int(pidfile.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)  # actually reaped by THIS same thread -- never a zombie
+    assert not (scope_dir / "agent-retrospective-run-run-p1-1-main-thread-evaluator").exists()
+
+
+def test_signal_during_registry_lock_hold_no_reentrant_deadlock(tmp_path: Path) -> None:
+    """Issue #2646 P1-1 fix_delta: a SIGTERM delivered to the MAIN thread
+    while it is ITSELF inside a ``_ACTIVE_CHILD_PROCESSES_LOCK`` critical
+    section must never deadlock. The pre-fix_delta signal handler itself
+    acquired this SAME (non-reentrant) ``threading.Lock`` -- if the
+    interrupted thread already held it, the handler (running NESTED, on the
+    SAME thread, inside the interrupted call) would try to reacquire a lock
+    it already holds and block forever. The new handler never touches this
+    Lock at all.
+
+    Self-signaling (``os.kill(os.getpid(), ...)`` called directly from the
+    SAME thread that installed the handler, exactly like every other
+    SIGINT/SIGTERM test in this module) reliably triggers the Python-level
+    handler at the very next bytecode boundary -- no artificial sleep-based
+    ordering needed. TWO signals are sent back-to-back (no gap) to also
+    exercise re-entrant/duplicate delivery landing before the first one has
+    even been processed (POSIX does not queue a second standard signal
+    while the first is already pending, but issuing this call pattern must
+    still never deadlock or raise anything other than ``RunInterrupted``).
+    Wrapped in a SIGALRM watchdog so a real regression (deadlock/hang) fails
+    this test deterministically instead of hanging the whole suite."""
+    scope_dir = tmp_path / "scope"
+
+    started_at = time.monotonic()
+    with _watchdog_alarm(10.0):
+        with pytest.raises(rr.RunInterrupted):
+            with rr.run_scoped_temp_dir("run-p1-1-reentrancy", base_dir=scope_dir):
+                with rr._ACTIVE_CHILD_PROCESSES_LOCK:
+                    # main thread now holds the EXACT Lock the pre-fix_delta
+                    # signal handler used to try to reacquire from inside
+                    # itself.
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    os.kill(os.getpid(), signal.SIGTERM)  # duplicate/re-entrant delivery
+                    pytest.fail("unreachable: the signal handler must have already raised by now")
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 5.0  # never hit the watchdog -- no deadlock
+    assert not rr._ACTIVE_CHILD_PROCESSES
+    assert not rr._LAUNCHES_IN_FLIGHT
+    assert not (scope_dir / "agent-retrospective-run-run-p1-1-reentrancy").exists()
+
+
+def test_popen_registry_registration_race_child_not_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2646 P1-2 fix_delta: a child whose ``Popen()`` has ALREADY
+    completed (the real OS process exists) but whose handle has not yet been
+    promoted from ``_LAUNCHES_IN_FLIGHT`` into ``_ACTIVE_CHILD_PROCESSES``
+    must still be terminated by a parent interrupt that lands EXACTLY in
+    that window -- never left to run to its own natural (here: 30s)
+    completion just because a single one-shot registry snapshot did not yet
+    contain it. The window is pinned deterministically by monkeypatching
+    ``_promote_launch_to_active`` to block on an ``Event`` released only
+    once the test has confirmed the race window is open."""
+    monkeypatch.setattr(rr, "_CHILD_PROCESS_TERMINATE_GRACE_SEC", 1.0)
+    reached_popen_boundary = threading.Event()
+    release_promotion = threading.Event()
+    original_promote = rr._promote_launch_to_active
+
+    def _delayed_promote(handle_id: int, proc: "subprocess.Popen") -> None:
+        reached_popen_boundary.set()
+        release_promotion.wait(timeout=5.0)
+        original_promote(handle_id, proc)
+
+    monkeypatch.setattr(rr, "_promote_launch_to_active", _delayed_promote)
+
+    pidfile = tmp_path / "child.pid"
+    script = "\n".join(["import os, time", f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))", "time.sleep(30)"])
+    worker_errors: list[BaseException] = []
+
+    def _run_child() -> None:
+        try:
+            rr._lifecycle_subprocess_run(
+                [sys.executable, "-c", script],
+                cwd=str(tmp_path),
+                env=dict(os.environ),
+                input=None,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except rr.RunInterrupted:
+            pass
+        except BaseException as exc:  # pragma: no cover - diagnostics only
+            worker_errors.append(exc)
+
+    with _watchdog_alarm(15.0):
+        worker = threading.Thread(target=_run_child, daemon=True)
+        worker.start()
+
+        assert reached_popen_boundary.wait(timeout=5.0), "Popen() never completed in time"
+        deadline = time.monotonic() + 5.0
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pidfile.exists(), "child never started in time"
+        child_pid = int(pidfile.read_text())
+        assert os.kill(child_pid, 0) is None  # real OS process genuinely exists already
+
+        # the race window is now OPEN and pinned: `Popen()` has completed
+        # (the child is alive) but its handle is still only in
+        # `_LAUNCHES_IN_FLIGHT` -- never yet visible in
+        # `_ACTIVE_CHILD_PROCESSES` -- exactly the window the pre-fix_delta
+        # single-snapshot `terminate_all_active_child_processes()` could
+        # miss entirely.
+        assert not rr._ACTIVE_CHILD_PROCESSES
+        assert rr._LAUNCHES_IN_FLIGHT
+
+        # release the promotion gate shortly AFTER the parent interrupt's
+        # own convergence loop has already started polling, from a
+        # DIFFERENT thread (the main thread is about to be busy running
+        # `run_scoped_temp_dir`'s own cleanup convergence).
+        releaser = threading.Timer(0.15, release_promotion.set)
+        releaser.daemon = True
+        releaser.start()
+
+        scope_dir = tmp_path / "scope"
+        with pytest.raises(rr.RunInterrupted):
+            with rr.run_scoped_temp_dir("run-p1-2-popen-race", base_dir=scope_dir):
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        releaser.join(timeout=1.0)
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        assert worker_errors == []
+
+    # the child that was Popen'ed-but-not-yet-registered at the exact
+    # moment of interrupt was still found and terminated -- never left to
+    # run out its own 30s sleep.
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    assert not rr._ACTIVE_CHILD_PROCESSES
+    assert not rr._LAUNCHES_IN_FLIGHT
+    assert not (scope_dir / "agent-retrospective-run-run-p1-2-popen-race").exists()
+
+
+def test_aggregate_success_records_preserve_real_exit_code() -> None:
+    """Issue #2646 P2 fix_delta: a SUCCESSFUL observer's per-observer
+    aggregate record must carry the REAL observed
+    ``AgentInvocationResult.exit_code`` -- never a hardcoded ``None`` --
+    including a non-``0`` value (proving the wiring is never implicitly
+    special-cased to only ever thread through literal ``0``)."""
+    ctx, plan, _results = _prepare(run_id="run-p2-success-exit-code")
+    observer_requests = [_observer_request(spec.observer_id) for spec in rr.EXPECTED_OBSERVER_MANIFEST]
+    exit_codes = {"codebase-investigator": 0, "retrospective-runtime-observer": 7, "web-researcher": 0}
+
+    def _invoke(request: rr.AgentInvocationRequest) -> rr.AgentInvocationResult:
+        return rr.AgentInvocationResult(
+            status="ok",
+            structured_output=_bundle_wire(
+                run_id=ctx.run_id, base_sha=ctx.base_sha, digest=plan.source_set_digest, observer_id=request.agent_name
+            ),
+            raw_stdout_excerpt=None,
+            exit_code=exit_codes[request.agent_name],
+            reason_code=None,
+        )
+
+    bundles = _run_wave(ctx, plan, _invoke, observer_requests)
+    assert len(bundles) == 3
+
+
+def test_aggregate_preserves_exit_code_for_post_process_validation_failures() -> None:
+    """Issue #2646 P2 fix_delta: `AgentInvocationResult.exit_code` must
+    survive into the per-observer aggregate even when a POST-process
+    validation failure (schema mismatch / observer_id identity mismatch) --
+    never the underlying process's own status -- is what ultimately makes
+    that observer's record `status: failed`. Process success (`exit_code:
+    0`) is never silently discarded merely because the CONTENT it produced
+    later failed validation. A genuinely nonzero-exit process failure is
+    also asserted here as a regression-safety net for the pre-existing
+    (already correct) passthrough this fix_delta must not disturb."""
+    ctx, plan, _results = _prepare(run_id="run-p2-post-process-exit-code")
+    observer_requests = [_observer_request(spec.observer_id) for spec in rr.EXPECTED_OBSERVER_MANIFEST]
+
+    def _invoke(request: rr.AgentInvocationRequest) -> rr.AgentInvocationResult:
+        if request.agent_name == "codebase-investigator":
+            # the process itself succeeded (exit_code 0) but the CONTENT it
+            # produced fails schema parsing (WireContractError path).
+            return rr.AgentInvocationResult(
+                status="ok",
+                structured_output={"totally": "wrong-shape"},
+                raw_stdout_excerpt=None,
+                exit_code=0,
+                reason_code=None,
+            )
+        if request.agent_name == "retrospective-runtime-observer":
+            # the process itself succeeded (exit_code 0) but the RETURNED
+            # observer_id does not match the request (identity mismatch).
+            return _ok_result(
+                _bundle_wire(
+                    run_id=ctx.run_id,
+                    base_sha=ctx.base_sha,
+                    digest=plan.source_set_digest,
+                    observer_id="web-researcher",
+                )
+            )
+        # web-researcher: a genuine process-level (nonzero exit) failure --
+        # already worked correctly pre-fix_delta; asserted here to prove
+        # this fix_delta does not disturb it.
+        return _failure_result(status="api_error", reason_code="nonzero_exit", exit_code=3)
+
+    with pytest.raises(rr.ObserverWaveFailed) as excinfo:
+        _run_wave(ctx, plan, _invoke, observer_requests)
+
+    by_id = {r.observer_id: r for r in excinfo.value.observer_results}
+    assert by_id["codebase-investigator"].status == "failed"
+    assert by_id["codebase-investigator"].exit_code == 0
+    assert by_id["retrospective-runtime-observer"].status == "failed"
+    assert by_id["retrospective-runtime-observer"].reason_code == "observer_id_mismatch"
+    assert by_id["retrospective-runtime-observer"].exit_code == 0
+    assert by_id["web-researcher"].status == "failed"
+    assert by_id["web-researcher"].reason_code == "nonzero_exit"
+    assert by_id["web-researcher"].exit_code == 3

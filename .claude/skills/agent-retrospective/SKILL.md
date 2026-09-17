@@ -106,8 +106,12 @@ observer 自身の timeout では、その observer の実 subprocess を termin
 kill → reap してから terminal record を確定し、他 observer は継続する。親プロセスへの
 SIGINT/SIGTERM では、起動済みの全 observer 子プロセスへ終了要求を出し、有限の猶予後に必要なら
 kill し、全ての子プロセスの終了・reap を確認してから run-scoped temporary directory の cleanup を
-実行する（`run_scoped_temp_dir()`/`terminate_all_active_child_processes()`）。詳細は
-`references/execution-budget.md` を参照。
+実行する（`run_scoped_temp_dir()`/`terminate_all_active_child_processes()`）。SIGINT/SIGTERM の
+Python シグナルハンドラ自体は「中断要求の記録＋即時 raise」のみに限定され（Lock 取得やブロッキング
+待機を一切行わない）、実際の terminate → 猶予 → kill → reap 収束は `run_scoped_temp_dir()` 自身の
+`finally`（通常の制御フロー）で行う。これは evaluator のように main thread が自身の子プロセスを
+同期呼び出し中に割り込まれるケースで「自分自身の reap 完了を自分で待つ」自己待機を構造的に防ぐため
+（Issue #2646 PR #2650 fix_delta）。詳細は `references/execution-budget.md` を参照。
 
 `DelegatedAgentPermissionPolicy`（`run_retrospective.py`）が実際の subprocess argv（`--disallowedTools`）
 と subprocess env（mutation credential を除去した allowlist）へ直接反映され、`git commit`/`git push`/

@@ -33,11 +33,23 @@ observer_wave_concurrency_model: fan_out_fan_in_all_terminal
   はいずれも typed operational failure として扱われ、プログラマバグ（`KeyError`/`AssertionError` 等）と
   混同されない（`collect_snapshot.py` の既存規約と同じ方針）
 - `cleanup_required: true` -- `run_scoped_temp_dir` が success/exception/SIGINT/SIGTERM の全経路で
-  private temp artifact ディレクトリ（mode `0700`）を削除する。Issue #2646 以降、SIGINT/SIGTERM ハンドラは
-  cleanup（`shutil.rmtree`）の前に、起動済みの全 observer 子プロセスへ終了要求を出し（`terminate()`）、
-  有限の猶予後に必要なら `kill()` へ escalate し、全ての子プロセスが実際に reap されたことを確認してから
-  ``RunInterrupted`` を送出する（`terminate_all_active_child_processes()`）。順序は常に「終了要求 → 猶予
-  → (必要なら) kill → reap 確認 → 例外伝播 → temp dir cleanup」であり、逆順にはならない
+  private temp artifact ディレクトリ（mode `0700`）を削除する。Issue #2646 以降、cleanup
+  （`shutil.rmtree`）の前に、起動済みの全 observer 子プロセスへ終了要求を出し（`terminate()`）、有限の
+  猶予後に必要なら `kill()` へ escalate し、全ての子プロセスが実際に reap されたことを確認する。外部
+  から観測される順序は常に「終了要求 → 猶予 → (必要なら) kill → reap 確認 → 例外伝播 → temp dir
+  cleanup」であり、逆順にはならない。ただし PR #2650 fix_delta（P1-1/P1-2）以降、この収束処理
+  （``terminate_all_active_child_processes()``）自体は SIGINT/SIGTERM の生の Python シグナルハンドラの
+  中では実行しない -- ハンドラは「中断要求の記録（`_request_interrupt()`）＋即時 raise」のみに限定され、
+  `_ACTIVE_CHILD_PROCESSES_LOCK` の取得やブロッキング待機を一切行わない。実際の収束処理は
+  `run_scoped_temp_dir()` 自身の `finally`（通常の制御フロー、シグナルハンドラではない）で、raise された
+  `RunInterrupted` がそこまで unwind してきた後に実行する。これは evaluator のように main thread が
+  自身の子プロセスを同期呼び出し中（`_lifecycle_subprocess_run()`）に割り込まれるケースで、シグナル
+  ハンドラが「自分自身が所有する子プロセスの reap 完了」を待とうとして自己待機する構造的欠陥（および
+  同一 Lock の再取得によるデッドロック）を防ぐ。main thread 自身が所有する子プロセスは、その
+  `_lifecycle_subprocess_run()` 自身の `finally` で inline に reap される（signal handler や別スレッドの
+  reap 完了に依存しない）。また `Popen()` 完了から registry 登録（`_promote_launch_to_active()`）までの
+  間に親 interrupt が競合しても、その launch は `_reserve_launch_slot()`/`_LAUNCHES_IN_FLIGHT` により
+  収束対象から漏れない（一度の registry snapshot だけで収束済みと判定しない）
 - `observer_wave_concurrency_model: fan_out_fan_in_all_terminal` -- `run_observer_wave()` は required
   observer 全件を、先に dispatch した observer の completion を待たずに同時 dispatch（fan-out）し、
   全件が terminal になるまで待つ（fan-in）。1 件の通常失敗（malformed/schema 不一致/nonzero exit 等）は

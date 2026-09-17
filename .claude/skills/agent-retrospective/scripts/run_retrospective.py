@@ -1262,32 +1262,60 @@ def build_agent_invocation_argv(
 
 
 # ---------------------------------------------------------------------------
-# child-process lifecycle registry (Issue #2646 AC6): a small, module-level
-# process-handle registry (never a general concurrency/security framework --
-# OWNER review anchor comment's "推奨する実装の形") that lets a SIGINT/SIGTERM
-# delivered to THIS process locate and terminate every still-running
-# observer subprocess dispatched by `run_observer_wave`'s fan-out, and lets
-# an observer's OWN per-request timeout be handled as terminate -> bounded
-# grace -> kill -> reap rather than an unconditional immediate kill. These
-# two paths are deliberately kept separate (case (b) vs case (c) below):
+# child-process lifecycle registry (Issue #2646 AC6; P1-1/P1-2 fix_delta
+# hardening): a small, module-level process-handle registry (never a general
+# concurrency/security framework -- OWNER review anchor comment's "推奨する
+# 実装の形") that lets a SIGINT/SIGTERM delivered to THIS process locate and
+# terminate every still-running observer subprocess dispatched by
+# `run_observer_wave`'s fan-out (and the evaluator's own main-thread-owned
+# subprocess), and lets an observer's OWN per-request timeout be handled as
+# terminate -> bounded grace -> kill -> reap rather than an unconditional
+# immediate kill. These two paths are deliberately kept separate (case (b)
+# vs case (c) below):
 #   - case (b) (`_terminate_and_reap_process`, called from
-#     `_lifecycle_subprocess_run`'s OWN worker thread after ITS OWN
-#     `communicate(timeout=...)` already raised `TimeoutExpired`) safely
+#     `_lifecycle_subprocess_run`'s OWN thread -- ordinary control flow,
+#     NEVER a signal handler -- either after ITS OWN
+#     `communicate(timeout=...)` already raised `TimeoutExpired`, or in its
+#     own `finally` when some OTHER exception unwound that same call) safely
 #     calls `Popen.communicate()` again on that SAME Popen -- an officially
 #     supported retry pattern (see `subprocess.Popen.communicate`'s own
 #     docstring) because only ONE thread (the one that owns this Popen) is
 #     ever the party -- and always has been the ONLY party -- calling
-#     `communicate()`/`wait()` on it.
-#   - case (c) (`terminate_all_active_child_processes`, called from
-#     `run_scoped_temp_dir`'s SIGINT/SIGTERM handler, i.e. the MAIN thread)
+#     `communicate()`/`wait()` on it. This is also the mechanism a
+#     main-thread-owned subprocess (e.g. the evaluator, invoked synchronously
+#     from `run_cli`'s main thread -- Issue #2646 P1-1 fix_delta) reaps
+#     ITSELF when a signal-raised `RunInterrupted` unwinds its own blocked
+#     `communicate()` call: this thread's own `finally` performs the reap
+#     inline, never depending on a signal handler or a peer thread to do it
+#     (that dependency was the pre-fix_delta "self-wait": the SIGINT/SIGTERM
+#     handler used to poll THIS registry waiting for the owning thread's own
+#     unregister -- but when the owning thread WAS the interrupted thread,
+#     itself frozen inside the nested handler call, it could never reach
+#     that unregister until the handler -- which was doing the waiting --
+#     returned).
+#   - case (c) (`terminate_all_active_child_processes`, called from ORDINARY
+#     control flow -- `run_scoped_temp_dir`'s own `finally`, and
+#     `run_observer_wave`'s fan-in `except` clause -- NEVER from inside the
+#     raw OS signal handler itself, see `_request_interrupt`'s docstring)
 #     NEVER calls `communicate()`/`wait()` on a process it does not own --
-#     doing so concurrently with the owning worker thread's own in-flight
+#     doing so concurrently with the owning thread's own in-flight
 #     `communicate()` call is unsafe (not thread-safe per the stdlib). It
 #     only ever sends signals (`terminate()`/`kill()`, both plain
-#     `os.kill()` calls, safe from any thread) and then polls this
-#     registry until the owning thread's own `finally:
-#     _unregister_active_child_process(...)` confirms the reap actually
-#     happened.
+#     `os.kill()` calls, safe from any thread) and then polls this registry
+#     (and `_LAUNCHES_IN_FLIGHT`, see below) until the owning thread's own
+#     `finally: _unregister_active_child_process(...)` confirms the reap
+#     actually happened.
+#
+# `_LAUNCHES_IN_FLIGHT` (Issue #2646 P1-2 fix_delta) closes the race between
+# a child's `Popen()` completing and this registry actually recording it:
+# `_reserve_launch_slot()` reserves a handle (and refuses to reserve one at
+# all once an interrupt has already been requested) BEFORE `Popen()` ever
+# runs; `_promote_launch_to_active()` moves that SAME handle into the real
+# active registry the instant `Popen()` returns. A child that is Popen'ed
+# but not yet promoted is still visible (as "in flight") to
+# `terminate_all_active_child_processes()`'s convergence loop, which keeps
+# re-sampling BOTH sets until neither has anything left -- never declaring
+# convergence from a single one-shot snapshot.
 # ---------------------------------------------------------------------------
 
 #: Issue #2646 AC6: bounded grace period (seconds) between SIGTERM and a
@@ -1300,18 +1328,103 @@ _CHILD_PROCESS_TERMINATE_GRACE_SEC: float = 5.0
 
 _ACTIVE_CHILD_PROCESSES_LOCK = threading.Lock()
 _ACTIVE_CHILD_PROCESSES: dict[int, subprocess.Popen] = {}
+#: Issue #2646 P1-2 (fix_delta): handles reserved via `_reserve_launch_slot`
+#: whose `Popen()` has not (yet) been promoted into `_ACTIVE_CHILD_PROCESSES`
+#: -- the Popen()-completed/registration-pending race window closer.
+_LAUNCHES_IN_FLIGHT: set[int] = set()
 _ACTIVE_CHILD_PROCESS_HANDLE_SEQ = itertools.count()
 
+#: Issue #2646 P1-1 (fix_delta): the ONLY two pieces of state a signal
+#: handler is ever allowed to touch (see `_request_interrupt`). Setting a
+#: `threading.Event` takes that Event's OWN internal lock -- never
+#: `_ACTIVE_CHILD_PROCESSES_LOCK` -- so this can never self-deadlock the way
+#: re-acquiring `_ACTIVE_CHILD_PROCESSES_LOCK` from inside the handler could
+#: (the exact pre-fix_delta bug: if the interrupted thread already held that
+#: Lock -- e.g. mid `_reserve_launch_slot`/`_promote_launch_to_active` -- a
+#: handler that tried to re-acquire the SAME non-reentrant `Lock` on that
+#: SAME thread would block forever). `_INTERRUPT_SIGNUM` is a single plain
+#: attribute write (atomic under the GIL); it is only ever READ after
+#: `_INTERRUPT_REQUESTED.is_set()` is already `True`.
+_INTERRUPT_REQUESTED = threading.Event()
+_INTERRUPT_SIGNUM: int | None = None
 
-def _register_active_child_process(proc: "subprocess.Popen") -> int:
-    handle_id = next(_ACTIVE_CHILD_PROCESS_HANDLE_SEQ)
+
+def _current_interrupt_signum() -> int:
+    """Best-effort signum for a `RunInterrupted` raised somewhere other than
+    directly inside the signal handler itself (e.g. `_reserve_launch_slot`
+    refusing a brand-new launch, or `_lifecycle_subprocess_run` noticing
+    `_INTERRUPT_REQUESTED` after its own child already completed
+    naturally). Falls back to `SIGTERM` in the (should-never-happen) case
+    this is read before `_INTERRUPT_SIGNUM` was ever set."""
+    return _INTERRUPT_SIGNUM if _INTERRUPT_SIGNUM is not None else signal.SIGTERM
+
+
+def _request_interrupt(signum: int) -> None:
+    """Issue #2646 P1-1 (fix_delta): the ENTIRE body of work a signal
+    handler is ever allowed to perform -- no `_ACTIVE_CHILD_PROCESSES_LOCK`
+    acquisition, no blocking wait, no `terminate()`/`kill()` calls, no reap
+    polling. Just records that an interrupt was requested so ordinary
+    (non-signal) control flow can react: `_reserve_launch_slot` refuses new
+    launches once this is set, and `terminate_all_active_child_processes`
+    (called from ordinary code -- `run_scoped_temp_dir`'s own `finally`, or
+    `run_observer_wave`'s fan-in `except` clause -- never from the handler
+    itself) performs the actual terminate -> grace -> kill -> reap
+    convergence."""
+    global _INTERRUPT_SIGNUM
+    _INTERRUPT_SIGNUM = signum
+    _INTERRUPT_REQUESTED.set()
+
+
+def _reset_interrupt_state() -> None:
+    """Issue #2646 P1-2 (fix_delta): re-armed at both the start and the end
+    of every `run_scoped_temp_dir` use so one run's interrupt FLAG
+    (module-global, shared across every run in this same process -- e.g.
+    across tests) can never leak into the next run and make
+    `_reserve_launch_slot` refuse every launch before that next run even
+    begins. Deliberately never touches `_ACTIVE_CHILD_PROCESSES` /
+    `_LAUNCHES_IN_FLIGHT` themselves: those reflect REAL, currently-live
+    process handles that may have been registered from code running
+    entirely OUTSIDE this exact context-manager scope (e.g. a worker
+    thread's own already-in-flight dispatch) and must never be silently
+    discarded out from under their owning thread -- only that owning
+    thread's own `_unregister_active_child_process` may ever remove them."""
+    global _INTERRUPT_SIGNUM
+    _INTERRUPT_REQUESTED.clear()
+    _INTERRUPT_SIGNUM = None
+
+
+def _reserve_launch_slot() -> int | None:
+    """Issue #2646 P1-2 (fix_delta): reserve a launch slot BEFORE `Popen()`
+    ever runs. Returns `None` (caller MUST NOT launch) once an interrupt has
+    already been requested -- this module never starts a brand-new child
+    after that point."""
     with _ACTIVE_CHILD_PROCESSES_LOCK:
+        if _INTERRUPT_REQUESTED.is_set():
+            return None
+        handle_id = next(_ACTIVE_CHILD_PROCESS_HANDLE_SEQ)
+        _LAUNCHES_IN_FLIGHT.add(handle_id)
+        return handle_id
+
+
+def _promote_launch_to_active(handle_id: int, proc: "subprocess.Popen") -> None:
+    """Issue #2646 P1-2 (fix_delta): moves a reserved launch slot into the
+    real active registry the instant `Popen()` returns -- closes the
+    Popen()-completed/registration-pending race window `_reserve_launch_slot`
+    alone cannot: even if a parent interrupt lands in between, this child is
+    still visible (as "in flight") to `terminate_all_active_child_processes`
+    until this exact call runs, and visible (as "active") from it onward --
+    never a gap where it is visible to neither."""
+    with _ACTIVE_CHILD_PROCESSES_LOCK:
+        _LAUNCHES_IN_FLIGHT.discard(handle_id)
         _ACTIVE_CHILD_PROCESSES[handle_id] = proc
-    return handle_id
 
 
 def _unregister_active_child_process(handle_id: int) -> None:
+    """Removes ``handle_id`` from BOTH the in-flight and active views
+    (idempotent, harmless if it was never promoted -- e.g. ``Popen()``
+    itself raised before any promotion ever happened)."""
     with _ACTIVE_CHILD_PROCESSES_LOCK:
+        _LAUNCHES_IN_FLIGHT.discard(handle_id)
         _ACTIVE_CHILD_PROCESSES.pop(handle_id, None)
 
 
@@ -1345,51 +1458,88 @@ def _terminate_and_reap_process(proc: "subprocess.Popen", *, grace_sec: float | 
 def terminate_all_active_child_processes(
     *, grace_sec: float | None = None, reap_timeout_sec: float = 30.0
 ) -> list[int]:
-    """AC6 case (c): terminate every currently-registered child subprocess,
-    escalate to SIGKILL for any still alive after a bounded grace period,
-    then block (bounded by ``reap_timeout_sec``) until every one of them has
-    actually been reaped by its OWNING worker thread (see module note
-    above for why this never calls ``communicate()``/``wait()`` itself).
-    Called synchronously from `run_scoped_temp_dir`'s SIGINT/SIGTERM
-    handler BEFORE ``RunInterrupted`` is raised, so callers always observe:
-    terminate -> grace -> kill -> reap confirmed -> (exception propagates)
-    -> temp dir cleanup (never the reverse). Returns the PIDs this call
-    acted on (diagnostics/tests)."""
+    """AC6 case (c) (Issue #2646 P1-1/P1-2 fix_delta hardening): the actual
+    terminate -> bounded grace -> kill -> reap CONVERGENCE step -- called
+    from ORDINARY control flow (`run_scoped_temp_dir`'s own `finally`,
+    `run_observer_wave`'s fan-in `except` clause) -- NEVER from inside the
+    raw OS signal handler itself (see `_request_interrupt`'s docstring for
+    why: no blocking convergence and no `_ACTIVE_CHILD_PROCESSES_LOCK`
+    acquisition may ever happen there).
+
+    Unlike a single one-shot registry snapshot, this repeatedly re-samples
+    BOTH `_LAUNCHES_IN_FLIGHT` (a child whose `Popen()` may not have
+    completed -- or may have completed but not yet been promoted into the
+    active registry -- at the exact instant an interrupt was requested) and
+    `_ACTIVE_CHILD_PROCESSES` until NEITHER contains anything: no launch is
+    still in flight, and every registered child has actually been reaped by
+    its OWNING thread's own `_lifecycle_subprocess_run` (never
+    `wait()`/`communicate()`'d from here). `_reserve_launch_slot` already
+    guarantees no BRAND NEW launch can begin once an interrupt has been
+    requested, so this in-flight/active state can only ever shrink once
+    that happens. A safe (idempotent) no-op when nothing was ever launched.
+    Returns the PIDs this call sent a signal to (diagnostics/tests)."""
     grace = _CHILD_PROCESS_TERMINATE_GRACE_SEC if grace_sec is None else grace_sec
+    seen_pids: set[int] = set()
+
+    def _terminate_currently_registered() -> bool:
+        """Sends `terminate()` to every currently-registered, still-alive
+        child. Returns whether everything has already converged (nothing in
+        flight, nothing registered)."""
+        with _ACTIVE_CHILD_PROCESSES_LOCK:
+            in_flight = bool(_LAUNCHES_IN_FLIGHT)
+            snapshot = dict(_ACTIVE_CHILD_PROCESSES)
+        for proc in snapshot.values():
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                else:
+                    seen_pids.add(proc.pid)
+        return not in_flight and not snapshot
+
+    deadline = time.monotonic() + grace
+    while True:
+        if _terminate_currently_registered():
+            return sorted(seen_pids)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+
+    # escalate: SIGKILL anything still alive after the grace period
+    # (including anything only JUST promoted at the very end of it).
     with _ACTIVE_CHILD_PROCESSES_LOCK:
         snapshot = dict(_ACTIVE_CHILD_PROCESSES)
-    if not snapshot:
-        return []
     for proc in snapshot.values():
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-    deadline = time.monotonic() + grace
-    remaining_ids = set(snapshot)
-    while remaining_ids and time.monotonic() < deadline:
-        with _ACTIVE_CHILD_PROCESSES_LOCK:
-            remaining_ids = {hid for hid in remaining_ids if hid in _ACTIVE_CHILD_PROCESSES}
-        if remaining_ids:
-            time.sleep(0.02)
-    with _ACTIVE_CHILD_PROCESSES_LOCK:
-        remaining_ids = {hid for hid in remaining_ids if hid in _ACTIVE_CHILD_PROCESSES}
-    for hid in remaining_ids:
-        proc = snapshot[hid]
         if proc.poll() is None:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
+            else:
+                seen_pids.add(proc.pid)
+
+    # bounded safety net: converge on both sets becoming empty -- never
+    # merely "the FIRST snapshot is now empty" -- escalating straight to
+    # `kill()` (skipping another full grace period) for anything that only
+    # shows up this late.
     reap_deadline = time.monotonic() + reap_timeout_sec
     while time.monotonic() < reap_deadline:
         with _ACTIVE_CHILD_PROCESSES_LOCK:
-            still_present = any(hid in _ACTIVE_CHILD_PROCESSES for hid in snapshot)
-        if not still_present:
+            converged = not _LAUNCHES_IN_FLIGHT and not _ACTIVE_CHILD_PROCESSES
+            snapshot = dict(_ACTIVE_CHILD_PROCESSES)
+        if converged:
             break
+        for proc in snapshot.values():
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                else:
+                    seen_pids.add(proc.pid)
         time.sleep(0.02)
-    return [proc.pid for proc in snapshot.values()]
+    return sorted(seen_pids)
 
 
 def _lifecycle_subprocess_run(
@@ -1402,36 +1552,85 @@ def _lifecycle_subprocess_run(
     text: bool = True,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess:
-    """Issue #2646 AC6: the production default ``runner`` for
+    """Issue #2646 AC6 (P1-1/P1-2 fix_delta hardening): the production
+    default ``runner`` for
     ``invoke_agent``/``invoke_agent_with_role_adapter``/``run_cli``. From
     the caller's point of view this behaves exactly like
     ``subprocess.run(argv, cwd=cwd, env=env, input=input,
     capture_output=capture_output, text=text, timeout=timeout)`` (same
     ``CompletedProcess`` return shape, same ``subprocess.TimeoutExpired`` on
-    timeout) EXCEPT the live ``Popen`` handle is kept registered in this
-    module's active-child-process registry for its entire lifetime (so a
-    parent SIGINT/SIGTERM can find and terminate it -- case (c)), and its
-    OWN timeout is handled as terminate -> bounded grace -> kill -> reap
-    (case (b)) rather than the unconditional immediate ``kill()`` the
-    stdlib's own ``subprocess.run`` performs on timeout."""
-    proc = subprocess.Popen(
-        list(argv),
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE if capture_output else None,
-        stderr=subprocess.PIPE if capture_output else None,
-        text=text,
-    )
-    handle_id = _register_active_child_process(proc)
+    timeout) EXCEPT:
+
+    - a launch slot is reserved (`_reserve_launch_slot`) BEFORE ``Popen()``
+      ever runs, and refused (raising ``RunInterrupted``, never starting a
+      process) once a parent interrupt has already been requested;
+    - the live ``Popen`` handle is promoted into this module's
+      active-child-process registry the INSTANT ``Popen()`` returns (so a
+      parent SIGINT/SIGTERM can find and terminate it -- case (c) -- even if
+      it arrives in the narrow window right after ``Popen()`` but before
+      this function would otherwise have registered it);
+    - its OWN timeout is handled as terminate -> bounded grace -> kill ->
+      reap (case (b)) rather than the unconditional immediate ``kill()`` the
+      stdlib's own ``subprocess.run`` performs on timeout;
+    - THIS thread reaps its OWN child inline, in its own ``finally``,
+      regardless of *why* the block below unwound -- a signal-raised
+      ``RunInterrupted`` while blocked in ``communicate()`` (e.g. a
+      main-thread-owned evaluator invocation) never depends on the signal
+      handler, or a peer thread, to do that reap (Issue #2646 P1-1: this is
+      what makes a main-thread-owned child's own interruption never
+      self-wait on its own not-yet-reached ``finally``);
+    - if an interrupt was already requested BEFORE this exact call ever
+      began, this raises ``RunInterrupted`` immediately and never starts a
+      process at all; once a process HAS been started, this child being
+      reached by the parent interrupt (via
+      ``terminate_all_active_child_processes``'s own ``terminate()``/
+      ``kill()``) is observed here as an ordinary (signal-shaped, negative)
+      ``returncode`` on a normal return -- exactly like ``subprocess.run``
+      itself would report it -- never as an exception this call's own
+      caller has to additionally special-case."""
+    handle_id = _reserve_launch_slot()
+    if handle_id is None:
+        raise RunInterrupted(_current_interrupt_signum())
+    proc: "subprocess.Popen | None" = None
     try:
+        proc = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE if capture_output else None,
+            stderr=subprocess.PIPE if capture_output else None,
+            text=text,
+        )
+        _promote_launch_to_active(handle_id, proc)
         try:
             stdout, stderr = proc.communicate(input=input, timeout=timeout)
         except subprocess.TimeoutExpired:
-            _terminate_and_reap_process(proc)
             raise subprocess.TimeoutExpired(cmd=list(argv), timeout=timeout) from None
+        # Issue #2646 P1-2 (fix_delta): deliberately does NOT raise
+        # `RunInterrupted` merely because `_INTERRUPT_REQUESTED` happens to
+        # be set once `communicate()` returns -- a parent SIGINT/SIGTERM
+        # that reaches THIS child (via `terminate_all_active_child_processes`
+        # sending it a real `terminate()`/`kill()`) is observed here as an
+        # ordinary negative `returncode`, exactly like `subprocess.run`
+        # itself would report it -- never as an exception the caller has to
+        # additionally special-case (AC6's pre-existing
+        # terminate-vs-timeout distinction: this call returning NORMALLY
+        # here, with a signal-shaped `returncode`, is exactly what proves
+        # the child was actually reached by the terminate/kill escalation
+        # rather than left to run out its own timeout).
         return subprocess.CompletedProcess(args=list(argv), returncode=proc.returncode, stdout=stdout, stderr=stderr)
     finally:
+        # Issue #2646 P1-1 (fix_delta): guarantee THIS thread's own child is
+        # actually terminated and reaped -- a REAL `os.waitpid` outcome
+        # (`proc.poll()`), never merely "removed from this dict" -- before
+        # its handle is ever removed from the registry, on ANY abnormal
+        # unwind of the block above (this own timeout already reaps via the
+        # `except` clause, but a signal-raised `RunInterrupted` or any other
+        # exception reaches this SAME guarantee here). Never `unregister`
+        # without confirming the reap first.
+        if proc is not None and proc.poll() is None:
+            _terminate_and_reap_process(proc)
         _unregister_active_child_process(handle_id)
 
 
@@ -2121,7 +2320,12 @@ def run_observer_wave(
         try:
             bundle = parse_agent_output_with_repair(raw_text, EvidenceBundle, repair=repair)
         except WireContractError as exc:
-            return request, None, exc, getattr(exc, "reason_code", type(exc).__name__), None
+            # Issue #2646 P2 (fix_delta): the underlying process already
+            # completed with `result.exit_code` (e.g. `0`) BEFORE this
+            # post-process schema validation ever ran -- that observed
+            # exit code is never discarded merely because the *content* it
+            # produced later failed validation.
+            return request, None, exc, getattr(exc, "reason_code", type(exc).__name__), result.exit_code
         # Issue #2646 AC4 / anchor review P1 finding #1: the REQUEST-side
         # agent_name is the aggregate's identity authority -- a returned
         # `observer_id` that does not match the observer THIS request
@@ -2133,27 +2337,38 @@ def run_observer_wave(
             exc = ObserverWaveFailed(
                 f"observer_id_mismatch:request={request.agent_name}:returned={bundle.observer_id}",
                 reason_code="observer_id_mismatch",
+                # Issue #2646 P2 (fix_delta): preserve the real observed
+                # exit code (typically `0` -- the process itself
+                # succeeded) even though this identity check fails it.
+                exit_code=result.exit_code,
             )
             return request, None, exc, exc.reason_code, exc.exit_code
         if bundle.run_id != ctx.run_id:
             exc = ObserverWaveFailed(
                 f"observer_run_id_mismatch:{request.agent_name}",
                 reason_code="observer_run_id_mismatch",
+                exit_code=result.exit_code,
             )
             return request, None, exc, exc.reason_code, exc.exit_code
         if bundle.source_set_digest != plan.source_set_digest:
             exc = ObserverWaveFailed(
                 f"observer_source_set_digest_mismatch:{request.agent_name}",
                 reason_code="observer_source_set_digest_mismatch",
+                exit_code=result.exit_code,
             )
             return request, None, exc, exc.reason_code, exc.exit_code
         if bundle.base_sha != ctx.base_sha:
             exc = ObserverWaveFailed(
                 f"observer_base_sha_mismatch:{request.agent_name}",
                 reason_code="observer_base_sha_mismatch",
+                exit_code=result.exit_code,
             )
             return request, None, exc, exc.reason_code, exc.exit_code
-        return request, bundle, None, None, None
+        # Issue #2646 P2 (fix_delta): thread the real observed
+        # `result.exit_code` through on the success path too -- previously
+        # this was hardcoded to `None`, discarding it even when the
+        # process exited cleanly (`0`).
+        return request, bundle, None, None, result.exit_code
 
     # Fan-out: every request is SUBMITTED before this call site ever blocks
     # on any one of them (AC3) -- `ThreadPoolExecutor.submit` returns
@@ -2162,14 +2377,32 @@ def run_observer_wave(
     # of every other dispatched observer's own progress.
     with ThreadPoolExecutor(max_workers=_observer_wave_max_workers(len(observer_requests))) as executor:
         futures = [executor.submit(_process_one, request) for request in observer_requests]
-        # Fan-in: wait for EVERY dispatched observer to reach a terminal
-        # outcome -- a failure in one future is never allowed to cancel or
-        # skip collection of the others (AC1). Iterated in REQUEST order
-        # (not completion order) so downstream ordering (duplicate
-        # detection, `bundles` list order) stays deterministic regardless
-        # of which observer actually finishes first. `_process_one` never
-        # raises, so `.result()` here never raises either.
-        outcomes = [future.result() for future in futures]
+        try:
+            # Fan-in: wait for EVERY dispatched observer to reach a terminal
+            # outcome -- a failure in one future is never allowed to cancel
+            # or skip collection of the others (AC1). Iterated in REQUEST
+            # order (not completion order) so downstream ordering (duplicate
+            # detection, `bundles` list order) stays deterministic
+            # regardless of which observer actually finishes first.
+            # `_process_one` never raises for an ORDINARY per-observer
+            # failure (it always returns a tuple), so `.result()` here only
+            # ever raises for a genuine parent-interrupt-raised
+            # `RunInterrupted` (this thread was blocked waiting on a PEER
+            # worker thread's own future when the signal fired) or an
+            # equally unexpected bug.
+            outcomes = [future.result() for future in futures]
+        except BaseException:
+            # Issue #2646 P1-2 (fix_delta): a PEER worker thread's own
+            # subprocess is never this thread's to `communicate()`/`wait()`
+            # on directly, but (whether it is fully registered yet or only
+            # `_reserve_launch_slot`-reserved/mid-`Popen()`) it must be
+            # actively drained NOW, from this ORDINARY control flow (never
+            # the signal handler itself), so this `with ThreadPoolExecutor`
+            # block's own `__exit__` (`shutdown(wait=True)`) below never
+            # blocks on a peer that would otherwise run to its own
+            # unbounded natural completion.
+            terminate_all_active_child_processes()
+            raise
 
     seen_ids: set[str] = set()
     bundles: list[EvidenceBundle] = []
@@ -2195,18 +2428,28 @@ def run_observer_wave(
             dup_exc = ObserverWaveFailed(
                 f"duplicate_observer_id:{request.agent_name}", reason_code="duplicate_observer_id"
             )
-            _record_failure(request, dup_exc, dup_exc.reason_code, None)
+            # Issue #2646 P2 (fix_delta): `exit_code` here is the outcome
+            # tuple's own observed exit code (the process behind this
+            # bundle already completed, typically `0`) -- never discarded
+            # merely because a cross-observer duplicate check fails it.
+            _record_failure(request, dup_exc, dup_exc.reason_code, exit_code)
             continue
         if expected_ids is not None and request.agent_name not in expected_ids:
             unmanifested_exc = ObserverWaveFailed(
                 f"observer_id_not_in_manifest:{request.agent_name}", reason_code="observer_id_not_in_manifest"
             )
-            _record_failure(request, unmanifested_exc, unmanifested_exc.reason_code, None)
+            _record_failure(request, unmanifested_exc, unmanifested_exc.reason_code, exit_code)
             continue
         seen_ids.add(request.agent_name)
         bundles.append(bundle)
+        # Issue #2646 P2 (fix_delta): thread the real observed
+        # `exit_code` (this outcome's own, from `_process_one`'s success
+        # return) into the success record too, instead of hardcoding
+        # `None`.
         observer_results.append(
-            ObserverWaveObserverResult(observer_id=request.agent_name, status="ok", reason_code=None, exit_code=None)
+            ObserverWaveObserverResult(
+                observer_id=request.agent_name, status="ok", reason_code=None, exit_code=exit_code
+            )
         )
 
     if not failures and expected_ids is not None and seen_ids != expected_ids:
@@ -4144,19 +4387,42 @@ def run_scoped_temp_dir(run_id: str, *, base_dir: Path | None = None):
     Cleanup failure (``shutil.rmtree`` raising) is surfaced -- not silently
     swallowed -- so callers observe a leaked private temp directory rather
     than believing cleanup silently succeeded (Issue #2237 fix_delta gate
-    #12: ``test_temp_scope_is_on_production_path_and_cleanup_failure_surfaces``)."""
+    #12: ``test_temp_scope_is_on_production_path_and_cleanup_failure_surfaces``).
+
+    Issue #2646 P1-1/P1-2 (fix_delta): the SIGINT/SIGTERM handler installed
+    here is deliberately minimal (see `_request_interrupt`'s docstring) --
+    it never touches `_ACTIVE_CHILD_PROCESSES_LOCK` and never runs the
+    actual terminate/grace/kill/reap convergence itself. That convergence
+    (`terminate_all_active_child_processes`) instead runs in this context
+    manager's own `finally`, i.e. from ORDINARY control flow once the
+    signal-raised `RunInterrupted` has already unwound back to here -- the
+    externally-observable ordering callers rely on is unchanged (every
+    still-running child is confirmed terminated and reaped BEFORE this
+    `finally`'s own `shutil.rmtree` ever runs -- terminate -> grace -> kill
+    -> reap confirmed -> temp dir cleanup, never the reverse), but a
+    main-thread-owned child (e.g. the evaluator) is now reaped inline by its
+    OWN `_lifecycle_subprocess_run` call frame as that exception unwinds
+    through it, rather than by this handler polling a registry entry only
+    that exact call frame could ever remove (the pre-fix_delta self-wait)."""
     base = base_dir if base_dir is not None else Path(tempfile.gettempdir())
     path = base / f"agent-retrospective-run-{run_id}"
     path.mkdir(mode=0o700, parents=True, exist_ok=False)
     os.chmod(path, 0o700)  # explicit: `mkdir(mode=...)` is masked by umask
 
+    # Issue #2646 P1-2 (fix_delta): re-armed at the START of every use so a
+    # PRIOR run's interrupt/registry state (module-global, shared across
+    # runs in this same process -- e.g. across tests) can never leak into
+    # THIS run.
+    _reset_interrupt_state()
+
     def _signal_handler(signum: int, _frame: Any) -> None:
-        # Issue #2646 AC6 case (c): terminate every still-running child
-        # subprocess (bounded grace -> kill escalation) and confirm every
-        # one has actually been reaped by its OWNING worker thread BEFORE
-        # this raises -- so this context manager's own `finally` cleanup
-        # below never runs while a child this run launched is still alive.
-        terminate_all_active_child_processes()
+        # Issue #2646 P1-1 (fix_delta): see `_request_interrupt`'s own
+        # docstring -- this is the ENTIRE body of work this handler is ever
+        # allowed to perform. The actual terminate -> grace -> kill -> reap
+        # convergence happens below, in this context manager's OWN
+        # `finally` (ordinary control flow, never signal-handler code),
+        # once this raise has already unwound back to it.
+        _request_interrupt(signum)
         raise RunInterrupted(signum)
 
     previous_handlers: dict[int, Any] = {}
@@ -4166,9 +4432,19 @@ def run_scoped_temp_dir(run_id: str, *, base_dir: Path | None = None):
     try:
         yield path
     finally:
-        for sig, handler in previous_handlers.items():
-            signal.signal(sig, handler)
-        shutil.rmtree(path)
+        try:
+            # Issue #2646 P1-1/P1-2 (fix_delta): the real terminate ->
+            # bounded grace -> kill -> reap CONVERGENCE (never performed by
+            # the signal handler itself) -- runs unconditionally (a cheap,
+            # idempotent no-op when nothing was ever launched) so it also
+            # covers an ordinary non-signal exception raised while a child
+            # happened to still be mid-launch.
+            terminate_all_active_child_processes()
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
+            shutil.rmtree(path)
+            _reset_interrupt_state()
 
 
 # ---------------------------------------------------------------------------
