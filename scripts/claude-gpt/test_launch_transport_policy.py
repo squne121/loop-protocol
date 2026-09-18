@@ -349,6 +349,30 @@ def test_transport_override_applies_even_without_parent_env_set(tmp_path):
     assert captured.get("CCP_CODEX_TRANSPORT") == "http"
 
 
+@pytest.mark.parametrize(
+    "extra_env",
+    [
+        pytest.param(None, id="parent_env_unset"),
+        pytest.param({"CCP_AUTO_REVIEW_MODEL": "gpt-5.6-luna"}, id="parent_env_overridden"),
+    ],
+)
+def test_auto_review_model_override_reaches_child_env_as_terra(tmp_path, extra_env):
+    """GIVEN 親 env に CCP_AUTO_REVIEW_MODEL が未設定、または他の値
+    （例: gpt-5.6-luna）で設定されている
+    WHEN launch.sh --check-only を実行する
+    THEN fake proxy が capture した child env の CCP_AUTO_REVIEW_MODEL は
+    どちらのケースでも "gpt-5.6-terra" になる（Issue #2654: launcher-owned な
+    CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY が、親 env の有無・値に関わらず優先
+    される実効値を検証する。静的な定義行 grep だけでは、この実効値が
+    意図せず上書きされても検知できない）
+    """
+    result = _run_check_only(tmp_path, extra_env=extra_env)
+    assert result.returncode == 0, result.stderr
+
+    captured = _read_captured_env(tmp_path)
+    assert captured.get("CCP_AUTO_REVIEW_MODEL") == "gpt-5.6-terra"
+
+
 # --- unrelated parent variables の scrub 確認（AC4） -----------------------------
 
 

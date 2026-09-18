@@ -221,13 +221,17 @@ CLAUDE_GPT_MODEL_HAIKU="gpt-5.6-luna[1m]"
 # upstream raine/claude-code-proxy（pinned 0.1.34）は non-streaming・tool-free な
 # auto mode classifier request（`apply_auto_review_model()`）を `CCP_AUTO_REVIEW_MODEL`
 # 未設定時、provider が codex なら無条件で `gpt-5.6-luna` （`CODEX_AUTO_REVIEW_MODEL`
-# 定数）へ固定 fallback する。native Claude Code の auto mode classifier は既定で
-# Claude Sonnet 5 上で動作する（`code.claude.com/docs/en/permission-modes`）ため、
-# Claude-GPT 側の classifier destination は本来の session model である
-# `CLAUDE_GPT_MODEL_SONNET`（gpt-5.6-terra）に揃えるのが native 相当に最も近い。
-# 未設定時の実効挙動（Issue #2654 bounded comparison A: proxy log 実測で
-# classifier request 1030/1030件が gpt-5.6-luna へ固定到達）との比較結果は
-# Issue #2654 本文に記録する。
+# 定数）へ固定 fallback する。この未設定時デフォルトを避けるため、claude-gpt
+# launcher 側で classifier 専用のモデル選択を明示し、候補として `gpt-5.6-terra`
+# を採用した。native Claude Code の auto mode classifier は `/model` で選択した
+# session model とは独立に既定で Claude Sonnet 5 上で動作する
+# （`code.claude.com/docs/en/permission-modes`）ため、session model と揃えることが
+# native 相当になるという根拠はない。`gpt-5.6-terra` の採用はあくまで launcher が
+# 明示的に選んだ候補という位置づけであり、native classifier（Sonnet 5）との性能
+# 同等性、および `gpt-5.6-luna` 比での過剰拒否率・latency の改善は未検証である。
+# classifier request の到達先が `gpt-5.6-terra` へ変更されたこと自体は Issue #2654
+# の bounded comparison（proxy log 実測で classifier request 1030/1030件が
+# 変更前は gpt-5.6-luna へ固定到達していたことの確認）で確認済みである。
 CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-5.6-terra"
 
 # claude_gpt_strip_context_hint: model alias 末尾の `[1m]` 等 context-window hint suffix
