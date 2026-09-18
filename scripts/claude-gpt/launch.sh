@@ -1610,6 +1610,12 @@ while [ "$PORT_ATTEMPTS" -lt "$PORT_MAX_ATTEMPTS" ] && [ "$READY" != "true" ]; d
   # CCP_CODEX_TRANSPORT は repository-owned の CLAUDE_GPT_CODEX_TRANSPORT_POLICY（lib.sh
   # 単一 source of truth）を無条件で渡し、isolated proxy config.json や upstream
   # built-in default の websocket よりも優先させる（Issue #2204）。
+  # CCP_AUTO_REVIEW_MODEL は repository-owned の CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY
+  # （lib.sh 単一 source of truth）を無条件で渡す。未設定時 upstream proxy は
+  # non-streaming・tool-free な auto mode classifier request を provider=codex の
+  # 場合無条件で gpt-5.6-luna へ fallback する（Issue #2654 bounded comparison A:
+  # proxy log 実測で 1030/1030 件が gpt-5.6-luna へ固定到達）ため、session model と
+  # 揃えるために明示上書きする。
   env -i \
     "PATH=$PATH" \
     "HOME=$PROXY_HOME_TARGET" \
@@ -1618,6 +1624,7 @@ while [ "$PORT_ATTEMPTS" -lt "$PORT_MAX_ATTEMPTS" ] && [ "$READY" != "true" ]; d
     "CCP_BIND_ADDRESS=127.0.0.1" \
     "CCP_LOG_STDERR=1" \
     "CCP_CODEX_TRANSPORT=$CLAUDE_GPT_CODEX_TRANSPORT_POLICY" \
+    "CCP_AUTO_REVIEW_MODEL=$CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY" \
     "$PROXY_BIN_TARGET" serve --port "$PROXY_PORT" --no-monitor > "$PROXY_LOG" 2>&1 &
   PROXY_PID=$!
 
