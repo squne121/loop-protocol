@@ -94,6 +94,28 @@ Issue #2467 AC8: 上記 2 行は、Issue の Allowed Paths 内の repo-relative 
 - `tee`, `>`, `>>`, `mkdir -p` は `artifacts/` 配下への証跡生成に限る
 - 実行後に artifact path を `runtime_ac_results[].notes` または `artifact_present` に記録する
 
+### Issue #2656 限定 narrow exception（canonical delegation route runtime probe）
+
+上記「動作検証 VC」例外は network side effect を含む script を対象外とするが、
+Issue #2656 の AC1 は canonical delegation route（`run_gemini_headless.run_delegation()`）
+経由で実際の `agy` child process を起動する runtime verification を必須とする。
+以下の固定コマンド 1 パターンに限り、network side effect を含む実行を許可する
+（他の任意 Python 実行・任意 network access には一切拡張しない）。
+
+```bash
+AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST=1 AGY_PREFLIGHT_RUNTIME_ACCOUNT_SESSION_MODE=1 \
+  uv run python .claude/skills/gemini-cli-headless-delegation/tests/test_agy_structured_output_capability_runtime.py \
+  --stage2-model-backed --caller-context claude-gpt
+```
+
+許可条件（すべて満たす場合のみ）:
+- スクリプトパスが `.claude/skills/gemini-cli-headless-delegation/tests/test_agy_structured_output_capability_runtime.py` と完全一致し、フラグが `--stage2-model-backed --caller-context claude-gpt` と完全一致する（引数の追加・省略・置換は不可）
+- 環境変数は `AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST=1` と `AGY_PREFLIGHT_RUNTIME_ACCOUNT_SESSION_MODE=1` の 2 つのみを付与する
+- 実行経路は canonical AGY route（`run_gemini_headless.run_delegation()`）のみであり、他の任意 network access には拡張しない
+- 書き込み先はスクリプト自身が生成する worktree-local `artifacts/` 配下の証跡に限定される（test-runner 自身はファイル書き込みを行わない）
+- 実行結果（exit code・stdout の verdict/reason・artifact path）を `runtime_ac_results[].notes` に記録する
+- 本例外は Issue #2656 が固定するこの 1 コマンドパターンにのみ適用され、他の Issue・他のスクリプト・他の引数の組み合わせへ一般化しない
+
 ## 実行してはいけないコマンド
 
 - `echo ... > file` / `tee` / `sed -i` 等のファイル書き込み
