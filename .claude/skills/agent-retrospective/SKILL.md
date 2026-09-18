@@ -354,6 +354,26 @@ fail-closed に解決・保存する resolver。v1 は project Skill only（`plu
   返す public-only 経路は存在しない。ChatGPT 等の GitHub-only reader が既存 public artifact のみ
   から claim 真偽を独自判定する手段は提供しない。
 
+## since-last-retrospective の checkpoint 確定（Issue #2644）
+
+`run_retrospective.py --since-last-retrospective` の checkpoint/watermark 書き戻しは、収集・coverage
+計算（`collect_session_sources()`/`build_session_window_coverage_result()`）の直後ではなく、
+`analysis_runner`（`--enable-full-analysis` 指定時は `build_since_last_analysis_runner()` 経由の
+`run_cli()` 呼び出し）が observer/evaluator/finalize まで成功した後にのみ行われる。同一 run で
+固定した window・選択 session 集合・collector 結果は `build_runtime_observer_task_prompt()` を通じて
+`retrospective-runtime-observer` の実プロンプトへそのまま渡され、`run_cli()` の
+`current_source_coverage` 引数として `compute_delta()` / canonical `finding_contract.evaluations[]`
+生成経路の両方に同一の current source coverage 判定入力として伝播する。observer/evaluator/finalize が
+失敗した場合は `checkpoint_advanced: false` / `checkpoint_advance_reason: "blocked_evaluation_failure"`
+となり watermark ファイルへの書き込みは行われない（次回実行で同じ未分析 window が再選択される）。
+
+**checkpointの完了はGitHub投稿の成功と区別する。** 既存の `publish_authorized` 事前 authorization
+判定（`compute_checkpoint_disposition()` が参照する）は checkpoint 確定の入力の一つだが、
+`finalize()` 完了後に別処理が行う実際の GitHub comment/post（publication、`persist_retrospective_run.py`
+の責務）の成功・失敗は checkpoint 確定の入力に一切含めない。`analysis_runner` は `run_cli()`/
+`finalize()` が返す proposal-only `PublishRequest` の生成・受け渡しの完了までを指し、GitHub への
+実際の投稿呼び出しは行わない。
+
 ## Guardrails（ガードレール）
 
 - **Allowed Paths 外を編集しない**
