@@ -2531,6 +2531,617 @@ class TestExtension1PlainTextMarkerRecognition:
         assert identity["agent_type"] == "pr-reviewer"
         assert identity["source"] == module.AGENT_TYPE_SOURCE_PLAIN_MARKER
 
+
+# ---------------------------------------------------------------------------
+# Issue #2663: generic hook-chain evidence capability
+# (--require-hook-chain-evidence, evaluate_all_matching_hooks_observed,
+# evaluate_sibling_side_effect_inventory, evaluate_hook_chain_evidence).
+#
+# Every JSON shape below (hook_started/hook_response field names,
+# hook_name format, hook_id correlation, self-echoed stdin payload shape,
+# stop_hook_active field) was captured from REAL, live ``claude`` CLI
+# 2.1.277 output (``--include-hook-events --output-format stream-json``)
+# during this Issue's own implementation, not guessed from documentation.
+# ---------------------------------------------------------------------------
+
+
+def _hc_default_hook_name(hook_event: str) -> str:
+    """Mirrors the real, live-confirmed ``hook_name`` shape: ``"<event>"``
+    for a matcher-less event (Stop), ``"<event>:<tool>"`` for a
+    matcher-scoped event -- these fixtures only ever exercise the
+    PreToolUse/Bash target."""
+    return f"{hook_event}:Bash" if hook_event == "PreToolUse" else hook_event
+
+
+def _hc_hook_started_line(hook_id: str, hook_event: str, hook_name: str | None = None) -> str:
+    return json.dumps({
+        "type": "system", "subtype": "hook_started",
+        "hook_id": hook_id, "hook_name": hook_name or _hc_default_hook_name(hook_event),
+        "hook_event": hook_event, "session_id": "fixture-session",
+    })
+
+
+def _hc_hook_response_line(
+    hook_id: str, hook_event: str, *,
+    exit_code: int = 0, outcome: str = "success",
+    hook_name: str | None = None, self_echo_payload: dict | None = None,
+) -> str:
+    text = json.dumps(self_echo_payload) if self_echo_payload is not None else ""
+    return json.dumps({
+        "type": "system", "subtype": "hook_response",
+        "hook_id": hook_id, "hook_name": hook_name or _hc_default_hook_name(hook_event),
+        "hook_event": hook_event, "session_id": "fixture-session",
+        "output": text, "stdout": text, "stderr": "",
+        "exit_code": exit_code, "outcome": outcome,
+    })
+
+
+def _hc_bash_tool_use_line(tool_use_id: str, command: str = "echo hi") -> str:
+    return json.dumps({
+        "type": "assistant", "session_id": "fixture-session",
+        "message": {"content": [
+            {"type": "tool_use", "id": tool_use_id, "name": "Bash", "input": {"command": command}}
+        ]},
+    })
+
+
+def _hc_bash_tool_result_line(tool_use_id: str) -> str:
+    return json.dumps({
+        "type": "user", "session_id": "fixture-session",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tool_use_id, "content": "ok"}
+        ]},
+    })
+
+
+def _hc_pretool_observer_payload(tool_use_id: str, command: str = "echo hi") -> dict:
+    return {
+        "session_id": "fixture-session", "hook_event_name": "PreToolUse",
+        "tool_name": "Bash", "tool_input": {"command": command},
+        "tool_use_id": tool_use_id,
+    }
+
+
+def _hc_stop_observer_payload(stop_hook_active: bool) -> dict:
+    return {
+        "session_id": "fixture-session", "hook_event_name": "Stop",
+        "stop_hook_active": stop_hook_active,
+    }
+
+
+def _hc_pretool_window(
+    tool_use_id: str, *, sibling_ids: list[str], observer_id: str = "OBS",
+    denied_id: str | None = None, missing_response_id: str | None = None,
+    extra_unmatched_response_id: str | None = None,
+    reverse_response_order: bool = False, duplicate_started_id: str | None = None,
+) -> list[str]:
+    """One complete positive-or-deny scenario window (Issue #2663 AC5/AC6):
+    a Bash tool_use line immediately followed by the PreToolUse hook_started
+    /hook_response cluster (observer + siblings), immediately followed by
+    the tool_result line -- exactly the contiguous shape confirmed live."""
+    lines = [_hc_bash_tool_use_line(tool_use_id)]
+    started_ids = [observer_id] + [sid for sid in sibling_ids if sid != missing_response_id]
+    if duplicate_started_id:
+        started_ids.append(duplicate_started_id)
+    for hid in started_ids:
+        lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+    response_ids = [observer_id] + [sid for sid in sibling_ids if sid != missing_response_id]
+    if reverse_response_order:
+        response_ids = list(reversed(response_ids))
+    for hid in response_ids:
+        if hid == observer_id:
+            lines.append(_hc_hook_response_line(
+                hid, "PreToolUse", self_echo_payload=_hc_pretool_observer_payload(tool_use_id)
+            ))
+        else:
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=2 if hid == denied_id else 0))
+    if extra_unmatched_response_id:
+        lines.append(_hc_hook_response_line(extra_unmatched_response_id, "PreToolUse", exit_code=0))
+    lines.append(_hc_bash_tool_result_line(tool_use_id))
+    return lines
+
+
+def _hc_stop_window(
+    *, stop_hook_active: bool = False, observer_id: str = "STOP-OBS", sibling_id: str = "STOP-1"
+) -> list[str]:
+    return [
+        _hc_hook_started_line(observer_id, "Stop"),
+        _hc_hook_started_line(sibling_id, "Stop"),
+        _hc_hook_response_line(sibling_id, "Stop", exit_code=0),
+        _hc_hook_response_line(
+            observer_id, "Stop", self_echo_payload=_hc_stop_observer_payload(stop_hook_active)
+        ),
+    ]
+
+
+_HC_HOOKS_DIR = "${CLAUDE_PROJECT_DIR}/.claude/hooks"
+_HC_STOP_MANIFEST_NAME = "private-agent-session-manifest-stop-1-a.json"
+_HC_STOP_MANIFEST_NAME_2 = "private-agent-session-manifest-stop-2-b.json"
+
+_HC_FOUR_HOOK_SETTINGS = {
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Bash|Read|Write|Edit|Grep|Glob|MultiEdit",
+                "hooks": [{"type": "command", "command": f"{_HC_HOOKS_DIR}/secret_boundary_guard.sh"}],
+            },
+            {
+                "matcher": "Bash|Write|Edit|MultiEdit",
+                "hooks": [{"type": "command", "command": f"{_HC_HOOKS_DIR}/guard-japanese-prose.sh"}],
+            },
+            {
+                "matcher": "Bash|Write|Edit|MultiEdit",
+                "hooks": [{"type": "command", "command": f"{_HC_HOOKS_DIR}/ci_test_performance_advisory.sh"}],
+            },
+            {
+                "matcher": "Bash|Write|Edit|MultiEdit",
+                "hooks": [{"type": "command", "command": f"{_HC_HOOKS_DIR}/root_temporary_residue_advisory.sh"}],
+            },
+        ],
+        "Stop": [
+            {"hooks": [{"type": "command", "command": f"{_HC_HOOKS_DIR}/session_manifest_coordinator.sh"}]},
+        ],
+    }
+}
+
+
+def _hc_write_settings(worktree: Path, settings: dict) -> None:
+    settings_dir = worktree / ".claude"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    (settings_dir / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+
+
+class TestHookChainEvidenceSettingsInjection:
+    """Issue #2663 AC1: bounded, closed, purely additive observer hook
+    registration -- never a caller-supplied event/path/marker/config, and
+    byte-identical to the pre-existing settings JSON when omitted."""
+
+    def test_omitted_by_default_settings_json_unchanged(self) -> None:
+        module = _load_module()
+        import inspect
+
+        params = inspect.signature(module.run_structured_claude).parameters
+        assert "include_hook_chain_evidence_hooks" in params
+        assert params["include_hook_chain_evidence_hooks"].default is False
+
+    def test_given_flag_set_when_argv_built_then_pretool_and_stop_observer_groups_are_added(
+        self, tmp_path: Path,
+    ) -> None:
+        module = _load_module()
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        observed = tmp_path / "settings-observed.json"
+        _write_fake_exe(fake_bin / "claude", f"""
+settings=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--settings" ]; then
+    settings="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+printf '%s' "$settings" > {shlex.quote(str(observed))}
+cat > /dev/null
+printf '%s\\n' '{{"type":"system","subtype":"init"}}'
+printf '%s\\n' '{{"type":"result","subtype":"success"}}'
+""")
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        rc, _out, _err, _timed_out = module.run_structured_claude(
+            str(worktree), "hello", 30.0, 4, claude_bin=str(fake_bin / "claude"),
+            include_hook_chain_evidence_hooks=True,
+        )
+        assert rc == 0
+        settings_obj = json.loads(observed.read_text(encoding="utf-8"))
+        assert settings_obj["hooks"]["PreToolUse"] == [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "cat"}]}
+        ]
+        assert settings_obj["hooks"]["Stop"] == [{"hooks": [{"type": "command", "command": "cat"}]}]
+        # The pre-existing SubagentStart/SubagentStop observability hooks
+        # (byte-identical to _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON)
+        # remain untouched -- purely additive.
+        assert settings_obj["hooks"]["SubagentStart"] == [{"hooks": [{"type": "command", "command": "cat"}]}]
+        assert settings_obj["crossSessionInbound"] == "refuse"
+
+
+class TestLoadCommandHooksForEvent:
+    """Issue #2663 AC2: expected-cohort extraction mirrors (without
+    subprocess-executing) hookchain_harness.py's settings-driven logic."""
+
+    def test_given_four_pretool_bash_groups_when_loaded_then_all_four_commands_returned(self) -> None:
+        module = _load_module()
+        commands = module._load_command_hooks_for_event(_HC_FOUR_HOOK_SETTINGS, "PreToolUse", "Bash")
+        assert len(commands) == 4
+        assert any("secret_boundary_guard.sh" in c for c in commands)
+        assert any("guard-japanese-prose.sh" in c for c in commands)
+
+    def test_given_matcher_not_covering_tool_when_loaded_then_excluded(self) -> None:
+        module = _load_module()
+        settings = {"hooks": {"PreToolUse": [
+            {"matcher": "Read|Write", "hooks": [{"type": "command", "command": "x.sh"}]},
+        ]}}
+        assert module._load_command_hooks_for_event(settings, "PreToolUse", "Bash") == []
+
+    def test_given_no_tool_name_filter_when_loaded_then_matcher_ignored(self) -> None:
+        module = _load_module()
+        commands = module._load_command_hooks_for_event(_HC_FOUR_HOOK_SETTINGS, "Stop", None)
+        assert len(commands) == 1
+        assert "session_manifest_coordinator.sh" in commands[0]
+
+    def test_given_missing_settings_file_when_read_then_none_returned(self, tmp_path: Path) -> None:
+        module = _load_module()
+        assert module._read_project_settings(str(tmp_path)) is None
+
+
+class TestEvaluateAllMatchingHooksObserved:
+    """Issue #2663 AC2/AC6: all_matching_hooks_observed verdict."""
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        return worktree
+
+    def test_given_positive_and_deny_scenarios_fully_observed_when_evaluated_then_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window("tu-pos", sibling_ids=["H1", "H2", "H3", "H4"])
+            + _hc_pretool_window("tu-deny", sibling_ids=["H5", "H6", "H7", "H8"], denied_id="H6", observer_id="OBS2")
+            + _hc_stop_window()
+            + [_result_event_line()]
+        )
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "pass"
+        assert result["passed"] is True
+        assert result["expected_count"] == 4
+        assert result["positive_window_count"] == 1
+        assert result["deny_window_count"] == 1
+
+    def test_ac6a_same_total_count_but_one_handler_missing_and_one_unattributed_extra_is_not_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(a): total hook_response count nominally equals the expected
+        cohort size (4), but one expected handler (H4) never produced a
+        matching hook_response (dangling hook_started) while an unrelated,
+        never-started hook_id (GHOST) supplied a spurious response -- must
+        not read as pass."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window(
+                "tu-pos", sibling_ids=["H1", "H2", "H3", "H4"],
+                missing_response_id="H4", extra_unmatched_response_id="GHOST",
+            )
+            + _hc_pretool_window("tu-deny", sibling_ids=["H5", "H6", "H7", "H8"], denied_id="H6", observer_id="OBS2")
+            + [_result_event_line()]
+        )
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "fail"
+        assert result["passed"] is False
+        assert result["windows"][0]["reason"] == "unmatched_hook_response"
+
+    def test_ac6b_reversed_completion_order_and_duplicate_started_record_not_misjudged(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(b): sibling hook_response records completing in reversed
+        order relative to their hook_started order, plus a duplicate
+        hook_started for the same hook_id (a lifecycle re-announcement),
+        must not be misjudged as a "duplicate" execution."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window(
+                "tu-pos", sibling_ids=["H1", "H2", "H3", "H4"],
+                reverse_response_order=True, duplicate_started_id="H1",
+            )
+            + _hc_pretool_window("tu-deny", sibling_ids=["H5", "H6", "H7", "H8"], denied_id="H7", observer_id="OBS2")
+            + [_result_event_line()]
+        )
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "pass"
+
+    def test_ac6f_no_bash_tool_use_observed_is_fail_not_pass(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join([_system_init_line(), _result_event_line()])
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "fail"
+        assert result["reason"] == "no_bash_tool_use_observed"
+
+    def test_ac6f_positive_only_with_zero_deny_scenarios_is_fail(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window("tu-pos", sibling_ids=["H1", "H2", "H3", "H4"])
+            + [_result_event_line()]
+        )
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "fail"
+        assert result["deny_window_count"] == 0
+
+    def test_ac6h_corrupted_evidence_zero_observer_self_echo_is_unverified_not_fail_or_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(h): corrupted/ambiguous evidence (the observer's own
+        response cannot be uniquely identified) must be distinguished from
+        a genuine execution failure -- unverified, never fail or pass."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        lines = [_system_init_line(), _hc_bash_tool_use_line("tu-corrupt")]
+        for hid in ["OBS", "H1", "H2", "H3", "H4"]:
+            lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+        for hid in ["OBS", "H1", "H2", "H3", "H4"]:
+            # Observer response corrupted: no self-echo payload at all.
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=0))
+        lines.append(_hc_bash_tool_result_line("tu-corrupt"))
+        lines.append(_result_event_line())
+        result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+        assert result["status"] == "unverified"
+        assert result["windows"][0]["reason"] == "observer_self_echo_not_uniquely_identified"
+
+    def test_extra_unattributable_hook_execution_beyond_expected_count_is_unverified(
+        self, tmp_path: Path,
+    ) -> None:
+        """Issue #2663 In Scope: a foreign (e.g. user-level) extra hook
+        execution sharing the same event+tool bucket is never silently
+        promoted to pass NOR blindly condemned as fail -- unverified."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window("tu-pos", sibling_ids=["H1", "H2", "H3", "H4", "H5"])
+            + _hc_pretool_window("tu-deny", sibling_ids=["H6", "H7", "H8", "H9"], denied_id="H7", observer_id="OBS2")
+            + [_result_event_line()]
+        )
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "unverified"
+
+    def test_given_unreadable_project_settings_when_evaluated_then_unverified(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = tmp_path / "wt-no-settings"
+        worktree.mkdir()
+        stdout = "\n".join([_system_init_line(), _result_event_line()])
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "unverified"
+        assert result["reason"] == "project_settings_unreadable"
+
+
+class TestEvaluateSiblingSideEffectInventory:
+    """Issue #2663 AC3/AC6: sibling_side_effect_inventory_complete verdict."""
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        return worktree
+
+    def test_ac6d_new_manifest_file_observed_is_pass(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)), [], [_HC_STOP_MANIFEST_NAME],
+        )
+        assert result["status"] == "pass"
+        assert result["reason"] == "new_manifest_observed"
+        assert result["new_file_count"] == 1
+
+    def test_ac6d_valid_no_change_via_stop_hook_active_is_pass_not_fail(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=True)), [], [],
+        )
+        assert result["status"] == "pass"
+        assert result["reason"] == "valid_no_change_stop_hook_active"
+
+    def test_missing_side_effect_when_no_new_file_and_stop_hook_not_active_is_fail(
+        self, tmp_path: Path,
+    ) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)), [], [],
+        )
+        assert result["status"] == "fail"
+        assert result["reason"] == "missing_side_effect"
+
+    def test_ac6g_preexisting_stale_manifest_present_in_both_snapshots_is_not_mistaken_for_new(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(g): a stale artifact already present before this run started
+        (and still present after) must never be mistaken for THIS run's own
+        new post-condition."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=True)),
+            ["stale-from-earlier-run.json"], ["stale-from-earlier-run.json"],
+        )
+        assert result["new_file_count"] == 0
+        assert result["status"] == "pass"  # stop_hook_active True: valid no-change
+
+    def test_overflow_more_new_files_than_expected_is_fail(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)),
+            [], [_HC_STOP_MANIFEST_NAME, _HC_STOP_MANIFEST_NAME_2],
+        )
+        assert result["status"] == "fail"
+        assert result["reason"] == "overflow"
+
+    def test_target_handler_not_configured_is_unverified(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = tmp_path / "wt-no-target"
+        worktree.mkdir()
+        _hc_write_settings(worktree, {"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/unrelated.sh"}]}
+        ]}})
+        result = module.evaluate_sibling_side_effect_inventory(str(worktree), "", [], [])
+        assert result["status"] == "unverified"
+        assert result["reason"] == "target_handler_not_configured"
+
+    def test_unreadable_postcondition_snapshots_is_unverified(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(str(worktree), "", None, None)
+        assert result["status"] == "unverified"
+        assert result["reason"] == "postcondition_unreadable"
+
+
+class TestEvaluateHookChainEvidenceAggregate:
+    """Issue #2663 AC4: aggregate PASS only when BOTH assertions independently
+    report status: pass."""
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        return worktree
+
+    def _full_positive_and_deny_stream(self, *, stop_hook_active: bool) -> str:
+        return "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window("tu-pos", sibling_ids=["H1", "H2", "H3", "H4"])
+            + _hc_pretool_window("tu-deny", sibling_ids=["H5", "H6", "H7", "H8"], denied_id="H6", observer_id="OBS2")
+            + _hc_stop_window(stop_hook_active=stop_hook_active)
+            + [_result_event_line()]
+        )
+
+    def test_ac6c_both_hooks_observed_but_side_effect_missing_fails_only_the_side_effect_assertion(
+        self, tmp_path: Path,
+    ) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = self._full_positive_and_deny_stream(stop_hook_active=False)
+        result = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [])
+        assert result["all_matching_hooks_observed"]["status"] == "pass"
+        assert result["sibling_side_effect_inventory_complete"]["status"] == "fail"
+        assert result["status"] == "fail"
+        assert result["passed"] is False
+
+    def test_ac6e_deny_scenario_present_and_sibling_side_effect_still_completes_is_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(e): a PreToolUse deny occurring earlier in the session does
+        not prevent the independent Stop-time side effect from being
+        correctly observed as completed."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = self._full_positive_and_deny_stream(stop_hook_active=False)
+        result = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [_HC_STOP_MANIFEST_NAME])
+        assert result["all_matching_hooks_observed"]["deny_window_count"] == 1
+        assert result["sibling_side_effect_inventory_complete"]["status"] == "pass"
+        assert result["status"] == "pass"
+        assert result["passed"] is True
+
+    def test_both_pass_is_aggregate_pass(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = self._full_positive_and_deny_stream(stop_hook_active=True)
+        result = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [])
+        assert result["status"] == "pass"
+        assert result["passed"] is True
+
+
+class TestRequireHookChainEvidenceCLI:
+    """Issue #2663 AC1/AC6(h): CLI-level flag validation and pre-existing
+    (legacy) caller backward compatibility."""
+
+    def test_flag_requires_structured_mode_and_claude_runtime(
+        self, repo_with_worktree: tuple[Path, Path], tmp_path: Path,
+    ) -> None:
+        repo, worktree = repo_with_worktree
+        prompt = _prompt_file(tmp_path)
+        result = _run(
+            repo, worktree,
+            "--runtime", "claude", "--mode", "interactive",
+            "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+            "--require-hook-chain-evidence",
+        )
+        assert result.returncode != 0
+        assert "--require-hook-chain-evidence requires --runtime claude --mode structured" in result.stderr
+
+    def test_legacy_caller_omitting_flag_gets_no_hook_chain_evidence_key_and_unchanged_exit_code(
+        self, repo_with_worktree: tuple[Path, Path], tmp_path: Path,
+    ) -> None:
+        repo, worktree = repo_with_worktree
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+        prompt = _prompt_file(tmp_path)
+        result = _run(
+            repo, worktree,
+            "--runtime", "claude", "--mode", "structured",
+            "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+            "--evidence-json", str(tmp_path / "evidence.json"),
+            fake_bin_dir=fake_bin,
+        )
+        assert result.returncode == 0, result.stderr
+        evidence = json.loads((tmp_path / "evidence.json").read_text(encoding="utf-8"))
+        assert "hook_chain_evidence" not in evidence
+
+    def test_end_to_end_require_hook_chain_evidence_pass(
+        self, repo_with_worktree: tuple[Path, Path], tmp_path: Path,
+    ) -> None:
+        """Issue #2663 AC5-shaped end-to-end wiring proof (deterministic
+        fake claude binary, not the live runtime -- the live canonical
+        invocation itself is this Issue's own separate AC5 trial): the CLI
+        flag threads through settings injection, before/after manifest
+        snapshotting, and the aggregate gate, end to end."""
+        repo, worktree = repo_with_worktree
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        stream_lines = (
+            [_system_init_line()]
+            + _hc_pretool_window("tu-pos", sibling_ids=["H1", "H2", "H3", "H4"])
+            + _hc_pretool_window("tu-deny", sibling_ids=["H5", "H6", "H7", "H8"], denied_id="H6", observer_id="OBS2")
+            + _hc_stop_window(stop_hook_active=False)
+            + [_result_event_line()]
+        )
+        manifests_dir_rel = "artifacts/session-manifest-runtime/manifests"
+        body_lines = ["cat > /dev/null"]
+        body_lines.append(f"mkdir -p {shlex.quote(manifests_dir_rel)}")
+        body_lines.append(
+            f"printf '{{}}' > {shlex.quote(manifests_dir_rel)}/private-agent-session-manifest-stop-1-a.json"
+        )
+        # A co-registered, non-target manifest writer (the settings.json
+        # PostToolUse debounce hook) also writes into the SAME directory --
+        # confirmed live -- and must be correctly ignored by the
+        # filename-token-scoped AC3 assertion (never inflate it to
+        # "overflow", never satisfy it either).
+        body_lines.append(
+            f"printf '{{}}' > {shlex.quote(manifests_dir_rel)}/private-agent-session-manifest-posttooluse-1-b.json"
+        )
+        for line in stream_lines:
+            body_lines.append(f"printf '%s\\n' {shlex.quote(line)}")
+        body_lines.append("exit 0")
+        _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "\n" + "\n".join(body_lines) + "\n")
+        prompt = _prompt_file(tmp_path)
+        result = _run(
+            repo, worktree,
+            "--runtime", "claude", "--mode", "structured",
+            "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+            "--evidence-json", str(tmp_path / "evidence.json"),
+            "--require-hook-chain-evidence",
+            fake_bin_dir=fake_bin,
+        )
+        assert result.returncode == 0, result.stderr
+        evidence = json.loads((tmp_path / "evidence.json").read_text(encoding="utf-8"))
+        hook_chain_evidence = evidence["hook_chain_evidence"]
+        assert hook_chain_evidence["status"] == "pass"
+        assert hook_chain_evidence["all_matching_hooks_observed"]["status"] == "pass"
+        assert hook_chain_evidence["sibling_side_effect_inventory_complete"]["status"] == "pass"
+
     def test_json_payload_path_stays_byte_identical_and_takes_precedence(self) -> None:
         """The pre-existing JSON-object recognition path must remain
         untouched: when JSON parses successfully, the plain-text fallback

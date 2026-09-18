@@ -40,6 +40,7 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 - `--expect-marker-source main|subagent`（任意。既定 `subagent`。Issue #2498 AC3。`--expect-marker` 使用時の SubAgent causal-evidence 既定強制（Issue #2183 fix-delta）に対する additive な provenance 入力。`subagent`（既定）: 省略時の暗黙強制と完全に同一 — `--expect-marker` を指定する構造化 run は引き続き `causal_evidence_source == hook_id_correlated` を要求され、マーカー探索対象テキストも従来どおり captured stdout+stderr の結合ブロブ全体のまま変化しない。`main`: SubAgent 委譲のない direct Skill invocation を表明し、causal-evidence gate から opt out する。**加えて（PR #2500 fix_delta P1-1、OWNER REQUEST_CHANGES https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805）、`main` 選択時のみマーカー探索対象テキストを `extract_claude_main_output_text()`（`type: "assistant"` イベント自身の `message.content[].text` のみを emission 順に連結したもの）に限定する** — caller が prompt に書いた文字列（`UserPromptExpansion` hook 自身の stdin echo に含まれる `prompt`/`command_args` 等）や hook echo、stderr は一切含まない。これにより caller が prompt に書いただけの文字列がモデル自身の出力を経ずに marker 判定を satisfy することを防ぐ。`--expect-skill-command` との併用が**必須**（併用しない `main` 単独指定は起動前の usage error（parser.error）として拒否される — 無条件の causal-evidence opt-out に退化させないため）。`--require-subagent-causal-evidence`（明示的な独立要求）はこのフラグの値に関わらず有効のまま）
 - `--expect-skill-command <name>`（任意。Issue #2498 AC4。`--expect-marker-source main` との必須ペア。`--mode structured` + `--claude-adapter native` 限定。native `UserPromptExpansion` hook イベント（実機 Claude Code 2.1.261 で確認済み: `command:"cat"` hook がその hook 自身の stdin payload — `command_name`/`command_args`/`command_source` を含む — を echo する）の `command_name` フィールド一致によって direct Skill/slash-command invocation の発生を検証する（`extract_claude_user_prompt_expansion_command_names()`）。`command_source` の値域は公式ドキュメント上で列挙されていないため判定根拠にしない。指定時は structured lane の `--settings` に `UserPromptExpansion` hook 登録を追加した拡張版 JSON（`_CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON`）を使う — 未指定の既存呼び出しは元の `_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON`（`{"SubagentStart", "SubagentStop"}` のみ）のまま変化しない）
 - `--require-clean-postcondition`（任意）
+- `--require-hook-chain-evidence`（任意。既定 off。`--runtime claude --mode structured --claude-adapter native` 限定。Issue #2663。generic hook-chain evidence capability — 詳細は下記「Generic Hook-Chain Evidence（AC2/AC3、Issue #2663）」節を参照)
 - `--inspect-session-log-metadata` / `--require-session-log-metadata`（任意。既定では session log を読まない）
 - `--agent-type <persona 名>`（任意。static declaration。CLI へ forward しない）
 - `--claude-agent-name <persona 名>`（任意。claude runtime + structured mode 限定。実際に `--agent <name>` として CLI へ forward し、main-session identity（`main_agent_identity`）・candidate Agent definition binding（`agent_definition`）・Skill evidence（`skill_evidence`）の evidence source になる。Issue #2046）
@@ -405,6 +406,117 @@ payload が構造的に現れないため、`causal_evidence_source` は今の�
 
 いずれの lane でも判定結果は常に `summary.md` / `schema_summary["subagent_causal_evidence"]`
 に記録され、marker のみの PASS だったのか hook ID 相関で PASS したのかを事後に判別できる。
+
+## Generic Hook-Chain Evidence（汎用 hook 連鎖証跡、AC2/AC3、Issue #2663）
+
+`--require-hook-chain-evidence` は、structured native Claude lane に opt-in する
+generic hook-chain evidence capability である。bounded closed allowlist（下記の
+固定 event/tool/handler の組のみ）だけを受理し、caller-supplied な任意の
+command／path／marker／config は一切受理しない。有効化すると invocation-local
+additive `--settings` overlay に「`PreToolUse`（matcher `Bash`）」「`Stop`」の
+2 つの観測用 `cat` hook を追加登録し、さらに Claude Code 自身の `--setting-sources
+project` フラグ（固定値。caller が選択できない）を併用して、evidence cohort を
+**現在の tested_head の project-level `.claude/settings.json` のみ**（user／
+local／managed／plugin／skill 等の source を除外）に確定的に限定する
+（live 検証で確認: `--setting-sources` を指定しない場合、この runner を実行する
+ホストのユーザーレベル `~/.claude/settings.json` に登録された PreToolUse/Bash
+hook が cohort に紛れ込み、`unattributable_extra_hook_execution` による
+`unverified` 判定の原因になることを Issue #2663 実装時の live trial で確認した）。
+existing hooks/`.claude/settings.json`／`.claude/hooks/**` は一切変更・disable・
+置換しない（Out of Scope）。
+
+`schema_summary["hook_chain_evidence"]`（`summary.md`／`--evidence-json` の両方に
+記録される）は次の 2 つの独立した assertion と、その aggregate を持つ:
+
+- `all_matching_hooks_observed`（AC2）: 対象は `PreToolUse` イベント + `Bash` tool
+  のみ（bounded, closed）。expected cohort は tested_head の
+  `.claude/settings.json` の `PreToolUse` 内、matcher が `Bash` を含む
+  hook group の `command` 数（例: 現行 repo では
+  `secret_boundary_guard.sh` / `guard-japanese-prose.sh` /
+  `ci_test_performance_advisory.sh` / `root_temporary_residue_advisory.sh`
+  の 4 件）。runner 自身が追加する観測用 `cat` hook は、その hook 自身が
+  stdin をそのまま echo するという構造的な self-echo 署名（
+  `hook_event_name`/`tool_name`/`tool_input`/`tool_use_id` を全て含む
+  JSON）で positively 識別され、cohort から明示的に除外される。各 Bash
+  tool_use（positive scenario 用・deny scenario 用の両方）ごとに、
+  hook_id で対応付けられた `hook_started`+`hook_response` ペアの件数を
+  expected cohort 数と照合する。件数不足は `fail`（`missing_handler_
+  evidence`）。件数超過（識別できない追加 hook execution）は `fail` では
+  なく `unverified`（`unattributable_extra_hook_execution` — user/local/
+  managed/plugin/skill source の存在をもって「runtime全体の完全性を
+  証明した」とは主張しないため）。positive scenario（deny なし）と deny
+  scenario（`exit_code == 2` を観測した hook が最低 1 件）の両方が観測され、
+  かつ両方の window が `status: pass` の場合にのみ全体が `pass` になる
+  （どちらか一方が欠けている、または全 Bash tool_use がゼロ件の場合は
+  `fail`）。
+- `sibling_side_effect_inventory_complete`（AC3）: hook の exit code（実行完了）
+  とは独立に、実際の post-condition を確認する。対象 handler は
+  `.claude/hooks/session_manifest_coordinator.sh`（`Stop` イベント。tested_head
+  の `.claude/settings.json` に実際に登録されているかを確認し、未登録なら
+  `unverified`）。期待する変化は `artifacts/session-manifest-runtime/manifests/`
+  配下への新規ファイル出現（`generate_session_manifest_from_hook.mjs` 自身の
+  filename 契約 `private-agent-session-manifest-{eventNameLower}-{timestamp}-
+  {stableKeySegment}.json` の `-stop-` タグでのみ判定し、同じディレクトリへ
+  書き込む別の非対象 handler — 例えば同 repo の `PostToolUse` debounce hook
+  `session_manifest_debounce.mjs` — の書き込みは対象外として無視する。live
+  検証で、単一セッションが `posttooluse` タグと `stop` タグの両方の新規
+  ファイルを生成することを確認済み）。post-condition の読み取りタイミングは
+  「対象 sibling hook 群（この runner が subprocess として起動した Claude Code
+  プロセス全体）の実行完了後」— `claude -p` の subprocess 自体が終了するまで
+  この runner は post-condition を読まないため、同期 Stop hook の完了は
+  構造的に保証される。正常な無変更の条件は、runner 自身が追加した観測用
+  `Stop` hook の self-echo stdin payload から回収した `stop_hook_active`
+  （bool。runtime が実際に返すフィールド）が `true` の場合のみ（Stop hook
+  再入時の正当な no-op）。新規ファイルが 1 件を超える場合は overflow として
+  `fail`。新規ファイルなしかつ `stop_hook_active` が `true` でない場合は
+  `missing_side_effect` として `fail`。
+- aggregate: `hook_chain_evidence.status`（`passed: true|false`）は、上記
+  2 つの assertion が **両方とも** `status: pass` の場合にのみ `pass`。
+
+3 値ステータス（`pass` / `fail` / `unverified`）の意味は共通: `unverified` は
+「識別できないため PASS を主張できない」であり、`fail`（明確な欠落・overflow・
+不一致）とも `pass`（cohort/post-condition を完全に確認できた）とも異なる。
+boolean `passed` は `status == "pass"` の場合にのみ `true`。SKIP・fallback・
+`unverified` はいずれも PASS の代替にならない。
+
+### canonical live invocation（実行可能な正本コマンド、Issue #2663 AC5）
+
+```bash
+uv run --locked python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py \
+  --runtime claude --mode structured \
+  --worktree "$WORKTREE" \
+  --prompt-file <positive scenario と deny scenario の両方を promptに含む、非 tracked ファイル> \
+  --output-dir artifacts/runtime-smoke/hook-chain-current-head \
+  --timeout-seconds 180 --max-turns 4 \
+  --require-clean-postcondition --require-hook-chain-evidence
+```
+
+- exit `0`: 両 assertion が `pass`（かつ他の有効な gate も全て満たした場合）
+- exit `1`: いずれかの assertion が `fail`、または `unverified`（cohort/
+  post-condition を識別できない、この runner を実行するホスト環境固有の
+  user-level hook 混入等）を含む — `unverified` は SKIP ではなく FAIL 側の
+  exit code として扱われる（PASS を主張しないことを exit code でも明示する）
+- exit `77`: claude 実行ファイル自体が利用不能等、既存の capability SKIP 条件
+  （本 flag 固有の SKIP 条件は追加していない）
+
+prompt file は、無害な入力で PreToolUse/Bash hook を最低 1 回発生させる
+positive scenario のコマンドと、`secret_boundary_guard.sh` が実際に deny
+（exit code 2）を返す状況を発生させる deny scenario のコマンド（例:
+`printenv`）の両方を、別々の Bash tool_use として含める必要がある
+（AC5 の「空の expected/observed set が一致しただけの PASS を禁止する」
+要件、および「hook lifecycle の複数レコードや順序前後を誤判定しない」
+要件を満たすため）。
+
+### 開発中 trial と最終 acceptance evidence の区別（AC5）
+
+開発中の trial 実行は、Allowed Paths 内の未 commit candidate に対しても許可
+される（失敗時は診断として修正・再実行してよい）。ただし最終 acceptance
+evidence は、対象変更を commit した HEAD に対してのみ成立する。`summary.md`
+の `tested_head`（commit SHA）と、検証対象 tracked inputs が実際にその HEAD
+と一致していること、実行前後で意図しない worktree drift がないこと
+（`--require-clean-postcondition` の `postcondition_unexpected_changes`）の
+3 点を確認する。`before == after` の fingerprint 一致だけを「開始時点で HEAD
+と一致していた」の意味として扱わない。
 
 ## 手順
 
