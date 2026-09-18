@@ -41,11 +41,14 @@ def test_stop_hook_group_is_additive_and_present(tmp_path):
     assert any("CLAUDE_GPT_LATITUDE_HOOK" in cmd for cmd in stop_commands)
 
 
-def test_existing_hook_groups_are_preserved(tmp_path):
+def test_spark_authorization_gate_hook_groups_are_retired(tmp_path):
     """GIVEN 通常の launch.sh --check-only 実行
     WHEN 生成された settings.local.json を読む
-    THEN 既存の UserPromptSubmit/PreToolUse/SubagentStart/SubagentStop
-         authorization gate hook groups が置き換えられず維持される（AC1）
+    THEN 旧 Spark 認可 gate（UserPromptSubmit/PreToolUse(Agent)/
+         SubagentStart/SubagentStop への SPARK_GATE_WRITER command 注入）は
+         一切存在しない（Issue #2651 AC1: gate 自体が撤去され、
+         Latitude Stop hook group（別テストで確認済み）のような他の既存
+         hook 登録の共存は引き続き妨げられない）
     """
     result, settings_path = run_check_only(tmp_path)
     assert settings_path.exists(), result.stderr
@@ -53,18 +56,21 @@ def test_existing_hook_groups_are_preserved(tmp_path):
     hooks = settings["hooks"]
 
     ups_commands = [h["command"] for group in hooks["UserPromptSubmit"] for h in group["hooks"]]
-    assert any("SPARK_GATE_WRITER" in cmd and "user-prompt-submit" in cmd for cmd in ups_commands)
+    assert not any("SPARK_GATE_WRITER" in cmd for cmd in ups_commands)
 
     ptu_groups = hooks["PreToolUse"]
-    assert any(group.get("matcher") == "Agent" for group in ptu_groups)
+    assert not any(group.get("matcher") == "Agent" for group in ptu_groups)
     ptu_commands = [h["command"] for group in ptu_groups for h in group["hooks"]]
-    assert any("SPARK_GATE_WRITER" in cmd and "pre-tool-use-agent" in cmd for cmd in ptu_commands)
+    assert not any("SPARK_GATE_WRITER" in cmd for cmd in ptu_commands)
 
     sas_commands = [h["command"] for group in hooks["SubagentStart"] for h in group["hooks"]]
-    assert any("SPARK_GATE_WRITER" in cmd and "subagent-start" in cmd for cmd in sas_commands)
+    assert not any("SPARK_GATE_WRITER" in cmd for cmd in sas_commands)
 
     sap_commands = [h["command"] for group in hooks["SubagentStop"] for h in group["hooks"]]
-    assert any("SPARK_GATE_WRITER" in cmd and "subagent-stop" in cmd for cmd in sap_commands)
+    assert not any("SPARK_GATE_WRITER" in cmd for cmd in sap_commands)
+
+    # "env" no longer carries SPARK_GATE_WRITER either (Issue #2651).
+    assert "SPARK_GATE_WRITER" not in settings.get("env", {})
 
 
 def test_latitude_hook_command_references_repo_owned_script_path(tmp_path):

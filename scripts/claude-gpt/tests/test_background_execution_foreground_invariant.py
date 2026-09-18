@@ -74,17 +74,37 @@ def _load_module():
 
 @pytest.fixture(scope="module")
 def gate_script_source() -> str:
+    """Issue #2651: the Spark explicit-only authorization gate (Issue #2186)
+    that used to embed this suite's AC13 fork/background invariant
+    detection between ``SPARK_GATE_WRITER_PY_BEGIN``/``_END`` markers in
+    ``launch.sh`` has been retired. ``extract_spark_gate_writer_source()``
+    now always returns ``None`` (no marker region exists to extract any
+    more) -- this fixture asserts that negative/retired outcome instead of
+    the prior positive-source contract, then skips every test that depends
+    on rendering and executing that (now nonexistent) gate script, since
+    there is no gate source left to render. This does NOT touch or rewrite
+    the invariant-behavior test bodies below (`test_invariant_*`), nor
+    `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`/`Bash.run_in_background`, nor
+    `test_launch_sh_exports_production_invariant_before_child_process_
+    launch` (a separate, non-Spark, static regression check on launch.sh's
+    unconditional pre-launch exports that is unaffected and still runs) --
+    only this fixture's own extraction-source assertion changes (#2652
+    scope boundary preserved)."""
     module = _load_module()
     launch_sh_text = LAUNCH_SH.read_text(encoding="utf-8")
     source = module.extract_spark_gate_writer_source(launch_sh_text)
-    assert source is not None, "SPARK_GATE_WRITER_PY_BEGIN/_END markers not found in launch.sh"
-    assert LAUNCH_NONCE_PLACEHOLDER in source
-    assert "background_execution_invariant_violation" in source, (
-        "gate writer source must contain the Issue #2274 AC13 fork/background "
-        "invariant detection; if this drifted, this suite would silently stop "
-        "testing the actual mechanism."
+    assert source is None, (
+        "extract_spark_gate_writer_source() must return None now that the "
+        "Spark authorization gate (SPARK_GATE_WRITER_PY_BEGIN/_END marker "
+        "region) has been retired from launch.sh (Issue #2651); a non-None "
+        "return here would mean the gate was reintroduced without updating "
+        "this negative-test contract."
     )
-    return source
+    pytest.skip(
+        "GPT-5.3-Codex-Spark authorization gate retired (Issue #2651): no "
+        "gate script source remains to render/execute, so this fixture's "
+        "dependent behavioral tests no longer apply."
+    )
 
 
 def _render_gate_script(directory: Path, source: str, launch_nonce: str) -> Path:

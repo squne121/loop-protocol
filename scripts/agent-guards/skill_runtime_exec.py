@@ -1019,6 +1019,73 @@ def _resolve_trusted_executable(name: str, project_root: str) -> str:
     return resolved if name == "python3" else real
 
 
+def _detect_legacy_spark_execution_request(command_id: str) -> tuple[str | None, str | None] | None:
+    """Issue #2651 OWNER review fix_delta
+    (https://github.com/squne121/loop-protocol/pull/2662#issuecomment-5736035898
+    P1 blocker 1): detect a legacy Spark execution request on the
+    canonical `preflight.run` executor's OWN input boundary, before
+    `_sanitize_env()` ever strips `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK`
+    from the child environment.
+
+    Stripping those two env vars before dispatch (as `_sanitize_env()`
+    already does below) is not by itself a rejection -- it only prevents
+    the retired directive from reaching a CHILD process. Without this
+    check, `workflow_start_entry.py`'s own retired-directive check never
+    even runs for a `preflight.run`-routed request, because by the time
+    that check would see `spark_mode`, this executor has already replaced
+    it with `None` -- indistinguishable from "Spark not requested at all"
+    -- and the ordinary producer/inner-preflight flow proceeds unchanged
+    (exactly the silent-fallthrough OWNER flagged).
+
+    Only `command_id == "preflight.run"` is in scope: it is the sole
+    command id this allowlist ever carried these two env vars for (see
+    `_sanitize_env()` below), so it is the only one where stripping them
+    could have silently converted a real request into `spark_mode=None`.
+    A direct, non-canonical-executor invocation of
+    `workflow_start_entry.py` never passes through this executor at all,
+    so it is unaffected and keeps its own existing retired-rejection path.
+
+    Returns the raw `(LOOP_SPARK_MODE, LOOP_SPARK_FALLBACK)` values when
+    either is present in `os.environ` for `command_id == "preflight.run"`,
+    else `None` (no legacy request detected; ordinary `preflight.run`
+    dispatch is unaffected)."""
+    if command_id != "preflight.run":
+        return None
+    mode = os.environ.get("LOOP_SPARK_MODE")
+    fallback = os.environ.get("LOOP_SPARK_FALLBACK")
+    if mode is None and fallback is None:
+        return None
+    return (mode, fallback)
+
+
+def _emit_legacy_spark_retired_rejection(issue_number: int, mode: str | None, fallback: str | None) -> int:
+    """Deterministic, stateless retired rejection for a legacy Spark
+    execution request detected by `_detect_legacy_spark_execution_request`.
+    Never spawns a child/inner preflight process, never substitutes a
+    different model or Agent for the request, and never re-adds
+    `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` to any child environment."""
+    print(
+        json.dumps(
+            {
+                "schema": "SKILL_RUNTIME_EXEC_RESULT_V1",
+                "status": "blocked",
+                "issue_number": issue_number,
+                "command_id": "preflight.run",
+                "reason": "spark_delegation_retired",
+                "detail": (
+                    "GPT-5.3-Codex-Spark delegation is retired in this repository "
+                    "(Issue #2651). Unset LOOP_SPARK_MODE/LOOP_SPARK_FALLBACK and "
+                    "re-run; this request is not silently substituted with another "
+                    "model or Agent. No child or inner preflight process was started."
+                ),
+                "requested_spark_mode": mode,
+                "requested_spark_fallback": fallback,
+            }
+        )
+    )
+    return 3
+
+
 def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
     allowed_keys = {
         "GH_HOST",
@@ -1057,10 +1124,21 @@ def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
     # Only bare `preflight.run`'s first hop (`workflow_start_entry.py`) reads
     # the invocation-scoped capability request. Keep this policy separate
     # from the GitHub credential carrier policy above.
+    #
+    # Issue #2651: `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` are no longer
+    # carried through this allowlist for any command id. GPT-5.3-Codex-Spark
+    # delegation has been retired; a caller that still sets these env vars
+    # for a direct (non-canonical-executor) `workflow_start_entry.py`
+    # invocation still gets a deterministic retired rejection from that
+    # module's own `run()`. For `preflight.run` specifically,
+    # `main()`'s `_detect_legacy_spark_execution_request()` check (OWNER
+    # review fix_delta, PR #2662#issuecomment-5736035898 blocker 1) already
+    # returns a retired rejection BEFORE this function is ever reached when
+    # either env var is set -- so this allowlist boundary only ever runs
+    # for `preflight.run` once no legacy Spark request is present, and
+    # simply never forwards them regardless.
     if command_id == "preflight.run":
         allowed_keys |= {
-            "LOOP_SPARK_MODE",
-            "LOOP_SPARK_FALLBACK",
             "LOOP_PLANNED_OPERATIONS_JSON",
         }
     env = {
@@ -2376,6 +2454,16 @@ def main(argv: list[str] | None = None) -> int:
     stale_entries = _normalize_and_validate_runtime_env(project_root)
     if stale_entries:
         return _emit_stale_runtime_failure(args.issue_number, stale_entries)
+
+    # Issue #2651 OWNER review fix_delta (blocker 1): detect a legacy Spark
+    # execution request on this executor's OWN input boundary, before
+    # `_sanitize_env()` strips `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` below
+    # and before any child/inner preflight is dispatched. Must run ahead of
+    # every other command-id branch below.
+    legacy_spark_request = _detect_legacy_spark_execution_request(args.command_id)
+    if legacy_spark_request is not None:
+        spark_mode, spark_fallback = legacy_spark_request
+        return _emit_legacy_spark_retired_rejection(args.issue_number, spark_mode, spark_fallback)
 
     is_fixture_command = args.command_id == "preflight.run.fixture"
     is_fixture_human_context_command = args.command_id == "preflight.run.fixture.with_human_context"

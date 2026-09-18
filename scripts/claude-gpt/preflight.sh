@@ -61,14 +61,17 @@ fi
 #        （launcher バグまたは host 側の不備。fail-closed）
 # --workflow-profile <profile>: Issue #2273. Thin dispatcher to the Python
 # `workflow_capability_preflight.py` module, which returns the structured
-# `CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1` JSON result (trusted `uv` / Spark
-# route capability / GitHub read capability / GitHub write (mutation)
-# capability, judged separately -- see that module's docstring and the
-# Issue's `## Result Schema` section). This branch does not duplicate any
-# of that judgment logic in shell; it only forwards CLI args and the exit
-# code. A well-formed assessment (including `decision: blocked`) exits 0;
-# non-zero exit codes are reserved for invalid input / internal errors so
-# a `set -e` caller does not lose the JSON payload.
+# `CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1` JSON result (trusted `uv` /
+# GitHub read capability / GitHub write (mutation) capability, judged
+# separately -- see that module's docstring and the Issue's
+# `## Result Schema` section). GPT-5.3-Codex-Spark delegation route
+# capability judgment (formerly a 4th dimension here) has been retired
+# (Issue #2651): `checks.spark.status` is now only `not_required` or
+# `retired`, never a live binary/auth-based judgment. This branch does
+# not duplicate any of that judgment logic in shell; it only forwards CLI
+# args and the exit code. A well-formed assessment (including `decision:
+# blocked`) exits 0; non-zero exit codes are reserved for invalid input /
+# internal errors so a `set -e` caller does not lose the JSON payload.
 if [ "${1:-}" = "--workflow-profile" ]; then
   shift
   # P1-2 fix: `workflow_capability_preflight.py` judges trusted-`uv`

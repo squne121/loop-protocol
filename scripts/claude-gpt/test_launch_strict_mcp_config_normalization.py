@@ -363,11 +363,21 @@ def _extract_agents_flag(argv: list[str]) -> tuple[dict, list[str]]:
 
 def _assert_agents_flag_wired(argv: list[str]) -> list[str]:
     """`argv`（canonical prefix 除去済み）から `--agents` flag を抽出し、
-    spark-codex の `model` が `gpt-5.3-codex-spark` と一致することを検証した上で、
-    残り（caller argv 相当）を返す。"""
+    残り（caller argv 相当）を返す。
+
+    Issue #2651: the launcher-owned `spark-codex` custom SubAgent definition
+    (Issue #2186) has been retired -- an ordinary launch's `--agents` value
+    is now the empty object `{}` (no default agent registered), never a
+    `spark-codex` entry. This helper now only asserts the flag is
+    structurally present and well-formed JSON (delegated to
+    `_extract_agents_flag`); it no longer asserts any specific agent-name
+    content, since callers that DO care about specific content (e.g. a
+    smoke-canary entry) assert that directly.
+    """
     agents_flag, remaining = _extract_agents_flag(argv)
-    assert agents_flag.get("spark-codex", {}).get("model") == "gpt-5.3-codex-spark", (
-        f"--agents flag missing or malformed spark-codex model id: {agents_flag!r}"
+    assert isinstance(agents_flag, dict), f"--agents flag value is not a JSON object: {agents_flag!r}"
+    assert "spark-codex" not in agents_flag, (
+        f"--agents flag must never contain the retired spark-codex definition: {agents_flag!r}"
     )
     return remaining
 
@@ -1192,9 +1202,9 @@ def test_normal_launch_blocks_when_auto_mode_readback_fails(tmp_path):
     )
 
 
-# --- Issue #2186 P0 fix-delta (PR #2244 adversarial review): runtime-smoke
-#     observation hooks must never displace the spark-codex authorization
-#     gate's PreToolUse(matcher: Agent) entry ----------------------------
+# --- Issue #2186 P0 fix-delta origin, retired by Issue #2651: runtime-smoke
+#     observation hooks must never displace OTHER existing hook-group
+#     registrations by wholesale replacement (additive only) -----------
 
 
 @pytest.mark.parametrize(
@@ -1204,19 +1214,23 @@ def test_normal_launch_blocks_when_auto_mode_readback_fails(tmp_path):
         ("hook-sink-multi-turn", {"CLAUDE_GPT_HOOK_SINK_NONCE": "nonce-fixture-hooksink"}),
     ],
 )
-def test_runtime_smoke_hooks_never_drop_spark_authorization_gate(
+def test_runtime_smoke_hooks_never_reintroduce_spark_authorization_gate(
     tmp_path, smoke_hooks_value, extra_env
 ):
     """GIVEN CLAUDE_GPT_RUNTIME_SMOKE_HOOKS is set to either
     ``subagent-start-stop`` or ``hook-sink-multi-turn``
     WHEN launch.sh generates the launcher-owned ``--settings`` JSON
-    THEN ``hooks.PreToolUse`` still contains a ``matcher: "Agent"`` entry
-    whose command references ``SPARK_GATE_WRITER`` (Issue #2186 P0
-    fix-delta: prior to this fix, requesting runtime-smoke observation hooks
-    silently REPLACED the entire hooks fragment, dropping the spark-codex
-    explicit-only authorization gate's PreToolUse entry entirely -- which
-    left Claude Code's default-allow behavior in effect for any Agent tool
-    call while runtime-smoke observation was active).
+    THEN ``hooks.PreToolUse`` still contains NO ``matcher: "Agent"`` entry
+    and no ``SPARK_GATE_WRITER`` command anywhere (Issue #2651: the former
+    spark-codex explicit-only authorization gate that used to occupy this
+    slot has been retired entirely -- a runtime-smoke observation request
+    must never reintroduce it), while the OTHER additive hook-group
+    registrations (SubagentStart/SubagentStop, and for
+    ``hook-sink-multi-turn`` also UserPromptSubmit/Stop/StopFailure) remain
+    present and non-empty -- proving the underlying "additive, never a
+    wholesale replacement" invariant this test originally guarded still
+    holds for the surviving hook mechanisms (the launcher-owned Latitude
+    Stop hook group in particular).
     """
     result = _run_launch(
         tmp_path,
@@ -1231,22 +1245,23 @@ def test_runtime_smoke_hooks_never_drop_spark_authorization_gate(
 
     pre_tool_use_groups = hooks["PreToolUse"]
     agent_groups = [g for g in pre_tool_use_groups if g.get("matcher") == "Agent"]
-    assert agent_groups, f"no matcher=Agent PreToolUse group found: {pre_tool_use_groups!r}"
-    assert any(
-        "SPARK_GATE_WRITER" in h.get("command", "")
-        for g in agent_groups
-        for h in g.get("hooks", [])
-    ), f"matcher=Agent PreToolUse group missing SPARK_GATE_WRITER command: {agent_groups!r}"
+    assert not agent_groups, f"a retired matcher=Agent PreToolUse group reappeared: {pre_tool_use_groups!r}"
+    assert not any(
+        "SPARK_GATE_WRITER" in h["command"]
+        for event_groups in hooks.values()
+        for g in event_groups
+        for h in g["hooks"]
+    )
 
-    # The gate's UserPromptSubmit/SubagentStart/SubagentStop entries must
-    # also survive alongside any observation-only sink commands.
-    for event in ("UserPromptSubmit", "SubagentStart", "SubagentStop"):
-        groups = hooks[event]
-        assert any(
-            "SPARK_GATE_WRITER" in h.get("command", "")
-            for g in groups
-            for h in g.get("hooks", [])
-        ), f"{event} missing SPARK_GATE_WRITER gate command: {groups!r}"
+    assert hooks["SubagentStart"], "SubagentStart hook group must still be additively registered"
+    assert hooks["SubagentStop"], "SubagentStop hook group must still be additively registered"
+    # The launcher-owned Latitude Stop hook group (Issue #2426) must remain
+    # wired regardless of the runtime-smoke mode requested.
+    stop_commands = [h["command"] for g in hooks["Stop"] for h in g["hooks"]]
+    assert any("CLAUDE_GPT_LATITUDE_HOOK" in cmd for cmd in stop_commands)
+    if smoke_hooks_value == "hook-sink-multi-turn":
+        assert hooks["UserPromptSubmit"], "UserPromptSubmit sink group must still be additively registered"
+        assert hooks.get("StopFailure"), "StopFailure sink group must still be additively registered"
 
 
 if __name__ == "__main__":

@@ -160,7 +160,10 @@ def test_delegated_research_agy_degrades_with_fallback_route_when_absent(monkeyp
 
 
 # =============================================================================
-# spark_delegation mirrors the existing _spark_capability() verdict.
+# Issue #2651: spark_delegation mirrors the retired _spark_status() verdict
+# -- `not_required` (ordinary callers) maps to ready; any non-None
+# directive (`retired`) always maps to unavailable. There is no more
+# `eligible`/`fallback_only` live-observed state to map.
 # =============================================================================
 
 
@@ -169,20 +172,11 @@ def test_spark_delegation_maps_not_required_to_ready(monkeypatch):
     assert result["actor_capabilities"]["spark_delegation"]["status"] == "ready"
 
 
-def test_spark_delegation_maps_fallback_only_to_degraded_with_route():
-    entry = wcp._spark_delegation_capability(wcp.SPARK_FALLBACK_ONLY)
-    assert entry["status"] == "degraded"
-    assert entry["fallback_route"] == "non_spark_agent"
-
-
-def test_spark_delegation_maps_unavailable_to_unavailable():
-    entry = wcp._spark_delegation_capability(wcp.SPARK_UNAVAILABLE)
+def test_spark_delegation_maps_retired_to_unavailable_with_reason():
+    entry = wcp._spark_delegation_capability(wcp.SPARK_RETIRED)
     assert entry["status"] == "unavailable"
-
-
-def test_spark_delegation_maps_eligible_to_ready():
-    entry = wcp._spark_delegation_capability(wcp.SPARK_ELIGIBLE)
-    assert entry["status"] == "ready"
+    assert entry["reason_code"] == "spark_delegation_retired"
+    assert entry["fallback_route"] is None
 
 
 # =============================================================================

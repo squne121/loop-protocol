@@ -144,7 +144,12 @@ def test_workflow_start_ready_invokes_inner_once():
     assert exit_code == 0
 
 
-def test_workflow_start_degraded_uses_declared_fallback_once():
+def test_workflow_start_blocks_declared_spark_directive_before_producer_call():
+    """Issue #2651: GPT-5.3-Codex-Spark delegation is retired -- an
+    explicit `spark_mode` directive (any value, any `spark_fallback`) now
+    deterministically retires to `blocked` WITHOUT ever calling the
+    producer or the inner preflight (there is no more `degraded`/
+    fallback_only continuation path)."""
     producer, producer_calls = _make_recording_producer(
         "degraded", checks={"spark": {"status": "fallback_only"}}
     )
@@ -160,22 +165,22 @@ def test_workflow_start_degraded_uses_declared_fallback_once():
         invoke_inner_preflight_fn=inner,
     )
 
-    assert len(producer_calls) == 1
-    assert producer_calls[0]["spark_mode"] == "preferred"
-    assert producer_calls[0]["spark_fallback"] == "allowed"
-    assert len(inner_calls) == 1
-    assert result["inner_preflight_invoked"] is True
-    assert result["decision"] == "degraded"
-    assert exit_code == 0
+    assert producer_calls == []
+    assert inner_calls == []
+    assert result["inner_preflight_invoked"] is False
+    assert result["decision"] == "blocked"
+    assert result["reasons"] == ["spark_delegation_retired"]
+    assert exit_code == 2
 
 
 # ---------------------------------------------------------------------------
-# AC5: exact caller-declared spark/planned_operations pass-through; missing
-# planned_operations fails closed BEFORE the producer is called.
+# AC5: exact caller-declared planned_operations pass-through when Spark is
+# not requested (spark_mode=None); missing planned_operations fails closed
+# BEFORE the producer is called.
 # ---------------------------------------------------------------------------
 
 
-def test_workflow_start_passes_exact_spark_and_planned_operations():
+def test_workflow_start_passes_exact_planned_operations_when_spark_not_requested():
     producer, producer_calls = _make_recording_producer("ready")
     inner, inner_calls = _make_recording_inner(returncode=0)
     planned_operations_json = (
@@ -188,8 +193,8 @@ def test_workflow_start_passes_exact_spark_and_planned_operations():
     wse.run(
         issue_number=1228,
         repo=_REPO,
-        spark_mode="required",
-        spark_fallback="allowed",
+        spark_mode=None,
+        spark_fallback=None,
         planned_operations_json=planned_operations_json,
         capability_preflight_result_fn=producer,
         invoke_inner_preflight_fn=inner,
@@ -198,8 +203,11 @@ def test_workflow_start_passes_exact_spark_and_planned_operations():
     assert len(producer_calls) == 1
     call = producer_calls[0]
     assert call["repo"] == _REPO
-    assert call["spark_mode"] == "required"
-    assert call["spark_fallback"] == "allowed"
+    # Issue #2651: the producer no longer receives spark_mode/spark_fallback
+    # kwargs at all (root_entry_router.capability_preflight_result()'s
+    # signature dropped them).
+    assert "spark_mode" not in call
+    assert "spark_fallback" not in call
     assert call["planned_operations"] == [
         {
             "phase": "workflow_start",

@@ -113,8 +113,6 @@ def test_workflow_start_blocked_uses_compact_stdout_grammar(monkeypatch, capsys)
         '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
         '"operation": "definitely_unsupported_operation_xyz", "requires_mutation": true}]'
     )
-    monkeypatch.setenv("LOOP_SPARK_MODE", "required")
-    monkeypatch.setenv("LOOP_SPARK_FALLBACK", "forbidden")
     monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", planned_operations_json)
 
     def _blocked_producer(**kwargs):
@@ -127,11 +125,17 @@ def test_workflow_start_blocked_uses_compact_stdout_grammar(monkeypatch, capsys)
     def _failing_inner(**kwargs):
         raise AssertionError("inner preflight must not be invoked on the blocked path")
 
+    # Issue #2651: spark_mode=None so this test genuinely exercises
+    # `_blocked_producer` (a non-None spark_mode would retire and short-
+    # circuit BEFORE the producer is ever called, making this fake
+    # producer's `decision: blocked` shape irrelevant to the observed
+    # result -- this test's subject is the compact-stdout-grammar
+    # rendering of a producer's own blocked result, not Spark retirement).
     result, exit_code = wse.run(
         issue_number=2323,
         repo=_REPO,
-        spark_mode="required",
-        spark_fallback="forbidden",
+        spark_mode=None,
+        spark_fallback=None,
         planned_operations_json=os.environ["LOOP_PLANNED_OPERATIONS_JSON"],
         capability_preflight_result_fn=_blocked_producer,
         invoke_inner_preflight_fn=_failing_inner,
@@ -197,8 +201,6 @@ def test_malformed_producer_reasons_fail_closed(monkeypatch, bad_reasons):
         '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
         '"operation": "definitely_unsupported_operation_xyz", "requires_mutation": true}]'
     )
-    monkeypatch.setenv("LOOP_SPARK_MODE", "required")
-    monkeypatch.setenv("LOOP_SPARK_FALLBACK", "forbidden")
     monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", planned_operations_json)
 
     def _malformed_producer(**kwargs):
@@ -211,11 +213,14 @@ def test_malformed_producer_reasons_fail_closed(monkeypatch, bad_reasons):
     def _failing_inner(**kwargs):
         raise AssertionError("inner preflight must not be invoked on the blocked path")
 
+    # Issue #2651: spark_mode=None so this test genuinely exercises
+    # `_malformed_producer` (a non-None spark_mode would retire and
+    # short-circuit BEFORE the producer is ever called).
     result, exit_code = wse.run(
         issue_number=2323,
         repo=_REPO,
-        spark_mode="required",
-        spark_fallback="forbidden",
+        spark_mode=None,
+        spark_fallback=None,
         planned_operations_json=os.environ["LOOP_PLANNED_OPERATIONS_JSON"],
         capability_preflight_result_fn=_malformed_producer,
         invoke_inner_preflight_fn=_failing_inner,
@@ -241,8 +246,6 @@ def test_valid_single_line_reason_containing_status_substring_is_not_forged(monk
         '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
         '"operation": "definitely_unsupported_operation_xyz", "requires_mutation": true}]'
     )
-    monkeypatch.setenv("LOOP_SPARK_MODE", "required")
-    monkeypatch.setenv("LOOP_SPARK_FALLBACK", "forbidden")
     monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", planned_operations_json)
 
     def _producer(**kwargs):
@@ -255,11 +258,14 @@ def test_valid_single_line_reason_containing_status_substring_is_not_forged(monk
     def _failing_inner(**kwargs):
         raise AssertionError("inner preflight must not be invoked on the blocked path")
 
+    # Issue #2651: spark_mode=None so this test genuinely exercises
+    # `_producer` (a non-None spark_mode would retire and short-circuit
+    # BEFORE the producer is ever called).
     result, exit_code = wse.run(
         issue_number=2323,
         repo=_REPO,
-        spark_mode="required",
-        spark_fallback="forbidden",
+        spark_mode=None,
+        spark_fallback=None,
         planned_operations_json=os.environ["LOOP_PLANNED_OPERATIONS_JSON"],
         capability_preflight_result_fn=_producer,
         invoke_inner_preflight_fn=_failing_inner,
