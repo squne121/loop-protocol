@@ -4,16 +4,15 @@ This module deliberately keeps the public signal envelope small.  Producer
 adapters provide an origin session internally; public callers never select a
 Task, Activity, Binding, or session identity.
 """
+
 from __future__ import annotations
 
 import json
 import re
 import sqlite3
-from dataclasses import dataclass
 from typing import Any
 
 import task_context_db as db
-import task_context_errors as errors
 import task_context_service as service
 
 _SIGNAL_SOURCES = {
@@ -37,6 +36,7 @@ class DuplicateMemberError(ValueError):
 
 class _StrictObject(dict[str, Any]):
     """A decoded object retaining duplicate-member evidence until classified."""
+
     def __init__(self, pairs: list[tuple[str, Any]]):
         super().__init__()
         self.duplicate_keys: list[str] = []
@@ -78,8 +78,16 @@ def _validate_evidence(kind: str, evidence: Any) -> tuple[dict[str, Any] | None,
         return None, _outcome("rejected_evidence", "INVALID_ISSUE_NUMBER")
     if "pr_number" in evidence and (not _is_int(evidence["pr_number"]) or evidence["pr_number"] <= 0):
         return None, _outcome("rejected_evidence", "INVALID_PR_NUMBER")
-    digest_field = "approved_body_sha256" if kind == "refinement_approved" else (
-        "merge_commit_oid" if kind == "pr_merged_observed" else "merge_identity" if kind == "cleanup_completed" else None
+    digest_field = (
+        "approved_body_sha256"
+        if kind == "refinement_approved"
+        else (
+            "merge_commit_oid"
+            if kind == "pr_merged_observed"
+            else "merge_identity"
+            if kind == "cleanup_completed"
+            else None
+        )
     )
     if digest_field:
         value = evidence[digest_field]
@@ -89,7 +97,9 @@ def _validate_evidence(kind: str, evidence: Any) -> tuple[dict[str, Any] | None,
     return evidence, None
 
 
-def validate_public_signal(payload: Any, *, duplicate_evidence_member: bool = False) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def validate_public_signal(
+    payload: Any, *, duplicate_evidence_member: bool = False
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Validate exactly the frozen v1 public payload, without mutating state."""
     if not isinstance(payload, dict):
         return None, _outcome("rejected_envelope", "NON_OBJECT_ROOT")
@@ -102,7 +112,12 @@ def validate_public_signal(payload: Any, *, duplicate_evidence_member: bool = Fa
         return None, _outcome("rejected_envelope", "FORBIDDEN_CALLER_IDENTITY")
     if keys != _TOP_LEVEL:
         return None, _outcome("rejected_envelope", "UNKNOWN_TOP_LEVEL_FIELD")
-    if not isinstance(payload.get("signal_kind"), str) or not isinstance(payload.get("source"), str) or not isinstance(payload.get("source_schema_version"), str) or not isinstance(payload.get("evidence"), dict):
+    if (
+        not isinstance(payload.get("signal_kind"), str)
+        or not isinstance(payload.get("source"), str)
+        or not isinstance(payload.get("source_schema_version"), str)
+        or not isinstance(payload.get("evidence"), dict)
+    ):
         return None, _outcome("rejected_envelope", "WRONG_TOP_LEVEL_TYPE")
     kind = payload["signal_kind"]
     source = payload["source"]
@@ -173,7 +188,9 @@ def _metadata_matches(row: sqlite3.Row, **wanted: Any) -> bool:
     return all(metadata.get(key) == value for key, value in wanted.items())
 
 
-def _resolve_origin_tx(conn: sqlite3.Connection, origin_session_id: str | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def _resolve_origin_tx(
+    conn: sqlite3.Connection, origin_session_id: str | None
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     if not origin_session_id:
         return None, _outcome("deferred", "unbound")
     rows = conn.execute(
@@ -205,7 +222,9 @@ def _activity_for_tx(conn: sqlite3.Connection, task_id: str, kind: str) -> dict[
 
 
 def _has_cleanup_started_tx(conn: sqlite3.Connection, task_id: str, repo: str, pr_number: int) -> bool:
-    rows = conn.execute("SELECT metadata_json FROM events WHERE task_id = ? AND event_type = 'workflow:cleanup_started'", (task_id,)).fetchall()
+    rows = conn.execute(
+        "SELECT metadata_json FROM events WHERE task_id = ? AND event_type = 'workflow:cleanup_started'", (task_id,)
+    ).fetchall()
     return any(_metadata_matches(row, repo=repo, pr_number=pr_number) for row in rows)
 
 
@@ -214,7 +233,9 @@ def _accepted_event_tx(conn: sqlite3.Connection, key: str) -> dict[str, Any] | N
     return dict(row) if row else None
 
 
-def _append_signal_tx(conn: sqlite3.Connection, payload: dict[str, Any], origin: dict[str, Any], activity_id: str | None) -> str:
+def _append_signal_tx(
+    conn: sqlite3.Connection, payload: dict[str, Any], origin: dict[str, Any], activity_id: str | None
+) -> str:
     return service._append_event_tx(
         conn,
         event_type=f"workflow:{payload['signal_kind']}",
@@ -227,7 +248,9 @@ def _append_signal_tx(conn: sqlite3.Connection, payload: dict[str, Any], origin:
     )
 
 
-def _validate_claims_or_attach_implementation_tx(conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]) -> dict[str, Any] | None:
+def _validate_claims_or_attach_implementation_tx(
+    conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]
+) -> dict[str, Any] | None:
     repo, issue, pr = evidence["repo"], evidence["issue_number"], evidence["pr_number"]
     issue_claim, pr_claim = _claim_for_tx(conn, repo, "issue", issue), _claim_for_tx(conn, repo, "pr", pr)
     if (issue_claim and issue_claim["task_id"] != task_id) or (pr_claim and pr_claim["task_id"] != task_id):
@@ -236,7 +259,8 @@ def _validate_claims_or_attach_implementation_tx(conn: sqlite3.Connection, task_
     # conflict; do not let a new PR silently become equivalent.
     other_pr = conn.execute(
         "SELECT 1 FROM task_ref_claims WHERE task_id = ? AND repo = ? AND ref_kind = 'pr' "
-        "AND ref_number != ? AND released_at IS NULL LIMIT 1", (task_id, repo, pr)
+        "AND ref_number != ? AND released_at IS NULL LIMIT 1",
+        (task_id, repo, pr),
     ).fetchone()
     if other_pr:
         return _outcome("conflict", "OUT_OF_ORDER_SIGNAL")
@@ -250,7 +274,9 @@ def _validate_claims_or_attach_implementation_tx(conn: sqlite3.Connection, task_
     return None
 
 
-def _validate_required_claims_tx(conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]) -> dict[str, Any] | None:
+def _validate_required_claims_tx(
+    conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]
+) -> dict[str, Any] | None:
     issue = _claim_for_tx(conn, evidence["repo"], "issue", evidence["issue_number"])
     if not issue or issue["task_id"] != task_id:
         return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
@@ -261,7 +287,9 @@ def _validate_required_claims_tx(conn: sqlite3.Connection, task_id: str, evidenc
     return None
 
 
-def apply_workflow_signal(conn: sqlite3.Connection, payload: Any, *, origin_session_id: str | None = None) -> dict[str, Any]:
+def apply_workflow_signal(
+    conn: sqlite3.Connection, payload: Any, *, origin_session_id: str | None = None
+) -> dict[str, Any]:
     """Apply one validated workflow fact in one BEGIN IMMEDIATE transaction."""
     valid, rejected = validate_public_signal(payload)
     if rejected:
@@ -291,9 +319,15 @@ def apply_workflow_signal(conn: sqlite3.Connection, payload: Any, *, origin_sess
                 if existing["task_id"] == task_id:
                     return _outcome("duplicate_noop", "SAME_TASK_SAME_FACT", task_id=task_id)
                 return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
-            if kind == "pr_merged_observed" and _has_cleanup_started_tx(conn, task_id, evidence["repo"], evidence["pr_number"]):
+            if kind == "pr_merged_observed" and _has_cleanup_started_tx(
+                conn, task_id, evidence["repo"], evidence["pr_number"]
+            ):
                 return _outcome("late_noop", "CLEANUP_ALREADY_BEGUN", task_id=task_id)
-            activity_kind = {"refinement_approved": "refine", "implementation_pr_observed": "implementation", "pr_merged_observed": "implementation"}.get(kind)
+            activity_kind = {
+                "refinement_approved": "refine",
+                "implementation_pr_observed": "implementation",
+                "pr_merged_observed": "implementation",
+            }.get(kind)
             activity = _activity_for_tx(conn, task_id, activity_kind) if activity_kind else None
             if kind == "implementation_pr_observed":
                 if activity is None:
@@ -304,28 +338,44 @@ def apply_workflow_signal(conn: sqlite3.Connection, payload: Any, *, origin_sess
                     return _outcome("deferred", "activity_missing")
                 if activity["status"] != "ACTIVE":
                     return _outcome("duplicate_noop", "activity_terminal", task_id=task_id)
-                conn.execute("UPDATE activities SET status = 'DONE', ended_at = ? WHERE id = ?", (service.now_iso(), activity["id"]))
+                conn.execute(
+                    "UPDATE activities SET status = 'DONE', ended_at = ? WHERE id = ?",
+                    (service.now_iso(), activity["id"]),
+                )
                 event_id = _append_signal_tx(conn, valid, origin, activity["id"])
             elif kind == "pr_merged_observed":
                 if activity is None or activity["status"] != "ACTIVE":
                     return _outcome("deferred", "IMPLEMENTATION_NOT_READY")
-                conn.execute("UPDATE activities SET status = 'DONE', ended_at = ? WHERE id = ?", (service.now_iso(), activity["id"]))
+                conn.execute(
+                    "UPDATE activities SET status = 'DONE', ended_at = ? WHERE id = ?",
+                    (service.now_iso(), activity["id"]),
+                )
                 event_id = _append_signal_tx(conn, valid, origin, activity["id"])
             else:  # cleanup_completed
                 merge_payload = {
                     "signal_kind": "pr_merged_observed",
                     "source": "post-merge-cleanup",
                     "source_schema_version": "v1",
-                    "evidence": {"repo": evidence["repo"], "issue_number": evidence["issue_number"], "pr_number": evidence["pr_number"], "merge_commit_oid": evidence["merge_identity"]},
+                    "evidence": {
+                        "repo": evidence["repo"],
+                        "issue_number": evidence["issue_number"],
+                        "pr_number": evidence["pr_number"],
+                        "merge_commit_oid": evidence["merge_identity"],
+                    },
                 }
                 if not _accepted_event_tx(conn, dedupe_key_for(merge_payload)):
                     return _outcome("conflict", "OUT_OF_ORDER_SIGNAL")
-                cleanup = _find_cleanup_instance_tx(conn, task_id, evidence["repo"], evidence["pr_number"], evidence["merge_identity"])
+                cleanup = _find_cleanup_instance_tx(
+                    conn, task_id, evidence["repo"], evidence["pr_number"], evidence["merge_identity"]
+                )
                 if cleanup is None:
                     return _outcome("deferred", "CLEANUP_NOT_ELIGIBLE")
                 if cleanup["status"] != "ACTIVE":
                     return _outcome("duplicate_noop", "activity_terminal", task_id=task_id)
-                conn.execute("UPDATE activities SET status = 'DONE', ended_at = ? WHERE id = ?", (service.now_iso(), cleanup["id"]))
+                conn.execute(
+                    "UPDATE activities SET status = 'DONE', ended_at = ? WHERE id = ?",
+                    (service.now_iso(), cleanup["id"]),
+                )
                 event_id = _append_signal_tx(conn, valid, origin, cleanup["id"])
             service._bump_projection_tx(conn, origin["binding_id"])
             return _outcome("applied", "APPLIED", task_id=task_id, event_id=event_id)
@@ -337,21 +387,52 @@ def apply_workflow_signal(conn: sqlite3.Connection, payload: Any, *, origin_sess
         raise
 
 
-def _find_cleanup_instance_tx(conn: sqlite3.Connection, task_id: str, repo: str, pr_number: int, merge_identity: str) -> dict[str, Any] | None:
-    rows = conn.execute("SELECT * FROM events WHERE task_id = ? AND event_type = 'workflow:cleanup_started' ORDER BY occurred_at DESC", (task_id,)).fetchall()
+def _find_cleanup_instance_tx(
+    conn: sqlite3.Connection, task_id: str, repo: str, pr_number: int, merge_identity: str
+) -> dict[str, Any] | None:
+    rows = conn.execute(
+        "SELECT * FROM events WHERE task_id = ? AND event_type = 'workflow:cleanup_started' ORDER BY occurred_at DESC",
+        (task_id,),
+    ).fetchall()
     for row in rows:
         if _metadata_matches(row, repo=repo, pr_number=pr_number, merge_identity=merge_identity):
             activity_id = json.loads(row["metadata_json"])["activity_id"]
-            activity = conn.execute("SELECT * FROM activities WHERE id = ? AND task_id = ?", (activity_id, task_id)).fetchone()
+            activity = conn.execute(
+                "SELECT * FROM activities WHERE id = ? AND task_id = ?", (activity_id, task_id)
+            ).fetchone()
             return dict(activity) if activity else None
     return None
 
 
-def begin_cleanup_lifecycle(conn: sqlite3.Connection, *, origin_session_id: str | None, repo: str, issue_number: int, pr_number: int, merge_identity: str) -> dict[str, Any]:
+def begin_cleanup_lifecycle(
+    conn: sqlite3.Connection,
+    *,
+    origin_session_id: str | None,
+    repo: str,
+    issue_number: int,
+    pr_number: int,
+    merge_identity: str,
+) -> dict[str, Any]:
     """Durably select/resume the one eligible cleanup Activity after merge acceptance."""
-    if not isinstance(repo, str) or not _REPO.fullmatch(repo) or not all(_is_int(v) and v > 0 for v in (issue_number, pr_number)) or not isinstance(merge_identity, str) or not _HEX40.fullmatch(merge_identity):
+    if (
+        not isinstance(repo, str)
+        or not _REPO.fullmatch(repo)
+        or not all(_is_int(v) and v > 0 for v in (issue_number, pr_number))
+        or not isinstance(merge_identity, str)
+        or not _HEX40.fullmatch(merge_identity)
+    ):
         return _outcome("rejected_evidence", "INVALID_CLEANUP_LIFECYCLE_EVIDENCE")
-    merge_payload = {"signal_kind": "pr_merged_observed", "source": "post-merge-cleanup", "source_schema_version": "v1", "evidence": {"repo": repo, "issue_number": issue_number, "pr_number": pr_number, "merge_commit_oid": merge_identity}}
+    merge_payload = {
+        "signal_kind": "pr_merged_observed",
+        "source": "post-merge-cleanup",
+        "source_schema_version": "v1",
+        "evidence": {
+            "repo": repo,
+            "issue_number": issue_number,
+            "pr_number": pr_number,
+            "merge_commit_oid": merge_identity,
+        },
+    }
     with db.write_transaction(conn):
         origin, outcome = _resolve_origin_tx(conn, origin_session_id)
         if outcome:
@@ -363,21 +444,41 @@ def begin_cleanup_lifecycle(conn: sqlite3.Connection, *, origin_session_id: str 
         found = _find_cleanup_instance_tx(conn, task_id, repo, pr_number, merge_identity)
         if found is not None:
             return _outcome("selected", "CLEANUP_ALREADY_SELECTED", task_id=task_id, activity_id=found["id"])
-        active = conn.execute("SELECT id FROM activities WHERE task_id = ? AND status = 'ACTIVE'", (task_id,)).fetchone()
+        active = conn.execute(
+            "SELECT id FROM activities WHERE task_id = ? AND status = 'ACTIVE'", (task_id,)
+        ).fetchone()
         if active:
             return _outcome("conflict", "OUT_OF_ORDER_SIGNAL")
         activity_id = service._transition_activity_tx(conn, task_id, "cleanup")
-        service._append_event_tx(conn, event_type="workflow:cleanup_started", task_id=task_id, activity_id=activity_id, binding_id=origin["binding_id"], execution_run_id=origin["execution_run_id"], metadata={"repo": repo, "issue_number": issue_number, "pr_number": pr_number, "merge_identity": merge_identity, "activity_id": activity_id})
+        service._append_event_tx(
+            conn,
+            event_type="workflow:cleanup_started",
+            task_id=task_id,
+            activity_id=activity_id,
+            binding_id=origin["binding_id"],
+            execution_run_id=origin["execution_run_id"],
+            metadata={
+                "repo": repo,
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "merge_identity": merge_identity,
+                "activity_id": activity_id,
+            },
+        )
         service._bump_projection_tx(conn, origin["binding_id"])
         return _outcome("selected", "CLEANUP_STARTED", task_id=task_id, activity_id=activity_id)
 
 
 def cleanup_pending_for_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Derived state: accepted merge plus nonterminal eligible cleanup."""
-    rows = db.execute_readonly(conn, "SELECT * FROM events WHERE task_id = ? AND event_type = 'workflow:pr_merged_observed'", (task_id,)).fetchall()
+    rows = db.execute_readonly(
+        conn, "SELECT * FROM events WHERE task_id = ? AND event_type = 'workflow:pr_merged_observed'", (task_id,)
+    ).fetchall()
     for row in rows:
         data = json.loads(row["metadata_json"] or "{}")
-        cleanup = _find_cleanup_instance_tx(conn, task_id, data.get("repo"), data.get("pr_number"), data.get("merge_commit_oid"))
+        cleanup = _find_cleanup_instance_tx(
+            conn, task_id, data.get("repo"), data.get("pr_number"), data.get("merge_commit_oid")
+        )
         if cleanup is None or cleanup["status"] != "DONE":
             return True
     return False

@@ -10,6 +10,7 @@ LOOP_PROTOCOL の PR 起票を決定論的に行う。skill (SKILL.md) の手順
 - gh pr create 実行
 - KEY=VALUE stdout contract
 """
+
 from __future__ import annotations
 
 import argparse
@@ -183,9 +184,7 @@ def resolve_canonical_repository(requested_repo: str) -> str | None:
 
 def get_linked_issue_state(repo: str, issue_number: int) -> str | None:
     try:
-        result = run_gh(
-            "issue", "view", str(issue_number), "--repo", repo, "--json", "state"
-        )
+        result = run_gh("issue", "view", str(issue_number), "--repo", repo, "--json", "state")
         data = json.loads(result.stdout)
     except (subprocess.SubprocessError, json.JSONDecodeError):
         return None
@@ -222,9 +221,7 @@ def apply_linked_issue_reference(body: str, issue_number: int, link_kind: str) -
     return body + sep + f"{link_kind} #{issue_number}\n"
 
 
-def resolve_linked_issue_reference_kind(
-    body: str, issue_number: int, default_link_kind: str
-) -> str:
+def resolve_linked_issue_reference_kind(body: str, issue_number: int, default_link_kind: str) -> str:
     """Report the caller's existing link kind, or the state-derived default."""
     pattern = re.compile(rf"(Closes|Refs|Fixes|Resolves)\s+#{issue_number}\b", re.IGNORECASE)
     match = pattern.search(body)
@@ -263,9 +260,7 @@ def _run_pr_body_validator(
     changed_paths: list[str] | None,
     linked_issue: int,
 ) -> dict[str, object]:
-    validator_script = (
-        Path(__file__).resolve().parent / "validate_pr_body.py"
-    )
+    validator_script = Path(__file__).resolve().parent / "validate_pr_body.py"
 
     body_file = tempfile.NamedTemporaryFile(
         mode="w",
@@ -388,7 +383,6 @@ def _run_pr_body_validator(
             Path(changed_paths_file.name).unlink(missing_ok=True)
 
 
-
 def _run_japanese_content_validator(
     body_text: str,
     threshold: float = 0.1,
@@ -404,8 +398,7 @@ def _run_japanese_content_validator(
       - stderr: str (on fail/internal)
     """
     validator_script = (
-        Path(__file__).resolve().parent.parent.parent
-        / "create-issue" / "scripts" / "validate_japanese_content.py"
+        Path(__file__).resolve().parent.parent.parent / "create-issue" / "scripts" / "validate_japanese_content.py"
     )
 
     body_sha256 = f"sha256:{hashlib.sha256(body_text.encode('utf-8')).hexdigest()}"
@@ -512,6 +505,7 @@ def _run_japanese_content_validator(
     finally:
         Path(body_file.name).unlink(missing_ok=True)
 
+
 def classify_closing_issue_relation(snapshot: object, candidate_issue: int) -> tuple[str, str, dict | None]:
     """Total, bounded classifier for a fresh PR GraphQL snapshot (#2565).
 
@@ -554,10 +548,22 @@ def emit_implementation_pr_observed(*, repo: str, pr_number: int, linked_issue: 
         return "deferred", "RELATION_UNAVAILABLE"
     query = (
         "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
-        "{nameWithOwner pullRequest(number:$number){number closingIssuesReferences(first:2,excludeUserLinked:false,userLinkedOnly:false){nodes{number}}}}}"
+        "{nameWithOwner pullRequest(number:$number){number "
+        "closingIssuesReferences(first:2,excludeUserLinked:false,userLinkedOnly:false){nodes{number}}}}}"
     )
     try:
-        response = run_gh("api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}")
+        response = run_gh(
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={pr_number}",
+        )
         snapshot = json.loads(response.stdout)
     except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
         return "deferred", "RELATION_UNAVAILABLE"
@@ -565,9 +571,20 @@ def emit_implementation_pr_observed(*, repo: str, pr_number: int, linked_issue: 
     if evidence is None:
         return disposition, reason
     ctl = Path(__file__).resolve().parents[4] / "scripts" / "task-context" / "task_contextctl.py"
-    payload = {"signal_kind": "implementation_pr_observed", "source": "open-pr", "source_schema_version": "v1", "evidence": evidence}
+    payload = {
+        "signal_kind": "implementation_pr_observed",
+        "source": "open-pr",
+        "source_schema_version": "v1",
+        "evidence": evidence,
+    }
     try:
-        proc = subprocess.run([sys.executable, str(ctl), "signal", "apply"], input=json.dumps(payload), text=True, capture_output=True, timeout=10)
+        proc = subprocess.run(
+            [sys.executable, str(ctl), "signal", "apply"],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
         data = json.loads(proc.stdout.splitlines()[-1]) if proc.stdout.splitlines() else {}
         result = data.get("data", {}) if isinstance(data, dict) else {}
         return str(result.get("disposition", "deferred")), str(result.get("reason_code", "RELATION_UNAVAILABLE"))
@@ -630,9 +647,7 @@ def main(argv: list[str] | None = None) -> int:
     # hard gate remains active. A caller-provided reference is preserved exactly;
     # state-derived linkage is appended only when the body has none.
     default_link_kind = "Closes" if state == "OPEN" else "Refs"
-    link_kind = resolve_linked_issue_reference_kind(
-        original_body, args.linked_issue, default_link_kind
-    )
+    link_kind = resolve_linked_issue_reference_kind(original_body, args.linked_issue, default_link_kind)
     final_body = apply_linked_issue_reference(original_body, args.linked_issue, link_kind)
 
     changed_paths = resolve_changed_paths(args.changed_paths)
