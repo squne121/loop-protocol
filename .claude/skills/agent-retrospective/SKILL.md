@@ -367,6 +367,21 @@ fail-closed に解決・保存する resolver。v1 は project Skill only（`plu
 失敗した場合は `checkpoint_advanced: false` / `checkpoint_advance_reason: "blocked_evaluation_failure"`
 となり watermark ファイルへの書き込みは行われない（次回実行で同じ未分析 window が再選択される）。
 
+`--enable-full-analysis` を指定しない coverage-only invocation（`analysis_runner` 未接続）は
+observer/evaluator/finalize を一切実行しないため、分析済みを表す durable watermark を進めてはならない
+（PR #2660 fix_delta P1-1: OWNER REQUEST_CHANGES）。収集・coverage の disposition 単体が advance 相当
+だった場合でも、`run_since_last_retrospective_cli()` は `checkpoint_advanced` を `false`・
+`checkpoint_advance_reason` を `blocked_evaluation_failure` へ強制的に再計算し、watermark ファイルへは
+書き込まない（新しい `checkpoint_advance_reason` enum 値は追加せず、「未実行」と「実行して失敗」を同一の
+既存値で表現する）。`checkpoint_advanced == true` は、計算上の advance 判定ではなく実際の watermark
+ファイル書き込みが成功した後にのみ成立する。
+
+`analysis_runner` が成功した場合に生成される proposal-only `PublishRequest` は捨てられない（PR #2660
+fix_delta P1-2）。`run_since_last_retrospective_cli()` の `analysis_result_sink` 引数（caller が渡す
+list）へ append され、`main()` は checkpoint/watermark commit 後、既存の `PublishRequest.to_wire()`
+シリアライズ経路（default mode の `print(publish_request.to_wire())` と同一）を再利用して stdout の
+追加行へ出力する。新規 DB・publisher framework・persistence subsystem・permission broker は追加しない。
+
 **checkpointの完了はGitHub投稿の成功と区別する。** 既存の `publish_authorized` 事前 authorization
 判定（`compute_checkpoint_disposition()` が参照する）は checkpoint 確定の入力の一つだが、
 `finalize()` 完了後に別処理が行う実際の GitHub comment/post（publication、`persist_retrospective_run.py`

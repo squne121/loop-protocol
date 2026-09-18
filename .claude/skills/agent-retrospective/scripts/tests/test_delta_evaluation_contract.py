@@ -543,13 +543,30 @@ def test_ac3_repository_only_finding_still_resolves_under_runtime_unavailable():
     ]
 
 
-def test_ac8_coverage_complete_zero_observed_is_distinct_from_ac2_and_still_resolves():
+def test_ac8_coverage_complete_zero_observed_is_distinct_from_ac2_and_does_not_resolve():
     # BOTH runtime sources report status "observed" (coverage genuinely
-    # complete this run) with selected_session_count 0 ("coverage complete +
-    # zero observed", Issue #2644 AC8) -- distinct from AC2's "unavailable"/
-    # "partial" -- so the runtime-dependent finding is still eligible for
-    # normal "resolved" classification (this run genuinely looked and found
-    # nothing, unlike AC2 where it never looked at all).
+    # complete this run -- the collector pipeline itself worked correctly)
+    # with selected_session_count 0 ("coverage complete + zero observed",
+    # Issue #2644 AC8). This is DISTINGUISHABLE at the coverage/orchestration
+    # layer from AC2's genuinely "unavailable" input (asserted below) -- but
+    # PR #2660 fix_delta P1-3 (OWNER REQUEST_CHANGES): that distinction alone
+    # does not make "coverage complete + zero observed" sufficient evidence
+    # that a previously-reported runtime-dependent finding was actually
+    # fixed. This run gathered ZERO actual session evidence either way, so
+    # "no candidate reported this run" carries exactly as little resolution
+    # signal as AC2's unavailable case -- the finding must stay
+    # `indeterminate`, never auto-`resolved` purely because the collector
+    # itself reported a clean "observed" status.
+    for source_id in ("claude_code", "claude_gpt"):
+        zero_observed_entry = _RUNTIME_COMPLETE_ZERO_OBSERVED_COVERAGE[source_id]
+        unavailable_entry = _RUNTIME_UNAVAILABLE_COVERAGE[source_id]
+        assert zero_observed_entry["status"] == "observed"
+        assert zero_observed_entry["selected_session_count"] == 0
+        # coverage/orchestration-layer distinction from AC2 is preserved even
+        # though both now gate resolution the same conservative way.
+        assert unavailable_entry["status"] == "unavailable"
+        assert zero_observed_entry["status"] != unavailable_entry["status"]
+
     previous_candidate = _last_evaluation_only_candidate(
         identity_value="finding-runtime-1", evidence_refs=[_runtime_evidence_ref()]
     )
@@ -558,8 +575,17 @@ def test_ac8_coverage_complete_zero_observed_is_distinct_from_ac2_and_still_reso
     )
     delta = rr.compute_delta(previous, [], current_source_coverage=_RUNTIME_COMPLETE_ZERO_OBSERVED_COVERAGE)
     assert delta == [
-        {"finding_identity": "finding-runtime-1", "evaluation_status": "classified", "delta_status": "resolved"}
+        {
+            "finding_identity": "finding-runtime-1",
+            "evaluation_status": "indeterminate",
+            "delta_status": None,
+            "indeterminate_reason": "source_partial",
+        }
     ]
+    # never the new delta_status enum value being introduced -- reuses the
+    # EXISTING indeterminate representation (delta_status stays None/absent),
+    # same as AC2.
+    assert all(entry.get("delta_status") is None for entry in delta)
 
 
 def test_ac9_not_requested_runtime_source_does_not_gate_resolution():
