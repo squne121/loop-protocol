@@ -19,6 +19,11 @@ _CTL = _ROOT / "scripts" / "task-context" / "task_contextctl.py"
 
 
 def _merged_evidence(snapshot: object, issue_number: int, pr_number: int) -> tuple[dict | None, str]:
+    # A GraphQL response may carry plausible partial data alongside top-level
+    # errors. It is not authoritative merged-PR evidence and must never reach
+    # either signal application or cleanup selection.
+    if not isinstance(snapshot, dict) or "errors" in snapshot:
+        return None, "RELATION_UNAVAILABLE"
     try:
         pr = snapshot["data"]["repository"]["pullRequest"]
         repo = snapshot["data"]["repository"]["nameWithOwner"]

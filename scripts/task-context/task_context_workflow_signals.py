@@ -443,8 +443,14 @@ def begin_cleanup_lifecycle(
             return outcome
         assert origin is not None
         task_id = origin["task_id"]
-        if not _accepted_event_tx(conn, dedupe_key_for(merge_payload)):
+        accepted = _accepted_event_tx(conn, dedupe_key_for(merge_payload))
+        if accepted is None:
             return _outcome("conflict", "OUT_OF_ORDER_SIGNAL")
+        # The accepted merge fact is globally deduplicated. Cleanup selection
+        # may proceed only for the Task that owns that accepted fact; otherwise
+        # this origin would create a second lifecycle for the same merge.
+        if accepted["task_id"] != task_id:
+            return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
         found = _find_cleanup_instance_tx(conn, task_id, repo, pr_number, merge_identity)
         if found is not None:
             if found["status"] == "ACTIVE":
