@@ -230,6 +230,35 @@ def test_build_proxy_env_helper_references_same_transport_policy_constant():
     assert "CCP_CODEX_TRANSPORT=" in body
 
 
+def test_auto_review_model_policy_constant_defined_exactly_once_in_lib_sh():
+    """GIVEN lib.sh
+    WHEN CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-5.6-terra" の行を数える
+    THEN 無条件定数として一つだけ存在する（Issue #2654 Outcome (a)）
+    """
+    content = LIB_SH.read_text(encoding="utf-8")
+    matches = [
+        line
+        for line in content.splitlines()
+        if line.strip() == 'CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-5.6-terra"'
+    ]
+    assert len(matches) == 1
+
+
+def test_build_proxy_env_helper_references_auto_review_model_policy_constant():
+    """GIVEN lib.sh の claude_gpt_build_proxy_env()
+    WHEN 内容を読む
+    THEN CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY を参照する CCP_AUTO_REVIEW_MODEL 出力行が
+    存在する（Issue #2654: 未設定時 upstream proxy が classifier request を
+    無条件で gpt-5.6-luna へ fallback するデフォルトを、明示設定で上書きする）
+    """
+    content = LIB_SH.read_text(encoding="utf-8")
+    start = content.index("claude_gpt_build_proxy_env() {")
+    end = content.index("\n}", start)
+    body = content[start:end]
+    assert "CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY" in body
+    assert "CCP_AUTO_REVIEW_MODEL=" in body
+
+
 def test_default_check_only_settings_exclude_runtime_smoke_peer_policy(tmp_path):
     """Default launcher invocations must retain unrelated denials only."""
     result = _run_check_only(tmp_path)
