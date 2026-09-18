@@ -94,7 +94,7 @@ Issue #2467 AC8: 上記 2 行は、Issue の Allowed Paths 内の repo-relative 
 - `tee`, `>`, `>>`, `mkdir -p` は `artifacts/` 配下への証跡生成に限る
 - 実行後に artifact path を `runtime_ac_results[].notes` または `artifact_present` に記録する
 
-### Issue #2656 限定 narrow exception（canonical delegation route runtime probe）
+### Issue #2656 限定の狭域例外（正規委譲経路のランタイム検証）
 
 上記「動作検証 VC」例外は network side effect を含む script を対象外とするが、
 Issue #2656 の AC1 は canonical delegation route（`run_gemini_headless.run_delegation()`）
