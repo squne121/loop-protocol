@@ -582,6 +582,16 @@ ALLOWED_EVENT_METADATA_KEYS = frozenset(
         "duration_ms",
         "exit_code",
         "run_kind",
+        # Trusted workflow-signal facts (Issue #2565). Values remain small
+        # scalar evidence; raw workflow output is never journaled.
+        "signal_kind",
+        "source",
+        "source_schema_version",
+        "issue_number",
+        "pr_number",
+        "approved_body_sha256",
+        "merge_commit_oid",
+        "merge_identity",
     }
 )
 _MAX_EVENT_METADATA_STRING_LEN = 200
@@ -621,6 +631,7 @@ def append_event(
     binding_id: str | None = None,
     execution_run_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    dedupe_key: str | None = None,
 ) -> dict[str, Any]:
     with db.write_transaction(conn):
         event_id = _append_event_tx(
@@ -631,6 +642,7 @@ def append_event(
             binding_id=binding_id,
             execution_run_id=execution_run_id,
             metadata=metadata,
+            dedupe_key=dedupe_key,
         )
     row = db.execute_readonly(conn, "SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
     return _row_to_dict(row)  # type: ignore[return-value]
@@ -645,14 +657,15 @@ def _append_event_tx(
     binding_id: str | None = None,
     execution_run_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    dedupe_key: str | None = None,
 ) -> str:
     metadata = metadata or {}
     _validate_event_metadata(metadata)
     event_id = new_id("event")
     conn.execute(
         "INSERT INTO events "
-        "(id, task_id, activity_id, binding_id, execution_run_id, event_type, metadata_json, occurred_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(id, task_id, activity_id, binding_id, execution_run_id, event_type, metadata_json, dedupe_key, occurred_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             event_id,
             task_id,
@@ -661,6 +674,7 @@ def _append_event_tx(
             execution_run_id,
             event_type,
             json.dumps(metadata, sort_keys=True),
+            dedupe_key,
             now_iso(),
         ),
     )
@@ -907,6 +921,13 @@ def get_current_projection_for_session(conn: sqlite3.Connection, claude_session_
     activity = get_activity(conn, activity_id) if activity_id else None
     location = get_current_location(conn, binding["id"])
     task_refs = list_live_task_refs(conn, task_id) if task_id else []
+    # Workflow facts derive attention; presentation stays owned by the
+    # existing renderer and consumes this unchanged projection field.
+    attention = None
+    if task_id:
+        import task_context_workflow_signals as workflow_signals
+        if workflow_signals.cleanup_pending_for_task(conn, task_id):
+            attention = "CLEANUP_PENDING"
     return {
         "binding": binding,
         "task": task,
@@ -914,7 +935,7 @@ def get_current_projection_for_session(conn: sqlite3.Connection, claude_session_
         "runtime_location": location,
         "task_refs": task_refs,
         "execution_run_id": execution_run_id,
-        "attention": None,
+        "attention": attention,
     }
 
 

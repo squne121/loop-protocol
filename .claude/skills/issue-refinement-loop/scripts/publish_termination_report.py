@@ -439,11 +439,33 @@ def _post_github_comment(
 # Main publish flow
 # ---------------------------------------------------------------------------
 
+def _emit_refinement_approved_signal(*, repo: str, issue_number: int, approved_body_sha256: str | None) -> None:
+    """Post-publish best-effort adapter; it cannot undo a published handoff."""
+    origin = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not origin or not isinstance(approved_body_sha256, str):
+        return
+    if __import__("re").fullmatch(r"[0-9a-f]{64}", approved_body_sha256) is None:
+        return
+    payload = {
+        "signal_kind": "refinement_approved",
+        "source": "issue-refinement-loop",
+        "source_schema_version": "v1",
+        "evidence": {"repo": repo.lower(), "issue_number": issue_number, "approved_body_sha256": approved_body_sha256},
+    }
+    ctl = _PROJECT_ROOT / "scripts" / "task-context" / "task_contextctl.py"
+    try:
+        subprocess.run([sys.executable, str(ctl), "signal", "apply"], input=json.dumps(payload), text=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def publish(
     *,
     issue_number: int,
     body: str,
     repo: str,
+    termination_reason: str | None = None,
+    approved_body_sha256: str | None = None,
 ) -> int:
     """
     Core publish flow: post `body` (already-assembled plain markdown) as a
@@ -464,6 +486,10 @@ def publish(
         )
         return 1
 
+    if termination_reason == "approved":
+        _emit_refinement_approved_signal(
+            repo=repo, issue_number=issue_number, approved_body_sha256=approved_body_sha256
+        )
     print(
         f"[publish_termination_report] comment posted for issue #{issue_number}",
         file=sys.stderr,
@@ -591,6 +617,17 @@ def main() -> int:
         help="Path to a plain markdown body file (default: stdin; legacy plain-body mode)",
     )
     parser.add_argument(
+        "--termination-reason",
+        choices=("approved", "needs_fix", "human_judgment"),
+        default=None,
+        help="Canonical termination reason; only approved emits refinement_approved after publish.",
+    )
+    parser.add_argument(
+        "--approved-body-sha256",
+        default=None,
+        help="SHA-256 of the persisted approved Issue body (required to emit approved signal).",
+    )
+    parser.add_argument(
         "--human-history-request-file",
         type=str,
         default=None,
@@ -639,6 +676,8 @@ def main() -> int:
         issue_number=args.issue_number,
         body=body,
         repo=args.repo,
+        termination_reason=args.termination_reason,
+        approved_body_sha256=args.approved_body_sha256,
     )
 
 

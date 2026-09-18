@@ -9,6 +9,18 @@ PR マージ後のローカル環境 cleanup と Git 整理を `post-merge-clean
 
 Codex CLI では、このステップ専用の custom agent `post-merge-cleanup-worker` を起動する。root thread は直接ファイル編集・テスト実行・commit・push・review judgment を行わない。
 
+## Task Context trusted merge commit point（Issue #2565）
+
+Before selecting, resuming, or dispatching cleanup work, the orchestrator obtains a
+fresh merged-PR GraphQL snapshot and invokes
+`scripts/task_context_workflow_signal.py --phase merged`. Only `applied` or a
+same-Task `duplicate_noop` may continue to the durable cleanup selection; all
+other dispositions stop this invocation without cleanup Activity/work dispatch.
+After final successful cleanup work only, invoke the same adapter with
+`--phase completed`. Receipt/partial/failed/human-review outcomes never emit
+`cleanup_completed`. Adapter outcomes are diagnostic and never roll back a
+completed producer operation.
+
 ## Delegation / 委譲
 
 main thread は以下の static call shape で SubAgent に委譲する:

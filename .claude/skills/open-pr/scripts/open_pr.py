@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -511,6 +512,69 @@ def _run_japanese_content_validator(
     finally:
         Path(body_file.name).unlink(missing_ok=True)
 
+def classify_closing_issue_relation(snapshot: object, candidate_issue: int) -> tuple[str, str, dict | None]:
+    """Total, bounded classifier for a fresh PR GraphQL snapshot (#2565).
+
+    It intentionally treats malformed, partial, and unavailable snapshots as
+    unavailable rather than attempting a textual/branch-name fallback.
+    """
+    if not isinstance(snapshot, dict):
+        return "deferred", "RELATION_UNAVAILABLE", None
+    try:
+        repository = snapshot["data"]["repository"]
+        pull_request = repository["pullRequest"]
+        relation = pull_request["closingIssuesReferences"]
+        nodes = relation["nodes"]
+        repo = repository["nameWithOwner"]
+    except (KeyError, TypeError):
+        return "deferred", "RELATION_UNAVAILABLE", None
+    if not isinstance(nodes, list) or not isinstance(repo, str) or not isinstance(pull_request, dict):
+        return "deferred", "RELATION_UNAVAILABLE", None
+    if any(not isinstance(node, dict) or type(node.get("number")) is not int for node in nodes):
+        return "deferred", "RELATION_UNAVAILABLE", None
+    if len(nodes) == 0:
+        return "deferred", "NO_LINK", None
+    if len(nodes) >= 2:
+        return "conflict", "MULTIPLE_CLOSING_ISSUES", None
+    if nodes[0]["number"] != candidate_issue:
+        return "conflict", "RELATION_ISSUE_MISMATCH", None
+    number = pull_request.get("number")
+    if type(number) is not int or number <= 0:
+        return "deferred", "RELATION_UNAVAILABLE", None
+    return "matched", "MATCHED", {"repo": repo.lower(), "issue_number": candidate_issue, "pr_number": number}
+
+
+def emit_implementation_pr_observed(*, repo: str, pr_number: int, linked_issue: int) -> tuple[str, str]:
+    """Best-effort producer adapter; a Task Context outcome never rolls back PR work."""
+    origin = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not origin:
+        return "deferred", "unbound"
+    owner, sep, name = repo.partition("/")
+    if not sep or not owner or not name:
+        return "deferred", "RELATION_UNAVAILABLE"
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
+        "{nameWithOwner pullRequest(number:$number){number closingIssuesReferences(first:2,excludeUserLinked:false,userLinkedOnly:false){nodes{number}}}}}"
+    )
+    try:
+        response = run_gh("api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}")
+        snapshot = json.loads(response.stdout)
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
+        return "deferred", "RELATION_UNAVAILABLE"
+    disposition, reason, evidence = classify_closing_issue_relation(snapshot, linked_issue)
+    if evidence is None:
+        return disposition, reason
+    ctl = Path(__file__).resolve().parents[4] / "scripts" / "task-context" / "task_contextctl.py"
+    payload = {"signal_kind": "implementation_pr_observed", "source": "open-pr", "source_schema_version": "v1", "evidence": evidence}
+    try:
+        proc = subprocess.run([sys.executable, str(ctl), "signal", "apply"], input=json.dumps(payload), text=True, capture_output=True, timeout=10)
+        data = json.loads(proc.stdout.splitlines()[-1]) if proc.stdout.splitlines() else {}
+        result = data.get("data", {}) if isinstance(data, dict) else {}
+        return str(result.get("disposition", "deferred")), str(result.get("reason_code", "RELATION_UNAVAILABLE"))
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, IndexError):
+        return "deferred", "RELATION_UNAVAILABLE"
+
+
 def create_pr(repo: str, title: str, body_file: Path, branch: str, draft: bool) -> str:
     args = [
         "pr",
@@ -601,6 +665,11 @@ def main(argv: list[str] | None = None) -> int:
 
     existing = find_existing_pr(repo, branch)
     if existing:
+        signal_disposition, signal_reason = emit_implementation_pr_observed(
+            repo=repo, pr_number=int(existing["number"]), linked_issue=args.linked_issue
+        )
+        emit_kv("TASK_CONTEXT_SIGNAL_DISPOSITION", signal_disposition)
+        emit_kv("TASK_CONTEXT_SIGNAL_REASON", signal_reason)
         emit_kv("EXISTING", "true")
         emit_kv("PR_URL", existing["url"])
         emit_kv("PR_NUMBER", existing["number"])
@@ -652,6 +721,11 @@ def main(argv: list[str] | None = None) -> int:
             # で再確認する（idempotency チェックの canonical target 追従）。
             canonical_existing = find_existing_pr(target_repo, branch)
             if canonical_existing:
+                signal_disposition, signal_reason = emit_implementation_pr_observed(
+                    repo=target_repo, pr_number=int(canonical_existing["number"]), linked_issue=args.linked_issue
+                )
+                emit_kv("TASK_CONTEXT_SIGNAL_DISPOSITION", signal_disposition)
+                emit_kv("TASK_CONTEXT_SIGNAL_REASON", signal_reason)
                 emit_kv("EXISTING", "true")
                 emit_kv("PR_URL", canonical_existing["url"])
                 emit_kv("PR_NUMBER", canonical_existing["number"])
@@ -673,6 +747,12 @@ def main(argv: list[str] | None = None) -> int:
 
         match = re.search(r"/pull/(\d+)", pr_url)
         pr_number = match.group(1) if match else ""
+        if pr_number:
+            signal_disposition, signal_reason = emit_implementation_pr_observed(
+                repo=pr_create_repo, pr_number=int(pr_number), linked_issue=args.linked_issue
+            )
+            emit_kv("TASK_CONTEXT_SIGNAL_DISPOSITION", signal_disposition)
+            emit_kv("TASK_CONTEXT_SIGNAL_REASON", signal_reason)
 
         emit_kv("PR_URL", pr_url)
         emit_kv("PR_NUMBER", pr_number)

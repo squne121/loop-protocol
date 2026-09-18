@@ -1,0 +1,1 @@
+from test_signal_refinement_approved import test_given_refine_activity_and_claim_when_approved_signal_then_only_refine_terminalizes

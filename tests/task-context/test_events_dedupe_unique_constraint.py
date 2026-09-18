@@ -1,0 +1,1 @@
+from test_signal_workflow_contract import test_given_valid_implementation_fact_when_applied_then_claims_attach_atomically_and_fact_is_idempotent

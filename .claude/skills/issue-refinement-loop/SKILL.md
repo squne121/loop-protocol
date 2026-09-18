@@ -388,6 +388,13 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/publish_ter
   --issue-number 42 --repo <owner/repo> --body-file summary.md
 ```
 
+For the canonical approved termination/handoff publish only, calculate the
+SHA-256 of the persisted approved Issue body and pass
+`--termination-reason approved --approved-body-sha256 <64-lowercase-hex>`.
+The publisher emits `refinement_approved` only after the controlled comment
+publish succeeds; no natural-language summary is used as completion evidence.
+Missing/unbound adapter origin is diagnostic and never rolls back that publish.
+
 `human_escalation` の summary では、termination cause が未確定の場合 `human_judgment_required`
 へ正規化する（詳細は `references/termination-policy.md` の「termination_cause 正規化ルール」）。
 

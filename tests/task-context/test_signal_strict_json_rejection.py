@@ -1,0 +1,1 @@
+from test_signal_workflow_contract import test_given_duplicate_public_member_when_strict_parser_runs_then_envelope_rejection_is_reported

@@ -1,0 +1,1 @@
+from test_signal_workflow_contract import test_given_forbidden_identity_or_bad_evidence_when_validated_then_rejection_is_non_mutating
