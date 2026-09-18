@@ -216,6 +216,19 @@ def test_launch_sh_env_i_invocation_references_transport_policy():
     assert 'CCP_CODEX_TRANSPORT=$CLAUDE_GPT_CODEX_TRANSPORT_POLICY' in content
 
 
+def test_launch_sh_env_i_invocation_references_auto_review_model_policy():
+    """GIVEN launch.sh の実 proxy env -i invocation
+    WHEN 内容を読む
+    THEN CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY を参照する CCP_AUTO_REVIEW_MODEL 行が
+    存在する（Issue #2654。lib.sh の claude_gpt_build_proxy_env() ヘルパーは
+    この実 invocation とは独立した並行実装であり、参照するだけでは実行時に
+    反映されないため、実 invocation 側にも同じ source of truth 定数を直接渡す
+    必要がある）
+    """
+    content = LAUNCH_SH.read_text(encoding="utf-8")
+    assert 'CCP_AUTO_REVIEW_MODEL=$CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY' in content
+
+
 def test_build_proxy_env_helper_references_same_transport_policy_constant():
     """GIVEN lib.sh の claude_gpt_build_proxy_env()
     WHEN 内容を読む
@@ -384,6 +397,7 @@ def test_child_env_contains_only_expected_allowlist_keys(tmp_path):
         "CCP_BIND_ADDRESS",
         "CCP_LOG_STDERR",
         "CCP_CODEX_TRANSPORT",
+        "CCP_AUTO_REVIEW_MODEL",
     }
     # LC_CTYPE は CPython インタプリタ自身が起動時に行う locale coercion（PEP 538/540）
     # により fake proxy プロセス自身の os.environ へ自己追加されることがある値であり、
