@@ -3305,3 +3305,148 @@ def test_checkpoint_advances_independent_of_publication_success(tmp_path: Path) 
 
     assert result["checkpoint"]["checkpoint_advanced"] is True
     assert watermark_file.exists()
+
+
+def test_p1_4_connected_analysis_reaches_runtime_unavailable_indeterminate_branch(tmp_path: Path) -> None:
+    """PR #2660 fix_delta P1-4 (OWNER REQUEST_CHANGES): the connected
+    (``--enable-full-analysis``) ``--since-last-retrospective`` path must
+    actually reach ``analysis_runner`` -- and through it, ``compute_delta()``'s
+    runtime-unavailable/partial evidence-dependent branch (Issue #2644
+    AC2/AC3) -- even when a REQUIRED session source is NOT ``observed`` this
+    run. Before this fix, ``run_since_last_retrospective_cli()`` gated the
+    analysis ATTEMPT itself on ``result["checkpoint"]["checkpoint_advanced"]``,
+    which folds in "every required source is ``observed``" -- so a run with
+    one required source unavailable could never reach ``analysis_runner`` at
+    all, making AC2/AC3's runtime-unavailable/partial branch structurally
+    unreachable from this CLI's own production entrypoint (the reviewer's
+    root-cause finding). This test proves (a) analysis genuinely runs (the
+    full observer/evaluator call graph is invoked, never skipped), (b)
+    ``compute_delta()``'s runtime-unavailable branch is actually HIT (a
+    previously-reported runtime-evidence finding classifies
+    ``indeterminate``/``source_partial``, never a false ``resolved``), and (c)
+    the checkpoint disposition itself remains correctly blocked
+    (``blocked_missing_required_source``) -- this relaxation never promotes
+    an under-covered run's checkpoint to advanced."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    fake_home = tmp_path / "home"
+    slug = str(repo_root.resolve()).replace("/", "-")
+    # ONLY claude_code is wired (a real sentinel session); claude_gpt IS
+    # required but its env var (`CLAUDE_GPT_HOOK_SINK_PATH`) is deliberately
+    # never set in `env` below -- `collect_session_sources` therefore never
+    # wires a collector for it, so its coverage entry reports
+    # `status: "required"`/`reason_code: "collector_not_configured"`, NOT
+    # `observed` -- this is the exact "required source not observed"
+    # condition that previously blocked the analysis ATTEMPT itself.
+    _write_sentinel_session(fake_home / ".claude" / "projects" / slug, "SENTINEL-P1-4")
+
+    # Issue #2644 PR #2660 fix_delta: see the matching comment on the AC1/
+    # AC6/AC10 tests above -- `HEAD` resolves identically to this checkout's
+    # real current commit in both a normal local checkout and a
+    # detached-HEAD CI checkout.
+    head_rev_parse = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
+    )
+    assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
+    real_head_sha = head_rev_parse.stdout.strip()
+    real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+    native_result = _native_codebase_investigation_result(
+        _real_repo_evidence_ref(repo_root, real_head_sha, "CLAUDE.md")
+    )
+    call_log: list[str] = []
+    # the fake evaluator reports ZERO current candidates this run (the
+    # `_make_since_last_fake_runner` default, unchanged here) -- so the
+    # previously-reported runtime-evidence finding seeded below is ABSENT
+    # this run, which is exactly the "resolved vs. indeterminate" fork
+    # `compute_delta()`'s runtime-unavailable branch decides.
+    fake_runner = _make_since_last_fake_runner(
+        expected_digest, call_log, native_codebase_investigation_result=native_result
+    )
+
+    previous_identity = "finding-p1-4-runtime-1"
+    previous_candidate = {
+        "finding_contract": {
+            "identity": {"value": previous_identity},
+            "evaluations": [
+                {
+                    "presence_delta": "new",
+                    "evidence_refs": [_runtime_evidence_ref_for_judgment("p1-4")],
+                }
+            ],
+        }
+    }
+    provider = rr.FixturePreviousStateProvider(
+        fixtures={
+            (_REPOSITORY_ID, rr.DEFAULT_PREVIOUS_STATE_SCOPE): rr.PreviousStateResult(
+                status="available",
+                previous_run_ref="run-prior-p1-4",
+                candidates=[previous_candidate],
+                read_version="v1",
+            )
+        }
+    )
+
+    analysis_runner = rr.build_since_last_analysis_runner(
+        repo_root=repo_root,
+        repository_id=_REPOSITORY_ID,
+        target_issue=2644,
+        request_id="req-p1-4-1",
+        idempotency_key="idem-p1-4-1",
+        schema_dir=schema_dir,
+        previous_state_provider=provider,
+        runner=fake_runner,
+        git_runner=_real_git_runner,
+        run_id="run-p1-4-1",
+        temp_base_dir=tmp_path,
+    )
+
+    sink: list[Any] = []
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=repo_root,
+        required_sources=["claude_code", "claude_gpt"],
+        env={"HOME": str(fake_home)},
+        publish_authorized=True,
+        analysis_runner=analysis_runner,
+        analysis_result_sink=sink,
+        clock=_since_last_clock,
+    )
+
+    # (a) the required-but-unwired source genuinely reports non-`observed`
+    # this run -- the exact precondition that previously blocked the
+    # analysis ATTEMPT itself.
+    assert result["source_coverage"]["claude_gpt"]["status"] != "observed"
+    assert result["source_coverage"]["claude_code"]["status"] == "observed"
+
+    # (b) analysis genuinely ran: every observer + the evaluator were
+    # actually invoked (never skipped merely because coverage was
+    # incomplete this run), and a PublishRequest was captured via the sink.
+    assert sorted(call_log) == sorted(
+        [spec.observer_id for spec in rr.EXPECTED_OBSERVER_MANIFEST] + ["retrospective-evaluator"]
+    )
+    assert len(sink) == 1
+    publish_request = sink[0]
+
+    # (c) compute_delta()'s runtime-unavailable/partial branch was actually
+    # REACHED: the previously-reported runtime-evidence finding (absent this
+    # run) classifies `indeterminate`/`source_partial`, never a false
+    # `resolved` -- proving `analysis_runner` really was invoked with THIS
+    # run's own under-covered `current_source_coverage`, not merely called
+    # with an empty/complete stand-in.
+    delta_entry = next(e for e in publish_request.delta_results if e["finding_identity"] == previous_identity)
+    assert delta_entry["evaluation_status"] == "indeterminate"
+    assert delta_entry["delta_status"] is None
+    assert delta_entry["indeterminate_reason"] == "source_partial"
+
+    # (d) the checkpoint disposition itself is UNCHANGED by this relaxation
+    # -- a successful analysis attempt never by itself promotes an
+    # under-covered run's checkpoint to advanced; only genuine full
+    # required-source coverage does.
+    assert result["checkpoint"]["checkpoint_advanced"] is False
+    assert result["checkpoint"]["checkpoint_advance_reason"] == "blocked_missing_required_source"
+    rr.validate_session_window_coverage(result)

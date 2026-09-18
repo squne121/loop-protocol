@@ -389,6 +389,19 @@ list）へ append され、`main()` は checkpoint/watermark commit 後、既存
 `finalize()` が返す proposal-only `PublishRequest` の生成・受け渡しの完了までを指し、GitHub への
 実際の投稿呼び出しは行わない。
 
+`analysis_runner` を実際に呼び出すか（＝分析 ATTEMPT を試みるか）の条件は `publish_authorized` が
+`true` であること**のみ**であり、required source が全て `observed` かどうかには依存しない（PR #2660
+fix_delta P1-4: OWNER REQUEST_CHANGES、P1-1 導入時の
+`if result["checkpoint"]["checkpoint_advanced"]:` gate を supersede）。この gate を required-source
+coverage の完全性にも依存させていた旧実装では、`--enable-full-analysis` の connected 経路が
+`current_source_coverage` に `unavailable`/`partial` な required source を含む状態で `analysis_runner`
+へ到達することが構造的に不可能になり、結果として `compute_delta()` の runtime-unavailable/partial
+evidence-dependent 分岐（AC2/AC3、`_unavailable_evidence_source_ids()`）が本番 entrypoint から一切
+到達不能になっていた。分析 ATTEMPT が成功しても、それ自体が checkpoint disposition を advance へ
+昇格させることはない（`compute_checkpoint_disposition()` の優先順位により、required source 未観測時は
+分析結果に関わらず `blocked_missing_required_source` のまま維持される）。checkpoint が実際に advance
+するのは、引き続き required source の完全な coverage と authorization の両方が揃った場合のみである。
+
 ## Guardrails（ガードレール）
 
 - **Allowed Paths 外を編集しない**

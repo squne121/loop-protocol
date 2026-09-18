@@ -6482,20 +6482,32 @@ def run_since_last_retrospective_cli(
       result["source_coverage"])`` with THIS SAME run's already-collected
       ``collector_results``/``source_coverage`` (Issue #2644 AC1 -- the
       exact values already used to compute the envelope above, never a
-      second independent collection), but ONLY when the coverage/
-      authorization-only disposition already computed above would have
-      advanced (``result["checkpoint"]["checkpoint_advanced"]`` is
-      ``True``) -- a run that was already going to block for missing
-      coverage or missing publish authorization never invokes analysis at
-      all (Issue #2644 Outcome 3: those are independent, coverage-only
-      preconditions, not the analysis-success gate this parameter adds).
-      Production callers pass a closure that threads the SAME
-      ``collector_results``/``source_coverage`` into ``run_cli()``'s
-      caller-supplied ``prompts``/``current_source_coverage`` parameters
-      (see ``build_since_last_analysis_runner()``) -- this function itself
-      never calls ``run_cli()`` directly, keeping this module's one
-      observer-dispatch implementation (``run_observer_wave()``) as the
-      sole call site, never a second parallel pipeline.
+      second independent collection), whenever ``publish_authorized`` is
+      ``True`` -- a run that was never explicitly publish-authorized never
+      invokes analysis at all (Issue #2644 Outcome 3's authorization gate is
+      unchanged). PR #2660 fix_delta P1-4 (OWNER REQUEST_CHANGES,
+      superseding this parameter's PR #2660 fix_delta P1-1 "ONLY when
+      ``result["checkpoint"]["checkpoint_advanced"]`` is already ``True``"
+      wording): gating the analysis ATTEMPT itself on full required-source
+      coverage made the connected (``--enable-full-analysis``) production
+      path structurally unable to ever reach ``analysis_runner`` with an
+      ``unavailable``/``partial`` required source in
+      ``result["source_coverage"]`` -- ``compute_delta()``'s runtime-
+      unavailable/partial evidence-dependent branch (this Issue's Outcome
+      1/In Scope) would then be unreachable end-to-end from this CLI's own
+      production entrypoint. Whether the analysis attempt itself SUCCEEDS
+      never by itself promotes the checkpoint disposition to advanced --
+      that still requires genuine full required-source coverage (see
+      ``compute_checkpoint_disposition``'s priority order); this parameter's
+      relaxation only widens WHEN analysis is attempted, never widens WHEN
+      the checkpoint may advance. Production callers pass a closure that
+      threads the SAME ``collector_results``/``source_coverage`` into
+      ``run_cli()``'s caller-supplied ``prompts``/``current_source_coverage``
+      parameters (see ``build_since_last_analysis_runner()``) -- this
+      function itself never calls ``run_cli()`` directly, keeping this
+      module's one observer-dispatch implementation
+      (``run_observer_wave()``) as the sole call site, never a second
+      parallel pipeline.
       - Raises (any ``Exception``): the analysis phase itself failed
         (observer wave / evaluator / finalize). The checkpoint disposition
         is recomputed via ``compute_checkpoint_disposition(...,
@@ -6591,12 +6603,33 @@ def run_since_last_retrospective_cli(
             window_end=window_end,
             clock=clock,
         )
-        # Issue #2644 AC5/AC6/AC10: the analysis phase (observer/evaluator/
-        # finalize) runs ONLY when the coverage/authorization-only
-        # disposition above would already have advanced -- never for a run
-        # that was going to block anyway for missing coverage/authorization
-        # (those existing, independent preconditions are unaffected).
-        if result["checkpoint"]["checkpoint_advanced"]:
+        # Issue #2644 AC5/AC6/AC10; PR #2660 fix_delta P1-4 (OWNER
+        # REQUEST_CHANGES, superseding fix_delta P1-1's original
+        # `if result["checkpoint"]["checkpoint_advanced"]:` gate): the
+        # analysis phase (observer/evaluator/finalize) is now attempted
+        # whenever `publish_authorized` is `True`, regardless of whether
+        # every required source was `observed` this run. Gating the
+        # ATTEMPT itself on full required-source coverage made the
+        # connected (`--enable-full-analysis`) production path structurally
+        # unable to ever reach `analysis_runner` with an `unavailable`/
+        # `partial` required source in `result["source_coverage"]` --
+        # `compute_delta()`'s runtime-unavailable/partial evidence-dependent
+        # branch (Outcome 1/In Scope) was then unreachable end-to-end from
+        # this CLI's own production entrypoint (PR #2660 fix_delta review
+        # finding). `publish_authorized` remains the one precondition still
+        # enforced before ever attempting analysis (Issue #2644 Outcome 3's
+        # explicit-authorization gate, unrelated to coverage completeness,
+        # is unchanged). This relaxation never by itself changes WHETHER the
+        # checkpoint may advance: `compute_checkpoint_disposition`'s own
+        # priority order re-derives `blocked_missing_required_source` (or
+        # `blocked_no_publish_authorization`) ahead of any
+        # `evaluation_failed` check, so every recompute below reproduces the
+        # SAME blocked disposition `result["checkpoint"]` already held
+        # whenever required-source coverage (or authorization) was
+        # incomplete -- only genuine full required-source coverage plus
+        # authorization ever advances the checkpoint (see that function's
+        # docstring).
+        if publish_authorized:
             if analysis_runner is None:
                 # PR #2660 fix_delta P1-1 (OWNER REQUEST_CHANGES): this is a
                 # COVERAGE-ONLY invocation -- observer/evaluator/finalize were
@@ -6608,7 +6641,12 @@ def run_since_last_retrospective_cli(
                 # `blocked_evaluation_failure` -- "never attempted" and
                 # "attempted and failed" both mean "no analysis result exists
                 # to commit" from the checkpoint's own perspective, and no new
-                # `checkpoint_advance_reason` enum value is introduced).
+                # `checkpoint_advance_reason` enum value is introduced). When
+                # the disposition was already blocked for a coverage reason
+                # (e.g. `blocked_missing_required_source`), this recompute is
+                # a no-op: `compute_checkpoint_disposition`'s priority order
+                # re-derives that SAME reason regardless of
+                # `evaluation_failed`.
                 result = dict(result)
                 result["checkpoint"] = compute_checkpoint_disposition(
                     required_sources=resolved_required_sources,
@@ -6644,7 +6682,12 @@ def run_since_last_retrospective_cli(
                     # `main()` prints its `.to_wire()` form through the SAME
                     # existing serialization channel every other analysis
                     # result in this module already uses) before the
-                    # checkpoint/watermark is durably committed below.
+                    # checkpoint/watermark is durably committed below. The
+                    # disposition computed above (`result["checkpoint"]`) is
+                    # kept AS-IS here (PR #2660 fix_delta P1-4): a SUCCESSFUL
+                    # analysis attempt never itself promotes an under-covered
+                    # run's disposition to advanced -- only genuine full
+                    # required-source coverage plus authorization does that.
                     if analysis_result_sink is not None:
                         analysis_result_sink.append(analysis_publish_request)
         if prior_watermark_file is not None and result["checkpoint"]["checkpoint_advanced"]:
