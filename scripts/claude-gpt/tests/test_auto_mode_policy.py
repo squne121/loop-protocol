@@ -221,7 +221,11 @@ def test_narrow_policy_scope_mentions_only_trusted_repo_and_agy_route():
     """GIVEN 生成された autoMode fragment
     WHEN environment/allow の narrow label 文字列を確認する
     THEN squne121/loop-protocol と provider=agy route のみを明示し、broad gh api・
-    arbitrary provider・credential forwarding は含まない
+    arbitrary provider は含まない。GitHub auth モデルは Claude child（native
+    同等の ambient auth）と AGY delegation（github_research route の read-only
+    broker 専有）を別々の actor-specific 記述として持ち、「GitHub write
+    credential は launcher-owned transaction broker のみが保持する」という
+    旧一括り記述（#2658 AC1）は残っていない
     """
     result = _run_sh_function("claude_gpt_auto_mode_standalone_json")
     payload = json.loads(result.stdout)
@@ -242,9 +246,24 @@ def test_narrow_policy_scope_mentions_only_trusted_repo_and_agy_route():
     assert "broad gh api" in env_label or "broad" in env_label
     assert "対象外" in env_label
 
+    # AC1: 現行実装と矛盾する一括り credential 記述が除去されている
+    assert "launcher-owned transaction broker のみが保持し" not in env_label
+    # AC2: Claude child と AGY delegation が別々の actor-specific 記述として
+    # 分離されている（一方に統合していない）
+    assert "Claude child" in env_label
+    assert "GitHub auth" in env_label
+    assert "native 同等" in env_label
+    assert "GH_CONFIG_DIR" in env_label
+    assert "github_research" in env_label
+    assert "AGY process 自身には渡さない" in env_label
+
 
 def test_narrow_policy_scope_names_only_the_controlled_issue_edit_transaction_identity():
-    """The autoMode allow SSOT describes the exact canonical transaction."""
+    """The autoMode allow SSOT describes the exact canonical transaction, and
+    (AC3/AC4/AC5) describes normal approved operations via a native GitHub
+    client + authoritative live readback rather than a generic broker-only
+    route, while still keeping the narrow-use executor descriptions.
+    """
     result = _run_sh_function("claude_gpt_auto_mode_standalone_json")
     assert result.returncode == 0, result.stderr
     allow_label = json.loads(result.stdout)["autoMode"]["allow"][1]
@@ -255,16 +274,49 @@ def test_narrow_policy_scope_names_only_the_controlled_issue_edit_transaction_id
     assert "token/argv identity" in allow_label
     assert "generic uv/Python/raw gh" in allow_label
 
+    # AC3: 通常操作を generic broker のみに限定する旧記述が残っていない
+    assert (
+        "GitHub mutation transaction broker（canonical builder/wrapper 経由、"
+        "raw gh api を使わない）による"
+    ) not in allow_label
+    # AC4: native GitHub client + authoritative live readback が通常 route
+    assert "native GitHub client" in allow_label
+    assert "live readback" in allow_label
+    # AC5: controlled Issue-edit transaction と AGY read-only broker の narrow
+    # executor 記述は維持されている
+    assert "read-only broker" in allow_label
+
 
 def test_narrow_policy_scope_documents_second_gate_not_authority():
     """GIVEN narrow label
     WHEN authority に関する記述を確認する
-    THEN autoMode が authority ではなく判断補助であることを明示する
+    THEN autoMode が authority ではなく判断補助であることを明示する。AC6:
+    push/ref/merge の authority と Issue/PR object mutation の authority が
+    分離して記述されており、一括り文言「決定論的な authority は
+    permissions.deny / PreToolUse hook / transaction broker が持つ」は
+    残っていない
     """
     result = _run_sh_function("claude_gpt_auto_mode_standalone_json")
     payload = json.loads(result.stdout)
     allow_label = payload["autoMode"]["allow"][1]
     assert "authority" in allow_label
+    assert "決定論的な authority は permissions.deny" not in allow_label
+    assert "push/ref/merge" in allow_label
+    assert "repository permissions" in allow_label
+    assert "branch protection" in allow_label
+    assert "Issue/PR object mutation" in allow_label
+    assert "GitHub API authorization" in allow_label
+
+
+def test_hard_deny_addition_comment_matches_current_claude_child_gh_config_behavior():
+    """GIVEN lib.sh の hard_deny 追加分コメント（L367-375 付近）
+    WHEN 内容を確認する
+    THEN Claude child は native gh config directory を使うという現行実装
+    （Issue #2299/#2303）と矛盾する、stale な「隔離 HOME/GH_CONFIG_DIR による
+    raw gh 認証遮断」記述が残っていない（#2658 AC10）
+    """
+    content = LIB_SH.read_text(encoding="utf-8")
+    assert "隔離 HOME/GH_CONFIG_DIR による raw" not in content
 
 
 # --- AC3: isolation_and_auto_mode_enforcement --------------------------------
