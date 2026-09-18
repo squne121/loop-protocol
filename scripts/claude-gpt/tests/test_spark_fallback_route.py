@@ -1,18 +1,25 @@
 """scripts/claude-gpt/tests/test_spark_fallback_route.py
 
-Issue #2340 AC4: `preferred + fallback allowed + fallback_only` must let the
-workflow continue in `degraded` mode (not `blocked`) and must record the
-fallback route via `actor_capabilities.spark_delegation` -- without this
-preflight module itself fabricating a `resolvedModel` claim (that evidence
-is Child A #2274's live-invocation responsibility, not a static preflight
-judgment; Issue #2340 In Scope item 5 keeps the lazy-attempt design).
+Issue #2651: GPT-5.3-Codex-Spark delegation is retired repository-wide.
+This file used to verify Issue #2340 AC4's `preferred + fallback allowed +
+fallback_only` degraded-continue semantics -- a live binary/auth-based
+Spark eligibility judgment that no longer exists. It is replaced (file path
+kept, per Issue #2651 Allowed Paths -- no file deletion) with a negative
+regression suite: no `spark_mode` directive can ever reach `eligible` /
+`fallback_only` / `degraded` any more. Any non-None `spark_mode`
+(`required` or `preferred`, regardless of `spark_fallback` or observed
+binary/auth availability) now deterministically yields a retired
+`blocked` decision -- never a silent fallback to a different model/agent,
+and never a live-observed eligibility promotion. `spark_mode=None`
+(ordinary callers) is unaffected.
 """
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
+
+import pytest
 
 _TESTS_DIR = Path(__file__).resolve().parent
 _SCRIPTS_DIR = _TESTS_DIR.parent
@@ -28,25 +35,26 @@ import workflow_capability_preflight as wcp  # noqa: E402
 _DEFAULT_REPO = "squne121/loop-protocol"
 
 
-def _assess_with_spark(monkeypatch, *, spark_mode, spark_fallback, binary_available, auth_available):
+def _assess_with_spark(monkeypatch, *, spark_mode, spark_fallback):
+    """No `_run_env_only_preflight` monkeypatch here (unlike the retired
+    positive-contract version of this file): `assess()`'s retired Spark
+    decision (`_spark_status()`) never calls it any more, so a test that
+    still wanted to prove "even if the binary/auth WERE observed available,
+    the directive is still retired" would need to patch it -- the tests
+    below intentionally omit that to prove the retired branch is reached
+    unconditionally, with no probe spawned at all."""
     monkeypatch.setattr(wcp, "_github_auth_probe", lambda deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED))
     monkeypatch.setattr(wcp, "_github_repo_read_probe", lambda repo, deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED))
     monkeypatch.setattr(wcp.trusted_uv_mod, "check_trusted_uv", lambda project_root: {
         "status": wcp.trusted_uv_mod.STATUS_OK, "reason": "resolved", "resolved_path": "/fake/uv"
     })
-    monkeypatch.setattr(
-        wcp,
-        "_run_env_only_preflight",
-        lambda deadline_ns: wcp.ProbeOutcome(
-            wcp.PROBE_COMPLETED,
-            stdout=json.dumps(
-                {
-                    "binary_available": binary_available,
-                    "chatgpt_auth": {"available": auth_available},
-                }
-            ),
-        ),
-    )
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError(
+            "assess() must not spawn the retired Spark env-only probe any more"
+        )
+
+    monkeypatch.setattr(wcp, "_run_env_only_preflight", _fail_if_called)
     monkeypatch.setattr(wcp.subprocess, "run", lambda *a, **k: __import__("subprocess").CompletedProcess([], 0))
     monkeypatch.setattr(wcp.shutil, "which", lambda name: None)
 
@@ -60,76 +68,41 @@ def _assess_with_spark(monkeypatch, *, spark_mode, spark_fallback, binary_availa
     )
 
 
-def test_preferred_fallback_allowed_fallback_only_degrades_and_continues(monkeypatch):
-    """GIVEN spark_mode=preferred + spark_fallback=allowed but the Spark
-    binary/auth is unavailable, WHEN assess() runs, THEN the overall decision
-    is `degraded` (workflow continues) rather than `blocked`, and the
-    fallback route is recorded in `actor_capabilities.spark_delegation`."""
-    result = _assess_with_spark(
-        monkeypatch,
-        spark_mode="preferred",
-        spark_fallback="allowed",
-        binary_available=False,
-        auth_available=False,
-    )
-    assert result["checks"]["spark"]["status"] == "fallback_only"
-    assert result["decision"] == "degraded"
-    spark_entry = result["actor_capabilities"]["spark_delegation"]
-    assert spark_entry["status"] == "degraded"
-    assert spark_entry["fallback_route"] == "non_spark_agent"
-    assert any("spark:fallback_only" in r for r in result["reasons"])
-
-
-def test_preferred_fallback_forbidden_unavailable_blocks(monkeypatch):
-    """GIVEN spark_fallback=forbidden and Spark is unavailable, WHEN
-    assess() runs, THEN the workflow is blocked (fail closed, no silent
-    fallback)."""
-    result = _assess_with_spark(
-        monkeypatch,
-        spark_mode="preferred",
-        spark_fallback="forbidden",
-        binary_available=False,
-        auth_available=False,
-    )
-    assert result["checks"]["spark"]["status"] == "unavailable"
+@pytest.mark.parametrize("spark_fallback", ["allowed", "forbidden", None])
+def test_preferred_directive_is_always_retired_regardless_of_fallback(monkeypatch, spark_fallback):
+    """GIVEN spark_mode=preferred (any spark_fallback value), WHEN assess()
+    runs, THEN the route is retired and the overall decision is `blocked`
+    -- never `degraded`/`ready`, and no live probe is spawned to judge
+    eligibility."""
+    result = _assess_with_spark(monkeypatch, spark_mode="preferred", spark_fallback=spark_fallback)
+    assert result["checks"]["spark"]["status"] == "retired"
     assert result["decision"] == "blocked"
-    assert result["actor_capabilities"]["spark_delegation"]["status"] == "unavailable"
+    spark_entry = result["actor_capabilities"]["spark_delegation"]
+    assert spark_entry["status"] == "unavailable"
+    assert spark_entry["reason_code"] == "spark_delegation_retired"
+    assert spark_entry["fallback_route"] is None
+    assert any("spark:retired" in r for r in result["reasons"])
 
 
-def test_preferred_binary_and_auth_available_is_eligible_not_fallback(monkeypatch):
-    """GIVEN Spark binary + auth ARE available, WHEN assess() runs, THEN the
-    route is `eligible` (workflow proceeds with Spark, not degraded), and
-    this preflight does NOT fabricate a `resolvedModel` claim -- that remains
-    the live-invocation's own evidence responsibility (lazy-attempt design,
-    In Scope item 5)."""
-    result = _assess_with_spark(
-        monkeypatch,
-        spark_mode="preferred",
-        spark_fallback="allowed",
-        binary_available=True,
-        auth_available=True,
-    )
-    assert result["checks"]["spark"]["status"] == "eligible"
+@pytest.mark.parametrize("spark_fallback", ["allowed", "forbidden", None])
+def test_required_directive_is_always_retired_regardless_of_fallback(monkeypatch, spark_fallback):
+    """GIVEN spark_mode=required (any spark_fallback value), WHEN assess()
+    runs, THEN the route is retired and the overall decision is `blocked`.
+    `required` and `preferred` share identical retired semantics -- there
+    is no more mode-specific branching once Spark is retired."""
+    required_result = _assess_with_spark(monkeypatch, spark_mode="required", spark_fallback=spark_fallback)
+    preferred_result = _assess_with_spark(monkeypatch, spark_mode="preferred", spark_fallback=spark_fallback)
+    assert required_result["checks"]["spark"]["status"] == preferred_result["checks"]["spark"]["status"] == "retired"
+    assert required_result["decision"] == preferred_result["decision"] == "blocked"
+
+
+def test_spark_mode_none_is_unaffected_ordinary_caller(monkeypatch):
+    """GIVEN spark_mode=None (an ordinary caller that never requested
+    Spark), WHEN assess() runs, THEN the workflow proceeds `ready` and
+    `actor_capabilities.spark_delegation` reports ready -- no regression
+    for callers that never touch the retired route."""
+    result = _assess_with_spark(monkeypatch, spark_mode=None, spark_fallback=None)
+    assert result["checks"]["spark"]["status"] == "not_required"
     assert result["decision"] == "ready"
     assert result["actor_capabilities"]["spark_delegation"]["status"] == "ready"
-    assert "resolvedModel" not in result["checks"]["spark"]
-    assert set(result["checks"]["spark"].keys()) == {"status"}
-
-
-def test_required_mode_with_fallback_allowed_is_same_semantics_as_preferred(monkeypatch):
-    """`_spark_capability()` treats `spark_mode` truthiness uniformly --
-    `required` and `preferred` share the same fallback_only/degraded
-    semantics when `spark_fallback=allowed` (no separate global preflight
-    added for `required`, per In Scope item 5)."""
-    required_result = _assess_with_spark(
-        monkeypatch, spark_mode="required", spark_fallback="allowed",
-        binary_available=False, auth_available=False,
-    )
-    preferred_result = _assess_with_spark(
-        monkeypatch, spark_mode="preferred", spark_fallback="allowed",
-        binary_available=False, auth_available=False,
-    )
-    required_spark_status = required_result["checks"]["spark"]["status"]
-    preferred_spark_status = preferred_result["checks"]["spark"]["status"]
-    assert required_spark_status == preferred_spark_status == "fallback_only"
-    assert required_result["decision"] == preferred_result["decision"] == "degraded"
+    assert not any(r.startswith("spark:") for r in result["reasons"])

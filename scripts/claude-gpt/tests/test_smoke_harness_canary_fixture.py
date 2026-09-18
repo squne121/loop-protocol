@@ -52,11 +52,11 @@ def _sh(script: str, *, timeout: float = 15) -> subprocess.CompletedProcess[str]
     )
 
 
-def _canary_fragment(marker: str, nonce: str, reserved_name: str = RESERVED_SPARK_AGENT_NAME):
-    script = (
-        f". '{LIB_SH}'\n"
-        f"claude_gpt_smoke_canary_agents_json_fragment {_q(marker)} {_q(nonce)} {_q(reserved_name)}\n"
-    )
+def _canary_fragment(marker: str, nonce: str):
+    """Issue #2651: the function's `reserved_name` 3rd parameter (former
+    spark-codex collision-avoidance) has been removed entirely -- this
+    helper now only ever passes marker/nonce."""
+    script = f". '{LIB_SH}'\nclaude_gpt_smoke_canary_agents_json_fragment {_q(marker)} {_q(nonce)}\n"
     return _sh(script)
 
 
@@ -165,22 +165,23 @@ def test_canary_fixture_rejects_empty_nonce():
     assert result.stdout.strip() == ""
 
 
-def test_canary_fixture_rejects_name_collision_with_reserved_spark_agent_name(monkeypatch):
-    """Structural collision-rejection: if the derived canary name were ever
-    to equal the reserved spark-codex session-local agent name, the
-    function must refuse to emit a fixture (fail-closed), never silently
-    letting the canary shadow/overwrite the spark definition."""
-    # Force a collision by passing the canary's own about-to-be-derived
-    # name as the "reserved" name argument -- this simulates the collision
-    # condition deterministically without needing to brute-force a
-    # sha256 preimage.
-    probe = _canary_fragment(MARKER, "collision-probe-nonce", reserved_name="placeholder")
-    assert probe.returncode == 0, probe.stderr
-    derived_name = next(iter(json.loads(probe.stdout)))
-
-    collided = _canary_fragment(MARKER, "collision-probe-nonce", reserved_name=derived_name)
-    assert collided.returncode != 0
-    assert collided.stdout.strip() == ""
+def test_canary_fixture_no_longer_has_reserved_name_collision_parameter():
+    """Issue #2651: the reserved-name collision-rejection mechanism (former
+    3rd `reserved_name` parameter, guarding against a collision with the
+    now-retired spark-codex session-local agent name) has been removed
+    entirely -- there is no longer any spark-codex definition to collide
+    with. A stray extra positional argument (as a legacy caller might still
+    pass) is simply ignored by the shell function, never read as a
+    collision-check input; the function still succeeds normally."""
+    result = _sh(
+        f". '{LIB_SH}'\n"
+        f"claude_gpt_smoke_canary_agents_json_fragment {_q(MARKER)} {_q('collision-probe-nonce')} "
+        f"{_q(RESERVED_SPARK_AGENT_NAME)}\n"
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert len(payload) == 1
+    assert RESERVED_SPARK_AGENT_NAME not in payload
 
 
 # --- caller cannot override name/prompt/model/tools -------------------------
@@ -189,14 +190,16 @@ def test_canary_fixture_rejects_name_collision_with_reserved_spark_agent_name(mo
 def test_canary_fixture_function_signature_accepts_no_name_prompt_model_tools_params():
     """AC14: "caller から name/prompt/model/tools を受け取らない" is enforced
     structurally -- the function's own positional parameters are marker,
-    nonce, reserved_name only. Verify by grepping the function body in
-    lib.sh: no `$4`/`$5`/`$6` positional parameter is ever read (which
-    would indicate an additional caller-supplied override channel)."""
+    nonce only (Issue #2651 removed the former `reserved_name` 3rd
+    parameter along with the spark-codex collision it used to guard
+    against). Verify by grepping the function body in lib.sh: no
+    `$3`/`$4`/`$5`/`$6` positional parameter is ever read (which would
+    indicate an additional caller-supplied override channel)."""
     text = LIB_SH.read_text(encoding="utf-8")
     start = text.index("claude_gpt_smoke_canary_agents_json_fragment() {")
     end = text.index("\n}\n", start)
     body = text[start:end]
-    for forbidden_positional in ("$4", "$5", "$6", "$7", "$8", "$9"):
+    for forbidden_positional in ("$3", "$4", "$5", "$6", "$7", "$8", "$9"):
         assert forbidden_positional not in body, (
             f"canary fixture function body reads {forbidden_positional}, which "
             "would be an undocumented caller-supplied override channel"

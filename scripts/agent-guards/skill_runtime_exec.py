@@ -1057,10 +1057,16 @@ def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
     # Only bare `preflight.run`'s first hop (`workflow_start_entry.py`) reads
     # the invocation-scoped capability request. Keep this policy separate
     # from the GitHub credential carrier policy above.
+    #
+    # Issue #2651: `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` are no longer
+    # carried through this allowlist. GPT-5.3-Codex-Spark delegation has
+    # been retired; a caller that still sets these env vars for a direct
+    # (non-canonical-executor) `workflow_start_entry.py` invocation still
+    # gets a deterministic retired rejection from that module's own
+    # `run()` -- this allowlist boundary simply no longer forwards them to
+    # the canonical `preflight.run` executor path.
     if command_id == "preflight.run":
         allowed_keys |= {
-            "LOOP_SPARK_MODE",
-            "LOOP_SPARK_FALLBACK",
             "LOOP_PLANNED_OPERATIONS_JSON",
         }
     env = {

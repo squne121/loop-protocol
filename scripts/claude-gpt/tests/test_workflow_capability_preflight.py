@@ -180,18 +180,23 @@ def test_workflow_capability_accepts_pinned_uv():
 # --- AC5 / AC6 -----------------------------------------------------------
 
 
-def _no_spark_env(monkeypatch):
-    monkeypatch.setattr(
-        wcp,
-        "_run_env_only_preflight",
-        lambda deadline_ns: _completed_probe(
-            json.dumps({"binary_available": False, "chatgpt_auth": {"available": False}})
-        ),
-    )
+def _fail_if_spark_probe_spawned(monkeypatch):
+    """Issue #2651: `assess()`'s retired Spark decision (`_spark_status()`)
+    never spawns the (former) Spark env-only probe any more -- pin it to
+    raise if called, so these tests fail loudly instead of silently if
+    that invariant ever regresses."""
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("assess() must not spawn the retired Spark env-only probe any more")
+
+    monkeypatch.setattr(wcp, "_run_env_only_preflight", _fail_if_called)
 
 
-def test_workflow_capability_blocks_required_spark_incompatibility(monkeypatch):
-    _no_spark_env(monkeypatch)
+def test_workflow_capability_blocks_required_spark_directive_as_retired(monkeypatch):
+    """Issue #2651: `spark_mode=required` (any `spark_fallback`) is always
+    retired -- `checks.spark.status == "retired"` and `decision ==
+    "blocked"`, never a live binary/auth-based `unavailable` judgment."""
+    _fail_if_spark_probe_spawned(monkeypatch)
     result = wcp.assess(
         project_root=str(_REPO_ROOT),
         profile="issue-to-impl",
@@ -200,29 +205,30 @@ def test_workflow_capability_blocks_required_spark_incompatibility(monkeypatch):
         spark_fallback="forbidden",
         planned_operations=[],
     )
-    assert result["checks"]["spark"]["status"] == wcp.SPARK_UNAVAILABLE
+    assert result["checks"]["spark"]["status"] == wcp.SPARK_RETIRED
     assert result["decision"] == wcp.DECISION_BLOCKED
     assert any("spark" in reason for reason in result["reasons"])
 
 
-def test_workflow_capability_degrades_preferred_spark_incompatibility(monkeypatch):
-    _no_spark_env(monkeypatch)
+def test_workflow_capability_blocks_preferred_spark_directive_as_retired_never_degrades(monkeypatch):
+    """Issue #2651: `spark_mode=preferred` + `spark_fallback=allowed` used
+    to degrade-and-continue when Spark was unavailable (Issue #2340 AC4).
+    That fallback_only/degraded state no longer exists -- the directive is
+    retired unconditionally and the overall decision is `blocked`, never
+    `degraded`."""
+    _fail_if_spark_probe_spawned(monkeypatch)
     # Isolate this assertion to the Spark route judgment: without pinning
     # GitHub auth/repo-read to available, a CI runner without `gh auth`
     # configured would report decision=blocked via the (unrelated)
-    # `not github_auth` branch before the Spark fallback_only -> degraded
-    # branch is ever reached.
+    # `not github_auth` branch, which would not distinguish "blocked
+    # because Spark is retired" from "blocked because GitHub is
+    # unavailable".
     monkeypatch.setattr(wcp, "_github_auth_probe", lambda deadline_ns: _completed_probe())
     monkeypatch.setattr(wcp, "_github_repo_read_probe", lambda repo, deadline_ns: _completed_probe())
-    # Issue #2340 AC2: `controlled_github_read` is a REQUIRED capability that
-    # fails closed with priority over the Spark route's OPTIONAL `degraded`
-    # signal (see `test_actor_scoped_capability_probe.py::
-    # test_root_read_pass_controlled_read_fail_blocks_before_downstream_actor`,
-    # which asserts `controlled_github_unavailable` blocks regardless of any
-    # other signal). Without pinning this probe to `ready`, a CI runner
-    # without a live, sanitized-env `gh api` route would report
-    # decision=blocked via `controlled_github_unavailable` before the Spark
-    # fallback_only -> degraded branch under test is ever reached.
+    # Issue #2340 AC2: `controlled_github_read` is a REQUIRED capability
+    # that fails closed with priority over any OPTIONAL signal -- pin it to
+    # `ready` so this test isolates the Spark-retired blocked reason from a
+    # `controlled_github_unavailable` blocked reason.
     monkeypatch.setattr(
         wcp,
         "_controlled_github_read_probe",
@@ -236,8 +242,8 @@ def test_workflow_capability_degrades_preferred_spark_incompatibility(monkeypatc
         spark_fallback="allowed",
         planned_operations=[],
     )
-    assert result["checks"]["spark"]["status"] == wcp.SPARK_FALLBACK_ONLY
-    assert result["decision"] == wcp.DECISION_DEGRADED
+    assert result["checks"]["spark"]["status"] == wcp.SPARK_RETIRED
+    assert result["decision"] == wcp.DECISION_BLOCKED
 
 
 # --- AC7 -------------------------------------------------------------------

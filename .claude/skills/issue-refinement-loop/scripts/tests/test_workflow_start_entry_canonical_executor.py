@@ -466,16 +466,23 @@ def test_canonical_executor_preserves_gh_config_dir_to_root_github_probes_before
     ]
 
 
-def test_canonical_executor_blocks_unsupported_operation_and_required_forbidden_spark_before_inner_starts(
+def test_canonical_executor_blocks_unsupported_operation_before_inner_starts(
     tmp_path: Path,
 ) -> None:
     """Real subprocess boundary proof for verification requirements 1, 3,
     and 4 of PR #2320 review's minimum 6 cases: the canonical executor
-    carries the invocation-scoped `LOOP_*` capability request through to
-    the real producer (proven by the SPECIFIC `unsupported_operation` and
-    `spark:unavailable` reason strings only the real producer, having
+    carries the invocation-scoped `LOOP_PLANNED_OPERATIONS_JSON` capability
+    request through to the real producer (proven by the SPECIFIC
+    `unsupported_operation` reason string only the real producer, having
     actually received this exact request, would emit), and
-    `run_refinement_preflight.py` is never started."""
+    `run_refinement_preflight.py` is never started.
+
+    Issue #2651: `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` are set here too,
+    but `_sanitize_env()` no longer carries them through to the dispatched
+    child at all (GPT-5.3-Codex-Spark delegation is retired) -- so unlike
+    before this Issue, no `spark:unavailable` blocker is ever produced by
+    this scenario; the block reason is exclusively the unsupported
+    operation route."""
     repo = _make_repo(tmp_path)
     _install_real_capability_preflight_fixture(repo)
     inner_marker = tmp_path / "inner-ran.marker"
@@ -518,7 +525,9 @@ def test_canonical_executor_blocks_unsupported_operation_and_required_forbidden_
         "definitely_unsupported_operation_xyz" in blocker and "operation_route_unavailable" in blocker
         for blocker in parsed["blockers"]
     ), parsed["blockers"]
-    assert any(blocker.startswith("spark:unavailable") for blocker in parsed["blockers"]), parsed["blockers"]
+    # Issue #2651: no spark:* blocker is ever produced any more -- the env
+    # var never reached the real producer (see docstring).
+    assert not any(blocker.startswith("spark:") for blocker in parsed["blockers"]), parsed["blockers"]
     assert not inner_marker.exists(), "run_refinement_preflight.py must never have started"
 
 

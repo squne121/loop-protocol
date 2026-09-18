@@ -50,16 +50,25 @@ def _load_module():
 
 @pytest.fixture(scope="module")
 def gate_script_source() -> str:
+    """Issue #2651: the Spark explicit-only authorization gate that used to
+    embed this suite's AC12 ``detect_available_models_silent_fallback``
+    evidence-analysis helper has been retired --
+    ``extract_spark_gate_writer_source()`` now always returns ``None``.
+    This fixture asserts that negative/retired outcome, then skips every
+    test that depends on rendering and executing the (now nonexistent)
+    gate script."""
     module = _load_module()
     launch_sh_text = LAUNCH_SH.read_text(encoding="utf-8")
     source = module.extract_spark_gate_writer_source(launch_sh_text)
-    assert source is not None, "SPARK_GATE_WRITER_PY_BEGIN/_END markers not found in launch.sh"
-    assert "detect_available_models_silent_fallback" in source, (
-        "gate writer source must contain the Issue #2274 AC12 silent-fallback "
-        "detector; if this drifted, this suite would silently stop testing "
-        "the actual embedded logic."
+    assert source is None, (
+        "extract_spark_gate_writer_source() must return None now that the "
+        "Spark authorization gate (SPARK_GATE_WRITER_PY_BEGIN/_END marker "
+        "region) has been retired from launch.sh (Issue #2651)."
     )
-    return source
+    pytest.skip(
+        "GPT-5.3-Codex-Spark authorization gate retired (Issue #2651): no "
+        "gate script source remains to render/execute."
+    )
 
 
 def _render_gate_script(directory: Path, source: str) -> Path:

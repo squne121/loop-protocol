@@ -6657,22 +6657,18 @@ def classify_spark_failure(sanitized_reason: str) -> dict:
 
 
 def extract_spark_gate_writer_source(launch_sh_text: str) -> str | None:
-    """Extract the exact python source embedded in ``scripts/claude-gpt/
-    launch.sh`` between the ``SPARK_GATE_WRITER_PY_BEGIN``/``_END`` markers
-    (Issue #2186). This is the single source of truth for the explicit-only
-    authorization gate logic actually executed at runtime; tests use this
-    instead of re-implementing/duplicating the gate logic, so there is no
-    drift between what is tested and what actually runs."""
-    begin_marker = "# SPARK_GATE_WRITER_PY_BEGIN\n"
-    end_marker = "# SPARK_GATE_WRITER_PY_END\n"
-    begin_idx = launch_sh_text.find(begin_marker)
-    if begin_idx == -1:
-        return None
-    begin_idx += len(begin_marker)
-    end_idx = launch_sh_text.find(end_marker, begin_idx)
-    if end_idx == -1:
-        return None
-    return launch_sh_text[begin_idx:end_idx]
+    """Retired (Issue #2651): the ``SPARK_GATE_WRITER_PY_BEGIN``/``_END``
+    marker region this function used to extract from ``scripts/claude-gpt/
+    launch.sh`` (Issue #2186's explicit-only Spark authorization gate
+    source) has been removed from ``launch.sh`` entirely, along with the
+    gate itself. This function is kept, name-compatible, only because its
+    consumers (``test_run_worktree_agent_runtime_smoke_spark_explicit_gate.
+    py`` and ``test_background_execution_foreground_invariant.py``'s
+    fixture) now assert the negative/retired outcome -- it always returns
+    ``None`` unconditionally, never re-parsing ``launch_sh_text`` for
+    markers that can no longer exist."""
+    del launch_sh_text  # retired: no marker region exists to extract any more
+    return None
 
 
 if __name__ == "__main__":

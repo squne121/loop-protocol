@@ -101,9 +101,7 @@ def test_controlled_github_unavailable_routes_typed_blocked_via_real_producer(fa
     reason -- the same failure mode that used to only surface downstream as
     issue-editor's own `gh_issue_fetch_failed_rc_4` (Issue #2332)."""
     monkeypatch.setenv("FAKE_GH_CONTROLLED_READ_OK", "0")
-    result = router.capability_preflight_result(
-        repo=_DEFAULT_REPO, spark_mode=None, spark_fallback=None, planned_operations=[]
-    )
+    result = router.capability_preflight_result(repo=_DEFAULT_REPO, planned_operations=[])
     assert result["decision"] == "blocked"
     assert any("controlled_github_unavailable" in r for r in result["reasons"])
     actor_caps = result.get("actor_capabilities", {})
@@ -123,58 +121,80 @@ def test_root_read_and_controlled_read_agree_when_both_healthy(fake_gh_env):
     # `gh repo view` alone succeeding does not make `controlled_github_read`
     # succeed (they are different command shapes) -- this is intentional:
     # the fixture demonstrates the exact asymmetry AC2 exists to catch.
-    result = router.capability_preflight_result(
-        repo=_DEFAULT_REPO, spark_mode=None, spark_fallback=None, planned_operations=[]
-    )
+    result = router.capability_preflight_result(repo=_DEFAULT_REPO, planned_operations=[])
     assert result["actor_capabilities"]["root_github_read"]["status"] == "ready"
     assert result["actor_capabilities"]["controlled_github_read"]["status"] == "ready"
     assert result["decision"] == "ready"
 
 
 # =============================================================================
-# #2330-origin failure class: Spark `fallback_only` must degrade (continue),
-# not block, when fallback is allowed.
+# Issue #2651: GPT-5.3-Codex-Spark delegation is retired. The #2330-origin
+# `fallback_only` -> degraded scenario this section used to reproduce
+# end-to-end (real producer/consumer subprocess boundary) no longer exists
+# -- `root_entry_router.capability_preflight_result()` no longer accepts
+# `spark_mode`/`spark_fallback` at all (its only callers are inside this
+# Issue's Allowed Paths and change together in this same PR -- unlike
+# `workflow_capability_preflight.py::assess()`, which keeps them for an
+# external pinned caller). Replaced with a negative regression: the Spark
+# channel is severed at this producer/consumer boundary entirely.
 # =============================================================================
 
 
-def test_spark_fallback_only_degrades_workflow_continues(fake_gh_env, monkeypatch):
+def test_capability_preflight_result_no_longer_accepts_spark_kwargs(fake_gh_env):
+    """GIVEN the real producer/consumer boundary, WHEN
+    `capability_preflight_result()` is called with the legacy `spark_mode`/
+    `spark_fallback` keyword arguments, THEN it raises `TypeError` --
+    the channel that used to forward a caller's Spark directive to the
+    real `workflow_capability_preflight.py` subprocess is fully removed,
+    not merely made a no-op."""
+    with pytest.raises(TypeError):
+        router.capability_preflight_result(  # type: ignore[call-arg]
+            repo=_DEFAULT_REPO, spark_mode="preferred", spark_fallback="allowed", planned_operations=[]
+        )
+
+
+def test_capability_preflight_result_reports_spark_not_required_regardless_of_proxy_binary(
+    fake_gh_env, monkeypatch
+):
     """GIVEN Spark's binary is unavailable (PATH-stripped, deterministic
-    regardless of host machine) with `spark_mode=preferred` +
-    `spark_fallback=allowed`, WHEN the real producer runs, THEN the overall
-    decision is `degraded` (workflow continues) and the fallback route is
-    recorded via `actor_capabilities.spark_delegation` -- reproducing the
-    #2330 Spark `fallback_only` scenario end-to-end through the real
-    producer/consumer subprocess boundary."""
+    regardless of host machine), WHEN the real producer runs through
+    `capability_preflight_result()` (no Spark directive channel any more),
+    THEN `checks.spark.status` is `not_required` and the overall decision
+    is `ready` -- the retired route never surfaces as `fallback_only`/
+    `degraded` through this boundary, reproducing the #2330-origin scenario
+    as a negative control instead."""
     _strip_proxy_binary_from_path(monkeypatch)
 
-    result = router.capability_preflight_result(
-        repo=_DEFAULT_REPO,
-        spark_mode="preferred",
-        spark_fallback="allowed",
-        planned_operations=[],
-    )
-    assert result["checks"]["spark"]["status"] == "fallback_only"
-    assert result["decision"] == "degraded"
-    assert result["actor_capabilities"]["spark_delegation"]["status"] == "degraded"
-    assert result["actor_capabilities"]["spark_delegation"]["fallback_route"] == "non_spark_agent"
+    result = router.capability_preflight_result(repo=_DEFAULT_REPO, planned_operations=[])
+    assert result["checks"]["spark"]["status"] == "not_required"
+    assert result["decision"] == "ready"
+    assert result["actor_capabilities"]["spark_delegation"]["status"] == "ready"
 
 
-def test_workflow_start_entry_still_invokes_inner_preflight_when_degraded(fake_gh_env, monkeypatch):
+def test_workflow_start_entry_rejects_spark_directive_before_producer_ever_runs(fake_gh_env, monkeypatch):
     """The full production chain (`workflow_start_entry.run()` ->
-    `root_entry_router.capability_preflight_result()`, both real, only the
-    innermost `run_refinement_preflight.py` invocation is stubbed to avoid
-    launching a second full loop stage from this unit test) must still
-    proceed past capability preflight when Spark degrades to fallback_only
-    -- `degraded` is not `blocked`."""
+    `root_entry_router.capability_preflight_result()`, both real) must
+    return a deterministic `blocked` result for an explicit `spark_mode`
+    directive WITHOUT ever invoking the producer or the innermost
+    `run_refinement_preflight.py` -- `workflow_start_entry.run()` keeps its
+    `spark_mode`/`spark_fallback` keyword parameters (unlike
+    `capability_preflight_result()`) only for an external pinned caller
+    (`test_runtime_smoke_issue_to_impl.py`) that always passes `None`; a
+    real non-None directive is retired at this module's own boundary."""
     _strip_proxy_binary_from_path(monkeypatch)
     sys.path.insert(0, str(_SKILLS_SCRIPTS_DIR)) if str(_SKILLS_SCRIPTS_DIR) not in sys.path else None
     import workflow_start_entry as wse
 
     invoked = {"count": 0}
+    producer_calls = {"count": 0}
 
     def _stub_inner(*, issue_number, repo):
         invoked["count"] += 1
         return 0
+
+    def _counting_producer(**kwargs):
+        producer_calls["count"] += 1
+        return router.capability_preflight_result(**kwargs)
 
     result, exit_code = wse.run(
         issue_number=1,
@@ -184,12 +204,14 @@ def test_workflow_start_entry_still_invokes_inner_preflight_when_degraded(fake_g
         planned_operations_json=json.dumps(
             [{"phase": "impl", "actor_role": "worker", "operation": "issue_comment", "requires_mutation": True}]
         ),
-        capability_preflight_result_fn=router.capability_preflight_result,
+        capability_preflight_result_fn=_counting_producer,
         invoke_inner_preflight_fn=_stub_inner,
     )
-    assert result["decision"] == "degraded"
-    assert invoked["count"] == 1
-    assert exit_code == 0
+    assert result["decision"] == "blocked"
+    assert result["reasons"] == ["spark_delegation_retired"]
+    assert producer_calls["count"] == 0
+    assert invoked["count"] == 0
+    assert exit_code == 2
 
 
 def test_workflow_start_entry_never_invokes_inner_preflight_when_controlled_github_blocked(fake_gh_env, monkeypatch):

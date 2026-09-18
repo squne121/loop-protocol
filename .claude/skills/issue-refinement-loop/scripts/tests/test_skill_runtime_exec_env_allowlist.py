@@ -96,7 +96,12 @@ def test_sanitize_env_never_synthesizes_gh_config_dir_for_carrier_commands(monke
     assert "GH_CONFIG_DIR" not in sre._sanitize_env("/fake/project/root", command_id=command_id)
 
 
-def test_sanitize_env_carries_capability_request_for_bare_preflight_run(monkeypatch):
+def test_sanitize_env_carries_planned_operations_but_not_spark_for_bare_preflight_run(monkeypatch):
+    """Issue #2651: `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` no longer pass
+    through this allowlist for ANY command id, including bare
+    `preflight.run` -- GPT-5.3-Codex-Spark delegation is retired. Only
+    `LOOP_PLANNED_OPERATIONS_JSON` (unrelated to Spark) is still carried
+    through for the bare `preflight.run` command id."""
     monkeypatch.setenv("LOOP_SPARK_MODE", "required")
     monkeypatch.setenv("LOOP_SPARK_FALLBACK", "forbidden")
     monkeypatch.setenv(
@@ -106,8 +111,8 @@ def test_sanitize_env_carries_capability_request_for_bare_preflight_run(monkeypa
 
     env = sre._sanitize_env("/fake/project/root", command_id="preflight.run")
 
-    assert env["LOOP_SPARK_MODE"] == "required"
-    assert env["LOOP_SPARK_FALLBACK"] == "forbidden"
+    assert "LOOP_SPARK_MODE" not in env
+    assert "LOOP_SPARK_FALLBACK" not in env
     assert env["LOOP_PLANNED_OPERATIONS_JSON"] == (
         '[{"phase": "p", "actor_role": "r", "operation": "issue_comment", "requires_mutation": true}]'
     )

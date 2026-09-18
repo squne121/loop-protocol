@@ -68,18 +68,30 @@ def _load_module():
 
 @pytest.fixture(scope="module")
 def gate_script_source() -> str:
+    """Issue #2651: the explicit-only Spark authorization gate this whole
+    module used to hermetically exercise has been retired -- the
+    ``SPARK_GATE_WRITER_PY_BEGIN``/``_END`` marker region no longer exists
+    in ``launch.sh``, and ``extract_spark_gate_writer_source()`` now always
+    returns ``None`` (see that function's own updated docstring). This
+    fixture asserts that negative/retired outcome, then skips every test
+    that depends on rendering and executing the (now nonexistent) gate
+    script -- there is no gate source left to render. The two
+    ``classify_spark_failure()``-based tests at the bottom of this module
+    do not depend on this fixture and are unaffected (that function is
+    kept, unmodified, as defensive dead code -- Issue #2651 Allowed Paths
+    only names ``extract_spark_gate_writer_source()`` for retirement)."""
     module = _load_module()
     launch_sh_text = LAUNCH_SH.read_text(encoding="utf-8")
     source = module.extract_spark_gate_writer_source(launch_sh_text)
-    assert source is not None, "SPARK_GATE_WRITER_PY_BEGIN/_END markers not found in launch.sh"
-    assert LAUNCH_NONCE_PLACEHOLDER in source, (
-        "gate writer source must still contain the launch-nonce placeholder "
-        "that launch.sh substitutes via `sed` after the heredoc write "
-        "(Issue #2186 P0 fix-delta); if this constant drifted from "
-        "launch.sh, this hermetic test suite would silently stop testing "
-        "the actual nonce-scoping mechanism."
+    assert source is None, (
+        "extract_spark_gate_writer_source() must return None now that the "
+        "Spark authorization gate (SPARK_GATE_WRITER_PY_BEGIN/_END marker "
+        "region) has been retired from launch.sh (Issue #2651)."
     )
-    return source
+    pytest.skip(
+        "GPT-5.3-Codex-Spark authorization gate retired (Issue #2651): no "
+        "gate script source remains to render/execute."
+    )
 
 
 def _render_gate_script(directory: Path, source: str, launch_nonce: str) -> Path:

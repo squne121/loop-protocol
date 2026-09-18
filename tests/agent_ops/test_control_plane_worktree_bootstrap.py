@@ -816,11 +816,14 @@ def test_given_main_wired_and_preflight_run_dispatched_when_run_then_env_transpo
     `subprocess.run()` call with no explicit `env=` of its own -- i.e. it
     plainly inherits whatever `Popen(env=...)` handed the dedicated-root
     child at the very top) records the ACTUAL environment it observed.
-    Proves invocation-scoped `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK`/
-    `LOOP_PLANNED_OPERATIONS_JSON` (bare `preflight.run`) and the #2407
-    `GH_CONFIG_DIR` carrier arrive UNCHANGED at the real dispatched child,
-    AND that an unrelated, non-allowlisted env var is never generically
-    passed through."""
+    Proves invocation-scoped `LOOP_PLANNED_OPERATIONS_JSON` (bare
+    `preflight.run`) and the #2407 `GH_CONFIG_DIR` carrier arrive UNCHANGED
+    at the real dispatched child, that an unrelated, non-allowlisted env
+    var is never generically passed through, AND (Issue #2651)
+    `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` never reach the dispatched
+    child even when set on this process -- GPT-5.3-Codex-Spark delegation
+    is retired, so this allowlist no longer carries them for any command
+    id, including bare `preflight.run`."""
     inner_marker = tmp_path / "inner-ran.marker"
     inner_env_marker = tmp_path / "inner-env.marker"
     local, url = _init_main_dispatch_fixture(
@@ -855,12 +858,14 @@ def test_given_main_wired_and_preflight_run_dispatched_when_run_then_env_transpo
         '"operation": "issue_comment", "requires_mutation": true}]'
     )
     monkeypatch.setenv("GH_CONFIG_DIR", gh_config_dir)
-    # `spark_fallback="allowed"` (rather than `"forbidden"`) keeps the real
-    # producer's decision at `degraded` (not `blocked`) when no real Spark
-    # binary/auth is available in this fixture, so `workflow_start_entry.py`
-    # still invokes the inner preflight -- this test's positive path is
-    # about env-var transport parity, not about forcing a hard Spark
-    # capability failure.
+    # Issue #2651: LOOP_SPARK_MODE/LOOP_SPARK_FALLBACK are set here
+    # deliberately -- this test proves they are stripped by
+    # `_sanitize_env()` before ever reaching the dispatched child (never
+    # carried through, unlike before this Issue), so the real producer
+    # never even observes a Spark directive and the workflow proceeds
+    # ordinarily (`workflow_start_entry.py` sees `spark_mode=None`,
+    # invoking the inner preflight normally -- not because of a
+    # `degraded`-vs-`blocked` distinction, which no longer applies).
     monkeypatch.setenv("LOOP_SPARK_MODE", "required")
     monkeypatch.setenv("LOOP_SPARK_FALLBACK", "allowed")
     monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", planned_operations_json)
@@ -878,19 +883,27 @@ def test_given_main_wired_and_preflight_run_dispatched_when_run_then_env_transpo
     assert inner_env_marker.exists()
     observed = json.loads(inner_env_marker.read_text(encoding="utf-8"))
     assert observed["GH_CONFIG_DIR"] == gh_config_dir
-    assert observed["LOOP_SPARK_MODE"] == "required"
-    assert observed["LOOP_SPARK_FALLBACK"] == "allowed"
+    assert observed["LOOP_SPARK_MODE"] is None
+    assert observed["LOOP_SPARK_FALLBACK"] is None
     assert observed["LOOP_PLANNED_OPERATIONS_JSON"] == planned_operations_json
     assert observed["LOOP_PROTOCOL_TEST_UNRELATED_CANARY"] is None
 
 
-def test_given_non_carrier_command_id_when_env_sanitized_then_spark_keys_not_carried(tmp_path, monkeypatch):
+def test_given_any_command_id_when_env_sanitized_then_spark_keys_never_carried(tmp_path, monkeypatch):
+    """Issue #2651: `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` are stripped by
+    `_sanitize_env()` for EVERY command id now, including bare
+    `preflight.run` (which used to carry them through as the sole Spark
+    directive channel). `LOOP_PLANNED_OPERATIONS_JSON` (unrelated to
+    Spark) keeps its pre-existing bare-`preflight.run`-only carrier
+    behavior."""
     monkeypatch.setenv("LOOP_SPARK_MODE", "required")
     monkeypatch.setenv("LOOP_SPARK_FALLBACK", "forbidden")
     monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", "[]")
     bare_env = exec_mod._sanitize_env(str(tmp_path), "preflight.run")
     sibling_env = exec_mod._sanitize_env(str(tmp_path), "preflight.run.with_anchor")
-    assert bare_env.get("LOOP_SPARK_MODE") == "required"
+    assert "LOOP_SPARK_MODE" not in bare_env
+    assert "LOOP_SPARK_FALLBACK" not in bare_env
+    assert bare_env.get("LOOP_PLANNED_OPERATIONS_JSON") == "[]"
     assert "LOOP_SPARK_MODE" not in sibling_env
     assert "LOOP_SPARK_FALLBACK" not in sibling_env
     assert "LOOP_PLANNED_OPERATIONS_JSON" not in sibling_env

@@ -233,7 +233,6 @@ PROXY_STATE_DIR_TARGET=$(claude_gpt_proxy_state_dir)
 PROXY_HOME_TARGET=$(claude_gpt_proxy_home_dir)
 MCP_CONFIG_PATH=$(claude_gpt_mcp_config_path)
 SETTINGS_PATH=$(claude_gpt_session_settings_path)
-SPARK_AUTH_DIR_TARGET=$(claude_gpt_spark_auth_dir)
 # --- Claude/AGY プロセス専用の隔離 HOME/XDG（P0-6）。credential を一切置かない
 #     空ディレクトリとして扱う。ambient 実 HOME 配下の SSH key/GPG key 等の
 #     無関係な secret を Claude/AGY プロセスから利用不能にすることが目的。
@@ -270,8 +269,7 @@ CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET=$(claude_gpt_claude_isolated_xdg_cache_dir)
 #     （このディレクトリは作成せず、reject_if_under_repo の対象にもしない）。 ---
 for d in "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
   "$CLAUDE_ISOLATED_HOME_TARGET" \
-  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET" \
-  "$SPARK_AUTH_DIR_TARGET"; do
+  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"; do
   if ! claude_gpt_reject_if_under_repo "$d" "$SELF_PATH"; then
     printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"canonical_path_under_repo_or_worktree","path":"%s"}\n' "$d"
     exit 5
@@ -298,8 +296,7 @@ umask 077
 # --- GPT 専用ディレクトリを準備する（既存なら idempotent） ---
 mkdir -p "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
   "$CLAUDE_ISOLATED_HOME_TARGET" \
-  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET" \
-  "$SPARK_AUTH_DIR_TARGET"
+  "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"
 
 # --- strict_mcp mode 用の空 MCP config を書き込む（repository/user MCP を読み込ませない） ---
 STRICT_MCP_MODE=true
@@ -340,795 +337,32 @@ MCP_JSON_EOF
 #     (`subagent-start-stop`)のみを受け付ける。それ以外の値は fragment を空のままにする(拒否)。
 #     既存の CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS(--settings 等 CLI 引数拒否)とは独立した経路であり、
 #     それを変更・弱体化するものではない。 ---
-# --- Spark explicit-only authorization gate (Issue #2186) ------------------
-#
-# Session-local, nonce-keyed sidecar authorization gate. The gate writer
-# python source below is embedded between fixed markers
-# (`SPARK_GATE_WRITER_PY_BEGIN`/`_END`) so hermetic tests can extract the
-# exact executed source (single source of truth, no drift between runtime
-# and test fixtures) instead of re-implementing the same logic twice.
-SPARK_LAUNCH_NONCE="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-SPARK_GATE_WRITER="${PROXY_STATE_DIR_TARGET}/spark-gate-${SPARK_LAUNCH_NONCE}.py"
-( umask 077 && cat > "$SPARK_GATE_WRITER" <<'SPARK_GATE_WRITER_PY_END_MARKER'
-# SPARK_GATE_WRITER_PY_BEGIN
-import json
-import os
-import re
-import sys
-import time
-import uuid
-
-SPARK_AGENT = "spark-codex"
-AUTH_DIR = os.environ.get("CLAUDE_GPT_SPARK_AUTH_DIR", "")
-# Issue #2186 P0 fix-delta (PR #2244 adversarial review, forgery finding):
-# the launch nonce is intentionally NOT read from a process environment
-# variable. `export`ing it would make it visible to the main `claude`
-# process's own env (and therefore to the unrestricted Bash tool via `env`),
-# letting main Claude itself forge a fake pending-authorization sidecar file
-# with the correct launch_nonce and self-authorize a spark-codex invocation
-# without ever going through UserPromptSubmit. Instead, launch.sh substitutes
-# this placeholder with the literal per-launch nonce value via a post-heredoc
-# `sed` rewrite of this file (see `SPARK_GATE_WRITER` generation), so the
-# value is only ever present inside a file under a `permissions.deny`
-# Read-denied directory, never inside the claude process's own environ.
-LAUNCH_NONCE = "__CLAUDE_GPT_SPARK_LAUNCH_NONCE__"
-
-MENTION_RE = re.compile(r"(?<![\w-])@agent-spark-codex(?![\w-])")
-FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
-INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
-DQUOTE_RE = re.compile(r'"[^"\n]*"')
-SQUOTE_RE = re.compile(r"'[^'\n]*'")
-
-
-def strip_non_authorizing(text):
-    text = FENCE_RE.sub(" ", text)
-    text = INLINE_CODE_RE.sub(" ", text)
-    text = DQUOTE_RE.sub(" ", text)
-    text = SQUOTE_RE.sub(" ", text)
-    kept = []
-    for line in text.split("\n"):
-        if line.lstrip().startswith(">"):
-            continue
-        kept.append(line)
-    return "\n".join(kept)
-
-
-def has_canonical_mention(prompt_text):
-    if not isinstance(prompt_text, str):
-        return False
-    return bool(MENTION_RE.search(strip_non_authorizing(prompt_text)))
-
-
-# --- Structured delegation directive (Issue #2258) -------------------------
-#
-# In addition to the canonical `@agent-spark-codex` mention above (kept
-# fully unchanged/backward-compatible), a human's prompt text may contain a
-# structured `DELEGATION_REQUEST_V1` directive as plain (non-fenced,
-# non-quoted, non-blockquoted) `key: value` lines. It is parsed from the
-# SAME `strip_non_authorizing()`-stripped text used for mention detection,
-# so a directive appearing only inside a quoted string / fenced code block /
-# inline code span / blockquote is never authorizing (Issue #2258 AC4) --
-# it is entirely removed before this parser ever sees it.
-DELEGATION_SCHEMA_VALUE = "DELEGATION_REQUEST_V1"
-DELEGATION_AGENT_ID = "spark-codex"
-DELEGATION_MODEL = "gpt-5.3-codex-spark"
-DELEGATION_VALID_MODES = ("required", "preferred")
-DELEGATION_VALID_FALLBACK = ("forbidden", "allowed")
-DELEGATION_AUTH_SOURCE = "explicit_directive"
-DELEGATION_REQUIRED_KEYS = (
-    "schema",
-    "agent_id",
-    "model",
-    "mode",
-    "fallback",
-    "wait",
-    "authorization_source",
-)
-
-
-# --- Issue #2274 AC11/AC13: effective-environment fail-closed detection ----
-#
-# `CLAUDE_CODE_SUBAGENT_MODEL` (and, separately, the fork/background
-# execution posture) can be re-injected into the actual `claude` child
-# process's environment via managed/user/project/local Claude Code settings
-# `env` blocks, not only via an ambient shell export -- launch.sh's own
-# `unset CLAUDE_CODE_SUBAGENT_MODEL` (see below) cannot observe or prevent
-# that re-injection from a settings layer. Rather than attempting to
-# hermetically reproduce every settings-layer merge (out of scope -- managed
-# settings in particular cannot be fully controlled from a test harness),
-# this hook inspects `os.environ` at the moment it actually runs inside the
-# `claude` child process: any re-injection from ANY source (shell export or
-# settings `env` block) surfaces identically in `os.environ` by the time
-# Claude Code invokes this hook, so a single check covers all sources without
-# over-claiming that managed settings were independently controlled.
-def effective_env_override_reason():
-    # Issue #2274 PR #2285 OWNER fix-delta P0-3: deny ANY non-empty
-    # CLAUDE_CODE_SUBAGENT_MODEL, including a value that happens to equal
-    # DELEGATION_MODEL. Per Claude Code's official model resolution
-    # precedence (CLAUDE_CODE_SUBAGENT_MODEL > per-invocation model >
-    # subagent definition frontmatter > main conversation model), the env
-    # var -- not the session-local agent definition -- is the true binding
-    # authority whenever it is set, even to a same-value override. Allowing
-    # a same-value override to pass would contradict the Issue's Outcome
-    # ("definition-only authority") and would make `definition.source:
-    # launcher_owned_agents_json` in SPARK_DELEGATION_EVIDENCE_V2 a false
-    # claim about which layer actually won model resolution for that run.
-    # (Also covers the literal string "inherit", which is non-empty.)
-    subagent_model = os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
-    if subagent_model not in (None, ""):
-        return "unsupported_effective_model_override"
-    fork_value = os.environ.get("CLAUDE_CODE_FORK_SUBAGENT", "")
-    disable_background_value = os.environ.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "")
-    fork_enabled = fork_value not in ("", "0")
-    disable_background_enabled = disable_background_value == "1"
-    if fork_enabled or not disable_background_enabled:
-        # Production invariant (Issue #2274 In Scope): `CLAUDE_CODE_FORK_SUBAGENT`
-        # unset/0 AND `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: 1`. Any of the 5
-        # distinguishable states outside that invariant (both unset, fork-only,
-        # disable-background-only, both, or re-injected via settings) denies
-        # BEFORE the Agent launches -- never a post-hoc detection.
-        return "background_execution_invariant_violation"
-    return None
-
-DIRECTIVE_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+?)\s*$")
-
-
-def _candidate_directive_blocks(stripped_text):
-    # Group consecutive `key: value` lines into blocks, separated by any
-    # blank line or any line that does not match the `key: value` shape
-    # (e.g. ordinary prose). A block never spans across such a break, so a
-    # directive-looking fragment interrupted by unrelated prose never
-    # accidentally merges with a genuine directive elsewhere in the prompt.
-    blocks = []
-    current = []
-    for line in stripped_text.split("\n"):
-        m = DIRECTIVE_LINE_RE.match(line)
-        if m:
-            current.append((m.group(1), m.group(2)))
-        else:
-            if current:
-                blocks.append(current)
-                current = []
-    if current:
-        blocks.append(current)
-    return blocks
-
-
-def parse_delegation_directive(prompt_text):
-    """Parse an explicit-only DELEGATION_REQUEST_V1 directive out of
-    `prompt_text`. Returns a dict with `status` of `absent` (no directive
-    attempt found), `malformed` (a `schema: DELEGATION_REQUEST_V1` anchor
-    line was found but the surrounding block fails strict validation --
-    missing keys, wrong enum value, typo/case mismatch, wrong agent_id/model
-    -- Issue #2258 AC5), or `valid` (fully well-formed directive; also
-    carries `mode`/`fallback`, Issue #2258 AC1/AC2)."""
-    if not isinstance(prompt_text, str):
-        return {"status": "absent"}
-    stripped = strip_non_authorizing(prompt_text)
-    for block in _candidate_directive_blocks(stripped):
-        keys_seen = [k for k, _ in block]
-        if "schema" not in keys_seen:
-            continue
-        values = {}
-        for k, v in block:
-            values[k] = v
-        if values.get("schema") != DELEGATION_SCHEMA_VALUE:
-            # Not a spark delegation directive at all (different schema
-            # value); keep scanning other candidate blocks.
-            continue
-        # Issue #2258 P1-7 fix-delta: hardening checks for this
-        # authorization-parsing surface, applied only once a block has
-        # already matched `schema: DELEGATION_REQUEST_V1` (ordinary
-        # unrelated `key: value`-shaped prose elsewhere in the prompt is
-        # never touched by these checks -- same scanning behavior as
-        # before). A duplicated key is rejected instead of silently
-        # keeping the last-write-wins value, and any key outside the
-        # known schema is rejected instead of being silently ignored.
-        seen_counts = {}
-        for k, _ in block:
-            seen_counts[k] = seen_counts.get(k, 0) + 1
-        duplicated = [k for k, c in seen_counts.items() if c > 1]
-        if duplicated:
-            return {"status": "malformed", "reason": "duplicate_key", "key": duplicated[0]}
-        unknown = [k for k in values if k not in DELEGATION_REQUIRED_KEYS]
-        if unknown:
-            return {"status": "malformed", "reason": "unknown_key", "key": unknown[0]}
-        missing = [k for k in DELEGATION_REQUIRED_KEYS if k not in values]
-        if missing:
-            return {"status": "malformed", "reason": "missing_required_keys", "missing": missing}
-        if values["agent_id"] != DELEGATION_AGENT_ID:
-            return {"status": "malformed", "reason": "invalid_agent_id", "value": values["agent_id"]}
-        if values["model"] != DELEGATION_MODEL:
-            return {"status": "malformed", "reason": "invalid_model", "value": values["model"]}
-        if values["mode"] not in DELEGATION_VALID_MODES:
-            return {"status": "malformed", "reason": "invalid_mode", "value": values["mode"]}
-        if values["fallback"] not in DELEGATION_VALID_FALLBACK:
-            return {"status": "malformed", "reason": "invalid_fallback", "value": values["fallback"]}
-        # Issue #2258 P1-5 fix-delta: `mode`/`fallback` are individually
-        # valid enum values above, but the pairing itself must not be
-        # semantically contradictory. The Issue #2258 contract is
-        # `required => no fallback` / `preferred => fallback allowed`; the
-        # enum value set itself is unchanged (schema stays the same).
-        if (values["mode"], values["fallback"]) not in (
-            ("required", "forbidden"),
-            ("preferred", "allowed"),
-        ):
-            return {
-                "status": "malformed",
-                "reason": "contradictory_mode_fallback",
-                "mode": values["mode"],
-                "fallback": values["fallback"],
-            }
-        if values["wait"] != "true":
-            return {"status": "malformed", "reason": "invalid_wait", "value": values["wait"]}
-        if values["authorization_source"] != DELEGATION_AUTH_SOURCE:
-            return {
-                "status": "malformed",
-                "reason": "invalid_authorization_source",
-                "value": values["authorization_source"],
-            }
-        return {"status": "valid", "mode": values["mode"], "fallback": values["fallback"]}
-    return {"status": "absent"}
-
-
-def read_payload():
-    try:
-        raw = sys.stdin.read()
-    except Exception:
-        return {}
-    if not raw:
-        return {}
-    try:
-        payload = json.loads(raw)
-    except ValueError:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def pending_path(session_id):
-    return os.path.join(AUTH_DIR, "pending-" + session_id + ".json")
-
-
-def counter_path(session_id):
-    return os.path.join(AUTH_DIR, "counter-" + session_id + ".txt")
-
-
-def next_prompt_counter(session_id):
-    path = counter_path(session_id)
-    n = 0
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            n = int((fh.read() or "0").strip() or "0")
-    except (OSError, ValueError):
-        n = 0
-    n += 1
-    tmp = path + ".tmp-" + str(os.getpid())
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(str(n))
-    os.replace(tmp, path)
-    return n
-
-
-def clear_pending(session_id):
-    try:
-        os.remove(pending_path(session_id))
-    except OSError:
-        pass
-
-
-def required_lock_path(session_id):
-    # Issue #2258 AC3: while this file exists for a session, the current
-    # turn's Agent tool calls for any subagent_type OTHER than spark-codex
-    # are denied -- a `mode: required` + `fallback: forbidden` directive's
-    # Spark authorization was consumed and no silent substitute delegation
-    # is permitted for the remainder of this turn (structured terminal stop
-    # of the Agent-delegation path, forcing the failure/result to be
-    # surfaced explicitly rather than silently downgraded).
-    return os.path.join(AUTH_DIR, "required-lock-" + session_id + ".json")
-
-
-def preferred_marker_path(session_id):
-    # Issue #2258 AC2: while this file exists for a session, the NEXT
-    # non-spark Agent tool call for this turn is logged (once) as an
-    # explicit fallback-from-preferred-Spark event via additionalContext,
-    # then the marker is consumed (single-shot log, not a gate decision).
-    return os.path.join(AUTH_DIR, "preferred-marker-" + session_id + ".json")
-
-
-def clear_delegation_locks(session_id):
-    # A new turn (UserPromptSubmit) always releases any delegation lock/
-    # marker left over from a prior turn -- these never carry over, exactly
-    # like the pending mention/directive authorization itself.
-    for path in (required_lock_path(session_id), preferred_marker_path(session_id)):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-def has_nested_agent_origin(payload):
-    # Issue #2186 P1 fix-delta: a genuinely top-level user turn's hook
-    # payload never carries an `agent_id`/`parent_tool_use_id` (or
-    # `parentToolUseId`) field -- those are only present when the event
-    # originates from within a SubAgent's own execution context. Requiring
-    # their absence at BOTH UserPromptSubmit and PreToolUse(Agent) time
-    # closes the gap where a different SubAgent sharing the same
-    # `session_id` could otherwise piggyback on (or independently trigger)
-    # an authorization intended only for the top-level main session.
-    for key in ("agent_id", "parent_tool_use_id", "parentToolUseId"):
-        if payload.get(key):
-            return True
-    return False
-
-
-def _write_malformed_directive_marker(session_id, counter, directive):
-    # Issue #2258 AC5: a malformed directive attempt is recorded as an
-    # explicit, independently-inspectable diagnostic artifact (never a
-    # silent no-op indistinguishable from "no directive present at all",
-    # and never an authorization).
-    path = os.path.join(AUTH_DIR, "malformed-" + session_id + "-" + str(counter) + ".json")
-    tmp = path + ".tmp-" + str(os.getpid())
-    record = {"session_id": session_id, "prompt_id": counter, "directive": directive}
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(record, fh)
-        os.replace(tmp, path)
-    except OSError:
-        pass
-
-
-def cmd_user_prompt_submit(payload):
-    session_id = payload.get("session_id") or ""
-    prompt = payload.get("prompt")
-    if not session_id or not AUTH_DIR:
-        return
-    if has_nested_agent_origin(payload):
-        # A prompt-submit event that itself carries nested-agent origin
-        # fields cannot be a genuine top-level user turn; never record a
-        # pending authorization from it (fail closed).
-        return
-    try:
-        os.makedirs(AUTH_DIR, exist_ok=True)
-    except OSError:
-        return
-    counter = next_prompt_counter(session_id)
-    # A new turn always invalidates any previous unconsumed authorization for
-    # this session first -- authorization never carries over to the next turn
-    # (Issue #2186 AC3), and likewise releases any delegation lock/marker
-    # left over from a prior turn (Issue #2258).
-    clear_pending(session_id)
-    clear_delegation_locks(session_id)
-
-    # Issue #2258: a structured DELEGATION_REQUEST_V1 directive is an
-    # independent, additional authorization source alongside (never a
-    # replacement for) the canonical @agent-spark-codex mention above.
-    directive = parse_delegation_directive(prompt)
-    delegation_mode = None
-    delegation_fallback = None
-    authorization_source = None
-    if directive.get("status") == "valid":
-        delegation_mode = directive["mode"]
-        delegation_fallback = directive["fallback"]
-        authorization_source = DELEGATION_AUTH_SOURCE
-    elif has_canonical_mention(prompt):
-        authorization_source = "canonical_mention"
-
-    # Issue #2258 P1-6 fix-delta: a malformed directive attempt is always
-    # recorded as an explicit diagnostic artifact, independent of whether a
-    # SEPARATE canonical-mention authorization is granted this same turn --
-    # both happen together (grant authorization AND record the diagnostic),
-    # never either/or. Previously this write was skipped whenever
-    # canonical-mention authorization already set `authorization_source`,
-    # silently suppressing the diagnostic.
-    if directive.get("status") == "malformed":
-        _write_malformed_directive_marker(session_id, counter, directive)
-
-    if authorization_source is None:
-        if directive.get("status") == "malformed":
-            output = {
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": "CLAUDE_GPT_SPARK_DIRECTIVE_MALFORMED_V1 "
-                    + json.dumps({"reason": directive.get("reason")}),
-                }
-            }
-            sys.stdout.write(json.dumps(output))
-        return
-
-    # Issue #2258 P0-1/P0-2 fix-delta: for `mode: required` + `fallback:
-    # forbidden`, establish the no-fallback delegation lock RIGHT NOW (at
-    # UserPromptSubmit time), before any Agent tool call this turn can
-    # happen -- not only after the Spark authorization is later consumed.
-    # This closes the loophole where a non-Spark Agent call made BEFORE the
-    # FIRST Spark PreToolUse call this turn would otherwise pass through the
-    # ordinary allow no-op path untouched (the lock file didn't exist yet).
-    # `clear_delegation_locks()` above already released any prior turn's
-    # lock, so this never leaks across turns.
-    #
-    # Fail-CLOSED: if the lock file cannot be written, treat this the same
-    # as "no authorization granted this turn" -- do not write the pending
-    # authorization record either. A `required`+`forbidden` directive must
-    # never result in Spark being allowed with no lock enforced.
-    if delegation_mode == "required" and delegation_fallback == "forbidden":
-        try:
-            with open(required_lock_path(session_id), "w", encoding="utf-8") as fh:
-                json.dump({"session_id": session_id, "created_ts": time.time()}, fh)
-        except OSError:
-            return
-
-    record = {
-        "session_id": session_id,
-        "prompt_id": counter,
-        "launch_nonce": LAUNCH_NONCE,
-        "authorization_turn_id": session_id + ":" + str(counter),
-        "consumed": False,
-        "created_ts": time.time(),
-        "nonce": uuid.uuid4().hex,
-        "authorization_source": authorization_source,
-        "delegation_mode": delegation_mode,
-        "delegation_fallback": delegation_fallback,
-    }
-    target = pending_path(session_id)
-    tmp = target + ".tmp-" + str(os.getpid())
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(record, fh)
-    os.replace(tmp, target)
-
-
-def cmd_pre_tool_use_agent(payload):
-    tool_input = payload.get("tool_input")
-    subagent_type = tool_input.get("subagent_type") if isinstance(tool_input, dict) else None
-    session_id = payload.get("session_id") or ""
-    if subagent_type != SPARK_AGENT:
-        # Issue #2258 AC3: a `mode: required` + `fallback: forbidden`
-        # directive whose Spark authorization was already consumed this
-        # turn forbids ANY other Agent subagent_type for the remainder of
-        # the turn -- no silent substitute/fallback delegation. This is a
-        # gate decision (fail-closed deny), unlike the ordinary no-op
-        # pass-through below.
-        if session_id and AUTH_DIR and os.path.exists(required_lock_path(session_id)):
-            output = {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": "required_delegation_lock_active_no_fallback_agent_allowed",
-                }
-            }
-            sys.stdout.write(json.dumps(output))
-            sys.exit(0)
-        # Issue #2258 AC2: a `mode: preferred` directive whose Spark
-        # authorization was consumed this turn allows fallback to any other
-        # subagent_type, but the fallback event is logged explicitly
-        # (advisory additionalContext only, single-shot -- never a gate
-        # decision, never interferes with ordinary SubAgent mapping).
-        if session_id and AUTH_DIR:
-            marker = preferred_marker_path(session_id)
-            if os.path.exists(marker):
-                try:
-                    os.remove(marker)
-                except OSError:
-                    pass
-                output = {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "additionalContext": "CLAUDE_GPT_SPARK_FALLBACK_LOGGED_V1 "
-                        + json.dumps(
-                            {
-                                "session_id": session_id,
-                                "reason": "preferred_mode_fallback_to_non_spark_agent",
-                                "subagent_type": subagent_type,
-                            }
-                        ),
-                    }
-                }
-                sys.stdout.write(json.dumps(output))
-                sys.exit(0)
-        # Not our concern -- explicit allow, no interference with ordinary
-        # SubAgent mapping (Issue #2186 AC1).
-        return
-    decision = "deny"
-    reason = "no_pending_authorization"
-    record = None
-    if has_nested_agent_origin(payload):
-        # Issue #2186 P1 fix-delta (AC5): the Agent tool_use itself
-        # originates from a nested SubAgent context (or reports fields
-        # consistent with one), never from the top-level main session --
-        # deny unconditionally, independent of whether a pending
-        # authorization otherwise exists for this session_id.
-        reason = "nested_agent_origin_forbidden"
-    elif session_id and AUTH_DIR:
-        pending = pending_path(session_id)
-        try:
-            with open(pending, "r", encoding="utf-8") as fh:
-                record = json.load(fh)
-        except (OSError, ValueError):
-            record = None
-        if isinstance(record, dict) and record.get("consumed") is False and record.get("launch_nonce") == LAUNCH_NONCE:
-            consumed_marker = pending + ".consumed-" + uuid.uuid4().hex
-            try:
-                os.rename(pending, consumed_marker)
-                decision = "allow"
-                reason = "authorization_consumed"
-            except OSError:
-                decision = "deny"
-                reason = "authorization_consume_race_lost"
-        elif isinstance(record, dict) and record.get("launch_nonce") != LAUNCH_NONCE:
-            reason = "authorization_carryover_stale_launch_nonce"
-        elif isinstance(record, dict) and record.get("consumed") is not False:
-            reason = "authorization_already_consumed"
-    # Issue #2258 P0-3 fix-delta: an explicit `model` field in the actual
-    # Agent tool_input payload that does not exactly match the pinned Spark
-    # model is a hard negative control -- an attacker/confused-model trying
-    # to invoke spark-codex with a different model parameter must not be
-    # silently allowed, even if a genuine pending authorization would
-    # otherwise have been consumed above (consumption already happened;
-    # denying now is still fail-closed since the authorization is spent
-    # either way).
-    # Issue #2274 (OWNER adversarial reframe of #2258 P0-3/P0-4): model
-    # binding for spark-codex is owned exclusively by the session-local
-    # custom agent definition (`--agents`). This hook no longer injects a
-    # `model` field into `updatedInput` -- it only inspects, normalizes, or
-    # rejects a `model` field the caller itself proposed, per the
-    # normalization contract:
-    #   * key absent                          -> allow, leave input untouched
-    #   * exact DELEGATION_MODEL string        -> allow, strip the key (the
-    #                                             definition route owns it)
-    #   * any other string (alias/`inherit`/
-    #     a different full model id)           -> deny
-    #                                             `explicit_model_override_mismatch`
-    #   * non-string JSON type (null/object/
-    #     array/number)                        -> deny
-    #                                             `invalid_model_field_type`
-    if decision == "allow" and subagent_type == SPARK_AGENT:
-        env_violation_reason = effective_env_override_reason()
-        if env_violation_reason is not None:
-            decision = "deny"
-            reason = env_violation_reason
-    if decision == "allow" and isinstance(tool_input, dict) and "model" in tool_input:
-        model_value = tool_input.get("model")
-        if not isinstance(model_value, str):
-            decision = "deny"
-            reason = "invalid_model_field_type"
-        elif model_value != DELEGATION_MODEL:
-            decision = "deny"
-            reason = "explicit_model_override_mismatch"
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": decision,
-            "permissionDecisionReason": reason,
-        }
-    }
-    if decision == "allow":
-        # Issue #2258 P0-3/P0-4 fix-delta: pin the actual executed model to
-        # the Spark model (present or absent in the original tool_input --
-        # either way the pinned value wins) and force foreground execution
-        # (`run_in_background: false`) so a `wait: true` directive's Spark
-        # invocation is deterministically blocking, regardless of what
-        # run_in_background value Claude Code itself proposed. Paired with
-        # `permissionDecision: "allow"` (never `"defer"`, since `defer`
-        # drops `updatedInput` per the PreToolUse hook contract).
-        # Issue #2274 AC1/AC2: never generate/forward a `model` field --
-        # custom agent definition (session-local `--agents`) is the sole
-        # model binding authority. A caller-proposed `model` field that
-        # reached this point is guaranteed (by the normalization contract
-        # above) to be the exact DELEGATION_MODEL string, so stripping it
-        # here is a pure normalization (not a behavior change) rather than
-        # a pin.
-        base_input = tool_input if isinstance(tool_input, dict) else {}
-        updated_input = dict(base_input)
-        updated_input.pop("model", None)
-        updated_input["run_in_background"] = False
-        output["hookSpecificOutput"]["updatedInput"] = updated_input
-    if decision == "allow" and isinstance(record, dict) and session_id and AUTH_DIR:
-        # Issue #2258 AC2/AC3: wire the directive's mode/fallback policy
-        # into the delegation lock/marker state (see required_lock_path /
-        # preferred_marker_path) and surface it to the model via
-        # additionalContext, so a `required`+`forbidden` invocation is
-        # explicitly told never to silently substitute another
-        # model/agent on failure, and a `preferred` invocation's eventual
-        # fallback gets logged (Issue #2258 AC2).
-        mode_v = record.get("delegation_mode")
-        fallback_v = record.get("delegation_fallback")
-        if mode_v == "required" and fallback_v == "forbidden":
-            # Issue #2258 P0-1 fix-delta: the no-fallback lock was already
-            # established at UserPromptSubmit time (see
-            # cmd_user_prompt_submit), not here -- this branch now only
-            # surfaces the additionalContext instruction message.
-            output["hookSpecificOutput"]["additionalContext"] = "CLAUDE_GPT_SPARK_DELEGATION_V1 " + json.dumps(
-                {
-                    "mode": mode_v,
-                    "fallback": fallback_v,
-                    "instruction": (
-                        "If this Spark invocation fails for any reason, you MUST NOT "
-                        "silently substitute a different agent or model; report the "
-                        "failure explicitly to the user and stop this delegation path."
-                    ),
-                }
-            )
-        elif mode_v == "preferred":
-            try:
-                with open(preferred_marker_path(session_id), "w", encoding="utf-8") as fh:
-                    json.dump({"session_id": session_id, "created_ts": time.time()}, fh)
-            except OSError:
-                pass
-    # Issue #2186 P1 fix-delta (PR #2244 adversarial review): allow/deny is
-    # communicated EXCLUSIVELY via exit-0 stdout structured JSON
-    # (`hookSpecificOutput.permissionDecision`), never via `exit 2` +
-    # stderr blocking-error semantics. Claude Code's own hook contract
-    # treats structured JSON decisions and exit-2 blocking errors as two
-    # separate mechanisms; mixing them risked `permissionDecisionReason`
-    # diagnostic values (e.g. `authorization_carryover_stale_launch_nonce`)
-    # never actually being interpreted because they were written to stdout
-    # while exit 2 signals a stderr-based blocking error path instead.
-    sys.stdout.write(json.dumps(output))
-    sys.exit(0)
-
-
-def cmd_subagent_lifecycle(payload):
-    # SubagentStart/SubagentStop are audit-only for this gate; causal evidence
-    # itself is derived independently from `--include-hook-events` stream-json
-    # lifecycle events (PR #2220 `extract_claude_hook_lifecycle_events()`),
-    # reused unchanged (Issue #2186 In Scope).
-    return
-
-
-def detect_available_models_silent_fallback(payload):
-    """Issue #2274 AC12: given an evidence payload carrying
-    ``requested_model`` (the session-local custom agent definition's
-    declared model -- DELEGATION_MODEL), and whichever of
-    ``resolved_model`` / ``models_used`` / ``available_models`` the runtime
-    actually surfaced for a completed Agent invocation, detect a SILENT
-    fallback to an inherited/substituted model instead of ever promoting
-    such a run to PASS.
-
-    This is pure evidence analysis -- it never gates a tool call (unlike
-    ``cmd_pre_tool_use_agent``) and is never wired into the PreToolUse
-    authorization decision or the gate hook registration. It exists so the
-    live evidence pipeline (SPARK_DELEGATION_EVIDENCE_V2, Issue #2274
-    AC5/AC6/AC7) has a single, independently testable, typed classifier for
-    this specific failure shape instead of silently treating "no explicit
-    error" as success.
-
-    Returns a dict with ``status`` (``"pass"`` or ``"blocked"``, never a
-    bare boolean) and a typed ``reason`` (never ``None`` when blocked):
-
-    - ``requested_model_missing``: ``requested_model`` itself was not a
-      non-empty string -- nothing to compare against, fail closed.
-    - ``insufficient_evidence``: neither ``resolved_model`` nor
-      ``models_used`` was observed at all -- nothing to compare
-      ``requested_model`` against, fail closed (never assumed to match).
-    - ``available_models_excludes_requested_silent_fallback``: the runtime
-      surfaced a non-empty ``available_models`` list that does NOT contain
-      ``requested_model``, AND the observed ``resolved_model``/
-      ``models_used`` disagree with ``requested_model`` -- the exact
-      silent-substitution shape this AC exists to catch (Claude Code
-      falling back to an inherited model when the requested one is not in
-      ``availableModels``, per the Issue's Current Validated Scope
-      analysis of https://code.claude.com/docs/en/model-config).
-    - ``resolved_model_mismatch_despite_available``: ``available_models``
-      DID contain ``requested_model``, yet the observed resolved/used model
-      still disagrees -- a distinct anomaly, still never PASS.
-    - ``resolved_model_mismatch_without_available_models_evidence``: the
-      observed resolved/used model disagrees with ``requested_model`` but
-      ``available_models`` itself was never observed, so the more specific
-      exclusion reason above could not be confirmed -- still never PASS.
-    - ``match``: ``resolved_model`` (when observed) equals
-      ``requested_model``, and ``requested_model`` is present in
-      ``models_used`` (when that list was observed).
-
-    Fails closed on every field -- a comparison that cannot be honestly
-    made from the already-captured evidence never defaults to ``"pass"``.
-    """
-    requested_model = payload.get("requested_model") if isinstance(payload, dict) else None
-    resolved_model = payload.get("resolved_model") if isinstance(payload, dict) else None
-    models_used = payload.get("models_used") if isinstance(payload, dict) else None
-    available_models = payload.get("available_models") if isinstance(payload, dict) else None
-
-    result = {
-        "status": None,
-        "reason": None,
-        "requested_model": requested_model,
-        "resolved_model": resolved_model,
-        "models_used": models_used,
-        "available_models": available_models,
-    }
-
-    if not isinstance(requested_model, str) or not requested_model:
-        result["status"] = "blocked"
-        result["reason"] = "requested_model_missing"
-        return result
-
-    has_resolved_evidence = isinstance(resolved_model, str) and bool(resolved_model)
-    has_models_used_evidence = isinstance(models_used, list) and len(models_used) > 0
-
-    if not has_resolved_evidence and not has_models_used_evidence:
-        result["status"] = "blocked"
-        result["reason"] = "insufficient_evidence"
-        return result
-
-    resolved_match = (not has_resolved_evidence) or (resolved_model == requested_model)
-    models_used_match = (not has_models_used_evidence) or (requested_model in models_used)
-
-    if resolved_match and models_used_match:
-        result["status"] = "pass"
-        result["reason"] = "match"
-        return result
-
-    has_available_models_evidence = isinstance(available_models, list) and len(available_models) > 0
-    if has_available_models_evidence and requested_model not in available_models:
-        result["status"] = "blocked"
-        result["reason"] = "available_models_excludes_requested_silent_fallback"
-    elif has_available_models_evidence:
-        result["status"] = "blocked"
-        result["reason"] = "resolved_model_mismatch_despite_available"
-    else:
-        result["status"] = "blocked"
-        result["reason"] = "resolved_model_mismatch_without_available_models_evidence"
-    return result
-
-
-def cmd_detect_available_models_fallback(payload):
-    sys.stdout.write(json.dumps(detect_available_models_silent_fallback(payload)))
-    sys.exit(0)
-
-
-def main():
-    event = sys.argv[1] if len(sys.argv) > 1 else ""
-    payload = read_payload()
-    try:
-        if event == "user-prompt-submit":
-            cmd_user_prompt_submit(payload)
-        elif event == "pre-tool-use-agent":
-            cmd_pre_tool_use_agent(payload)
-        elif event in ("subagent-start", "subagent-stop"):
-            cmd_subagent_lifecycle(payload)
-        elif event == "detect-available-models-fallback":
-            cmd_detect_available_models_fallback(payload)
-    except SystemExit:
-        raise
-    except Exception:
-        # Fail closed: never let an unexpected exception here silently permit
-        # a spark-codex invocation nor crash the parent claude-gpt session.
-        # Decision channel is exit-0 stdout JSON only (Issue #2186 P1
-        # fix-delta) -- never exit 2, so this path stays consistent with
-        # cmd_pre_tool_use_agent's normal deny path.
-        if event == "pre-tool-use-agent":
-            output = {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": "gate_internal_error",
-                }
-            }
-            sys.stdout.write(json.dumps(output))
-        sys.exit(0)
-
-
-if __name__ == "__main__":
-    main()
-# SPARK_GATE_WRITER_PY_END
-SPARK_GATE_WRITER_PY_END_MARKER
-)
-# Issue #2186 P0 fix-delta: SPARK_LAUNCH_NONCE is generated exclusively from
-# `date -u +%Y%m%dT%H%M%SZ` and `$$` (see SPARK_LAUNCH_NONCE= above), so it is
-# always `[0-9A-Za-z_-]+` and safe as a sed replacement (no `/`, `&`,
-# backslash, or newline). Fail closed if that assumption is ever violated
-# instead of silently emitting a broken gate script.
-case "$SPARK_LAUNCH_NONCE" in
+# --- Launch nonce (Issue #2186 origin; generalized by Issue #2651 Spark
+#     retirement -- still used below for other per-launch unique file
+#     naming: ISSUE_EDITOR_PERMISSION_REQUEST_HOOK, and the
+#     subagent-start-stop runtime-smoke observation sink writer). ---
+LAUNCH_NONCE="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+# LAUNCH_NONCE is generated exclusively from `date -u +%Y%m%dT%H%M%SZ` and
+# `$$`, so it is always `[0-9A-Za-z_-]+` and safe to interpolate into file
+# paths below. Fail closed if that assumption is ever violated instead of
+# silently emitting an unsafe path.
+case "$LAUNCH_NONCE" in
   *[!0-9A-Za-z_-]*)
-    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"spark_launch_nonce_unsafe_chars"}\n'
+    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"launch_nonce_unsafe_chars"}\n'
     exit 9
     ;;
 esac
-# Substitute the literal nonce into the gate script file directly, rather
-# than exporting CLAUDE_GPT_SPARK_LAUNCH_NONCE into the claude process's own
-# environment (P0 forgery fix -- see the LAUNCH_NONCE placeholder comment
-# embedded in the gate script above).
-sed -i "s/__CLAUDE_GPT_SPARK_LAUNCH_NONCE__/${SPARK_LAUNCH_NONCE}/" "$SPARK_GATE_WRITER"
-export CLAUDE_GPT_SPARK_AUTH_DIR="$SPARK_AUTH_DIR_TARGET"
-export SPARK_GATE_WRITER
-SPARK_AGENTS_JSON=$(claude_gpt_spark_agents_json_fragment)
+
+# --- Spark explicit-only authorization gate: retired (Issue #2651) --------
+#
+# The GPT-5.3-Codex-Spark custom SubAgent, its explicit-only authorization
+# gate (UserPromptSubmit -> PreToolUse(Agent) -> SubagentStart/SubagentStop
+# consume, formerly embedded here between fixed BEGIN/END source markers),
+# and the session-local `--agents` fragment that registered it have all
+# been removed. Ordinary SubAgent smoke canary generation
+# (`claude_gpt_smoke_canary_agents_json_fragment`, invoked below) does not
+# depend on any Spark constant or function removed from lib.sh.
+AGENTS_JSON="{}"
 
 # --- Issue #2433: PermissionRequest narrow escape hatch ----------------------
 #
@@ -1138,7 +372,7 @@ SPARK_AGENTS_JSON=$(claude_gpt_spark_agents_json_fragment)
 # it returns an allow decision for exactly one controlled Issue-edit transaction
 # shape and returns no decision for every other input. Existing deny/ask rules
 # remain outside this hook's authority.
-ISSUE_EDITOR_PERMISSION_REQUEST_HOOK="${PROXY_STATE_DIR_TARGET}/issue-editor-permission-request-${SPARK_LAUNCH_NONCE}.py"
+ISSUE_EDITOR_PERMISSION_REQUEST_HOOK="${PROXY_STATE_DIR_TARGET}/issue-editor-permission-request-${LAUNCH_NONCE}.py"
 ( umask 077 && cat > "$ISSUE_EDITOR_PERMISSION_REQUEST_HOOK" <<'ISSUE_EDITOR_PERMISSION_REQUEST_HOOK_PY_EOF'
 # ISSUE_EDITOR_PERMISSION_REQUEST_HOOK_PY_BEGIN
 import json
@@ -1229,45 +463,39 @@ export ISSUE_EDITOR_PERMISSION_REQUEST_HOOK
 #     `json.dumps`, never raw string concatenation, so neither can break out
 #     of the fixed {description, prompt, tools} shape). Marker/nonce
 #     presence without the other is rejected fail-closed (never silently
-#     ignored), and fixture synthesis failure (malformed input,
-#     reserved-name collision) is fail-closed too -- launch is aborted
-#     before `claude` is ever exec'd. ---
+#     ignored), and fixture synthesis failure (malformed input) is
+#     fail-closed too -- launch is aborted before `claude` is ever exec'd.
+#     Issue #2651: the retired Spark custom agent no longer exists, so
+#     there is nothing left to merge this fixture against or collide with
+#     -- when requested, the canary fixture IS the entire `--agents` value.
+#     ---
 if [ -n "${CLAUDE_GPT_SMOKE_CANARY_MARKER:-}" ] || [ -n "${CLAUDE_GPT_SMOKE_CANARY_NONCE:-}" ]; then
   if [ -z "${CLAUDE_GPT_SMOKE_CANARY_MARKER:-}" ] || [ -z "${CLAUDE_GPT_SMOKE_CANARY_NONCE:-}" ]; then
     printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"smoke_canary_marker_or_nonce_missing"}\n' >&2
     exit 2
   fi
-  CANARY_FRAGMENT_JSON=$(claude_gpt_smoke_canary_agents_json_fragment "$CLAUDE_GPT_SMOKE_CANARY_MARKER" "$CLAUDE_GPT_SMOKE_CANARY_NONCE" "$CLAUDE_GPT_SPARK_AGENT_NAME")
+  CANARY_FRAGMENT_JSON=$(claude_gpt_smoke_canary_agents_json_fragment "$CLAUDE_GPT_SMOKE_CANARY_MARKER" "$CLAUDE_GPT_SMOKE_CANARY_NONCE")
   if [ -z "$CANARY_FRAGMENT_JSON" ]; then
     printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"smoke_canary_fixture_synthesis_failed"}\n' >&2
     exit 2
   fi
-  MERGED_AGENTS_JSON=$(claude_gpt_agents_json_merge_validate "$SPARK_AGENTS_JSON" "$CANARY_FRAGMENT_JSON")
-  if [ -z "$MERGED_AGENTS_JSON" ]; then
-    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"smoke_canary_agents_merge_failed"}\n' >&2
-    exit 2
-  fi
-  SPARK_AGENTS_JSON="$MERGED_AGENTS_JSON"
+  AGENTS_JSON="$CANARY_FRAGMENT_JSON"
 fi
 
-# --- explicit-only authorization gate hook groups (Issue #2186 P0 fix-delta,
-#     PR #2244 adversarial review) ---
+# --- explicit-only authorization gate hook groups: retired (Issue #2651,
+#     formerly Issue #2186 P0 fix-delta / PR #2244 adversarial review) ---
 #
-# The gate-owning hook groups below MUST always be present, regardless of
-# CLAUDE_GPT_RUNTIME_SMOKE_HOOKS. Prior to this fix, setting
-# CLAUDE_GPT_RUNTIME_SMOKE_HOOKS reassigned HOOKS_JSON_FRAGMENT wholesale,
-# which silently dropped the "PreToolUse"(matcher: Agent) authorization gate
-# entry (and the UserPromptSubmit/SubagentStart/SubagentStop gate entries)
-# whenever runtime-smoke observation hooks were requested -- leaving the
-# spark-codex authorization gate structurally absent (Claude Code
-# default-allows tool calls when no PreToolUse hook matches). Runtime-smoke
-# observation commands are now appended as ADDITIONAL hook-group objects
-# within the same event's array, never as a replacement.
-UPS_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" user-prompt-submit"}]}'
-PTU_HOOK_GROUPS='{"matcher": "Agent", "hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" pre-tool-use-agent"}]}'
+# The former Spark authorization gate's UserPromptSubmit /
+# PreToolUse(matcher: Agent) / SubagentStart / SubagentStop hook entries
+# have been removed along with the gate itself -- these hook-group
+# variables now default to empty and are only additively populated below
+# when a runtime-smoke observation mode registers its own sink (never a
+# replacement of an authorization gate, since none remains to replace).
+UPS_HOOK_GROUPS=""
+PTU_HOOK_GROUPS=""
 PERMISSION_REQUEST_HOOK_GROUPS='{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 \"$ISSUE_EDITOR_PERMISSION_REQUEST_HOOK\""}]}'
-SAS_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" subagent-start"}]}'
-SAP_HOOK_GROUPS='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_GATE_WRITER\" subagent-stop"}]}'
+SAS_HOOK_GROUPS=""
+SAP_HOOK_GROUPS=""
 
 # --- Issue #2426 AC1: launcher-owned Latitude Stop hook group (additive to
 #     whatever else is registered on Stop below -- never a replacement of an
@@ -1298,7 +526,6 @@ if [ -n "$CLAUDE_GPT_NATIVE_LATITUDE_PROJECT" ]; then
 fi
 ENV_JSON_FRAGMENT=",
   \"env\": {
-    \"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\",
     \"CLAUDE_GPT_LATITUDE_HOOK\": \"${CLAUDE_GPT_LATITUDE_HOOK}\",
     \"CLAUDE_GPT_NATIVE_SETTINGS_PATH\": \"${CLAUDE_NATIVE_LATITUDE_SETTINGS_PATH_TARGET}\",
     \"CLAUDE_GPT_HOME_ROOT\": \"${CLAUDE_GPT_HOME}\",
@@ -1321,14 +548,16 @@ if [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-start-stop" ]; then
   # this file uses) at the moment THIS hook process itself runs, and
   # echoes that byte offset back alongside the original payload -- still
   # strictly observational (no permissionDecision, no authorization
-  # semantics touched, the gate's own SubagentStart/SubagentStop audit
-  # entries above are unmodified) and independent of the other hook
-  # entries' execution order (per Claude Code's hooks reference, matching
+  # semantics touched; Issue #2651 retired the former Spark authorization
+  # gate that used to also register SubagentStart/SubagentStop entries
+  # here, so this sink is now the sole entry these events carry) and
+  # independent of the other hook entries' execution order (per Claude
+  # Code's hooks reference, matching
   # hooks run in parallel with no ordering guarantee between them; this
   # design never assumes one hook runs before another -- it only records
   # this hook's own execution-time state).
   SPARK_LIFECYCLE_OFFSET_LOG_PATH="${PROXY_STATE_DIR_TARGET}/claude-code-proxy/proxy.log"
-  SPARK_LIFECYCLE_OFFSET_WRITER="${PROXY_STATE_DIR_TARGET}/spark-lifecycle-offset-writer-${SPARK_LAUNCH_NONCE}.py"
+  SPARK_LIFECYCLE_OFFSET_WRITER="${PROXY_STATE_DIR_TARGET}/spark-lifecycle-offset-writer-${LAUNCH_NONCE}.py"
   ( umask 077 && cat > "$SPARK_LIFECYCLE_OFFSET_WRITER" <<'SPARK_LIFECYCLE_OFFSET_WRITER_EOF'
 import json
 import os
@@ -1387,11 +616,13 @@ if __name__ == "__main__":
 SPARK_LIFECYCLE_OFFSET_WRITER_EOF
   )
   CAT_SINK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$SPARK_LIFECYCLE_OFFSET_WRITER\""}]}'
-  SAS_HOOK_GROUPS="${SAS_HOOK_GROUPS}, ${CAT_SINK_GROUP}"
-  SAP_HOOK_GROUPS="${SAP_HOOK_GROUPS}, ${CAT_SINK_GROUP}"
+  # Issue #2651: SAS_HOOK_GROUPS/SAP_HOOK_GROUPS default to empty now that
+  # the former Spark authorization gate no longer populates them, so this
+  # sink IS the entry (no leading-comma append onto an empty array item).
+  SAS_HOOK_GROUPS="${CAT_SINK_GROUP}"
+  SAP_HOOK_GROUPS="${CAT_SINK_GROUP}"
   ENV_JSON_FRAGMENT=",
   \"env\": {
-    \"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\",
     \"SPARK_LIFECYCLE_OFFSET_LOG_PATH\": \"${SPARK_LIFECYCLE_OFFSET_LOG_PATH}\",
     \"SPARK_LIFECYCLE_OFFSET_WRITER\": \"${SPARK_LIFECYCLE_OFFSET_WRITER}\",
     \"CLAUDE_GPT_LATITUDE_HOOK\": \"${CLAUDE_GPT_LATITUDE_HOOK}\",
@@ -1464,28 +695,27 @@ if __name__ == "__main__":
     main()
 HOOK_SINK_WRITER_EOF
   )
-  # Observation-only sink writer groups appended alongside (never instead
-  # of) the gate's UserPromptSubmit/SubagentStart/SubagentStop entries
-  # above; gate command runs first within each event's hook array.
-  # Stop/StopFailure have no gate equivalent, so they get sink-only groups.
+  # Observation-only sink writer groups. Issue #2651: the former Spark
+  # authorization gate's UserPromptSubmit/SubagentStart/SubagentStop
+  # entries are gone, so UPS_HOOK_GROUPS/SAS_HOOK_GROUPS/SAP_HOOK_GROUPS
+  # default to empty and this sink IS each entry (no leading-comma append
+  # onto an empty array item). Stop/StopFailure never had a gate
+  # equivalent, so they keep the same append/sink-only shape as before.
   SINK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}'
-  UPS_HOOK_GROUPS="${UPS_HOOK_GROUPS}, ${SINK_GROUP}"
+  UPS_HOOK_GROUPS="${SINK_GROUP}"
   # Issue #2426 AC1: append (never replace) so the launcher-owned Latitude
   # Stop hook group set as the default above stays wired even when this
   # runtime-smoke observation sink is also requested.
   STOP_HOOK_GROUPS="${STOP_HOOK_GROUPS}, ${SINK_GROUP}"
   STOPFAILURE_HOOK_GROUPS="${SINK_GROUP}"
-  SAS_HOOK_GROUPS="${SAS_HOOK_GROUPS}, ${SINK_GROUP}"
-  SAP_HOOK_GROUPS="${SAP_HOOK_GROUPS}, ${SINK_GROUP}"
+  SAS_HOOK_GROUPS="${SINK_GROUP}"
+  SAP_HOOK_GROUPS="${SINK_GROUP}"
   # Also baked literally into settings.json's own "env" block (belt-and-
   # braces alongside the exported shell env vars below) so the 3-way
   # run_nonce match the harness verifies (AC16) has a nonce value that is
   # genuinely "baked into settings.json at launch", not merely inherited.
-  # SPARK_GATE_WRITER is retained here too, since the authorization gate
-  # hook commands above remain wired and still need it resolved.
   ENV_JSON_FRAGMENT=",
   \"env\": {
-    \"SPARK_GATE_WRITER\": \"${SPARK_GATE_WRITER}\",
     \"CLAUDE_GPT_HOOK_SINK_NONCE\": \"${CLAUDE_GPT_HOOK_SINK_NONCE}\",
     \"CLAUDE_GPT_HOOK_SINK_PATH\": \"${CLAUDE_GPT_HOOK_SINK_PATH}\",
     \"CLAUDE_GPT_HOOK_SINK_WRITER\": \"${CLAUDE_GPT_HOOK_SINK_WRITER}\",
@@ -1515,27 +745,11 @@ HOOKS_JSON_FRAGMENT=',
 )"'
   }'
 
-# --- Spark authorization sidecar directory deny (Issue #2186 P0 fix-delta,
-#     PR #2244 adversarial review, forgery finding; Issue #2440 migrated the
-#     legacy `Write(path)` rule below to canonical `Edit(path)` -- Claude
-#     Code's file permission check only matches `Edit(path)` for
-#     file-editing tools, so the old `Write(path)` deny was silently
-#     ineffective and only emitted a startup warning) ---
-#
-# `Read`/`Edit` deny on SPARK_AUTH_DIR_TARGET is a best-effort
-# defense against main Claude's built-in tools directly forging or reading
-# the pending-authorization sidecar file. Like the existing
-# PROXY_CONFIG_DIR_TARGET/PROXY_STATE_DIR_TARGET/PROXY_HOME_TARGET denies
-# above, this does NOT constrain the unrestricted Bash tool (`cat`,
-# `python3 -c`, etc. can still read/write under this directory); combined
-# with removing CLAUDE_GPT_SPARK_LAUNCH_NONCE from the claude process's own
-# environment (see the sed substitution above), forging a pending record
-# with the correct `launch_nonce` value now additionally requires
-# discovering that value via a Bash-tool file read rather than a trivial
-# `env` inspection, but is not architecturally impossible for an
-# unrestricted Bash tool. This residual gap is a known limitation, not a
-# closed security boundary (documented for the reviewer, consistent with
-# Issue #2158's Scope Reframe treatment of the analogous proxy-dir denies).
+# --- Spark authorization sidecar directory deny: retired (Issue #2651,
+#     formerly Issue #2186 P0 fix-delta / PR #2244 adversarial review /
+#     Issue #2440). The Spark explicit-only authorization gate, its
+#     pending-authorization sidecar file, and this deny rule protecting it
+#     have all been removed along with the gate itself. ---
 
 # --- launcher-owned autoMode policy（Issue #2203, second-gate 判断補助。
 #     決定論的 authority は permissions.deny / PreToolUse hook / GitHub mutation
@@ -1564,9 +778,7 @@ cat > "$SETTINGS_PATH" <<SETTINGS_JSON_EOF
     "deny": [
       "Read(/${PROXY_CONFIG_DIR_TARGET}/**)",
       "Read(/${PROXY_STATE_DIR_TARGET}/**)",
-      "Read(/${PROXY_HOME_TARGET}/**)",
-      "Read(/${SPARK_AUTH_DIR_TARGET}/**)",
-      "Edit(/${SPARK_AUTH_DIR_TARGET}/**)"${PEER_POLICY_DENY_SUFFIX}
+      "Read(/${PROXY_HOME_TARGET}/**)"${PEER_POLICY_DENY_SUFFIX}
     ]
   }${PEER_POLICY_SETTINGS_FRAGMENT},
   "enabledPlugins": {}${HOOKS_JSON_FRAGMENT}${ENV_JSON_FRAGMENT},
@@ -1885,25 +1097,14 @@ exec 9<&0
 #     Outcome 節）。caller 由来の `--permission-mode` は上記 forbidden-flag ループ
 #     （CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS 経由）で既に全面拒否済みのため、ここに
 #     到達する時点で "$@" に `--permission-mode` トークンは含まれない。 ---
-# --- Issue #2274 PR #2285 OWNER fix-delta P0-3: best-effort audit record of
-#     the EXACT `--agents` JSON this invocation is about to pass to `claude`,
-#     written by launch.sh itself immediately before exec (never
-#     self-reported by an external observer after the fact).
-#     scripts/claude-gpt/runtime_smoke_test.sh's --spark-delegation evidence
-#     builder reads this file back and only reports `definition.source:
-#     "launcher_owned_agents_json"` when it can independently confirm
-#     agent_name/model from THIS file's real content -- never from a fixed
-#     string constant. Best-effort and never fatal: a write failure here
-#     must not block an otherwise-authorized launch, since this is an audit
-#     side-channel, not the authorization gate itself. Written under
-#     CLAUDE_GPT_HOME's spark-auth dir (never under the repo/worktree --
-#     see claude_gpt_reject_if_under_repo). ---
-SPARK_AGENTS_JSON_AUDIT_DIR="$(claude_gpt_spark_auth_dir)"
-mkdir -p "$SPARK_AGENTS_JSON_AUDIT_DIR" 2>/dev/null || true
-SPARK_AGENTS_JSON_AUDIT_PATH="${SPARK_AGENTS_JSON_AUDIT_DIR}/last-agents-json.json"
-( umask 077 && printf '%s' "$SPARK_AGENTS_JSON" > "$SPARK_AGENTS_JSON_AUDIT_PATH" ) 2>/dev/null || true
+# --- Issue #2274 PR #2285 OWNER fix-delta P0-3 audit record: retired
+#     (Issue #2651). This best-effort `last-agents-json.json` audit file
+#     existed only for `scripts/claude-gpt/runtime_smoke_test.sh`'s
+#     `--spark-delegation` live evidence builder to read back; that mode is
+#     now an immediate deterministic rejection and never reaches this file,
+#     so the write is removed along with its sole reader. ---
 # shellcheck disable=SC2086
-"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" --permission-mode auto --agents "$SPARK_AGENTS_JSON" "$@" <&9 &
+"$CLAUDE_BIN" --strict-mcp-config --mcp-config "$MCP_CONFIG_PATH" --settings "$SETTINGS_PATH" --permission-mode auto --agents "$AGENTS_JSON" "$@" <&9 &
 CLAUDE_PID=$!
 
 wait "$CLAUDE_PID"

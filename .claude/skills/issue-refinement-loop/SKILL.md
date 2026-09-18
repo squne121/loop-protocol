@@ -113,10 +113,9 @@ repository evidence が disposition を独立に決定できない場合だけ h
 
 canonical bare `preflight.run` は `workflow_start_entry.py` を first hop とし、Step 0g mutation・SubAgent dispatch・GitHub mutation より前に workflow capability preflight を一度だけ実行する（`decision: blocked` なら以降を起動しない。Step 0 のこの preflight と Step 5 の preflight は独立した fresh call であり、Step 0 の結果を Step 5 の implementation-entry authorization として再利用しない）。`decision: ready`/`degraded` の場合のみ `workflow_start_entry.py` が `run_refinement_preflight.py` wrapper を trusted `uv` 経由で一度だけ起動し、Issue fetch・anchor comment 構造検証・planner stdin 組立・`REFINEMENT_LOOP_PLAN_V1` 生成を一括実行する（判断ロジックは `plan_refinement_loop.py` に委譲）。
 
-コマンドの canonical な argv 定義は `ISSUE_REFINEMENT_COMMAND_REGISTRY_V1`（`scripts/command_registry.py`）に集約されている。SubAgent / main thread は手書き shell string を消費せず、registry entry を参照する。bare `preflight.run` の production 実行はこれらのゲートを迂回するため `run_refinement_preflight.py` を直接起動してはならず、canonical executor 経由の呼び出しのみを使う（PR #2320 review P0-3）。capability request（`spark_mode`/`spark_fallback`/`planned_operations`）を宣言する場合は `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK`/`LOOP_PLANNED_OPERATIONS_JSON` を永続 export せずこの1回の invocation にだけ設定する（`_sanitize_env()` は `command_id == "preflight.run"` の場合のみこの3変数を child へ通す。未宣言時は producer を呼ばず `environment_failure` で fail-closed）:
+コマンドの canonical な argv 定義は `ISSUE_REFINEMENT_COMMAND_REGISTRY_V1`（`scripts/command_registry.py`）に集約されている。SubAgent / main thread は手書き shell string を消費せず、registry entry を参照する。bare `preflight.run` の production 実行はこれらのゲートを迂回するため `run_refinement_preflight.py` を直接起動してはならず、canonical executor 経由の呼び出しのみを使う（PR #2320 review P0-3）。capability request（`planned_operations`）を宣言する場合は `LOOP_PLANNED_OPERATIONS_JSON` を永続 export せずこの1回の invocation にだけ設定する（`_sanitize_env()` は `command_id == "preflight.run"` の場合のみこの変数を child へ通す。未宣言時は producer を呼ばず `environment_failure` で fail-closed）。GPT-5.3-Codex-Spark delegation は退役済みのため（Issue #2651）、`LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` の宣言・export 手順はもはや存在しない（`_sanitize_env()` はこの2変数を一切 child へ通さない）:
 
 ```bash
-LOOP_SPARK_MODE=<required|preferred> LOOP_SPARK_FALLBACK=<forbidden|allowed> \
 LOOP_PLANNED_OPERATIONS_JSON='[{"phase":"<p>","actor_role":"<r>","operation":"<op>","requires_mutation":<bool>}]' \
 uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
   --command-id preflight.run --issue-number <N> --repo <owner/repo>
