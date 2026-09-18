@@ -1259,4 +1259,12 @@ class TestIssue2631SharedHelperIntegration:
             assert "contents: read" in job_block
             assert "checks: read" in job_block
             assert "commits/" not in job_block
+            # PR #2669 review fix_delta iteration 1: the attempt-scoped Jobs
+            # acquisition sequence (`gh api --paginate --slurp`) must occur
+            # EXACTLY ONCE inside each mutually-exclusive acquisition job --
+            # not zero (missed acquisition), not more than once (a second,
+            # independent re-fetch that AC1/AC3 forbid).
+            assert job_block.count("--paginate --slurp") == 1, job_block.count(
+                "--paginate --slurp"
+            )
             assert "check-runs?per_page" not in job_block

@@ -127,6 +127,55 @@ def _make_snapshot(
     )
 
 
+def _make_multi_page_snapshot(
+    cjs,
+    names: list[str],
+    *,
+    split_at: int,
+    head_sha: str = EXPECTED_SHA,
+    run_id: int = RUN_ID,
+    run_attempt: int = RUN_ATTEMPT,
+    repository: str = REPOSITORY,
+    conclusions: dict[str, str] | None = None,
+) -> dict:
+    """Build a REAL validated snapshot from a genuinely MULTI-PAGE ``gh api
+    --paginate --slurp`` page array (page 1 = ``names[:split_at]``, page 2 =
+    ``names[split_at:]``). Every other fixture in this suite uses a single
+    one-page ``pages=[{...}]`` list, which never exercises
+    ``ci_job_snapshot._validate_pages``'s actual multi-page flatten /
+    cross-page ``total_count`` consistency logic (AC1) -- this helper does."""
+    conclusions = conclusions or {}
+    jobs = [
+        _job_row(
+            name,
+            job_id=idx + 1,
+            run_id=run_id,
+            head_sha=head_sha,
+            run_attempt=run_attempt,
+            conclusion=conclusions.get(name, "success"),
+        )
+        for idx, name in enumerate(names)
+    ]
+    total = len(jobs)
+    identity_payload = {
+        "id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": head_sha,
+        "run_started_at": "2026-01-01T00:00:00Z",
+        "repository": {"full_name": repository},
+    }
+    return cjs.build_snapshot(
+        pages=[
+            {"total_count": total, "jobs": jobs[:split_at]},
+            {"total_count": total, "jobs": jobs[split_at:]},
+        ],
+        identity_payload=identity_payload,
+        expected_repository=repository,
+        expected_run_id=run_id,
+        expected_head_sha=head_sha,
+    )
+
+
 def _verify(mod, snapshot: dict, **kwargs):
     kwargs.setdefault("expected_repository", REPOSITORY)
     kwargs.setdefault("expected_head_sha", EXPECTED_SHA)
@@ -213,6 +262,87 @@ class TestMixedProvenanceStructurallyPrevented:
         with pytest.raises(cjs.SnapshotError, match="job_row_run_id_mismatch"):
             cjs.build_snapshot(
                 pages=[{"total_count": 1, "jobs": [foreign_job]}],
+                identity_payload=identity_payload,
+                expected_repository=REPOSITORY,
+                expected_run_id=RUN_ID,
+                expected_head_sha=EXPECTED_SHA,
+            )
+
+
+class TestMultiPageAcquisition:
+    """PR #2669 review fix_delta iteration 1: exercise
+    ``ci_job_snapshot._validate_pages``'s actual multi-page combination /
+    consistency logic (AC1) and the acquisition-sequence-once invariant
+    (AC3) with a genuine multi-page ``pages`` list, not the single-page
+    shortcut every other fixture in this suite uses."""
+
+    def test_required_job_present_only_on_later_page_is_not_dropped(self, mod, cjs):
+        # node-backed-hook-tests is ALL_REQUIRED[-1]; split_at=2 puts it on
+        # page 2 only (page 1 = ["actionlint", "python-test-core"]).
+        snapshot = _make_multi_page_snapshot(cjs, ALL_REQUIRED, split_at=2)
+        assert len(snapshot["jobs"]) == len(ALL_REQUIRED)
+        assert {j["name"] for j in snapshot["jobs"]} == set(ALL_REQUIRED)
+
+        report = _verify(mod, snapshot)
+        assert report["ok"] is True, report["violations"]
+        for name in ALL_REQUIRED:
+            assert report["checks"][name]["found"] is True
+
+    def test_failing_job_on_later_page_is_not_a_partial_success(self, mod, cjs):
+        # The failing job (node-backed-hook-tests) lives ONLY on page 2;
+        # this must fail-closed, never be silently dropped/ignored as if
+        # only page 1's jobs mattered.
+        snapshot = _make_multi_page_snapshot(
+            cjs,
+            ALL_REQUIRED,
+            split_at=2,
+            conclusions={"node-backed-hook-tests": "failure"},
+        )
+        assert len(snapshot["jobs"]) == len(ALL_REQUIRED)
+
+        report = _verify(mod, snapshot)
+        assert report["ok"] is False
+        assert any(
+            "node-backed-hook-tests" in v and "failure" in v for v in report["violations"]
+        )
+
+    def test_page_total_count_mismatch_across_pages_is_rejected(self, cjs):
+        identity_payload = {
+            "id": RUN_ID,
+            "run_attempt": RUN_ATTEMPT,
+            "head_sha": EXPECTED_SHA,
+            "run_started_at": "2026-01-01T00:00:00Z",
+            "repository": {"full_name": REPOSITORY},
+        }
+        jobs = [_job_row(n, job_id=idx + 1) for idx, n in enumerate(ALL_REQUIRED)]
+        with pytest.raises(cjs.SnapshotError, match="job_pages_total_count_mismatch_across_pages"):
+            cjs.build_snapshot(
+                pages=[
+                    {"total_count": len(jobs), "jobs": jobs[:2]},
+                    {"total_count": len(jobs) + 1, "jobs": jobs[2:]},
+                ],
+                identity_payload=identity_payload,
+                expected_repository=REPOSITORY,
+                expected_run_id=RUN_ID,
+                expected_head_sha=EXPECTED_SHA,
+            )
+
+    def test_partial_multi_page_acquisition_is_rejected(self, cjs):
+        """A page array that stops short of ``total_count`` (e.g. an
+        interrupted paginated fetch) is NEVER treated as success evidence,
+        even though every individual page it DOES contain is well-formed."""
+        identity_payload = {
+            "id": RUN_ID,
+            "run_attempt": RUN_ATTEMPT,
+            "head_sha": EXPECTED_SHA,
+            "run_started_at": "2026-01-01T00:00:00Z",
+            "repository": {"full_name": REPOSITORY},
+        }
+        jobs = [_job_row(n, job_id=idx + 1) for idx, n in enumerate(ALL_REQUIRED)]
+        with pytest.raises(cjs.SnapshotError, match="job_pages_incomplete_partial_acquisition"):
+            cjs.build_snapshot(
+                # declares 4 total but only ships page 1's 2 rows.
+                pages=[{"total_count": len(jobs), "jobs": jobs[:2]}],
                 identity_payload=identity_payload,
                 expected_repository=REPOSITORY,
                 expected_run_id=RUN_ID,
