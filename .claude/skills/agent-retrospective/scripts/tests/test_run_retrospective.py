@@ -2765,8 +2765,29 @@ def _real_git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProc
     (``apply_codebase_investigator_role_adapter`` ->
     ``_verify_repo_evidence_ref_bytes``) that offers no injectable seam
     outside this module's own hermetic unit tests. A genuinely resolvable
-    ``base_sha`` (this real checkout's actual ``main`` HEAD) is therefore
-    required for these tests, not a fabricated SHA."""
+    ``base_sha`` (this real checkout's actual current commit) is therefore
+    required for these tests, not a fabricated SHA.
+
+    Issue #2644 PR #2660 fix_delta: ``run_cli``'s own ``_base_sha_resolver``
+    literally requests ``git rev-parse main``, which only resolves in a
+    checkout with a local ``main`` branch. A GitHub Actions checkout is
+    typically a detached ``HEAD`` with NO local ``main`` ref at all -- git's
+    own known behavior for that unresolvable non-option rev-parse argument
+    is to echo the literal argument back on stdout alongside a non-zero
+    exit, which previously fed the literal string ``"main"`` forward as a
+    fabricated ``base_sha``. This test-local real-git-runner shim rewrites
+    exactly that one call to ``git rev-parse HEAD`` before executing it --
+    ``HEAD`` resolves identically to this checkout's actual current commit
+    in both a normal local checkout (where it happens to also be reachable
+    from ``main``) and a detached-HEAD CI checkout, without changing
+    ``run_cli``'s own production call site or its argv (this is a test-only
+    real-transport adapter, not a change to the assertion in
+    ``test_run_retrospective_identity_binding.py``'s separate mocked
+    ``git_runner``, which is intentionally left asserting the literal
+    ``["git", "rev-parse", "main"]`` production call the real skill still
+    makes)."""
+    if argv == ["git", "rev-parse", "main"]:
+        argv = ["git", "rev-parse", "HEAD"]
     return subprocess.run(argv, **kwargs)
 
 
@@ -2913,9 +2934,22 @@ def test_ac1_since_last_selected_session_sentinel_reaches_runtime_observer_input
     sentinel = "SENTINEL-AC1-f3d8c1a2"
     _write_sentinel_session(fake_home / ".claude" / "projects" / slug, sentinel)
 
-    real_head_sha = subprocess.run(
-        ["git", "rev-parse", "main"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
-    ).stdout.strip()
+    # Issue #2644 PR #2660 fix_delta: `git rev-parse main` only resolves in
+    # checkouts with a local `main` branch. GitHub Actions checks out a
+    # detached HEAD with no local `main` ref, and git's own known behavior
+    # for an unresolvable non-option rev-parse argument is to echo the
+    # literal argument back on stdout alongside a non-zero exit -- so the
+    # unchecked `.stdout.strip()` silently returned the string "main"
+    # instead of a real SHA, which then failed `_FULL_SHA_RE` validation in
+    # `collect_repository_source()`. `HEAD` resolves identically in both a
+    # normal checkout and a detached-HEAD CI checkout, and the test's
+    # actual intent is "the real commit SHA of this checkout" -- not
+    # specifically the tip of `main`.
+    head_rev_parse = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
+    )
+    assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
+    real_head_sha = head_rev_parse.stdout.strip()
     real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
     expected_digest = rr.compute_source_set_digest([real_observation])
     native_result = _native_codebase_investigation_result(
@@ -3126,9 +3160,22 @@ def test_checkpoint_advances_once_on_success(tmp_path: Path) -> None:
     _write_sentinel_session(fake_home / ".claude" / "projects" / slug, "SENTINEL-AC6")
     watermark_file = tmp_path / "watermark.json"
 
-    real_head_sha = subprocess.run(
-        ["git", "rev-parse", "main"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
-    ).stdout.strip()
+    # Issue #2644 PR #2660 fix_delta: `git rev-parse main` only resolves in
+    # checkouts with a local `main` branch. GitHub Actions checks out a
+    # detached HEAD with no local `main` ref, and git's own known behavior
+    # for an unresolvable non-option rev-parse argument is to echo the
+    # literal argument back on stdout alongside a non-zero exit -- so the
+    # unchecked `.stdout.strip()` silently returned the string "main"
+    # instead of a real SHA, which then failed `_FULL_SHA_RE` validation in
+    # `collect_repository_source()`. `HEAD` resolves identically in both a
+    # normal checkout and a detached-HEAD CI checkout, and the test's
+    # actual intent is "the real commit SHA of this checkout" -- not
+    # specifically the tip of `main`.
+    head_rev_parse = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
+    )
+    assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
+    real_head_sha = head_rev_parse.stdout.strip()
     real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
     expected_digest = rr.compute_source_set_digest([real_observation])
     native_result = _native_codebase_investigation_result(
@@ -3194,9 +3241,22 @@ def test_checkpoint_advances_independent_of_publication_success(tmp_path: Path) 
     _write_sentinel_session(fake_home / ".claude" / "projects" / slug, "SENTINEL-AC10")
     watermark_file = tmp_path / "watermark.json"
 
-    real_head_sha = subprocess.run(
-        ["git", "rev-parse", "main"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
-    ).stdout.strip()
+    # Issue #2644 PR #2660 fix_delta: `git rev-parse main` only resolves in
+    # checkouts with a local `main` branch. GitHub Actions checks out a
+    # detached HEAD with no local `main` ref, and git's own known behavior
+    # for an unresolvable non-option rev-parse argument is to echo the
+    # literal argument back on stdout alongside a non-zero exit -- so the
+    # unchecked `.stdout.strip()` silently returned the string "main"
+    # instead of a real SHA, which then failed `_FULL_SHA_RE` validation in
+    # `collect_repository_source()`. `HEAD` resolves identically in both a
+    # normal checkout and a detached-HEAD CI checkout, and the test's
+    # actual intent is "the real commit SHA of this checkout" -- not
+    # specifically the tip of `main`.
+    head_rev_parse = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
+    )
+    assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
+    real_head_sha = head_rev_parse.stdout.strip()
     real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
     expected_digest = rr.compute_source_set_digest([real_observation])
     native_result = _native_codebase_investigation_result(
