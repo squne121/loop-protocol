@@ -695,7 +695,7 @@ Scope Delta（Issue #2563 Allowed Paths に明記済み: `targets` への当該�
 登録はその CI 常設ゲート化（`python-test` job の
 `uncovered_changed_test_files` gate 対応）を目的とする。
 
-## Trusted workflow signals（Issue #2565）
+## 信頼済み workflow signals（Issue #2565）
 
 Workflow producer が completion を反映する場合は、`task-contextctl signal apply`
 へ公開 v1 envelope（`signal_kind`, `source`, `source_schema_version`, `evidence`
