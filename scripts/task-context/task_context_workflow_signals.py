@@ -303,12 +303,16 @@ def apply_workflow_signal(
                 return outcome
             assert origin is not None
             task_id, kind, evidence = origin["task_id"], valid["signal_kind"], valid["evidence"]
-            # A missing implementation phase is never a license to attach
-            # Issue/PR claims. Check it before the otherwise atomic attachment
-            # branch so every deferred outcome stays non-mutating.
-            if kind == "implementation_pr_observed" and _activity_for_tx(conn, task_id, "implementation") is None:
-                return _outcome("deferred", "activity_missing")
+            # Implementation evidence belongs only to the currently eligible
+            # historical implementation Activity. Check its fixed selection
+            # before claim attachment so delayed/replayed facts cannot mutate
+            # claims or events after that phase has terminalized.
             if kind == "implementation_pr_observed":
+                implementation = _activity_for_tx(conn, task_id, "implementation")
+                if implementation is None:
+                    return _outcome("deferred", "activity_missing")
+                if implementation["status"] != "ACTIVE":
+                    return _outcome("duplicate_noop", "activity_terminal", task_id=task_id)
                 outcome = _validate_claims_or_attach_implementation_tx(conn, task_id, evidence)
             else:
                 outcome = _validate_required_claims_tx(conn, task_id, evidence)
@@ -443,7 +447,12 @@ def begin_cleanup_lifecycle(
             return _outcome("conflict", "OUT_OF_ORDER_SIGNAL")
         found = _find_cleanup_instance_tx(conn, task_id, repo, pr_number, merge_identity)
         if found is not None:
-            return _outcome("selected", "CLEANUP_ALREADY_SELECTED", task_id=task_id, activity_id=found["id"])
+            if found["status"] == "ACTIVE":
+                return _outcome("selected", "CLEANUP_ALREADY_SELECTED", task_id=task_id, activity_id=found["id"])
+            # A terminal historical cleanup instance is not resumable and must
+            # never be reported as selected to a caller that could redispatch
+            # work from that result.
+            return _outcome("duplicate_noop", "activity_terminal", task_id=task_id)
         active = conn.execute(
             "SELECT id FROM activities WHERE task_id = ? AND status = 'ACTIVE'", (task_id,)
         ).fetchone()

@@ -514,6 +514,10 @@ def classify_closing_issue_relation(snapshot: object, candidate_issue: int) -> t
     """
     if not isinstance(snapshot, dict):
         return "deferred", "RELATION_UNAVAILABLE", None
+    # GraphQL may return usable-looking partial `data` alongside a top-level
+    # `errors` member. That is not fresh authoritative relation evidence.
+    if "errors" in snapshot:
+        return "deferred", "RELATION_UNAVAILABLE", None
     try:
         repository = snapshot["data"]["repository"]
         pull_request = repository["pullRequest"]
