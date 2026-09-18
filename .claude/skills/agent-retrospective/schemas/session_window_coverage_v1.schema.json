@@ -210,7 +210,8 @@
             "advanced_full_coverage",
             "no_new_sessions_selected",
             "blocked_missing_required_source",
-            "blocked_no_publish_authorization"
+            "blocked_no_publish_authorization",
+            "blocked_evaluation_failure"
           ]
         }
       },
@@ -236,7 +237,11 @@
           "then": {
             "properties": {
               "checkpoint_advance_reason": {
-                "enum": ["blocked_missing_required_source", "blocked_no_publish_authorization"]
+                "enum": [
+                  "blocked_missing_required_source",
+                  "blocked_no_publish_authorization",
+                  "blocked_evaluation_failure"
+                ]
               }
             }
           }
