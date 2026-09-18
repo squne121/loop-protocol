@@ -51,6 +51,23 @@ def _clock():
     return datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
 
 
+def _stub_success_analysis_runner(collector_results: Any, source_coverage: Any) -> str:
+    """PR #2660 fix_delta P1-1 (OWNER REQUEST_CHANGES): a trivial stand-in
+    `analysis_runner` used ONLY by this file's collector-wiring / watermark
+    file I/O mechanics tests below (never the connected-pipeline tests
+    themselves, which live in `test_run_retrospective.py`'s real fake-runner
+    AC1/AC4/AC5/AC6/AC10 tests). Since coverage-only (`analysis_runner is
+    None`) invocations can no longer durably advance the checkpoint, these
+    tests need SOME successful `analysis_runner` to exercise the same
+    watermark-write/readback mechanics they always have -- this stub proves
+    nothing about the REAL observer/evaluator/finalize connection (that is
+    `test_run_retrospective.py`'s job); it only signals "analysis succeeded"
+    so `run_since_last_retrospective_cli()` proceeds past its
+    ``analysis_runner is not None`` success branch."""
+    del collector_results, source_coverage
+    return "stub-analysis-result"
+
+
 def _collector_result(
     *,
     source_status: str,
@@ -757,6 +774,38 @@ def test_run_since_last_retrospective_cli_writes_watermark_file_on_advancement(t
         json.dumps({"type": "user", "timestamp": "2026-01-01T00:00:00Z"}) + "\n", encoding="utf-8"
     )
     watermark_file = tmp_path / "watermark.json"
+    # PR #2660 fix_delta P1-1: a coverage-only invocation (no analysis_runner)
+    # can no longer durably advance the checkpoint -- a stub successful
+    # analysis_runner is required to reach the watermark-write path this test
+    # exercises (see _stub_success_analysis_runner's own docstring).
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=tmp_path,
+        required_sources=["claude_code"],
+        env={"HOME": str(tmp_path)},
+        prior_watermark_file=watermark_file,
+        publish_authorized=True,
+        clock=_clock,
+        analysis_runner=_stub_success_analysis_runner,
+    )
+    assert result["checkpoint"]["checkpoint_advanced"] is True
+    written = json.loads(watermark_file.read_text(encoding="utf-8"))
+    assert written == result["watermark"]
+
+
+def test_run_since_last_retrospective_cli_coverage_only_never_advances_checkpoint(tmp_path):
+    """PR #2660 fix_delta P1-1 (OWNER REQUEST_CHANGES): the SAME collection
+    scenario as the test above, but WITHOUT an analysis_runner -- coverage
+    alone (even fully observed + authorized) must never durably advance the
+    checkpoint or write the watermark file, since observer/evaluator/finalize
+    never ran."""
+    (tmp_path / ".git").mkdir()
+    slug = str(tmp_path.resolve()).replace("/", "-")
+    sessions_dir = tmp_path / ".claude" / "projects" / slug
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "session1.jsonl").write_text(
+        json.dumps({"type": "user", "timestamp": "2026-01-01T00:00:00Z"}) + "\n", encoding="utf-8"
+    )
+    watermark_file = tmp_path / "watermark.json"
     result = rr.run_since_last_retrospective_cli(
         repo_root=tmp_path,
         required_sources=["claude_code"],
@@ -765,9 +814,12 @@ def test_run_since_last_retrospective_cli_writes_watermark_file_on_advancement(t
         publish_authorized=True,
         clock=_clock,
     )
-    assert result["checkpoint"]["checkpoint_advanced"] is True
-    written = json.loads(watermark_file.read_text(encoding="utf-8"))
-    assert written == result["watermark"]
+    assert result["orchestration"]["status"] == "succeeded"  # collection/coverage itself succeeded
+    assert result["source_coverage"]["claude_code"]["status"] == "observed"
+    assert result["checkpoint"]["checkpoint_advanced"] is False
+    assert result["checkpoint"]["checkpoint_advance_reason"] == "blocked_evaluation_failure"
+    assert not watermark_file.exists()
+    rr.validate_session_window_coverage(result)
 
 
 def test_run_since_last_retrospective_cli_does_not_write_watermark_file_when_not_authorized(tmp_path):
@@ -788,7 +840,9 @@ def test_run_since_last_retrospective_cli_does_not_write_watermark_file_when_not
 def test_run_since_last_retrospective_cli_second_invocation_reads_back_written_watermark(tmp_path):
     """Regression item 9: a durable write on invocation 1 is actually READ
     and USED by invocation 2 -- the core AC6 "next run behavior
-    deterministic" proof."""
+    deterministic" proof. PR #2660 fix_delta P1-1: both invocations must
+    supply a (stub) successful analysis_runner, since coverage-only
+    invocations can no longer durably write the watermark at all."""
     (tmp_path / ".git").mkdir()
     slug = str(tmp_path.resolve()).replace("/", "-")
     sessions_dir = tmp_path / ".claude" / "projects" / slug
@@ -808,6 +862,7 @@ def test_run_since_last_retrospective_cli_second_invocation_reads_back_written_w
         prior_watermark_file=watermark_file,
         publish_authorized=True,
         clock=_clock_run1,
+        analysis_runner=_stub_success_analysis_runner,
     )
     assert first["source_coverage"]["claude_code"]["selected_session_count"] == 1
     assert watermark_file.exists()
@@ -826,6 +881,7 @@ def test_run_since_last_retrospective_cli_second_invocation_reads_back_written_w
         prior_watermark_file=watermark_file,
         publish_authorized=True,
         clock=_clock_run2,
+        analysis_runner=_stub_success_analysis_runner,
     )
     assert second["source_coverage"]["claude_code"]["selected_session_count"] == 0
     assert second["watermark"]["from_exclusive"] == first["watermark"]["to_inclusive"]
@@ -865,7 +921,9 @@ def test_run_since_last_retrospective_cli_missing_watermark_file_with_wired_coll
     """Same bootstrap scenario, but with the `claude_code` collector
     actually wired -- proves the missing-file bootstrap path reaches a real
     `first_run_no_prior_state` advancement and durably writes the file,
-    not just a degraded no-op."""
+    not just a degraded no-op. PR #2660 fix_delta P1-1: requires a (stub)
+    successful analysis_runner, since coverage alone can no longer advance
+    the checkpoint."""
     (tmp_path / ".git").mkdir()
     slug = str(tmp_path.resolve()).replace("/", "-")
     sessions_dir = tmp_path / ".claude" / "projects" / slug
@@ -881,6 +939,7 @@ def test_run_since_last_retrospective_cli_missing_watermark_file_with_wired_coll
         prior_watermark_file=watermark_file,
         publish_authorized=True,
         clock=_clock,
+        analysis_runner=_stub_success_analysis_runner,
     )
     assert result["orchestration"]["status"] == "succeeded"
     assert result["checkpoint"] == {
@@ -1048,6 +1107,9 @@ def test_run_since_last_retrospective_cli_end_to_end_degraded_when_unwired(tmp_p
 
 
 def test_run_since_last_retrospective_cli_end_to_end_complete_with_real_session_files(tmp_path):
+    """PR #2660 fix_delta P1-1: requires a (stub) successful analysis_runner
+    to actually reach `checkpoint_advanced: True` -- coverage alone
+    (`analysis_completeness: "complete"`) is no longer sufficient."""
     (tmp_path / ".git").mkdir()
     slug = str(tmp_path.resolve()).replace("/", "-")
     sessions_dir = tmp_path / ".claude" / "projects" / slug
@@ -1061,6 +1123,7 @@ def test_run_since_last_retrospective_cli_end_to_end_complete_with_real_session_
         env={"HOME": str(tmp_path)},
         publish_authorized=True,
         clock=_clock,
+        analysis_runner=_stub_success_analysis_runner,
     )
     assert result["analysis_completeness"] == "complete"
     assert result["source_coverage"]["claude_code"]["status"] == "observed"

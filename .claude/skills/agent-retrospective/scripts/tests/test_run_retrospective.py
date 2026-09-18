@@ -41,12 +41,14 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -2717,3 +2719,734 @@ def test_execute_run_wires_latitude_binding_into_production_call_graph():
         "resource_identity": latitude_evidence["evidence_ref"],
         "projection_digest": latitude_evidence["evidence_identity"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Issue #2644: runtime source coverage / checkpoint separation
+#
+#   AC1  since_last_selected_session_sentinel_reaches_runtime_observer_input
+#   AC4  run_cli_delta_results_matches_canonical_evaluations_for_present_candidate
+#   AC5  checkpoint_not_advanced_on_observer_or_evaluator_failure
+#   AC6  checkpoint_advances_once_on_success
+#   AC10 checkpoint_advances_independent_of_publication_success
+# ---------------------------------------------------------------------------
+
+
+def _since_last_clock():
+    return datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _write_sentinel_session(sessions_dir: Path, sentinel: str) -> None:
+    # a real `timestamp` field (rather than relying on file mtime, Issue
+    # #2601 PR #2612 fix_delta Finding 1) keeps this session INSIDE
+    # `_since_last_clock()`'s fixed window regardless of wall-clock time --
+    # `resolve_claude_code_session_paths` applies the SAME window bound
+    # `--since-last-retrospective` filters session selection with.
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / "session1.jsonl").write_text(
+        json.dumps({"type": "user", "sessionId": sentinel, "timestamp": "2026-09-01T00:00:00Z"}) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _since_last_fake_git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    assert argv == ["git", "rev-parse", "main"]
+    return subprocess.CompletedProcess(argv, returncode=0, stdout=_FULL_SHA + "\n", stderr="")
+
+
+def _real_git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+    """Issue #2644: a REAL (non-mocked) ``git_runner`` passthrough for the
+    AC1/AC5/AC6/AC10 connected-analysis tests below, which pass a non-``None``
+    ``prompts`` dict into ``run_cli()`` -- this makes ``codebase-investigator``
+    take the AGY advisory native-fallback role-adapter path
+    (``build_observer_requests``'s ``caller_supplied_task_path``, Issue
+    #2374), which independently re-verifies its own fake response's evidence
+    bytes via a REAL ``git show`` subprocess call
+    (``apply_codebase_investigator_role_adapter`` ->
+    ``_verify_repo_evidence_ref_bytes``) that offers no injectable seam
+    outside this module's own hermetic unit tests. A genuinely resolvable
+    ``base_sha`` (this real checkout's actual current commit) is therefore
+    required for these tests, not a fabricated SHA.
+
+    Issue #2644 PR #2660 fix_delta: ``run_cli``'s own ``_base_sha_resolver``
+    literally requests ``git rev-parse main``, which only resolves in a
+    checkout with a local ``main`` branch. A GitHub Actions checkout is
+    typically a detached ``HEAD`` with NO local ``main`` ref at all -- git's
+    own known behavior for that unresolvable non-option rev-parse argument
+    is to echo the literal argument back on stdout alongside a non-zero
+    exit, which previously fed the literal string ``"main"`` forward as a
+    fabricated ``base_sha``. This test-local real-git-runner shim rewrites
+    exactly that one call to ``git rev-parse HEAD`` before executing it --
+    ``HEAD`` resolves identically to this checkout's actual current commit
+    in both a normal local checkout (where it happens to also be reachable
+    from ``main``) and a detached-HEAD CI checkout, without changing
+    ``run_cli``'s own production call site or its argv (this is a test-only
+    real-transport adapter, not a change to the assertion in
+    ``test_run_retrospective_identity_binding.py``'s separate mocked
+    ``git_runner``, which is intentionally left asserting the literal
+    ``["git", "rev-parse", "main"]`` production call the real skill still
+    makes)."""
+    if argv == ["git", "rev-parse", "main"]:
+        argv = ["git", "rev-parse", "HEAD"]
+    return subprocess.run(argv, **kwargs)
+
+
+def _real_repo_evidence_ref(repo_root: Path, commit_sha: str, path: str) -> dict[str, Any]:
+    """Builds a REAL, independently-git-show-verifiable ``REPO_EVIDENCE_REF_V1``
+    (Issue #2644) -- the excerpt covers the ENTIRE file at ``commit_sha``, and
+    ``excerpt_sha256`` is computed with the exact byte-reconstruction scheme
+    ``validate_repo_evidence_ref.py`` itself uses, so the real ``git show``
+    call ``apply_codebase_investigator_role_adapter`` performs against THIS
+    real checkout's own git history actually verifies it."""
+    completed = subprocess.run(
+        ["git", "show", f"{commit_sha}:{path}"], cwd=str(repo_root), capture_output=True, check=True
+    )
+    excerpt_bytes = completed.stdout
+    lines = excerpt_bytes.split(b"\n")
+    line_count = len(lines) - 1 if excerpt_bytes.endswith(b"\n") else len(lines)
+    start_line, end_line = 1, line_count
+    reconstructed = b"\n".join(lines[start_line - 1 : end_line])
+    if end_line < len(lines):
+        reconstructed += b"\n"
+    excerpt_sha256 = hashlib.sha256(reconstructed).hexdigest()
+    return {
+        "type": "REPO_EVIDENCE_REF_V1",
+        "commit_sha": commit_sha,
+        "object_format": "sha1" if len(commit_sha) == 40 else "sha256",
+        "path": path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "permalink": f"https://github.com/squne121/loop-protocol/blob/{commit_sha}/{path}#L{start_line}-L{end_line}",
+        "excerpt_sha256": excerpt_sha256,
+        "verification_status": "verified",
+        "verification_method": "sha256_hash_match",
+        "verified_at": "2026-09-10T12:00:00Z",
+    }
+
+
+def _native_codebase_investigation_result(evidence_ref: dict[str, Any]) -> dict[str, Any]:
+    """A minimal, schema-valid ``CODEBASE_INVESTIGATION_RESULT_V1`` (Issue
+    #2374's native AGY advisory fallback contract) -- used as
+    ``codebase-investigator``'s fake response whenever a connected-analysis
+    test's ``prompts`` dict makes ``run_cli()`` route it through the native
+    role-adapter path."""
+    return {
+        "schema_version": 1,
+        "status": "ok",
+        "investigation_route": "local_asset_research",
+        "evidence_refs": [evidence_ref],
+        "discovery_summary": "since-last-retrospective connected analysis test fixture.",
+        "impact_scope": [],
+        "failure_reason": None,
+        "source_evidence_result": None,
+    }
+
+
+def _make_since_last_fake_runner(
+    expected_digest: str,
+    call_log: list[str],
+    *,
+    fail_observer_id: str | None = None,
+    captured_inputs: dict[str, str] | None = None,
+    native_codebase_investigation_result: dict[str, Any] | None = None,
+) -> Any:
+    """Issue #2644: a full 3-observer + evaluator fake pipeline runner
+    (mirrors ``test_executable_entrypoint_collectors_to_publish_request``'s
+    fake ``_runner``), reused by the AC1/AC4/AC5/AC6/AC10 tests below.
+    ``captured_inputs`` (when supplied) records each observer's REAL
+    ``kwargs["input"]`` (the actual prompt text the observer subprocess
+    receives via stdin) keyed by ``agent_name`` -- AC1's end-to-end sentinel
+    proof reads this back. ``native_codebase_investigation_result`` (when
+    supplied) is returned VERBATIM as ``codebase-investigator``'s
+    ``structured_output`` -- required whenever the caller's ``prompts`` dict
+    makes ``run_cli()`` route that observer through the native role-adapter
+    path (Issue #2374); omitted, this falls back to the generic
+    ``EvidenceBundle`` response every observer uses on the default (no
+    caller-supplied prompts) path."""
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        agent_name = argv[argv.index("--agent") + 1]
+        call_log.append(agent_name)
+        if captured_inputs is not None:
+            captured_inputs[agent_name] = kwargs["input"]
+        if fail_observer_id is not None and agent_name == fail_observer_id:
+            return subprocess.CompletedProcess(argv, returncode=1, stdout="", stderr="boom")
+        if agent_name == "retrospective-evaluator":
+            evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
+            evaluation_payload = {
+                "schema_version": rr.WIRE_SCHEMA_EVALUATION,
+                "run_id": evaluator_request.run_id,
+                "base_sha": kwargs["env"].get("AGENT_RETROSPECTIVE_BASE_SHA", ""),
+                "source_set_digest": evaluator_request.source_set_digest,
+                "candidate_records": [],
+                "evidence_ref": "e",
+            }
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(evaluation_payload)), stderr=""
+            )
+        if agent_name == "codebase-investigator" and native_codebase_investigation_result is not None:
+            return subprocess.CompletedProcess(
+                argv,
+                returncode=0,
+                stdout=json.dumps(_wrapper_payload(native_codebase_investigation_result)),
+                stderr="",
+            )
+        bundle = rr.EvidenceBundle(
+            run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
+            base_sha=kwargs["env"].get("AGENT_RETROSPECTIVE_BASE_SHA", ""),
+            source_set_digest=expected_digest,
+            observer_id=agent_name,
+            evidence_ref=f"evidence://{agent_name}",
+            findings=[],
+        )
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(bundle.to_wire()))), stderr=""
+        )
+
+    return _runner
+
+
+def _runtime_evidence_ref_for_judgment(suffix: str = "1") -> dict[str, Any]:
+    """A judgment-only (pre-enrichment) evidence_ref an evaluator would
+    supply for a `runtime`-sourced finding -- `projection_digest` is
+    intentionally omitted (never accepted from the evaluator's wire
+    payload; `_enrich_evidence_ref` always recomputes it from real
+    `finding_sets` data)."""
+    return {"ref_type": "runtime_receipt", "source_id": "runtime", "resource_identity": f"runtime-session#{suffix}"}
+
+
+def test_ac1_since_last_selected_session_sentinel_reaches_runtime_observer_input(tmp_path: Path) -> None:
+    """Issue #2644 AC1: the window/selected session collector_results this
+    same --since-last-retrospective run fixed are the ONLY ones threaded
+    into the actual retrospective-runtime-observer prompt -- proven by
+    embedding a distinguishable per-run sentinel in a real session
+    transcript and finding it verbatim in the observer's real
+    ``kwargs["input"]``, never merely a call-count assertion."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    fake_home = tmp_path / "home"
+    slug = str(repo_root.resolve()).replace("/", "-")
+    sentinel = "SENTINEL-AC1-f3d8c1a2"
+    _write_sentinel_session(fake_home / ".claude" / "projects" / slug, sentinel)
+
+    # Issue #2644 PR #2660 fix_delta: `git rev-parse main` only resolves in
+    # checkouts with a local `main` branch. GitHub Actions checks out a
+    # detached HEAD with no local `main` ref, and git's own known behavior
+    # for an unresolvable non-option rev-parse argument is to echo the
+    # literal argument back on stdout alongside a non-zero exit -- so the
+    # unchecked `.stdout.strip()` silently returned the string "main"
+    # instead of a real SHA, which then failed `_FULL_SHA_RE` validation in
+    # `collect_repository_source()`. `HEAD` resolves identically in both a
+    # normal checkout and a detached-HEAD CI checkout, and the test's
+    # actual intent is "the real commit SHA of this checkout" -- not
+    # specifically the tip of `main`.
+    head_rev_parse = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
+    )
+    assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
+    real_head_sha = head_rev_parse.stdout.strip()
+    real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+    native_result = _native_codebase_investigation_result(
+        _real_repo_evidence_ref(repo_root, real_head_sha, "CLAUDE.md")
+    )
+    call_log: list[str] = []
+    captured_inputs: dict[str, str] = {}
+    fake_runner = _make_since_last_fake_runner(
+        expected_digest,
+        call_log,
+        captured_inputs=captured_inputs,
+        native_codebase_investigation_result=native_result,
+    )
+
+    analysis_runner = rr.build_since_last_analysis_runner(
+        repo_root=repo_root,
+        repository_id=_REPOSITORY_ID,
+        target_issue=2644,
+        request_id="req-ac1-1",
+        idempotency_key="idem-ac1-1",
+        schema_dir=schema_dir,
+        previous_state_provider=rr.FixturePreviousStateProvider(fixtures={}),
+        runner=fake_runner,
+        git_runner=_real_git_runner,
+        run_id="run-ac1-1",
+        temp_base_dir=tmp_path,
+    )
+
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=repo_root,
+        required_sources=["claude_code"],
+        env={"HOME": str(fake_home)},
+        publish_authorized=True,
+        analysis_runner=analysis_runner,
+        clock=_since_last_clock,
+    )
+
+    assert result["checkpoint"]["checkpoint_advanced"] is True
+    assert sorted(call_log) == sorted(
+        [spec.observer_id for spec in rr.EXPECTED_OBSERVER_MANIFEST] + ["retrospective-evaluator"]
+    )
+    assert sentinel in captured_inputs["retrospective-runtime-observer"]
+    # the OTHER two observers never receive the runtime session evidence --
+    # this proves the connection is specific to the runtime observer, not a
+    # blanket broadcast of private session content to every observer.
+    assert sentinel not in captured_inputs["codebase-investigator"]
+    assert sentinel not in captured_inputs["web-researcher"]
+
+
+def test_ac4_run_cli_delta_results_matches_canonical_evaluations_for_present_candidate(tmp_path: Path) -> None:
+    """Issue #2644 AC4: canonical `finding_contract.evaluations[]` generation
+    (`_classify_current_candidate_delta`/`_build_evaluation_entry`, wired via
+    `run_evaluation()`) and the top-level `PublishRequest.delta_results`
+    sidecar (`compute_delta()`) must agree for a candidate ACTUALLY reported
+    this run, when both are fed the SAME `current_source_coverage` through
+    `run_cli()`."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    real_observation = rr.build_repository_collector(repo_root)(_FULL_SHA).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+    key = _identity_key("ac4_rule")
+    identity_value = _validate_mod.compute_finding_identity(key)
+    judgment = _judgment_from_key(key, candidate_id="cand-ac4-1", evidence_refs=[_runtime_evidence_ref_for_judgment()])
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        agent_name = argv[argv.index("--agent") + 1]
+        if agent_name == "retrospective-evaluator":
+            evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
+            evaluation_payload = {
+                "schema_version": rr.WIRE_SCHEMA_EVALUATION,
+                "run_id": evaluator_request.run_id,
+                "base_sha": _FULL_SHA,
+                "source_set_digest": evaluator_request.source_set_digest,
+                "candidate_records": [judgment],
+                "evidence_ref": "e",
+            }
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(evaluation_payload)), stderr=""
+            )
+        runtime_findings = (
+            [{"claim": "x", "claim_class": "runtime_behavior"}]
+            if agent_name == "retrospective-runtime-observer"
+            else []
+        )
+        bundle = rr.EvidenceBundle(
+            run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
+            base_sha=kwargs["env"].get("AGENT_RETROSPECTIVE_BASE_SHA", ""),
+            source_set_digest=expected_digest,
+            observer_id=agent_name,
+            evidence_ref=f"evidence://{agent_name}",
+            findings=runtime_findings,
+        )
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(bundle.to_wire()))), stderr=""
+        )
+
+    current_source_coverage = {
+        "claude_code": {"status": "unavailable", "reason_code": "source_not_present", "selected_session_count": None},
+        "claude_gpt": {"status": "unavailable", "reason_code": "source_not_present", "selected_session_count": None},
+    }
+    publish_request = rr.run_cli(
+        repo_root=repo_root,
+        repository_id=_REPOSITORY_ID,
+        target_issue=2644,
+        request_id="req-ac4-1",
+        idempotency_key="idem-ac4-1",
+        schema_dir=schema_dir,
+        prompts=None,
+        runner=_runner,
+        git_runner=_since_last_fake_git_runner,
+        run_id="run-ac4-1",
+        temp_base_dir=tmp_path,
+        current_source_coverage=current_source_coverage,
+    )
+
+    assert len(publish_request.candidate_records) == 1
+    canonical_evaluation = publish_request.candidate_records[0]["finding_contract"]["evaluations"][-1]
+    delta_entry = next(e for e in publish_request.delta_results if e["finding_identity"] == identity_value)
+    assert canonical_evaluation["evaluation_status"] == delta_entry["evaluation_status"]
+    if canonical_evaluation["evaluation_status"] == "classified":
+        assert canonical_evaluation["delta_status"] == delta_entry["delta_status"]
+    else:
+        assert "delta_status" not in canonical_evaluation
+        assert delta_entry["delta_status"] is None
+
+
+def test_checkpoint_not_advanced_on_observer_or_evaluator_failure(tmp_path: Path) -> None:
+    """Issue #2644 AC5: an observer failure during the connected analysis
+    phase must block checkpoint advancement -- verified against a REAL
+    tmp_path watermark file (never merely a mocked write-function call
+    count): (a) the file is never created, (b) checkpoint_advanced is False
+    with checkpoint_advance_reason blocked_evaluation_failure, (c) the
+    result still schema-validates, (d) a second invocation against the SAME
+    (still-absent) watermark file re-selects the SAME unanalyzed session."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    fake_home = tmp_path / "home"
+    slug = str(repo_root.resolve()).replace("/", "-")
+    _write_sentinel_session(fake_home / ".claude" / "projects" / slug, "SENTINEL-AC5")
+    watermark_file = tmp_path / "watermark.json"
+
+    real_observation = rr.build_repository_collector(repo_root)(_FULL_SHA).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+
+    def _run_once() -> dict[str, Any]:
+        call_log: list[str] = []
+        fake_runner = _make_since_last_fake_runner(
+            expected_digest, call_log, fail_observer_id="retrospective-runtime-observer"
+        )
+        analysis_runner = rr.build_since_last_analysis_runner(
+            repo_root=repo_root,
+            repository_id=_REPOSITORY_ID,
+            target_issue=2644,
+            request_id="req-ac5-1",
+            idempotency_key="idem-ac5-1",
+            schema_dir=schema_dir,
+            previous_state_provider=rr.FixturePreviousStateProvider(fixtures={}),
+            runner=fake_runner,
+            git_runner=_since_last_fake_git_runner,
+            run_id="run-ac5-1",
+            temp_base_dir=tmp_path,
+        )
+        return rr.run_since_last_retrospective_cli(
+            repo_root=repo_root,
+            required_sources=["claude_code"],
+            env={"HOME": str(fake_home)},
+            prior_watermark_file=watermark_file,
+            publish_authorized=True,
+            analysis_runner=analysis_runner,
+            clock=_since_last_clock,
+        )
+
+    first = _run_once()
+    assert first["checkpoint"]["checkpoint_advanced"] is False
+    assert first["checkpoint"]["checkpoint_advance_reason"] == "blocked_evaluation_failure"
+    assert first["orchestration"]["status"] == "succeeded"  # collection/coverage itself succeeded
+    assert not watermark_file.exists()
+    rr.validate_session_window_coverage(first)
+
+    # re-run: the watermark file was never written, so the SAME session
+    # (never actually analyzed) is re-selected as this run's candidate.
+    second = _run_once()
+    assert second["source_coverage"]["claude_code"]["selected_session_count"] == 1
+    assert second["checkpoint"]["checkpoint_advance_reason"] == "blocked_evaluation_failure"
+
+
+def test_checkpoint_advances_once_on_success(tmp_path: Path) -> None:
+    """Issue #2644 AC6: a fully successful connected analysis run advances
+    the checkpoint exactly once, and a REAL tmp_path watermark file is
+    durably written and read back with the exact reported watermark."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    fake_home = tmp_path / "home"
+    slug = str(repo_root.resolve()).replace("/", "-")
+    _write_sentinel_session(fake_home / ".claude" / "projects" / slug, "SENTINEL-AC6")
+    watermark_file = tmp_path / "watermark.json"
+
+    # Issue #2644 PR #2660 fix_delta: `git rev-parse main` only resolves in
+    # checkouts with a local `main` branch. GitHub Actions checks out a
+    # detached HEAD with no local `main` ref, and git's own known behavior
+    # for an unresolvable non-option rev-parse argument is to echo the
+    # literal argument back on stdout alongside a non-zero exit -- so the
+    # unchecked `.stdout.strip()` silently returned the string "main"
+    # instead of a real SHA, which then failed `_FULL_SHA_RE` validation in
+    # `collect_repository_source()`. `HEAD` resolves identically in both a
+    # normal checkout and a detached-HEAD CI checkout, and the test's
+    # actual intent is "the real commit SHA of this checkout" -- not
+    # specifically the tip of `main`.
+    head_rev_parse = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
+    )
+    assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
+    real_head_sha = head_rev_parse.stdout.strip()
+    real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+    native_result = _native_codebase_investigation_result(
+        _real_repo_evidence_ref(repo_root, real_head_sha, "CLAUDE.md")
+    )
+    call_log: list[str] = []
+    fake_runner = _make_since_last_fake_runner(
+        expected_digest, call_log, native_codebase_investigation_result=native_result
+    )
+    analysis_runner = rr.build_since_last_analysis_runner(
+        repo_root=repo_root,
+        repository_id=_REPOSITORY_ID,
+        target_issue=2644,
+        request_id="req-ac6-1",
+        idempotency_key="idem-ac6-1",
+        schema_dir=schema_dir,
+        previous_state_provider=rr.FixturePreviousStateProvider(fixtures={}),
+        runner=fake_runner,
+        git_runner=_real_git_runner,
+        run_id="run-ac6-1",
+        temp_base_dir=tmp_path,
+    )
+
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=repo_root,
+        required_sources=["claude_code"],
+        env={"HOME": str(fake_home)},
+        prior_watermark_file=watermark_file,
+        publish_authorized=True,
+        analysis_runner=analysis_runner,
+        clock=_since_last_clock,
+    )
+
+    assert result["checkpoint"]["checkpoint_advanced"] is True
+    assert result["checkpoint"]["checkpoint_advance_reason"] in (
+        "first_run_no_prior_state",
+        "advanced_full_coverage",
+        "no_new_sessions_selected",
+    )
+    assert watermark_file.exists()
+    written = json.loads(watermark_file.read_text(encoding="utf-8"))
+    assert written == result["watermark"]
+    rr.validate_session_window_coverage(result)
+
+
+def test_checkpoint_advances_independent_of_publication_success(tmp_path: Path) -> None:
+    """Issue #2644 AC10(b): checkpoint advancement depends ONLY on
+    observer/evaluator/finalize success (a proposal-only `PublishRequest`) --
+    never on an actual GitHub publication call, which this connected
+    analysis path never even invokes. Proven by patching the persistence
+    module loader to raise if it is EVER touched, then asserting the
+    checkpoint still advances and a real tmp_path watermark file is
+    written."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    fake_home = tmp_path / "home"
+    slug = str(repo_root.resolve()).replace("/", "-")
+    _write_sentinel_session(fake_home / ".claude" / "projects" / slug, "SENTINEL-AC10")
+    watermark_file = tmp_path / "watermark.json"
+
+    # Issue #2644 PR #2660 fix_delta: `git rev-parse main` only resolves in
+    # checkouts with a local `main` branch. GitHub Actions checks out a
+    # detached HEAD with no local `main` ref, and git's own known behavior
+    # for an unresolvable non-option rev-parse argument is to echo the
+    # literal argument back on stdout alongside a non-zero exit -- so the
+    # unchecked `.stdout.strip()` silently returned the string "main"
+    # instead of a real SHA, which then failed `_FULL_SHA_RE` validation in
+    # `collect_repository_source()`. `HEAD` resolves identically in both a
+    # normal checkout and a detached-HEAD CI checkout, and the test's
+    # actual intent is "the real commit SHA of this checkout" -- not
+    # specifically the tip of `main`.
+    head_rev_parse = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
+    )
+    assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
+    real_head_sha = head_rev_parse.stdout.strip()
+    real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+    native_result = _native_codebase_investigation_result(
+        _real_repo_evidence_ref(repo_root, real_head_sha, "CLAUDE.md")
+    )
+    call_log: list[str] = []
+    fake_runner = _make_since_last_fake_runner(
+        expected_digest, call_log, native_codebase_investigation_result=native_result
+    )
+
+    def _publication_must_never_be_touched():
+        raise AssertionError(
+            "checkpoint advancement must never touch the GitHub publication module"
+        )
+
+    original_loader = rr._persist_retrospective_run_module
+    rr._persist_retrospective_run_module = _publication_must_never_be_touched
+    try:
+        analysis_runner = rr.build_since_last_analysis_runner(
+            repo_root=repo_root,
+            repository_id=_REPOSITORY_ID,
+            target_issue=2644,
+            request_id="req-ac10-1",
+            idempotency_key="idem-ac10-1",
+            schema_dir=schema_dir,
+            # explicit FixturePreviousStateProvider -- never resolve_previous_state_provider()'s
+            # 'issue-comments' default, which itself would call the patched loader above for an
+            # unrelated (legitimate, non-publication) reason.
+            previous_state_provider=rr.FixturePreviousStateProvider(fixtures={}),
+            runner=fake_runner,
+            git_runner=_real_git_runner,
+            run_id="run-ac10-1",
+            temp_base_dir=tmp_path,
+        )
+        result = rr.run_since_last_retrospective_cli(
+            repo_root=repo_root,
+            required_sources=["claude_code"],
+            env={"HOME": str(fake_home)},
+            prior_watermark_file=watermark_file,
+            publish_authorized=True,
+            analysis_runner=analysis_runner,
+            clock=_since_last_clock,
+        )
+    finally:
+        rr._persist_retrospective_run_module = original_loader
+
+    assert result["checkpoint"]["checkpoint_advanced"] is True
+    assert watermark_file.exists()
+
+
+def test_p1_4_connected_analysis_reaches_runtime_unavailable_indeterminate_branch(tmp_path: Path) -> None:
+    """PR #2660 fix_delta P1-4 (OWNER REQUEST_CHANGES): the connected
+    (``--enable-full-analysis``) ``--since-last-retrospective`` path must
+    actually reach ``analysis_runner`` -- and through it, ``compute_delta()``'s
+    runtime-unavailable/partial evidence-dependent branch (Issue #2644
+    AC2/AC3) -- even when a REQUIRED session source is NOT ``observed`` this
+    run. Before this fix, ``run_since_last_retrospective_cli()`` gated the
+    analysis ATTEMPT itself on ``result["checkpoint"]["checkpoint_advanced"]``,
+    which folds in "every required source is ``observed``" -- so a run with
+    one required source unavailable could never reach ``analysis_runner`` at
+    all, making AC2/AC3's runtime-unavailable/partial branch structurally
+    unreachable from this CLI's own production entrypoint (the reviewer's
+    root-cause finding). This test proves (a) analysis genuinely runs (the
+    full observer/evaluator call graph is invoked, never skipped), (b)
+    ``compute_delta()``'s runtime-unavailable branch is actually HIT (a
+    previously-reported runtime-evidence finding classifies
+    ``indeterminate``/``source_partial``, never a false ``resolved``), and (c)
+    the checkpoint disposition itself remains correctly blocked
+    (``blocked_missing_required_source``) -- this relaxation never promotes
+    an under-covered run's checkpoint to advanced."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    fake_home = tmp_path / "home"
+    slug = str(repo_root.resolve()).replace("/", "-")
+    # ONLY claude_code is wired (a real sentinel session); claude_gpt IS
+    # required but its env var (`CLAUDE_GPT_HOOK_SINK_PATH`) is deliberately
+    # never set in `env` below -- `collect_session_sources` therefore never
+    # wires a collector for it, so its coverage entry reports
+    # `status: "required"`/`reason_code: "collector_not_configured"`, NOT
+    # `observed` -- this is the exact "required source not observed"
+    # condition that previously blocked the analysis ATTEMPT itself.
+    _write_sentinel_session(fake_home / ".claude" / "projects" / slug, "SENTINEL-P1-4")
+
+    # Issue #2644 PR #2660 fix_delta: see the matching comment on the AC1/
+    # AC6/AC10 tests above -- `HEAD` resolves identically to this checkout's
+    # real current commit in both a normal local checkout and a
+    # detached-HEAD CI checkout.
+    head_rev_parse = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
+    )
+    assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
+    real_head_sha = head_rev_parse.stdout.strip()
+    real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
+    expected_digest = rr.compute_source_set_digest([real_observation])
+    native_result = _native_codebase_investigation_result(
+        _real_repo_evidence_ref(repo_root, real_head_sha, "CLAUDE.md")
+    )
+    call_log: list[str] = []
+    # the fake evaluator reports ZERO current candidates this run (the
+    # `_make_since_last_fake_runner` default, unchanged here) -- so the
+    # previously-reported runtime-evidence finding seeded below is ABSENT
+    # this run, which is exactly the "resolved vs. indeterminate" fork
+    # `compute_delta()`'s runtime-unavailable branch decides.
+    fake_runner = _make_since_last_fake_runner(
+        expected_digest, call_log, native_codebase_investigation_result=native_result
+    )
+
+    previous_identity = "finding-p1-4-runtime-1"
+    previous_candidate = {
+        "finding_contract": {
+            "identity": {"value": previous_identity},
+            "evaluations": [
+                {
+                    "presence_delta": "new",
+                    "evidence_refs": [_runtime_evidence_ref_for_judgment("p1-4")],
+                }
+            ],
+        }
+    }
+    provider = rr.FixturePreviousStateProvider(
+        fixtures={
+            (_REPOSITORY_ID, rr.DEFAULT_PREVIOUS_STATE_SCOPE): rr.PreviousStateResult(
+                status="available",
+                previous_run_ref="run-prior-p1-4",
+                candidates=[previous_candidate],
+                read_version="v1",
+            )
+        }
+    )
+
+    analysis_runner = rr.build_since_last_analysis_runner(
+        repo_root=repo_root,
+        repository_id=_REPOSITORY_ID,
+        target_issue=2644,
+        request_id="req-p1-4-1",
+        idempotency_key="idem-p1-4-1",
+        schema_dir=schema_dir,
+        previous_state_provider=provider,
+        runner=fake_runner,
+        git_runner=_real_git_runner,
+        run_id="run-p1-4-1",
+        temp_base_dir=tmp_path,
+    )
+
+    sink: list[Any] = []
+    result = rr.run_since_last_retrospective_cli(
+        repo_root=repo_root,
+        required_sources=["claude_code", "claude_gpt"],
+        env={"HOME": str(fake_home)},
+        publish_authorized=True,
+        analysis_runner=analysis_runner,
+        analysis_result_sink=sink,
+        clock=_since_last_clock,
+    )
+
+    # (a) the required-but-unwired source genuinely reports non-`observed`
+    # this run -- the exact precondition that previously blocked the
+    # analysis ATTEMPT itself.
+    assert result["source_coverage"]["claude_gpt"]["status"] != "observed"
+    assert result["source_coverage"]["claude_code"]["status"] == "observed"
+
+    # (b) analysis genuinely ran: every observer + the evaluator were
+    # actually invoked (never skipped merely because coverage was
+    # incomplete this run), and a PublishRequest was captured via the sink.
+    assert sorted(call_log) == sorted(
+        [spec.observer_id for spec in rr.EXPECTED_OBSERVER_MANIFEST] + ["retrospective-evaluator"]
+    )
+    assert len(sink) == 1
+    publish_request = sink[0]
+
+    # (c) compute_delta()'s runtime-unavailable/partial branch was actually
+    # REACHED: the previously-reported runtime-evidence finding (absent this
+    # run) classifies `indeterminate`/`source_partial`, never a false
+    # `resolved` -- proving `analysis_runner` really was invoked with THIS
+    # run's own under-covered `current_source_coverage`, not merely called
+    # with an empty/complete stand-in.
+    delta_entry = next(e for e in publish_request.delta_results if e["finding_identity"] == previous_identity)
+    assert delta_entry["evaluation_status"] == "indeterminate"
+    assert delta_entry["delta_status"] is None
+    assert delta_entry["indeterminate_reason"] == "source_partial"
+
+    # (d) the checkpoint disposition itself is UNCHANGED by this relaxation
+    # -- a successful analysis attempt never by itself promotes an
+    # under-covered run's checkpoint to advanced; only genuine full
+    # required-source coverage does.
+    assert result["checkpoint"]["checkpoint_advanced"] is False
+    assert result["checkpoint"]["checkpoint_advance_reason"] == "blocked_missing_required_source"
+    rr.validate_session_window_coverage(result)
