@@ -2834,9 +2834,57 @@ history を保持するため、この限定なしに「毎回 fresh」と一般
 3. **`CLAUDE_CODE_FORK_SUBAGENT=1`**: interactive セッションか `-p` かに関わらず、
    すべての SubAgent が background 実行になる。
 4. **`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`**: background task 機構自体を無効化し、
-   同期的（synchronous）に実行する。
+   同期的（synchronous）に実行する。main-thread Bash tool schema 自体から
+   `run_in_background` フィールドが失われる（auto-backgrounding・Ctrl+B・SubAgent の
+   background 実行を含む background task 機能全体の無効化）。
 
 「省略 = foreground」という単純な断定はしない。
+
+### claude-gpt launcher の background/foreground 実行契約（Issue #2652）
+
+`scripts/claude-gpt/launch.sh` はかつて（Issue #2274 AC13）、実 `claude` 子プロセスに対して
+session-global に `unset CLAUDE_CODE_FORK_SUBAGENT` と `export
+CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` の両方を production invariant として設定していた。
+この disable は GPT-5.3-Codex-Spark delegation（Issue #2186/#2274）の model/evidence causal
+chain を deterministic にする目的（`effective_env_override_reason()` PreToolUse(Agent) gate
+hook が同 invariant からの逸脱を fail-closed で deny していた）に限定して導入されたが、
+実際の影響範囲は Spark 呼び出しに限らず **Claude-GPT session 全体**の Bash tool schema から
+`run_in_background` を削除するという、Spark より広い blast radius を持っていた。
+
+Issue #2651/#2662 で GPT-5.3-Codex-Spark delegation とその authorization gate
+（`SPARK_GATE_WRITER_PY_BEGIN`/`_END`）自体が撤去され、上記 disable の Spark 固有の存在理由は
+消滅した。しかし session-global disable の行自体は撤去されずに残っており、
+`issue-refinement-loop` の canonical Step 2（`root_review_pipeline.produce` を
+`run_in_background: true` で起動し completion notification を待って mandatory join する
+契約、Issue #2610）が Claude-GPT session では実行不能になる、という非互換が発生していた
+（Issue #2652 Background）。
+
+Issue #2652 でこの session-global disable を撤去した。現行の launcher は実 `claude` 子プロセス
+起動直前に以下の両方を明示的に `unset` する（`export ...=1` のような特定値への固定ではない）:
+
+```sh
+unset CLAUDE_CODE_FORK_SUBAGENT
+unset CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
+```
+
+- `unset`（単なる absence 依存ではない）にしているのは、launch 元の親 shell からの ambient
+  export leak が子プロセス環境へ引き継がれることを防ぐため（`CLAUDE_CODE_FORK_SUBAGENT` 側で
+  既に採用していたのと同じ forgery-prevention の理由）。
+- これにより、親 shell の `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` が未設定・`0`・`1` のいずれで
+  あっても、launcher が所有する設定範囲では Claude Code 既定の background 有効状態に収束する。
+- `CLAUDE_CODE_FORK_SUBAGENT` の unset は独立した契約として維持し、`CLAUDE_CODE_DISABLE_
+  BACKGROUND_TASKS` の撤去と一括では扱わない（Issue #2652 Design Direction）。この launcher
+  自体は `CLAUDE_CODE_FORK_SUBAGENT` unset が引き続き必要かどうかを再評価しない。
+
+**launcher が保証できない範囲（阻害要因の明示）**: 上記 `unset` は、この launcher 自身が子
+プロセス環境へ注入する内容のみを制御する。launcher が所有しない設定層（enterprise
+`managed-settings.json`、または launcher 自身の isolated `CLAUDE_CONFIG_DIR`
+（`settings.local.json`。この launcher が毎回生成する内容にはこの変数を含めていない）の外側
+にある Claude Code `settings.json` の `env` block 等）がこの変数を再注入する場合、launcher は
+それを検出・上書きできない。本 Issue の修正時点で確認した限り、本リポジトリの project-scope
+`.claude/settings.json` / `.claude/settings.local.json` はこの変数を参照しておらず、環境上
+`managed-settings.json` も存在しないが、これは launcher が保証する不変条件ではなく、
+launcher の isolation scope 外の外部要因であることを明示しておく。
 
 ### isolation（worktree 分離の適用条件）
 

@@ -35,6 +35,27 @@ evidence layer, not this pre-launch gate hook -- this suite covers only the
 gate hook's pre-launch invariant deny. The PostToolUse-status classification
 helper itself is tracked as remaining work for this Issue and is
 intentionally NOT asserted here (no SKIP/placeholder substitute for it).
+
+Issue #2652 update: the gate hook described above (and therefore the AC13
+`test_invariant_*` behavioral tests exercising it) was retired in Issue
+#2651/#2662 -- see the `gate_script_source` fixture below, which now skips
+every test depending on it. Separately, the static, non-Spark regression
+check on `launch.sh`'s own unconditional pre-launch exports for the real
+`claude` child process (formerly named
+`test_launch_sh_exports_production_invariant_before_child_process_launch`,
+renamed below to
+`test_launch_sh_restores_effective_background_capability_before_child_process_launch`)
+is UPDATED (not left unaffected) by Issue #2652: it used to pin
+`export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`
+as a positive invariant. That session-global background-task disable had
+no remaining non-Spark justification once the Spark gate above was retired,
+and its blast radius (deleting `Bash.run_in_background` from the schema for
+the entire Claude-GPT session) broke `issue-refinement-loop`'s canonical
+Step 2 background+join contract (Issue #2610) for every Claude-GPT session,
+not just Spark invocations. Issue #2652 retires that disable (`unset`
+instead of `export ...=1`) while keeping `CLAUDE_CODE_FORK_SUBAGENT` unset
+as an independent, unretired contract -- the updated test below asserts
+this new pairing.
 """
 
 from __future__ import annotations
@@ -83,13 +104,13 @@ def gate_script_source() -> str:
     the prior positive-source contract, then skips every test that depends
     on rendering and executing that (now nonexistent) gate script, since
     there is no gate source left to render. This does NOT touch or rewrite
-    the invariant-behavior test bodies below (`test_invariant_*`), nor
-    `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`/`Bash.run_in_background`, nor
-    `test_launch_sh_exports_production_invariant_before_child_process_
-    launch` (a separate, non-Spark, static regression check on launch.sh's
-    unconditional pre-launch exports that is unaffected and still runs) --
-    only this fixture's own extraction-source assertion changes (#2652
-    scope boundary preserved)."""
+    the invariant-behavior test bodies below (`test_invariant_*`) beyond
+    the skip itself. `test_launch_sh_exports_production_invariant_before_
+    child_process_launch` does NOT use this fixture at all (it is a
+    separate, non-Spark, static regression check on launch.sh's own
+    unconditional pre-launch exports) and Issue #2652 DOES update that
+    test's body directly (see module docstring above) -- this fixture's
+    skip has no bearing on it either way."""
     module = _load_module()
     launch_sh_text = LAUNCH_SH.read_text(encoding="utf-8")
     source = module.extract_spark_gate_writer_source(launch_sh_text)
@@ -246,10 +267,40 @@ def test_invariant_settings_layer_reinjection_surfaces_identically_to_shell_expo
     assert _reason(result) == "background_execution_invariant_violation"
 
 
-def test_launch_sh_exports_production_invariant_before_child_process_launch():
-    # Static regression: the launcher itself must pin the invariant for the
-    # real `claude` child process (previously only CLAUDE_CODE_SUBAGENT_MODEL
-    # was unset; CLAUDE_CODE_DISABLE_BACKGROUND_TASKS was never set at all).
+def test_launch_sh_restores_effective_background_capability_before_child_process_launch():
+    # Static regression (Issue #2652): the launcher must no longer disable
+    # Claude Code's background task mechanism session-globally for the real
+    # `claude` child process. Doing so used to delete `run_in_background`
+    # from the Bash tool schema for the ENTIRE Claude-GPT session --
+    # breaking issue-refinement-loop's canonical Step 2 background-launch +
+    # mandatory completion-join contract (Issue #2610) -- for a Spark-only
+    # deterministic-evidence concern (Issue #2274 AC13) that no longer has
+    # a gate to protect (Issue #2651/#2662 retired the Spark authorization
+    # gate and the delegation itself). `CLAUDE_CODE_FORK_SUBAGENT` unset is
+    # an INDEPENDENT, unretired contract per Issue #2652 Design Direction
+    # (not bulk-deleted alongside the background-task disable).
+    #
+    # Both variables must be explicitly `unset` (not merely absent from the
+    # script, and not merely deleted-without-replacement) so that a leaked
+    # ambient export from the launching parent shell cannot survive into
+    # the child `claude` process's environment regardless of the parent
+    # shell's own value for `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`
+    # (unset / `0` / `1`) -- Issue #2652 AC2.
     launch_sh_text = LAUNCH_SH.read_text(encoding="utf-8")
     assert "unset CLAUDE_CODE_FORK_SUBAGENT" in launch_sh_text
-    assert "export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1" in launch_sh_text
+    assert "unset CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" in launch_sh_text
+    # Guard against reintroducing the retired session-global disable as an
+    # actual executable statement (Verification Guidance: "launcher が不要な
+    # session-global background disable を再導入しない"). Checked line-by-line
+    # (not a raw substring-of-the-whole-file check) so that this guard
+    # cannot be defeated by wrapping the executable line in a comment, and
+    # so that comments elsewhere in this file discussing the retired
+    # `export ...=1`/`=0` forms (for historical/rationale context) never
+    # false-positive this regression check.
+    executable_lines = [
+        line.split("#", 1)[0].strip()
+        for line in launch_sh_text.splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    assert "export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1" not in executable_lines
+    assert "export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=0" not in executable_lines
