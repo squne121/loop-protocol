@@ -2352,6 +2352,28 @@ def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
 #   windowing below therefore scopes by a bounded stream-index SPAN
 #   (bounded by consecutive Bash tool_use lines), never by strict
 #   cluster-adjacency.
+# - Issue #2663 AC5 live-trial fix_delta (post-merge repeated-trial
+#   instability report): a hook's ``hook_response`` can itself be flushed
+#   to the JSON stream AFTER the NEXT Bash tool_use line entirely -- not
+#   merely interleaved with rate_limit_event noise INSIDE its own window,
+#   but genuinely crossing the window boundary. Confirmed live in a
+#   multi-Bash-call trial where ALL 5 ``hook_response`` records for the
+#   FIRST Bash call's PreToolUse/Bash cohort (4 project sibling hooks +
+#   this runner's own additive observer) were only flushed to the stream
+#   AFTER the SECOND Bash tool_use line -- leaving the first call's own
+#   window-span with zero ``hook_response`` records at all (spuriously
+#   reading as ``observer_self_echo_not_uniquely_identified`` /
+#   ``observed_count: 0``) while the second call's window-span absorbed
+#   those 5 records as spurious ``unmatched_hook_response`` noise on top
+#   of its own genuine 5. ``hook_started`` itself was NOT observed to
+#   drift across a window boundary in that same trial (it is emitted at
+#   the moment the hook gate begins, structurally tied to its own tool
+#   call) -- only a completed hook's RESPONSE flush timing is unreliable
+#   under load. Pairing below is therefore GLOBAL (keyed by ``hook_id``
+#   across the WHOLE PreToolUse/Bash record stream, never window-scoped),
+#   and each resulting pair (or true orphan/dangling record) is attributed
+#   to a window by its own ``hook_started``'s stream_index -- never by
+#   wherever the paired ``hook_response`` physically landed.
 # ---------------------------------------------------------------------------
 
 
@@ -2469,33 +2491,67 @@ def _claude_bash_tool_use_events(stdout: str) -> list[dict]:
     return results
 
 
-def _evaluate_hook_chain_window(records: list[dict], expected_count: int) -> dict:
+def _pair_pretool_hook_records_globally(records: list[dict]) -> dict:
+    """Global (never window-scoped) ``hook_started``/``hook_response``
+    pairing by ``hook_id`` across the WHOLE PreToolUse/Bash record stream
+    (Issue #2663 AC5 live-trial fix_delta -- see the module-level comment
+    block above ``_pair_pretool_hook_records_globally``'s call site for the
+    confirmed-live counter-example this exists to tolerate).
+
+    Only ``subtype == "hook_started"`` and ``subtype == "hook_response"``
+    records with a non-empty ``hook_id`` participate. A duplicate
+    ``hook_started`` re-announcement for the same ``hook_id`` (AC6(b)) is
+    NOT double-counted -- the first (earliest stream_index) announcement is
+    the pairing anchor. A ``hook_response`` whose ``hook_id`` has no
+    corresponding ``hook_started`` anywhere in ``records`` -- or a SECOND
+    ``hook_response`` for an already-paired ``hook_id`` -- is an orphan,
+    never silently counted as evidence (AC6(a)).
+
+    Returns ``{"paired": [{"started": rec, "response": rec}, ...],
+    "orphan_responses": [rec, ...]}``; a ``hook_started`` that never
+    receives ANY matching ``hook_response`` simply produces no pair (its
+    own window naturally under-counts ``observed_count``, matching prior
+    "missing_handler_evidence" behavior)."""
+    started_by_id: dict[str, dict] = {}
+    for r in records:
+        if (
+            r["subtype"] == "hook_started"
+            and r["hook_id"]
+            and r["hook_event"] == _HOOK_CHAIN_EVIDENCE_EVENT
+        ):
+            started_by_id.setdefault(r["hook_id"], r)
+
+    paired: list[dict] = []
+    orphan_responses: list[dict] = []
+    claimed_hook_ids: set[str] = set()
+    for r in records:
+        if r["subtype"] != "hook_response" or r["hook_event"] != _HOOK_CHAIN_EVIDENCE_EVENT:
+            continue
+        hook_id = r["hook_id"]
+        if hook_id and hook_id in started_by_id and hook_id not in claimed_hook_ids:
+            paired.append({"started": started_by_id[hook_id], "response": r})
+            claimed_hook_ids.add(hook_id)
+        else:
+            orphan_responses.append(r)
+    return {"paired": paired, "orphan_responses": orphan_responses}
+
+
+def _evaluate_hook_chain_window(paired: list[dict], unmatched_response_count: int, expected_count: int) -> dict:
     """Evaluate one PreToolUse/Bash scenario window (Issue #2663 AC2/AC6).
 
-    ``records`` is every PreToolUse/Bash hook record whose stream_index
-    falls within one Bash ``tool_use`` event's bounded span (see
-    ``evaluate_all_matching_hooks_observed``), already restricted to
-    ``hook_event == _HOOK_CHAIN_EVIDENCE_EVENT`` records by the caller. A
-    sibling hook's
-    evidence only counts as OBSERVED when a ``hook_started`` AND a later
-    ``hook_response`` share the SAME ``hook_id`` within this window -- a
-    ``hook_response`` with no matching ``hook_started`` (or vice versa) is
-    dropped as unmatched/anomalous, never silently counted (Issue #2663
-    AC6(a)/(h): a masked "same total count, one missing + one unattributed"
-    substitution must not read as PASS)."""
-    started_ids = {
-        r["hook_id"] for r in records
-        if r["subtype"] == "hook_started" and r["hook_id"] and r["hook_event"] == _HOOK_CHAIN_EVIDENCE_EVENT
-    }
-    responses = [
-        r for r in records
-        if r["subtype"] == "hook_response" and r["hook_event"] == _HOOK_CHAIN_EVIDENCE_EVENT
-    ]
-    matched = [r for r in responses if r["hook_id"] and r["hook_id"] in started_ids]
-    unmatched_response_count = len(responses) - len(matched)
-
-    self_echo = [r for r in matched if r["is_self_echo"]]
-    non_observer = [r for r in matched if not r["is_self_echo"]]
+    ``paired`` is every GLOBALLY hook_id-matched ``{"started", "response"}``
+    pair whose ``started`` record's stream_index falls within this window's
+    bounded span (see ``evaluate_all_matching_hooks_observed`` and
+    ``_pair_pretool_hook_records_globally``) -- attribution never depends on
+    where the paired ``response`` physically landed. ``unmatched_response_
+    count`` is the count of orphan ``hook_response`` records (no
+    corresponding ``hook_started`` anywhere in the whole stream) whose OWN
+    stream_index falls within this window -- a ``hook_response`` with no
+    matching ``hook_started`` is dropped as unmatched/anomalous, never
+    silently counted (Issue #2663 AC6(a)/(h): a masked "same total count,
+    one missing + one unattributed" substitution must not read as PASS)."""
+    self_echo = [p for p in paired if p["response"]["is_self_echo"]]
+    non_observer = [p for p in paired if not p["response"]["is_self_echo"]]
 
     if len(self_echo) != 1:
         return {
@@ -2505,11 +2561,11 @@ def _evaluate_hook_chain_window(records: list[dict], expected_count: int) -> dic
             "observed_count": len(non_observer),
             "expected_count": expected_count,
             "unmatched_response_count": unmatched_response_count,
-            "denied": any(r["exit_code"] == 2 for r in non_observer),
+            "denied": any(p["response"]["exit_code"] == 2 for p in non_observer),
         }
 
     observed_count = len(non_observer)
-    denied = any(r["exit_code"] == 2 for r in non_observer)
+    denied = any(p["response"]["exit_code"] == 2 for p in non_observer)
 
     if unmatched_response_count > 0:
         return {
@@ -2604,15 +2660,42 @@ def evaluate_all_matching_hooks_observed(stdout: str, worktree: str) -> dict:
         f"{_HOOK_CHAIN_EVIDENCE_EVENT}:{_HOOK_CHAIN_EVIDENCE_TOOL}",
     )
     boundaries = [tu["stream_index"] for tu in bash_tool_uses[1:]] + [None]
+    window_bounds = [
+        (tool_use["stream_index"], upper_bound)
+        for tool_use, upper_bound in zip(bash_tool_uses, boundaries)
+    ]
+
+    def _window_index_for(stream_index: int) -> int | None:
+        for i, (lower, upper) in enumerate(window_bounds):
+            if stream_index > lower and (upper is None or stream_index < upper):
+                return i
+        return None
+
+    # Issue #2663 AC5 live-trial fix_delta: pair hook_started/hook_response
+    # GLOBALLY by hook_id first (never window-scoped -- see
+    # _pair_pretool_hook_records_globally's docstring), then attribute each
+    # resulting pair to a window using its OWN hook_started's stream_index.
+    # A response that physically lands after the NEXT Bash tool_use's line
+    # (confirmed live) is therefore still correctly attributed to the call
+    # that actually triggered it, never to whichever window it happened to
+    # land in.
+    pairing = _pair_pretool_hook_records_globally(all_pretool_bash_records)
+    per_window_paired: list[list[dict]] = [[] for _ in window_bounds]
+    per_window_unmatched_response_count: list[int] = [0 for _ in window_bounds]
+    for pair in pairing["paired"]:
+        idx = _window_index_for(pair["started"]["stream_index"])
+        if idx is not None:
+            per_window_paired[idx].append(pair)
+    for orphan_response in pairing["orphan_responses"]:
+        idx = _window_index_for(orphan_response["stream_index"])
+        if idx is not None:
+            per_window_unmatched_response_count[idx] += 1
 
     window_results: list[dict] = []
-    for tool_use, upper_bound in zip(bash_tool_uses, boundaries):
-        lower = tool_use["stream_index"]
-        window_records = [
-            r for r in all_pretool_bash_records
-            if r["stream_index"] > lower and (upper_bound is None or r["stream_index"] < upper_bound)
-        ]
-        window_results.append(_evaluate_hook_chain_window(window_records, expected_count))
+    for i in range(len(window_bounds)):
+        window_results.append(_evaluate_hook_chain_window(
+            per_window_paired[i], per_window_unmatched_response_count[i], expected_count
+        ))
 
     if any(w["status"] == "fail" for w in window_results):
         overall_status = "fail"

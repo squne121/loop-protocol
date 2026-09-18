@@ -2913,6 +2913,65 @@ class TestEvaluateAllMatchingHooksObserved:
         assert result["status"] == "unverified"
         assert result["reason"] == "project_settings_unreadable"
 
+    def test_first_call_responses_flushed_after_second_call_boundary_still_attributed_correctly(
+        self, tmp_path: Path,
+    ) -> None:
+        """Issue #2663 AC5 live-trial fix_delta regression: a repeated
+        ``--require-hook-chain-evidence`` live trial against the SAME
+        committed HEAD flipped PASS -> FAIL because the first Bash call's 5
+        ``hook_response`` records (4 project sibling hooks + this runner's
+        own observer) were only flushed to the JSON stream AFTER the
+        SECOND Bash tool_use line -- their ``hook_started`` records
+        remained correctly positioned in the first call's own window.
+        Under the old strict window-span filtering (bounding BOTH
+        ``hook_started`` and ``hook_response`` by the same span), this
+        produced a spurious ``observer_self_echo_not_uniquely_identified``
+        for window 0 (0 records observed at all) and a spurious
+        ``unmatched_hook_response`` (5 extra) for window 1. Global hook_id
+        pairing attributed by the ``hook_started``'s own stream_index must
+        read this as two fully-observed, correctly-attributed windows."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        positive_sibling_ids = ["H1", "H2", "H3", "H4"]
+        deny_sibling_ids = ["H5", "H6", "H7", "H8"]
+        lines = [
+            _system_init_line(),
+            _hc_bash_tool_use_line("tu-pos", command="echo hi"),
+        ]
+        for hid in ["OBS", *positive_sibling_ids]:
+            lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+        lines.append(_hc_bash_tool_use_line("tu-deny", command="env"))
+        for hid in ["OBS2", *deny_sibling_ids]:
+            lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+        # The first call's own hook_response records are flushed late --
+        # physically AFTER the second Bash tool_use line, inside what a
+        # naive span-filter would treat as window 1's own span.
+        lines.append(_hc_hook_response_line(
+            "OBS", "PreToolUse", self_echo_payload=_hc_pretool_observer_payload("tu-pos", command="echo hi")
+        ))
+        for hid in positive_sibling_ids:
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=0))
+        # The second call's own hook_response records follow, in-window as
+        # normal.
+        lines.append(_hc_hook_response_line(
+            "OBS2", "PreToolUse", self_echo_payload=_hc_pretool_observer_payload("tu-deny", command="env")
+        ))
+        for hid in deny_sibling_ids:
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=2 if hid == "H7" else 0))
+        lines.append(_hc_bash_tool_result_line("tu-deny"))
+        lines.append(_result_event_line())
+
+        result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+        assert result["status"] == "pass"
+        assert result["passed"] is True
+        assert result["positive_window_count"] == 1
+        assert result["deny_window_count"] == 1
+        assert result["windows"][0]["status"] == "pass"
+        assert result["windows"][0]["observed_count"] == 4
+        assert result["windows"][1]["status"] == "pass"
+        assert result["windows"][1]["observed_count"] == 4
+        assert result["windows"][1]["denied"] is True
+
 
 class TestEvaluateSiblingSideEffectInventory:
     """Issue #2663 AC3/AC6: sibling_side_effect_inventory_complete verdict."""
