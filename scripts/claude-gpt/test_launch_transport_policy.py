@@ -216,6 +216,19 @@ def test_launch_sh_env_i_invocation_references_transport_policy():
     assert 'CCP_CODEX_TRANSPORT=$CLAUDE_GPT_CODEX_TRANSPORT_POLICY' in content
 
 
+def test_launch_sh_env_i_invocation_references_auto_review_model_policy():
+    """GIVEN launch.sh の実 proxy env -i invocation
+    WHEN 内容を読む
+    THEN CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY を参照する CCP_AUTO_REVIEW_MODEL 行が
+    存在する（Issue #2654。lib.sh の claude_gpt_build_proxy_env() ヘルパーは
+    この実 invocation とは独立した並行実装であり、参照するだけでは実行時に
+    反映されないため、実 invocation 側にも同じ source of truth 定数を直接渡す
+    必要がある）
+    """
+    content = LAUNCH_SH.read_text(encoding="utf-8")
+    assert 'CCP_AUTO_REVIEW_MODEL=$CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY' in content
+
+
 def test_build_proxy_env_helper_references_same_transport_policy_constant():
     """GIVEN lib.sh の claude_gpt_build_proxy_env()
     WHEN 内容を読む
@@ -228,6 +241,35 @@ def test_build_proxy_env_helper_references_same_transport_policy_constant():
     body = content[start:end]
     assert "CLAUDE_GPT_CODEX_TRANSPORT_POLICY" in body
     assert "CCP_CODEX_TRANSPORT=" in body
+
+
+def test_auto_review_model_policy_constant_defined_exactly_once_in_lib_sh():
+    """GIVEN lib.sh
+    WHEN CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-5.6-terra" の行を数える
+    THEN 無条件定数として一つだけ存在する（Issue #2654 Outcome (a)）
+    """
+    content = LIB_SH.read_text(encoding="utf-8")
+    matches = [
+        line
+        for line in content.splitlines()
+        if line.strip() == 'CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-5.6-terra"'
+    ]
+    assert len(matches) == 1
+
+
+def test_build_proxy_env_helper_references_auto_review_model_policy_constant():
+    """GIVEN lib.sh の claude_gpt_build_proxy_env()
+    WHEN 内容を読む
+    THEN CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY を参照する CCP_AUTO_REVIEW_MODEL 出力行が
+    存在する（Issue #2654: 未設定時 upstream proxy が classifier request を
+    無条件で gpt-5.6-luna へ fallback するデフォルトを、明示設定で上書きする）
+    """
+    content = LIB_SH.read_text(encoding="utf-8")
+    start = content.index("claude_gpt_build_proxy_env() {")
+    end = content.index("\n}", start)
+    body = content[start:end]
+    assert "CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY" in body
+    assert "CCP_AUTO_REVIEW_MODEL=" in body
 
 
 def test_default_check_only_settings_exclude_runtime_smoke_peer_policy(tmp_path):
@@ -307,6 +349,30 @@ def test_transport_override_applies_even_without_parent_env_set(tmp_path):
     assert captured.get("CCP_CODEX_TRANSPORT") == "http"
 
 
+@pytest.mark.parametrize(
+    "extra_env",
+    [
+        pytest.param(None, id="parent_env_unset"),
+        pytest.param({"CCP_AUTO_REVIEW_MODEL": "gpt-5.6-luna"}, id="parent_env_overridden"),
+    ],
+)
+def test_auto_review_model_override_reaches_child_env_as_terra(tmp_path, extra_env):
+    """GIVEN 親 env に CCP_AUTO_REVIEW_MODEL が未設定、または他の値
+    （例: gpt-5.6-luna）で設定されている
+    WHEN launch.sh --check-only を実行する
+    THEN fake proxy が capture した child env の CCP_AUTO_REVIEW_MODEL は
+    どちらのケースでも "gpt-5.6-terra" になる（Issue #2654: launcher-owned な
+    CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY が、親 env の有無・値に関わらず優先
+    される実効値を検証する。静的な定義行 grep だけでは、この実効値が
+    意図せず上書きされても検知できない）
+    """
+    result = _run_check_only(tmp_path, extra_env=extra_env)
+    assert result.returncode == 0, result.stderr
+
+    captured = _read_captured_env(tmp_path)
+    assert captured.get("CCP_AUTO_REVIEW_MODEL") == "gpt-5.6-terra"
+
+
 # --- unrelated parent variables の scrub 確認（AC4） -----------------------------
 
 
@@ -355,6 +421,7 @@ def test_child_env_contains_only_expected_allowlist_keys(tmp_path):
         "CCP_BIND_ADDRESS",
         "CCP_LOG_STDERR",
         "CCP_CODEX_TRANSPORT",
+        "CCP_AUTO_REVIEW_MODEL",
     }
     # LC_CTYPE は CPython インタプリタ自身が起動時に行う locale coercion（PEP 538/540）
     # により fake proxy プロセス自身の os.environ へ自己追加されることがある値であり、
