@@ -466,16 +466,29 @@ def test_canonical_executor_preserves_gh_config_dir_to_root_github_probes_before
     ]
 
 
-def test_canonical_executor_blocks_unsupported_operation_and_required_forbidden_spark_before_inner_starts(
+def test_canonical_executor_blocks_unsupported_operation_before_inner_starts(
     tmp_path: Path,
 ) -> None:
     """Real subprocess boundary proof for verification requirements 1, 3,
     and 4 of PR #2320 review's minimum 6 cases: the canonical executor
-    carries the invocation-scoped `LOOP_*` capability request through to
-    the real producer (proven by the SPECIFIC `unsupported_operation` and
-    `spark:unavailable` reason strings only the real producer, having
+    carries the invocation-scoped `LOOP_PLANNED_OPERATIONS_JSON` capability
+    request through to the real producer (proven by the SPECIFIC
+    `unsupported_operation` reason string only the real producer, having
     actually received this exact request, would emit), and
-    `run_refinement_preflight.py` is never started."""
+    `run_refinement_preflight.py` is never started.
+
+    Issue #2651 OWNER review fix_delta
+    (https://github.com/squne121/loop-protocol/pull/2662#issuecomment-5736035898
+    P1 blocker 1): `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` are deliberately
+    NOT set here any more. This test used to set them alongside the
+    unsupported-operation request to prove they never reached the real
+    producer, but the canonical executor now rejects a legacy Spark
+    request on its OWN input boundary BEFORE any producer dispatch at all
+    (see `test_control_plane_worktree_bootstrap.
+    test_given_legacy_spark_env_when_preflight_run_dispatched_then_retired_rejection_and_no_inner_dispatch`),
+    so setting them here would make this test observe THAT rejection
+    instead of the unsupported-operation route it exists to prove. This
+    test now stays scoped to the unsupported-operation route alone."""
     repo = _make_repo(tmp_path)
     _install_real_capability_preflight_fixture(repo)
     inner_marker = tmp_path / "inner-ran.marker"
@@ -484,8 +497,6 @@ def test_canonical_executor_blocks_unsupported_operation_and_required_forbidden_
         repo,
         inner_marker,
         extra_env={
-            "LOOP_SPARK_MODE": "required",
-            "LOOP_SPARK_FALLBACK": "forbidden",
             "LOOP_PLANNED_OPERATIONS_JSON": json.dumps(
                 [
                     {
@@ -518,7 +529,9 @@ def test_canonical_executor_blocks_unsupported_operation_and_required_forbidden_
         "definitely_unsupported_operation_xyz" in blocker and "operation_route_unavailable" in blocker
         for blocker in parsed["blockers"]
     ), parsed["blockers"]
-    assert any(blocker.startswith("spark:unavailable") for blocker in parsed["blockers"]), parsed["blockers"]
+    # Issue #2651: no spark:* blocker is ever produced any more -- the env
+    # var never reached the real producer (see docstring).
+    assert not any(blocker.startswith("spark:") for blocker in parsed["blockers"]), parsed["blockers"]
     assert not inner_marker.exists(), "run_refinement_preflight.py must never have started"
 
 

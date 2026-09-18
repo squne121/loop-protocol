@@ -10,10 +10,16 @@ This module judges, SEPARATELY:
     `scripts/agent-guards/trusted_runtime_capabilities.py`, which itself
     delegates to the canonical `skill_runtime_exec` resolver -- no second
     resolver is introduced here)
-  - Spark delegation route capability (`not_required` / `eligible` /
-    `fallback_only` / `unavailable`) -- a static, observable-config based
-    judgment, NOT a runtime model-identity proof (that remains Child A
-    `#2274`'s `resolvedModel`-based responsibility)
+  - Spark delegation route capability: RETIRED (Issue #2651).
+    `spark_mode`/`spark_fallback` remain accepted keyword-only arguments on
+    `assess()` for byte-for-byte call-signature compatibility with existing
+    ordinary callers that pass `spark_mode=None` (e.g.
+    `test_timeout_taxonomy_compat.py`,
+    `scripts/agent-guards/tests/test_capability_artifact_sanitization.py`),
+    but any NON-None `spark_mode` now produces a deterministic
+    `"retired"` verdict -- never a live binary/auth-based
+    eligible/fallback_only judgment, and never a silent fallback to a
+    different model/agent.
   - GitHub READ capability (`gh auth status` + a repository read probe)
   - GitHub WRITE (mutation) capability, evaluated PER planned operation
     (`phase`/`actor_role`/`operation`) against a small, invocation-scoped
@@ -109,9 +115,12 @@ DECISION_DEGRADED = "degraded"
 DECISION_BLOCKED = "blocked"
 
 SPARK_NOT_REQUIRED = "not_required"
-SPARK_ELIGIBLE = "eligible"
-SPARK_FALLBACK_ONLY = "fallback_only"
-SPARK_UNAVAILABLE = "unavailable"
+# Issue #2651: GPT-5.3-Codex-Spark delegation is retired. `SPARK_ELIGIBLE` /
+# `SPARK_FALLBACK_ONLY` / `SPARK_UNAVAILABLE` (the live binary/auth-based
+# judgment enum) are removed; any non-None `spark_mode` now maps
+# deterministically to `SPARK_RETIRED` regardless of proxy binary/ChatGPT
+# auth availability.
+SPARK_RETIRED = "retired"
 
 # Issue #2340 AC2: actor/execution-substrate-scoped capability status enum.
 # Distinct from the overall `decision` enum (`ready`/`degraded`/`blocked`) --
@@ -206,11 +215,24 @@ def _run_probe_with_deadline(
 
 
 def _run_env_only_preflight(deadline_ns: int | None = None) -> ProbeOutcome | dict:
-    """Run the Spark environment probe under the common deadline.
+    """Run `preflight.sh --env-only` under the common deadline.
+
+    Issue #2651: this probe's `binary_available`/`chatgpt_auth` payload is
+    NO LONGER consulted by `assess()`'s Spark decision (Spark delegation is
+    retired -- see `_spark_status()`). The function itself is kept, byte-
+    for-byte name-compatible, only because it is a pinned direct-monkeypatch
+    target of an existing ordinary caller outside this Issue's Allowed
+    Paths (`scripts/agent-guards/tests/test_capability_artifact_
+    sanitization.py`, which calls `assess(spark_mode=None, ...)` and would
+    raise `AttributeError` from `monkeypatch.setattr` if this name were
+    removed, even though that call path never actually invokes it). It
+    remains a legitimate direct diagnostic utility (proxy binary / ChatGPT
+    auth environment observability is not itself a Spark selection/dispatch
+    decision) -- it is simply no longer wired into the retired route.
 
     The no-argument dictionary return is retained only for existing direct
-    diagnostic callers; assessment always supplies its shared deadline and
-    receives the typed outcome.
+    diagnostic callers; assessment (when it ever called this) always
+    supplied its shared deadline and received the typed outcome.
     """
     compatibility_mode = deadline_ns is None
     deadline_ns = _local_deadline_ns() if deadline_ns is None else deadline_ns
@@ -233,14 +255,11 @@ def _run_env_only_preflight(deadline_ns: int | None = None) -> ProbeOutcome | di
 
 
 def _validate_spark_env_payload(parsed: object) -> bool:
-    """Validate only the Spark JSON fields `_spark_capability()` consumes
-    (Issue #2401 AC3): `binary_available: bool`, `chatgpt_auth: object`,
-    `chatgpt_auth.available: bool`. Any other malformed/invalid shape
-    (non-dict top level, non-bool `binary_available`, missing/non-dict
-    `chatgpt_auth`, non-bool `chatgpt_auth.available`) is rejected here so
-    the caller can normalize it into the existing structured
-    malformed-output reason instead of risking an uncaught exception later
-    (e.g. `.get()` on a non-dict `chatgpt_auth` value)."""
+    """Validate the `preflight.sh --env-only` JSON shape
+    (`binary_available: bool`, `chatgpt_auth.available: bool`). Kept
+    alongside `_run_env_only_preflight()` for the same pinned-caller
+    name-compatibility reason documented on that function; no longer
+    consulted by `assess()`'s retired Spark decision."""
     if not isinstance(parsed, dict):
         return False
     if not isinstance(parsed.get("binary_available"), bool):
@@ -253,29 +272,17 @@ def _validate_spark_env_payload(parsed: object) -> bool:
     return True
 
 
-def _spark_capability(
-    spark_mode: str | None,
-    spark_fallback: str | None,
-    env_only_result: dict,
-) -> str:
-    """Judge Spark route capability from a caller-declared directive
-    (`spark_mode`/`spark_fallback`) plus observable proxy binary/auth
-    state. This is a "no known blocking reason" judgment, not a runtime
-    model-identity proof (Issue #2273 In Scope note)."""
+def _spark_status(spark_mode: str | None) -> str:
+    """Judge Spark route status from a caller-declared directive
+    (`spark_mode`) alone (Issue #2651: GPT-5.3-Codex-Spark delegation is
+    retired). No live binary/auth probe is run for Spark any more -- a
+    non-None `spark_mode` (`required`/`preferred`, regardless of
+    `spark_fallback`) always maps to `SPARK_RETIRED`, never to a
+    live-observed eligible/fallback_only judgment and never to a silent
+    fallback."""
     if not spark_mode:
         return SPARK_NOT_REQUIRED
-
-    binary_available = bool(env_only_result.get("binary_available"))
-    auth_available = bool(env_only_result.get("chatgpt_auth", {}).get("available"))
-    known_blocking_reason = not (binary_available and auth_available)
-
-    if not known_blocking_reason:
-        return SPARK_ELIGIBLE
-
-    if spark_fallback == "allowed":
-        return SPARK_FALLBACK_ONLY
-    # spark_fallback == "forbidden" (or unspecified/malformed): fail closed.
-    return SPARK_UNAVAILABLE
+    return SPARK_RETIRED
 
 
 def _github_auth_probe(deadline_ns: int) -> ProbeOutcome:
@@ -403,29 +410,26 @@ def _delegated_research_agy_capability() -> dict:
 
 
 def _spark_delegation_capability(spark_status: str) -> dict:
-    """Actor-scoped entry (Issue #2340 AC2): maps the existing
-    `_spark_capability()` verdict onto the shared ready/degraded/unavailable
-    enum (no new Spark judgment logic -- AC4/AC5 lazy-fallback semantics are
-    unchanged)."""
-    if spark_status in (SPARK_NOT_REQUIRED, SPARK_ELIGIBLE):
+    """Actor-scoped entry (Issue #2340 AC2, retired by Issue #2651): maps
+    `_spark_status()`'s verdict onto the shared ready/degraded/unavailable
+    enum. `SPARK_NOT_REQUIRED` (ordinary callers, `spark_mode=None`) always
+    reports ready -- no regression for callers that never requested Spark.
+    Any non-None `spark_mode` (`SPARK_RETIRED`) always reports unavailable
+    with a `spark_delegation_retired` reason -- there is no more
+    fallback_only/degraded state, and no live binary/auth probe result can
+    ever promote it back to ready."""
+    if spark_status == SPARK_NOT_REQUIRED:
         return {
             "status": ACTOR_CAPABILITY_READY,
             "reason_code": None,
             "fallback_route": None,
-            "probe_execution_class": "spark_directive_env_probe",
-        }
-    if spark_status == SPARK_FALLBACK_ONLY:
-        return {
-            "status": ACTOR_CAPABILITY_DEGRADED,
-            "reason_code": "spark_fallback_only",
-            "fallback_route": "non_spark_agent",
-            "probe_execution_class": "spark_directive_env_probe",
+            "probe_execution_class": "spark_directive_retired_probe",
         }
     return {
         "status": ACTOR_CAPABILITY_UNAVAILABLE,
-        "reason_code": "spark_unavailable",
+        "reason_code": "spark_delegation_retired",
         "fallback_route": None,
-        "probe_execution_class": "spark_directive_env_probe",
+        "probe_execution_class": "spark_directive_retired_probe",
     }
 
 
@@ -524,12 +528,12 @@ def assess(
             "provisioned uv; see docs/dev/claude-gpt-runtime-prerequisites.md"
         )
 
-    # Issue #2401 AC1: the required GitHub probes (`github_auth`, then
-    # `github_repo_read` only when `github_auth` completed) and the
-    # `controlled_github_read` probe (run independently of the root
-    # `github_auth`/`github_repo_read` outcome) all run BEFORE the optional
-    # `spark_env_only` probe below, so a slow/starved optional probe can
-    # never consume the shared deadline budget a required probe needs.
+    # Issue #2401 AC1 (Spark probe retired by Issue #2651): the required
+    # GitHub probes (`github_auth`, then `github_repo_read` only when
+    # `github_auth` completed) and the `controlled_github_read` probe (run
+    # independently of the root `github_auth`/`github_repo_read` outcome)
+    # never share their deadline budget with a Spark probe any more --
+    # there is no live Spark probe in the decision path at all now.
     github_auth_outcome = _github_auth_probe(deadline_ns)
     _append_probe_reason(reasons, "github_auth", github_auth_outcome)
     github_auth = github_auth_outcome.kind == PROBE_COMPLETED
@@ -573,42 +577,18 @@ def assess(
                 f"{entry.get('actor_role', 'unknown')}; do not start this mutation-requiring phase"
             )
 
-    # Optional Spark probe LAST (Issue #2401 AC1/AC2): it must never starve
-    # a required probe's share of the shared deadline. When the required
-    # probes above already consumed the deadline, this probe legitimately
-    # degrades (no spawn once exhausted -- see `_run_probe_with_deadline`)
-    # rather than blocking the required GitHub capability it did not affect.
-    if spark_mode is None:
-        spark_status = SPARK_NOT_REQUIRED
-    else:
-        spark_outcome = _run_env_only_preflight(deadline_ns)
-        if spark_outcome.kind == PROBE_COMPLETED:
-            try:
-                parsed_spark_payload = json.loads(spark_outcome.stdout)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                spark_outcome = ProbeOutcome(PROBE_MALFORMED_OUTPUT)
-                env_only_result = {}
-            else:
-                if _validate_spark_env_payload(parsed_spark_payload):
-                    env_only_result = parsed_spark_payload
-                else:
-                    spark_outcome = ProbeOutcome(PROBE_MALFORMED_OUTPUT)
-                    env_only_result = {}
-        else:
-            env_only_result = {}
-        _append_probe_reason(reasons, "spark_env_only", spark_outcome)
-        spark_status = _spark_capability(spark_mode, spark_fallback, env_only_result)
-    if spark_status == SPARK_UNAVAILABLE:
+    # Issue #2651: GPT-5.3-Codex-Spark delegation is retired. A caller-
+    # declared `spark_mode` is judged deterministically from the directive
+    # alone (`_spark_status()`) -- no live binary/auth probe is spawned for
+    # it any more (the former `spark_env_only` probe / deadline-sharing
+    # concern from Issue #2401 no longer applies to this decision).
+    spark_status = _spark_status(spark_mode)
+    if spark_status == SPARK_RETIRED:
         reasons.append(
-            "spark:unavailable: required Spark delegation route has no known-available "
-            "binary/auth and fallback is forbidden by the directive; do not launch the "
-            "SubAgent until the Spark route (claude-code-proxy binary + ChatGPT "
-            "subscription auth) is available, or relax the directive to preferred/allowed"
-        )
-    elif spark_status == SPARK_FALLBACK_ONLY:
-        reasons.append(
-            "spark:fallback_only: Spark route is not currently available; the directive "
-            "permits fallback so the workflow may proceed in degraded mode"
+            "spark:retired: GPT-5.3-Codex-Spark delegation has been retired from this "
+            "repository (Issue #2651); this workflow no longer selects or falls back to "
+            "it -- remove the spark_mode/spark_fallback directive and use an ordinary "
+            "SubAgent instead"
         )
 
     actor_capabilities = {
@@ -620,10 +600,8 @@ def assess(
 
     if missing_mutation_route or not github_auth or not github_repo_read or controlled_github_unavailable:
         decision = DECISION_BLOCKED
-    elif not uv_ok or spark_status == SPARK_UNAVAILABLE:
+    elif not uv_ok or spark_status == SPARK_RETIRED:
         decision = DECISION_BLOCKED
-    elif spark_status == SPARK_FALLBACK_ONLY:
-        decision = DECISION_DEGRADED
     else:
         decision = DECISION_READY
 

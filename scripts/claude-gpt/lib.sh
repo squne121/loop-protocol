@@ -714,51 +714,17 @@ claude_gpt_reject_if_under_repo() {
   return 0
 }
 
-# --- Spark custom SubAgent（Issue #2186, Parent #2154 Gate1/Gate2 準拠）---
+# --- GPT-5.3-Codex-Spark delegation route: retired（Issue #2651）---
 #
-# `spark-codex` は claude-gpt session にだけ `--agents` フラグ経由で session-local
-# 登録する custom SubAgent。`.claude/agents/spark-codex.md` は意図的に作らない
-# （project scope の agent 定義は Native session にも露出するため。Issue #2186
-# Gate1 採用済み設計）。`model` に非 Anthropic full model ID
-# （`gpt-5.3-codex-spark`）を渡すことで、その SubAgent 単体の推論だけが proxy 経由で
-# Codex backend へ route され、parent session の model は変化しない（Gate2 live
-# canary 実証済み）。Spark は text-only research preview であり、通常 profile の
-# `[1m]`/272k context suffix・閾値を継承しない（source document context ceiling は
-# 128K。Issue #2186 Background）。
-CLAUDE_GPT_SPARK_AGENT_NAME="spark-codex"
-CLAUDE_GPT_SPARK_MODEL="gpt-5.3-codex-spark"
-
-# claude_gpt_spark_agent_prompt: spark-codex custom SubAgent の system prompt 本文。
-# 通常 profile の main model 切替や自律呼び出しではなく、user の current-turn
-# 明示 `@agent-spark-codex` mention の後にだけ authorization gate を通って起動する
-# delegate であることを明記する。
-claude_gpt_spark_agent_prompt() {
-  printf 'You are spark-codex, an explicit-only GPT-5.3-Codex-Spark delegate SubAgent. You are only ever invoked when the user has written the canonical @agent-spark-codex mention in their current turn and an explicit-only fail-closed authorization gate (UserPromptSubmit -> PreToolUse(Agent) -> consume) has allowed exactly this one invocation. You are text-only (no image/web-search capability) and must treat your context ceiling as a conservative 128K (do not assume the ordinary profile 272K/[1m] budget). Report failures explicitly to the parent; never silently fall back to another model.
-'
-}
-
-# claude_gpt_spark_agents_json_fragment: `--agents` フラグへ渡す session-local JSON
-# 本体を返す（このセッションだけに spark-codex を登録し、project `.claude/agents/**`
-# の既存12定義・Native session には一切影響しない）。
-#
-# `disallowedTools`（Issue #2186 P2 fix-delta, PR #2244 adversarial review）:
-# Spark は text-only research preview であり image/web-search capability を
-# 持たない前提（Issue #2186 Background/Out of Scope）。この制約を prose
-# だけでなく agent 定義自体の構造でも強制するため、web 系 tool を
-# 明示的に disallow する。
-claude_gpt_spark_agents_json_fragment() {
-  description_json=$(claude_gpt_json_escape "Explicit-only GPT-5.3-Codex-Spark delegate. Invoked only via canonical current-turn @agent-spark-codex mention.")
-  prompt_json=$(claude_gpt_json_escape "$(claude_gpt_spark_agent_prompt)")
-  printf '{"%s": {"description": %s, "prompt": %s, "model": "%s", "disallowedTools": ["WebFetch", "WebSearch"]}}' \
-    "$CLAUDE_GPT_SPARK_AGENT_NAME" "$description_json" "$prompt_json" "$CLAUDE_GPT_SPARK_MODEL"
-}
-
-# claude_gpt_spark_auth_dir: explicit-only authorization gate の nonce/session_id
-# keyed sidecar file を置くディレクトリ（GPT 専用 HOME 配下。worktree/repo 配下では
-# ない。claude_gpt_reject_if_under_repo による canonical path safety の対象）。
-claude_gpt_spark_auth_dir() {
-  printf '%s/spark-auth\n' "$CLAUDE_GPT_HOME"
-}
+# The former Spark custom SubAgent definition (Issue #2186, Parent #2154
+# Gate1/Gate2), its system prompt, its `--agents` JSON fragment generator,
+# its explicit-only authorization gate, and its nonce/session_id sidecar
+# auth directory have all been removed from this launcher. Repository-owned
+# Claude-GPT / Claude Code invocation no longer selects, injects, or
+# dispatches the retired non-Anthropic Spark model in any form. Ordinary
+# SubAgent smoke canary generation
+# (`claude_gpt_smoke_canary_agents_json_fragment`, below) does not depend
+# on any Spark constant or function removed here.
 
 # --- Codex transport policy（Issue #2204, Parent #2154）---
 #
@@ -858,25 +824,26 @@ CLAUDE_GPT_AGENTS_MERGE_VALIDATE_PY
 # name/prompt/model/tools を一切受け取らない（この関数のシグネチャ自体が受け取れる
 # のは expected marker と smoke run 固有 nonce の 2 つだけ -- caller override は
 # 構造的に不可能）。生成した agent name は smoke run 固有 nonce（呼び出し元が
-# 生成する高エントロピー値。推測困難な値であること）を組み込み、他 run や
-# session-local spark 定義名との衝突を避ける。tools は常に空配列、prompt は
-# 固定の canary prompt に expected marker を埋め込んだもの。
+# 生成する高エントロピー値。推測困難な値であること）を組み込み、他 run との
+# 衝突を避ける。tools は常に空配列、prompt は固定の canary prompt に expected
+# marker を埋め込んだもの。
+#
+# Issue #2651: 旧 Spark 定義名との衝突検査（$3 予約名引数）は撤去した。
+# Spark custom agent 定義自体が repository から撤去されたため、この関数は
+# spark 定数へ一切依存しない（衝突対象が存在しない）。
 #
 # JSON serializer（python3 の `json.dumps`）で一括生成した直後に自身で
 # parse/readback し、以下のいずれかを検出したら stdout へ何も書かず exit 1 する
 # （fail-closed。malformed JSON をそのまま `--agents` へ渡さない）:
 #   - marker/nonce が空
-#   - 生成した agent name が予約済み spark 定義名（$3 に渡された値）と衝突する
 #   - readback した object の top-level key が 1 個でない
 #   - readback した prompt/tools が固定 spec と一致しない（tools が空配列でない・
 #     model key が存在する等）
 #
-# 引数: $1=expected marker文字列  $2=smoke run 固有 nonce  $3=予約済み spark 定義名
-#       （$CLAUDE_GPT_SPARK_AGENT_NAME 等。衝突検査専用、この値自体は生成しない）
+# 引数: $1=expected marker文字列  $2=smoke run 固有 nonce
 claude_gpt_smoke_canary_agents_json_fragment() {
   marker="$1"
   nonce="$2"
-  reserved_name="$3"
   if [ -z "$marker" ] || [ -z "$nonce" ]; then
     return 1
   fi
@@ -884,19 +851,17 @@ claude_gpt_smoke_canary_agents_json_fragment() {
     return 1
   fi
   prompt_text="You are a launcher-owned canary SubAgent used only for claude-gpt runtime smoke test positive control (Issue #2274 AC14/AC15). You have no tools. When invoked, respond with exactly: ${marker} and nothing else."
-  python3 - "$nonce" "$prompt_text" "$marker" "$reserved_name" <<'CLAUDE_GPT_CANARY_FIXTURE_PY'
+  python3 - "$nonce" "$prompt_text" "$marker" <<'CLAUDE_GPT_CANARY_FIXTURE_PY'
 import hashlib
 import json
 import sys
 
-nonce, prompt_text, marker, reserved_name = sys.argv[1:5]
+nonce, prompt_text, marker = sys.argv[1:4]
 
 if not nonce or not prompt_text or not marker:
     sys.exit(1)
 
 agent_name = "canary-smoke-" + hashlib.sha256(nonce.encode("utf-8")).hexdigest()[:32]
-if reserved_name and agent_name == reserved_name:
-    sys.exit(1)
 
 fixture = {
     agent_name: {
@@ -912,8 +877,6 @@ try:
 except (json.JSONDecodeError, ValueError):
     sys.exit(1)
 if not isinstance(readback, dict) or len(readback) != 1:
-    sys.exit(1)
-if reserved_name and reserved_name in readback:
     sys.exit(1)
 only_key = next(iter(readback))
 if only_key != agent_name:

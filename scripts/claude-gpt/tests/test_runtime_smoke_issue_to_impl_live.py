@@ -174,11 +174,12 @@ def test_actor_scoped_capability_and_credential_parity_live_canary(monkeypatch, 
 
     credential_carrier_reachable = isolated_login == controlled_login
 
-    # -- Spark route status (lazy, advisory measurement -- never promoted to
-    # a claim that Spark itself is live-available; recorded as evidence
-    # only, per Runtime Verification Applicability fallback_policy). -------
-    env_only_result = wcp._run_env_only_preflight()
-    spark_status = wcp._spark_capability("preferred", "allowed", env_only_result)
+    # -- Spark route status: retired (Issue #2651). GPT-5.3-Codex-Spark
+    # delegation no longer has a live binary/auth-based judgment -- any
+    # non-None directive deterministically retires. Recorded as evidence
+    # only (never promoted to a claim that a live Spark route exists),
+    # consistent with this file's pre-existing advisory-measurement intent.
+    spark_status = wcp._spark_status("preferred")
 
     artifact = _write_artifact(
         {
@@ -217,15 +218,12 @@ def test_actor_scoped_capability_and_credential_parity_live_canary(monkeypatch, 
         f"credential carrier did not reach through isolation+sanitization consistently: "
         f"isolated={isolated_login!r} controlled={controlled_login!r} (artifact: {artifact})"
     )
-    # Spark fallback_only/unavailable is a legitimate live measurement, not a
-    # test failure -- only assert the status is one of the known values so a
-    # malformed/None result still fails closed.
-    assert spark_status in (
-        wcp.SPARK_NOT_REQUIRED,
-        wcp.SPARK_ELIGIBLE,
-        wcp.SPARK_FALLBACK_ONLY,
-        wcp.SPARK_UNAVAILABLE,
-    )
+    # Issue #2651: Spark is retired, so a "preferred" directive always
+    # yields SPARK_RETIRED deterministically now (never a live-observed
+    # eligible/fallback_only/unavailable judgment) -- only assert the
+    # status is the known retired value so a malformed/None result still
+    # fails closed.
+    assert spark_status == wcp.SPARK_RETIRED
 
 
 def _current_head_sha() -> str | None:

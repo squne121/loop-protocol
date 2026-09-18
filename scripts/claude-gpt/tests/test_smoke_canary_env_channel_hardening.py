@@ -256,9 +256,11 @@ MALICIOUS_AGENT_JSON = json.dumps(
 def test_legacy_raw_json_env_var_is_a_structural_no_op(tmp_path):
     """Setting the OLD raw-JSON escape-hatch env var name on an ordinary
     launch must never inject its content -- the final `--agents` JSON must
-    contain ONLY the launcher-owned `spark-codex` definition, and `claude`
-    must still be invoked normally (proving the malicious content never
-    reached exec, not merely that the launch aborted)."""
+    be empty (Issue #2651: the launcher-owned `spark-codex` definition it
+    used to also contain has been retired -- there is no default agent
+    registered by an ordinary launch any more), and `claude` must still be
+    invoked normally (proving the malicious content never reached exec,
+    not merely that the launch aborted)."""
     result, argv_file = _run_launch(
         tmp_path,
         extra_env={"CLAUDE_GPT_SMOKE_CANARY_AGENTS_JSON": MALICIOUS_AGENT_JSON},
@@ -267,7 +269,7 @@ def test_legacy_raw_json_env_var_is_a_structural_no_op(tmp_path):
     assert argv_file.exists(), "fake claude was never invoked -- launch aborted unexpectedly"
     argv = json.loads(argv_file.read_text(encoding="utf-8"))
     agents = _extract_agents_json(argv)
-    assert set(agents.keys()) == {"spark-codex"}, agents
+    assert agents == {}, agents
     assert "malicious-injected-agent" not in agents
     raw_agents_text = argv[argv.index("--agents") + 1]
     for forbidden in ("hooks", "permissionMode", "mcpServers", "bypassPermissions", "evil"):
@@ -296,8 +298,9 @@ def test_canary_nonce_without_marker_is_rejected_before_exec(tmp_path):
 
 def test_canary_marker_and_nonce_produce_only_the_fixed_shape(tmp_path):
     """A legitimate marker+nonce pair must synthesize a canary entry with
-    exactly the fixed {description, prompt, tools} shape merged alongside
-    spark-codex -- never any additional key."""
+    exactly the fixed {description, prompt, tools} shape -- and (Issue
+    #2651) it is now the ONLY entry in `--agents`, since there is no more
+    launcher-owned `spark-codex` definition to merge it alongside."""
     result, argv_file = _run_launch(
         tmp_path,
         extra_env={
@@ -309,7 +312,7 @@ def test_canary_marker_and_nonce_produce_only_the_fixed_shape(tmp_path):
     argv = json.loads(argv_file.read_text(encoding="utf-8"))
     agents = _extract_agents_json(argv)
     canary_name = "canary-smoke-" + _sha256_prefix("hardening-test-nonce-0001")
-    assert set(agents.keys()) == {"spark-codex", canary_name}
+    assert set(agents.keys()) == {canary_name}
     canary_entry = agents[canary_name]
     assert set(canary_entry.keys()) == {"description", "prompt", "tools"}
     assert canary_entry["tools"] == []

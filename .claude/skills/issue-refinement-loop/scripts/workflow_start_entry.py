@@ -10,6 +10,15 @@ profiles -- `preflight.run.with_anchor` / `.with_human_context` /
 continue to first-hop into `run_refinement_preflight.py` directly and are
 unaffected by this module; Issue #2311 is scoped to the bare command only).
 
+Issue #2651: GPT-5.3-Codex-Spark delegation is retired repository-wide. A
+caller-declared `spark_mode` (`required`/`preferred`) is still validated
+against its fixed enum (step 1a below) but now always yields a
+deterministic `blocked` result (`reasons: ["spark_delegation_retired"]`)
+BEFORE the capability-preflight producer is ever invoked -- never a live
+eligible/fallback_only judgment, and never a silent fallback to a
+different model/agent. `spark_mode=None` (the ordinary case) is
+unaffected.
+
 Within a SINGLE continuous invocation, this module:
 
   1. Assembles the caller-declared, invocation-scoped capability request
@@ -349,11 +358,37 @@ def run(
         )
         return result, 2
 
+    # Issue #2651: GPT-5.3-Codex-Spark delegation is retired. When the
+    # caller's capability request explicitly declares a `spark_mode`
+    # (`required`/`preferred`), this module returns a deterministic
+    # retired-blocked result WITHOUT ever invoking the producer (which no
+    # longer accepts `spark_mode`/`spark_fallback` at all --
+    # `root_entry_router.capability_preflight_result()`'s signature dropped
+    # them in this same Issue, since that function has no external pinned
+    # caller outside Allowed Paths). `spark_mode`/`spark_fallback` remain
+    # accepted keyword-only parameters on THIS function -- unlike
+    # `capability_preflight_result()` -- because a real external caller
+    # outside this Issue's Allowed Paths
+    # (`scripts/claude-gpt/tests/test_runtime_smoke_issue_to_impl.py`)
+    # already pins `wse.run(spark_mode=None, spark_fallback=None, ...)`; it
+    # always passes `None` for both, so this retired branch is never
+    # reached by that caller and its behavior is unaffected.
+    if capability_request["spark_mode"] is not None:
+        result = _compact_result(
+            status="blocked",
+            reason="spark_delegation_retired",
+            checks={},
+            reasons=["spark_delegation_retired"],
+            decision="blocked",
+            inner_preflight_invoked=False,
+            next_action="human_judgment_required",
+            blockers=["spark_delegation_retired"],
+        )
+        return result, 2
+
     # AC2: call the producer exactly once.
     producer_result = capability_preflight_result_fn(
         repo=repo,
-        spark_mode=capability_request["spark_mode"],
-        spark_fallback=capability_request["spark_fallback"],
         planned_operations=capability_request["planned_operations"],
     )
     decision = producer_result.get("decision")
