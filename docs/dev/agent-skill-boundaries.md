@@ -81,7 +81,7 @@ native Codex CLI 撤去に伴い、`legacy_codex_projection` / `legacy_codex_onl
 
 ## Manual Spark Agents の撤去（手動 Spark エージェントの撤去、Issue #2161 で削除済み）
 
-`spark-skim` / `spark-worker` / `spark-deep`（旧 `.codex/agents/spark-*.toml`）は native Codex CLI 専用の custom subagent であり、Codex CLI 撤去に伴い削除した。将来の Spark 設計は `claude-gpt-session` 上のカスタム SubAgent `spark-codex` として #2186 が別途所有し、Codex CLI `.toml` を継続保持する設計ではない（2026-08-25 人間レビュー反映）。
+`spark-skim` / `spark-worker` / `spark-deep`（旧 `.codex/agents/spark-*.toml`）は native Codex CLI 専用の custom subagent であり、Codex CLI 撤去に伴い削除した。当時は将来の Spark 設計を `claude-gpt-session` 上のカスタム SubAgent `spark-codex` として #2186 が別途所有する計画だった（2026-08-25 人間レビュー反映）が、その `claude-gpt-session` 上の `spark-codex`（GPT-5.3-Codex-Spark delegation）自体も #2651 で repository-owned Claude-GPT / Claude Code integration から撤去済みである。Codex CLI `.toml` を継続保持する設計ではなかった、という記述自体は歴史的事実として変更しない。
 
 ### `review-issue` / `issue-reviewer` の使い分け
 

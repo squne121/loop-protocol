@@ -2888,7 +2888,12 @@ def _find_previous_candidate(previous_state: "PreviousStateResult", identity_val
     return None
 
 
-def _classify_current_candidate_delta(previous_state: "PreviousStateResult", identity_value: str) -> dict[str, Any]:
+def _classify_current_candidate_delta(
+    previous_state: "PreviousStateResult",
+    identity_value: str,
+    *,
+    current_source_coverage: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Classify ONE currently-reported candidate's presence/absence delta
     against ``previous_state`` (Issue #2362 Scope Reframe -- AC3) by
     delegating to `compute_delta()` (the exact same algorithm the
@@ -2901,9 +2906,23 @@ def _classify_current_candidate_delta(previous_state: "PreviousStateResult", ide
     ``finding_identity`` matches `identity_value` is returned, since a
     currently-reported candidate's own identity is always present in the
     single-item ``current_identities`` set `compute_delta()` builds, so its
-    own classification entry is always produced."""
+    own classification entry is always produced.
+
+    ``current_source_coverage`` (Issue #2644 AC4) is threaded through
+    UNCHANGED to the same `compute_delta()` call the top-level
+    ``PublishRequest.delta_results`` sidecar uses, so both call sites always
+    see identical inputs for the SAME run -- this parameter has no observable
+    effect on THIS function's own return value (a currently-reported
+    candidate's identity is always present in the singleton batch, so it is
+    classified by ``compute_delta()``'s PRESENT-candidate branch, which
+    ``current_source_coverage`` never affects -- only the "resolved"
+    synthesis branch, for identities absent from the batch, reads it); it is
+    accepted here purely so callers cannot construct the two call sites with
+    silently divergent inputs."""
     synthetic_candidate = {"finding_contract": {"identity": {"value": identity_value}}}
-    for result in compute_delta(previous_state, [synthetic_candidate]):
+    for result in compute_delta(
+        previous_state, [synthetic_candidate], current_source_coverage=current_source_coverage
+    ):
         if result.get("finding_identity") == identity_value:
             return result
     # Defensive: compute_delta() always classifies a present current
@@ -3023,6 +3042,7 @@ def _enrich_candidate_record(
     timestamp: str,
     previous_state: "PreviousStateResult",
     real_evidence_index: dict[str, list[dict[str, Any]]],
+    current_source_coverage: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Deterministic enrichment (Issue #2362 Scope Reframe, 2026-08-28
     owner-approved) for a single raw JUDGMENT-ONLY candidate record: builds
@@ -3100,7 +3120,9 @@ def _enrich_candidate_record(
         if isinstance(prev_finding_contract, dict):
             prev_evaluations = list(prev_finding_contract.get("evaluations") or [])
 
-    classification = _classify_current_candidate_delta(previous_state, identity_value)
+    classification = _classify_current_candidate_delta(
+        previous_state, identity_value, current_source_coverage=current_source_coverage
+    )
     enriched_evidence_refs = _enrich_evidence_refs(
         raw_candidate.get("evidence_refs"), real_evidence_index=real_evidence_index
     )
@@ -3141,6 +3163,7 @@ def _enrich_evaluation_payload(
     timestamp: str,
     previous_state: "PreviousStateResult",
     finding_sets: Sequence[dict[str, Any]],
+    current_source_coverage: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Apply `_enrich_candidate_record` to every entry of
     `payload["candidate_records"]` (Issue #2362 Scope Reframe). Returns a
@@ -3162,6 +3185,7 @@ def _enrich_evaluation_payload(
             timestamp=timestamp,
             previous_state=previous_state,
             real_evidence_index=real_evidence_index,
+            current_source_coverage=current_source_coverage,
         )
         for record in payload.get("candidate_records", [])
     ]
@@ -3177,6 +3201,7 @@ def run_evaluation(
     previous_state: "PreviousStateResult",
     clock: Callable[[], datetime] = _utcnow,
     repair: Callable[[str, WireContractError], str] | None = None,
+    current_source_coverage: dict[str, dict[str, Any]] | None = None,
 ) -> Evaluation:
     """Invoke the evaluator exactly once with ``evaluator_request`` (built
     only from validated ``FindingSet`` projections -- see
@@ -3259,6 +3284,7 @@ def run_evaluation(
             timestamp=_iso(clock()),
             previous_state=previous_state,
             finding_sets=evaluator_request.finding_sets,
+            current_source_coverage=current_source_coverage,
         )
         # Step 4 (construction): canonical candidate validation
         # (_post_validate()/_validate_candidate_records()/validate_candidate())
@@ -3383,6 +3409,7 @@ def execute_run(
     clock: Callable[[], datetime] = _utcnow,
     previous_state_provider: "PreviousStateProviderProtocol | None" = None,
     previous_state_scope: str = DEFAULT_PREVIOUS_STATE_SCOPE,
+    current_source_coverage: dict[str, dict[str, Any]] | None = None,
 ) -> PublishRequest:
     """Reference composition of ``prepare`` -> ``validate-observers`` ->
     ``prepare-evaluator`` -> evaluator invocation -> delta computation ->
@@ -3425,8 +3452,11 @@ def execute_run(
         repository_id=repository_id,
         previous_state=previous_state,
         clock=clock,
+        current_source_coverage=current_source_coverage,
     )
-    delta_results = compute_delta(previous_state, evaluation.candidate_records)
+    delta_results = compute_delta(
+        previous_state, evaluation.candidate_records, current_source_coverage=current_source_coverage
+    )
 
     # Issue #2375 PR #2392 fix_delta: wires `collect_latitude_runtime_evidence_once()`/
     # `bind_latitude_evidence_to_candidates()` into the actual `execute_run()` call graph --
@@ -3628,7 +3658,98 @@ def _last_evaluation(candidate: dict[str, Any]) -> dict[str, Any] | None:
     return evaluations[-1] if evaluations else None
 
 
-def compute_delta(previous: PreviousStateResult, current_candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+#: canonical `evidence_refs[].source_id` literal for evidence produced by the
+#: SINGLE `retrospective-runtime-observer` (Issue #2237 `EXPECTED_OBSERVER_MANIFEST`
+#: -- one observer interprets BOTH `claude_code`/`claude_gpt` session sources
+#: together; the canonical schema has no per-underlying-session-source
+#: discriminator, see `agent_improvement_candidate_v1.schema.json`'s
+#: `evidence_refs[].source_id` `oneOf`). Issue #2644 AC2/AC3: a finding whose
+#: LAST evaluation cites this literal is conservatively treated as dependent on
+#: EVERY session source this run (see `_unavailable_evidence_source_ids`) --
+#: never split finer than the schema itself can represent.
+_RUNTIME_EVIDENCE_SOURCE_ID = "runtime"
+#: `session_window_coverage/v1`'s `source_coverage` keys that back a
+#: `evidence_refs[].source_id == "runtime"` claim (Issue #2601's
+#: `--since-last-retrospective` session sources).
+_RUNTIME_DEPENDENT_SESSION_SOURCES: tuple[str, ...] = ("claude_code", "claude_gpt")
+
+
+def _unavailable_evidence_source_ids(current_source_coverage: dict[str, dict[str, Any]] | None) -> frozenset[str]:
+    """Issue #2644 AC2/AC3/AC8: maps THIS run's `session_window_coverage/v1`-shaped
+    ``source_coverage`` (e.g. from ``compute_source_coverage_map()``) to the set of
+    canonical ``evidence_refs[].source_id`` literals a finding's LAST evaluation may
+    cite that this run's OWN coverage cannot trust an absence-read for.
+
+    ``None``/empty input (the default -- every existing caller that never passes
+    ``current_source_coverage``) returns an empty set: zero behavior change (Issue
+    #2644 is purely additive over Issue #2237/#2601's pre-existing ``compute_delta()``
+    contract).
+
+    A required session source with status other than ``observed``/``not_requested``
+    (i.e. ``required``/``unavailable``/``partial``) makes ``"runtime"`` untrustworthy
+    THIS run -- both underlying sources feed the SAME single observer, so a partial
+    read of either one taints the aggregate interpretation (fail-closed; never
+    assumed independent).
+
+    PR #2660 fix_delta P1-3 (OWNER REQUEST_CHANGES): "coverage complete" (every
+    requested source reports ``status: "observed"``) is, BY ITSELF, still not
+    trustworthy absence evidence when EVERY observed source's
+    ``selected_session_count`` is ``0`` (Issue #2644 AC8's "coverage complete +
+    zero observed" scenario) -- this run's collector pipeline genuinely worked,
+    but it gathered zero actual session evidence, so "no candidate reported"
+    carries exactly as little information as AC2's genuinely-``unavailable``
+    case. This is intentionally kept DISTINCT from ``status: "not_requested"``
+    (Issue #2644 AC9's required "keep the existing treatment" -- a caller that
+    deliberately narrowed ``--session-sources`` never had this run's
+    ``"runtime"`` evidence in scope to begin with, unlike a source that WAS
+    requested and observed nothing): only sources that were ACTUALLY
+    ``observed`` this run count toward the zero-observed total below; a source
+    with ONLY ``not_requested`` entries (no source observed at all) does not
+    trigger this branch, matching AC9. A source with at least one non-zero
+    ``selected_session_count`` observation means this run DID gather real
+    runtime evidence, so ``"runtime"`` remains trusted."""
+    if not current_source_coverage:
+        return frozenset()
+    any_observed = False
+    observed_session_total = 0
+    for source_id in _RUNTIME_DEPENDENT_SESSION_SOURCES:
+        entry = current_source_coverage.get(source_id)
+        if not isinstance(entry, dict):
+            continue
+        status = entry.get("status")
+        if status not in ("observed", "not_requested"):
+            return frozenset({_RUNTIME_EVIDENCE_SOURCE_ID})
+        if status == "observed":
+            any_observed = True
+            observed_session_total += entry.get("selected_session_count") or 0
+    if any_observed and observed_session_total == 0:
+        return frozenset({_RUNTIME_EVIDENCE_SOURCE_ID})
+    return frozenset()
+
+
+def _evaluation_cites_unavailable_source(
+    evaluation: dict[str, Any] | None, unavailable_source_ids: frozenset[str]
+) -> bool:
+    """Issue #2644 AC2/AC3: ``True`` iff ``evaluation`` (a PREVIOUS candidate's
+    last ``finding_contract.evaluations[]`` entry) cites at least one
+    ``evidence_refs[].source_id`` in ``unavailable_source_ids``. A finding whose
+    evidence is entirely e.g. ``"repository"``/``"github"``/``"web"`` (AC3's
+    "unrelated repository-only finding") is never affected, regardless of how
+    degraded THIS run's session-source coverage is."""
+    if not evaluation or not unavailable_source_ids:
+        return False
+    for ref in evaluation.get("evidence_refs") or []:
+        if isinstance(ref, dict) and ref.get("source_id") in unavailable_source_ids:
+            return True
+    return False
+
+
+def compute_delta(
+    previous: PreviousStateResult,
+    current_candidates: Sequence[dict[str, Any]],
+    *,
+    current_source_coverage: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Classify each canonical (``agent_improvement_candidate/v1``,
     #2288/#2289) candidate in ``current_candidates`` against ``previous``
     (Issue #2237 P0-4). Identity is read from
@@ -3644,7 +3765,24 @@ def compute_delta(previous: PreviousStateResult, current_candidates: Sequence[di
     Incomplete source coverage on the *previous* read (``partial``/``stale``)
     forces every current candidate's classification to ``indeterminate`` --
     an indeterminate evaluation is never reported as ``resolved`` (absence
-    observed under incomplete coverage is not evidence of resolution)."""
+    observed under incomplete coverage is not evidence of resolution).
+
+    ``current_source_coverage`` (Issue #2644, additive -- ``None`` default is a
+    complete no-op, identical to this function's pre-#2644 behavior) is a
+    SEPARATE, orthogonal axis from ``previous.status``: it describes whether
+    THIS run's own session-source collection (e.g.
+    ``compute_source_coverage_map()``'s output) actually observed every
+    required runtime source, not whether the PAST read was trustworthy. When a
+    previously-reported finding is absent from ``current_candidates`` this run
+    (the "resolved" synthesis below) AND that finding's last evaluation cites
+    evidence from a session source THIS run failed to fully observe
+    (``_evaluation_depends_on_unavailable_source``), this function reports
+    ``indeterminate`` instead of ``resolved`` -- "no candidate reported" is not
+    evidence of resolution when the run never actually looked at that
+    finding's evidence source. An unrelated finding whose evidence is
+    repository-only (or any other non-``"runtime"`` source) is never affected
+    by this -- only ``previous.status`` (the pre-existing axis) can force
+    indeterminate for those."""
     if previous.status in ("no_history", "legacy_unavailable"):
         results: list[dict[str, Any]] = []
         for candidate in current_candidates:
@@ -3689,11 +3827,27 @@ def compute_delta(previous: PreviousStateResult, current_candidates: Sequence[di
         results.append({"finding_identity": identity, "evaluation_status": "classified", "delta_status": delta_status})
 
     if not source_incomplete:
+        unavailable_source_ids = _unavailable_evidence_source_ids(current_source_coverage)
         for identity, prev_eval in prev_by_identity.items():
             if identity in current_identities:
                 continue
             if prev_eval is not None and prev_eval.get("presence_delta") in ("resolved", "still_absent"):
                 continue  # already absent as of the previous run; nothing new to report
+            if _evaluation_cites_unavailable_source(prev_eval, unavailable_source_ids):
+                # Issue #2644 AC2: THIS run never actually observed the
+                # session source this finding's evidence depends on -- "no
+                # candidate reported" is not trustworthy absence evidence,
+                # so this stays indeterminate rather than being synthesized
+                # as `resolved`.
+                results.append(
+                    {
+                        "finding_identity": identity,
+                        "evaluation_status": "indeterminate",
+                        "delta_status": None,
+                        "indeterminate_reason": "source_partial",
+                    }
+                )
+                continue
             results.append(
                 {"finding_identity": identity, "evaluation_status": "classified", "delta_status": "resolved"}
             )
@@ -4881,6 +5035,7 @@ def run_cli(
     temp_base_dir: Path | None = None,
     previous_state_provider: "PreviousStateProviderProtocol | None" = None,
     previous_state_scope: str = DEFAULT_PREVIOUS_STATE_SCOPE,
+    current_source_coverage: dict[str, dict[str, Any]] | None = None,
 ) -> PublishRequest:
     """The single production call graph (Issue #2237 P0-2): manual-trigger
     preflight -> run-scoped temp dir -> collector closures -> ``prepare`` ->
@@ -4910,7 +5065,22 @@ def run_cli(
     identity via ``bind_observer_prompt`` (Issue #2350) -- it is never
     forwarded to the observer CLI as raw, unbound task text, which
     previously left every non-empty caller-supplied prompt structurally
-    unable to satisfy ``run_observer_wave()``'s identity checks."""
+    unable to satisfy ``run_observer_wave()``'s identity checks.
+
+    ``current_source_coverage`` (Issue #2644, additive -- ``None`` default is
+    a complete no-op, identical to this function's pre-#2644 behavior) is
+    THIS run's ``session_window_coverage/v1``-shaped ``source_coverage`` map
+    (e.g. from ``compute_source_coverage_map()``/
+    ``build_since_last_analysis_runner()``), when the caller already knows
+    it (e.g. a since-last-retrospective analysis run -- see
+    ``run_since_last_retrospective_cli()``'s ``analysis_runner`` parameter).
+    Threaded UNCHANGED into both ``run_evaluation()`` (canonical
+    ``finding_contract.evaluations[]`` generation) and this function's own
+    top-level ``compute_delta()`` call (``PublishRequest.delta_results``) so
+    the two never see divergent inputs (Issue #2644 AC4). ``None`` (a caller
+    with no session-source coverage information, e.g. every existing
+    ``run_cli()`` caller before this Issue) leaves both call sites'
+    behavior byte-for-byte unchanged."""
     manual_trigger_preflight(repo_root=repo_root)
     resolved_run_id = run_id or str(uuid.uuid4())
 
@@ -5042,8 +5212,11 @@ def run_cli(
             repository_id=repository_id,
             previous_state=previous_state,
             clock=clock,
+            current_source_coverage=current_source_coverage,
         )
-        delta_results = compute_delta(previous_state, evaluation.candidate_records)
+        delta_results = compute_delta(
+            previous_state, evaluation.candidate_records, current_source_coverage=current_source_coverage
+        )
 
         # Issue #2376 fix_delta (OWNER review issuecomment-5552512140
         # blocker 1): the private-audit producer hook was previously wired
@@ -5123,6 +5296,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--enable-full-analysis",
+        action="store_true",
+        help=(
+            "Issue #2644: when combined with --since-last-retrospective, connects THIS run's "
+            "already-selected session collector_results into run_cli()'s full observer/evaluator/"
+            "finalize pipeline (via build_since_last_analysis_runner()) before committing the "
+            "checkpoint/watermark -- requires --repository-id/--target-issue/--request-id/"
+            "--idempotency-key to also be supplied. Omitted (default, PR #2660 fix_delta P1-1): "
+            "--since-last-retrospective stays COVERAGE-ONLY -- it never invokes the Agent pipeline "
+            "AND never durably advances the checkpoint/watermark (checkpoint_advance_reason is "
+            "forced to blocked_evaluation_failure whenever coverage/authorization alone would have "
+            "advanced) -- only collection/coverage reporting is produced."
+        ),
+    )
+    parser.add_argument(
         "--publish-authorized",
         action="store_true",
         help=(
@@ -5172,13 +5360,65 @@ def main(argv: Sequence[str] | None = None) -> int:
         # read/parse itself, inside its own try/except.
         required_sources = [s.strip() for s in args.session_sources.split(",") if s.strip()]
         prior_watermark_file = Path(args.prior_watermark_file) if args.prior_watermark_file else None
+        analysis_runner = None
+        if args.enable_full_analysis:
+            # Issue #2644 In Scope: minimal connection into run_cli()'s
+            # existing full observer/evaluator/finalize pipeline -- opt-in
+            # only, and only when the full-analysis identifiers this
+            # pipeline genuinely needs are ALL present.
+            missing_full_analysis = [
+                flag
+                for flag, value in (
+                    ("--repository-id", args.repository_id),
+                    ("--target-issue", args.target_issue),
+                    ("--request-id", args.request_id),
+                    ("--idempotency-key", args.idempotency_key),
+                )
+                if value is None
+            ]
+            if missing_full_analysis:
+                parser.error(
+                    "--enable-full-analysis requires: " + ", ".join(missing_full_analysis)
+                )
+            analysis_runner = build_since_last_analysis_runner(
+                repo_root=Path(args.repo_root),
+                repository_id=args.repository_id,
+                target_issue=args.target_issue,
+                request_id=args.request_id,
+                idempotency_key=args.idempotency_key,
+                schema_dir=Path(args.schema_dir),
+                previous_state_provider=resolve_previous_state_provider(
+                    state_backend=args.state_backend,
+                    repository_id=args.repository_id,
+                    target_issue=args.target_issue,
+                ),
+            )
+        # PR #2660 fix_delta P1-2 (OWNER REQUEST_CHANGES): a caller-owned
+        # sink that captures the connected analysis phase's proposal-only
+        # `PublishRequest` (when `--enable-full-analysis` is set AND analysis
+        # succeeds) -- see `run_since_last_retrospective_cli()`'s
+        # `analysis_result_sink` docstring for why the coverage-shaped
+        # `session_window_coverage/v1` envelope alone cannot carry it.
+        analysis_result_sink: list[Any] = []
         result = run_since_last_retrospective_cli(
             repo_root=Path(args.repo_root),
             required_sources=required_sources,
             prior_watermark_file=prior_watermark_file,
             publish_authorized=args.publish_authorized,
+            analysis_runner=analysis_runner,
+            analysis_result_sink=analysis_result_sink,
         )
         print(json.dumps(result, sort_keys=True))
+        if analysis_result_sink:
+            # SAME serialization channel the default (non `--since-last-
+            # retrospective`) mode already uses below (`print(publish_
+            # request.to_wire())`) -- an additional stdout line, never a new
+            # persistence/publisher subsystem, so a caller (root Skill / main
+            # conversation) that wants to actually publish this connected
+            # analysis run's result can still do so via the EXISTING
+            # publish channel (`persist_retrospective_run.py`), independent
+            # of the checkpoint/watermark commit already completed above.
+            print(analysis_result_sink[0].to_wire())
         return 0
 
     missing_required = [
@@ -5806,6 +6046,7 @@ def compute_checkpoint_disposition(
     source_coverage: dict[str, dict[str, Any]],
     prior_watermark: dict[str, Any] | None,
     publish_authorized: bool,
+    evaluation_failed: bool = False,
 ) -> dict[str, Any]:
     """Issue #2601 AC6 Verification Scenarios C/D/E: determines
     ``checkpoint_advanced``/``checkpoint_advance_reason``, in this priority
@@ -5820,10 +6061,25 @@ def compute_checkpoint_disposition(
        (``blocked_no_publish_authorization`` -- Scenario E: a complete,
        first-run, zero-session coverage is NEVER reported as an
        already-durable checkpoint without explicit publish authorization).
-    4. no prior watermark -> ``first_run_no_prior_state``.
-    5. zero sessions selected across every required source ->
+    4. ``evaluation_failed`` is ``True`` -> never advance
+       (``blocked_evaluation_failure``, Issue #2644 AC5; PR #2660 fix_delta
+       P1-1). Checked only AFTER every coverage/authorization precondition
+       above already passed -- this represents the caller's own
+       observer/evaluator/finalize analysis phase (run AFTER those
+       preconditions hold, see ``run_since_last_retrospective_cli()``'s
+       ``analysis_runner``) either having FAILED, or never having been
+       ATTEMPTED at all (a coverage-only ``--since-last-retrospective``
+       invocation with no ``analysis_runner`` supplied) -- both are the SAME
+       "no durable analysis result exists to commit" outcome from this
+       function's own perspective, and this one enum value represents both;
+       it is a SEPARATE failure mode from "coverage was never good enough to
+       even attempt analysis" (reasons 1-3 above). ``False`` (the default --
+       every pre-#2644 caller, and every caller of THIS pure function
+       directly) never changes this function's behavior at all.
+    5. no prior watermark -> ``first_run_no_prior_state``.
+    6. zero sessions selected across every required source ->
        ``no_new_sessions_selected`` (Scenario C).
-    6. otherwise -> ``advanced_full_coverage``."""
+    7. otherwise -> ``advanced_full_coverage``."""
     all_observed = all(source_coverage[source_id]["status"] == "observed" for source_id in required_sources)
     if not all_observed:
         return {"checkpoint_advanced": False, "checkpoint_advance_reason": "blocked_missing_required_source"}
@@ -5833,6 +6089,8 @@ def compute_checkpoint_disposition(
         return {"checkpoint_advanced": False, "checkpoint_advance_reason": "blocked_missing_required_source"}
     if not publish_authorized:
         return {"checkpoint_advanced": False, "checkpoint_advance_reason": "blocked_no_publish_authorization"}
+    if evaluation_failed:
+        return {"checkpoint_advanced": False, "checkpoint_advance_reason": "blocked_evaluation_failure"}
     if prior_watermark is None:
         return {"checkpoint_advanced": True, "checkpoint_advance_reason": "first_run_no_prior_state"}
     total_selected = sum(
@@ -5851,6 +6109,7 @@ def build_session_window_coverage_result(
     publish_authorized: bool,
     window_end: datetime | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    evaluation_failed: bool = False,
 ) -> dict[str, Any]:
     """Issue #2601: pure top-level builder combining every function above
     into one ``session_window_coverage/v1``-schema-valid envelope. Always
@@ -5862,7 +6121,10 @@ def build_session_window_coverage_result(
     supplied, is forwarded verbatim to ``compute_session_window`` so the
     reported ``watermark.to_inclusive`` matches the SAME frozen boundary
     ``run_since_last_retrospective_cli`` already used to filter session
-    selection, rather than a second independent ``clock()`` call here."""
+    selection, rather than a second independent ``clock()`` call here.
+
+    ``evaluation_failed`` (Issue #2644 AC5, additive -- ``False`` default is
+    a no-op) is forwarded verbatim to ``compute_checkpoint_disposition``."""
     resolved_required_sources = list(required_sources)
     source_coverage = compute_source_coverage_map(resolved_required_sources, collector_results)
     analysis_completeness = compute_analysis_completeness(resolved_required_sources, source_coverage)
@@ -5875,6 +6137,7 @@ def build_session_window_coverage_result(
         source_coverage=source_coverage,
         prior_watermark=prior_watermark,
         publish_authorized=publish_authorized,
+        evaluation_failed=evaluation_failed,
     )
     result = {
         "schema_version": WIRE_SCHEMA_SESSION_WINDOW_COVERAGE,
@@ -6140,6 +6403,8 @@ def run_since_last_retrospective_cli(
     env: dict[str, str] | None = None,
     run_id: str | None = None,
     clock: Callable[[], datetime] = _utcnow,
+    analysis_runner: Callable[[dict[str, Any | None], dict[str, dict[str, Any]]], Any] | None = None,
+    analysis_result_sink: list[Any] | None = None,
 ) -> dict[str, Any]:
     """``--since-last-retrospective`` CLI mode entrypoint (Issue #2601).
     Deliberately distinct from ``run_cli()``'s full observer/evaluator Agent
@@ -6187,7 +6452,102 @@ def run_since_last_retrospective_cli(
       see ``compute_checkpoint_disposition``'s priority order), the new
       watermark is durably written back to this SAME file
       (``_write_prior_watermark_file``, Finding 3) so a NEXT invocation
-      pointed at the same path genuinely uses this run's boundary."""
+      pointed at the same path genuinely uses this run's boundary.
+
+    ``analysis_runner`` (Issue #2644 AC1/AC5/AC6/AC10; PR #2660 fix_delta P1-1
+    -- OWNER REQUEST_CHANGES: coverage-only ``None`` no longer advances the
+    durable checkpoint, superseding this parameter's original additive-only
+    design):
+
+    - ``None`` (default): COVERAGE-ONLY mode -- this invocation never runs
+      observer/evaluator/finalize at all (unchanged from this function's
+      original design intent, see this docstring's opening paragraph), so it
+      has no analysis result to commit. The coverage/authorization-only
+      disposition computed above (``result["checkpoint"]``) is a PROPOSAL
+      eligibility check only, never itself sufficient to represent
+      "analysis complete": whenever that disposition would have advanced,
+      it is recomputed here via ``compute_checkpoint_disposition(...,
+      evaluation_failed=True)`` -- ``checkpoint_advanced: False`` /
+      ``checkpoint_advance_reason: "blocked_evaluation_failure"`` (this enum
+      value is reused rather than adding a new one: from the checkpoint's
+      own perspective, "evaluation was never attempted" and "evaluation was
+      attempted and failed" both mean the identical thing -- no durable
+      analysis result exists to commit) -- and the watermark file is NEVER
+      written for this run. A caller that only wants coverage/collection
+      reporting (never a durable checkpoint) keeps working exactly as
+      before; a caller that wants the checkpoint to actually advance MUST
+      supply a real ``analysis_runner`` (production: ``--enable-full-
+      analysis``, via ``build_since_last_analysis_runner()``).
+    - a callable: invoked as ``analysis_runner(collector_results,
+      result["source_coverage"])`` with THIS SAME run's already-collected
+      ``collector_results``/``source_coverage`` (Issue #2644 AC1 -- the
+      exact values already used to compute the envelope above, never a
+      second independent collection), whenever ``publish_authorized`` is
+      ``True`` -- a run that was never explicitly publish-authorized never
+      invokes analysis at all (Issue #2644 Outcome 3's authorization gate is
+      unchanged). PR #2660 fix_delta P1-4 (OWNER REQUEST_CHANGES,
+      superseding this parameter's PR #2660 fix_delta P1-1 "ONLY when
+      ``result["checkpoint"]["checkpoint_advanced"]`` is already ``True``"
+      wording): gating the analysis ATTEMPT itself on full required-source
+      coverage made the connected (``--enable-full-analysis``) production
+      path structurally unable to ever reach ``analysis_runner`` with an
+      ``unavailable``/``partial`` required source in
+      ``result["source_coverage"]`` -- ``compute_delta()``'s runtime-
+      unavailable/partial evidence-dependent branch (this Issue's Outcome
+      1/In Scope) would then be unreachable end-to-end from this CLI's own
+      production entrypoint. Whether the analysis attempt itself SUCCEEDS
+      never by itself promotes the checkpoint disposition to advanced --
+      that still requires genuine full required-source coverage (see
+      ``compute_checkpoint_disposition``'s priority order); this parameter's
+      relaxation only widens WHEN analysis is attempted, never widens WHEN
+      the checkpoint may advance. Production callers pass a closure that
+      threads the SAME ``collector_results``/``source_coverage`` into
+      ``run_cli()``'s caller-supplied ``prompts``/``current_source_coverage``
+      parameters (see ``build_since_last_analysis_runner()``) -- this
+      function itself never calls ``run_cli()`` directly, keeping this
+      module's one observer-dispatch implementation
+      (``run_observer_wave()``) as the sole call site, never a second
+      parallel pipeline.
+      - Raises (any ``Exception``): the analysis phase itself failed
+        (observer wave / evaluator / finalize). The checkpoint disposition
+        is recomputed via ``compute_checkpoint_disposition(...,
+        evaluation_failed=True)`` -- ``checkpoint_advanced: False`` /
+        ``checkpoint_advance_reason: "blocked_evaluation_failure"`` -- and
+        the watermark file is NEVER written for this run (the next
+        invocation re-selects the SAME unanalyzed window, Issue #2644
+        AC5). This exception is intentionally NOT re-raised past this
+        function (mirrors this function's existing AC2 "never raises"
+        contract) and is NEVER conflated with the outer
+        ``orchestration.status: "failed"`` catch-all below --
+        ``orchestration.status`` stays ``"succeeded"`` (collection/coverage
+        genuinely succeeded; only the SEPARATE analysis phase failed).
+      - Returns normally: the coverage-only disposition computed above
+        (``result["checkpoint"]``) is kept as-is, and the watermark is
+        written (Issue #2644 AC6/AC10 -- checkpoint commit only ever depends
+        on analysis SUCCESS, never on any later GitHub-publication
+        outcome, which this function never calls at all). The returned value
+        (the analysis phase's proposal-only ``PublishRequest``) is appended
+        to ``analysis_result_sink`` (PR #2660 fix_delta P1-2, when supplied)
+        -- this function NEVER discards a successfully-produced analysis
+        result merely because it only writes the coverage-shaped
+        ``session_window_coverage/v1`` envelope (whose closed schema has no
+        room for the ``PublishRequest`` fields themselves) as its own return
+        value; the caller (production: ``main()``) is responsible for
+        surfacing ``analysis_result_sink``'s captured ``PublishRequest``
+        through the SAME existing serialization channel
+        (``PublishRequest.to_wire()``) every other analysis result in this
+        module already uses, never a new persistence/publisher subsystem.
+
+    ``analysis_result_sink`` (Issue #2644 PR #2660 fix_delta P1-2, additive --
+    ``None`` default is a no-op): when supplied (an empty, caller-owned
+    ``list``), a successful ``analysis_runner`` call's returned
+    ``PublishRequest`` is appended to it -- this is the ONLY way a caller of
+    THIS function recovers the underlying analysis result, since the
+    function's own return value is always the coverage-shaped
+    ``session_window_coverage/v1`` envelope. Never populated when
+    ``analysis_runner`` is ``None`` (nothing was analyzed) or raised (the
+    analysis phase failed) -- only a genuinely successful analysis run ever
+    has a ``PublishRequest`` worth keeping."""
     resolved_required_sources = list(required_sources) if required_sources else list(DEFAULT_REQUIRED_SESSION_SOURCES)
     resolved_env = env if env is not None else dict(os.environ)
     # `run_id` (Issue #2601 PR #2612 fix_delta Finding 2) is this
@@ -6243,6 +6603,93 @@ def run_since_last_retrospective_cli(
             window_end=window_end,
             clock=clock,
         )
+        # Issue #2644 AC5/AC6/AC10; PR #2660 fix_delta P1-4 (OWNER
+        # REQUEST_CHANGES, superseding fix_delta P1-1's original
+        # `if result["checkpoint"]["checkpoint_advanced"]:` gate): the
+        # analysis phase (observer/evaluator/finalize) is now attempted
+        # whenever `publish_authorized` is `True`, regardless of whether
+        # every required source was `observed` this run. Gating the
+        # ATTEMPT itself on full required-source coverage made the
+        # connected (`--enable-full-analysis`) production path structurally
+        # unable to ever reach `analysis_runner` with an `unavailable`/
+        # `partial` required source in `result["source_coverage"]` --
+        # `compute_delta()`'s runtime-unavailable/partial evidence-dependent
+        # branch (Outcome 1/In Scope) was then unreachable end-to-end from
+        # this CLI's own production entrypoint (PR #2660 fix_delta review
+        # finding). `publish_authorized` remains the one precondition still
+        # enforced before ever attempting analysis (Issue #2644 Outcome 3's
+        # explicit-authorization gate, unrelated to coverage completeness,
+        # is unchanged). This relaxation never by itself changes WHETHER the
+        # checkpoint may advance: `compute_checkpoint_disposition`'s own
+        # priority order re-derives `blocked_missing_required_source` (or
+        # `blocked_no_publish_authorization`) ahead of any
+        # `evaluation_failed` check, so every recompute below reproduces the
+        # SAME blocked disposition `result["checkpoint"]` already held
+        # whenever required-source coverage (or authorization) was
+        # incomplete -- only genuine full required-source coverage plus
+        # authorization ever advances the checkpoint (see that function's
+        # docstring).
+        if publish_authorized:
+            if analysis_runner is None:
+                # PR #2660 fix_delta P1-1 (OWNER REQUEST_CHANGES): this is a
+                # COVERAGE-ONLY invocation -- observer/evaluator/finalize were
+                # never run, so there is no durable analysis result to commit.
+                # `checkpoint_advanced` must never be reported/written as
+                # `True` on the strength of collection/coverage/authorization
+                # ALONE; recompute via the SAME `evaluation_failed=True`
+                # branch a genuine analysis FAILURE would take (reusing
+                # `blocked_evaluation_failure` -- "never attempted" and
+                # "attempted and failed" both mean "no analysis result exists
+                # to commit" from the checkpoint's own perspective, and no new
+                # `checkpoint_advance_reason` enum value is introduced). When
+                # the disposition was already blocked for a coverage reason
+                # (e.g. `blocked_missing_required_source`), this recompute is
+                # a no-op: `compute_checkpoint_disposition`'s priority order
+                # re-derives that SAME reason regardless of
+                # `evaluation_failed`.
+                result = dict(result)
+                result["checkpoint"] = compute_checkpoint_disposition(
+                    required_sources=resolved_required_sources,
+                    source_coverage=result["source_coverage"],
+                    prior_watermark=resolved_prior_watermark,
+                    publish_authorized=publish_authorized,
+                    evaluation_failed=True,
+                )
+                validate_session_window_coverage(result)
+            else:
+                try:
+                    analysis_publish_request = analysis_runner(collector_results, result["source_coverage"])
+                except Exception:  # noqa: BLE001 -- deliberately broad: any analysis-phase
+                    # failure (observer wave / evaluator / finalize) blocks checkpoint
+                    # advancement the SAME way regardless of which phase raised; the
+                    # caller's own analysis_runner is responsible for its own internal
+                    # diagnostics/logging, this function's own contract is only ever
+                    # "did the analysis phase succeed or not" (never re-raised -- see
+                    # this function's own pre-existing AC2 "never raises" contract).
+                    result = dict(result)
+                    result["checkpoint"] = compute_checkpoint_disposition(
+                        required_sources=resolved_required_sources,
+                        source_coverage=result["source_coverage"],
+                        prior_watermark=resolved_prior_watermark,
+                        publish_authorized=publish_authorized,
+                        evaluation_failed=True,
+                    )
+                    validate_session_window_coverage(result)
+                else:
+                    # PR #2660 fix_delta P1-2 (OWNER REQUEST_CHANGES): never
+                    # discard a successfully-produced analysis result -- make
+                    # it retrievable via the caller-supplied sink (production:
+                    # `main()` prints its `.to_wire()` form through the SAME
+                    # existing serialization channel every other analysis
+                    # result in this module already uses) before the
+                    # checkpoint/watermark is durably committed below. The
+                    # disposition computed above (`result["checkpoint"]`) is
+                    # kept AS-IS here (PR #2660 fix_delta P1-4): a SUCCESSFUL
+                    # analysis attempt never itself promotes an under-covered
+                    # run's disposition to advanced -- only genuine full
+                    # required-source coverage plus authorization does that.
+                    if analysis_result_sink is not None:
+                        analysis_result_sink.append(analysis_publish_request)
         if prior_watermark_file is not None and result["checkpoint"]["checkpoint_advanced"]:
             _write_prior_watermark_file(prior_watermark_file, result["watermark"])
         return result
@@ -6277,6 +6724,134 @@ def run_since_last_retrospective_cli(
                 "checkpoint_advance_reason": "blocked_missing_required_source",
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# Issue #2644: minimal connection from --since-last-retrospective's already-
+# selected session collector_results into run_cli()'s EXISTING
+# caller-supplied-prompt path (`prompts=`/`--prompts-file`) -- reuses
+# run_cli()'s one production observer-dispatch call graph unchanged; never a
+# second/parallel observer-dispatch or transport implementation (Child A/B,
+# #2645/#2646, are untouched).
+# ---------------------------------------------------------------------------
+
+
+def build_runtime_observer_task_prompt(collector_results: dict[str, Any | None]) -> str:
+    """Serializes THIS run's already-collected session ``collector_results``
+    (``collect_session_sources()``'s return value -- real
+    ``collect_snapshot.collect_claude_code_source``/``collect_claude_gpt_source``
+    output, already scrubbed by those adapters) into task text suitable for
+    ``retrospective-runtime-observer``'s caller-supplied prompt (via
+    ``run_cli(prompts={...})``/``--prompts-file`` -- see
+    ``.claude/agents/retrospective-runtime-observer.md``'s input contract:
+    "呼び出し元...がプロンプト本文として...解釈対象の private runtime
+    evidence...を渡す").
+
+    Issue #2644 AC1: embeds each wired source's OWN ``observation`` (public
+    shape) and ``private_evidence["normalized_records"]`` (the adapter's own
+    redacted per-line records -- e.g. Claude Code's ``sessionId``/``type``/
+    ``timestamp``/``role``, never raw absolute paths) verbatim, so a caller
+    that seeds a distinguishable identifier into a real session transcript
+    (a test-only sentinel, or a genuinely unique session id) can prove this
+    exact value reaches the observer's real task text end-to-end -- never
+    merely a session COUNT/digest that would not by itself prove which
+    session's content actually arrived. A source with no
+    ``CollectorResult`` (``None`` -- never wired/attempted this run, see
+    ``compute_source_coverage_entry``) is omitted entirely -- this function
+    never fabricates a placeholder entry for an unwired source."""
+    sections: list[dict[str, Any]] = []
+    for source_id in sorted(collector_results or {}):
+        result = collector_results[source_id]
+        if result is None:
+            continue
+        private_evidence = result.private_evidence or {}
+        sections.append(
+            {
+                "source_id": source_id,
+                "observation": result.observation,
+                "normalized_records": private_evidence.get("normalized_records", []),
+                "provenance": private_evidence.get("provenance", {}),
+            }
+        )
+    return "RUNTIME_SESSION_EVIDENCE\n" + json.dumps({"sources": sections}, sort_keys=True)
+
+
+#: non-empty placeholder task text for the two non-runtime observers
+#: (Issue #2644 AC1) -- `--since-last-retrospective` mode has no
+#: substantive caller-supplied investigative task for `codebase-investigator`/
+#: `web-researcher` (it is a SESSION-evidence connection, not a repository/web
+#: investigation trigger); `_reject_missing_or_empty_prompts` requires every
+#: `EXPECTED_OBSERVER_MANIFEST` entry to have a non-empty prompt when a
+#: `prompts` dict is supplied at all (`run_cli()`'s caller-supplied-prompt
+#: path), so these two still need SOME non-empty text.
+_SINCE_LAST_ANALYSIS_NO_TASK_PROMPT = (
+    "No substantive caller-supplied investigative task for this observer this run "
+    "(--since-last-retrospective analysis run; see retrospective-runtime-observer's "
+    "own task text for the actual session evidence this run analyzes)."
+)
+
+
+def build_since_last_analysis_prompts(collector_results: dict[str, Any | None]) -> dict[str, str]:
+    """Builds a full ``prompts`` dict (every ``EXPECTED_OBSERVER_MANIFEST``
+    ``observer_id``) suitable for ``run_cli(prompts=...)``, embedding THIS
+    run's ``collector_results`` into ``retrospective-runtime-observer``'s
+    task text (Issue #2644 AC1) via ``build_runtime_observer_task_prompt``."""
+    return {
+        "retrospective-runtime-observer": build_runtime_observer_task_prompt(collector_results),
+        "codebase-investigator": _SINCE_LAST_ANALYSIS_NO_TASK_PROMPT,
+        "web-researcher": _SINCE_LAST_ANALYSIS_NO_TASK_PROMPT,
+    }
+
+
+def build_since_last_analysis_runner(
+    *,
+    repo_root: Path,
+    repository_id: str,
+    target_issue: int,
+    request_id: str,
+    idempotency_key: str,
+    schema_dir: Path,
+    previous_state_provider: "PreviousStateProviderProtocol | None" = None,
+    runner: Callable[..., subprocess.CompletedProcess] = _lifecycle_subprocess_run,
+    git_runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    clock: Callable[[], datetime] = _utcnow,
+    run_id: str | None = None,
+    temp_base_dir: Path | None = None,
+) -> Callable[[dict[str, Any | None], dict[str, dict[str, Any]]], PublishRequest]:
+    """Issue #2644 In Scope: the ``analysis_runner`` factory production
+    ``main()`` wiring uses for a since-last-retrospective run that ALSO
+    supplies full-analysis identifiers (``--repository-id``/
+    ``--target-issue``/``--request-id``/``--idempotency-key``). Returns a
+    closure over ``run_cli()`` -- this module's ONE production observer/
+    evaluator/finalize call graph -- never a second/parallel pipeline;
+    ``finalize()``'s ``PublishRequest`` return (proposal-only, no GitHub
+    mutation -- see ``run_cli``/``finalize`` docstrings) is exactly the
+    "analysis result generated and handed off" completion
+    ``run_since_last_retrospective_cli``'s checkpoint separation (Issue
+    #2644 Outcome 3/4) treats as sufficient for checkpoint advancement --
+    GitHub publication (a separate, later, human-authorized channel; see
+    ``persist_retrospective_run.py``) is never invoked from here."""
+
+    def _run(collector_results: dict[str, Any | None], source_coverage: dict[str, dict[str, Any]]) -> PublishRequest:
+        prompts = build_since_last_analysis_prompts(collector_results)
+        return run_cli(
+            repo_root=repo_root,
+            repository_id=repository_id,
+            target_issue=target_issue,
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            schema_dir=schema_dir,
+            prompts=prompts,
+            runner=runner,
+            git_runner=git_runner,
+            clock=clock,
+            run_id=run_id,
+            temp_base_dir=temp_base_dir,
+            previous_state_provider=previous_state_provider,
+            current_source_coverage=source_coverage,
+        )
+
+    return _run
 
 
 if __name__ == "__main__":

@@ -354,6 +354,54 @@ fail-closed に解決・保存する resolver。v1 は project Skill only（`plu
   返す public-only 経路は存在しない。ChatGPT 等の GitHub-only reader が既存 public artifact のみ
   から claim 真偽を独自判定する手段は提供しない。
 
+## since-last-retrospective の checkpoint 確定（Issue #2644）
+
+`run_retrospective.py --since-last-retrospective` の checkpoint/watermark 書き戻しは、収集・coverage
+計算（`collect_session_sources()`/`build_session_window_coverage_result()`）の直後ではなく、
+`analysis_runner`（`--enable-full-analysis` 指定時は `build_since_last_analysis_runner()` 経由の
+`run_cli()` 呼び出し）が observer/evaluator/finalize まで成功した後にのみ行われる。同一 run で
+固定した window・選択 session 集合・collector 結果は `build_runtime_observer_task_prompt()` を通じて
+`retrospective-runtime-observer` の実プロンプトへそのまま渡され、`run_cli()` の
+`current_source_coverage` 引数として `compute_delta()` / canonical `finding_contract.evaluations[]`
+生成経路の両方に同一の current source coverage 判定入力として伝播する。observer/evaluator/finalize が
+失敗した場合は `checkpoint_advanced: false` / `checkpoint_advance_reason: "blocked_evaluation_failure"`
+となり watermark ファイルへの書き込みは行われない（次回実行で同じ未分析 window が再選択される）。
+
+`--enable-full-analysis` を指定しない coverage-only invocation（`analysis_runner` 未接続）は
+observer/evaluator/finalize を一切実行しないため、分析済みを表す durable watermark を進めてはならない
+（PR #2660 fix_delta P1-1: OWNER REQUEST_CHANGES）。収集・coverage の disposition 単体が advance 相当
+だった場合でも、`run_since_last_retrospective_cli()` は `checkpoint_advanced` を `false`・
+`checkpoint_advance_reason` を `blocked_evaluation_failure` へ強制的に再計算し、watermark ファイルへは
+書き込まない（新しい `checkpoint_advance_reason` enum 値は追加せず、「未実行」と「実行して失敗」を同一の
+既存値で表現する）。`checkpoint_advanced == true` は、計算上の advance 判定ではなく実際の watermark
+ファイル書き込みが成功した後にのみ成立する。
+
+`analysis_runner` が成功した場合に生成される proposal-only `PublishRequest` は捨てられない（PR #2660
+fix_delta P1-2）。`run_since_last_retrospective_cli()` の `analysis_result_sink` 引数（caller が渡す
+list）へ append され、`main()` は checkpoint/watermark commit 後、既存の `PublishRequest.to_wire()`
+シリアライズ経路（default mode の `print(publish_request.to_wire())` と同一）を再利用して stdout の
+追加行へ出力する。新規 DB・publisher framework・persistence subsystem・permission broker は追加しない。
+
+**checkpointの完了はGitHub投稿の成功と区別する。** 既存の `publish_authorized` 事前 authorization
+判定（`compute_checkpoint_disposition()` が参照する）は checkpoint 確定の入力の一つだが、
+`finalize()` 完了後に別処理が行う実際の GitHub comment/post（publication、`persist_retrospective_run.py`
+の責務）の成功・失敗は checkpoint 確定の入力に一切含めない。`analysis_runner` は `run_cli()`/
+`finalize()` が返す proposal-only `PublishRequest` の生成・受け渡しの完了までを指し、GitHub への
+実際の投稿呼び出しは行わない。
+
+`analysis_runner` を実際に呼び出すか（＝分析 ATTEMPT を試みるか）の条件は `publish_authorized` が
+`true` であること**のみ**であり、required source が全て `observed` かどうかには依存しない（PR #2660
+fix_delta P1-4: OWNER REQUEST_CHANGES、P1-1 導入時の
+`if result["checkpoint"]["checkpoint_advanced"]:` gate を supersede）。この gate を required-source
+coverage の完全性にも依存させていた旧実装では、`--enable-full-analysis` の connected 経路が
+`current_source_coverage` に `unavailable`/`partial` な required source を含む状態で `analysis_runner`
+へ到達することが構造的に不可能になり、結果として `compute_delta()` の runtime-unavailable/partial
+evidence-dependent 分岐（AC2/AC3、`_unavailable_evidence_source_ids()`）が本番 entrypoint から一切
+到達不能になっていた。分析 ATTEMPT が成功しても、それ自体が checkpoint disposition を advance へ
+昇格させることはない（`compute_checkpoint_disposition()` の優先順位により、required source 未観測時は
+分析結果に関わらず `blocked_missing_required_source` のまま維持される）。checkpoint が実際に advance
+するのは、引き続き required source の完全な coverage と authorization の両方が揃った場合のみである。
+
 ## Guardrails（ガードレール）
 
 - **Allowed Paths 外を編集しない**

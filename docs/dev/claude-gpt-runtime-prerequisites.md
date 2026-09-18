@@ -20,21 +20,26 @@ CI ランナーが提供する hostedtoolcache のいずれかに限定してい
 詳細な探索lane・version pinの正規化・復旧コマンドは `docs/dev/workflow.md` の
 「Trusted uv のローカル開発復旧」を正本とする。
 
-## Spark delegation route の判定範囲（P1-5 責務境界）
+## Spark delegation route: 撤去済み（Issue #2651）
 
-`checks.spark.status`（`not_required` / `eligible` / `fallback_only` /
-`unavailable`）は、claude-code-proxy バイナリの availability と ChatGPT
-subscription auth の availability のみに基づく静的判定である。すなわち、
-この preflight チェックが確認しているのは「Spark 委譲経路を構成する
-proxy バイナリと認証情報が揃っているか」という起動可否の観点のみであり、
-それ以上の意味を持たない。
+GPT-5.3-Codex-Spark delegation は repository-owned Claude-GPT / Claude Code
+integration から撤去された。`checks.spark.status` はかつて
+`not_required` / `eligible` / `fallback_only` / `unavailable` の4値を
+claude-code-proxy バイナリの availability と ChatGPT subscription auth の
+availability に基づいて静的判定していた（P1-5 責務境界、Issue #2273
+起源）が、この判定ロジック自体（`_spark_capability()` および
+env-only probe への配線）は撤去された。
 
-**`spark.status: eligible` は、実行時に実際に使われるモデルが
-`CLAUDE_CODE_SUBAGENT_MODEL` の override 意図と適合していることの証明では
-ない。** 言い換えると、Spark delegation route が利用可能だと preflight が
-判定したとしても、実際に起動される Agent が意図したモデルに正しく
-束縛されている保証はこの preflight の範囲外である。実効 model 適合性の
-検証は、PR #2285 / Issue #2274 で導入された Agent 起動直前の model gate
-（`resolvedModel` ベースの判定）の責務であり、本 preflight はその責務を
-重複実装しない。両者は役割が異なる別レイヤーの安全機構として、
-意図的に分離されている。
+現在の `checks.spark.status` は `not_required`（`spark_mode` 未指定。
+ordinary caller は無変更で動作し続ける）または `retired`（`spark_mode`
+に `required`/`preferred` いずれかの値が指定された場合。
+proxy バイナリ・ChatGPT auth の実 availability に関わらず、常に
+deterministic に `retired` となり、`decision: blocked` を返す）の
+2値のみを取る。旧 `eligible` / `fallback_only` / `unavailable` の
+live 判定・fallback 継続経路は存在しない。
+
+`assess()`（`scripts/claude-gpt/workflow_capability_preflight.py`）の
+`spark_mode`/`spark_fallback` キーワード引数自体は、既存の ordinary
+caller（`spark_mode=None` で呼ぶもの）との呼び出し契約維持のため
+シグネチャとして残っているが、非 `None` 値に対する live 判定分岐は
+撤去済みである。

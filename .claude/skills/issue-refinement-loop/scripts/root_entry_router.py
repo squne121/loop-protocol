@@ -432,8 +432,6 @@ class FileBackedFakeGitHubEntryTransport:
 
 def capability_preflight_result(
     repo: str,
-    spark_mode: str | None = None,
-    spark_fallback: str | None = None,
     planned_operations: "tuple[dict, ...] | list[dict]" = (),
 ) -> dict:
     """Invoke ``scripts/claude-gpt/workflow_capability_preflight.py`` once and
@@ -443,6 +441,13 @@ def capability_preflight_result(
     so callers such as ``workflow_start_entry.py`` can obtain the structured
     result without constructing a ``GhCliGitHubEntryTransport`` and without
     reimplementing the producer-invocation logic (Issue #2311 AC2).
+
+    Issue #2651: the ``spark_mode``/``spark_fallback`` parameters are
+    removed (GPT-5.3-Codex-Spark delegation is retired). This function's
+    only callers are inside this same Issue's Allowed Paths and change
+    together in this PR -- unlike ``workflow_capability_preflight.py::
+    assess()``, no external pinned caller outside Allowed Paths depends on
+    this function's keyword-argument shape.
 
     Read-only: the underlying script performs no GitHub mutation of its own
     (Issue #2273 AC12).
@@ -471,10 +476,6 @@ def capability_preflight_result(
         "--deadline-monotonic-ns",
         str(deadline_ns),
     ]
-    if spark_mode is not None:
-        argv.extend(["--spark-mode", spark_mode])
-    if spark_fallback is not None:
-        argv.extend(["--spark-fallback", spark_fallback])
     planned_ops_path: Optional[str] = None
     try:
         if planned_operations:
@@ -575,8 +576,6 @@ class GhCliGitHubEntryTransport:
 
     repo: str
     base_ref: str = "main"
-    spark_mode: str | None = None
-    spark_fallback: str | None = None
     planned_operations: tuple[dict, ...] = field(
         default_factory=lambda: (
             {
@@ -606,8 +605,6 @@ class GhCliGitHubEntryTransport:
         """
         result = capability_preflight_result(
             repo=self.repo,
-            spark_mode=self.spark_mode,
-            spark_fallback=self.spark_fallback,
             planned_operations=self.planned_operations,
         )
         return result.get("decision") in ("ready", "degraded")

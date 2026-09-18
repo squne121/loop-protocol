@@ -64,38 +64,23 @@ def _completed(argv, *, stdout: str = "", returncode: int = 0) -> subprocess.Com
 # =============================================================================
 
 
-def test_required_probes_run_before_optional_spark_and_starvation_degrades(monkeypatch):
-    """GIVEN the three required GitHub probes complete WITHIN budget (a
-    genuinely POSITIVE remaining-timeout share reaches the optional Spark
-    probe), WHEN assess() runs with spark_mode=preferred/spark_fallback=
-    allowed and the optional spark_env_only probe spawns and then receives a
-    real `subprocess.TimeoutExpired`, THEN the required probes are observed
-    to run BEFORE the optional probe (`gh, gh, gh, sh` order), the overall
-    decision is `degraded` (not `blocked`), and the GitHub probe results
-    remain ready.
-
-    Issue #2401 P2-1 fix_delta: this is AC2's actual scenario -- a spawned
-    Spark probe starved by `TimeoutExpired` mid-flight -- not the separate
-    before-spawn deadline-exhaustion case, which
-    `test_expired_deadline_spawns_no_new_process` in
-    `test_workflow_capability_preflight_deadline.py` already covers (AC7's
-    focused suite includes that file)."""
+def test_required_probes_run_and_no_optional_spark_probe_is_ever_spawned(monkeypatch):
+    """Issue #2651: the optional Spark env-only probe (`spark_env_only`,
+    formerly spawned as `sh preflight.sh --env-only`) is retired -- it is
+    never spawned any more, regardless of `spark_mode`/`spark_fallback` or
+    how much of the shared deadline budget remains after the three
+    required GitHub probes. `assess()`'s Spark decision is now purely
+    directive-based (`_spark_status()`), so there is no more "spawned but
+    starved by TimeoutExpired mid-flight" scenario to observe -- this test
+    instead confirms the absence of any `sh` subprocess call."""
     monkeypatch.setattr(wcp.trusted_uv_mod, "check_trusted_uv", _ready_uv)
-    # One monotonic read per probe attempt: the three required probes each
-    # advance the clock but stay well within the shared 100s-relative
-    # budget, leaving the optional spark_env_only probe a genuinely positive
-    # remaining-timeout share when `_run_probe_with_deadline` checks it.
     clock_values = iter((90_000_000_000, 91_000_000_000, 92_000_000_000, 93_000_000_000))
     monkeypatch.setattr(wcp.time, "monotonic_ns", lambda: next(clock_values))
 
     calls: list[list[str]] = []
-    spark_timeouts: list[float] = []
 
     def fake_run(argv, **kwargs):
         calls.append(list(argv))
-        if argv[0] == "sh":
-            spark_timeouts.append(kwargs["timeout"])
-            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
         return _completed(argv)
 
     monkeypatch.setattr(wcp.subprocess, "run", fake_run)
@@ -110,19 +95,17 @@ def test_required_probes_run_before_optional_spark_and_starvation_degrades(monke
         deadline_ns=100_000_000_000,
     )
 
-    # The three required `gh` probes ran BEFORE the optional `sh` (spark)
-    # probe, which then spawned (not starved before spawn) and timed out.
-    assert [call[0] for call in calls] == ["gh", "gh", "gh", "sh"]
-    assert spark_timeouts and spark_timeouts[0] > 0
-    assert "preflight_probe_timeout:spark_env_only" in result["reasons"]
+    # Only the three required `gh` probes ran -- no `sh` (spark) probe.
+    assert [call[0] for call in calls] == ["gh", "gh", "gh"]
+    assert not any("spark_env_only" in reason for reason in result["reasons"])
 
     assert result["checks"]["github"]["auth"] is True
     assert result["checks"]["github"]["repo_read"] is True
     assert result["actor_capabilities"]["root_github_read"]["status"] == "ready"
     assert result["actor_capabilities"]["controlled_github_read"]["status"] == "ready"
 
-    assert result["checks"]["spark"]["status"] == wcp.SPARK_FALLBACK_ONLY
-    assert result["decision"] == wcp.DECISION_DEGRADED
+    assert result["checks"]["spark"]["status"] == wcp.SPARK_RETIRED
+    assert result["decision"] == wcp.DECISION_BLOCKED
 
 
 def test_controlled_github_read_runs_independently_of_root_auth_failure(monkeypatch):
@@ -190,7 +173,12 @@ def test_controlled_github_read_runs_independently_of_root_auth_failure(monkeypa
         "non_bool_chatgpt_auth_available",
     ),
 )
-def test_malformed_spark_payload_returns_structured_reason(monkeypatch, stdout):
+def test_malformed_spark_payload_is_irrelevant_to_the_retired_decision(monkeypatch, stdout):
+    """Issue #2651: `_run_env_only_preflight()` (whatever it would return,
+    malformed or not) is never consulted by `assess()`'s retired Spark
+    decision -- both `preferred`/`allowed` and `required`/`forbidden`
+    directives deterministically retire to `blocked`, regardless of this
+    monkeypatched payload."""
     monkeypatch.setattr(wcp.trusted_uv_mod, "check_trusted_uv", _ready_uv)
     monkeypatch.setattr(wcp, "_github_auth_probe", lambda deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED))
     monkeypatch.setattr(
@@ -205,9 +193,10 @@ def test_malformed_spark_payload_returns_structured_reason(monkeypatch, stdout):
         lambda deadline_ns: wcp.ProbeOutcome(wcp.PROBE_COMPLETED, stdout=stdout),
     )
 
-    # preferred/allowed: malformed Spark output degrades (fallback allowed),
-    # and -- the crux of this AC -- assess() must not raise.
-    degraded_result = wcp.assess(
+    # preferred/allowed: retired -> blocked (never degraded), and -- the
+    # crux of this AC -- assess() must not raise regardless of the
+    # (unconsulted) malformed payload.
+    preferred_result = wcp.assess(
         project_root=str(_REPO_ROOT),
         profile="issue-to-impl",
         repo=_REPO,
@@ -215,12 +204,11 @@ def test_malformed_spark_payload_returns_structured_reason(monkeypatch, stdout):
         spark_fallback="allowed",
         planned_operations=[],
     )
-    assert "preflight_probe_malformed_output:spark_env_only" in degraded_result["reasons"]
-    assert degraded_result["checks"]["spark"]["status"] == wcp.SPARK_FALLBACK_ONLY
-    assert degraded_result["decision"] == wcp.DECISION_DEGRADED
+    assert not any("spark_env_only" in reason for reason in preferred_result["reasons"])
+    assert preferred_result["checks"]["spark"]["status"] == wcp.SPARK_RETIRED
+    assert preferred_result["decision"] == wcp.DECISION_BLOCKED
 
-    # required/forbidden: malformed Spark output blocks (fail closed, no
-    # silent fallback).
+    # required/forbidden: also retired -> blocked (identical semantics).
     blocked_result = wcp.assess(
         project_root=str(_REPO_ROOT),
         profile="issue-to-impl",
@@ -229,7 +217,7 @@ def test_malformed_spark_payload_returns_structured_reason(monkeypatch, stdout):
         spark_fallback="forbidden",
         planned_operations=[],
     )
-    assert blocked_result["checks"]["spark"]["status"] == wcp.SPARK_UNAVAILABLE
+    assert blocked_result["checks"]["spark"]["status"] == wcp.SPARK_RETIRED
     assert blocked_result["decision"] == wcp.DECISION_BLOCKED
 
 
@@ -285,17 +273,13 @@ def test_assess_without_deadline_creates_one_shared_local_deadline(monkeypatch):
         seen_deadlines.append(deadline_ns)
         return wcp.ProbeOutcome(wcp.PROBE_COMPLETED)
 
-    def _run_env_only_preflight(deadline_ns):
-        seen_deadlines.append(deadline_ns)
-        return wcp.ProbeOutcome(
-            wcp.PROBE_COMPLETED,
-            stdout=json.dumps({"binary_available": True, "chatgpt_auth": {"available": True}}),
-        )
+    def _fail_if_spark_probe_called(deadline_ns):
+        raise AssertionError("assess() must not spawn the retired Spark env-only probe any more")
 
     monkeypatch.setattr(wcp, "_github_auth_probe", _github_auth_probe)
     monkeypatch.setattr(wcp, "_github_repo_read_probe", _github_repo_read_probe)
     monkeypatch.setattr(wcp, "_controlled_github_read_probe", _controlled_github_read_probe)
-    monkeypatch.setattr(wcp, "_run_env_only_preflight", _run_env_only_preflight)
+    monkeypatch.setattr(wcp, "_run_env_only_preflight", _fail_if_spark_probe_called)
 
     result = wcp.assess(
         project_root=str(_REPO_ROOT),
@@ -310,9 +294,14 @@ def test_assess_without_deadline_creates_one_shared_local_deadline(monkeypatch):
     # Exactly one local absolute deadline created for this call to the REAL
     # assess() (not a monkeypatched replacement of assess() itself).
     assert local_deadline_calls["count"] == 1
-    # The SAME deadline value reached every applicable probe, unchanged.
-    assert seen_deadlines == [sentinel_deadline] * 4
-    assert result["decision"] == wcp.DECISION_READY
+    # The SAME deadline value reached every applicable (required-only, now
+    # that the optional Spark probe is retired -- Issue #2651) probe.
+    assert seen_deadlines == [sentinel_deadline] * 3
+    # spark_mode="preferred" still deterministically retires -> blocked
+    # (never ready/degraded) now, even though the required GitHub probes
+    # above are all pinned ready.
+    assert result["checks"]["spark"]["status"] == wcp.SPARK_RETIRED
+    assert result["decision"] == wcp.DECISION_BLOCKED
 
 
 # =============================================================================

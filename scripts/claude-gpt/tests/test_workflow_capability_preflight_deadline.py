@@ -33,7 +33,12 @@ def _completed(argv, *, stdout=""):
     return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
 
-def test_all_four_probes_share_decreasing_remaining_timeout(monkeypatch):
+def test_all_three_required_probes_share_decreasing_remaining_timeout(monkeypatch):
+    """Issue #2651: the optional Spark env-only probe is retired -- only the
+    3 required GitHub probes (`github_auth` -> `github_repo_read` ->
+    `controlled_github_read`) share the deadline any more, even when
+    `spark_mode="required"` is declared (the directive is judged
+    deterministically retired, without spawning any process for it)."""
     clock_values = iter((90_000_000_000, 91_000_000_000, 92_000_000_000, 93_000_000_000))
     monkeypatch.setattr(wcp.time, "monotonic_ns", lambda: next(clock_values))
     monkeypatch.setattr(wcp.trusted_uv_mod, "check_trusted_uv", _ready_uv)
@@ -41,8 +46,7 @@ def test_all_four_probes_share_decreasing_remaining_timeout(monkeypatch):
 
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs["timeout"]))
-        stdout = json.dumps({"binary_available": True, "chatgpt_auth": {"available": True}})
-        return _completed(argv, stdout=stdout)
+        return _completed(argv)
 
     monkeypatch.setattr(wcp.subprocess, "run", fake_run)
 
@@ -56,14 +60,12 @@ def test_all_four_probes_share_decreasing_remaining_timeout(monkeypatch):
         deadline_ns=100_000_000_000,
     )
 
-    assert result["decision"] == wcp.DECISION_READY
-    assert [round(timeout, 3) for _, timeout in calls] == [10.0, 9.0, 8.0, 7.0]
-    # Issue #2401 AC1: required GitHub probes (`github_auth` ->
-    # `github_repo_read` -> `controlled_github_read`) now run BEFORE the
-    # optional Spark probe, so the shared deadline's decreasing remaining
-    # timeout is observed by `gh`, `gh`, `gh`, `sh` in that order (not the
-    # prior `sh`-first order).
-    assert [call[0][0] for call in calls] == ["gh", "gh", "gh", "sh"]
+    # The overall decision is `blocked` (Spark directive retired), not
+    # `ready` -- this test's own subject is the shared-deadline timeout
+    # sequence, not the decision outcome (covered elsewhere).
+    assert result["checks"]["spark"]["status"] == wcp.SPARK_RETIRED
+    assert [round(timeout, 3) for _, timeout in calls] == [10.0, 9.0, 8.0]
+    assert [call[0][0] for call in calls] == ["gh", "gh", "gh"]
 
 
 def test_expired_deadline_spawns_no_new_process(monkeypatch):
@@ -87,7 +89,12 @@ def test_expired_deadline_spawns_no_new_process(monkeypatch):
     assert "preflight_deadline_exhausted:controlled_github_read" in result["reasons"]
 
 
-def test_spark_none_skips_env_probe_and_timeout_semantics_are_preserved(monkeypatch):
+def test_spark_probe_is_never_spawned_for_any_spark_mode_value(monkeypatch):
+    """Issue #2651: no `spark_mode` value spawns the (retired) Spark
+    env-only probe any more -- not `None` (never did), and not
+    `preferred`/`required` either (used to, before retirement). Every
+    non-None directive now deterministically retires without spawning a
+    process for it, and `spark_mode=None` remains `not_required`/`ready`."""
     monkeypatch.setattr(wcp.trusted_uv_mod, "check_trusted_uv", _ready_uv)
     calls = []
 
@@ -110,18 +117,25 @@ def test_spark_none_skips_env_probe_and_timeout_semantics_are_preserved(monkeypa
         project_root=str(_REPO_ROOT), profile="issue-to-impl", repo=_REPO,
         spark_mode="preferred", spark_fallback="allowed", planned_operations=[],
     )
-    assert preferred["checks"]["spark"]["status"] == wcp.SPARK_FALLBACK_ONLY
-    assert preferred["decision"] == wcp.DECISION_DEGRADED
+    assert preferred["checks"]["spark"]["status"] == wcp.SPARK_RETIRED
+    assert preferred["decision"] == wcp.DECISION_BLOCKED
     required = wcp.assess(
         project_root=str(_REPO_ROOT), profile="issue-to-impl", repo=_REPO,
         spark_mode="required", spark_fallback="forbidden", planned_operations=[],
     )
-    assert required["checks"]["spark"]["status"] == wcp.SPARK_UNAVAILABLE
+    assert required["checks"]["spark"]["status"] == wcp.SPARK_RETIRED
     assert required["decision"] == wcp.DECISION_BLOCKED
+    assert all(argv[0] != "sh" for argv in calls)
 
 
 @pytest.mark.parametrize("stdout", ("not-json", "[]"))
-def test_successful_malformed_spark_output_returns_structured_reason(monkeypatch, stdout):
+def test_malformed_spark_probe_output_is_irrelevant_to_the_retired_decision(monkeypatch, stdout):
+    """Issue #2651: `assess()`'s retired Spark decision never calls
+    `_run_env_only_preflight()` any more, so even if it were monkeypatched
+    to return malformed output, the result is completely unaffected --
+    `reasons` never carries a `preflight_probe_malformed_output:
+    spark_env_only` entry, and the decision is the plain deterministic
+    retired-blocked outcome (never `degraded`)."""
     monkeypatch.setattr(wcp.trusted_uv_mod, "check_trusted_uv", _ready_uv)
     monkeypatch.setattr(
         wcp,
@@ -153,9 +167,9 @@ def test_successful_malformed_spark_output_returns_structured_reason(monkeypatch
         planned_operations=[],
     )
 
-    assert "preflight_probe_malformed_output:spark_env_only" in result["reasons"]
-    assert result["checks"]["spark"]["status"] == wcp.SPARK_FALLBACK_ONLY
-    assert result["decision"] == wcp.DECISION_DEGRADED
+    assert not any("spark_env_only" in reason for reason in result["reasons"])
+    assert result["checks"]["spark"]["status"] == wcp.SPARK_RETIRED
+    assert result["decision"] == wcp.DECISION_BLOCKED
 
 
 def test_producer_cli_without_deadline_passes_none_to_assess(monkeypatch):

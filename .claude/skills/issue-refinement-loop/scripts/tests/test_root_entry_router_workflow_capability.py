@@ -18,6 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
@@ -208,16 +210,30 @@ def test_capability_preflight_blocked_publishes_no_audit_comment(tmp_path):
 # --- P0-3: production consumer declares its own planned audit mutation ---
 
 
-def test_gh_cli_transport_declares_spark_and_planned_operations(monkeypatch, tmp_path):
-    """GIVEN a GhCliGitHubEntryTransport constructed with spark_mode /
-    spark_fallback / planned_operations
+def test_gh_cli_transport_no_longer_accepts_spark_kwargs():
+    """Issue #2651: `GhCliGitHubEntryTransport` no longer accepts
+    `spark_mode`/`spark_fallback` constructor arguments at all -- the
+    dataclass fields were removed (this class's only callers are inside
+    this Issue's Allowed Paths, unlike `workflow_capability_preflight.py::
+    assess()`, which keeps them for an external pinned caller)."""
+    with pytest.raises(TypeError):
+        rer.GhCliGitHubEntryTransport(  # type: ignore[call-arg]
+            repo=_REPO,
+            spark_mode="required",
+            spark_fallback="forbidden",
+        )
+
+
+def test_gh_cli_transport_declares_planned_operations_without_spark_argv(monkeypatch, tmp_path):
+    """GIVEN a GhCliGitHubEntryTransport constructed with planned_operations
+    (no Spark kwargs -- they no longer exist)
     WHEN capability_preflight() dispatches to workflow_capability_preflight.py
-    THEN the subprocess argv carries --spark-mode / --spark-fallback /
-    --planned-operations-json, and the JSON file behind
-    --planned-operations-json contains the declared operations (P0-3 fix:
-    the production transport must self-declare the audit `issue_comment`
-    mutation it is about to perform, not let the preflight pass on an
-    empty/unstated operation set)."""
+    THEN the subprocess argv carries --planned-operations-json (and the JSON
+    file behind it contains the declared operations -- P0-3 fix: the
+    production transport must self-declare the audit `issue_comment`
+    mutation it is about to perform), but NEVER --spark-mode/--spark-fallback
+    (Issue #2651: the Spark directive channel is fully severed at this
+    boundary)."""
 
     captured = {}
 
@@ -238,8 +254,6 @@ def test_gh_cli_transport_declares_spark_and_planned_operations(monkeypatch, tmp
 
     transport = rer.GhCliGitHubEntryTransport(
         repo=_REPO,
-        spark_mode="required",
-        spark_fallback="forbidden",
         planned_operations=(
             {
                 "phase": "audit",
@@ -253,10 +267,8 @@ def test_gh_cli_transport_declares_spark_and_planned_operations(monkeypatch, tmp
     assert transport.capability_preflight() is True
 
     argv = captured["argv"]
-    assert "--spark-mode" in argv
-    assert argv[argv.index("--spark-mode") + 1] == "required"
-    assert "--spark-fallback" in argv
-    assert argv[argv.index("--spark-fallback") + 1] == "forbidden"
+    assert "--spark-mode" not in argv
+    assert "--spark-fallback" not in argv
     assert "--planned-operations-json" in argv
     assert captured["written"] == [
         {
@@ -379,17 +391,17 @@ def test_real_producer_blocked_on_fake_gh_auth_failure_posts_no_comment(tmp_path
         assert state.get("comments", {}) == {}
 
 
-def test_real_producer_receives_spark_directive_and_planned_operations(tmp_path, monkeypatch):
+def test_real_producer_receives_planned_operations(tmp_path, monkeypatch):
     """GIVEN the REAL `workflow_capability_preflight.py` producer, driven
     through the REAL `GhCliGitHubEntryTransport.capability_preflight()`
-    consumer, with a required Spark directive and an UNREGISTERED planned
-    operation
-    THEN the real producer receives and acts on both: the unregistered
+    consumer, with an UNREGISTERED planned operation (no Spark kwargs --
+    Issue #2651 removed them from this class's constructor)
+    THEN the real producer receives and acts on it: the unregistered
     operation makes it `route: unavailable` (visible via a blocked
-    decision), proving `--spark-mode`/`--spark-fallback`/
-    `--planned-operations-json` actually reach the real subprocess argv end
-    to end (not just the unit-level argv assertion in
-    ``test_gh_cli_transport_declares_spark_and_planned_operations``)."""
+    decision), proving the `--planned-operations-json` payload actually
+    reaches the real subprocess argv end to end (not just the unit-level
+    argv assertion in
+    ``test_gh_cli_transport_declares_planned_operations_without_spark_argv``)."""
 
     bin_dir = tmp_path / "bin"
     _install_fake_gh(bin_dir)
@@ -402,8 +414,6 @@ def test_real_producer_receives_spark_directive_and_planned_operations(tmp_path,
 
     transport = rer.GhCliGitHubEntryTransport(
         repo=_REPO,
-        spark_mode="required",
-        spark_fallback="forbidden",
         planned_operations=(
             {
                 "phase": "audit",
