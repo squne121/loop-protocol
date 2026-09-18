@@ -23,11 +23,13 @@ import pytest
 _SCRIPT = (
     pathlib.Path(__file__).parent.parent / "ci_verdict_summary_v2.py"
 )
-_WORKFLOW = pathlib.Path(__file__).parents[5] / ".github/workflows/ci.yml"
+_REPO_ROOT = pathlib.Path(__file__).parents[5]
+_WORKFLOW = _REPO_ROOT / ".github/workflows/ci.yml"
+_CI_JOB_SNAPSHOT_SCRIPT = _REPO_ROOT / "scripts" / "ci" / "ci_job_snapshot.py"
 
 
 def _load_module(path: pathlib.Path) -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location("ci_verdict_summary_v2", path)
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -37,6 +39,15 @@ def _load_module(path: pathlib.Path) -> types.ModuleType:
 @pytest.fixture(scope="module")
 def v2() -> types.ModuleType:
     return _load_module(_SCRIPT)
+
+
+@pytest.fixture(scope="module")
+def cjs() -> types.ModuleType:
+    """Issue #2631: the SAME shared job-snapshot helper both real production
+    consumers (this module and scripts/ci/verify_ci_check_conclusions.py)
+    import -- tests build REAL snapshots through it, never a mirror/fake
+    reimplementation."""
+    return _load_module(_CI_JOB_SNAPSHOT_SCRIPT)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +95,65 @@ def build(
         event_name=event_name,
         raw_checks=checks,
     )
+
+
+def _job_row(
+    name: str,
+    *,
+    job_id: int,
+    run_id: int = 555,
+    head_sha: str = EXPECTED_SHA,
+    run_attempt: int | None = 1,
+    status: str | None = "completed",
+    conclusion: str | None = "success",
+    check_run_url: str | None = None,
+) -> dict:
+    """Build one raw Actions Jobs API row (Issue #2631 attempt-scoped
+    acquisition contract)."""
+    return {
+        "id": job_id,
+        "name": name,
+        "run_id": run_id,
+        "head_sha": head_sha,
+        "run_attempt": run_attempt,
+        "status": status,
+        "conclusion": conclusion,
+        "started_at": "2026-01-01T00:00:00Z",
+        "completed_at": "2026-01-01T00:05:00Z",
+        "check_run_url": check_run_url
+        or f"https://api.github.com/repos/owner/repo/check-runs/{job_id}",
+    }
+
+
+def _build_job_snapshot_file(
+    cjs: types.ModuleType,
+    tmp_path: pathlib.Path,
+    jobs: list[dict],
+    *,
+    run_id: int = 555,
+    run_attempt: int = 1,
+    head_sha: str = EXPECTED_SHA,
+    repository: str = "owner/repo",
+) -> pathlib.Path:
+    """Build a REAL validated ci_job_snapshot_v1 file via the shared helper
+    (never a hand-rolled fixture bypassing its own validation)."""
+    identity_payload = {
+        "id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": head_sha,
+        "run_started_at": "2026-01-01T00:00:00Z",
+        "repository": {"full_name": repository},
+    }
+    snapshot = cjs.build_snapshot(
+        pages=[{"total_count": len(jobs), "jobs": jobs}],
+        identity_payload=identity_payload,
+        expected_repository=repository,
+        expected_run_id=run_id,
+        expected_head_sha=head_sha,
+    )
+    out = tmp_path / "ci_job_snapshot.json"
+    cjs.atomic_write_snapshot(snapshot, out)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -496,29 +566,18 @@ class TestOrdinaryPrDispatchOnlyExcludedClassification:
             status="completed",
             conclusion="skipped",
             head_sha=EXPECTED_SHA,
-            provenance="github_check_run_api",
+            provenance="github_actions_job_api",
         )
         check.update(overrides)
         return check
 
     @pytest.mark.parametrize("name", CONDITIONAL_EXCLUDED_NAMES)
-    def test_exact_ordinary_pr_skip_is_excluded_without_relaxing_other_checks(self, v2, name):
-        raw_checks = v2.check_runs_api_to_raw_checks(
-            {
-                "check_runs": [
-                    {
-                        "id": 24_333,
-                        "name": name,
-                        "status": "completed",
-                        "conclusion": "skipped",
-                        "head_sha": EXPECTED_SHA,
-                        "details_url": "https://github.com/owner/repo/actions/runs/1/job/1",
-                        "app": {"slug": "github-actions"},
-                    }
-                ]
-            },
-            workflow_run_id=1,
-        )
+    def test_exact_ordinary_pr_skip_is_excluded_without_relaxing_other_checks(
+        self, v2, cjs, tmp_path, name
+    ):
+        job = _job_row(name, job_id=24_333, status="completed", conclusion="skipped")
+        snapshot_path = _build_job_snapshot_file(cjs, tmp_path, [job])
+        raw_checks = v2.job_snapshot_file_to_raw_checks(str(snapshot_path))
         checks = _all_other_required_checks_passing()
         checks.extend(raw_checks)
         artifact = build(v2, checks)
@@ -865,23 +924,13 @@ class TestB1B2NeedsResultSynthetic:
         assert entry["failure_reason"] == "gh_error"
 
 
-class TestP0RealCheckRunApiEvidence:
-    """P0: merge-ready evidence must originate from CheckRun API rows."""
+class TestP0RealJobApiEvidence:
+    """P0 (Issue #2631): merge-ready evidence must originate from the
+    attempt-scoped Actions Jobs snapshot via the REAL shared helper
+    (scripts/ci/ci_job_snapshot.py) -- never a mirror/fake reimplementation
+    or the retired commit-scoped CheckRuns acquisition."""
 
-    def _api_row(
-        self, name: str, *, head_sha: str = EXPECTED_SHA, run_id: int = 123, app_slug: str = "github-actions"
-    ) -> dict:
-        return {
-            "id": len(name) + 1000,
-            "name": name,
-            "status": "completed",
-            "conclusion": "success",
-            "head_sha": head_sha,
-            "details_url": f"https://github.com/owner/repo/actions/runs/{run_id}/job/1",
-            "app": {"slug": app_slug},
-        }
-
-    def test_actual_check_runs_are_bound_to_current_workflow_and_head(self, v2):
+    def test_actual_jobs_are_bound_to_current_workflow_and_head(self, v2, cjs, tmp_path):
         names = [
             "typecheck", "lint", "test", "build", "e2e",
             "e2e-core", "e2e-responsive-matrix",
@@ -889,16 +938,16 @@ class TestP0RealCheckRunApiEvidence:
             "node-backed-hook-tests", "actionlint", "agy-causal-claim-drift-gate",
             "visual-impact-policy",
         ]
-        raw_checks = v2.check_runs_api_to_raw_checks(
-            {"check_runs": [self._api_row(name) for name in names]}, workflow_run_id=123
-        )
+        jobs = [_job_row(name, job_id=1000 + i) for i, name in enumerate(names)]
+        snapshot_path = _build_job_snapshot_file(cjs, tmp_path, jobs)
+        raw_checks = v2.job_snapshot_file_to_raw_checks(str(snapshot_path))
         artifact = build(v2, raw_checks)
-        assert artifact["overall_status"] == "merge_ready"
+        assert artifact["overall_status"] == "merge_ready", artifact
         assert all(check["head_sha"] == EXPECTED_SHA for check in artifact["checks"])
         assert [check["check_run_id"] for check in artifact["checks"]] == [
             row["check_run_id"] for row in raw_checks
         ]
-        assert all(check["provenance"] == "github_check_run_api" for check in artifact["checks"])
+        assert all(check["provenance"] == "github_actions_job_api" for check in artifact["checks"])
 
     def test_required_check_without_check_run_id_blocks_merge_ready(self, v2):
         raw = make_check("typecheck")
@@ -908,39 +957,74 @@ class TestP0RealCheckRunApiEvidence:
         assert entry["blocking_merge_ready"] is True
         assert entry["failure_reason"] == "gh_error"
 
-    def test_actual_check_run_with_stale_head_blocks_merge_ready(self, v2):
-        raw = self._api_row("typecheck", head_sha=OTHER_SHA)
+    def test_actual_job_with_stale_head_blocks_merge_ready(self, v2):
+        raw = {
+            "name": "typecheck",
+            "workflow": "ci",
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": OTHER_SHA,
+            "check_run_id": 1042,
+            "check_run_url": "https://api.github.com/repos/owner/repo/check-runs/1042",
+            "provenance": "github_actions_job_api",
+        }
         entry = v2.build_check_entry(raw, "ci", EXPECTED_SHA)
-        assert entry["check_run_id"] == raw["id"]
+        assert entry["check_run_id"] == 1042
         assert entry["head_sha_match"] is False
         assert entry["blocking_merge_ready"] is True
         assert entry["failure_reason"] == "stale_head_sha"
 
-    def test_wrong_workflow_run_is_not_accepted_as_evidence(self, v2):
-        with pytest.raises(ValueError, match="no_current_workflow_evidence"):
-            v2.check_runs_api_to_raw_checks(
-                {"check_runs": [self._api_row("typecheck", run_id=999)]}, workflow_run_id=123
+    def test_wrong_workflow_run_is_not_accepted_as_evidence(self, cjs):
+        """AC2: a job row bound to a DIFFERENT run_id than the identity SSOT
+        is a fail-closed structural violation at snapshot-build time."""
+        identity_payload = {
+            "id": 123,
+            "run_attempt": 1,
+            "head_sha": EXPECTED_SHA,
+            "run_started_at": "2026-01-01T00:00:00Z",
+            "repository": {"full_name": "owner/repo"},
+        }
+        mismatched_job = _job_row("typecheck", job_id=1, run_id=999)
+        with pytest.raises(cjs.SnapshotError, match="job_row_run_id_mismatch"):
+            cjs.build_snapshot(
+                pages=[{"total_count": 1, "jobs": [mismatched_job]}],
+                identity_payload=identity_payload,
+                expected_repository="owner/repo",
+                expected_run_id=123,
+                expected_head_sha=EXPECTED_SHA,
             )
 
-    def test_cli_rejects_malformed_actual_check_run_payload(self, v2, tmp_path):
-        source = tmp_path / "check-runs.json"
+    def test_duplicate_job_name_is_deterministically_rejected(self, v2, cjs, tmp_path):
+        """AC8: a duplicate job name is NEVER disambiguated by e.g. picking
+        the highest id -- it is a deterministic reject."""
+        jobs = [_job_row("typecheck", job_id=1), _job_row("typecheck", job_id=2)]
+        snapshot_path = _build_job_snapshot_file(cjs, tmp_path, jobs)
+        with pytest.raises(ValueError, match="duplicate_job_name"):
+            v2.job_snapshot_file_to_raw_checks(str(snapshot_path))
+
+    def test_cli_rejects_malformed_job_snapshot_payload(self, v2, tmp_path):
+        source = tmp_path / "ci_job_snapshot.json"
         output = tmp_path / "verdict.json"
-        source.write_text(json.dumps({"check_runs": [{"name": "test"}]}))
+        source.write_text(json.dumps({"schema": "wrong_schema"}))
         assert v2.main([
             "--expected-head-sha", EXPECTED_SHA,
             "--pr-head-sha", EXPECTED_SHA,
             "--workflow-run-id", "123",
-            "--check-runs-api-json", str(source),
+            "--job-snapshot-json", str(source),
             "--output", str(output),
         ]) == 1
         assert not output.exists()
 
-    def test_workflow_uses_commit_scoped_check_run_api_not_needs_result(self):
+    def test_workflow_uses_attempt_scoped_jobs_api_not_needs_result(self):
         workflow = _WORKFLOW.read_text()
         verdict_job = workflow[workflow.index("  ci-verdict-summary:"):]
-        assert "commits/${PR_HEAD_SHA}/check-runs?per_page=100" in verdict_job
-        assert "--check-runs-api-json ci_verdict_summary_v2_check_runs.json" in verdict_job
+        assert (
+            "actions/runs/${GH_RUN_ID}/attempts/${GH_RUN_ATTEMPT}/jobs?per_page=100"
+            in verdict_job
+        )
+        assert "--job-snapshot-json ci_job_snapshot.json" in verdict_job
         assert "--needs-json" not in verdict_job
+        assert "commits/${PR_HEAD_SHA}/check-runs" not in verdict_job
 
 
 # ---------------------------------------------------------------------------
@@ -1083,40 +1167,33 @@ class TestP0_1AllRealCiJobsClassified:
     def test_python_test_core_is_classified(self, v2):
         assert v2.get_classification("ci", "python-test-core") != "unknown"
 
-    def test_real_ci_jobs_all_green_yields_merge_ready_not_gh_error(self, v2):
+    def test_real_ci_jobs_all_green_yields_merge_ready_not_gh_error(self, v2, cjs, tmp_path):
         """End-to-end reproduction of the reported bug (run 30271027218):
         every job that feeds ci-verdict-summary succeeds at the current head,
         and overall_status must be merge_ready, never gh_error.
 
-        The synthetic check-run set below is the union of ci-verdict-summary's
+        The synthetic Jobs snapshot below is the union of ci-verdict-summary's
         own `needs` AND every `("ci", <name>)` entry in REQUIRED_CHECKS (Issue
         #2119: e2e-core / e2e-responsive-matrix are REQUIRED_CHECKS entries
         but are deliberately NOT in ci-verdict-summary's `needs` — AC11, the
         aggregate `e2e` is the sole authoritative dependency there — yet
-        GitHub's real check-runs API still returns a CheckRun for every
-        workflow job regardless of any other job's `needs` graph, so a
-        faithful "every real CI job succeeded" simulation must include them
-        too)."""
+        GitHub's real Jobs API still returns a job row for every workflow job
+        regardless of any other job's `needs` graph, so a faithful "every
+        real CI job succeeded" simulation must include them too). The
+        in-progress `ci-verdict-summary` job itself is also present in the
+        snapshot (as it would be for real) and must be excluded by the
+        shared bridge, not by this test manually filtering it out."""
         needs = self._ci_verdict_summary_needs()
         required_ci_names = {name for (workflow, name) in v2.REQUIRED_CHECKS if workflow == "ci"}
-        needs = sorted(set(needs) | required_ci_names)
+        names = sorted(set(needs) | required_ci_names | {"ci-verdict-summary"})
         run_id = 4242
 
-        def api_row(name: str) -> dict:
-            return {
-                "id": abs(hash(name)) % 100000 + 1,
-                "name": name,
-                "status": "completed",
-                "conclusion": "success",
-                "head_sha": EXPECTED_SHA,
-                "details_url": f"https://github.com/owner/repo/actions/runs/{run_id}/job/1",
-                "app": {"slug": "github-actions"},
-            }
-
-        raw_checks = v2.check_runs_api_to_raw_checks(
-            {"check_runs": [api_row(name) for name in needs if name != "ci-verdict-summary"]},
-            workflow_run_id=run_id,
-        )
+        jobs = [
+            _job_row(name, job_id=abs(hash(name)) % 100000 + 1, run_id=run_id)
+            for name in names
+        ]
+        snapshot_path = _build_job_snapshot_file(cjs, tmp_path, jobs, run_id=run_id)
+        raw_checks = v2.job_snapshot_file_to_raw_checks(str(snapshot_path))
         artifact = build(v2, raw_checks)
         assert artifact["overall_status"] == "merge_ready", artifact
         assert not any(c["failure_reason"] == "gh_error" for c in artifact["checks"]), artifact["checks"]
@@ -1133,3 +1210,53 @@ class TestP0_1AllRealCiJobsClassified:
         gate_block = verdict_job[gate_idx:]
         assert 'overall_status != "merge_ready"' in gate_block
         assert "sys.exit(1)" in gate_block
+
+
+# ---------------------------------------------------------------------------
+# Issue #2631 AC3: integration proof that this producer actually imports and
+# calls the REAL shared helper (scripts/ci/ci_job_snapshot.py), not a
+# mirror/fake reimplementation of its identity/provenance semantics.
+# ---------------------------------------------------------------------------
+
+
+class TestIssue2631SharedHelperIntegration:
+    def test_job_snapshot_bridge_uses_the_real_shared_module(self, v2, cjs, tmp_path):
+        job = _job_row("typecheck", job_id=1)
+        snapshot_path = _build_job_snapshot_file(cjs, tmp_path, [job])
+        loaded = cjs.load_snapshot(str(snapshot_path))
+        expected = cjs.job_snapshot_to_raw_checks(loaded)
+        actual = v2.job_snapshot_file_to_raw_checks(str(snapshot_path))
+        assert actual == expected
+
+    def test_job_snapshot_bridge_raises_on_shared_helper_schema_violation(self, v2, tmp_path):
+        """A snapshot the shared helper itself rejects (SnapshotError) must
+        surface here too -- confirming this module actually calls into the
+        shared validator rather than trusting the file blindly."""
+        source = tmp_path / "ci_job_snapshot.json"
+        source.write_text(json.dumps({"schema": "not_ci_job_snapshot_v1", "jobs": []}))
+        with pytest.raises(ValueError, match="snapshot_schema_mismatch"):
+            v2.job_snapshot_file_to_raw_checks(str(source))
+
+    def test_conditional_excluded_tuples_reference_new_job_api_provenance(self, v2):
+        assert v2.EXACT_CHECK_RUN_PROVENANCE == "github_actions_job_api"
+
+    def test_workflow_both_acquisition_owners_use_shared_helper(self):
+        """AC3: both mutually-exclusive acquisition owners (normal PR route
+        and benchmark dispatch route) invoke the SAME shared helper script,
+        never a per-route reimplementation."""
+        workflow = _WORKFLOW.read_text()
+        # ci-verdict-summary is the LAST job in ci.yml -- slice to EOF.
+        verdict_job = workflow[workflow.index("  ci-verdict-summary:"):]
+        gate_ready_job = workflow[
+            workflow.index("  ci-runtime-baseline-gate-ready:") : workflow.index(
+                "  reliability-assessment:"
+            )
+        ]
+        assert "scripts/ci/ci_job_snapshot.py" in verdict_job
+        assert "scripts/ci/ci_job_snapshot.py" in gate_ready_job
+        for job_block in (verdict_job, gate_ready_job):
+            assert "actions: read" in job_block
+            assert "contents: read" in job_block
+            assert "checks: read" in job_block
+            assert "commits/" not in job_block
+            assert "check-runs?per_page" not in job_block
