@@ -6671,5 +6671,30 @@ def extract_spark_gate_writer_source(launch_sh_text: str) -> str | None:
     return None
 
 
+def extract_spark_prompt_retirement_hook_source(launch_sh_text: str) -> str | None:
+    """Issue #2651 OWNER review fix_delta
+    (https://github.com/squne121/loop-protocol/pull/2662#issuecomment-5736035898
+    P1 blocker 2): extract the ``SPARK_PROMPT_RETIREMENT_PY_BEGIN``/``_END``
+    marker region ``scripts/claude-gpt/launch.sh`` embeds as its
+    always-registered ``UserPromptSubmit`` hook. This hook is the small,
+    stateless replacement for the retired Spark authorization gate's own
+    ``UserPromptSubmit`` entry: it rejects an ACTIVE legacy Spark execution
+    request (an ``@agent-spark-codex`` mention, or a valid
+    ``DELEGATION_REQUEST_V1`` directive naming ``spark-codex``/
+    ``gpt-5.3-codex-spark``) before the model ever processes the prompt,
+    without re-adding any pending-authorization state, model evidence, or
+    ledger. Returns ``None`` if the marker region is not found (e.g. a
+    ``launch_sh_text`` that predates this hook)."""
+    begin_marker = "# SPARK_PROMPT_RETIREMENT_PY_BEGIN"
+    end_marker = "# SPARK_PROMPT_RETIREMENT_PY_END"
+    begin_index = launch_sh_text.find(begin_marker)
+    if begin_index == -1:
+        return None
+    end_index = launch_sh_text.find(end_marker, begin_index)
+    if end_index == -1:
+        return None
+    return launch_sh_text[begin_index : end_index + len(end_marker)]
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

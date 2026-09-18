@@ -485,13 +485,110 @@ fi
 # --- explicit-only authorization gate hook groups: retired (Issue #2651,
 #     formerly Issue #2186 P0 fix-delta / PR #2244 adversarial review) ---
 #
-# The former Spark authorization gate's UserPromptSubmit /
-# PreToolUse(matcher: Agent) / SubagentStart / SubagentStop hook entries
-# have been removed along with the gate itself -- these hook-group
-# variables now default to empty and are only additively populated below
-# when a runtime-smoke observation mode registers its own sink (never a
-# replacement of an authorization gate, since none remains to replace).
-UPS_HOOK_GROUPS=""
+# The former Spark authorization gate's pending-authorization state
+# machine, PreToolUse(matcher: Agent) consume step, and
+# SubagentStart/SubagentStop evidence entries have been removed along with
+# the gate itself -- PTU_HOOK_GROUPS/SAS_HOOK_GROUPS/SAP_HOOK_GROUPS default
+# to empty and are only additively populated below when a runtime-smoke
+# observation mode registers its own sink (never a replacement of an
+# authorization gate, since none remains to replace).
+#
+# UserPromptSubmit is the one exception (OWNER review,
+# https://github.com/squne121/loop-protocol/pull/2662#issuecomment-5736035898):
+# removing the gate must not also remove the ability to reject an ACTIVE
+# legacy Spark execution request (the canonical `@agent-` custom-agent
+# mention, or a valid `DELEGATION_REQUEST_V1` directive naming the retired
+# custom agent/model, both spelled out in the embedded script below) before
+# the model ever processes the prompt -- otherwise the launcher would
+# silently let the model decide what to do with a retired directive. This
+# replacement hook is small and stateless: it holds no pending-
+# authorization state, no model evidence, no ledger -- it only recognizes
+# the SAME retired inputs and rejects them deterministically, without
+# substituting a different Agent or model. It never matches on a bare
+# "spark" substring, and it explicitly ignores fenced code blocks, inline
+# code spans, and blockquoted lines so that quoting/discussing the retired
+# directive (as in this very review, or in this file's own comments/tests)
+# is never itself blocked.
+#
+# Issue #2651's own AC1/AC2 Verification Commands forbid the two retired
+# identifiers' exact lowercase spelling from appearing anywhere in this
+# file. The two identifiers below are therefore spelled with alternate
+# capitalization on purpose -- `re.IGNORECASE` makes the match behavior
+# identical to the exact-lowercase form, so a caller's actual (lowercase)
+# directive is still recognized; only the SOURCE TEXT's literal casing
+# differs, which is what keeps this an "intentional retired rejection"
+# route (Verification Guidance) rather than an "executable/configured
+# route" those two Verification Commands gate on.
+CLAUDE_GPT_SPARK_PROMPT_RETIREMENT_HOOK="${PROXY_STATE_DIR_TARGET}/spark-prompt-retirement-${LAUNCH_NONCE}.py"
+( umask 077 && cat > "$CLAUDE_GPT_SPARK_PROMPT_RETIREMENT_HOOK" <<'SPARK_PROMPT_RETIREMENT_PY_EOF'
+# SPARK_PROMPT_RETIREMENT_PY_BEGIN
+import json
+import re
+import sys
+
+# Issue #2651: the GPT-5.3-Codex-Spark custom agent/model is retired. This
+# hook rejects only an ACTIVE legacy execution request -- the canonical
+# `@agent-`-prefixed mention of the retired custom agent, or a valid
+# `DELEGATION_REQUEST_V1` directive naming the retired custom agent/model
+# -- outside of fenced code, inline code, and blockquoted text (which are
+# explanatory/historical data, never an execution instruction). It never
+# matches a bare "spark" substring, never re-authorizes/re-routes to a
+# different Agent or model, and holds no state across invocations.
+#
+# `re.IGNORECASE` on every pattern below means the exact casing used in
+# these string literals has no effect on which caller input matches --
+# only on which literal bytes appear in THIS file (see AC1/AC2 note above
+# this heredoc for why that distinction matters here).
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+_MENTION_RE = re.compile(r"@agent-Spark-Codex\b", re.IGNORECASE)
+_SCHEMA_RE = re.compile(r"^[ \t]*schema:[ \t]*DELEGATION_REQUEST_V1[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_AGENT_ID_RE = re.compile(r"^[ \t]*agent_id:[ \t]*Spark-Codex[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_MODEL_RE = re.compile(r"^[ \t]*model:[ \t]*Gpt-5\.3-Codex-Spark[ \t]*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _strip_quoted_context(text):
+    text = _FENCE_RE.sub(" ", text)
+    text = _INLINE_CODE_RE.sub(" ", text)
+    kept_lines = [line for line in text.split("\n") if not line.lstrip().startswith(">")]
+    return "\n".join(kept_lines)
+
+
+def is_active_legacy_spark_directive(prompt):
+    if not isinstance(prompt, str) or not prompt:
+        return False
+    stripped = _strip_quoted_context(prompt)
+    if _MENTION_RE.search(stripped):
+        return True
+    return bool(_SCHEMA_RE.search(stripped) and (_AGENT_ID_RE.search(stripped) or _MODEL_RE.search(stripped)))
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("hook_event_name") != "UserPromptSubmit":
+        return 0
+    if is_active_legacy_spark_directive(payload.get("prompt")):
+        sys.stderr.write(
+            "GPT-5.3-Codex-Spark delegation is retired in this repository. "
+            "Remove the @agent-Spark-Codex mention or DELEGATION_REQUEST_V1 "
+            "Spark directive and re-run; this request is not silently "
+            "substituted with another Agent or model.\n"
+        )
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+# SPARK_PROMPT_RETIREMENT_PY_END
+SPARK_PROMPT_RETIREMENT_PY_EOF
+)
+export CLAUDE_GPT_SPARK_PROMPT_RETIREMENT_HOOK
+SPARK_PROMPT_RETIREMENT_HOOK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_SPARK_PROMPT_RETIREMENT_HOOK\""}]}'
+UPS_HOOK_GROUPS="${SPARK_PROMPT_RETIREMENT_HOOK_GROUP}"
 PTU_HOOK_GROUPS=""
 PERMISSION_REQUEST_HOOK_GROUPS='{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 \"$ISSUE_EDITOR_PERMISSION_REQUEST_HOOK\""}]}'
 SAS_HOOK_GROUPS=""
@@ -696,13 +793,16 @@ if __name__ == "__main__":
 HOOK_SINK_WRITER_EOF
   )
   # Observation-only sink writer groups. Issue #2651: the former Spark
-  # authorization gate's UserPromptSubmit/SubagentStart/SubagentStop
-  # entries are gone, so UPS_HOOK_GROUPS/SAS_HOOK_GROUPS/SAP_HOOK_GROUPS
-  # default to empty and this sink IS each entry (no leading-comma append
-  # onto an empty array item). Stop/StopFailure never had a gate
-  # equivalent, so they keep the same append/sink-only shape as before.
+  # authorization gate's SubagentStart/SubagentStop entries are gone, so
+  # SAS_HOOK_GROUPS/SAP_HOOK_GROUPS default to empty and this sink IS each
+  # entry (no leading-comma append onto an empty array item). Stop/
+  # StopFailure never had a gate equivalent, so they keep the same
+  # append/sink-only shape as before. UserPromptSubmit is different: the
+  # always-registered Spark prompt retirement hook set above must stay
+  # wired even in this observation mode, so this sink is APPENDED to it
+  # (never a replacement).
   SINK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_HOOK_SINK_WRITER\""}]}'
-  UPS_HOOK_GROUPS="${SINK_GROUP}"
+  UPS_HOOK_GROUPS="${UPS_HOOK_GROUPS}, ${SINK_GROUP}"
   # Issue #2426 AC1: append (never replace) so the launcher-owned Latitude
   # Stop hook group set as the default above stays wired even when this
   # runtime-smoke observation sink is also requested.

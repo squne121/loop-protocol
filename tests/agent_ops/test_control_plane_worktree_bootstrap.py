@@ -804,26 +804,10 @@ def test_given_preflight_run_command_id_when_env_sanitized_in_isolation_then_exp
     assert env["GH_CONFIG_DIR"] == str(tmp_path / "isolated-gh-config")
 
 
-def test_given_main_wired_and_preflight_run_dispatched_when_run_then_env_transport_parity_into_real_dedicated_child(
-    tmp_path, monkeypatch
-):
-    """Issue #2199 AC6: extends the SAME AC5 real-process-chain fixture
+def _prepare_env_transport_parity_fixture(tmp_path, monkeypatch):
+    """Shared setup for the env-transport-parity real-dispatch-chain fixture
     (`exec_mod.main()` itself, never a mocked `_run_child_with_supervision`
-    leaf, never an isolated `_sanitize_env()` call in the test process) so
-    the innermost real subprocess this chain actually reaches (the
-    `run_refinement_preflight.py` stub, launched via
-    `workflow_start_entry.py`'s `_default_invoke_inner_preflight()`, a plain
-    `subprocess.run()` call with no explicit `env=` of its own -- i.e. it
-    plainly inherits whatever `Popen(env=...)` handed the dedicated-root
-    child at the very top) records the ACTUAL environment it observed.
-    Proves invocation-scoped `LOOP_PLANNED_OPERATIONS_JSON` (bare
-    `preflight.run`) and the #2407 `GH_CONFIG_DIR` carrier arrive UNCHANGED
-    at the real dispatched child, that an unrelated, non-allowlisted env
-    var is never generically passed through, AND (Issue #2651)
-    `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` never reach the dispatched
-    child even when set on this process -- GPT-5.3-Codex-Spark delegation
-    is retired, so this allowlist no longer carries them for any command
-    id, including bare `preflight.run`."""
+    leaf, never an isolated `_sanitize_env()` call in the test process)."""
     inner_marker = tmp_path / "inner-ran.marker"
     inner_env_marker = tmp_path / "inner-env.marker"
     local, url = _init_main_dispatch_fixture(
@@ -852,27 +836,38 @@ def test_given_main_wired_and_preflight_run_dispatched_when_run_then_env_transpo
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(local))
     monkeypatch.setenv("SKILL_RUNTIME_TEST_INNER_MARKER_PATH", str(inner_marker))
     monkeypatch.setenv("SKILL_RUNTIME_TEST_INNER_ENV_MARKER_PATH", str(inner_env_marker))
+    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+    monkeypatch.delenv("LOOP_SPARK_MODE", raising=False)
+    monkeypatch.delenv("LOOP_SPARK_FALLBACK", raising=False)
+    return inner_marker, inner_env_marker
+
+
+def test_given_main_wired_and_preflight_run_dispatched_when_run_then_env_transport_parity_into_real_dedicated_child(
+    tmp_path, monkeypatch
+):
+    """Issue #2199 AC6: the innermost real subprocess this chain actually
+    reaches (the `run_refinement_preflight.py` stub, launched via
+    `workflow_start_entry.py`'s `_default_invoke_inner_preflight()`, a plain
+    `subprocess.run()` call with no explicit `env=` of its own -- i.e. it
+    plainly inherits whatever `Popen(env=...)` handed the dedicated-root
+    child at the very top) records the ACTUAL environment it observed.
+    Proves invocation-scoped `LOOP_PLANNED_OPERATIONS_JSON` (bare
+    `preflight.run`) and the #2407 `GH_CONFIG_DIR` carrier arrive UNCHANGED
+    at the real dispatched child, that an unrelated, non-allowlisted env
+    var is never generically passed through, and that ordinary
+    `preflight.run` dispatch (no Spark request at all) is unaffected by the
+    Issue #2651 retirement checks covered separately below."""
+    inner_marker, inner_env_marker = _prepare_env_transport_parity_fixture(tmp_path, monkeypatch)
     gh_config_dir = str(tmp_path / "fixture-gh-config")
     planned_operations_json = (
         '[{"phase": "workflow_start", "actor_role": "issue-refinement-loop", '
         '"operation": "issue_comment", "requires_mutation": true}]'
     )
     monkeypatch.setenv("GH_CONFIG_DIR", gh_config_dir)
-    # Issue #2651: LOOP_SPARK_MODE/LOOP_SPARK_FALLBACK are set here
-    # deliberately -- this test proves they are stripped by
-    # `_sanitize_env()` before ever reaching the dispatched child (never
-    # carried through, unlike before this Issue), so the real producer
-    # never even observes a Spark directive and the workflow proceeds
-    # ordinarily (`workflow_start_entry.py` sees `spark_mode=None`,
-    # invoking the inner preflight normally -- not because of a
-    # `degraded`-vs-`blocked` distinction, which no longer applies).
-    monkeypatch.setenv("LOOP_SPARK_MODE", "required")
-    monkeypatch.setenv("LOOP_SPARK_FALLBACK", "allowed")
     monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", planned_operations_json)
     # Not allowlisted anywhere in `_sanitize_env()` -- must NOT reach the
     # dispatched child (proof against generic env pass-through widening).
     monkeypatch.setenv("LOOP_PROTOCOL_TEST_UNRELATED_CANARY", "should-not-propagate")
-    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
 
     exit_code = exec_mod.main(
         ["--command-id", "preflight.run", "--issue-number", "1228", "--repo", "squne121/loop-protocol"]
@@ -887,6 +882,56 @@ def test_given_main_wired_and_preflight_run_dispatched_when_run_then_env_transpo
     assert observed["LOOP_SPARK_FALLBACK"] is None
     assert observed["LOOP_PLANNED_OPERATIONS_JSON"] == planned_operations_json
     assert observed["LOOP_PROTOCOL_TEST_UNRELATED_CANARY"] is None
+
+
+@pytest.mark.parametrize(
+    ("spark_mode", "spark_fallback"),
+    [
+        pytest.param("required", "forbidden", id="required_forbidden"),
+        pytest.param("preferred", "allowed", id="preferred_allowed"),
+    ],
+)
+def test_given_legacy_spark_env_when_preflight_run_dispatched_then_retired_rejection_and_no_inner_dispatch(
+    tmp_path, monkeypatch, capsys, spark_mode, spark_fallback
+):
+    """Issue #2651 OWNER review fix_delta
+    (https://github.com/squne121/loop-protocol/pull/2662#issuecomment-5736035898
+    P1 blocker 1): a legacy `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` request
+    reaching the canonical `preflight.run` executor must be rejected on
+    THIS executor's own input boundary -- deterministically, non-zero exit,
+    with no child/inner preflight process ever started -- for BOTH
+    previously-valid legacy shapes (`required`+`forbidden` and
+    `preferred`+`allowed`). This replaces the prior (incorrect) expectation
+    that `_sanitize_env()` merely stripping these two vars before dispatch
+    was itself sufficient: that only prevented the CHILD from seeing them
+    while still letting the ordinary producer/inner-preflight flow proceed
+    with `spark_mode=None` -- i.e. exactly the silent request-to-ordinary-
+    flow conversion the OWNER review flagged. Ordinary `preflight.run`
+    dispatch with no Spark env at all is proven unaffected by the sibling
+    `test_given_main_wired_and_preflight_run_dispatched_when_run_then_env_transport_parity_into_real_dedicated_child`
+    test above."""
+    inner_marker, inner_env_marker = _prepare_env_transport_parity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "fixture-gh-config"))
+    monkeypatch.setenv("LOOP_PLANNED_OPERATIONS_JSON", "[]")
+    monkeypatch.setenv("LOOP_SPARK_MODE", spark_mode)
+    monkeypatch.setenv("LOOP_SPARK_FALLBACK", spark_fallback)
+
+    exit_code = exec_mod.main(
+        ["--command-id", "preflight.run", "--issue-number", "1228", "--repo", "squne121/loop-protocol"]
+    )
+
+    assert exit_code != 0
+    # No child/inner preflight process was ever started -- proves the
+    # rejection happens before dispatch, not as a post-hoc classification
+    # of a real child's outcome.
+    assert not inner_marker.exists()
+    assert not inner_env_marker.exists()
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "blocked"
+    assert result["reason"] == "spark_delegation_retired"
+    assert "retired" in result["detail"].lower()
+    assert result["requested_spark_mode"] == spark_mode
+    assert result["requested_spark_fallback"] == spark_fallback
 
 
 def test_given_any_command_id_when_env_sanitized_then_spark_keys_never_carried(tmp_path, monkeypatch):

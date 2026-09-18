@@ -477,12 +477,18 @@ def test_canonical_executor_blocks_unsupported_operation_before_inner_starts(
     actually received this exact request, would emit), and
     `run_refinement_preflight.py` is never started.
 
-    Issue #2651: `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` are set here too,
-    but `_sanitize_env()` no longer carries them through to the dispatched
-    child at all (GPT-5.3-Codex-Spark delegation is retired) -- so unlike
-    before this Issue, no `spark:unavailable` blocker is ever produced by
-    this scenario; the block reason is exclusively the unsupported
-    operation route."""
+    Issue #2651 OWNER review fix_delta
+    (https://github.com/squne121/loop-protocol/pull/2662#issuecomment-5736035898
+    P1 blocker 1): `LOOP_SPARK_MODE`/`LOOP_SPARK_FALLBACK` are deliberately
+    NOT set here any more. This test used to set them alongside the
+    unsupported-operation request to prove they never reached the real
+    producer, but the canonical executor now rejects a legacy Spark
+    request on its OWN input boundary BEFORE any producer dispatch at all
+    (see `test_control_plane_worktree_bootstrap.
+    test_given_legacy_spark_env_when_preflight_run_dispatched_then_retired_rejection_and_no_inner_dispatch`),
+    so setting them here would make this test observe THAT rejection
+    instead of the unsupported-operation route it exists to prove. This
+    test now stays scoped to the unsupported-operation route alone."""
     repo = _make_repo(tmp_path)
     _install_real_capability_preflight_fixture(repo)
     inner_marker = tmp_path / "inner-ran.marker"
@@ -491,8 +497,6 @@ def test_canonical_executor_blocks_unsupported_operation_before_inner_starts(
         repo,
         inner_marker,
         extra_env={
-            "LOOP_SPARK_MODE": "required",
-            "LOOP_SPARK_FALLBACK": "forbidden",
             "LOOP_PLANNED_OPERATIONS_JSON": json.dumps(
                 [
                     {

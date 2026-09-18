@@ -755,3 +755,162 @@ def test_p1_7_unknown_key_in_directive_block_rejected_as_malformed(gate_script_s
     assert context is not None
     payload = json.loads(context[len("CLAUDE_GPT_SPARK_DIRECTIVE_MALFORMED_V1 ") :])
     assert payload["reason"] == "unknown_key"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2651 OWNER review fix_delta (blocker 2):
+# https://github.com/squne121/loop-protocol/pull/2662#issuecomment-5736035898
+#
+# The retired Spark authorization gate is gone (see `gate_script_source`
+# fixture above -- it now asserts `extract_spark_gate_writer_source()`
+# returns `None` and skips every test that depended on it). But removing
+# the gate must not also remove the ability to reject an ACTIVE legacy
+# Spark execution request before the model ever processes the prompt.
+# `scripts/claude-gpt/launch.sh` now embeds a small, stateless
+# `UserPromptSubmit` hook (marker region `SPARK_PROMPT_RETIREMENT_PY_BEGIN`/
+# `_END`) that does exactly this. These tests extract and execute THAT
+# real, currently-registered source -- never a re-implementation -- through
+# its actual production input boundary (stdin JSON, `hook_event_name` /
+# `prompt` fields, exit code), the same mechanism the retired-gate tests
+# above used for the (now nonexistent) authorization gate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def retirement_hook_source() -> str:
+    launch_sh_text = LAUNCH_SH.read_text(encoding="utf-8")
+    module = _load_module()
+    source = module.extract_spark_prompt_retirement_hook_source(launch_sh_text)
+    assert source is not None, (
+        "extract_spark_prompt_retirement_hook_source() must find the "
+        "SPARK_PROMPT_RETIREMENT_PY_BEGIN/_END marker region in launch.sh "
+        "-- the Issue #2651 UserPromptSubmit retirement hook must stay "
+        "registered even though the old Spark authorization gate is gone."
+    )
+    return source
+
+
+def _run_retirement_hook(source: str, tmp_path: Path, payload: dict) -> subprocess.CompletedProcess[str]:
+    hook_path = tmp_path / f"spark_prompt_retirement_{uuid.uuid4().hex}.py"
+    hook_path.write_text(source, encoding="utf-8")
+    return subprocess.run(
+        [sys.executable, str(hook_path)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def _user_prompt_submit_payload(prompt: str) -> dict:
+    return {"hook_event_name": "UserPromptSubmit", "prompt": prompt}
+
+
+_LEGACY_DIRECTIVE_TEXT = (
+    "schema: DELEGATION_REQUEST_V1\n"
+    "agent_id: spark-codex\n"
+    "model: gpt-5.3-codex-spark\n"
+    "mode: {mode}\n"
+    "fallback: {fallback}\n"
+    "wait: true\n"
+    "authorization_source: explicit_directive\n"
+)
+
+
+def test_retirement_hook_rejects_active_agent_spark_codex_mention(retirement_hook_source, tmp_path):
+    result = _run_retirement_hook(
+        retirement_hook_source,
+        tmp_path,
+        _user_prompt_submit_payload("please delegate this to @agent-spark-codex right now"),
+    )
+    assert result.returncode == 2
+    assert "retired" in result.stderr.lower()
+
+
+@pytest.mark.parametrize(
+    ("mode", "fallback"),
+    [
+        pytest.param("required", "forbidden", id="required_forbidden"),
+        pytest.param("preferred", "allowed", id="preferred_allowed"),
+    ],
+)
+def test_retirement_hook_rejects_active_valid_delegation_request_v1_directive(
+    retirement_hook_source, tmp_path, mode, fallback
+):
+    prompt = "please run this via spark:\n" + _LEGACY_DIRECTIVE_TEXT.format(mode=mode, fallback=fallback)
+    result = _run_retirement_hook(retirement_hook_source, tmp_path, _user_prompt_submit_payload(prompt))
+    assert result.returncode == 2
+    assert "retired" in result.stderr.lower()
+
+
+def test_retirement_hook_allows_directive_inside_fenced_code_block(retirement_hook_source, tmp_path):
+    directive = _LEGACY_DIRECTIVE_TEXT.format(mode="required", fallback="forbidden")
+    prompt = "here is the old (now retired) directive shape for reference:\n```\n" + directive + "\n```\n"
+    result = _run_retirement_hook(retirement_hook_source, tmp_path, _user_prompt_submit_payload(prompt))
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_retirement_hook_allows_mention_inside_inline_code(retirement_hook_source, tmp_path):
+    result = _run_retirement_hook(
+        retirement_hook_source,
+        tmp_path,
+        _user_prompt_submit_payload("the retired mention `@agent-spark-codex` used to trigger the old gate"),
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_retirement_hook_allows_mention_inside_blockquote(retirement_hook_source, tmp_path):
+    result = _run_retirement_hook(
+        retirement_hook_source,
+        tmp_path,
+        _user_prompt_submit_payload("> the OWNER review quoted: @agent-spark-codex is retired"),
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_retirement_hook_allows_historical_documentation_text(retirement_hook_source, tmp_path):
+    result = _run_retirement_hook(
+        retirement_hook_source,
+        tmp_path,
+        _user_prompt_submit_payload(
+            "Issue #2651 retired GPT-5.3-Codex-Spark delegation; the spark-codex agent no longer exists."
+        ),
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_retirement_hook_never_rejects_on_bare_spark_substring(retirement_hook_source, tmp_path):
+    # Issue #2651 input boundary: broad "spark" substring rejection is
+    # explicitly disallowed. Ordinary prose mentioning "spark" without an
+    # active canonical mention or a valid structured directive must pass.
+    result = _run_retirement_hook(
+        retirement_hook_source,
+        tmp_path,
+        _user_prompt_submit_payload("can you add some spark to this feature idea?"),
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_retirement_hook_allows_ordinary_non_spark_prompt(retirement_hook_source, tmp_path):
+    result = _run_retirement_hook(
+        retirement_hook_source,
+        tmp_path,
+        _user_prompt_submit_payload("please fix the failing pytest in scripts/claude-gpt/tests"),
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_retirement_hook_ignores_non_user_prompt_submit_events(retirement_hook_source, tmp_path):
+    result = _run_retirement_hook(
+        retirement_hook_source,
+        tmp_path,
+        {"hook_event_name": "Stop", "prompt": "@agent-spark-codex"},
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
