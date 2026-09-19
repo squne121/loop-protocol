@@ -278,6 +278,140 @@ class TestAuthorizedUniqueCandidateMaterialization:
 
 
 # ---------------------------------------------------------------------------
+# PR #2673 review iteration 2 (fix_delta): the create path must actually work
+# against the REAL create_issue_txn.run_transaction() writer -- including its
+# in-repo validate_issue_body.py body-validation gate (Blocker 2.5), which is
+# production logic (not external GitHub I/O) and therefore must NOT be faked.
+# Every other test in this file substitutes a SpyCreateFn for create_fn, so
+# this in-repo gate was never exercised end-to-end and a body/title that
+# failed it (LP001/LP002/LP031) went undetected.
+# ---------------------------------------------------------------------------
+
+
+class TestRealCreateIssueTxnWriterIntegration:
+    """create_fn=None (the production default) falls through to
+    ``create_issue_txn.run_transaction()`` itself. Only true external I/O --
+    the GitHub API calls for issue create / label apply / label readback /
+    post-create race-detection poll -- is monkeypatched here, following the
+    exact same monkeypatch boundary convention already used by
+    ``create-issue/tests/test_create_issue_txn.py``'s own
+    ``_patch_successful_create()`` helpers (txn._issue_create,
+    txn._poll_for_created_issue, txn._issue_apply_labels,
+    txn._readback_labels). ``validate_issue_body.py`` runs for real via
+    subprocess, exactly as create_issue_txn.run_transaction() invokes it in
+    production."""
+
+    def _patch_github_io_boundary(self, monkeypatch: pytest.MonkeyPatch, issue_number: int) -> None:
+        import create_issue_txn as txn
+
+        monkeypatch.setattr(
+            txn, "_issue_create", lambda *_a, **_k: f"https://github.com/owner/repo/issues/{issue_number}"
+        )
+        monkeypatch.setattr(txn, "_poll_for_created_issue", lambda *_a, **_k: ("confirmed", [issue_number]))
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+    def test_authorized_unique_candidate_materializes_via_real_writer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC1/AC2/AC8 Scenario C, exercised against the REAL writer (no
+        SpyCreateFn): 'authorized unique candidate -> Issue materialized'."""
+        self._patch_github_io_boundary(monkeypatch, issue_number=9001)
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Improve real writer coverage"),
+        )
+
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_no_match_search_fn,
+            detail_fn=_no_match_detail_fn,
+            create_fn=None,  # exercises the REAL create_issue_txn.run_transaction() writer
+        )
+
+        assert result.status == "created", (
+            "expected 'created' via the real create_issue_txn.run_transaction() writer "
+            f"(including its real validate_issue_body.py gate); got status={result.status!r} "
+            f"errors={result.errors!r}"
+        )
+        assert result.issue_number == 9001
+        assert result.next_action == {"kind": "issue_refinement_loop", "issue_number": 9001}
+
+    def test_agent_improvement_candidate_materializes_via_real_writer_with_default_issue_kind(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC3: default issue_kind ('implementation') must be creatable via
+        the real writer too, using the other producer schema's adapter."""
+        self._patch_github_io_boundary(monkeypatch, issue_number=9002)
+        candidate = h.adapt_agent_improvement_candidate(_agent_candidate_with_finding_contract())
+        assert candidate.issue_kind == "implementation"
+
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_no_match_search_fn,
+            detail_fn=_no_match_detail_fn,
+            create_fn=None,
+        )
+
+        assert result.status == "created", f"status={result.status!r} errors={result.errors!r}"
+        assert result.issue_number == 9002
+
+    def test_rendered_title_and_body_pass_real_validator_for_implementation_kind(self) -> None:
+        """Direct, fast confirmation that render_materialization_title()/
+        render_materialization_body() output passes the SAME
+        validate_issue_body.py --kind implementation gate that
+        create_issue_txn.run_transaction() invokes internally (Blocker 2.5) --
+        without going through the full transaction/subprocess machinery."""
+        import validate_issue_body
+
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Improve real writer coverage"),
+        )
+        title = h.render_materialization_title(candidate)
+        body = h.render_materialization_body(candidate)
+
+        result = validate_issue_body.validate_issue_body(body, kind="implementation", title=title)
+
+        assert result.status == "pass", (
+            "rendered materialization body/title failed validate_issue_body.py --kind implementation: "
+            f"{[(e.rule_id, e.message) for e in result.errors]}"
+        )
+
+    def test_rendered_title_has_implementation_prefix(self) -> None:
+        """LP031: title must start with '実装:' or 'implement:', derived from
+        the candidate's own title (not a hardcoded, unrelated title)."""
+        candidate = h.adapt_agent_improvement_candidate(_agent_candidate_legacy())
+        title = h.render_materialization_title(candidate)
+        assert title.startswith(("実装:", "implement:"))
+        assert candidate.title in title
+
+    def test_rendered_title_does_not_double_prefix_an_already_prefixed_title(self) -> None:
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="実装: Already prefixed"),
+        )
+        title = h.render_materialization_title(candidate)
+        assert title == "実装: Already prefixed"
+
+    def test_rendered_body_embeds_contract_schema_version_and_issue_kind(self) -> None:
+        """LP002: Machine-Readable Contract must include
+        contract_schema_version and issue_kind, not just dedupe_key."""
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(),
+        )
+        body = h.render_materialization_body(candidate)
+        assert "contract_schema_version: v1" in body
+        assert f"issue_kind: {candidate.issue_kind}" in body
+        assert candidate.dedupe_key in body
+
+
+# ---------------------------------------------------------------------------
 # B2: same dedupe key / different title -> duplicate (key wins over title)
 # ---------------------------------------------------------------------------
 

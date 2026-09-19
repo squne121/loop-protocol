@@ -328,18 +328,104 @@ class MaterializationResult:
     errors: list[str] = field(default_factory=list)
 
 
+_IMPLEMENTATION_TITLE_PREFIXES = ("実装:", "implement:")
+
+# PR #2673 review iteration 2 blocker: materialize_candidate()'s create path
+# handed a body to create_issue_txn.run_transaction() that failed its own
+# in-repo validate_issue_body.py --kind implementation gate (LP001 missing
+# sections, LP002 missing MRC fields, LP031 title prefix) before any GitHub
+# mutation was even attempted. Per this Issue's Design Constraints
+# ("retrospective orchestration が独自の ready 判定を実装しない" /
+# "Reuse, do not clone"), this module does not synthesize genuine AC/VC
+# content -- it renders clearly-marked placeholder sections that structurally
+# satisfy the validator and explicitly point to issue-refinement-loop as the
+# mandatory next action to refine them.
+_PLACEHOLDER_NOTICE = (
+    "この Issue は retrospective follow-up candidate の自動 handoff（Issue #2602）により、"
+    "issue-refinement-loop の refine 前提となる構造ゲート（LP001/LP002/LP031）を通すための"
+    "プレースホルダーとして生成された。具体的な内容は issue-refinement-loop がこの Issue を"
+    "精査して確定する必要がある（本モジュールは独自の ready 判定を実装しないスコープ制約のため）。"
+)
+
+
+def render_materialization_title(candidate: NormalizedCandidate) -> str:
+    """Render the Issue title for a freshly materialized candidate.
+
+    LP031: an ``implementation``-kind Issue title must start with '実装:' or
+    'implement:'. Derived from the candidate's own title (never a hardcoded,
+    unrelated title) so the created Issue remains traceable to its source
+    candidate."""
+    stripped_title = candidate.title.strip()
+    if stripped_title.startswith(_IMPLEMENTATION_TITLE_PREFIXES):
+        return stripped_title
+    return f"実装: {stripped_title}"
+
+
 def render_materialization_body(candidate: NormalizedCandidate) -> str:
-    """Render the Issue body for a freshly materialized candidate. The
-    dedupe_key is embedded verbatim so a later rerun's dedupe readback
+    """Render the Issue body for a freshly materialized candidate.
+
+    The dedupe_key is embedded verbatim so a later rerun's dedupe readback
     (AC2(f): downstream-failure rerun reuses the same Issue) can confirm an
     exact match via ``readback_dedupe_matches()`` against the created
-    Issue's own body."""
+    Issue's own body.
+
+    This body must structurally pass ``validate_issue_body.py --kind
+    implementation`` (LP001 required sections, LP002 required Machine-
+    Readable Contract fields, LP031 title prefix) because
+    ``create_issue_txn.run_transaction()`` calls that validator internally
+    before any GitHub mutation (Blocker 2.5). Sections whose real content is
+    not this module's responsibility to author are clearly-marked
+    placeholders pointing at issue-refinement-loop, not synthesized AC/VC
+    content (Design Constraints: "Reuse, do not clone" /
+    "retrospective orchestration が独自の ready 判定を実装しない")."""
     source_ref_lines = "\n".join(f"  {k}: {v!r}" for k, v in sorted(candidate.source_reference.items()))
     return (
         "## Machine-Readable Contract\n\n"
         "```yaml\n"
+        "contract_schema_version: v1\n"
+        f"issue_kind: {candidate.issue_kind}\n"
         f'dedupe_key: "{candidate.dedupe_key}"\n'
         "```\n\n"
+        "## Parent Issue\n\n"
+        "none\n\n"
+        "## Parent Goal Ref\n\n"
+        f"- Goal: {_PLACEHOLDER_NOTICE}\n"
+        "- Desired Destination: issue-refinement-loop が本 Issue を refine し、具体的な"
+        "Goal と Desired Destination を確定する。\n\n"
+        "## Current Validated Scope\n\n"
+        f"- {_PLACEHOLDER_NOTICE}\n\n"
+        "## Remaining Parent Gaps\n\n"
+        "- なし（retrospective follow-up candidate に直接の親 Issue はない）\n\n"
+        "## Outcome\n\n"
+        f"{_PLACEHOLDER_NOTICE}\n\n"
+        "## Runtime Verification Applicability\n\n"
+        "- decision: not_applicable\n"
+        "- reason: retrospective handoff によるプレースホルダー生成のため、"
+        "issue-refinement-loop が具体的な動作検証要否を確定するまでは適用判定できない。\n\n"
+        "## In Scope\n\n"
+        f"- {_PLACEHOLDER_NOTICE}\n\n"
+        "## Out of Scope\n\n"
+        "- retrospective orchestration が独自の ready 判定を実装すること"
+        "（Issue #2602 Design Constraints）\n\n"
+        "## Acceptance Criteria\n\n"
+        f"- {_PLACEHOLDER_NOTICE}\n\n"
+        "## Verification Commands\n\n"
+        "```bash\n"
+        '$ echo "placeholder: issue-refinement-loop が具体的な Verification Commands を確定する"\n'
+        "```\n\n"
+        "## Allowed Paths\n\n"
+        f"- {_PLACEHOLDER_NOTICE}\n\n"
+        "## Stop Conditions\n\n"
+        "- Allowed Paths 外の変更が必要と判明した場合\n"
+        "- In Scope の固定契約（キー集合・スキーマ・型定義）の変更が必要になった場合\n"
+        "- 新規 Issue の起票が必要と判断した場合（スコープ分割が発生する場合）\n"
+        "- 後続 Phase / 別スコープへの波及が判明した場合\n"
+        "- nested SubAgent delegation が必要になった場合\n"
+        "- 外部サービス利用・権限昇格・既存テスト大規模改変が必要になった場合\n\n"
+        "## Required Skills\n\n"
+        "なし\n\n"
+        "## Required Design References\n\n"
+        "- docs/dev/agent-skill-boundaries.md#FOLLOW_UP_ISSUE_REQUEST_V1\n\n"
         "## Source Reference\n\n"
         "```yaml\n"
         f"{source_ref_lines}\n"
@@ -432,10 +518,11 @@ def materialize_candidate(
     # otherwise it could re-match a different, merely-same-titled issue and
     # silently override this already-confirmed "create" decision.
     creator = create_fn or _default_create_fn
+    title = render_materialization_title(candidate)
     body = render_materialization_body(candidate)
     txn_result = creator(
         repo=repo,
-        title=candidate.title,
+        title=title,
         body=body,
         body_file="",
         labels=list(candidate.labels),
