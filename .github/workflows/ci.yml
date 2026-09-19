@@ -2304,33 +2304,74 @@ jobs:
     runs-on: ubuntu-latest
     needs: [e2e]
     if: ${{ !cancelled() && (github.event.inputs.benchmark_layout == 'monolith' || github.event.inputs.benchmark_layout == 'split') }}
+    # Issue #2631 AC9: same minimal read-only permission set as
+    # ci-verdict-summary -- this job is an INDEPENDENT acquisition owner for
+    # the same attempt-scoped Jobs snapshot contract on the benchmark
+    # dispatch route.
+    permissions:
+      contents: read
+      actions: read
+      checks: read
     steps:
-      - name: Fetch check-runs for gate-ready latency
+      # Issue #2631: this job now invokes the shared
+      # scripts/ci/ci_job_snapshot.py helper (same acquisition contract as
+      # ci-verdict-summary), which requires the repo checked out.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up locked Python runner
+        uses: ./.github/actions/setup-python-uv
+      - name: Acquire attempt-scoped Jobs snapshot (Issue #2631)
+        # AC1/AC2/AC3: the SAME shared helper/normalizer as
+        # ci-verdict-summary's own acquisition step -- an INDEPENDENT
+        # acquisition owner (the two dispatch routes are mutually
+        # exclusive), not a second call within the SAME job as that one.
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
           GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}/attempts/${GH_RUN_ATTEMPT}/jobs?per_page=100" \
+            > ci_job_snapshot_pages.json
+          test -s ci_job_snapshot_pages.json
           gh api \
-            "repos/${GH_REPOSITORY}/commits/${GH_HEAD_SHA}/check-runs?per_page=100" \
-            > ci_verdict_summary_v2_check_runs.json
-          test -s ci_verdict_summary_v2_check_runs.json
+            "repos/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}/attempts/${GH_RUN_ATTEMPT}" \
+            > ci_job_snapshot_identity.json
+          test -s ci_job_snapshot_identity.json
+          uv run --locked python3 scripts/ci/ci_job_snapshot.py \
+            --pages-json ci_job_snapshot_pages.json \
+            --identity-json ci_job_snapshot_identity.json \
+            --expected-repository "$GH_REPOSITORY" \
+            --expected-run-id "$GH_RUN_ID" \
+            --expected-head-sha "$GH_HEAD_SHA" \
+            --output ci_job_snapshot.json
       # Issue #2119 AC9(b) (PR #2137 human review issuecomment-5273090534 P0
       # fix): gate-ready latency is the wall-clock time from workflow-run
       # start until the required stable `e2e` aggregate check itself
       # reaches a conclusion. Computed here (not inside jobs.e2e itself,
       # which check-visual-artifact-pipeline.py's AC13 guard forbids from
       # carrying any upload-artifact/download-artifact step) from the real
-      # per-commit check-run `completed_at` for the "e2e" check (fetched
-      # above) minus the real workflow-run `run_started_at` (both
-      # authoritative GitHub API timestamps, not self-measured wall-clock
-      # deltas).
+      # attempt-scoped Jobs snapshot `completed_at` for the "e2e" job
+      # (acquired above) minus the snapshot's own identity-SSOT
+      # `run_started_at` (both authoritative GitHub API timestamps, not
+      # self-measured wall-clock deltas).
       - name: Record gate-ready latency (ci_runtime_baseline_v1)
+        # PR #2669 review fix_delta (Blocker 3, Issue #2631 AC4): this step
+        # computes the measurement via the shared, NEVER-RAISING
+        # ``ci_job_snapshot.compute_gate_ready_latency_artifact`` helper --
+        # an unparseable timestamp, a not-yet-completed job, or a negative
+        # (stale-snapshot) delta is recorded as a diagnostic-only
+        # ``gate_ready_latency_omitted_reason``, never an unhandled
+        # exception that would abort this step (and, transitively, the
+        # required ``if-no-files-found: error`` upload step below) or a
+        # fabricated/negative ``gate_ready_latency_ms``.
         if: ${{ !cancelled() }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPOSITORY: ${{ github.repository }}
           GH_RUN_ID: ${{ github.run_id }}
           GH_RUN_ATTEMPT: ${{ github.run_attempt }}
           GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -2338,46 +2379,28 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ci_runtime_baseline_artifacts
-          RUN_STARTED_AT="$(gh api "repos/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}" --jq .run_started_at)"
-          export RUN_STARTED_AT
-          python3 - <<'PY'
-          import json, os, pathlib
-          from datetime import datetime, timezone
+          uv run --locked python3 - <<'PY'
+          import json, os, pathlib, sys
 
-          run_started_at = datetime.fromisoformat(
-              os.environ["RUN_STARTED_AT"].replace("Z", "+00:00")
+          sys.path.insert(0, "scripts/ci")
+          import ci_job_snapshot  # noqa: E402
+
+          snapshot = ci_job_snapshot.load_snapshot("ci_job_snapshot.json")
+          artifact = ci_job_snapshot.compute_gate_ready_latency_artifact(
+              snapshot,
+              job_name="e2e",
+              run_id=os.environ["GH_RUN_ID"],
+              run_attempt=os.environ["GH_RUN_ATTEMPT"],
+              head_sha=os.environ["GH_HEAD_SHA"],
+              merge_sha=os.environ["GH_SHA"],
           )
-
-          check_runs = json.loads(
-              pathlib.Path("ci_verdict_summary_v2_check_runs.json").read_text(encoding="utf-8")
-          ).get("check_runs", [])
-          e2e_runs = [c for c in check_runs if c.get("name") == "e2e" and c.get("status") == "completed"]
-
-          artifact = {
-              "schema": "ci_runtime_baseline_v1",
-              "run_id": os.environ["GH_RUN_ID"],
-              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
-              "head_sha": os.environ["GH_HEAD_SHA"],
-              "merge_sha": os.environ["GH_SHA"],
-              "job": "e2e",
-              "run_started_at": os.environ["RUN_STARTED_AT"],
-              "measurements": [],
-          }
-
-          if e2e_runs:
-              completed_at = datetime.fromisoformat(
-                  e2e_runs[0]["completed_at"].replace("Z", "+00:00")
-              )
-              gate_ready_latency_ms = int((completed_at - run_started_at).total_seconds() * 1000)
-              artifact["gate_ready_latency_ms"] = gate_ready_latency_ms
-              artifact["gate_ready_at"] = e2e_runs[0]["completed_at"]
-              print(f"gate_ready_latency_ms={gate_ready_latency_ms}")
+          if "gate_ready_latency_ms" in artifact:
+              print(f"gate_ready_latency_ms={artifact['gate_ready_latency_ms']}")
           else:
-              # The "e2e" check-run was not found completed at fetch time --
-              # do NOT fabricate a latency value (fail-closed: this run is
-              # simply excluded from the gate-ready-latency cohort rather
-              # than silently degrading to success).
-              print("no completed 'e2e' check-run found; gate_ready_latency_ms omitted")
+              print(
+                  "gate_ready_latency_ms omitted: "
+                  f"{artifact.get('gate_ready_latency_omitted_reason')}"
+              )
 
           out = pathlib.Path("ci_runtime_baseline_artifacts") / "ci_runtime_baseline_v1_e2e.json"
           out.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
@@ -5007,6 +5030,15 @@ jobs:
     # aggregation has nothing meaningful left to summarize.
     if: ${{ !cancelled() && github.event.inputs.python_test_bench != 'true' && github.event.inputs.benchmark_layout == '' }}
     needs: [typecheck, lint, test, build, e2e, python-test-core, python-test, node-backed-hook-tests, actionlint, agy-causal-claim-drift-gate, visual-impact-policy]
+    # Issue #2631 AC9: minimal read-only permissions for the attempt-scoped
+    # Jobs acquisition (`actions: read`) and the AC6/AC7 conditional
+    # `check_run_url` dereference (`checks: read`, a SEPARATE scope from the
+    # Actions Jobs API). Neither is a write permission or a new
+    # authentication method.
+    permissions:
+      contents: read
+      actions: read
+      checks: read
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -5049,19 +5081,47 @@ jobs:
           path: ci_verdict_summary_v2_binding_artifacts/
           if-no-files-found: error
           retention-days: 30
-      - name: Generate ci_verdict_summary_v2 artifact
-        # P0: needs.result is synthetic and carries neither a CheckRun id nor
-        # a per-check head SHA. Read commit-scoped GitHub CheckRun evidence
-        # for this exact workflow run before generating a merge-ready artifact.
+      - name: Acquire attempt-scoped Jobs snapshot (Issue #2631)
+        # P0/AC1/AC2: needs.result is synthetic and carries neither a job id
+        # nor a per-check head SHA. Acquire the documented attempt-scoped
+        # Jobs endpoint EXACTLY ONCE for this job, identity-anchored to the
+        # request-scoped exact-attempt endpoint (the SSOT for
+        # run_id/run_attempt/head_sha/repository), and validate/normalize
+        # the paginated result via the shared helper before any consumer
+        # step reads it. This REPLACES the former commit-scoped GitHub
+        # CheckRuns acquisition entirely.
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
+          set -euo pipefail
           test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
+          gh api --paginate --slurp \
+            "repos/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}/attempts/${GH_RUN_ATTEMPT}/jobs?per_page=100" \
+            > ci_job_snapshot_pages.json
+          test -s ci_job_snapshot_pages.json
           gh api \
-            "repos/${GITHUB_REPOSITORY}/commits/${PR_HEAD_SHA}/check-runs?per_page=100" \
-            > ci_verdict_summary_v2_check_runs.json
-          test -s ci_verdict_summary_v2_check_runs.json
+            "repos/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}/attempts/${GH_RUN_ATTEMPT}" \
+            > ci_job_snapshot_identity.json
+          test -s ci_job_snapshot_identity.json
+          uv run --locked python3 scripts/ci/ci_job_snapshot.py \
+            --pages-json ci_job_snapshot_pages.json \
+            --identity-json ci_job_snapshot_identity.json \
+            --expected-repository "$GH_REPOSITORY" \
+            --expected-run-id "$GH_RUN_ID" \
+            --expected-head-sha "$PR_HEAD_SHA" \
+            --output ci_job_snapshot.json
+      - name: Generate ci_verdict_summary_v2 artifact
+        # AC1/AC2/AC3: consumes the SAME immutable shared snapshot acquired
+        # above -- no independent re-fetch.
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
           mkdir -p ci_verdict_summary_v2_artifacts
           uv run --locked python3 .claude/skills/pr-review-judge/scripts/ci_verdict_summary_v2.py \
             --expected-head-sha "$PR_HEAD_SHA" \
@@ -5070,7 +5130,7 @@ jobs:
             --workflow-run-id "${{ github.run_id }}" \
             --workflow-run-attempt "${{ github.run_attempt }}" \
             --event-name "${{ github.event_name }}" \
-            --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
+            --job-snapshot-json ci_job_snapshot.json \
             --artifact-id "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-id }}" \
             --artifact-url "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-url }}" \
             --artifact-digest "${{ steps.upload-ci-verdict-summary-v2-binding.outputs.artifact-digest }}" \
@@ -5102,10 +5162,23 @@ jobs:
       # quantity; post-split, the aggregate job depends on `needs`, so its
       # own step runtime alone would undercount the real gate-ready latency.
       - name: Record gate-ready latency (ci_runtime_baseline_v1)
+        # AC1/AC2/AC3/AC4: consumes the SAME attempt-scoped shared snapshot
+        # acquired above (via the shared helper's resolve_unique_job, so a
+        # duplicate "e2e" job name is deterministically rejected rather than
+        # silently disambiguated, AC8) instead of a second independent API
+        # fetch. run_started_at is the snapshot's own identity-SSOT field
+        # (from the exact-attempt endpoint) -- no separate `gh api
+        # actions/runs/{id}` call is needed for it any more.
+        # PR #2669 review fix_delta (Blocker 3): computed via the shared,
+        # NEVER-RAISING ``ci_job_snapshot.compute_gate_ready_latency_artifact``
+        # helper -- an unparseable timestamp, a not-yet-completed job, or a
+        # negative (stale-snapshot) delta is recorded as a diagnostic-only
+        # ``gate_ready_latency_omitted_reason``, never an unhandled
+        # exception that would abort this step (and, transitively, the
+        # required ``if-no-files-found: error`` upload step below) or a
+        # fabricated/negative ``gate_ready_latency_ms``.
         if: ${{ !cancelled() }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPOSITORY: ${{ github.repository }}
           GH_RUN_ID: ${{ github.run_id }}
           GH_RUN_ATTEMPT: ${{ github.run_attempt }}
           GH_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -5113,46 +5186,28 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ci_runtime_baseline_artifacts
-          RUN_STARTED_AT="$(gh api "repos/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}" --jq .run_started_at)"
-          export RUN_STARTED_AT
-          python3 - <<'PY'
-          import json, os, pathlib
-          from datetime import datetime, timezone
+          uv run --locked python3 - <<'PY'
+          import json, os, pathlib, sys
 
-          run_started_at = datetime.fromisoformat(
-              os.environ["RUN_STARTED_AT"].replace("Z", "+00:00")
+          sys.path.insert(0, "scripts/ci")
+          import ci_job_snapshot  # noqa: E402
+
+          snapshot = ci_job_snapshot.load_snapshot("ci_job_snapshot.json")
+          artifact = ci_job_snapshot.compute_gate_ready_latency_artifact(
+              snapshot,
+              job_name="e2e",
+              run_id=os.environ["GH_RUN_ID"],
+              run_attempt=os.environ["GH_RUN_ATTEMPT"],
+              head_sha=os.environ["GH_HEAD_SHA"],
+              merge_sha=os.environ["GH_SHA"],
           )
-
-          check_runs = json.loads(
-              pathlib.Path("ci_verdict_summary_v2_check_runs.json").read_text(encoding="utf-8")
-          ).get("check_runs", [])
-          e2e_runs = [c for c in check_runs if c.get("name") == "e2e" and c.get("status") == "completed"]
-
-          artifact = {
-              "schema": "ci_runtime_baseline_v1",
-              "run_id": os.environ["GH_RUN_ID"],
-              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
-              "head_sha": os.environ["GH_HEAD_SHA"],
-              "merge_sha": os.environ["GH_SHA"],
-              "job": "e2e",
-              "run_started_at": os.environ["RUN_STARTED_AT"],
-              "measurements": [],
-          }
-
-          if e2e_runs:
-              completed_at = datetime.fromisoformat(
-                  e2e_runs[0]["completed_at"].replace("Z", "+00:00")
-              )
-              gate_ready_latency_ms = int((completed_at - run_started_at).total_seconds() * 1000)
-              artifact["gate_ready_latency_ms"] = gate_ready_latency_ms
-              artifact["gate_ready_at"] = e2e_runs[0]["completed_at"]
-              print(f"gate_ready_latency_ms={gate_ready_latency_ms}")
+          if "gate_ready_latency_ms" in artifact:
+              print(f"gate_ready_latency_ms={artifact['gate_ready_latency_ms']}")
           else:
-              # The "e2e" check-run was not found completed at fetch time --
-              # do NOT fabricate a latency value (fail-closed: this run is
-              # simply excluded from the gate-ready-latency cohort rather
-              # than silently degrading to success).
-              print("no completed 'e2e' check-run found; gate_ready_latency_ms omitted")
+              print(
+                  "gate_ready_latency_ms omitted: "
+                  f"{artifact.get('gate_ready_latency_omitted_reason')}"
+              )
 
           out = pathlib.Path("ci_runtime_baseline_artifacts") / "ci_runtime_baseline_v1_e2e.json"
           out.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
@@ -5169,6 +5224,8 @@ jobs:
         # Issue #2161 (native Codex CLI retirement): the former
         # native-Codex-CLI-lane sentinel download + AC6 sentinel verification
         # branch were removed along with the job.
+        # Issue #2631: consumes the SAME attempt-scoped shared snapshot
+        # acquired above (no independent re-fetch, AC1/AC2/AC3).
         if: ${{ !cancelled() }}
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -5176,14 +5233,16 @@ jobs:
         run: |
           if [ "$PYTHON_TEST_BENCH" = "true" ]; then
             uv run --locked python3 scripts/ci/verify_ci_check_conclusions.py \
-              --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
+              --job-snapshot-json ci_job_snapshot.json \
+              --repository "${{ github.repository }}" \
               --expected-head-sha "$PR_HEAD_SHA" \
               --workflow-run-id "${{ github.run_id }}" \
               --workflow-run-attempt "${{ github.run_attempt }}" \
               --bench-mode
           else
             uv run --locked python3 scripts/ci/verify_ci_check_conclusions.py \
-              --check-runs-api-json ci_verdict_summary_v2_check_runs.json \
+              --job-snapshot-json ci_job_snapshot.json \
+              --repository "${{ github.repository }}" \
               --expected-head-sha "$PR_HEAD_SHA" \
               --workflow-run-id "${{ github.run_id }}" \
               --workflow-run-attempt "${{ github.run_attempt }}"
