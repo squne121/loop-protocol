@@ -582,6 +582,48 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
 - `issue-refinement-loop`: scope split / out-of-scope discovery / child materialization の出口を持つ **thin orchestrator**。review-issue 由来の観察を routing するだけで、follow-up の raw context を保持・再解釈しない。終了コメントには materialization 結果（`FOLLOW_UP_MATERIALIZATION_RESULT_V1`）のみを出す。
 - main thread（impl-review-loop Step 5 / post-merge-cleanup）: リクエストを受け取り、dedupe_key で dedupe チェック後に `issue-creator` / `create-issue` 経由で起票する。
 
+### 振り返り follow-up candidate の Issue 化ハンドオフ境界（Issue #2602, #1939 Workstream 4）
+
+human-triggered retrospective が返す follow-up improvement candidate（採否は必ず人間判断）を、
+既存の dedupe/materialization 契約経由で GitHub Issue へ変換し、`issue-refinement-loop` →
+`impl-review-loop` の正式 entrypoint へ決定論的に handoff するための境界。
+
+**入力（producer schema、2 種類・統合しない）**:
+
+| producer schema | 定義箇所 | dedupe key の導出元 |
+|---|---|---|
+| `chatgpt_retrospective_result/v1` の `follow_up_issue_candidates[]` | `docs/schemas/chatgpt-retrospective-result.schema.json` | `target.repo` + `target.type` + `target.number` + 正規化した `title`（`input_marker_digest` 等の run-specific 値は使わない） |
+| `agent_improvement_candidate/v1` | `.claude/skills/agent-retrospective/schemas/agent_improvement_candidate_v1.schema.json` | `finding_contract.identity.value`（存在する場合。`source_run_ref`/timestamp/evidence fingerprint 等の run-specific 値は除外済みの stable identity）。`finding_contract` 不在の legacy candidate は `candidate_id` を使う |
+
+いずれの schema も `additionalProperties: false` であり、`dedupe_key` フィールドを追加しない。
+dedupe key の導出は producer schema の外側、`.claude/skills/issue-refinement-loop/scripts/retrospective_candidate_handoff.py`
+のアダプタ層（`adapt_chatgpt_candidate()` / `adapt_agent_improvement_candidate()`）で行う。
+
+**責務境界（新規モジュールの範囲）**:
+
+- `retrospective_candidate_handoff.py`（`materialize_candidate()`）: 人間の明示的な
+  `human_authorized=True` を前提に、既存の caller 側 dedupe_key 検索
+  （`plan_child_materialization.py::_search_dedupe_candidates()` を再利用、複製しない）で
+  OPEN/CLOSED 両方の既存 Issue を readback し、重複なしと確定した場合のみ
+  `create_issue_txn.run_transaction(..., skip_internal_title_dedupe=True)` を呼んで Issue を
+  create/reuse する。**責務はここで終わる**: `issue-refinement-loop` / `impl-review-loop` の
+  内部 state machine（`root_entry_router.py` の root-owned entry transition 関数を含む）を
+  自ら呼び出すことはしない。
+- `create_issue_txn.py` の `skip_internal_title_dedupe`（既定 `False`、後方互換維持）:
+  outer（呼び出し元）が dedupe_key 検索で「create 確定」と判定した場合にのみ、この script
+  自身の内部 title-only OPEN-issue dedupe を bypass する opt-in フラグ。既存呼び出し元の挙動は
+  変わらない。
+- materialize 後の ready 化（`## Outcome` / `## Acceptance Criteria` 等の body contract 充足）は
+  引き続き `issue-refinement-loop` の責務であり、`retrospective_candidate_handoff.py` は
+  `next_action: {kind: issue_refinement_loop, issue_number: N}` を返すのみで、その判定を代行しない。
+- ready 化後の実装起動（`impl-review-loop` Step 1 の起動）は、従来どおり `issue-refinement-loop`
+  の `approved` 終了時に同一 turn 内で実行される `root_entry_router.py` の root-owned entry
+  transition 関数に一本化されたままであり、本ハンドオフ層が新しい起動経路を追加することはない。
+- `issue-refinement-loop` / `impl-review-loop` が返す canonical terminal
+  （`already_satisfied` / `no_change_required` / `blocked` / `human_escalation` /
+  `max_iterations` / `draft_pr_ready`）は `propagate_canonical_terminal()` により無変更のまま
+  伝播される（handoff 層が独自の completion 判定へ昇格させない）。
+
 ## CHILD_MATERIALIZATION_PLAN_V2
 
 delivery-rollup parent の child materialization 制御スキームで使う plan スキーマ。

@@ -48,6 +48,18 @@ FOLLOW_UP_MATERIALIZATION_RESULT_V1:
   note_only_observations: []
 ```
 
+## 振り返り follow-up candidate のハンドオフ（Issue #2602, #1939 Workstream 4）
+
+human-triggered retrospective が返す follow-up improvement candidate
+（`chatgpt_retrospective_result/v1` の `follow_up_issue_candidates[]` または
+`agent_improvement_candidate/v1`）は、`.claude/skills/issue-refinement-loop/scripts/retrospective_candidate_handoff.py`
+のアダプタ・dedupe/overlap readback・materialize ロジックを経由して既存の
+`create-issue` 起票フローへ渡される。producer 別の dedupe key 導出規則、
+責務境界（この module は Issue create/reuse までで責務が終わり、`impl-review-loop`
+Step 1 の起動は行わない）は `docs/dev/agent-skill-boundaries.md` の
+「Retrospective Follow-up Candidate Handoff」節を参照する。この Skill 自身の
+ready 判定・state machine は変更されない。
+
 ## 禁止事項（Must not）
 
 - title の類似検索だけで dedupe を済ませない
