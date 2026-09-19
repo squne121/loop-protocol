@@ -203,6 +203,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["standard", "triage_only"],
         help="label profile: standard | triage_only",
     )
+    # Opt-in bypass of this script's own internal title-only OPEN-issue dedupe search
+    # (Issue #2602 AC2(g)). Default False preserves full backward compatibility for all
+    # existing callers. Intended only for callers that already confirmed via an outer
+    # dedupe_key search that issue creation is warranted (see run_transaction()'s
+    # skip_internal_title_dedupe docstring comment above).
+    parser.add_argument(
+        "--skip-internal-title-dedupe",
+        dest="skip_internal_title_dedupe",
+        action="store_true",
+        default=False,
+    )
     ns = parser.parse_args(argv)
     ns.subcommand = "create"
     return ns
@@ -2062,6 +2073,7 @@ def run_transaction(
     gh_bin: str,
     blocking_issue_numbers: list[int | str] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    skip_internal_title_dedupe: bool = False,
 ) -> TransactionResult:
     labels = _resolve_labels(labels, issue_kind, label_profile)
     try:
@@ -2168,17 +2180,29 @@ def run_transaction(
         )
     # --- End parent resolution ---
 
-    try:
-        dedupe_issue_numbers = _find_open_issues_by_title(repo, title, gh_bin)
-    except TransactionError as exc:
-        return TransactionResult(
-            status="failure",
-            issue_number=None,
-            issue_url=None,
-            completed_steps=[],
-            failure_stage=exc.stage,
-            failure_message=exc.message,
-        )
+    # skip_internal_title_dedupe (Issue #2602 AC2(g)): opt-in bypass of this script's own
+    # internal title-only OPEN-issue dedupe search. Intended ONLY for callers that have
+    # already confirmed via an outer, dedupe_key-based search (e.g.
+    # plan_child_materialization.py::_search_dedupe_candidates() /
+    # docs/dev/agent-skill-boundaries.md FOLLOW_UP_ISSUE_REQUEST_V1 dedupe flow) that no
+    # duplicate exists across OPEN/CLOSED issues. Without this bypass, this internal
+    # title-only search could re-match a DIFFERENT issue that merely shares the same
+    # title (dedupe_key mismatch), silently overriding the outer caller's "create
+    # confirmed" decision. Default is False: unchanged behavior for all existing callers.
+    if skip_internal_title_dedupe:
+        dedupe_issue_numbers = []
+    else:
+        try:
+            dedupe_issue_numbers = _find_open_issues_by_title(repo, title, gh_bin)
+        except TransactionError as exc:
+            return TransactionResult(
+                status="failure",
+                issue_number=None,
+                issue_url=None,
+                completed_steps=[],
+                failure_stage=exc.stage,
+                failure_message=exc.message,
+            )
     dedupe_number: int | None = dedupe_issue_numbers[0] if dedupe_issue_numbers else None
     if len(dedupe_issue_numbers) > 1:
         dedupe_collision_issue_number = dedupe_issue_numbers[0]
@@ -2682,6 +2706,7 @@ def run_transaction_with_authoritative_readback(
     gh_bin: str,
     blocking_issue_numbers: list[int | str] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    skip_internal_title_dedupe: bool = False,
 ) -> TransactionResult:
     """Wrap run_transaction() with an authoritative post-create GraphQL readback
     of node_id, plus a body_sha256 computed from the effective body text.
@@ -2704,6 +2729,7 @@ def run_transaction_with_authoritative_readback(
         gh_bin=gh_bin,
         blocking_issue_numbers=blocking_issue_numbers,
         sleep_fn=sleep_fn,
+        skip_internal_title_dedupe=skip_internal_title_dedupe,
     )
     if result.issue_number is None:
         return result
@@ -3021,6 +3047,7 @@ def main(argv: list[str] | None = None) -> int:
             dependency_issue_numbers=args.dependency,
             blocking_issue_numbers=args.blocking,
             gh_bin=args.gh,
+            skip_internal_title_dedupe=args.skip_internal_title_dedupe,
         )
 
     sys.stdout.write(f"{json.dumps(result.__dict__, ensure_ascii=False, sort_keys=True)}\n")

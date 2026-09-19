@@ -2526,3 +2526,231 @@ class TestRecoveryHintGraphQLQuoteAndNewlinePreserved:
         assert "\\\\n" not in hint, (
             f"Expected no literal \\\\n (double backslash) in hint, got: {hint!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2602 AC2(g): skip_internal_title_dedupe opt-in bypass
+#
+# Backward-compat regression guard: default (unset) behavior must be byte-for-byte
+# identical to before this Issue (internal title-only OPEN-issue dedupe search still
+# runs). The new flag is opt-in only for callers that already confirmed via an outer
+# dedupe_key search that issue creation is warranted.
+# ---------------------------------------------------------------------------
+
+class TestSkipInternalTitleDedupe:
+    def _patch_successful_create(self, monkeypatch: pytest.MonkeyPatch, *, find_open_spy: list) -> None:
+        def _spy_find_open_issues_by_title(*args, **kwargs):
+            find_open_spy.append((args, kwargs))
+            return []
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _spy_find_open_issues_by_title)
+        monkeypatch.setattr(txn, "_issue_create", lambda *_a, **_k: "https://github.com/owner/repo/issues/99")
+        monkeypatch.setattr(txn, "_poll_for_created_issue", lambda *_a, **_k: ("confirmed", [99]))
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+    def test_default_false_still_calls_internal_title_dedupe_search(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Backward compatibility: omitting skip_internal_title_dedupe (default False)
+        preserves the existing internal title-only dedupe search call."""
+        find_open_spy: list = []
+        self._patch_successful_create(monkeypatch, find_open_spy=find_open_spy)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body=_MINIMAL_VALID_BODY,
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+        )
+
+        assert len(find_open_spy) == 1, (
+            "Expected _find_open_issues_by_title to be called exactly once when "
+            "skip_internal_title_dedupe is not passed (default False)"
+        )
+        assert result.status == "success"
+        assert result.issue_number == 99
+
+    def test_explicit_false_still_calls_internal_title_dedupe_search(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        find_open_spy: list = []
+        self._patch_successful_create(monkeypatch, find_open_spy=find_open_spy)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body=_MINIMAL_VALID_BODY,
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            skip_internal_title_dedupe=False,
+        )
+
+        assert len(find_open_spy) == 1
+        assert result.status == "success"
+
+    def test_true_bypasses_internal_title_dedupe_search(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """skip_internal_title_dedupe=True: the internal title-only search is not called
+        at all, and the transaction proceeds straight to the create path."""
+        find_open_spy: list = []
+        self._patch_successful_create(monkeypatch, find_open_spy=find_open_spy)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body=_MINIMAL_VALID_BODY,
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            skip_internal_title_dedupe=True,
+        )
+
+        assert len(find_open_spy) == 0, (
+            "Expected _find_open_issues_by_title NOT to be called when "
+            "skip_internal_title_dedupe=True"
+        )
+        assert result.status == "success"
+        assert result.issue_number == 99
+
+    def test_true_does_not_reuse_internal_title_match_even_if_one_exists(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard for the exact bug this flag prevents an outer caller from
+        hitting: even if an internal title-only search WOULD have found a same-title
+        issue, skip_internal_title_dedupe=True must not let that internal match steal
+        the transaction away from the outer caller's already-confirmed create decision."""
+        find_open_spy: list = []
+
+        def _would_have_found_a_title_match(*args, **kwargs):
+            find_open_spy.append((args, kwargs))
+            return [4242]  # would have been treated as a dedupe target if called
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _would_have_found_a_title_match)
+        monkeypatch.setattr(txn, "_issue_create", lambda *_a, **_k: "https://github.com/owner/repo/issues/99")
+        monkeypatch.setattr(txn, "_poll_for_created_issue", lambda *_a, **_k: ("confirmed", [99]))
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body=_MINIMAL_VALID_BODY,
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            skip_internal_title_dedupe=True,
+        )
+
+        assert len(find_open_spy) == 0
+        assert result.status == "success"
+        assert result.issue_number == 99, (
+            "Expected a fresh create (issue 99), not a reuse of the internal-only "
+            "title match (issue 4242)"
+        )
+
+    def test_run_transaction_with_authoritative_readback_forwards_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """run_transaction_with_authoritative_readback() forwards skip_internal_title_dedupe
+        through to run_transaction() unchanged."""
+        captured: dict = {}
+
+        def _fake_run_transaction(**kwargs):
+            captured.update(kwargs)
+            return txn.TransactionResult(
+                status="success",
+                issue_number=99,
+                issue_url="https://github.com/owner/repo/issues/99",
+                completed_steps=["issue-create"],
+            )
+
+        monkeypatch.setattr(txn, "run_transaction", _fake_run_transaction)
+        monkeypatch.setattr(txn, "_issue_graphql_ids", lambda *_a, **_k: ("node-1", 1))
+
+        txn.run_transaction_with_authoritative_readback(
+            repo="owner/repo",
+            title="Test Issue",
+            body=_MINIMAL_VALID_BODY,
+            body_file="",
+            labels=[],
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            skip_internal_title_dedupe=True,
+        )
+
+        assert captured.get("skip_internal_title_dedupe") is True
+
+    def test_cli_flag_wires_to_run_transaction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--skip-internal-title-dedupe CLI flag reaches run_transaction()."""
+        captured: dict = {}
+
+        def _fake_run_transaction(**kwargs):
+            captured.update(kwargs)
+            return txn.TransactionResult(
+                status="success",
+                issue_number=99,
+                issue_url="https://github.com/owner/repo/issues/99",
+                completed_steps=["issue-create"],
+            )
+
+        monkeypatch.setattr(txn, "run_transaction", _fake_run_transaction)
+
+        exit_code = txn.main(
+            [
+                "--repo",
+                "owner/repo",
+                "--title",
+                "Test Issue",
+                "--body",
+                _MINIMAL_VALID_BODY,
+                "--skip-internal-title-dedupe",
+            ]
+        )
+
+        assert exit_code == 0
+        assert captured.get("skip_internal_title_dedupe") is True
+
+    def test_cli_flag_defaults_to_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict = {}
+
+        def _fake_run_transaction(**kwargs):
+            captured.update(kwargs)
+            return txn.TransactionResult(
+                status="success",
+                issue_number=99,
+                issue_url="https://github.com/owner/repo/issues/99",
+                completed_steps=["issue-create"],
+            )
+
+        monkeypatch.setattr(txn, "run_transaction", _fake_run_transaction)
+
+        txn.main(
+            [
+                "--repo",
+                "owner/repo",
+                "--title",
+                "Test Issue",
+                "--body",
+                _MINIMAL_VALID_BODY,
+            ]
+        )
+
+        assert captured.get("skip_internal_title_dedupe") is False
