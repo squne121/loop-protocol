@@ -419,6 +419,15 @@ def collect_claude_code_source(
         status, pagination, reason = "partial", "partial", "malformed_response"
     else:
         status, pagination, reason = "complete", "complete", None
+    # Issue #2664 AC6: `evidence_digest` (the fingerprint of the SAME
+    # `normalized` records actually reaching analysis via `private_evidence`)
+    # is computed once here and reused for BOTH `private_evidence.evidence_digest`
+    # and the public `observation.etag` (existing free-form string field,
+    # `agent_retrospective_run_v1.schema.json` -- no new schema key), so
+    # `compute_source_set_digest()` (which canonically JSON-serializes the
+    # full observation dict, unchanged) reflects the actual runtime content
+    # this collector produced, not merely its status/timestamps/counts.
+    evidence_digest = _digest(normalized)
     observation = _build_observation(
         source_type="runtime",
         source_id=source_id,
@@ -427,12 +436,13 @@ def collect_claude_code_source(
         fetch_started_at=fetch_started_at,
         fetch_completed_at=fetch_completed_at,
         partial_reason=reason if pagination == "partial" else None,
+        etag=f"sha256:{evidence_digest}",
     )
     return _finalize(
         observation,
         {
             "normalized_records": normalized,
-            "evidence_digest": _digest(normalized),
+            "evidence_digest": evidence_digest,
             "provenance": {"session_count": len(session_paths), "sessions_read": sessions_read},
             "diagnostics": {
                 "malformed_line_count": malformed_line_count,
@@ -657,6 +667,10 @@ def collect_claude_gpt_source(
         status, pagination, reason = "partial", "partial", "session_incomplete"
 
     fetch_completed_at = _iso(clock())
+    # Issue #2664 AC6: same evidence_digest-derived etag treatment as
+    # `collect_claude_code_source` above -- computed once, reused for both
+    # `private_evidence.evidence_digest` and `observation.etag`.
+    evidence_digest = _digest(nonce_matched)
     observation = _build_observation(
         source_type="runtime",
         source_id=source_id,
@@ -665,13 +679,14 @@ def collect_claude_gpt_source(
         fetch_started_at=fetch_started_at,
         fetch_completed_at=fetch_completed_at,
         partial_reason=reason if pagination == "partial" else None,
+        etag=f"sha256:{evidence_digest}",
     )
     diagnostics["reason_code"] = reason
     return _finalize(
         observation,
         {
             "normalized_records": nonce_matched,
-            "evidence_digest": _digest(nonce_matched),
+            "evidence_digest": evidence_digest,
             "provenance": {"complete_sessions": complete_sessions},
             "diagnostics": diagnostics,
         },
