@@ -415,15 +415,46 @@ generic hook-chain evidence capability である。bounded closed allowlist（�
 command／path／marker／config は一切受理しない。有効化すると invocation-local
 additive `--settings` overlay に「`PreToolUse`（matcher `Bash`）」「`Stop`」の
 2 つの観測用 `cat` hook を追加登録し、さらに Claude Code 自身の `--setting-sources
-project` フラグ（固定値。caller が選択できない）を併用して、evidence cohort を
-**現在の tested_head の project-level `.claude/settings.json` のみ**（user／
-local／managed／plugin／skill 等の source を除外）に確定的に限定する
-（live 検証で確認: `--setting-sources` を指定しない場合、この runner を実行する
+project` フラグ（固定値。caller が選択できない）を併用する。
+
+**`--setting-sources project` の正確な効果（PR #2668 fix_delta で訂正）**: 公式
+CLI reference（https://code.claude.com/docs/en/cli-reference）が定義するのは
+「どの設定ファイル（user／project／local の `settings.json`）を読み込むか」のみ
+であり、managed policy／plugin／Skill が独立に登録する hook を除外するもの
+**ではない**。`"project"` 固定は user／local の設定ファイル source を除外する
+効果のみ確定的に持つ（live 検証: `--setting-sources` 省略時、runner を実行する
 ホストのユーザーレベル `~/.claude/settings.json` に登録された PreToolUse/Bash
-hook が cohort に紛れ込み、`unattributable_extra_hook_execution` による
-`unverified` 判定の原因になることを Issue #2663 実装時の live trial で確認した）。
+hook が cohort に紛れ込み `unattributable_extra_hook_execution` を誘発すること
+を確認済み）。managed／plugin／Skill が登録した hook はこのフラグの有無に関係
+なく引き続き `unattributable_extra_hook_execution`（`unverified`）として扱われる
+（後述の「confirmed runtime-capability boundary」参照）。旧版のこの文書と
+コードコメントが「user／local／managed／plugin／skill 等の source を除外する」
+と記載していたのは誤りで、PR #2668 fix_delta（anchor review
+https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277）
+で訂正した。
+
 existing hooks/`.claude/settings.json`／`.claude/hooks/**` は一切変更・disable・
 置換しない（Out of Scope）。
+
+**confirmed runtime-capability boundary（handler identity は証明できない、PR
+#2668 fix_delta P1-1）**: `hook_id` は「この `hook_started` とこの
+`hook_response` が同一 invocation である」ことのみを証明し、`hook_name` は
+「このレコードがこの event(+tool) グループに属する」ことのみを証明する
+（同一 event+matcher に登録された sibling command hook はすべて同一の
+`hook_name` を共有する）。settings.json に列挙された **どの具体的な command
+hook が実際に実行されたか** を証明する公式チャネルは存在しない
+（https://code.claude.com/docs/en/hooks-guide ／
+https://code.claude.com/docs/en/agent-sdk/hooks: "all matching hooks run in
+parallel ... write each hook to act independently rather than relying on
+another hook having run first" — 実行順序も非決定的なため、順序ベースの
+heuristic も無効）。したがって `all_matching_hooks_observed` の `pass` は
+「期待 cohort と同数の PreToolUse/Bash hook 実行が hook_id で正しく対応付け
+られ、orphan／不足／識別不能な超過が無い」ことの証明であり、「settings.json
+に列挙された特定の N 個の handler が個別に実行された」ことの証明では **ない**
+（例: 期待 handler が A,B,C,D で実際の実行が A,X,C,D（X は B の同数置換で、X
+自身も正常な hook_started/hook_response ペアを持つ）の場合、現在の判定は
+区別できず `pass` になる — これは既知の、確認済みの runtime capability
+の上限であり、実装漏れではない）。
 
 `schema_summary["hook_chain_evidence"]`（`summary.md`／`--evidence-json` の両方に
 記録される）は次の 2 つの独立した assertion と、その aggregate を持つ:
@@ -448,7 +479,16 @@ existing hooks/`.claude/settings.json`／`.claude/hooks/**` は一切変更・di
   scenario（`exit_code == 2` を観測した hook が最低 1 件）の両方が観測され、
   かつ両方の window が `status: pass` の場合にのみ全体が `pass` になる
   （どちらか一方が欠けている、または全 Bash tool_use がゼロ件の場合は
-  `fail`）。
+  `fail`）。**同一 assistant メッセージ内に複数の Bash tool_use block が
+  含まれる場合**（公式 Agent SDK が明記する正当な形— 各 block は distinct な
+  `tool_use_id` を持つ）、これらは同一 `stream_index` を共有するため、
+  従来の「tool_use 自身の行位置」だけでは個別の window に分離できない
+  （PR #2668 fix_delta P1-2）。この場合は、観測用 hook 自身の self-echo
+  payload に既に必須キーとして含まれる `tool_use_id` の **値**（従来は
+  key の存在のみ確認していた）を読み取り、宣言された `tool_use_id` 群と
+  一意に対応付けて sub-window を分割する。対応が一意に決まらない場合
+  （不足・重複・未知の値）は window ごとに `unverified`
+  （`self_echo_tool_use_id_ambiguous`）とし、決して推測しない。
 - `sibling_side_effect_inventory_complete`（AC3）: hook の exit code（実行完了）
   とは独立に、実際の post-condition を確認する。対象 handler は
   `.claude/hooks/session_manifest_coordinator.sh`（`Stop` イベント。tested_head
@@ -460,16 +500,37 @@ existing hooks/`.claude/settings.json`／`.claude/hooks/**` は一切変更・di
   書き込む別の非対象 handler — 例えば同 repo の `PostToolUse` debounce hook
   `session_manifest_debounce.mjs` — の書き込みは対象外として無視する。live
   検証で、単一セッションが `posttooluse` タグと `stop` タグの両方の新規
-  ファイルを生成することを確認済み）。post-condition の読み取りタイミングは
-  「対象 sibling hook 群（この runner が subprocess として起動した Claude Code
-  プロセス全体）の実行完了後」— `claude -p` の subprocess 自体が終了するまで
-  この runner は post-condition を読まないため、同期 Stop hook の完了は
-  構造的に保証される。正常な無変更の条件は、runner 自身が追加した観測用
-  `Stop` hook の self-echo stdin payload から回収した `stop_hook_active`
-  （bool。runtime が実際に返すフィールド）が `true` の場合のみ（Stop hook
-  再入時の正当な no-op）。新規ファイルが 1 件を超える場合は overflow として
-  `fail`。新規ファイルなしかつ `stop_hook_active` が `true` でない場合は
-  `missing_side_effect` として `fail`。
+  ファイルを生成することを確認済み）。**この判定に使うディレクトリ snapshot
+  自体は、Stop タグでフィルタしてから件数上限を適用する**（PR #2668
+  fix_delta P2-1 — 旧実装は「全ファイル列挙 → sort → 先頭 N 件に切り詰め →
+  その後で Stop タグを判定」という順序だったため、Stop タグより辞書順で先に
+  来る `-posttooluse-` タグの過去ファイルが N 件以上蓄積すると、正当な新規
+  Stop manifest が切り詰められて見落とされていた。Stop タグ該当分自体が
+  上限を超えた場合のみ `truncated` フラグを立て、呼び出し側は
+  `unverified`（`session_manifest_snapshot_truncated`）として扱う — 証跡を
+  静かに欠落させない）。**新規ファイルは、埋め込まれた `actor.session_id`
+  が現在の run 自身の session id と一致する場合のみ「この run の証跡」として
+  カウントする**（PR #2668 fix_delta P1-3(a) — 同じディレクトリに同時実行中
+  ／stale な別 session が正規の Stop manifest を書き込んだ場合、それを
+  この run 自身の成功として誤カウントしないため。session id はこの manifest
+  スキーマ自身が既に持つ `actor.session_id` フィールドと、この runner が
+  既に読み取っている stream 自身の session id から比較する。マッチしない、
+  またはスキーマにフィールドが無いファイルは対象外）。post-condition の
+  読み取りタイミングは「対象 sibling hook 群（この runner が subprocess
+  として起動した Claude Code プロセス全体）の実行完了後」— `claude -p` の
+  subprocess 自体が終了するまでこの runner は post-condition を読まないため、
+  同期 Stop hook の完了は構造的に保証される。**正常な無変更の条件は、観測用
+  `Stop` hook の self-echo から回収した `stop_hook_active: true` に加えて、
+  対象 `session_manifest_coordinator.sh` 自身が STDERR に出力する
+  `SESSION_MANIFEST_COORDINATOR_RESULT_V1={"steps":["stop_guard"],...}`
+  完了マーカーの両方が揃った場合のみ**（PR #2668 fix_delta P1-3(b) —
+  観測用 hook 自身の入力だけでは「対象 coordinator 自身が実際に no-op を
+  完了した」ことを証明できないため。構造化 `hook_response` イベントの
+  `stderr` フィールドが hook 自身の stderr を露出することを、このリポジトリ
+  自身の bounded local live trial（Claude Code 2.1.277）で確認済み — 従来
+  この module は `stdout`/`output` のみ読んでいた）。新規ファイルが 1 件を
+  超える場合は overflow として `fail`。新規ファイルなしかつ上記 2 条件が
+  揃わない場合は `missing_side_effect` として `fail`。
 - aggregate: `hook_chain_evidence.status`（`passed: true|false`）は、上記
   2 つの assertion が **両方とも** `status: pass` の場合にのみ `pass`。
 

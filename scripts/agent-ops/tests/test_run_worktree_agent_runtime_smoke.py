@@ -2565,15 +2565,29 @@ def _hc_hook_response_line(
     hook_id: str, hook_event: str, *,
     exit_code: int = 0, outcome: str = "success",
     hook_name: str | None = None, self_echo_payload: dict | None = None,
+    stderr: str = "",
 ) -> str:
     text = json.dumps(self_echo_payload) if self_echo_payload is not None else ""
     return json.dumps({
         "type": "system", "subtype": "hook_response",
         "hook_id": hook_id, "hook_name": hook_name or _hc_default_hook_name(hook_event),
         "hook_event": hook_event, "session_id": "fixture-session",
-        "output": text, "stdout": text, "stderr": "",
+        "output": text + stderr, "stdout": text, "stderr": stderr,
         "exit_code": exit_code, "outcome": outcome,
     })
+
+
+def _hc_coordinator_result_stderr(steps: list[str] | None = None, *, status: str = "ok") -> str:
+    """Issue #2663 PR #2668 fix_delta (P1-3(b)): the real
+    ``.claude/hooks/session_manifest_coordinator.sh``'s own
+    ``SESSION_MANIFEST_COORDINATOR_RESULT_V1={...}`` marker shape --
+    confirmed by reading the script (always its own LAST stderr line on
+    every exit path) and confirmed exposed on the structured
+    ``hook_response`` event's own ``stderr`` field by a bounded local live
+    trial against installed Claude Code 2.1.277 during this fix_delta."""
+    steps = steps if steps is not None else ["stop_guard"]
+    marker = json.dumps({"status": status, "reason_code": None, "timeout_reason": None, "steps": steps})
+    return f"SESSION_MANIFEST_COORDINATOR_RESULT_V1={marker}\n"
 
 
 def _hc_bash_tool_use_line(tool_use_id: str, command: str = "echo hi") -> str:
@@ -2581,6 +2595,24 @@ def _hc_bash_tool_use_line(tool_use_id: str, command: str = "echo hi") -> str:
         "type": "assistant", "session_id": "fixture-session",
         "message": {"content": [
             {"type": "tool_use", "id": tool_use_id, "name": "Bash", "input": {"command": command}}
+        ]},
+    })
+
+
+def _hc_bash_tool_use_line_multi(tool_use_ids: list[str], commands: list[str] | None = None) -> str:
+    """A single assistant message declaring MULTIPLE ``Bash`` tool_use
+    blocks (Issue #2663 PR #2668 fix_delta P1-2 regression fixture) --
+    each with its own distinct ``tool_use_id`` but the SAME stream_index
+    (same JSONL line), exactly the officially-supported shape the anchor
+    review's counter-example exercises (see
+    https://code.claude.com/docs/en/agent-sdk/hooks)."""
+    if commands is None:
+        commands = ["echo hi"] * len(tool_use_ids)
+    return json.dumps({
+        "type": "assistant", "session_id": "fixture-session",
+        "message": {"content": [
+            {"type": "tool_use", "id": tool_use_id, "name": "Bash", "input": {"command": command}}
+            for tool_use_id, command in zip(tool_use_ids, commands)
         ]},
     })
 
@@ -2642,16 +2674,68 @@ def _hc_pretool_window(
 
 
 def _hc_stop_window(
-    *, stop_hook_active: bool = False, observer_id: str = "STOP-OBS", sibling_id: str = "STOP-1"
+    *, stop_hook_active: bool = False, observer_id: str = "STOP-OBS", sibling_id: str = "STOP-1",
+    sibling_stderr: str | None = None,
 ) -> list[str]:
+    """Issue #2663 PR #2668 fix_delta (P1-3(b)): ``sibling_stderr``
+    defaults to the real coordinator's own ``stop_guard`` early-exit
+    marker whenever ``stop_hook_active`` is True (mirroring
+    ``.claude/hooks/session_manifest_coordinator.sh``'s own actual
+    behavior -- it writes that exact marker to stderr precisely when its
+    own stdin ``stop_hook_active`` is true), and empty otherwise -- pass
+    an explicit value to exercise a mismatch/ambiguity scenario."""
+    if sibling_stderr is None:
+        sibling_stderr = _hc_coordinator_result_stderr(["stop_guard"]) if stop_hook_active else ""
     return [
         _hc_hook_started_line(observer_id, "Stop"),
         _hc_hook_started_line(sibling_id, "Stop"),
-        _hc_hook_response_line(sibling_id, "Stop", exit_code=0),
+        _hc_hook_response_line(sibling_id, "Stop", exit_code=0, stderr=sibling_stderr),
         _hc_hook_response_line(
             observer_id, "Stop", self_echo_payload=_hc_stop_observer_payload(stop_hook_active)
         ),
     ]
+
+
+def _hc_pretool_window_shared(
+    tool_use_id: str, *, sibling_ids: list[str], observer_id: str,
+    denied_id: str | None = None,
+) -> list[str]:
+    """Like ``_hc_pretool_window`` but WITHOUT its own leading Bash
+    tool_use line -- used for the Issue #2663 PR #2668 fix_delta (P1-2)
+    SAME-assistant-message multi-Bash regression, where the caller emits
+    ONE shared ``_hc_bash_tool_use_line_multi(...)`` line up front
+    covering all co-located calls."""
+    lines: list[str] = []
+    started_ids = [observer_id] + sibling_ids
+    for hid in started_ids:
+        lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+    for hid in started_ids:
+        if hid == observer_id:
+            lines.append(_hc_hook_response_line(
+                hid, "PreToolUse", self_echo_payload=_hc_pretool_observer_payload(tool_use_id)
+            ))
+        else:
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=2 if hid == denied_id else 0))
+    lines.append(_hc_bash_tool_result_line(tool_use_id))
+    return lines
+
+
+def _hc_write_manifest_file(
+    module, worktree: Path, filename: str, *, session_id: str | None = "fixture-session",
+) -> None:
+    """Write a real Issue #2663 AC3 target-directory manifest file (Issue
+    #2663 PR #2668 fix_delta P1-3(a) regression fixture) --
+    ``evaluate_sibling_side_effect_inventory`` now reads this file's own
+    ``actor.session_id`` to bind a candidate new file to the CURRENT run's
+    session before counting it. ``session_id=None`` writes a manifest with
+    no ``actor`` field at all (the "schema has no session id" residual
+    case)."""
+    manifests_dir = worktree.joinpath(*module._HOOK_CHAIN_SIDE_EFFECT_ARTIFACT_RELPATH)
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    content: dict = {"schema": "agent_session_manifest/v1"}
+    if session_id is not None:
+        content["actor"] = {"session_id": session_id}
+    (manifests_dir / filename).write_text(json.dumps(content), encoding="utf-8")
 
 
 _HC_HOOKS_DIR = "${CLAUDE_PROJECT_DIR}/.claude/hooks"
@@ -2973,6 +3057,106 @@ class TestEvaluateAllMatchingHooksObserved:
         assert result["windows"][1]["denied"] is True
 
 
+class TestEvaluateAllMatchingHooksObservedSharedStreamIndex:
+    """Issue #2663 PR #2668 fix_delta (P1-2, anchor review
+    https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277):
+    multiple Bash tool_use blocks declared inside the SAME assistant
+    message (same stream_index) must not collapse into a degenerate empty
+    window / absorb-everything pair."""
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        return worktree
+
+    def test_ac6b_same_assistant_message_multi_bash_both_windows_independently_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(b): the anchor review's own reproduced counter-example --
+        two Bash tool_use blocks (distinct tool_use_ids) inside ONE
+        assistant message, each followed later in the stream by its own
+        full complement of correctly tool_use_id-tagged self-echo +
+        sibling hook_started/hook_response pairs -- both windows must
+        independently reach ``status: pass`` (not the old spurious
+        ``observer_self_echo_not_uniquely_identified``/``unverified``)."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        lines = [
+            _system_init_line(),
+            _hc_bash_tool_use_line_multi(["tu-A", "tu-B"]),
+        ]
+        lines += _hc_pretool_window_shared("tu-A", sibling_ids=["H1", "H2", "H3", "H4"], observer_id="OBS-A")
+        lines += _hc_pretool_window_shared(
+            "tu-B", sibling_ids=["H5", "H6", "H7", "H8"], observer_id="OBS-B", denied_id="H6",
+        )
+        lines.append(_result_event_line())
+        result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+        assert result["status"] == "pass"
+        assert result["passed"] is True
+        assert result["windows"][0]["status"] == "pass"
+        assert result["windows"][0]["observed_count"] == 4
+        assert result["windows"][0]["denied"] is False
+        assert result["windows"][1]["status"] == "pass"
+        assert result["windows"][1]["observed_count"] == 4
+        assert result["windows"][1]["denied"] is True
+        assert result["positive_window_count"] == 1
+        assert result["deny_window_count"] == 1
+
+    def test_ac6b_ambiguous_self_echo_tool_use_id_mapping_fails_closed_unverified(
+        self, tmp_path: Path,
+    ) -> None:
+        """Companion negative case: within a shared-stream_index span, an
+        observer's self-echo claims a ``tool_use_id`` that DUPLICATES
+        another call's own already-claimed id (an unresolvable/ambiguous
+        mapping) -- must fail closed to ``unverified``, never a guessed
+        attribution."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        lines = [
+            _system_init_line(),
+            _hc_bash_tool_use_line_multi(["tu-A", "tu-B"]),
+        ]
+        lines += _hc_pretool_window_shared("tu-A", sibling_ids=["H1", "H2", "H3", "H4"], observer_id="OBS-A")
+        # OBS-B's own self-echo wrongly claims tool_use_id "tu-A" (already
+        # claimed by OBS-A above) -- an unresolvable duplicate mapping.
+        lines.append(_hc_hook_started_line("OBS-B", "PreToolUse"))
+        for hid in ["H5", "H6", "H7", "H8"]:
+            lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+        lines.append(_hc_hook_response_line(
+            "OBS-B", "PreToolUse", self_echo_payload=_hc_pretool_observer_payload("tu-A")
+        ))
+        for hid in ["H5", "H6", "H7", "H8"]:
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=0))
+        lines.append(_hc_bash_tool_result_line("tu-B"))
+        lines.append(_result_event_line())
+        result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+        assert result["status"] == "unverified"
+        assert result["windows"][0]["reason"] == "self_echo_tool_use_id_ambiguous"
+        assert result["windows"][1]["reason"] == "self_echo_tool_use_id_ambiguous"
+
+    def test_single_bash_per_message_windowing_unchanged_when_mixed_with_shared_group(
+        self, tmp_path: Path,
+    ) -> None:
+        """The pre-existing single-Bash-per-message case must remain
+        byte-identical even when it appears ALONGSIDE a shared-
+        stream_index group elsewhere in the same stream."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        lines = [_system_init_line()]
+        lines += _hc_pretool_window("tu-solo", sibling_ids=["H1", "H2", "H3", "H4"])
+        lines.append(_hc_bash_tool_use_line_multi(["tu-A", "tu-B"]))
+        lines += _hc_pretool_window_shared("tu-A", sibling_ids=["H5", "H6", "H7", "H8"], observer_id="OBS-A")
+        lines += _hc_pretool_window_shared(
+            "tu-B", sibling_ids=["H9", "H10", "H11", "H12"], observer_id="OBS-B", denied_id="H10",
+        )
+        lines.append(_result_event_line())
+        result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+        assert result["status"] == "pass"
+        assert len(result["windows"]) == 3
+        assert all(w["status"] == "pass" for w in result["windows"])
+
+
 class TestEvaluateSiblingSideEffectInventory:
     """Issue #2663 AC3/AC6: sibling_side_effect_inventory_complete verdict."""
 
@@ -2985,6 +3169,7 @@ class TestEvaluateSiblingSideEffectInventory:
     def test_ac6d_new_manifest_file_observed_is_pass(self, tmp_path: Path) -> None:
         module = _load_module()
         worktree = self._worktree(tmp_path)
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME, session_id="fixture-session")
         result = module.evaluate_sibling_side_effect_inventory(
             str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)), [], [_HC_STOP_MANIFEST_NAME],
         )
@@ -2992,7 +3177,49 @@ class TestEvaluateSiblingSideEffectInventory:
         assert result["reason"] == "new_manifest_observed"
         assert result["new_file_count"] == 1
 
+    def test_p1_3a_new_file_with_mismatched_session_id_is_not_counted_as_new(
+        self, tmp_path: Path,
+    ) -> None:
+        """Issue #2663 PR #2668 fix_delta (P1-3(a), anchor review
+        counter-example A): a new Stop-tagged file that genuinely appeared
+        between before/after snapshots, but whose OWN embedded session id
+        belongs to an unrelated/concurrent session, must NOT be counted as
+        THIS run's own evidence -- and must not pass on that basis alone."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME, session_id="unrelated-other-session")
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)), [], [_HC_STOP_MANIFEST_NAME],
+        )
+        assert result["status"] == "fail"
+        assert result["reason"] == "missing_side_effect"
+        assert result["new_file_count"] == 0
+
+    def test_p1_3a_zero_hook_events_with_unrelated_stop_file_present_is_not_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """Issue #2663 PR #2668 fix_delta AC6: zero hook events observed at
+        all (this runner's own current session id cannot even be
+        determined) plus an unrelated Stop-tagged file present must never
+        read as pass -- an empty current-session set excludes every
+        candidate file, regardless of that file's own content."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME, session_id="fixture-session")
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "", [], [_HC_STOP_MANIFEST_NAME],
+        )
+        assert result["status"] == "fail"
+        assert result["reason"] == "missing_side_effect"
+        assert result["new_file_count"] == 0
+
     def test_ac6d_valid_no_change_via_stop_hook_active_is_pass_not_fail(self, tmp_path: Path) -> None:
+        """Issue #2663 AC6(f) / PR #2668 fix_delta (P1-3(b)): the FULL
+        corroborating-evidence combination -- the observer's own
+        ``stop_hook_active: true`` self-echo AND the target coordinator's
+        own ``steps: ["stop_guard"]`` completion marker (both provided by
+        ``_hc_stop_window``'s own default when ``stop_hook_active=True``)
+        -- must still reach pass."""
         module = _load_module()
         worktree = self._worktree(tmp_path)
         result = module.evaluate_sibling_side_effect_inventory(
@@ -3000,6 +3227,25 @@ class TestEvaluateSiblingSideEffectInventory:
         )
         assert result["status"] == "pass"
         assert result["reason"] == "valid_no_change_stop_hook_active"
+
+    def test_p1_3b_observer_only_stop_hook_active_without_coordinator_confirmation_is_not_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """Issue #2663 PR #2668 fix_delta (P1-3(b), anchor review
+        counter-example B): the observer's own ``stop_hook_active: true``
+        self-echo ALONE, with no corroborating completion marker from the
+        TARGET coordinator itself, must no longer be sufficient for a
+        pass -- this is exactly the anchor review's own reproduced
+        counter-example (previously this read as
+        ``valid_no_change_stop_hook_active``)."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            _hc_stop_window(stop_hook_active=True, sibling_stderr="")
+        )
+        result = module.evaluate_sibling_side_effect_inventory(str(worktree), stdout, [], [])
+        assert result["status"] == "fail"
+        assert result["reason"] == "missing_side_effect"
 
     def test_missing_side_effect_when_no_new_file_and_stop_hook_not_active_is_fail(
         self, tmp_path: Path,
@@ -3030,6 +3276,8 @@ class TestEvaluateSiblingSideEffectInventory:
     def test_overflow_more_new_files_than_expected_is_fail(self, tmp_path: Path) -> None:
         module = _load_module()
         worktree = self._worktree(tmp_path)
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME, session_id="fixture-session")
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME_2, session_id="fixture-session")
         result = module.evaluate_sibling_side_effect_inventory(
             str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)),
             [], [_HC_STOP_MANIFEST_NAME, _HC_STOP_MANIFEST_NAME_2],
@@ -3054,6 +3302,78 @@ class TestEvaluateSiblingSideEffectInventory:
         result = module.evaluate_sibling_side_effect_inventory(str(worktree), "", None, None)
         assert result["status"] == "unverified"
         assert result["reason"] == "postcondition_unreadable"
+
+    def test_snapshot_truncated_flag_is_unverified_never_a_silent_drop(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "", [], [], snapshot_truncated=True,
+        )
+        assert result["status"] == "unverified"
+        assert result["reason"] == "session_manifest_snapshot_truncated"
+
+
+class TestSnapshotSessionManifestFilesP2Truncation:
+    """Issue #2663 PR #2668 fix_delta (P2-1, anchor review
+    https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277):
+    filter-for-token BEFORE sort/cap, so a high-volume UNRELATED writer
+    sharing this directory can never numerically push a genuinely new
+    Stop-tagged manifest out of a fixed-size snapshot cap."""
+
+    def test_high_volume_unrelated_posttooluse_files_never_truncate_away_new_stop_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The anchor review's own counter-example (2000 pre-existing
+        ``-posttooluse-`` files sorting before a new ``-stop-`` file) --
+        reproduced here with a smaller, fast cap to assert the fix's
+        FILTERING logic scales independently of the absolute numbers."""
+        module = _load_module()
+        monkeypatch.setattr(module, "_HOOK_CHAIN_SIDE_EFFECT_MAX_SNAPSHOT_ENTRIES", 5)
+        worktree = tmp_path / "wt"
+        manifests_dir = worktree.joinpath(*module._HOOK_CHAIN_SIDE_EFFECT_ARTIFACT_RELPATH)
+        manifests_dir.mkdir(parents=True)
+        for i in range(20):
+            (manifests_dir / f"private-agent-session-manifest-posttooluse-{i:04d}-x.json").write_text(
+                "{}", encoding="utf-8"
+            )
+        before, before_truncated = module._snapshot_session_manifest_files(str(worktree))
+        assert before_truncated is False
+        assert before == []
+        new_name = "private-agent-session-manifest-stop-9999-abc.json"
+        (manifests_dir / new_name).write_text(
+            json.dumps({"actor": {"session_id": "fixture-session"}}), encoding="utf-8"
+        )
+        after, after_truncated = module._snapshot_session_manifest_files(str(worktree))
+        assert after_truncated is False
+        assert after == [new_name]
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)), before, after,
+        )
+        assert result["status"] == "pass"
+        assert result["reason"] == "new_manifest_observed"
+
+    def test_stop_tagged_subset_exceeding_cap_is_flagged_truncated_and_unverified(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = _load_module()
+        monkeypatch.setattr(module, "_HOOK_CHAIN_SIDE_EFFECT_MAX_SNAPSHOT_ENTRIES", 3)
+        worktree = tmp_path / "wt"
+        manifests_dir = worktree.joinpath(*module._HOOK_CHAIN_SIDE_EFFECT_ARTIFACT_RELPATH)
+        manifests_dir.mkdir(parents=True)
+        for i in range(5):
+            (manifests_dir / f"private-agent-session-manifest-stop-{i:04d}-x.json").write_text(
+                "{}", encoding="utf-8"
+            )
+        entries, truncated = module._snapshot_session_manifest_files(str(worktree))
+        assert truncated is True
+        assert len(entries) == 3
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "", entries, entries, snapshot_truncated=truncated,
+        )
+        assert result["status"] == "unverified"
+        assert result["reason"] == "session_manifest_snapshot_truncated"
 
 
 class TestEvaluateHookChainEvidenceAggregate:
@@ -3095,6 +3415,7 @@ class TestEvaluateHookChainEvidenceAggregate:
         correctly observed as completed."""
         module = _load_module()
         worktree = self._worktree(tmp_path)
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME, session_id="fixture-session")
         stdout = self._full_positive_and_deny_stream(stop_hook_active=False)
         result = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [_HC_STOP_MANIFEST_NAME])
         assert result["all_matching_hooks_observed"]["deny_window_count"] == 1
@@ -3168,10 +3489,15 @@ class TestRequireHookChainEvidenceCLI:
             + [_result_event_line()]
         )
         manifests_dir_rel = "artifacts/session-manifest-runtime/manifests"
+        # Issue #2663 PR #2668 fix_delta (P1-3(a)): the new Stop-tagged
+        # manifest must carry the SAME session id as the fixture stream's
+        # own "fixture-session" for the run-binding check to count it.
+        stop_manifest_content = shlex.quote(json.dumps({"actor": {"session_id": "fixture-session"}}))
         body_lines = ["cat > /dev/null"]
         body_lines.append(f"mkdir -p {shlex.quote(manifests_dir_rel)}")
         body_lines.append(
-            f"printf '{{}}' > {shlex.quote(manifests_dir_rel)}/private-agent-session-manifest-stop-1-a.json"
+            f"printf '%s' {stop_manifest_content} > "
+            f"{shlex.quote(manifests_dir_rel)}/private-agent-session-manifest-stop-1-a.json"
         )
         # A co-registered, non-target manifest writer (the settings.json
         # PostToolUse debounce hook) also writes into the SAME directory --
