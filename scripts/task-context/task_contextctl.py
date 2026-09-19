@@ -72,15 +72,8 @@ EXIT_CODE_BY_ERROR_CODE = {
 }
 
 
-def _read_stdin_object() -> dict:
-    """Read stdin as a raw parsed JSON object (or ``{}`` if stdin is empty).
-
-    This is the *envelope* object -- it is validated/unwrapped separately by
-    ``envelope.validate_and_unwrap_request`` in ``main()`` (fix_delta finding
-    1). Renamed from the former ``_read_stdin_payload`` because it no longer
-    returns an operation payload directly.
-    """
-    raw = sys.stdin.read()
+def _read_stdin_object(raw: str) -> dict:
+    """Parse generic CLI input as one JSON object (or ``{}`` when empty)."""
     if not raw.strip():
         return {}
     try:
@@ -90,6 +83,22 @@ def _read_stdin_object() -> dict:
     if not isinstance(obj, dict):
         raise errors.ValidationError("stdin JSON object must be a JSON object (mapping)")
     return obj
+
+
+def _parse_signal_apply_input(raw: str) -> tuple[dict | None, dict | None]:
+    """Classify direct public signal JSON before generic CLI-envelope parsing.
+
+    A valid legacy request envelope remains on the generic path. Every other
+    non-empty direct ``signal apply`` input receives the v1 envelope taxonomy,
+    including malformed JSON and a non-object JSON root.
+    """
+    try:
+        parsed = workflow_signals.strict_json_loads(raw)
+    except json.JSONDecodeError:
+        return None, {"disposition": "rejected_envelope", "reason_code": "MALFORMED_JSON"}
+    if envelope.is_valid_request_envelope(parsed):
+        return None, None
+    return workflow_signals.validate_public_signal(parsed)
 
 
 def _open_db_and_migrate(cwd: str | None = None):
@@ -286,17 +295,27 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result), file=sys.stdout)
         return errors.ValidationError.exit_code
 
+    raw_stdin = sys.stdin.read()
     try:
-        stdin_obj = _read_stdin_object()
-        # signal apply's public v1 wire payload is intentionally direct: it
-        # has exactly four top-level fields. Retain the request-envelope
-        # transport only as an internal compatibility wrapper for hook clients.
-        if operation == "signal_apply" and stdin_obj and (
-            "signal_kind" in stdin_obj or "source" in stdin_obj or "evidence" in stdin_obj
-        ):
-            payload = stdin_obj
-        else:
-            payload = envelope.validate_and_unwrap_request(stdin_obj, expected_operation=operation) if stdin_obj else {}
+        payload = None
+        if operation == "signal_apply" and raw_stdin.strip():
+            payload, rejection = _parse_signal_apply_input(raw_stdin)
+            if rejection is not None:
+                print(json.dumps(envelope.build_ok_result(rejection)), file=sys.stdout)
+                return EXIT_OK
+        if payload is None:
+            stdin_obj = _read_stdin_object(raw_stdin)
+            # signal apply's public v1 wire payload is intentionally direct:
+            # it has exactly four top-level fields. Retain the request-envelope
+            # transport only as an internal compatibility wrapper for hook clients.
+            if operation == "signal_apply" and stdin_obj and (
+                "signal_kind" in stdin_obj or "source" in stdin_obj or "evidence" in stdin_obj
+            ):
+                payload = stdin_obj
+            else:
+                payload = (
+                    envelope.validate_and_unwrap_request(stdin_obj, expected_operation=operation) if stdin_obj else {}
+                )
     except errors.ValidationError as exc:
         result = envelope.build_error_result(exc.code, exc.message, exc.details)
         print(json.dumps(result), file=sys.stdout)
