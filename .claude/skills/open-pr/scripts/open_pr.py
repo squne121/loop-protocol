@@ -682,6 +682,19 @@ def main(argv: list[str] | None = None) -> int:
         emit_error(E_PR_BODY_JAPANESE_VALIDATION_FAILED, japanese_result.get("stderr", ""))
         return EXIT_BLOCKED
 
+    draft = str(args.draft).strip().lower() == "true"
+
+    # A preview has no producer side effects. In particular, do not inspect an
+    # existing PR because that path emits implementation_pr_observed.
+    if args.dry_run:
+        emit_kv("DRY_RUN", "true")
+        emit_kv("PR_TITLE_PREVIEW", args.pr_title)
+        emit_kv("PR_BODY_PREVIEW_FIRST_LINES", "\\n".join(final_body.splitlines()[:5]))
+        emit_kv("LINKED_ISSUE", args.linked_issue)
+        emit_kv("LINK_KIND", link_kind)
+        emit_kv("DRAFT", str(draft).lower())
+        return 0
+
     existing = find_existing_pr(repo, branch)
     if existing:
         signal_disposition, signal_reason = emit_implementation_pr_observed(
@@ -696,8 +709,6 @@ def main(argv: list[str] | None = None) -> int:
         emit_kv("LINK_KIND", link_kind)
         return 0
 
-    draft = str(args.draft).strip().lower() == "true"
-
     final_body_file = tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".md",
@@ -709,15 +720,6 @@ def main(argv: list[str] | None = None) -> int:
         final_body_file.flush()
         final_body_file.close()
         final_body_path = Path(final_body_file.name)
-
-        if args.dry_run:
-            emit_kv("DRY_RUN", "true")
-            emit_kv("PR_TITLE_PREVIEW", args.pr_title)
-            emit_kv("PR_BODY_PREVIEW_FIRST_LINES", "\\n".join(final_body.splitlines()[:5]))
-            emit_kv("LINKED_ISSUE", args.linked_issue)
-            emit_kv("LINK_KIND", link_kind)
-            emit_kv("DRAFT", str(draft).lower())
-            return 0
 
         # #1679: canonical repository resolution / PR mutation target
         # binding (Issue #1470) is an independent fail-closed safety

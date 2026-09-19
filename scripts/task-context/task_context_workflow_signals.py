@@ -72,7 +72,7 @@ def _validate_evidence(kind: str, evidence: Any) -> tuple[dict[str, Any] | None,
     if set(evidence) != expected:
         return None, _outcome("rejected_evidence", "INVALID_EVIDENCE_FIELDS")
     repo = evidence["repo"]
-    if not isinstance(repo, str) or not _REPO.fullmatch(repo):
+    if not isinstance(repo, str) or not _REPO.fullmatch(repo) or repo.endswith(".git"):
         return None, _outcome("rejected_evidence", "INVALID_REPOSITORY")
     if not _is_int(evidence["issue_number"]) or evidence["issue_number"] <= 0:
         return None, _outcome("rejected_evidence", "INVALID_ISSUE_NUMBER")
@@ -287,6 +287,48 @@ def _validate_required_claims_tx(
     return None
 
 
+def _validate_merged_prerequisites_tx(
+    conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Classify absent implementation claims as not-ready, not identity conflicts."""
+    issue = _claim_for_tx(conn, evidence["repo"], "issue", evidence["issue_number"])
+    pr = _claim_for_tx(conn, evidence["repo"], "pr", evidence["pr_number"])
+    if issue is None or pr is None:
+        return _outcome("deferred", "IMPLEMENTATION_NOT_READY")
+    if issue["task_id"] != task_id or pr["task_id"] != task_id:
+        return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
+    return None
+
+
+def _matching_accepted_merge_tx(
+    conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Find the exact accepted merge fact required by cleanup completion."""
+    merge_payload = {
+        "signal_kind": "pr_merged_observed",
+        "source": "post-merge-cleanup",
+        "source_schema_version": "v1",
+        "evidence": {
+            "repo": evidence["repo"],
+            "issue_number": evidence["issue_number"],
+            "pr_number": evidence["pr_number"],
+            "merge_commit_oid": evidence["merge_identity"],
+        },
+    }
+    accepted = _accepted_event_tx(conn, dedupe_key_for(merge_payload))
+    if accepted is None:
+        return None, None
+    if accepted["task_id"] != task_id or not _metadata_matches(
+        accepted,
+        repo=evidence["repo"],
+        issue_number=evidence["issue_number"],
+        pr_number=evidence["pr_number"],
+        merge_commit_oid=evidence["merge_identity"],
+    ):
+        return None, _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
+    return accepted, None
+
+
 def apply_workflow_signal(
     conn: sqlite3.Connection, payload: Any, *, origin_session_id: str | None = None
 ) -> dict[str, Any]:
@@ -303,17 +345,33 @@ def apply_workflow_signal(
                 return outcome
             assert origin is not None
             task_id, kind, evidence = origin["task_id"], valid["signal_kind"], valid["evidence"]
-            # Implementation evidence belongs only to the currently eligible
-            # historical implementation Activity. Check its fixed selection
-            # before claim attachment so delayed/replayed facts cannot mutate
-            # claims or events after that phase has terminalized.
             if kind == "implementation_pr_observed":
                 implementation = _activity_for_tx(conn, task_id, "implementation")
                 if implementation is None:
                     return _outcome("deferred", "activity_missing")
                 if implementation["status"] != "ACTIVE":
                     return _outcome("duplicate_noop", "activity_terminal", task_id=task_id)
+                # The implementation dedupe key deliberately identifies a PR,
+                # not an Issue. A replay with that PR but another Issue is a
+                # conflict, never an opportunity to attach a second Issue claim.
+                accepted_implementation = _accepted_event_tx(conn, key)
+                if accepted_implementation and accepted_implementation["task_id"] == task_id and not _metadata_matches(
+                    accepted_implementation,
+                    repo=evidence["repo"],
+                    issue_number=evidence["issue_number"],
+                    pr_number=evidence["pr_number"],
+                ):
+                    return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
                 outcome = _validate_claims_or_attach_implementation_tx(conn, task_id, evidence)
+            elif kind == "pr_merged_observed":
+                outcome = _validate_merged_prerequisites_tx(conn, task_id, evidence)
+            elif kind == "cleanup_completed":
+                accepted_merge, outcome = _matching_accepted_merge_tx(conn, task_id, evidence)
+                if outcome:
+                    return outcome
+                if accepted_merge is None:
+                    return _outcome("conflict", "OUT_OF_ORDER_SIGNAL")
+                outcome = _validate_required_claims_tx(conn, task_id, evidence)
             else:
                 outcome = _validate_required_claims_tx(conn, task_id, evidence)
             if outcome:
@@ -356,19 +414,6 @@ def apply_workflow_signal(
                 )
                 event_id = _append_signal_tx(conn, valid, origin, activity["id"])
             else:  # cleanup_completed
-                merge_payload = {
-                    "signal_kind": "pr_merged_observed",
-                    "source": "post-merge-cleanup",
-                    "source_schema_version": "v1",
-                    "evidence": {
-                        "repo": evidence["repo"],
-                        "issue_number": evidence["issue_number"],
-                        "pr_number": evidence["pr_number"],
-                        "merge_commit_oid": evidence["merge_identity"],
-                    },
-                }
-                if not _accepted_event_tx(conn, dedupe_key_for(merge_payload)):
-                    return _outcome("conflict", "OUT_OF_ORDER_SIGNAL")
                 cleanup = _find_cleanup_instance_tx(
                     conn, task_id, evidence["repo"], evidence["pr_number"], evidence["merge_identity"]
                 )
@@ -421,6 +466,7 @@ def begin_cleanup_lifecycle(
     if (
         not isinstance(repo, str)
         or not _REPO.fullmatch(repo)
+        or repo.endswith(".git")
         or not all(_is_int(v) and v > 0 for v in (issue_number, pr_number))
         or not isinstance(merge_identity, str)
         or not _HEX40.fullmatch(merge_identity)

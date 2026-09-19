@@ -313,6 +313,26 @@ def test_given_bound_task_and_explicit_unclaimed_pr_url_when_submitted_then_no_l
     assert (current_task_id, current_activity_id) == (bound["task_id"], bound["activity_id"])
 
 
+def test_given_initially_unbound_binding_and_explicit_unclaimed_pr_when_submitted_then_passes_without_autobind(conn):
+    conn_holder["conn"] = conn
+    binding_id = _start_session("tab-1", "s1")
+    before = _task_context_snapshot(conn)
+
+    result = _submit(
+        "s1",
+        "tab-1",
+        classification_kind="EXPLICIT",
+        target_repo="owner/repo",
+        target_ref_kind="pr",
+        target_ref_number=99,
+    )
+
+    assert result == {"decision": "pass", "reason_code": "unclaimed_pr_local_only"}
+    assert _task_context_snapshot(conn) == before
+    current_task_id, current_activity_id, _ = service.get_current_task_activity_for_binding(conn, binding_id)
+    assert (current_task_id, current_activity_id) == (None, None)
+
+
 def test_given_bound_task_and_claimed_pr_when_submitted_then_existing_same_target_path_is_preserved(conn):
     """The AC6 narrow exception must not alter legitimate claimed PR handling."""
     conn_holder["conn"] = conn

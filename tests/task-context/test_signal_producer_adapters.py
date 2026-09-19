@@ -49,3 +49,43 @@ def test_given_unbound_origin_when_open_pr_observes_a_pr_then_it_does_not_fetch_
         "deferred",
         "unbound",
     )
+
+
+def test_given_dry_run_and_existing_pr_when_open_pr_runs_then_it_never_emits_a_signal(tmp_path, monkeypatch):
+    body_file = tmp_path / "body.md"
+    body_file.write_text("## Summary\n\npreview", encoding="utf-8")
+    monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda *_args: "OPEN")
+    monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda *_args: [])
+    monkeypatch.setattr(open_pr, "_run_pr_body_validator", lambda *_args: {"status": "pass"})
+    monkeypatch.setattr(open_pr, "_run_japanese_content_validator", lambda *_args: {"status": "pass"})
+    monkeypatch.setattr(
+        open_pr,
+        "find_existing_pr",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("dry-run must not inspect an existing PR")),
+    )
+    monkeypatch.setattr(
+        open_pr,
+        "emit_implementation_pr_observed",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("dry-run must not emit a Task Context signal")),
+    )
+
+    assert (
+        open_pr.main(
+            [
+                "--pr-title",
+                "preview",
+                "--linked-issue",
+                "20",
+                "--publish",
+                "yes",
+                "--pr-body-file",
+                str(body_file),
+                "--repo",
+                "owner/repo",
+                "--branch",
+                "preview-branch",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )

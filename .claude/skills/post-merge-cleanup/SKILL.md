@@ -16,8 +16,10 @@ cleanup work を select、resume、または dispatch する前に、orchestrato
 `duplicate_noop` の場合だけ durable cleanup selection を試行できる。続く cleanup-begin outcome が `selected`
 （新規または非terminal instance の再選択）の場合だけ cleanup Activity/work を dispatch し、terminal instance の
 `duplicate_noop/activity_terminal` を含む他の outcome では dispatch せずこの invocation を停止する。最終 cleanup work が成功した後に限り、同じ adapter を
-`--phase completed` で呼び出す。receipt/partial/failed/human-review outcome は `cleanup_completed` を
-emit しない。adapter outcome は diagnostic であり、完了済み producer operation を rollback しない。
+`--phase completed` で呼び出す。completed invocation は worker の完全な `POST_MERGE_CLEANUP_REPORT_V1` を保存した
+`--cleanup-receipt-file` を必須とし、closed-key validation 済みかつ `status: ok`、`human_review_required: false`、
+`unresolved_cleanup_items: []`、`errors: []` の final-success receipt だけが signal を emit できる。receipt/partial/failed/human-review/no-proof
+outcome は `cleanup_completed` を emit せず dispatch も再開しない。adapter outcome は diagnostic であり、完了済み producer operation を rollback しない。
 
 ## Delegation / 委譲
 

@@ -37,3 +37,18 @@ def test_given_claim_owned_by_different_task_when_implementation_fact_arrives_th
     assert mutation_counts(conn) == before
     assert service.find_live_claim(conn, REPO, "pr", 21) is None
     assert second_task["id"] != first_task["id"]
+
+
+def test_given_accepted_pr_fact_with_different_issue_when_replayed_then_conflict_precedes_claim_mutation(conn):
+    task, _, _, _ = create_origin(conn)
+    result = signals.apply_workflow_signal(conn, implementation_payload(), origin_session_id="session-1")
+    assert result["disposition"] == "applied"
+    changed_issue = implementation_payload(issue_number=22)
+    before = mutation_counts(conn)
+
+    result = signals.apply_workflow_signal(conn, changed_issue, origin_session_id="session-1")
+
+    assert result == {"disposition": "conflict", "reason_code": "FACT_TASK_IDENTITY_CONFLICT"}
+    assert mutation_counts(conn) == before
+    assert service.find_live_claim(conn, REPO, "issue", 22) is None
+    assert service.find_live_claim(conn, REPO, "issue", 20)["task_id"] == task["id"]

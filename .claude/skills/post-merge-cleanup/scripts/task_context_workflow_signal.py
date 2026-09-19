@@ -15,7 +15,45 @@ import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(_ROOT / "scripts"))
+from check_post_merge_cleanup_boundary import validate_report_v1  # noqa: E402
+
 _CTL = _ROOT / "scripts" / "task-context" / "task_contextctl.py"
+
+
+def _final_success_receipt_reason(receipt_file: Path | None) -> str | None:
+    """Return a fail-closed reason unless the worker report proves final success."""
+    if receipt_file is None:
+        return "CLEANUP_FINAL_SUCCESS_RECEIPT_REQUIRED"
+    try:
+        receipt_text = receipt_file.read_text(encoding="utf-8")
+    except OSError:
+        return "CLEANUP_FINAL_SUCCESS_RECEIPT_INVALID"
+    try:
+        payload = json.loads(receipt_text)
+    except json.JSONDecodeError:
+        try:
+            import yaml
+        except ImportError:
+            return "CLEANUP_FINAL_SUCCESS_RECEIPT_INVALID"
+        try:
+            payload = yaml.safe_load(receipt_text)
+        except yaml.YAMLError:
+            return "CLEANUP_FINAL_SUCCESS_RECEIPT_INVALID"
+    if isinstance(payload, dict) and set(payload) == {"POST_MERGE_CLEANUP_REPORT_V1"}:
+        payload = payload["POST_MERGE_CLEANUP_REPORT_V1"]
+    validation = validate_report_v1(payload)
+    if not validation.valid:
+        return "CLEANUP_FINAL_SUCCESS_RECEIPT_INVALID"
+    assert isinstance(payload, dict)
+    if (
+        payload["status"] != "ok"
+        or payload["human_review_required"] is not False
+        or payload["unresolved_cleanup_items"]
+        or payload["errors"]
+    ):
+        return "CLEANUP_NOT_FINAL_SUCCESS"
+    return None
 
 
 def _merged_evidence(snapshot: object, issue_number: int, pr_number: int) -> tuple[dict | None, str]:
@@ -64,6 +102,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--issue-number", type=int, required=True)
     parser.add_argument("--pr-number", type=int, required=True)
     parser.add_argument("--phase", choices=("merged", "completed"), required=True)
+    parser.add_argument(
+        "--cleanup-receipt-file",
+        type=Path,
+        help="final cleanup worker result (required for --phase completed)",
+    )
     args = parser.parse_args(argv)
     try:
         snapshot = json.loads(args.snapshot_file.read_text(encoding="utf-8"))
@@ -101,6 +144,10 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         print(json.dumps(result))
+        return 0
+    receipt_reason = _final_success_receipt_reason(args.cleanup_receipt_file)
+    if receipt_reason:
+        print(json.dumps({"disposition": "deferred", "reason_code": receipt_reason}))
         return 0
     completed_evidence = {
         "repo": evidence["repo"],

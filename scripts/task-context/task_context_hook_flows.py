@@ -296,6 +296,13 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
     if not (target_repo and target_ref_kind and target_ref_number is not None):
         return {"decision": "pass", "reason_code": "malformed_target_payload"}
 
+    # An explicit PR target has no equivalence authority until a local claim
+    # exists. This check intentionally precedes autobind: an otherwise-unbound
+    # Binding must not turn an unclaimed PR prompt into a new Task.
+    live_claim = service.find_live_claim(conn, target_repo, target_ref_kind, target_ref_number)
+    if target_ref_kind == "pr" and live_claim is None:
+        return {"decision": "pass", "reason_code": "unclaimed_pr_local_only"}
+
     if current_task_id is None:
         bound = service.bind_target_to_binding(
             conn,
@@ -314,17 +321,8 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
             **_projection_fields(bound),
         }
 
-    live_claim = service.find_live_claim(conn, target_repo, target_ref_kind, target_ref_number)
     if live_claim is not None and live_claim["task_id"] == current_task_id:
         return {"decision": "pass", "reason_code": "same_target"}
-
-    # Issue #2565 AC6: an explicitly classified PR with no local claim is
-    # not equivalence authority. Keep this narrowly limited to unclaimed PRs:
-    # do not query GitHub, absorb it into a provisional Task, or even append a
-    # prompt event. Claimed PRs and every non-PR reference retain their normal
-    # paths below.
-    if target_ref_kind == "pr" and live_claim is None:
-        return {"decision": "pass", "reason_code": "unclaimed_pr_local_only"}
 
     refs_count = service.count_live_task_ref_claims(conn, current_task_id)
     current_activity = service.get_activity(conn, current_activity_id) if current_activity_id else None

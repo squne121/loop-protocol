@@ -25,6 +25,28 @@ def test_given_no_matching_merge_when_cleanup_completion_arrives_then_out_of_ord
     assert mutation_counts(conn) == before
 
 
+def test_given_missing_implementation_prerequisite_when_merge_arrives_then_not_ready_precedes_identity_conflict(conn):
+    from workflow_signal_test_support import merged_payload
+
+    create_origin(conn)
+    before = mutation_counts(conn)
+
+    result = signals.apply_workflow_signal(conn, merged_payload(), origin_session_id="session-1")
+
+    assert result == {"disposition": "deferred", "reason_code": "IMPLEMENTATION_NOT_READY"}
+    assert mutation_counts(conn) == before
+
+
+def test_given_no_accepted_merge_or_claims_when_cleanup_completion_arrives_then_out_of_order_is_non_mutating(conn):
+    create_origin(conn)
+    before = mutation_counts(conn)
+
+    result = signals.apply_workflow_signal(conn, cleanup_completed_payload(), origin_session_id="session-1")
+
+    assert result == {"disposition": "conflict", "reason_code": "OUT_OF_ORDER_SIGNAL"}
+    assert mutation_counts(conn) == before
+
+
 def test_given_terminal_cleanup_replay_when_signal_arrives_then_same_fact_noop_preserves_state(
     conn,
 ):

@@ -30,3 +30,16 @@ def test_given_invalid_strict_evidence_when_signal_applied_then_evidence_rejecti
         "reason_code": "INVALID_REPOSITORY",
     }
     assert mutation_counts(conn) == before
+
+
+def test_given_git_suffix_repository_evidence_when_signal_applied_then_rejected_without_mutation(conn):
+    create_origin(conn)
+    payload = implementation_payload()
+    payload["evidence"]["repo"] = "squne121/loop-protocol.git"
+    before = mutation_counts(conn)
+
+    assert signals.apply_workflow_signal(conn, payload, origin_session_id="session-1") == {
+        "disposition": "rejected_evidence",
+        "reason_code": "INVALID_REPOSITORY",
+    }
+    assert mutation_counts(conn) == before
