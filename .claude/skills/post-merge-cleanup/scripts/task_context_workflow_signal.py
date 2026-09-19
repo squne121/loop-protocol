@@ -71,11 +71,14 @@ def _merged_evidence(snapshot: object, issue_number: int, pr_number: int) -> tup
         return None, "RELATION_UNAVAILABLE"
     if pr.get("merged") is not True or pr.get("number") != pr_number or not isinstance(repo, str):
         return None, "MERGED_SNAPSHOT_INVALID"
+    if not isinstance(nodes, list) or len(nodes) != 1 or not isinstance(nodes[0], dict):
+        return None, "RELATION_ISSUE_MISMATCH"
+    relation_repository = nodes[0].get("repository")
+    relation_repo = relation_repository.get("nameWithOwner") if isinstance(relation_repository, dict) else None
     if (
-        not isinstance(nodes, list)
-        or len(nodes) != 1
-        or not isinstance(nodes[0], dict)
-        or nodes[0].get("number") != issue_number
+        nodes[0].get("number") != issue_number
+        or not isinstance(relation_repo, str)
+        or relation_repo.lower() != repo.lower()
     ):
         return None, "RELATION_ISSUE_MISMATCH"
     if not isinstance(oid, str):

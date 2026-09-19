@@ -506,11 +506,21 @@ def _run_japanese_content_validator(
         Path(body_file.name).unlink(missing_ok=True)
 
 
-def classify_closing_issue_relation(snapshot: object, candidate_issue: int) -> tuple[str, str, dict | None]:
+def _relation_repo_identity(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if re.fullmatch(r"[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._-]*", normalized) else None
+
+
+def classify_closing_issue_relation(
+    snapshot: object, candidate_issue: int, candidate_repo: str | None = None
+) -> tuple[str, str, dict | None]:
     """Total, bounded classifier for a fresh PR GraphQL snapshot (#2565).
 
-    It intentionally treats malformed, partial, and unavailable snapshots as
-    unavailable rather than attempting a textual/branch-name fallback.
+    A closing reference is an ``(repository, issue number)`` fact.  Number
+    equality alone is not sufficient because GitHub may close an Issue in a
+    different repository.
     """
     if not isinstance(snapshot, dict):
         return "deferred", "RELATION_UNAVAILABLE", None
@@ -523,23 +533,31 @@ def classify_closing_issue_relation(snapshot: object, candidate_issue: int) -> t
         pull_request = repository["pullRequest"]
         relation = pull_request["closingIssuesReferences"]
         nodes = relation["nodes"]
-        repo = repository["nameWithOwner"]
+        repo = _relation_repo_identity(repository["nameWithOwner"])
     except (KeyError, TypeError):
         return "deferred", "RELATION_UNAVAILABLE", None
-    if not isinstance(nodes, list) or not isinstance(repo, str) or not isinstance(pull_request, dict):
+    expected_repo = _relation_repo_identity(candidate_repo) if candidate_repo is not None else repo
+    if not isinstance(nodes, list) or repo is None or expected_repo is None or not isinstance(pull_request, dict):
         return "deferred", "RELATION_UNAVAILABLE", None
-    if any(not isinstance(node, dict) or type(node.get("number")) is not int for node in nodes):
+    if any(
+        not isinstance(node, dict)
+        or type(node.get("number")) is not int
+        or not isinstance(node.get("repository"), dict)
+        or _relation_repo_identity(node["repository"].get("nameWithOwner")) is None
+        for node in nodes
+    ):
         return "deferred", "RELATION_UNAVAILABLE", None
     if len(nodes) == 0:
         return "deferred", "NO_LINK", None
     if len(nodes) >= 2:
         return "conflict", "MULTIPLE_CLOSING_ISSUES", None
-    if nodes[0]["number"] != candidate_issue:
+    relation_repo = _relation_repo_identity(nodes[0]["repository"]["nameWithOwner"])
+    if nodes[0]["number"] != candidate_issue or relation_repo != expected_repo:
         return "conflict", "RELATION_ISSUE_MISMATCH", None
     number = pull_request.get("number")
     if type(number) is not int or number <= 0:
         return "deferred", "RELATION_UNAVAILABLE", None
-    return "matched", "MATCHED", {"repo": repo.lower(), "issue_number": candidate_issue, "pr_number": number}
+    return "matched", "MATCHED", {"repo": repo, "issue_number": candidate_issue, "pr_number": number}
 
 
 def emit_implementation_pr_observed(*, repo: str, pr_number: int, linked_issue: int) -> tuple[str, str]:
@@ -553,7 +571,8 @@ def emit_implementation_pr_observed(*, repo: str, pr_number: int, linked_issue: 
     query = (
         "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
         "{nameWithOwner pullRequest(number:$number){number "
-        "closingIssuesReferences(first:2,excludeUserLinked:false,userLinkedOnly:false){nodes{number}}}}}"
+        "closingIssuesReferences(first:2,excludeUserLinked:false,userLinkedOnly:false)"
+        "{nodes{number repository{nameWithOwner}}}}}"
     )
     try:
         response = run_gh(
@@ -571,7 +590,7 @@ def emit_implementation_pr_observed(*, repo: str, pr_number: int, linked_issue: 
         snapshot = json.loads(response.stdout)
     except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
         return "deferred", "RELATION_UNAVAILABLE"
-    disposition, reason, evidence = classify_closing_issue_relation(snapshot, linked_issue)
+    disposition, reason, evidence = classify_closing_issue_relation(snapshot, linked_issue, repo)
     if evidence is None:
         return disposition, reason
     ctl = Path(__file__).resolve().parents[4] / "scripts" / "task-context" / "task_contextctl.py"

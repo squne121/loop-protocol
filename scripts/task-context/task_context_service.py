@@ -996,6 +996,36 @@ def _ensure_active_activity_tx(conn: sqlite3.Connection, task_id: str, kind: str
     return _transition_activity_tx(conn, task_id, kind)
 
 
+def _select_activity_for_binding_tx(conn: sqlite3.Connection, task_id: str, kind: str) -> str:
+    """Select an ACTIVE Activity, except resume a merge-accepted Task at its
+    historical implementation Activity until cleanup owns the next transition.
+
+    A fresh Binding may resolve the same Task after ``pr_merged_observed`` was
+    committed but before ``cleanup begin`` ran.  Starting a generic native
+    Activity in that narrow gap would make the canonical cleanup transition
+    out-of-order.  Reattach to the completed implementation Activity instead;
+    ``begin_cleanup_lifecycle`` owns creating and binding cleanup atomically.
+    """
+    active = conn.execute(
+        "SELECT id FROM activities WHERE task_id = ? AND status = 'ACTIVE'", (task_id,)
+    ).fetchone()
+    if active is not None:
+        return active["id"]
+    merged = conn.execute(
+        "SELECT activity_id FROM events WHERE task_id = ? AND event_type = 'workflow:pr_merged_observed' "
+        "AND activity_id IS NOT NULL ORDER BY occurred_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if merged is not None:
+        implementation = conn.execute(
+            "SELECT id FROM activities WHERE id = ? AND task_id = ? AND kind = 'implementation'",
+            (merged["activity_id"], task_id),
+        ).fetchone()
+        if implementation is not None:
+            return implementation["id"]
+    return _transition_activity_tx(conn, task_id, kind)
+
+
 def _attach_or_start_binding_run_tx(
     conn: sqlite3.Connection,
     binding_id: str,
@@ -1070,7 +1100,7 @@ def bind_target_to_binding(
     and explicit ``/task <github-ref>`` rebind."""
     with db.write_transaction(conn):
         task_id = _resolve_or_create_task_for_target_tx(conn, repo, ref_kind, ref_number)
-        activity_id = _ensure_active_activity_tx(conn, task_id, activity_kind)
+        activity_id = _select_activity_for_binding_tx(conn, task_id, activity_kind)
         return _finish_binding_mutation_tx(
             conn,
             binding_id=binding_id,

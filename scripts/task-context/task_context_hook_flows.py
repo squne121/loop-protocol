@@ -312,6 +312,7 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
             ref_kind=target_ref_kind,
             ref_number=target_ref_number,
             reason_code="autobind",
+            activity_kind="refine",
         )
         return {
             "decision": "pass",

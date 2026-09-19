@@ -25,7 +25,7 @@ def test_given_graphql_data_plus_top_level_errors_when_merge_signal_runs_then_it
                     "number": 21,
                     "merged": True,
                     "mergeCommit": {"oid": "b" * 40},
-                    "closingIssuesReferences": {"nodes": [{"number": 20}]},
+                    "closingIssuesReferences": {"nodes": [{"number": 20, "repository": {"nameWithOwner": "squne121/loop-protocol"}}]},
                 },
             }
         },
@@ -69,7 +69,7 @@ def _merged_snapshot() -> dict:
                     "number": 21,
                     "merged": True,
                     "mergeCommit": {"oid": "b" * 40},
-                    "closingIssuesReferences": {"nodes": [{"number": 20}]},
+                    "closingIssuesReferences": {"nodes": [{"number": 20, "repository": {"nameWithOwner": "squne121/loop-protocol"}}]},
                 },
             }
         }
@@ -97,6 +97,17 @@ def _cleanup_report(*, status: str = "ok", human_review_required: bool = False) 
         "warnings": [],
         "errors": [],
     }
+
+
+def test_given_cross_repository_same_number_closing_relation_when_merged_evidence_is_derived_then_it_is_rejected():
+    snapshot = _merged_snapshot()
+    snapshot["data"]["repository"]["pullRequest"]["closingIssuesReferences"]["nodes"][0]["repository"] = {
+        "nameWithOwner": "owner/other"
+    }
+
+    evidence, reason = post_merge_signal._merged_evidence(snapshot, 20, 21)
+
+    assert (evidence, reason) == (None, "RELATION_ISSUE_MISMATCH")
 
 
 def _must_not_apply(*_args, **_kwargs):

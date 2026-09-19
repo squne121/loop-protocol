@@ -248,12 +248,23 @@ def _append_signal_tx(
     )
 
 
-def _validate_claims_or_attach_implementation_tx(
+def _validate_implementation_claims_tx(
     conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]
 ) -> dict[str, Any] | None:
+    """Validate a proposed implementation attachment without writing claims."""
     repo, issue, pr = evidence["repo"], evidence["issue_number"], evidence["pr_number"]
     issue_claim, pr_claim = _claim_for_tx(conn, repo, "issue", issue), _claim_for_tx(conn, repo, "pr", pr)
     if (issue_claim and issue_claim["task_id"] != task_id) or (pr_claim and pr_claim["task_id"] != task_id):
+        return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
+    # A Task has one primary Issue identity.  An open-pr producer may remain
+    # successful, but it must not attach an unrelated Issue/PR fact to the
+    # origin Task that an ACTIVE hook deliberately kept unchanged.
+    other_issue = conn.execute(
+        "SELECT 1 FROM task_ref_claims WHERE task_id = ? AND ref_kind = 'issue' AND released_at IS NULL "
+        "AND (repo != ? OR ref_number != ?) LIMIT 1",
+        (task_id, repo, issue),
+    ).fetchone()
+    if other_issue:
         return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
     # An Issue already tied to another implementation PR is an explicit
     # conflict; do not let a new PR silently become equivalent.
@@ -264,14 +275,16 @@ def _validate_claims_or_attach_implementation_tx(
     ).fetchone()
     if other_pr:
         return _outcome("conflict", "OUT_OF_ORDER_SIGNAL")
-    # Validate every legal attachment before inserting either row.  The single
-    # transaction makes the two inserts all-or-nothing if an unexpected DB
-    # constraint wins a race.
-    if issue_claim is None:
-        _claim_tx(conn, task_id, repo, "issue", issue)
-    if pr_claim is None:
-        _claim_tx(conn, task_id, repo, "pr", pr)
     return None
+
+
+def _attach_implementation_claims_tx(conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]) -> None:
+    """Attach only an already-admissible implementation fact."""
+    repo, issue, pr = evidence["repo"], evidence["issue_number"], evidence["pr_number"]
+    if _claim_for_tx(conn, repo, "issue", issue) is None:
+        _claim_tx(conn, task_id, repo, "issue", issue)
+    if _claim_for_tx(conn, repo, "pr", pr) is None:
+        _claim_tx(conn, task_id, repo, "pr", pr)
 
 
 def _validate_required_claims_tx(
@@ -362,7 +375,7 @@ def apply_workflow_signal(
                     pr_number=evidence["pr_number"],
                 ):
                     return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
-                outcome = _validate_claims_or_attach_implementation_tx(conn, task_id, evidence)
+                outcome = _validate_implementation_claims_tx(conn, task_id, evidence)
             elif kind == "pr_merged_observed":
                 outcome = _validate_merged_prerequisites_tx(conn, task_id, evidence)
             elif kind == "cleanup_completed":
@@ -394,6 +407,7 @@ def apply_workflow_signal(
             if kind == "implementation_pr_observed":
                 if activity is None:
                     return _outcome("deferred", "activity_missing")
+                _attach_implementation_claims_tx(conn, task_id, evidence)
                 event_id = _append_signal_tx(conn, valid, origin, activity["id"])
             elif kind == "refinement_approved":
                 if activity is None:
@@ -403,6 +417,17 @@ def apply_workflow_signal(
                 conn.execute(
                     "UPDATE activities SET status = 'DONE', ended_at = ? WHERE id = ?",
                     (service.now_iso(), activity["id"]),
+                )
+                # An ordinary Issue-prompt hook starts refine. Its approved
+                # handoff is the canonical implementation phase start, and
+                # the current managed origin must follow that phase atomically.
+                implementation_id = service._transition_activity_tx(conn, task_id, "implementation")
+                service._attach_execution_run_tx(
+                    conn,
+                    origin["execution_run_id"],
+                    task_id=task_id,
+                    activity_id=implementation_id,
+                    binding_id=origin["binding_id"],
                 )
                 event_id = _append_signal_tx(conn, valid, origin, activity["id"])
             elif kind == "pr_merged_observed":
@@ -500,6 +525,14 @@ def begin_cleanup_lifecycle(
         found = _find_cleanup_instance_tx(conn, task_id, repo, pr_number, merge_identity)
         if found is not None:
             if found["status"] == "ACTIVE":
+                service._attach_execution_run_tx(
+                    conn,
+                    origin["execution_run_id"],
+                    task_id=task_id,
+                    activity_id=found["id"],
+                    binding_id=origin["binding_id"],
+                )
+                service._bump_projection_tx(conn, origin["binding_id"])
                 return _outcome("selected", "CLEANUP_ALREADY_SELECTED", task_id=task_id, activity_id=found["id"])
             # A terminal historical cleanup instance is not resumable and must
             # never be reported as selected to a caller that could redispatch
@@ -511,6 +544,13 @@ def begin_cleanup_lifecycle(
         if active:
             return _outcome("conflict", "OUT_OF_ORDER_SIGNAL")
         activity_id = service._transition_activity_tx(conn, task_id, "cleanup")
+        service._attach_execution_run_tx(
+            conn,
+            origin["execution_run_id"],
+            task_id=task_id,
+            activity_id=activity_id,
+            binding_id=origin["binding_id"],
+        )
         service._append_event_tx(
             conn,
             event_type="workflow:cleanup_started",

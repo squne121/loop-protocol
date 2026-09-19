@@ -11,7 +11,9 @@ Codex CLI では、このステップ専用の custom agent `post-merge-cleanup-
 
 ## Task Context の信頼済み merge commit point（Issue #2565）
 
-cleanup work を select、resume、または dispatch する前に、orchestrator は fresh merged-PR GraphQL snapshot を取得し、
+cleanup work を select、resume、または dispatch する前に、orchestrator は fresh merged-PR GraphQL snapshot を取得する。snapshot は
+`closingIssuesReferences(first: 2) { nodes { number repository { nameWithOwner } } }` を含め、candidate Issue は
+repository identity と Issue number の組で照合する（同番号でも別 repository は non-mutating mismatch）。
 `scripts/task_context_workflow_signal.py --phase merged` を呼び出す。merge signal が `applied` または同一 Task の
 `duplicate_noop` の場合だけ durable cleanup selection を試行できる。続く cleanup-begin outcome が `selected`
 （新規または非terminal instance の再選択）の場合だけ cleanup Activity/work を dispatch し、terminal instance の

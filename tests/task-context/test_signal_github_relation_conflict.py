@@ -11,13 +11,21 @@ import open_pr
 
 
 def _snapshot(*, nodes: object = None, errors: object = None) -> dict:
+    raw_nodes = [] if nodes is None else nodes
+    if isinstance(raw_nodes, list):
+        raw_nodes = [
+            {**node, "repository": node.get("repository", {"nameWithOwner": "Squne121/Loop-Protocol"})}
+            if isinstance(node, dict)
+            else node
+            for node in raw_nodes
+        ]
     snapshot = {
         "data": {
             "repository": {
                 "nameWithOwner": "Squne121/Loop-Protocol",
                 "pullRequest": {
                     "number": 21,
-                    "closingIssuesReferences": {"nodes": [] if nodes is None else nodes},
+                    "closingIssuesReferences": {"nodes": raw_nodes},
                 },
             }
         }
@@ -56,6 +64,14 @@ def test_given_nonmatching_relation_shapes_when_classified_then_each_has_a_non_m
         disposition, reason, evidence = open_pr.classify_closing_issue_relation(snapshot, 20)
         assert (disposition, reason) == expected
         assert evidence is None
+
+
+def test_given_same_issue_number_in_different_repository_when_classified_then_relation_is_non_mutating_mismatch():
+    snapshot = _snapshot(nodes=[{"number": 20, "repository": {"nameWithOwner": "owner/other"}}])
+    disposition, reason, evidence = open_pr.classify_closing_issue_relation(
+        snapshot, 20, "squne121/loop-protocol"
+    )
+    assert (disposition, reason, evidence) == ("conflict", "RELATION_ISSUE_MISMATCH", None)
 
 
 def test_given_top_level_graphql_errors_with_plausible_data_when_classified_then_relation_is_unavailable():
