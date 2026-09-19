@@ -56,6 +56,11 @@ TEST_FILE_EXCL = "scripts/ci/tests/test_python_invocation_policy.py"
 CHECKER_FILE_EXCL = "scripts/ci/check_python_invocation_policy.py"
 EXCEPTIONS_PATH = "scripts/ci/python_invocation_policy_exceptions.json"
 
+# gitignore'd runtime-local surface (see .gitignore) — not a repository-owned
+# governed surface. Bounded to this exact prefix only (Issue #2674); does not
+# extend to `.claude/skills/**` at large.
+SYSTEM_SKILLS_PREFIX = ".claude/skills/.system/"
+
 SURFACE_GLOBS = [
     ".github/workflows/**/*.yml",
     ".github/workflows/**/*.yaml",
@@ -1121,6 +1126,8 @@ def should_exclude(file_path: str, repo_root: str) -> bool:
     if rel == TEST_FILE_EXCL:
         return True
     if rel == CHECKER_FILE_EXCL:
+        return True
+    if rel.startswith(SYSTEM_SKILLS_PREFIX):
         return True
     return False
 

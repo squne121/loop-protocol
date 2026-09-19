@@ -496,6 +496,100 @@ def test_false_positive_test_file_excluded_from_surface_scan():
 
 
 # ---------------------------------------------------------------------------
+# Issue #2674: .claude/skills/.system/ bounded exclusion (gitignore'd
+# runtime-local surface — not a repository-owned governed surface).
+# AC1/AC5 checker constant, AC2/AC4/AC7/AC8 positive control (ordinary
+# project skill still detected), AC1/AC3/AC7/AC8 negative control (.system
+# is not scanned and does not pollute the repo-wide clean check).
+# ---------------------------------------------------------------------------
+
+def _write_skill_md(root: Path, rel_dir: str, body: str) -> Path:
+    d = root / rel_dir
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "SKILL.md"
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def test_system_skills_prefix_constant_is_bounded():
+    assert checker.SYSTEM_SKILLS_PREFIX == ".claude/skills/.system/"
+
+
+def test_system_skills_negative_control_not_in_surface_scan(tmp_path):
+    _write_skill_md(
+        tmp_path,
+        ".claude/skills/.system/example",
+        "```bash\npython3 scripts/foo.py\n```\n",
+    )
+    files = checker.collect_surface_files(tmp_path)
+    rels = {Path(f).relative_to(tmp_path).as_posix() for f in files}
+    assert ".claude/skills/.system/example/SKILL.md" not in rels
+
+
+def test_system_skills_negative_control_scan_check_reports_zero_violations(tmp_path):
+    _write_skill_md(
+        tmp_path,
+        ".claude/skills/.system/example",
+        "```bash\npython3 scripts/foo.py\n```\n",
+    )
+    result = checker.run_check(tmp_path)
+    assert result.violations == []
+
+
+def test_system_skills_positive_control_detected_as_direct_python_script(tmp_path):
+    _write_skill_md(
+        tmp_path,
+        ".claude/skills/project-owned",
+        "```bash\npython3 scripts/foo.py\n```\n",
+    )
+    files = checker.collect_surface_files(tmp_path)
+    rels = {Path(f).relative_to(tmp_path).as_posix() for f in files}
+    assert ".claude/skills/project-owned/SKILL.md" in rels
+
+    result = checker.run_check(tmp_path)
+    types = {v.violation_type for v in result.violations}
+    assert "direct_python_script" in types
+
+
+def test_system_skills_should_exclude_is_bounded_to_exact_prefix(tmp_path):
+    system_path = str(tmp_path / ".claude/skills/.system/example/SKILL.md")
+    assert checker.should_exclude(system_path, str(tmp_path)) is True
+    # A directory name that merely starts with the same characters (but is
+    # not the exact `.system/` segment) must NOT be excluded (AC5: bounded,
+    # not a broad prefix/glob match over `.claude/skills/**`).
+    lookalike_path = str(tmp_path / ".claude/skills/.systemic/SKILL.md")
+    assert checker.should_exclude(lookalike_path, str(tmp_path)) is False
+    normal_path = str(tmp_path / ".claude/skills/normal-skill/SKILL.md")
+    assert checker.should_exclude(normal_path, str(tmp_path)) is False
+
+
+def test_system_skills_exclusion_does_not_extend_to_rest_of_skills_dir(tmp_path):
+    _write_skill_md(
+        tmp_path,
+        ".claude/skills/.system/example",
+        "```bash\npython3 scripts/foo.py\n```\n",
+    )
+    _write_skill_md(
+        tmp_path,
+        ".claude/skills/normal-skill",
+        "```bash\npython3 scripts/bar.py\n```\n",
+    )
+    files = checker.collect_surface_files(tmp_path)
+    rels = {Path(f).relative_to(tmp_path).as_posix() for f in files}
+    assert ".claude/skills/.system/example/SKILL.md" not in rels
+    assert ".claude/skills/normal-skill/SKILL.md" in rels
+
+
+def test_system_skills_excluded_from_real_repo_scan_when_present():
+    # Whether or not a local (gitignore'd) .system/ checkout exists, the
+    # repository-owned governed surface scan must never include it (AC7:
+    # identical scan result with/without local .system present).
+    files = checker.collect_surface_files(REPO_ROOT)
+    rels = {Path(f).relative_to(REPO_ROOT).as_posix() for f in files}
+    assert not any(r.startswith(checker.SYSTEM_SKILLS_PREFIX) for r in rels)
+
+
+# ---------------------------------------------------------------------------
 # AC7 repo_scan_clean
 # ---------------------------------------------------------------------------
 
