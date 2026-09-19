@@ -56,6 +56,11 @@ TEST_FILE_EXCL = "scripts/ci/tests/test_python_invocation_policy.py"
 CHECKER_FILE_EXCL = "scripts/ci/check_python_invocation_policy.py"
 EXCEPTIONS_PATH = "scripts/ci/python_invocation_policy_exceptions.json"
 
+# gitignore'd runtime-local surface (see .gitignore) — not a repository-owned
+# governed surface. Bounded to this exact prefix only (Issue #2674); does not
+# extend to `.claude/skills/**` at large.
+SYSTEM_SKILLS_PREFIX = ".claude/skills/.system/"
+
 SURFACE_GLOBS = [
     ".github/workflows/**/*.yml",
     ".github/workflows/**/*.yaml",
@@ -1122,6 +1127,8 @@ def should_exclude(file_path: str, repo_root: str) -> bool:
         return True
     if rel == CHECKER_FILE_EXCL:
         return True
+    if rel.startswith(SYSTEM_SKILLS_PREFIX):
+        return True
     return False
 
 
@@ -1202,16 +1209,14 @@ def collect_surface_files(repo_root: Path) -> list[str]:
         if p.is_file():
             files.append(str(p))
 
-    seen: set[str] = set()
-    result: list[str] = []
-    for f in files:
-        k = os.path.realpath(f)
-        if k not in seen:
-            seen.add(k)
-            result.append(f)
-
+    # Exclusion must run before realpath-based dedup (Issue #2674 fix-delta):
+    # an excluded `.claude/skills/.system/**/SKILL.md` candidate must never
+    # consume the `seen` slot for a governed skill's realpath. Ordering it
+    # after dedup allowed a `.system` file symlink pointing at the same real
+    # file as an ordinary skill to shadow (and then itself be excluded),
+    # dropping both from the scan (AC7 regression).
     filtered = []
-    for f in result:
+    for f in files:
         rel = os.path.relpath(f, root).replace("\\", "/")
         if ".claude/worktrees/" in rel:
             continue
@@ -1219,7 +1224,15 @@ def collect_surface_files(repo_root: Path) -> list[str]:
             continue
         filtered.append(f)
 
-    return filtered
+    seen: set[str] = set()
+    result: list[str] = []
+    for f in filtered:
+        k = os.path.realpath(f)
+        if k not in seen:
+            seen.add(k)
+            result.append(f)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
