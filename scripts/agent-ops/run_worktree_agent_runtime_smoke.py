@@ -635,6 +635,125 @@ _CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON = json
 })
 
 
+# ---------------------------------------------------------------------------
+# Issue #2663: generic hook-chain evidence capability -- bounded, CLOSED
+# allowlist (never caller-supplied) of exactly one PreToolUse event/tool
+# target (AC2's ``all_matching_hooks_observed``) and one Stop-event side
+# effect target (AC3's ``sibling_side_effect_inventory_complete``). Neither
+# the event, the tool, the side-effect handler, nor the artifact path is
+# accepted as a CLI input -- ``--require-hook-chain-evidence`` is a bare
+# opt-in switch (Out of Scope: "caller-supplied arbitrary command/path/
+# marker/config").
+# ---------------------------------------------------------------------------
+
+_HOOK_CHAIN_EVIDENCE_EVENT = "PreToolUse"
+_HOOK_CHAIN_EVIDENCE_TOOL = "Bash"
+_HOOK_CHAIN_SIDE_EFFECT_EVENT = "Stop"
+# Basename-only match against the current project settings' Stop-event
+# command hook(s) (Issue #2663 "Current Validated Scope" /
+# ``.claude/hooks/session_manifest_coordinator.sh``, Out of Scope for this
+# Issue to edit). Never a hardcoded path -- only used to confirm the target
+# handler is genuinely CONFIGURED in the tested_head's own
+# ``.claude/settings.json`` before asserting anything about its side effect.
+_HOOK_CHAIN_SIDE_EFFECT_TARGET_BASENAME = "session_manifest_coordinator.sh"
+# ``generate_session_manifest_from_hook.mjs``'s own default
+# ``SESSION_MANIFEST_ARTIFACTS_DIR`` (Out of Scope for this Issue to edit).
+_HOOK_CHAIN_SIDE_EFFECT_ARTIFACT_RELPATH = ("artifacts", "session-manifest-runtime", "manifests")
+# Bounded directory listing -- never an unbounded scan (AC3 "bounded
+# location/resource").
+_HOOK_CHAIN_SIDE_EFFECT_MAX_SNAPSHOT_ENTRIES = 2000
+# ``generate_session_manifest_from_hook.mjs``'s own confirmed-live filename
+# contract: ``private-agent-session-manifest-{eventNameLower}-{timestamp}-
+# {stableKeySegment}.json`` (see its own source, "Artifact naming" comment).
+# This runner's own settings overlay ALSO additively registers a
+# ``PostToolUse`` debounced manifest writer that is NOT the AC3 target
+# handler (``session_manifest_coordinator.sh``, a ``Stop``-event hook) --
+# confirmed live: a single trial session produced BOTH a
+# ``...-posttooluse-...json`` and a ``...-stop-...json`` new manifest file
+# for the SAME session. Only the ``-stop-`` tagged filename is the target
+# handler's OWN side effect; the debounced PostToolUse writer is a
+# different, non-target hook and must never be counted toward this
+# assertion (positively OR negatively).
+_HOOK_CHAIN_SIDE_EFFECT_FILENAME_TOKEN = f"-{_HOOK_CHAIN_SIDE_EFFECT_EVENT.lower()}-"
+# A single structured (-p, single session, no subagent) invocation produces
+# at most one genuinely NEW, Stop-tagged manifest file; more than that is
+# an overflow anomaly, never silently accepted as extra evidence of success.
+_HOOK_CHAIN_SIDE_EFFECT_MAX_EXPECTED_NEW_FILES = 1
+
+# The raw hook stdin payload keys this module inspects to positively
+# self-identify the runner's OWN additive ``cat`` observer hook responses
+# (never the underlying project command hooks, none of which echo their own
+# stdin verbatim -- confirmed by reading every hook script named in the
+# expected PreToolUse/Stop cohorts). Only presence of these keys is used;
+# their VALUES (tool_input, transcript_path, last_assistant_message, ...)
+# are never read or persisted, except ``stop_hook_active`` (a bare boolean,
+# not prose/content).
+_HOOK_CHAIN_SELF_ECHO_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
+    "PreToolUse": ("tool_name", "tool_input", "tool_use_id"),
+    "Stop": ("stop_hook_active",),
+}
+
+
+def _read_project_settings(worktree: str) -> dict | None:
+    """Read-only parse of the tested_head worktree's OWN
+    ``.claude/settings.json`` (Issue #2663 AC2/AC3's expected-cohort /
+    target-handler source of truth). Reads the checked-out working-tree
+    file directly -- ``verify_worktree_identity`` already guarantees
+    ``worktree`` is the real, identity-verified checkout, and the final
+    acceptance-evidence HEAD-binding requirement (AC5) is enforced
+    elsewhere (``tested_head`` / postcondition fingerprint), not here.
+    Returns ``None`` (never a fabricated/empty cohort) on any read or parse
+    failure."""
+    settings_path = Path(worktree) / ".claude" / "settings.json"
+    try:
+        raw = settings_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_command_hooks_for_event(
+    settings: dict, event: str, tool_name: str | None
+) -> list[str]:
+    """The ``command`` template string of every ``type: "command"`` hook
+    registered under ``hooks[event]`` in a parsed ``.claude/settings.json``
+    object, restricted to groups whose ``matcher`` token-set covers
+    ``tool_name`` (or every group, when ``tool_name`` is ``None`` -- used
+    for matcher-less events like ``Stop``).
+
+    Issue #2663 Out of Scope: this deliberately mirrors (but does not
+    subprocess-execute, and is not imported from)
+    ``.claude/hooks/tests/hookchain_harness.py``'s
+    ``load_pretool_hook_commands`` read-only settings-parsing logic --
+    reimplemented locally, read-only, so this Allowed-Paths-scoped module
+    never depends on a file outside its own Allowed Paths, and never
+    reuses that harness's SEQUENTIAL SUBPROCESS EXECUTION technique as a
+    runtime evidence producer (Out of Scope)."""
+    groups = (settings.get("hooks") or {}).get(event) or []
+    commands: list[str] = []
+    if not isinstance(groups, list):
+        return commands
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        if tool_name is not None:
+            matcher = group.get("matcher", "")
+            matcher_tools = {m.strip() for m in str(matcher).split("|") if m.strip()}
+            if matcher_tools and tool_name not in matcher_tools:
+                continue
+        for hook in group.get("hooks", []) or []:
+            if not isinstance(hook, dict) or hook.get("type") != "command":
+                continue
+            command = hook.get("command")
+            if isinstance(command, str):
+                commands.append(command)
+    return commands
+
+
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            max_turns: int, claude_bin: str = "claude",
                            claude_agent_name: str | None = None,
@@ -642,6 +761,7 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            hermetic_settings_file: str | None = None,
                            claude_adapter: str = "native",
                            include_user_prompt_expansion_hook: bool = False,
+                           include_hook_chain_evidence_hooks: bool = False,
                            ) -> tuple[int | None, str, str, bool]:
     """Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES
     https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173):
@@ -711,7 +831,74 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
             if include_user_prompt_expansion_hook
             else _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
         )
+        # Issue #2663 AC1/AC2/AC3: purely additive, opt-in observation-only
+        # hook registration used ONLY when the caller passes
+        # ``--require-hook-chain-evidence``. This does NOT parse from a
+        # settings JSON re-derived at call time -- it mutates the SAME fixed
+        # constant dict (via json.loads/json.dumps) so every pre-existing
+        # caller (``include_hook_chain_evidence_hooks`` defaults to
+        # ``False``) keeps getting the exact, byte-identical settings_json
+        # selected above. The two ADDED groups are bounded and closed (no
+        # caller-supplied command/path/marker/config is ever accepted):
+        # - ``PreToolUse`` (matcher "Bash"): an additive ``cat`` observer
+        #   hook that echoes its own stdin verbatim, giving
+        #   ``evaluate_all_matching_hooks_observed`` a self-identifying
+        #   signature (Issue #2663 AC2) to positively exclude the observer
+        #   itself from the current-project-settings PreToolUse/Bash cohort
+        #   it is comparing against.
+        # - ``Stop`` (no matcher): the same additive ``cat`` observer
+        #   pattern, giving ``evaluate_sibling_side_effect_inventory``
+        #   (Issue #2663 AC3) the real ``stop_hook_active`` boolean the
+        #   runtime's own Stop hook payload carries, used ONLY to recognize
+        #   the documented valid-no-change condition -- never to read or
+        #   persist the surrounding raw hook payload (e.g.
+        #   ``last_assistant_message``, ``transcript_path``).
+        if include_hook_chain_evidence_hooks:
+            settings_obj = json.loads(settings_json)
+            hooks_obj = settings_obj.setdefault("hooks", {})
+            hooks_obj["PreToolUse"] = [
+                {
+                    "matcher": _HOOK_CHAIN_EVIDENCE_TOOL,
+                    "hooks": [{"type": "command", "command": "cat"}],
+                }
+            ]
+            hooks_obj["Stop"] = [{"hooks": [{"type": "command", "command": "cat"}]}]
+            settings_json = json.dumps(settings_obj)
         argv += ["--settings", settings_json]
+        if include_hook_chain_evidence_hooks:
+            # Issue #2663 AC2 live-trial fix, corrected by PR #2668
+            # fix_delta (P1-1, anchor review
+            # https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277):
+            # the expected cohort is explicitly defined as "current PROJECT
+            # settings (.claude/settings.json)". Claude Code's own
+            # ``--setting-sources`` flag (per the official CLI reference,
+            # https://code.claude.com/docs/en/cli-reference: "Comma-
+            # separated list of setting sources to load (user, project,
+            # local)") controls ONLY which SETTINGS FILES are read to
+            # assemble a session's static hook configuration -- it does
+            # NOT, and cannot, exclude hooks registered by managed policy,
+            # plugins, or Skills, which register independently of
+            # ``--setting-sources`` (an earlier revision of this comment
+            # incorrectly claimed a broader "user/local/managed" exclusion;
+            # corrected here). Fixing this to ``"project"`` (never caller-
+            # configurable) is confirmed live to exclude the user/local
+            # settings.json FILE sources specifically -- e.g. it prevents a
+            # host's own ``~/.claude/settings.json`` PreToolUse/Bash hook
+            # from leaking into the observed cohort. Any managed/plugin/
+            # Skill-registered hook sharing the same event+tool remains
+            # observationally indistinguishable from a genuine unknown/
+            # duplicate entry on this channel regardless of this flag, and
+            # is handled the same way everywhere else in this module:
+            # ``unattributable_extra_hook_execution`` (unverified, never
+            # silently promoted to pass or fail) -- see the "Confirmed
+            # runtime-capability boundary" comment above
+            # ``_hook_chain_self_echo_fields`` for the full handler-
+            # identity limitation this flag does NOT resolve.
+            # ``--settings <JSON>`` (this runner's own additive observer
+            # overlay, appended above) is a SEPARATE mechanism from the
+            # ``--setting-sources`` file-source allowlist and is confirmed
+            # live to still apply even when only "project" is loaded.
+            argv += ["--setting-sources", "project"]
     # Issue #1734 fix_delta 3 (AC7): purely additive, opt-in persona binding.
     # When ``claude_agent_name`` is provided, insert ``--agent <name>`` so the
     # underlying ``claude`` process actually launches with that Agent as the
@@ -2119,6 +2306,975 @@ def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
 
         events.append(entry)
     return events
+
+
+# ---------------------------------------------------------------------------
+# Issue #2663: generic hook-chain evidence capability.
+#
+# ``all_matching_hooks_observed`` and ``sibling_side_effect_inventory_
+# complete`` are two INDEPENDENT assertions:
+#
+# 1. ``all_matching_hooks_observed`` -- for the bounded
+#    ``_HOOK_CHAIN_EVIDENCE_EVENT``/``_HOOK_CHAIN_EVIDENCE_TOOL`` target
+#    (PreToolUse/Bash), does every command hook currently registered in this
+#    tested_head's OWN ``.claude/settings.json`` for that event+tool
+#    actually produce completion evidence (a matched hook_started +
+#    hook_response pair, by ``hook_id``) for each real Bash tool call the
+#    session makes -- excluding this runner's own additive ``cat`` observer
+#    hook (self-identified structurally, never by counting alone)?
+#
+# 2. ``sibling_side_effect_inventory_complete`` -- independent of any hook's
+#    own exit code, does the bounded
+#    ``_HOOK_CHAIN_SIDE_EFFECT_ARTIFACT_RELPATH`` directory show the actual
+#    POST-CONDITION (a new file) the Stop-event
+#    ``_HOOK_CHAIN_SIDE_EFFECT_TARGET_BASENAME`` handler is documented to
+#    produce, read only AFTER the whole ``claude -p`` subprocess (and thus
+#    every synchronous Stop hook) has exited?
+#
+# Both were validated against REAL, live ``claude`` CLI output (2.1.277,
+# ``--include-hook-events --output-format stream-json``) during this
+# Issue's own implementation trial -- not guessed from documentation, which
+# does not specify this shape (see the Issue's own "Current Validated
+# Scope" caveat). Key confirmed facts this module relies on:
+#
+# - Each hook execution emits a ``{"type":"system","subtype":"hook_
+#   started",...}`` record followed later by a ``{"type":"system",
+#   "subtype":"hook_response",...}`` record, correlated by a shared,
+#   per-invocation-random ``hook_id`` -- NOT by any stable per-config-entry
+#   identifier. ``hook_name`` is ``"<event>"`` (e.g. ``"Stop"``) or
+#   ``"<event>:<resolved-tool>"`` (e.g. ``"PreToolUse:Bash"``) -- the same
+#   label for every sibling hook registered for that event+tool, so it
+#   cannot itself distinguish individual sibling command hooks. This is
+#   exactly the "runtimeが実際に提供する同等の識別子" AC2 explicitly allows
+#   as a fallback for the (unavailable) event+matcher+command-string
+#   identity -- the real command string is never exposed on this channel.
+# - ALL sibling hooks registered for an event+tool run to completion
+#   regardless of whether one of them returns a deny (exit code 2) --
+#   confirmed live: a denying hook does not short-circuit its siblings.
+# - A hook that stays silent on success (this repository's own
+#   secret_boundary_guard.sh / guard-japanese-prose.sh /
+#   ci_test_performance_advisory.sh / root_temporary_residue_advisory.sh,
+#   confirmed by reading each script) produces an EMPTY ``stdout``/
+#   ``output``, never a JSON echo -- only this runner's own additive
+#   ``cat`` observer hook echoes its verbatim stdin JSON payload, which
+#   this module uses as a positive, structural self-identification
+#   signature (never a count-based guess).
+# - PreToolUse hook_started/hook_response records for one Bash tool call
+#   appear in the stream between that tool_use's own line and the NEXT
+#   Bash tool_use's line -- but NOT necessarily immediately adjacent or
+#   mutually contiguous. Confirmed live (2.1.277): a ``rate_limit_event``
+#   line can land physically BETWEEN one call's own hook_started and
+#   hook_response records, and a ``PostToolUse`` hook's own hook_started
+#   can appear before the matching ``user``/tool_result line. Evidence
+#   windowing below therefore scopes by a bounded stream-index SPAN
+#   (bounded by consecutive Bash tool_use lines), never by strict
+#   cluster-adjacency.
+# - Issue #2663 AC5 live-trial fix_delta (post-merge repeated-trial
+#   instability report): a hook's ``hook_response`` can itself be flushed
+#   to the JSON stream AFTER the NEXT Bash tool_use line entirely -- not
+#   merely interleaved with rate_limit_event noise INSIDE its own window,
+#   but genuinely crossing the window boundary. Confirmed live in a
+#   multi-Bash-call trial where ALL 5 ``hook_response`` records for the
+#   FIRST Bash call's PreToolUse/Bash cohort (4 project sibling hooks +
+#   this runner's own additive observer) were only flushed to the stream
+#   AFTER the SECOND Bash tool_use line -- leaving the first call's own
+#   window-span with zero ``hook_response`` records at all (spuriously
+#   reading as ``observer_self_echo_not_uniquely_identified`` /
+#   ``observed_count: 0``) while the second call's window-span absorbed
+#   those 5 records as spurious ``unmatched_hook_response`` noise on top
+#   of its own genuine 5. ``hook_started`` itself was NOT observed to
+#   drift across a window boundary in that same trial (it is emitted at
+#   the moment the hook gate begins, structurally tied to its own tool
+#   call) -- only a completed hook's RESPONSE flush timing is unreliable
+#   under load. Pairing below is therefore GLOBAL (keyed by ``hook_id``
+#   across the WHOLE PreToolUse/Bash record stream, never window-scoped),
+#   and each resulting pair (or true orphan/dangling record) is attributed
+#   to a window by its own ``hook_started``'s stream_index -- never by
+#   wherever the paired ``hook_response`` physically landed.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Confirmed runtime-capability boundary (PR #2668 fix_delta P1-1; anchor
+# review https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277).
+# This is a documented, evidence-backed LIMIT of what this module's evidence
+# channel can prove -- not an oversight left for a future fix_delta.
+#
+# ``hook_id`` proves ONLY that a given ``hook_started`` record and a given
+# ``hook_response`` record are the SAME single hook invocation (a random,
+# per-invocation correlation id -- never a stable per-config-entry
+# identifier). ``hook_name`` proves ONLY that a record belongs to a given
+# event(+tool) GROUP -- it is the IDENTICAL label for every sibling command
+# hook registered under that same event+matcher (e.g. every PreToolUse/Bash
+# sibling hook shares the literal ``hook_name`` "PreToolUse:Bash"). Neither
+# field -- nor any other field on the documented ``hook_started``/
+# ``hook_response`` system events, nor on a hook's own stdin payload --
+# identifies WHICH specific configured command hook (by event+matcher+
+# command-string identity, as Issue #2663 AC2 originally envisioned)
+# produced a given execution. Sources (official docs, not inferred):
+# https://code.claude.com/docs/en/hooks-guide and
+# https://code.claude.com/docs/en/agent-sdk/hooks -- "When an event fires,
+# all matching hooks run in parallel ... write each hook to act
+# independently rather than relying on another hook having run first."
+# Execution order across sibling hooks is explicitly non-deterministic, so
+# an ordering/positional heuristic cannot substitute for a real identity
+# channel either (and none is implemented here for that reason).
+#
+# Consequence (confirmed by local reproduction against synthetic stream-json
+# input during this fix_delta, not merely asserted): if the expected cohort
+# is handlers {A, B, C, D} and the ACTUAL executions are {A, X, C, D} (X a
+# same-count substitution for B, X also producing its own well-formed
+# hook_started/hook_response pair with a normal hook_id), ``evaluate_all_
+# matching_hooks_observed`` cannot distinguish that stream from a genuine
+# {A, B, C, D} execution -- both read as ``pass``. It verifies "N sibling
+# PreToolUse/Bash hook executions completed, hook_id-paired, none orphaned,
+# none missing, none unattributable-extra", never "the N handlers named in
+# tested_head's settings.json, SPECIFICALLY, each individually ran". This is
+# the maximal identity granularity Claude Code's documented hook stream
+# provides today; closing this gap would require an undocumented/future
+# runtime channel (e.g. a stable per-config-entry hook identifier), not a
+# code change in this module. Do not read this assertion's ``pass`` as
+# per-command handler identity proof, and do not add an ordering/positional
+# "identity" heuristic to fake one -- the fact above (non-deterministic
+# parallel execution) makes any such heuristic actively misleading.
+# ---------------------------------------------------------------------------
+
+
+def _hook_chain_self_echo_fields(
+    hook_event: str | None, stdout_text: object
+) -> tuple[bool, bool | None, str | None]:
+    """Structural (never count-based) self-identification of this runner's
+    OWN additive ``cat`` observer hook response (Issue #2663 AC2/AC3): the
+    observer is the only registered hook for
+    ``_HOOK_CHAIN_EVIDENCE_EVENT``/``_HOOK_CHAIN_SIDE_EFFECT_EVENT`` that
+    echoes its own raw hook stdin payload verbatim back on ``stdout``. Only
+    PRESENCE of the allowlisted keys is checked -- their values (prompt
+    text, transcript paths, tool input) are never read here or returned to
+    any caller, with two narrow exceptions, both bare scalar fields already
+    REQUIRED to be present (never prose/content, never a new raw-content
+    channel): the ``Stop`` event's own ``stop_hook_active`` boolean (AC3's
+    valid-no-change signal) and, since PR #2668 fix_delta (P1-2), the
+    ``PreToolUse`` event's own ``tool_use_id`` string -- used ONLY to
+    disambiguate which of MULTIPLE same-``stream_index`` Bash ``tool_use``
+    blocks (officially supported: an assistant message may declare more
+    than one tool_use, each with its own distinct ``tool_use_id`` --
+    https://code.claude.com/docs/en/agent-sdk/hooks) this particular
+    self-echoed PreToolUse invocation belongs to. This is NOT a per-command
+    HANDLER identity channel (see the "Confirmed runtime-capability
+    boundary" comment above) -- it identifies only which REAL tool call
+    (not which sibling command hook) this runner's own observer was
+    triggered for.
+
+    Returns ``(is_self_echo, stop_hook_active, tool_use_id)``.
+    ``stop_hook_active`` is always ``None`` unless ``hook_event == "Stop"``
+    and self-echo is confirmed. ``tool_use_id`` is always ``None`` unless
+    ``hook_event == "PreToolUse"`` and self-echo is confirmed."""
+    if hook_event not in _HOOK_CHAIN_SELF_ECHO_REQUIRED_KEYS:
+        return False, None, None
+    if not isinstance(stdout_text, str) or not stdout_text.strip():
+        return False, None, None
+    parsed = _parse_embedded_json_object(stdout_text)
+    if not isinstance(parsed, dict):
+        return False, None, None
+    if parsed.get("hook_event_name") != hook_event:
+        return False, None, None
+    if not all(key in parsed for key in _HOOK_CHAIN_SELF_ECHO_REQUIRED_KEYS[hook_event]):
+        return False, None, None
+    stop_hook_active = None
+    tool_use_id = None
+    if hook_event == _HOOK_CHAIN_SIDE_EFFECT_EVENT:
+        value = parsed.get("stop_hook_active")
+        stop_hook_active = value if isinstance(value, bool) else None
+    if hook_event == _HOOK_CHAIN_EVIDENCE_EVENT:
+        value = parsed.get("tool_use_id")
+        tool_use_id = value if isinstance(value, str) and value else None
+    return True, stop_hook_active, tool_use_id
+
+
+_SESSION_MANIFEST_COORDINATOR_RESULT_MARKER = "SESSION_MANIFEST_COORDINATOR_RESULT_V1="
+
+
+def _extract_session_manifest_coordinator_result(stderr_text: object) -> dict | None:
+    """Issue #2663 PR #2668 fix_delta (P1-3(b), anchor review
+    https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277
+    counter-example B): bounded, line-scoped parse of
+    ``.claude/hooks/session_manifest_coordinator.sh``'s own
+    ``SESSION_MANIFEST_COORDINATOR_RESULT_V1={...}`` JSON marker (read-only
+    reference; Out of Scope for this Issue to edit) -- confirmed, by
+    reading that script's every exit path, to be written VERBATIM to its
+    own STDERR (never stdout) on EVERY exit (the early
+    ``stop_hook_active`` guard, a guard failure, and full success all end
+    with this exact marker line).
+
+    Confirmed live (bounded local trial against installed Claude Code
+    2.1.277, run during this fix_delta) that the structured
+    ``hook_response`` system event DOES expose a hook's own stderr text,
+    verbatim, on a dedicated ``stderr`` field -- distinct from
+    ``stdout``/``output`` (the latter being the combined stream) -- a
+    channel this module never read before. Only the parsed marker OBJECT
+    is returned (never the surrounding raw stderr text, never persisted
+    beyond this call) -- ``None`` on any absence/parse failure, never
+    fabricated. Only an exact object parse of the marker's own line is
+    accepted -- never a regex-scraped value."""
+    if not isinstance(stderr_text, str) or not stderr_text:
+        return None
+    marker_index = stderr_text.find(_SESSION_MANIFEST_COORDINATOR_RESULT_MARKER)
+    if marker_index < 0:
+        return None
+    json_start = marker_index + len(_SESSION_MANIFEST_COORDINATOR_RESULT_MARKER)
+    line_end = stderr_text.find("\n", json_start)
+    candidate = stderr_text[json_start:] if line_end < 0 else stderr_text[json_start:line_end]
+    candidate = candidate.strip()
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def extract_claude_hook_event_records(
+    stdout: str, hook_event: str, hook_name: str | None = None
+) -> list[dict]:
+    """Every ``hook_started``/``hook_response`` system record in ``stdout``
+    for one specific ``hook_event`` (optionally further restricted to an
+    exact ``hook_name``), each retaining its own stream_index. Each record:
+    ``{"stream_index", "subtype", "hook_id", "hook_name", "hook_event",
+    "exit_code", "outcome", "is_self_echo", "stop_hook_active",
+    "tool_use_id", "coordinator_result"}``. No raw hook stdin/stdout/stderr
+    body is retained on the returned records -- every derived field is
+    computed once, up front, and the underlying text is discarded.
+    ``tool_use_id`` (PR #2668 fix_delta P1-2) is populated only for a
+    self-echoed ``PreToolUse`` response (see
+    ``_hook_chain_self_echo_fields``). ``coordinator_result`` (PR #2668
+    fix_delta P1-3(b)) is populated only for a ``Stop`` ``hook_response``
+    whose own ``stderr`` field carries
+    ``.claude/hooks/session_manifest_coordinator.sh``'s own
+    ``SESSION_MANIFEST_COORDINATOR_RESULT_V1={...}`` completion marker (see
+    ``_extract_session_manifest_coordinator_result``) -- confirmed, by a
+    bounded local live trial against installed Claude Code 2.1.277 during
+    this fix_delta, that a ``hook_response`` system event's own ``stderr``
+    field DOES carry a hook's stderr text verbatim (distinct from
+    ``stdout``/``output``, which is the combined stream) -- previously
+    unread anywhere in this module.
+
+    Issue #2663 live-trial fix: an earlier revision of this module grouped
+    hook records via strict "consecutive stream-index" clustering and
+    matched a Bash ``tool_use`` to whichever cluster began EXACTLY at
+    ``tool_use.stream_index + 1``. Confirmed live against real Claude Code
+    2.1.277 output, that assumption is false in practice -- a
+    ``rate_limit_event`` line landed physically BETWEEN this repository's
+    own PreToolUse ``hook_started`` and ``hook_response`` records for a
+    single real Bash tool call, splitting what should have been one
+    contiguous evidence window into two and causing a live PASS-eligible
+    run to read as spuriously ``unverified``. This function therefore
+    performs NO clustering/contiguity assumption at all -- callers scope
+    query records to a bounded stream_index SPAN instead (see
+    ``evaluate_all_matching_hooks_observed`` below), which tolerates any
+    interleaved non-hook noise (rate_limit_event, a different event's own
+    hook records, thinking blocks, ...)."""
+    records: list[dict] = []
+    for stream_index, payload in enumerate(_iter_claude_stream_events(stdout)):
+        if payload.get("type") != "system":
+            continue
+        subtype = payload.get("subtype")
+        if subtype not in ("hook_started", "hook_response"):
+            continue
+        if payload.get("hook_event") != hook_event:
+            continue
+        payload_hook_name = payload.get("hook_name")
+        if hook_name is not None and payload_hook_name != hook_name:
+            continue
+        is_self_echo = False
+        stop_hook_active = None
+        tool_use_id = None
+        coordinator_result = None
+        if subtype == "hook_response":
+            is_self_echo, stop_hook_active, tool_use_id = _hook_chain_self_echo_fields(
+                hook_event, payload.get("stdout")
+            )
+            if hook_event == _HOOK_CHAIN_SIDE_EFFECT_EVENT:
+                coordinator_result = _extract_session_manifest_coordinator_result(
+                    payload.get("stderr")
+                )
+        records.append({
+            "stream_index": stream_index,
+            "subtype": subtype,
+            "hook_id": payload.get("hook_id"),
+            "hook_name": payload_hook_name,
+            "hook_event": hook_event,
+            "exit_code": payload.get("exit_code"),
+            "outcome": payload.get("outcome"),
+            "is_self_echo": is_self_echo,
+            "stop_hook_active": stop_hook_active,
+            "tool_use_id": tool_use_id,
+            "coordinator_result": coordinator_result,
+        })
+    return records
+
+
+def _claude_bash_tool_use_events(stdout: str) -> list[dict]:
+    """Every ``Bash`` ``tool_use`` block's ``{"stream_index", "tool_use_id"}``
+    (Issue #2663 AC5 positive/deny scenario windowing) -- never the
+    command text itself, which is never read or persisted here."""
+    results: list[dict] = []
+    for stream_index, payload in enumerate(_iter_claude_stream_events(stdout)):
+        if payload.get("type") != "assistant":
+            continue
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == "Bash"
+            ):
+                results.append({"stream_index": stream_index, "tool_use_id": block.get("id")})
+    return results
+
+
+def _pair_pretool_hook_records_globally(records: list[dict]) -> dict:
+    """Global (never window-scoped) ``hook_started``/``hook_response``
+    pairing by ``hook_id`` across the WHOLE PreToolUse/Bash record stream
+    (Issue #2663 AC5 live-trial fix_delta -- see the module-level comment
+    block above ``_pair_pretool_hook_records_globally``'s call site for the
+    confirmed-live counter-example this exists to tolerate).
+
+    Only ``subtype == "hook_started"`` and ``subtype == "hook_response"``
+    records with a non-empty ``hook_id`` participate. A duplicate
+    ``hook_started`` re-announcement for the same ``hook_id`` (AC6(b)) is
+    NOT double-counted -- the first (earliest stream_index) announcement is
+    the pairing anchor. A ``hook_response`` whose ``hook_id`` has no
+    corresponding ``hook_started`` anywhere in ``records`` -- or a SECOND
+    ``hook_response`` for an already-paired ``hook_id`` -- is an orphan,
+    never silently counted as evidence (AC6(a)).
+
+    Returns ``{"paired": [{"started": rec, "response": rec}, ...],
+    "orphan_responses": [rec, ...]}``; a ``hook_started`` that never
+    receives ANY matching ``hook_response`` simply produces no pair (its
+    own window naturally under-counts ``observed_count``, matching prior
+    "missing_handler_evidence" behavior).
+
+    Note (PR #2668 fix_delta P1-1): this pairing proves only "this
+    hook_started and this hook_response are the same invocation" -- it is
+    NOT, and cannot be, a per-command HANDLER identity channel. See the
+    "Confirmed runtime-capability boundary" comment above
+    ``_hook_chain_self_echo_fields``."""
+    started_by_id: dict[str, dict] = {}
+    for r in records:
+        if (
+            r["subtype"] == "hook_started"
+            and r["hook_id"]
+            and r["hook_event"] == _HOOK_CHAIN_EVIDENCE_EVENT
+        ):
+            started_by_id.setdefault(r["hook_id"], r)
+
+    paired: list[dict] = []
+    orphan_responses: list[dict] = []
+    claimed_hook_ids: set[str] = set()
+    for r in records:
+        if r["subtype"] != "hook_response" or r["hook_event"] != _HOOK_CHAIN_EVIDENCE_EVENT:
+            continue
+        hook_id = r["hook_id"]
+        if hook_id and hook_id in started_by_id and hook_id not in claimed_hook_ids:
+            paired.append({"started": started_by_id[hook_id], "response": r})
+            claimed_hook_ids.add(hook_id)
+        else:
+            orphan_responses.append(r)
+    return {"paired": paired, "orphan_responses": orphan_responses}
+
+
+def _evaluate_hook_chain_window(paired: list[dict], unmatched_response_count: int, expected_count: int) -> dict:
+    """Evaluate one PreToolUse/Bash scenario window (Issue #2663 AC2/AC6).
+
+    ``paired`` is every GLOBALLY hook_id-matched ``{"started", "response"}``
+    pair whose ``started`` record's stream_index falls within this window's
+    bounded span (see ``evaluate_all_matching_hooks_observed`` and
+    ``_pair_pretool_hook_records_globally``) -- attribution never depends on
+    where the paired ``response`` physically landed. ``unmatched_response_
+    count`` is the count of orphan ``hook_response`` records (no
+    corresponding ``hook_started`` anywhere in the whole stream) whose OWN
+    stream_index falls within this window -- a ``hook_response`` with no
+    matching ``hook_started`` is dropped as unmatched/anomalous, never
+    silently counted (Issue #2663 AC6(a)/(h): a masked "same total count,
+    one missing + one unattributed" substitution must not read as PASS).
+
+    Note (PR #2668 fix_delta P1-1): a ``pass`` verdict here proves "N
+    sibling PreToolUse/Bash hook executions completed, hook_id-paired,
+    none orphaned/missing/unattributable-extra" -- never "the specific N
+    handlers named in settings.json, individually, each ran" (no channel
+    exists to prove the latter; see the "Confirmed runtime-capability
+    boundary" comment above ``_hook_chain_self_echo_fields``)."""
+    self_echo = [p for p in paired if p["response"]["is_self_echo"]]
+    non_observer = [p for p in paired if not p["response"]["is_self_echo"]]
+
+    if len(self_echo) != 1:
+        return {
+            "status": "unverified",
+            "reason": "observer_self_echo_not_uniquely_identified",
+            "observer_response_count": len(self_echo),
+            "observed_count": len(non_observer),
+            "expected_count": expected_count,
+            "unmatched_response_count": unmatched_response_count,
+            "denied": any(p["response"]["exit_code"] == 2 for p in non_observer),
+        }
+
+    observed_count = len(non_observer)
+    denied = any(p["response"]["exit_code"] == 2 for p in non_observer)
+
+    if unmatched_response_count > 0:
+        return {
+            "status": "fail",
+            "reason": "unmatched_hook_response",
+            "observed_count": observed_count,
+            "expected_count": expected_count,
+            "unmatched_response_count": unmatched_response_count,
+            "denied": denied,
+        }
+    if observed_count < expected_count:
+        return {
+            "status": "fail",
+            "reason": "missing_handler_evidence",
+            "observed_count": observed_count,
+            "expected_count": expected_count,
+            "unmatched_response_count": 0,
+            "denied": denied,
+        }
+    if observed_count > expected_count:
+        # Issue #2663 In Scope: "project settings外から合成されるhook
+        # source...の存在をもって「runtime全体の全hookを証明した」とは
+        # 主張しない（識別不能な場合はunverifiedとする）" -- a user/local/
+        # managed/plugin/skill-level extra hook (e.g. this environment's
+        # own ``~/.claude/settings.json`` PreToolUse/Bash hook, confirmed
+        # live) is observationally indistinguishable from a genuine
+        # "duplicate/unknown" entry on this channel; never silently
+        # promoted to either pass or fail.
+        return {
+            "status": "unverified",
+            "reason": "unattributable_extra_hook_execution",
+            "observed_count": observed_count,
+            "expected_count": expected_count,
+            "unmatched_response_count": 0,
+            "denied": denied,
+        }
+    return {
+        "status": "pass",
+        "reason": None,
+        "observed_count": observed_count,
+        "expected_count": expected_count,
+        "unmatched_response_count": 0,
+        "denied": denied,
+    }
+
+
+def _partition_shared_stream_index_span(
+    lower: int,
+    upper: int | None,
+    declared_tool_use_ids: list[str],
+    self_echo_pairs: list[dict],
+) -> list[tuple[int, int | None]] | None:
+    """Issue #2663 PR #2668 fix_delta (P1-2, anchor review
+    https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277):
+    sub-boundary partition for a SHARED stream_index span -- multiple
+    ``Bash`` ``tool_use`` blocks declared inside the SAME assistant
+    message (officially supported by the Agent SDK: distinct tool_use
+    blocks in one assistant message each carry their own ``tool_use_id``,
+    see https://code.claude.com/docs/en/agent-sdk/hooks and
+    https://code.claude.com/docs/en/hooks-guide). The bare assistant
+    message stream_index can no longer distinguish these calls' own
+    windows (they all share the same ``lower`` bound) -- instead, each
+    declared ``tool_use_id`` is anchored to the GLOBALLY hook_id-paired
+    self-echo PreToolUse response whose OWN embedded ``tool_use_id``
+    (see ``_hook_chain_self_echo_fields``) matches it, using that pair's
+    ``started`` record's stream_index (never the response's own
+    stream_index, which can be flushed late -- see the module-level
+    comment block's AC5 finding above ``_hook_chain_self_echo_fields``) as
+    the anchor.
+
+    Anchors are sorted ascending and adjacent anchors are split at their
+    integer midpoint -- tolerant of this module's own confirmed
+    non-deterministic PARALLEL sibling hook_started ordering WITHIN one
+    call's own cohort (https://code.claude.com/docs/en/hooks-guide: "all
+    matching hooks run in parallel"), because the gap between one call's
+    own cohort and the NEXT call's cohort structurally spans that entire
+    call's synchronous hook resolution plus tool execution plus result
+    emission -- comfortably larger than the sibling-launch jitter within a
+    single cohort.
+
+    Returns ``None`` (never a guess) when the self-echo evidence within
+    this span does not cleanly, unambiguously biject onto
+    ``declared_tool_use_ids`` -- a missing anchor for a declared id, two
+    anchors claiming the same id, or an anchor whose value matches no
+    declared id -- forcing the caller to fail closed to
+    ``self_echo_tool_use_id_ambiguous`` rather than guess an
+    attribution."""
+    anchors: dict[str, int] = {}
+    for pair in self_echo_pairs:
+        started_index = pair["started"]["stream_index"]
+        if not (started_index > lower and (upper is None or started_index < upper)):
+            continue
+        tool_use_id = pair["response"].get("tool_use_id")
+        if not isinstance(tool_use_id, str) or tool_use_id not in declared_tool_use_ids:
+            return None
+        if tool_use_id in anchors:
+            return None
+        anchors[tool_use_id] = started_index
+    if len(anchors) != len(declared_tool_use_ids):
+        return None
+
+    ordered_ids = sorted(declared_tool_use_ids, key=lambda tool_use_id: anchors[tool_use_id])
+    anchor_values = [anchors[tool_use_id] for tool_use_id in ordered_ids]
+    bounds_by_id: dict[str, tuple[int, int | None]] = {}
+    for i, tool_use_id in enumerate(ordered_ids):
+        window_lower = lower if i == 0 else (anchor_values[i - 1] + anchor_values[i]) // 2
+        window_upper = (
+            upper if i == len(ordered_ids) - 1
+            else (anchor_values[i] + anchor_values[i + 1]) // 2
+        )
+        bounds_by_id[tool_use_id] = (window_lower, window_upper)
+    return [bounds_by_id[tool_use_id] for tool_use_id in declared_tool_use_ids]
+
+
+def evaluate_all_matching_hooks_observed(stdout: str, worktree: str) -> dict:
+    """Issue #2663 AC2: ``all_matching_hooks_observed`` verdict.
+
+    Returns ``{"status": "pass"|"fail"|"unverified", "passed": bool,
+    "expected_count": int|None, "positive_window_count": int,
+    "deny_window_count": int, "windows": [...], "reason": str|None}``.
+    ``passed`` is ``True`` only when ``status == "pass"``.
+
+    Note (PR #2668 fix_delta P1-1): a ``pass`` here is NOT per-command
+    handler identity proof -- see the "Confirmed runtime-capability
+    boundary" comment above ``_hook_chain_self_echo_fields``."""
+    settings = _read_project_settings(worktree)
+    if settings is None:
+        return {
+            "status": "unverified",
+            "passed": False,
+            "reason": "project_settings_unreadable",
+            "expected_count": None,
+            "positive_window_count": 0,
+            "deny_window_count": 0,
+            "windows": [],
+        }
+    expected_commands = _load_command_hooks_for_event(
+        settings, _HOOK_CHAIN_EVIDENCE_EVENT, _HOOK_CHAIN_EVIDENCE_TOOL
+    )
+    expected_count = len(expected_commands)
+
+    bash_tool_uses = _claude_bash_tool_use_events(stdout)
+
+    if not bash_tool_uses:
+        return {
+            "status": "fail",
+            "passed": False,
+            "reason": "no_bash_tool_use_observed",
+            "expected_count": expected_count,
+            "positive_window_count": 0,
+            "deny_window_count": 0,
+            "windows": [],
+        }
+
+    # Issue #2663 live-trial fix: SPAN-based windowing, never strict
+    # cluster-adjacency (see extract_claude_hook_event_records's docstring
+    # for the confirmed-live counter-example). All PreToolUse/Bash records
+    # strictly between one Bash tool_use and the NEXT Bash tool_use (or end
+    # of stream, for the last one) belong to that tool_use's own window --
+    # tolerant of any interleaved rate_limit_event / other-tool hook
+    # records / thinking blocks.
+    all_pretool_bash_records = extract_claude_hook_event_records(
+        stdout, _HOOK_CHAIN_EVIDENCE_EVENT,
+        f"{_HOOK_CHAIN_EVIDENCE_EVENT}:{_HOOK_CHAIN_EVIDENCE_TOOL}",
+    )
+    # Issue #2663 AC5 live-trial fix_delta: pair hook_started/hook_response
+    # GLOBALLY by hook_id first (never window-scoped -- see
+    # _pair_pretool_hook_records_globally's docstring), then attribute each
+    # resulting pair to a window using its OWN hook_started's stream_index.
+    # A response that physically lands after the NEXT Bash tool_use's line
+    # (confirmed live) is therefore still correctly attributed to the call
+    # that actually triggered it, never to whichever window it happened to
+    # land in. Computed here (before window construction) because PR #2668
+    # fix_delta (P1-2) SHARED-stream_index window construction (below) also
+    # needs the self-echo pairs to derive sub-boundaries.
+    pairing = _pair_pretool_hook_records_globally(all_pretool_bash_records)
+    self_echo_pairs = [p for p in pairing["paired"] if p["response"]["is_self_echo"]]
+
+    # Issue #2663 PR #2668 fix_delta (P1-2): group Bash tool_use events by
+    # their own (possibly SHARED) stream_index -- consecutive tool_use
+    # entries sharing one stream_index came from the SAME assistant
+    # message (multiple tool_use blocks in one message; officially
+    # supported -- see _partition_shared_stream_index_span's docstring).
+    # ``bash_tool_uses`` is already in stream order, so co-located entries
+    # are always adjacent -- grouping never reorders anything.
+    groups: list[list[dict]] = []
+    for tool_use in bash_tool_uses:
+        if groups and groups[-1][0]["stream_index"] == tool_use["stream_index"]:
+            groups[-1].append(tool_use)
+        else:
+            groups.append([tool_use])
+    group_upper_bounds = [group[0]["stream_index"] for group in groups[1:]] + [None]
+
+    # window_bounds[i] / window_forced[i] stay parallel to the ORIGINAL
+    # ``bash_tool_uses`` order (grouping only merges ADJACENT
+    # identical-stream_index entries, so flattening groups back out
+    # reproduces that same order).
+    window_bounds: list[tuple[int, int | None] | None] = []
+    window_forced: list[dict | None] = []
+    for group, group_upper in zip(groups, group_upper_bounds):
+        group_lower = group[0]["stream_index"]
+        if len(group) == 1:
+            window_bounds.append((group_lower, group_upper))
+            window_forced.append(None)
+            continue
+        declared_ids = [tool_use["tool_use_id"] for tool_use in group]
+        partition = None
+        if all(isinstance(tool_use_id, str) and tool_use_id for tool_use_id in declared_ids):
+            partition = _partition_shared_stream_index_span(
+                group_lower, group_upper, declared_ids, self_echo_pairs
+            )
+        if partition is None:
+            # Issue #2663 PR #2668 fix_delta (P1-2 negative case): the
+            # self-echo evidence for this shared span could not cleanly,
+            # unambiguously biject onto the declared tool_use_ids -- never
+            # guess an attribution; every window sharing this span fails
+            # closed to unverified.
+            for _ in group:
+                window_bounds.append(None)
+                window_forced.append({
+                    "status": "unverified",
+                    "reason": "self_echo_tool_use_id_ambiguous",
+                    "observed_count": 0,
+                    "expected_count": expected_count,
+                    "unmatched_response_count": 0,
+                    "denied": False,
+                })
+        else:
+            for bounds in partition:
+                window_bounds.append(bounds)
+                window_forced.append(None)
+
+    def _window_index_for(stream_index: int) -> int | None:
+        for i, bounds in enumerate(window_bounds):
+            if bounds is None:
+                continue
+            lower, upper = bounds
+            if stream_index > lower and (upper is None or stream_index < upper):
+                return i
+        return None
+
+    per_window_paired: list[list[dict]] = [[] for _ in window_bounds]
+    per_window_unmatched_response_count: list[int] = [0 for _ in window_bounds]
+    for pair in pairing["paired"]:
+        idx = _window_index_for(pair["started"]["stream_index"])
+        if idx is not None:
+            per_window_paired[idx].append(pair)
+    for orphan_response in pairing["orphan_responses"]:
+        idx = _window_index_for(orphan_response["stream_index"])
+        if idx is not None:
+            per_window_unmatched_response_count[idx] += 1
+
+    window_results: list[dict] = []
+    for i in range(len(window_bounds)):
+        if window_forced[i] is not None:
+            window_results.append(window_forced[i])
+        else:
+            window_results.append(_evaluate_hook_chain_window(
+                per_window_paired[i], per_window_unmatched_response_count[i], expected_count
+            ))
+
+    if any(w["status"] == "fail" for w in window_results):
+        overall_status = "fail"
+    elif any(w["status"] == "unverified" for w in window_results):
+        overall_status = "unverified"
+    else:
+        positive_window_count = sum(1 for w in window_results if not w["denied"])
+        deny_window_count = sum(1 for w in window_results if w["denied"])
+        # Issue #2663 AC5/AC6(f): an empty expected/observed scenario set
+        # (no positive call, no deny call) must never read as PASS.
+        overall_status = "pass" if positive_window_count > 0 and deny_window_count > 0 else "fail"
+
+    positive_window_count = sum(1 for w in window_results if not w["denied"])
+    deny_window_count = sum(1 for w in window_results if w["denied"])
+    return {
+        "status": overall_status,
+        "passed": overall_status == "pass",
+        "reason": None if overall_status == "pass" else "see windows[]",
+        "expected_count": expected_count,
+        "positive_window_count": positive_window_count,
+        "deny_window_count": deny_window_count,
+        "windows": window_results,
+    }
+
+
+def _snapshot_session_manifest_files(worktree: str) -> tuple[list[str] | None, bool]:
+    """Bounded directory listing (filenames only -- never content) of the
+    Issue #2663 AC3 side-effect target directory.
+
+    Issue #2663 PR #2668 fix_delta (P2-1, anchor review
+    https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277):
+    an earlier revision listed and alphabetically sorted EVERY file in the
+    directory, THEN capped to the first
+    ``_HOOK_CHAIN_SIDE_EFFECT_MAX_SNAPSHOT_ENTRIES`` -- Stop-tag filtering
+    happened only afterward, in the caller. Because this directory is
+    ALSO shared by an unrelated, high-volume writer (the settings.json
+    PostToolUse debounce hook's own ``-posttooluse-`` tagged files, which
+    sort alphabetically BEFORE ``-stop-`` tagged ones), once that many
+    pre-existing ``-posttooluse-`` files accumulated, a genuinely NEW
+    ``-stop-`` tagged manifest was silently truncated away, and this
+    run's own valid new evidence read as a false ``missing_side_effect``.
+
+    Fixed here: filtering for the Stop-tag token
+    (``_HOOK_CHAIN_SIDE_EFFECT_FILENAME_TOKEN``) happens DURING directory
+    iteration, BEFORE any sort/cap -- the cap now applies ONLY to the
+    already-small, Stop-tag-relevant subset, never to the whole unfiltered
+    directory listing (an unrelated writer's own file volume can never
+    influence this snapshot at all, positively or negatively).
+
+    Returns ``(entries, truncated)``. ``entries`` is the sorted list of
+    Stop-tagged filenames only; ``None`` (never a fabricated/empty list)
+    only when the directory exists but cannot be listed (permission
+    error) -- an absent directory is a legitimate, listable "no manifests
+    yet" state. ``truncated`` is ``True`` only when the STOP-TAGGED subset
+    itself exceeds the defensive cap -- surfaced explicitly (never a
+    silent drop) so the caller (``evaluate_sibling_side_effect_inventory``)
+    treats that specific case as ``unverified`` rather than silently
+    losing evidence."""
+    manifests_dir = Path(worktree).joinpath(*_HOOK_CHAIN_SIDE_EFFECT_ARTIFACT_RELPATH)
+    if not manifests_dir.exists():
+        return [], False
+    try:
+        stop_tagged = sorted(
+            p.name for p in manifests_dir.iterdir()
+            if p.is_file() and _HOOK_CHAIN_SIDE_EFFECT_FILENAME_TOKEN in p.name
+        )
+    except OSError:
+        return None, False
+    truncated = len(stop_tagged) > _HOOK_CHAIN_SIDE_EFFECT_MAX_SNAPSHOT_ENTRIES
+    return stop_tagged[:_HOOK_CHAIN_SIDE_EFFECT_MAX_SNAPSHOT_ENTRIES], truncated
+
+
+def extract_claude_hook_chain_stop_hook_active(stdout: str) -> bool | None:
+    """The real, runtime-returned ``stop_hook_active`` boolean from this
+    runner's own additive Stop observer hook (Issue #2663 AC3 valid
+    no-change condition). ``None`` when the observer's own response cannot
+    be uniquely, structurally identified (never guessed from count)."""
+    stop_records = extract_claude_hook_event_records(
+        stdout, _HOOK_CHAIN_SIDE_EFFECT_EVENT, _HOOK_CHAIN_SIDE_EFFECT_EVENT
+    )
+    self_echo_responses = [
+        record for record in stop_records
+        if record["subtype"] == "hook_response" and record["is_self_echo"]
+    ]
+    if len(self_echo_responses) != 1:
+        return None
+    return self_echo_responses[0]["stop_hook_active"]
+
+
+def _extract_target_coordinator_completion(stdout: str) -> dict | None:
+    """Issue #2663 PR #2668 fix_delta (P1-3(b), anchor review counter-
+    example B): the TARGET ``session_manifest_coordinator.sh`` handler's
+    OWN (non-observer) completion marker for the ``Stop`` event --
+    distinguished from this runner's own additive observer response the
+    same way the rest of this module already does (structural ``is_self_
+    echo`` presence check), never by position/count. Returns the parsed
+    ``SESSION_MANIFEST_COORDINATOR_RESULT_V1`` marker object only when
+    EXACTLY ONE non-self-echo Stop ``hook_response`` record carries one
+    (see ``_extract_session_manifest_coordinator_result``) -- ``None``
+    (never guessed) when zero or more than one candidate is found; a hook
+    that happens to run alongside the coordinator but never emits this
+    exact marker is never mistaken for it (this is a CONTENT-based
+    signature, the same class of positive self-identification already
+    used for the observer's own self-echo -- not an ordering/position
+    guess, and not a claim about handler identity in general; see the
+    "Confirmed runtime-capability boundary" comment above
+    ``_hook_chain_self_echo_fields``)."""
+    stop_records = extract_claude_hook_event_records(
+        stdout, _HOOK_CHAIN_SIDE_EFFECT_EVENT, _HOOK_CHAIN_SIDE_EFFECT_EVENT
+    )
+    candidates = [
+        record for record in stop_records
+        if record["subtype"] == "hook_response"
+        and not record["is_self_echo"]
+        and record.get("coordinator_result") is not None
+    ]
+    if len(candidates) != 1:
+        return None
+    return candidates[0]["coordinator_result"]
+
+
+def _session_manifest_actor_session_id(worktree: str, filename: str) -> str | None:
+    """Issue #2663 PR #2668 fix_delta (P1-3(a)): best-effort, bounded read
+    of one Issue #2663 AC3 target-directory manifest file's own embedded
+    ``actor.session_id`` field -- read-only, bounded to this run's own
+    Allowed-Paths-scoped artifact directory (never attacker-controlled,
+    never a network fetch), used ONLY to bind a candidate new file to the
+    CURRENT run's own session before counting it as this run's evidence.
+    The field is populated (see ``scripts/generate-session-manifest.mjs``
+    and ``.claude/hooks/generate_session_manifest_from_hook.mjs``, both
+    read-only references, Out of Scope for this Issue to edit) from the
+    SAME hook stdin ``session_id`` this module's own stream already
+    exposes for the current run. ``None`` (never fabricated) when the file
+    cannot be read/parsed or the field is absent -- callers must never
+    treat that as a match."""
+    manifest_path = Path(worktree).joinpath(*_HOOK_CHAIN_SIDE_EFFECT_ARTIFACT_RELPATH, filename)
+    try:
+        raw = manifest_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    actor = data.get("actor")
+    if not isinstance(actor, dict):
+        return None
+    session_id = actor.get("session_id")
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
+def evaluate_sibling_side_effect_inventory(
+    worktree: str,
+    stdout: str,
+    manifests_before: list[str] | None,
+    manifests_after: list[str] | None,
+    snapshot_truncated: bool = False,
+) -> dict:
+    """Issue #2663 AC3: ``sibling_side_effect_inventory_complete`` verdict.
+
+    Independent of hook exit codes -- reads the actual post-condition (new
+    files under the bounded manifests directory) AFTER the whole structured
+    ``claude`` subprocess (and thus every synchronous Stop hook, per the
+    Claude Code Stop hook contract) has exited.
+
+    Issue #2663 PR #2668 fix_delta (P1-3(a)/(b), P2-1, anchor review
+    https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277):
+
+    - ``snapshot_truncated`` (P2-1): ``True`` when either the before/after
+      Stop-tagged manifest-directory snapshot was itself truncated by
+      ``_snapshot_session_manifest_files``'s own defensive cap -- this
+      assertion refuses to guess completeness in that case:
+      ``unverified``, never a silently-incomplete "no new file" read.
+    - New-file "run binding" (P1-3(a), counter-example A): a candidate new
+      Stop-tagged file is counted ONLY when its own embedded
+      ``actor.session_id`` (see ``_session_manifest_actor_session_id``)
+      matches the CURRENT run's own session id (reusing the existing
+      ``extract_claude_stream_session_ids`` extraction, never a new raw
+      channel). A same-directory file belonging to a concurrent, stale, or
+      otherwise unrelated session is never counted as (or against) this
+      run's own evidence.
+    - Valid no-change corroboration (P1-3(b), counter-example B): the "no
+      new file" path now requires BOTH the observer's own ``stop_hook_
+      active: true`` self-echo AND the TARGET
+      ``session_manifest_coordinator.sh`` handler's OWN (non-observer)
+      completion marker with ``"steps": ["stop_guard"]`` (see
+      ``_extract_target_coordinator_completion``) -- the observer's own
+      input alone no longer suffices (previously the sole signal)."""
+    settings = _read_project_settings(worktree)
+    if settings is None:
+        return {
+            "status": "unverified", "passed": False,
+            "reason": "project_settings_unreadable", "new_file_count": None,
+        }
+    stop_commands = _load_command_hooks_for_event(settings, _HOOK_CHAIN_SIDE_EFFECT_EVENT, None)
+    target_configured = any(
+        _HOOK_CHAIN_SIDE_EFFECT_TARGET_BASENAME in command for command in stop_commands
+    )
+    if not target_configured:
+        return {
+            "status": "unverified", "passed": False,
+            "reason": "target_handler_not_configured", "new_file_count": None,
+        }
+    if manifests_before is None or manifests_after is None:
+        return {
+            "status": "unverified", "passed": False,
+            "reason": "postcondition_unreadable", "new_file_count": None,
+        }
+    if snapshot_truncated:
+        return {
+            "status": "unverified", "passed": False,
+            "reason": "session_manifest_snapshot_truncated", "new_file_count": None,
+        }
+
+    # Issue #2663 live-trial fix: scope "new files" to ONLY the target
+    # handler's own filename tag (see _HOOK_CHAIN_SIDE_EFFECT_FILENAME_
+    # TOKEN's docstring) -- a co-registered, non-target manifest writer
+    # (the settings.json PostToolUse debounce hook) sharing the same
+    # bounded directory must never inflate or satisfy this assertion.
+    candidate_new_files = sorted(
+        name for name in (set(manifests_after) - set(manifests_before))
+        if _HOOK_CHAIN_SIDE_EFFECT_FILENAME_TOKEN in name
+    )
+    # Issue #2663 PR #2668 fix_delta (P1-3(a)): bind each candidate to the
+    # CURRENT run's own session before counting it (see this function's
+    # own docstring above). A file whose own session id cannot be
+    # determined -- or that does not match -- is excluded, never guessed.
+    current_session_ids = set(extract_claude_stream_session_ids(stdout))
+    new_files = [
+        name for name in candidate_new_files
+        if current_session_ids
+        and _session_manifest_actor_session_id(worktree, name) in current_session_ids
+    ]
+
+    if len(new_files) > _HOOK_CHAIN_SIDE_EFFECT_MAX_EXPECTED_NEW_FILES:
+        return {
+            "status": "fail", "passed": False,
+            "reason": "overflow", "new_file_count": len(new_files),
+        }
+    if len(new_files) > 0:
+        return {
+            "status": "pass", "passed": True,
+            "reason": "new_manifest_observed", "new_file_count": len(new_files),
+        }
+
+    # Issue #2663 PR #2668 fix_delta (P1-3(b)): the observer's own
+    # stop_hook_active self-echo is a necessary but no longer SUFFICIENT
+    # no-change signal -- it proves only that the EARLY-EXIT CONDITION
+    # reached this runner's own additive observer hook, never that the
+    # TARGET coordinator itself actually completed its own no-op path.
+    # Both must independently agree.
+    stop_hook_active = extract_claude_hook_chain_stop_hook_active(stdout)
+    coordinator_result = _extract_target_coordinator_completion(stdout)
+    coordinator_no_op_confirmed = (
+        isinstance(coordinator_result, dict)
+        and coordinator_result.get("status") == "ok"
+        and coordinator_result.get("steps") == ["stop_guard"]
+    )
+    if stop_hook_active is True and coordinator_no_op_confirmed:
+        return {
+            "status": "pass", "passed": True,
+            "reason": "valid_no_change_stop_hook_active", "new_file_count": 0,
+        }
+    return {
+        "status": "fail", "passed": False,
+        "reason": "missing_side_effect", "new_file_count": 0,
+    }
+
+
+def evaluate_hook_chain_evidence(
+    stdout: str,
+    worktree: str,
+    manifests_before: list[str] | None,
+    manifests_after: list[str] | None,
+    snapshot_truncated: bool = False,
+) -> dict:
+    """Issue #2663 AC4: aggregate hook-chain-evidence verdict. ``passed`` is
+    ``True`` only when BOTH ``all_matching_hooks_observed`` AND
+    ``sibling_side_effect_inventory_complete`` independently report
+    ``status: pass``."""
+    all_matching_hooks_observed = evaluate_all_matching_hooks_observed(stdout, worktree)
+    sibling_side_effect_inventory_complete = evaluate_sibling_side_effect_inventory(
+        worktree, stdout, manifests_before, manifests_after, snapshot_truncated=snapshot_truncated
+    )
+    passed = bool(all_matching_hooks_observed["passed"] and sibling_side_effect_inventory_complete["passed"])
+    return {
+        "status": "pass" if passed else "fail",
+        "passed": passed,
+        "all_matching_hooks_observed": all_matching_hooks_observed,
+        "sibling_side_effect_inventory_complete": sibling_side_effect_inventory_complete,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -5276,6 +6432,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--require-clean-postcondition", action="store_true")
     parser.add_argument(
+        "--require-hook-chain-evidence",
+        action="store_true",
+        help=(
+            "Issue #2663: opt-in (default off). Requires --runtime claude "
+            "--mode structured. When set, additively registers a bounded, "
+            "closed pair of observation-only 'cat' hooks (PreToolUse/Bash, "
+            "Stop -- never a caller-supplied command/path/marker/config) "
+            "and evaluates two independent assertions against the ALREADY "
+            "captured native stream-json evidence: "
+            "all_matching_hooks_observed (every command hook currently "
+            "registered in this tested_head's own .claude/settings.json "
+            "for PreToolUse/Bash, excluding this runner's own observer, "
+            "produced matched hook_started+hook_response completion "
+            "evidence for each real Bash tool call) and "
+            "sibling_side_effect_inventory_complete (a genuine new-file "
+            "post-condition under artifacts/session-manifest-runtime/"
+            "manifests/, read only after the whole subprocess exits, "
+            "independent of any hook's own exit code). Both are recorded "
+            "in schema_summary['hook_chain_evidence'] with a pass|fail|"
+            "unverified status; exit_code FAILs when either is not "
+            "status: pass. Omitted by default, so every pre-existing "
+            "caller's argv/behavior is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--require-session-baseline-preservation",
         action="store_true",
         help=(
@@ -5483,6 +6664,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--require-subagent-causal-evidence requires --runtime claude"
         )
+
+    # Issue #2663: the hook-chain-evidence observer hooks and its two
+    # assertions are only meaningful for a direct-subprocess structured
+    # claude invocation (the native stream-json --include-hook-events
+    # channel this whole capability reads).
+    if args.require_hook_chain_evidence and (args.runtime != "claude" or args.mode != "structured"):
+        parser.error("--require-hook-chain-evidence requires --runtime claude --mode structured")
+    # The observer-hook / --setting-sources injection above (see
+    # run_structured_claude) is only wired into the native adapter's
+    # branch -- the claude-gpt launcher owns its own separate settings
+    # mechanism (CLAUDE_GPT_RUNTIME_SMOKE_HOOKS) and forbids any
+    # additional --settings/--setting-sources flag outright.
+    if args.require_hook_chain_evidence and args.claude_adapter != "native":
+        parser.error("--require-hook-chain-evidence requires --claude-adapter native")
 
     # Issue #2498 AC4 (Step 2.5 semantic design review, severity: high):
     # '--expect-marker-source main' MUST NOT be usable on its own -- that
@@ -5777,6 +6972,17 @@ def main(argv: list[str] | None = None) -> int:
                 if hermetic_active:
                     claude_invocation_argv_for_evidence += ["--agents", hermetic_agents_file or ""]
                     claude_invocation_argv_for_evidence += ["--settings", hermetic_settings_file or ""]
+                # Issue #2663 AC3: the "before" snapshot of the bounded
+                # side-effect target directory MUST be captured before the
+                # subprocess starts (never fabricated/backfilled), and is
+                # independent of --require-clean-postcondition's own
+                # before_fp (a different, whole-repo-fingerprint gate).
+                if args.require_hook_chain_evidence:
+                    hook_chain_manifests_before, hook_chain_snapshot_before_truncated = (
+                        _snapshot_session_manifest_files(worktree)
+                    )
+                else:
+                    hook_chain_manifests_before, hook_chain_snapshot_before_truncated = None, False
                 rc, out, err, timed_out = run_structured_claude(
                     worktree, prompt, float(args.timeout_seconds), args.max_turns,
                     claude_bin=resolved_runtime_bin,
@@ -5785,6 +6991,7 @@ def main(argv: list[str] | None = None) -> int:
                     hermetic_settings_file=hermetic_settings_file if hermetic_active else None,
                     claude_adapter=args.claude_adapter,
                     include_user_prompt_expansion_hook=bool(args.expect_skill_command),
+                    include_hook_chain_evidence_hooks=bool(args.require_hook_chain_evidence),
                 )
                 capability_decision, capability_reason = classify_claude_structured_outcome(
                     rc, out, err, timed_out
@@ -5898,6 +7105,30 @@ def main(argv: list[str] | None = None) -> int:
                         errors.append(
                             "forbidden failure marker(s) observed: "
                             f"{forbidden_marker_scan['matched_markers']}"
+                        )
+                        exit_code = EXIT_FAIL
+                if args.require_hook_chain_evidence:
+                    # Issue #2663 AC3: the "after" snapshot is read only now
+                    # -- after the whole subprocess (and thus every
+                    # synchronous Stop hook) has already exited above.
+                    hook_chain_manifests_after, hook_chain_snapshot_after_truncated = (
+                        _snapshot_session_manifest_files(worktree)
+                    )
+                    hook_chain_evidence = evaluate_hook_chain_evidence(
+                        out, worktree, hook_chain_manifests_before, hook_chain_manifests_after,
+                        snapshot_truncated=(
+                            hook_chain_snapshot_before_truncated
+                            or hook_chain_snapshot_after_truncated
+                        ),
+                    )
+                    schema_summary["hook_chain_evidence"] = hook_chain_evidence
+                    if not hook_chain_evidence["passed"]:
+                        errors.append(
+                            "hook-chain evidence not verified: "
+                            f"all_matching_hooks_observed.status="
+                            f"{hook_chain_evidence['all_matching_hooks_observed']['status']!r}, "
+                            f"sibling_side_effect_inventory_complete.status="
+                            f"{hook_chain_evidence['sibling_side_effect_inventory_complete']['status']!r}"
                         )
                         exit_code = EXIT_FAIL
 

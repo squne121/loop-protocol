@@ -2531,6 +2531,1002 @@ class TestExtension1PlainTextMarkerRecognition:
         assert identity["agent_type"] == "pr-reviewer"
         assert identity["source"] == module.AGENT_TYPE_SOURCE_PLAIN_MARKER
 
+
+# ---------------------------------------------------------------------------
+# Issue #2663: generic hook-chain evidence capability
+# (--require-hook-chain-evidence, evaluate_all_matching_hooks_observed,
+# evaluate_sibling_side_effect_inventory, evaluate_hook_chain_evidence).
+#
+# Every JSON shape below (hook_started/hook_response field names,
+# hook_name format, hook_id correlation, self-echoed stdin payload shape,
+# stop_hook_active field) was captured from REAL, live ``claude`` CLI
+# 2.1.277 output (``--include-hook-events --output-format stream-json``)
+# during this Issue's own implementation, not guessed from documentation.
+# ---------------------------------------------------------------------------
+
+
+def _hc_default_hook_name(hook_event: str) -> str:
+    """Mirrors the real, live-confirmed ``hook_name`` shape: ``"<event>"``
+    for a matcher-less event (Stop), ``"<event>:<tool>"`` for a
+    matcher-scoped event -- these fixtures only ever exercise the
+    PreToolUse/Bash target."""
+    return f"{hook_event}:Bash" if hook_event == "PreToolUse" else hook_event
+
+
+def _hc_hook_started_line(hook_id: str, hook_event: str, hook_name: str | None = None) -> str:
+    return json.dumps({
+        "type": "system", "subtype": "hook_started",
+        "hook_id": hook_id, "hook_name": hook_name or _hc_default_hook_name(hook_event),
+        "hook_event": hook_event, "session_id": "fixture-session",
+    })
+
+
+def _hc_hook_response_line(
+    hook_id: str, hook_event: str, *,
+    exit_code: int = 0, outcome: str = "success",
+    hook_name: str | None = None, self_echo_payload: dict | None = None,
+    stderr: str = "",
+) -> str:
+    text = json.dumps(self_echo_payload) if self_echo_payload is not None else ""
+    return json.dumps({
+        "type": "system", "subtype": "hook_response",
+        "hook_id": hook_id, "hook_name": hook_name or _hc_default_hook_name(hook_event),
+        "hook_event": hook_event, "session_id": "fixture-session",
+        "output": text + stderr, "stdout": text, "stderr": stderr,
+        "exit_code": exit_code, "outcome": outcome,
+    })
+
+
+def _hc_coordinator_result_stderr(steps: list[str] | None = None, *, status: str = "ok") -> str:
+    """Issue #2663 PR #2668 fix_delta (P1-3(b)): the real
+    ``.claude/hooks/session_manifest_coordinator.sh``'s own
+    ``SESSION_MANIFEST_COORDINATOR_RESULT_V1={...}`` marker shape --
+    confirmed by reading the script (always its own LAST stderr line on
+    every exit path) and confirmed exposed on the structured
+    ``hook_response`` event's own ``stderr`` field by a bounded local live
+    trial against installed Claude Code 2.1.277 during this fix_delta."""
+    steps = steps if steps is not None else ["stop_guard"]
+    marker = json.dumps({"status": status, "reason_code": None, "timeout_reason": None, "steps": steps})
+    return f"SESSION_MANIFEST_COORDINATOR_RESULT_V1={marker}\n"
+
+
+def _hc_bash_tool_use_line(tool_use_id: str, command: str = "echo hi") -> str:
+    return json.dumps({
+        "type": "assistant", "session_id": "fixture-session",
+        "message": {"content": [
+            {"type": "tool_use", "id": tool_use_id, "name": "Bash", "input": {"command": command}}
+        ]},
+    })
+
+
+def _hc_bash_tool_use_line_multi(tool_use_ids: list[str], commands: list[str] | None = None) -> str:
+    """A single assistant message declaring MULTIPLE ``Bash`` tool_use
+    blocks (Issue #2663 PR #2668 fix_delta P1-2 regression fixture) --
+    each with its own distinct ``tool_use_id`` but the SAME stream_index
+    (same JSONL line), exactly the officially-supported shape the anchor
+    review's counter-example exercises (see
+    https://code.claude.com/docs/en/agent-sdk/hooks)."""
+    if commands is None:
+        commands = ["echo hi"] * len(tool_use_ids)
+    return json.dumps({
+        "type": "assistant", "session_id": "fixture-session",
+        "message": {"content": [
+            {"type": "tool_use", "id": tool_use_id, "name": "Bash", "input": {"command": command}}
+            for tool_use_id, command in zip(tool_use_ids, commands)
+        ]},
+    })
+
+
+def _hc_bash_tool_result_line(tool_use_id: str) -> str:
+    return json.dumps({
+        "type": "user", "session_id": "fixture-session",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": tool_use_id, "content": "ok"}
+        ]},
+    })
+
+
+def _hc_pretool_observer_payload(tool_use_id: str, command: str = "echo hi") -> dict:
+    return {
+        "session_id": "fixture-session", "hook_event_name": "PreToolUse",
+        "tool_name": "Bash", "tool_input": {"command": command},
+        "tool_use_id": tool_use_id,
+    }
+
+
+def _hc_stop_observer_payload(stop_hook_active: bool) -> dict:
+    return {
+        "session_id": "fixture-session", "hook_event_name": "Stop",
+        "stop_hook_active": stop_hook_active,
+    }
+
+
+def _hc_pretool_window(
+    tool_use_id: str, *, sibling_ids: list[str], observer_id: str = "OBS",
+    denied_id: str | None = None, missing_response_id: str | None = None,
+    extra_unmatched_response_id: str | None = None,
+    reverse_response_order: bool = False, duplicate_started_id: str | None = None,
+) -> list[str]:
+    """One complete positive-or-deny scenario window (Issue #2663 AC5/AC6):
+    a Bash tool_use line immediately followed by the PreToolUse hook_started
+    /hook_response cluster (observer + siblings), immediately followed by
+    the tool_result line -- exactly the contiguous shape confirmed live."""
+    lines = [_hc_bash_tool_use_line(tool_use_id)]
+    started_ids = [observer_id] + [sid for sid in sibling_ids if sid != missing_response_id]
+    if duplicate_started_id:
+        started_ids.append(duplicate_started_id)
+    for hid in started_ids:
+        lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+    response_ids = [observer_id] + [sid for sid in sibling_ids if sid != missing_response_id]
+    if reverse_response_order:
+        response_ids = list(reversed(response_ids))
+    for hid in response_ids:
+        if hid == observer_id:
+            lines.append(_hc_hook_response_line(
+                hid, "PreToolUse", self_echo_payload=_hc_pretool_observer_payload(tool_use_id)
+            ))
+        else:
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=2 if hid == denied_id else 0))
+    if extra_unmatched_response_id:
+        lines.append(_hc_hook_response_line(extra_unmatched_response_id, "PreToolUse", exit_code=0))
+    lines.append(_hc_bash_tool_result_line(tool_use_id))
+    return lines
+
+
+def _hc_stop_window(
+    *, stop_hook_active: bool = False, observer_id: str = "STOP-OBS", sibling_id: str = "STOP-1",
+    sibling_stderr: str | None = None,
+) -> list[str]:
+    """Issue #2663 PR #2668 fix_delta (P1-3(b)): ``sibling_stderr``
+    defaults to the real coordinator's own ``stop_guard`` early-exit
+    marker whenever ``stop_hook_active`` is True (mirroring
+    ``.claude/hooks/session_manifest_coordinator.sh``'s own actual
+    behavior -- it writes that exact marker to stderr precisely when its
+    own stdin ``stop_hook_active`` is true), and empty otherwise -- pass
+    an explicit value to exercise a mismatch/ambiguity scenario."""
+    if sibling_stderr is None:
+        sibling_stderr = _hc_coordinator_result_stderr(["stop_guard"]) if stop_hook_active else ""
+    return [
+        _hc_hook_started_line(observer_id, "Stop"),
+        _hc_hook_started_line(sibling_id, "Stop"),
+        _hc_hook_response_line(sibling_id, "Stop", exit_code=0, stderr=sibling_stderr),
+        _hc_hook_response_line(
+            observer_id, "Stop", self_echo_payload=_hc_stop_observer_payload(stop_hook_active)
+        ),
+    ]
+
+
+def _hc_pretool_window_shared(
+    tool_use_id: str, *, sibling_ids: list[str], observer_id: str,
+    denied_id: str | None = None,
+) -> list[str]:
+    """Like ``_hc_pretool_window`` but WITHOUT its own leading Bash
+    tool_use line -- used for the Issue #2663 PR #2668 fix_delta (P1-2)
+    SAME-assistant-message multi-Bash regression, where the caller emits
+    ONE shared ``_hc_bash_tool_use_line_multi(...)`` line up front
+    covering all co-located calls."""
+    lines: list[str] = []
+    started_ids = [observer_id] + sibling_ids
+    for hid in started_ids:
+        lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+    for hid in started_ids:
+        if hid == observer_id:
+            lines.append(_hc_hook_response_line(
+                hid, "PreToolUse", self_echo_payload=_hc_pretool_observer_payload(tool_use_id)
+            ))
+        else:
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=2 if hid == denied_id else 0))
+    lines.append(_hc_bash_tool_result_line(tool_use_id))
+    return lines
+
+
+def _hc_write_manifest_file(
+    module, worktree: Path, filename: str, *, session_id: str | None = "fixture-session",
+) -> None:
+    """Write a real Issue #2663 AC3 target-directory manifest file (Issue
+    #2663 PR #2668 fix_delta P1-3(a) regression fixture) --
+    ``evaluate_sibling_side_effect_inventory`` now reads this file's own
+    ``actor.session_id`` to bind a candidate new file to the CURRENT run's
+    session before counting it. ``session_id=None`` writes a manifest with
+    no ``actor`` field at all (the "schema has no session id" residual
+    case)."""
+    manifests_dir = worktree.joinpath(*module._HOOK_CHAIN_SIDE_EFFECT_ARTIFACT_RELPATH)
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    content: dict = {"schema": "agent_session_manifest/v1"}
+    if session_id is not None:
+        content["actor"] = {"session_id": session_id}
+    (manifests_dir / filename).write_text(json.dumps(content), encoding="utf-8")
+
+
+_HC_HOOKS_DIR = "${CLAUDE_PROJECT_DIR}/.claude/hooks"
+_HC_STOP_MANIFEST_NAME = "private-agent-session-manifest-stop-1-a.json"
+_HC_STOP_MANIFEST_NAME_2 = "private-agent-session-manifest-stop-2-b.json"
+
+_HC_FOUR_HOOK_SETTINGS = {
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Bash|Read|Write|Edit|Grep|Glob|MultiEdit",
+                "hooks": [{"type": "command", "command": f"{_HC_HOOKS_DIR}/secret_boundary_guard.sh"}],
+            },
+            {
+                "matcher": "Bash|Write|Edit|MultiEdit",
+                "hooks": [{"type": "command", "command": f"{_HC_HOOKS_DIR}/guard-japanese-prose.sh"}],
+            },
+            {
+                "matcher": "Bash|Write|Edit|MultiEdit",
+                "hooks": [{"type": "command", "command": f"{_HC_HOOKS_DIR}/ci_test_performance_advisory.sh"}],
+            },
+            {
+                "matcher": "Bash|Write|Edit|MultiEdit",
+                "hooks": [{"type": "command", "command": f"{_HC_HOOKS_DIR}/root_temporary_residue_advisory.sh"}],
+            },
+        ],
+        "Stop": [
+            {"hooks": [{"type": "command", "command": f"{_HC_HOOKS_DIR}/session_manifest_coordinator.sh"}]},
+        ],
+    }
+}
+
+
+def _hc_write_settings(worktree: Path, settings: dict) -> None:
+    settings_dir = worktree / ".claude"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    (settings_dir / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+
+
+class TestHookChainEvidenceSettingsInjection:
+    """Issue #2663 AC1: bounded, closed, purely additive observer hook
+    registration -- never a caller-supplied event/path/marker/config, and
+    byte-identical to the pre-existing settings JSON when omitted."""
+
+    def test_omitted_by_default_settings_json_unchanged(self) -> None:
+        module = _load_module()
+        import inspect
+
+        params = inspect.signature(module.run_structured_claude).parameters
+        assert "include_hook_chain_evidence_hooks" in params
+        assert params["include_hook_chain_evidence_hooks"].default is False
+
+    def test_given_flag_set_when_argv_built_then_pretool_and_stop_observer_groups_are_added(
+        self, tmp_path: Path,
+    ) -> None:
+        module = _load_module()
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        observed = tmp_path / "settings-observed.json"
+        _write_fake_exe(fake_bin / "claude", f"""
+settings=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--settings" ]; then
+    settings="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+printf '%s' "$settings" > {shlex.quote(str(observed))}
+cat > /dev/null
+printf '%s\\n' '{{"type":"system","subtype":"init"}}'
+printf '%s\\n' '{{"type":"result","subtype":"success"}}'
+""")
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        rc, _out, _err, _timed_out = module.run_structured_claude(
+            str(worktree), "hello", 30.0, 4, claude_bin=str(fake_bin / "claude"),
+            include_hook_chain_evidence_hooks=True,
+        )
+        assert rc == 0
+        settings_obj = json.loads(observed.read_text(encoding="utf-8"))
+        assert settings_obj["hooks"]["PreToolUse"] == [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "cat"}]}
+        ]
+        assert settings_obj["hooks"]["Stop"] == [{"hooks": [{"type": "command", "command": "cat"}]}]
+        # The pre-existing SubagentStart/SubagentStop observability hooks
+        # (byte-identical to _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON)
+        # remain untouched -- purely additive.
+        assert settings_obj["hooks"]["SubagentStart"] == [{"hooks": [{"type": "command", "command": "cat"}]}]
+        assert settings_obj["crossSessionInbound"] == "refuse"
+
+
+class TestLoadCommandHooksForEvent:
+    """Issue #2663 AC2: expected-cohort extraction mirrors (without
+    subprocess-executing) hookchain_harness.py's settings-driven logic."""
+
+    def test_given_four_pretool_bash_groups_when_loaded_then_all_four_commands_returned(self) -> None:
+        module = _load_module()
+        commands = module._load_command_hooks_for_event(_HC_FOUR_HOOK_SETTINGS, "PreToolUse", "Bash")
+        assert len(commands) == 4
+        assert any("secret_boundary_guard.sh" in c for c in commands)
+        assert any("guard-japanese-prose.sh" in c for c in commands)
+
+    def test_given_matcher_not_covering_tool_when_loaded_then_excluded(self) -> None:
+        module = _load_module()
+        settings = {"hooks": {"PreToolUse": [
+            {"matcher": "Read|Write", "hooks": [{"type": "command", "command": "x.sh"}]},
+        ]}}
+        assert module._load_command_hooks_for_event(settings, "PreToolUse", "Bash") == []
+
+    def test_given_no_tool_name_filter_when_loaded_then_matcher_ignored(self) -> None:
+        module = _load_module()
+        commands = module._load_command_hooks_for_event(_HC_FOUR_HOOK_SETTINGS, "Stop", None)
+        assert len(commands) == 1
+        assert "session_manifest_coordinator.sh" in commands[0]
+
+    def test_given_missing_settings_file_when_read_then_none_returned(self, tmp_path: Path) -> None:
+        module = _load_module()
+        assert module._read_project_settings(str(tmp_path)) is None
+
+
+class TestEvaluateAllMatchingHooksObserved:
+    """Issue #2663 AC2/AC6: all_matching_hooks_observed verdict."""
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        return worktree
+
+    def test_given_positive_and_deny_scenarios_fully_observed_when_evaluated_then_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window("tu-pos", sibling_ids=["H1", "H2", "H3", "H4"])
+            + _hc_pretool_window("tu-deny", sibling_ids=["H5", "H6", "H7", "H8"], denied_id="H6", observer_id="OBS2")
+            + _hc_stop_window()
+            + [_result_event_line()]
+        )
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "pass"
+        assert result["passed"] is True
+        assert result["expected_count"] == 4
+        assert result["positive_window_count"] == 1
+        assert result["deny_window_count"] == 1
+
+    def test_ac6a_same_total_count_but_one_handler_missing_and_one_unattributed_extra_is_not_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(a): total hook_response count nominally equals the expected
+        cohort size (4), but one expected handler (H4) never produced a
+        matching hook_response (dangling hook_started) while an unrelated,
+        never-started hook_id (GHOST) supplied a spurious response -- must
+        not read as pass."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window(
+                "tu-pos", sibling_ids=["H1", "H2", "H3", "H4"],
+                missing_response_id="H4", extra_unmatched_response_id="GHOST",
+            )
+            + _hc_pretool_window("tu-deny", sibling_ids=["H5", "H6", "H7", "H8"], denied_id="H6", observer_id="OBS2")
+            + [_result_event_line()]
+        )
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "fail"
+        assert result["passed"] is False
+        assert result["windows"][0]["reason"] == "unmatched_hook_response"
+
+    def test_ac6b_reversed_completion_order_and_duplicate_started_record_not_misjudged(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(b): sibling hook_response records completing in reversed
+        order relative to their hook_started order, plus a duplicate
+        hook_started for the same hook_id (a lifecycle re-announcement),
+        must not be misjudged as a "duplicate" execution."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window(
+                "tu-pos", sibling_ids=["H1", "H2", "H3", "H4"],
+                reverse_response_order=True, duplicate_started_id="H1",
+            )
+            + _hc_pretool_window("tu-deny", sibling_ids=["H5", "H6", "H7", "H8"], denied_id="H7", observer_id="OBS2")
+            + [_result_event_line()]
+        )
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "pass"
+
+    def test_ac6f_no_bash_tool_use_observed_is_fail_not_pass(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join([_system_init_line(), _result_event_line()])
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "fail"
+        assert result["reason"] == "no_bash_tool_use_observed"
+
+    def test_ac6f_positive_only_with_zero_deny_scenarios_is_fail(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window("tu-pos", sibling_ids=["H1", "H2", "H3", "H4"])
+            + [_result_event_line()]
+        )
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "fail"
+        assert result["deny_window_count"] == 0
+
+    def test_ac6h_corrupted_evidence_zero_observer_self_echo_is_unverified_not_fail_or_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(h): corrupted/ambiguous evidence (the observer's own
+        response cannot be uniquely identified) must be distinguished from
+        a genuine execution failure -- unverified, never fail or pass."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        lines = [_system_init_line(), _hc_bash_tool_use_line("tu-corrupt")]
+        for hid in ["OBS", "H1", "H2", "H3", "H4"]:
+            lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+        for hid in ["OBS", "H1", "H2", "H3", "H4"]:
+            # Observer response corrupted: no self-echo payload at all.
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=0))
+        lines.append(_hc_bash_tool_result_line("tu-corrupt"))
+        lines.append(_result_event_line())
+        result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+        assert result["status"] == "unverified"
+        assert result["windows"][0]["reason"] == "observer_self_echo_not_uniquely_identified"
+
+    def test_extra_unattributable_hook_execution_beyond_expected_count_is_unverified(
+        self, tmp_path: Path,
+    ) -> None:
+        """Issue #2663 In Scope: a foreign (e.g. user-level) extra hook
+        execution sharing the same event+tool bucket is never silently
+        promoted to pass NOR blindly condemned as fail -- unverified."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window("tu-pos", sibling_ids=["H1", "H2", "H3", "H4", "H5"])
+            + _hc_pretool_window("tu-deny", sibling_ids=["H6", "H7", "H8", "H9"], denied_id="H7", observer_id="OBS2")
+            + [_result_event_line()]
+        )
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "unverified"
+
+    def test_given_unreadable_project_settings_when_evaluated_then_unverified(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = tmp_path / "wt-no-settings"
+        worktree.mkdir()
+        stdout = "\n".join([_system_init_line(), _result_event_line()])
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "unverified"
+        assert result["reason"] == "project_settings_unreadable"
+
+    def test_first_call_responses_flushed_after_second_call_boundary_still_attributed_correctly(
+        self, tmp_path: Path,
+    ) -> None:
+        """Issue #2663 AC5 live-trial fix_delta regression: a repeated
+        ``--require-hook-chain-evidence`` live trial against the SAME
+        committed HEAD flipped PASS -> FAIL because the first Bash call's 5
+        ``hook_response`` records (4 project sibling hooks + this runner's
+        own observer) were only flushed to the JSON stream AFTER the
+        SECOND Bash tool_use line -- their ``hook_started`` records
+        remained correctly positioned in the first call's own window.
+        Under the old strict window-span filtering (bounding BOTH
+        ``hook_started`` and ``hook_response`` by the same span), this
+        produced a spurious ``observer_self_echo_not_uniquely_identified``
+        for window 0 (0 records observed at all) and a spurious
+        ``unmatched_hook_response`` (5 extra) for window 1. Global hook_id
+        pairing attributed by the ``hook_started``'s own stream_index must
+        read this as two fully-observed, correctly-attributed windows."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        positive_sibling_ids = ["H1", "H2", "H3", "H4"]
+        deny_sibling_ids = ["H5", "H6", "H7", "H8"]
+        lines = [
+            _system_init_line(),
+            _hc_bash_tool_use_line("tu-pos", command="echo hi"),
+        ]
+        for hid in ["OBS", *positive_sibling_ids]:
+            lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+        lines.append(_hc_bash_tool_use_line("tu-deny", command="env"))
+        for hid in ["OBS2", *deny_sibling_ids]:
+            lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+        # The first call's own hook_response records are flushed late --
+        # physically AFTER the second Bash tool_use line, inside what a
+        # naive span-filter would treat as window 1's own span.
+        lines.append(_hc_hook_response_line(
+            "OBS", "PreToolUse", self_echo_payload=_hc_pretool_observer_payload("tu-pos", command="echo hi")
+        ))
+        for hid in positive_sibling_ids:
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=0))
+        # The second call's own hook_response records follow, in-window as
+        # normal.
+        lines.append(_hc_hook_response_line(
+            "OBS2", "PreToolUse", self_echo_payload=_hc_pretool_observer_payload("tu-deny", command="env")
+        ))
+        for hid in deny_sibling_ids:
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=2 if hid == "H7" else 0))
+        lines.append(_hc_bash_tool_result_line("tu-deny"))
+        lines.append(_result_event_line())
+
+        result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+        assert result["status"] == "pass"
+        assert result["passed"] is True
+        assert result["positive_window_count"] == 1
+        assert result["deny_window_count"] == 1
+        assert result["windows"][0]["status"] == "pass"
+        assert result["windows"][0]["observed_count"] == 4
+        assert result["windows"][1]["status"] == "pass"
+        assert result["windows"][1]["observed_count"] == 4
+        assert result["windows"][1]["denied"] is True
+
+
+class TestEvaluateAllMatchingHooksObservedSharedStreamIndex:
+    """Issue #2663 PR #2668 fix_delta (P1-2, anchor review
+    https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277):
+    multiple Bash tool_use blocks declared inside the SAME assistant
+    message (same stream_index) must not collapse into a degenerate empty
+    window / absorb-everything pair."""
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        return worktree
+
+    def test_ac6b_same_assistant_message_multi_bash_both_windows_independently_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(b): the anchor review's own reproduced counter-example --
+        two Bash tool_use blocks (distinct tool_use_ids) inside ONE
+        assistant message, each followed later in the stream by its own
+        full complement of correctly tool_use_id-tagged self-echo +
+        sibling hook_started/hook_response pairs -- both windows must
+        independently reach ``status: pass`` (not the old spurious
+        ``observer_self_echo_not_uniquely_identified``/``unverified``)."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        lines = [
+            _system_init_line(),
+            _hc_bash_tool_use_line_multi(["tu-A", "tu-B"]),
+        ]
+        lines += _hc_pretool_window_shared("tu-A", sibling_ids=["H1", "H2", "H3", "H4"], observer_id="OBS-A")
+        lines += _hc_pretool_window_shared(
+            "tu-B", sibling_ids=["H5", "H6", "H7", "H8"], observer_id="OBS-B", denied_id="H6",
+        )
+        lines.append(_result_event_line())
+        result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+        assert result["status"] == "pass"
+        assert result["passed"] is True
+        assert result["windows"][0]["status"] == "pass"
+        assert result["windows"][0]["observed_count"] == 4
+        assert result["windows"][0]["denied"] is False
+        assert result["windows"][1]["status"] == "pass"
+        assert result["windows"][1]["observed_count"] == 4
+        assert result["windows"][1]["denied"] is True
+        assert result["positive_window_count"] == 1
+        assert result["deny_window_count"] == 1
+
+    def test_ac6b_ambiguous_self_echo_tool_use_id_mapping_fails_closed_unverified(
+        self, tmp_path: Path,
+    ) -> None:
+        """Companion negative case: within a shared-stream_index span, an
+        observer's self-echo claims a ``tool_use_id`` that DUPLICATES
+        another call's own already-claimed id (an unresolvable/ambiguous
+        mapping) -- must fail closed to ``unverified``, never a guessed
+        attribution."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        lines = [
+            _system_init_line(),
+            _hc_bash_tool_use_line_multi(["tu-A", "tu-B"]),
+        ]
+        lines += _hc_pretool_window_shared("tu-A", sibling_ids=["H1", "H2", "H3", "H4"], observer_id="OBS-A")
+        # OBS-B's own self-echo wrongly claims tool_use_id "tu-A" (already
+        # claimed by OBS-A above) -- an unresolvable duplicate mapping.
+        lines.append(_hc_hook_started_line("OBS-B", "PreToolUse"))
+        for hid in ["H5", "H6", "H7", "H8"]:
+            lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+        lines.append(_hc_hook_response_line(
+            "OBS-B", "PreToolUse", self_echo_payload=_hc_pretool_observer_payload("tu-A")
+        ))
+        for hid in ["H5", "H6", "H7", "H8"]:
+            lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=0))
+        lines.append(_hc_bash_tool_result_line("tu-B"))
+        lines.append(_result_event_line())
+        result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+        assert result["status"] == "unverified"
+        assert result["windows"][0]["reason"] == "self_echo_tool_use_id_ambiguous"
+        assert result["windows"][1]["reason"] == "self_echo_tool_use_id_ambiguous"
+
+    def test_single_bash_per_message_windowing_unchanged_when_mixed_with_shared_group(
+        self, tmp_path: Path,
+    ) -> None:
+        """The pre-existing single-Bash-per-message case must remain
+        byte-identical even when it appears ALONGSIDE a shared-
+        stream_index group elsewhere in the same stream."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        lines = [_system_init_line()]
+        lines += _hc_pretool_window("tu-solo", sibling_ids=["H1", "H2", "H3", "H4"])
+        lines.append(_hc_bash_tool_use_line_multi(["tu-A", "tu-B"]))
+        lines += _hc_pretool_window_shared("tu-A", sibling_ids=["H5", "H6", "H7", "H8"], observer_id="OBS-A")
+        lines += _hc_pretool_window_shared(
+            "tu-B", sibling_ids=["H9", "H10", "H11", "H12"], observer_id="OBS-B", denied_id="H10",
+        )
+        lines.append(_result_event_line())
+        result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+        assert result["status"] == "pass"
+        assert len(result["windows"]) == 3
+        assert all(w["status"] == "pass" for w in result["windows"])
+
+
+class TestEvaluateSiblingSideEffectInventory:
+    """Issue #2663 AC3/AC6: sibling_side_effect_inventory_complete verdict."""
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        return worktree
+
+    def test_ac6d_new_manifest_file_observed_is_pass(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME, session_id="fixture-session")
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)), [], [_HC_STOP_MANIFEST_NAME],
+        )
+        assert result["status"] == "pass"
+        assert result["reason"] == "new_manifest_observed"
+        assert result["new_file_count"] == 1
+
+    def test_p1_3a_new_file_with_mismatched_session_id_is_not_counted_as_new(
+        self, tmp_path: Path,
+    ) -> None:
+        """Issue #2663 PR #2668 fix_delta (P1-3(a), anchor review
+        counter-example A): a new Stop-tagged file that genuinely appeared
+        between before/after snapshots, but whose OWN embedded session id
+        belongs to an unrelated/concurrent session, must NOT be counted as
+        THIS run's own evidence -- and must not pass on that basis alone."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME, session_id="unrelated-other-session")
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)), [], [_HC_STOP_MANIFEST_NAME],
+        )
+        assert result["status"] == "fail"
+        assert result["reason"] == "missing_side_effect"
+        assert result["new_file_count"] == 0
+
+    def test_p1_3a_zero_hook_events_with_unrelated_stop_file_present_is_not_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """Issue #2663 PR #2668 fix_delta AC6: zero hook events observed at
+        all (this runner's own current session id cannot even be
+        determined) plus an unrelated Stop-tagged file present must never
+        read as pass -- an empty current-session set excludes every
+        candidate file, regardless of that file's own content."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME, session_id="fixture-session")
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "", [], [_HC_STOP_MANIFEST_NAME],
+        )
+        assert result["status"] == "fail"
+        assert result["reason"] == "missing_side_effect"
+        assert result["new_file_count"] == 0
+
+    def test_ac6d_valid_no_change_via_stop_hook_active_is_pass_not_fail(self, tmp_path: Path) -> None:
+        """Issue #2663 AC6(f) / PR #2668 fix_delta (P1-3(b)): the FULL
+        corroborating-evidence combination -- the observer's own
+        ``stop_hook_active: true`` self-echo AND the target coordinator's
+        own ``steps: ["stop_guard"]`` completion marker (both provided by
+        ``_hc_stop_window``'s own default when ``stop_hook_active=True``)
+        -- must still reach pass."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=True)), [], [],
+        )
+        assert result["status"] == "pass"
+        assert result["reason"] == "valid_no_change_stop_hook_active"
+
+    def test_p1_3b_observer_only_stop_hook_active_without_coordinator_confirmation_is_not_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """Issue #2663 PR #2668 fix_delta (P1-3(b), anchor review
+        counter-example B): the observer's own ``stop_hook_active: true``
+        self-echo ALONE, with no corroborating completion marker from the
+        TARGET coordinator itself, must no longer be sufficient for a
+        pass -- this is exactly the anchor review's own reproduced
+        counter-example (previously this read as
+        ``valid_no_change_stop_hook_active``)."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = "\n".join(
+            _hc_stop_window(stop_hook_active=True, sibling_stderr="")
+        )
+        result = module.evaluate_sibling_side_effect_inventory(str(worktree), stdout, [], [])
+        assert result["status"] == "fail"
+        assert result["reason"] == "missing_side_effect"
+
+    def test_missing_side_effect_when_no_new_file_and_stop_hook_not_active_is_fail(
+        self, tmp_path: Path,
+    ) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)), [], [],
+        )
+        assert result["status"] == "fail"
+        assert result["reason"] == "missing_side_effect"
+
+    def test_ac6g_preexisting_stale_manifest_present_in_both_snapshots_is_not_mistaken_for_new(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(g): a stale artifact already present before this run started
+        (and still present after) must never be mistaken for THIS run's own
+        new post-condition."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=True)),
+            ["stale-from-earlier-run.json"], ["stale-from-earlier-run.json"],
+        )
+        assert result["new_file_count"] == 0
+        assert result["status"] == "pass"  # stop_hook_active True: valid no-change
+
+    def test_overflow_more_new_files_than_expected_is_fail(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME, session_id="fixture-session")
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME_2, session_id="fixture-session")
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)),
+            [], [_HC_STOP_MANIFEST_NAME, _HC_STOP_MANIFEST_NAME_2],
+        )
+        assert result["status"] == "fail"
+        assert result["reason"] == "overflow"
+
+    def test_target_handler_not_configured_is_unverified(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = tmp_path / "wt-no-target"
+        worktree.mkdir()
+        _hc_write_settings(worktree, {"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/unrelated.sh"}]}
+        ]}})
+        result = module.evaluate_sibling_side_effect_inventory(str(worktree), "", [], [])
+        assert result["status"] == "unverified"
+        assert result["reason"] == "target_handler_not_configured"
+
+    def test_unreadable_postcondition_snapshots_is_unverified(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(str(worktree), "", None, None)
+        assert result["status"] == "unverified"
+        assert result["reason"] == "postcondition_unreadable"
+
+    def test_snapshot_truncated_flag_is_unverified_never_a_silent_drop(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "", [], [], snapshot_truncated=True,
+        )
+        assert result["status"] == "unverified"
+        assert result["reason"] == "session_manifest_snapshot_truncated"
+
+
+class TestSnapshotSessionManifestFilesP2Truncation:
+    """Issue #2663 PR #2668 fix_delta (P2-1, anchor review
+    https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277):
+    filter-for-token BEFORE sort/cap, so a high-volume UNRELATED writer
+    sharing this directory can never numerically push a genuinely new
+    Stop-tagged manifest out of a fixed-size snapshot cap."""
+
+    def test_high_volume_unrelated_posttooluse_files_never_truncate_away_new_stop_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The anchor review's own counter-example (2000 pre-existing
+        ``-posttooluse-`` files sorting before a new ``-stop-`` file) --
+        reproduced here with a smaller, fast cap to assert the fix's
+        FILTERING logic scales independently of the absolute numbers."""
+        module = _load_module()
+        monkeypatch.setattr(module, "_HOOK_CHAIN_SIDE_EFFECT_MAX_SNAPSHOT_ENTRIES", 5)
+        worktree = tmp_path / "wt"
+        manifests_dir = worktree.joinpath(*module._HOOK_CHAIN_SIDE_EFFECT_ARTIFACT_RELPATH)
+        manifests_dir.mkdir(parents=True)
+        for i in range(20):
+            (manifests_dir / f"private-agent-session-manifest-posttooluse-{i:04d}-x.json").write_text(
+                "{}", encoding="utf-8"
+            )
+        before, before_truncated = module._snapshot_session_manifest_files(str(worktree))
+        assert before_truncated is False
+        assert before == []
+        new_name = "private-agent-session-manifest-stop-9999-abc.json"
+        (manifests_dir / new_name).write_text(
+            json.dumps({"actor": {"session_id": "fixture-session"}}), encoding="utf-8"
+        )
+        after, after_truncated = module._snapshot_session_manifest_files(str(worktree))
+        assert after_truncated is False
+        assert after == [new_name]
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "\n".join(_hc_stop_window(stop_hook_active=False)), before, after,
+        )
+        assert result["status"] == "pass"
+        assert result["reason"] == "new_manifest_observed"
+
+    def test_stop_tagged_subset_exceeding_cap_is_flagged_truncated_and_unverified(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        module = _load_module()
+        monkeypatch.setattr(module, "_HOOK_CHAIN_SIDE_EFFECT_MAX_SNAPSHOT_ENTRIES", 3)
+        worktree = tmp_path / "wt"
+        manifests_dir = worktree.joinpath(*module._HOOK_CHAIN_SIDE_EFFECT_ARTIFACT_RELPATH)
+        manifests_dir.mkdir(parents=True)
+        for i in range(5):
+            (manifests_dir / f"private-agent-session-manifest-stop-{i:04d}-x.json").write_text(
+                "{}", encoding="utf-8"
+            )
+        entries, truncated = module._snapshot_session_manifest_files(str(worktree))
+        assert truncated is True
+        assert len(entries) == 3
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        result = module.evaluate_sibling_side_effect_inventory(
+            str(worktree), "", entries, entries, snapshot_truncated=truncated,
+        )
+        assert result["status"] == "unverified"
+        assert result["reason"] == "session_manifest_snapshot_truncated"
+
+
+class TestEvaluateHookChainEvidenceAggregate:
+    """Issue #2663 AC4: aggregate PASS only when BOTH assertions independently
+    report status: pass."""
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        return worktree
+
+    def _full_positive_and_deny_stream(self, *, stop_hook_active: bool) -> str:
+        return "\n".join(
+            [_system_init_line()]
+            + _hc_pretool_window("tu-pos", sibling_ids=["H1", "H2", "H3", "H4"])
+            + _hc_pretool_window("tu-deny", sibling_ids=["H5", "H6", "H7", "H8"], denied_id="H6", observer_id="OBS2")
+            + _hc_stop_window(stop_hook_active=stop_hook_active)
+            + [_result_event_line()]
+        )
+
+    def test_ac6c_both_hooks_observed_but_side_effect_missing_fails_only_the_side_effect_assertion(
+        self, tmp_path: Path,
+    ) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = self._full_positive_and_deny_stream(stop_hook_active=False)
+        result = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [])
+        assert result["all_matching_hooks_observed"]["status"] == "pass"
+        assert result["sibling_side_effect_inventory_complete"]["status"] == "fail"
+        assert result["status"] == "fail"
+        assert result["passed"] is False
+
+    def test_ac6e_deny_scenario_present_and_sibling_side_effect_still_completes_is_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC6(e): a PreToolUse deny occurring earlier in the session does
+        not prevent the independent Stop-time side effect from being
+        correctly observed as completed."""
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        _hc_write_manifest_file(module, worktree, _HC_STOP_MANIFEST_NAME, session_id="fixture-session")
+        stdout = self._full_positive_and_deny_stream(stop_hook_active=False)
+        result = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [_HC_STOP_MANIFEST_NAME])
+        assert result["all_matching_hooks_observed"]["deny_window_count"] == 1
+        assert result["sibling_side_effect_inventory_complete"]["status"] == "pass"
+        assert result["status"] == "pass"
+        assert result["passed"] is True
+
+    def test_both_pass_is_aggregate_pass(self, tmp_path: Path) -> None:
+        module = _load_module()
+        worktree = self._worktree(tmp_path)
+        stdout = self._full_positive_and_deny_stream(stop_hook_active=True)
+        result = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [])
+        assert result["status"] == "pass"
+        assert result["passed"] is True
+
+
+class TestRequireHookChainEvidenceCLI:
+    """Issue #2663 AC1/AC6(h): CLI-level flag validation and pre-existing
+    (legacy) caller backward compatibility."""
+
+    def test_flag_requires_structured_mode_and_claude_runtime(
+        self, repo_with_worktree: tuple[Path, Path], tmp_path: Path,
+    ) -> None:
+        repo, worktree = repo_with_worktree
+        prompt = _prompt_file(tmp_path)
+        result = _run(
+            repo, worktree,
+            "--runtime", "claude", "--mode", "interactive",
+            "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+            "--require-hook-chain-evidence",
+        )
+        assert result.returncode != 0
+        assert "--require-hook-chain-evidence requires --runtime claude --mode structured" in result.stderr
+
+    def test_legacy_caller_omitting_flag_gets_no_hook_chain_evidence_key_and_unchanged_exit_code(
+        self, repo_with_worktree: tuple[Path, Path], tmp_path: Path,
+    ) -> None:
+        repo, worktree = repo_with_worktree
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + FAKE_CLAUDE_SUCCESS_BODY)
+        prompt = _prompt_file(tmp_path)
+        result = _run(
+            repo, worktree,
+            "--runtime", "claude", "--mode", "structured",
+            "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+            "--evidence-json", str(tmp_path / "evidence.json"),
+            fake_bin_dir=fake_bin,
+        )
+        assert result.returncode == 0, result.stderr
+        evidence = json.loads((tmp_path / "evidence.json").read_text(encoding="utf-8"))
+        assert "hook_chain_evidence" not in evidence
+
+    def test_end_to_end_require_hook_chain_evidence_pass(
+        self, repo_with_worktree: tuple[Path, Path], tmp_path: Path,
+    ) -> None:
+        """Issue #2663 AC5-shaped end-to-end wiring proof (deterministic
+        fake claude binary, not the live runtime -- the live canonical
+        invocation itself is this Issue's own separate AC5 trial): the CLI
+        flag threads through settings injection, before/after manifest
+        snapshotting, and the aggregate gate, end to end."""
+        repo, worktree = repo_with_worktree
+        _hc_write_settings(worktree, _HC_FOUR_HOOK_SETTINGS)
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        stream_lines = (
+            [_system_init_line()]
+            + _hc_pretool_window("tu-pos", sibling_ids=["H1", "H2", "H3", "H4"])
+            + _hc_pretool_window("tu-deny", sibling_ids=["H5", "H6", "H7", "H8"], denied_id="H6", observer_id="OBS2")
+            + _hc_stop_window(stop_hook_active=False)
+            + [_result_event_line()]
+        )
+        manifests_dir_rel = "artifacts/session-manifest-runtime/manifests"
+        # Issue #2663 PR #2668 fix_delta (P1-3(a)): the new Stop-tagged
+        # manifest must carry the SAME session id as the fixture stream's
+        # own "fixture-session" for the run-binding check to count it.
+        stop_manifest_content = shlex.quote(json.dumps({"actor": {"session_id": "fixture-session"}}))
+        body_lines = ["cat > /dev/null"]
+        body_lines.append(f"mkdir -p {shlex.quote(manifests_dir_rel)}")
+        body_lines.append(
+            f"printf '%s' {stop_manifest_content} > "
+            f"{shlex.quote(manifests_dir_rel)}/private-agent-session-manifest-stop-1-a.json"
+        )
+        # A co-registered, non-target manifest writer (the settings.json
+        # PostToolUse debounce hook) also writes into the SAME directory --
+        # confirmed live -- and must be correctly ignored by the
+        # filename-token-scoped AC3 assertion (never inflate it to
+        # "overflow", never satisfy it either).
+        body_lines.append(
+            f"printf '{{}}' > {shlex.quote(manifests_dir_rel)}/private-agent-session-manifest-posttooluse-1-b.json"
+        )
+        for line in stream_lines:
+            body_lines.append(f"printf '%s\\n' {shlex.quote(line)}")
+        body_lines.append("exit 0")
+        _write_fake_exe(fake_bin / "claude", _HELP_BRANCH + "\n" + "\n".join(body_lines) + "\n")
+        prompt = _prompt_file(tmp_path)
+        result = _run(
+            repo, worktree,
+            "--runtime", "claude", "--mode", "structured",
+            "--prompt-file", str(prompt), "--output-dir", str(tmp_path / "out"),
+            "--evidence-json", str(tmp_path / "evidence.json"),
+            "--require-hook-chain-evidence",
+            fake_bin_dir=fake_bin,
+        )
+        assert result.returncode == 0, result.stderr
+        evidence = json.loads((tmp_path / "evidence.json").read_text(encoding="utf-8"))
+        hook_chain_evidence = evidence["hook_chain_evidence"]
+        assert hook_chain_evidence["status"] == "pass"
+        assert hook_chain_evidence["all_matching_hooks_observed"]["status"] == "pass"
+        assert hook_chain_evidence["sibling_side_effect_inventory_complete"]["status"] == "pass"
+
     def test_json_payload_path_stays_byte_identical_and_takes_precedence(self) -> None:
         """The pre-existing JSON-object recognition path must remain
         untouched: when JSON parses successfully, the plain-text fallback
