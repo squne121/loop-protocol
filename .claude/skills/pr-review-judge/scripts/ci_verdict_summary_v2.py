@@ -20,14 +20,33 @@ Design constraints:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 SCHEMA = "ci_verdict_summary_v2"
 SCHEMA_VERSION = 2
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+_CI_JOB_SNAPSHOT_PATH = REPO_ROOT / "scripts" / "ci" / "ci_job_snapshot.py"
+
+
+def _load_ci_job_snapshot_module() -> ModuleType:
+    """Dynamically load the canonical shared job-snapshot helper (Issue
+    #2631) -- the SAME helper ``scripts/ci/verify_ci_check_conclusions.py``
+    loads, so both consumers apply identical identity/provenance semantics
+    instead of reimplementing them."""
+    spec = importlib.util.spec_from_file_location("ci_job_snapshot", _CI_JOB_SNAPSHOT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load ci_job_snapshot module from {_CI_JOB_SNAPSHOT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 # Classification map: (workflow, check_name) -> classification
 # "required" = must pass at expected head SHA for merge-ready
@@ -106,17 +125,19 @@ CLASSIFICATION_MAP: dict[tuple[str, str], str] = {
     ("Check Japanese Content", "Issue Body Japanese Check (retrospective)"): "excluded",
 }
 
-# Issue #2433 PR #2561: unlike ordinary unconditional exclusions, these tuples
-# are excluded only for intentionally skipped ordinary-PR CheckRuns. The run
-# binding is represented by the adapter's github_check_run_api provenance:
-# check_runs_api_to_raw_checks() accepts that provenance only after binding the
-# CheckRun details URL to the exact workflow_run_id.
+# Issue #2433 PR #2561 (Issue #2631: migrated to attempt-scoped Jobs
+# provenance): unlike ordinary unconditional exclusions, these tuples are
+# excluded only for intentionally skipped ordinary-PR jobs. The run binding
+# is represented by the adapter's github_actions_job_api provenance:
+# job_snapshot_file_to_raw_checks() (via the shared
+# scripts/ci/ci_job_snapshot.py helper) accepts that provenance only after
+# binding the job row to the exact workflow_run_id/head_sha identity SSOT.
 CONDITIONAL_EXCLUDED_TUPLES: frozenset[tuple[str, str]] = frozenset({
     ("ci", "reliability-assessment"),
     ("ci", "close-evidence-publication"),
     ("ci", "ci-runtime-baseline-gate-ready"),
 })
-EXACT_CHECK_RUN_PROVENANCE = "github_check_run_api"
+EXACT_CHECK_RUN_PROVENANCE = "github_actions_job_api"
 
 
 # REQUIRED_CHECKS: (workflow, name) tuples that MUST appear with conclusion=success
@@ -548,9 +569,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--needs-json", default=None, help="JSON string or @file with needs.*.result map")
     p.add_argument("--checks-json", default=None, help="Path to JSON file containing check run list")
     p.add_argument(
-        "--check-runs-api-json",
+        "--job-snapshot-json",
         default=None,
-        help="GitHub REST commit check-runs response bound to --workflow-run-id",
+        help=(
+            "path to an attempt-scoped ci_job_snapshot_v1 file (Issue #2631; "
+            "produced by scripts/ci/ci_job_snapshot.py from the "
+            "GET .../actions/runs/{run_id}/attempts/{attempt}/jobs endpoint)"
+        ),
     )
     p.add_argument("--checks-stdin", action="store_true", help="Read check runs JSON from stdin")
     p.add_argument("--output", default=None, help="Output path for ci_verdict_summary_v2.json")
@@ -602,6 +627,27 @@ def needs_json_to_raw_checks(needs_map: dict[str, str]) -> list[dict[str, Any]]:
     return raw_checks
 
 
+# Issue #2019 In Scope F: verify the GitHub Actions App source, not merely
+# the check name/head_sha. A CheckRun row created by any other GitHub App
+# (or a user token) must never be accepted as evidence, even if its name
+# matches a required check exactly (spoofed-name defense).
+#
+# Issue #2631: this generic commit-scoped CheckRuns-to-raw_checks bridge is
+# NO LONGER wired into the ci-verdict-summary / ci-runtime-baseline-
+# gate-ready acquisition inventory (that inventory now exclusively uses
+# ``job_snapshot_file_to_raw_checks`` below, whose Jobs-API acquisition is
+# structurally immune to this exact spoofing concern -- a third-party App
+# cannot inject a fake row into an Actions run's OWN Jobs list the way it
+# could create an arbitrarily-named CheckRun via the Checks API). This
+# utility remains available/tested for OTHER out-of-scope consumers that
+# still build evidence from real commit-scoped CheckRuns rows (e.g. Issue
+# #2019 AC22's visual-impact-policy verdict-classifier proof, which reuses
+# this generic bridge as its raw_checks fixture builder rather than
+# reimplementing app-source spoof-defense semantics twice) -- retiring it
+# entirely from ci.yml is not the same as deleting the function.
+TRUSTED_CHECK_RUN_APP_SLUGS: frozenset[str] = frozenset({"github-actions"})
+
+
 def filter_check_runs_by_workflow_run(
     check_runs_payload: Any,
     *,
@@ -609,13 +655,6 @@ def filter_check_runs_by_workflow_run(
 ) -> list[dict[str, Any]]:
     """Return only the raw check-run rows whose ``details_url`` is bound to the
     given Actions ``workflow_run_id``.
-
-    Shared by ``ci_verdict_summary_v2.py`` (canonical producer) and
-    ``scripts/ci/verify_ci_check_conclusions.py`` (P1-3, Issue #1824 review) so
-    both consumers apply the IDENTICAL same-run binding rule instead of
-    grouping candidate check runs by (name, head_sha) alone -- which would
-    accept a mismatched rerun's check run as evidence for a different run of
-    the same commit.
 
     Raises ``ValueError`` on a structurally invalid payload. Returns an empty
     list (not an error) when the payload is well-formed but nothing matches
@@ -639,13 +678,6 @@ def filter_check_runs_by_workflow_run(
             continue
         matched.append(row)
     return matched
-
-
-# Issue #2019 In Scope F: verify the GitHub Actions App source, not merely
-# the check name/head_sha. A CheckRun row created by any other GitHub App
-# (or a user token) must never be accepted as evidence, even if its name
-# matches a required check exactly (spoofed-name defense).
-TRUSTED_CHECK_RUN_APP_SLUGS: frozenset[str] = frozenset({"github-actions"})
 
 
 def check_runs_api_to_raw_checks(
@@ -706,6 +738,55 @@ def check_runs_api_to_raw_checks(
     return raw_checks
 
 
+def job_snapshot_file_to_raw_checks(
+    job_snapshot_path: str,
+    *,
+    expected_repository: str,
+    expected_run_id: int,
+    expected_run_attempt: int,
+    expected_head_sha: str,
+    workflow: str = "ci",
+) -> list[dict[str, Any]]:
+    """Load an attempt-scoped ``ci_job_snapshot_v1`` file (Issue #2631) and
+    bridge it to the ``raw_checks`` shape ``generate_verdict`` consumes.
+
+    PR #2669 review fix_delta (Blocker 1): before ANY Jobs row is converted
+    to evidence, the RE-LOADED snapshot's own identity envelope is verified
+    via the shared helper's ``verify_snapshot_identity`` against the SAME
+    ``expected_repository`` / ``expected_run_id`` / ``expected_run_attempt``
+    / ``expected_head_sha`` the caller is about to stamp on the resulting
+    verdict artifact (``main()`` passes the identical CLI-derived values to
+    both this function and ``generate_verdict``). Without this, a snapshot
+    legitimately built for a DIFFERENT run/attempt could be silently
+    relabeled as evidence for the caller's claimed run purely because they
+    share a head SHA -- this call makes that structurally impossible: a
+    mismatch raises before any Jobs row is even looked at.
+
+    Delegates ALL identity/normalization/duplicate-name/CheckRun-binding
+    semantics to the shared helper (``scripts/ci/ci_job_snapshot.py``) --
+    the SAME helper ``scripts/ci/verify_ci_check_conclusions.py`` uses, so
+    both consumers reach identical conclusions from the SAME snapshot (no
+    independent re-fetch, AC1/AC2/AC3). Raises ``ValueError`` (wrapping the
+    shared helper's ``SnapshotError``) on any structural, identity, or
+    CheckRun-binding violation -- the former commit-scoped CheckRuns
+    acquisition and its ``details_url`` substring heuristic are retired
+    entirely.
+    """
+    ci_job_snapshot = _load_ci_job_snapshot_module()
+    try:
+        snapshot = ci_job_snapshot.load_snapshot(job_snapshot_path)
+        ci_job_snapshot.verify_snapshot_identity(
+            snapshot,
+            expected_repository=expected_repository,
+            expected_run_id=expected_run_id,
+            expected_run_attempt=expected_run_attempt,
+            expected_head_sha=expected_head_sha,
+        )
+        return ci_job_snapshot.job_snapshot_to_raw_checks(snapshot, workflow=workflow)
+    except ci_job_snapshot.SnapshotError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -747,15 +828,23 @@ def main(argv: list[str] | None = None) -> int:
             print("ERROR: --needs-json must be a JSON object {job_name: result}", file=sys.stderr)
             return 1
         raw_checks = needs_json_to_raw_checks(needs_map)
-    elif args.check_runs_api_json:
+    elif args.job_snapshot_json:
         try:
-            with open(args.check_runs_api_json) as f:
-                raw_payload = json.load(f)
-            raw_checks = check_runs_api_to_raw_checks(
-                raw_payload, workflow_run_id=args.workflow_run_id
+            # PR #2669 review fix_delta Blocker 1: the SAME repository/run/
+            # attempt/head-sha values used below for generate_verdict()'s
+            # own artifact identity are passed here so the snapshot's own
+            # identity envelope is verified against them BEFORE any Jobs
+            # row is converted to evidence -- see
+            # job_snapshot_file_to_raw_checks's docstring.
+            raw_checks = job_snapshot_file_to_raw_checks(
+                args.job_snapshot_json,
+                expected_repository=args.repository,
+                expected_run_id=args.workflow_run_id,
+                expected_run_attempt=args.workflow_run_attempt,
+                expected_head_sha=args.expected_head_sha,
             )
         except (OSError, json.JSONDecodeError, ValueError) as e:
-            print(f"ERROR: Failed to load real CheckRun API evidence: {e}", file=sys.stderr)
+            print(f"ERROR: Failed to load attempt-scoped job snapshot evidence: {e}", file=sys.stderr)
             return 1
     elif args.checks_stdin:
         raw_text = sys.stdin.read()
