@@ -30,7 +30,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +40,15 @@ SCHEMA = "ci_job_snapshot_v1"
 SCHEMA_VERSION = 1
 
 _CHECK_RUN_URL_HOST = "https://api.github.com/repos/"
+
+# PR #2669 review fix_delta (Blocker 2): the SAME canonical positive-decimal
+# pattern ``scripts/agent-ops/resolve_visual_impact.py`` already uses for its
+# own check_run_url parse (that file/its tests are out of scope, referenced
+# only). A bare ``str.isdigit()`` check (the prior implementation) also
+# accepts a leading-zero string like ``"007"`` and certain non-ASCII
+# Unicode-digit characters ``int()`` cannot always parse identically -- never
+# a canonical GitHub REST resource id.
+_CANONICAL_CHECK_RUN_ID_RE = re.compile(r"[1-9][0-9]*")
 
 
 class SnapshotError(RuntimeError):
@@ -258,6 +269,75 @@ def load_snapshot(path: str | Path) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Snapshot identity re-verification for a RE-LOADED snapshot (PR #2669
+# review fix_delta Blocker 1)
+# ---------------------------------------------------------------------------
+
+
+def verify_snapshot_identity(
+    snapshot: dict[str, Any],
+    *,
+    expected_repository: str,
+    expected_run_id: int,
+    expected_run_attempt: int,
+    expected_head_sha: str,
+) -> dict[str, Any]:
+    """Verify a RE-LOADED snapshot's own identity envelope (the
+    ``expected_repository`` / ``workflow_run_id`` / ``workflow_run_attempt``
+    / ``expected_head_sha`` fields ``build_snapshot`` persisted from the
+    exact-attempt identity SSOT, see ``resolve_identity``) matches the
+    caller's claimed identity via an EXACT match on all four fields.
+
+    ``build_snapshot`` already binds a snapshot's *own* identity at
+    construction time. This is a SEPARATE, later check: a snapshot that was
+    correctly built for run A/attempt A can still be loaded from disk and
+    fed to a verdict generator that is currently building evidence for run
+    B/attempt B (e.g. a stale leftover file, or a caller bug) -- because
+    every job row inside it shares the SAME head SHA, nothing about the
+    file's own JSON *content* looks wrong. Without this re-verification, a
+    consumer reading the file back has no way to tell those two situations
+    apart, and could silently relabel run A's evidence as run B's
+    ``merge_ready`` result (PR #2669 human review issuecomment-5737965265,
+    Blocker 1).
+
+    Unlike a Jobs-row's own ``run_attempt`` (optional per
+    ``_normalize_job_row`` -- a job row missing it is never rejected on that
+    basis alone), a MISSING or malformed field in the snapshot's OWN
+    identity envelope is always rejected here: this is envelope-level
+    identity, not optional per-job metadata.
+    """
+    repository = snapshot.get("expected_repository")
+    run_id = snapshot.get("workflow_run_id")
+    run_attempt = snapshot.get("workflow_run_attempt")
+    head_sha = snapshot.get("expected_head_sha")
+
+    if not isinstance(repository, str) or not repository:
+        raise SnapshotError("snapshot_identity_missing_repository")
+    if not isinstance(run_id, int) or isinstance(run_id, bool):
+        raise SnapshotError("snapshot_identity_missing_run_id")
+    if not isinstance(run_attempt, int) or isinstance(run_attempt, bool):
+        raise SnapshotError("snapshot_identity_missing_run_attempt")
+    if not isinstance(head_sha, str) or not head_sha:
+        raise SnapshotError("snapshot_identity_missing_head_sha")
+
+    if repository != expected_repository:
+        raise SnapshotError("snapshot_identity_repository_mismatch")
+    if run_id != expected_run_id:
+        raise SnapshotError("snapshot_identity_run_id_mismatch")
+    if run_attempt != expected_run_attempt:
+        raise SnapshotError("snapshot_identity_run_attempt_mismatch")
+    if head_sha != expected_head_sha:
+        raise SnapshotError("snapshot_identity_head_sha_mismatch")
+
+    return {
+        "repository": repository,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": head_sha,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Lookups (AC8: duplicate job name deterministic reject)
 # ---------------------------------------------------------------------------
 
@@ -295,12 +375,9 @@ def parse_check_run_url(url: Any, *, expected_owner_repo: str) -> int:
     if not url.startswith(prefix):
         raise SnapshotError("check_run_url_wrong_host_or_repo")
     suffix = url[len(prefix) :]
-    if not suffix or not suffix.isdigit():
+    if not suffix or not _CANONICAL_CHECK_RUN_ID_RE.fullmatch(suffix):
         raise SnapshotError("check_run_url_noncanonical")
-    check_run_id = int(suffix)
-    if check_run_id <= 0:
-        raise SnapshotError("check_run_url_noncanonical")
-    return check_run_id
+    return int(suffix)
 
 
 def verify_check_run_binding(
@@ -309,14 +386,19 @@ def verify_check_run_binding(
     expected_owner_repo: str,
     dereference_fn: Callable[[int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """AC6/AC7: strict-parse ``check_run_url`` and confirm it names the SAME
-    CheckRun as this Jobs row's own ``id`` (both values identify the SAME
-    underlying GitHub object per the documented Jobs API contract -- no
-    dereference is needed in the ordinary case, AC7's "unneeded => zero
-    calls"). A single ``checks: read`` Checks API dereference call is made
-    ONLY when the URL-derived id disagrees with the job's own id (AC7's
-    "needed => exactly one call"), and the dereferenced response's own
-    ``id`` must then match BOTH the URL-derived id and the job's id.
+    """AC6/AC7: strict-parse ``check_run_url`` and return the URL-derived
+    CheckRun id as the canonical ``check_run_id`` -- never the job row's own
+    ``id`` (the Jobs API documents ``id``/``check_run_url`` as separate
+    fields; their numeric values agreeing in practice is NOT an API
+    contract this module may assume or require, PR #2669 review Blocker 2).
+
+    No dereference is needed in the ordinary case where the URL-derived id
+    already equals the job's own id (AC7's "unneeded => zero calls"). A
+    single ``checks: read`` Checks API dereference call is made ONLY when
+    they disagree (AC7's "needed => exactly one call"), and the
+    dereferenced response's own ``id`` is checked ONLY against the
+    URL-derived id -- job-id agreement is never required for the
+    dereferenced response to be accepted.
     """
     job_id = job_row.get("id")
     if not isinstance(job_id, int) or isinstance(job_id, bool):
@@ -336,7 +418,7 @@ def verify_check_run_binding(
     if not isinstance(response, dict):
         raise SnapshotError("check_run_dereference_invalid_response")
     response_id = response.get("id")
-    if response_id != url_check_run_id or response_id != job_id:
+    if response_id != url_check_run_id:
         raise SnapshotError("check_run_dereference_id_mismatch")
     return {"check_run_id": response_id, "dereferenced": True}
 
@@ -353,6 +435,7 @@ def job_snapshot_to_raw_checks(
     *,
     workflow: str = "ci",
     exclude_job_names: frozenset[str] = DEFAULT_EXCLUDED_JOB_NAMES,
+    dereference_fn: Callable[[int], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Bridge a validated job snapshot to the ``raw_checks`` shape consumed
     by ``ci_verdict_summary_v2.generate_verdict`` -- the SAME shared
@@ -363,7 +446,20 @@ def job_snapshot_to_raw_checks(
     upstream input evidence). AC8: duplicate job names anywhere in the
     snapshot (including excluded ones) are deterministically rejected,
     never silently disambiguated.
+
+    PR #2669 review fix_delta (Blocker 2): each retained row's
+    ``check_run_id`` is now the URL-derived id returned by
+    ``verify_check_run_binding`` (strict-parsed via ``parse_check_run_url``)
+    -- never a bare ``job.get("id")`` assignment that skips URL validation
+    entirely. ``dereference_fn`` is optional and, per AC7, is called AT MOST
+    once PER MISMATCHED row (never unconditionally for every job) -- pass
+    ``None`` (the default) to fail closed on any id disagreement instead of
+    dereferencing.
     """
+    expected_owner_repo = snapshot.get("expected_repository")
+    if not isinstance(expected_owner_repo, str) or not expected_owner_repo:
+        raise SnapshotError("job_snapshot_missing_expected_repository")
+
     jobs = snapshot.get("jobs", [])
     seen_names: dict[str, int] = {}
     for job in jobs:
@@ -381,6 +477,9 @@ def job_snapshot_to_raw_checks(
         name = job["name"]
         if name in exclude_job_names:
             continue
+        binding = verify_check_run_binding(
+            job, expected_owner_repo=expected_owner_repo, dereference_fn=dereference_fn
+        )
         raw_checks.append(
             {
                 "name": name,
@@ -388,7 +487,7 @@ def job_snapshot_to_raw_checks(
                 "status": job.get("status"),
                 "conclusion": job.get("conclusion"),
                 "head_sha": job.get("head_sha"),
-                "check_run_id": job.get("id"),
+                "check_run_id": binding["check_run_id"],
                 "check_run_url": job.get("check_run_url"),
                 "provenance": "github_actions_job_api",
             }
@@ -396,6 +495,100 @@ def job_snapshot_to_raw_checks(
     if not raw_checks:
         raise SnapshotError("job_snapshot_no_current_workflow_evidence")
     return raw_checks
+
+
+# ---------------------------------------------------------------------------
+# ci_runtime_baseline_v1 gate-ready-latency measurement (PR #2669 review
+# fix_delta Blocker 3: Issue #2631 AC4)
+# ---------------------------------------------------------------------------
+
+
+def compute_gate_ready_latency_artifact(
+    snapshot: dict[str, Any],
+    *,
+    job_name: str,
+    run_id: str,
+    run_attempt: str,
+    head_sha: str,
+    merge_sha: str,
+) -> dict[str, Any]:
+    """Compute the ``ci_runtime_baseline_v1`` gate-ready-latency artifact for
+    ``job_name`` from the SAME immutable Jobs snapshot already acquired for
+    this job -- never a second independent API fetch.
+
+    This is a pure, deterministic, NEVER-RAISING function (AC4): an
+    unresolvable/ambiguous job name, a missing/malformed timestamp, a
+    timestamp that fails ISO-8601 parsing, and a negative computed latency
+    (``completed_at`` before ``run_started_at``, e.g. from a stale snapshot)
+    are ALL recorded as a diagnostic-only ``gate_ready_latency_omitted_reason``
+    string field -- NEVER as a raised exception, and NEVER as a fabricated
+    or negative ``gate_ready_latency_ms``. This auxiliary measurement must
+    never escalate to a required-job failure or abort the artifact write
+    that follows it (PR #2669 human review issuecomment-5737965265,
+    Blocker 3) -- callers MUST always write the returned artifact and MUST
+    NOT let this function's internal ``except`` branches propagate.
+    """
+    artifact: dict[str, Any] = {
+        "schema": "ci_runtime_baseline_v1",
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": head_sha,
+        "merge_sha": merge_sha,
+        "job": job_name,
+        "run_started_at": None,
+        "measurements": [],
+    }
+
+    run_started_at_raw = snapshot.get("run_started_at")
+    if not isinstance(run_started_at_raw, str) or not run_started_at_raw:
+        artifact["gate_ready_latency_omitted_reason"] = "snapshot_missing_run_started_at"
+        return artifact
+    artifact["run_started_at"] = run_started_at_raw
+
+    try:
+        run_started_at = datetime.fromisoformat(run_started_at_raw.replace("Z", "+00:00"))
+    except ValueError:
+        artifact["gate_ready_latency_omitted_reason"] = "run_started_at_parse_failed"
+        return artifact
+
+    try:
+        target_job = resolve_unique_job(snapshot, job_name)
+    except SnapshotError as exc:
+        # AC4/AC8: a missing or ambiguous (duplicate-name) job is NEVER
+        # fabricated into a latency value -- this run is simply excluded
+        # from the gate-ready-latency cohort (diagnostic-only).
+        artifact["gate_ready_latency_omitted_reason"] = f"job_not_uniquely_resolvable:{exc}"
+        return artifact
+
+    if target_job.get("status") != "completed":
+        artifact["gate_ready_latency_omitted_reason"] = "job_not_completed"
+        return artifact
+
+    completed_at_raw = target_job.get("completed_at")
+    if not isinstance(completed_at_raw, str) or not completed_at_raw:
+        artifact["gate_ready_latency_omitted_reason"] = "job_missing_completed_at"
+        return artifact
+
+    try:
+        completed_at = datetime.fromisoformat(completed_at_raw.replace("Z", "+00:00"))
+    except ValueError:
+        artifact["gate_ready_latency_omitted_reason"] = "completed_at_parse_failed"
+        return artifact
+
+    latency_ms = int((completed_at - run_started_at).total_seconds() * 1000)
+    if latency_ms < 0:
+        # Attempt membership (run_attempt) is never re-derived from this
+        # comparison -- a negative delta only ever omits the measurement
+        # (Issue #2631 contract: never add a physical-rerun/started_at
+        # provenance condition here).
+        artifact["gate_ready_latency_omitted_reason"] = (
+            "negative_latency_completed_before_run_started"
+        )
+        return artifact
+
+    artifact["gate_ready_latency_ms"] = latency_ms
+    artifact["gate_ready_at"] = completed_at_raw
+    return artifact
 
 
 # ---------------------------------------------------------------------------

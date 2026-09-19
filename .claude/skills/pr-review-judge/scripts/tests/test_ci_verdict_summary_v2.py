@@ -577,7 +577,13 @@ class TestOrdinaryPrDispatchOnlyExcludedClassification:
     ):
         job = _job_row(name, job_id=24_333, status="completed", conclusion="skipped")
         snapshot_path = _build_job_snapshot_file(cjs, tmp_path, [job])
-        raw_checks = v2.job_snapshot_file_to_raw_checks(str(snapshot_path))
+        raw_checks = v2.job_snapshot_file_to_raw_checks(
+            str(snapshot_path),
+            expected_repository="owner/repo",
+            expected_run_id=555,
+            expected_run_attempt=1,
+            expected_head_sha=EXPECTED_SHA,
+        )
         checks = _all_other_required_checks_passing()
         checks.extend(raw_checks)
         artifact = build(v2, checks)
@@ -940,14 +946,97 @@ class TestP0RealJobApiEvidence:
         ]
         jobs = [_job_row(name, job_id=1000 + i) for i, name in enumerate(names)]
         snapshot_path = _build_job_snapshot_file(cjs, tmp_path, jobs)
-        raw_checks = v2.job_snapshot_file_to_raw_checks(str(snapshot_path))
-        artifact = build(v2, raw_checks)
+        raw_checks = v2.job_snapshot_file_to_raw_checks(
+            str(snapshot_path),
+            expected_repository="owner/repo",
+            expected_run_id=555,
+            expected_run_attempt=1,
+            expected_head_sha=EXPECTED_SHA,
+        )
+        # PR #2669 review fix_delta: the artifact's OWN
+        # repository/workflow_run_id/workflow_run_attempt must be the SAME
+        # identity just verified above against the snapshot (production
+        # main() passes the identical CLI-derived values to both calls) --
+        # not the unrelated defaults build() hardcodes.
+        artifact = v2.generate_verdict(
+            expected_head_sha=EXPECTED_SHA,
+            pr_head_sha=EXPECTED_SHA,
+            repository="owner/repo",
+            workflow_run_id=555,
+            workflow_run_attempt=1,
+            event_name="pull_request",
+            raw_checks=raw_checks,
+        )
         assert artifact["overall_status"] == "merge_ready", artifact
+        assert artifact["workflow_run_id"] == 555
+        assert artifact["workflow_run_attempt"] == 1
         assert all(check["head_sha"] == EXPECTED_SHA for check in artifact["checks"])
         assert [check["check_run_id"] for check in artifact["checks"]] == [
             row["check_run_id"] for row in raw_checks
         ]
         assert all(check["provenance"] == "github_actions_job_api" for check in artifact["checks"])
+
+    def test_snapshot_from_a_different_run_id_is_rejected_not_relabeled(self, v2, cjs, tmp_path):
+        """PR #2669 human review (issuecomment-5737965265) Blocker 1: a
+        snapshot legitimately built for run 555 must be REJECTED -- never
+        silently relabeled as evidence for a caller currently claiming a
+        DIFFERENT run (1), even though every job row shares the same head
+        SHA."""
+        job = _job_row("typecheck", job_id=1)
+        snapshot_path = _build_job_snapshot_file(cjs, tmp_path, [job], run_id=555)
+        with pytest.raises(ValueError, match="snapshot_identity_run_id_mismatch"):
+            v2.job_snapshot_file_to_raw_checks(
+                str(snapshot_path),
+                expected_repository="owner/repo",
+                expected_run_id=1,
+                expected_run_attempt=1,
+                expected_head_sha=EXPECTED_SHA,
+            )
+
+    def test_snapshot_from_a_different_attempt_is_rejected_not_relabeled(self, v2, cjs, tmp_path):
+        job = _job_row("typecheck", job_id=1, run_attempt=2)
+        snapshot_path = _build_job_snapshot_file(cjs, tmp_path, [job], run_attempt=2)
+        with pytest.raises(ValueError, match="snapshot_identity_run_attempt_mismatch"):
+            v2.job_snapshot_file_to_raw_checks(
+                str(snapshot_path),
+                expected_repository="owner/repo",
+                expected_run_id=555,
+                expected_run_attempt=1,
+                expected_head_sha=EXPECTED_SHA,
+            )
+
+    def test_snapshot_envelope_missing_attempt_is_rejected(self, v2, cjs, tmp_path):
+        """The snapshot's OWN identity envelope (unlike a job row's optional
+        ``run_attempt``) is never treated as a don't-care when absent."""
+        job = _job_row("typecheck", job_id=1)
+        snapshot_path = _build_job_snapshot_file(cjs, tmp_path, [job])
+        tampered = json.loads(snapshot_path.read_text())
+        del tampered["workflow_run_attempt"]
+        snapshot_path.write_text(json.dumps(tampered))
+        with pytest.raises(ValueError, match="snapshot_identity_missing_run_attempt"):
+            v2.job_snapshot_file_to_raw_checks(
+                str(snapshot_path),
+                expected_repository="owner/repo",
+                expected_run_id=555,
+                expected_run_attempt=1,
+                expected_head_sha=EXPECTED_SHA,
+            )
+
+    def test_job_row_missing_attempt_is_still_accepted_when_envelope_matches(
+        self, v2, cjs, tmp_path
+    ):
+        """A job row's OWN ``run_attempt`` is optional (AC2) -- only the
+        snapshot's envelope-level identity is a hard requirement."""
+        job = _job_row("typecheck", job_id=1, run_attempt=None)
+        snapshot_path = _build_job_snapshot_file(cjs, tmp_path, [job])
+        raw_checks = v2.job_snapshot_file_to_raw_checks(
+            str(snapshot_path),
+            expected_repository="owner/repo",
+            expected_run_id=555,
+            expected_run_attempt=1,
+            expected_head_sha=EXPECTED_SHA,
+        )
+        assert raw_checks[0]["name"] == "typecheck"
 
     def test_required_check_without_check_run_id_blocks_merge_ready(self, v2):
         raw = make_check("typecheck")
@@ -1000,7 +1089,13 @@ class TestP0RealJobApiEvidence:
         jobs = [_job_row("typecheck", job_id=1), _job_row("typecheck", job_id=2)]
         snapshot_path = _build_job_snapshot_file(cjs, tmp_path, jobs)
         with pytest.raises(ValueError, match="duplicate_job_name"):
-            v2.job_snapshot_file_to_raw_checks(str(snapshot_path))
+            v2.job_snapshot_file_to_raw_checks(
+                str(snapshot_path),
+                expected_repository="owner/repo",
+                expected_run_id=555,
+                expected_run_attempt=1,
+                expected_head_sha=EXPECTED_SHA,
+            )
 
     def test_cli_rejects_malformed_job_snapshot_payload(self, v2, tmp_path):
         source = tmp_path / "ci_job_snapshot.json"
@@ -1193,7 +1288,13 @@ class TestP0_1AllRealCiJobsClassified:
             for name in names
         ]
         snapshot_path = _build_job_snapshot_file(cjs, tmp_path, jobs, run_id=run_id)
-        raw_checks = v2.job_snapshot_file_to_raw_checks(str(snapshot_path))
+        raw_checks = v2.job_snapshot_file_to_raw_checks(
+            str(snapshot_path),
+            expected_repository="owner/repo",
+            expected_run_id=run_id,
+            expected_run_attempt=1,
+            expected_head_sha=EXPECTED_SHA,
+        )
         artifact = build(v2, raw_checks)
         assert artifact["overall_status"] == "merge_ready", artifact
         assert not any(c["failure_reason"] == "gh_error" for c in artifact["checks"]), artifact["checks"]
@@ -1225,7 +1326,13 @@ class TestIssue2631SharedHelperIntegration:
         snapshot_path = _build_job_snapshot_file(cjs, tmp_path, [job])
         loaded = cjs.load_snapshot(str(snapshot_path))
         expected = cjs.job_snapshot_to_raw_checks(loaded)
-        actual = v2.job_snapshot_file_to_raw_checks(str(snapshot_path))
+        actual = v2.job_snapshot_file_to_raw_checks(
+            str(snapshot_path),
+            expected_repository="owner/repo",
+            expected_run_id=555,
+            expected_run_attempt=1,
+            expected_head_sha=EXPECTED_SHA,
+        )
         assert actual == expected
 
     def test_job_snapshot_bridge_raises_on_shared_helper_schema_violation(self, v2, tmp_path):
@@ -1235,7 +1342,13 @@ class TestIssue2631SharedHelperIntegration:
         source = tmp_path / "ci_job_snapshot.json"
         source.write_text(json.dumps({"schema": "not_ci_job_snapshot_v1", "jobs": []}))
         with pytest.raises(ValueError, match="snapshot_schema_mismatch"):
-            v2.job_snapshot_file_to_raw_checks(str(source))
+            v2.job_snapshot_file_to_raw_checks(
+                str(source),
+                expected_repository="owner/repo",
+                expected_run_id=555,
+                expected_run_attempt=1,
+                expected_head_sha=EXPECTED_SHA,
+            )
 
     def test_conditional_excluded_tuples_reference_new_job_api_provenance(self, v2):
         assert v2.EXACT_CHECK_RUN_PROVENANCE == "github_actions_job_api"

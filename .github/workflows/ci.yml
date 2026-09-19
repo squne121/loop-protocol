@@ -2361,6 +2361,15 @@ jobs:
       # `run_started_at` (both authoritative GitHub API timestamps, not
       # self-measured wall-clock deltas).
       - name: Record gate-ready latency (ci_runtime_baseline_v1)
+        # PR #2669 review fix_delta (Blocker 3, Issue #2631 AC4): this step
+        # computes the measurement via the shared, NEVER-RAISING
+        # ``ci_job_snapshot.compute_gate_ready_latency_artifact`` helper --
+        # an unparseable timestamp, a not-yet-completed job, or a negative
+        # (stale-snapshot) delta is recorded as a diagnostic-only
+        # ``gate_ready_latency_omitted_reason``, never an unhandled
+        # exception that would abort this step (and, transitively, the
+        # required ``if-no-files-found: error`` upload step below) or a
+        # fabricated/negative ``gate_ready_latency_ms``.
         if: ${{ !cancelled() }}
         env:
           GH_RUN_ID: ${{ github.run_id }}
@@ -2372,44 +2381,26 @@ jobs:
           mkdir -p ci_runtime_baseline_artifacts
           uv run --locked python3 - <<'PY'
           import json, os, pathlib, sys
-          from datetime import datetime, timezone
 
           sys.path.insert(0, "scripts/ci")
           import ci_job_snapshot  # noqa: E402
 
           snapshot = ci_job_snapshot.load_snapshot("ci_job_snapshot.json")
-          run_started_at_raw = snapshot["run_started_at"]
-          run_started_at = datetime.fromisoformat(run_started_at_raw.replace("Z", "+00:00"))
-
-          artifact = {
-              "schema": "ci_runtime_baseline_v1",
-              "run_id": os.environ["GH_RUN_ID"],
-              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
-              "head_sha": os.environ["GH_HEAD_SHA"],
-              "merge_sha": os.environ["GH_SHA"],
-              "job": "e2e",
-              "run_started_at": run_started_at_raw,
-              "measurements": [],
-          }
-
-          try:
-              e2e_job = ci_job_snapshot.resolve_unique_job(snapshot, "e2e")
-          except ci_job_snapshot.SnapshotError as exc:
-              # AC4/AC8: a missing or ambiguous (duplicate-name) "e2e" job is
-              # NEVER fabricated into a latency value.
-              e2e_job = None
-              print(f"'e2e' job not uniquely resolvable in snapshot: {exc}; gate_ready_latency_ms omitted")
-
-          if e2e_job is not None and e2e_job.get("status") == "completed" and e2e_job.get("completed_at"):
-              completed_at = datetime.fromisoformat(
-                  e2e_job["completed_at"].replace("Z", "+00:00")
+          artifact = ci_job_snapshot.compute_gate_ready_latency_artifact(
+              snapshot,
+              job_name="e2e",
+              run_id=os.environ["GH_RUN_ID"],
+              run_attempt=os.environ["GH_RUN_ATTEMPT"],
+              head_sha=os.environ["GH_HEAD_SHA"],
+              merge_sha=os.environ["GH_SHA"],
+          )
+          if "gate_ready_latency_ms" in artifact:
+              print(f"gate_ready_latency_ms={artifact['gate_ready_latency_ms']}")
+          else:
+              print(
+                  "gate_ready_latency_ms omitted: "
+                  f"{artifact.get('gate_ready_latency_omitted_reason')}"
               )
-              gate_ready_latency_ms = int((completed_at - run_started_at).total_seconds() * 1000)
-              artifact["gate_ready_latency_ms"] = gate_ready_latency_ms
-              artifact["gate_ready_at"] = e2e_job["completed_at"]
-              print(f"gate_ready_latency_ms={gate_ready_latency_ms}")
-          elif e2e_job is not None:
-              print("'e2e' job not completed at snapshot time; gate_ready_latency_ms omitted")
 
           out = pathlib.Path("ci_runtime_baseline_artifacts") / "ci_runtime_baseline_v1_e2e.json"
           out.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
@@ -5178,6 +5169,14 @@ jobs:
         # fetch. run_started_at is the snapshot's own identity-SSOT field
         # (from the exact-attempt endpoint) -- no separate `gh api
         # actions/runs/{id}` call is needed for it any more.
+        # PR #2669 review fix_delta (Blocker 3): computed via the shared,
+        # NEVER-RAISING ``ci_job_snapshot.compute_gate_ready_latency_artifact``
+        # helper -- an unparseable timestamp, a not-yet-completed job, or a
+        # negative (stale-snapshot) delta is recorded as a diagnostic-only
+        # ``gate_ready_latency_omitted_reason``, never an unhandled
+        # exception that would abort this step (and, transitively, the
+        # required ``if-no-files-found: error`` upload step below) or a
+        # fabricated/negative ``gate_ready_latency_ms``.
         if: ${{ !cancelled() }}
         env:
           GH_RUN_ID: ${{ github.run_id }}
@@ -5189,46 +5188,26 @@ jobs:
           mkdir -p ci_runtime_baseline_artifacts
           uv run --locked python3 - <<'PY'
           import json, os, pathlib, sys
-          from datetime import datetime, timezone
 
           sys.path.insert(0, "scripts/ci")
           import ci_job_snapshot  # noqa: E402
 
           snapshot = ci_job_snapshot.load_snapshot("ci_job_snapshot.json")
-          run_started_at_raw = snapshot["run_started_at"]
-          run_started_at = datetime.fromisoformat(run_started_at_raw.replace("Z", "+00:00"))
-
-          artifact = {
-              "schema": "ci_runtime_baseline_v1",
-              "run_id": os.environ["GH_RUN_ID"],
-              "run_attempt": os.environ["GH_RUN_ATTEMPT"],
-              "head_sha": os.environ["GH_HEAD_SHA"],
-              "merge_sha": os.environ["GH_SHA"],
-              "job": "e2e",
-              "run_started_at": run_started_at_raw,
-              "measurements": [],
-          }
-
-          try:
-              e2e_job = ci_job_snapshot.resolve_unique_job(snapshot, "e2e")
-          except ci_job_snapshot.SnapshotError as exc:
-              # AC4: a missing or ambiguous (duplicate-name) "e2e" job is
-              # NEVER fabricated into a latency value -- this run is simply
-              # excluded from the gate-ready-latency cohort (diagnostic-only,
-              # never a required-job failure).
-              e2e_job = None
-              print(f"'e2e' job not uniquely resolvable in snapshot: {exc}; gate_ready_latency_ms omitted")
-
-          if e2e_job is not None and e2e_job.get("status") == "completed" and e2e_job.get("completed_at"):
-              completed_at = datetime.fromisoformat(
-                  e2e_job["completed_at"].replace("Z", "+00:00")
+          artifact = ci_job_snapshot.compute_gate_ready_latency_artifact(
+              snapshot,
+              job_name="e2e",
+              run_id=os.environ["GH_RUN_ID"],
+              run_attempt=os.environ["GH_RUN_ATTEMPT"],
+              head_sha=os.environ["GH_HEAD_SHA"],
+              merge_sha=os.environ["GH_SHA"],
+          )
+          if "gate_ready_latency_ms" in artifact:
+              print(f"gate_ready_latency_ms={artifact['gate_ready_latency_ms']}")
+          else:
+              print(
+                  "gate_ready_latency_ms omitted: "
+                  f"{artifact.get('gate_ready_latency_omitted_reason')}"
               )
-              gate_ready_latency_ms = int((completed_at - run_started_at).total_seconds() * 1000)
-              artifact["gate_ready_latency_ms"] = gate_ready_latency_ms
-              artifact["gate_ready_at"] = e2e_job["completed_at"]
-              print(f"gate_ready_latency_ms={gate_ready_latency_ms}")
-          elif e2e_job is not None:
-              print("'e2e' job not completed at snapshot time; gate_ready_latency_ms omitted")
 
           out = pathlib.Path("ci_runtime_baseline_artifacts") / "ci_runtime_baseline_v1_e2e.json"
           out.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")

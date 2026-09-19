@@ -430,6 +430,11 @@ class TestCheckRunUrlBinding:
             cjs.verify_check_run_binding(job, expected_owner_repo=REPOSITORY)
 
     def test_mismatched_id_is_resolved_by_exactly_one_dereference(self, cjs):
+        """PR #2669 review fix_delta Blocker 2: the job's own ``id`` (42) and
+        the URL-derived CheckRun id (99) are NOT required to be numerically
+        equal -- the Jobs API documents them as separate fields. A single
+        dereference call confirming the response's own ``id`` matches the
+        URL-derived id is sufficient; job-id agreement is never required."""
         job = _job_row("python-test-core", job_id=42)
         job["check_run_url"] = f"https://api.github.com/repos/{REPOSITORY}/check-runs/99"
         calls: list[int] = []
@@ -438,11 +443,32 @@ class TestCheckRunUrlBinding:
             calls.append(check_run_id)
             return {"id": 99}
 
+        result = cjs.verify_check_run_binding(
+            job, expected_owner_repo=REPOSITORY, dereference_fn=dereference_fn
+        )
+        assert result == {"check_run_id": 99, "dereferenced": True}
+        assert calls == [99]
+
+    def test_dereference_response_id_disagreeing_with_url_is_rejected(self, cjs):
+        """The dereferenced response's own ``id`` must match the URL-derived
+        id -- a response for a DIFFERENT CheckRun is never accepted even if
+        the dereference call itself succeeded."""
+        job = _job_row("python-test-core", job_id=42)
+        job["check_run_url"] = f"https://api.github.com/repos/{REPOSITORY}/check-runs/99"
+
+        def dereference_fn(check_run_id: int) -> dict:
+            return {"id": 12345}
+
         with pytest.raises(cjs.SnapshotError, match="check_run_dereference_id_mismatch"):
             cjs.verify_check_run_binding(
                 job, expected_owner_repo=REPOSITORY, dereference_fn=dereference_fn
             )
-        assert calls == [99]
+
+    def test_leading_zero_check_run_id_is_rejected_as_noncanonical(self, cjs):
+        job = _job_row("python-test-core", job_id=42)
+        job["check_run_url"] = f"https://api.github.com/repos/{REPOSITORY}/check-runs/042"
+        with pytest.raises(cjs.SnapshotError, match="check_run_url_noncanonical"):
+            cjs.verify_check_run_binding(job, expected_owner_repo=REPOSITORY)
 
 
 class TestCli:
@@ -590,3 +616,164 @@ class TestCli:
         assert proc.returncode == 3
         payload = json.loads(proc.stdout)
         assert payload["ok"] is False
+
+
+class TestGateReadyLatency:
+    """PR #2669 review fix_delta Blocker 3 (Issue #2631 AC4):
+    ``ci_job_snapshot.compute_gate_ready_latency_artifact`` must NEVER
+    raise, NEVER record a negative ``gate_ready_latency_ms``, and always
+    record a diagnostic-only reason when the measurement itself cannot be
+    computed -- an auxiliary measurement must never escalate to a
+    required-job failure."""
+
+    def _snapshot(self, cjs, *, run_started_at="2026-01-01T00:00:00Z", jobs=None):
+        return {
+            "schema": "ci_job_snapshot_v1",
+            "schema_version": 1,
+            "expected_repository": REPOSITORY,
+            "workflow_run_id": RUN_ID,
+            "workflow_run_attempt": RUN_ATTEMPT,
+            "expected_head_sha": EXPECTED_SHA,
+            "run_started_at": run_started_at,
+            "jobs": jobs if jobs is not None else [],
+        }
+
+    def test_normal_completion_yields_positive_latency(self, cjs):
+        snapshot = self._snapshot(
+            cjs,
+            jobs=[
+                _job_row(
+                    "e2e",
+                    job_id=1,
+                    status="completed",
+                    conclusion="success",
+                )
+            ],
+        )
+        # _job_row's completed_at is "2026-01-01T00:05:00Z" (5 minutes after
+        # this snapshot's run_started_at).
+        artifact = cjs.compute_gate_ready_latency_artifact(
+            snapshot,
+            job_name="e2e",
+            run_id="123",
+            run_attempt="1",
+            head_sha=EXPECTED_SHA,
+            merge_sha=EXPECTED_SHA,
+        )
+        assert artifact["gate_ready_latency_ms"] == 5 * 60 * 1000
+        assert "gate_ready_latency_omitted_reason" not in artifact
+        assert artifact["gate_ready_at"] == "2026-01-01T00:05:00Z"
+
+    def test_negative_delta_is_omitted_not_recorded(self, cjs):
+        """completed_at BEFORE run_started_at (e.g. a stale snapshot) must
+        never produce a negative gate_ready_latency_ms."""
+        job = _job_row("e2e", job_id=1, status="completed")
+        job["completed_at"] = "1999-01-01T00:00:00Z"
+        snapshot = self._snapshot(cjs, jobs=[job])
+        artifact = cjs.compute_gate_ready_latency_artifact(
+            snapshot,
+            job_name="e2e",
+            run_id="123",
+            run_attempt="1",
+            head_sha=EXPECTED_SHA,
+            merge_sha=EXPECTED_SHA,
+        )
+        assert "gate_ready_latency_ms" not in artifact
+        assert (
+            artifact["gate_ready_latency_omitted_reason"]
+            == "negative_latency_completed_before_run_started"
+        )
+
+    def test_malformed_run_started_at_never_raises(self, cjs):
+        snapshot = self._snapshot(cjs, run_started_at="not-a-timestamp")
+        artifact = cjs.compute_gate_ready_latency_artifact(
+            snapshot,
+            job_name="e2e",
+            run_id="123",
+            run_attempt="1",
+            head_sha=EXPECTED_SHA,
+            merge_sha=EXPECTED_SHA,
+        )
+        assert "gate_ready_latency_ms" not in artifact
+        assert artifact["gate_ready_latency_omitted_reason"] == "run_started_at_parse_failed"
+
+    def test_malformed_completed_at_never_raises(self, cjs):
+        job = _job_row("e2e", job_id=1, status="completed")
+        job["completed_at"] = "not-a-timestamp"
+        snapshot = self._snapshot(cjs, jobs=[job])
+        artifact = cjs.compute_gate_ready_latency_artifact(
+            snapshot,
+            job_name="e2e",
+            run_id="123",
+            run_attempt="1",
+            head_sha=EXPECTED_SHA,
+            merge_sha=EXPECTED_SHA,
+        )
+        assert "gate_ready_latency_ms" not in artifact
+        assert artifact["gate_ready_latency_omitted_reason"] == "completed_at_parse_failed"
+
+    def test_job_not_uniquely_resolvable_is_omitted_not_raised(self, cjs):
+        snapshot = self._snapshot(cjs, jobs=[])
+        artifact = cjs.compute_gate_ready_latency_artifact(
+            snapshot,
+            job_name="e2e",
+            run_id="123",
+            run_attempt="1",
+            head_sha=EXPECTED_SHA,
+            merge_sha=EXPECTED_SHA,
+        )
+        assert "gate_ready_latency_ms" not in artifact
+        assert artifact["gate_ready_latency_omitted_reason"].startswith(
+            "job_not_uniquely_resolvable:"
+        )
+
+    def test_duplicate_job_name_is_omitted_not_raised(self, cjs):
+        snapshot = self._snapshot(
+            cjs,
+            jobs=[
+                _job_row("e2e", job_id=1, status="completed"),
+                _job_row("e2e", job_id=2, status="completed"),
+            ],
+        )
+        artifact = cjs.compute_gate_ready_latency_artifact(
+            snapshot,
+            job_name="e2e",
+            run_id="123",
+            run_attempt="1",
+            head_sha=EXPECTED_SHA,
+            merge_sha=EXPECTED_SHA,
+        )
+        assert "gate_ready_latency_ms" not in artifact
+        assert artifact["gate_ready_latency_omitted_reason"].startswith(
+            "job_not_uniquely_resolvable:"
+        )
+
+    def test_job_not_completed_is_omitted_not_raised(self, cjs):
+        job = _job_row("e2e", job_id=1, status="in_progress", conclusion=None)
+        job["completed_at"] = None
+        snapshot = self._snapshot(cjs, jobs=[job])
+        artifact = cjs.compute_gate_ready_latency_artifact(
+            snapshot,
+            job_name="e2e",
+            run_id="123",
+            run_attempt="1",
+            head_sha=EXPECTED_SHA,
+            merge_sha=EXPECTED_SHA,
+        )
+        assert "gate_ready_latency_ms" not in artifact
+        assert artifact["gate_ready_latency_omitted_reason"] == "job_not_completed"
+
+    def test_missing_completed_at_is_omitted_not_raised(self, cjs):
+        job = _job_row("e2e", job_id=1, status="completed")
+        job["completed_at"] = None
+        snapshot = self._snapshot(cjs, jobs=[job])
+        artifact = cjs.compute_gate_ready_latency_artifact(
+            snapshot,
+            job_name="e2e",
+            run_id="123",
+            run_attempt="1",
+            head_sha=EXPECTED_SHA,
+            merge_sha=EXPECTED_SHA,
+        )
+        assert "gate_ready_latency_ms" not in artifact
+        assert artifact["gate_ready_latency_omitted_reason"] == "job_missing_completed_at"

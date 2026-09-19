@@ -741,23 +741,47 @@ def check_runs_api_to_raw_checks(
 def job_snapshot_file_to_raw_checks(
     job_snapshot_path: str,
     *,
+    expected_repository: str,
+    expected_run_id: int,
+    expected_run_attempt: int,
+    expected_head_sha: str,
     workflow: str = "ci",
 ) -> list[dict[str, Any]]:
     """Load an attempt-scoped ``ci_job_snapshot_v1`` file (Issue #2631) and
     bridge it to the ``raw_checks`` shape ``generate_verdict`` consumes.
 
-    Delegates ALL identity/normalization/duplicate-name semantics to the
-    shared helper (``scripts/ci/ci_job_snapshot.py``) -- the SAME helper
-    ``scripts/ci/verify_ci_check_conclusions.py`` uses, so both consumers
-    reach identical conclusions from the SAME snapshot (no independent
-    re-fetch, AC1/AC2/AC3). Raises ``ValueError`` (wrapping the shared
-    helper's ``SnapshotError``) on any structural or identity violation --
-    the former commit-scoped CheckRuns acquisition and its
-    ``details_url`` substring heuristic are retired entirely.
+    PR #2669 review fix_delta (Blocker 1): before ANY Jobs row is converted
+    to evidence, the RE-LOADED snapshot's own identity envelope is verified
+    via the shared helper's ``verify_snapshot_identity`` against the SAME
+    ``expected_repository`` / ``expected_run_id`` / ``expected_run_attempt``
+    / ``expected_head_sha`` the caller is about to stamp on the resulting
+    verdict artifact (``main()`` passes the identical CLI-derived values to
+    both this function and ``generate_verdict``). Without this, a snapshot
+    legitimately built for a DIFFERENT run/attempt could be silently
+    relabeled as evidence for the caller's claimed run purely because they
+    share a head SHA -- this call makes that structurally impossible: a
+    mismatch raises before any Jobs row is even looked at.
+
+    Delegates ALL identity/normalization/duplicate-name/CheckRun-binding
+    semantics to the shared helper (``scripts/ci/ci_job_snapshot.py``) --
+    the SAME helper ``scripts/ci/verify_ci_check_conclusions.py`` uses, so
+    both consumers reach identical conclusions from the SAME snapshot (no
+    independent re-fetch, AC1/AC2/AC3). Raises ``ValueError`` (wrapping the
+    shared helper's ``SnapshotError``) on any structural, identity, or
+    CheckRun-binding violation -- the former commit-scoped CheckRuns
+    acquisition and its ``details_url`` substring heuristic are retired
+    entirely.
     """
     ci_job_snapshot = _load_ci_job_snapshot_module()
     try:
         snapshot = ci_job_snapshot.load_snapshot(job_snapshot_path)
+        ci_job_snapshot.verify_snapshot_identity(
+            snapshot,
+            expected_repository=expected_repository,
+            expected_run_id=expected_run_id,
+            expected_run_attempt=expected_run_attempt,
+            expected_head_sha=expected_head_sha,
+        )
         return ci_job_snapshot.job_snapshot_to_raw_checks(snapshot, workflow=workflow)
     except ci_job_snapshot.SnapshotError as exc:
         raise ValueError(str(exc)) from exc
@@ -806,7 +830,19 @@ def main(argv: list[str] | None = None) -> int:
         raw_checks = needs_json_to_raw_checks(needs_map)
     elif args.job_snapshot_json:
         try:
-            raw_checks = job_snapshot_file_to_raw_checks(args.job_snapshot_json)
+            # PR #2669 review fix_delta Blocker 1: the SAME repository/run/
+            # attempt/head-sha values used below for generate_verdict()'s
+            # own artifact identity are passed here so the snapshot's own
+            # identity envelope is verified against them BEFORE any Jobs
+            # row is converted to evidence -- see
+            # job_snapshot_file_to_raw_checks's docstring.
+            raw_checks = job_snapshot_file_to_raw_checks(
+                args.job_snapshot_json,
+                expected_repository=args.repository,
+                expected_run_id=args.workflow_run_id,
+                expected_run_attempt=args.workflow_run_attempt,
+                expected_head_sha=args.expected_head_sha,
+            )
         except (OSError, json.JSONDecodeError, ValueError) as e:
             print(f"ERROR: Failed to load attempt-scoped job snapshot evidence: {e}", file=sys.stderr)
             return 1
