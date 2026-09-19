@@ -486,6 +486,7 @@ def _poll_for_created_issue(
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     delays: tuple[float, ...] = _DEFAULT_RACE_DETECTION_DELAYS,
     sleep_fn: Callable[[float], None] = time.sleep,
+    skip_internal_title_dedupe: bool = False,
 ) -> tuple[Literal["confirmed", "race", "inconclusive"], list[int]]:
     """Poll for the newly created issue, absorbing GitHub search index propagation delay.
 
@@ -496,6 +497,15 @@ def _poll_for_created_issue(
 
     Raises:
         TransactionError: if the underlying dedupe-search raises (e.g., saturation guard).
+
+    ``skip_internal_title_dedupe`` (Issue #2602 P1-1): when the caller opted into
+    ``run_transaction(skip_internal_title_dedupe=True)``, an outer dedupe_key search has
+    already confirmed "create confirmed" (AC2(g)), and a different-key/same-title OPEN
+    issue is an explicitly ALLOWED case (AC2(b)/(g)) -- it must never be misdetected as a
+    post-create race collision. When True, this title-only search is therefore used ONLY
+    to confirm the new issue itself became visible; other same-title matches are ignored
+    entirely (never downgraded to "race"). Default False preserves the exact prior
+    behaviour for every existing caller.
     """
     last_matching: list[int] = []
     for attempt in range(max_attempts):
@@ -506,6 +516,16 @@ def _poll_for_created_issue(
         # May raise TransactionError(stage="dedupe-search") for saturation — let it propagate.
         matching = _find_open_issues_by_title(repo, title, gh_bin)
         last_matching = matching
+
+        if skip_internal_title_dedupe:
+            # Title-only matching cannot be used as a collision signal here: the outer
+            # dedupe_key search is the authoritative identity check, and this script's own
+            # internal title-only dedupe was explicitly bypassed for this create. Only
+            # confirm our own issue is visible; never flag "race" from other title matches.
+            if expected_issue_number in matching:
+                return ("confirmed", matching)
+            # Not yet visible: search index hasn't propagated yet — retry.
+            continue
 
         if len(matching) == 1 and matching[0] == expected_issue_number:
             # Only our issue is visible: confirmed.
@@ -2466,7 +2486,12 @@ def run_transaction(
         )
         try:
             poll_verdict, matching_issue_numbers = _poll_for_created_issue(
-                repo, title, issue_number, gh_bin, sleep_fn=sleep_fn
+                repo,
+                title,
+                issue_number,
+                gh_bin,
+                sleep_fn=sleep_fn,
+                skip_internal_title_dedupe=skip_internal_title_dedupe,
             )
         except TransactionError as exc:
             if exc.stage == "dedupe-search":

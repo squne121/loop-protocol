@@ -34,6 +34,8 @@ import json
 import re
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
@@ -676,12 +678,65 @@ def _fetch_subissues_actual(
         )
 
 
-def _search_dedupe_candidates(
-    repo: str, dedupe_key: str, gh_bin: str = "gh"
-) -> list[dict]:
-    """Search for existing issues matching a dedupe_key in all states.
+# ---------------------------------------------------------------------------
+# Dedupe search result-mode companion (Issue #2602 P1-3).
+#
+# _search_dedupe_candidates() below is reused, unmodified in its own
+# signature/behaviour for every existing caller (_classify_child() and the
+# retrospective_candidate_handoff.py legacy search_fn test seam): it still
+# always returns a plain list and never raises. It is now a thin wrapper
+# around _search_dedupe_candidates_with_outcome(), which is the minimal,
+# backward-compatible companion result contract this Issue's fix-delta adds
+# so that a caller which MUST distinguish "no duplicate found" from
+# "couldn't determine" (retrospective_candidate_handoff.py's
+# readback_dedupe_matches()) never has to convert search failure / result
+# truncation into a false "no duplicate -> create" decision.
+# ---------------------------------------------------------------------------
 
-    Returns a list of candidate dicts (may be empty).
+_DEDUPE_SEARCH_INITIAL_LIMIT = 10
+# Bounded second-page size used only to try to resolve an initial-page
+# saturation (Issue #2602 P1-3: "fetch additional pages if possible to
+# resolve it"). `gh issue list --search` does not expose a raw
+# cursor/page argument, so re-querying with a wider --limit is the
+# available resolution mechanism; if the widened query is ALSO saturated
+# the result is reported as genuinely indeterminate rather than guessed at.
+_DEDUPE_SEARCH_EXPANDED_LIMIT = 100
+# Bounded retry for transient command/parse failures only (not for
+# resolving truncation -- see _DEDUPE_SEARCH_EXPANDED_LIMIT above).
+_DEDUPE_SEARCH_TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+
+
+@dataclass(frozen=True)
+class DedupeSearchOutcome:
+    """Result-mode companion to `_search_dedupe_candidates()` (Issue #2602 P1-3).
+
+    mode:
+      "complete"  — the search succeeded and the returned candidates are the
+                    full result set (not truncated by the page-size limit).
+      "failure"   — the `gh` search command failed (non-zero exit) or its
+                    output could not be parsed as JSON, even after bounded
+                    retry. `candidates` is always [] in this mode.
+      "truncated" — the search succeeded but the result count met or
+                    exceeded the requested page limit even after the bounded
+                    page-expansion retry; completeness cannot be guaranteed.
+                    `candidates` holds whatever was last fetched (may be a
+                    partial view) -- callers that require dedupe-identity
+                    certainty MUST NOT treat this as "no duplicate found".
+    """
+
+    mode: Literal["complete", "failure", "truncated"]
+    candidates: list[dict]
+    error: Optional[str] = None
+
+
+def _run_dedupe_search_once(
+    repo: str, dedupe_key: str, gh_bin: str, limit: int
+) -> tuple[bool, list[dict], Optional[str]]:
+    """Single (non-retried) `gh issue list --search` attempt.
+
+    Returns (ok, candidates, error). ``ok`` is False for both a non-zero `gh`
+    exit and an unparsable/non-list JSON payload; `candidates` is always []
+    when ``ok`` is False.
     """
     args = [
         gh_bin,
@@ -696,15 +751,84 @@ def _search_dedupe_candidates(
         "--json",
         "number,title,state,url",
         "--limit",
-        "10",
+        str(limit),
     ]
     cp = subprocess.run(args, capture_output=True, text=True)
     if cp.returncode != 0:
-        return []
+        return False, [], (cp.stderr or cp.stdout or "gh issue list failed").strip() or "gh issue list failed"
     try:
-        return json.loads(cp.stdout.strip() or "[]")
-    except json.JSONDecodeError:
-        return []
+        data = json.loads(cp.stdout.strip() or "[]")
+    except json.JSONDecodeError as exc:
+        return False, [], f"non-json output from gh issue list: {exc}"
+    if not isinstance(data, list):
+        return False, [], "unexpected non-list JSON response from gh issue list"
+    return True, data, None
+
+
+def _search_dedupe_candidates_with_outcome(
+    repo: str,
+    dedupe_key: str,
+    gh_bin: str = "gh",
+    *,
+    initial_limit: int = _DEDUPE_SEARCH_INITIAL_LIMIT,
+    expanded_limit: int = _DEDUPE_SEARCH_EXPANDED_LIMIT,
+    retry_delays: tuple[float, ...] = _DEDUPE_SEARCH_TRANSIENT_RETRY_DELAYS,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    search_once_fn: Callable[[str, str, str, int], tuple[bool, list[dict], Optional[str]]] | None = None,
+) -> DedupeSearchOutcome:
+    """Search for existing issues matching a dedupe_key in all states,
+    reporting complete/failure/truncated as a machine-readable outcome
+    (Issue #2602 P1-3) instead of collapsing every non-success case to [].
+    """
+    run_once = search_once_fn or _run_dedupe_search_once
+
+    ok, candidates, error = run_once(repo, dedupe_key, gh_bin, initial_limit)
+    errors: list[str] = [error] if (not ok and error) else []
+    for delay in retry_delays:
+        if ok:
+            break
+        sleep_fn(delay)
+        ok, candidates, error = run_once(repo, dedupe_key, gh_bin, initial_limit)
+        if not ok and error:
+            errors.append(error)
+    if not ok:
+        return DedupeSearchOutcome(mode="failure", candidates=[], error="; ".join(errors) or None)
+
+    if len(candidates) < initial_limit:
+        return DedupeSearchOutcome(mode="complete", candidates=candidates)
+
+    # Initial page saturated: try a wider page to resolve the truncation
+    # before giving up and reporting "truncated" (indeterminate).
+    ok2, candidates2, error2 = run_once(repo, dedupe_key, gh_bin, expanded_limit)
+    errors2: list[str] = [error2] if (not ok2 and error2) else []
+    for delay in retry_delays:
+        if ok2:
+            break
+        sleep_fn(delay)
+        ok2, candidates2, error2 = run_once(repo, dedupe_key, gh_bin, expanded_limit)
+        if not ok2 and error2:
+            errors2.append(error2)
+    if not ok2:
+        # Could not resolve the truncation: indeterminate, never "complete".
+        return DedupeSearchOutcome(mode="truncated", candidates=candidates, error="; ".join(errors2) or None)
+    if len(candidates2) >= expanded_limit:
+        # Still saturated at the expanded page size: genuinely indeterminate.
+        return DedupeSearchOutcome(mode="truncated", candidates=candidates2)
+    return DedupeSearchOutcome(mode="complete", candidates=candidates2)
+
+
+def _search_dedupe_candidates(
+    repo: str, dedupe_key: str, gh_bin: str = "gh"
+) -> list[dict]:
+    """Search for existing issues matching a dedupe_key in all states.
+
+    Returns a list of candidate dicts (may be empty). Kept as a thin,
+    behaviourally-unchanged (best-effort, list-returning, never-raising)
+    wrapper for existing callers -- see _search_dedupe_candidates_with_outcome()
+    above for callers that must distinguish complete/failure/truncated
+    (Issue #2602 P1-3).
+    """
+    return _search_dedupe_candidates_with_outcome(repo, dedupe_key, gh_bin).candidates
 
 
 # ---------------------------------------------------------------------------

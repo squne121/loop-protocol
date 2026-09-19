@@ -29,6 +29,7 @@ Boundaries covered (Issue #2602 body, "## Verification Scenarios" +
 
 from __future__ import annotations
 
+import functools
 import sys
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ SCRIPT_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import retrospective_candidate_handoff as h  # noqa: E402
+import plan_child_materialization as pmc  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +414,65 @@ class TestRealCreateIssueTxnWriterIntegration:
 
 
 # ---------------------------------------------------------------------------
+# PR #2673 review P2-2 fix-delta: render_materialization_body() must use a
+# real YAML serializer (PyYAML's safe_dump()) instead of an f-string/repr(),
+# which breaks on titles containing quotes, backslashes, or YAML-significant
+# characters like colons. Round-trips render_materialization_body() output
+# through the repo's canonical mrc_contract_parser.parse_machine_readable_contract().
+# ---------------------------------------------------------------------------
+
+
+class TestYamlRoundTripSerialization:
+    @pytest.mark.parametrize(
+        "title",
+        [
+            'Fix "ready" status',
+            "Fix backslash \\ handling",
+            "Fix colon: handling",
+            'Mixed "quotes", a\\backslash, and a: colon',
+        ],
+    )
+    def test_dedupe_key_round_trips_through_real_mrc_parser_for_yaml_significant_titles(
+        self, title: str
+    ) -> None:
+        import mrc_contract_parser
+
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate(title=title)]),
+            _chatgpt_candidate(title=title),
+        )
+        body = h.render_materialization_body(candidate)
+
+        mrc_result = mrc_contract_parser.parse_machine_readable_contract(body)
+        assert mrc_result.ok, f"MRC failed to parse for title={title!r}: reason={mrc_result.reason!r}"
+        assert mrc_result.get("dedupe_key") == candidate.dedupe_key, (
+            f"round-tripped dedupe_key mismatch for title={title!r}: "
+            f"got {mrc_result.get('dedupe_key')!r}, expected {candidate.dedupe_key!r}"
+        )
+
+    def test_yaml_significant_title_body_still_passes_real_validator(self) -> None:
+        """The rendered body for a YAML-significant title must still pass the
+        real validate_issue_body.py --kind implementation gate (Blocker 2.5),
+        exactly like TestRealCreateIssueTxnWriterIntegration's plain-title
+        case."""
+        import validate_issue_body
+
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title='Fix "ready" status: with a colon'),
+        )
+        title = h.render_materialization_title(candidate)
+        body = h.render_materialization_body(candidate)
+
+        result = validate_issue_body.validate_issue_body(body, kind="implementation", title=title)
+
+        assert result.status == "pass", (
+            "rendered materialization body/title for a YAML-significant title failed "
+            f"validate_issue_body.py --kind implementation: {[(e.rule_id, e.message) for e in result.errors]}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # B2: same dedupe key / different title -> duplicate (key wins over title)
 # ---------------------------------------------------------------------------
 
@@ -424,7 +485,12 @@ class TestSameKeyDifferentTitleIsDuplicate:
         )
         # The existing issue has a DIFFERENT title, but its body contains the
         # exact dedupe_key -> must be treated as a duplicate.
-        existing_body = f'## Machine-Readable Contract\n\ndedupe_key: "{candidate.dedupe_key}"\n'
+        existing_body = (
+            "## Machine-Readable Contract\n\n"
+            "```yaml\n"
+            f'dedupe_key: "{candidate.dedupe_key}"\n'
+            "```\n"
+        )
 
         def _search(_repo: str, _key: str, _gh_bin: str) -> list[dict[str, Any]]:
             return [{"number": 42, "title": "A completely different title", "state": "OPEN", "url": "https://x/42"}]
@@ -469,8 +535,10 @@ class TestDifferentKeySameTitleIsNotDuplicate:
         # Full-text search matched issue #99 on the shared title, but its body
         # carries a DIFFERENT dedupe_key -> must NOT be treated as duplicate.
         other_body = (
-            '## Machine-Readable Contract\n\n'
+            "## Machine-Readable Contract\n\n"
+            "```yaml\n"
             'dedupe_key: "chatgpt-candidate:v1:owner/repo:issue:999:improve x"\n'
+            "```\n"
         )
 
         def _search(_repo: str, _key: str, _gh_bin: str) -> list[dict[str, Any]]:
@@ -503,6 +571,144 @@ class TestDifferentKeySameTitleIsNotDuplicate:
 
 
 # ---------------------------------------------------------------------------
+# PR #2673 review P1-2 fix-delta: exact dedupe_key comparison must not be a
+# whole-body substring test. readback_dedupe_matches() now reuses
+# mrc_contract_parser.parse_machine_readable_contract() to extract the
+# canonical MRC dedupe_key field and compares with `==`.
+# ---------------------------------------------------------------------------
+
+
+class TestExactDedupeKeyComparisonIsNotSubstring:
+    def test_requested_key_is_a_prefix_of_the_existing_key_is_not_a_duplicate(self) -> None:
+        """A longer key that merely CONTAINS the requested key as a prefix
+        must not be treated as a match under substring semantics -- only an
+        exact `==` counts."""
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Improve X"),
+        )
+        longer_key = candidate.dedupe_key + ":extra-suffix"
+        other_body = (
+            "## Machine-Readable Contract\n\n"
+            "```yaml\n"
+            f'dedupe_key: "{longer_key}"\n'
+            "```\n"
+        )
+
+        def _search(_repo: str, _key: str, _gh_bin: str) -> list[dict[str, Any]]:
+            return [{"number": 101, "title": "unrelated", "state": "OPEN", "url": "https://x/101"}]
+
+        def _detail(_repo: str, number: int, _gh_bin: str) -> dict[str, Any]:
+            return {
+                "number": 101,
+                "title": "unrelated",
+                "state": "OPEN",
+                "stateReason": None,
+                "url": "https://x/101",
+                "body": other_body,
+            }
+
+        create_fn = SpyCreateFn(issue_number=606)
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_search,
+            detail_fn=_detail,
+            create_fn=create_fn,
+        )
+
+        assert result.status == "created"
+        assert result.issue_number == 606
+        assert len(create_fn.calls) == 1
+
+    def test_requested_key_only_mentioned_in_description_section_is_not_a_duplicate(self) -> None:
+        """A body that mentions the requested dedupe_key only inside a
+        Description section (not the canonical MRC dedupe_key field) must not
+        be treated as a duplicate -- there is no valid Machine-Readable
+        Contract dedupe_key to compare against."""
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Improve X"),
+        )
+        other_body = (
+            "## Description\n\n"
+            f"See also candidate {candidate.dedupe_key} for background.\n"
+        )
+
+        def _search(_repo: str, _key: str, _gh_bin: str) -> list[dict[str, Any]]:
+            return [{"number": 102, "title": "unrelated", "state": "OPEN", "url": "https://x/102"}]
+
+        def _detail(_repo: str, number: int, _gh_bin: str) -> dict[str, Any]:
+            return {
+                "number": 102,
+                "title": "unrelated",
+                "state": "OPEN",
+                "stateReason": None,
+                "url": "https://x/102",
+                "body": other_body,
+            }
+
+        create_fn = SpyCreateFn(issue_number=707)
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_search,
+            detail_fn=_detail,
+            create_fn=create_fn,
+        )
+
+        assert result.status == "created"
+        assert result.issue_number == 707
+        assert len(create_fn.calls) == 1
+
+    def test_unrelated_field_containing_the_key_as_substring_is_not_a_duplicate(self) -> None:
+        """A completely unrelated MRC field (e.g. a free-text note) whose
+        value happens to contain the requested key as a substring must not be
+        treated as a duplicate: only the `dedupe_key` field itself, compared
+        with `==`, counts."""
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Improve X"),
+        )
+        other_body = (
+            "## Machine-Readable Contract\n\n"
+            "```yaml\n"
+            f'note: "unrelated field mentioning {candidate.dedupe_key} by accident"\n'
+            'dedupe_key: "chatgpt-candidate:v1:owner/repo:issue:999:different candidate"\n'
+            "```\n"
+        )
+
+        def _search(_repo: str, _key: str, _gh_bin: str) -> list[dict[str, Any]]:
+            return [{"number": 103, "title": "unrelated", "state": "OPEN", "url": "https://x/103"}]
+
+        def _detail(_repo: str, number: int, _gh_bin: str) -> dict[str, Any]:
+            return {
+                "number": 103,
+                "title": "unrelated",
+                "state": "OPEN",
+                "stateReason": None,
+                "url": "https://x/103",
+                "body": other_body,
+            }
+
+        create_fn = SpyCreateFn(issue_number=808)
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_search,
+            detail_fn=_detail,
+            create_fn=create_fn,
+        )
+
+        assert result.status == "created"
+        assert result.issue_number == 808
+        assert len(create_fn.calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # B4: same key / CLOSED issue -> not reopened, disposition preserved
 # ---------------------------------------------------------------------------
 
@@ -513,7 +719,12 @@ class TestSameKeyClosedIssueDispositionPreserved:
             _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
             _chatgpt_candidate(),
         )
-        closed_body = f'dedupe_key: "{candidate.dedupe_key}"\n'
+        closed_body = (
+            "## Machine-Readable Contract\n\n"
+            "```yaml\n"
+            f'dedupe_key: "{candidate.dedupe_key}"\n'
+            "```\n"
+        )
 
         def _search(_repo: str, _key: str, _gh_bin: str) -> list[dict[str, Any]]:
             return [{"number": 7, "title": "whatever", "state": "CLOSED", "url": "https://x/7"}]
@@ -543,6 +754,121 @@ class TestSameKeyClosedIssueDispositionPreserved:
         assert result.disposition == "NOT_PLANNED"
         assert len(create_fn.calls) == 0, "CLOSED duplicate must never be recreated"
         assert result.next_action is None, "CLOSED duplicate must not hand off to refinement"
+
+
+# ---------------------------------------------------------------------------
+# PR #2673 review P1-3 fix-delta: dedupe search read/search failure and
+# unresolved result truncation must never be silently converted into
+# "no duplicate found -> create". Only the `gh` I/O boundary
+# (pmc._run_dedupe_search_once, a thin subprocess.run wrapper) and the
+# sleep/time boundary (sleep_fn) are faked -- the real production
+# pmc._search_dedupe_candidates_with_outcome() decision logic is exercised
+# via readback_dedupe_matches()'s search_outcome_fn seam.
+# ---------------------------------------------------------------------------
+
+
+class TestDedupeSearchFailureAndTruncationAreIndeterminate:
+    def test_search_command_failure_is_never_converted_to_create(self) -> None:
+        def _always_fails(_repo, _dedupe_key, _gh_bin, _limit):
+            return False, [], "gh: command not found"
+
+        search_outcome_fn = functools.partial(
+            pmc._search_dedupe_candidates_with_outcome,
+            search_once_fn=_always_fails,
+            sleep_fn=lambda *_a, **_k: None,
+        )
+
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Improve X"),
+        )
+        create_fn = SpyCreateFn()
+
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_outcome_fn=search_outcome_fn,
+            detail_fn=_no_match_detail_fn,
+            create_fn=create_fn,
+        )
+
+        assert result.status == "failed"
+        assert len(create_fn.calls) == 0, "search failure must never fall through to create"
+        assert result.next_action is None
+
+    def test_unresolved_truncation_is_never_converted_to_create(self) -> None:
+        def _always_saturated(_repo, _dedupe_key, _gh_bin, limit):
+            # Always returns exactly `limit` items regardless of the
+            # requested page size, so even the bounded page-expansion retry
+            # cannot resolve the truncation.
+            return True, [{"number": n, "title": "x", "state": "OPEN", "url": ""} for n in range(limit)], None
+
+        search_outcome_fn = functools.partial(
+            pmc._search_dedupe_candidates_with_outcome,
+            search_once_fn=_always_saturated,
+            sleep_fn=lambda *_a, **_k: None,
+        )
+
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Improve X"),
+        )
+        create_fn = SpyCreateFn()
+
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_outcome_fn=search_outcome_fn,
+            detail_fn=_no_match_detail_fn,
+            create_fn=create_fn,
+        )
+
+        assert result.status == "failed"
+        assert result.search_truncated is True
+        assert len(create_fn.calls) == 0, "unresolved truncation must never fall through to create"
+
+    def test_resolvable_truncation_expands_and_completes(self) -> None:
+        """The initial page hits the saturation limit, but the widened
+        expanded-limit page resolves it (fewer items than the expanded
+        limit) -- this must be treated as complete, not indeterminate."""
+        calls: list[int] = []
+
+        def _first_page_saturated_then_resolved(_repo, _dedupe_key, _gh_bin, limit):
+            calls.append(limit)
+            if limit == pmc._DEDUPE_SEARCH_INITIAL_LIMIT:
+                return True, [{"number": n, "title": "x", "state": "OPEN", "url": ""} for n in range(limit)], None
+            # Expanded page: fewer items than the expanded limit -> complete.
+            return True, [{"number": 1, "title": "x", "state": "OPEN", "url": ""}], None
+
+        search_outcome_fn = functools.partial(
+            pmc._search_dedupe_candidates_with_outcome,
+            search_once_fn=_first_page_saturated_then_resolved,
+            sleep_fn=lambda *_a, **_k: None,
+        )
+
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Improve X"),
+        )
+        create_fn = SpyCreateFn(issue_number=909)
+
+        def _detail_never_matches(_repo: str, _number: int, _gh_bin: str) -> dict[str, Any]:
+            return {"body": "no mrc here", "state": "OPEN"}
+
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_outcome_fn=search_outcome_fn,
+            detail_fn=_detail_never_matches,
+            create_fn=create_fn,
+        )
+
+        assert calls == [pmc._DEDUPE_SEARCH_INITIAL_LIMIT, pmc._DEDUPE_SEARCH_EXPANDED_LIMIT]
+        assert result.status == "created"
+        assert len(create_fn.calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +929,194 @@ class TestDownstreamFailureRerunReusesIssue:
         assert second.status == "reused_open"
         assert second.issue_number == 88
         assert len(create_fn.calls) == 1, "rerun must not create a duplicate Issue"
+
+
+# ---------------------------------------------------------------------------
+# PR #2673 review P2-1 fix-delta: adapt_chatgpt_candidate() must preserve
+# NormalizedCandidate.blocked_by through materialization instead of
+# hardcoding dependency_issue_numbers=[] -- traced end to end: candidate
+# input -> adapter -> materialize_candidate()'s create call -> the writer's
+# actual (normalized int) dependency_issue_numbers argument.
+# ---------------------------------------------------------------------------
+
+
+class TestBlockedByPreservedThroughMaterialization:
+    def test_adapter_preserves_blocked_by_from_producer_candidate(self) -> None:
+        raw_candidate = _chatgpt_candidate(title="Improve X")
+        raw_candidate["blocked_by"] = ["#123", "#456"]
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [raw_candidate]),
+            raw_candidate,
+        )
+        assert candidate.blocked_by == ("#123", "#456")
+
+    def test_non_empty_blocked_by_survives_into_create_issue_txn_writer_arguments(self) -> None:
+        """Traces candidate input -> adapter -> materialize_candidate() ->
+        the writer's dependency_issue_numbers argument, confirming a
+        non-empty blocked_by survives with the same direction (--blocked-by,
+        never --blocking)."""
+        raw_candidate = _chatgpt_candidate(title="Improve X")
+        raw_candidate["blocked_by"] = ["#123", "#456"]
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [raw_candidate]),
+            raw_candidate,
+        )
+        create_fn = SpyCreateFn(issue_number=1234)
+
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_no_match_search_fn,
+            detail_fn=_no_match_detail_fn,
+            create_fn=create_fn,
+        )
+
+        assert result.status == "created"
+        assert len(create_fn.calls) == 1
+        assert create_fn.calls[0]["dependency_issue_numbers"] == [123, 456], (
+            "blocked_by must be normalized into plain issue-number ints and passed as "
+            "--blocked-by (dependency_issue_numbers), never --blocking (direction preserved)"
+        )
+        assert "blocking_issue_numbers" not in create_fn.calls[0] or not create_fn.calls[0].get(
+            "blocking_issue_numbers"
+        ), "blocked_by must never be inverted into the --blocking direction"
+
+    def test_empty_blocked_by_still_passes_empty_list(self) -> None:
+        """Regression guard: a candidate with no blocked_by references still
+        passes an empty list (not None), matching the writer's prior default
+        behaviour for every existing caller."""
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(),
+        )
+        create_fn = SpyCreateFn()
+
+        h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_no_match_search_fn,
+            detail_fn=_no_match_detail_fn,
+            create_fn=create_fn,
+        )
+
+        assert create_fn.calls[0]["dependency_issue_numbers"] == []
+
+    def test_agent_improvement_candidate_has_no_blocked_by_field_and_defaults_to_empty(self) -> None:
+        """agent_improvement_candidate/v1 has no blocked_by field at all;
+        NormalizedCandidate.blocked_by defaults to () for that adapter."""
+        candidate = h.adapt_agent_improvement_candidate(_agent_candidate_with_finding_contract())
+        assert candidate.blocked_by == ()
+
+
+# ---------------------------------------------------------------------------
+# PR #2673 review P2-3 fix-delta: materialize_candidate() must preserve the
+# created issue's identity and recovery context on
+# create_issue_txn.run_transaction() status="partial_failure" (issue WAS
+# created, but a downstream step failed), so a retry can readback the same
+# issue via dedupe_key instead of creating a duplicate. Exercises the REAL
+# create_issue_txn.run_transaction() writer (only its gh I/O boundary is
+# faked) -- not an idealized "create succeeded -> next search always finds
+# it" SpyCreateFn scenario.
+# ---------------------------------------------------------------------------
+
+
+class TestPartialFailureRecoveryContextPreservedForRetry:
+    def _patch_github_io_boundary_with_failing_label_readback(
+        self, monkeypatch: pytest.MonkeyPatch, *, issue_number: int, create_spy: list[int]
+    ) -> None:
+        import create_issue_txn as txn
+
+        def _spy_issue_create(*_a: Any, **_k: Any) -> str:
+            create_spy.append(issue_number)
+            return f"https://github.com/owner/repo/issues/{issue_number}"
+
+        monkeypatch.setattr(txn, "_issue_create", _spy_issue_create)
+        monkeypatch.setattr(txn, "_poll_for_created_issue", lambda *_a, **_k: ("confirmed", [issue_number]))
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        # Force a downstream (label-readback) failure -- collect-and-reconcile
+        # path: run_transaction() does NOT raise, it returns
+        # status="partial_failure" with the created issue's identity intact.
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: False)
+        monkeypatch.setattr(
+            txn,
+            "_readback_labels_with_result",
+            lambda *_a, **_k: txn.LabelReadbackResult(
+                ok=False,
+                expected_labels=["triage-required"],
+                actual_labels=[],
+                attempts=1,
+                retry_delays=[],
+                error_kind="missing_expected_labels",
+            ),
+        )
+        # Real gh I/O boundary for the partial-failure audit comment -- faked
+        # like every other test in this file that exercises a partial_failure
+        # path.
+        monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+
+    def test_downstream_failure_preserves_identity_and_retry_reuses_same_issue(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        create_spy: list[int] = []
+        self._patch_github_io_boundary_with_failing_label_readback(
+            monkeypatch, issue_number=4004, create_spy=create_spy
+        )
+
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Recover from partial failure"),
+        )
+
+        first = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_no_match_search_fn,
+            detail_fn=_no_match_detail_fn,
+            create_fn=None,  # exercises the REAL create_issue_txn.run_transaction() writer
+        )
+
+        assert first.status == "failed", f"status={first.status!r} errors={first.errors!r}"
+        assert first.issue_number == 4004, (
+            "the created issue's identity must be preserved on partial_failure so a "
+            "retry can readback it instead of creating a duplicate"
+        )
+        assert first.issue_url == "https://github.com/owner/repo/issues/4004"
+        assert first.partial_failure_stage == "label-readback"
+        assert len(create_spy) == 1
+
+        # Simulated retry: the outer dedupe_key search now finds the
+        # already-created issue #4004 via its REAL render_materialization_body()
+        # output (not an idealized fixture).
+        rendered_body = h.render_materialization_body(candidate)
+
+        def _retry_search(_repo: str, _key: str, _gh_bin: str) -> list[dict[str, Any]]:
+            return [{"number": 4004, "title": candidate.title, "state": "OPEN", "url": "https://x/4004"}]
+
+        def _retry_detail(_repo: str, number: int, _gh_bin: str) -> dict[str, Any]:
+            return {
+                "number": 4004,
+                "title": candidate.title,
+                "state": "OPEN",
+                "stateReason": None,
+                "url": "https://x/4004",
+                "body": rendered_body,
+            }
+
+        second = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_retry_search,
+            detail_fn=_retry_detail,
+            create_fn=None,
+        )
+
+        assert second.status == "reused_open"
+        assert second.issue_number == 4004
+        assert len(create_spy) == 1, "retry must not create a duplicate issue"
 
 
 # ---------------------------------------------------------------------------

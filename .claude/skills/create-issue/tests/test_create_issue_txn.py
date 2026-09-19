@@ -2754,3 +2754,113 @@ class TestSkipInternalTitleDedupe:
         )
 
         assert captured.get("skip_internal_title_dedupe") is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #2602 P1-1 fix-delta (PR #2673 human review): post-create race
+# detection must not misdetect a different-key/same-title OPEN issue as a
+# collision when skip_internal_title_dedupe=True (AC2(b)/(g) explicitly
+# allows this case). `_poll_for_created_issue()` (the real production
+# collision/race decision function) is exercised directly here -- only the
+# `gh` I/O boundary (`_find_open_issues_by_title`, `_issue_create`,
+# `_post_partial_failure_comment`) is faked, per this fix-delta's test policy.
+# ---------------------------------------------------------------------------
+
+
+class TestPostCreateRaceDetectionSkipInternalTitleDedupeInteraction:
+    def _patch_gh_io_boundary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        new_issue_number: int,
+        matching_numbers_by_call: list[list[int]],
+    ) -> list[int]:
+        call_count = [0]
+
+        def _fake_find_open_issues_by_title(_repo, _title, _gh_bin):
+            idx = call_count[0]
+            call_count[0] += 1
+            if idx < len(matching_numbers_by_call):
+                return matching_numbers_by_call[idx]
+            return matching_numbers_by_call[-1]
+
+        monkeypatch.setattr(txn, "_find_open_issues_by_title", _fake_find_open_issues_by_title)
+        monkeypatch.setattr(
+            txn, "_issue_create", lambda *_a, **_k: f"https://github.com/owner/repo/issues/{new_issue_number}"
+        )
+        monkeypatch.setattr(txn, "_issue_apply_labels", lambda *_a, **_k: None)
+        monkeypatch.setattr(txn, "_readback_labels", lambda *_a, **_k: True)
+        monkeypatch.setattr(txn, "_post_partial_failure_comment", lambda *_a, **_k: None)
+        return call_count
+
+    def test_skip_flag_true_different_key_same_title_open_issue_is_not_a_race(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Minimum fix-delta case: different-key + same-title -> create ->
+        post-create readback sees ANOTHER open issue with the same title (a
+        pre-existing, different-dedupe-key issue -- `_find_open_issues_by_title`
+        only ever returns numbers/titles, never bodies, so a different key is
+        represented here by a different, unrelated issue number) -> must NOT
+        be treated as a race -> processing continues to the newly-created
+        exact issue (#99), not a partial_failure."""
+        self._patch_gh_io_boundary(
+            monkeypatch,
+            new_issue_number=99,
+            # skip_internal_title_dedupe=True means the pre-create dedupe
+            # search is never called; the only call is the post-create poll,
+            # which sees both the brand-new issue (#99) and the unrelated
+            # pre-existing same-title issue (#4242).
+            matching_numbers_by_call=[[99, 4242]],
+        )
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body=_MINIMAL_VALID_BODY,
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            skip_internal_title_dedupe=True,
+        )
+
+        assert result.status == "success", (
+            f"expected success (no false race), got status={result.status!r} "
+            f"failure_stage={result.failure_stage!r} failure_message={result.failure_message!r}"
+        )
+        assert result.issue_number == 99
+
+    def test_skip_flag_false_default_still_treats_other_title_match_as_race(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard: default behaviour (skip_internal_title_dedupe not
+        set) is byte-for-byte unchanged -- a genuine post-create race (another
+        same-title OPEN issue appears between the pre-create dedupe search and
+        the post-create poll) is still detected and reported as
+        partial_failure/dedupe-race-detection."""
+        self._patch_gh_io_boundary(
+            monkeypatch,
+            new_issue_number=99,
+            matching_numbers_by_call=[
+                [],  # pre-create dedupe search (skip flag False): no match yet
+                [99, 4242],  # post-create poll attempt 1: a race appears
+            ],
+        )
+
+        result = txn.run_transaction(
+            repo="owner/repo",
+            title="Test Issue",
+            body=_MINIMAL_VALID_BODY,
+            body_file="",
+            labels=[],
+            issue_kind="",
+            parent_issue_number=0,
+            dependency_issue_numbers=[],
+            gh_bin="gh",
+            skip_internal_title_dedupe=False,
+        )
+
+        assert result.status == "partial_failure"
+        assert result.failure_stage == "dedupe-race-detection"

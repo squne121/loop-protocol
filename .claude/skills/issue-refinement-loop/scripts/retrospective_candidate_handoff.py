@@ -54,6 +54,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+import yaml
+
 # ---------------------------------------------------------------------------
 # Reuse existing production modules (do not clone their logic).
 # ---------------------------------------------------------------------------
@@ -63,12 +65,21 @@ if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS_DIR))
 
 import create_issue_txn  # noqa: E402
+import mrc_contract_parser  # noqa: E402
 import plan_child_materialization as _plan_child_materialization  # noqa: E402
 
 # Reused as-is (Issue #2602 Design Constraints: "Reuse the existing
 # caller-side dedupe convention"). This module does not reimplement the
 # gh issue list --state all --search "<dedupe_key>" search.
 search_dedupe_candidates = _plan_child_materialization._search_dedupe_candidates
+# PR #2673 review P1-3 fix-delta: the outcome-aware companion to
+# search_dedupe_candidates() above, which distinguishes complete/failure/
+# truncated instead of collapsing every non-success case to []. This is what
+# materialize_candidate() uses by default (search_fn=None) so a read/search
+# failure or an unresolved truncation is never silently converted into
+# "no duplicate found -> create" (see readback_dedupe_matches() below).
+search_dedupe_candidates_with_outcome = _plan_child_materialization._search_dedupe_candidates_with_outcome
+DedupeSearchOutcome = _plan_child_materialization.DedupeSearchOutcome
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +131,28 @@ class NormalizedCandidate:
     issue_kind: str = "implementation"
     labels: tuple[str, ...] = ("triage-required",)
     blocked_by: tuple[str, ...] = ()
+
+
+# Producer schemas represent blocked_by references as "#123"-style strings
+# (see docs/schemas/chatgpt-retrospective-result.schema.json's
+# `^#[0-9]+$` pattern). create_issue_txn.py's --blocked-by/
+# dependency_issue_numbers contract expects plain issue-number ints (see
+# _normalize_dependency_numbers() there, which rejects non-integer strings).
+# This regex is the sole translation point between the two representations
+# (Issue #2602 P2-1); it never inverts the dependency direction -- a
+# candidate's blocked_by always maps to create_issue_txn.py's --blocked-by
+# (the new issue IS blocked by these), never --blocking.
+_BLOCKED_BY_REFERENCE_RE = re.compile(r"^#([0-9]+)$")
+
+
+def _normalize_blocked_by_reference(raw_reference: str) -> int:
+    """Normalize a single producer-schema '#123'-style blocked_by reference
+    into the plain issue-number int create_issue_txn.py's --blocked-by
+    (dependency_issue_numbers) contract expects."""
+    match = _BLOCKED_BY_REFERENCE_RE.match(raw_reference.strip())
+    if not match:
+        raise ValueError(f"blocked_by reference does not match '#<digits>': {raw_reference!r}")
+    return int(match.group(1))
 
 
 def _normalize_title_for_key(title: str) -> str:
@@ -224,7 +257,11 @@ class DedupeMatch:
 
 @dataclass(frozen=True)
 class DedupeDecision:
-    action: Literal["create", "reuse_open", "reuse_closed", "human_escalation"]
+    # "indeterminate" (Issue #2602 P1-3): the dedupe search failed, or a
+    # saturated/truncated result could not be resolved via bounded page
+    # expansion -- identity cannot be determined either way. This must NEVER
+    # be converted into "create" (no duplicate found).
+    action: Literal["create", "reuse_open", "reuse_closed", "human_escalation", "indeterminate"]
     match: DedupeMatch | None = None
     reason: str | None = None
     search_truncated: bool = False
@@ -258,25 +295,63 @@ def readback_dedupe_matches(
     *,
     gh_bin: str = "gh",
     search_fn: Callable[[str, str, str], list[dict[str, Any]]] | None = None,
+    search_outcome_fn: Callable[[str, str, str], Any] | None = None,
     detail_fn: Callable[[str, int, str], dict[str, Any]] | None = None,
 ) -> DedupeDecision:
-    search = search_fn or search_dedupe_candidates
     detail = detail_fn or _fetch_issue_detail
 
-    raw_candidates = search(repo, dedupe_key, gh_bin)
-    # _search_dedupe_candidates() (reused, unmodified) hard-codes --limit 10;
-    # mirror that bound here so a saturated result is flagged rather than
-    # silently treated as complete (AC2(e)).
-    search_truncated = len(raw_candidates) >= 10
+    if search_fn is not None:
+        # Legacy/test seam (pre-existing AC2 contract): a plain candidate-list
+        # search function. Its result is treated as complete -- the P1-3
+        # complete/failure/truncated distinction only applies to the
+        # outcome-aware path below, which materialize_candidate() uses by
+        # default in production (search_fn=None).
+        raw_candidates = search_fn(repo, dedupe_key, gh_bin)
+        # Mirrors search_dedupe_candidates()'s hard-coded --limit 10 so a
+        # saturated result from this legacy seam is still flagged rather than
+        # silently treated as complete (AC2(e)).
+        search_truncated = len(raw_candidates) >= 10
+    else:
+        outcome_search = search_outcome_fn or search_dedupe_candidates_with_outcome
+        outcome = outcome_search(repo, dedupe_key, gh_bin)
+        if outcome.mode == "failure":
+            # P1-3: a dedupe search command/parse failure must never be
+            # converted into "no duplicate found -> create".
+            return DedupeDecision(
+                action="indeterminate",
+                reason=f"dedupe_search_failed: {outcome.error or 'unknown error'}",
+            )
+        if outcome.mode == "truncated":
+            # P1-3: truncation that the bounded page-expansion retry inside
+            # search_dedupe_candidates_with_outcome() could not resolve is
+            # genuinely indeterminate, not "no duplicate found".
+            return DedupeDecision(
+                action="indeterminate",
+                reason="dedupe_search_truncated_unresolved",
+                search_truncated=True,
+            )
+        raw_candidates = outcome.candidates
+        search_truncated = False
 
     confirmed: list[DedupeMatch] = []
     for item in raw_candidates:
         number = int(item["number"])
         detail_payload = detail(repo, number, gh_bin)
         body_text = detail_payload.get("body") or ""
-        if dedupe_key not in body_text:
-            # AC2(b): a full-text search hit whose body does not contain the
-            # exact dedupe_key is NOT treated as a duplicate by title alone.
+        # P1-2: exact dedupe_key identity is the canonical Machine-Readable
+        # Contract `dedupe_key` field (parsed via the shared, section-bound
+        # mrc_contract_parser.py -- never a whole-body substring test, which
+        # wrongly matches a prefix-only key, a longer key that merely
+        # contains the requested key, a key mentioned in a Description
+        # section, or an unrelated field with a matching substring).
+        mrc_result = mrc_contract_parser.parse_machine_readable_contract(body_text)
+        if not mrc_result.ok:
+            # No parseable Machine-Readable Contract -> identity cannot be
+            # confirmed from this hit; a full-text search match with no
+            # canonical dedupe_key field is NOT treated as a duplicate.
+            continue
+        existing_dedupe_key = mrc_result.get("dedupe_key")
+        if existing_dedupe_key != dedupe_key:
             continue
         confirmed.append(
             DedupeMatch(
@@ -326,6 +401,15 @@ class MaterializationResult:
     source_reference: dict[str, Any]
     next_action: dict[str, Any] | None
     errors: list[str] = field(default_factory=list)
+    # P2-3: when create_issue_txn.run_transaction() returns
+    # status="partial_failure" (an issue WAS created, but a downstream step --
+    # labels/sub-issue/dependency registration -- failed), the created
+    # issue's identity (issue_number/issue_url above) and this recovery
+    # context are preserved so a retry can readback the same issue via
+    # dedupe_key instead of creating a duplicate. None/() for every other
+    # status.
+    partial_failure_stage: str | None = None
+    partial_failure_completed_steps: tuple[str, ...] = ()
 
 
 _IMPLEMENTATION_TITLE_PREFIXES = ("実装:", "implement:")
@@ -378,13 +462,32 @@ def render_materialization_body(candidate: NormalizedCandidate) -> str:
     placeholders pointing at issue-refinement-loop, not synthesized AC/VC
     content (Design Constraints: "Reuse, do not clone" /
     "retrospective orchestration が独自の ready 判定を実装しない")."""
-    source_ref_lines = "\n".join(f"  {k}: {v!r}" for k, v in sorted(candidate.source_reference.items()))
+    # P2-2: use a real YAML serializer (PyYAML's safe_dump(), the same
+    # library mrc_contract_parser.py's canonical parser already depends on)
+    # instead of an f-string / repr() -- both break on titles/values
+    # containing quotes, backslashes, or YAML-significant characters like
+    # colons (dedupe_key values routinely contain colons, e.g.
+    # "chatgpt-candidate:v1:owner/repo:issue:10:some title").
+    mrc_yaml_text = yaml.safe_dump(
+        {
+            "contract_schema_version": "v1",
+            "issue_kind": candidate.issue_kind,
+            "dedupe_key": candidate.dedupe_key,
+        },
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+    ).rstrip("\n")
+    source_ref_yaml_text = yaml.safe_dump(
+        dict(candidate.source_reference),
+        default_flow_style=False,
+        sort_keys=True,
+        allow_unicode=True,
+    ).rstrip("\n")
     return (
         "## Machine-Readable Contract\n\n"
         "```yaml\n"
-        "contract_schema_version: v1\n"
-        f"issue_kind: {candidate.issue_kind}\n"
-        f'dedupe_key: "{candidate.dedupe_key}"\n'
+        f"{mrc_yaml_text}\n"
         "```\n\n"
         "## Parent Issue\n\n"
         "none\n\n"
@@ -428,7 +531,7 @@ def render_materialization_body(candidate: NormalizedCandidate) -> str:
         "- docs/dev/agent-skill-boundaries.md#FOLLOW_UP_ISSUE_REQUEST_V1\n\n"
         "## Source Reference\n\n"
         "```yaml\n"
-        f"{source_ref_lines}\n"
+        f"{source_ref_yaml_text}\n"
         "```\n\n"
         "## Description\n\n"
         f"{candidate.body}\n"
@@ -446,6 +549,7 @@ def materialize_candidate(
     repo: str,
     gh_bin: str = "gh",
     search_fn: Callable[[str, str, str], list[dict[str, Any]]] | None = None,
+    search_outcome_fn: Callable[[str, str, str], Any] | None = None,
     detail_fn: Callable[[str, int, str], dict[str, Any]] | None = None,
     create_fn: Callable[..., Any] | None = None,
 ) -> MaterializationResult:
@@ -466,8 +570,31 @@ def materialize_candidate(
         )
 
     decision = readback_dedupe_matches(
-        repo, candidate.dedupe_key, gh_bin=gh_bin, search_fn=search_fn, detail_fn=detail_fn
+        repo,
+        candidate.dedupe_key,
+        gh_bin=gh_bin,
+        search_fn=search_fn,
+        search_outcome_fn=search_outcome_fn,
+        detail_fn=detail_fn,
     )
+
+    if decision.action == "indeterminate":
+        # P1-3: dedupe identity could not be determined (search failure or
+        # unresolved truncation) -- never converted into "create". Returned
+        # as a retryable failure (not a hard human_escalation gate) so a
+        # caller can simply retry the whole materialize_candidate() call
+        # once the transient condition clears, without halting the session.
+        return MaterializationResult(
+            status="failed",
+            issue_number=None,
+            issue_url=None,
+            disposition=None,
+            dedupe_key=candidate.dedupe_key,
+            search_truncated=decision.search_truncated,
+            source_reference=candidate.source_reference,
+            next_action=None,
+            errors=[decision.reason or "dedupe search indeterminate"],
+        )
 
     if decision.action == "human_escalation":
         return MaterializationResult(
@@ -520,6 +647,12 @@ def materialize_candidate(
     creator = create_fn or _default_create_fn
     title = render_materialization_title(candidate)
     body = render_materialization_body(candidate)
+    # P2-1: preserve blocked_by through materialization -- normalize the
+    # producer's "#123"-style references into the plain issue-number ints
+    # create_issue_txn.py's --blocked-by (dependency_issue_numbers) contract
+    # expects, without inverting the dependency direction (the new issue IS
+    # blocked by these).
+    dependency_issue_numbers = [_normalize_blocked_by_reference(ref) for ref in candidate.blocked_by]
     txn_result = creator(
         repo=repo,
         title=title,
@@ -528,10 +661,27 @@ def materialize_candidate(
         labels=list(candidate.labels),
         issue_kind=candidate.issue_kind,
         parent_issue_number=0,
-        dependency_issue_numbers=[],
+        dependency_issue_numbers=dependency_issue_numbers,
         gh_bin=gh_bin,
         skip_internal_title_dedupe=True,
     )
+    if txn_result.status == "partial_failure" and txn_result.issue_number is not None:
+        # P2-3: the issue WAS created -- preserve its identity and recovery
+        # context so a retry can readback it via dedupe_key instead of
+        # creating a duplicate.
+        return MaterializationResult(
+            status="failed",
+            issue_number=txn_result.issue_number,
+            issue_url=txn_result.issue_url,
+            disposition=None,
+            dedupe_key=candidate.dedupe_key,
+            search_truncated=decision.search_truncated,
+            source_reference=candidate.source_reference,
+            next_action=None,
+            errors=[txn_result.failure_message or "issue creation partially failed"],
+            partial_failure_stage=txn_result.failure_stage,
+            partial_failure_completed_steps=tuple(txn_result.completed_steps or ()),
+        )
     if txn_result.status not in {"success", "dedupe"} or txn_result.issue_number is None:
         return MaterializationResult(
             status="failed",
