@@ -334,7 +334,10 @@ class TestDifferentKeySameTitleIsNotDuplicate:
         )
         # Full-text search matched issue #99 on the shared title, but its body
         # carries a DIFFERENT dedupe_key -> must NOT be treated as duplicate.
-        other_body = '## Machine-Readable Contract\n\ndedupe_key: "chatgpt-candidate:v1:owner/repo:issue:999:improve x"\n'
+        other_body = (
+            '## Machine-Readable Contract\n\n'
+            'dedupe_key: "chatgpt-candidate:v1:owner/repo:issue:999:improve x"\n'
+        )
 
         def _search(_repo: str, _key: str, _gh_bin: str) -> list[dict[str, Any]]:
             return [{"number": 99, "title": "Improve X", "state": "OPEN", "url": "https://x/99"}]
