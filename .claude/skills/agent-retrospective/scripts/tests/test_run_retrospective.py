@@ -3795,3 +3795,121 @@ def test_run_cli_final_source_observations_digest_matches_compute_source_set_dig
 
     recomputed = rr.compute_source_set_digest(publish_request.run_identity["source_observations"])
     assert recomputed == publish_request.run_identity["source_set_digest"] == expected_digest
+
+
+def test_run_cli_shares_frozen_runtime_results_for_two_simultaneous_runtime_sources(tmp_path: Path) -> None:
+    """Issue #2664, PR #2671 review fix_delta (Fix B): the production
+    ``since-last -> run_cli()`` path, driven via
+    ``frozen_runtime_collector_results``, wires TWO simultaneous frozen
+    runtime sources at once (``claude_code`` AND ``claude_gpt`` together) --
+    the AC1-AC4 tests above (and the existing #2644 fixtures) only ever
+    freeze a single ``claude_code`` entry. This is a regression PROVING
+    ``_build_frozen_runtime_collectors()``'s existing per-iteration
+    default-argument closure-capture (``def _collect(_base_sha, _result=
+    result)`` -- the standard late-binding-avoidance idiom for a value
+    captured inside a ``for`` loop) correctly binds a DISTINCT frozen
+    ``CollectorResult`` per ``source_id`` when two entries are frozen
+    simultaneously, rather than both closures spuriously capturing the same
+    (last-iteration) ``result`` -- it is NOT a refactor of that pattern.
+
+    This also exercises ``collect_claude_gpt_source()``'s NUMERIC
+    epoch-seconds ``min_completed_at``/``max_completed_at`` window-filter
+    codepath for the first time in this suite: the existing claude_gpt etag
+    fixture (``test_collect_claude_gpt_source_etag_matches_evidence_digest_
+    and_differs_with_record_content`` in ``test_collect_snapshot.py``) uses
+    ISO-string ``ts`` values and never passes window bounds, so it never
+    reaches the ``isinstance(ts, (int, float))``-gated branch
+    ``collect_claude_gpt_source()`` uses in production when
+    ``--since-last-retrospective`` supplies real watermark bounds."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    # (1) a real `collect_claude_code_source()` frozen result, distinct
+    # sentinel `sessionId`.
+    sessions_dir = tmp_path / "sessions_dual"
+    result_code = _frozen_claude_code_session_result(sessions_dir, "SESSION-2664-DUAL-CODE")
+
+    # (2) a real `collect_claude_gpt_source()` frozen result from a
+    # hook-sink fixture whose paired UserPromptSubmit/Stop records carry a
+    # NUMERIC epoch-seconds `ts` (not an ISO string), with `min_completed_at`/
+    # `max_completed_at` bounds that legitimately select it -- proving the
+    # actual min/max window-selection codepath runs, not just an unbounded
+    # call. Distinct sentinel `session_id` from the claude_code source above.
+    collect_snapshot = rr._collect_snapshot_module()
+    hook_sink_path = tmp_path / "hook_sink_dual.jsonl"
+
+    def _write_hook_sink_records(session_id: str) -> None:
+        records = [
+            {
+                "run_nonce": "nonce-2664-dual",
+                "event": "UserPromptSubmit",
+                "session_id": session_id,
+                "ts": 1756684800,
+            },
+            {"run_nonce": "nonce-2664-dual", "event": "Stop", "session_id": session_id, "ts": 1756684805},
+        ]
+        hook_sink_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+    _write_hook_sink_records("SESSION-2664-DUAL-GPT")
+    result_gpt = collect_snapshot.collect_claude_gpt_source(
+        hook_sink_path,
+        run_nonce="nonce-2664-dual",
+        min_completed_at="2025-08-31T23:59:59Z",
+        max_completed_at="2025-09-01T00:01:00Z",
+        clock=_since_last_clock,
+    )
+    # sanity: the window bounds genuinely SELECTED the numeric-`ts` record
+    # (never merely passed through an unbounded call).
+    assert result_gpt.observation["source_status"] == "complete"
+    assert len(result_gpt.private_evidence["normalized_records"]) == 2
+
+    # (3) freeze BOTH results above BEFORE mutating their underlying source
+    # files on disk with different sentinel content (mirrors the AC1
+    # post-freeze-mutation pattern above) -- proving neither is re-collected.
+    (sessions_dir / "session1.jsonl").write_text(
+        json.dumps(
+            {"type": "user", "sessionId": "SESSION-2664-POST-FREEZE-CODE", "timestamp": "2026-09-01T00:00:00Z"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_hook_sink_records("SESSION-2664-POST-FREEZE-GPT")
+
+    # (4) drive the production path via `_publish_request_with_frozen_runtime`,
+    # reusing the existing helper (which already accepts a
+    # `dict[str, Any | None]` of multiple frozen source ids and iterates
+    # `sorted(frozen_collector_results)`) rather than forking a parallel one.
+    publish_request, expected_digest = _publish_request_with_frozen_runtime(
+        repo_root,
+        schema_dir,
+        tmp_path,
+        {"claude_code": result_code, "claude_gpt": result_gpt},
+        run_tag="dual-runtime",
+    )
+
+    # (5) both `claude_code` and `claude_gpt` observations are present and
+    # non-None in the final `source_observations` (repository + claude_code
+    # + claude_gpt == 3 sources total).
+    observations = publish_request.run_identity["source_observations"]
+    source_ids = {obs["source_id"] for obs in observations}
+    assert source_ids == {"repository", "claude_code", "claude_gpt"}
+    assert len(observations) == 3
+
+    # the two runtime sentinels are distinct and neither result's normalized
+    # records/etag collide with the other (no cross-source mix-up).
+    code_records = result_code.private_evidence["normalized_records"]
+    gpt_records = result_gpt.private_evidence["normalized_records"]
+    assert code_records != gpt_records
+    assert result_code.observation["etag"] != result_gpt.observation["etag"]
+
+    # the two frozen results are never mutated by the post-freeze file edits
+    # above -- proven indirectly: `expected_digest` (independently
+    # recomputed by the helper from the still-frozen `.observation`s BEFORE
+    # this assertion) matches the run's actual `source_set_digest`, and
+    # `compute_source_set_digest()` independently re-run over the final
+    # persisted `source_observations` matches both.
+    assert publish_request.run_identity["source_set_digest"] == expected_digest
+    assert rr.compute_source_set_digest(observations) == expected_digest

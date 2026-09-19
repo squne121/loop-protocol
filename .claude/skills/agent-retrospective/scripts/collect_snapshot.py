@@ -427,6 +427,21 @@ def collect_claude_code_source(
     # `compute_source_set_digest()` (which canonically JSON-serializes the
     # full observation dict, unchanged) reflects the actual runtime content
     # this collector produced, not merely its status/timestamps/counts.
+    #
+    # PR #2671 review fix_delta (Fix A): `normalized` is scrubbed via
+    # `_scrub()` *before* the digest is computed, not after. `_finalize()`
+    # below still applies `_scrub()` to the whole `private_evidence` dict --
+    # but that is over the ALREADY-scrubbed `normalized` value now, so it is
+    # a no-op second pass (`_scrub()` is idempotent: a redacted placeholder
+    # string like `"[redacted-local-path]"` never re-matches
+    # `_ABS_PATH_RE`/`_BEARER_RE`, and dict/list recursion is
+    # structure-preserving). Without this, two records whose RAW values
+    # differ (e.g. distinct absolute `sessionId` paths) but collapse to the
+    # SAME scrubbed placeholder would still produce distinct
+    # `evidence_digest`/`etag` values computed from the pre-scrub content --
+    # a fingerprint that does not match the actually-returned (post-scrub)
+    # `private_evidence["normalized_records"]`.
+    normalized = _scrub(normalized)
     evidence_digest = _digest(normalized)
     observation = _build_observation(
         source_type="runtime",
@@ -670,6 +685,14 @@ def collect_claude_gpt_source(
     # Issue #2664 AC6: same evidence_digest-derived etag treatment as
     # `collect_claude_code_source` above -- computed once, reused for both
     # `private_evidence.evidence_digest` and `observation.etag`.
+    #
+    # PR #2671 review fix_delta (Fix A): `nonce_matched` is scrubbed via
+    # `_scrub()` *before* the digest is computed (same rationale as
+    # `collect_claude_code_source` above -- see its comment for the
+    # boundary-collision scenario this closes). `_finalize()`'s later
+    # `_scrub()` pass over the whole `private_evidence` dict is a no-op the
+    # second time since `_scrub()` is idempotent on already-scrubbed values.
+    nonce_matched = _scrub(nonce_matched)
     evidence_digest = _digest(nonce_matched)
     observation = _build_observation(
         source_type="runtime",
