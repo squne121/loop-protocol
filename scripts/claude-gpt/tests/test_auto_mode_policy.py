@@ -319,6 +319,95 @@ def test_hard_deny_addition_comment_matches_current_claude_child_gh_config_behav
     assert "隔離 HOME/GH_CONFIG_DIR による raw" not in content
 
 
+def test_environment_label_gh_config_dir_description_is_conditional_not_unconditional_parity():
+    """GIVEN CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL の GH_CONFIG_DIR 記述
+    WHEN launch.sh の実際の resolver（`${GH_CONFIG_DIR:-${HOME}/.config/gh}`）と
+    突き合わせる
+    THEN 無条件の「isolation 前に解決した native gh configuration directory を
+    使用する」という単純化された言い切りが残っておらず、親環境で非空値が明示
+    された場合はその値を保持し、未指定/空の場合のみ HOME/.config/gh を使う、
+    という resolver の実際の分岐が説明されている。また、非標準
+    XDG_CONFIG_HOME の自動解決までを native-equivalent と主張していない
+    （#2658 PR #2666 OWNER P2/P3 指摘反映）
+    """
+    result = _run_sh_function("claude_gpt_auto_mode_standalone_json")
+    env_label = json.loads(result.stdout)["autoMode"]["environment"][1]
+
+    # 無条件の単純化された言い切りは残っていない
+    assert "isolation 前に解決した native gh configuration directory を使用する" not in env_label
+
+    # resolver の実際の分岐（非空値の保持 / 未指定・空時のフォールバック）を説明する
+    assert "非空値" in env_label
+    assert "HOME/.config/gh" in env_label
+    assert "未指定" in env_label or "空の場合" in env_label
+
+    # 非標準 XDG_CONFIG_HOME 自動解決までの native-equivalent は主張しない
+    assert "native-equivalent は保証しない" in env_label
+
+    # launch.sh 側の resolver 実装自体は変更していないことを突き合わせる
+    launch_content = LAUNCH_SH.read_text(encoding="utf-8")
+    assert 'CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET="${GH_CONFIG_DIR:-${HOME}/.config/gh}"' in launch_content
+
+
+def test_hard_deny_addition_comment_does_not_defer_broker_or_hook_as_future_requirement():
+    """GIVEN lib.sh の hard_deny 追加分コメント
+    WHEN #2223 Owner Decision（generic broker/新規 enforcing PreToolUse hook を
+    追加しない）と突き合わせる
+    THEN 「別途 follow-up Issue で扱う」のような、broker/hook 追加を将来要件
+    として先送りする stale な記述が残っておらず、#2223 の決定（追加しない）を
+    直接明示している
+    """
+    content = LIB_SH.read_text(encoding="utf-8")
+    hard_deny_comment_match = re.search(
+        r"# hard_deny への追加分.*?\nCLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL=",
+        content,
+        re.DOTALL,
+    )
+    assert hard_deny_comment_match is not None
+    comment = hard_deny_comment_match.group(0)
+
+    # broker/hook 追加を future requirement として先送りする stale 記述が残っていない
+    assert "別途 follow-up Issue で扱う" not in comment
+    assert "要するため" not in comment
+
+    # #2223 Owner Decision による確定（追加しない）が明示されている
+    assert "#2223" in comment
+    assert "追加しない" in comment
+    assert "server-side authorization の代替ではない" in comment
+    assert "live readback" in comment
+
+
+def test_allow_label_controlled_transaction_raw_gh_exclusion_is_transaction_local():
+    """GIVEN controlled canonical Issue-edit transaction の
+    `generic uv/Python/raw gh は含まない` という exact-argv 制限の記述
+    WHEN 前段で許可した repository-scoped native GitHub client（`gh` 相当）に
+    よる通常操作との関係を確認する
+    THEN この token/argv 制限が本 controlled transaction にのみ適用される
+    transaction-local な restriction であることが明示されており、native
+    GitHub client による通常操作を一律に禁止するものではないと読み取れる。
+    かつ既存の exact token/argv identity 制約自体（`--input-file
+    <repo-relative-safe-operand>` の正確な引数列限定）は維持されている
+    """
+    result = _run_sh_function("claude_gpt_auto_mode_standalone_json")
+    allow_label = json.loads(result.stdout)["autoMode"]["allow"][1]
+
+    # 既存の exact token/argv identity 制約自体は維持されている（弱化していない）
+    assert (
+        "uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py "
+        "--input-file <repo-relative-safe-operand>"
+    ) in allow_label
+    assert "generic uv/Python/raw gh は含まない" in allow_label
+
+    # この制限が transaction-local であり、通常操作の一律禁止ではないことの明示
+    assert "transaction-local restriction" in allow_label
+    assert "一律に禁止するものではない" in allow_label
+    assert "repository-scoped native GitHub client" in allow_label
+
+    # repository-scoped native client による通常操作を許可する既存 semantic の維持
+    assert "native GitHub client" in allow_label
+    assert "read/create/edit/comment/close" in allow_label
+
+
 # --- AC3: isolation_and_auto_mode_enforcement --------------------------------
 
 FAKE_PROXY_SOURCE = r"""#!/usr/bin/env python3
