@@ -2906,6 +2906,41 @@ def _make_since_last_fake_runner(
     return _runner
 
 
+def _expected_since_last_digest_with_runtime(
+    repo_root: Path, real_base_sha: str, fake_home: Path, *, clock: Any = _since_last_clock
+) -> str:
+    """Issue #2664 AC5: independently (never by reading back the actual run's
+    own ``plan.source_set_digest`` -- that would be a tautological,
+    non-genuine assertion) reconstructs the ``source_set_digest``
+    ``run_cli()`` now computes once ``frozen_runtime_collector_results`` is
+    threaded through a ``build_since_last_analysis_runner()``-driven run:
+    the repository observation plus the SAME production
+    ``collect_claude_code_source`` call ``collect_session_sources()`` makes
+    against this fixture's session directory -- mirroring
+    ``run_since_last_retrospective_cli()``'s own window bound
+    (``window_start_exclusive=None`` -- every AC1/AC6/AC10/P1-4 fixture below
+    is a first run with no prior watermark -- and
+    ``window_end_inclusive=_iso(clock())``, the SAME fixed ``clock`` these
+    fixtures already pass into ``run_since_last_retrospective_cli``, so both
+    the window bound and the observation's own
+    ``fetch_started_at``/``fetch_completed_at`` fields are byte-for-byte
+    identical to what the real run computed). This keeps the AC1/AC6/AC10/
+    P1-4 fixtures below genuine (non-tautological) assertion targets after
+    this Issue's frozen-runtime wiring lands (Issue #2664 In Scope)."""
+    collect_snapshot = rr._collect_snapshot_module()
+    repo_observation = rr.build_repository_collector(repo_root)(real_base_sha).observation
+    sessions_dir = fake_home / ".claude" / "projects" / rr._claude_code_project_slug(repo_root)
+    window_end_inclusive = rr._iso(clock())
+    all_session_paths = rr.resolve_claude_code_session_paths(sessions_dir)
+    session_paths = rr.resolve_claude_code_session_paths(
+        sessions_dir, min_completed_at=None, max_completed_at=window_end_inclusive
+    )
+    claude_code_result = collect_snapshot.collect_claude_code_source(
+        session_paths, known_source_nonempty=bool(all_session_paths), clock=clock
+    )
+    return rr.compute_source_set_digest([repo_observation, claude_code_result.observation])
+
+
 def _runtime_evidence_ref_for_judgment(suffix: str = "1") -> dict[str, Any]:
     """A judgment-only (pre-enrichment) evidence_ref an evaluator would
     supply for a `runtime`-sourced finding -- `projection_digest` is
@@ -2950,8 +2985,7 @@ def test_ac1_since_last_selected_session_sentinel_reaches_runtime_observer_input
     )
     assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
     real_head_sha = head_rev_parse.stdout.strip()
-    real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
-    expected_digest = rr.compute_source_set_digest([real_observation])
+    expected_digest = _expected_since_last_digest_with_runtime(repo_root, real_head_sha, fake_home)
     native_result = _native_codebase_investigation_result(
         _real_repo_evidence_ref(repo_root, real_head_sha, "CLAUDE.md")
     )
@@ -3176,8 +3210,7 @@ def test_checkpoint_advances_once_on_success(tmp_path: Path) -> None:
     )
     assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
     real_head_sha = head_rev_parse.stdout.strip()
-    real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
-    expected_digest = rr.compute_source_set_digest([real_observation])
+    expected_digest = _expected_since_last_digest_with_runtime(repo_root, real_head_sha, fake_home)
     native_result = _native_codebase_investigation_result(
         _real_repo_evidence_ref(repo_root, real_head_sha, "CLAUDE.md")
     )
@@ -3257,8 +3290,7 @@ def test_checkpoint_advances_independent_of_publication_success(tmp_path: Path) 
     )
     assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
     real_head_sha = head_rev_parse.stdout.strip()
-    real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
-    expected_digest = rr.compute_source_set_digest([real_observation])
+    expected_digest = _expected_since_last_digest_with_runtime(repo_root, real_head_sha, fake_home)
     native_result = _native_codebase_investigation_result(
         _real_repo_evidence_ref(repo_root, real_head_sha, "CLAUDE.md")
     )
@@ -3354,8 +3386,7 @@ def test_p1_4_connected_analysis_reaches_runtime_unavailable_indeterminate_branc
     )
     assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
     real_head_sha = head_rev_parse.stdout.strip()
-    real_observation = rr.build_repository_collector(repo_root)(real_head_sha).observation
-    expected_digest = rr.compute_source_set_digest([real_observation])
+    expected_digest = _expected_since_last_digest_with_runtime(repo_root, real_head_sha, fake_home)
     native_result = _native_codebase_investigation_result(
         _real_repo_evidence_ref(repo_root, real_head_sha, "CLAUDE.md")
     )
@@ -3450,3 +3481,435 @@ def test_p1_4_connected_analysis_reaches_runtime_unavailable_indeterminate_branc
     assert result["checkpoint"]["checkpoint_advanced"] is False
     assert result["checkpoint"]["checkpoint_advance_reason"] == "blocked_missing_required_source"
     rr.validate_session_window_coverage(result)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2664: run_cli() shares ONE frozen runtime CollectorResult between
+# observer input and source_set_digest computation (pr-reviewer P2 #5
+# follow-up on PR #2660 / Issue #2644)
+#
+#   AC1  run_cli_shares_frozen_runtime_result_between_observer_and_digest_and_ignores_post_freeze_mutation
+#   AC2  run_cli_source_set_digest_differs_for_distinct_runtime_normalized_records
+#   AC3  frozen_runtime_collector_result_digest_stable_and_order_independent
+#   AC4  run_cli_final_source_observations_digest_matches_compute_source_set_digest
+#   AC5  existing #2644 fixtures above (updated expected_digest) + existing
+#        test_ac4_run_cli_delta_results_matches_canonical_evaluations_for_present_candidate /
+#        test_checkpoint_not_advanced_on_observer_or_evaluator_failure (unchanged)
+#   AC7  test_p1_4_connected_analysis_reaches_runtime_unavailable_indeterminate_branch above
+#        (updated fixture -- its claude_gpt=None entry now exercises the
+#        None-skip path via the real frozen_runtime_collector_results wiring)
+# ---------------------------------------------------------------------------
+
+
+def _publish_request_with_frozen_runtime(
+    repo_root: Path,
+    schema_dir: Path,
+    tmp_path: Path,
+    frozen_collector_results: dict[str, Any | None],
+    *,
+    run_tag: str,
+    base_sha: str = _FULL_SHA,
+) -> tuple[rr.PublishRequest, str]:
+    """Issue #2664: drives ``run_cli()``'s production
+    ``frozen_runtime_collector_results`` wiring end-to-end (collector
+    closures -> ``prepare()`` -> observer wave -> evaluator -> ``finalize()``)
+    with a caller-supplied frozen runtime ``collector_results`` map, a
+    deterministic fake observer/evaluator ``runner``, and a mocked
+    ``git_runner`` (this helper's callers assert ``source_set_digest``
+    sharing/stability -- the AC1 test above already separately exercises the
+    REAL ``git``/session-file/``build_since_last_analysis_runner()`` path).
+    Returns ``(publish_request, expected_digest)`` -- ``expected_digest`` is
+    computed INDEPENDENTLY (repository observation + every non-``None``
+    frozen entry's own ``observation``, sorted by source_id -- mirroring
+    ``_build_frozen_runtime_collectors``'s own construction order, never by
+    reading back the actual run's own digest) for the caller to assert
+    against."""
+    repo_observation = rr.build_repository_collector(repo_root)(base_sha).observation
+    runtime_observations = [
+        frozen_collector_results[source_id].observation
+        for source_id in sorted(frozen_collector_results)
+        if frozen_collector_results[source_id] is not None
+    ]
+    expected_digest = rr.compute_source_set_digest([repo_observation, *runtime_observations])
+
+    def _runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        agent_name = argv[argv.index("--agent") + 1]
+        if agent_name == "retrospective-evaluator":
+            evaluator_request = rr.EvaluatorRequest.from_wire(kwargs["input"])
+            evaluation_payload = {
+                "schema_version": rr.WIRE_SCHEMA_EVALUATION,
+                "run_id": evaluator_request.run_id,
+                "base_sha": base_sha,
+                "source_set_digest": evaluator_request.source_set_digest,
+                "candidate_records": [],
+                "evidence_ref": "e",
+            }
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=json.dumps(_wrapper_payload(evaluation_payload)), stderr=""
+            )
+        bundle = rr.EvidenceBundle(
+            run_id=kwargs["env"].get("AGENT_RETROSPECTIVE_RUN_ID", ""),
+            base_sha=kwargs["env"].get("AGENT_RETROSPECTIVE_BASE_SHA", ""),
+            source_set_digest=expected_digest,
+            observer_id=agent_name,
+            evidence_ref=f"evidence://{agent_name}",
+            findings=[],
+        )
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=json.dumps(_wrapper_payload(json.loads(bundle.to_wire()))), stderr=""
+        )
+
+    def _git_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        assert argv == ["git", "rev-parse", "main"]
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=base_sha + "\n", stderr="")
+
+    publish_request = rr.run_cli(
+        repo_root=repo_root,
+        repository_id=_REPOSITORY_ID,
+        target_issue=2664,
+        request_id=f"req-2664-{run_tag}",
+        idempotency_key=f"idem-2664-{run_tag}",
+        schema_dir=schema_dir,
+        prompts=None,
+        runner=_runner,
+        git_runner=_git_runner,
+        run_id=f"run-2664-{run_tag}",
+        temp_base_dir=tmp_path,
+        frozen_runtime_collector_results=frozen_collector_results,
+    )
+    return publish_request, expected_digest
+
+
+def _frozen_claude_code_session_result(session_dir: Path, session_id: str) -> Any:
+    """Builds a REAL (not hand-crafted) ``collect_snapshot.CollectorResult``
+    via the actual production ``collect_claude_code_source`` adapter, from a
+    single freshly-written session JSONL file under ``session_dir``."""
+    session_dir.mkdir(parents=True, exist_ok=True)
+    session_path = session_dir / "session1.jsonl"
+    session_path.write_text(
+        json.dumps({"type": "user", "sessionId": session_id, "timestamp": "2026-09-01T00:00:00Z"}) + "\n",
+        encoding="utf-8",
+    )
+    collect_snapshot = rr._collect_snapshot_module()
+    return collect_snapshot.collect_claude_code_source(
+        [session_path], known_source_nonempty=True, clock=_since_last_clock
+    )
+
+
+def test_run_cli_shares_frozen_runtime_result_between_observer_and_digest_and_ignores_post_freeze_mutation(
+    tmp_path: Path,
+) -> None:
+    """Issue #2664 AC1: the SAME frozen runtime ``CollectorResult``
+    (``collect_session_sources()``'s return value) reaches BOTH the real
+    ``retrospective-runtime-observer`` prompt text (via
+    ``build_since_last_analysis_prompts()``) and ``prepare()``'s
+    ``source_set_digest`` computation (via ``run_cli()``'s new
+    ``frozen_runtime_collector_results`` parameter) for the SAME
+    ``build_since_last_analysis_runner()``-driven production run -- never
+    re-collected. Proven by freezing ``collector_results`` via the real
+    ``collect_session_sources()`` call, THEN mutating the underlying session
+    JSONL file on disk, and confirming neither the observer's real captured
+    input nor the run's ``source_set_digest`` reflects that post-freeze
+    mutation (a correct implementation never re-reads the file)."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    fake_home = tmp_path / "home"
+    slug = str(repo_root.resolve()).replace("/", "-")
+    sentinel = "SENTINEL-2664-AC1-pre-freeze"
+    sessions_dir = fake_home / ".claude" / "projects" / slug
+    _write_sentinel_session(sessions_dir, sentinel)
+
+    head_rev_parse = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), capture_output=True, text=True, timeout=30
+    )
+    assert head_rev_parse.returncode == 0, f"git rev-parse HEAD failed: {head_rev_parse.stderr}"
+    real_head_sha = head_rev_parse.stdout.strip()
+
+    # freeze: the SAME production `collect_session_sources()` call
+    # `run_since_last_retrospective_cli()` makes before invoking
+    # `analysis_runner` -- this is the ONE collection this test performs.
+    collector_results = rr.collect_session_sources(
+        required_sources=["claude_code"],
+        env={"HOME": str(fake_home)},
+        repo_root=repo_root,
+        window_end_inclusive=rr._iso(_since_last_clock()),
+        clock=_since_last_clock,
+    )
+    assert collector_results["claude_code"] is not None
+
+    expected_digest = rr.compute_source_set_digest(
+        [
+            rr.build_repository_collector(repo_root)(real_head_sha).observation,
+            collector_results["claude_code"].observation,
+        ]
+    )
+
+    # post-freeze mutation: overwrite the SAME session file with a DIFFERENT
+    # sentinel AFTER `collector_results` above was frozen -- a correct
+    # implementation never re-reads this file, so neither the observer's
+    # captured input nor the digest below may reflect it.
+    mutated_record = {
+        "type": "user",
+        "sessionId": "SENTINEL-2664-POST-FREEZE-MUTATION",
+        "timestamp": "2026-09-01T00:00:00Z",
+    }
+    (sessions_dir / "session1.jsonl").write_text(json.dumps(mutated_record) + "\n", encoding="utf-8")
+
+    native_result = _native_codebase_investigation_result(
+        _real_repo_evidence_ref(repo_root, real_head_sha, "CLAUDE.md")
+    )
+    call_log: list[str] = []
+    captured_inputs: dict[str, str] = {}
+    fake_runner = _make_since_last_fake_runner(
+        expected_digest, call_log, captured_inputs=captured_inputs, native_codebase_investigation_result=native_result
+    )
+
+    analysis_runner = rr.build_since_last_analysis_runner(
+        repo_root=repo_root,
+        repository_id=_REPOSITORY_ID,
+        target_issue=2664,
+        request_id="req-2664-ac1-1",
+        idempotency_key="idem-2664-ac1-1",
+        schema_dir=schema_dir,
+        previous_state_provider=rr.FixturePreviousStateProvider(fixtures={}),
+        runner=fake_runner,
+        git_runner=_real_git_runner,
+        run_id="run-2664-ac1-1",
+        temp_base_dir=tmp_path,
+    )
+
+    publish_request = analysis_runner(collector_results, {"claude_code": {"status": "observed"}})
+
+    # (a) the observer received the PRE-freeze sentinel, never the
+    # post-freeze mutation -- observer input and digest share the SAME
+    # frozen value.
+    assert sentinel in captured_inputs["retrospective-runtime-observer"]
+    assert "SENTINEL-2664-POST-FREEZE-MUTATION" not in captured_inputs["retrospective-runtime-observer"]
+
+    # (b) the identity check inside `run_observer_wave()` only ever succeeds
+    # (never raising `ObserverWaveFailed`) if the REAL `plan.source_set_digest`
+    # `run_cli()` computed equals `expected_digest` -- reaching this
+    # assertion at all already proves the frozen (pre-mutation) digest was
+    # used, not merely its stated value.
+    assert publish_request.run_identity["source_set_digest"] == expected_digest
+    assert (
+        rr.compute_source_set_digest(publish_request.run_identity["source_observations"]) == expected_digest
+    )
+
+
+def test_run_cli_source_set_digest_differs_for_distinct_runtime_normalized_records(tmp_path: Path) -> None:
+    """Issue #2664 AC2: repository observation, collection status/pagination/
+    timestamps (fixed clock), and record COUNT are identical between two
+    ``run_cli()`` runs via the production ``frozen_runtime_collector_results``
+    path -- only the runtime source's ACTUAL normalized record CONTENT
+    differs (different ``sessionId``). ``run_cli()``'s ``source_set_digest``
+    must differ between the two runs."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    result_a = _frozen_claude_code_session_result(tmp_path / "sessions_a", "SESSION-2664-A")
+    result_b = _frozen_claude_code_session_result(tmp_path / "sessions_b", "SESSION-2664-B")
+
+    # AC2 precondition: identical status/pagination/timestamps/record-count
+    # shape, only the ACTUAL runtime normalized record content (and its
+    # etag, Issue #2664 AC6) differs.
+    for key in ("source_status", "pagination_completeness", "fetch_started_at", "fetch_completed_at"):
+        assert result_a.observation[key] == result_b.observation[key]
+    records_a = result_a.private_evidence["normalized_records"]
+    records_b = result_b.private_evidence["normalized_records"]
+    assert len(records_a) == len(records_b) == 1
+    assert records_a != records_b
+    assert result_a.observation["etag"] != result_b.observation["etag"]
+
+    publish_a, digest_a = _publish_request_with_frozen_runtime(
+        repo_root, schema_dir, tmp_path, {"claude_code": result_a}, run_tag="ac2-a"
+    )
+    publish_b, digest_b = _publish_request_with_frozen_runtime(
+        repo_root, schema_dir, tmp_path, {"claude_code": result_b}, run_tag="ac2-b"
+    )
+
+    assert digest_a != digest_b
+    assert publish_a.run_identity["source_set_digest"] == digest_a
+    assert publish_b.run_identity["source_set_digest"] == digest_b
+
+
+def test_frozen_runtime_collector_result_digest_stable_and_order_independent(tmp_path: Path) -> None:
+    """Issue #2664 AC3: reusing the SAME frozen runtime ``CollectorResult``
+    across two separate ``run_cli()`` runs (via ``frozen_runtime_collector_results``)
+    produces a STABLE ``source_set_digest``, and that digest does not depend
+    on source-observation ENUMERATION order (the existing
+    ``compute_source_set_digest()`` ordering guarantee, reused unchanged)."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    frozen_result = _frozen_claude_code_session_result(tmp_path / "sessions", "SESSION-2664-AC3")
+
+    publish_first, digest_first = _publish_request_with_frozen_runtime(
+        repo_root, schema_dir, tmp_path, {"claude_code": frozen_result}, run_tag="ac3-first"
+    )
+    # re-run reusing the SAME frozen collector result OBJECT -- digest must
+    # be stable across independent runs, never re-derived differently.
+    publish_second, digest_second = _publish_request_with_frozen_runtime(
+        repo_root, schema_dir, tmp_path, {"claude_code": frozen_result}, run_tag="ac3-second"
+    )
+    assert digest_first == digest_second
+    assert publish_first.run_identity["source_set_digest"] == publish_second.run_identity["source_set_digest"]
+
+    # order independence: the SAME two observations in the opposite
+    # enumeration order still digest identically.
+    observations = publish_first.run_identity["source_observations"]
+    assert len(observations) == 2
+    assert rr.compute_source_set_digest(observations) == rr.compute_source_set_digest(list(reversed(observations)))
+    assert rr.compute_source_set_digest(observations) == digest_first
+
+
+def test_run_cli_final_source_observations_digest_matches_compute_source_set_digest(tmp_path: Path) -> None:
+    """Issue #2664 AC4: the final ``source_observations``
+    ``run_cli()``/``finalize()`` returns (``PublishRequest.run_identity[
+    "source_observations"]``) independently re-digests, via the UNCHANGED
+    ``compute_source_set_digest()``, to the EXACT ``source_set_digest`` this
+    run actually used -- proving ``finalize()``'s persisted observation list
+    and ``prepare()``'s digest input never diverge even with a runtime
+    collector wired in via ``frozen_runtime_collector_results``."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    frozen_result = _frozen_claude_code_session_result(tmp_path / "sessions", "SESSION-2664-AC4")
+    publish_request, expected_digest = _publish_request_with_frozen_runtime(
+        repo_root, schema_dir, tmp_path, {"claude_code": frozen_result}, run_tag="ac4"
+    )
+
+    recomputed = rr.compute_source_set_digest(publish_request.run_identity["source_observations"])
+    assert recomputed == publish_request.run_identity["source_set_digest"] == expected_digest
+
+
+def test_run_cli_shares_frozen_runtime_results_for_two_simultaneous_runtime_sources(tmp_path: Path) -> None:
+    """Issue #2664, PR #2671 review fix_delta (Fix B): the production
+    ``since-last -> run_cli()`` path, driven via
+    ``frozen_runtime_collector_results``, wires TWO simultaneous frozen
+    runtime sources at once (``claude_code`` AND ``claude_gpt`` together) --
+    the AC1-AC4 tests above (and the existing #2644 fixtures) only ever
+    freeze a single ``claude_code`` entry. This is a regression PROVING
+    ``_build_frozen_runtime_collectors()``'s existing per-iteration
+    default-argument closure-capture (``def _collect(_base_sha, _result=
+    result)`` -- the standard late-binding-avoidance idiom for a value
+    captured inside a ``for`` loop) correctly binds a DISTINCT frozen
+    ``CollectorResult`` per ``source_id`` when two entries are frozen
+    simultaneously, rather than both closures spuriously capturing the same
+    (last-iteration) ``result`` -- it is NOT a refactor of that pattern.
+
+    This also exercises ``collect_claude_gpt_source()``'s NUMERIC
+    epoch-seconds ``min_completed_at``/``max_completed_at`` window-filter
+    codepath for the first time in this suite: the existing claude_gpt etag
+    fixture (``test_collect_claude_gpt_source_etag_matches_evidence_digest_
+    and_differs_with_record_content`` in ``test_collect_snapshot.py``) uses
+    ISO-string ``ts`` values and never passes window bounds, so it never
+    reaches the ``isinstance(ts, (int, float))``-gated branch
+    ``collect_claude_gpt_source()`` uses in production when
+    ``--since-last-retrospective`` supplies real watermark bounds."""
+    repo_root = _SCRIPTS_DIR.parents[3]
+    schema_dir = tmp_path / "schemas"
+    schema_dir.mkdir()
+    (schema_dir / "observer_result_v1.schema.json").write_text("{}", encoding="utf-8")
+    (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
+
+    # (1) a real `collect_claude_code_source()` frozen result, distinct
+    # sentinel `sessionId`.
+    sessions_dir = tmp_path / "sessions_dual"
+    result_code = _frozen_claude_code_session_result(sessions_dir, "SESSION-2664-DUAL-CODE")
+
+    # (2) a real `collect_claude_gpt_source()` frozen result from a
+    # hook-sink fixture whose paired UserPromptSubmit/Stop records carry a
+    # NUMERIC epoch-seconds `ts` (not an ISO string), with `min_completed_at`/
+    # `max_completed_at` bounds that legitimately select it -- proving the
+    # actual min/max window-selection codepath runs, not just an unbounded
+    # call. Distinct sentinel `session_id` from the claude_code source above.
+    collect_snapshot = rr._collect_snapshot_module()
+    hook_sink_path = tmp_path / "hook_sink_dual.jsonl"
+
+    def _write_hook_sink_records(session_id: str) -> None:
+        records = [
+            {
+                "run_nonce": "nonce-2664-dual",
+                "event": "UserPromptSubmit",
+                "session_id": session_id,
+                "ts": 1756684800,
+            },
+            {"run_nonce": "nonce-2664-dual", "event": "Stop", "session_id": session_id, "ts": 1756684805},
+        ]
+        hook_sink_path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+    _write_hook_sink_records("SESSION-2664-DUAL-GPT")
+    result_gpt = collect_snapshot.collect_claude_gpt_source(
+        hook_sink_path,
+        run_nonce="nonce-2664-dual",
+        min_completed_at="2025-08-31T23:59:59Z",
+        max_completed_at="2025-09-01T00:01:00Z",
+        clock=_since_last_clock,
+    )
+    # sanity: the window bounds genuinely SELECTED the numeric-`ts` record
+    # (never merely passed through an unbounded call).
+    assert result_gpt.observation["source_status"] == "complete"
+    assert len(result_gpt.private_evidence["normalized_records"]) == 2
+
+    # (3) freeze BOTH results above BEFORE mutating their underlying source
+    # files on disk with different sentinel content (mirrors the AC1
+    # post-freeze-mutation pattern above) -- proving neither is re-collected.
+    (sessions_dir / "session1.jsonl").write_text(
+        json.dumps(
+            {"type": "user", "sessionId": "SESSION-2664-POST-FREEZE-CODE", "timestamp": "2026-09-01T00:00:00Z"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_hook_sink_records("SESSION-2664-POST-FREEZE-GPT")
+
+    # (4) drive the production path via `_publish_request_with_frozen_runtime`,
+    # reusing the existing helper (which already accepts a
+    # `dict[str, Any | None]` of multiple frozen source ids and iterates
+    # `sorted(frozen_collector_results)`) rather than forking a parallel one.
+    publish_request, expected_digest = _publish_request_with_frozen_runtime(
+        repo_root,
+        schema_dir,
+        tmp_path,
+        {"claude_code": result_code, "claude_gpt": result_gpt},
+        run_tag="dual-runtime",
+    )
+
+    # (5) both `claude_code` and `claude_gpt` observations are present and
+    # non-None in the final `source_observations` (repository + claude_code
+    # + claude_gpt == 3 sources total).
+    observations = publish_request.run_identity["source_observations"]
+    source_ids = {obs["source_id"] for obs in observations}
+    assert source_ids == {"repository", "claude_code", "claude_gpt"}
+    assert len(observations) == 3
+
+    # the two runtime sentinels are distinct and neither result's normalized
+    # records/etag collide with the other (no cross-source mix-up).
+    code_records = result_code.private_evidence["normalized_records"]
+    gpt_records = result_gpt.private_evidence["normalized_records"]
+    assert code_records != gpt_records
+    assert result_code.observation["etag"] != result_gpt.observation["etag"]
+
+    # the two frozen results are never mutated by the post-freeze file edits
+    # above -- proven indirectly: `expected_digest` (independently
+    # recomputed by the helper from the still-frozen `.observation`s BEFORE
+    # this assertion) matches the run's actual `source_set_digest`, and
+    # `compute_source_set_digest()` independently re-run over the final
+    # persisted `source_observations` matches both.
+    assert publish_request.run_identity["source_set_digest"] == expected_digest
+    assert rr.compute_source_set_digest(observations) == expected_digest
