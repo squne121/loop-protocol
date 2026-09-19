@@ -106,15 +106,25 @@ def _render_gate_script(directory: Path, source: str, launch_nonce: str) -> Path
     return gate_path
 
 
-# Issue #2274 AC11/AC13: the production launcher always exports the
-# fork/background invariant (`CLAUDE_CODE_FORK_SUBAGENT` unset,
-# `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`) and never re-exports
-# `CLAUDE_CODE_SUBAGENT_MODEL` before the real `claude` child process (and
-# therefore this hook) runs. This suite predates that invariant and
-# implicitly assumes the compliant baseline (it never exercises the
-# invariant itself -- see test_background_execution_foreground_invariant.py
-# for that), so `_run_gate` applies it here to avoid false-failing against
-# whatever the ambient test-runner shell environment happens to have set.
+# Issue #2274 AC11/AC13 (historical, superseded by Issue #2652): the
+# production launcher used to always export the fork/background invariant
+# (`CLAUDE_CODE_FORK_SUBAGENT` unset, `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
+# =1`) and never re-export `CLAUDE_CODE_SUBAGENT_MODEL` before the real
+# `claude` child process (and therefore this hook) ran. That pairing was
+# enforced by this very gate hook's `effective_env_override_reason()`
+# check; the whole gate (and the value below) is retired dead code now --
+# every test in this module that depends on the `gate_script_source`
+# fixture below is unconditionally skipped (Issue #2651/#2662 retired the
+# Spark authorization gate this hook belonged to), so `_run_gate`'s use of
+# `_DEFAULT_COMPLIANT_EFFECTIVE_ENV` never actually executes. It is kept
+# unchanged here (rather than updated to the Issue #2652 launcher contract)
+# purely as an inert historical record, matching this module's existing
+# "kept, unmodified, as defensive dead code" policy for
+# `classify_spark_failure()` (see the `gate_script_source` fixture
+# docstring above). See
+# `scripts/claude-gpt/tests/test_background_execution_foreground_invariant.py`
+# for the CURRENT, actually-enforced launcher contract
+# (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` unset, not `=1`).
 _DEFAULT_COMPLIANT_EFFECTIVE_ENV = {
     "CLAUDE_CODE_FORK_SUBAGENT": "",
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
