@@ -203,6 +203,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["standard", "triage_only"],
         help="label profile: standard | triage_only",
     )
+    # Opt-in bypass of this script's own internal title-only OPEN-issue dedupe search
+    # (Issue #2602 AC2(g)). Default False preserves full backward compatibility for all
+    # existing callers. Intended only for callers that already confirmed via an outer
+    # dedupe_key search that issue creation is warranted (see run_transaction()'s
+    # skip_internal_title_dedupe docstring comment above).
+    parser.add_argument(
+        "--skip-internal-title-dedupe",
+        dest="skip_internal_title_dedupe",
+        action="store_true",
+        default=False,
+    )
     ns = parser.parse_args(argv)
     ns.subcommand = "create"
     return ns
@@ -475,6 +486,7 @@ def _poll_for_created_issue(
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     delays: tuple[float, ...] = _DEFAULT_RACE_DETECTION_DELAYS,
     sleep_fn: Callable[[float], None] = time.sleep,
+    skip_internal_title_dedupe: bool = False,
 ) -> tuple[Literal["confirmed", "race", "inconclusive"], list[int]]:
     """Poll for the newly created issue, absorbing GitHub search index propagation delay.
 
@@ -485,6 +497,15 @@ def _poll_for_created_issue(
 
     Raises:
         TransactionError: if the underlying dedupe-search raises (e.g., saturation guard).
+
+    ``skip_internal_title_dedupe`` (Issue #2602 P1-1): when the caller opted into
+    ``run_transaction(skip_internal_title_dedupe=True)``, an outer dedupe_key search has
+    already confirmed "create confirmed" (AC2(g)), and a different-key/same-title OPEN
+    issue is an explicitly ALLOWED case (AC2(b)/(g)) -- it must never be misdetected as a
+    post-create race collision. When True, this title-only search is therefore used ONLY
+    to confirm the new issue itself became visible; other same-title matches are ignored
+    entirely (never downgraded to "race"). Default False preserves the exact prior
+    behaviour for every existing caller.
     """
     last_matching: list[int] = []
     for attempt in range(max_attempts):
@@ -495,6 +516,16 @@ def _poll_for_created_issue(
         # May raise TransactionError(stage="dedupe-search") for saturation — let it propagate.
         matching = _find_open_issues_by_title(repo, title, gh_bin)
         last_matching = matching
+
+        if skip_internal_title_dedupe:
+            # Title-only matching cannot be used as a collision signal here: the outer
+            # dedupe_key search is the authoritative identity check, and this script's own
+            # internal title-only dedupe was explicitly bypassed for this create. Only
+            # confirm our own issue is visible; never flag "race" from other title matches.
+            if expected_issue_number in matching:
+                return ("confirmed", matching)
+            # Not yet visible: search index hasn't propagated yet — retry.
+            continue
 
         if len(matching) == 1 and matching[0] == expected_issue_number:
             # Only our issue is visible: confirmed.
@@ -2062,6 +2093,7 @@ def run_transaction(
     gh_bin: str,
     blocking_issue_numbers: list[int | str] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    skip_internal_title_dedupe: bool = False,
 ) -> TransactionResult:
     labels = _resolve_labels(labels, issue_kind, label_profile)
     try:
@@ -2168,17 +2200,29 @@ def run_transaction(
         )
     # --- End parent resolution ---
 
-    try:
-        dedupe_issue_numbers = _find_open_issues_by_title(repo, title, gh_bin)
-    except TransactionError as exc:
-        return TransactionResult(
-            status="failure",
-            issue_number=None,
-            issue_url=None,
-            completed_steps=[],
-            failure_stage=exc.stage,
-            failure_message=exc.message,
-        )
+    # skip_internal_title_dedupe (Issue #2602 AC2(g)): opt-in bypass of this script's own
+    # internal title-only OPEN-issue dedupe search. Intended ONLY for callers that have
+    # already confirmed via an outer, dedupe_key-based search (e.g.
+    # plan_child_materialization.py::_search_dedupe_candidates() /
+    # docs/dev/agent-skill-boundaries.md FOLLOW_UP_ISSUE_REQUEST_V1 dedupe flow) that no
+    # duplicate exists across OPEN/CLOSED issues. Without this bypass, this internal
+    # title-only search could re-match a DIFFERENT issue that merely shares the same
+    # title (dedupe_key mismatch), silently overriding the outer caller's "create
+    # confirmed" decision. Default is False: unchanged behavior for all existing callers.
+    if skip_internal_title_dedupe:
+        dedupe_issue_numbers = []
+    else:
+        try:
+            dedupe_issue_numbers = _find_open_issues_by_title(repo, title, gh_bin)
+        except TransactionError as exc:
+            return TransactionResult(
+                status="failure",
+                issue_number=None,
+                issue_url=None,
+                completed_steps=[],
+                failure_stage=exc.stage,
+                failure_message=exc.message,
+            )
     dedupe_number: int | None = dedupe_issue_numbers[0] if dedupe_issue_numbers else None
     if len(dedupe_issue_numbers) > 1:
         dedupe_collision_issue_number = dedupe_issue_numbers[0]
@@ -2442,7 +2486,12 @@ def run_transaction(
         )
         try:
             poll_verdict, matching_issue_numbers = _poll_for_created_issue(
-                repo, title, issue_number, gh_bin, sleep_fn=sleep_fn
+                repo,
+                title,
+                issue_number,
+                gh_bin,
+                sleep_fn=sleep_fn,
+                skip_internal_title_dedupe=skip_internal_title_dedupe,
             )
         except TransactionError as exc:
             if exc.stage == "dedupe-search":
@@ -2682,6 +2731,7 @@ def run_transaction_with_authoritative_readback(
     gh_bin: str,
     blocking_issue_numbers: list[int | str] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    skip_internal_title_dedupe: bool = False,
 ) -> TransactionResult:
     """Wrap run_transaction() with an authoritative post-create GraphQL readback
     of node_id, plus a body_sha256 computed from the effective body text.
@@ -2704,6 +2754,7 @@ def run_transaction_with_authoritative_readback(
         gh_bin=gh_bin,
         blocking_issue_numbers=blocking_issue_numbers,
         sleep_fn=sleep_fn,
+        skip_internal_title_dedupe=skip_internal_title_dedupe,
     )
     if result.issue_number is None:
         return result
@@ -3021,6 +3072,7 @@ def main(argv: list[str] | None = None) -> int:
             dependency_issue_numbers=args.dependency,
             blocking_issue_numbers=args.blocking,
             gh_bin=args.gh,
+            skip_internal_title_dedupe=args.skip_internal_title_dedupe,
         )
 
     sys.stdout.write(f"{json.dumps(result.__dict__, ensure_ascii=False, sort_keys=True)}\n")
