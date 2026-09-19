@@ -582,6 +582,16 @@ ALLOWED_EVENT_METADATA_KEYS = frozenset(
         "duration_ms",
         "exit_code",
         "run_kind",
+        # Trusted workflow-signal facts (Issue #2565). Values remain small
+        # scalar evidence; raw workflow output is never journaled.
+        "signal_kind",
+        "source",
+        "source_schema_version",
+        "issue_number",
+        "pr_number",
+        "approved_body_sha256",
+        "merge_commit_oid",
+        "merge_identity",
     }
 )
 _MAX_EVENT_METADATA_STRING_LEN = 200
@@ -621,6 +631,7 @@ def append_event(
     binding_id: str | None = None,
     execution_run_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    dedupe_key: str | None = None,
 ) -> dict[str, Any]:
     with db.write_transaction(conn):
         event_id = _append_event_tx(
@@ -631,6 +642,7 @@ def append_event(
             binding_id=binding_id,
             execution_run_id=execution_run_id,
             metadata=metadata,
+            dedupe_key=dedupe_key,
         )
     row = db.execute_readonly(conn, "SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
     return _row_to_dict(row)  # type: ignore[return-value]
@@ -645,14 +657,15 @@ def _append_event_tx(
     binding_id: str | None = None,
     execution_run_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    dedupe_key: str | None = None,
 ) -> str:
     metadata = metadata or {}
     _validate_event_metadata(metadata)
     event_id = new_id("event")
     conn.execute(
         "INSERT INTO events "
-        "(id, task_id, activity_id, binding_id, execution_run_id, event_type, metadata_json, occurred_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(id, task_id, activity_id, binding_id, execution_run_id, event_type, metadata_json, dedupe_key, occurred_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             event_id,
             task_id,
@@ -661,6 +674,7 @@ def _append_event_tx(
             execution_run_id,
             event_type,
             json.dumps(metadata, sort_keys=True),
+            dedupe_key,
             now_iso(),
         ),
     )
@@ -907,6 +921,13 @@ def get_current_projection_for_session(conn: sqlite3.Connection, claude_session_
     activity = get_activity(conn, activity_id) if activity_id else None
     location = get_current_location(conn, binding["id"])
     task_refs = list_live_task_refs(conn, task_id) if task_id else []
+    # Workflow facts derive attention; presentation stays owned by the
+    # existing renderer and consumes this unchanged projection field.
+    attention = None
+    if task_id:
+        import task_context_workflow_signals as workflow_signals
+        if workflow_signals.cleanup_pending_for_task(conn, task_id):
+            attention = "CLEANUP_PENDING"
     return {
         "binding": binding,
         "task": task,
@@ -914,7 +935,7 @@ def get_current_projection_for_session(conn: sqlite3.Connection, claude_session_
         "runtime_location": location,
         "task_refs": task_refs,
         "execution_run_id": execution_run_id,
-        "attention": None,
+        "attention": attention,
     }
 
 
@@ -972,6 +993,36 @@ def _ensure_active_activity_tx(conn: sqlite3.Connection, task_id: str, kind: str
     ).fetchone()
     if row is not None:
         return row["id"]
+    return _transition_activity_tx(conn, task_id, kind)
+
+
+def _select_activity_for_binding_tx(conn: sqlite3.Connection, task_id: str, kind: str) -> str:
+    """Select an ACTIVE Activity, except resume a merge-accepted Task at its
+    historical implementation Activity until cleanup owns the next transition.
+
+    A fresh Binding may resolve the same Task after ``pr_merged_observed`` was
+    committed but before ``cleanup begin`` ran.  Starting a generic native
+    Activity in that narrow gap would make the canonical cleanup transition
+    out-of-order.  Reattach to the completed implementation Activity instead;
+    ``begin_cleanup_lifecycle`` owns creating and binding cleanup atomically.
+    """
+    active = conn.execute(
+        "SELECT id FROM activities WHERE task_id = ? AND status = 'ACTIVE'", (task_id,)
+    ).fetchone()
+    if active is not None:
+        return active["id"]
+    merged = conn.execute(
+        "SELECT activity_id FROM events WHERE task_id = ? AND event_type = 'workflow:pr_merged_observed' "
+        "AND activity_id IS NOT NULL ORDER BY occurred_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if merged is not None:
+        implementation = conn.execute(
+            "SELECT id FROM activities WHERE id = ? AND task_id = ? AND kind = 'implementation'",
+            (merged["activity_id"], task_id),
+        ).fetchone()
+        if implementation is not None:
+            return implementation["id"]
     return _transition_activity_tx(conn, task_id, kind)
 
 
@@ -1049,7 +1100,7 @@ def bind_target_to_binding(
     and explicit ``/task <github-ref>`` rebind."""
     with db.write_transaction(conn):
         task_id = _resolve_or_create_task_for_target_tx(conn, repo, ref_kind, ref_number)
-        activity_id = _ensure_active_activity_tx(conn, task_id, activity_kind)
+        activity_id = _select_activity_for_binding_tx(conn, task_id, activity_kind)
         return _finish_binding_mutation_tx(
             conn,
             binding_id=binding_id,

@@ -14,6 +14,7 @@ out-of-repo consumer would use.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -37,7 +38,7 @@ def build_request(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def call(
-    argv: list[str], operation: str, payload: dict[str, Any], *, timeout: float
+    argv: list[str], operation: str, payload: dict[str, Any], *, timeout: float, origin_session_id: str | None = None
 ) -> dict[str, Any] | None:
     """Invoke ``task_contextctl.py <argv...>`` with ``payload`` wrapped in
     the canonical request envelope. Returns the parsed result envelope, or
@@ -45,12 +46,16 @@ def call(
     etc.) -- callers must fail open (never block a Claude Code hook event on
     an adapter-side transport failure)."""
     request = build_request(operation, payload)
+    child_env = dict(os.environ)
+    if origin_session_id is not None:
+        child_env["CLAUDE_CODE_SESSION_ID"] = origin_session_id
     try:
         proc = subprocess.run(
             [sys.executable, str(CTL_PATH), *argv],
             input=json.dumps(request),
             capture_output=True,
             text=True,
+            env=child_env,
             timeout=timeout,
         )
     except Exception:
@@ -62,6 +67,20 @@ def call(
         return json.loads(lines[-1])
     except json.JSONDecodeError:
         return None
+
+
+def call_signal_apply(
+    payload: dict[str, Any], *, origin_session_id: str | None, timeout: float = 5.0
+) -> dict[str, Any] | None:
+    """Map hook JSON's authoritative ``session_id`` to the CLI's internal
+    origin channel.  The session never enters the public signal payload."""
+    return call(
+        ["signal", "apply"],
+        "signal_apply",
+        payload,
+        timeout=timeout,
+        origin_session_id=origin_session_id,
+    )
 
 
 def call_hook(event: str, payload: dict[str, Any], *, timeout: float) -> dict[str, Any] | None:

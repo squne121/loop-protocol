@@ -30,7 +30,7 @@ a v1 consumer — see "Scope Growth Guard" in the Issue body):
 
 from __future__ import annotations
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 # ---------------------------------------------------------------------------
 # v1 DDL (PRAGMA user_version target = 1)
@@ -389,7 +389,22 @@ DDL_V2: list[str] = [
     """,
 ]
 
+# v3 is intentionally additive.  Workflow facts are still recorded in the
+# append-only event journal; ``dedupe_key`` gives their business identity a
+# physical same-fact guard without creating a second workflow ledger/table.
+DDL_V3: list[str] = [
+    """
+    ALTER TABLE events ADD COLUMN dedupe_key TEXT
+    """,
+    """
+    CREATE UNIQUE INDEX ux_events_dedupe_key
+        ON events(dedupe_key)
+        WHERE dedupe_key IS NOT NULL
+    """,
+]
+
 MIGRATIONS: dict[int, list[str]] = {
     1: DDL_V1,
     2: DDL_V2,
+    3: DDL_V3,
 }
