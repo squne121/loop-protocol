@@ -1209,16 +1209,14 @@ def collect_surface_files(repo_root: Path) -> list[str]:
         if p.is_file():
             files.append(str(p))
 
-    seen: set[str] = set()
-    result: list[str] = []
-    for f in files:
-        k = os.path.realpath(f)
-        if k not in seen:
-            seen.add(k)
-            result.append(f)
-
+    # Exclusion must run before realpath-based dedup (Issue #2674 fix-delta):
+    # an excluded `.claude/skills/.system/**/SKILL.md` candidate must never
+    # consume the `seen` slot for a governed skill's realpath. Ordering it
+    # after dedup allowed a `.system` file symlink pointing at the same real
+    # file as an ordinary skill to shadow (and then itself be excluded),
+    # dropping both from the scan (AC7 regression).
     filtered = []
-    for f in result:
+    for f in files:
         rel = os.path.relpath(f, root).replace("\\", "/")
         if ".claude/worktrees/" in rel:
             continue
@@ -1226,7 +1224,15 @@ def collect_surface_files(repo_root: Path) -> list[str]:
             continue
         filtered.append(f)
 
-    return filtered
+    seen: set[str] = set()
+    result: list[str] = []
+    for f in filtered:
+        k = os.path.realpath(f)
+        if k not in seen:
+            seen.add(k)
+            result.append(f)
+
+    return result
 
 
 # ---------------------------------------------------------------------------

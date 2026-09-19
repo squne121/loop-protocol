@@ -589,6 +589,46 @@ def test_system_skills_excluded_from_real_repo_scan_when_present():
     assert not any(r.startswith(checker.SYSTEM_SKILLS_PREFIX) for r in rels)
 
 
+def test_system_skills_realpath_symlink_does_not_shadow_normal_skill_scan(tmp_path):
+    """Regression (OWNER REQUEST_CHANGES, PR #2675): collect_surface_files()
+    must exclude `.claude/skills/.system/**` *before* realpath-based dedup,
+    not after. Previously, a `.system` SKILL.md that is a file symlink onto
+    the exact same real file as an ordinary (governed) skill would sort
+    first (`.system` < letters), consume the realpath dedup slot, cause the
+    ordinary skill to be dropped as a "duplicate", and then be excluded
+    itself — silently removing both from the scan (violates AC7: local
+    `.system` presence must not change repository-owned surface scan
+    results).
+
+    This proves full before/after equality of run_check()'s scan result
+    (scanned_files + violations), not merely that violations end up empty.
+    """
+    normal_skill_path = _write_skill_md(
+        tmp_path,
+        ".claude/skills/normal-skill",
+        "```bash\npython3 scripts/foo.py\n```\n",
+    )
+
+    baseline_files = checker.collect_surface_files(tmp_path)
+    baseline_result = checker.run_check(tmp_path)
+
+    # Sanity: the normal skill's violation is present in the baseline (so
+    # the later equality check is not vacuously trivial).
+    assert any(
+        v.file == ".claude/skills/normal-skill/SKILL.md" for v in baseline_result.violations
+    )
+
+    system_dir = tmp_path / ".claude" / "skills" / ".system" / "example"
+    system_dir.mkdir(parents=True, exist_ok=True)
+    (system_dir / "SKILL.md").symlink_to(normal_skill_path)
+
+    after_files = checker.collect_surface_files(tmp_path)
+    after_result = checker.run_check(tmp_path)
+
+    assert after_files == baseline_files
+    assert after_result == baseline_result
+
+
 # ---------------------------------------------------------------------------
 # AC7 repo_scan_clean
 # ---------------------------------------------------------------------------
