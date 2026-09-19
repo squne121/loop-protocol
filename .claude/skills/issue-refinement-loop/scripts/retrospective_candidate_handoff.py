@@ -50,9 +50,10 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Optional
 
 import yaml
 
@@ -68,18 +69,166 @@ import create_issue_txn  # noqa: E402
 import mrc_contract_parser  # noqa: E402
 import plan_child_materialization as _plan_child_materialization  # noqa: E402
 
-# Reused as-is (Issue #2602 Design Constraints: "Reuse the existing
-# caller-side dedupe convention"). This module does not reimplement the
-# gh issue list --state all --search "<dedupe_key>" search.
+# Reused as-is, completely unmodified (Issue #2602 Design Constraints: "Reuse
+# the existing caller-side dedupe convention"; ``## Required Design
+# References`` explicitly marks plan_child_materialization.py as
+# reference-only -- "本 Issue はこのファイル自体を変更しない、参照のみ" -- so
+# it is NOT in this Issue's ``## Allowed Paths`` and must never be edited from
+# this Issue). This module does not reimplement the
+# gh issue list --state all --search "<dedupe_key>" search this legacy,
+# list-returning function performs; it imports and calls it directly. Its own
+# 3 pre-existing callers (_classify_child()) never touch anything defined
+# below -- see PR #2673 review round-2 Blocker 1/3.
 search_dedupe_candidates = _plan_child_materialization._search_dedupe_candidates
-# PR #2673 review P1-3 fix-delta: the outcome-aware companion to
-# search_dedupe_candidates() above, which distinguishes complete/failure/
-# truncated instead of collapsing every non-success case to []. This is what
-# materialize_candidate() uses by default (search_fn=None) so a read/search
-# failure or an unresolved truncation is never silently converted into
-# "no duplicate found -> create" (see readback_dedupe_matches() below).
-search_dedupe_candidates_with_outcome = _plan_child_materialization._search_dedupe_candidates_with_outcome
-DedupeSearchOutcome = _plan_child_materialization.DedupeSearchOutcome
+
+
+# ---------------------------------------------------------------------------
+# Outcome-aware dedupe search companion (Issue #2602 P1-3, PR #2673 review
+# round-2 Blocker 1).
+#
+# The legacy ``search_dedupe_candidates()`` above always collapses every
+# non-success case (gh command failure, unparsable JSON, or a
+# saturated/truncated result page) down to a plain ``[]`` -- indistinguishable
+# from "confirmed: no duplicate exists". ``readback_dedupe_matches()`` below
+# needs a way to distinguish "confirmed: no duplicate" from "could not
+# determine", so this file adds that companion capability directly here
+# rather than inside plan_child_materialization.py (which this Issue does not
+# modify -- see the comment above). This is new capability, not a duplicate
+# of ``_search_dedupe_candidates()``'s own implementation: it needs
+# per-attempt success/error reporting and a configurable page limit that the
+# legacy, hard-coded-limit-10 function does not expose.
+# ---------------------------------------------------------------------------
+
+_DEDUPE_SEARCH_INITIAL_LIMIT = 10
+# Bounded second-page size used only to try to resolve an initial-page
+# saturation (Issue #2602 P1-3: "fetch additional pages if possible to
+# resolve it"). `gh issue list --search` does not expose a raw
+# cursor/page argument, so re-querying with a wider --limit is the
+# available resolution mechanism; if the widened query is ALSO saturated
+# the result is reported as genuinely indeterminate rather than guessed at.
+_DEDUPE_SEARCH_EXPANDED_LIMIT = 100
+# Bounded retry for transient command/parse failures only (not for
+# resolving truncation -- see _DEDUPE_SEARCH_EXPANDED_LIMIT above).
+_DEDUPE_SEARCH_TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+
+
+@dataclass(frozen=True)
+class DedupeSearchOutcome:
+    """Result-mode companion to ``search_dedupe_candidates()`` (Issue #2602
+    P1-3).
+
+    mode:
+      "complete"  — the search succeeded and the returned candidates are the
+                    full result set (not truncated by the page-size limit).
+      "failure"   — the `gh` search command failed (non-zero exit) or its
+                    output could not be parsed as JSON, even after bounded
+                    retry. `candidates` is always [] in this mode.
+      "truncated" — the search succeeded but the result count met or
+                    exceeded the requested page limit even after the bounded
+                    page-expansion retry; completeness cannot be guaranteed.
+                    `candidates` holds whatever was last fetched (may be a
+                    partial view) -- callers that require dedupe-identity
+                    certainty MUST NOT treat this as "no duplicate found".
+    """
+
+    mode: Literal["complete", "failure", "truncated"]
+    candidates: list[dict]
+    error: Optional[str] = None
+
+
+def _run_dedupe_search_once(
+    repo: str, dedupe_key: str, gh_bin: str, limit: int
+) -> tuple[bool, list[dict], Optional[str]]:
+    """Single (non-retried) ``gh issue list --search`` attempt.
+
+    Returns (ok, candidates, error). ``ok`` is False for both a non-zero `gh`
+    exit and an unparsable/non-list JSON payload; `candidates` is always []
+    when ``ok`` is False. This is a genuinely new primitive (per-attempt
+    success/error reporting + configurable limit), not a copy of
+    ``search_dedupe_candidates()``'s implementation.
+    """
+    args = [
+        gh_bin,
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "all",
+        "--search",
+        f'"{dedupe_key}"',
+        "--json",
+        "number,title,state,url",
+        "--limit",
+        str(limit),
+    ]
+    cp = subprocess.run(args, capture_output=True, text=True)
+    if cp.returncode != 0:
+        return False, [], (cp.stderr or cp.stdout or "gh issue list failed").strip() or "gh issue list failed"
+    try:
+        data = json.loads(cp.stdout.strip() or "[]")
+    except json.JSONDecodeError as exc:
+        return False, [], f"non-json output from gh issue list: {exc}"
+    if not isinstance(data, list):
+        return False, [], "unexpected non-list JSON response from gh issue list"
+    return True, data, None
+
+
+def search_dedupe_candidates_with_outcome(
+    repo: str,
+    dedupe_key: str,
+    gh_bin: str = "gh",
+    *,
+    initial_limit: int = _DEDUPE_SEARCH_INITIAL_LIMIT,
+    expanded_limit: int = _DEDUPE_SEARCH_EXPANDED_LIMIT,
+    retry_delays: tuple[float, ...] = _DEDUPE_SEARCH_TRANSIENT_RETRY_DELAYS,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    search_once_fn: Callable[[str, str, str, int], tuple[bool, list[dict], Optional[str]]] | None = None,
+) -> DedupeSearchOutcome:
+    """Search for existing issues matching a dedupe_key in all states,
+    reporting complete/failure/truncated as a machine-readable outcome
+    (Issue #2602 P1-3) instead of collapsing every non-success case to [].
+
+    This is what ``materialize_candidate()`` uses by default
+    (search_fn=None) so a read/search failure or an unresolved truncation is
+    never silently converted into "no duplicate found -> create" (see
+    ``readback_dedupe_matches()`` below).
+    """
+    run_once = search_once_fn or _run_dedupe_search_once
+
+    ok, candidates, error = run_once(repo, dedupe_key, gh_bin, initial_limit)
+    errors: list[str] = [error] if (not ok and error) else []
+    for delay in retry_delays:
+        if ok:
+            break
+        sleep_fn(delay)
+        ok, candidates, error = run_once(repo, dedupe_key, gh_bin, initial_limit)
+        if not ok and error:
+            errors.append(error)
+    if not ok:
+        return DedupeSearchOutcome(mode="failure", candidates=[], error="; ".join(errors) or None)
+
+    if len(candidates) < initial_limit:
+        return DedupeSearchOutcome(mode="complete", candidates=candidates)
+
+    # Initial page saturated: try a wider page to resolve the truncation
+    # before giving up and reporting "truncated" (indeterminate).
+    ok2, candidates2, error2 = run_once(repo, dedupe_key, gh_bin, expanded_limit)
+    errors2: list[str] = [error2] if (not ok2 and error2) else []
+    for delay in retry_delays:
+        if ok2:
+            break
+        sleep_fn(delay)
+        ok2, candidates2, error2 = run_once(repo, dedupe_key, gh_bin, expanded_limit)
+        if not ok2 and error2:
+            errors2.append(error2)
+    if not ok2:
+        # Could not resolve the truncation: indeterminate, never "complete".
+        return DedupeSearchOutcome(mode="truncated", candidates=candidates, error="; ".join(errors2) or None)
+    if len(candidates2) >= expanded_limit:
+        # Still saturated at the expanded page size: genuinely indeterminate.
+        return DedupeSearchOutcome(mode="truncated", candidates=candidates2)
+    return DedupeSearchOutcome(mode="complete", candidates=candidates2)
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +416,29 @@ class DedupeDecision:
     search_truncated: bool = False
 
 
+# Sentinel marker key (PR #2673 review round-2 Blocker 2): a per-candidate
+# detail fetch (`_fetch_issue_detail()` / an injected `detail_fn`) that
+# genuinely FAILED (non-zero `gh` exit, or unparsable JSON) must be
+# distinguishable from a successful fetch that legitimately found no
+# Machine-Readable Contract / no body (the pre-existing, widely-reused
+# `_no_match_detail_fn` test fixture returns a bare ``{}`` for exactly that
+# legitimate "no match" case -- see test_retrospective_candidate_handoff.py).
+# A bare ``{}`` without this marker key therefore still means "fetched
+# successfully, nothing found" and must keep scanning other candidates; only
+# a payload carrying this marker means "could not determine, fail closed".
+_DETAIL_FETCH_FAILED_MARKER = "_detail_fetch_failed"
+DETAIL_FETCH_FAILED: dict[str, Any] = {_DETAIL_FETCH_FAILED_MARKER: True}
+
+
 def _fetch_issue_detail(repo: str, number: int, gh_bin: str) -> dict[str, Any]:
     """Default (production) issue detail fetch: title/state/stateReason/url/body.
-    Tests inject ``detail_fn`` instead of exercising this subprocess path."""
+    Tests inject ``detail_fn`` instead of exercising this subprocess path.
+
+    Returns ``DETAIL_FETCH_FAILED`` (never a bare ``{}``) when the `gh`
+    command itself failed or its output could not be parsed as JSON, so
+    ``readback_dedupe_matches()`` can fail closed instead of silently
+    treating a transient fetch failure as "no match" (Issue #2602 PR #2673
+    review round-2 Blocker 2)."""
     args = [
         gh_bin,
         "issue",
@@ -282,11 +451,11 @@ def _fetch_issue_detail(repo: str, number: int, gh_bin: str) -> dict[str, Any]:
     ]
     completed = subprocess.run(args, capture_output=True, text=True)
     if completed.returncode != 0:
-        return {}
+        return dict(DETAIL_FETCH_FAILED)
     try:
         return json.loads(completed.stdout.strip() or "{}")
     except json.JSONDecodeError:
-        return {}
+        return dict(DETAIL_FETCH_FAILED)
 
 
 def readback_dedupe_matches(
@@ -337,6 +506,20 @@ def readback_dedupe_matches(
     for item in raw_candidates:
         number = int(item["number"])
         detail_payload = detail(repo, number, gh_bin)
+        if detail_payload.get(_DETAIL_FETCH_FAILED_MARKER):
+            # PR #2673 review round-2 Blocker 2: a per-candidate detail-fetch
+            # failure (non-zero `gh` exit / unparsable JSON) is NOT
+            # indistinguishable "no MRC found" -- it means identity for this
+            # search hit could not be determined at all. Silently
+            # `continue`-ing past it risks treating a genuine duplicate whose
+            # detail fetch transiently failed as "not a match", letting
+            # materialization proceed to create a duplicate. Fail closed for
+            # the whole decision instead of guessing.
+            return DedupeDecision(
+                action="indeterminate",
+                reason=f"dedupe_detail_fetch_failed_for_issue_{number}",
+                search_truncated=search_truncated,
+            )
         body_text = detail_payload.get("body") or ""
         # P1-2: exact dedupe_key identity is the canonical Machine-Readable
         # Contract `dedupe_key` field (parsed via the shared, section-bound
@@ -478,8 +661,20 @@ def render_materialization_body(candidate: NormalizedCandidate) -> str:
         sort_keys=False,
         allow_unicode=True,
     ).rstrip("\n")
+    # P2-1: the human review asked for a body-text reference to blocked_by
+    # in addition to the already-correct functional wiring (candidate's
+    # normalized blocked_by -> create_issue_txn.py's --blocked-by /
+    # dependency_issue_numbers, handled separately in materialize_candidate()
+    # below). Rendered on a render-time copy only -- never mutates
+    # candidate.source_reference itself (MaterializationResult.source_reference
+    # must remain the unmodified value adapt_*() produced), and reuses the
+    # same yaml.safe_dump()-based serialization as the rest of this function
+    # (P2-2) rather than reintroducing f-string/repr() formatting.
+    source_reference_for_render: dict[str, Any] = dict(candidate.source_reference)
+    if candidate.blocked_by:
+        source_reference_for_render["blocked_by"] = list(candidate.blocked_by)
     source_ref_yaml_text = yaml.safe_dump(
-        dict(candidate.source_reference),
+        source_reference_for_render,
         default_flow_style=False,
         sort_keys=True,
         allow_unicode=True,

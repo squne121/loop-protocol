@@ -30,17 +30,29 @@ Boundaries covered (Issue #2602 body, "## Verification Scenarios" +
 from __future__ import annotations
 
 import functools
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 SCRIPT_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import retrospective_candidate_handoff as h  # noqa: E402
-import plan_child_materialization as pmc  # noqa: E402
+
+
+def _extract_yaml_block(body: str, heading: str) -> dict[str, Any]:
+    """Round-trip a ```yaml fenced block following a Markdown ``heading`` in a
+    rendered Issue body back into a dict, for assertions that must not depend
+    on brittle raw-string matching (Issue #2602 P2-2: bodies are rendered via
+    yaml.safe_dump(), so they should be verified the same way)."""
+    escaped_heading = re.escape(heading)
+    match = re.search(rf"{escaped_heading}\n\n```yaml\n(.*?)\n```", body, re.DOTALL)
+    assert match, f"no ```yaml block found under heading {heading!r} in body:\n{body}"
+    return yaml.safe_load(match.group(1))
 
 
 # ---------------------------------------------------------------------------
@@ -757,13 +769,17 @@ class TestSameKeyClosedIssueDispositionPreserved:
 
 
 # ---------------------------------------------------------------------------
-# PR #2673 review P1-3 fix-delta: dedupe search read/search failure and
-# unresolved result truncation must never be silently converted into
-# "no duplicate found -> create". Only the `gh` I/O boundary
-# (pmc._run_dedupe_search_once, a thin subprocess.run wrapper) and the
-# sleep/time boundary (sleep_fn) are faked -- the real production
-# pmc._search_dedupe_candidates_with_outcome() decision logic is exercised
-# via readback_dedupe_matches()'s search_outcome_fn seam.
+# PR #2673 review P1-3 fix-delta (round-2 Blocker 1: this outcome-aware
+# search companion now lives in retrospective_candidate_handoff.py itself,
+# not in plan_child_materialization.py, which this Issue's Allowed Paths
+# excludes -- see the module-level comment above search_dedupe_candidates_
+# with_outcome() in retrospective_candidate_handoff.py). Dedupe search
+# read/search failure and unresolved result truncation must never be
+# silently converted into "no duplicate found -> create". Only the `gh`
+# I/O boundary (h._run_dedupe_search_once, a thin subprocess.run wrapper)
+# and the sleep/time boundary (sleep_fn) are faked -- the real production
+# h.search_dedupe_candidates_with_outcome() decision logic is exercised via
+# readback_dedupe_matches()'s search_outcome_fn seam.
 # ---------------------------------------------------------------------------
 
 
@@ -773,7 +789,7 @@ class TestDedupeSearchFailureAndTruncationAreIndeterminate:
             return False, [], "gh: command not found"
 
         search_outcome_fn = functools.partial(
-            pmc._search_dedupe_candidates_with_outcome,
+            h.search_dedupe_candidates_with_outcome,
             search_once_fn=_always_fails,
             sleep_fn=lambda *_a, **_k: None,
         )
@@ -805,7 +821,7 @@ class TestDedupeSearchFailureAndTruncationAreIndeterminate:
             return True, [{"number": n, "title": "x", "state": "OPEN", "url": ""} for n in range(limit)], None
 
         search_outcome_fn = functools.partial(
-            pmc._search_dedupe_candidates_with_outcome,
+            h.search_dedupe_candidates_with_outcome,
             search_once_fn=_always_saturated,
             sleep_fn=lambda *_a, **_k: None,
         )
@@ -837,13 +853,13 @@ class TestDedupeSearchFailureAndTruncationAreIndeterminate:
 
         def _first_page_saturated_then_resolved(_repo, _dedupe_key, _gh_bin, limit):
             calls.append(limit)
-            if limit == pmc._DEDUPE_SEARCH_INITIAL_LIMIT:
+            if limit == h._DEDUPE_SEARCH_INITIAL_LIMIT:
                 return True, [{"number": n, "title": "x", "state": "OPEN", "url": ""} for n in range(limit)], None
             # Expanded page: fewer items than the expanded limit -> complete.
             return True, [{"number": 1, "title": "x", "state": "OPEN", "url": ""}], None
 
         search_outcome_fn = functools.partial(
-            pmc._search_dedupe_candidates_with_outcome,
+            h.search_dedupe_candidates_with_outcome,
             search_once_fn=_first_page_saturated_then_resolved,
             sleep_fn=lambda *_a, **_k: None,
         )
@@ -866,7 +882,83 @@ class TestDedupeSearchFailureAndTruncationAreIndeterminate:
             create_fn=create_fn,
         )
 
-        assert calls == [pmc._DEDUPE_SEARCH_INITIAL_LIMIT, pmc._DEDUPE_SEARCH_EXPANDED_LIMIT]
+        assert calls == [h._DEDUPE_SEARCH_INITIAL_LIMIT, h._DEDUPE_SEARCH_EXPANDED_LIMIT]
+        assert result.status == "created"
+        assert len(create_fn.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# PR #2673 review round-2 Blocker 2: a per-candidate detail-fetch failure
+# (non-zero `gh issue view` exit / unparsable JSON) must never be
+# indistinguishable from "no MRC found in this candidate's body" -- it must
+# be surfaced as the same indeterminate/failure signal used for search-level
+# failures, not silently `continue`d past (which would let a genuine
+# duplicate whose detail fetch transiently failed fall through to "create").
+# ---------------------------------------------------------------------------
+
+
+class TestPerCandidateDetailFetchFailureIsIndeterminate:
+    def test_detail_fetch_failure_for_a_real_candidate_is_never_converted_to_create(self) -> None:
+        """search_fn returns a real, matching-looking candidate issue, but
+        detail_fn simulates a transient gh/JSON failure (the designated
+        h.DETAIL_FETCH_FAILED sentinel) for that specific candidate. The
+        overall decision must be indeterminate/failed, NOT "create" -- even
+        though, absent the failure, this candidate's body would have
+        confirmed an exact dedupe_key duplicate."""
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Improve X"),
+        )
+
+        def _search(_repo: str, _key: str, _gh_bin: str) -> list[dict[str, Any]]:
+            return [{"number": 55, "title": "looks like a duplicate", "state": "OPEN", "url": "https://x/55"}]
+
+        def _detail_transient_failure(_repo: str, number: int, _gh_bin: str) -> dict[str, Any]:
+            assert number == 55
+            # Simulates a transient `gh issue view` failure / JSON parse
+            # error for this specific candidate -- the designated failure
+            # sentinel, distinct from a bare `{}` "fetched OK, nothing found"
+            # response.
+            return dict(h.DETAIL_FETCH_FAILED)
+
+        create_fn = SpyCreateFn(issue_number=999)
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_search,
+            detail_fn=_detail_transient_failure,
+            create_fn=create_fn,
+        )
+
+        assert result.status == "failed"
+        assert len(create_fn.calls) == 0, "per-candidate detail-fetch failure must never fall through to create"
+        assert result.next_action is None
+
+    def test_bare_empty_dict_detail_response_is_still_legitimate_no_match(self) -> None:
+        """Regression guard: a detail_fn that legitimately fetched an issue
+        successfully but found no body/no MRC (the pre-existing, widely-used
+        `_no_match_detail_fn` shape: a bare `{}` with no failure marker) must
+        still be treated as "no match, keep scanning" -- only the designated
+        h.DETAIL_FETCH_FAILED sentinel means "could not determine"."""
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(title="Improve X"),
+        )
+
+        def _search(_repo: str, _key: str, _gh_bin: str) -> list[dict[str, Any]]:
+            return [{"number": 56, "title": "unrelated", "state": "OPEN", "url": "https://x/56"}]
+
+        create_fn = SpyCreateFn(issue_number=1000)
+        result = h.materialize_candidate(
+            candidate,
+            human_authorized=True,
+            repo="owner/repo",
+            search_fn=_search,
+            detail_fn=_no_match_detail_fn,
+            create_fn=create_fn,
+        )
+
         assert result.status == "created"
         assert len(create_fn.calls) == 1
 
@@ -1008,6 +1100,46 @@ class TestBlockedByPreservedThroughMaterialization:
         NormalizedCandidate.blocked_by defaults to () for that adapter."""
         candidate = h.adapt_agent_improvement_candidate(_agent_candidate_with_finding_contract())
         assert candidate.blocked_by == ()
+
+    def test_non_empty_blocked_by_is_referenced_in_rendered_body_text(self) -> None:
+        """PR #2673 review P2-1 (warning): in addition to the already-correct
+        functional --blocked-by wiring, a non-empty blocked_by must also be
+        referenced as text in render_materialization_body()'s output (via
+        the existing yaml.safe_dump()-based Source Reference block, never
+        f-string/repr())."""
+        raw_candidate = _chatgpt_candidate(title="Improve X")
+        raw_candidate["blocked_by"] = ["#123", "#456"]
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [raw_candidate]),
+            raw_candidate,
+        )
+
+        body = h.render_materialization_body(candidate)
+
+        assert "123" in body and "456" in body, "blocked_by issue numbers must be referenced in the rendered body"
+        # Round-trips through YAML rather than a brittle raw substring check.
+        # Rendered verbatim as the producer's own "#123"-style references
+        # (the same tuple NormalizedCandidate.blocked_by already holds) --
+        # normalization to plain ints is create_issue_txn.py's writer-arg
+        # concern (--blocked-by), exercised separately in
+        # test_non_empty_blocked_by_survives_into_create_issue_txn_writer_arguments.
+        rendered_source_reference = _extract_yaml_block(body, "## Source Reference")
+        assert rendered_source_reference["blocked_by"] == ["#123", "#456"]
+        # Rendering must not mutate the candidate's own source_reference.
+        assert "blocked_by" not in candidate.source_reference
+
+    def test_empty_blocked_by_is_not_referenced_in_rendered_body_text(self) -> None:
+        """Regression guard: an empty blocked_by must not add a spurious
+        empty blocked_by key/section to the rendered body."""
+        candidate = h.adapt_chatgpt_candidate(
+            _chatgpt_result({"repo": "owner/repo", "type": "issue", "number": 10}, [_chatgpt_candidate()]),
+            _chatgpt_candidate(),
+        )
+
+        body = h.render_materialization_body(candidate)
+
+        rendered_source_reference = _extract_yaml_block(body, "## Source Reference")
+        assert "blocked_by" not in rendered_source_reference
 
 
 # ---------------------------------------------------------------------------
