@@ -404,7 +404,9 @@ def select_issue_worktree(catalog, issue_number, root_realpath):
     controlled_executor_path = repo_root / "scripts" / "agent-guards" / "controlled_skill_mutation_exec.py"
     controlled_executor_source = controlled_executor_path.read_text(encoding="utf-8")
     default_gh_trusted_paths = '_GH_TRUSTED_PATHS = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"'
-    fixture_gh_trusted_paths = f'_GH_TRUSTED_PATHS = {str(trusted_gh_bin)!r} + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"'
+    fixture_gh_trusted_paths = (
+        f'_GH_TRUSTED_PATHS = {str(trusted_gh_bin)!r} + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"'
+    )
     assert default_gh_trusted_paths in controlled_executor_source, "_GH_TRUSTED_PATHS literal not found"
     _write_text(
         controlled_executor_path,
