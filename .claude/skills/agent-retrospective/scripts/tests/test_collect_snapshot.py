@@ -827,3 +827,221 @@ def test_given_exception_message_with_path_when_operational_result_built_then_sa
     assert diagnostics["errno"] == 13
     assert diagnostics["safe_detail"] is None
     assert "/home/squne" not in str(diagnostics)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2664 AC6: observation.etag reflects private_evidence.evidence_digest
+# ---------------------------------------------------------------------------
+
+
+def test_collect_claude_code_source_etag_matches_evidence_digest_and_differs_with_record_content(tmp_path):
+    """Issue #2664 AC6: ``collect_claude_code_source()``'s ``observation.etag``
+    equals ``f"sha256:{private_evidence['evidence_digest']}"`` for the SAME
+    result (never a distinct, independently-computed value), and differs
+    when the underlying ``normalized_records`` content differs -- proven
+    with two single-session inputs that share identical
+    status/pagination/record-count shape but differ only in ``sessionId``
+    content."""
+    record_a = {
+        "type": "user",
+        "role": "user",
+        "timestamp": "2026-08-20T00:00:00Z",
+        "sessionId": "s-a",
+        "uuid": "u1",
+    }
+    record_b = {**record_a, "sessionId": "s-b"}
+    session_a = tmp_path / "session_a.jsonl"
+    session_a.write_text(json.dumps(record_a) + "\n", encoding="utf-8")
+    session_b = tmp_path / "session_b.jsonl"
+    session_b.write_text(json.dumps(record_b) + "\n", encoding="utf-8")
+
+    result_a = cs.collect_claude_code_source([session_a], clock=_fixed_clock)
+    result_b = cs.collect_claude_code_source([session_b], clock=_fixed_clock)
+
+    records_a = result_a.private_evidence["normalized_records"]
+    records_b = result_b.private_evidence["normalized_records"]
+
+    # (a) etag is a `sha256:`-prefixed reflection of THIS SAME result's own
+    # evidence_digest -- never a fixed/fabricated placeholder.
+    assert result_a.observation["etag"] == f"sha256:{result_a.private_evidence['evidence_digest']}"
+    assert result_b.observation["etag"] == f"sha256:{result_b.private_evidence['evidence_digest']}"
+    assert result_a.observation["etag"] == f"sha256:{cs._digest(records_a)}"  # noqa: SLF001
+
+    # (b) different normalized record CONTENT (different sessionId) ->
+    # different etag, even though both results share identical
+    # status/pagination/record-count shape.
+    assert result_a.observation["source_status"] == result_b.observation["source_status"] == "complete"
+    assert len(records_a) == len(records_b) == 1
+    assert result_a.observation["etag"] != result_b.observation["etag"]
+
+    # (c) etag remains a schema-valid free-form string field on
+    # `source_observation` (no new schema key introduced).
+    _assert_valid_source_observation(result_a.observation)
+    _assert_valid_source_observation(result_b.observation)
+
+
+def test_collect_claude_code_source_etag_reflects_post_scrub_normalized_records_at_masking_boundary(tmp_path):
+    """Issue #2664, PR #2671 review fix_delta (Fix A): a raw `sessionId`
+    that is an absolute local path is redacted by `_scrub()` to the SAME
+    `"[redacted-local-path]"` placeholder regardless of which specific path
+    it held -- the masking boundary where two DISTINCT raw values collapse
+    to one scrubbed value (e.g. `/tmp/session-a` and `/tmp/session-b`).
+
+    Before this fix, `evidence_digest`/`observation.etag` were computed
+    from the PRE-scrub `normalized` records inside the collector, while
+    `_finalize()` independently scrubbed `private_evidence` a moment
+    later -- so the publicly observable etag/digest did not equal
+    `_digest()` of the ACTUALLY-RETURNED (post-scrub)
+    `private_evidence["normalized_records"]` whenever a record held a raw
+    path/credential-shaped value. This test independently recomputes
+    `_digest()` over the FINAL returned `normalized_records` and proves it
+    equals both `evidence_digest` and the `sha256:` part of `etag`, for two
+    inputs that collide at the masking boundary."""
+    record_a = {
+        "type": "user",
+        "role": "user",
+        "timestamp": "2026-08-20T00:00:00Z",
+        "sessionId": "/tmp/session-a",
+        "uuid": "u1",
+    }
+    record_b = {**record_a, "sessionId": "/tmp/session-b"}
+    session_a = tmp_path / "session_a.jsonl"
+    session_a.write_text(json.dumps(record_a) + "\n", encoding="utf-8")
+    session_b = tmp_path / "session_b.jsonl"
+    session_b.write_text(json.dumps(record_b) + "\n", encoding="utf-8")
+
+    result_a = cs.collect_claude_code_source([session_a], clock=_fixed_clock)
+    result_b = cs.collect_claude_code_source([session_b], clock=_fixed_clock)
+
+    records_a = result_a.private_evidence["normalized_records"]
+    records_b = result_b.private_evidence["normalized_records"]
+
+    # Both distinct raw sessionId values collapse to the identical
+    # redaction placeholder in the FINAL returned records.
+    assert records_a == records_b == [{**record_a, "sessionId": "[redacted-local-path]"}]
+
+    # evidence_digest/etag are the fingerprint of the FINAL (post-scrub)
+    # returned records, independently recomputed here -- never of the
+    # pre-scrub raw sessionId values (which differed between a and b).
+    assert result_a.private_evidence["evidence_digest"] == cs._digest(records_a)  # noqa: SLF001
+    assert result_b.private_evidence["evidence_digest"] == cs._digest(records_b)  # noqa: SLF001
+    assert result_a.observation["etag"] == f"sha256:{cs._digest(records_a)}"  # noqa: SLF001
+    assert result_b.observation["etag"] == f"sha256:{cs._digest(records_b)}"  # noqa: SLF001
+
+    # Because the scrubbed content is identical, the digests/etags for the
+    # two DIFFERENT raw inputs are now identical too -- proving the fix
+    # unifies all three values (normalized_records, evidence_digest, etag)
+    # around the SAME final content instead of leaking a pre-scrub
+    # distinction through the digest.
+    assert result_a.private_evidence["evidence_digest"] == result_b.private_evidence["evidence_digest"]
+    assert result_a.observation["etag"] == result_b.observation["etag"]
+
+
+def test_collect_claude_gpt_source_etag_matches_evidence_digest_and_differs_with_record_content(tmp_path):
+    """Issue #2664 AC6: ``collect_claude_gpt_source()``'s ``observation.etag``
+    equals ``f"sha256:{private_evidence['evidence_digest']}"`` for the SAME
+    result, and differs when the underlying (nonce-matched) hook-sink record
+    content differs -- proven with two paired UserPromptSubmit/Stop hook-sink
+    fixtures that share identical status/pagination/record-count shape but
+    differ only in ``session_id`` content."""
+    def _paired_events(session_id: str) -> list[dict]:
+        return [
+            {
+                "run_nonce": "n-etag",
+                "event": "UserPromptSubmit",
+                "session_id": session_id,
+                "ts": "2026-08-20T00:00:00Z",
+            },
+            {"run_nonce": "n-etag", "event": "Stop", "session_id": session_id, "ts": "2026-08-20T00:00:05Z"},
+        ]
+
+    sink_a = tmp_path / "hook_sink_a.jsonl"
+    _write_hook_sink(sink_a, _paired_events("s-etag-a"))
+    sink_b = tmp_path / "hook_sink_b.jsonl"
+    _write_hook_sink(sink_b, _paired_events("s-etag-b"))
+
+    result_a = cs.collect_claude_gpt_source(sink_a, run_nonce="n-etag", clock=_fixed_clock)
+    result_b = cs.collect_claude_gpt_source(sink_b, run_nonce="n-etag", clock=_fixed_clock)
+
+    records_a = result_a.private_evidence["normalized_records"]
+    records_b = result_b.private_evidence["normalized_records"]
+
+    # (a) etag is a `sha256:`-prefixed reflection of THIS SAME result's own
+    # evidence_digest -- never a fixed/fabricated placeholder.
+    assert result_a.observation["etag"] == f"sha256:{result_a.private_evidence['evidence_digest']}"
+    assert result_b.observation["etag"] == f"sha256:{result_b.private_evidence['evidence_digest']}"
+    assert result_a.observation["etag"] == f"sha256:{cs._digest(records_a)}"  # noqa: SLF001
+
+    # (b) different nonce-matched record CONTENT (different session_id) ->
+    # different etag, even though both results share identical
+    # status/pagination/record-count shape.
+    assert result_a.observation["source_status"] == result_b.observation["source_status"] == "complete"
+    assert len(records_a) == len(records_b) == 2
+    assert result_a.observation["etag"] != result_b.observation["etag"]
+
+    # (c) etag remains a schema-valid free-form string field on
+    # `source_observation` (no new schema key introduced).
+    _assert_valid_source_observation(result_a.observation)
+    _assert_valid_source_observation(result_b.observation)
+
+
+def test_collect_claude_gpt_source_etag_reflects_post_scrub_normalized_records_at_masking_boundary(tmp_path):
+    """Issue #2664, PR #2671 review fix_delta (Fix A): a raw `session_id`
+    that is an absolute local path is redacted by `_scrub()` to the SAME
+    `"[redacted-local-path]"` placeholder regardless of which specific path
+    it held -- the masking boundary where two DISTINCT raw values collapse
+    to one scrubbed value (e.g. `/tmp/session-a` and `/tmp/session-b`).
+
+    Before this fix, `evidence_digest`/`observation.etag` were computed
+    from the PRE-scrub `nonce_matched` records inside the collector, while
+    `_finalize()` independently scrubbed `private_evidence` a moment
+    later -- so the publicly observable etag/digest did not equal
+    `_digest()` of the ACTUALLY-RETURNED (post-scrub)
+    `private_evidence["normalized_records"]` whenever a record held a raw
+    path/credential-shaped value. This test independently recomputes
+    `_digest()` over the FINAL returned `normalized_records` and proves it
+    equals both `evidence_digest` and the `sha256:` part of `etag`, for two
+    inputs that collide at the masking boundary."""
+
+    def _paired_events(session_id: str) -> list[dict]:
+        return [
+            {
+                "run_nonce": "n-mask",
+                "event": "UserPromptSubmit",
+                "session_id": session_id,
+                "ts": "2026-08-20T00:00:00Z",
+            },
+            {"run_nonce": "n-mask", "event": "Stop", "session_id": session_id, "ts": "2026-08-20T00:00:05Z"},
+        ]
+
+    sink_a = tmp_path / "hook_sink_mask_a.jsonl"
+    _write_hook_sink(sink_a, _paired_events("/tmp/session-a"))
+    sink_b = tmp_path / "hook_sink_mask_b.jsonl"
+    _write_hook_sink(sink_b, _paired_events("/tmp/session-b"))
+
+    result_a = cs.collect_claude_gpt_source(sink_a, run_nonce="n-mask", clock=_fixed_clock)
+    result_b = cs.collect_claude_gpt_source(sink_b, run_nonce="n-mask", clock=_fixed_clock)
+
+    records_a = result_a.private_evidence["normalized_records"]
+    records_b = result_b.private_evidence["normalized_records"]
+
+    # Both distinct raw session_id values collapse to the identical
+    # redaction placeholder in the FINAL returned records.
+    assert records_a == records_b
+    assert all(r["session_id"] == "[redacted-local-path]" for r in records_a)
+
+    # evidence_digest/etag are the fingerprint of the FINAL (post-scrub)
+    # returned records, independently recomputed here -- never of the
+    # pre-scrub raw session_id values (which differed between a and b).
+    assert result_a.private_evidence["evidence_digest"] == cs._digest(records_a)  # noqa: SLF001
+    assert result_b.private_evidence["evidence_digest"] == cs._digest(records_b)  # noqa: SLF001
+    assert result_a.observation["etag"] == f"sha256:{cs._digest(records_a)}"  # noqa: SLF001
+    assert result_b.observation["etag"] == f"sha256:{cs._digest(records_b)}"  # noqa: SLF001
+
+    # Because the scrubbed content is identical, the digests/etags for the
+    # two DIFFERENT raw inputs are now identical too -- proving the fix
+    # unifies all three values (normalized_records, evidence_digest, etag)
+    # around the SAME final content instead of leaking a pre-scrub
+    # distinction through the digest.
+    assert result_a.private_evidence["evidence_digest"] == result_b.private_evidence["evidence_digest"]
+    assert result_a.observation["etag"] == result_b.observation["etag"]
