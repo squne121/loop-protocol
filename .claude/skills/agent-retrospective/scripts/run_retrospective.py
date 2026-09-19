@@ -4626,6 +4626,39 @@ def build_repository_collector(repo_root: Path) -> Callable[[str], Any]:
     return _collect
 
 
+def _build_frozen_runtime_collectors(collector_results: dict[str, Any | None]) -> list[Callable[[str], Any]]:
+    """Issue #2664 AC1/AC2/AC3/AC7: wraps each non-``None`` entry of an
+    ALREADY-COLLECTED runtime ``collector_results`` map (the SAME
+    ``collect_session_sources()``-shaped dict ``build_runtime_observer_task_prompt``
+    below consumes for observer task text) into a
+    ``Callable[[base_sha], CollectorResult]`` closure -- the shape
+    ``prepare()``'s ``collectors`` sequence requires (see
+    ``build_repository_collector`` above) -- that returns that EXACT frozen
+    ``collect_snapshot.CollectorResult`` object, ignoring the ``base_sha``
+    argument ``prepare()`` passes it and never re-accessing the underlying
+    JSONL/hook-sink files (no re-collection). A ``None``-valued entry (a
+    requested-but-unconfigured source this run, e.g. ``claude_gpt`` with no
+    hook-sink env var set -- see ``compute_source_coverage_entry``) is
+    skipped entirely, mirroring ``build_runtime_observer_task_prompt``'s
+    existing None-skip precedent below -- it is never wired into a closure,
+    so ``prepare()``'s ``source_set_digest`` never spuriously reflects an
+    unattempted source (AC7). Iterates ``sorted(collector_results)`` purely
+    for deterministic closure-construction order -- AC3 already establishes
+    that ``compute_source_set_digest()`` itself does not depend on
+    observation enumeration order."""
+    collectors: list[Callable[[str], Any]] = []
+    for source_id in sorted(collector_results or {}):
+        result = collector_results[source_id]
+        if result is None:
+            continue
+
+        def _collect(_base_sha: str, _result: Any = result) -> Any:
+            return _result
+
+        collectors.append(_collect)
+    return collectors
+
+
 #: fixed, non-identity fields used by ``_default_observer_prompt`` below
 #: (Issue #2345 fix_delta, OWNER review
 #: https://github.com/squne121/loop-protocol/pull/2347#issuecomment-5417901341,
@@ -5036,6 +5069,7 @@ def run_cli(
     previous_state_provider: "PreviousStateProviderProtocol | None" = None,
     previous_state_scope: str = DEFAULT_PREVIOUS_STATE_SCOPE,
     current_source_coverage: dict[str, dict[str, Any]] | None = None,
+    frozen_runtime_collector_results: dict[str, Any | None] | None = None,
 ) -> PublishRequest:
     """The single production call graph (Issue #2237 P0-2): manual-trigger
     preflight -> run-scoped temp dir -> collector closures -> ``prepare`` ->
@@ -5080,7 +5114,33 @@ def run_cli(
     the two never see divergent inputs (Issue #2644 AC4). ``None`` (a caller
     with no session-source coverage information, e.g. every existing
     ``run_cli()`` caller before this Issue) leaves both call sites'
-    behavior byte-for-byte unchanged."""
+    behavior byte-for-byte unchanged.
+
+    ``frozen_runtime_collector_results`` (Issue #2664, additive -- same
+    opt-in ``None``-default pattern as ``current_source_coverage`` above;
+    ``None`` is a complete no-op identical to this function's pre-#2664
+    behavior) is THIS run's already-collected runtime
+    ``collect_session_sources()``-shaped ``collector_results`` map (source id
+    -- e.g. ``"claude_code"``/``"claude_gpt"`` -- to a Child 3
+    ``collect_snapshot.CollectorResult``, or ``None`` for a requested-but-
+    unconfigured source), i.e. the SAME dict
+    ``build_since_last_analysis_runner()``'s ``_run`` closure already threads
+    into ``build_since_last_analysis_prompts()``/
+    ``build_runtime_observer_task_prompt()`` for the observer's task text.
+    When non-``None``, each non-``None`` entry is wrapped (via
+    ``_build_frozen_runtime_collectors``) into a closure that returns that
+    EXACT frozen ``CollectorResult`` object -- never re-collecting from the
+    underlying JSONL/hook-sink files -- and appended to the ``collectors``
+    list this function passes to ``prepare()``, so ``prepare()``'s
+    ``source_set_digest`` (via ``compute_source_set_digest()``, unchanged)
+    and the observer's task text derive from the IDENTICAL frozen runtime
+    evidence (Issue #2664 AC1/AC2/AC3/AC4). A ``None``-valued entry (a
+    requested-but-unconfigured source) is skipped entirely -- mirroring
+    ``build_runtime_observer_task_prompt()``'s existing None-skip precedent
+    -- never wired into a closure (Issue #2664 AC7). ``None`` (every existing
+    ``run_cli()`` caller before this Issue, and every caller that omits this
+    argument) leaves ``collectors`` byte-for-byte unchanged
+    (repository-only, Issue #2664 AC5)."""
     manual_trigger_preflight(repo_root=repo_root)
     resolved_run_id = run_id or str(uuid.uuid4())
 
@@ -5107,6 +5167,8 @@ def run_cli(
             settings_path=str(bash_guard_settings_path),
         )
         collectors = [build_repository_collector(repo_root)]
+        if frozen_runtime_collector_results is not None:
+            collectors.extend(_build_frozen_runtime_collectors(frozen_runtime_collector_results))
         ctx, plan, results = prepare(
             base_sha_resolver=_base_sha_resolver, collectors=collectors, clock=clock, run_id=resolved_run_id
         )
@@ -6830,7 +6892,15 @@ def build_since_last_analysis_runner(
     ``run_since_last_retrospective_cli``'s checkpoint separation (Issue
     #2644 Outcome 3/4) treats as sufficient for checkpoint advancement --
     GitHub publication (a separate, later, human-authorized channel; see
-    ``persist_retrospective_run.py``) is never invoked from here."""
+    ``persist_retrospective_run.py``) is never invoked from here.
+
+    Issue #2664 AC1: ``collector_results`` -- the SAME dict this closure
+    already threads into ``build_since_last_analysis_prompts()`` (observer
+    task text) -- is ALSO threaded into ``run_cli()``'s new
+    ``frozen_runtime_collector_results`` parameter, so observer input and
+    ``source_set_digest`` computation share the IDENTICAL frozen runtime
+    evidence for this run (never re-collected separately at either
+    site)."""
 
     def _run(collector_results: dict[str, Any | None], source_coverage: dict[str, dict[str, Any]]) -> PublishRequest:
         prompts = build_since_last_analysis_prompts(collector_results)
@@ -6849,6 +6919,7 @@ def build_since_last_analysis_runner(
             temp_base_dir=temp_base_dir,
             previous_state_provider=previous_state_provider,
             current_source_coverage=source_coverage,
+            frozen_runtime_collector_results=collector_results,
         )
 
     return _run
