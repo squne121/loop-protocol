@@ -1073,13 +1073,55 @@ echo "CLAUDE_GPT_AUTO_MODE_CHECK_PATH=${AUTO_MODE_CHECK_PATH}" >&2
 #     （正常/エラー/timeout/SIGINT/SIGTERM）で確実に proxy を kill/wait する。 ---
 
 unset CLAUDE_CODE_SUBAGENT_MODEL
-# Issue #2274 AC13: pin the production fork/background invariant
-# (`CLAUDE_CODE_FORK_SUBAGENT` unset/0, `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: 1`)
-# for the real claude child process. `unset` (not merely absent) so a
-# leaked ambient export from the launching shell cannot survive into the
-# child process's environment.
+# Issue #2652: the Spark-specific foreground invariant that Issue #2274
+# AC13 used to pin here (`CLAUDE_CODE_FORK_SUBAGENT` unset/0 PAIRED WITH
+# `export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`) is retired. That pairing
+# was enforced by the `effective_env_override_reason()` PreToolUse(Agent)
+# gate hook embedded in the now-removed Spark authorization gate
+# (SPARK_GATE_WRITER_PY_BEGIN/_END, Issue #2186/#2274), and existed only to
+# make the GPT-5.3-Codex-Spark delegation's model/evidence causal chain
+# deterministic (Issue #2274 In Scope). That gate -- and the Spark
+# delegation it protected -- was fully retired in Issue #2651/#2662. With
+# no gate left to protect, `export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`
+# had no remaining non-Spark justification, while its actual blast radius
+# was strictly broader than Spark: it disabled Claude Code's background
+# task mechanism for the ENTIRE Claude-GPT session, which also deleted
+# `run_in_background` from the Bash tool schema exposed to the main thread
+# -- breaking `issue-refinement-loop`'s canonical Step 2 background-launch
+# + mandatory completion-join contract (Issue #2610) for every Claude-GPT
+# session, not just Spark invocations (Issue #2652 Background/AC1).
+#
+# `CLAUDE_CODE_FORK_SUBAGENT` unset is kept as an INDEPENDENT contract
+# (Issue #2652 Design Direction explicitly forbids retiring it in bulk
+# alongside the background-task disable; this launcher does not evaluate
+# here whether it still needs a separate production rationale).
+#
+# Both variables are explicitly `unset` (not merely left absent), matching
+# the original forgery-prevention rationale: a leaked ambient export from
+# the launching parent shell must not survive into the child `claude`
+# process's environment. For `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`
+# specifically, this `unset` makes the launcher-owned session's background
+# capability independent of the parent shell's value for this variable
+# (unset / `0` / `1` all converge on Claude Code's own default of
+# background tasks enabled, per Issue #2652 AC2) -- this launcher does not
+# force it to any explicit value.
+#
+# Scope limit (Issue #2652 AC2): this `unset` only controls what this
+# launcher itself injects into the child process's environment. It cannot
+# observe or override a re-injection from a layer this launcher does not
+# own -- e.g. a managed/enterprise `managed-settings.json`, or a Claude
+# Code `settings.json` `env` block outside this launcher's own isolated
+# `CLAUDE_CONFIG_DIR` (`$CLAUDE_CONFIG_DIR_TARGET/settings.local.json`,
+# generated fresh per launch by this script and never sets this variable)
+# and outside this repository's project-scope `.claude/settings.json` /
+# `.claude/settings.local.json` (verified at the time of this fix to not
+# reference this variable). If such an external, launcher-owned-outside
+# layer sets this variable in a given deployment, that is a genuine
+# limitation of a repository-owned launcher's isolation scope -- not
+# something to silently claim success over (docs/dev/agent-skill-boundaries.md
+# documents this caveat explicitly rather than hiding it).
 unset CLAUDE_CODE_FORK_SUBAGENT
-export CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
+unset CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
 
 export CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_TARGET"
 export ANTHROPIC_BASE_URL="http://127.0.0.1:${PROXY_PORT}"
