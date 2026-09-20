@@ -447,6 +447,11 @@ class ExactSkillRuntimeCommand:
     anchor_context_file: str = ""
     # Issue #2039 AC8/AC11: repair_action.apply field.
     preflight_result_path: str = ""
+    # Issue #2688: owner_reaction.decide / owner_reaction.decide.fixture
+    # fields.
+    owner_user_id: str = ""
+    preview_binding_file: str = ""
+    gh_fixture_file: str = ""
 
 
 def command_allows_root_no_worktree(parsed: ExactSkillRuntimeCommand) -> bool:
@@ -1485,6 +1490,201 @@ def is_exact_skill_runtime_structural_repair_action_apply_executor_command(
     return active_issue == parsed.issue_number and entry is not None
 
 
+def parse_exact_skill_runtime_owner_reaction_decide_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact-match parser for the production `owner_reaction.decide` command
+    class (Issue #2688: skill_runtime_exec.py generic dispatch wiring for
+    the #1975 registry entry).
+
+    Mirrors `parse_exact_skill_runtime_repair_action_apply_command`
+    token-for-token, with two additional trailing token pairs
+    (`--owner-user-id <positive-int>` and `--preview-binding-file
+    <repo-relative-path>`). Both placeholders are `required: True` in
+    command_registry.py's `owner_reaction.decide` entry, so this is a
+    single fixed-length (14-token) shape -- no optional-segment ambiguity.
+    This is a separate, independent function; every other parser above is
+    entirely unmodified by this addition.
+    """
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    if len(tokens) != 14:
+        return None
+    if tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    expected_flags = ["--command-id", "--issue-number", "--repo", "--owner-user-id", "--preview-binding-file"]
+    expected_positions = [4, 6, 8, 10, 12]
+    for flag, pos in zip(expected_flags, expected_positions):
+        if tokens[pos] != flag:
+            return None
+    if any(
+        tok.startswith("--command-id=")
+        or tok.startswith("--issue-number=")
+        or tok.startswith("--repo=")
+        or tok.startswith("--owner-user-id=")
+        or tok.startswith("--preview-binding-file=")
+        for tok in tokens
+    ):
+        return None
+    command_id = tokens[5]
+    issue_number = tokens[7]
+    repo = tokens[9]
+    owner_user_id = tokens[11]
+    preview_binding_file = tokens[13]
+    if command_id != "owner_reaction.decide":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0:
+        return None
+    if repo != TRUSTED_REPO_SLUG:
+        return None
+    if not owner_user_id.isdigit() or int(owner_user_id) <= 0:
+        return None
+    if command_id not in SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"]:
+        return None
+    # Bind the preview binding input to THIS Issue's own artifact tree, the
+    # same confinement `repair_action.apply`'s preflight_result_path uses
+    # above -- never a generic repo-relative path.
+    if not _is_safe_issue_artifact_path(preview_binding_file, root, issue_number):
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        owner_user_id=owner_user_id,
+        preview_binding_file=preview_binding_file,
+    )
+
+
+def is_exact_skill_runtime_owner_reaction_decide_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """Same trusted-repo / default-branch / canonical-root / active-issue
+    safety boundary as `is_exact_skill_runtime_repair_action_apply_executor_command`,
+    applied to the `owner_reaction.decide` command class (Issue #2688).
+    `owner_reaction.decide` is bound to the issue's own active worktree --
+    it is deliberately NOT added to `ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS`
+    (same posture as `repair_action.apply`)."""
+    parsed = parse_exact_skill_runtime_owner_reaction_decide_command(command, project_root)
+    if parsed is None:
+        return False
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    default_branch = resolve_default_branch(project_root, deadline)
+    if not branch or branch != default_branch:
+        return False
+    repo_slug = resolve_repo_slug(project_root, deadline)
+    if repo_slug != parsed.repo:
+        return False
+    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
+    if active_issue != parsed.issue_number or entry is None:
+        return False
+    return True
+
+
+def parse_exact_skill_runtime_owner_reaction_decide_fixture_command(
+    command: str, project_root: str | None = None
+) -> ExactSkillRuntimeCommand | None:
+    """Exact parser for the distinct `owner_reaction.decide.fixture` lane
+    (Issue #1975 AC7's test-only sibling, wired for real dispatch by Issue
+    #2688). Deliberately a sibling of `owner_reaction.decide` above: it
+    accepts only the fixture command ID and its dedicated trailing
+    `--gh-fixture-file <repo-relative-path>` pair, appended after the SAME
+    4 required trailing tokens the production parser validates. 16-token
+    fixed-length shape -- `gh_fixture_file` is `required: True` in
+    command_registry.py's `owner_reaction.decide.fixture` entry."""
+    root = os.path.realpath(project_root or resolve_project_root())
+    if not command or _METACHAR_RE.search(command) or _LEADING_ENV_RE.match(command):
+        return None
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if len(tokens) != 16 or tokens[:4] != ["uv", "run", "python3", SKILL_RUNTIME_EXEC_REL]:
+        return None
+    if os.path.islink(os.path.join(root, SKILL_RUNTIME_EXEC_REL)):
+        return None
+    expected_script = os.path.realpath(os.path.join(root, SKILL_RUNTIME_EXEC_REL))
+    if os.path.realpath(os.path.join(root, tokens[3])) != expected_script:
+        return None
+    expected_flags = [
+        "--command-id",
+        "--issue-number",
+        "--repo",
+        "--owner-user-id",
+        "--preview-binding-file",
+        "--gh-fixture-file",
+    ]
+    expected_positions = [4, 6, 8, 10, 12, 14]
+    if any(tokens[pos] != flag for flag, pos in zip(expected_flags, expected_positions)):
+        return None
+    if any(token.startswith(f"{flag}=") for token in tokens for flag in expected_flags):
+        return None
+    command_id, issue_number, repo, owner_user_id, preview_binding_file, gh_fixture_file = (
+        tokens[5],
+        tokens[7],
+        tokens[9],
+        tokens[11],
+        tokens[13],
+        tokens[15],
+    )
+    if command_id != "owner_reaction.decide.fixture":
+        return None
+    if not issue_number.isdigit() or int(issue_number) <= 0 or repo != TRUSTED_REPO_SLUG:
+        return None
+    if not owner_user_id.isdigit() or int(owner_user_id) <= 0:
+        return None
+    policy = SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"].get(command_id)
+    if (
+        not isinstance(policy, dict)
+        or policy.get("execution_class") != "exact_owner_reaction_decide_fixture"
+    ):
+        return None
+    if not _is_safe_issue_artifact_path(preview_binding_file, root, issue_number):
+        return None
+    if not _is_safe_issue_artifact_path(gh_fixture_file, root, issue_number):
+        return None
+    return ExactSkillRuntimeCommand(
+        command_id=command_id,
+        issue_number=issue_number,
+        repo=repo,
+        argv=tuple(tokens),
+        owner_user_id=owner_user_id,
+        preview_binding_file=preview_binding_file,
+        gh_fixture_file=gh_fixture_file,
+    )
+
+
+def is_exact_skill_runtime_owner_reaction_decide_fixture_executor_command(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> bool:
+    """Apply the canonical root/default-branch/active-issue boundary to the
+    fixture sibling. It is never root-no-worktree eligible."""
+    parsed = parse_exact_skill_runtime_owner_reaction_decide_fixture_command(command, project_root)
+    if parsed is None or os.path.realpath(cwd) != os.path.realpath(project_root):
+        return False
+    branch = current_branch(project_root, deadline)
+    if not branch or branch != resolve_default_branch(project_root, deadline):
+        return False
+    if resolve_repo_slug(project_root, deadline) != parsed.repo:
+        return False
+    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
+    return active_issue == parsed.issue_number and entry is not None
+
+
 def _parse_exact_skill_runtime_authority_transport_consume_tail(
     tokens: list[str], root: str
 ) -> ExactSkillRuntimeCommand | None:
@@ -2219,6 +2419,40 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "--apply-structural-repair-action",
         "{preflight_result_path}",
     ],
+    # Issue #2688: preserve Issue #1975's registry argv exactly -- this
+    # Issue only wires the existing entries into real dispatch, it never
+    # touches command_registry.py.
+    "owner_reaction.decide": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/owner_reaction_decision.py",
+        "--repo",
+        "{repo}",
+        "--issue-number",
+        "{issue_number}",
+        "--owner-user-id",
+        "{owner_user_id}",
+        "--preview-binding-file",
+        "{preview_binding_file}",
+    ],
+    # Issue #2688: preserve Issue #1975 AC7's registry argv exactly.
+    "owner_reaction.decide.fixture": [
+        "uv",
+        "run",
+        "python3",
+        ".claude/skills/issue-refinement-loop/scripts/owner_reaction_decision.py",
+        "--repo",
+        "{repo}",
+        "--issue-number",
+        "{issue_number}",
+        "--owner-user-id",
+        "{owner_user_id}",
+        "--preview-binding-file",
+        "{preview_binding_file}",
+        "--gh-fixture-file",
+        "{gh_fixture_file}",
+    ],
 }
 _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
     "preflight.run": {
@@ -2333,6 +2567,24 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "repo": {"type": "owner_repo", "required": True},
         "preflight_result_path": {"type": "path", "required": True},
     },
+    # Issue #2688: preserve Issue #1975's registry placeholder contract
+    # exactly -- command_registry.py's `owner_reaction.decide` entry is
+    # unmodified by this Issue.
+    "owner_reaction.decide": {
+        "repo": {"type": "owner_repo", "required": True},
+        "issue_number": {"type": "positive_int", "required": True},
+        "owner_user_id": {"type": "positive_int", "required": True},
+        "preview_binding_file": {"type": "repo_relative_file", "required": True},
+    },
+    # Issue #2688: preserve Issue #1975 AC7's registry placeholder contract
+    # exactly.
+    "owner_reaction.decide.fixture": {
+        "repo": {"type": "owner_repo", "required": True},
+        "issue_number": {"type": "positive_int", "required": True},
+        "owner_user_id": {"type": "positive_int", "required": True},
+        "preview_binding_file": {"type": "repo_relative_file", "required": True},
+        "gh_fixture_file": {"type": "repo_relative_file", "required": True},
+    },
 }
 
 
@@ -2344,12 +2596,46 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
         raise ValueError("execution_class_mismatch")
     if entry.get("cwd_policy") != "repo_root":
         raise ValueError("cwd_policy_mismatch")
+    if entry.get("network_effect") != policy["network_effect"]:
+        raise ValueError("network_effect_mismatch")
+    # Issue #2688: `owner_reaction.decide` / `owner_reaction.decide.fixture`
+    # are the one exception to the checks below -- their command_registry.py
+    # entries (Issue #1975, unmodified by this Issue per its Allowed Paths /
+    # read-only design reference constraint) declare no `required_cwd` /
+    # `required_branch` / `allowed_write_roots` keys at all (this CLI is
+    # bound to the issue's own active worktree and never writes anything --
+    # see `is_exact_skill_runtime_owner_reaction_decide_executor_command`'s
+    # own active-issue-worktree boundary, which enforces the equivalent of
+    # `required_cwd`/`required_branch` independently of this entry-shape
+    # check). `None` here means "the key is absent", matched against
+    # `entry.get(...)`'s own `None` default -- never a widened default for
+    # these two read-only/local-only command_ids.
+    if command_id in {"owner_reaction.decide", "owner_reaction.decide.fixture"}:
+        if entry.get("required_cwd") is not None:
+            raise ValueError("required_cwd_mismatch")
+        if entry.get("required_branch") is not None:
+            raise ValueError("required_branch_mismatch")
+        if entry.get("allowed_write_roots") is not None:
+            raise ValueError("allowed_write_roots_mismatch")
+        argv = entry.get("argv")
+        expected_argv = _EXPECTED_ARGV_BY_COMMAND.get(command_id)
+        if expected_argv is None or argv != expected_argv:
+            raise ValueError("argv_template_mismatch")
+        placeholders = entry.get("placeholders")
+        expected_placeholders = _EXPECTED_PLACEHOLDERS_BY_COMMAND.get(command_id)
+        if expected_placeholders is None or placeholders != expected_placeholders:
+            raise ValueError("placeholder_mismatch")
+        declared_placeholders = set(placeholders)
+        argv_placeholders = {
+            token[1:-1] for token in argv if isinstance(token, str) and _PLACEHOLDER_RE.match(token)
+        }
+        if argv_placeholders != declared_placeholders:
+            raise ValueError("argv_placeholder_contract_mismatch")
+        return
     if entry.get("required_cwd") != policy["required_cwd"]:
         raise ValueError("required_cwd_mismatch")
     if entry.get("required_branch") != policy["required_branch"]:
         raise ValueError("required_branch_mismatch")
-    if entry.get("network_effect") != policy["network_effect"]:
-        raise ValueError("network_effect_mismatch")
     expected_write_roots = [".claude/artifacts/issue-refinement-loop/{active_issue}/"]
     # Issue #2584: `authority_transport.consume` / `repair_action.apply` /
     # `structural_repair_action.apply` join `contract_update.run.with_anchor`

@@ -47,6 +47,8 @@ from skill_runtime_command_policy import (
     is_exact_skill_runtime_decide_executor_command,
     is_exact_skill_runtime_executor_command,
     is_exact_skill_runtime_fixture_executor_command,
+    is_exact_skill_runtime_owner_reaction_decide_executor_command,
+    is_exact_skill_runtime_owner_reaction_decide_fixture_executor_command,
     is_exact_skill_runtime_repair_action_apply_executor_command,
     is_exact_skill_runtime_structural_repair_action_apply_executor_command,
     load_registry_entry,
@@ -2490,6 +2492,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--router-receipt-path", required=False, default=None)
     parser.add_argument("--contract-patch-plan-file", required=False, default=None)
     parser.add_argument("--anchor-context-file", required=False, default=None)
+    # Issue #2688: owner_reaction.decide / owner_reaction.decide.fixture.
+    parser.add_argument("--owner-user-id", required=False, type=int, default=None)
+    parser.add_argument("--preview-binding-file", required=False, default=None)
+    parser.add_argument("--gh-fixture-file", required=False, default=None)
     # Generic and structural mutation consumers have distinct command IDs and
     # exact outer flags. Argparse rejects a mixed invocation before dispatch;
     # each command branch below also enforces its exact pairing.
@@ -2564,6 +2570,11 @@ def main(argv: list[str] | None = None) -> int:
     is_consume_command = args.command_id == "authority_transport.consume"
     is_repair_action_apply_command = args.command_id == "repair_action.apply"
     is_structural_repair_action_apply_command = args.command_id == "structural_repair_action.apply"
+    # Issue #2688: owner_reaction.decide / owner_reaction.decide.fixture
+    # exact dispatch wiring (registry entries added in Issue #1975; the
+    # generic-dispatch wiring itself was explicitly Out of Scope there).
+    is_owner_reaction_decide_command = args.command_id == "owner_reaction.decide"
+    is_owner_reaction_decide_fixture_command = args.command_id == "owner_reaction.decide.fixture"
     # #2086 P0 fix_delta (Blocker 3): decide.run may ALSO carry
     # --invocation-id/--git-head-sha (bound into its Mode B authority-check
     # sub-fields), in addition to authority_transport.produce/consume.
@@ -2603,6 +2614,39 @@ def main(argv: list[str] | None = None) -> int:
     if is_structural_repair_action_apply_command and not args.apply_structural_repair_action:
         print(
             "skill_runtime_exec: --apply-structural-repair-action is required for structural_repair_action.apply",
+            file=sys.stderr,
+        )
+        return 2
+    # Issue #2688 AC4: exact required/forbidden combination validation for
+    # --owner-user-id/--preview-binding-file (production and fixture) and
+    # fixture's --gh-fixture-file.
+    if not (is_owner_reaction_decide_command or is_owner_reaction_decide_fixture_command) and (
+        args.owner_user_id or args.preview_binding_file
+    ):
+        print(
+            "skill_runtime_exec: --owner-user-id/--preview-binding-file are only allowed for "
+            "owner_reaction.decide/owner_reaction.decide.fixture",
+            file=sys.stderr,
+        )
+        return 2
+    if (is_owner_reaction_decide_command or is_owner_reaction_decide_fixture_command) and not (
+        args.owner_user_id and args.preview_binding_file
+    ):
+        print(
+            "skill_runtime_exec: --owner-user-id and --preview-binding-file are required for "
+            "owner_reaction.decide/owner_reaction.decide.fixture",
+            file=sys.stderr,
+        )
+        return 2
+    if not is_owner_reaction_decide_fixture_command and args.gh_fixture_file:
+        print(
+            "skill_runtime_exec: --gh-fixture-file is only allowed for owner_reaction.decide.fixture",
+            file=sys.stderr,
+        )
+        return 2
+    if is_owner_reaction_decide_fixture_command and not args.gh_fixture_file:
+        print(
+            "skill_runtime_exec: --gh-fixture-file is required for owner_reaction.decide.fixture",
             file=sys.stderr,
         )
         return 2
@@ -3050,6 +3094,82 @@ def main(argv: list[str] | None = None) -> int:
         ):
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
+    elif is_owner_reaction_decide_command:
+        if (
+            args.fixture
+            or args.anchor_comment_url
+            or args.loop_state_file
+            or args.review_result_verdict
+            or args.max_iterations
+        ):
+            print(
+                "skill_runtime_exec: only --owner-user-id/--preview-binding-file are allowed for "
+                "owner_reaction.decide",
+                file=sys.stderr,
+            )
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--owner-user-id",
+                str(args.owner_user_id),
+                "--preview-binding-file",
+                args.preview_binding_file,
+            ]
+        )
+        if not is_exact_skill_runtime_owner_reaction_decide_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
+    elif is_owner_reaction_decide_fixture_command:
+        if (
+            args.fixture
+            or args.anchor_comment_url
+            or args.loop_state_file
+            or args.review_result_verdict
+            or args.max_iterations
+        ):
+            print(
+                "skill_runtime_exec: only --owner-user-id/--preview-binding-file/--gh-fixture-file are "
+                "allowed for owner_reaction.decide.fixture",
+                file=sys.stderr,
+            )
+            return 2
+        command_text = " ".join(
+            [
+                "uv",
+                "run",
+                "python3",
+                SKILL_RUNTIME_EXEC_REL,
+                "--command-id",
+                args.command_id,
+                "--issue-number",
+                str(args.issue_number),
+                "--repo",
+                args.repo,
+                "--owner-user-id",
+                str(args.owner_user_id),
+                "--preview-binding-file",
+                args.preview_binding_file,
+                "--gh-fixture-file",
+                args.gh_fixture_file,
+            ]
+        )
+        if not is_exact_skill_runtime_owner_reaction_decide_fixture_executor_command(
+            command_text, project_root, project_root
+        ):
+            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+            return 2
     else:
         if args.fixture:
             print("skill_runtime_exec: --fixture is only allowed for preflight.run.fixture", file=sys.stderr)
@@ -3115,6 +3235,13 @@ def main(argv: list[str] | None = None) -> int:
         script_name = "decide_next_loop_action.py"
     elif args.command_id == "preflight.run":
         script_name = "workflow_start_entry.py"
+    elif is_owner_reaction_decide_command or is_owner_reaction_decide_fixture_command:
+        # Issue #2688 AC5: the first-hop script integrity/readback target
+        # must match the actual first-hop script command_registry.py
+        # renders for owner_reaction.decide/.fixture -- `owner_reaction_
+        # decision.py`, NOT `run_refinement_preflight.py` (the `else`
+        # branch below's target for every other command_id here).
+        script_name = "owner_reaction_decision.py"
     else:
         script_name = "run_refinement_preflight.py"
     script_path = Path(project_root) / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / script_name
@@ -3195,6 +3322,24 @@ def main(argv: list[str] | None = None) -> int:
             "issue_number": args.issue_number,
             "repo": args.repo,
             "preflight_result_path": args.apply_structural_repair_action,
+        }
+    elif is_owner_reaction_decide_command:
+        # Issue #2688 AC2: production profile shares the SAME registry
+        # entry / render_command() dispatch as the fixture sibling below --
+        # only `gh_fixture_file` differs.
+        render_params = {
+            "repo": args.repo,
+            "issue_number": args.issue_number,
+            "owner_user_id": args.owner_user_id,
+            "preview_binding_file": args.preview_binding_file,
+        }
+    elif is_owner_reaction_decide_fixture_command:
+        render_params = {
+            "repo": args.repo,
+            "issue_number": args.issue_number,
+            "owner_user_id": args.owner_user_id,
+            "preview_binding_file": args.preview_binding_file,
+            "gh_fixture_file": args.gh_fixture_file,
         }
     else:
         render_params = {"issue_number": args.issue_number, "repo": args.repo}
