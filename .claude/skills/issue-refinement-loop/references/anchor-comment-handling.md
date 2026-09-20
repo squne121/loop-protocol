@@ -211,6 +211,40 @@ freeform directive では常に空になる（`derive_contract_patch_operations(
 `preflight.run` → fresh review → fresh readiness が全て成功するまで実装は許可されない
 （既存の post-update gate と同一）。
 
+### mutation phase（`contract_update.run.with_human_context`）への配線（#2678）
+
+上記の read-only investigation evidence（`investigation_derived_path_literals`）は、
+`preflight.run.with_human_context`（read-only lane）だけでなく、実際に GitHub mutation を行う
+`contract_update.run.with_human_context`（mutation phase、`SKILL.md` の「Step 0g」参照）でも
+同じ意味で再現される。呼び出し側の操作手順は次の 2 ステップ:
+
+1. `preflight.run.with_human_context` を `--investigation-evidence-transport-path <manifest>`
+   付きで実行し、`route.action == "contract_update_required"` を確認する（read-only）。
+2. ステップ1の read-only invocation で使用した**同一の `<manifest>` パス**を、command ID が異なる
+   （＝呼び出し自体は別の）直後の `contract_update.run.with_human_context` invocation に再利用して
+   そのまま渡す（`--investigation-evidence-transport-path <manifest>`）。read-only 呼び出しとは
+   別の transport manifest を新たに生成し直す必要はない。
+
+`--investigation-evidence-primary-root` は caller が指定する項目ではない。
+`skill_runtime_exec.py` はこのフラグを CLI として受け付けず、`--investigation-evidence-
+transport-path` が指定された場合にのみ、executor が既に確認済みの `project_root`
+（#2197/#2199 専用worktree dispatch 前の PRIMARY checkout の絶対パス）を内部的に子プロセスへ
+付与する。transport manifest は PRIMARY checkout の `.claude/artifacts/` 配下にのみ存在すればよく、
+専用worktree（`execution_root`）側へのコピーは不要— この primary-root 伝搬が、専用worktree
+の異なる cwd からでも実 consumer が transport artifact を発見できる理由である
+（PR #2520 の専用worktree実行方式との整合、Issue #2678 AC2/AC5）。
+
+**invalid-transport の write-zero 保証（AC6）:** transport が明示指定され、かつ digest / issue /
+repo / anchor / body / HEAD / path confinement のいずれかの検証に失敗した場合、anchor 本文単独
+から独立に有効な `CONTRACT_PATCH_PLAN_V1`（exact backtick literal を含む directive 等、
+investigation evidence を必要としないケースを含む）が導出可能であっても、mutation consumer
+（`consume_trusted_anchor_contract_patch_plan()`）は一切呼び出されず、GitHub 更新要求も発生しない
+（`run_refinement_preflight.py` の `_investigation_evidence_transport_rejected` フラグ。
+transport 未指定時の挙動は byte-identical のまま変更されない）。`destructive_or_non_idempotent_
+operation` / `changes_permission_boundary` / `changes_external_service_boundary` /
+`requires_issue_split` の各 boundary はこの mutation phase でも緩和されない（`expands_allowed_paths`
+のみが対象、上記「read-only investigation による exact path 導出（AC3/AC4）」と同一）。
+
 ## anchor_context.py — 複数ターン分節・候補抽出・取得完全性（#1891）
 
 `anchor_context.py`（`scripts/anchor_context.py`）は、`run_refinement_preflight.py` が生成した既存 snapshot artifact（`anchor_comment.snapshot`）のみを唯一の入力とする pure analyzer である。独自の GitHub API 呼び出しは持たない。

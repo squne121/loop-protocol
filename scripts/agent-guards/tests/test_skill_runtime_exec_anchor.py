@@ -11,6 +11,7 @@ and AC9 (real executor chain positive + negative smoke).
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import pwd
@@ -284,6 +285,47 @@ REGISTRY = {
             },
         },
     },
+    # Issue #2678 AC2/AC4: mirrors `preflight.run.with_human_context` above
+    # (SAME optional transport/primary-root pair, before the mutation-only
+    # `--consume-contract-patch-plan` literal) -- byte-for-byte matched
+    # against the REAL, copied `skill_runtime_command_policy.py`'s
+    # `_EXPECTED_ARGV_BY_COMMAND`/`_EXPECTED_PLACEHOLDERS_BY_COMMAND`/
+    # `eligible_command_ids` for this command_id, which `validate_registry_
+    # entry()` cross-checks this fixture registry against.
+    "contract_update.run.with_human_context": {
+        "id": "contract_update.run.with_human_context",
+        "argv": [
+            "uv", "run", "python3",
+            ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+            "--issue-number", "{issue_number}", "--repo", "{repo}",
+            "--anchor-comment-url", "{anchor_comment_url}",
+            "--human-context-comment-url", "{anchor_comment_url}",
+            "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
+            "--investigation-evidence-primary-root", "{investigation_evidence_primary_root}",
+            "--consume-contract-patch-plan",
+        ],
+        "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_contract_update_anchor",
+        "required_cwd": "canonical_main_root", "required_branch": "default_branch",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            "artifacts/{active_issue}/issue-metadata/",
+        ],
+        "network_effect": "github_mutation",
+        "mutation": True,
+        "placeholders": {
+            "issue_number": {"type": "positive_int", "required": True},
+            "repo": {"type": "owner_repo", "required": True},
+            "anchor_comment_url": {
+                "type": "github_issue_comment_url", "required": True,
+            },
+            "investigation_evidence_transport_path": {
+                "type": "path", "required": False, "optional_flag_pair": True,
+            },
+            "investigation_evidence_primary_root": {
+                "type": "path", "required": False, "optional_flag_pair": True,
+            },
+        },
+    },
 }
 
 
@@ -329,6 +371,7 @@ parser.add_argument("--human-context-comment-url", dest="human_context_comment_u
 parser.add_argument("--agent-report-comment-url", dest="agent_report_comment_urls", action="append", default=[])
 parser.add_argument("--consume-contract-patch-plan", action="store_true")
 parser.add_argument("--investigation-evidence-transport-path", default=None)
+parser.add_argument("--investigation-evidence-primary-root", default=None)
 args = parser.parse_args()
 artifact = Path(".claude/artifacts/issue-refinement-loop") / args.issue_number
 artifact.mkdir(parents=True, exist_ok=True)
@@ -338,6 +381,9 @@ payload = {
     "anchor_comment_url": args.anchor_comment_url,
     "human_context_comment_urls": args.human_context_comment_urls,
     "agent_report_comment_urls": args.agent_report_comment_urls,
+    "consume_contract_patch_plan": args.consume_contract_patch_plan,
+    "investigation_evidence_transport_path": args.investigation_evidence_transport_path,
+    "investigation_evidence_primary_root": args.investigation_evidence_primary_root,
 }
 (artifact / "preflight.json").write_text(json.dumps(payload))
 print(json.dumps({"ok": True, **payload}))
@@ -561,6 +607,40 @@ def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path)
             source_root / ".claude" / "skills" / skill,
             repo_root / ".claude" / "skills" / skill,
         )
+    # Issue #2678 AC5: `review-issue/scripts/check_issue_contract.py`'s own
+    # fresh-review gate imports `evaluate_product_spec_gate` from
+    # `impl-review-loop/scripts/` (added to `sys.path` by that file itself).
+    # Without this dependency present, the product-spec check fails closed
+    # with "product spec checker evaluator import failed" for EVERY body,
+    # masking a real "approve" verdict behind a fixture-only gap unrelated
+    # to this Issue's own wiring -- copy only the `scripts/` subtree actually
+    # imported (never the whole `impl-review-loop` skill, out of scope here).
+    _copy_tree(
+        source_root / ".claude" / "skills" / "impl-review-loop" / "scripts",
+        repo_root / ".claude" / "skills" / "impl-review-loop" / "scripts",
+    )
+    # Issue #2678 AC5: `run_refinement_preflight.py`'s own post-update
+    # `allowed_paths` fresh-check gate dynamically loads
+    # `pr-review-judge/scripts/allowed_paths_review_gate.py` (alongside the
+    # already-copied `issue-contract-review/scripts/baseline_vc_preflight.py`).
+    # Without it present this gate silently collapses to `"unavailable"`
+    # (never `"pass"`) for every real-subprocess dispatch through this
+    # fixture, making `post_update_gate_passed` structurally unreachable
+    # regardless of body content -- same class of fixture-only gap as the
+    # product-spec import above, not a production behavior change.
+    _copy_tree(
+        source_root / ".claude" / "skills" / "pr-review-judge" / "scripts",
+        repo_root / ".claude" / "skills" / "pr-review-judge" / "scripts",
+    )
+    # `allowed_paths_review_gate.py` above additionally imports
+    # `changed_file_matcher` from `scripts/agent-guards/` (added to
+    # `sys.path` by that file itself, mirroring the SAME cross-skill-to-
+    # `scripts/agent-guards/` dependency shape this fixture already handles
+    # for `skill_runtime_exec.py` et al.).
+    _write_text(
+        repo_root / "scripts" / "agent-guards" / "changed_file_matcher.py",
+        (source_root / "scripts" / "agent-guards" / "changed_file_matcher.py").read_text(),
+    )
     _copy_tree(
         source_root / ".claude" / "skills" / "create-issue" / "scripts",
         repo_root / ".claude" / "skills" / "create-issue" / "scripts",
@@ -1058,6 +1138,13 @@ def test_executor_reaches_subprocess_and_rejects_anchor_on_preflight_run(tmp_pat
         "anchor_comment_url": _VALID_URL,
         "human_context_comment_urls": [],
         "agent_report_comment_urls": [],
+        # Issue #2678: the mock `run_refinement_preflight.py` now also
+        # records these three fields for every dispatch (used by the
+        # `contract_update.run.with_human_context` AC2/AC4 tests below) --
+        # unset/False for every ordinary preflight profile dispatch.
+        "consume_contract_patch_plan": False,
+        "investigation_evidence_transport_path": None,
+        "investigation_evidence_primary_root": None,
     }
     assert json.loads(positive.stdout)["anchor_comment_url"] == _VALID_URL
 
@@ -1219,18 +1306,25 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
         use_fixture_runtime=True,
         extra_env=config_only_env,
     )
-    # The controlled write reached final readback, but the post-update
-    # contract review detects the deliberately incomplete new AC.  That is a
-    # terminal fail-closed result, never a successful implementation route.
-    assert first.returncode == 2, first.stderr
+    # Issue #2678: the fixture now provides every cross-skill dependency the
+    # post-update fresh-checks gate actually imports in production
+    # (`impl-review-loop/scripts/evaluate_product_spec_gate.py`,
+    # `pr-review-judge/scripts/allowed_paths_review_gate.py` +
+    # `scripts/agent-guards/changed_file_matcher.py`) -- previously absent,
+    # which made the post-update review/allowed_paths gates collapse to a
+    # fixture-only "product spec checker evaluator import failed" /
+    # "unavailable" outcome instead of genuinely evaluating this directive's
+    # content. With those dependencies present, the controlled write reaches
+    # final readback AND every post-update gate (preflight/review/readiness/
+    # allowed_paths/permission_profile/runtime_evidence) genuinely passes --
+    # a successful implementation route, exit 0.
+    assert first.returncode == 0, first.stderr
     # Issue #2393 P1-A regression: this dispatch's `execution_root` was a
     # genuinely COLD dedicated worktree (no `tmp/` pre-seed above) the very
     # first time it ran a contract_update dispatch, and the transaction
     # above genuinely wrote+deleted files under a freshly-created `tmp/`.
     # The outer supervision layer must never misreport that as an
-    # unauthorized write, and the exit code 2 above must be the INNER
-    # child's own "needs_fix" mapping (relayed via the ordinary success
-    # path), never the outer `SKILL_RUNTIME_FAIL` failure line.
+    # unauthorized write.
     assert "SKILL_RUNTIME_FAIL" not in first.stderr, first.stderr
     assert "unauthorized_write_path" not in first.stderr
     assert first.stdout.strip(), "expected the inner transaction result to be relayed to the caller"
@@ -1258,16 +1352,13 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     assert config_states == ["expected_path"] * len(operations)
     result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     assert result["contract_update"] == {
-        "status": "failed",
+        "status": "applied",
         "disposition": "patch",
         "writes": 1,
         "iterations": 0,
         "final_readback": "verified",
         "fresh_preflight": "pass",
-        # The synthetic directive intentionally introduces a new AC without
-        # its matching verification-command marker.  The failed review must
-        # block the phase rather than remain telemetry on a successful exit.
-        "fresh_review": "needs_fix",
+        "fresh_review": "approve",
         "fresh_readiness": "go",
     }
     provenance = json.loads((artifact_dir / "refinement_preflight_provenance_v1.json").read_text())
@@ -1279,10 +1370,16 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
         use_fixture_runtime=True,
         extra_env=config_only_env,
     )
-    assert replay.returncode == 2, replay.stderr
+    assert replay.returncode == 0, replay.stderr
     replay_result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
-    assert replay_result["contract_update"]["status"] == "failed"
+    assert replay_result["contract_update"]["status"] == "no_change"
     assert replay_result["contract_update"]["writes"] == 0
+    # `contract_update.run.with_anchor` (the generic, non-human-context
+    # lane) never receives the SAME operator-selected-human-context
+    # relaxation (`operator_asserted_human_context`), so this SAME anchor
+    # comment does not resolve a valid patch plan on this lane -- unaffected
+    # by this Issue's fixture-completeness fix (fresh_checks is never
+    # reached at all on this route, unlike the human-context lane above).
     generic_replay = _run_executor(
         repo,
         command_id="contract_update.run.with_anchor",
@@ -1296,6 +1393,234 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     assert not (execution_root / "artifacts" / "1498" / "issue-metadata").exists() or len(
         list((execution_root / "artifacts" / "1498" / "issue-metadata").rglob("*.input.json"))
     ) == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #2678 AC5: a trusted, operator-selected human-context directive that
+# only names an "expand Allowed Paths as needed" phrase in prose (no exact
+# backtick literal -- the SAME `expands_allowed_paths`-boundary shape #2086's
+# read-only `preflight.run.with_human_context` lane already clears via
+# `investigation_derived_path_literals`) ALSO reaches a real, applied GitHub
+# mutation through the mutation-phase `contract_update.run.with_human_context`
+# -- with the transport artifact placed ONLY in the PRIMARY checkout (never
+# copied into the dedicated worktree `execution_root`), reusing the SAME
+# `_install_real_contract_update_fixture()` / dedicated-worktree harness
+# `test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff`
+# above already establishes.
+# ---------------------------------------------------------------------------
+
+
+def test_contract_update_phase_with_primary_only_transport_reaches_dedicated_worktree_consumer_and_applies(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = _make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    gh_config_dir = tmp_path / "test-owned-gh-config"
+    gh_config_dir.mkdir()
+    config_only_env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": str(gh_config_dir),
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+    }
+
+    immutable = json.loads(
+        (
+            REPO_ROOT
+            / ".claude/skills/issue-refinement-loop/tests/fixtures/issue_1835_trusted_anchor_iteration_zero.json"
+        ).read_text(encoding="utf-8")
+    )
+    # Issue #2678 AC5: reuses `expected_post_body_base64` -- the SAME
+    # already-baseline-expect-annotated Verification Commands body the
+    # sibling `test_contract_update_phase_reaches_fake_transaction_and_
+    # fresh_handoff` test above uses as ITS OWN starting body -- rather than
+    # `pre_body_base64` (whose unrelated, unannotated VC section would
+    # trigger `repair_issue_contract.py`'s own unrelated
+    # `insert_baseline_expect_fail` `needs_fix` classification regardless of
+    # this test's own mutation, masking the real post-update gate outcome
+    # this AC verifies).
+    pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    # #2086 AC3/AC4 shape: a vague "expand Allowed Paths as needed" directive
+    # (no exact backtick literal -- triggers `expands_allowed_paths` and
+    # fails closed to `human_escalation` WITHOUT investigation evidence,
+    # exactly like the read-only lane's own regression coverage in
+    # `test_operator_selected_scope_reframe.py` /
+    # `test_preflight_run_with_anchor.py::test_finding1_*`), COMBINED with a
+    # second bullet naming a known `_DIRECTIVE_SECTION_MARKERS` heading
+    # ("Stop Condition") so `derive_contract_patch_operations()` produces a
+    # non-empty, safely-appendable operation independent of the investigation
+    # literals themselves (AC5(b): non-empty patch operations, semantically
+    # the SAME shape the read-only lane would derive from this identical
+    # anchor body).
+    directive_text = "Stop Condition を追加してください: dedicated worktree 外への書き込みを禁止する。"
+    anchor_body = "\n".join(
+        [
+            "この issue-refinement-loop の欠陥は他の workflow skill にも共通するため、",
+            "allowed paths を必要に応じて拡張してください。",
+            "- impl-review-loop も合わせて直してください。",
+            f"- {directive_text}",
+        ]
+    )
+    anchor = {
+        "id": 1,
+        "body": anchor_body,
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
+
+    # AC5(a): the transport manifest is written ONLY under the PRIMARY
+    # checkout's own `.claude/artifacts/` root (`repo`) -- deliberately never
+    # copied into the dedicated worktree (`execution_root`) the mutation
+    # child actually dispatches under. Hand-built to the exact
+    # SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 shape `generate_authority_transport_
+    # manifest()` produces (never a new schema), bound to `repo`'s own real
+    # git HEAD -- the SAME confinement root the executor's internal
+    # `--investigation-evidence-primary-root` propagation (AC2) hands the
+    # child, independent of `execution_root`'s own (different) HEAD.
+    transport_rel_path = ".claude/artifacts/issue-refinement-loop/1498/manifest.json"
+    transport_abs_path = repo / transport_rel_path
+    transport_abs_path.parent.mkdir(parents=True, exist_ok=True)
+    repo_head_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    pre_body_sha256 = hashlib.sha256(pre_body.encode("utf-8")).hexdigest()
+    manifest_payload = [
+        {
+            "comment_url": anchor_url,
+            "body_sha256": pre_body_sha256,
+            "source_kind": "generated_by_agent",
+            "path_literals": ["docs/dev/workflow.md"],
+        }
+    ]
+    manifest_payload_json = json.dumps(
+        manifest_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    manifest = {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_TRANSPORT_V1",
+        "invocation_id": "test-2678-ac5",
+        "issue_number": 1498,
+        "repo": "squne121/loop-protocol",
+        "git_head_sha": repo_head_sha,
+        "generated_at": "2026-08-01T00:00:00Z",
+        "canonicalization_id": "loop-protocol-json-c14n-v1",
+        "source_comment_id": 1,
+        "source_comment_url": anchor_url,
+        "source_issue_body_sha256": pre_body_sha256,
+        "source_kind": "generated_by_agent",
+        "payload": manifest_payload,
+        "payload_sha256": hashlib.sha256(manifest_payload_json.encode("utf-8")).hexdigest(),
+    }
+    transport_abs_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert not (execution_root / transport_rel_path).exists(), (
+        "transport artifact must never be copied into the dedicated worktree"
+    )
+
+    result = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+        extra_env=config_only_env,
+        extra_args=["--investigation-evidence-transport-path", transport_rel_path],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    result_payload = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
+    contract_update = result_payload["contract_update"]
+    # AC5(c): applied, exactly one write.
+    assert contract_update["status"] == "applied", contract_update
+    assert contract_update["disposition"] == "patch"
+    assert contract_update["writes"] == 1
+    assert contract_update["final_readback"] == "verified"
+    # AC5(e): the post-update gate is not skipped/short-circuited.
+    assert contract_update["fresh_preflight"] == "pass"
+    assert contract_update["fresh_review"] == "approve"
+    assert contract_update["fresh_readiness"] == "go"
+
+    # AC5(d): the fake GitHub readback body reflects the expected update --
+    # the operation the vague-Allowed-Paths + Stop-Condition anchor body
+    # derives (non-empty, AC5(b)), applied under "## Stop Conditions".
+    updated_body = json.loads((artifact_dir / "fake_remote_issue.json").read_text())["body"]
+    assert directive_text in updated_body
+    stop_conditions_idx = updated_body.find("## Stop Conditions")
+    directive_idx = updated_body.find(directive_text)
+    required_skills_idx = updated_body.find("## Required Skills")
+    assert stop_conditions_idx != -1 and required_skills_idx != -1
+    assert stop_conditions_idx < directive_idx < required_skills_idx
+
+    # AC5(c): the fake `gh` boundary received exactly one PATCH (update)
+    # request.
+    operations = [
+        json.loads(line)
+        for line in (artifact_dir / "fake_gh_operations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert operations.count("issue_content_patch") == 1
+
+    # AC5(a): the transport artifact is STILL absent from the dedicated
+    # worktree after the real dispatch -- the primary-root propagation (AC2)
+    # is what let the child find it, never a copy step.
+    assert not (execution_root / transport_rel_path).exists()
+
+    # PR #2623 regression: a directive with a KNOWN section marker but that
+    # does NOT expand Allowed Paths (no investigation evidence needed) still
+    # reaches `issue_editor_required` unaffected when its own operations[]
+    # resolve empty -- unaffected by this test's own scenario (non-regression
+    # sanity: run without a transport path at all reaches the pre-#2678
+    # `expands_allowed_paths` -> `human_escalation` fail-closed route on the
+    # SAME anchor body, never a mutation).
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    no_transport = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+        extra_env=config_only_env,
+    )
+    assert no_transport.returncode == 2, no_transport.stdout + no_transport.stderr
+    no_transport_payload = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
+    assert no_transport_payload["contract_update"]["writes"] == 0
+    assert json.loads((artifact_dir / "fake_remote_issue.json").read_text())["body"] == pre_body
 
 
 def test_contract_update_outer_artifact_projection_failure_preserves_inner_transaction_result(
@@ -1475,11 +1800,17 @@ def test_contract_update_outer_artifact_projection_failure_preserves_inner_trans
 
     inner_result_path = Path(fields["inner_transaction_result_ref"])
     inner_result = json.loads(inner_result_path.read_text(encoding="utf-8"))
-    assert inner_result["contract_update"]["status"] == "failed"
+    # Issue #2678: the fixture now supplies every cross-skill dependency the
+    # post-update fresh-checks gate actually imports in production (see
+    # `test_contract_update_phase_reaches_fake_transaction_and_fresh_
+    # handoff` above) -- the inner mutation genuinely reaches `applied`/
+    # `approve` now; this test's OWN outer artifact-projection corruption
+    # (asserted above) is entirely independent of that inner outcome.
+    assert inner_result["contract_update"]["status"] == "applied"
     assert inner_result["contract_update"]["disposition"] == "patch"
     assert inner_result["contract_update"]["writes"] == 1
     assert inner_result["contract_update"]["final_readback"] == "verified"
-    assert inner_result["contract_update"]["fresh_review"] == "needs_fix"
+    assert inner_result["contract_update"]["fresh_review"] == "approve"
 
     # AC5: exactly one mutation/write call reached the fake GitHub
     # executable -- no blind resend after the outer artifact-projection
@@ -1541,6 +1872,84 @@ def test_anchor_profiles_materialize_only_the_explicit_origin_lane(tmp_path: Pat
     agent_payload = json.loads(artifact.read_text())
     assert agent_payload["human_context_comment_urls"] == []
     assert agent_payload["agent_report_comment_urls"] == [_VALID_URL]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2678 AC2/AC4: `contract_update.run.with_human_context` (the
+# mutation-phase counterpart of `preflight.run.with_human_context`) receives
+# the SAME executor-internal `investigation_evidence_primary_root`
+# propagation -- derived exclusively from the executor's own already-
+# confirmed `project_root`, never a caller-suppliable value -- and a
+# transport-absent dispatch remains byte-identical to its pre-#2678 shape.
+# ---------------------------------------------------------------------------
+
+
+def test_contract_update_investigation_evidence_primary_root_propagated_from_confirmed_project_root(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    artifact = (
+        _execution_root(repo) / ".claude" / "artifacts" / "issue-refinement-loop" / "1498" / "preflight.json"
+    )
+
+    result = _run_executor(
+        repo,
+        command_id="contract_update.run.with_human_context",
+        extra_args=[
+            "--investigation-evidence-transport-path",
+            ".claude/artifacts/issue-refinement-loop/1498/manifest.json",
+        ],
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(artifact.read_text())
+    assert payload["investigation_evidence_transport_path"] == (
+        ".claude/artifacts/issue-refinement-loop/1498/manifest.json"
+    )
+    # The primary-root value the child actually received is the EXECUTOR's
+    # own confirmed `project_root` (the PRIMARY checkout `repo` -- never the
+    # dedicated worktree `execution_root` the child's own cwd is under, and
+    # never anything the caller supplied -- `skill_runtime_exec.py`'s CLI
+    # does not even define a `--investigation-evidence-primary-root` flag
+    # for a caller to set).
+    assert payload["investigation_evidence_primary_root"] == os.path.realpath(str(repo))
+    assert payload["consume_contract_patch_plan"] is True
+
+    # `contract_update.run.with_anchor` (no human-context lane) is REJECTED
+    # before ever reaching the registry/child dispatch -- unaffected by this
+    # Issue's other-command_id-unchanged guarantee (AC2).
+    rejected = _run_executor(
+        repo,
+        command_id="contract_update.run.with_anchor",
+        extra_args=[
+            "--investigation-evidence-transport-path",
+            ".claude/artifacts/issue-refinement-loop/1498/manifest.json",
+        ],
+    )
+    assert rejected.returncode == 2, rejected.stderr
+    assert "only allowed for preflight.run.with_human_context and " in rejected.stderr
+    assert "contract_update.run.with_human_context" in rejected.stderr
+
+
+def test_contract_update_investigation_evidence_transport_absent_byte_identical_regression(
+    tmp_path: Path,
+) -> None:
+    """Issue #2678 AC4: a `contract_update.run.with_human_context` dispatch
+    that supplies no transport path renders/behaves exactly as it did before
+    this Issue -- no transport/primary-root token reaches the child argv."""
+    repo = _make_repo(tmp_path)
+    _install_skill_runtime_exec_fixture(repo)
+    artifact = (
+        _execution_root(repo) / ".claude" / "artifacts" / "issue-refinement-loop" / "1498" / "preflight.json"
+    )
+
+    result = _run_executor(repo, command_id="contract_update.run.with_human_context")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(artifact.read_text())
+    assert payload["investigation_evidence_transport_path"] is None
+    assert payload["investigation_evidence_primary_root"] is None
+    assert payload["human_context_comment_urls"] == [_VALID_URL]
+    assert payload["consume_contract_patch_plan"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1813,7 +2222,10 @@ def test_contract_update_relative_gh_config_dir_resolves_against_invocation_cwd(
         extra_env=config_only_env,
     )
 
-    assert result.returncode == 2, result.stderr
+    # Issue #2678: with the fixture's cross-skill dependency gaps closed
+    # (see `test_contract_update_phase_reaches_fake_transaction_and_fresh_
+    # handoff` above), this mutation now genuinely reaches `applied`, exit 0.
+    assert result.returncode == 0, result.stderr
     assert "AC2: trusted fixture directive" in json.loads(
         (artifact_dir / "fake_remote_issue.json").read_text()
     )["body"]
@@ -1926,7 +2338,10 @@ def test_contract_update_cold_dedicated_worktree_tmp_not_misdetected_after_workt
         use_fixture_runtime=True,
         extra_env=config_only_env,
     )
-    assert first.returncode == 2, first.stderr
+    # Issue #2678: with the fixture's cross-skill dependency gaps closed
+    # (see `test_contract_update_phase_reaches_fake_transaction_and_fresh_
+    # handoff` above), this mutation now genuinely reaches `applied`, exit 0.
+    assert first.returncode == 0, first.stderr
     assert "SKILL_RUNTIME_FAIL" not in first.stderr, first.stderr
     assert "unauthorized_write_path" not in first.stderr
 
@@ -1953,7 +2368,10 @@ def test_contract_update_cold_dedicated_worktree_tmp_not_misdetected_after_workt
         use_fixture_runtime=True,
         extra_env=config_only_env,
     )
-    assert second.returncode == 2, second.stderr
+    # `_populate_fixture_state()` reset `fake_remote_issue.json` back to the
+    # unmutated `pre_body` for the recreated worktree, so this is genuinely
+    # a fresh `applied` write again (Issue #2678), not a `no_change` replay.
+    assert second.returncode == 0, second.stderr
     assert "SKILL_RUNTIME_FAIL" not in second.stderr, second.stderr
     assert "unauthorized_write_path" not in second.stderr
     operations = [
