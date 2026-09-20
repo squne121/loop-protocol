@@ -585,7 +585,16 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "execution_class": "exact_authority_transport_consumer",
         "required_cwd": "canonical_main_root",
         "required_branch": "default_branch",
-        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        # Issue #2584: widened to the SAME 2-root shape as
+        # `contract_update.run.*` -- the non-noop
+        # `--contract-patch-plan-file`/`--anchor-context-file` path routes
+        # through the SAME `edit_issue_txn.py` transaction core, which
+        # writes its request metadata under
+        # `artifacts/{active_issue}/issue-metadata/`.
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            "artifacts/{active_issue}/issue-metadata/",
+        ],
         "network_effect": "github_mutation",
         "stdin_contract": "none",
         "stdout_contract": "scope_delta_consumption_receipt/v1",
@@ -622,7 +631,14 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "execution_class": "exact_repair_action_apply",
         "required_cwd": "canonical_main_root",
         "required_branch": "default_branch",
-        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        # Issue #2584: widened to the SAME 2-root shape as
+        # `contract_update.run.*` -- `_dispatch_candidate_body_via_edit_
+        # txn()` writes its request metadata under
+        # `artifacts/{active_issue}/issue-metadata/`.
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            "artifacts/{active_issue}/issue-metadata/",
+        ],
         "network_effect": "github_mutation",
         "stdin_contract": "none",
         "stdout_contract": "repair_apply_result/v1",
@@ -678,7 +694,13 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "execution_class": "exact_structural_repair_action_apply",
         "required_cwd": "canonical_main_root",
         "required_branch": "default_branch",
-        "allowed_write_roots": [".claude/artifacts/issue-refinement-loop/{active_issue}/"],
+        # Issue #2584: same widening as `repair_action.apply` above --
+        # `structural_repair_action.apply` shares the SAME
+        # `_dispatch_candidate_body_via_edit_txn()` transaction core.
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+            "artifacts/{active_issue}/issue-metadata/",
+        ],
         "network_effect": "github_mutation",
         "stdin_contract": "none",
         "stdout_contract": "structural_repair_apply_result/v1",
