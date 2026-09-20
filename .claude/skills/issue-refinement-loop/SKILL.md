@@ -141,9 +141,9 @@ uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
 
 このphaseは既存patch planをtransaction-localにconsumerへ渡し、candidate static readiness、controlled transaction、final readback、fresh preflight/review/readiness入力までを一続きに実行する。subagent / isolation worktree はこのcommandを直接実行しない。新しい永続schema、receipt、publisher、state storeは作らない。
 
-wrapper の出力フィールドを確認する:
+**investigation evidence transport（Issue #2678、#2086 AC3 の mutation phase 拡張。詳細・primary-root 内部生成・write-zero 保証は `references/anchor-comment-handling.md` の「mutation phase（#2678）」節を正本として参照）:** read-only `preflight.run.with_human_context` が `--investigation-evidence-transport-path` で `contract_update_required` decision を得た場合、その read-only invocation で使用した**同一の manifest path**を、直後の別の（command ID が異なる）`contract_update.run.with_human_context` invocation に再利用してそのまま渡す（manifest を再生成しない。例: `skill_runtime_exec.py --command-id contract_update.run.with_human_context --issue-number <N> --repo <owner/repo> --anchor-comment-url <canonical URL> --investigation-evidence-transport-path <repo-relative manifest path>`）。`optional_flag_pair`（省略時は byte-identical）。`--investigation-evidence-primary-root` は caller 指定不可（executor 内部生成）。検証失敗時は mutation consumer 呼出し・GitHub 更新要求ともに 0 回（write-zero）。対象外 boundary flag はこの緩和の対象外。
 
-**canonical stdout フィールド（機械可読）:**
+wrapper の出力フィールドを確認する（**canonical stdout フィールド（機械可読）**）:
 - `STATUS: pass | warn | needs_fix | blocked | environment_failure` — 常に出力される
 - `NEXT_ACTION: proceed | proceed_with_notes | apply_deterministic_repair | apply_deterministic_structural_repair | human_judgment_required | fix_environment | issue_editor_required` — 常に出力される（`issue_editor_required` は `--consume-contract-patch-plan` 経路限定。下記「`NEXT_ACTION: issue_editor_required` 受信時」参照）
 - `MUST_READ:` — 読むべきパス一覧（空の場合は省略）
@@ -168,8 +168,7 @@ wrapper の出力フィールドを確認する:
 - `DO_NOT_READ` — 予約済み（現在は常に空）、consumers は欠如に依存してはならない
 - `EVIDENCE` — raw issue body / comments は stdout に出力されない（artifact のみ）
 
-**warn (exit 1) の定義:**
-planner exit 0 かつ `fail_closed.required == false` かつ `decisions.*.confidence` に `"unknown"` が 1 つ以上含まれる場合、`STATUS: warn` / exit 1 を返す。human note が必要だが blocking ではない。`NEXT_ACTION: proceed_with_notes` に従って継続できる。
+**warn (exit 1) の定義:** planner exit 0 かつ `fail_closed.required == false` かつ `decisions.*.confidence` に `"unknown"` が 1 つ以上含まれる場合、`STATUS: warn` / exit 1 を返す。human note が必要だが blocking ではない。`NEXT_ACTION: proceed_with_notes` に従って継続できる。
 
 - `NEXT_ACTION:` に従って後続ステップを決定する
 - `ARTIFACT:` の `refinement_preflight_result_v1` パスから `fail_closed` / `decisions` を参照する
@@ -417,6 +416,7 @@ downstream skill（impl-review-loop・implement-issue・issue-contract-review・
 | anchor comment schema | `schemas/anchor_comment.schema.json`（Issue #1873: `loop_state.schema.json` から抽出） |
 | loop state field definitions（historical） | `references/loop-state.md` |
 | anchor comment handling | `references/anchor-comment-handling.md` |
+| owner reaction decision（read-only、heavy mutation 実行許可ではない） | `scripts/owner_reaction_decision.py` — `references/anchor-comment-handling.md`（#1975） |
 | scope signal guard | `references/scope-signal-guard.md` |
 | AC/VC reflection | `references/ac-vc-reflection.md` |
 | follow-up materialization | `references/follow-up-materialization.md` |

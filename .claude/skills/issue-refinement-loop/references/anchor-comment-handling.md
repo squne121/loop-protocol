@@ -211,6 +211,40 @@ freeform directive では常に空になる（`derive_contract_patch_operations(
 `preflight.run` → fresh review → fresh readiness が全て成功するまで実装は許可されない
 （既存の post-update gate と同一）。
 
+### mutation phase（`contract_update.run.with_human_context`）への配線（#2678）
+
+上記の read-only investigation evidence（`investigation_derived_path_literals`）は、
+`preflight.run.with_human_context`（read-only lane）だけでなく、実際に GitHub mutation を行う
+`contract_update.run.with_human_context`（mutation phase、`SKILL.md` の「Step 0g」参照）でも
+同じ意味で再現される。呼び出し側の操作手順は次の 2 ステップ:
+
+1. `preflight.run.with_human_context` を `--investigation-evidence-transport-path <manifest>`
+   付きで実行し、`route.action == "contract_update_required"` を確認する（read-only）。
+2. ステップ1の read-only invocation で使用した**同一の `<manifest>` パス**を、command ID が異なる
+   （＝呼び出し自体は別の）直後の `contract_update.run.with_human_context` invocation に再利用して
+   そのまま渡す（`--investigation-evidence-transport-path <manifest>`）。read-only 呼び出しとは
+   別の transport manifest を新たに生成し直す必要はない。
+
+`--investigation-evidence-primary-root` は caller が指定する項目ではない。
+`skill_runtime_exec.py` はこのフラグを CLI として受け付けず、`--investigation-evidence-
+transport-path` が指定された場合にのみ、executor が既に確認済みの `project_root`
+（#2197/#2199 専用worktree dispatch 前の PRIMARY checkout の絶対パス）を内部的に子プロセスへ
+付与する。transport manifest は PRIMARY checkout の `.claude/artifacts/` 配下にのみ存在すればよく、
+専用worktree（`execution_root`）側へのコピーは不要— この primary-root 伝搬が、専用worktree
+の異なる cwd からでも実 consumer が transport artifact を発見できる理由である
+（PR #2520 の専用worktree実行方式との整合、Issue #2678 AC2/AC5）。
+
+**invalid-transport の write-zero 保証（AC6）:** transport が明示指定され、かつ digest / issue /
+repo / anchor / body / HEAD / path confinement のいずれかの検証に失敗した場合、anchor 本文単独
+から独立に有効な `CONTRACT_PATCH_PLAN_V1`（exact backtick literal を含む directive 等、
+investigation evidence を必要としないケースを含む）が導出可能であっても、mutation consumer
+（`consume_trusted_anchor_contract_patch_plan()`）は一切呼び出されず、GitHub 更新要求も発生しない
+（`run_refinement_preflight.py` の `_investigation_evidence_transport_rejected` フラグ。
+transport 未指定時の挙動は byte-identical のまま変更されない）。`destructive_or_non_idempotent_
+operation` / `changes_permission_boundary` / `changes_external_service_boundary` /
+`requires_issue_split` の各 boundary はこの mutation phase でも緩和されない（`expands_allowed_paths`
+のみが対象、上記「read-only investigation による exact path 導出（AC3/AC4）」と同一）。
+
 ## anchor_context.py — 複数ターン分節・候補抽出・取得完全性（#1891）
 
 `anchor_context.py`（`scripts/anchor_context.py`）は、`run_refinement_preflight.py` が生成した既存 snapshot artifact（`anchor_comment.snapshot`）のみを唯一の入力とする pure analyzer である。独自の GitHub API 呼び出しは持たない。
@@ -248,6 +282,31 @@ trusted OWNER の multi-turn anchor で advisory route に入った後、候補�
 7. **保留 mutation の適用**: 一意な有効 owner reaction が確認できた時点で、対応する選択肢の heavy mutation だけを適用する。material conflict と無関係な non-heavy mutation（body improvement 等）は、この手順を待たずに `warn` で継続してよい。
 
 この手順は新規 decision ledger・独立 schema・publisher を追加せず、既存の Issue コメント投稿と GitHub reaction API readback のみで完結させる。
+
+### owner_reaction_decision.py — 手順 2〜6 の決定論的実装（#1975）
+
+上記手順の「全ページ取得（手順2）」「principal 固定（手順3）」「drift readback（手順4）」
+「untrusted reaction 除外（手順5）」「有効 reaction の一意性判定（手順6）」は、
+`.claude/skills/issue-refinement-loop/scripts/owner_reaction_decision.py` が
+canonical implementation として動作する read-only CLI である。preview binding
+（repository・Issue number・提示 comment ID・提示 comment body hash・
+reaction→`option_id` mapping・各 option の操作内容・対象・比較対象 anchor/Issue
+snapshot hash）を入力とし、`command_registry.py` の `owner_reaction.decide`
+command entry（`network_effect: github_read_only`、`mutation: false`）経由で
+起動する。内部の GitHub reaction 取得は `gh api -X GET --paginate --slurp`
+相当の argv 配列のみで行い、`gh` 自身の pagination（`Link: rel="next"` 追跡）を
+再実装しない。全件取得の成功条件（subprocess 正常終了・全ページ取得完了・全ページ
+shape 検証・reaction record 整合性検証）を 1 つでも満たさない場合は選択成立を
+返さず、fail-closed な `environment_error` を返す。
+
+この CLI の出力（`selected_option_id` を含む選択結果）は、それ自体では手順1の
+選択肢に対応する heavy mutation（`close` / `not_planned` /
+`replacement_issue_creation` / `dependency_removal` / `parent_child_change`）の
+実行許可にならない。`selected` を `approved_by_trusted_anchor` へ自動変換する
+配線、または既存 heavy mutation gate（`_classify_heavy_mutation_gate()` /
+`_is_approved_close_not_planned_decision()`）への直接接続は、本 CLI の責務外
+であり別 Issue の判断とする。手順7「保留 mutation の適用」は引き続き root
+control-plane が本 CLI の構造化結果を読んでから実施する運用手順のままである。
 
 ### known_context の取得完全性フィールド（AC5）
 

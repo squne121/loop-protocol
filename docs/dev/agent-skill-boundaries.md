@@ -1512,6 +1512,16 @@ executor は各 command id の `env_sanitize` に列挙された環境変数を�
 （共通: `PYTHONPATH`, `PYTHONHOME`, `GH_EDITOR`, `EDITOR`, `VISUAL`, `BROWSER`,
 `GH_HOST`, `GH_REPO`, `GH_CONFIG_DIR`, `GH_DEBUG`, `DEBUG`, `GH_TOKEN`, `GITHUB_TOKEN`）。
 
+これは `controlled_skill_mutation_policy.py` の generic/default sanitization boundary
+であり、全 command id に無条件適用されるわけではない。issue-metadata read/write
+helper（`_build_metadata_sanitized_env()`）と `issue_relationship.update`
+（`_relationship_gh_env()`）は、下記「環境サニタイズ境界（Issue #2665）」で説明する
+lane-specific な credential-carrier-preserving boundary を優先して使用し、
+`GH_TOKEN`/`GITHUB_TOKEN`/`GH_CONFIG_DIR` を無条件除去しない（#2299 / PR #2303 /
+#2665）。`issue_dependency.remove` の higher-trust sanitizer
+（`_build_issue_dependency_remove_gh_env()`）は本節の generic boundary と同様
+`GH_CONFIG_DIR` を無条件除去する、別 lane の境界として維持される。
+
 ### Idempotency（AC13、冪等性）
 
 各 command id の `idempotency.marker_file_pattern` で定義された local marker file が存在し、
@@ -2044,6 +2054,21 @@ cycle）は live traversal を要するため executor 側
 9. `parent`・`blockedBy`（全ページ）・`blocking`（全ページ）を post-readback する（mutation 成否に関わらず必ず実行する。AC9）
 10. 一部 operation が失敗していた場合は `partial` を返し、`before`/`desired`/`after`（fresh readback 値）/`completed_operations`/`pending_operations` を含める（AC9）
 11. 全 operation が成功し、かつ post-readback が desired と完全一致した場合のみ `applied` を返す。不一致の場合は `postcondition_rejected` を返す
+
+**環境サニタイズ境界（Issue #2665）**: 上記 2〜11 の全 `gh` subprocess 呼び出し
+（actor verification、precondition readback、mutation、postcondition
+readback、zero-delta no-op verification）は `_relationship_gh_env()` が一度
+だけ構築する単一の `env` を共有する。`_relationship_gh_env()` は
+`_build_metadata_sanitized_env()`（issue-metadata read/write helper が使う
+sanitizer）と同一の安全境界を再利用し、実行/ログ noise のみを
+`_METADATA_ENV_NOISE_STRIP_KEYS`（`GH_HOST`/`GH_REPO`/`GH_DEBUG`/`DEBUG`/
+editor-browser 系/`PYTHONPATH`/`PYTHONHOME`）で除去し、既存の credential
+carrier（`GH_TOKEN`/`GITHUB_TOKEN`/`GH_CONFIG_DIR`）は存在する場合そのまま
+維持し、存在しないものは合成しない。`issue_dependency.remove` 用の
+higher-trust sanitizer（`_build_issue_dependency_remove_gh_env()`。
+`GH_CONFIG_DIR` を無条件除去する）とは異なる境界であり、relationship
+route はそちらを共有しない（#2665 以前は誤って共有しており、継承した
+`GH_CONFIG_DIR` が無条件で失われる regression があった）。
 
 `blocking` 方向規約: Issue `T`（transaction subject）が `X` を block する場合、
 GraphQL `AddBlockedByInput`/`RemoveBlockedByInput` は `issueId=X`（block される側）、
