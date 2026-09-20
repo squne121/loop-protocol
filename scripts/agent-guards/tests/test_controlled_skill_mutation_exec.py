@@ -2189,6 +2189,473 @@ class TestIssueRelationshipUpdateParentRebindSingleMutation:
 
 
 # =============================================================================
+# Issue #2665 AC3: authentication, transport, GraphQL schema, actor
+# permission, or postcondition-readback failure in the
+# issue_relationship.update route must fail closed -- never report success
+# or a relationship-updated outcome. `TestIssueRelationshipUpdateActorPermission`
+# (above) already covers the actor-permission branch; the classes below fill
+# the remaining fail-closed branches this Issue's AC3 calls out explicitly:
+# authenticated-identity fetch failure, pre-mutation readback transport
+# failure, post-mutation readback transport failure (attempted-mutation
+# state preserved, never silently reclassified), and postcondition final
+# state mismatch.
+# =============================================================================
+
+
+class TestIssueRelationshipUpdateAuthenticationFailure:
+    """AC3: a failure to resolve the authenticated gh identity (the first
+    call the relationship route makes) must reject before any relationship
+    read or mutation GraphQL call is attempted."""
+
+    def test_actor_identity_fetch_error_rejected_before_any_graphql_call(self, monkeypatch):
+        input_data = _relationship_input(add_blocked_by=[5])
+        monkeypatch.setattr(
+            _exec,
+            "_fetch_issue_dependency_remove_actor",
+            lambda *_a, **_k: (None, None, "gh_api_authenticated_user_failed: gh not logged in"),
+        )
+        monkeypatch.setattr(_exec, "_check_no_tracked_changes", lambda *_a, **_k: [])
+
+        results: dict = {}
+
+        def _fail(reason, errors=None, status="error", extra=None):
+            results.update({"outcome": "fail", "status": status, "reason": reason, "extra": extra or {}})
+            return 1 if status != "error" else 2
+
+        def _ok(extra):
+            results.update({"outcome": "ok", **extra})
+            return 0
+
+        # Empty side_effect list: any _graphql_call invocation raises
+        # StopIteration and fails this test -- proving zero GraphQL calls
+        # happen when the authenticated-identity fetch itself fails.
+        with patch.object(_exec, "_graphql_call", side_effect=[]):
+            _exec._run_issue_relationship_update(_FakeArgs(input_data["issue_number"]), input_data, "gh", _fail, _ok)
+
+        assert results["outcome"] == "fail"
+        assert results["status"] == "transport_or_schema_error"
+        assert results["extra"]["mutation_attempted"] is False
+        assert "gh_api_authenticated_user_failed" in results["reason"]
+
+    def test_actor_identity_fetch_error_rejected_before_any_graphql_call_via_real_helper_subprocess_boundary(
+        self, monkeypatch
+    ):
+        """#2682 review P1: the same fail-closed guarantee as above, but
+        proven through the REAL `subprocess.run` CLI boundary (only that
+        boundary is mocked) -- the exact layer the #2665 credential-context
+        bug actually manifested at, not `_graphql_call` itself."""
+        captured = _relationship_subprocess_dispatch(monkeypatch, fail_call="auth")
+        input_data = _relationship_input(add_blocked_by=[5])
+
+        results = _invoke_relationship_update_capturing_result(input_data)
+
+        assert results["outcome"] == "fail"
+        assert results["status"] == "transport_or_schema_error"
+        assert results["extra"]["mutation_attempted"] is False
+        assert "gh_api_authenticated_user_failed" in results["reason"]
+        # Only the identity-fetch `user` call was ever attempted -- no
+        # permission call, no GraphQL call: the failure short-circuits
+        # before any subsequent subprocess-boundary call.
+        assert len(captured) == 1
+        assert captured[0][0][4] == "user"
+
+
+class TestIssueRelationshipUpdatePreReadbackTransportFailure:
+    """AC3: a transport/schema failure during the precondition readback
+    (before any mutation is attempted) must reject with
+    `mutation_attempted: False` -- never treated as a no-op success."""
+
+    def test_pre_self_and_parent_transport_error_rejected_before_mutation(self, monkeypatch):
+        input_data = _relationship_input(add_blocked_by=[5])
+        calls = [(None, "gh_api_graphql_failed: transient network error")]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "fail"
+        assert results["status"] == "transport_or_schema_error"
+        assert results["extra"]["mutation_attempted"] is False
+
+    def test_pre_blocked_by_readback_transport_error_rejected_before_mutation(self, monkeypatch):
+        input_data = _relationship_input(add_blocked_by=[5])
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),
+            (None, "gh_api_graphql_failed: transient network error"),
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "fail"
+        assert results["status"] == "transport_or_schema_error"
+        assert results["extra"]["mutation_attempted"] is False
+
+    def test_pre_self_and_parent_transport_error_rejected_before_mutation_via_real_helper_subprocess_boundary(
+        self, monkeypatch
+    ):
+        """#2682 review P1: real subprocess.run CLI boundary variant of
+        `test_pre_self_and_parent_transport_error_rejected_before_mutation`
+        above."""
+        captured = _relationship_subprocess_dispatch(monkeypatch, fail_call="pre_self_and_parent")
+        input_data = _relationship_input(add_blocked_by=[5])
+
+        results = _invoke_relationship_update_capturing_result(input_data)
+
+        assert results["outcome"] == "fail"
+        assert results["status"] == "transport_or_schema_error"
+        assert results["extra"]["mutation_attempted"] is False
+        # actor verification (2 calls) + the failed precondition
+        # self_and_parent readback (1) = 3 -- no further readback/mutation
+        # subprocess call was attempted once the precondition readback fails.
+        assert len(captured) == 3
+
+
+class TestIssueRelationshipUpdatePostReadbackTransportFailure:
+    """AC3: a transport/schema failure during the postcondition readback
+    AFTER a mutation was attempted must fail closed while preserving the
+    attempted/partial-completion state -- never reclassified as
+    `failed_no_mutation` or as an unexecuted transaction."""
+
+    def test_post_self_and_parent_transport_error_after_mutation_attempt_fails_closed(self, monkeypatch):
+        input_data = _relationship_input(add_blocked_by=[30])
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+            (_relationship_node_lookup("N30", 30), ""),
+            (
+                {
+                    "addBlockedBy": {
+                        "issue": {"id": "ISELF", "number": 1883},
+                        "blockingIssue": {"id": "N30", "number": 30},
+                    }
+                },
+                "",
+            ),
+            (None, "gh_api_graphql_failed: transient network error"),  # post self+parent fails
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "fail"
+        assert results["status"] == "transport_or_schema_error"
+        assert results["reason"] == "post_readback_failed_after_mutation_attempt"
+        # The mutation WAS attempted (and, per the fixture, completed) --
+        # this must survive into the failure result, not be silently
+        # dropped or reset to False (AC3: attempted/partial state preserved).
+        assert results["extra"]["mutation_attempted"] is True
+        assert results["extra"]["completed_operations"] == ["add_blocked_by:30"]
+
+    def test_post_self_and_parent_transport_error_after_mutation_fails_closed_via_real_helper_boundary(
+        self, monkeypatch
+    ):
+        """#2682 review P1: real subprocess.run CLI boundary variant of the
+        test above -- proves the mutation actually reached the GraphQL
+        `gh api graphql` call and the postcondition readback failure is
+        observed at the same subprocess boundary the #2665 bug affected."""
+        captured = _relationship_subprocess_dispatch(
+            monkeypatch, pre_blocked_by=[10], fail_call="post_self_and_parent"
+        )
+        input_data = _relationship_input(
+            expected_before={"parent": None, "blocked_by": [10], "blocking": []},
+            add_blocked_by=[30],
+        )
+
+        results = _invoke_relationship_update_capturing_result(input_data)
+
+        assert results["outcome"] == "fail"
+        assert results["status"] == "transport_or_schema_error"
+        assert results["reason"] == "post_readback_failed_after_mutation_attempt"
+        assert results["extra"]["mutation_attempted"] is True
+        assert results["extra"]["completed_operations"] == ["add_blocked_by:30"]
+        # actor verification (2) + pre readback (3) + node lookup (1) +
+        # mutation (1) + failed post self_and_parent readback (1) = 8 -- the
+        # post blockedBy/blocking readback calls are never attempted once
+        # the post self_and_parent call itself fails.
+        assert len(captured) == 8
+
+
+class TestIssueRelationshipUpdatePostconditionMismatch:
+    """AC3: the final-state readback diverging from the desired state after
+    a mutation attempt must reject as `postcondition_rejected` -- never
+    reported as success -- even though the mutation call itself returned a
+    well-formed GraphQL response."""
+
+    def test_after_state_diverges_from_desired_fails_closed_never_success(self, monkeypatch):
+        input_data = _relationship_input(add_blocked_by=[30])
+        calls = [
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+            (_relationship_node_lookup("N30", 30), ""),
+            (
+                {
+                    "addBlockedBy": {
+                        "issue": {"id": "ISELF", "number": 1883},
+                        "blockingIssue": {"id": "N30", "number": 30},
+                    }
+                },
+                "",
+            ),
+            (_relationship_self_and_parent("ISELF", 1883, parent=None), ""),  # post self+parent
+            (_relationship_field_page("ISELF", 1883, "blockedBy", []), ""),  # post blockedBy still empty: mismatch
+            (_relationship_field_page("ISELF", 1883, "blocking", []), ""),
+        ]
+        results = _run_relationship(monkeypatch, input_data, calls)
+        assert results["outcome"] == "fail"
+        assert results["status"] == "postcondition_rejected"
+        assert results["reason"] == "postcondition_final_state_mismatch"
+        assert results["extra"]["mutation_attempted"] is True
+
+
+# =============================================================================
+# Issue #2665 AC4: regression coverage that goes through the REAL relationship
+# helper (`_run_issue_relationship_update` and its real
+# `_fetch_authenticated_login` / `_fetch_issue_dependency_remove_actor` /
+# `_graphql_call` / `_fetch_self_and_parent` /
+# `_fetch_relationship_field_all_pages` / `_execute_relationship_operation`
+# call chain), mocking only the `subprocess.run` CLI boundary -- not
+# `_graphql_call` itself (unlike the `_run_relationship` harness used by the
+# rest of this file). Every actor-verification, precondition-readback,
+# mutation, postcondition-readback, and zero-delta no-op verification call is
+# asserted to receive the identical sanitized env and the fixed
+# `--hostname github.com` host argv, across config-only / each single token
+# carrier / all carriers simultaneously ambient inputs.
+# =============================================================================
+
+
+def _relationship_subprocess_dispatch(
+    monkeypatch,
+    *,
+    login="bot-actor",
+    permission="admin",
+    self_id="ISELF",
+    self_number=1883,
+    repo=TRUSTED_REPO,
+    pre_blocked_by=(),
+    pre_blocking=(),
+    add_target_id="N30",
+    add_target_number=30,
+    post_blocked_by=None,
+    post_blocking=None,
+    fail_call=None,
+):
+    """Patch `_exec.subprocess.run` with an argv/payload-keyed dispatcher
+    that answers a single add_blocked_by issue_relationship.update flow
+    through the REAL `_graphql_call` / actor-fetch code paths. Returns the
+    list of captured (argv, kwargs) tuples in call order for assertion.
+
+    `fail_call` (#2682 review P1) optionally injects a single non-zero-rc
+    failure at one call site so the fail-closed branches AC3 already covers
+    via the `_run_relationship` (mocked-`_graphql_call`) harness can also be
+    proven through this REAL subprocess.run CLI boundary -- the exact layer
+    the #2665 bug actually manifested at. One of:
+    - "auth": the identity-fetch `user` call fails (before any GraphQL call)
+    - "pre_self_and_parent": the first (precondition) self+parent readback
+      GraphQL call fails (before any mutation is attempted)
+    - "post_self_and_parent": the second (postcondition) self+parent
+      readback GraphQL call fails (after a mutation was attempted)
+    """
+    post_blocked_by = list(pre_blocked_by) + [add_target_number] if post_blocked_by is None else post_blocked_by
+    post_blocking = list(pre_blocking) if post_blocking is None else post_blocking
+    field_call_counts = {"self_and_parent": 0, "blockedBy": 0, "blocking": 0}
+    captured: list[tuple[list, dict]] = []
+
+    def _completed(stdout, returncode=0, stderr=""):
+        return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _failed(stderr="gh_api_call_failed: injected transport failure"):
+        return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=stderr)
+
+    def _dispatch(argv, **kwargs):
+        captured.append((list(argv), dict(kwargs)))
+        assert argv[0] == "gh"
+        assert argv[1:4] == ["api", "--hostname", "github.com"], f"host argv not pinned: {argv!r}"
+        if argv[4] == "user":
+            if fail_call == "auth":
+                return _failed("gh_api_authenticated_user_failed: injected auth failure")
+            return _completed(f"{login}\n")
+        if argv[4].startswith(f"repos/{repo}/collaborators/") and argv[4].endswith("/permission"):
+            return _completed(f"{permission}\n")
+        if argv[4] == "graphql":
+            payload = json.loads(kwargs["input"])
+            query = payload["query"]
+            if "parent { id number state }" in query:
+                field_call_counts["self_and_parent"] += 1
+                occurrence = field_call_counts["self_and_parent"]
+                if fail_call == "pre_self_and_parent" and occurrence == 1:
+                    return _failed("gh_api_graphql_failed: injected pre-readback transport failure")
+                if fail_call == "post_self_and_parent" and occurrence == 2:
+                    return _failed("gh_api_graphql_failed: injected post-readback transport failure")
+                data = _relationship_self_and_parent(self_id, self_number, parent=None)
+                return _completed(json.dumps({"data": data}))
+            if "blockedBy(first: 50" in query:
+                field_call_counts["blockedBy"] += 1
+                nums = pre_blocked_by if field_call_counts["blockedBy"] == 1 else post_blocked_by
+                nodes = [_rel_node(f"N{n}", n) for n in nums]
+                data = _relationship_field_page(self_id, self_number, "blockedBy", nodes)
+                return _completed(json.dumps({"data": data}))
+            if "blocking(first: 50" in query:
+                field_call_counts["blocking"] += 1
+                nums = pre_blocking if field_call_counts["blocking"] == 1 else post_blocking
+                nodes = [_rel_node(f"N{n}", n) for n in nums]
+                data = _relationship_field_page(self_id, self_number, "blocking", nodes)
+                return _completed(json.dumps({"data": data}))
+            if "addBlockedBy(input:" in query:
+                data = {
+                    "addBlockedBy": {
+                        "issue": {"id": self_id, "number": self_number},
+                        "blockingIssue": {"id": add_target_id, "number": add_target_number},
+                    }
+                }
+                return _completed(json.dumps({"data": data}))
+            if "issue(number: $number) { id number state }" in query:
+                data = _relationship_node_lookup(add_target_id, add_target_number)
+                return _completed(json.dumps({"data": data}))
+            raise AssertionError(f"unexpected relationship-route graphql query: {query!r}")
+        raise AssertionError(f"unexpected gh invocation: {argv!r}")
+
+    monkeypatch.setattr(_exec.subprocess, "run", _dispatch)
+    monkeypatch.setattr(_exec, "_check_no_tracked_changes", lambda *_a, **_k: [])
+    monkeypatch.setattr(_exec, "_capture_pre_mutation_snapshot", lambda *_a, **_k: (object(), None))
+    return captured
+
+
+def _assert_all_calls_share_sanitized_env_and_fixed_host(captured, expected_env_subset):
+    """Every captured gh subprocess call must receive an explicit env=
+    kwarg equal to the same sanitized dict (single boundary, no per-call-site
+    drift) that preserves exactly the ambient carriers in
+    `expected_env_subset` and strips `_METADATA_ENV_NOISE_STRIP_KEYS`. Host
+    pinning is asserted separately by `_relationship_subprocess_dispatch`
+    (raises on any non `--hostname github.com` argv)."""
+    assert captured, "no gh subprocess calls were observed"
+    envs = [kwargs.get("env") for _argv, kwargs in captured]
+    assert all(env is not None for env in envs), "every gh call must receive an explicit env= kwarg"
+    assert all(env == envs[0] for env in envs), "every gh call in the route must share one identical sanitized env"
+    for key in _exec._METADATA_ENV_NOISE_STRIP_KEYS:
+        assert key not in envs[0]
+    for carrier, value in expected_env_subset.items():
+        assert envs[0].get(carrier) == value
+    for carrier in ("GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"):
+        if carrier not in expected_env_subset:
+            assert carrier not in envs[0], f"{carrier} must not be synthesized when absent from the ambient env"
+
+
+def _apply_relationship_ambient_env(monkeypatch, ambient_env):
+    """Set exactly `ambient_env` for the three credential-carrier keys.
+
+    #2682 review P1: the carriers NOT present in `ambient_env` must be
+    explicitly removed first -- otherwise a "config_only" case only adds
+    `GH_CONFIG_DIR` on top of whatever the ambient pytest launcher
+    environment already carries (e.g. a real `GH_TOKEN`), and the
+    single-carrier claim these parametrized cases assert is never actually
+    exercised."""
+    for key in ("GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in ambient_env.items():
+        monkeypatch.setenv(key, value)
+
+
+def _invoke_relationship_update_capturing_result(input_data):
+    """Run `_run_issue_relationship_update` with a `_fail`/`_ok` pair that
+    records the single terminal outcome into a plain dict. Shared by the
+    real-helper subprocess-boundary tests (success, no-op, and the injected
+    fail-closed branches below) so each test body only states its scenario
+    and assertions (#2682 review P1)."""
+    results: dict = {}
+
+    def _fail(reason, errors=None, status="error", extra=None):
+        results.update({"outcome": "fail", "status": status, "reason": reason, "extra": extra or {}})
+        return 1 if status != "error" else 2
+
+    def _ok(extra):
+        results.update({"outcome": "ok", **extra})
+        return 0
+
+    _exec._run_issue_relationship_update(_FakeArgs(input_data["issue_number"]), input_data, "gh", _fail, _ok)
+    return results
+
+
+@pytest.mark.parametrize(
+    "ambient_env,expected_env_subset",
+    [
+        pytest.param(
+            {"GH_CONFIG_DIR": "/fake/native/gh/config"},
+            {"GH_CONFIG_DIR": "/fake/native/gh/config"},
+            id="config_only",
+        ),
+        pytest.param({"GH_TOKEN": "ambient-token-1"}, {"GH_TOKEN": "ambient-token-1"}, id="gh_token_only"),
+        pytest.param(
+            {"GITHUB_TOKEN": "ambient-token-2"}, {"GITHUB_TOKEN": "ambient-token-2"}, id="github_token_only"
+        ),
+        pytest.param(
+            {
+                "GH_TOKEN": "ambient-token-1",
+                "GITHUB_TOKEN": "ambient-token-2",
+                "GH_CONFIG_DIR": "/fake/native/gh/config",
+            },
+            {
+                "GH_TOKEN": "ambient-token-1",
+                "GITHUB_TOKEN": "ambient-token-2",
+                "GH_CONFIG_DIR": "/fake/native/gh/config",
+            },
+            id="all_carriers_simultaneously",
+        ),
+    ],
+)
+class TestIssueRelationshipUpdateRealHelperSubprocessBoundaryEnvParity:
+    """AC4: real relationship-helper regression, CLI subprocess boundary
+    only mocked, covering config-only / each single token carrier / all
+    carriers simultaneously -- for actor verification, precondition
+    readback, mutation, and postcondition readback."""
+
+    def test_add_blocked_by_flow_shares_sanitized_env_across_every_call(
+        self, monkeypatch, ambient_env, expected_env_subset
+    ):
+        _apply_relationship_ambient_env(monkeypatch, ambient_env)
+        # Noise/redirection overrides that must never reach a `gh`
+        # subprocess call, regardless of which credential carriers are set.
+        monkeypatch.setenv("GH_HOST", "evil.example.com")
+        monkeypatch.setenv("GH_DEBUG", "1")
+
+        captured = _relationship_subprocess_dispatch(monkeypatch, pre_blocked_by=[10])
+
+        input_data = _relationship_input(
+            expected_before={"parent": None, "blocked_by": [10], "blocking": []},
+            add_blocked_by=[30],
+        )
+        results = _invoke_relationship_update_capturing_result(input_data)
+
+        assert results["outcome"] == "ok"
+        assert results["status"] == "applied"
+        assert sorted(results["after"]["blocked_by"]) == [10, 30]
+        # actor verification (2 calls) + pre readback (3) + node lookup (1)
+        # + mutation (1) + post readback (3) = 10 gh subprocess calls, all
+        # sharing the identical sanitized env.
+        assert len(captured) == 10
+        _assert_all_calls_share_sanitized_env_and_fixed_host(captured, expected_env_subset)
+
+    def test_zero_delta_no_op_flow_shares_sanitized_env_across_every_call(
+        self, monkeypatch, ambient_env, expected_env_subset
+    ):
+        _apply_relationship_ambient_env(monkeypatch, ambient_env)
+        monkeypatch.setenv("GH_HOST", "evil.example.com")
+        monkeypatch.setenv("GH_DEBUG", "1")
+
+        # add_blocked_by=[10] is already present -- current == desired, so
+        # this resolves to a zero-delta no-op with no mutation/post-readback
+        # calls (only actor verification + the single precondition readback
+        # this route reuses as the no-op comparison).
+        captured = _relationship_subprocess_dispatch(monkeypatch, pre_blocked_by=[10])
+
+        input_data = _relationship_input(
+            expected_before={"parent": None, "blocked_by": [10], "blocking": []},
+            add_blocked_by=[10],
+        )
+        results = _invoke_relationship_update_capturing_result(input_data)
+
+        assert results["outcome"] == "ok"
+        assert results["status"] == "no_op"
+        assert results["mutation_attempted"] is False
+        # actor verification (2 calls) + precondition readback (3) = 5 gh
+        # subprocess calls -- no mutation, no post-readback.
+        assert len(captured) == 5
+        _assert_all_calls_share_sanitized_env_and_fixed_host(captured, expected_env_subset)
+
+
+# =============================================================================
 # Issue #1116 fix_delta P1-2: the plain `issue_comment.publish` POST path
 # (no remote marker found by the pre-mutation precheck) must reconcile a
 # lost-response POST via `_readback_by_marker_literal` exactly like the
