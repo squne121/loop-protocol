@@ -934,6 +934,88 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "repo": {"type": "owner_repo", "required": True},
         },
     },
+    # Issue #1975: read-only owner-reaction reader / stable-user-id
+    # principal resolver / drift checker / selection resolver, bound
+    # directly to `owner_reaction_decision.py` (NOT dispatched through
+    # `skill_runtime_exec.py`'s generic command_id dispatch table -- that
+    # wiring is explicitly Out of Scope for this Issue, same posture as
+    # `scope_rollup.run` above). This entry's own scope is limited to
+    # "registry entry rendering -> real CLI subprocess launch -> root
+    # reads the structured result" (Issue #1975 AC7). The CLI's output
+    # (`selected_option_id`) never itself authorizes a heavy mutation --
+    # see `references/anchor-comment-handling.md`.
+    "owner_reaction.decide": {
+        "id": "owner_reaction.decide",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/owner_reaction_decision.py",
+            "--repo", "{repo}",
+            "--issue-number", "{issue_number}",
+            "--owner-user-id", "{owner_user_id}",
+            "--preview-binding-file", "{preview_binding_file}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_owner_reaction_decide",
+        "stdin_contract": "none",
+        "stdout_contract": "owner_reaction_decision_result/v1",
+        # PR #2683 fix_delta (P2-3, OWNER adversarial review comment
+        # #5748651887): `decide()` now issues up to 5 SEQUENTIAL `gh`
+        # subprocess calls (repo owner resolution, reactions pagination,
+        # target comment readback, anchor comment readback, Issue
+        # readback -- see `owner_reaction_decision.py` module docstring).
+        # At `DEFAULT_GH_TIMEOUT` = 12s/call, a worst-case fully-serial
+        # chain is ~60s; widened from the previous 60 to leave comfortable
+        # margin for this outer subprocess budget to still observe a
+        # structured `environment_error` rather than being killed first.
+        "timeout_seconds": 90,
+        "mutation": False,
+        "network_effect": "github_read_only",
+        "placeholders": {
+            "repo": {"type": "owner_repo", "required": True},
+            "issue_number": {"type": "positive_int", "required": True},
+            "owner_user_id": {"type": "positive_int", "required": True},
+            "preview_binding_file": {"type": "repo_relative_file", "required": True},
+        },
+    },
+    # Issue #1975 AC7: test-only sibling that drives the SAME real CLI
+    # subprocess offline, via `--gh-fixture-file` (bypasses only the
+    # internal `gh api` network calls -- everything else, including this
+    # very subprocess launch, is real). Mirrors the established
+    # `preflight.run.fixture` precedent above. Production
+    # `owner_reaction.decide` argv/timeout/placeholders are entirely
+    # unaffected by this sibling entry.
+    "owner_reaction.decide.fixture": {
+        "id": "owner_reaction.decide.fixture",
+        "argv": [
+            "uv", "run", "python3",
+            f"{_SKILL_PREFIX}/owner_reaction_decision.py",
+            "--repo", "{repo}",
+            "--issue-number", "{issue_number}",
+            "--owner-user-id", "{owner_user_id}",
+            "--preview-binding-file", "{preview_binding_file}",
+            "--gh-fixture-file", "{gh_fixture_file}",
+        ],
+        "shell": False,
+        "cwd_policy": "repo_root",
+        "execution_class": "exact_owner_reaction_decide_fixture",
+        "stdin_contract": "none",
+        "stdout_contract": "owner_reaction_decision_result/v1",
+        # PR #2683 fix_delta P2-3: same outer-budget widening as
+        # `owner_reaction.decide` above (this sibling drives the same real
+        # CLI subprocess, just with `gh` faked).
+        "timeout_seconds": 90,
+        "mutation": False,
+        "network_effect": "local_only",
+        "test_only": True,
+        "placeholders": {
+            "repo": {"type": "owner_repo", "required": True},
+            "issue_number": {"type": "positive_int", "required": True},
+            "owner_user_id": {"type": "positive_int", "required": True},
+            "preview_binding_file": {"type": "repo_relative_file", "required": True},
+            "gh_fixture_file": {"type": "repo_relative_file", "required": True},
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------

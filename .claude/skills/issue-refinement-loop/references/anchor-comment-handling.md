@@ -249,6 +249,31 @@ trusted OWNER の multi-turn anchor で advisory route に入った後、候補�
 
 この手順は新規 decision ledger・独立 schema・publisher を追加せず、既存の Issue コメント投稿と GitHub reaction API readback のみで完結させる。
 
+### owner_reaction_decision.py — 手順 2〜6 の決定論的実装（#1975）
+
+上記手順の「全ページ取得（手順2）」「principal 固定（手順3）」「drift readback（手順4）」
+「untrusted reaction 除外（手順5）」「有効 reaction の一意性判定（手順6）」は、
+`.claude/skills/issue-refinement-loop/scripts/owner_reaction_decision.py` が
+canonical implementation として動作する read-only CLI である。preview binding
+（repository・Issue number・提示 comment ID・提示 comment body hash・
+reaction→`option_id` mapping・各 option の操作内容・対象・比較対象 anchor/Issue
+snapshot hash）を入力とし、`command_registry.py` の `owner_reaction.decide`
+command entry（`network_effect: github_read_only`、`mutation: false`）経由で
+起動する。内部の GitHub reaction 取得は `gh api -X GET --paginate --slurp`
+相当の argv 配列のみで行い、`gh` 自身の pagination（`Link: rel="next"` 追跡）を
+再実装しない。全件取得の成功条件（subprocess 正常終了・全ページ取得完了・全ページ
+shape 検証・reaction record 整合性検証）を 1 つでも満たさない場合は選択成立を
+返さず、fail-closed な `environment_error` を返す。
+
+この CLI の出力（`selected_option_id` を含む選択結果）は、それ自体では手順1の
+選択肢に対応する heavy mutation（`close` / `not_planned` /
+`replacement_issue_creation` / `dependency_removal` / `parent_child_change`）の
+実行許可にならない。`selected` を `approved_by_trusted_anchor` へ自動変換する
+配線、または既存 heavy mutation gate（`_classify_heavy_mutation_gate()` /
+`_is_approved_close_not_planned_decision()`）への直接接続は、本 CLI の責務外
+であり別 Issue の判断とする。手順7「保留 mutation の適用」は引き続き root
+control-plane が本 CLI の構造化結果を読んでから実施する運用手順のままである。
+
 ### known_context の取得完全性フィールド（AC5）
 
 `known_context` には以下の 3 フィールドを追加する（「読了」「理解」を主張しない事実ベースの命名）:
