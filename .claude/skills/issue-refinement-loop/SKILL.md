@@ -19,13 +19,11 @@ note_ja: 本ファイルは thin entrypoint 契約のメタデータであり、
 `issue-refinement-loop` は control-plane 専用の thin entrypoint である。詳細 procedure は `references/` を必要時だけ読む progressive disclosure とし、planner / reviewer / worker の判定ロジックをこのファイルへ再実装しない。
 
 ## 入力 (Inputs)
-
 - `issue_number`（必須）: 改善対象の Issue 番号
 - `max_iterations`（任意、既定 3）: review cycle の上限
 - `anchor_comment_url`（任意）: snapshot 固定して扱う対象コメント URL。URL 単独から origin は推定せず、canonical command profile が human context / agent report / unlabeled を明示する。
 
 ## ループ方針 (Loop Policy)
-
 ```yaml
 loop_policy:
   default_max_iterations: 3
@@ -42,7 +40,6 @@ loop_policy:
 ```
 
 ### loop_iteration_approval_gate
-
 `loop_iteration_approval_gate.default_required: false`
 
 ループの自動継続は「このリポジトリの loop policy 上の承認確認（過去に `--no-approval` と呼んでいた運用フラグ/指示）」であり、Claude Code の `--permission-mode`、`--dangerously-skip-permissions`、`permissions.defaultMode` は変更しない。loop policy は「何回まで自動で回すか」を制御し、Claude Code の permission mode は「ツール呼び出しの承認方式」を制御する。両者は直交する概念であり、loop policy の継続判断に permission mode を参照しない。
@@ -52,7 +49,6 @@ needs-fix を受け取ったとき:
 - `iteration + 1 >= max_iterations` → `human_escalation` で停止し、全 iteration 分の blocker summary を添付
 
 ## ループ構造 (Loop Structure)
-
 ```text
 [Step 0: Preconditions / planner input assembly]
         ↓
@@ -80,7 +76,6 @@ routing の必須処理ではない。Step 2a（旧 Replay Arbitration、#1532 V
 Step 番号は履歴互換のため維持する。
 
 ## LOOP_STATE
-
 `LOOP_STATE_V1` のフィールド定義・routing semantics・next action 決定手順は
 `references/loop-state.md` を参照する（#1873: `schemas/loop_state.schema.json` の JSON
 Schema ファイルと `build_loop_state.py` builder は撤去済み — orchestrator が planner /
@@ -100,9 +95,7 @@ repository evidence が disposition を独立に決定できない場合だけ h
 候補になる。
 
 ## 手順 (Procedure)
-
 ### Step 0: 前提条件 (Preconditions)
-
 1. Issue 本文と必要コメントを取得する。`state/needs-human` / `state/done` は presentation-only / non-authoritative metadata（#2084）であり、それら label の単独付与だけで hard stop としない。停止には別 authority — OWNER の明示指示、または `human_judgment_required`（scope-signal-guard 等の別 authority）— が必要である。`state/done` の代替として GitHub native Issue `closed` state（`gh issue view --json state`）を参照する。
 2. `anchor_comment_url` がある場合は snapshot を固定し、対象 Issue 所属を検証する。
 3. scope rollup preflight を mutation-free で実行し、`LOOP_STATE.scope_rollup_decision` を記録する。
@@ -385,6 +378,12 @@ plain markdown の summary を直接組み立て、`--body-file` または stdin
 uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py \
   --issue-number 42 --repo <owner/repo> --body-file summary.md
 ```
+
+canonical な approved termination/handoff publish の場合のみ、永続化済みの承認 Issue 本文の
+SHA-256 を計算し、`--termination-reason approved --approved-body-sha256 <64-lowercase-hex>` を
+渡す。publisher は controlled comment publish 成功後に限り `refinement_approved` を emit し、
+自然言語 summary を完了証跡として使用しない。
+origin が missing/unbound であることは diagnostic であり、この publish をロールバックしない。
 
 `human_escalation` の summary では、termination cause が未確定の場合 `human_judgment_required`
 へ正規化する（詳細は `references/termination-policy.md` の「termination_cause 正規化ルール」）。

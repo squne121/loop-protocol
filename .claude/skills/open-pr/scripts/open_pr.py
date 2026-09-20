@@ -10,11 +10,13 @@ LOOP_PROTOCOL の PR 起票を決定論的に行う。skill (SKILL.md) の手順
 - gh pr create 実行
 - KEY=VALUE stdout contract
 """
+
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -182,9 +184,7 @@ def resolve_canonical_repository(requested_repo: str) -> str | None:
 
 def get_linked_issue_state(repo: str, issue_number: int) -> str | None:
     try:
-        result = run_gh(
-            "issue", "view", str(issue_number), "--repo", repo, "--json", "state"
-        )
+        result = run_gh("issue", "view", str(issue_number), "--repo", repo, "--json", "state")
         data = json.loads(result.stdout)
     except (subprocess.SubprocessError, json.JSONDecodeError):
         return None
@@ -221,9 +221,7 @@ def apply_linked_issue_reference(body: str, issue_number: int, link_kind: str) -
     return body + sep + f"{link_kind} #{issue_number}\n"
 
 
-def resolve_linked_issue_reference_kind(
-    body: str, issue_number: int, default_link_kind: str
-) -> str:
+def resolve_linked_issue_reference_kind(body: str, issue_number: int, default_link_kind: str) -> str:
     """Report the caller's existing link kind, or the state-derived default."""
     pattern = re.compile(rf"(Closes|Refs|Fixes|Resolves)\s+#{issue_number}\b", re.IGNORECASE)
     match = pattern.search(body)
@@ -262,9 +260,7 @@ def _run_pr_body_validator(
     changed_paths: list[str] | None,
     linked_issue: int,
 ) -> dict[str, object]:
-    validator_script = (
-        Path(__file__).resolve().parent / "validate_pr_body.py"
-    )
+    validator_script = Path(__file__).resolve().parent / "validate_pr_body.py"
 
     body_file = tempfile.NamedTemporaryFile(
         mode="w",
@@ -387,7 +383,6 @@ def _run_pr_body_validator(
             Path(changed_paths_file.name).unlink(missing_ok=True)
 
 
-
 def _run_japanese_content_validator(
     body_text: str,
     threshold: float = 0.1,
@@ -403,8 +398,7 @@ def _run_japanese_content_validator(
       - stderr: str (on fail/internal)
     """
     validator_script = (
-        Path(__file__).resolve().parent.parent.parent
-        / "create-issue" / "scripts" / "validate_japanese_content.py"
+        Path(__file__).resolve().parent.parent.parent / "create-issue" / "scripts" / "validate_japanese_content.py"
     )
 
     body_sha256 = f"sha256:{hashlib.sha256(body_text.encode('utf-8')).hexdigest()}"
@@ -511,6 +505,116 @@ def _run_japanese_content_validator(
     finally:
         Path(body_file.name).unlink(missing_ok=True)
 
+
+def _relation_repo_identity(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if re.fullmatch(r"[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._-]*", normalized) else None
+
+
+def classify_closing_issue_relation(
+    snapshot: object, candidate_issue: int, candidate_repo: str | None = None
+) -> tuple[str, str, dict | None]:
+    """Total, bounded classifier for a fresh PR GraphQL snapshot (#2565).
+
+    A closing reference is an ``(repository, issue number)`` fact.  Number
+    equality alone is not sufficient because GitHub may close an Issue in a
+    different repository.
+    """
+    if not isinstance(snapshot, dict):
+        return "deferred", "RELATION_UNAVAILABLE", None
+    # GraphQL may return usable-looking partial `data` alongside a top-level
+    # `errors` member. That is not fresh authoritative relation evidence.
+    if "errors" in snapshot:
+        return "deferred", "RELATION_UNAVAILABLE", None
+    try:
+        repository = snapshot["data"]["repository"]
+        pull_request = repository["pullRequest"]
+        relation = pull_request["closingIssuesReferences"]
+        nodes = relation["nodes"]
+        repo = _relation_repo_identity(repository["nameWithOwner"])
+    except (KeyError, TypeError):
+        return "deferred", "RELATION_UNAVAILABLE", None
+    expected_repo = _relation_repo_identity(candidate_repo) if candidate_repo is not None else repo
+    if not isinstance(nodes, list) or repo is None or expected_repo is None or not isinstance(pull_request, dict):
+        return "deferred", "RELATION_UNAVAILABLE", None
+    if any(
+        not isinstance(node, dict)
+        or type(node.get("number")) is not int
+        or not isinstance(node.get("repository"), dict)
+        or _relation_repo_identity(node["repository"].get("nameWithOwner")) is None
+        for node in nodes
+    ):
+        return "deferred", "RELATION_UNAVAILABLE", None
+    if len(nodes) == 0:
+        return "deferred", "NO_LINK", None
+    if len(nodes) >= 2:
+        return "conflict", "MULTIPLE_CLOSING_ISSUES", None
+    relation_repo = _relation_repo_identity(nodes[0]["repository"]["nameWithOwner"])
+    if nodes[0]["number"] != candidate_issue or relation_repo != expected_repo:
+        return "conflict", "RELATION_ISSUE_MISMATCH", None
+    number = pull_request.get("number")
+    if type(number) is not int or number <= 0:
+        return "deferred", "RELATION_UNAVAILABLE", None
+    return "matched", "MATCHED", {"repo": repo, "issue_number": candidate_issue, "pr_number": number}
+
+
+def emit_implementation_pr_observed(*, repo: str, pr_number: int, linked_issue: int) -> tuple[str, str]:
+    """Best-effort producer adapter; a Task Context outcome never rolls back PR work."""
+    origin = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not origin:
+        return "deferred", "unbound"
+    owner, sep, name = repo.partition("/")
+    if not sep or not owner or not name:
+        return "deferred", "RELATION_UNAVAILABLE"
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
+        "{nameWithOwner pullRequest(number:$number){number "
+        "closingIssuesReferences(first:2,excludeUserLinked:false,userLinkedOnly:false)"
+        "{nodes{number repository{nameWithOwner}}}}}"
+    )
+    try:
+        response = run_gh(
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={pr_number}",
+        )
+        snapshot = json.loads(response.stdout)
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
+        return "deferred", "RELATION_UNAVAILABLE"
+    disposition, reason, evidence = classify_closing_issue_relation(snapshot, linked_issue, repo)
+    if evidence is None:
+        return disposition, reason
+    ctl = Path(__file__).resolve().parents[4] / "scripts" / "task-context" / "task_contextctl.py"
+    payload = {
+        "signal_kind": "implementation_pr_observed",
+        "source": "open-pr",
+        "source_schema_version": "v1",
+        "evidence": evidence,
+    }
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(ctl), "signal", "apply"],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        data = json.loads(proc.stdout.splitlines()[-1]) if proc.stdout.splitlines() else {}
+        result = data.get("data", {}) if isinstance(data, dict) else {}
+        return str(result.get("disposition", "deferred")), str(result.get("reason_code", "RELATION_UNAVAILABLE"))
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, IndexError):
+        return "deferred", "RELATION_UNAVAILABLE"
+
+
 def create_pr(repo: str, title: str, body_file: Path, branch: str, draft: bool) -> str:
     args = [
         "pr",
@@ -566,9 +670,7 @@ def main(argv: list[str] | None = None) -> int:
     # hard gate remains active. A caller-provided reference is preserved exactly;
     # state-derived linkage is appended only when the body has none.
     default_link_kind = "Closes" if state == "OPEN" else "Refs"
-    link_kind = resolve_linked_issue_reference_kind(
-        original_body, args.linked_issue, default_link_kind
-    )
+    link_kind = resolve_linked_issue_reference_kind(original_body, args.linked_issue, default_link_kind)
     final_body = apply_linked_issue_reference(original_body, args.linked_issue, link_kind)
 
     changed_paths = resolve_changed_paths(args.changed_paths)
@@ -599,16 +701,32 @@ def main(argv: list[str] | None = None) -> int:
         emit_error(E_PR_BODY_JAPANESE_VALIDATION_FAILED, japanese_result.get("stderr", ""))
         return EXIT_BLOCKED
 
+    draft = str(args.draft).strip().lower() == "true"
+
+    # A preview has no producer side effects. In particular, do not inspect an
+    # existing PR because that path emits implementation_pr_observed.
+    if args.dry_run:
+        emit_kv("DRY_RUN", "true")
+        emit_kv("PR_TITLE_PREVIEW", args.pr_title)
+        emit_kv("PR_BODY_PREVIEW_FIRST_LINES", "\\n".join(final_body.splitlines()[:5]))
+        emit_kv("LINKED_ISSUE", args.linked_issue)
+        emit_kv("LINK_KIND", link_kind)
+        emit_kv("DRAFT", str(draft).lower())
+        return 0
+
     existing = find_existing_pr(repo, branch)
     if existing:
+        signal_disposition, signal_reason = emit_implementation_pr_observed(
+            repo=repo, pr_number=int(existing["number"]), linked_issue=args.linked_issue
+        )
+        emit_kv("TASK_CONTEXT_SIGNAL_DISPOSITION", signal_disposition)
+        emit_kv("TASK_CONTEXT_SIGNAL_REASON", signal_reason)
         emit_kv("EXISTING", "true")
         emit_kv("PR_URL", existing["url"])
         emit_kv("PR_NUMBER", existing["number"])
         emit_kv("LINKED_ISSUE", args.linked_issue)
         emit_kv("LINK_KIND", link_kind)
         return 0
-
-    draft = str(args.draft).strip().lower() == "true"
 
     final_body_file = tempfile.NamedTemporaryFile(
         mode="w",
@@ -621,15 +739,6 @@ def main(argv: list[str] | None = None) -> int:
         final_body_file.flush()
         final_body_file.close()
         final_body_path = Path(final_body_file.name)
-
-        if args.dry_run:
-            emit_kv("DRY_RUN", "true")
-            emit_kv("PR_TITLE_PREVIEW", args.pr_title)
-            emit_kv("PR_BODY_PREVIEW_FIRST_LINES", "\\n".join(final_body.splitlines()[:5]))
-            emit_kv("LINKED_ISSUE", args.linked_issue)
-            emit_kv("LINK_KIND", link_kind)
-            emit_kv("DRAFT", str(draft).lower())
-            return 0
 
         # #1679: canonical repository resolution / PR mutation target
         # binding (Issue #1470) is an independent fail-closed safety
@@ -652,6 +761,11 @@ def main(argv: list[str] | None = None) -> int:
             # で再確認する（idempotency チェックの canonical target 追従）。
             canonical_existing = find_existing_pr(target_repo, branch)
             if canonical_existing:
+                signal_disposition, signal_reason = emit_implementation_pr_observed(
+                    repo=target_repo, pr_number=int(canonical_existing["number"]), linked_issue=args.linked_issue
+                )
+                emit_kv("TASK_CONTEXT_SIGNAL_DISPOSITION", signal_disposition)
+                emit_kv("TASK_CONTEXT_SIGNAL_REASON", signal_reason)
                 emit_kv("EXISTING", "true")
                 emit_kv("PR_URL", canonical_existing["url"])
                 emit_kv("PR_NUMBER", canonical_existing["number"])
@@ -673,6 +787,12 @@ def main(argv: list[str] | None = None) -> int:
 
         match = re.search(r"/pull/(\d+)", pr_url)
         pr_number = match.group(1) if match else ""
+        if pr_number:
+            signal_disposition, signal_reason = emit_implementation_pr_observed(
+                repo=pr_create_repo, pr_number=int(pr_number), linked_issue=args.linked_issue
+            )
+            emit_kv("TASK_CONTEXT_SIGNAL_DISPOSITION", signal_disposition)
+            emit_kv("TASK_CONTEXT_SIGNAL_REASON", signal_reason)
 
         emit_kv("PR_URL", pr_url)
         emit_kv("PR_NUMBER", pr_number)
