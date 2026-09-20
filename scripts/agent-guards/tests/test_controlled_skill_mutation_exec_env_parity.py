@@ -36,6 +36,7 @@ original `ENV_SANITIZE_KEYS` (unchanged) -- this file does not touch them.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -237,3 +238,92 @@ def test_edit_issue_txn_fetch_issue_uses_sanitized_env(monkeypatch):
     assert captured["env"]["GH_TOKEN"] == "ambient-shared-launcher-token"
     assert captured["env"]["GITHUB_TOKEN"] == "ambient-shared-launcher-token-2"
     assert captured["env"]["GH_CONFIG_DIR"] == "/fake/native/gh/config"
+
+
+# =============================================================================
+# Issue #2665: `issue_relationship.update`'s dedicated env builder
+# (`_relationship_gh_env()`) previously delegated to
+# `_build_issue_dependency_remove_gh_env()` -- the higher-trust
+# issue-dependency-removal boundary that unconditionally strips GH_CONFIG_DIR
+# (and GH_TOKEN/GITHUB_TOKEN via the generic `ENV_SANITIZE_KEYS`). This left
+# actor verification, precondition readback, the fixed GraphQL relationship
+# mutation, postcondition readback, and zero-delta no-op verification running
+# credential-starved relative to the preflight/readback context
+# (`_build_metadata_sanitized_env()`) that gates the same transaction. The
+# fix makes `_relationship_gh_env()` reuse that same carrier-preserving
+# policy instead of the dependency-removal one.
+# =============================================================================
+
+
+_RELATIONSHIP_CREDENTIAL_CARRIER_KEYS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR")
+
+
+@pytest.mark.parametrize(
+    "ambient_setup",
+    [
+        pytest.param(lambda mp: None, id="zero_carriers"),
+        pytest.param(
+            lambda mp: mp.setenv("GH_CONFIG_DIR", "/fake/native/gh/config"),
+            id="config_only",
+        ),
+        pytest.param(lambda mp: mp.setenv("GH_TOKEN", "ambient-shared-launcher-token"), id="gh_token_only"),
+        pytest.param(
+            lambda mp: mp.setenv("GITHUB_TOKEN", "ambient-shared-launcher-token-2"), id="github_token_only"
+        ),
+        pytest.param(_GivenAmbientCredentialEnv.apply, id="all_carriers_simultaneously"),
+    ],
+)
+def test_relationship_gh_env_preserves_present_carriers_only_and_strips_noise(monkeypatch, ambient_setup):
+    """GIVEN an ambient env carrying zero, one, or several of GH_TOKEN /
+    GITHUB_TOKEN / GH_CONFIG_DIR (plus noise/redirection overrides), WHEN
+    `_relationship_gh_env()` builds the env for the issue_relationship.update
+    route, THEN every carrier that IS present survives verbatim, no carrier
+    that is ABSENT is synthesized, and noise/redirection keys are stripped
+    (AC1 / AC4 config-only / single-carrier / multi-carrier coverage).
+
+    #2682 review P1: each parametrized case must delete the OTHER carriers
+    first -- otherwise "config_only" etc. only add a carrier on top of
+    whatever the ambient pytest launcher environment already carries (e.g. a
+    real GH_TOKEN), and the "single carrier" claim is never actually
+    exercised. The explicit `zero_carriers` case below directly pins "no
+    carrier is synthesized when none are present" without relying on the
+    absence of an unrelated ambient variable."""
+    for key in _RELATIONSHIP_CREDENTIAL_CARRIER_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    ambient_setup(monkeypatch)
+
+    env = _exec._relationship_gh_env()
+
+    for key in _exec._METADATA_ENV_NOISE_STRIP_KEYS:
+        assert key not in env, f"{key} must be stripped from the relationship route sanitized env"
+    for carrier in ("GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"):
+        if carrier in os.environ:
+            assert env.get(carrier) == os.environ[carrier], f"{carrier} must be preserved verbatim, not synthesized"
+        else:
+            assert carrier not in env, f"{carrier} must not be synthesized when absent from the ambient env"
+
+
+def test_relationship_gh_env_matches_metadata_sanitized_env_single_boundary(monkeypatch):
+    """The relationship route and the issue-metadata read/write route must
+    share the exact same sanitized-env policy (byte-identical output for the
+    same ambient input) -- not merely two independently-correct policies
+    that could drift apart later."""
+    _GivenAmbientCredentialEnv.apply(monkeypatch)
+
+    assert _exec._relationship_gh_env() == _exec._build_metadata_sanitized_env()
+
+
+def test_relationship_gh_env_no_longer_shares_dependency_remove_sanitizer(monkeypatch):
+    """Regression guard for the exact #2665 bug: an ambient GH_CONFIG_DIR
+    with NO GH_TOKEN/GITHUB_TOKEN present must survive
+    `_relationship_gh_env()` even though the higher-trust
+    `_build_issue_dependency_remove_gh_env()` (the sanitizer this route used
+    to delegate to) unconditionally strips it -- proving the two builders
+    are no longer the same function."""
+    monkeypatch.setenv("GH_CONFIG_DIR", "/fake/native/gh/config")
+
+    relationship_env = _exec._relationship_gh_env()
+    dependency_remove_env = _exec._build_issue_dependency_remove_gh_env()
+
+    assert relationship_env.get("GH_CONFIG_DIR") == "/fake/native/gh/config"
+    assert "GH_CONFIG_DIR" not in dependency_remove_env

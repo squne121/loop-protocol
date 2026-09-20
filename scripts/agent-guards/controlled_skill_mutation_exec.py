@@ -4483,8 +4483,39 @@ _RELATIONSHIP_MAX_ANCESTOR_WALK = 50
 
 
 def _relationship_gh_env() -> dict[str, str]:
-    """Sanitized environment, identical boundary to issue_dependency.remove."""
-    return _build_issue_dependency_remove_gh_env()
+    """Sanitized environment for every `gh` subprocess call made across the
+    issue_relationship.update route -- actor verification, precondition
+    readback, the fixed GraphQL relationship mutation, postcondition
+    readback, and zero-delta no-op verification all share this single
+    `env` value (see `_run_issue_relationship_update()`, which builds it
+    once via this function and threads it through every call below).
+
+    Issue #2665: this route previously delegated to
+    `_build_issue_dependency_remove_gh_env()`, the higher-trust boundary
+    #1667 built specifically for the issue-dependency-removal lane, which
+    unconditionally strips GH_CONFIG_DIR (and GH_TOKEN/GITHUB_TOKEN via the
+    generic `ENV_SANITIZE_KEYS`). That boundary is the wrong fit here: the
+    live preflight/readback context that gates a relationship update (the
+    issue-metadata read/write helpers this module also exposes) uses
+    `_build_metadata_sanitized_env()`, which deliberately keeps the
+    credential carrier intact (#2340 fix_delta P0-1 / #2299 / PR #2303).
+    Sharing the dependency-removal sanitizer instead left the relationship
+    route running credential-starved relative to the context that gates
+    it, and could silently strip an inherited GH_CONFIG_DIR even when
+    GH_TOKEN/GITHUB_TOKEN were absent.
+
+    This function therefore reuses the same "noise vs. credential" split
+    `_build_metadata_sanitized_env()` already applies: it strips only
+    execution/log-hygiene noise (`_METADATA_ENV_NOISE_STRIP_KEYS` --
+    GH_HOST/GH_REPO/GH_DEBUG/DEBUG/editor-browser/PYTHONPATH/PYTHONHOME)
+    and leaves whatever GH_TOKEN / GITHUB_TOKEN / GH_CONFIG_DIR is already
+    present in the invocation-scoped environment untouched -- never
+    converting between carriers and never synthesizing a carrier that was
+    not already present. No new credential broker or generic auth
+    abstraction is introduced; this is a direct reuse of the existing
+    preflight/readback-safe builder.
+    """
+    return _build_metadata_sanitized_env()
 
 
 def _relationship_split_repo(repo: str) -> tuple[str, str] | None:
