@@ -7,13 +7,13 @@ never treated as Task Context workflow completion)."""
 from __future__ import annotations
 
 import json
+import pathlib
 
 import task_context_hook_flows as hook_flows
 import task_context_service as service
 
-from conftest import REPO_ROOT
-
-_SETTINGS_PATH = REPO_ROOT / ".claude" / "settings.json"
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+_SETTINGS_PATH = _REPO_ROOT / ".claude" / "settings.json"
 
 
 # ---------------------------------------------------------------------------
