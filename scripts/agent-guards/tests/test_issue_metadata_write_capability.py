@@ -58,6 +58,16 @@ import skill_runtime_exec as sre  # noqa: E402
 import command_registry  # noqa: E402
 from skill_runtime_command_policy import SKILL_RUNTIME_COMMAND_POLICY_V2  # noqa: E402
 
+# Issue #2584 fix_delta (OWNER PR #2676 review, comment 5746217834): the
+# `authority_transport.consume` non-noop E2E test below builds its
+# CONTRACT_PATCH_PLAN_V1 / router-receipt fixtures using the REAL production
+# producer/router functions (never a hand-typed digest dict), exactly the
+# same convention `_write_structural_preflight_result()` already uses for
+# `build_structural_repair_bundle()`.
+import run_refinement_preflight as rrp  # noqa: E402
+import decide_next_loop_action as authority_router  # noqa: E402
+from scope_signal_delta import build_contract_patch_plan_v1, build_section_aware_candidate_body  # noqa: E402
+
 _EXPECTED_FIVE_COMMAND_IDS = frozenset(
     {
         "contract_update.run.with_anchor",
@@ -224,12 +234,25 @@ def _git(*args: str, cwd: Path) -> None:
     )
 
 
-def _make_repo(tmp_path: Path) -> Path:
+def _make_repo(tmp_path: Path, *, gitignore_artifacts: bool = False) -> Path:
+    """`gitignore_artifacts` (Issue #2584 fix_delta, OWNER PR #2676 review):
+    when True, adds the SAME `artifacts/` line the real repo's `.gitignore`
+    already carries. `git status --ignored=matching` collapses an entirely
+    new, entirely-ignored directory into a single `!! artifacts/` status
+    line instead of listing the files inside it -- this interacts with the
+    `artifacts/{active_issue}/issue-metadata/` allowed write root this
+    Issue adds, and is otherwise untested by this fixture (which, before
+    this fix_delta, never ignored `artifacts/` at all). Kept minimal: only
+    the ONE line needed to reproduce the interaction OWNER flagged, never a
+    full production-fidelity `.gitignore`."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git("init", "-q", "-b", "main", cwd=repo)
     _git("remote", "add", "origin", "https://github.com/squne121/loop-protocol.git", cwd=repo)
-    (repo / ".gitignore").write_text(".cache/\n__pycache__/\ntmp/\n.venv/\n")
+    gitignore_lines = ".cache/\n__pycache__/\ntmp/\n.venv/\n"
+    if gitignore_artifacts:
+        gitignore_lines += "artifacts/\n"
+    (repo / ".gitignore").write_text(gitignore_lines)
     (repo / "README.md").write_text("seed\n")
     _git("add", "README.md", ".gitignore", cwd=repo)
     _git("commit", "-q", "-m", "seed", cwd=repo)
@@ -259,12 +282,24 @@ from pathlib import Path
 argv = sys.argv[1:]
 
 
-def _state_path(issue: str) -> Path:
+def _state_dir(issue: str) -> Path:
     state_dir = os.environ.get("SKILL_RUNTIME_TEST_FAKE_GH_STATE_DIR")
     if not state_dir:
         print("SKILL_RUNTIME_TEST_FAKE_GH_STATE_DIR not set", file=sys.stderr)
         raise SystemExit(70)
-    return Path(state_dir) / issue / "fake_remote_issue.json"
+    return Path(state_dir) / issue
+
+
+def _state_path(issue: str) -> Path:
+    return _state_dir(issue) / "fake_remote_issue.json"
+
+
+def _comment_state_path(comment_id: str) -> Path:
+    state_dir = os.environ.get("SKILL_RUNTIME_TEST_FAKE_GH_STATE_DIR")
+    if not state_dir:
+        print("SKILL_RUNTIME_TEST_FAKE_GH_STATE_DIR not set", file=sys.stderr)
+        raise SystemExit(70)
+    return Path(state_dir) / "comments" / f"{comment_id}.json"
 
 
 def _fail(msg, code=64):
@@ -279,6 +314,26 @@ if len(argv) >= 3 and argv[0] == "issue" and argv[1] == "view":
     raise SystemExit(0)
 
 if argv and argv[0] == "api":
+    # Issue #2584 fix_delta: `authority_transport.consume`'s default
+    # `fetch_current()` callback reads a single issue comment via
+    # `gh api repos/{owner}/{repo}/issues/comments/{comment_id}` (note:
+    # `issues/comments/<id>`, never `issues/<id>` -- checked BEFORE the
+    # generic single-issue-number match below since the two url shapes are
+    # otherwise easy to conflate).
+    comment_match = None
+    for tok in argv:
+        cm = re.match(r"^repos/[^/]+/[^/]+/issues/comments/(\\d+)$", tok)
+        if cm:
+            comment_match = cm
+            break
+    if comment_match is not None:
+        comment_id = comment_match.group(1)
+        comment_path = _comment_state_path(comment_id)
+        if not comment_path.exists():
+            _fail(f"unknown_fake_gh_comment: {comment_id}")
+        print(comment_path.read_text(encoding="utf-8"))
+        raise SystemExit(0)
+
     m = None
     for tok in argv:
         mm = re.match(r"^repos/[^/]+/[^/]+/issues/(\\d+)$", tok)
@@ -300,6 +355,10 @@ if argv and argv[0] == "api":
         state["title"] = patch["title"]
         state["body"] = patch["body"]
         state["updatedAt"] = "2026-09-20T00:00:01Z"
+        # Issue #2584 fix_delta: minimal PATCH-attempt counter (a fake-gh
+        # state field, never a separate ledger/broker) so tests can assert
+        # the real mutation attempt happened EXACTLY once.
+        state["patch_attempt_count"] = state.get("patch_attempt_count", 0) + 1
         state_path.write_text(json.dumps(state), encoding="utf-8")
         # AC5/AC10(d) regression harness only: deterministically inject a
         # stray write AFTER the real PATCH lands, at a caller-chosen relative
@@ -442,6 +501,27 @@ def _write_remote_state(state_dir: Path, issue_number: str, body: str, title: st
     )
 
 
+def _read_remote_state(state_dir: Path, issue_number: str) -> dict:
+    return json.loads((state_dir / issue_number / "fake_remote_issue.json").read_text(encoding="utf-8"))
+
+
+def _write_fake_gh_comment(
+    state_dir: Path, comment_id: str, *, author_association: str, body: str = "trusted directive body"
+) -> None:
+    """Issue #2584 fix_delta: fake-gh single-comment fixture -- backs the
+    `gh api repos/{owner}/{repo}/issues/comments/{comment_id}` branch this
+    Issue's fix adds to `_FAKE_GH_SOURCE`, so `authority_transport.consume`'s
+    DEFAULT (never fixture-injected -- the real subprocess CLI has no way to
+    carry a Python callback across a JSON `--anchor-context-file`)
+    `fetch_current()` callback's real `gh`-backed anchor re-read succeeds."""
+    comments_dir = state_dir / "comments"
+    comments_dir.mkdir(parents=True, exist_ok=True)
+    (comments_dir / f"{comment_id}.json").write_text(
+        json.dumps({"id": int(comment_id), "author_association": author_association, "body": body}),
+        encoding="utf-8",
+    )
+
+
 def _write_repair_action_preflight_result(
     repo_root: Path, issue_number: str, *, original_body: str, candidate_body: str
 ) -> str:
@@ -520,6 +600,53 @@ def _run_executor(
     }
     if extra_env:
         env.update(extra_env)
+    return subprocess.run(argv, cwd=str(repo), capture_output=True, text=True, env=env, check=False)
+
+
+def _run_authority_transport_consume_executor(
+    repo: Path,
+    *,
+    issue_number: str,
+    invocation_id: str,
+    git_head_sha: str,
+    router_receipt_path: str,
+    contract_patch_plan_file: "str | None" = None,
+    anchor_context_file: "str | None" = None,
+) -> subprocess.CompletedProcess:
+    """Issue #2584 fix_delta: real `skill_runtime_exec.py` CLI invocation for
+    `authority_transport.consume` -- the OUTER top-level flag is
+    `--router-receipt-path` (translated into the child's own
+    `--consume-authority-transport` by `skill_runtime_exec.py` itself; see
+    `command_registry.py`'s `authority_transport.consume` entry)."""
+    argv = [
+        sys.executable,
+        "scripts/agent-guards/skill_runtime_exec.py",
+        "--command-id",
+        "authority_transport.consume",
+        "--issue-number",
+        issue_number,
+        "--repo",
+        "squne121/loop-protocol",
+        "--invocation-id",
+        invocation_id,
+        "--git-head-sha",
+        git_head_sha,
+        "--router-receipt-path",
+        router_receipt_path,
+    ]
+    if contract_patch_plan_file and anchor_context_file:
+        argv += [
+            "--contract-patch-plan-file",
+            contract_patch_plan_file,
+            "--anchor-context-file",
+            anchor_context_file,
+        ]
+    env = {
+        **os.environ,
+        "CLAUDE_PROJECT_DIR": str(repo),
+        "LOOP_ISSUE_NUMBER": issue_number,
+        "SKILL_RUNTIME_TEST_FAKE_GH_STATE_DIR": str(repo.parent / "gh-state"),
+    }
     return subprocess.run(argv, cwd=str(repo), capture_output=True, text=True, env=env, check=False)
 
 
@@ -804,6 +931,143 @@ def test_repair_action_apply_stray_write_to_other_issue_number_rejected(tmp_path
     assert f"artifacts/{other_issue_number}/issue-metadata/rogue.txt" in result.stderr
 
 
+# ---------------------------------------------------------------------------
+# Fix 2 (OWNER PR #2676 review, comment 5746217834): the real repo's
+# `.gitignore` includes `artifacts/`. `git status --ignored=matching`
+# collapses an entirely-new, entirely-ignored directory into a single `!!
+# artifacts/` line instead of listing the files inside it -- this interacts
+# with the `artifacts/{active_issue}/issue-metadata/` allowed write root
+# this Issue adds. `skill_runtime_exec.py` already ships a dedicated
+# expansion path for exactly this shape
+# (`_strict_ancestor_of_allowed_artifact_root()` /
+# `_expand_folded_ignored_status_dir()` / `_expand_new_status_paths()`,
+# added for Issue #1409) -- these 3 tests add the missing coverage proving
+# that expansion genuinely still authorizes/rejects correctly for THIS
+# Issue's widened command_ids under the ignored-`artifacts/` condition,
+# never merely fail-closing (or, worse, silently no-op-authorizing) on the
+# collapsed ancestor entry.
+# ---------------------------------------------------------------------------
+
+
+def test_repair_action_apply_production_shaped_mutation_success_with_gitignored_artifacts_root(
+    tmp_path: Path,
+) -> None:
+    """Under the SAME ignored-`artifacts/` condition the real repo's
+    `.gitignore` carries, a legitimate metadata write to
+    `artifacts/{active_issue}/issue-metadata/...` (the real `edit_issue_
+    txn.py` request-metadata write every successful mutation performs, see
+    `test_repair_action_apply_cold_tmp_production_shaped_mutation_success_
+    exit_0`) still succeeds -- the collapsed `!! artifacts/` status entry is
+    expanded and the leaf write is recognized as authorized, never
+    misreported as `unauthorized_write_path` merely because its ancestor
+    directory is git-ignored."""
+    repo = _make_repo(tmp_path, gitignore_artifacts=True)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    _install_fixture(repo, trusted_gh_bin)
+
+    issue_number = "900009"
+    _write_remote_state(tmp_path / "gh-state", issue_number, _ORIGINAL_BODY)
+    preflight_result_path = _write_repair_action_preflight_result(
+        repo, issue_number, original_body=_ORIGINAL_BODY, candidate_body=_CLEAN_CANDIDATE_BODY
+    )
+
+    result = _run_executor(
+        repo, command_id="repair_action.apply", issue_number=issue_number, preflight_result_path=preflight_result_path
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SKILL_RUNTIME_FAIL:" not in result.stderr
+    assert "unauthorized_write_path" not in result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["phase"] == "complete"
+    assert payload["failure_code"] is None
+    assert payload["mutation_outcome"] == "applied"
+    # The real edit_issue_txn.py request-metadata write actually landed
+    # under the now-git-ignored `artifacts/` root (`edit_issue_txn.py`'s own
+    # `_write_issue_metadata_input()` uses the fixed dedicated command_id
+    # `issue_content.update` for a body mutation, never the OUTER
+    # `repair_action.apply` command_id) -- this is the write this test
+    # proves is still correctly authorized, not merely a write that never
+    # happened to be attempted.
+    metadata_dir = repo / "artifacts" / issue_number / "issue-metadata" / "issue_content.update"
+    assert metadata_dir.is_dir()
+    assert list(metadata_dir.glob("*.input.json"))
+
+
+def test_repair_action_apply_stray_write_to_unrelated_root_rejected_with_gitignored_artifacts_root(
+    tmp_path: Path,
+) -> None:
+    """Mirrors `test_repair_action_apply_stray_write_to_unrelated_root_
+    rejected` under the ignored-`artifacts/` fixture variant: a write
+    outside every allowed root is still `unauthorized_write_path` even when
+    `artifacts/` is git-ignored (the stray path itself is not under
+    `artifacts/` at all here, so this also proves the ignored-`artifacts/`
+    condition never widens rejection scope elsewhere in the repo)."""
+    repo = _make_repo(tmp_path, gitignore_artifacts=True)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    _install_fixture(repo, trusted_gh_bin)
+
+    issue_number = "900010"
+    _write_remote_state(tmp_path / "gh-state", issue_number, _ORIGINAL_BODY)
+    preflight_result_path = _write_repair_action_preflight_result(
+        repo, issue_number, original_body=_ORIGINAL_BODY, candidate_body=_CLEAN_CANDIDATE_BODY
+    )
+
+    result = _run_executor(
+        repo,
+        command_id="repair_action.apply",
+        issue_number=issue_number,
+        preflight_result_path=preflight_result_path,
+        extra_env={"SKILL_RUNTIME_TEST_INJECT_STRAY_WRITE_AFTER_PATCH": "unexpected_stray_file.txt"},
+    )
+
+    assert result.returncode != 0
+    assert "SKILL_RUNTIME_FAIL:" in result.stderr, result.stdout + result.stderr
+    assert "reason_code=unauthorized_write_path" in result.stderr
+    assert "unexpected_stray_file.txt" in result.stderr
+
+
+def test_repair_action_apply_stray_write_to_other_issue_number_rejected_with_gitignored_artifacts_root(
+    tmp_path: Path,
+) -> None:
+    """Mirrors `test_repair_action_apply_stray_write_to_other_issue_number_
+    rejected` under the ignored-`artifacts/` fixture variant: a write into a
+    DIFFERENT Issue number's own `issue-metadata/` directory is still
+    `unauthorized_write_path` even though it lands inside the SAME
+    git-ignored `artifacts/` ancestor as THIS issue's own legitimate write
+    -- the collapsed `!! artifacts/` status entry is expanded to its real
+    leaf paths and compared per-path against the per-Issue allowed root,
+    never authorized wholesale merely because the ancestor directory as a
+    whole is git-ignored."""
+    repo = _make_repo(tmp_path, gitignore_artifacts=True)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    _install_fixture(repo, trusted_gh_bin)
+
+    issue_number = "900011"
+    other_issue_number = "9998"
+    _write_remote_state(tmp_path / "gh-state", issue_number, _ORIGINAL_BODY)
+    preflight_result_path = _write_repair_action_preflight_result(
+        repo, issue_number, original_body=_ORIGINAL_BODY, candidate_body=_CLEAN_CANDIDATE_BODY
+    )
+
+    result = _run_executor(
+        repo,
+        command_id="repair_action.apply",
+        issue_number=issue_number,
+        preflight_result_path=preflight_result_path,
+        extra_env={
+            "SKILL_RUNTIME_TEST_INJECT_STRAY_WRITE_AFTER_PATCH": (
+                f"artifacts/{other_issue_number}/issue-metadata/rogue.txt"
+            )
+        },
+    )
+
+    assert result.returncode != 0
+    assert "SKILL_RUNTIME_FAIL:" in result.stderr, result.stdout + result.stderr
+    assert "reason_code=unauthorized_write_path" in result.stderr
+    assert f"artifacts/{other_issue_number}/issue-metadata/rogue.txt" in result.stderr
+
+
 def test_repair_action_apply_semantic_failure_never_promoted_to_exit_0(tmp_path: Path) -> None:
     """AC6: a legal write-root (this Issue's own `issue-metadata/`) never
     causes the outer executor to promote a child SEMANTIC failure to exit 0.
@@ -1038,3 +1302,282 @@ def test_structural_repair_action_apply_production_shaped_mutation_success_exit_
     assert payload["failure_code"] is None
     assert payload["mutation_outcome"] == "applied"
     assert payload["items_applied"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 (OWNER PR #2676 review, comment 5746217834): a genuine NON-NOOP
+# `authority_transport.consume` regression test, driven through the REAL
+# `skill_runtime_exec.py -> command_registry.render_command ->
+# run_refinement_preflight.py -> consume_authority_transport ->
+# consume_trusted_anchor_contract_patch_plan -> run_trusted_anchor_
+# iteration_zero -> edit_issue_txn.py -> controlled_skill_mutation_exec.py`
+# subprocess chain (never in-process, so the `_allowed_artifact_roots()` /
+# `ISSUE_METADATA_WRITE_COMMAND_IDS` outer boundary this Issue widens is
+# actually exercised for `authority_transport.consume`, unlike the existing
+# `test_consume_authority_transport_delegates_mutation_to_real_contract_
+# patch_plan_consumer` in test_scope_delta_authority_e2e.py, which (a) uses
+# an empty `operations: []` NOOP patch plan and (b) calls
+# `consume_authority_transport()` directly in-process, never through this
+# executor at all).
+#
+# The outer `skill_runtime_exec.py` CLI has no JSON-serializable way to
+# inject a `callbacks` override (`--anchor-context-file` is plain JSON), so
+# `fetch_current`/`candidate_readiness`/`apply_transaction`/`fresh_checks`
+# are ALL the real, unmocked default callbacks -- `apply_transaction`
+# genuinely dispatches `edit_issue_txn.py`, and `fetch_current` genuinely
+# re-reads the Issue/anchor comment via `gh` (the SAME fake-`gh` boundary
+# every other test in this file already uses, extended here with a
+# `repos/.../issues/comments/<id>` branch).
+# ---------------------------------------------------------------------------
+
+
+def _write_authority_transport_consume_fixture(
+    repo: Path,
+    *,
+    issue_number: str,
+    invocation_id: str,
+    git_head_sha: str,
+    original_body: str,
+    anchor_comment_id: str,
+    anchor_body: str,
+) -> "tuple[str, str, str, str]":
+    """Builds the router-receipt/manifest pair via the REAL producer
+    (`generate_authority_transport_manifest`) + router
+    (`generate_router_receipt`) functions -- never a hand-typed digest dict --
+    exactly the same convention `_write_structural_preflight_result()` above
+    uses for `build_structural_repair_bundle()`. Also builds a genuinely
+    non-noop `CONTRACT_PATCH_PLAN_V1` (a real appended Stop Conditions
+    bullet, via `build_contract_patch_plan_v1()`) and its `anchor_context`
+    sidecar, both written under the SAME invocation-scoped artifact
+    directory as the router receipt/manifest.
+
+    Returns (router_receipt_path, contract_patch_plan_file, anchor_context_file,
+    expected_candidate_body) -- the first three repo-relative (as
+    `--router-receipt-path`/`--contract-patch-plan-file`/
+    `--anchor-context-file` require), the last the exact post-mutation body
+    text `build_section_aware_candidate_body()` (the SAME function
+    `run_trusted_anchor_iteration_zero()` itself uses) derives from
+    `original_body` + the single non-noop operation below.
+    """
+    issue_num_int = int(issue_number)
+    anchor_url = f"https://github.com/squne121/loop-protocol/issues/{issue_number}#issuecomment-{anchor_comment_id}"
+    evidence = {
+        "schema_version": "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1",
+        "source_kind": "issue_comment",
+        "source_ref": anchor_url,
+        "source_issue_number": issue_num_int,
+        "comment_id": int(anchor_comment_id),
+        "comment_url": anchor_url,
+        "issue_url": f"https://github.com/squne121/loop-protocol/issues/{issue_number}",
+        "body_sha256": _sha256(anchor_body),
+        "author_login": "owner",
+        "author_type": "User",
+        "author_association": "OWNER",
+        "captured_at": "2026-09-20T00:00:00Z",
+        "directive_markers": ["stop condition"],
+        "extracted_directives": ["Additional stop condition: escalate immediately on an external service outage"],
+        "ambiguity_flags": [],
+        "boundary_flags": [],
+        "confidence": "explicit",
+    }
+
+    produced, error = rrp.generate_authority_transport_manifest(
+        evidence=evidence,
+        issue_number=issue_num_int,
+        repo="squne121/loop-protocol",
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        repo_root=repo,
+    )
+    assert error is None, error
+
+    router_receipt = authority_router.generate_router_receipt(
+        transport_manifest_path=produced["manifest_path"],
+        issue_number=issue_num_int,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        authority_expected=True,
+        repo="squne121/loop-protocol",
+        repo_root=repo,
+    )
+    assert router_receipt["status"] == "ok", router_receipt
+
+    invocation_dir = (
+        repo
+        / ".claude"
+        / "artifacts"
+        / "issue-refinement-loop"
+        / issue_number
+        / "authority-transport"
+        / invocation_id
+    )
+    router_receipt_path = invocation_dir / "scope_delta_router_receipt_v1.json"
+    assert router_receipt_path.exists()
+
+    operation = {
+        "section": "Stop Conditions",
+        "text": "- 追加のテスト用 stop condition: 外部サービス障害時は直ちに作業を停止する",
+        "rationale": "authority_transport.consume の非noop回帰カバレッジ用トラステッドディレクティブ",
+        "source_evidence_index": 0,
+    }
+    contract_patch_plan = build_contract_patch_plan_v1(
+        target_issue_number=issue_num_int,
+        base_issue_body_sha256=f"sha256:{_sha256(original_body)}",
+        source_evidence=[evidence],
+        operations=[operation],
+    )
+    contract_patch_plan_path = invocation_dir / "contract_patch_plan.json"
+    contract_patch_plan_path.write_text(json.dumps(contract_patch_plan), encoding="utf-8")
+
+    anchor_context = {
+        "issue": {"body": original_body},
+        "anchor_url": anchor_url,
+        "anchor_payload": {"id": int(anchor_comment_id), "author_association": "OWNER"},
+        "anchor_body": anchor_body,
+    }
+    anchor_context_path = invocation_dir / "anchor_context.json"
+    anchor_context_path.write_text(json.dumps(anchor_context), encoding="utf-8")
+
+    expected_candidate = build_section_aware_candidate_body(
+        body=original_body,
+        operations=[operation],
+        source_identity={"repo": "squne121/loop-protocol", "issue_number": issue_num_int},
+    )
+    assert expected_candidate["changed"] is True
+
+    return (
+        str(router_receipt_path.relative_to(repo)),
+        str(contract_patch_plan_path.relative_to(repo)),
+        str(anchor_context_path.relative_to(repo)),
+        expected_candidate["candidate_body"],
+    )
+
+
+def test_authority_transport_consume_non_noop_production_shaped_mutation(tmp_path: Path) -> None:
+    """Issue #2584 fix_delta (OWNER PR #2676 review): `repair_action.apply` /
+    `structural_repair_action.apply` already have production-shaped E2E
+    mutation-success coverage through the real `skill_runtime_exec.py ->
+    ... -> edit_issue_txn.py -> controlled_skill_mutation_exec.py`
+    subprocess chain; `authority_transport.consume` did not for a genuinely
+    NON-NOOP patch plan.
+
+    This drives a real, non-empty `CONTRACT_PATCH_PLAN_V1` (an appended Stop
+    Conditions bullet) through the REAL subprocess chain and proves:
+
+    - the real controlled-mutation lane is reached (`mutation_lane ==
+      "contract_patch_plan_consumer"`, never the artifact-only lane), and
+      the inner transaction's own `writes` counter is exactly 1 (a real
+      PATCH attempt, not a synthesized one);
+    - the PATCH attempt happens exactly once (the fake-`gh` state's own
+      `patch_attempt_count` counter);
+    - the fake remote Issue body ends up EXACTLY matching the expected
+      post-mutation candidate body `build_section_aware_candidate_body()`
+      derives from the same operation;
+    - the transaction's own `tmp/` scratch directory node survives, empty
+      (same assertion style as
+      `test_repair_action_apply_cold_tmp_production_shaped_mutation_
+      success_exit_0`);
+    - the outer executor never reports `unauthorized_write_path` /
+      `SKILL_RUNTIME_FAIL` for the legitimate `artifacts/{issue}/
+      issue-metadata/` metadata write this Issue's capability widening
+      authorizes for `authority_transport.consume`.
+
+    Proof-boundary honesty: `run_trusted_anchor_iteration_zero()`'s default
+    (real, unmocked, CLI-driven -- never fixture-injectable) `fresh_checks()`
+    callback re-runs a SEPARATE, orthogonal 6-gate post-mutation freshness
+    conjunction (fresh `preflight`/`review`/`readiness`/`allowed_paths`/
+    `permission_profile`/`runtime_evidence` all needing to read "pass"/
+    "approve"/"go" for `_bounded_contract_update_handoff()` to map the
+    outcome to `status: applied`) that this minimal fixture does not attempt
+    to fully satisfy (it would require reproducing the full dedicated-worktree
+    `contract_update.run.*` E2E fixture in `test_skill_runtime_exec_anchor.py`
+    -- `_install_real_contract_update_fixture()` -- which itself only reaches
+    `fresh_review: "needs_fix"` / overall `status: "failed"` for its own
+    real-mutation scenario, `test_contract_update_phase_reaches_fake_
+    transaction_and_fresh_handoff`). This test therefore asserts the SAME
+    real-mutation-with-terminal-fail-closed-freshness-result shape that
+    established precedent already treats as valid non-noop mutation
+    coverage: `writes: 1` / a correct real PATCH / no unauthorized-write
+    misreport, without asserting the unrelated 6-gate outcome.
+    """
+    repo = _make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    _install_fixture(repo, trusted_gh_bin)
+    assert not (repo / "tmp").exists()
+
+    issue_number = "900008"
+    invocation_id = "e2e-non-noop-mutation-1"
+    git_head_sha = "abc123def456abc123def456abc123def456abc"
+    anchor_comment_id = "77777"
+    anchor_body = "trusted OWNER directive: add a stop condition"
+
+    state_dir = tmp_path / "gh-state"
+    _write_remote_state(state_dir, issue_number, _CLEAN_CANDIDATE_BODY)
+    _write_fake_gh_comment(state_dir, anchor_comment_id, author_association="OWNER", body=anchor_body)
+
+    (
+        router_receipt_path,
+        contract_patch_plan_path,
+        anchor_context_path,
+        expected_candidate_body,
+    ) = _write_authority_transport_consume_fixture(
+        repo,
+        issue_number=issue_number,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        original_body=_CLEAN_CANDIDATE_BODY,
+        anchor_comment_id=anchor_comment_id,
+        anchor_body=anchor_body,
+    )
+    assert expected_candidate_body != _CLEAN_CANDIDATE_BODY
+
+    result = _run_authority_transport_consume_executor(
+        repo,
+        issue_number=issue_number,
+        invocation_id=invocation_id,
+        git_head_sha=git_head_sha,
+        router_receipt_path=router_receipt_path,
+        contract_patch_plan_file=contract_patch_plan_path,
+        anchor_context_file=anchor_context_path,
+    )
+
+    assert "SKILL_RUNTIME_FAIL:" not in result.stderr, result.stdout + result.stderr
+    assert "unauthorized_write_path" not in result.stderr, result.stdout + result.stderr
+    assert result.stdout.strip(), result.stdout + result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt["mutation_lane"] == "contract_patch_plan_consumer", receipt
+
+    # Independently verify, via the fake remote state (never the receipt's
+    # own self-report), that the real controlled-mutation lane genuinely
+    # reached a single real PATCH producing exactly the expected body -- the
+    # load-bearing, non-noop proof this test exists to add.
+    final_state = _read_remote_state(state_dir, issue_number)
+    assert final_state["body"] == expected_candidate_body
+    assert final_state["patch_attempt_count"] == 1
+
+    # AC10(c): the transaction's own `tmp/` scratch workspace was created
+    # and used, and only the (now-empty) directory node survives -- the SAME
+    # `TMP_DIRECTORY_NODE_HOUSEKEEPING_COMMAND_IDS` exemption this Issue
+    # widens to include `authority_transport.consume`.
+    assert (repo / "tmp").is_dir()
+    assert list((repo / "tmp").iterdir()) == []
+
+    # Proof-boundary honesty (see docstring): the SEPARATE, orthogonal
+    # 6-gate post-mutation freshness conjunction inside `_bounded_contract_
+    # update_handoff()` (fresh preflight/review/readiness/allowed_paths/
+    # permission_profile/runtime_evidence, none of which this minimal
+    # fixture attempts to fully satisfy -- doing so would require
+    # reproducing `test_skill_runtime_exec_anchor.py`'s dedicated-worktree
+    # `_install_real_contract_update_fixture()`) genuinely fails here, so
+    # the receipt's OWN `mutation_applied` claim is conservatively `False`
+    # and the process exits non-zero -- this is the EXISTING "a child
+    # SEMANTIC failure must never be silently promoted to success" contract
+    # (already covered generally by
+    # `test_repair_action_apply_semantic_failure_never_promoted_to_exit_0`)
+    # holding for `authority_transport.consume` too: a real mutation
+    # genuinely landed (verified above, independently of this receipt), yet
+    # the outer receipt never claims an unqualified success.
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert receipt["status"] == "environment_failure"
+    assert receipt["reason_code"] == "contract_patch_plan_consumer_failed"
+    assert receipt["mutation_applied"] is False
