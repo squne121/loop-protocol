@@ -57,6 +57,53 @@ from controlled_skill_mutation_policy import (
 )
 
 
+class TestGraphqlCallDiagnosticRedaction:
+    def test_errors_redacts_before_truncation_when_token_crosses_boundary(self):
+        fake_token = "ghp_" + "A" * 36
+        errors = [{"message": "x" * 275 + fake_token}]
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"errors": errors}),
+            stderr="",
+        )
+
+        with patch.object(_exec.subprocess, "run", return_value=completed):
+            data, error = _exec._graphql_call("gh", {}, "query Test", {})
+
+        assert data is None
+        assert fake_token not in error
+        assert "ghp_" not in error
+        assert "[REDACTED]" in error
+
+    def test_response_parse_exception_redacts_secret_like_token(self):
+        fake_token = "ghp_" + "B" * 36
+        completed = SimpleNamespace(returncode=0, stdout="not-json", stderr="")
+
+        with (
+            patch.object(_exec.subprocess, "run", return_value=completed),
+            patch.object(_exec.json, "loads", side_effect=ValueError(f"bad response {fake_token}")),
+        ):
+            data, error = _exec._graphql_call("gh", {}, "query Test", {})
+
+        assert data is None
+        assert fake_token not in error
+        assert "[REDACTED]" in error
+
+    def test_outer_subprocess_exception_redacts_secret_like_token(self):
+        fake_token = "ghp_" + "C" * 36
+
+        with patch.object(
+            _exec.subprocess,
+            "run",
+            side_effect=RuntimeError(f"subprocess failure {fake_token}"),
+        ):
+            data, error = _exec._graphql_call("gh", {}, "query Test", {})
+
+        assert data is None
+        assert fake_token not in error
+        assert "[REDACTED]" in error
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
