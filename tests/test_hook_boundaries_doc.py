@@ -344,10 +344,30 @@ class TestBaseHeadHookTopologyDelta:
         # `hookSpecificOutput.permissionDecision: ask` を出す advisory guard
         # として。Allowed Paths は #2566 の OWNER-approved contract correction
         # により `docs/dev/hook-boundaries.md` / 本ファイルへ拡張済み）。
+        #
+        # Issue #2566 fix_delta P1-C (OWNER PR #2691 review, 2026-09-21):
+        # the original single `matcher: "SendMessage|Bash"` registration
+        # spawned the Python hook process for *every* Bash call, not just
+        # `herdr` invocations. Split into two registrations -- `SendMessage`
+        # (unchanged, always invoked) and a distinctly-named `Bash` entry
+        # (`hook_entry_bash_herdr.py`, its own handler_id so it does not
+        # collide with `hook_entry`/PreToolUse under this checker's
+        # `(handler_id, event)` key) guarded by a native `if: "Bash(herdr
+        # *)"` handler-level filter, so the interpreter process itself is
+        # never spawned for an ordinary non-`herdr` Bash call.
         ("hook_entry", "PreToolUse"): {
-            "matcher": "SendMessage|Bash",
+            "matcher": "SendMessage",
             "command": "python3",
             "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "PreToolUse"],
+            "timeout": 5,
+        },
+        ("hook_entry_bash_herdr", "PreToolUse"): {
+            "matcher": "Bash",
+            "command": "python3",
+            "args": [
+                "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry_bash_herdr.py",
+                "PreToolUse",
+            ],
             "timeout": 5,
         },
     }

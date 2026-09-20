@@ -203,12 +203,24 @@
         ]
       },
       {
-        "matcher": "SendMessage|Bash",
+        "matcher": "SendMessage",
         "hooks": [
           {
             "type": "command",
             "command": "python3",
             "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "PreToolUse"],
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(herdr *)",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry_bash_herdr.py", "PreToolUse"],
             "timeout": 5
           }
         ]

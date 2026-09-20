@@ -462,7 +462,7 @@ hook_boundaries_manifest_v1:
 
   - handler_id: hook_entry
     event: PreToolUse
-    matcher: "SendMessage|Bash"
+    matcher: "SendMessage"
     command: "python3"
     args:
       - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
@@ -487,21 +487,71 @@ hook_boundaries_manifest_v1:
     agent_action:
       on_any: proceed
     notes: >
-      Issue #2566: Task-aware cross-session `SendMessage` guard と cross-Task Herdr
-      control guard。`matcher: "SendMessage|Bash"` の `Bash` 側は
-      `pre_tool_use_classifier.looks_like_herdr_command` による argument-aware
-      early exit（無関係な Bash 呼び出しでは `task-contextctl` subprocess を spawn
-      しない、hot path 保護）。`task_context_hook_flows.on_pre_tool_use` はこの
-      Issue の対象範囲では `decision: "pass" | "ask"` のみを返し `"block"` を返さない
-      （target_kind: same_task_independent_session / in_session_subagent は
-      `"pass"`、known_cross_task_independent_session / unknown_independent_session
-      は `"ask"`）。adapter は常に exit 0 で、guard 対象時のみ stdout に
+      Issue #2566: Task-aware cross-session `SendMessage` guard。`SendMessage` tool_use
+      には Bash のような argument-aware early exit の対象がないため、`matcher:
+      "SendMessage"` はネイティブ側フィルタなしで常に呼び出される（fix_delta P1-C
+      以前はこのエントリが `matcher: "SendMessage|Bash"` として `Bash` 側も一括
+      担っていたが、Bash 側は下記の別 handler（`hook_entry_bash_herdr`）へ分離した）。
+      `task_context_hook_flows.on_pre_tool_use` はこの Issue の対象範囲では
+      `decision: "pass" | "ask"` のみを返し `"block"` を返さない（target_kind:
+      same_task_independent_session / in_session_subagent は `"pass"`、
+      known_cross_task_independent_session / unknown_independent_session は
+      `"ask"`）。adapter は常に exit 0 で、guard 対象時のみ stdout に
       `hookSpecificOutput.permissionDecision: "ask"` を出力する（`decision: "pass"`
       は無出力、既存の hard deny — 例: worktree-agent-runtime-smoke の
       `permissions.deny` — を上書きしない、AC6）。EventJournal には
       `transport`/`operation`/`target_kind`/`source_task_id`/`destination_task_id`/
       `decision`/`reason_code` の bounded metadata のみ記録し、message body /
       terminal output / raw Bash command は保存しない（AC7）。
+
+  - handler_id: hook_entry_bash_herdr
+    event: PreToolUse
+    matcher: "Bash"
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry_bash_herdr.py"
+      - "PreToolUse"
+    timeout: 5
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: PreToolUse
+      exit_2_effect: blocks_tool_call
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: hookSpecificOutput_permissionDecision_ask_or_deny_on_guarded_target_silent_otherwise
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2566 fix_delta P1-C: cross-Task Herdr control guard。`.claude/settings.json`
+      のこの handler オブジェクトは `if: "Bash(herdr *)"` を保持しており（公式
+      Claude Code hooks schema の `if` は matcher-group 直下ではなく個々の
+      handler に置く -- `pr_reviewer_guard.py` の既存前例と同じ配置規約、
+      `docs/dev/hook-boundaries.md` 第13節参照）、`herdr` で始まらない Bash 呼び出し
+      では Python interpreter process 自体が spawn されない（従来は
+      `matcher: "SendMessage|Bash"` の単一 handler が全 Bash 呼び出しで spawn され、
+      `pre_tool_use_classifier.looks_like_herdr_command` は spawn 後の
+      `task-contextctl` subprocess 起動だけを回避していた -- hot path 保護が
+      Python process 自体の spawn までは及んでいなかった）。この native `if`
+      フィルタは best-effort であり（`$()` やバッククォート等の曖昧な Bash 入力に
+      対しては保守的に発火し得る）、hard security boundary ではない
+      （`pre_tool_use_classifier.py` 側の `looks_like_herdr_command`/
+      `parse_herdr_command` は引き続き内部 fast-path/実分類として残置する）。
+      `hook_entry_bash_herdr.py` は `hook_entry.main` へ委譲するだけの薄い
+      entrypoint であり（`scripts/check_hook_boundaries.py` の
+      `(handler_id, event)` 複合キーが `matcher: "SendMessage"` の
+      `hook_entry`/PreToolUse エントリと衝突しないよう別ファイル名にしている
+      だけで、Task 判定ロジックは `hook_entry.py`/`task_context_hook_flows.py`
+      に一元化されたまま）。`task_context_hook_flows.on_pre_tool_use` の
+      decision/EventJournal 契約は上記 `hook_entry`/PreToolUse エントリと同一。
 
   - handler_id: hook_entry
     event: UserPromptExpansion

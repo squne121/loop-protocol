@@ -673,6 +673,42 @@ def _record_pre_tool_use_guard_event(
 
 
 def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, Any]:
+    """Issue #2566 fix_delta P1-B (OWNER PR #2691 review, 2026-09-21):
+    ``to`` is only ever confirmed, via this repo's own real prior
+    ``SendMessage`` tool_use history, to carry an ``agentId``-shaped
+    identifier (the same shape ``SubagentStart``'s own ``agent_id`` uses) --
+    every real ``to`` value sampled from this environment's own transcripts
+    matched that shape, addressing a Task/Agent-tool-spawned SubAgent (which
+    also covers an Agent Teams teammate represented the same way, per the
+    existing ``is_in_session_subagent`` lookup below). No real sample of a
+    genuinely independent (non-child) Claude Code session being addressed by
+    a session name/short identifier was found in that history, and Task
+    Context's own state (``tab_bindings`` / ``execution_runs`` /
+    ``runtime_locations``) tracks no such session-name field to resolve one
+    against even if upstream Claude Code does support that addressing mode
+    for cross-session ``SendMessage`` (per Claude Code's own hooks/
+    cross-session-messaging docs, which this module does not have direct
+    access to confirm against real runtime payloads for that specific case).
+
+    The ``get_binding_by_current_session(conn, to)`` fallback below predates
+    this note and assumes ``to`` equals ``claude_session_id`` -- an
+    assumption never validated by a real sample (``claude_session_id`` is
+    UUID-shaped; every observed ``to`` was the shorter ``agentId`` hex
+    shape, so this fallback is a no-op against real traffic today). It is
+    left in place, unchanged, as a harmless defensive fallback (a real
+    ``claude_session_id``-shaped ``to`` would still resolve correctly if it
+    ever occurred) -- but it must not be read as a validated "resolve an
+    independent session by name" mechanism: no such mechanism exists here.
+    Any ``to`` that does not match a currently-open SubAgent/teammate
+    ``agent_id`` therefore resolves to ``unknown_independent_session`` (ASK,
+    fail-safe) in practice. Building a reliable name/short-identifier ->
+    Binding mapping for a genuinely independent session, if upstream Claude
+    Code truly requires Task Context to distinguish that case, needs either
+    real `SendMessage` PreToolUse runtime evidence for that specific
+    scenario or a Task Context state/schema addition -- both out of this
+    fix_delta's scope; narrowing the contract to "independent session always
+    ASK" as a silent shortcut is explicitly rejected by this fix_delta, so
+    this gap is reported as an open item rather than papered over."""
     to = payload.get("to")
     caller_task_id = _resolve_caller_task_id(conn, payload.get("claude_session_id"))
 
@@ -684,10 +720,16 @@ def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, An
         # (already tracked via SubagentStart, Issue #2564) covers both an
         # in-session SubAgent and an Agent Teams teammate represented the
         # same way -- never a new peer registry, just the existing
-        # ExecutionRun bookkeeping.
+        # ExecutionRun bookkeeping. This is the only `to` shape this
+        # module's own real prior `SendMessage` usage has ever confirmed
+        # (see docstring above).
         if service.find_open_execution_runs(conn, run_kind="subagent", agent_id=to):
             is_in_session_subagent = True
         else:
+            # Defensive fallback only -- see docstring above: no real
+            # sample has ever shown `to` actually carrying a
+            # `claude_session_id`-shaped value, so this branch is a no-op
+            # against real traffic today, not a confirmed resolution path.
             try:
                 peer_binding = service.get_binding_by_current_session(conn, to)
             except errors.NotFoundError:

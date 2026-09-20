@@ -94,17 +94,20 @@ def test_given_pane_send_keys_when_parsed_then_control_category():
     assert parsed.category == ptu.CATEGORY_CONTROL
 
 
-def test_given_terminal_session_attach_when_parsed_then_control_category():
-    parsed = ptu.parse_herdr_command("herdr terminal session attach s1")
+def test_given_agent_attach_when_parsed_then_control_category():
+    parsed = ptu.parse_herdr_command("herdr agent attach my-agent --takeover")
     assert parsed is not None
     assert parsed.category == ptu.CATEGORY_CONTROL
-    assert parsed.operation == "terminal_session_attach"
+    assert parsed.operation == "agent_attach"
+    assert parsed.target_locator == "my-agent"
 
 
-def test_given_terminal_session_takeover_when_parsed_then_control_category():
-    parsed = ptu.parse_herdr_command("herdr terminal session takeover s1")
+def test_given_terminal_attach_when_parsed_then_control_category():
+    parsed = ptu.parse_herdr_command("herdr terminal attach s1 --takeover")
     assert parsed is not None
     assert parsed.category == ptu.CATEGORY_CONTROL
+    assert parsed.operation == "terminal_attach"
+    assert parsed.target_locator == "s1"
 
 
 # ---------------------------------------------------------------------------
@@ -137,3 +140,36 @@ def test_given_missing_target_locator_when_parsed_then_locator_is_none():
     parsed = ptu.parse_herdr_command("herdr pane read")
     assert parsed is not None
     assert parsed.target_locator is None
+
+
+# ---------------------------------------------------------------------------
+# parse_herdr_command -- leading global selectors (fix_delta P1-A: real
+# Herdr invocations place `--session <name>` / `--machine <label-or-id>`
+# *before* the subcommand, not after it).
+# ---------------------------------------------------------------------------
+
+
+def test_given_session_prefixed_pane_read_when_parsed_then_content_read_category():
+    parsed = ptu.parse_herdr_command("herdr --session my-session pane read p1 --lines 50")
+    assert parsed is not None
+    assert parsed.category == ptu.CATEGORY_CONTENT_READ
+    assert parsed.operation == "pane_read"
+    assert parsed.target_locator == "p1"
+    assert parsed.machine_scoped is False
+
+
+def test_given_session_prefixed_pane_send_text_when_parsed_then_control_category():
+    parsed = ptu.parse_herdr_command("herdr --session my-session pane send-text p1 hello")
+    assert parsed is not None
+    assert parsed.category == ptu.CATEGORY_CONTROL
+    assert parsed.operation == "pane_send-text"
+    assert parsed.target_locator == "p1"
+
+
+def test_given_machine_prefixed_agent_prompt_when_parsed_then_control_category_machine_scoped():
+    parsed = ptu.parse_herdr_command("herdr --machine other-host agent prompt my-agent hi --wait")
+    assert parsed is not None
+    assert parsed.category == ptu.CATEGORY_CONTROL
+    assert parsed.operation == "agent_prompt"
+    assert parsed.target_locator == "my-agent"
+    assert parsed.machine_scoped is True

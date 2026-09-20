@@ -68,12 +68,12 @@ HERDR_CONTROL_OPS: frozenset[tuple[str, ...]] = frozenset(
     {
         ("agent", "prompt"),
         ("agent", "send-keys"),
+        ("agent", "attach"),
         ("pane", "run"),
         ("pane", "send-text"),
         ("pane", "send-keys"),
+        ("terminal", "attach"),
         ("terminal", "session", "control"),
-        ("terminal", "session", "attach"),
-        ("terminal", "session", "takeover"),
     }
 )
 
@@ -92,6 +92,30 @@ class HerdrCommand(NamedTuple):
     operation: str
     target_locator: str | None
     machine_scoped: bool
+
+
+# Herdr's global selector flags (each takes exactly one value) are placed
+# *before* the subcommand, e.g. ``herdr --session <name> pane read ...`` /
+# ``herdr --machine <label-or-id> agent prompt ...`` -- never after it. The
+# fixed finite subcommand-prefix families above are matched against argv
+# tokens *after* stripping any such leading selector(s) (fix_delta P1-A:
+# without this, a real ``--session``/``--machine``-prefixed invocation never
+# matched any prefix in ``_ALL_GUARDED_OPS`` at all and fell through to
+# "out of guard scope" -- i.e. no ASK, not even a conservative one).
+_GLOBAL_SELECTOR_FLAGS: frozenset[str] = frozenset({"--session", "--machine"})
+
+
+def _strip_leading_global_selectors(args: list[str]) -> list[str]:
+    """Strip any leading ``<flag> <value>`` pairs (``--session NAME`` /
+    ``--machine LABEL``) from the front of ``args``, so subcommand-prefix
+    matching operates on the actual subcommand tokens. A trailing selector
+    flag with no following value (an already-malformed invocation) is left
+    untouched -- it simply fails to match any guarded prefix below, the same
+    as any other unrecognized shape."""
+    idx = 0
+    while idx < len(args) - 1 and args[idx] in _GLOBAL_SELECTOR_FLAGS:
+        idx += 2
+    return args[idx:]
 
 
 def looks_like_herdr_command(raw_command: str) -> bool:
@@ -124,10 +148,17 @@ def parse_herdr_command(raw_command: str) -> HerdrCommand | None:
     args = tokens[1:]
     if not args:
         return None
+    # `machine_scoped` reflects `--machine` appearing anywhere in the
+    # invocation (leading global selector or a trailing flag) -- computed
+    # against the *original* (unstripped) args, before the leading-selector
+    # strip below.
     machine_scoped = "--machine" in args
+    guarded_args = _strip_leading_global_selectors(args)
+    if not guarded_args:
+        return None
 
-    for prefix_len in range(min(_MAX_PREFIX_LEN, len(args)), 0, -1):
-        prefix = tuple(args[:prefix_len])
+    for prefix_len in range(min(_MAX_PREFIX_LEN, len(guarded_args)), 0, -1):
+        prefix = tuple(guarded_args[:prefix_len])
         category = None
         for candidate_category, ops in _OPS_BY_CATEGORY:
             if prefix in ops:
@@ -136,8 +167,8 @@ def parse_herdr_command(raw_command: str) -> HerdrCommand | None:
         if category is None:
             continue
         target_locator = None
-        if prefix_len < len(args) and not args[prefix_len].startswith("-"):
-            target_locator = args[prefix_len]
+        if prefix_len < len(guarded_args) and not guarded_args[prefix_len].startswith("-"):
+            target_locator = guarded_args[prefix_len]
         return HerdrCommand(
             category=category,
             operation="_".join(prefix),

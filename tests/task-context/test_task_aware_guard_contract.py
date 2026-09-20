@@ -31,29 +31,50 @@ def test_given_project_settings_when_read_then_cross_session_inbound_never_fixed
 
 
 def test_given_project_settings_when_read_then_pre_tool_use_guard_wired_with_narrow_matchers():
-    # `scripts/check_hook_boundaries.py` enforces a single settings.json
-    # registration per (handler_id, event) -- `hook_entry.py` can only be
-    # wired into `PreToolUse` once, so the SendMessage and Herdr-Bash
-    # concerns share one entry with a combined (still narrow, not a
-    # catch-all like `Bash|Read|Write|Edit|Grep|Glob|MultiEdit`) matcher.
+    # Issue #2566 fix_delta P1-C (OWNER PR #2691 review, 2026-09-21): the
+    # original single `matcher: "SendMessage|Bash"` `hook_entry.py`
+    # registration spawned the Python interpreter for *every* Bash call, not
+    # just `herdr` invocations. It is now split into two narrow, single-tool
+    # matcher registrations that both ultimately dispatch to
+    # `hook_entry.main` -- `SendMessage` (`hook_entry.py`, unchanged, always
+    # invoked -- there is no cheap native predicate to filter it further)
+    # and `Bash` (a distinctly-named `hook_entry_bash_herdr.py`, so
+    # `scripts/check_hook_boundaries.py`'s `(handler_id, event)` duplicate
+    # check does not collide the two registrations), guarded by a native
+    # `if: "Bash(herdr *)"` handler-level filter so the interpreter process
+    # itself is never spawned for an ordinary non-`herdr` Bash call.
     settings = json.loads(_SETTINGS_PATH.read_text())
     pre_tool_use = settings["hooks"]["PreToolUse"]
-    matchers_to_hook_entry = {
-        entry["matcher"]
+    hook_entry_family_entries = [
+        entry
         for entry in pre_tool_use
         if any(
-            isinstance(hook.get("args"), list) and "hook_entry.py" in " ".join(hook["args"])
+            isinstance(hook.get("args"), list)
+            and any(arg.endswith(("hook_entry.py", "hook_entry_bash_herdr.py")) for arg in hook["args"])
             for hook in entry.get("hooks", [])
         )
-    }
-    assert len(matchers_to_hook_entry) == 1, (
-        f"Issue #2566: hook_entry.py must be wired into PreToolUse exactly once "
-        f"(check_hook_boundaries.py duplicate-key constraint), got {matchers_to_hook_entry!r}"
+    ]
+    assert len(hook_entry_family_entries) == 2, (
+        "Issue #2566: expected exactly 2 PreToolUse registrations dispatching to "
+        f"hook_entry.main (SendMessage, Bash), got {len(hook_entry_family_entries)}"
     )
-    (matcher,) = matchers_to_hook_entry
-    matcher_tools = set(matcher.split("|"))
-    assert matcher_tools == {"SendMessage", "Bash"}, (
-        f"Issue #2566: SendMessage/Herdr guard must use a narrow combined matcher, got {matcher!r}"
+    matchers = {entry["matcher"] for entry in hook_entry_family_entries}
+    assert matchers == {"SendMessage", "Bash"}, (
+        f"Issue #2566: SendMessage/Herdr guard must use two narrow single-tool "
+        f"matchers (never a combined catch-all like the previous "
+        f"'SendMessage|Bash'), got {matchers!r}"
+    )
+    bash_entry = next(entry for entry in hook_entry_family_entries if entry["matcher"] == "Bash")
+    bash_hook = next(
+        hook
+        for hook in bash_entry["hooks"]
+        if any(arg.endswith("hook_entry_bash_herdr.py") for arg in hook.get("args", []))
+    )
+    assert bash_hook.get("if") == "Bash(herdr *)", (
+        "Issue #2566 fix_delta P1-C: the Bash-matcher hook_entry registration must "
+        'carry a native `if: "Bash(herdr *)"` handler-level filter so the Python '
+        "interpreter process itself is never spawned for an ordinary non-herdr "
+        "Bash call (hot-path cost control)"
     )
 
 
