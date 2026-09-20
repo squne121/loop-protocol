@@ -959,7 +959,16 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "execution_class": "exact_owner_reaction_decide",
         "stdin_contract": "none",
         "stdout_contract": "owner_reaction_decision_result/v1",
-        "timeout_seconds": 60,
+        # PR #2683 fix_delta (P2-3, OWNER adversarial review comment
+        # #5748651887): `decide()` now issues up to 5 SEQUENTIAL `gh`
+        # subprocess calls (repo owner resolution, reactions pagination,
+        # target comment readback, anchor comment readback, Issue
+        # readback -- see `owner_reaction_decision.py` module docstring).
+        # At `DEFAULT_GH_TIMEOUT` = 12s/call, a worst-case fully-serial
+        # chain is ~60s; widened from the previous 60 to leave comfortable
+        # margin for this outer subprocess budget to still observe a
+        # structured `environment_error` rather than being killed first.
+        "timeout_seconds": 90,
         "mutation": False,
         "network_effect": "github_read_only",
         "placeholders": {
@@ -992,7 +1001,10 @@ REGISTRY: dict[str, dict[str, Any]] = {
         "execution_class": "exact_owner_reaction_decide_fixture",
         "stdin_contract": "none",
         "stdout_contract": "owner_reaction_decision_result/v1",
-        "timeout_seconds": 60,
+        # PR #2683 fix_delta P2-3: same outer-budget widening as
+        # `owner_reaction.decide` above (this sibling drives the same real
+        # CLI subprocess, just with `gh` faked).
+        "timeout_seconds": 90,
         "mutation": False,
         "network_effect": "local_only",
         "test_only": True,

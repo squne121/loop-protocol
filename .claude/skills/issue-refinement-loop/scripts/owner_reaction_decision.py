@@ -12,15 +12,22 @@ working, deterministic program:
 
   2. Fetch ALL pages of GitHub reactions on the target comment.
   3. Resolve the reacting user's STABLE GitHub user ``id`` (not ``login``)
-     as principal -- only reactions whose id matches the fixed
-     ``owner_user_id`` count as owner reactions.
-  4. Detect drift/staleness against a fixed preview binding (comment body
-     hash / Issue body snapshot hash).
+     as principal -- only reactions whose id matches the repository's
+     AUTHORITATIVE owner stable id (resolved from ``GET repos/{repo}``,
+     never a caller-supplied id trusted on its own -- PR #2683 fix_delta
+     P2-1) count as owner reactions.
+  4. Detect drift/staleness against a fixed preview binding (target
+     comment body hash / anchor comment body hash / Issue body snapshot
+     hash), via a SINGLE readback performed AFTER reaction retrieval
+     completes (PR #2683 fix_delta P1-2: closes a TOCTOU window that an
+     earlier readback-before-fetch ordering could not detect), and cross-
+     checks that both the target comment and the anchor comment actually
+     belong to the given Issue (PR #2683 fix_delta P1-3).
   5. Exclude untrusted (non-owner) and unmapped reactions from the
      decision.
   6. Determine selection semantics: unanswered / reject-all (``-1`` only) /
      selected / conflict / no-selection (unmapped-only) / stale /
-     environment (fetch/pagination) failure.
+     environment (fetch/pagination/identity) failure.
 
 Out of Scope (see Issue #1975 "Out of Scope" for the authoritative list):
 this CLI never performs any GitHub mutation, never promotes ``selected`` to
@@ -34,7 +41,10 @@ it.
 Internal GitHub reads use ``gh api -X GET`` subprocess calls only (argv
 arrays, never a shell string). Reaction pagination uses
 ``gh api -X GET --paginate --slurp ...`` -- this CLI does not reimplement
-`gh`'s own ``Link: rel="next"`` pagination.
+`gh`'s own ``Link: rel="next"`` pagination. A single `decide()` run issues
+up to 5 SEQUENTIAL `gh` calls (repo owner resolution, reactions, target
+comment readback, anchor comment readback, Issue readback) -- see
+`DEFAULT_GH_TIMEOUT` for the per-call timeout budget this implies.
 
 "Full retrieval success" (the only condition under which a selection may be
 returned) requires ALL of:
@@ -62,7 +72,18 @@ from typing import Any, Callable
 
 SCHEMA_VERSION = "OWNER_REACTION_DECISION_RESULT_V1"
 
-DEFAULT_GH_TIMEOUT = 30.0
+# PR #2683 fix_delta (P2-3, OWNER adversarial review comment #5748651887):
+# `decide()` now issues up to 5 SEQUENTIAL `gh` subprocess calls (repo
+# owner resolution, reactions pagination, target comment readback, anchor
+# comment readback, Issue readback -- see the "Orchestration" section
+# below). At the previous 30s-per-call default, a worst-case chain could
+# exceed the `command_registry.py` `owner_reaction.decide*` outer
+# `timeout_seconds` budget before this module could ever produce a
+# structured `environment_error`, causing an ungraceful outer kill instead.
+# Lowered to a per-call budget that leaves comfortable margin under the
+# widened outer budget (see `command_registry.py` for the corresponding
+# `timeout_seconds` bump).
+DEFAULT_GH_TIMEOUT = 12.0
 
 # ---------------------------------------------------------------------------
 # Known GitHub reaction content values (fixed enum, GitHub REST API).
@@ -98,7 +119,21 @@ REASON_PREVIEW_DRIFTED = "preview_drifted"
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _REQUIRED_PREVIEW_BINDING_KEYS = frozenset(
-    {"comment_id", "comment_body_hash", "issue_snapshot_hash", "reaction_option_map", "options"}
+    {
+        "comment_id",
+        "comment_body_hash",
+        "issue_snapshot_hash",
+        "reaction_option_map",
+        "options",
+        # PR #2683 fix_delta P1-1 (OWNER adversarial review): the anchor
+        # comment that carries the material-conflict options themselves
+        # must ALSO be bound and read back -- without this, an edit to the
+        # anchor comment (the options text the owner is reacting to) could
+        # silently invalidate a selection that still looks internally
+        # consistent.
+        "anchor_comment_id",
+        "anchor_comment_body_hash",
+    }
 )
 
 
@@ -170,17 +205,31 @@ def default_gh_runner(argv: list[str], *, timeout: float) -> GhInvocationResult:
     return GhInvocationResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
-def _classify_gh_call(argv: list[str]) -> str:
-    """Classify which of the 3 network calls `argv` represents, purely
-    from the rendered endpoint token -- used by the fixture runner only
-    (test/AC7 path). Production `default_gh_runner` never calls this."""
+def _classify_gh_call(argv: list[str], *, anchor_comment_id: int | None = None) -> str:
+    """Classify which of the network calls `argv` represents, purely from
+    the rendered endpoint token -- used by the fixture runner only
+    (test/AC7 path). Production `default_gh_runner` never calls this.
+
+    `anchor_comment_id` disambiguates the anchor comment readback from the
+    target comment readback (PR #2683 fix_delta P1-1) -- both use the same
+    `/issues/comments/<id>` endpoint shape, differing only in which id is
+    rendered. When `anchor_comment_id` is not supplied (or does not match),
+    any `/issues/comments/<id>` call classifies as `"comment"`.
+    """
     endpoint = next((tok for tok in argv if tok.startswith("repos/")), "")
     if "/reactions" in endpoint:
         return "reactions"
-    if re.search(r"/issues/comments/\d+(\?.*)?$", endpoint):
+    comment_match = re.search(r"/issues/comments/(\d+)(\?.*)?$", endpoint)
+    if comment_match:
+        if anchor_comment_id is not None and int(comment_match.group(1)) == anchor_comment_id:
+            return "anchor"
         return "comment"
     if re.search(r"/issues/\d+(\?.*)?$", endpoint):
         return "issue"
+    if re.fullmatch(r"repos/[^/]+/[^/]+", endpoint):
+        # PR #2683 fix_delta P2-1: `GET repos/{repo}` -- resolves the
+        # authoritative repository owner stable id.
+        return "repo"
     return "unknown"
 
 
@@ -195,15 +244,24 @@ def make_fixture_gh_runner(fixture_path: Path) -> GhRunner:
     Fixture shape::
 
         {
-          "comment":   {"returncode": 0, "stdout": "<json text>", "stderr": ""},
-          "issue":     {"returncode": 0, "stdout": "<json text>", "stderr": ""},
-          "reactions": {"returncode": 0, "stdout": "<json text>", "stderr": ""}
+          "repo":              {"returncode": 0, "stdout": "<json text>", "stderr": ""},
+          "comment":           {"returncode": 0, "stdout": "<json text>", "stderr": ""},
+          "anchor":            {"returncode": 0, "stdout": "<json text>", "stderr": ""},
+          "issue":             {"returncode": 0, "stdout": "<json text>", "stderr": ""},
+          "reactions":         {"returncode": 0, "stdout": "<json text>", "stderr": ""},
+          "anchor_comment_id": 556
         }
+
+    `anchor_comment_id` (PR #2683 fix_delta P1-1) is routing metadata ONLY
+    -- it is never itself part of any faked `gh` response -- used to tell
+    the anchor comment readback call apart from the target comment
+    readback call (see `_classify_gh_call`).
     """
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    anchor_comment_id = fixture.get("anchor_comment_id")
 
     def _runner(argv: list[str], *, timeout: float) -> GhInvocationResult:  # noqa: ARG001
-        kind = _classify_gh_call(argv)
+        kind = _classify_gh_call(argv, anchor_comment_id=anchor_comment_id)
         entry = fixture.get(kind)
         if not isinstance(entry, dict):
             return GhInvocationResult(returncode=1, stdout="", stderr=f"no_fixture_for_kind:{kind}")
@@ -219,6 +277,13 @@ def make_fixture_gh_runner(fixture_path: Path) -> GhRunner:
 # ---------------------------------------------------------------------------
 # argv builders (gh api -X GET, explicit; --paginate --slurp for reactions)
 # ---------------------------------------------------------------------------
+
+
+def build_gh_argv_repo(repo: str) -> list[str]:
+    # PR #2683 fix_delta P2-1: resolves the repository's authoritative
+    # owner stable id (`owner.id`) -- never trusts a caller-supplied
+    # `--owner-user-id` on its own.
+    return ["gh", "api", "-X", "GET", f"repos/{repo}"]
 
 
 def build_gh_argv_comment(repo: str, comment_id: int) -> list[str]:
@@ -392,7 +457,15 @@ def validate_preview_binding(binding: Any) -> None:
     if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
         raise PreviewBindingInvalid("comment_id_invalid")
 
-    for hash_key in ("comment_body_hash", "issue_snapshot_hash"):
+    anchor_comment_id = binding["anchor_comment_id"]
+    if (
+        not isinstance(anchor_comment_id, int)
+        or isinstance(anchor_comment_id, bool)
+        or anchor_comment_id <= 0
+    ):
+        raise PreviewBindingInvalid("anchor_comment_id_invalid")
+
+    for hash_key in ("comment_body_hash", "issue_snapshot_hash", "anchor_comment_body_hash"):
         value = binding[hash_key]
         if not isinstance(value, str) or not _SHA256_HEX_RE.match(value):
             raise PreviewBindingInvalid(f"{hash_key}_invalid")
@@ -457,7 +530,11 @@ def _base_result(*, repo: str, issue_number: int, generated_at: str) -> dict:
         "selected_option_metadata": None,
         "owner_reaction_contents": [],
         "fetched_reaction_count": None,
-        "drift": {"comment_body_drifted": None, "issue_body_drifted": None},
+        "drift": {
+            "comment_body_drifted": None,
+            "issue_body_drifted": None,
+            "anchor_body_drifted": None,
+        },
         "errors": [],
     }
 
@@ -471,11 +548,17 @@ def _environment_error_result(base: dict, *, reason_code: str, detail: str = "")
     return result
 
 
-def _stale_result(base: dict, *, comment_drifted: bool, issue_drifted: bool) -> dict:
+def _stale_result(
+    base: dict, *, comment_drifted: bool, issue_drifted: bool, anchor_drifted: bool
+) -> dict:
     result = dict(base)
     result["status"] = STATUS_STALE
     result["reason_code"] = REASON_PREVIEW_DRIFTED
-    result["drift"] = {"comment_body_drifted": comment_drifted, "issue_body_drifted": issue_drifted}
+    result["drift"] = {
+        "comment_body_drifted": comment_drifted,
+        "issue_body_drifted": issue_drifted,
+        "anchor_body_drifted": anchor_drifted,
+    }
     return result
 
 
@@ -506,10 +589,50 @@ def decide(
         return _environment_error_result(base, reason_code="preview_binding_invalid", detail=str(exc))
 
     comment_id = preview_binding["comment_id"]
+    anchor_comment_id = preview_binding["anchor_comment_id"]
     base["preview_identity"] = {
         "comment_id": comment_id,
         "comment_body_hash": preview_binding["comment_body_hash"],
     }
+
+    # PR #2683 fix_delta P2-1 (OWNER adversarial review): resolve the
+    # AUTHORITATIVE repository owner stable id from `GET repos/{repo}` --
+    # a caller-supplied `--owner-user-id` is never trusted on its own.
+    try:
+        repo_metadata = fetch_json_object(build_gh_argv_repo(repo), gh_runner, timeout)
+    except GhFetchFailed as exc:
+        return _environment_error_result(
+            base, reason_code=f"repo_fetch_failed:{exc.reason_code}", detail=exc.detail
+        )
+    owner_metadata = repo_metadata.get("owner")
+    resolved_owner_id = owner_metadata.get("id") if isinstance(owner_metadata, dict) else None
+    if not isinstance(resolved_owner_id, int) or isinstance(resolved_owner_id, bool):
+        return _environment_error_result(base, reason_code="repo_owner_shape_invalid")
+    if resolved_owner_id != owner_user_id:
+        return _environment_error_result(base, reason_code="owner_user_id_mismatch")
+
+    # PR #2683 fix_delta P1-2 (TOCTOU, OWNER adversarial review): reactions
+    # are fetched FIRST, and the drift/identity readback of the target
+    # comment / anchor comment / Issue happens AFTER -- immediately before
+    # a selection may be finalized below. This is the ONLY readback this
+    # module performs; it deliberately supersedes the old
+    # "readback-before-reactions" ordering, which could not detect an edit
+    # that raced with (happened during, or immediately after) reaction
+    # pagination. Minimizing to a single post-fetch readback also keeps
+    # the total sequential `gh` call count bounded (see
+    # `command_registry.py` timeout_seconds for the corresponding budget).
+    try:
+        reactions = fetch_all_reactions(repo, comment_id, gh_runner=gh_runner, timeout=timeout)
+    except GhFetchFailed as exc:
+        return _environment_error_result(
+            base, reason_code=f"reactions_fetch_failed:{exc.reason_code}", detail=exc.detail
+        )
+    except ReactionPageShapeInvalid as exc:
+        return _environment_error_result(base, reason_code="reaction_page_shape_invalid", detail=str(exc))
+    except ReactionRecordIntegrityFailure as exc:
+        return _environment_error_result(base, reason_code="reaction_record_integrity_failure", detail=str(exc))
+
+    expected_issue_url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
 
     try:
         current_comment = fetch_json_object(build_gh_argv_comment(repo, comment_id), gh_runner, timeout)
@@ -520,6 +643,27 @@ def decide(
     current_comment_body = current_comment.get("body")
     if not isinstance(current_comment_body, str):
         return _environment_error_result(base, reason_code="comment_body_shape_invalid")
+    # PR #2683 fix_delta P1-3 (OWNER adversarial review): a `comment_id`
+    # that resolves to a DIFFERENT Issue's comment (e.g. a stale/reused id,
+    # or an id belonging to an unrelated Issue) must never be silently
+    # accepted -- verify the comment actually belongs to `issue_number`.
+    if current_comment.get("issue_url") != expected_issue_url:
+        return _environment_error_result(base, reason_code="comment_issue_url_mismatch")
+
+    try:
+        current_anchor = fetch_json_object(build_gh_argv_comment(repo, anchor_comment_id), gh_runner, timeout)
+    except GhFetchFailed as exc:
+        return _environment_error_result(
+            base, reason_code=f"anchor_fetch_failed:{exc.reason_code}", detail=exc.detail
+        )
+    current_anchor_body = current_anchor.get("body")
+    if not isinstance(current_anchor_body, str):
+        return _environment_error_result(base, reason_code="anchor_comment_body_shape_invalid")
+    # Same identity-binding risk applies to the anchor comment (it carries
+    # the options the owner is reacting to) -- verify it too belongs to
+    # `issue_number`.
+    if current_anchor.get("issue_url") != expected_issue_url:
+        return _environment_error_result(base, reason_code="anchor_comment_issue_url_mismatch")
 
     try:
         current_issue = fetch_json_object(build_gh_argv_issue(repo, issue_number), gh_runner, timeout)
@@ -532,22 +676,17 @@ def decide(
         return _environment_error_result(base, reason_code="issue_body_shape_invalid")
 
     comment_drifted = sha256_hex(current_comment_body) != preview_binding["comment_body_hash"]
+    anchor_drifted = sha256_hex(current_anchor_body) != preview_binding["anchor_comment_body_hash"]
     issue_drifted = sha256_hex(current_issue_body) != preview_binding["issue_snapshot_hash"]
-    if comment_drifted or issue_drifted:
-        return _stale_result(base, comment_drifted=comment_drifted, issue_drifted=issue_drifted)
-
-    try:
-        reactions = fetch_all_reactions(repo, comment_id, gh_runner=gh_runner, timeout=timeout)
-    except GhFetchFailed as exc:
-        return _environment_error_result(
-            base, reason_code=f"reactions_fetch_failed:{exc.reason_code}", detail=exc.detail
+    if comment_drifted or anchor_drifted or issue_drifted:
+        return _stale_result(
+            base,
+            comment_drifted=comment_drifted,
+            issue_drifted=issue_drifted,
+            anchor_drifted=anchor_drifted,
         )
-    except ReactionPageShapeInvalid as exc:
-        return _environment_error_result(base, reason_code="reaction_page_shape_invalid", detail=str(exc))
-    except ReactionRecordIntegrityFailure as exc:
-        return _environment_error_result(base, reason_code="reaction_record_integrity_failure", detail=str(exc))
 
-    owner_contents = resolve_owner_reaction_contents(reactions, owner_user_id)
+    owner_contents = resolve_owner_reaction_contents(reactions, resolved_owner_id)
     selection = compute_selection(owner_contents, preview_binding["reaction_option_map"])
 
     result = dict(base)
@@ -556,7 +695,11 @@ def decide(
     result["selected_option_id"] = selection["selected_option_id"]
     result["owner_reaction_contents"] = sorted(set(owner_contents))
     result["fetched_reaction_count"] = len(reactions)
-    result["drift"] = {"comment_body_drifted": False, "issue_body_drifted": False}
+    result["drift"] = {
+        "comment_body_drifted": False,
+        "issue_body_drifted": False,
+        "anchor_body_drifted": False,
+    }
     if selection["status"] == STATUS_SELECTED:
         result["selected_option_metadata"] = preview_binding["options"][selection["selected_option_id"]]
     return result
