@@ -504,7 +504,9 @@ def test_contract_update_with_human_context_exact_parser_rejects_malformed_inves
         + f" --investigation-evidence-transport-path {transport_path}",
         # Primary-root value tampered to a directory other than the
         # already-verified root (must be pinned exactly to `root`).
-        base + f" --investigation-evidence-transport-path {transport_path}" + " --investigation-evidence-primary-root /tmp",
+        base
+        + f" --investigation-evidence-transport-path {transport_path}"
+        + " --investigation-evidence-primary-root /tmp",
         # Extra unknown trailing flag after the valid transport suffix.
         base + f" --investigation-evidence-transport-path {transport_path}" + " --extra x",
         # Unsafe (absolute) transport path.
