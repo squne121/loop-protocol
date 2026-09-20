@@ -1052,7 +1052,8 @@ def _select_activity_for_binding_tx(conn: sqlite3.Connection, task_id: str, kind
     if active is not None:
         return active["id"]
     merged = conn.execute(
-        "SELECT activity_id, metadata_json FROM events WHERE task_id = ? AND event_type = 'workflow:pr_merged_observed' "
+        "SELECT activity_id, metadata_json FROM events "
+        "WHERE task_id = ? AND event_type = 'workflow:pr_merged_observed' "
         "AND activity_id IS NOT NULL ORDER BY occurred_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
