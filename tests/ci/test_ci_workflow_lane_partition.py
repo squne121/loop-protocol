@@ -27,6 +27,51 @@ def _load_workflow() -> dict:
     return yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
 
 
+def _collect_upload_artifact_if_no_files_found(job: dict) -> dict[str, str]:
+    """Map each `actions/upload-artifact` step's `with.name` to its
+    `with.if-no-files-found` value for a single job, by structurally
+    inspecting the job/step/`with` block fields (never free text)."""
+    result: dict[str, str] = {}
+    for step in job.get("steps", []):
+        if not isinstance(step, dict):
+            continue
+        uses = str(step.get("uses", ""))
+        if uses.split("@", 1)[0] == "actions/upload-artifact":
+            with_block = step.get("with") or {}
+            name = str(with_block.get("name", ""))
+            result[name] = str(with_block.get("if-no-files-found", ""))
+    return result
+
+
+def _assert_provider_evidence_upload_is_fail_closed(jobs: dict) -> None:
+    """Issue #2679 AC1: structural (job/step/`with`-block) replacement for
+    the removed free-text fallback (`"runtime evidence" in steps_text`).
+
+    Each provider job's own required-evidence `actions/upload-artifact` step
+    must declare `if-no-files-found: error`. A job whose steps merely
+    contain the literal string "runtime evidence" somewhere (e.g. in an
+    unrelated comment-like field), without the artifact actually existing
+    with the required field set, must NOT satisfy this check.
+    """
+    for provider_job_name, required_fragment in (
+        ("e2e-core", "ci-runtime-baseline"),
+        ("e2e-responsive-matrix", "ci-runtime-baseline"),
+        ("e2e-responsive-matrix", "responsive-canvas-runtime-evidence"),
+    ):
+        provider_job = jobs[provider_job_name]
+        upload_map = _collect_upload_artifact_if_no_files_found(provider_job)
+        matching = {name: value for name, value in upload_map.items() if required_fragment in name}
+        assert matching, (
+            f"jobs.{provider_job_name} must upload an artifact whose name contains "
+            f"{required_fragment!r} (structural evidence-binding check), got upload-artifact "
+            f"names: {list(upload_map)}"
+        )
+        assert all(value == "error" for value in matching.values()), (
+            f"jobs.{provider_job_name} artifact(s) matching {required_fragment!r} must set "
+            f"if-no-files-found: error (fail-closed evidence binding), got: {matching}"
+        )
+
+
 def test_e2e_core_and_e2e_responsive_matrix_have_no_dag_cross_dependency():
     doc = _load_workflow()
     jobs = doc["jobs"]
@@ -71,10 +116,88 @@ def test_aggregate_e2e_uses_needs_and_if_always_and_distinguishes_three_failure_
     # (c) runtime evidence failure: the aggregate must not degrade to
     # success purely on `result == success` without any evidence binding —
     # each provider's own if-no-files-found: error step is the enforcement
-    # mechanism; the aggregate step's comment/logic must reference it so a
-    # future edit cannot silently drop that binding without touching this
-    # job's own text.
-    assert "if-no-files-found: error" in steps_text or "runtime evidence" in steps_text
+    # mechanism. This is verified structurally (job/step/`with`-block direct
+    # inspection of each dependency named in `jobs.e2e.needs` above), not by
+    # matching a free-text fallback string against this job's own steps
+    # (Issue #2679 AC1 — the prior `or "runtime evidence" in steps_text`
+    # fallback allowed a comment-only PASS with no real field present).
+    _assert_provider_evidence_upload_is_fail_closed(jobs)
+
+
+def _fixture_jobs_with_fail_closed_provider_evidence() -> dict:
+    """Minimal synthetic job dicts that satisfy
+    `_assert_provider_evidence_upload_is_fail_closed` as-is (used as the
+    baseline for the false-negative/false-positive regression-lock tests
+    below, per Issue #2679 AC3/AC4)."""
+    return {
+        "e2e-core": {
+            "steps": [
+                {
+                    "name": "Upload ci-runtime-baseline artifact",
+                    "uses": "actions/upload-artifact@v7",
+                    "with": {
+                        "name": "ci-runtime-baseline-e2e-core-1",
+                        "if-no-files-found": "error",
+                    },
+                }
+            ]
+        },
+        "e2e-responsive-matrix": {
+            "steps": [
+                {
+                    "name": "Upload ci-runtime-baseline artifact",
+                    "uses": "actions/upload-artifact@v7",
+                    "with": {
+                        "name": "ci-runtime-baseline-e2e-responsive-matrix-1",
+                        "if-no-files-found": "error",
+                    },
+                },
+                {
+                    "name": "Upload responsive-canvas-runtime-evidence artifact",
+                    "uses": "actions/upload-artifact@v7",
+                    "with": {
+                        "name": "responsive-canvas-runtime-evidence-${{ github.run_attempt }}",
+                        "if-no-files-found": "error",
+                    },
+                },
+            ]
+        },
+    }
+
+
+def test_provider_evidence_structural_check_fixture_baseline_passes():
+    """Sanity check: the fixture used by the false-negative/false-positive
+    tests below is itself accepted by the structural check as-is."""
+    _assert_provider_evidence_upload_is_fail_closed(_fixture_jobs_with_fail_closed_provider_evidence())
+
+
+def test_provider_evidence_structural_check_false_negative_on_if_no_files_found_warn():
+    """Issue #2679 AC3: mutating a fixture's `if-no-files-found` to `warn`
+    must make the structural check FAIL — it must not silently pass."""
+    jobs = _fixture_jobs_with_fail_closed_provider_evidence()
+    jobs["e2e-core"]["steps"][0]["with"]["if-no-files-found"] = "warn"
+    with pytest.raises(AssertionError):
+        _assert_provider_evidence_upload_is_fail_closed(jobs)
+
+
+def test_provider_evidence_structural_check_false_positive_on_comment_only_runtime_evidence_string():
+    """Issue #2679 AC4: a fixture job whose steps merely contain the literal
+    string "runtime evidence" (comment-like, no real `uses`/`with` fields)
+    must NOT be accepted as PASS by the structural check."""
+    jobs = {
+        "e2e-core": {
+            "steps": [
+                {"name": "runtime evidence note (comment-only, no real upload-artifact step)"},
+            ]
+        },
+        "e2e-responsive-matrix": {
+            "steps": [
+                {"name": "runtime evidence note (comment-only, no real upload-artifact step)"},
+            ]
+        },
+    }
+    with pytest.raises(AssertionError):
+        _assert_provider_evidence_upload_is_fail_closed(jobs)
 
 
 def _load_ci_verdict_module() -> types.ModuleType:
