@@ -694,3 +694,23 @@ Scope Delta（Issue #2563 Allowed Paths に明記済み: `targets` への当該�
 `uv run --locked pytest tests/task-context -q` はローカルで pass し、この
 登録はその CI 常設ゲート化（`python-test` job の
 `uncovered_changed_test_files` gate 対応）を目的とする。
+
+## 信頼済み workflow signals（Issue #2565）
+
+Workflow producer が completion を反映する場合は、`task-contextctl signal apply`
+へ公開 v1 envelope（`signal_kind`, `source`, `source_schema_version`, `evidence`
+だけ）を渡す。Task / Activity / Binding / session ID は公開 payload に含めず、
+producer の起動 session を internal origin として渡す。service は open
+ExecutionRun → Binding → canonical Task を transaction 内で解決する。
+
+- envelope/evidence の不正、unbound origin、claim conflict、out-of-order は
+  non-mutating outcome であり、producer の既に成功した GitHub/cleanup work を
+  rollback しない。
+- accepted facts は `events.dedupe_key` の partial UNIQUE index で物理的に
+  dedupe する。identity は signal kind と business fact のみで、source/version
+  は metadata である。
+- `implementation_pr_observed` は Issue/PR claim を同一 transaction で合法性を
+  先に確認してから atomically attach し、Activity を terminal にしない。
+- accepted `pr_merged_observed` の後だけ cleanup lifecycle が唯一の cleanup
+  Activity を select/create して `cleanup_started` を journal する。merge 済みで
+  cleanup 未完了の OPEN Task は derived `CLEANUP_PENDING` である。
