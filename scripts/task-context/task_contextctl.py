@@ -41,6 +41,7 @@ import task_context_errors as errors  # noqa: E402
 import task_context_hook_flows as hook_flows  # noqa: E402
 import task_context_migration_runner as migration_runner  # noqa: E402
 import task_context_service as service  # noqa: E402
+import task_context_workflow_signals as workflow_signals  # noqa: E402
 
 # Empty/degraded projection shape returned by the read-only `query current`
 # session-selector path (AC9) when there is no DB yet or no Binding
@@ -71,24 +72,33 @@ EXIT_CODE_BY_ERROR_CODE = {
 }
 
 
-def _read_stdin_object() -> dict:
-    """Read stdin as a raw parsed JSON object (or ``{}`` if stdin is empty).
-
-    This is the *envelope* object -- it is validated/unwrapped separately by
-    ``envelope.validate_and_unwrap_request`` in ``main()`` (fix_delta finding
-    1). Renamed from the former ``_read_stdin_payload`` because it no longer
-    returns an operation payload directly.
-    """
-    raw = sys.stdin.read()
+def _read_stdin_object(raw: str) -> dict:
+    """Parse generic CLI input as one JSON object (or ``{}`` when empty)."""
     if not raw.strip():
         return {}
     try:
-        obj = json.loads(raw)
+        obj = workflow_signals.strict_json_loads(raw)
     except json.JSONDecodeError as exc:
         raise errors.ValidationError(f"stdin must contain exactly one UTF-8 JSON object: {exc}") from exc
     if not isinstance(obj, dict):
         raise errors.ValidationError("stdin JSON object must be a JSON object (mapping)")
     return obj
+
+
+def _parse_signal_apply_input(raw: str) -> tuple[dict | None, dict | None]:
+    """Classify direct public signal JSON before generic CLI-envelope parsing.
+
+    A valid legacy request envelope remains on the generic path. Every other
+    non-empty direct ``signal apply`` input receives the v1 envelope taxonomy,
+    including malformed JSON and a non-object JSON root.
+    """
+    try:
+        parsed = workflow_signals.strict_json_loads(raw)
+    except json.JSONDecodeError:
+        return None, {"disposition": "rejected_envelope", "reason_code": "MALFORMED_JSON"}
+    if envelope.is_valid_request_envelope(parsed):
+        return None, None
+    return workflow_signals.validate_public_signal(parsed)
 
 
 def _open_db_and_migrate(cwd: str | None = None):
@@ -151,15 +161,30 @@ def _dispatch(operation: str, payload: dict) -> dict:
             return envelope.build_ok_result(result)
 
         if operation == "signal_apply":
-            task_id = payload.get("task_id")
-            repo = payload.get("repo")
-            ref_kind = payload.get("ref_kind")
-            ref_number = payload.get("ref_number")
-            if not (task_id and repo and ref_kind and ref_number is not None):
-                raise errors.ValidationError(
-                    "signal apply requires task_id, repo, ref_kind, ref_number in payload"
-                )
-            result = service.claim_task_ref(conn, task_id, repo, ref_kind, int(ref_number))
+            # The public payload is frozen by #2565.  Its caller-visible
+            # shape contains no identity selector; the CLI obtains the only
+            # permitted origin from the invoking Claude session environment.
+            if not payload:
+                raise errors.ValidationError("signal apply requires the v1 workflow signal payload")
+            result = workflow_signals.apply_workflow_signal(
+                conn,
+                payload,
+                origin_session_id=os.environ.get("CLAUDE_CODE_SESSION_ID"),
+            )
+            return envelope.build_ok_result(result)
+
+        if operation == "cleanup_begin":
+            required = ("repo", "issue_number", "pr_number", "merge_identity")
+            if any(key not in payload for key in required):
+                raise errors.ValidationError("cleanup begin requires repo, issue_number, pr_number, merge_identity")
+            result = workflow_signals.begin_cleanup_lifecycle(
+                conn,
+                origin_session_id=os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                repo=payload["repo"],
+                issue_number=payload["issue_number"],
+                pr_number=payload["pr_number"],
+                merge_identity=payload["merge_identity"],
+            )
             return envelope.build_ok_result(result)
 
         if operation == "query_current":
@@ -227,6 +252,10 @@ def main(argv: list[str] | None = None) -> int:
     signal_sub = signal_p.add_subparsers(dest="signal_command", required=True)
     signal_sub.add_parser("apply")
 
+    cleanup_p = sub.add_parser("cleanup")
+    cleanup_sub = cleanup_p.add_subparsers(dest="cleanup_command", required=True)
+    cleanup_sub.add_parser("begin")
+
     query_p = sub.add_parser("query")
     query_sub = query_p.add_subparsers(dest="query_command", required=True)
     query_sub.add_parser("current")
@@ -251,6 +280,8 @@ def main(argv: list[str] | None = None) -> int:
         operation = "hook"
     elif args.command == "signal" and args.signal_command == "apply":
         operation = "signal_apply"
+    elif args.command == "cleanup" and args.cleanup_command == "begin":
+        operation = "cleanup_begin"
     elif args.command == "query" and args.query_command == "current":
         operation = "query_current"
     elif args.command == "projection" and args.projection_command == "flush":
@@ -264,17 +295,27 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result), file=sys.stdout)
         return errors.ValidationError.exit_code
 
+    raw_stdin = sys.stdin.read()
     try:
-        stdin_obj = _read_stdin_object()
-        # Empty stdin (`{}` from a completely empty pipe/no input) means "no
-        # request envelope provided" -- some operations (e.g. `smoke seed`)
-        # need no payload at all. Any *non-empty* stdin content, however,
-        # MUST be a fully valid request envelope: this is where the frozen
-        # `{schema_version, operation, request_id, payload}` shape is
-        # actually enforced end-to-end against the real CLI (fix_delta
-        # finding 1) -- unwrapping `payload` as the operation-specific
-        # input and rejecting mismatched/missing/extra top-level fields.
-        payload = envelope.validate_and_unwrap_request(stdin_obj, expected_operation=operation) if stdin_obj else {}
+        payload = None
+        if operation == "signal_apply" and raw_stdin.strip():
+            payload, rejection = _parse_signal_apply_input(raw_stdin)
+            if rejection is not None:
+                print(json.dumps(envelope.build_ok_result(rejection)), file=sys.stdout)
+                return EXIT_OK
+        if payload is None:
+            stdin_obj = _read_stdin_object(raw_stdin)
+            # signal apply's public v1 wire payload is intentionally direct:
+            # it has exactly four top-level fields. Retain the request-envelope
+            # transport only as an internal compatibility wrapper for hook clients.
+            if operation == "signal_apply" and stdin_obj and (
+                "signal_kind" in stdin_obj or "source" in stdin_obj or "evidence" in stdin_obj
+            ):
+                payload = stdin_obj
+            else:
+                payload = (
+                    envelope.validate_and_unwrap_request(stdin_obj, expected_operation=operation) if stdin_obj else {}
+                )
     except errors.ValidationError as exc:
         result = envelope.build_error_result(exc.code, exc.message, exc.details)
         print(json.dumps(result), file=sys.stdout)
