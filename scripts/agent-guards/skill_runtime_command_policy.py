@@ -1684,7 +1684,14 @@ def _parse_exact_skill_runtime_anchor_command(
     # No other command_id in this parser's grammar may carry it -- this is a
     # single, narrow, exact-match extension, not a generic passthrough.
     investigation_evidence_transport_path: "str | None" = None
-    allows_investigation_transport = command_id == "preflight.run.with_human_context"
+    # Issue #2678 AC3: `contract_update.run.with_human_context` (the
+    # mutation-phase counterpart of `preflight.run.with_human_context`) is
+    # allowed the SAME exact two/four-token transport/primary-root suffix
+    # grammar -- no other command_id in this parser's grammar may carry it.
+    allows_investigation_transport = command_id in (
+        "preflight.run.with_human_context",
+        "contract_update.run.with_human_context",
+    )
     if len(tokens) == base_expected_length:
         pass
     elif (
@@ -2109,6 +2116,16 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "{anchor_comment_url}",
         "--human-context-comment-url",
         "{anchor_comment_url}",
+        # Issue #2678 AC1/AC3: the SAME optional trailing pairs as
+        # `preflight.run.with_human_context` above (dropped by
+        # render_command()'s `optional_flag_pair` mechanism when absent --
+        # matched here verbatim for parity with
+        # `_parse_exact_skill_runtime_anchor_command()`'s own optional
+        # two/four-token suffix handling for this command_id).
+        "--investigation-evidence-transport-path",
+        "{investigation_evidence_transport_path}",
+        "--investigation-evidence-primary-root",
+        "{investigation_evidence_primary_root}",
         "--consume-contract-patch-plan",
     ],
     # #2086 AC10 (iteration 2): full argv template including #2053's
@@ -2260,6 +2277,19 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         "issue_number": {"type": "positive_int", "required": True},
         "repo": {"type": "owner_repo", "required": True},
         "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+        # Issue #2678 AC1: mirrors `preflight.run.with_human_context`'s
+        # SAME optional transport/primary-root pair.
+        "investigation_evidence_transport_path": {
+            "type": "path",
+            "required": False,
+            "optional_flag_pair": True,
+        },
+        # Issue #2678 AC2
+        "investigation_evidence_primary_root": {
+            "type": "path",
+            "required": False,
+            "optional_flag_pair": True,
+        },
     },
     # #2086 AC10 (iteration 2)
     "decide.run": {
