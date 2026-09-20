@@ -105,43 +105,6 @@ preflight_agy = _load_module(_PREFLIGHT_AGY_PATH, "preflight_agy")
 agy_permission_policy = _load_module(_AGY_PERMISSION_POLICY_PATH, "agy_permission_policy_stage2_handoff")
 
 
-def _real_agy_permission_policy_module() -> types.ModuleType:
-    """Return the SAME `agy_permission_policy` module object that
-    `run_gemini_headless.py`'s own `import agy_permission_policy as
-    _agy_permission_policy` (top of that file, Issue #1705) resolves to at
-    the moment `run_canonical_delegation_route_probe()` (below) reloads
-    `run_gemini_headless.py`.
-
-    Deliberately NOT the same object as this file's own `agy_permission_policy`
-    (loaded above under the distinct synthetic name
-    `agy_permission_policy_stage2_handoff` purely for this file's own
-    independent classification check) -- `run_gemini_headless.py` uses a
-    real, path-based `import agy_permission_policy` (it inserts its own
-    `scripts/` directory onto `sys.path`, see that file's Issue #1705
-    comment), which Python caches under the plain module name
-    `"agy_permission_policy"` in `sys.modules`. Reproducing that exact
-    bootstrap here (idempotent -- `sys.path.insert` is a no-op if already
-    present, and a repeat `import` of an already-cached name is a cheap
-    `sys.modules` lookup, never a re-exec) guarantees
-    `_pin_agy_bwrap_available_for_canonical_route_probe()` below patches the
-    identical module object `_run_agy()`'s
-    `agy_permission_policy.materialize_isolated_agy_workspace()` call
-    actually consults, regardless of what other test files in a full-suite
-    run may have already claimed that same `sys.modules` slot with their own
-    `importlib.util.spec_from_file_location("agy_permission_policy", ...)`
-    load (several sibling test files -- e.g.
-    `test_agy_permission_policy_oauth_token.py` -- intentionally reuse this
-    exact plain name; see that file's `_force_bwrap_available` fixture,
-    which this mirrors)."""
-    scripts_dir = _AGY_PERMISSION_POLICY_PATH.parent
-    if str(scripts_dir) not in sys.path:
-        sys.path.insert(0, str(scripts_dir))
-    # `import importlib.util` above already binds the `importlib` package
-    # name itself, so `importlib.import_module` is reachable without a
-    # separate `import importlib` statement.
-    return importlib.import_module("agy_permission_policy")
-
-
 @pytest.fixture(autouse=True)
 def _clear_agy_oauth_token_handoff_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Issue #2670: keep this file's pre-existing (#2616) tests deterministic
@@ -154,36 +117,114 @@ def _clear_agy_oauth_token_handoff_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", raising=False)
 
 
+def _write_fake_bwrap(bin_dir: Path) -> Path:
+    """Issue #2670 (live-CI regression fix_delta, iteration 4): write a real,
+    executable, thin-passthrough fake `bwrap` binary named `bwrap` under
+    *bin_dir*.
+
+    Unlike iteration 3's fix (`monkeypatch.setattr(..., "_bwrap_available",
+    lambda: True)`), which made `_bwrap_available()` LIE that `bwrap` is
+    installed -- letting `materialize_isolated_agy_workspace()`'s
+    `elif _bwrap_available():` branch (`agy_permission_policy.py`) build a
+    REAL `bwrap` argv prefix (`_build_bwrap_ro_bind_prefix()`) that
+    `_run_agy()` then actually tried to `subprocess.run()` on a CI runner
+    with no real `bwrap` binary at all -- this fixture makes `bwrap`
+    genuinely, honestly present on `PATH`, so the real (unmocked)
+    `_bwrap_available()` (`shutil.which("bwrap") is not None`) resolves
+    `True` truthfully. That live-CI failure
+    (`canonical_delegation_route_failure:agy_not_found`, GitHub Actions run
+    35503754208, job `python-test-core`) is what iteration 3's lie produced;
+    this fixture avoids reproducing it by never claiming something that
+    is not, in fact, true.
+
+    This fake ignores every real bwrap sandboxing flag (`--dev-bind`,
+    `--tmpfs`, `--ro-bind`) -- it performs no actual bind-mounting, mirroring
+    `_write_fake_agy()`'s thin-passthrough style above -- but DOES honor the
+    one part of bwrap's contract `_run_agy()`'s `--json-status-fd` proof path
+    (Issue #2434 AC6/AC10; see `run_gemini_headless.py`'s
+    `_bwrap_status_reports_child_started()`, which this fake's caller
+    ultimately depends on) actually requires: it locates the
+    `--json-status-fd <N>` argument, writes a valid `{"child-pid": <own real
+    pid>}` JSON line to file descriptor *N* (inherited via
+    `subprocess.run(..., pass_fds=(status_fd,))`, so the descriptor number
+    is unchanged across exec), then locates the trailing `--` separator and
+    `exec`s everything after it (the real/fake `agy` command bwrap would
+    have wrapped) -- so the wrapped command's own real behavior (printing
+    the sentinel, exit 0) is what determines the overall outcome, exactly as
+    a genuine `bwrap` invocation's exit behavior would."""
+    script = bin_dir / "bwrap"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "argv = sys.argv[1:]\n"
+        "status_fd = None\n"
+        "command = []\n"
+        "i = 0\n"
+        "while i < len(argv):\n"
+        "    if argv[i] == '--json-status-fd':\n"
+        "        status_fd = int(argv[i + 1])\n"
+        "        i += 2\n"
+        "        continue\n"
+        "    if argv[i] == '--':\n"
+        "        command = argv[i + 1:]\n"
+        "        break\n"
+        "    i += 1\n"
+        "if status_fd is not None:\n"
+        "    try:\n"
+        "        os.write(status_fd, (json.dumps({'child-pid': os.getpid()}) + '\\n').encode('utf-8'))\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "if not command:\n"
+        "    sys.exit(97)\n"
+        "os.execvp(command[0], command)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    return script
+
+
 @pytest.fixture(autouse=True)
-def _pin_agy_bwrap_available_for_canonical_route_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Issue #2670 (live-CI regression fix_delta): `run_canonical_delegation_route_probe()`'s
-    hermetic tests below (Issue #2616 fix_delta P1-1 / Issue #2670 AC5) route
-    through the REAL `run_gemini_headless.py::run_delegation()` ->
-    `_run_agy()` -> `agy_permission_policy.materialize_isolated_agy_workspace()`
-    call chain. That function fail-closes with `AgyReadOnlyBoundaryError`
-    (Issue #1779 AC7, caught by `run_delegation()`'s generic
-    `except Exception` and reclassified as the opaque
-    `failure_class: agy_unexpected_error`) for the `no_tools` profile
-    whenever the resolved AGY OAuth token handoff source exists AND the real
-    host has no `bwrap` binary on `PATH` -- exactly the case
+def _stage_real_fake_bwrap_on_path_for_canonical_route_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2670 (live-CI regression fix_delta, iteration 4): replaces
+    iteration 3's `_pin_agy_bwrap_available_for_canonical_route_probe` (which
+    lied about `_bwrap_available()` via `monkeypatch.setattr`) with a real,
+    executable fake `bwrap` binary (`_write_fake_bwrap()` above) prepended to
+    `PATH` for the duration of each test in this file.
+
+    `run_canonical_delegation_route_probe()`'s hermetic tests below (Issue
+    #2616 fix_delta P1-1 / Issue #2670 AC5) route through the REAL
+    `run_gemini_headless.py::run_delegation()` -> `_run_agy()` ->
+    `agy_permission_policy.materialize_isolated_agy_workspace()` call chain.
+    That function fail-closes with `AgyReadOnlyBoundaryError` (Issue #1779
+    AC7, caught by `run_delegation()`'s generic `except Exception` and
+    reclassified as the opaque `failure_class: agy_unexpected_error`) for
+    the `no_tools` profile whenever the resolved AGY OAuth token handoff
+    source exists AND `bwrap` is unavailable -- exactly the case
     `test_run_canonical_delegation_route_probe_passes_when_canonical_route_succeeds`
     below constructs (a validated handoff source via `_set_validated_handoff_env()`).
-    A live GitHub Actions run (`python-test-core`, full parallel suite)
-    observed this exact `agy_unexpected_error` / `AgyReadOnlyBoundaryError`
-    failure even though the identical test passes when this file runs in
-    isolation on a host that happens to already have `bwrap` installed --
-    i.e. this test's PASS was accidentally contingent on live host `bwrap`
-    availability, not on the handoff-selection / canonical-route behavior it
-    actually exists to verify (Issue #1779 AC7's own selection logic is
-    covered independently, and deterministically, by
-    `test_agy_permission_policy_readonly_boundary.py`; `bwrap`'s
-    presence/absence is never guaranteed in CI -- see that file's Stop
-    Conditions note and `test_agy_permission_policy_oauth_token.py`'s
-    identical `_force_bwrap_available` fixture, which this mirrors for the
-    real, standard-imported `agy_permission_policy` module `_run_agy()`
-    itself consults, not this file's own separately-loaded
-    `agy_permission_policy_stage2_handoff` copy)."""
-    monkeypatch.setattr(_real_agy_permission_policy_module(), "_bwrap_available", lambda: True)
+    `bwrap`'s presence/absence is never guaranteed in CI (Issue #1779 Stop
+    Conditions), so this fixture stages a real fake `bwrap` rather than
+    depending on -- or lying about -- host state. Prepended (not appended)
+    to `PATH` so this fixture's fake shadows any real `bwrap` already
+    installed on the host, keeping this file's tests deterministic
+    regardless of host `bwrap` state in either direction.
+
+    `materialize_isolated_agy_workspace()` reads `os.environ.get("PATH")` at
+    call time (inside the test, after this fixture already ran) to build the
+    isolated workspace's own `env["PATH"]`, and `_run_agy()`'s
+    `subprocess.run(run_command, ..., env=env, ...)` resolves the bare
+    `"bwrap"` argv[0] via that `env["PATH"]` -- so this fixture's
+    `monkeypatch.setenv("PATH", ...)` (which mutates `os.environ` directly)
+    is what actually reaches the real invocation argv's executable lookup,
+    not merely this test process's own `PATH`."""
+    fake_bwrap = _write_fake_bwrap(tmp_path)
+    original_path = os.environ.get("PATH", "")
+    monkeypatch.setenv("PATH", f"{fake_bwrap.parent}{os.pathsep}{original_path}")
 
 
 def _write_runtime_verification_log(
