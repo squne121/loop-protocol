@@ -59,3 +59,50 @@ def test_given_cross_task_accepted_fact_when_implementation_activity_terminal_th
 
     assert result == {"disposition": "conflict", "reason_code": "FACT_TASK_IDENTITY_CONFLICT"}
     assert _db_snapshot(conn) == before
+
+
+def test_given_other_task_live_claim_without_accepted_event_when_activity_terminal_then_conflict_is_non_mutating(conn):
+    """AC3 (PR #2692 OWNER review, comment
+    https://github.com/squne121/loop-protocol/pull/2692#issuecomment-5749549802):
+    Task A holds a *live claim* on Issue #20 (via an accepted
+    ``implementation_pr_observed`` fact for PR #22), but Task B now replays
+    a *novel* dedupe key (PR #21) that no Task has ever had accepted -- so
+    the ``_accepted_event_tx`` lookup for that key returns ``None``. Even
+    though there is no accepted-fact conflict for this specific dedupe key,
+    Task A's live claim on Issue #20 must still make this
+    ``conflict``/``FACT_TASK_IDENTITY_CONFLICT`` for Task B, evaluated
+    *before* Task B's own (terminal) implementation Activity state. Before
+    this fix, ``_validate_implementation_claims_tx`` (which performs the
+    live-claim check) was only reached once ``accepted_implementation`` was
+    known, but was preceded by the Activity-state branch, so Task B's
+    terminal Activity short-circuited to
+    ``duplicate_noop``/``activity_terminal`` instead. This test fails
+    against that code."""
+    task_a, _, _, _ = create_origin(conn, session="session-a")
+    applied_a = signals.apply_workflow_signal(
+        conn, implementation_payload(issue_number=20, pr_number=22), origin_session_id="session-a"
+    )
+    assert applied_a["disposition"] == "applied"
+
+    task_b, implementation_b, _, _ = create_origin(conn, session="session-b")
+    applied_b_impl = signals.apply_workflow_signal(
+        conn, implementation_payload(issue_number=30, pr_number=98), origin_session_id="session-b"
+    )
+    assert applied_b_impl["disposition"] == "applied"
+    applied_b_merge = signals.apply_workflow_signal(
+        conn, merged_payload(issue_number=30, pr_number=98), origin_session_id="session-b"
+    )
+    assert applied_b_merge["disposition"] == "applied"
+    assert service.get_activity(conn, implementation_b["id"])["status"] == "DONE"
+    assert task_a["id"] != task_b["id"]
+    before = _db_snapshot(conn)
+
+    # Task B sends a *novel* dedupe key (PR #21, never accepted by anyone)
+    # for the Issue that Task A already holds a live claim on, while Task
+    # B's own implementation Activity is terminal.
+    result = signals.apply_workflow_signal(
+        conn, implementation_payload(issue_number=20, pr_number=21), origin_session_id="session-b"
+    )
+
+    assert result == {"disposition": "conflict", "reason_code": "FACT_TASK_IDENTITY_CONFLICT"}
+    assert _db_snapshot(conn) == before

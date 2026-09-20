@@ -359,25 +359,30 @@ def apply_workflow_signal(
             assert origin is not None
             task_id, kind, evidence = origin["task_id"], valid["signal_kind"], valid["evidence"]
             if kind == "implementation_pr_observed":
-                # The implementation dedupe key deliberately identifies a PR,
-                # not an Issue. Per AC3's precedence (claim/Task consistency
-                # -> same-fact dedupe -> phase/terminal judgment), cross-Task
-                # accepted-fact identity must be judged before *any* local
-                # Activity state (missing or terminal): a replay whose
-                # dedupe key was already accepted by a *different* Task is
-                # always conflict/FACT_TASK_IDENTITY_CONFLICT, regardless of
-                # whether this Task's own implementation Activity is ACTIVE,
-                # terminal, or missing entirely (Issue #2690). An exact
+                # Per AC3's precedence (claim/Task consistency -> same-fact
+                # dedupe -> phase/terminal judgment), cross-Task claim/Task
+                # consistency must be judged before *any* local Activity
+                # state (missing or terminal), and before this dedupe key's
+                # own accepted-fact identity check. A different Task already
+                # holding a *live claim* on this Issue (or PR) is always
+                # conflict/FACT_TASK_IDENTITY_CONFLICT regardless of whether
+                # this specific dedupe key has ever been accepted by anyone,
+                # and regardless of whether this Task's own implementation
+                # Activity is ACTIVE, terminal, or missing entirely (Issue
+                # #2690 fix_delta / PR #2692 OWNER review). Only once
+                # claim/Task consistency is confirmed clean do we evaluate
+                # this dedupe key's own accepted-fact identity: a replay
+                # whose dedupe key was already accepted by a *different*
+                # Task is conflict/FACT_TASK_IDENTITY_CONFLICT; an exact
                 # replay of the accepted fact by the *same* Task falls
                 # through to the common SAME_TASK_SAME_FACT dedupe below
-                # regardless of Activity status, and a same-Task replay with
-                # the same PR but another Issue is always an identity
-                # conflict -- never a duplicate_noop -- even once the
-                # implementation Activity has already reached DONE. Only
-                # once the fact is confirmed genuinely new for this dedupe
-                # key (no accepted event for it belongs to any Task) may
-                # local Activity state (`activity_missing` /
-                # `activity_terminal`) be evaluated.
+                # regardless of Activity status. Only once the fact is
+                # confirmed genuinely new for this dedupe key (no accepted
+                # event for it belongs to any Task) may local Activity state
+                # (`activity_missing` / `activity_terminal`) be evaluated.
+                claim_conflict = _validate_implementation_claims_tx(conn, task_id, evidence)
+                if claim_conflict:
+                    return claim_conflict
                 accepted_implementation = _accepted_event_tx(conn, key)
                 if accepted_implementation is not None and accepted_implementation["task_id"] != task_id:
                     return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
@@ -395,7 +400,10 @@ def apply_workflow_signal(
                         return _outcome("deferred", "activity_missing")
                     if implementation["status"] != "ACTIVE":
                         return _outcome("duplicate_noop", "activity_terminal", task_id=task_id)
-                outcome = _validate_implementation_claims_tx(conn, task_id, evidence)
+                # claim/Task consistency was already validated above; do not
+                # re-run it here (outcome stays None unless a later branch
+                # sets it).
+                outcome = None
             elif kind == "pr_merged_observed":
                 outcome = _validate_merged_prerequisites_tx(conn, task_id, evidence)
             elif kind == "cleanup_completed":
