@@ -2045,6 +2045,21 @@ cycle）は live traversal を要するため executor 側
 10. 一部 operation が失敗していた場合は `partial` を返し、`before`/`desired`/`after`（fresh readback 値）/`completed_operations`/`pending_operations` を含める（AC9）
 11. 全 operation が成功し、かつ post-readback が desired と完全一致した場合のみ `applied` を返す。不一致の場合は `postcondition_rejected` を返す
 
+**環境サニタイズ境界（Issue #2665）**: 上記 2〜11 の全 `gh` subprocess 呼び出し
+（actor verification、precondition readback、mutation、postcondition
+readback、zero-delta no-op verification）は `_relationship_gh_env()` が一度
+だけ構築する単一の `env` を共有する。`_relationship_gh_env()` は
+`_build_metadata_sanitized_env()`（issue-metadata read/write helper が使う
+sanitizer）と同一の安全境界を再利用し、実行/ログ noise のみを
+`_METADATA_ENV_NOISE_STRIP_KEYS`（`GH_HOST`/`GH_REPO`/`GH_DEBUG`/`DEBUG`/
+editor-browser 系/`PYTHONPATH`/`PYTHONHOME`）で除去し、既存の credential
+carrier（`GH_TOKEN`/`GITHUB_TOKEN`/`GH_CONFIG_DIR`）は存在する場合そのまま
+維持し、存在しないものは合成しない。`issue_dependency.remove` 用の
+higher-trust sanitizer（`_build_issue_dependency_remove_gh_env()`。
+`GH_CONFIG_DIR` を無条件除去する）とは異なる境界であり、relationship
+route はそちらを共有しない（#2665 以前は誤って共有しており、継承した
+`GH_CONFIG_DIR` が無条件で失われる regression があった）。
+
 `blocking` 方向規約: Issue `T`（transaction subject）が `X` を block する場合、
 GraphQL `AddBlockedByInput`/`RemoveBlockedByInput` は `issueId=X`（block される側）、
 `blockingIssueId=T`（block する側）を用いる。`add_blocking`/`remove_blocking`
