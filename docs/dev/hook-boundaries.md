@@ -461,6 +461,49 @@ hook_boundaries_manifest_v1:
       起動し、hot path 自体は待たない。
 
   - handler_id: hook_entry
+    event: PreToolUse
+    matcher: "SendMessage|Bash"
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "PreToolUse"
+    timeout: 5
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: PreToolUse
+      exit_2_effect: blocks_tool_call
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: hookSpecificOutput_permissionDecision_ask_or_deny_on_guarded_target_silent_otherwise
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2566: Task-aware cross-session `SendMessage` guard と cross-Task Herdr
+      control guard。`matcher: "SendMessage|Bash"` の `Bash` 側は
+      `pre_tool_use_classifier.looks_like_herdr_command` による argument-aware
+      early exit（無関係な Bash 呼び出しでは `task-contextctl` subprocess を spawn
+      しない、hot path 保護）。`task_context_hook_flows.on_pre_tool_use` はこの
+      Issue の対象範囲では `decision: "pass" | "ask"` のみを返し `"block"` を返さない
+      （target_kind: same_task_independent_session / in_session_subagent は
+      `"pass"`、known_cross_task_independent_session / unknown_independent_session
+      は `"ask"`）。adapter は常に exit 0 で、guard 対象時のみ stdout に
+      `hookSpecificOutput.permissionDecision: "ask"` を出力する（`decision: "pass"`
+      は無出力、既存の hard deny — 例: worktree-agent-runtime-smoke の
+      `permissions.deny` — を上書きしない、AC6）。EventJournal には
+      `transport`/`operation`/`target_kind`/`source_task_id`/`destination_task_id`/
+      `decision`/`reason_code` の bounded metadata のみ記録し、message body /
+      terminal output / raw Bash command は保存しない（AC7）。
+
+  - handler_id: hook_entry
     event: UserPromptExpansion
     matcher: task
     command: "python3"

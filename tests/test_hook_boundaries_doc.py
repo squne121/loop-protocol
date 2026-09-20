@@ -338,6 +338,18 @@ class TestBaseHeadHookTopologyDelta:
             "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "UserPromptExpansion"],
             "timeout": 2,
         },
+        # Issue #2566: Task-aware cross-session `SendMessage` guard と
+        # cross-Task Herdr control guard. `fix_delta 6`（#2564）で見送った
+        # PreToolUse への配線をここで実施する（telemetry/no-op ではなく
+        # `hookSpecificOutput.permissionDecision: ask` を出す advisory guard
+        # として。Allowed Paths は #2566 の OWNER-approved contract correction
+        # により `docs/dev/hook-boundaries.md` / 本ファイルへ拡張済み）。
+        ("hook_entry", "PreToolUse"): {
+            "matcher": "SendMessage|Bash",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "PreToolUse"],
+            "timeout": 5,
+        },
     }
 
     del _hook_entry_added
