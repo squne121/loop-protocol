@@ -148,23 +148,9 @@ uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
 
 このphaseは既存patch planをtransaction-localにconsumerへ渡し、candidate static readiness、controlled transaction、final readback、fresh preflight/review/readiness入力までを一続きに実行する。subagent / isolation worktree はこのcommandを直接実行しない。新しい永続schema、receipt、publisher、state storeは作らない。
 
-**investigation evidence transport（Issue #2678、#2086 AC3 の mutation phase 拡張）:**
-`preflight.run.with_human_context`（read-only lane）が `--investigation-evidence-transport-path` を渡して `expands_allowed_paths` boundary を解除し `contract_update_required` decision を得た場合、同一の transport manifest path を **同一の呼び出しで** `contract_update.run.with_human_context` へもそのまま引き渡す（read-only preflight とは別の invocation を独立に起動するのではなく、read-only preflight が生成した transport manifest をこの mutation phase 呼び出しへ再利用する）:
+**investigation evidence transport（Issue #2678、#2086 AC3 の mutation phase 拡張。詳細・primary-root 内部生成・write-zero 保証は `references/anchor-comment-handling.md` の「mutation phase（#2678）」節を正本として参照）:** read-only `preflight.run.with_human_context` が `--investigation-evidence-transport-path` で `contract_update_required` decision を得た場合、**同一の呼び出しで** 同じ transport manifest path をそのまま `contract_update.run.with_human_context` へ渡す（例: `skill_runtime_exec.py --command-id contract_update.run.with_human_context --issue-number <N> --repo <owner/repo> --anchor-comment-url <canonical URL> --investigation-evidence-transport-path <repo-relative manifest path>`）。`optional_flag_pair`（省略時は byte-identical）。`--investigation-evidence-primary-root` は caller 指定不可（executor 内部生成）。検証失敗時は mutation consumer 呼出し・GitHub 更新要求ともに 0 回（write-zero）。対象外 boundary flag はこの緩和の対象外。
 
-```bash
-uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
-  --command-id contract_update.run.with_human_context \
-  --issue-number <N> \
-  --repo <owner/repo> \
-  --anchor-comment-url <canonical GitHub issue comment URL> \
-  --investigation-evidence-transport-path <repo-relative manifest path>
-```
-
-`--investigation-evidence-transport-path` は `optional_flag_pair`（省略可能。省略時は transport-absent の既存挙動と byte-identical）。`--investigation-evidence-primary-root` は **caller が渡してはならない** — `skill_runtime_exec.py` 自身の CLI はこのフラグを受け付けず、常に executor 内部で確認済みの `project_root`（専用worktree dispatch 前の PRIMARY checkout の絶対パス）から自動生成し、transport path が指定された場合にのみ子プロセスへ内部的に付与する。transport が明示指定され、かつ digest / issue / repo / anchor / body / HEAD / path confinement のいずれかの検証に失敗した場合、anchor 本文単独から別の有効な patch plan が導出可能であっても mutation consumer（`consume_trusted_anchor_contract_patch_plan()`）は呼び出されず、GitHub 更新要求も発生しない（write-zero 保証、`.claude/skills/issue-refinement-loop/tests/test_investigation_evidence_transport_mutation_guard.py` 参照）。`destructive_or_non_idempotent_operation` / `changes_permission_boundary` / `changes_external_service_boundary` / `requires_issue_split` boundary は investigation evidence によって緩和されない（`expands_allowed_paths` のみが対象、`.claude/skills/issue-refinement-loop/tests/test_investigation_evidence_transport_boundary_flags.py` 参照）。
-
-wrapper の出力フィールドを確認する:
-
-**canonical stdout フィールド（機械可読）:**
+wrapper の出力フィールドを確認する（**canonical stdout フィールド（機械可読）**）:
 - `STATUS: pass | warn | needs_fix | blocked | environment_failure` — 常に出力される
 - `NEXT_ACTION: proceed | proceed_with_notes | apply_deterministic_repair | apply_deterministic_structural_repair | human_judgment_required | fix_environment | issue_editor_required` — 常に出力される（`issue_editor_required` は `--consume-contract-patch-plan` 経路限定。下記「`NEXT_ACTION: issue_editor_required` 受信時」参照）
 - `MUST_READ:` — 読むべきパス一覧（空の場合は省略）
@@ -189,8 +175,7 @@ wrapper の出力フィールドを確認する:
 - `DO_NOT_READ` — 予約済み（現在は常に空）、consumers は欠如に依存してはならない
 - `EVIDENCE` — raw issue body / comments は stdout に出力されない（artifact のみ）
 
-**warn (exit 1) の定義:**
-planner exit 0 かつ `fail_closed.required == false` かつ `decisions.*.confidence` に `"unknown"` が 1 つ以上含まれる場合、`STATUS: warn` / exit 1 を返す。human note が必要だが blocking ではない。`NEXT_ACTION: proceed_with_notes` に従って継続できる。
+**warn (exit 1) の定義:** planner exit 0 かつ `fail_closed.required == false` かつ `decisions.*.confidence` に `"unknown"` が 1 つ以上含まれる場合、`STATUS: warn` / exit 1 を返す。human note が必要だが blocking ではない。`NEXT_ACTION: proceed_with_notes` に従って継続できる。
 
 - `NEXT_ACTION:` に従って後続ステップを決定する
 - `ARTIFACT:` の `refinement_preflight_result_v1` パスから `fail_closed` / `decisions` を参照する
