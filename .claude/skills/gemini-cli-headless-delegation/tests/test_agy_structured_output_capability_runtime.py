@@ -1120,7 +1120,17 @@ def test_write_ac5_handoff_summary_artifact_never_contains_forbidden_content() -
         handoff_classification=agy_permission_policy.AGY_HANDOFF_SOURCE_ABSENT,
     )
     content = artifact_path.read_text(encoding="utf-8")
-    for forbidden_key in ("stdout", "stderr", "response_text", "root_path", "source_path", "credential", "HOME", "XDG_CONFIG_HOME"):
+    forbidden_keys = (
+        "stdout",
+        "stderr",
+        "response_text",
+        "root_path",
+        "source_path",
+        "credential",
+        "HOME",
+        "XDG_CONFIG_HOME",
+    )
+    for forbidden_key in forbidden_keys:
         assert f'"{forbidden_key}"' not in content
 
 
