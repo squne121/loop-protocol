@@ -2726,10 +2726,14 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        if args.investigation_evidence_transport_path and args.command_id != "preflight.run.with_human_context":
+        if args.investigation_evidence_transport_path and args.command_id not in (
+            "preflight.run.with_human_context",
+            "contract_update.run.with_human_context",
+        ):
             print(
                 "skill_runtime_exec: --investigation-evidence-transport-path is only "
-                "allowed for preflight.run.with_human_context",
+                "allowed for preflight.run.with_human_context and "
+                "contract_update.run.with_human_context",
                 file=sys.stderr,
             )
             return 2
@@ -2765,10 +2769,19 @@ def main(argv: list[str] | None = None) -> int:
                 # validated-value-vs-used-value divergence) -- so this
                 # mirrors the SAME condition the render_params block below
                 # uses, not an independent one.
+                # Issue #2678 AC2: `contract_update.run.with_human_context`
+                # (the mutation-phase counterpart of
+                # `preflight.run.with_human_context`) receives the SAME
+                # executor-internal primary-root propagation, never a
+                # caller-suppliable value.
                 *(
                     ["--investigation-evidence-primary-root", project_root]
                     if args.investigation_evidence_transport_path
-                    and args.command_id == "preflight.run.with_human_context"
+                    and args.command_id
+                    in (
+                        "preflight.run.with_human_context",
+                        "contract_update.run.with_human_context",
+                    )
                     else []
                 ),
             ]
@@ -3204,7 +3217,14 @@ def main(argv: list[str] | None = None) -> int:
                 # root and silently miss the real evidence file. Always the
                 # executor's OWN already-verified `project_root` -- never a
                 # caller-suppliable value.
-                if args.command_id == "preflight.run.with_human_context":
+                # Issue #2678 AC2: extend the SAME executor-internal
+                # primary-root propagation to the mutation-phase
+                # `contract_update.run.with_human_context` profile (never a
+                # caller-supplied root).
+                if args.command_id in (
+                    "preflight.run.with_human_context",
+                    "contract_update.run.with_human_context",
+                ):
                     render_params["investigation_evidence_primary_root"] = project_root
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
