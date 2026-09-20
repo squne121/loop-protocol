@@ -8630,6 +8630,16 @@ def run_preflight(
     # -> `skill_runtime_exec.py` -> registry-rendered argv -> this subprocess
     # chain does; `main()` only ever threads this manifest path through, and
     # this is where it is validated and merged into known_context.
+    #
+    # Issue #2678 AC6: when a transport path is explicitly specified AND its
+    # validation fails, this flag fail-closes the mutation consumer call
+    # below (`consume_trusted_anchor_contract_patch_plan()`) even when an
+    # anchor-body-only patch plan is independently derivable via one of the
+    # other producer branches (noop-satisfied fallback / structured scope
+    # reframe synthesis) further down. Appending to `blockers` alone (as
+    # before this Issue) does not stop those other branches from still
+    # reaching the mutation consumer -- only this flag does.
+    _investigation_evidence_transport_rejected = False
     if investigation_evidence_transport_path is not None:
         # Issue #2199 OWNER feedback P1-3: `investigation_evidence_transport_path`
         # is validated by the executor (skill_runtime_command_policy.py) as a
@@ -8676,6 +8686,7 @@ def run_preflight(
             known_context["investigation_derived_path_literals"] = _validated_literals
         else:
             blockers.append(f"investigation_evidence_transport_rejected:{_transport_reason}")
+            _investigation_evidence_transport_rejected = True
 
     # --- Invoke planner ---
     known_context = _ensure_scope_signal_delta_input(
@@ -8802,7 +8813,17 @@ def run_preflight(
     _close_not_planned_disposition = _is_approved_close_not_planned_decision(
         known_context.get("scope_delta_decision") if isinstance(known_context, dict) else None
     )
-    if consume_contract_patch_plan and not _close_not_planned_disposition:
+    # Issue #2678 AC6: an explicitly-specified-and-rejected transport path
+    # fail-closes this entire mutation-consumer branch -- the mutation
+    # callback (`consume_trusted_anchor_contract_patch_plan()`) and any
+    # GitHub update request it could trigger are unreachable, regardless of
+    # whether an anchor-body-only patch plan is independently derivable
+    # below (noop-satisfied fallback / structured scope reframe synthesis).
+    if (
+        consume_contract_patch_plan
+        and not _close_not_planned_disposition
+        and not _investigation_evidence_transport_rejected
+    ):
         sidecar = plan.get("scope_signal_guard_decision_v2")
         authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else None
         patch_plan = authority.get("contract_patch_plan") if isinstance(authority, dict) else None
