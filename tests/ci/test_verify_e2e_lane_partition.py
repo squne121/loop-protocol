@@ -16,12 +16,24 @@ they never silently report PASS for that condition.
 
 AC7/AC8 verify workflow-level artifact-naming and preview-namespace
 exactly-once invariants by structurally parsing `.github/workflows/ci.yml`.
+
+Issue #2679 AC2/AC3/AC4 add a `ci-runtime-baseline-*` `if-no-files-found:
+error` structural regression test (mirroring the AC7 pattern), plus
+fixture-based false-negative/false-positive regression-lock tests that call
+the extracted parse/assert logic directly (both this file's own logic and,
+via `importlib`, the sibling structural check in
+`test_ci_workflow_lane_partition.py` that Issue #2679 AC1 fixed) rather than
+re-deriving a second, independently-buggy implementation.
 """
 from __future__ import annotations
 
+import copy
+import importlib.util
 import json
 import pathlib
+import re
 import subprocess
+import types
 
 import pytest
 import yaml
@@ -30,6 +42,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 VERIFY_SCRIPT = REPO_ROOT / "scripts" / "ci" / "verify-e2e-lane-partition.mjs"
 PLAYWRIGHT_BIN = REPO_ROOT / "node_modules" / ".bin" / "playwright"
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+CI_WORKFLOW_LANE_PARTITION_TEST_MODULE = REPO_ROOT / "tests" / "ci" / "test_ci_workflow_lane_partition.py"
 
 
 def _run_partition_check() -> dict:
@@ -80,6 +93,207 @@ def _collect_upload_artifact_names(job: dict) -> list[str]:
             with_block = step.get("with") or {}
             names.append(str(with_block.get("name", "")))
     return names
+
+
+def _collect_upload_artifact_metadata(job: dict) -> list[dict]:
+    """Like `_collect_upload_artifact_names`, but also captures each
+    `actions/upload-artifact` step's `with.if-no-files-found` value
+    (structural field, not free text) so regression tests can assert on it
+    directly (Issue #2679 AC2)."""
+    metadata = []
+    for step in job.get("steps", []):
+        if not isinstance(step, dict):
+            continue
+        uses = str(step.get("uses", ""))
+        if uses.split("@", 1)[0] == "actions/upload-artifact":
+            with_block = step.get("with") or {}
+            metadata.append(
+                {
+                    "name": str(with_block.get("name", "")),
+                    "if_no_files_found": with_block.get("if-no-files-found"),
+                }
+            )
+    return metadata
+
+
+def _assert_ci_runtime_baseline_if_no_files_found_is_error(jobs: dict) -> None:
+    """Issue #2679 AC2 (fix_delta P2-1/P2-3, PR #2681 review comment
+    5747896617): `ci-runtime-baseline-*` `actions/upload-artifact` steps in
+    both `e2e-core` and `e2e-responsive-matrix` must declare
+    `if-no-files-found: error` AND the contract-bound `with.path`, identified
+    by EXACT name matching (never substring matching -- see the sibling
+    module's docstring for the reproduced under-/over-inclusive failure
+    modes this replaces). This delegates identification to the sibling
+    `test_ci_workflow_lane_partition.py` module's shared
+    `_required_upload_target` / `_find_required_upload_step` helpers (via the
+    existing cross-file sibling-module-load pattern) rather than
+    reimplementing the same contract-bound matching a second time."""
+    sibling = _load_ci_workflow_lane_partition_module()
+    for job_name in ("e2e-core", "e2e-responsive-matrix"):
+        job = jobs[job_name]
+        literal_template, resolved_regex, expected_path = sibling._required_upload_target(
+            job_name, "ci-runtime-baseline"
+        )
+        with_block = sibling._find_required_upload_step(job, literal_template, resolved_regex)
+        assert with_block is not None, (
+            f"jobs.{job_name} must upload a ci-runtime-baseline-* artifact named exactly "
+            f"{literal_template!r} (or matching {resolved_regex.pattern!r}), got upload-artifact "
+            f"steps: {_collect_upload_artifact_metadata(job)}"
+        )
+        actual_path = str(with_block.get("path", ""))
+        assert actual_path == expected_path, (
+            f"jobs.{job_name} ci-runtime-baseline upload must set with.path == {expected_path!r}, "
+            f"got: {actual_path!r}"
+        )
+        if_no_files_found = with_block.get("if-no-files-found")
+        assert if_no_files_found == "error", (
+            f"jobs.{job_name} ci-runtime-baseline upload step must set "
+            f"if-no-files-found: error, got: {if_no_files_found!r}"
+        )
+
+
+def _load_ci_workflow_lane_partition_module() -> types.ModuleType:
+    """Load the sibling `test_ci_workflow_lane_partition.py` module under a
+    distinct module name (not the one pytest's own `--import-mode=importlib`
+    collection assigns it) so this file can directly re-invoke the Issue
+    #2679 AC1 structural check function without reimplementing it, avoiding
+    a `sys.modules` name collision with pytest's own collected copy of that
+    file."""
+    spec = importlib.util.spec_from_file_location(
+        "ci2679_test_ci_workflow_lane_partition_reexport",
+        CI_WORKFLOW_LANE_PARTITION_TEST_MODULE,
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_ci_runtime_baseline_artifact_upload_is_fail_closed():
+    """Issue #2679 AC2: ci-runtime-baseline-* artifact upload (e2e-core and
+    e2e-responsive-matrix) must be if-no-files-found: error, verified by
+    structurally parsing .github/workflows/ci.yml."""
+    doc = _load_workflow()
+    _assert_ci_runtime_baseline_if_no_files_found_is_error(doc["jobs"])
+
+
+_CI_RUNTIME_BASELINE_PATH = "ci_runtime_baseline_artifacts/"
+
+
+def _fixture_jobs_with_fail_closed_ci_runtime_baseline() -> dict:
+    return {
+        "e2e-core": {
+            "steps": [
+                {
+                    "uses": "actions/upload-artifact@v7",
+                    "with": {
+                        "name": "ci-runtime-baseline-e2e-core-1",
+                        "path": _CI_RUNTIME_BASELINE_PATH,
+                        "if-no-files-found": "error",
+                    },
+                }
+            ]
+        },
+        "e2e-responsive-matrix": {
+            "steps": [
+                {
+                    "uses": "actions/upload-artifact@v7",
+                    "with": {
+                        "name": "ci-runtime-baseline-e2e-responsive-matrix-1",
+                        "path": _CI_RUNTIME_BASELINE_PATH,
+                        "if-no-files-found": "error",
+                    },
+                }
+            ]
+        },
+    }
+
+
+_REQUIRED_CI_RUNTIME_BASELINE_FIXTURE_JOBS = ("e2e-core", "e2e-responsive-matrix")
+
+
+@pytest.mark.parametrize("job_name", _REQUIRED_CI_RUNTIME_BASELINE_FIXTURE_JOBS)
+@pytest.mark.parametrize("mutation", ("delete_field", "explicit_warn"))
+def test_ci_runtime_baseline_structural_check_false_negative_on_if_no_files_found_missing_or_warn(
+    job_name, mutation
+):
+    """Issue #2679 AC3 (fix_delta P2-2, PR #2681 review comment 5747896617):
+    both an explicit `if-no-files-found: warn` AND a MISSING field entirely
+    must make the AC2 check added in this file FAIL, for BOTH e2e-core and
+    e2e-responsive-matrix (not just `e2e-core` with an explicit `warn`,
+    which was the only case previously covered). A regex `match=` ties the
+    failure to the specific mutated job, not just "any AssertionError"."""
+    jobs = copy.deepcopy(_fixture_jobs_with_fail_closed_ci_runtime_baseline())
+    with_block = jobs[job_name]["steps"][0]["with"]
+    if mutation == "delete_field":
+        del with_block["if-no-files-found"]
+    else:
+        with_block["if-no-files-found"] = "warn"
+    with pytest.raises(AssertionError, match=rf"jobs\.{re.escape(job_name)}.*if-no-files-found"):
+        _assert_ci_runtime_baseline_if_no_files_found_is_error(jobs)
+
+
+def test_ci_runtime_baseline_structural_check_false_negative_sibling_ac1_check_also_fails_closed():
+    """Issue #2679 AC3 (cross-file regression lock): the sibling
+    `test_ci_workflow_lane_partition.py` module's AC1-fixed structural check
+    must ALSO fail closed on a missing-field mutation, invoked directly (not
+    reimplemented) per Issue #2679 Notes. Per-target `warn`/missing-field
+    coverage for the sibling's own three targets lives in that file's own
+    parametrized tests (`test_provider_evidence_structural_check_false_negative_on_if_no_files_found_missing_or_warn`)
+    -- this is a light cross-file lock, not a duplicate of that coverage."""
+    sibling = _load_ci_workflow_lane_partition_module()
+    ac1_jobs = sibling._fixture_jobs_with_fail_closed_provider_evidence()
+    del ac1_jobs["e2e-core"]["steps"][0]["with"]["if-no-files-found"]
+    with pytest.raises(AssertionError):
+        sibling._assert_provider_evidence_upload_is_fail_closed(ac1_jobs)
+
+
+def test_ci_runtime_baseline_structural_check_ignores_diagnostic_artifact_with_substring_name():
+    """Issue #2679 fix_delta P2-1: an unrelated diagnostic upload-artifact
+    step whose name merely CONTAINS `ci-runtime-baseline` as a substring
+    (but does not exactly match the required literal/resolved name form)
+    must be invisible to the AC2 check added in this file -- it must NOT be
+    misidentified as the required upload, and must NOT cause the check to
+    fail even though its own `if-no-files-found` is `warn`."""
+    jobs = copy.deepcopy(_fixture_jobs_with_fail_closed_ci_runtime_baseline())
+    jobs["e2e-core"]["steps"].append(
+        {
+            "uses": "actions/upload-artifact@v7",
+            "with": {
+                "name": "debug-ci-runtime-baseline-log",
+                "if-no-files-found": "warn",
+            },
+        }
+    )
+    _assert_ci_runtime_baseline_if_no_files_found_is_error(jobs)  # must not raise
+
+
+def test_ci_runtime_baseline_structural_check_false_positive_on_comment_only_runtime_evidence_string():
+    """Issue #2679 AC4: a fixture whose steps merely contain the literal
+    string "runtime evidence" (comment-like, no real upload-artifact step
+    with if-no-files-found: error) must NOT be accepted as PASS by EITHER
+    regression test's structural check — the AC2 check added in this file,
+    and the AC1-fixed check in the sibling
+    `test_ci_workflow_lane_partition.py` file (invoked directly here, not
+    reimplemented, per Issue #2679 Notes)."""
+    comment_only_jobs = {
+        "e2e-core": {
+            "steps": [
+                {"name": "runtime evidence note for ci-runtime-baseline (comment-only, no real field)"},
+            ]
+        },
+        "e2e-responsive-matrix": {
+            "steps": [
+                {"name": "runtime evidence note for ci-runtime-baseline (comment-only, no real field)"},
+            ]
+        },
+    }
+    with pytest.raises(AssertionError):
+        _assert_ci_runtime_baseline_if_no_files_found_is_error(comment_only_jobs)
+
+    sibling = _load_ci_workflow_lane_partition_module()
+    with pytest.raises(AssertionError):
+        sibling._assert_provider_evidence_upload_is_fail_closed(comment_only_jobs)
 
 
 def test_provider_artifacts_do_not_collide_and_bind_to_head_sha_and_run_attempt():
