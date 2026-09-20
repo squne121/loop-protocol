@@ -592,6 +592,18 @@ ALLOWED_EVENT_METADATA_KEYS = frozenset(
         "approved_body_sha256",
         "merge_commit_oid",
         "merge_identity",
+        # Task-aware PreToolUse guard bounded metadata (Issue #2566 In
+        # Scope: "EventJournal には ... bounded metadata のみを記録し、
+        # message body・terminal output・full Bash command は保存しない").
+        # `task_id` (above) already carries the *source* Task; `source_task_id`
+        # is kept as an explicit alias in the allowlist so a guard event can
+        # name it directly when it is not the row's own `task_id` (never a
+        # second SSOT -- both are small scalar Task ids).
+        "transport",
+        "target_kind",
+        "source_task_id",
+        "destination_task_id",
+        "decision",
     }
 )
 _MAX_EVENT_METADATA_STRING_LEN = 200
