@@ -513,11 +513,45 @@ def test_resolve_handoff_wholly_absent_interface_legacy_lookup_finds_nothing(
         pytest.param("/some/root", None, id="root-only"),
         pytest.param(None, "/some/root/antigravity-oauth-token", id="source-only"),
         pytest.param("  ", "/some/root/antigravity-oauth-token", id="root-blank-string"),
+        # Issue #2670 fix_delta MEDIUM: one key wholly UNSET (`None`) while
+        # the other is explicitly SUPPLIED as an empty/whitespace-only
+        # string. The pre-fix_delta `_handoff_value_present()` treated an
+        # empty/whitespace supplied value the same as "unset" (simple
+        # truthiness), so BOTH of these cases were misclassified as the
+        # handoff interface being wholly absent (permitting the legacy
+        # ordinary-lookup fallback) instead of a partial, fail-closed
+        # handoff -- see `_handoff_key_present()` docstring.
+        pytest.param(None, "", id="root-unset-source-empty-string"),
+        pytest.param(None, "   ", id="root-unset-source-whitespace-only"),
+        pytest.param("", None, id="root-empty-string-source-unset"),
+        pytest.param("   ", None, id="root-whitespace-only-source-unset"),
     ],
 )
 def test_resolve_handoff_partial_is_invalid_rejected_no_fallback(
     handoff_root: "str | None", handoff_source: "str | None"
 ) -> None:
+    result = app.resolve_agy_oauth_token_source(handoff_root=handoff_root, handoff_source=handoff_source)
+    assert result.classification == app.AGY_HANDOFF_INVALID_REJECTED
+    assert result.source_path is None
+
+
+@pytest.mark.parametrize(
+    "handoff_root,handoff_source",
+    [
+        pytest.param("", "", id="both-empty-string"),
+        pytest.param("   ", "   ", id="both-whitespace-only"),
+    ],
+)
+def test_resolve_handoff_both_supplied_empty_or_whitespace_is_invalid_rejected_not_ordinary_lookup(
+    handoff_root: str, handoff_source: str
+) -> None:
+    """Issue #2670 fix_delta MEDIUM: both dedicated values being explicitly
+    SUPPLIED (even as an empty or whitespace-only string) must never be
+    misclassified as the interface being "wholly absent" -- presence is
+    identity-based (`is not None`), never content-truthiness-based. The
+    pre-fix_delta implementation would (wrongly) treat both of these cases
+    as `AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP` (permitting the legacy
+    fallback) instead of failing closed with no fallback."""
     result = app.resolve_agy_oauth_token_source(handoff_root=handoff_root, handoff_source=handoff_source)
     assert result.classification == app.AGY_HANDOFF_INVALID_REJECTED
     assert result.source_path is None

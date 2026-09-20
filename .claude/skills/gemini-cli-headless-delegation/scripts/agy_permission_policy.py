@@ -686,8 +686,26 @@ class AgyOauthTokenHandoffResult:
     source_path: "Path | None" = None
 
 
-def _handoff_value_present(raw: "str | None") -> bool:
-    return bool(raw and raw.strip())
+def _handoff_key_present(raw: "str | None") -> bool:
+    """True iff the underlying env var / caller-supplied value was actually
+    supplied AT ALL (Issue #2670 fix_delta MEDIUM) -- distinct from whether
+    its normalized content happens to be well-formed or even non-empty.
+
+    `None` means the key itself is wholly unset (never supplied); any other
+    value -- including `""` or a whitespace-only string -- means the caller
+    DID supply this key. The prior `_handoff_value_present()` implementation
+    (`bool(raw and raw.strip())`) conflated these two distinct states: a key
+    explicitly supplied as an empty/whitespace string was misclassified as
+    "not present", so a case such as (root UNSET, source explicitly set to
+    `""`) fell through to `not root_present and not source_present` and was
+    (wrongly) treated as the handoff interface being wholly absent
+    (`AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP`, permitting the legacy
+    fallback) instead of failing closed as a partial/malformed handoff
+    (`AGY_HANDOFF_INVALID_REJECTED`, no fallback). Presence must be
+    determined by identity (`is not None`) only; the downstream
+    structural/path validation below is what actually rejects malformed
+    supplied content."""
+    return raw is not None
 
 
 def resolve_agy_oauth_token_source(
@@ -705,13 +723,24 @@ def resolve_agy_oauth_token_source(
     of the two supplied values -- it never enumerates alternate candidates
     or backends:
 
-    1. Both values absent (unset or empty) -> the handoff interface is
-       wholly absent; the pre-existing ordinary `os.environ["HOME"]` lookup
-       is permitted (`AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP`), whether or
-       not it actually finds a file.
-    2. Exactly one of the two values present -> a partial handoff;
-       fail-closed with no fallback (`AGY_HANDOFF_INVALID_REJECTED`).
-    3. Both values present -> normalize both, derive the sole candidate by
+    1. Both values wholly UNSET (the env var / caller-supplied kwarg is
+       literally absent, i.e. `None` -- never merely empty/whitespace) ->
+       the handoff interface is wholly absent; the pre-existing ordinary
+       `os.environ["HOME"]` lookup is permitted
+       (`AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP`), whether or not it
+       actually finds a file.
+    2. Exactly one of the two values is present (supplied at all -- an
+       explicitly empty-string or whitespace-only supplied value still
+       counts as "present" here, never as "absent") while the other is
+       wholly unset -> a partial handoff; fail-closed with no fallback
+       (`AGY_HANDOFF_INVALID_REJECTED`). Issue #2670 fix_delta MEDIUM:
+       presence is determined by whether the value was supplied AT ALL
+       (`is not None`, see `_handoff_key_present()`), never by whether its
+       trimmed content happens to be non-empty -- a caller supplying one
+       key as an empty/whitespace string is a malformed partial handoff,
+       not equivalent to that key being unset.
+    3. Both values are present (supplied at all, per the same
+       `is not None` presence check) -> normalize both, derive the sole candidate by
        joining the normalized root with the exact filename
        `antigravity-oauth-token`, and require exact equality with the
        normalized supplied source. A non-absolute value or an inequality is
@@ -732,8 +761,8 @@ def resolve_agy_oauth_token_source(
     raw_root = handoff_root if handoff_root is not None else os.environ.get(AGY_OAUTH_TOKEN_HANDOFF_ROOT_ENV)
     raw_source = handoff_source if handoff_source is not None else os.environ.get(AGY_OAUTH_TOKEN_HANDOFF_SOURCE_ENV)
 
-    root_present = _handoff_value_present(raw_root)
-    source_present = _handoff_value_present(raw_source)
+    root_present = _handoff_key_present(raw_root)
+    source_present = _handoff_key_present(raw_source)
 
     if not root_present and not source_present:
         return AgyOauthTokenHandoffResult(

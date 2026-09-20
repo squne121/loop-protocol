@@ -230,14 +230,18 @@ if "auto-mode" in argv:
 if argv and argv[0] == "--strict-mcp-config":
     dump_path = os.environ.get("FAKE_CLAUDE_ENV_DUMP_PATH")
     if dump_path:
-        observed = {
-            name: (os.environ[name] if name in os.environ else None)
-            for name in (
-                "HOME",
-                "AGY_OAUTH_TOKEN_HANDOFF_ROOT",
-                "AGY_OAUTH_TOKEN_HANDOFF_SOURCE",
-            )
-        }
+        observed = {"HOME": os.environ.get("HOME")}
+        # Issue #2670 fix_delta LOW: enumerate the REAL environment's own
+        # AGY_OAUTH_TOKEN_HANDOFF-prefixed key set -- never a hardcoded list
+        # of just the two currently-known names -- so this dump (and
+        # therefore test_handoff_interface_carries_exactly_two_dedicated_values
+        # below) would actually observe, and fail on, a THIRD dedicated
+        # handoff variable being added to the launcher later. No
+        # unnecessary environment dumping/secret logging -- only this one
+        # documented, non-secret path-variable prefix is scanned.
+        for name, value in os.environ.items():
+            if name.startswith("AGY_OAUTH_TOKEN_HANDOFF"):
+                observed[name] = value
         with open(dump_path, "w", encoding="utf-8") as fh:
             json.dump(observed, fh)
     sys.exit(0)
@@ -380,7 +384,14 @@ def test_handoff_interface_carries_exactly_two_dedicated_values(tmp_path):
     """GIVEN the child process environment dump captured above
     WHEN filtering for any env var name containing `AGY_OAUTH_TOKEN_HANDOFF`
     THEN exactly the two dedicated names exist -- no third value, no
-    generic/broader-scoped variant is introduced by this handoff."""
+    generic/broader-scoped variant is introduced by this handoff.
+
+    Issue #2670 fix_delta LOW: the fake child (`_FAKE_CLAUDE_ENV_PROBE_SOURCE`
+    above) enumerates the REAL environment's own `AGY_OAUTH_TOKEN_HANDOFF`-
+    prefixed key set, not a hardcoded list of these two known names -- so
+    this test is self-sufficient: it would fail if a third dedicated
+    handoff variable were added to the launcher later, rather than being
+    structurally unable to observe one."""
     real_home = tmp_path / "real-home-exactness-check"
     token_dir = real_home / ".gemini" / ANTIGRAVITY_CLI_DIRNAME
     token_dir.mkdir(parents=True)
