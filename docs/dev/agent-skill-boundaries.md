@@ -1512,6 +1512,16 @@ executor は各 command id の `env_sanitize` に列挙された環境変数を�
 （共通: `PYTHONPATH`, `PYTHONHOME`, `GH_EDITOR`, `EDITOR`, `VISUAL`, `BROWSER`,
 `GH_HOST`, `GH_REPO`, `GH_CONFIG_DIR`, `GH_DEBUG`, `DEBUG`, `GH_TOKEN`, `GITHUB_TOKEN`）。
 
+これは `controlled_skill_mutation_policy.py` の generic/default sanitization boundary
+であり、全 command id に無条件適用されるわけではない。issue-metadata read/write
+helper（`_build_metadata_sanitized_env()`）と `issue_relationship.update`
+（`_relationship_gh_env()`）は、下記「環境サニタイズ境界（Issue #2665）」で説明する
+lane-specific な credential-carrier-preserving boundary を優先して使用し、
+`GH_TOKEN`/`GITHUB_TOKEN`/`GH_CONFIG_DIR` を無条件除去しない（#2299 / PR #2303 /
+#2665）。`issue_dependency.remove` の higher-trust sanitizer
+（`_build_issue_dependency_remove_gh_env()`）は本節の generic boundary と同様
+`GH_CONFIG_DIR` を無条件除去する、別 lane の境界として維持される。
+
 ### Idempotency（AC13、冪等性）
 
 各 command id の `idempotency.marker_file_pattern` で定義された local marker file が存在し、

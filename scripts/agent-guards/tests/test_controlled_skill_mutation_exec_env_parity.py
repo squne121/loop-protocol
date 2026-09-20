@@ -255,9 +255,13 @@ def test_edit_issue_txn_fetch_issue_uses_sanitized_env(monkeypatch):
 # =============================================================================
 
 
+_RELATIONSHIP_CREDENTIAL_CARRIER_KEYS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR")
+
+
 @pytest.mark.parametrize(
     "ambient_setup",
     [
+        pytest.param(lambda mp: None, id="zero_carriers"),
         pytest.param(
             lambda mp: mp.setenv("GH_CONFIG_DIR", "/fake/native/gh/config"),
             id="config_only",
@@ -275,7 +279,17 @@ def test_relationship_gh_env_preserves_present_carriers_only_and_strips_noise(mo
     `_relationship_gh_env()` builds the env for the issue_relationship.update
     route, THEN every carrier that IS present survives verbatim, no carrier
     that is ABSENT is synthesized, and noise/redirection keys are stripped
-    (AC1 / AC4 config-only / single-carrier / multi-carrier coverage)."""
+    (AC1 / AC4 config-only / single-carrier / multi-carrier coverage).
+
+    #2682 review P1: each parametrized case must delete the OTHER carriers
+    first -- otherwise "config_only" etc. only add a carrier on top of
+    whatever the ambient pytest launcher environment already carries (e.g. a
+    real GH_TOKEN), and the "single carrier" claim is never actually
+    exercised. The explicit `zero_carriers` case below directly pins "no
+    carrier is synthesized when none are present" without relying on the
+    absence of an unrelated ambient variable."""
+    for key in _RELATIONSHIP_CREDENTIAL_CARRIER_KEYS:
+        monkeypatch.delenv(key, raising=False)
     ambient_setup(monkeypatch)
 
     env = _exec._relationship_gh_env()
