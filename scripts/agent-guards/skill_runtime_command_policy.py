@@ -286,6 +286,38 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
             ],
             "network_effect": "github_mutation",
         },
+        # Issue #1975: read-only owner-reaction reader / stable-user-id
+        # principal resolver / drift checker / selection resolver, bound
+        # directly to `owner_reaction_decision.py`. This is a policy
+        # DECLARATION only -- it is not, and does not need to be, one of
+        # `skill_runtime_exec.py`'s hardcoded per-command_id dispatch
+        # branches (that generic-dispatch wiring is explicitly Out of
+        # Scope for this Issue, the same posture as `scope_rollup.run`
+        # below). No `ExactSkillRuntimeCommand` field / exact-match parser
+        # is added for this command_id, and it is deliberately NOT added
+        # to `ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS` -- neither is required
+        # by Issue #1975 AC7's scope ("registry entry rendering -> real
+        # CLI subprocess launch -> root reads the structured result"), and
+        # `local_main_branch_guard.py` (the hook that consumes root-no-
+        # worktree eligibility) is outside this Issue's Allowed Paths.
+        "owner_reaction.decide": {
+            "execution_class": "exact_owner_reaction_decide",
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [],
+            "network_effect": "github_read_only",
+        },
+        # Issue #1975 AC7: test-only sibling for the SAME real CLI
+        # subprocess run offline via `--gh-fixture-file` (mirrors the
+        # `preflight.run.fixture` precedent above). Production
+        # `owner_reaction.decide` is entirely unaffected by this entry.
+        "owner_reaction.decide.fixture": {
+            "execution_class": "exact_owner_reaction_decide_fixture",
+            "required_cwd": "canonical_main_root",
+            "required_branch": "default_branch",
+            "allowed_write_roots": [],
+            "network_effect": "local_only",
+        },
     },
 }
 
