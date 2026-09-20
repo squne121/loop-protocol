@@ -31,6 +31,11 @@ def test_given_project_settings_when_read_then_cross_session_inbound_never_fixed
 
 
 def test_given_project_settings_when_read_then_pre_tool_use_guard_wired_with_narrow_matchers():
+    # `scripts/check_hook_boundaries.py` enforces a single settings.json
+    # registration per (handler_id, event) -- `hook_entry.py` can only be
+    # wired into `PreToolUse` once, so the SendMessage and Herdr-Bash
+    # concerns share one entry with a combined (still narrow, not a
+    # catch-all like `Bash|Read|Write|Edit|Grep|Glob|MultiEdit`) matcher.
     settings = json.loads(_SETTINGS_PATH.read_text())
     pre_tool_use = settings["hooks"]["PreToolUse"]
     matchers_to_hook_entry = {
@@ -41,8 +46,15 @@ def test_given_project_settings_when_read_then_pre_tool_use_guard_wired_with_nar
             for hook in entry.get("hooks", [])
         )
     }
-    assert "SendMessage" in matchers_to_hook_entry, "Issue #2566: SendMessage guard must use a narrow matcher"
-    assert "Bash" in matchers_to_hook_entry, "Issue #2566: Herdr guard must use the Bash matcher"
+    assert len(matchers_to_hook_entry) == 1, (
+        f"Issue #2566: hook_entry.py must be wired into PreToolUse exactly once "
+        f"(check_hook_boundaries.py duplicate-key constraint), got {matchers_to_hook_entry!r}"
+    )
+    (matcher,) = matchers_to_hook_entry
+    matcher_tools = set(matcher.split("|"))
+    assert matcher_tools == {"SendMessage", "Bash"}, (
+        f"Issue #2566: SendMessage/Herdr guard must use a narrow combined matcher, got {matcher!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
