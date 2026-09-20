@@ -105,6 +105,43 @@ preflight_agy = _load_module(_PREFLIGHT_AGY_PATH, "preflight_agy")
 agy_permission_policy = _load_module(_AGY_PERMISSION_POLICY_PATH, "agy_permission_policy_stage2_handoff")
 
 
+def _real_agy_permission_policy_module() -> types.ModuleType:
+    """Return the SAME `agy_permission_policy` module object that
+    `run_gemini_headless.py`'s own `import agy_permission_policy as
+    _agy_permission_policy` (top of that file, Issue #1705) resolves to at
+    the moment `run_canonical_delegation_route_probe()` (below) reloads
+    `run_gemini_headless.py`.
+
+    Deliberately NOT the same object as this file's own `agy_permission_policy`
+    (loaded above under the distinct synthetic name
+    `agy_permission_policy_stage2_handoff` purely for this file's own
+    independent classification check) -- `run_gemini_headless.py` uses a
+    real, path-based `import agy_permission_policy` (it inserts its own
+    `scripts/` directory onto `sys.path`, see that file's Issue #1705
+    comment), which Python caches under the plain module name
+    `"agy_permission_policy"` in `sys.modules`. Reproducing that exact
+    bootstrap here (idempotent -- `sys.path.insert` is a no-op if already
+    present, and a repeat `import` of an already-cached name is a cheap
+    `sys.modules` lookup, never a re-exec) guarantees
+    `_pin_agy_bwrap_available_for_canonical_route_probe()` below patches the
+    identical module object `_run_agy()`'s
+    `agy_permission_policy.materialize_isolated_agy_workspace()` call
+    actually consults, regardless of what other test files in a full-suite
+    run may have already claimed that same `sys.modules` slot with their own
+    `importlib.util.spec_from_file_location("agy_permission_policy", ...)`
+    load (several sibling test files -- e.g.
+    `test_agy_permission_policy_oauth_token.py` -- intentionally reuse this
+    exact plain name; see that file's `_force_bwrap_available` fixture,
+    which this mirrors)."""
+    scripts_dir = _AGY_PERMISSION_POLICY_PATH.parent
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    # `import importlib.util` above already binds the `importlib` package
+    # name itself, so `importlib.import_module` is reachable without a
+    # separate `import importlib` statement.
+    return importlib.import_module("agy_permission_policy")
+
+
 @pytest.fixture(autouse=True)
 def _clear_agy_oauth_token_handoff_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Issue #2670: keep this file's pre-existing (#2616) tests deterministic
@@ -115,6 +152,38 @@ def _clear_agy_oauth_token_handoff_env(monkeypatch: pytest.MonkeyPatch) -> None:
     `test_agy_permission_policy_readonly_boundary.py`)."""
     monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", raising=False)
     monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _pin_agy_bwrap_available_for_canonical_route_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2670 (live-CI regression fix_delta): `run_canonical_delegation_route_probe()`'s
+    hermetic tests below (Issue #2616 fix_delta P1-1 / Issue #2670 AC5) route
+    through the REAL `run_gemini_headless.py::run_delegation()` ->
+    `_run_agy()` -> `agy_permission_policy.materialize_isolated_agy_workspace()`
+    call chain. That function fail-closes with `AgyReadOnlyBoundaryError`
+    (Issue #1779 AC7, caught by `run_delegation()`'s generic
+    `except Exception` and reclassified as the opaque
+    `failure_class: agy_unexpected_error`) for the `no_tools` profile
+    whenever the resolved AGY OAuth token handoff source exists AND the real
+    host has no `bwrap` binary on `PATH` -- exactly the case
+    `test_run_canonical_delegation_route_probe_passes_when_canonical_route_succeeds`
+    below constructs (a validated handoff source via `_set_validated_handoff_env()`).
+    A live GitHub Actions run (`python-test-core`, full parallel suite)
+    observed this exact `agy_unexpected_error` / `AgyReadOnlyBoundaryError`
+    failure even though the identical test passes when this file runs in
+    isolation on a host that happens to already have `bwrap` installed --
+    i.e. this test's PASS was accidentally contingent on live host `bwrap`
+    availability, not on the handoff-selection / canonical-route behavior it
+    actually exists to verify (Issue #1779 AC7's own selection logic is
+    covered independently, and deterministically, by
+    `test_agy_permission_policy_readonly_boundary.py`; `bwrap`'s
+    presence/absence is never guaranteed in CI -- see that file's Stop
+    Conditions note and `test_agy_permission_policy_oauth_token.py`'s
+    identical `_force_bwrap_available` fixture, which this mirrors for the
+    real, standard-imported `agy_permission_policy` module `_run_agy()`
+    itself consults, not this file's own separately-loaded
+    `agy_permission_policy_stage2_handoff` copy)."""
+    monkeypatch.setattr(_real_agy_permission_policy_module(), "_bwrap_available", lambda: True)
 
 
 def _write_runtime_verification_log(
