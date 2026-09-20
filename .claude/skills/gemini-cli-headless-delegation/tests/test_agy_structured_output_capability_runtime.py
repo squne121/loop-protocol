@@ -65,6 +65,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import types
 from datetime import datetime, timezone
@@ -75,6 +76,7 @@ import pytest
 
 
 _PREFLIGHT_AGY_PATH = Path(__file__).resolve().parents[1] / "scripts" / "preflight_agy.py"
+_AGY_PERMISSION_POLICY_PATH = Path(__file__).resolve().parents[1] / "scripts" / "agy_permission_policy.py"
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _ARTIFACTS_DIR = _REPO_ROOT / "artifacts"
 
@@ -84,11 +86,35 @@ def _load_module(path: Path, name: str) -> types.ModuleType:
     assert spec is not None
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    # dataclass()'s postponed-annotation resolution needs sys.modules[__module__]
+    # registered before exec (agy_permission_policy.py uses `@dataclass` under
+    # `from __future__ import annotations` -- Issue #2670).
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
 
 
 preflight_agy = _load_module(_PREFLIGHT_AGY_PATH, "preflight_agy")
+# Issue #2670: independently resolves the same closed handoff-selection
+# classification `materialize_isolated_agy_workspace()` (invoked inside
+# `run_delegation()` below) computed for THIS exact invocation -- both are
+# pure functions of the same `AGY_OAUTH_TOKEN_HANDOFF_ROOT` /
+# `_SOURCE` env vars and filesystem state, so they always agree without this
+# verifier needing to modify `run_gemini_headless.py` (Out of Scope) to
+# thread the classification through its own return value.
+agy_permission_policy = _load_module(_AGY_PERMISSION_POLICY_PATH, "agy_permission_policy_stage2_handoff")
+
+
+@pytest.fixture(autouse=True)
+def _clear_agy_oauth_token_handoff_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2670: keep this file's pre-existing (#2616) tests deterministic
+    regardless of ambient host state -- clears both dedicated handoff env
+    vars for every test; the dedicated Issue #2670 tests below set them
+    explicitly per case (mirrors the identical fixture in
+    `test_agy_permission_policy_oauth_token.py` /
+    `test_agy_permission_policy_readonly_boundary.py`)."""
+    monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", raising=False)
+    monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", raising=False)
 
 
 def _write_runtime_verification_log(
@@ -269,6 +295,100 @@ def _write_stage2_runtime_verification_log(
     ]
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return log_path
+
+
+# ---------------------------------------------------------------------------
+# Issue #2670 AC5/AC6: dedicated sanitized handoff-selection summary
+# artifact. The AC5 verifier (`run_canonical_delegation_route_probe()`
+# below) consumes the canonical policy/route's closed sanitized
+# handoff-selection classification (`agy_permission_policy.
+# resolve_agy_oauth_token_source()`) and writes this artifact. Allowlist-only
+# payload -- see module docstring; never raw stdout/stderr/response/
+# root/path/credential/account/token/HOME/XDG values.
+# ---------------------------------------------------------------------------
+
+_AC5_HANDOFF_SUMMARY_ALLOWED_KEYS = frozenset(
+    {
+        "schema",
+        "ac",
+        "route",
+        "caller_context",
+        "timestamp_utc",
+        "executed_command",
+        "binary_identity",
+        "verdict",
+        "reason_code",
+        "exit_status",
+        "artifact_path",
+        "canonical_result_classification",
+        "handoff_classification",
+        "launch_provenance_source_check",
+    }
+)
+
+
+def _write_ac5_handoff_summary_artifact(
+    *,
+    caller_context: str,
+    executed_command: "list[str]",
+    binary_identity: "dict[str, object] | None",
+    verdict: str,
+    reason_code: str,
+    exit_status: int,
+    canonical_result_classification: "dict[str, str] | None",
+    handoff_classification: "str | None",
+    launch_provenance_source_check: "dict[str, object] | None" = None,
+) -> Path:
+    """Issue #2670 AC5/AC6: write the dedicated sanitized handoff-selection
+    summary artifact.
+
+    Allowlist-only payload -- `executed_command`/`binary_identity` never
+    contain secret content (argv literals + realpath/sha256/version, matching
+    this file's pre-existing evidence posture), `handoff_classification` is
+    always one of the closed four labels
+    (`agy_permission_policy.AGY_HANDOFF_CLASSIFICATIONS`) and never a
+    root/path/token/credential value itself, and this function never accepts
+    (or therefore ever writes) a raw stdout/stderr/response/root/path/
+    credential/account/token/HOME/XDG value -- there is no parameter for any
+    of those.
+    """
+    if handoff_classification is not None:
+        assert handoff_classification in agy_permission_policy.AGY_HANDOFF_CLASSIFICATIONS, handoff_classification
+    _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ac_suffix = _CALLER_CONTEXT_AC_SUFFIX.get(caller_context, "")
+    artifact_path = _ARTIFACTS_DIR / f"runtime-verification-AC5-AC6-handoff-{ac_suffix or 'na'}-{timestamp}.log"
+    payload = {
+        "schema": "agy_oauth_token_handoff_summary/v1",
+        "ac": "AC5/AC6",
+        "route": "canonical_delegation",
+        "caller_context": caller_context,
+        "timestamp_utc": timestamp,
+        "executed_command": list(executed_command),
+        "binary_identity": binary_identity,
+        "verdict": verdict,
+        "reason_code": reason_code,
+        "exit_status": exit_status,
+        "artifact_path": str(artifact_path.relative_to(_REPO_ROOT)),
+        "canonical_result_classification": canonical_result_classification,
+        "handoff_classification": handoff_classification,
+        "launch_provenance_source_check": launch_provenance_source_check,
+    }
+    assert set(payload) <= _AC5_HANDOFF_SUMMARY_ALLOWED_KEYS, set(payload) - _AC5_HANDOFF_SUMMARY_ALLOWED_KEYS
+    lines = [
+        "=== AGY OAuth Token Handoff Summary Artifact (Issue #2670 AC5/AC6) ===",
+        f"Timestamp: {timestamp}",
+        "",
+        "--- Output (allowlist-only -- no raw stdout/stderr/response/root/path/"
+        "credential/account/token/HOME/XDG content) ---",
+        json.dumps(payload, indent=2, sort_keys=True),
+        "",
+        "--- Verdict ---",
+        f"Result: {verdict}",
+        f"Reason: {reason_code}",
+    ]
+    artifact_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return artifact_path
 
 
 def _stage2_skip(*, reason_code: str, caller_context: "str | None", **extra: object) -> int:
@@ -528,9 +648,12 @@ def _load_run_gemini_headless_module() -> types.ModuleType:
     return _load_module(_RUN_GEMINI_HEADLESS_PATH, "run_gemini_headless_stage2_canonical_route")
 
 
-def _classify_canonical_delegation_route_result(result: dict[str, Any]) -> "dict[str, str]":
+def _classify_canonical_delegation_route_result(
+    result: dict[str, Any], handoff_classification: str
+) -> "dict[str, str]":
     """Classify a `run_delegation()` normalized result for Issue #2616
-    AC8/AC9 (Issue #2616 fix_delta P1-1).
+    AC8/AC9 (Issue #2616 fix_delta P1-1), gated by Issue #2670 AC5's closed
+    sanitized handoff-selection classification.
 
     Never inspects raw stdout/stderr/response TEXT content -- only the
     normalized `ok`/`failure_class`/`response_text` (presence-only, never
@@ -541,6 +664,14 @@ def _classify_canonical_delegation_route_result(result: dict[str, Any]) -> "dict
     signal treated as `account_session_unavailable` SKIP -- every other
     non-`ok` result is FAIL, and this function never promotes a SKIP to
     PASS.
+
+    Issue #2670 AC5: an otherwise-PASS-shaped result (`ok is True` with a
+    non-empty `response_text`) is PASS-eligible ONLY when
+    *handoff_classification* is exactly
+    `agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED` -- the other
+    three closed classifications (`invalid_handoff_rejected` /
+    `source_absent` / `no_handoff_ordinary_lookup`) are SKIP/incomplete even
+    when the sentinel matches, never promoted to PASS.
     """
     if not isinstance(result, dict):
         return {"verdict": "FAIL", "reason_code": "canonical_delegation_route_result_malformed"}
@@ -550,6 +681,11 @@ def _classify_canonical_delegation_route_result(result: dict[str, Any]) -> "dict
             return {
                 "verdict": "FAIL",
                 "reason_code": "canonical_delegation_route_ok_without_response_text",
+            }
+        if handoff_classification != agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED:
+            return {
+                "verdict": "SKIP",
+                "reason_code": f"handoff_classification_not_validated:{handoff_classification}",
             }
         return {"verdict": "PASS", "reason_code": "canonical_delegation_route_success"}
     failure_class = result.get("failure_class")
@@ -596,7 +732,18 @@ def run_canonical_delegation_route_probe(caller_context: str) -> int:
         "timeout_sec": preflight_agy.RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS,
     }
     result = run_gemini_headless.run_delegation(request)
-    classification = _classify_canonical_delegation_route_result(result)
+    # Issue #2670 AC5: independently resolve the SAME closed sanitized
+    # handoff-selection classification `materialize_isolated_agy_workspace()`
+    # (invoked inside `run_delegation()` above, via its own separately
+    # module-loaded `agy_permission_policy`) computed for this exact
+    # invocation -- both are pure functions of the same
+    # `AGY_OAUTH_TOKEN_HANDOFF_ROOT` / `_SOURCE` env vars and filesystem
+    # state, so they always agree without requiring any change to
+    # `run_gemini_headless.py` (Out of Scope; not an Allowed Path).
+    handoff_result = agy_permission_policy.resolve_agy_oauth_token_source()
+    classification = _classify_canonical_delegation_route_result(result, handoff_result.classification)
+    exit_status = 77 if classification["verdict"] == "SKIP" else (0 if classification["verdict"] == "PASS" else 1)
+    executed_command = [sys.executable] + sys.argv
 
     _write_stage2_runtime_verification_log(
         verdict=classification["verdict"],
@@ -606,6 +753,20 @@ def run_canonical_delegation_route_probe(caller_context: str) -> int:
         stage1_status=None,
         primary_classification=classification,
         secondary_classification=None,
+    )
+    # Issue #2670 AC5/AC6: the dedicated sanitized handoff-selection summary
+    # artifact -- allowlist-only, never raw stdout/stderr/response/root/
+    # path/credential/account/token/HOME/XDG content (see
+    # `_write_ac5_handoff_summary_artifact()` docstring).
+    _write_ac5_handoff_summary_artifact(
+        caller_context=caller_context,
+        executed_command=executed_command,
+        binary_identity=binary_identity,
+        verdict=classification["verdict"],
+        reason_code=classification["reason_code"],
+        exit_status=exit_status,
+        canonical_result_classification=classification,
+        handoff_classification=handoff_result.classification,
     )
 
     if classification["verdict"] == "SKIP":
@@ -621,6 +782,7 @@ def run_canonical_delegation_route_probe(caller_context: str) -> int:
         "verdict": classification["verdict"],
         "reason_code": classification["reason_code"],
         "binary_identity": binary_identity,
+        "handoff_classification": handoff_result.classification,
     }
     print(json.dumps(result_payload, indent=2, sort_keys=True))
     return 0 if classification["verdict"] == "PASS" else 1
@@ -717,7 +879,8 @@ def test_stage2_binary_identity_unchanged_missing_path_is_mismatch(tmp_path: Pat
 
 def test_classify_canonical_delegation_route_result_pass_requires_ok_and_response_text() -> None:
     verdict = _classify_canonical_delegation_route_result(
-        {"ok": True, "failure_class": None, "response_text": "LOOP_AGY_STAGE2_RUNTIME_OK"}
+        {"ok": True, "failure_class": None, "response_text": "LOOP_AGY_STAGE2_RUNTIME_OK"},
+        agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED,
     )
     assert verdict == {"verdict": "PASS", "reason_code": "canonical_delegation_route_success"}
 
@@ -727,7 +890,10 @@ def test_classify_canonical_delegation_route_result_ok_without_response_text_is_
     evidence (Issue #2616 fix_delta P1-1 -- classification is scoped to the
     normalized fields `run_delegation()` computed, but a structurally
     incoherent `ok: True` with nothing to show for it still fails closed)."""
-    verdict = _classify_canonical_delegation_route_result({"ok": True, "failure_class": None, "response_text": None})
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": True, "failure_class": None, "response_text": None},
+        agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED,
+    )
     assert verdict["verdict"] == "FAIL"
     assert verdict["reason_code"] == "canonical_delegation_route_ok_without_response_text"
 
@@ -738,18 +904,53 @@ def test_classify_canonical_delegation_route_result_auth_required_is_skip() -> N
     tool-profile isolation (Issue #1705) redirects HOME away from the real
     account session -- is an honest SKIP, never promoted to PASS."""
     verdict = _classify_canonical_delegation_route_result(
-        {"ok": False, "failure_class": "agy_auth_required", "response_text": None}
+        {"ok": False, "failure_class": "agy_auth_required", "response_text": None},
+        agy_permission_policy.AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP,
     )
     assert verdict == {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
 
 
 def test_classify_canonical_delegation_route_result_other_failure_is_fail() -> None:
     verdict = _classify_canonical_delegation_route_result(
-        {"ok": False, "failure_class": "agy_exit_nonzero", "response_text": None}
+        {"ok": False, "failure_class": "agy_exit_nonzero", "response_text": None},
+        agy_permission_policy.AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP,
     )
     assert verdict == {
         "verdict": "FAIL",
         "reason_code": "canonical_delegation_route_failure:agy_exit_nonzero",
+    }
+
+
+# --- Issue #2670 AC5: PASS requires BOTH the ok/response_text shape AND the
+#     closed handoff-selection classification to be exactly
+#     `validated_handoff_selected` -- the other three classifications are
+#     SKIP/incomplete even when the sentinel matches. ------------------------
+
+
+@pytest.mark.parametrize(
+    "handoff_classification",
+    [
+        pytest.param(
+            "invalid_handoff_rejected",
+            id="invalid_handoff_rejected",
+        ),
+        pytest.param("source_absent", id="source_absent"),
+        pytest.param(
+            "no_handoff_ordinary_lookup",
+            id="no_handoff_ordinary_lookup",
+        ),
+    ],
+)
+def test_classify_canonical_delegation_route_result_skips_when_handoff_not_validated_even_with_matching_sentinel(
+    handoff_classification: str,
+) -> None:
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": True, "failure_class": None, "response_text": "LOOP_AGY_STAGE2_RUNTIME_OK"},
+        handoff_classification,
+    )
+    assert verdict == {
+        "verdict": "SKIP",
+        "reason_code": f"handoff_classification_not_validated:{handoff_classification}",
     }
 
 
@@ -784,14 +985,28 @@ def test_run_canonical_delegation_route_probe_fails_when_canonical_route_returns
     assert exit_code == 1
 
 
+def _set_validated_handoff_env(tmp_path: Path, monkeypatch: Any) -> None:
+    """Issue #2670: set up a validated launcher handoff (dummy fixture --
+    never a real credential) so `resolve_agy_oauth_token_source()` resolves
+    to `AGY_HANDOFF_VALIDATED_SELECTED` for the duration of a test."""
+    root = tmp_path / "handoff-root-stage2"
+    root.mkdir(parents=True, exist_ok=True)
+    source = root / "antigravity-oauth-token"
+    source.write_text("dummy-fixture-token-value-stage2", encoding="utf-8")
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", str(root))
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", str(source))
+
+
 def test_run_canonical_delegation_route_probe_passes_when_canonical_route_succeeds(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     """The positive counterpart to the two FAIL cases above: when the
-    canonical route's own `agy` child process genuinely succeeds, the
-    probe reaches PASS -- demonstrating the verifier's PASS is actually
-    contingent on `run_delegation()`'s real outcome, not independent of it
-    (Issue #2616 fix_delta P1-1)."""
+    canonical route's own `agy` child process genuinely succeeds AND a
+    validated launcher handoff is present, the probe reaches PASS --
+    demonstrating the verifier's PASS is actually contingent on
+    `run_delegation()`'s real outcome (Issue #2616 fix_delta P1-1) AND the
+    closed handoff-selection classification (Issue #2670 AC5), not
+    independent of either."""
     fake_agy = _write_fake_agy(
         tmp_path,
         "agy-success",
@@ -799,10 +1014,114 @@ def test_run_canonical_delegation_route_probe_passes_when_canonical_route_succee
     )
     monkeypatch.setenv("AGY_BIN", str(fake_agy))
     monkeypatch.chdir(tmp_path)
+    _set_validated_handoff_env(tmp_path, monkeypatch)
 
     exit_code = run_canonical_delegation_route_probe("claude-code")
 
     assert exit_code == 0
+
+
+def test_run_canonical_delegation_route_probe_skips_when_handoff_not_validated_even_with_matching_sentinel(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Issue #2670 AC5: the exact same successful `agy` child process
+    (matching sentinel, exit 0) as the PASS test above, but WITHOUT a
+    validated handoff (no dedicated handoff env vars set, and the ambient
+    `HOME` ordinary-lookup fixture has no real source either) -- this must
+    SKIP (`no_handoff_ordinary_lookup`), never PASS, proving the probe's
+    PASS is genuinely contingent on the handoff classification and not just
+    the sentinel match."""
+    fake_agy = _write_fake_agy(
+        tmp_path,
+        "agy-success-no-handoff",
+        f"printf '%s\\n' '{preflight_agy.RUNTIME_VERIFICATION_SENTINEL_PROMPT}'\nexit 0\n",
+    )
+    monkeypatch.setenv("AGY_BIN", str(fake_agy))
+    monkeypatch.chdir(tmp_path)
+    # Force the ordinary-lookup ambient HOME to a source-free fixture so this
+    # test is deterministic regardless of the actual host's real $HOME state.
+    ordinary_home = tmp_path / "ordinary-home-no-real-token"
+    ordinary_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(ordinary_home))
+
+    exit_code = run_canonical_delegation_route_probe("claude-code")
+
+    assert exit_code == 77
+
+
+# --- Issue #2670 AC6: the dedicated sanitized handoff-selection summary
+#     artifact writer. ---------------------------------------------------
+
+
+def test_write_ac5_handoff_summary_artifact_payload_is_allowlist_only(tmp_path: Path) -> None:
+    # Writes under the real repo-root `artifacts/` dir (worktree-local,
+    # untracked -- `.gitignore` excludes it), matching this file's
+    # pre-existing evidence-writer test convention (e.g.
+    # `test_structured_output_capability_runtime_probe_same_binary_evidence`).
+    artifact_path = _write_ac5_handoff_summary_artifact(
+        caller_context="claude-gpt",
+        executed_command=[sys.executable, "-m", "pytest", "--stage2-model-backed", "--caller-context", "claude-gpt"],
+        binary_identity={"realpath": str(tmp_path / "fake-agy"), "sha256": "deadbeef", "size": 123},
+        verdict="PASS",
+        reason_code="canonical_delegation_route_success",
+        exit_status=0,
+        canonical_result_classification={"verdict": "PASS", "reason_code": "canonical_delegation_route_success"},
+        handoff_classification=agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED,
+    )
+    assert artifact_path.exists()
+    content = artifact_path.read_text(encoding="utf-8")
+    output_marker = "content) ---\n"
+    verdict_marker = "\n\n--- Verdict ---"
+    start = content.index(output_marker) + len(output_marker)
+    end = content.index(verdict_marker)
+    payload = json.loads(content[start:end])
+    assert set(payload) <= _AC5_HANDOFF_SUMMARY_ALLOWED_KEYS
+    assert payload["handoff_classification"] == "validated_handoff_selected"
+    assert payload["verdict"] == "PASS"
+    assert payload["exit_status"] == 0
+    assert payload["artifact_path"] == str(artifact_path.relative_to(_REPO_ROOT))
+
+
+def test_write_ac5_handoff_summary_artifact_rejects_unknown_handoff_classification() -> None:
+    """Fail-closed guard: an out-of-vocabulary handoff_classification value
+    (a bug, never a real production value -- `resolve_agy_oauth_token_source()`
+    only ever returns one of the closed four) must raise, not silently write
+    a corrupted artifact."""
+    with pytest.raises(AssertionError):
+        _write_ac5_handoff_summary_artifact(
+            caller_context="claude-gpt",
+            executed_command=["fake"],
+            binary_identity=None,
+            verdict="PASS",
+            reason_code="x",
+            exit_status=0,
+            canonical_result_classification=None,
+            handoff_classification="not_a_real_classification",
+        )
+
+
+def test_write_ac5_handoff_summary_artifact_never_contains_forbidden_content() -> None:
+    """Adversarial check: even if a caller accidentally passed a
+    credential-shaped string through `reason_code` (the only free-text
+    field this writer accepts besides `executed_command` literals), the
+    writer itself never adds any NEW forbidden field -- there is no
+    parameter for raw stdout/stderr/response/root/path/credential/account/
+    token/HOME/XDG content at all, so this test proves-by-construction that
+    the writer's fixed key set can never carry one under its own key name.
+    """
+    artifact_path = _write_ac5_handoff_summary_artifact(
+        caller_context="claude-gpt",
+        executed_command=[sys.executable, "-m", "pytest"],
+        binary_identity=None,
+        verdict="SKIP",
+        reason_code="handoff_classification_not_validated:source_absent",
+        exit_status=77,
+        canonical_result_classification=None,
+        handoff_classification=agy_permission_policy.AGY_HANDOFF_SOURCE_ABSENT,
+    )
+    content = artifact_path.read_text(encoding="utf-8")
+    for forbidden_key in ("stdout", "stderr", "response_text", "root_path", "source_path", "credential", "HOME", "XDG_CONFIG_HOME"):
+        assert f'"{forbidden_key}"' not in content
 
 
 if __name__ == "__main__":

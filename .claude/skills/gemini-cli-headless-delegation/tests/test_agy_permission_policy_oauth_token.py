@@ -85,6 +85,23 @@ def _force_bwrap_available(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(app, "_bwrap_available", lambda: True)
 
 
+@pytest.fixture(autouse=True)
+def _clear_agy_oauth_token_handoff_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2670: this file's pre-existing (#1740/#1743) tests exercise the
+    LEGACY `os.environ["HOME"]`-only lookup path (`monkeypatch.setenv("HOME",
+    ...)`, no handoff env vars) -- they must stay deterministic regardless of
+    whether the actual host process happens to have
+    `AGY_OAUTH_TOKEN_HANDOFF_ROOT` / `AGY_OAUTH_TOKEN_HANDOFF_SOURCE` set
+    ambiently (e.g. when this suite itself runs inside a
+    `scripts/claude-gpt/launch.sh` session). Clearing both here, for every
+    test in this file, keeps the pre-existing assertions exercising exactly
+    the `no_handoff_ordinary_lookup` branch they were written against; the
+    dedicated Issue #2670 tests below set them explicitly per case.
+    """
+    monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", raising=False)
+    monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", raising=False)
+
+
 ALL_PROFILES = [
     app.NO_TOOLS_PROFILE,
     app.LOCAL_ASSET_RESEARCH_PROFILE,
@@ -433,5 +450,256 @@ def test_agy_oauth_token_reachability_integration(tmp_path: Path, monkeypatch: p
         )
         assert smoke_result.returncode == 0, smoke_result.stderr
         assert "LOOP_AGY_ISOLATED_SMOKE_OK" in smoke_result.stdout
+    finally:
+        shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2670 AC1/AC2/AC4: pre-isolation launcher handoff for the approved
+# AGY OAuth token source -- `resolve_agy_oauth_token_source()`'s closed,
+# four-member input-state classification, and its integration into
+# `materialize_isolated_agy_workspace()`.
+# ---------------------------------------------------------------------------
+
+
+def _make_handoff_fixture(
+    tmp_path: Path, *, dirname: str = "handoff-root", token_content: "str | None" = "dummy-fixture-token-value"
+) -> tuple[Path, Path]:
+    """Return (root, source) -- a fixture `<root>/antigravity-oauth-token`
+    layout. *token_content* `None` creates *root* without the source file
+    (source_absent fixture)."""
+    root = tmp_path / dirname
+    root.mkdir(parents=True)
+    source = root / "antigravity-oauth-token"
+    if token_content is not None:
+        source.write_text(token_content, encoding="utf-8")
+    return root, source
+
+
+# --- AC1: wholly absent interface falls back to ordinary lookup (never
+#     enumerates an alternate candidate/backend) -----------------------------
+
+
+def test_resolve_handoff_wholly_absent_interface_permits_ordinary_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_real_home = _make_fake_agy_home(tmp_path)
+    monkeypatch.setenv("HOME", str(fake_real_home))
+
+    result = app.resolve_agy_oauth_token_source()
+    assert result.classification == app.AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP
+    assert result.source_path == fake_real_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+
+
+def test_resolve_handoff_wholly_absent_interface_legacy_lookup_finds_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_real_home = tmp_path / "real-home-no-token-legacy"
+    fake_real_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_real_home))
+
+    result = app.resolve_agy_oauth_token_source()
+    assert result.classification == app.AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP
+    assert result.source_path is None
+
+
+# --- AC2: partial handoff (exactly one of the two dedicated values) is
+#     rejected with no fallback -- never falls back to ordinary lookup ------
+
+
+@pytest.mark.parametrize(
+    "handoff_root,handoff_source",
+    [
+        pytest.param("/some/root", None, id="root-only"),
+        pytest.param(None, "/some/root/antigravity-oauth-token", id="source-only"),
+        pytest.param("  ", "/some/root/antigravity-oauth-token", id="root-blank-string"),
+    ],
+)
+def test_resolve_handoff_partial_is_invalid_rejected_no_fallback(
+    handoff_root: "str | None", handoff_source: "str | None"
+) -> None:
+    result = app.resolve_agy_oauth_token_source(handoff_root=handoff_root, handoff_source=handoff_source)
+    assert result.classification == app.AGY_HANDOFF_INVALID_REJECTED
+    assert result.source_path is None
+
+
+# --- AC2: complete valid handoff -- exact single-source candidate, takes
+#     validated precedence over whatever the ordinary lookup would find ------
+
+
+def test_resolve_handoff_complete_valid_selects_regular_file(tmp_path: Path) -> None:
+    root, source = _make_handoff_fixture(tmp_path)
+    result = app.resolve_agy_oauth_token_source(handoff_root=str(root), handoff_source=str(source))
+    assert result.classification == app.AGY_HANDOFF_VALIDATED_SELECTED
+    assert result.source_path == source
+
+
+def test_resolve_handoff_complete_valid_takes_precedence_over_different_ordinary_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DIFFERENT, unrelated `$HOME` fixture is set ambiently -- the
+    validated handoff must still be selected (never the ordinary-lookup
+    fixture), proving validated precedence (Issue #2670 truth table item
+    1)."""
+    unrelated_home = _make_fake_agy_home(tmp_path, dirname="unrelated-ordinary-home")
+    monkeypatch.setenv("HOME", str(unrelated_home))
+    root, source = _make_handoff_fixture(tmp_path, dirname="handoff-root-precedence")
+
+    result = app.resolve_agy_oauth_token_source(handoff_root=str(root), handoff_source=str(source))
+    assert result.classification == app.AGY_HANDOFF_VALIDATED_SELECTED
+    assert result.source_path == source
+    assert result.source_path != unrelated_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+
+
+def test_resolve_handoff_complete_valid_accepts_in_root_symlink(tmp_path: Path) -> None:
+    root, source = _make_handoff_fixture(tmp_path, token_content=None)
+    real_target = root / "other-file-in-root"
+    real_target.write_text("dummy-fixture-token-value", encoding="utf-8")
+    source.symlink_to(real_target)
+
+    result = app.resolve_agy_oauth_token_source(handoff_root=str(root), handoff_source=str(source))
+    assert result.classification == app.AGY_HANDOFF_VALIDATED_SELECTED
+    assert result.source_path == source
+
+
+# --- AC2: launcher-observed exact source absence -- no fallback, SKIP/
+#     incomplete for AC5, but not the same classification as a malformed
+#     handoff -----------------------------------------------------------------
+
+
+def test_resolve_handoff_source_absent_when_candidate_entry_missing(tmp_path: Path) -> None:
+    root, source = _make_handoff_fixture(tmp_path, token_content=None)
+    result = app.resolve_agy_oauth_token_source(handoff_root=str(root), handoff_source=str(source))
+    assert result.classification == app.AGY_HANDOFF_SOURCE_ABSENT
+    assert result.source_path is None
+
+
+# --- AC2: structural/logical mismatch and boundary-escape rejections --------
+
+
+def test_resolve_handoff_invalid_when_source_is_sibling_subdirectory_same_name(tmp_path: Path) -> None:
+    root = tmp_path / "handoff-root-subdir"
+    root.mkdir()
+    subdir = root / "subdir"
+    subdir.mkdir()
+    nested_source = subdir / "antigravity-oauth-token"
+    nested_source.write_text("dummy-fixture-token-value", encoding="utf-8")
+
+    result = app.resolve_agy_oauth_token_source(handoff_root=str(root), handoff_source=str(nested_source))
+    assert result.classification == app.AGY_HANDOFF_INVALID_REJECTED
+
+
+def test_resolve_handoff_invalid_when_symlink_escapes_root(tmp_path: Path) -> None:
+    root, source = _make_handoff_fixture(tmp_path, dirname="handoff-root-escape", token_content=None)
+    outside_dir = tmp_path / "outside-root"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "escape-target"
+    outside_file.write_text("dummy-fixture-token-value", encoding="utf-8")
+    source.symlink_to(outside_file)
+
+    result = app.resolve_agy_oauth_token_source(handoff_root=str(root), handoff_source=str(source))
+    assert result.classification == app.AGY_HANDOFF_INVALID_REJECTED
+    assert result.source_path is None
+
+
+def test_resolve_handoff_invalid_when_candidate_entry_is_directory(tmp_path: Path) -> None:
+    root = tmp_path / "handoff-root-dir-entry"
+    root.mkdir()
+    dir_as_source = root / "antigravity-oauth-token"
+    dir_as_source.mkdir()
+
+    result = app.resolve_agy_oauth_token_source(handoff_root=str(root), handoff_source=str(dir_as_source))
+    assert result.classification == app.AGY_HANDOFF_INVALID_REJECTED
+
+
+def test_resolve_handoff_invalid_when_paths_are_not_absolute(tmp_path: Path) -> None:
+    result = app.resolve_agy_oauth_token_source(
+        handoff_root="relative/root", handoff_source="relative/root/antigravity-oauth-token"
+    )
+    assert result.classification == app.AGY_HANDOFF_INVALID_REJECTED
+
+
+def test_resolve_handoff_classifications_are_only_the_closed_four(tmp_path: Path) -> None:
+    assert app.AGY_HANDOFF_CLASSIFICATIONS == {
+        app.AGY_HANDOFF_VALIDATED_SELECTED,
+        app.AGY_HANDOFF_INVALID_REJECTED,
+        app.AGY_HANDOFF_SOURCE_ABSENT,
+        app.AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP,
+    }
+
+
+# --- AC4: materialize_isolated_agy_workspace() integration -- the resolved
+#     classification is recorded on IsolatedAgyWorkspace, and the exposed
+#     symlink is built from the handoff-selected candidate under HOME
+#     isolation (never the ordinary/ambient HOME lookup once a validated
+#     handoff is supplied). ----------------------------------------------------
+
+
+def test_materialize_workspace_records_validated_handoff_classification_and_exposes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Simulate a HOME-isolating caller (like scripts/claude-gpt/launch.sh):
+    # the ambient HOME the ordinary lookup would use points at an empty,
+    # unrelated directory that never contains the real source -- only the
+    # dedicated handoff carries the approved source through.
+    isolated_ambient_home = tmp_path / "isolated-ambient-home"
+    isolated_ambient_home.mkdir()
+    monkeypatch.setenv("HOME", str(isolated_ambient_home))
+
+    root, source = _make_handoff_fixture(tmp_path, dirname="handoff-root-materialize")
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", str(root))
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", str(source))
+
+    for profile in ALL_PROFILES:
+        workspace = app.materialize_isolated_agy_workspace(profile, parent_dir=tmp_path)
+        try:
+            assert workspace.agy_oauth_token_handoff_classification == app.AGY_HANDOFF_VALIDATED_SELECTED
+            assert workspace.agy_oauth_token_path is not None
+            assert workspace.agy_oauth_token_path.is_symlink()
+            assert workspace.agy_oauth_token_path.resolve() == source.resolve()
+            assert workspace.agy_oauth_token_path == (
+                Path(workspace.env["HOME"]) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+            )
+        finally:
+            shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
+def test_materialize_workspace_records_source_absent_classification_and_no_exposure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    isolated_ambient_home = tmp_path / "isolated-ambient-home-absent"
+    isolated_ambient_home.mkdir()
+    monkeypatch.setenv("HOME", str(isolated_ambient_home))
+
+    root, source = _make_handoff_fixture(tmp_path, dirname="handoff-root-materialize-absent", token_content=None)
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", str(root))
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", str(source))
+
+    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path)
+    try:
+        assert workspace.agy_oauth_token_handoff_classification == app.AGY_HANDOFF_SOURCE_ABSENT
+        # source_absent has no fallback -- no exposure at all, even though
+        # the (unrelated) ambient ordinary-lookup HOME is also empty here.
+        assert workspace.agy_oauth_token_path is None
+    finally:
+        shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
+def test_materialize_workspace_records_invalid_rejected_classification_and_no_fallback_to_ordinary_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial handoff must fail closed with no fallback -- even when the
+    ordinary-lookup ambient HOME genuinely has a valid real token file, that
+    ordinary fixture must NOT be used once any handoff value was supplied
+    (Issue #2670 truth table item 2: fail closed, no fallback)."""
+    fake_real_home_with_real_token = _make_fake_agy_home(tmp_path, dirname="ordinary-home-with-real-token")
+    monkeypatch.setenv("HOME", str(fake_real_home_with_real_token))
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", str(tmp_path / "partial-root-only"))
+    monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", raising=False)
+
+    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path)
+    try:
+        assert workspace.agy_oauth_token_handoff_classification == app.AGY_HANDOFF_INVALID_REJECTED
+        assert workspace.agy_oauth_token_path is None
     finally:
         shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
