@@ -25,8 +25,9 @@ _MIGRATIONS_DIR = _SCRIPTS_DIR / "migrations"
 # cannot be a normal importable package, so it gets the same bare-module
 # sys.path treatment as `scripts/task-context` above.
 _HOOKS_DIR = _REPO_ROOT / ".claude" / "hooks" / "task_context"
+_TESTS_DIR = _REPO_ROOT / "tests" / "task-context"
 
-for _dir in (str(_SCRIPTS_DIR), str(_MIGRATIONS_DIR), str(_HOOKS_DIR)):
+for _dir in (str(_SCRIPTS_DIR), str(_MIGRATIONS_DIR), str(_HOOKS_DIR), str(_TESTS_DIR)):
     if _dir not in sys.path:
         sys.path.insert(0, _dir)
 
