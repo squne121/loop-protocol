@@ -87,17 +87,29 @@ ARTIFACT_DIR = Path(os.environ.get("PUBLISH_ARTIFACT_DIR", "artifacts"))
 # in the new human-history comment so legacy machine-readable comments retain
 # their target, marker, payload, and consumers unchanged.
 _HUMAN_HISTORY_FIELDS = (
-    "loop_kind", "phase", "source_issue_number", "target_kind", "target_number",
-    "route_or_termination_reason", "reviewed_ref",
+    "loop_kind",
+    "phase",
+    "source_issue_number",
+    "target_kind",
+    "target_number",
+    "route_or_termination_reason",
+    "reviewed_ref",
 )
-_HUMAN_HISTORY_REASONS = frozenset({
-    "completed", "needs_fix", "human_judgment", "binding_missing", "binding_ambiguous",
-    "binding_wrong_repo", "binding_gone", "head_drift", "human_escalation",
-})
+_HUMAN_HISTORY_REASONS = frozenset(
+    {
+        "completed",
+        "needs_fix",
+        "human_judgment",
+        "binding_missing",
+        "binding_ambiguous",
+        "binding_wrong_repo",
+        "binding_gone",
+        "head_drift",
+        "human_escalation",
+    }
+)
 _HUMAN_HISTORY_MARKER_PREFIX = "<!-- loop-protocol/human-history:v1:sha256:"
-_HUMAN_HISTORY_MARKER_RE = __import__("re").compile(
-    r"^<!-- loop-protocol/human-history:v1:sha256:[0-9a-f]{64} -->$"
-)
+_HUMAN_HISTORY_MARKER_RE = __import__("re").compile(r"^<!-- loop-protocol/human-history:v1:sha256:[0-9a-f]{64} -->$")
 _HUMAN_HISTORY_ISSUE_REF_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
 _HUMAN_HISTORY_PR_REF_RE = __import__("re").compile(r"^refs/pull/([1-9][0-9]*)/head@([0-9a-f]{40})$")
 _HUMAN_HISTORY_HEAD_SHA_RE = __import__("re").compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
@@ -143,9 +155,12 @@ def _validate_human_history_identity(identity: object) -> tuple[dict | None, str
     valid = {
         ("issue-refinement-loop", "review-complete", "issue"): {"completed", "needs_fix", "human_judgment"},
         ("impl-review-loop", "pre-PR-binding", "issue"): {"completed", "needs_fix", "human_judgment"},
-        (
-            "impl-review-loop", "binding-validation", "issue"
-        ): {"binding_missing", "binding_ambiguous", "binding_wrong_repo", "binding_gone"},
+        ("impl-review-loop", "binding-validation", "issue"): {
+            "binding_missing",
+            "binding_ambiguous",
+            "binding_wrong_repo",
+            "binding_gone",
+        },
         ("impl-review-loop", "post-PR-binding", "pull_request"): {"completed", "needs_fix", "human_judgment"},
         ("impl-review-loop", "post-PR-head-drift", "pull_request"): {"head_drift"},
         ("impl-review-loop", "conflict-resolution", "issue"): {"human_escalation"},
@@ -172,8 +187,14 @@ def _validate_public_safe_human_text(value: object, field: str) -> tuple[str | N
 
 
 def render_human_history_comment(
-    *, identity: object, result: object, evidence_refs: object, recommended_action: object,
-    recommended_reason: object, impact_if_unaddressed: object, stale_evidence: object = None,
+    *,
+    identity: object,
+    result: object,
+    evidence_refs: object,
+    recommended_action: object,
+    recommended_reason: object,
+    impact_if_unaddressed: object,
+    stale_evidence: object = None,
 ) -> tuple[dict | None, str]:
     """Build a public-safe Japanese human-history body and stable marker."""
     value, error = _validate_human_history_identity(identity)
@@ -182,8 +203,10 @@ def render_human_history_comment(
     assert value is not None
     text_values: dict[str, str] = {}
     for name, raw in {
-        "result": result, "recommended_action": recommended_action,
-        "recommended_reason": recommended_reason, "impact_if_unaddressed": impact_if_unaddressed,
+        "result": result,
+        "recommended_action": recommended_action,
+        "recommended_reason": recommended_reason,
+        "impact_if_unaddressed": impact_if_unaddressed,
     }.items():
         clean, text_error = _validate_public_safe_human_text(raw, name)
         if text_error:
@@ -236,9 +259,18 @@ def render_human_history_comment(
 
 
 def publish_human_history(
-    *, target_number: int, repo: str, identity: object, result: object, evidence_refs: object,
-    recommended_action: object, recommended_reason: object, impact_if_unaddressed: object,
-    stale_evidence: object = None, dry_run: bool = False, receipt: dict | None = None,
+    *,
+    target_number: int,
+    repo: str,
+    identity: object,
+    result: object,
+    evidence_refs: object,
+    recommended_action: object,
+    recommended_reason: object,
+    impact_if_unaddressed: object,
+    stale_evidence: object = None,
+    dry_run: bool = False,
+    receipt: dict | None = None,
 ) -> int:
     """Publish one human-history event through existing issue_comment.publish.
 
@@ -252,9 +284,13 @@ def publish_human_history(
     `receipt`.
     """
     rendered, error = render_human_history_comment(
-        identity=identity, result=result, evidence_refs=evidence_refs,
-        recommended_action=recommended_action, recommended_reason=recommended_reason,
-        impact_if_unaddressed=impact_if_unaddressed, stale_evidence=stale_evidence,
+        identity=identity,
+        result=result,
+        evidence_refs=evidence_refs,
+        recommended_action=recommended_action,
+        recommended_reason=recommended_reason,
+        impact_if_unaddressed=impact_if_unaddressed,
+        stale_evidence=stale_evidence,
     )
     if error or rendered is None:
         _record_artifact(issue_number=target_number, reason_code=error or "human_history_render_failed")
@@ -263,14 +299,19 @@ def publish_human_history(
         _record_artifact(issue_number=target_number, reason_code="human_history_target_binding_invalid")
         return 1
     return _post_github_comment(
-        issue_number=target_number, body=rendered["body"], repo=repo, marker=rendered["marker"],
-        dry_run=dry_run, receipt=receipt,
+        issue_number=target_number,
+        body=rendered["body"],
+        repo=repo,
+        marker=rendered["marker"],
+        dry_run=dry_run,
+        receipt=receipt,
     )
 
 
 # ---------------------------------------------------------------------------
 # Artifact logging (fail-closed: logs to local file, never leaks body to stderr)
 # ---------------------------------------------------------------------------
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -314,6 +355,7 @@ def _record_artifact(
 # ---------------------------------------------------------------------------
 # GitHub comment posting (fail-closed)
 # ---------------------------------------------------------------------------
+
 
 def _post_github_comment(
     *,
@@ -368,26 +410,35 @@ def _post_github_comment(
         comment_body = body
 
     request = build_isolation_issue_comment_request(
-        issue_number=issue_number, repo=repo, comment_body=comment_body, marker=marker,
+        issue_number=issue_number,
+        repo=repo,
+        comment_body=comment_body,
+        marker=marker,
     )
     materialized_rel_path, materialize_err = materialize_isolation_issue_comment_request(
-        request=request, expected_issue_number=issue_number, expected_repo=repo,
+        request=request,
+        expected_issue_number=issue_number,
+        expected_repo=repo,
         project_root=_PROJECT_ROOT,
     )
     if materialize_err:
         print(
-            f"[publish_termination_report] materialize_isolation_issue_comment_request "
-            f"failed: {materialize_err}",
+            f"[publish_termination_report] materialize_isolation_issue_comment_request failed: {materialize_err}",
             file=sys.stderr,
         )
         return 1
 
     cmd = [
-        sys.executable, str(CONTROLLED_SKILL_MUTATION_EXEC_SCRIPT),
-        "--command-id", COMMAND_ID_ISSUE_COMMENT_PUBLISH,
-        "--issue-number", str(issue_number),
-        "--input-file", materialized_rel_path,
-        "--repo", repo,
+        sys.executable,
+        str(CONTROLLED_SKILL_MUTATION_EXEC_SCRIPT),
+        "--command-id",
+        COMMAND_ID_ISSUE_COMMENT_PUBLISH,
+        "--issue-number",
+        str(issue_number),
+        "--input-file",
+        materialized_rel_path,
+        "--repo",
+        repo,
         "--json",
     ]
     if dry_run:
@@ -439,11 +490,57 @@ def _post_github_comment(
 # Main publish flow
 # ---------------------------------------------------------------------------
 
+
+def _emit_refinement_approved_signal(
+    *, repo: str, issue_number: int, approved_body_sha256: str | None
+) -> tuple[str, str]:
+    """Post-publish best-effort adapter; it cannot undo a published handoff.
+
+    Returns ``(disposition, reason_code)`` the same way
+    ``open_pr.emit_implementation_pr_observed()`` already does. The
+    canonical approved-handoff publish above has already succeeded and
+    stays independent of this outcome -- this return value only lets the
+    caller surface a silent Task Context sync failure (e.g. ``deferred`` /
+    ``unbound`` from a stale origin session) instead of discarding it, so it
+    no longer only shows up later as a confusing downstream
+    ``activity_missing``. Never fail-closed, never rolled back.
+    """
+    origin = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not origin:
+        return "deferred", "unbound"
+    if not isinstance(approved_body_sha256, str) or __import__("re").fullmatch(
+        r"[0-9a-f]{64}", approved_body_sha256
+    ) is None:
+        return "rejected_evidence", "INVALID_APPROVED_BODY_SHA256"
+    payload = {
+        "signal_kind": "refinement_approved",
+        "source": "issue-refinement-loop",
+        "source_schema_version": "v1",
+        "evidence": {"repo": repo.lower(), "issue_number": issue_number, "approved_body_sha256": approved_body_sha256},
+    }
+    ctl = _PROJECT_ROOT / "scripts" / "task-context" / "task_contextctl.py"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(ctl), "signal", "apply"],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        data = json.loads(proc.stdout.splitlines()[-1]) if proc.stdout.splitlines() else {}
+        result = data.get("data", {}) if isinstance(data, dict) else {}
+        return str(result.get("disposition", "deferred")), str(result.get("reason_code", "ADAPTER_UNAVAILABLE"))
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, IndexError):
+        return "deferred", "ADAPTER_UNAVAILABLE"
+
+
 def publish(
     *,
     issue_number: int,
     body: str,
     repo: str,
+    termination_reason: str | None = None,
+    approved_body_sha256: str | None = None,
 ) -> int:
     """
     Core publish flow: post `body` (already-assembled plain markdown) as a
@@ -464,6 +561,27 @@ def publish(
         )
         return 1
 
+    if termination_reason == "approved":
+        signal_disposition, signal_reason = _emit_refinement_approved_signal(
+            repo=repo, issue_number=issue_number, approved_body_sha256=approved_body_sha256
+        )
+        print(
+            f"[publish_termination_report] task_context refinement_approved signal "
+            f"disposition={signal_disposition!r} reason_code={signal_reason!r}",
+            file=sys.stderr,
+        )
+        # The canonical approved-handoff publish above already succeeded and
+        # stays independent of this outcome (never fail-closed, never
+        # rolled back). Anything other than a clean applied/duplicate
+        # outcome is recorded to the existing artifact log so a stale-origin
+        # sync failure is diagnosable here instead of only surfacing later
+        # as a confusing downstream `activity_missing`.
+        if signal_disposition not in {"applied", "duplicate_noop"}:
+            _record_artifact(
+                issue_number=issue_number,
+                reason_code="task_context_signal_not_applied",
+                extra={"signal_disposition": signal_disposition, "signal_reason_code": signal_reason},
+            )
     print(
         f"[publish_termination_report] comment posted for issue #{issue_number}",
         file=sys.stderr,
@@ -484,10 +602,16 @@ def publish(
 # ---------------------------------------------------------------------------
 
 _HUMAN_HISTORY_REQUEST_SCHEMA = "HUMAN_HISTORY_PUBLISH_REQUEST_V1"
-_HUMAN_HISTORY_REQUEST_REQUIRED_KEYS = frozenset({
-    "identity", "result", "evidence_refs", "recommended_action", "recommended_reason",
-    "impact_if_unaddressed",
-})
+_HUMAN_HISTORY_REQUEST_REQUIRED_KEYS = frozenset(
+    {
+        "identity",
+        "result",
+        "evidence_refs",
+        "recommended_action",
+        "recommended_reason",
+        "impact_if_unaddressed",
+    }
+)
 _HUMAN_HISTORY_REQUEST_OPTIONAL_KEYS = frozenset({"stale_evidence"})
 
 
@@ -591,6 +715,17 @@ def main() -> int:
         help="Path to a plain markdown body file (default: stdin; legacy plain-body mode)",
     )
     parser.add_argument(
+        "--termination-reason",
+        choices=("approved", "needs_fix", "human_judgment"),
+        default=None,
+        help="Canonical termination reason; only approved emits refinement_approved after publish.",
+    )
+    parser.add_argument(
+        "--approved-body-sha256",
+        default=None,
+        help="SHA-256 of the persisted approved Issue body (required to emit approved signal).",
+    )
+    parser.add_argument(
         "--human-history-request-file",
         type=str,
         default=None,
@@ -639,6 +774,8 @@ def main() -> int:
         issue_number=args.issue_number,
         body=body,
         repo=args.repo,
+        termination_reason=args.termination_reason,
+        approved_body_sha256=args.approved_body_sha256,
     )
 
 

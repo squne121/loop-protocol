@@ -261,3 +261,93 @@ def test_given_commit_on_submission_when_sibling_hook_blocks_later_then_no_rollb
     reread = service.get_task(conn, task_id)
     assert reread["id"] == task_id
     assert service.find_live_claim(conn, "owner/repo", "issue", 7)["task_id"] == task_id
+
+
+def _task_context_snapshot(conn):
+    """Capture every persistent Task Context table to prove a no-op path."""
+    table_names = [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+    ]
+    return {name: [tuple(row) for row in conn.execute(f'SELECT * FROM "{name}"')] for name in table_names}
+
+
+def test_given_bound_task_and_explicit_unclaimed_pr_url_when_submitted_then_no_lookup_or_task_context_mutation(
+    conn, monkeypatch
+):
+    """AC6: an unclaimed PR URL is only a local pass-through observation."""
+    import hook_entry
+
+    conn_holder["conn"] = conn
+    binding_id = _start_session("tab-1", "s1")
+    bound = _submit(
+        "s1", "tab-1", classification_kind="EXPLICIT", target_repo="owner/repo", target_ref_kind="issue",
+        target_ref_number=1,
+    )
+    target_fields = {}
+    monkeypatch.setattr(
+        hook_entry,
+        "_current_repo",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("explicit PR URL must not trigger lookup")),
+    )
+    hook_entry._apply_user_prompt_submit_fields(
+        target_fields,
+        {"prompt": "Review https://github.com/owner/repo/pull/99", "cwd": "/unused"},
+    )
+    assert target_fields == {
+        "classification_kind": "EXPLICIT",
+        "target_repo": "owner/repo",
+        "target_ref_kind": "pr",
+        "target_ref_number": 99,
+    }
+
+    before = _task_context_snapshot(conn)
+    result = _submit("s1", "tab-1", **target_fields)
+
+    assert result == {"decision": "pass", "reason_code": "unclaimed_pr_local_only"}
+    assert _task_context_snapshot(conn) == before
+    assert service.find_live_claim(conn, "owner/repo", "pr", 99) is None
+    current_task_id, current_activity_id, _ = service.get_current_task_activity_for_binding(conn, binding_id)
+    assert (current_task_id, current_activity_id) == (bound["task_id"], bound["activity_id"])
+
+
+def test_given_initially_unbound_binding_and_explicit_unclaimed_pr_when_submitted_then_passes_without_autobind(conn):
+    conn_holder["conn"] = conn
+    binding_id = _start_session("tab-1", "s1")
+    before = _task_context_snapshot(conn)
+
+    result = _submit(
+        "s1",
+        "tab-1",
+        classification_kind="EXPLICIT",
+        target_repo="owner/repo",
+        target_ref_kind="pr",
+        target_ref_number=99,
+    )
+
+    assert result == {"decision": "pass", "reason_code": "unclaimed_pr_local_only"}
+    assert _task_context_snapshot(conn) == before
+    current_task_id, current_activity_id, _ = service.get_current_task_activity_for_binding(conn, binding_id)
+    assert (current_task_id, current_activity_id) == (None, None)
+
+
+def test_given_bound_task_and_claimed_pr_when_submitted_then_existing_same_target_path_is_preserved(conn):
+    """The AC6 narrow exception must not alter legitimate claimed PR handling."""
+    conn_holder["conn"] = conn
+    _start_session("tab-1", "s1")
+    bound = _submit(
+        "s1", "tab-1", classification_kind="EXPLICIT", target_repo="owner/repo", target_ref_kind="issue",
+        target_ref_number=1,
+    )
+    assert service.claim_task_ref(conn, bound["task_id"], "owner/repo", "pr", 99)["status"] == "claimed"
+
+    before = _task_context_snapshot(conn)
+    result = _submit(
+        "s1", "tab-1", classification_kind="EXPLICIT", target_repo="owner/repo", target_ref_kind="pr",
+        target_ref_number=99,
+    )
+
+    assert result == {"decision": "pass", "reason_code": "same_target"}
+    assert _task_context_snapshot(conn) == before
