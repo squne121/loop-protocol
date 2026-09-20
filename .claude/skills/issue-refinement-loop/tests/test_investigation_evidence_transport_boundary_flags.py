@@ -20,6 +20,18 @@ non-relaxation end-to-end through the real `run_preflight()` ->
 MUTATION-phase lane this Issue actually wires -- a VALID (non-rejected)
 transport still yields zero writes / zero mutation-callback invocations for
 a destructive-boundary directive, no new scope classifier or schema.
+
+#2678 P1-1/P1-2 fix_delta (PR #2684 review):
+  - The end-to-end test below `monkeypatch`es `preflight._find_repo_root`
+    to a throwaway, per-test git checkout under pytest's own `tmp_path`
+    instead of writing/`shutil.rmtree()`-ing the real repo checkout's
+    `.claude/artifacts/issue-refinement-loop/<N>/` (mirrors the same fix in
+    `test_investigation_evidence_transport_mutation_guard.py` -- see that
+    module's own docstring for the full rationale).
+  - `test_split_permission_and_external_service_boundary_flags_not_relaxed`
+    (renamed from `test_permission_and_external_service_boundary_flags_
+    not_relaxed`) now ALSO covers `requires_issue_split` -- AC7 names 4
+    non-relaxed boundaries but the original suite only exercised 3 of them.
 """
 
 from __future__ import annotations
@@ -27,7 +39,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import shutil
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -57,6 +70,28 @@ _URL = f"https://github.com/{_REPO}/issues/{_ISSUE}#issuecomment-1"
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_GIT_ENV = {
+    **os.environ,
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+}
+
+
+def _make_isolated_repo_root(tmp_path: Path) -> Path:
+    """A throwaway, per-test git checkout under pytest's own `tmp_path` --
+    see `test_investigation_evidence_transport_mutation_guard.py`'s own
+    `_make_isolated_repo_root()` docstring for the full rationale."""
+    root = tmp_path / "isolated-repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True, capture_output=True, env=_GIT_ENV)
+    (root / "README.md").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=str(root), check=True, capture_output=True, env=_GIT_ENV)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=str(root), check=True, capture_output=True, env=_GIT_ENV)
+    return root
 
 
 # ---------------------------------------------------------------------------
@@ -133,10 +168,20 @@ def test_destructive_and_permission_boundary_flags_not_relaxed():
     assert result["route"]["reason_code"] == "destructive_or_non_idempotent_operation"
 
 
-def test_permission_and_external_service_boundary_flags_not_relaxed():
-    """AC7 (sibling boundaries): `changes_permission_boundary` and
-    `changes_external_service_boundary` are equally never cleared by
-    investigation-derived literals."""
+def test_split_permission_and_external_service_boundary_flags_not_relaxed():
+    """AC7 (sibling boundaries): `requires_issue_split`,
+    `changes_permission_boundary`, and `changes_external_service_boundary`
+    are equally never cleared by investigation-derived literals -- the
+    positive `requires_issue_split` case (#2678 P1-2 fix_delta) was
+    previously missing even though this module's own docstring already
+    claimed coverage for all 4 non-relaxed boundaries."""
+    split_body = "\n".join(
+        [
+            "複数の Issue に split into separate issues する必要があるほどスコープが大きいので、"
+            "allowed paths を必要に応じて拡張してください。",
+            "- impl-review-loop も合わせて直してください。",
+        ]
+    )
     permission_body = "\n".join(
         [
             "sudo access が必要になるため allowed paths を必要に応じて拡張してください。",
@@ -151,6 +196,7 @@ def test_permission_and_external_service_boundary_flags_not_relaxed():
     )
     payload = {"id": 1, "author_association": "OWNER", "user": {"login": "owner", "type": "User"}}
     for body, expected_reason in (
+        (split_body, "requires_issue_split"),
         (permission_body, "changes_permission_boundary"),
         (external_body, "changes_external_service_boundary"),
     ):
@@ -273,13 +319,21 @@ def _callbacks(*, issue_body: str, anchor_comment: dict):
     }, calls
 
 
-def test_valid_transport_still_fails_closed_for_destructive_directive_end_to_end():
+def test_valid_transport_still_fails_closed_for_destructive_directive_end_to_end(tmp_path, monkeypatch):
     """AC7 end-to-end: a VALID (non-rejected) transport manifest reaches
     `known_context["investigation_derived_path_literals"]`, but the
     destructive-boundary directive's route stays `human_escalation` --
     zero mutation-callback invocations through the real `run_preflight()`
-    call chain, not merely at the classifier-unit level above."""
-    repo_root = preflight._find_repo_root()
+    call chain, not merely at the classifier-unit level above.
+
+    #2678 P1-1 fix_delta: `_find_repo_root()` is monkeypatched to a
+    throwaway, per-test git checkout under `tmp_path` instead of the real
+    repo checkout -- see this module's own docstring / `test_investigation_
+    evidence_transport_mutation_guard.py`'s `_make_isolated_repo_root()`
+    docstring for the full rationale."""
+    repo_root = _make_isolated_repo_root(tmp_path)
+    monkeypatch.setattr(preflight, "_find_repo_root", lambda: repo_root)
+
     issue_body = _issue_body()
     anchor_comment = _destructive_anchor_comment()
     fixture = {
@@ -292,11 +346,8 @@ def test_valid_transport_still_fails_closed_for_destructive_directive_end_to_end
         "anchor_comment_urls": [_URL],
         "anchor_comments": [anchor_comment],
     }
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as handle:
-        json.dump(fixture, handle)
-        fixture_path = Path(handle.name)
+    fixture_path = tmp_path / "preflight_fixture_destructive.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 
     body_sha256 = preflight._sha256(issue_body)
     git_head_sha = preflight._git_head_sha(repo_root)
@@ -331,22 +382,17 @@ def test_valid_transport_still_fails_closed_for_destructive_directive_end_to_end
 
     callbacks, calls = _callbacks(issue_body=issue_body, anchor_comment=anchor_comment)
     known_context = {"human_context_comment_urls": [_URL]}
-    try:
-        result, _exit_code = preflight.run_preflight(
-            issue_number=_ISSUE,
-            repo=_REPO,
-            anchor_comment_urls=[_URL],
-            fixture_path=fixture_path,
-            known_context=known_context,
-            consume_contract_patch_plan=True,
-            contract_update_callbacks=callbacks,
-            investigation_evidence_transport_path=manifest_path,
-            investigation_evidence_primary_root=repo_root,
-        )
-    finally:
-        fixture_path.unlink(missing_ok=True)
-        if artifact_dir.exists():
-            shutil.rmtree(artifact_dir)
+    result, _exit_code = preflight.run_preflight(
+        issue_number=_ISSUE,
+        repo=_REPO,
+        anchor_comment_urls=[_URL],
+        fixture_path=fixture_path,
+        known_context=known_context,
+        consume_contract_patch_plan=True,
+        contract_update_callbacks=callbacks,
+        investigation_evidence_transport_path=manifest_path,
+        investigation_evidence_primary_root=repo_root,
+    )
 
     # The transport itself validated fine (no rejection blocker) -- the
     # destructive boundary, not a transport failure, is what fail-closes

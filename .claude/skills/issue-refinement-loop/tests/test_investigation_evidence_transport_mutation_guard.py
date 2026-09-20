@@ -20,6 +20,22 @@ Reuses the production `run_preflight()` -> `consume_trusted_anchor_
 contract_patch_plan()` call chain via `fixture_path` mode (the SAME
 in-process E2E convention `test_preflight_run_with_anchor.py` already
 establishes for this module) -- no new harness.
+
+#2678 P1-1 fix_delta (PR #2684 review): `run_preflight()` has no `repo_root`
+parameter -- it always derives its own `repo_root` internally via
+`_find_repo_root()` (a bare, module-level function, walking up from THIS
+production script's own `__file__`), and both the investigation-evidence
+transport confinement AND the unconditional `_write_preflight_artifacts()`
+triple (`raw_issue_snapshot.json` / `planner_input.json` /
+`refinement_preflight_result_v1.json`) write there. Every test below
+therefore `monkeypatch`es `preflight._find_repo_root` (the SAME loaded
+module object's own global, which every bare `_find_repo_root()` call
+inside that module resolves against) to a throwaway, per-test git checkout
+under pytest's own `tmp_path` -- never the real repo checkout. No
+`shutil.rmtree()` of a shared, real-checkout directory is needed any more:
+`tmp_path` is test-local and torn down by pytest itself, so concurrent
+pytest-xdist workers (`.github/ci/python-test-plan.json`'s 4-worker/
+loadscope target for this directory) never share a write target.
 """
 
 from __future__ import annotations
@@ -27,9 +43,12 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import shutil
+import os
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = SKILL_ROOT / "scripts"
@@ -52,9 +71,34 @@ _ISSUE = 267800
 _URL = f"https://github.com/{_REPO}/issues/{_ISSUE}#issuecomment-1"
 _NEW_ALLOWED_PATH = "docs/dev/some-new-allowed-path-2678.md"
 
+_GIT_ENV = {
+    **os.environ,
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@t",
+}
+
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _make_isolated_repo_root(tmp_path: Path) -> Path:
+    """A throwaway, per-test git checkout under pytest's own `tmp_path` --
+    this is what every test below `monkeypatch`es `_find_repo_root()` to
+    return, so no artifact this call chain writes ever lands under the real
+    repo checkout (mirrors the isolated-repo convention `_make_repo()`
+    already establishes in `scripts/agent-guards/tests/
+    test_skill_runtime_exec_anchor.py`, minus the subprocess-dispatch
+    machinery this in-process test chain does not need)."""
+    root = tmp_path / "isolated-repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True, capture_output=True, env=_GIT_ENV)
+    (root / "README.md").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=str(root), check=True, capture_output=True, env=_GIT_ENV)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=str(root), check=True, capture_output=True, env=_GIT_ENV)
+    return root
 
 
 def _issue_body() -> str:
@@ -160,8 +204,17 @@ def _callbacks(*, issue_body: str, anchor_comment: dict):
 def _write_manifest(*, repo_root: Path, valid_body_sha256: str, git_head_sha: str, tamper: str) -> Path:
     """Hand-build a SCOPE_DELTA_AUTHORITY_TRANSPORT_V1 manifest matching
     `generate_authority_transport_manifest()`'s own shape, then tamper
-    exactly ONE binding field so `_validate_investigation_evidence_transport()`
-    fails closed on that ONE check."""
+    exactly ONE binding field (or, for `unsafe_path`, the WRITE LOCATION
+    itself) so `_validate_investigation_evidence_transport()` fails closed
+    on that ONE check.
+
+    #2678 P2-2 fix_delta (PR #2684 review): extended beyond the original
+    4 tamper kinds (stale_body / stale_head / wrong_issue / digest_mismatch)
+    to also cover `wrong_repo`, `wrong_anchor`, and `unsafe_path` --
+    the AC6/AC8 write-zero matrix's own text promises coverage for "digest /
+    issue / repo / anchor / stale body / stale HEAD / unsafe path", but the
+    original suite only exercised 4 of those 7 reasons.
+    """
     payload = [
         {
             "comment_url": _URL,
@@ -186,6 +239,9 @@ def _write_manifest(*, repo_root: Path, valid_body_sha256: str, git_head_sha: st
         "payload": payload,
         "payload_sha256": _sha256(payload_json),
     }
+    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(_ISSUE)
+    manifest_path = artifact_dir / "manifest.json"
+
     if tamper == "stale_body":
         manifest["source_issue_body_sha256"] = _sha256("a different, stale issue body")
     elif tamper == "stale_head":
@@ -194,18 +250,26 @@ def _write_manifest(*, repo_root: Path, valid_body_sha256: str, git_head_sha: st
         manifest["issue_number"] = _ISSUE + 1
     elif tamper == "digest_mismatch":
         manifest["payload_sha256"] = _sha256("tampered")
+    elif tamper == "wrong_repo":
+        manifest["repo"] = "someone-else/unrelated-repo"
+    elif tamper == "wrong_anchor":
+        manifest["source_comment_url"] = f"https://github.com/{_REPO}/issues/{_ISSUE}#issuecomment-999"
+    elif tamper == "unsafe_path":
+        # Content is otherwise valid -- ONLY the write location is outside
+        # `_confine_artifact_path()`'s `<repo_root>/.claude/artifacts/` root.
+        manifest_path = repo_root / "manifest_outside_artifact_root.json"
     else:
         raise ValueError(f"unknown tamper kind: {tamper}")
 
-    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(_ISSUE)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = artifact_dir / "manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return manifest_path
 
 
-def _run(tamper: str):
-    repo_root = preflight._find_repo_root()
+def _run(tamper: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo_root = _make_isolated_repo_root(tmp_path)
+    monkeypatch.setattr(preflight, "_find_repo_root", lambda: repo_root)
+
     issue_body = _issue_body()
     anchor_comment = _anchor_comment()
     fixture = {
@@ -218,11 +282,8 @@ def _run(tamper: str):
         "anchor_comment_urls": [_URL],
         "anchor_comments": [anchor_comment],
     }
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as handle:
-        json.dump(fixture, handle)
-        fixture_path = Path(handle.name)
+    fixture_path = tmp_path / f"preflight_fixture_{tamper}.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
 
     manifest_path = _write_manifest(
         repo_root=repo_root,
@@ -231,37 +292,74 @@ def _run(tamper: str):
         tamper=tamper,
     )
     callbacks, calls = _callbacks(issue_body=issue_body, anchor_comment=anchor_comment)
-    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(_ISSUE)
     known_context = {"human_context_comment_urls": [_URL]}
-    try:
-        result, exit_code = preflight.run_preflight(
-            issue_number=_ISSUE,
-            repo=_REPO,
-            anchor_comment_urls=[_URL],
-            fixture_path=fixture_path,
-            known_context=known_context,
-            consume_contract_patch_plan=True,
-            contract_update_callbacks=callbacks,
-            investigation_evidence_transport_path=manifest_path,
-            investigation_evidence_primary_root=repo_root,
-        )
-    finally:
-        fixture_path.unlink(missing_ok=True)
-        if artifact_dir.exists():
-            shutil.rmtree(artifact_dir)
+    result, exit_code = preflight.run_preflight(
+        issue_number=_ISSUE,
+        repo=_REPO,
+        anchor_comment_urls=[_URL],
+        fixture_path=fixture_path,
+        known_context=known_context,
+        consume_contract_patch_plan=True,
+        contract_update_callbacks=callbacks,
+        investigation_evidence_transport_path=manifest_path,
+        investigation_evidence_primary_root=repo_root,
+    )
     return result, exit_code, calls
 
 
-def test_invalid_transport_with_independently_valid_anchor_write_zero():
-    """AC6: a rejected transport (stale body binding) fail-closes the
-    mutation consumer even though the anchor body ALONE derives a valid,
-    non-empty patch plan -- mutation callback invocation count AND the
-    (fixture-proxy) GitHub update-request count are both exactly 0."""
-    result, _exit_code, calls = _run(tamper="stale_body")
+@pytest.mark.parametrize(
+    "tamper,expected_reason_prefix",
+    [
+        pytest.param(
+            "stale_body",
+            "investigation_evidence_transport_rejected:transport_issue_body_sha256_mismatch",
+            id="stale_body",
+        ),
+        pytest.param(
+            "stale_head",
+            "investigation_evidence_transport_rejected:transport_git_head_sha_mismatch",
+            id="stale_head",
+        ),
+        pytest.param(
+            "wrong_issue",
+            "investigation_evidence_transport_rejected:transport_issue_number_mismatch",
+            id="wrong_issue",
+        ),
+        pytest.param(
+            "digest_mismatch",
+            "investigation_evidence_transport_rejected:transport_payload_digest_mismatch",
+            id="digest_mismatch",
+        ),
+        pytest.param(
+            "wrong_repo",
+            "investigation_evidence_transport_rejected:transport_repo_mismatch",
+            id="wrong_repo",
+        ),
+        pytest.param(
+            "wrong_anchor",
+            "investigation_evidence_transport_rejected:transport_anchor_url_mismatch",
+            id="wrong_anchor",
+        ),
+        pytest.param(
+            "unsafe_path",
+            "investigation_evidence_transport_rejected:path_confinement_outside_artifact_root",
+            id="unsafe_path",
+        ),
+    ],
+)
+def test_invalid_transport_with_independently_valid_anchor_write_zero(
+    tamper, expected_reason_prefix, tmp_path, monkeypatch
+):
+    """AC6/AC8: a rejected transport (any of the 7 documented binding
+    failures) fail-closes the mutation consumer even though the anchor body
+    ALONE derives a valid, non-empty patch plan -- mutation callback
+    invocation count AND the (fixture-proxy) GitHub update-request count are
+    both exactly 0 (observable assertion, not a status-string check
+    alone)."""
+    result, _exit_code, calls = _run(tamper, tmp_path, monkeypatch)
 
     assert any(
-        isinstance(b, str) and b.startswith("investigation_evidence_transport_rejected:")
-        for b in result.get("blockers", [])
+        isinstance(b, str) and b.startswith(expected_reason_prefix) for b in result.get("blockers", [])
     ), result.get("blockers")
     # Observable assertion (not a status-string check alone): the mutation
     # callback (`apply_transaction`, proxy for `edit_issue_txn.py` -- the
@@ -280,53 +378,15 @@ def test_invalid_transport_with_independently_valid_anchor_write_zero():
     assert "contract_update" not in result, result
 
 
-def test_invalid_transport_stale_head_with_independently_valid_anchor_write_zero():
-    """AC6 (stale HEAD variant): same guarantee for a `git_head_sha`
-    mismatch -- a distinct binding failure from the stale-body case above."""
-    result, _exit_code, calls = _run(tamper="stale_head")
-
-    assert any(
-        isinstance(b, str) and b.startswith("investigation_evidence_transport_rejected:")
-        for b in result.get("blockers", [])
-    ), result.get("blockers")
-    assert calls["apply_transaction"] == 0
-    assert calls["fresh_checks"] == 0
-    assert result.get("contract_update", {}).get("writes", 0) == 0
-
-
-def test_invalid_transport_wrong_issue_with_independently_valid_anchor_write_zero():
-    """AC6 (wrong-issue variant)."""
-    result, _exit_code, calls = _run(tamper="wrong_issue")
-
-    assert any(
-        isinstance(b, str) and b.startswith("investigation_evidence_transport_rejected:")
-        for b in result.get("blockers", [])
-    ), result.get("blockers")
-    assert calls["apply_transaction"] == 0
-    assert calls["fresh_checks"] == 0
-    assert result.get("contract_update", {}).get("writes", 0) == 0
-
-
-def test_invalid_transport_digest_mismatch_with_independently_valid_anchor_write_zero():
-    """AC6 (payload digest tamper variant)."""
-    result, _exit_code, calls = _run(tamper="digest_mismatch")
-
-    assert any(
-        isinstance(b, str) and b.startswith("investigation_evidence_transport_rejected:")
-        for b in result.get("blockers", [])
-    ), result.get("blockers")
-    assert calls["apply_transaction"] == 0
-    assert calls["fresh_checks"] == 0
-    assert result.get("contract_update", {}).get("writes", 0) == 0
-
-
-def test_valid_transport_absent_regression_still_reaches_mutation_for_same_anchor():
+def test_valid_transport_absent_regression_still_reaches_mutation_for_same_anchor(tmp_path, monkeypatch):
     """Non-regression control: WITHOUT any transport path at all (the
     ordinary, pre-#2678 call shape), this SAME independently-valid anchor
     directive still reaches the mutation consumer and writes exactly once --
     proving the AC6 guard above is transport-presence-gated, not an
     accidental universal block of this directive shape."""
-    repo_root = preflight._find_repo_root()
+    repo_root = _make_isolated_repo_root(tmp_path)
+    monkeypatch.setattr(preflight, "_find_repo_root", lambda: repo_root)
+
     issue_body = _issue_body()
     anchor_comment = _anchor_comment()
     fixture = {
@@ -339,28 +399,19 @@ def test_valid_transport_absent_regression_still_reaches_mutation_for_same_ancho
         "anchor_comment_urls": [_URL],
         "anchor_comments": [anchor_comment],
     }
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as handle:
-        json.dump(fixture, handle)
-        fixture_path = Path(handle.name)
+    fixture_path = tmp_path / "preflight_fixture_regression.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
     callbacks, calls = _callbacks(issue_body=issue_body, anchor_comment=anchor_comment)
-    artifact_dir = repo_root / ".claude" / "artifacts" / "issue-refinement-loop" / str(_ISSUE)
     known_context = {"human_context_comment_urls": [_URL]}
-    try:
-        result, _exit_code = preflight.run_preflight(
-            issue_number=_ISSUE,
-            repo=_REPO,
-            anchor_comment_urls=[_URL],
-            fixture_path=fixture_path,
-            known_context=known_context,
-            consume_contract_patch_plan=True,
-            contract_update_callbacks=callbacks,
-        )
-    finally:
-        fixture_path.unlink(missing_ok=True)
-        if artifact_dir.exists():
-            shutil.rmtree(artifact_dir)
+    result, _exit_code = preflight.run_preflight(
+        issue_number=_ISSUE,
+        repo=_REPO,
+        anchor_comment_urls=[_URL],
+        fixture_path=fixture_path,
+        known_context=known_context,
+        consume_contract_patch_plan=True,
+        contract_update_callbacks=callbacks,
+    )
 
     assert calls["apply_transaction"] == 1
     assert result["contract_update"]["writes"] == 1

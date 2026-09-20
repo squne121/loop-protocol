@@ -220,7 +220,8 @@ freeform directive では常に空になる（`derive_contract_patch_operations(
 
 1. `preflight.run.with_human_context` を `--investigation-evidence-transport-path <manifest>`
    付きで実行し、`route.action == "contract_update_required"` を確認する（read-only）。
-2. **同一の** `<manifest>` パスを、同一の呼び出しで `contract_update.run.with_human_context` へ
+2. ステップ1の read-only invocation で使用した**同一の `<manifest>` パス**を、command ID が異なる
+   （＝呼び出し自体は別の）直後の `contract_update.run.with_human_context` invocation に再利用して
    そのまま渡す（`--investigation-evidence-transport-path <manifest>`）。read-only 呼び出しとは
    別の transport manifest を新たに生成し直す必要はない。
 
