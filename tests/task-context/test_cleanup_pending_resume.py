@@ -88,3 +88,46 @@ def test_given_task_a_accepted_merge_when_task_b_begins_same_cleanup_identity_th
     assert service.get_activity(conn, activity_b["id"])["status"] == "ACTIVE"
     assert signals.cleanup_pending_for_task(conn, task_a["id"]) is True
     assert signals.cleanup_pending_for_task(conn, task_b["id"]) is False
+
+
+def test_given_cleanup_already_completed_when_fresh_binding_normal_prompts_same_issue_then_done_implementation_is_not_reselected(
+    conn,
+):
+    """fix_delta Finding 1 (PR #2661 OWNER review): the merge-gap fallback in
+    ``_select_activity_for_binding_tx`` must resume the historical
+    implementation Activity only while cleanup has NOT yet begun for the
+    accepted merge fact. Once cleanup has begun *and completed*, the
+    ``workflow:pr_merged_observed`` event remaining in history must not keep
+    re-selecting the DONE implementation Activity for a fresh Binding's
+    ordinary autobind -- it must fall through to a new native Activity."""
+    task, implementation_id = _accepted_cleanup(conn)
+    assert (
+        signals.apply_workflow_signal(conn, cleanup_completed_payload(), origin_session_id="session-1")["disposition"]
+        == "applied"
+    )
+    assert service.get_activity(conn, implementation_id)["status"] == "DONE"
+
+    # Fresh Binding, ordinary autobind ("normal prompt on the same Issue") --
+    # not a cleanup-lifecycle call and not the same Binding/session as above.
+    fresh_binding = service.create_binding(conn)
+
+    result = service.bind_target_to_binding(
+        conn,
+        binding_id=fresh_binding["id"],
+        execution_run_id=None,
+        repo=REPO,
+        ref_kind="issue",
+        ref_number=20,
+        reason_code="autobind",
+    )
+
+    assert result["task_id"] == task["id"]
+    assert result["activity_id"] != implementation_id, (
+        "a fresh Binding's normal prompt must not re-attach to the DONE implementation Activity"
+    )
+    resumed = service.get_activity(conn, result["activity_id"])
+    assert resumed["kind"] == "native_operator"
+    assert resumed["status"] == "ACTIVE"
+    # The DONE implementation Activity itself must stay untouched (no
+    # resurrection/mutation), and cleanup must stay in its completed state.
+    assert service.get_activity(conn, implementation_id)["status"] == "DONE"

@@ -143,6 +143,42 @@ def test_given_accepted_merge_before_cleanup_begin_when_fresh_binding_resumes_th
     assert service.get_current_task_activity_for_binding(conn, started["binding_id"])[1] == selected["activity_id"]
 
 
+def test_given_merged_implementation_when_delayed_signal_for_different_issue_same_pr_arrives_then_it_is_identity_conflict_not_activity_terminal(
+    conn,
+):
+    """fix_delta Finding 2 (PR #2661 OWNER review): the ``implementation``
+    dedupe key identifies ``repo+PR`` only, not the Issue. Per AC3's
+    precedence (claim/Task consistency -> same-fact dedupe -> phase/terminal
+    judgment), a same-PR-but-different-Issue replay must be classified as
+    ``conflict``/``FACT_TASK_IDENTITY_CONFLICT`` even once the
+    implementation Activity has already reached DONE -- it must never be
+    misclassified as ``duplicate_noop``/``activity_terminal``."""
+    task, implementation, _, _ = create_origin(conn)
+    assert (
+        signals.apply_workflow_signal(conn, implementation_payload(issue_number=20, pr_number=21), origin_session_id="session-1")[
+            "disposition"
+        ]
+        == "applied"
+    )
+    assert (
+        signals.apply_workflow_signal(conn, merged_payload(issue_number=20, pr_number=21), origin_session_id="session-1")[
+            "disposition"
+        ]
+        == "applied"
+    )
+    assert service.get_activity(conn, implementation["id"])["status"] == "DONE"
+    before = _db_snapshot(conn)
+
+    # A delayed signal for a *different* Issue (#22) on the *same* PR (#21).
+    result = signals.apply_workflow_signal(
+        conn, implementation_payload(issue_number=22, pr_number=21), origin_session_id="session-1"
+    )
+
+    assert result == {"disposition": "conflict", "reason_code": "FACT_TASK_IDENTITY_CONFLICT"}
+    assert _db_snapshot(conn) == before
+    assert service.get_activity(conn, implementation["id"])["status"] == "DONE"
+
+
 def test_given_released_claims_when_same_task_or_other_task_replays_accepted_fact_then_no_state_is_written(conn):
     task_a, _, _, _ = create_origin(conn, session="session-a")
     assert signals.apply_workflow_signal(conn, implementation_payload(), origin_session_id="session-a")["disposition"] == "applied"

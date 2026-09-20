@@ -996,6 +996,38 @@ def _ensure_active_activity_tx(conn: sqlite3.Connection, task_id: str, kind: str
     return _transition_activity_tx(conn, task_id, kind)
 
 
+def _cleanup_already_begun_for_merge_tx(conn: sqlite3.Connection, task_id: str, merged_row: sqlite3.Row) -> bool:
+    """True when a ``workflow:cleanup_started`` event already exists for the
+    same ``(repo, pr_number)`` the merge-gap fallback below would otherwise
+    resume the historical implementation Activity for.
+
+    Once cleanup has begun (whether it is still ACTIVE or has since reached
+    DONE), the merge-gap fallback must not fire again: cleanup already owns
+    -- or has already finished -- the post-merge transition, so a fresh
+    Binding must fall through to the ordinary activity-transition path
+    instead of re-attaching to a completed implementation Activity.
+    """
+    try:
+        merged_metadata = json.loads(merged_row["metadata_json"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    repo, pr_number = merged_metadata.get("repo"), merged_metadata.get("pr_number")
+    if repo is None or pr_number is None:
+        return False
+    rows = conn.execute(
+        "SELECT metadata_json FROM events WHERE task_id = ? AND event_type = 'workflow:cleanup_started'",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            cleanup_metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if cleanup_metadata.get("repo") == repo and cleanup_metadata.get("pr_number") == pr_number:
+            return True
+    return False
+
+
 def _select_activity_for_binding_tx(conn: sqlite3.Connection, task_id: str, kind: str) -> str:
     """Select an ACTIVE Activity, except resume a merge-accepted Task at its
     historical implementation Activity until cleanup owns the next transition.
@@ -1005,6 +1037,14 @@ def _select_activity_for_binding_tx(conn: sqlite3.Connection, task_id: str, kind
     Activity in that narrow gap would make the canonical cleanup transition
     out-of-order.  Reattach to the completed implementation Activity instead;
     ``begin_cleanup_lifecycle`` owns creating and binding cleanup atomically.
+
+    This fallback is scoped strictly to that narrow gap: it only applies
+    while no cleanup instance has begun yet for the accepted merge fact
+    (``_cleanup_already_begun_for_merge_tx`` is False). Once cleanup has
+    begun -- ACTIVE or already DONE -- the ``pr_merged_observed`` event
+    remaining in history must not keep re-selecting the DONE implementation
+    Activity; fall through to the ordinary ``_transition_activity_tx`` path
+    so the session is free to start/advance to the next normal Activity.
     """
     active = conn.execute(
         "SELECT id FROM activities WHERE task_id = ? AND status = 'ACTIVE'", (task_id,)
@@ -1012,11 +1052,11 @@ def _select_activity_for_binding_tx(conn: sqlite3.Connection, task_id: str, kind
     if active is not None:
         return active["id"]
     merged = conn.execute(
-        "SELECT activity_id FROM events WHERE task_id = ? AND event_type = 'workflow:pr_merged_observed' "
+        "SELECT activity_id, metadata_json FROM events WHERE task_id = ? AND event_type = 'workflow:pr_merged_observed' "
         "AND activity_id IS NOT NULL ORDER BY occurred_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if merged is not None:
+    if merged is not None and not _cleanup_already_begun_for_merge_tx(conn, task_id, merged):
         implementation = conn.execute(
             "SELECT id FROM activities WHERE id = ? AND task_id = ? AND kind = 'implementation'",
             (merged["activity_id"], task_id),

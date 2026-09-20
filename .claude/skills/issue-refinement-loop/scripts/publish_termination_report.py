@@ -491,13 +491,27 @@ def _post_github_comment(
 # ---------------------------------------------------------------------------
 
 
-def _emit_refinement_approved_signal(*, repo: str, issue_number: int, approved_body_sha256: str | None) -> None:
-    """Post-publish best-effort adapter; it cannot undo a published handoff."""
+def _emit_refinement_approved_signal(
+    *, repo: str, issue_number: int, approved_body_sha256: str | None
+) -> tuple[str, str]:
+    """Post-publish best-effort adapter; it cannot undo a published handoff.
+
+    Returns ``(disposition, reason_code)`` the same way
+    ``open_pr.emit_implementation_pr_observed()`` already does. The
+    canonical approved-handoff publish above has already succeeded and
+    stays independent of this outcome -- this return value only lets the
+    caller surface a silent Task Context sync failure (e.g. ``deferred`` /
+    ``unbound`` from a stale origin session) instead of discarding it, so it
+    no longer only shows up later as a confusing downstream
+    ``activity_missing``. Never fail-closed, never rolled back.
+    """
     origin = os.environ.get("CLAUDE_CODE_SESSION_ID")
-    if not origin or not isinstance(approved_body_sha256, str):
-        return
-    if __import__("re").fullmatch(r"[0-9a-f]{64}", approved_body_sha256) is None:
-        return
+    if not origin:
+        return "deferred", "unbound"
+    if not isinstance(approved_body_sha256, str) or __import__("re").fullmatch(
+        r"[0-9a-f]{64}", approved_body_sha256
+    ) is None:
+        return "rejected_evidence", "INVALID_APPROVED_BODY_SHA256"
     payload = {
         "signal_kind": "refinement_approved",
         "source": "issue-refinement-loop",
@@ -506,15 +520,18 @@ def _emit_refinement_approved_signal(*, repo: str, issue_number: int, approved_b
     }
     ctl = _PROJECT_ROOT / "scripts" / "task-context" / "task_contextctl.py"
     try:
-        subprocess.run(
+        proc = subprocess.run(
             [sys.executable, str(ctl), "signal", "apply"],
             input=json.dumps(payload),
             text=True,
             capture_output=True,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
-        pass
+        data = json.loads(proc.stdout.splitlines()[-1]) if proc.stdout.splitlines() else {}
+        result = data.get("data", {}) if isinstance(data, dict) else {}
+        return str(result.get("disposition", "deferred")), str(result.get("reason_code", "ADAPTER_UNAVAILABLE"))
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, IndexError):
+        return "deferred", "ADAPTER_UNAVAILABLE"
 
 
 def publish(
@@ -545,9 +562,26 @@ def publish(
         return 1
 
     if termination_reason == "approved":
-        _emit_refinement_approved_signal(
+        signal_disposition, signal_reason = _emit_refinement_approved_signal(
             repo=repo, issue_number=issue_number, approved_body_sha256=approved_body_sha256
         )
+        print(
+            f"[publish_termination_report] task_context refinement_approved signal "
+            f"disposition={signal_disposition!r} reason_code={signal_reason!r}",
+            file=sys.stderr,
+        )
+        # The canonical approved-handoff publish above already succeeded and
+        # stays independent of this outcome (never fail-closed, never
+        # rolled back). Anything other than a clean applied/duplicate
+        # outcome is recorded to the existing artifact log so a stale-origin
+        # sync failure is diagnosable here instead of only surfacing later
+        # as a confusing downstream `activity_missing`.
+        if signal_disposition not in {"applied", "duplicate_noop"}:
+            _record_artifact(
+                issue_number=issue_number,
+                reason_code="task_context_signal_not_applied",
+                extra={"signal_disposition": signal_disposition, "signal_reason_code": signal_reason},
+            )
     print(
         f"[publish_termination_report] comment posted for issue #{issue_number}",
         file=sys.stderr,

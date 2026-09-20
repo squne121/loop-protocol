@@ -362,19 +362,29 @@ def apply_workflow_signal(
                 implementation = _activity_for_tx(conn, task_id, "implementation")
                 if implementation is None:
                     return _outcome("deferred", "activity_missing")
-                if implementation["status"] != "ACTIVE":
-                    return _outcome("duplicate_noop", "activity_terminal", task_id=task_id)
                 # The implementation dedupe key deliberately identifies a PR,
-                # not an Issue. A replay with that PR but another Issue is a
-                # conflict, never an opportunity to attach a second Issue claim.
+                # not an Issue. Per AC3's precedence (claim/Task consistency
+                # -> same-fact dedupe -> phase/terminal judgment), identity
+                # must be judged before phase/terminal status: an exact
+                # replay of the accepted fact falls through to the common
+                # SAME_TASK_SAME_FACT dedupe below regardless of Activity
+                # status, and a replay with the same PR but another Issue is
+                # always an identity conflict -- never a duplicate_noop --
+                # even once the implementation Activity has already reached
+                # DONE. Only a genuinely new fact (no accepted event for this
+                # dedupe key belongs to this Task) arriving after the
+                # Activity is already terminal is `activity_terminal`.
                 accepted_implementation = _accepted_event_tx(conn, key)
-                if accepted_implementation and accepted_implementation["task_id"] == task_id and not _metadata_matches(
-                    accepted_implementation,
-                    repo=evidence["repo"],
-                    issue_number=evidence["issue_number"],
-                    pr_number=evidence["pr_number"],
-                ):
-                    return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
+                if accepted_implementation and accepted_implementation["task_id"] == task_id:
+                    if not _metadata_matches(
+                        accepted_implementation,
+                        repo=evidence["repo"],
+                        issue_number=evidence["issue_number"],
+                        pr_number=evidence["pr_number"],
+                    ):
+                        return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
+                elif implementation["status"] != "ACTIVE":
+                    return _outcome("duplicate_noop", "activity_terminal", task_id=task_id)
                 outcome = _validate_implementation_claims_tx(conn, task_id, evidence)
             elif kind == "pr_merged_observed":
                 outcome = _validate_merged_prerequisites_tx(conn, task_id, evidence)

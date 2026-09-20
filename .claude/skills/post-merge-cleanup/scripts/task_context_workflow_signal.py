@@ -87,16 +87,39 @@ def _merged_evidence(snapshot: object, issue_number: int, pr_number: int) -> tup
 
 
 def _run(argv: list[str], body: dict) -> dict:
-    proc = subprocess.run(
-        [sys.executable, str(_CTL), *argv], input=json.dumps(body), text=True, capture_output=True, timeout=15
-    )
+    """Invoke ``task_contextctl`` and normalize its result to the typed
+    ``{"disposition": ..., "reason_code": ...}`` shape every other producer
+    adapter (e.g. ``open_pr.emit_implementation_pr_observed``) already
+    returns.
+
+    A subprocess timeout/OSError, an unparsable/empty stdout, or a
+    well-formed ``status: error`` result envelope (whose ``data`` carries
+    ``{message, details}``, not a typed disposition) are all normalized to a
+    diagnosable ``deferred`` outcome instead of an uncaught exception or a
+    bare ``{}``. This is a read normalization only -- it never rolls back or
+    fail-closes any already-completed post-merge cleanup work.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(_CTL), *argv], input=json.dumps(body), text=True, capture_output=True, timeout=15
+        )
+    except (subprocess.SubprocessError, OSError):
+        return {"disposition": "deferred", "reason_code": "ADAPTER_UNAVAILABLE"}
     if not proc.stdout.splitlines():
         return {"disposition": "deferred", "reason_code": "ADAPTER_UNAVAILABLE"}
     try:
         envelope = json.loads(proc.stdout.splitlines()[-1])
-        return envelope.get("data", {}) if isinstance(envelope, dict) else {}
     except json.JSONDecodeError:
         return {"disposition": "deferred", "reason_code": "ADAPTER_UNAVAILABLE"}
+    if not isinstance(envelope, dict):
+        return {"disposition": "deferred", "reason_code": "ADAPTER_UNAVAILABLE"}
+    data = envelope.get("data", {})
+    if isinstance(data, dict) and "disposition" in data:
+        return data
+    # status: error (or any other envelope shape lacking a typed
+    # disposition) -- surface the envelope's own error code rather than
+    # silently returning {message, details} or {}.
+    return {"disposition": "deferred", "reason_code": str(envelope.get("code", "ADAPTER_UNAVAILABLE"))}
 
 
 def main(argv: list[str] | None = None) -> int:
