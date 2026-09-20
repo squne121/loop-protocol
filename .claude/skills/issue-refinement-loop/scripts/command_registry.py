@@ -369,6 +369,8 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "--repo", "{repo}",
             "--anchor-comment-url", "{anchor_comment_url}",
             "--human-context-comment-url", "{anchor_comment_url}",
+            "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
+            "--investigation-evidence-primary-root", "{investigation_evidence_primary_root}",
             "--consume-contract-patch-plan",
         ],
         "shell": False,
@@ -392,6 +394,23 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "issue_number": {"type": "positive_int", "required": True},
             "repo": {"type": "owner_repo", "required": True},
             "anchor_comment_url": {"type": "github_issue_comment_url", "required": True},
+            # Issue #2678 AC1: mirrors `preflight.run.with_human_context`'s
+            # SAME optional transport/primary-root pair -- an invocation
+            # without a read-only-investigation directive never supplies
+            # this, and render_command()'s `optional_flag_pair` mechanism
+            # drops the whole `--investigation-evidence-transport-path
+            # {value}` pair when absent, keeping transport-absent argv
+            # byte-identical to pre-#2678 behavior (AC4).
+            "investigation_evidence_transport_path": {
+                "type": "path", "required": False, "optional_flag_pair": True,
+            },
+            # Issue #2678 AC2: the privileged executor's explicit handoff of
+            # the PRIMARY checkout's own absolute path, ONLY ever rendered
+            # when `investigation_evidence_transport_path` is itself present
+            # -- never a generic, independently-suppliable placeholder.
+            "investigation_evidence_primary_root": {
+                "type": "path", "required": False, "optional_flag_pair": True,
+            },
         },
     },
     # Issue #1547: scope_rollup.run exact command -- bound directly to

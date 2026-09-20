@@ -148,6 +148,20 @@ uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
 
 このphaseは既存patch planをtransaction-localにconsumerへ渡し、candidate static readiness、controlled transaction、final readback、fresh preflight/review/readiness入力までを一続きに実行する。subagent / isolation worktree はこのcommandを直接実行しない。新しい永続schema、receipt、publisher、state storeは作らない。
 
+**investigation evidence transport（Issue #2678、#2086 AC3 の mutation phase 拡張）:**
+`preflight.run.with_human_context`（read-only lane）が `--investigation-evidence-transport-path` を渡して `expands_allowed_paths` boundary を解除し `contract_update_required` decision を得た場合、同一の transport manifest path を **同一の呼び出しで** `contract_update.run.with_human_context` へもそのまま引き渡す（read-only preflight とは別の invocation を独立に起動するのではなく、read-only preflight が生成した transport manifest をこの mutation phase 呼び出しへ再利用する）:
+
+```bash
+uv run --locked python3 scripts/agent-guards/skill_runtime_exec.py \
+  --command-id contract_update.run.with_human_context \
+  --issue-number <N> \
+  --repo <owner/repo> \
+  --anchor-comment-url <canonical GitHub issue comment URL> \
+  --investigation-evidence-transport-path <repo-relative manifest path>
+```
+
+`--investigation-evidence-transport-path` は `optional_flag_pair`（省略可能。省略時は transport-absent の既存挙動と byte-identical）。`--investigation-evidence-primary-root` は **caller が渡してはならない** — `skill_runtime_exec.py` 自身の CLI はこのフラグを受け付けず、常に executor 内部で確認済みの `project_root`（専用worktree dispatch 前の PRIMARY checkout の絶対パス）から自動生成し、transport path が指定された場合にのみ子プロセスへ内部的に付与する。transport が明示指定され、かつ digest / issue / repo / anchor / body / HEAD / path confinement のいずれかの検証に失敗した場合、anchor 本文単独から別の有効な patch plan が導出可能であっても mutation consumer（`consume_trusted_anchor_contract_patch_plan()`）は呼び出されず、GitHub 更新要求も発生しない（write-zero 保証、`.claude/skills/issue-refinement-loop/tests/test_investigation_evidence_transport_mutation_guard.py` 参照）。`destructive_or_non_idempotent_operation` / `changes_permission_boundary` / `changes_external_service_boundary` / `requires_issue_split` boundary は investigation evidence によって緩和されない（`expands_allowed_paths` のみが対象、`.claude/skills/issue-refinement-loop/tests/test_investigation_evidence_transport_boundary_flags.py` 参照）。
+
 wrapper の出力フィールドを確認する:
 
 **canonical stdout フィールド（機械可読）:**
