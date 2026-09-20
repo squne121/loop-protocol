@@ -45,7 +45,13 @@ def _reaction(*, reaction_id: int, content: str, user_id: int, login: str = "som
     return {"id": reaction_id, "content": content, "user": {"id": user_id, "login": login}}
 
 
-def _binding(*, comment_body: str = "preview body", issue_body: str = "issue body", reaction_option_map=None, options=None) -> dict:
+def _binding(
+    *,
+    comment_body: str = "preview body",
+    issue_body: str = "issue body",
+    reaction_option_map=None,
+    options=None,
+) -> dict:
     reaction_option_map = reaction_option_map if reaction_option_map is not None else {
         "+1": "option_a",
         "eyes": "option_b",
@@ -63,7 +69,13 @@ def _binding(*, comment_body: str = "preview body", issue_body: str = "issue bod
     }
 
 
-def _fake_runner(*, comment_body="preview body", issue_body="issue body", reactions_pages=None, reactions_result: "m.GhInvocationResult | None" = None):
+def _fake_runner(
+    *,
+    comment_body="preview body",
+    issue_body="issue body",
+    reactions_pages=None,
+    reactions_result: "m.GhInvocationResult | None" = None,
+):
     """Build a gh_runner covering the comment/issue fetches (drift check)
     trivially succeeding at the given bodies, with the reactions fetch
     controlled either by `reactions_pages` (a list-of-lists to JSON-encode
