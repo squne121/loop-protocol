@@ -191,10 +191,68 @@ CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS = frozenset(
     {"contract_update.run.with_anchor", "contract_update.run.with_human_context"}
 )
 
+# Issue #2584: a capability independent of
+# `CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS` above. That frozenset
+# stays scoped to its original 2 commands and keeps driving the `tmp/`
+# directory-node exemption (`_snapshot_repo_paths()`), the cold-worktree
+# `tmp/` pre-creation fix, and the inner-transaction-result evidence lookup
+# (`_resolve_inner_transaction_evidence_fields()`) -- none of that behavior
+# is touched or extended here. This new frozenset ONLY governs
+# `_allowed_artifact_roots()`'s decision to additionally permit
+# `artifacts/{issue}/issue-metadata/` as a write root, for every command_id
+# whose child dispatch is known to route a real GitHub Issue-body mutation
+# through the SAME `edit_issue_txn.py` transaction core (directly, as with
+# `repair_action.apply`/`structural_repair_action.apply`'s shared
+# `_dispatch_candidate_body_via_edit_txn()`, or via a non-noop
+# `authority_transport.consume` path): before this Issue, a successful
+# mutation by any of the 3 non-`contract_update.run.*` members here was
+# misreported as `unauthorized_write_path` even though the write landed
+# inside this exact Issue-scoped metadata directory (false negative).
+ISSUE_METADATA_WRITE_COMMAND_IDS = frozenset(
+    {
+        "contract_update.run.with_anchor",
+        "contract_update.run.with_human_context",
+        "authority_transport.consume",
+        "repair_action.apply",
+        "structural_repair_action.apply",
+    }
+)
+
+# Issue #2584 In Scope item 5 (owner decision): a SECOND capability,
+# independent of BOTH `CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS` and
+# `ISSUE_METADATA_WRITE_COMMAND_IDS` above, though it happens to share the
+# SAME 5 command_ids as the latter (every member's child dispatch can reach
+# `edit_issue_txn.py`'s transaction core, which uses the repo-root `tmp/`
+# directory-node as its transaction-local scratch workspace -- the SAME
+# reason `CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS` already carries its
+# own `tmp/` exemption for its original 2 members). This frozenset governs
+# ONLY the `tmp/` directory-node housekeeping exemption (the cold-worktree
+# pre-creation in `_dispatch_child_and_check_postconditions()` and the
+# directory-node mtime-churn exclusion in `_snapshot_repo_paths()`) for the 3
+# additional (non-`contract_update.run.*`) members. It must NEVER be merged
+# with `CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS` -- every call site
+# that consults either frozenset for `tmp/` housekeeping keeps its own
+# separate `if command_id in ...` branch, so widening/narrowing one
+# frozenset's membership can never silently change the other's behavior.
+# `CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS` keeps sole, unmodified
+# ownership of every OTHER semantic it already drives (the cold-worktree
+# `tmp/` pre-creation's own contract_update-specific comment/rationale, and
+# `_resolve_inner_transaction_evidence_fields()`'s inner-transaction-result
+# evidence lookup) -- none of that is touched or extended by this frozenset.
+TMP_DIRECTORY_NODE_HOUSEKEEPING_COMMAND_IDS = frozenset(
+    {
+        "contract_update.run.with_anchor",
+        "contract_update.run.with_human_context",
+        "authority_transport.consume",
+        "repair_action.apply",
+        "structural_repair_action.apply",
+    }
+)
+
 
 def _allowed_artifact_roots(project_root: str, issue_number: str, command_id: str = "") -> tuple[Path, ...]:
     roots = [Path(project_root) / ".claude" / "artifacts" / "issue-refinement-loop" / issue_number]
-    if command_id in CONTRACT_UPDATE_MUTATION_DEDICATED_COMMAND_IDS:
+    if command_id in ISSUE_METADATA_WRITE_COMMAND_IDS:
         # The existing edit-issue transaction writes its request metadata
         # under this exact Issue-scoped directory.  Do not grant the phase a
         # broader artifacts root or a second Issue's metadata directory.
@@ -534,6 +592,18 @@ def _snapshot_repo_paths(project_root: str, issue_number: str, command_id: str =
         # files, and deletes those files before returning.  Ignore only the
         # directory-node mtime churn here; any residual child path remains in
         # the snapshot and is still rejected below.
+        allowed_parent_dirs.add(root / "tmp")
+    # Issue #2584 In Scope item 5: a SEPARATE, independent gate for the SAME
+    # `tmp/` directory-node mtime-churn exclusion, covering the 3 additional
+    # command_ids whose dispatch also reaches `edit_issue_txn.py`'s
+    # transaction core outside the `CONTRACT_UPDATE_MUTATION_DEDICATED_
+    # COMMAND_IDS` branch above. `allowed_parent_dirs` is a set, so adding
+    # the SAME `root / "tmp"` path here when BOTH conditions happen to be
+    # true (e.g. `contract_update.run.with_anchor`) is a no-op, never a
+    # double-exemption -- only the directory-NODE's own entry is ever
+    # skipped; every residual child path left inside `tmp/` after the child
+    # returns is still walked and still rejected below, exactly as before.
+    if command_id in TMP_DIRECTORY_NODE_HOUSEKEEPING_COMMAND_IDS:
         allowed_parent_dirs.add(root / "tmp")
     # Issue #1409: also skip recording the directory-node entry (its own
     # mtime/size) for every ancestor of each race-tolerant-unattributable
@@ -2250,6 +2320,19 @@ def _dispatch_child_and_check_postconditions(
         # gap without weakening either check or excluding `tmp/**` wholesale
         # (a residual child path left inside `tmp/` after the child returns
         # is still rejected by both diffs, exactly as before).
+        (Path(dispatch_root) / "tmp").mkdir(parents=True, exist_ok=True)
+    # Issue #2584 In Scope item 5: a SEPARATE, independent gate performing
+    # the SAME cold-worktree `tmp/` pre-creation for the 3 additional
+    # command_ids that also dispatch through `edit_issue_txn.py`'s
+    # transaction core outside the `CONTRACT_UPDATE_MUTATION_DEDICATED_
+    # COMMAND_IDS` branch above (owner decision: this branch must never be
+    # merged with, or have its own contract-update-specific rationale
+    # reused by, that branch -- see `TMP_DIRECTORY_NODE_HOUSEKEEPING_
+    # COMMAND_IDS`'s own module-level docstring). `mkdir(..., exist_ok=True)`
+    # is idempotent, so both branches firing for a `CONTRACT_UPDATE_
+    # MUTATION_DEDICATED_COMMAND_IDS` member (which is ALSO a member of this
+    # frozenset) is a harmless no-op, never a double-creation.
+    if command_id in TMP_DIRECTORY_NODE_HOUSEKEEPING_COMMAND_IDS:
         (Path(dispatch_root) / "tmp").mkdir(parents=True, exist_ok=True)
     # Issue #2393 P1-B: captured BEFORE the child runs, so
     # `_resolve_inner_transaction_evidence_fields()` can later distinguish

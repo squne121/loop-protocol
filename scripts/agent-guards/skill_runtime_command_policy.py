@@ -230,12 +230,21 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
         # placeholders are supplied, this command's default execution path
         # genuinely performs a real GitHub issue mutation via
         # `edit_issue_txn.py`'s `gh` subprocess calls.
+        # Issue #2584: `authority_transport.consume` reaches the SAME
+        # `edit_issue_txn.py` transaction core as `contract_update.run.*`
+        # whenever `--contract-patch-plan-file`/`--anchor-context-file` are
+        # supplied (non-noop path), so its `allowed_write_roots` is aligned
+        # to the SAME 2-root shape as those two profiles -- previously
+        # missing `artifacts/{active_issue}/issue-metadata/` here caused a
+        # successful mutation to be misreported as `unauthorized_write_path`
+        # by `skill_runtime_exec.py`'s outer postcondition audit.
         "authority_transport.consume": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_CONSUMER,
             "required_cwd": "canonical_main_root",
             "required_branch": "default_branch",
             "allowed_write_roots": [
                 ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+                "artifacts/{active_issue}/issue-metadata/",
             ],
             "network_effect": "github_mutation",
         },
@@ -244,24 +253,36 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
         # controlled edit_issue_txn.py Issue-body mutation. Bound to the
         # issue's own active worktree (not root-no-worktree eligible), same
         # boundary as authority_transport.consume.
+        # Issue #2584: `allowed_write_roots` widened to the SAME 2-root
+        # shape as `contract_update.run.*` -- `_dispatch_candidate_body_via_
+        # edit_txn()` writes its request metadata under
+        # `artifacts/{active_issue}/issue-metadata/`, and the previously
+        # missing second root caused a successful mutation to be
+        # misreported as `unauthorized_write_path` (false negative).
         "repair_action.apply": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_REPAIR_ACTION_APPLY,
             "required_cwd": "canonical_main_root",
             "required_branch": "default_branch",
             "allowed_write_roots": [
                 ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+                "artifacts/{active_issue}/issue-metadata/",
             ],
             "network_effect": "github_mutation",
         },
         # Issue #2402: sibling policy for PR #2400's existing structural
         # consumer. This only validates outer transport; nested structural
         # bundle semantics remain the consumer's responsibility.
+        # Issue #2584: same `allowed_write_roots` widening as
+        # `repair_action.apply` above -- `structural_repair_action.apply`
+        # shares the same `_dispatch_candidate_body_via_edit_txn()`
+        # transaction core.
         "structural_repair_action.apply": {
             "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_STRUCTURAL_REPAIR_ACTION_APPLY,
             "required_cwd": "canonical_main_root",
             "required_branch": "default_branch",
             "allowed_write_roots": [
                 ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+                "artifacts/{active_issue}/issue-metadata/",
             ],
             "network_effect": "github_mutation",
         },
@@ -2268,15 +2289,31 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
     if entry.get("network_effect") != policy["network_effect"]:
         raise ValueError("network_effect_mismatch")
     expected_write_roots = [".claude/artifacts/issue-refinement-loop/{active_issue}/"]
-    if command_id in {"contract_update.run.with_anchor", "contract_update.run.with_human_context"}:
+    # Issue #2584: `authority_transport.consume` / `repair_action.apply` /
+    # `structural_repair_action.apply` join `contract_update.run.with_anchor`
+    # / `contract_update.run.with_human_context` here -- all 5 command_ids
+    # can route a real GitHub Issue-body mutation through the SAME
+    # `edit_issue_txn.py` transaction core, which writes its request
+    # metadata under `artifacts/{active_issue}/issue-metadata/`. This set is
+    # intentionally NOT widened to every `network_effect: github_mutation`
+    # command_id in general (e.g. `decide.run` / `authority_transport.produce`
+    # stay on the single default root below -- neither one ever reaches
+    # `edit_issue_txn.py`).
+    if command_id in {
+        "contract_update.run.with_anchor",
+        "contract_update.run.with_human_context",
+        "authority_transport.consume",
+        "repair_action.apply",
+        "structural_repair_action.apply",
+    }:
         expected_write_roots.append("artifacts/{active_issue}/issue-metadata/")
-    # #2086 AC10 (iteration 2): `decide.run` / `authority_transport.produce` /
-    # `authority_transport.consume` all now use the same
-    # `.claude/artifacts/issue-refinement-loop/{active_issue}/` write root as
-    # every other eligible command_id (matching this module's own
-    # eligible_command_ids declarations, which were already merged from
+    # #2086 AC10 (iteration 2): `decide.run` / `authority_transport.produce`
+    # still use the same `.claude/artifacts/issue-refinement-loop/{active_issue}/`
+    # write root as every other eligible command_id (matching this module's
+    # own eligible_command_ids declarations, which were already merged from
     # #2053/PR #2068 before this Issue's AC10 wiring made this function
-    # actually check them) -- no per-command-id exception is needed.
+    # actually check them) -- no per-command-id exception is needed for
+    # those two.
     if entry.get("allowed_write_roots") != expected_write_roots:
         raise ValueError("allowed_write_roots_mismatch")
     argv = entry.get("argv")
