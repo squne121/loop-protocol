@@ -75,6 +75,21 @@ SKILL_RUNTIME_EXECUTION_CLASS_REPAIR_ACTION_APPLY = "exact_repair_action_apply"
 # Its command ID, outer flag, and parser remain separate from the generic lane.
 SKILL_RUNTIME_EXECUTION_CLASS_STRUCTURAL_REPAIR_ACTION_APPLY = "exact_structural_repair_action_apply"
 _DECIDE_VERDICT_VALUES = frozenset({"approve", "request_changes", "needs-fix"})
+# Issue #2689 P0-1 fix_delta (PR #2697 OWNER review comment #5755475318):
+# mirrors `_DECIDE_VERDICT_VALUES` above -- the SAME 5 literal heavy
+# mutation categories `command_registry.py`'s own `_MUTATION_CATEGORY_VALUES`
+# / `run_refinement_preflight.py`'s own `HEAVY_MUTATION_CATEGORIES`
+# independently declare (no cross-module import; same established
+# duplicated-literal-set pattern this file already uses for verdicts).
+_HEAVY_MUTATION_CATEGORY_VALUES = frozenset(
+    {
+        "close",
+        "not_planned",
+        "replacement_issue_creation",
+        "dependency_removal",
+        "parent_child_change",
+    }
+)
 
 
 # Canonical GitHub issue comment URL shape used both for the registry
@@ -476,10 +491,17 @@ class ExactSkillRuntimeCommand:
     # Issue #2039 AC8/AC11: repair_action.apply field.
     preflight_result_path: str = ""
     # Issue #2688: owner_reaction.decide / owner_reaction.decide.fixture
-    # fields.
+    # fields. Issue #2689 reuses `owner_user_id`/`preview_binding_file` for
+    # the SAME conceptual values carried by
+    # `preflight.run.with_human_context`/`contract_update.run.with_human_context`'s
+    # own optional mutation-gate transport triple (below).
     owner_user_id: str = ""
     preview_binding_file: str = ""
     gh_fixture_file: str = ""
+    # Issue #2689 P0-1 fix_delta: optional mutation-gate transport triple
+    # carried by `preflight.run.with_human_context` /
+    # `contract_update.run.with_human_context` only.
+    mutation_category: str = ""
 
 
 def command_allows_root_no_worktree(parsed: ExactSkillRuntimeCommand) -> bool:
@@ -1932,16 +1954,40 @@ def _parse_exact_skill_runtime_anchor_command(
         "preflight.run.with_human_context",
         "contract_update.run.with_human_context",
     )
-    if len(tokens) == base_expected_length:
-        pass
+    # Issue #2689 P0-1 fix_delta: the SAME two command_ids ALSO allow an
+    # exact, atomic 6-token `--mutation-category <cat> --owner-user-id
+    # <positive-int> --preview-binding-file <repo-relative-path>` suffix,
+    # appended AFTER whichever investigation-evidence suffix (0/2/4 tokens)
+    # was consumed above -- never independently, never partially. This
+    # reuses the SAME "allows_investigation_transport" command_id set
+    # (rather than a new frozenset) because both extensions are gated on the
+    # identical two production human-context profiles.
+    allows_mutation_gate_transport = allows_investigation_transport
+    mutation_category: "str | None" = None
+    owner_user_id: "str | None" = None
+    preview_binding_file: "str | None" = None
+    if len(tokens) < base_expected_length:
+        return None
+    elif (
+        len(tokens) == base_expected_length
+        or tokens[base_expected_length] != "--investigation-evidence-transport-path"
+    ):
+        # No investigation-evidence suffix at all -- the trailing tokens (if
+        # any) are checked below as the mutation-gate transport suffix
+        # instead (Issue #2689 P0-1 fix_delta), or there are none.
+        _evidence_suffix_len = 0
     elif (
         allows_investigation_transport
-        and len(tokens) == base_expected_length + 2
-        and tokens[base_expected_length] == "--investigation-evidence-transport-path"
+        and len(tokens) >= base_expected_length + 2
+        and (
+            len(tokens) == base_expected_length + 2
+            or tokens[base_expected_length + 2] != "--investigation-evidence-primary-root"
+        )
     ):
         investigation_evidence_transport_path = tokens[base_expected_length + 1]
         if not _is_safe_repo_relative_fixture_path(investigation_evidence_transport_path, root):
             return None
+        _evidence_suffix_len = 2
     elif (
         # Issue #2199 OWNER feedback P1-3: an OPTIONAL further two-token
         # `--investigation-evidence-primary-root <primary-root-abs-path>`
@@ -1956,7 +2002,7 @@ def _parse_exact_skill_runtime_anchor_command(
         # tampered/forged value can never redirect confinement to an
         # attacker-chosen alternate root.
         allows_investigation_transport
-        and len(tokens) == base_expected_length + 4
+        and len(tokens) >= base_expected_length + 4
         and tokens[base_expected_length] == "--investigation-evidence-transport-path"
         and tokens[base_expected_length + 2] == "--investigation-evidence-primary-root"
     ):
@@ -1965,6 +2011,32 @@ def _parse_exact_skill_runtime_anchor_command(
         if not _is_safe_repo_relative_fixture_path(investigation_evidence_transport_path, root):
             return None
         if os.path.realpath(investigation_evidence_primary_root) != root:
+            return None
+        _evidence_suffix_len = 4
+    else:
+        return None
+    # Issue #2689 P0-1 fix_delta: the mutation-gate transport triple, if
+    # present, is an exact 6-token block starting immediately after the
+    # investigation-evidence suffix consumed above -- no other trailing
+    # tokens are permitted (any remainder is rejected).
+    _mutation_suffix_start = base_expected_length + _evidence_suffix_len
+    if len(tokens) == _mutation_suffix_start:
+        pass
+    elif (
+        allows_mutation_gate_transport
+        and len(tokens) == _mutation_suffix_start + 6
+        and tokens[_mutation_suffix_start] == "--mutation-category"
+        and tokens[_mutation_suffix_start + 2] == "--owner-user-id"
+        and tokens[_mutation_suffix_start + 4] == "--preview-binding-file"
+    ):
+        mutation_category = tokens[_mutation_suffix_start + 1]
+        owner_user_id = tokens[_mutation_suffix_start + 3]
+        preview_binding_file = tokens[_mutation_suffix_start + 5]
+        if mutation_category not in _HEAVY_MUTATION_CATEGORY_VALUES:
+            return None
+        if not owner_user_id.isdigit() or int(owner_user_id) <= 0:
+            return None
+        if not _is_safe_issue_artifact_path(preview_binding_file, root, issue_number):
             return None
     else:
         return None
@@ -1992,6 +2064,9 @@ def _parse_exact_skill_runtime_anchor_command(
         repo=repo,
         argv=tuple(tokens),
         anchor_comment_url=anchor_comment_url,
+        mutation_category=mutation_category or "",
+        owner_user_id=owner_user_id or "",
+        preview_binding_file=preview_binding_file or "",
     )
 
 
@@ -2315,6 +2390,16 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         # rather than treated as a repo-relative path.
         "--investigation-evidence-primary-root",
         "{investigation_evidence_primary_root}",
+        # Issue #2689 P0-1 fix_delta: the SAME optional atomic
+        # mutation_category/owner_user_id/preview_binding_file triple
+        # `_parse_exact_skill_runtime_anchor_command()`'s own optional
+        # 6-token suffix handling now matches for this command_id.
+        "--mutation-category",
+        "{mutation_category}",
+        "--owner-user-id",
+        "{owner_user_id}",
+        "--preview-binding-file",
+        "{preview_binding_file}",
     ],
     "preflight.run.with_agent_report": [
         "uv",
@@ -2366,6 +2451,15 @@ _EXPECTED_ARGV_BY_COMMAND: dict[str, list[str]] = {
         "{investigation_evidence_transport_path}",
         "--investigation-evidence-primary-root",
         "{investigation_evidence_primary_root}",
+        # Issue #2689 P0-1 fix_delta: the SAME optional atomic
+        # mutation_category/owner_user_id/preview_binding_file triple as
+        # `preflight.run.with_human_context` above.
+        "--mutation-category",
+        "{mutation_category}",
+        "--owner-user-id",
+        "{owner_user_id}",
+        "--preview-binding-file",
+        "{preview_binding_file}",
         "--consume-contract-patch-plan",
     ],
     # #2086 AC10 (iteration 2): full argv template including #2053's
@@ -2536,6 +2630,23 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
             "required": False,
             "optional_flag_pair": True,
         },
+        # Issue #2689 P0-1 fix_delta: the atomic optional mutation-gate
+        # transport triple.
+        "mutation_category": {
+            "type": "mutation_category",
+            "required": False,
+            "optional_flag_pair": True,
+        },
+        "owner_user_id": {
+            "type": "positive_int",
+            "required": False,
+            "optional_flag_pair": True,
+        },
+        "preview_binding_file": {
+            "type": "repo_relative_file",
+            "required": False,
+            "optional_flag_pair": True,
+        },
     },
     "preflight.run.with_agent_report": {
         "issue_number": {"type": "positive_int", "required": True},
@@ -2561,6 +2672,23 @@ _EXPECTED_PLACEHOLDERS_BY_COMMAND: dict[str, dict[str, Any]] = {
         # Issue #2678 AC2
         "investigation_evidence_primary_root": {
             "type": "path",
+            "required": False,
+            "optional_flag_pair": True,
+        },
+        # Issue #2689 P0-1 fix_delta: mirrors
+        # `preflight.run.with_human_context`'s SAME atomic optional triple.
+        "mutation_category": {
+            "type": "mutation_category",
+            "required": False,
+            "optional_flag_pair": True,
+        },
+        "owner_user_id": {
+            "type": "positive_int",
+            "required": False,
+            "optional_flag_pair": True,
+        },
+        "preview_binding_file": {
+            "type": "repo_relative_file",
             "required": False,
             "optional_flag_pair": True,
         },

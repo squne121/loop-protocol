@@ -104,12 +104,21 @@ def test_contract_update_with_human_context_registry_entry_adds_only_the_two_kno
     entry = registry.REGISTRY["contract_update.run.with_human_context"]
     new_placeholders = {"investigation_evidence_transport_path", "investigation_evidence_primary_root"}
     assert new_placeholders <= set(entry["placeholders"])
-    # No OTHER new placeholder was introduced alongside these two.
+    # Issue #2689 P0-1 fix_delta (PR #2697 OWNER review comment
+    # #5755475318): the atomic optional mutation-gate transport triple this
+    # Issue adds alongside the #2678 transport/primary-root pair -- an
+    # OWNER-approved, intentional addition to this registry entry's
+    # placeholder set (not a scope relaxation of the #2678 boundaries this
+    # test otherwise pins below).
+    mutation_gate_placeholders = {"mutation_category", "owner_user_id", "preview_binding_file"}
+    assert mutation_gate_placeholders <= set(entry["placeholders"])
+    # No OTHER new placeholder was introduced alongside these five.
     unexpected = set(entry["placeholders"]) - {
         "issue_number",
         "repo",
         "anchor_comment_url",
         *new_placeholders,
+        *mutation_gate_placeholders,
     }
     assert unexpected == set(), unexpected
     # The mutation/permission-scope-relevant registry declarations this
