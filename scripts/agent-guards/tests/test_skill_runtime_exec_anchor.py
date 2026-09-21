@@ -239,6 +239,12 @@ REGISTRY = {
             "--human-context-comment-url", "{anchor_comment_url}",
             "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
             "--investigation-evidence-primary-root", "{investigation_evidence_primary_root}",
+            # Issue #2689 P0-1 fix_delta: kept in parity with the real
+            # `command_registry.py` entry (see the SAME comment below for
+            # `contract_update.run.with_human_context`).
+            "--mutation-category", "{mutation_category}",
+            "--owner-user-id", "{owner_user_id}",
+            "--preview-binding-file", "{preview_binding_file}",
         ],
         "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_anchor",
         "required_cwd": "canonical_main_root", "required_branch": "default_branch",
@@ -261,6 +267,16 @@ REGISTRY = {
             # checks this fixture registry against).
             "investigation_evidence_primary_root": {
                 "type": "path", "required": False, "optional_flag_pair": True,
+            },
+            # Issue #2689 P0-1 fix_delta: same parity requirement as above.
+            "mutation_category": {
+                "type": "mutation_category", "required": False, "optional_flag_pair": True,
+            },
+            "owner_user_id": {
+                "type": "positive_int", "required": False, "optional_flag_pair": True,
+            },
+            "preview_binding_file": {
+                "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
             },
         },
     },
@@ -302,6 +318,12 @@ REGISTRY = {
             "--human-context-comment-url", "{anchor_comment_url}",
             "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
             "--investigation-evidence-primary-root", "{investigation_evidence_primary_root}",
+            # Issue #2689 P0-1 fix_delta: kept in parity with the real
+            # `command_registry.py` entry (same atomic optional triple as
+            # `preflight.run.with_human_context` above).
+            "--mutation-category", "{mutation_category}",
+            "--owner-user-id", "{owner_user_id}",
+            "--preview-binding-file", "{preview_binding_file}",
             "--consume-contract-patch-plan",
         ],
         "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_contract_update_anchor",
@@ -323,6 +345,16 @@ REGISTRY = {
             },
             "investigation_evidence_primary_root": {
                 "type": "path", "required": False, "optional_flag_pair": True,
+            },
+            # Issue #2689 P0-1 fix_delta: same parity requirement as above.
+            "mutation_category": {
+                "type": "mutation_category", "required": False, "optional_flag_pair": True,
+            },
+            "owner_user_id": {
+                "type": "positive_int", "required": False, "optional_flag_pair": True,
+            },
+            "preview_binding_file": {
+                "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
             },
         },
     },

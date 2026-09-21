@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import sys
 from pathlib import Path
 
@@ -175,6 +176,18 @@ class _FakeRunnerResult:
         self.stdout = stdout
         self.stderr = ""
         self.returncode = 0
+
+
+class _FakeRunnerResultWithReturncode:
+    """PR #2697 review fix_delta (P1/P2): unlike `_FakeRunnerResult` above
+    (which is always `returncode=0`), this lets a test independently control
+    `returncode` -- needed to exercise the "non-zero exit with parseable
+    JSON stdout" fail-closed regression."""
+
+    def __init__(self, *, stdout: str, returncode: int) -> None:
+        self.stdout = stdout
+        self.stderr = ""
+        self.returncode = returncode
 
 
 def test_gate_uses_fresh_invocation_result_only():
@@ -345,3 +358,111 @@ def test_existing_trusted_anchor_predicate_unchanged():
         "anchor_author_association": "OWNER",
     }
     assert preflight._is_approved_close_not_planned_decision(decision)
+
+
+# ---------------------------------------------------------------------------
+# PR #2697 review fix_delta P1: non-zero subprocess exit MUST fail-closed to
+# `None` even when stdout happens to parse as valid JSON.
+# ---------------------------------------------------------------------------
+
+
+def test_nonzero_returncode_with_parseable_json_stdout_fails_closed_to_none():
+    def fake_runner(argv, **kwargs):
+        # A subprocess that prints a well-formed, even `selected`-shaped
+        # payload before exiting non-zero (e.g. a partial/stale write, or a
+        # crash AFTER printing) must never be treated as a successful fresh
+        # invocation.
+        return _FakeRunnerResultWithReturncode(
+            stdout=json.dumps(_selected_decision(target=f"#{TARGET_ISSUE}")),
+            returncode=1,
+        )
+
+    result = preflight._run_owner_reaction_decision_fresh(
+        repo=REPO,
+        issue_number=TARGET_ISSUE,
+        owner_user_id=999,
+        preview_binding_file="preview_binding.json",
+        subprocess_runner=fake_runner,
+    )
+    assert result is None
+
+
+def test_nonzero_returncode_gate_fails_closed_end_to_end():
+    def fake_runner(argv, **kwargs):
+        return _FakeRunnerResultWithReturncode(
+            stdout=json.dumps(_selected_decision(target=f"#{TARGET_ISSUE}")),
+            returncode=2,
+        )
+
+    gate = preflight._classify_heavy_mutation_gate_with_fresh_owner_reaction(
+        mutation_category="not_planned",
+        scope_delta_decision=None,
+        owner_reaction_context={
+            "owner_user_id": 999,
+            "preview_binding_file": "preview_binding.json",
+        },
+        repo=REPO,
+        issue_number=TARGET_ISSUE,
+        subprocess_runner=fake_runner,
+    )
+    assert gate["status"] == "blocked"
+    assert gate["fail_closed"] is True
+
+
+# ---------------------------------------------------------------------------
+# PR #2697 review fix_delta P2: schema identity of the parsed decision must
+# match the canonical `OWNER_REACTION_DECISION_RESULT_V1` schema literal.
+# ---------------------------------------------------------------------------
+
+
+def test_schema_mismatch_fails_closed_to_none():
+    def fake_runner(argv, **kwargs):
+        payload = _selected_decision(target=f"#{TARGET_ISSUE}")
+        payload["schema"] = "SOME_OTHER_SCHEMA_V1"
+        return _FakeRunnerResultWithReturncode(stdout=json.dumps(payload), returncode=0)
+
+    result = preflight._run_owner_reaction_decision_fresh(
+        repo=REPO,
+        issue_number=TARGET_ISSUE,
+        owner_user_id=999,
+        preview_binding_file="preview_binding.json",
+        subprocess_runner=fake_runner,
+    )
+    assert result is None
+
+
+def test_missing_schema_field_fails_closed_to_none():
+    def fake_runner(argv, **kwargs):
+        payload = _selected_decision(target=f"#{TARGET_ISSUE}")
+        del payload["schema"]
+        return _FakeRunnerResultWithReturncode(stdout=json.dumps(payload), returncode=0)
+
+    result = preflight._run_owner_reaction_decision_fresh(
+        repo=REPO,
+        issue_number=TARGET_ISSUE,
+        owner_user_id=999,
+        preview_binding_file="preview_binding.json",
+        subprocess_runner=fake_runner,
+    )
+    assert result is None
+
+
+def test_correct_schema_and_zero_returncode_still_succeeds():
+    # Non-regression: the P1/P2 fail-closed checks above must not reject a
+    # genuinely well-formed, zero-exit response.
+    def fake_runner(argv, **kwargs):
+        return _FakeRunnerResultWithReturncode(
+            stdout=json.dumps(_selected_decision(target=f"#{TARGET_ISSUE}")),
+            returncode=0,
+        )
+
+    result = preflight._run_owner_reaction_decision_fresh(
+        repo=REPO,
+        issue_number=TARGET_ISSUE,
+        owner_user_id=999,
+        preview_binding_file="preview_binding.json",
+        subprocess_runner=fake_runner,
+    )
+    assert result is not None
+    assert result["schema"] == "OWNER_REACTION_DECISION_RESULT_V1"
+    assert result["status"] == "selected"

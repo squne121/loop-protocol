@@ -162,8 +162,23 @@ def _pinned_uv_version(repo_root: Path) -> str:
 
 def install_fixture(repo_root: Path, trusted_gh_bin: Path) -> None:
     """Install the REAL (unmodified) privileged executor, policy module,
-    command_registry.py, and owner_reaction_decision.py -- the exact four
-    files Issue #2688's AC3 full-chain requires. Only
+    command_registry.py, owner_reaction_decision.py, and
+    run_refinement_preflight.py (plus its own direct script/schema
+    dependencies).
+
+    The first four were the exact files Issue #2688's AC3 full-chain
+    required. Issue #2689 P0-1 fix_delta additionally requires
+    `run_refinement_preflight.py` itself (the real canonical entrypoint the
+    heavy mutation gate lives in) so a test can launch it directly -- see
+    `test_owner_reaction_not_planned_gate_production_shaped.py`'s real
+    `run_refinement_preflight.py` subprocess E2E, which reuses this fixture
+    installer rather than hand-rolling a new one. `plan_refinement_loop.py`
+    (the planner subprocess) / `repair_issue_contract.py` (the pre-processor
+    subprocess `run_preflight()` unconditionally invokes) / the
+    `schemas/` directory (result/input schema validation) are additionally
+    copied so a real `run_refinement_preflight.py --fixture` invocation
+    reaches a normal terminal status instead of an unrelated
+    missing-dependency `environment_failure`. Only
     `scripts/agent-ops/worktree_catalog.py` remains a minimal local stub (it
     depends on live worktree enumeration that is out of this Issue's scope,
     mirroring the SAME stubbing convention every other real-dispatch fixture
@@ -173,8 +188,17 @@ def install_fixture(repo_root: Path, trusted_gh_bin: Path) -> None:
         "scripts/agent-guards/skill_runtime_command_policy.py",
         ".claude/skills/issue-refinement-loop/scripts/command_registry.py",
         ".claude/skills/issue-refinement-loop/scripts/owner_reaction_decision.py",
+        ".claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py",
+        ".claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py",
+        ".claude/skills/issue-refinement-loop/scripts/repair_issue_contract.py",
     ):
         write_text(repo_root / rel, (REPO_ROOT / rel).read_text(encoding="utf-8"))
+
+    schemas_src = REPO_ROOT / ".claude" / "skills" / "issue-refinement-loop" / "schemas"
+    schemas_dst = repo_root / ".claude" / "skills" / "issue-refinement-loop" / "schemas"
+    schemas_dst.mkdir(parents=True, exist_ok=True)
+    for schema_file in schemas_src.glob("*.json"):
+        write_text(schemas_dst / schema_file.name, schema_file.read_text(encoding="utf-8"))
 
     write_text(
         repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
