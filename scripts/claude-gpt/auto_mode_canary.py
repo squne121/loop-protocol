@@ -1018,10 +1018,23 @@ def _effective_policy(auto_mode_check_json_path: Path | None, settings_path: Pat
     （再計算ではなく、fail-closed readback が計算した digest の照合転記。
     渡されなかった場合は "unavailable_not_provided" と明示し、
     偽の計算済み値を捏造しない）。加えて canary script / lib.sh / preflight.sh /
-    generated settings / trusted gh binary の SHA-256 を含める。"""
+    generated settings / trusted gh binary の SHA-256 を含める。
+
+    `classify_all_shell` は Issue #2709 AC2 の tri-state/availability evidence
+    （`generated_key_present` / `direct_readback_available` / `effective_value` /
+    `native_parity_claimed`）をそのまま `preflight.sh --auto-mode-check` の
+    出力（`CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1.classify_all_shell`）から
+    転記する。未読出の boolean を enabled・native parity・denial-rate 改善として
+    報告しない（AC2）。入力が渡されなかった場合の既定値は「未評価・未確認」を
+    表す安全な false/false/null/false であり、真であることを推定しない。"""
     policy: dict = {
         "permission_mode": "auto",
-        "classify_all_shell": True,
+        "classify_all_shell": {
+            "generated_key_present": False,
+            "direct_readback_available": False,
+            "effective_value": None,
+            "native_parity_claimed": False,
+        },
         "auto_mode_defaults_digest": "unavailable_not_provided",
         "effective_config_digest": "unavailable_not_provided",
         "auto_mode_readback_ok": None,
@@ -1043,9 +1056,17 @@ def _effective_policy(auto_mode_check_json_path: Path | None, settings_path: Pat
         policy["auto_mode_defaults_digest"] = digests.get("auto_mode_defaults_digest", "unknown")
         policy["effective_config_digest"] = digests.get("effective_config_digest", "unknown")
         policy["auto_mode_readback_ok"] = check_payload.get("ok")
-        policy["classify_all_shell"] = bool(
-            check_payload.get("checks", {}).get("classify_all_shell_enabled", policy["classify_all_shell"])
-        )
+        classify_all_shell_payload = check_payload.get("classify_all_shell")
+        if isinstance(classify_all_shell_payload, dict):
+            raw_effective_value = classify_all_shell_payload.get("effective_value")
+            policy["classify_all_shell"] = {
+                "generated_key_present": bool(classify_all_shell_payload.get("generated_key_present", False)),
+                "direct_readback_available": bool(
+                    classify_all_shell_payload.get("direct_readback_available", False)
+                ),
+                "effective_value": raw_effective_value if isinstance(raw_effective_value, bool) else None,
+                "native_parity_claimed": bool(classify_all_shell_payload.get("native_parity_claimed", False)),
+            }
 
     if settings_path is not None:
         policy["settings_sha256"] = _sha256_file(settings_path)

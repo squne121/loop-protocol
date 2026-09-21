@@ -49,16 +49,22 @@ fi
 # / `claude auto-mode defaults` の readback で検証する独立モード。既存の完全モード
 # （引数なし）の exit code 契約（0/3/4/5/6）や、それを subprocess 経由で駆動する既存
 # hermetic test（test_launch_strict_mcp_config_normalization.py 等、fake claude binary
-# を使う）を汚染しないよう、既定パス（launch.sh からの通常呼び出し）には組み込まず、
-# 明示的な opt-in サブコマンドとして分離する（真の起動フローへの配線は followup とする）。
+# を使う）を汚染しないよう、この chunk 自体は別 subcommand として分離しているが、
+# `launch.sh`（通常起動フロー）は実際にこの `--auto-mode-check` を毎回 subprocess
+# 呼び出しし、readback 失敗時は起動を止める（launch.sh 内の Issue #2203 AC1
+# コメント参照。「配線は followup」という過去の記述は stale だったため訂正 —
+# Issue #2709 Background）。
 #
 # Exit code:
-#   0  = auto-mode readback 成功、$defaults 保持・narrow scope 反映・classifyAllShell
-#        有効を確認
+#   0  = auto-mode readback 成功。$defaults 保持・narrow scope 反映・hard_deny
+#        追加分保持・soft_deny 不変を確認。classifyAllShell は tri-state/
+#        availability evidence（`classify_all_shell` フィールド）として出力する
+#        のみで、単独では exit code に影響しない（Issue #2709 AC1/AC2/AC6）
 #   2  = 呼び出しエラー（settings_path 未指定・不存在）
 #   3  = claude バイナリが見つからない（環境不可）
-#   8  = auto-mode 未対応 version・readback mismatch・classifyAllShell 未反映
-#        （launcher バグまたは host 側の不備。fail-closed）
+#   8  = narrow scope 未反映・hard_deny/soft_deny 不整合、または classifyAllShell
+#        の direct readback が generated key 省略と矛盾する値を返した
+#        （launcher バグまたは host 側の不備。fail-closed。Issue #2709 AC5）
 # --workflow-profile <profile>: Issue #2273. Thin dispatcher to the Python
 # `workflow_capability_preflight.py` module, which returns the structured
 # `CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1` JSON result (trusted `uv` /
