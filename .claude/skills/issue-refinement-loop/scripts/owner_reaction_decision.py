@@ -31,12 +31,25 @@ working, deterministic program:
 
 Out of Scope (see Issue #1975 "Out of Scope" for the authoritative list):
 this CLI never performs any GitHub mutation, never promotes ``selected`` to
-``approved_by_trusted_anchor``, and never wires into the existing heavy
-mutation gate (``_classify_heavy_mutation_gate()`` /
+``approved_by_trusted_anchor``, and never itself wires into the existing
+heavy mutation gate (``_classify_heavy_mutation_gate()`` /
 ``_is_approved_close_not_planned_decision()`` in
 ``run_refinement_preflight.py``). Its output is a structured decision only
--- the caller (root control-plane) decides what, if anything, to do with
-it.
+-- the caller decides what, if anything, to do with it.
+
+Issue #2689 (parent #1950) implements exactly that consumption on the
+``run_refinement_preflight.py`` side, for the ``not_planned`` mutation
+category only: immediately before evaluating its heavy mutation gate,
+``run_refinement_preflight.py`` issues a FRESH subprocess execution of this
+very CLI (same ``--repo`` / ``--issue-number`` / ``--owner-user-id`` /
+``--preview-binding-file`` argument shape as the ``owner_reaction.decide``
+registry entry) and feeds the parsed result into its own
+``_is_approved_owner_reaction_not_planned_decision()`` predicate -- an
+INDEPENDENT predicate from ``_is_approved_close_not_planned_decision()``
+that never converts ``selected`` into ``approved_by_trusted_anchor``. This
+module remains entirely unaware of, and unmodified for, that consumer: its
+own selection semantics, reaction-reading logic, and Out of Scope boundary
+above are unchanged by #2689.
 
 Internal GitHub reads use ``gh api -X GET`` subprocess calls only (argv
 arrays, never a shell string). Reaction pagination uses

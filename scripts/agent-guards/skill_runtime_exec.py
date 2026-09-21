@@ -2502,9 +2502,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--contract-patch-plan-file", required=False, default=None)
     parser.add_argument("--anchor-context-file", required=False, default=None)
     # Issue #2688: owner_reaction.decide / owner_reaction.decide.fixture.
+    # Issue #2689 P0-1 fix_delta: `--owner-user-id`/`--preview-binding-file`
+    # are ALSO reused (same argparse flags, same value shapes) for
+    # `preflight.run.with_human_context`/`contract_update.run.with_human_context`'s
+    # own optional mutation-gate transport triple below.
     parser.add_argument("--owner-user-id", required=False, type=int, default=None)
     parser.add_argument("--preview-binding-file", required=False, default=None)
     parser.add_argument("--gh-fixture-file", required=False, default=None)
+    parser.add_argument("--mutation-category", required=False, default=None)
     # Generic and structural mutation consumers have distinct command IDs and
     # exact outer flags. Argparse rejects a mixed invocation before dispatch;
     # each command branch below also enforces its exact pairing.
@@ -2574,6 +2579,12 @@ def main(argv: list[str] | None = None) -> int:
         "contract_update.run.with_anchor",
         "contract_update.run.with_human_context",
     }
+    # Issue #2689 P0-1 fix_delta: the ONLY two command_ids that may carry
+    # `--mutation-category`/`--owner-user-id`/`--preview-binding-file`.
+    is_with_human_context_command = args.command_id in {
+        "preflight.run.with_human_context",
+        "contract_update.run.with_human_context",
+    }
     is_decide_command = args.command_id == "decide.run"
     is_produce_command = args.command_id == "authority_transport.produce"
     is_consume_command = args.command_id == "authority_transport.consume"
@@ -2626,15 +2637,20 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    # Issue #2688 AC4: exact required/forbidden combination validation for
-    # --owner-user-id/--preview-binding-file (production and fixture) and
-    # fixture's --gh-fixture-file.
-    if not (is_owner_reaction_decide_command or is_owner_reaction_decide_fixture_command) and (
-        args.owner_user_id or args.preview_binding_file
-    ):
+    # Issue #2688 AC4 / Issue #2689 P0-1 fix_delta: exact required/forbidden
+    # combination validation for --owner-user-id/--preview-binding-file
+    # (production and fixture owner_reaction.decide profiles, PLUS the two
+    # with_human_context profiles' own optional mutation-gate transport
+    # triple) and fixture's --gh-fixture-file.
+    if not (
+        is_owner_reaction_decide_command
+        or is_owner_reaction_decide_fixture_command
+        or is_with_human_context_command
+    ) and (args.owner_user_id or args.preview_binding_file):
         print(
             "skill_runtime_exec: --owner-user-id/--preview-binding-file are only allowed for "
-            "owner_reaction.decide/owner_reaction.decide.fixture",
+            "owner_reaction.decide/owner_reaction.decide.fixture/"
+            "preflight.run.with_human_context/contract_update.run.with_human_context",
             file=sys.stderr,
         )
         return 2
@@ -2647,6 +2663,31 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if not is_with_human_context_command and args.mutation_category:
+        print(
+            "skill_runtime_exec: --mutation-category is only allowed for "
+            "preflight.run.with_human_context/contract_update.run.with_human_context",
+            file=sys.stderr,
+        )
+        return 2
+    if is_with_human_context_command:
+        # Issue #2689 P0-1 fix_delta: an atomic optional triple -- all three
+        # supplied together, or none at all. A partial combination is a
+        # contract violation (fail-closed exit 2), mirroring
+        # `run_refinement_preflight.py`'s own `main()` validation of this
+        # SAME triple.
+        _mutation_gate_fields_present = (
+            bool(args.mutation_category),
+            args.owner_user_id is not None,
+            bool(args.preview_binding_file),
+        )
+        if any(_mutation_gate_fields_present) and not all(_mutation_gate_fields_present):
+            print(
+                "skill_runtime_exec: --mutation-category/--owner-user-id/--preview-binding-file "
+                "must be supplied together or not at all",
+                file=sys.stderr,
+            )
+            return 2
     if not is_owner_reaction_decide_fixture_command and args.gh_fixture_file:
         print(
             "skill_runtime_exec: --gh-fixture-file is only allowed for owner_reaction.decide.fixture",
@@ -2835,6 +2876,27 @@ def main(argv: list[str] | None = None) -> int:
                         "preflight.run.with_human_context",
                         "contract_update.run.with_human_context",
                     )
+                    else []
+                ),
+                # Issue #2689 P0-1 fix_delta: this outer command-string
+                # validation gate must ALSO see the EXACT same mutation-gate
+                # transport triple `render_command()` will actually render
+                # below -- mirrors the SAME condition the render_params
+                # block below uses (P2136 H3 validated-value-vs-used-value
+                # divergence, same precedent as the primary-root propagation
+                # above). Only ever non-empty for the two with_human_context
+                # command_ids (enforced by the guard above), and only when
+                # the caller supplied the full atomic triple.
+                *(
+                    [
+                        "--mutation-category",
+                        args.mutation_category,
+                        "--owner-user-id",
+                        str(args.owner_user_id),
+                        "--preview-binding-file",
+                        args.preview_binding_file,
+                    ]
+                    if is_with_human_context_command and args.mutation_category
                     else []
                 ),
             ]
@@ -3389,6 +3451,16 @@ def main(argv: list[str] | None = None) -> int:
                     "contract_update.run.with_human_context",
                 ):
                     render_params["investigation_evidence_primary_root"] = project_root
+            # Issue #2689 P0-1 fix_delta: the mutation-gate transport triple
+            # -- ONLY ever populated for the two with_human_context
+            # command_ids (guarded above), and ONLY when the caller
+            # supplied the full atomic triple (`args.mutation_category`
+            # truthy implies `args.owner_user_id`/`args.preview_binding_file`
+            # are also present, per the all-or-none guard above).
+            if is_with_human_context_command and args.mutation_category:
+                render_params["mutation_category"] = args.mutation_category
+                render_params["owner_user_id"] = args.owner_user_id
+                render_params["preview_binding_file"] = args.preview_binding_file
     child_argv = render_command(args.command_id, render_params)
     child_argv = _resolve_child_argv(child_argv)
 

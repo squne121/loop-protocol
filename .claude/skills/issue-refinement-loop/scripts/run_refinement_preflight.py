@@ -271,6 +271,14 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 _SCHEMAS_DIR = _SCRIPTS_DIR.parent / "schemas"
 PLANNER_SCRIPT = _SCRIPTS_DIR / "plan_refinement_loop.py"
 REPAIR_SCRIPT = _SCRIPTS_DIR / "repair_issue_contract.py"
+# Issue #2689: sibling `owner_reaction_decision.py` (Issue #1975), invoked as
+# a fresh subprocess immediately before the heavy mutation gate evaluates a
+# `not_planned` mutation_category -- see
+# `_run_owner_reaction_decision_fresh()` / `_classify_heavy_mutation_gate_with_fresh_owner_reaction()`
+# below. Never imported as a Python module (this module never re-implements
+# or re-exports owner_reaction_decision.py's selection semantics -- Out of
+# Scope for #2689).
+OWNER_REACTION_DECISION_SCRIPT = _SCRIPTS_DIR / "owner_reaction_decision.py"
 
 SCHEMA_VERSION_RESULT = "refinement_preflight_result/v1"
 SCHEMA_VERSION_PLANNER_INPUT = "refinement_loop_planner_input/v1"
@@ -6229,10 +6237,141 @@ HEAVY_MUTATION_CATEGORIES = frozenset(
 )
 
 
+def _is_approved_owner_reaction_not_planned_decision(
+    decision: "dict | None", *, target_issue_number: "int | None"
+) -> bool:
+    """#2689 AC1/AC5: independent predicate -- deliberately NOT a variant of
+    `_is_approved_close_not_planned_decision()` above (never calls it, never
+    reads/writes `authorized_mutation_category` / `anchor_author_association`
+    / `implementation_go`, the trusted-anchor gate's own fields). Reads ONLY
+    an `OWNER_REACTION_DECISION_RESULT_V1`-shaped dict (the fresh
+    `owner_reaction_decision.py` subprocess output -- see
+    `_run_owner_reaction_decision_fresh()`) and NEVER converts a `selected`
+    status into `approved_by_trusted_anchor` (that authority semantic is
+    exclusive to the pre-existing trusted-anchor gate; #2689 AC5) -- this
+    function only ever returns a plain bool, it never mutates or re-labels
+    `decision`.
+
+    True only when ALL of:
+      - `decision["status"] == "selected"` (rejects `unresolved` / `stale` /
+        `environment_error` -- #2689 AC3)
+      - `decision["selected_option_metadata"]["operation"] == "close_not_planned"`
+      - the selected option's `target` is EXACTLY `f"#{target_issue_number}"`
+        -- a same-operation, different-target option is never treated as
+        approved (#2689 AC2, matching the identity-binding contract fixed by
+        `test_preview_binding_primary_identity` in
+        `test_owner_reaction_decision.py`).
+    """
+    if target_issue_number is None or isinstance(target_issue_number, bool):
+        return False
+    if not isinstance(decision, dict):
+        return False
+    if decision.get("status") != "selected":
+        return False
+    metadata = decision.get("selected_option_metadata")
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("operation") != "close_not_planned":
+        return False
+    target = metadata.get("target")
+    return isinstance(target, str) and target == f"#{target_issue_number}"
+
+
+def _build_owner_reaction_decide_argv(
+    *, repo: str, issue_number: int, owner_user_id: int, preview_binding_file: str
+) -> list[str]:
+    """#2689 AC4: renders the SAME `--repo` / `--issue-number` /
+    `--owner-user-id` / `--preview-binding-file` argument shape as
+    `command_registry.py`'s production `owner_reaction.decide` entry (never
+    a divergently-shaped re-implementation). This module invokes
+    `owner_reaction_decision.py` directly via `sys.executable` (the SAME
+    in-process-sibling-subprocess convention `_run_repair_subprocess()`
+    above already uses for `repair_issue_contract.py`), not through
+    `scripts/agent-guards/skill_runtime_exec.py` -- #2689 Out of Scope
+    forbids adding any new dispatch surface to that executor / its
+    `command_registry.py` / `skill_runtime_command_policy.py`.
+    """
+    return [
+        sys.executable,
+        str(OWNER_REACTION_DECISION_SCRIPT),
+        "--repo", repo,
+        "--issue-number", str(issue_number),
+        "--owner-user-id", str(owner_user_id),
+        "--preview-binding-file", preview_binding_file,
+    ]
+
+
+def _run_owner_reaction_decision_fresh(
+    *,
+    repo: str,
+    issue_number: int,
+    owner_user_id: int,
+    preview_binding_file: str,
+    timeout: float = 90.0,
+    subprocess_runner: "Callable[..., Any] | None" = None,
+) -> "dict | None":
+    """#2689 AC4: ALWAYS issues a brand-new `owner_reaction_decision.py`
+    subprocess -- this function holds no module-level cache/memoization of
+    its own, so calling it N times in the same process performs N real
+    subprocess launches, never a cached/reused result from a prior call.
+    Returns the parsed `OWNER_REACTION_DECISION_RESULT_V1` dict, or `None`
+    on ANY transport-level failure (nonzero exit, non-JSON stdout, launch
+    error, timeout, schema mismatch). Callers MUST treat `None` as "not
+    approved" (fail-closed) -- never as an implicit approval.
+
+    PR #2697 review fix_delta (P1): a non-zero `proc.returncode` is ALWAYS
+    fail-closed to `None`, even when stdout happens to be parseable JSON
+    (e.g. a subprocess that prints a partial/stale payload before exiting
+    non-zero) -- transport success is never inferred from stdout shape
+    alone.
+
+    PR #2697 review fix_delta (P2): a lightweight schema-identity check --
+    the parsed dict's `schema` field must equal
+    `OWNER_REACTION_DECISION_RESULT_V1` (the canonical
+    `owner_reaction_decision.py` output schema) -- rejects any payload that
+    is valid JSON but not actually shaped like the expected producer
+    output. This is a single literal-equality check, not a new generic
+    schema-validator framework.
+    """
+    runner = subprocess_runner or subprocess.run
+    argv = _build_owner_reaction_decide_argv(
+        repo=repo,
+        issue_number=issue_number,
+        owner_user_id=owner_user_id,
+        preview_binding_file=preview_binding_file,
+    )
+    try:
+        proc = runner(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    # PR #2697 review fix_delta (P1): fail-closed on ANY non-zero exit,
+    # regardless of whether stdout happens to parse as JSON.
+    returncode = getattr(proc, "returncode", None)
+    if returncode != 0:
+        return None
+    stdout = getattr(proc, "stdout", None)
+    if not isinstance(stdout, str) or not stdout:
+        return None
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    # PR #2697 review fix_delta (P2): reject any payload that does not
+    # carry the canonical OWNER_REACTION_DECISION_RESULT_V1 schema
+    # identity, even if it otherwise parses as a JSON object.
+    if parsed.get("schema") != "OWNER_REACTION_DECISION_RESULT_V1":
+        return None
+    return parsed
+
+
 def _classify_heavy_mutation_gate(
     *,
     mutation_category: "str | None",
     scope_delta_decision: "dict | None",
+    owner_reaction_decision: "dict | None" = None,
+    target_issue_number: "int | None" = None,
 ) -> dict:
     """#1891 AC6: fail-closed gate for heavy mutation categories.
 
@@ -6243,6 +6382,16 @@ def _classify_heavy_mutation_gate(
     Non-heavy mutation categories (ordinary body improvement / additional investigation / review
     continuation) are never blocked here -- they continue with a `warn`
     status, matching the pre-existing advisory-only behavior.
+
+    `owner_reaction_decision` / `target_issue_number` (#2689, both default
+    `None`, fully backward compatible -- every pre-existing caller that
+    omits them observes byte-identical behavior to before #2689): an
+    INDEPENDENT, `not_planned`-only OR-branch alongside the pre-existing
+    trusted-anchor `exact_close_not_planned` branch above -- see
+    `_is_approved_owner_reaction_not_planned_decision()`. This never changes
+    `exact_close_not_planned`'s own boolean identity, and never widens
+    `HEAVY_MUTATION_CATEGORIES` or the fail-closed default for any other
+    heavy mutation category (#2689 Out of Scope).
     """
     decision = scope_delta_decision or {}
     is_heavy = mutation_category in HEAVY_MUTATION_CATEGORIES
@@ -6251,14 +6400,23 @@ def _classify_heavy_mutation_gate(
         and mutation_category == "not_planned"
         and decision.get("authorized_mutation_category") == mutation_category
     )
+    owner_reaction_not_planned_approved = mutation_category == "not_planned" and (
+        _is_approved_owner_reaction_not_planned_decision(
+            owner_reaction_decision, target_issue_number=target_issue_number
+        )
+    )
 
-    if exact_close_not_planned:
+    if exact_close_not_planned or owner_reaction_not_planned_approved:
         return {
             "mutation_category": mutation_category,
             "is_heavy_mutation": is_heavy,
             "status": "allowed",
             "fail_closed": False,
-            "reason": "owner_close_not_planned_decision_present",
+            "reason": (
+                "owner_close_not_planned_decision_present"
+                if exact_close_not_planned
+                else "owner_reaction_not_planned_decision_present"
+            ),
         }
 
     if is_heavy:
@@ -6277,6 +6435,58 @@ def _classify_heavy_mutation_gate(
         "fail_closed": False,
         "reason": "non_heavy_mutation_warning_continue",
     }
+
+
+def _classify_heavy_mutation_gate_with_fresh_owner_reaction(
+    *,
+    mutation_category: "str | None",
+    scope_delta_decision: "dict | None",
+    owner_reaction_context: "dict | None",
+    repo: str,
+    issue_number: int,
+    subprocess_runner: "Callable[..., Any] | None" = None,
+) -> dict:
+    """#2689 AC4: production wiring wrapper around `_classify_heavy_mutation_gate()`.
+
+    ONLY when `mutation_category == "not_planned"` AND the caller supplies
+    an `owner_reaction_context` dict (`{"owner_user_id": <positive int>,
+    "preview_binding_file": <repo-relative path str>}`, mirroring
+    `command_registry.py`'s `owner_reaction.decide` placeholders) does this
+    function issue a FRESH `owner_reaction_decision.py` subprocess -- via
+    `_run_owner_reaction_decision_fresh()` -- immediately before delegating
+    to `_classify_heavy_mutation_gate()`, and that SAME-invocation result
+    (never a prior/cached one -- this function holds no state of its own)
+    is the ONLY owner-reaction input the gate call below observes. When
+    `owner_reaction_context` is absent/malformed, or `mutation_category` is
+    anything other than `"not_planned"`, no subprocess is issued at all and
+    `_classify_heavy_mutation_gate()` behaves byte-identically to before
+    #2689.
+    """
+    owner_reaction_decision_fresh: "dict | None" = None
+    if mutation_category == "not_planned" and isinstance(owner_reaction_context, dict):
+        owner_user_id = owner_reaction_context.get("owner_user_id")
+        preview_binding_file = owner_reaction_context.get("preview_binding_file")
+        if (
+            isinstance(owner_user_id, int)
+            and not isinstance(owner_user_id, bool)
+            and owner_user_id > 0
+            and isinstance(preview_binding_file, str)
+            and preview_binding_file
+        ):
+            owner_reaction_decision_fresh = _run_owner_reaction_decision_fresh(
+                repo=repo,
+                issue_number=issue_number,
+                owner_user_id=owner_user_id,
+                preview_binding_file=preview_binding_file,
+                subprocess_runner=subprocess_runner,
+            )
+
+    return _classify_heavy_mutation_gate(
+        mutation_category=mutation_category,
+        scope_delta_decision=scope_delta_decision,
+        owner_reaction_decision=owner_reaction_decision_fresh,
+        target_issue_number=issue_number,
+    )
 
 
 def _apply_multi_turn_candidate_route(
@@ -8610,9 +8820,19 @@ def run_preflight(
     # ordinary body-improvement preflight runs that do not carry one.
     if known_context and known_context.get("mutation_category"):
         known_context = dict(known_context)
-        _heavy_mutation_gate = _classify_heavy_mutation_gate(
+        # #2689: `_classify_heavy_mutation_gate_with_fresh_owner_reaction()`
+        # issues the fresh `owner_reaction_decision.py` subprocess (ONLY for
+        # mutation_category == "not_planned", ONLY when the caller supplied
+        # `known_context["owner_reaction_context"]`) immediately before
+        # delegating to `_classify_heavy_mutation_gate()` -- when that key is
+        # absent (every pre-#2689 caller), behavior is byte-identical to the
+        # prior direct `_classify_heavy_mutation_gate()` call this replaces.
+        _heavy_mutation_gate = _classify_heavy_mutation_gate_with_fresh_owner_reaction(
             mutation_category=known_context.get("mutation_category"),
             scope_delta_decision=known_context.get("scope_delta_decision"),
+            owner_reaction_context=known_context.get("owner_reaction_context"),
+            repo=repo,
+            issue_number=issue_number,
         )
         known_context["heavy_mutation_gate"] = _heavy_mutation_gate
         # #1891 iteration 2 (PR #1923 OWNER REQUEST_CHANGES): the heavy
@@ -10247,6 +10467,53 @@ def main(argv: list[str] | None = None) -> None:
         "raw `gh issue edit` call). Requires --issue-number, --repo.",
     )
 
+    # Issue #2689 P0-1 fix_delta (PR #2697 OWNER review comment
+    # #5755475318): canonical production transport for the heavy mutation
+    # gate's `mutation_category` / `owner_reaction_context` -- before this,
+    # no command_registry.py-rendered production argv ever populated
+    # `known_context["mutation_category"]`, so
+    # `_classify_heavy_mutation_gate_with_fresh_owner_reaction()` was
+    # unreachable from the real CLI entrypoint regardless of how it was
+    # dispatched. `--mutation-category`'s choices are the SAME 5 literal
+    # heavy mutation categories `HEAVY_MUTATION_CATEGORIES` already declares
+    # -- this flag never opens a NEW category; only `not_planned` is
+    # actually approvable via the owner-reaction path (see
+    # `_classify_heavy_mutation_gate()`). `--owner-user-id` /
+    # `--preview-binding-file` mirror the SAME `owner_reaction.decide`
+    # placeholder shapes `command_registry.py` already declares.
+    parser.add_argument(
+        "--mutation-category",
+        dest="mutation_category",
+        choices=sorted(HEAVY_MUTATION_CATEGORIES),
+        default=None,
+        metavar="CATEGORY",
+        help="Issue #2689: intended heavy-mutation category for this invocation "
+        "(one of HEAVY_MUTATION_CATEGORIES). Only ever consulted by the "
+        "pre-existing #1891 heavy mutation gate; never widens which categories "
+        "the gate actually approves. Requires --owner-user-id and "
+        "--preview-binding-file to also be supplied (all three together, or none).",
+    )
+    parser.add_argument(
+        "--owner-user-id",
+        dest="owner_user_id",
+        type=int,
+        default=None,
+        metavar="USER_ID",
+        help="Issue #2689: stable GitHub user id of the OWNER whose reaction the "
+        "fresh owner_reaction_decision.py subprocess resolves against. Only "
+        "meaningful together with --mutation-category and "
+        "--preview-binding-file.",
+    )
+    parser.add_argument(
+        "--preview-binding-file",
+        dest="preview_binding_file",
+        default=None,
+        metavar="PREVIEW_BINDING_JSON_PATH",
+        help="Issue #2689: repo-relative path to the PREVIEW_BINDING_V1 artifact "
+        "owner_reaction_decision.py binds its selection against. Only "
+        "meaningful together with --mutation-category and --owner-user-id.",
+    )
+
     args = parser.parse_args(argv)
 
     # #2053: producer / consumer dedicated CLI modes -- bypass the full
@@ -10388,6 +10655,24 @@ def main(argv: list[str] | None = None) -> None:
         if not url.startswith(_GITHUB_URL_PREFIX):
             input_errors.append(f"--anchor-comment-url must start with {_GITHUB_URL_PREFIX!r}, got {url!r}")
 
+    # Issue #2689 P0-1 fix_delta: --mutation-category / --owner-user-id /
+    # --preview-binding-file are an all-or-none atomic group -- any partial
+    # combination is a contract violation (fail-closed exit 2), mirroring
+    # the exact-grammar posture `skill_runtime_command_policy.py`'s
+    # production transport enforces for this same triple.
+    _mutation_gate_fields_present = (
+        args.mutation_category is not None,
+        args.owner_user_id is not None,
+        args.preview_binding_file is not None,
+    )
+    if any(_mutation_gate_fields_present) and not all(_mutation_gate_fields_present):
+        input_errors.append(
+            "--mutation-category/--owner-user-id/--preview-binding-file must be "
+            "supplied together or not at all"
+        )
+    if args.owner_user_id is not None and args.owner_user_id <= 0:
+        input_errors.append(f"--owner-user-id must be a positive int, got {args.owner_user_id}")
+
     if input_errors:
         # Build minimal blocked result for argparse validation failure
         _repo_root = _find_repo_root()
@@ -10418,6 +10703,19 @@ def main(argv: list[str] | None = None) -> None:
         cli_known_context = {
             _HUMAN_CONTEXT_COMMENT_URLS_FIELD: args.human_context_comment_urls,
             _AGENT_REPORT_COMMENT_URLS_FIELD: args.agent_report_comment_urls,
+        }
+
+    # Issue #2689 P0-1 fix_delta: materialize `known_context["mutation_category"]`
+    # / `known_context["owner_reaction_context"]` from the validated CLI
+    # triple above -- this is the ONLY place in `main()` that populates
+    # these two keys; `run_preflight()` -> `_classify_heavy_mutation_gate_
+    # with_fresh_owner_reaction()` reads them unchanged (#2689 AC4).
+    if args.mutation_category is not None:
+        cli_known_context = dict(cli_known_context) if cli_known_context else {}
+        cli_known_context["mutation_category"] = args.mutation_category
+        cli_known_context["owner_reaction_context"] = {
+            "owner_user_id": args.owner_user_id,
+            "preview_binding_file": args.preview_binding_file,
         }
 
     _, exit_code = run_preflight(

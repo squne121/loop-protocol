@@ -416,7 +416,7 @@ downstream skill（impl-review-loop・implement-issue・issue-contract-review・
 | anchor comment schema | `schemas/anchor_comment.schema.json`（Issue #1873: `loop_state.schema.json` から抽出） |
 | loop state field definitions（historical） | `references/loop-state.md` |
 | anchor comment handling | `references/anchor-comment-handling.md` |
-| owner reaction decision（read-only、heavy mutation 実行許可ではない） | `scripts/owner_reaction_decision.py` — `references/anchor-comment-handling.md`（#1975） |
+| owner reaction decision（read-only。`_classify_heavy_mutation_gate_with_fresh_owner_reaction()` 経由で `not_planned` category のみ heavy mutation gate へ fresh-subprocess 限定接続済み — `_is_approved_owner_reaction_not_planned_decision()`、#2689） | `scripts/owner_reaction_decision.py` — `references/anchor-comment-handling.md`（#1975） |
 | scope signal guard | `references/scope-signal-guard.md` |
 | AC/VC reflection | `references/ac-vc-reflection.md` |
 | follow-up materialization | `references/follow-up-materialization.md` |

@@ -256,16 +256,26 @@ def test_owner_reaction_decide_first_hop_targets_owner_reaction_decision_not_run
     """AC5: the executor's first-hop script integrity/readback target is
     owner_reaction_decision.py, not run_refinement_preflight.py (the
     default target for every other command_id wired through
-    skill_runtime_exec.py's main() dispatch). Proven by deliberately never
-    installing run_refinement_preflight.py in this fixture repo at all --
-    if the executor's script_name selection ever regressed to target that
-    file for owner_reaction.decide, this dispatch would fail closed with
-    `preflight_script_invalid` instead of succeeding."""
+    skill_runtime_exec.py's main() dispatch). Proven by deliberately
+    removing run_refinement_preflight.py from this fixture repo after
+    install -- if the executor's script_name selection ever regressed to
+    target that file for owner_reaction.decide, this dispatch would fail
+    closed with `preflight_script_invalid` instead of succeeding.
+
+    Issue #2689 P0-1 fix_delta: `install_fixture()` now ALSO copies
+    `run_refinement_preflight.py` (needed by a DIFFERENT real-dispatch test
+    for the `preflight.run.with_human_context`/`contract_update.run.with_
+    human_context` mutation-gate transport wiring), so this test's own
+    negative control removes it again immediately after install --
+    `owner_reaction.decide`/`.fixture` never touch this file regardless of
+    whether it is present in the fixture repo.
+    """
     repo = make_repo(tmp_path)
     install_fixture(repo, tmp_path / "trusted-gh-bin")
     run_refinement_preflight_path = (
         repo / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "run_refinement_preflight.py"
     )
+    run_refinement_preflight_path.unlink()
     assert not run_refinement_preflight_path.exists()
 
     preview_binding_rel = _seed_preview_binding(repo)
