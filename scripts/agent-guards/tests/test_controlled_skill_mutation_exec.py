@@ -71,6 +71,9 @@ class TestGraphqlCallDiagnosticRedaction:
             data, error = _exec._graphql_call("gh", {}, "query Test", {})
 
         assert data is None
+        prefix = "gh_api_graphql_errors: "
+        assert error.startswith(prefix)
+        assert len(error[len(prefix) :]) == 300
         assert fake_token not in error
         assert "ghp_" not in error
         assert "[REDACTED]" in error
