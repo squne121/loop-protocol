@@ -1188,6 +1188,15 @@ def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
             "contract_update.run.with_human_context",
             "repair_action.apply",
             "structural_repair_action.apply",
+            # PR #2694 review fix_delta (P0-1): `owner_reaction.decide` is a
+            # real `gh api` consumer (its first hop, owner_reaction_decision.py,
+            # shells out to `gh` for the production profile). Without this,
+            # a canonical Claude-GPT environment authenticated via a normal
+            # `gh auth login` stored credential (no explicit GH_TOKEN/
+            # GITHUB_TOKEN) could never dispatch it. `owner_reaction.decide.
+            # fixture` (the local-only `--gh-fixture-file` lane, which never
+            # invokes `gh` at all) is deliberately NOT added here.
+            "owner_reaction.decide",
         }
     )
     if command_id in gh_config_dir_carrier_command_ids:
@@ -3101,6 +3110,12 @@ def main(argv: list[str] | None = None) -> int:
             or args.loop_state_file
             or args.review_result_verdict
             or args.max_iterations
+            # PR #2694 review fix_delta (P1-1): without this, argparse would
+            # accept this flag, the outer command-string reconstruction
+            # below would silently drop it (never forwarded to the exact
+            # parser or render_params), and the caller-supplied value would
+            # be silently ignored rather than rejected.
+            or args.investigation_evidence_transport_path
         ):
             print(
                 "skill_runtime_exec: only --owner-user-id/--preview-binding-file are allowed for "
@@ -3138,6 +3153,9 @@ def main(argv: list[str] | None = None) -> int:
             or args.loop_state_file
             or args.review_result_verdict
             or args.max_iterations
+            # PR #2694 review fix_delta (P1-1): same forbidden-flag closure
+            # as the production branch above.
+            or args.investigation_evidence_transport_path
         ):
             print(
                 "skill_runtime_exec: only --owner-user-id/--preview-binding-file/--gh-fixture-file are "

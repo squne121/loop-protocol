@@ -206,6 +206,64 @@ def test_other_command_id_rejects_gh_fixture_file(tmp_path):
     assert "--gh-fixture-file is only allowed for owner_reaction.decide.fixture" in result.stderr, result.stderr
 
 
+def test_owner_reaction_decide_rejects_investigation_evidence_transport_path(tmp_path):
+    """PR #2694 review fix_delta (P1-1): `--investigation-evidence-
+    transport-path` is only meaningful for
+    `preflight.run.with_human_context`/`contract_update.run.with_human_
+    context`. Before this fix_delta, `owner_reaction.decide`'s forbidden-
+    flag check never listed this flag, so argparse silently accepted it,
+    the outer command-string reconstruction silently dropped it (never
+    forwarded to the exact parser or render_params), and the caller's value
+    was silently ignored instead of being rejected -- even though the error
+    message for OTHER forbidden flags on this same command_id already
+    claimed "only --owner-user-id/--preview-binding-file are allowed"."""
+    repo = make_repo(tmp_path)
+    install_fixture(repo, tmp_path / "trusted-gh-bin")
+    preview_binding_rel, _ = _seed(repo)
+    result = run_executor(
+        repo,
+        [
+            "--command-id", "owner_reaction.decide",
+            "--issue-number", str(ISSUE_NUMBER),
+            "--repo", "squne121/loop-protocol",
+            "--owner-user-id", str(OWNER_USER_ID),
+            "--preview-binding-file", preview_binding_rel,
+            "--investigation-evidence-transport-path", "some/evidence.json",
+        ],
+        extra_env=_env(),
+    )
+    assert result.returncode == 2, (result.returncode, result.stdout, result.stderr)
+    assert "only --owner-user-id/--preview-binding-file are allowed for owner_reaction.decide" in result.stderr, (
+        result.stderr
+    )
+
+
+def test_owner_reaction_decide_fixture_rejects_investigation_evidence_transport_path(tmp_path):
+    """PR #2694 review fix_delta (P1-1): same forbidden-flag closure for the
+    fixture sibling."""
+    repo = make_repo(tmp_path)
+    install_fixture(repo, tmp_path / "trusted-gh-bin")
+    preview_binding_rel, gh_fixture_rel = _seed(repo)
+    result = run_executor(
+        repo,
+        [
+            "--command-id", "owner_reaction.decide.fixture",
+            "--issue-number", str(ISSUE_NUMBER),
+            "--repo", "squne121/loop-protocol",
+            "--owner-user-id", str(OWNER_USER_ID),
+            "--preview-binding-file", preview_binding_rel,
+            "--gh-fixture-file", gh_fixture_rel,
+            "--investigation-evidence-transport-path", "some/evidence.json",
+        ],
+        extra_env=_env(),
+    )
+    assert result.returncode == 2, (result.returncode, result.stdout, result.stderr)
+    assert (
+        "only --owner-user-id/--preview-binding-file/--gh-fixture-file are "
+        "allowed for owner_reaction.decide.fixture" in result.stderr
+    ), result.stderr
+
+
 def test_owner_reaction_decide_rejects_cross_command_flags(tmp_path):
     """owner_reaction.decide must reject flags belonging to other command
     classes (e.g. --loop-state-file, which is decide.run's)."""

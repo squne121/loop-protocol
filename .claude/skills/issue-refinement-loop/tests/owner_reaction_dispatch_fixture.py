@@ -81,6 +81,18 @@ def _classify(argv, anchor_comment_id):
 
 
 def main():
+    # PR #2694 review fix_delta (P0-1) regression coverage: when set, record
+    # the GH_CONFIG_DIR value this fake `gh` invocation actually observed
+    # (empty string if absent) so a test can assert the real
+    # skill_runtime_exec.py -> _sanitize_env() child dispatch forwarded a
+    # caller-supplied GH_CONFIG_DIR through to a genuine `gh` subprocess.
+    # Never touched by any scenario that does not set this env var.
+    observed_gh_config_dir_path = os.environ.get(
+        "SKILL_RUNTIME_TEST_OBSERVED_GH_CONFIG_DIR_FILE"
+    )
+    if observed_gh_config_dir_path:
+        with open(observed_gh_config_dir_path, "w", encoding="utf-8") as fh:
+            fh.write(os.environ.get("GH_CONFIG_DIR", ""))
     state_path = os.environ.get("SKILL_RUNTIME_TEST_OWNER_REACTION_GH_STATE_FILE")
     if not state_path:
         sys.stderr.write("fake_gh: no_state_file\\n")
@@ -179,8 +191,13 @@ def list_worktrees(project_root: str, deadline=None):
 
 
 def select_issue_worktree(catalog, issue_number, root_realpath):
-    # owner_reaction.decide / owner_reaction.decide.fixture are NOT
-    # root-no-worktree eligible (same boundary as repair_action.apply).
+    # PR #2694 review fix_delta (P1-2): owner_reaction.decide /
+    # owner_reaction.decide.fixture are now root-no-worktree eligible (see
+    # `command_allows_root_no_worktree()` in skill_runtime_command_policy.py),
+    # so most test scenarios never need this stub to resolve a real entry at
+    # all. It still returns one unconditionally so any scenario that DOES
+    # set LOOP_ISSUE_NUMBER (mirroring an active worktree being present)
+    # keeps behaving exactly as before.
     return {"issue_number": issue_number, "path": root_realpath}
 ''',
     )

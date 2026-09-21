@@ -288,18 +288,24 @@ SKILL_RUNTIME_COMMAND_POLICY_V2: dict[str, Any] = {
         },
         # Issue #1975: read-only owner-reaction reader / stable-user-id
         # principal resolver / drift checker / selection resolver, bound
-        # directly to `owner_reaction_decision.py`. This is a policy
-        # DECLARATION only -- it is not, and does not need to be, one of
-        # `skill_runtime_exec.py`'s hardcoded per-command_id dispatch
-        # branches (that generic-dispatch wiring is explicitly Out of
-        # Scope for this Issue, the same posture as `scope_rollup.run`
-        # below). No `ExactSkillRuntimeCommand` field / exact-match parser
-        # is added for this command_id, and it is deliberately NOT added
-        # to `ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS` -- neither is required
-        # by Issue #1975 AC7's scope ("registry entry rendering -> real
-        # CLI subprocess launch -> root reads the structured result"), and
-        # `local_main_branch_guard.py` (the hook that consumes root-no-
-        # worktree eligibility) is outside this Issue's Allowed Paths.
+        # directly to `owner_reaction_decision.py`. Issue #1975 itself only
+        # declared this policy entry; Issue #2688 (this repo's current
+        # state) added the actual generic-dispatch wiring -- both
+        # `ExactSkillRuntimeCommand` fields (`owner_user_id`,
+        # `preview_binding_file`, `gh_fixture_file`) and dedicated exact
+        # parsers/checkers (`parse_exact_skill_runtime_owner_reaction_decide_
+        # command` / `is_exact_skill_runtime_owner_reaction_decide_executor_
+        # command` and their `.fixture` siblings below), plus a hardcoded
+        # `elif is_owner_reaction_decide_command / is_owner_reaction_decide_
+        # fixture_command:` dispatch branch in `skill_runtime_exec.py`'s
+        # `main()`. PR #2694 review fix_delta (P1-2): both command IDs are
+        # read-only/local-only (`allowed_write_roots: []`) and never needed
+        # the issue's own active worktree, so they are now registered in
+        # `ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS` / `_ROOT_NO_WORKTREE_
+        # POLICY_INVARIANTS` below (mirroring the `preflight.run`/`decide.run`
+        # precedent), and their exact checkers use the SAME canonical
+        # `command_allows_root_no_worktree()` short-circuit every other
+        # root-no-worktree-eligible checker uses -- not a bespoke bypass.
         "owner_reaction.decide": {
             "execution_class": "exact_owner_reaction_decide",
             "required_cwd": "canonical_main_root",
@@ -332,6 +338,11 @@ ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset(
         "contract_update.run.with_anchor",
         "contract_update.run.with_human_context",
         "decide.run",
+        # PR #2694 review fix_delta (P1-2): read-only/local-only, never
+        # writes anything (`allowed_write_roots: []`) -- see the comment on
+        # the `eligible_command_ids["owner_reaction.decide"]` entry above.
+        "owner_reaction.decide",
+        "owner_reaction.decide.fixture",
     }
 )
 _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
@@ -423,6 +434,23 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
         "allowed_write_roots": [
             ".claude/artifacts/issue-refinement-loop/{active_issue}/",
         ],
+    },
+    # PR #2694 review fix_delta (P1-2): mirrors
+    # `eligible_command_ids["owner_reaction.decide"]` / `.fixture` exactly --
+    # both are read-only/local-only and never write anything.
+    "owner_reaction.decide": {
+        "execution_class": "exact_owner_reaction_decide",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "github_read_only",
+        "allowed_write_roots": [],
+    },
+    "owner_reaction.decide.fixture": {
+        "execution_class": "exact_owner_reaction_decide_fixture",
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "local_only",
+        "allowed_write_roots": [],
     },
 }
 
@@ -1571,12 +1599,16 @@ def parse_exact_skill_runtime_owner_reaction_decide_command(
 def is_exact_skill_runtime_owner_reaction_decide_executor_command(
     command: str, cwd: str, project_root: str, deadline: Deadline | None = None
 ) -> bool:
-    """Same trusted-repo / default-branch / canonical-root / active-issue
-    safety boundary as `is_exact_skill_runtime_repair_action_apply_executor_command`,
-    applied to the `owner_reaction.decide` command class (Issue #2688).
-    `owner_reaction.decide` is bound to the issue's own active worktree --
-    it is deliberately NOT added to `ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS`
-    (same posture as `repair_action.apply`)."""
+    """Same trusted-repo / default-branch / canonical-root safety boundary as
+    `is_exact_skill_runtime_executor_command`, applied to the
+    `owner_reaction.decide` command class (Issue #2688). `owner_reaction.
+    decide` is read-only and never writes anything -- PR #2694 review
+    fix_delta (P1-2): registered in `ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS`,
+    so this uses the SAME canonical `command_allows_root_no_worktree()`
+    short-circuit `is_exact_skill_runtime_executor_command` uses, never a
+    bespoke bypass. Only falls back to requiring a real active-issue
+    worktree entry when that eligibility check fails (e.g. a future policy
+    regression that removes it from the allowlist)."""
     parsed = parse_exact_skill_runtime_owner_reaction_decide_command(command, project_root)
     if parsed is None:
         return False
@@ -1589,6 +1621,8 @@ def is_exact_skill_runtime_owner_reaction_decide_executor_command(
     repo_slug = resolve_repo_slug(project_root, deadline)
     if repo_slug != parsed.repo:
         return False
+    if command_allows_root_no_worktree(parsed):
+        return True
     active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
     if active_issue != parsed.issue_number or entry is None:
         return False
@@ -1671,8 +1705,12 @@ def parse_exact_skill_runtime_owner_reaction_decide_fixture_command(
 def is_exact_skill_runtime_owner_reaction_decide_fixture_executor_command(
     command: str, cwd: str, project_root: str, deadline: Deadline | None = None
 ) -> bool:
-    """Apply the canonical root/default-branch/active-issue boundary to the
-    fixture sibling. It is never root-no-worktree eligible."""
+    """Apply the canonical root/default-branch boundary to the fixture
+    sibling. PR #2694 review fix_delta (P1-2): registered in
+    `ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS` (read-only/local-only, never
+    writes anything), so this uses the SAME canonical
+    `command_allows_root_no_worktree()` short-circuit as the production
+    profile above."""
     parsed = parse_exact_skill_runtime_owner_reaction_decide_fixture_command(command, project_root)
     if parsed is None or os.path.realpath(cwd) != os.path.realpath(project_root):
         return False
@@ -1681,6 +1719,8 @@ def is_exact_skill_runtime_owner_reaction_decide_fixture_executor_command(
         return False
     if resolve_repo_slug(project_root, deadline) != parsed.repo:
         return False
+    if command_allows_root_no_worktree(parsed):
+        return True
     active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
     return active_issue == parsed.issue_number and entry is not None
 
@@ -2603,11 +2643,13 @@ def validate_registry_entry(command_id: str, entry: dict[str, Any], active_issue
     # entries (Issue #1975, unmodified by this Issue per its Allowed Paths /
     # read-only design reference constraint) declare no `required_cwd` /
     # `required_branch` / `allowed_write_roots` keys at all (this CLI is
-    # bound to the issue's own active worktree and never writes anything --
-    # see `is_exact_skill_runtime_owner_reaction_decide_executor_command`'s
-    # own active-issue-worktree boundary, which enforces the equivalent of
+    # read-only/local-only and never writes anything -- see
+    # `is_exact_skill_runtime_owner_reaction_decide_executor_command`'s own
+    # cwd/default-branch checks, which enforce the equivalent of
     # `required_cwd`/`required_branch` independently of this entry-shape
-    # check). `None` here means "the key is absent", matched against
+    # check; PR #2694 review fix_delta P1-2 additionally made both command
+    # IDs root-no-worktree eligible, so an active-issue worktree is no
+    # longer required either). `None` here means "the key is absent", matched against
     # `entry.get(...)`'s own `None` default -- never a widened default for
     # these two read-only/local-only command_ids.
     if command_id in {"owner_reaction.decide", "owner_reaction.decide.fixture"}:

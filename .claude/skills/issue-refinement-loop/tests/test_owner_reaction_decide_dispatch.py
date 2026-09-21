@@ -302,6 +302,166 @@ def test_owner_reaction_decide_first_hop_targets_owner_reaction_decision_not_run
     assert payload["schema"] == "OWNER_REACTION_DECISION_RESULT_V1", payload
 
 
+def test_gh_config_dir_carrier_includes_production_but_not_fixture_owner_reaction(tmp_path):
+    """PR #2694 review fix_delta (P0-1) structural regression: production
+    `owner_reaction.decide` must be registered in `_sanitize_env()`'s
+    `gh_config_dir_carrier_command_ids` allowlist (it is a real `gh api`
+    consumer); the local-only `owner_reaction.decide.fixture` sibling (which
+    never invokes `gh` at all) must NOT be added to the same allowlist."""
+    repo = make_repo(tmp_path)
+    install_fixture(repo, tmp_path / "trusted-gh-bin")
+    executor_source = (repo / "scripts" / "agent-guards" / "skill_runtime_exec.py").read_text(encoding="utf-8")
+    start = executor_source.index("gh_config_dir_carrier_command_ids = frozenset(")
+    end = executor_source.index("\n    )\n", start)
+    block = executor_source[start:end]
+    assert '"owner_reaction.decide"' in block, block
+    assert '"owner_reaction.decide.fixture"' not in block, block
+
+
+def test_owner_reaction_decide_production_forwards_gh_config_dir_to_real_gh_subprocess(tmp_path):
+    """PR #2694 review fix_delta (P0-1) behavioral regression: a caller-
+    supplied GH_CONFIG_DIR (the normal `gh auth login` stored-credential
+    carrier, distinct from an explicit GH_TOKEN/GITHUB_TOKEN) must reach the
+    real `gh` subprocess `owner_reaction_decision.py` shells out to for the
+    production profile -- proven end-to-end through a real
+    skill_runtime_exec.py subprocess, never a direct function call."""
+    repo = make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    install_fixture(repo, trusted_gh_bin)
+    preview_binding_rel = _seed_preview_binding(repo)
+
+    gh_state_path = tmp_path / "gh-state.json"
+    write_gh_state(
+        gh_state_path,
+        repo="squne121/loop-protocol",
+        issue_number=ISSUE_NUMBER,
+        owner_user_id=OWNER_USER_ID,
+        comment_id=COMMENT_ID,
+        comment_body=COMMENT_BODY,
+        anchor_comment_id=ANCHOR_COMMENT_ID,
+        anchor_body=ANCHOR_BODY,
+        issue_body=ISSUE_BODY,
+        reactions=REACTIONS,
+    )
+    gh_config_dir = tmp_path / "gh-config-dir"
+    gh_config_dir.mkdir()
+    observed_path = tmp_path / "observed-gh-config-dir.txt"
+
+    result = run_executor(
+        repo,
+        [
+            "--command-id", "owner_reaction.decide",
+            "--issue-number", str(ISSUE_NUMBER),
+            "--repo", "squne121/loop-protocol",
+            "--owner-user-id", str(OWNER_USER_ID),
+            "--preview-binding-file", preview_binding_rel,
+        ],
+        extra_env={
+            **_base_env(),
+            "SKILL_RUNTIME_TEST_OWNER_REACTION_GH_STATE_FILE": str(gh_state_path),
+            "GH_CONFIG_DIR": str(gh_config_dir),
+            "SKILL_RUNTIME_TEST_OBSERVED_GH_CONFIG_DIR_FILE": str(observed_path),
+        },
+    )
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "selected", payload
+    assert observed_path.is_file(), "fake gh never ran / never observed GH_CONFIG_DIR"
+    assert observed_path.read_text(encoding="utf-8") == str(gh_config_dir)
+
+
+def test_owner_reaction_decide_dispatch_succeeds_without_active_issue_worktree(tmp_path, monkeypatch):
+    """PR #2694 review fix_delta (P1-2): `owner_reaction.decide` is
+    read-only (`allowed_write_roots: []`) and must be root-no-worktree
+    eligible -- it must dispatch successfully even when no active issue
+    worktree resolves at all (LOOP_ISSUE_NUMBER unset), unlike a real
+    mutation command class such as `repair_action.apply`."""
+    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+    repo = make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    install_fixture(repo, trusted_gh_bin)
+    preview_binding_rel = _seed_preview_binding(repo)
+
+    gh_state_path = tmp_path / "gh-state.json"
+    write_gh_state(
+        gh_state_path,
+        repo="squne121/loop-protocol",
+        issue_number=ISSUE_NUMBER,
+        owner_user_id=OWNER_USER_ID,
+        comment_id=COMMENT_ID,
+        comment_body=COMMENT_BODY,
+        anchor_comment_id=ANCHOR_COMMENT_ID,
+        anchor_body=ANCHOR_BODY,
+        issue_body=ISSUE_BODY,
+        reactions=REACTIONS,
+    )
+
+    result = run_executor(
+        repo,
+        [
+            "--command-id", "owner_reaction.decide",
+            "--issue-number", str(ISSUE_NUMBER),
+            "--repo", "squne121/loop-protocol",
+            "--owner-user-id", str(OWNER_USER_ID),
+            "--preview-binding-file", preview_binding_rel,
+        ],
+        # Deliberately NO `LOOP_ISSUE_NUMBER` -- resolve_active_issue()
+        # returns (None, None), so this can only succeed via the
+        # root-no-worktree eligibility path, never the active-issue-worktree
+        # fallback.
+        extra_env={"SKILL_RUNTIME_TEST_OWNER_REACTION_GH_STATE_FILE": str(gh_state_path)},
+    )
+    assert "exact command class rejected" not in result.stderr, result.stderr
+    assert "active_issue_worktree_missing" not in result.stderr, result.stderr
+    assert "active_issue_mismatch" not in result.stderr, result.stderr
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "selected", payload
+
+
+def test_owner_reaction_decide_fixture_dispatch_succeeds_without_active_issue_worktree(tmp_path, monkeypatch):
+    """PR #2694 review fix_delta (P1-2): the fixture sibling must be
+    root-no-worktree eligible too."""
+    monkeypatch.delenv("LOOP_ISSUE_NUMBER", raising=False)
+    repo = make_repo(tmp_path)
+    install_fixture(repo, tmp_path / "trusted-gh-bin")
+    preview_binding_rel = _seed_preview_binding(repo)
+
+    gh_fixture_path = _artifact_dir(repo) / "gh_fixture.json"
+    write_gh_state(
+        gh_fixture_path,
+        repo="squne121/loop-protocol",
+        issue_number=ISSUE_NUMBER,
+        owner_user_id=OWNER_USER_ID,
+        comment_id=COMMENT_ID,
+        comment_body=COMMENT_BODY,
+        anchor_comment_id=ANCHOR_COMMENT_ID,
+        anchor_body=ANCHOR_BODY,
+        issue_body=ISSUE_BODY,
+        reactions=REACTIONS,
+    )
+    gh_fixture_rel = str(gh_fixture_path.relative_to(repo))
+
+    result = run_executor(
+        repo,
+        [
+            "--command-id", "owner_reaction.decide.fixture",
+            "--issue-number", str(ISSUE_NUMBER),
+            "--repo", "squne121/loop-protocol",
+            "--owner-user-id", str(OWNER_USER_ID),
+            "--preview-binding-file", preview_binding_rel,
+            "--gh-fixture-file", gh_fixture_rel,
+        ],
+        extra_env={},
+    )
+    assert "exact command class rejected" not in result.stderr, result.stderr
+    assert "active_issue_worktree_missing" not in result.stderr, result.stderr
+    assert "active_issue_mismatch" not in result.stderr, result.stderr
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "selected", payload
+
+
 def test_owner_reaction_decision_py_argv_template_unchanged_by_this_issue():
     """AC6 (static companion, full runtime coverage lives in
     test_owner_reaction_decision.py per the live Issue's own Verification
