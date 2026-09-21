@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -66,15 +67,28 @@ def _run_sh_function(function_name: str, *args: str) -> subprocess.CompletedProc
     return subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=20)
 
 
-def _write_fake_claude(path: Path, *, version: str, expose_classify_all_shell: bool | None) -> Path:
+def _write_fake_claude(
+    path: Path,
+    *,
+    version: str,
+    expose_classify_all_shell: bool | None,
+    classify_all_shell_raw_literal: str | None = None,
+) -> Path:
     """auto-mode defaults/config readback に応答する fake claude binary を書き出す。
 
     `expose_classify_all_shell` が None の場合、effective config は現行 vendor CLI
     実機検証（Claude Code 2.1.233, 2026-08-16）通り classifyAllShell key を一切
     公開しない。True/False の場合は effective config にその値の key を明示的に
     含める（direct readback availability のテスト用）。
+
+    `classify_all_shell_raw_literal` は P2-1 の non-boolean drift regression
+    （PR #2717 owner review 反映）用に、任意の Python リテラル source 文字列
+    （例: `'"false"'`（JSON string）、`"None"`（JSON null）、`"123"`（number））を
+    そのまま注入する。指定時は `expose_classify_all_shell` より優先する。
     """
-    if expose_classify_all_shell is None:
+    if classify_all_shell_raw_literal is not None:
+        classify_all_shell_line = f'        config["classifyAllShell"] = {classify_all_shell_raw_literal}\n'
+    elif expose_classify_all_shell is None:
         classify_all_shell_line = ""
     else:
         classify_all_shell_line = f'        config["classifyAllShell"] = {expose_classify_all_shell!r}\n'
@@ -142,6 +156,107 @@ def _write_generated_settings(tmp_path: Path) -> Path:
     return settings_path
 
 
+def _resolve_ac4_verifier_claude_bin() -> str | None:
+    """AC4 runtime verifier 用の claude 解決（PR #2717 owner review P1-2 反映）。
+
+    `claude_gpt_resolve_claude_bin()`（lib.sh）と同じ優先順位（`CLAUDE_GPT_CLAUDE_BIN`
+    override → PATH 上の `claude`）をこの呼び出し時点で独立に再評価する。
+    モジュール import 時に一度だけ評価する `REAL_CLAUDE_BIN` とは異なり、この関数は
+    呼び出しごとに再評価するため、`run_ac4_runtime_verifier()` を独立 subprocess として
+    起動するテストが `env=` 経由で SKIP / 非 SKIP を決定論的に切り替えられる。
+    """
+    override = os.environ.get("CLAUDE_GPT_CLAUDE_BIN")
+    if override:
+        return override
+    return shutil.which("claude")
+
+
+def run_ac4_runtime_verifier() -> int:
+    """AC4 authoritative runtime verifier（process-level exit code contract）。
+
+    PR #2717 owner review P1-2 反映: `pytest.mark.skipif(REAL_CLAUDE_BIN is None,
+    ...)` は pytest の通常 skip であり、その process exit code は 0（成功）である。
+    `docs/dev/runtime-verification-policy.md` が要求する「CLI 利用不能時は exit 77
+    の explicit SKIP、PASS に昇格しない」という process-level 契約の代替にはならない。
+    この関数は AC4 の authoritative runtime VC として、独立した薄い CLI entrypoint
+    （`python3 test_classify_all_shell_native_projection.py`）から呼び出される。
+    中身は `test_real_cli_projection_readback_or_skip` と同じ readback ロジックを
+    再利用する薄いラッパーであり、新規 harness ファイルは追加しない。
+
+    戻り値（process exit code として使う想定）:
+      0  = readback 成功（classifyAllShell omission・4 tri-state フィールド・
+           既存安全境界チェックすべて PASS）
+      1  = readback/policy 異常（fail-closed。`preflight.sh` の非 0 exit（環境不可の
+           exit 3 を除く）・不正 JSON・期待した evidence shape との不一致を含む）
+      77 = SKIP（claude CLI が利用不能。PASS へ昇格しない）
+    """
+    if _resolve_ac4_verifier_claude_bin() is None:
+        print("SKIP: claude CLI not available for AC4 runtime verification", file=sys.stderr)
+        return 77
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        settings_path = _write_generated_settings(tmp_path)
+        env = dict(os.environ)
+        result = subprocess.run(
+            [str(PREFLIGHT_SH), "--auto-mode-check", str(settings_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        if result.returncode == 3:
+            # claude_gpt_resolve_claude_bin() 解決値が実際には実行できなかった
+            # 場合（TOCTOU race）も environment-unavailable として SKIP にする。
+            print(
+                "SKIP: preflight.sh reported claude binary not found (exit 3)",
+                file=sys.stderr,
+            )
+            return 77
+        if result.returncode != 0:
+            sys.stderr.write(result.stdout)
+            sys.stderr.write(result.stderr)
+            return 1
+
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            print("AC4 runtime verifier: preflight.sh output was not valid JSON", file=sys.stderr)
+            return 1
+
+        checks = payload.get("checks", {})
+        classify_all_shell = payload.get("classify_all_shell", {})
+        direct_readback_available = classify_all_shell.get("direct_readback_available")
+        effective_value_ok = (
+            isinstance(classify_all_shell.get("effective_value"), bool)
+            if direct_readback_available
+            else classify_all_shell.get("effective_value") is None
+        )
+        readback_ok = (
+            payload.get("ok") is True
+            and all(
+                checks.get(name) is True
+                for name in (
+                    "environment_narrow_label_present",
+                    "allow_narrow_label_present",
+                    "hard_deny_defaults_and_additions_present",
+                    "soft_deny_unmodified",
+                )
+            )
+            and set(classify_all_shell.keys()) == _EXPECTED_TRI_STATE_KEYS
+            and classify_all_shell.get("generated_key_present") is False
+            and classify_all_shell.get("native_parity_claimed") is False
+            and isinstance(direct_readback_available, bool)
+            and effective_value_ok
+        )
+        if not readback_ok:
+            print(json.dumps(payload), file=sys.stderr)
+            return 1
+
+        print(json.dumps(payload))
+        return 0
+
+
 # --- AC1: generated autoMode omits classifyAllShell ----------------------------
 
 
@@ -191,6 +306,7 @@ def test_effective_policy_reports_tri_state_evidence(tmp_path):
     check_json_path.write_text(
         json.dumps(
             {
+                "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2",
                 "ok": True,
                 "classify_all_shell": {
                     "generated_key_present": False,
@@ -207,6 +323,7 @@ def test_effective_policy_reports_tri_state_evidence(tmp_path):
         encoding="utf-8",
     )
     policy = canary._effective_policy(check_json_path, None)
+    assert policy["auto_mode_check_schema_mismatch"] is False
     assert set(policy["classify_all_shell"].keys()) == _EXPECTED_TRI_STATE_KEYS
     assert policy["classify_all_shell"]["generated_key_present"] is False
     assert policy["classify_all_shell"]["direct_readback_available"] is True
@@ -274,6 +391,16 @@ def test_native_aligned_projection_preserves_hard_deny(tmp_path):
 
 
 # --- AC4: real CLI focused runtime verifier, or SKIP (no fallback promotion) ---
+#
+# `test_real_cli_projection_readback_or_skip` は unit regression として
+# `pytest.mark.skipif` で real claude CLI 不在時を扱うが、pytest の skip は
+# process exit 0（成功）であり、AC4 が要求する「CLI 不在時は exit 77 の
+# explicit SKIP」という process-level 契約の代替にはならない（PR #2717 owner
+# review P1-2）。AC4 の authoritative runtime VC は本ファイル下部の
+# `run_ac4_runtime_verifier()` / `if __name__ == "__main__":` entrypoint
+# （`python3 test_classify_all_shell_native_projection.py` として直接実行する）
+# であり、その exit 0/1/77 の三系統は
+# `test_ac4_runtime_verifier_*` で regression する。
 
 
 @pytest.mark.skipif(REAL_CLAUDE_BIN is None, reason="claude CLI not available")
@@ -283,8 +410,10 @@ def test_real_cli_projection_readback_or_skip(tmp_path):
     `preflight.sh --auto-mode-check` を実行する
     THEN generated policy（key omission・4 rule lists の readback・hard-deny
     追加分）と readback availability を sanitized evidence として出力して
-    PASS する。GitHub mutation や classifier request を発生させない
-    （real claude CLI 未利用時は pytest skip とし PASS へ昇格しない）
+    PASS する。GitHub mutation や classifier request を発生させない。
+    これは unit regression であり、AC4 の authoritative process-level SKIP=77
+    契約は `run_ac4_runtime_verifier()` 側が担う（real claude CLI 未利用時は
+    ここでは pytest skip とし PASS へ昇格しない）
     """
     settings_path = _write_generated_settings(tmp_path)
     result = subprocess.run(
@@ -315,6 +444,63 @@ def test_real_cli_projection_readback_or_skip(tmp_path):
     # HOME 絶対パスを含めない（digest 化された値と narrow label のみ）。
     for forbidden_key in ("prompt", "response", "transcript", "token", "credential"):
         assert forbidden_key not in payload
+
+
+def test_ac4_runtime_verifier_skips_with_exit_77_when_claude_unavailable():
+    """GIVEN claude CLI が PATH 上になく `CLAUDE_GPT_CLAUDE_BIN` override も
+    未設定の subprocess 環境
+    WHEN `python3 test_classify_all_shell_native_projection.py` を実行する
+    THEN process exit code は 77（explicit SKIP）であり、PASS（exit 0）へ
+    昇格しない（PR #2717 owner review P1-2。host に real claude CLI が
+    存在するかどうかに関わらず、この subprocess 呼び出し自体の env で
+    決定論的に検証する）
+    """
+    env = {
+        "PATH": "/nonexistent-claude-gpt-p1-2-skip-path",
+        "HOME": os.environ.get("HOME", "/tmp"),
+    }
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve())],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    assert result.returncode == 77, result.stdout + result.stderr
+    assert "SKIP" in result.stderr
+
+
+@pytest.mark.skipif(REAL_CLAUDE_BIN is None, reason="claude CLI not available")
+def test_ac4_runtime_verifier_exits_0_on_success_and_1_on_contradicting_readback(tmp_path):
+    """GIVEN real claude CLI が利用可能な環境
+    WHEN `run_ac4_runtime_verifier()` を（実 claude・fail-closed を強制する
+    fake claude の双方で）subprocess として実行する
+    THEN readback 成功時は exit 0、fail-closed な readback（AC5 の矛盾ケース）
+    時は exit 1 を返す（PASS/FAIL いずれも exit 77 へフォールバックしない）
+    """
+    verifier_path = Path(__file__).resolve()
+
+    success = subprocess.run(
+        [sys.executable, str(verifier_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert success.returncode == 0, success.stdout + success.stderr
+    success_payload = json.loads(success.stdout)
+    assert success_payload["ok"] is True
+
+    fake_claude_contradicts = _write_fake_claude(
+        tmp_path / "fake-claude-ac4-verifier-contradicts", version="2.1.233", expose_classify_all_shell=True
+    )
+    failure = subprocess.run(
+        [sys.executable, str(verifier_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "CLAUDE_GPT_CLAUDE_BIN": str(fake_claude_contradicts)},
+    )
+    assert failure.returncode == 1, failure.stdout + failure.stderr
 
 
 # --- AC5: direct_readback_available:false is not a merge blocker,   -----------
@@ -393,6 +579,48 @@ def test_unreadable_native_boolean_does_not_claim_parity(tmp_path):
     assert false_payload["classify_all_shell"]["effective_value"] is False
 
 
+# --- P2-1: direct readback の型異常を genuine false へ黙って正規化しない -------
+# (PR #2717 owner review 反映) ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw_literal",
+    ['"false"', "None", "123", "[]", "{}"],
+    ids=["json_string_false", "json_null", "number", "empty_list", "empty_dict"],
+)
+def test_classify_all_shell_readback_non_boolean_is_schema_drift_not_false(tmp_path, raw_literal):
+    """GIVEN native CLI の `auto-mode config` が classifyAllShell に non-boolean
+    値（文字列 "false"・null・数値・list・dict 等）を返す（将来の vendor CLI
+    readback surface 変化を模擬）
+    WHEN preflight.sh --auto-mode-check を実行する
+    THEN `config.get("classifyAllShell") is True` の truthiness 判定で genuine
+    な false へ黙って正規化せず、`classify_all_shell_readback_non_boolean` の
+    明示的な reason を出し fail-closed（exit 8）にする。`direct_readback_available`
+    は false のまま（有効な boolean readback として扱わない）
+    """
+    settings_path = _write_generated_settings(tmp_path)
+    fake_claude = _write_fake_claude(
+        tmp_path / f"fake-claude-non-boolean-{abs(hash(raw_literal))}",
+        version="2.1.233",
+        expose_classify_all_shell=None,
+        classify_all_shell_raw_literal=raw_literal,
+    )
+    result = subprocess.run(
+        [str(PREFLIGHT_SH), "--auto-mode-check", str(settings_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "CLAUDE_GPT_CLAUDE_BIN": str(fake_claude)},
+    )
+    assert result.returncode == 8, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert "classify_all_shell_readback_non_boolean" in payload["fail_closed_reasons"]
+    assert payload["classify_all_shell"]["direct_readback_available"] is False
+    assert payload["classify_all_shell"]["effective_value"] is None
+    assert payload["classify_all_shell"]["native_parity_claimed"] is False
+
+
 # --- AC6: version floor is non-blocking capability info -------------------------
 
 
@@ -401,7 +629,7 @@ def test_min_supported_version_gate_is_non_blocking(tmp_path):
     WHEN 他の安全境界（narrow label・hard_deny・soft_deny）が全て満たされている
     状態で preflight.sh --auto-mode-check を実行する
     THEN version floor は launcher 起動そのものを拒否しない（ok は true のまま、
-    fail_closed_reasons に version 関連の理由は含まれない）。claude_version.ok
+    fail_closed_reasons に version 関連の理由は含まれない）。claude_version.classify_all_shell_setting_version_floor_met
     のみが capability 情報として false を示す
     """
     below_min_version = "2.0.0"
@@ -425,5 +653,17 @@ def test_min_supported_version_gate_is_non_blocking(tmp_path):
     assert payload["checks"]["hard_deny_defaults_and_additions_present"] is True
     assert payload["checks"]["soft_deny_unmodified"] is True
     assert not any(reason.startswith("claude_version_") for reason in payload["fail_closed_reasons"])
-    assert payload["claude_version"]["ok"] is False
+    assert payload["claude_version"]["classify_all_shell_setting_version_floor_met"] is False
     assert payload["claude_version"]["raw"].startswith(below_min_version)
+
+
+if __name__ == "__main__":
+    # AC4 authoritative runtime verifier entrypoint（process-level exit code
+    # contract。PR #2717 owner review P1-2 反映）。
+    #
+    #   uv run --locked python3 scripts/claude-gpt/tests/test_classify_all_shell_native_projection.py
+    #
+    # 単体実行時は pytest を経由せず、`run_ac4_runtime_verifier()` の結果を
+    # そのまま process exit code として返す（0=成功 / 1=readback・policy 異常 /
+    # 77=claude CLI 利用不能の SKIP）。
+    sys.exit(run_ac4_runtime_verifier())

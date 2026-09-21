@@ -489,13 +489,19 @@ CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL="claude-gpt launcher ha
 CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL="claude-gpt launcher hard_deny 追加分（second-gate 補助・defense-in-depth）: force push（--force / --force-with-lease / +refspec）は絶対拒否する。"
 CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL="claude-gpt launcher hard_deny 追加分（second-gate 補助・defense-in-depth）: remote ref（branch/tag/release）の削除は絶対拒否する。"
 
-# `claude auto-mode config` readback による classifyAllShell 直接 boolean 検証が
-# 利用可能かどうかを示す non-blocking capability 情報（Issue #2709 AC6）。
-# 以前は launcher 起動そのものを拒否する hard fail-closed version gate だったが、
-# launcher-generated settings が `classifyAllShell` を無条件注入・必須視しなくなった
-# ため（Issue #2709 AC1）、この version floor の役割は「readback 検証 evidence の
-# 信頼性メタデータ」に縮小した。この version floor を必要とする他の独立機能は
-# 現時点で存在しない（investigation 済み、Issue #2709 Background 参照）。
+# `autoMode.classifyAllShell` setting のサポート開始バージョン（support floor）を
+# 示す non-blocking capability 情報（Issue #2709 AC6。PR #2717 owner review P2-2
+# 反映）。v2.1.193 が意味するのは「`autoMode.classifyAllShell` という setting 自体を
+# vendor CLI がサポートし始めた境界」であり、`claude auto-mode config` の direct
+# boolean readback が利用可能かどうかとは別物である（現行 vendor CLI は
+# `auto-mode defaults`/`auto-mode config` で 4 rule lists のみを公開し、この version
+# floor を満たしていても `classifyAllShell` key の direct readback は依然
+# unavailable — 実機検証 Claude Code 2.1.278 で確認済み）。以前は launcher 起動
+# そのものを拒否する hard fail-closed version gate だったが、launcher-generated
+# settings が `classifyAllShell` を無条件注入・必須視しなくなったため
+# （Issue #2709 AC1）、この version floor の役割は「setting support floor を
+# 満たしているかどうかのメタデータ」に縮小した。この version floor を必要とする
+# 他の独立機能は現時点で存在しない（investigation 済み、Issue #2709 Background 参照）。
 CLAUDE_GPT_MIN_SUPPORTED_CLAUDE_VERSION="2.1.193"
 
 # claude_gpt_json_escape: 任意文字列を JSON 文字列リテラル（引用符込み）へ変換する。
@@ -551,7 +557,9 @@ claude_gpt_auto_mode_standalone_json() {
 # 引数2: 検証対象の settings.local.json 絶対パス
 # 戻り値: 0 = readback 成功（PASS）、8 = fail-closed（narrow label 未反映・
 #         hard_deny/soft_deny 不整合・classifyAllShell の direct readback が
-#         generated key 省略と矛盾する値を返した、のいずれか。version floor は
+#         generated key 省略と矛盾する値を返した・classifyAllShell の direct
+#         readback が exact bool でない値を返した（schema/capability drift。
+#         PR #2717 owner review P2-1）、のいずれか。version floor は
 #         non-blocking capability 情報であり、単独では fail-closed の理由にならない
 #         — Issue #2709 AC6）
 claude_gpt_auto_mode_readback() {
@@ -559,7 +567,7 @@ claude_gpt_auto_mode_readback() {
   settings_path="$2"
 
   if ! command -v python3 >/dev/null 2>&1; then
-    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1","status":"blocked","reason":"python3_unavailable"}\n'
+    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2","status":"blocked","reason":"python3_unavailable"}\n'
     return 8
   fi
 
@@ -647,20 +655,25 @@ with open(defaults_path, encoding="utf-8") as fh:
 with open(config_path, encoding="utf-8") as fh:
     config_text = fh.read()
 
-# --- version capability info（non-blocking, Issue #2709 AC6）。以前は
-#     classifyAllShell readback を検証する version 未満を無条件 fail-closed に
-#     していたが、launcher が classifyAllShell を無条件注入しなくなったため
-#     （AC1）、この version floor は「classifyAllShell direct boolean readback
-#     検証が利用可能かどうか」を示す capability メタデータへ縮小した。
+# --- version capability info（non-blocking, Issue #2709 AC6。PR #2717 owner
+#     review P2-2 反映）。以前は classifyAllShell readback を検証する version
+#     未満を無条件 fail-closed にしていたが、launcher が classifyAllShell を
+#     無条件注入しなくなったため（AC1）、この version floor は
+#     「`autoMode.classifyAllShell` setting のサポート開始バージョン
+#     （support floor）を満たしているかどうか」を示す capability メタデータへ
+#     縮小した。これは vendor CLI の `auto-mode config` が classifyAllShell の
+#     direct boolean readback を公開しているかどうかとは別の意味であり
+#     （現行 vendor CLI は version floor を満たしていても direct readback は
+#     unavailable — 実機検証済み）、両者を混同する名称・説明にはしない。
 #     launcher 起動そのものはこの判定では拒否しない（reasons へは追加しない）。 ---
 parsed_version = _parse_version(version_text) if version_rc == 0 else None
 min_version = _parse_version(min_supported_version)
 if version_rc != 0 or parsed_version is None:
-    version_ok = False
+    classify_all_shell_setting_version_floor_met = False
 elif min_version is not None and parsed_version < min_version:
-    version_ok = False
+    classify_all_shell_setting_version_floor_met = False
 else:
-    version_ok = True
+    classify_all_shell_setting_version_floor_met = True
 
 defaults = None
 config = None
@@ -743,8 +756,17 @@ generated_key_present = '"classifyAllShell"' in settings_text
 direct_readback_available = False
 effective_value = None
 if config is not None and "classifyAllShell" in config:
-    direct_readback_available = True
-    effective_value = config.get("classifyAllShell") is True
+    # PR #2717 owner review P2-1: `is True` は truthiness 相当の緩い判定であり、
+    # vendor CLI が将来 non-boolean 値（文字列 "false" / null / 数値等）を
+    # 返した場合に genuine な false へ黙って正規化してしまう。exact bool 型で
+    # ない場合は effective_value を確定させず、schema/capability drift として
+    # 明示的な reason を出す（新しい generic validator framework は作らない）。
+    raw_classify_all_shell_value = config["classifyAllShell"]
+    if type(raw_classify_all_shell_value) is bool:
+        direct_readback_available = True
+        effective_value = raw_classify_all_shell_value
+    else:
+        reasons.append("classify_all_shell_readback_non_boolean")
 
 # AC5 block condition (b): if direct readback becomes available in the
 # future and reports the projection enabled despite the launcher never
@@ -769,14 +791,18 @@ config_digest = _digest(config_text) if config is not None else "unknown"
 ok = not reasons
 
 result = {
-    "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1",
+    "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2",
     "status": "ok" if ok else "blocked",
     "ok": ok,
     "claude_version": {
         "raw": version_text.strip(),
         "parsed": list(parsed_version) if parsed_version else None,
         "min_supported": list(min_version) if min_version else None,
-        "ok": version_ok,
+        # PR #2717 owner review P2-2: この field は「`autoMode.classifyAllShell`
+        # setting のサポート開始バージョンを満たしているか」のみを表す。
+        # classifyAllShell の direct boolean readback availability とは独立
+        # （それは下記 `classify_all_shell.direct_readback_available` を見る）。
+        "classify_all_shell_setting_version_floor_met": classify_all_shell_setting_version_floor_met,
     },
     "checks": {
         "environment_narrow_label_present": env_label_present,

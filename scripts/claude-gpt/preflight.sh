@@ -55,6 +55,12 @@ fi
 # コメント参照。「配線は followup」という過去の記述は stale だったため訂正 —
 # Issue #2709 Background）。
 #
+# 出力 schema: `CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2`（PR #2717 owner review
+# P1-1 反映。旧 `checks.classify_all_shell_enabled` / `checks.classify_all_shell_
+# verification_source`（bool/string）から、トップレベル `classify_all_shell`
+# tri-state/availability evidence object（4 フィールド）へ breaking shape change
+# したため、V1 のままでの互換維持は行わず schema identity を V2 へ cutover した）。
+#
 # Exit code:
 #   0  = auto-mode readback 成功。$defaults 保持・narrow scope 反映・hard_deny
 #        追加分保持・soft_deny 不変を確認。classifyAllShell は tri-state/
@@ -62,8 +68,10 @@ fi
 #        のみで、単独では exit code に影響しない（Issue #2709 AC1/AC2/AC6）
 #   2  = 呼び出しエラー（settings_path 未指定・不存在）
 #   3  = claude バイナリが見つからない（環境不可）
-#   8  = narrow scope 未反映・hard_deny/soft_deny 不整合、または classifyAllShell
-#        の direct readback が generated key 省略と矛盾する値を返した
+#   8  = narrow scope 未反映・hard_deny/soft_deny 不整合、classifyAllShell の
+#        direct readback が generated key 省略と矛盾する値を返した、または
+#        classifyAllShell の direct readback が exact bool でない値を返した
+#        （schema/capability drift。PR #2717 owner review P2-1）のいずれか
 #        （launcher バグまたは host 側の不備。fail-closed。Issue #2709 AC5）
 # --workflow-profile <profile>: Issue #2273. Thin dispatcher to the Python
 # `workflow_capability_preflight.py` module, which returns the structured
@@ -94,12 +102,12 @@ fi
 if [ "${1:-}" = "--auto-mode-check" ]; then
   AUTO_MODE_SETTINGS_PATH="${2:-}"
   if [ -z "$AUTO_MODE_SETTINGS_PATH" ] || [ ! -f "$AUTO_MODE_SETTINGS_PATH" ]; then
-    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1","status":"blocked","reason":"settings_path_missing_or_not_found"}\n'
+    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2","status":"blocked","reason":"settings_path_missing_or_not_found"}\n'
     exit 2
   fi
   CLAUDE_BIN_FOR_CHECK=$(claude_gpt_resolve_claude_bin)
   if [ -z "$CLAUDE_BIN_FOR_CHECK" ]; then
-    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1","status":"blocked","reason":"claude_binary_not_found"}\n'
+    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2","status":"blocked","reason":"claude_binary_not_found"}\n'
     exit 3
   fi
   claude_gpt_auto_mode_readback "$CLAUDE_BIN_FOR_CHECK" "$AUTO_MODE_SETTINGS_PATH"

@@ -164,7 +164,7 @@ def test_generated_settings_defaults_readback_via_real_claude_cli(tmp_path):
         assert classify_all_shell["effective_value"] is None
     assert payload["digests"]["auto_mode_defaults_digest"] != "unknown"
     assert payload["digests"]["effective_config_digest"] != "unknown"
-    assert isinstance(payload["claude_version"]["ok"], bool)
+    assert isinstance(payload["claude_version"]["classify_all_shell_setting_version_floor_met"], bool)
 
 
 def test_auto_mode_readback_fail_closed_on_unsupported_claude_version(tmp_path):
@@ -172,7 +172,7 @@ def test_auto_mode_readback_fail_closed_on_unsupported_claude_version(tmp_path):
     WHEN preflight.sh --auto-mode-check を実行する
     THEN version floor は non-blocking capability info に縮小されたため
     （Issue #2709 AC6）、`claude_version_below_minimum_supported` は
-    fail_closed_reasons に現れず、`claude_version.ok` のみが false になる。
+    fail_closed_reasons に現れず、`claude_version.classify_all_shell_setting_version_floor_met` のみが false になる。
     このシナリオの exit 8 / ok=False は、fake CLI が narrow environment/allow
     label を一切反映しない baseline を返すこと（他の既存 safety check の失敗）に
     由来し、version floor 単独が原因ではないことを検証する
@@ -223,7 +223,7 @@ sys.exit(1)
     assert "claude_version_below_minimum_supported" not in payload["fail_closed_reasons"]
     assert "environment_narrow_label_not_reflected" in payload["fail_closed_reasons"]
     assert "allow_narrow_label_not_reflected" in payload["fail_closed_reasons"]
-    assert payload["claude_version"]["ok"] is False
+    assert payload["claude_version"]["classify_all_shell_setting_version_floor_met"] is False
     assert payload["classify_all_shell"]["generated_key_present"] is False
     assert payload["classify_all_shell"]["direct_readback_available"] is False
     assert payload["classify_all_shell"]["effective_value"] is None
@@ -1377,7 +1377,7 @@ def test_sanitized_evidence_schema_has_required_top_level_keys(tmp_path):
         "exit_classification",
     ):
         assert key in payload
-    assert payload["schema"] == "AUTO_MODE_CANARY_EVIDENCE_V1"
+    assert payload["schema"] == "AUTO_MODE_CANARY_EVIDENCE_V2"
 
 
 def test_sanitized_evidence_never_contains_raw_prompt_response_or_credential():
@@ -1388,7 +1388,7 @@ def test_sanitized_evidence_never_contains_raw_prompt_response_or_credential():
     credential/token は保存・投稿しない）
     """
     payload = {
-        "schema": "AUTO_MODE_CANARY_EVIDENCE_V1",
+        "schema": "AUTO_MODE_CANARY_EVIDENCE_V2",
         "nested": {"agent_id_digest": "abc123", "provider": "agy"},
         "list": [{"receipt_digest": "def456"}],
     }
@@ -1646,6 +1646,7 @@ def test_effective_policy_transcribes_real_digests_not_placeholder(tmp_path):
     check_json_path.write_text(
         json.dumps(
             {
+                "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2",
                 "ok": True,
                 "checks": {},
                 "classify_all_shell": {
@@ -1670,6 +1671,7 @@ def test_effective_policy_transcribes_real_digests_not_placeholder(tmp_path):
     assert policy["effective_config_digest"] == "b" * 64
     assert policy["auto_mode_defaults_digest"] != "see_preflight_auto_mode_check_output"
     assert policy["auto_mode_readback_ok"] is True
+    assert policy["auto_mode_check_schema_mismatch"] is False
     assert policy["classify_all_shell"] == {
         "generated_key_present": False,
         "direct_readback_available": False,
@@ -1680,6 +1682,134 @@ def test_effective_policy_transcribes_real_digests_not_placeholder(tmp_path):
     assert policy["lib_sh_sha256"] != "unknown"
     assert policy["preflight_sh_sha256"] != "unknown"
     assert policy["settings_sha256"] != "unavailable_not_provided"
+
+
+# --- P1-1: legacy V1 schema artifact は schema mismatch として拒否する --------
+# (PR #2717 owner review 反映。旧形状を「未評価 evidence」へ黙って変換しない) --
+
+
+def test_effective_policy_rejects_legacy_v1_schema_as_mismatch_not_pass(tmp_path):
+    """GIVEN 旧 `CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1` shape（`checks.
+    classify_all_shell_enabled: bool` / `checks.classify_all_shell_verification_
+    source: string`）の legacy artifact
+    WHEN _effective_policy に渡す
+    THEN 新 tri-state shape の「未評価・未確認」既定値へ静かに変換されず、
+    `auto_mode_check_schema_mismatch: true` と観測した schema 文字列を明示する
+    （不正な旧 evidence が `exit_classification: pass` に紛れ込まない）
+    """
+    legacy_v1_payload = {
+        "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1",
+        "status": "ok",
+        "ok": True,
+        "checks": {
+            "environment_narrow_label_present": True,
+            "allow_narrow_label_present": True,
+            "hard_deny_defaults_and_additions_present": True,
+            "soft_deny_unmodified": True,
+            "classify_all_shell_enabled": True,
+            "classify_all_shell_verification_source": "effective_config",
+        },
+        "digests": {
+            "auto_mode_defaults_digest": "e" * 64,
+            "effective_config_digest": "f" * 64,
+        },
+        "fail_closed_reasons": [],
+    }
+    check_json_path = tmp_path / "legacy-v1-auto-mode-check.json"
+    check_json_path.write_text(json.dumps(legacy_v1_payload), encoding="utf-8")
+
+    policy = canary._effective_policy(check_json_path, None)
+    assert policy["auto_mode_check_schema_mismatch"] is True
+    assert policy["auto_mode_check_observed_schema"] == "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1"
+    # legacy V1 の digest/ok を転記しない（"unavailable_not_provided" のまま）。
+    assert policy["auto_mode_defaults_digest"] == "unavailable_not_provided"
+    assert policy["effective_config_digest"] == "unavailable_not_provided"
+    assert policy["auto_mode_readback_ok"] is None
+    # legacy V1 の bool 形状（classify_all_shell_enabled: True）が新 tri-state
+    # shape の effective_value: true 相当へ読み替えられていないこと。
+    assert policy["classify_all_shell"] == {
+        "generated_key_present": False,
+        "direct_readback_available": False,
+        "effective_value": None,
+        "native_parity_claimed": False,
+    }
+
+
+def test_run_marks_overall_fail_when_auto_mode_check_schema_mismatches(tmp_path):
+    """GIVEN 他の判定（AC4 agy causal receipt canary）は単独なら EXIT_OK/"pass"
+    になる正常な receipt だが、`--auto-mode-check-json` に legacy V1 artifact を
+    渡している
+    WHEN auto_mode_canary.py をサブプロセスとして実行する
+    THEN schema mismatch は evidence の `effective_policy` に記録され、overall
+    `exit_classification` は "pass" に紛れ込まず、非 0 exit で終了する
+    （PR #2717 owner review P1-1: schema 不一致単独でも fail-closed。旧 V1
+    artifact を渡しても他の canary が通れば pass になってしまう回帰を防ぐ）
+    """
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "agent_id": "a",
+                "tool_use_id": "t",
+                "builder_path": "b",
+                "wrapper_path": "w",
+                "provider": "agy",
+                "profile": "default",
+                "request_nonce": "n",
+                "fallback_used": False,
+                "provider_skipped": False,
+                "wrapper_exit_code": 0,
+                "terminal_completion": True,
+                "marker_only_insufficient": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    legacy_v1_payload = {
+        "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1",
+        "ok": True,
+        "checks": {"classify_all_shell_enabled": True},
+        "digests": {"auto_mode_defaults_digest": "g" * 64, "effective_config_digest": "h" * 64},
+    }
+    check_json_path = tmp_path / "legacy-v1-auto-mode-check.json"
+    check_json_path.write_text(json.dumps(legacy_v1_payload), encoding="utf-8")
+
+    # baseline: 同じ receipt だが --auto-mode-check-json を渡さない場合は pass
+    # になることを先に確認し、legacy artifact だけが差分要因であることを保証する。
+    baseline = subprocess.run(
+        [sys.executable, str(CANARY_PY), "--mode", "agy", "--agy-receipt-path", str(receipt_path), "--no-evidence"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    baseline_payload = json.loads(baseline.stdout)
+    assert baseline_payload["exit_classification"] == "pass"
+    assert baseline.returncode == 0
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CANARY_PY),
+            "--mode",
+            "agy",
+            "--agy-receipt-path",
+            str(receipt_path),
+            "--auto-mode-check-json",
+            str(check_json_path),
+            "--no-evidence",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["effective_policy"]["auto_mode_check_schema_mismatch"] is True
+    assert payload["effective_policy"]["auto_mode_check_observed_schema"] == (
+        "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1"
+    )
+    assert payload["exit_classification"] != "pass"
+    assert result.returncode != 0
 
 
 # --- P1-2: edit body 完全一致 / comment readback 検証 ---------------------------
