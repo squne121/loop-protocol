@@ -26,6 +26,33 @@ STATE_ROOT_ENV_VAR = "LOOP_TASK_CONTEXT_STATE_ROOT"
 XDG_STATE_HOME_ENV_VAR = "XDG_STATE_HOME"
 DB_FILE_NAME = "task-context.sqlite3"
 
+# --- Issue #2568 In Scope: runtime-smoke scope carrier ----------------------
+#
+# ``worktree-agent-runtime-smoke`` (and any other caller wanting to run
+# ``task-contextctl smoke seed`` against a run-scoped isolated state root)
+# sets this env var to ``RUNTIME_SMOKE_SCOPE_VALUE`` explicitly, alongside
+# ``LOOP_TASK_CONTEXT_STATE_ROOT`` pointing at the isolated root. Unset (or
+# any other value) means "not a runtime-smoke invocation" -- `task_contextctl
+# _dispatch()` rejects `smoke_seed` in that case, strictly before opening/
+# migrating the DB (AC6). This module never infers scope from anything else
+# (state root path shape, cwd, ...).
+SCOPE_ENV_VAR = "LOOP_TASK_CONTEXT_SCOPE"
+RUNTIME_SMOKE_SCOPE_VALUE = "runtime_smoke"
+
+
+def resolve_task_context_scope() -> str:
+    """Read the raw ``LOOP_TASK_CONTEXT_SCOPE`` carrier value.
+
+    Returns the empty string when unset -- never raises, never guesses from
+    any other env var or from ``LOOP_TASK_CONTEXT_STATE_ROOT``."""
+    return os.environ.get(SCOPE_ENV_VAR, "")
+
+
+def is_runtime_smoke_scope() -> bool:
+    """``True`` only when ``LOOP_TASK_CONTEXT_SCOPE`` is exactly
+    ``RUNTIME_SMOKE_SCOPE_VALUE`` (AC6 gate predicate)."""
+    return resolve_task_context_scope() == RUNTIME_SMOKE_SCOPE_VALUE
+
 # --- Issue #2567 In Scope: runtime variant carrier -------------------------
 #
 # The Claude-GPT launcher (``scripts/claude-gpt/launch.sh``) exports this

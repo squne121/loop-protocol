@@ -270,10 +270,19 @@ _POISON_HERDR_BODY = (
     'STATE_DIR="$FAKE_HERDR_STATE_DIR"\n'
     'mkdir -p "$STATE_DIR"\n'
     'CALL_COUNTER_FILE="$STATE_DIR/api_snapshot_calls"\n'
-    'if [ "$1" = "--session" ]; then\n'
+    # Issue #2568 AC1/AC10: distinguish the bare persistent-session-holder
+    # invocation ("herdr --session <name>", nothing follows) from a one-shot
+    # command invocation that now also explicitly passes --session <name>
+    # ("herdr --session <name> <subcommand> ..."). Only the bare form gets
+    # the sleep-300 session-holder simulation; the subcommand form shifts
+    # --session <name> off and falls through to the normal dispatch below.
+    'if [ "$1" = "--session" ] && [ -z "$3" ]; then\n'
     '  touch "$STATE_DIR/$2.session"\n'
     "  sleep 300\n"
     "  exit 0\n"
+    "fi\n"
+    'if [ "$1" = "--session" ]; then\n'
+    "  shift 2\n"
     "fi\n"
     'case "$1 $2" in\n'
     '  "status server")\n'

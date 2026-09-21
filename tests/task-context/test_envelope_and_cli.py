@@ -73,7 +73,9 @@ def test_given_result_envelope_builder_when_called_then_shape_matches_frozen_con
     assert res["code"] == "OK"
 
 
-def test_given_smoke_seed_when_run_via_cli_then_exit_zero_and_ok_envelope(state_root, monkeypatch, capsys):
+def test_given_smoke_seed_when_run_via_cli_then_exit_zero_and_ok_envelope(
+    state_root, runtime_smoke_scope, monkeypatch, capsys
+):
     result, exit_code, _ = _run_cli(["smoke", "seed"], {}, monkeypatch, capsys)
     assert exit_code == 0
     assert envelope.is_valid_result_envelope(result)
@@ -84,7 +86,7 @@ def test_given_smoke_seed_when_run_via_cli_then_exit_zero_and_ok_envelope(state_
 
 
 def test_given_smoke_seed_with_empty_stdin_when_run_via_cli_then_no_envelope_required(
-    state_root, monkeypatch, capsys
+    state_root, runtime_smoke_scope, monkeypatch, capsys
 ):
     """Completely empty stdin (no request envelope at all) is allowed for
     operations that need no payload -- only *non-empty* stdin content must
@@ -112,7 +114,7 @@ def test_given_query_current_unknown_task_id_when_run_via_cli_then_not_found_exi
 
 
 def test_given_query_current_after_smoke_seed_when_run_via_cli_then_ok_and_task_found(
-    state_root, monkeypatch, capsys
+    state_root, runtime_smoke_scope, monkeypatch, capsys
 ):
     seeded, _, _ = _run_cli(["smoke", "seed"], {}, monkeypatch, capsys)
     task_id = seeded["data"]["task_id"]
@@ -231,7 +233,7 @@ def test_given_envelope_operation_mismatched_with_argv_derived_operation_when_ru
 
 
 def test_given_canonical_envelope_when_query_current_payload_unwrapped_then_task_id_used(
-    state_root, monkeypatch, capsys
+    state_root, runtime_smoke_scope, monkeypatch, capsys
 ):
     """Positive-path proof that the CLI actually unwraps `payload` as the
     operation input -- not just accepts/rejects envelope shape."""
@@ -251,6 +253,7 @@ def test_given_canonical_envelope_when_piped_to_real_cli_subprocess_then_ok_enve
     request = envelope.build_request("smoke_seed", {"title": "subprocess smoke"})
     env = dict(os.environ)
     env["LOOP_TASK_CONTEXT_STATE_ROOT"] = str(state_root)
+    env["LOOP_TASK_CONTEXT_SCOPE"] = "runtime_smoke"
     proc = subprocess.run(
         [sys.executable, str(_CLI_PATH), "smoke", "seed"],
         input=json.dumps(request),
