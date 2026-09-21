@@ -26,18 +26,14 @@ _DEFAULT_ARTIFACT_DIR = _REPO_ROOT / "artifacts" / "impl-review-loop"
 _TRIAGE_SCHEMA = "CONTRACT_BLOCKER_TRIAGE_V1"
 _TRIAGE_PATH = _SCRIPT_DIR / "triage_contract_blockers.py"
 # #1475: shared GitHub provenance trust policy (single source of truth).
-_CRP_PATH = (
-    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
-    / "contract_review_result_parser.py"
-)
+_CRP_PATH = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts" / "contract_review_result_parser.py"
 _BASELINE_PREFLIGHT_PATH = (
-    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
-    / "baseline_vc_preflight.py"
+    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts" / "baseline_vc_preflight.py"
 )
 _ALLOWED_PATHS_GATE_PATH = (
-    _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts"
-    / "allowed_paths_review_gate.py"
+    _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts" / "allowed_paths_review_gate.py"
 )
+_IMPLEMENTATION_LANDED_EVIDENCE_PATH = _SCRIPT_DIR / "implementation_landed_evidence.py"
 _FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL)
 _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
 # #1950 AC6-AC8: comment-id resolution for --human-context-comment-url /
@@ -162,9 +158,7 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
             key = match.group(1).strip()
             value = match.group(2).strip()
             if value:
-                if (value.startswith('"') and value.endswith('"')) or (
-                    value.startswith("'") and value.endswith("'")
-                ):
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
                     value = value[1:-1]
                 result[key] = value
             else:
@@ -352,9 +346,7 @@ def _validate_agent_report_schema(body: str) -> tuple["str | None", str, list[st
     return matched_ids[0], "ok", []
 
 
-_ISSUE_OR_PR_COMMENT_URL_RE = re.compile(
-    r"^https://github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)#issuecomment-(\d+)$"
-)
+_ISSUE_OR_PR_COMMENT_URL_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)#issuecomment-(\d+)$")
 
 
 def _parse_issue_or_pr_comment_url(url: str) -> tuple[str, str, int, int] | None:
@@ -435,10 +427,7 @@ def _pr_closes_target_issue(
         return False
     expected_url = f"https://github.com/{repo}/issues/{issue_number}"
     return any(
-        isinstance(ref, dict)
-        and ref.get("number") == issue_number
-        and ref.get("url") == expected_url
-        for ref in refs
+        isinstance(ref, dict) and ref.get("number") == issue_number and ref.get("url") == expected_url for ref in refs
     )
 
 
@@ -575,11 +564,7 @@ def _find_latest_result(
     Every caller that decides go/blocked precedence must pass
     trusted_only=True.
     """
-    candidates = (
-        [item for item in results if item.get("is_trusted_author") is True]
-        if trusted_only
-        else results
-    )
+    candidates = [item for item in results if item.get("is_trusted_author") is True] if trusted_only else results
     if not candidates:
         return None
     return sorted(
@@ -657,9 +642,7 @@ def _normalize_contract_snapshot_live(
     comments: list[dict[str, Any]],
     parse_warning_counts: dict[str, int],
 ) -> tuple[dict[str, Any], bool]:
-    parsed_results, parser_counts = _parse_contract_results(
-        comments, issue_url, _issue_number_from_url(issue_url)
-    )
+    parsed_results, parser_counts = _parse_contract_results(comments, issue_url, _issue_number_from_url(issue_url))
     parse_warning_counts.update(parser_counts)
 
     # #1475 fix_delta P1 item 1: trust filtering before precedence -- an
@@ -826,12 +809,66 @@ def _next_action_route(
     return "human_review_required"
 
 
+def _collect_implementation_landed_evidence(
+    *,
+    issue_number: int,
+    repo: str,
+    issue_body: str,
+    command_log: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Collect bounded pre-Step-1 candidate evidence through the strict producer."""
+    module = _load_module(
+        _IMPLEMENTATION_LANDED_EVIDENCE_PATH,
+        "implementation_landed_evidence",
+    )
+
+    def recorded_run(argv: list[str]) -> tuple[int, str, str]:
+        rc, stdout, stderr = _run_command(argv)
+        _record_command(
+            command_log,
+            "implementation_landed_candidate_discovery",
+            argv,
+            rc,
+            stdout,
+            stderr,
+        )
+        return rc, stdout, stderr
+
+    # #2699 AC9: `resolve_landing_disposition_with_freshness_rebind()` is the
+    # canonical collect -> verify-freshness-immediately-before-finalizing ->
+    # bounded-retry-once -> derive entry point. It supersedes a bare
+    # `collect_candidate_inputs()` + `derive_landing_disposition()` chain,
+    # which never re-verified collection-time identity before finalizing.
+    evidence = module.resolve_landing_disposition_with_freshness_rebind(
+        repo=repo,
+        issue_number=issue_number,
+        current_scope=issue_body,
+        run_command=recorded_run,
+    )
+    # This is the production control-plane projection consumed before any
+    # worker/worktree/new-PR invocation.  It is deliberately explicit rather
+    # than leaving callers to infer suppression from a prose disposition.
+    disposition = evidence["landing_disposition"]["disposition"]
+    evidence["pre_step1_data_plane"] = {
+        "start_data_plane": disposition == "ordinary_dispatch_or_explicit_recovery",
+        "action": (
+            "dispatch_step1"
+            if disposition == "ordinary_dispatch_or_explicit_recovery"
+            else "resume_existing_pr"
+            if disposition == "existing_pr_resume"
+            else "suppress_worker_worktree_new_pr"
+        ),
+    }
+    return evidence
+
+
 def build_intake_capsule(
     issue_number: int,
     repo: str = _DEFAULT_REPO,
     ensure_contract_snapshot_result: str | None = None,
     human_context_comment_urls: list[str] | None = None,
     agent_report_comment_urls: list[str] | None = None,
+    include_implementation_landed_evidence: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
     # #1869 fix_delta P0-4: `errors` is split into `fatal_errors` (blocks
     # intake / forces exit 1 — reserved for live Issue not accessible,
@@ -886,9 +923,7 @@ def build_intake_capsule(
     comments_for_digest: list[dict[str, Any]] = []
     if ensure_contract_snapshot_result:
         try:
-            ensure_payload = json.loads(
-                Path(ensure_contract_snapshot_result).read_text(encoding="utf-8")
-            )
+            ensure_payload = json.loads(Path(ensure_contract_snapshot_result).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             # Advisory: snapshot fetch/parse failure is a warning, not fatal
             # (#1869 fix_delta P0-4 -- contract snapshot artifacts never
@@ -938,28 +973,18 @@ def build_intake_capsule(
     context_inputs_full: dict[str, Any] | None = None
     context_inputs_summary: dict[str, Any] | None = None
     if human_context_comment_urls or agent_report_comment_urls:
-        provenance_conflict_urls = sorted(
-            set(human_context_comment_urls) & set(agent_report_comment_urls)
-        )
+        provenance_conflict_urls = sorted(set(human_context_comment_urls) & set(agent_report_comment_urls))
         if ensure_contract_snapshot_result:
-            _ctx_comments, _ctx_counts, _ctx_errors = _collect_issue_comments(
-                issue_number, repo, command_log
-            )
+            _ctx_comments, _ctx_counts, _ctx_errors = _collect_issue_comments(issue_number, repo, command_log)
             fatal_errors.extend(_ctx_errors)
         else:
             _ctx_comments = comments_for_digest
         comments_by_id: dict[int, dict[str, Any]] = {
-            comment["id"]: comment
-            for comment in _ctx_comments
-            if isinstance(comment.get("id"), int)
+            comment["id"]: comment for comment in _ctx_comments if isinstance(comment.get("id"), int)
         }
 
-        human_urls_to_resolve = [
-            url for url in human_context_comment_urls if url not in provenance_conflict_urls
-        ]
-        agent_urls_to_resolve = [
-            url for url in agent_report_comment_urls if url not in provenance_conflict_urls
-        ]
+        human_urls_to_resolve = [url for url in human_context_comment_urls if url not in provenance_conflict_urls]
+        agent_urls_to_resolve = [url for url in agent_report_comment_urls if url not in provenance_conflict_urls]
         human_resolved, human_errors = _resolve_context_comments(
             human_urls_to_resolve, "human_supplied", comments_by_id, issue_number, repo, command_log
         )
@@ -967,8 +992,7 @@ def build_intake_capsule(
             agent_urls_to_resolve, "agent_generated", comments_by_id, issue_number, repo, command_log
         )
         provenance_conflict_entries = [
-            {"url": url, "reason": "provenance_conflict_url_in_both_lanes"}
-            for url in provenance_conflict_urls
+            {"url": url, "reason": "provenance_conflict_url_in_both_lanes"} for url in provenance_conflict_urls
         ]
 
         # AC8: repository/Issue/comment mismatch, dual-lane URLs, missing
@@ -976,9 +1000,7 @@ def build_intake_capsule(
         # -- they block intake (fatal_errors), not merely advisory warnings.
         fatal_errors.extend(human_errors)
         fatal_errors.extend(agent_errors)
-        fatal_errors.extend(
-            f"provenance_conflict:{url}" for url in provenance_conflict_urls
-        )
+        fatal_errors.extend(f"provenance_conflict:{url}" for url in provenance_conflict_urls)
 
         context_inputs_full = {
             "human_supplied": human_resolved,
@@ -988,12 +1010,8 @@ def build_intake_capsule(
         # AC7: stdout projection excludes raw comment body -- only
         # provenance/hash/metadata is surfaced in the stdout-facing capsule.
         context_inputs_summary = {
-            "human_supplied": [
-                {k: v for k, v in entry.items() if k != "body"} for entry in human_resolved
-            ],
-            "agent_generated": [
-                {k: v for k, v in entry.items() if k != "body"} for entry in agent_resolved
-            ],
+            "human_supplied": [{k: v for k, v in entry.items() if k != "body"} for entry in human_resolved],
+            "agent_generated": [{k: v for k, v in entry.items() if k != "body"} for entry in agent_resolved],
             "provenance_conflicts": provenance_conflict_entries,
         }
 
@@ -1040,6 +1058,14 @@ def build_intake_capsule(
         "route": _next_action_route(issue_meta["ready_tuple"]["status"], contract_snapshot),
         "reason_codes": warnings + fatal_errors,
     }
+    implementation_landed_evidence: dict[str, Any] | None = None
+    if include_implementation_landed_evidence:
+        implementation_landed_evidence = _collect_implementation_landed_evidence(
+            issue_number=issue_number,
+            repo=repo,
+            issue_body=issue_meta["body"],
+            command_log=command_log,
+        )
 
     capsule = {
         "schema": _SCHEMA_NAME,
@@ -1072,6 +1098,8 @@ def build_intake_capsule(
         # passed, so existing consumers of IMPL_REVIEW_INTAKE_CAPSULE_V1 are
         # unaffected.
         capsule["context_inputs"] = context_inputs_summary
+    if implementation_landed_evidence is not None:
+        capsule["implementation_landed_evidence"] = implementation_landed_evidence
 
     artifact_payload = {
         "schema": _SCHEMA_NAME,
@@ -1102,6 +1130,8 @@ def build_intake_capsule(
         # Full body snapshot lives ONLY in the artifact -- never projected
         # to stdout (AC7).
         artifact_payload["context_inputs"] = context_inputs_full
+    if implementation_landed_evidence is not None:
+        artifact_payload["implementation_landed_evidence"] = implementation_landed_evidence
 
     # #1869 fix_delta P0-4: exit code depends ONLY on fatal_errors (live
     # Issue not accessible / repo state unreadable). Comment/snapshot/body
@@ -1128,6 +1158,7 @@ def build_capsule_argv(
     max_stdout_bytes: int = _DEFAULT_MAX_STDOUT_BYTES,
     human_context_comment_urls: list[str] | None = None,
     agent_report_comment_urls: list[str] | None = None,
+    include_implementation_landed_evidence: bool = False,
 ) -> list[str]:
     """Pure (no I/O, no subprocess) argv materializer for the canonical
     `build_intake_capsule.py` invocation. When `human_context_comment_urls` /
@@ -1151,6 +1182,8 @@ def build_capsule_argv(
         argv += ["--human-context-comment-url", url]
     for url in agent_report_comment_urls or []:
         argv += ["--agent-report-comment-url", url]
+    if include_implementation_landed_evidence:
+        argv.append("--include-implementation-landed-evidence")
     return argv
 
 
@@ -1254,6 +1287,11 @@ def main() -> int:
     parser.add_argument("--max-stdout-bytes", type=int, default=_DEFAULT_MAX_STDOUT_BYTES)
     parser.add_argument("--ensure-contract-snapshot-result")
     parser.add_argument("--artifact-dir", default=str(_DEFAULT_ARTIFACT_DIR))
+    parser.add_argument(
+        "--include-implementation-landed-evidence",
+        action="store_true",
+        help="collect bounded candidate evidence for the pre-Step-1 landing disposition",
+    )
     # #1950 AC6: provenance-separated context inputs. Origin is decided
     # solely by which flag the caller used -- never inferred from comment
     # body/author. Repeatable; same URL passed to both flags is a
@@ -1293,6 +1331,7 @@ def main() -> int:
         ensure_contract_snapshot_result=args.ensure_contract_snapshot_result,
         human_context_comment_urls=args.human_context_comment_urls,
         agent_report_comment_urls=args.agent_report_comment_urls,
+        include_implementation_landed_evidence=args.include_implementation_landed_evidence,
     )
 
     artifact_dir = Path(args.artifact_dir)

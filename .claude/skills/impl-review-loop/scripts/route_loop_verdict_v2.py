@@ -139,16 +139,28 @@ ROUTE_FAIL_CLOSED = "fail_closed"
 _UPDATE_BRANCH_EXECUTOR = "implementation-worker"
 _UPDATE_BRANCH_SKILL = "implement-issue.update_branch"
 
-_VALID_VERDICTS: frozenset[str] = frozenset({
-    "APPROVE", "REQUEST_CHANGES", "HUMAN_REVIEW_REQUIRED",
-})
+_VALID_VERDICTS: frozenset[str] = frozenset(
+    {
+        "APPROVE",
+        "REQUEST_CHANGES",
+        "HUMAN_REVIEW_REQUIRED",
+    }
+)
 
 _VALID_MERGEABLE: frozenset[str] = frozenset({"MERGEABLE", "CONFLICTING", "UNKNOWN"})
 
-_VALID_MERGE_STATE_STATUS: frozenset[str] = frozenset({
-    "CLEAN", "UNSTABLE", "BEHIND", "DIRTY", "BLOCKED", "UNKNOWN",
-    "DRAFT", "HAS_HOOKS",
-})
+_VALID_MERGE_STATE_STATUS: frozenset[str] = frozenset(
+    {
+        "CLEAN",
+        "UNSTABLE",
+        "BEHIND",
+        "DIRTY",
+        "BLOCKED",
+        "UNKNOWN",
+        "DRAFT",
+        "HAS_HOOKS",
+    }
+)
 
 # merge_state_status values that require deferral to the current-head
 # required-CI / branch-protection evaluator. NOT a conflict, NOT a human
@@ -162,8 +174,13 @@ _APPROVABLE_STATUSES: frozenset[str] = frozenset({"CLEAN", "HAS_HOOKS"})
 # (Issue #1873). `test_verdict` is included: PR #1870 (#1856) removed it from
 # the public API, and it must not resurface as a reviewer_verdict field.
 _REJECTED_LEGACY_FIELDS: tuple[str, ...] = (
-    "merge_ready", "required_auto_actions", "allowed_paths_gate",
-    "mergeability", "mergeStateStatus", "recommendations", "test_verdict",
+    "merge_ready",
+    "required_auto_actions",
+    "allowed_paths_gate",
+    "mergeability",
+    "mergeStateStatus",
+    "recommendations",
+    "test_verdict",
 )
 
 
@@ -221,10 +238,7 @@ def classify_main_drift(
         expected_old_sha,
         observed_old_sha,
     )
-    if any(
-        not isinstance(value, str) or not _MAIN_DRIFT_SHA.fullmatch(value)
-        for value in values
-    ):
+    if any(not isinstance(value, str) or not _MAIN_DRIFT_SHA.fullmatch(value) for value in values):
         return MainDriftDecision("hard_stop", "base_sha_fingerprint_mismatch", None, {}, {})
     if expected_head_sha != observed_head_sha:
         return MainDriftDecision("hard_stop", "expected_head_cas_mismatch", None, {}, {})
@@ -243,10 +257,7 @@ def classify_main_drift(
     if semantic_ambiguity:
         return MainDriftDecision("hard_stop", "semantic_ambiguity", None, {}, {})
     if any(
-        not any(
-            path == allowed or (allowed.endswith("/") and path.startswith(allowed))
-            for allowed in allowed_paths
-        )
+        not any(path == allowed or (allowed.endswith("/") and path.startswith(allowed)) for allowed in allowed_paths)
         for path in set(latest_main_net_diff)
     ):
         return MainDriftDecision("hard_stop", "allowed_paths_conflict", None, {}, {})
@@ -261,9 +272,7 @@ def classify_main_drift(
         # failure. The caller must persist drift_rebind_attempts (e.g. in
         # LOOP_STATE) across cycles for this bound to be effective; this
         # function itself performs no persistence (no side effects).
-        return MainDriftDecision(
-            "hard_stop", "concurrent_base_churn_budget_exhausted", None, {}, {}
-        )
+        return MainDriftDecision("hard_stop", "concurrent_base_churn_budget_exhausted", None, {}, {})
 
     common = {
         "evidence_epoch": {
@@ -330,6 +339,7 @@ def build_step5_live_mergeability(
 # ---------------------------------------------------------------------------
 # Output schema
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class RouteDecision:
@@ -404,6 +414,7 @@ def _conflict(reason_code: str) -> RouteDecision:
 # ---------------------------------------------------------------------------
 # Schema validation
 # ---------------------------------------------------------------------------
+
 
 def _validate_reviewer_verdict(raw: Any) -> str | None:
     """Return a reason_code if reviewer_verdict is malformed, else None."""
@@ -560,9 +571,7 @@ def _classify_implementation_main_drift(
         return classify_main_drift(
             current_base_sha=main_drift["current_base_sha"],
             evidence_base_sha=main_drift["evidence_base_sha"],
-            allowed_paths_snapshot_base_sha=main_drift[
-                "allowed_paths_snapshot_base_sha"
-            ],
+            allowed_paths_snapshot_base_sha=main_drift["allowed_paths_snapshot_base_sha"],
             allowed_paths=main_drift["allowed_paths"],
             latest_main_net_diff=main_drift["latest_main_net_diff"],
             expected_head_sha=reviewed_head_sha,
@@ -571,14 +580,11 @@ def _classify_implementation_main_drift(
             observed_old_sha=main_drift["observed_old_sha"],
             semantic_ambiguity=bool(main_drift.get("semantic_ambiguity", False)),
             behind_fast_path_eligible=(
-                _is_behind(merge_state_status)
-                and bool(main_drift.get("behind_fast_path_eligible", False))
+                _is_behind(merge_state_status) and bool(main_drift.get("behind_fast_path_eligible", False))
             ),
             drift_rebind_attempts=int(main_drift.get("drift_rebind_attempts", 0)),
             max_drift_rebind_attempts=int(
-                main_drift.get(
-                    "max_drift_rebind_attempts", DEFAULT_MAX_DRIFT_REBIND_ATTEMPTS
-                )
+                main_drift.get("max_drift_rebind_attempts", DEFAULT_MAX_DRIFT_REBIND_ATTEMPTS)
             ),
         )
     except (KeyError, TypeError):
@@ -660,6 +666,62 @@ def _evaluate_already_satisfied(live_mergeability: Mapping[str, Any]) -> RouteDe
         return None
 
     return _already_satisfied_decision()
+
+
+# ---------------------------------------------------------------------------
+# Issue #2699: pre-Step-1 landing disposition. The evidence producer owns
+# strict parsing/validation/normalization; this consumer is the pure route.
+# ---------------------------------------------------------------------------
+
+
+def resolve_pre_step1_landing_disposition(
+    evidence: Mapping[str, Any] | str | None,
+    *,
+    repo: str,
+    issue_number: int,
+) -> dict[str, Any]:
+    """Derive a pre-dispatch disposition without I/O or caller assertions."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = Path(__file__).with_name("implementation_landed_evidence.py")
+    spec = importlib.util.spec_from_file_location("implementation_landed_evidence_for_route", path)
+    if spec is None or spec.loader is None:
+        return {
+            "disposition": "reconciliation_required",
+            "reason_codes": ["implementation_landed_evidence_module_unavailable"],
+            "candidate": None,
+        }
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.derive_landing_disposition(
+        evidence,
+        repo=repo,
+        issue_number=issue_number,
+    )
+
+
+def resolve_pre_step1_data_plane_action(
+    evidence: Mapping[str, Any] | str | None,
+    *,
+    repo: str,
+    issue_number: int,
+) -> dict[str, Any]:
+    """The enforceable pre-Step-1 gate used before any worker/worktree/PR call.
+
+    Keeping this mapping in the production route module makes the suppression
+    more than preparation prose: callers receive a single `start_data_plane`
+    boolean and may not reinterpret the evidence disposition themselves.
+    """
+    disposition = resolve_pre_step1_landing_disposition(evidence, repo=repo, issue_number=issue_number)
+    name = disposition["disposition"]
+    if name == "ordinary_dispatch_or_explicit_recovery":
+        return {"disposition": disposition, "start_data_plane": True, "action": "dispatch_step1"}
+    if name == "existing_pr_resume":
+        return {"disposition": disposition, "start_data_plane": False, "action": "resume_existing_pr"}
+    return {"disposition": disposition, "start_data_plane": False, "action": "suppress_worker_worktree_new_pr"}
 
 
 # ---------------------------------------------------------------------------
@@ -801,8 +863,7 @@ def build_already_satisfied_evidence(
     )
 
     pr_head_fresh = (
-        isinstance(pr_head_test_verdict, Mapping)
-        and pr_head_test_verdict.get("head_sha") == live_pr_head_sha
+        isinstance(pr_head_test_verdict, Mapping) and pr_head_test_verdict.get("head_sha") == live_pr_head_sha
     )
     base_pass_ids = _pass_ac_ids(base_test_verdict)
     pr_pass_ids = _pass_ac_ids(pr_head_test_verdict) if pr_head_fresh else None
@@ -835,6 +896,7 @@ def _reconciliation_decision(drift: MainDriftDecision) -> RouteDecision:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def route_loop_verdict_v2(
     reviewer_verdict: Mapping[str, Any],
@@ -1031,8 +1093,7 @@ def route_loop_verdict_v2(
 
     return _fail(
         "unexpected_mergeability_combination",
-        f"mergeable={mergeable}, merge_state_status={merge_state_status} did not "
-        f"match any known routing branch.",
+        f"mergeable={mergeable}, merge_state_status={merge_state_status} did not match any known routing branch.",
     )
 
 
