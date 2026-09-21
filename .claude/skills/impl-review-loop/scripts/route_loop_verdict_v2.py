@@ -699,6 +699,29 @@ def resolve_pre_step1_landing_disposition(
     )
 
 
+def resolve_pre_step1_data_plane_action(
+    evidence: Mapping[str, Any] | str | None,
+    *,
+    repo: str,
+    issue_number: int,
+) -> dict[str, Any]:
+    """The enforceable pre-Step-1 gate used before any worker/worktree/PR call.
+
+    Keeping this mapping in the production route module makes the suppression
+    more than preparation prose: callers receive a single `start_data_plane`
+    boolean and may not reinterpret the evidence disposition themselves.
+    """
+    disposition = resolve_pre_step1_landing_disposition(
+        evidence, repo=repo, issue_number=issue_number
+    )
+    name = disposition["disposition"]
+    if name == "ordinary_dispatch_or_explicit_recovery":
+        return {"disposition": disposition, "start_data_plane": True, "action": "dispatch_step1"}
+    if name == "existing_pr_resume":
+        return {"disposition": disposition, "start_data_plane": False, "action": "resume_existing_pr"}
+    return {"disposition": disposition, "start_data_plane": False, "action": "suppress_worker_worktree_new_pr"}
+
+
 # ---------------------------------------------------------------------------
 # Issue #2607 fix_delta iteration 1 (PR #2626 review comment, P0-1): the
 # preparation.md pre-dispatch choke point's decision logic is a production

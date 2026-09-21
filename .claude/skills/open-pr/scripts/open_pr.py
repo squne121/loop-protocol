@@ -29,6 +29,7 @@ E_LINKED_ISSUE_STATE_UNKNOWN = "E_LINKED_ISSUE_STATE_UNKNOWN"
 E_GH_FAILURE = "E_GH_FAILURE"
 E_SCHEMA_CONSUMER_INVENTORY_MISSING = "E_SCHEMA_CONSUMER_INVENTORY_MISSING"
 E_PR_BODY_JAPANESE_VALIDATION_FAILED = "E_PR_BODY_JAPANESE_VALIDATION_FAILED"
+E_IMPLEMENTATION_SCOPE_COVERAGE_UNAVAILABLE = "E_IMPLEMENTATION_SCOPE_COVERAGE_UNAVAILABLE"
 
 # fail-closed exit code for hard failures (publish approval missing, pr body
 # file missing, gh/repo/branch resolution failure, validator failure,
@@ -226,6 +227,59 @@ def resolve_linked_issue_reference_kind(body: str, issue_number: int, default_li
     pattern = re.compile(rf"(Closes|Refs|Fixes|Resolves)\s+#{issue_number}\b", re.IGNORECASE)
     match = pattern.search(body)
     return match.group(1) if match else default_link_kind
+
+
+def _load_implementation_scope_evidence_module():
+    """Load #2699's shared normalizer without creating a shared package."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts" / "implementation_landed_evidence.py"
+    spec = importlib.util.spec_from_file_location("implementation_landed_evidence_for_open_pr", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def get_linked_issue_body(repo: str, issue_number: int) -> str | None:
+    try:
+        result = run_gh("issue", "view", str(issue_number), "--repo", repo, "--json", "body")
+        payload = json.loads(result.stdout)
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
+        return None
+    body = payload.get("body") if isinstance(payload, dict) else None
+    return body if isinstance(body, str) else None
+
+
+def resolve_head_sha() -> str | None:
+    try:
+        result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, timeout=10)
+    except subprocess.SubprocessError:
+        return None
+    sha = result.stdout.strip()
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha, re.IGNORECASE) else None
+
+
+def append_implementation_scope_coverage(body: str, *, repo: str, linked_issue: int) -> str | None:
+    """Embed the immutable publication-time marker before validation/create."""
+    issue_body = get_linked_issue_body(repo, linked_issue)
+    head_sha = resolve_head_sha()
+    module = _load_implementation_scope_evidence_module()
+    if issue_body is None or head_sha is None or module is None:
+        return None
+    try:
+        marker = module.build_scope_coverage_marker(
+            issue_number=linked_issue, issue_body=issue_body, pr_head_sha=head_sha
+        )
+        block = module.render_scope_coverage_marker(marker)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    # The wrapper is idempotent: a retry must never create two historical
+    # snapshots for the same publication transaction.
+    if "IMPLEMENTATION_SCOPE_COVERAGE_V1:" in body:
+        return body
+    return body.rstrip() + "\n\n" + block + "\n"
 
 
 def resolve_changed_paths(provided_paths: list[str] | None = None) -> list[str] | None:
@@ -672,6 +726,15 @@ def main(argv: list[str] | None = None) -> int:
     default_link_kind = "Closes" if state == "OPEN" else "Refs"
     link_kind = resolve_linked_issue_reference_kind(original_body, args.linked_issue, default_link_kind)
     final_body = apply_linked_issue_reference(original_body, args.linked_issue, link_kind)
+    final_body = append_implementation_scope_coverage(
+        final_body, repo=repo, linked_issue=args.linked_issue
+    )
+    if final_body is None:
+        emit_error(
+            E_IMPLEMENTATION_SCOPE_COVERAGE_UNAVAILABLE,
+            "live Issue body / branch HEAD / shared scope normalizer を取得できませんでした",
+        )
+        return EXIT_BLOCKED
 
     changed_paths = resolve_changed_paths(args.changed_paths)
     validator_result = _run_pr_body_validator(final_body, changed_paths, args.linked_issue)

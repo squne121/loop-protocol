@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only runtime verifier for Issue #2699 AC9."""
+"""Read-only runtime verifier for Issue #2699 AC12."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def verify(*, artifact_path: Path, run_command=_run) -> tuple[dict[str, Any], in
         "--repo",
         REPO,
         "--json",
-        "number,url,state,mergeCommit,closingIssuesReferences",
+        "number,url,state,mergeCommit,closingIssuesReferences,body",
     ]
     issue_rc, issue_out, issue_err = collect("issue_metadata", issue_argv)
     pr_rc, pr_out, pr_err = collect("pr_metadata", pr_argv)
@@ -104,6 +104,9 @@ def verify(*, artifact_path: Path, run_command=_run) -> tuple[dict[str, Any], in
         isinstance(ref, dict) and ref.get("number") == ISSUE_NUMBER and ref.get("url") == issue.get("url")
         for ref in (pr.get("closingIssuesReferences") or [])
     )
+    # This live historical PR predates the producer.  Treating a missing marker
+    # as exact coverage would be the forbidden merge-time reconstruction path.
+    legacy_marker_missing = "IMPLEMENTATION_SCOPE_COVERAGE_V1:" not in str(pr.get("body") or "")
     ancestry = compare_out.strip() in {"ahead", "identical"}
     payload.update(
         {
@@ -120,9 +123,16 @@ def verify(*, artifact_path: Path, run_command=_run) -> tuple[dict[str, Any], in
             },
             "non_closing_relation": not closing,
             "merge_commit_current_main_ancestry": ancestry,
+            "legacy_scope_coverage_marker_missing": legacy_marker_missing,
+            "legacy_compatibility_disposition": "implementation_already_landed"
+            if not legacy_marker_missing else "ordinary_dispatch_or_explicit_recovery",
             "compare_status": compare_out.strip(),
             "status": "PASS"
-            if issue.get("number") == ISSUE_NUMBER and pr.get("number") == PR_NUMBER and not closing and ancestry
+            if issue.get("number") == ISSUE_NUMBER
+            and pr.get("number") == PR_NUMBER
+            and not closing
+            and ancestry
+            and legacy_marker_missing
             else "FAIL",
             "reason": None,
             "errors": [],

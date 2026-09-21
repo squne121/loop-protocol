@@ -144,3 +144,33 @@ def test_lifecycle_and_scope_expansion_regressions():
         _evidence(candidates=[_candidate()], coverage=expanded), repo=REPO, issue_number=ISSUE
     )
     assert result["disposition"] == "ordinary_dispatch_or_explicit_recovery"
+
+
+def test_candidate_discovery_dedupes_and_reconciles_conflicting_qualified_candidates():
+    """AC7: two independently qualified PRs are never selected first-hit."""
+    one = _candidate(lifecycle="open")
+    two = _candidate(lifecycle="draft")
+    result = mod.derive_landing_disposition(
+        _evidence(candidates=[one, two]), repo=REPO, issue_number=ISSUE
+    )
+    assert result["disposition"] == "reconciliation_required"
+    assert result["reason_codes"] == ["qualified_candidate_conflict"]
+
+
+def test_markerless_open_draft_candidate_allowed_paths_coverage_determines_resume_or_reconciliation():
+    """AC6: legacy resumable branches need explicit current Allowed Paths coverage."""
+    resumable = _candidate(lifecycle="open", fresh=True, ownership=True)
+    blocked = _candidate(lifecycle="draft", fresh=True, ownership=False)
+    assert mod.derive_landing_disposition(_evidence(candidates=[resumable]), repo=REPO, issue_number=ISSUE)["disposition"] == "existing_pr_resume"
+    assert mod.derive_landing_disposition(_evidence(candidates=[blocked]), repo=REPO, issue_number=ISSUE)["disposition"] == "reconciliation_required"
+
+
+def test_candidate_discovery_is_not_landing_authority_or_body_heuristic():
+    """AC8: Refs/title text cannot masquerade as timeline PR provenance."""
+    rows = [{"number": 1, "body": "Refs #2119", "state": "MERGED", "mergedAt": "x", "mergeCommit": {"oid": SHA}}]
+    def run(argv):
+        if argv[:3] == ["gh", "pr", "list"]:
+            return 0, __import__("json").dumps(rows), ""
+        return 0, "[]", ""
+    evidence = mod.collect_candidate_inputs(repo=REPO, issue_number=ISSUE, current_scope={}, run_command=run)
+    assert evidence["candidates"] == []

@@ -863,6 +863,20 @@ def _collect_implementation_landed_evidence(
         repo=repo,
         issue_number=issue_number,
     )
+    # This is the production control-plane projection consumed before any
+    # worker/worktree/new-PR invocation.  It is deliberately explicit rather
+    # than leaving callers to infer suppression from a prose disposition.
+    disposition = evidence["landing_disposition"]["disposition"]
+    evidence["pre_step1_data_plane"] = {
+        "start_data_plane": disposition == "ordinary_dispatch_or_explicit_recovery",
+        "action": (
+            "dispatch_step1"
+            if disposition == "ordinary_dispatch_or_explicit_recovery"
+            else "resume_existing_pr"
+            if disposition == "existing_pr_resume"
+            else "suppress_worker_worktree_new_pr"
+        ),
+    }
     return evidence
 
 

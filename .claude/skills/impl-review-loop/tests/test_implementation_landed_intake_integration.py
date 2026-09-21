@@ -59,8 +59,12 @@ def test_disposition_precedes_worker_worktree_and_new_pr():
     route = _load(ROUTE, "route_loop_verdict_v2_landing")
     landed = route.resolve_pre_step1_landing_disposition(_evidence(), repo="squne121/loop-protocol", issue_number=2119)
     unsafe = route.resolve_pre_step1_landing_disposition(None, repo="squne121/loop-protocol", issue_number=2119)
+    landed_gate = route.resolve_pre_step1_data_plane_action(_evidence(), repo="squne121/loop-protocol", issue_number=2119)
+    unsafe_gate = route.resolve_pre_step1_data_plane_action(None, repo="squne121/loop-protocol", issue_number=2119)
     assert landed["disposition"] == "implementation_already_landed"
     assert unsafe["disposition"] == "reconciliation_required"
+    assert landed_gate == {"disposition": landed, "start_data_plane": False, "action": "suppress_worker_worktree_new_pr"}
+    assert unsafe_gate["start_data_plane"] is False
     preparation = (ROOT / ".claude/skills/impl-review-loop/steps/preparation.md").read_text(encoding="utf-8")
     assert preparation.index("Evidence-Based Landing Disposition") < preparation.index("Already-Satisfied Early-Exit")
     assert "worker / worktree / new PR を開始せず" in preparation

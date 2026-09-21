@@ -232,7 +232,15 @@ uv run python3 .claude/skills/impl-review-loop/scripts/build_intake_capsule.py \
   --include-implementation-landed-evidence
 ```
 
-capsule の `implementation_landed_evidence` を
+capsule の `implementation_landed_evidence.pre_step1_data_plane` は production
+control-plane の唯一の data-plane 許可値である。`start_data_plane: false` のときは worker
+dispatch、worktree 作成、new PR 作成を呼び出してはならない。`action` が
+`resume_existing_pr` のときも新規 PR は作成せず既存 PR を再開する。呼び出し元は
+`landing_disposition` の prose を独自解釈せず、この boolean/action を先に消費する。
+`route_loop_verdict_v2.py::resolve_pre_step1_data_plane_action()` は同じ禁止を pure
+production API として返す。
+
+`implementation_landed_evidence` を
 `route_loop_verdict_v2.py::resolve_pre_step1_landing_disposition()` に渡す。producer の
 strict validator が identity、freshness、candidate provenance、lifecycle、merged OID の
 main ancestry、state-specific scope coverage を検証し、canonical normalizer が immutable
