@@ -669,7 +669,9 @@ def emit_implementation_pr_observed(*, repo: str, pr_number: int, linked_issue: 
         return "deferred", "RELATION_UNAVAILABLE"
 
 
-def _validate_pr_body(body: str, changed_paths: list[str] | None, linked_issue: int) -> tuple[bool, str | None, str | None]:
+def _validate_pr_body(
+    body: str, changed_paths: list[str] | None, linked_issue: int
+) -> tuple[bool, str | None, str | None]:
     """Run both PR-body validators against `body`.
 
     Returns `(passed, error_code, detail)`. `error_code`/`detail` are set only
@@ -857,7 +859,9 @@ def main(argv: list[str] | None = None) -> int:
                 "live Issue body / branch HEAD / shared scope normalizer を取得できませんでした",
             )
             return EXIT_BLOCKED
-        marker_passed, marker_error_code, marker_detail = _validate_pr_body(marker_body, changed_paths, args.linked_issue)
+        marker_passed, marker_error_code, marker_detail = _validate_pr_body(
+            marker_body, changed_paths, args.linked_issue
+        )
         if not marker_passed:
             emit_error(marker_error_code, marker_detail or "")
             return EXIT_BLOCKED

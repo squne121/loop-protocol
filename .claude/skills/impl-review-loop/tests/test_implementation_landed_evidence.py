@@ -76,6 +76,96 @@ def test_scope_normalizer_distinguishes_exact_coverage_from_later_expansion():
     assert exact["immutable_merged_snapshot"]["content_sha256"] != expanded["live_current_scope"]["content_sha256"]
 
 
+def _scope_manifest_issue_body(
+    *, reversed_lists: bool = False, operational: str = "progress one", ac_checked: bool = False
+) -> str:
+    """An Issue body containing both semantic fields (In Scope / Acceptance
+    Criteria / Allowed Paths) and the operational-prose / progress-state /
+    runtime-evidence sections `build_scope_manifest()` must exclude."""
+    in_scope = "- build intake\n- publish marker" if not reversed_lists else "- publish marker\n- build intake"
+    ac1_box = "[x]" if ac_checked else "[ ]"
+    ac2_box = "[ ]" if ac_checked else "[x]"
+    acs = (
+        f"- {ac2_box} AC2: marker persists\n- {ac1_box} AC1: scope normalizes"
+        if not reversed_lists
+        else f"- {ac1_box} AC1: scope normalizes\n- {ac2_box} AC2: marker persists"
+    )
+    paths = "- `.claude/a.py`\n- `.claude/b.py`" if not reversed_lists else "- `.claude/b.py`\n- `.claude/a.py`"
+    return f"""## Machine-Readable Contract
+```yaml
+goal_ref: marker goal
+change_kind: workflow
+```
+## In Scope
+{in_scope}
+## Acceptance Criteria
+{acs}
+## Allowed Paths
+{paths}
+## Remaining Parent Gaps
+- {operational}
+## Runtime Evidence
+- changing this does not alter semantic scope
+"""
+
+
+def test_scope_normalizer_excludes_operational_prose_and_progress_state():
+    """AC2: the canonical normalizer includes only the "Canonical
+    Implementation Scope Normalizer" semantic fields (goal_ref / change_kind
+    / In Scope / Acceptance Criteria text / Allowed Paths), excludes
+    operational prose / checkbox state / runtime evidence / progress text,
+    and is order-independent (sorted) per list -- none of these alone may
+    change the digest, while a genuine semantic change must."""
+    baseline = mod.canonicalize_scope_manifest(
+        mod.build_scope_manifest(_scope_manifest_issue_body(operational="first update"))
+    )
+
+    # Checkbox state ([ ] vs [x], per item) alone must not change the digest.
+    checkbox_flip = mod.canonicalize_scope_manifest(
+        mod.build_scope_manifest(_scope_manifest_issue_body(operational="first update", ac_checked=True))
+    )
+    assert checkbox_flip["content_sha256"] == baseline["content_sha256"]
+
+    # "## Remaining Parent Gaps" operational/progress prose alone must not
+    # change the digest.
+    operational_only = mod.canonicalize_scope_manifest(
+        mod.build_scope_manifest(_scope_manifest_issue_body(operational="a completely different later update"))
+    )
+    assert operational_only["content_sha256"] == baseline["content_sha256"]
+
+    # Recording order of the In Scope / Acceptance Criteria / Allowed Paths
+    # bullets alone must not change the digest (order-independent sort
+    # normalization).
+    reordered = mod.canonicalize_scope_manifest(
+        mod.build_scope_manifest(_scope_manifest_issue_body(reversed_lists=True, operational="first update"))
+    )
+    assert reordered["content_sha256"] == baseline["content_sha256"]
+
+    # "## Runtime Evidence" content is excluded entirely.
+    body_with_extra_runtime_evidence = (
+        _scope_manifest_issue_body(operational="first update") + "- another runtime detail\n"
+    )
+    runtime_extra = mod.canonicalize_scope_manifest(mod.build_scope_manifest(body_with_extra_runtime_evidence))
+    assert runtime_extra["content_sha256"] == baseline["content_sha256"]
+
+    # Sanity: a genuine semantic change (a new Allowed Paths entry) DOES
+    # change the digest -- the exclusions above are not vacuously trivial.
+    manifest = mod.build_scope_manifest(_scope_manifest_issue_body(operational="first update"))
+    manifest["allowed_paths"] = manifest["allowed_paths"] + [".claude/c.py"]
+    changed = mod.canonicalize_scope_manifest(manifest)
+    assert changed["content_sha256"] != baseline["content_sha256"]
+
+    # Only the semantic fields the normalizer section lists are present.
+    assert set(mod.build_scope_manifest(_scope_manifest_issue_body()).keys()) == {
+        "schema_version",
+        "goal_ref",
+        "change_kind",
+        "in_scope",
+        "acceptance_criteria",
+        "allowed_paths",
+    }
+
+
 def test_disposition_precedence_reconciles_contradictory_insufficient_stale_and_identity_mismatch():
     """GIVEN unsafe evidence WHEN routed THEN reconciliation wins all lifecycle paths."""
     cases = [
@@ -358,13 +448,18 @@ def test_2119_2137_legacy_and_durable_marker_fixture_regressions():
         == "ordinary_dispatch_or_explicit_recovery"
     )
 
-    contradictory = _evidence(candidates=[_candidate(lifecycle="merged")], coverage=_exact_coverage(), contradictory=True)
+    contradictory = _evidence(
+        candidates=[_candidate(lifecycle="merged")], coverage=_exact_coverage(), contradictory=True
+    )
     assert (
         mod.derive_landing_disposition(contradictory, repo=REPO, issue_number=ISSUE)["disposition"]
         == "reconciliation_required"
     )
 
-    assert mod.derive_landing_disposition(None, repo=REPO, issue_number=ISSUE)["disposition"] == "reconciliation_required"
+    assert (
+        mod.derive_landing_disposition(None, repo=REPO, issue_number=ISSUE)["disposition"]
+        == "reconciliation_required"
+    )
 
     # #2699 P1-1: a malformed merged-candidate marker is reconciliation_required
     # regardless of lifecycle, ahead of the ancestry/exact-coverage checks.
