@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -86,7 +87,7 @@ def _merged_evidence(snapshot: object, issue_number: int, pr_number: int) -> tup
     return {"repo": repo.lower(), "issue_number": issue_number, "pr_number": pr_number, "merge_commit_oid": oid}, "OK"
 
 
-def _run(argv: list[str], body: dict) -> dict:
+def _run(argv: list[str], body: dict, *, origin_session_id: str | None = None) -> dict:
     """Invoke ``task_contextctl`` and normalize its result to the typed
     ``{"disposition": ..., "reason_code": ...}`` shape every other producer
     adapter (e.g. ``open_pr.emit_implementation_pr_observed``) already
@@ -98,10 +99,31 @@ def _run(argv: list[str], body: dict) -> dict:
     diagnosable ``deferred`` outcome instead of an uncaught exception or a
     bare ``{}``. This is a read normalization only -- it never rolls back or
     fail-closes any already-completed post-merge cleanup work.
+
+    Issue #2719 AC3: ``task_contextctl.py`` reads its origin session id from
+    its *own* process environment (``os.environ["CLAUDE_CODE_SESSION_ID"]``,
+    see ``task_contextctl._dispatch``). Previously this subprocess call
+    passed no ``env=`` at all and unconditionally inherited whatever
+    ``CLAUDE_CODE_SESSION_ID`` happened to already be set in *this*
+    adapter's own ambient environment -- an implicit, uncontrolled
+    passthrough. This now mirrors the explicit override pattern
+    ``.claude/hooks/task_context/ctl_client.py``'s ``call()`` already uses
+    for the hook transport: build ``child_env`` from a copy of this
+    process's environment, then explicitly set the caller-supplied
+    ``origin_session_id`` into it before starting the child process, so the
+    origin session provenance is never left to implicit inheritance.
     """
+    child_env = dict(os.environ)
+    if origin_session_id is not None:
+        child_env["CLAUDE_CODE_SESSION_ID"] = origin_session_id
     try:
         proc = subprocess.run(
-            [sys.executable, str(_CTL), *argv], input=json.dumps(body), text=True, capture_output=True, timeout=15
+            [sys.executable, str(_CTL), *argv],
+            input=json.dumps(body),
+            text=True,
+            capture_output=True,
+            timeout=15,
+            env=child_env,
         )
     except (subprocess.SubprocessError, OSError):
         return {"disposition": "deferred", "reason_code": "ADAPTER_UNAVAILABLE"}
@@ -133,7 +155,18 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="final cleanup worker result (required for --phase completed)",
     )
+    parser.add_argument(
+        "--origin-session-id",
+        default=None,
+        help=(
+            "origin Claude session id to set explicitly into the "
+            "task_contextctl.py child process's CLAUDE_CODE_SESSION_ID "
+            "(Issue #2719 AC3). Falls back to this adapter's own "
+            "CLAUDE_CODE_SESSION_ID when omitted."
+        ),
+    )
     args = parser.parse_args(argv)
+    origin_session_id = args.origin_session_id or os.environ.get("CLAUDE_CODE_SESSION_ID")
     try:
         snapshot = json.loads(args.snapshot_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -150,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
             "source_schema_version": "v1",
             "evidence": evidence,
         }
-        result = _run(["signal", "apply"], signal)
+        result = _run(["signal", "apply"], signal, origin_session_id=origin_session_id)
         if result.get("disposition") not in {"applied", "duplicate_noop"}:
             print(json.dumps(result))
             return 0
@@ -168,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
                 "request_id": "post-merge-cleanup",
                 "payload": begin,
             },
+            origin_session_id=origin_session_id,
         )
         print(json.dumps(result))
         return 0
@@ -187,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         "source_schema_version": "v1",
         "evidence": completed_evidence,
     }
-    result = _run(["signal", "apply"], completed)
+    result = _run(["signal", "apply"], completed, origin_session_id=origin_session_id)
     print(json.dumps(result))
     return 0
 
