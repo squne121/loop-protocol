@@ -90,8 +90,8 @@ roles:
 # the first provider, gemini the second/fallback provider. setup_check_order
 # (setup_check.py --provider auto) is also agy-first, so it now matches
 # runtime_order below (previously the two intentionally differed -- see
-# references/model-routing.md, which still documents the pre-#1692
-# gemini-first runtime_order and is a documented follow-up to refresh).
+# references/model-routing.md, which now documents the agy-first
+# runtime_order and no longer needs a refresh).
 provider_auto_policy_v1:
   schema_version: v1
   runtime_order:
