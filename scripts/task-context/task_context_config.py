@@ -26,6 +26,33 @@ STATE_ROOT_ENV_VAR = "LOOP_TASK_CONTEXT_STATE_ROOT"
 XDG_STATE_HOME_ENV_VAR = "XDG_STATE_HOME"
 DB_FILE_NAME = "task-context.sqlite3"
 
+# --- Issue #2568 In Scope: runtime-smoke scope carrier ----------------------
+#
+# ``worktree-agent-runtime-smoke`` (and any other caller wanting to run
+# ``task-contextctl smoke seed`` against a run-scoped isolated state root)
+# sets this env var to ``RUNTIME_SMOKE_SCOPE_VALUE`` explicitly, alongside
+# ``LOOP_TASK_CONTEXT_STATE_ROOT`` pointing at the isolated root. Unset (or
+# any other value) means "not a runtime-smoke invocation" -- `task_contextctl
+# _dispatch()` rejects `smoke_seed` in that case, strictly before opening/
+# migrating the DB (AC6). This module never infers scope from anything else
+# (state root path shape, cwd, ...).
+SCOPE_ENV_VAR = "LOOP_TASK_CONTEXT_SCOPE"
+RUNTIME_SMOKE_SCOPE_VALUE = "runtime_smoke"
+
+
+def resolve_task_context_scope() -> str:
+    """Read the raw ``LOOP_TASK_CONTEXT_SCOPE`` carrier value.
+
+    Returns the empty string when unset -- never raises, never guesses from
+    any other env var or from ``LOOP_TASK_CONTEXT_STATE_ROOT``."""
+    return os.environ.get(SCOPE_ENV_VAR, "")
+
+
+def is_runtime_smoke_scope() -> bool:
+    """``True`` only when ``LOOP_TASK_CONTEXT_SCOPE`` is exactly
+    ``RUNTIME_SMOKE_SCOPE_VALUE`` (AC6 gate predicate)."""
+    return resolve_task_context_scope() == RUNTIME_SMOKE_SCOPE_VALUE
+
 # --- Issue #2567 In Scope: runtime variant carrier -------------------------
 #
 # The Claude-GPT launcher (``scripts/claude-gpt/launch.sh``) exports this
@@ -142,6 +169,16 @@ def resolve_state_root(cwd: str | pathlib.Path | None = None) -> pathlib.Path:
       silently resolved against ``cwd``) -- see AC/contract for
       ``LOOP_TASK_CONTEXT_STATE_ROOT``.
     - Otherwise: ``$XDG_STATE_HOME/loop-protocol/task-context/v1/<repo_instance_key>/``.
+
+    Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 1 (atomic carrier
+    integrity): when the caller has opted into ``LOOP_TASK_CONTEXT_SCOPE=
+    runtime_smoke`` (``is_runtime_smoke_scope()``), the canonical XDG
+    fallback above must NEVER be reached -- a runtime-smoke caller that
+    omitted (or emptied) ``LOOP_TASK_CONTEXT_STATE_ROOT`` raises here,
+    strictly before any canonical path is computed/returned, instead of
+    silently resolving to (and later materializing/migrating) the
+    canonical DB. When scope is NOT runtime_smoke this function's
+    behavior is byte-identical to before this fix_delta.
     """
     override = os.environ.get(STATE_ROOT_ENV_VAR, "")
     if override:
@@ -153,6 +190,12 @@ def resolve_state_root(cwd: str | pathlib.Path | None = None) -> pathlib.Path:
                 "silently resolved against the current working directory."
             )
         return candidate
+    if is_runtime_smoke_scope():
+        raise ValueError(
+            f"{SCOPE_ENV_VAR}={RUNTIME_SMOKE_SCOPE_VALUE!r} requires an explicit, "
+            f"non-empty, absolute {STATE_ROOT_ENV_VAR} -- refusing to fall back to "
+            "the canonical state root/DB for a runtime-smoke-scoped caller."
+        )
     key = repo_instance_key(cwd=cwd)
     return _default_xdg_state_home() / "loop-protocol" / "task-context" / "v1" / key
 

@@ -36,6 +36,7 @@ for _dir in (_THIS_DIR, _MIGRATIONS_DIR):
 
 import task_context_config as config  # noqa: E402
 import task_context_db as db  # noqa: E402
+
 import task_context_envelope as envelope  # noqa: E402
 import task_context_errors as errors  # noqa: E402
 import task_context_hook_flows as hook_flows  # noqa: E402
@@ -152,6 +153,42 @@ def _dispatch(operation: str, payload: dict) -> dict:
         # never materializes the Task Context state-root/DB file at all as
         # a side effect of a no-op hook firing.
         return envelope.build_ok_result({"decision": "pass", "reason_code": "observe_only_non_herdr"})
+
+    if operation == "smoke_seed" and not config.is_runtime_smoke_scope():
+        # Issue #2568 AC6: `smoke seed` is only ever permitted for a caller
+        # that has explicitly opted into the isolated runtime-smoke scope
+        # (LOOP_TASK_CONTEXT_SCOPE=runtime_smoke). Rejecting here -- strictly
+        # before _open_db_and_migrate() below -- means a scope-mismatched
+        # caller never materializes the state-root directory, the SQLite DB
+        # file, or any migration side effect (proven by a deterministic test
+        # asserting the state-root path does not exist afterward). This
+        # mirrors the non-Herdr hook early-return pattern immediately above:
+        # the DB is never opened for a request this dispatcher already knows
+        # to reject.
+        raise errors.ValidationError(
+            "smoke seed is only permitted when "
+            f"{config.SCOPE_ENV_VAR}={config.RUNTIME_SMOKE_SCOPE_VALUE!r}",
+            scope=config.resolve_task_context_scope() or None,
+        )
+
+    if operation == "smoke_seed" and not os.environ.get(config.STATE_ROOT_ENV_VAR, ""):
+        # Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 1 (atomic
+        # carrier integrity): scope alone is not sufficient -- a runtime-
+        # smoke-scoped caller that omitted (or emptied)
+        # LOOP_TASK_CONTEXT_STATE_ROOT must be rejected here, strictly
+        # before _open_db_and_migrate() below, so the canonical state-root
+        # directory/DB file is never materialized or migrated as a side
+        # effect. (config.resolve_state_root() also independently raises
+        # ValueError in this exact situation -- this explicit check gives
+        # the caller a typed VALIDATION_ERROR result/exit code instead of
+        # falling through to the generic INTERNAL_ERROR catch-all in
+        # _run() below, and documents the invariant at the call site that
+        # owns the DB-open decision.)
+        raise errors.ValidationError(
+            "smoke seed requires an explicit, non-empty, absolute "
+            f"{config.STATE_ROOT_ENV_VAR} when "
+            f"{config.SCOPE_ENV_VAR}={config.RUNTIME_SMOKE_SCOPE_VALUE!r}",
+        )
 
     conn = _open_db_and_migrate()
     try:

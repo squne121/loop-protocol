@@ -40,7 +40,7 @@ def test_given_no_db_file_yet_when_query_current_by_session_then_degraded_empty_
 
 
 def test_given_db_exists_but_no_binding_for_session_when_queried_then_degraded_not_error(
-    state_root, monkeypatch, capsys
+    state_root, runtime_smoke_scope, monkeypatch, capsys
 ):
     # Force DB creation via an unrelated write path first (smoke seed).
     _run_cli(["smoke", "seed"], envelope.build_request("smoke_seed", {}), monkeypatch, capsys)
@@ -88,7 +88,7 @@ def test_given_bound_session_when_queried_then_full_projection_returned(state_ro
 
 
 def test_given_legacy_task_id_selector_when_queried_then_unaffected_by_session_addition(
-    state_root, monkeypatch, capsys
+    state_root, runtime_smoke_scope, monkeypatch, capsys
 ):
     """Backward compatibility: the pre-existing task_id-based `query
     current` path (and its migrate-on-open semantics/error taxonomy) must

@@ -81,13 +81,18 @@ interactive lane は、同じ固定 `--settings` overlay を forward するた�
 呼び出し元の Herdr session ではなく、実行のたびに新規生成する isolated named session の
 中で agent lifecycle を駆動する（詳細は `references/herdr.md` 参照）。
 
+isolated session へのコマンド送信は環境変数のみに依存せず、`herdr --session
+"<isolated-name>" ...` を明示的に指定する（Issue #2568 AC1/AC10、#2571 の
+real-machine spike finding を踏まえた両建て -- `HERDR_SESSION` 環境変数の pin は
+維持しつつ CLI フラグでも同じ session 名を明示する。詳細は `references/herdr.md` 参照）。
+
 ```bash
-HERDR_SESSION=<isolated-name> herdr workspace create --cwd "$WORKTREE" --no-focus
-HERDR_SESSION=<isolated-name> herdr agent start <unique-name> --kind claude --pane <pane-id> -- --max-turns "$MAX_TURNS"
-HERDR_SESSION=<isolated-name> herdr agent prompt <unique-name> "<prompt>" --wait --timeout <ms>
-HERDR_SESSION=<isolated-name> herdr agent get <unique-name>
-HERDR_SESSION=<isolated-name> herdr agent explain <unique-name> --json
-HERDR_SESSION=<isolated-name> herdr agent read <unique-name> --source recent-unwrapped --lines <bounded>
+herdr --session "<isolated-name>" workspace create --cwd "$WORKTREE" --no-focus
+herdr --session "<isolated-name>" agent start <unique-name> --kind claude --pane <pane-id> -- --max-turns "$MAX_TURNS"
+herdr --session "<isolated-name>" agent prompt <unique-name> "<prompt>" --wait --timeout <ms>
+herdr --session "<isolated-name>" agent get <unique-name>
+herdr --session "<isolated-name>" agent explain <unique-name> --json
+herdr --session "<isolated-name>" agent read <unique-name> --source recent-unwrapped --lines <bounded>
 herdr session stop <isolated-name> --json && herdr session delete <isolated-name> --json
 ```
 

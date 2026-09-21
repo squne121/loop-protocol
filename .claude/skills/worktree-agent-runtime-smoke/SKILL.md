@@ -41,6 +41,7 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 - `--expect-skill-command <name>`（任意。Issue #2498 AC4。`--expect-marker-source main` との必須ペア。`--mode structured` + `--claude-adapter native` 限定。native `UserPromptExpansion` hook イベント（実機 Claude Code 2.1.261 で確認済み: `command:"cat"` hook がその hook 自身の stdin payload — `command_name`/`command_args`/`command_source` を含む — を echo する）の `command_name` フィールド一致によって direct Skill/slash-command invocation の発生を検証する（`extract_claude_user_prompt_expansion_command_names()`）。`command_source` の値域は公式ドキュメント上で列挙されていないため判定根拠にしない。指定時は structured lane の `--settings` に `UserPromptExpansion` hook 登録を追加した拡張版 JSON（`_CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON`）を使う — 未指定の既存呼び出しは元の `_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON`（`{"SubagentStart", "SubagentStop"}` のみ）のまま変化しない）
 - `--require-clean-postcondition`（任意）
 - `--require-hook-chain-evidence`（任意。既定 off。`--runtime claude --mode structured --claude-adapter native` 限定。Issue #2663。generic hook-chain evidence capability — 詳細は下記「Generic Hook-Chain Evidence（AC2/AC3、Issue #2663）」節を参照)
+- `--task-context-scope <value>` / `--task-context-state-root <absolute path>`（任意。既定 None。Issue #2568 In Scope。structured/interactive 両 lane で、子 runtime プロセス／isolated herdr session へ `LOOP_TASK_CONTEXT_SCOPE`/`LOOP_TASK_CONTEXT_STATE_ROOT` を verbatim で additive に forward する env/carrier passthrough のみ。本 runner はこの値を一切解釈・検証しない — Task Context 固有の semantic（`task-contextctl smoke seed` の scope gate 等）は `scripts/task-context/task_contextctl.py` / `scripts/task-context/task_context_runtime_smoke_verifier.py` 側の責務であり、本 runner には一切埋め込まない）
 - `--inspect-session-log-metadata` / `--require-session-log-metadata`（任意。既定では session log を読まない）
 - `--agent-type <persona 名>`（任意。static declaration。CLI へ forward しない）
 - `--claude-agent-name <persona 名>`（任意。claude runtime + structured mode 限定。実際に `--agent <name>` として CLI へ forward し、main-session identity（`main_agent_identity`）・candidate Agent definition binding（`agent_definition`）・Skill evidence（`skill_evidence`）の evidence source になる。Issue #2046）
@@ -133,6 +134,13 @@ TUI `/status`、Skill picker、approval 画面、subagent UI、context 表示等
 named session を新規生成し、その session 内だけで agent lifecycle を駆動し、
 終了時にその session そのものを stop／delete し、両 command の成功と launcher process
 termination を確認する（確認できない場合は fail-closed で exit 1）。詳細は `references/herdr.md` を参照。
+
+isolated session を対象とする `workspace create`／`pane run`／`agent start|prompt|get|
+explain|read|wait|send-keys` はすべて、`HERDR_SESSION` 環境変数の pin に加えて
+`herdr --session "<isolated-name>" ...` を明示的に指定する（Issue #2568 AC1/AC10。
+#2571 の real-machine spike finding: 環境変数のみでは確実に route されない）。`session
+stop`／`session delete` は対象 session 名を第一引数に取るため、この位置引数自体が
+既に明示的なターゲット指定である。
 
 ## Main-Session Agent Identity Evidence（メインセッション Agent Identity 証跡、Issue #2046）
 

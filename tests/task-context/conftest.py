@@ -51,6 +51,16 @@ def state_root(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def runtime_smoke_scope(monkeypatch):
+    """Issue #2568 AC6: set LOOP_TASK_CONTEXT_SCOPE=runtime_smoke so
+    `task-contextctl smoke seed` is permitted. Deliberately a separate
+    fixture from `state_root` (rather than folded into it) so AC6's negative
+    test can assert the rejection with `state_root` set but this fixture
+    NOT requested."""
+    monkeypatch.setenv(config.SCOPE_ENV_VAR, config.RUNTIME_SMOKE_SCOPE_VALUE)
+
+
+@pytest.fixture
 def db_file(state_root):
     return config.db_path()
 

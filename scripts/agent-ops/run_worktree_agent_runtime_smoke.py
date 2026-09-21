@@ -754,6 +754,47 @@ def _load_command_hooks_for_event(
     return commands
 
 
+def _task_context_env_pairs(
+    task_context_scope: str | None, task_context_state_root: str | None
+) -> list[tuple[str, str]]:
+    """Issue #2568 In Scope: purely additive Task Context environment/
+    carrier PASSTHROUGH -- this runner never interprets these values (no
+    Task Context semantic verdict lives here, see Issue #2568 Out of
+    Scope / the ``task_context_runtime_smoke_verifier`` module under
+    ``scripts/task-context/`` for that). It only forwards
+    ``LOOP_TASK_CONTEXT_SCOPE``/``LOOP_TASK_CONTEXT_STATE_ROOT`` verbatim to
+    the launched child runtime process/session when a caller supplies them,
+    so a caller can drive an isolated, run-scoped Task Context state root
+    through a REAL fresh Native/Claude-GPT runtime. Omitted (empty list)
+    when neither is given, so every pre-existing caller's argv/env is
+    unchanged.
+
+    Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 1 (atomic carrier
+    integrity): the two carrier values are a single atomic pair. Exactly
+    one supplied (the other missing/empty) is a caller configuration error
+    -- never silently forwarded as a half-carrier, which would let a
+    downstream process either derive scope with no isolated root (falling
+    through to the canonical DB) or receive a bare state-root override
+    with no scope opt-in. Raised here, strictly before every call site's
+    own child-process launch (both ``run_structured_claude``'s
+    ``subprocess.run`` and ``run_interactive_herdr_isolated``'s ``herdr
+    workspace create``), so no process is ever spawned with a
+    half-carrier."""
+    if bool(task_context_scope) != bool(task_context_state_root):
+        raise ValueError(
+            "task_context_scope and task_context_state_root must be given "
+            "together (both or neither) -- got "
+            f"task_context_scope={task_context_scope!r}, "
+            f"task_context_state_root={task_context_state_root!r}"
+        )
+    pairs: list[tuple[str, str]] = []
+    if task_context_scope:
+        pairs.append(("LOOP_TASK_CONTEXT_SCOPE", task_context_scope))
+    if task_context_state_root:
+        pairs.append(("LOOP_TASK_CONTEXT_STATE_ROOT", task_context_state_root))
+    return pairs
+
+
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            max_turns: int, claude_bin: str = "claude",
                            claude_agent_name: str | None = None,
@@ -762,6 +803,8 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            claude_adapter: str = "native",
                            include_user_prompt_expansion_hook: bool = False,
                            include_hook_chain_evidence_hooks: bool = False,
+                           task_context_scope: str | None = None,
+                           task_context_state_root: str | None = None,
                            ) -> tuple[int | None, str, str, bool]:
     """Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES
     https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173):
@@ -928,6 +971,15 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
         argv += ["--agents", hermetic_agents_json]
     if hermetic_settings_file:
         argv += ["--settings", hermetic_settings_file]
+    # Issue #2568 In Scope: additive Task Context env/carrier passthrough,
+    # applied last so it never disturbs any argv construction above. Only
+    # takes effect when the caller opts in.
+    task_context_pairs = _task_context_env_pairs(task_context_scope, task_context_state_root)
+    if task_context_pairs:
+        if launch_env is None:
+            launch_env = os.environ.copy()
+        for key, value in task_context_pairs:
+            launch_env[key] = value
     return _run(argv, cwd=worktree, timeout=timeout_seconds, input_text=prompt, env=launch_env)
 
 
@@ -5558,6 +5610,32 @@ def diff_all_herdr_workspace_snapshots(
     return diffs
 
 
+def _herdr_session_argv_prefix(herdr_bin: str, env: dict[str, str]) -> list[str]:
+    """Issue #2568 AC1/AC10: every Herdr CLI operation that targets THIS
+    lane's isolated named session must explicitly pass ``--session <name>``,
+    never rely on the ambient ``HERDR_SESSION`` env var alone (#2571 real-
+    machine spike finding: env-var-only routing is not reliably honored by
+    every herdr subcommand). ``env`` is this lane's own explicit,
+    already-pinned ``isolated_env`` (never the ambient process env), and
+    ``HERDR_SESSION`` is set on it exactly once, right after the isolated
+    session is created -- this helper only reads that already-isolated
+    value back out, it never derives the session name from anything else.
+    Every call site below still ALSO passes ``env=isolated_env`` (both the
+    explicit flag AND the isolated env var stay pinned; belt-and-suspenders,
+    not a replacement for the existing env isolation)."""
+    session_name = env.get("HERDR_SESSION")
+    if not session_name:
+        # Should be unreachable within this lane (HERDR_SESSION is always
+        # set before any of these call sites run) -- fail closed rather than
+        # silently falling back to an unspecified/default/ambient session.
+        raise HerdrLaneError(
+            "internal error: herdr command constructed with no isolated "
+            "HERDR_SESSION set on env -- refusing to target an unspecified "
+            "session"
+        )
+    return [herdr_bin, "--session", session_name]
+
+
 def new_isolated_session_name(herdr_bin: str, env: dict[str, str] | None = None) -> str:
     """Generate a fresh high-entropy name without reading any Herdr namespace.
 
@@ -5632,7 +5710,8 @@ def _send_prompt_turn(
     ``HerdrLaneError`` on failure."""
     prompt_deadline = time.monotonic() + timeout_seconds
     rc, out, err, timed_out = _run(
-        [herdr_bin, "agent", "prompt", agent_name, prompt_text, "--wait",
+        _herdr_session_argv_prefix(herdr_bin, isolated_env) +
+        ["agent", "prompt", agent_name, prompt_text, "--wait",
          "--timeout", str(int(timeout_seconds * 1000))],
         timeout=timeout_seconds + 20.0, env=isolated_env,
     )
@@ -5649,7 +5728,8 @@ def _send_prompt_turn(
             if evidence.get("prompt_stall_recovered") is not True:
                 evidence["prompt_stall_recovered"] = False
             baseline_rc, baseline_out, _e, _t = _run(
-                [herdr_bin, "agent", "get", agent_name], timeout=15.0, env=isolated_env,
+                _herdr_session_argv_prefix(herdr_bin, isolated_env) + ["agent", "get", agent_name],
+                timeout=15.0, env=isolated_env,
             )
             baseline_seq = (
                 _extract_agent_field(baseline_out, "state_change_seq")
@@ -5658,7 +5738,7 @@ def _send_prompt_turn(
 
             remaining = max(1.0, prompt_deadline - time.monotonic())
             send_rc, send_out, send_err, send_timed_out = _run(
-                [herdr_bin, "agent", "send-keys", agent_name, "enter"],
+                _herdr_session_argv_prefix(herdr_bin, isolated_env) + ["agent", "send-keys", agent_name, "enter"],
                 timeout=min(20.0, remaining), env=isolated_env,
             )
             if send_timed_out or send_rc != 0:
@@ -5671,7 +5751,8 @@ def _send_prompt_turn(
             observed_change = baseline_seq is None
             while not observed_change and time.monotonic() < poll_deadline:
                 poll_rc, poll_out, _e, _t = _run(
-                    [herdr_bin, "agent", "get", agent_name], timeout=10.0, env=isolated_env,
+                    _herdr_session_argv_prefix(herdr_bin, isolated_env) + ["agent", "get", agent_name],
+                    timeout=10.0, env=isolated_env,
                 )
                 if poll_rc == 0:
                     seq = _extract_agent_field(poll_out, "state_change_seq")
@@ -5687,8 +5768,8 @@ def _send_prompt_turn(
 
             remaining = max(1.0, prompt_deadline - time.monotonic())
             wait_rc, wait_out, wait_err, wait_timed_out = _run(
-                [herdr_bin, "agent", "wait", agent_name,
-                 "--timeout", str(int(remaining * 1000))],
+                _herdr_session_argv_prefix(herdr_bin, isolated_env) +
+                ["agent", "wait", agent_name, "--timeout", str(int(remaining * 1000))],
                 timeout=remaining + 20.0, env=isolated_env,
             )
             if wait_timed_out or wait_rc != 0:
@@ -5714,6 +5795,8 @@ def run_interactive_herdr_isolated(
     claude_adapter: str = "native",
     additional_prompts: list[str] | None = None,
     hook_sink_enabled: bool = False,
+    task_context_scope: str | None = None,
+    task_context_state_root: str | None = None,
 ) -> list[str]:
     """Drive an isolated-session herdr agent lifecycle. Mutates ``evidence``
     in place (so cleanup/session identity survive even if this raises) and
@@ -5810,7 +5893,9 @@ def run_interactive_herdr_isolated(
 
         claude_bin_receipt_path: str | None = None
         claude_bin_launcher_nonce: str | None = None
-        workspace_create_argv = [herdr_bin, "workspace", "create", "--cwd", worktree, "--no-focus"]
+        workspace_create_argv = _herdr_session_argv_prefix(herdr_bin, isolated_env) + [
+            "workspace", "create", "--cwd", worktree, "--no-focus",
+        ]
         if runtime == "claude" and claude_bin_override:
             resolved_claude_bin_override = os.path.realpath(claude_bin_override)
             if not os.path.isfile(resolved_claude_bin_override) or not os.access(
@@ -5957,7 +6042,15 @@ def run_interactive_herdr_isolated(
                     ("CLAUDE_GPT_HOOK_SINK_PATH", str(hook_sink_path)),
                 ]
 
-        for key, value in [*launcher_env_pairs, *hook_sink_env_pairs]:
+        # Issue #2568 In Scope: additive Task Context env/carrier
+        # passthrough, threaded through the SAME herdr `workspace create
+        # --env` mechanism as the launcher/hook-sink pairs above (Finding 1:
+        # updating only this Python client's own env never reaches the
+        # already-running Herdr server/pane process). Only applied when the
+        # caller opts in; omitted by default.
+        task_context_env_pairs = _task_context_env_pairs(task_context_scope, task_context_state_root)
+
+        for key, value in [*launcher_env_pairs, *hook_sink_env_pairs, *task_context_env_pairs]:
             isolated_env[key] = value
             workspace_create_argv += ["--env", f"{key}={value}"]
 
@@ -5999,7 +6092,7 @@ def run_interactive_herdr_isolated(
                 _escaped_claude_gpt_bin = isolated_env["CLAUDE_GPT_CLAUDE_BIN"].replace("'", "'\\''")
                 _pin_cmd += f" && export CLAUDE_GPT_CLAUDE_BIN='{_escaped_claude_gpt_bin}'"
             _pin_rc, _pin_out, _pin_err, _pin_timed_out = _run(
-                [herdr_bin, "pane", "run", pane_id, _pin_cmd],
+                _herdr_session_argv_prefix(herdr_bin, isolated_env) + ["pane", "run", pane_id, _pin_cmd],
                 timeout=15.0, env=isolated_env,
             )
             if _pin_timed_out or _pin_rc != 0:
@@ -6008,17 +6101,18 @@ def run_interactive_herdr_isolated(
                     f"already-running shell: {_redact(_pin_err or _pin_out)}"
                 )
 
-        runtime_env_pairs = [*launcher_env_pairs, *hook_sink_env_pairs]
+        runtime_env_pairs = [*launcher_env_pairs, *hook_sink_env_pairs, *task_context_env_pairs]
         if runtime_env_pairs:
-            # An interactive login shell can clobber inherited launcher policy
-            # or hook-sink env vars, so explicitly re-export the fixed values
-            # in the already-running pane shell before ``agent start``.
+            # An interactive login shell can clobber inherited launcher
+            # policy, hook-sink, or Task Context carrier env vars, so
+            # explicitly re-export the fixed values in the already-running
+            # pane shell before ``agent start``.
             _pin_runtime_env_cmd = " && ".join(
                 f"export {key}='{value.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
                 for key, value in runtime_env_pairs
             )
             _pin_runtime_env_rc, _pin_runtime_env_out, _pin_runtime_env_err, _pin_runtime_env_timed_out = _run(
-                [herdr_bin, "pane", "run", pane_id, _pin_runtime_env_cmd],
+                _herdr_session_argv_prefix(herdr_bin, isolated_env) + ["pane", "run", pane_id, _pin_runtime_env_cmd],
                 timeout=15.0, env=isolated_env,
             )
             if _pin_runtime_env_timed_out or _pin_runtime_env_rc != 0:
@@ -6055,7 +6149,8 @@ def run_interactive_herdr_isolated(
         start_timed_out = False
         for attempt in range(5):
             start_rc, start_out, start_err, start_timed_out = _run(
-                [herdr_bin, "agent", "start", agent_name, "--kind", runtime,
+                _herdr_session_argv_prefix(herdr_bin, isolated_env) +
+                ["agent", "start", agent_name, "--kind", runtime,
                  "--pane", pane_id, "--timeout", str(int(min(timeout_seconds, 300.0) * 1000)),
                  *agent_extra_args],
                 timeout=timeout_seconds, env=isolated_env,
@@ -6075,7 +6170,8 @@ def run_interactive_herdr_isolated(
             evidence["turns_completed"] += 1
 
         rc, out, err, timed_out = _run(
-            [herdr_bin, "agent", "get", agent_name], timeout=20.0, env=isolated_env,
+            _herdr_session_argv_prefix(herdr_bin, isolated_env) + ["agent", "get", agent_name],
+            timeout=20.0, env=isolated_env,
         )
         state = None
         if rc == 0:
@@ -6094,7 +6190,8 @@ def run_interactive_herdr_isolated(
             raise HerdrLaneError(f"agent lifecycle state is unusable for evidence: {state}")
 
         rc, out, _err, _timed_out = _run(
-            [herdr_bin, "agent", "explain", agent_name, "--json"], timeout=20.0, env=isolated_env,
+            _herdr_session_argv_prefix(herdr_bin, isolated_env) + ["agent", "explain", agent_name, "--json"],
+            timeout=20.0, env=isolated_env,
         )
         if rc == 0:
             try:
@@ -6106,7 +6203,8 @@ def run_interactive_herdr_isolated(
                 pass
 
         rc, out, _err, _timed_out = _run(
-            [herdr_bin, "agent", "read", agent_name, "--source", "recent-unwrapped",
+            _herdr_session_argv_prefix(herdr_bin, isolated_env) +
+            ["agent", "read", agent_name, "--source", "recent-unwrapped",
              "--lines", str(_MAX_PANE_LINES)],
             timeout=20.0, env=isolated_env,
         )
@@ -6457,6 +6555,36 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--task-context-scope",
+        default=None,
+        help=(
+            "Issue #2568 In Scope: purely additive environment/carrier "
+            "passthrough. When given, forwarded verbatim to the launched "
+            "child runtime process/session as LOOP_TASK_CONTEXT_SCOPE "
+            "(structured lane: subprocess env; interactive lane: herdr "
+            "'workspace create --env' plus a pane re-export, same "
+            "mechanism as the existing launcher/hook-sink env pairs). This "
+            "runner never interprets or validates the value -- Task "
+            "Context-specific semantics (e.g. gating "
+            "'task-contextctl smoke seed' on scope=='runtime_smoke') live "
+            "in scripts/task-context/task_contextctl.py and "
+            "task_context_runtime_smoke_verifier.py, never here. Omitted "
+            "by default (None), so every pre-existing caller's argv/env is "
+            "unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--task-context-state-root",
+        default=None,
+        help=(
+            "Issue #2568 In Scope: the LOOP_TASK_CONTEXT_STATE_ROOT "
+            "counterpart to --task-context-scope above -- same additive, "
+            "opt-in, uninterpreted passthrough mechanism. Callers pass a "
+            "run-scoped isolated absolute path (e.g. from "
+            "task_context_runtime_smoke_verifier.build_isolated_state_root)."
+        ),
+    )
+    parser.add_argument(
         "--require-session-baseline-preservation",
         action="store_true",
         help=(
@@ -6622,6 +6750,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--scan-forbidden-markers requires --runtime claude")
     if args.additional_prompt and args.mode != "interactive":
         parser.error("--additional-prompt requires --mode interactive")
+    if bool(args.task_context_scope) != bool(args.task_context_state_root):
+        # Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 1: the two
+        # carrier flags are a single atomic pair -- reject a half-carrier
+        # here, before any worktree/child-process setup below, rather than
+        # letting it reach _task_context_env_pairs()'s own later raise.
+        parser.error(
+            "--task-context-scope and --task-context-state-root must be "
+            "given together (both or neither)"
+        )
     if args.additional_prompt and args.runtime != "claude":
         parser.error("--additional-prompt requires --runtime claude")
     # Issue #2219 fix_delta iteration 1 (Option B): the interactive lane's
@@ -6865,6 +7002,16 @@ def main(argv: list[str] | None = None) -> int:
         "transport": "direct" if args.mode == "structured" else "herdr_isolated_session",
         "worktree": os.path.relpath(worktree, repo_root),
         "timeout_seconds": args.timeout_seconds,
+        # Issue #2568 In Scope: raw-observation-only record of whether the
+        # caller opted into the additive Task Context env/carrier
+        # passthrough (--task-context-scope / --task-context-state-root).
+        # No Task Context semantic verdict is derived or embedded here --
+        # this is purely "was the carrier configured for this run", never
+        # "did Task Context behave correctly" (that lives in
+        # scripts/task-context/task_context_runtime_smoke_verifier.py).
+        "task_context_carrier_configured": bool(
+            args.task_context_scope or args.task_context_state_root
+        ),
         "tested_head": tested_head,
         "runtime_version": runtime_version,
         "resolved_executable": resolved_runtime_bin,
@@ -6992,6 +7139,8 @@ def main(argv: list[str] | None = None) -> int:
                     claude_adapter=args.claude_adapter,
                     include_user_prompt_expansion_hook=bool(args.expect_skill_command),
                     include_hook_chain_evidence_hooks=bool(args.require_hook_chain_evidence),
+                    task_context_scope=args.task_context_scope,
+                    task_context_state_root=args.task_context_state_root,
                 )
                 capability_decision, capability_reason = classify_claude_structured_outcome(
                     rc, out, err, timed_out
@@ -7531,6 +7680,8 @@ def main(argv: list[str] | None = None) -> int:
                     claude_adapter=args.claude_adapter,
                     additional_prompts=args.additional_prompt or None,
                     hook_sink_enabled=_hook_sink_enabled,
+                    task_context_scope=args.task_context_scope,
+                    task_context_state_root=args.task_context_state_root,
                 )
 
                 if evidence.get("final_state") == "blocked":
