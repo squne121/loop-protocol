@@ -131,6 +131,35 @@ gh issue view 2656 --repo squne121/loop-protocol --json comments
 - 上記 2 コマンドは Issue #2656 に限定した exact command 一致の read-only exception であり、他の Issue・他のパス・他の JSON フィールド指定への一般化ではない
 - 任意の GitHub mutation（`gh issue edit` / `gh issue comment` 等）には一切拡張しない
 
+### Issue #2670 限定の狭域例外（正規委譲経路のランタイム検証・AC5）
+
+Issue #2670 の AC5 は、上記「Issue #2656 限定の狭域例外（正規委譲経路のランタイム検証）」節が固定するコマンドと script path・フラグ・環境変数のいずれも exact に同一のコマンド文字列を、`## AC5 Execution Procedure`（tested checkout の host 側通常 terminal から `scripts/claude-gpt/launch.sh` を通常起動して作った fresh outer から、その inner test-runner が実行する）下で実行する canonical delegation route runtime verification を必須とする。
+
+```bash
+AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST=1 AGY_PREFLIGHT_RUNTIME_ACCOUNT_SESSION_MODE=1 \
+  uv run python .claude/skills/gemini-cli-headless-delegation/tests/test_agy_structured_output_capability_runtime.py \
+  --stage2-model-backed --caller-context claude-gpt
+```
+
+許可条件（すべて満たす場合のみ。上記「Issue #2656 限定の狭域例外」節と同一の完全一致条件を Issue #2670 の inner test-runner invocation にも適用する）:
+- スクリプトパスが `.claude/skills/gemini-cli-headless-delegation/tests/test_agy_structured_output_capability_runtime.py` と完全一致し、フラグが `--stage2-model-backed --caller-context claude-gpt` と完全一致する（引数の追加・省略・置換は不可）
+- 環境変数は `AGY_PREFLIGHT_CONFIRM_RUNTIME_PROBE_COST=1` と `AGY_PREFLIGHT_RUNTIME_ACCOUNT_SESSION_MODE=1` の 2 つのみを付与する
+- 実行経路は canonical AGY route（`run_gemini_headless.run_delegation()`）のみであり、他の任意 network access には拡張しない
+- **永続化する** runtime verification の証跡（sanitized handoff-selection summary artifact を含む）は、スクリプト自身が生成する worktree-local `artifacts/` 配下に限定される（test-runner 自身はファイル書き込みを行わない）
+- 実行結果（exit code・stdout の `verdict`/`reason_code`・`handoff_classification`・sanitized artifact path）を `runtime_ac_results[].notes` に記録する。`handoff_classification` は `validated_handoff_selected` / `invalid_handoff_rejected` / `source_absent` / `no_handoff_ordinary_lookup` の 4 値ラベルのみであり、root/path/token/credential/account/response/HOME/XDG 値を一切含まない
+- 本例外は Issue #2656／Issue #2670 が固定するこの exact 1 コマンドパターンにのみ適用され、他の Issue・他のスクリプト・他の引数の組み合わせへ一般化しない
+
+### Issue #2670 限定の狭域例外（AC7 guard script の read-only 確認）
+
+Issue #2670 の AC7 は以下の guard script を `preflight-scope: runtime_only` として要求する。`.claude/skills/create-issue/references/body-authoring.md` / `.claude/skills/create-issue/SKILL.md` の 2 ファイルを読むのみで、書き込み・network side effect を一切持たないため、Issue #2670 に限定した exact command 一致の read-only exception として実行を許可する。
+
+```bash
+uv run python .claude/skills/create-issue/scripts/verify_vc_single_command_guardrail_docs.py --strict
+```
+
+- 上記コマンドは Issue #2670 に限定した exact command 一致の read-only exception であり、他の Issue・他のスクリプト・他の引数の組み合わせへの一般化ではない
+- 実行結果（exit code）を `runtime_ac_results[].notes` に記録する
+
 ## 実行してはいけないコマンド
 
 - `echo ... > file` / `tee` / `sed -i` 等のファイル書き込み
