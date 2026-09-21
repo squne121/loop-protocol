@@ -6,7 +6,49 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import task_context_hook_flows as hook_flows
+import task_context_session_registry as session_registry
+
+
+@pytest.fixture
+def session_registry_dir(tmp_path, monkeypatch):
+    """Point `LOOP_TASK_CONTEXT_SESSION_REGISTRY_DIR` at an isolated tmp
+    directory standing in for Claude Code's own real
+    `~/.claude/sessions/` registry, so tests never touch (or depend on) a
+    real developer machine's session files."""
+    directory = tmp_path / "claude-sessions"
+    directory.mkdir()
+    monkeypatch.setenv(session_registry.SESSION_REGISTRY_DIR_ENV_VAR, str(directory))
+    return directory
+
+
+def _write_session_registry_record(directory, *, pid: int, session_id: str, name: str) -> None:
+    """Write a fixture file shaped like a real
+    `~/.claude/sessions/<pid>.json` record (independently confirmed schema,
+    see `task_context_session_registry` module docstring)."""
+    record = {
+        "pid": pid,
+        "sessionId": session_id,
+        "cwd": "/tmp/example-cwd",
+        "startedAt": "2026-09-21T00:00:00Z",
+        "procStart": 123456,
+        "version": "2.1.0",
+        "peerProtocol": 1,
+        "peerFeatures": [],
+        "kind": "interactive",
+        "entrypoint": "cli",
+        "pidDomain": "local",
+        "messagingSocketPath": f"/tmp/claude-{pid}.sock",
+        "name": name,
+        "nameSource": "auto",
+        "nameSince": "2026-09-21T00:00:00Z",
+        "status": "idle",
+        "updatedAt": "2026-09-21T00:00:00Z",
+        "statusUpdatedAt": "2026-09-21T00:00:00Z",
+    }
+    (directory / f"{pid}.json").write_text(json.dumps(record), encoding="utf-8")
 
 
 def _bind_session_to_task(conn, *, herdr_tab_id: str, claude_session_id: str, repo: str, ref_number: int) -> str:
@@ -165,6 +207,152 @@ def test_given_notify_when_idle_cross_task_when_pre_tool_use_then_ask(conn):
         {"tool_name": "SendMessage", "claude_session_id": "s1", "to": "s2", "notify_when_idle": True},
     )
     assert result["decision"] == "ask"
+
+
+# ---------------------------------------------------------------------------
+# SendMessage / notify_when_idle -- name-based resolution against Claude
+# Code's own on-disk session registry (Issue #2566 fix_delta P1-B iteration
+# 2, operator finding). Unlike the `to == claude_session_id` fixtures above
+# (which prove the legacy fallback still works), these fixtures use a
+# realistic `name`/`sessionId` pair -- `to` is the registry `name`, distinct
+# in shape and value from the Task Context `claude_session_id` it resolves
+# to -- proving the name-based resolver, not just the literal fallback, is
+# reachable.
+# ---------------------------------------------------------------------------
+
+
+def test_given_send_message_to_registry_name_same_task_when_pre_tool_use_then_pass(conn, session_registry_dir):
+    task_id = _bind_session_to_task(conn, herdr_tab_id="tab-1", claude_session_id="s1", repo="owner/repo", ref_number=1)
+    hook_flows.on_session_start(
+        conn, {"source": "startup", "herdr_tab_id": "tab-2", "claude_session_id": "sess-uuid-peer-alpha"}
+    )
+    hook_flows.on_user_prompt_submit(
+        conn,
+        {
+            "herdr_tab_id": "tab-2",
+            "claude_session_id": "sess-uuid-peer-alpha",
+            "classification_kind": "EXPLICIT",
+            "target_repo": "owner/repo",
+            "target_ref_kind": "issue",
+            "target_ref_number": 1,
+        },
+    )
+    _write_session_registry_record(
+        session_registry_dir, pid=1001, session_id="sess-uuid-peer-alpha", name="peer-alpha"
+    )
+
+    result = hook_flows.on_pre_tool_use(
+        conn, {"tool_name": "SendMessage", "claude_session_id": "s1", "to": "peer-alpha"}
+    )
+    assert result["decision"] == "pass"
+    assert result["target_kind"] == "same_task_independent_session"
+    assert task_id
+
+
+def test_given_send_message_to_registry_name_cross_task_when_pre_tool_use_then_ask(conn, session_registry_dir):
+    _bind_session_to_task(conn, herdr_tab_id="tab-1", claude_session_id="s1", repo="owner/repo", ref_number=1)
+    _bind_session_to_task(
+        conn, herdr_tab_id="tab-2", claude_session_id="sess-uuid-peer-beta", repo="owner/repo", ref_number=2
+    )
+    _write_session_registry_record(
+        session_registry_dir, pid=1002, session_id="sess-uuid-peer-beta", name="peer-beta"
+    )
+
+    result = hook_flows.on_pre_tool_use(
+        conn, {"tool_name": "SendMessage", "claude_session_id": "s1", "to": "peer-beta"}
+    )
+    assert result["decision"] == "ask"
+    assert result["target_kind"] == "known_cross_task_independent_session"
+
+
+def test_given_send_message_to_colliding_registry_name_when_pre_tool_use_then_ask_unresolved(
+    conn, session_registry_dir
+):
+    """Two on-disk records share the same `name` -- an intentional
+    short-identifier-collision fail-safe (see `task_context_session_registry`
+    module docstring): the name resolves to `None` rather than a guessed
+    `sessionId`, and (since it also does not equal `claude_session_id`
+    verbatim) falls through to `unknown_independent_session` (ASK)."""
+    _bind_session_to_task(conn, herdr_tab_id="tab-1", claude_session_id="s1", repo="owner/repo", ref_number=1)
+    _bind_session_to_task(
+        conn, herdr_tab_id="tab-2", claude_session_id="sess-uuid-dup-1", repo="owner/repo", ref_number=1
+    )
+    _write_session_registry_record(session_registry_dir, pid=2001, session_id="sess-uuid-dup-1", name="dup-name")
+    _write_session_registry_record(session_registry_dir, pid=2002, session_id="sess-uuid-dup-2", name="dup-name")
+
+    result = hook_flows.on_pre_tool_use(
+        conn, {"tool_name": "SendMessage", "claude_session_id": "s1", "to": "dup-name"}
+    )
+    assert result["decision"] == "ask"
+    assert result["target_kind"] == "unknown_independent_session"
+
+
+def test_given_send_message_registry_dir_missing_when_pre_tool_use_then_ask_fail_closed(conn, monkeypatch, tmp_path):
+    """The registry directory itself does not exist -- must fail closed
+    (unresolved -> `unknown_independent_session` -> ASK), never raise."""
+    _bind_session_to_task(conn, herdr_tab_id="tab-1", claude_session_id="s1", repo="owner/repo", ref_number=1)
+    monkeypatch.setenv(
+        session_registry.SESSION_REGISTRY_DIR_ENV_VAR, str(tmp_path / "does-not-exist-sessions-dir")
+    )
+
+    result = hook_flows.on_pre_tool_use(
+        conn, {"tool_name": "SendMessage", "claude_session_id": "s1", "to": "whoever"}
+    )
+    assert result["decision"] == "ask"
+    assert result["target_kind"] == "unknown_independent_session"
+
+
+def test_given_send_message_registry_file_corrupt_when_pre_tool_use_then_ask_fail_closed(
+    conn, session_registry_dir
+):
+    """A registry file that is not valid JSON must be skipped, not raised,
+    and must not prevent resolution of *other* valid records in the same
+    directory."""
+    (session_registry_dir / "9999.json").write_text("{not valid json", encoding="utf-8")
+    task_id = _bind_session_to_task(conn, herdr_tab_id="tab-1", claude_session_id="s1", repo="owner/repo", ref_number=1)
+
+    result = hook_flows.on_pre_tool_use(
+        conn, {"tool_name": "SendMessage", "claude_session_id": "s1", "to": "whoever"}
+    )
+    assert result["decision"] == "ask"
+    assert result["target_kind"] == "unknown_independent_session"
+    assert task_id
+
+
+def test_given_notify_when_idle_registry_name_same_task_when_pre_tool_use_then_pass(conn, session_registry_dir):
+    """`notify_when_idle` shares `_on_pre_tool_use_send_message` with
+    `SendMessage`, so it automatically picks up the same name-based
+    resolver -- no separate function/logic path to keep in sync."""
+    _bind_session_to_task(conn, herdr_tab_id="tab-1", claude_session_id="s1", repo="owner/repo", ref_number=1)
+    hook_flows.on_session_start(
+        conn, {"source": "startup", "herdr_tab_id": "tab-2", "claude_session_id": "sess-uuid-peer-gamma"}
+    )
+    hook_flows.on_user_prompt_submit(
+        conn,
+        {
+            "herdr_tab_id": "tab-2",
+            "claude_session_id": "sess-uuid-peer-gamma",
+            "classification_kind": "EXPLICIT",
+            "target_repo": "owner/repo",
+            "target_ref_kind": "issue",
+            "target_ref_number": 1,
+        },
+    )
+    _write_session_registry_record(
+        session_registry_dir, pid=1003, session_id="sess-uuid-peer-gamma", name="peer-gamma"
+    )
+
+    result = hook_flows.on_pre_tool_use(
+        conn,
+        {
+            "tool_name": "SendMessage",
+            "claude_session_id": "s1",
+            "to": "peer-gamma",
+            "notify_when_idle": True,
+        },
+    )
+    assert result["decision"] == "pass"
+    assert result["target_kind"] == "same_task_independent_session"
 
 
 # ---------------------------------------------------------------------------

@@ -44,6 +44,7 @@ if _THIS_DIR not in sys.path:
 
 import task_context_errors as errors  # noqa: E402
 import task_context_service as service  # noqa: E402
+import task_context_session_registry as session_registry  # noqa: E402
 import task_context_target_kind as target_kind  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -673,42 +674,40 @@ def _record_pre_tool_use_guard_event(
 
 
 def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, Any]:
-    """Issue #2566 fix_delta P1-B (OWNER PR #2691 review, 2026-09-21):
-    ``to`` is only ever confirmed, via this repo's own real prior
-    ``SendMessage`` tool_use history, to carry an ``agentId``-shaped
-    identifier (the same shape ``SubagentStart``'s own ``agent_id`` uses) --
-    every real ``to`` value sampled from this environment's own transcripts
-    matched that shape, addressing a Task/Agent-tool-spawned SubAgent (which
-    also covers an Agent Teams teammate represented the same way, per the
-    existing ``is_in_session_subagent`` lookup below). No real sample of a
-    genuinely independent (non-child) Claude Code session being addressed by
-    a session name/short identifier was found in that history, and Task
-    Context's own state (``tab_bindings`` / ``execution_runs`` /
-    ``runtime_locations``) tracks no such session-name field to resolve one
-    against even if upstream Claude Code does support that addressing mode
-    for cross-session ``SendMessage`` (per Claude Code's own hooks/
-    cross-session-messaging docs, which this module does not have direct
-    access to confirm against real runtime payloads for that specific case).
+    """Issue #2566 fix_delta P1-B iteration 2 (operator finding, OWNER PR
+    #2691 review, 2026-09-21): independent investigation of Claude Code's
+    own ``https://code.claude.com/docs/en/cross-session-messaging`` docs,
+    plus a real on-machine sample of its own on-disk session registry
+    (``~/.claude/sessions/<pid>.json``), found that a real ``SendMessage``/
+    ``notify_when_idle`` ``to`` value for a genuinely independent (non-child)
+    Claude Code session addresses that session by its ``name`` field -- not
+    by a raw ``claude_session_id``, and not only by the ``agentId``-shaped
+    identifier this module already resolves via the open-SubAgent-
+    ExecutionRun lookup below. Claude Code itself already owns and
+    maintains that on-disk registry (one JSON record per session, carrying
+    both ``name`` and ``sessionId``); this module never builds a new peer
+    registry/router of its own -- ``task_context_session_registry`` only
+    performs a **read-only** scan of that existing, Claude-Code-owned
+    registry to translate a ``name`` into the ``sessionId`` Task Context's
+    own ``tab_bindings.current_claude_session_id`` already tracks (see
+    ``task_context_session_registry.resolve_session_name_to_claude_session_id``
+    for the read-only lookup and its fail-closed/collision behavior).
 
-    The ``get_binding_by_current_session(conn, to)`` fallback below predates
-    this note and assumes ``to`` equals ``claude_session_id`` -- an
-    assumption never validated by a real sample (``claude_session_id`` is
-    UUID-shaped; every observed ``to`` was the shorter ``agentId`` hex
-    shape, so this fallback is a no-op against real traffic today). It is
-    left in place, unchanged, as a harmless defensive fallback (a real
-    ``claude_session_id``-shaped ``to`` would still resolve correctly if it
-    ever occurred) -- but it must not be read as a validated "resolve an
-    independent session by name" mechanism: no such mechanism exists here.
-    Any ``to`` that does not match a currently-open SubAgent/teammate
-    ``agent_id`` therefore resolves to ``unknown_independent_session`` (ASK,
-    fail-safe) in practice. Building a reliable name/short-identifier ->
-    Binding mapping for a genuinely independent session, if upstream Claude
-    Code truly requires Task Context to distinguish that case, needs either
-    real `SendMessage` PreToolUse runtime evidence for that specific
-    scenario or a Task Context state/schema addition -- both out of this
-    fix_delta's scope; narrowing the contract to "independent session always
-    ASK" as a silent shortcut is explicitly rejected by this fix_delta, so
-    this gap is reported as an open item rather than papered over."""
+    Known limitation (intentionally out of scope for this fix_delta): when
+    more than one on-disk registry record shares the same ``name`` (a short-
+    identifier collision, per Claude Code's own docs), that name resolves
+    to ``None`` (unresolved) rather than being guessed at -- Claude Code's
+    exact short-identifier derivation algorithm for that case was not
+    confirmed by this investigation, and guessing wrong would silently
+    misroute a cross-Task guard decision to the wrong peer, which is worse
+    than the existing ``unknown_independent_session`` -> ASK fail-safe a
+    ``None`` resolution falls through to below.
+
+    The direct ``get_binding_by_current_session(conn, to)`` fallback
+    (``to`` equals ``claude_session_id`` verbatim) is preserved, unchanged,
+    for backward compatibility -- it is tried only when the name-based
+    resolver above returns no match, so a real ``claude_session_id``-shaped
+    ``to`` (should one ever occur) would still resolve correctly."""
     to = payload.get("to")
     caller_task_id = _resolve_caller_task_id(conn, payload.get("claude_session_id"))
 
@@ -720,20 +719,32 @@ def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, An
         # (already tracked via SubagentStart, Issue #2564) covers both an
         # in-session SubAgent and an Agent Teams teammate represented the
         # same way -- never a new peer registry, just the existing
-        # ExecutionRun bookkeeping. This is the only `to` shape this
-        # module's own real prior `SendMessage` usage has ever confirmed
-        # (see docstring above).
+        # ExecutionRun bookkeeping.
         if service.find_open_execution_runs(conn, run_kind="subagent", agent_id=to):
             is_in_session_subagent = True
         else:
-            # Defensive fallback only -- see docstring above: no real
-            # sample has ever shown `to` actually carrying a
-            # `claude_session_id`-shaped value, so this branch is a no-op
-            # against real traffic today, not a confirmed resolution path.
-            try:
-                peer_binding = service.get_binding_by_current_session(conn, to)
-            except errors.NotFoundError:
-                peer_binding = None
+            peer_binding = None
+            # Name-based resolution against Claude Code's own on-disk
+            # session registry (read-only; see docstring above and
+            # `task_context_session_registry` module docstring). Only when
+            # this resolves to exactly one `sessionId` do we look that
+            # `sessionId` up as a Binding -- an unresolved name (no match,
+            # or a collision) falls through to the legacy direct fallback
+            # below rather than being guessed at.
+            resolved_session_id = session_registry.resolve_session_name_to_claude_session_id(to)
+            if resolved_session_id:
+                try:
+                    peer_binding = service.get_binding_by_current_session(conn, resolved_session_id)
+                except errors.NotFoundError:
+                    peer_binding = None
+            else:
+                # Legacy defensive fallback: `to` equals `claude_session_id`
+                # verbatim. Tried only when the name-based resolver above
+                # found no match, preserving prior back-compat behavior.
+                try:
+                    peer_binding = service.get_binding_by_current_session(conn, to)
+                except errors.NotFoundError:
+                    peer_binding = None
             if peer_binding is not None:
                 peer_session_found = True
                 peer_task_id, _, _ = service.get_current_task_activity_for_binding(conn, peer_binding["id"])
