@@ -239,6 +239,12 @@ REGISTRY = {
             "--human-context-comment-url", "{anchor_comment_url}",
             "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
             "--investigation-evidence-primary-root", "{investigation_evidence_primary_root}",
+            # Issue #2689 P0-1 fix_delta: kept in parity with the real
+            # `command_registry.py` entry (see the SAME comment below for
+            # `contract_update.run.with_human_context`).
+            "--mutation-category", "{mutation_category}",
+            "--owner-user-id", "{owner_user_id}",
+            "--preview-binding-file", "{preview_binding_file}",
         ],
         "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_anchor",
         "required_cwd": "canonical_main_root", "required_branch": "default_branch",
@@ -261,6 +267,16 @@ REGISTRY = {
             # checks this fixture registry against).
             "investigation_evidence_primary_root": {
                 "type": "path", "required": False, "optional_flag_pair": True,
+            },
+            # Issue #2689 P0-1 fix_delta: same parity requirement as above.
+            "mutation_category": {
+                "type": "mutation_category", "required": False, "optional_flag_pair": True,
+            },
+            "owner_user_id": {
+                "type": "positive_int", "required": False, "optional_flag_pair": True,
+            },
+            "preview_binding_file": {
+                "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
             },
         },
     },
@@ -302,6 +318,12 @@ REGISTRY = {
             "--human-context-comment-url", "{anchor_comment_url}",
             "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
             "--investigation-evidence-primary-root", "{investigation_evidence_primary_root}",
+            # Issue #2689 P0-1 fix_delta: kept in parity with the real
+            # `command_registry.py` entry (same atomic optional triple as
+            # `preflight.run.with_human_context` above).
+            "--mutation-category", "{mutation_category}",
+            "--owner-user-id", "{owner_user_id}",
+            "--preview-binding-file", "{preview_binding_file}",
             "--consume-contract-patch-plan",
         ],
         "shell": False, "cwd_policy": "repo_root", "execution_class": "exact_skill_runtime_contract_update_anchor",
@@ -323,6 +345,16 @@ REGISTRY = {
             },
             "investigation_evidence_primary_root": {
                 "type": "path", "required": False, "optional_flag_pair": True,
+            },
+            # Issue #2689 P0-1 fix_delta: same parity requirement as above.
+            "mutation_category": {
+                "type": "mutation_category", "required": False, "optional_flag_pair": True,
+            },
+            "owner_user_id": {
+                "type": "positive_int", "required": False, "optional_flag_pair": True,
+            },
+            "preview_binding_file": {
+                "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
             },
         },
     },
@@ -1393,6 +1425,157 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
     assert not (execution_root / "artifacts" / "1498" / "issue-metadata").exists() or len(
         list((execution_root / "artifacts" / "1498" / "issue-metadata").rglob("*.input.json"))
     ) == 1
+
+
+def test_mutation_gate_transport_triple_reaches_real_subprocess_and_heavy_mutation_gate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """PR #2697 fix_delta (Blocker 2, review comment on reviewed_head_sha
+    9ac3da6e): the NEW `--mutation-category`/`--owner-user-id`/
+    `--preview-binding-file` atomic triple this PR adds to
+    `command_registry.py`'s `preflight.run.with_human_context`/
+    `contract_update.run.with_human_context` entries (and to
+    `skill_runtime_command_policy.py`'s exact-grammar parser) is actually
+    accepted by a REAL `skill_runtime_exec.py` subprocess -- reusing
+    `_install_real_contract_update_fixture()` (the SAME real registry/
+    policy/executor/`run_refinement_preflight.py` fixture the sibling
+    `contract_update.run.with_human_context` tests above already establish,
+    never a new bespoke harness) -- and reaches the real
+    `run_refinement_preflight.py`'s own `--mutation-category`/
+    `--owner-user-id`/`--preview-binding-file` argparse flags added by
+    Issue #2689, which materialize `known_context["mutation_category"]` and
+    reach the pre-existing #1891 heavy mutation gate
+    (`_classify_heavy_mutation_gate()` via
+    `_classify_heavy_mutation_gate_with_fresh_owner_reaction()`).
+
+    Deliberately uses the READ-ONLY `preflight.run.with_human_context`
+    command_id (its own `command_registry.py` argv template never carries
+    `--consume-contract-patch-plan`) rather than
+    `contract_update.run.with_human_context`, so this test exercises ONLY
+    the NEW transport plumbing this PR adds -- never the pre-existing
+    mutation-write path, which is unaffected either way. The `not_planned`
+    owner-reaction APPROVAL flow itself (the fresh `owner_reaction_
+    decision.py` subprocess `_classify_heavy_mutation_gate_with_fresh_
+    owner_reaction()` conditionally issues) is already covered, end to end,
+    by `test_owner_reaction_not_planned_gate_production_shaped.py::
+    test_selected_not_planned_reaches_gate_via_real_subprocess` -- a
+    DIFFERENT real-subprocess entrypoint (`run_refinement_preflight.py`
+    directly, never through `skill_runtime_exec.py`/`command_registry.py`/
+    `skill_runtime_command_policy.py`, which is what THIS test targets).
+    This test's own `mutation_category="close"` deliberately never approves
+    (only `not_planned` ever can, per `_classify_heavy_mutation_gate()`), so
+    no nested `owner_reaction_decision.py` subprocess is even attempted --
+    isolating the transport-assembly claim (a) from the owner-reaction-
+    approval claim already covered elsewhere.
+    """
+    repo = _make_repo(tmp_path)
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    control_plane_remote_url = _install_real_contract_update_fixture(repo, trusted_gh_bin)
+    execution_root = _materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir()
+    gh_config_dir = tmp_path / "test-owned-gh-config"
+    gh_config_dir.mkdir()
+    config_only_env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": str(gh_config_dir),
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+    }
+    # Reuses the SAME known-good anchor + pre-body pair (from the fixture
+    # `test_contract_update_phase_reaches_fake_transaction_and_fresh_
+    # handoff` above already exercises through the far LONGER
+    # `contract_update.run.with_human_context` mutation path) so this
+    # simpler read-only dispatch is proven to reach past every earlier
+    # anchor-validation / scope-delta-evidence step this same preamble code
+    # performs, all the way to the #1891 heavy mutation gate (evaluated
+    # "before the planner is invoked at all" per its own inline comment).
+    immutable = json.loads(
+        (
+            REPO_ROOT
+            / ".claude/skills/issue-refinement-loop/tests/fixtures/issue_1835_trusted_anchor_iteration_zero.json"
+        ).read_text(encoding="utf-8")
+    )
+    pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    anchor = {
+        "id": 1,
+        "body": "## Revised AC\n- AC2: trusted fixture directive\n",
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
+
+    preview_binding_file = ".claude/artifacts/issue-refinement-loop/1498/owner_reaction_preview.json"
+    result = _run_executor(
+        repo,
+        command_id="preflight.run.with_human_context",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+        extra_env=config_only_env,
+        extra_args=[
+            "--mutation-category",
+            "close",
+            "--owner-user-id",
+            "42",
+            "--preview-binding-file",
+            preview_binding_file,
+        ],
+    )
+    # Never rejected at the outer executor's own argument-shape guard (the
+    # command_id-allowlist / all-or-none checks `skill_runtime_exec.py`'s
+    # `main()` performs BEFORE any child dispatch) -- this positively rules
+    # out the one returncode==2-shaped failure this test must distinguish
+    # from the real child's OWN #1891 heavy mutation gate ALSO exiting 2
+    # (blocked) for a legitimately-transported, never-approved `close`
+    # category.
+    assert "only allowed for" not in result.stderr, result.stderr
+    assert "must be supplied together or not at all" not in result.stderr, result.stderr
+
+    result_payload = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
+    # The real, unmodified `run_refinement_preflight.py` reached its own
+    # `--mutation-category`/`--owner-user-id`/`--preview-binding-file`
+    # argparse flags (Issue #2689 P0-1 fix_delta) ONLY if the outer real
+    # `skill_runtime_exec.py` subprocess actually reconstructed the exact
+    # command_text, validated it via `skill_runtime_command_policy.
+    # parse_exact_skill_runtime_anchor_command()`, and rendered it into the
+    # child argv via `command_registry.render_command()` -- proving the new
+    # triple's command_text reconstruction / render_params wiring this PR
+    # adds actually works end to end through a real subprocess dispatch,
+    # not merely via the direct (non-subprocess) unit-level
+    # `command_registry.render_command()` /
+    # `skill_runtime_command_policy.parse_exact_skill_runtime_anchor_
+    # command()` calls in `test_owner_reaction_not_planned_gate.py`.
+    assert "HEAVY_MUTATION_FAIL_CLOSED" in result_payload["blockers"], result_payload
+    # Never a mutation attempt: `preflight.run.with_human_context`'s own
+    # `command_registry.py` argv template never carries
+    # `--consume-contract-patch-plan`, so `contract_update` handoff is not
+    # even produced for this read-only command_id.
+    assert "contract_update" not in result_payload, result_payload
+    assert json.loads((artifact_dir / "fake_remote_issue.json").read_text())["body"] == pre_body
 
 
 # ---------------------------------------------------------------------------

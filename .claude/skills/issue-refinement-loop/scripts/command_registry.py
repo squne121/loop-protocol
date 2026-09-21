@@ -256,6 +256,17 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "--human-context-comment-url", "{anchor_comment_url}",
             "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
             "--investigation-evidence-primary-root", "{investigation_evidence_primary_root}",
+            # Issue #2689 P0-1 fix_delta (PR #2697 OWNER review comment
+            # #5755475318): the SAME optional atomic
+            # mutation_category/owner_user_id/preview_binding_file triple as
+            # `contract_update.run.with_human_context` below -- the ONLY
+            # production transport that carries these into
+            # `run_refinement_preflight.py`'s CLI, whose `main()` then feeds
+            # them into `known_context["mutation_category"]` /
+            # `known_context["owner_reaction_context"]`.
+            "--mutation-category", "{mutation_category}",
+            "--owner-user-id", "{owner_user_id}",
+            "--preview-binding-file", "{preview_binding_file}",
         ],
         "shell": False,
         "cwd_policy": "repo_root",
@@ -290,6 +301,25 @@ REGISTRY: dict[str, dict[str, Any]] = {
             # independently-suppliable placeholder.
             "investigation_evidence_primary_root": {
                 "type": "path", "required": False, "optional_flag_pair": True,
+            },
+            # Issue #2689 P0-1 fix_delta: an atomic optional triple -- a
+            # caller either supplies all three (to route
+            # `known_context["mutation_category"]` /
+            # `known_context["owner_reaction_context"]` into
+            # `run_refinement_preflight.py`) or none of them (byte-identical
+            # pre-#2689 argv). `render_command()` itself does not enforce
+            # the all-or-none coupling (that is enforced by
+            # `skill_runtime_exec.py`'s own guard and
+            # `skill_runtime_command_policy.py`'s exact parser, both of
+            # which are the only real callers of this entry).
+            "mutation_category": {
+                "type": "mutation_category", "required": False, "optional_flag_pair": True,
+            },
+            "owner_user_id": {
+                "type": "positive_int", "required": False, "optional_flag_pair": True,
+            },
+            "preview_binding_file": {
+                "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
             },
         },
     },
@@ -371,6 +401,12 @@ REGISTRY: dict[str, dict[str, Any]] = {
             "--human-context-comment-url", "{anchor_comment_url}",
             "--investigation-evidence-transport-path", "{investigation_evidence_transport_path}",
             "--investigation-evidence-primary-root", "{investigation_evidence_primary_root}",
+            # Issue #2689 P0-1 fix_delta: the SAME optional atomic
+            # mutation_category/owner_user_id/preview_binding_file triple as
+            # `preflight.run.with_human_context` above.
+            "--mutation-category", "{mutation_category}",
+            "--owner-user-id", "{owner_user_id}",
+            "--preview-binding-file", "{preview_binding_file}",
             "--consume-contract-patch-plan",
         ],
         "shell": False,
@@ -410,6 +446,18 @@ REGISTRY: dict[str, dict[str, Any]] = {
             # -- never a generic, independently-suppliable placeholder.
             "investigation_evidence_primary_root": {
                 "type": "path", "required": False, "optional_flag_pair": True,
+            },
+            # Issue #2689 P0-1 fix_delta: mirrors
+            # `preflight.run.with_human_context`'s SAME atomic optional
+            # triple.
+            "mutation_category": {
+                "type": "mutation_category", "required": False, "optional_flag_pair": True,
+            },
+            "owner_user_id": {
+                "type": "positive_int", "required": False, "optional_flag_pair": True,
+            },
+            "preview_binding_file": {
+                "type": "repo_relative_file", "required": False, "optional_flag_pair": True,
             },
         },
     },
@@ -1044,6 +1092,19 @@ REGISTRY: dict[str, dict[str, Any]] = {
 _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _HTTPS_URL_RE = re.compile(r"^https://")
 _VERDICT_VALUES: frozenset[str] = frozenset({"approve", "request_changes", "needs-fix"})
+# Issue #2689 P0-1 fix_delta: mirrors `run_refinement_preflight.py`'s own
+# `HEAVY_MUTATION_CATEGORIES` literal set (independently declared here, same
+# established pattern as `_VERDICT_VALUES` above -- no cross-module import,
+# no shared generic enum framework).
+_MUTATION_CATEGORY_VALUES: frozenset[str] = frozenset(
+    {
+        "close",
+        "not_planned",
+        "replacement_issue_creation",
+        "dependency_removal",
+        "parent_child_change",
+    }
+)
 
 # Issue #1498: canonical GitHub issue comment URL shape.
 #   https://github.com/{owner}/{repo}/issues/{digits}#issuecomment-{digits}
@@ -1169,6 +1230,16 @@ def _validate_placeholder_value(name: str, value: Any, spec: dict) -> None:
         if not isinstance(value, str) or value not in _VERDICT_VALUES:
             raise ValueError(
                 f"Placeholder '{name}': must be one of {sorted(_VERDICT_VALUES)}, got {value!r}"
+            )
+
+    elif ph_type == "mutation_category":
+        # Issue #2689 P0-1 fix_delta: mirrors the `verdict` enum-literal
+        # pattern above -- the same 5 literal heavy mutation categories
+        # `run_refinement_preflight.py`'s `HEAVY_MUTATION_CATEGORIES`
+        # declares, never a caller-suppliable arbitrary string.
+        if not isinstance(value, str) or value not in _MUTATION_CATEGORY_VALUES:
+            raise ValueError(
+                f"Placeholder '{name}': must be one of {sorted(_MUTATION_CATEGORY_VALUES)}, got {value!r}"
             )
 
     elif ph_type == "string":
@@ -1310,6 +1381,7 @@ _KNOWN_PLACEHOLDER_TYPES: frozenset[str] = frozenset({
     "url",
     "github_issue_comment_url",
     "verdict",
+    "mutation_category",
     "string",
     "bool_flag",
 })
