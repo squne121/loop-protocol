@@ -3749,17 +3749,18 @@ def _graphql_call(gh_bin: str, env: dict[str, str], query: str, variables: dict)
         try:
             parsed = json.loads(out.stdout)
         except Exception as exc:
-            return None, f"gh_api_graphql_response_parse_error: {exc}"
+            return None, f"gh_api_graphql_response_parse_error: {_redact_secret_like_tokens(str(exc))}"
         if not isinstance(parsed, dict):
             return None, "gh_api_graphql_response_not_object"
         if parsed.get("errors"):
-            return None, f"gh_api_graphql_errors: {json.dumps(parsed['errors'])[:300]}"
+            safe_errors = _redact_secret_like_tokens(json.dumps(parsed["errors"]))[:300]
+            return None, f"gh_api_graphql_errors: {safe_errors}"
         data = parsed.get("data")
         if not isinstance(data, dict):
             return None, "gh_api_graphql_response_missing_data"
         return data, ""
     except Exception as exc:
-        return None, f"gh_api_graphql_exception: {exc}"
+        return None, f"gh_api_graphql_exception: {_redact_secret_like_tokens(str(exc))}"
 
 
 def _fetch_issue_dependency_remove_actor(
