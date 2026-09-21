@@ -63,6 +63,7 @@ if str(_THIS_DIR) not in sys.path:
 
 import classifier  # noqa: E402
 import ctl_client  # noqa: E402
+import pre_tool_use_classifier  # noqa: E402
 
 # Issue #2564 In Scope: "UserPromptSubmit Task Context adapter の timeout は
 # 既定 30 秒を使わず最大 1 秒の bounded hot-path budget とし、既存 SQLite
@@ -75,7 +76,17 @@ _GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]+([\w.-]+/[\w.-]+?)(?:\.git)?/?$
 
 _PROJECTION_FLUSH_PATH = _THIS_DIR / "projection_flush_entry.py"
 
-_VALID_DECISIONS = ("pass", "block")
+# "ask" (Issue #2566) is additive to the pre-existing "pass"/"block"
+# vocabulary -- see the PreToolUse branch in `main()` below for how each
+# value maps onto the actual Claude Code PreToolUse hook JSON output
+# contract (`hookSpecificOutput.permissionDecision`).
+_VALID_DECISIONS = ("pass", "block", "ask")
+
+# Issue #2566: tool_name values this adapter's PreToolUse dispatch actually
+# classifies. Every other tool_name reaching PreToolUse (only possible if a
+# future settings.json matcher broadens beyond "SendMessage"/"Bash") is
+# left fully unclassified -- observability-only, never blocked/asked here.
+_PRE_TOOL_USE_MESSAGING_TOOL_NAMES = ("SendMessage", "notify_when_idle")
 
 
 def _read_stdin_json() -> dict:
@@ -285,6 +296,82 @@ def _apply_cwd_changed_fields(payload: dict, hook_input: dict) -> None:
     payload["branch"] = branch
 
 
+def _apply_pre_tool_use_fields(payload: dict, hook_input: dict) -> None:
+    """Issue #2566: reduce the raw Claude Code `tool_name`/`tool_input` down
+    to the small structured fields the SendMessage/Herdr guard needs.
+    Never forwards a peer message body (`tool_input.message`), terminal
+    output, or the full raw Bash command line onward -- only a bounded `to`
+    string / `notify_when_idle` flag, or (for a recognized guarded `herdr`
+    subcommand only) its category/operation/target-locator/machine-scoped
+    fields (AC7)."""
+    tool_name = hook_input.get("tool_name")
+    payload["tool_name"] = tool_name
+    tool_input = hook_input.get("tool_input")
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+
+    if tool_name in _PRE_TOOL_USE_MESSAGING_TOOL_NAMES:
+        to = tool_input.get("to")
+        payload["to"] = to if isinstance(to, str) else None
+        if tool_input.get("notify_when_idle"):
+            payload["notify_when_idle"] = True
+        return
+
+    if tool_name == "Bash":
+        command = tool_input.get("command")
+        if not isinstance(command, str):
+            return
+        # Argument-aware best-effort early exit (Issue #2566 Outcome): the
+        # overwhelming majority of Bash calls are not `herdr` invocations at
+        # all, so `main()` never even reaches `ctl_client.call_hook` (no
+        # `task-contextctl` subprocess spawn) for them -- see the
+        # `PreToolUse` branch in `main()` below.
+        if not pre_tool_use_classifier.looks_like_herdr_command(command):
+            return
+        parsed = pre_tool_use_classifier.parse_herdr_command(command)
+        if parsed is None:
+            # Recognized as a `herdr` invocation but not one of the finite
+            # guarded subcommands (Issue #2566 In Scope) -- out of guard
+            # scope, no decision.
+            return
+        payload["herdr_category"] = parsed.category
+        payload["herdr_operation"] = parsed.operation
+        payload["herdr_target_locator"] = parsed.target_locator
+        payload["herdr_machine_scoped"] = parsed.machine_scoped
+
+
+def _pre_tool_use_guard_applicable(payload: dict) -> bool:
+    """True iff `_apply_pre_tool_use_fields` found something this guard
+    actually needs to classify -- i.e. it is safe/correct to skip calling
+    `task-contextctl` entirely otherwise (hot-path cost control, Issue
+    #2566 Outcome: "無関係な Bash 呼び出しでは guard プロセスを spawn
+    しない")."""
+    return "to" in payload or "herdr_category" in payload
+
+
+def _pre_tool_use_hook_specific_output(
+    decision: str, reason_code: str | None, target_kind_value: str | None
+) -> dict | None:
+    """Translate the Task Context guard's own `decision` into the actual
+    Claude Code `PreToolUse` hook JSON output contract
+    (`hookSpecificOutput.permissionDecision`: "allow" | "deny" | "ask").
+    `decision == "pass"` returns ``None`` (emit nothing -- let Claude Code's
+    normal permission resolution proceed untouched; this guard can only
+    ever *tighten*, never itself force an "allow" that would override some
+    other, unrelated hard deny -- e.g. worktree-agent-runtime-smoke's own
+    `permissions.deny` for `SendMessage`/`ListAgents`, Issue #2566 AC6)."""
+    if decision == "pass":
+        return None
+    permission_decision = "deny" if decision == "block" else "ask"
+    reason = f"task-context: {reason_code or target_kind_value or 'guarded_target'}"
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": permission_decision,
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
 def _render_additional_context(projection_data: dict) -> str | None:
     task = projection_data.get("task")
     if not task:
@@ -341,6 +428,18 @@ def main(argv: list[str]) -> int:
         timeout = _apply_user_prompt_expansion_fields(payload, hook_input, HOT_PATH_TIMEOUT_SECONDS)
     elif event == "CwdChanged":
         _apply_cwd_changed_fields(payload, hook_input)
+    elif event == "PreToolUse":
+        # Issue #2566: same bounded hot-path budget as UserPromptSubmit --
+        # this guard must never meaningfully slow down an ordinary tool
+        # call.
+        timeout = HOT_PATH_TIMEOUT_SECONDS
+        _apply_pre_tool_use_fields(payload, hook_input)
+        if not _pre_tool_use_guard_applicable(payload):
+            # Argument-aware early exit: not a SendMessage/notify_when_idle
+            # call and not a recognized guarded `herdr` Bash subcommand --
+            # skip `ctl_client.call_hook` (no `task-contextctl` subprocess
+            # spawn) entirely and let the tool call proceed untouched.
+            return 0
     elif event in ("SubagentStart", "SubagentStop"):
         # fix_delta 5: Claude Code's SubagentStart/SubagentStop hook input
         # carries an `agent_id` UUID identifying the SubAgent *instance* --
@@ -431,6 +530,17 @@ def main(argv: list[str]) -> int:
                     file=sys.stderr,
                 )
                 return 2
+        return 0
+
+    if event == "PreToolUse":
+        # Issue #2566: `data.decision` here is only ever "pass"/"ask"
+        # (`task_context_hook_flows.on_pre_tool_use` never returns "block"
+        # for this Issue's guarded surfaces -- see the module docstring);
+        # `envelope_ok` already fails open to "pass" on any adapter/service
+        # transport failure, consistent with every other event.
+        output = _pre_tool_use_hook_specific_output(decision, data.get("reason_code"), data.get("target_kind"))
+        if output is not None:
+            print(json.dumps(output))
         return 0
 
     if event == "SessionStart" and decision == "pass":
