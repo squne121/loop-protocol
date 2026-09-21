@@ -56,6 +56,8 @@ def _common_monkeypatches(monkeypatch: pytest.MonkeyPatch, linked_issue: int = 1
     monkeypatch.setattr(open_pr, "resolve_branch", lambda: f"worktree-issue-{linked_issue}-test")
     monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
     monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+    monkeypatch.setattr(open_pr, "get_linked_issue_body", lambda repo, issue: "## Allowed Paths\n- example\n")
+    monkeypatch.setattr(open_pr, "resolve_head_sha", lambda: "a" * 40)
     monkeypatch.setattr(
         open_pr,
         "_run_pr_body_validator",
