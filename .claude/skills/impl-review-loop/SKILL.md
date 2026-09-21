@@ -150,6 +150,24 @@ LOOP_STATE:
 
 > **重要**: `verdict: APPROVE` 単独では終了しない。live mergeability が `CLEAN`/`HAS_HOOKS` かつ `blockers == []` の両条件が必要（`route_loop_verdict_v2()` が判定する）。
 
+## Evidence-Based Landing Disposition（実装済み scope の pre-Step-1 duplicate-dispatch 判定、Issue #2699）
+
+`preparation.md` の「0-a-0. Evidence-Based Landing Disposition」は、worker dispatch・worktree 作成・new PR 作成のいずれよりも前に一度だけ評価する pre-Step-1 choke point であり、`implementation_landed_evidence.py` の strict producer（`collect_candidate_inputs()` → `resolve_landing_disposition_with_freshness_rebind()` → `derive_landing_disposition()`）が返す disposition を、呼び出し元が自己解釈せずそのまま消費する。
+
+| disposition | data-plane action |
+|---|---|
+| `implementation_already_landed` | worker / worktree / new PR を開始せず、no-op disposition を記録する |
+| `existing_pr_resume` | linked open/draft PR を resume し、duplicate PR を作成しない |
+| `already_satisfied` | 下記「Disposition Precedence」の合成結果。`already_satisfied` route（既存 #2607、`already_satisfied_decision` を含む）と同じ扱いで、worker / worktree / new PR を開始せず recommendation を構造化して報告する（上記「Already-Satisfied Recommendation Structure」参照） |
+| `ordinary_dispatch_or_explicit_recovery` | 通常の Step 1 へ進む |
+| `reconciliation_required` | worker / worktree / new PR を開始せず、fresh evidence の reconciliation を要求する |
+
+`contradictory`（materialization failure を含む）、insufficient、stale、identity mismatch、malformed durable marker は lifecycle（open/draft/merged）に関わらず常に最優先で `reconciliation_required` にする。`implementation_already_landed` は、merged candidate、verified main ancestry、durable marker による exact current-scope coverage がすべて成立したときに限り、`IMPLEMENTATION_SCOPE_COVERAGE_V1` marker を持たない legacy merged candidate（例: #2119 に対する #2137）は現在の body から merge-time scope を推測せず `implementation_already_landed` を導出しない。open / draft candidate は、marker 付きなら exact coverage、markerless なら現在の `## Allowed Paths` 全エントリのカバレッジ検証の両方が揃った場合に限り `existing_pr_resume` となる。
+
+**Disposition Precedence（新しい enum を追加しない #2607 との合成）**: `derive_landing_disposition()` が landing authority を確立できなかった場合（`ordinary_dispatch_or_explicit_recovery` かつ `reason_codes` に `no_qualified_candidate` または `closed_unmerged_candidate` を含む）に限り、`implementation_landed_evidence.py::apply_already_satisfied_precedence()` が既存 `route_loop_verdict_v2.py::resolve_already_satisfied_early_exit_decision()` をそのまま呼び出して再評価し、`early_exit: true` なら結果を `already_satisfied` に差し替える。`reconciliation_required` / `implementation_already_landed` / `existing_pr_resume`、および他の理由による `ordinary_dispatch_or_explicit_recovery` はこの合成の対象外であり無条件で優先される（新しい判定ロジックの再実装ではなく、既存関数の再利用）。
+
+**AC9 Freshness / Decision-Time Rebind**: `resolve_landing_disposition_with_freshness_rebind()` は、disposition 確定直前に issue body sha256 / candidate head-or-merge-oid / current main sha を live 再取得し、collection 開始時の値と不一致なら bounded に 1 回だけ discovery + evaluation をやり直す。再試行後も不一致なら `reconciliation_required`（`reason_codes: ["freshness_rebind_failed"]`）にする。単純な `observed_at` TTL のみを authority にしない。
+
 ## Already-Satisfied Recommendation Structure（要求が既に充足済みの場合の推奨構造。`already_satisfied` の recommendation 構造、Issue #2607 AC8）
 
 `already_satisfied` は 2 つの経路（`preparation.md` の early-exit、`route_loop_verdict_v2()` の Step 5 recovery route）のいずれから到達しても、以下と同じ `result` / `recommendation` 構造で報告する。`route_loop_verdict_v2()` 側は `RouteDecision.selected_action` の `result` / `recommendation` キーとしてこの構造をそのまま返す（新規 top-level schema は新設しない）。

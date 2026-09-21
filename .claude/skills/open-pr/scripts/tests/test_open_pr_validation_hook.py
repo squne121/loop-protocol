@@ -315,6 +315,8 @@ def test_existing_refs_for_open_issue_are_preserved_and_run_preflights(
         monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-link-kind")
         monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
         monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+        monkeypatch.setattr(open_pr, "get_linked_issue_body", lambda repo, issue: "## Allowed Paths\n- example\n")
+        monkeypatch.setattr(open_pr, "resolve_head_sha", lambda: "a" * 40)
 
         def fake_validator(body, changed_paths, linked_issue):
             observed["body"] = body
@@ -1050,6 +1052,8 @@ def test_ac8_japanese_pass_allows_gh_pr_create(monkeypatch: pytest.MonkeyPatch):
         # 解決が成功していたが、CI サンドボックス環境では None を返し
         # EXIT_BLOCKED になっていた。決定論的に pass させるためモックする。
         monkeypatch.setattr(open_pr, "resolve_canonical_repository", lambda repo: repo)
+        monkeypatch.setattr(open_pr, "get_linked_issue_body", lambda repo, issue: "## Allowed Paths\n- example\n")
+        monkeypatch.setattr(open_pr, "resolve_head_sha", lambda: "a" * 40)
         monkeypatch.setattr(
             open_pr,
             "_run_pr_body_validator",
