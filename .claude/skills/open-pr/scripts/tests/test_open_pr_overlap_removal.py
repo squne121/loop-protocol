@@ -104,6 +104,8 @@ def test_phase_implementation_label_does_not_trigger_overlap_gate(monkeypatch: p
         )
         monkeypatch.setattr(open_pr, "find_existing_pr", lambda repo, branch: None)
         monkeypatch.setattr(open_pr, "resolve_canonical_repository", lambda repo: repo)
+        monkeypatch.setattr(open_pr, "get_linked_issue_body", lambda repo, issue: "## Allowed Paths\n- example\n")
+        monkeypatch.setattr(open_pr, "resolve_head_sha", lambda: "a" * 40)
         monkeypatch.setattr(open_pr, "create_pr", fake_create_pr)
 
         # open_pr module no longer defines a label-forcing gate at all; there
