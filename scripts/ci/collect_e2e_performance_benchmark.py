@@ -2527,6 +2527,574 @@ def main_run_experiment(argv: list[str] | None = None) -> int:
     return EXIT_COMPLETE
 
 
+# =============================================================================
+# Issue #2672: `materialize-cohort-fixture` subcommand -- a small offline
+# transformer (no new framework) that assembles a
+# `tests/ci/test_ci_performance_gate.py`-consumable `cohort_fixture.json`
+# from (1) an already-collected `e2e_performance_benchmark_manifest_v2`
+# manifest, (2) a directory of real `ci_runtime_baseline_v1` artifact JSON
+# payloads (both the `e2e-core`/`e2e-responsive-matrix` provider flavor and
+# the `e2e` gate-ready-latency flavor -- see
+# `scripts/ci/ci_job_snapshot.py::compute_gate_ready_latency_artifact` and
+# `.github/workflows/ci.yml`'s "Collect ci_runtime_baseline_v1 artifact"
+# step), and (3) a small `--assessment-context` JSON carrying the
+# non-baseline metadata (`issue_number` / `pr_number` / `measured_at` /
+# `functional_evidence` / `declared_impact` / `risk_acknowledgement` /
+# `cohort_provenance`) that appears in neither the manifest nor any raw
+# artifact payload. This module performs NO network calls and reuses this
+# file's own existing `validate_manifest_v2_semantics()` /
+# `REQUIRED_PROVIDER_JOBS_BY_LAYOUT` (manifest v2 semantics) rather than
+# reinventing manifest validation, and never duplicates
+# `tests/ci/test_ci_performance_gate.py`'s eligibility/pairing/phase-
+# completeness/percentile/sample-floor logic (that module is a read-only
+# consumer of this subcommand's output, never imported here).
+# =============================================================================
+
+# #2672 AC7: the ONLY four conditions under which `materialize-cohort-
+# fixture` itself exits non-zero -- every other evidence gap (single-lineage
+# missing baseline, split-peer missing, monolith required-phase missing,
+# etc; #2672 AC8) is passed through to the fixture unchanged and is NEVER
+# fatal here (that classification is `tests/ci/test_ci_performance_gate.py`'s
+# job, via its own `evidence_errors`/`gate_status` machinery).
+MATERIALIZATION_FATAL_UNREPRESENTABLE = "manifest_run_unrepresentable_by_any_evidence"
+MATERIALIZATION_FATAL_IDENTITY_CONFLICT = "artifact_identity_conflict_cannot_bind_uniquely"
+MATERIALIZATION_FATAL_MANIFEST_INVALID = "manifest_invalid"
+MATERIALIZATION_FATAL_EVIDENCE_ERRORS_UNREPRESENTABLE = "manifest_evidence_errors_not_losslessly_representable"
+
+# Exit code for the four #2672 AC7 fatal-boundary conditions above --
+# distinct in NAME (never in behavior/collision) from the pre-existing
+# `EXIT_INCOMPLETE` used by the unrelated v1 `main()` collector; both
+# happen to be 2 because this module's existing exit-code palette for a
+# "written manifest/fixture, but caller must fail-closed" outcome is {2},
+# with {0, 3} reserved for success/operational-failure respectively.
+EXIT_MATERIALIZATION_FATAL_BOUNDARY = 2
+
+REQUIRED_ASSESSMENT_CONTEXT_FIELDS = (
+    "issue_number",
+    "pr_number",
+    "measured_at",
+    "functional_evidence",
+    "declared_impact",
+    "risk_acknowledgement",
+    "cohort_provenance",
+)
+
+# #2672 Producer -> Consumer field adapter contract: `benchmark_layout`
+# ("monolith"/"split") maps onto the existing `before`==monolith /
+# `after`==split stand-in convention `tests/ci/test_ci_performance_gate.py`
+# already uses (Issue #2422's own `topology` tag mirrors this exact
+# mapping) -- never re-derived/guessed from baseline content.
+BENCHMARK_LAYOUT_TO_ARM = {"monolith": "before", "split": "after"}
+
+# #2672 Manifest ↔ Artifact Binding Matrix / core-responsive baseline
+# adapter: every one of these field NAMES already matches VERBATIM between
+# the real producer artifact (`.github/workflows/ci.yml`'s "Collect
+# ci_runtime_baseline_v1 artifact" step for `e2e-core`/`e2e-responsive-
+# matrix`) and the shape `tests/ci/test_ci_performance_gate.py`'s
+# `WITHIN_COHORT_REQUIRED_EQUAL` / `INTENTIONAL_TREATMENT_DIFFERENCE`
+# fingerprint tuples + `measurements` expect -- this is a field SELECTION,
+# never a rename (unlike the gate-ready adapter below, #2672 AC3).
+PROVIDER_BASELINE_PASSTHROUGH_FIELDS = (
+    "job",
+    "measurements",
+    "host_runner_image",
+    "playwright_container_image_digest",
+    "node_version",
+    "pnpm_version",
+    "playwright_version",
+    "lockfile_hash",
+    "workflow_digest",
+    "cohort_role",
+)
+
+
+class MaterializationFatalError(OperationalErrorV2):
+    """#2672 AC7: raised for exactly one of the four fatal-boundary
+    conditions -- `reason` is always one of the four
+    `MATERIALIZATION_FATAL_*` constants above, never a free-form string,
+    so a caller/test can assert on the SPECIFIC condition triggered."""
+
+    def __init__(self, reason: str, detail: str):
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"{reason}: {detail}")
+
+
+def _normalize_provider_run_attempt(value: object) -> int | None:
+    """Accepts either a schema-`integer` `run_attempt` (manifest v2's own
+    `Run.run_attempt` shape) or the producer-shaped numeric STRING
+    `run_attempt` real `ci_runtime_baseline_v1` artifacts actually carry
+    (`os.environ["GH_RUN_ATTEMPT"]`, a GitHub Actions env var, is always a
+    string) -- both must compare equal under normalization. Never accepts
+    a bool, a non-digit string, or a value < 1 (fail-closed exclusion, not
+    a guess)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, str) and value.isdigit():
+        parsed = int(value)
+        return parsed if parsed >= 1 else None
+    return None
+
+
+def _classify_artifact_dir_payload(payload: Any) -> str | None:
+    """#2672 AC16: classifies a JSON payload already loaded from
+    `--artifact-dir` by its OWN content (`schema` + `job` fields) --
+    never by filename. Returns `"provider"` (an `e2e-core`/
+    `e2e-responsive-matrix` measured-workload baseline), `"gate_ready"`
+    (the `e2e` aggregate gate-ready-latency baseline), or `None` (not a
+    `ci_runtime_baseline_v1` payload this subcommand understands -- e.g.
+    a `typecheck`/`lint` job's baseline, or an unrelated file the
+    directory happens to also contain)."""
+    if not isinstance(payload, dict) or payload.get("schema") != "ci_runtime_baseline_v1":
+        return None
+    job = payload.get("job")
+    if job in MEASURED_PROVIDER_JOBS:
+        return "provider"
+    if job == GATE_READY_JOB_NAME:
+        return "gate_ready"
+    return None
+
+
+def _provider_identity_key(payload: dict) -> tuple | None:
+    workflow_run_id = payload.get("workflow_run_id")
+    run_attempt = _normalize_provider_run_attempt(payload.get("run_attempt"))
+    job = payload.get("job")
+    if not isinstance(workflow_run_id, int) or isinstance(workflow_run_id, bool):
+        return None
+    if run_attempt is None or not isinstance(job, str):
+        return None
+    return (job, workflow_run_id, run_attempt)
+
+
+def _gate_ready_identity_key(payload: dict) -> tuple | None:
+    """Gate-ready artifacts carry the producer's `run_id` (a STRING,
+    #2672 AC3 rename source), never `workflow_run_id` -- this derives the
+    same normalized-int identity `_provider_identity_key` uses for
+    provider artifacts, WITHOUT yet performing the rename (the rename
+    itself happens in `_build_gate_ready_record`, kept as a separate,
+    single-purpose step per the Producer -> Consumer Field Adapter
+    contract)."""
+    raw_run_id = payload.get("run_id")
+    workflow_run_id: int | None = None
+    if isinstance(raw_run_id, int) and not isinstance(raw_run_id, bool):
+        workflow_run_id = raw_run_id
+    elif isinstance(raw_run_id, str) and raw_run_id.isdigit():
+        workflow_run_id = int(raw_run_id)
+    run_attempt = _normalize_provider_run_attempt(payload.get("run_attempt"))
+    if workflow_run_id is None or run_attempt is None:
+        return None
+    return (workflow_run_id, run_attempt)
+
+
+def _dedupe_artifacts_by_identity(keyed: dict[tuple, list[dict]]) -> tuple[dict[tuple, dict], list[tuple]]:
+    """#2672 Root/Run/Attempt/Duplicate 完全性契約: an identity group whose
+    members are ALL byte-for-byte identical (`json.dumps(sort_keys=True)`)
+    is an idempotent, harmless duplicate -- e.g. the SAME artifact
+    downloaded into two different `--artifact-dir` subdirectories (#2672
+    AC16) -- and resolves to a single deterministic (canonical-JSON
+    `min()`) representative. A group whose members DISAGREE on even one
+    field is a genuine conflicting duplicate, returned in the second
+    tuple element's key list -- the caller treats this as fatal-boundary
+    condition 2 (#2672 AC7), NEVER a silent `min()`/first-wins/last-wins
+    tie-break."""
+    resolved: dict[tuple, dict] = {}
+    conflicts: list[tuple] = []
+    for key, group in keyed.items():
+        normalized = {json.dumps(item, sort_keys=True, default=str) for item in group}
+        if len(normalized) > 1:
+            conflicts.append(key)
+            continue
+        resolved[key] = min(group, key=lambda item: json.dumps(item, sort_keys=True, default=str))
+    return resolved, conflicts
+
+
+def _build_gate_ready_record(payload: dict, workflow_run_id: int, run_attempt: int) -> dict:
+    """#2672 AC3/AC4: the explicit Producer -> Consumer field rename
+    adapter -- producer `run_id`/`gate_ready_at` become fixture
+    `workflow_run_id`/`check_completed_at` (values propagated verbatim,
+    NEVER recomputed); `run_attempt`/`run_started_at` keep their meaning
+    and value unchanged. A producer artifact missing `gate_ready_at`
+    (the diagnostic-only omission `scripts/ci/ci_job_snapshot.py::
+    compute_gate_ready_latency_artifact` records instead, e.g.
+    `job_not_completed`) leaves `check_completed_at` OUT of the fixture
+    record entirely -- no fabricated timestamp is ever synthesized; the
+    existing consumer's invalid-timestamp taxonomy classifies the gap."""
+    record: dict = {
+        "workflow_run_id": workflow_run_id,
+        "run_attempt": run_attempt,
+    }
+    run_started_at = payload.get("run_started_at")
+    if isinstance(run_started_at, str) and run_started_at:
+        record["run_started_at"] = run_started_at
+    gate_ready_at = payload.get("gate_ready_at")
+    if isinstance(gate_ready_at, str) and gate_ready_at:
+        record["check_completed_at"] = gate_ready_at
+    return record
+
+
+def _build_provider_baseline_record(payload: dict, workflow_run_id: int, run_attempt: int) -> dict:
+    """#2672 AC2/AC12: builds one `core_baselines`/`responsive_baselines`
+    entry via field SELECTION only (`PROVIDER_BASELINE_PASSTHROUGH_
+    FIELDS`) -- `workflow_digest` here is the baseline's OWN post-checkout
+    local sha256sum (the real producer's `WORKFLOW_DIGEST_RAW`), copied
+    verbatim; this function never reads the manifest's Contents-API
+    commit-bytes `workflow_digest` at all, so the two same-named-but-
+    different-provenance values can never be cross-overwritten by
+    construction (#2672 AC12)."""
+    record: dict = {
+        "workflow_run_id": workflow_run_id,
+        "run_attempt": run_attempt,
+    }
+    for field in PROVIDER_BASELINE_PASSTHROUGH_FIELDS:
+        if field in payload:
+            record[field] = payload[field]
+    return record
+
+
+def materialize_cohort_fixture(manifest: dict, artifacts: list[dict], assessment_context: dict) -> dict:
+    """#2672: the pure, hermetic core of `materialize-cohort-fixture` --
+    never touches the filesystem itself (mirrors this module's existing
+    `collect_benchmark_manifest`/`build_manifest_v2` pure-function-plus-
+    thin-CLI-wrapper split), so it is directly unit-testable. Raises
+    `MaterializationFatalError` for exactly the four #2672 AC7 fatal
+    conditions; every other evidence gap is passed through into the
+    returned fixture unchanged (#2672 AC8) for
+    `tests/ci/test_ci_performance_gate.py::run_evidence_gate()` to
+    classify."""
+    try:
+        _validate_against_schema_v2(manifest)
+    except OperationalErrorV2 as exc:
+        raise MaterializationFatalError(MATERIALIZATION_FATAL_MANIFEST_INVALID, str(exc)) from exc
+
+    semantic_violations = validate_manifest_v2_semantics(manifest)
+    if semantic_violations:
+        raise MaterializationFatalError(
+            MATERIALIZATION_FATAL_MANIFEST_INVALID,
+            f"semantic_violations={semantic_violations!r}",
+        )
+
+    # #2672 AC7 condition 4 / AC21: `cohort_fixture.json`'s documented
+    # shape has NO existing field that losslessly preserves an arbitrary
+    # manifest-level `evidence_errors` entry -- per the Manifest ↔
+    # Artifact Binding Matrix contract, that absence itself is what makes
+    # a non-empty `evidence_errors` list a materialization failure, never
+    # a silent drop.
+    manifest_evidence_errors = manifest.get("evidence_errors") or []
+    if manifest_evidence_errors:
+        raise MaterializationFatalError(
+            MATERIALIZATION_FATAL_EVIDENCE_ERRORS_UNREPRESENTABLE,
+            f"evidence_errors={manifest_evidence_errors!r}",
+        )
+
+    for field in REQUIRED_ASSESSMENT_CONTEXT_FIELDS:
+        if field not in assessment_context:
+            raise OperationalErrorV2(f"assessment_context_missing_field: {field}")
+
+    experiment_identity = manifest["experiment_identity"]
+    frozen_source_sha = manifest["frozen_source_sha"]
+
+    # #2672 AC16: only the (job, workflow_run_id, run_attempt) /
+    # (workflow_run_id, run_attempt) identities the MANIFEST actually
+    # references are ever dedupe/conflict-checked -- an unrelated
+    # bystander `ci_runtime_baseline_v1` payload elsewhere in
+    # `--artifact-dir` (e.g. a normal push/PR run's baseline, never part
+    # of this benchmark experiment) can never trigger a false
+    # identity-conflict fatal error.
+    needed_provider_keys: set[tuple] = set()
+    needed_gate_ready_keys: set[tuple] = set()
+    run_index: list[tuple] = []
+    for block in manifest.get("blocks", []):
+        block_id = block.get("block_id")
+        for run in block.get("runs", []):
+            layout = run.get("benchmark_layout")
+            arm_name = BENCHMARK_LAYOUT_TO_ARM.get(layout)
+            if arm_name is None:
+                continue
+            workflow_run_id = run.get("workflow_run_id")
+            run_attempt = run.get("run_attempt")
+            workflow_sha = run.get("workflow_sha")
+            run_index.append((block_id, layout, arm_name, workflow_run_id, run_attempt, workflow_sha))
+            for job in REQUIRED_PROVIDER_JOBS_BY_LAYOUT.get(layout, frozenset()):
+                needed_provider_keys.add((job, workflow_run_id, run_attempt))
+            needed_gate_ready_keys.add((workflow_run_id, run_attempt))
+
+    provider_by_key: dict[tuple, list[dict]] = {}
+    gate_ready_by_key: dict[tuple, list[dict]] = {}
+    for payload in artifacts:
+        kind = _classify_artifact_dir_payload(payload)
+        if kind == "provider":
+            key = _provider_identity_key(payload)
+            if key is not None and key in needed_provider_keys:
+                provider_by_key.setdefault(key, []).append(payload)
+        elif kind == "gate_ready":
+            key = _gate_ready_identity_key(payload)
+            if key is not None and key in needed_gate_ready_keys:
+                gate_ready_by_key.setdefault(key, []).append(payload)
+
+    provider_resolved, provider_conflicts = _dedupe_artifacts_by_identity(provider_by_key)
+    gate_ready_resolved, gate_ready_conflicts = _dedupe_artifacts_by_identity(gate_ready_by_key)
+    if provider_conflicts or gate_ready_conflicts:
+        raise MaterializationFatalError(
+            MATERIALIZATION_FATAL_IDENTITY_CONFLICT,
+            f"provider_conflicts={sorted(provider_conflicts, key=str)!r} "
+            f"gate_ready_conflicts={sorted(gate_ready_conflicts, key=str)!r}",
+        )
+
+    arms: dict[str, dict] = {
+        "before": {
+            "commit_sha": frozen_source_sha,
+            "core_baselines": [],
+            "responsive_baselines": [],
+            "gate_ready_baselines": [],
+        },
+        "after": {
+            "commit_sha": frozen_source_sha,
+            "core_baselines": [],
+            "responsive_baselines": [],
+            "gate_ready_baselines": [],
+        },
+    }
+
+    unrepresentable_runs: list[str] = []
+    for block_id, layout, arm_name, workflow_run_id, run_attempt, workflow_sha in run_index:
+        run_has_any_evidence = False
+
+        # #2672 AC13: monolith topology only ever iterates `e2e-core`
+        # (REQUIRED_PROVIDER_JOBS_BY_LAYOUT["monolith"] == {"e2e-core"}),
+        # so a `responsive_baselines` entry is structurally never
+        # appended for a monolith run -- no fictional record is possible.
+        for job in sorted(REQUIRED_PROVIDER_JOBS_BY_LAYOUT.get(layout, frozenset())):
+            candidate = provider_resolved.get((job, workflow_run_id, run_attempt))
+            if candidate is None:
+                continue
+            # #2672 Manifest ↔ Artifact Binding Matrix (AC11): a candidate
+            # sharing (job, workflow_run_id, run_attempt) whose OTHER
+            # declared binding fields disagree with this specific run's
+            # expected values is not usable AS THIS RUN's evidence -- it
+            # is excluded (treated as absent for this job/run, #2672 AC8),
+            # never force-bound and never itself independently fatal
+            # (fatal condition 2 is reserved for genuinely CONFLICTING
+            # candidates sharing one identity slot, detected above).
+            if (
+                candidate.get("block_id") != block_id
+                or candidate.get("benchmark_layout") != layout
+                or candidate.get("experiment_id") != experiment_identity
+                or candidate.get("workflow_sha") != workflow_sha
+                or candidate.get("measured_head_sha") != frozen_source_sha
+            ):
+                continue
+            run_has_any_evidence = True
+            record = _build_provider_baseline_record(candidate, workflow_run_id, run_attempt)
+            if job == "e2e-core":
+                arms[arm_name]["core_baselines"].append(record)
+            elif job == "e2e-responsive-matrix":
+                arms[arm_name]["responsive_baselines"].append(record)
+
+        gate_ready_candidate = gate_ready_resolved.get((workflow_run_id, run_attempt))
+        if gate_ready_candidate is not None:
+            run_has_any_evidence = True
+            arms[arm_name]["gate_ready_baselines"].append(
+                _build_gate_ready_record(gate_ready_candidate, workflow_run_id, run_attempt)
+            )
+
+        if not run_has_any_evidence:
+            unrepresentable_runs.append(f"block_id={block_id!r} workflow_run_id={workflow_run_id!r}")
+
+    if unrepresentable_runs:
+        raise MaterializationFatalError(
+            MATERIALIZATION_FATAL_UNREPRESENTABLE,
+            f"runs={sorted(unrepresentable_runs)!r}",
+        )
+
+    # #2672 AC14: stable LIST ordering (`sort_keys=True` at serialization
+    # time only reorders dict KEYS, never array element order) --
+    # independent of `--artifact-dir` file enumeration / glob order.
+    for arm in arms.values():
+        for baseline_key in ("core_baselines", "responsive_baselines", "gate_ready_baselines"):
+            arm[baseline_key].sort(key=lambda r: (r["workflow_run_id"], r["run_attempt"]))
+
+    return {
+        "issue_number": assessment_context["issue_number"],
+        "pr_number": assessment_context["pr_number"],
+        "measured_at": assessment_context["measured_at"],
+        "functional_evidence": assessment_context["functional_evidence"],
+        "declared_impact": assessment_context["declared_impact"],
+        "risk_acknowledgement": assessment_context["risk_acknowledgement"],
+        "cohort_provenance": assessment_context["cohort_provenance"],
+        "before": arms["before"],
+        "after": arms["after"],
+    }
+
+
+def _reject_non_finite_json_constant(constant: str) -> None:
+    raise OperationalErrorV2(f"non_standard_json_constant_rejected: {constant!r}")
+
+
+def _load_json_file_reject_nan_infinity(path: str) -> Any:
+    """#2672 AC14: dedicated loader for `materialize-cohort-fixture`
+    inputs ONLY -- Python's `json.load` silently accepts the non-standard
+    `NaN`/`Infinity`/`-Infinity` tokens by default; this rejects them via
+    `parse_constant` instead of silently coercing them into a real
+    `float('nan')`/`float('inf')` that could later leak into the output
+    fixture. The pre-existing shared `_load_json_file()` (used by every
+    OTHER subcommand, #2672 AC15/AC24) is intentionally left unchanged."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle, parse_constant=_reject_non_finite_json_constant)
+    except OSError as exc:
+        raise OperationalErrorV2(f"file_not_readable: {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise OperationalErrorV2(f"json_parse_error: {path}: {exc}") from exc
+
+
+def _iter_artifact_dir_json_files(artifact_dir: str) -> list[str]:
+    """#2672 AC16: recursive directory scan (never a flattened single
+    level), returned in a stable (path-sorted) order so this listing step
+    itself never introduces order-dependence ahead of the identity-keyed
+    dedup that follows."""
+    matches: list[str] = []
+    for root, _dirs, files in os.walk(artifact_dir):
+        for name in files:
+            if name.endswith(".json"):
+                matches.append(os.path.join(root, name))
+    return sorted(matches)
+
+
+def _load_ci_runtime_baseline_v1_artifacts(artifact_dir: str) -> list[dict]:
+    """#2672 AC16: loads every `schema == "ci_runtime_baseline_v1"` JSON
+    payload found recursively under `artifact_dir`, classifying by
+    PAYLOAD CONTENT only -- never by filename (duplicate
+    `ci_runtime_baseline_v1.json` filenames across subdirectories, e.g.
+    one per `actions/download-artifact` destination, are expected and
+    handled by the identity-keyed dedup in `materialize_cohort_fixture`,
+    never by a filename-based flatten). A file that fails to parse as
+    JSON, or parses but is not a `ci_runtime_baseline_v1` payload, is
+    silently skipped here -- it is simply not evidence this subcommand
+    understands (e.g. a `typecheck`/`lint` job's own baseline, or an
+    unrelated file `--artifact-dir` happens to also contain), never a
+    materialization error on its own."""
+    artifacts: list[dict] = []
+    for path in _iter_artifact_dir_json_files(artifact_dir):
+        try:
+            data = _load_json_file_reject_nan_infinity(path)
+        except OperationalErrorV2:
+            continue
+        if isinstance(data, dict) and data.get("schema") == "ci_runtime_baseline_v1":
+            artifacts.append(data)
+    return artifacts
+
+
+def _write_cohort_fixture_atomic(path: str, data: Any) -> None:
+    """#2672 AC14/AC15: dedicated deterministic serializer for
+    `materialize-cohort-fixture` output ONLY -- the pre-existing shared
+    `_write_json_atomic()` (`json.dump(data, handle, indent=2)`, no
+    `sort_keys`/`allow_nan`, used by every OTHER subcommand) is
+    intentionally left unmodified (#2672 AC15/AC24). Serializes with
+    stable key ordering (`sort_keys=True`), UTF-8, `ensure_ascii=False`,
+    fixed indentation/separators, `allow_nan=False` (a non-finite float
+    anywhere in `data` raises `OperationalErrorV2` here rather than being
+    silently written as invalid JSON), and a deterministic terminal
+    newline -- then writes to a same-directory temp file, fsyncs, and
+    only THEN atomically `os.replace`s it onto `path`. `path` is never
+    opened for writing before serialization succeeds, so a failure here
+    (or in the caller, before this function is even reached) always
+    leaves any pre-existing good `path` completely untouched (#2672
+    AC14/AC22)."""
+    try:
+        text = json.dumps(
+            data,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+            separators=(",", ": "),
+        )
+    except ValueError as exc:
+        raise OperationalErrorV2(f"cohort_fixture_contains_non_finite_float: {exc}") from exc
+    if not text.endswith("\n"):
+        text += "\n"
+
+    output_dir = os.path.dirname(path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+
+
+def parse_materialize_cohort_fixture_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="collect_e2e_performance_benchmark.py materialize-cohort-fixture",
+        description=(
+            "Issue #2672: materializes a tests/ci/test_ci_performance_gate.py-"
+            "consumable cohort_fixture.json from an already-collected "
+            "e2e_performance_benchmark_manifest_v2 manifest, a directory of real "
+            "ci_runtime_baseline_v1 artifact JSON payloads, and a small "
+            "non-baseline assessment-context JSON. Small offline transformer "
+            "only -- no new framework, no live GitHub API calls."
+        ),
+    )
+    parser.add_argument(
+        "--manifest",
+        required=True,
+        help="Path to an e2e_performance_benchmark_manifest_v2 JSON file",
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        required=True,
+        help=(
+            "Directory to recursively scan for ci_runtime_baseline_v1 JSON "
+            "artifact payloads (classified by payload content, never filename)"
+        ),
+    )
+    parser.add_argument(
+        "--assessment-context",
+        required=True,
+        help=(
+            "Path to a small JSON file carrying non-baseline metadata: "
+            '{"issue_number": int, "pr_number": int, "measured_at": str, '
+            '"functional_evidence": {...}, "declared_impact": str, '
+            '"risk_acknowledgement": {...}, "cohort_provenance": {...}}'
+        ),
+    )
+    parser.add_argument("--output", required=True, help="Path to write the materialized cohort_fixture.json")
+    return parser.parse_args(argv)
+
+
+def main_materialize_cohort_fixture(argv: list[str] | None = None) -> int:
+    args = parse_materialize_cohort_fixture_args(argv)
+    try:
+        manifest = _load_json_file_reject_nan_infinity(args.manifest)
+        if not isinstance(manifest, dict):
+            raise OperationalErrorV2("manifest_must_be_a_json_object")
+        assessment_context = _load_json_file_reject_nan_infinity(args.assessment_context)
+        if not isinstance(assessment_context, dict):
+            raise OperationalErrorV2("assessment_context_must_be_a_json_object")
+        if not os.path.isdir(args.artifact_dir):
+            raise OperationalErrorV2(f"artifact_dir_not_a_directory: {args.artifact_dir}")
+        artifacts = _load_ci_runtime_baseline_v1_artifacts(args.artifact_dir)
+        fixture = materialize_cohort_fixture(manifest, artifacts, assessment_context)
+    except MaterializationFatalError as exc:
+        sys.stderr.write(f"materialization_fatal: reason={exc.reason} detail={exc.detail}\n")
+        return EXIT_MATERIALIZATION_FATAL_BOUNDARY
+    except (OperationalError, OperationalErrorV2) as exc:
+        sys.stderr.write(f"operational_failure: {exc}\n")
+        return EXIT_OPERATIONAL_FAILURE
+
+    try:
+        _write_cohort_fixture_atomic(args.output, fixture)
+    except OperationalErrorV2 as exc:
+        sys.stderr.write(f"operational_failure: {exc}\n")
+        return EXIT_OPERATIONAL_FAILURE
+
+    print(f"cohort_fixture written to {args.output}")
+    return EXIT_COMPLETE
+
+
 if __name__ == "__main__":
     # Issue #2422 AC7/AC9: `run-experiment` is a distinct sub-invocation,
     # dispatched here (never inside `parse_args()`/`main()` above, which
@@ -2535,4 +3103,8 @@ if __name__ == "__main__":
     # `--before-sha`/`--after-sha` flag shape).
     if len(sys.argv) > 1 and sys.argv[1] == "run-experiment":
         sys.exit(main_run_experiment(sys.argv[2:]))
+    # Issue #2672: `materialize-cohort-fixture` is likewise a distinct
+    # sub-invocation, dispatched the same way -- never inside `main()`.
+    if len(sys.argv) > 1 and sys.argv[1] == "materialize-cohort-fixture":
+        sys.exit(main_materialize_cohort_fixture(sys.argv[2:]))
     sys.exit(main())

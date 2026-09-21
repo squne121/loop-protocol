@@ -9,6 +9,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import subprocess
+import sys
 
 import pytest
 
@@ -2607,3 +2609,744 @@ def test_parse_run_experiment_args_reliability_evidence_omitted_defaults_false()
     existing Performance-only `run-experiment` caller)."""
     args = collector.parse_run_experiment_args(_run_experiment_argv())
     assert args.reliability_evidence is False
+
+
+# =============================================================================
+# Issue #2672: `materialize-cohort-fixture` subcommand tests.
+#
+# fixture output contract's正本 is current main's real consumer,
+# `tests/ci/test_ci_performance_gate.py::_cli_main()` / `run_evidence_gate()`
+# -- helpers below build inputs shaped like the REAL producers this
+# subcommand adapts (`.github/workflows/ci.yml`'s "Collect
+# ci_runtime_baseline_v1 artifact" step for e2e-core/e2e-responsive-matrix,
+# and `scripts/ci/ci_job_snapshot.py::compute_gate_ready_latency_artifact`
+# for the `e2e` gate-ready flavor), never an invented shape.
+# =============================================================================
+
+MCF_EXPERIMENT_IDENTITY = "exp-2672-materialize"
+
+
+def _mcf_manifest(blocks: list[dict], *, experiment_identity: str = MCF_EXPERIMENT_IDENTITY) -> dict:
+    manifest = collector.build_manifest_v2(
+        experiment_identity=experiment_identity,
+        frozen_source_sha=FROZEN_SOURCE_SHA,
+        workflow_sha=V2_WORKFLOW_SHA,
+        workflow_digest=V2_WORKFLOW_DIGEST,
+        frozen_non_treatment=_frozen_non_treatment(),
+        blocks=blocks,
+        generated_at="2026-09-21T00:00:00Z",
+    )
+    assert manifest["evidence_errors"] == []
+    return manifest
+
+
+def _mcf_provider_artifact(
+    job: str,
+    workflow_run_id: int,
+    *,
+    block_id: str,
+    layout: str,
+    run_attempt: int = 1,
+    experiment_identity: str = MCF_EXPERIMENT_IDENTITY,
+    workflow_sha: str = V2_WORKFLOW_SHA,
+    frozen_source_sha: str = FROZEN_SOURCE_SHA,
+    measurements: list[dict] | None = None,
+    workflow_digest: str = "sha256:" + "f" * 64,
+    cohort_role: str = "e2e_performance_benchmark",
+) -> dict:
+    """Shaped like the REAL producer artifact
+    (`.github/workflows/ci.yml`'s "Collect ci_runtime_baseline_v1
+    artifact" step for `e2e-core`/`e2e-responsive-matrix`): `run_id`/
+    `run_attempt` are producer-shaped STRINGS, `workflow_run_id` is a
+    separate v2-fields INT, and `experiment_id`/`benchmark_layout`/
+    `block_id`/`workflow_sha`/`measured_head_sha` are the binding fields
+    the materializer's Manifest ↔ Artifact Binding Matrix consumes."""
+    if measurements is None:
+        if layout == "monolith":
+            measurements = [
+                {"phase_id": "test_e2e_ci", "elapsed_ms": 120_000},
+                {"phase_id": "test_e2e_monolith_responsive", "elapsed_ms": 90_000},
+            ]
+        else:
+            measurements = [{"phase_id": "test_e2e_core", "elapsed_ms": 60_000}]
+    return {
+        "schema": "ci_runtime_baseline_v1",
+        "run_id": str(workflow_run_id),
+        "run_attempt": str(run_attempt),
+        "head_sha": "0" * 40,
+        "merge_sha": "0" * 40,
+        "job": job,
+        "measurement_method": "date_plus3N_ms",
+        "measurements": measurements,
+        "host_runner_image": "Linux/X64",
+        "host_runner_image_provenance": "os_arch_fallback",
+        "playwright_container_image_digest": "sha256:" + "c" * 64,
+        "node_version": "20.0.0",
+        "pnpm_version": "9.0.0",
+        "playwright_version": "1.40.0",
+        "lockfile_hash": "sha256:" + "d" * 64,
+        "workflow_digest": workflow_digest,
+        "cohort_role": cohort_role,
+        "workflow_run_id": workflow_run_id,
+        "experiment_id": experiment_identity,
+        "benchmark_layout": layout,
+        "block_id": block_id,
+        "workflow_sha": workflow_sha,
+        "measured_head_sha": frozen_source_sha,
+    }
+
+
+def _mcf_gate_ready_artifact(
+    workflow_run_id: int,
+    *,
+    run_attempt: int = 1,
+    run_started_at: str = "2026-09-01T00:00:00Z",
+    gate_ready_at: str | None = "2026-09-01T00:05:00Z",
+) -> dict:
+    """Shaped like the REAL gate-ready producer artifact
+    (`scripts/ci/ci_job_snapshot.py::compute_gate_ready_latency_artifact`):
+    `run_id` (never `workflow_run_id`) is the producer's own identity
+    field, and `gate_ready_at` is OMITTED (never a fabricated value) when
+    `gate_ready_at=None` is passed -- mirroring that helper's own
+    diagnostic-only `gate_ready_latency_omitted_reason` path."""
+    artifact = {
+        "schema": "ci_runtime_baseline_v1",
+        "run_id": str(workflow_run_id),
+        "run_attempt": str(run_attempt),
+        "head_sha": "0" * 40,
+        "merge_sha": "0" * 40,
+        "job": "e2e",
+        "run_started_at": run_started_at,
+        "measurements": [],
+    }
+    if gate_ready_at is not None:
+        artifact["gate_ready_latency_ms"] = 300_000
+        artifact["gate_ready_at"] = gate_ready_at
+    else:
+        artifact["gate_ready_latency_omitted_reason"] = "job_not_completed"
+    return artifact
+
+
+def _mcf_assessment_context(*, issue_number: int = 2672, pr_number: int = 9001) -> dict:
+    return {
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "measured_at": "2026-09-21T00:00:00Z",
+        "functional_evidence": {
+            "proof_level": "check_run_only",
+            "coverage_bound": False,
+        },
+        "declared_impact": "materialize-cohort-fixture test fixture (#2672).",
+        "risk_acknowledgement": {
+            "reference": {"source_kind": "issue_comment", "source_id": "issuecomment-0000000000"},
+            "verification_status": "unverified",
+        },
+        "cohort_provenance": {
+            "runner_image": "ubuntu-24.04/20260901.1",
+            "workers": 4,
+            "scheduler": "loadscope",
+            "command_manifest_digest": "sha256:" + "a" * 64,
+            "test_selection_digest": "sha256:" + "b" * 64,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# AC1/AC2/AC18: basic small-sample success (1 monolith + 1 split).
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_small_sample_monolith_and_split_succeeds():
+    """#2672 AC1/AC2/AC18: a small 1-monolith + 1-split sample succeeds --
+    the sample-floor eligibility check is the CONSUMER's (`run_evidence_
+    gate()`) responsibility, never conflated with this subcommand's own
+    success condition."""
+    manifest = _mcf_manifest([_block("block-0001", 501001, 501002)])
+    artifacts = [
+        _mcf_provider_artifact("e2e-core", 501001, block_id="block-0001", layout="monolith"),
+        _mcf_provider_artifact("e2e-core", 501002, block_id="block-0001", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 501002, block_id="block-0001", layout="split"),
+        _mcf_gate_ready_artifact(501001),
+        _mcf_gate_ready_artifact(501002),
+    ]
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+
+    assert len(fixture["before"]["core_baselines"]) == 1
+    assert fixture["before"]["responsive_baselines"] == []
+    assert len(fixture["before"]["gate_ready_baselines"]) == 1
+    assert len(fixture["after"]["core_baselines"]) == 1
+    assert len(fixture["after"]["responsive_baselines"]) == 1
+    assert len(fixture["after"]["gate_ready_baselines"]) == 1
+    assert fixture["before"]["commit_sha"] == FROZEN_SOURCE_SHA
+    assert fixture["after"]["commit_sha"] == FROZEN_SOURCE_SHA
+    # AC2: existing before/after stand-in shape maintained verbatim.
+    assert set(fixture["before"]) == {"commit_sha", "core_baselines", "responsive_baselines", "gate_ready_baselines"}
+    assert set(fixture) == {
+        "issue_number",
+        "pr_number",
+        "measured_at",
+        "functional_evidence",
+        "declared_impact",
+        "risk_acknowledgement",
+        "cohort_provenance",
+        "before",
+        "after",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# AC13/AC20: monolith topology never receives a fictional responsive
+# baseline, even when a stray e2e-responsive-matrix artifact shares the
+# monolith run's workflow_run_id.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_monolith_never_receives_responsive_baseline_ac13_ac20():
+    manifest = _mcf_manifest([_block("block-0002", 502001, 502002)])
+    stray_responsive = _mcf_provider_artifact(
+        "e2e-responsive-matrix", 502001, block_id="block-0002", layout="monolith"
+    )
+    artifacts = [
+        _mcf_provider_artifact("e2e-core", 502001, block_id="block-0002", layout="monolith"),
+        _mcf_provider_artifact("e2e-core", 502002, block_id="block-0002", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 502002, block_id="block-0002", layout="split"),
+        stray_responsive,
+        _mcf_gate_ready_artifact(502001),
+        _mcf_gate_ready_artifact(502002),
+    ]
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+    assert fixture["before"]["responsive_baselines"] == []
+
+
+# --------------------------------------------------------------------------- #
+# AC3/AC4: Producer -> Consumer gate-ready field adapter.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_gate_ready_adapter_renames_fields_ac3():
+    manifest = _mcf_manifest([_block("block-0003", 503001, 503002)])
+    artifacts = [
+        _mcf_provider_artifact("e2e-core", 503001, block_id="block-0003", layout="monolith"),
+        _mcf_provider_artifact("e2e-core", 503002, block_id="block-0003", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 503002, block_id="block-0003", layout="split"),
+        _mcf_gate_ready_artifact(503001, run_started_at="2026-09-01T00:00:00Z", gate_ready_at="2026-09-01T00:07:00Z"),
+        _mcf_gate_ready_artifact(503002),
+    ]
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+    record = fixture["before"]["gate_ready_baselines"][0]
+    assert record["workflow_run_id"] == 503001
+    assert record["run_attempt"] == 1
+    assert record["run_started_at"] == "2026-09-01T00:00:00Z"
+    assert record["check_completed_at"] == "2026-09-01T00:07:00Z"
+    assert "run_id" not in record
+    assert "gate_ready_at" not in record
+
+
+def test_materialize_cohort_fixture_gate_ready_missing_gate_ready_at_not_fabricated_ac4():
+    """#2672 AC4: a producer gate-ready artifact missing `gate_ready_at`
+    (diagnostic omission) must never get a fabricated `check_completed_at`
+    -- the field is simply absent, left for the existing consumer's
+    invalid-timestamp taxonomy to classify."""
+    manifest = _mcf_manifest([_block("block-0004", 504001, 504002)])
+    artifacts = [
+        _mcf_provider_artifact("e2e-core", 504001, block_id="block-0004", layout="monolith"),
+        _mcf_provider_artifact("e2e-core", 504002, block_id="block-0004", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 504002, block_id="block-0004", layout="split"),
+        _mcf_gate_ready_artifact(504001, gate_ready_at=None),
+        _mcf_gate_ready_artifact(504002),
+    ]
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+    record = fixture["before"]["gate_ready_baselines"][0]
+    assert record["workflow_run_id"] == 504001
+    assert "check_completed_at" not in record
+    assert record["run_started_at"] == "2026-09-01T00:00:00Z"
+
+
+# --------------------------------------------------------------------------- #
+# AC7: the four fatal-boundary conditions -- and ONLY these four.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_fatal_manifest_run_unrepresentable_ac7_condition1():
+    manifest = _mcf_manifest([_block("block-0005", 505001, 505002)])
+    with pytest.raises(collector.MaterializationFatalError) as exc_info:
+        collector.materialize_cohort_fixture(manifest, [], _mcf_assessment_context())
+    assert exc_info.value.reason == collector.MATERIALIZATION_FATAL_UNREPRESENTABLE
+
+
+def test_materialize_cohort_fixture_fatal_identity_conflict_ac7_condition2_ac10():
+    manifest = _mcf_manifest([_block("block-0006", 506001, 506002)])
+    conflicting_a = _mcf_provider_artifact("e2e-core", 506001, block_id="block-0006", layout="monolith")
+    conflicting_b = _mcf_provider_artifact(
+        "e2e-core",
+        506001,
+        block_id="block-0006",
+        layout="monolith",
+        measurements=[
+            {"phase_id": "test_e2e_ci", "elapsed_ms": 999_999},
+            {"phase_id": "test_e2e_monolith_responsive", "elapsed_ms": 1},
+        ],
+    )
+    artifacts = [
+        conflicting_a,
+        conflicting_b,
+        _mcf_provider_artifact("e2e-core", 506002, block_id="block-0006", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 506002, block_id="block-0006", layout="split"),
+    ]
+    with pytest.raises(collector.MaterializationFatalError) as exc_info:
+        collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+    assert exc_info.value.reason == collector.MATERIALIZATION_FATAL_IDENTITY_CONFLICT
+
+
+def test_materialize_cohort_fixture_fatal_manifest_invalid_ac7_condition3():
+    manifest = _mcf_manifest([_block("block-0007", 507001, 507002)])
+    del manifest["workflow_sha"]
+    with pytest.raises(collector.MaterializationFatalError) as exc_info:
+        collector.materialize_cohort_fixture(manifest, [], _mcf_assessment_context())
+    assert exc_info.value.reason == collector.MATERIALIZATION_FATAL_MANIFEST_INVALID
+
+
+def test_materialize_cohort_fixture_fatal_evidence_errors_non_empty_ac7_condition4_ac21():
+    manifest = _mcf_manifest([_block("block-0008", 508001, 508002)])
+    manifest["evidence_errors"] = [{"block_id": "block-0008", "reason": "synthetic", "detail": "synthetic detail"}]
+    with pytest.raises(collector.MaterializationFatalError) as exc_info:
+        collector.materialize_cohort_fixture(manifest, [], _mcf_assessment_context())
+    assert exc_info.value.reason == collector.MATERIALIZATION_FATAL_EVIDENCE_ERRORS_UNREPRESENTABLE
+
+
+# --------------------------------------------------------------------------- #
+# AC8/AC20: a gap in exactly ONE baseline lineage is never fatal.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_partial_evidence_gap_is_non_fatal_ac8_ac20():
+    """#2672 AC8/AC20: a run missing ONE lineage (here: split's
+    responsive provider baseline) while at least one OTHER lineage
+    (core / gate-ready) represents every manifest run is never fatal --
+    the gap is simply absent from the fixture, for the existing consumer
+    to classify (e.g. `missing_pair_e2e-responsive-matrix`)."""
+    manifest = _mcf_manifest([_block("block-0009", 509001, 509002)])
+    artifacts = [
+        _mcf_provider_artifact("e2e-core", 509001, block_id="block-0009", layout="monolith"),
+        _mcf_provider_artifact("e2e-core", 509002, block_id="block-0009", layout="split"),
+        # e2e-responsive-matrix for 509002 intentionally omitted (AC8 gap).
+        _mcf_gate_ready_artifact(509001),
+        _mcf_gate_ready_artifact(509002),
+    ]
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+    assert fixture["after"]["responsive_baselines"] == []
+    assert len(fixture["after"]["core_baselines"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# AC9/AC20: different attempts / runs are never mixed together.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_does_not_mix_different_run_attempts_ac9_ac20():
+    """#2672 AC9: an attempt-2 artifact is never substituted in for a
+    manifest run whose entry is attempt 1 -- it simply does not match
+    that run's identity, so the run stays evidenced only by whatever
+    baseline lineage ACTUALLY matches."""
+    manifest = _mcf_manifest([_block("block-0010", 510001, 510002)])
+    wrong_attempt = _mcf_provider_artifact(
+        "e2e-core", 510001, block_id="block-0010", layout="monolith", run_attempt=2
+    )
+    artifacts = [
+        wrong_attempt,
+        _mcf_provider_artifact("e2e-core", 510002, block_id="block-0010", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 510002, block_id="block-0010", layout="split"),
+        _mcf_gate_ready_artifact(510001),
+        _mcf_gate_ready_artifact(510002),
+    ]
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+    assert fixture["before"]["core_baselines"] == []
+    assert len(fixture["before"]["gate_ready_baselines"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# AC10/AC16: idempotent duplicate artifacts are deduped harmlessly.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_idempotent_duplicate_artifact_is_deduped_ac10_ac16():
+    manifest = _mcf_manifest([_block("block-0011", 511001, 511002)])
+    monolith_core = _mcf_provider_artifact("e2e-core", 511001, block_id="block-0011", layout="monolith")
+    artifacts = [
+        monolith_core,
+        json.loads(json.dumps(monolith_core)),  # byte-identical duplicate (e.g. downloaded twice)
+        _mcf_provider_artifact("e2e-core", 511002, block_id="block-0011", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 511002, block_id="block-0011", layout="split"),
+        _mcf_gate_ready_artifact(511001),
+        _mcf_gate_ready_artifact(511002),
+    ]
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+    assert len(fixture["before"]["core_baselines"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# AC11: a binding-field mismatch excludes the candidate, never force-binds.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_binding_mismatch_excludes_candidate_ac11():
+    manifest = _mcf_manifest([_block("block-0012", 512001, 512002)])
+    wrong_experiment = _mcf_provider_artifact(
+        "e2e-core", 512001, block_id="block-0012", layout="monolith", experiment_identity="other-experiment"
+    )
+    artifacts = [
+        wrong_experiment,
+        _mcf_provider_artifact("e2e-core", 512002, block_id="block-0012", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 512002, block_id="block-0012", layout="split"),
+        _mcf_gate_ready_artifact(512001),
+        _mcf_gate_ready_artifact(512002),
+    ]
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+    assert fixture["before"]["core_baselines"] == []
+    assert len(fixture["before"]["gate_ready_baselines"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# AC12: baseline `workflow_digest` provenance is never cross-overwritten
+# by the manifest's own (different-provenance) `workflow_digest`.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_preserves_baseline_workflow_digest_never_manifest_value_ac12():
+    manifest = _mcf_manifest([_block("block-0013", 513001, 513002)])
+    baseline_digest = "sha256:" + "b" * 64
+    assert baseline_digest != manifest["workflow_digest"]
+    artifacts = [
+        _mcf_provider_artifact(
+            "e2e-core", 513001, block_id="block-0013", layout="monolith", workflow_digest=baseline_digest
+        ),
+        _mcf_provider_artifact("e2e-core", 513002, block_id="block-0013", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 513002, block_id="block-0013", layout="split"),
+        _mcf_gate_ready_artifact(513001),
+        _mcf_gate_ready_artifact(513002),
+    ]
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+    assert fixture["before"]["core_baselines"][0]["workflow_digest"] == baseline_digest
+
+
+# --------------------------------------------------------------------------- #
+# AC14/AC21: deterministic output regardless of input artifact order.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_output_is_byte_identical_regardless_of_artifact_order_ac14_ac21():
+    manifest = _mcf_manifest([_block("block-0014", 514001, 514002)])
+    artifacts = [
+        _mcf_provider_artifact("e2e-core", 514001, block_id="block-0014", layout="monolith"),
+        _mcf_provider_artifact("e2e-core", 514002, block_id="block-0014", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 514002, block_id="block-0014", layout="split"),
+        _mcf_gate_ready_artifact(514001),
+        _mcf_gate_ready_artifact(514002),
+    ]
+    context = _mcf_assessment_context()
+    fixture_forward = collector.materialize_cohort_fixture(manifest, artifacts, context)
+    fixture_reversed = collector.materialize_cohort_fixture(manifest, list(reversed(artifacts)), context)
+    assert json.dumps(fixture_forward, sort_keys=True) == json.dumps(fixture_reversed, sort_keys=True)
+
+
+# --------------------------------------------------------------------------- #
+# AC14/AC15/AC22: dedicated serializer -- non-finite floats rejected,
+# existing good output preserved on failure, pre-existing shared
+# `_write_json_atomic()` left byte-for-byte unchanged (AC24).
+# --------------------------------------------------------------------------- #
+def test_write_cohort_fixture_atomic_rejects_non_finite_float_ac14_ac15(tmp_path):
+    output_path = tmp_path / "cohort_fixture.json"
+    with pytest.raises(collector.OperationalErrorV2):
+        collector._write_cohort_fixture_atomic(str(output_path), {"bad": float("nan")})
+    assert not output_path.exists()
+
+
+def test_write_cohort_fixture_atomic_preserves_existing_output_on_failure_ac22(tmp_path):
+    output_path = tmp_path / "cohort_fixture.json"
+    output_path.write_text('{"good": true}\n', encoding="utf-8")
+    with pytest.raises(collector.OperationalErrorV2):
+        collector._write_cohort_fixture_atomic(str(output_path), {"bad": float("inf")})
+    assert output_path.read_text(encoding="utf-8") == '{"good": true}\n'
+
+
+def test_write_cohort_fixture_atomic_output_has_stable_key_order_and_terminal_newline_ac14():
+    output = {}
+    import tempfile as _tempfile
+
+    with _tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/cohort_fixture.json"
+        collector._write_cohort_fixture_atomic(path, {"b": 1, "a": 2})
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+    assert text.startswith('{\n  "a": 2,\n  "b": 1\n}')
+    assert text.endswith("\n")
+    assert output == {}  # sentinel: no accidental mutation of a shared dict
+
+
+def test_write_json_atomic_legacy_subcommand_serializer_unchanged_ac15_ac24():
+    """#2672 AC15/AC24: the pre-existing shared `_write_json_atomic()`
+    (used by every OTHER subcommand) is untouched -- it still accepts a
+    non-finite float via `json.dump`'s default `allow_nan=True`, proving
+    the new dedicated serializer was ADDED, never substituted in
+    globally."""
+    import tempfile as _tempfile
+
+    with _tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/legacy.json"
+        collector._write_json_atomic(path, {"value": float("nan")})
+        assert "NaN" in pathlib.Path(path).read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# AC16: recursive directory scan, duplicate filenames across
+# subdirectories, and unrelated/non-JSON files handled correctly.
+# --------------------------------------------------------------------------- #
+def test_load_ci_runtime_baseline_v1_artifacts_recursive_scan_ac16(tmp_path):
+    dir_a = tmp_path / "dir_a" / "nested"
+    dir_b = tmp_path / "dir_b"
+    dir_a.mkdir(parents=True)
+    dir_b.mkdir(parents=True)
+    (dir_a / "ci_runtime_baseline_v1.json").write_text(
+        json.dumps(_mcf_provider_artifact("e2e-core", 515001, block_id="block-0015", layout="monolith")),
+        encoding="utf-8",
+    )
+    # Same literal filename in a DIFFERENT directory -- must not be
+    # flattened/overwritten (AC16), and must be classified by payload
+    # content, not filename.
+    (dir_b / "ci_runtime_baseline_v1.json").write_text(
+        json.dumps(_mcf_provider_artifact("e2e-core", 515002, block_id="block-0015", layout="split")),
+        encoding="utf-8",
+    )
+    (dir_b / "ci_runtime_baseline_v1_responsive.json").write_text(
+        json.dumps(_mcf_provider_artifact("e2e-responsive-matrix", 515002, block_id="block-0015", layout="split")),
+        encoding="utf-8",
+    )
+    (dir_a / "README.md").write_text("not evidence", encoding="utf-8")
+    (dir_a / "unrelated.json").write_text(json.dumps({"schema": "unrelated_schema_v1"}), encoding="utf-8")
+
+    artifacts = collector._load_ci_runtime_baseline_v1_artifacts(str(tmp_path))
+    manifest = _mcf_manifest([_block("block-0015", 515001, 515002)])
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+
+    assert len(fixture["before"]["core_baselines"]) == 1
+    assert len(fixture["after"]["core_baselines"]) == 1
+    assert len(fixture["after"]["responsive_baselines"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# AC17: real subprocess CLI invocation of `materialize-cohort-fixture` --
+# never merely a static `grep def main_materialize_cohort_fixture` check.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_cli_subprocess_invocation_ac17(tmp_path):
+    manifest = _mcf_manifest([_block("block-0016", 516001, 516002)])
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    (artifact_dir / "monolith_core.json").write_text(
+        json.dumps(_mcf_provider_artifact("e2e-core", 516001, block_id="block-0016", layout="monolith")),
+        encoding="utf-8",
+    )
+    (artifact_dir / "split_core.json").write_text(
+        json.dumps(_mcf_provider_artifact("e2e-core", 516002, block_id="block-0016", layout="split")),
+        encoding="utf-8",
+    )
+    (artifact_dir / "split_responsive.json").write_text(
+        json.dumps(_mcf_provider_artifact("e2e-responsive-matrix", 516002, block_id="block-0016", layout="split")),
+        encoding="utf-8",
+    )
+    (artifact_dir / "gate_ready_monolith.json").write_text(
+        json.dumps(_mcf_gate_ready_artifact(516001)), encoding="utf-8"
+    )
+    (artifact_dir / "gate_ready_split.json").write_text(
+        json.dumps(_mcf_gate_ready_artifact(516002)), encoding="utf-8"
+    )
+
+    assessment_context_path = tmp_path / "assessment_context.json"
+    assessment_context_path.write_text(json.dumps(_mcf_assessment_context()), encoding="utf-8")
+    output_path = tmp_path / "cohort_fixture.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "materialize-cohort-fixture",
+            "--manifest",
+            str(manifest_path),
+            "--artifact-dir",
+            str(artifact_dir),
+            "--assessment-context",
+            str(assessment_context_path),
+            "--output",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert len(written["before"]["core_baselines"]) == 1
+    assert len(written["after"]["core_baselines"]) == 1
+    assert len(written["after"]["responsive_baselines"]) == 1
+
+
+def test_materialize_cohort_fixture_cli_subprocess_fatal_boundary_exit_code_ac7_ac17(tmp_path):
+    """#2672 AC7/AC17: a real subprocess invocation with NO artifact
+    evidence at all terminates non-zero (never 0, and never pytest's own
+    exit 5) and never writes `--output` (AC22)."""
+    manifest = _mcf_manifest([_block("block-0017", 517001, 517002)])
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    assessment_context_path = tmp_path / "assessment_context.json"
+    assessment_context_path.write_text(json.dumps(_mcf_assessment_context()), encoding="utf-8")
+    output_path = tmp_path / "cohort_fixture.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "materialize-cohort-fixture",
+            "--manifest",
+            str(manifest_path),
+            "--artifact-dir",
+            str(artifact_dir),
+            "--assessment-context",
+            str(assessment_context_path),
+            "--output",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == collector.EXIT_MATERIALIZATION_FATAL_BOUNDARY
+    assert result.returncode != 0
+    assert result.returncode != 5
+    assert not output_path.exists()
+
+
+# --------------------------------------------------------------------------- #
+# AC19: a production-shaped (>= MIN_COHORT_RUN_COUNT per arm) generated
+# fixture is fed UNMODIFIED through the real
+# `tests/ci/test_ci_performance_gate.py::run_evidence_gate()` consumer.
+# --------------------------------------------------------------------------- #
+def _mcf_production_shaped_manifest_and_artifacts(block_count: int = 20, id_base: int = 600000):
+    blocks = []
+    artifacts = []
+    for i in range(block_count):
+        block_id = f"block-prod-{i:04d}"
+        monolith_id = id_base + i * 2
+        split_id = id_base + i * 2 + 1
+        blocks.append(_block(block_id, monolith_id, split_id))
+        artifacts.append(
+            _mcf_provider_artifact(
+                "e2e-core",
+                monolith_id,
+                block_id=block_id,
+                layout="monolith",
+                measurements=[
+                    {"phase_id": "test_e2e_ci", "elapsed_ms": 120_000 + i},
+                    {"phase_id": "test_e2e_monolith_responsive", "elapsed_ms": 90_000 + i},
+                ],
+            )
+        )
+        artifacts.append(
+            _mcf_provider_artifact(
+                "e2e-core",
+                split_id,
+                block_id=block_id,
+                layout="split",
+                measurements=[{"phase_id": "test_e2e_core", "elapsed_ms": 60_000 + i}],
+            )
+        )
+        artifacts.append(
+            _mcf_provider_artifact(
+                "e2e-responsive-matrix",
+                split_id,
+                block_id=block_id,
+                layout="split",
+                measurements=[{"phase_id": "test_e2e_responsive", "elapsed_ms": 30_000 + i}],
+            )
+        )
+        artifacts.append(_mcf_gate_ready_artifact(monolith_id))
+        artifacts.append(_mcf_gate_ready_artifact(split_id))
+    manifest = _mcf_manifest(blocks)
+    return manifest, artifacts
+
+
+def test_materialize_cohort_fixture_production_shaped_reaches_run_evidence_gate_ac19():
+    """#2672 AC19: production-shaped fixture generation, fed unmodified
+    into the real consumer -- the assessment/receipt path must be
+    reached (`gate_status: complete`), even though final
+    `approval_eligible` legitimately stays False here (no trusted
+    `ci_verdict_summary_v2` artifact supplied to this test)."""
+    manifest, artifacts = _mcf_production_shaped_manifest_and_artifacts()
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+
+    gate_spec = importlib.util.spec_from_file_location(
+        "test_ci_performance_gate_for_2672", str(REPO_ROOT / "tests" / "ci" / "test_ci_performance_gate.py")
+    )
+    assert gate_spec is not None and gate_spec.loader is not None
+    gate = importlib.util.module_from_spec(gate_spec)
+    gate_spec.loader.exec_module(gate)
+
+    result = gate.run_evidence_gate(fixture)
+
+    assert result["gate_status"] == "complete"
+    assert result["assessment"] is not None
+    assert result["assessment"]["issue_number"] == fixture["issue_number"]
+    assert result["assessment"]["functional_evidence"] == fixture["functional_evidence"]
+    assert result["validation_result"] is not None
+    assert result["validation_result"]["structural_valid"] is True
+    assert result["validation_result"]["semantic_valid"] is True
+    # AC19: non-baseline metadata is actually consulted by the consumer --
+    # `issue_number`/`functional_evidence` above prove reachability; the
+    # gate's own reason for withholding approval (no trusted
+    # ci_verdict_summary_v2 artifact was supplied in this unit test) is
+    # expected and is a DIFFERENT axis from "the path was reached".
+    assert result["validation_result"]["approval_eligible"] is False
+
+
+def test_materialize_cohort_fixture_production_shaped_cli_subprocess_reaches_gate_ac17_ac19(tmp_path):
+    """#2672 AC17/AC19: the SAME production-shaped scenario as above, but
+    driven end-to-end via two real subprocess invocations -- this
+    subcommand's CLI, then `tests/ci/test_ci_performance_gate.py`'s own
+    `_cli_main` CLI -- proving the real, callable CLI-to-CLI path (not
+    merely in-process function calls) reaches `gate_status: complete`."""
+    manifest, artifacts = _mcf_production_shaped_manifest_and_artifacts(block_count=20, id_base=700000)
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    for index, artifact in enumerate(artifacts):
+        (artifact_dir / f"artifact-{index:04d}.json").write_text(json.dumps(artifact), encoding="utf-8")
+    assessment_context_path = tmp_path / "assessment_context.json"
+    assessment_context_path.write_text(json.dumps(_mcf_assessment_context()), encoding="utf-8")
+    cohort_fixture_path = tmp_path / "cohort_fixture.json"
+
+    materialize_result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "materialize-cohort-fixture",
+            "--manifest",
+            str(manifest_path),
+            "--artifact-dir",
+            str(artifact_dir),
+            "--assessment-context",
+            str(assessment_context_path),
+            "--output",
+            str(cohort_fixture_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert materialize_result.returncode == 0, materialize_result.stderr
+
+    gate_script_path = REPO_ROOT / "tests" / "ci" / "test_ci_performance_gate.py"
+    gate_output_path = tmp_path / "gate_result.json"
+    gate_result = subprocess.run(
+        [
+            sys.executable,
+            str(gate_script_path),
+            "--cohort-fixture",
+            str(cohort_fixture_path),
+            "--output",
+            str(gate_output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    # exit 3 == complete evidence, semantic_valid, but NOT approval_eligible
+    # (no trusted ci_verdict_summary_v2 supplied) -- see `_cli_main`'s exit
+    # code docstring in tests/ci/test_ci_performance_gate.py.
+    assert gate_result.returncode == 3, gate_result.stderr
+    written = json.loads(gate_output_path.read_text(encoding="utf-8"))
+    assert written["gate_status"] == "complete"
+    assert written["assessment"] is not None
