@@ -279,6 +279,12 @@ def derive_landing_disposition(raw: Any, *, repo: str, issue_number: int, now: d
     evidence = validated["evidence"]
     candidates = evidence["candidates"]
     qualified = [c for c in candidates if c["lifecycle"] in {"merged", "open", "draft", "closed_unmerged"}]
+    # Structured closing linkage has explicit GitHub landing semantics and is
+    # therefore selected ahead of an otherwise valid timeline cross-reference.
+    # Ambiguity is only among candidates at the chosen authority level.
+    closing = [c for c in qualified if c.get("provenance", {}).get("kind") == "closing_relation"]
+    if closing:
+        qualified = closing
     if len(qualified) > 1:
         return {"disposition": "reconciliation_required", "reason_codes": ["qualified_candidate_conflict"], "candidate": None}
     if not qualified:

@@ -156,6 +156,15 @@ def test_candidate_discovery_dedupes_and_reconciles_conflicting_qualified_candid
     assert result["disposition"] == "reconciliation_required"
     assert result["reason_codes"] == ["qualified_candidate_conflict"]
 
+    # Closing relation wins over an independently verified non-closing source;
+    # only same-authority multiplicity is contradictory.
+    closing = _candidate(lifecycle="open", provenance="closing_relation")
+    cross_ref = _candidate(lifecycle="draft", provenance="verified_cross_reference")
+    result = mod.derive_landing_disposition(
+        _evidence(candidates=[closing, cross_ref]), repo=REPO, issue_number=ISSUE
+    )
+    assert result["disposition"] == "existing_pr_resume"
+
 
 def test_markerless_open_draft_candidate_allowed_paths_coverage_determines_resume_or_reconciliation():
     """AC6: legacy resumable branches need explicit current Allowed Paths coverage."""
