@@ -200,6 +200,56 @@ claude_gpt_resolve_native_settings_path() {
   printf '%s/.claude/settings.json\n' "$ambient_home"
 }
 
+# claude_gpt_resolve_task_context_state_root: Task Context canonical
+# absolute state root を、isolated HOME / XDG への切替 *前* の ambient 環境
+# から resolve する（Issue #2567 In Scope carrier precedence: 「未設定の
+# 通常operatorだけambient user XDG/HOMEからcanonical rootをHOME isolation前
+# に解決する」）。
+#
+# 既存 SSOT である `scripts/task-context/task_context_config.py` の
+# `resolve_state_root()`（#2563 canonical state-root 契約）をそのまま呼び出す
+# だけで、state-root 導出ロジック自体はここに複製しない。この関数は単に
+# 「isolated HOME へ切り替わる前の ambient HOME/XDG_STATE_HOME で
+# resolve_state_root() を呼ぶ」という *タイミング* だけを担う。
+#
+# 呼び出し側は isolated HOME 切替（`export HOME="$CLAUDE_ISOLATED_HOME_TARGET"`）
+# より前の行でこの関数を呼び出すこと（`claude_gpt_resolve_native_settings_path`
+# と同じ理由）。呼び出し側はさらに、inherited `LOOP_TASK_CONTEXT_STATE_ROOT`
+# が既に非空の場合はこの関数を呼ばず、その値をそのまま保持すること（AC3:
+# runtime-smoke override を上書きしない -- この関数自身は env を読まないので
+# その判定は呼び出し側の責務のまま）。
+#
+# 引数1: `scripts/task-context/task_context_config.py` への絶対パス
+# 引数2: repo_instance_key の `git rev-parse` 解決に使う repo/worktree cwd
+# 戻り値: resolve された canonical absolute state root（改行付き）。
+#         python3 未対応・resolve 失敗時は空文字列（呼び出し側は空文字列を
+#         「解決できなかった」として扱い、LOOP_TASK_CONTEXT_STATE_ROOT を
+#         明示 export しない fail-open degrade にすること -- 既存の
+#         isolated-HOME-based 挙動へ静かに戻るだけで、起動失敗にはしない）。
+claude_gpt_resolve_task_context_state_root() {
+  config_path="$1"
+  repo_cwd="$2"
+  if [ -z "$config_path" ] || [ -z "$repo_cwd" ] || ! command -v python3 >/dev/null 2>&1; then
+    printf ''
+    return 0
+  fi
+  python3 -c '
+import importlib.util
+import sys
+
+config_path, repo_cwd = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location(
+    "claude_gpt_task_context_config_lib", config_path
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    sys.stdout.write(str(module.resolve_state_root(cwd=repo_cwd)))
+except Exception:
+    pass
+' "$config_path" "$repo_cwd" 2>/dev/null
+}
+
 # --- Model alias mapping（Parent #2154 アーキテクチャ決定 E 準拠） ---
 # opus -> gpt-5.6-sol / sonnet -> gpt-5.6-terra（main 推奨） / haiku -> gpt-5.6-luna
 #

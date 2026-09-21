@@ -1187,6 +1187,47 @@ export STRICT_MCP_MODE
 export AGY_OAUTH_TOKEN_HANDOFF_ROOT="${HOME}/.gemini/antigravity-cli"
 export AGY_OAUTH_TOKEN_HANDOFF_SOURCE="${AGY_OAUTH_TOKEN_HANDOFF_ROOT}/antigravity-oauth-token"
 
+# --- Issue #2567 In Scope: Task Context canonical state-root / runtime-
+#     variant carrier. Must run *before* the isolated HOME/XDG switch below
+#     (same ordering requirement as CLAUDE_NATIVE_LATITUDE_SETTINGS_PATH_TARGET
+#     above), otherwise `task_context_config.resolve_state_root()` would
+#     derive its default root from the isolated (empty) Claude-GPT HOME
+#     instead of the ambient real HOME/XDG_STATE_HOME Native Claude uses --
+#     producing a second, isolated-HOME-scoped Task Context DB (AC1/AC2).
+#
+#     Precedence (In Scope, AC3): an inherited, non-empty
+#     `LOOP_TASK_CONTEXT_STATE_ROOT` (e.g. a runtime-smoke override) is kept
+#     exactly as-is and never recomputed/overwritten here. Only when it is
+#     unset does this launcher resolve one from ambient XDG/HOME, via the
+#     existing `task_context_config.resolve_state_root()` SSOT (never a
+#     duplicated resolution rule) -- `claude_gpt_resolve_task_context_state_root`
+#     (lib.sh) is a thin ordering wrapper around that same function.
+#
+#     `LOOP_TASK_CONTEXT_SCOPE` is intentionally left completely untouched
+#     here: this shell process already inherited whatever ambient value the
+#     caller set (ordinary env inheritance, e.g. `worktree-agent-runtime-
+#     smoke`'s `LOOP_TASK_CONTEXT_SCOPE=runtime_smoke`), and a normal
+#     operator launch has no scope value of its own to assign -- so simply
+#     never assigning/exporting it here is what "preserved, never
+#     overwritten" (AC3) means in practice.
+if [ -z "${LOOP_TASK_CONTEXT_STATE_ROOT:-}" ]; then
+  CLAUDE_GPT_TASK_CONTEXT_CONFIG_PATH="${REPO_ROOT}/scripts/task-context/task_context_config.py"
+  CLAUDE_GPT_RESOLVED_TASK_CONTEXT_STATE_ROOT=$(claude_gpt_resolve_task_context_state_root \
+    "$CLAUDE_GPT_TASK_CONTEXT_CONFIG_PATH" "$REPO_ROOT")
+  if [ -n "$CLAUDE_GPT_RESOLVED_TASK_CONTEXT_STATE_ROOT" ]; then
+    LOOP_TASK_CONTEXT_STATE_ROOT="$CLAUDE_GPT_RESOLVED_TASK_CONTEXT_STATE_ROOT"
+    export LOOP_TASK_CONTEXT_STATE_ROOT
+  fi
+  # Resolution failure (python3 unavailable, git/repo error, etc.) leaves
+  # LOOP_TASK_CONTEXT_STATE_ROOT unset -- fail-open degrade to the child
+  # process's own default (ambient-XDG-derived, or isolated-HOME-derived if
+  # HOME has already been swapped by the time it runs) rather than blocking
+  # launch on a non-essential carrier.
+fi
+# Fixed value on every normal-mode launch (Issue #2567 In Scope carrier
+# contract) -- this launcher IS the claude_gpt runtime, unconditionally.
+export LOOP_TASK_CONTEXT_RUNTIME_VARIANT=claude_gpt
+
 export HOME="$CLAUDE_ISOLATED_HOME_TARGET"
 export GH_CONFIG_DIR="$CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET"
 export XDG_CONFIG_HOME="$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET"

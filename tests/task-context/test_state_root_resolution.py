@@ -57,3 +57,30 @@ def test_given_state_root_when_db_path_computed_then_it_ends_with_canonical_file
     path = config.db_path()
     assert path.name == "task-context.sqlite3"
     assert path.parent == state_root
+
+
+# ---------------------------------------------------------------------------
+# Issue #2567 AC4: operator run_kind/runtime_profile/resume_profile
+# resolution from LOOP_TASK_CONTEXT_RUNTIME_VARIANT.
+# ---------------------------------------------------------------------------
+
+
+def test_given_runtime_variant_unset_when_resolving_operator_run_kind_then_native_operator_no_profiles(
+    monkeypatch,
+):
+    monkeypatch.delenv(config.RUNTIME_VARIANT_ENV_VAR, raising=False)
+    assert config.operator_run_kind_and_profiles() == ("native_operator", None, None)
+
+
+def test_given_runtime_variant_claude_gpt_when_resolving_operator_run_kind_then_claude_gpt_v1_profiles(
+    monkeypatch,
+):
+    monkeypatch.setenv(config.RUNTIME_VARIANT_ENV_VAR, "claude_gpt")
+    assert config.operator_run_kind_and_profiles() == ("claude_gpt", "claude_gpt_v1", "claude_gpt_v1")
+
+
+def test_given_unrecognized_runtime_variant_value_when_resolving_then_falls_back_to_native_operator(
+    monkeypatch,
+):
+    monkeypatch.setenv(config.RUNTIME_VARIANT_ENV_VAR, "some_future_variant")
+    assert config.operator_run_kind_and_profiles() == ("native_operator", None, None)
