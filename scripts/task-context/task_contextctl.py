@@ -171,6 +171,25 @@ def _dispatch(operation: str, payload: dict) -> dict:
             scope=config.resolve_task_context_scope() or None,
         )
 
+    if operation == "smoke_seed" and not os.environ.get(config.STATE_ROOT_ENV_VAR, ""):
+        # Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 1 (atomic
+        # carrier integrity): scope alone is not sufficient -- a runtime-
+        # smoke-scoped caller that omitted (or emptied)
+        # LOOP_TASK_CONTEXT_STATE_ROOT must be rejected here, strictly
+        # before _open_db_and_migrate() below, so the canonical state-root
+        # directory/DB file is never materialized or migrated as a side
+        # effect. (config.resolve_state_root() also independently raises
+        # ValueError in this exact situation -- this explicit check gives
+        # the caller a typed VALIDATION_ERROR result/exit code instead of
+        # falling through to the generic INTERNAL_ERROR catch-all in
+        # _run() below, and documents the invariant at the call site that
+        # owns the DB-open decision.)
+        raise errors.ValidationError(
+            "smoke seed requires an explicit, non-empty, absolute "
+            f"{config.STATE_ROOT_ENV_VAR} when "
+            f"{config.SCOPE_ENV_VAR}={config.RUNTIME_SMOKE_SCOPE_VALUE!r}",
+        )
+
     conn = _open_db_and_migrate()
     try:
         if operation == "hook":

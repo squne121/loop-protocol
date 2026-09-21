@@ -169,6 +169,16 @@ def resolve_state_root(cwd: str | pathlib.Path | None = None) -> pathlib.Path:
       silently resolved against ``cwd``) -- see AC/contract for
       ``LOOP_TASK_CONTEXT_STATE_ROOT``.
     - Otherwise: ``$XDG_STATE_HOME/loop-protocol/task-context/v1/<repo_instance_key>/``.
+
+    Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 1 (atomic carrier
+    integrity): when the caller has opted into ``LOOP_TASK_CONTEXT_SCOPE=
+    runtime_smoke`` (``is_runtime_smoke_scope()``), the canonical XDG
+    fallback above must NEVER be reached -- a runtime-smoke caller that
+    omitted (or emptied) ``LOOP_TASK_CONTEXT_STATE_ROOT`` raises here,
+    strictly before any canonical path is computed/returned, instead of
+    silently resolving to (and later materializing/migrating) the
+    canonical DB. When scope is NOT runtime_smoke this function's
+    behavior is byte-identical to before this fix_delta.
     """
     override = os.environ.get(STATE_ROOT_ENV_VAR, "")
     if override:
@@ -180,6 +190,12 @@ def resolve_state_root(cwd: str | pathlib.Path | None = None) -> pathlib.Path:
                 "silently resolved against the current working directory."
             )
         return candidate
+    if is_runtime_smoke_scope():
+        raise ValueError(
+            f"{SCOPE_ENV_VAR}={RUNTIME_SMOKE_SCOPE_VALUE!r} requires an explicit, "
+            f"non-empty, absolute {STATE_ROOT_ENV_VAR} -- refusing to fall back to "
+            "the canonical state root/DB for a runtime-smoke-scoped caller."
+        )
     key = repo_instance_key(cwd=cwd)
     return _default_xdg_state_home() / "loop-protocol" / "task-context" / "v1" / key
 

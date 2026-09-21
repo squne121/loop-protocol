@@ -11,6 +11,8 @@ import shlex
 import stat
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
 
@@ -41,21 +43,22 @@ class TestTaskContextEnvPairsPureFunction:
             ("LOOP_TASK_CONTEXT_STATE_ROOT", "/abs/state-root"),
         ]
 
-    def test_given_only_scope_when_computed_then_only_scope_pair(self) -> None:
-        module = _load_module()
-        assert module._task_context_env_pairs("runtime_smoke", None) == [
-            ("LOOP_TASK_CONTEXT_SCOPE", "runtime_smoke")
-        ]
-
-    def test_given_only_state_root_when_computed_then_only_state_root_pair(self) -> None:
-        module = _load_module()
-        assert module._task_context_env_pairs(None, "/abs/state-root") == [
-            ("LOOP_TASK_CONTEXT_STATE_ROOT", "/abs/state-root")
-        ]
-
     def test_given_empty_strings_when_computed_then_empty(self) -> None:
         module = _load_module()
         assert module._task_context_env_pairs("", "") == []
+
+    def test_given_only_scope_when_computed_then_raises(self) -> None:
+        """Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 1 (atomic
+        carrier integrity): exactly one of the pair given is a caller
+        configuration error, rejected before any child process launch."""
+        module = _load_module()
+        with pytest.raises(ValueError):
+            module._task_context_env_pairs("runtime_smoke", None)
+
+    def test_given_only_state_root_when_computed_then_raises(self) -> None:
+        module = _load_module()
+        with pytest.raises(ValueError):
+            module._task_context_env_pairs(None, "/abs/state-root")
 
 
 class TestStructuredLaneCarrierPassthrough:

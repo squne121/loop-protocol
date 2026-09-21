@@ -767,7 +767,26 @@ def _task_context_env_pairs(
     so a caller can drive an isolated, run-scoped Task Context state root
     through a REAL fresh Native/Claude-GPT runtime. Omitted (empty list)
     when neither is given, so every pre-existing caller's argv/env is
-    unchanged."""
+    unchanged.
+
+    Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 1 (atomic carrier
+    integrity): the two carrier values are a single atomic pair. Exactly
+    one supplied (the other missing/empty) is a caller configuration error
+    -- never silently forwarded as a half-carrier, which would let a
+    downstream process either derive scope with no isolated root (falling
+    through to the canonical DB) or receive a bare state-root override
+    with no scope opt-in. Raised here, strictly before every call site's
+    own child-process launch (both ``run_structured_claude``'s
+    ``subprocess.run`` and ``run_interactive_herdr_isolated``'s ``herdr
+    workspace create``), so no process is ever spawned with a
+    half-carrier."""
+    if bool(task_context_scope) != bool(task_context_state_root):
+        raise ValueError(
+            "task_context_scope and task_context_state_root must be given "
+            "together (both or neither) -- got "
+            f"task_context_scope={task_context_scope!r}, "
+            f"task_context_state_root={task_context_state_root!r}"
+        )
     pairs: list[tuple[str, str]] = []
     if task_context_scope:
         pairs.append(("LOOP_TASK_CONTEXT_SCOPE", task_context_scope))
@@ -6731,6 +6750,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--scan-forbidden-markers requires --runtime claude")
     if args.additional_prompt and args.mode != "interactive":
         parser.error("--additional-prompt requires --mode interactive")
+    if bool(args.task_context_scope) != bool(args.task_context_state_root):
+        # Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 1: the two
+        # carrier flags are a single atomic pair -- reject a half-carrier
+        # here, before any worktree/child-process setup below, rather than
+        # letting it reach _task_context_env_pairs()'s own later raise.
+        parser.error(
+            "--task-context-scope and --task-context-state-root must be "
+            "given together (both or neither)"
+        )
     if args.additional_prompt and args.runtime != "claude":
         parser.error("--additional-prompt requires --runtime claude")
     # Issue #2219 fix_delta iteration 1 (Option B): the interactive lane's

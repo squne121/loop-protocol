@@ -151,7 +151,9 @@ def canonical_conn(state_root):
 def test_given_untouched_canonical_db_when_diffed_then_aggregate_passes(canonical_conn):
     before = verifier.snapshot_canonical_tables(canonical_conn)
     after = verifier.snapshot_canonical_tables(canonical_conn)
-    result = verifier.canonical_delta_contract(before, after)
+    result = verifier.canonical_delta_contract(
+        before, after, expected_task_id="unused-task-id", expected_activity_id="unused-activity-id"
+    )
     assert result.status == "pass"
     assert all(r.status == "pass" for r in result.forbidden_tables.values())
     assert result.execution_runs.status == "pass"
@@ -165,7 +167,9 @@ def test_given_single_valid_runtime_smoke_rollup_when_diffed_then_aggregate_pass
     verifier.roll_up_runtime_smoke_execution_run(canonical_conn, task_id=task["id"], activity_id=activity["id"])
 
     after = verifier.snapshot_canonical_tables(canonical_conn)
-    result = verifier.canonical_delta_contract(before, after)
+    result = verifier.canonical_delta_contract(
+        before, after, expected_task_id=task["id"], expected_activity_id=activity["id"]
+    )
     assert result.status == "pass", result.execution_runs.violations
     assert len(result.execution_runs.added) == 1
     added = result.execution_runs.added[0]
@@ -178,7 +182,9 @@ def test_given_forbidden_table_row_added_when_diffed_then_fails(canonical_conn):
     service.create_task(canonical_conn, title="unexpected canonical mutation")
     after = verifier.snapshot_canonical_tables(canonical_conn)
 
-    result = verifier.canonical_delta_contract(before, after)
+    result = verifier.canonical_delta_contract(
+        before, after, expected_task_id="unused-task-id", expected_activity_id="unused-activity-id"
+    )
     assert result.status == "fail"
     assert result.forbidden_tables["tasks"].status == "fail"
     assert result.forbidden_tables["tasks"].added
@@ -193,14 +199,16 @@ def test_given_more_than_one_runtime_smoke_row_added_when_diffed_then_fails(cano
     verifier.roll_up_runtime_smoke_execution_run(canonical_conn, task_id=task["id"], activity_id=activity["id"])
 
     after = verifier.snapshot_canonical_tables(canonical_conn)
-    result = verifier.assert_execution_runs_delta_contract(before, after)
+    result = verifier.assert_execution_runs_delta_contract(
+        before, after, expected_task_id=task["id"], expected_activity_id=activity["id"]
+    )
     assert result.status == "fail"
     assert any("exceeds max" in v for v in result.violations)
 
 
 def test_given_execution_run_with_non_null_binding_id_added_when_diffed_then_fails(canonical_conn):
     task = service.create_task(canonical_conn, title="parent task")
-    service.transition_activity(canonical_conn, task["id"], kind="work")
+    activity = service.transition_activity(canonical_conn, task["id"], kind="work")
     binding = service.create_binding(canonical_conn)
     before = verifier.snapshot_canonical_tables(canonical_conn)
 
@@ -211,7 +219,9 @@ def test_given_execution_run_with_non_null_binding_id_added_when_diffed_then_fai
     service.start_execution_run(canonical_conn, run_kind="native_operator", binding_id=binding["id"])
 
     after = verifier.snapshot_canonical_tables(canonical_conn)
-    result = verifier.assert_execution_runs_delta_contract(before, after)
+    result = verifier.assert_execution_runs_delta_contract(
+        before, after, expected_task_id=task["id"], expected_activity_id=activity["id"]
+    )
     assert result.status == "fail"
     assert any("run_kind" in v for v in result.violations)
 
@@ -227,9 +237,79 @@ def test_given_existing_execution_run_mutated_when_diffed_then_fails(canonical_c
     service.end_execution_run(canonical_conn, run["id"])
 
     after = verifier.snapshot_canonical_tables(canonical_conn)
-    result = verifier.assert_execution_runs_delta_contract(before, after)
+    result = verifier.assert_execution_runs_delta_contract(
+        before, after, expected_task_id=task["id"], expected_activity_id=activity["id"]
+    )
     assert result.status == "fail"
     assert any("mutated" in v for v in result.violations)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 3 (AC5 parent Task/
+# Activity attribution must be directly asserted in the DB delta)
+# ---------------------------------------------------------------------------
+
+
+def test_given_task_id_none_when_rolling_up_execution_run_then_raises(canonical_conn):
+    activity_task = service.create_task(canonical_conn, title="parent task")
+    activity = service.transition_activity(canonical_conn, activity_task["id"], kind="work")
+    with pytest.raises(ValueError):
+        verifier.roll_up_runtime_smoke_execution_run(canonical_conn, task_id=None, activity_id=activity["id"])
+
+
+def test_given_activity_id_none_when_rolling_up_execution_run_then_raises(canonical_conn):
+    task = service.create_task(canonical_conn, title="parent task")
+    with pytest.raises(ValueError):
+        verifier.roll_up_runtime_smoke_execution_run(canonical_conn, task_id=task["id"], activity_id=None)
+
+
+def test_given_added_row_bound_to_different_task_when_diffed_then_fails(canonical_conn):
+    task = service.create_task(canonical_conn, title="parent task")
+    activity = service.transition_activity(canonical_conn, task["id"], kind="work")
+    other_task = service.create_task(canonical_conn, title="a different task")
+    other_activity = service.transition_activity(canonical_conn, other_task["id"], kind="work")
+    before = verifier.snapshot_canonical_tables(canonical_conn)
+
+    verifier.roll_up_runtime_smoke_execution_run(
+        canonical_conn, task_id=other_task["id"], activity_id=other_activity["id"]
+    )
+
+    after = verifier.snapshot_canonical_tables(canonical_conn)
+    result = verifier.assert_execution_runs_delta_contract(
+        before, after, expected_task_id=task["id"], expected_activity_id=activity["id"]
+    )
+    assert result.status == "fail"
+    assert any("task_id" in v for v in result.violations)
+
+
+def test_given_added_row_bound_to_different_activity_under_same_task_when_diffed_then_fails(canonical_conn):
+    task = service.create_task(canonical_conn, title="parent task")
+    activity = service.transition_activity(canonical_conn, task["id"], kind="work")
+    other_activity = service.transition_activity(canonical_conn, task["id"], kind="review")
+    before = verifier.snapshot_canonical_tables(canonical_conn)
+
+    verifier.roll_up_runtime_smoke_execution_run(canonical_conn, task_id=task["id"], activity_id=other_activity["id"])
+
+    after = verifier.snapshot_canonical_tables(canonical_conn)
+    result = verifier.assert_execution_runs_delta_contract(
+        before, after, expected_task_id=task["id"], expected_activity_id=activity["id"]
+    )
+    assert result.status == "fail"
+    assert any("activity_id" in v for v in result.violations)
+
+
+def test_given_missing_expected_task_id_when_asserting_delta_contract_then_raises(canonical_conn):
+    before = verifier.snapshot_canonical_tables(canonical_conn)
+    after = verifier.snapshot_canonical_tables(canonical_conn)
+    with pytest.raises(ValueError):
+        verifier.assert_execution_runs_delta_contract(before, after, expected_task_id="", expected_activity_id="a1")
+
+
+def test_given_missing_expected_activity_id_when_asserting_delta_contract_then_raises(canonical_conn):
+    before = verifier.snapshot_canonical_tables(canonical_conn)
+    after = verifier.snapshot_canonical_tables(canonical_conn)
+    with pytest.raises(ValueError):
+        verifier.assert_execution_runs_delta_contract(before, after, expected_task_id="t1", expected_activity_id="")
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +329,9 @@ def test_given_isolated_smoke_fixture_when_checked_against_canonical_then_absent
 
     canonical_before = verifier.snapshot_canonical_tables(canonical_conn)
     canonical_after = verifier.snapshot_canonical_tables(canonical_conn)
-    result = verifier.canonical_delta_contract(canonical_before, canonical_after)
+    result = verifier.canonical_delta_contract(
+        canonical_before, canonical_after, expected_task_id="unused-task-id", expected_activity_id="unused-activity-id"
+    )
     assert result.status == "pass"
 
 
@@ -366,3 +448,136 @@ def test_given_missing_session_ids_when_asserted_then_fails_not_silently_assumed
     )
     assert evidence.status == "fail"
     assert any("missing pre_clear_session_id" in v for v in evidence.violations)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 1 (atomic carrier
+# integrity): runtime_smoke scope requires an explicit state-root; extra
+# cannot override the two reserved build_isolated_env() keys.
+# ---------------------------------------------------------------------------
+
+
+def test_given_runtime_smoke_scope_and_no_state_root_when_resolving_then_raises_before_canonical_fallback(
+    monkeypatch,
+):
+    monkeypatch.delenv(config.STATE_ROOT_ENV_VAR, raising=False)
+    monkeypatch.setenv(config.SCOPE_ENV_VAR, config.RUNTIME_SMOKE_SCOPE_VALUE)
+    with pytest.raises(ValueError, match=config.SCOPE_ENV_VAR):
+        config.resolve_state_root()
+
+
+def test_given_runtime_smoke_scope_and_empty_state_root_when_resolving_then_raises(monkeypatch):
+    monkeypatch.setenv(config.STATE_ROOT_ENV_VAR, "")
+    monkeypatch.setenv(config.SCOPE_ENV_VAR, config.RUNTIME_SMOKE_SCOPE_VALUE)
+    with pytest.raises(ValueError):
+        config.resolve_state_root()
+
+
+def test_given_non_runtime_smoke_scope_and_no_state_root_when_resolving_then_unchanged_canonical_behavior(
+    monkeypatch,
+):
+    monkeypatch.delenv(config.STATE_ROOT_ENV_VAR, raising=False)
+    monkeypatch.delenv(config.SCOPE_ENV_VAR, raising=False)
+    # Non-regression: a caller supplying neither carrier var must see
+    # exactly the pre-existing canonical resolution, no new exception.
+    result = config.resolve_state_root()
+    expected = config._default_xdg_state_home() / "loop-protocol" / "task-context" / "v1" / config.repo_instance_key()
+    assert result == expected
+
+
+def test_given_runtime_smoke_scope_with_state_root_but_env_var_stripped_when_smoke_seed_then_rejected(
+    state_root, runtime_smoke_scope, monkeypatch, capsys
+):
+    """AC6 extension: scope alone is not sufficient -- if the STATE_ROOT env
+    var itself is unset (even though the `state_root` fixture set it, we
+    strip it back off here), smoke seed must be rejected before
+    `_open_db_and_migrate()`, never falling back to the canonical DB."""
+    monkeypatch.delenv(config.STATE_ROOT_ENV_VAR, raising=False)
+    result, exit_code = _run_cli(["smoke", "seed"], envelope.build_request("smoke_seed", {}), monkeypatch, capsys)
+    assert exit_code == 2
+    assert result["code"] == "VALIDATION_ERROR"
+    assert not state_root.exists()
+
+
+def test_given_extra_attempts_to_override_reserved_keys_when_building_isolated_env_then_reserved_keys_win(tmp_path):
+    state_root = verifier.build_isolated_state_root(tmp_path, run_id="extra-override-check")
+    env = verifier.build_isolated_env(
+        state_root,
+        extra={
+            config.SCOPE_ENV_VAR: "not_runtime_smoke",
+            config.STATE_ROOT_ENV_VAR: "/tmp/attacker-controlled",
+            "SOME_OTHER_KEY": "kept",
+        },
+    )
+    assert env[config.SCOPE_ENV_VAR] == config.RUNTIME_SMOKE_SCOPE_VALUE
+    assert env[config.STATE_ROOT_ENV_VAR] == str(state_root)
+    assert env["SOME_OTHER_KEY"] == "kept"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2568 PR #2708 REQUEST_CHANGES fix_delta item 4 (P2): /clear causal
+# ordering evidence beyond same-Task/Activity/Binding + distinct sessions.
+# ---------------------------------------------------------------------------
+
+
+def test_given_real_causal_clear_event_in_order_when_asserted_then_passes():
+    evidence = verifier.assert_clear_causal_evidence(
+        pre_clear_execution_run={"ended_at": "2026-01-01T00:00:00+00:00"},
+        clear_event={
+            "metadata_json": json.dumps({"reason_code": "clear_restored_binding"}),
+            "occurred_at": "2026-01-01T00:00:01+00:00",
+        },
+        post_clear_execution_run={"started_at": "2026-01-01T00:00:02+00:00"},
+    )
+    assert evidence.status == "pass"
+
+
+def test_given_two_unrelated_sessions_with_no_real_clear_event_when_asserted_then_fails():
+    """Two unrelated sessions on the same Binding, with no real causal
+    clear-event ordering between them, must NOT pass this assertion."""
+    evidence = verifier.assert_clear_causal_evidence(
+        pre_clear_execution_run={"ended_at": "2026-01-01T00:00:00+00:00"},
+        clear_event=None,
+        post_clear_execution_run={"started_at": "2026-01-01T00:00:02+00:00"},
+    )
+    assert evidence.status == "fail"
+    assert any("missing clear-associated event evidence" in v for v in evidence.violations)
+
+
+def test_given_clear_event_with_wrong_reason_code_when_asserted_then_fails():
+    evidence = verifier.assert_clear_causal_evidence(
+        pre_clear_execution_run={"ended_at": "2026-01-01T00:00:00+00:00"},
+        clear_event={
+            "metadata": {"reason_code": "startup_new_binding"},
+            "occurred_at": "2026-01-01T00:00:01+00:00",
+        },
+        post_clear_execution_run={"started_at": "2026-01-01T00:00:02+00:00"},
+    )
+    assert evidence.status == "fail"
+    assert any("reason_code" in v for v in evidence.violations)
+
+
+def test_given_clear_event_out_of_causal_order_when_asserted_then_fails():
+    evidence = verifier.assert_clear_causal_evidence(
+        pre_clear_execution_run={"ended_at": "2026-01-01T00:00:05+00:00"},
+        clear_event={
+            "metadata": {"reason_code": "clear_restored_binding"},
+            "occurred_at": "2026-01-01T00:00:01+00:00",
+        },
+        post_clear_execution_run={"started_at": "2026-01-01T00:00:02+00:00"},
+    )
+    assert evidence.status == "fail"
+    assert any("causal ordering violated" in v for v in evidence.violations)
+
+
+def test_given_missing_pre_clear_execution_run_when_asserted_then_fails():
+    evidence = verifier.assert_clear_causal_evidence(
+        pre_clear_execution_run=None,
+        clear_event={
+            "metadata": {"reason_code": "clear_restored_binding"},
+            "occurred_at": "2026-01-01T00:00:01+00:00",
+        },
+        post_clear_execution_run={"started_at": "2026-01-01T00:00:02+00:00"},
+    )
+    assert evidence.status == "fail"
+    assert any("pre_clear_execution_run" in v for v in evidence.violations)
