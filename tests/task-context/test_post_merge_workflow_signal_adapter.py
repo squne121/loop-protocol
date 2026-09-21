@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -152,3 +153,77 @@ def test_given_partial_failed_or_human_review_receipt_when_cleanup_completion_ru
             "disposition": "deferred",
             "reason_code": "CLEANUP_NOT_FINAL_SUCCESS",
         }
+
+
+def test_given_explicit_origin_session_id_when_run_invokes_ctl_then_child_env_overrides_claude_code_session_id(
+    monkeypatch,
+):
+    """Issue #2719 AC3: mirrors `.claude/hooks/task_context/ctl_client.py`'s
+    explicit `child_env["CLAUDE_CODE_SESSION_ID"] = origin_session_id`
+    override -- an ambient, differently-valued `CLAUDE_CODE_SESSION_ID`
+    inherited by this adapter's own process must never leak into the
+    `task_contextctl.py` child process when a caller-supplied
+    `origin_session_id` is given."""
+    captured: dict = {}
+
+    def fake_subprocess_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"data": {"disposition": "applied"}}), stderr="")
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "ambient-session")
+    monkeypatch.setattr(post_merge_signal.subprocess, "run", fake_subprocess_run)
+
+    result = post_merge_signal._run(["signal", "apply"], {"k": "v"}, origin_session_id="override-session")
+
+    assert result == {"disposition": "applied"}
+    assert captured["env"] is not None
+    assert captured["env"]["CLAUDE_CODE_SESSION_ID"] == "override-session"
+
+
+def test_given_no_origin_session_id_when_run_invokes_ctl_then_child_env_falls_back_to_ambient_value(monkeypatch):
+    captured: dict = {}
+
+    def fake_subprocess_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"data": {"disposition": "applied"}}), stderr="")
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "ambient-session")
+    monkeypatch.setattr(post_merge_signal.subprocess, "run", fake_subprocess_run)
+
+    post_merge_signal._run(["signal", "apply"], {"k": "v"})
+
+    assert captured["env"]["CLAUDE_CODE_SESSION_ID"] == "ambient-session"
+
+
+def test_given_origin_session_id_flag_when_main_runs_merged_phase_then_it_is_forwarded_to_run(
+    tmp_path, monkeypatch, capsys
+):
+    snapshot_file = tmp_path / "snapshot.json"
+    snapshot_file.write_text(json.dumps(_merged_snapshot()), encoding="utf-8")
+    captured_calls: list = []
+
+    def fake_run(argv, body, *, origin_session_id=None):
+        captured_calls.append(origin_session_id)
+        return {"disposition": "deferred", "reason_code": "STUBBED"}
+
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.setattr(post_merge_signal, "_run", fake_run)
+
+    assert (
+        post_merge_signal.main(
+            [
+                "--snapshot-file",
+                str(snapshot_file),
+                "--issue-number",
+                "20",
+                "--pr-number",
+                "21",
+                "--phase",
+                "merged",
+                "--origin-session-id",
+                "flag-session",
+            ]
+        )
+        == 0
+    )
+    assert captured_calls == ["flag-session"]

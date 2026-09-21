@@ -188,22 +188,152 @@ def _metadata_matches(row: sqlite3.Row, **wanted: Any) -> bool:
     return all(metadata.get(key) == value for key, value in wanted.items())
 
 
+_MANAGED_ORIGIN_RUN_KINDS = ("native_operator", "claude_gpt")
+_ORIGIN_UNBOUND_REASON = "unbound"
+_ORIGIN_RESOLUTION_FAILURE_EVENT_TYPE = "workflow:origin_resolution_failed"
+
+
+def _classify_origin_candidates(
+    candidates: list[Any], origin_session_id: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Evaluate raw LEFT JOIN origin candidates predicate-by-predicate.
+
+    Issue #2719 AC1: rather than collapsing every failure mode into the
+    single opaque ``unbound`` the previous 6-predicate-ANDed SQL query
+    produced, each candidate row is walked through the same predicates in a
+    fixed order so the specific cause is distinguishable:
+    ``origin_run_ended`` -> ``origin_run_kind_mismatch`` ->
+    ``origin_task_unattached`` -> ``origin_binding_session_mismatch``.
+    ``origin_ambiguous`` covers >1 candidate passing every predicate; this
+    is unreachable through any real write path today (the
+    ``ux_execution_runs_open_managed_session`` partial unique index already
+    forbids two simultaneously open+managed ExecutionRuns sharing one
+    ``claude_session_id`` -- the pre-decomposition code carried the exact
+    same ``len(rows) != 1`` defensive check), but is kept as a distinct,
+    directly testable reason-code for defense-in-depth against a future
+    schema change or a raw-SQL bypass of the typed service layer.
+
+    ``candidates`` rows only need mapping-style ``row["column"]`` access
+    (a plain ``dict`` or a ``sqlite3.Row`` both work), which lets tests
+    exercise this pure classification independently of the SQL fetch.
+    """
+    if not candidates:
+        return None, _outcome("deferred", "origin_run_not_found")
+    matched: list[Any] = []
+    last_failure: dict[str, Any] | None = None
+    for row in candidates:
+        if row["ended_at"] is not None:
+            reason = "origin_run_ended"
+        elif row["run_kind"] not in _MANAGED_ORIGIN_RUN_KINDS:
+            reason = "origin_run_kind_mismatch"
+        elif row["task_id"] is None:
+            reason = "origin_task_unattached"
+        elif row["binding_session_id"] != origin_session_id:
+            reason = "origin_binding_session_mismatch"
+        else:
+            matched.append(row)
+            continue
+        last_failure = _outcome(
+            "deferred",
+            reason,
+            execution_run_id=row["execution_run_id"],
+            task_id=row["task_id"],
+            activity_id=row["activity_id"],
+            binding_id=row["binding_id"],
+        )
+    if len(matched) > 1:
+        anchor = matched[0]
+        return None, _outcome(
+            "deferred",
+            "origin_ambiguous",
+            execution_run_id=anchor["execution_run_id"],
+            task_id=anchor["task_id"],
+            activity_id=anchor["activity_id"],
+            binding_id=anchor["binding_id"],
+            count=len(matched),
+        )
+    if len(matched) == 1:
+        row = matched[0]
+        return {
+            "execution_run_id": row["execution_run_id"],
+            "task_id": row["task_id"],
+            "activity_id": row["activity_id"],
+            "binding_id": row["binding_id"],
+        }, None
+    assert last_failure is not None
+    return None, last_failure
+
+
 def _resolve_origin_tx(
     conn: sqlite3.Connection, origin_session_id: str | None
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Resolve the one live, managed-operator ExecutionRun bound to
+    ``origin_session_id``.
+
+    On failure this returns the *specific* reason_code (one of the 7 Issue
+    #2719 codes) as internal diagnostic detail -- callers that only need
+    the frozen public ``unbound`` disposition (Issue #2565 contract) call
+    ``_unbound_outcome()`` themselves instead of returning this function's
+    outcome verbatim; ``apply_workflow_signal`` additionally persists this
+    specific reason_code into the ``events`` journal (AC2) before doing so.
+    """
     if not origin_session_id:
-        return None, _outcome("deferred", "unbound")
-    rows = conn.execute(
-        "SELECT er.id AS execution_run_id, er.task_id, er.activity_id, er.binding_id "
-        "FROM execution_runs er JOIN tab_bindings tb ON tb.id = er.binding_id "
-        "WHERE er.claude_session_id = ? AND er.ended_at IS NULL "
-        "AND er.run_kind IN ('native_operator', 'claude_gpt') "
-        "AND tb.current_claude_session_id = ? AND er.task_id IS NOT NULL",
-        (origin_session_id, origin_session_id),
+        return None, _outcome("deferred", "origin_session_missing")
+    candidates = conn.execute(
+        "SELECT er.id AS execution_run_id, er.task_id, er.activity_id, er.binding_id, "
+        "er.ended_at, er.run_kind, tb.current_claude_session_id AS binding_session_id "
+        "FROM execution_runs er LEFT JOIN tab_bindings tb ON tb.id = er.binding_id "
+        "WHERE er.claude_session_id = ? "
+        "ORDER BY er.started_at ASC, er.id ASC",
+        (origin_session_id,),
     ).fetchall()
-    if len(rows) != 1:
-        return None, _outcome("deferred", "unbound")
-    return dict(rows[0]), None
+    return _classify_origin_candidates(candidates, origin_session_id)
+
+
+def _unbound_outcome() -> dict[str, Any]:
+    """The frozen public disposition for every origin-resolution failure
+    (Issue #2565 contract, preserved by Issue #2719). ``_resolve_origin_tx``'s
+    specific reason_code is a diagnostic-only detail persisted separately
+    (see ``_record_origin_resolution_failure_tx``); it is never surfaced as
+    this outcome's own ``reason_code`` so every existing
+    ``{"disposition": "deferred", "reason_code": "unbound"}`` consumer
+    contract keeps working unchanged."""
+    return _outcome("deferred", _ORIGIN_UNBOUND_REASON)
+
+
+def _record_origin_resolution_failure_tx(
+    conn: sqlite3.Connection, payload: dict[str, Any], failure: dict[str, Any]
+) -> None:
+    """Persist AC1's specific reason_code into the append-only ``events``
+    journal (AC2) whenever at least one ExecutionRun candidate could be
+    identified for the failure.
+
+    ``origin_session_missing`` / ``origin_run_not_found`` carry no
+    resolvable ExecutionRun/Task at all and are deliberately NOT persisted
+    here: this preserves the pre-existing "an unbound origin resolution is
+    fully non-mutating" regression guarantee those two reason codes'
+    fixtures exercise (Issue #2690/#2692 fix_delta;
+    ``test_given_unbound_origin_when_fact_applied_then_it_is_deferred_before_dedupe_or_claim_mutation``
+    and its ``mutation_counts`` siblings)."""
+    execution_run_id = failure.get("execution_run_id")
+    if execution_run_id is None:
+        return
+    metadata: dict[str, Any] = {
+        "reason_code": failure["reason_code"],
+        "signal_kind": payload["signal_kind"],
+        "source": payload["source"],
+    }
+    if "count" in failure:
+        metadata["count"] = failure["count"]
+    service._append_event_tx(
+        conn,
+        event_type=_ORIGIN_RESOLUTION_FAILURE_EVENT_TYPE,
+        task_id=failure.get("task_id"),
+        activity_id=failure.get("activity_id"),
+        binding_id=failure.get("binding_id"),
+        execution_run_id=execution_run_id,
+        metadata=metadata,
+    )
 
 
 def _claim_tx(conn: sqlite3.Connection, task_id: str, repo: str, kind: str, number: int) -> None:
@@ -353,9 +483,10 @@ def apply_workflow_signal(
     key = dedupe_key_for(valid)
     try:
         with db.write_transaction(conn):
-            origin, outcome = _resolve_origin_tx(conn, origin_session_id)
-            if outcome:
-                return outcome
+            origin, origin_failure = _resolve_origin_tx(conn, origin_session_id)
+            if origin_failure:
+                _record_origin_resolution_failure_tx(conn, valid, origin_failure)
+                return _unbound_outcome()
             assert origin is not None
             task_id, kind, evidence = origin["task_id"], valid["signal_kind"], valid["evidence"]
             if kind == "implementation_pr_observed":
@@ -537,9 +668,9 @@ def begin_cleanup_lifecycle(
         },
     }
     with db.write_transaction(conn):
-        origin, outcome = _resolve_origin_tx(conn, origin_session_id)
-        if outcome:
-            return outcome
+        origin, origin_failure = _resolve_origin_tx(conn, origin_session_id)
+        if origin_failure:
+            return _unbound_outcome()
         assert origin is not None
         task_id = origin["task_id"]
         accepted = _accepted_event_tx(conn, dedupe_key_for(merge_payload))
