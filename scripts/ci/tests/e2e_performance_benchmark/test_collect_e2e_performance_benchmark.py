@@ -2700,7 +2700,7 @@ def _mcf_gate_ready_artifact(
     workflow_run_id: int,
     *,
     run_attempt: int = 1,
-    run_started_at: str = "2026-09-01T00:00:00Z",
+    run_started_at: str | None = "2026-09-01T00:00:00Z",
     gate_ready_at: str | None = "2026-09-01T00:05:00Z",
 ) -> dict:
     """Shaped like the REAL gate-ready producer artifact
@@ -2818,6 +2818,12 @@ def test_materialize_cohort_fixture_monolith_never_receives_responsive_baseline_
 # AC3/AC4: Producer -> Consumer gate-ready field adapter.
 # --------------------------------------------------------------------------- #
 def test_materialize_cohort_fixture_gate_ready_adapter_renames_fields_ac3():
+    """#2672 AC3 (PR #2698 review P1): `run_id` -> `workflow_run_id` and
+    `gate_ready_at` -> `check_completed_at` are pure KEY renames -- the
+    producer's raw (numeric-STRING-shaped, per `ci_job_snapshot.py`)
+    `run_id`/`run_attempt` values must survive UNCHANGED into the
+    fixture, never int-coerced by the separate int-normalized identity
+    `_gate_ready_identity_key()` uses internally for MATCHING only."""
     manifest = _mcf_manifest([_block("block-0003", 503001, 503002)])
     artifacts = [
         _mcf_provider_artifact("e2e-core", 503001, block_id="block-0003", layout="monolith"),
@@ -2828,8 +2834,10 @@ def test_materialize_cohort_fixture_gate_ready_adapter_renames_fields_ac3():
     ]
     fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
     record = fixture["before"]["gate_ready_baselines"][0]
-    assert record["workflow_run_id"] == 503001
-    assert record["run_attempt"] == 1
+    # Raw producer-shaped STRINGS preserved verbatim (AC3) -- NOT
+    # int-coerced to 503001 / 1.
+    assert record["workflow_run_id"] == "503001"
+    assert record["run_attempt"] == "1"
     assert record["run_started_at"] == "2026-09-01T00:00:00Z"
     assert record["check_completed_at"] == "2026-09-01T00:07:00Z"
     assert "run_id" not in record
@@ -2851,9 +2859,29 @@ def test_materialize_cohort_fixture_gate_ready_missing_gate_ready_at_not_fabrica
     ]
     fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
     record = fixture["before"]["gate_ready_baselines"][0]
-    assert record["workflow_run_id"] == 504001
+    # Raw producer-shaped STRING preserved verbatim (AC3) -- NOT
+    # int-coerced to 504001.
+    assert record["workflow_run_id"] == "504001"
     assert "check_completed_at" not in record
     assert record["run_started_at"] == "2026-09-01T00:00:00Z"
+
+
+def test_materialize_cohort_fixture_gate_ready_run_started_at_null_preserved_as_present_key_ac3():
+    """#2672 AC3 (PR #2698 review P1): the real producer
+    (`compute_gate_ready_latency_artifact`) always sets `run_started_at`,
+    defaulting to `None` when the snapshot lacks a usable timestamp --
+    that `None` must be preserved as a PRESENT key with a `null` value in
+    the fixture record, never silently omitted."""
+    manifest = _mcf_manifest([_block("block-0003b", 503101, 503102)])
+    artifacts = [
+        _mcf_gate_ready_artifact(503101, run_started_at=None, gate_ready_at=None),
+        _mcf_gate_ready_artifact(503102),
+    ]
+    fixture = collector.materialize_cohort_fixture(manifest, artifacts, _mcf_assessment_context())
+    record = fixture["before"]["gate_ready_baselines"][0]
+    assert "run_started_at" in record
+    assert record["run_started_at"] is None
+    assert "check_completed_at" not in record
 
 
 # --------------------------------------------------------------------------- #
@@ -3049,6 +3077,22 @@ def test_write_cohort_fixture_atomic_preserves_existing_output_on_failure_ac22(t
     assert output_path.read_text(encoding="utf-8") == '{"good": true}\n'
 
 
+def test_write_cohort_fixture_atomic_wraps_oserror_as_operational_error_and_cleans_up_tmp_ac22(tmp_path):
+    """#2672 AC22 (PR #2698 review P2): a FILESYSTEM-level failure (here:
+    `path` itself is an existing DIRECTORY, so the final `os.replace`
+    raises `IsADirectoryError`, an `OSError` subclass) must surface as
+    `OperationalErrorV2` -- never an uncaught traceback -- so
+    `main_materialize_cohort_fixture()`'s existing exit-code-3 structured
+    failure path handles it, and must never leave an orphaned
+    `*.tmp-*` temp file behind in the output directory."""
+    output_path = tmp_path / "cohort_fixture.json"
+    output_path.mkdir()  # `path` is a directory, not a file -- forces os.replace to raise OSError.
+    with pytest.raises(collector.OperationalErrorV2):
+        collector._write_cohort_fixture_atomic(str(output_path), {"a": 1})
+    leftover = [p.name for p in tmp_path.iterdir() if p.name != "cohort_fixture.json"]
+    assert leftover == []
+
+
 def test_write_cohort_fixture_atomic_output_has_stable_key_order_and_terminal_newline_ac14():
     output = {}
     import tempfile as _tempfile
@@ -3206,6 +3250,153 @@ def test_materialize_cohort_fixture_cli_subprocess_fatal_boundary_exit_code_ac7_
     assert result.returncode != 0
     assert result.returncode != 5
     assert not output_path.exists()
+
+
+def _run_materialize_cohort_fixture_cli(
+    *, manifest_path, artifact_dir, assessment_context_path, output_path
+):
+    return subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "materialize-cohort-fixture",
+            "--manifest",
+            str(manifest_path),
+            "--artifact-dir",
+            str(artifact_dir),
+            "--assessment-context",
+            str(assessment_context_path),
+            "--output",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# AC22 (PR #2698 review P2): the CLI BOUNDARY, not merely the internal
+# `_write_cohort_fixture_atomic()` writer in isolation, must preserve an
+# existing valid `cohort_fixture.json` byte-for-byte when generation
+# fails -- for both of the two failure paths this subcommand can reach
+# BEFORE the writer is ever invoked.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_cli_subprocess_preserves_existing_output_on_missing_evidence_failure_ac22(
+    tmp_path,
+):
+    """AC7 condition 1 (no evidence for a manifest run) reached through
+    the real CLI entrypoint -- a pre-existing good `cohort_fixture.json`
+    must be left byte-for-byte untouched."""
+    manifest = _mcf_manifest([_block("block-0022a", 522101, 522102)])
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()  # no evidence at all.
+    assessment_context_path = tmp_path / "assessment_context.json"
+    assessment_context_path.write_text(json.dumps(_mcf_assessment_context()), encoding="utf-8")
+    output_path = tmp_path / "cohort_fixture.json"
+    sentinel_bytes = b'{"sentinel": "pre-existing-good-output-missing-evidence"}\n'
+    output_path.write_bytes(sentinel_bytes)
+
+    result = _run_materialize_cohort_fixture_cli(
+        manifest_path=manifest_path,
+        artifact_dir=artifact_dir,
+        assessment_context_path=assessment_context_path,
+        output_path=output_path,
+    )
+    assert result.returncode != 0, result.stderr
+    assert output_path.read_bytes() == sentinel_bytes
+
+
+def test_materialize_cohort_fixture_cli_subprocess_preserves_existing_output_on_evidence_errors_failure_ac22(
+    tmp_path,
+):
+    """AC7 condition 4 (non-empty manifest-level `evidence_errors`,
+    losslessly-unrepresentable in `cohort_fixture.json`'s documented
+    shape) reached through the real CLI entrypoint -- the SAME
+    preservation guarantee, exercised via the OTHER (pre-artifact-scan
+    manifest-rejection) failure path."""
+    manifest = _mcf_manifest([_block("block-0022b", 522201, 522202)])
+    manifest["evidence_errors"] = [
+        {"block_id": "block-0022b", "reason": "synthetic", "detail": "synthetic detail"}
+    ]
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    assessment_context_path = tmp_path / "assessment_context.json"
+    assessment_context_path.write_text(json.dumps(_mcf_assessment_context()), encoding="utf-8")
+    output_path = tmp_path / "cohort_fixture.json"
+    sentinel_bytes = b'{"sentinel": "pre-existing-good-output-evidence-errors"}\n'
+    output_path.write_bytes(sentinel_bytes)
+
+    result = _run_materialize_cohort_fixture_cli(
+        manifest_path=manifest_path,
+        artifact_dir=artifact_dir,
+        assessment_context_path=assessment_context_path,
+        output_path=output_path,
+    )
+    assert result.returncode != 0, result.stderr
+    assert output_path.read_bytes() == sentinel_bytes
+
+
+# --------------------------------------------------------------------------- #
+# AC14/AC21 (PR #2698 review P3): the byte-identical-determinism
+# guarantee must hold for the ACTUAL bytes the dedicated serializer
+# writes to disk via the real CLI boundary -- comparing
+# `json.dumps(..., sort_keys=True)` of two in-memory Python objects (as
+# the pre-fix_delta test below still separately does) cannot observe the
+# real serializer's own key ordering / terminal newline / NaN-rejection
+# behavior actually exercised at that boundary.
+# --------------------------------------------------------------------------- #
+def test_materialize_cohort_fixture_cli_subprocess_output_bytes_identical_regardless_of_artifact_dir_order_ac14_ac21(
+    tmp_path,
+):
+    """Two `--artifact-dir`s carry the IDENTICAL artifact payload SET but
+    in deliberately REVERSED path-sort file-name order; both real CLI
+    invocations must write byte-for-byte identical `cohort_fixture.json`
+    files."""
+    manifest = _mcf_manifest([_block("block-0023", 523001, 523002)])
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assessment_context_path = tmp_path / "assessment_context.json"
+    assessment_context_path.write_text(json.dumps(_mcf_assessment_context()), encoding="utf-8")
+
+    artifacts = [
+        _mcf_provider_artifact("e2e-core", 523001, block_id="block-0023", layout="monolith"),
+        _mcf_provider_artifact("e2e-core", 523002, block_id="block-0023", layout="split"),
+        _mcf_provider_artifact("e2e-responsive-matrix", 523002, block_id="block-0023", layout="split"),
+        _mcf_gate_ready_artifact(523001),
+        _mcf_gate_ready_artifact(523002),
+    ]
+
+    forward_dir = tmp_path / "artifacts_forward"
+    reversed_dir = tmp_path / "artifacts_reversed"
+    forward_dir.mkdir()
+    reversed_dir.mkdir()
+    last_index = len(artifacts) - 1
+    for index, artifact in enumerate(artifacts):
+        (forward_dir / f"{index:02d}.json").write_text(json.dumps(artifact), encoding="utf-8")
+        (reversed_dir / f"{last_index - index:02d}.json").write_text(json.dumps(artifact), encoding="utf-8")
+
+    forward_output = tmp_path / "cohort_fixture_forward.json"
+    reversed_output = tmp_path / "cohort_fixture_reversed.json"
+    forward_result = _run_materialize_cohort_fixture_cli(
+        manifest_path=manifest_path,
+        artifact_dir=forward_dir,
+        assessment_context_path=assessment_context_path,
+        output_path=forward_output,
+    )
+    reversed_result = _run_materialize_cohort_fixture_cli(
+        manifest_path=manifest_path,
+        artifact_dir=reversed_dir,
+        assessment_context_path=assessment_context_path,
+        output_path=reversed_output,
+    )
+    assert forward_result.returncode == 0, forward_result.stderr
+    assert reversed_result.returncode == 0, reversed_result.stderr
+    assert forward_output.read_bytes() == reversed_output.read_bytes()
 
 
 # --------------------------------------------------------------------------- #

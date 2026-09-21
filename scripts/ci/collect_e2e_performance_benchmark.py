@@ -92,6 +92,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -2710,24 +2711,34 @@ def _dedupe_artifacts_by_identity(keyed: dict[tuple, list[dict]]) -> tuple[dict[
     return resolved, conflicts
 
 
-def _build_gate_ready_record(payload: dict, workflow_run_id: int, run_attempt: int) -> dict:
+def _build_gate_ready_record(payload: dict) -> dict:
     """#2672 AC3/AC4: the explicit Producer -> Consumer field rename
     adapter -- producer `run_id`/`gate_ready_at` become fixture
-    `workflow_run_id`/`check_completed_at` (values propagated verbatim,
-    NEVER recomputed); `run_attempt`/`run_started_at` keep their meaning
-    and value unchanged. A producer artifact missing `gate_ready_at`
-    (the diagnostic-only omission `scripts/ci/ci_job_snapshot.py::
-    compute_gate_ready_latency_artifact` records instead, e.g.
+    `workflow_run_id`/`check_completed_at` via KEY RENAME ONLY, with the
+    VALUE propagated verbatim from `payload`, NEVER recomputed and NEVER
+    int-coerced (PR #2698 review P1: the real producer
+    `scripts/ci/ci_job_snapshot.py::compute_gate_ready_latency_artifact`
+    emits `run_id`/`run_attempt` as numeric STRINGS from
+    `GH_RUN_ID`/`GH_RUN_ATTEMPT`, and the real consumer's
+    `_normalize_run_attempt()` already accepts that producer shape, so
+    there is no consumer-side need to coerce here). This is intentionally
+    decoupled from the separate int-normalized identity
+    `_gate_ready_identity_key()` computes for MATCHING only -- that
+    normalization must never leak into this output projection.
+    `run_started_at` is always emitted as a PRESENT key (verbatim,
+    including `None`, since the real producer always sets this key,
+    defaulting to `None` when the snapshot lacks a usable timestamp) --
+    never omitted, and never fabricated. A producer artifact missing
+    `gate_ready_at` (the diagnostic-only omission
+    `compute_gate_ready_latency_artifact` records instead, e.g.
     `job_not_completed`) leaves `check_completed_at` OUT of the fixture
     record entirely -- no fabricated timestamp is ever synthesized; the
     existing consumer's invalid-timestamp taxonomy classifies the gap."""
     record: dict = {
-        "workflow_run_id": workflow_run_id,
-        "run_attempt": run_attempt,
+        "workflow_run_id": payload.get("run_id"),
+        "run_attempt": payload.get("run_attempt"),
+        "run_started_at": payload.get("run_started_at"),
     }
-    run_started_at = payload.get("run_started_at")
-    if isinstance(run_started_at, str) and run_started_at:
-        record["run_started_at"] = run_started_at
     gate_ready_at = payload.get("gate_ready_at")
     if isinstance(gate_ready_at, str) and gate_ready_at:
         record["check_completed_at"] = gate_ready_at
@@ -2896,7 +2907,7 @@ def materialize_cohort_fixture(manifest: dict, artifacts: list[dict], assessment
         if gate_ready_candidate is not None:
             run_has_any_evidence = True
             arms[arm_name]["gate_ready_baselines"].append(
-                _build_gate_ready_record(gate_ready_candidate, workflow_run_id, run_attempt)
+                _build_gate_ready_record(gate_ready_candidate)
             )
 
         if not run_has_any_evidence:
@@ -3001,7 +3012,14 @@ def _write_cohort_fixture_atomic(path: str, data: Any) -> None:
     opened for writing before serialization succeeds, so a failure here
     (or in the caller, before this function is even reached) always
     leaves any pre-existing good `path` completely untouched (#2672
-    AC14/AC22)."""
+    AC14/AC22). PR #2698 review P2: any FILESYSTEM-level failure
+    (`os.makedirs`, temp-file creation/write/fsync, or the final
+    `os.replace`) is wrapped as `OperationalErrorV2` (chained via
+    `from exc`) -- never an uncaught traceback -- so
+    `main_materialize_cohort_fixture()`'s existing exit-code-3
+    structured-failure handling covers it too, and any temp file created
+    before the failure is best-effort removed rather than left
+    orphaned."""
     try:
         text = json.dumps(
             data,
@@ -3017,13 +3035,24 @@ def _write_cohort_fixture_atomic(path: str, data: Any) -> None:
         text += "\n"
 
     output_dir = os.path.dirname(path) or "."
-    os.makedirs(output_dir, exist_ok=True)
-    tmp_path = f"{path}.tmp-{os.getpid()}"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp_path, path)
+    tmp_path: str | None = None
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=output_dir, prefix=f"{os.path.basename(path)}.tmp-")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    except OSError as exc:
+        raise OperationalErrorV2(f"cohort_fixture_write_failed: {exc}") from exc
+    finally:
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def parse_materialize_cohort_fixture_args(argv: list[str] | None = None) -> argparse.Namespace:
