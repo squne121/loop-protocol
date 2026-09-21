@@ -469,24 +469,26 @@ def _child_safety_and_compatibility_errors(subtask: Mapping[str, Any], rgh: Any)
         # Iteration 3 Blocker 3 (deliberate v1 design decision, documented
         # per reviewer request rather than implementing full per-attempt
         # budget accounting): provider="auto" internally re-enters
-        # run_delegation() once per candidate provider in
-        # PROVIDER_AUTO_RUNTIME_ORDER (gemini, then agy fallback) *inside a
-        # single child subprocess*. From the orchestrator's point of view
-        # that subprocess still consumes exactly one max_total_attempts slot
-        # and exactly one "auto" provider-semaphore slot -- but it may
-        # actually invoke both the gemini and agy CLIs underneath, which are
-        # not separately budgeted. Building real per-attempt budget handoff
-        # would require the orchestrator to intercept run_delegation()'s
-        # internal provider_auto_dispatch() loop (a non-trivial coupling
-        # into run_gemini_headless.py's retry machinery), which is out of
+        # run_delegation() once for each candidate provider in PROVIDER_AUTO_RUNTIME_ORDER order,
+        # *inside a single child subprocess*. From the orchestrator's
+        # point of view that subprocess still consumes exactly one
+        # max_total_attempts slot and exactly one
+        # "auto" provider-semaphore slot -- but it may actually invoke both
+        # the gemini and agy CLIs underneath, which are not separately
+        # budgeted. Building real per-attempt budget handoff would require
+        # the orchestrator to intercept run_delegation()'s internal
+        # provider_auto_dispatch() loop (a non-trivial coupling into
+        # run_gemini_headless.py's retry machinery), which is out of
         # proportion for a fix_delta iteration. Banning provider="auto" for
         # fan-out children removes the specific double-counting/semaphore-
         # bypass risk; callers that want provider fallback can submit
         # separate gemini and agy subtasks explicitly instead.
         errors.append(
             "provider_profile_incompatible: provider=auto is forbidden for fan-out children in v1 "
-            "-- its internal gemini-then-agy fallback attempts are not accounted for by "
-            "max_total_attempts / per-provider semaphores; submit explicit gemini/agy subtasks instead"
+            "-- its internal per-candidate-provider fallback attempts ("
+            "up to one provider-level attempt for each candidate reached in PROVIDER_AUTO_RUNTIME_ORDER"
+            ") are not accounted for by max_total_attempts / per-provider semaphores; submit "
+            "explicit gemini/agy subtasks instead"
         )
     elif provider == "agy" and tool_profile not in rgh.AGY_SUPPORTED_PROFILES:
         errors.append(
