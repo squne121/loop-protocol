@@ -218,7 +218,7 @@ intake_gate:
   evaluated_at: "<ISO8601>"
 ```
 
-## 0-a-0. Evidence-Based Landing Disposition（pre-Step-1 duplicate-dispatch choke point、#2699）
+## 0-a-0. Evidence-Based Landing Disposition（実装済み scope を確認する pre-Step-1 duplicate-dispatch choke point、#2699）
 
 Root-owned entry transition が fresh `invoke_impl_review_loop` を返し、既存の
 Already-Satisfied choke point が `dispatch_step1: true` を返した後、worker dispatch、
