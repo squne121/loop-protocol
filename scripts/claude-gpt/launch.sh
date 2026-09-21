@@ -1159,6 +1159,34 @@ export STRICT_MCP_MODE
 #     `GH_TOKEN` 系 / `GH_HOST` / `GH_REPO` も ambient 値をそのまま unset せず
 #     子プロセスへ引き継ぐ。`SSH_AUTH_SOCK` / `GIT_ASKPASS` 系（GitHub auth とは
 #     無関係）は引き続き scrub する。 ---
+# --- Issue #2670: 承認済み file-backed AGY account session source-path の
+#     pre-isolation handoff。`agy_permission_policy.py` の
+#     `_real_home_agy_oauth_token_file()` は唯一の承認済み source を
+#     `$HOME/.gemini/antigravity-cli/antigravity-oauth-token` として
+#     ambient `$HOME` から導出するが、直後の `export HOME=...`（isolated
+#     HOME への差し替え）以降にその lookup を行う経路（この launcher が
+#     起動する Claude-GPT outer 配下の任意の inner test-runner / AGY
+#     呼び出し）からは、ambient `$HOME` が新規かつ空の isolated HOME に
+#     なっているため、実 host にその source ファイルが存在していても
+#     構造的に見えなくなる（本 Issue の Outcome 節）。
+#     この block は isolation 直前・実 ambient `$HOME` がまだ real host
+#     値である時点で、承認済み root（`$HOME/.gemini/antigravity-cli`）と
+#     その配下の exact source path を一緒に捕捉し、この 2 値だけを持つ
+#     専用 non-secret path handoff interface（`AGY_OAUTH_TOKEN_HANDOFF_ROOT`
+#     / `AGY_OAUTH_TOKEN_HANDOFF_SOURCE`）として `agy_permission_policy.py`
+#     へ引き渡す。broad な HOME/XDG passthrough や汎用 environment channel
+#     ではなく、この 2 path 値のみの path-only transport であり、origin
+#     authentication・trusted channel・security control のいずれでもない
+#     -- `agy_permission_policy.py::resolve_agy_oauth_token_source()` が
+#     両値を独立に正規化・structural revalidation してから初めて候補
+#     entry を承認済み source として扱う（Issue #2670 AC1/AC2）。承認済み
+#     source が実際に存在するか否かに関わらず常にこの 2 値を渡す -- 存在
+#     しない場合の判定（`source_absent`）は policy 側の revalidation が
+#     行う。値は export するのみで、この launcher 自身は一切 log・
+#     display・ファイル書き込みしない。
+export AGY_OAUTH_TOKEN_HANDOFF_ROOT="${HOME}/.gemini/antigravity-cli"
+export AGY_OAUTH_TOKEN_HANDOFF_SOURCE="${AGY_OAUTH_TOKEN_HANDOFF_ROOT}/antigravity-oauth-token"
+
 export HOME="$CLAUDE_ISOLATED_HOME_TARGET"
 export GH_CONFIG_DIR="$CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET"
 export XDG_CONFIG_HOME="$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET"
