@@ -92,6 +92,14 @@ def test_given_pre_tool_use_when_processed_then_observability_only_pass(conn):
     assert result["reason_code"] == "observability_only"
 
 
+def test_given_pre_tool_use_for_non_guarded_tool_when_processed_then_observability_only_pass(conn):
+    """Issue #2566 In Scope: `ListAgents` (and every other tool this guard
+    does not classify) is never blocked on Task Context grounds."""
+    result = hook_flows.on_pre_tool_use(conn, {"tool_name": "ListAgents"})
+    assert result["decision"] == "pass"
+    assert result["reason_code"] == "observability_only"
+
+
 def test_given_stop_when_processed_then_run_stays_open_but_health_unaffected_and_event_recorded(conn):
     hook_flows.on_session_start(conn, {"source": "startup", "herdr_tab_id": "tab-1", "claude_session_id": "s1"})
     result = hook_flows.on_stop(conn, {"claude_session_id": "s1"})

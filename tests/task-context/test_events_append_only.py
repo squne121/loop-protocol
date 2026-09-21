@@ -19,10 +19,46 @@ def test_given_allowed_metadata_when_event_appended_then_it_is_stored(conn):
     assert event["event_type"] == "hook:UserPromptSubmit"
 
 
-@pytest.mark.parametrize("forbidden_key", ["prompt", "transcript", "command", "message_body", "raw_input", "text"])
+@pytest.mark.parametrize(
+    "forbidden_key",
+    [
+        "prompt",
+        "transcript",
+        "command",
+        "message_body",
+        "raw_input",
+        "text",
+        # Issue #2566: peer message body / raw addressing / terminal output /
+        # full Bash command line must never reach the events allowlist.
+        "message",
+        "to",
+        "terminal_output",
+        "raw_command",
+    ],
+)
 def test_given_forbidden_metadata_key_when_event_appended_then_validation_error_raised(conn, forbidden_key):
     with pytest.raises(errors.ValidationError):
         service.append_event(conn, event_type="hook:test", metadata={forbidden_key: "some content"})
+
+
+def test_given_pre_tool_use_guard_metadata_keys_when_event_appended_then_it_is_stored(conn):
+    """Issue #2566 In Scope: EventJournal bounded metadata for the
+    PreToolUse guard -- transport/operation/target_kind/source_task_id/
+    destination_task_id/decision/reason_code."""
+    event = service.append_event(
+        conn,
+        event_type="hook:PreToolUse",
+        metadata={
+            "transport": "send_message",
+            "operation": "send_message",
+            "target_kind": "known_cross_task_independent_session",
+            "source_task_id": "task_a",
+            "destination_task_id": "task_b",
+            "decision": "ask",
+            "reason_code": "target_kind_known_cross_task_independent_session",
+        },
+    )
+    assert event["event_type"] == "hook:PreToolUse"
 
 
 def test_given_oversized_string_value_when_event_appended_then_validation_error_raised(conn):
