@@ -62,6 +62,17 @@ app = _load_module()
 _BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 
 
+@pytest.fixture(autouse=True)
+def _clear_agy_oauth_token_handoff_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2670: this file's pre-existing (#1779) tests exercise the
+    LEGACY `os.environ["HOME"]`-only lookup path -- clearing both dedicated
+    handoff env vars here, for every test, keeps them deterministic
+    regardless of ambient host state (mirrors
+    `test_agy_permission_policy_oauth_token.py`'s identical fixture)."""
+    monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", raising=False)
+    monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", raising=False)
+
+
 def _make_fake_agy_home(tmp_path: Path, *, token_content: str = "fake-dummy-token-value") -> Path:
     fake_real_home = tmp_path / "real-home"
     token_dir = fake_real_home / ".gemini" / "antigravity-cli"
@@ -370,3 +381,99 @@ def test_no_fail_closed_when_bwrap_available_even_for_sensitive_profiles(
         )
     finally:
         shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2670 AC3: the existing bwrap RO bind / fail-closed enforcement above
+# is unaffected by whether the approved source was selected via a validated
+# launcher handoff or the legacy ordinary lookup -- both routes feed the
+# exact same `agy_oauth_token_path` symlink target into
+# `_build_bwrap_ro_bind_prefix()`.
+# ---------------------------------------------------------------------------
+
+
+def _make_handoff_fixture(tmp_path: Path, *, dirname: str = "handoff-root") -> tuple[Path, Path]:
+    root = tmp_path / dirname
+    root.mkdir(parents=True)
+    source = root / "antigravity-oauth-token"
+    source.write_text("DUMMY_FIXTURE_TOKEN_NOT_A_REAL_CREDENTIAL_HANDOFF", encoding="utf-8")
+    return root, source
+
+
+def test_kernel_enforced_mode_via_validated_handoff_isolated_ambient_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GIVEN the ambient ordinary-lookup `$HOME` is an isolated, empty
+    directory (simulating a HOME-isolating caller like
+    `scripts/claude-gpt/launch.sh`) that never contains the real source
+    WHEN a validated launcher handoff supplies the approved source instead
+    THEN the same kernel-enforced read-only guarantee (AC3/#1779) still
+    applies -- the RO bind is not conditioned on which route selected the
+    source."""
+    isolated_ambient_home = tmp_path / "isolated-ambient-home-ac3"
+    isolated_ambient_home.mkdir()
+    monkeypatch.setenv("HOME", str(isolated_ambient_home))
+    monkeypatch.setattr(app, "_bwrap_available", lambda: True)
+
+    root, source = _make_handoff_fixture(tmp_path)
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", str(root))
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", str(source))
+
+    workspace = app.materialize_isolated_agy_workspace(app.GROUNDED_RESEARCH_PROFILE, parent_dir=tmp_path)
+    try:
+        assert workspace.agy_oauth_token_handoff_classification == app.AGY_HANDOFF_VALIDATED_SELECTED
+        assert workspace.agy_oauth_token_readonly_mode == app.AGY_OAUTH_TOKEN_READONLY_KERNEL_ENFORCED
+        assert workspace.agy_oauth_token_bwrap_prefix is not None
+        assert str(source) in workspace.agy_oauth_token_bwrap_prefix
+    finally:
+        shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
+def test_fail_closed_via_source_absent_handoff_when_bwrap_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC7's fail-closed check must correctly stay OPEN (no exception) when
+    the handoff resolution itself determines `source_absent` -- there is
+    nothing to protect, matching the pre-#2670 CI-safety guarantee (never
+    fail-closed merely because bwrap is unavailable when no real source
+    exists), now verified through the handoff route rather than only the
+    legacy ambient-HOME route."""
+    isolated_ambient_home = tmp_path / "isolated-ambient-home-ac7"
+    isolated_ambient_home.mkdir()
+    monkeypatch.setenv("HOME", str(isolated_ambient_home))
+    monkeypatch.setattr(app, "_bwrap_available", lambda: False)
+
+    root, source = _make_handoff_fixture(tmp_path, dirname="handoff-root-ac7-absent")
+    source.unlink()
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", str(root))
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", str(source))
+
+    workspace = app.materialize_isolated_agy_workspace(app.NO_TOOLS_PROFILE, parent_dir=tmp_path)
+    try:
+        assert workspace.agy_oauth_token_handoff_classification == app.AGY_HANDOFF_SOURCE_ABSENT
+        assert workspace.agy_oauth_token_readonly_mode == app.AGY_OAUTH_TOKEN_READONLY_ABSENT
+    finally:
+        shutil.rmtree(workspace.workspace_dir, ignore_errors=True)
+
+
+def test_fail_closed_via_validated_handoff_when_bwrap_unavailable_and_source_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC7's fail-closed check must correctly fire when the handoff
+    resolution determines `validated_handoff_selected` (a real approved
+    source exists via the handoff route) and bwrap is unavailable -- the
+    same fail-closed guarantee the legacy ambient-HOME route already had,
+    now also proven for the handoff route (Issue #2670: the fail-closed
+    check was updated to use the resolved handoff result rather than the
+    raw ambient-`HOME` lookup)."""
+    isolated_ambient_home = tmp_path / "isolated-ambient-home-ac7-present"
+    isolated_ambient_home.mkdir()
+    monkeypatch.setenv("HOME", str(isolated_ambient_home))
+    monkeypatch.setattr(app, "_bwrap_available", lambda: False)
+
+    root, source = _make_handoff_fixture(tmp_path, dirname="handoff-root-ac7-present")
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", str(root))
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", str(source))
+
+    with pytest.raises(app.AgyReadOnlyBoundaryError):
+        app.materialize_isolated_agy_workspace(app.NO_TOOLS_PROFILE, parent_dir=tmp_path)

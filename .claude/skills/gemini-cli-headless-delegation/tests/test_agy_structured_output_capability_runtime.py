@@ -65,6 +65,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import types
 from datetime import datetime, timezone
@@ -75,6 +76,7 @@ import pytest
 
 
 _PREFLIGHT_AGY_PATH = Path(__file__).resolve().parents[1] / "scripts" / "preflight_agy.py"
+_AGY_PERMISSION_POLICY_PATH = Path(__file__).resolve().parents[1] / "scripts" / "agy_permission_policy.py"
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _ARTIFACTS_DIR = _REPO_ROOT / "artifacts"
 
@@ -84,11 +86,152 @@ def _load_module(path: Path, name: str) -> types.ModuleType:
     assert spec is not None
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    # dataclass()'s postponed-annotation resolution needs sys.modules[__module__]
+    # registered before exec (agy_permission_policy.py uses `@dataclass` under
+    # `from __future__ import annotations` -- Issue #2670).
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
 
 
 preflight_agy = _load_module(_PREFLIGHT_AGY_PATH, "preflight_agy")
+# Issue #2670: this module-level `agy_permission_policy` instance is used
+# ONLY as a source of the closed four-state handoff-selection
+# classification vocabulary (`AGY_HANDOFF_VALIDATED_SELECTED` etc.) referenced
+# below -- never to independently re-derive an actual invocation's own
+# classification. Fix_delta (PR #2687 review, HIGH): the pre-fix_delta
+# `run_canonical_delegation_route_probe()` called
+# `resolve_agy_oauth_token_source()` a second, independent time AFTER
+# `run_delegation()` already returned, and treated that separate call's
+# result as if it were evidence of the actual invocation's own
+# classification -- proxy evidence, not causal attribution. See that
+# function's docstring for the corrected design, which instead intercepts
+# the SAME internal `resolve_agy_oauth_token_source()` call
+# `materialize_isolated_agy_workspace()` makes for the actual invocation, on
+# the actual `run_gemini_headless` module instance used for that exact call.
+agy_permission_policy = _load_module(_AGY_PERMISSION_POLICY_PATH, "agy_permission_policy_stage2_handoff")
+
+
+@pytest.fixture(autouse=True)
+def _clear_agy_oauth_token_handoff_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2670: keep this file's pre-existing (#2616) tests deterministic
+    regardless of ambient host state -- clears both dedicated handoff env
+    vars for every test; the dedicated Issue #2670 tests below set them
+    explicitly per case (mirrors the identical fixture in
+    `test_agy_permission_policy_oauth_token.py` /
+    `test_agy_permission_policy_readonly_boundary.py`)."""
+    monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", raising=False)
+    monkeypatch.delenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", raising=False)
+
+
+def _write_fake_bwrap(bin_dir: Path) -> Path:
+    """Issue #2670 (live-CI regression fix_delta, iteration 4): write a real,
+    executable, thin-passthrough fake `bwrap` binary named `bwrap` under
+    *bin_dir*.
+
+    Unlike iteration 3's fix (`monkeypatch.setattr(..., "_bwrap_available",
+    lambda: True)`), which made `_bwrap_available()` LIE that `bwrap` is
+    installed -- letting `materialize_isolated_agy_workspace()`'s
+    `elif _bwrap_available():` branch (`agy_permission_policy.py`) build a
+    REAL `bwrap` argv prefix (`_build_bwrap_ro_bind_prefix()`) that
+    `_run_agy()` then actually tried to `subprocess.run()` on a CI runner
+    with no real `bwrap` binary at all -- this fixture makes `bwrap`
+    genuinely, honestly present on `PATH`, so the real (unmocked)
+    `_bwrap_available()` (`shutil.which("bwrap") is not None`) resolves
+    `True` truthfully. That live-CI failure
+    (`canonical_delegation_route_failure:agy_not_found`, GitHub Actions run
+    35503754208, job `python-test-core`) is what iteration 3's lie produced;
+    this fixture avoids reproducing it by never claiming something that
+    is not, in fact, true.
+
+    This fake ignores every real bwrap sandboxing flag (`--dev-bind`,
+    `--tmpfs`, `--ro-bind`) -- it performs no actual bind-mounting, mirroring
+    `_write_fake_agy()`'s thin-passthrough style above -- but DOES honor the
+    one part of bwrap's contract `_run_agy()`'s `--json-status-fd` proof path
+    (Issue #2434 AC6/AC10; see `run_gemini_headless.py`'s
+    `_bwrap_status_reports_child_started()`, which this fake's caller
+    ultimately depends on) actually requires: it locates the
+    `--json-status-fd <N>` argument, writes a valid `{"child-pid": <own real
+    pid>}` JSON line to file descriptor *N* (inherited via
+    `subprocess.run(..., pass_fds=(status_fd,))`, so the descriptor number
+    is unchanged across exec), then locates the trailing `--` separator and
+    `exec`s everything after it (the real/fake `agy` command bwrap would
+    have wrapped) -- so the wrapped command's own real behavior (printing
+    the sentinel, exit 0) is what determines the overall outcome, exactly as
+    a genuine `bwrap` invocation's exit behavior would."""
+    script = bin_dir / "bwrap"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "argv = sys.argv[1:]\n"
+        "status_fd = None\n"
+        "command = []\n"
+        "i = 0\n"
+        "while i < len(argv):\n"
+        "    if argv[i] == '--json-status-fd':\n"
+        "        status_fd = int(argv[i + 1])\n"
+        "        i += 2\n"
+        "        continue\n"
+        "    if argv[i] == '--':\n"
+        "        command = argv[i + 1:]\n"
+        "        break\n"
+        "    i += 1\n"
+        "if status_fd is not None:\n"
+        "    try:\n"
+        "        os.write(status_fd, (json.dumps({'child-pid': os.getpid()}) + '\\n').encode('utf-8'))\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "if not command:\n"
+        "    sys.exit(97)\n"
+        "os.execvp(command[0], command)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    return script
+
+
+@pytest.fixture(autouse=True)
+def _stage_real_fake_bwrap_on_path_for_canonical_route_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2670 (live-CI regression fix_delta, iteration 4): replaces
+    iteration 3's `_pin_agy_bwrap_available_for_canonical_route_probe` (which
+    lied about `_bwrap_available()` via `monkeypatch.setattr`) with a real,
+    executable fake `bwrap` binary (`_write_fake_bwrap()` above) prepended to
+    `PATH` for the duration of each test in this file.
+
+    `run_canonical_delegation_route_probe()`'s hermetic tests below (Issue
+    #2616 fix_delta P1-1 / Issue #2670 AC5) route through the REAL
+    `run_gemini_headless.py::run_delegation()` -> `_run_agy()` ->
+    `agy_permission_policy.materialize_isolated_agy_workspace()` call chain.
+    That function fail-closes with `AgyReadOnlyBoundaryError` (Issue #1779
+    AC7, caught by `run_delegation()`'s generic `except Exception` and
+    reclassified as the opaque `failure_class: agy_unexpected_error`) for
+    the `no_tools` profile whenever the resolved AGY OAuth token handoff
+    source exists AND `bwrap` is unavailable -- exactly the case
+    `test_run_canonical_delegation_route_probe_passes_when_canonical_route_succeeds`
+    below constructs (a validated handoff source via `_set_validated_handoff_env()`).
+    `bwrap`'s presence/absence is never guaranteed in CI (Issue #1779 Stop
+    Conditions), so this fixture stages a real fake `bwrap` rather than
+    depending on -- or lying about -- host state. Prepended (not appended)
+    to `PATH` so this fixture's fake shadows any real `bwrap` already
+    installed on the host, keeping this file's tests deterministic
+    regardless of host `bwrap` state in either direction.
+
+    `materialize_isolated_agy_workspace()` reads `os.environ.get("PATH")` at
+    call time (inside the test, after this fixture already ran) to build the
+    isolated workspace's own `env["PATH"]`, and `_run_agy()`'s
+    `subprocess.run(run_command, ..., env=env, ...)` resolves the bare
+    `"bwrap"` argv[0] via that `env["PATH"]` -- so this fixture's
+    `monkeypatch.setenv("PATH", ...)` (which mutates `os.environ` directly)
+    is what actually reaches the real invocation argv's executable lookup,
+    not merely this test process's own `PATH`."""
+    fake_bwrap = _write_fake_bwrap(tmp_path)
+    original_path = os.environ.get("PATH", "")
+    monkeypatch.setenv("PATH", f"{fake_bwrap.parent}{os.pathsep}{original_path}")
 
 
 def _write_runtime_verification_log(
@@ -269,6 +412,100 @@ def _write_stage2_runtime_verification_log(
     ]
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return log_path
+
+
+# ---------------------------------------------------------------------------
+# Issue #2670 AC5/AC6: dedicated sanitized handoff-selection summary
+# artifact. The AC5 verifier (`run_canonical_delegation_route_probe()`
+# below) consumes the canonical policy/route's closed sanitized
+# handoff-selection classification (`agy_permission_policy.
+# resolve_agy_oauth_token_source()`) and writes this artifact. Allowlist-only
+# payload -- see module docstring; never raw stdout/stderr/response/
+# root/path/credential/account/token/HOME/XDG values.
+# ---------------------------------------------------------------------------
+
+_AC5_HANDOFF_SUMMARY_ALLOWED_KEYS = frozenset(
+    {
+        "schema",
+        "ac",
+        "route",
+        "caller_context",
+        "timestamp_utc",
+        "executed_command",
+        "binary_identity",
+        "verdict",
+        "reason_code",
+        "exit_status",
+        "artifact_path",
+        "canonical_result_classification",
+        "handoff_classification",
+        "launch_provenance_source_check",
+    }
+)
+
+
+def _write_ac5_handoff_summary_artifact(
+    *,
+    caller_context: str,
+    executed_command: "list[str]",
+    binary_identity: "dict[str, object] | None",
+    verdict: str,
+    reason_code: str,
+    exit_status: int,
+    canonical_result_classification: "dict[str, str] | None",
+    handoff_classification: "str | None",
+    launch_provenance_source_check: "dict[str, object] | None" = None,
+) -> Path:
+    """Issue #2670 AC5/AC6: write the dedicated sanitized handoff-selection
+    summary artifact.
+
+    Allowlist-only payload -- `executed_command`/`binary_identity` never
+    contain secret content (argv literals + realpath/sha256/version, matching
+    this file's pre-existing evidence posture), `handoff_classification` is
+    always one of the closed four labels
+    (`agy_permission_policy.AGY_HANDOFF_CLASSIFICATIONS`) and never a
+    root/path/token/credential value itself, and this function never accepts
+    (or therefore ever writes) a raw stdout/stderr/response/root/path/
+    credential/account/token/HOME/XDG value -- there is no parameter for any
+    of those.
+    """
+    if handoff_classification is not None:
+        assert handoff_classification in agy_permission_policy.AGY_HANDOFF_CLASSIFICATIONS, handoff_classification
+    _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ac_suffix = _CALLER_CONTEXT_AC_SUFFIX.get(caller_context, "")
+    artifact_path = _ARTIFACTS_DIR / f"runtime-verification-AC5-AC6-handoff-{ac_suffix or 'na'}-{timestamp}.log"
+    payload = {
+        "schema": "agy_oauth_token_handoff_summary/v1",
+        "ac": "AC5/AC6",
+        "route": "canonical_delegation",
+        "caller_context": caller_context,
+        "timestamp_utc": timestamp,
+        "executed_command": list(executed_command),
+        "binary_identity": binary_identity,
+        "verdict": verdict,
+        "reason_code": reason_code,
+        "exit_status": exit_status,
+        "artifact_path": str(artifact_path.relative_to(_REPO_ROOT)),
+        "canonical_result_classification": canonical_result_classification,
+        "handoff_classification": handoff_classification,
+        "launch_provenance_source_check": launch_provenance_source_check,
+    }
+    assert set(payload) <= _AC5_HANDOFF_SUMMARY_ALLOWED_KEYS, set(payload) - _AC5_HANDOFF_SUMMARY_ALLOWED_KEYS
+    lines = [
+        "=== AGY OAuth Token Handoff Summary Artifact (Issue #2670 AC5/AC6) ===",
+        f"Timestamp: {timestamp}",
+        "",
+        "--- Output (allowlist-only -- no raw stdout/stderr/response/root/path/"
+        "credential/account/token/HOME/XDG content) ---",
+        json.dumps(payload, indent=2, sort_keys=True),
+        "",
+        "--- Verdict ---",
+        f"Result: {verdict}",
+        f"Reason: {reason_code}",
+    ]
+    artifact_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return artifact_path
 
 
 def _stage2_skip(*, reason_code: str, caller_context: "str | None", **extra: object) -> int:
@@ -528,28 +765,76 @@ def _load_run_gemini_headless_module() -> types.ModuleType:
     return _load_module(_RUN_GEMINI_HEADLESS_PATH, "run_gemini_headless_stage2_canonical_route")
 
 
-def _classify_canonical_delegation_route_result(result: dict[str, Any]) -> "dict[str, str]":
-    """Classify a `run_delegation()` normalized result for Issue #2616
-    AC8/AC9 (Issue #2616 fix_delta P1-1).
+# Issue #2670 fix_delta BLOCKER: the EXACT expected sentinel text a genuine
+# successful invocation's `response_text` must equal (after
+# leading/trailing-whitespace normalization only) for AC5 PASS-eligibility.
+# Deliberately a distinct constant from
+# `preflight_agy.RUNTIME_VERIFICATION_SENTINEL_PROMPT` (the *prompt* text
+# sent to the model, `"Return exactly: LOOP_AGY_STAGE2_RUNTIME_OK"`) -- this
+# is the expected *response* value itself. Comparing against this exact
+# string (never a substring/prefix/"is non-empty" check) is what prevents an
+# arbitrary non-empty response -- or the prompt's own instruction text
+# containing this same substring -- from being misclassified as a matching
+# response.
+_EXPECTED_CANONICAL_DELEGATION_ROUTE_SENTINEL_RESPONSE = "LOOP_AGY_STAGE2_RUNTIME_OK"
 
-    Never inspects raw stdout/stderr/response TEXT content -- only the
-    normalized `ok`/`failure_class`/`response_text` (presence-only, never
-    read) fields `run_delegation()` itself already computed from the actual
-    `agy` child process invocation it performed. A genuine
-    `failure_class == "agy_auth_required"` (production's own existing
-    auth-required classification, `_classify_agy_failure()`) is the ONLY
-    signal treated as `account_session_unavailable` SKIP -- every other
-    non-`ok` result is FAIL, and this function never promotes a SKIP to
-    PASS.
+
+def _classify_canonical_delegation_route_result(
+    result: dict[str, Any], handoff_classification: "str | None"
+) -> "dict[str, str]":
+    """Classify a `run_delegation()` normalized result for Issue #2616
+    AC8/AC9 (Issue #2616 fix_delta P1-1), gated by Issue #2670 AC5's closed
+    sanitized handoff-selection classification.
+
+    Never inspects raw stdout/stderr/response TEXT content beyond exact
+    comparison against the fixed expected sentinel string -- only the
+    normalized `ok`/`failure_class`/`response_text` fields `run_delegation()`
+    itself already computed from the actual `agy` child process invocation
+    it performed. A genuine `failure_class == "agy_auth_required"`
+    (production's own existing auth-required classification,
+    `_classify_agy_failure()`) is the ONLY signal treated as
+    `account_session_unavailable` SKIP -- every other non-`ok` result is
+    FAIL, and this function never promotes a SKIP to PASS.
+
+    Issue #2670 fix_delta BLOCKER: PASS requires ALL of -- `ok is True`,
+    `response_text.strip() == _EXPECTED_CANONICAL_DELEGATION_ROUTE_SENTINEL_RESPONSE`
+    (exact, normalized-whitespace-only equality -- never
+    substring/prefix/"non-empty" containment), AND *handoff_classification*
+    is exactly `agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED`. An
+    arbitrary non-empty response (including the sentinel plus any extra
+    text, or the prompt's own instruction text
+    `"Return exactly: LOOP_AGY_STAGE2_RUNTIME_OK"` itself, which contains
+    the sentinel as a substring but is not equal to it) is never
+    PASS-eligible -- it is classified FAIL below, distinct from the
+    "no response text at all" FAIL case. The other three closed handoff
+    classifications (`invalid_handoff_rejected` / `source_absent` /
+    `no_handoff_ordinary_lookup`) remain SKIP/incomplete even when the
+    sentinel matches exactly, never promoted to PASS.
     """
     if not isinstance(result, dict):
         return {"verdict": "FAIL", "reason_code": "canonical_delegation_route_result_malformed"}
     if result.get("ok") is True:
         response_text = result.get("response_text")
-        if not isinstance(response_text, str) or not response_text.strip():
+        if not isinstance(response_text, str):
             return {
                 "verdict": "FAIL",
                 "reason_code": "canonical_delegation_route_ok_without_response_text",
+            }
+        normalized_response_text = response_text.strip()
+        if not normalized_response_text:
+            return {
+                "verdict": "FAIL",
+                "reason_code": "canonical_delegation_route_ok_without_response_text",
+            }
+        if normalized_response_text != _EXPECTED_CANONICAL_DELEGATION_ROUTE_SENTINEL_RESPONSE:
+            return {
+                "verdict": "FAIL",
+                "reason_code": "canonical_delegation_route_response_text_sentinel_mismatch",
+            }
+        if handoff_classification != agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED:
+            return {
+                "verdict": "SKIP",
+                "reason_code": f"handoff_classification_not_validated:{handoff_classification}",
             }
         return {"verdict": "PASS", "reason_code": "canonical_delegation_route_success"}
     failure_class = result.get("failure_class")
@@ -575,6 +860,30 @@ def run_canonical_delegation_route_probe(caller_context: str) -> int:
     production path -- an honest `SKIP: account_session_unavailable` result
     is therefore an expected, not a failing, outcome; it is never promoted
     to PASS.
+
+    Issue #2670 fix_delta (PR #2687 review, HIGH -- causal attribution): the
+    handoff-selection classification fed to
+    `_classify_canonical_delegation_route_result()` below is captured
+    DIRECTLY from the single `agy_permission_policy.resolve_agy_oauth_token_source()`
+    call `materialize_isolated_agy_workspace()` makes internally for THIS
+    exact invocation -- intercepted via a wrapper installed on
+    `run_gemini_headless._agy_permission_policy` (the exact
+    `agy_permission_policy` module object `_run_agy()` calls through inside
+    the loaded `run_gemini_headless` module instance used for this call) --
+    never a second, independent call performed AFTER `run_delegation()` has
+    already returned. The pre-fix_delta implementation called
+    `resolve_agy_oauth_token_source()` again, separately, once
+    `run_delegation()` completed; both calls are pure functions of the same
+    env vars / filesystem state and so always happened to agree in
+    practice, but that agreement was never causal -- it was proxy evidence
+    (an independent re-evaluation of the same inputs at a later time, T2),
+    not attribution to what the actual invocation itself computed and acted
+    on at materialization time (T1). This wrapper never modifies
+    `run_gemini_headless.py` on disk (Out of Scope, not an Allowed Path) --
+    it only monkeypatches an attribute on the module OBJECT this function
+    already loads fresh for the duration of this one call
+    (`_load_run_gemini_headless_module()`), then restores the original
+    function before returning.
     """
     agy_bin = os.environ.get("AGY_BIN") or shutil.which("agy")
     if agy_bin is None:
@@ -595,8 +904,52 @@ def run_canonical_delegation_route_probe(caller_context: str) -> int:
         "context_files": [],
         "timeout_sec": preflight_agy.RUNTIME_VERIFICATION_OUTER_DEADLINE_SECONDS,
     }
-    result = run_gemini_headless.run_delegation(request)
-    classification = _classify_canonical_delegation_route_result(result)
+
+    # Issue #2670 fix_delta (HIGH): intercept the ACTUAL invocation's own
+    # internal `resolve_agy_oauth_token_source()` call -- made exactly once,
+    # at the very top of `materialize_isolated_agy_workspace()`, before any
+    # success/fail-closed branch -- rather than re-deriving the
+    # classification independently after `run_delegation()` returns.
+    # `pp_module` is the precise `agy_permission_policy` module object
+    # `run_gemini_headless`'s own `_run_agy()` calls through
+    # (`_agy_permission_policy.materialize_isolated_agy_workspace(...)`),
+    # regardless of whatever `sys.modules["agy_permission_policy"]` cache
+    # state produced it -- patching this specific attribute reference is
+    # therefore guaranteed to intercept the exact call the real invocation
+    # makes, never a different module instance.
+    pp_module = run_gemini_headless._agy_permission_policy
+    _real_resolve_handoff_source = pp_module.resolve_agy_oauth_token_source
+    captured_handoff_results: "list[Any]" = []
+
+    def _resolve_handoff_source_and_capture(*args: Any, **kwargs: Any) -> Any:
+        handoff_result = _real_resolve_handoff_source(*args, **kwargs)
+        captured_handoff_results.append(handoff_result)
+        return handoff_result
+
+    pp_module.resolve_agy_oauth_token_source = _resolve_handoff_source_and_capture
+    try:
+        result = run_gemini_headless.run_delegation(request)
+    finally:
+        pp_module.resolve_agy_oauth_token_source = _real_resolve_handoff_source
+
+    # The LAST captured call is the one whose materialized workspace the
+    # actual `agy` child process invocation classified by *result* actually
+    # ran under (`materialize_isolated_agy_workspace()` calls
+    # `resolve_agy_oauth_token_source()` exactly once per call, and this
+    # "no_tools"-profile route calls `materialize_isolated_agy_workspace()`
+    # exactly once per `_run_agy()` attempt). `None` only when this route
+    # never reached `materialize_isolated_agy_workspace()` at all (e.g. an
+    # invocation-policy rejection raised before that call site) -- in that
+    # case `result["ok"]` is always False, so
+    # `_classify_canonical_delegation_route_result()` never actually
+    # consults this value (it is read only in the `ok is True` branch, which
+    # requires materialization to have already succeeded).
+    handoff_classification_value = (
+        captured_handoff_results[-1].classification if captured_handoff_results else None
+    )
+    classification = _classify_canonical_delegation_route_result(result, handoff_classification_value)
+    exit_status = 77 if classification["verdict"] == "SKIP" else (0 if classification["verdict"] == "PASS" else 1)
+    executed_command = [sys.executable] + sys.argv
 
     _write_stage2_runtime_verification_log(
         verdict=classification["verdict"],
@@ -606,6 +959,20 @@ def run_canonical_delegation_route_probe(caller_context: str) -> int:
         stage1_status=None,
         primary_classification=classification,
         secondary_classification=None,
+    )
+    # Issue #2670 AC5/AC6: the dedicated sanitized handoff-selection summary
+    # artifact -- allowlist-only, never raw stdout/stderr/response/root/
+    # path/credential/account/token/HOME/XDG content (see
+    # `_write_ac5_handoff_summary_artifact()` docstring).
+    _write_ac5_handoff_summary_artifact(
+        caller_context=caller_context,
+        executed_command=executed_command,
+        binary_identity=binary_identity,
+        verdict=classification["verdict"],
+        reason_code=classification["reason_code"],
+        exit_status=exit_status,
+        canonical_result_classification=classification,
+        handoff_classification=handoff_classification_value,
     )
 
     if classification["verdict"] == "SKIP":
@@ -621,6 +988,7 @@ def run_canonical_delegation_route_probe(caller_context: str) -> int:
         "verdict": classification["verdict"],
         "reason_code": classification["reason_code"],
         "binary_identity": binary_identity,
+        "handoff_classification": handoff_classification_value,
     }
     print(json.dumps(result_payload, indent=2, sort_keys=True))
     return 0 if classification["verdict"] == "PASS" else 1
@@ -717,9 +1085,74 @@ def test_stage2_binary_identity_unchanged_missing_path_is_mismatch(tmp_path: Pat
 
 def test_classify_canonical_delegation_route_result_pass_requires_ok_and_response_text() -> None:
     verdict = _classify_canonical_delegation_route_result(
-        {"ok": True, "failure_class": None, "response_text": "LOOP_AGY_STAGE2_RUNTIME_OK"}
+        {"ok": True, "failure_class": None, "response_text": "LOOP_AGY_STAGE2_RUNTIME_OK"},
+        agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED,
     )
     assert verdict == {"verdict": "PASS", "reason_code": "canonical_delegation_route_success"}
+
+
+# --- Issue #2670 fix_delta BLOCKER: exact sentinel polarity -- PASS requires
+#     an EXACT (normalized-whitespace-only) match of the expected response
+#     sentinel, never a substring/prefix/"non-empty" containment check. -----
+
+
+def test_classify_canonical_delegation_route_result_pass_with_whitespace_only_padded_sentinel() -> None:
+    """Leading/trailing whitespace-only padding around the exact sentinel is
+    still PASS-eligible -- normalization is whitespace-strip only, never a
+    content-shape relaxation."""
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": True, "failure_class": None, "response_text": "  \nLOOP_AGY_STAGE2_RUNTIME_OK\n  "},
+        agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED,
+    )
+    assert verdict == {"verdict": "PASS", "reason_code": "canonical_delegation_route_success"}
+
+
+def test_classify_canonical_delegation_route_result_arbitrary_non_empty_response_is_fail() -> None:
+    """An arbitrary non-empty response that is NOT the exact sentinel must
+    never be classified as if it were a matching response -- the pre-fix_delta
+    implementation would have let this reach PASS whenever the handoff was
+    validated, since it only checked `response_text.strip()` for
+    non-emptiness."""
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": True, "failure_class": None, "response_text": "some other text entirely"},
+        agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED,
+    )
+    assert verdict == {
+        "verdict": "FAIL",
+        "reason_code": "canonical_delegation_route_response_text_sentinel_mismatch",
+    }
+
+
+def test_classify_canonical_delegation_route_result_sentinel_plus_trailing_text_is_fail() -> None:
+    """The sentinel PLUS extra trailing text is not an exact match -- must
+    FAIL, never PASS (guards against a `startswith()`/substring-style
+    relaxation of the equality check)."""
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": True, "failure_class": None, "response_text": "LOOP_AGY_STAGE2_RUNTIME_OK extra"},
+        agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED,
+    )
+    assert verdict == {
+        "verdict": "FAIL",
+        "reason_code": "canonical_delegation_route_response_text_sentinel_mismatch",
+    }
+
+
+def test_classify_canonical_delegation_route_result_prompt_instruction_text_itself_is_fail() -> None:
+    """The PROMPT instruction text sent to the model
+    (`preflight_agy.RUNTIME_VERIFICATION_SENTINEL_PROMPT`,
+    "Return exactly: LOOP_AGY_STAGE2_RUNTIME_OK") contains the sentinel as a
+    substring but must never itself be classified as if it were a matching
+    RESPONSE -- conflating the instruction text asking for the sentinel with
+    an actual matching response is exactly the ambiguity this fix_delta
+    closes."""
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": True, "failure_class": None, "response_text": preflight_agy.RUNTIME_VERIFICATION_SENTINEL_PROMPT},
+        agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED,
+    )
+    assert verdict == {
+        "verdict": "FAIL",
+        "reason_code": "canonical_delegation_route_response_text_sentinel_mismatch",
+    }
 
 
 def test_classify_canonical_delegation_route_result_ok_without_response_text_is_fail() -> None:
@@ -727,7 +1160,10 @@ def test_classify_canonical_delegation_route_result_ok_without_response_text_is_
     evidence (Issue #2616 fix_delta P1-1 -- classification is scoped to the
     normalized fields `run_delegation()` computed, but a structurally
     incoherent `ok: True` with nothing to show for it still fails closed)."""
-    verdict = _classify_canonical_delegation_route_result({"ok": True, "failure_class": None, "response_text": None})
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": True, "failure_class": None, "response_text": None},
+        agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED,
+    )
     assert verdict["verdict"] == "FAIL"
     assert verdict["reason_code"] == "canonical_delegation_route_ok_without_response_text"
 
@@ -738,18 +1174,53 @@ def test_classify_canonical_delegation_route_result_auth_required_is_skip() -> N
     tool-profile isolation (Issue #1705) redirects HOME away from the real
     account session -- is an honest SKIP, never promoted to PASS."""
     verdict = _classify_canonical_delegation_route_result(
-        {"ok": False, "failure_class": "agy_auth_required", "response_text": None}
+        {"ok": False, "failure_class": "agy_auth_required", "response_text": None},
+        agy_permission_policy.AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP,
     )
     assert verdict == {"verdict": "SKIP", "reason_code": "account_session_unavailable"}
 
 
 def test_classify_canonical_delegation_route_result_other_failure_is_fail() -> None:
     verdict = _classify_canonical_delegation_route_result(
-        {"ok": False, "failure_class": "agy_exit_nonzero", "response_text": None}
+        {"ok": False, "failure_class": "agy_exit_nonzero", "response_text": None},
+        agy_permission_policy.AGY_HANDOFF_NO_HANDOFF_ORDINARY_LOOKUP,
     )
     assert verdict == {
         "verdict": "FAIL",
         "reason_code": "canonical_delegation_route_failure:agy_exit_nonzero",
+    }
+
+
+# --- Issue #2670 AC5: PASS requires BOTH the ok/response_text shape AND the
+#     closed handoff-selection classification to be exactly
+#     `validated_handoff_selected` -- the other three classifications are
+#     SKIP/incomplete even when the sentinel matches. ------------------------
+
+
+@pytest.mark.parametrize(
+    "handoff_classification",
+    [
+        pytest.param(
+            "invalid_handoff_rejected",
+            id="invalid_handoff_rejected",
+        ),
+        pytest.param("source_absent", id="source_absent"),
+        pytest.param(
+            "no_handoff_ordinary_lookup",
+            id="no_handoff_ordinary_lookup",
+        ),
+    ],
+)
+def test_classify_canonical_delegation_route_result_skips_when_handoff_not_validated_even_with_matching_sentinel(
+    handoff_classification: str,
+) -> None:
+    verdict = _classify_canonical_delegation_route_result(
+        {"ok": True, "failure_class": None, "response_text": "LOOP_AGY_STAGE2_RUNTIME_OK"},
+        handoff_classification,
+    )
+    assert verdict == {
+        "verdict": "SKIP",
+        "reason_code": f"handoff_classification_not_validated:{handoff_classification}",
     }
 
 
@@ -784,25 +1255,203 @@ def test_run_canonical_delegation_route_probe_fails_when_canonical_route_returns
     assert exit_code == 1
 
 
+def _set_validated_handoff_env(tmp_path: Path, monkeypatch: Any) -> None:
+    """Issue #2670: set up a validated launcher handoff (dummy fixture --
+    never a real credential) so `resolve_agy_oauth_token_source()` resolves
+    to `AGY_HANDOFF_VALIDATED_SELECTED` for the duration of a test."""
+    root = tmp_path / "handoff-root-stage2"
+    root.mkdir(parents=True, exist_ok=True)
+    source = root / "antigravity-oauth-token"
+    source.write_text("dummy-fixture-token-value-stage2", encoding="utf-8")
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_ROOT", str(root))
+    monkeypatch.setenv("AGY_OAUTH_TOKEN_HANDOFF_SOURCE", str(source))
+
+
 def test_run_canonical_delegation_route_probe_passes_when_canonical_route_succeeds(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     """The positive counterpart to the two FAIL cases above: when the
-    canonical route's own `agy` child process genuinely succeeds, the
-    probe reaches PASS -- demonstrating the verifier's PASS is actually
-    contingent on `run_delegation()`'s real outcome, not independent of it
-    (Issue #2616 fix_delta P1-1)."""
+    canonical route's own `agy` child process genuinely succeeds AND a
+    validated launcher handoff is present, the probe reaches PASS --
+    demonstrating the verifier's PASS is actually contingent on
+    `run_delegation()`'s real outcome (Issue #2616 fix_delta P1-1) AND the
+    closed handoff-selection classification (Issue #2670 AC5), not
+    independent of either."""
+    # Issue #2670 fix_delta BLOCKER: the fake `agy`'s stdout must be the
+    # EXACT expected response sentinel itself
+    # (`_EXPECTED_CANONICAL_DELEGATION_ROUTE_SENTINEL_RESPONSE`), never the
+    # *prompt* instruction text (`RUNTIME_VERIFICATION_SENTINEL_PROMPT`,
+    # "Return exactly: LOOP_AGY_STAGE2_RUNTIME_OK") this test previously
+    # (incorrectly) printed here -- that prompt text is not equal to the
+    # expected response and would now correctly FAIL the exact-sentinel
+    # check rather than being treated as an arbitrary "non-empty" pass.
     fake_agy = _write_fake_agy(
         tmp_path,
         "agy-success",
-        f"printf '%s\\n' '{preflight_agy.RUNTIME_VERIFICATION_SENTINEL_PROMPT}'\nexit 0\n",
+        f"printf '%s\\n' '{_EXPECTED_CANONICAL_DELEGATION_ROUTE_SENTINEL_RESPONSE}'\nexit 0\n",
     )
     monkeypatch.setenv("AGY_BIN", str(fake_agy))
     monkeypatch.chdir(tmp_path)
+    _set_validated_handoff_env(tmp_path, monkeypatch)
 
     exit_code = run_canonical_delegation_route_probe("claude-code")
 
     assert exit_code == 0
+
+
+def test_run_canonical_delegation_route_probe_ignores_poisoned_second_hand_module_level_resolver(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Issue #2670 fix_delta (HIGH regression -- causal attribution, not
+    proxy evidence): the PRE-fix_delta implementation classified AC5
+    PASS-eligibility using a SECOND, independent
+    `resolve_agy_oauth_token_source()` call on THIS test file's own
+    module-level `agy_permission_policy` object (loaded separately, under
+    its own unique `sys.modules` name, from the `agy_permission_policy`
+    module object `run_gemini_headless`'s own `_run_agy()` actually calls
+    through) -- performed AFTER `run_delegation()` already returned. That
+    was proxy evidence (an independent re-evaluation of the same pure
+    inputs at a later time), not attribution to what the actual invocation
+    itself computed and acted on.
+
+    Proof: even when THIS test file's own module-level
+    `agy_permission_policy.resolve_agy_oauth_token_source` is poisoned to
+    always report `source_absent` -- completely independent of the real,
+    genuinely validated handoff env state -- a real successful `agy` child
+    process invocation under that validated handoff must still reach PASS.
+    Under the pre-fix_delta implementation (which called exactly this
+    poisoned module-level object a second time after the fact), this same
+    setup would have wrongly produced SKIP."""
+    fake_agy = _write_fake_agy(
+        tmp_path,
+        "agy-success-causal-attribution",
+        f"printf '%s\\n' '{_EXPECTED_CANONICAL_DELEGATION_ROUTE_SENTINEL_RESPONSE}'\nexit 0\n",
+    )
+    monkeypatch.setenv("AGY_BIN", str(fake_agy))
+    monkeypatch.chdir(tmp_path)
+    _set_validated_handoff_env(tmp_path, monkeypatch)
+
+    def _poisoned_always_source_absent(*args: Any, **kwargs: Any) -> Any:
+        return agy_permission_policy.AgyOauthTokenHandoffResult(agy_permission_policy.AGY_HANDOFF_SOURCE_ABSENT)
+
+    monkeypatch.setattr(agy_permission_policy, "resolve_agy_oauth_token_source", _poisoned_always_source_absent)
+
+    exit_code = run_canonical_delegation_route_probe("claude-code")
+
+    assert exit_code == 0
+
+
+def test_run_canonical_delegation_route_probe_skips_when_handoff_not_validated_even_with_matching_sentinel(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Issue #2670 AC5: the exact same successful `agy` child process
+    (matching sentinel, exit 0) as the PASS test above, but WITHOUT a
+    validated handoff (no dedicated handoff env vars set, and the ambient
+    `HOME` ordinary-lookup fixture has no real source either) -- this must
+    SKIP (`no_handoff_ordinary_lookup`), never PASS, proving the probe's
+    PASS is genuinely contingent on the handoff classification and not just
+    the sentinel match."""
+    fake_agy = _write_fake_agy(
+        tmp_path,
+        "agy-success-no-handoff",
+        f"printf '%s\\n' '{_EXPECTED_CANONICAL_DELEGATION_ROUTE_SENTINEL_RESPONSE}'\nexit 0\n",
+    )
+    monkeypatch.setenv("AGY_BIN", str(fake_agy))
+    monkeypatch.chdir(tmp_path)
+    # Force the ordinary-lookup ambient HOME to a source-free fixture so this
+    # test is deterministic regardless of the actual host's real $HOME state.
+    ordinary_home = tmp_path / "ordinary-home-no-real-token"
+    ordinary_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(ordinary_home))
+
+    exit_code = run_canonical_delegation_route_probe("claude-code")
+
+    assert exit_code == 77
+
+
+# --- Issue #2670 AC6: the dedicated sanitized handoff-selection summary
+#     artifact writer. ---------------------------------------------------
+
+
+def test_write_ac5_handoff_summary_artifact_payload_is_allowlist_only(tmp_path: Path) -> None:
+    # Writes under the real repo-root `artifacts/` dir (worktree-local,
+    # untracked -- `.gitignore` excludes it), matching this file's
+    # pre-existing evidence-writer test convention (e.g.
+    # `test_structured_output_capability_runtime_probe_same_binary_evidence`).
+    artifact_path = _write_ac5_handoff_summary_artifact(
+        caller_context="claude-gpt",
+        executed_command=[sys.executable, "-m", "pytest", "--stage2-model-backed", "--caller-context", "claude-gpt"],
+        binary_identity={"realpath": str(tmp_path / "fake-agy"), "sha256": "deadbeef", "size": 123},
+        verdict="PASS",
+        reason_code="canonical_delegation_route_success",
+        exit_status=0,
+        canonical_result_classification={"verdict": "PASS", "reason_code": "canonical_delegation_route_success"},
+        handoff_classification=agy_permission_policy.AGY_HANDOFF_VALIDATED_SELECTED,
+    )
+    assert artifact_path.exists()
+    content = artifact_path.read_text(encoding="utf-8")
+    output_marker = "content) ---\n"
+    verdict_marker = "\n\n--- Verdict ---"
+    start = content.index(output_marker) + len(output_marker)
+    end = content.index(verdict_marker)
+    payload = json.loads(content[start:end])
+    assert set(payload) <= _AC5_HANDOFF_SUMMARY_ALLOWED_KEYS
+    assert payload["handoff_classification"] == "validated_handoff_selected"
+    assert payload["verdict"] == "PASS"
+    assert payload["exit_status"] == 0
+    assert payload["artifact_path"] == str(artifact_path.relative_to(_REPO_ROOT))
+
+
+def test_write_ac5_handoff_summary_artifact_rejects_unknown_handoff_classification() -> None:
+    """Fail-closed guard: an out-of-vocabulary handoff_classification value
+    (a bug, never a real production value -- `resolve_agy_oauth_token_source()`
+    only ever returns one of the closed four) must raise, not silently write
+    a corrupted artifact."""
+    with pytest.raises(AssertionError):
+        _write_ac5_handoff_summary_artifact(
+            caller_context="claude-gpt",
+            executed_command=["fake"],
+            binary_identity=None,
+            verdict="PASS",
+            reason_code="x",
+            exit_status=0,
+            canonical_result_classification=None,
+            handoff_classification="not_a_real_classification",
+        )
+
+
+def test_write_ac5_handoff_summary_artifact_never_contains_forbidden_content() -> None:
+    """Adversarial check: even if a caller accidentally passed a
+    credential-shaped string through `reason_code` (the only free-text
+    field this writer accepts besides `executed_command` literals), the
+    writer itself never adds any NEW forbidden field -- there is no
+    parameter for raw stdout/stderr/response/root/path/credential/account/
+    token/HOME/XDG content at all, so this test proves-by-construction that
+    the writer's fixed key set can never carry one under its own key name.
+    """
+    artifact_path = _write_ac5_handoff_summary_artifact(
+        caller_context="claude-gpt",
+        executed_command=[sys.executable, "-m", "pytest"],
+        binary_identity=None,
+        verdict="SKIP",
+        reason_code="handoff_classification_not_validated:source_absent",
+        exit_status=77,
+        canonical_result_classification=None,
+        handoff_classification=agy_permission_policy.AGY_HANDOFF_SOURCE_ABSENT,
+    )
+    content = artifact_path.read_text(encoding="utf-8")
+    forbidden_keys = (
+        "stdout",
+        "stderr",
+        "response_text",
+        "root_path",
+        "source_path",
+        "credential",
+        "HOME",
+        "XDG_CONFIG_HOME",
+    )
+    for forbidden_key in forbidden_keys:
+        assert f'"{forbidden_key}"' not in content
 
 
 if __name__ == "__main__":
