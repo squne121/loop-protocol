@@ -1,6 +1,16 @@
 """Task Context v1 — read-only Claude Code native session registry
 consumer (Issue #2566 fix_delta P1-B, PR #2691 OWNER review 2026-09-21).
 
+Issue #2567 AC5 (OWNER anchor comment P1 blocker, 2026-09-21): Claude-GPT's
+launcher-owned isolated ``CLAUDE_CONFIG_DIR`` relocates the on-disk session
+registry this module reads (Claude Code moves ``~/.claude/sessions`` under
+``CLAUDE_CONFIG_DIR`` when that env var is set). ``resolve_session_registry_dir()``
+therefore resolves, in order: (1) ``LOOP_TASK_CONTEXT_SESSION_REGISTRY_DIR``
+override (tests only), (2) ``CLAUDE_CONFIG_DIR/sessions`` when
+``CLAUDE_CONFIG_DIR`` is set (covers both Claude-GPT's isolated config root
+and any Native invocation that also sets ``CLAUDE_CONFIG_DIR``), (3) the
+pre-existing ``~/.claude/sessions`` default.
+
 Claude Code itself maintains its own on-disk session registry under
 ``~/.claude/sessions/<pid>.json`` -- one JSON record per Claude Code
 session, independently confirmed (real on-machine sample, plus
@@ -46,21 +56,33 @@ import os
 import pathlib
 
 SESSION_REGISTRY_DIR_ENV_VAR = "LOOP_TASK_CONTEXT_SESSION_REGISTRY_DIR"
+CLAUDE_CONFIG_DIR_ENV_VAR = "CLAUDE_CONFIG_DIR"
 
 
 def _default_session_registry_dir() -> pathlib.Path:
+    """Issue #2567 AC5: prefer ``CLAUDE_CONFIG_DIR/sessions`` when
+    ``CLAUDE_CONFIG_DIR`` is set (non-empty) -- this is the directory Claude
+    Code's own session registry actually lives under for any invocation that
+    sets a custom config dir (Claude-GPT's isolated profile being the
+    motivating case). Falls back to ``~/.claude/sessions`` only when
+    ``CLAUDE_CONFIG_DIR`` is unset/empty, unchanged from prior behavior."""
+    claude_config_dir = os.environ.get(CLAUDE_CONFIG_DIR_ENV_VAR, "")
+    if claude_config_dir:
+        return pathlib.Path(claude_config_dir) / "sessions"
     return pathlib.Path.home() / ".claude" / "sessions"
 
 
 def resolve_session_registry_dir() -> pathlib.Path:
     """Resolve the on-disk session registry directory to scan.
 
-    Defaults to Claude Code's own real registry location
-    (``~/.claude/sessions``); overridable via
-    ``LOOP_TASK_CONTEXT_SESSION_REGISTRY_DIR`` for tests only (mirrors the
-    sibling ``task_context_config.resolve_state_root`` override contract --
-    an explicit override is used as-is, never silently resolved against
-    ``cwd``)."""
+    Precedence (Issue #2567 AC5):
+    1. ``LOOP_TASK_CONTEXT_SESSION_REGISTRY_DIR`` override (tests only --
+       mirrors the sibling ``task_context_config.resolve_state_root``
+       override contract: used as-is, never silently resolved against
+       ``cwd``).
+    2. ``CLAUDE_CONFIG_DIR/sessions`` when ``CLAUDE_CONFIG_DIR`` is set.
+    3. ``~/.claude/sessions`` (Claude Code's real default registry
+       location)."""
     override = os.environ.get(SESSION_REGISTRY_DIR_ENV_VAR, "")
     if override:
         return pathlib.Path(override)

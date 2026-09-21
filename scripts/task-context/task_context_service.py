@@ -39,6 +39,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+import task_context_config  # noqa: E402
 import task_context_db as db  # noqa: E402
 import task_context_errors as errors  # noqa: E402
 
@@ -1090,9 +1091,21 @@ def _attach_or_start_binding_run_tx(
         _attach_execution_run_tx(conn, execution_run_id, task_id=task_id, activity_id=activity_id)
         return execution_run_id
     # No open managed run on this binding yet (SessionStart normally starts
-    # one) -- degrade gracefully by starting one rather than raising.
+    # one) -- degrade gracefully by starting one rather than raising. Issue
+    # #2567 AC4: use the current process's runtime-variant-derived run_kind
+    # (claude_gpt vs native_operator) instead of hardcoding native_operator,
+    # so this degrade path never mis-tags a Claude-GPT operator run.
+    degrade_run_kind, degrade_runtime_profile, degrade_resume_profile = (
+        task_context_config.operator_run_kind_and_profiles()
+    )
     run_id = _start_execution_run_tx(
-        conn, run_kind="native_operator", task_id=task_id, activity_id=activity_id, binding_id=binding_id
+        conn,
+        run_kind=degrade_run_kind,
+        task_id=task_id,
+        activity_id=activity_id,
+        binding_id=binding_id,
+        runtime_profile=degrade_runtime_profile,
+        resume_profile=degrade_resume_profile,
     )
     run_session = conn.execute(
         "SELECT claude_session_id FROM execution_runs WHERE id = ?", (run_id,)
