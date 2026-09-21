@@ -274,8 +274,9 @@ def test_provider_profile_compatibility_preflight(tmp_path):
 
 def test_provider_auto_rejected_at_preflight(tmp_path):
     """Issue #1273 iteration 3 Blocker 3: provider="auto" is forbidden for
-    fan-out children (its internal gemini-then-agy fallback attempts are not
-    accounted for by max_total_attempts / per-provider semaphores)."""
+    fan-out children (its internal
+    fallback attempts for each candidate provider in PROVIDER_AUTO_RUNTIME_ORDER order
+    are not accounted for by max_total_attempts / per-provider semaphores)."""
     module = load_module()
     auto_subtask = make_subtask(tmp_path, subtask_id="auto-1", provider="auto", tool_profile="no_tools")
     safe_subtask = make_subtask(tmp_path, subtask_id="safe-1")
@@ -292,6 +293,10 @@ def test_provider_auto_rejected_at_preflight(tmp_path):
     auto_outcome = next(r for r in result["results"] if r["subtask_id"] == "auto-1")
     assert auto_outcome["fanout_status"] == "failed"
     assert any("provider=auto is forbidden" in reason for reason in auto_outcome["reasons"])
+    assert any(
+        "up to one provider-level attempt for each candidate reached in PROVIDER_AUTO_RUNTIME_ORDER" in reason
+        for reason in auto_outcome["reasons"]
+    )
 
 
 # ---------------------------------------------------------------------------

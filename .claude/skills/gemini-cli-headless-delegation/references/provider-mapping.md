@@ -242,7 +242,7 @@ agy 優先の fallback 順序を確認できる。
 | 目的 | どちらの provider が使える状態か診断する | quota/capacity 系失敗時に別 provider へ切り替えて委譲を完了させる |
 | `--fix` | `unsupported_provider_option` で拒否（副作用対象が曖昧なため） | 該当なし（runtime dispatch に `--fix` 相当の概念はない） |
 
-`setup_check_order` と `runtime_order` の現況: 両者は PR #1798（Issue #1692）以降、`setup_check_order` は「まず agy が使えるかを優先的に確認したい」という診断上の関心、`runtime_order` は「Antigravity CLI（agy）を既定 provider として優先しつつ quota/capacity 失敗時のみ gemini にフォールバックする」という実行時の安全側デフォルトという、それぞれ独立した動機に基づきながらも、結果として `setup_check_order` と `runtime_order` は両方とも agy-first で一致している（`config/model_routing.yaml` の `provider_auto_policy_v1` ブロックのコメントを参照）。なお `references/model-routing.md` は agy-first の provider_auto_policy_v1 を明示的に記載しており、本節と矛盾しない。
+`setup_check_order` と `runtime_order` の現況: 両者は PR #1798（Issue #1692）以降、`setup_check_order` は「まず agy が使えるかを優先的に確認したい」という診断上の関心、`runtime_order` は「provider=auto の runtime candidate ordering における第一候補が agy である。quota/capacity 失敗時のみ gemini にフォールバックする」という実行時の安全側デフォルトという、それぞれ独立した動機に基づきながらも、結果として `setup_check_order` と `runtime_order` は両方とも agy-first で一致している（`config/model_routing.yaml` の `provider_auto_policy_v1` ブロックのコメントを参照）。なお `references/model-routing.md` は agy-first の provider_auto_policy_v1 を明示的に記載しており、本節と矛盾しない。
 
 ## AGY PreToolUse フックの来歴記録（Issue #1708 の実機 readback 調査結果）
 
@@ -366,12 +366,11 @@ legacy_decision:
       上は既に agy-first であること）は github_research の legacy 化 blocking
       判断（`blocking_gap`）自体には影響しない（github_research は runtime
       auto の対象 profile ではないため）。なお本ファイル上部「runtime
-      `provider=auto`」節の 216/240/244 行目付近（`runtime_order` =
-      `("gemini", "agy")` という gemini-first の記述・比較表・理由説明）は、
-      この実コードの現況（agy-first）と矛盾した記述のまま本 PR（#1823）では
-      変更していない。当該箇所の修正は Issue #1804 が別途担当する（下記
-      「#1804 との関係」参照）。読者は本節の事実確認と、本ファイル上部の未更新
-      の記述を混同しないこと。
+      `provider=auto`」節にあった、`runtime_order` が `("gemini", "agy")` の
+      gemini-first のままだった記述・比較表・理由説明は、この実コードの現況
+      （agy-first）と矛盾していたが、Issue #1804 の対応により解消済みである
+      （下記「#1804 との関係」参照）。現在は本節の事実確認と本ファイル上部の
+      記述は一致している。
     builder_default: >-
       blocked ではない。`build_request.py` 等での既定 provider 選択で
       github_research を要求しない呼び出し経路については、agy-first 化を
@@ -415,16 +414,15 @@ legacy_decision:
 
 ### `legacy_decision:` と Issue #1804 との関係
 
-`references/provider-mapping.md` の「runtime `provider=auto`」節にある
-`runtime_order`（216/240/244 行目付近、`PROVIDER_AUTO_RUNTIME_ORDER` =
-`("gemini", "agy")` という gemini-first の記述・比較表・理由説明）は、実
-コード上の `PROVIDER_AUTO_RUNTIME_ORDER`（既に `("agy", "gemini")` の
-agy-first、PR #1798 / Issue #1692 で反転済み）と矛盾した記述のままである。
-この既存記述の修正は Issue #1804 が対象とするスコープであり、本 PR（#1823 /
-Issue #1806）ではその記述（該当箇所の値・比較表・理由説明）を変更しない。
-上記 `effective_scope_by_unit.runtime_auto_priority` は、legacy 化判断の
-観点から runtime auto が実コード上は既に agy-first であるという事実を記録
-し、それが本 legacy_decision の blocking_gap によって妨げられないことを
-明確化するものであり、github_research の legacy 化 blocking 判断
-（`blocking_gap`）自体には影響しない。上記 docs 記述矛盾（216/240/244
-行目）の解消そのものは Issue #1804 側で扱う。
+`references/provider-mapping.md` の「runtime `provider=auto`」節にあった
+`runtime_order`（`PROVIDER_AUTO_RUNTIME_ORDER` = `("gemini", "agy")` という
+gemini-first の記述・比較表・理由説明）は、実コード上の
+`PROVIDER_AUTO_RUNTIME_ORDER`（既に `("agy", "gemini")` の agy-first、
+PR #1798 / Issue #1692 で反転済み）と矛盾した記述であったが、
+Issue #1804 の対応により解消済みであり、本節の記述（該当箇所の値・比較表・
+理由説明）は現在 agy-first に修正されている。上記
+`effective_scope_by_unit.runtime_auto_priority` は、legacy 化判断の観点から
+runtime auto が実コード上は既に agy-first であるという事実を記録し、それが
+本 legacy_decision の blocking_gap によって妨げられないことを明確化する
+ものであり、github_research の legacy 化 blocking 判断（`blocking_gap`）
+自体には影響しない。

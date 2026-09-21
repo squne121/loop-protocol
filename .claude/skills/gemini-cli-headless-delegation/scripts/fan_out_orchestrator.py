@@ -485,9 +485,10 @@ def _child_safety_and_compatibility_errors(subtask: Mapping[str, Any], rgh: Any)
         # separate gemini and agy subtasks explicitly instead.
         errors.append(
             "provider_profile_incompatible: provider=auto is forbidden for fan-out children in v1 "
-            "-- its internal per-candidate-provider fallback attempts (one per entry in "
-            "PROVIDER_AUTO_RUNTIME_ORDER) are not accounted for by "
-            "max_total_attempts / per-provider semaphores; submit explicit gemini/agy subtasks instead"
+            "-- its internal per-candidate-provider fallback attempts ("
+            "up to one provider-level attempt for each candidate reached in PROVIDER_AUTO_RUNTIME_ORDER"
+            ") are not accounted for by max_total_attempts / per-provider semaphores; submit "
+            "explicit gemini/agy subtasks instead"
         )
     elif provider == "agy" and tool_profile not in rgh.AGY_SUPPORTED_PROFILES:
         errors.append(
