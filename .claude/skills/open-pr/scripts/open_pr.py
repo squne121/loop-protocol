@@ -726,9 +726,7 @@ def main(argv: list[str] | None = None) -> int:
     default_link_kind = "Closes" if state == "OPEN" else "Refs"
     link_kind = resolve_linked_issue_reference_kind(original_body, args.linked_issue, default_link_kind)
     final_body = apply_linked_issue_reference(original_body, args.linked_issue, link_kind)
-    final_body = append_implementation_scope_coverage(
-        final_body, repo=repo, linked_issue=args.linked_issue
-    )
+    final_body = append_implementation_scope_coverage(final_body, repo=repo, linked_issue=args.linked_issue)
     if final_body is None:
         emit_error(
             E_IMPLEMENTATION_SCOPE_COVERAGE_UNAVAILABLE,

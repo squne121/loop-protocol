@@ -125,7 +125,8 @@ def verify(*, artifact_path: Path, run_command=_run) -> tuple[dict[str, Any], in
             "merge_commit_current_main_ancestry": ancestry,
             "legacy_scope_coverage_marker_missing": legacy_marker_missing,
             "legacy_compatibility_disposition": "implementation_already_landed"
-            if not legacy_marker_missing else "ordinary_dispatch_or_explicit_recovery",
+            if not legacy_marker_missing
+            else "ordinary_dispatch_or_explicit_recovery",
             "compare_status": compare_out.strip(),
             "status": "PASS"
             if issue.get("number") == ISSUE_NUMBER

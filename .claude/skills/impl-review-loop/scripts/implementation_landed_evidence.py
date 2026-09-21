@@ -5,6 +5,7 @@
 not an intake-time reconstruction of historical Issue text.  This module owns
 the normalizer used by both open-pr (producer) and intake (consumer).
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -72,6 +73,7 @@ def _machine_contract(body: str) -> Mapping[str, Any]:
     for fence in _FENCE_RE.findall(body):
         try:
             import yaml  # PyYAML is already used by repository skill tooling.
+
             parsed = yaml.safe_load(fence)
         except Exception:
             continue
@@ -108,7 +110,9 @@ def canonicalize_scope_manifest(scope: Any) -> dict[str, Any]:
             return {str(key): normalize(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
         if isinstance(value, (list, tuple, set, frozenset)):
             items = [normalize(item) for item in value]
-            return sorted(items, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+            return sorted(
+                items, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            )
         return value
 
     normalized = normalize(manifest)
@@ -151,7 +155,13 @@ def render_scope_coverage_marker(marker: Mapping[str, Any]) -> str:
     # JSON is a YAML subset; using it for nested objects keeps canonical values
     # byte-for-byte visible and is accepted by the existing PR-body validator.
     lines = [f"{COVERAGE_SCHEMA}:"]
-    for key in ("schema_version", "issue_number", "issue_body_sha256", "normalized_scope_manifest_sha256", "pr_head_sha"):
+    for key in (
+        "schema_version",
+        "issue_number",
+        "issue_body_sha256",
+        "normalized_scope_manifest_sha256",
+        "pr_head_sha",
+    ):
         lines.append(f"  {key}: {json.dumps(payload.get(key), ensure_ascii=False)}")
     lines.append("  scope_manifest: " + json.dumps(payload.get("scope_manifest"), ensure_ascii=False, sort_keys=True))
     return "```yaml\n" + "\n".join(lines) + "\n```"
@@ -162,6 +172,7 @@ def _parse_marker(pr_body: str, *, issue_number: int) -> tuple[dict[str, Any] | 
     for fence in _FENCE_RE.findall(pr_body or ""):
         try:
             import yaml
+
             parsed = yaml.safe_load(fence)
         except Exception:
             continue
@@ -190,7 +201,10 @@ def _parse_marker(pr_body: str, *, issue_number: int) -> tuple[dict[str, Any] | 
 def coverage_from_pr_body(*, pr_body: str, issue_number: int, live_issue_body: str) -> dict[str, Any]:
     marker, errors = _parse_marker(pr_body, issue_number=issue_number)
     if marker is None:
-        return {"status": "missing_marker" if errors == ["scope_coverage_marker_missing"] else "invalid", "errors": errors}
+        return {
+            "status": "missing_marker" if errors == ["scope_coverage_marker_missing"] else "invalid",
+            "errors": errors,
+        }
     immutable = marker["scope_manifest"]
     coverage = normalize_scope_coverage(immutable, live_issue_body)
     coverage.update({"marker": marker, "errors": []})
@@ -201,7 +215,9 @@ def _allowed_paths_covered(allowed_paths: list[str], files: Any) -> bool:
     if not allowed_paths or not isinstance(files, list):
         return False
     paths = [str(f.get("path")) for f in files if isinstance(f, Mapping) and isinstance(f.get("path"), str)]
-    return all(any(path == entry or path.startswith(entry.rstrip("/") + "/") for path in paths) for entry in allowed_paths)
+    return all(
+        any(path == entry or path.startswith(entry.rstrip("/") + "/") for path in paths) for entry in allowed_paths
+    )
 
 
 def _candidate_errors(candidate: Any, repo: str, issue_number: int) -> list[str]:
@@ -212,7 +228,11 @@ def _candidate_errors(candidate: Any, repo: str, issue_number: int) -> list[str]
     if not isinstance(target, Mapping) or target.get("repo") != repo or target.get("issue_number") != issue_number:
         errors.append("candidate_target_identity_mismatch")
     provenance = candidate.get("provenance")
-    if not isinstance(provenance, Mapping) or provenance.get("kind") not in {"closing_relation", "verified_cross_reference"} or provenance.get("verified") is not True:
+    if (
+        not isinstance(provenance, Mapping)
+        or provenance.get("kind") not in {"closing_relation", "verified_cross_reference"}
+        or provenance.get("verified") is not True
+    ):
         errors.append("candidate_provenance_unverified")
     lifecycle = candidate.get("lifecycle")
     if lifecycle not in {"merged", "open", "draft", "closed_unmerged"}:
@@ -222,7 +242,11 @@ def _candidate_errors(candidate: Any, repo: str, issue_number: int) -> list[str]
         errors.append("candidate_pr_identity_invalid")
     if lifecycle == "merged":
         ancestry = candidate.get("main_ancestry")
-        if not _valid_sha(candidate.get("merge_oid")) or not isinstance(ancestry, Mapping) or ancestry.get("verified") is not True:
+        if (
+            not _valid_sha(candidate.get("merge_oid"))
+            or not isinstance(ancestry, Mapping)
+            or ancestry.get("verified") is not True
+        ):
             errors.append("merged_candidate_main_ancestry_unverified")
     return errors
 
@@ -241,12 +265,19 @@ def parse_implementation_landed_evidence(raw: Any) -> tuple[dict[str, Any] | Non
     return result, []
 
 
-def validate_implementation_landed_evidence(raw: Any, *, repo: str, issue_number: int, now: dt.datetime | None = None) -> dict[str, Any]:
+def validate_implementation_landed_evidence(
+    raw: Any, *, repo: str, issue_number: int, now: dt.datetime | None = None
+) -> dict[str, Any]:
     evidence, errors = parse_implementation_landed_evidence(raw)
     if evidence is None:
         return {"valid": False, "errors": errors, "evidence": None}
     target = evidence.get("target")
-    if not isinstance(target, Mapping) or target.get("repo") != repo or target.get("issue_number") != issue_number or not _valid_digest(target.get("body_sha256")):
+    if (
+        not isinstance(target, Mapping)
+        or target.get("repo") != repo
+        or target.get("issue_number") != issue_number
+        or not _valid_digest(target.get("body_sha256"))
+    ):
         errors.append("target_identity_or_body_digest_invalid")
     freshness = evidence.get("freshness")
     if not isinstance(freshness, Mapping) or freshness.get("status") != "fresh":
@@ -272,7 +303,9 @@ def _coverage_for(candidate: Mapping[str, Any], evidence: Mapping[str, Any]) -> 
     return global_coverage if isinstance(global_coverage, Mapping) else None
 
 
-def derive_landing_disposition(raw: Any, *, repo: str, issue_number: int, now: dt.datetime | None = None) -> dict[str, Any]:
+def derive_landing_disposition(
+    raw: Any, *, repo: str, issue_number: int, now: dt.datetime | None = None
+) -> dict[str, Any]:
     validated = validate_implementation_landed_evidence(raw, repo=repo, issue_number=issue_number, now=now)
     if not validated["valid"]:
         return {"disposition": "reconciliation_required", "reason_codes": validated["errors"], "candidate": None}
@@ -286,29 +319,69 @@ def derive_landing_disposition(raw: Any, *, repo: str, issue_number: int, now: d
     if closing:
         qualified = closing
     if len(qualified) > 1:
-        return {"disposition": "reconciliation_required", "reason_codes": ["qualified_candidate_conflict"], "candidate": None}
+        return {
+            "disposition": "reconciliation_required",
+            "reason_codes": ["qualified_candidate_conflict"],
+            "candidate": None,
+        }
     if not qualified:
-        return {"disposition": "ordinary_dispatch_or_explicit_recovery", "reason_codes": ["no_qualified_candidate"], "candidate": None}
+        return {
+            "disposition": "ordinary_dispatch_or_explicit_recovery",
+            "reason_codes": ["no_qualified_candidate"],
+            "candidate": None,
+        }
     candidate = qualified[0]
     lifecycle = candidate["lifecycle"]
     if lifecycle == "closed_unmerged":
-        return {"disposition": "ordinary_dispatch_or_explicit_recovery", "reason_codes": ["closed_unmerged_candidate"], "candidate": candidate}
+        return {
+            "disposition": "ordinary_dispatch_or_explicit_recovery",
+            "reason_codes": ["closed_unmerged_candidate"],
+            "candidate": candidate,
+        }
     if lifecycle == "merged":
         ancestry = candidate.get("main_ancestry")
         if not isinstance(ancestry, Mapping) or ancestry.get("reachable") is not True:
-            return {"disposition": "ordinary_dispatch_or_explicit_recovery", "reason_codes": ["merged_candidate_not_on_current_main"], "candidate": candidate}
+            return {
+                "disposition": "ordinary_dispatch_or_explicit_recovery",
+                "reason_codes": ["merged_candidate_not_on_current_main"],
+                "candidate": candidate,
+            }
         coverage = _coverage_for(candidate, evidence)
-        if isinstance(coverage, Mapping) and coverage.get("exact_coverage") is True and coverage.get("later_scope_expansion") is False:
+        if (
+            isinstance(coverage, Mapping)
+            and coverage.get("exact_coverage") is True
+            and coverage.get("later_scope_expansion") is False
+        ):
             return {"disposition": "implementation_already_landed", "reason_codes": [], "candidate": candidate}
-        return {"disposition": "ordinary_dispatch_or_explicit_recovery", "reason_codes": ["legacy_or_later_scope_expansion"], "candidate": candidate}
+        return {
+            "disposition": "ordinary_dispatch_or_explicit_recovery",
+            "reason_codes": ["legacy_or_later_scope_expansion"],
+            "candidate": candidate,
+        }
     coverage = _coverage_for(candidate, evidence)
     if isinstance(coverage, Mapping) and coverage.get("status") == "invalid":
-        return {"disposition": "reconciliation_required", "reason_codes": list(coverage.get("errors") or ["invalid_scope_marker"]), "candidate": candidate}
+        return {
+            "disposition": "reconciliation_required",
+            "reason_codes": list(coverage.get("errors") or ["invalid_scope_marker"]),
+            "candidate": candidate,
+        }
     if isinstance(coverage, Mapping) and coverage.get("exact_coverage") is True:
         return {"disposition": "existing_pr_resume", "reason_codes": [], "candidate": candidate}
-    if (coverage is None or (isinstance(coverage, Mapping) and coverage.get("status") == "missing_marker")) and candidate.get("current_scope_ownership") is True and candidate.get("head_fresh") is True:
-        return {"disposition": "existing_pr_resume", "reason_codes": ["markerless_allowed_paths_coverage"], "candidate": candidate}
-    return {"disposition": "reconciliation_required", "reason_codes": ["open_draft_scope_ownership_not_exact"], "candidate": candidate}
+    if (
+        (coverage is None or (isinstance(coverage, Mapping) and coverage.get("status") == "missing_marker"))
+        and candidate.get("current_scope_ownership") is True
+        and candidate.get("head_fresh") is True
+    ):
+        return {
+            "disposition": "existing_pr_resume",
+            "reason_codes": ["markerless_allowed_paths_coverage"],
+            "candidate": candidate,
+        }
+    return {
+        "disposition": "reconciliation_required",
+        "reason_codes": ["open_draft_scope_ownership_not_exact"],
+        "candidate": candidate,
+    }
 
 
 def _run(argv: list[str]) -> tuple[int, str, str]:
@@ -326,7 +399,14 @@ def _json(run: Callable[[list[str]], tuple[int, str, str]], argv: list[str]) -> 
         return None, False
 
 
-def collect_candidate_inputs(*, repo: str, issue_number: int, current_scope: Any, run_command: Callable[[list[str]], tuple[int, str, str]] = _run, max_candidates: int = 20) -> dict[str, Any]:
+def collect_candidate_inputs(
+    *,
+    repo: str,
+    issue_number: int,
+    current_scope: Any,
+    run_command: Callable[[list[str]], tuple[int, str, str]] = _run,
+    max_candidates: int = 20,
+) -> dict[str, Any]:
     """Collect bounded closing and timeline cross-reference candidates.
 
     A body mention is never treated as a cross-reference.  Timeline candidates
@@ -335,10 +415,39 @@ def collect_candidate_inputs(*, repo: str, issue_number: int, current_scope: Any
     """
     issue_body = current_scope if isinstance(current_scope, str) else json.dumps(current_scope, ensure_ascii=False)
     commands: list[dict[str, Any]] = []
+
     def run(argv: list[str]) -> tuple[int, str, str]:
-        rc, out, err = run_command(argv); commands.append({"argv": argv, "exit_code": rc}); return rc, out, err
-    rows, list_ok = _json(run, ["gh", "pr", "list", "--repo", repo, "--state", "all", "--limit", str(max_candidates), "--json", "number,closingIssuesReferences"])
-    timeline, timeline_ok = _json(run, ["gh", "api", "--paginate", "-H", "Accept: application/vnd.github+json", f"repos/{repo}/issues/{issue_number}/timeline?per_page=100"])
+        rc, out, err = run_command(argv)
+        commands.append({"argv": argv, "exit_code": rc})
+        return rc, out, err
+
+    rows, list_ok = _json(
+        run,
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--limit",
+            str(max_candidates),
+            "--json",
+            "number,closingIssuesReferences",
+        ],
+    )
+    timeline, timeline_ok = _json(
+        run,
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "-H",
+            "Accept: application/vnd.github+json",
+            f"repos/{repo}/issues/{issue_number}/timeline?per_page=100",
+        ],
+    )
     found: dict[int, str] = {}
     if isinstance(rows, list):
         for row in rows:
@@ -357,26 +466,71 @@ def collect_candidate_inputs(*, repo: str, issue_number: int, current_scope: Any
                 found.setdefault(number, "verified_cross_reference")
     candidates: list[dict[str, Any]] = []
     for number, provenance_kind in list(found.items())[:max_candidates]:
-        pr, ok = _json(run, ["gh", "pr", "view", str(number), "--repo", repo, "--json", "number,url,state,isDraft,mergedAt,mergeCommit,headRefOid,closingIssuesReferences,body,files"])
+        pr, ok = _json(
+            run,
+            [
+                "gh",
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                repo,
+                "--json",
+                "number,url,state,isDraft,mergedAt,mergeCommit,headRefOid,closingIssuesReferences,body,files",
+            ],
+        )
         if not ok or not isinstance(pr, Mapping):
             continue
         refs = pr.get("closingIssuesReferences") or []
         closing = any(isinstance(ref, Mapping) and ref.get("number") == issue_number for ref in refs)
         provenance_kind = "closing_relation" if closing else provenance_kind
         state = str(pr.get("state") or "").upper()
-        lifecycle = "merged" if pr.get("mergedAt") else "draft" if state == "OPEN" and pr.get("isDraft") is True else "open" if state == "OPEN" else "closed_unmerged"
-        candidate: dict[str, Any] = {"target": {"repo": repo, "issue_number": issue_number}, "pr": {"number": number, "url": pr.get("url"), "head_sha": pr.get("headRefOid")}, "provenance": {"kind": provenance_kind, "verified": True}, "lifecycle": lifecycle, "head_fresh": lifecycle not in {"open", "draft"} or _valid_sha(pr.get("headRefOid")), "current_scope_ownership": False}
-        coverage = coverage_from_pr_body(pr_body=str(pr.get("body") or ""), issue_number=issue_number, live_issue_body=issue_body)
+        lifecycle = (
+            "merged"
+            if pr.get("mergedAt")
+            else "draft"
+            if state == "OPEN" and pr.get("isDraft") is True
+            else "open"
+            if state == "OPEN"
+            else "closed_unmerged"
+        )
+        candidate: dict[str, Any] = {
+            "target": {"repo": repo, "issue_number": issue_number},
+            "pr": {"number": number, "url": pr.get("url"), "head_sha": pr.get("headRefOid")},
+            "provenance": {"kind": provenance_kind, "verified": True},
+            "lifecycle": lifecycle,
+            "head_fresh": lifecycle not in {"open", "draft"} or _valid_sha(pr.get("headRefOid")),
+            "current_scope_ownership": False,
+        }
+        coverage = coverage_from_pr_body(
+            pr_body=str(pr.get("body") or ""), issue_number=issue_number, live_issue_body=issue_body
+        )
         candidate["scope_coverage"] = coverage
         if lifecycle in {"open", "draft"} and coverage.get("status") == "missing_marker":
-            candidate["current_scope_ownership"] = _allowed_paths_covered(build_scope_manifest(issue_body)["allowed_paths"], pr.get("files"))
+            candidate["current_scope_ownership"] = _allowed_paths_covered(
+                build_scope_manifest(issue_body)["allowed_paths"], pr.get("files")
+            )
         if lifecycle == "merged":
             merge_oid = (pr.get("mergeCommit") or {}).get("oid") if isinstance(pr.get("mergeCommit"), Mapping) else None
             candidate["merge_oid"] = merge_oid
             candidate["main_ancestry"] = {"verified": False, "reachable": False}
             if _valid_sha(merge_oid):
                 rc, out, _ = run(["gh", "api", f"repos/{repo}/compare/{merge_oid}...main", "--jq", ".status"])
-                candidate["main_ancestry"] = {"verified": rc == 0, "reachable": rc == 0 and out.strip() in {"ahead", "identical"}}
+                candidate["main_ancestry"] = {
+                    "verified": rc == 0,
+                    "reachable": rc == 0 and out.strip() in {"ahead", "identical"},
+                }
         candidates.append(candidate)
     status = "fresh" if list_ok and timeline_ok else "stale"
-    return {"schema": EVIDENCE_SCHEMA, "schema_version": 1, "target": {"repo": repo, "issue_number": issue_number, "body_sha256": _body_digest(issue_body)}, "freshness": {"status": status}, "contradictory": False, "candidates": candidates, "scope_coverage": None, "discovery": {"bounded_max_candidates": max_candidates, "commands": commands}, "current_scope_manifest": canonicalize_scope_manifest(issue_body), "decision_time_rebind": {"status": "fresh" if status == "fresh" else "stale"}}
+    return {
+        "schema": EVIDENCE_SCHEMA,
+        "schema_version": 1,
+        "target": {"repo": repo, "issue_number": issue_number, "body_sha256": _body_digest(issue_body)},
+        "freshness": {"status": status},
+        "contradictory": False,
+        "candidates": candidates,
+        "scope_coverage": None,
+        "discovery": {"bounded_max_candidates": max_candidates, "commands": commands},
+        "current_scope_manifest": canonicalize_scope_manifest(issue_body),
+        "decision_time_rebind": {"status": "fresh" if status == "fresh" else "stale"},
+    }

@@ -26,17 +26,12 @@ _DEFAULT_ARTIFACT_DIR = _REPO_ROOT / "artifacts" / "impl-review-loop"
 _TRIAGE_SCHEMA = "CONTRACT_BLOCKER_TRIAGE_V1"
 _TRIAGE_PATH = _SCRIPT_DIR / "triage_contract_blockers.py"
 # #1475: shared GitHub provenance trust policy (single source of truth).
-_CRP_PATH = (
-    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
-    / "contract_review_result_parser.py"
-)
+_CRP_PATH = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts" / "contract_review_result_parser.py"
 _BASELINE_PREFLIGHT_PATH = (
-    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
-    / "baseline_vc_preflight.py"
+    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts" / "baseline_vc_preflight.py"
 )
 _ALLOWED_PATHS_GATE_PATH = (
-    _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts"
-    / "allowed_paths_review_gate.py"
+    _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts" / "allowed_paths_review_gate.py"
 )
 _IMPLEMENTATION_LANDED_EVIDENCE_PATH = _SCRIPT_DIR / "implementation_landed_evidence.py"
 _FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL)
@@ -163,9 +158,7 @@ def _parse_simple_yaml_block(block: str) -> dict[str, Any]:
             key = match.group(1).strip()
             value = match.group(2).strip()
             if value:
-                if (value.startswith('"') and value.endswith('"')) or (
-                    value.startswith("'") and value.endswith("'")
-                ):
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
                     value = value[1:-1]
                 result[key] = value
             else:
@@ -353,9 +346,7 @@ def _validate_agent_report_schema(body: str) -> tuple["str | None", str, list[st
     return matched_ids[0], "ok", []
 
 
-_ISSUE_OR_PR_COMMENT_URL_RE = re.compile(
-    r"^https://github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)#issuecomment-(\d+)$"
-)
+_ISSUE_OR_PR_COMMENT_URL_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)#issuecomment-(\d+)$")
 
 
 def _parse_issue_or_pr_comment_url(url: str) -> tuple[str, str, int, int] | None:
@@ -436,10 +427,7 @@ def _pr_closes_target_issue(
         return False
     expected_url = f"https://github.com/{repo}/issues/{issue_number}"
     return any(
-        isinstance(ref, dict)
-        and ref.get("number") == issue_number
-        and ref.get("url") == expected_url
-        for ref in refs
+        isinstance(ref, dict) and ref.get("number") == issue_number and ref.get("url") == expected_url for ref in refs
     )
 
 
@@ -576,11 +564,7 @@ def _find_latest_result(
     Every caller that decides go/blocked precedence must pass
     trusted_only=True.
     """
-    candidates = (
-        [item for item in results if item.get("is_trusted_author") is True]
-        if trusted_only
-        else results
-    )
+    candidates = [item for item in results if item.get("is_trusted_author") is True] if trusted_only else results
     if not candidates:
         return None
     return sorted(
@@ -658,9 +642,7 @@ def _normalize_contract_snapshot_live(
     comments: list[dict[str, Any]],
     parse_warning_counts: dict[str, int],
 ) -> tuple[dict[str, Any], bool]:
-    parsed_results, parser_counts = _parse_contract_results(
-        comments, issue_url, _issue_number_from_url(issue_url)
-    )
+    parsed_results, parser_counts = _parse_contract_results(comments, issue_url, _issue_number_from_url(issue_url))
     parse_warning_counts.update(parser_counts)
 
     # #1475 fix_delta P1 item 1: trust filtering before precedence -- an
@@ -941,9 +923,7 @@ def build_intake_capsule(
     comments_for_digest: list[dict[str, Any]] = []
     if ensure_contract_snapshot_result:
         try:
-            ensure_payload = json.loads(
-                Path(ensure_contract_snapshot_result).read_text(encoding="utf-8")
-            )
+            ensure_payload = json.loads(Path(ensure_contract_snapshot_result).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             # Advisory: snapshot fetch/parse failure is a warning, not fatal
             # (#1869 fix_delta P0-4 -- contract snapshot artifacts never
@@ -993,28 +973,18 @@ def build_intake_capsule(
     context_inputs_full: dict[str, Any] | None = None
     context_inputs_summary: dict[str, Any] | None = None
     if human_context_comment_urls or agent_report_comment_urls:
-        provenance_conflict_urls = sorted(
-            set(human_context_comment_urls) & set(agent_report_comment_urls)
-        )
+        provenance_conflict_urls = sorted(set(human_context_comment_urls) & set(agent_report_comment_urls))
         if ensure_contract_snapshot_result:
-            _ctx_comments, _ctx_counts, _ctx_errors = _collect_issue_comments(
-                issue_number, repo, command_log
-            )
+            _ctx_comments, _ctx_counts, _ctx_errors = _collect_issue_comments(issue_number, repo, command_log)
             fatal_errors.extend(_ctx_errors)
         else:
             _ctx_comments = comments_for_digest
         comments_by_id: dict[int, dict[str, Any]] = {
-            comment["id"]: comment
-            for comment in _ctx_comments
-            if isinstance(comment.get("id"), int)
+            comment["id"]: comment for comment in _ctx_comments if isinstance(comment.get("id"), int)
         }
 
-        human_urls_to_resolve = [
-            url for url in human_context_comment_urls if url not in provenance_conflict_urls
-        ]
-        agent_urls_to_resolve = [
-            url for url in agent_report_comment_urls if url not in provenance_conflict_urls
-        ]
+        human_urls_to_resolve = [url for url in human_context_comment_urls if url not in provenance_conflict_urls]
+        agent_urls_to_resolve = [url for url in agent_report_comment_urls if url not in provenance_conflict_urls]
         human_resolved, human_errors = _resolve_context_comments(
             human_urls_to_resolve, "human_supplied", comments_by_id, issue_number, repo, command_log
         )
@@ -1022,8 +992,7 @@ def build_intake_capsule(
             agent_urls_to_resolve, "agent_generated", comments_by_id, issue_number, repo, command_log
         )
         provenance_conflict_entries = [
-            {"url": url, "reason": "provenance_conflict_url_in_both_lanes"}
-            for url in provenance_conflict_urls
+            {"url": url, "reason": "provenance_conflict_url_in_both_lanes"} for url in provenance_conflict_urls
         ]
 
         # AC8: repository/Issue/comment mismatch, dual-lane URLs, missing
@@ -1031,9 +1000,7 @@ def build_intake_capsule(
         # -- they block intake (fatal_errors), not merely advisory warnings.
         fatal_errors.extend(human_errors)
         fatal_errors.extend(agent_errors)
-        fatal_errors.extend(
-            f"provenance_conflict:{url}" for url in provenance_conflict_urls
-        )
+        fatal_errors.extend(f"provenance_conflict:{url}" for url in provenance_conflict_urls)
 
         context_inputs_full = {
             "human_supplied": human_resolved,
@@ -1043,12 +1010,8 @@ def build_intake_capsule(
         # AC7: stdout projection excludes raw comment body -- only
         # provenance/hash/metadata is surfaced in the stdout-facing capsule.
         context_inputs_summary = {
-            "human_supplied": [
-                {k: v for k, v in entry.items() if k != "body"} for entry in human_resolved
-            ],
-            "agent_generated": [
-                {k: v for k, v in entry.items() if k != "body"} for entry in agent_resolved
-            ],
+            "human_supplied": [{k: v for k, v in entry.items() if k != "body"} for entry in human_resolved],
+            "agent_generated": [{k: v for k, v in entry.items() if k != "body"} for entry in agent_resolved],
             "provenance_conflicts": provenance_conflict_entries,
         }
 
