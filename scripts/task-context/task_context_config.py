@@ -2,6 +2,16 @@
 
 See ``docs/dev/task-context.md`` (## Repository Instance Identity,
 ## LOOP_TASK_CONTEXT_STATE_ROOT Resolution) for the authoritative rationale.
+
+Issue #2567 (Claude-GPT canonical Task Context DB / operator runtime
+profile integration) added the ``LOOP_TASK_CONTEXT_RUNTIME_VARIANT`` carrier
+and the ``operator_run_kind_and_profiles()`` helper below. This module stays
+the single SSOT for both "where is the canonical state root" (pre-existing)
+and "which ExecutionRun run_kind/runtime_profile/resume_profile does the
+current operator process use" (new) -- callers (``task_context_hook_flows``,
+``task_context_service``, and the Claude-GPT launcher's own
+``scripts/claude-gpt/lib.sh``) read this module rather than re-deriving
+either decision themselves.
 """
 
 from __future__ import annotations
@@ -10,10 +20,77 @@ import hashlib
 import os
 import pathlib
 import subprocess
+import warnings
 
 STATE_ROOT_ENV_VAR = "LOOP_TASK_CONTEXT_STATE_ROOT"
 XDG_STATE_HOME_ENV_VAR = "XDG_STATE_HOME"
 DB_FILE_NAME = "task-context.sqlite3"
+
+# --- Issue #2567 In Scope: runtime variant carrier -------------------------
+#
+# The Claude-GPT launcher (``scripts/claude-gpt/launch.sh``) exports this
+# env var (fixed value ``"claude_gpt"``) on every normal-mode launch, before
+# it swaps HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME to the isolated Claude-GPT
+# profile. Native Claude never sets it, so its absence (or any value other
+# than ``"claude_gpt"``) means "native_operator" -- this module never infers
+# the variant from anything else (HOME, CLAUDE_CONFIG_DIR, proxy env, ...).
+RUNTIME_VARIANT_ENV_VAR = "LOOP_TASK_CONTEXT_RUNTIME_VARIANT"
+CLAUDE_GPT_RUNTIME_VARIANT = "claude_gpt"
+NATIVE_OPERATOR_RUN_KIND = "native_operator"
+CLAUDE_GPT_RUN_KIND = "claude_gpt"
+CLAUDE_GPT_RUNTIME_PROFILE = "claude_gpt_v1"
+
+
+def resolve_operator_runtime_variant() -> str:
+    """Read the raw ``LOOP_TASK_CONTEXT_RUNTIME_VARIANT`` carrier value.
+
+    Returns the empty string when unset (the native_operator default) --
+    never raises, never guesses from any other env var."""
+    return os.environ.get(RUNTIME_VARIANT_ENV_VAR, "")
+
+
+def operator_run_kind_and_profiles() -> tuple[str, str | None, str | None]:
+    """Resolve the ``(run_kind, runtime_profile, resume_profile)`` triple a
+    managed operator ExecutionRun (SessionStart new-binding / restored-
+    binding, and the ``_attach_or_start_binding_run_tx`` degrade path) should
+    be started/recorded with, based on the current process's
+    ``LOOP_TASK_CONTEXT_RUNTIME_VARIANT`` (AC4).
+
+    - ``"claude_gpt"`` -> ``("claude_gpt", "claude_gpt_v1", "claude_gpt_v1")``
+    - unset -> ``("native_operator", None, None)`` (intentional native
+      default, unchanged).
+    - any OTHER non-empty value (typo'd/future variant) -> also degrades to
+      ``("native_operator", None, None)`` for now (the persisted ExecutionRun
+      ``run_kind`` contract is intentionally left unchanged here -- see
+      PR #2696 review fix_delta P2 note below), but this is no longer
+      completely silent: it emits a ``RuntimeWarning`` (never raises, never
+      changes the returned triple) so a misconfigured
+      ``LOOP_TASK_CONTEXT_RUNTIME_VARIANT`` is observable instead of being
+      indistinguishable from an intentionally-unset one.
+
+      PR #2696 review fix_delta (P2, non-blocking, OWNER REQUEST_CHANGES):
+      giving this case its OWN distinct ``run_kind`` (rather than degrading
+      to ``native_operator``) would require changing
+      ``task_context_schema.py``'s ``run_kind`` ``CHECK`` constraint and the
+      ``VALID_RUN_KINDS``/``MANAGED_RUN_KINDS`` sets in
+      ``task_context_service.py``, plus auditing every existing query that
+      hardcodes ``run_kind IN ('native_operator', 'claude_gpt')`` -- a larger
+      schema-migration-shaped change out of this fix_delta's narrow scope.
+      Deferred as an optional follow-up; this warning is the narrow,
+      non-blocking diagnostic improvement that fits within scope today."""
+    raw = resolve_operator_runtime_variant()
+    if raw == CLAUDE_GPT_RUNTIME_VARIANT:
+        return CLAUDE_GPT_RUN_KIND, CLAUDE_GPT_RUNTIME_PROFILE, CLAUDE_GPT_RUNTIME_PROFILE
+    if raw:
+        warnings.warn(
+            f"{RUNTIME_VARIANT_ENV_VAR}={raw!r} is not a recognized runtime "
+            f"variant (expected unset or {CLAUDE_GPT_RUNTIME_VARIANT!r}) -- "
+            f"degrading to {NATIVE_OPERATOR_RUN_KIND!r} run_kind/profiles "
+            "rather than treating it as intentionally native.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return NATIVE_OPERATOR_RUN_KIND, None, None
 
 
 def repo_instance_key(cwd: str | pathlib.Path | None = None) -> str:

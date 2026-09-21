@@ -42,6 +42,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+import task_context_config as config  # noqa: E402
 import task_context_errors as errors  # noqa: E402
 import task_context_service as service  # noqa: E402
 import task_context_session_registry as session_registry  # noqa: E402
@@ -98,6 +99,36 @@ def _bump_projection(conn, binding_id: str | None) -> dict[str, Any]:
     return {"projection_key": projection_key, "projection_revision": next_revision}
 
 
+def _open_managed_runs_for_binding(conn, binding_id: str) -> list[dict[str, Any]]:
+    """Issue #2567 AC4: an open managed run for ``binding_id`` may now be
+    either ``run_kind`` in ``service.MANAGED_RUN_KINDS`` (native_operator or
+    claude_gpt) -- the DB's ``ux_execution_runs_open_managed_per_binding``
+    unique index already enforces at most one such row *regardless of
+    run_kind*, so this never needs to reconcile more than one candidate; it
+    only needs to look under whichever kind the stale run actually used,
+    instead of assuming native_operator."""
+    runs: list[dict[str, Any]] = []
+    for kind in service.MANAGED_RUN_KINDS:
+        runs.extend(service.find_open_execution_runs(conn, binding_id=binding_id, run_kind=kind))
+    return runs
+
+
+def _most_recent_managed_run_for_binding(conn, binding_id: str) -> dict[str, Any] | None:
+    """Issue #2567 AC4 counterpart of ``_open_managed_runs_for_binding`` for
+    the "no open run -- recover the last-known Task/Activity from history"
+    branch (AC3): considers the most recent run across every managed
+    run_kind, not just native_operator, so a binding whose last managed run
+    happened to be a claude_gpt run still restores correctly."""
+    candidates = [
+        run
+        for kind in service.MANAGED_RUN_KINDS
+        if (run := service.get_most_recent_execution_run_for_binding(conn, binding_id, run_kind=kind)) is not None
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda run: run["started_at"])
+
+
 _LOCATION_PAYLOAD_KEYS = ("cwd", "worktree", "branch")
 
 
@@ -119,7 +150,8 @@ def _projection_fields(result: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# SessionStart (AC1, AC2, AC3, AC14, AC15)
+# SessionStart (AC1, AC2, AC3, AC14, AC15; Issue #2567 AC1/AC4 runtime-variant
+# awareness)
 # ---------------------------------------------------------------------------
 
 _RECOVERABLE_SOURCES = frozenset({"startup", "resume", "clear"})
@@ -154,12 +186,19 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         existing_binding = service.get_binding_by_current_location(conn, herdr_locator)
 
     location_fields = _location_fields(payload)
+    run_kind, runtime_profile, resume_profile = config.operator_run_kind_and_profiles()
 
     if existing_binding is None:
         binding = service.create_binding(conn)
         binding_id = binding["id"]
         service.relocate_binding(conn, binding_id, herdr_locator, **location_fields)
-        run = service.start_execution_run(conn, run_kind="native_operator", binding_id=binding_id)
+        run = service.start_execution_run(
+            conn,
+            run_kind=run_kind,
+            binding_id=binding_id,
+            runtime_profile=runtime_profile,
+            resume_profile=resume_profile,
+        )
         if claude_session_id:
             _set_session_on_run(conn, binding_id, run["id"], claude_session_id)
         service.append_event(
@@ -185,7 +224,13 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
     # duplicate open managed run for the same binding (AC1(d)). Capture the
     # stale run's Task/Activity identity *before* ending it -- once ended it
     # no longer shows up in the open-run lookup used to recover it.
-    stale_runs = service.find_open_execution_runs(conn, binding_id=binding_id, run_kind="native_operator")
+    #
+    # Issue #2567 AC1/AC4: this binding's stale/latest managed run may be
+    # either run_kind (native_operator or claude_gpt) depending on which
+    # runtime flavor last held it -- looked up across BOTH kinds so
+    # switching runtime flavor across restarts never loses/duplicates
+    # Task/Activity identity.
+    stale_runs = _open_managed_runs_for_binding(conn, binding_id)
     if stale_runs:
         task_id = stale_runs[0]["task_id"]
         activity_id = stale_runs[0]["activity_id"]
@@ -193,13 +238,19 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         # No currently-open run (e.g. a prior clean `/quit` already ended
         # it) -- recover the last-known Task/Activity from history so the
         # restore doesn't lose continuity (AC3).
-        last_run = service.get_most_recent_execution_run_for_binding(conn, binding_id, run_kind="native_operator")
+        last_run = _most_recent_managed_run_for_binding(conn, binding_id)
         task_id = last_run["task_id"] if last_run else None
         activity_id = last_run["activity_id"] if last_run else None
     for stale in stale_runs:
         service.end_execution_run(conn, stale["id"])
     run = service.start_execution_run(
-        conn, run_kind="native_operator", task_id=task_id, activity_id=activity_id, binding_id=binding_id
+        conn,
+        run_kind=run_kind,
+        task_id=task_id,
+        activity_id=activity_id,
+        binding_id=binding_id,
+        runtime_profile=runtime_profile,
+        resume_profile=resume_profile,
     )
     service.relocate_binding(conn, binding_id, herdr_locator, **location_fields)
     service.set_binding_health(conn, binding_id, "ACTIVE")
