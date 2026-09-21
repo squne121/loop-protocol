@@ -38,6 +38,7 @@ _ALLOWED_PATHS_GATE_PATH = (
     _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts"
     / "allowed_paths_review_gate.py"
 )
+_IMPLEMENTATION_LANDED_EVIDENCE_PATH = _SCRIPT_DIR / "implementation_landed_evidence.py"
 _FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL)
 _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
 # #1950 AC6-AC8: comment-id resolution for --human-context-comment-url /
@@ -826,12 +827,52 @@ def _next_action_route(
     return "human_review_required"
 
 
+def _collect_implementation_landed_evidence(
+    *,
+    issue_number: int,
+    repo: str,
+    issue_body: str,
+    command_log: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Collect bounded pre-Step-1 candidate evidence through the strict producer."""
+    module = _load_module(
+        _IMPLEMENTATION_LANDED_EVIDENCE_PATH,
+        "implementation_landed_evidence",
+    )
+
+    def recorded_run(argv: list[str]) -> tuple[int, str, str]:
+        rc, stdout, stderr = _run_command(argv)
+        _record_command(
+            command_log,
+            "implementation_landed_candidate_discovery",
+            argv,
+            rc,
+            stdout,
+            stderr,
+        )
+        return rc, stdout, stderr
+
+    evidence = module.collect_candidate_inputs(
+        repo=repo,
+        issue_number=issue_number,
+        current_scope=issue_body,
+        run_command=recorded_run,
+    )
+    evidence["landing_disposition"] = module.derive_landing_disposition(
+        evidence,
+        repo=repo,
+        issue_number=issue_number,
+    )
+    return evidence
+
+
 def build_intake_capsule(
     issue_number: int,
     repo: str = _DEFAULT_REPO,
     ensure_contract_snapshot_result: str | None = None,
     human_context_comment_urls: list[str] | None = None,
     agent_report_comment_urls: list[str] | None = None,
+    include_implementation_landed_evidence: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
     # #1869 fix_delta P0-4: `errors` is split into `fatal_errors` (blocks
     # intake / forces exit 1 — reserved for live Issue not accessible,
@@ -1040,6 +1081,14 @@ def build_intake_capsule(
         "route": _next_action_route(issue_meta["ready_tuple"]["status"], contract_snapshot),
         "reason_codes": warnings + fatal_errors,
     }
+    implementation_landed_evidence: dict[str, Any] | None = None
+    if include_implementation_landed_evidence:
+        implementation_landed_evidence = _collect_implementation_landed_evidence(
+            issue_number=issue_number,
+            repo=repo,
+            issue_body=issue_meta["body"],
+            command_log=command_log,
+        )
 
     capsule = {
         "schema": _SCHEMA_NAME,
@@ -1072,6 +1121,8 @@ def build_intake_capsule(
         # passed, so existing consumers of IMPL_REVIEW_INTAKE_CAPSULE_V1 are
         # unaffected.
         capsule["context_inputs"] = context_inputs_summary
+    if implementation_landed_evidence is not None:
+        capsule["implementation_landed_evidence"] = implementation_landed_evidence
 
     artifact_payload = {
         "schema": _SCHEMA_NAME,
@@ -1102,6 +1153,8 @@ def build_intake_capsule(
         # Full body snapshot lives ONLY in the artifact -- never projected
         # to stdout (AC7).
         artifact_payload["context_inputs"] = context_inputs_full
+    if implementation_landed_evidence is not None:
+        artifact_payload["implementation_landed_evidence"] = implementation_landed_evidence
 
     # #1869 fix_delta P0-4: exit code depends ONLY on fatal_errors (live
     # Issue not accessible / repo state unreadable). Comment/snapshot/body
@@ -1128,6 +1181,7 @@ def build_capsule_argv(
     max_stdout_bytes: int = _DEFAULT_MAX_STDOUT_BYTES,
     human_context_comment_urls: list[str] | None = None,
     agent_report_comment_urls: list[str] | None = None,
+    include_implementation_landed_evidence: bool = False,
 ) -> list[str]:
     """Pure (no I/O, no subprocess) argv materializer for the canonical
     `build_intake_capsule.py` invocation. When `human_context_comment_urls` /
@@ -1151,6 +1205,8 @@ def build_capsule_argv(
         argv += ["--human-context-comment-url", url]
     for url in agent_report_comment_urls or []:
         argv += ["--agent-report-comment-url", url]
+    if include_implementation_landed_evidence:
+        argv.append("--include-implementation-landed-evidence")
     return argv
 
 
@@ -1254,6 +1310,11 @@ def main() -> int:
     parser.add_argument("--max-stdout-bytes", type=int, default=_DEFAULT_MAX_STDOUT_BYTES)
     parser.add_argument("--ensure-contract-snapshot-result")
     parser.add_argument("--artifact-dir", default=str(_DEFAULT_ARTIFACT_DIR))
+    parser.add_argument(
+        "--include-implementation-landed-evidence",
+        action="store_true",
+        help="collect bounded candidate evidence for the pre-Step-1 landing disposition",
+    )
     # #1950 AC6: provenance-separated context inputs. Origin is decided
     # solely by which flag the caller used -- never inferred from comment
     # body/author. Repeatable; same URL passed to both flags is a
@@ -1293,6 +1354,7 @@ def main() -> int:
         ensure_contract_snapshot_result=args.ensure_contract_snapshot_result,
         human_context_comment_urls=args.human_context_comment_urls,
         agent_report_comment_urls=args.agent_report_comment_urls,
+        include_implementation_landed_evidence=args.include_implementation_landed_evidence,
     )
 
     artifact_dir = Path(args.artifact_dir)

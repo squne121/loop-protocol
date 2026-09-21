@@ -663,6 +663,43 @@ def _evaluate_already_satisfied(live_mergeability: Mapping[str, Any]) -> RouteDe
 
 
 # ---------------------------------------------------------------------------
+# Issue #2699: pre-Step-1 landing disposition. The evidence producer owns
+# strict parsing/validation/normalization; this consumer is the pure route.
+# ---------------------------------------------------------------------------
+
+
+def resolve_pre_step1_landing_disposition(
+    evidence: Mapping[str, Any] | str | None,
+    *,
+    repo: str,
+    issue_number: int,
+) -> dict[str, Any]:
+    """Derive a pre-dispatch disposition without I/O or caller assertions."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = Path(__file__).with_name("implementation_landed_evidence.py")
+    spec = importlib.util.spec_from_file_location(
+        "implementation_landed_evidence_for_route", path
+    )
+    if spec is None or spec.loader is None:
+        return {
+            "disposition": "reconciliation_required",
+            "reason_codes": ["implementation_landed_evidence_module_unavailable"],
+            "candidate": None,
+        }
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.derive_landing_disposition(
+        evidence,
+        repo=repo,
+        issue_number=issue_number,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Issue #2607 fix_delta iteration 1 (PR #2626 review comment, P0-1): the
 # preparation.md pre-dispatch choke point's decision logic is a production
 # function of THIS module, not a helper duplicated inside a test file. Both

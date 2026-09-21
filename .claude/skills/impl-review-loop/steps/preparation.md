@@ -218,6 +218,41 @@ intake_gate:
   evaluated_at: "<ISO8601>"
 ```
 
+## 0-a-0. Evidence-Based Landing Disposition（pre-Step-1 duplicate-dispatch choke point、#2699）
+
+Root-owned entry transition が fresh `invoke_impl_review_loop` を返し、既存の
+Already-Satisfied choke point が `dispatch_step1: true` を返した後、worker dispatch、
+worktree 作成、new PR 作成のいずれよりも前に一度だけ実行する。候補 discovery は
+landing authority ではない。`generic Refs`、title / branch regex、merged state、または
+`pr_merged_observed` 単独から landed を推論してはならない。
+
+```bash
+uv run python3 .claude/skills/impl-review-loop/scripts/build_intake_capsule.py \
+  --issue-number <issue_number> --repo <owner/repo> --max-stdout-bytes 4096 \
+  --include-implementation-landed-evidence
+```
+
+capsule の `implementation_landed_evidence` を
+`route_loop_verdict_v2.py::resolve_pre_step1_landing_disposition()` に渡す。producer の
+strict validator が identity、freshness、candidate provenance、lifecycle、merged OID の
+main ancestry、state-specific scope coverage を検証し、canonical normalizer が immutable
+merged snapshot と live current scope を content-addressed manifest として比較する。
+呼び出し元は disposition を自己申告せず、判定ロジックを再実装しない。
+
+| disposition | data-plane action |
+|---|---|
+| `implementation_already_landed` | worker / worktree / new PR を開始せず、no-op disposition を記録する |
+| `existing_pr_resume` | linked open/draft PR を resume し、duplicate PR を作成しない |
+| `ordinary_dispatch_or_explicit_recovery` | 通常の Step 1 へ進む |
+| `reconciliation_required` | worker / worktree / new PR を開始せず、fresh evidence の reconciliation を要求する |
+
+`contradictory`、insufficient、stale、identity mismatch は常に最優先で
+`reconciliation_required` にする。`implementation_already_landed` は、merged candidate、
+verified main ancestry、exact current-scope coverage がすべて成立したときに限る。open /
+draft candidate は fresh head と current-scope ownership が両方検証できた場合に限り
+`existing_pr_resume` となる。closed-unmerged、no-qualified-candidate、main 非到達、later
+scope expansion は `ordinary_dispatch_or_explicit_recovery` とする。
+
 ## 0-a-1. Already-Satisfied Early-Exit choke point（実装着手前の no-op 判定、#2607）
 
 **単一の共通 choke point（特定の分岐内にネストしない）**: 上記 0-a のステップ 5〜8（`next_action.route` が `proceed_to_step_1` / `request_readiness_check` / `run_contract_blocker_triage` / `human_review_required` のどの値であっても）、および下記「1-d. Product Spec Check の評価」で `product_spec_preflight.routing_action` が `continue` / `stop_human` / `refresh_contract_snapshot` のどの値であっても、それらの分岐が Step 1（implementation-worker dispatch）へ実際に到達する **直前**に、以下の共通判定を必ず一度だけ評価する。本 choke point は `## 0. Intake Gate` を通過済み（`INTAKE_GATE_RESULT_V1.status: pass`）の場合にのみ評価される。
