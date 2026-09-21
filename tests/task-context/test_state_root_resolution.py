@@ -66,17 +66,22 @@ def test_given_state_root_when_db_path_computed_then_it_ends_with_canonical_file
 
 
 def test_given_runtime_variant_unset_when_resolving_operator_run_kind_then_native_operator_no_profiles(
-    monkeypatch,
+    monkeypatch, recwarn
 ):
     monkeypatch.delenv(config.RUNTIME_VARIANT_ENV_VAR, raising=False)
     assert config.operator_run_kind_and_profiles() == ("native_operator", None, None)
+    # PR #2696 review fix_delta P2: an intentionally-UNSET variant is the
+    # normal native default and must never emit a diagnostic warning --
+    # only a genuinely unrecognized non-empty value should (see below).
+    assert len(recwarn) == 0
 
 
 def test_given_runtime_variant_claude_gpt_when_resolving_operator_run_kind_then_claude_gpt_v1_profiles(
-    monkeypatch,
+    monkeypatch, recwarn
 ):
     monkeypatch.setenv(config.RUNTIME_VARIANT_ENV_VAR, "claude_gpt")
     assert config.operator_run_kind_and_profiles() == ("claude_gpt", "claude_gpt_v1", "claude_gpt_v1")
+    assert len(recwarn) == 0
 
 
 def test_given_unrecognized_runtime_variant_value_when_resolving_then_falls_back_to_native_operator(
@@ -84,3 +89,20 @@ def test_given_unrecognized_runtime_variant_value_when_resolving_then_falls_back
 ):
     monkeypatch.setenv(config.RUNTIME_VARIANT_ENV_VAR, "some_future_variant")
     assert config.operator_run_kind_and_profiles() == ("native_operator", None, None)
+
+
+def test_given_unrecognized_runtime_variant_value_when_resolving_then_diagnostic_warning_is_emitted(
+    monkeypatch,
+):
+    """PR #2696 review fix_delta (P2, non-blocking): unlike an intentionally
+    unset variant, a typo'd/unrecognized non-empty value must no longer be
+    COMPLETELY silent -- it still degrades to native_operator (the
+    persisted ExecutionRun run_kind contract is unchanged, deferred as a
+    larger schema-migration-shaped follow-up), but now emits a
+    RuntimeWarning naming the offending value, so misconfiguration is at
+    least observable rather than indistinguishable from the intentional
+    native case."""
+    monkeypatch.setenv(config.RUNTIME_VARIANT_ENV_VAR, "some_future_variant")
+    with pytest.warns(RuntimeWarning, match="some_future_variant"):
+        result = config.operator_run_kind_and_profiles()
+    assert result == ("native_operator", None, None)

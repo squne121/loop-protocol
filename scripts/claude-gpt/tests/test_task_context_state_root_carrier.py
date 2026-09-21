@@ -20,6 +20,11 @@ overwritten (AC3).
 - AC3 (subprocess-level, negative-control-adjacent): the same real launch
   with `LOOP_TASK_CONTEXT_STATE_ROOT`/`LOOP_TASK_CONTEXT_SCOPE` already set
   in the outer (ambient) environment.
+- AC1/AC2 (launcher-boundary, PR #2696 review fix_delta P1-1): when the
+  canonical resolver is invoked (no inherited override) and fails, the
+  launcher's real `launch.sh` source (a bounded, exact-text-extracted slice
+  -- never a hand-duplicated reimplementation) must fail fast and never
+  reach the isolated-HOME switch, instead of silently degrading to it.
 """
 
 from __future__ import annotations
@@ -108,7 +113,11 @@ def test_ac2_lib_sh_resolves_ambient_home_derived_state_root(tmp_path):
 def test_ac2_lib_sh_resolves_empty_when_python3_unavailable(tmp_path):
     """GIVEN python3 が PATH 上に存在しない
     WHEN claude_gpt_resolve_task_context_state_root を呼ぶ
-    THEN fail-open で空文字列を返す（launch 自体を止めない）
+    THEN 空文字列を返す（この wrapper 関数自身の戻り値契約は不変 -- 「失敗を
+    launch.sh の fail-open degrade として扱ってよい」という意味ではない。
+    その判断は呼び出し側 launch.sh の責務であり、
+    `test_ac1_ac2_launcher_fails_fast_when_resolver_fails_with_no_inherited_override`
+    が launcher boundary での新しい fail-fast 契約を検証する）
     """
     ambient_home = tmp_path / "ambient-home"
     ambient_home.mkdir()
@@ -127,6 +136,127 @@ def test_ac2_lib_sh_resolves_empty_when_python3_unavailable(tmp_path):
     result = subprocess.run([sh_bin, "-c", script], env=env, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
+
+
+# ---------------------------------------------------------------------------
+# AC1/AC2 (launcher-boundary, PR #2696 review fix_delta P1-1): when the
+# resolver is actually invoked (no inherited override) and fails, launch.sh
+# must fail fast BEFORE the isolated-HOME switch, not silently degrade to it.
+# ---------------------------------------------------------------------------
+
+
+def _extract_launch_sh_state_root_block_and_home_switch() -> str:
+    """Extract the EXACT, unmodified source lines of launch.sh spanning from
+    the `if [ -z "${LOOP_TASK_CONTEXT_STATE_ROOT:-}" ]; then` guard through
+    (but not including) `export HOME="$CLAUDE_ISOLATED_HOME_TARGET"`.
+
+    This is a bounded slice of the real launcher source (never a
+    hand-duplicated reimplementation of its logic) -- the anchors are
+    literal, unique lines so this stays coupled to the actual launch.sh text
+    and fails loudly (via the assertions below) if that text ever moves
+    without updating this extraction.
+    """
+    lines = LAUNCH_SH.read_text(encoding="utf-8").splitlines()
+    start_marker = 'if [ -z "${LOOP_TASK_CONTEXT_STATE_ROOT:-}" ]; then'
+    end_marker = 'export HOME="$CLAUDE_ISOLATED_HOME_TARGET"'
+    start_indices = [i for i, line in enumerate(lines) if line == start_marker]
+    end_indices = [i for i, line in enumerate(lines) if line == end_marker]
+    assert len(start_indices) == 1, (
+        f"expected exactly one '{start_marker}' line in launch.sh, found {len(start_indices)}"
+    )
+    assert len(end_indices) == 1, (
+        f"expected exactly one '{end_marker}' line in launch.sh, found {len(end_indices)}"
+    )
+    start, end = start_indices[0], end_indices[0]
+    assert start < end, "state-root guard must precede the isolated-HOME switch"
+    return "\n".join(lines[start:end])
+
+
+def _run_launch_sh_state_root_block(tmp_path, *, resolver_returns: str, inherited_state_root: str = ""):
+    """Execute the extracted launch.sh slice under `sh`, with
+    `claude_gpt_resolve_task_context_state_root` stubbed to deterministically
+    simulate resolver success/failure (rather than truly removing python3
+    from PATH, which would also break this harness's own python-based
+    fixtures elsewhere) -- the extracted block is real launch.sh code; only
+    the resolver's own return value is a controlled fixture input, exactly
+    as `claude_gpt_resolve_task_context_state_root`'s own documented failure
+    contract (empty string) describes.
+    """
+    block = _extract_launch_sh_state_root_block_and_home_switch()
+    repo_root = tmp_path / "fake-repo-root"
+    repo_root.mkdir()
+    marker_path = tmp_path / "reached-home-switch.marker"
+
+    script = f"""#!/bin/sh
+REPO_ROOT={_sh_quote(str(repo_root))}
+PROXY_PID=""
+claude_gpt_resolve_task_context_state_root() {{
+  printf '%s' {_sh_quote(resolver_returns)}
+}}
+{block}
+touch {_sh_quote(str(marker_path))}
+"""
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "LOOP_TASK_CONTEXT_STATE_ROOT": inherited_state_root,
+    }
+    result = subprocess.run(
+        ["sh", "-c", script], env=env, capture_output=True, text=True, timeout=20
+    )
+    return result, marker_path
+
+
+def _sh_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def test_ac1_ac2_launcher_fails_fast_when_resolver_fails_with_no_inherited_override(tmp_path):
+    """GIVEN LOOP_TASK_CONTEXT_STATE_ROOT is unset (no inherited override) AND
+    the canonical resolver fails (returns empty -- the documented contract
+    for python3-unavailable / resolver-error)
+    WHEN the real (extracted, unmodified) launch.sh state-root block runs
+    THEN the process exits non-zero (10), prints a non-secret diagnostic to
+    stderr and a `CLAUDE_GPT_LAUNCH_RESULT_V1` failed JSON to stdout, and
+    NEVER reaches the isolated-HOME switch (the marker file after it is
+    never created) -- no more fail-open degrade into a split-brain DB.
+    """
+    result, marker_path = _run_launch_sh_state_root_block(tmp_path, resolver_returns="")
+    assert result.returncode == 10, result.stdout + "\n---stderr---\n" + result.stderr
+    assert not marker_path.exists(), "launcher must never reach the isolated-HOME switch on resolver failure"
+    assert "task_context_state_root_resolution_failed" in result.stdout
+    assert '"status":"failed"' in result.stdout
+    assert "resolution failed" in result.stderr
+    # No secret/raw config values (repo paths are not secrets, but the
+    # diagnostic must stay a short fixed message, never a raw config dump).
+    assert str(tmp_path) not in result.stderr
+
+
+def test_ac1_ac2_launcher_proceeds_when_resolver_succeeds(tmp_path):
+    """Sanity/positive-control for the extraction harness itself: when the
+    resolver DOES return a non-empty root, the same real launch.sh block
+    exports it and continues on to the isolated-HOME switch (marker
+    created) -- proving the harness is not vacuously "always failing".
+    """
+    resolved_root = str(tmp_path / "resolved-state-root")
+    result, marker_path = _run_launch_sh_state_root_block(tmp_path, resolver_returns=resolved_root)
+    assert result.returncode == 0, result.stdout + "\n---stderr---\n" + result.stderr
+    assert marker_path.exists(), "launcher must proceed to the isolated-HOME switch on resolver success"
+
+
+def test_ac3_launcher_never_invokes_resolver_when_state_root_already_inherited(tmp_path):
+    """GIVEN LOOP_TASK_CONTEXT_STATE_ROOT is already non-empty (inherited
+    override, e.g. runtime-smoke)
+    WHEN the real launch.sh block runs, even with a resolver stub that would
+    fail if called
+    THEN the resolver is never invoked (AC3 precedence unchanged) and the
+    launcher proceeds straight to the isolated-HOME switch.
+    """
+    inherited_root = str(tmp_path / "inherited-runtime-smoke-root")
+    result, marker_path = _run_launch_sh_state_root_block(
+        tmp_path, resolver_returns="", inherited_state_root=inherited_root
+    )
+    assert result.returncode == 0, result.stdout + "\n---stderr---\n" + result.stderr
+    assert marker_path.exists(), "AC3: inherited override must skip the resolver and proceed"
 
 
 # ---------------------------------------------------------------------------

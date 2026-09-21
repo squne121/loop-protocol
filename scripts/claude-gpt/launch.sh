@@ -28,6 +28,9 @@
 #   5   canonical path 違反（repo/worktree 配下への書き込みを拒否）
 #   6   read 制限 settings が未生成または不正
 #   7   proxy 起動失敗（loopback bind / readiness / model alias を確認できない）
+#   10  Task Context canonical state-root 解決失敗（python3 未対応 / resolver
+#       error）で、isolated HOME への切替を fail-fast で止めた（Issue #2567
+#       PR #2696 review fix_delta P1-1）
 
 # --- Herdr Agents session hint: self-reexec (#2332) ---
 # Herdr 内(HERDR_ENV=1)かつ呼び出し側が HERDR_AGENT を設定していない場合だけ、
@@ -297,6 +300,20 @@ umask 077
 mkdir -p "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET" \
   "$CLAUDE_ISOLATED_HOME_TARGET" \
   "$CLAUDE_ISOLATED_XDG_CONFIG_DIR_TARGET" "$CLAUDE_ISOLATED_XDG_CACHE_DIR_TARGET"
+
+# --- Issue #2567 PR #2696 review fix_delta (P1-2): native cross-session
+#     messaging (ListAgents/SendMessage) peer-discovery bridge. Must run
+#     while `CLAUDE_NATIVE_LATITUDE_SETTINGS_PATH_TARGET` (resolved above,
+#     before the isolated HOME switch, from the SAME ambient
+#     CLAUDE_CONFIG_DIR/HOME precedence -- never a duplicated resolution)
+#     still names the real ambient Native config root. Native's own session
+#     registration directory sits alongside its `settings.json` (both
+#     directly under Native's CLAUDE_CONFIG_DIR / `~/.claude`); see
+#     `claude_gpt_link_native_sessions_dir` (lib.sh) for the full rationale
+#     and official-docs citation. Best-effort / non-blocking. ---
+CLAUDE_GPT_NATIVE_SESSIONS_DIR_TARGET="$(dirname "$CLAUDE_NATIVE_LATITUDE_SETTINGS_PATH_TARGET")/sessions"
+claude_gpt_link_native_sessions_dir \
+  "$CLAUDE_GPT_NATIVE_SESSIONS_DIR_TARGET" "${CLAUDE_CONFIG_DIR_TARGET}/sessions"
 
 # --- strict_mcp mode 用の空 MCP config を書き込む（repository/user MCP を読み込ませない） ---
 STRICT_MCP_MODE=true
@@ -1210,6 +1227,20 @@ export AGY_OAUTH_TOKEN_HANDOFF_SOURCE="${AGY_OAUTH_TOKEN_HANDOFF_ROOT}/antigravi
 #     operator launch has no scope value of its own to assign -- so simply
 #     never assigning/exporting it here is what "preserved, never
 #     overwritten" (AC3) means in practice.
+#
+#     PR #2696 review fix_delta (P1-1, OWNER REQUEST_CHANGES): resolution
+#     failure used to leave `LOOP_TASK_CONTEXT_STATE_ROOT` unset and fall
+#     through to the isolated-HOME switch below -- a fail-OPEN degrade that
+#     let the child `claude` process derive its OWN default state root from
+#     the already-isolated (empty) Claude-GPT HOME/XDG, silently producing a
+#     second, isolated-HOME-scoped Task Context DB (a direct AC1/AC2
+#     violation, not a harmless degrade). Only the inherited-override branch
+#     (a non-empty `LOOP_TASK_CONTEXT_STATE_ROOT` already set by the caller,
+#     e.g. runtime-smoke) may still skip calling the resolver entirely, per
+#     AC3 -- that precedence is unchanged. When the resolver actually runs
+#     and fails (python3 unavailable, git/repo error, etc.), this launcher
+#     now fails fast (before `export HOME="$CLAUDE_ISOLATED_HOME_TARGET"`)
+#     instead of continuing.
 if [ -z "${LOOP_TASK_CONTEXT_STATE_ROOT:-}" ]; then
   CLAUDE_GPT_TASK_CONTEXT_CONFIG_PATH="${REPO_ROOT}/scripts/task-context/task_context_config.py"
   CLAUDE_GPT_RESOLVED_TASK_CONTEXT_STATE_ROOT=$(claude_gpt_resolve_task_context_state_root \
@@ -1217,12 +1248,13 @@ if [ -z "${LOOP_TASK_CONTEXT_STATE_ROOT:-}" ]; then
   if [ -n "$CLAUDE_GPT_RESOLVED_TASK_CONTEXT_STATE_ROOT" ]; then
     LOOP_TASK_CONTEXT_STATE_ROOT="$CLAUDE_GPT_RESOLVED_TASK_CONTEXT_STATE_ROOT"
     export LOOP_TASK_CONTEXT_STATE_ROOT
+  else
+    echo "claude-gpt launch.sh: Task Context canonical state-root resolution failed (python3 unavailable or resolver error) -- refusing to fall through to an isolated-HOME-derived Task Context DB (Issue #2567 AC1/AC2). Set LOOP_TASK_CONTEXT_STATE_ROOT explicitly to override, or ensure python3 is on PATH." >&2
+    kill "$PROXY_PID" 2>/dev/null
+    wait "$PROXY_PID" 2>/dev/null
+    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"failed","reason":"task_context_state_root_resolution_failed"}\n'
+    exit 10
   fi
-  # Resolution failure (python3 unavailable, git/repo error, etc.) leaves
-  # LOOP_TASK_CONTEXT_STATE_ROOT unset -- fail-open degrade to the child
-  # process's own default (ambient-XDG-derived, or isolated-HOME-derived if
-  # HOME has already been swapped by the time it runs) rather than blocking
-  # launch on a non-essential carrier.
 fi
 # Fixed value on every normal-mode launch (Issue #2567 In Scope carrier
 # contract) -- this launcher IS the claude_gpt runtime, unconditionally.

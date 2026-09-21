@@ -222,10 +222,16 @@ claude_gpt_resolve_native_settings_path() {
 # 引数1: `scripts/task-context/task_context_config.py` への絶対パス
 # 引数2: repo_instance_key の `git rev-parse` 解決に使う repo/worktree cwd
 # 戻り値: resolve された canonical absolute state root（改行付き）。
-#         python3 未対応・resolve 失敗時は空文字列（呼び出し側は空文字列を
-#         「解決できなかった」として扱い、LOOP_TASK_CONTEXT_STATE_ROOT を
-#         明示 export しない fail-open degrade にすること -- 既存の
-#         isolated-HOME-based 挙動へ静かに戻るだけで、起動失敗にはしない）。
+#         python3 未対応・resolve 失敗時は空文字列。
+#
+#         PR #2696 review fix_delta (P1-1): 呼び出し側（launch.sh）は、この
+#         関数が実際に呼ばれた（= inherited override が無かった）にも関わらず
+#         空文字列を返した場合、もはや「解決できなかった」を fail-open で
+#         isolated-HOME-based 挙動へ静かに戻す degrade として扱ってはならない
+#         -- isolated HOME 切替前に fail-fast で起動を止めること（AC1/AC2:
+#         isolated HOME 由来の split-brain Task Context DB を防ぐ）。この
+#         関数自身の戻り値契約（失敗時は空文字列）は変更しない -- fail-fast
+#         判断は呼び出し側の責務のまま。
 claude_gpt_resolve_task_context_state_root() {
   config_path="$1"
   repo_cwd="$2"
@@ -248,6 +254,60 @@ try:
 except Exception:
     pass
 ' "$config_path" "$repo_cwd" 2>/dev/null
+}
+
+# claude_gpt_link_native_sessions_dir: Native Claude Code の cross-session
+# messaging（ListAgents/SendMessage）が Claude-GPT session を peer として
+# 発見できるようにする、narrow な同一 machine 内 discovery bridge。
+#
+# PR #2696 review fix_delta (P1-2, OWNER REQUEST_CHANGES)。公式ドキュメント
+# （https://code.claude.com/docs/en/cross-session-messaging「Message sessions
+# on other machines」節、及び https://code.claude.com/docs/en/settings の
+# `CLAUDE_CONFIG_DIR` 説明。2026-09-21 時点で web-researcher 相当の直接取得で
+# 確認、実機 `~/.claude/sessions/<pid>.json` のファイル構造でも確認済み）:
+# 「Each session registers itself in files on disk. ... two sessions can
+# reach each other only when they can see the same files.」-- Native session
+# は `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/` 配下に自身を登録する。
+# この launcher は Claude-GPT 用に `CLAUDE_CONFIG_DIR` を isolated
+# `$CLAUDE_GPT_HOME/claude` へ切り替えるため、そのままでは Claude-GPT
+# session は `$CLAUDE_GPT_HOME/claude/sessions/` という Native とは別の
+# ディレクトリへ登録され、`ListAgents`/`SendMessage` は互いを発見できない
+# （公式ドキュメントが同じ理由で説明する WSL2 セッションと native Windows
+# セッションが互いを発見できないケースと同型の構造的分断）。
+#
+# この関数は isolated `sessions/` ディレクトリが未作成（かつ既存ファイルが
+# 一切無い）場合に限り、それを Native の `sessions/` ディレクトリへの
+# symlink として作成する。これにより両 runtime の session registration
+# ファイルが同一ディレクトリを共有し、native `ListAgents`/`SendMessage` が
+# 実際に機能するようになる -- `LOOP_TASK_CONTEXT_SESSION_REGISTRY_DIR`
+# （Task Context 側の advisory guard 専用 lookup）とは独立した、Claude Code
+# 本体の native transport 自体に対する fix である。
+#
+# 既に何か（symlink・real directory・その他）が isolated 側に存在する場合は
+# 一切変更しない（idempotent re-launch、pre-fix launcher で既に生成された
+# session データの破壊防止）。best-effort・non-blocking: どの失敗経路でも
+# 起動そのものは止めない（Fix 1 の state-root fail-fast とは異なり、これは
+# safety-critical isolation control ではなく additive discovery bridge）。
+#
+# 引数1: native sessions directory（ambient `CLAUDE_CONFIG_DIR`/`HOME` から
+#         isolated HOME 切替前に解決済みのもの。呼び出し側の責務）
+# 引数2: isolated Claude-GPT sessions directory
+#         （`${CLAUDE_CONFIG_DIR_TARGET}/sessions`）
+claude_gpt_link_native_sessions_dir() {
+  native_sessions_dir="$1"
+  isolated_sessions_dir="$2"
+  if [ -z "$native_sessions_dir" ] || [ -z "$isolated_sessions_dir" ]; then
+    return 0
+  fi
+  if [ -e "$isolated_sessions_dir" ] || [ -L "$isolated_sessions_dir" ]; then
+    # 既に symlink・real directory・その他何かが存在する -- 既存の状態
+    # （pre-fix launcher が作った real directory の session データを含む）
+    # を破壊しないため、一切触らない。
+    return 0
+  fi
+  mkdir -p "$native_sessions_dir" 2>/dev/null || return 0
+  ln -s "$native_sessions_dir" "$isolated_sessions_dir" 2>/dev/null
+  return 0
 }
 
 # --- Model alias mapping（Parent #2154 アーキテクチャ決定 E 準拠） ---
