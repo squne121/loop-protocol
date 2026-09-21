@@ -240,26 +240,55 @@ dispatch、worktree 作成、new PR 作成を呼び出してはならない。`a
 `route_loop_verdict_v2.py::resolve_pre_step1_data_plane_action()` は同じ禁止を pure
 production API として返す。
 
-`implementation_landed_evidence` を
-`route_loop_verdict_v2.py::resolve_pre_step1_landing_disposition()` に渡す。producer の
-strict validator が identity、freshness、candidate provenance、lifecycle、merged OID の
-main ancestry、state-specific scope coverage を検証し、canonical normalizer が immutable
-merged snapshot と live current scope を content-addressed manifest として比較する。
-呼び出し元は disposition を自己申告せず、判定ロジックを再実装しない。
+`implementation_landed_evidence.py::collect_candidate_inputs()` の producer は identity、
+freshness、candidate provenance、lifecycle、merged OID の main ancestry、state-specific
+scope coverage を検証し、canonical normalizer が immutable merged snapshot と live
+current scope を content-addressed manifest として比較する。呼び出し元
+（`build_intake_capsule.py`）は `implementation_landed_evidence.py
+::resolve_landing_disposition_with_freshness_rebind()` を経由してこの producer を呼び出す
+（下記 AC9 参照）。`route_loop_verdict_v2.py::resolve_pre_step1_landing_disposition()` は
+既に構築済みの evidence を受け取って `derive_landing_disposition()` を呼ぶ pure route
+consumer である。呼び出し元は disposition を自己申告せず、判定ロジックを再実装しない。
 
 | disposition | data-plane action |
 |---|---|
 | `implementation_already_landed` | worker / worktree / new PR を開始せず、no-op disposition を記録する |
 | `existing_pr_resume` | linked open/draft PR を resume し、duplicate PR を作成しない |
+| `already_satisfied` | 下記「Disposition Precedence の already_satisfied 合成」参照。worker / worktree / new PR を開始せず recommendation を構造化して報告する（`SKILL.md` の「Already-Satisfied Recommendation Structure」） |
 | `ordinary_dispatch_or_explicit_recovery` | 通常の Step 1 へ進む |
 | `reconciliation_required` | worker / worktree / new PR を開始せず、fresh evidence の reconciliation を要求する |
 
-`contradictory`、insufficient、stale、identity mismatch は常に最優先で
-`reconciliation_required` にする。`implementation_already_landed` は、merged candidate、
-verified main ancestry、exact current-scope coverage がすべて成立したときに限る。open /
-draft candidate は fresh head と current-scope ownership が両方検証できた場合に限り
+`contradictory`（発見済み candidate の詳細取得失敗を含む）、insufficient、stale、identity
+mismatch、malformed durable marker は、candidate lifecycle が open/draft/merged のいずれ
+であっても常に最優先で `reconciliation_required` にする。`implementation_already_landed`
+は、merged candidate、verified main ancestry、durable marker による exact current-scope
+coverage がすべて成立したときに限る（`IMPLEMENTATION_SCOPE_COVERAGE_V1` marker を持たない
+legacy merged candidate は現在の body から merge-time scope を推測しない）。open / draft
+candidate は fresh head と current-scope ownership が両方検証できた場合に限り
 `existing_pr_resume` となる。closed-unmerged、no-qualified-candidate、main 非到達、later
-scope expansion は `ordinary_dispatch_or_explicit_recovery` とする。
+scope expansion は（下記の `already_satisfied` 合成が不発の場合）
+`ordinary_dispatch_or_explicit_recovery` とする。
+
+**Disposition Precedence の `already_satisfied` 合成（新しい enum を追加しない #2607 との
+合成）**: `derive_landing_disposition()` が landing authority を確立できなかった場合
+（`ordinary_dispatch_or_explicit_recovery` かつ `reason_codes` に `no_qualified_candidate`
+または `closed_unmerged_candidate` を含む）に限り、
+`implementation_landed_evidence.py::apply_already_satisfied_precedence()` を呼び出す。この
+関数は既存 `route_loop_verdict_v2.py::resolve_already_satisfied_early_exit_decision()`
+（下記「0-a-1」が使うものと同一の production 関数）をそのまま再利用して `pr_exists` /
+`base_ac_satisfied` を再評価し、`early_exit: true` なら結果を `already_satisfied` に
+差し替える。`reconciliation_required` / `implementation_already_landed` /
+`existing_pr_resume`、および他の理由による `ordinary_dispatch_or_explicit_recovery` は
+この合成の対象外であり無条件で優先される。典型的な発火条件は、closed-unmerged な候補が
+既に存在するため下記 0-a-1 の `pr_exists` 判定では early-exit しないが、その候補が
+landing authority を持ち得ず、かつ `base_ac_satisfied` が独立に true であるケースである。
+
+**AC9 Freshness / Decision-Time Rebind**:
+`resolve_landing_disposition_with_freshness_rebind()` は、disposition 確定直前に issue
+body sha256 / candidate head-or-merge-oid / current main sha を live 再取得し、collection
+開始時の値と不一致なら bounded に 1 回だけ discovery + evaluation をやり直す。再試行後も
+不一致なら `reconciliation_required`（`reason_codes: ["freshness_rebind_failed"]`）にする。
+単純な `observed_at` TTL のみを authority にしない。
 
 ## 0-a-1. Already-Satisfied Early-Exit choke point（実装着手前の no-op 判定、#2607）
 

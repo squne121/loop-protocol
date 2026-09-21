@@ -834,16 +834,16 @@ def _collect_implementation_landed_evidence(
         )
         return rc, stdout, stderr
 
-    evidence = module.collect_candidate_inputs(
+    # #2699 AC9: `resolve_landing_disposition_with_freshness_rebind()` is the
+    # canonical collect -> verify-freshness-immediately-before-finalizing ->
+    # bounded-retry-once -> derive entry point. It supersedes a bare
+    # `collect_candidate_inputs()` + `derive_landing_disposition()` chain,
+    # which never re-verified collection-time identity before finalizing.
+    evidence = module.resolve_landing_disposition_with_freshness_rebind(
         repo=repo,
         issue_number=issue_number,
         current_scope=issue_body,
         run_command=recorded_run,
-    )
-    evidence["landing_disposition"] = module.derive_landing_disposition(
-        evidence,
-        repo=repo,
-        issue_number=issue_number,
     )
     # This is the production control-plane projection consumed before any
     # worker/worktree/new-PR invocation.  It is deliberately explicit rather

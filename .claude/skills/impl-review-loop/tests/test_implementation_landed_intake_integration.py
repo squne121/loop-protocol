@@ -76,8 +76,14 @@ def test_disposition_precedes_worker_worktree_and_new_pr():
     assert "worker / worktree / new PR を開始せず" in preparation
 
 
-def test_live_runtime_verifier_records_2119_2137_without_fixture_fallback(tmp_path):
-    """GIVEN live-shaped read responses WHEN AC9 verifier runs THEN it records non-fallback evidence."""
+def test_live_runtime_verifier_records_2119_2137_legacy_compatibility_without_fixture_fallback(tmp_path):
+    """AC12: GIVEN live-shaped #2119/#2137 read responses (a legacy merged
+    candidate with no durable IMPLEMENTATION_SCOPE_COVERAGE_V1 marker) WHEN
+    the runtime verifier runs THEN it records non-fallback evidence and the
+    legacy-compatibility disposition itself is derived through the same
+    production `derive_landing_disposition()` function `build_intake_capsule
+    .py` uses -- not a verifier-local inline ternary -- and correctly stays
+    ordinary_dispatch_or_explicit_recovery (never implementation_already_landed)."""
     runtime = _load(RUNTIME, "implementation_landed_runtime")
     issue = {"number": 2119, "url": "https://github.com/squne121/loop-protocol/issues/2119", "body": "live body"}
     pr = {
@@ -92,9 +98,11 @@ def test_live_runtime_verifier_records_2119_2137_without_fixture_fallback(tmp_pa
     def run(_argv):
         return responses.pop(0)
 
-    artifact = tmp_path / "artifacts" / "runtime-verification-AC9-test.log"
+    artifact = tmp_path / "artifacts" / "runtime-verification-AC12-test.log"
     payload, code = runtime.verify(artifact_path=artifact, run_command=run)
     assert code == 0
     assert payload["status"] == "PASS"
     assert payload["fallback_used"] is False
+    assert payload["legacy_scope_coverage_marker_missing"] is True
+    assert payload["legacy_compatibility_disposition"] == "ordinary_dispatch_or_explicit_recovery"
     assert artifact.exists()

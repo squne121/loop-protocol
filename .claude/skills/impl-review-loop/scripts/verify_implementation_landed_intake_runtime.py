@@ -31,6 +31,29 @@ def _write_artifact(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _load_evidence_module() -> Any | None:
+    """Load implementation_landed_evidence.py's production functions.
+
+    #2699 P1-5 (Finding J / AC12): this verifier's live fetch (issue/PR
+    metadata, merge-commit main-ancestry compare) stays verifier-owned, but
+    the parse/normalize/disposition judgement itself must go through the
+    production `derive_landing_disposition()` / `coverage_from_pr_body()`
+    rather than a verifier-local inline ternary duplicating that logic.
+    """
+    import importlib.util
+
+    path = Path(__file__).resolve().with_name("implementation_landed_evidence.py")
+    spec = importlib.util.spec_from_file_location("implementation_landed_evidence_for_runtime_verifier", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    return module
+
+
 def verify(*, artifact_path: Path, run_command=_run) -> tuple[dict[str, Any], int]:
     records: list[dict[str, Any]] = []
 
@@ -104,16 +127,60 @@ def verify(*, artifact_path: Path, run_command=_run) -> tuple[dict[str, Any], in
         isinstance(ref, dict) and ref.get("number") == ISSUE_NUMBER and ref.get("url") == issue.get("url")
         for ref in (pr.get("closingIssuesReferences") or [])
     )
-    # This live historical PR predates the producer.  Treating a missing marker
-    # as exact coverage would be the forbidden merge-time reconstruction path.
-    legacy_marker_missing = "IMPLEMENTATION_SCOPE_COVERAGE_V1:" not in str(pr.get("body") or "")
     ancestry = compare_out.strip() in {"ahead", "identical"}
+
+    evidence_module = _load_evidence_module()
+    if evidence_module is None:
+        payload.update({"status": "FAIL", "reason": "evidence_module_unavailable", "errors": []})
+        _write_artifact(artifact_path, payload)
+        return payload, 1
+
+    issue_body = str(issue.get("body") or "")
+    pr_body = str(pr.get("body") or "")
+    coverage = evidence_module.coverage_from_pr_body(
+        pr_body=pr_body, issue_number=ISSUE_NUMBER, live_issue_body=issue_body
+    )
+    # This live historical PR predates the producer. Treating a missing
+    # marker as exact coverage would be the forbidden merge-time
+    # reconstruction path -- `coverage["status"]` is the production parser's
+    # own judgement of marker absence, not a verifier-local body substring
+    # search.
+    legacy_marker_missing = coverage.get("status") == "missing_marker"
+    candidate = {
+        "target": {"repo": REPO, "issue_number": ISSUE_NUMBER},
+        "pr": {"number": pr.get("number"), "url": pr.get("url"), "head_sha": None},
+        "provenance": {"kind": "closing_relation" if closing else "verified_cross_reference", "verified": True},
+        "lifecycle": "merged",
+        "head_fresh": True,
+        "current_scope_ownership": False,
+        "merge_oid": merge_oid,
+        "main_ancestry": {"verified": True, "reachable": ancestry},
+        "scope_coverage": coverage,
+    }
+    evidence = {
+        "schema": evidence_module.EVIDENCE_SCHEMA,
+        "schema_version": 1,
+        "target": {
+            "repo": REPO,
+            "issue_number": ISSUE_NUMBER,
+            "body_sha256": evidence_module._body_digest(issue_body),
+        },
+        "freshness": {"status": "fresh"},
+        "contradictory": False,
+        "candidates": [candidate],
+        "scope_coverage": None,
+    }
+    # #2699 P1-5 (Finding J / AC12): the disposition judgement itself runs
+    # through the same production function `build_intake_capsule.py` calls,
+    # not a verifier-local inline ternary.
+    disposition_result = evidence_module.derive_landing_disposition(evidence, repo=REPO, issue_number=ISSUE_NUMBER)
+    legacy_compatibility_disposition = disposition_result["disposition"]
     payload.update(
         {
             "issue_identity": {
                 "number": issue.get("number"),
                 "url": issue.get("url"),
-                "body_sha256": _digest(str(issue.get("body") or "")),
+                "body_sha256": _digest(issue_body),
             },
             "pr_identity": {
                 "number": pr.get("number"),
@@ -124,9 +191,8 @@ def verify(*, artifact_path: Path, run_command=_run) -> tuple[dict[str, Any], in
             "non_closing_relation": not closing,
             "merge_commit_current_main_ancestry": ancestry,
             "legacy_scope_coverage_marker_missing": legacy_marker_missing,
-            "legacy_compatibility_disposition": "implementation_already_landed"
-            if not legacy_marker_missing
-            else "ordinary_dispatch_or_explicit_recovery",
+            "legacy_compatibility_disposition": legacy_compatibility_disposition,
+            "legacy_compatibility_disposition_reason_codes": disposition_result.get("reason_codes", []),
             "compare_status": compare_out.strip(),
             "status": "PASS"
             if issue.get("number") == ISSUE_NUMBER
@@ -134,6 +200,7 @@ def verify(*, artifact_path: Path, run_command=_run) -> tuple[dict[str, Any], in
             and not closing
             and ancestry
             and legacy_marker_missing
+            and legacy_compatibility_disposition == "ordinary_dispatch_or_explicit_recovery"
             else "FAIL",
             "reason": None,
             "errors": [],

@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 EVIDENCE_SCHEMA = "IMPLEMENTATION_LANDED_EVIDENCE_V1"
@@ -339,6 +340,19 @@ def derive_landing_disposition(
             "candidate": candidate,
         }
     if lifecycle == "merged":
+        # #2699 P1-1 (Finding E / Disposition Precedence step 1): a malformed
+        # durable marker (schema/identity/digest invalid) is
+        # `reconciliation_required` regardless of lifecycle, and this check
+        # must run ahead of the merged-only ancestry/exact-coverage checks so
+        # a malformed marker is never silently treated as "no marker" and
+        # downgraded to `legacy_or_later_scope_expansion`.
+        coverage = _coverage_for(candidate, evidence)
+        if isinstance(coverage, Mapping) and coverage.get("status") == "invalid":
+            return {
+                "disposition": "reconciliation_required",
+                "reason_codes": list(coverage.get("errors") or ["invalid_scope_marker"]),
+                "candidate": candidate,
+            }
         ancestry = candidate.get("main_ancestry")
         if not isinstance(ancestry, Mapping) or ancestry.get("reachable") is not True:
             return {
@@ -346,7 +360,6 @@ def derive_landing_disposition(
                 "reason_codes": ["merged_candidate_not_on_current_main"],
                 "candidate": candidate,
             }
-        coverage = _coverage_for(candidate, evidence)
         if (
             isinstance(coverage, Mapping)
             and coverage.get("exact_coverage") is True
@@ -387,6 +400,17 @@ def derive_landing_disposition(
 def _run(argv: list[str]) -> tuple[int, str, str]:
     cp = subprocess.run(argv, check=False, capture_output=True, text=True)
     return cp.returncode, cp.stdout, cp.stderr
+
+
+_API_REPO_URL_RE = re.compile(r"^https?://[^/]+/repos/([^/]+/[^/]+?)(?:/.*)?$", re.I)
+
+
+def _repo_from_api_url(url: str | None) -> str | None:
+    """Extract `owner/repo` from a GitHub REST API URL, or None if absent."""
+    if not isinstance(url, str) or not url:
+        return None
+    match = _API_REPO_URL_RE.match(url)
+    return match.group(1) if match else None
 
 
 def _json(run: Callable[[list[str]], tuple[int, str, str]], argv: list[str]) -> tuple[Any, bool]:
@@ -462,9 +486,20 @@ def collect_candidate_inputs(
             source_issue = source.get("issue") if isinstance(source, Mapping) else None
             pr_info = source_issue.get("pull_request") if isinstance(source_issue, Mapping) else None
             number = source_issue.get("number") if isinstance(source_issue, Mapping) else None
-            if isinstance(pr_info, Mapping) and type(number) is int and number > 0:
-                found.setdefault(number, "verified_cross_reference")
+            if not isinstance(pr_info, Mapping) or type(number) is not int or number <= 0:
+                continue
+            # #2699 P1-2 (Finding F): `source.issue.pull_request` alone only
+            # proves the cross-referencing item is *a* PR, not that it lives
+            # in the target repository. A same-numbered PR in an unrelated
+            # repo must never be treated as a candidate for this Issue.
+            candidate_repo = _repo_from_api_url(
+                source_issue.get("repository_url") if isinstance(source_issue.get("repository_url"), str) else None
+            ) or _repo_from_api_url(pr_info.get("url") if isinstance(pr_info.get("url"), str) else None)
+            if candidate_repo is not None and candidate_repo.lower() != repo.lower():
+                continue
+            found.setdefault(number, "verified_cross_reference")
     candidates: list[dict[str, Any]] = []
+    materialization_failures: list[int] = []
     for number, provenance_kind in list(found.items())[:max_candidates]:
         pr, ok = _json(
             run,
@@ -480,6 +515,14 @@ def collect_candidate_inputs(
             ],
         )
         if not ok or not isinstance(pr, Mapping):
+            # #2699 P0-3 (Finding C): a discovered candidate whose detail
+            # fetch fails must not silently collapse discovery into
+            # "no candidate" (`no_qualified_candidate` -> possible
+            # `ordinary_dispatch_or_explicit_recovery`/duplicate work).
+            # Recording it here forces `contradictory` below, which
+            # `derive_landing_disposition()` always routes to
+            # `reconciliation_required` ahead of every lifecycle branch.
+            materialization_failures.append(number)
             continue
         refs = pr.get("closingIssuesReferences") or []
         closing = any(isinstance(ref, Mapping) and ref.get("number") == issue_number for ref in refs)
@@ -521,16 +564,284 @@ def collect_candidate_inputs(
                     "reachable": rc == 0 and out.strip() in {"ahead", "identical"},
                 }
         candidates.append(candidate)
+    # #2699 AC9: the current main HEAD sha is one of the three collection-time
+    # reference values (issue body / candidate head-or-merge-oid / main sha)
+    # that `resolve_landing_disposition_with_freshness_rebind()` re-verifies
+    # immediately before finalizing a disposition.
+    main_rc, main_out, _ = run(["gh", "api", f"repos/{repo}/commits/main", "--jq", ".sha"])
+    main_head_sha = main_out.strip() if main_rc == 0 else None
+    if not _valid_sha(main_head_sha):
+        main_head_sha = None
     status = "fresh" if list_ok and timeline_ok else "stale"
     return {
         "schema": EVIDENCE_SCHEMA,
         "schema_version": 1,
         "target": {"repo": repo, "issue_number": issue_number, "body_sha256": _body_digest(issue_body)},
         "freshness": {"status": status},
-        "contradictory": False,
+        # #2699 P0-3 (Finding C): a discovered candidate whose materialization
+        # (`gh pr view`) failed is evidence-invalid, not evidence-absent --
+        # `validate_implementation_landed_evidence()` treats `contradictory`
+        # as a hard error, which `derive_landing_disposition()` always
+        # routes to `reconciliation_required` ahead of every other branch.
+        "contradictory": bool(materialization_failures),
         "candidates": candidates,
         "scope_coverage": None,
         "discovery": {"bounded_max_candidates": max_candidates, "commands": commands},
         "current_scope_manifest": canonicalize_scope_manifest(issue_body),
         "decision_time_rebind": {"status": "fresh" if status == "fresh" else "stale"},
+        "materialization_failures": materialization_failures,
+        "main_head_sha": main_head_sha,
+    }
+
+
+# ---------------------------------------------------------------------------
+# #2699 AC9: decision-time freshness rebind + bounded retry.
+#
+# `collect_candidate_inputs()` records the identity values that must stay
+# stable through disposition finalization (issue body sha256, each
+# candidate's head-or-merge-oid, current main HEAD sha). This section
+# re-fetches those same three value classes live, immediately before a
+# disposition is finalized, and bounded-retries (collect + evaluate) exactly
+# once on drift before giving up with `reconciliation_required`
+# (`reason_codes: ["freshness_rebind_failed"]`).
+# ---------------------------------------------------------------------------
+
+_FRESHNESS_REBIND_MAX_RETRIES = 1
+
+
+def _collection_time_reference(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """The collection-time snapshot of the values freshness-rebind protects."""
+    candidates = evidence.get("candidates") if isinstance(evidence.get("candidates"), list) else []
+    candidate_identity: dict[int, str | None] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        pr = candidate.get("pr")
+        number = pr.get("number") if isinstance(pr, Mapping) else None
+        if not isinstance(number, int):
+            continue
+        if candidate.get("lifecycle") == "merged":
+            candidate_identity[number] = candidate.get("merge_oid")
+        else:
+            candidate_identity[number] = pr.get("head_sha") if isinstance(pr, Mapping) else None
+    target = evidence.get("target") if isinstance(evidence.get("target"), Mapping) else {}
+    return {
+        "issue_body_sha256": target.get("body_sha256"),
+        "main_head_sha": evidence.get("main_head_sha"),
+        "candidate_identity": candidate_identity,
+    }
+
+
+def _live_freshness_reference(
+    *,
+    repo: str,
+    issue_number: int,
+    candidates: list[Any],
+    run_command: Callable[[list[str]], tuple[int, str, str]],
+) -> dict[str, Any]:
+    """Live re-fetch of the same three value classes, taken right before
+    finalizing a disposition. `ok` is False whenever any live fetch fails
+    (transport failure is treated as non-fresh, never as a silent match)."""
+    rc, out, _ = run_command(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"])
+    issue_body_sha256: str | None = None
+    if rc == 0:
+        try:
+            payload = json.loads(out)
+        except json.JSONDecodeError:
+            payload = None
+        body = payload.get("body") if isinstance(payload, Mapping) else None
+        if isinstance(body, str):
+            issue_body_sha256 = _body_digest(body)
+
+    main_rc, main_out, _ = run_command(["gh", "api", f"repos/{repo}/commits/main", "--jq", ".sha"])
+    main_head_sha = main_out.strip() if main_rc == 0 else None
+    if not _valid_sha(main_head_sha):
+        main_head_sha = None
+
+    candidate_identity: dict[int, str | None] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        pr = candidate.get("pr")
+        number = pr.get("number") if isinstance(pr, Mapping) else None
+        if not isinstance(number, int):
+            continue
+        c_rc, c_out, _ = run_command(
+            ["gh", "pr", "view", str(number), "--repo", repo, "--json", "headRefOid,mergedAt,mergeCommit"]
+        )
+        identity: str | None = None
+        if c_rc == 0:
+            try:
+                c_payload = json.loads(c_out)
+            except json.JSONDecodeError:
+                c_payload = None
+            if isinstance(c_payload, Mapping) and c_payload.get("mergedAt"):
+                merge_commit = c_payload.get("mergeCommit")
+                identity = merge_commit.get("oid") if isinstance(merge_commit, Mapping) else None
+            elif isinstance(c_payload, Mapping):
+                identity = c_payload.get("headRefOid")
+        candidate_identity[number] = identity
+
+    ok = (
+        issue_body_sha256 is not None
+        and main_head_sha is not None
+        and all(value is not None for value in candidate_identity.values())
+    )
+    return {
+        "ok": ok,
+        "issue_body_sha256": issue_body_sha256,
+        "main_head_sha": main_head_sha,
+        "candidate_identity": candidate_identity,
+    }
+
+
+def _freshness_matches(collected: Mapping[str, Any], live: Mapping[str, Any]) -> bool:
+    if not live.get("ok"):
+        return False
+    if collected.get("issue_body_sha256") != live.get("issue_body_sha256"):
+        return False
+    if collected.get("main_head_sha") != live.get("main_head_sha"):
+        return False
+    return collected.get("candidate_identity") == live.get("candidate_identity")
+
+
+def resolve_landing_disposition_with_freshness_rebind(
+    *,
+    repo: str,
+    issue_number: int,
+    current_scope: Any,
+    run_command: Callable[[list[str]], tuple[int, str, str]] = _run,
+    max_candidates: int = 20,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
+    """AC9 production entry point: collect, verify freshness immediately
+    before finalizing, bounded-retry once on drift, then finalize.
+
+    This is the canonical replacement for a caller manually chaining
+    `collect_candidate_inputs()` -> `derive_landing_disposition()` without a
+    freshness check (`build_intake_capsule.py` uses this)."""
+    evidence = collect_candidate_inputs(
+        repo=repo,
+        issue_number=issue_number,
+        current_scope=current_scope,
+        run_command=run_command,
+        max_candidates=max_candidates,
+    )
+    for attempt in range(_FRESHNESS_REBIND_MAX_RETRIES + 1):
+        collected_ref = _collection_time_reference(evidence)
+        live_ref = _live_freshness_reference(
+            repo=repo,
+            issue_number=issue_number,
+            candidates=evidence.get("candidates") or [],
+            run_command=run_command,
+        )
+        if _freshness_matches(collected_ref, live_ref):
+            evidence["decision_time_rebind"] = {"status": "fresh"}
+            evidence["landing_disposition"] = derive_landing_disposition(
+                evidence, repo=repo, issue_number=issue_number, now=now
+            )
+            return evidence
+        if attempt >= _FRESHNESS_REBIND_MAX_RETRIES:
+            evidence["decision_time_rebind"] = {"status": "stale"}
+            evidence["landing_disposition"] = {
+                "disposition": "reconciliation_required",
+                "reason_codes": ["freshness_rebind_failed"],
+                "candidate": None,
+            }
+            return evidence
+        # Bounded retry: re-collect once before giving up (#2699 AC9).
+        evidence = collect_candidate_inputs(
+            repo=repo,
+            issue_number=issue_number,
+            current_scope=current_scope,
+            run_command=run_command,
+            max_candidates=max_candidates,
+        )
+    # Unreachable: the loop above always returns within
+    # `_FRESHNESS_REBIND_MAX_RETRIES + 1` iterations.
+    evidence["decision_time_rebind"] = {"status": "stale"}
+    evidence["landing_disposition"] = {
+        "disposition": "reconciliation_required",
+        "reason_codes": ["freshness_rebind_failed"],
+        "candidate": None,
+    }
+    return evidence
+
+
+# ---------------------------------------------------------------------------
+# #2699 Disposition Precedence step 2: reuse #2607's existing
+# `route_loop_verdict_v2.py::resolve_already_satisfied_early_exit_decision()`
+# rather than adding a new enum. This only overrides a landed-evidence
+# result that itself could not establish landing authority (no qualified
+# candidate, or only closed-unmerged candidates survive qualification) --
+# `reconciliation_required` / `implementation_already_landed` /
+# `existing_pr_resume` (Disposition Precedence steps 1/3/4/4b/4c) are never
+# touched by this step.
+# ---------------------------------------------------------------------------
+
+_NO_LANDING_AUTHORITY_REASON_CODES = frozenset({"no_qualified_candidate", "closed_unmerged_candidate"})
+
+
+def _load_route_loop_verdict_v2_module() -> Any | None:
+    import importlib.util
+
+    path = Path(__file__).resolve().with_name("route_loop_verdict_v2.py")
+    spec = importlib.util.spec_from_file_location("route_loop_verdict_v2_for_evidence", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    return module
+
+
+def apply_already_satisfied_precedence(
+    landing_result: Mapping[str, Any],
+    *,
+    next_action_route: str,
+    product_spec_routing_action: str,
+    pr_exists: bool,
+    base_ac_satisfied: bool,
+    route_loop_verdict_v2_module: Any | None = None,
+) -> dict[str, Any]:
+    """Disposition Precedence step 1 -> step 2 composition (AC4).
+
+    `landing_result` is `derive_landing_disposition()`'s output. When (and
+    only when) it could not establish landing authority
+    (`ordinary_dispatch_or_explicit_recovery` with `no_qualified_candidate`
+    or `closed_unmerged_candidate`), this re-evaluates the existing #2607
+    `resolve_already_satisfied_early_exit_decision()` and, if it fires,
+    returns the `already_satisfied` route instead. Every other landing
+    disposition (`reconciliation_required`, `implementation_already_landed`,
+    `existing_pr_resume`, and any other `ordinary_dispatch_or_explicit_recovery`
+    reason) passes through unchanged -- step 1 always wins over step 2.
+    """
+    disposition = landing_result.get("disposition")
+    reason_codes = landing_result.get("reason_codes") or []
+    no_landing_authority = disposition == "ordinary_dispatch_or_explicit_recovery" and any(
+        code in _NO_LANDING_AUTHORITY_REASON_CODES for code in reason_codes
+    )
+    if not no_landing_authority:
+        return dict(landing_result)
+
+    module = route_loop_verdict_v2_module or _load_route_loop_verdict_v2_module()
+    if module is None:
+        return dict(landing_result)
+
+    decision = module.resolve_already_satisfied_early_exit_decision(
+        next_action_route=next_action_route,
+        product_spec_routing_action=product_spec_routing_action,
+        pr_exists=pr_exists,
+        base_ac_satisfied=base_ac_satisfied,
+    )
+    if decision.get("early_exit") is not True:
+        return dict(landing_result)
+
+    return {
+        "disposition": "already_satisfied",
+        "reason_codes": ["already_satisfied_no_pr_created"],
+        "candidate": landing_result.get("candidate"),
+        "already_satisfied_decision": decision,
     }

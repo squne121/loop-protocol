@@ -669,6 +669,41 @@ def emit_implementation_pr_observed(*, repo: str, pr_number: int, linked_issue: 
         return "deferred", "RELATION_UNAVAILABLE"
 
 
+def _validate_pr_body(body: str, changed_paths: list[str] | None, linked_issue: int) -> tuple[bool, str | None, str | None]:
+    """Run both PR-body validators against `body`.
+
+    Returns `(passed, error_code, detail)`. `error_code`/`detail` are set only
+    when `passed` is False, mirroring the two `emit_error(...)` call sites
+    this replaces. Any `VALIDATOR_RULE_IDS` / `PR_BODY_PREFLIGHT_RESULT_V1`
+    stdout emitted before the failure is still emitted here.
+    """
+    validator_result = _run_pr_body_validator(body, changed_paths, linked_issue)
+    if validator_result.get("status") != "pass":
+        errors = validator_result.get("errors", [])
+        rule_ids = ",".join(error.get("rule_id", "") for error in errors if isinstance(error, dict))
+        detail = validator_result.get("message", "PR body validation failed")
+        if rule_ids:
+            detail = f"{detail}; rule_ids={rule_ids}"
+            emit_kv("VALIDATOR_RULE_IDS", rule_ids)
+        return False, _classify_validator_errors(errors), str(detail)
+
+    japanese_result = _run_japanese_content_validator(body)
+    if japanese_result.get("status") != "pass":
+        _jap_status = japanese_result.get("status")
+        preflight = {
+            "schema": "PR_BODY_PREFLIGHT_RESULT_V1",
+            "status": _jap_status if _jap_status in {"fail", "internal"} else "internal",
+            "body_sha256": japanese_result.get("body_sha256", ""),
+            "failed_blocks": japanese_result.get("failed_blocks", 0),
+            "aggregate_ratio": japanese_result.get("aggregate_ratio", 0.0),
+            "threshold": japanese_result.get("threshold", 0.1),
+        }
+        emit_kv("PR_BODY_PREFLIGHT_RESULT_V1", json.dumps(preflight, ensure_ascii=False))
+        return False, E_PR_BODY_JAPANESE_VALIDATION_FAILED, japanese_result.get("stderr", "")
+
+    return True, None, None
+
+
 def create_pr(repo: str, title: str, body_file: Path, branch: str, draft: bool) -> str:
     args = [
         "pr",
@@ -726,40 +761,18 @@ def main(argv: list[str] | None = None) -> int:
     default_link_kind = "Closes" if state == "OPEN" else "Refs"
     link_kind = resolve_linked_issue_reference_kind(original_body, args.linked_issue, default_link_kind)
     final_body = apply_linked_issue_reference(original_body, args.linked_issue, link_kind)
-    final_body = append_implementation_scope_coverage(final_body, repo=repo, linked_issue=args.linked_issue)
-    if final_body is None:
-        emit_error(
-            E_IMPLEMENTATION_SCOPE_COVERAGE_UNAVAILABLE,
-            "live Issue body / branch HEAD / shared scope normalizer を取得できませんでした",
-        )
-        return EXIT_BLOCKED
 
+    # Issue #2699 P0-1 fix_delta: the durable IMPLEMENTATION_SCOPE_COVERAGE_V1
+    # marker is only ever meaningful as a *publication-time* snapshot, so it
+    # is computed later, immediately before `create_pr()`, and only on the
+    # branch that actually creates a new PR. Validating this pre-marker body
+    # first means dry-run, existing-PR resume, and a validator error-path
+    # never depend on marker retrieval (live Issue body / branch HEAD /
+    # shared normalizer availability).
     changed_paths = resolve_changed_paths(args.changed_paths)
-    validator_result = _run_pr_body_validator(final_body, changed_paths, args.linked_issue)
-    if validator_result.get("status") != "pass":
-        errors = validator_result.get("errors", [])
-        rule_ids = ",".join(error.get("rule_id", "") for error in errors if isinstance(error, dict))
-        detail = validator_result.get("message", "PR body validation failed")
-        if rule_ids:
-            detail = f"{detail}; rule_ids={rule_ids}"
-            emit_kv("VALIDATOR_RULE_IDS", rule_ids)
-        error_code = _classify_validator_errors(errors)
-        emit_error(error_code, str(detail))
-        return EXIT_BLOCKED
-
-    japanese_result = _run_japanese_content_validator(final_body)
-    if japanese_result.get("status") != "pass":
-        _jap_status = japanese_result.get("status")
-        preflight = {
-            "schema": "PR_BODY_PREFLIGHT_RESULT_V1",
-            "status": _jap_status if _jap_status in {"fail", "internal"} else "internal",
-            "body_sha256": japanese_result.get("body_sha256", ""),
-            "failed_blocks": japanese_result.get("failed_blocks", 0),
-            "aggregate_ratio": japanese_result.get("aggregate_ratio", 0.0),
-            "threshold": japanese_result.get("threshold", 0.1),
-        }
-        emit_kv("PR_BODY_PREFLIGHT_RESULT_V1", json.dumps(preflight, ensure_ascii=False))
-        emit_error(E_PR_BODY_JAPANESE_VALIDATION_FAILED, japanese_result.get("stderr", ""))
+    passed, error_code, detail = _validate_pr_body(final_body, changed_paths, args.linked_issue)
+    if not passed:
+        emit_error(error_code, detail or "")
         return EXIT_BLOCKED
 
     draft = str(args.draft).strip().lower() == "true"
@@ -796,11 +809,6 @@ def main(argv: list[str] | None = None) -> int:
         delete=False,
     )
     try:
-        final_body_file.write(final_body)
-        final_body_file.flush()
-        final_body_file.close()
-        final_body_path = Path(final_body_file.name)
-
         # #1679: canonical repository resolution / PR mutation target
         # binding (Issue #1470) is an independent fail-closed safety
         # boundary that is kept after peer OPEN Issue overlap preflight is
@@ -833,6 +841,31 @@ def main(argv: list[str] | None = None) -> int:
                 emit_kv("LINKED_ISSUE", args.linked_issue)
                 emit_kv("LINK_KIND", link_kind)
                 return 0
+
+        # Issue #2699 P0-1 fix_delta: a new PR is actually about to be
+        # created (dry-run, existing-PR resume, and the canonical-existing
+        # resume above have all already returned), so this is the only
+        # branch where computing the durable IMPLEMENTATION_SCOPE_COVERAGE_V1
+        # publication-time marker is required. Embedding it, and then
+        # re-validating the body that will actually be published, keeps the
+        # existing PR-body validator (Japanese ratio / Safety Claim Matrix
+        # etc.) as the single source of truth for what `create_pr()` sends.
+        marker_body = append_implementation_scope_coverage(final_body, repo=repo, linked_issue=args.linked_issue)
+        if marker_body is None:
+            emit_error(
+                E_IMPLEMENTATION_SCOPE_COVERAGE_UNAVAILABLE,
+                "live Issue body / branch HEAD / shared scope normalizer を取得できませんでした",
+            )
+            return EXIT_BLOCKED
+        marker_passed, marker_error_code, marker_detail = _validate_pr_body(marker_body, changed_paths, args.linked_issue)
+        if not marker_passed:
+            emit_error(marker_error_code, marker_detail or "")
+            return EXIT_BLOCKED
+
+        final_body_file.write(marker_body)
+        final_body_file.flush()
+        final_body_file.close()
+        final_body_path = Path(final_body_file.name)
 
         try:
             pr_url = create_pr(pr_create_repo, args.pr_title, final_body_path, branch, draft)

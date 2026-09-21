@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -11,6 +13,13 @@ spec = importlib.util.spec_from_file_location("implementation_landed_evidence", 
 assert spec and spec.loader
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
+
+ROUTE_SCRIPT = ROOT / ".claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py"
+route_spec = importlib.util.spec_from_file_location("route_loop_verdict_v2_for_landed_evidence_test", ROUTE_SCRIPT)
+assert route_spec and route_spec.loader
+route_mod = importlib.util.module_from_spec(route_spec)
+sys.modules[route_spec.name] = route_mod
+route_spec.loader.exec_module(route_mod)
 
 REPO = "squne121/loop-protocol"
 ISSUE = 2119
@@ -187,3 +196,265 @@ def test_candidate_discovery_is_not_landing_authority_or_body_heuristic():
 
     evidence = mod.collect_candidate_inputs(repo=REPO, issue_number=ISSUE, current_scope={}, run_command=run)
     assert evidence["candidates"] == []
+
+
+def test_disposition_precedence_reuses_already_satisfied_before_landed_evidence():
+    """AC4: a no-landing-authority result (no qualified candidate, or only
+    closed-unmerged candidates survive qualification) falls back to #2607's
+    existing already_satisfied early-exit instead of a new enum. Every other
+    disposition (reconciliation_required / implementation_already_landed /
+    existing_pr_resume / any other ordinary_dispatch reason) is untouched --
+    Disposition Precedence step 1 always wins over step 2."""
+    no_candidate = mod.derive_landing_disposition(_evidence(candidates=[]), repo=REPO, issue_number=ISSUE)
+    assert no_candidate["reason_codes"] == ["no_qualified_candidate"]
+
+    closed_unmerged = mod.derive_landing_disposition(
+        _evidence(candidates=[_candidate(lifecycle="closed_unmerged")]), repo=REPO, issue_number=ISSUE
+    )
+    assert closed_unmerged["reason_codes"] == ["closed_unmerged_candidate"]
+
+    for landing_result in (no_candidate, closed_unmerged):
+        composed = mod.apply_already_satisfied_precedence(
+            landing_result,
+            next_action_route="proceed_to_step_1",
+            product_spec_routing_action="continue",
+            pr_exists=False,
+            base_ac_satisfied=True,
+            route_loop_verdict_v2_module=route_mod,
+        )
+        assert composed["disposition"] == "already_satisfied"
+        # Reuses route_loop_verdict_v2's existing production decision
+        # function rather than re-implementing the early-exit判定 (#2607).
+        assert composed["already_satisfied_decision"] == route_mod.resolve_already_satisfied_early_exit_decision(
+            next_action_route="proceed_to_step_1",
+            product_spec_routing_action="continue",
+            pr_exists=False,
+            base_ac_satisfied=True,
+        )
+
+    # base_ac_satisfied False must not fire the fallback.
+    untouched = mod.apply_already_satisfied_precedence(
+        no_candidate,
+        next_action_route="proceed_to_step_1",
+        product_spec_routing_action="continue",
+        pr_exists=False,
+        base_ac_satisfied=False,
+        route_loop_verdict_v2_module=route_mod,
+    )
+    assert untouched == no_candidate
+
+    # Step 1 always wins: reconciliation_required is never overridden, even
+    # when base_ac_satisfied is independently true.
+    reconciliation = mod.derive_landing_disposition(None, repo=REPO, issue_number=ISSUE)
+    passthrough = mod.apply_already_satisfied_precedence(
+        reconciliation,
+        next_action_route="proceed_to_step_1",
+        product_spec_routing_action="continue",
+        pr_exists=False,
+        base_ac_satisfied=True,
+        route_loop_verdict_v2_module=route_mod,
+    )
+    assert passthrough == reconciliation
+
+    # implementation_already_landed / existing_pr_resume are also untouched.
+    landed = mod.derive_landing_disposition(
+        _evidence(candidates=[_candidate(lifecycle="merged")], coverage=_exact_coverage()),
+        repo=REPO,
+        issue_number=ISSUE,
+    )
+    resume = mod.derive_landing_disposition(
+        _evidence(candidates=[_candidate(lifecycle="open")]), repo=REPO, issue_number=ISSUE
+    )
+    for result in (landed, resume):
+        assert (
+            mod.apply_already_satisfied_precedence(
+                result,
+                next_action_route="proceed_to_step_1",
+                product_spec_routing_action="continue",
+                pr_exists=False,
+                base_ac_satisfied=True,
+                route_loop_verdict_v2_module=route_mod,
+            )
+            == result
+        )
+
+
+def test_legacy_merged_candidate_without_durable_marker_never_yields_implementation_already_landed():
+    """AC5: a merged candidate with a missing durable marker (legacy PR,
+    e.g. #2137) must never yield implementation_already_landed, for either
+    provenance kind, and must not silently reconstruct merge-time scope from
+    the current body."""
+    missing_marker_coverage = mod.coverage_from_pr_body(
+        pr_body="no marker here", issue_number=ISSUE, live_issue_body="## Allowed Paths\n- `.claude/a.py`\n"
+    )
+    assert missing_marker_coverage["status"] == "missing_marker"
+
+    for provenance in ("closing_relation", "verified_cross_reference"):
+        candidate = _candidate(lifecycle="merged", provenance=provenance)
+        evidence = _evidence(candidates=[candidate], coverage=missing_marker_coverage)
+        result = mod.derive_landing_disposition(evidence, repo=REPO, issue_number=ISSUE)
+        assert result["disposition"] != "implementation_already_landed"
+        assert result["disposition"] == "ordinary_dispatch_or_explicit_recovery"
+        assert result["reason_codes"] == ["legacy_or_later_scope_expansion"]
+
+
+def test_2119_2137_legacy_and_durable_marker_fixture_regressions():
+    """AC10: #2119/PR#2137-shaped fixtures pin every required lifecycle
+    disposition, including the legacy (marker-missing) vs durable-marker
+    merged-closing distinction, scope expansion, open/draft resume (marker
+    and markerless), closed-unmerged, no-candidate, contradictory,
+    insufficient evidence, and a malformed merged marker."""
+    legacy_missing_marker = mod.coverage_from_pr_body(pr_body="", issue_number=ISSUE, live_issue_body="body")
+    legacy = _evidence(
+        candidates=[_candidate(lifecycle="merged", provenance="closing_relation")], coverage=legacy_missing_marker
+    )
+    assert (
+        mod.derive_landing_disposition(legacy, repo=REPO, issue_number=ISSUE)["disposition"]
+        == "ordinary_dispatch_or_explicit_recovery"
+    )
+
+    durable = _evidence(
+        candidates=[_candidate(lifecycle="merged", provenance="closing_relation")], coverage=_exact_coverage()
+    )
+    assert (
+        mod.derive_landing_disposition(durable, repo=REPO, issue_number=ISSUE)["disposition"]
+        == "implementation_already_landed"
+    )
+
+    expansion = mod.normalize_scope_coverage({"ac": ["AC1"]}, {"ac": ["AC1", "AC9"]})
+    expanded = _evidence(candidates=[_candidate(lifecycle="merged")], coverage=expansion)
+    assert (
+        mod.derive_landing_disposition(expanded, repo=REPO, issue_number=ISSUE)["disposition"]
+        == "ordinary_dispatch_or_explicit_recovery"
+    )
+
+    open_marker = _evidence(candidates=[_candidate(lifecycle="open")], coverage=_exact_coverage())
+    assert (
+        mod.derive_landing_disposition(open_marker, repo=REPO, issue_number=ISSUE)["disposition"]
+        == "existing_pr_resume"
+    )
+
+    open_markerless = _evidence(candidates=[_candidate(lifecycle="open", ownership=True, fresh=True)])
+    assert (
+        mod.derive_landing_disposition(open_markerless, repo=REPO, issue_number=ISSUE)["disposition"]
+        == "existing_pr_resume"
+    )
+
+    draft_markerless_blocked = _evidence(candidates=[_candidate(lifecycle="draft", ownership=False, fresh=True)])
+    assert (
+        mod.derive_landing_disposition(draft_markerless_blocked, repo=REPO, issue_number=ISSUE)["disposition"]
+        == "reconciliation_required"
+    )
+
+    closed_unmerged = _evidence(candidates=[_candidate(lifecycle="closed_unmerged")])
+    assert (
+        mod.derive_landing_disposition(closed_unmerged, repo=REPO, issue_number=ISSUE)["disposition"]
+        == "ordinary_dispatch_or_explicit_recovery"
+    )
+
+    no_candidate = _evidence(candidates=[])
+    assert (
+        mod.derive_landing_disposition(no_candidate, repo=REPO, issue_number=ISSUE)["disposition"]
+        == "ordinary_dispatch_or_explicit_recovery"
+    )
+
+    contradictory = _evidence(candidates=[_candidate(lifecycle="merged")], coverage=_exact_coverage(), contradictory=True)
+    assert (
+        mod.derive_landing_disposition(contradictory, repo=REPO, issue_number=ISSUE)["disposition"]
+        == "reconciliation_required"
+    )
+
+    assert mod.derive_landing_disposition(None, repo=REPO, issue_number=ISSUE)["disposition"] == "reconciliation_required"
+
+    # #2699 P1-1: a malformed merged-candidate marker is reconciliation_required
+    # regardless of lifecycle, ahead of the ancestry/exact-coverage checks.
+    malformed_merged_marker = {"status": "invalid", "errors": ["scope_coverage_manifest_digest_mismatch"]}
+    malformed = _evidence(candidates=[_candidate(lifecycle="merged")], coverage=malformed_merged_marker)
+    malformed_result = mod.derive_landing_disposition(malformed, repo=REPO, issue_number=ISSUE)
+    assert malformed_result["disposition"] == "reconciliation_required"
+    assert malformed_result["reason_codes"] == ["scope_coverage_manifest_digest_mismatch"]
+
+
+def test_decision_time_freshness_rebind_and_bounded_retry():
+    """AC9: disposition finalization re-verifies issue body sha256 /
+    candidate head-or-merge-oid / current main sha live, immediately before
+    finalizing, bounded-retries collection exactly once on drift, and
+    returns reconciliation_required(freshness_rebind_failed) if the retry
+    still disagrees."""
+    issue_body = "## Allowed Paths\n- `.claude/a.py`\n"
+    allowed_files = [{"path": ".claude/a.py"}]
+
+    def _pr_list_response():
+        return 0, json.dumps([{"number": 2137, "closingIssuesReferences": [{"number": ISSUE}]}]), ""
+
+    def _pr_view_full_response():
+        return (
+            0,
+            json.dumps(
+                {
+                    "number": 2137,
+                    "url": f"https://github.com/{REPO}/pull/2137",
+                    "state": "OPEN",
+                    "isDraft": False,
+                    "mergedAt": None,
+                    "mergeCommit": None,
+                    "headRefOid": SHA,
+                    "closingIssuesReferences": [{"number": ISSUE}],
+                    "body": "",
+                    "files": allowed_files,
+                }
+            ),
+            "",
+        )
+
+    def _pr_view_identity_response():
+        return 0, json.dumps({"headRefOid": SHA, "mergedAt": None, "mergeCommit": None}), ""
+
+    def make_run(main_sha_sequence):
+        state = {"main_sha_calls": 0, "pr_list_calls": 0}
+
+        def run(argv):
+            if argv[:3] == ["gh", "pr", "list"]:
+                state["pr_list_calls"] += 1
+                return _pr_list_response()
+            if argv[:2] == ["gh", "api"] and len(argv) > 2 and "timeline" in argv[-1]:
+                return 0, "[]", ""
+            if argv[:2] == ["gh", "api"] and len(argv) > 2 and "commits/main" in argv[2]:
+                sha = main_sha_sequence[state["main_sha_calls"]]
+                state["main_sha_calls"] += 1
+                return 0, sha, ""
+            if argv[:3] == ["gh", "pr", "view"]:
+                if argv[-1] == "headRefOid,mergedAt,mergeCommit":
+                    return _pr_view_identity_response()
+                return _pr_view_full_response()
+            if argv[:3] == ["gh", "issue", "view"]:
+                return 0, json.dumps({"body": issue_body}), ""
+            return 1, "", "unexpected argv: " + " ".join(argv)
+
+        return run, state
+
+    # Drift on the first rebind check, then a matching retry: succeeds using
+    # the retried (second) collection's disposition.
+    main_shas_recover = ["1" * 40, "2" * 40, "3" * 40, "3" * 40]
+    run_recover, state_recover = make_run(main_shas_recover)
+    result_recover = mod.resolve_landing_disposition_with_freshness_rebind(
+        repo=REPO, issue_number=ISSUE, current_scope=issue_body, run_command=run_recover
+    )
+    assert result_recover["decision_time_rebind"]["status"] == "fresh"
+    assert result_recover["landing_disposition"]["disposition"] == "existing_pr_resume"
+    # Bounded: exactly one initial collection + one retry collection.
+    assert state_recover["pr_list_calls"] == 2
+
+    # Drift on both the first and the (bounded, single) retry: gives up.
+    main_shas_fail = ["1" * 40, "2" * 40, "3" * 40, "4" * 40]
+    run_fail, state_fail = make_run(main_shas_fail)
+    result_fail = mod.resolve_landing_disposition_with_freshness_rebind(
+        repo=REPO, issue_number=ISSUE, current_scope=issue_body, run_command=run_fail
+    )
+    assert result_fail["decision_time_rebind"]["status"] == "stale"
+    assert result_fail["landing_disposition"] == {
+        "disposition": "reconciliation_required",
+        "reason_codes": ["freshness_rebind_failed"],
+        "candidate": None,
+    }
+    assert state_fail["pr_list_calls"] == 2
