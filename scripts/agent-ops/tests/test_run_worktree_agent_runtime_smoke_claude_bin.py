@@ -330,10 +330,22 @@ def test_preflight_claude_available_with_override_ignores_path(monkeypatch, tmp_
 _FORWARDER_CAUSAL_PROOF_HERDR_BODY = """
 STATE_DIR="$FAKE_HERDR_STATE_DIR"
 mkdir -p "$STATE_DIR"
-if [ "$1" = "--session" ]; then
+# Issue #2568 AC1/AC10: production code now explicitly prefixes EVERY
+# isolated-session herdr command with --session <name> (not just the
+# persistent session-holder process launched by create_isolated_session).
+# Distinguish the bare "herdr --session <name>" persistent-session-holder
+# invocation (nothing follows the session name) from a one-shot
+# "herdr --session <name> <subcommand> ..." invocation (something follows)
+# by checking $3: only the bare form gets the session-holder sleep-300
+# simulation; the subcommand form falls through to the normal dispatch
+# below after shifting the --session <name> pair off.
+if [ "$1" = "--session" ] && [ -z "$3" ]; then
   touch "$STATE_DIR/$2.session"
   sleep 300
   exit 0
+fi
+if [ "$1" = "--session" ]; then
+  shift 2
 fi
 case "$1 $2" in
   "status server")
@@ -522,8 +534,18 @@ def test_interactive_lane_claude_bin_shim_is_forwarder_not_symlink(monkeypatch, 
 # ---------------------------------------------------------------------------
 
 _FORWARDER_CAUSAL_PROOF_HERDR_BODY_WITH_PANE_LOG = _FORWARDER_CAUSAL_PROOF_HERDR_BODY.replace(
-    'mkdir -p "$STATE_DIR"\n',
-    'mkdir -p "$STATE_DIR"\n'
+    # Issue #2568 AC1/AC10: anchored AFTER the --session shift block (not
+    # right after "mkdir -p") -- production argv is now always
+    # "herdr --session <name> pane run ...", so $1/$2 only become
+    # "pane"/"run" once the shift above has already consumed --session
+    # <name>. Anchoring before the shift would leave $1 == "--session"
+    # forever and this pane_run_argv.log capture would never fire.
+    'if [ "$1" = "--session" ]; then\n'
+    '  shift 2\n'
+    'fi\n',
+    'if [ "$1" = "--session" ]; then\n'
+    '  shift 2\n'
+    'fi\n'
     'if [ "$1" = "pane" ] && [ "$2" = "run" ]; then\n'
     '  printf \'%s\\n\' "$@" >> "$STATE_DIR/pane_run_argv.log"\n'
     'fi\n',

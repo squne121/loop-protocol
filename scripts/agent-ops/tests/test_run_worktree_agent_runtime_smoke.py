@@ -249,7 +249,12 @@ def test_given_claude_gpt_default_interactive_lane_then_fixed_policy_channel_rea
 
     def fake_run(argv, *, env=None, **_kwargs):
         calls.append((list(argv), dict(env or {})))
-        command = argv[1:3]
+        # Issue #2568 AC1/AC10: production argv for these commands is now
+        # "herdr_bin --session <name> <subcommand> ...", so the subcommand
+        # words are at argv[3:5], not argv[1:3] (session stop/delete are
+        # unaffected -- this test never asserts on those, so the shift-agnostic
+        # default catch-all below still handles them correctly either way).
+        command = argv[3:5]
         if command == ["workspace", "create"]:
             return 0, '{"result":{"root_pane":{"pane_id":"pane-fixture"}}}', "", False
         if command == ["agent", "get"]:
@@ -266,7 +271,7 @@ def test_given_claude_gpt_default_interactive_lane_then_fixed_policy_channel_rea
     )
 
     workspace_argv, workspace_env = next(
-        (argv, env) for argv, env in calls if argv[1:3] == ["workspace", "create"]
+        (argv, env) for argv, env in calls if argv[3:5] == ["workspace", "create"]
     )
     assert workspace_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] == "subagent-start-stop"
     assert ["--env", "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop"] == [
@@ -277,12 +282,12 @@ def test_given_claude_gpt_default_interactive_lane_then_fixed_policy_channel_rea
     ][0]
 
     pane_export = next(
-        argv[4] for argv, _env in calls
-        if argv[1:3] == ["pane", "run"]
-        and "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS" in argv[4]
+        argv[6] for argv, _env in calls
+        if argv[3:5] == ["pane", "run"]
+        and "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS" in argv[6]
     )
     assert pane_export == "export CLAUDE_GPT_RUNTIME_SMOKE_HOOKS='subagent-start-stop'"
-    agent_start_argv = next(argv for argv, _env in calls if argv[1:3] == ["agent", "start"])
+    agent_start_argv = next(argv for argv, _env in calls if argv[3:5] == ["agent", "start"])
     assert "--settings" not in agent_start_argv
 
 
@@ -1044,10 +1049,22 @@ exit 0
 _FAKE_ISOLATED_HERDR_BODY = """
 STATE_DIR="$FAKE_HERDR_STATE_DIR"
 mkdir -p "$STATE_DIR"
-if [ "$1" = "--session" ]; then
+# Issue #2568 AC1/AC10: production code now explicitly prefixes EVERY
+# isolated-session herdr command with --session <name> (not just the
+# persistent session-holder process launched by create_isolated_session).
+# Distinguish the bare "herdr --session <name>" persistent-session-holder
+# invocation (nothing follows the session name) from a one-shot
+# "herdr --session <name> <subcommand> ..." invocation (something follows)
+# by checking $3: only the bare form gets the session-holder sleep-300
+# simulation; the subcommand form falls through to the normal dispatch
+# below after shifting the --session <name> pair off.
+if [ "$1" = "--session" ] && [ -z "$3" ]; then
   touch "$STATE_DIR/$2.session"
   sleep 300
   exit 0
+fi
+if [ "$1" = "--session" ]; then
+  shift 2
 fi
 case "$1 $2" in
   "status server")
@@ -1462,10 +1479,22 @@ def test_given_default_interactive_lane_when_new_session_name_generated_then_nam
 _FAKE_ISOLATED_HERDR_STALL_THEN_RECOVER_BODY = """
 STATE_DIR="$FAKE_HERDR_STATE_DIR"
 mkdir -p "$STATE_DIR"
-if [ "$1" = "--session" ]; then
+# Issue #2568 AC1/AC10: production code now explicitly prefixes EVERY
+# isolated-session herdr command with --session <name> (not just the
+# persistent session-holder process launched by create_isolated_session).
+# Distinguish the bare "herdr --session <name>" persistent-session-holder
+# invocation (nothing follows the session name) from a one-shot
+# "herdr --session <name> <subcommand> ..." invocation (something follows)
+# by checking $3: only the bare form gets the session-holder sleep-300
+# simulation; the subcommand form falls through to the normal dispatch
+# below after shifting the --session <name> pair off.
+if [ "$1" = "--session" ] && [ -z "$3" ]; then
   touch "$STATE_DIR/$2.session"
   sleep 300
   exit 0
+fi
+if [ "$1" = "--session" ]; then
+  shift 2
 fi
 case "$1 $2" in
   "status server")
@@ -1619,10 +1648,22 @@ def test_given_agent_prompt_stalled_and_recovery_never_observes_state_change_the
     body = """
 STATE_DIR="$FAKE_HERDR_STATE_DIR"
 mkdir -p "$STATE_DIR"
-if [ "$1" = "--session" ]; then
+# Issue #2568 AC1/AC10: production code now explicitly prefixes EVERY
+# isolated-session herdr command with --session <name> (not just the
+# persistent session-holder process launched by create_isolated_session).
+# Distinguish the bare "herdr --session <name>" persistent-session-holder
+# invocation (nothing follows the session name) from a one-shot
+# "herdr --session <name> <subcommand> ..." invocation (something follows)
+# by checking $3: only the bare form gets the session-holder sleep-300
+# simulation; the subcommand form falls through to the normal dispatch
+# below after shifting the --session <name> pair off.
+if [ "$1" = "--session" ] && [ -z "$3" ]; then
   touch "$STATE_DIR/$2.session"
   sleep 300
   exit 0
+fi
+if [ "$1" = "--session" ]; then
+  shift 2
 fi
 case "$1 $2" in
   "status server")
@@ -1719,10 +1760,22 @@ def test_given_agent_prompt_fails_for_non_stall_reason_when_lane_runs_then_no_re
     body = """
 STATE_DIR="$FAKE_HERDR_STATE_DIR"
 mkdir -p "$STATE_DIR"
-if [ "$1" = "--session" ]; then
+# Issue #2568 AC1/AC10: production code now explicitly prefixes EVERY
+# isolated-session herdr command with --session <name> (not just the
+# persistent session-holder process launched by create_isolated_session).
+# Distinguish the bare "herdr --session <name>" persistent-session-holder
+# invocation (nothing follows the session name) from a one-shot
+# "herdr --session <name> <subcommand> ..." invocation (something follows)
+# by checking $3: only the bare form gets the session-holder sleep-300
+# simulation; the subcommand form falls through to the normal dispatch
+# below after shifting the --session <name> pair off.
+if [ "$1" = "--session" ] && [ -z "$3" ]; then
   touch "$STATE_DIR/$2.session"
   sleep 300
   exit 0
+fi
+if [ "$1" = "--session" ]; then
+  shift 2
 fi
 case "$1 $2" in
   "status server")

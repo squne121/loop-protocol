@@ -586,10 +586,22 @@ fi
 _FAKE_ISOLATED_HERDR_BODY_MULTI_TURN = """
 STATE_DIR="$FAKE_HERDR_STATE_DIR"
 mkdir -p "$STATE_DIR"
-if [ "$1" = "--session" ]; then
+# Issue #2568 AC1/AC10: production code now explicitly prefixes EVERY
+# isolated-session herdr command with --session <name> (not just the
+# persistent session-holder process launched by create_isolated_session).
+# Distinguish the bare "herdr --session <name>" persistent-session-holder
+# invocation (nothing follows the session name) from a one-shot
+# "herdr --session <name> <subcommand> ..." invocation (something follows)
+# by checking $3: only the bare form gets the session-holder sleep-300
+# simulation; the subcommand form falls through to the normal dispatch
+# below after shifting the --session <name> pair off.
+if [ "$1" = "--session" ] && [ -z "$3" ]; then
   touch "$STATE_DIR/$2.session"
   sleep 300
   exit 0
+fi
+if [ "$1" = "--session" ]; then
+  shift 2
 fi
 case "$1 $2" in
   "status server")
@@ -690,10 +702,22 @@ exit 0
 _FAKE_ISOLATED_HERDR_BODY_MULTI_TURN_WITH_CLAUDE_BIN_RECEIPT = """
 STATE_DIR="$FAKE_HERDR_STATE_DIR"
 mkdir -p "$STATE_DIR"
-if [ "$1" = "--session" ]; then
+# Issue #2568 AC1/AC10: production code now explicitly prefixes EVERY
+# isolated-session herdr command with --session <name> (not just the
+# persistent session-holder process launched by create_isolated_session).
+# Distinguish the bare "herdr --session <name>" persistent-session-holder
+# invocation (nothing follows the session name) from a one-shot
+# "herdr --session <name> <subcommand> ..." invocation (something follows)
+# by checking $3: only the bare form gets the session-holder sleep-300
+# simulation; the subcommand form falls through to the normal dispatch
+# below after shifting the --session <name> pair off.
+if [ "$1" = "--session" ] && [ -z "$3" ]; then
   touch "$STATE_DIR/$2.session"
   sleep 300
   exit 0
+fi
+if [ "$1" = "--session" ]; then
+  shift 2
 fi
 case "$1 $2" in
   "status server")

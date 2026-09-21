@@ -21,18 +21,25 @@ herdr session list --json
 
 # 2. 高エントロピーな名前を生成し、HERDR_SESSION を isolated session 名に固定した
 #    環境（継承された HERDR_SESSION／HERDR_SOCKET_PATH／HERDR_PANE_ID／HERDR_TAB_ID／
-#    HERDR_WORKSPACE_ID は除去済み）で、その session 内に workspace を作成する
-HERDR_SESSION=<isolated-name> herdr workspace create --cwd "$WORKTREE" --no-focus
+#    HERDR_WORKSPACE_ID は除去済み）で、その session 内に workspace を作成する。
+#    isolated session へのコマンド送信は環境変数のみに依存せず、`herdr --session
+#    <isolated-name> ...` を明示的に指定する（Issue #2568 AC1/AC10、#2571 の
+#    real-machine spike で確認された「環境変数のみでは確実に route されない」
+#    finding を踏まえた両建て — HERDR_SESSION 環境変数の pin はそのまま維持しつつ、
+#    CLI フラグでも同じ session 名を明示する）
+herdr --session "<isolated-name>" workspace create --cwd "$WORKTREE" --no-focus
 # -> result.workspace.root_pane.pane_id を使う
 
-# 3. 同じ isolated 環境で agent lifecycle を駆動する
-HERDR_SESSION=<isolated-name> herdr agent start <unique-name> --kind claude|codex --pane <pane-id> --timeout <ms>
-HERDR_SESSION=<isolated-name> herdr agent prompt <unique-name> "<prompt>" --wait --timeout <ms>
-HERDR_SESSION=<isolated-name> herdr agent get <unique-name>
-HERDR_SESSION=<isolated-name> herdr agent explain <unique-name> --json
-HERDR_SESSION=<isolated-name> herdr agent read <unique-name> --source recent-unwrapped --lines <bounded>
+# 3. 同じ isolated 環境・同じ明示 --session で agent lifecycle を駆動する
+herdr --session "<isolated-name>" agent start <unique-name> --kind claude|codex --pane <pane-id> --timeout <ms>
+herdr --session "<isolated-name>" agent prompt <unique-name> "<prompt>" --wait --timeout <ms>
+herdr --session "<isolated-name>" agent get <unique-name>
+herdr --session "<isolated-name>" agent explain <unique-name> --json
+herdr --session "<isolated-name>" agent read <unique-name> --source recent-unwrapped --lines <bounded>
 
-# 4. 終了時は session そのものを終了し、消失を確認する（成功／失敗・SIGINT／SIGTERM を問わない）
+# 4. 終了時は session そのものを終了し、消失を確認する（成功／失敗・SIGINT／SIGTERM を問わない）。
+#    session 自体の stop/delete は対象 session 名を第一引数に取るため、この位置引数
+#    自体が既に明示的なターゲット指定である（追加の --session は不要）。
 herdr session stop <isolated-name> --json
 herdr session delete <isolated-name> --json
 herdr session list --json   # <isolated-name> が含まれないことを確認する
