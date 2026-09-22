@@ -181,12 +181,31 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         # steal the parent's live Binding for the same Tab).
         return {"decision": "pass", "reason_code": "fork_no_inherited_binding", "binding_id": None}
 
+    # Issue #2569 AC3/AC4 (durable recovery / strong anchor): the current
+    # Claude native session id is a STRONGER recovery anchor than the Herdr
+    # locator -- a Herdr cold restart typically reassigns
+    # tab/workspace/pane ids (AC3), but `claude --resume S`/the Claude-GPT
+    # launcher's `--resume S` preserve the exact same Claude session id S
+    # across the restart, and `current_claude_session_id` on the Binding is
+    # never cleared by `/quit`/SessionEnd (see `_end_current_run` below --
+    # only `runtime_health` changes). So try the session-id anchor FIRST;
+    # only fall back to the (locator may have changed across a cold
+    # restart, but is still the right anchor for the existing same-tab
+    # resume/`/clear` case the locator lookup already covered) live-location
+    # match when no Binding currently claims this exact session id.
     existing_binding = None
-    if source in _RECOVERABLE_SOURCES:
+    if claude_session_id:
+        try:
+            existing_binding = service.get_binding_by_current_session(conn, claude_session_id)
+        except errors.NotFoundError:
+            existing_binding = None
+    if existing_binding is None and source in _RECOVERABLE_SOURCES:
         existing_binding = service.get_binding_by_current_location(conn, herdr_locator)
 
     location_fields = _location_fields(payload)
-    run_kind, runtime_profile, resume_profile = config.operator_run_kind_and_profiles()
+    run_kind, runtime_profile, resume_profile = config.normalize_operator_profiles_for_new_run(
+        *config.operator_run_kind_and_profiles()
+    )
 
     if existing_binding is None:
         binding = service.create_binding(conn)

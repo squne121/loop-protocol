@@ -1096,7 +1096,9 @@ def _attach_or_start_binding_run_tx(
     # (claude_gpt vs native_operator) instead of hardcoding native_operator,
     # so this degrade path never mis-tags a Claude-GPT operator run.
     degrade_run_kind, degrade_runtime_profile, degrade_resume_profile = (
-        task_context_config.operator_run_kind_and_profiles()
+        task_context_config.normalize_operator_profiles_for_new_run(
+            *task_context_config.operator_run_kind_and_profiles()
+        )
     )
     run_id = _start_execution_run_tx(
         conn,

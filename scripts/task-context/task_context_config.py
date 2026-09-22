@@ -67,6 +67,18 @@ NATIVE_OPERATOR_RUN_KIND = "native_operator"
 CLAUDE_GPT_RUN_KIND = "claude_gpt"
 CLAUDE_GPT_RUNTIME_PROFILE = "claude_gpt_v1"
 
+# --- Issue #2569 In Scope: Native profile migration contract ---------------
+#
+# ``native_claude_v1`` is the explicit effective-profile value for a
+# Native-operator managed ExecutionRun (AC13). ``invalid_managed_profile`` is
+# the sentinel returned by ``resolve_effective_runtime_profile()`` below for
+# any managed ``(run_kind, runtime_profile, resume_profile)`` triple that
+# does not match one of the fixed contract combinations (AC14) -- callers
+# (the resume dispatcher) must treat it as ``RESTORE_BLOCKED``, never as a
+# reason to fall back to plain Native.
+NATIVE_CLAUDE_RUNTIME_PROFILE = "native_claude_v1"
+INVALID_MANAGED_PROFILE = "invalid_managed_profile"
+
 
 def resolve_operator_runtime_variant() -> str:
     """Read the raw ``LOOP_TASK_CONTEXT_RUNTIME_VARIANT`` carrier value.
@@ -118,6 +130,71 @@ def operator_run_kind_and_profiles() -> tuple[str, str | None, str | None]:
             stacklevel=2,
         )
     return NATIVE_OPERATOR_RUN_KIND, None, None
+
+
+def normalize_operator_profiles_for_new_run(
+    run_kind: str, runtime_profile: str | None, resume_profile: str | None
+) -> tuple[str, str | None, str | None]:
+    """Issue #2569 AC13 ("本Issue以降に作成される新規Native ExecutionRunは
+    ``runtime_profile``/``resume_profile``へ明示的に``native_claude_v1``を
+    保存する -- NULL新規書き込みを終了する"): given the raw triple
+    ``operator_run_kind_and_profiles()`` returns, upgrade the intentional
+    ``(native_operator, None, None)`` legacy-shaped default to the explicit
+    ``(native_operator, native_claude_v1, native_claude_v1)`` triple that
+    every NEW managed ExecutionRun row must be started with from this Issue
+    onward.
+
+    Deliberately a separate function from ``operator_run_kind_and_profiles``
+    (rather than changing that function's own return value) -- the raw
+    triple's ``(native_operator, None, None)`` shape is still relied on
+    elsewhere (its own "intentionally unset vs recognized variant" contract
+    and existing tests), and this Issue's requirement is narrowly about what
+    gets *persisted* on a newly-started ExecutionRun row, not about
+    redefining what "unset ``LOOP_TASK_CONTEXT_RUNTIME_VARIANT``" means.
+    Only the two callers that actually call ``start_execution_run`` for a
+    NEW row (``task_context_hook_flows.on_session_start`` and
+    ``task_context_service._attach_or_start_binding_run_tx``'s degrade path)
+    apply this normalization. Claude-GPT triples (already explicit) and any
+    other value pass through unchanged."""
+    if run_kind == NATIVE_OPERATOR_RUN_KIND and runtime_profile is None and resume_profile is None:
+        return NATIVE_OPERATOR_RUN_KIND, NATIVE_CLAUDE_RUNTIME_PROFILE, NATIVE_CLAUDE_RUNTIME_PROFILE
+    return run_kind, runtime_profile, resume_profile
+
+
+def resolve_effective_runtime_profile(
+    run_kind: str, runtime_profile: str | None, resume_profile: str | None
+) -> str:
+    """Issue #2569 "Native profile migration contract" -- resolve the
+    *effective* runtime profile for an already-persisted managed
+    ExecutionRun's ``(run_kind, runtime_profile, resume_profile)`` triple
+    (AC13/AC14). Read-time compatibility only -- never mutates the DB, never
+    backfills.
+
+    - ``(native_operator, NULL, NULL)`` -> ``native_claude_v1`` (legacy
+      pre-#2569 row, current mainline's intentional
+      ``operator_run_kind_and_profiles()`` default -- see that function's
+      docstring).
+    - ``(native_operator, native_claude_v1, native_claude_v1)`` ->
+      ``native_claude_v1`` (new-style explicit row, #2569 onward).
+    - ``(claude_gpt, claude_gpt_v1, claude_gpt_v1)`` -> ``claude_gpt_v1``.
+    - any other combination of a managed run_kind (``native_operator`` /
+      ``claude_gpt``) -> ``invalid_managed_profile`` (AC14 -- the resume
+      dispatcher must RESTORE_BLOCKED, never fall back to plain Native)."""
+    if run_kind == NATIVE_OPERATOR_RUN_KIND and runtime_profile is None and resume_profile is None:
+        return NATIVE_CLAUDE_RUNTIME_PROFILE
+    if (
+        run_kind == NATIVE_OPERATOR_RUN_KIND
+        and runtime_profile == NATIVE_CLAUDE_RUNTIME_PROFILE
+        and resume_profile == NATIVE_CLAUDE_RUNTIME_PROFILE
+    ):
+        return NATIVE_CLAUDE_RUNTIME_PROFILE
+    if (
+        run_kind == CLAUDE_GPT_RUN_KIND
+        and runtime_profile == CLAUDE_GPT_RUNTIME_PROFILE
+        and resume_profile == CLAUDE_GPT_RUNTIME_PROFILE
+    ):
+        return CLAUDE_GPT_RUNTIME_PROFILE
+    return INVALID_MANAGED_PROFILE
 
 
 def repo_instance_key(cwd: str | pathlib.Path | None = None) -> str:

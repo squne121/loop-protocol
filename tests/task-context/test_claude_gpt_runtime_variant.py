@@ -55,8 +55,13 @@ def test_given_runtime_variant_unset_when_session_start_new_binding_then_native_
     runs = service.find_open_execution_runs(conn, binding_id=binding_id, run_kind="native_operator")
     assert len(runs) == 1
     assert runs[0]["run_kind"] == "native_operator"
-    assert runs[0]["runtime_profile"] is None
-    assert runs[0]["resume_profile"] is None
+    # Issue #2569 AC13: every NEW Native ExecutionRun from this Issue onward
+    # records the explicit `native_claude_v1` profile pair instead of the
+    # legacy NULL/NULL shape (read-time compatibility for pre-#2569 rows is
+    # covered separately by test_native_profile_migration.py; no existing
+    # row is backfilled by this normalization).
+    assert runs[0]["runtime_profile"] == "native_claude_v1"
+    assert runs[0]["resume_profile"] == "native_claude_v1"
 
 
 def test_given_native_run_cleanly_ended_when_resuming_under_claude_gpt_variant_then_task_identity_preserved(
@@ -176,7 +181,9 @@ def test_given_claude_gpt_run_ended_when_resuming_under_native_variant_then_task
     assert restored["task_id"] == task_id
     native_runs = service.find_open_execution_runs(conn, binding_id=binding_id, run_kind="native_operator")
     assert len(native_runs) == 1
-    assert native_runs[0]["runtime_profile"] is None
+    # Issue #2569 AC13: this is a NEW Native ExecutionRun row (started fresh
+    # by this restore), so it records the explicit `native_claude_v1` pair.
+    assert native_runs[0]["runtime_profile"] == "native_claude_v1"
 
 
 # ---------------------------------------------------------------------------

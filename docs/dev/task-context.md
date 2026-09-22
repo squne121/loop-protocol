@@ -17,8 +17,11 @@ RuntimeLocation / GitHub-ref-claim / Event / projection-outbox）として提供
 API、machine-only CLI（`task-contextctl`）、deterministic tests のみ** である。
 
 `.claude/settings.json` の hook 配線、Herdr/statusLine projection、Claude-GPT
-launcher 配線、`worktree-agent-runtime-smoke`、cold-restart dispatcher、
-daemon/dashboard/message-bus は本 Issue の Out of Scope（親 #2562 参照）。
+launcher 配線、`worktree-agent-runtime-smoke`、daemon/dashboard/message-bus は
+本 Issue（#2563）の Out of Scope（親 #2562 参照）。cold-restart dispatcher は
+#2563 時点では Out of Scope だったが、後続の Issue #2569 で実装され、本
+ドキュメント下部の「Native profile migration contract」「Durable recovery」
+「Cold-restart resume dispatcher」の各節に追記されている。
 
 ## リポジトリ構成
 
@@ -714,3 +717,161 @@ ExecutionRun → Binding → canonical Task を transaction 内で解決する�
 - accepted `pr_merged_observed` の後だけ cleanup lifecycle が唯一の cleanup
   Activity を select/create して `cleanup_started` を journal する。merge 済みで
   cleanup 未完了の OPEN Task は derived `CLEANUP_PENDING` である。
+
+## Native profile migration contract（Issue #2569 AC13/AC14）
+
+`execution_runs.runtime_profile` / `resume_profile` の Native ExecutionRun 向け
+値は、read-time compatibility と new-write normalization の 2 段構えである。
+
+- **read-time compatibility（後方互換、DB backfill なし）**:
+  `task_context_config.resolve_effective_runtime_profile(run_kind,
+  runtime_profile, resume_profile)` が下記 4 パターンを解決する。
+  - `(native_operator, NULL, NULL)` → `native_claude_v1`（#2569 以前の
+    intentional な書き込み。`operator_run_kind_and_profiles()` の unset
+    デフォルトはこの Issue では変更していない）
+  - `(native_operator, native_claude_v1, native_claude_v1)` →
+    `native_claude_v1`（#2569 以降の新規書き込み）
+  - `(claude_gpt, claude_gpt_v1, claude_gpt_v1)` → `claude_gpt_v1`
+  - 上記いずれにも一致しない managed run_kind の組み合わせ →
+    `invalid_managed_profile`（AC14。resume dispatcher はこれを
+    `RESTORE_BLOCKED` として扱い、Native へ fallback しない）
+- **new-write normalization**: `task_context_config.
+  normalize_operator_profiles_for_new_run(run_kind, runtime_profile,
+  resume_profile)` が `operator_run_kind_and_profiles()` の生の戻り値を
+  正規化する。`(native_operator, None, None)` を
+  `(native_operator, native_claude_v1, native_claude_v1)` へ明示化し、
+  それ以外（claude_gpt の明示 triple 等）はそのまま通す。この正規化は
+  `task_context_hook_flows.on_session_start` の 2 箇所の
+  `start_execution_run` 呼び出し（new-binding / restored-binding）と
+  `task_context_service._attach_or_start_binding_run_tx` の degrade path
+  にのみ適用され、`operator_run_kind_and_profiles()` 自体の戻り値契約
+  （既存 `tests/task-context/test_state_root_resolution.py` が固定する
+  「unset → `(native_operator, None, None)`」の raw triple 契約）は変更
+  しない — 別関数として分離することで、既存の「intentionally unset か
+  未知 variant か」判定ロジック（`RuntimeWarning` 発火含む）に触れずに
+  「新規 ExecutionRun 行は明示的な profile を保存する」という #2569 の
+  要求だけを満たす。
+
+## Durable recovery: セッション ID を strong anchor にする（Issue #2569 AC3/AC4）
+
+`task_context_hook_flows.on_session_start` の Binding 解決は、`claude_session_id`
+による解決を Herdr locator（`herdr_tab_id`）による解決より優先する。
+
+1. `claude_session_id` が truthy な場合、まず
+   `service.get_binding_by_current_session(conn, claude_session_id)` を試す。
+2. それが `NotFoundError` の場合のみ（または `claude_session_id` が空の場合）、
+   従来どおり `source in {"startup", "resume", "clear"}` で
+   `service.get_binding_by_current_location(conn, herdr_locator)` にフォール
+   バックする。
+
+理由: Herdr cold restart は tab/workspace/pane locator を再割り当てしうる
+（AC3）が、`claude --resume S` / Claude-GPT launcher の `--resume S` は同一
+Claude session id `S` を保持する。`tab_bindings.current_claude_session_id` は
+`/quit`（SessionEnd）でも clear されない（`runtime_health` のみ `SUSPENDED`
+に変わる — `_end_current_run` 参照）ため、cold restart 後も session id 経由で
+同一 Binding を厳密に 1 件解決できる（AC4: 「locator 単独を identity
+authority にしない」）。同一 tab 上で新しい session id を伴う通常の
+`/clear`/resume（既存 `tests/task-context/test_hook_flows_session_start.py` の
+挙動）は、session id ベース解決が unmatched のまま従来の locator ベース
+解決へ自然にフォールバックするため、既存契約は変更されない。
+
+## Cold-restart resume dispatcher（Issue #2569）
+
+`scripts/task-context/task_context_resume_dispatcher.py` は、Herdr cold
+restart 後に保存済み `agent_session`（＝過去の `claude_session_id`）を
+profile-aware に resume する読み取り専用の classifier + 薄い launch
+実行体である。新しい daemon/lease table/lock file/distributed coordinator
+は追加しない。
+
+### 起動モデル（post-hoc orchestration、AC12）
+
+Herdr 自身の native resume（`resume_agents_on_restore`）を
+`HERDR_CONFIG_PATH` で session-scope に `false` へ無効化した上で、Herdr
+自身の `[[startup]]` plugin hook（session restore 完了・API socket ready
+後に一度だけ自動発火する）だけを Task Context-owned orchestrator の唯一の
+自動 trigger として使う。dispatcher 自身は `claude --resume` を shim/
+intercept しない（causal probe による実証は Issue #2569 本文
+「AC12 Production Interception Primitive 調査状況」節および
+[issuecomment-5770908872](https://github.com/squne121/loop-protocol/issues/2569#issuecomment-5770908872) /
+[issuecomment-5772732319](https://github.com/squne121/loop-protocol/issues/2569#issuecomment-5772732319)
+を参照）。
+
+### 状態固定リポジトリ identity（AC15）
+
+`resolve_dispatcher_state_root()` は常にこのモジュール自身の on-disk
+location（`_DISPATCHER_REPO_ANCHOR_CWD = os.path.dirname(__file__)`）を
+`config.resolve_state_root(cwd=...)` へ渡す。復元対象 pane が報告する cwd
+は一切使わない — Herdr がどのディレクトリで dispatcher を起動しても
+（あるいは resume 対象 pane がリポジトリ外の cwd を最後に報告していても）
+同じ state root/DB に解決される。
+
+### 5-way decision table
+
+```text
+Binding state                     | resolved profile          | dispatcher action
+-----------------------------------|----------------------------|--------------------------------------------
+ACTIVE                             | native_claude_v1 (valid)  | herdr agent start <name> --kind claude --pane <pane> -- --resume S
+ACTIVE                             | claude_gpt_v1 (valid)     | herdr pane run <pane> scripts/claude-gpt/launch.sh -- --resume S
+SUSPENDED / DETACHED               | (該当セッション)            | 自動起動しない（noop_suspended_no_auto_resume）
+unknown / never-managed            | (該当なし)                 | Task Context が ownership を主張しない（noop_unmanaged_session）
+managed but invalid/inconsistent   | invalid_managed_profile   | RESTORE_BLOCKED（Native fallback 禁止）
+```
+
+Native は `herdr agent start ... --kind claude --pane <id> -- --resume S`
+（causal probe が観測した `[[startup]]` hook 自身の実行形そのもの。
+[issuecomment-5772732319](https://github.com/squne121/loop-protocol/issues/2569#issuecomment-5772732319)
+参照）、Claude-GPT は `herdr pane run <id> scripts/claude-gpt/launch.sh --
+--resume S`（`--kind claude` は PATH 上の `claude` 実行ファイルを直接解決
+するため、repository-owned wrapper script を経由させる Claude-GPT では
+使えない — 使うと env swap を経由しない plain Native 起動に silently
+downgrade してしまう、AC6 が禁ずる挙動そのものになる）。
+
+`classify_for_resume(conn, session_id)` はこの表を純粋な read-only
+判定として実装する（I/O を一切行わない）。`prepare_managed_resume
+(session_id)` はこの分類を実行し、launch 可能な場合のみ Binding を
+`ACTIVE -> RESTORING` へ遷移させる（AC17 の pre-launch half）。
+
+### Two-phase restore state machine（AC17）と failure SSOT（AC16）
+
+`ACTIVE -> (prepare_managed_resume) -> RESTORING -> profile-specific launch
+-> SessionStart(source=resume, session_id=S) ACK -> old ExecutionRun
+technical close -> new ExecutionRun (同一 Task/Activity/Binding) -> locator
+re-home -> ACTIVE`。
+
+- pre-launch half（ACTIVE -> RESTORING、launch 失敗時の RESTORE_BLOCKED
+  遷移）は `task_context_resume_dispatcher.py`（`prepare_managed_resume` /
+  `mark_restore_blocked` / `execute_resume_decision`）が担う。
+- post-ACK half（old run close -> new run start -> locator re-home ->
+  ACTIVE）は、既存の `task_context_hook_flows.on_session_start` が
+  「durable recovery: セッション ID を strong anchor にする」節の
+  session-id-first 解決と組み合わさることで、cold restart 経由の resume
+  でも汎用的に実行される（dispatcher 側で重複実装しない）。
+- ACK（`SessionStart(source=resume, session_id=S)` の到達）より前の
+  いかなる失敗も `binding.runtime_health = RESTORE_BLOCKED` にする。これが
+  唯一の failure SSOT であり、別途 `Attention=NEEDS_HUMAN` のような新しい
+  projection は導入しない（表示層は既存の `runtime_health` フィールドから
+  導出する）。
+
+### Repository-owned finite runtime profile のみを再適用する
+
+`build_launch_argv()` は `decision.action` に対して次の 2 通りの固定 argv
+形状のみを構築する（`herdr` サブコマンド自体を含む完全な argv）。raw
+argv/environment/credential の replay は行わない。
+
+- Native: `["agent", "start", <name>, "--kind", "claude", "--pane",
+  pane_id, "--", "--resume", session_id]`
+- Claude-GPT: `["pane", "run", pane_id, str(scripts/claude-gpt/launch.sh),
+  "--", "--resume", session_id]`
+
+`execute_resume_decision()` がこれを `[herdr_bin, (--session S,) *argv]`
+として実行する。dispatcher 自身のプロセスは置き換えない（`os.execvp` は
+使わない）— `[[startup]]` hook から起動される単一の orchestrator プロセ
+スが複数 pane を順に dispatch できる必要があるため。
+
+既知の残存 caveat（round-3 causal probe で発見済み、本 Issue では未解消）:
+nested Claude Code 環境からは `CLAUDE_CODE_CHILD_SESSION` の継承により
+resume 後プロセスの transcript persistence が暗黙に無効化されうる。
+`herdr agent start`/`herdr pane run` のいずれも、resume 対象プロセスへ
+env を注入する CLI flag を持たないため、本モジュールはこれを
+`CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` 等で対処していない（既知の
+limitation として記録するに留める）。
