@@ -37,8 +37,9 @@ _SCRIPTS = {
     "typecheck:e2e": "tsc -p tests/e2e/tsconfig.json --noEmit",
     "lint:docs": "pnpm run lint:md && pnpm run lint:prose && pnpm run validate:roadmap-refs",
     "lint:md": (
-        "markdownlint-cli2 '**/*.md' '#node_modules/**' '#.claude/worktrees/**' "
-        "'#dist/**' '#coverage/**' '#playwright-report/**' '#test-results/**'"
+        "markdownlint-cli2 '**/*.md' '#node_modules/**' '#.agents/skills/**' "
+        "'#.claude/worktrees/**' '#dist/**' '#coverage/**' '#playwright-report/**' "
+        "'#test-results/**'"
     ),
     "lint:prose": (
         "textlint --config .textlintrc 'docs/**/*.md' 'README.md' '.github/**/*.md' "
