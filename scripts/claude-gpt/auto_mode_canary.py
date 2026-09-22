@@ -52,7 +52,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 EVIDENCE_DIR = SCRIPT_DIR / ".evidence"
 
-EVIDENCE_SCHEMA = "AUTO_MODE_CANARY_EVIDENCE_V1"
+EVIDENCE_SCHEMA = "AUTO_MODE_CANARY_EVIDENCE_V2"
+
+# PR #2717 owner review P1-1: `preflight.sh --auto-mode-check` が出力する
+# schema identity。`_effective_policy()` はこの値と一致する check_payload の
+# みを転記対象とし、一致しない場合（欠落・V1 legacy artifact・不明 schema）は
+# 「未評価値」へ黙って変換せず、schema mismatch として明示的に扱う。
+EXPECTED_AUTO_MODE_CHECK_SCHEMA = "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2"
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -1018,13 +1024,37 @@ def _effective_policy(auto_mode_check_json_path: Path | None, settings_path: Pat
     （再計算ではなく、fail-closed readback が計算した digest の照合転記。
     渡されなかった場合は "unavailable_not_provided" と明示し、
     偽の計算済み値を捏造しない）。加えて canary script / lib.sh / preflight.sh /
-    generated settings / trusted gh binary の SHA-256 を含める。"""
+    generated settings / trusted gh binary の SHA-256 を含める。
+
+    `classify_all_shell` は Issue #2709 AC2 の tri-state/availability evidence
+    （`generated_key_present` / `direct_readback_available` / `effective_value` /
+    `native_parity_claimed`）をそのまま `preflight.sh --auto-mode-check` の
+    出力（`CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2.classify_all_shell`）から
+    転記する。未読出の boolean を enabled・native parity・denial-rate 改善として
+    報告しない（AC2）。入力が渡されなかった場合の既定値は「未評価・未確認」を
+    表す安全な false/false/null/false であり、真であることを推定しない。
+
+    PR #2717 owner review P1-1: `check_payload` の `schema` が
+    `EXPECTED_AUTO_MODE_CHECK_SCHEMA`（`CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2`）
+    と一致しない場合（欠落・legacy V1 artifact・不明 schema のいずれか）は、
+    その中身を「未評価値」へ黙って変換して転記しない。代わりに
+    `auto_mode_check_schema_mismatch: true` と観測した schema 文字列を明示し、
+    呼び出し元（`main()`）が overall exit classification を fail-closed にできる
+    ようにする（旧 V1 artifact を渡しても `exit_classification: pass` に
+    紛れ込まない — negative regression: `test_effective_policy_rejects_legacy_v1_schema_as_mismatch_not_pass`）。"""
     policy: dict = {
         "permission_mode": "auto",
-        "classify_all_shell": True,
+        "classify_all_shell": {
+            "generated_key_present": False,
+            "direct_readback_available": False,
+            "effective_value": None,
+            "native_parity_claimed": False,
+        },
         "auto_mode_defaults_digest": "unavailable_not_provided",
         "effective_config_digest": "unavailable_not_provided",
         "auto_mode_readback_ok": None,
+        "auto_mode_check_schema_mismatch": False,
+        "auto_mode_check_observed_schema": None,
         "canary_script_sha256": _sha256_file(Path(__file__).resolve()),
         "broker_source_sha256": _sha256_file(Path(__file__).resolve()),
         "lib_sh_sha256": _sha256_file(SCRIPT_DIR / "lib.sh"),
@@ -1039,13 +1069,26 @@ def _effective_policy(auto_mode_check_json_path: Path | None, settings_path: Pat
             check_payload = json.loads(auto_mode_check_json_path.read_text(encoding="utf-8"))
         except ValueError:
             check_payload = {}
-        digests = check_payload.get("digests", {})
-        policy["auto_mode_defaults_digest"] = digests.get("auto_mode_defaults_digest", "unknown")
-        policy["effective_config_digest"] = digests.get("effective_config_digest", "unknown")
-        policy["auto_mode_readback_ok"] = check_payload.get("ok")
-        policy["classify_all_shell"] = bool(
-            check_payload.get("checks", {}).get("classify_all_shell_enabled", policy["classify_all_shell"])
-        )
+        observed_schema = check_payload.get("schema") if isinstance(check_payload, dict) else None
+        if observed_schema != EXPECTED_AUTO_MODE_CHECK_SCHEMA:
+            policy["auto_mode_check_schema_mismatch"] = True
+            policy["auto_mode_check_observed_schema"] = observed_schema
+        else:
+            digests = check_payload.get("digests", {})
+            policy["auto_mode_defaults_digest"] = digests.get("auto_mode_defaults_digest", "unknown")
+            policy["effective_config_digest"] = digests.get("effective_config_digest", "unknown")
+            policy["auto_mode_readback_ok"] = check_payload.get("ok")
+            classify_all_shell_payload = check_payload.get("classify_all_shell")
+            if isinstance(classify_all_shell_payload, dict):
+                raw_effective_value = classify_all_shell_payload.get("effective_value")
+                policy["classify_all_shell"] = {
+                    "generated_key_present": bool(classify_all_shell_payload.get("generated_key_present", False)),
+                    "direct_readback_available": bool(
+                        classify_all_shell_payload.get("direct_readback_available", False)
+                    ),
+                    "effective_value": raw_effective_value if isinstance(raw_effective_value, bool) else None,
+                    "native_parity_claimed": bool(classify_all_shell_payload.get("native_parity_claimed", False)),
+                }
 
     if settings_path is not None:
         policy["settings_sha256"] = _sha256_file(settings_path)
@@ -1181,6 +1224,15 @@ def main(argv: list[str] | None = None) -> int:
         results["negative"] = {"exit_code": rc, **detail}
         codes.append(rc)
 
+    effective_policy = _effective_policy(args.auto_mode_check_json, args.settings_path)
+    if effective_policy.get("auto_mode_check_schema_mismatch"):
+        # PR #2717 owner review P1-1: `--auto-mode-check-json` に渡された
+        # artifact の schema が期待値（V2）と一致しない場合、他の mode の
+        # 結果が全て OK/SKIP であっても overall を fail-closed にする。旧 V1
+        # artifact が静かに「未評価 evidence」へ変換され `exit_classification:
+        # pass` に紛れ込むことを防ぐ。
+        codes.append(EXIT_FAIL)
+
     # aggregate exit: FAIL(1) > SKIP(77) > OK(0)（SKIP を PASS へ昇格しない）。
     if EXIT_FAIL in codes:
         overall = EXIT_FAIL
@@ -1197,7 +1249,7 @@ def main(argv: list[str] | None = None) -> int:
         "generated_at": _now_iso(),
         "mode": args.mode,
         "sut_revision": _sut_revision(),
-        "effective_policy": _effective_policy(args.auto_mode_check_json, args.settings_path),
+        "effective_policy": effective_policy,
         "agy_causal_receipt": results.get("agy"),
         "github_remote_object_identity": results.get("github"),
         "negative_control": (results.get("github") or results.get("negative") or {}).get(

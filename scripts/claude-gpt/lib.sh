@@ -489,8 +489,19 @@ CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL="claude-gpt launcher ha
 CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL="claude-gpt launcher hard_deny 追加分（second-gate 補助・defense-in-depth）: force push（--force / --force-with-lease / +refspec）は絶対拒否する。"
 CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL="claude-gpt launcher hard_deny 追加分（second-gate 補助・defense-in-depth）: remote ref（branch/tag/release）の削除は絶対拒否する。"
 
-# `claude auto-mode config` readback で version-gate と実動作を検証する対応最小
-# Claude Code version（`classifyAllShell` が黙って無視されない最小 version。P0-3）。
+# `autoMode.classifyAllShell` setting のサポート開始バージョン（support floor）を
+# 示す non-blocking capability 情報（Issue #2709 AC6。PR #2717 owner review P2-2
+# 反映）。v2.1.193 が意味するのは「`autoMode.classifyAllShell` という setting 自体を
+# vendor CLI がサポートし始めた境界」であり、`claude auto-mode config` の direct
+# boolean readback が利用可能かどうかとは別物である（現行 vendor CLI は
+# `auto-mode defaults`/`auto-mode config` で 4 rule lists のみを公開し、この version
+# floor を満たしていても `classifyAllShell` key の direct readback は依然
+# unavailable — 実機検証 Claude Code 2.1.278 で確認済み）。以前は launcher 起動
+# そのものを拒否する hard fail-closed version gate だったが、launcher-generated
+# settings が `classifyAllShell` を無条件注入・必須視しなくなったため
+# （Issue #2709 AC1）、この version floor の役割は「setting support floor を
+# 満たしているかどうかのメタデータ」に縮小した。この version floor を必要とする
+# 他の独立機能は現時点で存在しない（investigation 済み、Issue #2709 Background 参照）。
 CLAUDE_GPT_MIN_SUPPORTED_CLAUDE_VERSION="2.1.193"
 
 # claude_gpt_json_escape: 任意文字列を JSON 文字列リテラル（引用符込み）へ変換する。
@@ -508,14 +519,20 @@ claude_gpt_json_escape() {
 
 # claude_gpt_auto_mode_json_fragment: settings JSON の `"autoMode": {...}` フィールド
 # 本体（キー名を含む）を1行の文字列として返す。`"$defaults"` を各配列の先頭に必ず
-# 含め、`classifyAllShell: true` を必須化する（Issue #2203 Outcome 節）。
+# 含める。`classifyAllShell` キーは意図的に省略する（Issue #2709 AC1）: native
+# Claude Code の既定は narrow な Bash/PowerShell allow が classifier より先に
+# 解決される key-omission 相当であり、launcher が `classifyAllShell: true` を
+# 無条件注入することは native full parity の主張ではなく Claude-GPT 固有の
+# classifier coverage 拡張だった。この無条件注入を除去し、native default と
+# 同様にキー自体を省略する。hard_deny への narrow 追加分（default branch push /
+# force push / remote ref deletion）は本変更と独立に維持する。
 claude_gpt_auto_mode_json_fragment() {
   env_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL")
   allow_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL")
   hard_deny_default_branch_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL")
   hard_deny_force_push_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL")
   hard_deny_ref_deletion_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL")
-  printf '"autoMode": {"environment": ["$defaults", %s], "allow": ["$defaults", %s], "hard_deny": ["$defaults", %s, %s, %s], "classifyAllShell": true}' \
+  printf '"autoMode": {"environment": ["$defaults", %s], "allow": ["$defaults", %s], "hard_deny": ["$defaults", %s, %s, %s]}' \
     "$env_label_json" "$allow_label_json" \
     "$hard_deny_default_branch_json" "$hard_deny_force_push_json" "$hard_deny_ref_deletion_json"
 }
@@ -529,22 +546,28 @@ claude_gpt_auto_mode_standalone_json() {
 
 # claude_gpt_auto_mode_readback: `claude auto-mode defaults` / `claude auto-mode config`
 # の実 readback で、launcher-generated settings の autoMode が effective config に
-# 正しく反映されていること（narrow environment/allow label 反映・hard_deny/soft_deny
-# 不変・classifyAllShell 有効）を検証する（Issue #2203 AC1）。python3 必須（未対応
-# 環境は fail-closed）。呼び出し元プロセスの env を継承せず、`env -i` で最小限のみ渡す
-# （FAKE_CLAUDE_ARGV_FILE 等、他コンポーネントの hermetic test 観測用 env の汚染防止も
-# 兼ねる）。
+# 正しく反映されていること（narrow environment/allow label 反映・hard_deny 追加分
+# 保持・soft_deny 不変）を検証する（Issue #2203 AC1 / Issue #2709 で classifyAllShell
+# 関連の fail-closed 契約を tri-state/availability evidence へ更新）。python3 必須
+# （未対応環境は fail-closed）。呼び出し元プロセスの env を継承せず、`env -i` で
+# 最小限のみ渡す（FAKE_CLAUDE_ARGV_FILE 等、他コンポーネントの hermetic test 観測用
+# env の汚染防止も兼ねる）。
 #
 # 引数1: claude 実行バイナリの絶対パス
 # 引数2: 検証対象の settings.local.json 絶対パス
-# 戻り値: 0 = readback 成功（PASS）、8 = fail-closed（未対応 version・readback
-#         mismatch・classifyAllShell 未反映）
+# 戻り値: 0 = readback 成功（PASS）、8 = fail-closed（narrow label 未反映・
+#         hard_deny/soft_deny 不整合・classifyAllShell の direct readback が
+#         generated key 省略と矛盾する値を返した・classifyAllShell の direct
+#         readback が exact bool でない値を返した（schema/capability drift。
+#         PR #2717 owner review P2-1）、のいずれか。version floor は
+#         non-blocking capability 情報であり、単独では fail-closed の理由にならない
+#         — Issue #2709 AC6）
 claude_gpt_auto_mode_readback() {
   claude_bin="$1"
   settings_path="$2"
 
   if ! command -v python3 >/dev/null 2>&1; then
-    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1","status":"blocked","reason":"python3_unavailable"}\n'
+    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2","status":"blocked","reason":"python3_unavailable"}\n'
     return 8
   fi
 
@@ -632,20 +655,25 @@ with open(defaults_path, encoding="utf-8") as fh:
 with open(config_path, encoding="utf-8") as fh:
     config_text = fh.read()
 
-# --- version gate（P0-3）。classifyAllShell は Claude Code v2.1.193 未満では
-#     黙って無視されるため、settings 文字列の有無ではなく実際に対応 version かを
-#     機械的に確認し、未対応/取得不能なら fail-closed とする。 ---
+# --- version capability info（non-blocking, Issue #2709 AC6。PR #2717 owner
+#     review P2-2 反映）。以前は classifyAllShell readback を検証する version
+#     未満を無条件 fail-closed にしていたが、launcher が classifyAllShell を
+#     無条件注入しなくなったため（AC1）、この version floor は
+#     「`autoMode.classifyAllShell` setting のサポート開始バージョン
+#     （support floor）を満たしているかどうか」を示す capability メタデータへ
+#     縮小した。これは vendor CLI の `auto-mode config` が classifyAllShell の
+#     direct boolean readback を公開しているかどうかとは別の意味であり
+#     （現行 vendor CLI は version floor を満たしていても direct readback は
+#     unavailable — 実機検証済み）、両者を混同する名称・説明にはしない。
+#     launcher 起動そのものはこの判定では拒否しない（reasons へは追加しない）。 ---
 parsed_version = _parse_version(version_text) if version_rc == 0 else None
 min_version = _parse_version(min_supported_version)
-version_ok = False
-if version_rc != 0:
-    reasons.append("claude_version_command_failed")
-elif parsed_version is None:
-    reasons.append("claude_version_unparsable")
+if version_rc != 0 or parsed_version is None:
+    classify_all_shell_setting_version_floor_met = False
 elif min_version is not None and parsed_version < min_version:
-    reasons.append("claude_version_below_minimum_supported")
+    classify_all_shell_setting_version_floor_met = False
 else:
-    version_ok = True
+    classify_all_shell_setting_version_floor_met = True
 
 defaults = None
 config = None
@@ -670,8 +698,6 @@ env_label_present = False
 allow_label_present = False
 hard_deny_superset_ok = None
 soft_deny_unmodified = None
-classify_all_shell_ok = False
-classify_all_shell_source = "not_evaluated"
 
 if defaults is not None and config is not None:
     for key in ("environment", "allow", "hard_deny", "soft_deny"):
@@ -705,66 +731,86 @@ if defaults is not None and config is not None:
     if not soft_deny_unmodified:
         reasons.append("soft_deny_modified")
 
-    # classifyAllShell の readback（P0-3）。実機検証（Claude Code 2.1.233,
-    # 2026-08-16）の結果、現行 CLI の `auto-mode defaults` / `auto-mode config`
-    # JSON はこの key 自体を一切出力しない（settings 側で明示 true にしていても
-    # effective config オブジェクトに現れない）。そのため effective config の
-    # key 存在を正本にする検証は現行 CLI では原理的に成立しない（vendor CLI の
-    # 制約であり、settings 文字列チェックの単純な置き換えでは代替できない）。
-    # ここでは「settings 文字列存在チェックだけでは CLI が key を無視していても
-    # PASS してしまう」という P0-3 の懸念に対し、二重の検証で fail-closed に
-    # 倒す。
-    #   1. effective config に key が現れる場合（将来 CLI がこの key を
-    #      公開した場合）はそれを正本として使う。
-    #   2. key が現れない場合は、(a) version gate（対応 CLI version 以上）と
-    #      (b) settings ファイル上の literal `"classifyAllShell": true` の
-    #      両方を要求する（version gate 単独より厳格。CLI が対応 version
-    #      以上であっても readback で真偽を確認できない現状の限界を、
-    #      「未対応 version は無条件 fail-closed」で部分的に補う）。
-    classify_all_shell_source = "effective_config"
-    if "classifyAllShell" in config:
-        classify_all_shell_ok = config.get("classifyAllShell") is True
-        if not classify_all_shell_ok:
-            reasons.append("classify_all_shell_not_enabled")
+# classifyAllShell tri-state/availability evidence (Issue #2709 AC1/AC2/AC5).
+# The launcher no longer injects `classifyAllShell` into generated settings
+# (AC1), so a boolean "enabled" readback is no longer the right question.
+# Real-machine verification (Claude Code 2.1.233, 2026-08-16) showed the
+# current vendor CLI does not expose this key in `auto-mode defaults` /
+# `auto-mode config` effective config output at all. This evidence
+# distinguishes (a) whether the launcher-generated settings literally
+# contain the key, from (b) whether the native CLI's direct boolean
+# readback surface is available -- and never infers/reports an unread
+# boolean as enabled, native-parity, or denial-rate-improving (AC2). This
+# computation is independent of the defaults/config success branch above
+# so that `generated_key_present` is always evaluated from the actual
+# generated settings file on disk (needed for the AC5 contradiction guard
+# below even if the `auto-mode defaults`/`auto-mode config` commands
+# themselves failed).
+try:
+    with open(settings_path, encoding="utf-8") as fh:
+        settings_text = fh.read()
+except OSError:
+    settings_text = ""
+generated_key_present = '"classifyAllShell"' in settings_text
+
+direct_readback_available = False
+effective_value = None
+if config is not None and "classifyAllShell" in config:
+    # PR #2717 owner review P2-1: `is True` は truthiness 相当の緩い判定であり、
+    # vendor CLI が将来 non-boolean 値（文字列 "false" / null / 数値等）を
+    # 返した場合に genuine な false へ黙って正規化してしまう。exact bool 型で
+    # ない場合は effective_value を確定させず、schema/capability drift として
+    # 明示的な reason を出す（新しい generic validator framework は作らない）。
+    raw_classify_all_shell_value = config["classifyAllShell"]
+    if type(raw_classify_all_shell_value) is bool:
+        direct_readback_available = True
+        effective_value = raw_classify_all_shell_value
     else:
-        classify_all_shell_source = "settings_literal_plus_version_gate_best_effort"
-        try:
-            with open(settings_path, encoding="utf-8") as fh:
-                settings_text = fh.read()
-        except OSError:
-            settings_text = ""
-        settings_literal_ok = (
-            '"classifyAllShell": true' in settings_text or '"classifyAllShell":true' in settings_text
-        )
-        classify_all_shell_ok = settings_literal_ok and version_ok
-        if not settings_literal_ok:
-            reasons.append("classify_all_shell_not_enabled")
-        elif not version_ok:
-            reasons.append("classify_all_shell_unverifiable_below_minimum_version")
+        reasons.append("classify_all_shell_readback_non_boolean")
+
+# AC5 block condition (b): if direct readback becomes available in the
+# future and reports the projection enabled despite the launcher never
+# having generated the key, that contradicts the generated/default
+# projection and must fail-closed rather than be silently accepted as a
+# denial-rate improvement or native parity claim.
+if direct_readback_available and not generated_key_present and effective_value is True:
+    reasons.append("classify_all_shell_effective_value_contradicts_omitted_key")
+
+classify_all_shell_evidence = {
+    "generated_key_present": generated_key_present,
+    "direct_readback_available": direct_readback_available,
+    "effective_value": effective_value,
+    "native_parity_claimed": False,
+}
 
 defaults_digest = _digest(defaults_text) if defaults is not None else "unknown"
 config_digest = _digest(config_text) if config is not None else "unknown"
 
-ok = not reasons and version_ok
+# version floor is non-blocking capability info only (AC6); it does not
+# participate in `ok`.
+ok = not reasons
 
 result = {
-    "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1",
+    "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2",
     "status": "ok" if ok else "blocked",
     "ok": ok,
     "claude_version": {
         "raw": version_text.strip(),
         "parsed": list(parsed_version) if parsed_version else None,
         "min_supported": list(min_version) if min_version else None,
-        "ok": version_ok,
+        # PR #2717 owner review P2-2: この field は「`autoMode.classifyAllShell`
+        # setting のサポート開始バージョンを満たしているか」のみを表す。
+        # classifyAllShell の direct boolean readback availability とは独立
+        # （それは下記 `classify_all_shell.direct_readback_available` を見る）。
+        "classify_all_shell_setting_version_floor_met": classify_all_shell_setting_version_floor_met,
     },
     "checks": {
         "environment_narrow_label_present": env_label_present,
         "allow_narrow_label_present": allow_label_present,
         "hard_deny_defaults_and_additions_present": bool(hard_deny_superset_ok),
         "soft_deny_unmodified": bool(soft_deny_unmodified),
-        "classify_all_shell_enabled": classify_all_shell_ok,
-        "classify_all_shell_verification_source": classify_all_shell_source,
     },
+    "classify_all_shell": classify_all_shell_evidence,
     "digests": {
         "auto_mode_defaults_digest": defaults_digest,
         "effective_config_digest": config_digest,

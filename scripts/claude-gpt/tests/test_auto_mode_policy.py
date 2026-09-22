@@ -6,7 +6,8 @@ Issue #2203（2026-08-16 OWNER adversarial review 反映）の regression matrix
 broker の後段にある second-gate の判断補助であり、決定論的 authority ではない
 （Configure auto mode ドキュメント準拠）。本ファイルはこの区別を前提として、
 launcher-generated settings への narrow autoMode 注入・permission-mode
-enforcement・classifyAllShell 必須化・GitHubMutationBroker の object-identity
+enforcement・classifyAllShell の native-aligned key omission と tri-state/
+availability evidence（Issue #2709）・GitHubMutationBroker の object-identity
 state machine・standalone runtime canary（`auto_mode_canary.py`）の exit code
 semantics・sanitized evidence schema・negative control を検証する。
 
@@ -91,7 +92,9 @@ def test_generated_settings_defaults_present_and_valid_json():
     """GIVEN lib.sh の claude_gpt_auto_mode_standalone_json
     WHEN 呼び出す
     THEN 妥当な JSON であり、environment/allow 配列の先頭に "$defaults" が
-    存在し、classifyAllShell が true である
+    存在する。`classifyAllShell` キーは native default と同様に生成設定から
+    省略される（Issue #2709 AC1。native full parity の主張ではなく、
+    Claude-GPT 固有の無条件注入を除去したもの）
     """
     result = _run_sh_function("claude_gpt_auto_mode_standalone_json")
     assert result.returncode == 0, result.stderr
@@ -99,7 +102,7 @@ def test_generated_settings_defaults_present_and_valid_json():
     auto_mode = payload["autoMode"]
     assert auto_mode["environment"][0] == "$defaults"
     assert auto_mode["allow"][0] == "$defaults"
-    assert auto_mode["classifyAllShell"] is True
+    assert "classifyAllShell" not in auto_mode
     assert len(auto_mode["environment"]) >= 2
     assert len(auto_mode["allow"]) >= 2
 
@@ -123,8 +126,10 @@ def test_generated_settings_not_written_to_project_settings():
 def test_generated_settings_defaults_readback_via_real_claude_cli(tmp_path):
     """GIVEN 実 claude CLI と launcher-owned settings fragment
     WHEN `preflight.sh --auto-mode-check <settings_path>` を実行する
-    THEN readback は ok、$defaults 由来の hard_deny/soft_deny は不変、
-    classifyAllShell は有効と判定される（AC1 PASS evidence）
+    THEN readback は ok、$defaults 由来の hard_deny/soft_deny は不変であり、
+    classifyAllShell は tri-state/availability evidence として報告される
+    （Issue #2709 AC1/AC2 PASS evidence。generated settings は key を省略し、
+    direct readback が未対応でも enabled/native parity と誤認しない）
     """
     claude_config_dir = tmp_path / "claude-gpt-home" / "claude"
     claude_config_dir.mkdir(parents=True)
@@ -145,26 +150,32 @@ def test_generated_settings_defaults_readback_via_real_claude_cli(tmp_path):
     assert payload["checks"]["allow_narrow_label_present"] is True
     assert payload["checks"]["hard_deny_defaults_and_additions_present"] is True
     assert payload["checks"]["soft_deny_unmodified"] is True
-    assert payload["checks"]["classify_all_shell_enabled"] is True
     # 実機検証（Claude Code 2.1.233, 2026-08-16）: 現行 CLI の `auto-mode config`
-    # JSON は classifyAllShell key 自体を公開しない。effective config に key が
-    # 現れる場合はそれを正本にし、現れない場合は version gate + settings 文字列の
-    # best-effort 二重検証へ fall back する（P0-3 fix-delta。lib.sh コメント参照）。
-    assert payload["checks"]["classify_all_shell_verification_source"] in (
-        "effective_config",
-        "settings_literal_plus_version_gate_best_effort",
-    )
+    # JSON は classifyAllShell key 自体を公開しない。generated settings は
+    # `classifyAllShell` を省略し（AC1）、direct readback の availability は
+    # vendor CLI 依存の独立した evidence として区別する（AC2）。
+    classify_all_shell = payload["classify_all_shell"]
+    assert classify_all_shell["generated_key_present"] is False
+    assert classify_all_shell["native_parity_claimed"] is False
+    assert isinstance(classify_all_shell["direct_readback_available"], bool)
+    if classify_all_shell["direct_readback_available"]:
+        assert isinstance(classify_all_shell["effective_value"], bool)
+    else:
+        assert classify_all_shell["effective_value"] is None
     assert payload["digests"]["auto_mode_defaults_digest"] != "unknown"
     assert payload["digests"]["effective_config_digest"] != "unknown"
-    assert payload["claude_version"]["ok"] is True
+    assert isinstance(payload["claude_version"]["classify_all_shell_setting_version_floor_met"], bool)
 
 
 def test_auto_mode_readback_fail_closed_on_unsupported_claude_version(tmp_path):
     """GIVEN claude --version が min supported version 未満を報告する
     WHEN preflight.sh --auto-mode-check を実行する
-    THEN classifyAllShell 等の他チェックに関わらず fail-closed（exit 8,
-    claude_version_below_minimum_supported）で拒否する（P0-3: settings 文字列
-    存在チェックだけでは検出できない version-gate 要件）
+    THEN version floor は non-blocking capability info に縮小されたため
+    （Issue #2709 AC6）、`claude_version_below_minimum_supported` は
+    fail_closed_reasons に現れず、`claude_version.classify_all_shell_setting_version_floor_met` のみが false になる。
+    このシナリオの exit 8 / ok=False は、fake CLI が narrow environment/allow
+    label を一切反映しない baseline を返すこと（他の既存 safety check の失敗）に
+    由来し、version floor 単独が原因ではないことを検証する
     """
     fake_claude_source = r"""#!/usr/bin/env python3
 import json
@@ -182,7 +193,6 @@ if "auto-mode" in argv:
         "allow": ["defaults-allow-baseline"],
         "hard_deny": ["defaults-hard-deny-baseline"],
         "soft_deny": ["defaults-soft-deny-baseline"],
-        "classifyAllShell": True,
     }
     print(json.dumps(baseline))
     sys.exit(0)
@@ -210,8 +220,14 @@ sys.exit(1)
     assert result.returncode == 8, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["ok"] is False
-    assert "claude_version_below_minimum_supported" in payload["fail_closed_reasons"]
-    assert payload["claude_version"]["ok"] is False
+    assert "claude_version_below_minimum_supported" not in payload["fail_closed_reasons"]
+    assert "environment_narrow_label_not_reflected" in payload["fail_closed_reasons"]
+    assert "allow_narrow_label_not_reflected" in payload["fail_closed_reasons"]
+    assert payload["claude_version"]["classify_all_shell_setting_version_floor_met"] is False
+    assert payload["classify_all_shell"]["generated_key_present"] is False
+    assert payload["classify_all_shell"]["direct_readback_available"] is False
+    assert payload["classify_all_shell"]["effective_value"] is None
+    assert payload["classify_all_shell"]["native_parity_claimed"] is False
 
 
 # --- AC2: narrow_policy_scope -------------------------------------------------
@@ -492,12 +508,14 @@ if argv and argv[0] == "--version":
 if "auto-mode" in argv:
     auto_mode_idx = argv.index("auto-mode")
     subcommand = argv[auto_mode_idx + 1] if auto_mode_idx + 1 < len(argv) else ""
+    # Issue #2709: 実機検証（Claude Code 2.1.233, 2026-08-16）に合わせ、baseline は
+    # classifyAllShell key を一切公開しない（vendor CLI の実際の挙動。generated
+    # settings も同様にこの key を省略する — AC1）。
     baseline = {
         "environment": ["defaults-env-baseline"],
         "allow": ["defaults-allow-baseline"],
         "hard_deny": ["defaults-hard-deny-baseline"],
         "soft_deny": ["defaults-soft-deny-baseline"],
-        "classifyAllShell": False,
     }
     if subcommand == "defaults":
         print(json.dumps(baseline))
@@ -528,8 +546,6 @@ if "auto-mode" in argv:
             _merge("environment")
             _merge("allow")
             _merge("hard_deny")
-            if auto_mode.get("classifyAllShell"):
-                config["classifyAllShell"] = True
         print(json.dumps(config))
         sys.exit(0)
 
@@ -601,14 +617,15 @@ def test_isolation_and_auto_mode_enforcement_injects_exactly_one_permission_mode
 def test_isolation_and_auto_mode_enforcement_settings_has_classify_all_shell_and_defaults(tmp_path):
     """GIVEN 正常起動
     WHEN 生成された settings.local.json を読む
-    THEN autoMode.classifyAllShell が true であり、既存 isolation guard（read
-    deny・enabledPlugins 空）を回帰させない
+    THEN autoMode.classifyAllShell キーは native default と同様に省略され
+    （Issue #2709 AC1）、既存 isolation guard（read deny・enabledPlugins 空）を
+    回帰させない
     """
     result = _run_launch(tmp_path, ["-p", "hello"])
     assert result.returncode == 0, result.stderr
     settings_path = tmp_path / "claude-gpt-home" / "claude" / "settings.local.json"
     payload = json.loads(settings_path.read_text(encoding="utf-8"))
-    assert payload["autoMode"]["classifyAllShell"] is True
+    assert "classifyAllShell" not in payload["autoMode"]
     assert payload["autoMode"]["environment"][0] == "$defaults"
     assert payload["autoMode"]["allow"][0] == "$defaults"
     assert payload["enabledPlugins"] == {}
@@ -623,7 +640,7 @@ def test_permission_request_hook_is_launcher_owned_and_does_not_add_permissions_
     settings_path = tmp_path / "claude-gpt-home" / "claude" / "settings.local.json"
     payload = json.loads(settings_path.read_text(encoding="utf-8"))
 
-    assert payload["autoMode"]["classifyAllShell"] is True
+    assert "classifyAllShell" not in payload["autoMode"]
     assert set(payload["permissions"]) == {"deny"}
     hook_groups = payload["hooks"]["PermissionRequest"]
     assert len(hook_groups) == 1
@@ -1360,7 +1377,7 @@ def test_sanitized_evidence_schema_has_required_top_level_keys(tmp_path):
         "exit_classification",
     ):
         assert key in payload
-    assert payload["schema"] == "AUTO_MODE_CANARY_EVIDENCE_V1"
+    assert payload["schema"] == "AUTO_MODE_CANARY_EVIDENCE_V2"
 
 
 def test_sanitized_evidence_never_contains_raw_prompt_response_or_credential():
@@ -1371,7 +1388,7 @@ def test_sanitized_evidence_never_contains_raw_prompt_response_or_credential():
     credential/token は保存・投稿しない）
     """
     payload = {
-        "schema": "AUTO_MODE_CANARY_EVIDENCE_V1",
+        "schema": "AUTO_MODE_CANARY_EVIDENCE_V2",
         "nested": {"agent_id_digest": "abc123", "provider": "agy"},
         "list": [{"receipt_digest": "def456"}],
     }
@@ -1629,8 +1646,15 @@ def test_effective_policy_transcribes_real_digests_not_placeholder(tmp_path):
     check_json_path.write_text(
         json.dumps(
             {
+                "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2",
                 "ok": True,
-                "checks": {"classify_all_shell_enabled": True},
+                "checks": {},
+                "classify_all_shell": {
+                    "generated_key_present": False,
+                    "direct_readback_available": False,
+                    "effective_value": None,
+                    "native_parity_claimed": False,
+                },
                 "digests": {
                     "auto_mode_defaults_digest": "a" * 64,
                     "effective_config_digest": "b" * 64,
@@ -1647,10 +1671,145 @@ def test_effective_policy_transcribes_real_digests_not_placeholder(tmp_path):
     assert policy["effective_config_digest"] == "b" * 64
     assert policy["auto_mode_defaults_digest"] != "see_preflight_auto_mode_check_output"
     assert policy["auto_mode_readback_ok"] is True
+    assert policy["auto_mode_check_schema_mismatch"] is False
+    assert policy["classify_all_shell"] == {
+        "generated_key_present": False,
+        "direct_readback_available": False,
+        "effective_value": None,
+        "native_parity_claimed": False,
+    }
     assert policy["canary_script_sha256"] != "unknown"
     assert policy["lib_sh_sha256"] != "unknown"
     assert policy["preflight_sh_sha256"] != "unknown"
     assert policy["settings_sha256"] != "unavailable_not_provided"
+
+
+# --- P1-1: legacy V1 schema artifact は schema mismatch として拒否する --------
+# (PR #2717 owner review 反映。旧形状を「未評価 evidence」へ黙って変換しない) --
+
+
+def test_effective_policy_rejects_legacy_v1_schema_as_mismatch_not_pass(tmp_path):
+    """GIVEN 旧 `CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1` shape（`checks.
+    classify_all_shell_enabled: bool` / `checks.classify_all_shell_verification_
+    source: string`）の legacy artifact
+    WHEN _effective_policy に渡す
+    THEN 新 tri-state shape の「未評価・未確認」既定値へ静かに変換されず、
+    `auto_mode_check_schema_mismatch: true` と観測した schema 文字列を明示する
+    （不正な旧 evidence が `exit_classification: pass` に紛れ込まない）
+    """
+    legacy_v1_payload = {
+        "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1",
+        "status": "ok",
+        "ok": True,
+        "checks": {
+            "environment_narrow_label_present": True,
+            "allow_narrow_label_present": True,
+            "hard_deny_defaults_and_additions_present": True,
+            "soft_deny_unmodified": True,
+            "classify_all_shell_enabled": True,
+            "classify_all_shell_verification_source": "effective_config",
+        },
+        "digests": {
+            "auto_mode_defaults_digest": "e" * 64,
+            "effective_config_digest": "f" * 64,
+        },
+        "fail_closed_reasons": [],
+    }
+    check_json_path = tmp_path / "legacy-v1-auto-mode-check.json"
+    check_json_path.write_text(json.dumps(legacy_v1_payload), encoding="utf-8")
+
+    policy = canary._effective_policy(check_json_path, None)
+    assert policy["auto_mode_check_schema_mismatch"] is True
+    assert policy["auto_mode_check_observed_schema"] == "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1"
+    # legacy V1 の digest/ok を転記しない（"unavailable_not_provided" のまま）。
+    assert policy["auto_mode_defaults_digest"] == "unavailable_not_provided"
+    assert policy["effective_config_digest"] == "unavailable_not_provided"
+    assert policy["auto_mode_readback_ok"] is None
+    # legacy V1 の bool 形状（classify_all_shell_enabled: True）が新 tri-state
+    # shape の effective_value: true 相当へ読み替えられていないこと。
+    assert policy["classify_all_shell"] == {
+        "generated_key_present": False,
+        "direct_readback_available": False,
+        "effective_value": None,
+        "native_parity_claimed": False,
+    }
+
+
+def test_run_marks_overall_fail_when_auto_mode_check_schema_mismatches(tmp_path):
+    """GIVEN 他の判定（AC4 agy causal receipt canary）は単独なら EXIT_OK/"pass"
+    になる正常な receipt だが、`--auto-mode-check-json` に legacy V1 artifact を
+    渡している
+    WHEN auto_mode_canary.py をサブプロセスとして実行する
+    THEN schema mismatch は evidence の `effective_policy` に記録され、overall
+    `exit_classification` は "pass" に紛れ込まず、非 0 exit で終了する
+    （PR #2717 owner review P1-1: schema 不一致単独でも fail-closed。旧 V1
+    artifact を渡しても他の canary が通れば pass になってしまう回帰を防ぐ）
+    """
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "agent_id": "a",
+                "tool_use_id": "t",
+                "builder_path": "b",
+                "wrapper_path": "w",
+                "provider": "agy",
+                "profile": "default",
+                "request_nonce": "n",
+                "fallback_used": False,
+                "provider_skipped": False,
+                "wrapper_exit_code": 0,
+                "terminal_completion": True,
+                "marker_only_insufficient": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    legacy_v1_payload = {
+        "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1",
+        "ok": True,
+        "checks": {"classify_all_shell_enabled": True},
+        "digests": {"auto_mode_defaults_digest": "g" * 64, "effective_config_digest": "h" * 64},
+    }
+    check_json_path = tmp_path / "legacy-v1-auto-mode-check.json"
+    check_json_path.write_text(json.dumps(legacy_v1_payload), encoding="utf-8")
+
+    # baseline: 同じ receipt だが --auto-mode-check-json を渡さない場合は pass
+    # になることを先に確認し、legacy artifact だけが差分要因であることを保証する。
+    baseline = subprocess.run(
+        [sys.executable, str(CANARY_PY), "--mode", "agy", "--agy-receipt-path", str(receipt_path), "--no-evidence"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    baseline_payload = json.loads(baseline.stdout)
+    assert baseline_payload["exit_classification"] == "pass"
+    assert baseline.returncode == 0
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CANARY_PY),
+            "--mode",
+            "agy",
+            "--agy-receipt-path",
+            str(receipt_path),
+            "--auto-mode-check-json",
+            str(check_json_path),
+            "--no-evidence",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["effective_policy"]["auto_mode_check_schema_mismatch"] is True
+    assert payload["effective_policy"]["auto_mode_check_observed_schema"] == (
+        "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V1"
+    )
+    assert payload["exit_classification"] != "pass"
+    assert result.returncode != 0
 
 
 # --- P1-2: edit body 完全一致 / comment readback 検証 ---------------------------
