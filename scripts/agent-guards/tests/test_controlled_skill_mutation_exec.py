@@ -107,6 +107,89 @@ class TestGraphqlCallDiagnosticRedaction:
         assert "[REDACTED]" in error
 
 
+# Issue #2718 AC2 / AC3 / AC4: `_redact_secret_like_tokens()` /
+# `_graphql_call()` coverage for the new-format `ghs_<APP_ID>_<JWT>` GitHub
+# App installation token, plus a regression fixture pinning that classic
+# `gh[oprsu]_...` token redaction -- including the classic short `ghs_`
+# form -- is unchanged. These are module-level functions (not methods) so
+# their bare pytest node ids match the Issue's Verification Commands.
+
+
+def test_redact_secret_like_tokens_fully_redacts_new_installation_token():
+    """AC2: a new-format token (`ghs_<APP_ID>_<JWT header>.<payload>.<sig>`)
+    must be replaced by exactly one `[REDACTED]` -- no APP_ID or JWT segment
+    fragment may survive."""
+    app_id = "123456789"
+    jwt_header = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"
+    jwt_payload = "eyJpc3MiOiJodHRwczovL2FwaS5naXRodWIuY29tIiwiaWF0IjoxNzAwMDAwMDAwfQ"
+    jwt_signature = "AbCdEf-123_XyZ9876543210"
+    new_token = f"ghs_{app_id}_{jwt_header}.{jwt_payload}.{jwt_signature}"
+
+    result = _exec._redact_secret_like_tokens(f"before {new_token} after")
+
+    assert result == "before [REDACTED] after"
+    assert app_id not in result
+    assert jwt_header not in result
+    assert jwt_payload not in result
+    assert jwt_signature not in result
+
+
+def test_redact_secret_like_tokens_preserves_classic_ghs_token_redaction():
+    """AC3: the classic short `ghs_[A-Za-z0-9]{20,}` token form must still
+    be fully redacted (no behavior regression from the new AC2 pattern)."""
+    classic_ghs_token = "ghs_" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+
+    result = _exec._redact_secret_like_tokens(f"before {classic_ghs_token} after")
+
+    assert result == "before [REDACTED] after"
+    assert classic_ghs_token not in result
+    assert "ghs_" not in result
+
+
+def test_graphql_call_exception_redacts_new_installation_token():
+    """AC4: the new-format token must be fully redacted through the same
+    production call path (`_graphql_call`'s outer-exception branch) as
+    `TestGraphqlCallDiagnosticRedaction.test_outer_subprocess_exception_redacts_secret_like_token`
+    above -- no APP_ID/JWT fragment may survive in the returned
+    diagnostic."""
+    app_id = "987654321"
+    jwt_header = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9"
+    jwt_payload = "eyJpc3MiOiJodHRwczovL2FwaS5naXRodWIuY29tIiwiaWF0IjoxNzAwMDAwMDAwfQ"
+    jwt_signature = "AbCdEf-123_XyZ9876543210"
+    new_token = f"ghs_{app_id}_{jwt_header}.{jwt_payload}.{jwt_signature}"
+
+    with patch.object(
+        _exec.subprocess,
+        "run",
+        side_effect=RuntimeError(f"subprocess failure {new_token}"),
+    ):
+        data, error = _exec._graphql_call("gh", {}, "query Test", {})
+
+    assert data is None
+    assert new_token not in error
+    assert app_id not in error
+    assert jwt_header not in error
+    assert jwt_payload not in error
+    assert jwt_signature not in error
+    assert "[REDACTED]" in error
+
+
+def test_redact_secret_like_tokens_short_ghs_string_below_new_threshold_not_matched_by_new_pattern():
+    """Regression pin for the PR #2722 review fix: the new-format `ghs_`
+    pattern requires >= 36 chars after the prefix (not the originally-shipped
+    >= 20), to avoid over-broadly redacting short, non-token strings that
+    happen to start with `ghs_`. A 24-char body (matches the old `{20,}`
+    threshold but not the new `{36,}` one) must fall through to the classic
+    `gh[oprsu]_[A-Za-z0-9]{20,}` pattern instead -- it is still fully
+    redacted overall, but not via the `ghs_`-specific pattern."""
+    short_ghs_string = "ghs_" + "A1b2C3d4E5f6G7h8I9j0K1l2"  # 24 chars, alnum-only
+    assert not _exec._SECRET_LIKE_PATTERNS[0].search(short_ghs_string)
+
+    result = _exec._redact_secret_like_tokens(f"before {short_ghs_string} after")
+
+    assert result == "before [REDACTED] after"
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
