@@ -768,7 +768,22 @@ def _extract_http_status(stderr: str) -> int | None:
 # output in its return value -- every other branch here already returns a
 # fixed, credential-free canonical string. Redaction runs BEFORE bounding, so
 # a token that happens to fall within the truncation window never survives.
+#
+# Issue #2718: GitHub's 2026-04-24 changelog introduced a new-format GitHub
+# App installation token shape: `ghs_<APP_ID>_<JWT>` (the `ghs_` prefix is
+# unchanged; APP_ID and the dot-separated JWT header/payload/signature use
+# the base64url charset `[A-Za-z0-9._-]`, ~520 chars total). The pre-existing
+# `gh[oprsu]_[A-Za-z0-9]{20,}` pattern below only matches an alphanumeric
+# body, so on a new-format token it stops at the first `_`/`.` separator and
+# only redacts the `ghs_<APP_ID>` prefix, leaving JWT fragments exposed. This
+# new pattern is listed FIRST (order matters: `_redact_secret_like_tokens()`
+# applies patterns sequentially via `.sub()`) so its wider charset consumes
+# the entire new-format token in one pass, before the classic pattern would
+# otherwise get a chance to partially match and leave a fragment behind.
+# This is a simple charset-based extension only -- it does not parse or rely
+# on the JWT's internal header/payload/signature semantics.
 _SECRET_LIKE_PATTERNS = (
+    _re.compile(r"ghs_[A-Za-z0-9._-]{20,}"),
     _re.compile(r"gh[oprsu]_[A-Za-z0-9]{20,}"),
     _re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
     _re.compile(r"(?i)\bauthorization:\s*bearer\s+\S+"),
