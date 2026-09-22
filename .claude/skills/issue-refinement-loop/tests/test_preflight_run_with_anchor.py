@@ -509,6 +509,7 @@ def test_e2e_full_rewrite_required_reaches_next_action_via_canonical_consumer(tm
     # the absence of any comment-posting callback, which this fixture never
     # supplies.
     assert result["contract_update"]["status"] != "no_change"
+    assert result["contract_update"]["reason_code"] == "approved_scope_requires_full_contract_rewrite"
     # AC4: the existing _bounded_contract_update_handoff() post-update
     # 6-gate (preflight/review/readiness/allowed_paths/permission_profile/
     # runtime_evidence) is still exercised for this disposition -- fresh_checks
@@ -1027,6 +1028,17 @@ _HRD_EXPLICIT_BODY = (
     "clarifying context for new contributors.\n"
 )
 _HRD_PROSE_ONLY_BODY = "This section could probably be clearer at some point."
+_HRD_INVALID_BINDING_BODY = (
+    "```yaml\n"
+    "schema_version: ANCHOR_SCOPE_REFRAME_V1\n"
+    "target:\n  repo: squne121/loop-protocol\n  issue_number: 9999\n"
+    "decision: approve_scope_delta\n"
+    'allowed_path_deltas: ["docs/product/features/binding.md"]\n'
+    'rationale: "wrong target fixture"\n'
+    'required_rerun: ["contract_review"]\n'
+    "```\n\n"
+    + _HRD_EXPLICIT_BODY
+)
 
 
 def _hrd_issue_body() -> str:
@@ -1190,6 +1202,100 @@ def test_ac1_ac6_explicit_human_review_directive_reaches_next_action_production_
     # genuinely ran -- this route is never authorized from a stale in-hand
     # snapshot alone.
     assert calls["fetch_current"] >= 1
+
+
+_MISSING_PLANNER_PATCH_PLAN = object()
+
+
+def _force_hrd_planner_patch_plan_missing(monkeypatch, replacement=_MISSING_PLANNER_PATCH_PLAN):
+    """Keep the real entrypoint while supplying the #2724 missing-plan shape."""
+    original_invoke = _e2e_preflight._invoke_planner
+    observed = {}
+
+    def invoke_without_patch_plan(*args, **kwargs):
+        plan, exit_code, stderr, stdout = original_invoke(*args, **kwargs)
+        assert isinstance(plan, dict)
+        patched_plan = copy.deepcopy(plan)
+        sidecar = patched_plan.get("scope_signal_guard_decision_v2")
+        if not isinstance(sidecar, dict):
+            observed["original_plan"] = None
+            return patched_plan, exit_code, stderr, stdout
+        authority = sidecar.get("scope_delta_authority")
+        if not isinstance(authority, dict):
+            observed["original_plan"] = None
+            return patched_plan, exit_code, stderr, stdout
+        observed["original_plan"] = authority.get("contract_patch_plan")
+        if replacement is _MISSING_PLANNER_PATCH_PLAN:
+            authority.pop("contract_patch_plan", None)
+        else:
+            authority["contract_patch_plan"] = replacement
+        return patched_plan, exit_code, stderr, stdout
+
+    monkeypatch.setattr(_e2e_preflight, "_invoke_planner", invoke_without_patch_plan)
+    return observed
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [_MISSING_PLANNER_PATCH_PLAN, []],
+    ids=["absent", "non_dict"],
+)
+def test_explicit_human_review_directive_reaches_next_action_production_reachable_when_planner_plan_missing(
+    tmp_path, capsys, monkeypatch, replacement
+):
+    """AC1: only the canonical consumer routes eligible missing-plan input."""
+    observed = _force_hrd_planner_patch_plan_missing(monkeypatch, replacement)
+
+    result, _exit_code, calls = _hrd_run_preflight(
+        tmp_path, anchor_body=_HRD_EXPLICIT_BODY, run_id=f"missing_plan_{type(replacement).__name__}"
+    )
+    captured = capsys.readouterr()
+
+    assert isinstance(observed["original_plan"], dict)
+    assert "NEXT_ACTION: issue_editor_required" in captured.out
+    assert result["next_action"] == "issue_editor_required"
+    assert result["contract_update"]["reason_code"] == "explicit_trusted_human_directive_requires_issue_editor"
+    assert result["contract_update"]["writes"] == 0
+    assert calls["apply_transaction"] == 0
+    assert calls["fetch_current"] >= 1
+
+
+@pytest.mark.parametrize(
+    ("name", "anchor_body", "author_association", "human_context_urls", "context_extra"),
+    [
+        ("wrong_lane", _HRD_EXPLICIT_BODY, "OWNER", (), None),
+        ("untrusted", _HRD_EXPLICIT_BODY, "NONE", (_HRD_URL,), None),
+        ("ambiguous", _HRD_PROSE_ONLY_BODY, "OWNER", (_HRD_URL,), None),
+        ("invalid_binding", _HRD_INVALID_BINDING_BODY, "OWNER", (_HRD_URL,), None),
+    ],
+)
+def test_missing_planner_plan_ineligible_input_remains_fail_closed_production_reachable(
+    tmp_path,
+    monkeypatch,
+    name,
+    anchor_body,
+    author_association,
+    human_context_urls,
+    context_extra,
+):
+    """AC3: missing planner input never becomes a genuine empty-plan noop."""
+    _force_hrd_planner_patch_plan_missing(monkeypatch)
+
+    result, _exit_code, calls = _hrd_run_preflight(
+        tmp_path,
+        anchor_body=anchor_body,
+        run_id=f"missing_plan_{name}",
+        author_association=author_association,
+        human_context_comment_urls=human_context_urls,
+        known_context_extra=context_extra,
+    )
+
+    assert result["next_action"] != "issue_editor_required"
+    assert result["contract_update"]["writes"] == 0
+    assert result["contract_update"]["status"] == "failed"
+    assert result["contract_update"]["disposition"] not in {"proven_no_change", "no_change"}
+    assert calls["apply_transaction"] == 0
+    assert "PLANNER_FAIL_CLOSED" in result["blockers"]
 
 
 def test_ac3_untrusted_author_association_never_escalates_production_reachable(tmp_path):
