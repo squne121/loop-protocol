@@ -771,19 +771,35 @@ def _extract_http_status(stderr: str) -> int | None:
 #
 # Issue #2718: GitHub's 2026-04-24 changelog introduced a new-format GitHub
 # App installation token shape: `ghs_<APP_ID>_<JWT>` (the `ghs_` prefix is
-# unchanged; APP_ID and the dot-separated JWT header/payload/signature use
-# the base64url charset `[A-Za-z0-9._-]`, ~520 chars total). The pre-existing
-# `gh[oprsu]_[A-Za-z0-9]{20,}` pattern below only matches an alphanumeric
-# body, so on a new-format token it stops at the first `_`/`.` separator and
-# only redacts the `ghs_<APP_ID>` prefix, leaving JWT fragments exposed. This
-# new pattern is listed FIRST (order matters: `_redact_secret_like_tokens()`
-# applies patterns sequentially via `.sub()`) so its wider charset consumes
-# the entire new-format token in one pass, before the classic pattern would
-# otherwise get a chance to partially match and leave a fragment behind.
-# This is a simple charset-based extension only -- it does not parse or rely
-# on the JWT's internal header/payload/signature semantics.
+# unchanged; the token body is APP_ID followed by a JWT in compact
+# serialization -- header, payload, and signature segments, each base64url
+# encoded, joined by `.` delimiters). Note that `.` is the JWS
+# compact-serialization segment separator, not itself a base64url character
+# -- base64url's own charset is `[A-Za-z0-9_-]`. Including `.` in the char
+# class below is a deliberate, simple extension so one pattern can match the
+# whole dot-joined token in a single pass; it does not imply `.` is part of
+# base64url, and this pattern does not parse or rely on the JWT's internal
+# header/payload/signature semantics. New-format tokens run to ~520 chars
+# total, so the pattern requires at least 36 chars after the `ghs_` prefix --
+# wide enough to match real new-format tokens (and external prior art such as
+# github/gh-aw-firewall PR #3786 and aquasecurity/trivy PR #10826, which both
+# use `{36,}`) while narrowing false-positive redaction of short
+# punctuation-bearing strings that happen to start with `ghs_`.
+#
+# On a representative new-format fixture (a ~9-digit APP_ID), the
+# pre-existing `gh[oprsu]_[A-Za-z0-9]{20,}` pattern below does not match at
+# all: its body class is alphanumeric-only, and a 9-digit APP_ID is far
+# short of the 20-char minimum, so the match attempt fails outright at the
+# first `_` separator rather than partially consuming the token. This new
+# pattern is listed FIRST only so `_redact_secret_like_tokens()` (which
+# applies patterns sequentially via `.sub()`) prefers the more specific
+# `ghs_`-aware pattern before the general `gh[oprsu]_` pattern gets a chance
+# to look at the same text; on today's fixtures the general pattern would
+# not have matched the new-format token regardless of ordering, so this
+# ordering is a specific-before-general convention, not a correctness
+# requirement for the fixtures currently in this test suite.
 _SECRET_LIKE_PATTERNS = (
-    _re.compile(r"ghs_[A-Za-z0-9._-]{20,}"),
+    _re.compile(r"ghs_[A-Za-z0-9._-]{36,}"),
     _re.compile(r"gh[oprsu]_[A-Za-z0-9]{20,}"),
     _re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
     _re.compile(r"(?i)\bauthorization:\s*bearer\s+\S+"),

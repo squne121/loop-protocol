@@ -174,6 +174,22 @@ def test_graphql_call_exception_redacts_new_installation_token():
     assert "[REDACTED]" in error
 
 
+def test_redact_secret_like_tokens_short_ghs_string_below_new_threshold_not_matched_by_new_pattern():
+    """Regression pin for the PR #2722 review fix: the new-format `ghs_`
+    pattern requires >= 36 chars after the prefix (not the originally-shipped
+    >= 20), to avoid over-broadly redacting short, non-token strings that
+    happen to start with `ghs_`. A 24-char body (matches the old `{20,}`
+    threshold but not the new `{36,}` one) must fall through to the classic
+    `gh[oprsu]_[A-Za-z0-9]{20,}` pattern instead -- it is still fully
+    redacted overall, but not via the `ghs_`-specific pattern."""
+    short_ghs_string = "ghs_" + "A1b2C3d4E5f6G7h8I9j0K1l2"  # 24 chars, alnum-only
+    assert not _exec._SECRET_LIKE_PATTERNS[0].search(short_ghs_string)
+
+    result = _exec._redact_secret_like_tokens(f"before {short_ghs_string} after")
+
+    assert result == "before [REDACTED] after"
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
