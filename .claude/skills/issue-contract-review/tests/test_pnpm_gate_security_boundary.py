@@ -186,18 +186,52 @@ def test_producer_evidence_round_trips_to_triage(
 
 
 def test_repository_manifest_test_script_matches_registry() -> None:
-    """GIVEN the real repo package.json WHEN compared to the registry THEN the test script matches exactly.
+    """GIVEN the real repo package.json WHEN compared to the registry THEN every
+    registered script matches exactly (not just "test").
 
-    (Major 1, PR #1559 review). Regression tests above only compare
-    package.json against a synthetic manifest built from
-    registry.expected_scripts() itself, which cannot detect drift between
-    the real repository package.json and the registry. Production
-    validate_manifest() performs a byte-for-byte comparison against the
-    real package.json and fail-closes on manifest_integrity:closure_drift:test,
-    so this test reads the actual repository package.json to close that gap.
+    (Major 1, PR #1559 review; generalized per Issue #2723 OWNER
+    REQUEST_CHANGES.) Regression tests above only compare package.json
+    against a synthetic manifest built from registry.expected_scripts()
+    itself, which cannot detect drift between the real repository
+    package.json and the registry. Production validate_manifest() performs
+    a byte-for-byte comparison against the real package.json and
+    fail-closes on manifest_integrity:closure_drift:<name>, so this test
+    reads the actual repository package.json to close that gap.
+
+    Issue #2723: the original version of this test compared only the
+    "test" script, which let a real drift in the "lint:md" script (a
+    missing '#.agents/skills/**' exclude pattern) go undetected. This
+    generalized version asserts exact equality (not substring matching)
+    for every script name registered in registry.expected_scripts(),
+    including "lint:md", so the same class of drift is caught for any
+    registered script, not just "test".
     """
     manifest = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
-    assert manifest["scripts"]["test"] == registry.expected_scripts()["test"]
+    scripts = manifest["scripts"]
+    for name, expected_body in registry.expected_scripts().items():
+        assert scripts.get(name) == expected_body, (
+            f"registry closure for {name!r} does not exactly match "
+            f"package.json[\"scripts\"][{name!r}]:\n"
+            f"  registry   : {expected_body!r}\n"
+            f"  package.json: {scripts.get(name)!r}"
+        )
+
+
+def test_repository_lint_docs_gate_validates_against_real_manifest() -> None:
+    """GIVEN the real repository package.json WHEN the lint:docs gate is
+    prepared THEN validate_manifest() reports no manifest-integrity error.
+
+    (Issue #2723 AC2.) This is independent evidence from the full-closure
+    comparison above: it exercises the actual production fail-closed gate
+    function (validate_manifest()) against the real repository, rather than
+    re-deriving the same comparison by hand. Before the Issue #2723
+    "lint:md" registry closure sync, this call returned
+    "manifest_integrity:closure_drift:lint:md" instead of None.
+    """
+    gate = registry.gate_for_request(["pnpm", "lint:docs"])
+    assert gate is not None
+    _, error = registry.validate_manifest(gate, str(REPO_ROOT))
+    assert error is None, error
 
 
 def test_retro_live_verification_post_is_not_a_generic_gate():
