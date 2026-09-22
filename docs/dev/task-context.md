@@ -875,3 +875,27 @@ resume 後プロセスの transcript persistence が暗黙に無効化されう�
 env を注入する CLI flag を持たないため、本モジュールはこれを
 `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` 等で対処していない（既知の
 limitation として記録するに留める）。
+
+**fix_delta corrective iteration（PR #2731、2026-09-22）で行った追加検証の結果**:
+上記の `CLAUDE_CODE_CHILD_SESSION` 仮説を、production dispatcher が構築する
+argv 形状（`scripts/claude-gpt/launch.sh -- --resume <session_id> ...`）を
+そのまま直接実行する形で、`CLAUDE_CODE_CHILD_SESSION=1` が ambient に設定
+された nested Claude Code 環境（本 fix_delta 自身の実行環境）から 3 パターン
+（同一 cwd での create→resume、異なる cwd での resume、fresh disposable
+create→resume）で実機再現を試みたが、いずれも "No conversation found" は
+再現せず、`--resume` は正しく live recall（事前に送った canary token を正確に
+想起）に成功した。この結果は、当該 caveat が仮説として記録した「Claude-GPT
+resume が `CLAUDE_CODE_CHILD_SESSION` 単体で構造的に壊れる」という因果関係を
+支持しない。
+
+このため、直近の test-runner 独立検証で観測された実機 canary の
+"No conversation found with session ID" failure（AC2/AC6, PR #2731 review）は、
+この既知 caveat（`CLAUDE_CODE_CHILD_SESSION`）を根拠として一般化・確定する
+ことはできない。実 Herdr pane／PTY／cold-restart 固有の要因（本 fix_delta では
+nested herdr session の bootstrap 複雑さから、direct script 実行による代替
+検証に留め、実 Herdr session を用いた完全な cold-restart canary の再実行までは
+実施していない）である可能性が残るため、次回 Real Herdr canary 実行時は
+raw claude stderr／proxy log／transcript ファイルの存在有無を証跡として保存し、
+再現した場合のみ具体的な原因を特定することを推奨する。現時点でこれを
+「Claude-GPT の exact restore が構造的に不可能」と結論づける根拠はない
+（実際に direct reproduction では exact restore が機能することを確認した）。

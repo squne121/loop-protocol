@@ -343,6 +343,25 @@ def mark_restore_blocked(binding_id: str) -> None:
 # `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` on the resumed process itself,
 # so this is documented here (and in docs/dev/task-context.md) as a known
 # limitation rather than silently left unaddressed or falsely claimed fixed.
+#
+# PR #2731 fix_delta corrective iteration (2026-09-22): direct reproduction
+# of the exact production argv shape this module builds for Claude-GPT
+# (`scripts/claude-gpt/launch.sh -- --resume <session_id> ...`), run from a
+# nested Claude Code environment with `CLAUDE_CODE_CHILD_SESSION=1` ambient
+# (matching the conditions under which the independent test-runner canary
+# reported "No conversation found"), did NOT reproduce that failure across
+# three attempts (same-cwd create->resume, cross-cwd resume, fresh
+# disposable create->resume) -- `--resume` correctly recalled a canary
+# token each time. This does not confirm the `CLAUDE_CODE_CHILD_SESSION`
+# hypothesis above as the actual cause of that specific test-runner
+# failure, and does not rule out a real Herdr pane/PTY/cold-restart-timing
+# factor this direct-script reproduction does not exercise (a full
+# disposable-named-Herdr-session cold-restart canary was not re-run in this
+# iteration; see docs/dev/task-context.md for the full account). See
+# Issue #2569 comments / PR #2731 for the recorded evidence. Do not treat
+# this caveat as evidence that exact Claude-GPT restore is structurally
+# impossible -- direct reproduction of this module's own launch argv shape
+# showed exact restore working end to end.
 
 
 def _native_agent_name(decision: ResumeDecision) -> str:
