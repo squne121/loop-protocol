@@ -553,3 +553,81 @@ def test_decision_time_freshness_rebind_and_bounded_retry():
         "candidate": None,
     }
     assert state_fail["pr_list_calls"] == 2
+
+
+def test_default_route_loop_verdict_v2_loader_succeeds_without_module_injection():
+    """AC4: GIVEN no `route_loop_verdict_v2_module` injection WHEN the
+    default (dependency-injection-free) `_load_route_loop_verdict_v2_module()`
+    loader runs THEN it actually loads `route_loop_verdict_v2.py` (returns a
+    non-None module exposing the production decision function) instead of
+    silently swallowing the `sys.modules`-registration-order exec failure
+    and returning None."""
+    loaded = mod._load_route_loop_verdict_v2_module()
+    assert loaded is not None
+    assert hasattr(loaded, "resolve_already_satisfied_early_exit_decision")
+    assert hasattr(loaded, "resolve_pre_step1_data_plane_action")
+
+
+def test_apply_already_satisfied_precedence_fires_through_default_loader():
+    """AC3/AC4: GIVEN a no-landing-authority result WHEN
+    `apply_already_satisfied_precedence()` is called WITHOUT injecting
+    `route_loop_verdict_v2_module` (default loader only) THEN it still
+    successfully loads `route_loop_verdict_v2.py` and fires the
+    `already_satisfied` composition -- proving the default production load
+    path (not just the dependency-injected test path) actually applies the
+    precedence."""
+    no_candidate = mod.derive_landing_disposition(_evidence(candidates=[]), repo=REPO, issue_number=ISSUE)
+    composed = mod.apply_already_satisfied_precedence(
+        no_candidate,
+        next_action_route="proceed_to_step_1",
+        product_spec_routing_action="not_yet_evaluated_at_pre_step1_landing_disposition",
+        pr_exists=False,
+        base_ac_satisfied=True,
+    )
+    assert composed["disposition"] == "already_satisfied"
+    assert composed["reason_codes"] == ["already_satisfied_no_pr_created"]
+
+
+def test_derive_pr_exists_from_landing_candidate_across_pr_fixture_shapes():
+    """#2713 AC3: `pr_exists` production source. open/draft/merged candidates
+    are resume/conflict-relevant targets (True); a closed-unmerged candidate
+    was abandoned without landing and is not (False); no candidate at all is
+    also not (False)."""
+    assert mod.derive_pr_exists_from_landing_candidate(_candidate(lifecycle="open")) is True
+    assert mod.derive_pr_exists_from_landing_candidate(_candidate(lifecycle="draft")) is True
+    assert mod.derive_pr_exists_from_landing_candidate(_candidate(lifecycle="merged")) is True
+    assert mod.derive_pr_exists_from_landing_candidate(_candidate(lifecycle="closed_unmerged")) is False
+    assert mod.derive_pr_exists_from_landing_candidate(None) is False
+
+
+def test_derive_base_ac_satisfied_from_verification_result_never_fabricates_a_fallback():
+    """#2713 In Scope: `base_ac_satisfied` production source. A fresh
+    (head_sha-matching) all-pass TEST_VERDICT_MACHINE/v2 yields True; a
+    fresh result with any non-pass entry yields False; anything
+    undeterminable (missing result, missing live_main_sha, stale/mismatched
+    head_sha, or malformed runtime_ac_results) yields None -- never a
+    fabricated True/False fallback."""
+    fresh_pass = {
+        "head_sha": SHA,
+        "runtime_ac_results": [{"ac": "AC1", "status": "pass"}, {"ac": "AC2", "status": "pass"}],
+    }
+    fresh_fail = {
+        "head_sha": SHA,
+        "runtime_ac_results": [{"ac": "AC1", "status": "pass"}, {"ac": "AC2", "status": "fail"}],
+    }
+    assert mod.derive_base_ac_satisfied_from_verification_result(fresh_pass, live_main_sha=SHA) is True
+    assert mod.derive_base_ac_satisfied_from_verification_result(fresh_fail, live_main_sha=SHA) is False
+
+    # Undeterminable cases -- never fabricated.
+    assert mod.derive_base_ac_satisfied_from_verification_result(None, live_main_sha=SHA) is None
+    assert mod.derive_base_ac_satisfied_from_verification_result(fresh_pass, live_main_sha=None) is None
+    assert mod.derive_base_ac_satisfied_from_verification_result(fresh_pass, live_main_sha="b" * 40) is None
+    assert (
+        mod.derive_base_ac_satisfied_from_verification_result({"head_sha": SHA}, live_main_sha=SHA) is None
+    )
+    assert (
+        mod.derive_base_ac_satisfied_from_verification_result(
+            {"head_sha": SHA, "runtime_ac_results": []}, live_main_sha=SHA
+        )
+        is None
+    )

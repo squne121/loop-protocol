@@ -34,6 +34,20 @@ _ALLOWED_PATHS_GATE_PATH = (
     _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts" / "allowed_paths_review_gate.py"
 )
 _IMPLEMENTATION_LANDED_EVIDENCE_PATH = _SCRIPT_DIR / "implementation_landed_evidence.py"
+# #2713 AC1: single production import site for the pre-Step-1 data-plane
+# route consumer (`resolve_pre_step1_data_plane_action()`).
+_ROUTE_LOOP_VERDICT_V2_PATH = _SCRIPT_DIR / "route_loop_verdict_v2.py"
+# #2713 In Scope: `product_spec_routing_action` is purely echoed as
+# provenance metadata by `resolve_already_satisfied_early_exit_decision()`
+# (it never affects the early_exit / dispatch_step1 boolean -- see that
+# function's docstring in route_loop_verdict_v2.py). This evidence-based
+# landing-disposition choke point (preparation.md "0-a-0") runs BEFORE
+# preparation.md's separate "1-d. Product Spec Check" step, so no real
+# `product_spec_preflight.routing_action` value exists yet at this call
+# site. Inventing an arbitrary real-looking value (e.g. "continue") here
+# would misrepresent a check that never ran, so an explicit, self-
+# documenting "not yet evaluated" sentinel is used instead.
+_PRE_STEP1_PRODUCT_SPEC_ROUTING_ACTION_NOT_YET_EVALUATED = "not_yet_evaluated_at_pre_step1_landing_disposition"
 _FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL)
 _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
 # #1950 AC6-AC8: comment-id resolution for --human-context-comment-url /
@@ -125,7 +139,21 @@ def _load_module(path: Path, name: str) -> Any:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot_load_module:{path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    # #2713 AC4: register in sys.modules BEFORE exec_module() (matches
+    # route_loop_verdict_v2.py's own pattern, lines 696-698, and
+    # implementation_landed_evidence.py::_load_route_loop_verdict_v2_module()).
+    # route_loop_verdict_v2.py uses `from __future__ import annotations` with
+    # `@dataclass(frozen=True)` classes; CPython's dataclasses internals
+    # resolve stringified ClassVar/InitVar annotations via
+    # `sys.modules.get(cls.__module__)`, which raises AttributeError during
+    # class decoration if the module is not yet registered under its own
+    # __name__ at that point.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
     return module
 
 
@@ -815,11 +843,64 @@ def _collect_implementation_landed_evidence(
     repo: str,
     issue_body: str,
     command_log: list[dict[str, Any]],
+    next_action_route: str | None = None,
+    base_ac_verification_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Collect bounded pre-Step-1 candidate evidence through the strict producer."""
+    """Collect bounded pre-Step-1 candidate evidence through the strict producer.
+
+    #2713: this is a single linear pipeline with no branch that re-derives
+    disposition a second time from raw evidence (AC5):
+
+    1. Evidence acquisition + freshness verification
+       (`resolve_landing_disposition_with_freshness_rebind()`).
+    2. Already-satisfied Disposition Precedence composition
+       (`implementation_landed_evidence.py::apply_already_satisfied_precedence()`,
+       AC3) using production-derived `pr_exists` / `base_ac_satisfied`
+       inputs (see below) -- never a test-injected boolean, and never a
+       fixed `True`/`False` fallback.
+    3. Exactly one call into
+       `route_loop_verdict_v2.py::resolve_pre_step1_data_plane_action()`
+       against the FINAL (post-composition) disposition (AC1/AC2) -- the
+       naive inline branch on the disposition name that used to live here
+       is gone; the production route module owns that mapping exclusively.
+    4. Non-destructive projection onto the existing `pre_step1_data_plane`
+       capsule shape (`start_data_plane` / `action` -- unchanged key set,
+       AC6).
+
+    `pr_exists` (AC3): NOT "a PR existed at some point in history" -- it is
+    "is the current landing-disposition candidate itself a target that a
+    resume/conflict determination could act on", derived from the SAME
+    candidate `resolve_landing_disposition_with_freshness_rebind()` already
+    resolved via
+    `implementation_landed_evidence.py::derive_pr_exists_from_landing_candidate()`
+    (open/draft/merged -> True, closed-unmerged/no-candidate -> False; see
+    that function's docstring for the closed-unmerged semantics).
+
+    `base_ac_satisfied` (AC3): derived from an independent
+    Verification-Commands evaluation of current main
+    (`base_ac_verification_result`, a TEST_VERDICT_MACHINE/v2-shaped
+    payload) via
+    `implementation_landed_evidence.py::derive_base_ac_satisfied_from_verification_result()`,
+    cross-checked against the SAME live `main_head_sha` this evidence
+    collection step already fetched (`collect_candidate_inputs()`'s AC9
+    freshness reference) -- not a caller-asserted boolean. Today's
+    `build_intake_capsule.py` CLI has no wiring that produces a
+    `base_ac_verification_result` (no test-runner dispatch happens at this
+    call site), so `base_ac_verification_result` defaults to `None` in
+    production and the derivation is undeterminable (`None`). Per #2713 In
+    Scope, an undeterminable `base_ac_satisfied` is never fabricated as a
+    fixed `True`/`False` -- `apply_already_satisfied_precedence()` is
+    skipped entirely in that case and the freshness-rebound landing
+    disposition passes through unchanged. A future Issue that wires a real
+    production source can supply it through this same parameter.
+    """
     module = _load_module(
         _IMPLEMENTATION_LANDED_EVIDENCE_PATH,
         "implementation_landed_evidence",
+    )
+    route_module = _load_module(
+        _ROUTE_LOOP_VERDICT_V2_PATH,
+        "route_loop_verdict_v2",
     )
 
     def recorded_run(argv: list[str]) -> tuple[int, str, str]:
@@ -845,19 +926,38 @@ def _collect_implementation_landed_evidence(
         current_scope=issue_body,
         run_command=recorded_run,
     )
+
+    # #2713 AC3: Disposition Precedence step 2. See docstring above for the
+    # `pr_exists` / `base_ac_satisfied` production-source semantics.
+    landing_disposition = evidence["landing_disposition"]
+    base_ac_satisfied = module.derive_base_ac_satisfied_from_verification_result(
+        base_ac_verification_result,
+        live_main_sha=evidence.get("main_head_sha"),
+    )
+    if base_ac_satisfied is None:
+        final_disposition = landing_disposition
+    else:
+        pr_exists = module.derive_pr_exists_from_landing_candidate(landing_disposition.get("candidate"))
+        final_disposition = module.apply_already_satisfied_precedence(
+            landing_disposition,
+            next_action_route=next_action_route or "unknown",
+            product_spec_routing_action=_PRE_STEP1_PRODUCT_SPEC_ROUTING_ACTION_NOT_YET_EVALUATED,
+            pr_exists=pr_exists,
+            base_ac_satisfied=base_ac_satisfied,
+        )
+    evidence["landing_disposition"] = final_disposition
+
+    # #2713 AC1/AC2/AC5: exactly one call into the production route module's
+    # `resolve_pre_step1_data_plane_action()`, against the FINAL disposition.
     # This is the production control-plane projection consumed before any
     # worker/worktree/new-PR invocation.  It is deliberately explicit rather
     # than leaving callers to infer suppression from a prose disposition.
-    disposition = evidence["landing_disposition"]["disposition"]
+    data_plane = route_module.resolve_pre_step1_data_plane_action(final_disposition)
+    # #2713 AC6: the existing capsule key set (`start_data_plane` / `action`)
+    # is unchanged.
     evidence["pre_step1_data_plane"] = {
-        "start_data_plane": disposition == "ordinary_dispatch_or_explicit_recovery",
-        "action": (
-            "dispatch_step1"
-            if disposition == "ordinary_dispatch_or_explicit_recovery"
-            else "resume_existing_pr"
-            if disposition == "existing_pr_resume"
-            else "suppress_worker_worktree_new_pr"
-        ),
+        "start_data_plane": data_plane["start_data_plane"],
+        "action": data_plane["action"],
     }
     return evidence
 
@@ -1063,6 +1163,7 @@ def build_intake_capsule(
         implementation_landed_evidence = _collect_implementation_landed_evidence(
             issue_number=issue_number,
             repo=repo,
+            next_action_route=next_action["route"],
             issue_body=issue_meta["body"],
             command_log=command_log,
         )

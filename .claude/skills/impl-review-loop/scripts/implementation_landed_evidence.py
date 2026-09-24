@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -783,6 +784,23 @@ _NO_LANDING_AUTHORITY_REASON_CODES = frozenset({"no_qualified_candidate", "close
 
 
 def _load_route_loop_verdict_v2_module() -> Any | None:
+    """Default (dependency-injection-free) production loader.
+
+    #2713 AC4: `sys.modules[spec.name] = module` MUST be registered before
+    `exec_module()` -- matching `route_loop_verdict_v2.py`'s own
+    `resolve_pre_step1_landing_disposition()` pattern (that file, lines
+    696-698). Without this registration, `route_loop_verdict_v2.py`'s
+    `@dataclass(frozen=True)` classes (it uses
+    `from __future__ import annotations`, so field annotations are
+    strings) fail during `exec_module()`: CPython's `dataclasses`
+    internals resolve stringified `ClassVar`/`InitVar` annotations via
+    `sys.modules.get(cls.__module__)`, and when that lookup returns `None`
+    (module not yet registered under its own `__name__`), it raises
+    `AttributeError` while decorating the class. That exception was
+    previously swallowed by the `except Exception: return None` below,
+    silently making `apply_already_satisfied_precedence()` a permanent
+    no-op through the default loader.
+    """
     import importlib.util
 
     path = Path(__file__).resolve().with_name("route_loop_verdict_v2.py")
@@ -790,11 +808,88 @@ def _load_route_loop_verdict_v2_module() -> Any | None:
     if spec is None or spec.loader is None:
         return None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
     except Exception:
+        sys.modules.pop(spec.name, None)
         return None
     return module
+
+
+def derive_pr_exists_from_landing_candidate(candidate: Mapping[str, Any] | None) -> bool:
+    """Production source for `apply_already_satisfied_precedence()`'s
+    `pr_exists` input (#2713 AC3).
+
+    `pr_exists` is NOT "a PR existed at some point in history" -- it is
+    "is the current landing-disposition candidate itself a target that a
+    resume / conflict determination could act on", derived directly from
+    the SAME qualified candidate `derive_landing_disposition()` already
+    resolved (its `lifecycle` field). This mapping is total across the
+    five PR fixture shapes this module recognizes:
+
+    - open / draft: an active PR exists that a resume determination could
+      act on -> True.
+    - merged: a landed PR object exists. (In practice a merged candidate
+      is normally intercepted upstream by `implementation_already_landed`
+      / `legacy_or_later_scope_expansion` before
+      `apply_already_satisfied_precedence()` is ever reached, but the
+      mapping stays total for direct callers/tests.) -> True.
+    - closed_unmerged: the PR was abandoned without landing. It is not a
+      resumable or blocking artifact for `already_satisfied` purposes: a
+      closed-unmerged attempt does not, by itself, mean the requirement is
+      already satisfied, but it also does not preclude concluding
+      `already_satisfied` from independent `base_ac_satisfied` evidence ->
+      False. This is the explicit semantic #2713 calls out for
+      documentation.
+    - no candidate (`candidate is None`): nothing exists -> False.
+    """
+    if not isinstance(candidate, Mapping):
+        return False
+    return candidate.get("lifecycle") in {"merged", "open", "draft"}
+
+
+def derive_base_ac_satisfied_from_verification_result(
+    verification_result: Mapping[str, Any] | None,
+    *,
+    live_main_sha: str | None,
+) -> bool | None:
+    """Production source for `apply_already_satisfied_precedence()`'s
+    `base_ac_satisfied` input (#2713 AC3).
+
+    `verification_result` is a TEST_VERDICT_MACHINE/v2-shaped payload (the
+    same shape `route_loop_verdict_v2.py::build_already_satisfied_evidence()`
+    consumes as `base_test_verdict`): `{"head_sha": <sha>,
+    "runtime_ac_results": [{"ac": <id>, "status": "pass"|"fail"|"skip"}]}`,
+    representing an independent Verification-Commands evaluation of current
+    main -- never a caller-asserted boolean.
+
+    Returns `None` (undeterminable) whenever the result cannot be trusted:
+    no `verification_result` supplied, no `live_main_sha` to cross-check
+    freshness against, a `head_sha` mismatch (a stale/mismatched run is
+    never silently trusted -- mirrors `build_already_satisfied_evidence()`'s
+    own `base_ac_satisfied` freshness gate), or a missing/empty/malformed
+    `runtime_ac_results`. Callers MUST treat `None` as "do not apply
+    precedence" (pass the existing landing disposition through unchanged)
+    rather than defaulting to a fixed `True`/`False` (#2713 In Scope).
+
+    Only a well-formed, fresh result yields a determinate boolean: `True`
+    iff every `runtime_ac_results` entry has `status == "pass"`, else
+    `False`.
+    """
+    if not isinstance(verification_result, Mapping):
+        return None
+    if not isinstance(live_main_sha, str) or not live_main_sha:
+        return None
+    if verification_result.get("head_sha") != live_main_sha:
+        return None
+    results = verification_result.get("runtime_ac_results")
+    if not isinstance(results, list) or not results:
+        return None
+    for entry in results:
+        if not isinstance(entry, Mapping) or entry.get("status") != "pass":
+            return False
+    return True
 
 
 def apply_already_satisfied_precedence(
