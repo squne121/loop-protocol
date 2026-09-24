@@ -247,7 +247,10 @@ def main(argv: list[str] | None = None) -> int:
         "--ack-timeout-seconds",
         type=float,
         default=dispatcher._DEFAULT_ACK_TIMEOUT_SECONDS,
-        help="Shared bounded deadline (fix_delta P1-2) for ALL dispatched candidates' ACKs, starting after every dispatch has been sent",
+        help=(
+            "Shared bounded deadline (fix_delta P1-2) for ALL dispatched candidates' "
+            "ACKs, starting after every dispatch has been sent"
+        ),
     )
     parser.add_argument(
         "--force-run-outside-scope-gate",
