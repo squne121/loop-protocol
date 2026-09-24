@@ -31,6 +31,13 @@ SCRIPT_VERSION = "1.1.0"
 REDACT_PATTERNS = [
     # PEM key block (multiline — apply first)
     (re.compile(r"-----BEGIN [A-Z ]+-----[\s\S]+?-----END [A-Z ]+-----"), "<PEM_KEY>"),
+    # GitHub App installation token (new format: ghs_<APP_ID>_<JWT>).
+    # The JWT segments are dot-separated, so the generic `gh[opsur]_...`
+    # pattern below (which excludes `.` from its charset) cannot fully
+    # redact these tokens. Listed before the generic pattern so the
+    # more specific `ghs_`-aware pattern is preferred (opaque-token
+    # redaction; JWT header/payload/signature semantics are not parsed).
+    (re.compile(r"ghs_[A-Za-z0-9._-]{36,}"), "<GITHUB_TOKEN>"),
     # GitHub token (ghs_, ghp_, gho_, ghu_, ghr_ prefixes with 20+ chars)
     (re.compile(r"gh[opsur]_[A-Za-z0-9_]{20,}"), "<GITHUB_TOKEN>"),
     # OpenAI key

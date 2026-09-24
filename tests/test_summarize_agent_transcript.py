@@ -382,6 +382,63 @@ class TestNoRawAndRedaction:
 
 
 # ---------------------------------------------------------------------------
+# Issue #2725 AC2/AC3: ghs_ App installation token (JWT) redaction の
+# module-level regression test (Verification Commands の node id と一致
+# させるため class に入れない)
+# ---------------------------------------------------------------------------
+
+
+def test_redact_patterns_fully_redacts_new_installation_token() -> None:
+    """redact: 新形式 GitHub App installation token (ghs_<APP_ID>_<JWT>)
+    が JWT header/payload/signature の断片も残さず単一の
+    <GITHUB_TOKEN> に完全置換される (Issue #2725 AC2)。
+
+    実際の新形式 installation token は全長約520文字であり、この
+    fixture もその境界を反映する（PR #2735 レビュー指摘）。将来
+    dedicated matcher (`ghs_[A-Za-z0-9._-]{36,}`) に意図しない上限が
+    追加された場合、この長さ下限アサーションが regression を検知する。"""
+    jwt_header = "eyJhbGciOiJSUzI1NiJ9"
+    jwt_payload = "eyJpc3MiOiJodHRwczovL2V4YW1wbGUuY29tIn0" + ("A" * 320)
+    jwt_signature = "s1gN4tuRe-_placeholder123456789" + ("B" * 110)
+    token = f"ghs_123456789_{jwt_header}.{jwt_payload}.{jwt_signature}"
+    assert len(token) >= 520, "fixture token must reflect real ~520 char new-format length"
+    text = f"before {token} after"
+
+    result = sat.redact_string(text)
+
+    assert result == "before <GITHUB_TOKEN> after"
+    assert jwt_header not in result
+    assert jwt_payload not in result
+    assert jwt_signature not in result
+    assert "ghs_" not in result
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["ghp_", "gho_", "ghs_", "ghu_", "ghr_"],
+)
+def test_redact_patterns_preserves_classic_github_token_redaction(
+    prefix: str,
+) -> None:
+    """redact: classic gh[opsur]_ 形式トークン (5 prefix) の redaction
+    挙動が回帰していないことを個別に検証する (Issue #2725 AC3)。
+
+    body は実際の classic token と同じ全長40文字（prefix4文字 +
+    body36文字）にする。32文字 body だと新設の ghs_ dedicated matcher
+    (`ghs_[A-Za-z0-9._-]{36,}`) にマッチせず generic matcher に落ちて
+    しまい、新 matcher が classic token の backward compatibility を
+    壊していないことを検証できないため（PR #2735 レビュー指摘）。"""
+    token = f"{prefix}{'a' * 36}"
+    assert len(token) == 40
+    text = f"before {token} after"
+
+    result = sat.redact_string(text)
+
+    assert result == "before <GITHUB_TOKEN> after"
+    assert token not in result
+
+
+# ---------------------------------------------------------------------------
 # AC7/AC11: privacy canary fixture — canary が stdout/artifact に残らない
 # ---------------------------------------------------------------------------
 
