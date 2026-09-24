@@ -295,7 +295,7 @@ LOOP_POLICY_V1:
 
 `issue_kind: parent` かつ `parent_mode: delivery-rollup` の Issue が `approved` 終了する場合:
 
-- `LOOP_HANDOFF_RESULT_V1` marker は出力しない（`impl-review-loop` への handoff は発生しないため）。marker が出力されない以上、marker 内の `status: impl_ready` / `routing_action: run_impl_review_loop` フィールドも一切出力されない（#1940 review: marker 非出力の帰結として明示する）
+- `LOOP_HANDOFF_RESULT_V1` marker は出力しない（`impl-review-loop` への handoff は発生しないため）。marker が出力されない以上、marker 内の `status: refinement_approved`（legacy reader compatibility 専用の旧値: `impl_ready`）/ `routing_action: none`（legacy reader compatibility 専用の旧値: `run_impl_review_loop`）フィールドも一切出力されない（#1940 review: marker 非出力の帰結として明示する。#2740: producer 語彙更新後もこの帰結は不変）
 - plain Markdown の終了要約（fenced YAML marker を伴わない）のみを投稿する
 - 既存の `FOLLOW_UP_MATERIALIZATION_RESULT_V1`（child issue materialization 結果）は変更なく併記する
 - 終了要約本文に `Final Gate: not applicable` と reason code（例: `delivery_rollup_parent_without_verification_commands`）を明記し、上記「Final Gate 適用除外」節の「Final Gate 成功」（`status: go` を実際に確認した通常経路）と区別する
@@ -308,7 +308,7 @@ LOOP_POLICY_V1:
 <!-- LOOP_HANDOFF_RESULT_V1 -->
 ```yaml
 LOOP_HANDOFF_RESULT_V1:
-  status: impl_ready | human_judgment_required | blocked
+  status: refinement_approved | human_judgment_required | blocked  # legacy reader-only alias: impl_ready
   ...
 ```
 ````
@@ -320,8 +320,8 @@ fenced YAML ブロックが marker の内容を保持する。
 
 ```yaml
 LOOP_HANDOFF_RESULT_V1:
-  status: impl_ready | human_judgment_required | blocked
-  routing_action: run_impl_review_loop | ask_human | blocked
+  status: refinement_approved | human_judgment_required | blocked  # refinement_approved は #2740 以降の producer 契約。legacy reader-only alias: impl_ready（新規 producer はもう出力しない）
+  routing_action: none | ask_human | blocked  # none は #2740 以降の producer 契約。legacy reader-only alias: run_impl_review_loop（新規 producer はもう出力しない）
   contract_review:
     status: go | blocked          # CONTRACT_REVIEW_RESULT_V1.status を echo（衝突回避のため separated）
     gate_result: fresh_go | missing_go | stale_go | invalidated_by_request_changes | blocked
@@ -333,8 +333,9 @@ LOOP_HANDOFF_RESULT_V1:
   label_sync_observation:
     # #2084: presentation_sync — non-authoritative telemetry only. GitHub
     # Issue labels are presentation-only metadata (SSOT: docs/dev/workflow.md,
-    # docs/dev/github-ops.md) and MUST NOT participate in impl_ready /
-    # status / routing_action authority. This block records the
+    # docs/dev/github-ops.md) and MUST NOT participate in refinement_approved
+    # (legacy reader-only alias: impl_ready) / status / routing_action
+    # authority. This block records the
     # best-effort presentation sync outcome for observability only.
     kind: presentation_sync
     result: applied | noop | failed
@@ -368,6 +369,12 @@ LOOP_HANDOFF_RESULT_V1:
 ```
 
 **Note**: 上記 4 フィールド（`checked_body_sha256` / `checker_exit_code` / `missing_sections` / `missing_contract_keys`）はスキーマの SSOT として本セクションが定義する。これら 4 フィールド + attempt counter に対する runtime enforcement（`max_rewrite_attempts` 制限・no-progress detection）は #664 で `decide_rewrite_route.py` として実装済みであり、その orchestrator からの invocation 手順は直下の「Rewrite Loop Runtime Router」セクションが normative SSOT となる。
+
+### producer 語彙更新（#2740）
+
+`issue-refinement-loop` が `approved` 終了するとき、`LOOP_HANDOFF_RESULT_V1` の新規 producer 値は `status: refinement_approved` / `routing_action: none`（または同義の非-dispatch値）である。`status: refinement_approved` は「`issue-refinement-loop` が `approved` で終了した」という audit telemetry を表すのみであり、`impl-review-loop` Step 1 の implementation dispatch を authorize しない（#2740、本セクション冒頭「適用範囲」節および `## Root-Owned Synchronous Entry Transition` 節参照）。旧値 `status: impl_ready` / `routing_action: run_impl_review_loop` は legacy reader compatibility のためだけに残り、新規 producer はもう出力しない。既存の readiness-invariant 前提条件（`contract_review.gate_result == fresh_go` / hygiene auto-fix evidence 完備 / `blockers` 空）は `refinement_approved` 発行条件としてそのまま維持する。
+
+**Task Context workflow-signal との別概念であることの明示**: `scripts/task-context/task_context_workflow_signals.py`（Issue #2565 由来）が発行する Task Context の `signal_kind: "refinement_approved"` と、本 `LOOP_HANDOFF_RESULT_V1.status: refinement_approved` は、同じ文字列 `refinement_approved` を共有するが**別スキーマ・別概念**である。前者は Task Context 側の workflow-signal パイプライン（`publish_termination_report.py::_emit_refinement_approved_signal()`）が発行する human-history 相当の signal であり、後者は本ファイルが定義する `LOOP_HANDOFF_RESULT_V1` marker のフィールド値である。両者は独立に発行され、一方の値が他方の authority や producer 契約を変更しない（本 Issue #2740 は Task Context workflow-signal pipeline 自体を変更しない — Out of Scope）。
 
 ### Rewrite Loop Runtime Router（リライトループの実行時ルーター, #664 / #814）
 
@@ -430,26 +437,28 @@ checker exit 1（needs-fix）はインフラ障害でなく正常系として ro
 
 **routing の正準性**: rewrite ループの停止判断は `decide_rewrite_route` の `route` を SSOT とする。orchestrator は prose で attempt 数や no-progress を再判定しない（thin entrypoint 原則）。`route: human_judgment_required` は本ファイルの `human_escalation` 経路と連動する。
 
-### `impl_ready` 定義
+### `refinement_approved` 定義（legacy reader-only alias: `impl_ready`）
 
-`status: impl_ready` を出力できるのは以下のすべてが真のときのみ:
+`status: refinement_approved`（legacy reader-only alias: `impl_ready`。新規 producer はもう `impl_ready` を出力しない、#2740）を出力できるのは以下のすべてが真のときのみ:
 
 1. `contract_review.gate_result == fresh_go` — 最新の `CONTRACT_REVIEW_RESULT_V1.status == "go"` が存在し、現 Issue body hash に対して fresh
 2. `contract_review.status == go` が後続の `request_changes` / `blocked` により無効化されていない
 3. `metadata.title_prefix_ready == true` または `auto_fixes.required` に `metadata_hygiene` / `template_hygiene` の `result: applied` エントリが存在する
 4. `auto_fixes.required` が空（または全 applied 済み）かつ `auto_fixes.skipped` が空
 5. `blockers` が空
-6. `routing_action == run_impl_review_loop`
+6. `routing_action == none`（legacy reader-only alias: `run_impl_review_loop`）
 
-**Title prefix 不在のみを理由に `impl_ready` を拒否してはならない** — implementation-worker (repair mode) が auto-fix evidence を添付していれば `impl_ready` は許可される。`phase/implementation` label（および他の presentation label）の有無は `impl_ready` 判定条件から除外する（#2084）。`label_sync_observation`（presentation_sync）の `result`（`applied | noop | failed`）を変えても `status` / `routing_action` / `implementation_allowed` は変化しない。`auto_fixes.required` に triage label 遷移（`triage-required` remove、`phase/implementation` / `agent/implementer` add）を追加してはならない — それらは `label_sync_observation` として readiness decision 後に best-effort で実行される非authoritative な presentation sync である。
+**Title prefix 不在のみを理由に `refinement_approved` を拒否してはならない** — implementation-worker (repair mode) が auto-fix evidence を添付していれば `refinement_approved` は許可される。`phase/implementation` label（および他の presentation label）の有無は `refinement_approved` 判定条件から除外する（#2084）。`label_sync_observation`（presentation_sync）の `result`（`applied | noop | failed`）を変えても `status` / `routing_action` / `implementation_allowed` は変化しない。`auto_fixes.required` に triage label 遷移（`triage-required` remove、`phase/implementation` / `agent/implementer` add）を追加してはならない — それらは `label_sync_observation` として readiness decision 後に best-effort で実行される非authoritative な presentation sync である。
 
-`auto_fixes.required` / `auto_fixes.skipped` の各エントリは `kind` / `executor` / `result` / `evidence`（`before` / `after` / `comment_url`）を含む。`result: skipped` または `evidence` 欠如 → `impl_ready` 禁止。
+`auto_fixes.required` / `auto_fixes.skipped` の各エントリは `kind` / `executor` / `result` / `evidence`（`before` / `after` / `comment_url`）を含む。`result: skipped` または `evidence` 欠如 → `refinement_approved` 禁止。
+
+**注（#2740）**: `status: refinement_approved` は `issue-refinement-loop` が `approved` 終了したという audit telemetry を表すのみであり、単独で `impl-review-loop` Step 1 の implementation dispatch を authorize しない。`impl_ready` / `run_impl_review_loop` の旧語彙は legacy reader compatibility（過去に投稿済みの comment を読む consumer）のためだけに残る。
 
 ### Routing Rules（ルーティング規則）
 
 | 条件 | `status` | `routing_action` |
 |---|---|---|
-| 全 invariant 満足（上記 1〜7） | `impl_ready` | `run_impl_review_loop` |
+| 全 invariant 満足（上記 1〜6） | `refinement_approved`（legacy: `impl_ready`） | `none`（legacy: `run_impl_review_loop`） |
 | `contract_review.gate_result` が `missing_go` / `stale_go` | `blocked` | `blocked` |
 | `request_changes` / `blocked` が `go` を後続で無効化 | `blocked` | `blocked` |
 | scope / goal / AC に semantic change が検出された | `human_judgment_required` | `ask_human` |
@@ -473,14 +482,14 @@ scope / goal / AC への semantic change が検出されたとき、`issue-refin
 | `stale_state_label_cleanup` | implementation-worker (repair mode) | stale `state/blocked` / `state/queued` を検出 |
 | `contract_snapshot_materialization` | implementation-worker (repair mode) | contract snapshot comment 未作成 |
 
-各委譲は `auto_fixes.required` エントリとして記録し、`result: applied` かつ `evidence` 完備のものだけが `impl_ready` に貢献する。
+各委譲は `auto_fixes.required` エントリとして記録し、`result: applied` かつ `evidence` 完備のものだけが `refinement_approved`（legacy: `impl_ready`）に貢献する。
 
 
 ## Root-Owned Synchronous Entry Transition（root が単独で所有する同期的な実装着手への遷移経路、#2272 正本）
 
-`issue-refinement-loop` の `approved` 終了（`LOOP_HANDOFF_RESULT_V1.status: impl_ready`）は
-`impl-review-loop` Step 1 起動の **唯一の authority ではない**。root/main thread が
-Issue review 開始から `impl-review-loop` 起動判断までを単一の連続した control flow
+`issue-refinement-loop` の `approved` 終了（`LOOP_HANDOFF_RESULT_V1.status: refinement_approved`、
+legacy reader-only alias: `impl_ready`）は `impl-review-loop` Step 1 起動の **authority ではない**
+（#2740）。root/main thread が Issue review 開始から `impl-review-loop` 起動判断までを単一の連続した control flow
 として実行する invocation（同一 root invocation）の中でのみ、以下の process-local な
 戻り値 `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` を生成・消費する。durable authorization
 packet ではなく、保存・再ロード用の API を持たない。GitHub comment・artifact・

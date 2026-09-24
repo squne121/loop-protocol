@@ -81,7 +81,7 @@ open/closed state・Machine-Readable Contract・GitHub native dependency close �
 explicit operator/OWNER directive・review/test/CI 結果に基づく）のみであり、label が
 readiness を左右することはない。
 
-### Entry Transition（Step 1 起動契約, #2272）
+### Entry Transition（Step 1 起動契約, #2272 / #2740）
 
 Step 1 起動の実 authority は `CONTRACT_REVIEW_RESULT_V1.status: go` の telemetry
 確認だけでなく、root/main thread が単一の継続した call stack の中で自ら実行する
@@ -90,9 +90,28 @@ Step 1 起動の実 authority は `CONTRACT_REVIEW_RESULT_V1.status: go` の tel
 `run_root_transition()`。root-direct 再設計、#2272。producer/consumer を別プロセスに
 分離し `invocation_token` の再提示で authorize する旧方式は撤回済み）。GitHub
 コメント上の過去 `LOOP_HANDOFF_RESULT_V1` は audit telemetry に過ぎず、単独では
-Step 1 を authorize しない。正本は
-`.claude/skills/issue-refinement-loop/references/termination-policy.md` の
-「Root-Owned Synchronous Entry Transition」節。
+Step 1 を authorize しない。
+
+**明示的実装依頼がある場合にのみ Step 1 が起動する（#2740）**: `issue-refinement-loop` の
+`approved` 終了それ自体も Step 1 起動の authority ではない。`approved` は実装開始の
+代替承認ではなく、`issue-refinement-loop` 自身の Step 5（終了処理）は `approved` 終了時に
+`run_root_transition()` を呼び出さない。`run_root_transition()` を呼び出し、それゆえ
+`ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1` を生成・消費するのは、ユーザーが実装を明示的に
+依頼した invocation（例: `/impl-review-loop <N>` の直接呼び出し、または実装依頼を伴う
+自然文プロンプト）を通じて起動された `impl-review-loop` 自身のエントリゲート
+（`.claude/skills/impl-review-loop/steps/preparation.md`）のみである。fresh review /
+live-state 確認を経た開始手順および開始後の自律的な実装・検証・PR レビュー能力は本変更
+による縮小対象ではない。
+
+正本は `.claude/skills/issue-refinement-loop/references/termination-policy.md` の
+「Root-Owned Synchronous Entry Transition」節（新規 producer 語彙: `status:
+refinement_approved` / `routing_action: none`。旧 `impl_ready` /
+`run_impl_review_loop` は legacy reader compatibility 専用）。
+
+**Issue #260 との関係（重複ではなく補完、#2740）**: Issue #260 は `docs/dev/agent-skill-boundaries.md`
+への human-gate 原則そのものの docs-only な追記を扱う。本節（#2740）は、その原則を
+`issue-refinement-loop` → `impl-review-loop` 間の実装 handoff 配線に適用した具体的な契約
+記述であり、#260 の scope（docs-only の原則記述）を変更・重複しない。
 
 ## Workflow Topology（ワークフロー構成）
 
