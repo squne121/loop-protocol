@@ -39,6 +39,41 @@ DB_FILE_NAME = "task-context.sqlite3"
 SCOPE_ENV_VAR = "LOOP_TASK_CONTEXT_SCOPE"
 RUNTIME_SMOKE_SCOPE_VALUE = "runtime_smoke"
 
+# --- Issue #2569 PR #2731 review fix_delta P1-1: cold-restart startup
+# orchestrator scope gate ------------------------------------------------
+#
+# Herdr's own plugin docs (https://herdr.dev, "Plugins" -> "Install and
+# link") state plainly: "Installed and linked plugins, including their
+# enabled state, are global to the current user and available in EVERY
+# Herdr session" -- there is no Herdr-level mechanism to scope a linked
+# plugin's `[[startup]]` hook to only the dedicated LOOP_PROTOCOL
+# project-scoped named session. Left unguarded, the SAME startup-hook
+# command would therefore also fire on every restart of the human/default
+# Herdr session (and any other named session on the machine), which is
+# exactly the interference the Issue's Real Herdr canary must rule out.
+#
+# `task_context_cold_restart_startup.py`'s `main()` requires this env var
+# to be exactly ``COLD_RESTART_SCOPE_VALUE`` before it performs ANY herdr
+# subprocess call or DB read -- otherwise it is an immediate, side-effect-
+# free no-op. Only the dedicated named session's OWN launch wrapper sets
+# this (alongside `HERDR_CONFIG_PATH` pointing at that session's
+# `resume_agents_on_restore = false` config) -- ordinary OS process
+# environment inheritance (Herdr's plugin startup-hook child process
+# inherits the launching shell's/server's environment) carries it down to
+# the plugin invocation without requiring any Herdr-specific plugin API
+# support for per-session env injection.
+COLD_RESTART_SCOPE_ENV_VAR = "LOOP_TASK_CONTEXT_COLD_RESTART_SCOPE"
+COLD_RESTART_SCOPE_VALUE = "cold_restart_dedicated_session"
+
+
+def is_cold_restart_dedicated_session() -> bool:
+    """``True`` only when ``LOOP_TASK_CONTEXT_COLD_RESTART_SCOPE`` is
+    exactly ``COLD_RESTART_SCOPE_VALUE`` -- the gate predicate
+    ``task_context_cold_restart_startup.main()`` checks before doing
+    anything else (fix_delta P1-1 "Herdr plugins are user-global" safety
+    guard)."""
+    return os.environ.get(COLD_RESTART_SCOPE_ENV_VAR, "") == COLD_RESTART_SCOPE_VALUE
+
 
 def resolve_task_context_scope() -> str:
     """Read the raw ``LOOP_TASK_CONTEXT_SCOPE`` carrier value.
@@ -66,6 +101,18 @@ CLAUDE_GPT_RUNTIME_VARIANT = "claude_gpt"
 NATIVE_OPERATOR_RUN_KIND = "native_operator"
 CLAUDE_GPT_RUN_KIND = "claude_gpt"
 CLAUDE_GPT_RUNTIME_PROFILE = "claude_gpt_v1"
+
+# --- Issue #2569 In Scope: Native profile migration contract ---------------
+#
+# ``native_claude_v1`` is the explicit effective-profile value for a
+# Native-operator managed ExecutionRun (AC13). ``invalid_managed_profile`` is
+# the sentinel returned by ``resolve_effective_runtime_profile()`` below for
+# any managed ``(run_kind, runtime_profile, resume_profile)`` triple that
+# does not match one of the fixed contract combinations (AC14) -- callers
+# (the resume dispatcher) must treat it as ``RESTORE_BLOCKED``, never as a
+# reason to fall back to plain Native.
+NATIVE_CLAUDE_RUNTIME_PROFILE = "native_claude_v1"
+INVALID_MANAGED_PROFILE = "invalid_managed_profile"
 
 
 def resolve_operator_runtime_variant() -> str:
@@ -118,6 +165,71 @@ def operator_run_kind_and_profiles() -> tuple[str, str | None, str | None]:
             stacklevel=2,
         )
     return NATIVE_OPERATOR_RUN_KIND, None, None
+
+
+def normalize_operator_profiles_for_new_run(
+    run_kind: str, runtime_profile: str | None, resume_profile: str | None
+) -> tuple[str, str | None, str | None]:
+    """Issue #2569 AC13 ("本Issue以降に作成される新規Native ExecutionRunは
+    ``runtime_profile``/``resume_profile``へ明示的に``native_claude_v1``を
+    保存する -- NULL新規書き込みを終了する"): given the raw triple
+    ``operator_run_kind_and_profiles()`` returns, upgrade the intentional
+    ``(native_operator, None, None)`` legacy-shaped default to the explicit
+    ``(native_operator, native_claude_v1, native_claude_v1)`` triple that
+    every NEW managed ExecutionRun row must be started with from this Issue
+    onward.
+
+    Deliberately a separate function from ``operator_run_kind_and_profiles``
+    (rather than changing that function's own return value) -- the raw
+    triple's ``(native_operator, None, None)`` shape is still relied on
+    elsewhere (its own "intentionally unset vs recognized variant" contract
+    and existing tests), and this Issue's requirement is narrowly about what
+    gets *persisted* on a newly-started ExecutionRun row, not about
+    redefining what "unset ``LOOP_TASK_CONTEXT_RUNTIME_VARIANT``" means.
+    Only the two callers that actually call ``start_execution_run`` for a
+    NEW row (``task_context_hook_flows.on_session_start`` and
+    ``task_context_service._attach_or_start_binding_run_tx``'s degrade path)
+    apply this normalization. Claude-GPT triples (already explicit) and any
+    other value pass through unchanged."""
+    if run_kind == NATIVE_OPERATOR_RUN_KIND and runtime_profile is None and resume_profile is None:
+        return NATIVE_OPERATOR_RUN_KIND, NATIVE_CLAUDE_RUNTIME_PROFILE, NATIVE_CLAUDE_RUNTIME_PROFILE
+    return run_kind, runtime_profile, resume_profile
+
+
+def resolve_effective_runtime_profile(
+    run_kind: str, runtime_profile: str | None, resume_profile: str | None
+) -> str:
+    """Issue #2569 "Native profile migration contract" -- resolve the
+    *effective* runtime profile for an already-persisted managed
+    ExecutionRun's ``(run_kind, runtime_profile, resume_profile)`` triple
+    (AC13/AC14). Read-time compatibility only -- never mutates the DB, never
+    backfills.
+
+    - ``(native_operator, NULL, NULL)`` -> ``native_claude_v1`` (legacy
+      pre-#2569 row, current mainline's intentional
+      ``operator_run_kind_and_profiles()`` default -- see that function's
+      docstring).
+    - ``(native_operator, native_claude_v1, native_claude_v1)`` ->
+      ``native_claude_v1`` (new-style explicit row, #2569 onward).
+    - ``(claude_gpt, claude_gpt_v1, claude_gpt_v1)`` -> ``claude_gpt_v1``.
+    - any other combination of a managed run_kind (``native_operator`` /
+      ``claude_gpt``) -> ``invalid_managed_profile`` (AC14 -- the resume
+      dispatcher must RESTORE_BLOCKED, never fall back to plain Native)."""
+    if run_kind == NATIVE_OPERATOR_RUN_KIND and runtime_profile is None and resume_profile is None:
+        return NATIVE_CLAUDE_RUNTIME_PROFILE
+    if (
+        run_kind == NATIVE_OPERATOR_RUN_KIND
+        and runtime_profile == NATIVE_CLAUDE_RUNTIME_PROFILE
+        and resume_profile == NATIVE_CLAUDE_RUNTIME_PROFILE
+    ):
+        return NATIVE_CLAUDE_RUNTIME_PROFILE
+    if (
+        run_kind == CLAUDE_GPT_RUN_KIND
+        and runtime_profile == CLAUDE_GPT_RUNTIME_PROFILE
+        and resume_profile == CLAUDE_GPT_RUNTIME_PROFILE
+    ):
+        return CLAUDE_GPT_RUNTIME_PROFILE
+    return INVALID_MANAGED_PROFILE
 
 
 def repo_instance_key(cwd: str | pathlib.Path | None = None) -> str:

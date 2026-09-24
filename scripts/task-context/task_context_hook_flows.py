@@ -181,12 +181,31 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         # steal the parent's live Binding for the same Tab).
         return {"decision": "pass", "reason_code": "fork_no_inherited_binding", "binding_id": None}
 
+    # Issue #2569 AC3/AC4 (durable recovery / strong anchor): the current
+    # Claude native session id is a STRONGER recovery anchor than the Herdr
+    # locator -- a Herdr cold restart typically reassigns
+    # tab/workspace/pane ids (AC3), but `claude --resume S`/the Claude-GPT
+    # launcher's `--resume S` preserve the exact same Claude session id S
+    # across the restart, and `current_claude_session_id` on the Binding is
+    # never cleared by `/quit`/SessionEnd (see `_end_current_run` below --
+    # only `runtime_health` changes). So try the session-id anchor FIRST;
+    # only fall back to the (locator may have changed across a cold
+    # restart, but is still the right anchor for the existing same-tab
+    # resume/`/clear` case the locator lookup already covered) live-location
+    # match when no Binding currently claims this exact session id.
     existing_binding = None
-    if source in _RECOVERABLE_SOURCES:
+    if claude_session_id:
+        try:
+            existing_binding = service.get_binding_by_current_session(conn, claude_session_id)
+        except errors.NotFoundError:
+            existing_binding = None
+    if existing_binding is None and source in _RECOVERABLE_SOURCES:
         existing_binding = service.get_binding_by_current_location(conn, herdr_locator)
 
     location_fields = _location_fields(payload)
-    run_kind, runtime_profile, resume_profile = config.operator_run_kind_and_profiles()
+    run_kind, runtime_profile, resume_profile = config.normalize_operator_profiles_for_new_run(
+        *config.operator_run_kind_and_profiles()
+    )
 
     if existing_binding is None:
         binding = service.create_binding(conn)
@@ -241,21 +260,27 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         last_run = _most_recent_managed_run_for_binding(conn, binding_id)
         task_id = last_run["task_id"] if last_run else None
         activity_id = last_run["activity_id"] if last_run else None
-    for stale in stale_runs:
-        service.end_execution_run(conn, stale["id"])
-    run = service.start_execution_run(
+    # PR #2731 review fix_delta Finding 3 follow-up: the old-run close ->
+    # new-run start -> locator detach/re-home -> Binding ACTIVE -> (optional)
+    # session attach sequence below used to be 4-6 independently committing
+    # ``service`` calls, each opening its own ``BEGIN IMMEDIATE``. Bundled
+    # into a single atomic service-layer operation so a crash partway
+    # through can never leave the Binding in a half-restored state (see
+    # ``service._complete_restore_tx`` for the transaction-internal step
+    # sequence and rollback rationale).
+    run = service.complete_session_start_restore(
         conn,
+        binding_id=binding_id,
+        stale_run_ids=[stale["id"] for stale in stale_runs],
         run_kind=run_kind,
         task_id=task_id,
         activity_id=activity_id,
-        binding_id=binding_id,
         runtime_profile=runtime_profile,
         resume_profile=resume_profile,
+        herdr_locator=herdr_locator,
+        claude_session_id=claude_session_id,
+        **location_fields,
     )
-    service.relocate_binding(conn, binding_id, herdr_locator, **location_fields)
-    service.set_binding_health(conn, binding_id, "ACTIVE")
-    if claude_session_id:
-        _set_session_on_run(conn, binding_id, run["id"], claude_session_id)
     service.append_event(
         conn,
         event_type="hook:SessionStart",

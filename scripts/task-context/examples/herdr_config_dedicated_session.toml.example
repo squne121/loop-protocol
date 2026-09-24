@@ -1,0 +1,40 @@
+# Issue #2569 / PR #2731 review fix_delta P1-1 -- example project-scoped
+# Herdr config for the DEDICATED LOOP_PROTOCOL named Herdr session only.
+#
+# Point HERDR_CONFIG_PATH at a copy of this file ONLY when launching the
+# one dedicated named session this Issue's design targets -- never as a
+# global/user-wide config replacement (Stop Condition:
+# "project-scopedに限定できずglobal/user-wide `claude`置換が必要になる場合").
+#
+# This is intentionally a minimal fragment layered on top of your normal
+# ~/.config/herdr/config.toml (via HERDR_CONFIG_PATH, which REPLACES the
+# config file Herdr reads for that one process -- copy any other settings
+# you rely on from your normal config.toml into this file too).
+
+[session]
+# Architecturally disables Herdr's OWN native agent auto-resume for every
+# pane in THIS session (AC12 composite primitive). This makes the
+# `[[startup]]` hook the sole automatic resume trigger, eliminating any
+# race between Herdr's own resume and the Task Context-owned orchestrator.
+resume_agents_on_restore = false
+
+# --- Launch wrapper (shell snippet, not part of the TOML above) -----------
+#
+# Launch the dedicated session with BOTH this config AND the scope-gate env
+# var `task_context_cold_restart_startup.py` requires before it will do
+# anything (see that module's docstring "Session scoping" -- Herdr plugins
+# are user-global, so this env var is what stops the SAME linked plugin's
+# startup hook from also firing in your human/default session):
+#
+#   HERDR_CONFIG_PATH=/path/to/herdr_config_dedicated_session.toml \
+#   LOOP_TASK_CONTEXT_COLD_RESTART_SCOPE=cold_restart_dedicated_session \
+#   herdr --session <your-dedicated-session-name>
+#
+# Ordinary OS process environment inheritance carries
+# LOOP_TASK_CONTEXT_COLD_RESTART_SCOPE from this launch command down into
+# the Herdr server process it starts, and from there into every plugin
+# startup-hook child process that server later spawns for this session
+# (Herdr plugin runtime commands inherit their invoking server process's
+# environment; this repository's env var rides along on that same
+# inheritance path without needing any Herdr-specific per-session plugin
+# scoping API).
