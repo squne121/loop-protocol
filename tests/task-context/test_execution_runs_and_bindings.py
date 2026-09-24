@@ -330,6 +330,91 @@ def test_given_locator_collision_resolved_when_clear_happens_then_correct_bindin
     assert execution_run_id_b == run_b["id"]
 
 
+# ---------------------------------------------------------------------------
+# PR #2731 review fix_delta Finding 3 follow-up -- the SessionStart
+# restore-ACK-success sequence (old-run close -> new-run start ->
+# locator-detach/re-home -> Binding ACTIVE -> optional session attach) must
+# be one atomic service-layer operation: a crash partway through must never
+# leave a half-restored Binding behind.
+# ---------------------------------------------------------------------------
+
+
+def test_given_exception_mid_restore_when_complete_session_start_restore_then_rolled_back_all_or_nothing(
+    conn, monkeypatch
+):
+    """Simulate a crash after step 2 of the (previously 4 separately
+    committing) restore steps -- the old ExecutionRun has been closed and
+    the new one started, but the exception fires before the locator
+    relocation (step 3) or the Binding ACTIVE write (step 4) ever run. The
+    whole ``complete_session_start_restore`` call must roll back as one
+    unit: the pre-restore state (old run still open, Binding still
+    RESTORING, no partial locator move committed) must be fully preserved
+    -- never a half-applied intermediate state."""
+    task = service.create_task(conn, title="Restore Task")
+    activity = service.transition_activity(conn, task["id"], kind="impl")
+    binding = service.create_binding(conn)
+    service.relocate_binding(conn, binding["id"], "w1:p1")
+    stale_run = service.start_execution_run(
+        conn,
+        run_kind="native_operator",
+        task_id=task["id"],
+        activity_id=activity["id"],
+        binding_id=binding["id"],
+        claude_session_id="pre-restore-session",
+    )
+    service.set_binding_session(
+        conn, binding["id"], "pre-restore-session", execution_run_id=stale_run["id"]
+    )
+    service.set_binding_health(conn, binding["id"], "RESTORING")
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated crash after step 2 of 4 (old-run close + new-run start)")
+
+    # ``_relocate_binding_tx`` is step 3 -- patch it out so the bundled
+    # transaction fails strictly *after* steps 1 (end old run) and 2 (start
+    # new run) have already executed (but not yet committed, since they are
+    # all inside the same still-open ``BEGIN IMMEDIATE``).
+    monkeypatch.setattr(service, "_relocate_binding_tx", _boom)
+
+    with pytest.raises(RuntimeError):
+        service.complete_session_start_restore(
+            conn,
+            binding_id=binding["id"],
+            stale_run_ids=[stale_run["id"]],
+            run_kind="native_operator",
+            task_id=task["id"],
+            activity_id=activity["id"],
+            herdr_locator="w1:p2",
+            claude_session_id="post-restore-session",
+        )
+
+    # All-or-nothing: the pre-restore state must be fully preserved.
+    reloaded_binding = service.get_binding(conn, binding["id"])
+    assert reloaded_binding["runtime_health"] == "RESTORING", (
+        "Binding must still be RESTORING -- the ACTIVE write (step 4) must not have committed"
+    )
+    assert reloaded_binding["current_claude_session_id"] == "pre-restore-session", (
+        "the new session attach must not have committed"
+    )
+
+    reloaded_stale_run = service.get_execution_run(conn, stale_run["id"])
+    assert reloaded_stale_run["ended_at"] is None, (
+        "the old ExecutionRun close (step 1) must have rolled back -- it must still be open"
+    )
+
+    open_runs = service.find_open_execution_runs(conn, binding_id=binding["id"], run_kind="native_operator")
+    assert [r["id"] for r in open_runs] == [stale_run["id"]], (
+        "the new ExecutionRun start (step 2) must have rolled back -- no extra open run row"
+    )
+
+    location = service.get_current_location(conn, binding["id"])
+    assert location is not None
+    assert location["herdr_locator"] == "w1:p1", (
+        "no partial locator move may be committed -- the pre-restore location observation "
+        "must still be the current one"
+    )
+
+
 def test_given_no_stale_claim_when_ambiguous_multi_claim_exists_then_lookup_fails_closed(conn):
     """Defensive hardening (review: "get_binding_by_current_location() を
     ... fetchone() で ... 誤って選ぶ ... 曖昧性を検出せず"): if more than

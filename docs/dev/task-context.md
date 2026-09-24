@@ -990,13 +990,13 @@ projection が、SQLite（Task Context DB）のみを情報源として正しく
    `[[startup]]` hook の複数 pane enumeration orchestrator は、もはや
    「将来 operator が Allowed Paths 外で用意するもの」ではなく、本 PR で
    `scripts/task-context/task_context_cold_restart_startup.py` として
-   committed artifact 化した（次節「Cold-restart startup orchestrator」
+   committed artifact 化した（次節「コールド再起動時の起動オーケストレーター」
    参照）。discovery は Herdr 自身の `agent_session` フィールドではなく、
    Task Context 自身の `runtime_locations`/`tab_bindings`（`herdr_locator`
    で現在 live な pane を照合し `current_claude_session_id` を取得）を
    ソースにする（Native/Claude-GPT どちらも同じ discovery 経路で扱える）。
 
-## Cold-restart startup orchestrator（`[[startup]]` hook 実体、PR #2731 review fix_delta P1-1）
+## コールド再起動時の起動オーケストレーター（`[[startup]]` hook の実体、PR #2731 review fix_delta P1-1）
 
 `scripts/task-context/task_context_cold_restart_startup.py` が、Herdr の
 `[[startup]]` plugin hook が実際に起動する committed artifact である
@@ -1094,7 +1094,7 @@ example manifest である。`herdr plugin link <dir>` は運用者自身が行�
   `not_dispatched` / `dispatched_waiting_ack` / `restored` /
   `restore_blocked` / `dispatch_failed` を明示的に区別する。
 
-### classify + ACTIVE→RESTORING の atomic 化（PR #2731 review fix_delta P2-1）
+### 分類判定と ACTIVE→RESTORING 遷移の原子化（PR #2731 review fix_delta P2-1）
 
 `prepare_managed_resume()` は、`classify_for_resume()` の read と
 `ACTIVE -> RESTORING`（または `-> RESTORE_BLOCKED`）の write を、同一の
@@ -1118,7 +1118,7 @@ service 層に追加した。
 返す。これにより dry-run 後の本実行が `noop_restore_already_in_progress`
 で block される問題は解消された。
 
-### locator collision の atomic 化（PR #2731 review fix_delta P1-3）
+### ロケータ衝突時の解決処理の原子化（PR #2731 review fix_delta P1-3）
 
 `service._relocate_binding_tx()` は、移動先 `herdr_locator` を今も保持
 している別 Binding の location observation（`runtime_locations` の
@@ -1133,7 +1133,7 @@ locator に対して unreleased な location observation が複数存在する
 で任意の 1 件を選ぶのではなく `None`（fail-closed、どれも選ばない）を
 返すよう変更した。
 
-### Real Herdr canary（PR #2731 fix_delta iteration、新規 committed startup entrypoint の実機実証、2026-09-24）
+### 実機 Herdr canary 検証（PR #2731 fix_delta iteration、新規 committed startup entrypoint の実機実証、2026-09-24）
 
 P1-1 で committed artifact 化した `task_context_cold_restart_startup.py`
 自体を対象に、disposable named Herdr session（isolated

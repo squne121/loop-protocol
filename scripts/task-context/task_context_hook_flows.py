@@ -260,21 +260,27 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         last_run = _most_recent_managed_run_for_binding(conn, binding_id)
         task_id = last_run["task_id"] if last_run else None
         activity_id = last_run["activity_id"] if last_run else None
-    for stale in stale_runs:
-        service.end_execution_run(conn, stale["id"])
-    run = service.start_execution_run(
+    # PR #2731 review fix_delta Finding 3 follow-up: the old-run close ->
+    # new-run start -> locator detach/re-home -> Binding ACTIVE -> (optional)
+    # session attach sequence below used to be 4-6 independently committing
+    # ``service`` calls, each opening its own ``BEGIN IMMEDIATE``. Bundled
+    # into a single atomic service-layer operation so a crash partway
+    # through can never leave the Binding in a half-restored state (see
+    # ``service._complete_restore_tx`` for the transaction-internal step
+    # sequence and rollback rationale).
+    run = service.complete_session_start_restore(
         conn,
+        binding_id=binding_id,
+        stale_run_ids=[stale["id"] for stale in stale_runs],
         run_kind=run_kind,
         task_id=task_id,
         activity_id=activity_id,
-        binding_id=binding_id,
         runtime_profile=runtime_profile,
         resume_profile=resume_profile,
+        herdr_locator=herdr_locator,
+        claude_session_id=claude_session_id,
+        **location_fields,
     )
-    service.relocate_binding(conn, binding_id, herdr_locator, **location_fields)
-    service.set_binding_health(conn, binding_id, "ACTIVE")
-    if claude_session_id:
-        _set_session_on_run(conn, binding_id, run["id"], claude_session_id)
     service.append_event(
         conn,
         event_type="hook:SessionStart",

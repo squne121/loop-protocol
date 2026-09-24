@@ -519,6 +519,17 @@ def start_execution_run(
     return get_execution_run(conn, run_id)
 
 
+def _set_execution_run_session_tx(conn: sqlite3.Connection, run_id: str, claude_session_id: str) -> None:
+    """Transaction-internal counterpart of ``set_execution_run_session`` (PR
+    #2731 review fix_delta Finding 3 follow-up factoring -- see
+    ``_set_binding_health_tx``)."""
+    get_execution_run(conn, run_id)
+    conn.execute(
+        "UPDATE execution_runs SET claude_session_id = ? WHERE id = ?",
+        (claude_session_id, run_id),
+    )
+
+
 def set_execution_run_session(conn: sqlite3.Connection, run_id: str, claude_session_id: str) -> dict[str, Any]:
     """Attach ``claude_session_id`` to an already-started ExecutionRun after
     the fact (Issue #2564 SessionStart recovery/new-binding flows only learn
@@ -527,11 +538,7 @@ def set_execution_run_session(conn: sqlite3.Connection, run_id: str, claude_sess
     partial unique index -- SQLite re-checks it on this UPDATE the same as
     any INSERT."""
     with db.write_transaction(conn):
-        get_execution_run(conn, run_id)
-        conn.execute(
-            "UPDATE execution_runs SET claude_session_id = ? WHERE id = ?",
-            (claude_session_id, run_id),
-        )
+        _set_execution_run_session_tx(conn, run_id, claude_session_id)
     return get_execution_run(conn, run_id)
 
 
@@ -592,6 +599,110 @@ def _end_execution_run_tx(conn: sqlite3.Connection, run_id: str) -> None:
 def end_execution_run(conn: sqlite3.Connection, run_id: str) -> dict[str, Any]:
     with db.write_transaction(conn):
         _end_execution_run_tx(conn, run_id)
+    return get_execution_run(conn, run_id)
+
+
+# ---------------------------------------------------------------------------
+# SessionStart restore-ACK-success bundling (PR #2731 review fix_delta
+# Finding 3 follow-up -- see module docstring "Transaction-internal
+# helpers")
+# ---------------------------------------------------------------------------
+#
+# ``task_context_hook_flows.on_session_start()``'s restore branch used to
+# call ``end_execution_run`` / ``start_execution_run`` / ``relocate_binding``
+# / ``set_binding_health`` (and, when a ``claude_session_id`` is already
+# known, ``set_execution_run_session`` / ``set_binding_session``) as up to
+# six separate public functions, each opening and committing its own
+# ``BEGIN IMMEDIATE``. A process death between any two of those commits left
+# the restore half-applied (e.g. the stale run closed but no new run
+# started, or the new run started but the Binding never returned to
+# ACTIVE). ``_complete_restore_tx`` bundles the whole sequence into the
+# SINGLE already-open write transaction its public wrapper
+# ``complete_session_start_restore`` holds, reusing the existing
+# transaction-internal ``_*_tx`` helpers exactly as ``prepare_managed_resume``
+# already does for its own classify+transition bundling (P2-1) -- no new
+# schema, lock file, or lease table is introduced.
+
+
+def _complete_restore_tx(
+    conn: sqlite3.Connection,
+    *,
+    binding_id: str,
+    stale_run_ids: list[str],
+    run_kind: str,
+    task_id: str | None,
+    activity_id: str | None,
+    runtime_profile: str | None,
+    resume_profile: str | None,
+    herdr_locator: str,
+    cwd: str | None = None,
+    worktree: str | None = None,
+    branch: str | None = None,
+    claude_session_id: str | None = None,
+) -> str:
+    """Transaction-internal: assumes a write transaction (``BEGIN
+    IMMEDIATE``) is already open. Bundles old-run close -> new-run start ->
+    locator detach/re-home -> Binding ACTIVE -> (optional) session attach
+    into one all-or-nothing unit; an exception raised partway through rolls
+    back every step already applied within this same transaction (see
+    ``task_context_db.write_transaction``'s bare ``except Exception:
+    ROLLBACK``)."""
+    for stale_run_id in stale_run_ids:
+        _end_execution_run_tx(conn, stale_run_id)
+    run_id = _start_execution_run_tx(
+        conn,
+        run_kind=run_kind,
+        task_id=task_id,
+        activity_id=activity_id,
+        binding_id=binding_id,
+        runtime_profile=runtime_profile,
+        resume_profile=resume_profile,
+    )
+    _relocate_binding_tx(conn, binding_id, herdr_locator, cwd=cwd, worktree=worktree, branch=branch)
+    _set_binding_health_tx(conn, binding_id, "ACTIVE")
+    if claude_session_id:
+        _set_execution_run_session_tx(conn, run_id, claude_session_id)
+        _set_binding_session_tx(conn, binding_id, claude_session_id, execution_run_id=run_id)
+    return run_id
+
+
+def complete_session_start_restore(
+    conn: sqlite3.Connection,
+    *,
+    binding_id: str,
+    stale_run_ids: list[str],
+    run_kind: str,
+    task_id: str | None = None,
+    activity_id: str | None = None,
+    runtime_profile: str | None = None,
+    resume_profile: str | None = None,
+    herdr_locator: str,
+    cwd: str | None = None,
+    worktree: str | None = None,
+    branch: str | None = None,
+    claude_session_id: str | None = None,
+) -> dict[str, Any]:
+    """Public wrapper: opens exactly ONE ``BEGIN IMMEDIATE`` write
+    transaction covering the entire SessionStart restore-ACK-success
+    sequence (``task_context_hook_flows.on_session_start()``'s restore
+    branch). See ``_complete_restore_tx`` for the bundled step sequence and
+    crash-window rationale."""
+    with db.write_transaction(conn):
+        run_id = _complete_restore_tx(
+            conn,
+            binding_id=binding_id,
+            stale_run_ids=stale_run_ids,
+            run_kind=run_kind,
+            task_id=task_id,
+            activity_id=activity_id,
+            runtime_profile=runtime_profile,
+            resume_profile=resume_profile,
+            herdr_locator=herdr_locator,
+            cwd=cwd,
+            worktree=worktree,
+            branch=branch,
+            claude_session_id=claude_session_id,
+        )
     return get_execution_run(conn, run_id)
 
 
