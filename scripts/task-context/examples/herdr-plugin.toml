@@ -1,0 +1,42 @@
+# Issue #2569 / PR #2731 review fix_delta P1-1 -- example Herdr plugin
+# manifest for `task_context_cold_restart_startup.py`.
+#
+# Schema verified live against the installed Herdr's own docs (0.9.1,
+# https://raw.githubusercontent.com/herdrdev/herdr/v0.9.1/docs/next/website/
+# src/content/docs/plugins.mdx, "Manifest" / "Startup hooks" sections).
+#
+# This is an EXAMPLE, not auto-linked by anything in this repository --
+# `herdr plugin link` is an operator action, out of this Issue's write-
+# capable scope (Allowed Paths do not include any global/user Herdr plugin
+# directory). Copy this file (and
+# herdr_config_dedicated_session.toml.example, next to it) into a plugin
+# directory of your own and `herdr plugin link <that-directory>` yourself.
+#
+# IMPORTANT (see task_context_cold_restart_startup.py's module docstring,
+# "Session scoping"): per Herdr's own docs, "Installed and linked plugins
+# ... are global to the current user and available in every Herdr session"
+# -- linking this plugin makes its [[startup]] hook fire on EVERY Herdr
+# session's restart, not only your dedicated LOOP_PROTOCOL session. That is
+# why `task_context_cold_restart_startup.py` refuses to do anything unless
+# LOOP_TASK_CONTEXT_COLD_RESTART_SCOPE is present in its process
+# environment (set by your dedicated session's own launch wrapper -- see
+# herdr_config_dedicated_session.toml.example's accompanying launch
+# snippet below). Do not skip that step.
+
+id = "loop-protocol.task-context-cold-restart"
+name = "Task Context Cold-Restart Resume"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Issue #2569 profile-aware cold-restart resume orchestrator for the LOOP_PROTOCOL Task Context v1 control-plane"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = [
+  "uv", "run", "--locked", "python3",
+  "/ABSOLUTE/PATH/TO/loop-protocol/scripts/task-context/task_context_cold_restart_startup.py",
+]
+# Replace the absolute path above with this repository's actual checkout
+# path on the machine the dedicated named Herdr session runs on. `command`
+# is a plain argv array (no shell expansion, no `~`/env expansion) per the
+# Herdr "Plugins" doc's "Manifest" section -- it must be a literal absolute
+# path.

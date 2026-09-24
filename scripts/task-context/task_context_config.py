@@ -39,6 +39,41 @@ DB_FILE_NAME = "task-context.sqlite3"
 SCOPE_ENV_VAR = "LOOP_TASK_CONTEXT_SCOPE"
 RUNTIME_SMOKE_SCOPE_VALUE = "runtime_smoke"
 
+# --- Issue #2569 PR #2731 review fix_delta P1-1: cold-restart startup
+# orchestrator scope gate ------------------------------------------------
+#
+# Herdr's own plugin docs (https://herdr.dev, "Plugins" -> "Install and
+# link") state plainly: "Installed and linked plugins, including their
+# enabled state, are global to the current user and available in EVERY
+# Herdr session" -- there is no Herdr-level mechanism to scope a linked
+# plugin's `[[startup]]` hook to only the dedicated LOOP_PROTOCOL
+# project-scoped named session. Left unguarded, the SAME startup-hook
+# command would therefore also fire on every restart of the human/default
+# Herdr session (and any other named session on the machine), which is
+# exactly the interference the Issue's Real Herdr canary must rule out.
+#
+# `task_context_cold_restart_startup.py`'s `main()` requires this env var
+# to be exactly ``COLD_RESTART_SCOPE_VALUE`` before it performs ANY herdr
+# subprocess call or DB read -- otherwise it is an immediate, side-effect-
+# free no-op. Only the dedicated named session's OWN launch wrapper sets
+# this (alongside `HERDR_CONFIG_PATH` pointing at that session's
+# `resume_agents_on_restore = false` config) -- ordinary OS process
+# environment inheritance (Herdr's plugin startup-hook child process
+# inherits the launching shell's/server's environment) carries it down to
+# the plugin invocation without requiring any Herdr-specific plugin API
+# support for per-session env injection.
+COLD_RESTART_SCOPE_ENV_VAR = "LOOP_TASK_CONTEXT_COLD_RESTART_SCOPE"
+COLD_RESTART_SCOPE_VALUE = "cold_restart_dedicated_session"
+
+
+def is_cold_restart_dedicated_session() -> bool:
+    """``True`` only when ``LOOP_TASK_CONTEXT_COLD_RESTART_SCOPE`` is
+    exactly ``COLD_RESTART_SCOPE_VALUE`` -- the gate predicate
+    ``task_context_cold_restart_startup.main()`` checks before doing
+    anything else (fix_delta P1-1 "Herdr plugins are user-global" safety
+    guard)."""
+    return os.environ.get(COLD_RESTART_SCOPE_ENV_VAR, "") == COLD_RESTART_SCOPE_VALUE
+
 
 def resolve_task_context_scope() -> str:
     """Read the raw ``LOOP_TASK_CONTEXT_SCOPE`` carrier value.

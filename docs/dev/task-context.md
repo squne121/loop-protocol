@@ -985,11 +985,209 @@ projection が、SQLite（Task Context DB）のみを情報源として正しく
 2. `scripts/claude-gpt/launch.sh` は `herdr pane report-agent-session` を
    呼ばないため、Herdr 自身の `pane.get`/`pane.list` の `agent_session`
    フィールドは Claude-GPT pane には決して現れない（`herdr agent start
-   --kind claude` 経由の Native pane にのみ現れる）。将来 operator が
-   `[[startup]]` hook の複数 pane enumeration orchestrator（本 Issue の
-   Allowed Paths 外、運用側で用意するもの）を実装する際は、Herdr 自身の
-   `agent_session` フィールドではなく、Task Context 自身の
-   `runtime_locations`/`tab_bindings`（`herdr_locator` で該当 pane を照合し
-   `current_claude_session_id` を取得）を discovery のソースにする必要が
-   ある。本 canary ではこの方法で実際に `--session-id`/`--pane-id` を
-   dispatcher へ渡し、Claude-GPT の resume が問題なく機能することを確認した。
+   --kind claude` 経由の Native pane にのみ現れる）。**PR #2731 review
+   fix_delta P1-1 でこの制約への対応を本 Issue のスコープ内へ引き上げた**:
+   `[[startup]]` hook の複数 pane enumeration orchestrator は、もはや
+   「将来 operator が Allowed Paths 外で用意するもの」ではなく、本 PR で
+   `scripts/task-context/task_context_cold_restart_startup.py` として
+   committed artifact 化した（次節「Cold-restart startup orchestrator」
+   参照）。discovery は Herdr 自身の `agent_session` フィールドではなく、
+   Task Context 自身の `runtime_locations`/`tab_bindings`（`herdr_locator`
+   で現在 live な pane を照合し `current_claude_session_id` を取得）を
+   ソースにする（Native/Claude-GPT どちらも同じ discovery 経路で扱える）。
+
+## Cold-restart startup orchestrator（`[[startup]]` hook 実体、PR #2731 review fix_delta P1-1）
+
+`scripts/task-context/task_context_cold_restart_startup.py` が、Herdr の
+`[[startup]]` plugin hook が実際に起動する committed artifact である
+（canary 専用の使い捨てスクリプトではない）。次の一続きの成果物チェーンを
+実装する:
+
+```text
+専用named sessionの復元
+  -> [[startup]] hook が本モジュールの main() を起動
+  -> discover_resume_candidates(): Task Context DB（tab_bindings/
+     runtime_locations）を identity authority として、ACTIVE かつ
+     current_claude_session_id を持つ managed Binding のうち、その
+     herdr_locator が現在 live な pane として存在するものを列挙
+  -> dispatcher.prepare_managed_resume() / execute_resume_decision() で
+     各候補を dispatch
+  -> dispatcher.await_all_acks() で全 dispatch 後に共通の bounded deadline
+     内で ACK を回収
+  -> 終了（いずれかが restored に到達しなければ exit 非 0）
+```
+
+新しい daemon/lease table/lock file/distributed coordinator は追加しない
+（本モジュールも `task_context_resume_dispatcher.py` 同様、1 回実行して
+終了する plain Python entrypoint）。
+
+### plugin は user 全体 global であることへの対応（session scoping）
+
+Herdr 自身の公式 plugin doc（`https://herdr.dev` "Plugins" -> "Install and
+link"）は "Installed and linked plugins ... are global to the current user
+and available in every Herdr session" と明記している。つまり、linked plugin
+の `[[startup]]` hook を LOOP_PROTOCOL 専用 named session だけへスコープする
+Herdr 側の機構は存在せず、同じ hook コマンドは human/default session を含む
+**あらゆる** Herdr session の再起動でも発火してしまう。これは本 Issue の
+Real Herdr canary が要求する「human/default Herdr session へ影響しない
+こと」と直接衝突しうる、本 Issue 着手時点では想定されていなかった制約である。
+
+このため `task_context_cold_restart_startup.py` の `main()` は、
+`LOOP_TASK_CONTEXT_COLD_RESTART_SCOPE`（`task_context_config.
+COLD_RESTART_SCOPE_ENV_VAR`）が厳密な sentinel 値と一致しない限り、
+herdr subprocess 呼び出しも DB read も一切行わず即座に no-op で終了する
+（`is_cold_restart_dedicated_session()`）。この env var は専用 named
+session を起動する launch wrapper 自身が設定し（`HERDR_CONFIG_PATH` と
+併記 — 例: `scripts/task-context/examples/
+herdr_config_dedicated_session.toml.example` 末尾のシェルスニペット参照）、
+通常の OS process 環境継承（Herdr server プロセス → その子である plugin
+startup hook プロセス）でそのまま伝播する。Herdr 側に per-session の
+plugin scoping API が無くても成立する。
+
+また discovery/dispatch のいずれの herdr 呼び出しも `--session <name>` を
+明示的には渡さない（渡すと、存在しない named session を誤って作成
+しうるため）。plugin runtime コマンドには Herdr 自身が
+`HERDR_SOCKET_PATH`/`HERDR_BIN_PATH` を注入する（Herdr "Plugins" doc
+"Commands and environment" 節）ため、これらの呼び出しは常に「今動いている
+session」へ ambient に scope される。
+
+### plugin manifest の実際のスキーマ
+
+`scripts/task-context/examples/herdr-plugin.toml` は、インストール済み
+Herdr（0.9.1）自身の公式 doc
+（`https://raw.githubusercontent.com/herdrdev/herdr/v0.9.1/docs/next/
+website/src/content/docs/plugins.mdx`）と照合して確認したスキーマに基づく
+example manifest である。`herdr plugin link <dir>` は運用者自身が行う操作
+であり、本 Issue の Allowed Paths（グローバル/ユーザー全体の Herdr plugin
+ディレクトリを含まない）の外なので、本リポジトリはこの example を
+自動的にはリンクしない。
+
+### ACK/dispatch の分離と共通 bounded deadline（PR #2731 review fix_delta P1-2）
+
+`task_context_resume_dispatcher.py` 側の変更点:
+
+- `execute_resume_decision()` の Herdr CLI 呼び出し成功（exit 0）は
+  「dispatch コマンドの送信に成功した」ことのみを意味し、「実際に resume
+  が成功した」ことを意味しない（Herdr の `pane run` はコマンド文字列 +
+  Enter を送るだけで、起動そのものを保証しない）。
+- `await_ack(binding_id, execution_run_id, timeout_seconds=...)` が、
+  bounded deadline の間 Binding の `runtime_health` を poll し、
+  `ACTIVE`（ACK 成功）/`RESTORE_BLOCKED`（他要因で既に block 済み、または
+  timeout 到達）/`noop_no_longer_pending` のいずれかを返す。timeout 到達時は
+  `mark_restore_blocked_if_pending()` を自ら呼び出して `RESTORE_BLOCKED`
+  へ遷移させる。
+- `mark_restore_blocked_if_pending(binding_id, execution_run_id)` は、
+  「Binding が今も RESTORING であり、かつ `execution_run_id`（pre-restore
+  の旧 run）がまだ `ended_at IS NULL` である場合」だけを 1 つの
+  `BEGIN IMMEDIATE` トランザクション内で確認してから `RESTORE_BLOCKED` へ
+  更新する。ACK が既に成功して旧 run が technical close 済みであれば
+  no-op（既に `ACTIVE` な Binding を決して巻き戻さない）。
+- `await_all_acks(pending, timeout_seconds=...)` は複数 Binding をラウンド
+  ロビンで poll し、**dispatch 後の 1 つの共通 deadline** を全 pending に
+  対して適用する（1 pane の失敗が他の pane の bounded wait を直列に
+  ブロックしない）。`task_context_cold_restart_startup.
+  run_startup_orchestrator()` がこれを使う。
+- CLI（`task_contextctl` 経由ではなく `task_context_resume_dispatcher.py`
+  単体 CLI）の `main()` は、Herdr dispatch 自体が失敗した場合に exit 非 0
+  を返すよう修正した（従来は常に 0 を返していた）。`--ack-timeout-seconds`
+  / `--no-await-ack` を追加し、結果 JSON の `dispatch_status` フィールドで
+  `not_dispatched` / `dispatched_waiting_ack` / `restored` /
+  `restore_blocked` / `dispatch_failed` を明示的に区別する。
+
+### classify + ACTIVE→RESTORING の atomic 化（PR #2731 review fix_delta P2-1）
+
+`prepare_managed_resume()` は、`classify_for_resume()` の read と
+`ACTIVE -> RESTORING`（または `-> RESTORE_BLOCKED`）の write を、同一の
+`db.write_transaction()`（`BEGIN IMMEDIATE`）内で行うよう変更した。
+`BEGIN IMMEDIATE` は書き込みロックを read より前に確保するため、同一
+session_id への並行呼び出しは自然に直列化される: 先に commit した側だけが
+launch 可能な結果を得て、後続の呼び出しは（自分の `BEGIN IMMEDIATE` が
+先行 commit を待ってから）既に `RESTORING` になった状態を読み、
+`noop_restore_already_in_progress` を返す。既存 public setter との入れ子
+トランザクションを避けるため、`service._set_binding_health_tx()` /
+`service._end_execution_run_tx()` という transaction-internal helper を
+service 層に追加した。
+
+### `--dry-run` の read-only 化（PR #2731 review fix_delta P2-2）
+
+`--dry-run` は `classify_for_resume_readonly()` を経由し、
+`task_context_db.connect_readonly()`（DB ファイル作成・migration・write
+のいずれも行わない、真の read-only 接続）だけを使う。state root/DB が
+まだ materialize されていない場合も、それを新規作成せず
+`ACTION_NOOP_UNMANAGED`（`reason_code=state_root_not_yet_materialized`）を
+返す。これにより dry-run 後の本実行が `noop_restore_already_in_progress`
+で block される問題は解消された。
+
+### locator collision の atomic 化（PR #2731 review fix_delta P1-3）
+
+`service._relocate_binding_tx()` は、移動先 `herdr_locator` を今も保持
+している別 Binding の location observation（`runtime_locations` の
+unreleased row）を検出し、**その location observation だけ**を
+`released_at` で detach する（別 Binding の `runtime_health`/
+`execution_runs` など Task/Activity/Binding としての semantic identity は
+一切変更しない）。この detach は `relocate_binding()` 自身が既に持つ単一の
+`BEGIN IMMEDIATE` の中で行われるため、追加のトランザクション設計は不要
+だった。また `service.get_binding_by_current_location()` は、同一
+locator に対して unreleased な location observation が複数存在する
+（本来この detach 修正後は起こらないはずだが、防御的に）場合、`fetchone()`
+で任意の 1 件を選ぶのではなく `None`（fail-closed、どれも選ばない）を
+返すよう変更した。
+
+### Real Herdr canary（PR #2731 fix_delta iteration、新規 committed startup entrypoint の実機実証、2026-09-24）
+
+P1-1 で committed artifact 化した `task_context_cold_restart_startup.py`
+自体を対象に、disposable named Herdr session（isolated
+`LOOP_TASK_CONTEXT_STATE_ROOT`、`herdr plugin link`/`unlink` で実施後に
+完全 cleanup 済み）で実機 canary を実施した。
+
+- ACTIVE Native / ACTIVE Claude-GPT / SUSPENDED の 3 pane を同一 disposable
+  session 内に同時に用意し、各 ACTIVE pane へ canary token を会話内に
+  植え付けた。
+- 対象プロセス（Native `claude`、Claude-GPT 内部 `claude`）と disposable
+  session 自身の herdr server プロセスを `kill -9`（abrupt kill、graceful
+  stop ではない）し、同一 session 名で cold start した。
+- linked plugin の `[[startup]]` hook が人間操作なしで自動発火し
+  （`herdr plugin log list` の `event: "startup"` / `status: "succeeded"`
+  で確認）、本 fix_delta で committed 化した
+  `task_context_cold_restart_startup.py` 自身が discovery（Task Context DB
+  由来、Herdr 自身の `agent_session` field には依存しない）と dispatch を
+  実行した。結果 JSON（`candidates_discovered: 2`、両方
+  `dispatch_status: "restored"`、`any_failed: false`）を確認した。
+- Task Context DB 上で、Native/Claude-GPT 双方について同一 `binding_id`・
+  同一 `claude_session_id` が保持されたまま、旧 ExecutionRun の `ended_at`
+  と新 ExecutionRun の `started_at` がミリ秒単位で連続し、`runtime_locations`
+  が再開後の同一 pane_id（`w1:p2`/`w1:p3`）へ re-home され、Binding が
+  `ACTIVE` へ戻ったことを確認した。SUSPENDED だった 3 つ目の Binding は
+  discovery の候補にすら含まれず（`candidates_discovered: 2`）、新しい
+  ExecutionRun も一切作られなかった。
+- 再開後の両プロセスへ新規 prompt を送り、事前に植え付けた canary token を
+  正確に live recall することを確認した（Native/Claude-GPT いずれも exact
+  restore、plain Native への downgrade なし）。
+- `/proc/<pid>/status` の `PPid` chain を再開後プロセスから遡り、Native
+  （`claude --resume <sid>`）・Claude-GPT（内部 `claude --resume <sid>` は
+  `scripts/claude-gpt/launch.sh` 経由の `sh` の子）いずれも disposable
+  session 自身の（cold restart 後に新しく起動した）herdr server プロセスへ
+  到達することを確認した（OS-level process-parentage evidence）。
+- 使用バージョン: Herdr `0.9.1`（protocol `22`）、Claude Code（Native/
+  Claude-GPT とも同一 binary）`2.1.281`。
+- cold restart 前後で human/default Herdr session（`herdr pane list` で
+  workspace/pane 構成を canary 前後比較）は一切変化せず、disposable
+  session・linked plugin は canary 終了時に完全に stop／delete／unlink 済み
+  （`herdr plugin list` が `No plugins installed.` に戻ることを確認）。
+  synthetic canary token 以外の secret/credential/raw env 値は記録していない。
+
+**新たに確認した知見（既存の `CLAUDE_CODE_CHILD_SESSION` caveat の具体化）**:
+本 canary を実行した agent 自身がネストした Claude Code 環境（このリポジトリの
+別 SubAgent セッション）から動作しているため、その環境変数
+（`CLAUDE_CODE_CHILD_SESSION`/`CLAUDE_CODE_SESSION_ATTENDED`/
+`CLAUDE_CODE_SESSION_ID`）を disposable session の herdr server 起動コマンド
+がそのまま継承すると、その配下の Native/Claude-GPT pane も同じ制約を継承し、
+transcript persistence が無効化され、cold restart 後の `--resume` が
+"No conversation found with session ID" で失敗する（実機で再現した）。
+disposable session の herdr server プロセスを起動する shell からこれら 3 つの
+env var を明示的に `unset` してから起動するだけで、その配下の全プロセスは
+継承せず、上記の完全な exact-restore 実証に成功した。これは
+`task_context_resume_dispatcher.py`/`task_context_cold_restart_startup.py`
+自体のコード契約変更を必要としない、canary 実行手順上の knowledge であり、
+今後同様の canary を（特にネストした Claude Code 環境内の agent から）
+実行する場合の前提条件として記録する。

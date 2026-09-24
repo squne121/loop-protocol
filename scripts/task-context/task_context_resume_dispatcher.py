@@ -14,26 +14,34 @@ Architecture (post-hoc orchestration model, Issue #2569 AC12; NOT a
 2. Herdr's own ``[[startup]]`` plugin hook -- which the Issue's causal-probe
    evidence confirmed fires exactly once, automatically, after Herdr's own
    session restore + API socket become ready -- is the SOLE automatic
-   trigger for this module's orchestrator entrypoint (``main()`` below).
-3. The orchestrator enumerates the named session's panes (each pane's last
-   reported ``agent_session`` reference -- via Herdr's own
-   ``pane.get``/``pane.list``/``report-agent-session`` primitives, see
-   ``docs/dev/task-context.md`` "Cold-restart resume dispatcher"), resolves
-   each one against Task Context via ``classify_for_resume()``/
-   ``prepare_managed_resume()`` below, and for every dispatchable Binding
-   injects the resolved profile-specific launch command into that EXACT
-   pane via ``herdr pane run <pane_id> <command...>`` -- never becomes/
-   replaces its own process image, since a single ``[[startup]]``-triggered
-   orchestrator process must be able to dispatch N panes, not just one.
+   trigger for ``task_context_cold_restart_startup.py``'s orchestrator
+   entrypoint (PR #2731 review fix_delta P1-1 -- that sibling module, in
+   THIS same ``scripts/task-context/`` directory, is the actual
+   ``[[startup]]``-hook-invoked multi-pane orchestrator; see its own
+   docstring and ``docs/dev/task-context.md`` "Cold-restart resume
+   dispatcher").
+3. That orchestrator enumerates the named session's CURRENTLY LIVE panes
+   (``herdr pane list``) and cross-references them against Task Context's
+   OWN durable state (``tab_bindings``/``runtime_locations`` -- never
+   Herdr's own per-pane ``agent_session`` field, which is never populated
+   for Claude-GPT panes at all -- fix_delta P1-1) to resolve which
+   (session_id, pane_id) pairs are dispatch candidates, then calls THIS
+   module's ``prepare_managed_resume()`` / ``execute_resume_decision()`` /
+   ``await_all_acks()`` for each one. This module itself stays a single-
+   session-id classify+launch+ACK building block -- it never becomes/
+   replaces its own process image (no ``os.execvp``), since a single
+   ``[[startup]]``-triggered orchestrator process must be able to dispatch
+   N panes, not just one, by calling into this module N times.
 
 No new daemon/lease table/lock file/distributed coordinator is introduced
-(Issue Outcome/Stop Conditions) -- this module is a plain one-shot Python
-entrypoint the ``[[startup]]`` hook invokes and that exits once every
-resolvable pane has been dispatched (or classified as not-auto-resumable).
-Existing SQLite constraints (``BEGIN IMMEDIATE``, the
+(Issue Outcome/Stop Conditions) -- both this module and
+``task_context_cold_restart_startup.py`` are plain one-shot Python
+entrypoints that exit once every resolvable pane has been dispatched (or
+classified as not-auto-resumable) and ACKs have been collected within a
+bounded deadline. Existing SQLite constraints (``BEGIN IMMEDIATE``, the
 ``ux_tab_bindings_current_session``/``ux_execution_runs_open_managed_*``
-unique indexes) remain the sole concurrency mechanism -- this module adds no
-locking of its own.
+unique indexes) remain the sole concurrency mechanism -- neither module adds
+any locking of its own.
 """
 
 from __future__ import annotations
@@ -44,6 +52,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -278,31 +287,215 @@ def prepare_managed_resume(session_id: str) -> ResumeDecision:
     ``session_id``'s Binding and, if it is dispatchable, transition
     ACTIVE -> RESTORING inside the dispatcher's own fixed-identity DB
     (AC15) before returning. Never launches a process itself --
-    ``execute_resume_decision()`` is the only I/O-performing function."""
+    ``execute_resume_decision()`` is the only I/O-performing function.
+
+    PR #2731 review fix_delta P2-1 ("classify+transition が atomic では
+    ない -- TOCTOU race"): the classification read and the ACTIVE ->
+    RESTORING (or -> RESTORE_BLOCKED) write below now run inside ONE
+    ``db.write_transaction`` (``BEGIN IMMEDIATE``), instead of
+    ``classify_for_resume`` reading outside any transaction and a separate
+    ``service.set_binding_health`` call opening its own transaction
+    afterwards. ``BEGIN IMMEDIATE`` acquires SQLite's write lock up front
+    (before the read below runs), so two concurrent callers for the same
+    session_id fully serialize here: whichever call's transaction commits
+    first is the only one that can observe ACTIVE and transition it to
+    RESTORING; the second call's ``BEGIN IMMEDIATE`` blocks (within the
+    connection's busy_timeout budget) until the first commits, then
+    re-reads the NOW-RESTORING state itself and classifies to
+    ``ACTION_NOOP_ALREADY_RESTORING`` -- never a second concurrent
+    ``launch_*`` result for the same Binding."""
     conn = open_dispatcher_db()
     try:
-        decision = classify_for_resume(conn, session_id)
-        if decision.action in _LAUNCHABLE_ACTIONS and decision.binding_id:
-            service.set_binding_health(conn, decision.binding_id, "RESTORING")
-        elif decision.action == ACTION_RESTORE_BLOCKED and decision.binding_id:
-            service.set_binding_health(conn, decision.binding_id, "RESTORE_BLOCKED")
+        with db.write_transaction(conn):
+            decision = classify_for_resume(conn, session_id)
+            if decision.action in _LAUNCHABLE_ACTIONS and decision.binding_id:
+                service._set_binding_health_tx(conn, decision.binding_id, "RESTORING")
+            elif decision.action == ACTION_RESTORE_BLOCKED and decision.binding_id:
+                service._set_binding_health_tx(conn, decision.binding_id, "RESTORE_BLOCKED")
         return decision
     finally:
         conn.close()
 
 
-def mark_restore_blocked(binding_id: str) -> None:
-    """AC17: any pre-ACK launch failure (argv construction error, the
-    launch subprocess itself failing to start, etc.) must transition the
-    Binding to RESTORE_BLOCKED -- the single failure SSOT (AC16). Opens its
-    own fresh connection at the dispatcher's fixed-identity state root
-    (AC15) -- callers must not reuse a connection that might already be
-    closed/stale by the time a launch failure is observed."""
-    conn = open_dispatcher_db()
+def classify_for_resume_readonly(session_id: str) -> ResumeDecision:
+    """PR #2731 review fix_delta P2-2 ("--dry-run が実際の復元を妨げる状態
+    変更を行う"): the read-only counterpart of ``prepare_managed_resume``
+    for ``--dry-run`` callers. Uses ``task_context_db.connect_readonly``
+    (never ``open_dispatcher_db``/``db.connect``) -- no DB file creation, no
+    migration, no ``ACTIVE -> RESTORING`` write, no filesystem state-root
+    materialization side effect of any kind. If the state root/DB has not
+    been materialized yet at all, this returns a NOOP_UNMANAGED-shaped
+    decision rather than creating it."""
+    db_file = resolve_dispatcher_state_root() / config.DB_FILE_NAME
+    conn = db.connect_readonly(db_file)
+    if conn is None:
+        return ResumeDecision(
+            action=ACTION_NOOP_UNMANAGED,
+            reason_code="state_root_not_yet_materialized",
+            session_id=session_id,
+        )
     try:
-        service.set_binding_health(conn, binding_id, "RESTORE_BLOCKED")
+        return classify_for_resume(conn, session_id)
     finally:
         conn.close()
+
+
+def mark_restore_blocked_if_pending(binding_id: str, execution_run_id: str | None) -> bool:
+    """AC17 + PR #2731 review fix_delta P1-2 ("mark_restore_blocked() は
+    現在の状態を確認せず更新するため ... 正常復元済みの Binding を
+    RESTORE_BLOCKED へ戻せる"): only transitions ``binding_id`` to
+    RESTORE_BLOCKED if it is STILL the exact same pending RESTORING
+    transaction this caller is reacting to -- i.e. ``runtime_health`` is
+    still ``RESTORING`` AND (when ``execution_run_id``, the PRE-restore/old
+    managed ExecutionRun id, is given) that old run has not already been
+    technically closed by a successful ACK. Both the read and the
+    conditional write happen inside ONE ``BEGIN IMMEDIATE`` transaction, so
+    a late/stale dispatch-failure signal arriving after
+    ``SessionStart(source=resume, ...)`` already advanced the Binding to
+    ACTIVE (and technically closed the old run) is correctly recognized as
+    stale and is a no-op -- it never downgrades an already-ACTIVE Binding.
+    Returns ``True`` if the RESTORE_BLOCKED transition was actually
+    applied, ``False`` if this was a no-op (already ACK'd / already
+    blocked / binding health changed out from under this pending attempt).
+
+    Opens its own fresh connection at the dispatcher's fixed-identity state
+    root (AC15) -- callers must not reuse a connection that might already
+    be closed/stale by the time a launch failure/timeout is observed."""
+    conn = open_dispatcher_db()
+    try:
+        with db.write_transaction(conn):
+            binding = service.get_binding(conn, binding_id)
+            if binding["runtime_health"] != "RESTORING":
+                return False
+            if execution_run_id:
+                run = service.get_execution_run(conn, execution_run_id)
+                if run["ended_at"] is not None:
+                    # The old run was already technically closed -- an ACK
+                    # already completed the restore (it is ACTIVE again, or
+                    # mid-flight to becoming so); this failure signal is
+                    # stale and must not downgrade a successful restore.
+                    return False
+            service._set_binding_health_tx(conn, binding_id, "RESTORE_BLOCKED")
+            return True
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Bounded ACK collection (PR #2731 review fix_delta P1-2)
+# ---------------------------------------------------------------------------
+#
+# Herdr's `pane run`/`agent start` returning exit 0 only means the launch
+# COMMAND was successfully injected/sent into the pane -- it is NOT proof
+# that the resumed Claude process actually started or that
+# `SessionStart(source=resume, session_id=S)` for the target session was
+# ever observed. `await_ack` below polls the dispatcher's own DB (the same
+# state `task_context_hook_flows.on_session_start` mutates once the ACK
+# hook payload actually arrives, out-of-process, from the resumed Claude
+# session) for a bounded deadline. Success (`"restored"`) requires the
+# Binding to have reached ACTIVE again; on deadline expiry, this calls
+# ``mark_restore_blocked_if_pending`` -- which is itself guarded, so an ACK
+# that lands concurrently with (just after) the deadline is never
+# downgraded from ACTIVE back to RESTORE_BLOCKED.
+
+_DEFAULT_ACK_TIMEOUT_SECONDS = 30.0
+_DEFAULT_ACK_POLL_INTERVAL_SECONDS = 0.2
+
+
+def await_ack(
+    binding_id: str,
+    execution_run_id: str | None,
+    *,
+    timeout_seconds: float = _DEFAULT_ACK_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = _DEFAULT_ACK_POLL_INTERVAL_SECONDS,
+    clock=time.monotonic,
+    sleep=time.sleep,
+) -> str:
+    """Poll for the ACK (Binding back at ACTIVE) within ``timeout_seconds``
+    of wall-clock budget starting NOW. Returns one of:
+
+    - ``"restored"`` -- the Binding reached ACTIVE within the deadline
+      (the post-ACK half, ``task_context_hook_flows.on_session_start``,
+      observed the matching ``SessionStart(source=resume, session_id=S)``
+      and completed old-run-close/new-run-start/locator-re-home/ACTIVE).
+    - ``"restore_blocked"`` -- either some other observer already
+      transitioned the Binding to RESTORE_BLOCKED, or the deadline expired
+      first and this call itself applied that transition (guarded --
+      ``mark_restore_blocked_if_pending`` never downgrades an ACK that
+      raced in concurrently).
+    - ``"noop_no_longer_pending"`` -- the Binding is neither RESTORING nor
+      ACTIVE nor RESTORE_BLOCKED by the time this polled/timed out (e.g.
+      externally SUSPENDED/DETACHED mid-flight) -- reported distinctly so
+      callers do not conflate it with an ordinary timeout.
+    """
+    deadline = clock() + timeout_seconds
+    while True:
+        conn = open_dispatcher_db()
+        try:
+            binding = service.get_binding(conn, binding_id)
+        finally:
+            conn.close()
+        health = binding["runtime_health"]
+        if health == "ACTIVE":
+            return "restored"
+        if health == "RESTORE_BLOCKED":
+            return "restore_blocked"
+        if health != "RESTORING":
+            return "noop_no_longer_pending"
+        now = clock()
+        if now >= deadline:
+            mark_restore_blocked_if_pending(binding_id, execution_run_id)
+            return "restore_blocked"
+        sleep(min(poll_interval_seconds, deadline - now))
+
+
+def await_all_acks(
+    pending: list[tuple[str, str | None]],
+    *,
+    timeout_seconds: float = _DEFAULT_ACK_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = _DEFAULT_ACK_POLL_INTERVAL_SECONDS,
+    clock=time.monotonic,
+    sleep=time.sleep,
+) -> dict[str, str]:
+    """Multi-pane counterpart of ``await_ack`` (fix_delta P1-2: "全pane
+    へのdispatch後に共通の期限で結果を回収すれば、1つの失敗paneが他の
+    復元を長時間止める必要もありません"). ``pending`` is a list of
+    ``(binding_id, execution_run_id)`` pairs -- ONE shared deadline starting
+    NOW covers every one of them; each round polls every still-pending
+    binding once (never sequentially blocking on one binding's own full
+    timeout before moving to the next). Returns ``{binding_id: status}``
+    with the same status vocabulary as ``await_ack``."""
+    deadline = clock() + timeout_seconds
+    results: dict[str, str] = {}
+    remaining = list(pending)
+    while remaining:
+        still_pending: list[tuple[str, str | None]] = []
+        for binding_id, execution_run_id in remaining:
+            conn = open_dispatcher_db()
+            try:
+                binding = service.get_binding(conn, binding_id)
+            finally:
+                conn.close()
+            health = binding["runtime_health"]
+            if health == "ACTIVE":
+                results[binding_id] = "restored"
+            elif health == "RESTORE_BLOCKED":
+                results[binding_id] = "restore_blocked"
+            elif health != "RESTORING":
+                results[binding_id] = "noop_no_longer_pending"
+            else:
+                still_pending.append((binding_id, execution_run_id))
+        remaining = still_pending
+        if not remaining:
+            break
+        now = clock()
+        if now >= deadline:
+            for binding_id, execution_run_id in remaining:
+                mark_restore_blocked_if_pending(binding_id, execution_run_id)
+                results[binding_id] = "restore_blocked"
+            break
+        sleep(min(poll_interval_seconds, deadline - now))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +610,7 @@ def execute_resume_decision(
     herdr_session: str | None = None,
     claude_gpt_launch_script: Path | str | None = None,
     agent_name: str | None = None,
-    run_fn=subprocess.run,
+    run_fn=None,
 ) -> subprocess.CompletedProcess:
     """Dispatch ``decision`` (must be one of the two launchable actions)
     into the exact Herdr pane ``pane_id``. This is the process-boundary
@@ -426,7 +619,15 @@ def execute_resume_decision(
     child of THIS process), which talks to Herdr's own server, which then
     executes the resolved launch command as the target pane's foreground
     process (a descendant of the Herdr server process). ``run_fn`` is
-    injectable purely so tests never spawn a real herdr/claude process."""
+    injectable purely so tests never spawn a real herdr/claude process --
+    left unset, it resolves ``subprocess.run`` at CALL time (a dynamic
+    module-attribute lookup, not a def-time-bound default) so
+    ``unittest.mock``/``monkeypatch`` patching ``subprocess.run`` works
+    uniformly whether a caller passes ``run_fn`` explicitly or reaches this
+    function indirectly (e.g. via the CLI's ``main()``, which never exposes
+    its own ``run_fn`` knob)."""
+    if run_fn is None:
+        run_fn = subprocess.run
     subcommand_argv = build_launch_argv(
         decision, claude_gpt_launch_script=claude_gpt_launch_script, agent_name=agent_name, pane_id=pane_id
     )
@@ -438,13 +639,15 @@ def execute_resume_decision(
         result = run_fn(herdr_argv, check=False, capture_output=True, text=True)
     except OSError:
         if decision.binding_id:
-            mark_restore_blocked(decision.binding_id)
+            mark_restore_blocked_if_pending(decision.binding_id, decision.execution_run_id)
         raise
     if result.returncode != 0 and decision.binding_id:
         # Pre-ACK failure (AC17): the launch command itself could not be
         # dispatched into the pane -- fail closed rather than leaving the
-        # Binding stuck at RESTORING with nothing actually launched.
-        mark_restore_blocked(decision.binding_id)
+        # Binding stuck at RESTORING with nothing actually launched. Guarded
+        # (fix_delta P1-2) so a late/stale failure that arrives after an ACK
+        # already succeeded never downgrades an already-ACTIVE Binding.
+        mark_restore_blocked_if_pending(decision.binding_id, decision.execution_run_id)
     return result
 
 
@@ -463,13 +666,44 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--herdr-bin", default="herdr")
     parser.add_argument("--herdr-session", default=None, help="Named Herdr session (omit for the default session)")
     parser.add_argument("--claude-gpt-launch-script", default=None)
-    parser.add_argument("--dry-run", action="store_true", help="Classify + prepare only; never actually launch")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Classify only (read-only DB connection, no write of any kind -- "
+            "fix_delta P2-2); never actually launch."
+        ),
+    )
+    parser.add_argument(
+        "--ack-timeout-seconds",
+        type=float,
+        default=_DEFAULT_ACK_TIMEOUT_SECONDS,
+        help="Bounded wait, after a successful Herdr dispatch, for the SessionStart ACK (fix_delta P1-2)",
+    )
+    parser.add_argument(
+        "--no-await-ack",
+        action="store_true",
+        help="Dispatch only; report dispatched_waiting_ack immediately instead of polling for the ACK",
+    )
     args = parser.parse_args(argv)
 
-    decision = prepare_managed_resume(args.session_id)
-    result: dict[str, Any] = {"decision": decision.to_public_dict(), "dispatched": False}
+    # fix_delta P2-2: --dry-run uses the read-only classify path -- never
+    # `prepare_managed_resume` (which writes ACTIVE -> RESTORING) -- so a
+    # dry-run invocation can NEVER block a subsequent real run.
+    decision = classify_for_resume_readonly(args.session_id) if args.dry_run else prepare_managed_resume(
+        args.session_id
+    )
+    result: dict[str, Any] = {"decision": decision.to_public_dict(), "dispatch_status": "not_dispatched"}
 
-    if decision.action in _LAUNCHABLE_ACTIONS and not args.dry_run:
+    if args.dry_run or decision.action not in _LAUNCHABLE_ACTIONS:
+        print(json.dumps(result))
+        return 0
+
+    # fix_delta P1-2: the CLI's exit code/result JSON must distinguish
+    # "the launch command was sent to Herdr" from "the resume actually
+    # succeeded" -- and must be nonzero when the Herdr dispatch ITSELF
+    # fails (previously `main()` always returned 0 even then).
+    try:
         proc = execute_resume_decision(
             decision,
             pane_id=args.pane_id,
@@ -477,11 +711,29 @@ def main(argv: list[str] | None = None) -> int:
             herdr_session=args.herdr_session,
             claude_gpt_launch_script=args.claude_gpt_launch_script,
         )
-        result["dispatched"] = proc.returncode == 0
-        result["herdr_pane_run_returncode"] = proc.returncode
+    except OSError as exc:
+        result["dispatch_status"] = "dispatch_failed"
+        result["error"] = str(exc)
+        print(json.dumps(result))
+        return 1
 
+    result["herdr_pane_run_returncode"] = proc.returncode
+    if proc.returncode != 0:
+        result["dispatch_status"] = "dispatch_failed"
+        print(json.dumps(result))
+        return 1
+
+    if args.no_await_ack:
+        result["dispatch_status"] = "dispatched_waiting_ack"
+        print(json.dumps(result))
+        return 0
+
+    ack_status = await_ack(
+        decision.binding_id, decision.execution_run_id, timeout_seconds=args.ack_timeout_seconds
+    )
+    result["dispatch_status"] = ack_status
     print(json.dumps(result))
-    return 0
+    return 0 if ack_status == "restored" else 1
 
 
 if __name__ == "__main__":
