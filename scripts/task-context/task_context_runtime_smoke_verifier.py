@@ -687,6 +687,8 @@ def orchestrate_runtime_smoke(
     run_id: str | None = None,
     timeout_seconds: float = 180.0,
     runner_argv_extra: list[str] | None = None,
+    canonical_task_id: str | None = None,
+    canonical_activity_id: str | None = None,
     wrong_primary_target_evidence: WrongPrimaryTargetEvidence | None = None,
     clear_scenario_evidence: ClearScenarioEvidence | None = None,
     clear_causal_evidence: ClearScenarioEvidence | None = None,
@@ -718,7 +720,28 @@ def orchestrate_runtime_smoke(
     module's own functions) as optional parameters, and reports each as
     ``"skipped"`` (never fabricated as ``"pass"``) when a caller does not
     supply one for a given orchestration call, consistent with Issue #2568's
-    own runtime-verification skip_conditions."""
+    own runtime-verification skip_conditions.
+
+    ``canonical_task_id``/``canonical_activity_id`` (Issue #2744, added for
+    live-runtime testability -- purely additive, both default ``None``):
+    ``roll_up_runtime_smoke_execution_run``'s own docstring requires the
+    canonical ``execution_runs`` roll-up row to be attributed to "the
+    caller's own current parent Task/Activity" -- i.e. a Task/Activity pair
+    that ALREADY exists in ``canonical_conn`` before this call (so it is
+    already present in both the ``before`` and ``after``
+    ``snapshot_canonical_tables`` snapshots and therefore never itself
+    trips the AC3 ``tasks``/``activities`` byte-identical check below).
+    When both are supplied, this orchestration attributes the roll-up (and
+    the ``canonical_delta_contract`` expected-attribution check) to exactly
+    that pre-existing pair. When omitted (the default), this orchestration
+    keeps its original behavior of reusing the run's OWN isolated smoke-seed
+    ``task_id``/``activity_id`` for the canonical roll-up -- byte-identical
+    to this function's behavior before this parameter existed. Note that
+    default-path reuse only succeeds against a ``canonical_conn`` that
+    happens to already contain a Task/Activity with those exact (isolated,
+    randomly-generated) ids, which no real canonical DB does; a caller
+    driving a genuine live run against a real canonical DB must supply its
+    own pre-existing canonical Task/Activity via these two parameters."""
     violations: list[str] = []
 
     state_root = build_isolated_state_root(base_dir, run_id=run_id)
@@ -753,11 +776,17 @@ def orchestrate_runtime_smoke(
         )
     claude_session_id = (runner_evidence or {}).get("parent_session_id")
 
-    roll_up_runtime_smoke_execution_run(canonical_conn, task_id=task_id, activity_id=activity_id)
+    # See the ``canonical_task_id``/``canonical_activity_id`` docstring note
+    # above: prefer the caller-supplied pre-existing canonical pair when
+    # given; fall back to this run's own isolated seed ids otherwise
+    # (byte-identical to this function's pre-Issue-#2744 default behavior).
+    roll_up_task_id = canonical_task_id if canonical_task_id is not None else task_id
+    roll_up_activity_id = canonical_activity_id if canonical_activity_id is not None else activity_id
+    roll_up_runtime_smoke_execution_run(canonical_conn, task_id=roll_up_task_id, activity_id=roll_up_activity_id)
 
     after = snapshot_canonical_tables(canonical_conn)
     canonical_delta = canonical_delta_contract(
-        before, after, expected_task_id=task_id, expected_activity_id=activity_id
+        before, after, expected_task_id=roll_up_task_id, expected_activity_id=roll_up_activity_id
     )
     if canonical_delta.status != "pass":
         violations.append("canonical_delta_contract failed (see canonical_delta for detail)")
