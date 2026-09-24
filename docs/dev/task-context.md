@@ -938,6 +938,40 @@ end-to-end cold-restart resume を実機で確認した。
 - default/human Herdr session の workspace/pane 構成は前後で不変であることを
   確認し、disposable session・plugin は完全に stop/delete/unlink 済み。
 
+**使用したバージョン情報（本 canary 実施時点、2026-09-24）**: Herdr
+client/server は `0.9.1`、Herdr protocol は `22`、Claude Code（Native）は
+`2.1.281`。Claude-GPT 経由（`scripts/claude-gpt/launch.sh` 起動時のバナー
+表示）は `Claude Code v2.1.281 gpt-5.6-terra[1m]` であり、これは同一の
+Claude Code binary（`2.1.281`）を、claude-gpt が model/proxy layer のみ
+差し替えて起動していることを示す（Herdr 側 binary の差し替えは行っていない）。
+
+**AC11（Herdr metadata/tab title 消失後も SQLite から projection を再生成
+できる）の実機証跡**: 上記 disposable named Herdr session で作成した
+binding（`binding_a73b38fc32e340cea42bae4e95b59eca`、
+`claude_session_id=c2932a9e-c84a-4b7a-9847-406215784721`）に対し、その
+Herdr session 自体が完全に削除された後（＝ Herdr 自身の tab
+title/workspace/pane metadata が一切残っていない状態）に、
+`scripts/task-context/task_contextctl.py query current` を実行して
+projection の再生成を確認した。
+
+```bash
+echo '{"schema_version":"task-context-request/v1","request_id":"probe-1","operation":"query_current","payload":{"session_id":"c2932a9e-c84a-4b7a-9847-406215784721"}}' | uv run --locked python3 scripts/task-context/task_contextctl.py query current
+```
+
+実際に得られたレスポンス（要約せず引用）:
+
+```json
+{"schema_version": "task-context-result/v1", "status": "ok", "code": "OK", "data": {"binding": {"id": "binding_a73b38fc32e340cea42bae4e95b59eca", "current_claude_session_id": "c2932a9e-c84a-4b7a-9847-406215784721", "runtime_health": "SUSPENDED", "created_at": "2026-09-24T01:10:43.577974+00:00", "updated_at": "2026-09-24T01:14:34.298666+00:00"}, "task": null, "activity": null, "runtime_location": {"id": "loc_96988ff5bb07445ca6494e92a3c89c9d", "binding_id": "binding_a73b38fc32e340cea42bae4e95b59eca", "herdr_locator": "w5:p1", "observed_at": "2026-09-24T01:11:24.426805+00:00", "released_at": null, "cwd": null, "worktree": null, "branch": null}, "task_refs": [], "execution_run_id": null, "attention": null, "degraded": false, "degraded_reason": null}}
+```
+
+`degraded: false` である点が重要な証跡である。対象の disposable Herdr
+session は既に完全に stop/delete 済みで Herdr 側 metadata は一切存在しない
+にもかかわらず、`binding`（`runtime_health`、`created_at`/`updated_at` 含む）
+と `runtime_location`（`herdr_locator: "w5:p1"` を含む）から成る完全な
+projection が、SQLite（Task Context DB）のみを情報源として正しく
+再生成されている。これは AC11 が要求する「Herdr metadata 消失後も SQLite
+から projection を再生成できる」ことの実機確認である。
+
 **運用上の知見（2 件、コードの契約変更は不要）**:
 
 1. `herdr session stop`（graceful stop）は各 pane の Claude プロセスに
