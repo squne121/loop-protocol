@@ -29,10 +29,13 @@ never PASS (Issue #2744 fallback_policy).
 from __future__ import annotations
 
 import importlib.util
+import json
+import platform
 import shutil
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +128,40 @@ def _assert_no_fallback_field(payload: Any, *, path: str = "") -> None:
             _assert_no_fallback_field(item, path=f"{path}[{idx}]")
 
 
+_ARTIFACTS_DIR = _REPO_ROOT / "artifacts"
+
+
+def _write_runtime_verification_log(
+    *, verdict: str, exit_code: int, reason: str, vc_input: dict[str, Any], vc_output: dict[str, Any]
+) -> Path:
+    """``docs/dev/runtime-verification-policy.md`` ## 4 証跡保存フォーマット:
+    write this run's AC2 evidence under worktree-local ``artifacts/`` (never
+    committed -- see repo root ``.gitignore``'s ``artifacts/`` entry)."""
+    _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_path = _ARTIFACTS_DIR / f"runtime-verification-AC2-{timestamp}.log"
+    claude_bin = shutil.which("claude") or "unavailable"
+    lines = [
+        "=== Runtime Verification Log ===",
+        "AC: AC2 (Issue #2744) -- disposable shadow canonical root live isolation",
+        f"Timestamp: {datetime.now(timezone.utc).isoformat()}",
+        f"Environment: {platform.platform()} / python {platform.python_version()} / claude_bin={claude_bin}",
+        "",
+        "--- Input ---",
+        json.dumps(vc_input, indent=2, sort_keys=True, default=str),
+        "",
+        "--- Output ---",
+        json.dumps(vc_output, indent=2, sort_keys=True, default=str)[:20000],
+        "",
+        "--- Verdict ---",
+        f"Result: {verdict}",
+        f"Exit Code: {exit_code}",
+        f"Reason: {reason}",
+    ]
+    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return log_path
+
+
 def _seed_canonical_task_activity(conn) -> tuple[str, str]:
     task = service.create_task(conn, title="issue-2744 live shadow isolation parent task")
     activity = service.transition_activity(conn, task["id"], kind="verification")
@@ -209,77 +246,116 @@ def test_given_disposable_shadow_canonical_root_when_orchestrate_runtime_smoke_r
                 f"(exit {_runner_module.EXIT_SKIP}) -- runner_evidence={result.runner_evidence!r}"
             )
 
-        assert result.runner_returncode == 0, (
-            f"real generic runner launch did not exit 0: returncode={result.runner_returncode} "
-            f"runner_evidence={result.runner_evidence!r}"
-        )
-        _assert_no_fallback_field(result.runner_evidence, path="runner_evidence")
-        _assert_no_fallback_field(result.to_dict(), path="result")
-
-        # --- isolated side: synthetic writes must have actually landed -----
-        state_root = verifier.build_isolated_state_root(base_dir, run_id=run_id)
-        isolated_db_file = state_root / config.DB_FILE_NAME
-        assert isolated_db_file.is_file(), (
-            f"expected the run-scoped isolated Task Context DB to be materialized at "
-            f"{isolated_db_file}, but it was not"
-        )
-        isolated_conn = db.connect_readonly(isolated_db_file)
-        assert isolated_conn is not None
+        vc_input = {
+            "xdg_state_home": str(xdg_state_home),
+            "canonical_db_file": str(canonical_db_file),
+            "canonical_task_id": canonical_task_id,
+            "canonical_activity_id": canonical_activity_id,
+            "base_dir": str(base_dir),
+            "run_id": run_id,
+            "worktree": str(_REPO_ROOT),
+            "runner_argv_extra": ["--max-turns", "2"],
+        }
+        vc_output: dict[str, Any] = {"runner_returncode": result.runner_returncode}
         try:
-            seed_task_id = result.seed["data"]["task_id"]
-            seed_activity_id = result.seed["data"]["activity_id"]
-            isolated_task_row = db.execute_readonly(
-                isolated_conn, "SELECT * FROM tasks WHERE id = ?", (seed_task_id,)
-            ).fetchone()
-            isolated_activity_row = db.execute_readonly(
-                isolated_conn, "SELECT * FROM activities WHERE id = ?", (seed_activity_id,)
-            ).fetchone()
-            assert isolated_task_row is not None, (
-                f"expected the synthetic smoke-seed task {seed_task_id!r} to exist in the "
-                "ISOLATED DB (it must never be written to the shadow canonical DB)"
+            assert result.runner_returncode == 0, (
+                f"real generic runner launch did not exit 0: returncode={result.runner_returncode} "
+                f"runner_evidence={result.runner_evidence!r}"
             )
-            assert isolated_activity_row is not None, (
-                f"expected the synthetic smoke-seed activity {seed_activity_id!r} to exist "
-                "in the ISOLATED DB"
+            _assert_no_fallback_field(result.runner_evidence, path="runner_evidence")
+            _assert_no_fallback_field(result.to_dict(), path="result")
+
+            # --- isolated side: synthetic writes must have actually landed -
+            state_root = verifier.build_isolated_state_root(base_dir, run_id=run_id)
+            isolated_db_file = state_root / config.DB_FILE_NAME
+            vc_output["isolated_db_file"] = str(isolated_db_file)
+            assert isolated_db_file.is_file(), (
+                f"expected the run-scoped isolated Task Context DB to be materialized at "
+                f"{isolated_db_file}, but it was not"
             )
-        finally:
-            isolated_conn.close()
+            isolated_conn = db.connect_readonly(isolated_db_file)
+            assert isolated_conn is not None
+            try:
+                seed_task_id = result.seed["data"]["task_id"]
+                seed_activity_id = result.seed["data"]["activity_id"]
+                isolated_task_row = db.execute_readonly(
+                    isolated_conn, "SELECT * FROM tasks WHERE id = ?", (seed_task_id,)
+                ).fetchone()
+                isolated_activity_row = db.execute_readonly(
+                    isolated_conn, "SELECT * FROM activities WHERE id = ?", (seed_activity_id,)
+                ).fetchone()
+                vc_output["isolated_task_row_present"] = isolated_task_row is not None
+                vc_output["isolated_activity_row_present"] = isolated_activity_row is not None
+                assert isolated_task_row is not None, (
+                    f"expected the synthetic smoke-seed task {seed_task_id!r} to exist in the "
+                    "ISOLATED DB (it must never be written to the shadow canonical DB)"
+                )
+                assert isolated_activity_row is not None, (
+                    f"expected the synthetic smoke-seed activity {seed_activity_id!r} to exist "
+                    "in the ISOLATED DB"
+                )
+            finally:
+                isolated_conn.close()
 
-        # --- shadow canonical side: only the ONE expected delta -------------
-        after = _snapshot_ac2_tables(canonical_conn)
+            # --- shadow canonical side: only the ONE expected delta --------
+            after = _snapshot_ac2_tables(canonical_conn)
 
-        for table in ("events", "runtime_locations", "projection_outbox"):
-            delta = _diff_by_key(before[table], after[table], _AC2_TABLE_PRIMARY_KEYS[table])
-            assert not delta["added"], f"unexpected row(s) added to shadow canonical {table}: {delta['added']}"
-            assert not delta["removed"], f"unexpected row(s) removed from shadow canonical {table}: {delta['removed']}"
-            assert not delta["mutated"], f"unexpected row(s) mutated in shadow canonical {table}: {delta['mutated']}"
+            for table in ("events", "runtime_locations", "projection_outbox"):
+                delta = _diff_by_key(before[table], after[table], _AC2_TABLE_PRIMARY_KEYS[table])
+                vc_output[f"{table}_delta"] = delta
+                assert not delta["added"], f"unexpected row(s) added to shadow canonical {table}: {delta['added']}"
+                assert not delta["removed"], (
+                    f"unexpected row(s) removed from shadow canonical {table}: {delta['removed']}"
+                )
+                assert not delta["mutated"], (
+                    f"unexpected row(s) mutated in shadow canonical {table}: {delta['mutated']}"
+                )
 
-        execution_runs_delta = _diff_by_key(
-            before["execution_runs"], after["execution_runs"], _AC2_TABLE_PRIMARY_KEYS["execution_runs"]
-        )
-        assert not execution_runs_delta["removed"], (
-            f"unexpected row(s) removed from shadow canonical execution_runs: "
-            f"{execution_runs_delta['removed']}"
-        )
-        assert not execution_runs_delta["mutated"], (
-            f"unexpected row(s) mutated in shadow canonical execution_runs: "
-            f"{execution_runs_delta['mutated']}"
-        )
-        assert len(execution_runs_delta["added"]) == 1, (
-            "expected exactly ONE execution_runs row added to the shadow canonical DB "
-            f"(the deliberate AC5 roll-up), got {len(execution_runs_delta['added'])}: "
-            f"{execution_runs_delta['added']}"
-        )
-        added_run = execution_runs_delta["added"][0]
-        assert added_run["run_kind"] == "runtime_smoke"
-        assert added_run["binding_id"] is None
-        assert added_run["task_id"] == canonical_task_id
-        assert added_run["activity_id"] == canonical_activity_id
+            execution_runs_delta = _diff_by_key(
+                before["execution_runs"], after["execution_runs"], _AC2_TABLE_PRIMARY_KEYS["execution_runs"]
+            )
+            vc_output["execution_runs_delta"] = execution_runs_delta
+            assert not execution_runs_delta["removed"], (
+                f"unexpected row(s) removed from shadow canonical execution_runs: "
+                f"{execution_runs_delta['removed']}"
+            )
+            assert not execution_runs_delta["mutated"], (
+                f"unexpected row(s) mutated in shadow canonical execution_runs: "
+                f"{execution_runs_delta['mutated']}"
+            )
+            assert len(execution_runs_delta["added"]) == 1, (
+                "expected exactly ONE execution_runs row added to the shadow canonical DB "
+                f"(the deliberate AC5 roll-up), got {len(execution_runs_delta['added'])}: "
+                f"{execution_runs_delta['added']}"
+            )
+            added_run = execution_runs_delta["added"][0]
+            assert added_run["run_kind"] == "runtime_smoke"
+            assert added_run["binding_id"] is None
+            assert added_run["task_id"] == canonical_task_id
+            assert added_run["activity_id"] == canonical_activity_id
 
-        # Cross-check against this module's own independent contract for the
-        # SAME execution_runs delta, reusing rather than re-deriving its
-        # attribution assertion.
-        assert result.canonical_delta.execution_runs.status == "pass", result.canonical_delta.to_dict()
-        assert result.canonical_delta.status == "pass", result.canonical_delta.to_dict()
+            # Cross-check against this module's own independent contract for
+            # the SAME execution_runs delta, reusing rather than re-deriving
+            # its attribution assertion.
+            vc_output["canonical_delta"] = result.canonical_delta.to_dict()
+            assert result.canonical_delta.execution_runs.status == "pass", result.canonical_delta.to_dict()
+            assert result.canonical_delta.status == "pass", result.canonical_delta.to_dict()
+        except BaseException as exc:
+            _write_runtime_verification_log(
+                verdict="FAIL",
+                exit_code=1,
+                reason=f"{type(exc).__name__}: {exc}",
+                vc_input=vc_input,
+                vc_output=vc_output,
+            )
+            raise
+        else:
+            _write_runtime_verification_log(
+                verdict="PASS",
+                exit_code=0,
+                reason="all canonical-side isolation deltas matched the expected AC5-only roll-up",
+                vc_input=vc_input,
+                vc_output=vc_output,
+            )
     finally:
         canonical_conn.close()
