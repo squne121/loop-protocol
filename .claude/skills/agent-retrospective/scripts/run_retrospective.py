@@ -5386,13 +5386,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--publish-authorized",
         action="store_true",
         help=(
-            "Authorizes checkpoint advancement to be reported as durable (default: False -- a "
-            "proposal-only result; the actual durable persistence write is a separate, "
-            "human-authorized publish channel, out of this Issue's scope). Issue #2715: this flag "
-            "is NOT limited to authorizing GitHub comment publication -- it also gates whether "
-            "--enable-full-analysis's connected full observer/evaluator/finalize pipeline attempt "
-            "is invoked at all; --enable-full-analysis without this flag is rejected at parse time "
-            "(parser.error()/SystemExit(2)) rather than silently running as a no-op."
+            "Issue #2715 fix_delta (PR #2738 REQUEST_CHANGES): this flag has THREE distinct "
+            "effects, none of which is authorizing GitHub comment publication itself. "
+            "(1) Gates whether --enable-full-analysis's connected observer/evaluator/finalize "
+            "pipeline attempt is invoked at all -- --enable-full-analysis without this flag is "
+            "rejected at parse time (parser.error()/SystemExit(2)) rather than silently running "
+            "as a no-op coverage-only pass. (2) When --prior-watermark-file is also supplied and "
+            "this run's checkpoint disposition advances (coverage/regression checks pass AND this "
+            "flag is True), the new watermark is written back to that SAME local file path "
+            "(temp-file + os.replace) -- this local write-back happens ENTIRELY within this CLI "
+            "invocation, with no GitHub interaction. (3) It does NOT authorize or perform GitHub "
+            "publication: the PublishRequest this run may produce is always proposal-only "
+            "(authorization_required=True) regardless of this flag -- the actual durable "
+            "persistence write to GitHub is a separate, human-authorized publish channel, out of "
+            "this Issue's scope. Default: False."
         ),
     )
     parser.add_argument("--repository-id", required=False)

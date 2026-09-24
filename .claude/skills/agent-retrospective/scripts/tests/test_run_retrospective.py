@@ -3957,15 +3957,37 @@ def test_help_strings_document_enable_full_analysis_rejection_without_publish_au
     assert "SystemExit(2)" in enable_help
 
 
-def test_publish_authorized_help_does_not_read_as_github_comment_publication_only() -> None:
-    # AC5: --publish-authorized must not be described as authorizing ONLY
-    # GitHub comment publication -- it must also document that it gates
-    # whether --enable-full-analysis's pipeline attempt runs at all.
+def test_publish_authorized_help_documents_full_analysis_gate_watermark_writeback_and_publication_boundary() -> (
+    None
+):
+    # Issue #2715 fix_delta (PR #2738 REQUEST_CHANGES): --publish-authorized's
+    # help previously said this flag "is NOT limited to authorizing GitHub
+    # comment publication" -- wording that misreads as this flag ALSO
+    # authorizing GitHub comment publication (just not exclusively). It does
+    # not: GitHub publication is a separate, human-authorized channel this
+    # flag never touches. The help must instead separately document (1) that
+    # this flag gates whether --enable-full-analysis's connected pipeline
+    # attempt is invoked at all, (2) that a supplied --prior-watermark-file
+    # may be written back to when checkpoint advancement occurs (a purely
+    # local effect, no GitHub interaction), and (3) that GitHub publication
+    # itself remains a separate, human-authorized, proposal-only channel this
+    # flag does not authorize or perform.
     parser = rr._build_arg_parser()
     publish_help = _flag_help(parser, "--publish-authorized")
-    assert "NOT limited to authorizing GitHub comment publication" in publish_help
+    # (1) gates the connected full-analysis pipeline attempt
     assert "--enable-full-analysis" in publish_help
-    assert "gates" in publish_help
+    assert "pipeline attempt is invoked" in publish_help
+    # (2) conditional watermark/checkpoint write-back is a local file effect
+    assert "--prior-watermark-file" in publish_help
+    assert "written back" in publish_help
+    # (3) does not authorize/perform GitHub publication; proposal-only boundary
+    assert "does NOT authorize or perform GitHub" in publish_help
+    assert "proposal-only" in publish_help
+    assert "authorization_required=True" in publish_help
+    assert "separate, human-authorized publish channel" in publish_help
+    # the misleading old phrasing (readable as "this flag DOES authorize
+    # GitHub comment publication, just not ONLY that") must be fully gone
+    assert "NOT limited to authorizing GitHub comment publication" not in publish_help
 
 
 def test_since_last_retrospective_help_does_not_unconditionally_claim_identifiers_are_ignored() -> None:
@@ -4001,7 +4023,12 @@ def test_enable_full_analysis_without_publish_authorized_rejected(capsys: pytest
             ]
         )
     assert excinfo.value.code == 2
-    assert "--publish-authorized" in capsys.readouterr().err
+    # PR #2738 REQUEST_CHANGES: a bare `"--publish-authorized" in stderr`
+    # substring check is a false-green -- argparse's own usage line already
+    # contains the flag name regardless of which error fired. Assert the
+    # actual LAST stderr line (the `parser.error()` message itself) instead.
+    error_line = capsys.readouterr().err.rstrip().splitlines()[-1]
+    assert error_line.endswith("error: --enable-full-analysis requires: --publish-authorized")
 
 
 def test_enable_full_analysis_without_publish_authorized_rejected_without_since_last_retrospective(
@@ -4013,7 +4040,10 @@ def test_enable_full_analysis_without_publish_authorized_rejected_without_since_
     with pytest.raises(SystemExit) as excinfo:
         rr.main(["--enable-full-analysis"])
     assert excinfo.value.code == 2
-    assert "--publish-authorized" in capsys.readouterr().err
+    # PR #2738 REQUEST_CHANGES: same false-green concern as the sibling test
+    # above -- verify the actual last error line, not a usage-line substring.
+    error_line = capsys.readouterr().err.rstrip().splitlines()[-1]
+    assert error_line.endswith("error: --enable-full-analysis requires: --publish-authorized")
 
 
 def test_enable_full_analysis_with_publish_authorized_still_requires_identifiers(
@@ -4025,8 +4055,14 @@ def test_enable_full_analysis_with_publish_authorized_still_requires_identifiers
     with pytest.raises(SystemExit) as excinfo:
         rr.main(["--since-last-retrospective", "--enable-full-analysis", "--publish-authorized"])
     assert excinfo.value.code == 2
-    stderr = capsys.readouterr().err
-    assert "--repository-id" in stderr
+    # PR #2738 REQUEST_CHANGES: verify the actual last error line names the
+    # missing identifiers, rather than a usage-line substring match on
+    # "--repository-id" that would also pass for an unrelated error.
+    error_line = capsys.readouterr().err.rstrip().splitlines()[-1]
+    assert error_line.endswith(
+        "error: --enable-full-analysis requires: "
+        "--repository-id, --target-issue, --request-id, --idempotency-key"
+    )
 
 
 def test_enable_full_analysis_valid_combination_reaches_analysis_runner(
