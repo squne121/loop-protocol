@@ -81,7 +81,7 @@ open/closed state・Machine-Readable Contract・GitHub native dependency close �
 explicit operator/OWNER directive・review/test/CI 結果に基づく）のみであり、label が
 readiness を左右することはない。
 
-### Entry Transition（Step 1 起動契約, #2272 / #2740）
+### Entry Transition（Step 1 起動契約, #2272 由来、#2740 で追記）
 
 Step 1 起動の実 authority は `CONTRACT_REVIEW_RESULT_V1.status: go` の telemetry
 確認だけでなく、root/main thread が単一の継続した call stack の中で自ら実行する
