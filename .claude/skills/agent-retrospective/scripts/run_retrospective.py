@@ -6005,19 +6005,19 @@ def compute_source_coverage_entry(
 
 
 def _selected_session_count(source_id: str, private_evidence: dict[str, Any]) -> int:
-    """Best-effort per-source selected-session count from the SAME
-    ``private_evidence.provenance`` every collector in ``collect_snapshot.py``
-    already produces (never re-derived from raw records). ``claude_gpt``'s
-    authoritative count is ``complete_sessions`` (paired ``UserPromptSubmit``/
-    ``Stop`` sessions -- the same provenance ``_resolve_latitude_target_
-    session_id`` already reuses); every other source (``claude_code``
-    included) falls back to ``sessions_read`` (the count of session files
-    this collector actually opened and parsed), or ``session_count`` (the
-    caller-supplied session_paths length) when ``sessions_read`` is absent."""
+    """Return the selected session count without changing public schema.
+
+    ``claude_code`` prefers additive private ``logical_session_count``
+    provenance when present. Legacy results retain their physical
+    ``sessions_read`` / ``session_count`` fallback. ``claude_gpt`` continues
+    to use its existing ``complete_sessions`` semantics unchanged.
+    """
     provenance = private_evidence.get("provenance", {}) or {}
     if source_id == "claude_gpt":
         complete_sessions = provenance.get("complete_sessions") or []
         return len(complete_sessions)
+    if source_id == "claude_code" and "logical_session_count" in provenance:
+        return int(provenance.get("logical_session_count") or 0)
     if "sessions_read" in provenance:
         return int(provenance.get("sessions_read") or 0)
     return int(provenance.get("session_count") or 0)
@@ -6252,15 +6252,14 @@ def build_session_window_coverage_result(
 
 
 def _claude_code_project_slug(repo_root: Path) -> str:
-    """Mirrors Claude Code's own on-disk ``~/.claude/projects/<slug>/``
-    directory-naming convention (the resolved absolute repository path with
-    every ``/`` replaced by ``-`` -- observed directly against this Issue's
-    own live local ``~/.claude/projects/`` listing; also consistent with
-    ``scripts/agent-ops/run_worktree_agent_runtime_smoke.py``'s references to
-    ``~/.claude/projects/*/<session_id>.jsonl``). Pure string transform, no
-    filesystem access -- scopes session discovery to THIS repository's own
-    sessions rather than globbing every project on the host."""
-    return str(repo_root.resolve()).replace("/", "-")
+    """Return the bounded Claude Code project slug for this repository path.
+
+    This deliberately implements only the observed current-repository rule:
+    every non-alphanumeric character in a resolved path of at most 200
+    characters becomes ``-``. Long-path truncation/hash behavior remains out
+    of scope rather than being guessed here.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(repo_root.resolve()))
 
 
 def default_claude_code_sessions_dir(env: dict[str, str], *, repo_root: Path) -> Path | None:
@@ -6345,11 +6344,13 @@ def resolve_claude_code_session_paths(
     min_completed_at: str | None = None,
     max_completed_at: str | None = None,
 ) -> list[Path]:
-    """Deterministic, sorted discovery of every ``*.jsonl`` transcript under
-    ``sessions_dir``. Returns ``[]`` (never raises) when ``sessions_dir``
-    does not exist -- the collector itself (``collect_claude_code_source``)
-    already reports an empty ``session_paths`` list as ``unavailable``, so
-    this never silently manufactures a false ``observed``.
+    """Deterministic, sorted discovery of top-level ``*.jsonl`` transcripts in
+    ``sessions_dir``. Nested records (including subagents and tool artifacts)
+    are naturally excluded by hierarchy rather than a directory-name denylist.
+    Returns ``[]`` (never raises) when ``sessions_dir`` does not exist -- the
+    collector itself (``collect_claude_code_source``) already reports an empty
+    ``session_paths`` list as ``unavailable``, so this never silently
+    manufactures a false ``observed``.
 
     Issue #2601 PR #2612 fix_delta (OWNER REQUEST_CHANGES Finding 1, P0):
     when ``min_completed_at``/``max_completed_at`` (ISO-8601 strings) are
@@ -6366,7 +6367,7 @@ def resolve_claude_code_session_paths(
     closed, never silently included as in-window."""
     if not sessions_dir.is_dir():
         return []
-    all_paths = sorted(sessions_dir.glob("**/*.jsonl"))
+    all_paths = sorted(sessions_dir.glob("*.jsonl"))
     if min_completed_at is None and max_completed_at is None:
         return all_paths
 
@@ -6383,6 +6384,44 @@ def resolve_claude_code_session_paths(
             continue
         selected.append(path)
     return selected
+
+
+def _claude_code_logical_session_count(session_paths: Sequence[Path]) -> int:
+    """Count fail-safe logical sessions in an already-selected physical set.
+
+    A file joins another only when every eligible ``sessionId`` value found in
+    its JSONL records is the same raw, non-blank string. Missing, malformed,
+    unreadable, or conflicting identity leaves that file with an unshared
+    fallback group, so uncertainty can never collapse two physical files into
+    one logical session. This helper deliberately consumes only the selected
+    window; it neither discovers nested files nor backfills out-of-window
+    continuation fragments.
+    """
+    group_keys: set[tuple[str, str | int]] = set()
+    for index, path in enumerate(session_paths):
+        candidates: set[str] = set()
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            candidate = record.get("sessionId")
+            if isinstance(candidate, str) and candidate.strip():
+                candidates.add(candidate)
+        if len(candidates) == 1:
+            group_keys.add(("session_id", next(iter(candidates))))
+        else:
+            group_keys.add(("physical_fallback", index))
+    return len(group_keys)
 
 
 def default_claude_gpt_hook_sink_path(env: dict[str, str]) -> Path | None:
@@ -6446,9 +6485,12 @@ def collect_session_sources(
                 min_completed_at=window_start_exclusive,
                 max_completed_at=window_end_inclusive,
             )
-            results["claude_code"] = collect_snapshot.collect_claude_code_source(
+            claude_code_result = collect_snapshot.collect_claude_code_source(
                 session_paths, known_source_nonempty=bool(all_session_paths), clock=clock
             )
+            provenance = claude_code_result.private_evidence.setdefault("provenance", {})
+            provenance["logical_session_count"] = _claude_code_logical_session_count(session_paths)
+            results["claude_code"] = claude_code_result
         else:
             results["claude_code"] = None
     if "claude_gpt" in required_sources:
