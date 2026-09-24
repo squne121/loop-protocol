@@ -7156,16 +7156,16 @@ def consume_trusted_anchor_contract_patch_plan(
     anchor_url: str,
     anchor_payload: dict,
     anchor_body: str,
-    contract_patch_plan: dict,
+    contract_patch_plan: Optional[dict],
     callbacks: Optional[dict[str, Any]] = None,
     known_context: Optional[dict[str, Any]] = None,
     patch_plan_producer_available: bool = True,
 ) -> dict:
     """Connect an approved patch plan to the controlled transaction lane.
 
-    The planner remains read-only.  This explicit consumer is called only by
-    the opt-in preflight execution path after a trusted directive has produced
-    an existing ``CONTRACT_PATCH_PLAN_V1``.  Its default callbacks use the
+    The planner remains read-only. This explicit consumer accepts an existing
+    ``CONTRACT_PATCH_PLAN_V1`` or the narrowly represented missing-plan state
+    from the opt-in preflight execution path. Its default callbacks use the
     existing readiness checker and ``edit_issue_txn.py``; tests can inject
     fixture callbacks without a GitHub mutation.
     """
@@ -7179,7 +7179,12 @@ def consume_trusted_anchor_contract_patch_plan(
     # would silently treat an invalid/untyped payload as an ordinary no-op
     # replay. Fail closed instead: no rewrite_route classification, no
     # mutation attempt.
-    _raw_operations = contract_patch_plan.get("operations", [])
+    # #2724: a missing/non-dict planner plan is represented as ``None`` at
+    # this private consumer boundary, never materialized as ``operations: []``.
+    # The latter is a genuine plan representation whose ordinary no-op path
+    # must remain unavailable to missing-plan input.
+    _missing_contract_patch_plan = not isinstance(contract_patch_plan, dict)
+    _raw_operations = [] if _missing_contract_patch_plan else contract_patch_plan.get("operations", [])
     if not isinstance(_raw_operations, list):
         return {
             "status": "blocked",
@@ -7242,6 +7247,33 @@ def consume_trusted_anchor_contract_patch_plan(
         current_anchor["source_body_sha256"] = f"sha256:{_sha256(current_anchor.get('body', ''))}"
         return current_issue, current_anchor
 
+    def _human_review_directive_editor_route() -> Optional[dict[str, Any]]:
+        return _decide_human_review_directive_editor_route(
+            known_context=known_context,
+            anchor_url=anchor_url,
+            anchor_body=anchor_body,
+            issue_number=issue_number,
+            repo=repo,
+            issue_body_sha256=_sha256(issue.get("body", "")),
+            fetch_current=fetch_current,
+        )
+
+    # #2724: route the planner-missing state through the existing canonical
+    # consumer and SSOT only when no structured scope reframe governs it.
+    # Ineligible freeform input remains fail-closed here rather than falling
+    # through to the genuine empty-operations no-change behavior below.
+    if _missing_contract_patch_plan:
+        if _decision_kind == "absent":
+            _editor_route_result = _human_review_directive_editor_route()
+            if _editor_route_result is not None:
+                return _editor_route_result
+        return {
+            "status": "blocked",
+            "failure": "contract_patch_plan_missing",
+            "writes": 0,
+            "iterations": 0,
+        }
+
     # #2620: an explicit trusted human_review_directive whose derived
     # operations[] is empty (no safe section-bound patch representation)
     # and which is NOT governed by a STRUCTURED ANCHOR_SCOPE_REFRAME_V1
@@ -7255,15 +7287,7 @@ def consume_trusted_anchor_contract_patch_plan(
     # to an ordinary "no_change" no-op instead of hand off to issue-editor
     # -- the exact #2620 control-plane gap.
     if _decision_kind == "absent" and not _raw_operations:
-        _editor_route_result = _decide_human_review_directive_editor_route(
-            known_context=known_context,
-            anchor_url=anchor_url,
-            anchor_body=anchor_body,
-            issue_number=issue_number,
-            repo=repo,
-            issue_body_sha256=_sha256(issue.get("body", "")),
-            fetch_current=fetch_current,
-        )
+        _editor_route_result = _human_review_directive_editor_route()
         if _editor_route_result is not None:
             return _editor_route_result
 
@@ -9149,8 +9173,7 @@ def run_preflight(
                 operations=[],
             )
         if (
-            isinstance(patch_plan, dict)
-            and anchor_payload_for_consumer is not None
+            anchor_payload_for_consumer is not None
             and anchor_body_for_consumer is not None
             and anchor_url_for_consumer is not None
         ):
@@ -9161,7 +9184,7 @@ def run_preflight(
                 anchor_url=anchor_url_for_consumer,
                 anchor_payload=anchor_payload_for_consumer,
                 anchor_body=anchor_body_for_consumer,
-                contract_patch_plan=patch_plan,
+                contract_patch_plan=patch_plan if isinstance(patch_plan, dict) else None,
                 callbacks=contract_update_callbacks,
                 known_context=known_context,
                 patch_plan_producer_available=_patch_plan_producer_available,
