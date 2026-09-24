@@ -2777,9 +2777,12 @@ authority ではない（[Configure auto mode](https://code.claude.com/docs/en/a
 `classifyAllShell` キーは launcher-generated `autoMode` から intentionally
 omitted であり、生成しない（PR #2717 / Issue #2709）。
 
-本 Issue（#2203）の Allowed Paths 内で実装した決定論的な authorization boundary は
-次の三層で構成される。ただし各層のスコープは限定的であり、raw `gh` / raw `git push`
-全般に対する production-grade な deterministic deny ではない（下記「未達スコープ」参照）。
+本 Issue（#2203）の Allowed Paths 内で実装したのは、launcher-local な
+defense-in-depth と canary Issue lifecycle 専用の narrow な transaction guard で
+あり、repository の server-side security authority ではない（後述「未達スコープ」の
+Issue #2223 Owner Decision 参照）。実装した層は次の三層である。ただし各層のスコープは
+限定的であり、raw `gh` / raw `git push` 全般に対する production-grade な
+deterministic deny ではない（下記「未達スコープ」参照）。
 
 1. `permissions.deny`（絶対拒否。autoMode では緩和しない）
 2. 引数・repository・object identity を検証する `PreToolUse` hook
@@ -2805,12 +2808,13 @@ authorization boundary ではない。raw `gh` / raw `git push`（force push・d
 push・remote ref 削除・repository settings 変更等）に対する generic な production-grade
 broker / 新規 enforcing hook-level deny は、Issue #2223（CLOSED、implementation から
 research/Owner Decision へ reframe 済み）で「作らない」方針に確定している。同 Owner
-Decision では、server-side protection・repository permission・required CI・
-authoritative live readback を security authority の正本とし、mutation correctness は
-native/client operation とそれに続く live readback を基本とする。独立した transaction
-semantics が必要な狭い範囲（本節の canary Issue lifecycle broker 等）にのみ narrow な
-transaction executor を限定して用いる。PR #2666 後の現行 `lib.sh` はこの方針へ
-同期済みである。
+Decision では、server-side protection・repository permission・required CI を
+security authority の正本とし、mutation correctness の evidence は native/client
+operation とそれに続く authoritative live readback を基本とする（live readback は
+mutation correctness の evidence であり、security authority そのものではない）。
+独立した transaction semantics が必要な狭い範囲（本節の canary Issue lifecycle
+broker 等）にのみ narrow な transaction executor を限定して用いる。PR #2666 後の
+現行 `lib.sh` はこの方針へ同期済みである。
 
 ## agent-retrospective の run 境界 / source authority（情報源の権威） / mutation boundary（変更操作の境界）（ADR 0007、Issue #2234）
 

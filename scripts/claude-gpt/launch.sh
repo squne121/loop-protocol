@@ -869,8 +869,9 @@ HOOKS_JSON_FRAGMENT=',
 #     have all been removed along with the gate itself. ---
 
 # --- launcher-owned autoMode policy（Issue #2203, second-gate 判断補助。
-#     決定論的 authority は permissions.deny / PreToolUse hook / GitHub mutation
-#     transaction broker であり、この autoMode は project .claude/settings*.json
+#     autoMode は second gate（Auto mode classifier への判断補助）であり、
+#     repository security authority ではない（詳細は lib.sh の policy prose
+#     および Issue #2223 参照）。この autoMode は project .claude/settings*.json
 #     ではなくこの launcher-owned --settings にのみ注入する） ---
 AUTO_MODE_JSON_FRAGMENT=$(claude_gpt_auto_mode_json_fragment)
 
