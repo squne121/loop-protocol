@@ -1028,6 +1028,30 @@ _HRD_EXPLICIT_BODY = (
     "clarifying context for new contributors.\n"
 )
 _HRD_PROSE_ONLY_BODY = "This section could probably be clearer at some point."
+# PR #2732 OWNER REQUEST_CHANGES (P1, iteration N): a representative
+# reproduction of #2715's own origin comment
+# (https://github.com/squne121/loop-protocol/issues/2715#issuecomment-5770013860),
+# which OWNER pointed out `_HRD_EXPLICIT_BODY` (a short freeform onboarding
+# sentence) does not structurally represent -- specifically its "Allowed
+# Paths:" heading followed by exact repository-relative path bullets. Kept
+# verbatim to the load-bearing structural section of that comment (Title /
+# change_kind / In Scope / Allowed Paths headings + bullet lists).
+_HRD_2715_ORIGIN_BODY = (
+    "### 推奨する最小 reframe\n\n"
+    "Title:\n"
+    "実装: since-last full-analysis のCLI helpと前提条件を実際の起動契約に一致させる\n\n"
+    "change_kind:\n"
+    "code\n\n"
+    "In Scope:\n"
+    "- --since-last-retrospective help の条件付き説明を修正\n"
+    "- --enable-full-analysis help に --publish-authorized 必須を明記\n"
+    "- --publish-authorized help に analysis attempt gate でもあることを明記\n"
+    "- --enable-full-analysis && !--publish-authorized を parser.error で拒否\n"
+    "- help/conditional validation の regression test を test_run_retrospective.py に1件追加\n\n"
+    "Allowed Paths:\n"
+    "- .claude/skills/agent-retrospective/scripts/run_retrospective.py\n"
+    "- .claude/skills/agent-retrospective/scripts/tests/test_run_retrospective.py\n"
+)
 _HRD_INVALID_BINDING_BODY = (
     "```yaml\n"
     "schema_version: ANCHOR_SCOPE_REFRAME_V1\n"
@@ -1260,13 +1284,179 @@ def test_explicit_human_review_directive_reaches_next_action_production_reachabl
     assert calls["fetch_current"] >= 1
 
 
+def _spy_classify_scope_delta_authority(monkeypatch):
+    """PR #2732 OWNER REQUEST_CHANGES (P2): observe whether the freeform
+    #2620 route's canonical, existing classifier
+    (`scope_signal_delta.classify_scope_delta_authority()`, the SAME
+    function `_decide_human_review_directive_editor_route()` calls for its
+    own fresh re-classification) was invoked at all for a given
+    negative-matrix case, and what `route` disposition it reached -- without
+    reimplementing or duplicating that classifier's own logic. A standard
+    module import is used (not the custom `importlib` reload
+    `_e2e_load_module()` uses for `run_refinement_preflight.py`), so this is
+    the SAME cached `scope_signal_delta` module object every local
+    `from scope_signal_delta import classify_scope_delta_authority` call
+    inside the production entrypoint resolves against.
+    """
+    import scope_signal_delta
+
+    original = scope_signal_delta.classify_scope_delta_authority
+    calls: list = []
+
+    def spy(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(scope_signal_delta, "classify_scope_delta_authority", spy)
+    return calls
+
+
+def test_issue2715_origin_comment_reproduction_stays_fail_closed_at_expands_allowed_paths_boundary(
+    tmp_path, monkeypatch
+):
+    """PR #2732 OWNER REQUEST_CHANGES (P1, iteration N): #2715's own origin
+    comment (issuecomment-5770013860) carries an "Allowed Paths:" heading
+    followed by exact repository-relative path bullets -- a structural
+    shape `_HRD_EXPLICIT_BODY` (a short freeform onboarding sentence) never
+    represented. This reproduces that exact structure
+    (`_HRD_2715_ORIGIN_BODY`) and drives it through the REAL
+    `run_preflight()` -> `consume_trusted_anchor_contract_patch_plan()` ->
+    `_decide_human_review_directive_editor_route()` call chain, with
+    `_force_hrd_planner_patch_plan_missing()` applied the same way the
+    existing #2724 positive fixture uses it.
+
+    OBSERVED (not assumed) outcome, confirmed by running this fixture
+    before writing any assertion: this body's own "Allowed Paths:" heading
+    trips `scope_signal_delta.detect_boundary_flags()`'s
+    `expands_allowed_paths` boundary (the heading text alone matches
+    `_ALLOWED_PATHS_DIRECTIVE_RE`), while none of the individual bullet
+    items below it independently carries the phrase "allowed paths"
+    together with a path literal in the SAME extracted directive item
+    (`_has_explicit_exact_allowed_path_expansion()` requires both in one
+    item), and no `investigation_derived_path_literals` were supplied. The
+    FRESH `classify_scope_delta_authority()` re-classification therefore
+    resolves `route.action == "human_escalation"` /
+    `route.reason_code == "expands_allowed_paths"` -- never
+    `contract_update_required` -- so
+    `decide_human_review_directive_editor_route()` (the #2620 SSOT) is
+    never eligible, `_decide_human_review_directive_editor_route()` returns
+    `None`, and the transaction falls through to the PRE-EXISTING
+    `contract_patch_plan_missing` fail-closed path. This is NOT the #2620
+    `issue_editor_required` handoff. It is a genuine, independently
+    reproduced fail-closed outcome for this exact real-world comment shape,
+    pinned here as its own regression so it can never silently regress into
+    either a false `issue_editor_required` promotion or a silent
+    operations[] synthesis. Per #2724's Stop Conditions, this residual
+    boundary is NOT relaxed here (that would be a classifier-eligibility
+    change, out of this Issue's Allowed Paths/In Scope) -- it is only
+    observed and fixed as a regression.
+    """
+    observed = _force_hrd_planner_patch_plan_missing(monkeypatch)
+    classify_calls = _spy_classify_scope_delta_authority(monkeypatch)
+
+    result, _exit_code, calls = _hrd_run_preflight(
+        tmp_path, anchor_body=_HRD_2715_ORIGIN_BODY, run_id="issue2715_origin_reproduction"
+    )
+
+    # The planner's OWN (pre-force) authority classification never carried a
+    # contract_patch_plan for this body either -- the expands_allowed_paths
+    # boundary already blocks it before this helper's forced removal has
+    # anything to remove. This is a materially different missing-plan cause
+    # than `_HRD_EXPLICIT_BODY`'s genuine planner-omission case above, and is
+    # asserted explicitly rather than assumed.
+    assert observed["original_plan"] is None
+
+    assert result["next_action"] != "issue_editor_required"
+    assert result["next_action"] == "human_judgment_required"
+    assert "PLANNER_FAIL_CLOSED" in result["blockers"]
+    assert result["contract_update"]["status"] == "failed"
+    assert result["contract_update"]["writes"] == 0
+    assert result["contract_update"].get("reason_code") is None
+    assert calls["apply_transaction"] == 0
+    # The boundary check short-circuits before the #2620 route's own fresh,
+    # TOCTOU-safe fetch_current() readback is ever reached.
+    assert calls["fetch_current"] == 0
+
+    # Independently pin WHY this stays fail-closed: the SAME classifier the
+    # production route calls resolves human_escalation /
+    # expands_allowed_paths for this exact evidence, not some other
+    # unrelated fail-closed cause.
+    assert len(classify_calls) == 1
+    assert classify_calls[0]["route"]["action"] == "human_escalation"
+    assert classify_calls[0]["route"]["reason_code"] == "expands_allowed_paths"
+
+
 @pytest.mark.parametrize(
-    ("name", "anchor_body", "author_association", "human_context_urls", "context_extra"),
+    (
+        "name",
+        "anchor_body",
+        "author_association",
+        "human_context_urls",
+        "context_extra",
+        "replacement",
+        "expect_classifier_reached",
+        "expected_authority_reason_code",
+    ),
     [
-        ("wrong_lane", _HRD_EXPLICIT_BODY, "OWNER", (), None),
-        ("untrusted", _HRD_EXPLICIT_BODY, "NONE", (_HRD_URL,), None),
-        ("ambiguous", _HRD_PROSE_ONLY_BODY, "OWNER", (_HRD_URL,), None),
-        ("invalid_binding", _HRD_INVALID_BINDING_BODY, "OWNER", (_HRD_URL,), None),
+        (
+            "wrong_lane",
+            _HRD_EXPLICIT_BODY,
+            "OWNER",
+            (),
+            None,
+            _MISSING_PLANNER_PATCH_PLAN,
+            True,
+            "ai_inferred_scope_delta",
+        ),
+        (
+            "untrusted",
+            _HRD_EXPLICIT_BODY,
+            "NONE",
+            (_HRD_URL,),
+            None,
+            _MISSING_PLANNER_PATCH_PLAN,
+            True,
+            "untrusted_author_association",
+        ),
+        (
+            "ambiguous",
+            _HRD_PROSE_ONLY_BODY,
+            "OWNER",
+            (_HRD_URL,),
+            None,
+            _MISSING_PLANNER_PATCH_PLAN,
+            True,
+            "ambiguous_human_directive",
+        ),
+        (
+            "invalid_binding",
+            _HRD_INVALID_BINDING_BODY,
+            "OWNER",
+            (_HRD_URL,),
+            None,
+            _MISSING_PLANNER_PATCH_PLAN,
+            False,
+            None,
+        ),
+        # PR #2732 OWNER REQUEST_CHANGES (P2 item 4): a representative
+        # non-dict (malformed) planner `contract_patch_plan` case, reusing
+        # the existing `replacement=[]` pattern already exercised by
+        # `test_explicit_human_review_directive_reaches_next_action_
+        # production_reachable_when_planner_plan_missing` -- combined here
+        # with the `untrusted` ineligibility cause to confirm a malformed
+        # non-dict artifact is never coerced into a different (more
+        # permissive) outcome than the equivalent "absent" case.
+        (
+            "untrusted_non_dict_plan",
+            _HRD_EXPLICIT_BODY,
+            "NONE",
+            (_HRD_URL,),
+            None,
+            [],
+            True,
+            "untrusted_author_association",
+        ),
     ],
 )
 def test_missing_planner_plan_ineligible_input_remains_fail_closed_production_reachable(
@@ -1277,9 +1467,24 @@ def test_missing_planner_plan_ineligible_input_remains_fail_closed_production_re
     author_association,
     human_context_urls,
     context_extra,
+    replacement,
+    expect_classifier_reached,
+    expected_authority_reason_code,
 ):
-    """AC3: missing planner input never becomes a genuine empty-plan noop."""
-    _force_hrd_planner_patch_plan_missing(monkeypatch)
+    """AC3: missing planner input never becomes a genuine empty-plan noop.
+
+    PR #2732 OWNER REQUEST_CHANGES (P2): each case additionally pins (1)
+    whether the #2620 freeform route's canonical classifier
+    (`scope_signal_delta.classify_scope_delta_authority()`) was reached at
+    all for this ineligibility cause, and (2) when reached, the exact
+    `route.reason_code` it independently resolved -- distinguishing the
+    shared `PLANNER_FAIL_CLOSED` marker's DIFFERENT underlying causes
+    (wrong lane / untrusted author / ambiguous directive / never reached at
+    all for a binding-mismatched structured payload) instead of treating
+    them as one interchangeable outcome.
+    """
+    _force_hrd_planner_patch_plan_missing(monkeypatch, replacement)
+    classify_calls = _spy_classify_scope_delta_authority(monkeypatch)
 
     result, _exit_code, calls = _hrd_run_preflight(
         tmp_path,
@@ -1296,6 +1501,13 @@ def test_missing_planner_plan_ineligible_input_remains_fail_closed_production_re
     assert result["contract_update"]["disposition"] not in {"proven_no_change", "no_change"}
     assert calls["apply_transaction"] == 0
     assert "PLANNER_FAIL_CLOSED" in result["blockers"]
+
+    if expect_classifier_reached:
+        assert len(classify_calls) == 1
+        assert classify_calls[0]["route"]["action"] == "human_escalation"
+        assert classify_calls[0]["route"]["reason_code"] == expected_authority_reason_code
+    else:
+        assert classify_calls == []
 
 
 def test_ac3_untrusted_author_association_never_escalates_production_reachable(tmp_path):
