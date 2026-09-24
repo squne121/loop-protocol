@@ -2770,10 +2770,12 @@ blind spot になる）。
 ## claude-gpt launcher における auto mode の second-gate 境界（Issue #2203）
 
 `scripts/claude-gpt/launch.sh` が生成する launcher-owned `--settings` の
-`autoMode`（`environment` / `allow` / `classifyAllShell: true`）は、Claude Code の
+`autoMode`（`environment` / `allow` / `hard_deny`）は、Claude Code の
 Auto mode 自然言語 classifier に対する判断補助（second gate）であり、決定論的な
 authority ではない（[Configure auto mode](https://code.claude.com/docs/en/auto-mode-config)、
 [Configure permissions](https://code.claude.com/docs/en/permissions) 準拠）。
+`classifyAllShell` キーは launcher-generated `autoMode` から intentionally
+omitted であり、生成しない（PR #2717 / Issue #2709）。
 
 本 Issue（#2203）の Allowed Paths 内で実装した決定論的な authorization boundary は
 次の三層で構成される。ただし各層のスコープは限定的であり、raw `gh` / raw `git push`
@@ -2794,16 +2796,21 @@ flag として拒否し、launcher 自身が exactly one の `--permission-mode 
 は project `.claude/settings.json` / `.claude/settings.local.json` には追加せず、
 launcher-owned `--settings` にのみ注入する。
 
-### 未達スコープ（production broker は別 Issue）
+### 未達スコープ（generic production broker は作らない — Issue #2223 CLOSED / minimal-harness Owner Decision）
 
 上記 3 層目の `GitHubMutationBroker` は `squne121/loop-protocol` の canary Issue
 lifecycle（本 Issue の live 検証専用）にスコープが限定された broker であり、汎用の
 GitHub mutation authority（任意の `gh` / raw `git push` 全般）に対する決定論的な
 authorization boundary ではない。raw `gh` / raw `git push`（force push・default branch
-push・remote ref 削除・repository settings 変更等）を deterministic に deny する
-production-grade な broker / hook-level deny の実装は本 Issue の scope 外であり、
-follow-up Issue #2223（実装: raw gh/git push を deterministic deny し GitHub
-mutation production broker を実装する、OPEN）で対応する。
+push・remote ref 削除・repository settings 変更等）に対する generic な production-grade
+broker / 新規 enforcing hook-level deny は、Issue #2223（CLOSED、implementation から
+research/Owner Decision へ reframe 済み）で「作らない」方針に確定している。同 Owner
+Decision では、server-side protection・repository permission・required CI・
+authoritative live readback を security authority の正本とし、mutation correctness は
+native/client operation とそれに続く live readback を基本とする。独立した transaction
+semantics が必要な狭い範囲（本節の canary Issue lifecycle broker 等）にのみ narrow な
+transaction executor を限定して用いる。PR #2666 後の現行 `lib.sh` はこの方針へ
+同期済みである。
 
 ## agent-retrospective の run 境界 / source authority（情報源の権威） / mutation boundary（変更操作の境界）（ADR 0007、Issue #2234）
 
