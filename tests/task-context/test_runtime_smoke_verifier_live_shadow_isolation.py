@@ -41,15 +41,32 @@ from typing import Any
 
 import pytest
 
+_TESTS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _TESTS_DIR.parents[1]
+_RUNNER_PATH = _REPO_ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
+
+# PR #2745 OWNER review (F5): mirrors tests/task-context/conftest.py's own
+# bare-module sys.path bootstrap (scripts/task-context is a hyphenated
+# directory name and therefore cannot be imported as a normal Python
+# package). Under ordinary pytest collection, conftest.py already performs
+# this exact insertion before this module is ever imported, so this is a
+# harmless, idempotent no-op duplicate in that mode (the ``not in sys.path``
+# guard below prevents a second insertion). It exists here too ONLY so this
+# module can ALSO run standalone as a script (``python3
+# test_runtime_smoke_verifier_live_shadow_isolation.py``, see the
+# machine-readable SKIP(77)/FAIL(1)/PASS(0) verification entrypoint at the
+# bottom of this file), which never loads conftest.py at all.
+_SCRIPTS_DIR = _REPO_ROOT / "scripts" / "task-context"
+_MIGRATIONS_DIR = _SCRIPTS_DIR / "migrations"
+for _dir in (str(_SCRIPTS_DIR), str(_MIGRATIONS_DIR)):
+    if _dir not in sys.path:
+        sys.path.insert(0, _dir)
+
 import task_context_config as config  # noqa: E402
 import task_context_db as db  # noqa: E402
 import task_context_migration_runner as migration_runner  # noqa: E402
 import task_context_runtime_smoke_verifier as verifier  # noqa: E402
 import task_context_service as service  # noqa: E402
-
-_TESTS_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _TESTS_DIR.parents[1]
-_RUNNER_PATH = _REPO_ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
 
 _MODULE_NAME = "run_worktree_agent_runtime_smoke_issue_2744_live_shadow_isolation"
 _spec = importlib.util.spec_from_file_location(_MODULE_NAME, _RUNNER_PATH)
@@ -57,6 +74,19 @@ assert _spec is not None and _spec.loader is not None
 _runner_module = importlib.util.module_from_spec(_spec)
 sys.modules[_MODULE_NAME] = _runner_module
 _spec.loader.exec_module(_runner_module)
+
+# PR #2745 OWNER review (F3, https://github.com/squne121/loop-protocol/pull/2745#issuecomment-5816561294):
+# this module drives a REAL `claude` CLI subprocess (via
+# `orchestrate_runtime_smoke()`'s own unmodified `invoke_generic_runner`).
+# `pyproject.toml`'s default addopts already deselect `claude_live`-marked
+# tests (`-m 'not github_live and not claude_live'`) -- without this marker,
+# a bare `uv run pytest tests/task-context/ -v` (no `-m` override) would
+# still collect and execute this module and could launch a real Claude
+# model call in an environment where a working `claude` CLI happens to be
+# present. Marking this module `claude_live` keeps it opt-in, exactly like
+# every other real-CLI-invoking test in this repository (see
+# `.claude/skills/agent-retrospective/scripts/tests/verify_run_retrospective_live_cli.sh`).
+pytestmark = pytest.mark.claude_live
 
 # The AC2 canonical-side table set (Issue #2744) -- deliberately DIFFERENT
 # from this module's own FORBIDDEN_TABLES (tasks/activities/tab_bindings/
@@ -112,6 +142,58 @@ def _diff_by_key(before: list[dict[str, Any]], after: list[dict[str, Any]], key:
         if before_by_key[k] != after_by_key[k]
     ]
     return {"added": added, "removed": removed, "mutated": mutated}
+
+
+# PR #2745 OWNER review (F1): `task-contextctl`'s own dispatcher
+# (`_dispatch()`) short-circuits EVERY `hook` operation with
+# `{"decision": "pass", "reason_code": "observe_only_non_herdr"}` *before*
+# ever opening the DB whenever the hook payload's `herdr_tab_id` is falsy
+# (`.claude/hooks/task_context/hook_entry.py::_build_base_payload` reads
+# `HERDR_TAB_ID` straight out of the child process's own environment). The
+# generic runner's STRUCTURED lane (`run_structured_claude()`) never strips
+# inherited `HERDR_*` env vars (that stripping -- `_isolated_env()` -- is
+# only ever applied to the separate INTERACTIVE herdr lane), so whatever
+# `HERDR_TAB_ID` this test process itself happens to have is what the real
+# `claude` child (and therefore every hook subprocess it spawns) inherits.
+# Rather than depend on the ambient invoking shell's own Herdr Tab identity
+# (which may or may not be set, making this test's central isolation
+# guarantee non-deterministic across environments), this test deliberately
+# sets a SYNTHETIC, run-scoped `HERDR_TAB_ID` before driving the real run --
+# `task_context_hook_flows.py` only ever treats this value as an opaque
+# locator string keyed into the ISOLATED DB's own `tab_bindings` table; it
+# never itself shells out to the real `herdr` CLI/session machinery.
+_SYNTHETIC_HERDR_TAB_ID_ENV_VAR = "HERDR_TAB_ID"
+
+
+def _assert_isolated_runtime_hook_write_observed(isolated_conn) -> list[dict[str, Any]]:
+    """PR #2745 OWNER review (F1): positive proof that a REAL runtime hook
+    (not just the pre-launch `smoke seed`, which never itself calls
+    `service.append_event`) actually reached `task_context_hook_flows.py`'s
+    real DB-mutating dispatch path in the ISOLATED DB -- i.e. that
+    `herdr_tab_id` was non-empty and the dispatcher did NOT take its
+    `observe_only_non_herdr` early-return (which returns before ever
+    opening the DB, so it can never itself produce an `events` row). Any
+    row in the isolated DB's `events` table is unambiguous evidence of this,
+    since `smoke seed` (`task_contextctl.py`'s `smoke_seed` operation)
+    creates only `tasks`/`activities`/`tab_bindings`/`execution_runs` rows
+    and never an `events` row itself. Raises via a plain assertion (not a
+    silent False) when no such row exists, so a caller cannot mistake
+    "hook never actually wrote" for a passing isolation result."""
+    rows = [
+        dict(row)
+        for row in db.execute_readonly(
+            isolated_conn, "SELECT * FROM events ORDER BY occurred_at"
+        ).fetchall()
+    ]
+    assert rows, (
+        "expected at least one real runtime-hook-authored row in the ISOLATED "
+        "DB's events table (proof the hook chain actually reached its "
+        "DB-mutating dispatch path, not the 'observe_only_non_herdr' "
+        "early-return) -- got none. This means this run's positive isolation "
+        "evidence would otherwise rest ONLY on the pre-launch smoke-seed rows, "
+        "which is not evidence that any runtime hook write happened at all."
+    )
+    return rows
 
 
 def _assert_no_fallback_field(payload: Any, *, path: str = "") -> None:
@@ -183,7 +265,34 @@ def test_given_disposable_shadow_canonical_root_when_orchestrate_runtime_smoke_r
     the shadow canonical side."""
     available, detail = _native_claude_available()
     if not available:
+        # PR #2745 OWNER review (F5): a SKIP this early (before any DB is
+        # even opened) previously left no runtime-verification-policy.md
+        # ## 4 evidence log behind at all. Persist a minimal SKIP record so
+        # every terminal outcome of this test -- PASS, FAIL, and SKIP alike
+        # -- is captured under artifacts/, not just the PASS/FAIL branches
+        # reached once a run actually starts.
+        _write_runtime_verification_log(
+            verdict="SKIP",
+            exit_code=77,
+            reason=f"native Claude Code live environment unavailable: {detail}",
+            vc_input={},
+            vc_output={},
+        )
         pytest.skip(f"native Claude Code live environment unavailable: {detail}")
+
+    # PR #2745 OWNER review (F1): see _SYNTHETIC_HERDR_TAB_ID_ENV_VAR's own
+    # docstring-comment above -- without a non-empty HERDR_TAB_ID reaching
+    # the real claude child's own environment, every runtime hook this run
+    # fires takes task-contextctl's `observe_only_non_herdr` early-return
+    # and never writes to the isolated DB at all, making this test's
+    # positive isolation evidence rest solely on the pre-launch smoke-seed
+    # rows (PR #2745 review finding). Set BEFORE build_isolated_env()/the
+    # real subprocess launch below so it is inherited all the way down:
+    # this test process -> invoke_generic_runner's subprocess.run(env=None)
+    # -> run_structured_claude()'s own os.environ.copy() -> the real
+    # `claude` child -> its own hook subprocess.
+    synthetic_herdr_tab_id = "issue-2744-live-shadow-isolation-" + uuid.uuid4().hex[:12]
+    monkeypatch.setenv(_SYNTHETIC_HERDR_TAB_ID_ENV_VAR, synthetic_herdr_tab_id)
 
     # --- disposable shadow canonical root -----------------------------------
     xdg_state_home = tmp_path / "xdg-state-home"
@@ -221,6 +330,23 @@ def test_given_disposable_shadow_canonical_root_when_orchestrate_runtime_smoke_r
         output_dir = tmp_path / "runtime-smoke-output"
         run_id = "live-shadow-isolation-" + uuid.uuid4().hex[:12]
 
+        # PR #2745 OWNER review (F5): built BEFORE the real subprocess launch
+        # (every field here is already known) so the TimeoutExpired/EXIT_SKIP
+        # branches immediately below can also persist a
+        # runtime-verification-policy.md ## 4 evidence log -- previously only
+        # the PASS/FAIL branches further down did.
+        vc_input = {
+            "xdg_state_home": str(xdg_state_home),
+            "canonical_db_file": str(canonical_db_file),
+            "canonical_task_id": canonical_task_id,
+            "canonical_activity_id": canonical_activity_id,
+            "base_dir": str(base_dir),
+            "run_id": run_id,
+            "worktree": str(_REPO_ROOT),
+            "runner_argv_extra": ["--max-turns", "2"],
+            "synthetic_herdr_tab_id": synthetic_herdr_tab_id,
+        }
+
         try:
             result = verifier.orchestrate_runtime_smoke(
                 canonical_conn,
@@ -235,27 +361,34 @@ def test_given_disposable_shadow_canonical_root_when_orchestrate_runtime_smoke_r
                 canonical_activity_id=canonical_activity_id,
             )
         except subprocess.TimeoutExpired as exc:
+            _write_runtime_verification_log(
+                verdict="FAIL",
+                exit_code=1,
+                reason=f"orchestrate_runtime_smoke() did not complete within its bounded timeout: {exc}",
+                vc_input=vc_input,
+                vc_output={},
+            )
             pytest.fail(
                 "orchestrate_runtime_smoke() (real subprocess launch) did not "
                 f"complete within its bounded timeout: {exc}"
             )
 
         if result.runner_returncode == _runner_module.EXIT_SKIP:
+            _write_runtime_verification_log(
+                verdict="SKIP",
+                exit_code=77,
+                reason=(
+                    "generic runner itself reported capability-unavailable "
+                    f"(exit {_runner_module.EXIT_SKIP})"
+                ),
+                vc_input=vc_input,
+                vc_output={"runner_returncode": result.runner_returncode, "runner_evidence": result.runner_evidence},
+            )
             pytest.skip(
                 "generic runner itself reported capability-unavailable "
                 f"(exit {_runner_module.EXIT_SKIP}) -- runner_evidence={result.runner_evidence!r}"
             )
 
-        vc_input = {
-            "xdg_state_home": str(xdg_state_home),
-            "canonical_db_file": str(canonical_db_file),
-            "canonical_task_id": canonical_task_id,
-            "canonical_activity_id": canonical_activity_id,
-            "base_dir": str(base_dir),
-            "run_id": run_id,
-            "worktree": str(_REPO_ROOT),
-            "runner_argv_extra": ["--max-turns", "2"],
-        }
         vc_output: dict[str, Any] = {"runner_returncode": result.runner_returncode}
         try:
             assert result.runner_returncode == 0, (
@@ -264,6 +397,20 @@ def test_given_disposable_shadow_canonical_root_when_orchestrate_runtime_smoke_r
             )
             _assert_no_fallback_field(result.runner_evidence, path="runner_evidence")
             _assert_no_fallback_field(result.to_dict(), path="result")
+
+            # PR #2745 OWNER review (F1): the aggregate verdict itself (which
+            # already folds in the canonical_delta/statusline/scenario
+            # sub-verdicts) and the presence of SOME runner evidence dict are
+            # both part of the AND this test's overall PASS rests on -- not
+            # previously asserted directly.
+            vc_output["result_status"] = result.status
+            assert result.status == "pass", (
+                f"orchestrate_runtime_smoke() aggregate result.status={result.status!r}, "
+                f"expected 'pass' -- violations={result.violations!r}"
+            )
+            assert result.runner_evidence is not None, (
+                "expected SOME runner_evidence dict to have been observed for this real run, got None"
+            )
 
             # --- isolated side: synthetic writes must have actually landed -
             state_root = verifier.build_isolated_state_root(base_dir, run_id=run_id)
@@ -294,6 +441,16 @@ def test_given_disposable_shadow_canonical_root_when_orchestrate_runtime_smoke_r
                     f"expected the synthetic smoke-seed activity {seed_activity_id!r} to exist "
                     "in the ISOLATED DB"
                 )
+
+                # PR #2745 OWNER review (F1): positive proof that a REAL
+                # runtime hook (not just the pre-launch smoke seed) actually
+                # wrote to the isolated DB -- see
+                # _assert_isolated_runtime_hook_write_observed's own
+                # docstring for why an events-table row is the right,
+                # seed-independent signal.
+                hook_events = _assert_isolated_runtime_hook_write_observed(isolated_conn)
+                vc_output["isolated_hook_events_count"] = len(hook_events)
+                vc_output["isolated_hook_event_types"] = sorted({row["event_type"] for row in hook_events})
             finally:
                 isolated_conn.close()
 
@@ -359,3 +516,87 @@ def test_given_disposable_shadow_canonical_root_when_orchestrate_runtime_smoke_r
             )
     finally:
         canonical_conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Machine-readable SKIP(77)/FAIL(1)/PASS(0) verification entrypoint
+# (PR #2745 OWNER review, F5, https://github.com/squne121/loop-protocol/pull/2745#issuecomment-5816561294)
+# ---------------------------------------------------------------------------
+#
+# Ordinary pytest collection/execution of this module (e.g. the Issue #2744
+# Verification Command `uv run pytest
+# tests/task-context/test_runtime_smoke_verifier_live_shadow_isolation.py -v`)
+# is COMPLETELY UNCHANGED by everything below: `pytest.skip()` inside the
+# test function above still reports pytest's own SKIPPED / exit-0 semantics
+# in that mode, exactly as before this fix_delta. `docs/dev/runtime-
+# verification-policy.md`'s exit-code convention (SKIP == 77, distinct from
+# a plain pytest exit 0 that could just as easily mean "everything passed")
+# only applies to the SEPARATE, explicit entrypoint below, reached ONLY by
+# invoking this file directly as a script:
+#   uv run python3 tests/task-context/test_runtime_smoke_verifier_live_shadow_isolation.py
+#
+# This deliberately lives inside this SAME Allowed-Paths file (Issue #2744's
+# Allowed Paths list this file by its exact path, not a new one) rather than
+# as a new standalone shell/py wrapper script -- no new global pytest plugin
+# or generic pass/fail framework is introduced; this is a narrow, local
+# dual-purpose (importable pytest module + invokable script) entrypoint,
+# modeled on `.claude/skills/agent-retrospective/scripts/tests/
+# verify_run_retrospective_live_cli.sh`'s own SKIP(77)/FAIL(1)/PASS(0)
+# contract (that script itself cannot be reused here -- it targets a
+# different test file with different skip_conditions -- so its CONTRACT,
+# not its code, is what is reused).
+
+
+class _OutcomeCollector:
+    """An in-process pytest plugin (never registered globally -- passed only
+    via ``pytest.main(..., plugins=[...])`` for this one nested invocation)
+    that records each collected test's terminal outcome (``"passed"`` /
+    ``"failed"`` / ``"skipped"``) so ``_run_as_verification_entrypoint``
+    below can distinguish a genuine SKIP from a genuine PASS/FAIL -- a plain
+    pytest process exit code alone conflates "all skipped" with "all
+    passed" (both exit 0)."""
+
+    def __init__(self) -> None:
+        self.outcomes: list[str] = []
+
+    def pytest_runtest_logreport(self, report) -> None:  # noqa: ANN001 - pytest hook signature
+        if report.when == "call" or (report.when == "setup" and report.skipped):
+            self.outcomes.append(report.outcome)
+
+
+def _run_as_verification_entrypoint() -> int:
+    """SKIP (77) / FAIL (1) / PASS (0), per docs/dev/runtime-verification-
+    policy.md's exit-code convention:
+
+    - the two documented skip_conditions (Issue #2744 body's
+      ``## Runtime Verification Applicability`` block) -- no working
+      ``claude`` CLI, or this test itself reporting SKIPPED for any reason
+      (including the generic runner's own capability-unavailable exit) --
+      map to SKIP (77), with a leading ``SKIP: `` stdout line.
+    - any real assertion failure, or the nested pytest run reporting ANY
+      failed outcome, is FAIL (1).
+    - only a genuine PASS outcome (with no failures and no skips) is PASS
+      (0)."""
+    available, detail = _native_claude_available()
+    if not available:
+        print(f"SKIP: native Claude Code live environment unavailable: {detail}")
+        return 77
+
+    collector = _OutcomeCollector()
+    pytest.main(["-o", "addopts=", "-m", "claude_live", "-q", __file__], plugins=[collector])
+
+    if any(outcome == "failed" for outcome in collector.outcomes):
+        print("FAIL: live shadow isolation verification failed (see pytest output above)")
+        return 1
+    if collector.outcomes and all(outcome == "skipped" for outcome in collector.outcomes):
+        print("SKIP: nested pytest run reported SKIPPED (see pytest output above for reason)")
+        return 77
+    if any(outcome == "passed" for outcome in collector.outcomes):
+        print("PASS: live shadow isolation verification succeeded")
+        return 0
+    print("FAIL: no test outcomes observed from the nested pytest run")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(_run_as_verification_entrypoint())

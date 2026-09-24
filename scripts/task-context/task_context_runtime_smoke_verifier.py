@@ -684,11 +684,11 @@ def orchestrate_runtime_smoke(
     base_dir: Path,
     prompt_file: str,
     output_dir: str,
+    canonical_task_id: str,
+    canonical_activity_id: str,
     run_id: str | None = None,
     timeout_seconds: float = 180.0,
     runner_argv_extra: list[str] | None = None,
-    canonical_task_id: str | None = None,
-    canonical_activity_id: str | None = None,
     wrong_primary_target_evidence: WrongPrimaryTargetEvidence | None = None,
     clear_scenario_evidence: ClearScenarioEvidence | None = None,
     clear_causal_evidence: ClearScenarioEvidence | None = None,
@@ -723,26 +723,51 @@ def orchestrate_runtime_smoke(
     own runtime-verification skip_conditions.
 
     ``canonical_task_id``/``canonical_activity_id`` (Issue #2744, added for
-    live-runtime testability -- purely additive, both default ``None``):
-    ``roll_up_runtime_smoke_execution_run``'s own docstring requires the
-    canonical ``execution_runs`` roll-up row to be attributed to "the
-    caller's own current parent Task/Activity" -- i.e. a Task/Activity pair
-    that ALREADY exists in ``canonical_conn`` before this call (so it is
-    already present in both the ``before`` and ``after``
-    ``snapshot_canonical_tables`` snapshots and therefore never itself
-    trips the AC3 ``tasks``/``activities`` byte-identical check below).
-    When both are supplied, this orchestration attributes the roll-up (and
-    the ``canonical_delta_contract`` expected-attribution check) to exactly
-    that pre-existing pair. When omitted (the default), this orchestration
-    keeps its original behavior of reusing the run's OWN isolated smoke-seed
-    ``task_id``/``activity_id`` for the canonical roll-up -- byte-identical
-    to this function's behavior before this parameter existed. Note that
-    default-path reuse only succeeds against a ``canonical_conn`` that
-    happens to already contain a Task/Activity with those exact (isolated,
-    randomly-generated) ids, which no real canonical DB does; a caller
-    driving a genuine live run against a real canonical DB must supply its
-    own pre-existing canonical Task/Activity via these two parameters."""
+    live-runtime testability; PR #2745 OWNER review F4 made both REQUIRED,
+    not Optional/defaulted): ``roll_up_runtime_smoke_execution_run``'s own
+    docstring requires the canonical ``execution_runs`` roll-up row to be
+    attributed to "the caller's own current parent Task/Activity" -- i.e. a
+    Task/Activity pair that ALREADY exists in ``canonical_conn`` before this
+    call (so it is already present in both the ``before`` and ``after``
+    ``snapshot_canonical_tables`` snapshots and therefore never itself trips
+    the AC3 ``tasks``/``activities`` byte-identical check below). This
+    orchestration always attributes the roll-up (and the
+    ``canonical_delta_contract`` expected-attribution check) to exactly this
+    caller-supplied pair -- there is no "reuse this run's OWN isolated
+    smoke-seed ids for the canonical roll-up" fallback mode: PR #2708's
+    original default-path reuse only ever succeeded against a
+    ``canonical_conn`` that happened to already contain a Task/Activity with
+    those exact (isolated, randomly-generated) ids, which no real canonical
+    DB does, so making the parameters Optional/defaulted only deferred a
+    guaranteed ``NotFoundError`` from call time to roll-up time, AFTER the
+    real seed/subprocess launch had already run (PR #2745 review finding).
+    Both ids are validated -- via ``task_context_service.get_task``/
+    ``get_activity`` against ``canonical_conn`` (each raising
+    ``errors.NotFoundError`` if absent) plus an explicit
+    ``activity["task_id"] == canonical_task_id`` cross-check -- BEFORE the
+    ``smoke seed`` subprocess or the real runtime-smoke subprocess launch
+    below, so an invalid pair is rejected before either side effect, never
+    after."""
     violations: list[str] = []
+
+    if not canonical_task_id:
+        raise ValueError("canonical_task_id is required and must be non-empty")
+    if not canonical_activity_id:
+        raise ValueError("canonical_activity_id is required and must be non-empty")
+    # PR #2745 OWNER review (F4): validated against canonical_conn BEFORE any
+    # seed/subprocess side effect below -- service.get_task/get_activity each
+    # raise errors.NotFoundError when the id does not exist in this
+    # canonical DB, and the explicit task_id cross-check below catches a
+    # syntactically-valid-but-mismatched pair (an Activity that belongs to a
+    # DIFFERENT Task than the supplied canonical_task_id).
+    service.get_task(canonical_conn, canonical_task_id)
+    canonical_activity_row = service.get_activity(canonical_conn, canonical_activity_id)
+    if canonical_activity_row["task_id"] != canonical_task_id:
+        raise ValueError(
+            f"canonical_activity_id {canonical_activity_id!r} belongs to task_id "
+            f"{canonical_activity_row['task_id']!r}, not the supplied canonical_task_id "
+            f"{canonical_task_id!r}"
+        )
 
     state_root = build_isolated_state_root(base_dir, run_id=run_id)
     if is_state_root_materialized(state_root):
@@ -750,12 +775,35 @@ def orchestrate_runtime_smoke(
     env = build_isolated_env(state_root)
 
     seed = invoke_smoke_seed(env, title="runtime-smoke orchestration seed")
+    # PR #2745 OWNER review (F4): the run's OWN isolated smoke-seed task_id
+    # is still needed below (evidence_json_path naming); its activity_id is
+    # no longer read here now that canonical_task_id/canonical_activity_id
+    # are required and always used for the roll-up (no more "reuse the
+    # run's own isolated seed ids" fallback -- see docstring above).
     task_id = seed["data"]["task_id"]
-    activity_id = seed["data"]["activity_id"]
 
     before = snapshot_canonical_tables(canonical_conn)
 
     evidence_json_path = Path(base_dir) / f"runner-evidence-{run_id or task_id}.json"
+    # PR #2745 OWNER review (F2, https://github.com/squne121/loop-protocol/pull/2745#issuecomment-5816561294):
+    # the two reserved carrier flags (``--task-context-scope``/
+    # ``--task-context-state-root``) are placed LAST, strictly AFTER
+    # ``runner_argv_extra``, not before it. The generic runner's own
+    # ``argparse``-based CLI (unmodified -- Out of Scope, #2568/PR #2708
+    # responsibility boundary) resolves a repeated option to its LAST
+    # occurrence ("last flag wins"); putting the reserved pair first (as
+    # before this fix) meant a caller-supplied ``runner_argv_extra``
+    # containing the SAME option names could silently shadow the canonical
+    # scope/state-root values the child generic runner actually acts on --
+    # while a naive check of "is the flag present in argv" (its FIRST
+    # occurrence) would still find the canonical pair and wrongly report
+    # this canonical carrier contract intact. Ordering the reserved pair
+    # last, using the exact same standard argparse last-occurrence-wins
+    # behavior (not a new validation/rejection mechanism), makes the
+    # canonical values the ones the child generic runner actually parses,
+    # regardless of what ``runner_argv_extra`` contains -- this is a narrow
+    # ordering fix to THIS module's own argv construction, not a change to
+    # the generic runner's own option parsing/defaults.
     argv = [
         "--runtime", "claude",
         "--mode", "structured",
@@ -764,9 +812,9 @@ def orchestrate_runtime_smoke(
         "--output-dir", output_dir,
         "--timeout-seconds", str(int(timeout_seconds)),
         "--evidence-json", str(evidence_json_path),
+        *(runner_argv_extra or []),
         "--task-context-scope", config.RUNTIME_SMOKE_SCOPE_VALUE,
         "--task-context-state-root", str(state_root),
-        *(runner_argv_extra or []),
     ]
     proc = invoke_generic_runner(argv, timeout_seconds=timeout_seconds + 60.0)
     runner_evidence = _read_evidence_json(evidence_json_path)
@@ -776,12 +824,12 @@ def orchestrate_runtime_smoke(
         )
     claude_session_id = (runner_evidence or {}).get("parent_session_id")
 
-    # See the ``canonical_task_id``/``canonical_activity_id`` docstring note
-    # above: prefer the caller-supplied pre-existing canonical pair when
-    # given; fall back to this run's own isolated seed ids otherwise
-    # (byte-identical to this function's pre-Issue-#2744 default behavior).
-    roll_up_task_id = canonical_task_id if canonical_task_id is not None else task_id
-    roll_up_activity_id = canonical_activity_id if canonical_activity_id is not None else activity_id
+    # PR #2745 OWNER review (F4): canonical_task_id/canonical_activity_id are
+    # now required and already validated against canonical_conn above --
+    # always attribute the roll-up to exactly that caller-supplied pair (no
+    # "reuse this run's own isolated seed ids" fallback -- see docstring).
+    roll_up_task_id = canonical_task_id
+    roll_up_activity_id = canonical_activity_id
     roll_up_runtime_smoke_execution_run(canonical_conn, task_id=roll_up_task_id, activity_id=roll_up_activity_id)
 
     after = snapshot_canonical_tables(canonical_conn)

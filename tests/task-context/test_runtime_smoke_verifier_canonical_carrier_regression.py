@@ -29,7 +29,9 @@ DB) is Issue #2744 AC2, covered separately by
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
+import sys
 from pathlib import Path
 
 import task_context_config as config  # noqa: E402
@@ -37,6 +39,26 @@ import task_context_db as db  # noqa: E402
 import task_context_migration_runner as migration_runner  # noqa: E402
 import task_context_runtime_smoke_verifier as verifier  # noqa: E402
 import task_context_service as service  # noqa: E402
+
+_TESTS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _TESTS_DIR.parents[1]
+_RUNNER_PATH = _REPO_ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
+
+# PR #2745 OWNER review (F2, https://github.com/squne121/loop-protocol/pull/2745#issuecomment-5816561294):
+# a fresh, uniquely-named module load of the generic runner (same
+# bare-module-name-collision-avoidance pattern already used by
+# ``test_runtime_smoke_verifier_live_shadow_isolation.py``), reused ONLY to
+# call its own real ``build_parser()`` -- never to re-derive or duplicate its
+# argv-parsing semantics. This lets the adversarial test below assert on the
+# EFFECTIVE value the generic runner itself would parse (its own last-flag-
+# wins ``argparse`` behavior), not merely on argv's first textual occurrence
+# of a flag name.
+_MODULE_NAME = "run_worktree_agent_runtime_smoke_issue_2744_canonical_carrier_regression"
+_spec = importlib.util.spec_from_file_location(_MODULE_NAME, _RUNNER_PATH)
+assert _spec is not None and _spec.loader is not None
+_runner_module = importlib.util.module_from_spec(_spec)
+sys.modules[_MODULE_NAME] = _runner_module
+_spec.loader.exec_module(_runner_module)
 
 
 def _open_canonical_conn(tmp_path: Path):
@@ -228,5 +250,86 @@ def test_given_caller_supplied_extra_argv_when_orchestrate_runtime_smoke_invoked
         assert argv[argv.index("--task-context-scope") + 1] == config.RUNTIME_SMOKE_SCOPE_VALUE
         assert "--task-context-state-root" in argv
         assert Path(argv[argv.index("--task-context-state-root") + 1]).is_absolute()
+    finally:
+        canonical_conn.close()
+
+
+def test_given_adversarial_extra_argv_reuses_reserved_flag_names_when_orchestrate_runtime_smoke_invoked_then_generic_runner_effective_parsed_value_still_canonical(
+    tmp_path, monkeypatch
+):
+    """PR #2745 OWNER review (F2, https://github.com/squne121/loop-protocol/pull/2745#issuecomment-5816561294):
+    GIVEN a caller passes ``runner_argv_extra`` that adversarially reuses the
+    SAME reserved option names this module owns (``--task-context-scope``
+    with a DIFFERENT value, ``--task-context-state-root`` with a DIFFERENT
+    path) rather than merely an unrelated extra flag
+    WHEN orchestrate_runtime_smoke() builds the child argv AND the generic
+    runner's own real ``build_parser()`` (unmodified, imported as-is -- never
+    re-derived) parses that exact captured argv
+    THEN the EFFECTIVE parsed values (``Namespace.task_context_scope`` /
+    ``Namespace.task_context_state_root`` -- i.e. what the child generic
+    runner itself would actually act on, not just argv's first textual
+    occurrence of either flag name) are still the canonical
+    ``runtime_smoke`` scope and the canonical run-scoped isolated state root
+    -- never the caller-supplied adversarial values. A prior version of this
+    regression suite only checked ``argv.index(...)``'s FIRST occurrence,
+    which cannot detect a later, effective-value-shadowing duplicate."""
+    canonical_conn, _canonical_db_file = _open_canonical_conn(tmp_path)
+    try:
+        canonical_task_id, canonical_activity_id = _seed_canonical_task_activity(canonical_conn)
+
+        captured_argv: list[list[str]] = []
+        monkeypatch.setattr(
+            verifier, "invoke_generic_runner", _fake_invoke_generic_runner_factory(captured_argv)
+        )
+
+        base_dir = tmp_path / "runtime-smoke-base"
+        base_dir.mkdir()
+        run_id = "det-run-adversarial-extra-argv"
+        expected_state_root = verifier.build_isolated_state_root(base_dir, run_id=run_id)
+
+        adversarial_state_root = str(tmp_path / "adversarial-caller-supplied-state-root")
+        verifier.orchestrate_runtime_smoke(
+            canonical_conn,
+            worktree=str(tmp_path),
+            base_dir=base_dir,
+            prompt_file=str(tmp_path / "prompt.txt"),
+            output_dir=str(tmp_path / "output"),
+            run_id=run_id,
+            timeout_seconds=5.0,
+            runner_argv_extra=[
+                "--max-turns", "3",
+                "--task-context-scope", "adversarial-not-runtime-smoke",
+                "--task-context-state-root", adversarial_state_root,
+            ],
+            canonical_task_id=canonical_task_id,
+            canonical_activity_id=canonical_activity_id,
+        )
+
+        assert len(captured_argv) == 1
+        argv = captured_argv[0]
+
+        # Both the caller-supplied adversarial pair AND the canonical
+        # reserved pair are present SOMEWHERE in argv (this module never
+        # drops or rejects runner_argv_extra) -- the property under test is
+        # which one the generic runner's OWN parser resolves to.
+        assert argv.count("--task-context-scope") == 2, (
+            f"expected the adversarial AND canonical --task-context-scope occurrences both present, got: {argv}"
+        )
+        assert argv.count("--task-context-state-root") == 2, (
+            f"expected the adversarial AND canonical --task-context-state-root occurrences both present, got: {argv}"
+        )
+
+        parser = _runner_module.build_parser()
+        parsed, _unrecognized = parser.parse_known_args(argv)
+        assert parsed.task_context_scope == config.RUNTIME_SMOKE_SCOPE_VALUE, (
+            "the generic runner's OWN parser must resolve --task-context-scope to the canonical value "
+            f"even though runner_argv_extra supplied an adversarial duplicate first; got {parsed.task_context_scope!r}"
+        )
+        assert parsed.task_context_state_root == str(expected_state_root), (
+            "the generic runner's OWN parser must resolve --task-context-state-root to the canonical "
+            "run-scoped isolated path even though runner_argv_extra supplied an adversarial duplicate "
+            f"first; got {parsed.task_context_state_root!r}"
+        )
+        assert parsed.task_context_state_root != adversarial_state_root
     finally:
         canonical_conn.close()
