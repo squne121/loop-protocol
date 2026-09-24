@@ -718,7 +718,7 @@ ExecutionRun → Binding → canonical Task を transaction 内で解決する�
   Activity を select/create して `cleanup_started` を journal する。merge 済みで
   cleanup 未完了の OPEN Task は derived `CLEANUP_PENDING` である。
 
-## Native profile migration contract（Issue #2569 AC13/AC14）
+## Native profile migration contract（Native プロファイルの移行契約、Issue #2569 AC13/AC14）
 
 `execution_runs.runtime_profile` / `resume_profile` の Native ExecutionRun 向け
 値は、read-time compatibility と new-write normalization の 2 段構えである。
@@ -775,7 +775,7 @@ authority にしない」）。同一 tab 上で新しい session id を伴う�
 挙動）は、session id ベース解決が unmatched のまま従来の locator ベース
 解決へ自然にフォールバックするため、既存契約は変更されない。
 
-## Cold-restart resume dispatcher（Issue #2569）
+## Cold-restart resume dispatcher（コールドリスタート再開ディスパッチャー、Issue #2569）
 
 `scripts/task-context/task_context_resume_dispatcher.py` は、Herdr cold
 restart 後に保存済み `agent_session`（＝過去の `claude_session_id`）を
@@ -805,7 +805,7 @@ location（`_DISPATCHER_REPO_ANCHOR_CWD = os.path.dirname(__file__)`）を
 （あるいは resume 対象 pane がリポジトリ外の cwd を最後に報告していても）
 同じ state root/DB に解決される。
 
-### 5-way decision table
+### 5-way decision table（5 分岐の判定テーブル）
 
 ```text
 Binding state                     | resolved profile          | dispatcher action
@@ -831,12 +831,16 @@ downgrade してしまう、AC6 が禁ずる挙動そのものになる）。
 (session_id)` はこの分類を実行し、launch 可能な場合のみ Binding を
 `ACTIVE -> RESTORING` へ遷移させる（AC17 の pre-launch half）。
 
-### Two-phase restore state machine（AC17）と failure SSOT（AC16）
+### Two-phase restore state machine（二段階の復元状態遷移、AC17）と failure SSOT（唯一の失敗正本、AC16）
 
-`ACTIVE -> (prepare_managed_resume) -> RESTORING -> profile-specific launch
+以下は状態遷移の概略を示す図であり、各矢印は実装上のフェーズ境界にそのまま対応する。
+
+```text
+ACTIVE -> (prepare_managed_resume) -> RESTORING -> profile-specific launch
 -> SessionStart(source=resume, session_id=S) ACK -> old ExecutionRun
 technical close -> new ExecutionRun (同一 Task/Activity/Binding) -> locator
-re-home -> ACTIVE`。
+re-home -> ACTIVE
+```
 
 - pre-launch half（ACTIVE -> RESTORING、launch 失敗時の RESTORE_BLOCKED
   遷移）は `task_context_resume_dispatcher.py`（`prepare_managed_resume` /
@@ -858,9 +862,9 @@ re-home -> ACTIVE`。
 形状のみを構築する（`herdr` サブコマンド自体を含む完全な argv）。raw
 argv/environment/credential の replay は行わない。
 
-- Native: `["agent", "start", <name>, "--kind", "claude", "--pane",
+- Native（`herdr agent start` 経由で起動する場合の argv）: `["agent", "start", <name>, "--kind", "claude", "--pane",
   pane_id, "--", "--resume", session_id]`
-- Claude-GPT: `["pane", "run", pane_id, str(scripts/claude-gpt/launch.sh),
+- Claude-GPT（`herdr pane run` 経由でラッパースクリプトを起動する場合の argv）: `["pane", "run", pane_id, str(scripts/claude-gpt/launch.sh),
   "--", "--resume", session_id]`
 
 `execute_resume_decision()` がこれを `[herdr_bin, (--session S,) *argv]`
