@@ -39,6 +39,7 @@ Plus the 12 production-shaped fix_delta gates required by OWNER review #3
 
 from __future__ import annotations
 
+import argparse
 import copy
 import dataclasses
 import hashlib
@@ -3913,3 +3914,212 @@ def test_run_cli_shares_frozen_runtime_results_for_two_simultaneous_runtime_sour
     # persisted `source_observations` matches both.
     assert publish_request.run_identity["source_set_digest"] == expected_digest
     assert rr.compute_source_set_digest(observations) == expected_digest
+
+
+# ---------------------------------------------------------------------------
+# Issue #2715: --since-last-retrospective / --enable-full-analysis /
+# --publish-authorized help-string consistency + conditional validation
+# ---------------------------------------------------------------------------
+
+
+def _flag_help(parser: argparse.ArgumentParser, option_string: str) -> str:
+    for action in parser._actions:  # noqa: SLF001 -- test-only introspection, mirrors existing rr._* access pattern
+        if option_string in action.option_strings:
+            assert action.help is not None
+            return action.help
+    raise AssertionError(f"no action registered for {option_string!r}")
+
+
+def test_help_strings_mutually_reference_the_enable_full_analysis_publish_authorized_contract() -> None:
+    # AC1/AC4: the three help strings must not be read in isolation --
+    # each one that participates in the connected full-analysis contract
+    # must point at the others, so the valid combination (AC1) is readable
+    # from any one of the three.
+    parser = rr._build_arg_parser()
+    since_help = _flag_help(parser, "--since-last-retrospective")
+    enable_help = _flag_help(parser, "--enable-full-analysis")
+    publish_help = _flag_help(parser, "--publish-authorized")
+
+    assert "--enable-full-analysis" in since_help
+    assert "--publish-authorized" in since_help
+    assert "--publish-authorized" in enable_help
+    assert "--repository-id" in enable_help and "--target-issue" in enable_help
+    assert "--enable-full-analysis" in publish_help
+
+
+def test_help_strings_document_enable_full_analysis_rejection_without_publish_authorized() -> None:
+    # AC1/AC2: --enable-full-analysis's own help must state that omitting
+    # --publish-authorized is rejected (parser.error()/SystemExit(2)),
+    # never described as an accepted/no-op combination.
+    parser = rr._build_arg_parser()
+    enable_help = _flag_help(parser, "--enable-full-analysis")
+    assert "parser.error" in enable_help
+    assert "SystemExit(2)" in enable_help
+
+
+def test_publish_authorized_help_documents_full_analysis_gate_watermark_writeback_and_publication_boundary() -> (
+    None
+):
+    # Issue #2715 fix_delta (PR #2738 REQUEST_CHANGES): --publish-authorized's
+    # help previously said this flag "is NOT limited to authorizing GitHub
+    # comment publication" -- wording that misreads as this flag ALSO
+    # authorizing GitHub comment publication (just not exclusively). It does
+    # not: GitHub publication is a separate, human-authorized channel this
+    # flag never touches. The help must instead separately document (1) that
+    # this flag gates whether --enable-full-analysis's connected pipeline
+    # attempt is invoked at all, (2) that a supplied --prior-watermark-file
+    # may be written back to when checkpoint advancement occurs (a purely
+    # local effect, no GitHub interaction), and (3) that GitHub publication
+    # itself remains a separate, human-authorized, proposal-only channel this
+    # flag does not authorize or perform.
+    parser = rr._build_arg_parser()
+    publish_help = _flag_help(parser, "--publish-authorized")
+    # (1) gates the connected full-analysis pipeline attempt
+    assert "--enable-full-analysis" in publish_help
+    assert "pipeline attempt is invoked" in publish_help
+    # (2) conditional watermark/checkpoint write-back is a local file effect
+    assert "--prior-watermark-file" in publish_help
+    assert "written back" in publish_help
+    # (3) does not authorize/perform GitHub publication; proposal-only boundary
+    assert "does NOT authorize or perform GitHub" in publish_help
+    assert "proposal-only" in publish_help
+    assert "authorization_required=True" in publish_help
+    assert "separate, human-authorized publish channel" in publish_help
+    # the misleading old phrasing (readable as "this flag DOES authorize
+    # GitHub comment publication, just not ONLY that") must be fully gone
+    assert "NOT limited to authorizing GitHub comment publication" not in publish_help
+
+
+def test_since_last_retrospective_help_does_not_unconditionally_claim_identifiers_are_ignored() -> None:
+    # AC1/AC4: the old wording unconditionally said the full-analysis
+    # identifiers "are ignored" when --since-last-retrospective is set --
+    # that is false once --enable-full-analysis is ALSO supplied (Issue
+    # #2644). The help text must scope that claim to the "by itself" case
+    # and cross-reference the combined case.
+    parser = rr._build_arg_parser()
+    since_help = _flag_help(parser, "--since-last-retrospective")
+    assert "BY ITSELF" in since_help
+    assert "required again" in since_help
+
+
+def test_enable_full_analysis_without_publish_authorized_rejected(capsys: pytest.CaptureFixture[str]) -> None:
+    # AC2/AC3: --enable-full-analysis without --publish-authorized is
+    # rejected via the existing parser.error()/SystemExit(2) pattern
+    # (never a success/no-op), even when every other required identifier
+    # is supplied.
+    with pytest.raises(SystemExit) as excinfo:
+        rr.main(
+            [
+                "--since-last-retrospective",
+                "--enable-full-analysis",
+                "--repository-id",
+                "squne121/loop-protocol",
+                "--target-issue",
+                "2715",
+                "--request-id",
+                "req-2715",
+                "--idempotency-key",
+                "idem-2715",
+            ]
+        )
+    assert excinfo.value.code == 2
+    # PR #2738 REQUEST_CHANGES: a bare `"--publish-authorized" in stderr`
+    # substring check is a false-green -- argparse's own usage line already
+    # contains the flag name regardless of which error fired. Assert the
+    # actual LAST stderr line (the `parser.error()` message itself) instead.
+    error_line = capsys.readouterr().err.rstrip().splitlines()[-1]
+    assert error_line.endswith("error: --enable-full-analysis requires: --publish-authorized")
+
+
+def test_enable_full_analysis_without_publish_authorized_rejected_without_since_last_retrospective(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # AC2: the rejection is not conditioned on --since-last-retrospective
+    # also being supplied -- a bare --enable-full-analysis invocation is
+    # rejected the same way.
+    with pytest.raises(SystemExit) as excinfo:
+        rr.main(["--enable-full-analysis"])
+    assert excinfo.value.code == 2
+    # PR #2738 REQUEST_CHANGES: same false-green concern as the sibling test
+    # above -- verify the actual last error line, not a usage-line substring.
+    error_line = capsys.readouterr().err.rstrip().splitlines()[-1]
+    assert error_line.endswith("error: --enable-full-analysis requires: --publish-authorized")
+
+
+def test_enable_full_analysis_with_publish_authorized_still_requires_identifiers(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # AC3/AC7: the NEW --publish-authorized validation must not weaken the
+    # PRE-EXISTING Issue #2644 required-identifiers validation --
+    # supplying --publish-authorized alone is still insufficient.
+    with pytest.raises(SystemExit) as excinfo:
+        rr.main(["--since-last-retrospective", "--enable-full-analysis", "--publish-authorized"])
+    assert excinfo.value.code == 2
+    # PR #2738 REQUEST_CHANGES: verify the actual last error line names the
+    # missing identifiers, rather than a usage-line substring match on
+    # "--repository-id" that would also pass for an unrelated error.
+    error_line = capsys.readouterr().err.rstrip().splitlines()[-1]
+    assert error_line.endswith(
+        "error: --enable-full-analysis requires: "
+        "--repository-id, --target-issue, --request-id, --idempotency-key"
+    )
+
+
+def test_enable_full_analysis_valid_combination_reaches_analysis_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC1: the fully-valid combination (all three flags + required
+    # identifiers) must reach `run_since_last_retrospective_cli()` with a
+    # real `analysis_runner` and `publish_authorized=True` -- the new
+    # validation must never reject a legitimate invocation.
+    captured: dict[str, Any] = {}
+
+    def _fake_run_since_last_retrospective_cli(**kwargs: Any) -> dict[str, Any]:
+        captured["publish_authorized"] = kwargs["publish_authorized"]
+        captured["analysis_runner_supplied"] = kwargs["analysis_runner"] is not None
+        return {"schema_version": "session_window_coverage/v1"}
+
+    monkeypatch.setattr(rr, "run_since_last_retrospective_cli", _fake_run_since_last_retrospective_cli)
+
+    exit_code = rr.main(
+        [
+            "--since-last-retrospective",
+            "--enable-full-analysis",
+            "--publish-authorized",
+            "--repository-id",
+            "squne121/loop-protocol",
+            "--target-issue",
+            "2715",
+            "--request-id",
+            "req-2715",
+            "--idempotency-key",
+            "idem-2715",
+            "--state-backend",
+            "fixture",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["publish_authorized"] is True
+    assert captured["analysis_runner_supplied"] is True
+
+
+def test_since_last_retrospective_alone_is_unaffected_by_new_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC6: a coverage-only invocation (--since-last-retrospective without
+    # --enable-full-analysis) must be completely unaffected by the new
+    # conditional validation -- `analysis_runner` stays `None` and no
+    # SystemExit is raised.
+    captured: dict[str, Any] = {}
+
+    def _fake_run_since_last_retrospective_cli(**kwargs: Any) -> dict[str, Any]:
+        captured["analysis_runner"] = kwargs["analysis_runner"]
+        return {"schema_version": "session_window_coverage/v1"}
+
+    monkeypatch.setattr(rr, "run_since_last_retrospective_cli", _fake_run_since_last_retrospective_cli)
+
+    exit_code = rr.main(["--since-last-retrospective"])
+
+    assert exit_code == 0
+    assert captured["analysis_runner"] is None

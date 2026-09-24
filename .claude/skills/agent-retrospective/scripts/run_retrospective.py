@@ -5315,13 +5315,14 @@ def run_cli(
     return publish_request
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Stable executable entrypoint (Issue #2237 P0-2). The root Skill (see
-    ``SKILL.md``'s Procedure) invokes this via a single Bash call; this
-    module owns everything downstream. Prints the ``PublishRequest``
-    envelope (success) or a typed ``{"status": "failed", "reason_code":
-    ..., "reason": ...}`` payload (failure) to stdout; exit code is ``0`` on
-    success and ``1`` on any typed phase failure."""
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Issue #2715: factored out of ``main()`` so tests can inspect each
+    flag's raw ``help`` string directly (unwrapped by argparse's
+    ``HelpFormatter``) to assert the ``--since-last-retrospective``/
+    ``--enable-full-analysis``/``--publish-authorized`` help strings stay
+    mutually consistent, rather than parsing ``--help``'s line-wrapped
+    stdout. Behavior-preserving: ``main()`` still builds/parses argv exactly
+    as before, just via this factory."""
     parser = argparse.ArgumentParser(
         prog="run_retrospective.py",
         description=(
@@ -5336,9 +5337,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=(
             "Issue #2601: session-window coverage mode. Computes per-source session coverage / "
             "watermark / checkpoint-advancement disposition via the existing collector adapters "
-            "instead of running the full observer/evaluator Agent pipeline. When set, "
-            "--repository-id/--target-issue/--request-id/--idempotency-key/--schema-dir/"
-            "--prompts-file/--state-backend are not required and are ignored."
+            "instead of running the full observer/evaluator Agent pipeline. When set BY ITSELF "
+            "(without --enable-full-analysis), --repository-id/--target-issue/--request-id/"
+            "--idempotency-key/--schema-dir/--prompts-file/--state-backend are not required and "
+            "are ignored. Issue #2715: when ALSO combined with --enable-full-analysis (which in "
+            "turn requires --publish-authorized -- see --enable-full-analysis's help), "
+            "--repository-id/--target-issue/--request-id/--idempotency-key become required again, "
+            "because that combination connects this coverage run into the full observer/evaluator/"
+            "finalize Agent pipeline those identifiers drive."
         ),
     )
     parser.add_argument(
@@ -5365,7 +5371,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "already-selected session collector_results into run_cli()'s full observer/evaluator/"
             "finalize pipeline (via build_since_last_analysis_runner()) before committing the "
             "checkpoint/watermark -- requires --repository-id/--target-issue/--request-id/"
-            "--idempotency-key to also be supplied. Omitted (default, PR #2660 fix_delta P1-1): "
+            "--idempotency-key to also be supplied, AND requires --publish-authorized to also be "
+            "set (Issue #2715: --enable-full-analysis WITHOUT --publish-authorized is rejected via "
+            "parser.error()/SystemExit(2) rather than silently degrading to coverage-only, because "
+            "this pipeline connection is only ever attempted when publish_authorized is True -- see "
+            "--publish-authorized's help). Omitted (default, PR #2660 fix_delta P1-1): "
             "--since-last-retrospective stays COVERAGE-ONLY -- it never invokes the Agent pipeline "
             "AND never durably advances the checkpoint/watermark (checkpoint_advance_reason is "
             "forced to blocked_evaluation_failure whenever coverage/authorization alone would have "
@@ -5376,9 +5386,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--publish-authorized",
         action="store_true",
         help=(
-            "Authorizes checkpoint advancement to be reported as durable (default: False -- a "
-            "proposal-only result; the actual durable persistence write is a separate, "
-            "human-authorized publish channel, out of this Issue's scope)."
+            "Issue #2715 fix_delta (PR #2738 REQUEST_CHANGES): this flag has THREE distinct "
+            "effects, none of which is authorizing GitHub comment publication itself. "
+            "(1) Gates whether --enable-full-analysis's connected observer/evaluator/finalize "
+            "pipeline attempt is invoked at all -- --enable-full-analysis without this flag is "
+            "rejected at parse time (parser.error()/SystemExit(2)) rather than silently running "
+            "as a no-op coverage-only pass. (2) When --prior-watermark-file is also supplied and "
+            "this run's checkpoint disposition advances (coverage/regression checks pass AND this "
+            "flag is True), the new watermark is written back to that SAME local file path "
+            "(temp-file + os.replace) -- this local write-back happens ENTIRELY within this CLI "
+            "invocation, with no GitHub interaction. (3) It does NOT authorize or perform GitHub "
+            "publication: the PublishRequest this run may produce is always proposal-only "
+            "(authorization_required=True) regardless of this flag -- the actual durable "
+            "persistence write to GitHub is a separate, human-authorized publish channel, out of "
+            "this Issue's scope. Default: False."
         ),
     )
     parser.add_argument("--repository-id", required=False)
@@ -5402,7 +5423,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             "'--state-backend fixture' explicitly."
         ),
     )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Stable executable entrypoint (Issue #2237 P0-2). The root Skill (see
+    ``SKILL.md``'s Procedure) invokes this via a single Bash call; this
+    module owns everything downstream. Prints the ``PublishRequest``
+    envelope (success) or a typed ``{"status": "failed", "reason_code":
+    ..., "reason": ...}`` payload (failure) to stdout; exit code is ``0`` on
+    success and ``1`` on any typed phase failure."""
+    parser = _build_arg_parser()
     args = parser.parse_args(argv)
+
+    # Issue #2715: --enable-full-analysis's connected full observer/
+    # evaluator/finalize pipeline attempt is only ever invoked when
+    # publish_authorized is True (see run_since_last_retrospective_cli's
+    # docstring) -- accepting --enable-full-analysis without
+    # --publish-authorized would otherwise silently run as a no-op
+    # (coverage-only) success. Reject at parse time instead, matching the
+    # existing parser.error()/SystemExit(2) pattern used below for the
+    # other --enable-full-analysis precondition (missing identifiers).
+    if args.enable_full_analysis and not args.publish_authorized:
+        parser.error("--enable-full-analysis requires: --publish-authorized")
 
     if args.since_last_retrospective:
         # Issue #2601: session-window coverage mode. Never raises (AC2) --
