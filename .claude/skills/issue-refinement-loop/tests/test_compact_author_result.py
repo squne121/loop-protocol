@@ -29,6 +29,7 @@ from compact_author_result import (
     COMPACT_SCHEMA_VERSION,
     REQUIRED_COMPACT_FIELDS,
     _atomic_write,
+    _no_secret_check,
     compact_author_result,
 )
 
@@ -339,3 +340,39 @@ def test_compact_author_result_rejects_absolute_path():
     from compact_author_result import _validate_artifact_path
     with pytest.raises(ValueError, match="Absolute"):
         _validate_artifact_path("/etc/passwd")
+
+
+# ---------------------------------------------------------------------------
+# #2726: ghs_ pattern widened to detect new-format ghs_<APP_ID>_<JWT> tokens
+# ---------------------------------------------------------------------------
+
+
+def test_no_secret_check_detects_new_format_ghs_installation_token():
+    """GIVEN new-format ghs_<APP_ID>_<JWT> token with '_', '.', '-' chars
+    WHEN _no_secret_check called THEN 'GitHub server token' violation detected (AC2)."""
+    new_format_token = "ghs_123456789_abcDEF-ghi.JKL_mno789PQRstuVWXyz0123"
+    violations = _no_secret_check(new_format_token)
+    assert "GitHub server token" in violations
+
+
+def test_no_secret_check_detects_legacy_ghs_token():
+    """GIVEN legacy fixed-length classic ghs_ token (ghs_ + 36 alnum chars)
+    WHEN _no_secret_check called THEN 'GitHub server token' violation still detected (AC4)."""
+    legacy = "ghs_" + "A" * 36
+    violations = _no_secret_check(legacy)
+    assert "GitHub server token" in violations
+
+
+def test_compact_author_result_new_format_ghs_token_raises_valueerror(tmp_path):
+    """GIVEN artifact pass-through field containing a new-format ghs_<APP_ID>_<JWT> token
+    WHEN compact_author_result called THEN ValueError raised and no success artifact
+    content is generated (fail-closed semantics maintained, AC3)."""
+    new_format_token = "ghs_987654321_zyxWVU-tsr.qpo_nml654KJIhgfEDCba9876"
+    raw_result = {
+        "status": "ok",
+        "checked_body_sha256": "abc123def456abc123def456abc123def456abc123def456abc123def456abc123",
+        "mutation_result": {"diff_summary": f"token: {new_format_token}"},
+    }
+    artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
+    with pytest.raises(ValueError, match="secret-like strings detected in artifact content"):
+        compact_author_result(raw_result, artifact_dir=artifact_dir, issue_number=42)
