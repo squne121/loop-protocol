@@ -440,7 +440,7 @@ def test_default_claude_code_sessions_dir_env_override_takes_precedence(tmp_path
 
 def test_default_claude_code_sessions_dir_falls_back_to_home_convention(tmp_path):
     resolved = rr.default_claude_code_sessions_dir({"HOME": str(tmp_path)}, repo_root=tmp_path)
-    expected_slug = str(tmp_path.resolve()).replace("/", "-")
+    expected_slug = rr._claude_code_project_slug(tmp_path)
     assert resolved == tmp_path / ".claude" / "projects" / expected_slug
 
 
@@ -488,7 +488,7 @@ def test_collect_session_sources_unwired_when_env_unresolvable(tmp_path):
 
 
 def test_collect_session_sources_wires_real_claude_code_collector(tmp_path):
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -578,7 +578,7 @@ def test_collect_session_sources_applies_window_bounds_to_claude_code(tmp_path):
     window bounds into `resolve_claude_code_session_paths` -- a source that
     globs to 2 files unconditionally globs to only the in-window one when a
     window is supplied."""
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "old.jsonl").write_text(
@@ -609,7 +609,7 @@ def test_run_since_last_retrospective_cli_second_run_excludes_prior_window_sessi
     than an unbounded first run -- not the same "all sessions" result every
     time (the exact false-green Finding 1 identified)."""
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "before.jsonl").write_text(
@@ -767,7 +767,7 @@ def test_run_since_last_retrospective_cli_claude_gpt_uses_real_nonce_not_run_id(
 
 def test_run_since_last_retrospective_cli_writes_watermark_file_on_advancement(tmp_path):
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -799,7 +799,7 @@ def test_run_since_last_retrospective_cli_coverage_only_never_advances_checkpoin
     checkpoint or write the watermark file, since observer/evaluator/finalize
     never ran."""
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -844,7 +844,7 @@ def test_run_since_last_retrospective_cli_second_invocation_reads_back_written_w
     supply a (stub) successful analysis_runner, since coverage-only
     invocations can no longer durably write the watermark at all."""
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -925,7 +925,7 @@ def test_run_since_last_retrospective_cli_missing_watermark_file_with_wired_coll
     successful analysis_runner, since coverage alone can no longer advance
     the checkpoint."""
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -1065,7 +1065,7 @@ def test_compute_session_window_reuses_supplied_window_end_verbatim():
 
 def test_ac5_guard_still_blocks_after_selector_fix_when_source_regresses(tmp_path):
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -1111,7 +1111,7 @@ def test_run_since_last_retrospective_cli_end_to_end_complete_with_real_session_
     to actually reach `checkpoint_advanced: True` -- coverage alone
     (`analysis_completeness: "complete"`) is no longer sufficient."""
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -1155,3 +1155,345 @@ def test_main_since_last_retrospective_flag_bypasses_required_target_issue_args(
 def test_main_default_mode_still_requires_target_issue_args():
     with pytest.raises(SystemExit):
         rr.main(["--repo-root", str(_SKILL_DIR)])
+
+
+# ---------------------------------------------------------------------------
+# Issue #2714: Claude Code top-level physical discovery and fail-safe logical
+# grouping. These cases use real JSONL fixture files and production collector
+# wiring; no public schema or collect_snapshot provenance semantics change.
+# ---------------------------------------------------------------------------
+
+
+def _write_claude_code_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+
+def _claude_code_sessions_dir(tmp_path: Path) -> Path:
+    sessions_dir = tmp_path / ".claude" / "projects" / rr._claude_code_project_slug(tmp_path)
+    sessions_dir.mkdir(parents=True)
+    return sessions_dir
+
+
+def test_claude_code_project_slug_normalizes_non_alphanumeric_for_bounded_paths():
+    assert rr._claude_code_project_slug(Path("/home/squne/projects/LOOP_PROTOCOL")) == (
+        "-home-squne-projects-LOOP-PROTOCOL"
+    )
+    assert rr._claude_code_project_slug(Path("/home/squne/project.v1_name")) == "-home-squne-project-v1-name"
+
+
+def test_claude_code_paths_are_top_level_only_before_existing_window_filter(tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    nested_dir = sessions_dir / "any-nested-directory"
+    nested_dir.mkdir(parents=True)
+    _write_claude_code_jsonl(
+        sessions_dir / "in-window.jsonl", [{"timestamp": "2026-06-15T00:00:00Z", "sessionId": "in"}]
+    )
+    _write_claude_code_jsonl(
+        sessions_dir / "out-of-window.jsonl", [{"timestamp": "2026-05-15T00:00:00Z", "sessionId": "out"}]
+    )
+    _write_claude_code_jsonl(
+        nested_dir / "nested.jsonl", [{"timestamp": "2026-06-15T00:00:00Z", "sessionId": "nested"}]
+    )
+
+    paths = rr.resolve_claude_code_session_paths(
+        sessions_dir,
+        min_completed_at="2026-06-01T00:00:00Z",
+        max_completed_at="2026-07-01T00:00:00Z",
+    )
+    assert [path.name for path in paths] == ["in-window.jsonl"]
+
+
+def test_claude_code_logical_identity_grouping_fail_safe_matrix(tmp_path):
+    def count_for(name: str, record_sets: list[list[dict[str, Any]]]) -> int:
+        directory = tmp_path / name
+        directory.mkdir()
+        paths = []
+        for index, records in enumerate(record_sets):
+            path = directory / f"{index}.jsonl"
+            _write_claude_code_jsonl(path, records)
+            paths.append(path)
+        return rr._claude_code_logical_session_count(paths)
+
+    assert count_for("same", [[{"sessionId": "same"}], [{"sessionId": "same"}]]) == 1
+    assert count_for("different", [[{"sessionId": "one"}], [{"sessionId": "two"}]]) == 2
+    assert count_for("missing", [[{"type": "user"}], [{"type": "assistant"}]]) == 2
+    assert count_for("conflicting", [[{"sessionId": "shared"}, {"sessionId": "other"}], [{"sessionId": "shared"}]]) == 2
+
+    absent_values: list[Any] = [None, 1, {}, [], True, "", "   "]
+    assert count_for("absent-values", [[{"sessionId": value}] for value in absent_values]) == len(absent_values)
+    assert count_for("raw-not-trimmed", [[{"sessionId": "same"}], [{"sessionId": " same "}]]) == 2
+
+
+def test_claude_code_logical_count_reaches_public_coverage_without_schema_change(tmp_path):
+    sessions_dir = _claude_code_sessions_dir(tmp_path)
+    _write_claude_code_jsonl(sessions_dir / "one.jsonl", [{"sessionId": "logical-id"}])
+    _write_claude_code_jsonl(sessions_dir / "two.jsonl", [{"sessionId": "logical-id"}])
+
+    results = rr.collect_session_sources(
+        required_sources=["claude_code"], env={"HOME": str(tmp_path)}, repo_root=tmp_path, clock=_clock
+    )
+    collector_result = results["claude_code"]
+    assert collector_result is not None
+    provenance = collector_result.private_evidence["provenance"]
+    assert provenance["session_count"] == 2
+    assert provenance["sessions_read"] == 2
+    assert provenance["logical_session_count"] == 1
+
+    coverage = rr.compute_source_coverage_entry("claude_code", collector_result, required=True)
+    assert coverage["selected_session_count"] == 1
+    assert "logical_session_count" not in coverage
+
+
+def test_claude_code_logical_count_production_path_and_legacy_fallback(tmp_path):
+    sessions_dir = _claude_code_sessions_dir(tmp_path)
+    _write_claude_code_jsonl(sessions_dir / "one.jsonl", [{"sessionId": "same"}])
+    _write_claude_code_jsonl(sessions_dir / "two.jsonl", [{"sessionId": "same"}])
+    result = rr.collect_session_sources(
+        required_sources=["claude_code"], env={"HOME": str(tmp_path)}, repo_root=tmp_path, clock=_clock
+    )["claude_code"]
+    assert result is not None
+    coverage = rr.compute_source_coverage_map(["claude_code"], {"claude_code": result})
+    assert coverage["claude_code"]["selected_session_count"] == 1
+
+    assert rr._selected_session_count("claude_code", {"provenance": {"sessions_read": 3}}) == 3
+    assert rr._selected_session_count("claude_gpt", {"provenance": {"complete_sessions": ["a", "b"]}}) == 2
+
+
+def test_nested_only_claude_code_history_remains_source_not_present(tmp_path):
+    sessions_dir = _claude_code_sessions_dir(tmp_path)
+    nested_dir = sessions_dir / "opaque-child"
+    nested_dir.mkdir()
+    _write_claude_code_jsonl(nested_dir / "nested.jsonl", [{"sessionId": "nested"}])
+
+    result = rr.collect_session_sources(
+        required_sources=["claude_code"], env={"HOME": str(tmp_path)}, repo_root=tmp_path, clock=_clock
+    )["claude_code"]
+    assert result is not None
+    assert result.private_evidence["provenance"]["session_count"] == 0
+    assert result.private_evidence["provenance"]["logical_session_count"] == 0
+    coverage = rr.compute_source_coverage_entry("claude_code", result, required=True)
+    assert coverage == {"status": "unavailable", "reason_code": "source_not_present", "selected_session_count": None}
+
+
+# ---------------------------------------------------------------------------
+# AC8 live-verifier runner (``run_verify_since_last_retrospective_live_cli.py``)
+# regression tests -- PR #2737 review fix_delta, blockers 1 and 2:
+#   Blocker 1: the AC8 target pytest subprocess must not inherit
+#              AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR from the parent
+#              process (a stale test-only override could substitute
+#              fixture/other-project history for the live on-disk evidence).
+#   Blocker 2: PASS/SKIP/FAIL must be decided from a structural --junitxml
+#              report, never from human-readable pytest terminal text (which
+#              PYTEST_ADDOPTS / colored output can reshape).
+# ---------------------------------------------------------------------------
+
+
+def _ac8_live_verifier_runner_module():
+    import importlib.util
+
+    module_name = "agent_retrospective_ac8_live_verifier_runner_for_session_window_coverage_test"
+    module_path = Path(__file__).resolve().parent / "run_verify_since_last_retrospective_live_cli.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+def _single_testcase_junit_xml(
+    name: str, *, failed: bool = False, errored: bool = False, skipped: bool = False
+) -> str:
+    body = ""
+    if failed:
+        body = '<failure message="boom">boom</failure>'
+    elif errored:
+        body = '<error message="boom">boom</error>'
+    elif skipped:
+        body = '<skipped type="pytest.skip" message="skip-reason" />'
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites name="pytest tests">'
+        '<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1">'
+        f'<testcase classname="mod" name="{name}" time="0.0">{body}</testcase>'
+        "</testsuite></testsuites>"
+    )
+
+
+def test_ac8_live_verifier_normal_pass_via_structural_junit_outcome(tmp_path):
+    """Regression #1: a clean single-testcase JUnit report is PASS."""
+    runner = _ac8_live_verifier_runner_module()
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text(_single_testcase_junit_xml(runner._TARGET_TEST_NAME), encoding="utf-8")
+
+    outcome = runner._parse_junit_outcome(junit_path, runner._TARGET_TEST_NAME)
+
+    assert outcome == {"failed": False, "errored": False, "skipped": False}
+    assert runner._pass_observed(0, outcome) is True
+    assert runner._skip_observed(0, outcome) is False
+
+
+def test_ac8_live_verifier_pass_observed_ignores_pytest_addopts_quiet_style_terminal_text(tmp_path):
+    """Regression #2: a `PYTEST_ADDOPTS=-q`-shaped transcript with no
+    recognizable "N passed" summary line must not change the PASS verdict --
+    the verdict comes only from the structural JUnit report."""
+    runner = _ac8_live_verifier_runner_module()
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text(_single_testcase_junit_xml(runner._TARGET_TEST_NAME), encoding="utf-8")
+    outcome = runner._parse_junit_outcome(junit_path, runner._TARGET_TEST_NAME)
+
+    quiet_style_stdout = "."  # `-q -q` / custom reporters can render exactly this
+    assert "passed" not in quiet_style_stdout
+    assert runner._pass_observed(0, outcome) is True
+
+
+def test_ac8_live_verifier_pass_observed_ignores_colored_terminal_output(tmp_path):
+    """Regression #3: colored terminal output cannot influence the verdict --
+    `_pass_observed` / `_skip_observed` never take pytest stdout/stderr as an
+    argument at all."""
+    import inspect
+
+    runner = _ac8_live_verifier_runner_module()
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text(_single_testcase_junit_xml(runner._TARGET_TEST_NAME), encoding="utf-8")
+    outcome = runner._parse_junit_outcome(junit_path, runner._TARGET_TEST_NAME)
+
+    assert set(inspect.signature(runner._pass_observed).parameters) == {"returncode", "outcome"}
+    assert set(inspect.signature(runner._skip_observed).parameters) == {"returncode", "outcome"}
+    assert runner._pass_observed(0, outcome) is True
+
+
+def test_ac8_live_verifier_skip_via_structural_junit_outcome(tmp_path):
+    """Regression #4: a single skipped testcase is SKIP, never PASS."""
+    runner = _ac8_live_verifier_runner_module()
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text(
+        _single_testcase_junit_xml(runner._TARGET_TEST_NAME, skipped=True), encoding="utf-8"
+    )
+
+    outcome = runner._parse_junit_outcome(junit_path, runner._TARGET_TEST_NAME)
+
+    assert outcome == {"failed": False, "errored": False, "skipped": True}
+    assert runner._skip_observed(0, outcome) is True
+    assert runner._pass_observed(0, outcome) is False
+
+
+def test_ac8_live_verifier_fail_and_error_via_structural_junit_outcome(tmp_path):
+    """Regression #5: a failed or errored testcase is never PASS/SKIP."""
+    runner = _ac8_live_verifier_runner_module()
+
+    fail_path = tmp_path / "fail.xml"
+    fail_path.write_text(
+        _single_testcase_junit_xml(runner._TARGET_TEST_NAME, failed=True), encoding="utf-8"
+    )
+    fail_outcome = runner._parse_junit_outcome(fail_path, runner._TARGET_TEST_NAME)
+    assert fail_outcome == {"failed": True, "errored": False, "skipped": False}
+    assert runner._pass_observed(1, fail_outcome) is False
+    assert runner._skip_observed(1, fail_outcome) is False
+
+    error_path = tmp_path / "error.xml"
+    error_path.write_text(
+        _single_testcase_junit_xml(runner._TARGET_TEST_NAME, errored=True), encoding="utf-8"
+    )
+    error_outcome = runner._parse_junit_outcome(error_path, runner._TARGET_TEST_NAME)
+    assert error_outcome == {"failed": False, "errored": True, "skipped": False}
+    assert runner._pass_observed(1, error_outcome) is False
+    assert runner._skip_observed(1, error_outcome) is False
+
+
+def test_ac8_live_verifier_malformed_missing_or_ambiguous_junit_report_fails_closed(tmp_path):
+    """Regression #6: missing / empty / unparsable / zero-testcase /
+    multi-testcase / name-mismatched JUnit reports must all fail closed
+    (``None``), and ``None`` must never be treated as PASS or SKIP even when
+    the pytest process itself returned 0."""
+    runner = _ac8_live_verifier_runner_module()
+    target = runner._TARGET_TEST_NAME
+
+    missing_path = tmp_path / "missing.xml"
+    assert runner._parse_junit_outcome(missing_path, target) is None
+
+    empty_path = tmp_path / "empty.xml"
+    empty_path.write_text("", encoding="utf-8")
+    assert runner._parse_junit_outcome(empty_path, target) is None
+
+    invalid_path = tmp_path / "invalid.xml"
+    invalid_path.write_text("<testsuites><testsuite>", encoding="utf-8")
+    assert runner._parse_junit_outcome(invalid_path, target) is None
+
+    zero_testcases_path = tmp_path / "zero.xml"
+    zero_testcases_path.write_text(
+        '<?xml version="1.0"?><testsuites><testsuite tests="0"></testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    assert runner._parse_junit_outcome(zero_testcases_path, target) is None
+
+    multiple_path = tmp_path / "multiple.xml"
+    multiple_path.write_text(
+        '<?xml version="1.0"?><testsuites><testsuite tests="2">'
+        f'<testcase classname="mod" name="{target}" time="0.0" />'
+        f'<testcase classname="mod" name="{target}" time="0.0" />'
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    assert runner._parse_junit_outcome(multiple_path, target) is None
+
+    wrong_name_path = tmp_path / "wrong_name.xml"
+    wrong_name_path.write_text(_single_testcase_junit_xml("some_other_test"), encoding="utf-8")
+    assert runner._parse_junit_outcome(wrong_name_path, target) is None
+
+    assert runner._pass_observed(0, None) is False
+    assert runner._skip_observed(0, None) is False
+
+
+def test_ac8_live_verifier_child_env_strips_session_dir_override_only(monkeypatch):
+    """Regression #7 (unit level): `_child_env()` drops only
+    AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR, leaves every other
+    environment variable untouched, and never mutates the parent process's
+    own `os.environ`."""
+    import os
+
+    runner = _ac8_live_verifier_runner_module()
+    monkeypatch.setenv("AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR", "/should-not-survive")
+    monkeypatch.setenv("AC8_REGRESSION_CANARY", "still-here")
+
+    child_env = runner._child_env()
+
+    assert "AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR" not in child_env
+    assert child_env["AC8_REGRESSION_CANARY"] == "still-here"
+    assert os.environ["AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR"] == "/should-not-survive"
+
+
+def test_ac8_live_verifier_child_env_override_not_visible_to_real_subprocess(tmp_path, monkeypatch):
+    """Regression #7 (end-to-end): a parent-process override set right before
+    launch actually disappears inside a REAL child pytest process started
+    with `_child_env()`, while an unrelated variable (standing in for
+    HOME/PATH/auth) still reaches the child unmodified."""
+    import subprocess
+
+    runner = _ac8_live_verifier_runner_module()
+    monkeypatch.setenv("AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR", "/should-not-be-seen")
+    monkeypatch.setenv("AC8_REGRESSION_CANARY", "still-here")
+
+    probe_file = tmp_path / "test_ac8_env_probe.py"
+    probe_file.write_text(
+        "import os\n"
+        "def test_since_last_retrospective_claude_code_collector_live():\n"
+        "    assert os.environ.get('AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR') is None\n"
+        "    assert os.environ.get('AC8_REGRESSION_CANARY') == 'still-here'\n",
+        encoding="utf-8",
+    )
+    junit_path = tmp_path / "probe-junit.xml"
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", str(probe_file), "-q", f"--junitxml={junit_path}"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=runner._child_env(),
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    outcome = runner._parse_junit_outcome(junit_path, runner._TARGET_TEST_NAME)
+    assert outcome == {"failed": False, "errored": False, "skipped": False}
