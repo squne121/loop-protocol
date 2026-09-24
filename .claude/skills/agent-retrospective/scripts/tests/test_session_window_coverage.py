@@ -1273,3 +1273,227 @@ def test_nested_only_claude_code_history_remains_source_not_present(tmp_path):
     assert result.private_evidence["provenance"]["logical_session_count"] == 0
     coverage = rr.compute_source_coverage_entry("claude_code", result, required=True)
     assert coverage == {"status": "unavailable", "reason_code": "source_not_present", "selected_session_count": None}
+
+
+# ---------------------------------------------------------------------------
+# AC8 live-verifier runner (``run_verify_since_last_retrospective_live_cli.py``)
+# regression tests -- PR #2737 review fix_delta, blockers 1 and 2:
+#   Blocker 1: the AC8 target pytest subprocess must not inherit
+#              AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR from the parent
+#              process (a stale test-only override could substitute
+#              fixture/other-project history for the live on-disk evidence).
+#   Blocker 2: PASS/SKIP/FAIL must be decided from a structural --junitxml
+#              report, never from human-readable pytest terminal text (which
+#              PYTEST_ADDOPTS / colored output can reshape).
+# ---------------------------------------------------------------------------
+
+
+def _ac8_live_verifier_runner_module():
+    import importlib.util
+
+    module_name = "agent_retrospective_ac8_live_verifier_runner_for_session_window_coverage_test"
+    module_path = Path(__file__).resolve().parent / "run_verify_since_last_retrospective_live_cli.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+def _single_testcase_junit_xml(
+    name: str, *, failed: bool = False, errored: bool = False, skipped: bool = False
+) -> str:
+    body = ""
+    if failed:
+        body = '<failure message="boom">boom</failure>'
+    elif errored:
+        body = '<error message="boom">boom</error>'
+    elif skipped:
+        body = '<skipped type="pytest.skip" message="skip-reason" />'
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites name="pytest tests">'
+        '<testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1">'
+        f'<testcase classname="mod" name="{name}" time="0.0">{body}</testcase>'
+        "</testsuite></testsuites>"
+    )
+
+
+def test_ac8_live_verifier_normal_pass_via_structural_junit_outcome(tmp_path):
+    """Regression #1: a clean single-testcase JUnit report is PASS."""
+    runner = _ac8_live_verifier_runner_module()
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text(_single_testcase_junit_xml(runner._TARGET_TEST_NAME), encoding="utf-8")
+
+    outcome = runner._parse_junit_outcome(junit_path, runner._TARGET_TEST_NAME)
+
+    assert outcome == {"failed": False, "errored": False, "skipped": False}
+    assert runner._pass_observed(0, outcome) is True
+    assert runner._skip_observed(0, outcome) is False
+
+
+def test_ac8_live_verifier_pass_observed_ignores_pytest_addopts_quiet_style_terminal_text(tmp_path):
+    """Regression #2: a `PYTEST_ADDOPTS=-q`-shaped transcript with no
+    recognizable "N passed" summary line must not change the PASS verdict --
+    the verdict comes only from the structural JUnit report."""
+    runner = _ac8_live_verifier_runner_module()
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text(_single_testcase_junit_xml(runner._TARGET_TEST_NAME), encoding="utf-8")
+    outcome = runner._parse_junit_outcome(junit_path, runner._TARGET_TEST_NAME)
+
+    quiet_style_stdout = "."  # `-q -q` / custom reporters can render exactly this
+    assert "passed" not in quiet_style_stdout
+    assert runner._pass_observed(0, outcome) is True
+
+
+def test_ac8_live_verifier_pass_observed_ignores_colored_terminal_output(tmp_path):
+    """Regression #3: colored terminal output cannot influence the verdict --
+    `_pass_observed` / `_skip_observed` never take pytest stdout/stderr as an
+    argument at all."""
+    import inspect
+
+    runner = _ac8_live_verifier_runner_module()
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text(_single_testcase_junit_xml(runner._TARGET_TEST_NAME), encoding="utf-8")
+    outcome = runner._parse_junit_outcome(junit_path, runner._TARGET_TEST_NAME)
+
+    assert set(inspect.signature(runner._pass_observed).parameters) == {"returncode", "outcome"}
+    assert set(inspect.signature(runner._skip_observed).parameters) == {"returncode", "outcome"}
+    assert runner._pass_observed(0, outcome) is True
+
+
+def test_ac8_live_verifier_skip_via_structural_junit_outcome(tmp_path):
+    """Regression #4: a single skipped testcase is SKIP, never PASS."""
+    runner = _ac8_live_verifier_runner_module()
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text(
+        _single_testcase_junit_xml(runner._TARGET_TEST_NAME, skipped=True), encoding="utf-8"
+    )
+
+    outcome = runner._parse_junit_outcome(junit_path, runner._TARGET_TEST_NAME)
+
+    assert outcome == {"failed": False, "errored": False, "skipped": True}
+    assert runner._skip_observed(0, outcome) is True
+    assert runner._pass_observed(0, outcome) is False
+
+
+def test_ac8_live_verifier_fail_and_error_via_structural_junit_outcome(tmp_path):
+    """Regression #5: a failed or errored testcase is never PASS/SKIP."""
+    runner = _ac8_live_verifier_runner_module()
+
+    fail_path = tmp_path / "fail.xml"
+    fail_path.write_text(
+        _single_testcase_junit_xml(runner._TARGET_TEST_NAME, failed=True), encoding="utf-8"
+    )
+    fail_outcome = runner._parse_junit_outcome(fail_path, runner._TARGET_TEST_NAME)
+    assert fail_outcome == {"failed": True, "errored": False, "skipped": False}
+    assert runner._pass_observed(1, fail_outcome) is False
+    assert runner._skip_observed(1, fail_outcome) is False
+
+    error_path = tmp_path / "error.xml"
+    error_path.write_text(
+        _single_testcase_junit_xml(runner._TARGET_TEST_NAME, errored=True), encoding="utf-8"
+    )
+    error_outcome = runner._parse_junit_outcome(error_path, runner._TARGET_TEST_NAME)
+    assert error_outcome == {"failed": False, "errored": True, "skipped": False}
+    assert runner._pass_observed(1, error_outcome) is False
+    assert runner._skip_observed(1, error_outcome) is False
+
+
+def test_ac8_live_verifier_malformed_missing_or_ambiguous_junit_report_fails_closed(tmp_path):
+    """Regression #6: missing / empty / unparsable / zero-testcase /
+    multi-testcase / name-mismatched JUnit reports must all fail closed
+    (``None``), and ``None`` must never be treated as PASS or SKIP even when
+    the pytest process itself returned 0."""
+    runner = _ac8_live_verifier_runner_module()
+    target = runner._TARGET_TEST_NAME
+
+    missing_path = tmp_path / "missing.xml"
+    assert runner._parse_junit_outcome(missing_path, target) is None
+
+    empty_path = tmp_path / "empty.xml"
+    empty_path.write_text("", encoding="utf-8")
+    assert runner._parse_junit_outcome(empty_path, target) is None
+
+    invalid_path = tmp_path / "invalid.xml"
+    invalid_path.write_text("<testsuites><testsuite>", encoding="utf-8")
+    assert runner._parse_junit_outcome(invalid_path, target) is None
+
+    zero_testcases_path = tmp_path / "zero.xml"
+    zero_testcases_path.write_text(
+        '<?xml version="1.0"?><testsuites><testsuite tests="0"></testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    assert runner._parse_junit_outcome(zero_testcases_path, target) is None
+
+    multiple_path = tmp_path / "multiple.xml"
+    multiple_path.write_text(
+        '<?xml version="1.0"?><testsuites><testsuite tests="2">'
+        f'<testcase classname="mod" name="{target}" time="0.0" />'
+        f'<testcase classname="mod" name="{target}" time="0.0" />'
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    assert runner._parse_junit_outcome(multiple_path, target) is None
+
+    wrong_name_path = tmp_path / "wrong_name.xml"
+    wrong_name_path.write_text(_single_testcase_junit_xml("some_other_test"), encoding="utf-8")
+    assert runner._parse_junit_outcome(wrong_name_path, target) is None
+
+    assert runner._pass_observed(0, None) is False
+    assert runner._skip_observed(0, None) is False
+
+
+def test_ac8_live_verifier_child_env_strips_session_dir_override_only(monkeypatch):
+    """Regression #7 (unit level): `_child_env()` drops only
+    AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR, leaves every other
+    environment variable untouched, and never mutates the parent process's
+    own `os.environ`."""
+    import os
+
+    runner = _ac8_live_verifier_runner_module()
+    monkeypatch.setenv("AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR", "/should-not-survive")
+    monkeypatch.setenv("AC8_REGRESSION_CANARY", "still-here")
+
+    child_env = runner._child_env()
+
+    assert "AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR" not in child_env
+    assert child_env["AC8_REGRESSION_CANARY"] == "still-here"
+    assert os.environ["AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR"] == "/should-not-survive"
+
+
+def test_ac8_live_verifier_child_env_override_not_visible_to_real_subprocess(tmp_path, monkeypatch):
+    """Regression #7 (end-to-end): a parent-process override set right before
+    launch actually disappears inside a REAL child pytest process started
+    with `_child_env()`, while an unrelated variable (standing in for
+    HOME/PATH/auth) still reaches the child unmodified."""
+    import subprocess
+
+    runner = _ac8_live_verifier_runner_module()
+    monkeypatch.setenv("AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR", "/should-not-be-seen")
+    monkeypatch.setenv("AC8_REGRESSION_CANARY", "still-here")
+
+    probe_file = tmp_path / "test_ac8_env_probe.py"
+    probe_file.write_text(
+        "import os\n"
+        "def test_since_last_retrospective_claude_code_collector_live():\n"
+        "    assert os.environ.get('AGENT_RETROSPECTIVE_CLAUDE_CODE_SESSIONS_DIR') is None\n"
+        "    assert os.environ.get('AC8_REGRESSION_CANARY') == 'still-here'\n",
+        encoding="utf-8",
+    )
+    junit_path = tmp_path / "probe-junit.xml"
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", str(probe_file), "-q", f"--junitxml={junit_path}"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=runner._child_env(),
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    outcome = runner._parse_junit_outcome(junit_path, runner._TARGET_TEST_NAME)
+    assert outcome == {"failed": False, "errored": False, "skipped": False}
