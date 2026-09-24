@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -553,3 +554,273 @@ def test_decision_time_freshness_rebind_and_bounded_retry():
         "candidate": None,
     }
     assert state_fail["pr_list_calls"] == 2
+
+
+def test_default_route_loop_verdict_v2_loader_succeeds_without_module_injection():
+    """AC4: GIVEN no `route_loop_verdict_v2_module` injection WHEN the
+    default (dependency-injection-free) `_load_route_loop_verdict_v2_module()`
+    loader runs THEN it actually loads `route_loop_verdict_v2.py` (returns a
+    non-None module exposing the production decision function) instead of
+    silently swallowing the `sys.modules`-registration-order exec failure
+    and returning None."""
+    loaded = mod._load_route_loop_verdict_v2_module()
+    assert loaded is not None
+    assert hasattr(loaded, "resolve_already_satisfied_early_exit_decision")
+    assert hasattr(loaded, "resolve_pre_step1_data_plane_action")
+
+
+def test_apply_already_satisfied_precedence_fires_through_default_loader():
+    """AC3/AC4: GIVEN a no-landing-authority result WHEN
+    `apply_already_satisfied_precedence()` is called WITHOUT injecting
+    `route_loop_verdict_v2_module` (default loader only) THEN it still
+    successfully loads `route_loop_verdict_v2.py` and fires the
+    `already_satisfied` composition -- proving the default production load
+    path (not just the dependency-injected test path) actually applies the
+    precedence."""
+    no_candidate = mod.derive_landing_disposition(_evidence(candidates=[]), repo=REPO, issue_number=ISSUE)
+    composed = mod.apply_already_satisfied_precedence(
+        no_candidate,
+        next_action_route="proceed_to_step_1",
+        product_spec_routing_action="not_yet_evaluated_at_pre_step1_landing_disposition",
+        pr_exists=False,
+        base_ac_satisfied=True,
+    )
+    assert composed["disposition"] == "already_satisfied"
+    assert composed["reason_codes"] == ["already_satisfied_no_pr_created"]
+
+
+def _patch_spec_from_file_location_to_fail(monkeypatch, expected_name):
+    """Return a REAL `ModuleSpec` (built via the genuine
+    `spec_from_file_location()`) so `module_from_spec()` / the import
+    machinery see a fully well-formed spec, with only `loader.exec_module()`
+    swapped out to raise -- isolates the `exec_module()` failure path
+    without hand-rolling a fake spec/loader pair that the frozen import
+    machinery rejects for missing attributes (`origin`,
+    `submodule_search_locations`, etc.)."""
+    import importlib.util as importlib_util
+
+    original_spec_from_file_location = importlib_util.spec_from_file_location
+
+    def fake_spec_from_file_location(name, path):
+        assert name == expected_name
+        spec = original_spec_from_file_location(name, path)
+
+        def failing_exec_module(module):  # noqa: ARG001 - matches Loader.exec_module signature
+            raise RuntimeError("simulated exec_module failure")
+
+        spec.loader.exec_module = failing_exec_module
+        return spec
+
+    monkeypatch.setattr(importlib_util, "spec_from_file_location", fake_spec_from_file_location)
+
+
+def test_default_adjudicate_vc_result_loader_succeeds_without_module_injection():
+    """#2713 AC9: GIVEN no injection WHEN the default
+    `_load_adjudicate_vc_result_module()` loader runs THEN it actually loads
+    `adjudicate_vc_result.py` and exposes
+    `adapt_test_verdict_to_current_vc_result()` (the function
+    `derive_base_ac_satisfied_from_verification_result()` reuses)."""
+    loaded = mod._load_adjudicate_vc_result_module()
+    assert loaded is not None
+    assert hasattr(loaded, "adapt_test_verdict_to_current_vc_result")
+
+
+def test_route_loop_verdict_v2_loader_success_leaves_module_registered_under_its_own_name():
+    """#2713 AC10: the success path is unaffected by the restore-on-failure
+    logic added for AC10 -- the freshly executed module stays registered
+    under its own `sys.modules` name."""
+    module_name = "route_loop_verdict_v2_for_evidence"
+    sys.modules.pop(module_name, None)
+    try:
+        loaded = mod._load_route_loop_verdict_v2_module()
+        assert loaded is not None
+        assert sys.modules.get(module_name) is loaded
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_route_loop_verdict_v2_loader_removes_only_its_own_newly_inserted_entry_on_failure(monkeypatch):
+    """#2713 AC10 (PR #2741 review, P2): WHEN `sys.modules` has NO prior
+    entry under the loader's module name AND `exec_module()` fails THEN the
+    loader pop()s the entry it itself inserted -- no dangling half-
+    initialized module is left behind."""
+    module_name = "route_loop_verdict_v2_for_evidence"
+    sys.modules.pop(module_name, None)
+
+    _patch_spec_from_file_location_to_fail(monkeypatch, module_name)
+
+    loaded = mod._load_route_loop_verdict_v2_module()
+    assert loaded is None
+    assert module_name not in sys.modules
+
+
+def test_route_loop_verdict_v2_loader_restores_prior_entry_on_failure(monkeypatch):
+    """#2713 AC10 (PR #2741 review, P2): WHEN `sys.modules` ALREADY has an
+    entry under the loader's module name (from an unrelated prior load)
+    AND `exec_module()` fails THEN that prior entry is restored -- it must
+    never be left deleted or permanently clobbered by the half-initialized
+    failed module."""
+    module_name = "route_loop_verdict_v2_for_evidence"
+    sentinel = types.ModuleType(module_name)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = sentinel
+    try:
+        _patch_spec_from_file_location_to_fail(monkeypatch, module_name)
+
+        loaded = mod._load_route_loop_verdict_v2_module()
+        assert loaded is None
+        assert sys.modules.get(module_name) is sentinel
+    finally:
+        if previous is not None:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
+
+
+def test_adjudicate_vc_result_loader_removes_only_its_own_newly_inserted_entry_on_failure(monkeypatch):
+    """#2713 AC10 (PR #2741 review, P2): same register-before-exec /
+    restore-on-failure contract as `_load_route_loop_verdict_v2_module()`,
+    applied to `_load_adjudicate_vc_result_module()` -- no prior entry
+    means the newly inserted entry is simply removed on failure."""
+    module_name = "adjudicate_vc_result_for_evidence"
+    sys.modules.pop(module_name, None)
+
+    _patch_spec_from_file_location_to_fail(monkeypatch, module_name)
+
+    loaded = mod._load_adjudicate_vc_result_module()
+    assert loaded is None
+    assert module_name not in sys.modules
+
+
+def test_adjudicate_vc_result_loader_restores_prior_entry_on_failure(monkeypatch):
+    """#2713 AC10 (PR #2741 review, P2): a pre-existing `sys.modules` entry
+    under `_load_adjudicate_vc_result_module()`'s module name is restored,
+    not destroyed, when `exec_module()` fails."""
+    module_name = "adjudicate_vc_result_for_evidence"
+    sentinel = types.ModuleType(module_name)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = sentinel
+    try:
+        _patch_spec_from_file_location_to_fail(monkeypatch, module_name)
+
+        loaded = mod._load_adjudicate_vc_result_module()
+        assert loaded is None
+        assert sys.modules.get(module_name) is sentinel
+    finally:
+        if previous is not None:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
+
+
+def test_derive_pr_exists_from_landing_candidate_across_pr_fixture_shapes():
+    """#2713 AC3: `pr_exists` production source. open/draft/merged candidates
+    are resume/conflict-relevant targets (True); a closed-unmerged candidate
+    was abandoned without landing and is not (False); no candidate at all is
+    also not (False)."""
+    assert mod.derive_pr_exists_from_landing_candidate(_candidate(lifecycle="open")) is True
+    assert mod.derive_pr_exists_from_landing_candidate(_candidate(lifecycle="draft")) is True
+    assert mod.derive_pr_exists_from_landing_candidate(_candidate(lifecycle="merged")) is True
+    assert mod.derive_pr_exists_from_landing_candidate(_candidate(lifecycle="closed_unmerged")) is False
+    assert mod.derive_pr_exists_from_landing_candidate(None) is False
+
+
+def _runtime_ac_entry(ac="AC1", *, command_hash=None, status="pass", exit_code=0, **flags):
+    entry = {
+        "ac": ac,
+        "command_hash": command_hash or ("sha256:" + "1" * 64),
+        "status": status,
+        "exit_code": exit_code,
+    }
+    entry.update(flags)
+    return entry
+
+
+def _test_verdict(entries, **overrides):
+    payload = {
+        "schema": "TEST_VERDICT_MACHINE/v2",
+        "generated_at": "2026-09-24T00:00:00Z",
+        "head_sha": SHA,
+        "contract_body_sha256": "sha256:" + "c" * 64,
+        "result": "PASS",
+        "runtime_ac_results": entries,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_derive_base_ac_satisfied_from_verification_result_reuses_adjudicate_vc_result_adapter():
+    """#2713 AC3/AC9 (PR #2741 review, P1-2): `base_ac_satisfied` production
+    source reuses `adjudicate_vc_result.py::adapt_test_verdict_to_current_vc_result()`
+    rather than a second, weaker validator. A fresh (head_sha-matching),
+    fully clean all-pass TEST_VERDICT_MACHINE/v2 yields True; a fresh result
+    with any non-pass entry yields False; anything undeterminable (missing
+    result, missing live_main_sha, stale/mismatched head_sha, or malformed
+    runtime_ac_results/adapter errors) yields None -- never a fabricated
+    True/False fallback."""
+    fresh_pass = _test_verdict([_runtime_ac_entry("AC1"), _runtime_ac_entry("AC2", command_hash="sha256:" + "2" * 64)])
+    fresh_fail = _test_verdict(
+        [_runtime_ac_entry("AC1"), _runtime_ac_entry("AC2", command_hash="sha256:" + "2" * 64, status="fail")]
+    )
+    assert mod.derive_base_ac_satisfied_from_verification_result(fresh_pass, live_main_sha=SHA) is True
+    assert mod.derive_base_ac_satisfied_from_verification_result(fresh_fail, live_main_sha=SHA) is False
+
+    # Undeterminable cases -- never fabricated.
+    assert mod.derive_base_ac_satisfied_from_verification_result(None, live_main_sha=SHA) is None
+    assert mod.derive_base_ac_satisfied_from_verification_result(fresh_pass, live_main_sha=None) is None
+    assert mod.derive_base_ac_satisfied_from_verification_result(fresh_pass, live_main_sha="b" * 40) is None
+    assert mod.derive_base_ac_satisfied_from_verification_result({"head_sha": SHA}, live_main_sha=SHA) is None
+    assert (
+        mod.derive_base_ac_satisfied_from_verification_result(
+            _test_verdict([], head_sha=SHA), live_main_sha=SHA
+        )
+        is None
+    )
+
+
+def test_derive_base_ac_satisfied_from_verification_result_rejects_incomplete_payloads():
+    """#2713 AC9 (PR #2741 review, P1-2): an incomplete `runtime_ac_results`
+    entry (missing AC identity, missing command_hash, exit_code != 0,
+    fallback_detected, human_review_required, stop_condition_triggered, or a
+    SKIP/PARTIAL status) must never be mistaken for `base_ac_satisfied:
+    True`."""
+    # Not even a recognizable TEST_VERDICT_MACHINE/v2 payload at all (no
+    # `schema` field) -- the adapter fails closed with
+    # unsupported_source_schema, which this function treats as
+    # undeterminable (None), never True.
+    assert (
+        mod.derive_base_ac_satisfied_from_verification_result(
+            {"head_sha": SHA, "runtime_ac_results": [{"ac": "AC1", "status": "pass"}]}, live_main_sha=SHA
+        )
+        is None
+    )
+
+    # AC identity missing.
+    missing_ac = _test_verdict([{"command_hash": "sha256:" + "1" * 64, "status": "pass", "exit_code": 0}])
+    assert mod.derive_base_ac_satisfied_from_verification_result(missing_ac, live_main_sha=SHA) is None
+
+    # command_hash missing.
+    missing_hash = _test_verdict([{"ac": "AC1", "status": "pass", "exit_code": 0}])
+    assert mod.derive_base_ac_satisfied_from_verification_result(missing_hash, live_main_sha=SHA) is None
+
+    # exit_code != 0 despite a "pass" status must not be trusted as True.
+    nonzero_exit = _test_verdict([_runtime_ac_entry("AC1", exit_code=1)])
+    assert mod.derive_base_ac_satisfied_from_verification_result(nonzero_exit, live_main_sha=SHA) is False
+
+    # fallback_detected / human_review_required / stop_condition_triggered
+    # (per-entry) must each deny True.
+    for flag in ("fallback_detected", "human_review_required", "stop_condition_triggered"):
+        flagged = _test_verdict([_runtime_ac_entry("AC1", **{flag: True})])
+        assert mod.derive_base_ac_satisfied_from_verification_result(flagged, live_main_sha=SHA) is False
+
+    # Aggregate-level human_review_required (TEST_VERDICT top-level field,
+    # not per-entry) must also deny True.
+    aggregate_human_review = _test_verdict([_runtime_ac_entry("AC1")], human_review_required=True)
+    assert (
+        mod.derive_base_ac_satisfied_from_verification_result(aggregate_human_review, live_main_sha=SHA) is False
+    )
+
+    # SKIP / PARTIAL status entries must never be treated as pass.
+    for status in ("skip", "partial", "SKIP", "PARTIAL"):
+        skipped = _test_verdict([_runtime_ac_entry("AC1", status=status)])
+        assert mod.derive_base_ac_satisfied_from_verification_result(skipped, live_main_sha=SHA) is False
