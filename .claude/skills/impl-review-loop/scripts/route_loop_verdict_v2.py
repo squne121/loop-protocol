@@ -704,19 +704,36 @@ def resolve_pre_step1_landing_disposition(
 
 
 def resolve_pre_step1_data_plane_action(
-    evidence: Mapping[str, Any] | str | None,
-    *,
-    repo: str,
-    issue_number: int,
+    disposition: Mapping[str, Any],
 ) -> dict[str, Any]:
     """The enforceable pre-Step-1 gate used before any worker/worktree/PR call.
 
-    Keeping this mapping in the production route module makes the suppression
-    more than preparation prose: callers receive a single `start_data_plane`
-    boolean and may not reinterpret the evidence disposition themselves.
+    `disposition` MUST already be a resolved landing-disposition mapping
+    (`{"disposition": <name>, "reason_codes": [...], "candidate": ...}`) --
+    either `derive_landing_disposition()`'s / `resolve_pre_step1_landing_
+    disposition()`'s direct output, or, after Disposition Precedence
+    composition (#2607/#2713),
+    `implementation_landed_evidence.py::apply_already_satisfied_precedence()`'s
+    output (which may replace the disposition name with `already_satisfied`).
+
+    #2713 AC5: this function performs no evidence parsing/validation/
+    recompute of its own anymore -- it used to accept raw `evidence` and
+    internally call `resolve_pre_step1_landing_disposition()` again, which
+    meant a caller that had already composed a final disposition (e.g.
+    `already_satisfied` overriding a bare
+    `ordinary_dispatch_or_explicit_recovery`) could have that composition
+    silently undone by an independent second raw-evidence reinterpretation
+    here. Taking an already-resolved `disposition` mapping instead makes
+    that double-application structurally impossible: there is exactly one
+    place (the caller) that derives a disposition, and exactly one call
+    into this function to turn it into a data-plane action.
+
+    Keeping this mapping in the production route module makes the
+    suppression more than preparation prose: callers receive a single
+    `start_data_plane` boolean and may not reinterpret the disposition
+    themselves.
     """
-    disposition = resolve_pre_step1_landing_disposition(evidence, repo=repo, issue_number=issue_number)
-    name = disposition["disposition"]
+    name = disposition.get("disposition") if isinstance(disposition, Mapping) else None
     if name == "ordinary_dispatch_or_explicit_recovery":
         return {"disposition": disposition, "start_data_plane": True, "action": "dispatch_step1"}
     if name == "existing_pr_resume":

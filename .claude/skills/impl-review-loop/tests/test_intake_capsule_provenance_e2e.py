@@ -635,6 +635,34 @@ def test_build_capsule_argv_materializes_canonical_command_with_additive_flags()
     ]
 
 
+def test_build_capsule_argv_materializes_base_ac_verification_result_file_additively():
+    """#2713 AC8 (PR #2741 review, P1-1): `base_ac_verification_result_file`
+    additively appends `--base-ac-verification-result-file <path>` to the
+    canonical command -- the SAME additive-flag pattern
+    `--human-context-comment-url` / `--agent-report-comment-url` already
+    use, never a separate/forked argv shape. Absent (None/omitted), the
+    canonical command is byte-for-byte unchanged from before #2713."""
+    verification_result_path = "/tmp/base-ac-verification-result.json"
+
+    argv_no_file = mod.build_capsule_argv(issue_number=_ISSUE_NUMBER, repo=_REPO)
+    assert "--base-ac-verification-result-file" not in argv_no_file
+
+    argv_with_file = mod.build_capsule_argv(
+        issue_number=_ISSUE_NUMBER,
+        repo=_REPO,
+        include_implementation_landed_evidence=True,
+        base_ac_verification_result_file=verification_result_path,
+    )
+    # The base command (+ the pre-existing --include-implementation-landed-evidence
+    # flag) is an unmodified prefix -- additive, not a fork.
+    assert argv_with_file[: len(argv_no_file)] == argv_no_file
+    assert argv_with_file[len(argv_no_file) :] == [
+        "--include-implementation-landed-evidence",
+        "--base-ac-verification-result-file",
+        verification_result_path,
+    ]
+
+
 def test_build_capsule_argv_e2e_subprocess_invocation_resolves_context_inputs(tmp_path):
     """#1950 AC6/AC7 (P0-2 fix_delta test): actually invoke
     `build_intake_capsule.py` through the EXACT argv `build_capsule_argv()`

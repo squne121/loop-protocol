@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -783,6 +784,29 @@ _NO_LANDING_AUTHORITY_REASON_CODES = frozenset({"no_qualified_candidate", "close
 
 
 def _load_route_loop_verdict_v2_module() -> Any | None:
+    """Default (dependency-injection-free) production loader.
+
+    #2713 AC4: `sys.modules[spec.name] = module` MUST be registered before
+    `exec_module()` -- matching `route_loop_verdict_v2.py`'s own
+    `resolve_pre_step1_landing_disposition()` pattern (that file, lines
+    696-698). Without this registration, `route_loop_verdict_v2.py`'s
+    `@dataclass(frozen=True)` classes (it uses
+    `from __future__ import annotations`, so field annotations are
+    strings) fail during `exec_module()`: CPython's `dataclasses`
+    internals resolve stringified `ClassVar`/`InitVar` annotations via
+    `sys.modules.get(cls.__module__)`, and when that lookup returns `None`
+    (module not yet registered under its own `__name__`), it raises
+    `AttributeError` while decorating the class. That exception was
+    previously swallowed by the `except Exception: return None` below,
+    silently making `apply_already_satisfied_precedence()` a permanent
+    no-op through the default loader.
+
+    #2713 AC10 (PR #2741 review, P2): register-before-exec must not destroy
+    a same-named `sys.modules` entry that already existed BEFORE this loader
+    ran. `prior_module` snapshots whatever was there first; on `exec_module()`
+    failure, that original entry is restored (not merely `pop()`-ed) so only
+    the entry this loader itself inserted is ever removed.
+    """
     import importlib.util
 
     path = Path(__file__).resolve().with_name("route_loop_verdict_v2.py")
@@ -790,11 +814,173 @@ def _load_route_loop_verdict_v2_module() -> Any | None:
     if spec is None or spec.loader is None:
         return None
     module = importlib.util.module_from_spec(spec)
+    prior_module = sys.modules.get(spec.name)
+    sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
     except Exception:
+        if prior_module is not None:
+            sys.modules[spec.name] = prior_module
+        else:
+            sys.modules.pop(spec.name, None)
         return None
     return module
+
+
+def _load_adjudicate_vc_result_module() -> Any | None:
+    """Default (dependency-injection-free) loader for
+    `adjudicate_vc_result.py`, used solely to reuse its existing
+    `adapt_test_verdict_to_current_vc_result()` TEST_VERDICT_MACHINE/v2
+    validation (#2713 AC9 -- see
+    `derive_base_ac_satisfied_from_verification_result()` below). Follows the
+    same register-before-exec / restore-on-failure pattern as
+    `_load_route_loop_verdict_v2_module()` above (#2713 AC10).
+    """
+    import importlib.util
+
+    path = Path(__file__).resolve().with_name("adjudicate_vc_result.py")
+    spec = importlib.util.spec_from_file_location("adjudicate_vc_result_for_evidence", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    prior_module = sys.modules.get(spec.name)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        if prior_module is not None:
+            sys.modules[spec.name] = prior_module
+        else:
+            sys.modules.pop(spec.name, None)
+        return None
+    return module
+
+
+def derive_pr_exists_from_landing_candidate(candidate: Mapping[str, Any] | None) -> bool:
+    """Production source for `apply_already_satisfied_precedence()`'s
+    `pr_exists` input (#2713 AC3).
+
+    `pr_exists` is NOT "a PR existed at some point in history" -- it is
+    "is the current landing-disposition candidate itself a target that a
+    resume / conflict determination could act on", derived directly from
+    the SAME qualified candidate `derive_landing_disposition()` already
+    resolved (its `lifecycle` field). This mapping is total across the
+    five PR fixture shapes this module recognizes:
+
+    - open / draft: an active PR exists that a resume determination could
+      act on -> True.
+    - merged: a landed PR object exists. (In practice a merged candidate
+      is normally intercepted upstream by `implementation_already_landed`
+      / `legacy_or_later_scope_expansion` before
+      `apply_already_satisfied_precedence()` is ever reached, but the
+      mapping stays total for direct callers/tests.) -> True.
+    - closed_unmerged: the PR was abandoned without landing. It is not a
+      resumable or blocking artifact for `already_satisfied` purposes: a
+      closed-unmerged attempt does not, by itself, mean the requirement is
+      already satisfied, but it also does not preclude concluding
+      `already_satisfied` from independent `base_ac_satisfied` evidence ->
+      False. This is the explicit semantic #2713 calls out for
+      documentation.
+    - no candidate (`candidate is None`): nothing exists -> False.
+    """
+    if not isinstance(candidate, Mapping):
+        return False
+    return candidate.get("lifecycle") in {"merged", "open", "draft"}
+
+
+def derive_base_ac_satisfied_from_verification_result(
+    verification_result: Mapping[str, Any] | None,
+    *,
+    live_main_sha: str | None,
+    adjudicate_vc_result_module: Any | None = None,
+) -> bool | None:
+    """Production source for `apply_already_satisfied_precedence()`'s
+    `base_ac_satisfied` input (#2713 AC3).
+
+    `verification_result` is a TEST_VERDICT_MACHINE/v2-shaped payload (the
+    same shape `route_loop_verdict_v2.py::build_already_satisfied_evidence()`
+    consumes as `base_test_verdict` and the same shape
+    `.claude/agents/test-runner.md` reports): `{"schema":
+    "TEST_VERDICT_MACHINE/v2", "head_sha": <sha>, "contract_body_sha256":
+    <sha256>, "runtime_ac_results": [{"ac": <id>, "command_hash": <sha256>,
+    "status": "pass"|"fail"|"skip", "exit_code": <int>,
+    "fallback_detected": <bool>, "human_review_required": <bool>,
+    "stop_condition_triggered": <bool>}, ...]}`, representing an independent
+    Verification-Commands evaluation of current main -- never a
+    caller-asserted boolean.
+
+    #2713 AC9 (PR #2741 review, P1-2): rather than re-implementing a second,
+    weaker TEST_VERDICT_MACHINE/v2 validator, this reuses
+    `adjudicate_vc_result.py::adapt_test_verdict_to_current_vc_result()` --
+    the SAME adapter `adjudicate_vc_result()`'s production callers already
+    trust -- and only inspects its validated output. That adapter already
+    enforces: `schema == "TEST_VERDICT_MACHINE/v2"`, non-empty `head_sha` /
+    `contract_body_sha256`, and (per `runtime_ac_results[]` entry)
+    non-empty `ac` identity and `command_hash`; any of those missing is
+    reported back via its `errors` list. A malformed/incomplete payload
+    (missing AC identity, missing command_hash, or an unparseable schema)
+    therefore yields `None` here -- undeterminable -- rather than being
+    coerced into `True`.
+
+    Returns `None` (undeterminable) whenever the result cannot be trusted:
+    no `verification_result` supplied, no `live_main_sha` to cross-check
+    freshness against, the adapter itself reports validation errors, the
+    adapter's `head_sha` does not match `live_main_sha` (a stale/mismatched
+    run is never silently trusted -- mirrors
+    `build_already_satisfied_evidence()`'s own `base_ac_satisfied` freshness
+    gate), or the adapted `results` list is missing/empty. Callers MUST
+    treat `None` as "do not apply precedence" (pass the existing landing
+    disposition through unchanged) rather than defaulting to a fixed
+    `True`/`False` (#2713 In Scope).
+
+    Returns `False` (determinately not satisfied) whenever the adapted,
+    fresh result carries ANY of: an aggregate `fallback_detected` /
+    `human_review_required` / `stop_condition_triggered` flag, or a
+    `runtime_ac_results` entry whose `status != "pass"` (this rejects
+    `SKIP`/`PARTIAL`/`fail` entries), `exit_code != 0`, or a per-entry
+    `fallback_detected` / `human_review_required` /
+    `stop_condition_triggered` flag (#2713 AC9).
+
+    Only a well-formed, fresh, wholly-clean result yields `True`.
+    """
+    if not isinstance(verification_result, Mapping):
+        return None
+    if not isinstance(live_main_sha, str) or not live_main_sha:
+        return None
+
+    module = adjudicate_vc_result_module or _load_adjudicate_vc_result_module()
+    if module is None:
+        return None
+
+    converted, adapt_errors = module.adapt_test_verdict_to_current_vc_result(dict(verification_result))
+    if converted is None or adapt_errors:
+        return None
+    if converted.get("head_sha") != live_main_sha:
+        return None
+
+    results = converted.get("results")
+    if not isinstance(results, list) or not results:
+        return None
+
+    if converted.get("fallback_detected") or converted.get("human_review_required") or converted.get(
+        "stop_condition_triggered"
+    ):
+        return False
+
+    for entry in results:
+        if not isinstance(entry, Mapping):
+            return False
+        if entry.get("status") != "pass":
+            return False
+        if entry.get("exit_code") != 0:
+            return False
+        if (
+            entry.get("fallback_detected")
+            or entry.get("human_review_required")
+            or entry.get("stop_condition_triggered")
+        ):
+            return False
+    return True
 
 
 def apply_already_satisfied_precedence(

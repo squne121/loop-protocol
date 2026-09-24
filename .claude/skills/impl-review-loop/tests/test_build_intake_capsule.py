@@ -7,6 +7,8 @@ import importlib.util
 import io
 import json
 import builtins
+import sys
+import types
 from pathlib import Path
 from unittest.mock import patch
 
@@ -952,3 +954,92 @@ def test_cross_repo_direct_lookup_url_is_fail_closed_without_extra_gh_call():
     assert any(
         err.startswith("human_supplied_comment_repo_mismatch:") for err in capsule["fatal_errors"]
     ), capsule
+
+
+# ---------------------------------------------------------------------------
+# #2713 AC10 (PR #2741 review, P2): `_load_module()`'s register-before-exec
+# must not destroy a same-named `sys.modules` entry that already existed
+# before the loader ran -- only the entry the loader itself inserted is ever
+# removed on failure; a pre-existing entry is restored.
+# ---------------------------------------------------------------------------
+
+
+def _patch_spec_from_file_location_to_fail(monkeypatch, expected_name):
+    """Return a REAL `ModuleSpec` (built via the genuine
+    `spec_from_file_location()`) so `module_from_spec()` / the import
+    machinery see a fully well-formed spec, with only `loader.exec_module()`
+    swapped out to raise -- isolates the `exec_module()` failure path
+    without hand-rolling a fake spec/loader pair that the frozen import
+    machinery rejects for missing attributes (`origin`,
+    `submodule_search_locations`, etc.)."""
+    original_spec_from_file_location = importlib.util.spec_from_file_location
+
+    def fake_spec_from_file_location(name, path):
+        assert name == expected_name
+        spec = original_spec_from_file_location(name, path)
+
+        def failing_exec_module(module):  # noqa: ARG001 - matches Loader.exec_module signature
+            raise RuntimeError("simulated exec_module failure")
+
+        spec.loader.exec_module = failing_exec_module
+        return spec
+
+    monkeypatch.setattr(importlib.util, "spec_from_file_location", fake_spec_from_file_location)
+
+
+def test_load_module_success_leaves_module_registered_under_its_own_name():
+    """#2713 AC10: the success path is unaffected by the restore-on-failure
+    logic -- the freshly executed module stays registered under its own
+    `sys.modules` name."""
+    module_name = "build_intake_capsule_load_module_success_test"
+    sys.modules.pop(module_name, None)
+    try:
+        loaded = mod._load_module(SCRIPT_PATH, module_name)
+        assert loaded is not None
+        assert sys.modules.get(module_name) is loaded
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_load_module_removes_only_its_own_newly_inserted_entry_on_failure(monkeypatch):
+    """#2713 AC10 (PR #2741 review, P2): WHEN `sys.modules` has NO prior
+    entry under the loader's module name AND `exec_module()` fails THEN
+    `_load_module()` pop()s the entry it itself inserted -- no dangling
+    half-initialized module is left behind."""
+    module_name = "build_intake_capsule_load_module_no_prior_test"
+    sys.modules.pop(module_name, None)
+
+    _patch_spec_from_file_location_to_fail(monkeypatch, module_name)
+
+    try:
+        mod._load_module(SCRIPT_PATH, module_name)
+        raise AssertionError("expected RuntimeError to propagate")
+    except RuntimeError:
+        pass
+    assert module_name not in sys.modules
+
+
+def test_load_module_restores_prior_entry_on_failure(monkeypatch):
+    """#2713 AC10 (PR #2741 review, P2): WHEN `sys.modules` ALREADY has an
+    entry under the loader's module name (from an unrelated prior load)
+    AND `exec_module()` fails THEN `_load_module()` restores that prior
+    entry -- it must never be left deleted or permanently clobbered by the
+    half-initialized failed module."""
+    module_name = "build_intake_capsule_load_module_prior_exists_test"
+    sentinel = types.ModuleType(module_name)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = sentinel
+    try:
+        _patch_spec_from_file_location_to_fail(monkeypatch, module_name)
+
+        try:
+            mod._load_module(SCRIPT_PATH, module_name)
+            raise AssertionError("expected RuntimeError to propagate")
+        except RuntimeError:
+            pass
+        assert sys.modules.get(module_name) is sentinel
+    finally:
+        if previous is not None:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)

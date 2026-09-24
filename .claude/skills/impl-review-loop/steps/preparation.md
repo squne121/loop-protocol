@@ -226,10 +226,24 @@ worktree 作成、new PR 作成のいずれよりも前に一度だけ実行す�
 landing authority ではない。`generic Refs`、title / branch regex、merged state、または
 `pr_merged_observed` 単独から landed を推論してはならない。
 
+**`--base-ac-verification-result-file`（#2713 AC8、PR #2741 レビュー P1-1）**:
+本 Step を実行する前に、下記「0-a-1」の条件 2 で説明する test-runner 評価
+（対象 Issue の Verification Commands を current main の `evidence_base_sha` に
+対して独立実行した `TEST_VERDICT_MACHINE/v2` 評価）を、`preflight-scope:
+pr_review_only` の VC のみで構成されていない限り常に先に実行し、結果を
+`$BASE_AC_VERIFICATION_RESULT_FILE` に保存する（詳細は「0-a-1」参照。この評価は
+下記 0-a-1 自身の `pr_exists` ゲート判定を待たない）。この JSON ファイルパスを
+`--base-ac-verification-result-file` として以下のコマンドへ additive に渡すことで、
+`apply_already_satisfied_precedence()` が `base_ac_satisfied` を判定できるようになる
+（未生成・未取得の場合はこのフラグを省略してよい。`build_intake_capsule.py` 側は
+`base_ac_verification_result` を `None` として fail-safe に扱い、precedence 合成を
+単に skip する ── 判定不能を固定 `True`/`False` へ捏造しない）。
+
 ```bash
 uv run python3 .claude/skills/impl-review-loop/scripts/build_intake_capsule.py \
   --issue-number <issue_number> --repo <owner/repo> --max-stdout-bytes 4096 \
-  --include-implementation-landed-evidence
+  --include-implementation-landed-evidence \
+  --base-ac-verification-result-file "$BASE_AC_VERIFICATION_RESULT_FILE"
 ```
 
 capsule の `implementation_landed_evidence.pre_step1_data_plane` は production
@@ -300,6 +314,11 @@ body sha256 / candidate head-or-merge-oid / current main sha を live 再取得�
 
 1. **PR 未作成（`no_linked_pr_ever` = true。`pr_exists` の否定）**: 対象 Issue に GitHub 上で構造化リンクされた PR が all-state（open/closed/merged）で一件も存在しない。判定には `gh pr list --search "<issue_number> in:body"` のような自由文検索を用いず、`gh pr list --repo <repo> --state all --json number,closingIssuesReferences` で取得できる `closingIssuesReferences`（構造化リンク情報）を用いる（`build_intake_capsule.py::_pr_closes_target_issue()` が個別 PR に対して採用している構造化リンク判定と同一パターンを、PR 一覧取得側で踏襲する。`build_intake_capsule.py` 自体は本 Issue の Allowed Paths 外であり変更しない）。取得した各エントリの `closingIssuesReferences[].number` のいずれかが対象 Issue 番号と一致する PR が1件でもあれば `pr_exists = true`（early-exit 不発）
 2. **base_ac_satisfied が true**: `evidence_base_sha`（current main HEAD の live SHA）を、`.claude/skills/issue-refinement-loop/scripts/root_entry_router.py` の `fetch_live_issue()` が使う既存パターンと同一の `gh api repos/<repo>/git/refs/heads/main --jq '.object.sha'` で取得する（ローカル worktree の `git rev-parse HEAD` は使わない。ローカル checkout の HEAD は live main と乖離しうるため）。取得した `evidence_base_sha` の checkout に対して `test-runner` SubAgent を独立実行し、対象 Issue の `## Verification Commands` を current main の checkout に対して評価させた `TEST_VERDICT_MACHINE/v2`（`head_sha` に `evidence_base_sha` を記録）の `runtime_ac_results` が全て `status: pass` であること
+
+**test-runner 評価の実行タイミングとファイル保存（#2713 AC8、PR #2741 レビュー P1-1）**:
+上記の test-runner 評価は、本 choke point 自身の判定条件 1（`pr_exists` ゲート）の成否とは無関係に、対象 Issue の `## Verification Commands` が構造的に評価可能な場合（下記「scope 限界」の `preflight-scope: pr_review_only` のみで構成されるケースを除く）は常に実行する。これは、closed-unmerged な候補が既に存在し条件 1 の `pr_exists` が `true` になって本 choke point 自体は不発になるケースでも、上記「0-a-0」の Disposition Precedence 合成（`apply_already_satisfied_precedence()`）が独立に同じ `base_ac_satisfied` を必要とするためである。
+
+この test-runner 評価は「0-a-0」（本 Step より前に実行される Evidence-Based Landing Disposition）よりも先に一度だけ実行し、結果の `TEST_VERDICT_MACHINE/v2` JSON を `$BASE_AC_VERIFICATION_RESULT_FILE` に保存する。「0-a-0」の `build_intake_capsule.py` 呼び出しはこのファイルを `--base-ac-verification-result-file` として消費し（上記「0-a-0」参照）、本 choke point 自身の条件 2 判定（`runtime_ac_results` が全て `status: pass`）も同じファイルの内容を再利用する ── test-runner を二重起動しない。本 choke point の early-exit 判定ロジック自体（`resolve_already_satisfied_early_exit_decision()` の呼び出し）はこの変更による影響を受けない。
 
 いずれか一方でも成立しない場合は本 choke point は不発（no-op）であり、通常どおり Step 1 へ進む。
 

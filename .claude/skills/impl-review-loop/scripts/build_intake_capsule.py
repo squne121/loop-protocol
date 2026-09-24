@@ -34,6 +34,20 @@ _ALLOWED_PATHS_GATE_PATH = (
     _REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts" / "allowed_paths_review_gate.py"
 )
 _IMPLEMENTATION_LANDED_EVIDENCE_PATH = _SCRIPT_DIR / "implementation_landed_evidence.py"
+# #2713 AC1: single production import site for the pre-Step-1 data-plane
+# route consumer (`resolve_pre_step1_data_plane_action()`).
+_ROUTE_LOOP_VERDICT_V2_PATH = _SCRIPT_DIR / "route_loop_verdict_v2.py"
+# #2713 In Scope: `product_spec_routing_action` is purely echoed as
+# provenance metadata by `resolve_already_satisfied_early_exit_decision()`
+# (it never affects the early_exit / dispatch_step1 boolean -- see that
+# function's docstring in route_loop_verdict_v2.py). This evidence-based
+# landing-disposition choke point (preparation.md "0-a-0") runs BEFORE
+# preparation.md's separate "1-d. Product Spec Check" step, so no real
+# `product_spec_preflight.routing_action` value exists yet at this call
+# site. Inventing an arbitrary real-looking value (e.g. "continue") here
+# would misrepresent a check that never ran, so an explicit, self-
+# documenting "not yet evaluated" sentinel is used instead.
+_PRE_STEP1_PRODUCT_SPEC_ROUTING_ACTION_NOT_YET_EVALUATED = "not_yet_evaluated_at_pre_step1_landing_disposition"
 _FENCED_YAML_RE = re.compile(r"```ya?ml[ \t]*\n(.*?)```", re.DOTALL)
 _CONTRACT_REVIEW_MARKER = "CONTRACT_REVIEW_RESULT_V1"
 # #1950 AC6-AC8: comment-id resolution for --human-context-comment-url /
@@ -125,7 +139,31 @@ def _load_module(path: Path, name: str) -> Any:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot_load_module:{path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    # #2713 AC4: register in sys.modules BEFORE exec_module() (matches
+    # route_loop_verdict_v2.py's own pattern, lines 696-698, and
+    # implementation_landed_evidence.py::_load_route_loop_verdict_v2_module()).
+    # route_loop_verdict_v2.py uses `from __future__ import annotations` with
+    # `@dataclass(frozen=True)` classes; CPython's dataclasses internals
+    # resolve stringified ClassVar/InitVar annotations via
+    # `sys.modules.get(cls.__module__)`, which raises AttributeError during
+    # class decoration if the module is not yet registered under its own
+    # __name__ at that point.
+    #
+    # #2713 AC10 (PR #2741 review, P2): register-before-exec must not destroy
+    # a same-named sys.modules entry that already existed BEFORE this loader
+    # ran. `prior_module` snapshots whatever was there first; on exec_module()
+    # failure, that original entry is restored (not merely pop()-ed) so only
+    # the entry this loader itself inserted is ever removed.
+    prior_module = sys.modules.get(spec.name)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        if prior_module is not None:
+            sys.modules[spec.name] = prior_module
+        else:
+            sys.modules.pop(spec.name, None)
+        raise
     return module
 
 
@@ -815,11 +853,72 @@ def _collect_implementation_landed_evidence(
     repo: str,
     issue_body: str,
     command_log: list[dict[str, Any]],
+    next_action_route: str | None = None,
+    base_ac_verification_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Collect bounded pre-Step-1 candidate evidence through the strict producer."""
+    """Collect bounded pre-Step-1 candidate evidence through the strict producer.
+
+    #2713: this is a single linear pipeline with no branch that re-derives
+    disposition a second time from raw evidence (AC5):
+
+    1. Evidence acquisition + freshness verification
+       (`resolve_landing_disposition_with_freshness_rebind()`).
+    2. Already-satisfied Disposition Precedence composition
+       (`implementation_landed_evidence.py::apply_already_satisfied_precedence()`,
+       AC3) using production-derived `pr_exists` / `base_ac_satisfied`
+       inputs (see below) -- never a test-injected boolean, and never a
+       fixed `True`/`False` fallback.
+    3. Exactly one call into
+       `route_loop_verdict_v2.py::resolve_pre_step1_data_plane_action()`
+       against the FINAL (post-composition) disposition (AC1/AC2) -- the
+       naive inline branch on the disposition name that used to live here
+       is gone; the production route module owns that mapping exclusively.
+    4. Non-destructive projection onto the existing `pre_step1_data_plane`
+       capsule shape (`start_data_plane` / `action` -- unchanged key set,
+       AC6).
+
+    `pr_exists` (AC3): NOT "a PR existed at some point in history" -- it is
+    "is the current landing-disposition candidate itself a target that a
+    resume/conflict determination could act on", derived from the SAME
+    candidate `resolve_landing_disposition_with_freshness_rebind()` already
+    resolved via
+    `implementation_landed_evidence.py::derive_pr_exists_from_landing_candidate()`
+    (open/draft/merged -> True, closed-unmerged/no-candidate -> False; see
+    that function's docstring for the closed-unmerged semantics).
+
+    `base_ac_satisfied` (AC3): derived from an independent
+    Verification-Commands evaluation of current main
+    (`base_ac_verification_result`, a TEST_VERDICT_MACHINE/v2-shaped
+    payload) via
+    `implementation_landed_evidence.py::derive_base_ac_satisfied_from_verification_result()`
+    (#2713 AC9: that function reuses `adjudicate_vc_result.py::
+    adapt_test_verdict_to_current_vc_result()`'s existing validation rather
+    than a second, weaker one), cross-checked against the SAME live
+    `main_head_sha` this evidence collection step already fetched
+    (`collect_candidate_inputs()`'s AC9 freshness reference) -- not a
+    caller-asserted boolean.
+
+    #2713 AC8 (PR #2741 review, P1-1): `build_intake_capsule.py` now wires a
+    real production source for `base_ac_verification_result` -- the
+    `--base-ac-verification-result-file <path>` CLI flag / the public
+    `build_intake_capsule()` function's `base_ac_verification_result`
+    parameter (see `main()` and `build_capsule_argv()` below; produced per
+    preparation.md "0-a-1"'s current-main test-runner evaluation). When the
+    caller supplies nothing (flag/parameter omitted, file missing, or file
+    unparseable), `base_ac_verification_result` stays `None` and the
+    derivation is undeterminable (`None`). Per #2713 In Scope, an
+    undeterminable `base_ac_satisfied` is never fabricated as a fixed
+    `True`/`False` -- `apply_already_satisfied_precedence()` is skipped
+    entirely in that case and the freshness-rebound landing disposition
+    passes through unchanged.
+    """
     module = _load_module(
         _IMPLEMENTATION_LANDED_EVIDENCE_PATH,
         "implementation_landed_evidence",
+    )
+    route_module = _load_module(
+        _ROUTE_LOOP_VERDICT_V2_PATH,
+        "route_loop_verdict_v2",
     )
 
     def recorded_run(argv: list[str]) -> tuple[int, str, str]:
@@ -845,19 +944,38 @@ def _collect_implementation_landed_evidence(
         current_scope=issue_body,
         run_command=recorded_run,
     )
+
+    # #2713 AC3: Disposition Precedence step 2. See docstring above for the
+    # `pr_exists` / `base_ac_satisfied` production-source semantics.
+    landing_disposition = evidence["landing_disposition"]
+    base_ac_satisfied = module.derive_base_ac_satisfied_from_verification_result(
+        base_ac_verification_result,
+        live_main_sha=evidence.get("main_head_sha"),
+    )
+    if base_ac_satisfied is None:
+        final_disposition = landing_disposition
+    else:
+        pr_exists = module.derive_pr_exists_from_landing_candidate(landing_disposition.get("candidate"))
+        final_disposition = module.apply_already_satisfied_precedence(
+            landing_disposition,
+            next_action_route=next_action_route or "unknown",
+            product_spec_routing_action=_PRE_STEP1_PRODUCT_SPEC_ROUTING_ACTION_NOT_YET_EVALUATED,
+            pr_exists=pr_exists,
+            base_ac_satisfied=base_ac_satisfied,
+        )
+    evidence["landing_disposition"] = final_disposition
+
+    # #2713 AC1/AC2/AC5: exactly one call into the production route module's
+    # `resolve_pre_step1_data_plane_action()`, against the FINAL disposition.
     # This is the production control-plane projection consumed before any
     # worker/worktree/new-PR invocation.  It is deliberately explicit rather
     # than leaving callers to infer suppression from a prose disposition.
-    disposition = evidence["landing_disposition"]["disposition"]
+    data_plane = route_module.resolve_pre_step1_data_plane_action(final_disposition)
+    # #2713 AC6: the existing capsule key set (`start_data_plane` / `action`)
+    # is unchanged.
     evidence["pre_step1_data_plane"] = {
-        "start_data_plane": disposition == "ordinary_dispatch_or_explicit_recovery",
-        "action": (
-            "dispatch_step1"
-            if disposition == "ordinary_dispatch_or_explicit_recovery"
-            else "resume_existing_pr"
-            if disposition == "existing_pr_resume"
-            else "suppress_worker_worktree_new_pr"
-        ),
+        "start_data_plane": data_plane["start_data_plane"],
+        "action": data_plane["action"],
     }
     return evidence
 
@@ -869,6 +987,7 @@ def build_intake_capsule(
     human_context_comment_urls: list[str] | None = None,
     agent_report_comment_urls: list[str] | None = None,
     include_implementation_landed_evidence: bool = False,
+    base_ac_verification_result: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
     # #1869 fix_delta P0-4: `errors` is split into `fatal_errors` (blocks
     # intake / forces exit 1 — reserved for live Issue not accessible,
@@ -1063,8 +1182,19 @@ def build_intake_capsule(
         implementation_landed_evidence = _collect_implementation_landed_evidence(
             issue_number=issue_number,
             repo=repo,
+            next_action_route=next_action["route"],
             issue_body=issue_meta["body"],
             command_log=command_log,
+            # #2713 AC8 (PR #2741 review, P1-1): the canonical CLI/public-API
+            # boundary for supplying an independent current-main Verification
+            # Commands evaluation -- see `main()`'s
+            # `--base-ac-verification-result-file` flag and
+            # `build_capsule_argv()`'s `base_ac_verification_result_file`
+            # kwarg below. Defaults to None (undeterminable) when the caller
+            # supplies nothing, which `_collect_implementation_landed_
+            # evidence()` already treats as "skip already_satisfied
+            # precedence" (never a fabricated True/False).
+            base_ac_verification_result=base_ac_verification_result,
         )
 
     capsule = {
@@ -1159,13 +1289,19 @@ def build_capsule_argv(
     human_context_comment_urls: list[str] | None = None,
     agent_report_comment_urls: list[str] | None = None,
     include_implementation_landed_evidence: bool = False,
+    base_ac_verification_result_file: str | None = None,
 ) -> list[str]:
     """Pure (no I/O, no subprocess) argv materializer for the canonical
     `build_intake_capsule.py` invocation. When `human_context_comment_urls` /
     `agent_report_comment_urls` are non-empty, the SAME two flags
     (`--human-context-comment-url` / `--agent-report-comment-url`) are
     appended additively -- this is not a separate code path, it is the same
-    canonical command with additive flags (see preparation.md "0-a")."""
+    canonical command with additive flags (see preparation.md "0-a").
+
+    #2713 AC8 (PR #2741 review, P1-1): `base_ac_verification_result_file`,
+    when non-None, additively appends `--base-ac-verification-result-file
+    <path>` -- the SSOT for preparation.md "0-a-0"'s canonical invocation
+    (see preparation.md "0-a-1" for where that file is produced)."""
     argv = [
         "uv",
         "run",
@@ -1184,6 +1320,8 @@ def build_capsule_argv(
         argv += ["--agent-report-comment-url", url]
     if include_implementation_landed_evidence:
         argv.append("--include-implementation-landed-evidence")
+    if base_ac_verification_result_file:
+        argv += ["--base-ac-verification-result-file", base_ac_verification_result_file]
     return argv
 
 
@@ -1292,6 +1430,23 @@ def main() -> int:
         action="store_true",
         help="collect bounded candidate evidence for the pre-Step-1 landing disposition",
     )
+    # #2713 AC8 (PR #2741 review, P1-1): canonical CLI boundary for supplying
+    # an independent current-main Verification Commands evaluation
+    # (TEST_VERDICT_MACHINE/v2-shaped JSON file, see preparation.md "0-a-1")
+    # so `already_satisfied` precedence can actually fire from production
+    # (not merely from a private-helper direct argument injection in tests).
+    # A large TEST_VERDICT payload is passed by file path, never embedded
+    # directly into argv.
+    parser.add_argument(
+        "--base-ac-verification-result-file",
+        dest="base_ac_verification_result_file",
+        default=None,
+        help=(
+            "path to a TEST_VERDICT_MACHINE/v2-shaped JSON file (current-main "
+            "Verification Commands evaluation) used to derive base_ac_satisfied "
+            "for already_satisfied precedence (#2713)"
+        ),
+    )
     # #1950 AC6: provenance-separated context inputs. Origin is decided
     # solely by which flag the caller used -- never inferred from comment
     # body/author. Repeatable; same URL passed to both flags is a
@@ -1325,6 +1480,25 @@ def main() -> int:
         )
         return 1
 
+    # #2713 AC8 (PR #2741 review, P1-1): fail-safe file load -- a missing or
+    # malformed --base-ac-verification-result-file must never block intake
+    # or be silently promoted to a fabricated True/False. It degrades to
+    # None (undeterminable), which `_collect_implementation_landed_evidence()`
+    # already treats as "skip already_satisfied precedence, pass the
+    # existing disposition through unchanged" (#2713 In Scope).
+    base_ac_verification_result: dict[str, Any] | None = None
+    if args.base_ac_verification_result_file:
+        try:
+            loaded_verification_result = json.loads(
+                Path(args.base_ac_verification_result_file).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            base_ac_verification_result = None
+        else:
+            base_ac_verification_result = (
+                loaded_verification_result if isinstance(loaded_verification_result, dict) else None
+            )
+
     capsule, artifact_payload, exit_code = build_intake_capsule(
         issue_number=args.issue_number,
         repo=args.repo,
@@ -1332,6 +1506,7 @@ def main() -> int:
         human_context_comment_urls=args.human_context_comment_urls,
         agent_report_comment_urls=args.agent_report_comment_urls,
         include_implementation_landed_evidence=args.include_implementation_landed_evidence,
+        base_ac_verification_result=base_ac_verification_result,
     )
 
     artifact_dir = Path(args.artifact_dir)
