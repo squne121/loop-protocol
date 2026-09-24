@@ -440,7 +440,7 @@ def test_default_claude_code_sessions_dir_env_override_takes_precedence(tmp_path
 
 def test_default_claude_code_sessions_dir_falls_back_to_home_convention(tmp_path):
     resolved = rr.default_claude_code_sessions_dir({"HOME": str(tmp_path)}, repo_root=tmp_path)
-    expected_slug = str(tmp_path.resolve()).replace("/", "-")
+    expected_slug = rr._claude_code_project_slug(tmp_path)
     assert resolved == tmp_path / ".claude" / "projects" / expected_slug
 
 
@@ -488,7 +488,7 @@ def test_collect_session_sources_unwired_when_env_unresolvable(tmp_path):
 
 
 def test_collect_session_sources_wires_real_claude_code_collector(tmp_path):
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -578,7 +578,7 @@ def test_collect_session_sources_applies_window_bounds_to_claude_code(tmp_path):
     window bounds into `resolve_claude_code_session_paths` -- a source that
     globs to 2 files unconditionally globs to only the in-window one when a
     window is supplied."""
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "old.jsonl").write_text(
@@ -609,7 +609,7 @@ def test_run_since_last_retrospective_cli_second_run_excludes_prior_window_sessi
     than an unbounded first run -- not the same "all sessions" result every
     time (the exact false-green Finding 1 identified)."""
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "before.jsonl").write_text(
@@ -767,7 +767,7 @@ def test_run_since_last_retrospective_cli_claude_gpt_uses_real_nonce_not_run_id(
 
 def test_run_since_last_retrospective_cli_writes_watermark_file_on_advancement(tmp_path):
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -799,7 +799,7 @@ def test_run_since_last_retrospective_cli_coverage_only_never_advances_checkpoin
     checkpoint or write the watermark file, since observer/evaluator/finalize
     never ran."""
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -844,7 +844,7 @@ def test_run_since_last_retrospective_cli_second_invocation_reads_back_written_w
     supply a (stub) successful analysis_runner, since coverage-only
     invocations can no longer durably write the watermark at all."""
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -925,7 +925,7 @@ def test_run_since_last_retrospective_cli_missing_watermark_file_with_wired_coll
     successful analysis_runner, since coverage alone can no longer advance
     the checkpoint."""
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -1065,7 +1065,7 @@ def test_compute_session_window_reuses_supplied_window_end_verbatim():
 
 def test_ac5_guard_still_blocks_after_selector_fix_when_source_regresses(tmp_path):
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -1111,7 +1111,7 @@ def test_run_since_last_retrospective_cli_end_to_end_complete_with_real_session_
     to actually reach `checkpoint_advanced: True` -- coverage alone
     (`analysis_completeness: "complete"`) is no longer sufficient."""
     (tmp_path / ".git").mkdir()
-    slug = str(tmp_path.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(tmp_path)
     sessions_dir = tmp_path / ".claude" / "projects" / slug
     sessions_dir.mkdir(parents=True)
     (sessions_dir / "session1.jsonl").write_text(
@@ -1155,3 +1155,121 @@ def test_main_since_last_retrospective_flag_bypasses_required_target_issue_args(
 def test_main_default_mode_still_requires_target_issue_args():
     with pytest.raises(SystemExit):
         rr.main(["--repo-root", str(_SKILL_DIR)])
+
+
+# ---------------------------------------------------------------------------
+# Issue #2714: Claude Code top-level physical discovery and fail-safe logical
+# grouping. These cases use real JSONL fixture files and production collector
+# wiring; no public schema or collect_snapshot provenance semantics change.
+# ---------------------------------------------------------------------------
+
+
+def _write_claude_code_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+
+def _claude_code_sessions_dir(tmp_path: Path) -> Path:
+    sessions_dir = tmp_path / ".claude" / "projects" / rr._claude_code_project_slug(tmp_path)
+    sessions_dir.mkdir(parents=True)
+    return sessions_dir
+
+
+def test_claude_code_project_slug_normalizes_non_alphanumeric_for_bounded_paths():
+    assert rr._claude_code_project_slug(Path("/home/squne/projects/LOOP_PROTOCOL")) == (
+        "-home-squne-projects-LOOP-PROTOCOL"
+    )
+    assert rr._claude_code_project_slug(Path("/home/squne/project.v1_name")) == "-home-squne-project-v1-name"
+
+
+def test_claude_code_paths_are_top_level_only_before_existing_window_filter(tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    nested_dir = sessions_dir / "any-nested-directory"
+    nested_dir.mkdir(parents=True)
+    _write_claude_code_jsonl(
+        sessions_dir / "in-window.jsonl", [{"timestamp": "2026-06-15T00:00:00Z", "sessionId": "in"}]
+    )
+    _write_claude_code_jsonl(
+        sessions_dir / "out-of-window.jsonl", [{"timestamp": "2026-05-15T00:00:00Z", "sessionId": "out"}]
+    )
+    _write_claude_code_jsonl(
+        nested_dir / "nested.jsonl", [{"timestamp": "2026-06-15T00:00:00Z", "sessionId": "nested"}]
+    )
+
+    paths = rr.resolve_claude_code_session_paths(
+        sessions_dir,
+        min_completed_at="2026-06-01T00:00:00Z",
+        max_completed_at="2026-07-01T00:00:00Z",
+    )
+    assert [path.name for path in paths] == ["in-window.jsonl"]
+
+
+def test_claude_code_logical_identity_grouping_fail_safe_matrix(tmp_path):
+    def count_for(name: str, record_sets: list[list[dict[str, Any]]]) -> int:
+        directory = tmp_path / name
+        directory.mkdir()
+        paths = []
+        for index, records in enumerate(record_sets):
+            path = directory / f"{index}.jsonl"
+            _write_claude_code_jsonl(path, records)
+            paths.append(path)
+        return rr._claude_code_logical_session_count(paths)
+
+    assert count_for("same", [[{"sessionId": "same"}], [{"sessionId": "same"}]]) == 1
+    assert count_for("different", [[{"sessionId": "one"}], [{"sessionId": "two"}]]) == 2
+    assert count_for("missing", [[{"type": "user"}], [{"type": "assistant"}]]) == 2
+    assert count_for("conflicting", [[{"sessionId": "shared"}, {"sessionId": "other"}], [{"sessionId": "shared"}]]) == 2
+
+    absent_values: list[Any] = [None, 1, {}, [], True, "", "   "]
+    assert count_for("absent-values", [[{"sessionId": value}] for value in absent_values]) == len(absent_values)
+    assert count_for("raw-not-trimmed", [[{"sessionId": "same"}], [{"sessionId": " same "}]]) == 2
+
+
+def test_claude_code_logical_count_reaches_public_coverage_without_schema_change(tmp_path):
+    sessions_dir = _claude_code_sessions_dir(tmp_path)
+    _write_claude_code_jsonl(sessions_dir / "one.jsonl", [{"sessionId": "logical-id"}])
+    _write_claude_code_jsonl(sessions_dir / "two.jsonl", [{"sessionId": "logical-id"}])
+
+    results = rr.collect_session_sources(
+        required_sources=["claude_code"], env={"HOME": str(tmp_path)}, repo_root=tmp_path, clock=_clock
+    )
+    collector_result = results["claude_code"]
+    assert collector_result is not None
+    provenance = collector_result.private_evidence["provenance"]
+    assert provenance["session_count"] == 2
+    assert provenance["sessions_read"] == 2
+    assert provenance["logical_session_count"] == 1
+
+    coverage = rr.compute_source_coverage_entry("claude_code", collector_result, required=True)
+    assert coverage["selected_session_count"] == 1
+    assert "logical_session_count" not in coverage
+
+
+def test_claude_code_logical_count_production_path_and_legacy_fallback(tmp_path):
+    sessions_dir = _claude_code_sessions_dir(tmp_path)
+    _write_claude_code_jsonl(sessions_dir / "one.jsonl", [{"sessionId": "same"}])
+    _write_claude_code_jsonl(sessions_dir / "two.jsonl", [{"sessionId": "same"}])
+    result = rr.collect_session_sources(
+        required_sources=["claude_code"], env={"HOME": str(tmp_path)}, repo_root=tmp_path, clock=_clock
+    )["claude_code"]
+    assert result is not None
+    coverage = rr.compute_source_coverage_map(["claude_code"], {"claude_code": result})
+    assert coverage["claude_code"]["selected_session_count"] == 1
+
+    assert rr._selected_session_count("claude_code", {"provenance": {"sessions_read": 3}}) == 3
+    assert rr._selected_session_count("claude_gpt", {"provenance": {"complete_sessions": ["a", "b"]}}) == 2
+
+
+def test_nested_only_claude_code_history_remains_source_not_present(tmp_path):
+    sessions_dir = _claude_code_sessions_dir(tmp_path)
+    nested_dir = sessions_dir / "opaque-child"
+    nested_dir.mkdir()
+    _write_claude_code_jsonl(nested_dir / "nested.jsonl", [{"sessionId": "nested"}])
+
+    result = rr.collect_session_sources(
+        required_sources=["claude_code"], env={"HOME": str(tmp_path)}, repo_root=tmp_path, clock=_clock
+    )["claude_code"]
+    assert result is not None
+    assert result.private_evidence["provenance"]["session_count"] == 0
+    assert result.private_evidence["provenance"]["logical_session_count"] == 0
+    coverage = rr.compute_source_coverage_entry("claude_code", result, required=True)
+    assert coverage == {"status": "unavailable", "reason_code": "source_not_present", "selected_session_count": None}
