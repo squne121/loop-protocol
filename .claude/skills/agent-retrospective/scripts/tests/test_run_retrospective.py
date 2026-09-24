@@ -39,6 +39,7 @@ Plus the 12 production-shaped fix_delta gates required by OWNER review #3
 
 from __future__ import annotations
 
+import argparse
 import copy
 import dataclasses
 import hashlib
@@ -3913,3 +3914,176 @@ def test_run_cli_shares_frozen_runtime_results_for_two_simultaneous_runtime_sour
     # persisted `source_observations` matches both.
     assert publish_request.run_identity["source_set_digest"] == expected_digest
     assert rr.compute_source_set_digest(observations) == expected_digest
+
+
+# ---------------------------------------------------------------------------
+# Issue #2715: --since-last-retrospective / --enable-full-analysis /
+# --publish-authorized help-string consistency + conditional validation
+# ---------------------------------------------------------------------------
+
+
+def _flag_help(parser: argparse.ArgumentParser, option_string: str) -> str:
+    for action in parser._actions:  # noqa: SLF001 -- test-only introspection, mirrors existing rr._* access pattern
+        if option_string in action.option_strings:
+            assert action.help is not None
+            return action.help
+    raise AssertionError(f"no action registered for {option_string!r}")
+
+
+def test_help_strings_mutually_reference_the_enable_full_analysis_publish_authorized_contract() -> None:
+    # AC1/AC4: the three help strings must not be read in isolation --
+    # each one that participates in the connected full-analysis contract
+    # must point at the others, so the valid combination (AC1) is readable
+    # from any one of the three.
+    parser = rr._build_arg_parser()
+    since_help = _flag_help(parser, "--since-last-retrospective")
+    enable_help = _flag_help(parser, "--enable-full-analysis")
+    publish_help = _flag_help(parser, "--publish-authorized")
+
+    assert "--enable-full-analysis" in since_help
+    assert "--publish-authorized" in since_help
+    assert "--publish-authorized" in enable_help
+    assert "--repository-id" in enable_help and "--target-issue" in enable_help
+    assert "--enable-full-analysis" in publish_help
+
+
+def test_help_strings_document_enable_full_analysis_rejection_without_publish_authorized() -> None:
+    # AC1/AC2: --enable-full-analysis's own help must state that omitting
+    # --publish-authorized is rejected (parser.error()/SystemExit(2)),
+    # never described as an accepted/no-op combination.
+    parser = rr._build_arg_parser()
+    enable_help = _flag_help(parser, "--enable-full-analysis")
+    assert "parser.error" in enable_help
+    assert "SystemExit(2)" in enable_help
+
+
+def test_publish_authorized_help_does_not_read_as_github_comment_publication_only() -> None:
+    # AC5: --publish-authorized must not be described as authorizing ONLY
+    # GitHub comment publication -- it must also document that it gates
+    # whether --enable-full-analysis's pipeline attempt runs at all.
+    parser = rr._build_arg_parser()
+    publish_help = _flag_help(parser, "--publish-authorized")
+    assert "NOT limited to authorizing GitHub comment publication" in publish_help
+    assert "--enable-full-analysis" in publish_help
+    assert "gates" in publish_help
+
+
+def test_since_last_retrospective_help_does_not_unconditionally_claim_identifiers_are_ignored() -> None:
+    # AC1/AC4: the old wording unconditionally said the full-analysis
+    # identifiers "are ignored" when --since-last-retrospective is set --
+    # that is false once --enable-full-analysis is ALSO supplied (Issue
+    # #2644). The help text must scope that claim to the "by itself" case
+    # and cross-reference the combined case.
+    parser = rr._build_arg_parser()
+    since_help = _flag_help(parser, "--since-last-retrospective")
+    assert "BY ITSELF" in since_help
+    assert "required again" in since_help
+
+
+def test_enable_full_analysis_without_publish_authorized_rejected(capsys: pytest.CaptureFixture[str]) -> None:
+    # AC2/AC3: --enable-full-analysis without --publish-authorized is
+    # rejected via the existing parser.error()/SystemExit(2) pattern
+    # (never a success/no-op), even when every other required identifier
+    # is supplied.
+    with pytest.raises(SystemExit) as excinfo:
+        rr.main(
+            [
+                "--since-last-retrospective",
+                "--enable-full-analysis",
+                "--repository-id",
+                "squne121/loop-protocol",
+                "--target-issue",
+                "2715",
+                "--request-id",
+                "req-2715",
+                "--idempotency-key",
+                "idem-2715",
+            ]
+        )
+    assert excinfo.value.code == 2
+    assert "--publish-authorized" in capsys.readouterr().err
+
+
+def test_enable_full_analysis_without_publish_authorized_rejected_without_since_last_retrospective(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # AC2: the rejection is not conditioned on --since-last-retrospective
+    # also being supplied -- a bare --enable-full-analysis invocation is
+    # rejected the same way.
+    with pytest.raises(SystemExit) as excinfo:
+        rr.main(["--enable-full-analysis"])
+    assert excinfo.value.code == 2
+    assert "--publish-authorized" in capsys.readouterr().err
+
+
+def test_enable_full_analysis_with_publish_authorized_still_requires_identifiers(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # AC3/AC7: the NEW --publish-authorized validation must not weaken the
+    # PRE-EXISTING Issue #2644 required-identifiers validation --
+    # supplying --publish-authorized alone is still insufficient.
+    with pytest.raises(SystemExit) as excinfo:
+        rr.main(["--since-last-retrospective", "--enable-full-analysis", "--publish-authorized"])
+    assert excinfo.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "--repository-id" in stderr
+
+
+def test_enable_full_analysis_valid_combination_reaches_analysis_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC1: the fully-valid combination (all three flags + required
+    # identifiers) must reach `run_since_last_retrospective_cli()` with a
+    # real `analysis_runner` and `publish_authorized=True` -- the new
+    # validation must never reject a legitimate invocation.
+    captured: dict[str, Any] = {}
+
+    def _fake_run_since_last_retrospective_cli(**kwargs: Any) -> dict[str, Any]:
+        captured["publish_authorized"] = kwargs["publish_authorized"]
+        captured["analysis_runner_supplied"] = kwargs["analysis_runner"] is not None
+        return {"schema_version": "session_window_coverage/v1"}
+
+    monkeypatch.setattr(rr, "run_since_last_retrospective_cli", _fake_run_since_last_retrospective_cli)
+
+    exit_code = rr.main(
+        [
+            "--since-last-retrospective",
+            "--enable-full-analysis",
+            "--publish-authorized",
+            "--repository-id",
+            "squne121/loop-protocol",
+            "--target-issue",
+            "2715",
+            "--request-id",
+            "req-2715",
+            "--idempotency-key",
+            "idem-2715",
+            "--state-backend",
+            "fixture",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["publish_authorized"] is True
+    assert captured["analysis_runner_supplied"] is True
+
+
+def test_since_last_retrospective_alone_is_unaffected_by_new_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC6: a coverage-only invocation (--since-last-retrospective without
+    # --enable-full-analysis) must be completely unaffected by the new
+    # conditional validation -- `analysis_runner` stays `None` and no
+    # SystemExit is raised.
+    captured: dict[str, Any] = {}
+
+    def _fake_run_since_last_retrospective_cli(**kwargs: Any) -> dict[str, Any]:
+        captured["analysis_runner"] = kwargs["analysis_runner"]
+        return {"schema_version": "session_window_coverage/v1"}
+
+    monkeypatch.setattr(rr, "run_since_last_retrospective_cli", _fake_run_since_last_retrospective_cli)
+
+    exit_code = rr.main(["--since-last-retrospective"])
+
+    assert exit_code == 0
+    assert captured["analysis_runner"] is None
