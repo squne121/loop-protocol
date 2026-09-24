@@ -903,3 +903,59 @@ raw claude stderr／proxy log／transcript ファイルの存在有無を証跡�
 再現した場合のみ具体的な原因を特定することを推奨する。現時点でこれを
 「Claude-GPT の exact restore が構造的に不可能」と結論づける根拠はない
 （実際に direct reproduction では exact restore が機能することを確認した）。
+
+**Real Herdr canary（PR #2731、2026-09-24）完全実施結果**: disposable named
+Herdr session（`resume_agents_on_restore=false` + `[[startup]]` plugin hook、
+cleanup 済み）で、production dispatcher（`task_context_resume_dispatcher.py`）
+と `scripts/claude-gpt/launch.sh` を実際に使用し、Native／Claude-GPT 両方の
+end-to-end cold-restart resume を実機で確認した。
+
+- Native: 対象 pane の Claude プロセスと disposable session の herdr server
+  プロセス自体を `kill -9`（graceful `herdr session stop` ではなく、真の
+  crash/cold-restart を模する abrupt kill）し、同一 session を cold start。
+  `[[startup]]` hook が人間操作なしで自動発火（`HERDR_PLUGIN_EVENT=startup`
+  を観測）し、dispatcher が `launch_native` を判定して実際に
+  `herdr agent start ... --resume S` を dispatch（`dispatched: true`）。
+  再開後プロセスへの新規 prompt で事前に伝えた canary token を正確に live
+  recall。Task Context DB 上で旧 ExecutionRun の `ended_at` と新
+  ExecutionRun の `started_at` がミリ秒単位で連続し、同一 binding
+  ・同一 `claude_session_id` を維持したまま locator（`runtime_locations`）
+  が re-home されたことを確認。`/proc/<pid>/status` の `PPid` 連鎖を
+  再開後プロセスから遡り、disposable session 自身の herdr server プロセスに
+  到達すること（OS-level process-parentage evidence）を確認した。
+- Claude-GPT: 同様の abrupt kill + cold restart 手順で、dispatcher が
+  `launch_claude_gpt` を判定し、実際に `scripts/claude-gpt/launch.sh --
+  --resume S` を dispatch。生成されたプロセスの実際の argv
+  （`claude --strict-mcp-config --mcp-config .../mcp-empty.json --settings
+  .../settings.local.json ... --resume S`）を `/proc/<pid>/cmdline` で確認し、
+  plain Native `claude --resume` への fallback がないことを確認（AC6）。
+  再開後の新規 prompt で canary token を正確に live recall し、OS-level
+  process-parentage も同じく disposable session の herdr server まで遡れる
+  ことを確認した。
+- SUSPENDED: 通常の `/quit` で SUSPENDED にした binding は、cold restart 後も
+  `classify_for_resume` が `noop_suspended_no_auto_resume` を返し、対象 pane
+  に新しい agent_session が一切現れないことを確認した。
+- default/human Herdr session の workspace/pane 構成は前後で不変であることを
+  確認し、disposable session・plugin は完全に stop/delete/unlink 済み。
+
+**運用上の知見（2 件、コードの契約変更は不要）**:
+
+1. `herdr session stop`（graceful stop）は各 pane の Claude プロセスに
+   通常終了の機会を与えるため、Claude Code 自身の SessionEnd 相当の処理が
+   走り、`runtime_health` が `ACTIVE` のままではなく `SUSPENDED` に変わって
+   しまう（`/quit` と同じ経路）。真の「Herdr cold restart」（ホスト
+   crash/reboot 相当で `ACTIVE` な binding が resume 対象になるケース）を
+   模す場合は、対象プロセスと herdr server プロセス自体を `kill -9` する
+   必要がある。graceful stop は「意図的な session 終了」の妥当な扱いであり
+   実装のバグではないが、今後 canary を再実行する際の前提として明記する。
+2. `scripts/claude-gpt/launch.sh` は `herdr pane report-agent-session` を
+   呼ばないため、Herdr 自身の `pane.get`/`pane.list` の `agent_session`
+   フィールドは Claude-GPT pane には決して現れない（`herdr agent start
+   --kind claude` 経由の Native pane にのみ現れる）。将来 operator が
+   `[[startup]]` hook の複数 pane enumeration orchestrator（本 Issue の
+   Allowed Paths 外、運用側で用意するもの）を実装する際は、Herdr 自身の
+   `agent_session` フィールドではなく、Task Context 自身の
+   `runtime_locations`/`tab_bindings`（`herdr_locator` で該当 pane を照合し
+   `current_claude_session_id` を取得）を discovery のソースにする必要が
+   ある。本 canary ではこの方法で実際に `--session-id`/`--pane-id` を
+   dispatcher へ渡し、Claude-GPT の resume が問題なく機能することを確認した。
