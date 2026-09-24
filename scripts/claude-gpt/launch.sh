@@ -869,8 +869,9 @@ HOOKS_JSON_FRAGMENT=',
 #     have all been removed along with the gate itself. ---
 
 # --- launcher-owned autoMode policy（Issue #2203, second-gate 判断補助。
-#     決定論的 authority は permissions.deny / PreToolUse hook / GitHub mutation
-#     transaction broker であり、この autoMode は project .claude/settings*.json
+#     autoMode は second gate（Auto mode classifier への判断補助）であり、
+#     repository security authority ではない（詳細は lib.sh の policy prose
+#     および Issue #2223 参照）。この autoMode は project .claude/settings*.json
 #     ではなくこの launcher-owned --settings にのみ注入する） ---
 AUTO_MODE_JSON_FRAGMENT=$(claude_gpt_auto_mode_json_fragment)
 
@@ -1068,9 +1069,16 @@ fi
 #     effective readback（`preflight.sh --auto-mode-check`）を実行する（P0-3,
 #     PR #2214 OWNER adversarial review 反映）。従来はこの opt-in サブコマンドが
 #     通常起動へ一度も配線されておらず、readback 未実行のまま launch_result が
-#     ok を返せてしまっていた。readback 失敗（未対応 version・narrow label 未反映・
-#     hard_deny/soft_deny 不整合・classifyAllShell 未有効化のいずれか）は fail-closed
-#     で起動を止める。 ---
+#     ok を返せてしまっていた。
+#     launcher-generated `autoMode` は `classifyAllShell` キーを生成しない
+#     （PR #2717 / Issue #2709）。preflight は key omission と native
+#     direct-readback availability を tri-state evidence
+#     （generated_key_present / direct_readback_available / effective_value）
+#     として記録するだけであり、version support floor 単独や
+#     `direct_readback_available=false` 単独では起動を拒否しない。
+#     起動可否は preflight の exit code を正本とし、詳細な fail-closed reason
+#     の SSOT は `preflight.sh` / `lib.sh` の V2 contract を参照する
+#     （本コメントに個別 reason を再列挙しない）。 ---
 export CLAUDE_GPT_CLAUDE_BIN="$CLAUDE_BIN"
 AUTO_MODE_CHECK_JSON=$("$SCRIPT_DIR/preflight.sh" --auto-mode-check "$SETTINGS_PATH")
 AUTO_MODE_CHECK_RC=$?
