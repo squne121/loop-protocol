@@ -2965,7 +2965,7 @@ def test_ac1_since_last_selected_session_sentinel_reaches_runtime_observer_input
     (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
 
     fake_home = tmp_path / "home"
-    slug = str(repo_root.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(repo_root)
     sentinel = "SENTINEL-AC1-f3d8c1a2"
     _write_sentinel_session(fake_home / ".claude" / "projects" / slug, sentinel)
 
@@ -3129,7 +3129,7 @@ def test_checkpoint_not_advanced_on_observer_or_evaluator_failure(tmp_path: Path
     (schema_dir / "evaluation_result_v1.schema.json").write_text("{}", encoding="utf-8")
 
     fake_home = tmp_path / "home"
-    slug = str(repo_root.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(repo_root)
     _write_sentinel_session(fake_home / ".claude" / "projects" / slug, "SENTINEL-AC5")
     watermark_file = tmp_path / "watermark.json"
 
@@ -3190,7 +3190,7 @@ def test_checkpoint_advances_once_on_success(tmp_path: Path) -> None:
     (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
 
     fake_home = tmp_path / "home"
-    slug = str(repo_root.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(repo_root)
     _write_sentinel_session(fake_home / ".claude" / "projects" / slug, "SENTINEL-AC6")
     watermark_file = tmp_path / "watermark.json"
 
@@ -3270,7 +3270,7 @@ def test_checkpoint_advances_independent_of_publication_success(tmp_path: Path) 
     (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
 
     fake_home = tmp_path / "home"
-    slug = str(repo_root.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(repo_root)
     _write_sentinel_session(fake_home / ".claude" / "projects" / slug, "SENTINEL-AC10")
     watermark_file = tmp_path / "watermark.json"
 
@@ -3367,7 +3367,7 @@ def test_p1_4_connected_analysis_reaches_runtime_unavailable_indeterminate_branc
     (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
 
     fake_home = tmp_path / "home"
-    slug = str(repo_root.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(repo_root)
     # ONLY claude_code is wired (a real sentinel session); claude_gpt IS
     # required but its env var (`CLAUDE_GPT_HOOK_SINK_PATH`) is deliberately
     # never set in `env` below -- `collect_session_sources` therefore never
@@ -3619,7 +3619,7 @@ def test_run_cli_shares_frozen_runtime_result_between_observer_and_digest_and_ig
     (schema_dir / "codebase_investigation_result_v1.schema.json").write_text("{}", encoding="utf-8")
 
     fake_home = tmp_path / "home"
-    slug = str(repo_root.resolve()).replace("/", "-")
+    slug = rr._claude_code_project_slug(repo_root)
     sentinel = "SENTINEL-2664-AC1-pre-freeze"
     sessions_dir = fake_home / ".claude" / "projects" / slug
     _write_sentinel_session(sessions_dir, sentinel)
