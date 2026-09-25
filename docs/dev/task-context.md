@@ -1103,19 +1103,46 @@ process-info --pane <locator>` を追加で呼び出し、3 値
 read-only 取得後・dispatch 前）で完結し、二段階復元状態遷移の atomic
 性は変更しない。
 
+**PR #2764 OWNER review による契約修正（2026-09-25、
+[issuecomment-5832937110](https://github.com/squne121/loop-protocol/pull/2764#issuecomment-5832937110)）**:
+`PROVEN_ALIVE` は「対象の Task Context Binding/session への causal
+identity evidence が確立できる場合に限る」と定義を狭めた。`herdr pane
+process-info` は pane の *現在の* foreground job を返すだけで、それが
+「この Binding/session が最後に起動した、まさにその runtime process」で
+あることを一切保証しない（別の人間コマンド／無関係なツールが同じ pane の
+foreground を占有していても区別できない）。このため:
+
+- `foreground_processes` に shell 以外の entry が1件でもある、または
+  `foreground_process_group_id` が `shell_pid` と単に数値として異なる、
+  というだけでは `PROVEN_ALIVE` にしない（従来の誤った判定を修正）。この
+  causal identity evidence を現在の Herdr 0.9.1 primitive だけでは確立
+  できないため、`_classify_pane_process_liveness()` は現状 `PROVEN_ALIVE`
+  へ実質的に到達しない（`UNKNOWN` を返す）。将来 identity-bound evidence
+  を追加する場合は別 Issue の scope とする（tri-state 語彙・
+  `live_runtime_preserved` result bucket 自体は変更しない）。
+- `shell_pid` が欠落／`None`／正の整数でない場合は、
+  `foreground_process_group_id` の有無にかかわらず必ず `UNKNOWN` にする
+  （比較の anchor が無効なまま `PROVEN_ABSENT`/`PROVEN_ALIVE` のどちらに
+  も倒さない）。
+
 ```text
 locator が live_pane_ids に存在する ACTIVE Binding（一意 claimant）
   -> herdr pane process-info --pane <locator>
-       - 呼び出し成功 かつ shell 自身以外の foreground process が
-         parseable に確認できる
-           -> PROVEN_ALIVE -> live_runtime_preserved（dispatch 0 件）
-       - 呼び出し成功 かつ shell 自身以外に foreground process が
-         存在しないことが明確（bare-shell-only）
+       - shell_pid が有効（正の整数）かつ shell 自身以外に
+         foreground process が存在しないことが明確（bare-shell-only、
+         または foreground_process_group_id == shell_pid）
            -> PROVEN_ABSENT -> candidates（既存の dispatch 経路、
-              exactly-once resume）
-       - 呼び出し失敗・空・unparseable・platform 非対応・
-         複数候補で単一の対象に絞り込めない（identity ambiguous）
+              second probe 後に exactly-once resume）
+       - shell_pid が欠落/無効・呼び出し失敗・空・unparseable・
+         platform 非対応・複数候補で単一の対象に絞り込めない
+         （identity ambiguous）・shell 以外の foreground process/
+         group id が観測されたが対象 Binding/session への causal
+         identity evidence を確立できない
            -> UNKNOWN -> unresolved_target（reason: liveness_unresolved）
+       - （将来の identity-bound evidence 拡張が実装された場合のみ）
+         対象 Binding/session への causal identity evidence が確立できる
+           -> PROVEN_ALIVE -> live_runtime_preserved（dispatch 0 件、
+              現状の実装では到達しない）
 ```
 
 `PROVEN_ABSENT` の第一経路（locator 自体が `live_pane_ids` に存在しない
@@ -1123,6 +1150,38 @@ locator が live_pane_ids に存在する ACTIVE Binding（一意 claimant）
 おり変更しない（#2742 の回帰防止）。RESTORING Binding・duplicate-locator
 claim も同様にこのプローブへ到達しない（対象が単一に絞り込めない/
 そもそも対象外のため）。
+
+### dispatch 直前の second probe（TOCTOU 低減、PR #2764 fix_delta P2-a）
+
+discovery phase の `PROVEN_ABSENT` 判定と、`run_startup_orchestrator()`
+がその候補に対して実際に `prepare_managed_resume()`（ACTIVE ->
+RESTORING の最初の DB mutation）を呼び出す瞬間は同一時刻ではない ---
+DB のクローズ/再オープンや他候補の dispatch/ACK 処理などで任意の
+wall-clock 時間が経過しうる。この window の間に、まさにその pane で
+live handoff が発生する可能性は排除できない。
+
+これを軽減するため、`run_startup_orchestrator()` は各候補について
+`prepare_managed_resume()` を呼ぶ **直前** に、同じ pane_id へ
+discovery phase と全く同じ read-only `_classify_pane_process_liveness()`
+プローブをもう一度実行する。この second probe が `PROVEN_ABSENT`（一致）
+の場合のみ通常通り dispatch へ進む。`PROVEN_ALIVE`/`UNKNOWN` に変化して
+いた場合は `prepare_managed_resume()` を一切呼び出さず（ACTIVE ->
+RESTORING の DB mutation を発生させず）、`dispatch_status:
+"second_probe_no_longer_absent"` として明示的に報告し、`any_failed =
+true` にする（silent drop にしない）。
+
+**設計判断（完全 atomic 化はしない）**: SQLite 側の書き込みと Herdr 側の
+外部プロセス状態を跨いで discovery -> second probe -> dispatch を完全に
+atomic にする lease/lock/distributed coordinator は導入しない（Issue
+Outcome/Stop Conditions が新規 daemon/lease/lock file/distributed
+coordinator を禁止するため）。そのため second probe の実行と実際の
+`prepare_managed_resume()` 呼び出しの間にも、なお小さな race window が
+残る（re-probe 後・dispatch 前に live handoff が発生する可能性はゼロ
+にはならない）。これは意図的に許容する residual risk であり、コード内
+コメント（`task_context_cold_restart_startup.py` の
+`run_startup_orchestrator()` docstring）にも明記している。将来この
+window 自体をゼロにする必要が生じた場合は、独立した Issue で
+lease/generation-counter 等の設計を検討する。
 
 **`herdr pane process-info` の実レスポンス形状（Herdr 0.9.1、本 Issue の
 実装時に稼働中の実サーバへ対し実際に発行して fact-check 済み）**:
@@ -1159,29 +1218,39 @@ dispatched: 0` / `mutations_applied: 0` を含む結果として、discovery の
 "live_runtime_preserved"` の結果エントリとして扱い、`"restored"` と並ぶ
 非失敗（`any_failed` に算入しない）outcome とする --- 「Binding が
 存在しなかった」ケースと「live handoff で生存を証明して意図的に何も
-しなかった」ケースを summary 上で区別する。
+しなかった」ケースを summary 上で区別する。**PR #2764 OWNER review 修正
+後の現状**: 上記「PR #2764 OWNER review による契約修正」の通り
+`PROVEN_ALIVE`（したがってこの `live_runtime_preserved` 結果）は現在の
+Herdr 0.9.1 primitive だけでは実質的に到達しない --- causal identity
+evidence を確立できる将来の拡張のために result shape/vocabulary だけを
+維持している。
 
 **`liveness_unresolved`（UNKNOWN）**: `pane process-info` の呼び出し自体
-が失敗・空・unparseable・platform 非対応、または `foreground_processes`
-内のエントリから `pid` を読み取れず shell 自身かどうか判定不能
-（identity ambiguous）な場合。`unresolved_target`（reason:
-`liveness_unresolved`）として報告し `any_failed = true` にする --- fail
-closed（duplicate launch を避けるため resume/launch を一切発行しない）。
-`agent_status == "unknown"` は absence の証拠にしない（Herdr
-`herdrdev/herdr#4579` の既知 issue: Windows 上で agent process は存在
-するが検出できず `agent_status` が `unknown` に固定される実例が一次資料
-で確認されている）--- この判定に `agent_status` を一切使わない設計は
-この既知の落とし穴を最初から回避する。
+が失敗・空・unparseable・platform 非対応、`shell_pid` が欠落／無効、
+`foreground_processes` 内のエントリから `pid` を読み取れず shell 自身
+かどうか判定不能（identity ambiguous）な場合に加え、**PR #2764 OWNER
+review 修正後は** shell 以外の foreground process や `shell_pid` と
+異なる `foreground_process_group_id` が観測されても、それが対象
+Binding/session への causal identity evidence を構成しない限りここに
+分類される（従来 `PROVEN_ALIVE` としていた判定の大部分がここへ移動した）。
+`unresolved_target`（reason: `liveness_unresolved`）として報告し
+`any_failed = true` にする --- fail closed（duplicate launch を避ける
+ため resume/launch を一切発行しない）。`agent_status == "unknown"` は
+absence の証拠にしない（Herdr `herdrdev/herdr#4579` の既知 issue:
+Windows 上で agent process は存在するが検出できず `agent_status` が
+`unknown` に固定される実例が一次資料で確認されている）--- この判定に
+`agent_status` を一切使わない設計はこの既知の落とし穴を最初から回避する。
 
 **AC8: heuristic identity を使わない**: cold-restart / live-handoff の
 区別に cwd・pane 順序・terminal title・process `name` 単独を使わない
 --- 判定根拠は `foreground_processes` 内エントリの `pid` と `shell_pid`
 の同一性比較のみ。`name` が `"bash"` を名乗っていても `pid` が
-`shell_pid` と異なれば別プロセスとして `PROVEN_ALIVE` に、逆に `cwd` が
-いかにも作業中らしい値であっても `pid` が `shell_pid` と一致すれば
-`PROVEN_ABSENT` になる（`tests/task-context/test_cold_restart_startup.py`
-の `test_classify_pane_process_liveness_ac8_*` 系テストが両方向を
-検証する）。
+`shell_pid` と異なれば shell 自身とは判定しない（PR #2764 OWNER review
+修正後は、その事実だけでは `PROVEN_ALIVE` にせず `UNKNOWN` にする ---
+causal identity evidence が無いため）。逆に `cwd` がいかにも作業中らしい
+値であっても `pid` が `shell_pid` と一致すれば `PROVEN_ABSENT` になる
+（`tests/task-context/test_cold_restart_startup.py` の
+`test_classify_pane_process_liveness_ac8_*` 系テストが両方向を検証する）。
 
 **`missing_current_runtime_location`（AC5）**: discovery SQL の
 `runtime_locations` 結合を（実質）`INNER JOIN` から `LEFT JOIN` へ変更
@@ -1422,3 +1491,17 @@ cold-restart/`[[startup]]` hook 発火観測/cleanup を実際に行う（PR #27
 する --- 将来 Herdr が safe な local-only live handoff trigger を追加
 した場合のみ、この判定ロジック（`_live_handoff_capability()`）の更新で
 対応する。
+
+**PR #2764 fix_delta P2-b（観測範囲の明確化）**: cold restart の 2
+causal boundary が実際に SKIP されず実行された場合でも、この canary が
+アサートするのは `discover_resume_candidates()` が返す
+`discovery["candidates"]` の件数がちょうど 1 件であること（discovery
+boundary のみ）であり、実際に `prepare_managed_resume()`/
+`execute_resume_decision()` を経由した dispatch・ACK・runtime
+profile/identity の保持まで検証しているわけではない（そこまでの
+end-to-end 実証は PR #2731 の Real Herdr canary が別途行った実績を
+参照する）。テスト docstring もこの実際の観測範囲に合わせて記述する
+（過大な "resume"/"runtime profile/identity preserved" という表現は
+使わない）。live handoff の 2 causal boundary は、本 Issue の
+実装時点で Herdr 0.9.1 CLI surface に safe な local trigger が存在
+しないため常に SKIP であり、manual/runtime-unverified 領域として扱う。

@@ -1,10 +1,23 @@
 """Issue #2752 AC7 -- narrow Herdr runtime canary for the 4 causal
 boundaries a `[[startup]]` hook re-fire must distinguish:
 
-1. Native   + live handoff  -> `live_runtime_preserved`, 0 dispatch.
-2. Claude-GPT + live handoff -> `live_runtime_preserved`, 0 dispatch.
-3. Native   + real cold restart -> runtime absent, exactly-one resume.
-4. Claude-GPT + real cold restart -> runtime absent, exactly-one resume.
+1. Native      + live handoff    -> MANUAL / RUNTIME-UNVERIFIED today (see
+   PR #2764 fix_delta P2-b below -- always SKIPs; no safe, disposable,
+   automatable local live-handoff trigger exists in the installed Herdr
+   0.9.1 CLI surface).
+2. Claude-GPT  + live handoff    -> MANUAL / RUNTIME-UNVERIFIED today (same
+   reason as (1)).
+3. Native      + real cold restart -> when NOT skipped, observes only that
+   `discover_resume_candidates()`'s discovery boundary yields exactly one
+   dispatch candidate (`len(discovery["candidates"]) == 1`) after the pane
+   is regenerated at the same locator -- this does NOT drive an actual
+   dispatch/ACK cycle or verify runtime profile/identity persistence beyond
+   that discovery boundary (see PR #2764 fix_delta P2-b; end-to-end
+   dispatch/ACK/profile-persistence was separately verified by the PR #2731
+   Real Herdr canary, `docs/dev/task-context.md` "実機 Herdr canary（PR
+   #2731...)").
+4. Claude-GPT  + real cold restart -> same discovery-boundary-only scope as
+   (3).
 
 Runtime Verification Applicability (Issue #2752 body): ``immediate`` for
 AC7 only (AC1-AC6/AC8/AC9 are covered by deterministic pytest in
@@ -264,8 +277,15 @@ def _skip_with_log(ac_boundary: str, reason: str, evidence: dict[str, Any]) -> N
 
 
 def test_native_live_handoff_preserves_runtime_and_dispatches_zero_resume_commands():
-    """AC7 causal boundary 1: Native + live handoff -> `live_runtime_
-    preserved`, launch/resume command count = 0."""
+    """AC7 causal boundary 1 (Native + live handoff): MANUAL /
+    RUNTIME-UNVERIFIED today -- `_live_handoff_capability()` always returns
+    ``False`` (no safe, disposable, side-effect-free local trigger for a
+    genuine Herdr live handoff exists in the installed Herdr 0.9.1 CLI
+    surface -- see that function's own docstring), so this test always
+    SKIPs with a recorded evidence log rather than ever exercising the
+    `live_runtime_preserved`/zero-dispatch assertion its name describes.
+    Kept ready (never asserting a fabricated PASS) for a future Herdr
+    release that adds a safe local handoff trigger primitive."""
     ok, reason, evidence = _cold_restart_canary_capability()
     if ok:
         handoff_ok, handoff_reason, handoff_evidence = _live_handoff_capability()
@@ -285,8 +305,12 @@ def test_native_live_handoff_preserves_runtime_and_dispatches_zero_resume_comman
 
 
 def test_claude_gpt_live_handoff_preserves_runtime_and_dispatches_zero_resume_commands():
-    """AC7 causal boundary 2: Claude-GPT + live handoff -> `live_runtime_
-    preserved`, launch/resume command count = 0."""
+    """AC7 causal boundary 2 (Claude-GPT + live handoff): MANUAL /
+    RUNTIME-UNVERIFIED today -- same reason as causal boundary 1 (Native):
+    `_live_handoff_capability()` always returns ``False`` in the installed
+    Herdr 0.9.1 CLI surface, so this test always SKIPs with a recorded
+    evidence log rather than exercising the `live_runtime_preserved`/
+    zero-dispatch assertion its name describes."""
     ok, reason, evidence = _cold_restart_canary_capability()
     if ok:
         handoff_ok, handoff_reason, handoff_evidence = _live_handoff_capability()
@@ -353,13 +377,22 @@ def _find_session_server_pid(herdr_bin: str, session_name: str) -> int | None:
 
 
 def _run_cold_restart_boundary(*, ac_boundary: str, runtime_variant_env: str | None) -> None:
-    """Real end-to-end cold-restart causal boundary: create a disposable
-    named Herdr session distinct from 'default', start a Native or
-    Claude-GPT agent pane inside it, kill -9 both the agent process and
-    the disposable session's own server (never 'default''s), cold-start
-    the same session name again, and verify `task_context_cold_restart_
-    startup.discover_resume_candidates()` classifies the regenerated pane
-    as PROVEN_ABSENT (bare-shell-only) -> dispatched exactly once."""
+    """Real cold-restart causal boundary, DISCOVERY BOUNDARY ONLY (PR #2764
+    fix_delta P2-b -- corrects an earlier draft's overclaim): create a
+    disposable named Herdr session distinct from 'default', start a Native
+    or Claude-GPT agent pane inside it, kill -9 both the agent process and
+    the disposable session's own server (never 'default''s), cold-start the
+    same session name again, and verify `task_context_cold_restart_startup.
+    discover_resume_candidates()` classifies the regenerated pane as
+    PROVEN_ABSENT (bare-shell-only) such that `discovery["candidates"]` has
+    exactly one entry. This does NOT drive `prepare_managed_resume()`/
+    `execute_resume_decision()`/ACK to observe an actual end-to-end dispatch
+    or runtime profile/identity persistence beyond that discovery boundary
+    -- that broader end-to-end path was separately, already verified by the
+    PR #2731 Real Herdr canary (`docs/dev/task-context.md` "実機 Herdr
+    canary（PR #2731...)"); adding a heavier harness here to re-verify it
+    again is not required by this Issue's fix_delta and is deliberately not
+    added."""
     ok, reason, evidence = _cold_restart_canary_capability()
     if not ok:
         _skip_with_log(ac_boundary, reason, evidence)
@@ -484,7 +517,11 @@ def _run_cold_restart_boundary(*, ac_boundary: str, runtime_variant_env: str | N
             ac_boundary=ac_boundary,
             verdict="PASS",
             exit_code=0,
-            reason="pane regenerated at same locator classified PROVEN_ABSENT -> exactly-one dispatch candidate",
+            reason=(
+                "pane regenerated at same locator classified PROVEN_ABSENT -> exactly-one discovery-level "
+                "dispatch candidate (discovery boundary only -- actual dispatch/ACK/profile persistence not "
+                "exercised by this canary, see PR #2764 fix_delta P2-b)"
+            ),
             evidence=evidence,
         )
     except BaseException as exc:
@@ -506,9 +543,13 @@ def _run_cold_restart_boundary(*, ac_boundary: str, runtime_variant_env: str | N
 # ---------------------------------------------------------------------------
 
 
-def test_native_cold_restart_regenerates_pane_and_dispatches_exactly_once():
-    """AC7 causal boundary 3: Native + real cold restart -> runtime
-    absent, exactly-one resume, runtime profile/identity preserved."""
+def test_native_cold_restart_regenerates_pane_and_yields_exactly_one_discovery_candidate():
+    """AC7 causal boundary 3 (Native + real cold restart), DISCOVERY
+    BOUNDARY ONLY (PR #2764 fix_delta P2-b): when not skipped, asserts
+    ``len(discovery["candidates"]) == 1`` after the pane is regenerated at
+    the same locator -- does NOT dispatch/ACK or verify runtime profile/
+    identity persistence beyond that boundary (see `_run_cold_restart_
+    boundary()`'s own docstring)."""
     _run_cold_restart_boundary(ac_boundary="native-cold-restart", runtime_variant_env=None)
 
 
@@ -517,9 +558,11 @@ def test_native_cold_restart_regenerates_pane_and_dispatches_exactly_once():
 # ---------------------------------------------------------------------------
 
 
-def test_claude_gpt_cold_restart_regenerates_pane_and_dispatches_exactly_once():
-    """AC7 causal boundary 4: Claude-GPT + real cold restart -> runtime
-    absent, exactly-one resume, runtime profile preserved."""
+def test_claude_gpt_cold_restart_regenerates_pane_and_yields_exactly_one_discovery_candidate():
+    """AC7 causal boundary 4 (Claude-GPT + real cold restart), DISCOVERY
+    BOUNDARY ONLY (PR #2764 fix_delta P2-b): same discovery-boundary-only
+    scope as causal boundary 3 (Native) -- see `_run_cold_restart_
+    boundary()`'s own docstring."""
     _run_cold_restart_boundary(
         ac_boundary="claude-gpt-cold-restart", runtime_variant_env=config.CLAUDE_GPT_RUNTIME_VARIANT
     )

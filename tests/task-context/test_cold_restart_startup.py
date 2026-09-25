@@ -26,6 +26,21 @@ Covers:
   title/process name alone -- ever drives the classification. AC6
   (regression guard): every pre-#2752 test below is kept and updated
   (never deleted) to route the new `pane process-info` probe explicitly.
+- PR #2764 fix_delta (OWNER review P1/P2, pull request review comment
+  https://github.com/squne121/loop-protocol/pull/2764#issuecomment-5832937110):
+  `PROVEN_ALIVE` now requires positive causal identity evidence the current
+  Herdr 0.9.1 `pane process-info` primitive alone never supplies -- a
+  non-shell foreground process's mere presence, or a `foreground_process_
+  group_id` merely differing numerically from `shell_pid`, is now
+  classified `UNKNOWN` (never `PROVEN_ALIVE`); a missing/invalid
+  `shell_pid` is always `UNKNOWN` regardless of what else the response
+  reports. The tests below that used to assert `PROVEN_ALIVE`/
+  `live_runtime_preserved` from exactly those signals are updated (never
+  silently deleted) to assert the new `UNKNOWN`/`liveness_unresolved`
+  outcome instead. PR #2764 fix_delta P2-a additionally covers the new
+  dispatch-time second liveness probe (`run_startup_orchestrator()`
+  re-classifies a `PROVEN_ABSENT` candidate immediately before
+  `prepare_managed_resume()` -- see the "second probe" tests below).
 """
 
 from __future__ import annotations
@@ -119,7 +134,11 @@ def _bare_shell_process_info_response(pane_id: str, *, shell_pid: int = 1000) ->
 def _alive_process_info_response(
     pane_id: str, *, shell_pid: int = 1000, foreground_pid: int = 4242, name: str = "claude"
 ) -> subprocess.CompletedProcess:
-    """AC1/AC2 / PROVEN_ALIVE: a distinct non-shell foreground process."""
+    """A distinct non-shell foreground process. PR #2764 fix_delta (OWNER
+    review P1): this response no longer classifies `PROVEN_ALIVE` -- a
+    non-shell foreground process alone is not causal identity evidence for
+    a SPECIFIC Binding/session's own runtime, so this now classifies
+    `UNKNOWN` (`liveness_unresolved`)."""
     return _process_info_response(
         pane_id,
         shell_pid=shell_pid,
@@ -343,6 +362,15 @@ def test_given_active_binding_dispatched_and_acked_when_orchestrating_then_repor
     _discovery_run = _routed_run(("normal-tab-1",), {"normal-tab-1": _bare_shell_process_info_response("normal-tab-1")})
 
     def _dispatch_and_ack_run(argv, **kwargs):
+        # PR #2764 fix_delta P2-a: `run_startup_orchestrator()` now
+        # re-probes the SAME pane's liveness (via bare `subprocess.run`)
+        # immediately before `prepare_managed_resume()` -- route that
+        # second `pane process-info` call to the same bare-shell-only
+        # response discovery already observed, so this candidate remains
+        # dispatchable exactly as before.
+        if argv[1:3] == ["pane", "process-info"]:
+            assert argv[3] == "--pane", f"expected --pane flag, got argv={argv!r}"
+            return _bare_shell_process_info_response(argv[4])
         # The launch command "succeeds" (exit 0) and, exactly like a real
         # resumed Claude process would out-of-process, immediately drives
         # the SessionStart(source=resume, ...) ACK for the same session
@@ -395,6 +423,13 @@ def test_given_native_and_claude_gpt_candidates_when_orchestrating_then_both_dis
     )
 
     def _dispatch_run(argv, **kwargs):
+        # PR #2764 fix_delta P2-a: route the dispatch-time second liveness
+        # probe (bare `subprocess.run`) to the same bare-shell-only
+        # response discovery already observed for each pane, so both
+        # candidates remain dispatchable exactly as before.
+        if argv[1:3] == ["pane", "process-info"]:
+            assert argv[3] == "--pane", f"expected --pane flag, got argv={argv!r}"
+            return _bare_shell_process_info_response(argv[4])
         return subprocess.CompletedProcess(argv, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", _dispatch_run)
@@ -409,6 +444,116 @@ def test_given_native_and_claude_gpt_candidates_when_orchestrating_then_both_dis
     statuses = {r["dispatch_status"] for r in summary["results"]}
     assert statuses == {"restore_blocked"}
     assert summary["any_failed"] is True
+
+
+# ---------------------------------------------------------------------------
+# PR #2764 fix_delta P2-a: dispatch-time second liveness probe (TOCTOU
+# guard between discovery's PROVEN_ABSENT classification and the actual
+# `prepare_managed_resume()` call a `run_startup_orchestrator()` candidate
+# loop iteration later performs).
+# ---------------------------------------------------------------------------
+
+
+def test_given_proven_absent_candidate_when_second_probe_finds_non_shell_process_then_not_dispatched(
+    conn, state_root, monkeypatch
+):
+    """Discovery classified PROVEN_ABSENT, but the dispatch-time re-probe of
+    the SAME pane (immediately before `prepare_managed_resume()`) now finds
+    a non-shell foreground process (UNKNOWN, per the OWNER-review-corrected
+    causal-identity semantics) -- `prepare_managed_resume()` must never be
+    called (no ACTIVE -> RESTORING DB mutation), and this candidate must be
+    reported via the new `second_probe_no_longer_absent` dispatch_status,
+    `any_failed = true`."""
+    binding_id = _seed_active_native_binding(conn, herdr_locator="race-tab-1", session_id="race-s1")
+    conn.close()
+
+    _discovery_run = _routed_run(("race-tab-1",), {"race-tab-1": _bare_shell_process_info_response("race-tab-1")})
+
+    prepare_calls: list[str] = []
+    real_prepare_managed_resume = dispatcher.prepare_managed_resume
+
+    def _tracking_prepare_managed_resume(session_id):
+        prepare_calls.append(session_id)
+        return real_prepare_managed_resume(session_id)
+
+    monkeypatch.setattr(dispatcher, "prepare_managed_resume", _tracking_prepare_managed_resume)
+
+    def _second_probe_run(argv, **kwargs):
+        if argv[1:3] == ["pane", "process-info"]:
+            assert argv[3] == "--pane", f"expected --pane flag, got argv={argv!r}"
+            # A live handoff happened in the window between discovery and
+            # this dispatch-time re-probe -- a non-shell process now shows
+            # up for the SAME pane.
+            return _alive_process_info_response(argv[4])
+        raise AssertionError(f"must never dispatch a launch command for this candidate: {argv}")
+
+    monkeypatch.setattr(subprocess, "run", _second_probe_run)
+
+    summary = startup.run_startup_orchestrator(herdr_bin="herdr", discovery_run_fn=_discovery_run)
+
+    assert prepare_calls == [], "prepare_managed_resume() must never be called when the second probe disagrees"
+    assert summary["candidates_discovered"] == 1
+    assert summary["any_failed"] is True
+    assert len(summary["results"]) == 1
+    entry = summary["results"][0]
+    assert entry["dispatch_status"] == startup.DISPATCH_STATUS_SECOND_PROBE_NO_LONGER_ABSENT
+    assert entry["second_probe_classification"] == startup.LIVENESS_UNKNOWN
+
+    fresh = dispatcher.open_dispatcher_db()
+    try:
+        assert service.get_binding(fresh, binding_id)["runtime_health"] == "ACTIVE"
+    finally:
+        fresh.close()
+
+
+def test_given_proven_absent_candidate_when_second_probe_confirms_absent_then_dispatched_once(
+    conn, state_root, monkeypatch
+):
+    """Discovery classified PROVEN_ABSENT, and the dispatch-time re-probe of
+    the SAME pane confirms PROVEN_ABSENT again (no live handoff occurred in
+    the window) -- `prepare_managed_resume()` must be called exactly once
+    (never zero, never twice), and the ordinary dispatch/ACK path proceeds
+    unaffected by the new second probe."""
+    _seed_active_native_binding(conn, herdr_locator="race-tab-2", session_id="race-s2")
+    conn.close()
+
+    _discovery_run = _routed_run(("race-tab-2",), {"race-tab-2": _bare_shell_process_info_response("race-tab-2")})
+
+    prepare_calls: list[str] = []
+    real_prepare_managed_resume = dispatcher.prepare_managed_resume
+
+    def _tracking_prepare_managed_resume(session_id):
+        prepare_calls.append(session_id)
+        return real_prepare_managed_resume(session_id)
+
+    monkeypatch.setattr(dispatcher, "prepare_managed_resume", _tracking_prepare_managed_resume)
+
+    def _dispatch_and_ack_run(argv, **kwargs):
+        if argv[1:3] == ["pane", "process-info"]:
+            assert argv[3] == "--pane", f"expected --pane flag, got argv={argv!r}"
+            # No live handoff occurred -- the second probe reconfirms the
+            # exact same bare-shell-only evidence discovery already saw.
+            return _bare_shell_process_info_response(argv[4])
+        ack_conn = dispatcher.open_dispatcher_db()
+        try:
+            hook_flows.on_session_start(
+                ack_conn,
+                {"source": "resume", "herdr_tab_id": "race-tab-2-after-resume", "claude_session_id": "race-s2"},
+            )
+        finally:
+            ack_conn.close()
+        return subprocess.CompletedProcess(argv, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _dispatch_and_ack_run)
+
+    summary = startup.run_startup_orchestrator(
+        herdr_bin="herdr", ack_timeout_seconds=1.0, discovery_run_fn=_discovery_run
+    )
+
+    assert prepare_calls == ["race-s2"], "prepare_managed_resume() must be called exactly once"
+    assert summary["candidates_discovered"] == 1
+    assert summary["any_failed"] is False
+    assert summary["results"][0]["dispatch_status"] == "restored"
 
 
 def test_given_one_candidate_acks_and_one_times_out_when_orchestrating_then_shared_deadline_does_not_block_the_acked_one(
@@ -600,31 +745,40 @@ def test_duplicate_binding_claims_on_same_live_pane_are_all_unresolved_and_not_d
 
 
 # ---------------------------------------------------------------------------
-# Issue #2752 AC1: live handoff -- ACTIVE Native Binding, PROVEN_ALIVE pane
-# process -> `live_runtime_preserved`, zero dispatch, Binding untouched.
+# PR #2764 fix_delta (OWNER review P1) supersedes the original Issue #2752
+# AC1 test below: a non-shell foreground process alone is NOT causal
+# identity evidence the pane's runtime IS this specific Binding/session's
+# own launched process -- `herdr pane process-info` only reports whatever
+# job currently occupies the pane's foreground slot. This now classifies
+# UNKNOWN (`liveness_unresolved`), never `PROVEN_ALIVE`/
+# `live_runtime_preserved`, and must NEVER be dispatched into either (never
+# silently indistinguishable from an ordinary discovery-failure case).
 # ---------------------------------------------------------------------------
 
 
-def test_given_active_native_binding_with_proven_alive_pane_process_when_discovering_then_live_runtime_preserved(
+def test_given_active_native_binding_with_non_shell_foreground_process_when_discovering_then_liveness_unresolved(
     conn, state_root
 ):
+    """PR #2764 fix_delta (OWNER review P1): a distinct non-shell foreground
+    process by itself is not causal identity evidence for THIS Binding's
+    own runtime -- classified UNKNOWN (never PROVEN_ALIVE), reported as
+    `unresolved_target` (reason: `liveness_unresolved`), never dispatched,
+    `any_failed = true`."""
     binding_id = _seed_active_native_binding(conn, herdr_locator="live-tab-native", session_id="live-s-native")
 
     _run = _routed_run(("live-tab-native",), {"live-tab-native": _alive_process_info_response("live-tab-native")})
 
     discovery = startup.discover_resume_candidates(conn, herdr_bin="herdr", run_fn=_run)
     assert discovery["candidates"] == []
-    assert discovery["unresolved_targets"] == []
     assert discovery["restore_blocked"] == []
-    assert len(discovery["live_runtime_preserved"]) == 1
-    entry = discovery["live_runtime_preserved"][0]
-    assert entry["binding_id"] == binding_id
-    assert entry["session_id"] == "live-s-native"
-    assert entry["pane_id"] == "live-tab-native"
-    assert entry["runtime_profile"] == "native_claude_v1"
-    assert entry["launch_commands_dispatched"] == 0
-    assert entry["mutations_applied"] == 0
-    assert "liveness_evidence" in entry
+    assert discovery["live_runtime_preserved"] == []
+    assert discovery["unresolved_targets"] == [
+        {
+            "binding_id": binding_id,
+            "session_id": "live-s-native",
+            "reason": startup.REASON_LIVENESS_UNRESOLVED,
+        }
+    ]
 
     # Binding identity/state must be completely untouched -- discovery
     # itself never opens a write_transaction.
@@ -635,11 +789,11 @@ def test_given_active_native_binding_with_proven_alive_pane_process_when_discove
     conn.close()
     summary = startup.run_startup_orchestrator(herdr_bin="herdr", discovery_run_fn=_run)
     assert summary["candidates_discovered"] == 0
-    assert summary["any_failed"] is False
+    assert summary["any_failed"] is True
     matching = [r for r in summary["results"] if r.get("binding_id") == binding_id]
     assert len(matching) == 1
-    assert matching[0]["dispatch_status"] == "live_runtime_preserved"
-    assert matching[0]["runtime_profile"] == "native_claude_v1"
+    assert matching[0]["dispatch_status"] == "unresolved_target"
+    assert matching[0]["reason"] == startup.REASON_LIVENESS_UNRESOLVED
 
     fresh = dispatcher.open_dispatcher_db()
     try:
@@ -813,15 +967,35 @@ def test_classify_pane_process_liveness_bare_shell_only_is_proven_absent():
     assert evidence["shell_pid"] == 100
 
 
-def test_classify_pane_process_liveness_empty_foreground_list_is_proven_absent():
+def test_classify_pane_process_liveness_omitted_foreground_processes_field_is_unknown_not_proven_absent():
+    """PR #2764 fix_delta P1: per Herdr's own serialization contract
+    (``#[serde(skip_serializing_if = "Vec::is_empty")]``), a genuinely
+    empty ``foreground_processes`` is OMITTED from the response entirely --
+    Herdr never sends a literal ``"foreground_processes": []``. An earlier
+    draft of this test synthesized that unrealistic literal-empty-array
+    shape and asserted PROVEN_ABSENT from it; this is rewritten to the
+    REAL contract shape (the field simply absent, ``shell_pid`` alone
+    present, no ``foreground_process_group_id`` either) and now correctly
+    asserts UNKNOWN -- omission alone is never strong enough explicit
+    bare-shell evidence to conclude PROVEN_ABSENT."""
+
     def _run(argv, **kwargs):
-        return _process_info_response("pane-1", shell_pid=100, foreground_processes=[])
+        return _process_info_response("pane-1", shell_pid=100)
 
-    classification, _evidence = startup._classify_pane_process_liveness("pane-1", herdr_bin="herdr", run_fn=_run)
-    assert classification == startup.LIVENESS_PROVEN_ABSENT
+    classification, evidence = startup._classify_pane_process_liveness("pane-1", herdr_bin="herdr", run_fn=_run)
+    assert classification == startup.LIVENESS_UNKNOWN
+    assert evidence["reason"] == "process_info_platform_no_foreground_data"
 
 
-def test_classify_pane_process_liveness_non_shell_foreground_process_is_proven_alive():
+def test_classify_pane_process_liveness_non_shell_foreground_process_is_unknown_not_proven_alive():
+    """PR #2764 fix_delta (OWNER review P1): a distinct non-shell foreground
+    process is NOT causal identity evidence that it IS this specific
+    Binding/session's own runtime -- ``herdr pane process-info`` only
+    reports whatever job currently occupies the pane's foreground slot,
+    with no linkage back to a particular Binding/session. This must never
+    be PROVEN_ALIVE; it is UNKNOWN (`liveness_unresolved` at the discovery
+    layer)."""
+
     def _run(argv, **kwargs):
         return _process_info_response(
             "pane-1",
@@ -833,15 +1007,19 @@ def test_classify_pane_process_liveness_non_shell_foreground_process_is_proven_a
         )
 
     classification, evidence = startup._classify_pane_process_liveness("pane-1", herdr_bin="herdr", run_fn=_run)
-    assert classification == startup.LIVENESS_PROVEN_ALIVE
+    assert classification == startup.LIVENESS_UNKNOWN
+    assert evidence["reason"] == "process_info_non_shell_foreground_process_no_causal_identity"
     assert evidence["foreground_processes"] == [{"pid": 200, "name": "claude", "argv": ["claude"], "cwd": "/x"}]
 
 
-def test_classify_pane_process_liveness_ac8_process_named_bash_but_different_pid_is_still_proven_alive():
+def test_classify_pane_process_liveness_ac8_process_named_bash_but_different_pid_is_unknown_not_provably_alive():
     """AC8: process `name` alone must never be trusted -- a process whose
     reported name happens to be a common shell name ("bash") but whose pid
-    does NOT match the pane's own shell_pid is still a distinct (alive)
-    foreground process."""
+    does NOT match the pane's own shell_pid is still a distinct foreground
+    process. PR #2764 fix_delta (OWNER review P1) corrects the ORIGINAL
+    AC8 test's conclusion here: that distinctness alone is not causal
+    identity evidence for THIS Binding's own runtime, so this is UNKNOWN,
+    never PROVEN_ALIVE (renamed from `..._is_still_proven_alive`)."""
 
     def _run(argv, **kwargs):
         return _process_info_response(
@@ -854,7 +1032,32 @@ def test_classify_pane_process_liveness_ac8_process_named_bash_but_different_pid
         )
 
     classification, _evidence = startup._classify_pane_process_liveness("pane-1", herdr_bin="herdr", run_fn=_run)
-    assert classification == startup.LIVENESS_PROVEN_ALIVE
+    assert classification == startup.LIVENESS_UNKNOWN
+
+
+def test_classify_pane_process_liveness_missing_shell_pid_with_foreground_processes_is_unknown():
+    """PR #2764 fix_delta (OWNER review P2): without a valid (positive
+    integer) `shell_pid` anchor, no entry in `foreground_processes` can be
+    positively attributed to "is/is not the pane's own shell" -- this must
+    be UNKNOWN, never PROVEN_ABSENT/PROVEN_ALIVE, even if every entry
+    superficially looks like a bare shell."""
+
+    def _run(argv, **kwargs):
+        payload = {
+            "id": "cli:pane:process_info",
+            "result": {
+                "process_info": {
+                    "pane_id": "pane-1",
+                    "foreground_processes": [{"pid": 100, "name": "bash", "cwd": "/x"}],
+                },
+                "type": "pane_process_info",
+            },
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(payload), stderr="")
+
+    classification, evidence = startup._classify_pane_process_liveness("pane-1", herdr_bin="herdr", run_fn=_run)
+    assert classification == startup.LIVENESS_UNKNOWN
+    assert evidence["reason"] == "process_info_missing_shell_pid_for_foreground_processes"
 
 
 def test_classify_pane_process_liveness_ac8_cwd_alone_never_used_for_decision():
@@ -883,12 +1086,40 @@ def test_classify_pane_process_liveness_foreground_process_group_id_matches_shel
     assert classification == startup.LIVENESS_PROVEN_ABSENT
 
 
-def test_classify_pane_process_liveness_foreground_process_group_id_differs_from_shell_is_proven_alive():
+def test_classify_pane_process_liveness_foreground_process_group_id_differs_from_shell_is_unknown_not_proven_alive():
+    """PR #2764 fix_delta (OWNER review P1): a `foreground_process_group_id`
+    that merely differs numerically from `shell_pid` is NOT causal identity
+    evidence of PROVEN_ALIVE (renamed from `..._is_proven_alive`) -- it is
+    UNKNOWN."""
+
     def _run(argv, **kwargs):
         return _process_info_response("pane-1", shell_pid=100, foreground_process_group_id=555)
 
-    classification, _evidence = startup._classify_pane_process_liveness("pane-1", herdr_bin="herdr", run_fn=_run)
-    assert classification == startup.LIVENESS_PROVEN_ALIVE
+    classification, evidence = startup._classify_pane_process_liveness("pane-1", herdr_bin="herdr", run_fn=_run)
+    assert classification == startup.LIVENESS_UNKNOWN
+    assert evidence["reason"] == "process_info_foreground_process_group_id_no_causal_identity"
+
+
+def test_classify_pane_process_liveness_missing_shell_pid_with_group_id_present_is_unknown():
+    """PR #2764 fix_delta (OWNER review P2): a `foreground_process_group_id`
+    present without a valid `shell_pid` anchor can never be compared, so
+    this must be UNKNOWN regardless of the group id's value -- never
+    PROVEN_ABSENT/PROVEN_ALIVE."""
+
+    def _run(argv, **kwargs):
+        payload = {
+            "id": "cli:pane:process_info",
+            "result": {
+                "process_info": {"pane_id": "pane-1", "foreground_process_group_id": 100},
+                "type": "pane_process_info",
+            },
+        }
+        return subprocess.CompletedProcess(argv, returncode=0, stdout=json.dumps(payload), stderr="")
+
+    classification, evidence = startup._classify_pane_process_liveness("pane-1", herdr_bin="herdr", run_fn=_run)
+    assert classification == startup.LIVENESS_UNKNOWN
+    assert evidence["reason"] == "process_info_foreground_process_group_id_no_causal_identity"
+    assert evidence["shell_pid"] is None
 
 
 def test_classify_pane_process_liveness_call_failure_is_unknown():

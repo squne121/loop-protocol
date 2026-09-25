@@ -243,11 +243,18 @@ def test_given_successful_dispatch_then_ack_when_session_start_resume_fires_then
 
 # ---------------------------------------------------------------------------
 # Issue #2752 AC2 / AC9 -- tri-state liveness classification integration
-# with the dispatcher's own state machine: PROVEN_ALIVE must never trigger
+# with the dispatcher's own state machine. PR #2764 fix_delta (OWNER review
+# P1, https://github.com/squne121/loop-protocol/pull/2764#issuecomment-5832937110):
+# a non-shell foreground process alone is NOT causal identity evidence for
+# a SPECIFIC Binding/session's own runtime -- this is now classified
+# UNKNOWN (`liveness_unresolved`), never PROVEN_ALIVE/`live_runtime_
+# preserved`. Either way (UNKNOWN or, if a future evidence-bound extension
+# ever reintroduces PROVEN_ALIVE, that too) must never trigger
 # `prepare_managed_resume()`/ACTIVE -> RESTORING at all (Native/Claude-GPT
-# symmetry), and PROVEN_ABSENT (bare-shell-only) must reach the ordinary
-# ACTIVE -> RESTORING transition unaffected by the new liveness probe (AC3
-# case 2 / AC6 regression guard).
+# symmetry) -- that invariant is what these tests actually verify. PROVEN_
+# ABSENT (bare-shell-only) must reach the ordinary ACTIVE -> RESTORING
+# transition unaffected by the new liveness probe (AC3 case 2 / AC6
+# regression guard).
 # ---------------------------------------------------------------------------
 
 
@@ -306,15 +313,19 @@ def _routed_run(pane_list_ids: tuple[str, ...], process_info_responses: dict[str
     return _run
 
 
-def test_given_active_claude_gpt_binding_with_proven_alive_pane_process_when_discovering_then_live_runtime_preserved(
+def test_given_active_claude_gpt_binding_with_non_shell_foreground_process_when_discovering_then_liveness_unresolved(
     conn, state_root, monkeypatch
 ):
-    """Issue #2752 AC2: symmetry with AC1 (Native) -- an ACTIVE Claude-GPT
-    Binding whose pane process is PROVEN alive must never be dispatched a
-    duplicate ``scripts/claude-gpt/launch.sh`` invocation, and its
-    ``runtime_health`` must never leave ACTIVE (no ACTIVE -> RESTORING
-    transition at all -- ``prepare_managed_resume()`` is never even called
-    for a ``live_runtime_preserved`` entry)."""
+    """Issue #2752 AC2 (PR #2764 fix_delta, OWNER review P1 correction):
+    symmetry with the Native case -- an ACTIVE Claude-GPT Binding whose pane
+    reports a non-shell foreground process is NOT causal identity evidence
+    for THIS Binding's own runtime, so it is classified UNKNOWN
+    (`liveness_unresolved`), never PROVEN_ALIVE/`live_runtime_preserved`.
+    Either way, it must never be dispatched a duplicate
+    ``scripts/claude-gpt/launch.sh`` invocation, and its ``runtime_health``
+    must never leave ACTIVE (no ACTIVE -> RESTORING transition at all --
+    ``prepare_managed_resume()`` is never even called for an
+    `unresolved_target` entry)."""
     binding_id, _run_id = _seed_active_claude_gpt_binding(
         conn, monkeypatch, herdr_locator="live-tab-gpt", session_id="live-s-gpt"
     )
@@ -323,14 +334,14 @@ def test_given_active_claude_gpt_binding_with_proven_alive_pane_process_when_dis
 
     discovery = startup.discover_resume_candidates(conn, herdr_bin="herdr", run_fn=_run)
     assert discovery["candidates"] == []
-    assert discovery["unresolved_targets"] == []
-    assert len(discovery["live_runtime_preserved"]) == 1
-    entry = discovery["live_runtime_preserved"][0]
-    assert entry["binding_id"] == binding_id
-    assert entry["session_id"] == "live-s-gpt"
-    assert entry["runtime_profile"] == "claude_gpt_v1"
-    assert entry["launch_commands_dispatched"] == 0
-    assert entry["mutations_applied"] == 0
+    assert discovery["live_runtime_preserved"] == []
+    assert discovery["unresolved_targets"] == [
+        {
+            "binding_id": binding_id,
+            "session_id": "live-s-gpt",
+            "reason": startup.REASON_LIVENESS_UNRESOLVED,
+        }
+    ]
 
     # No RESTORING transition -- the binding's runtime_health is untouched.
     assert service.get_binding(conn, binding_id)["runtime_health"] == "ACTIVE"
@@ -338,9 +349,10 @@ def test_given_active_claude_gpt_binding_with_proven_alive_pane_process_when_dis
     conn.close()
     summary = startup.run_startup_orchestrator(herdr_bin="herdr", discovery_run_fn=_run)
     assert summary["candidates_discovered"] == 0
-    assert summary["any_failed"] is False
+    assert summary["any_failed"] is True
     matching = [r for r in summary["results"] if r.get("binding_id") == binding_id]
-    assert matching[0]["dispatch_status"] == "live_runtime_preserved"
+    assert matching[0]["dispatch_status"] == "unresolved_target"
+    assert matching[0]["reason"] == startup.REASON_LIVENESS_UNRESOLVED
 
     fresh = dispatcher.open_dispatcher_db()
     try:
@@ -349,10 +361,13 @@ def test_given_active_claude_gpt_binding_with_proven_alive_pane_process_when_dis
         fresh.close()
 
 
-def test_given_native_and_claude_gpt_proven_alive_bindings_when_discovering_then_neither_transitions_off_active(
+def test_given_native_and_claude_gpt_non_shell_foreground_bindings_when_discovering_then_neither_transitions_off_active(
     conn, state_root, monkeypatch
 ):
-    """AC9: AC1/AC2 reproduced together, Native + Claude-GPT symmetric."""
+    """AC9 (PR #2764 fix_delta correction): the Native+Claude-GPT-symmetric
+    case reproduced together -- both classify UNKNOWN (`liveness_
+    unresolved`), never PROVEN_ALIVE/`live_runtime_preserved`, and neither
+    Binding ever leaves ACTIVE."""
     native_binding_id, _ = _seed_active_native_binding(conn, herdr_locator="ac9-native-tab", session_id="ac9-native-s")
     gpt_binding_id, _ = _seed_active_claude_gpt_binding(
         conn, monkeypatch, herdr_locator="ac9-gpt-tab", session_id="ac9-gpt-s"
@@ -368,7 +383,10 @@ def test_given_native_and_claude_gpt_proven_alive_bindings_when_discovering_then
 
     discovery = startup.discover_resume_candidates(conn, herdr_bin="herdr", run_fn=_run)
     assert discovery["candidates"] == []
-    assert {e["binding_id"] for e in discovery["live_runtime_preserved"]} == {native_binding_id, gpt_binding_id}
+    assert discovery["live_runtime_preserved"] == []
+    assert {e["binding_id"] for e in discovery["unresolved_targets"]} == {native_binding_id, gpt_binding_id}
+    for entry in discovery["unresolved_targets"]:
+        assert entry["reason"] == startup.REASON_LIVENESS_UNRESOLVED
 
     for binding_id in (native_binding_id, gpt_binding_id):
         assert service.get_binding(conn, binding_id)["runtime_health"] == "ACTIVE"

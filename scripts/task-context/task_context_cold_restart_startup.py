@@ -164,9 +164,36 @@ REASON_MISSING_CURRENT_RUNTIME_LOCATION = "missing_current_runtime_location"
 # see the Issue body's "Herdr 0.9.1 一次資料 fact-check" section. The three
 # outcomes below are a closed, fixed vocabulary (Stop Condition: changing
 # this 3-value set requires human sign-off).
+#
+# OWNER review (PR #2764 fix_delta, pull request review comment
+# https://github.com/squne121/loop-protocol/pull/2764#issuecomment-5832937110):
+# `LIVENESS_PROVEN_ALIVE` requires positive CAUSAL IDENTITY EVIDENCE that a
+# reported foreground process/process-group IS the specific runtime this
+# Task Context Binding/session last launched -- not merely that SOME
+# foreground process other than the pane's shell currently exists. The
+# current Herdr 0.9.1 `pane process-info` primitive alone never supplies
+# that identity linkage (it only reports whatever job currently occupies a
+# pane's foreground slot), so `_classify_pane_process_liveness()` never
+# returns this value today -- see that function's own docstring. The
+# constant/vocabulary entry and the `live_runtime_preserved` result bucket
+# it feeds are intentionally kept so a future, independently-scoped
+# identity-bound follow-up Issue can wire real evidence into this same
+# shape without changing the tri-state vocabulary itself again.
 LIVENESS_PROVEN_ALIVE = "PROVEN_ALIVE"
 LIVENESS_PROVEN_ABSENT = "PROVEN_ABSENT"
 LIVENESS_UNKNOWN = "UNKNOWN"
+
+# Issue #2752 OWNER review (PR #2764 fix_delta P2-a, TOCTOU between the
+# discovery phase's liveness probe and the actual dispatch a candidate
+# later goes through in `run_startup_orchestrator()`): a candidate that
+# discovery classified `LIVENESS_PROVEN_ABSENT` is re-probed with the exact
+# same read-only ``_classify_pane_process_liveness()`` primitive
+# immediately before `dispatcher.prepare_managed_resume()` is ever called.
+# If that second probe no longer agrees (now `PROVEN_ALIVE`/`UNKNOWN`),
+# this dispatch_status is reported instead of silently dropping the
+# candidate or dispatching anyway -- no `prepare_managed_resume()` call, no
+# ACTIVE -> RESTORING DB mutation, `any_failed = true`.
+DISPATCH_STATUS_SECOND_PROBE_NO_LONGER_ABSENT = "second_probe_no_longer_absent"
 
 
 def _classify_pane_process_liveness(pane_id: str, *, herdr_bin: str, run_fn) -> tuple[str, dict[str, Any]]:
@@ -189,7 +216,56 @@ def _classify_pane_process_liveness(pane_id: str, *, herdr_bin: str, run_fn) -> 
     "argv": [...] (platform-dependent, may be omitted)}, ...] (omitted on
     platforms that do not expose per-process foreground data)}, "type":
     "pane_process_info"}}`` -- i.e. the payload is nested one level under
-    ``result.process_info``, NOT directly under ``result``.
+    ``result.process_info``, NOT directly under ``result``. Per Herdr's own
+    serialization contract (``#[serde(skip_serializing_if =
+    "Vec::is_empty")]`` on ``foreground_processes``), a genuinely empty
+    process list is OMITTED from the response entirely -- Herdr never sends
+    a literal ``"foreground_processes": []`` -- so this function must never
+    treat an *omitted* ``foreground_processes`` key as equivalent to a
+    positively-observed empty/bare-shell array; omission only means "this
+    platform/response did not include that field", which is exactly as
+    inconclusive as ``shell_pid`` alone (see the ``process_info_platform_
+    no_foreground_data`` branch below).
+
+    Issue #2752 OWNER review (PR #2764 fix_delta, pull request review
+    comment https://github.com/squne121/loop-protocol/pull/2764#issuecomment-5832937110,
+    P1 blocker): an earlier draft of this function treated ANY reported
+    foreground process other than the pane's own shell -- or any
+    ``foreground_process_group_id`` that merely differed numerically from
+    ``shell_pid`` -- as ``LIVENESS_PROVEN_ALIVE``. That is NOT causal
+    identity evidence: ``herdr pane process-info`` only reports whatever
+    job happens to currently occupy the pane's foreground slot, with no
+    linkage whatsoever back to a SPECIFIC Task Context Binding/session (a
+    human could have typed an unrelated command into that same pane, or a
+    completely different tool could be running there). Positively proving
+    "this pane's foreground process still IS the specific runtime this
+    Binding/session last launched" would require an independent causal-
+    identity mechanism (e.g. a recorded launched-process pid/generation the
+    Binding itself owns) that does not exist today and is explicitly Out of
+    Scope for this Issue/PR (a future evidence-bound extension is a
+    separate Issue's concern). Consequently this function now ONLY ever
+    returns ``LIVENESS_PROVEN_ALIVE`` if a future caller supplies that kind
+    of positive, evidence-bound signal -- with the CURRENT Herdr 0.9.1
+    ``pane process-info`` primitive alone, this classification is
+    unreachable in practice (every branch below that used to reach
+    ``LIVENESS_PROVEN_ALIVE`` now returns ``LIVENESS_UNKNOWN`` instead).
+    This is intentional, not an oversight: the tri-state vocabulary
+    (``LIVENESS_PROVEN_ALIVE`` / ``LIVENESS_PROVEN_ABSENT`` /
+    ``LIVENESS_UNKNOWN``) and the ``live_runtime_preserved`` result bucket
+    it feeds are kept exactly as-is so that a later, narrowly-scoped
+    identity-bound follow-up Issue can wire evidence into this same shape
+    without another vocabulary/result-shape change.
+
+    Similarly, ``shell_pid`` itself must be a POSITIVE, valid integer
+    process id before it can be used as the comparison anchor for anything
+    else in this response -- a missing/``None``/non-positive-integer
+    ``shell_pid`` means there is no reliable anchor to compare ANY other
+    field against (a bare-shell/absence conclusion drawn from a
+    ``foreground_process_group_id`` matching an invalid ``shell_pid`` would
+    be spurious), so every branch below first checks ``shell_pid``
+    validity and falls back to ``LIVENESS_UNKNOWN`` whenever it is invalid,
+    regardless of what ``foreground_process_group_id``/``foreground_
+    processes`` otherwise report (OWNER review P2 blocker).
 
     AC8: the ONLY signal this function ever inspects is structured
     foreground-process PID data (compared against the pane's own
@@ -239,7 +315,23 @@ def _classify_pane_process_liveness(pane_id: str, *, herdr_bin: str, run_fn) -> 
     foreground_processes = result.get("foreground_processes")
     foreground_process_group_id = result.get("foreground_process_group_id")
 
+    # OWNER review P2: `shell_pid` must be a positive integer to serve as a
+    # comparison anchor at all -- `None`/missing/non-integer/non-positive
+    # never lets ANY of the branches below conclude PROVEN_ABSENT (or, per
+    # the P1 correction above, PROVEN_ALIVE either).
+    shell_pid_is_valid = isinstance(shell_pid, int) and not isinstance(shell_pid, bool) and shell_pid > 0
+
     if isinstance(foreground_processes, list):
+        if not shell_pid_is_valid:
+            # Without a valid shell_pid anchor, no entry in
+            # foreground_processes can be positively attributed to "is/is
+            # not the pane's own shell" -- causal identity cannot be
+            # established either way.
+            return LIVENESS_UNKNOWN, {
+                "reason": "process_info_missing_shell_pid_for_foreground_processes",
+                "foreground_processes": foreground_processes,
+                "shell_pid": shell_pid,
+            }
         non_shell: list[Any] = []
         for entry in foreground_processes:
             if not isinstance(entry, dict) or "pid" not in entry:
@@ -253,23 +345,39 @@ def _classify_pane_process_liveness(pane_id: str, *, herdr_bin: str, run_fn) -> 
             if entry["pid"] != shell_pid:
                 non_shell.append(entry)
         if non_shell:
-            return LIVENESS_PROVEN_ALIVE, {"foreground_processes": non_shell, "shell_pid": shell_pid}
+            # OWNER review P1: a non-shell foreground process's mere
+            # presence is NOT causal identity evidence that it IS the
+            # specific runtime this Binding/session last launched --
+            # `herdr pane process-info` only reports whatever job currently
+            # happens to be the pane's foreground job, with no linkage back
+            # to a particular Task Context Binding/session. Never
+            # PROVEN_ALIVE from this signal alone (see function docstring).
+            return LIVENESS_UNKNOWN, {
+                "reason": "process_info_non_shell_foreground_process_no_causal_identity",
+                "foreground_processes": non_shell,
+                "shell_pid": shell_pid,
+            }
         # bare-shell-only: parseable, successful response, every reported
-        # foreground process IS the pane's own shell (or none at all) --
-        # AC3 case 2 (real cold restart re-generating a pane at the same
-        # locator).
+        # foreground process IS the pane's own shell (or the list is
+        # positively present-but-empty) -- AC3 case 2 (real cold restart
+        # re-generating a pane at the same locator).
         return LIVENESS_PROVEN_ABSENT, {"foreground_processes": foreground_processes, "shell_pid": shell_pid}
 
     if foreground_process_group_id is not None:
         # Some platforms only expose a single foreground-process(-group) id,
         # not a full process list (Herdr socket-api doc: "foreground process
         # group id" when full per-process data is unavailable).
-        if shell_pid is not None and foreground_process_group_id == shell_pid:
+        if shell_pid_is_valid and foreground_process_group_id == shell_pid:
             return LIVENESS_PROVEN_ABSENT, {
                 "foreground_process_group_id": foreground_process_group_id,
                 "shell_pid": shell_pid,
             }
-        return LIVENESS_PROVEN_ALIVE, {
+        # Either shell_pid is missing/invalid (OWNER review P2) or the
+        # group id simply differs from shell_pid -- neither is causal
+        # identity evidence of PROVEN_ALIVE (OWNER review P1); both are
+        # reported as UNKNOWN.
+        return LIVENESS_UNKNOWN, {
+            "reason": "process_info_foreground_process_group_id_no_causal_identity",
             "foreground_process_group_id": foreground_process_group_id,
             "shell_pid": shell_pid,
         }
@@ -277,8 +385,11 @@ def _classify_pane_process_liveness(pane_id: str, *, herdr_bin: str, run_fn) -> 
     if shell_pid is not None:
         # This platform published only the pane's own shell pid and nothing
         # about what (if anything) is foreground in it -- "platform 非対応"
-        # per the Issue body. Never treat shell_pid alone as proof of either
-        # liveness or absence.
+        # per the Issue body. This is also the branch a genuinely-empty
+        # (per Herdr's own skip_serializing_if contract, OMITTED rather
+        # than an explicit `[]`) `foreground_processes` field falls into.
+        # Never treat shell_pid alone as proof of either liveness or
+        # absence.
         return LIVENESS_UNKNOWN, {"reason": "process_info_platform_no_foreground_data", "shell_pid": shell_pid}
 
     return LIVENESS_UNKNOWN, {"reason": "process_info_empty_result"}
@@ -364,17 +475,28 @@ def discover_resume_candidates(
     (see ``_classify_pane_process_liveness()``) BEFORE deciding whether it
     is dispatchable, classifying it into one of three outcomes:
 
-    - ``LIVENESS_PROVEN_ALIVE``: the pane's runtime process is still
-      running (parseable foreground-process evidence beyond the pane's own
-      shell). Reported via ``"live_runtime_preserved"`` -- NOT a candidate,
-      NEVER dispatched, Binding identity untouched.
+    - ``LIVENESS_PROVEN_ALIVE``: the pane's runtime process is POSITIVELY,
+      causally tied back to this specific Binding/session (a future
+      identity-bound evidence mechanism this Issue/PR does not implement --
+      OWNER review PR #2764 fix_delta P1: neither an arbitrary non-shell
+      foreground process nor a mismatched ``foreground_process_group_id``
+      alone is causal identity evidence, since ``herdr pane process-info``
+      never links back to a specific Binding/session; see
+      ``_classify_pane_process_liveness()``'s own docstring). Reported via
+      ``"live_runtime_preserved"`` -- NOT a candidate, NEVER dispatched,
+      Binding identity untouched. With the current Herdr 0.9.1 primitive
+      alone this is unreachable in practice; the bucket is kept for a
+      future narrowly-scoped follow-up.
     - ``LIVENESS_PROVEN_ABSENT``: ``process-info`` succeeded and clearly
       showed bare-shell-only (no foreground process besides the pane's own
-      shell) -- a real cold restart re-generated a pane at the same
-      locator (AC3 case 2). Added to ``"candidates"`` exactly like before.
+      shell, with a valid ``shell_pid`` anchor -- OWNER review P2) -- a real
+      cold restart re-generated a pane at the same locator (AC3 case 2).
+      Added to ``"candidates"`` exactly like before.
     - ``LIVENESS_UNKNOWN``: the call itself failed/was empty/unparseable/
-      not exposed by this platform/identity-ambiguous. Reported via
-      ``"unresolved_targets"`` (``REASON_LIVENESS_UNRESOLVED``) -- never
+      not exposed by this platform/identity-ambiguous/lacks a valid
+      ``shell_pid`` anchor/reported a foreground process or process-group
+      that cannot be positively tied back to this Binding/session. Reported
+      via ``"unresolved_targets"`` (``REASON_LIVENESS_UNRESOLVED``) -- never
       dispatched, never silently treated as either proven state (AC4/AC8
       fail-closed).
 
@@ -586,14 +708,41 @@ def run_startup_orchestrator(
     ack_timeout_seconds: float = dispatcher._DEFAULT_ACK_TIMEOUT_SECONDS,
     discovery_run_fn=None,
 ) -> dict[str, Any]:
-    """The full one-shot orchestration cycle: discover -> dispatch every
-    candidate -> collect ACKs against one shared bounded deadline -> return
-    a JSON-serializable summary. Never launches a process itself outside of
+    """The full one-shot orchestration cycle: discover -> re-probe each
+    candidate's liveness immediately before dispatch (fix_delta P2-a) ->
+    dispatch every candidate still confirmed absent -> collect ACKs against
+    one shared bounded deadline -> return a JSON-serializable summary. Never
+    launches a process itself outside of
     ``task_context_resume_dispatcher.execute_resume_decision`` (dispatch)
-    and ``herdr pane list`` (read-only discovery). Never passes
-    ``herdr_session`` through to the dispatcher (see module docstring
-    "Session scoping") -- every herdr call this whole cycle makes stays
-    unqualified/ambient."""
+    and ``herdr pane list``/``herdr pane process-info`` (read-only
+    discovery/re-probe). Never passes ``herdr_session`` through to the
+    dispatcher (see module docstring "Session scoping") -- every herdr call
+    this whole cycle makes stays unqualified/ambient.
+
+    Second liveness probe (Issue #2752 OWNER review, PR #2764 fix_delta
+    P2-a): the discovery phase's ``LIVENESS_PROVEN_ABSENT`` classification
+    and the moment this loop actually calls
+    ``dispatcher.prepare_managed_resume()`` (the first DB-mutating step,
+    ACTIVE -> RESTORING) are NOT the same instant -- an arbitrary amount of
+    wall-clock time (DB open/close, other candidates' dispatch/ACK work)
+    can elapse between them, during which a live handoff could still occur
+    for THIS exact pane. To narrow (never fully close -- see below) that
+    TOCTOU window, this loop re-runs the exact same read-only
+    ``_classify_pane_process_liveness()`` probe against the SAME pane_id
+    immediately before calling ``prepare_managed_resume()``. Only a second
+    ``LIVENESS_PROVEN_ABSENT`` result proceeds to dispatch; any other
+    result (``PROVEN_ALIVE``/``UNKNOWN``) reports
+    ``DISPATCH_STATUS_SECOND_PROBE_NO_LONGER_ABSENT`` and skips this
+    candidate entirely -- no ``prepare_managed_resume()`` call, no ACTIVE ->
+    RESTORING DB mutation, never a silent drop. This module deliberately
+    does NOT introduce a SQLite/Herdr cross-system lease or lock to make
+    discovery+re-probe+dispatch fully atomic (Issue Outcome / Stop
+    Conditions forbid a new daemon/lease/distributed coordinator) -- a
+    small residual race between THIS re-probe and the
+    ``prepare_managed_resume()`` call a few lines below remains a
+    documented, accepted risk, not eliminated (see
+    docs/dev/task-context.md's "second probe" note for the design
+    rationale)."""
     conn = dispatcher.open_dispatcher_db()
     try:
         discovery = discover_resume_candidates(conn, herdr_bin=herdr_bin, run_fn=discovery_run_fn)
@@ -608,6 +757,25 @@ def run_startup_orchestrator(
     results: list[dict[str, Any]] = []
     pending_acks: list[tuple[str, str | None]] = []
     for session_id, pane_id in candidates:
+        second_classification, second_evidence = _classify_pane_process_liveness(
+            pane_id, herdr_bin=herdr_bin, run_fn=subprocess.run
+        )
+        if second_classification != LIVENESS_PROVEN_ABSENT:
+            # fix_delta P2-a: never call `prepare_managed_resume()` (no
+            # ACTIVE -> RESTORING mutation) and never dispatch if the
+            # SAME pane's liveness no longer confirms PROVEN_ABSENT right
+            # before dispatch -- surfaced explicitly, never silently
+            # dropped.
+            results.append(
+                {
+                    "session_id": session_id,
+                    "pane_id": pane_id,
+                    "dispatch_status": DISPATCH_STATUS_SECOND_PROBE_NO_LONGER_ABSENT,
+                    "second_probe_classification": second_classification,
+                    "second_probe_evidence": second_evidence,
+                }
+            )
+            continue
         decision = dispatcher.prepare_managed_resume(session_id)
         entry: dict[str, Any] = {
             "session_id": session_id,
