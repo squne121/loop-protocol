@@ -466,7 +466,7 @@ def test_live_runtime_verifier_records_2119_2137_legacy_compatibility_without_fi
     assert artifact.exists()
 
 
-def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_references_excluded():
+def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_references_excluded(monkeypatch):
     """AC9: production-shaped regression through `collect_candidate_inputs()`
     (timeline candidate collection -> real `gh pr view` PR body fetch -> a
     genuine `IMPLEMENTATION_SCOPE_COVERAGE_V1` marker text produced by
@@ -478,7 +478,21 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
     timeline cross-references for the current target Issue #2727, but each
     carries a well-formed durable marker naming a *different* sibling Issue
     (#2725 / #2726). Neither is a qualified landing candidate for the
-    current target, and `qualified_candidate_conflict` never fires (AC1/AC2)."""
+    current target, and `qualified_candidate_conflict` never fires (AC1/AC2).
+
+    #2750 PR #2758 review (P1 blocker, comment
+    https://github.com/squne121/loop-protocol/pull/2758#issuecomment-5831103538):
+    this test used to stop at `derive_landing_disposition()`. It now
+    continues the SAME #2727 incident-shaped fixture through the canonical
+    production composition `build_intake_capsule.py::
+    _collect_implementation_landed_evidence()` actually runs
+    (`resolve_landing_disposition_with_freshness_rebind()` ->
+    `derive_landing_disposition()` -> `apply_already_satisfied_precedence()`
+    -> `resolve_pre_step1_data_plane_action()`), reusing the existing mock
+    `gh` / `base_ac_verification_result` fixture patterns from
+    `test_collect_implementation_landed_evidence_applies_precedence_through_
+    default_loader()` above -- never a bespoke test-only re-implementation
+    of that composition logic."""
     landed_evidence = _load(LANDED_EVIDENCE, "implementation_landed_evidence_for_2727_integration_test")
 
     target_issue = 2727
@@ -486,6 +500,7 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
     target_issue_body = "## Allowed Paths\n- `.claude/a.py`\n"
     sibling_body_2725 = "## Allowed Paths\n- `.claude/x.py`\n"
     sibling_body_2726 = "## Allowed Paths\n- `.claude/y.py`\n"
+    main_sha = "9" * 40
 
     marker_2735 = landed_evidence.render_scope_coverage_marker(
         landed_evidence.build_scope_coverage_marker(
@@ -521,6 +536,15 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
         },
     ]
 
+    # #2750 PR #2758 review: `_LIGHT_PR_FIELDS` distinguishes the freshness-
+    # rebind `gh pr view --json headRefOid,mergedAt,mergeCommit` shape
+    # (`_live_freshness_reference()`) from the discovery-time
+    # `gh pr view --json number,url,state,...` shape (`collect_candidate_
+    # inputs()`) -- both real production call shapes the same fixture must
+    # answer once this test continues through
+    # `resolve_landing_disposition_with_freshness_rebind()`.
+    _LIGHT_PR_FIELDS = "headRefOid,mergedAt,mergeCommit"
+
     def run(argv):
         if argv[:3] == ["gh", "pr", "list"]:
             # Neither PR's closingIssuesReferences names the current target
@@ -537,6 +561,22 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
             )
         if argv[:2] == ["gh", "api"] and len(argv) > 2 and "timeline" in argv[-1]:
             return 0, json.dumps(timeline_events), ""
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] == "2735" and argv[-1] == _LIGHT_PR_FIELDS:
+            return (
+                0,
+                json.dumps(
+                    {"headRefOid": "a" * 40, "mergedAt": "2026-09-01T00:00:00Z", "mergeCommit": {"oid": "a" * 40}}
+                ),
+                "",
+            )
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] == "2746" and argv[-1] == _LIGHT_PR_FIELDS:
+            return (
+                0,
+                json.dumps(
+                    {"headRefOid": "b" * 40, "mergedAt": "2026-09-02T00:00:00Z", "mergeCommit": {"oid": "b" * 40}}
+                ),
+                "",
+            )
         if argv[:3] == ["gh", "pr", "view"] and argv[3] == "2735":
             return (
                 0,
@@ -575,10 +615,12 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
                 ),
                 "",
             )
+        if argv[:3] == ["gh", "issue", "view"] and argv[3] == str(target_issue):
+            return 0, json.dumps({"body": target_issue_body}), ""
         if argv[:2] == ["gh", "api"] and len(argv) > 2 and "compare" in argv[2]:
             return 0, "ahead\n", ""
         if argv[:2] == ["gh", "api"] and len(argv) > 2 and "commits/main" in argv[2]:
-            return 0, "9" * 40 + "\n", ""
+            return 0, main_sha + "\n", ""
         return 1, "", "unexpected argv: " + " ".join(argv)
 
     evidence = landed_evidence.collect_candidate_inputs(
@@ -593,3 +635,32 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
     result = landed_evidence.derive_landing_disposition(evidence, repo=repo, issue_number=target_issue)
     assert result["disposition"] == "ordinary_dispatch_or_explicit_recovery"
     assert result["reason_codes"] == ["no_qualified_candidate"]
+
+    # #2750 PR #2758 review (P1 blocker): continue the SAME #2727
+    # incident-shaped fixture through the canonical production entry point
+    # `build_intake_capsule.py::_collect_implementation_landed_evidence()`
+    # -- `resolve_landing_disposition_with_freshness_rebind()` ->
+    # `derive_landing_disposition()` -> `apply_already_satisfied_precedence()`
+    # -> `resolve_pre_step1_data_plane_action()` -- with a fresh, clean
+    # base AC PASS `base_ac_verification_result` (reusing `_fresh_test_
+    # verdict()` from above) so the no-qualified-candidate disposition
+    # composes into `already_satisfied` / `suppress_worker_worktree_new_pr`,
+    # never re-deriving that composition locally in the test.
+    build_capsule = _load(BUILD_CAPSULE, "build_intake_capsule_for_2727_integration_test")
+    monkeypatch.setattr(build_capsule, "_run_command", run)
+
+    production_evidence = build_capsule._collect_implementation_landed_evidence(
+        issue_number=target_issue,
+        repo=repo,
+        issue_body=target_issue_body,
+        command_log=[],
+        next_action_route="proceed_to_step_1",
+        base_ac_verification_result=_fresh_test_verdict(main_sha),
+    )
+
+    assert production_evidence["landing_disposition"]["reason_codes"] != ["qualified_candidate_conflict"]
+    assert production_evidence["landing_disposition"]["disposition"] == "already_satisfied"
+    assert production_evidence["pre_step1_data_plane"] == {
+        "start_data_plane": False,
+        "action": "suppress_worker_worktree_new_pr",
+    }
