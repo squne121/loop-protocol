@@ -1077,7 +1077,7 @@ Issue の Out of Scope として別の narrow follow-up Issue へ委ねる。
 選ばず該当する全 Binding を `unresolved_target` として報告し dispatch
 しない（変更なし）。
 
-### cold restart / live handoff 境界: tri-state pane-process liveness classification（Issue #2752）
+### cold restart と live handoff の境界判定: pane process の3値生存性分類（tri-state pane-process liveness classification、Issue #2752）
 
 **Issue #2742 が残した Out of Scope の解消**: #2742 は「locator が
 `live_pane_ids` に存在する ACTIVE Binding」を無条件に `candidates`
@@ -1365,7 +1365,7 @@ env var を明示的に `unset` してから起動するだけで、その配下
 今後同様の canary を（特にネストした Claude Code 環境内の agent から）
 実行する場合の前提条件として記録する。
 
-### narrow Herdr canary（Issue #2752 AC7、`tests/task-context/test_live_handoff_duplicate_resume_canary.py`）
+### 狭い範囲の実 Herdr canary 検証（narrow Herdr canary、Issue #2752 AC7、`tests/task-context/test_live_handoff_duplicate_resume_canary.py`）
 
 Issue #2752 の AC7 は、上記 tri-state liveness classification の 4 つの
 causal boundary（Native/Claude-GPT × live handoff/cold restart）を実 Herdr
