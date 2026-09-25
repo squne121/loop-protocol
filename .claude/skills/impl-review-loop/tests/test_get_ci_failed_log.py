@@ -357,6 +357,24 @@ class TestRedaction:
         assert "[REDACTED]" in redacted
         assert applied is True
 
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "ghp_" + "A" * 36,
+            "ghs_" + "A" * 36,
+            "github_pat_" + "A" * 59,
+            "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature_123",
+        ],
+        ids=["classic_ghp", "classic_ghs", "github_pat", "bare_jwt"],
+    )
+    def test_existing_token_formats_fully_redacted(self, token):
+        """AC3 (#2728): classic ghp_/ghs_/github_pat_/bare-JWT 形式の
+        redact_tokens() 非回帰を named parametrize node で明示的に検証する。"""
+        redacted, applied = mod.redact_tokens(f"before {token} after")
+        assert applied is True
+        assert redacted == "before [REDACTED] after"
+        assert token not in redacted
+
     def test_sha_not_redacted(self):
         sha = "abc123def456abc123def456abc123def456abc1"
         text = f"head sha: {sha}"
