@@ -84,6 +84,51 @@ import task_context_config as config  # noqa: E402
 import task_context_db as db  # noqa: E402
 import task_context_resume_dispatcher as dispatcher  # noqa: E402
 
+# ---------------------------------------------------------------------------
+# Discovery result vocabulary (Issue #2742 -- follow-up to #2570's runtime
+# acceptance fact-check; aligned with the #2570 result vocabulary
+# `restored` / `expected_skip_suspended` / `restore_blocked` /
+# `unresolved_target`).
+# ---------------------------------------------------------------------------
+
+# A managed (ACTIVE) Binding's recorded `herdr_locator` no longer names any
+# currently-live pane in this session -- there is nowhere to dispatch a
+# resume command to. Previously silently dropped from the candidate set
+# (indistinguishable from "no candidates at all" -- a false green).
+REASON_LOCATOR_NOT_LIVE = "locator_not_live"
+
+# Two or more ACTIVE Bindings claim the exact same live `herdr_locator`.
+# `runtime_locations` only enforces `UNIQUE(binding_id) WHERE released_at IS
+# NULL` -- it does NOT enforce locator-level uniqueness across different
+# Bindings -- so this is an application-level detection, not a DB
+# constraint violation. Arbitrarily picking one claimant to dispatch into
+# would silently starve the others; instead every claimant for the pane is
+# reported and none are dispatched.
+REASON_DUPLICATE_LOCATOR_CLAIM = "duplicate_locator_claim"
+
+# A RESTORING Binding discovery re-detected on a subsequent cold restart.
+# Contract Reconciliation (2026-09-25, Issue #2742 AC2): this is reported
+# UNCONDITIONALLY for every RESTORING Binding -- discovery never calls
+# `mark_restore_blocked_if_pending()` and never mutates DB state, because
+# that guard's success condition (runtime_health == "RESTORING" AND
+# execution_run.ended_at IS NULL) only confirms a pending restore has not
+# yet been ACKed, NOT that the underlying process/pane is actually dead
+# (a live Herdr handoff can leave a Binding in this exact same DB state).
+# DB state is left untouched; this is reported so it never silently
+# vanishes from an operator's view the way a permanently-stuck RESTORING
+# Binding previously did.
+REASON_RESTORING_NOT_PROVABLY_STALE = "restoring_not_provably_stale"
+
+# Reserved (Contract Reconciliation 2026-09-25, Issue #2742 AC2): NEVER
+# emitted by `discover_resume_candidates()` today -- kept only so the
+# `"restore_blocked"` result key and downstream summary/exit-code wiring
+# remain backward compatible for a future independent liveness mechanism
+# (e.g. a generation counter or pid liveness check) that could actually
+# prove a RESTORING Binding is stale and converge it to RESTORE_BLOCKED.
+# See the module Notes for Reviewer for the narrow follow-up this defers
+# to.
+REASON_STALE_RESTORING_CONVERGED = "stale_restoring_converged"
+
 
 class HerdrDiscoveryError(RuntimeError):
     """`herdr pane list` itself failed or returned unparseable output --
@@ -105,7 +150,7 @@ def discover_resume_candidates(
     *,
     herdr_bin: str,
     run_fn=None,
-) -> list[tuple[str, str]]:
+) -> dict[str, Any]:
     """Enumerate the AMBIENT Herdr session's CURRENTLY LIVE panes
     (unqualified ``herdr pane list`` -- see module docstring "Session
     scoping" for why no ``--session`` flag is ever passed) and cross-
@@ -130,8 +175,35 @@ def discover_resume_candidates(
     i.e. the locator is used only to find WHERE to dispatch, never as the
     identity itself.
 
-    Returns a list of ``(session_id, pane_id)`` pairs, most-recently-updated
-    Binding first.
+    Issue #2742 (follow-up to #2570's runtime acceptance fact-check): this
+    now also (a) reports -- rather than silently drops -- an ACTIVE
+    Binding whose recorded locator no longer names a live pane, or whose
+    locator is claimed by more than one ACTIVE Binding at once, and (b)
+    includes RESTORING Bindings in discovery so a prior dispatch attempt
+    that never reached ACK before THIS process itself was interrupted
+    (host crash/reboot mid-restore) is re-detected on a subsequent cold
+    restart instead of being permanently orphaned at RESTORING.
+
+    Returns a dict with three keys:
+
+    - ``"candidates"``: a list of ``(session_id, pane_id)`` pairs --
+      exactly the previous return shape -- for ACTIVE Bindings whose
+      locator uniquely names a currently-live pane. Dispatchable.
+    - ``"unresolved_targets"``: a list of
+      ``{"binding_id", "session_id", "reason"}`` dicts for Bindings this
+      run could not (or must not) resolve a dispatch target for. No
+      resume command is ever sent for these. ``reason`` is one of
+      ``REASON_LOCATOR_NOT_LIVE`` / ``REASON_DUPLICATE_LOCATOR_CLAIM`` /
+      ``REASON_RESTORING_NOT_PROVABLY_STALE``.
+    - ``"restore_blocked"``: ALWAYS empty (Contract Reconciliation
+      2026-09-25, Issue #2742 AC2). Reserved for a future independent
+      liveness mechanism (e.g. a generation counter or pid liveness
+      check) that could confirm a RESTORING Binding is truly stale and
+      converge it to RESTORE_BLOCKED -- ``discover_resume_candidates()``
+      never calls ``dispatcher.mark_restore_blocked_if_pending()`` and
+      never mutates DB state for a RESTORING Binding; every RESTORING
+      Binding is reported only via ``"unresolved_targets"`` (see AC2
+      Contract Reconciliation note in the module Notes for Reviewer).
     """
     if run_fn is None:
         run_fn = subprocess.run
@@ -150,20 +222,93 @@ def discover_resume_candidates(
     rows = db.execute_readonly(
         conn,
         "SELECT tb.id AS binding_id, tb.current_claude_session_id AS session_id, "
+        "tb.runtime_health AS runtime_health, "
         "rl.herdr_locator AS herdr_locator, tb.updated_at AS updated_at "
         "FROM tab_bindings tb "
         "JOIN runtime_locations rl ON rl.binding_id = tb.id AND rl.released_at IS NULL "
-        "WHERE tb.runtime_health = 'ACTIVE' AND tb.current_claude_session_id IS NOT NULL "
+        "WHERE tb.runtime_health IN ('ACTIVE', 'RESTORING') AND tb.current_claude_session_id IS NOT NULL "
         "ORDER BY tb.updated_at DESC",
     ).fetchall()
 
     candidates: list[tuple[str, str]] = []
+    unresolved_targets: list[dict[str, Any]] = []
+    restore_blocked: list[dict[str, Any]] = []
+
+    # AC4: group ACTIVE rows by locator FIRST so a duplicate claim on one
+    # live pane is detected and reported for ALL claimants -- never
+    # resolved by arbitrarily picking whichever row `ORDER BY
+    # tb.updated_at DESC` happened to sort first.
+    active_rows_by_locator: dict[str, list[Any]] = {}
     for row in rows:
+        if row["runtime_health"] != "ACTIVE":
+            continue
         locator = row["herdr_locator"]
         session_id = row["session_id"]
-        if locator and session_id and locator in live_pane_ids:
-            candidates.append((session_id, locator))
-    return candidates
+        if not locator or not session_id:
+            continue
+        active_rows_by_locator.setdefault(locator, []).append(row)
+
+    for locator, claimant_rows in active_rows_by_locator.items():
+        if locator not in live_pane_ids:
+            # AC1: the recorded locator no longer names any currently-live
+            # pane -- nothing to dispatch to. Explicitly reported (never
+            # silently dropped) so this is distinguishable from "no
+            # candidates at all".
+            for row in claimant_rows:
+                unresolved_targets.append(
+                    {
+                        "binding_id": row["binding_id"],
+                        "session_id": row["session_id"],
+                        "reason": REASON_LOCATOR_NOT_LIVE,
+                    }
+                )
+            continue
+        if len(claimant_rows) > 1:
+            # AC4: same live pane claimed by >1 ACTIVE Binding -- report
+            # every claimant, dispatch none.
+            for row in claimant_rows:
+                unresolved_targets.append(
+                    {
+                        "binding_id": row["binding_id"],
+                        "session_id": row["session_id"],
+                        "reason": REASON_DUPLICATE_LOCATOR_CLAIM,
+                    }
+                )
+            continue
+        row = claimant_rows[0]
+        candidates.append((row["session_id"], locator))
+
+    # AC2 (Contract Reconciliation 2026-09-25): RESTORING Bindings are
+    # always reported as unresolved_target WITHOUT any DB mutation.
+    # mark_restore_blocked_if_pending()'s guard condition
+    # (runtime_health == "RESTORING" AND execution_run.ended_at IS NULL)
+    # confirms only that a pending restore has not yet been ACKed -- it
+    # does NOT prove the underlying process/pane is dead. A live Herdr
+    # handoff can leave a Binding in this exact same DB state while the
+    # pane is still genuinely alive, so treating guard success as a
+    # staleness proof would risk RESTORE_BLOCKED-ing a Binding that is
+    # mid live-handoff. True stale-RESTORING recovery requires an
+    # independent liveness mechanism (e.g. a generation counter or pid
+    # liveness check) that does not yet exist -- see Issue #2742 Notes
+    # for Reviewer "Contract Reconciliation" and the resulting narrow
+    # follow-up issue. This function therefore never mutates DB state
+    # for RESTORING bindings; it only reports them.
+    for row in rows:
+        if row["runtime_health"] != "RESTORING":
+            continue
+        unresolved_targets.append(
+            {
+                "binding_id": row["binding_id"],
+                "session_id": row["session_id"],
+                "reason": REASON_RESTORING_NOT_PROVABLY_STALE,
+            }
+        )
+
+    return {
+        "candidates": candidates,
+        "unresolved_targets": unresolved_targets,
+        "restore_blocked": restore_blocked,
+    }
 
 
 def run_startup_orchestrator(
@@ -183,9 +328,13 @@ def run_startup_orchestrator(
     unqualified/ambient."""
     conn = dispatcher.open_dispatcher_db()
     try:
-        candidates = discover_resume_candidates(conn, herdr_bin=herdr_bin, run_fn=discovery_run_fn)
+        discovery = discover_resume_candidates(conn, herdr_bin=herdr_bin, run_fn=discovery_run_fn)
     finally:
         conn.close()
+
+    candidates = discovery["candidates"]
+    unresolved_targets = discovery["unresolved_targets"]
+    stale_restore_blocked = discovery["restore_blocked"]
 
     results: list[dict[str, Any]] = []
     pending_acks: list[tuple[str, str | None]] = []
@@ -218,16 +367,48 @@ def run_startup_orchestrator(
                 entry["dispatch_status"] = "dispatch_failed"
         results.append(entry)
 
+    # AC1/AC2/AC4: discovery-level classifications that were never
+    # dispatchable at all -- reported as first-class result entries
+    # (never silently dropped from the summary) so `any_failed` below can
+    # see them.
+    for entry_data in unresolved_targets:
+        results.append(
+            {
+                "session_id": entry_data["session_id"],
+                "pane_id": None,
+                "binding_id": entry_data["binding_id"],
+                "dispatch_status": "unresolved_target",
+                "reason": entry_data["reason"],
+            }
+        )
+    for entry_data in stale_restore_blocked:
+        results.append(
+            {
+                "session_id": entry_data["session_id"],
+                "pane_id": None,
+                "binding_id": entry_data["binding_id"],
+                "dispatch_status": "restore_blocked",
+                "reason": entry_data["reason"],
+            }
+        )
+
     if pending_acks:
         ack_statuses = dispatcher.await_all_acks(pending_acks, timeout_seconds=ack_timeout_seconds)
         for entry in results:
-            binding_id = entry["decision"].get("binding_id")
+            binding_id = entry.get("decision", {}).get("binding_id") if "decision" in entry else entry.get(
+                "binding_id"
+            )
             if entry["dispatch_status"] == "dispatched_waiting_ack" and binding_id in ack_statuses:
                 entry["dispatch_status"] = ack_statuses[binding_id]
 
-    any_failed = any(
-        entry["dispatch_status"] not in ("restored", "not_dispatched") for entry in results
-    )
+    # Issue #2742: previously only `dispatch_status not in ("restored",
+    # "not_dispatched")` counted as a failure -- `not_dispatched` (e.g. an
+    # ACTIVE candidate that `classify_for_resume` itself immediately
+    # classified as RESTORE_BLOCKED, such as an invalid managed profile)
+    # was a false-green path, and the new `unresolved_target` /
+    # `restore_blocked` discovery-level classifications were not
+    # represented at all. Every non-"restored" outcome is now a failure.
+    any_failed = any(entry["dispatch_status"] != "restored" for entry in results)
     return {
         "candidates_discovered": len(candidates),
         "results": results,
