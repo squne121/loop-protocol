@@ -347,10 +347,41 @@ def test_compact_author_result_rejects_absolute_path():
 # ---------------------------------------------------------------------------
 
 
+def _make_new_format_ghs_token(app_id: str) -> str:
+    """Build a deterministic synthetic new-format ghs_ installation token.
+
+    Mirrors the PR #2735 precedent (`tests/test_summarize_agent_transcript.py`)
+    for real GitHub App installation tokens: `ghs_<APP_ID>_<header>.<payload>.<signature>`,
+    a JWT-shaped body with exactly two '.' separators and '_'/'.'/'-' chars
+    present, built up to real installation-token scale (>=520 chars) by
+    programmatically padding the payload/signature segments with repeated
+    filler rather than hardcoding a 520-char literal. This lets tests exercise
+    the dedicated `ghs_[A-Za-z0-9._-]{36,}` matcher's real length regime
+    instead of an artificially short fixture.
+    """
+    jwt_header = "eyJhbGciOiJSUzI1NiJ9"
+    jwt_payload = "eyJpc3MiOiJodHRwczovL2V4YW1wbGUuY29tIn0"
+    jwt_signature = "s1gN4tuRe-_placeholder123456789"
+
+    token = f"ghs_{app_id}_{jwt_header}.{jwt_payload}.{jwt_signature}"
+    while len(token) < 520:
+        jwt_payload += "A"
+        jwt_signature += "B"
+        token = f"ghs_{app_id}_{jwt_header}.{jwt_payload}.{jwt_signature}"
+
+    assert token.count(".") == 2
+    assert len(token) >= 520
+    return token
+
+
 def test_no_secret_check_detects_new_format_ghs_installation_token():
-    """GIVEN new-format ghs_<APP_ID>_<JWT> token with '_', '.', '-' chars
-    WHEN _no_secret_check called THEN 'GitHub server token' violation detected (AC2)."""
-    new_format_token = "ghs_123456789_abcDEF-ghi.JKL_mno789PQRstuVWXyz0123"
+    """GIVEN new-format ghs_<APP_ID>_<JWT> token with '_', '.', '-' chars,
+    built via _make_new_format_ghs_token() at real (>=520 char) installation-
+    token scale (PR #2735 precedent) WHEN _no_secret_check called THEN
+    'GitHub server token' violation detected (AC2)."""
+    new_format_token = _make_new_format_ghs_token("123456789")
+    assert new_format_token.count(".") == 2
+    assert len(new_format_token) >= 520
     violations = _no_secret_check(new_format_token)
     assert "GitHub server token" in violations
 
@@ -364,14 +395,33 @@ def test_no_secret_check_detects_legacy_ghs_token():
 
 
 def test_compact_author_result_new_format_ghs_token_raises_valueerror(tmp_path):
-    """GIVEN artifact pass-through field containing a new-format ghs_<APP_ID>_<JWT> token
-    WHEN compact_author_result called THEN ValueError raised and no success artifact
-    content is generated (fail-closed semantics maintained, AC3)."""
-    new_format_token = "ghs_987654321_zyxWVU-tsr.qpo_nml654KJIhgfEDCba9876"
+    """GIVEN artifact pass-through field containing a new-format ghs_<APP_ID>_<JWT>
+    token (built via _make_new_format_ghs_token(), PR #2735 precedent) WHEN
+    compact_author_result called THEN ValueError is raised while assembling the
+    artifact JSON, before compact_author_result returns any success result to
+    its caller — so the caller never reaches the point where it would write a
+    success artifact via its own _atomic_write call (fail-closed semantics
+    maintained, AC3).
+
+    The diff_summary text deliberately avoids the pre-existing generic
+    `token:` / `secret:` / `api_key:` detector prefixes, so this test proves
+    the fail-closed path is driven by the newly widened dedicated `ghs_`
+    matcher itself rather than by a false pass through the generic detector.
+    """
+    new_format_token = _make_new_format_ghs_token("987654321")
+    assert new_format_token.count(".") == 2
+    assert len(new_format_token) >= 520
+    diff_summary = f"credential fixture {new_format_token}"
+    # Negative control: confirm this fixture does not incidentally trip the
+    # pre-existing generic detectors, so a pass here is attributable only to
+    # the dedicated ghs_ matcher.
+    assert "token:" not in diff_summary
+    assert "secret:" not in diff_summary
+    assert "api_key:" not in diff_summary
     raw_result = {
         "status": "ok",
         "checked_body_sha256": "abc123def456abc123def456abc123def456abc123def456abc123def456abc123",
-        "mutation_result": {"diff_summary": f"token: {new_format_token}"},
+        "mutation_result": {"diff_summary": diff_summary},
     }
     artifact_dir = tmp_path / ".claude/artifacts/issue-refinement-loop"
     with pytest.raises(ValueError, match="secret-like strings detected in artifact content"):
