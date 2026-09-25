@@ -581,3 +581,145 @@ def test_given_missing_pre_clear_execution_run_when_asserted_then_fails():
     )
     assert evidence.status == "fail"
     assert any("pre_clear_execution_run" in v for v in evidence.violations)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2747: orchestrate_runtime_smoke()'s reinterpretation of a completed
+# structured runtime-smoke session's post-session statusLine observation.
+# ``collect_statusline_evidence()`` itself is monkeypatched (never its own
+# leaf semantics -- those stay Out of Scope, see PR body / #2747) so these
+# tests deterministically drive orchestrate_runtime_smoke()'s aggregation
+# logic for each of the "executed" / "executed_degenerate" / "failed" /
+# "skipped" leaf outcomes, without requiring a real claude CLI.
+# ---------------------------------------------------------------------------
+
+
+def _open_scratch_canonical_conn(tmp_path):
+    db_file = tmp_path / "canonical" / "task-context.sqlite3"
+    conn = db.connect(db_file)
+    migration_runner.migrate(conn)
+    return conn
+
+
+def _seed_scratch_task_activity(conn):
+    task = service.create_task(conn, title="issue-2747 statusline reinterpretation parent task")
+    activity = service.transition_activity(conn, task["id"], kind="verification")
+    return task["id"], activity["id"]
+
+
+def _fake_invoke_generic_runner_ok(argv, *, timeout_seconds):
+    return subprocess.CompletedProcess(args=list(argv), returncode=0, stdout="", stderr="")
+
+
+def _fake_invoke_generic_runner_failing(argv, *, timeout_seconds):
+    return subprocess.CompletedProcess(args=list(argv), returncode=1, stdout="", stderr="boom")
+
+
+def _fake_collect_statusline_evidence(statusline_result):
+    def _fake(env, *, claude_session_id, timeout_seconds=5.0):
+        return dict(statusline_result)
+
+    return _fake
+
+
+def _run_orchestration_with_fake_statusline(
+    tmp_path, monkeypatch, *, statusline_result, run_id, runner=_fake_invoke_generic_runner_ok
+):
+    canonical_conn = _open_scratch_canonical_conn(tmp_path)
+    try:
+        canonical_task_id, canonical_activity_id = _seed_scratch_task_activity(canonical_conn)
+        monkeypatch.setattr(verifier, "invoke_generic_runner", runner)
+        monkeypatch.setattr(
+            verifier, "collect_statusline_evidence", _fake_collect_statusline_evidence(statusline_result)
+        )
+        base_dir = tmp_path / "runtime-smoke-base"
+        base_dir.mkdir()
+        return verifier.orchestrate_runtime_smoke(
+            canonical_conn,
+            worktree=str(tmp_path),
+            base_dir=base_dir,
+            prompt_file=str(tmp_path / "prompt.txt"),
+            output_dir=str(tmp_path / "output"),
+            run_id=run_id,
+            timeout_seconds=5.0,
+            canonical_task_id=canonical_task_id,
+            canonical_activity_id=canonical_activity_id,
+        )
+    finally:
+        canonical_conn.close()
+
+
+def test_given_completed_structured_session_when_statusline_executed_degenerate_then_reinterpreted_not_applicable(
+    tmp_path, monkeypatch
+):
+    """AC1: a completed structured runtime-smoke session whose post-session
+    statusLine observation reports "executed_degenerate" must be
+    reinterpreted as not_applicable -- preserving the original leaf
+    status/rendered -- and must NOT, on its own, fail the aggregate
+    result."""
+    result = _run_orchestration_with_fake_statusline(
+        tmp_path,
+        monkeypatch,
+        statusline_result={"status": "executed_degenerate", "rendered": "Unbound", "returncode": 0},
+        run_id="issue-2747-executed-degenerate",
+    )
+    assert result.statusline_evidence["status"] == "not_applicable"
+    assert result.statusline_evidence["underlying_status"] == "executed_degenerate"
+    assert result.statusline_evidence["rendered"] == "Unbound"
+    assert not any("statusline_evidence" in v for v in result.violations)
+    assert result.status == "pass", result.violations
+
+
+@pytest.mark.parametrize("leaf_status", ["failed", "skipped"])
+def test_given_completed_structured_session_when_statusline_failed_or_skipped_then_still_fails_aggregate(
+    tmp_path, monkeypatch, leaf_status
+):
+    """Regression (AC1): unlike "executed_degenerate", a "failed"
+    (statusline script itself crashed) or "skipped" (no claude_session_id
+    observed -- possible runner evidence-contract breakage) leaf status must
+    NOT be rounded into not_applicable -- both remain genuine violations and
+    the aggregate result must still be "fail"."""
+    result = _run_orchestration_with_fake_statusline(
+        tmp_path,
+        monkeypatch,
+        statusline_result={"status": leaf_status, "rendered": None},
+        run_id=f"issue-2747-{leaf_status}",
+    )
+    assert result.statusline_evidence["status"] == leaf_status
+    assert "underlying_status" not in result.statusline_evidence
+    assert result.status == "fail"
+    assert any(f"statusline_evidence status={leaf_status!r}" in v for v in result.violations)
+
+
+def test_given_completed_structured_session_when_statusline_executed_then_unchanged_pass_semantics(
+    tmp_path, monkeypatch
+):
+    """AC2: the existing "executed" fail-closed semantics are unchanged by
+    this reinterpretation -- no rewrite happens and the aggregate result
+    passes exactly as before."""
+    result = _run_orchestration_with_fake_statusline(
+        tmp_path,
+        monkeypatch,
+        statusline_result={"status": "executed", "rendered": "Task: foo", "returncode": 0},
+        run_id="issue-2747-executed",
+    )
+    assert result.statusline_evidence == {"status": "executed", "rendered": "Task: foo", "returncode": 0}
+    assert result.status == "pass", result.violations
+
+
+def test_given_runner_failure_and_statusline_not_applicable_when_orchestrated_then_aggregate_still_fails(
+    tmp_path, monkeypatch
+):
+    """AC3: an unrelated genuine runner failure alongside a not_applicable
+    statusline result must still fail the aggregate -- not_applicable must
+    never mask an unrelated applicable failure."""
+    result = _run_orchestration_with_fake_statusline(
+        tmp_path,
+        monkeypatch,
+        statusline_result={"status": "executed_degenerate", "rendered": "Unbound", "returncode": 0},
+        run_id="issue-2747-runner-failure",
+        runner=_fake_invoke_generic_runner_failing,
+    )
+    assert result.statusline_evidence["status"] == "not_applicable"
+    assert result.status == "fail"
+    assert any("generic runner exit_code" in v for v in result.violations)
