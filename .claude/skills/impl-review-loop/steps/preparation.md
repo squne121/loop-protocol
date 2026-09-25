@@ -36,10 +36,12 @@ bounded retry 方針は `.claude/skills/issue-refinement-loop/references/termina
   という一続きの手順を実行する。`review_verdict` / `reviewed_body_sha256` /
   `reviewed_base_sha` は呼び出し元から受け取る値ではなく、この呼び出し自身が実行した
   current-run review と live fetch の結果から導出される。
-- GitHub コメント上の過去 `LOOP_HANDOFF_RESULT_V1`（`status: impl_ready`）は、
+- GitHub コメント上の過去 `LOOP_HANDOFF_RESULT_V1`（`status: refinement_approved`。
+  legacy コメント上では旧 `status: impl_ready` として現れる場合がある）は、
   それ単独では `run_root_transition()` の入力にすらならない（同関数は route/envelope
   を一切受理しない）。コメント再取得は audit telemetry であり、単独では実装を
-  authorize しない。
+  authorize しない（#2740: `issue-refinement-loop` の `approved` 終了自体も
+  実装開始の代替承認ではない）。
 - 下記「0. Intake Gate」で定義する優先順位付き停止理由（サブ理由）のうち、
   最高優先の理由（title prefix 欠落等）に次ぐ 2 番目の理由、すなわち陳腐化した
   契約レビュー（go コメント発行後に Issue 本文が更新された状態）を扱うサブ理由は、

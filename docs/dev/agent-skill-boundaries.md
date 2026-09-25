@@ -20,9 +20,13 @@ worker や CI/review/security/permission/publication の safety stop と混同�
 
 ## Root-Owned Synchronous Entry Transition 境界（単一の継続した呼び出しの中で完結する root-direct 方式、#2272）
 
-`issue-refinement-loop` から `impl-review-loop` への実装着手起動は、GitHub コメント
-（`LOOP_HANDOFF_RESULT_V1`）を authorization 手段にしない。root/main thread が
-同一 control flow 内で `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1`（process-local, 非永続）を
+`impl-review-loop` Step 1 の実装着手起動は、GitHub コメント（`LOOP_HANDOFF_RESULT_V1`）を
+authorization 手段にしない。`issue-refinement-loop` の `approved` 終了それ自体も Step 1 起動の
+authority ではない（#2740。`approved` は実装開始の代替承認ではない）。Step 1 は、**明示的実装依頼が
+ある場合にのみ**——ユーザーが実装を明示的に依頼した invocation（例: `/impl-review-loop <N>` の
+直接呼び出し、または実装依頼を伴う自然文プロンプト）を通じて `impl-review-loop` 自身のエントリ
+ゲート（`.claude/skills/impl-review-loop/steps/preparation.md`）が起動されたときにのみ——root/main
+thread が同一 control flow 内で `ROOT_IMPLEMENTATION_ENTRY_ROUTE_V1`（process-local, 非永続）を
 生成・消費する:
 
 - **entry point**: `.claude/skills/issue-refinement-loop/scripts/root_entry_router.py`
@@ -30,12 +34,23 @@ worker や CI/review/security/permission/publication の safety stop と混同�
   live Issue fetch・同一呼び出し内での current-run `issue-contract-review`・
   body/base drift 判定・bounded retry・Step 1 の直接起動までを単一の継続した
   call stack の中で行う。producer/consumer を別プロセスに分離し
-  `invocation_token` の再提示で authorize する旧方式は撤回済み。
+  `invocation_token` の再提示で authorize する旧方式は撤回済み。`issue-refinement-loop`
+  自身の Step 5（終了処理）は、`approved` 終了時にこの `run_root_transition()` を
+  呼び出さない（#2740）。呼び出すのは `impl-review-loop` 自身のエントリゲートのみである。
 
 `LOOP_HANDOFF_RESULT_V1` の GitHub コメント marker は audit telemetry として残るが、
-Step 1 起動の authority ではない。正本は
+Step 1 起動の authority ではない（新規 producer 値は `status: refinement_approved` /
+`routing_action: none`。旧 `impl_ready` / `run_impl_review_loop` は legacy reader
+compatibility 専用）。正本は
 `.claude/skills/issue-refinement-loop/references/termination-policy.md` の
 「Root-Owned Synchronous Entry Transition」節。
+
+**Issue #260 との関係（重複ではなく補完、#2740）**: Issue #260 は本ドキュメントへの
+human-gate 原則そのものの docs-only な追記を扱う。本節（#2740）は、その原則を
+`issue-refinement-loop` → `impl-review-loop` 間の実装 handoff 配線（Step 5 の
+`run_root_transition()` 呼び出しを切断し、Step 1 起動を明示的実装依頼の invocation にのみ
+限定する具体的な配線変更）に適用したものであり、#260 の scope（docs-only の原則記述）を
+変更・重複しない。
 
 ## SubAgent 役割分類と permissionMode 一覧
 
