@@ -670,6 +670,28 @@ def test_given_completed_structured_session_when_statusline_executed_degenerate_
     assert result.status == "pass", result.violations
 
 
+@pytest.mark.parametrize("rendered", ["Degraded", ""])
+def test_given_completed_structured_session_when_statusline_executed_degenerate_not_unbound_then_still_fails_aggregate(
+    tmp_path, monkeypatch, rendered
+):
+    """Regression (Issue #2747 OWNER review, PR #2749 comment): only
+    rendered=="Unbound" may be reinterpreted as not_applicable.
+    "executed_degenerate" with rendered=="Degraded" or rendered=="" (per
+    .claude/hooks/task_context/statusline.py, "Degraded" signals a genuine
+    DB/query/transport failure surfaced via exit code 0) must remain a
+    fail-closed violation and must NOT be rounded into not_applicable."""
+    result = _run_orchestration_with_fake_statusline(
+        tmp_path,
+        monkeypatch,
+        statusline_result={"status": "executed_degenerate", "rendered": rendered, "returncode": 0},
+        run_id=f"issue-2747-degenerate-{rendered or 'empty'}",
+    )
+    assert result.statusline_evidence["status"] == "executed_degenerate"
+    assert "not_applicable" != result.statusline_evidence["status"]
+    assert result.status == "fail"
+    assert any("statusline_evidence status='executed_degenerate'" in v for v in result.violations)
+
+
 @pytest.mark.parametrize("leaf_status", ["failed", "skipped"])
 def test_given_completed_structured_session_when_statusline_failed_or_skipped_then_still_fails_aggregate(
     tmp_path, monkeypatch, leaf_status

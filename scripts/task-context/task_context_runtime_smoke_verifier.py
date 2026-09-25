@@ -840,33 +840,35 @@ def orchestrate_runtime_smoke(
         violations.append("canonical_delta_contract failed (see canonical_delta for detail)")
 
     statusline_evidence = collect_statusline_evidence(env, claude_session_id=claude_session_id)
-    if statusline_evidence["status"] == "executed_degenerate":
-        # Issue #2747: orchestrate_runtime_smoke() only ever calls
-        # collect_statusline_evidence() AFTER invoke_generic_runner()'s
-        # blocking subprocess.run() has already returned (evidence lifecycle
-        # unchanged -- see this function's own docstring). For a completed
-        # non-interactive structured runtime-smoke session, the Claude
-        # session (including SessionEnd) has therefore already ended -- and
-        # the operator Binding already gone SUSPENDED -- by the time this
-        # out-of-band statusLine query runs, so collect_statusline_evidence()
-        # deterministically observes a degenerate render rather than a
-        # genuine failure of statusLine itself. This is a known, purely
-        # timing-driven non-applicability of the post-session probe, NOT
-        # equivalent to a "failed" (statusline script crashed) or "skipped"
-        # (no claude_session_id observed -- possible runner evidence-contract
-        # breakage) result, both of which remain genuine fail-closed
-        # violations below. Re-interpret ONLY "executed_degenerate" as
-        # not_applicable -- never on its own turning the aggregate `status`
-        # into "fail" -- while preserving the original leaf evidence
-        # (status/rendered/returncode) under `underlying_status`/as-is keys
-        # so a genuine regression stays diagnosable and distinct from this
-        # known timing limitation. collect_statusline_evidence()'s own
+    if statusline_evidence["status"] == "executed_degenerate" and statusline_evidence.get("rendered") == "Unbound":
+        # Issue #2747 (OWNER review, PR #2749 comment): the synthetic smoke
+        # seed used by this orchestration is never pre-bound with
+        # claude_session_id -- the out-of-band statusLine invocation below
+        # therefore triggers a genuine, real SessionStart against
+        # .claude/hooks/task_context/statusline.py, which creates a brand
+        # new Binding for that session. That fresh Binding has not yet had
+        # this run's Task attached to it, so the statusLine query
+        # deterministically observes "Unbound" -- a structural artifact of
+        # how this seed/probe is wired, NOT a signal about statusLine's own
+        # health. Re-interpret ONLY this specific "executed_degenerate" +
+        # rendered=="Unbound" combination as not_applicable -- never on its
+        # own turning the aggregate `status` into "fail" -- while preserving
+        # the original leaf evidence (status/rendered/returncode) under
+        # `underlying_status`/as-is keys so a genuine regression stays
+        # diagnosable and distinct from this known wiring limitation.
+        # "Degraded" and "" renders are NOT re-interpreted here: per
+        # .claude/hooks/task_context/statusline.py, "Degraded" represents a
+        # genuine DB/query/transport failure surfaced via exit code 0, and
+        # must remain a fail-closed violation below (falls through to the
+        # `elif` branch). collect_statusline_evidence()'s own
         # executed/executed_degenerate/failed/skipped leaf semantics are
         # untouched by this re-interpretation (Out of Scope).
         statusline_evidence = {
             **statusline_evidence,
             "status": "not_applicable",
-            "reason": "structured runtime session completed before out-of-band statusLine observation",
+            "reason": "synthetic smoke seed lacks pre-bound claude_session_id, so the out-of-band "
+            "statusLine probe observes a freshly-created, not-yet-Task-bound Binding (Unbound) "
+            "rather than a genuine statusLine failure",
             "underlying_status": statusline_evidence["status"],
         }
     elif statusline_evidence["status"] != "executed":
