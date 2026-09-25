@@ -1143,10 +1143,24 @@ PUBLIC_SAFETY_ALLOWED_TOP_LEVEL_FIELDS = frozenset(
 )
 
 _ABSOLUTE_PATH_RE = re.compile(r"(?:^|[\s\"'=(:])(/home/[^\s\"')]+|/Users/[^\s\"')]+|/root/[^\s\"')]+)")
+# New-format GitHub App installation tokens look like
+# ``ghs_<APP_ID>_<header>.<payload>.<signature>``. The legacy
+# ``\bghs_[A-Za-z0-9]{20,}\b`` pattern below does not match this shape at
+# all: its body class is alphanumeric-only, so the match attempt stops at
+# the first ``_`` separator after ``APP_ID`` (a word character, which also
+# defeats the trailing ``\b``) rather than partially consuming the token.
+# This dedicated matcher is added ahead of the legacy pattern (Issue #2726 /
+# PR #2746 precedent, `scripts/agent-guards/controlled_skill_mutation_exec.py`
+# `_SECRET_LIKE_PATTERNS`) so the more specific new-format ``ghs_`` matcher
+# is evaluated first; the legacy pattern is kept unchanged for classic
+# short-form tokens. ``[A-Za-z0-9._-]`` is the charset GitHub uses for these
+# installation tokens; ``.`` is the JWT/JWS compact-serialization segment
+# delimiter and is not parsed further here.
 _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bgho_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"ghs_[A-Za-z0-9._-]{36,}"),
     re.compile(r"\bghs_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
