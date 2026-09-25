@@ -1149,13 +1149,24 @@ _ABSOLUTE_PATH_RE = re.compile(r"(?:^|[\s\"'=(:])(/home/[^\s\"')]+|/Users/[^\s\"
 # all: its body class is alphanumeric-only, so the match attempt stops at
 # the first ``_`` separator after ``APP_ID`` (a word character, which also
 # defeats the trailing ``\b``) rather than partially consuming the token.
-# This dedicated matcher is added ahead of the legacy pattern (Issue #2726 /
-# PR #2746 precedent, `scripts/agent-guards/controlled_skill_mutation_exec.py`
-# `_SECRET_LIKE_PATTERNS`) so the more specific new-format ``ghs_`` matcher
-# is evaluated first; the legacy pattern is kept unchanged for classic
-# short-form tokens. ``[A-Za-z0-9._-]`` is the charset GitHub uses for these
-# installation tokens; ``.`` is the JWT/JWS compact-serialization segment
-# delimiter and is not parsed further here.
+# The ``ghs_[A-Za-z0-9._-]{36,}`` pattern below is NOT a new-format-only
+# matcher: it is a broad, unanchored, 36-char-minimum pattern that also
+# matches classic/current 36-char-or-longer ``ghs_`` tokens in addition to
+# the new installation-token shape above. It is added ahead of the legacy
+# pattern (Issue #2718 / PR #2722 precedent in
+# `scripts/agent-guards/controlled_skill_mutation_exec.py`
+# `_SECRET_LIKE_PATTERNS`; Issue #2726 / PR #2746 applied the same widening
+# to `.claude/skills/issue-refinement-loop/scripts/compact_author_result.py`)
+# so this broader shape is matched first. The legacy
+# ``\bghs_[A-Za-z0-9]{20,}\b`` pattern is kept unchanged below it, mainly as
+# a regression guard for the shorter (roughly 20-35 char) short-form
+# token-like inputs it previously caught on its own (see
+# ``test_short_form_legacy_ghs_detector_input_blocks_publication``'s
+# fixture, which deliberately stays under 36 chars to exercise that
+# legacy-only regime rather than represent a real classic/current token).
+# ``[A-Za-z0-9._-]`` is the charset GitHub uses for these installation
+# tokens; ``.`` is the JWT/JWS compact-serialization segment delimiter and
+# is not parsed further here.
 _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),

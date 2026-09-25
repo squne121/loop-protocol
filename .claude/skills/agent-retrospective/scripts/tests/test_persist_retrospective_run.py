@@ -1275,9 +1275,13 @@ def test_public_safety_validator_runs_before_post_rejects_token_pattern() -> Non
 def test_new_format_installation_token_blocks_publication() -> None:
     """Issue #2727 AC2: a realistic synthetic new-format GitHub App
     installation token (``ghs_<APP_ID>_<header>.<payload>.<signature>``,
-    containing exactly 2 ``.`` delimiters and well over 520 characters)
+    containing exactly 2 ``.`` delimiters, ``-``/``_``/``.`` characters from
+    the matcher's ``[A-Za-z0-9._-]`` charset, and well over 520 characters)
     must be rejected by the fail-closed publication gate before any
-    transport call is made."""
+    publication POST / ``create_comment`` call is made (the safety
+    validator itself may still perform read-only transport calls earlier
+    in the flow, e.g. idempotency/optimistic-concurrency lookups; what is
+    asserted here is that ``create_call_count`` stays 0)."""
     new_format_token = (
         "ghs_987654321_eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9."
         "eyJpc3MiOiJodHRwczovL2FwaS5naXRodWIuY29tL2FwcC9pbnN0YWxsYXRpb25zLzk4NzY1NDMyMSIs"
@@ -1285,11 +1289,16 @@ def test_new_format_installation_token_blocks_publication() -> None:
         "InJlYWQiLCJpc3N1ZXMiOiJ3cml0ZSIsInB1bGxfcmVxdWVzdHMiOiJ3cml0ZSIsIm1ldGFkYXRhIjoi"
         "cmVhZCIsImNoZWNrcyI6IndyaXRlIiwiZGVwbG95bWVudHMiOiJ3cml0ZSIsInN0YXR1c2VzIjoid3Jp"
         "dGUifSwicmVwb3NpdG9yeV9pZHMiOls5ODc2NTQzMjFdfQ."
+        "s1gN4tuRe-_"
         "QmFzZTY0dXJsRW5jb2RlZFNpZ25hdHVyZVBsYWNlaG9sZGVyRm9yVGVzdEZpeHR1cmVQdXJwb3Nlc09ubHlEb05vdFVzZQ"
         "QmFzZTY0dXJsRW5jb2RlZFNpZ25hdHVyZVBsYWNlaG9sZGVyRm9yVGVzdEZpeHR1cmVQdXJwb3Nlc09ubHlEb05vdFVzZQ"
         "QmFzZTY0dXJsRW5jb2RlZFNpZ25hdHVyZVBsYWNlaG9sZGVyRm9yVGVzdEZpeHR1cmVQdXJwb3Nlc09ubHlEb05vdFVzZQ"
         "QmFzZTY0dXJsRW5jb2RlZFNpZ25hdHVyZVBsYWNlaG9sZGVyRm9yVGVzdEZpeHR1cmVQdXJwb3Nlc09ubHlEb05vdFVzZQ"
     )
+    # The matcher's charset is [A-Za-z0-9._-]; the fixture must actually
+    # exercise every non-alphanumeric member of it, not just '_' and '.'.
+    assert "-" in new_format_token
+    assert "_" in new_format_token
     assert new_format_token.count(".") == 2
     assert len(new_format_token) >= 520
 
@@ -1317,10 +1326,14 @@ def test_new_format_installation_token_blocks_publication() -> None:
     assert transport.create_call_count == 0
 
 
-def test_classic_ghs_token_blocks_publication() -> None:
-    """Issue #2727 AC3: classic legacy-format ``ghs_`` tokens (matching
-    ``\\bghs_[A-Za-z0-9]{20,}\\b``) must continue to be rejected by the same
-    fail-closed publication gate after the new-format matcher is added."""
+def test_short_form_legacy_ghs_detector_input_blocks_publication() -> None:
+    """Issue #2727 AC3: short-form legacy detector input (matching
+    ``\\bghs_[A-Za-z0-9]{20,}\\b`` but deliberately kept under the 36-char
+    minimum the broader ``ghs_[A-Za-z0-9._-]{36,}`` pattern requires, so
+    only the legacy pattern below it can match) must continue to be
+    rejected by the same fail-closed publication gate after the broader
+    matcher is added. This fixture is a short-form token-like string, not
+    a real classic/current-length (36+ char) GitHub token."""
     transport = FakeIssueCommentTransport()
     candidate = _new_candidate()
     tainted_delta = [
@@ -1332,7 +1345,7 @@ def test_classic_ghs_token_blocks_publication() -> None:
         }
     ]
     pub_req = _publish_request_dict(
-        candidate_records=[candidate], delta_results=tainted_delta, request_id="req-2727-ac3-classic-ghs"
+        candidate_records=[candidate], delta_results=tainted_delta, request_id="req-2727-ac3-legacy-short-form"
     )
     ctx = pr.AuthorizationContext(tty_confirm=lambda _prompt: True, is_tty=lambda: True)
 
