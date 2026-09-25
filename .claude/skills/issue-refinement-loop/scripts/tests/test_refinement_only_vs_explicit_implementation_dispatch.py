@@ -11,14 +11,19 @@ invocation（`/impl-review-loop <N>` 相当）を通じて `impl-review-loop` �
 fake transport / spy パターンを再利用し、以下 2 テストで両者を区別する:
 
 - `test_refinement_only_termination_never_dispatches_implementation`
-  (negative): `issue-refinement-loop` の Step 5 termination が実際に呼ぶ
+  (negative): これは **構造的（静的 AST）検査**であり、実行時の振る舞い証明
+  ではない。`issue-refinement-loop` の Step 5 termination が実際に呼ぶ
   production スクリプト群（`.claude/skills/issue-refinement-loop/scripts/`
   直下の `root_entry_router.py` 自身を除く非テストモジュール）を静的に検査し、
-  いずれも `run_root_transition(` を呼び出していないことを検証した上で、その
-  帰結として同一テスト内で構築した spy `invoke_step1` の呼び出し回数が 0 の
-  ままであることを確認する。これは #2740 で切断された「Step 5 が
-  root_entry_router を呼ぶ経路」が production コードのどこにも存在しないこと
-  を構造的にピン留めする（grep VC ではなく AST 解析 + pytest）。
+  いずれも `run_root_transition(` を呼び出していないことを検証する。これは
+  #2740 で切断された「Step 5 が root_entry_router を呼ぶ経路」が production
+  コードのどこにも存在しないことを構造的にピン留めする（grep VC ではなく AST
+  解析 + pytest）。テスト内に構築するローカル spy `invoke_step1` は
+  production path のどこにも接続されておらず、その呼び出し回数が 0 である
+  ことは AST 検査結果から論理的に導かれる**自明な帰結（tautology）** であっ
+  て、それ自体が独立した runtime 振る舞い証拠ではない（PR #2748 OWNER レビ
+  ュー P2 指摘、issuecomment-5825945601）。独立した決定的証拠は上記 AST
+  assertion のみが担う。
 - `test_explicit_implementation_request_invokes_step1_exactly_once_after_fresh_review`
   (positive): `test_root_entry_router_advances_once_on_positive_fixture`
   (AC16) と同型のポジティブフィクスチャで `run_root_transition()` を直接呼び
@@ -94,15 +99,17 @@ def test_refinement_only_termination_never_dispatches_implementation():
     `root_entry_router.py` 自身を除く全非テストモジュール -- 特に
     `publish_termination_report.py` や `dependency_materializer.py` を含む）
     を AST 解析で静的検査する
-    THEN いずれのモジュールも `run_root_transition(` を呼び出しておらず、
-    そのためローカルに構築した spy `invoke_step1` の呼び出し回数は 0 のまま
-    -- refinement-only termination だけでは `impl-review-loop` Step 1 の
-    implementation dispatch が構造的に発生し得ないことをピン留めする。"""
+    THEN いずれのモジュールも `run_root_transition(` を呼び出していない --
+    refinement-only termination だけでは `impl-review-loop` Step 1 の
+    implementation dispatch が構造的に発生し得ないことを静的にピン留めする。
 
-    invoke_calls = {"count": 0}
-
-    def _invoke_step1():
-        invoke_calls["count"] += 1
+    この assertion は **構造検査（static/AST）のみ**を独立した証拠として扱
+    う。以前の実装は、production path に接続されていないローカル spy
+    `invoke_step1` の呼び出し回数が 0 であることを追加で assert していたが、
+    このカウンタはこのテスト内のどのコードからも呼び出されようがないため、
+    AST 検査の結果に関わらず常に真になる tautological な assertion であり、
+    独立した振る舞い証拠を追加しなかった（PR #2748 OWNER レビュー P2 指摘、
+    issuecomment-5825945601）。誤解を招く自明な assertion として削除した。"""
 
     offending: list[str] = []
     for py_file in sorted(_SCRIPTS_DIR.glob("*.py")):
@@ -118,10 +125,6 @@ def test_refinement_only_termination_never_dispatches_implementation():
         "run_root_transition() outside root_entry_router.py itself -- "
         f"Step 5 termination must never wire implementation dispatch (#2740): {offending}"
     )
-
-    # No production script under this directory ever wires the callback in
-    # during a refinement-only termination; the spy stays untouched.
-    assert invoke_calls["count"] == 0
 
 
 # --- positive: explicit implementation request dispatches Step 1 exactly once ---
