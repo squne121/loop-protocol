@@ -27,10 +27,19 @@ ISSUE = 2119
 SHA = "a" * 40
 
 
-def _candidate(*, lifecycle="merged", provenance="closing_relation", ancestry=True, fresh=True, ownership=True):
+def _candidate(
+    *,
+    lifecycle="merged",
+    provenance="closing_relation",
+    ancestry=True,
+    fresh=True,
+    ownership=True,
+    pr_number=2137,
+    scope_coverage=None,
+):
     candidate = {
         "target": {"repo": REPO, "issue_number": ISSUE},
-        "pr": {"number": 2137, "url": f"https://github.com/{REPO}/pull/2137", "head_sha": SHA},
+        "pr": {"number": pr_number, "url": f"https://github.com/{REPO}/pull/{pr_number}", "head_sha": SHA},
         "provenance": {"kind": provenance, "verified": True},
         "lifecycle": lifecycle,
         "head_fresh": fresh,
@@ -38,7 +47,17 @@ def _candidate(*, lifecycle="merged", provenance="closing_relation", ancestry=Tr
     }
     if lifecycle == "merged":
         candidate.update({"merge_oid": SHA, "main_ancestry": {"verified": ancestry, "reachable": ancestry}})
+    if scope_coverage is not None:
+        candidate["scope_coverage"] = scope_coverage
     return candidate
+
+
+def _sibling_identity_mismatch_coverage(*, other_issue_number=9999):
+    """A well-formed candidate-local marker whose `issue_number` names a
+    *different* Issue, with no other marker error -- the exact #2750 shape
+    (`_parse_marker()` returns `errors == ["scope_coverage_issue_identity_mismatch"]`
+    alone when every other marker field validates)."""
+    return {"status": "invalid", "errors": ["scope_coverage_issue_identity_mismatch"]}
 
 
 def _evidence(*, candidates, coverage=None, freshness="fresh", contradictory=False, repo=REPO, issue=ISSUE):
@@ -824,3 +843,233 @@ def test_derive_base_ac_satisfied_from_verification_result_rejects_incomplete_pa
     for status in ("skip", "partial", "SKIP", "PARTIAL"):
         skipped = _test_verdict([_runtime_ac_entry("AC1", status=status)])
         assert mod.derive_base_ac_satisfied_from_verification_result(skipped, live_main_sha=SHA) is False
+
+
+# ---------------------------------------------------------------------------
+# #2750: bounded carve-out for irrelevant non-closing cross-reference
+# candidates whose own durable marker names a different Issue.
+# ---------------------------------------------------------------------------
+
+
+def test_2727_incident_shape_two_sibling_cross_references_do_not_conflict():
+    """AC1/AC2: GIVEN the exact #2727 incident shape (two merged
+    `verified_cross_reference` candidates, each a PR #2735/#2746 analogue
+    whose own durable marker names a different sibling Issue with no other
+    marker error) WHEN routed THEN neither is a qualified landing candidate
+    for the current target Issue, `qualified_candidate_conflict` never
+    fires, and the result falls through to `no_qualified_candidate` ->
+    existing `already_satisfied` precedence (AC2)."""
+    sibling_one = _candidate(
+        lifecycle="merged",
+        provenance="verified_cross_reference",
+        pr_number=2735,
+        scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=2725),
+    )
+    sibling_two = _candidate(
+        lifecycle="merged",
+        provenance="verified_cross_reference",
+        pr_number=2746,
+        scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=2726),
+    )
+    result = mod.derive_landing_disposition(
+        _evidence(candidates=[sibling_one, sibling_two]), repo=REPO, issue_number=ISSUE
+    )
+    assert result["disposition"] == "ordinary_dispatch_or_explicit_recovery"
+    assert result["reason_codes"] == ["no_qualified_candidate"]
+
+    composed = mod.apply_already_satisfied_precedence(
+        result,
+        next_action_route="proceed_to_step_1",
+        product_spec_routing_action="continue",
+        pr_exists=False,
+        base_ac_satisfied=True,
+        route_loop_verdict_v2_module=route_mod,
+    )
+    assert composed["disposition"] == "already_satisfied"
+
+    # No landing authority and base_ac_satisfied unproven -> canonical
+    # ordinary_dispatch_or_explicit_recovery route, still never a conflict.
+    unproven = mod.apply_already_satisfied_precedence(
+        result,
+        next_action_route="proceed_to_step_1",
+        product_spec_routing_action="continue",
+        pr_exists=False,
+        base_ac_satisfied=False,
+        route_loop_verdict_v2_module=route_mod,
+    )
+    assert unproven["disposition"] == "ordinary_dispatch_or_explicit_recovery"
+
+
+def test_valid_non_closing_candidate_survives_sibling_cross_reference_exclusion():
+    """AC4: GIVEN a valid current-target non-closing candidate together with
+    multiple irrelevant sibling candidates WHEN routed THEN the siblings are
+    excluded from conflict counting and only the valid candidate is
+    evaluated (no `qualified_candidate_conflict`)."""
+    valid = _candidate(lifecycle="merged", provenance="verified_cross_reference", pr_number=100, ancestry=True)
+    sibling_a = _candidate(
+        lifecycle="merged",
+        provenance="verified_cross_reference",
+        pr_number=101,
+        scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=201),
+    )
+    sibling_b = _candidate(
+        lifecycle="open",
+        provenance="verified_cross_reference",
+        pr_number=102,
+        scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=202),
+    )
+    evidence = _evidence(candidates=[valid, sibling_a, sibling_b], coverage=_exact_coverage())
+    result = mod.derive_landing_disposition(evidence, repo=REPO, issue_number=ISSUE)
+    assert result["disposition"] == "implementation_already_landed"
+    assert result["candidate"]["pr"]["number"] == 100
+
+
+def test_non_closing_candidate_with_identity_mismatch_plus_other_marker_error_stays_fail_closed():
+    """AC4: GIVEN a non-closing candidate whose marker error set is
+    `scope_coverage_issue_identity_mismatch` PLUS another marker error
+    (compound failure) WHEN routed alongside another qualified candidate
+    THEN it is NOT treated as irrelevant -- it remains in conflict counting
+    and the result stays `reconciliation_required` (fail-closed), never
+    silently dropped."""
+    compound_error_candidate = _candidate(
+        lifecycle="merged",
+        provenance="verified_cross_reference",
+        pr_number=201,
+        scope_coverage={
+            "status": "invalid",
+            "errors": ["scope_coverage_issue_identity_mismatch", "scope_coverage_manifest_digest_mismatch"],
+        },
+    )
+    other = _candidate(lifecycle="open", provenance="verified_cross_reference", pr_number=202)
+    result = mod.derive_landing_disposition(
+        _evidence(candidates=[compound_error_candidate, other]), repo=REPO, issue_number=ISSUE
+    )
+    assert result["disposition"] == "reconciliation_required"
+    assert result["reason_codes"] == ["qualified_candidate_conflict"]
+
+    # In isolation (no other qualified candidate), the compound-error
+    # candidate's own marker invalidity is still fail-closed on its own.
+    solo = mod.derive_landing_disposition(
+        _evidence(candidates=[compound_error_candidate]), repo=REPO, issue_number=ISSUE
+    )
+    assert solo["disposition"] == "reconciliation_required"
+    assert set(solo["reason_codes"]) == {
+        "scope_coverage_issue_identity_mismatch",
+        "scope_coverage_manifest_digest_mismatch",
+    }
+
+
+def test_closing_relation_identity_mismatch_stays_reconciliation_required():
+    """AC3: GIVEN a `closing_relation` candidate (structured
+    `closingIssuesReferences` names the current target Issue) whose own
+    durable marker identity mismatches WHEN routed THEN the carve-out never
+    applies (closing relation is a genuine contradiction, not an irrelevant
+    cross-reference) and the result stays `reconciliation_required`."""
+    closing_mismatch = _candidate(
+        lifecycle="merged",
+        provenance="closing_relation",
+        scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=9999),
+    )
+    result = mod.derive_landing_disposition(_evidence(candidates=[closing_mismatch]), repo=REPO, issue_number=ISSUE)
+    assert result["disposition"] == "reconciliation_required"
+    assert result["reason_codes"] == ["scope_coverage_issue_identity_mismatch"]
+
+    # Even alongside an otherwise-irrelevant sibling cross-reference, the
+    # closing candidate's presence keeps the sibling-exclusion branch from
+    # ever running (closing relation is selected first, per existing
+    # closing-priority contract) -- the mismatch stays contradictory.
+    sibling = _candidate(
+        lifecycle="open",
+        provenance="verified_cross_reference",
+        pr_number=301,
+        scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=302),
+    )
+    result_with_sibling = mod.derive_landing_disposition(
+        _evidence(candidates=[closing_mismatch, sibling]), repo=REPO, issue_number=ISSUE
+    )
+    assert result_with_sibling["disposition"] == "reconciliation_required"
+    assert result_with_sibling["reason_codes"] == ["scope_coverage_issue_identity_mismatch"]
+
+
+def test_markerless_2119_2137_candidate_is_never_excluded_by_sibling_mismatch_reasoning():
+    """AC5: GIVEN a markerless (#2119/PR #2137-shaped) non-closing candidate
+    WHEN evaluated against the #2750 carve-out THEN it is never treated as
+    an irrelevant cross-reference (the carve-out only fires for a marker
+    that parsed with the single `scope_coverage_issue_identity_mismatch`
+    error, never for an absent marker) -- legacy markerless compatibility
+    (#2699) is unaffected, including when it coexists with a genuinely
+    irrelevant sibling."""
+    markerless = _candidate(lifecycle="open", provenance="verified_cross_reference", pr_number=2137, ownership=True)
+    assert mod._is_irrelevant_cross_reference(markerless) is False
+
+    missing_marker_status = _candidate(
+        lifecycle="open",
+        provenance="verified_cross_reference",
+        pr_number=2137,
+        scope_coverage={"status": "missing_marker", "errors": ["scope_coverage_marker_missing"]},
+        ownership=True,
+    )
+    assert mod._is_irrelevant_cross_reference(missing_marker_status) is False
+
+    # Markerless legacy candidate resumes exactly as before (#2699) when it
+    # is the sole qualified candidate after an irrelevant sibling (well-formed
+    # marker naming a different Issue) is excluded.
+    sibling = _candidate(
+        lifecycle="draft",
+        provenance="verified_cross_reference",
+        pr_number=555,
+        scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=556),
+    )
+    result = mod.derive_landing_disposition(
+        _evidence(candidates=[markerless, sibling]), repo=REPO, issue_number=ISSUE
+    )
+    assert result["disposition"] == "existing_pr_resume"
+    assert result["reason_codes"] == ["markerless_allowed_paths_coverage"]
+    assert result["candidate"]["pr"]["number"] == 2137
+
+
+def test_open_draft_lifecycle_gets_same_sibling_cross_reference_carve_out_as_merged():
+    """AC1/AC5: the #2750 carve-out is not limited to `lifecycle == merged`
+    -- an all-open/draft pair of irrelevant sibling `verified_cross_reference`
+    candidates must be excluded exactly like the merged case, since
+    `len(qualified) > 1` conflict counting runs before any lifecycle
+    branch."""
+    sibling_open = _candidate(
+        lifecycle="open",
+        provenance="verified_cross_reference",
+        pr_number=601,
+        scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=701),
+    )
+    sibling_draft = _candidate(
+        lifecycle="draft",
+        provenance="verified_cross_reference",
+        pr_number=602,
+        scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=702),
+    )
+    result = mod.derive_landing_disposition(
+        _evidence(candidates=[sibling_open, sibling_draft]), repo=REPO, issue_number=ISSUE
+    )
+    assert result["disposition"] == "ordinary_dispatch_or_explicit_recovery"
+    assert result["reason_codes"] == ["no_qualified_candidate"]
+
+
+def test_is_irrelevant_cross_reference_unit_boundaries():
+    """Direct unit coverage of `_is_irrelevant_cross_reference()`'s exact
+    boundary conditions: closing_relation is never eligible, a valid
+    (non-invalid) marker is never eligible, and only the single-error
+    identity-mismatch shape qualifies."""
+    closing = _candidate(
+        provenance="closing_relation", scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=1)
+    )
+    assert mod._is_irrelevant_cross_reference(closing) is False
+
+    valid_marker = _candidate(provenance="verified_cross_reference", scope_coverage=_exact_coverage())
+    assert mod._is_irrelevant_cross_reference(valid_marker) is False
+
+    non_mapping_coverage = _candidate(provenance="verified_cross_reference", scope_coverage="not-a-mapping")
+    assert mod._is_irrelevant_cross_reference(non_mapping_coverage) is False
+
+    single_identity_mismatch = _candidate(
+        provenance="verified_cross_reference", scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=1)
+    )
+    assert mod._is_irrelevant_cross_reference(single_identity_mismatch) is True
