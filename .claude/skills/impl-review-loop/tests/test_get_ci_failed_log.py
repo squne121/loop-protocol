@@ -8,8 +8,9 @@ from pathlib import Path
 import pytest
 
 SCRIPT_PATH = (
-    Path(__file__).parent.parent.parent
-    / ".claude/skills/impl-review-loop/scripts/get_ci_failed_log.py"
+    Path(__file__).parent.parent
+    / "scripts"
+    / "get_ci_failed_log.py"
 )
 
 
@@ -380,6 +381,46 @@ class TestRedaction:
         text, flag = result
         assert isinstance(text, str)
         assert isinstance(flag, bool)
+
+    def test_new_installation_token_fully_redacted(self):
+        """GIVEN a deterministic synthetic new-format ghs_<APP_ID>_<JWT>
+        installation token (not a real credential; PR #2735 / #2746 / #2751
+        precedent fixture shape: 'ghs_' + APP_ID + '_' + JWT header.payload.signature,
+        with exactly two '.' separators and both '_' and '-' characters present,
+        padded to installation-token scale) WHEN embedded in 'before <token> after'
+        and passed to redact_tokens() THEN the result is exactly
+        'before [REDACTED] after' with no token fragment (APP_ID, header, payload,
+        or signature) remaining anywhere in the output.
+        """
+        jwt_header = "eyJhbGciOiJSUzI1NiJ9"
+        jwt_payload = "eyJpc3MiOiJodHRwczovL2V4YW1wbGUuY29tIn0"
+        jwt_signature = "s1gN4tuRe-_placeholder123456789"
+        app_id = "123456789"
+        token = f"ghs_{app_id}_{jwt_header}.{jwt_payload}.{jwt_signature}"
+        while len(token) < 520:
+            jwt_payload += "A"
+            jwt_signature += "B"
+            token = f"ghs_{app_id}_{jwt_header}.{jwt_payload}.{jwt_signature}"
+
+        # Fixture sanity: JWT-shaped, exactly two '.' separators, contains
+        # both '_' and '-', and is at real installation-token scale so a
+        # matcher that lost the '._-' charset extension cannot pass by luck.
+        assert token.count(".") == 2
+        assert "_" in token
+        assert "-" in token
+        assert len(token) >= 520
+        assert token.startswith(f"ghs_{app_id}_")
+
+        text = f"before {token} after"
+        redacted, applied = mod.redact_tokens(text)
+
+        assert applied is True
+        assert redacted == "before [REDACTED] after"
+        assert app_id not in redacted
+        assert jwt_header not in redacted
+        assert jwt_payload not in redacted
+        assert jwt_signature not in redacted
+        assert token not in redacted
 
 
 # ---------------------------------------------------------------------------
