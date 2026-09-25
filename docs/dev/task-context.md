@@ -1077,6 +1077,123 @@ Issue の Out of Scope として別の narrow follow-up Issue へ委ねる。
 選ばず該当する全 Binding を `unresolved_target` として報告し dispatch
 しない（変更なし）。
 
+### cold restart / live handoff 境界: tri-state pane-process liveness classification（Issue #2752）
+
+**Issue #2742 が残した Out of Scope の解消**: #2742 は「locator が
+`live_pane_ids` に存在する ACTIVE Binding」を無条件に `candidates`
+（dispatch 対象）へ入れていた。Herdr 0.9.1 一次資料の fact-check
+（`session-state.mdx` "A successful handoff preserves ... pane PTYs and
+processes"）により、Herdr の live handoff（`herdr update --handoff` /
+`herdr --remote <target> --handoff` の内部機構）は pane process を
+best-effort で保持しうる一方、`[[startup]]` plugin hook 自体は live
+handoff 後の新 server 側で再実行される（`plugins.mdx` "They run again
+when a new server takes over during live handoff"）ことが判明した。
+つまり「locator が live である」ことは「その pane の runtime process が
+死んでいる（＝安全に再 launch してよい）」ことの証明にはならない ---
+真の cold restart（process 消失）と live handoff（process 生存）を pane
+存在の有無だけで区別すると、生存中の Binding へ duplicate resume/launch
+を送ってしまう。
+
+`discover_resume_candidates()` は、locator が `live_pane_ids` に存在し
+かつ一意の claimant である ACTIVE Binding について、`herdr pane
+process-info --pane <locator>` を追加で呼び出し、3 値
+（`PROVEN_ALIVE` / `PROVEN_ABSENT` / `UNKNOWN`）に分類してから dispatch
+可否を決める。このプローブは `prepare_managed_resume()` の
+`write_transaction`（`BEGIN IMMEDIATE`）の外側 --- discovery phase（DB
+read-only 取得後・dispatch 前）で完結し、二段階復元状態遷移の atomic
+性は変更しない。
+
+```text
+locator が live_pane_ids に存在する ACTIVE Binding（一意 claimant）
+  -> herdr pane process-info --pane <locator>
+       - 呼び出し成功 かつ shell 自身以外の foreground process が
+         parseable に確認できる
+           -> PROVEN_ALIVE -> live_runtime_preserved（dispatch 0 件）
+       - 呼び出し成功 かつ shell 自身以外に foreground process が
+         存在しないことが明確（bare-shell-only）
+           -> PROVEN_ABSENT -> candidates（既存の dispatch 経路、
+              exactly-once resume）
+       - 呼び出し失敗・空・unparseable・platform 非対応・
+         複数候補で単一の対象に絞り込めない（identity ambiguous）
+           -> UNKNOWN -> unresolved_target（reason: liveness_unresolved）
+```
+
+`PROVEN_ABSENT` の第一経路（locator 自体が `live_pane_ids` に存在しない
+= 既存の `REASON_LOCATOR_NOT_LIVE`）はこのプローブに到達する前に確定して
+おり変更しない（#2742 の回帰防止）。RESTORING Binding・duplicate-locator
+claim も同様にこのプローブへ到達しない（対象が単一に絞り込めない/
+そもそも対象外のため）。
+
+**`herdr pane process-info` の実レスポンス形状（Herdr 0.9.1、本 Issue の
+実装時に稼働中の実サーバへ対し実際に発行して fact-check 済み）**:
+
+```bash
+$ herdr pane process-info --pane <pane_id>
+{"id":"cli:pane:process_info","result":{"process_info":{
+  "pane_id":"<pane_id>",
+  "shell_pid":<int>,
+  "foreground_process_group_id":<int>,
+  "foreground_processes":[{"pid":<int>,"name":<str>,"cwd":<str>}]
+},"type":"pane_process_info"}}
+```
+
+CLI の呼び出し形は `--pane <ID>`（named option。他の discovery 呼び出し
+の locator 位置引数とは異なる、`herdr pane process-info --help` で確認
+済み）であり、実際のペイロードは `result` 直下ではなく
+`result.process_info` に 1 段ネストされる。`argv`（プロセス起動コマンド
+ライン全体）フィールドは実際の応答に含まれないことがある（Herdr
+socket-api doc が明記する「プラットフォームが公開する場合は」の条件付き
+フィールドの実例） --- 本モジュールの判定は `pid` の同一性のみに依存し、
+`argv`/`name`/`cwd` の有無・内容には依存しない（AC8、下記参照）。
+
+**`live_runtime_preserved` 結果**: `PROVEN_ALIVE` と判定された ACTIVE
+Binding は `binding_id` / `session_id` / `pane_id`（locator）/
+`runtime_profile`（Native/Claude-GPT、best-effort。ACTIVE な managed
+ExecutionRun から `task_context_resume_dispatcher.classify_for_resume()`
+と同じ read-only 解決を行うのみで、この解決結果は dispatch 可否の判定
+そのものには使わない）/ `liveness_evidence` / `launch_commands_
+dispatched: 0` / `mutations_applied: 0` を含む結果として、discovery の
+トップレベル戻り値に `candidates` / `unresolved_targets` /
+`restore_blocked` と並ぶ第 4 のキーとして追加される。
+`run_startup_orchestrator()` はこれを `dispatch_status:
+"live_runtime_preserved"` の結果エントリとして扱い、`"restored"` と並ぶ
+非失敗（`any_failed` に算入しない）outcome とする --- 「Binding が
+存在しなかった」ケースと「live handoff で生存を証明して意図的に何も
+しなかった」ケースを summary 上で区別する。
+
+**`liveness_unresolved`（UNKNOWN）**: `pane process-info` の呼び出し自体
+が失敗・空・unparseable・platform 非対応、または `foreground_processes`
+内のエントリから `pid` を読み取れず shell 自身かどうか判定不能
+（identity ambiguous）な場合。`unresolved_target`（reason:
+`liveness_unresolved`）として報告し `any_failed = true` にする --- fail
+closed（duplicate launch を避けるため resume/launch を一切発行しない）。
+`agent_status == "unknown"` は absence の証拠にしない（Herdr
+`herdrdev/herdr#4579` の既知 issue: Windows 上で agent process は存在
+するが検出できず `agent_status` が `unknown` に固定される実例が一次資料
+で確認されている）--- この判定に `agent_status` を一切使わない設計は
+この既知の落とし穴を最初から回避する。
+
+**AC8: heuristic identity を使わない**: cold-restart / live-handoff の
+区別に cwd・pane 順序・terminal title・process `name` 単独を使わない
+--- 判定根拠は `foreground_processes` 内エントリの `pid` と `shell_pid`
+の同一性比較のみ。`name` が `"bash"` を名乗っていても `pid` が
+`shell_pid` と異なれば別プロセスとして `PROVEN_ALIVE` に、逆に `cwd` が
+いかにも作業中らしい値であっても `pid` が `shell_pid` と一致すれば
+`PROVEN_ABSENT` になる（`tests/task-context/test_cold_restart_startup.py`
+の `test_classify_pane_process_liveness_ac8_*` 系テストが両方向を
+検証する）。
+
+**`missing_current_runtime_location`（AC5）**: discovery SQL の
+`runtime_locations` 結合を（実質）`INNER JOIN` から `LEFT JOIN` へ変更
+し、ACTIVE/RESTORING Binding に current（`released_at IS NULL`）な
+`runtime_locations` row が 1 件も存在しない場合も `rows` に現れるように
+した（従来は該当 Binding が `candidates` にも `unresolved_targets` にも
+一切現れず、silent に discovery から消えていた --- `REASON_LOCATOR_NOT_
+LIVE` は row 自体は取得できた後の locator 不一致判定であり、row が
+JOIN で落ちるケースはカバーしていなかった）。current row が無い Binding
+は `unresolved_target`（reason: `missing_current_runtime_location`）と
+して明示的に報告され、dispatch 0 件・DB mutation 0 件になる。
+
 ### plugin は user 全体 global であることへの対応（session scoping）
 
 Herdr 自身の公式 plugin doc（`https://herdr.dev` "Plugins" -> "Install and
@@ -1247,3 +1364,61 @@ env var を明示的に `unset` してから起動するだけで、その配下
 自体のコード契約変更を必要としない、canary 実行手順上の knowledge であり、
 今後同様の canary を（特にネストした Claude Code 環境内の agent から）
 実行する場合の前提条件として記録する。
+
+### narrow Herdr canary（Issue #2752 AC7、`tests/task-context/test_live_handoff_duplicate_resume_canary.py`）
+
+Issue #2752 の AC7 は、上記 tri-state liveness classification の 4 つの
+causal boundary（Native/Claude-GPT × live handoff/cold restart）を実 Herdr
+上で観測することを要求する。`tests/task-context/test_live_handoff_
+duplicate_resume_canary.py` が `pytest -k native_live_handoff` /
+`claude_gpt_live_handoff` / `native_cold_restart` / `claude_gpt_cold_
+restart` の 4 テストとしてこれを実装する。
+
+**本 Issue の実装時点（2026-09-25）での実行結果**: 4 テストとも SKIP
+（`docs/dev/runtime-verification-policy.md` SKIP 規約、exit 相当 77、
+fabricated PASS にしない）。理由は 2 系統:
+
+1. **cold restart の 2 causal boundary（Native/Claude-GPT）**: 本
+   Issue を実装した agent 自身のプロセスが、この機（`herdr status
+   server --json` / `herdr pane list` で実機 fact-check 済み）で実際に
+   稼働中の "default" 名前付き Herdr session --- 他の複数の並行稼働中
+   agent pane（人間向けの実作業を伴う実 session）を含む --- の 1 pane
+   として動作していることを、この canary 自身の capability チェック
+   （`HERDR_SOCKET_PATH` がこの canary プロセス自身の ambient 環境に
+   設定されているか）で検出した。この canary は cold restart
+   causal boundary の検証に `kill -9` による disposable session の
+   server プロセス破棄を要するため、"default" session と同一ホスト・
+   同一ユーザーアカウント・共有 global plugin-link state を持つ
+   nested な文脈からこれを実行することは、"default" session への
+   巻き添え被害のリスクを負う --- 本モジュール自身の設計原則
+   （"Session scoping" 節）および PR #2731 Real Herdr canary の前例が
+   共に「human/default Herdr session へ影響しないこと」を hard
+   invariant とする以上、この canary は安全側に倒して SKIP する。
+   これは PR #2731 の既存 `CLAUDE_CODE_CHILD_SESSION` caveat（上記
+   参照）と同種の、ネストした agent 実行環境固有の制約である。
+2. **live handoff の 2 causal boundary（Native/Claude-GPT）**:
+   インストール済み Herdr 0.9.1 の CLI surface を `herdr --help` で
+   実機 fact-check した結果、live handoff をローカルで起動できる
+   trigger は `herdr update --handoff`（ネットワーク経由でインストール
+   済み Herdr バイナリ自体のバージョンを実際に更新する）と
+   `herdr --remote <ssh-target> --handoff`（SSH remote target 必須）の
+   2 つのみであることが判明した。いずれも disposable かつ
+   side-effect-free に自動テストから安全に起動できる local trigger
+   ではないため（上記 (1) のネスト起因の理由とは独立した、Herdr の
+   CLI surface そのものの制約）、この 2 causal boundary は無条件に
+   SKIP する。
+
+各テストは SKIP 時も `docs/dev/runtime-verification-policy.md` ## 4
+証跡保存フォーマットに従い、判定理由・capability 検査結果を
+`artifacts/runtime-verification-AC7-<boundary>-<timestamp>.log`
+（gitignored、PR には要約のみ添付）へ記録する。`herdr` バイナリ + 認証
+済み native `claude` login が利用可能かつこの canary プロセス自身が
+Herdr 管理下の pane の外（プレーンな非 Herdr shell、例えば素の CI
+runner や人間の素のターミナル）で実行される環境では、cold restart の 2
+causal boundary は disposable named session の実 bootstrap/kill-9/
+cold-restart/`[[startup]]` hook 発火観測/cleanup を実際に行う（PR #2731
+の実証済みレシピを再利用）。live handoff の 2 causal boundary は、その
+環境であっても上記 (2) の Herdr CLI surface 制約により引き続き SKIP
+する --- 将来 Herdr が safe な local-only live handoff trigger を追加
+した場合のみ、この判定ロジック（`_live_handoff_capability()`）の更新で
+対応する。
