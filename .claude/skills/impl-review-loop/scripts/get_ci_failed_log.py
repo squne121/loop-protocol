@@ -62,7 +62,7 @@ def strip_ansi(text: str) -> str:
 KNOWN_TOKEN_PATTERN = re.compile(
     r"(?i)("
     r"ghp_[A-Za-z0-9]{36,}"
-    r"|ghs_[A-Za-z0-9]{36,}"
+    r"|ghs_[A-Za-z0-9._-]{36,}"
     r"|github_pat_[A-Za-z0-9_]{59,}"
     r"|eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
     r")"
