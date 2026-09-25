@@ -305,6 +305,34 @@ def _coverage_for(candidate: Mapping[str, Any], evidence: Mapping[str, Any]) -> 
     return global_coverage if isinstance(global_coverage, Mapping) else None
 
 
+def _is_irrelevant_cross_reference(candidate: Mapping[str, Any]) -> bool:
+    """#2750 bounded carve-out to the #2699 P1-1 fail-closed contract below.
+
+    A `verified_cross_reference` candidate (never a `closing_relation`
+    candidate -- callers must only apply this when no closing candidate is
+    present) whose own durable `IMPLEMENTATION_SCOPE_COVERAGE_V1` marker
+    names a *different* Issue, with no other marker error, is not ambiguous
+    landing-authority evidence for the current target Issue -- it is a
+    precedent/reference cross-reference that merely mentions the current
+    Issue's PR/Issue graph without claiming to land it. Deliberately reads
+    only the candidate-local `candidate["scope_coverage"]` (never
+    `_coverage_for()`'s evidence-level fallback) so this qualification
+    decision can never be satisfied by an unrelated global marker.
+
+    Only fires when the marker parse failed for exactly one reason
+    (`scope_coverage_issue_identity_mismatch`); any additional marker error
+    (schema/digest/manifest/etc.) keeps the candidate in conflict counting
+    (fail-closed), and a missing marker (markerless legacy candidate, #2119 /
+    PR #2137 / #2699) is never treated as irrelevant by this check.
+    """
+    if candidate.get("provenance", {}).get("kind") != "verified_cross_reference":
+        return False
+    coverage = candidate.get("scope_coverage")
+    if not isinstance(coverage, Mapping) or coverage.get("status") != "invalid":
+        return False
+    return list(coverage.get("errors") or []) == ["scope_coverage_issue_identity_mismatch"]
+
+
 def derive_landing_disposition(
     raw: Any, *, repo: str, issue_number: int, now: dt.datetime | None = None
 ) -> dict[str, Any]:
@@ -320,6 +348,16 @@ def derive_landing_disposition(
     closing = [c for c in qualified if c.get("provenance", {}).get("kind") == "closing_relation"]
     if closing:
         qualified = closing
+    else:
+        # #2750 bounded carve-out: only applied when no `closing_relation`
+        # candidate exists for the current target Issue. When a closing
+        # candidate is present, its own identity mismatch stays a genuine
+        # contradiction (fail-closed, unchanged from #2699 P1-1) -- this
+        # branch never runs in that case. Excluding irrelevant sibling
+        # cross-references here (before conflict counting, across every
+        # qualified lifecycle: merged/open/draft/closed_unmerged) is what
+        # prevents #2727-shaped false `qualified_candidate_conflict` stops.
+        qualified = [c for c in qualified if not _is_irrelevant_cross_reference(c)]
     if len(qualified) > 1:
         return {
             "disposition": "reconciliation_required",
@@ -346,7 +384,11 @@ def derive_landing_disposition(
         # `reconciliation_required` regardless of lifecycle, and this check
         # must run ahead of the merged-only ancestry/exact-coverage checks so
         # a malformed marker is never silently treated as "no marker" and
-        # downgraded to `legacy_or_later_scope_expansion`.
+        # downgraded to `legacy_or_later_scope_expansion`. (#2750: this
+        # candidate already survived the bounded irrelevant-cross-reference
+        # carve-out above -- either it is a `closing_relation` candidate, or
+        # its own marker error was not a lone `scope_coverage_issue_identity_mismatch`
+        # -- so an invalid marker reaching this point stays fail-closed.)
         coverage = _coverage_for(candidate, evidence)
         if isinstance(coverage, Mapping) and coverage.get("status") == "invalid":
             return {

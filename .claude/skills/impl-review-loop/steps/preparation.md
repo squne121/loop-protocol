@@ -285,6 +285,24 @@ candidate は fresh head と current-scope ownership が両方検証できた場
 scope expansion は（下記の `already_satisfied` 合成が不発の場合）
 `ordinary_dispatch_or_explicit_recovery` とする。
 
+**Bounded carve-out（irrelevant sibling cross-reference の除外、Issue #2750）**: 上記の
+identity mismatch fail-closed 契約には、`qualified_candidate_conflict` の conflict counting
+に限定した bounded な例外が1つだけ存在する。`closing_relation`（構造化
+`closingIssuesReferences` が current target Issue を含む）candidate が1件も存在しない場合
+に限り、`verified_cross_reference` candidate のうち、candidate-local `scope_coverage`
+（`_coverage_for()` の evidence-level fallback ではなく `candidate["scope_coverage"]` 自体）
+が `status: invalid` かつ `errors` が **`scope_coverage_issue_identity_mismatch` の1件だけ**
+（他の schema/digest/manifest 等の error と複合していない）の場合に限り、その candidate は
+qualified landing candidate から除外され、`qualified_candidate_conflict` を生成しない。この
+carve-out は lifecycle（merged/open/draft/closed_unmerged のいずれも）を問わず conflict
+counting より前段で適用され、除外の結果 qualified candidate が0件になった場合は通常の
+`no_qualified_candidate`（→ 上記の `already_satisfied` 合成）にそのまま合流する。
+`closing_relation` candidate が1件でも存在する場合はこの carve-out を一切適用せず、その
+candidate の identity mismatch は従来どおり contradictory evidence として
+`reconciliation_required` を維持する。markerless candidate（marker 自体が存在しない）や、
+identity mismatch 以外の marker error を含む candidate（複合 error）はこの carve-out の対象
+外であり除外されない（#2119/#2137 の markerless legacy compatibility を壊さない）。
+
 **Disposition Precedence の `already_satisfied` 合成（新しい enum を追加しない #2607 との
 合成）**: `derive_landing_disposition()` が landing authority を確立できなかった場合
 （`ordinary_dispatch_or_explicit_recovery` かつ `reason_codes` に `no_qualified_candidate`
