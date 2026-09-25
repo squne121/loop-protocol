@@ -170,7 +170,7 @@ def _no_secret_check(text: str) -> list[str]:
         (r"(?i)(token\s*[:=]\s*)[A-Za-z0-9\-._]{20,}", "token value"),
         (r"(?i)(cookie\s*[:=]\s*)[A-Za-z0-9\-._]{20,}", "cookie value"),
         (r"ghp_[A-Za-z0-9]{36}", "GitHub personal access token"),
-        (r"ghs_[A-Za-z0-9]{36}", "GitHub server token"),
+        (r"ghs_[A-Za-z0-9._-]{36,}", "GitHub server token"),
     ]
     violations = []
     for pattern, label in patterns:
