@@ -14,8 +14,10 @@ its scope once ACTIVE is reached again).
 
 from __future__ import annotations
 
+import json
 import subprocess
 
+import task_context_cold_restart_startup as startup
 import task_context_hook_flows as hook_flows
 import task_context_resume_dispatcher as dispatcher
 import task_context_service as service
@@ -128,9 +130,7 @@ def test_given_already_restoring_binding_when_prepared_again_then_noop_and_no_du
 # ---------------------------------------------------------------------------
 
 
-def test_given_launch_dispatch_fails_when_executing_resume_then_binding_restore_blocked_not_ended(
-    conn, state_root
-):
+def test_given_launch_dispatch_fails_when_executing_resume_then_binding_restore_blocked_not_ended(conn, state_root):
     binding_id, run_id = _seed_active_native_binding(conn, herdr_locator="sm-tab-5", session_id="sm-s5")
     conn.close()
 
@@ -140,9 +140,7 @@ def test_given_launch_dispatch_fails_when_executing_resume_then_binding_restore_
     def _failing_run(argv, **kwargs):
         return subprocess.CompletedProcess(argv, returncode=1, stdout="", stderr="pane not found")
 
-    result = dispatcher.execute_resume_decision(
-        decision, pane_id="pane-does-not-exist", run_fn=_failing_run
-    )
+    result = dispatcher.execute_resume_decision(decision, pane_id="pane-does-not-exist", run_fn=_failing_run)
     assert result.returncode == 1
 
     fresh = dispatcher.open_dispatcher_db()
@@ -158,9 +156,7 @@ def test_given_launch_dispatch_fails_when_executing_resume_then_binding_restore_
         fresh.close()
 
 
-def test_given_launch_subprocess_raises_oserror_when_executing_resume_then_binding_restore_blocked(
-    conn, state_root
-):
+def test_given_launch_subprocess_raises_oserror_when_executing_resume_then_binding_restore_blocked(conn, state_root):
     binding_id, _run_id = _seed_active_native_binding(conn, herdr_locator="sm-tab-6", session_id="sm-s6")
     conn.close()
 
@@ -191,9 +187,7 @@ def test_given_launch_subprocess_raises_oserror_when_executing_resume_then_bindi
 # ---------------------------------------------------------------------------
 
 
-def test_given_successful_dispatch_then_ack_when_session_start_resume_fires_then_full_cycle_completes(
-    conn, state_root
-):
+def test_given_successful_dispatch_then_ack_when_session_start_resume_fires_then_full_cycle_completes(conn, state_root):
     binding_id, old_run_id = _seed_active_native_binding(conn, herdr_locator="sm-tab-7-old-locator", session_id="sm-s7")
     conn.close()
 
@@ -223,7 +217,11 @@ def test_given_successful_dispatch_then_ack_when_session_start_resume_fires_then
     try:
         ack_result = hook_flows.on_session_start(
             ack_conn,
-            {"source": "resume", "herdr_tab_id": "sm-tab-7-new-locator-after-cold-restart", "claude_session_id": "sm-s7"},
+            {
+                "source": "resume",
+                "herdr_tab_id": "sm-tab-7-new-locator-after-cold-restart",
+                "claude_session_id": "sm-s7",
+            },
         )
         assert ack_result["binding_id"] == binding_id
 
@@ -241,3 +239,197 @@ def test_given_successful_dispatch_then_ack_when_session_start_resume_fires_then
         assert location["herdr_locator"] == "sm-tab-7-new-locator-after-cold-restart"
     finally:
         ack_conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Issue #2752 AC2 / AC9 -- tri-state liveness classification integration
+# with the dispatcher's own state machine. PR #2764 fix_delta (OWNER review
+# P1, https://github.com/squne121/loop-protocol/pull/2764#issuecomment-5832937110):
+# a non-shell foreground process alone is NOT causal identity evidence for
+# a SPECIFIC Binding/session's own runtime -- this is now classified
+# UNKNOWN (`liveness_unresolved`), never PROVEN_ALIVE/`live_runtime_
+# preserved`. Either way (UNKNOWN or, if a future evidence-bound extension
+# ever reintroduces PROVEN_ALIVE, that too) must never trigger
+# `prepare_managed_resume()`/ACTIVE -> RESTORING at all (Native/Claude-GPT
+# symmetry) -- that invariant is what these tests actually verify. PROVEN_
+# ABSENT (bare-shell-only) must reach the ordinary ACTIVE -> RESTORING
+# transition unaffected by the new liveness probe (AC3 case 2 / AC6
+# regression guard).
+# ---------------------------------------------------------------------------
+
+
+def _pane_list_response(*pane_ids: str) -> subprocess.CompletedProcess:
+    payload = {
+        "id": "cli:pane:list",
+        "result": {"panes": [{"pane_id": pid} for pid in pane_ids], "type": "pane_list"},
+    }
+    return subprocess.CompletedProcess(["herdr", "pane", "list"], returncode=0, stdout=json.dumps(payload), stderr="")
+
+
+def _alive_process_info_response(
+    pane_id: str, *, shell_pid: int = 100, foreground_pid: int = 500, name: str = "claude"
+) -> subprocess.CompletedProcess:
+    """Response shape fact-checked live against an installed Herdr 0.9.1
+    server (Issue #2752 implementation) -- nested one level under
+    ``result.process_info``, never directly under ``result``."""
+    process_info = {
+        "pane_id": pane_id,
+        "shell_pid": shell_pid,
+        "foreground_processes": [
+            {"pid": shell_pid, "name": "bash", "cwd": "/tmp"},
+            {"pid": foreground_pid, "name": name, "cwd": "/tmp"},
+        ],
+    }
+    payload = {"id": "cli:pane:process_info", "result": {"process_info": process_info, "type": "pane_process_info"}}
+    return subprocess.CompletedProcess(
+        ["herdr", "pane", "process-info", "--pane", pane_id], returncode=0, stdout=json.dumps(payload), stderr=""
+    )
+
+
+def _bare_shell_process_info_response(pane_id: str, *, shell_pid: int = 100) -> subprocess.CompletedProcess:
+    process_info = {
+        "pane_id": pane_id,
+        "shell_pid": shell_pid,
+        "foreground_processes": [{"pid": shell_pid, "name": "bash", "cwd": "/tmp"}],
+    }
+    payload = {"id": "cli:pane:process_info", "result": {"process_info": process_info, "type": "pane_process_info"}}
+    return subprocess.CompletedProcess(
+        ["herdr", "pane", "process-info", "--pane", pane_id], returncode=0, stdout=json.dumps(payload), stderr=""
+    )
+
+
+def _routed_run(pane_list_ids: tuple[str, ...], process_info_responses: dict[str, subprocess.CompletedProcess]):
+    def _run(argv, **kwargs):
+        if argv[1:3] == ["pane", "list"]:
+            return _pane_list_response(*pane_list_ids)
+        if argv[1:3] == ["pane", "process-info"]:
+            assert argv[3] == "--pane", f"expected --pane flag, got argv={argv!r}"
+            pane_id = argv[4]
+            if pane_id not in process_info_responses:
+                raise AssertionError(f"unexpected `herdr pane process-info` probe for pane {pane_id!r}")
+            return process_info_responses[pane_id]
+        raise AssertionError(f"unexpected herdr argv: {argv}")
+
+    return _run
+
+
+def test_given_active_claude_gpt_binding_with_non_shell_foreground_process_when_discovering_then_liveness_unresolved(
+    conn, state_root, monkeypatch
+):
+    """Issue #2752 AC2 (PR #2764 fix_delta, OWNER review P1 correction):
+    symmetry with the Native case -- an ACTIVE Claude-GPT Binding whose pane
+    reports a non-shell foreground process is NOT causal identity evidence
+    for THIS Binding's own runtime, so it is classified UNKNOWN
+    (`liveness_unresolved`), never PROVEN_ALIVE/`live_runtime_preserved`.
+    Either way, it must never be dispatched a duplicate
+    ``scripts/claude-gpt/launch.sh`` invocation, and its ``runtime_health``
+    must never leave ACTIVE (no ACTIVE -> RESTORING transition at all --
+    ``prepare_managed_resume()`` is never even called for an
+    `unresolved_target` entry)."""
+    binding_id, _run_id = _seed_active_claude_gpt_binding(
+        conn, monkeypatch, herdr_locator="live-tab-gpt", session_id="live-s-gpt"
+    )
+
+    _run = _routed_run(("live-tab-gpt",), {"live-tab-gpt": _alive_process_info_response("live-tab-gpt")})
+
+    discovery = startup.discover_resume_candidates(conn, herdr_bin="herdr", run_fn=_run)
+    assert discovery["candidates"] == []
+    assert discovery["live_runtime_preserved"] == []
+    assert discovery["unresolved_targets"] == [
+        {
+            "binding_id": binding_id,
+            "session_id": "live-s-gpt",
+            "reason": startup.REASON_LIVENESS_UNRESOLVED,
+        }
+    ]
+
+    # No RESTORING transition -- the binding's runtime_health is untouched.
+    assert service.get_binding(conn, binding_id)["runtime_health"] == "ACTIVE"
+
+    conn.close()
+    summary = startup.run_startup_orchestrator(herdr_bin="herdr", discovery_run_fn=_run)
+    assert summary["candidates_discovered"] == 0
+    assert summary["any_failed"] is True
+    matching = [r for r in summary["results"] if r.get("binding_id") == binding_id]
+    assert matching[0]["dispatch_status"] == "unresolved_target"
+    assert matching[0]["reason"] == startup.REASON_LIVENESS_UNRESOLVED
+
+    fresh = dispatcher.open_dispatcher_db()
+    try:
+        assert service.get_binding(fresh, binding_id)["runtime_health"] == "ACTIVE"
+    finally:
+        fresh.close()
+
+
+def test_given_native_and_claude_gpt_non_shell_foreground_bindings_when_discovering_then_neither_transitions_off_active(
+    conn, state_root, monkeypatch
+):
+    """AC9 (PR #2764 fix_delta correction): the Native+Claude-GPT-symmetric
+    case reproduced together -- both classify UNKNOWN (`liveness_
+    unresolved`), never PROVEN_ALIVE/`live_runtime_preserved`, and neither
+    Binding ever leaves ACTIVE."""
+    native_binding_id, _ = _seed_active_native_binding(conn, herdr_locator="ac9-native-tab", session_id="ac9-native-s")
+    gpt_binding_id, _ = _seed_active_claude_gpt_binding(
+        conn, monkeypatch, herdr_locator="ac9-gpt-tab", session_id="ac9-gpt-s"
+    )
+
+    _run = _routed_run(
+        ("ac9-native-tab", "ac9-gpt-tab"),
+        {
+            "ac9-native-tab": _alive_process_info_response("ac9-native-tab"),
+            "ac9-gpt-tab": _alive_process_info_response("ac9-gpt-tab"),
+        },
+    )
+
+    discovery = startup.discover_resume_candidates(conn, herdr_bin="herdr", run_fn=_run)
+    assert discovery["candidates"] == []
+    assert discovery["live_runtime_preserved"] == []
+    assert {e["binding_id"] for e in discovery["unresolved_targets"]} == {native_binding_id, gpt_binding_id}
+    for entry in discovery["unresolved_targets"]:
+        assert entry["reason"] == startup.REASON_LIVENESS_UNRESOLVED
+
+    for binding_id in (native_binding_id, gpt_binding_id):
+        assert service.get_binding(conn, binding_id)["runtime_health"] == "ACTIVE"
+
+
+def test_given_native_and_claude_gpt_proven_absent_bindings_when_dispatched_then_both_transition_to_restoring(
+    conn, state_root, monkeypatch
+):
+    """AC9: AC3 case 2 / AC6 regression guard, exercised through the
+    dispatcher's own ``prepare_managed_resume()`` for the exact
+    ``candidates`` shape ``discover_resume_candidates()`` now produces
+    after a bare-shell-only (PROVEN_ABSENT) liveness classification."""
+    native_binding_id, _ = _seed_active_native_binding(
+        conn, herdr_locator="ac9-cold-native-tab", session_id="ac9-cold-native-s"
+    )
+    gpt_binding_id, _ = _seed_active_claude_gpt_binding(
+        conn, monkeypatch, herdr_locator="ac9-cold-gpt-tab", session_id="ac9-cold-gpt-s"
+    )
+
+    _run = _routed_run(
+        ("ac9-cold-native-tab", "ac9-cold-gpt-tab"),
+        {
+            "ac9-cold-native-tab": _bare_shell_process_info_response("ac9-cold-native-tab"),
+            "ac9-cold-gpt-tab": _bare_shell_process_info_response("ac9-cold-gpt-tab"),
+        },
+    )
+
+    discovery = startup.discover_resume_candidates(conn, herdr_bin="herdr", run_fn=_run)
+    assert discovery["live_runtime_preserved"] == []
+    assert set(discovery["candidates"]) == {
+        ("ac9-cold-native-s", "ac9-cold-native-tab"),
+        ("ac9-cold-gpt-s", "ac9-cold-gpt-tab"),
+    }
+    conn.close()
+
+    native_decision = dispatcher.prepare_managed_resume("ac9-cold-native-s")
+    gpt_decision = dispatcher.prepare_managed_resume("ac9-cold-gpt-s")
+    assert native_decision.action == dispatcher.ACTION_LAUNCH_NATIVE
+    assert gpt_decision.action == dispatcher.ACTION_LAUNCH_CLAUDE_GPT
+
+    fresh = dispatcher.open_dispatcher_db()
+    try:
+        assert service.get_binding(fresh, native_binding_id)["runtime_health"] == "RESTORING"
+        assert service.get_binding(fresh, gpt_binding_id)["runtime_health"] == "RESTORING"
+    finally:
+        fresh.close()
