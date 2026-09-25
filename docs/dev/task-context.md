@@ -1015,14 +1015,11 @@ projection が、SQLite（Task Context DB）のみを情報源として正しく
        - unresolved_targets: (a) ACTIVE だが herdr_locator が現在 live な
          pane に存在しない（locator_not_live）、(b) 同一 live pane を 2 件
          以上の ACTIVE Binding が claim している（duplicate_locator_claim
-         -- いずれも dispatch しない）、(c) RESTORING だが既存の guarded
-         primitive mark_restore_blocked_if_pending() が stale と確定できな
-         かった（restoring_not_provably_stale -- DB state 変更なし）
-       - restore_blocked: RESTORING かつ mark_restore_blocked_if_pending()
-         が stale と確定し RESTORE_BLOCKED へ収束させたもの
-         （stale_restoring_converged -- 冪等: 収束後は次回以降のクエリで
-         RESTORE_BLOCKED として除外されるため再収束・重複 resume は発生
-         しない）
+         -- いずれも dispatch しない）、(c) RESTORING の Binding（
+         restoring_not_provably_stale -- DB state 変更なし。下記参照）
+       - restore_blocked: 常に空（`stale_restoring_converged` は将来の
+         独立した liveness mechanism のために語彙・配線のみ予約されており、
+         本モジュールが実際に emit することはない）
   -> dispatcher.prepare_managed_resume() / execute_resume_decision() で
      candidates のみを dispatch
   -> dispatcher.await_all_acks() で全 dispatch 後に共通の bounded deadline
@@ -1047,22 +1044,38 @@ cold restart` という中断シナリオで、`RESTORING` の Binding は
 `runtime_health = 'ACTIVE'` フィルタから常に除外され続けるため、二度と
 discovery されず永久に RESTORING のまま取り残される（orphan RESTORING）。
 
-修正方針は、クエリ自体を `ACTIVE` / `RESTORING` の両方へ広げつつ、
-「staleと証明できなければ状態を変更しない」設計に一本化する: RESTORING の
-staleness 判定は本モジュールが独自ロジックを実装するのではなく、
+修正方針は、クエリ自体を `ACTIVE` / `RESTORING` の両方へ広げる。ただし
+RESTORING の扱いについては、**Contract Reconciliation（2026-09-25、
+PR #2754 に対する OWNER レビュー issuecomment-5828693174 を受けた Issue
+#2742 契約改訂）**により当初案から変更した。当初案は「
 `task_context_resume_dispatcher.py` の既存 guarded primitive
-`mark_restore_blocked_if_pending(binding_id, execution_run_id)`
-（**変更しない**）へ完全に委譲する。この primitive が「まだ RESTORING で
-あり、かつ pre-restore の ExecutionRun がまだ `ended_at IS NULL` である」
-ことを 1 つの `BEGIN IMMEDIATE` トランザクション内で確認できた場合のみ
-`RESTORE_BLOCKED` へ収束させ、確認できない場合（例: 判定の直前に本物の
-ACK が到達し、既に ACTIVE へ遷移し old run が technical close 済みだった
-場合）は一切 DB を変更せず `unresolved_target` として報告する。同一
-`herdr_locator` を複数の ACTIVE Binding が claim しているケース（
+`mark_restore_blocked_if_pending(binding_id, execution_run_id)`（
+**変更しない**）が『まだ RESTORING であり、かつ pre-restore の
+ExecutionRun がまだ `ended_at IS NULL` である』ことを確認できた場合、
+それを stale の証明として扱い `RESTORE_BLOCKED` へ自動収束させる」という
+設計だったが、この guard 条件は「pending restore が ACK 待ちで未完了」を
+確認するに過ぎず、process death 等の真の staleness を証明しない
+ことが判明した（Herdr の live handoff 中の正常な RESTORING でも同じ DB
+state が成立するため、guard 成立を根拠に自動収束させると、実際には
+生存中の pane を誤って `RESTORE_BLOCKED` にしてしまうリスクがある）。
+
+このため `discover_resume_candidates()` は `mark_restore_blocked_if_pending()`
+を一切呼び出さず、RESTORING の Binding を発見した場合は常に DB state を
+変更せず `unresolved_target`（`restoring_not_provably_stale`）として
+報告するに留める設計に単純化した。`restore_blocked` という結果キー・
+`stale_restoring_converged` という語彙自体は後方互換のため残しているが、
+本モジュールが実際にこれを emit することはなく、常に空リストになる。
+真に stale な RESTORING Binding を自動的に `RESTORE_BLOCKED` へ収束させる
+機能（true stale RESTORING recovery）には、generation counter や pid
+liveness check 等の独立した liveness mechanism が必要であり、これは本
+Issue の Out of Scope として別の narrow follow-up Issue へ委ねる。
+
+同一 `herdr_locator` を複数の ACTIVE Binding が claim しているケース（
 `runtime_locations` は `UNIQUE(binding_id) WHERE released_at IS NULL` の
-みを保証し、`herdr_locator` 自体の Binding 間 uniqueness は保証しない）も
-同様に、いずれか 1 件を恣意的に選ばず該当する全 Binding を
-`unresolved_target` として報告し dispatch しない。
+みを保証し、`herdr_locator` 自体の Binding 間 uniqueness は保証しない）は
+上記 RESTORING の扱いとは独立した defect であり、いずれか 1 件を恣意的に
+選ばず該当する全 Binding を `unresolved_target` として報告し dispatch
+しない（変更なし）。
 
 ### plugin は user 全体 global であることへの対応（session scoping）
 

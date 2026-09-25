@@ -10,8 +10,10 @@ Covers:
 - end-to-end orchestration with two simultaneous candidates and a shared
   ACK deadline.
 - Issue #2742 (follow-up to #2570's runtime acceptance fact-check):
-  locator-mismatch candidate loss (AC1), orphan RESTORING re-detection and
-  its guarded convergence to RESTORE_BLOCKED (AC2), the normal-path
+  locator-mismatch candidate loss (AC1), orphan RESTORING re-detection
+  always reported as unresolved_target WITHOUT any DB mutation -- never
+  auto-converged to RESTORE_BLOCKED (AC2, per the 2026-09-25 Contract
+  Reconciliation over PR #2754's OWNER review), the normal-path
   regression guard (AC3), and duplicate-pane claim conflicts (AC4).
 """
 
@@ -370,18 +372,22 @@ def test_given_one_candidate_acks_and_one_times_out_when_orchestrating_then_shar
 # ---------------------------------------------------------------------------
 
 
-def test_stale_restoring_binding_converges_to_restore_blocked_idempotently(conn, state_root):
+def test_restoring_binding_always_reported_as_unresolved_target_without_db_mutation(conn, state_root):
     """`ACTIVE -> RESTORING commit -> ACK前に停止 -> 再度cold restart`: a
     prior dispatch attempt left this Binding stuck at RESTORING (its
     pre-restore ExecutionRun never technically closed -- no ACK ever
-    arrived). A SUBSEQUENT `discover_resume_candidates()` call (simulating
-    the next cold restart's `[[startup]]` hook firing) must re-detect it,
-    confirm staleness via the existing guarded
-    `mark_restore_blocked_if_pending()` primitive, and converge it to
-    RESTORE_BLOCKED -- never send a duplicate resume command. Running the
-    exact same discovery again afterwards must be a pure no-op (idempotent
-    -- RESTORE_BLOCKED bindings are no longer selected by the query at
-    all)."""
+    arrived). Contract Reconciliation (2026-09-25, PR #2754 OWNER review,
+    issuecomment-5828693174): `mark_restore_blocked_if_pending()`'s guard
+    condition (`runtime_health == "RESTORING" AND execution_run.ended_at IS
+    NULL`) only confirms a pending restore has not yet been ACKed -- it
+    does NOT prove the underlying process/pane is actually dead, since a
+    live Herdr handoff can leave a Binding in this exact same DB state
+    while the pane is still genuinely alive. `discover_resume_candidates()`
+    therefore NEVER calls `mark_restore_blocked_if_pending()` and NEVER
+    mutates DB state for a RESTORING Binding -- it always reports it as
+    `unresolved_target` and leaves `runtime_health` at RESTORING. Running
+    the exact same discovery again afterwards must produce the identical
+    result and leave the DB in the identical state (idempotent)."""
     binding_id, run_id = _seed_active_native_binding_with_run_id(
         conn, herdr_locator="stale-tab-1", session_id="stale-s1"
     )
@@ -403,10 +409,22 @@ def test_stale_restoring_binding_converges_to_restore_blocked_idempotently(conn,
 
     def _run(argv, **kwargs):
         # The pane the Binding's OLD locator named may or may not still be
-        # live -- staleness confirmation for a RESTORING Binding is
-        # delegated entirely to `mark_restore_blocked_if_pending()`, never
-        # decided by the live pane list.
+        # live -- discovery never inspects the live pane list to decide a
+        # RESTORING Binding's fate; it is unconditionally reported as
+        # unresolved_target regardless of what this returns.
         return _pane_list_response("stale-tab-1")
+
+    expected_discovery = {
+        "candidates": [],
+        "unresolved_targets": [
+            {
+                "binding_id": binding_id,
+                "session_id": "stale-s1",
+                "reason": startup.REASON_RESTORING_NOT_PROVABLY_STALE,
+            }
+        ],
+        "restore_blocked": [],
+    }
 
     fresh = dispatcher.open_dispatcher_db()
     try:
@@ -414,117 +432,32 @@ def test_stale_restoring_binding_converges_to_restore_blocked_idempotently(conn,
     finally:
         fresh.close()
 
-    assert discovery["candidates"] == []
-    assert discovery["unresolved_targets"] == []
-    assert discovery["restore_blocked"] == [
-        {
-            "binding_id": binding_id,
-            "session_id": "stale-s1",
-            "reason": startup.REASON_STALE_RESTORING_CONVERGED,
-        }
-    ]
+    assert discovery == expected_discovery
 
     after_first = dispatcher.open_dispatcher_db()
     try:
-        assert service.get_binding(after_first, binding_id)["runtime_health"] == "RESTORE_BLOCKED"
+        assert service.get_binding(after_first, binding_id)["runtime_health"] == "RESTORING"
         assert service.get_execution_run(after_first, run_id)["ended_at"] is None
     finally:
         after_first.close()
 
-    # Idempotency: run the exact same discovery again. RESTORE_BLOCKED is
-    # excluded from the discovery query entirely, so this must be a
-    # complete no-op -- no re-emitted restore_blocked entry, no further DB
-    # mutation, no duplicate resume command.
+    # Idempotency: run the exact same discovery again. Since discovery
+    # never mutates DB state for RESTORING Bindings, this must reproduce
+    # the identical result and leave the DB in the identical state.
     fresh2 = dispatcher.open_dispatcher_db()
     try:
         discovery_again = startup.discover_resume_candidates(fresh2, herdr_bin="herdr", run_fn=_run)
     finally:
         fresh2.close()
 
-    assert discovery_again == {"candidates": [], "unresolved_targets": [], "restore_blocked": []}
+    assert discovery_again == expected_discovery
 
     after_second = dispatcher.open_dispatcher_db()
     try:
-        assert service.get_binding(after_second, binding_id)["runtime_health"] == "RESTORE_BLOCKED"
+        assert service.get_binding(after_second, binding_id)["runtime_health"] == "RESTORING"
         assert service.get_execution_run(after_second, run_id)["ended_at"] is None
     finally:
         after_second.close()
-
-
-def test_restoring_binding_not_provably_stale_is_left_unchanged_as_unresolved_target(
-    conn, state_root, monkeypatch
-):
-    """If staleness cannot be confirmed (the guarded primitive itself
-    declines the RESTORE_BLOCKED transition -- e.g. a genuinely concurrent
-    ACK lands for this exact Binding between discovery's own read and its
-    call into `mark_restore_blocked_if_pending()`), the Binding must be
-    left completely unchanged and reported as `unresolved_target` --
-    never forced into RESTORE_BLOCKED, and never silently dropped."""
-    binding_id, run_id = _seed_active_native_binding_with_run_id(
-        conn, herdr_locator="race-tab-1", session_id="race-s1"
-    )
-    conn.close()
-
-    decision = dispatcher.prepare_managed_resume("race-s1")
-    assert decision.action == dispatcher.ACTION_LAUNCH_NATIVE
-
-    real_mark_restore_blocked_if_pending = dispatcher.mark_restore_blocked_if_pending
-
-    def _racing_ack_then_real_guard(bid, exec_run_id):
-        # Inject a genuinely concurrent ACK for this exact Binding right
-        # in the race window between discover_resume_candidates()'s own
-        # SELECT (which observed RESTORING) and this guard call --
-        # deterministically reproducing the exact condition
-        # `mark_restore_blocked_if_pending()`'s own docstring documents as
-        # a "late/stale...signal" that must never downgrade an
-        # already-ACTIVE Binding.
-        if bid == binding_id:
-            ack_conn = dispatcher.open_dispatcher_db()
-            try:
-                hook_flows.on_session_start(
-                    ack_conn,
-                    {
-                        "source": "resume",
-                        "herdr_tab_id": "race-tab-1-new-after-ack",
-                        "claude_session_id": "race-s1",
-                    },
-                )
-            finally:
-                ack_conn.close()
-        return real_mark_restore_blocked_if_pending(bid, exec_run_id)
-
-    monkeypatch.setattr(dispatcher, "mark_restore_blocked_if_pending", _racing_ack_then_real_guard)
-
-    def _run(argv, **kwargs):
-        return _pane_list_response("race-tab-1")
-
-    fresh = dispatcher.open_dispatcher_db()
-    try:
-        discovery = startup.discover_resume_candidates(fresh, herdr_bin="herdr", run_fn=_run)
-    finally:
-        fresh.close()
-
-    assert discovery["candidates"] == []
-    assert discovery["restore_blocked"] == []
-    assert discovery["unresolved_targets"] == [
-        {
-            "binding_id": binding_id,
-            "session_id": "race-s1",
-            "reason": startup.REASON_RESTORING_NOT_PROVABLY_STALE,
-        }
-    ]
-
-    # The racing ACK itself (not discovery) is what advanced the Binding to
-    # ACTIVE -- discovery's own guard call must be a pure no-op on top of
-    # that (never itself mutate anything further).
-    after = dispatcher.open_dispatcher_db()
-    try:
-        binding_after = service.get_binding(after, binding_id)
-        assert binding_after["runtime_health"] == "ACTIVE"
-        old_run_after = service.get_execution_run(after, run_id)
-        assert old_run_after["ended_at"] is not None
-    finally:
-        after.close()
 
     summary = startup.run_startup_orchestrator(herdr_bin="herdr", discovery_run_fn=_run)
     matching = [r for r in summary["results"] if r.get("binding_id") == binding_id]

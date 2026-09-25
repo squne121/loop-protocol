@@ -83,7 +83,6 @@ for _dir in (_THIS_DIR, _MIGRATIONS_DIR):
 import task_context_config as config  # noqa: E402
 import task_context_db as db  # noqa: E402
 import task_context_resume_dispatcher as dispatcher  # noqa: E402
-import task_context_service as service  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Discovery result vocabulary (Issue #2742 -- follow-up to #2570's runtime
@@ -107,22 +106,27 @@ REASON_LOCATOR_NOT_LIVE = "locator_not_live"
 # reported and none are dispatched.
 REASON_DUPLICATE_LOCATOR_CLAIM = "duplicate_locator_claim"
 
-# A RESTORING Binding whose pre-restore ExecutionRun the guarded
-# `mark_restore_blocked_if_pending()` primitive could NOT confirm as stale
-# (the primitive itself is authoritative here -- see its own docstring for
-# exactly which conditions make it decline the transition). DB state is
-# left untouched; this is reported so it never silently vanishes from an
-# operator's view the way a permanently-stuck RESTORING Binding previously
-# did.
+# A RESTORING Binding discovery re-detected on a subsequent cold restart.
+# Contract Reconciliation (2026-09-25, Issue #2742 AC2): this is reported
+# UNCONDITIONALLY for every RESTORING Binding -- discovery never calls
+# `mark_restore_blocked_if_pending()` and never mutates DB state, because
+# that guard's success condition (runtime_health == "RESTORING" AND
+# execution_run.ended_at IS NULL) only confirms a pending restore has not
+# yet been ACKed, NOT that the underlying process/pane is actually dead
+# (a live Herdr handoff can leave a Binding in this exact same DB state).
+# DB state is left untouched; this is reported so it never silently
+# vanishes from an operator's view the way a permanently-stuck RESTORING
+# Binding previously did.
 REASON_RESTORING_NOT_PROVABLY_STALE = "restoring_not_provably_stale"
 
-# A RESTORING Binding whose pre-restore ExecutionRun the guarded
-# `mark_restore_blocked_if_pending()` primitive DID confirm as stale (still
-# RESTORING, pre-restore run not yet ended) -- converged to RESTORE_BLOCKED.
-# This is the "orphan RESTORING" defect's resolution: a prior dispatch
-# attempt that never reached SessionStart(source=resume) ACK before this
-# process itself was interrupted (e.g. host crash/reboot mid-restore) is no
-# longer left stuck at RESTORING forever across subsequent cold restarts.
+# Reserved (Contract Reconciliation 2026-09-25, Issue #2742 AC2): NEVER
+# emitted by `discover_resume_candidates()` today -- kept only so the
+# `"restore_blocked"` result key and downstream summary/exit-code wiring
+# remain backward compatible for a future independent liveness mechanism
+# (e.g. a generation counter or pid liveness check) that could actually
+# prove a RESTORING Binding is stale and converge it to RESTORE_BLOCKED.
+# See the module Notes for Reviewer for the narrow follow-up this defers
+# to.
 REASON_STALE_RESTORING_CONVERGED = "stale_restoring_converged"
 
 
@@ -191,14 +195,15 @@ def discover_resume_candidates(
       resume command is ever sent for these. ``reason`` is one of
       ``REASON_LOCATOR_NOT_LIVE`` / ``REASON_DUPLICATE_LOCATOR_CLAIM`` /
       ``REASON_RESTORING_NOT_PROVABLY_STALE``.
-    - ``"restore_blocked"``: a list of
-      ``{"binding_id", "session_id", "reason": REASON_STALE_RESTORING_CONVERGED}``
-      dicts for RESTORING Bindings the guarded
-      ``dispatcher.mark_restore_blocked_if_pending()`` primitive confirmed
-      as stale and converged to RESTORE_BLOCKED (idempotent -- a Binding
-      already RESTORE_BLOCKED is no longer selected by the query below at
-      all, so re-running this against the same DB state never re-emits it
-      here nor re-applies any transition).
+    - ``"restore_blocked"``: ALWAYS empty (Contract Reconciliation
+      2026-09-25, Issue #2742 AC2). Reserved for a future independent
+      liveness mechanism (e.g. a generation counter or pid liveness
+      check) that could confirm a RESTORING Binding is truly stale and
+      converge it to RESTORE_BLOCKED -- ``discover_resume_candidates()``
+      never calls ``dispatcher.mark_restore_blocked_if_pending()`` and
+      never mutates DB state for a RESTORING Binding; every RESTORING
+      Binding is reported only via ``"unresolved_targets"`` (see AC2
+      Contract Reconciliation note in the module Notes for Reviewer).
     """
     if run_fn is None:
         run_fn = subprocess.run
@@ -273,37 +278,31 @@ def discover_resume_candidates(
         row = claimant_rows[0]
         candidates.append((row["session_id"], locator))
 
-    # AC2: RESTORING Bindings -- re-detect a prior dispatch attempt that
-    # never reached ACK before a previous orchestrator run was itself
-    # interrupted. Delegates staleness confirmation entirely to the
-    # existing guarded primitive (never re-implements its guard
-    # conditions -- Stop Condition boundary with
-    # `task_context_resume_dispatcher.py`).
+    # AC2 (Contract Reconciliation 2026-09-25): RESTORING Bindings are
+    # always reported as unresolved_target WITHOUT any DB mutation.
+    # mark_restore_blocked_if_pending()'s guard condition
+    # (runtime_health == "RESTORING" AND execution_run.ended_at IS NULL)
+    # confirms only that a pending restore has not yet been ACKed -- it
+    # does NOT prove the underlying process/pane is dead. A live Herdr
+    # handoff can leave a Binding in this exact same DB state while the
+    # pane is still genuinely alive, so treating guard success as a
+    # staleness proof would risk RESTORE_BLOCKED-ing a Binding that is
+    # mid live-handoff. True stale-RESTORING recovery requires an
+    # independent liveness mechanism (e.g. a generation counter or pid
+    # liveness check) that does not yet exist -- see Issue #2742 Notes
+    # for Reviewer "Contract Reconciliation" and the resulting narrow
+    # follow-up issue. This function therefore never mutates DB state
+    # for RESTORING bindings; it only reports them.
     for row in rows:
         if row["runtime_health"] != "RESTORING":
             continue
-        binding_id = row["binding_id"]
-        session_id = row["session_id"]
-        _task_id, _activity_id, execution_run_id = service.get_current_task_activity_for_binding(
-            conn, binding_id
+        unresolved_targets.append(
+            {
+                "binding_id": row["binding_id"],
+                "session_id": row["session_id"],
+                "reason": REASON_RESTORING_NOT_PROVABLY_STALE,
+            }
         )
-        guard_applied = dispatcher.mark_restore_blocked_if_pending(binding_id, execution_run_id)
-        if guard_applied:
-            restore_blocked.append(
-                {
-                    "binding_id": binding_id,
-                    "session_id": session_id,
-                    "reason": REASON_STALE_RESTORING_CONVERGED,
-                }
-            )
-        else:
-            unresolved_targets.append(
-                {
-                    "binding_id": binding_id,
-                    "session_id": session_id,
-                    "reason": REASON_RESTORING_NOT_PROVABLY_STALE,
-                }
-            )
 
     return {
         "candidates": candidates,
