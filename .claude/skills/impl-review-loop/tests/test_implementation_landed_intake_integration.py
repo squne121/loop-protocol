@@ -464,3 +464,132 @@ def test_live_runtime_verifier_records_2119_2137_legacy_compatibility_without_fi
     assert payload["legacy_scope_coverage_marker_missing"] is True
     assert payload["legacy_compatibility_disposition"] == "ordinary_dispatch_or_explicit_recovery"
     assert artifact.exists()
+
+
+def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_references_excluded():
+    """AC9: production-shaped regression through `collect_candidate_inputs()`
+    (timeline candidate collection -> real `gh pr view` PR body fetch -> a
+    genuine `IMPLEMENTATION_SCOPE_COVERAGE_V1` marker text produced by
+    `build_scope_coverage_marker()`/`render_scope_coverage_marker()` and
+    parsed by `coverage_from_pr_body()` -> candidate qualification via
+    `derive_landing_disposition()`), reusing this module's existing mock
+    `gh` pattern -- not a hand-built candidate dict. Reproduces the exact
+    #2727 incident shape: PR #2735 and PR #2746 analogues are discovered as
+    timeline cross-references for the current target Issue #2727, but each
+    carries a well-formed durable marker naming a *different* sibling Issue
+    (#2725 / #2726). Neither is a qualified landing candidate for the
+    current target, and `qualified_candidate_conflict` never fires (AC1/AC2)."""
+    landed_evidence = _load(LANDED_EVIDENCE, "implementation_landed_evidence_for_2727_integration_test")
+
+    target_issue = 2727
+    repo = "squne121/loop-protocol"
+    target_issue_body = "## Allowed Paths\n- `.claude/a.py`\n"
+    sibling_body_2725 = "## Allowed Paths\n- `.claude/x.py`\n"
+    sibling_body_2726 = "## Allowed Paths\n- `.claude/y.py`\n"
+
+    marker_2735 = landed_evidence.render_scope_coverage_marker(
+        landed_evidence.build_scope_coverage_marker(
+            issue_number=2725, issue_body=sibling_body_2725, pr_head_sha="a" * 40
+        )
+    )
+    marker_2746 = landed_evidence.render_scope_coverage_marker(
+        landed_evidence.build_scope_coverage_marker(
+            issue_number=2726, issue_body=sibling_body_2726, pr_head_sha="b" * 40
+        )
+    )
+
+    timeline_events = [
+        {
+            "event": "cross-referenced",
+            "source": {
+                "issue": {
+                    "number": 2735,
+                    "pull_request": {"url": f"https://api.github.com/repos/{repo}/pulls/2735"},
+                    "repository_url": f"https://api.github.com/repos/{repo}",
+                }
+            },
+        },
+        {
+            "event": "cross-referenced",
+            "source": {
+                "issue": {
+                    "number": 2746,
+                    "pull_request": {"url": f"https://api.github.com/repos/{repo}/pulls/2746"},
+                    "repository_url": f"https://api.github.com/repos/{repo}",
+                }
+            },
+        },
+    ]
+
+    def run(argv):
+        if argv[:3] == ["gh", "pr", "list"]:
+            # Neither PR's closingIssuesReferences names the current target
+            # Issue #2727 -- both close a different sibling Issue instead.
+            return (
+                0,
+                json.dumps(
+                    [
+                        {"number": 2735, "closingIssuesReferences": [{"number": 2725}]},
+                        {"number": 2746, "closingIssuesReferences": [{"number": 2726}]},
+                    ]
+                ),
+                "",
+            )
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "timeline" in argv[-1]:
+            return 0, json.dumps(timeline_events), ""
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] == "2735":
+            return (
+                0,
+                json.dumps(
+                    {
+                        "number": 2735,
+                        "url": f"https://github.com/{repo}/pull/2735",
+                        "state": "MERGED",
+                        "isDraft": False,
+                        "mergedAt": "2026-09-01T00:00:00Z",
+                        "mergeCommit": {"oid": "a" * 40},
+                        "headRefOid": "a" * 40,
+                        "closingIssuesReferences": [{"number": 2725}],
+                        "body": marker_2735,
+                        "files": [],
+                    }
+                ),
+                "",
+            )
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] == "2746":
+            return (
+                0,
+                json.dumps(
+                    {
+                        "number": 2746,
+                        "url": f"https://github.com/{repo}/pull/2746",
+                        "state": "MERGED",
+                        "isDraft": False,
+                        "mergedAt": "2026-09-02T00:00:00Z",
+                        "mergeCommit": {"oid": "b" * 40},
+                        "headRefOid": "b" * 40,
+                        "closingIssuesReferences": [{"number": 2726}],
+                        "body": marker_2746,
+                        "files": [],
+                    }
+                ),
+                "",
+            )
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "compare" in argv[2]:
+            return 0, "ahead\n", ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "commits/main" in argv[2]:
+            return 0, "9" * 40 + "\n", ""
+        return 1, "", "unexpected argv: " + " ".join(argv)
+
+    evidence = landed_evidence.collect_candidate_inputs(
+        repo=repo, issue_number=target_issue, current_scope=target_issue_body, run_command=run
+    )
+    assert len(evidence["candidates"]) == 2
+    for candidate in evidence["candidates"]:
+        assert candidate["provenance"]["kind"] == "verified_cross_reference"
+        assert candidate["scope_coverage"]["status"] == "invalid"
+        assert candidate["scope_coverage"]["errors"] == ["scope_coverage_issue_identity_mismatch"]
+
+    result = landed_evidence.derive_landing_disposition(evidence, repo=repo, issue_number=target_issue)
+    assert result["disposition"] == "ordinary_dispatch_or_explicit_recovery"
+    assert result["reason_codes"] == ["no_qualified_candidate"]
