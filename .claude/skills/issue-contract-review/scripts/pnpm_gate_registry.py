@@ -36,11 +36,7 @@ _SCRIPTS = {
     "build": "tsc && vite build",
     "typecheck:e2e": "tsc -p tests/e2e/tsconfig.json --noEmit",
     "lint:docs": "pnpm run lint:md && pnpm run lint:prose && pnpm run validate:roadmap-refs",
-    "lint:md": (
-        "markdownlint-cli2 '**/*.md' '#node_modules/**' '#.agents/skills/**' "
-        "'#.claude/worktrees/**' '#dist/**' '#coverage/**' '#playwright-report/**' "
-        "'#test-results/**'"
-    ),
+    "lint:md": "markdownlint-cli2",
     "lint:prose": (
         "textlint --config .textlintrc 'docs/**/*.md' 'README.md' '.github/**/*.md' "
         "'CLAUDE.md' 'AGENTS.md' 'SECURITY.md' '.claude/**/*.md'"
