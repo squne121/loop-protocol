@@ -23,7 +23,7 @@ Runtime Verification Applicability: not_applicable
 from __future__ import annotations
 
 import ast
-import importlib.util
+import importlib
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -45,22 +45,42 @@ for _p in (str(_SCRIPTS_DIR), str(_CREATE_ISSUE_SCRIPTS_DIR)):
         sys.path.insert(0, _p)
 
 
-def _load_module(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
-    return mod
+def _import_and_verify_module(name: str, expected_path: Path):
+    """Import `name` through the ordinary import machinery and confirm it
+    resolved to the expected repo file.
+
+    This intentionally does NOT force-replace any pre-existing
+    `sys.modules[name]` entry with a freshly constructed module object --
+    it relies on Python's normal import cache, so a module already
+    imported earlier in this same process (including via the bare
+    `import baseline_vc_preflight` / `import prose_boundary_policy`
+    statements inside `contract_readiness_check.py` and
+    `baseline_vc_preflight.py` themselves) resolves to the very same
+    object this test module imports.
+
+    The `module.__file__` check below only *detects* -- it never repairs
+    -- an accidental `sys.modules` collision with an unrelated same-named
+    module loaded from a different path earlier in a shared pytest
+    session; if that happens, the assertion fails loudly instead of
+    silently testing the wrong file.
+    """
+    module = importlib.import_module(name)
+    actual_path = Path(module.__file__).resolve()
+    assert actual_path == expected_path.resolve(), (
+        f"{name!r} resolved to {actual_path}, expected {expected_path} "
+        "(sys.modules likely already holds an unrelated same-named module "
+        "from a different path -- this test does not force-replace it)"
+    )
+    return module
 
 
-_prose_boundary_policy = _load_module(
+_prose_boundary_policy = _import_and_verify_module(
     "prose_boundary_policy", _PROSE_BOUNDARY_POLICY_PATH
 )
-_baseline_vc_preflight = _load_module(
+_baseline_vc_preflight = _import_and_verify_module(
     "baseline_vc_preflight", _BASELINE_VC_PREFLIGHT_PATH
 )
-_contract_readiness_check = _load_module(
+_contract_readiness_check = _import_and_verify_module(
     "contract_readiness_check", _CONTRACT_READINESS_CHECK_PATH
 )
 
@@ -78,6 +98,44 @@ def _module_top_level_import_targets(path: Path) -> set[str]:
             if node.module:
                 targets.add(node.module)
     return targets
+
+
+def _tree_references_name_as_identifier(tree: ast.AST, name: str) -> bool:
+    """Return True if `name` is referenced as a live Python identifier
+    (an `ast.Name` load/use, or the attribute name of an `ast.Attribute`
+    access) anywhere in `tree`.
+
+    This is deliberately narrower than a raw substring-in-source check: a
+    comment or a docstring that merely *mentions* `name` does not produce
+    an `ast.Name` / `ast.Attribute` node, so it does not trip this check.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == name:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr == name:
+            return True
+    return False
+
+
+def _tree_defines_function(tree: ast.AST, func_name: str) -> bool:
+    """Return True if `tree` contains a (sync or async) function
+    definition named `func_name`."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            return True
+    return False
+
+
+def _file_tree(path: Path) -> ast.AST:
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _file_references_name_as_identifier(path: Path, name: str) -> bool:
+    return _tree_references_name_as_identifier(_file_tree(path), name)
+
+
+def _file_defines_function(path: Path, func_name: str) -> bool:
+    return _tree_defines_function(_file_tree(path), func_name)
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +162,20 @@ class TestBaselineVcPreflightDelegation:
 
     def test_baseline_vc_preflight_has_no_independent_heading_boundary_primitives(self):
         """AC7: baseline_vc_preflight.py's own source no longer references the
-        heading-boundary primitives directly -- it only calls the shared
-        prose_boundary_policy helper, so it cannot hold an independent copy
-        of the section-boundary algorithm."""
-        source = _BASELINE_VC_PREFLIGHT_PATH.read_text(encoding="utf-8")
-        assert "parse_atx_heading_line" not in source
-        assert "lookup_heading_policy" not in source
+        heading-boundary primitives as live identifiers -- it only calls the
+        shared prose_boundary_policy helper, so it cannot hold an independent
+        copy of the section-boundary algorithm.
+
+        This is an AST-based structural check (not a raw substring-in-source
+        check): a comment or docstring merely mentioning the forbidden name
+        does not trip it (see
+        TestAstStructuralGateIgnoresProseOccurrences below)."""
+        assert not _file_references_name_as_identifier(
+            _BASELINE_VC_PREFLIGHT_PATH, "parse_atx_heading_line"
+        )
+        assert not _file_references_name_as_identifier(
+            _BASELINE_VC_PREFLIGHT_PATH, "lookup_heading_policy"
+        )
 
     def test_baseline_vc_preflight_delegates_actual_call_to_shared_helper(self):
         """Functional delegation check: patching
@@ -150,14 +216,25 @@ class TestContractReadinessCheckDelegation:
 
     def test_contract_readiness_check_has_no_independent_heading_boundary_primitives(self):
         """AC8: contract_readiness_check.py's own source no longer
-        references the heading-boundary primitives directly (it used to
-        call parse_atx_heading_line()/lookup_heading_policy() in its own
-        fence-aware loop before delegating to the shared helper)."""
-        source = _CONTRACT_READINESS_CHECK_PATH.read_text(encoding="utf-8")
-        assert "parse_atx_heading_line" not in source
-        assert "lookup_heading_policy" not in source
-        assert "def _fenced_line_indices" not in source, (
-            "contract_readiness_check.py must not hold its own "
+        references the heading-boundary primitives as live identifiers (it
+        used to call parse_atx_heading_line()/lookup_heading_policy() in its
+        own fence-aware loop before delegating to the shared helper), and no
+        longer defines its own `_fenced_line_indices()`.
+
+        This is an AST-based structural check (not a raw
+        substring-in-source check): a comment or docstring merely
+        mentioning the forbidden name/def does not trip it (see
+        TestAstStructuralGateIgnoresProseOccurrences below)."""
+        assert not _file_references_name_as_identifier(
+            _CONTRACT_READINESS_CHECK_PATH, "parse_atx_heading_line"
+        )
+        assert not _file_references_name_as_identifier(
+            _CONTRACT_READINESS_CHECK_PATH, "lookup_heading_policy"
+        )
+        assert not _file_defines_function(
+            _CONTRACT_READINESS_CHECK_PATH, "_fenced_line_indices"
+        ), (
+            "contract_readiness_check.py must not define its own "
             "_fenced_line_indices() -- that primitive now lives only in "
             "prose_boundary_policy.py"
         )
@@ -193,3 +270,33 @@ class TestContractReadinessCheckDelegation:
         direction; only the reverse direction is disallowed)."""
         targets = _module_top_level_import_targets(_CONTRACT_READINESS_CHECK_PATH)
         assert "baseline_vc_preflight" in targets
+
+
+# ---------------------------------------------------------------------------
+# Pin: the AST-based structural gate above must not false-positive on a
+# comment/docstring that merely mentions a forbidden name/def -- unlike a
+# raw substring-in-source check, which would.
+# ---------------------------------------------------------------------------
+
+
+class TestAstStructuralGateIgnoresProseOccurrences:
+    _FIXTURE_SOURCE = (
+        '"""This docstring mentions parse_atx_heading_line and '
+        'lookup_heading_policy only as prose, never as a call or a '
+        'definition. It also mentions _fenced_line_indices in prose."""\n'
+        "\n"
+        "# another comment referencing lookup_heading_policy and "
+        "parse_atx_heading_line\n"
+        "\n"
+        "def _fenced_line_indices_is_a_different_identifier():\n"
+        "    return 1\n"
+    )
+
+    def test_prose_only_mentions_do_not_trip_the_identifier_check(self):
+        tree = ast.parse(self._FIXTURE_SOURCE)
+        assert not _tree_references_name_as_identifier(tree, "parse_atx_heading_line")
+        assert not _tree_references_name_as_identifier(tree, "lookup_heading_policy")
+
+    def test_prose_only_mention_does_not_trip_the_function_definition_check(self):
+        tree = ast.parse(self._FIXTURE_SOURCE)
+        assert not _tree_defines_function(tree, "_fenced_line_indices")
