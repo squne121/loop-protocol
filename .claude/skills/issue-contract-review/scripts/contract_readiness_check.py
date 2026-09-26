@@ -77,6 +77,7 @@ from baseline_vc_preflight import (  # noqa: E402
 )
 import vc_runtime_history as _vc_runtime_history  # noqa: E402
 from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
+from vc_contract_syntax import parse_verification_commands_section as _parse_vc_section  # noqa: E402
 from prose_boundary_policy import (  # noqa: E402
     BLOCK_KIND_CODE_FENCE,
     HEADING_POLICY,
@@ -1403,12 +1404,15 @@ def _fenced_line_indices(body: str) -> set[int]:
     return indices
 
 
-def _extract_rva_section(body: str) -> tuple[str, int, int] | None:
-    """Extract the top-level RVA section with the shared GFM heading policy.
+def _extract_section_by_canonical_name(body: str, canonical_en: str) -> tuple[str, int, int] | None:
+    """Extract a level-2 section by its shared GFM heading policy canonical name.
 
     Fenced examples cannot satisfy or terminate the section.  The accepted
     heading forms, indentation, and closing-hash handling are delegated to
     prose_boundary_policy rather than reproduced with a body-wide regex.
+    Centralised (Issue #2771) so `_extract_rva_section` and the Acceptance
+    Criteria section extraction used by the runtime assertion binding
+    coverage check share the exact same heading-boundary logic.
     """
     lines = body.splitlines(keepends=True)
     fenced = _fenced_line_indices(body)
@@ -1420,7 +1424,7 @@ def _extract_rva_section(body: str) -> tuple[str, int, int] | None:
         if heading is None or heading["level"] != 2:
             continue
         policy = lookup_heading_policy(heading["text"])
-        if not policy or policy.get("canonical_en") != "Runtime Verification Applicability":
+        if not policy or policy.get("canonical_en") != canonical_en:
             continue
 
         end_index = len(lines)
@@ -1433,6 +1437,16 @@ def _extract_rva_section(body: str) -> tuple[str, int, int] | None:
                 break
         return "".join(lines[start_index + 1:end_index]), start_index + 1, end_index
     return None
+
+
+def _extract_rva_section(body: str) -> tuple[str, int, int] | None:
+    """Extract the top-level Runtime Verification Applicability section."""
+    return _extract_section_by_canonical_name(body, "Runtime Verification Applicability")
+
+
+def _extract_ac_section(body: str) -> tuple[str, int, int] | None:
+    """Extract the top-level Acceptance Criteria section (Issue #2771)."""
+    return _extract_section_by_canonical_name(body, "Acceptance Criteria")
 
 
 def _is_canonical_implementation_issue(body: str) -> bool:
@@ -1627,6 +1641,116 @@ def check_extension_surface_advisory(body: str) -> list[dict]:
                 "Non-blocking: one or more declared Allowed Paths match a project-local "
                 "extension candidate perimeter (unknown_surface_policy.project_candidate_path_globs) "
                 "but no known extension-surface risk-trigger rule. No action required."
+            ),
+            "autofixable": False,
+        }
+    ]
+
+
+def check_runtime_assertion_binding_coverage(body: str) -> list[dict]:
+    """Issue #2771: hard-required verification profile assertion binding
+    completeness.
+
+    Same-type addition as `check_extension_surface_risk_trigger()` above --
+    uses the shared evaluator's `evaluate_runtime_assertion_binding_
+    coverage()` to verify that every `(verification_profile_id,
+    assertion_id)` pair derived purely from `matched_rules[].enforcement ==
+    "hard"` has an explicit `runtime_assertion_bindings` declaration, and
+    that each declared binding's `ac` is referentially valid (exists, is
+    declared in `applicable_acs`, is consistent with the decision-level
+    runtime-verification tag, and has a canonical `# AC<N>` reference in
+    `## Verification Commands`). Structural completeness only -- never a
+    semantic judgment of whether the bound VC proves the assertion (Issue
+    #2771 Outcome / AC10).
+    """
+    if not _is_canonical_implementation_issue(body):
+        return []
+
+    allowed_path_entries = _extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return []
+
+    rva_section = _extract_rva_section(body)
+    rva_section_text = rva_section[0] if rva_section is not None else ""
+    ac_section = _extract_ac_section(body)
+    ac_section_text = ac_section[0] if ac_section is not None else ""
+    # Issue #2771 PR #2780 OWNER F2 review: use the same GFM-aware section
+    # extraction (fence-aware, closing-hash-tolerant, nested-heading-safe)
+    # already used for the RVA / Acceptance Criteria sections above, and
+    # already used independently by review-issue's C15
+    # (`check_c15_runtime_assertion_binding_coverage` -> `extract_section()`)
+    # -- NOT the legacy `extract_verification_commands_section()` regex
+    # (``^##\s+Verification Commands\s*$(.+?)(?=^##|\Z)``), which fails to
+    # extract a GFM closing-hash heading (``## Verification Commands ##``)
+    # and can be cut short by a nested ``### Runtime checks`` subheading or
+    # a ``##``-prefixed line inside a fenced code example. Using a
+    # different extractor than review-issue's C15 for the SAME input body
+    # let the two consumers disagree on `ac_vc_refs` for identical Issues
+    # even though both call the exact same shared evaluator function.
+    vc_section = _extract_section_by_canonical_name(body, "Verification Commands")
+    vc_section_text = vc_section[0] if vc_section is not None else ""
+
+    vc_parse_result = _parse_vc_section(vc_section_text)
+    ac_vc_refs = {re.sub(r"^AC", "", ref) for ref in vc_parse_result.ac_refs}
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+
+    section_start_line = rva_section[1] if rva_section is not None else 0
+    section_end_line = rva_section[2] if rva_section is not None else 0
+
+    try:
+        verdict = evaluator.evaluate_runtime_assertion_binding_coverage(
+            allowed_path_entries=allowed_path_entries,
+            rva_section_text=rva_section_text,
+            ac_section_text=ac_section_text,
+            ac_vc_refs=ac_vc_refs,
+        )
+    except evaluator.PolicyLoadError as exc:
+        # Issue #2771 AC6: a policy integrity defect (dangling profile
+        # reference / duplicate assertion id within a profile) is not
+        # Issue-author-fixable -- mirrors check_extension_surface_risk_
+        # trigger()'s existing EXTSURF002 human_judgment escalation above.
+        return [
+            {
+                "rule_id": "RUNTIMEASSERT002",
+                "severity": "error",
+                "source_check": "contract_readiness_check",
+                "category": "runtime_assertion_binding_coverage_policy_unavailable",
+                "section": "Runtime Verification Applicability",
+                "line_start": section_start_line,
+                "line_end": section_end_line,
+                "minimal_context": [f"runtime assertion binding coverage policy unavailable: {exc}"],
+                "fix_hint": (
+                    "The extension-surface risk-trigger policy's verification_profiles "
+                    "(docs/dev/extension-surface-runtime-policy.yaml) failed its structural "
+                    "contract check and cannot be evaluated. This is not body-author-fixable; "
+                    "escalate to a human/owner to repair the policy file."
+                ),
+                "autofixable": False,
+            }
+        ]
+
+    if verdict["verdict"] != "needs_fix":
+        return []
+
+    return [
+        {
+            "rule_id": "RUNTIMEASSERT001",
+            "severity": "error",
+            "source_check": "contract_readiness_check",
+            "category": "runtime_assertion_binding_coverage",
+            "section": "Runtime Verification Applicability",
+            "line_start": section_start_line,
+            "line_end": section_end_line,
+            "minimal_context": verdict["reasons"],
+            "fix_hint": (
+                "Declare a `runtime_assertion_bindings` entry (profile/assertion/ac) for every "
+                "hard-required (verification_profile, assertion) pair, remove any binding that is "
+                "not hard-required or duplicated, and ensure each bound ac exists, is listed in "
+                "applicable_acs, carries the runtime-verification tag, and is referenced from "
+                "## Verification Commands: " + "; ".join(verdict["reasons"])
             ),
             "autofixable": False,
         }
@@ -2031,6 +2155,7 @@ def build_result(
     # `ext_surface_errors` (the escalation-gating variable below) --
     # included in `all_errors` for display only.
     ext_surface_advisory_errors = check_extension_surface_advisory(body)
+    runtime_assertion_binding_errors = check_runtime_assertion_binding_coverage(body)
 
     preflight_errors: list[dict] = []
     preflight_aggregate = "go"
@@ -2051,6 +2176,7 @@ def build_result(
         + rdr_errors
         + ext_surface_errors
         + ext_surface_advisory_errors
+        + runtime_assertion_binding_errors
         + static_vc_errors
         + preflight_errors
     )
@@ -2073,6 +2199,19 @@ def build_result(
         if any(
             e.get("category") == "extension_surface_risk_trigger_policy_unavailable"
             for e in ext_surface_errors
+        ):
+            overall_status = _raise_status(overall_status, "human_judgment")
+        else:
+            overall_status = _raise_status(overall_status, "needs_fix")
+    if runtime_assertion_binding_errors:
+        # Issue #2771 AC6: distinguish the Issue-side needs_fix path
+        # (missing/unknown/duplicate/invalid binding declarations) from the
+        # policy-side integrity failure path (dangling profile reference /
+        # duplicate assertion id), mirroring the ext_surface_errors pattern
+        # immediately above.
+        if any(
+            e.get("category") == "runtime_assertion_binding_coverage_policy_unavailable"
+            for e in runtime_assertion_binding_errors
         ):
             overall_status = _raise_status(overall_status, "human_judgment")
         else:

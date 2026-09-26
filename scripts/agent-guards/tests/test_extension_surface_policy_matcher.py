@@ -699,3 +699,145 @@ def test_invalid_issue_time_enforcement_fails_closed():
         assert False, "expected PolicyLoadError for invalid issue_time_enforcement value"
     except extension_surface_policy_matcher.PolicyLoadError as exc:
         assert "hrad" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2771 PR #2780 OWNER F1 review: `_extract_rva_yaml_field()` /
+# `parse_runtime_assertion_bindings()` / `extract_applicable_acs()` must not
+# regress a structurally normal Issue body into a false "field absent"
+# reading just because of a trailing comment, `yaml.safe_dump()`-style
+# same-indent block sequence, or a bullet-prefixed field key.
+# ---------------------------------------------------------------------------
+
+_HOOK_BINDING_YAML_INDENTED = """\
+decision: immediate
+applicable_acs: [AC1]
+runtime_assertion_bindings:
+  - profile: hook-chain-runtime-smoke
+    assertion: all_matching_hooks_observed
+    ac: AC1
+  - profile: hook-chain-runtime-smoke
+    assertion: sibling_side_effect_inventory_complete
+    ac: AC1
+"""
+
+_EXPECTED_HOOK_BINDINGS = [
+    {"profile": "hook-chain-runtime-smoke", "assertion": "all_matching_hooks_observed", "ac": "1"},
+    {
+        "profile": "hook-chain-runtime-smoke",
+        "assertion": "sibling_side_effect_inventory_complete",
+        "ac": "1",
+    },
+]
+
+
+def test_binding_key_line_trailing_comment_does_not_truncate_block():
+    """A trailing YAML comment on `runtime_assertion_bindings:`'s own key
+    line must not be mistaken for a non-empty inline value that swallows
+    the nested list (Issue #2771 PR #2780 OWNER F1 review)."""
+    commented = _HOOK_BINDING_YAML_INDENTED.replace(
+        "runtime_assertion_bindings:",
+        "runtime_assertion_bindings: # このACで両方を検証する",
+    )
+    bindings, malformed = extension_surface_policy_matcher.parse_runtime_assertion_bindings(commented)
+    assert malformed == []
+    assert bindings == _EXPECTED_HOOK_BINDINGS
+
+    baseline_bindings, baseline_malformed = extension_surface_policy_matcher.parse_runtime_assertion_bindings(
+        _HOOK_BINDING_YAML_INDENTED
+    )
+    assert baseline_malformed == []
+    assert bindings == baseline_bindings
+
+
+def test_binding_yaml_safe_dump_same_indent_sequence_is_parsed():
+    """`yaml.safe_dump()`'s own output style -- a mapping value's sequence
+    items at the SAME indentation as the key, not indented deeper -- is
+    valid YAML and must parse to the same bindings as the indented form
+    (Issue #2771 PR #2780 OWNER F1 review)."""
+    dumped_style = (
+        "decision: immediate\n"
+        "applicable_acs: [AC1]\n"
+        "runtime_assertion_bindings:\n"
+        "- profile: hook-chain-runtime-smoke\n"
+        "  assertion: all_matching_hooks_observed\n"
+        "  ac: AC1\n"
+        "- profile: hook-chain-runtime-smoke\n"
+        "  assertion: sibling_side_effect_inventory_complete\n"
+        "  ac: AC1\n"
+    )
+    bindings, malformed = extension_surface_policy_matcher.parse_runtime_assertion_bindings(dumped_style)
+    assert malformed == []
+    assert bindings == _EXPECTED_HOOK_BINDINGS
+
+
+def test_bullet_prefixed_applicable_acs_field_is_read():
+    """An `applicable_acs` field written as its own bullet item
+    (`- applicable_acs: [AC1]`), matching the existing `- decision:` /
+    `- reason:` bullet authoring convention, must not be read as absent
+    (Issue #2771 PR #2780 OWNER F1 review)."""
+    bulleted = "- decision: immediate\n- applicable_acs: [AC1]\n"
+    assert extension_surface_policy_matcher.extract_applicable_acs(bulleted) == {"1"}
+
+
+def test_bullet_prefixed_field_same_indent_sibling_bullet_not_swallowed():
+    """A bullet-prefixed `runtime_assertion_bindings:` key's same-indent
+    continuation rule must NOT reach across into the next, unrelated
+    sibling bullet field (Issue #2771 PR #2780 OWNER F1 review: the
+    same-indent continuation only applies to the plain, non-bullet key
+    form)."""
+    bulleted_with_sibling = (
+        "- decision: immediate\n"
+        "- runtime_assertion_bindings:\n"
+        "  - profile: hook-chain-runtime-smoke\n"
+        "    assertion: all_matching_hooks_observed\n"
+        "    ac: AC1\n"
+        "- reason: unrelated sibling field text\n"
+    )
+    bindings, malformed = extension_surface_policy_matcher.parse_runtime_assertion_bindings(
+        bulleted_with_sibling
+    )
+    assert malformed == []
+    assert bindings == [
+        {"profile": "hook-chain-runtime-smoke", "assertion": "all_matching_hooks_observed", "ac": "1"}
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2771 PR #2780 OWNER F3 review: `extract_ac_numbers()` must only
+# treat a genuine task-list AC declaration as "real" -- not every
+# `AC<N>`-shaped substring anywhere in the Acceptance Criteria section text
+# (a known false-positive shape independently tracked for review-issue's C5
+# checker in Issue #1712; this fix is local to this function only).
+# ---------------------------------------------------------------------------
+
+
+def test_ac_number_in_prose_explaining_a_prior_proposal_is_not_declared():
+    """GIVEN a single genuine AC1 task-list item whose own description text
+    mentions a previous proposal's number (AC99)
+    WHEN AC numbers are extracted
+    THEN only AC1 is reported as declared -- AC99 is prose, not a real AC."""
+    section = "- [ ] AC1: 現在の受入条件。旧案のAC99は参考情報であり、今回の受入条件ではない。\n"
+    assert extension_surface_policy_matcher.extract_ac_numbers(section) == {"1"}
+
+
+def test_ac_number_only_inside_fenced_example_is_not_declared():
+    """GIVEN a real AC1 task-list item plus a fenced code example that shows
+    what an `AC99` line might look like
+    WHEN AC numbers are extracted
+    THEN AC99 (fenced-only) is not counted as a real, declared AC."""
+    section = (
+        "- [ ] AC1: concrete AC\n"
+        "\n"
+        "```markdown\n"
+        "- [ ] AC99: example only, not a real AC\n"
+        "```\n"
+    )
+    assert extension_surface_policy_matcher.extract_ac_numbers(section) == {"1"}
+
+
+def test_ac_number_declared_as_checked_task_list_item_is_read():
+    """A checked task-list item (`- [x] AC2: ...`) is still a genuine
+    declared AC, not just the unchecked `- [ ]` form."""
+    section = "- [x] AC2: already-completed AC\n"
+    assert extension_surface_policy_matcher.extract_ac_numbers(section) == {"2"}
