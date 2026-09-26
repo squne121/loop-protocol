@@ -50,6 +50,17 @@ import pnpm_gate_registry as pnpm_gate_registry  # noqa: E402
 import vc_runtime_history as _vc_runtime_history  # noqa: E402
 from allowed_paths_policy import is_no_path_marker  # noqa: E402
 
+# Issue #2782: level-2 section extraction authority (shared with
+# contract_readiness_check.py::_extract_section_by_canonical_name()). This
+# module does NOT import contract_readiness_check.py (that would form a
+# cycle, since contract_readiness_check.py already imports this module) --
+# both files delegate to prose_boundary_policy.py instead.
+_CREATE_ISSUE_SCRIPTS_DIR = _REPO_ROOT / ".claude" / "skills" / "create-issue" / "scripts"
+if str(_CREATE_ISSUE_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS_DIR))
+
+from prose_boundary_policy import extract_level2_section as _extract_level2_section  # noqa: E402
+
 
 # Issue #1333 AC1: per-command timeout の named constant。
 # 実測 test_baseline_vc_preflight.py 実行時間（約58秒、real 0m59.376s）を
@@ -701,15 +712,24 @@ def read_body_file(path: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def extract_verification_commands_section(body: str) -> Optional[str]:
-    """body から `## Verification Commands` セクションを抽出"""
-    match = re.search(
-        r"^##\s+Verification Commands\s*$(.+?)(?=^##|\Z)",
-        body,
-        re.MULTILINE | re.DOTALL,
-    )
-    if match:
-        return match.group(1)
-    return None
+    """
+    body から `## Verification Commands` セクションを抽出する。
+
+    section boundary algorithm 自体は持たず、単一 authority である
+    `prose_boundary_policy.extract_level2_section()`（#2782）へ委譲する
+    （GFM closing-hash 見出し・section 内 nested 見出し・fenced code block
+    内の擬似 `##` 行のいずれに対しても誤抽出しない）。
+
+    Return contract（#2782 AC4）:
+      None            -- heading 不在（`## Verification Commands` が body に
+                          存在しない）
+      ""              -- heading 存在するが本文が空、または空白のみ
+      non-empty str   -- heading 存在し、本文に実行可能な content がある
+
+    presence のみを判定する consumer は `is not None` を使うこと。
+    truthiness / `bool()` は "" と None を区別できないため使用しない。
+    """
+    return _extract_level2_section(body, "Verification Commands")
 
 
 _ALLOWED_PATH_BULLET_RE = re.compile(r"^\s*[-+*]\s+")
@@ -5631,8 +5651,18 @@ def _main_impl() -> int:
         return 2 if error_code else 2
 
     # Verification Commands セクションを抽出
+    #
+    # #2782: presence 判定（heading 不在）と content validation（heading は
+    # あるが実行可能 content がない）を分離する。旧実装は `if not vc_section:`
+    # により、heading 不在（None）と「heading は存在するが本文が空」（""）を
+    # 同一の VC001_NO_VERIFICATION_COMMANDS_SECTION（"body does not contain
+    # heading"）に conflate していた。ここでは presence（`is None`）のみを
+    # 判定し、"" の場合はこの分岐を通過させて、下流の
+    # extract_fenced_bash_blocks() / commands 抽出ロジックに空文字列を渡す
+    # （結果として VC002_NO_COMMANDS_EXTRACTED 等の content validation エラー
+    # に正しく帰着する）。
     vc_section = extract_verification_commands_section(body)
-    if not vc_section:
+    if vc_section is None:
         result = {
             "schema": "baseline_vc_preflight/v1",
             "issue": args.issue or 0,

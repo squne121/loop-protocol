@@ -79,11 +79,8 @@ import vc_runtime_history as _vc_runtime_history  # noqa: E402
 from mrc_contract_parser import parse_machine_readable_contract  # noqa: E402
 from vc_contract_syntax import parse_verification_commands_section as _parse_vc_section  # noqa: E402
 from prose_boundary_policy import (  # noqa: E402
-    BLOCK_KIND_CODE_FENCE,
+    extract_level2_section_with_bounds as _extract_level2_section_with_bounds,
     HEADING_POLICY,
-    iter_markdown_blocks,
-    lookup_heading_policy,
-    parse_atx_heading_line,
 )
 
 # Issue #2165 (OWNER 2026-08-15 REQUEST_CHANGES P1-1(c)): derive the
@@ -1392,18 +1389,6 @@ def _default_fix_hint(category: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _fenced_line_indices(body: str) -> set[int]:
-    """Return zero-based line indexes owned by fenced blocks using the shared policy."""
-    indices: set[int] = set()
-    line_index = 0
-    for block_text, block_kind in iter_markdown_blocks(body):
-        line_count = len(block_text.splitlines(keepends=True))
-        if block_kind == BLOCK_KIND_CODE_FENCE:
-            indices.update(range(line_index, line_index + line_count))
-        line_index += line_count
-    return indices
-
-
 def _extract_section_by_canonical_name(body: str, canonical_en: str) -> tuple[str, int, int] | None:
     """Extract a level-2 section by its shared GFM heading policy canonical name.
 
@@ -1413,30 +1398,19 @@ def _extract_section_by_canonical_name(body: str, canonical_en: str) -> tuple[st
     Centralised (Issue #2771) so `_extract_rva_section` and the Acceptance
     Criteria section extraction used by the runtime assertion binding
     coverage check share the exact same heading-boundary logic.
+
+    #2782: this function no longer implements the section-boundary
+    algorithm itself. It delegates to
+    `prose_boundary_policy.extract_level2_section_with_bounds()`, the single
+    shared authority also used by
+    `baseline_vc_preflight.py::extract_verification_commands_section()`, so
+    this file holds no independent copy of the fence-aware heading-boundary
+    loop. This module imports `baseline_vc_preflight` (see top-of-file
+    import), so it cannot import back from it for this helper without
+    forming a cycle -- prose_boundary_policy.py has no dependency on either
+    file, which is why it is the delegation target for both.
     """
-    lines = body.splitlines(keepends=True)
-    fenced = _fenced_line_indices(body)
-
-    for start_index, line in enumerate(lines):
-        if start_index in fenced:
-            continue
-        heading = parse_atx_heading_line(line.rstrip("\r\n"))
-        if heading is None or heading["level"] != 2:
-            continue
-        policy = lookup_heading_policy(heading["text"])
-        if not policy or policy.get("canonical_en") != canonical_en:
-            continue
-
-        end_index = len(lines)
-        for index in range(start_index + 1, len(lines)):
-            if index in fenced:
-                continue
-            boundary = parse_atx_heading_line(lines[index].rstrip("\r\n"))
-            if boundary is not None and boundary["level"] == 2:
-                end_index = index
-                break
-        return "".join(lines[start_index + 1:end_index]), start_index + 1, end_index
-    return None
+    return _extract_level2_section_with_bounds(body, canonical_en)
 
 
 def _extract_rva_section(body: str) -> tuple[str, int, int] | None:
@@ -2356,8 +2330,16 @@ def main() -> int:
         is_canonical_parent = (
             resolution.status == "profile" and resolution.canonical_issue_kind == "parent"
         )
-        parent_has_vc_section = is_canonical_parent and bool(
-            extract_verification_commands_section(body)
+        # #2782 AC6: presence-only判定は truthiness / bool() ではなく
+        # `is not None` を使う。extract_verification_commands_section() の
+        # return contract は None（heading 不在）/ ""（heading 存在するが
+        # 本文空）/ non-empty str（heading 存在し本文あり）を区別する。
+        # bool() では "" と None が同じ False になり、「VC section が
+        # 実質的に存在しない」canonical parent のみを baseline preflight
+        # スキップ対象とする意図（heading が存在する以上、たとえ空でも
+        # parent author が VC に opt-in したとみなし実行する）が壊れる。
+        parent_has_vc_section = is_canonical_parent and (
+            extract_verification_commands_section(body) is not None
         )
         skip_preflight = is_canonical_parent and not parent_has_vc_section
         if not skip_preflight:
