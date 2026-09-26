@@ -48,6 +48,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
+# Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`). Pure
+# policy library only -- not a grammar library import.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_AGENT_OPS_DIR = _REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+from allowed_paths_policy import is_no_path_marker  # noqa: E402
+
 
 SCHEMA_VERSION = "issue_overlap_preflight/v1"
 
@@ -410,7 +418,14 @@ def extract_allowed_path_entries(body: str) -> List[str]:
     entries: List[str] = []
     for line in match.group(1).splitlines():
         stripped = line.strip()
-        if stripped and not stripped.startswith("#") and normalize_path(stripped):
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Issue #2783: judge no-path marker BEFORE normalize_path() (fixed
+        # order: wrapper strip -> marker match -> ordinary normalization).
+        # A marker line contributes 0 paths / entries.
+        if is_no_path_marker(stripped):
+            continue
+        if normalize_path(stripped):
             entries.append(stripped)
     return entries
 

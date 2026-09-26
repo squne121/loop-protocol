@@ -12,9 +12,18 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Sequence
+
+# Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`, this
+# module's own directory). Pure policy library only -- not a grammar
+# library import.
+_AGENT_OPS_DIR = Path(__file__).resolve().parent
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+from allowed_paths_policy import is_no_path_marker  # noqa: E402
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -88,14 +97,31 @@ def _allowed_paths(runner: Runner, root: Path, repo: str, issue_number: int) -> 
         return None, "allowed_paths_section_missing"
     section = body.split(marker, 1)[1].split("\n## ", 1)[0]
     paths = []
+    # Issue #2783: distinguish "section present but no bullet lines at all
+    # / all bullets blank" (malformed contract, unchanged
+    # `allowed_paths_empty`) from "section present + an explicit no-path
+    # marker bullet" (intentional no-mutation contract, new
+    # `allowed_paths_no_path_marker`). Both still resolve to a blocked,
+    # `allowed_paths is None` outcome upstream (0 declared paths means no
+    # source diff can ever be allowed by this fail-closed publish
+    # executor), but the reason_code now records WHY, instead of
+    # collapsing both into one ambiguous "empty" code.
+    saw_no_path_marker = False
     for line in section.splitlines():
         stripped = line.strip()
         if not stripped.startswith("-"):
+            continue
+        # Judge no-path marker BEFORE stripping the trailing backtick
+        # wrapper -- a marker line contributes 0 paths.
+        if is_no_path_marker(stripped):
+            saw_no_path_marker = True
             continue
         candidate = stripped[1:].strip().strip("`")
         if candidate:
             paths.append(candidate)
     if not paths:
+        if saw_no_path_marker:
+            return None, "allowed_paths_no_path_marker"
         return None, "allowed_paths_empty"
     return paths, None
 

@@ -31,6 +31,13 @@ _VC_SYNTAX_DIR = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "
 if str(_VC_SYNTAX_DIR) not in sys.path:
     sys.path.insert(0, str(_VC_SYNTAX_DIR))
 
+# Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`). This
+# module is a small pure policy library, not a grammar library import — do
+# not import anything else from it here.
+_AGENT_OPS_DIR = _REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+
 from vc_contract_syntax import (  # noqa: E402
     VALID_PRE_FLIGHT_SCOPE_VALUES,
     parse_ac_marker_line,
@@ -41,6 +48,7 @@ from vc_contract_syntax import (  # noqa: E402
 )
 import pnpm_gate_registry as pnpm_gate_registry  # noqa: E402
 import vc_runtime_history as _vc_runtime_history  # noqa: E402
+from allowed_paths_policy import is_no_path_marker  # noqa: E402
 
 
 # Issue #1333 AC1: per-command timeout の named constant。
@@ -750,16 +758,42 @@ def extract_allowed_paths(body: str) -> List[str]:
         return []
 
     section = match.group(1)
+
+    # Issue #2783 AC8: a code-fence-wrapped no-path marker (e.g.
+    # ```\n(none)\n```) spans multiple lines, so it must be recognized as a
+    # single wrapped entry BEFORE the per-line loop below (which otherwise
+    # would see the fence delimiters and inner content as separate lines).
+    # Judged identically to a bullet-wrapped marker: is_no_path_marker()
+    # itself performs the fence-stripping; here we only decide whether to
+    # blank the whole fence block out of the section (0 paths) or leave it
+    # untouched for the per-line loop's existing (unrelated) handling.
+    def _blank_fence_if_marker(fence_match: "re.Match[str]") -> str:
+        if is_no_path_marker(fence_match.group(0)):
+            return "\n" * fence_match.group(0).count("\n")
+        return fence_match.group(0)
+
+    section = re.sub(r"```[^\n]*\n.*?```", _blank_fence_if_marker, section, flags=re.DOTALL)
+
     paths = []
     for line in section.splitlines():
         stripped = line.strip()
+        if not stripped:
+            continue
         # Lines starting with a bullet marker (-, +, *) are list items
         if _ALLOWED_PATH_BULLET_RE.match(stripped):
+            # Issue #2783: judge no-path marker BEFORE annotation
+            # normalization (fixed order: wrapper strip -> marker match ->
+            # ordinary annotation normalization). A marker line contributes
+            # 0 paths.
+            if is_no_path_marker(stripped):
+                continue
             path = _normalize_allowed_path_entry(stripped)
             if path:
                 paths.append(path)
         # Also handle lines without bullet prefix (plain paths or backtick-wrapped)
-        elif stripped and not stripped.startswith("#"):
+        elif not stripped.startswith("#"):
+            if is_no_path_marker(stripped):
+                continue
             path = _normalize_allowed_path_entry(stripped)
             if path:
                 paths.append(path)

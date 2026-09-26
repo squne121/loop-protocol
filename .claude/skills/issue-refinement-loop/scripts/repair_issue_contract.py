@@ -58,6 +58,14 @@ try:
 except ImportError:  # pragma: no cover - defensive fallback (fail-closed, not fail-open)
     _canonical_parse_mrc = None
 
+# Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`). Pure
+# policy library only -- not a grammar library import.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_AGENT_OPS_DIR = _REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+from allowed_paths_policy import is_no_path_marker  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -677,6 +685,10 @@ def _extract_allowed_paths_ric(body: str) -> list:
     section = body[start:start + nxt.start()] if nxt else body[start:]
     paths = []
     for line in section.split('\n'):
+        # Issue #2783: judge no-path marker BEFORE the bullet-token regex
+        # below -- a marker line contributes 0 paths.
+        if is_no_path_marker(line.strip()):
+            continue
         lm = re.match(r'^\s*[-*]\s+`?([^`\s]+)`?\s*$', line)
         if lm:
             paths.append(lm.group(1))

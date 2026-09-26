@@ -18,6 +18,14 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+# Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`). Pure
+# policy library only -- not a grammar library import.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_AGENT_OPS_DIR = _REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+from allowed_paths_policy import is_no_path_marker  # noqa: E402
+
 EVIDENCE_SCHEMA = "IMPLEMENTATION_LANDED_EVIDENCE_V1"
 COVERAGE_SCHEMA = "IMPLEMENTATION_SCOPE_COVERAGE_V1"
 MANIFEST_SCHEMA = "IMPLEMENTATION_SCOPE_MANIFEST_V1"
@@ -97,7 +105,15 @@ def build_scope_manifest(issue_body: str) -> dict[str, Any]:
         "change_kind": str(contract.get("change_kind") or "").strip(),
         "in_scope": _list_items(_section(issue_body, "In Scope")),
         "acceptance_criteria": _list_items(_section(issue_body, "Acceptance Criteria"), acceptance=True),
-        "allowed_paths": _list_items(_section(issue_body, "Allowed Paths")),
+        # Issue #2783: a canonical `(none)` / legacy
+        # `読み取り専用。リポジトリ変更なし（既定）` no-path marker entry
+        # contributes 0 allowed_paths, unlike "In Scope" / "Acceptance
+        # Criteria" bullets (where `_list_items()` above is intentionally
+        # unmodified -- this filtering is Allowed-Paths-specific, not a
+        # change to the shared list-item extractor).
+        "allowed_paths": [
+            p for p in _list_items(_section(issue_body, "Allowed Paths")) if not is_no_path_marker(p)
+        ],
     }
 
 

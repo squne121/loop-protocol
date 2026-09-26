@@ -78,3 +78,18 @@ def test_is_docs_only_allowed_paths_false_when_empty():
 def test_has_code_or_runtime_scope():
     assert pc.has_code_or_runtime_scope(["docs/x.md", "src/runtime.ts"]) is True
     assert pc.has_code_or_runtime_scope(["docs/x.md", "CLAUDE.md"]) is False
+
+
+def test_extract_allowed_paths_no_path_marker_returns_empty():
+    """AC12 (Issue #2783): canonical marker `(none)` and legacy marker
+    `読み取り専用。リポジトリ変更なし（既定）` as the sole Allowed Paths entry
+    both resolve to []."""
+    body_canonical = "## Allowed Paths\n\n- (none)\n\n## Stop Conditions\n\n- 1\n"
+    assert pc.extract_allowed_paths(body_canonical) == []
+
+    body_legacy = (
+        "## Allowed Paths\n\n"
+        "- 読み取り専用。リポジトリ変更なし（既定）\n\n"
+        "## Stop Conditions\n\n- 1\n"
+    )
+    assert pc.extract_allowed_paths(body_legacy) == []

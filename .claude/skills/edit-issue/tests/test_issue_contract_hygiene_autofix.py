@@ -795,3 +795,21 @@ def test_vc_shape_mixed_changed_and_not_autofixable_fails_closed():
             probe_file.parent.rmdir()
         except OSError:
             pass  # never remove the shared "scripts/" parent directory
+
+
+def test_parse_allowed_paths_no_path_marker_returns_empty():
+    """AC12 (Issue #2783): canonical marker `(none)` and legacy marker
+    `読み取り専用。リポジトリ変更なし（既定）` as the sole Allowed Paths entry
+    both resolve to [] (the missing-section sentinel `None` is reserved for
+    "no ## Allowed Paths section at all", unaffected by this fix). Before
+    Issue #2783 this module had no annotation stripping at all, so both
+    markers leaked as literal non-empty "path" strings."""
+    autofix = _load_autofix_module()
+
+    lines_canonical = "## Allowed Paths\n\n- (none)\n\n## Stop Conditions\n".split("\n")
+    assert autofix.parse_allowed_paths(lines_canonical) == []
+
+    lines_legacy = (
+        "## Allowed Paths\n\n- 読み取り専用。リポジトリ変更なし（既定）\n\n## Stop Conditions\n"
+    ).split("\n")
+    assert autofix.parse_allowed_paths(lines_legacy) == []

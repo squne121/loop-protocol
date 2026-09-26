@@ -201,3 +201,48 @@ def test_given_target_moves_after_preflight_when_publishing_then_lease_rejects_w
     assert _git(bare, "rev-parse", "refs/heads/target") == competing_head
     assert runner.publish_argv is not None
     assert f"--force-with-lease=refs/heads/target:{base}" in runner.publish_argv
+
+
+def test_allowed_paths_missing_vs_explicit_none_distinguished(replay_repo):
+    """AC13 (Issue #2783): `_allowed_paths()` distinguishes "Allowed Paths
+    section missing" (malformed contract, `allowed_paths_section_missing`,
+    unchanged) from "Allowed Paths section present + explicit `(none)`"
+    (intentional no-mutation contract, new
+    `allowed_paths_no_path_marker`). Both still resolve to a blocked
+    outcome (0 declared paths means no source diff can ever be allowed),
+    but the reason_code now records WHY instead of collapsing both into
+    one ambiguous "empty" code."""
+    repo, bare, base = replay_repo
+    head = _commit(repo, "allowed.txt", "source\n", "approved source")
+    original = _git(bare, "rev-parse", "refs/heads/target")
+
+    # Section missing entirely.
+    body_missing = "## Stop Conditions\n\n- none\n"
+    result_missing, _ = _execute(repo, bare, base, head, body_missing)
+    assert result_missing["status"] == "blocked"
+    assert result_missing["errors"] == ["allowed_paths_section_missing"]
+    assert _git(bare, "rev-parse", "refs/heads/target") == original
+
+    # Section present, explicit canonical no-path marker.
+    body_canonical_marker = "## Allowed Paths\n\n- (none)\n\n## Stop Conditions\n\n- none\n"
+    result_canonical, _ = _execute(repo, bare, base, head, body_canonical_marker)
+    assert result_canonical["status"] == "blocked"
+    assert result_canonical["errors"] == ["allowed_paths_no_path_marker"]
+    assert _git(bare, "rev-parse", "refs/heads/target") == original
+
+    # Section present, explicit legacy no-path marker.
+    body_legacy_marker = (
+        "## Allowed Paths\n\n- 読み取り専用。リポジトリ変更なし（既定）\n\n## Stop Conditions\n\n- none\n"
+    )
+    result_legacy, _ = _execute(repo, bare, base, head, body_legacy_marker)
+    assert result_legacy["status"] == "blocked"
+    assert result_legacy["errors"] == ["allowed_paths_no_path_marker"]
+    assert _git(bare, "rev-parse", "refs/heads/target") == original
+
+    # Section present but genuinely empty (malformed contract, no bullet
+    # lines at all) -- distinct from the marker case, unchanged reason_code.
+    body_empty_section = "## Allowed Paths\n\n## Stop Conditions\n\n- none\n"
+    result_empty, _ = _execute(repo, bare, base, head, body_empty_section)
+    assert result_empty["status"] == "blocked"
+    assert result_empty["errors"] == ["allowed_paths_empty"]
+    assert _git(bare, "rev-parse", "refs/heads/target") == original
