@@ -382,6 +382,119 @@ def lookup_heading_policy(heading_text: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# level-2 canonical section extraction（#2782: single authority for section
+# boundary determination, shared by baseline_vc_preflight.py's
+# extract_verification_commands_section() and contract_readiness_check.py's
+# _extract_section_by_canonical_name()）
+# ---------------------------------------------------------------------------
+
+
+def _fenced_line_indices(body: str) -> frozenset[int]:
+    """
+    body 内の fenced code block（``` / ~~~）が占有する 0-based 行インデックス集合を返す。
+
+    iter_markdown_blocks() の GFM 準拠 fence 判定（indent 0-3、backtick/tilde
+    種別・長さ一致の closing、未閉 fence は EOF まで code とみなす）をそのまま
+    再利用する。section 抽出の見出し境界判定が fenced code block 内の擬似
+    `##` 行を見出しとして誤認しないようにするための補助 index。
+    """
+    indices: set[int] = set()
+    line_index = 0
+    for block_text, block_kind in iter_markdown_blocks(body):
+        line_count = len(block_text.splitlines(keepends=True))
+        if block_kind == BLOCK_KIND_CODE_FENCE:
+            indices.update(range(line_index, line_index + line_count))
+        line_index += line_count
+    return frozenset(indices)
+
+
+def extract_level2_section_with_bounds(
+    body: str, canonical_en: str
+) -> tuple[str, int, int] | None:
+    """
+    body から canonical_en に対応する level-2（``##``）見出しセクションを、
+    本文テキストと 0-based の [start_index, end_index) 行範囲つきで抽出する。
+
+    section boundary algorithm の単一 authority（#2782）。
+    `baseline_vc_preflight.py::extract_verification_commands_section()` と
+    `contract_readiness_check.py::_extract_section_by_canonical_name()` は
+    いずれもこの関数（または `extract_level2_section()`）へ委譲し、
+    見出し境界判定ロジックの独立コピーを持たない。
+
+    判定規則:
+      - fenced code block 内の行は見出し候補として扱わない
+        （``_fenced_line_indices`` で fence 占有行を事前に除外）
+      - 見出し行の解析・GFM closing-hash 除去・indent 許容は
+        ``parse_atx_heading_line()`` に委譲する
+      - 見出しテキストの canonical 名解決（日英表記ゆれ・括弧付き表記含む）は
+        ``lookup_heading_policy()`` に委譲する
+      - target セクションの終端は、target セクション内で最初に現れる
+        「fenced code block 外の level-2（``##``）見出し」（canonical 名が
+        一致するか否かを問わない）とする。level-3 以降の nested 見出し
+        （例: ``### Runtime checks``）はセクションを終端させない
+
+    Returns:
+        None                        -- canonical_en に一致する見出しが存在しない
+        (text, start_index, end_index) -- 見出しが存在する場合。
+          text は見出し行を含まない本文（末尾の次見出し直前まで、raw）。
+          start_index は本文の開始行（見出し行の次の行）、
+          end_index は本文終了直後の行（次の level-2 見出し行、または EOF）。
+          text が空/空白のみでも tuple は返す（emptiness 判定は
+          ``extract_level2_section()`` の呼び出し側が行う）。
+    """
+    lines = body.splitlines(keepends=True)
+    fenced = _fenced_line_indices(body)
+
+    for start_index, line in enumerate(lines):
+        if start_index in fenced:
+            continue
+        heading = parse_atx_heading_line(line.rstrip("\r\n"))
+        if heading is None or heading["level"] != 2:
+            continue
+        policy = lookup_heading_policy(heading["text"])
+        if not policy or policy.get("canonical_en") != canonical_en:
+            continue
+
+        end_index = len(lines)
+        for index in range(start_index + 1, len(lines)):
+            if index in fenced:
+                continue
+            boundary = parse_atx_heading_line(lines[index].rstrip("\r\n"))
+            if boundary is not None and boundary["level"] == 2:
+                end_index = index
+                break
+        return "".join(lines[start_index + 1:end_index]), start_index + 1, end_index
+
+    return None
+
+
+def extract_level2_section(body: str, canonical_en: str) -> str | None:
+    """
+    body から canonical_en に対応する level-2（``##``）見出しセクションの
+    本文テキストのみを抽出する（`extract_level2_section_with_bounds()` の
+    薄いラッパー。行範囲が不要な consumer 向け）。
+
+    Return contract（#2782 AC4 — 呼び出し側は必ずこの 3 値を区別すること）:
+      None            -- heading 不在（canonical_en に一致する ``##`` 見出しが
+                          body に存在しない）
+      ""              -- heading 存在するが本文が空、または空白のみ
+      non-empty str   -- heading 存在し、本文に内容がある（raw text。
+                          先頭に見出し直後の改行を含みうる）
+
+    presence のみを判定する consumer は必ず ``is not None`` を使うこと。
+    truthiness / ``bool()`` は "" と None を区別できないため使用しない
+    （#2782 P1 — PR #2780 OWNER review comment F2 の指摘）。
+    """
+    result = extract_level2_section_with_bounds(body, canonical_en)
+    if result is None:
+        return None
+    text, _start_index, _end_index = result
+    if not text.strip():
+        return ""
+    return text
+
+
+# ---------------------------------------------------------------------------
 # GFM ATX heading parser（B2: #654）
 # ---------------------------------------------------------------------------
 
