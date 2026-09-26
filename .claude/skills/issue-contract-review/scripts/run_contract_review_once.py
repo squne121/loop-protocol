@@ -195,7 +195,14 @@ def _resolve_delivery_rollup_applicability(body: str) -> DeliveryRollupApplicabi
             reason_code=None,
             body_sha256=body_sha256,
         )
-    if extract_verification_commands_section(body):
+    # #2782 AC5: presence-only判定は truthiness ではなく `is not None` を使う。
+    # extract_verification_commands_section() の return contract は None
+    # （heading 不在）/ ""（heading 存在するが本文空）/ non-empty str
+    # （heading 存在し本文あり）を区別する。truthiness では "" と None が
+    # 同じ False になり、delivery-rollup parent が空の VC section を持つ
+    # だけで（本来 "vc_section_present" とすべきところ）誤って
+    # applicable=True（適用除外）側に倒れてしまう。
+    if extract_verification_commands_section(body) is not None:
         return DeliveryRollupApplicability(
             applicable=False,
             issue_kind=resolution.canonical_issue_kind,
