@@ -120,6 +120,10 @@ PR が schema を変更しうると判断される場合:
 
 `Not controlled` 列が非空の際は bounded な主張であること、証跡一致、必要 follow-up があることを確認。
 
+### 4.6b) Enumerated / Exhaustive Claim Evidence Coverage（有限列挙・全称 Claim の証拠基準、Issue #2765）
+
+AC または Safety Claim Matrix の Claim が有限集合について all / each / 全対応 / 非回帰などの exhaustive completeness を主張する場合（単なる例示列挙は対象外）、aggregate な suite/class の PASS 件数のみを直接 coverage evidence として受理せず、各列挙ケースについて **case identity AND relevant executable assertion が PASS していること** を確認する（詳細: `references/ac-evidence-checks.md`）。skip / xfail / 未実行は AC が明示的に許可しない限り direct evidence にしない。Safety Claim Matrix は claim-to-evidence coverage とし、Evidence が test の場合のみ同 rule を適用する（詳細: `references/safety-claim-gate.md`）。1ケースでも欠落する場合は current-head CI が green でも `REQUEST_CHANGES` blocker とする。この判定ステップへ実際に到達した場合、出力に `PR_REVIEW_JUDGE_EVIDENCE_COVERAGE_RULE_APPLIED` を含める。
+
 ### 4.7) Clean-Room Review（grounded_research / 認証 surface 変更）
 
 grounded_research 関連（`.claude/skills/gemini-cli-headless-delegation/**` の
@@ -261,9 +265,9 @@ script が計算するのは G1–G5（`references/deterministic-gates.md`）等
 
 - `references/evidence-policy.md`: 証拠優先度、`PR_BODY_SELF_REPORT_ONLY_APPROVE_PROHIBITED`、APPROVE 禁止条件。
 - `references/ci-verdict-summary.md`: `ci_verdict_summary.py` の判定規則。
-- `references/ac-evidence-checks.md`: AC coverage、Allowed Paths、runtime evidence、placeholder 判定。
+- `references/ac-evidence-checks.md`: AC coverage、Allowed Paths、runtime evidence、placeholder 判定、finite/exhaustive claim の case-level evidence coverage（Issue #2765）。
 - `references/schema-consumer-gate.md`: schema_change_applicability と `Schema Consumer Inventory` 判定。
-- `references/safety-claim-gate.md`: safety-sensitive 判定と `Safety Claim Matrix` 要件。
+- `references/safety-claim-gate.md`: safety-sensitive 判定と `Safety Claim Matrix` 要件、claim-to-evidence coverage（Issue #2765）。
 - `references/loop-verdict-v2-schema.md`: 最小 convention の必須フィールド。
 - `references/allowed-paths-gate.md`: `ALLOWED_PATHS_GATE_RESULT_V1` の再計算手順。
 - `references/required-auto-actions.md`: 機械的に対応可能な不備の blockers への反映方針。
