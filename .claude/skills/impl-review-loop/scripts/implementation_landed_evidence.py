@@ -713,11 +713,18 @@ def _live_freshness_reference(
     (transport failure is treated as non-fresh, never as a silent match) --
     EXCEPT for a candidate already qualified as an irrelevant sibling cross-
     reference (#2750 carve-out) at collection time (research Issue #2761):
-    its own transport failure or head drift must not block the current
-    target's disposition. That candidate's qualification is independently
-    re-derived here from a freshly re-fetched `body`/`closingIssuesReferences`
-    (AC1's "decision-time の live body 再解析" -- never trusted from the
-    collection-time snapshot alone, and never required to byte-match it)."""
+    its head-identity DRIFT alone must not block the current target's
+    disposition, once its irrelevance has been FRESHLY reconfirmed from this
+    candidate's own successfully-fetched, fully-typed live `body`/
+    `closingIssuesReferences` (AC1's "decision-time の live body 再解析" --
+    never trusted from the collection-time snapshot alone, and never
+    required to byte-match it). A transport/parse failure on THIS
+    candidate's own live re-fetch, or a `body`/`closingIssuesReferences`
+    field that is missing/None/wrong-type, is authority-UNCONFIRMED -- never
+    silently treated as "still irrelevant" -- so it is NOT excluded from the
+    freshness identity requirement and drives `ok=False` /
+    `freshness_rebind_failed` like any other unconfirmed candidate (research
+    Issue #2761 P1-1/P1-2)."""
     rc, out, _ = run_command(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"])
     issue_body_sha256: str | None = None
     live_issue_body: str | None = None
@@ -739,6 +746,16 @@ def _live_freshness_reference(
     candidate_identity: dict[int, str | None] = {}
     excluded_candidate_numbers: set[int] = set()
     candidate_live_updates: dict[int, dict[str, Any]] = {}
+    # research Issue #2761 P1-1/P1-2: a previously-qualified-irrelevant
+    # candidate whose decision-time live authority (this candidate's own
+    # `gh pr view` transport/parse, or its `body`/`closingIssuesReferences`
+    # field shape) could not be fully verified. Tracked SEPARATELY from
+    # `candidate_identity` because a malformed-but-present `body`/
+    # `closingIssuesReferences` payload still carries a perfectly valid
+    # `headRefOid`/`mergeCommit` identity -- relying on `candidate_identity`
+    # alone (as a `None` proxy for "unconfirmed") would silently miss this
+    # case and fail back open.
+    unconfirmed_qualified_irrelevant_numbers: set[int] = set()
     for candidate in candidates:
         if not isinstance(candidate, Mapping):
             continue
@@ -768,18 +785,40 @@ def _live_freshness_reference(
 
         if not previously_qualified_irrelevant:
             continue
-        if c_payload is None or live_issue_body is None:
-            # Cannot reconfirm live (transport/parse failure on THIS
-            # candidate, or the current target's own live body itself could
-            # not be fetched). An already-established-irrelevant sibling's
-            # inability to be reconfirmed must not propagate to the current
-            # target -- the collection-time classification is retained, and
-            # this candidate's identity is excluded from the freshness match
-            # requirement below.
-            excluded_candidate_numbers.add(number)
+        # research Issue #2761 P1-1/P1-2: a collection-time-qualified
+        # irrelevant sibling's decision-time re-confirmation is only trusted
+        # from FULLY verified fresh authority -- this candidate's own
+        # `gh pr view` transport/parse succeeding AND yielding a `body`
+        # string AND a `closingIssuesReferences` list. Any of those being
+        # missing/None/wrong-type (or the current target's own live body
+        # itself failing to fetch) means negative qualification cannot be
+        # freshly re-derived: this candidate is UNKNOWN, never silently
+        # re-confirmed as "still irrelevant". Recorded in
+        # `unconfirmed_qualified_irrelevant_numbers`, which independently
+        # forces `ok=False` below -- unlike the previous fail-open behavior,
+        # this does NOT rely on `candidate_identity[number]` happening to be
+        # `None` (a malformed `body`/`closingIssuesReferences` payload can
+        # still carry a perfectly valid `headRefOid`/`mergeCommit`).
+        if c_payload is None:
+            unconfirmed_qualified_irrelevant_numbers.add(number)
             continue
-        live_body = c_payload.get("body") if isinstance(c_payload.get("body"), str) else ""
-        live_refs = c_payload.get("closingIssuesReferences") or []
+        raw_body = c_payload.get("body")
+        raw_refs = c_payload.get("closingIssuesReferences")
+        if not isinstance(raw_body, str) or not isinstance(raw_refs, list):
+            # Field missing/None/wrong-type is authority-UNCONFIRMED, never
+            # equivalent to a verified empty `closingIssuesReferences: []`
+            # (which legitimately means "confirmed: no closing relation").
+            unconfirmed_qualified_irrelevant_numbers.add(number)
+            continue
+        if live_issue_body is None:
+            # The current target's own live body could not be fetched, so
+            # body-coverage cannot be freshly re-derived for anyone.
+            # `issue_body_sha256` is already `None` here, which
+            # independently drives `ok=False` below.
+            unconfirmed_qualified_irrelevant_numbers.add(number)
+            continue
+        live_body = raw_body
+        live_refs = raw_refs
         live_closing = any(isinstance(ref, Mapping) and ref.get("number") == issue_number for ref in live_refs)
         live_coverage = coverage_from_pr_body(
             pr_body=live_body, issue_number=issue_number, live_issue_body=live_issue_body
@@ -802,6 +841,7 @@ def _live_freshness_reference(
     ok = (
         issue_body_sha256 is not None
         and main_head_sha is not None
+        and not unconfirmed_qualified_irrelevant_numbers
         and all(
             identity is not None
             for number, identity in candidate_identity.items()
@@ -810,6 +850,7 @@ def _live_freshness_reference(
     )
     return {
         "ok": ok,
+        "unconfirmed_qualified_irrelevant_numbers": unconfirmed_qualified_irrelevant_numbers,
         "issue_body_sha256": issue_body_sha256,
         "main_head_sha": main_head_sha,
         "candidate_identity": candidate_identity,

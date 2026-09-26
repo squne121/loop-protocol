@@ -7,6 +7,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / ".claude/skills/impl-review-loop/scripts/implementation_landed_evidence.py"
@@ -25,6 +26,14 @@ route_spec.loader.exec_module(route_mod)
 REPO = "squne121/loop-protocol"
 ISSUE = 2119
 SHA = "a" * 40
+
+# Sentinels for `_build_pipeline_run()`'s sibling live-field overrides
+# (research Issue #2761 P1-2 regressions): `_UNSET` means "use the default
+# derivation", `_MISSING_FIELD` means "omit the key entirely from the live
+# `gh pr view` JSON payload" (distinct from an explicit `None` value, which
+# callers pass directly as the override).
+_UNSET = object()
+_MISSING_FIELD = object()
 
 
 def _candidate(
@@ -1144,6 +1153,8 @@ def _build_pipeline_run(
     sibling_live_closing: bool = False,
     sibling_ancestry_call_should_fail: bool = True,
     sibling_light_fetch_fails: bool = False,
+    sibling_live_body_field_override: Any = _UNSET,
+    sibling_live_refs_field_override: Any = _UNSET,
     main_sha: str = "9" * 40,
 ):
     """Production-shaped `run_command` mock covering the FULL
@@ -1229,19 +1240,23 @@ def _build_pipeline_run(
                     if sibling_light_fetch_fails:
                         return 1, "", "simulated sibling live fetch transport failure"
                     refs = [{"number": ISSUE}] if sibling_live_closing else [{"number": _SIBLING_OTHER_ISSUE}]
-                    return (
-                        0,
-                        json.dumps(
-                            {
-                                "headRefOid": sibling_live_head_sha,
-                                "mergedAt": sibling_shape["merged_at"],
-                                "mergeCommit": sibling_merge_commit_live,
-                                "body": sibling_live_body,
-                                "closingIssuesReferences": refs,
-                            }
-                        ),
-                        "",
-                    )
+                    if sibling_live_refs_field_override is not _UNSET:
+                        refs = sibling_live_refs_field_override
+                    body_value = sibling_live_body
+                    if sibling_live_body_field_override is not _UNSET:
+                        body_value = sibling_live_body_field_override
+                    live_payload = {
+                        "headRefOid": sibling_live_head_sha,
+                        "mergedAt": sibling_shape["merged_at"],
+                        "mergeCommit": sibling_merge_commit_live,
+                        "body": body_value,
+                        "closingIssuesReferences": refs,
+                    }
+                    if live_payload["body"] is _MISSING_FIELD:
+                        del live_payload["body"]
+                    if live_payload["closingIssuesReferences"] is _MISSING_FIELD:
+                        del live_payload["closingIssuesReferences"]
+                    return (0, json.dumps(live_payload), "")
                 return 1, "", f"unexpected light-field pr view for {number}"
             if number == str(_REAL_PR):
                 return (
@@ -1618,15 +1633,18 @@ def test_collect_candidate_inputs_compound_marker_error_sibling_is_not_qualified
 
 
 def test_freshness_rebind_open_draft_sibling_head_drift_does_not_fail_target_freshness():
-    """AC2 (scenario 11): GIVEN an open/draft `verified_cross_reference`
-    sibling candidate already qualified irrelevant at collection time, whose
-    live `headRefOid` DRIFTS between collection and decision time (still
-    freshly reconfirmed irrelevant otherwise) WHEN `resolve_landing_
-    disposition_with_freshness_rebind()` runs THEN this head drift does not
-    cause `freshness_rebind_failed`/`reconciliation_required` for the
-    current target -- the genuine current-target candidate still reaches
-    `implementation_already_landed`."""
-    for lifecycle in ("open", "draft"):
+    """AC2/AC6 (scenario 11, extended by research Issue #2761 P2-3): GIVEN
+    an open/draft/closed-unmerged `verified_cross_reference` sibling
+    candidate already qualified irrelevant at collection time, whose live
+    `headRefOid` DRIFTS between collection and decision time (still freshly
+    reconfirmed irrelevant otherwise, from FRESH decision-time body +
+    closing-relation authority) WHEN `resolve_landing_disposition_with_
+    freshness_rebind()` runs THEN this head drift does not cause
+    `freshness_rebind_failed`/`reconciliation_required` for the current
+    target -- the genuine current-target candidate still reaches
+    `implementation_already_landed` -- including for a CLOSED-UNMERGED
+    sibling, not just open/draft."""
+    for lifecycle in ("open", "draft", "closed_unmerged"):
         run, _calls = _build_pipeline_run(
             sibling_lifecycle=lifecycle,
             sibling_collect_head_sha="2" * 40,
@@ -1637,3 +1655,82 @@ def test_freshness_rebind_open_draft_sibling_head_drift_does_not_fail_target_fre
         )
         assert result["decision_time_rebind"]["status"] == "fresh", lifecycle
         assert result["landing_disposition"]["disposition"] == "implementation_already_landed", lifecycle
+
+
+def test_freshness_rebind_qualified_sibling_decision_time_fetch_failure_is_unknown_not_confirmed_irrelevant():
+    """research Issue #2761 P1-1/P2-1 (blocker regression): GIVEN a
+    collection-time-qualified-irrelevant `verified_cross_reference` sibling
+    candidate whose decision-time `gh pr view` (`_LIVE_CANDIDATE_REFRESH_
+    FIELDS`) transport call FAILS WHEN `resolve_landing_disposition_with_
+    freshness_rebind()` runs THEN the candidate is treated as UNKNOWN, never
+    as "still confirmed irrelevant" -- fresh authority (`body`/
+    `closingIssuesReferences`) could not be re-derived, so it is NOT
+    excluded from the freshness identity requirement, and (after the
+    existing bounded retry, which also cannot reconfirm it because the same
+    transport failure persists) the overall result is `reconciliation_
+    required` / `freshness_rebind_failed` -- exactly the same fail-closed
+    outcome as any other decision-time transport failure, never a silent
+    fail-open pass-through for the current target."""
+    run, _calls = _build_pipeline_run(sibling_lifecycle="merged", sibling_light_fetch_fails=True)
+    result = mod.resolve_landing_disposition_with_freshness_rebind(
+        repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+    )
+    assert result["decision_time_rebind"]["status"] == "stale"
+    assert result["landing_disposition"]["disposition"] == "reconciliation_required"
+    assert result["landing_disposition"]["reason_codes"] == ["freshness_rebind_failed"]
+
+
+def test_freshness_rebind_qualified_sibling_unverified_closing_authority_is_not_confirmed_irrelevant():
+    """research Issue #2761 P1-2/P2-2 (blocker regression, parameterized):
+    GIVEN a collection-time-qualified-irrelevant `verified_cross_reference`
+    sibling candidate whose decision-time `gh pr view` response has a
+    `body` or `closingIssuesReferences` field that is MISSING / `None` /
+    the wrong type WHEN `resolve_landing_disposition_with_freshness_
+    rebind()` runs THEN that field-level ambiguity is never treated as
+    "verified: no closing relation" or "verified: empty body" -- the
+    candidate's fresh negative qualification cannot be re-derived, so it
+    stays UNKNOWN (not excluded from the freshness identity requirement),
+    and the bounded-retried result is `reconciliation_required` /
+    `freshness_rebind_failed` in every boundary case."""
+    boundary_cases = (
+        ("body", _MISSING_FIELD),
+        ("body", None),
+        ("body", 12345),
+        ("closingIssuesReferences", _MISSING_FIELD),
+        ("closingIssuesReferences", None),
+        ("closingIssuesReferences", "not-a-list"),
+    )
+    for field, bad_value in boundary_cases:
+        overrides = {
+            "sibling_live_body_field_override": bad_value if field == "body" else _UNSET,
+            "sibling_live_refs_field_override": bad_value if field == "closingIssuesReferences" else _UNSET,
+        }
+        run, _calls = _build_pipeline_run(sibling_lifecycle="merged", **overrides)
+        result = mod.resolve_landing_disposition_with_freshness_rebind(
+            repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+        )
+        label = f"{field}={bad_value!r}"
+        assert result["decision_time_rebind"]["status"] == "stale", label
+        assert result["landing_disposition"]["disposition"] == "reconciliation_required", label
+        assert result["landing_disposition"]["reason_codes"] == ["freshness_rebind_failed"], label
+
+
+def test_freshness_rebind_qualified_sibling_verified_empty_closing_refs_still_confirms_irrelevant():
+    """research Issue #2761 P1-2 (positive control): GIVEN a collection-
+    time-qualified-irrelevant sibling candidate whose decision-time
+    `closingIssuesReferences` is a VERIFIED (successfully fetched, correctly
+    typed) empty list `[]` WHEN `resolve_landing_disposition_with_
+    freshness_rebind()` runs THEN this is treated as "confirmed: no closing
+    relation" (not as unconfirmed authority) -- the sibling's fresh negative
+    qualification succeeds normally and the genuine current-target candidate
+    still reaches `implementation_already_landed`, proving `[]` and
+    missing/None/invalid-type are NOT conflated."""
+    run, _calls = _build_pipeline_run(
+        sibling_lifecycle="merged",
+        sibling_live_refs_field_override=[],
+    )
+    result = mod.resolve_landing_disposition_with_freshness_rebind(
+        repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+    )
+    assert result["decision_time_rebind"]["status"] == "fresh"
+    assert result["landing_disposition"]["disposition"] == "implementation_already_landed"
