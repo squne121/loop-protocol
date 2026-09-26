@@ -78,6 +78,15 @@ def test_redact_fully_redacts_new_installation_token() -> None:
     assert redacted == "before [REDACTED] after"
 
 
+# Canonical string identity of the specific-before-legacy broad ``ghs_``
+# matcher under test. Using exact pattern-string identity (rather than a
+# substring heuristic like ``"{36,}" not in pattern.pattern``) ensures this
+# selector only ever targets *this* matcher: an unrelated future matcher for
+# a different prefix (e.g. ``ghp_``) that happens to also adopt a
+# ``{36,}`` quantifier must not be silently swept up by this test.
+_BROAD_GHS_PATTERN = r"ghs_[A-Za-z0-9._-]{36,}"
+
+
 def test_self_check_redaction_detects_partial_redaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -93,20 +102,71 @@ def test_self_check_redaction_detects_partial_redaction(
     live `_SECRET_PATTERNS` list for the duration of this test only, so the
     fix under test (the broad matcher itself) is never touched.
     """
+    # Sanity: exactly one pattern in the live list must match the canonical
+    # broad ghs_ matcher string. If this fails, either the matcher was
+    # removed/renamed or duplicated, and the exact-identity selector below
+    # would silently target the wrong (or no) matcher.
+    broad_matches = [
+        pattern
+        for pattern in srrs._SECRET_PATTERNS
+        if pattern.pattern == _BROAD_GHS_PATTERN
+    ]
+    assert len(broad_matches) == 1
+
     legacy_only_patterns = [
         pattern
         for pattern in srrs._SECRET_PATTERNS
-        if "{36,}" not in pattern.pattern
+        if pattern.pattern != _BROAD_GHS_PATTERN
     ]
 
     # Sanity: the legacy-only list must still contain the pre-existing
     # legacy ghs_ matcher (otherwise this test would not reproduce the
-    # pre-fix scenario), and must have dropped the new broad matcher.
+    # pre-fix scenario), and must have dropped only the broad matcher.
     assert any(p.pattern == r"ghs_[0-9A-Za-z]+" for p in legacy_only_patterns)
-    assert not any("{36,}" in p.pattern for p in legacy_only_patterns)
+    assert not any(p.pattern == _BROAD_GHS_PATTERN for p in legacy_only_patterns)
     assert len(legacy_only_patterns) == len(srrs._SECRET_PATTERNS) - 1
 
     monkeypatch.setattr(srrs, "_SECRET_PATTERNS", legacy_only_patterns)
+
+    assert srrs._self_check_redaction() is False
+
+
+def test_self_check_redaction_detects_dash_dropped_from_broad_matcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GIVEN _SECRET_PATTERNS' broad ghs_ matcher mutated so the "-"
+    character class is dropped (``ghs_[A-Za-z0-9._-]{36,}`` regressed to
+    ``ghs_[A-Za-z0-9._]{36,}``), with the legacy ``ghs_[0-9A-Za-z]+``
+    matcher left untouched
+    WHEN _self_check_redaction() runs
+    THEN it returns False, because the production self-check sample must
+    itself contain a "-" so this specific regression is caught (fixes the
+    false-green where a synthetic sample without "-" would still pass even
+    after "-" support silently regressed).
+
+    This does not mutate the production module file; it monkeypatches the
+    live `_SECRET_PATTERNS` list for the duration of this test only.
+    """
+    broad_matches = [
+        pattern
+        for pattern in srrs._SECRET_PATTERNS
+        if pattern.pattern == _BROAD_GHS_PATTERN
+    ]
+    assert len(broad_matches) == 1
+
+    dash_dropped_pattern = re.compile(r"ghs_[A-Za-z0-9._]{36,}")
+
+    mutated_patterns = [
+        dash_dropped_pattern if pattern.pattern == _BROAD_GHS_PATTERN else pattern
+        for pattern in srrs._SECRET_PATTERNS
+    ]
+
+    # Sanity: the legacy ghs_ matcher must still be present and untouched.
+    assert any(p.pattern == r"ghs_[0-9A-Za-z]+" for p in mutated_patterns)
+    assert not any(p.pattern == _BROAD_GHS_PATTERN for p in mutated_patterns)
+    assert len(mutated_patterns) == len(srrs._SECRET_PATTERNS)
+
+    monkeypatch.setattr(srrs, "_SECRET_PATTERNS", mutated_patterns)
 
     assert srrs._self_check_redaction() is False
 

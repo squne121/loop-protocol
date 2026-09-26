@@ -767,13 +767,24 @@ def _self_check_redaction() -> bool:
     # present, but unredacted fragments still leak). Verify instead that
     # a standalone new-format token is redacted to exactly
     # "[REDACTED]" with nothing left over.
+    #
+    # The synthetic sample below mirrors the structural properties of a
+    # real new-format token (exactly two "." JWS segment delimiters, at
+    # least one "_", at least one "-", and a length representative of a
+    # real ~520-char GitHub App installation token) so that dropping the
+    # "-" character class from the broad ghs_ matcher (regressing it to
+    # ``ghs_[A-Za-z0-9._]{36,}``) is caught by this self-check instead of
+    # producing a false-green PASS. This is a synthetic fixture only — it
+    # is not, and must never be, a real credential.
     new_format_sample = (
         "ghs_1234567_"
-        + ("a" * 40)
+        + ("a" * 50)
         + "."
-        + ("b" * 200)
+        + ("b" * 300)
+        + "-"
+        + ("d" * 100)
         + "."
-        + ("c" * 40)
+        + ("c" * 60)
     )
     if redact(new_format_sample) != "[REDACTED]":
         return False
