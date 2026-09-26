@@ -138,6 +138,13 @@ _SECRET_PATTERNS = [
     re.compile(r"github_pat_[0-9A-Za-z_]+"),
     re.compile(r"gho_[0-9A-Za-z]+"),
     re.compile(r"ghu_[0-9A-Za-z]+"),
+    # New-format GitHub App installation token:
+    # ghs_<APP_ID>_<JWT-header>.<payload>.<signature>
+    # Must be evaluated before the legacy ghs_ matcher below
+    # (specific-before-legacy) so the full token — including the
+    # JWS Compact Serialization "." delimiters — is redacted instead
+    # of only the fragment up to the first "_" after the APP_ID.
+    re.compile(r"ghs_[A-Za-z0-9._-]{36,}"),
     re.compile(r"ghs_[0-9A-Za-z]+"),
     re.compile(r"ghr_[0-9A-Za-z]+"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
@@ -750,6 +757,27 @@ def _self_check_redaction() -> bool:
     for raw in samples:
         if raw in redact(raw):
             return False
+
+    # New-format GitHub App installation token
+    # (ghs_<APP_ID>_<JWT-header>.<payload>.<signature>): a partial-match
+    # matcher can replace only a fragment of the token (leaving the rest
+    # of the string, e.g. the "." delimiters and remaining segments, in
+    # place). Checking "raw in redact(raw)" alone does not catch that
+    # false-green (the original raw string as a whole is no longer
+    # present, but unredacted fragments still leak). Verify instead that
+    # a standalone new-format token is redacted to exactly
+    # "[REDACTED]" with nothing left over.
+    new_format_sample = (
+        "ghs_1234567_"
+        + ("a" * 40)
+        + "."
+        + ("b" * 200)
+        + "."
+        + ("c" * 40)
+    )
+    if redact(new_format_sample) != "[REDACTED]":
+        return False
+
     return True
 
 
