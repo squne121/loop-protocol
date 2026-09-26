@@ -813,6 +813,37 @@ def _line_indent(line: str) -> int:
     return len(line) - len(line.lstrip(" \t"))
 
 
+def _strip_unquoted_yaml_comment(text: str) -> str:
+    """Strip a trailing unquoted YAML comment (``# ...``) from ``text``.
+
+    Issue #2771 PR #2780 OWNER F1 review: a field key line's trailing
+    explanatory comment (``runtime_assertion_bindings: # このACで両方を検証
+    する``) must never be mistaken for that field's actual inline value --
+    the previous implementation treated the raw, un-stripped remainder of
+    the line as the inline value, so a comment-only suffix made a normal
+    block-form binding disappear (parsed as a single truncated line instead
+    of the field plus its nested block).
+
+    Only a ``#`` that starts the string or is preceded by whitespace, and
+    that is not inside a single- or double-quoted string, begins a comment
+    (the same informal subset of the YAML comment rule PyYAML itself
+    applies to plain scalars). This is intentionally a narrow, local
+    heuristic scoped to this line-based field extractor -- not a general
+    YAML tokenizer.
+    """
+    in_single = False
+    in_double = False
+    for index, ch in enumerate(text):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            if index == 0 or text[index - 1] in (" ", "\t"):
+                return text[:index]
+    return text
+
+
 def _extract_rva_yaml_field(rva_section_text: str, field_name: str) -> Optional[Any]:
     """Best-effort extraction of a single top-level RVA field's value.
 
@@ -829,26 +860,68 @@ def _extract_rva_yaml_field(rva_section_text: str, field_name: str) -> Optional[
     whole section. Returns ``None`` if the field is absent or its isolated
     slice fails to parse (never raises -- a missing/malformed field degrades
     to "absent", the same as every other RVA field check in this codebase).
+
+    Issue #2771 PR #2780 OWNER F1 review fixed 3 false-negative patterns
+    beyond the original "strictly deeper indent" design:
+
+    - A trailing YAML comment on the field's own key line
+      (``field_name: # comment``) is stripped before deciding whether an
+      inline value is present (see ``_strip_unquoted_yaml_comment``).
+    - A ``field_name:`` key followed by a block sequence at the *same*
+      indentation (the shape PyYAML's own ``yaml.safe_dump()`` emits for a
+      mapping value that is a list -- valid YAML; a sequence item does not
+      need to be indented deeper than its mapping key) is now recognised as
+      that field's nested block, provided the key line itself was matched
+      in its plain (non-bullet) form. This same-indent continuation is
+      deliberately NOT applied when the key itself was bullet-prefixed
+      (``- field_name:``), because in that authoring style a *sibling*
+      field at the same indentation is also written as a ``- other_field:``
+      bullet -- applying the same-indent rule there would swallow the next,
+      unrelated field into this one's value.
+    - A ``field_name`` key that is itself written as a Markdown/YAML bullet
+      item (``- field_name: value``), matching the existing authoring
+      convention already used for other RVA fields such as ``- decision:``
+      / ``- reason:``.
     """
     if not rva_section_text:
         return None
     lines = rva_section_text.splitlines()
-    pattern = re.compile(rf"^([ \t]*){re.escape(field_name)}\s*:[ \t]*(.*)$")
+    escaped_field = re.escape(field_name)
+    plain_pattern = re.compile(rf"^([ \t]*){escaped_field}\s*:[ \t]*(.*)$")
+    bullet_pattern = re.compile(rf"^([ \t]*)-[ \t]+{escaped_field}\s*:[ \t]*(.*)$")
     for index, line in enumerate(lines):
-        match = pattern.match(line)
+        is_bullet = False
+        match = plain_pattern.match(line)
         if match is None:
-            continue
+            match = bullet_pattern.match(line)
+            if match is None:
+                continue
+            is_bullet = True
         indent = len(match.group(1))
-        inline_value = match.group(2).strip()
+        inline_value = _strip_unquoted_yaml_comment(match.group(2)).strip()
         if inline_value:
             candidate = f"{field_name}: {inline_value}"
         else:
-            block_lines = [line]
+            # The key line itself is reconstructed fresh (never the raw
+            # ``line``) so a bullet prefix (``- field_name:``) or a
+            # comment-only suffix on the key line can never leak into the
+            # isolated candidate parsed below -- only the nested nxt lines'
+            # own (already comment-free by construction) indentation is
+            # preserved verbatim.
+            block_lines = [f"{field_name}:"]
             for nxt in lines[index + 1:]:
                 if not nxt.strip():
                     block_lines.append(nxt)
                     continue
-                if _line_indent(nxt) > indent:
+                nxt_indent = _line_indent(nxt)
+                if nxt_indent > indent:
+                    block_lines.append(nxt)
+                    continue
+                if (
+                    not is_bullet
+                    and nxt_indent == indent
+                    and nxt.lstrip(" \t").startswith("- ")
+                ):
                     block_lines.append(nxt)
                     continue
                 break
@@ -882,12 +955,49 @@ def extract_applicable_acs(rva_section_text: str) -> set[str]:
     return result
 
 
+_AC_TASK_LIST_ITEM_RE = re.compile(r"^[ \t]*-[ \t]*\[[ xX]\][ \t]*AC(\d+)\b")
+
+
 def extract_ac_numbers(ac_section_text: str) -> set[str]:
-    """Digit-only AC numbers declared anywhere in the Acceptance Criteria
-    section text (mirrors the ``AC(\\d+)`` collection already used
-    independently by ``check_c5_ac_vc_alignment`` -- centralised here so the
-    runtime assertion binding coverage gate never diverges from it)."""
-    return set(re.findall(r"AC(\d+)", ac_section_text or ""))
+    """Digit-only AC numbers actually DECLARED as a task-list item's own AC
+    label (e.g. ``- [ ] AC3: ...``) in the Acceptance Criteria section text.
+
+    Issue #2771 PR #2780 OWNER F3 review: an earlier version of this
+    function used a body-wide ``AC(\\d+)`` regex, which also matched
+    ``AC<N>``-shaped substrings appearing in prose explaining a *previous*
+    proposal (e.g. ``旧案のAC99は参考情報であり...``), a URL fragment, a
+    filename, or a fenced code example -- none of which declare a real
+    Acceptance Criterion. That made a binding's referential-validity check
+    (``ac_not_found``) pass for a nonexistent AC as long as its number
+    happened to appear anywhere in the section's text.
+
+    This is the same known false-positive shape independently tracked for
+    the ``review-issue`` C5 checker's own AC-number collection (Issue
+    #1712) -- this fix is intentionally scoped ONLY to this function's own
+    local AC-number extraction, not a fix to C5 itself and not a new
+    general-purpose Markdown parser.
+
+    Only the first ``AC<N>``-shaped token immediately following a
+    task-list checkbox marker (``- [ ]`` / ``- [x]`` / ``- [X]``) on a
+    non-fenced line counts as that item's own declared AC number -- any
+    further ``AC<N>``-shaped text later in the same line (prose, examples)
+    is ignored, and lines inside fenced code blocks are excluded entirely
+    (a fenced example illustrating what an AC line looks like does not
+    itself declare a real AC).
+    """
+    result: set[str] = set()
+    in_fence = False
+    for line in (ac_section_text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = _AC_TASK_LIST_ITEM_RE.match(line)
+        if match:
+            result.add(match.group(1))
+    return result
 
 
 _RUNTIME_VERIFICATION_TAG_RE = re.compile(r"<!--\s*runtime-verification:\s*true\s*-->")

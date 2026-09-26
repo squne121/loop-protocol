@@ -1674,7 +1674,21 @@ def check_runtime_assertion_binding_coverage(body: str) -> list[dict]:
     rva_section_text = rva_section[0] if rva_section is not None else ""
     ac_section = _extract_ac_section(body)
     ac_section_text = ac_section[0] if ac_section is not None else ""
-    vc_section_text = extract_verification_commands_section(body) or ""
+    # Issue #2771 PR #2780 OWNER F2 review: use the same GFM-aware section
+    # extraction (fence-aware, closing-hash-tolerant, nested-heading-safe)
+    # already used for the RVA / Acceptance Criteria sections above, and
+    # already used independently by review-issue's C15
+    # (`check_c15_runtime_assertion_binding_coverage` -> `extract_section()`)
+    # -- NOT the legacy `extract_verification_commands_section()` regex
+    # (``^##\s+Verification Commands\s*$(.+?)(?=^##|\Z)``), which fails to
+    # extract a GFM closing-hash heading (``## Verification Commands ##``)
+    # and can be cut short by a nested ``### Runtime checks`` subheading or
+    # a ``##``-prefixed line inside a fenced code example. Using a
+    # different extractor than review-issue's C15 for the SAME input body
+    # let the two consumers disagree on `ac_vc_refs` for identical Issues
+    # even though both call the exact same shared evaluator function.
+    vc_section = _extract_section_by_canonical_name(body, "Verification Commands")
+    vc_section_text = vc_section[0] if vc_section is not None else ""
 
     vc_parse_result = _parse_vc_section(vc_section_text)
     ac_vc_refs = {re.sub(r"^AC", "", ref) for ref in vc_parse_result.ac_refs}

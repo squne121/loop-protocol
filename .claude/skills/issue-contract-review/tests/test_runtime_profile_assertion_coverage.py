@@ -388,3 +388,292 @@ def test_review_issue_and_issue_contract_review_agree_on_approve():
     assert review_status == check_issue_contract.CheckResult.PASS
     assert review_issues == []
     assert readiness_errors == []
+
+
+# --- Issue #2771 PR #2780 OWNER F1/F2/F3 regression fixtures --------------
+#
+# These use a raw, hand-written body (not `_build_body`/`_BODY_TEMPLATE`)
+# because F1/F2 exercise Runtime Verification Applicability / Verification
+# Commands *authoring variations* that `_BODY_TEMPLATE`'s fixed key lines and
+# single ```bash fence cannot express (a trailing comment on the
+# `runtime_assertion_bindings:` key line itself, a `yaml.safe_dump()`-style
+# same-indent block sequence, a GFM closing-hash heading, a nested `###`
+# subheading, and a stray fenced `##`-prefixed line).
+
+
+def _f1_f2_f3_body(
+    *,
+    ac_section: str,
+    vc_heading: str,
+    vc_body: str,
+    runtime_assertion_bindings_block: str,
+) -> str:
+    return f"""## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "none"
+goal_ref: "test"
+change_kind: workflow
+```
+
+## Outcome
+
+Concrete outcome sentence for F1/F2/F3 regression fixture testing.
+
+## Acceptance Criteria
+
+{ac_section}
+
+{vc_heading}
+
+{vc_body}
+
+## Allowed Paths
+
+- .claude/hooks/foo.py
+
+## Stop Conditions
+
+- one
+- two
+- three
+- four
+- five
+- six
+
+## Runtime Verification Applicability
+
+```yaml
+decision: immediate
+applicable_acs:
+  - AC1
+  - AC2
+execution_environment:
+  cli_tools:
+    - python3
+skip_conditions:
+  - "none"
+fallback_policy:
+  fallback_success_is_pass: false
+artifact_requirements:
+  - "artifacts/out.json"
+{runtime_assertion_bindings_block}
+```
+
+## Required Skills
+
+none
+"""
+
+
+_STANDARD_AC_SECTION = (
+    "- [ ] AC1: concrete AC 1 <!-- runtime-verification: true -->\n"
+    "- [ ] AC2: concrete AC 2 <!-- runtime-verification: true -->"
+)
+_STANDARD_VC_HEADING = "## Verification Commands"
+_STANDARD_VC_BODY = (
+    "```bash\n# AC1\n$ rg -n 'concrete' file1.py\n# AC2\n$ rg -n 'concrete' file2.py\n```"
+)
+_STANDARD_BINDINGS_BLOCK = (
+    "runtime_assertion_bindings:\n"
+    + _binding("hook-chain-runtime-smoke", _HOOK_ASSERTION_1, "AC1")
+    + _binding("hook-chain-runtime-smoke", _HOOK_ASSERTION_2, "AC2")
+)
+
+
+def test_f1_binding_key_line_comment_matches_baseline_result():
+    """OWNER regression table row 1: a trailing comment on the
+    `runtime_assertion_bindings:` key line must yield the exact same
+    coverage result as the same fixture without the comment."""
+    _, contract_readiness_check = _load_consumers("f1_key_line_comment")
+    baseline_body = _f1_f2_f3_body(
+        ac_section=_STANDARD_AC_SECTION,
+        vc_heading=_STANDARD_VC_HEADING,
+        vc_body=_STANDARD_VC_BODY,
+        runtime_assertion_bindings_block=_STANDARD_BINDINGS_BLOCK,
+    )
+    commented_body = _f1_f2_f3_body(
+        ac_section=_STANDARD_AC_SECTION,
+        vc_heading=_STANDARD_VC_HEADING,
+        vc_body=_STANDARD_VC_BODY,
+        runtime_assertion_bindings_block=_STANDARD_BINDINGS_BLOCK.replace(
+            "runtime_assertion_bindings:", "runtime_assertion_bindings: # このACで両方を検証する", 1
+        ),
+    )
+    baseline_errors = contract_readiness_check.check_runtime_assertion_binding_coverage(baseline_body)
+    commented_errors = contract_readiness_check.check_runtime_assertion_binding_coverage(commented_body)
+    assert baseline_errors == []
+    assert commented_errors == baseline_errors
+
+
+def test_f1_yaml_safe_dump_style_matches_baseline_result():
+    """OWNER regression table row 2: a `yaml.safe_dump()`-formatted
+    (same-indent block sequence) `runtime_assertion_bindings` must yield the
+    exact same coverage result as the indented form."""
+    _, contract_readiness_check = _load_consumers("f1_safe_dump_style")
+    baseline_body = _f1_f2_f3_body(
+        ac_section=_STANDARD_AC_SECTION,
+        vc_heading=_STANDARD_VC_HEADING,
+        vc_body=_STANDARD_VC_BODY,
+        runtime_assertion_bindings_block=_STANDARD_BINDINGS_BLOCK,
+    )
+    dumped_style_block = (
+        "runtime_assertion_bindings:\n"
+        "- profile: hook-chain-runtime-smoke\n"
+        f"  assertion: {_HOOK_ASSERTION_1}\n"
+        "  ac: AC1\n"
+        "- profile: hook-chain-runtime-smoke\n"
+        f"  assertion: {_HOOK_ASSERTION_2}\n"
+        "  ac: AC2\n"
+    )
+    dumped_body = _f1_f2_f3_body(
+        ac_section=_STANDARD_AC_SECTION,
+        vc_heading=_STANDARD_VC_HEADING,
+        vc_body=_STANDARD_VC_BODY,
+        runtime_assertion_bindings_block=dumped_style_block,
+    )
+    baseline_errors = contract_readiness_check.check_runtime_assertion_binding_coverage(baseline_body)
+    dumped_errors = contract_readiness_check.check_runtime_assertion_binding_coverage(dumped_body)
+    assert baseline_errors == []
+    assert dumped_errors == baseline_errors
+
+
+def test_f1_bullet_prefixed_applicable_acs_does_not_regress():
+    """OWNER regression table row 3: the existing bullet-list
+    `- applicable_acs: [AC1]` form must not lose the applicable ACs."""
+    _, contract_readiness_check = _load_consumers("f1_bullet_applicable_acs")
+    bulleted_body = f"""## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+parent_issue: "none"
+goal_ref: "test"
+change_kind: workflow
+```
+
+## Outcome
+
+Concrete outcome sentence for F1 bullet applicable_acs fixture testing.
+
+## Acceptance Criteria
+
+- [ ] AC1: concrete AC 1 <!-- runtime-verification: true -->
+
+## Verification Commands
+
+```bash
+# AC1
+$ rg -n 'concrete' file1.py
+```
+
+## Allowed Paths
+
+- .claude/hooks/foo.py
+
+## Stop Conditions
+
+- one
+- two
+- three
+- four
+- five
+- six
+
+## Runtime Verification Applicability
+
+```yaml
+- decision: immediate
+- applicable_acs: [AC1]
+- execution_environment:
+    cli_tools:
+      - python3
+- skip_conditions:
+    - "none"
+- fallback_policy:
+    fallback_success_is_pass: false
+- artifact_requirements:
+    - "artifacts/out.json"
+- runtime_assertion_bindings:
+{_binding("hook-chain-runtime-smoke", _HOOK_ASSERTION_1, "AC1")}\
+{_binding("hook-chain-runtime-smoke", _HOOK_ASSERTION_2, "AC1")}```
+
+## Required Skills
+
+none
+"""
+    errors = contract_readiness_check.check_runtime_assertion_binding_coverage(bulleted_body)
+    assert errors == []
+
+
+def test_f2_vc_closing_hash_heading_and_nested_subheading_consumers_agree():
+    """OWNER regression table row 4: a GFM closing-hash VC heading
+    (`## Verification Commands ##`) plus a nested `### Runtime checks`
+    subheading must not break section extraction, and both consumers
+    (review-issue C15 and issue-contract-review readiness) must agree."""
+    check_issue_contract, contract_readiness_check = _load_consumers("f2_closing_hash_nested")
+    body = _f1_f2_f3_body(
+        ac_section=_STANDARD_AC_SECTION,
+        vc_heading="## Verification Commands ##",
+        vc_body=(
+            "```bash\n# AC1\n$ rg -n 'concrete' file1.py\n```\n\n"
+            "### Runtime checks\n\n"
+            "```bash\n# AC2\n$ rg -n 'concrete' file2.py\n```"
+        ),
+        runtime_assertion_bindings_block=_STANDARD_BINDINGS_BLOCK,
+    )
+    review_status, review_issues = check_issue_contract.check_c15_runtime_assertion_binding_coverage(
+        body, "implementation"
+    )
+    readiness_errors = contract_readiness_check.check_runtime_assertion_binding_coverage(body)
+    assert review_status == check_issue_contract.CheckResult.PASS
+    assert review_issues == []
+    assert readiness_errors == []
+
+
+def test_f2_vc_fenced_hash_line_does_not_truncate_section():
+    """OWNER regression table row 5: a fenced (non-bash) code block
+    containing a `##`-prefixed line inside the Verification Commands
+    section must not be mistaken for a heading boundary that cuts the
+    section short before the real, later VC commands."""
+    _, contract_readiness_check = _load_consumers("f2_fenced_hash_line")
+    body = _f1_f2_f3_body(
+        ac_section=_STANDARD_AC_SECTION,
+        vc_heading=_STANDARD_VC_HEADING,
+        vc_body=(
+            "```bash\n# AC1\n$ rg -n 'concrete' file1.py\n```\n\n"
+            "```text\n## smoke test inside fence, must not truncate section\n```\n\n"
+            "```bash\n# AC2\n$ rg -n 'concrete' file2.py\n```"
+        ),
+        runtime_assertion_bindings_block=_STANDARD_BINDINGS_BLOCK,
+    )
+    errors = contract_readiness_check.check_runtime_assertion_binding_coverage(body)
+    assert errors == []
+
+
+def test_f3_ac_only_in_prose_is_ac_not_found():
+    """OWNER regression table row 6: binding a hard-required assertion to an
+    AC number (AC99) that only ever appears inside another AC's own prose
+    description (explaining a superseded prior proposal) must be reported
+    as `ac_not_found` -- the prose mention is not itself a declared AC."""
+    _, contract_readiness_check = _load_consumers("f3_ac_only_in_prose")
+    body = _f1_f2_f3_body(
+        ac_section=(
+            "- [ ] AC1: 現在の受入条件。旧案のAC99は参考情報であり、今回の受入条件ではない。"
+            " <!-- runtime-verification: true -->"
+        ),
+        vc_heading=_STANDARD_VC_HEADING,
+        vc_body="```bash\n# AC1\n$ rg -n 'concrete' file1.py\n# AC99\n$ rg -n 'concrete' file99.py\n```",
+        runtime_assertion_bindings_block=(
+            "runtime_assertion_bindings:\n"
+            + _binding("hook-chain-runtime-smoke", _HOOK_ASSERTION_1, "AC1")
+            + _binding("hook-chain-runtime-smoke", _HOOK_ASSERTION_2, "AC99")
+        ),
+    )
+    errors = contract_readiness_check.check_runtime_assertion_binding_coverage(body)
+    assert len(errors) == 1
+    minimal_context = " ".join(errors[0]["minimal_context"])
+    assert "ac_not_found" in minimal_context
+    assert "AC99" in minimal_context
