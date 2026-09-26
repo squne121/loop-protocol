@@ -13,12 +13,12 @@
 - 検証結果: 各 VC が記録されている
 -  placeholder（`<達成（根拠）>`）は未達成扱い
 
-## Runtime immediate
+## Runtime immediate（即時 runtime 検証）
 
 - `decision: immediate` 時に `## Runtime Verification Evidence` と artifact/ログの参照が必要
 - evidence が一切無い場合は blocker
 
-## Multi-linked issue
+## Multi-linked issue（複数 Issue 紐付け）
 
 複数 linked issue の場合は Issue ごとの AC coverage matrix が必要。
 
