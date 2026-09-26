@@ -43,7 +43,11 @@ def _policy_with_profile(profile_id: str, assertion_ids: list[str]) -> dict:
 
 
 def _rule(profile_id: str, enforcement: str) -> dict:
-    return {"rule_id": f"rule-{profile_id}-{enforcement}", "verification_profile": profile_id, "enforcement": enforcement}
+    return {
+        "rule_id": f"rule-{profile_id}-{enforcement}",
+        "verification_profile": profile_id,
+        "enforcement": enforcement,
+    }
 
 
 # --- AC1: hard-only derivation -------------------------------------------
