@@ -1131,6 +1131,7 @@ class DeterministicChecks:
     C12_product_trace_fields_structure: str = CheckResult.NA
     C13_vc_preflight_decision_consistency: str = CheckResult.NA
     C14_extension_surface_risk_trigger: str = CheckResult.NA
+    C15_runtime_assertion_binding_coverage: str = CheckResult.NA
 
 
 @dataclass
@@ -1685,6 +1686,66 @@ def check_c14_extension_surface_risk_trigger(body: str, issue_kind: str) -> tupl
         # finding rather than silently looking identical to "no candidate
         # match found" (NA) or forcing a hard block (FAIL).
         return CheckResult.WARN, [f"extension-surface risk-trigger policy unavailable: {exc}"]
+
+    if verdict["verdict"] == "needs_fix":
+        return CheckResult.FAIL, verdict["reasons"]
+    return CheckResult.PASS, []
+
+
+def check_c15_runtime_assertion_binding_coverage(body: str, issue_kind: str) -> tuple[str, list[str]]:
+    """C15 (Issue #2771): hard-required verification profile assertion
+    binding completeness.
+
+    Uses the shared evaluator's
+    `evaluate_runtime_assertion_binding_coverage()` to verify that every
+    `(verification_profile_id, assertion_id)` pair derived purely from
+    `matched_rules[].enforcement == "hard"` has an explicit
+    `runtime_assertion_bindings` declaration in the Issue's Runtime
+    Verification Applicability section, and that each declared binding's
+    `ac` is referentially valid (exists, is declared in `applicable_acs`,
+    is consistent with the decision-level runtime-verification tag, and has
+    a canonical `# AC<N>` reference in `## Verification Commands`).
+
+    This is a STRUCTURAL COMPLETENESS check only -- it never judges whether
+    the bound VC actually proves the assertion's semantic postcondition
+    (Issue #2771 Outcome / AC10). Mirrors `check_c14_extension_surface_
+    risk_trigger`'s NA/WARN/FAIL shape so the two checks share the same
+    call-site pattern.
+    """
+    if issue_kind != "implementation":
+        return CheckResult.NA, []
+
+    allowed_path_entries = pc_extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return CheckResult.NA, []
+
+    rva_section = extract_section(body, "Runtime Verification Applicability")
+    ac_section = extract_section(body, "Acceptance Criteria")
+    vc_section = extract_section(body, "Verification Commands")
+
+    if _VC_SECTION_PARSER_AVAILABLE and vc_section:
+        parse_result = _parse_vc_section(vc_section)
+        ac_vc_refs = {re.sub(r"^AC", "", ref) for ref in parse_result.ac_refs}
+    else:
+        ac_vc_refs = _extract_vc_ac_refs(vc_section or "")
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return CheckResult.NA, []
+
+    try:
+        verdict = evaluator.evaluate_runtime_assertion_binding_coverage(
+            allowed_path_entries=allowed_path_entries,
+            rva_section_text=rva_section or "",
+            ac_section_text=ac_section or "",
+            ac_vc_refs=ac_vc_refs,
+        )
+    except evaluator.PolicyLoadError as exc:
+        # Issue #2771 AC6: a policy integrity defect (dangling profile
+        # reference / duplicate assertion id within a profile) is not
+        # Issue-author-fixable -- WARN (not FAIL, not NA), mirroring C14's
+        # existing PolicyLoadError handling above.
+        return CheckResult.WARN, [f"runtime assertion binding coverage policy unavailable: {exc}"]
 
     if verdict["verdict"] == "needs_fix":
         return CheckResult.FAIL, verdict["reasons"]
@@ -2613,6 +2674,35 @@ def run_checks(
         blocking=checks.C14_extension_surface_risk_trigger == CheckResult.FAIL,
     )
 
+    # C15: Runtime Verification profile assertion binding coverage (Issue #2771)
+    checks.C15_runtime_assertion_binding_coverage, issues = check_c15_runtime_assertion_binding_coverage(
+        body, issue_kind
+    )
+    if checks.C15_runtime_assertion_binding_coverage == CheckResult.FAIL:
+        result.blocking_issues.extend(issues)
+        _append_findings(
+            result,
+            issues,
+            deterministic_domain_key="runtime_assertion_binding_coverage",
+            finding_kind=REVIEW_ISSUE_FINDING_KIND_HEURISTIC_CONCERN,
+            blocking=True,
+        )
+    elif checks.C15_runtime_assertion_binding_coverage == CheckResult.WARN:
+        for msg in issues:
+            _add_warning(
+                result,
+                code="c15_runtime_assertion_binding_coverage_policy_unavailable",
+                severity="warning",
+                evidence=[msg],
+                suggested_action=(
+                    "The extension-surface runtime policy's verification_profiles could not be "
+                    "evaluated for this Issue's runtime assertion binding coverage (policy "
+                    "integrity failure, not an Issue-author-fixable defect). Escalate to a "
+                    "human/owner to repair docs/dev/extension-surface-runtime-policy.yaml."
+                ),
+                emit_finding=False,
+            )
+
     # C14b: Extension surface candidate perimeter advisory (Issue #2339,
     # non-blocking -- must never touch checks.* / all_check_values / verdict).
     extension_surface_candidate_advisories = get_extension_surface_candidate_advisories(body, issue_kind)
@@ -2652,6 +2742,7 @@ def run_checks(
         checks.C12_product_trace_fields_structure,
         checks.C13_vc_preflight_decision_consistency,
         checks.C14_extension_surface_risk_trigger,
+        checks.C15_runtime_assertion_binding_coverage,
     ]
     has_fail = any(v in (CheckResult.FAIL, CheckResult.LEGACY_MISSING) for v in all_check_values)
     has_structured_blockers = bool(result.structured_blockers)

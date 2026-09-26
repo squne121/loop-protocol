@@ -137,6 +137,49 @@ Issue 起票時に動作検証の適用判定セクションを記載する。`r
 - 自由記述の「後続 Issue で検証する」だけでは不完全。機械的に検出できる半構造化フォーマットで記述すること。
 - 適用判定の詳細基準は `docs/dev/runtime-verification-policy.md` の「Runtime Verification Applicability」を参照する。
 
+### 実行時検証プロファイルの assertion binding 記法（`runtime_assertion_bindings`, Issue #2771）
+
+`docs/dev/extension-surface-runtime-policy.yaml` の risk-trigger rule に **hard** で一致する Allowed Paths を宣言した Issue は、その rule が要求する `verification_profile` の `assertions[]`（証明すべき postcondition）を、どの runtime AC が担うかを `runtime_assertion_bindings` として明示する。`enforcement == advisory` のみで到達した profile / assertion は required set に含まれない（PR #2370 の advisory non-blocking 方針を継続する）。
+
+**canonical wire format**（`profile` / `assertion` / `ac` の3フィールドのみ。`vc:` やコマンド本文をここに複製しない — VC 本体は既存の `## Verification Commands` の `# AC<N>` 参照で紐づける）:
+
+```yaml
+## Runtime Verification Applicability
+
+decision: immediate
+applicable_acs:
+  - AC3
+  - AC4
+runtime_assertion_bindings:
+  - profile: skill-invocation-runtime-smoke
+    assertion: procedure_steps_executed_in_declared_order
+    ac: AC3
+  - profile: skill-invocation-runtime-smoke
+    assertion: output_contract_schema_fields_present
+    ac: AC4
+```
+
+**hard-required 時の生成規則**:
+
+- Allowed Paths が hard selector に一致する rule ごとに、その `verification_profile` の `assertions[]` 全件（`docs/dev/extension-surface-runtime-policy.yaml` の `verification_profiles.<profile_id>.assertions[].id`）を洗い出す。
+- 各 assertion について、それを実証する runtime AC（`applicable_acs` に含まれ、`<!-- runtime-verification: true -->` タグを持ち、`## Verification Commands` に `# AC<N>` canonical reference がある AC）を1つ選び `runtime_assertion_bindings` に1エントリとして書く。
+- 同一 `verification_profile` が複数 selector（enforcement が異なるものを含む）でマッチした場合でも、profile 単位でいずれか1つが hard なら全 assertions が required になる（advisory な selector が assertion を個別に部分追加することはない）。
+- 複数 profile が同時に要求される場合（Issue #2467 のような同時適用）は、各 profile の assertions を漏れなく列挙する。
+
+**識別子の組み合わせ（composite identity）と 1 key = 1 ac の制約**:
+
+- 各エントリの識別子は `(profile, assertion)` の組（composite identity）である。`assertion` の `id` は policy 上 profile 内でのみ一意性が保証されるため、`profile` を含めない `assertion` 単独を識別子にしてはならない。
+- **1つの `(profile, assertion)` key は高々1つの `ac` にのみ bind できる**。同じ key を2回以上宣言してはならない（bind 先の `ac` が同一でも異なっても duplicate として拒否される）。
+- 一方、**複数の異なる key が同一の `ac` を指すことは許容される**。1つの AC/VC が複数 assertion の evidence を兼ねてよい。
+
+**#2775 未解決時の escape valve**（author-facing）:
+
+`skill-invocation-runtime-smoke` を要求する Issue で、対象 Skill に `output_contract_schema_fields_present` を実証できる canonical な output schema が実在しないと判断した場合（#2775 が指摘する構造的不整合 — 29 Skill 中 `schemas/` を持つのは4件のみ）、その assertion の binding を、同じ profile の `procedure_steps_executed_in_declared_order` を証明する runtime AC と **同一の** `ac` へ bind してよい（AC4 が明示的に許容する「複数 assertion が同一 AC を共有する」ケース）。この場合、その AC/VC が両方の assertion の意味を実際に十分証明しているかの判断（semantic sufficiency）は、以下の structural completeness gate の責務ではなく既存 semantic review（`pr-review-judge` 等）の責務になる。#2775 の解決を本 escape valve の適用条件・マージ順序の前提条件にはしない。
+
+**structural completeness と semantic sufficiency の責務境界**:
+
+`runtime_assertion_bindings` の機械判定（`scripts/agent-guards/extension_surface_policy_matcher.py` の `evaluate_runtime_assertion_binding_coverage()`）が保証するのは、宣言漏れ・未知宣言・重複宣言の不在と binding 先 AC の referential integrity（実在確認 / `applicable_acs` 包含 / runtime-verification タグ整合 / VC canonical reference 存在）という **structural completeness** のみである。binding された VC が assertion の意味を実際に証明しているか（**semantic sufficiency**）は判定しない。この境界は Issue 起票時にも維持し、「binding が揃っている」ことを「動作検証の意味的な十分性が保証された」と混同しないこと。
+
 ## VC 作成ガイダンス
 
 > 動作検証 AC（`runtime-verification: true`）を含む VC の設計は `docs/dev/runtime-verification-policy.md` を参照すること。

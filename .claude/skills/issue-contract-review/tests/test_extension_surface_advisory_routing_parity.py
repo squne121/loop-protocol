@@ -311,6 +311,17 @@ class _StubPolicyUnavailableEvaluator:
     def evaluate_allowed_paths(cls, *args, **kwargs):
         raise cls.PolicyLoadError("synthetic malformed policy for AC7 parity test")
 
+    @classmethod
+    def evaluate_runtime_assertion_binding_coverage(cls, **kwargs):
+        # Issue #2771: `build_result()` now also calls this shared-evaluator
+        # entrypoint unconditionally for every implementation-kind body with
+        # a non-empty Allowed Paths set, same as `evaluate_issue_risk_
+        # trigger`/`evaluate_allowed_paths` above -- this stub must raise the
+        # same PolicyLoadError so the "malformed policy" scenario this test
+        # simulates stays internally consistent instead of surfacing an
+        # unrelated AttributeError.
+        raise cls.PolicyLoadError("synthetic malformed policy for AC7 parity test")
+
 
 def test_malformed_policy_routing_is_intentionally_different_and_documented(monkeypatch):
     """PR #2370 OWNER review fix_delta (P1, malformed-policy sub-bullet): the

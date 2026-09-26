@@ -57,6 +57,7 @@ from changed_file_matcher import AllowedPathsMatcher  # noqa: E402
 
 SCHEMA_POLICY_EVALUATION = "EXTENSION_SURFACE_POLICY_EVALUATION_V1"
 SCHEMA_RISK_TRIGGER_VERDICT = "EXTENSION_SURFACE_RISK_TRIGGER_VERDICT_V1"
+SCHEMA_RUNTIME_ASSERTION_BINDING_COVERAGE = "RUNTIME_ASSERTION_BINDING_COVERAGE_RESULT_V1"
 
 # Mirrors `_RVA_IMMEDIATE_REQUIRED_FIELDS` in
 # `.claude/skills/issue-contract-review/scripts/contract_readiness_check.py`'s
@@ -692,4 +693,420 @@ def evaluate_issue_risk_trigger(
         # never contribute to `reasons`/`verdict`; verdict stays `approve`
         # when reasons is empty even if advisories is non-empty, AC6).
         "advisories": policy_evaluation.get("advisories", []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Runtime Verification profile assertion binding coverage (Issue #2771)
+# ---------------------------------------------------------------------------
+#
+# This gate guarantees STRUCTURAL COMPLETENESS ONLY (structural_completeness_
+# not_semantic_sufficiency): it verifies that every hard-required
+# (verification_profile_id, assertion_id) composite pair -- derived purely
+# from `matched_rules[].enforcement == "hard"`, never from an advisory-only
+# match (PR #2370's non-blocking advisory semantics are not re-introduced as
+# a blocker from this new angle) -- has an explicit `runtime_assertion_
+# bindings` declaration in the Issue's Runtime Verification Applicability
+# section. Whether the *bound* VC/AC actually proves the assertion's
+# semantic postcondition (semantic sufficiency) is explicitly NOT judged
+# here and remains the responsibility of existing semantic review
+# (`pr-review-judge` etc.) -- see Issue #2771 Outcome / AC10.
+#
+# `.claude/skills/review-issue/scripts/check_issue_contract.py` and
+# `.claude/skills/issue-contract-review/scripts/contract_readiness_check.py`
+# both call the functions below (never reimplement composite-identity
+# derivation independently) so the two consumers cannot drift (Issue #2771
+# In Scope, "review-issue と issue-contract-review の双方で同一 shared
+# evaluator を使い parity を維持する").
+
+
+def derive_required_runtime_assertions(
+    matched_rules: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> set[tuple[str, str]]:
+    """Derive the required ``(verification_profile_id, assertion_id)``
+    composite set from ``matched_rules`` (as returned by
+    ``evaluate_allowed_paths()``), restricted to profiles that have at least
+    one ``enforcement == "hard"`` matched rule (Issue #2771 AC1/AC2).
+
+    Grouping is by ``verification_profile`` id, not by individual matched
+    rule: if the *same* profile is reached by more than one matched rule
+    (possible when a policy fixture declares two distinct rules that both
+    reference the same profile), the profile's assertions are required as
+    soon as *any* one of those rules is ``enforcement == "hard"`` -- an
+    all-advisory set of rules for a profile keeps that profile entirely out
+    of the required set (AC2). This is a profile-level decision; there is no
+    per-assertion partial-hard/partial-advisory split within a single
+    profile's own ``assertions[]`` list.
+
+    Raises ``PolicyLoadError`` -- the same exception class this module
+    already uses to fail closed on a malformed policy document -- for a
+    *policy* integrity defect: a matched rule referencing a
+    ``verification_profile`` id that is not defined in the policy's
+    top-level ``verification_profiles`` mapping (a dangling profile
+    reference), or a profile whose ``assertions[]`` list declares the same
+    ``id`` more than once. Both are defects in
+    ``docs/dev/extension-surface-runtime-policy.yaml`` itself, not in the
+    Issue being reviewed, and Issue #2771 AC6 requires this module to keep
+    that distinction explicit rather than silently reporting a policy defect
+    as if it were an author-fixable Issue ``needs_fix``.
+    """
+    profiles = policy.get("verification_profiles")
+    if not isinstance(profiles, dict):
+        raise PolicyLoadError(
+            "policy yaml is missing a 'verification_profiles' mapping (required to derive "
+            "hard-required runtime assertion coverage, Issue #2771)"
+        )
+
+    referenced_profile_ids: set[str] = set()
+    hard_profile_ids: set[str] = set()
+    for rule in matched_rules:
+        profile_id = rule.get("verification_profile")
+        if not profile_id:
+            continue
+        referenced_profile_ids.add(profile_id)
+        if rule.get("enforcement") == "hard":
+            hard_profile_ids.add(profile_id)
+
+    required: set[tuple[str, str]] = set()
+    for profile_id in referenced_profile_ids:
+        profile = profiles.get(profile_id)
+        if not isinstance(profile, dict):
+            raise PolicyLoadError(
+                f"matched rule references verification_profile {profile_id!r} which is not "
+                "defined in the policy's 'verification_profiles' mapping (dangling profile "
+                "reference -- a policy integrity failure, not an Issue defect, Issue #2771 AC6)"
+            )
+        assertions = profile.get("assertions")
+        if not isinstance(assertions, list) or not assertions:
+            raise PolicyLoadError(
+                f"verification_profile {profile_id!r} declares no non-empty 'assertions' list "
+                "(policy integrity failure, Issue #2771 AC6)"
+            )
+        seen_assertion_ids: set[str] = set()
+        assertion_ids: list[str] = []
+        for assertion in assertions:
+            assertion_id = assertion.get("id") if isinstance(assertion, dict) else None
+            if not assertion_id:
+                raise PolicyLoadError(
+                    f"verification_profile {profile_id!r} declares a malformed assertion entry "
+                    "missing a non-empty 'id' (policy integrity failure, Issue #2771 AC6)"
+                )
+            if assertion_id in seen_assertion_ids:
+                raise PolicyLoadError(
+                    f"verification_profile {profile_id!r} declares duplicate assertion id "
+                    f"{assertion_id!r} (policy integrity failure -- not an Issue defect, "
+                    "Issue #2771 AC6)"
+                )
+            seen_assertion_ids.add(assertion_id)
+            assertion_ids.append(assertion_id)
+
+        if profile_id in hard_profile_ids:
+            for assertion_id in assertion_ids:
+                required.add((profile_id, assertion_id))
+
+    return required
+
+
+def _line_indent(line: str) -> int:
+    """Count of leading whitespace characters (spaces/tabs) on ``line``."""
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _extract_rva_yaml_field(rva_section_text: str, field_name: str) -> Optional[Any]:
+    """Best-effort extraction of a single top-level RVA field's value.
+
+    The ``## Runtime Verification Applicability`` section is not guaranteed
+    to be a single well-formed YAML document as a whole -- existing Issue
+    bodies mix bullet-list prose lines (``- decision: immediate``) with bare
+    ``key: value`` lines, both inside and outside a ```` ```yaml ```` fence
+    (e.g. ``- decision: immediate`` followed by ``applicable_acs: [AC1]`` at
+    the same indentation is not one valid YAML document). To stay robust
+    against this without inventing a new markup convention, this function
+    locates only ``field_name``'s own line plus its nested block (lines
+    indented strictly deeper than the field, blank lines included) and
+    parses *that* isolated slice as its own tiny YAML document -- never the
+    whole section. Returns ``None`` if the field is absent or its isolated
+    slice fails to parse (never raises -- a missing/malformed field degrades
+    to "absent", the same as every other RVA field check in this codebase).
+    """
+    if not rva_section_text:
+        return None
+    lines = rva_section_text.splitlines()
+    pattern = re.compile(rf"^([ \t]*){re.escape(field_name)}\s*:[ \t]*(.*)$")
+    for index, line in enumerate(lines):
+        match = pattern.match(line)
+        if match is None:
+            continue
+        indent = len(match.group(1))
+        inline_value = match.group(2).strip()
+        if inline_value:
+            candidate = f"{field_name}: {inline_value}"
+        else:
+            block_lines = [line]
+            for nxt in lines[index + 1:]:
+                if not nxt.strip():
+                    block_lines.append(nxt)
+                    continue
+                if _line_indent(nxt) > indent:
+                    block_lines.append(nxt)
+                    continue
+                break
+            candidate = "\n".join(block_lines)
+        try:
+            parsed = yaml.safe_load(candidate)
+        except yaml.YAMLError:
+            return None
+        if isinstance(parsed, dict) and field_name in parsed:
+            return parsed[field_name]
+        return None
+    return None
+
+
+_AC_TOKEN_RE = re.compile(r"^AC(\d+)$")
+
+
+def extract_applicable_acs(rva_section_text: str) -> set[str]:
+    """Digit-only AC numbers declared in the RVA section's ``applicable_acs``
+    field (e.g. ``{"3", "5"}`` for ``applicable_acs: [AC3, AC5]``). Returns
+    an empty set if the field is absent or not a list of ``AC<N>`` strings."""
+    raw = _extract_rva_yaml_field(rva_section_text, "applicable_acs")
+    if not isinstance(raw, list):
+        return set()
+    result: set[str] = set()
+    for item in raw:
+        if isinstance(item, str):
+            m = _AC_TOKEN_RE.match(item.strip())
+            if m:
+                result.add(m.group(1))
+    return result
+
+
+def extract_ac_numbers(ac_section_text: str) -> set[str]:
+    """Digit-only AC numbers declared anywhere in the Acceptance Criteria
+    section text (mirrors the ``AC(\\d+)`` collection already used
+    independently by ``check_c5_ac_vc_alignment`` -- centralised here so the
+    runtime assertion binding coverage gate never diverges from it)."""
+    return set(re.findall(r"AC(\d+)", ac_section_text or ""))
+
+
+_RUNTIME_VERIFICATION_TAG_RE = re.compile(r"<!--\s*runtime-verification:\s*true\s*-->")
+
+
+def decision_level_runtime_verification_tag_consistent(
+    declared_decision: Optional[str], ac_section_text: str
+) -> bool:
+    """Mirrors ``check_c11_decision_tag_consistency``'s existing decision-vs-
+    tag pass/fail semantics (a *decision-level*, whole-Acceptance-Criteria-
+    section aggregate: ``decision: immediate`` requires at least one
+    ``<!-- runtime-verification: true -->`` tag somewhere in the section;
+    ``not_applicable``/``deferred`` require none). Centralised here so the
+    runtime assertion binding coverage gate reuses this exact existing tag
+    mechanism (Issue #2771 AC5 point 3) instead of introducing a new
+    per-assertion tagging convention."""
+    has_rv_tag = bool(_RUNTIME_VERIFICATION_TAG_RE.search(ac_section_text or ""))
+    if declared_decision == "immediate":
+        return has_rv_tag
+    if declared_decision in ("not_applicable", "deferred"):
+        return not has_rv_tag
+    return True
+
+
+_RUNTIME_ASSERTION_BINDING_ALLOWED_KEYS = frozenset({"profile", "assertion", "ac"})
+
+
+def parse_runtime_assertion_bindings(
+    rva_section_text: str,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Parse the canonical ``runtime_assertion_bindings`` wire format list.
+
+    Canonical shape (Issue #2771 In Scope): a list of mappings, each with
+    exactly the three keys ``profile`` / ``assertion`` / ``ac`` -- never a
+    duplicated ``vc:``/command-text field (the binding only records *which*
+    AC owns the assertion; the VC command text itself lives in the existing
+    ``## Verification Commands`` section and is cross-checked separately by
+    ``derive_required_runtime_assertions``'s caller via the existing C5 /
+    ``parse_verification_commands_section`` parser).
+
+    Returns ``(bindings, malformed_entry_descriptions)``. Each returned
+    binding dict has ``profile`` / ``assertion`` (verbatim strings) and
+    ``ac`` (digit-only, e.g. ``"3"`` for ``ac: AC3``). A raw
+    ``runtime_assertion_bindings`` value that is present but not a list, or
+    an individual entry that is not a mapping, declares an unexpected key,
+    or is missing/malformed ``profile``/``assertion``/``ac``, is reported as
+    a human-readable string in ``malformed_entry_descriptions`` rather than
+    silently skipped (an Issue-side declaration defect, Issue #2771 AC3/AC4)
+    -- never raised as a policy integrity failure, since a malformed
+    *declaration* is always something the Issue author can fix.
+    """
+    raw = _extract_rva_yaml_field(rva_section_text, "runtime_assertion_bindings")
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        return [], [
+            "'runtime_assertion_bindings' is present but is not a list "
+            f"(got {type(raw).__name__})"
+        ]
+
+    bindings: list[dict[str, str]] = []
+    malformed: list[str] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            malformed.append(f"runtime_assertion_bindings[{index}] is not a mapping")
+            continue
+        extra_keys = set(entry.keys()) - _RUNTIME_ASSERTION_BINDING_ALLOWED_KEYS
+        if extra_keys:
+            malformed.append(
+                f"runtime_assertion_bindings[{index}] declares unexpected key(s) "
+                f"{sorted(extra_keys)} (canonical shape is profile/assertion/ac only, Issue #2771)"
+            )
+            continue
+        profile = entry.get("profile")
+        assertion = entry.get("assertion")
+        ac = entry.get("ac")
+        if not isinstance(profile, str) or not profile.strip():
+            malformed.append(f"runtime_assertion_bindings[{index}] is missing a non-empty 'profile'")
+            continue
+        if not isinstance(assertion, str) or not assertion.strip():
+            malformed.append(f"runtime_assertion_bindings[{index}] is missing a non-empty 'assertion'")
+            continue
+        if not isinstance(ac, str) or not _AC_TOKEN_RE.match(ac.strip()):
+            malformed.append(
+                f"runtime_assertion_bindings[{index}] declares 'ac' as {ac!r}, expected 'AC<N>' form"
+            )
+            continue
+        bindings.append(
+            {
+                "profile": profile.strip(),
+                "assertion": assertion.strip(),
+                "ac": _AC_TOKEN_RE.match(ac.strip()).group(1),
+            }
+        )
+    return bindings, malformed
+
+
+def evaluate_runtime_assertion_binding_coverage(
+    allowed_path_entries: list[str],
+    rva_section_text: str,
+    ac_section_text: str,
+    ac_vc_refs: set[str],
+    policy: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """High-level verdict shared verbatim by both consumers (Issue #2771,
+    mirrors ``evaluate_issue_risk_trigger``'s existing cross-consumer parity
+    pattern for Issue #2290).
+
+    This function performs STRUCTURAL COMPLETENESS checking only
+    (structural_completeness_not_semantic_sufficiency): it verifies that
+    every hard-required ``(verification_profile_id, assertion_id)`` pair is
+    explicitly bound to a real, referentially-valid Acceptance Criterion via
+    ``runtime_assertion_bindings``. It does not, and cannot, judge whether
+    the bound VC actually *proves* the assertion's semantic postcondition
+    (that remains existing semantic review's responsibility, Issue #2771
+    Outcome / AC9 / AC10).
+
+    ``ac_vc_refs`` is the caller-supplied, digit-only set of AC numbers that
+    the ``## Verification Commands`` section references via a canonical
+    ``# AC<N>`` comment (the same set already produced by the existing
+    ``vc_contract_syntax.parse_verification_commands_section`` / C5 parser
+    both consumers already import) -- passed in rather than re-parsed here
+    so this module does not need a new cross-directory import dependency on
+    top of its existing ``changed_file_matcher`` sibling import.
+
+    Raises ``PolicyLoadError`` (propagated from
+    ``derive_required_runtime_assertions``) for a policy integrity defect;
+    callers MUST catch this separately from the returned ``verdict`` so an
+    Issue-side declaration defect (``needs_fix``, returned normally) is
+    never confused with a policy-side defect the Issue author cannot fix
+    (Issue #2771 AC6).
+    """
+    policy_data = policy if policy is not None else load_policy()
+    policy_evaluation = evaluate_allowed_paths(allowed_path_entries, policy=policy_data)
+    required = derive_required_runtime_assertions(policy_evaluation["matched_rules"], policy_data)
+
+    declared_decision: Optional[str] = None
+    decision_match = re.search(r"decision:\s*(\S+)", rva_section_text or "")
+    if decision_match:
+        declared_decision = decision_match.group(1).strip()
+
+    bindings, malformed_entries = parse_runtime_assertion_bindings(rva_section_text)
+
+    ac_numbers = extract_ac_numbers(ac_section_text)
+    applicable_acs = extract_applicable_acs(rva_section_text)
+    tag_consistent = decision_level_runtime_verification_tag_consistent(
+        declared_decision, ac_section_text
+    )
+
+    declared_key_counts: dict[tuple[str, str], int] = {}
+    for binding in bindings:
+        key = (binding["profile"], binding["assertion"])
+        declared_key_counts[key] = declared_key_counts.get(key, 0) + 1
+    declared_keys = set(declared_key_counts.keys())
+
+    missing = sorted(required - declared_keys)
+    unknown = sorted(declared_keys - required)
+    duplicate = sorted(key for key, count in declared_key_counts.items() if count > 1)
+
+    invalid_ac_bindings: list[dict[str, Any]] = []
+    for binding in bindings:
+        ac_digit = binding["ac"]
+        reasons: list[str] = []
+        if ac_digit not in ac_numbers:
+            reasons.append("ac_not_found")
+        if ac_digit not in applicable_acs:
+            reasons.append("ac_not_in_applicable_acs")
+        if not tag_consistent:
+            reasons.append("runtime_verification_tag_inconsistent")
+        if ac_digit not in ac_vc_refs:
+            reasons.append("ac_missing_vc_reference")
+        if reasons:
+            invalid_ac_bindings.append(
+                {
+                    "profile": binding["profile"],
+                    "assertion": binding["assertion"],
+                    "ac": f"AC{ac_digit}",
+                    "reasons": reasons,
+                }
+            )
+
+    reasons_out: list[str] = []
+    if missing:
+        reasons_out.append(
+            "missing runtime_assertion_bindings for hard-required (profile, assertion) pairs: "
+            + ", ".join(f"{p}/{a}" for p, a in missing)
+        )
+    if unknown:
+        reasons_out.append(
+            "declared runtime_assertion_bindings reference (profile, assertion) pairs that are "
+            "not hard-required: " + ", ".join(f"{p}/{a}" for p, a in unknown)
+        )
+    if duplicate:
+        reasons_out.append(
+            "duplicate runtime_assertion_bindings declared for the same (profile, assertion) key "
+            "(1 key = 1 ac; declaring the same key more than once is invalid regardless of whether "
+            "the bound ac matches): " + ", ".join(f"{p}/{a}" for p, a in duplicate)
+        )
+    reasons_out.extend(malformed_entries)
+    for entry in invalid_ac_bindings:
+        reasons_out.append(
+            f"runtime_assertion_bindings entry {entry['profile']}/{entry['assertion']} -> "
+            f"{entry['ac']} is invalid: {', '.join(entry['reasons'])}"
+        )
+
+    verdict = "needs_fix" if reasons_out else "approve"
+
+    return {
+        "schema": SCHEMA_RUNTIME_ASSERTION_BINDING_COVERAGE,
+        "verdict": verdict,
+        "required_assertions": sorted(f"{p}/{a}" for p, a in required),
+        "declared_bindings": [
+            {"profile": b["profile"], "assertion": b["assertion"], "ac": f"AC{b['ac']}"}
+            for b in bindings
+        ],
+        "missing": [f"{p}/{a}" for p, a in missing],
+        "unknown": [f"{p}/{a}" for p, a in unknown],
+        "duplicate": [f"{p}/{a}" for p, a in duplicate],
+        "malformed_binding_entries": malformed_entries,
+        "invalid_ac_bindings": invalid_ac_bindings,
+        "reasons": reasons_out,
     }
