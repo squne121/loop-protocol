@@ -11,7 +11,8 @@
  */
 
 import { spawnSync } from 'child_process'
-import { existsSync, readFileSync, writeFileSync, rmSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdtempSync } from 'fs'
+import { tmpdir } from 'os'
 import { resolve, join } from 'path'
 import { describe, expect, it } from 'vitest'
 
@@ -200,7 +201,7 @@ describe('scanner_github_token_classic_and_ghs (Issue #2733 AC1–AC4)', () => {
     expect(ruleIds).toContain('github_token_classic')
   })
 
-  it('AC2: GIVEN a synthetic new-format stateless ghs_ App installation token fixture WHEN scanner runs THEN exactly one github_token_classic finding is reported and the raw token never appears in stdout/stderr', () => {
+  it('AC2: GIVEN a synthetic new-format stateless ghs_ App installation token fixture WHEN scanner runs THEN exactly one GitHub token finding is reported, the finding is rule github_token_classic, and the raw token never appears in stdout/stderr', () => {
     const ghsFile = join(FIXTURES_DIR, 'invalid', 'with_ghs_token.txt')
     expect(existsSync(ghsFile)).toBe(true)
 
@@ -209,9 +210,10 @@ describe('scanner_github_token_classic_and_ghs (Issue #2733 AC1–AC4)', () => {
     expect(parsed.raw_value_included).toBe(false)
 
     const githubFindings = parsed.findings.filter(
-      (f: { rule_id: string }) => f.rule_id === 'github_token_classic'
+      (f: { source_kind: string }) => f.source_kind === 'github_token'
     )
-    expect(githubFindings.length).toBe(1)
+    expect(githubFindings).toHaveLength(1)
+    expect(githubFindings[0].rule_id).toBe('github_token_classic')
 
     // Extract the raw synthetic token from the fixture file to assert it is
     // never echoed back by the scanner (fixture is fully synthetic — not a
@@ -223,23 +225,34 @@ describe('scanner_github_token_classic_and_ghs (Issue #2733 AC1–AC4)', () => {
 
     expect(result.stdout).not.toContain(rawToken)
     expect(result.stderr).not.toContain(rawToken)
+
+    // Stateless new-format shape assertion (opaque string — not JWT-validated).
+    // Guards against regression back to the shorter legacy stateful ghs_ shape:
+    // the fixture must remain a long, dot-delimited (2 separators / 3 segments)
+    // opaque token. Payload contents / claims / signature are never parsed.
+    expect(rawToken.length).toBeGreaterThanOrEqual(500)
+    expect(rawToken.match(/\./g) ?? []).toHaveLength(2)
   })
 
   it('AC3: GIVEN a legacy stateful ghs_ token-like input ("ghs_" + "A".repeat(36)) WHEN scanned THEN exactly one GitHub token finding is reported (no duplicate finding from two rules matching the same token)', () => {
     const legacyToken = 'ghs_' + 'A'.repeat(36)
-    // Written to a throwaway scratch fixture (not committed) so this test
-    // does not depend on a pre-existing fixture file for the legacy shape.
-    const scratchPath = join(FIXTURES_DIR, 'invalid', '.scratch_legacy_ghs.txt')
+    // Written to a unique OS temp directory (not the repository worktree) so
+    // this test does not leave a secret-like untracked fixture behind on
+    // parallel runs or interruption, and does not depend on a pre-existing
+    // fixture file for the legacy shape.
+    const tempDir = mkdtempSync(join(tmpdir(), 'issue-2733-legacy-ghs-'))
+    const scratchPath = join(tempDir, 'scratch_legacy_ghs.txt')
     writeFileSync(scratchPath, `legacy token: ${legacyToken}\n`)
     try {
       const result = runScanner(scratchPath)
       const parsed = JSON.parse(result.stdout)
       const githubFindings = parsed.findings.filter(
-        (f: { rule_id: string }) => f.rule_id === 'github_token_classic'
+        (f: { source_kind: string }) => f.source_kind === 'github_token'
       )
-      expect(githubFindings.length).toBe(1)
+      expect(githubFindings).toHaveLength(1)
+      expect(githubFindings[0].rule_id).toBe('github_token_classic')
     } finally {
-      rmSync(scratchPath, { force: true })
+      rmSync(tempDir, { recursive: true, force: true })
     }
   })
 
